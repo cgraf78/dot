@@ -37,6 +37,12 @@ It publishes:
 Both destinations are no-clobber. An existing regular `dot` command is
 preserved only when it is byte-identical to the generated client adapter in
 `support/client-launcher.sh`; other regular files and directories are rejected.
+The optional adapter reads a client-owned cutover lock, validates that its
+minimum standalone revision is an ancestor of the active checkout, and invokes
+a client-owned library-handoff recovery helper before dispatch. During a
+fleet migration it falls back to the retained embedded launcher; after that
+restoration horizon it keeps the same bytes and prints the recovery installer
+when the standalone checkout is unavailable.
 
 ## Runtime model
 
