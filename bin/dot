@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Stock macOS Bash enters only through this small trampoline. The runtime uses
+# Bash 4 features, so interpreter discovery and runtime binding stay together
+# and are revalidated on every invocation.
+
+set -euo pipefail
+CDPATH=
+shopt -u nocasematch
+
+dot_trampoline_source() {
+  local source=${BASH_SOURCE[0]} directory target hops=0
+
+  while [[ -L "$source" ]]; do
+    hops=$((hops + 1))
+    [[ "$hops" -le 40 ]] || {
+      printf 'dot: launcher symlink chain is too deep\n' >&2
+      return 1
+    }
+    directory=$(cd -P -- "$(dirname "$source")" && pwd -P) || return 1
+    target=$(readlink "$source") || return 1
+    case $target in
+      /*) source=$target ;;
+      *) source=$directory/$target ;;
+    esac
+  done
+  [[ -f "$source" ]] || return 1
+  directory=$(cd -P -- "$(dirname "$source")" && pwd -P) || return 1
+  printf '%s/%s\n' "$directory" "${source##*/}"
+}
+
+dot_trampoline=$(dot_trampoline_source) || {
+  printf 'dot: cannot resolve launcher source\n' >&2
+  exit 1
+}
+dot_checkout=$(cd -P -- "${dot_trampoline%/*}/.." && pwd -P) || {
+  printf 'dot: cannot resolve checkout root\n' >&2
+  exit 1
+}
+dot_resolver=$dot_checkout/support/checkout-bash-v1.sh
+[[ -f "$dot_resolver" && ! -L "$dot_resolver" ]] || {
+  printf 'dot: Bash resolver is missing: %s\n' "$dot_resolver" >&2
+  exit 1
+}
+
+# shellcheck disable=SC1090 # Resolved from the physical checkout at runtime.
+. "$dot_resolver"
+checkout_bash_v1_select dot "${DOT_BASH:-}" ||
+  exit 1
+checkout_bash_v1_bind "$dot_checkout/lib/dot/main.sh" ||
+  exit 1
+exec "$CHECKOUT_BASH_V1_INTERPRETER" "$CHECKOUT_BASH_V1_RUNTIME" "$@"

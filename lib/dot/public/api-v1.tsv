@@ -1,0 +1,9 @@
+# dot public shell API v1
+# name	arity	status	effects
+dot_ui_color_hex	1	0 success; 2 invalid syntax or arity	writes one validated #rrggbb value to stdout
+dot_ui_has_gum	0	0 available; 1 unavailable; 2 invalid arity	sets REPLY to the validated Gum executable on success
+dot_ui_hex_to_rgb	1	0 success; 2 invalid hex or arity	writes r;g;b decimal components to stdout
+dot_ui_summary_box	2+	selected renderer status; 2 invalid color or arity	writes a styled or plain summary box to stdout
+dot_ui_title	1+	selected renderer status; 2 invalid arity	writes a styled or plain title to stdout
+dot_xdg_home	1	0 success; 1 no absolute base; 2 invalid kind or arity	sets REPLY on success and clears it on entry
+dot_xdg_path	2	0 success; 1 no absolute base; 2 invalid kind, suffix, or arity	sets REPLY on success and clears it on entry

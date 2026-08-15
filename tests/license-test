@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+grep -Fqx 'MIT License' "$root/LICENSE"
+grep -Fq 'THE SOFTWARE IS PROVIDED "AS IS"' "$root/LICENSE"
+printf 'license-test: ok\n'

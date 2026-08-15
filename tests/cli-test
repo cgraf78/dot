@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+
+HOME=$DOT_TEST_TMP/home
+mkdir -p "$HOME"
+version=$(HOME="$HOME" DOT_BASH="$BASH" "$DOT_TEST_ROOT/bin/dot" --version)
+assert_contains 'dot 0.1.0-dev' "$version" 'version product identity'
+assert_contains 'config 1; extensions 1; library 1' "$version" \
+  'version interface inventory'
+help=$(HOME="$HOME" DOT_BASH="$BASH" "$DOT_TEST_ROOT/bin/dot" --help)
+assert_contains 'usage: dot <command>' "$help" 'help usage'
+assert_contains 'init' "$help" 'help initialization command'
+
+relative_version=$(
+  cd "$DOT_TEST_ROOT"
+  CDPATH=.:/tmp HOME="$HOME" DOT_BASH="$BASH" bin/dot --version
+)
+assert_contains 'dot 0.1.0-dev' "$relative_version" \
+  'relative launcher with inherited CDPATH'
+
+set +e
+nocase_output=$(HOME="$HOME" DOT_BASH="$BASH" \
+  bash -O nocasematch "$DOT_TEST_ROOT/lib/dot/main.sh" HELP 2>&1)
+nocase_status=$?
+set -e
+assert_eq 1 "$nocase_status" 'inherited nocasematch command status'
+assert_contains 'command is not available in this development build: HELP' \
+  "$nocase_output" 'case-sensitive command dispatch'
+
+printf 'cli-test: ok\n'

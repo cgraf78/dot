@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+
+[[ $(git hash-object "$DOT_TEST_ROOT/support/client-launcher.sh") == 153771e992e9259051e04678fb5c7acd0bc7001c ]] || fail 'client launcher v1 changed in place; update its migration fixture deliberately'
+
+install_home=$DOT_TEST_TMP/install
+runtime=$install_home/cgraf78/dot/bin/dot
+log=$DOT_TEST_TMP/launcher.log
+mkdir -p "${runtime%/*}"
+cat >"$runtime" <<'RUNTIME'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
+RUNTIME
+chmod 0755 "$runtime"
+DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  SHDEPS_INSTALL_DIR="$install_home/" \
+  "$DOT_TEST_ROOT/support/client-launcher.sh" first 'two words'
+assert_eq $'first\ntwo words' "$(cat "$log")" 'client launcher arguments'
+
+if SHDEPS_INSTALL_DIR=relative \
+  "$DOT_TEST_ROOT/support/client-launcher.sh" >/dev/null 2>&1; then
+  fail 'client launcher accepted a relative install root'
+fi
+
+printf 'client-launcher-test: ok\n'

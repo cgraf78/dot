@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "31 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@8ed24ec2f6955aa3bf1177ecab2e88ca19bd6f7d
+    with:
+      matrix-set: full
+      profiles: base,python
+      shellcheck-inventory-path: .github/shellcheck-files.txt
+      test-command: bash tests/run
+      termux-profiles: base,python
+
+  macos-bash32:
+    name: Stock macOS Bash 3.2 bootstrap
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify stock Bash cannot satisfy the runtime contract
+        shell: /bin/bash {0}
+        run: |-
+          set -euo pipefail
+          [[ ${BASH_VERSINFO[0]} -eq 3 && ${BASH_VERSINFO[1]} -eq 2 ]]
+
+          for script in \
+            install.sh \
+            bin/dot \
+            support/checkout-bash-v1.sh \
+            support/client-launcher.sh \
+            support/install-checkout.sh \
+            support/post-install.sh \
+            lib/dot/public/api-version.sh \
+            lib/dot/public/ui.sh \
+            lib/dot/public/xdg.sh; do
+            /bin/bash -n "$script"
+          done
+
+          state="$RUNNER_TEMP/stock-only-state"
+          set +e
+          output=$(XDG_STATE_HOME="$state" /bin/bash -c '
+            . "$1"
+            checkout_bash_v1_select dot /bin/bash
+          ' -- support/checkout-bash-v1.sh 2>&1)
+          status=$?
+          set -e
+          [[ $status -ne 0 ]]
+          [[ $output == *'explicit interpreter is not Bash 4 or newer'* ]]
+          [[ ! -e "$state" && ! -L "$state" ]]
+
+      - name: Provision a separate modern Bash candidate
+        shell: /bin/bash {0}
+        run: |-
+          set -euo pipefail
+          if modern_prefix=$(brew --prefix bash 2>/dev/null); then
+            :
+          else
+            brew install bash
+            modern_prefix=$(brew --prefix bash)
+          fi
+          modern_bash="$modern_prefix/bin/bash"
+          "$modern_bash" --noprofile --norc -c \
+            'test "${BASH_VERSINFO[0]}" -ge 4'
+          printf 'DOT_TEST_MODERN_BASH=%s\n' "$modern_bash" >>"$GITHUB_ENV"
+
+      - name: Pipe installer through stock Bash and run the trampoline
+        shell: /bin/bash {0}
+        run: |-
+          set -euo pipefail
+          [[ ${BASH_VERSINFO[0]} -eq 3 && ${BASH_VERSINFO[1]} -eq 2 ]]
+
+          origin="$RUNNER_TEMP/dot-origin.git"
+          git init --quiet --bare "$origin"
+          git -C "$origin" symbolic-ref HEAD refs/heads/main
+          git push --quiet "$origin" HEAD:refs/heads/main
+
+          prefix="$RUNNER_TEMP/dot-bash32"
+          managed="$RUNNER_TEMP/managed/cgraf78/dot"
+          state="$RUNNER_TEMP/runtime-state"
+          HOME="$RUNNER_TEMP/home" PREFIX="$prefix" XDG_STATE_HOME="$state" \
+            CGRAF78_CHECKOUT_INSTALL_BASH="$DOT_TEST_MODERN_BASH" \
+            CGRAF78_CHECKOUT_INSTALL_DIR="$managed" \
+            CGRAF78_CHECKOUT_INSTALL_REPO_URL="file://$origin" \
+            /bin/bash -s <install.sh
+          [[ -d "$managed/.git" ]]
+          [[ -L "$prefix/bin/dot" ]]
+          HOME="$RUNNER_TEMP/home" XDG_STATE_HOME="$state" \
+            /bin/bash "$prefix/bin/dot" --version
+
+  required:
+    name: Required
+    if: ${{ always() }}
+    needs: [shell, macos-bash32]
+    runs-on: ubuntu-24.04
+    env:
+      SHELL_RESULT: ${{ needs.shell.result }}
+      BASH32_RESULT: ${{ needs.macos-bash32.result }}
+    steps:
+      - name: Require all compatibility checks
+        shell: bash
+        run: |-
+          printf 'Shared shell CI: %s\n' "$SHELL_RESULT"
+          printf 'Stock macOS Bash 3.2: %s\n' "$BASH32_RESULT"
+          test "$SHELL_RESULT" = success
+          test "$BASH32_RESULT" = success
+
+  actions-sync:
+    name: cgraf78/actions sync
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@8ed24ec2f6955aa3bf1177ecab2e88ca19bd6f7d

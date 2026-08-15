@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+
+entry_count() {
+  find "$1" ! -path "$1" -prune -print | wc -l | tr -d ' '
+}
+
+HOME=$DOT_TEST_TMP/home
+PREFIX=$DOT_TEST_TMP/prefix
+HOME="$HOME" PREFIX="$PREFIX" "$DOT_TEST_ROOT/support/install-checkout.sh" \
+  >/dev/null
+[[ -L "$PREFIX/bin/dot" ]] || fail 'installer did not publish command link'
+[[ -L "$PREFIX/lib/dot" ]] || fail 'installer did not publish library link'
+assert_eq "$DOT_TEST_ROOT/bin/dot" "$(readlink "$PREFIX/bin/dot")" \
+  'command link target'
+assert_eq "$DOT_TEST_ROOT/lib/dot/public" "$(readlink "$PREFIX/lib/dot")" \
+  'library link target'
+
+# Reinstalling an already-correct pair is a true no-op and therefore must not
+# depend on allocating a capability-probe directory.
+HOME="$HOME" PREFIX="$PREFIX" TMPDIR="$DOT_TEST_TMP/missing/tmp" \
+  "$DOT_TEST_ROOT/support/install-checkout.sh" >/dev/null
+assert_eq "$DOT_TEST_ROOT/bin/dot" "$(readlink "$PREFIX/bin/dot")" \
+  'reinstalled command link target'
+assert_eq "$DOT_TEST_ROOT/lib/dot/public" "$(readlink "$PREFIX/lib/dot")" \
+  'reinstalled library link target'
+
+cdpath_prefix=$DOT_TEST_TMP/cdpath-prefix
+(
+  cd "$DOT_TEST_ROOT"
+  CDPATH=.:/tmp HOME="$HOME" PREFIX="$cdpath_prefix" \
+    support/install-checkout.sh >/dev/null
+)
+[[ -L "$cdpath_prefix/bin/dot" && -L "$cdpath_prefix/lib/dot" ]] ||
+  fail 'relative support installer inherited a corrupting CDPATH'
+
+# When the canonical Shdeps root selects this checkout (including through a
+# development symlink), installed links must retain that canonical spelling so
+# switching back to a managed directory does not require relinking the library.
+canonical_prefix=$DOT_TEST_TMP/canonical-prefix
+canonical_root=$DOT_TEST_TMP/canonical-root/cgraf78/dot
+mkdir -p "${canonical_root%/*}"
+ln -s "$DOT_TEST_ROOT" "$canonical_root"
+HOME="$HOME" PREFIX="$canonical_prefix" \
+  CGRAF78_CHECKOUT_INSTALL_DIR="$canonical_root" \
+  "$DOT_TEST_ROOT/support/install-checkout.sh" >/dev/null
+assert_eq "$canonical_root/bin/dot" \
+  "$(readlink "$canonical_prefix/bin/dot")" \
+  'canonical command link target'
+assert_eq "$canonical_root/lib/dot/public" \
+  "$(readlink "$canonical_prefix/lib/dot")" \
+  'canonical library link target'
+
+collision=$DOT_TEST_TMP/collision
+mkdir -p "$collision/bin" "$collision/lib"
+printf 'client command\n' >"$collision/bin/dot"
+chmod 0755 "$collision/bin/dot"
+if HOME="$HOME" PREFIX="$collision" \
+  "$DOT_TEST_ROOT/support/install-checkout.sh" >/dev/null 2>&1; then
+  fail 'installer replaced an unrelated regular command'
+fi
+assert_eq 'client command' "$(cat "$collision/bin/dot")" \
+  'unrelated command preservation'
+
+library_collision=$DOT_TEST_TMP/library-collision
+mkdir -p "$library_collision/lib/dot"
+printf 'client library\n' >"$library_collision/lib/dot/foreign"
+if HOME="$HOME" PREFIX="$library_collision" TMPDIR="$DOT_TEST_TMP/missing/tmp" \
+  "$DOT_TEST_ROOT/support/install-checkout.sh" >/dev/null 2>&1; then
+  fail 'installer replaced an unrelated library directory'
+fi
+assert_eq 'client library' "$(cat "$library_collision/lib/dot/foreign")" \
+  'unrelated library preservation'
+[[ ! -e "$library_collision/bin/dot" &&
+  ! -L "$library_collision/bin/dot" ]] ||
+  fail 'library preflight failure published the command'
+
+adapter=$DOT_TEST_TMP/adapter
+mkdir -p "$adapter/bin"
+cp "$DOT_TEST_ROOT/support/client-launcher.sh" "$adapter/bin/dot"
+chmod 0755 "$adapter/bin/dot"
+HOME="$HOME" PREFIX="$adapter" "$DOT_TEST_ROOT/support/install-checkout.sh" \
+  >/dev/null
+[[ -f "$adapter/bin/dot" && ! -L "$adapter/bin/dot" ]] ||
+  fail 'installer replaced the exact client adapter'
+[[ -L "$adapter/lib/dot" ]] ||
+  fail 'adapter install did not publish the public library'
+
+# Tool behavior, rather than uname, selects exact-destination flags. This
+# models macOS with Homebrew coreutils ahead of /bin and prevents a future
+# platform-name shortcut from choosing unsupported BSD flags for GNU tools.
+gnu_on_darwin_bin=$DOT_TEST_TMP/gnu-on-darwin-bin
+mkdir -p "$gnu_on_darwin_bin"
+cat >"$gnu_on_darwin_bin/uname" <<'UNAME'
+#!/usr/bin/env bash
+printf 'Darwin\n'
+UNAME
+chmod 0755 "$gnu_on_darwin_bin/uname"
+gnu_on_darwin=$DOT_TEST_TMP/gnu-on-darwin
+HOME="$HOME" PREFIX="$gnu_on_darwin" PATH="$gnu_on_darwin_bin:$PATH" \
+  "$DOT_TEST_ROOT/support/install-checkout.sh" >/dev/null
+[[ -L "$gnu_on_darwin/bin/dot" && -L "$gnu_on_darwin/lib/dot" ]] ||
+  fail 'GNU link tools were rejected under a Darwin uname'
+
+# The portable `mv -n` publication boundary must preserve a late non-symlink
+# winner. A wrapper creates the race at the real syscall boundary without a
+# test-only branch in production code.
+real_mv=$(type -P mv)
+fake_bin=$DOT_TEST_TMP/fake-bin
+mkdir -p "$fake_bin"
+cat >"$fake_bin/mv" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+target=
+for argument in "$@"; do
+  target=$argument
+done
+if [[ $target == */bin/dot && ! -e $target && ! -L $target ]]; then
+  case ${DOT_INSTALL_COLLISION:?} in
+    regular) printf 'late regular\n' >"$target" ;;
+    directory)
+      mkdir "$target"
+      printf 'foreign entry\n' >"$target/foreign"
+      ;;
+    symlink-directory)
+      external=${DOT_INSTALL_EXTERNAL:?}
+      mkdir "$external"
+      printf 'foreign entry\n' >"$external/foreign"
+      ln -s "${DOT_INSTALL_EXPECTED_SOURCE:?}" \
+        "$external/.dot.dot-install-stage-v1"
+      ln -s "$external" "$target"
+      ;;
+  esac
+fi
+exec "${DOT_REAL_MV:?}" "$@"
+WRAPPER
+chmod 0755 "$fake_bin/mv"
+
+for collision_kind in regular directory symlink-directory; do
+  raced=$DOT_TEST_TMP/raced-$collision_kind
+  external=$DOT_TEST_TMP/raced-$collision_kind-external
+  if HOME="$HOME" PREFIX="$raced" PATH="$fake_bin:$PATH" \
+    DOT_REAL_MV="$real_mv" DOT_INSTALL_COLLISION="$collision_kind" \
+    DOT_INSTALL_EXTERNAL="$external" \
+    DOT_INSTALL_EXPECTED_SOURCE="$DOT_TEST_ROOT/bin/dot" \
+    "$DOT_TEST_ROOT/support/install-checkout.sh" >/dev/null 2>&1; then
+    fail "installer accepted a late $collision_kind destination"
+  fi
+  if [[ $collision_kind == regular ]]; then
+    assert_eq 'late regular' "$(cat "$raced/bin/dot")" \
+      'late regular destination preservation'
+  elif [[ $collision_kind == directory ]]; then
+    assert_eq 'foreign entry' "$(cat "$raced/bin/dot/foreign")" \
+      'late directory contents'
+    assert_eq 1 "$(entry_count "$raced/bin/dot")" \
+      'late directory stage cleanup'
+  else
+    [[ -L "$raced/bin/dot" ]] ||
+      fail 'installer replaced a late symlink-to-directory'
+    assert_eq "$external" "$(readlink "$raced/bin/dot")" \
+      'late symlink-to-directory target'
+    assert_eq 'foreign entry' "$(cat "$external/foreign")" \
+      'external directory contents'
+    [[ -L "$external/.dot.dot-install-stage-v1" ]] ||
+      fail 'installer removed an external exact-looking stage'
+    assert_eq "$DOT_TEST_ROOT/bin/dot" \
+      "$(readlink "$external/.dot.dot-install-stage-v1")" \
+      'external exact-looking stage target'
+    assert_eq 2 "$(entry_count "$external")" \
+      'external directory stage preservation'
+  fi
+  [[ ! -e "$raced/bin/.dot.dot-install-stage-v1" &&
+    ! -L "$raced/bin/.dot.dot-install-stage-v1" ]] ||
+    fail "installer left a stage after $collision_kind collision"
+done
+
+# A kill after portable mv nested the deterministic stage is recoverable on
+# the next run. The foreign directory is preserved; only dot's exact stage is
+# retired before the collision is reported again.
+recovery=$DOT_TEST_TMP/recovery
+mkdir -p "$recovery/bin/dot"
+printf 'foreign entry\n' >"$recovery/bin/dot/foreign"
+ln -s "$DOT_TEST_ROOT/bin/dot" \
+  "$recovery/bin/dot/.dot.dot-install-stage-v1"
+if HOME="$HOME" PREFIX="$recovery" \
+  "$DOT_TEST_ROOT/support/install-checkout.sh" >/dev/null 2>&1; then
+  fail 'installer accepted a directory containing an interrupted stage'
+fi
+assert_eq 'foreign entry' "$(cat "$recovery/bin/dot/foreign")" \
+  'interrupted stage directory preservation'
+assert_eq 1 "$(entry_count "$recovery/bin/dot")" \
+  'interrupted nested stage cleanup'
+
+printf 'install-test: ok\n'

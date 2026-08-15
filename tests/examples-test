@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/public/xdg.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/config.sh"
+
+[[ -f "$DOT_TEST_ROOT/examples/minimal-dotfiles/home/.bashrc" ]] ||
+  fail 'minimal example is missing its one-file payload'
+HOME=$DOT_TEST_TMP/home
+mkdir -p "$HOME"
+dot_config_load \
+  "$DOT_TEST_ROOT/examples/extension-dotfiles/home/.config/dot/config"
+assert_eq "$HOME/.local/lib/dotfiles" "$DOT_EXTENSIONS_DIR" \
+  'extension example path'
+assert_eq none "$DOT_DEPENDENCY_PROVIDER" 'extension example provider'
+
+printf 'examples-test: ok\n'

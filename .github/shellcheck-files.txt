@@ -1,0 +1,23 @@
+# type<TAB>repository-relative path
+# `fixture` records are discovered but intentionally excluded from ShellCheck.
+program	bin/dot
+program	install.sh
+program	lib/dot/config.sh
+program	lib/dot/main.sh
+program	lib/dot/public/api-version.sh
+program	lib/dot/public/ui.sh
+program	lib/dot/public/xdg.sh
+program	scripts/checkout-installer.conf
+program	support/checkout-bash-v1.sh
+program	support/client-launcher.sh
+program	support/install-checkout.sh
+program	support/post-install.sh
+program	tests/cli-test
+program	tests/client-launcher-test
+program	tests/config-test
+program	tests/examples-test
+program	tests/install-test
+program	tests/library-test
+program	tests/lib/test.sh
+program	tests/license-test
+program	tests/run

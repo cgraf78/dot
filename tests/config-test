@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/public/xdg.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/config.sh"
+
+HOME=$DOT_TEST_TMP/home
+mkdir -p "$HOME"
+
+dot_config_load "$DOT_TEST_TMP/missing"
+assert_eq none "$DOT_DEPENDENCY_PROVIDER" 'missing config provider default'
+assert_eq '' "$DOT_EXTENSIONS_DIR" 'missing config extension default'
+
+config=$DOT_TEST_TMP/config
+# shellcheck disable=SC2016 # The config parser, not this test shell, expands it.
+printf '%s\n' \
+  'version=1' \
+  'extension_api=1' \
+  'extensions_dir=${HOME}/.local/lib/dotfiles' \
+  'dependency_provider=shdeps' >"$config"
+dot_config_load "$config"
+assert_eq "$HOME/.local/lib/dotfiles" "$DOT_EXTENSIONS_DIR" \
+  'HOME expansion'
+assert_eq shdeps "$DOT_DEPENDENCY_PROVIDER" 'provider selection'
+
+saved_home=$HOME
+unset HOME
+if dot_config_load "$config" >/dev/null 2>&1; then
+  fail 'expanded a HOME-based path without HOME'
+fi
+HOME=/
+# shellcheck disable=SC2016 # The config parser expands this literal token.
+printf '%s\n' \
+  'version=1' \
+  'extension_api=1' \
+  'extensions_dir=$HOME/extensions' >"$config"
+dot_config_load "$config"
+assert_eq /extensions "$DOT_EXTENSIONS_DIR" 'root HOME expansion'
+HOME=$saved_home
+
+for invalid in \
+  'dependency_provider=none' \
+  $'version=1\nunknown=value' \
+  $'version=1\nversion=1' \
+  $'version=1\nextensions_dir=relative' \
+  $'version=1\nextensions_dir=/tmp/extensions' \
+  $'version=1\nextensions_dir=$PATH' \
+  $'version=1\nextension_api=1\nextensions_dir=$HOME/path/$PATH' \
+  $'version=1\nextension_api=1\nextensions_dir=~/path/~other'; do
+  printf '%s\n' "$invalid" >"$config"
+  if dot_config_load "$config" >/dev/null 2>&1; then
+    fail "accepted invalid config: $invalid"
+  fi
+done
+
+printf 'version=1\0dependency_provider=none\n' >"$config"
+if dot_config_load "$config" >/dev/null 2>&1; then
+  fail 'accepted a config containing NUL'
+fi
+
+config_target=$DOT_TEST_TMP/config-target
+printf 'version=1\n' >"$config_target"
+rm "$config"
+
+dd if=/dev/zero of="$config" bs=65537 count=1 2>/dev/null
+if dot_config_load "$config" >/dev/null 2>&1; then
+  fail 'accepted an oversized config'
+fi
+rm "$config"
+ln -s "$config_target" "$config"
+if dot_config_load "$config" >/dev/null 2>&1; then
+  fail 'accepted a symlinked config'
+fi
+rm "$config"
+
+# shellcheck disable=SC2034 # Read dynamically by dot_xdg_home.
+XDG_CONFIG_HOME=relative
+dot_xdg_home config
+assert_eq "$HOME/.config" "$REPLY" 'relative XDG fallback'
+
+printf 'config-test: ok\n'

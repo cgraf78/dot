@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+# shellcheck disable=SC1091 # Public files come from the repository under test.
+. "$DOT_TEST_ROOT/lib/dot/public/api-version.sh"
+# shellcheck disable=SC1091
+. "$DOT_TEST_ROOT/lib/dot/public/xdg.sh"
+# shellcheck disable=SC1091
+. "$DOT_TEST_ROOT/lib/dot/public/ui.sh"
+
+assert_eq 1 "$DOT_LIBRARY_API" 'public API version'
+
+inventory=$DOT_TEST_ROOT/lib/dot/public/api-v1.tsv
+actual=$DOT_TEST_TMP/actual-functions
+expected=$DOT_TEST_TMP/expected-functions
+docs=$DOT_TEST_ROOT/docs/library.md
+awk -F '\t' '!/^#/ && NF { print $1 }' "$inventory" | LC_ALL=C sort >"$expected"
+declare -F | awk '{ print $3 }' | awk '/^dot_/' | LC_ALL=C sort >"$actual"
+cmp -s "$expected" "$actual" || fail 'public function inventory drifted'
+while IFS=$'\t' read -r name arity status effects extra; do
+  [[ $name == \#* || -z $name ]] && continue
+  [[ -n $arity && -n $status && -n $effects && -z ${extra:-} ]] ||
+    fail "malformed public API inventory row: $name"
+  grep -Fq -- "$name" "$docs" || fail "public API is undocumented: $name"
+done <"$inventory"
+
+variable_inventory=$DOT_TEST_ROOT/lib/dot/public/variables-v1.tsv
+inventory_variables=$DOT_TEST_TMP/inventory-variables
+referenced_variables=$DOT_TEST_TMP/referenced-variables
+awk -F '\t' '!/^#/ && NF { print $1 }' "$variable_inventory" |
+  LC_ALL=C sort >"$inventory_variables"
+{
+  # DOT_LIBRARY_API is assigned rather than expanded, while PATH is consumed
+  # implicitly by `type -P`. Every other public global must appear as a shell
+  # expansion and is derived directly from the public source.
+  printf '%s\n' DOT_LIBRARY_API PATH
+  grep -Eho '\$\{?[A-Z][A-Z0-9_]*' \
+    "$DOT_TEST_ROOT/lib/dot/public/api-version.sh" \
+    "$DOT_TEST_ROOT/lib/dot/public/xdg.sh" \
+    "$DOT_TEST_ROOT/lib/dot/public/ui.sh" |
+    sed -E 's/^\$\{?//'
+} | LC_ALL=C sort -u >"$referenced_variables"
+cmp -s "$inventory_variables" "$referenced_variables" ||
+  fail 'public variable inventory drifted'
+while IFS=$'\t' read -r name kind direction contract extra; do
+  [[ $name == \#* || -z $name ]] && continue
+  [[ -n $kind && -n $direction && -n $contract && -z ${extra:-} ]] ||
+    fail "malformed public variable inventory row: $name"
+  grep -Fq -- "\`$name\`" "$docs" ||
+    fail "public variable is undocumented: $name"
+done <"$variable_inventory"
+
+HOME=/ dot_xdg_home config
+assert_eq /.config "$REPLY" 'root HOME XDG join'
+test_home=$DOT_TEST_TMP/home
+HOME=$test_home dot_xdg_path state dot/runtime
+assert_eq "$test_home/.local/state/dot/runtime" "$REPLY" 'XDG path join'
+
+assert_status_2() {
+  local status
+
+  set +e
+  (
+    set -u
+    "$@"
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  assert_eq 2 "$status" "public API validation: $*"
+}
+
+assert_status_2 dot_xdg_home
+assert_status_2 dot_xdg_path state ../escape
+assert_status_2 dot_ui_color_hex invalid
+assert_status_2 dot_ui_hex_to_rgb '#12345'
+assert_status_2 dot_ui_has_gum extra
+assert_status_2 dot_ui_title
+assert_status_2 dot_ui_summary_box green
+
+REPLY=sentinel
+set +e
+dot_ui_has_gum extra >/dev/null 2>&1
+gum_misuse_status=$?
+set -e
+assert_eq 2 "$gum_misuse_status" 'Gum misuse status'
+assert_eq '' "$REPLY" 'Gum misuse clears REPLY'
+
+assert_eq '#3fb950' "$(dot_ui_color_hex green)" 'named color mapping'
+assert_eq '#A0b1C2' "$(dot_ui_color_hex '#A0b1C2')" 'literal color validation'
+assert_eq '160;177;194' "$(dot_ui_hex_to_rgb '#A0b1C2')" 'RGB conversion'
+
+shopt -s nocasematch
+assert_status_2 dot_xdg_home CONFIG
+assert_status_2 dot_ui_color_hex GREEN
+shopt -u nocasematch
+
+no_gum_path=$DOT_TEST_TMP/no-gum
+mkdir -p "$no_gum_path"
+title_output=$(IFS=: NO_COLOR=1 PATH="$no_gum_path" dot_ui_title one two)
+assert_eq $'\none two' "$title_output" 'title argument joining'
+summary_output=$(IFS=: NO_COLOR=1 PATH="$no_gum_path" \
+  dot_ui_summary_box green one two)
+assert_eq $'════════════════════════════════\none two\n════════════════════════════════' \
+  "$summary_output" 'summary argument joining'
+
+fake_bin=$DOT_TEST_TMP/fake-bin
+mkdir -p "$fake_bin"
+cat >"$fake_bin/gum" <<'GUM'
+#!/usr/bin/env bash
+if [[ ${1:-} == style && ${2:-} == --help ]]; then
+  exit 0
+fi
+printf 'fake gum\n'
+GUM
+chmod 0755 "$fake_bin/gum"
+REPLY=sentinel
+PATH="$fake_bin:$PATH" dot_ui_title one two >/dev/null
+assert_eq sentinel "$REPLY" 'title REPLY preservation'
+PATH="$fake_bin:$PATH" dot_ui_summary_box green one two >/dev/null
+assert_eq sentinel "$REPLY" 'summary REPLY preservation'
+# shellcheck disable=SC2119 # The public availability probe intentionally has no args.
+PATH="$fake_bin:$PATH" dot_ui_has_gum
+assert_eq "$fake_bin/gum" "$REPLY" 'Gum availability result'
+
+# Some UTF-8 locale collation tables let a fullwidth digit match `[0-9]`.
+# Public syntax is ASCII regardless of the caller's locale, so exercise that
+# hostile spelling whenever the host provides the locale that exposes it.
+utf8_locale=$(locale -a 2>/dev/null |
+  awk 'tolower($0) ~ /^en_us.*utf/ { print; exit }')
+if [[ -n $utf8_locale ]]; then
+  set +e
+  unicode_output=$(LC_ALL=$utf8_locale dot_ui_color_hex '#Ａ00000')
+  unicode_status=$?
+  set -e
+  assert_eq 2 "$unicode_status" 'locale-independent color syntax'
+  assert_eq '' "$unicode_output" 'invalid Unicode color output'
+fi
+
+printf 'library-test: ok\n'

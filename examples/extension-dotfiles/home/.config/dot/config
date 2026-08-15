@@ -1,0 +1,4 @@
+version=1
+extension_api=1
+extensions_dir=$HOME/.local/lib/dotfiles
+dependency_provider=none

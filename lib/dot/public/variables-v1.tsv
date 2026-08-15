@@ -1,0 +1,11 @@
+# dot public shell variables v1
+# name	kind	direction	contract
+DOT_LIBRARY_API	shell variable	output	set and exported to the integer 1 when api-version.sh is sourced
+HOME	environment	input	absolute fallback root used only when the selected XDG base is empty or relative
+NO_COLOR	environment	input	nonempty disables ANSI styling in the plain terminal renderer
+PATH	environment	input	search path used only to discover the optional Gum executable
+REPLY	shell variable	output	cleared on XDG and Gum-availability entry, then set to a resolved path or validated Gum executable on success
+XDG_CACHE_HOME	environment	input	absolute cache base; empty or relative values fall back through HOME
+XDG_CONFIG_HOME	environment	input	absolute configuration base; empty or relative values fall back through HOME
+XDG_DATA_HOME	environment	input	absolute data base; empty or relative values fall back through HOME
+XDG_STATE_HOME	environment	input	absolute state base; empty or relative values fall back through HOME
