@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+
+HOME=$DOT_TEST_TMP/home
+DOT_SOURCE_ROOT=$root
+DOT_EXTENSIONS_DIR=$HOME/extensions
+mkdir -p "$HOME" "$DOT_EXTENSIONS_DIR" "$DOT_TEST_TMP/bin"
+export HOME DOT_SOURCE_ROOT DOT_EXTENSIONS_DIR
+# shellcheck source=../lib/dot/public/xdg.sh
+. "$root/lib/dot/public/xdg.sh"
+# shellcheck source=../lib/dot/temp.sh
+. "$root/lib/dot/temp.sh"
+# shellcheck source=../lib/dot/families.sh
+. "$root/lib/dot/families.sh"
+# shellcheck source=../lib/dot/merge-block.sh
+. "$root/lib/dot/merge-block.sh"
+# shellcheck source=../lib/dot/merge-hooks.sh
+. "$root/lib/dot/merge-hooks.sh"
+# shellcheck source=../lib/dot/hook-api.sh
+. "$root/lib/dot/hook-api.sh"
+
+literal_dollar='$'
+literal_tilde='~'
+assert_eq "$HOME/example" "$(dot_expand_home "${literal_dollar}HOME/example")" \
+  'hook API expands HOME placeholder'
+assert_eq "$HOME/example" "$(dot_expand_home "$literal_tilde/example")" \
+  'hook API expands tilde placeholder'
+
+family_root=$(dot_hook_family fixture)
+mkdir -p "$family_root"
+printf 'one\n' >"$family_root/10-one.txt"
+assert_eq "$family_root/10-one.txt" "$(dot_hook_family_files fixture)" \
+  'hook family API enumerates a configured family'
+assert_eq "$family_root/10-one.txt" \
+  "$(dot_hook_family_files_matching fixture '*.txt')" \
+  'hook family API filters a configured family'
+assert_eq '10-one.txt' \
+  "$(dot_hook_family_relpath fixture "$family_root/10-one.txt")" \
+  'hook family API returns a family-relative path'
+assert_eq '10-one.txt' \
+  "$(dot_hook_family_marker_name fixture "$family_root/10-one.txt")" \
+  'hook family API returns a marker-safe identity'
+
+text_target=$HOME/generated/config
+mkdir -p "${text_target%/*}"
+dot_write_text_if_changed "$text_target" $'alpha\nbeta'
+assert_eq $'alpha\nbeta' "$(<"$text_target")" 'text helper writes exact content'
+inode_before=$(stat -c '%i' "$text_target" 2>/dev/null || stat -f '%i' "$text_target")
+dot_write_text_if_changed "$text_target" $'alpha\nbeta'
+inode_after=$(stat -c '%i' "$text_target" 2>/dev/null || stat -f '%i' "$text_target")
+assert_eq "$inode_before" "$inode_after" 'unchanged text helper preserves inode'
+
+directory_target=$HOME/generated/directory
+mkdir "$directory_target"
+set +e
+dot_write_text_if_changed "$directory_target" unsafe >/dev/null 2>&1
+directory_status=$?
+set -e
+assert_eq 1 "$directory_status" 'text helper refuses directory destination'
+assert_eq '' "$(find "$directory_target" -mindepth 1 -maxdepth 1 -print -quit)" \
+  'text helper never nests staged output in a directory'
+
+cat >"$DOT_TEST_TMP/bin/jq" <<'JQ'
+#!/usr/bin/env python3
+import json
+import sys
+
+args = sys.argv[1:]
+if args and args[0] == "empty":
+    with open(args[1], encoding="utf-8") as source:
+        json.load(source)
+    raise SystemExit(0)
+if "--slurpfile" in args:
+    source = args[args.index("s") + 1]
+    destination = args[args.index("d") + 1]
+    with open(destination, encoding="utf-8") as stream:
+        merged = json.load(stream)
+    with open(source, encoding="utf-8") as stream:
+        merged.update(json.load(stream))
+else:
+    source = args[-1]
+    with open(source, encoding="utf-8") as stream:
+        merged = json.load(stream)
+json.dump(merged, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+JQ
+chmod 0755 "$DOT_TEST_TMP/bin/jq"
+PATH=$DOT_TEST_TMP/bin:$PATH
+export PATH
+json_source=$HOME/source.json
+json_target=$HOME/generated.json
+printf '{"alpha":1}\n' >"$json_source"
+json_filter="\$d[0] * \$s[0]"
+dot_json_layer fixture "$json_source" "$json_target" "$json_filter"
+assert_contains '"alpha": 1' "$(<"$json_target")" 'JSON helper copies first layer'
+printf '{"beta":2}\n' >"$json_source"
+dot_json_layer fixture "$json_source" "$json_target" "$json_filter"
+json_content=$(<"$json_target")
+assert_contains '"alpha": 1' "$json_content" 'JSON helper retains destination keys'
+assert_contains '"beta": 2' "$json_content" 'JSON helper overlays source keys'
+
+managed_target=$HOME/managed.conf
+managed_block=$(dot_managed_block_build '# dot:test' source.conf body)
+dot_managed_block_merge "$managed_target" "$managed_block"
+assert_contains '# dot:test begin' "$(<"$managed_target")" \
+  'managed-block API publishes an exact block'
+managed_family_block=$(dot_managed_block_build '# dot:family:new' source.conf newer)
+dot_managed_block_merge_family "$managed_target" '# dot:' "$managed_family_block"
+managed_content=$(<"$managed_target")
+[[ $managed_content != *'# dot:test begin'* ]] ||
+  fail 'managed-block family API did not retire stale blocks'
+assert_contains '# dot:family:new begin' "$managed_content" \
+  'managed-block family API publishes replacement blocks'
+stripped_family=$(dot_managed_block_strip_family '# dot:family:' "$managed_content")
+[[ $stripped_family != *'# dot:family:new begin'* ]] ||
+  fail 'managed-block family strip retained a matching block'
+
+printf 'hook-api-test: ok\n'

@@ -12,12 +12,22 @@ but its repository identity and tracked executable surfaces are revalidated.
 `install.sh --managed` bypasses and never executes that development target.
 
 Client configuration is parsed as data. Extension discovery is versioned and
-the current parser rejects unsafe file types, control bytes, unknown grammar,
-and unbounded input before any provider or extension can execute.
+rejects unsafe roots, path components, file types, ownership, modes, duplicate
+identities, control bytes, unknown grammar, and unbounded input before a fresh
+worker Bash sources client code. Hook and doctor workers receive only their
+documented API and private temporary storage; cancellation owns their process
+groups and descendants.
 
-The remaining extension ownership checks, reserved-control-plane preflight,
-and resumable initialization transaction are implementation gates for the next
-extraction groups. Until those gates land, this local skeleton does not claim
-those protections. The finished transaction design will cover tested SIGKILL
-boundaries but will not claim power-loss durability without filesystem
-`fsync`, or safety against a hostile process with the same user credentials.
+Before initialization, repository integration, or overlay publication, dot
+inspects the complete candidate inventory against its dynamic control-plane
+paths. The check covers lexical and physical containment, including a
+symlinked parent into dot or provider state. Publication revalidates the
+physical parent generation. The only public-command exception is the exact
+tracked executable `support/client-launcher.sh` for this release.
+
+Initialization and overlay replacement use private, generation-bound recovery
+records. Rollback removes or restores only the exact leaf, parent, staged, and
+backup generations recorded before mutation. Tests materialize and recover
+the durable process-crash phases. These guarantees do not claim power-loss
+durability without filesystem `fsync`, or safety against a hostile process
+running concurrently with the same user credentials.

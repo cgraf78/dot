@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+# shellcheck source=../lib/dot/temp.sh
+. "$root/lib/dot/temp.sh"
+# shellcheck source=../lib/dot/merge-block.sh
+. "$root/lib/dot/merge-block.sh"
+
+dot_body=$'  generated\n# vim: set ft=conf\n# -*- mode: conf -*-\n'
+block=$(_mb_build '# dot-managed:example' '/source/example' "$dot_body")
+assert_contains '# dot-managed:example begin' "$block" 'managed block begin marker'
+assert_contains '# source: /source/example' "$block" 'managed block source marker'
+assert_contains generated "$block" 'managed block body'
+[[ $block != *'vim:'* && $block != *'-*- '* ]] ||
+  fail 'managed block retained editor modelines'
+
+destination=$DOT_TEST_TMP/config/output
+mkdir -p "${destination%/*}"
+cat >"$destination" <<'EOF'
+manual first
+
+# dot-managed:family:old begin
+# DO NOT EDIT: changes will be overwritten by dot update
+# source: /source/old
+old generated
+# dot-managed:family:old end
+
+manual last
+EOF
+first=$(_mb_build '# dot-managed:family:new' '/source/new' 'new generated')
+second=$(_mb_build '# dot-managed:family:second' '/source/second' 'second generated')
+_mb_merge_family "$destination" '# dot-managed:family:' "$first" "$second"
+content=$(<"$destination")
+assert_contains 'manual first' "$content" 'family merge preserves leading manual content'
+assert_contains 'manual last' "$content" 'family merge preserves trailing manual content'
+[[ $content != *'old generated'* ]] || fail 'family merge retained stale generated block'
+assert_contains 'new generated' "$content" 'family merge publishes replacement block'
+assert_contains 'second generated' "$content" 'family merge publishes every current block'
+mode=$(stat -c '%a' "$destination" 2>/dev/null || stat -f '%Lp' "$destination")
+assert_eq 600 "$mode" 'managed output is private'
+
+inode_before=$(stat -c '%i' "$destination" 2>/dev/null || stat -f '%i' "$destination")
+_mb_merge_family "$destination" '# dot-managed:family:' "$first" "$second"
+inode_after=$(stat -c '%i' "$destination" 2>/dev/null || stat -f '%i' "$destination")
+assert_eq "$inode_before" "$inode_after" 'unchanged managed output keeps its inode'
+
+foreign_dir=$DOT_TEST_TMP/foreign-directory
+mkdir "$foreign_dir"
+set +e
+_mb_merge "$foreign_dir" "$first" >/dev/null 2>&1
+foreign_status=$?
+set -e
+assert_eq 1 "$foreign_status" 'managed block refuses a directory destination'
+entries=$(find "$foreign_dir" -mindepth 1 -maxdepth 1 -print -quit)
+assert_eq '' "$entries" 'managed block does not nest a staged file in a directory'
+
+printf 'merge-block-test: ok\n'

@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+
+HOME=$DOT_TEST_TMP/home
+mkdir -p "$HOME"
+DOT_SOURCE_ROOT=$root
+export HOME DOT_SOURCE_ROOT
+# shellcheck source=/dev/null
+. "$root/lib/dot/public/api-version.sh"
+# shellcheck source=/dev/null
+. "$root/lib/dot/public/xdg.sh"
+# shellcheck source=/dev/null
+. "$root/lib/dot/public/ui.sh"
+# shellcheck source=/dev/null
+. "$root/lib/dot/config.sh"
+dot_config_load
+# shellcheck source=/dev/null
+. "$root/lib/dot/runtime.sh"
+
+inventory_functions() {
+  awk -F '\t' '!/^#/ && NF {print $1}' "$1" | LC_ALL=C sort
+}
+
+source_functions() {
+  awk '/^dot_[a-z0-9_]+\(\)[[:space:]]*\{/ {
+    name=$1; sub(/\(\)$/, "", name); print name
+  }' "$@" | LC_ALL=C sort -u
+}
+
+hook_expected=$(inventory_functions "$root/lib/dot/hook-api-v1.tsv")
+hook_actual=$(
+  {
+    source_functions "$root/lib/dot/hook-api.sh" "$root/lib/dot/families.sh"
+    printf '%s\n' dot_xdg_path
+  } | LC_ALL=C sort -u
+)
+assert_eq "$hook_expected" "$hook_actual" 'hook API inventory matches source'
+
+doctor_expected=$(inventory_functions "$root/lib/dot/doctor-api-v1.tsv")
+doctor_actual=$(source_functions "$root/lib/dot/doctor-api.sh")
+assert_eq "$doctor_expected" "$doctor_actual" 'doctor API inventory matches source'
+
+while IFS= read -r function_name; do
+  declare -F "$function_name" >/dev/null ||
+    fail "hook API function is not loaded: $function_name"
+done <<<"$hook_expected"
+while IFS= read -r function_name; do
+  declare -F "$function_name" >/dev/null ||
+    fail "doctor API function is not loaded: $function_name"
+done <<<"$doctor_expected"
+
+set +e
+(dot_family_files) >/dev/null 2>&1
+family_files_missing_status=$?
+dot_family_files "$HOME" unexpected >/dev/null 2>&1
+family_files_extra_status=$?
+(dot_family_files_matching) >/dev/null 2>&1
+family_matching_missing_status=$?
+set -e
+assert_eq 2 "$family_files_missing_status" \
+  'dot_family_files rejects a missing directory argument'
+assert_eq 2 "$family_files_extra_status" \
+  'dot_family_files rejects extra arguments'
+assert_eq 2 "$family_matching_missing_status" \
+  'dot_family_files_matching rejects a missing directory argument'
+
+trust_root=$HOME/extensions-trust
+mkdir -p "$trust_root/merge-hooks.d" "$HOME/support-real"
+chmod 0755 "$trust_root" "$trust_root/merge-hooks.d" "$HOME/support-real"
+printf '%s\n' 'support_value=unsafe' >"$HOME/support-real/helper.sh"
+chmod 0644 "$HOME/support-real/helper.sh"
+ln -s "$HOME/support-real" "$trust_root/merge-hooks.d/lib"
+DOT_EXTENSION_API=1
+DOT_EXTENSIONS_DIR=$trust_root
+export DOT_EXTENSION_API DOT_EXTENSIONS_DIR
+if dot_hook_source merge-hooks.d/lib/helper.sh; then
+  fail 'dot_hook_source followed a symlinked support-directory component'
+fi
+printf '%s\n' 'return 7' >"$trust_root/merge-hooks.d/return-seven.sh"
+chmod 0644 "$trust_root/merge-hooks.d/return-seven.sh"
+set +e
+dot_hook_source merge-hooks.d/return-seven.sh
+hook_source_failure_status=$?
+set -e
+assert_eq 1 "$hook_source_failure_status" \
+  'dot_hook_source normalizes a support-module failure'
+
+active_overlay=$HOME/.dotfiles-example
+active_origin=$HOME/example-origin.git
+extension_rel=extensions-trust/merge-hooks.d/10-linked.sh
+extension_link=$HOME/$extension_rel
+mkdir -p "$active_overlay/home/${extension_rel%/*}" "$active_origin"
+git init -q --bare "$active_origin"
+git init -q "$active_overlay"
+git -C "$active_overlay" remote add origin "$active_origin"
+cat >"$active_overlay/home/$extension_rel" <<'HOOK'
+merge() {
+  family=$(dot_hook_family example) || return 1
+  [[ $family == "$HOME/.config/dot/merge-hooks.d/example" ]] || return 1
+  dot_tool_present git
+}
+HOOK
+chmod 0644 "$active_overlay/home/$extension_rel"
+rm -f "$extension_link"
+_overlay_link_target "$extension_rel" example
+active_target=$REPLY
+ln -s "$active_target" "$extension_link"
+mkdir -p "${DOT_OVERLAY_MANIFEST%/*}"
+printf '%s\t%s\t%s\n' "$extension_rel" example "$active_target" \
+  >"$DOT_OVERLAY_MANIFEST"
+chmod 0600 "$DOT_OVERLAY_MANIFEST"
+# shellcheck disable=SC2034 # Consumed dynamically by the sourced validator.
+OVERLAYS=("example|$active_overlay|$active_origin|fixture|false|git")
+_dot_extension_file_validate "$extension_link" ||
+  fail 'active owned overlay implementation symlink was rejected'
+
+mkdir -p "$HOME/.config/dot/overlays.d" "$HOME/overlay-worker"
+chmod 0700 "$HOME/overlay-worker"
+printf 'url=%s\n' "$active_origin" \
+  >"$HOME/.config/dot/overlays.d/10-example.conf"
+chmod 0644 "$HOME/.config/dot/overlays.d/10-example.conf"
+_dot_extension_worker_run merge "$extension_link" "$HOME/overlay-worker" \
+  "$HOME/overlay-worker-result" ||
+  fail 'fresh worker rejected an active overlay implementation symlink'
+assert_eq 1 "$(<"$HOME/overlay-worker-result")" \
+  'fresh worker records an active overlay merge entry point'
+
+chmod 0775 "$active_overlay/home/${extension_rel%/*}"
+if _dot_extension_file_validate "$extension_link"; then
+  fail 'group-writable overlay implementation parent was trusted'
+fi
+chmod 0755 "$active_overlay/home/${extension_rel%/*}"
+
+OVERLAYS=()
+if _dot_extension_file_validate "$extension_link"; then
+  fail 'stale overlay manifest authorized an inactive implementation symlink'
+fi
+
+outside=$HOME/outside-extension.sh
+printf '%s\n' 'merge() { :; }' >"$outside"
+chmod 0644 "$outside"
+rm -f "$extension_link"
+ln -s "$outside" "$extension_link"
+printf '%s\t%s\t%s\n' "$extension_rel" example "$outside" \
+  >"$DOT_OVERLAY_MANIFEST"
+# shellcheck disable=SC2034 # Consumed dynamically by the sourced validator.
+OVERLAYS=("example|$active_overlay|$active_origin|fixture|false|git")
+if _dot_extension_file_validate "$extension_link"; then
+  fail 'overlay manifest authorized an implementation outside its checkout'
+fi
+
+mkdir -p "$trust_root/doctor.d/lib" "$HOME/doctor-worker" "$HOME/fake-bin"
+chmod 0755 "$trust_root/doctor.d"
+chmod 0755 "$trust_root/doctor.d/lib"
+chmod 0700 "$HOME/doctor-worker"
+cat >"$trust_root/doctor.d/lib/checks.sh" <<'SUPPORT'
+client_doctor_check() {
+  dot_doctor_ok 'doctor support loaded'
+}
+SUPPORT
+chmod 0644 "$trust_root/doctor.d/lib/checks.sh"
+cat >"$trust_root/doctor.d/10-worker.sh" <<'DOCTOR'
+[[ $# -eq 0 ]] || return 1
+doctor() {
+  dot_doctor_source doctor.d/lib/checks.sh || return 1
+  declare -F client_doctor_check >/dev/null || return 1
+  [[ ${DOT_TEST_INHERITED_VARIABLE:-} == present ]] || return 1
+  ! declare -F dot_test_inherited_function >/dev/null || return 1
+  ! declare -F _base_git >/dev/null || return 1
+  ! declare -F _link_overlays >/dev/null || return 1
+  ! declare -F _run_merges >/dev/null || return 1
+  ! shopt -q extglob || return 1
+  [[ $PWD == "$HOME" ]] || return 1
+  [[ -d $TMPDIR && -O $TMPDIR ]] || return 1
+  mode=$(stat -c '%a' "$TMPDIR" 2>/dev/null || stat -f '%Lp' "$TMPDIR") ||
+    return 1
+  (((8#$mode & 077) == 0)) || return 1
+  [[ -z $(trap -p) ]] || return 1
+  ! IFS= read -r _ || return 1
+  display=$(dot_doctor_display_path "$HOME/example") || return 1
+  [[ $display == '~/example' ]] || return 1
+  client_doctor_check
+  dot_doctor_ok 'isolated worker' "$display"
+}
+DOCTOR
+chmod 0644 "$trust_root/doctor.d/10-worker.sh"
+cat >"$HOME/fake-bin/bash" <<'FAKE'
+#!/bin/sh
+exit 99
+FAKE
+chmod 0755 "$HOME/fake-bin/bash"
+cat >"$HOME/worker-bash-env" <<'BASH_ENV_FILE'
+printf '%s\n' sourced >"$HOME/worker-bash-env-ran"
+BASH_ENV_FILE
+: >"$HOME/doctor-results"
+chmod 0600 "$HOME/doctor-results"
+dot_test_inherited_function() { :; }
+export -f dot_test_inherited_function
+export DOT_TEST_INHERITED_VARIABLE=present
+export BASH_ENV=$HOME/worker-bash-env
+shopt -s extglob
+export BASHOPTS
+PATH="$HOME/fake-bin:$PATH" _dot_extension_worker_run doctor \
+  "$trust_root/doctor.d/10-worker.sh" "$HOME/doctor-worker" \
+  "$HOME/doctor-results" || fail 'isolated doctor worker failed'
+shopt -u extglob
+unset BASH_ENV DOT_TEST_INHERITED_VARIABLE
+export -n -f dot_test_inherited_function
+[[ ! -e $HOME/worker-bash-env-ran ]] ||
+  fail 'doctor worker sourced inherited BASH_ENV'
+doctor_results=$(<"$HOME/doctor-results")
+assert_contains $'ok\tdoctor support loaded\t' "$doctor_results" \
+  'doctor worker sourced validated client support'
+assert_contains $'ok\tisolated worker\t~/example' "$doctor_results" \
+  'doctor worker published the expected result record'
+
+mkdir "$HOME/public-worker"
+chmod 0755 "$HOME/public-worker"
+cat >"$trust_root/doctor.d/20-public-temp.sh" <<'DOCTOR'
+doctor() {
+  : >"$HOME/public-worker-ran"
+  dot_doctor_ok 'public worker ran'
+}
+DOCTOR
+chmod 0644 "$trust_root/doctor.d/20-public-temp.sh"
+if _dot_extension_worker_run doctor \
+  "$trust_root/doctor.d/20-public-temp.sh" "$HOME/public-worker" \
+  "$HOME/doctor-results"; then
+  fail 'doctor worker accepted non-private temporary storage'
+fi
+[[ ! -e $HOME/public-worker-ran ]] ||
+  fail 'doctor extension ran with non-private temporary storage'
+
+mkdir "$HOME/cancellable-worker"
+chmod 0700 "$HOME/cancellable-worker"
+cat >"$trust_root/doctor.d/30-cancellable.sh" <<'DOCTOR'
+doctor() {
+  printf '%s\n' "$BASHPID" >"$HOME/cancellable-worker-pid"
+  while :; do :; done
+}
+DOCTOR
+chmod 0644 "$trust_root/doctor.d/30-cancellable.sh"
+_dot_extension_worker_exec doctor \
+  "$trust_root/doctor.d/30-cancellable.sh" "$HOME/cancellable-worker" \
+  "$HOME/doctor-results" &
+cancellable_pid=$!
+worker_deadline=$((SECONDS + 5))
+while ((SECONDS < worker_deadline)); do
+  [[ -s $HOME/cancellable-worker-pid ]] && break
+  kill -0 "$cancellable_pid" 2>/dev/null || break
+  sleep 0.01
+done
+[[ -s $HOME/cancellable-worker-pid ]] || {
+  kill -TERM "$cancellable_pid" 2>/dev/null || true
+  wait "$cancellable_pid" 2>/dev/null || true
+  fail 'cancellable doctor worker did not publish its process identity'
+}
+assert_eq "$cancellable_pid" "$(<"$HOME/cancellable-worker-pid")" \
+  'registered worker pid is the fresh Bash process'
+kill -TERM "$cancellable_pid"
+set +e
+wait "$cancellable_pid"
+cancellable_status=$?
+set -e
+assert_eq 143 "$cancellable_status" 'fresh Bash worker preserves TERM status'
+
+assert_contains hook-api-v1.tsv "$(<"$root/docs/extensions.md")" \
+  'extension docs link hook inventory'
+assert_contains doctor-api-v1.tsv "$(<"$root/docs/extensions.md")" \
+  'extension docs link doctor inventory'
+
+printf 'extensions-api-test: ok\n'

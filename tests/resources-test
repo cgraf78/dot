@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+# shellcheck source=../lib/dot/resources.sh
+. "$root/lib/dot/resources.sh"
+
+TMPDIR=$DOT_TEST_TMP/allocator
+mkdir -p "$TMPDIR"
+export TMPDIR
+_dot_cleanup_mktemp
+owned_file=$REPLY
+_dot_cleanup_mktemp -d
+owned_dir=$REPLY
+[[ -f $owned_file && ! -L $owned_file ]] || fail 'owned temporary file was not created'
+[[ -d $owned_dir && ! -L $owned_dir ]] || fail 'owned temporary directory was not created'
+file_mode=$(stat -c '%a' "$owned_file" 2>/dev/null || stat -f '%Lp' "$owned_file")
+dir_mode=$(stat -c '%a' "$owned_dir" 2>/dev/null || stat -f '%Lp' "$owned_dir")
+assert_eq 600 "$file_mode" 'owned temporary file is private'
+assert_eq 700 "$dir_mode" 'owned temporary directory is private'
+_dot_cleanup_all
+[[ ! -e $owned_file && ! -L $owned_file ]] || fail 'cleanup retained temporary file'
+[[ ! -e $owned_dir && ! -L $owned_dir ]] || fail 'cleanup retained temporary directory'
+
+case_root=$DOT_TEST_TMP/cancellation
+mkdir -p "$case_root"
+DOT_TEST_ROOT=$root DOT_TEST_CASE_ROOT=$case_root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_TEST_ROOT/lib/dot/resources.sh"
+    _dot_cleanup_install_owner_traps
+    _dot_cleanup_begin_job_launch
+    (
+      printf "%s\n" "$BASHPID" >"$DOT_TEST_CASE_ROOT/worker.pid"
+      (
+        trap "" TERM
+        printf "%s\n" "$BASHPID" >"$DOT_TEST_CASE_ROOT/child.pid"
+        while :; do sleep 1; done
+      ) &
+      wait "$!"
+    ) <&"$DOT_CLEANUP_LAUNCH_STDIN_FD" &
+    worker=$!
+    _dot_cleanup_finish_job_launch "$worker"
+    wait "$worker"
+    _dot_cleanup_unregister_pid "$worker"
+    : >"$DOT_TEST_CASE_ROOT/later"
+  ' >"$case_root/out" 2>"$case_root/err" &
+owner=$!
+deadline=$((SECONDS + 5))
+while ((SECONDS < deadline)); do
+  [[ -s $case_root/worker.pid && -s $case_root/child.pid ]] && break
+  kill -0 "$owner" 2>/dev/null || break
+  sleep 0.01
+done
+[[ -s $case_root/worker.pid && -s $case_root/child.pid ]] || {
+  kill -TERM "$owner" 2>/dev/null || true
+  wait "$owner" 2>/dev/null || true
+  fail 'resource cancellation fixture did not start'
+}
+worker=$(<"$case_root/worker.pid")
+child=$(<"$case_root/child.pid")
+kill -TERM "$owner"
+set +e
+wait "$owner"
+owner_status=$?
+set -e
+assert_eq 143 "$owner_status" 'resource owner preserves TERM status'
+for pid in "$worker" "$child"; do
+  deadline=$((SECONDS + 5))
+  while kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)); do
+    sleep 0.01
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    fail "resource cleanup retained process $pid"
+  fi
+done
+[[ ! -e $case_root/later ]] || fail 'resource cancellation ran later work'
+
+pull_root=$DOT_TEST_TMP/pull-cancellation
+mkdir -p "$pull_root/tmp"
+DOT_TEST_ROOT=$root DOT_TEST_CASE_ROOT=$pull_root TMPDIR=$pull_root/tmp \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_TEST_ROOT/lib/dot/resources.sh"
+    . "$DOT_TEST_ROOT/lib/dot/repos/pull.sh"
+    _dot_cleanup_install_owner_traps
+    _pull_overlay_active() { return 0; }
+    _dot_update_jobs() { printf "2\n"; }
+    _dot_maybe_stage_progress() { :; }
+    _join_comma() { local IFS=,; printf "%s" "$*"; }
+    _pull_overlay() {
+      if [[ $1 == alpha ]]; then
+        printf "%s\n" "$BASHPID" >"$DOT_TEST_CASE_ROOT/pull-worker.pid"
+        (
+          trap "" TERM
+          printf "%s\n" "$BASHPID" >"$DOT_TEST_CASE_ROOT/pull-child.pid"
+          while :; do sleep 1; done
+        ) &
+        wait "$!"
+      else
+        while :; do sleep 1; done
+      fi
+      REPLY_STATUS=current
+    }
+    OVERLAYS=(
+      "alpha|/unused/alpha|file:///alpha||false|git"
+      "beta|/unused/beta|file:///beta||false|git"
+    )
+    _pull_overlays
+    : >"$DOT_TEST_CASE_ROOT/later"
+  ' >"$pull_root/out" 2>"$pull_root/err" &
+pull_owner=$!
+deadline=$((SECONDS + 5))
+while ((SECONDS < deadline)); do
+  [[ -s $pull_root/pull-worker.pid && -s $pull_root/pull-child.pid ]] && break
+  kill -0 "$pull_owner" 2>/dev/null || break
+  sleep 0.01
+done
+[[ -s $pull_root/pull-worker.pid && -s $pull_root/pull-child.pid ]] || {
+  kill -TERM "$pull_owner" 2>/dev/null || true
+  wait "$pull_owner" 2>/dev/null || true
+  fail 'concurrent pull cancellation fixture did not start'
+}
+pull_child=$(<"$pull_root/pull-child.pid")
+kill -TERM "$pull_owner"
+set +e
+wait "$pull_owner"
+pull_status=$?
+set -e
+assert_eq 143 "$pull_status" 'concurrent pull preserves TERM status'
+deadline=$((SECONDS + 5))
+while kill -0 "$pull_child" 2>/dev/null && ((SECONDS < deadline)); do
+  sleep 0.01
+done
+if kill -0 "$pull_child" 2>/dev/null; then
+  kill -KILL "$pull_child" 2>/dev/null || true
+  fail 'concurrent pull left a TERM-ignoring descendant alive'
+fi
+[[ ! -e $pull_root/later ]] || fail 'concurrent pull cancellation ran later work'
+
+printf 'resources-test: ok\n'

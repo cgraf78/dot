@@ -22,13 +22,32 @@ relative_version=$(
 assert_contains 'dot 0.1.0-dev' "$relative_version" \
   'relative launcher with inherited CDPATH'
 
+linked_admin=$DOT_TEST_TMP/linked-version-admin
+linked_root=$DOT_TEST_TMP/linked-version-root
+git init -q "$linked_admin"
+git -C "$linked_admin" config user.name fixture
+git -C "$linked_admin" config user.email fixture@example.invalid
+printf 'fixture\n' >"$linked_admin/README"
+git -C "$linked_admin" add README
+git -C "$linked_admin" -c core.hooksPath=/dev/null commit -qm fixture
+git -C "$linked_admin" worktree add -q -b linked-version "$linked_root"
+mkdir -p "$linked_root/lib/dot/public"
+cp "$DOT_TEST_ROOT/VERSION" "$linked_root/VERSION"
+cp "$DOT_TEST_ROOT/lib/dot/main.sh" "$linked_root/lib/dot/main.sh"
+cp "$DOT_TEST_ROOT/lib/dot/config.sh" "$linked_root/lib/dot/config.sh"
+cp "$DOT_TEST_ROOT/lib/dot/public/"*.sh "$linked_root/lib/dot/public/"
+linked_revision=$(git -C "$linked_root" rev-parse --short=12 HEAD)
+linked_version=$(HOME="$HOME" "$BASH" "$linked_root/lib/dot/main.sh" --version)
+assert_contains "source $linked_revision" "$linked_version" \
+  'linked-worktree runtime reports its source revision'
+
 set +e
 nocase_output=$(HOME="$HOME" DOT_BASH="$BASH" \
   bash -O nocasematch "$DOT_TEST_ROOT/lib/dot/main.sh" HELP 2>&1)
 nocase_status=$?
 set -e
 assert_eq 1 "$nocase_status" 'inherited nocasematch command status'
-assert_contains 'command is not available in this development build: HELP' \
+assert_contains 'unknown command: HELP' \
   "$nocase_output" 'case-sensitive command dispatch'
 
 printf 'cli-test: ok\n'

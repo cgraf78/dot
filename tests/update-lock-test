@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+# shellcheck source=lib/repo.sh
+. "$root/tests/lib/repo.sh"
+
+fixture_home lock
+home=$REPLY
+state=$DOT_TEST_TMP/lock-state
+ready=$DOT_TEST_TMP/lock-ready
+release=$DOT_TEST_TMP/lock-release
+
+HOME=$home XDG_STATE_HOME=$state DOT_SOURCE_ROOT=$DOT_TEST_ROOT \
+  bash -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/api-version.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/public/ui.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/config.sh"
+    dot_config_load
+    . "$DOT_SOURCE_ROOT/lib/dot/runtime.sh"
+    _dot_update_lock_acquire
+    : >"$1"
+    while [[ ! -e $2 ]]; do sleep 0.01; done
+  ' -- "$ready" "$release" &
+holder=$!
+
+remaining=1000
+while [[ ! -e $ready && $remaining -gt 0 ]]; do
+  kill -0 "$holder" 2>/dev/null || fail 'lock holder exited before readiness'
+  sleep 0.01
+  remaining=$((remaining - 1))
+done
+[[ -e $ready ]] || fail 'lock holder did not become ready'
+
+set +e
+run_dot "$home" "$state" update >/dev/null 2>&1
+contender_status=$?
+set -e
+assert_eq 75 "$contender_status" 'concurrent update returns temporary-failure status'
+status_output=$(run_dot "$home" "$state" init --status)
+assert_contains 'initialization: not started' "$status_output" \
+  'read-only init status does not acquire operation lock'
+
+: >"$release"
+wait "$holder"
+run_dot "$home" "$state" update >/dev/null
+[[ ! -e $state/dot/update.lock.d ]] || fail 'operation lock was not released'
+
+printf 'update-lock-test: ok\n'

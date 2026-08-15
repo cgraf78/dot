@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+manifest=$root/docs/source-provenance-v1.tsv
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/dot-provenance.XXXXXX")
+trap 'rm -rf -- "$temporary"' EXIT
+
+awk -F '\t' '
+  /^#/ { next }
+  NF != 2 || $1 == "" || $2 == "" { exit 1 }
+  seen[$1]++ { exit 1 }
+  { print $1 }
+' "$manifest" | sort >"$temporary/expected"
+
+git -C "$root" ls-files install.sh bin lib/dot support tests |
+  sort >"$temporary/actual"
+
+if ! cmp -s "$temporary/expected" "$temporary/actual"; then
+  diff -u "$temporary/expected" "$temporary/actual" >&2 || true
+  printf 'provenance-test: source inventory drift\n' >&2
+  exit 1
+fi
+
+while IFS=$'\t' read -r path origin; do
+  [[ $path == \#* ]] && continue
+  [[ -e $root/$path || -L $root/$path ]] || {
+    printf 'provenance-test: missing tracked path: %s\n' "$path" >&2
+    exit 1
+  }
+  case $origin in
+    standalone:new | dotfiles:* | actions:* | shdeps:*) ;;
+    *)
+      printf 'provenance-test: unknown origin for %s: %s\n' "$path" "$origin" >&2
+      exit 1
+      ;;
+  esac
+done <"$manifest"
+
+if grep -Eiq 'dotfiles-(work|personal)|private overlay repository' "$manifest"; then
+  printf 'provenance-test: private source named in public inventory\n' >&2
+  exit 1
+fi
+
+printf 'provenance-test: ok\n'

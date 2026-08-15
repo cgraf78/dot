@@ -1,0 +1,25 @@
+# function	arguments	status	result and side effects
+dot_hook_source	RELATIVE_PATH	0 sourced; 1 unsafe or unavailable; 2 invalid arguments	sources one validated client support module in the current isolated worker
+dot_hook_family	FAMILY	0 success; 2 invalid arguments	prints the XDG client fragment-family directory
+dot_hook_family_files	FAMILY	0 success; 2 invalid arguments	prints the ordered aggregate and .replace winner stream for one client family
+dot_hook_family_files_matching	FAMILY [PATTERN...]	0 success; 2 invalid arguments	prints one client family filtered before .replace winner selection
+dot_hook_family_relpath	FAMILY FILE	0 success; 2 invalid arguments	prints FILE relative to the configured client family
+dot_hook_family_marker_name	FAMILY FILE	0 success; 2 invalid arguments	prints a slash-free marker identity for FILE
+dot_family_files	DIRECTORY	0 success; 2 invalid arguments	prints the ordered aggregate and .replace winner stream
+dot_family_files_matching	DIRECTORY [PATTERN...]	0 success; 2 invalid arguments	prints the ordered stream filtered before .replace winner selection
+dot_family_relpath	FAMILY FILE	0 success; 2 invalid arguments	prints FILE relative to the configured family
+dot_expand_home	VALUE	0 success; 2 invalid arguments	prints only documented HOME placeholder expansion
+dot_sibling_tmp_for	DESTINATION	0 allocated; 1 failure; 2 invalid arguments	sets REPLY to an exclusive sibling temporary file
+dot_write_text_if_changed	DESTINATION TEXT	0 success; 1 failure; 2 invalid arguments	atomically writes changed text and preserves an unchanged inode
+dot_commit_tmp	TEMP DESTINATION	0 success; 1 failure; 2 invalid arguments	atomically replaces DESTINATION with a prepared sibling
+dot_json_available	-	0 available; 1 unavailable; 2 invalid arguments	no output
+dot_json_layer	LABEL SOURCE DESTINATION FILTER	0 success; 1 failure; 2 invalid arguments	merges one validated JSON layer through jq
+dot_managed_block_build	MARKER SOURCE BODY	0 success; 2 invalid arguments	prints one managed block
+dot_managed_block_strip	MARKER INPUT	0 success; 2 invalid arguments	prints INPUT without the exact managed block
+dot_managed_block_strip_family	MARKER_PREFIX INPUT	0 success; 2 invalid arguments	prints INPUT without any block in the marker family
+dot_managed_block_merge	DESTINATION [BLOCK...]	0 success; 1 failure; 2 invalid arguments	atomically reconciles exact blocks after hand-managed content
+dot_managed_block_merge_family	DESTINATION MARKER_PREFIX [BLOCK...]	0 success; 1 failure; 2 invalid arguments	atomically replaces a complete marker family after hand-managed content
+dot_xdg_path	KIND RELATIVE_SUFFIX	0 success; 1 no absolute base; 2 invalid arguments	sets REPLY to an absolute XDG path
+dot_tool_present	COMMAND_OR_PATH	0 present; 1 absent; 2 invalid arguments	checks one literal executable name or filesystem path
+dot_hook_log	TEXT...	0 success	prints unless quiet mode is active
+dot_hook_warn	TEXT...	0 success	prints a warning to stderr

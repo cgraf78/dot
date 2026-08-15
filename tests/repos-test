@@ -1,0 +1,668 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+# shellcheck source=lib/repo.sh
+. "$root/tests/lib/repo.sh"
+
+fixture_repo update topic .testrc $'one\n' 100644
+origin=$REPLY
+fixture_home update
+home=$REPLY
+state=$DOT_TEST_TMP/update-state
+run_dot "$home" "$state" init --yes "file://$origin" >/dev/null
+fixture_push update topic .testrc $'two\n' 100644
+run_dot "$home" "$state" update >/dev/null
+assert_eq two "$(<"$home/.testrc")" 'base update follows configured non-main upstream'
+assert_eq false "$(git --git-dir="$home/.dotfiles" config core.fsmonitor)" \
+  'base model disables fsmonitor'
+assert_eq no "$(git --git-dir="$home/.dotfiles" config status.showUntrackedFiles)" \
+  'base model suppresses untracked scan'
+assert_eq '' "$(git --git-dir="$home/.dotfiles" config --local --get pull.rebase 2>/dev/null || true)" \
+  'base update does not write pull policy'
+
+# Cron repair follows the configured upstream rather than assuming main.
+fixture_push update topic .testrc $'three\n' 100644
+printf 'three\n' >"$home/.testrc"
+run_dot "$home" "$state" update --cron >/dev/null
+assert_eq "$(git --git-dir="$home/.dotfiles" rev-parse origin/topic)" \
+  "$(git --git-dir="$home/.dotfiles" rev-parse HEAD)" \
+  'cron dirty repair follows non-main base upstream'
+
+fixture_repo reserved-update main .testrc $'safe\n' 100644
+reserved_origin=$REPLY
+fixture_home reserved-update
+reserved_home=$REPLY
+reserved_state=$DOT_TEST_TMP/reserved-update-state
+run_dot "$reserved_home" "$reserved_state" init --yes "file://$reserved_origin" >/dev/null
+before=$(git --git-dir="$reserved_home/.dotfiles" rev-parse HEAD)
+fixture_push reserved-update main .local/lib/dot/foreign $'unsafe\n' 100644
+set +e
+run_dot "$reserved_home" "$reserved_state" update >/dev/null 2>&1
+reserved_rc=$?
+set -e
+assert_eq 1 "$reserved_rc" 'base update rejects newly reserved candidate path'
+assert_eq "$before" "$(git --git-dir="$reserved_home/.dotfiles" rev-parse HEAD)" \
+  'reserved base update preserves current generation'
+[[ ! -e $reserved_home/.local/lib/dot/foreign ]] ||
+  fail 'reserved base update published candidate path'
+
+fixture_repo reserved-update-ancestor main .testrc $'safe\n' 100644
+reserved_ancestor_origin=$REPLY
+fixture_home reserved-update-ancestor
+reserved_ancestor_home=$REPLY
+reserved_ancestor_state=$DOT_TEST_TMP/reserved-update-ancestor-state
+run_dot "$reserved_ancestor_home" "$reserved_ancestor_state" init --yes \
+  "file://$reserved_ancestor_origin" >/dev/null
+fixture_push reserved-update-ancestor main .local /tmp/foreign 120000
+set +e
+run_dot "$reserved_ancestor_home" "$reserved_ancestor_state" update >/dev/null 2>&1
+reserved_ancestor_rc=$?
+set -e
+assert_eq 1 "$reserved_ancestor_rc" \
+  'base update rejects a reserved control-plane ancestor symlink'
+[[ ! -L $reserved_ancestor_home/.local ]] ||
+  fail 'reserved ancestor update published a symlink'
+
+# A later generation may add the exact generated client adapter at the public
+# command path, but any byte drift is a reserved-path violation and must leave
+# the last accepted generation live.
+fixture_repo adapter-update main .testrc $'one\n' 100644
+adapter_update_origin=$REPLY
+fixture_home adapter-update
+adapter_update_home=$REPLY
+adapter_update_state=$DOT_TEST_TMP/adapter-update-state
+run_dot "$adapter_update_home" "$adapter_update_state" init --yes \
+  "file://$adapter_update_origin" >/dev/null
+adapter_update_seed=$DOT_TEST_TMP/adapter-update-seed
+mkdir -p "$adapter_update_seed/.local/bin"
+cp "$root/support/client-launcher.sh" "$adapter_update_seed/.local/bin/dot"
+chmod 0755 "$adapter_update_seed/.local/bin/dot"
+git -C "$adapter_update_seed" add .local/bin/dot
+git -C "$adapter_update_seed" -c core.hooksPath=/dev/null commit -qm adapter
+git -C "$adapter_update_seed" push -q "$adapter_update_origin" HEAD:main
+run_dot "$adapter_update_home" "$adapter_update_state" update >/dev/null
+cmp -s "$root/support/client-launcher.sh" "$adapter_update_home/.local/bin/dot" ||
+  fail 'exact generated client launcher was not accepted during update'
+printf '# modified\n' >>"$adapter_update_seed/.local/bin/dot"
+git -C "$adapter_update_seed" add .local/bin/dot
+git -C "$adapter_update_seed" -c core.hooksPath=/dev/null commit -qm modified-adapter
+git -C "$adapter_update_seed" push -q "$adapter_update_origin" HEAD:main
+set +e
+run_dot "$adapter_update_home" "$adapter_update_state" update >/dev/null 2>&1
+adapter_update_status=$?
+set -e
+assert_eq 1 "$adapter_update_status" \
+  'modified generated client launcher is rejected during update'
+cmp -s "$root/support/client-launcher.sh" "$adapter_update_home/.local/bin/dot" ||
+  fail 'modified adapter update replaced the accepted client launcher'
+
+fixture_repo provider-state main .testrc $'safe\n' 100644
+provider_origin=$REPLY
+fixture_home provider-state
+provider_home=$REPLY
+provider_state=$DOT_TEST_TMP/provider-state-state
+run_dot "$provider_home" "$provider_state" init --yes "file://$provider_origin" >/dev/null
+fixture_push provider-state main provider-control/owned $'unsafe\n' 100644
+set +e
+SHDEPS_STATE_DIR="$provider_home/provider-control" \
+  run_dot "$provider_home" "$provider_state" update >/dev/null 2>&1
+provider_rc=$?
+set -e
+assert_eq 1 "$provider_rc" 'configured provider state root is reserved'
+[[ ! -e $provider_home/provider-control/owned ]] ||
+  fail 'provider state collision was published'
+
+fixture_repo overlay-base main .config/example/value $'base\n' 100644
+base_origin=$REPLY
+fixture_home overlay
+overlay_home=$REPLY
+overlay_state=$DOT_TEST_TMP/overlay-state
+run_dot "$overlay_home" "$overlay_state" init --yes "file://$base_origin" >/dev/null
+local_overlay=$DOT_TEST_TMP/local-overlay
+mkdir -p "$local_overlay/home/.config/example"
+printf 'local-overlay\n' >"$local_overlay/home/.config/example/value"
+mkdir -p "$overlay_home/.config/dot/overlays.d"
+printf 'sync=none\npath=%s\n' "$local_overlay" \
+  >"$overlay_home/.config/dot/overlays.d/10-alpha.local.conf"
+run_dot "$overlay_home" "$overlay_state" update >/dev/null
+[[ -L $overlay_home/.config/example/value ]] || fail 'local overlay did not publish link'
+assert_eq "$local_overlay/home/.config/example/value" \
+  "$(readlink "$overlay_home/.config/example/value")" \
+  'local overlay link target'
+overlay_index_entry=$(git --git-dir="$overlay_home/.dotfiles" \
+  ls-files -v -- .config/example/value)
+[[ ${overlay_index_entry:0:2} == 'S ' ]] ||
+  fail 'tracked overlay path did not receive skip-worktree ownership'
+
+# A crash can leave the pending manifest as the only complete authority for a
+# live overlay symlink. The next run must consume it even after the descriptor
+# and source disappear, restore the tracked base file, and clear index state.
+overlay_manifest=$overlay_state/dot/overlay-links
+cp "$overlay_manifest" "$overlay_manifest.pending"
+chmod 0600 "$overlay_manifest.pending"
+rm -f "$overlay_home/.config/dot/overlays.d/10-alpha.local.conf"
+rm -rf "$local_overlay"
+run_dot "$overlay_home" "$overlay_state" update >/dev/null
+[[ -f $overlay_home/.config/example/value &&
+  ! -L $overlay_home/.config/example/value ]] ||
+  fail 'pending overlay recovery did not restore the tracked base file'
+assert_eq base "$(<"$overlay_home/.config/example/value")" \
+  'pending overlay recovery restored base bytes'
+overlay_index_entry=$(git --git-dir="$overlay_home/.dotfiles" \
+  ls-files -v -- .config/example/value)
+[[ ${overlay_index_entry:0:2} != 'S ' ]] ||
+  fail 'pending overlay recovery retained skip-worktree ownership'
+[[ ! -e $overlay_manifest.pending && ! -L $overlay_manifest.pending ]] ||
+  fail 'pending overlay recovery record was not retired'
+
+fixture_repo git-overlay main home/.config/git-overlay/value $'git-overlay\n' 100644
+git_overlay_origin=$REPLY
+printf 'url=file://%s\n' "$git_overlay_origin" \
+  >"$overlay_home/.config/dot/overlays.d/20-beta.conf"
+run_dot "$overlay_home" "$overlay_state" update >/dev/null
+[[ -d $overlay_home/.dotfiles-beta/.git ]] || fail 'Git overlay was not cloned'
+[[ -L $overlay_home/.config/git-overlay/value ]] || fail 'Git overlay link missing'
+
+# The active overlay checkout itself is control-plane state and cannot be
+# introduced by a later base generation.
+fixture_push overlay-base main .dotfiles-beta/foreign $'unsafe\n' 100644
+set +e
+run_dot "$overlay_home" "$overlay_state" update >/dev/null 2>&1
+overlay_root_collision_rc=$?
+set -e
+assert_eq 1 "$overlay_root_collision_rc" 'base update rejects active overlay checkout root'
+[[ ! -e $overlay_home/.dotfiles-beta/foreign ]] ||
+  fail 'base update wrote into active overlay checkout root'
+
+fixture_repo unsafe-overlay main home/.local /tmp/foreign 120000
+unsafe_overlay_origin=$REPLY
+fixture_repo unsafe-overlay-base main README.md $'base\n' 100644
+unsafe_overlay_base_origin=$REPLY
+fixture_home unsafe-overlay
+unsafe_overlay_home=$REPLY
+unsafe_overlay_state=$DOT_TEST_TMP/unsafe-overlay-state
+run_dot "$unsafe_overlay_home" "$unsafe_overlay_state" init --yes \
+  "file://$unsafe_overlay_base_origin" >/dev/null
+mkdir -p "$unsafe_overlay_home/.config/dot/overlays.d"
+printf 'url=file://%s\n' "$unsafe_overlay_origin" \
+  >"$unsafe_overlay_home/.config/dot/overlays.d/10-unsafe.conf"
+set +e
+run_dot "$unsafe_overlay_home" "$unsafe_overlay_state" update >/dev/null 2>&1
+unsafe_overlay_rc=$?
+set -e
+assert_eq 1 "$unsafe_overlay_rc" 'overlay candidate reserved ancestor is rejected'
+[[ ! -e $unsafe_overlay_home/.dotfiles-unsafe ]] ||
+  fail 'unsafe overlay candidate was published'
+
+fixture_repo filtered-base main README.md $'base\n' 100644
+filtered_origin=$REPLY
+fixture_home filtered
+filtered_home=$REPLY
+filtered_state=$DOT_TEST_TMP/filtered-state
+run_dot "$filtered_home" "$filtered_state" init --yes "file://$filtered_origin" >/dev/null
+mkdir -p "$filtered_home/.config/dot/overlays.d"
+printf 'url=file:///does/not/exist\nplatforms=!%s\n' "$(uname -s | tr '[:upper:]' '[:lower:]')" \
+  >"$filtered_home/.config/dot/overlays.d/10-filtered.conf"
+run_dot "$filtered_home" "$filtered_state" update >/dev/null
+[[ ! -e $filtered_home/.dotfiles-filtered ]] || fail 'platform exclusion was ignored'
+
+# Linked-worktree overlays use a .git file and still participate in dirty
+# detection, safe cron repair, normalization, and pull.
+fixture_repo linked-overlay main home/.config/linked/value $'one\n' 100644
+linked_overlay_origin=$REPLY
+fixture_repo linked-base main README.md $'base\n' 100644
+linked_base_origin=$REPLY
+fixture_home linked
+linked_home=$REPLY
+linked_state=$DOT_TEST_TMP/linked-state
+run_dot "$linked_home" "$linked_state" init --yes "file://$linked_base_origin" >/dev/null
+linked_admin=$DOT_TEST_TMP/linked-admin
+git clone -q "$linked_overlay_origin" "$linked_admin"
+git -C "$linked_admin" worktree add -q -b linked \
+  "$linked_home/.dotfiles-linked" origin/main
+mkdir -p "$linked_home/.config/dot/overlays.d"
+linked_recorded_origin=$(git -C "$linked_home/.dotfiles-linked" config remote.origin.url)
+printf 'url=%s\n' "$linked_recorded_origin" \
+  >"$linked_home/.config/dot/overlays.d/10-linked.conf"
+run_dot "$linked_home" "$linked_state" update >/dev/null
+printf 'dirty\n' >"$linked_home/.dotfiles-linked/home/.config/linked/value"
+linked_status=$(run_dot "$linked_home" "$linked_state" status --short)
+assert_contains 'home/.config/linked/value' "$linked_status" \
+  'simple repository commands include linked-worktree overlays'
+git -C "$linked_home/.dotfiles-linked" checkout -q -- home/.config/linked/value
+fixture_push linked-overlay main home/.config/linked/value $'two\n' 100644
+printf 'two\n' >"$linked_home/.dotfiles-linked/home/.config/linked/value"
+run_dot "$linked_home" "$linked_state" update --cron >/dev/null
+assert_eq "$(git -C "$linked_home/.dotfiles-linked" rev-parse origin/main)" \
+  "$(git -C "$linked_home/.dotfiles-linked" rev-parse HEAD)" \
+  'linked-worktree overlay cron repair follows its upstream'
+assert_eq two "$(<"$linked_home/.config/linked/value")" \
+  'linked-worktree overlay link reflects updated content'
+
+# Parallel normalization is still owned work. A parent-only TERM must stop the
+# registered Bash job and a TERM-ignoring descendant rather than leaving Git
+# normalization running after the update lock owner exits.
+normalize_probe=$DOT_TEST_TMP/normalize-probe
+mkdir -p "$normalize_probe"
+DOT_TEST_ROOT=$root DOT_TEST_NORMALIZE_PROBE=$normalize_probe \
+  HOME=$DOT_TEST_TMP/normalize-home bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_TEST_ROOT/lib/dot/resources.sh"
+    . "$DOT_TEST_ROOT/lib/dot/repos/dirty.sh"
+    _dot_cleanup_install_owner_traps
+    _base_repo_exists() { return 0; }
+    _overlay_is_worktree() { return 0; }
+    OVERLAYS=("fixture|$HOME/overlay||||git")
+    _normalize_repo() {
+      if [[ $1 == base ]]; then
+        printf "%s\n" "$BASHPID" >"$DOT_TEST_NORMALIZE_PROBE/worker.pid"
+        (
+          trap "" TERM
+          printf "%s\n" "$BASHPID" >"$DOT_TEST_NORMALIZE_PROBE/child.pid"
+          while :; do sleep 1; done
+        ) &
+        wait "$!"
+      else
+        while :; do sleep 1; done
+      fi
+    }
+    _normalize_filtered
+  ' >"$normalize_probe/out" 2>"$normalize_probe/err" &
+normalize_owner=$!
+normalize_deadline=$((SECONDS + 5))
+while ((SECONDS < normalize_deadline)); do
+  [[ -s $normalize_probe/worker.pid && -s $normalize_probe/child.pid ]] && break
+  kill -0 "$normalize_owner" 2>/dev/null || break
+  sleep 0.01
+done
+[[ -s $normalize_probe/worker.pid && -s $normalize_probe/child.pid ]] || {
+  kill -TERM "$normalize_owner" 2>/dev/null || true
+  wait "$normalize_owner" 2>/dev/null || true
+  fail 'normalization cancellation fixture did not start'
+}
+normalize_child=$(<"$normalize_probe/child.pid")
+kill -TERM "$normalize_owner"
+set +e
+wait "$normalize_owner"
+normalize_status=$?
+set -e
+assert_eq 143 "$normalize_status" 'normalization preserves TERM status'
+normalize_deadline=$((SECONDS + 5))
+while kill -0 "$normalize_child" 2>/dev/null &&
+  ((SECONDS < normalize_deadline)); do
+  sleep 0.01
+done
+if kill -0 "$normalize_child" 2>/dev/null; then
+  kill -KILL "$normalize_child" 2>/dev/null || true
+  fail 'normalization left a TERM-ignoring descendant alive'
+fi
+
+# Link publication must not follow or populate a directory that appears after
+# destination classification.
+fixture_repo link-race-base main README.md $'base\n' 100644
+link_race_origin=$REPLY
+fixture_home link-race
+link_race_home=$REPLY
+link_race_state=$DOT_TEST_TMP/link-race-state
+run_dot "$link_race_home" "$link_race_state" init --yes "file://$link_race_origin" >/dev/null
+link_race_source=$DOT_TEST_TMP/link-race-source
+mkdir -p "$link_race_source/home/.config/race" \
+  "$link_race_home/.config/dot/overlays.d"
+printf 'source\n' >"$link_race_source/home/.config/race/value"
+printf 'sync=none\npath=%s\n' "$link_race_source" \
+  >"$link_race_home/.config/dot/overlays.d/10-race.local.conf"
+link_race_bin=$DOT_TEST_TMP/link-race-bin
+mkdir -p "$link_race_bin"
+cat >"$link_race_bin/mv" <<'MV'
+#!/usr/bin/env bash
+set -e
+last=${!#}
+if [[ $last == "$DOT_TEST_LINK_RACE_DEST" && ! -e $last && ! -L $last ]]; then
+  mkdir -p "$last"
+fi
+exec /usr/bin/mv "$@"
+MV
+chmod +x "$link_race_bin/mv"
+set +e
+PATH="$link_race_bin:$PATH" \
+  DOT_TEST_LINK_RACE_DEST="$link_race_home/.config/race/value" \
+  run_dot "$link_race_home" "$link_race_state" update >/dev/null 2>&1
+link_race_rc=$?
+set -e
+assert_eq 1 "$link_race_rc" 'late overlay link directory aborts publication'
+[[ -d $link_race_home/.config/race/value &&
+  ! -L $link_race_home/.config/race/value ]] ||
+  fail 'late overlay link directory was replaced'
+[[ -z $(find "$link_race_home/.config/race/value" -mindepth 1 -print -quit) ]] ||
+  fail 'overlay link publication nested state inside foreign directory'
+
+# An absent destination carries no replacement authority. If a regular file
+# wins before the final publication helper runs, it must survive unchanged.
+late_regular_home=$DOT_TEST_TMP/late-regular-home
+mkdir -p "$late_regular_home"
+printf 'foreign\n' >"$late_regular_home/value"
+set +e
+HOME=$late_regular_home DOT_SOURCE_ROOT=$root bash --noprofile --norc -c '
+  . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+  OVERLAYS=()
+  _overlay_publish_link managed-target "$HOME/value" ""
+'
+late_regular_status=$?
+set -e
+assert_eq 1 "$late_regular_status" 'late regular overlay destination aborts publication'
+[[ -f $late_regular_home/value && ! -L $late_regular_home/value ]] ||
+  fail 'late regular overlay destination was replaced'
+assert_eq foreign "$(<"$late_regular_home/value")" \
+  'late regular overlay destination bytes are preserved'
+
+# Replacement authority is generation-specific. A foreign file swapped in
+# after validation but at the actual move boundary must be parked, detected,
+# and restored instead of being overwritten by the desired symlink.
+replacement_race_home=$DOT_TEST_TMP/replacement-race-home
+replacement_race_bin=$DOT_TEST_TMP/replacement-race-bin
+replacement_race_state=$DOT_TEST_TMP/replacement-race-state
+mkdir -p "$replacement_race_home" "$replacement_race_bin" \
+  "$replacement_race_state"
+ln -s old-managed "$replacement_race_home/value"
+cat >"$replacement_race_bin/mv" <<'MV'
+#!/usr/bin/env bash
+set -e
+source_path=${@: -2:1}
+target_path=${@: -1}
+if [[ ! -e ${DOT_TEST_REPLACEMENT_RACE_DONE:-} &&
+  ($source_path == "$DOT_TEST_REPLACEMENT_RACE_DEST" ||
+  $target_path == "$DOT_TEST_REPLACEMENT_RACE_DEST") ]]; then
+  : >"$DOT_TEST_REPLACEMENT_RACE_DONE"
+  unlink "$DOT_TEST_REPLACEMENT_RACE_DEST"
+  printf 'foreign\n' >"$DOT_TEST_REPLACEMENT_RACE_DEST"
+fi
+exec /usr/bin/mv "$@"
+MV
+chmod +x "$replacement_race_bin/mv"
+set +e
+HOME=$replacement_race_home DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$replacement_race_state/overlay-links \
+  DOT_TEST_REPLACEMENT_RACE_DEST=$replacement_race_home/value \
+  DOT_TEST_REPLACEMENT_RACE_DONE=$DOT_TEST_TMP/replacement-race-done \
+  PATH="$replacement_race_bin:$PATH" bash --noprofile --norc -c '
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    OVERLAYS=()
+    expected=$(_dot_path_identity "$HOME/value")
+    _overlay_publish_link new-managed "$HOME/value" "$expected"
+  '
+replacement_race_status=$?
+set -e
+assert_eq 1 "$replacement_race_status" \
+  'replacement-boundary overlay winner aborts publication'
+[[ -f $replacement_race_home/value && ! -L $replacement_race_home/value ]] ||
+  fail 'replacement-boundary overlay winner was overwritten'
+assert_eq foreign "$(<"$replacement_race_home/value")" \
+  'replacement-boundary overlay winner bytes are preserved'
+
+# The durable replacement record must classify and converge every filesystem
+# phase independently of the current overlay configuration: preparation rolls
+# back, a parked old generation is restored, and a published desired link
+# commits by retiring only the exact parked generation.
+replacement_recovery_home=$DOT_TEST_TMP/replacement-recovery-home
+replacement_recovery_state=$DOT_TEST_TMP/replacement-recovery-state
+mkdir -p "$replacement_recovery_home" "$replacement_recovery_state"
+HOME=$replacement_recovery_home XDG_STATE_HOME=$replacement_recovery_state \
+  DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$replacement_recovery_state/overlay-links \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    OVERLAYS=()
+
+    materialize() {
+      local name=$1 phase=$2 destination=$HOME/$1 target=new-$1
+      local expected physical parent_identity record transaction record_line
+      ln -s old-$name "$destination"
+      expected=$(_dot_path_identity "$destination")
+      _overlay_destination_context "$destination"
+      physical=$OVERLAY_PHYSICAL_DESTINATION
+      parent_identity=$OVERLAY_PARENT_IDENTITY
+      _overlay_replacement_record_path "$destination"
+      record=$REPLY
+      transaction=${physical%/*}/.${physical##*/}.dot-overlay-replace-v1
+      printf -v record_line "%s\t%s\t%s\t%s\t%s\t%s" \
+        "$destination" "$physical" "$target" "$expected" \
+        "$transaction" "$parent_identity"
+      _overlay_write_private_line "$record" "$record_line"
+      mkdir "$transaction"
+      chmod 0700 "$transaction"
+      case $phase in
+        prepared)
+          ln -s "$target" "$transaction/next"
+          ;;
+        parked)
+          ln -s "$target" "$transaction/next"
+          mv "$physical" "$transaction/previous"
+          ;;
+        committed)
+          mv "$physical" "$transaction/previous"
+          ln -s "$target" "$physical"
+          ;;
+      esac
+      _overlay_recover_replacements
+      [[ ! -e $record && ! -L $record && ! -e $transaction && ! -L $transaction ]]
+      if [[ $phase == committed ]]; then
+        [[ -L $physical && $(readlink "$physical") == "$target" ]]
+      else
+        [[ -L $physical && $(readlink "$physical") == old-$name ]]
+      fi
+    }
+
+    materialize prepared prepared
+    materialize parked parked
+    materialize committed committed
+
+    destination=$HOME/malformed
+    ln -s old-malformed "$destination"
+    expected=$(_dot_path_identity "$destination")
+    _overlay_destination_context "$destination"
+    physical=$OVERLAY_PHYSICAL_DESTINATION
+    parent_identity=$OVERLAY_PARENT_IDENTITY
+    _overlay_replacement_record_path "$destination"
+    record=$REPLY
+    transaction=${physical%/*}/.${physical##*/}.dot-overlay-replace-v1
+    printf -v record_line "%s\t%s\t%s\t%s\t%s\t%s" \
+      "$destination" "$physical" new-malformed "$expected" \
+      "$transaction" "$parent_identity"
+    _overlay_write_private_line "$record" "$record_line"
+    mkdir "$transaction"
+    chmod 0700 "$transaction"
+    : >"$transaction/foreign"
+    if _overlay_recover_replacements; then
+      exit 1
+    fi
+    [[ -L $destination && $(readlink "$destination") == old-malformed ]]
+    [[ -f $record && -d $transaction && -f $transaction/foreign ]]
+  '
+
+# Lexically ordinary destinations may resolve through a user symlink into dot
+# or provider state. Physical containment is part of reserved-path ownership.
+fixture_repo physical-reserved-base main README.md $'base\n' 100644
+physical_reserved_origin=$REPLY
+fixture_home physical-reserved
+physical_reserved_home=$REPLY
+physical_reserved_state=$DOT_TEST_TMP/physical-reserved-state
+run_dot "$physical_reserved_home" "$physical_reserved_state" init --yes \
+  "file://$physical_reserved_origin" >/dev/null
+physical_reserved_source=$DOT_TEST_TMP/physical-reserved-source
+mkdir -p "$physical_reserved_source/home/alias" \
+  "$physical_reserved_home/.config/dot/overlays.d"
+printf 'unsafe\n' >"$physical_reserved_source/home/alias/owned"
+ln -s "$physical_reserved_state/dot" "$physical_reserved_home/alias"
+printf 'sync=none\npath=%s\n' "$physical_reserved_source" \
+  >"$physical_reserved_home/.config/dot/overlays.d/10-physical.local.conf"
+set +e
+run_dot "$physical_reserved_home" "$physical_reserved_state" update \
+  >/dev/null 2>&1
+physical_reserved_status=$?
+set -e
+assert_eq 1 "$physical_reserved_status" \
+  'overlay destination resolving into reserved state is rejected'
+[[ ! -e $physical_reserved_state/dot/owned &&
+  ! -L $physical_reserved_state/dot/owned ]] ||
+  fail 'overlay published through a symlink into reserved state'
+
+# Bind publication to the physical parent generation. Retargeting the lexical
+# parent at the move boundary must not redirect the staged link into state.
+retarget_home=$DOT_TEST_TMP/retarget-home
+retarget_state=$DOT_TEST_TMP/retarget-state
+retarget_safe=$DOT_TEST_TMP/retarget-safe
+retarget_bin=$DOT_TEST_TMP/retarget-bin
+mkdir -p "$retarget_home" "$retarget_state/dot" "$retarget_safe" \
+  "$retarget_bin"
+ln -s "$retarget_safe" "$retarget_home/alias"
+cat >"$retarget_bin/mv" <<'MV'
+#!/usr/bin/env bash
+set -e
+source_path=${@: -2:1}
+target_path=${@: -1}
+if [[ ! -e ${DOT_TEST_RETARGET_DONE:-} &&
+  ($source_path == "$DOT_TEST_RETARGET_PHYSICAL" || $target_path == *'/value') ]]; then
+  : >"$DOT_TEST_RETARGET_DONE"
+  unlink "$HOME/alias"
+  ln -s "$DOT_TEST_RETARGET_RESERVED" "$HOME/alias"
+fi
+exec /usr/bin/mv "$@"
+MV
+chmod +x "$retarget_bin/mv"
+set +e
+HOME=$retarget_home XDG_STATE_HOME=$retarget_state DOT_SOURCE_ROOT=$root \
+  DOT_TEST_RETARGET_RESERVED=$retarget_state/dot \
+  DOT_TEST_RETARGET_PHYSICAL=$retarget_safe/value \
+  DOT_TEST_RETARGET_DONE=$DOT_TEST_TMP/retarget-done \
+  DOT_OVERLAY_MANIFEST=$retarget_state/overlay-links \
+  PATH="$retarget_bin:$PATH" bash --noprofile --norc -c '
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/overlays.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+  OVERLAYS=()
+  _overlay_publish_link managed "$HOME/alias/value" ""
+  '
+retarget_status=$?
+set -e
+assert_eq 1 "$retarget_status" 'overlay publication rejects a retargeted parent'
+[[ ! -e $retarget_state/dot/value && ! -L $retarget_state/dot/value ]] ||
+  fail 'overlay parent retarget wrote into reserved state'
+
+# Pending recovery authority also publishes without directory-following mv
+# semantics.
+fixture_repo manifest-race-base main README.md $'base\n' 100644
+manifest_race_origin=$REPLY
+fixture_home manifest-race
+manifest_race_home=$REPLY
+manifest_race_state=$DOT_TEST_TMP/manifest-race-state
+run_dot "$manifest_race_home" "$manifest_race_state" init --yes \
+  "file://$manifest_race_origin" >/dev/null
+manifest_source=$DOT_TEST_TMP/manifest-race-source
+mkdir -p "$manifest_source/home/.config/manifest" \
+  "$manifest_race_home/.config/dot/overlays.d"
+printf 'source\n' >"$manifest_source/home/.config/manifest/value"
+printf 'sync=none\npath=%s\n' "$manifest_source" \
+  >"$manifest_race_home/.config/dot/overlays.d/10-manifest.local.conf"
+manifest_bin=$DOT_TEST_TMP/manifest-race-bin
+mkdir -p "$manifest_bin"
+cat >"$manifest_bin/mv" <<'MV'
+#!/usr/bin/env bash
+set -e
+last=${!#}
+if [[ $last == "$DOT_TEST_MANIFEST_RACE_DEST" && ! -e $last && ! -L $last ]]; then
+  mkdir -p "$last"
+fi
+exec /usr/bin/mv "$@"
+MV
+chmod +x "$manifest_bin/mv"
+manifest_pending=$manifest_race_state/dot/overlay-links.pending
+set +e
+PATH="$manifest_bin:$PATH" DOT_TEST_MANIFEST_RACE_DEST=$manifest_pending \
+  run_dot "$manifest_race_home" "$manifest_race_state" update >/dev/null 2>&1
+manifest_race_rc=$?
+set -e
+assert_eq 1 "$manifest_race_rc" 'late pending-manifest directory aborts publication'
+[[ -d $manifest_pending && ! -L $manifest_pending ]] ||
+  fail 'late pending-manifest directory was replaced'
+[[ -z $(find "$manifest_pending" -mindepth 1 -print -quit) ]] ||
+  fail 'pending manifest publication nested state inside foreign directory'
+
+fixture_repo final-manifest-base main README.md $'base\n' 100644
+final_manifest_origin=$REPLY
+fixture_home final-manifest
+final_manifest_home=$REPLY
+final_manifest_state=$DOT_TEST_TMP/final-manifest-state
+run_dot "$final_manifest_home" "$final_manifest_state" init --yes \
+  "file://$final_manifest_origin" >/dev/null
+final_manifest_source=$DOT_TEST_TMP/final-manifest-source
+mkdir -p "$final_manifest_source/home/.config/final" \
+  "$final_manifest_home/.config/dot/overlays.d"
+printf 'source\n' >"$final_manifest_source/home/.config/final/value"
+printf 'sync=none\npath=%s\n' "$final_manifest_source" \
+  >"$final_manifest_home/.config/dot/overlays.d/10-final.local.conf"
+final_manifest_bin=$DOT_TEST_TMP/final-manifest-bin
+mkdir -p "$final_manifest_bin"
+cat >"$final_manifest_bin/mv" <<'MV'
+#!/usr/bin/env bash
+set -e
+last=${!#}
+if [[ $last == "$DOT_TEST_MANIFEST_RACE_DEST" && ! -e $last && ! -L $last ]]; then
+  mkdir -p "$last"
+fi
+exec /usr/bin/mv "$@"
+MV
+chmod +x "$final_manifest_bin/mv"
+final_manifest_path=$final_manifest_state/dot/overlay-links
+set +e
+PATH="$final_manifest_bin:$PATH" DOT_TEST_MANIFEST_RACE_DEST=$final_manifest_path \
+  run_dot "$final_manifest_home" "$final_manifest_state" update >/dev/null 2>&1
+final_manifest_rc=$?
+set -e
+assert_eq 1 "$final_manifest_rc" 'late final-manifest directory aborts publication'
+[[ -d $final_manifest_path && ! -L $final_manifest_path ]] ||
+  fail 'late final-manifest directory was replaced'
+[[ -z $(find "$final_manifest_path" -mindepth 1 -print -quit) ]] ||
+  fail 'final manifest publication nested state inside foreign directory'
+
+# A producer that emits a valid prefix and then fails must not authorize an
+# incompletely inspected candidate tree.
+set +e
+HOME=$DOT_TEST_TMP/partial-tree-home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    mkdir -p "$HOME"
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/resources.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/init-client.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    _dot_cleanup_install_owner_traps
+    partial_tree() {
+      printf "100644 blob 0000000000000000000000000000000000000000\\tREADME.md\\0"
+      return 1
+    }
+    _repo_validate_candidate_tree base main partial_tree
+  '
+partial_tree_status=$?
+set -e
+assert_eq 1 "$partial_tree_status" \
+  'update candidate validation rejects a failed ls-tree producer'
+
+printf 'repos-test: ok\n'
