@@ -7,6 +7,11 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$root/tests/lib/test.sh"
 # shellcheck source=lib/repo.sh
 . "$root/tests/lib/repo.sh"
+# shellcheck source=../lib/dot/public/xdg.sh
+. "$root/lib/dot/public/xdg.sh"
+_dot_xdg_path() { dot_xdg_path "$@"; }
+# shellcheck source=../lib/dot/update-lock.sh
+. "$root/lib/dot/update-lock.sh"
 
 fixture_repo doctor main README.md $'doctor\n' 100644
 origin=$REPLY
@@ -194,7 +199,7 @@ assert_contains 'update lock path is unsafe' "$lock_output" \
 
 rm "$lock_state/dot/update.lock.d"
 mkdir "$lock_state/dot/update.lock.d"
-lock_start=$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$$")
+lock_start=$(_dot_update_lock_process_start "$$")
 printf 'pid\t%s\nstart\t%s\ntoken\tfixture\n' "$$" "$lock_start" \
   >"$lock_state/dot/update.lock.d/owner"
 active_lock_output=$(run_dot "$lock_home" "$lock_state" doctor 2>&1)
@@ -331,18 +336,18 @@ cancel_status=$?
 set -e
 assert_eq 143 "$cancel_status" 'doctor coordinator preserves TERM status'
 cancel_deadline=$((SECONDS + 5))
-while kill -0 "$cancel_worker_pid" 2>/dev/null && ((SECONDS < cancel_deadline)); do
+while process_is_live "$cancel_worker_pid" && ((SECONDS < cancel_deadline)); do
   sleep 0.01
 done
-if kill -0 "$cancel_worker_pid" 2>/dev/null; then
+if process_is_live "$cancel_worker_pid"; then
   kill -KILL "$cancel_worker_pid" 2>/dev/null || true
   fail 'doctor cancellation left its fresh Bash worker alive'
 fi
 cancel_deadline=$((SECONDS + 5))
-while kill -0 "$cancel_child_pid" 2>/dev/null && ((SECONDS < cancel_deadline)); do
+while process_is_live "$cancel_child_pid" && ((SECONDS < cancel_deadline)); do
   sleep 0.01
 done
-if kill -0 "$cancel_child_pid" 2>/dev/null; then
+if process_is_live "$cancel_child_pid"; then
   kill -KILL "$cancel_child_pid" 2>/dev/null || true
   fail 'doctor cancellation left a TERM-ignoring descendant alive'
 fi

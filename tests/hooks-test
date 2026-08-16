@@ -225,20 +225,20 @@ cancellable_dot_status=$?
 set -e
 assert_eq 143 "$cancellable_dot_status" 'real update preserves TERM status'
 cancellable_deadline=$((SECONDS + 5))
-while kill -0 "$cancellable_hook_pid" 2>/dev/null &&
+while process_is_live "$cancellable_hook_pid" &&
   ((SECONDS < cancellable_deadline)); do
   sleep 0.01
 done
-if kill -0 "$cancellable_hook_pid" 2>/dev/null; then
+if process_is_live "$cancellable_hook_pid"; then
   kill -KILL "$cancellable_hook_pid" 2>/dev/null || true
   fail 'real update left the fresh Bash merge worker alive after TERM'
 fi
 cancellable_deadline=$((SECONDS + 5))
-while kill -0 "$cancellable_child_pid" 2>/dev/null &&
+while process_is_live "$cancellable_child_pid" &&
   ((SECONDS < cancellable_deadline)); do
   sleep 0.01
 done
-if kill -0 "$cancellable_child_pid" 2>/dev/null; then
+if process_is_live "$cancellable_child_pid"; then
   kill -KILL "$cancellable_child_pid" 2>/dev/null || true
   fail 'real update left a TERM-ignoring hook descendant alive after TERM'
 fi

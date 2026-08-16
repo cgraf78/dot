@@ -7,6 +7,8 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$root/tests/lib/test.sh"
 # shellcheck source=lib/repo.sh
 . "$root/tests/lib/repo.sh"
+# shellcheck source=../lib/dot/platform.sh
+. "$root/lib/dot/platform.sh"
 
 fixture_repo update topic .testrc $'one\n' 100644
 origin=$REPLY
@@ -368,7 +370,11 @@ filtered_home=$REPLY
 filtered_state=$DOT_TEST_TMP/filtered-state
 run_dot "$filtered_home" "$filtered_state" init --yes "file://$filtered_origin" >/dev/null
 mkdir -p "$filtered_home/.config/dot/overlays.d"
-printf 'url=file:///does/not/exist\nplatforms=!%s\n' "$(uname -s | tr '[:upper:]' '[:lower:]')" \
+filtered_platforms="!$(_dot_platform)"
+if [[ -n ${PREFIX:-} && $PREFIX == */com.termux/* ]]; then
+  filtered_platforms+=,!android
+fi
+printf 'url=file:///does/not/exist\nplatforms=%s\n' "$filtered_platforms" \
   >"$filtered_home/.config/dot/overlays.d/10-filtered.conf"
 run_dot "$filtered_home" "$filtered_state" update >/dev/null
 [[ ! -e $filtered_home/.dotfiles-filtered ]] || fail 'platform exclusion was ignored'
@@ -455,11 +461,11 @@ normalize_status=$?
 set -e
 assert_eq 143 "$normalize_status" 'normalization preserves TERM status'
 normalize_deadline=$((SECONDS + 5))
-while kill -0 "$normalize_child" 2>/dev/null &&
+while process_is_live "$normalize_child" &&
   ((SECONDS < normalize_deadline)); do
   sleep 0.01
 done
-if kill -0 "$normalize_child" 2>/dev/null; then
+if process_is_live "$normalize_child"; then
   kill -KILL "$normalize_child" 2>/dev/null || true
   fail 'normalization left a TERM-ignoring descendant alive'
 fi
