@@ -6,12 +6,9 @@ repositories, versioned extension hooks, and an optional dependency provider.
 The engine contains no application-specific configuration policy: the client
 repository supplies the files and extensions it wants.
 
-This repository is currently being built and tested locally. Its GitHub
-repository and public bootstrap URL are intentionally not live yet.
-
 ## Installation
 
-The eventual checkout-backed install is:
+Install the checkout-backed release with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cgraf78/dot/main/install.sh | bash
@@ -73,7 +70,7 @@ other shell files are private runtime implementation. See
 tests/run
 ```
 
-The public project will use the full shared Linux, macOS, and Termux shell
-matrix plus a stock macOS Bash 3.2 bootstrap job before publication.
+The project uses the full shared Linux, macOS, and Termux shell matrix plus a
+stock macOS Bash 3.2 bootstrap job.
 
 Licensed under the [MIT License](LICENSE).
