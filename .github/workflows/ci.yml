@@ -83,6 +83,7 @@ jobs:
 
           origin="$RUNNER_TEMP/dot-origin.git"
           git init --quiet --bare "$origin"
+          git -C "$origin" config receive.shallowUpdate true
           git -C "$origin" symbolic-ref HEAD refs/heads/main
           git push --quiet "$origin" HEAD:refs/heads/main
 
