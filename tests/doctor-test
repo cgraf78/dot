@@ -20,7 +20,14 @@ home=$REPLY
 state=$DOT_TEST_TMP/doctor-state
 run_dot "$home" "$state" init --yes "file://$origin" >/dev/null
 extensions=$home/extensions
-mkdir -p "$home/.config/dot" "$extensions/doctor.d"
+# Termux runners may enter tests with a permissive umask. Establish the exact
+# trusted collection modes so the fixture tests extension behavior, not the
+# ambient process policy.
+(
+  umask 0000
+  mkdir -p "$home/.config/dot" "$extensions/doctor.d"
+)
+chmod 0700 "$extensions" "$extensions/doctor.d"
 # shellcheck disable=SC2016 # Literal config grammar under test.
 printf '%s\n' \
   'version=1' \
@@ -285,7 +292,11 @@ git -C "$root" worktree remove --force "$linked_engine"
 # TERM-ignoring extension descendant.
 cancel_home=$DOT_TEST_TMP/doctor-cancel-home
 cancel_extensions=$cancel_home/extensions
-mkdir -p "$cancel_extensions/doctor.d"
+(
+  umask 0000
+  mkdir -p "$cancel_extensions/doctor.d"
+)
+chmod 0700 "$cancel_extensions" "$cancel_extensions/doctor.d"
 cat >"$cancel_extensions/doctor.d/10-cancellable.sh" <<'DOCTOR'
 doctor() {
   printf '%s\n' "$BASHPID" >"$HOME/doctor-worker.pid"
