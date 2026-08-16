@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+
+workflow=$DOT_TEST_ROOT/.github/workflows/ci.yml
+# shellcheck disable=SC2016 # The workflow must retain this literal shell expression.
+if ! grep -Fq '[[ -z "$modern_bash" || ! -x "$modern_bash" ]]' "$workflow"; then
+  fail 'modern Bash provisioning must validate the executable, not only its Homebrew prefix'
+fi
+
+printf 'workflow-test: ok\n'

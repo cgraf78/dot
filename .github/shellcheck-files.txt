@@ -79,3 +79,4 @@ program	tests/resources-test
 program	tests/run
 program	tests/shdeps-provider-test
 program	tests/update-lock-test
+program	tests/workflow-test
