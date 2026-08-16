@@ -185,7 +185,11 @@ doctor() {
   mode=$(stat -c '%a' "$TMPDIR" 2>/dev/null || stat -f '%Lp' "$TMPDIR") ||
     return 1
   (((8#$mode & 077) == 0)) || return 1
-  [[ -z $(trap -p) ]] || return 1
+  remaining_traps=$(trap -p)
+  case $remaining_traps in
+    '' | "trap -- '' SIGPIPE") ;;
+    *) return 1 ;;
+  esac
   ! IFS= read -r _ || return 1
   display=$(dot_doctor_display_path "$HOME/example") || return 1
   [[ $display == '~/example' ]] || return 1
@@ -210,9 +214,15 @@ export DOT_TEST_INHERITED_VARIABLE=present
 export BASH_ENV=$HOME/worker-bash-env
 shopt -s extglob
 export BASHOPTS
-PATH="$HOME/fake-bin:$PATH" _dot_extension_worker_run doctor \
-  "$trust_root/doctor.d/10-worker.sh" "$HOME/doctor-worker" \
-  "$HOME/doctor-results" || fail 'isolated doctor worker failed'
+(
+  # GitHub's runner enters the test shell with SIGPIPE ignored. Bash cannot
+  # reset a signal that was ignored when the interpreter started, so reproduce
+  # that host boundary even on local shells that begin with the default action.
+  trap '' PIPE
+  PATH="$HOME/fake-bin:$PATH" _dot_extension_worker_run doctor \
+    "$trust_root/doctor.d/10-worker.sh" "$HOME/doctor-worker" \
+    "$HOME/doctor-results"
+) || fail 'isolated doctor worker failed'
 shopt -u extglob
 unset BASH_ENV DOT_TEST_INHERITED_VARIABLE
 export -n -f dot_test_inherited_function

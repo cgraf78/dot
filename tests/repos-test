@@ -59,6 +59,132 @@ HOME=$init_namespace_home DOT_SOURCE_ROOT=$root bash --noprofile --norc -c '
 assert_eq 0 "$init_namespace_status" \
   'candidate validation reserves every same-parent init recovery namespace'
 
+# A caller can finish as soon as one reserved root matches, but the producer in
+# its process substitution must still be drained. Hosted CI enters Bash with
+# SIGPIPE ignored; closing the reader early therefore turns each later printf
+# into a noisy write error instead of terminating the producer silently.
+reserved_pipe_home=$DOT_TEST_TMP/reserved-pipe-home
+reserved_pipe_state=$DOT_TEST_TMP/reserved-pipe-state
+mkdir -p "$reserved_pipe_home" "$reserved_pipe_state"
+set +e
+reserved_pipe_output=$(HOME=$reserved_pipe_home \
+  XDG_STATE_HOME=$reserved_pipe_state DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    trap "" PIPE
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    OVERLAYS=()
+
+    # Delay the producer immediately after its first record so the old
+    # early-return consumer deterministically closes the pipe before record 2.
+    printf() {
+      local rc=0
+      builtin printf "$@" || rc=$?
+      if [[ ${1:-} == "%s\\n" && ${2:-} == "$XDG_STATE_HOME/dot" ]]; then
+        sleep 0.05
+      fi
+      if [[ $rc -ne 0 ]]; then
+        builtin printf "reserved-root producer wrote after reader exit\\n" >&2
+      fi
+      return "$rc"
+    }
+
+    dot_candidate_path_is_reserved "$XDG_STATE_HOME/dot/value"
+  ' 2>&1 >/dev/null)
+reserved_pipe_status=$?
+set -e
+assert_eq 0 "$reserved_pipe_status" \
+  'reserved-root lookup succeeds with an inherited ignored SIGPIPE'
+assert_eq '' "$reserved_pipe_output" \
+  'reserved-root lookup drains its producer without broken-pipe diagnostics'
+
+# Replacement identities are durable recovery data and therefore must use the
+# engine checkout's object format, not an exported repository selection from
+# the shell that happened to invoke dot. A SHA-256 decoy makes that drift
+# observable without mocking Git.
+replacement_identity_path=$DOT_TEST_TMP/replacement-identity-value
+replacement_identity_decoy=$DOT_TEST_TMP/replacement-identity-decoy
+printf 'replacement identity\n' >"$replacement_identity_path"
+git init -q --object-format=sha256 "$replacement_identity_decoy"
+replacement_identity_default=$(DOT_SOURCE_ROOT=$root \
+  DOT_TEST_REPLACEMENT_IDENTITY_PATH=$replacement_identity_path \
+  bash --noprofile --norc -c '
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _overlay_replacement_identity "$DOT_TEST_REPLACEMENT_IDENTITY_PATH"
+  ')
+replacement_identity_decoy_value=$(DOT_SOURCE_ROOT=$root \
+  DOT_TEST_REPLACEMENT_IDENTITY_PATH=$replacement_identity_path \
+  GIT_DIR=$replacement_identity_decoy/.git \
+  bash --noprofile --norc -c '
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _overlay_replacement_identity "$DOT_TEST_REPLACEMENT_IDENTITY_PATH"
+  ')
+assert_eq "$replacement_identity_default" "$replacement_identity_decoy_value" \
+  'replacement identity ignores an exported foreign Git repository'
+replacement_record_manifest=$DOT_TEST_TMP/replacement-record-state/overlay-links
+mkdir -p "${replacement_record_manifest%/*}"
+replacement_record_default=$(DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$replacement_record_manifest \
+  DOT_TEST_REPLACEMENT_IDENTITY_PATH=$replacement_identity_path \
+  bash --noprofile --norc -c '
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _overlay_replacement_record_path "$DOT_TEST_REPLACEMENT_IDENTITY_PATH"
+    printf "%s\n" "$REPLY"
+  ')
+replacement_record_decoy=$(DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$replacement_record_manifest \
+  DOT_TEST_REPLACEMENT_IDENTITY_PATH=$replacement_identity_path \
+  GIT_DIR=$replacement_identity_decoy/.git \
+  bash --noprofile --norc -c '
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _overlay_replacement_record_path "$DOT_TEST_REPLACEMENT_IDENTITY_PATH"
+    printf "%s\n" "$REPLY"
+  ')
+assert_eq "$replacement_record_default" "$replacement_record_decoy" \
+  'replacement record path ignores an exported foreign Git repository'
+
+replacement_record_home=$DOT_TEST_TMP/replacement-record-home
+mkdir -p "$replacement_record_home"
+replacement_record=$(HOME=$replacement_record_home DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$replacement_record_manifest \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    OVERLAYS=()
+    destination=$HOME/value
+    target=new-value
+    ln -s old-value "$destination"
+    expected=$(_overlay_replacement_identity "$destination")
+    _overlay_destination_context "$destination"
+    physical=$OVERLAY_PHYSICAL_DESTINATION
+    parent_identity=$OVERLAY_PARENT_IDENTITY
+    _overlay_replacement_record_path "$destination"
+    record=$REPLY
+    transaction=${physical%/*}/.${physical##*/}.dot-overlay-replace-v1
+    printf -v record_line "%s\t%s\t%s\t%s\t%s\t%s" \
+      "$destination" "$physical" "$target" "$expected" \
+      "$transaction" "$parent_identity"
+    _overlay_write_private_line "$record" "$record_line"
+    printf "%s\n" "$record"
+  ')
+HOME=$replacement_record_home DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$replacement_record_manifest \
+  DOT_TEST_REPLACEMENT_RECORD=$replacement_record \
+  GIT_DIR=$replacement_identity_decoy/.git \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _overlay_replacement_read "$DOT_TEST_REPLACEMENT_RECORD"
+    [[ $OVERLAY_REPLACE_IDENTITY_KIND == content ]]
+  '
+
 # Cron repair follows the configured upstream rather than assuming main.
 fixture_push update topic .testrc $'three\n' 100644
 printf 'three\n' >"$home/.testrc"
@@ -403,6 +529,7 @@ assert_eq foreign "$(<"$late_regular_home/value")" \
 replacement_race_home=$DOT_TEST_TMP/replacement-race-home
 replacement_race_bin=$DOT_TEST_TMP/replacement-race-bin
 replacement_race_state=$DOT_TEST_TMP/replacement-race-state
+replacement_race_real_stat=$(type -P stat)
 mkdir -p "$replacement_race_home" "$replacement_race_bin" \
   "$replacement_race_state"
 ln -s old-managed "$replacement_race_home/value"
@@ -420,19 +547,38 @@ if [[ ! -e ${DOT_TEST_REPLACEMENT_RACE_DONE:-} &&
 fi
 exec /usr/bin/mv "$@"
 MV
-chmod +x "$replacement_race_bin/mv"
+cat >"$replacement_race_bin/stat" <<'STAT'
+#!/usr/bin/env bash
+set -e
+last=${!#}
+if [[ ${1:-} == -c && ${2:-} == %d:%i ]] ||
+  [[ ${1:-} == -f && ${2:-} == %d:%i ]]; then
+  case $last in
+    "$DOT_TEST_REPLACEMENT_RACE_DEST" | \
+      */.value.dot-overlay-replace-v1/previous)
+      # Some filesystems can reuse a just-unlinked inode immediately. Force
+      # that ABA shape so the regression cannot depend on allocator behavior.
+      printf '1:1\n'
+      exit 0
+      ;;
+  esac
+fi
+exec "$DOT_TEST_REPLACEMENT_RACE_REAL_STAT" "$@"
+STAT
+chmod +x "$replacement_race_bin/mv" "$replacement_race_bin/stat"
 set +e
 HOME=$replacement_race_home DOT_SOURCE_ROOT=$root \
   DOT_OVERLAY_MANIFEST=$replacement_race_state/overlay-links \
   DOT_TEST_REPLACEMENT_RACE_DEST=$replacement_race_home/value \
   DOT_TEST_REPLACEMENT_RACE_DONE=$DOT_TEST_TMP/replacement-race-done \
+  DOT_TEST_REPLACEMENT_RACE_REAL_STAT=$replacement_race_real_stat \
   PATH="$replacement_race_bin:$PATH" bash --noprofile --norc -c '
     . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
     . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
     . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
     . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
     OVERLAYS=()
-    expected=$(_dot_path_identity "$HOME/value")
+    expected=$(_overlay_replacement_identity "$HOME/value")
     _overlay_publish_link new-managed "$HOME/value" "$expected"
   '
 replacement_race_status=$?
@@ -481,7 +627,7 @@ HOME=$replacement_mode_home DOT_SOURCE_ROOT=$root \
     . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
     . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
     OVERLAYS=()
-    expected=$(_dot_path_identity "$HOME/value")
+    expected=$(_overlay_replacement_identity "$HOME/value")
     _overlay_publish_link new-managed "$HOME/value" "$expected"
   '
 replacement_mode_status=$?
@@ -516,7 +662,7 @@ HOME=$replacement_recovery_home XDG_STATE_HOME=$replacement_recovery_state \
       local name=$1 phase=$2 destination=$HOME/$1 target=new-$1
       local expected physical parent_identity record transaction record_line
       ln -s old-$name "$destination"
-      expected=$(_dot_path_identity "$destination")
+      expected=$(_overlay_replacement_identity "$destination")
       _overlay_destination_context "$destination"
       physical=$OVERLAY_PHYSICAL_DESTINATION
       parent_identity=$OVERLAY_PARENT_IDENTITY
@@ -557,7 +703,7 @@ HOME=$replacement_recovery_home XDG_STATE_HOME=$replacement_recovery_state \
 
     destination=$HOME/malformed
     ln -s old-malformed "$destination"
-    expected=$(_dot_path_identity "$destination")
+    expected=$(_overlay_replacement_identity "$destination")
     _overlay_destination_context "$destination"
     physical=$OVERLAY_PHYSICAL_DESTINATION
     parent_identity=$OVERLAY_PARENT_IDENTITY
@@ -576,6 +722,108 @@ HOME=$replacement_recovery_home XDG_STATE_HOME=$replacement_recovery_state \
     fi
     [[ -L $destination && $(readlink "$destination") == old-malformed ]]
     [[ -f $record && -d $transaction && -f $transaction/foreign ]]
+  '
+
+# The previous released transaction format recorded only device and inode.
+# An upgrade can encounter any crash phase from those bytes, so recovery must
+# converge each exact engine-owned shape without making the legacy identity a
+# general authorization shortcut for malformed or foreign state.
+legacy_recovery_home=$DOT_TEST_TMP/legacy-replacement-recovery-home
+legacy_recovery_state=$DOT_TEST_TMP/legacy-replacement-recovery-state
+mkdir -p "$legacy_recovery_home" "$legacy_recovery_state"
+HOME=$legacy_recovery_home XDG_STATE_HOME=$legacy_recovery_state \
+  DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$legacy_recovery_state/overlay-links \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    OVERLAYS=()
+
+    materialize_legacy() {
+      local name=$1 phase=$2 destination=$HOME/$1 target=new-$1
+      local expected physical parent_identity record transaction record_line
+      ln -s old-$name "$destination"
+      expected=$(_dot_path_identity "$destination")
+      _overlay_destination_context "$destination"
+      physical=$OVERLAY_PHYSICAL_DESTINATION
+      parent_identity=$OVERLAY_PARENT_IDENTITY
+      _overlay_replacement_record_path "$destination"
+      record=$REPLY
+      transaction=${physical%/*}/.${physical##*/}.dot-overlay-replace-v1
+      printf -v record_line "%s\t%s\t%s\t%s\t%s\t%s" \
+        "$destination" "$physical" "$target" "$expected" \
+        "$transaction" "$parent_identity"
+      _overlay_write_private_line "$record" "$record_line"
+      if [[ $phase != record-only ]]; then
+        mkdir "$transaction"
+        chmod 0700 "$transaction"
+      fi
+      case $phase in
+        record-only) ;;
+        prepared)
+          ln -s "$target" "$transaction/next"
+          ;;
+        parked)
+          ln -s "$target" "$transaction/next"
+          mv "$physical" "$transaction/previous"
+          ;;
+        committed)
+          mv "$physical" "$transaction/previous"
+          ln -s "$target" "$physical"
+          ;;
+        terminal)
+          mv "$physical" "$transaction/previous"
+          ln -s "$target" "$physical"
+          rm -f "$transaction/previous"
+          ;;
+      esac
+      _overlay_recover_replacements
+      [[ ! -e $record && ! -L $record && ! -e $transaction && ! -L $transaction ]]
+      case $phase in
+        committed | terminal)
+          [[ -L $physical && $(readlink "$physical") == "$target" ]]
+          ;;
+        *)
+          [[ -L $physical && $(readlink "$physical") == old-$name ]]
+          ;;
+      esac
+    }
+
+    materialize_legacy legacy-record record-only
+    materialize_legacy legacy-prepared prepared
+    materialize_legacy legacy-parked parked
+    materialize_legacy legacy-committed committed
+    materialize_legacy legacy-terminal terminal
+
+    materialize_invalid_legacy() {
+      local name=$1 expected=$2 destination=$HOME/$1 target=new-$1
+      local physical parent_identity record transaction record_line
+      ln -s old-$name "$destination"
+      _overlay_destination_context "$destination"
+      physical=$OVERLAY_PHYSICAL_DESTINATION
+      parent_identity=$OVERLAY_PARENT_IDENTITY
+      _overlay_replacement_record_path "$destination"
+      record=$REPLY
+      transaction=${physical%/*}/.${physical##*/}.dot-overlay-replace-v1
+      printf -v record_line "%s\t%s\t%s\t%s\t%s\t%s" \
+        "$destination" "$physical" "$target" "$expected" \
+        "$transaction" "$parent_identity"
+      _overlay_write_private_line "$record" "$record_line"
+      mkdir "$transaction"
+      chmod 0700 "$transaction"
+      ln -s "$target" "$transaction/next"
+      if _overlay_recover_replacement "$record"; then
+        return 1
+      fi
+      [[ -L $physical && $(readlink "$physical") == old-$name ]]
+      [[ -f $record && -d $transaction && -L $transaction/next ]]
+    }
+
+    materialize_invalid_legacy legacy-wrong-generation 999999:999999
+    materialize_invalid_legacy legacy-malformed 1:2:3
   '
 
 # Recovery must make the same parent-generation decision as live publication.
@@ -604,7 +852,7 @@ HOME=$replacement_parent_home XDG_STATE_HOME=$replacement_parent_state \
 
     destination=$HOME/alias/value
     ln -s old-parent-generation "$destination"
-    expected=$(_dot_path_identity "$destination")
+    expected=$(_overlay_replacement_identity "$destination")
     _overlay_destination_context "$destination"
     physical=$OVERLAY_PHYSICAL_DESTINATION
     parent_identity=$OVERLAY_PARENT_IDENTITY

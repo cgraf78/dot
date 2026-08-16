@@ -148,14 +148,17 @@ _dot_reserved_roots() {
 }
 
 dot_path_is_reserved() {
-  local path=${1:-} root checkout parent name base
+  local path=${1:-} root checkout parent name base matched=1
 
   [[ $# -eq 1 && $path == /* ]] || return 2
   _dot_init_recovery_path_reserved "$path" && return 0
   while IFS= read -r root; do
     [[ -n "$root" ]] || continue
-    _dot_path_within "$path" "$root" && return 0
+    if _dot_path_within "$path" "$root"; then
+      matched=0
+    fi
   done < <(_dot_reserved_roots)
+  [[ $matched -eq 1 ]] || return 0
 
   checkout=${SHDEPS_INSTALL_DIR:-$HOME/.local/share}/cgraf78/dot
   parent=${checkout%/*}
@@ -180,15 +183,16 @@ dot_path_is_reserved() {
 # route to one (for example a tracked `.local` symlink). Normal Git directory
 # ancestors are absent from a recursive tree listing and remain allowed.
 dot_candidate_path_is_reserved() {
-  local path=${1:-} root physical
+  local path=${1:-} root physical matched=1
 
   [[ $# -eq 1 && $path == /* ]] || return 2
   while IFS= read -r root; do
     [[ -n $root ]] || continue
     if _dot_path_within "$path" "$root" || _dot_path_within "$root" "$path"; then
-      return 0
+      matched=0
     fi
   done < <(_dot_reserved_roots)
+  [[ $matched -eq 1 ]] || return 0
 
   # Candidate validation often runs before its parent directories exist. Map
   # the nearest existing ancestor physically and append the missing suffix;
@@ -197,12 +201,14 @@ dot_candidate_path_is_reserved() {
   if _dot_physical_directory_candidate "$path"; then
     physical=$REPLY
     _dot_init_recovery_path_reserved "$physical" && return 0
+    matched=1
     while IFS= read -r root; do
       [[ -n $root ]] || continue
       if _dot_path_within "$physical" "$root" || _dot_path_within "$root" "$physical"; then
-        return 0
+        matched=0
       fi
     done < <(_dot_reserved_roots)
+    [[ $matched -eq 1 ]] || return 0
   else
     return 0
   fi

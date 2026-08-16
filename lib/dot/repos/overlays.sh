@@ -389,7 +389,8 @@ _overlay_destination_context() {
 
 _overlay_replacement_record_path() {
   local destination=$1 hash
-  hash=$(printf '%s' "$destination" | git hash-object --stdin) || return 1
+  hash=$(printf '%s' "$destination" |
+    _overlay_replacement_hash_object --stdin) || return 1
   REPLY=${DOT_OVERLAY_MANIFEST}.replace.$hash
 }
 
@@ -415,6 +416,68 @@ _overlay_private_directory() {
   (((8#$mode & 077) == 0))
 }
 
+# Durable replacement identities and record names must not inherit the caller's
+# selected Git repository or configuration. Hash through the engine checkout in
+# a narrow sanitized subshell so its object format remains stable across crash
+# recovery even when dot was invoked from a different repository.
+_overlay_replacement_hash_object() (
+  unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
+  unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE GIT_CONFIG
+  unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT
+  unset GIT_CONFIG_PARAMETERS GIT_CONFIG_NOSYSTEM GIT_DEFAULT_HASH
+  export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+  command git -C "$DOT_SOURCE_ROOT" hash-object "$@"
+)
+
+# Device and inode alone are not a generation identity: a filesystem may reuse
+# an inode immediately after a late writer unlinks the validated destination.
+# Bind replacement authority to the no-follow mode, byte size, and exact
+# symlink-target/file bytes as well. The before/after metadata check rejects a
+# generation that changes while its fingerprint is being computed.
+_overlay_replacement_identity() {
+  local path=$1 identity metadata digest target
+  local identity_after metadata_after
+
+  identity=$(_dot_path_identity "$path") || return 1
+  metadata=$(stat -c '%f:%s' "$path" 2>/dev/null ||
+    stat -f '%p:%z' "$path" 2>/dev/null) || return 1
+  if [[ -L $path ]]; then
+    target=$(readlink "$path") || return 1
+    digest=$(printf '%s' "$target" |
+      _overlay_replacement_hash_object --stdin) || return 1
+  elif [[ -f $path ]]; then
+    digest=$(_overlay_replacement_hash_object --no-filters -- "$path") ||
+      return 1
+  else
+    return 1
+  fi
+  identity_after=$(_dot_path_identity "$path") || return 1
+  metadata_after=$(stat -c '%f:%s' "$path" 2>/dev/null ||
+    stat -f '%p:%z' "$path" 2>/dev/null) || return 1
+  [[ $identity_after == "$identity" && $metadata_after == "$metadata" ]] ||
+    return 1
+  printf '%s:%s:%s\n' "$identity" "$metadata" "$digest"
+}
+
+_overlay_replacement_generation_matches() {
+  local path=$1 expected=$2 identity_kind=$3 observed
+
+  case $identity_kind in
+    content)
+      observed=$(_overlay_replacement_identity "$path" 2>/dev/null) || return 1
+      ;;
+    legacy)
+      # Pre-content-identity releases stored only the no-follow device/inode
+      # pair. Limit that weaker authority to recovery records which have passed
+      # the surrounding private-record, exact-path, parent, and transaction
+      # validation; new publications never create this form.
+      observed=$(_dot_path_identity "$path" 2>/dev/null) || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  [[ $observed == "$expected" ]]
+}
+
 _overlay_replacement_transaction_safe() {
   local transaction=$1 entry nullglob_was_set=0 dotglob_was_set=0
   local -a entries=()
@@ -435,16 +498,24 @@ _overlay_replacement_transaction_safe() {
 
 _overlay_replacement_read() {
   local record=$1 line destination physical target expected transaction parent_identity extra
-  local hash expected_record expected_transaction
+  local hash expected_record expected_transaction identity_kind
   _overlay_private_regular_file "$record" || return 1
   line=$(<"$record")
   [[ $line != *$'\n'* ]] || return 1
   IFS=$'\t' read -r destination physical target expected transaction parent_identity extra <<<"$line"
   [[ -z $extra && $destination == /* && $physical == /* && $transaction == /* &&
     $target != *$'\t'* && $target != *$'\n'* && $target != *$'\r'* &&
-    $expected =~ ^[0-9]+:[0-9]+$ && $parent_identity =~ ^[0-9]+:[0-9]+$ ]] ||
+    $parent_identity =~ ^[0-9]+:[0-9]+$ ]] ||
     return 1
-  hash=$(printf '%s' "$destination" | git hash-object --stdin) || return 1
+  if [[ $expected =~ ^[0-9]+:[0-9]+:[0-9A-Fa-f]+:[0-9]+:([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+    identity_kind=content
+  elif [[ $expected =~ ^[0-9]+:[0-9]+$ ]]; then
+    identity_kind=legacy
+  else
+    return 1
+  fi
+  hash=$(printf '%s' "$destination" |
+    _overlay_replacement_hash_object --stdin) || return 1
   expected_record=${DOT_OVERLAY_MANIFEST}.replace.$hash
   [[ $record == "$expected_record" ]] || return 1
   expected_transaction=${physical%/*}/.${physical##*/}.dot-overlay-replace-v1
@@ -453,6 +524,7 @@ _overlay_replacement_read() {
   OVERLAY_REPLACE_PHYSICAL=$physical
   OVERLAY_REPLACE_TARGET=$target
   OVERLAY_REPLACE_EXPECTED=$expected
+  OVERLAY_REPLACE_IDENTITY_KIND=$identity_kind
   OVERLAY_REPLACE_TRANSACTION=$transaction
   OVERLAY_REPLACE_PARENT_IDENTITY=$parent_identity
 }
@@ -471,13 +543,14 @@ _overlay_replacement_cleanup() {
 
 _overlay_recover_replacement() {
   local record=$1 destination physical target expected transaction parent_identity
-  local previous=$record physical_parent current_identity previous_identity
+  local identity_kind previous=$record physical_parent previous_identity
   local lexical_parent_current=0
   _overlay_replacement_read "$record" || return 1
   destination=$OVERLAY_REPLACE_DESTINATION
   physical=$OVERLAY_REPLACE_PHYSICAL
   target=$OVERLAY_REPLACE_TARGET
   expected=$OVERLAY_REPLACE_EXPECTED
+  identity_kind=$OVERLAY_REPLACE_IDENTITY_KIND
   transaction=$OVERLAY_REPLACE_TRANSACTION
   parent_identity=$OVERLAY_REPLACE_PARENT_IDENTITY
   previous=$transaction/previous
@@ -490,8 +563,8 @@ _overlay_recover_replacement() {
   fi
 
   if [[ ! -e $transaction && ! -L $transaction ]]; then
-    current_identity=$(_dot_path_identity "$physical" 2>/dev/null || true)
-    [[ $current_identity == "$expected" ]] || return 1
+    _overlay_replacement_generation_matches "$physical" "$expected" "$identity_kind" ||
+      return 1
     rm -f -- "$record"
     return 0
   fi
@@ -502,15 +575,17 @@ _overlay_recover_replacement() {
   fi
 
   if [[ -e $previous || -L $previous ]]; then
-    previous_identity=$(_dot_path_identity "$previous") || return 1
+    _overlay_replacement_generation_matches "$previous" "$expected" "$identity_kind" ||
+      return 1
+    previous_identity=$(_overlay_replacement_identity "$previous") || return 1
     if [[ ! -e $physical && ! -L $physical ]]; then
       _dot_move_noreplace "$previous" "$physical" || return 1
-      [[ $(_dot_path_identity "$physical" 2>/dev/null || true) == "$previous_identity" ]] ||
+      [[ $(_overlay_replacement_identity "$physical" 2>/dev/null || true) == "$previous_identity" ]] ||
         return 1
       _overlay_replacement_cleanup "$record" "$transaction" "$target"
       return
     fi
-    if [[ $previous_identity == "$expected" && -L $physical &&
+    if [[ -L $physical &&
       $(readlink "$physical") == "$target" ]]; then
       if [[ $lexical_parent_current -eq 1 ]]; then
         rm -f -- "$previous" || return 1
@@ -534,8 +609,7 @@ _overlay_recover_replacement() {
     return 1
   fi
 
-  current_identity=$(_dot_path_identity "$physical" 2>/dev/null || true)
-  if [[ $current_identity == "$expected" ]]; then
+  if _overlay_replacement_generation_matches "$physical" "$expected" "$identity_kind"; then
     _overlay_replacement_cleanup "$record" "$transaction" "$target"
   elif [[ -L $physical && $(readlink "$physical") == "$target" ]]; then
     _overlay_replacement_cleanup "$record" "$transaction" "$target"
@@ -579,7 +653,7 @@ _overlay_publish_link() {
     return 1
   fi
   if [[ -n $expected_identity ]]; then
-    if [[ $(_dot_path_identity "$destination" 2>/dev/null || true) != "$expected_identity" ]]; then
+    if [[ $(_overlay_replacement_identity "$destination" 2>/dev/null || true) != "$expected_identity" ]]; then
       rm -f -- "$staged"
       rmdir "$stage" 2>/dev/null || true
       return 1
@@ -606,7 +680,7 @@ _overlay_publish_link() {
       _overlay_recover_replacement "$record" || true
       return 1
     fi
-    parked_identity=$(_dot_path_identity "$previous") || return 1
+    parked_identity=$(_overlay_replacement_identity "$previous") || return 1
     if [[ $parked_identity != "$expected_identity" ]]; then
       _dot_move_noreplace "$previous" "$physical" || return 1
       _overlay_replacement_cleanup "$record" "$transaction" "$target" || return 1
@@ -797,7 +871,7 @@ _link_overlay() {
         _warn "  skip (would replace unmanaged symlink): $rel"
         continue
       fi
-      replace_identity=$(_dot_path_identity "$dst") || return 1
+      replace_identity=$(_overlay_replacement_identity "$dst") || return 1
     elif [[ -e "$dst" ]]; then
       if [[ -d "$dst" ]]; then
         _warn "  skip (directory in the way): $rel"
@@ -811,7 +885,7 @@ _link_overlay() {
         _warn "  skip (would clobber modified tracked file): $rel"
         continue
       fi
-      replace_identity=$(_dot_path_identity "$dst") || return 1
+      replace_identity=$(_overlay_replacement_identity "$dst") || return 1
     fi
     # Re-check immediately before the link mutation. A previous writer in this
     # run may have introduced a symlinked parent after the initial preflight.

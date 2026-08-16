@@ -18,9 +18,11 @@ key. Duplicate identities are fatal before any extension runs. Each extension
 runs in a fresh invocation of the absolute Bash selected by the `dot` launcher;
 `PATH` cannot substitute another interpreter. Workers use `--noprofile` and
 `--norc`, start in `$HOME`, close stdin, set `umask 077`, enable
-`errexit`/`nounset`/`pipefail`, clear traps, and start with `extglob`,
-`nocasematch`, and `nullglob` disabled. Each worker receives a different
-private `TMPDIR`.
+`errexit`/`nounset`/`pipefail`, clear every resettable trap, and start with
+`extglob`, `nocasematch`, and `nullglob` disabled. POSIX shell semantics do not
+let a shell reset a signal it inherited as ignored, so that one host
+disposition (notably GitHub runners' ignored `SIGPIPE`) can remain visible.
+Each worker receives a different private `TMPDIR`.
 
 Ordinary exported client variables remain available because configuration
 policy can legitimately depend on platform and tool context. Bash startup and
