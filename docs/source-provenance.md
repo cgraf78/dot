@@ -2,7 +2,7 @@
 
 This repository has fresh history. Public engine extraction used only the
 public `cgraf78/dotfiles` tree at commit
-`81bb961a7405dc713eba65fd1a53682f44489c5d`; no implementation or fixture was
+`1f178787fbb7fc4dfdacbabea01fc196cf6aa462`; no implementation or fixture was
 copied from a private overlay repository. New standalone-only seams are marked
 as such below rather than being attributed to an older file.
 
@@ -10,7 +10,7 @@ as such below rather than being attributed to an older file.
 
 | Standalone path | Public source or origin | Notes |
 | --- | --- | --- |
-| `install.sh` | `cgraf78/actions` checkout-installer at `8ed24ec2f6955aa3bf1177ecab2e88ca19bd6f7d` | Generated, never hand-edited |
+| `install.sh` | `cgraf78/actions` checkout-installer at `d77303b78ba5db9efa1ac0d14a717ea1ea360d2d` | Generated, never hand-edited |
 | `support/checkout-bash-v1.sh` | `actions:checkout-installer/bash-resolver-v1.sh.in` at the same revision | Generated from the resolver embedded in `install.sh` |
 | `support/shdeps.lock` | `cgraf78/shdeps` at `a49dcb4d9d70d4f781053c90e42f52fe39400242` | Pins revision, installer digest, and ABI |
 
