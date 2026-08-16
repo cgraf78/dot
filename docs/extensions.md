@@ -88,6 +88,9 @@ merge() {
   done < <(dot_family_files "$family")
   dot_family_files_matching "$family" '*.json' >/dev/null || return
 
+  dot_hook_platform_match 'linux,macos' || return 0
+  dot_hook_host_match '!retired-host' || return 0
+
   expanded=$(dot_expand_home '$HOME/.config/example/config') || return
   dot_xdg_path config example/config || return
   destination=$REPLY

@@ -21,5 +21,7 @@ dot_managed_block_merge	DESTINATION [BLOCK...]	0 success; 1 failure; 2 invalid a
 dot_managed_block_merge_family	DESTINATION MARKER_PREFIX [BLOCK...]	0 success; 1 failure; 2 invalid arguments	atomically replaces a complete marker family after hand-managed content
 dot_xdg_path	KIND RELATIVE_SUFFIX	0 success; 1 no absolute base; 2 invalid arguments	sets REPLY to an absolute XDG path
 dot_tool_present	COMMAND_OR_PATH	0 present; 1 absent; 2 invalid arguments	checks one literal executable name or filesystem path
+dot_hook_platform_match	FILTER	0 matched; 1 unmatched; 2 invalid arguments	matches the current normalized platform against the generic include/exclude filter grammar
+dot_hook_host_match	FILTER	0 matched; 1 unmatched; 2 invalid arguments	matches the lowercase current host against the generic include/exclude filter grammar
 dot_hook_log	TEXT...	0 success	prints unless quiet mode is active
 dot_hook_warn	TEXT...	0 success	prints a warning to stderr

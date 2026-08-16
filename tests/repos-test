@@ -24,6 +24,41 @@ assert_eq no "$(git --git-dir="$home/.dotfiles" config status.showUntrackedFiles
 assert_eq '' "$(git --git-dir="$home/.dotfiles" config --local --get pull.rebase 2>/dev/null || true)" \
   'base update does not write pull policy'
 
+# Client trees may not occupy deterministic same-parent init staging or
+# rollback namespaces. Candidate inventories contain leaves, so cover both a
+# direct file and a descendant below a stage-shaped directory at root/nested
+# depths for every reserved prefix.
+init_namespace_status=0
+init_namespace_home=$DOT_TEST_TMP/init-namespace-home
+mkdir -p \
+  "$init_namespace_home/.dot-init-entry.physical" \
+  "$init_namespace_home/.dot-init-parent.physical" \
+  "$init_namespace_home/.dot-init-delete.physical"
+ln -s .dot-init-entry.physical "$init_namespace_home/entry-alias"
+ln -s .dot-init-parent.physical "$init_namespace_home/parent-alias"
+ln -s .dot-init-delete.physical "$init_namespace_home/delete-alias"
+HOME=$init_namespace_home DOT_SOURCE_ROOT=$root bash --noprofile --norc -c '
+  set -euo pipefail
+  . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+  OVERLAYS=()
+  for candidate in \
+    "$HOME/.dot-init-entry.fixture.path" \
+    "$HOME/nested/.dot-init-entry.fixture.path/owned" \
+    "$HOME/.dot-init-parent.fixture.path" \
+    "$HOME/nested/.dot-init-parent.fixture.path/owned" \
+    "$HOME/.dot-init-delete.fixture.path" \
+    "$HOME/nested/.dot-init-delete.fixture.path/owned" \
+    "$HOME/entry-alias/owned" \
+    "$HOME/parent-alias/owned" \
+    "$HOME/delete-alias/owned"; do
+    dot_candidate_path_is_reserved "$candidate"
+  done
+' || init_namespace_status=$?
+assert_eq 0 "$init_namespace_status" \
+  'candidate validation reserves every same-parent init recovery namespace'
+
 # Cron repair follows the configured upstream rather than assuming main.
 fixture_push update topic .testrc $'three\n' 100644
 printf 'three\n' >"$home/.testrc"
@@ -409,6 +444,56 @@ assert_eq 1 "$replacement_race_status" \
 assert_eq foreign "$(<"$replacement_race_home/value")" \
   'replacement-boundary overlay winner bytes are preserved'
 
+# The replacement transaction is recovery authority as soon as mkdir returns.
+# It must therefore be private at creation time, not only after a follow-up
+# chmod that SIGKILL could prevent. Force that chmod to fail and inspect the
+# already-created directory under an ordinary permissive caller umask.
+replacement_mode_home=$DOT_TEST_TMP/replacement-mode-home
+replacement_mode_state=$DOT_TEST_TMP/replacement-mode-state
+replacement_mode_bin=$DOT_TEST_TMP/replacement-mode-bin
+replacement_mode_record=$DOT_TEST_TMP/replacement-mode-record
+replacement_mode_chmod=$(type -P chmod)
+mkdir -p "$replacement_mode_home" "$replacement_mode_state" \
+  "$replacement_mode_bin"
+ln -s old-managed "$replacement_mode_home/value"
+cat >"$replacement_mode_bin/chmod" <<'CHMOD'
+#!/usr/bin/env bash
+set -e
+last=${!#}
+if [[ $last == *.dot-overlay-replace-v1 ]]; then
+  mode=$(stat -c '%a' "$last" 2>/dev/null || stat -f '%Lp' "$last")
+  printf '%s\n' "$mode" >"$DOT_TEST_REPLACEMENT_MODE_RECORD"
+  exit 1
+fi
+exec "$DOT_TEST_REPLACEMENT_MODE_CHMOD" "$@"
+CHMOD
+chmod +x "$replacement_mode_bin/chmod"
+set +e
+HOME=$replacement_mode_home DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$replacement_mode_state/overlay-links \
+  DOT_TEST_REPLACEMENT_MODE_RECORD=$replacement_mode_record \
+  DOT_TEST_REPLACEMENT_MODE_CHMOD=$replacement_mode_chmod \
+  PATH="$replacement_mode_bin:$PATH" bash --noprofile --norc -c '
+    set -euo pipefail
+    umask 022
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    OVERLAYS=()
+    expected=$(_dot_path_identity "$HOME/value")
+    _overlay_publish_link new-managed "$HOME/value" "$expected"
+  '
+replacement_mode_status=$?
+set -e
+assert_eq 1 "$replacement_mode_status" \
+  'replacement transaction chmod failure aborts publication'
+assert_eq 700 "$(<"$replacement_mode_record")" \
+  'replacement transaction is private before follow-up chmod'
+[[ -L $replacement_mode_home/value &&
+  $(readlink "$replacement_mode_home/value") == old-managed ]] ||
+  fail 'replacement transaction mode probe changed the authorized destination'
+
 # The durable replacement record must classify and converge every filesystem
 # phase independently of the current overlay configuration: preparation rolls
 # back, a parked old generation is restored, and a published desired link
@@ -492,6 +577,89 @@ HOME=$replacement_recovery_home XDG_STATE_HOME=$replacement_recovery_state \
     [[ -L $destination && $(readlink "$destination") == old-malformed ]]
     [[ -f $record && -d $transaction && -f $transaction/foreign ]]
   '
+
+# Recovery must make the same parent-generation decision as live publication.
+# If a user retargets a symlinked parent after the desired link was published
+# but before the transaction committed, restore the exact parked generation in
+# the original physical parent instead of silently committing a now-detached
+# replacement.
+replacement_parent_home=$DOT_TEST_TMP/replacement-parent-home
+replacement_parent_state=$DOT_TEST_TMP/replacement-parent-state
+replacement_parent_original=$DOT_TEST_TMP/replacement-parent-original
+replacement_parent_new=$DOT_TEST_TMP/replacement-parent-new
+mkdir -p "$replacement_parent_home" "$replacement_parent_state" \
+  "$replacement_parent_original" "$replacement_parent_new"
+ln -s "$replacement_parent_original" "$replacement_parent_home/alias"
+HOME=$replacement_parent_home XDG_STATE_HOME=$replacement_parent_state \
+  DOT_SOURCE_ROOT=$root \
+  DOT_TEST_REPLACEMENT_PARENT_NEW=$replacement_parent_new \
+  DOT_OVERLAY_MANIFEST=$replacement_parent_state/overlay-links \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    OVERLAYS=()
+
+    destination=$HOME/alias/value
+    ln -s old-parent-generation "$destination"
+    expected=$(_dot_path_identity "$destination")
+    _overlay_destination_context "$destination"
+    physical=$OVERLAY_PHYSICAL_DESTINATION
+    parent_identity=$OVERLAY_PARENT_IDENTITY
+    _overlay_replacement_record_path "$destination"
+    record=$REPLY
+    transaction=${physical%/*}/.${physical##*/}.dot-overlay-replace-v1
+    printf -v record_line "%s\t%s\t%s\t%s\t%s\t%s" \
+      "$destination" "$physical" new-parent-generation "$expected" \
+      "$transaction" "$parent_identity"
+    _overlay_write_private_line "$record" "$record_line"
+    mkdir "$transaction"
+    chmod 0700 "$transaction"
+    mv "$physical" "$transaction/previous"
+    ln -s new-parent-generation "$physical"
+
+    unlink "$HOME/alias"
+    ln -s "$DOT_TEST_REPLACEMENT_PARENT_NEW" "$HOME/alias"
+    _overlay_recover_replacements
+
+    [[ -L $physical && $(readlink "$physical") == old-parent-generation ]]
+    [[ ! -e $record && ! -L $record && ! -e $transaction && ! -L $transaction ]]
+    [[ ! -e $HOME/alias/value && ! -L $HOME/alias/value ]]
+  '
+
+# Physical aliases for a reserved root must exist before the reserved leaf
+# itself does. A candidate can otherwise traverse a second symlink to the same
+# physical parent and create the missing control-plane directory during
+# checkout before a later validation has anything realpath(1) can resolve.
+reserved_alias_home=$DOT_TEST_TMP/reserved-alias-home
+reserved_alias_physical=$DOT_TEST_TMP/reserved-alias-physical
+reserved_alias_bin=$DOT_TEST_TMP/reserved-alias-bin
+mkdir -p "$reserved_alias_home" "$reserved_alias_physical" \
+  "$reserved_alias_bin"
+ln -s "$reserved_alias_physical" "$reserved_alias_home/state-link"
+ln -s "$reserved_alias_physical" "$reserved_alias_home/other-link"
+cat >"$reserved_alias_bin/realpath" <<'REALPATH'
+#!/usr/bin/env bash
+exit 1
+REALPATH
+chmod +x "$reserved_alias_bin/realpath"
+set +e
+HOME=$reserved_alias_home XDG_STATE_HOME=$reserved_alias_home/state-link \
+  DOT_SOURCE_ROOT=$root PATH="$reserved_alias_bin:$PATH" \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    OVERLAYS=()
+    dot_candidate_path_is_reserved "$HOME/other-link/dot/owned"
+  '
+reserved_alias_status=$?
+set -e
+assert_eq 0 "$reserved_alias_status" \
+  'missing reserved leaf retains physical symlink-parent containment'
 
 # Lexically ordinary destinations may resolve through a user symlink into dot
 # or provider state. Physical containment is part of reserved-path ownership.

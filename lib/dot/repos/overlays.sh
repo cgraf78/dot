@@ -472,6 +472,7 @@ _overlay_replacement_cleanup() {
 _overlay_recover_replacement() {
   local record=$1 destination physical target expected transaction parent_identity
   local previous=$record physical_parent current_identity previous_identity
+  local lexical_parent_current=0
   _overlay_replacement_read "$record" || return 1
   destination=$OVERLAY_REPLACE_DESTINATION
   physical=$OVERLAY_REPLACE_PHYSICAL
@@ -483,6 +484,10 @@ _overlay_recover_replacement() {
   physical_parent=${physical%/*}
   [[ $(_dot_path_identity "$physical_parent" 2>/dev/null || true) == "$parent_identity" ]] ||
     return 1
+  if _dot_physical_leaf_candidate "$destination" &&
+    [[ $REPLY == "$physical" && $REPLY_PARENT_IDENTITY == "$parent_identity" ]]; then
+    lexical_parent_current=1
+  fi
 
   if [[ ! -e $transaction && ! -L $transaction ]]; then
     current_identity=$(_dot_path_identity "$physical" 2>/dev/null || true)
@@ -507,7 +512,22 @@ _overlay_recover_replacement() {
     fi
     if [[ $previous_identity == "$expected" && -L $physical &&
       $(readlink "$physical") == "$target" ]]; then
-      rm -f -- "$previous" || return 1
+      if [[ $lexical_parent_current -eq 1 ]]; then
+        rm -f -- "$previous" || return 1
+      else
+        # The desired link was published into the original physical parent,
+        # but the user's lexical parent now names a different generation. Park
+        # the exact generated link before restoring the exact old generation;
+        # every move is exclusive so a late third-party winner survives.
+        [[ ! -e $transaction/next && ! -L $transaction/next ]] || return 1
+        _dot_move_noreplace "$physical" "$transaction/next" || return 1
+        if [[ ! -L $transaction/next ||
+          $(readlink "$transaction/next") != "$target" ]]; then
+          _dot_move_noreplace "$transaction/next" "$physical" || true
+          return 1
+        fi
+        _dot_move_noreplace "$previous" "$physical" || return 1
+      fi
       _overlay_replacement_cleanup "$record" "$transaction" "$target"
       return
     fi
@@ -574,7 +594,10 @@ _overlay_publish_link() {
     _overlay_write_private_line "$record" \
       "$destination"$'\t'"$physical"$'\t'"$target"$'\t'"$expected_identity"$'\t'"$transaction"$'\t'"$parent_identity" ||
       return 1
-    mkdir "$transaction" || return 1
+    # The directory becomes durable recovery authority as soon as mkdir
+    # succeeds. Create it under a private umask so SIGKILL cannot strand a
+    # briefly world-readable transaction before the defensive chmod below.
+    (umask 077 && mkdir "$transaction") || return 1
     chmod 0700 "$transaction" || return 1
     _dot_move_noreplace "$staged" "$transaction/next" || return 1
     rmdir "$stage" 2>/dev/null || return 1

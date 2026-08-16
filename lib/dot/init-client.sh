@@ -172,22 +172,63 @@ _dot_init_private_directory() {
 }
 
 _dot_init_prepare_transaction() {
-  local transaction=$1 stage
+  local transaction=$1 stage marker
   _dot_init_private_directory "${transaction%/*}" || return 1
   stage=$(mktemp -d "${transaction}.prepare.XXXXXX") || return 1
   chmod 0700 "$stage" || return 1
+  # A matching pathname is not ownership evidence. Publish this exact private
+  # marker before the directory can become an orphan so a later invocation
+  # removes only a preparation generation that dot can prove it created.
+  marker=$stage/.dot-transaction-stage-v1
+  printf 'cgraf78 dot initialization preparation v1\n' >"$marker" || return 1
+  chmod 0600 "$marker" || return 1
   REPLY=$stage
+}
+
+_dot_init_transaction_stage_owned() {
+  local stage=$1 marker=$1/.dot-transaction-stage-v1 mode links
+
+  [[ -d $stage && ! -L $stage && -O $stage ]] || return 1
+  mode=$(stat -c '%a' "$stage" 2>/dev/null || stat -f '%Lp' "$stage" 2>/dev/null) ||
+    return 1
+  [[ $mode != *[!0-7]* ]] || return 1
+  (((8#$mode & 077) == 0)) || return 1
+  [[ -f $marker && ! -L $marker && -O $marker ]] || return 1
+  mode=$(stat -c '%a' "$marker" 2>/dev/null || stat -f '%Lp' "$marker" 2>/dev/null) ||
+    return 1
+  links=$(stat -c '%h' "$marker" 2>/dev/null || stat -f '%l' "$marker" 2>/dev/null) ||
+    return 1
+  [[ $mode == 600 && $links == 1 ]] || return 1
+  printf 'cgraf78 dot initialization preparation v1\n' | cmp -s - "$marker"
+}
+
+_dot_init_recover_transaction_stages() {
+  local transaction=$1 stage nullglob_was_set=0
+  local -a stages=()
+
+  shopt -q nullglob && nullglob_was_set=1
+  shopt -s nullglob
+  stages=("$transaction".prepare.*)
+  [[ $nullglob_was_set -eq 1 ]] || shopt -u nullglob
+  for stage in "${stages[@]+"${stages[@]}"}"; do
+    _dot_init_transaction_stage_owned "$stage" || continue
+    rm -rf -- "$stage" || return 1
+  done
 }
 
 _dot_init_publish_transaction() {
   local stage=$1 transaction=$2
-  [[ -d $stage && ! -L $stage && -f $stage/record && ! -L $stage/record ]] ||
+  _dot_init_transaction_stage_owned "$stage" || return 1
+  [[ -f $stage/record && ! -L $stage/record ]] ||
     return 1
   _dot_move_noreplace "$stage" "$transaction"
 }
 
 _dot_init_symlink_blob_safe() {
   local repo=$1 branch=$2 path=$3 raw size
+  # Read the blob without command substitution: shell variables cannot retain
+  # NUL, while tabs and newlines cannot be represented in the TSV journals.
+  # Reject those bytes before any client path or Git directory is published.
   _dot_cleanup_mktemp || return 1
   raw=$REPLY
   if ! git -C "$repo" show "$branch:$path" >"$raw"; then
@@ -825,38 +866,132 @@ _dot_init_publish_intent() {
   _dot_init_write_private_line "$file" "$line"
 }
 
+_dot_init_stage_claim_file() {
+  REPLY=$1/.dot-init-stage-claim-v1
+}
+
+_dot_init_stage_claim_matches() {
+  local stage=$1 kind=$2 path=$3 marker mode links
+
+  case $kind in entry | parent) ;; *) return 1 ;; esac
+  _dot_init_safe_relative_path "$path" || return 1
+  _dot_init_stage_claim_file "$stage"
+  marker=$REPLY
+  [[ -f $marker && ! -L $marker && -O $marker ]] || return 1
+  mode=$(stat -c '%a' "$marker" 2>/dev/null || stat -f '%Lp' "$marker" 2>/dev/null) ||
+    return 1
+  links=$(stat -c '%h' "$marker" 2>/dev/null || stat -f '%l' "$marker" 2>/dev/null) ||
+    return 1
+  [[ $mode == 600 && $links == 1 ]] || return 1
+  {
+    printf 'cgraf78 dot publication stage claim v1\n'
+    printf 'kind=%s\nnonce=%s\npath=%s\n' "$kind" "$DOT_INIT_NONCE" "$path"
+  } | cmp -s - "$marker"
+}
+
+_dot_init_stage_claim_write() {
+  local stage=$1 kind=$2 path=$3 marker temporary
+
+  _dot_init_stage_claim_file "$stage"
+  marker=$REPLY
+  [[ ! -e $marker && ! -L $marker ]] || return 1
+  _dot_sibling_tmp_for "$marker" || return 1
+  temporary=$REPLY
+  {
+    printf 'cgraf78 dot publication stage claim v1\n'
+    printf 'kind=%s\nnonce=%s\npath=%s\n' "$kind" "$DOT_INIT_NONCE" "$path"
+  } >"$temporary" || return 1
+  chmod 0600 "$temporary" || return 1
+  _dot_move_noreplace "$temporary" "$marker" || return 1
+  _dot_init_stage_claim_matches "$stage" "$kind" "$path"
+}
+
+_dot_init_stage_claim_only() {
+  local stage=$1 entry nullglob_was_set=0 dotglob_was_set=0
+  local -a entries=()
+
+  shopt -q nullglob && nullglob_was_set=1
+  shopt -q dotglob && dotglob_was_set=1
+  shopt -s nullglob dotglob
+  entries=("$stage"/*)
+  [[ $nullglob_was_set -eq 1 ]] || shopt -u nullglob
+  [[ $dotglob_was_set -eq 1 ]] || shopt -u dotglob
+  ((${#entries[@]} == 1)) || return 1
+  [[ ${entries[0]##*/} == .dot-init-stage-claim-v1 ]]
+}
+
+_dot_init_stage_claim_remove() {
+  local stage=$1 kind=$2 path=$3 marker
+
+  _dot_init_stage_claim_matches "$stage" "$kind" "$path" || return 1
+  _dot_init_stage_claim_file "$stage"
+  marker=$REPLY
+  rm -f -- "$marker"
+}
+
 _dot_init_parent_record() {
-  local transaction=$1 relative=$2 hash file line record_parent stage_rel dev ino extra expected
+  local transaction=$1 relative=$2 hash file line phase record_parent stage_rel
+  local dev ino mode extra expected
   hash=$(printf '%s' "$relative" | git hash-object --stdin) || return 1
   file=$transaction/parent-intent.$hash
   [[ -f $file && ! -L $file ]] || return 1
   line=$(<"$file")
   [[ $line != *$'\n'* ]] || return 1
-  IFS=$'\t' read -r record_parent stage_rel dev ino extra <<<"$line"
+  IFS=$'\t' read -r phase record_parent stage_rel dev ino mode extra <<<"$line"
   expected="$HOME/${relative%/*}"
   [[ ${relative%/*} != "$relative" ]] || expected=$HOME
   expected=${expected%/}/.dot-init-parent.$DOT_INIT_NONCE.$hash
-  [[ -z $extra && $record_parent == "$relative" &&
-    $stage_rel == "${expected#"$HOME"/}" &&
-    $dev =~ ^[0-9]+$ && $ino =~ ^[0-9]+$ ]] || return 1
-  REPLY="$stage_rel"$'\t'"$dev"$'\t'"$ino"
+  [[ -z $extra && ($phase == pending || $phase == prepared) &&
+    $record_parent == "$relative" &&
+    $stage_rel == "${expected#"$HOME"/}" ]] || return 1
+  if [[ $phase == prepared ]]; then
+    [[ $dev =~ ^[0-9]+$ && $ino =~ ^[0-9]+$ &&
+      $mode =~ ^[0-7]+$ ]] || return 1
+  else
+    [[ $dev == - && $ino == - && $mode == - ]] || return 1
+  fi
+  REPLY="$phase"$'\t'"$stage_rel"$'\t'"$dev"$'\t'"$ino"$'\t'"$mode"
 }
 
-_dot_init_private_empty_directory() {
-  local path=$1 mode
+# Parent publication uses two durable phases. `pending` reserves the exact
+# transaction-derived stage path before mkdir; `prepared` binds that path to
+# its device, inode, and mode before rename. Recovery therefore never guesses
+# that an unrelated directory merely resembling a stage belongs to dot.
+_dot_init_private_directory_matches() {
+  local path=$1 expected_identity=${2:-} expected_mode=${3:-}
+  local mode
+
   [[ -d $path && ! -L $path && -O $path ]] || return 1
   mode=$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null) ||
     return 1
   [[ $mode != *[!0-7]* ]] || return 1
   (((8#$mode & 077) == 0)) || return 1
-  rmdir "$path" 2>/dev/null || return 1
-  mkdir "$path" || return 1
-  chmod 0700 "$path"
+  [[ -z $expected_mode || $mode == "$expected_mode" ]] || return 1
+  [[ -z $expected_identity ]] ||
+    [[ $(_dot_path_identity "$path" 2>/dev/null || true) == "$expected_identity" ]] ||
+    return 1
+}
+
+_dot_init_private_empty_directory_matches() {
+  local path=$1 expected_identity=${2:-} expected_mode=${3:-}
+  local nullglob_was_set=0 dotglob_was_set=0
+  local -a entries=()
+
+  _dot_init_private_directory_matches "$path" "$expected_identity" "$expected_mode" ||
+    return 1
+
+  shopt -q nullglob && nullglob_was_set=1
+  shopt -q dotglob && dotglob_was_set=1
+  shopt -s nullglob dotglob
+  entries=("$path"/*)
+  [[ $nullglob_was_set -eq 1 ]] || shopt -u nullglob
+  [[ $dotglob_was_set -eq 1 ]] || shopt -u dotglob
+  ((${#entries[@]} == 0))
 }
 
 _dot_init_parent_directories() {
   local transaction=$1 relative=$2 current=$HOME component parent parent_rel=''
-  local hash intent stage stage_rel identity dev ino record extra
+  local hash intent stage stage_rel identity dev ino mode phase record extra
   local -a parts=()
   parent=${relative%/*}
   [[ $parent != "$relative" ]] || return 0
@@ -870,35 +1005,55 @@ _dot_init_parent_directories() {
     stage_rel=${stage#"$HOME"/}
     if [[ -e $intent || -L $intent ]]; then
       _dot_init_parent_record "$transaction" "$parent_rel" || return 1
-      IFS=$'\t' read -r record dev ino <<<"$REPLY"
+      IFS=$'\t' read -r phase record dev ino mode <<<"$REPLY"
       [[ $record == "$stage_rel" ]] || return 1
-      if [[ -e $current || -L $current ]]; then
-        [[ -d $current && ! -L $current &&
-          $(_dot_path_identity "$current" 2>/dev/null || true) == "$dev:$ino" ]] ||
-          return 1
-        continue
-      fi
-      [[ -d $stage && ! -L $stage &&
-        $(_dot_path_identity "$stage" 2>/dev/null || true) == "$dev:$ino" ]] ||
-        return 1
     elif [[ -e $current || -L $current ]]; then
       [[ -d $current && ! -L $current ]] || return 1
       continue
     else
-      if [[ -e $stage || -L $stage ]]; then
-        _dot_init_private_empty_directory "$stage" || return 1
-      else
+      [[ ! -e $stage && ! -L $stage ]] || return 1
+      _dot_init_write_private_line "$intent" \
+        "pending"$'\t'"$parent_rel"$'\t'"$stage_rel"$'\t-\t-\t-' || return 1
+      phase=pending
+    fi
+    if [[ $phase == pending ]]; then
+      [[ ! -e $current && ! -L $current ]] || return 1
+      if [[ ! -e $stage && ! -L $stage ]]; then
         mkdir "$stage" || return 1
         chmod 0700 "$stage" || return 1
+        _dot_init_stage_claim_write "$stage" parent "$parent_rel" || return 1
+      else
+        # The pending record reserves this pathname, but a directory that won
+        # after record publication is still foreign unless it carries the
+        # exact claim written by the engine that created it.
+        _dot_init_stage_claim_matches "$stage" parent "$parent_rel" || return 1
       fi
+      _dot_init_private_directory_matches "$stage" || return 1
+      _dot_init_stage_claim_only "$stage" || return 1
       identity=$(_dot_path_identity "$stage") || return 1
       dev=${identity%%:*}
       ino=${identity#*:}
+      mode=$(stat -c '%a' "$stage" 2>/dev/null || stat -f '%Lp' "$stage" 2>/dev/null) ||
+        return 1
       _dot_init_write_private_line "$intent" \
-        "$parent_rel"$'\t'"$stage_rel"$'\t'"$dev"$'\t'"$ino" || return 1
+        "prepared"$'\t'"$parent_rel"$'\t'"$stage_rel"$'\t'"$dev"$'\t'"$ino"$'\t'"$mode" true || return 1
+      phase=prepared
     fi
+    [[ $phase == prepared ]] || return 1
+    if [[ -e $current || -L $current ]]; then
+      [[ ! -e $stage && ! -L $stage ]] || return 1
+      _dot_init_private_directory_matches "$current" "$dev:$ino" "$mode" ||
+        return 1
+      continue
+    fi
+    _dot_init_private_directory_matches "$stage" "$dev:$ino" "$mode" || return 1
+    if [[ -e $stage/.dot-init-stage-claim-v1 || -L $stage/.dot-init-stage-claim-v1 ]]; then
+      _dot_init_stage_claim_only "$stage" || return 1
+      _dot_init_stage_claim_remove "$stage" parent "$parent_rel" || return 1
+    fi
+    _dot_init_private_empty_directory_matches "$stage" "$dev:$ino" "$mode" || return 1
     _dot_move_noreplace "$stage" "$current" || return 1
-    [[ $(_dot_path_identity "$current" 2>/dev/null || true) == "$dev:$ino" ]] ||
+    _dot_init_private_directory_matches "$current" "$dev:$ino" "$mode" ||
       return 1
   done
 }
@@ -912,16 +1067,58 @@ _dot_init_entry_intent() {
   IFS=$'\t' read -r phase mode oid path stage dev ino next_dev next_ino extra <<<"$line"
   _dot_init_entry_stage "$expected_path" || return 1
   expected_stage=${REPLY#"$HOME"/}
-  [[ -z $extra && ($phase == pending || $phase == prepared) &&
+  [[ -z $extra && ($phase == pending || $phase == staged || $phase == prepared) &&
     $mode == "$expected_mode" && $oid == "$expected_oid" &&
     $path == "$expected_path" && $stage == "$expected_stage" ]] || return 1
   if [[ $phase == prepared ]]; then
     [[ $dev =~ ^[0-9]+$ && $ino =~ ^[0-9]+$ &&
       $next_dev =~ ^[0-9]+$ && $next_ino =~ ^[0-9]+$ ]] || return 1
+  elif [[ $phase == staged ]]; then
+    [[ $dev =~ ^[0-9]+$ && $ino =~ ^[0-9]+$ &&
+      $next_dev == - && $next_ino == - ]] || return 1
   else
     [[ $dev == - && $ino == - && $next_dev == - && $next_ino == - ]] || return 1
   fi
   REPLY="$phase"$'\t'"$stage"$'\t'"$dev"$'\t'"$ino"$'\t'"$next_dev"$'\t'"$next_ino"
+}
+
+_dot_init_entry_stage_valid() {
+  local stage=$1 expected_identity=${2:-} mode
+
+  [[ -d $stage && ! -L $stage && -O $stage ]] || return 1
+  mode=$(stat -c '%a' "$stage" 2>/dev/null || stat -f '%Lp' "$stage" 2>/dev/null) ||
+    return 1
+  [[ $mode != *[!0-7]* ]] || return 1
+  (((8#$mode & 077) == 0)) || return 1
+  [[ -z $expected_identity ]] ||
+    [[ $(_dot_path_identity "$stage" 2>/dev/null || true) == "$expected_identity" ]]
+}
+
+_dot_init_entry_stage_only_next() {
+  local stage=$1 entry nullglob_was_set=0 dotglob_was_set=0
+  local -a entries=()
+
+  shopt -q nullglob && nullglob_was_set=1
+  shopt -q dotglob && dotglob_was_set=1
+  shopt -s nullglob dotglob
+  entries=("$stage"/*)
+  [[ $nullglob_was_set -eq 1 ]] || shopt -u nullglob
+  [[ $dotglob_was_set -eq 1 ]] || shopt -u dotglob
+  for entry in "${entries[@]+"${entries[@]}"}"; do
+    case ${entry##*/} in
+      next | .dot-init-stage-claim-v1) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+_dot_init_discard_staged_next() {
+  local stage=$1 next=$1/next
+
+  _dot_init_entry_stage_only_next "$stage" || return 1
+  [[ -e $next || -L $next ]] || return 0
+  [[ (-f $next && ! -L $next) || -L $next ]] || return 1
+  rm -f -- "$next"
 }
 
 _dot_init_publish_one() {
@@ -936,47 +1133,66 @@ _dot_init_publish_one() {
   next=$stage/next
   if [[ $phase == pending ]]; then
     if [[ -e $stage || -L $stage ]]; then
-      [[ -d $stage && ! -L $stage && -O $stage ]] || return 1
+      _dot_init_entry_stage_valid "$stage" || return 1
+      _dot_init_stage_claim_matches "$stage" entry "$path" || return 1
+      _dot_init_entry_stage_only_next "$stage" || return 1
+      [[ ! -e $next && ! -L $next ]] || return 1
     else
       mkdir "$stage" || return 1
       chmod 0700 "$stage" || return 1
+      _dot_init_stage_claim_write "$stage" entry "$path" || return 1
     fi
-    if [[ ! -e $next && ! -L $next ]]; then
-      case $mode in
-        100644 | 100755)
-          git --git-dir="$git_dir" show "$commit:$path" >"$next" || return 1
-          if [[ $mode == 100755 ]]; then chmod 0755 "$next"; else chmod 0644 "$next"; fi ||
-            return 1
-          ;;
-        120000)
-          link_target=$(
-            git --git-dir="$git_dir" show "$commit:$path"
-            printf .
-          ) || return 1
-          link_target=${link_target%.}
-          _dot_init_safe_value "$link_target" || return 1
-          ln -s "$link_target" "$next" || return 1
-          ;;
-        *) return 1 ;;
-      esac
-    fi
-    _dot_init_candidate_matches_git "$git_dir" "$commit" "$mode" "$oid" \
-      "${next#"$HOME"/}" || return 1
     identity=$(_dot_path_identity "$stage") || return 1
     stage_dev=${identity%%:*}
     stage_ino=${identity#*:}
+    # Bind the private container before redirection can create a partial next
+    # file. A crash during `git show` can then be rolled back without treating
+    # the incomplete bytes as a completed candidate generation.
+    _dot_init_write_private_line "$intent" \
+      "staged"$'\t'"$mode"$'\t'"$oid"$'\t'"$path"$'\t'"$stage_rel"$'\t'"$stage_dev"$'\t'"$stage_ino"$'\t-\t-' true || return 1
+    phase=staged
+  fi
+  if [[ $phase == staged ]]; then
+    _dot_init_entry_stage_valid "$stage" "$stage_dev:$stage_ino" || return 1
+    _dot_init_stage_claim_matches "$stage" entry "$path" || return 1
+    _dot_init_discard_staged_next "$stage" || return 1
+    case $mode in
+      100644 | 100755)
+        git --git-dir="$git_dir" show "$commit:$path" >"$next" || return 1
+        if [[ $mode == 100755 ]]; then chmod 0755 "$next"; else chmod 0644 "$next"; fi ||
+          return 1
+        ;;
+      120000)
+        link_target=$(
+          git --git-dir="$git_dir" show "$commit:$path"
+          printf .
+        ) || return 1
+        link_target=${link_target%.}
+        _dot_init_safe_value "$link_target" || return 1
+        ln -s "$link_target" "$next" || return 1
+        ;;
+      *) return 1 ;;
+    esac
+    _dot_init_candidate_matches_git "$git_dir" "$commit" "$mode" "$oid" \
+      "${next#"$HOME"/}" || return 1
     identity=$(_dot_path_identity "$next") || return 1
     next_dev=${identity%%:*}
     next_ino=${identity#*:}
     _dot_init_write_private_line "$intent" \
       "prepared"$'\t'"$mode"$'\t'"$oid"$'\t'"$path"$'\t'"$stage_rel"$'\t'"$stage_dev"$'\t'"$stage_ino"$'\t'"$next_dev"$'\t'"$next_ino" true || return 1
   fi
-  [[ $(_dot_path_identity "$stage" 2>/dev/null || true) == "$stage_dev:$stage_ino" &&
-  $(_dot_path_identity "$next" 2>/dev/null || true) == "$next_dev:$next_ino" ]] ||
+  _dot_init_entry_stage_valid "$stage" "$stage_dev:$stage_ino" || return 1
+  _dot_init_stage_claim_matches "$stage" entry "$path" || return 1
+  _dot_init_entry_stage_only_next "$stage" || return 1
+  [[ $(_dot_path_identity "$next" 2>/dev/null || true) == "$next_dev:$next_ino" ]] ||
+    return 1
+  _dot_init_candidate_matches_git "$git_dir" "$commit" "$mode" "$oid" \
+    "${next#"$HOME"/}" ||
     return 1
   _dot_move_noreplace "$next" "$target" || return 1
   [[ $(_dot_path_identity "$target" 2>/dev/null || true) == "$next_dev:$next_ino" ]] ||
     return 1
+  _dot_init_stage_claim_remove "$stage" entry "$path" || return 1
   rmdir "$stage" 2>/dev/null || return 1
   _dot_init_candidate_matches_git "$git_dir" "$commit" "$mode" "$oid" "$path"
 }
@@ -991,6 +1207,25 @@ _dot_init_prior_record() {
   return 1
 }
 
+_dot_init_published_stage_matches() {
+  local stage=$1 expected_identity=$2 path=$3 marker
+
+  # Once the leaf is published, the prepared intent's recorded stage inode is
+  # durable authority. The claim may still exist, or it may have been consumed
+  # immediately before an interrupted rmdir; only an unchanged empty mode-700
+  # directory is valid in the latter state.
+  _dot_init_private_directory_matches "$stage" "$expected_identity" 700 || return 1
+  _dot_init_entry_stage_only_next "$stage" || return 1
+  [[ ! -e $stage/next && ! -L $stage/next ]] || return 1
+  _dot_init_stage_claim_file "$stage"
+  marker=$REPLY
+  if [[ -e $marker || -L $marker ]]; then
+    _dot_init_stage_claim_matches "$stage" entry "$path"
+  else
+    _dot_init_private_empty_directory_matches "$stage" "$expected_identity" 700
+  fi
+}
+
 _dot_init_published_intent_matches() {
   local file=$1 mode=$2 oid=$3 path=$4 phase stage_rel stage_dev stage_ino next_dev next_ino
   local stage=$HOME
@@ -1001,24 +1236,29 @@ _dot_init_published_intent_matches() {
     return 1
   stage=$HOME/$stage_rel
   if [[ -e $stage || -L $stage ]]; then
-    [[ -d $stage && ! -L $stage &&
-      $(_dot_path_identity "$stage" 2>/dev/null || true) == "$stage_dev:$stage_ino" ]] ||
+    _dot_init_published_stage_matches "$stage" "$stage_dev:$stage_ino" "$path" ||
       return 1
   fi
-  REPLY=$stage
+  REPLY="$stage"$'\t'"$stage_dev:$stage_ino"
 }
 
 _dot_init_cleanup_published_stage() {
-  local stage=$1
+  local stage=$1 expected_identity=$2 path=$3 marker
   [[ ! -e $stage && ! -L $stage ]] && return 0
-  [[ -d $stage && ! -L $stage ]] || return 1
+  _dot_init_published_stage_matches "$stage" "$expected_identity" "$path" || return 1
+  _dot_init_stage_claim_file "$stage"
+  marker=$REPLY
+  if [[ -e $marker || -L $marker ]]; then
+    _dot_init_stage_claim_remove "$stage" entry "$path" || return 1
+  fi
+  _dot_init_private_empty_directory_matches "$stage" "$expected_identity" 700 || return 1
   rmdir "$stage"
 }
 
 _dot_init_publish_worktree() {
   local transaction=$1 tree prior
   local intents=$transaction/publish-intent mode oid path record kind dev ino old_mode size value
-  local intent_hash intent_file
+  local intent_hash intent_file published_stage published_stage_identity
   local git_dir=$DOT_INIT_GIT_DIR
 
   tree=$transaction/tree.tsv
@@ -1038,7 +1278,9 @@ _dot_init_publish_worktree() {
         continue
       fi
       if _dot_init_published_intent_matches "$intent_file" "$mode" "$oid" "$path"; then
-        _dot_init_cleanup_published_stage "$REPLY" || return 1
+        IFS=$'\t' read -r published_stage published_stage_identity <<<"$REPLY"
+        _dot_init_cleanup_published_stage "$published_stage" \
+          "$published_stage_identity" "$path" || return 1
         continue
       fi
       return 1
@@ -1185,40 +1427,126 @@ _dot_init_status() {
   fi
 }
 
+_dot_init_delete_park_path() {
+  local target=$1 kind=$2 key=$3 hash parent
+
+  case $kind in leaf | parent | git) ;; *) return 1 ;; esac
+  hash=$(printf '%s\t%s' "$kind" "$key" | git hash-object --stdin) || return 1
+  parent=${target%/*}
+  [[ -n $parent && $parent != "$target" ]] || return 1
+  REPLY=$parent/.dot-init-delete.$DOT_INIT_NONCE.$kind.$hash
+}
+
+_dot_init_leaf_delete_matches() {
+  local candidate=$1 expected_identity=$2 git_dir=$3 commit=$4 mode=$5 oid=$6
+  local relative
+
+  [[ $(_dot_path_identity "$candidate" 2>/dev/null || true) == "$expected_identity" ]] ||
+    return 1
+  [[ $candidate == "$HOME/"* ]] || return 1
+  relative=${candidate#"$HOME"/}
+  _dot_init_candidate_matches_git "$git_dir" "$commit" "$mode" "$oid" "$relative"
+}
+
+_dot_init_parent_delete_matches() {
+  local candidate=$1 expected_identity=$2 expected_mode=$3
+  _dot_init_private_empty_directory_matches "$candidate" \
+    "$expected_identity" "$expected_mode"
+}
+
+_dot_init_git_delete_matches() {
+  local candidate=$1 expected_identity=$2
+  [[ $(_dot_path_identity "$candidate" 2>/dev/null || true) == "$expected_identity" ]] ||
+    return 1
+  _dot_init_generation_matches "$candidate"
+}
+
+# Deletion by pathname is unsafe after validation because another process can
+# replace that pathname before rm/rmdir runs. Select one generation first with
+# an exclusive same-parent rename, validate the parked inode and contents, and
+# remove only that parked generation. If validation fails, restore a generation
+# parked by this invocation only while the original destination remains vacant.
+_dot_init_delete_parked_generation() {
+  local target=$1 park=$2 remover=$3 verifier=$4
+  local parked_now=0 parked_identity='' target_won=0
+  shift 4
+
+  if [[ ! -e $park && ! -L $park ]]; then
+    [[ -e $target || -L $target ]] || return 0
+    _dot_move_noreplace "$target" "$park" || return 1
+    parked_now=1
+  fi
+  if ! "$verifier" "$park" "$@"; then
+    if [[ $parked_now -eq 1 && ! -e $target && ! -L $target ]]; then
+      parked_identity=$(_dot_path_identity "$park") || return 1
+      _dot_move_noreplace "$park" "$target" || return 1
+      [[ $(_dot_path_identity "$target" 2>/dev/null || true) == "$parked_identity" ]] ||
+        return 1
+    fi
+    return 1
+  fi
+
+  [[ ! -e $target && ! -L $target ]] || target_won=1
+  # Revalidate immediately before removal so a changed parked generation is
+  # preserved rather than deleted merely because it occupies the park name.
+  "$verifier" "$park" "$@" || return 1
+  case $remover in
+    leaf) rm -f -- "$park" || return 1 ;;
+    parent) rmdir "$park" || return 1 ;;
+    tree) rm -rf -- "$park" || return 1 ;;
+    *) return 1 ;;
+  esac
+  [[ ! -e $park && ! -L $park && $target_won -eq 0 ]]
+}
+
 _dot_init_rollback_entry() {
   local intent=$1 mode=$2 oid=$3 path=$4 phase stage_rel stage_dev stage_ino
-  local next_dev next_ino stage target=$HOME/$4
+  local next_dev next_ino stage target=$HOME/$4 park
   _dot_init_entry_intent "$intent" "$mode" "$oid" "$path" || return 1
   IFS=$'\t' read -r phase stage_rel stage_dev stage_ino next_dev next_ino <<<"$REPLY"
   stage=$HOME/$stage_rel
-  if [[ -e $target || -L $target ]]; then
-    [[ $phase == prepared &&
-      $(_dot_path_identity "$target" 2>/dev/null || true) == "$next_dev:$next_ino" ]] ||
-      return 1
-    rm -f -- "$target" || return 1
+  _dot_init_delete_park_path "$target" leaf "$path" || return 1
+  park=$REPLY
+  if [[ -e $target || -L $target || -e $park || -L $park ]]; then
+    [[ $phase == prepared ]] || return 1
+    _dot_init_delete_parked_generation "$target" "$park" leaf \
+      _dot_init_leaf_delete_matches "$next_dev:$next_ino" \
+      "$DOT_INIT_GIT_DIR" "$DOT_INIT_COMMIT" "$mode" "$oid" || return 1
   fi
   if [[ -e $stage || -L $stage ]]; then
-    [[ -d $stage && ! -L $stage && -O $stage ]] || return 1
-    if [[ $phase == prepared ]]; then
-      [[ $(_dot_path_identity "$stage" 2>/dev/null || true) == "$stage_dev:$stage_ino" ]] ||
-        return 1
-    fi
-    if [[ -e $stage/next || -L $stage/next ]]; then
-      if [[ $phase == prepared ]]; then
-        [[ $(_dot_path_identity "$stage/next" 2>/dev/null || true) == "$next_dev:$next_ino" ]] ||
-          return 1
-      else
-        _dot_init_candidate_matches_git "$DOT_INIT_GIT_DIR" "$DOT_INIT_COMMIT" \
-          "$mode" "$oid" "${stage#"$HOME"/}/next" || return 1
-      fi
-      rm -f -- "$stage/next" || return 1
-    fi
+    case $phase in
+      pending)
+        _dot_init_entry_stage_valid "$stage" || return 1
+        _dot_init_stage_claim_matches "$stage" entry "$path" || return 1
+        _dot_init_entry_stage_only_next "$stage" || return 1
+        [[ ! -e $stage/next && ! -L $stage/next ]] || return 1
+        ;;
+      staged)
+        _dot_init_entry_stage_valid "$stage" "$stage_dev:$stage_ino" || return 1
+        _dot_init_stage_claim_matches "$stage" entry "$path" || return 1
+        _dot_init_discard_staged_next "$stage" || return 1
+        ;;
+      prepared)
+        _dot_init_entry_stage_valid "$stage" "$stage_dev:$stage_ino" || return 1
+        _dot_init_stage_claim_matches "$stage" entry "$path" || return 1
+        _dot_init_entry_stage_only_next "$stage" || return 1
+        if [[ -e $stage/next || -L $stage/next ]]; then
+          [[ $(_dot_path_identity "$stage/next" 2>/dev/null || true) == "$next_dev:$next_ino" ]] ||
+            return 1
+          _dot_init_candidate_matches_git "$DOT_INIT_GIT_DIR" "$DOT_INIT_COMMIT" \
+            "$mode" "$oid" "${stage#"$HOME"/}/next" || return 1
+          rm -f -- "$stage/next" || return 1
+        fi
+        ;;
+      *) return 1 ;;
+    esac
+    _dot_init_stage_claim_remove "$stage" entry "$path" || return 1
     rmdir "$stage" || return 1
   fi
 }
 
 _dot_init_rollback_parents() {
-  local transaction=$1 file line parent stage_rel dev ino target stage
+  local transaction=$1 file line parent phase stage_rel dev ino mode target stage park
   local nullglob_was_set=0
   local -a files=() records=()
   shopt -q nullglob && nullglob_was_set=1
@@ -1226,34 +1554,48 @@ _dot_init_rollback_parents() {
   files=("$transaction"/parent-intent.*)
   [[ $nullglob_was_set -eq 1 ]] || shopt -u nullglob
   for file in "${files[@]+"${files[@]}"}"; do
+    [[ ${file##*/} != parent-intent.*.tmp.* ]] || continue
     line=$(<"$file")
-    IFS=$'\t' read -r parent _ <<<"$line"
+    IFS=$'\t' read -r phase parent _ <<<"$line"
+    [[ $phase == pending || $phase == prepared ]] || return 1
     _dot_init_safe_relative_path "$parent" || return 1
     records+=("$parent"$'\t'"$file")
   done
   while IFS=$'\t' read -r parent file; do
     [[ -n $parent && -n $file ]] || continue
     _dot_init_parent_record "$transaction" "$parent" || return 1
-    IFS=$'\t' read -r stage_rel dev ino <<<"$REPLY"
+    IFS=$'\t' read -r phase stage_rel dev ino mode <<<"$REPLY"
     target=$HOME/$parent
     stage=$HOME/$stage_rel
-    if [[ -e $target || -L $target ]]; then
-      [[ -d $target && ! -L $target &&
-        $(_dot_path_identity "$target" 2>/dev/null || true) == "$dev:$ino" ]] ||
-        return 1
-      rmdir "$target" || return 1
+    _dot_init_delete_park_path "$target" parent "$parent" || return 1
+    park=$REPLY
+    if [[ -e $target || -L $target || -e $park || -L $park ]]; then
+      [[ $phase == prepared && ! -e $stage && ! -L $stage ]] || return 1
+      _dot_init_delete_parked_generation "$target" "$park" parent \
+        _dot_init_parent_delete_matches "$dev:$ino" "$mode" || return 1
     fi
     if [[ -e $stage || -L $stage ]]; then
-      [[ -d $stage && ! -L $stage &&
-        $(_dot_path_identity "$stage" 2>/dev/null || true) == "$dev:$ino" ]] ||
-        return 1
+      [[ ! -e $target && ! -L $target ]] || return 1
+      if [[ $phase == prepared ]]; then
+        _dot_init_private_directory_matches "$stage" "$dev:$ino" "$mode" || return 1
+        if [[ -e $stage/.dot-init-stage-claim-v1 || -L $stage/.dot-init-stage-claim-v1 ]]; then
+          _dot_init_stage_claim_only "$stage" || return 1
+          _dot_init_stage_claim_remove "$stage" parent "$parent" || return 1
+        fi
+        _dot_init_private_empty_directory_matches "$stage" "$dev:$ino" "$mode" || return 1
+      else
+        _dot_init_private_directory_matches "$stage" || return 1
+        _dot_init_stage_claim_only "$stage" || return 1
+        _dot_init_stage_claim_remove "$stage" parent "$parent" || return 1
+        _dot_init_private_empty_directory_matches "$stage" || return 1
+      fi
       rmdir "$stage" || return 1
     fi
   done < <(printf '%s\n' "${records[@]+"${records[@]}"}" | LC_ALL=C sort -r)
 }
 
 _dot_init_rollback_published() {
-  local transaction=$1 tree mode oid path hash intent
+  local transaction=$1 tree mode oid path hash intent git_park
   tree=$transaction/tree.tsv
   if [[ -f $tree ]]; then
     while IFS=$'\t' read -r mode oid path; do
@@ -1264,9 +1606,12 @@ _dot_init_rollback_published() {
     done < <(LC_ALL=C sort -r -t $'\t' -k3,3 "$tree")
     _dot_init_rollback_parents "$transaction" || return 1
   fi
-  if [[ -e $DOT_INIT_GIT_DIR || -L $DOT_INIT_GIT_DIR ]]; then
-    _dot_init_generation_matches "$DOT_INIT_GIT_DIR" || return 1
-    rm -rf -- "$DOT_INIT_GIT_DIR" || return 1
+  _dot_init_delete_park_path "$DOT_INIT_GIT_DIR" git "$DOT_INIT_GIT_DIR" || return 1
+  git_park=$REPLY
+  if [[ -e $DOT_INIT_GIT_DIR || -L $DOT_INIT_GIT_DIR ||
+    -e $git_park || -L $git_park ]]; then
+    _dot_init_delete_parked_generation "$DOT_INIT_GIT_DIR" "$git_park" tree \
+      _dot_init_git_delete_matches "$DOT_INIT_GIT_DEV:$DOT_INIT_GIT_INO" || return 1
   fi
   local container=$DOT_INIT_BACKUP/git-stage
   if [[ -e $container || -L $container ]]; then
@@ -1434,6 +1779,7 @@ dot_init_command() {
   _dot_init_transaction_dir || return 1
   transaction=$REPLY
   record=$transaction/record
+  _dot_init_recover_transaction_stages "$transaction" || return 1
   if [[ -e $transaction || -L $transaction ]]; then
     _dot_init_read_record "$record" ||
       _dot_init_error "malformed initialization transaction: $transaction" || return

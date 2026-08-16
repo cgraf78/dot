@@ -124,6 +124,74 @@ dot_tool_present() {
   esac
 }
 
+_dot_hook_platform() {
+  local value
+
+  if [[ -n ${WSL_DISTRO_NAME:-} || -n ${WSL_INTEROP:-} ]] ||
+    { [[ -r /proc/sys/kernel/osrelease ]] &&
+      grep -qi microsoft /proc/sys/kernel/osrelease; }; then
+    printf 'wsl\n'
+    return
+  fi
+  value=$(uname -s 2>/dev/null) || return 1
+  value=${value,,}
+  [[ $value == darwin ]] && value=macos
+  printf '%s\n' "$value"
+}
+
+_dot_hook_host() {
+  local value
+
+  value=$(hostname -s 2>/dev/null || hostname 2>/dev/null) || return 1
+  printf '%s\n' "${value,,}"
+}
+
+_dot_hook_match_specs() {
+  local spec=$1 case_mode=$2 current=$3 item normalized
+  local has_include=false
+  local -a items=()
+
+  [[ -n $spec ]] || return 0
+  IFS=, read -r -a items <<<"$spec"
+  for item in "${items[@]}"; do
+    [[ -n $item ]] || continue
+    if [[ $case_mode == lowercase ]]; then
+      normalized=${item,,}
+    else
+      normalized=$item
+    fi
+    [[ $normalized == '!'* ]] || has_include=true
+    [[ $normalized == "!$current" ]] && return 1
+  done
+  [[ $has_include == false ]] && return 0
+  for item in "${items[@]}"; do
+    [[ -n $item ]] || continue
+    [[ $case_mode == lowercase ]] && item=${item,,}
+    [[ $item == "$current" ]] && return 0
+  done
+  return 1
+}
+
+dot_hook_platform_match() {
+  local platform
+
+  [[ $# -eq 1 ]] || return 2
+  platform=$(_dot_hook_platform) || return 1
+  _dot_hook_match_specs "$1" exact "$platform" && return 0
+  if [[ -n ${PREFIX:-} && $PREFIX == */com.termux/* ]]; then
+    _dot_hook_match_specs "$1" exact android && return 0
+  fi
+  return 1
+}
+
+dot_hook_host_match() {
+  local host
+
+  [[ $# -eq 1 ]] || return 2
+  host=$(_dot_hook_host) || return 1
+  _dot_hook_match_specs "$1" lowercase "$host"
+}
+
 dot_hook_log() {
   _log "$@"
 }

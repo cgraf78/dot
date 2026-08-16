@@ -21,6 +21,8 @@ export HOME DOT_SOURCE_ROOT DOT_EXTENSIONS_DIR
 . "$root/lib/dot/merge-block.sh"
 # shellcheck source=../lib/dot/merge-hooks.sh
 . "$root/lib/dot/merge-hooks.sh"
+# shellcheck source=../lib/dot/platform.sh
+. "$root/lib/dot/platform.sh"
 # shellcheck source=../lib/dot/hook-api.sh
 . "$root/lib/dot/hook-api.sh"
 
@@ -45,6 +47,34 @@ assert_eq '10-one.txt' \
 assert_eq '10-one.txt' \
   "$(dot_hook_family_marker_name fixture "$family_root/10-one.txt")" \
   'hook family API returns a marker-safe identity'
+
+for filter in '' linux macos wsl android '!linux' 'linux,!macos'; do
+  platform_status=0
+  hook_status=0
+  dot_platform_match "$filter" || platform_status=$?
+  dot_hook_platform_match "$filter" || hook_status=$?
+  assert_eq "$platform_status" "$hook_status" \
+    "hook platform matcher conforms for [$filter]"
+done
+for filter in '' fixture-host '!fixture-host' 'fixture-host,!other'; do
+  host_status=0
+  hook_status=0
+  dot_host_match "$filter" || host_status=$?
+  dot_hook_host_match "$filter" || hook_status=$?
+  assert_eq "$host_status" "$hook_status" \
+    "hook host matcher conforms for [$filter]"
+done
+
+_dot_hook_platform() { printf 'linux\n'; }
+_dot_hook_host() { printf 'fixture-host\n'; }
+dot_hook_platform_match linux || fail 'hook platform matcher rejected current platform'
+if dot_hook_platform_match macos; then
+  fail 'hook platform matcher accepted a different platform'
+fi
+dot_hook_host_match FIXTURE-HOST || fail 'hook host matcher is not case-insensitive'
+if dot_hook_host_match '!fixture-host'; then
+  fail 'hook host matcher ignored an exclusion'
+fi
 
 text_target=$HOME/generated/config
 mkdir -p "${text_target%/*}"

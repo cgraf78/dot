@@ -102,6 +102,11 @@ cat >"$active_overlay/home/$extension_rel" <<'HOOK'
 merge() {
   family=$(dot_hook_family example) || return 1
   [[ $family == "$HOME/.config/dot/merge-hooks.d/example" ]] || return 1
+  declare -F dot_hook_platform_match >/dev/null || return 1
+  declare -F dot_hook_host_match >/dev/null || return 1
+  ! declare -F dot_platform_match >/dev/null || return 1
+  ! declare -F dot_host_match >/dev/null || return 1
+  ! declare -F _require_sudo >/dev/null || return 1
   dot_tool_present git
 }
 HOOK

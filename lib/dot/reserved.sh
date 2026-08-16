@@ -5,6 +5,30 @@ _dot_path_within() {
   [[ "$1" == "$2" || "$1" == "$2"/* ]]
 }
 
+_dot_init_recovery_path_reserved() {
+  local path=$1 relative component
+  local -a components=()
+
+  [[ -n ${HOME:-} && $path == /* ]] || return 1
+  if [[ $HOME == / ]]; then
+    relative=${path#/}
+  else
+    case $path in
+      "$HOME"/*) relative=${path#"$HOME"/} ;;
+      *) return 1 ;;
+    esac
+  fi
+  IFS=/ read -r -a components <<<"$relative"
+  for component in "${components[@]}"; do
+    case $component in
+      .dot-init-entry.* | .dot-init-parent.* | .dot-init-delete.*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
 _dot_normalize_absolute_path() {
   local input=${1:-} component output=/
   local -a parts=() normalized=()
@@ -76,8 +100,15 @@ _dot_reserved_root() {
   _dot_normalize_absolute_path "$requested" || return 1
   normalized=$REPLY
   printf '%s\n' "$normalized"
-  physical=$(realpath "$normalized" 2>/dev/null || true)
-  [[ -z $physical || $physical == "$normalized" ]] || printf '%s\n' "$physical"
+  # BSD realpath requires the complete path to exist, while reserved roots
+  # frequently name state that dot has not created yet. Resolve the deepest
+  # existing directory ancestor as a portable fallback so a symlinked parent
+  # cannot hide the physical control-plane path during candidate validation.
+  if ! physical=$(realpath "$normalized" 2>/dev/null); then
+    _dot_physical_directory_candidate "$normalized" || return 1
+    physical=$REPLY
+  fi
+  [[ $physical == "$normalized" ]] || printf '%s\n' "$physical"
 }
 
 _dot_reserved_roots() {
@@ -120,6 +151,7 @@ dot_path_is_reserved() {
   local path=${1:-} root checkout parent name base
 
   [[ $# -eq 1 && $path == /* ]] || return 2
+  _dot_init_recovery_path_reserved "$path" && return 0
   while IFS= read -r root; do
     [[ -n "$root" ]] || continue
     _dot_path_within "$path" "$root" && return 0
@@ -164,6 +196,7 @@ dot_candidate_path_is_reserved() {
   # not while inspecting an inert tree.
   if _dot_physical_directory_candidate "$path"; then
     physical=$REPLY
+    _dot_init_recovery_path_reserved "$physical" && return 0
     while IFS= read -r root; do
       [[ -n $root ]] || continue
       if _dot_path_within "$physical" "$root" || _dot_path_within "$root" "$physical"; then

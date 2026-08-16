@@ -254,6 +254,23 @@ assert_contains 'active dot revision is unavailable after provider update' \
   "$(<"$invalid_revision_output")" \
   'provider explains an invalid post-update checkout'
 
+missing_revision_output=$DOT_TEST_TMP/provider-missing-revision-output
+set +e
+(
+  HOME=$provider_home
+  XDG_STATE_HOME=$provider_state
+  DOT_SOURCE_ROOT=$root
+  _dot_active_revision() { :; }
+  _dot_provider_maybe_reexec "$before_revision"
+) >"$missing_revision_output" 2>&1
+missing_revision_status=$?
+set -e
+assert_eq 1 "$missing_revision_status" \
+  'provider fails closed when the post-update revision is missing'
+assert_contains 'active dot revision is unavailable after provider update' \
+  "$(<"$missing_revision_output")" \
+  'provider explains a missing post-update checkout revision'
+
 # The re-exec target is checkout-relative and argv remains an array. A fake
 # Graphviz `dot` first on PATH must never be consulted by this handoff.
 reexec_root=$DOT_TEST_TMP/reexec-root

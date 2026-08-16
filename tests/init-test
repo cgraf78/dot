@@ -58,6 +58,64 @@ for partial_shape in empty tree prior conflicts record-temp; do
   rm -rf "$partial_transaction"
 done
 
+# Transaction preparation happens beside the canonical authority directory and
+# is published with one no-replace rename. If the process dies immediately
+# before that rename, the next exact invocation must recognize only dot's
+# durable preparation marker, discard that pre-mutation stage, and leave no
+# abandoned stage behind. A similarly named foreign directory remains outside
+# dot's authority.
+fixture_repo transaction-stage main .testrc $'transaction-stage\n' 100644
+transaction_stage_origin=$REPLY
+fixture_home transaction-stage
+transaction_stage_home=$REPLY
+transaction_stage_state=$DOT_TEST_TMP/transaction-stage-state
+transaction_stage_bin=$DOT_TEST_TMP/transaction-stage-bin
+mkdir -p "$transaction_stage_bin"
+real_mv=$(type -P mv)
+cat >"$transaction_stage_bin/mv" <<'MV'
+#!/usr/bin/env bash
+set -e
+real=${DOT_TEST_REAL_MV:?}
+target=${!#}
+if [[ ${DOT_TEST_KILL_TRANSACTION_PUBLISH:-} == 1 &&
+  $target == "$XDG_STATE_HOME/dot/init/transaction" ]]; then
+  kill -KILL "$PPID"
+  exit 137
+fi
+exec "$real" "$@"
+MV
+chmod 0755 "$transaction_stage_bin/mv"
+set +e
+PATH="$transaction_stage_bin:$PATH" DOT_TEST_REAL_MV=$real_mv \
+  DOT_TEST_KILL_TRANSACTION_PUBLISH=1 \
+  run_dot "$transaction_stage_home" "$transaction_stage_state" init --yes \
+  "file://$transaction_stage_origin" >/dev/null 2>&1
+transaction_stage_first=$?
+set -e
+[[ $transaction_stage_first -ne 0 ]] ||
+  fail 'transaction publication interruption unexpectedly completed'
+transaction_stage_candidates=("$transaction_stage_state"/dot/init/transaction.prepare.*)
+[[ -d ${transaction_stage_candidates[0]} ]] ||
+  fail 'transaction publication interruption left no preparation stage'
+run_dot "$transaction_stage_home" "$transaction_stage_state" init --yes \
+  "file://$transaction_stage_origin" >/dev/null
+transaction_stage_candidates=("$transaction_stage_state"/dot/init/transaction.prepare.*)
+[[ ! -e ${transaction_stage_candidates[0]} && ! -L ${transaction_stage_candidates[0]} ]] ||
+  fail 'exact retry retained an owned transaction preparation stage'
+
+fixture_repo foreign-transaction-stage main .testrc $'foreign-stage\n' 100644
+foreign_transaction_origin=$REPLY
+fixture_home foreign-transaction-stage
+foreign_transaction_home=$REPLY
+foreign_transaction_state=$DOT_TEST_TMP/foreign-transaction-stage-state
+foreign_transaction_stage=$foreign_transaction_state/dot/init/transaction.prepare.foreign
+mkdir -p "$foreign_transaction_stage"
+printf 'foreign\n' >"$foreign_transaction_stage/evidence"
+run_dot "$foreign_transaction_home" "$foreign_transaction_state" init --yes \
+  "file://$foreign_transaction_origin" >/dev/null
+assert_eq foreign "$(<"$foreign_transaction_stage/evidence")" \
+  'foreign transaction preparation lookalike is preserved'
+
 # A detached remote HEAD has no advertised symref. The private staging clone
 # still discovers a unique branch, and `main` remains a deterministic fallback
 # only when the remote proves it exists.
@@ -413,6 +471,8 @@ legacy_origin=$REPLY
 fixture_home legacy-separate
 legacy_home=$REPLY
 git clone -q --bare "$legacy_origin" "$legacy_home/.dotfiles"
+git --git-dir="$legacy_home/.dotfiles" config core.fsmonitor true
+git --git-dir="$legacy_home/.dotfiles" config status.showUntrackedFiles all
 printf 'legacy\n' >"$legacy_home/.testrc"
 legacy_blocked_state=$DOT_TEST_TMP/legacy-blocked-state
 mkdir -p "$legacy_blocked_state/dot" "$DOT_TEST_TMP/legacy-foreign-init"
@@ -426,6 +486,12 @@ assert_eq 1 "$legacy_blocked_status" \
   'legacy adoption fails when durable transaction authority is unavailable'
 assert_eq true "$(git --git-dir="$legacy_home/.dotfiles" config --bool core.bare)" \
   'failed adoption leaves the supported legacy topology unchanged'
+assert_eq true \
+  "$(git --git-dir="$legacy_home/.dotfiles" config --bool core.fsmonitor)" \
+  'failed adoption does not mutate legacy fsmonitor policy before authority'
+assert_eq all \
+  "$(git --git-dir="$legacy_home/.dotfiles" config status.showUntrackedFiles)" \
+  'failed adoption does not mutate legacy status policy before authority'
 run_dot "$legacy_home" "$DOT_TEST_TMP/legacy-separate-state" init --yes \
   "file://$legacy_origin" >/dev/null
 run_dot "$legacy_home" "$DOT_TEST_TMP/legacy-separate-state" status >/dev/null
@@ -527,6 +593,287 @@ assert_eq 0 "$ancestor_rollback_status" 'ancestor conflict rollback succeeds'
 assert_eq 'prior ancestor' "$(<"$ancestor_home/nested")" \
   'ancestor conflict rollback restores prior bytes'
 
+# Pending intent publication reserves the deterministic stage name, but it
+# does not prove that a directory appearing immediately afterward was created
+# by this engine. Inject an empty private late winner after each intent rename;
+# both entry and parent publication must preserve and reject that directory
+# unless it carries dot's exact durable stage claim.
+late_stage_bin=$DOT_TEST_TMP/late-stage-bin
+mkdir -p "$late_stage_bin"
+cat >"$late_stage_bin/mv" <<'MV'
+#!/usr/bin/env bash
+set -e
+real=${DOT_TEST_REAL_MV:?}
+target=${!#}
+"$real" "$@"
+case ${DOT_TEST_LATE_STAGE_KIND:-}:"${target##*/}" in
+  entry:publish-intent.*)
+    IFS=$'\t' read -r phase _ _ _ stage _ <"$target"
+    ;;
+  parent:parent-intent.*)
+    IFS=$'\t' read -r phase _ stage _ <"$target"
+    ;;
+  *) exit 0 ;;
+esac
+case ${DOT_TEST_LATE_STAGE_KIND:-}:"${target##*/}" in
+  entry:publish-intent.* | parent:parent-intent.*)
+    if [[ $phase == pending && ! -e $HOME/$stage && ! -L $HOME/$stage ]]; then
+      mkdir "$HOME/$stage"
+      chmod 0700 "$HOME/$stage"
+      identity=$(stat -c '%d:%i' "$HOME/$stage" 2>/dev/null ||
+        stat -f '%d:%i' "$HOME/$stage")
+      printf '%s\t%s\n' "$HOME/$stage" "$identity" >"${DOT_TEST_LATE_STAGE_RECORD:?}"
+    fi
+    ;;
+esac
+MV
+chmod 0755 "$late_stage_bin/mv"
+
+fixture_repo late-entry-stage main value $'managed\n' 100644
+late_entry_origin=$REPLY
+fixture_home late-entry-stage
+late_entry_home=$REPLY
+late_entry_state=$DOT_TEST_TMP/late-entry-stage-state
+late_entry_record=$DOT_TEST_TMP/late-entry-stage-record
+set +e
+PATH="$late_stage_bin:$PATH" DOT_TEST_REAL_MV=$real_mv \
+  DOT_TEST_LATE_STAGE_KIND=entry DOT_TEST_LATE_STAGE_RECORD=$late_entry_record \
+  run_dot "$late_entry_home" "$late_entry_state" init --yes \
+  "file://$late_entry_origin" >/dev/null 2>&1
+late_entry_status=$?
+set -e
+assert_eq 1 "$late_entry_status" 'late empty entry stage is not adopted'
+IFS=$'\t' read -r late_entry_path late_entry_identity <"$late_entry_record"
+late_entry_current=$(stat -c '%d:%i' "$late_entry_path" 2>/dev/null ||
+  stat -f '%d:%i' "$late_entry_path")
+assert_eq "$late_entry_identity" "$late_entry_current" \
+  'late empty entry stage generation is preserved'
+
+fixture_repo late-parent-stage main newdir/value $'managed\n' 100644
+late_parent_origin=$REPLY
+fixture_home late-parent-stage
+late_parent_home=$REPLY
+late_parent_state=$DOT_TEST_TMP/late-parent-stage-state
+late_parent_record=$DOT_TEST_TMP/late-parent-stage-record
+set +e
+PATH="$late_stage_bin:$PATH" DOT_TEST_REAL_MV=$real_mv \
+  DOT_TEST_LATE_STAGE_KIND=parent DOT_TEST_LATE_STAGE_RECORD=$late_parent_record \
+  run_dot "$late_parent_home" "$late_parent_state" init --yes \
+  "file://$late_parent_origin" >/dev/null 2>&1
+late_parent_status=$?
+set -e
+assert_eq 1 "$late_parent_status" 'late empty parent stage is not adopted'
+IFS=$'\t' read -r late_parent_path late_parent_identity <"$late_parent_record"
+late_parent_current=$(stat -c '%d:%i' "$late_parent_path" 2>/dev/null ||
+  stat -f '%d:%i' "$late_parent_path")
+assert_eq "$late_parent_identity" "$late_parent_current" \
+  'late empty parent stage generation is preserved'
+
+# Publication stages are private transaction state, but a regular-file `show`
+# can be interrupted after shell redirection creates a partial `next`. The
+# stage directory must already have durable identity authority by then so
+# rollback can remove that partial generation without comparing it to the final
+# candidate blob.
+fixture_repo partial-entry-stage main value $'managed\n' 100644
+partial_entry_origin=$REPLY
+fixture_home partial-entry-stage
+partial_entry_home=$REPLY
+partial_entry_state=$DOT_TEST_TMP/partial-entry-state
+partial_entry_bin=$DOT_TEST_TMP/partial-entry-bin
+mkdir -p "$partial_entry_bin"
+cat >"$partial_entry_bin/git" <<'GIT'
+#!/usr/bin/env bash
+set -e
+real=${DOT_TEST_REAL_GIT:?}
+if [[ ${DOT_TEST_KILL_DURING_SHOW:-} == 1 ]]; then
+  for arg in "$@"; do
+    if [[ $arg == show ]]; then
+      printf 'partial'
+      kill -KILL "$PPID"
+      exit 137
+    fi
+  done
+fi
+exec "$real" "$@"
+GIT
+chmod 0755 "$partial_entry_bin/git"
+set +e
+PATH="$partial_entry_bin:$PATH" DOT_TEST_REAL_GIT=$real_git \
+  DOT_TEST_KILL_DURING_SHOW=1 \
+  run_dot "$partial_entry_home" "$partial_entry_state" init --yes \
+  "file://$partial_entry_origin" >/dev/null 2>&1
+partial_entry_first=$?
+set -e
+[[ $partial_entry_first -ne 0 ]] || fail 'partial entry stage fixture unexpectedly completed'
+set +e
+run_dot "$partial_entry_home" "$partial_entry_state" init --rollback >/dev/null 2>&1
+partial_entry_rollback=$?
+set -e
+assert_eq 0 "$partial_entry_rollback" 'rollback removes an owned partial entry stage'
+partial_entry_stages=("$partial_entry_home"/.dot-init-entry.*)
+[[ ! -e ${partial_entry_stages[0]} && ! -L ${partial_entry_stages[0]} ]] ||
+  fail 'rollback retained a partial entry stage'
+
+# Persisted inode identity prevents generation replacement, but it cannot
+# detect in-place writes. An exact retry must therefore revalidate the prepared
+# candidate bytes before publishing the staged leaf into HOME.
+fixture_repo modified-entry-stage main value $'managed\n' 100644
+modified_entry_origin=$REPLY
+fixture_home modified-entry-stage
+modified_entry_home=$REPLY
+modified_entry_state=$DOT_TEST_TMP/modified-entry-state
+modified_entry_bin=$DOT_TEST_TMP/modified-entry-bin
+mkdir -p "$modified_entry_bin"
+cat >"$modified_entry_bin/mv" <<'MV'
+#!/usr/bin/env bash
+set -e
+real=${DOT_TEST_REAL_MV:?}
+target=${!#}
+if [[ ${DOT_TEST_KILL_ENTRY_PUBLISH:-} == 1 && $target == "$HOME/value" ]]; then
+  kill -KILL "$PPID"
+  exit 137
+fi
+exec "$real" "$@"
+MV
+chmod 0755 "$modified_entry_bin/mv"
+set +e
+PATH="$modified_entry_bin:$PATH" DOT_TEST_REAL_MV=$real_mv \
+  DOT_TEST_KILL_ENTRY_PUBLISH=1 \
+  run_dot "$modified_entry_home" "$modified_entry_state" init --yes \
+  "file://$modified_entry_origin" >/dev/null 2>&1
+modified_entry_first=$?
+set -e
+[[ $modified_entry_first -ne 0 ]] || fail 'prepared entry stage fixture unexpectedly completed'
+modified_entry_stages=("$modified_entry_home"/.dot-init-entry.*)
+[[ -f ${modified_entry_stages[0]}/next && ! -L ${modified_entry_stages[0]}/next ]] ||
+  fail 'prepared entry stage fixture did not retain its next generation'
+printf 'changed\n' >"${modified_entry_stages[0]}/next"
+set +e
+run_dot "$modified_entry_home" "$modified_entry_state" init --yes \
+  "file://$modified_entry_origin" >/dev/null 2>&1
+modified_entry_retry=$?
+set -e
+assert_eq 1 "$modified_entry_retry" 'retry rejects an in-place modified entry stage'
+[[ ! -e $modified_entry_home/value && ! -L $modified_entry_home/value ]] ||
+  fail 'retry published an in-place modified entry stage'
+assert_eq changed "$(<"${modified_entry_stages[0]}/next")" \
+  'retry preserves an in-place modified entry stage for diagnosis'
+
+# A crash can also happen after `next` is published but before its empty stage
+# is removed. The stage identity remains authoritative, but cleanup must still
+# revalidate its private mode instead of deleting a changed directory solely
+# because the inode happens to match.
+fixture_repo changed-published-stage main value $'managed\n' 100644
+changed_stage_origin=$REPLY
+fixture_home changed-published-stage
+changed_stage_home=$REPLY
+changed_stage_state=$DOT_TEST_TMP/changed-published-stage-state
+changed_stage_bin=$DOT_TEST_TMP/changed-published-stage-bin
+mkdir -p "$changed_stage_bin"
+real_rmdir=$(type -P rmdir)
+cat >"$changed_stage_bin/rmdir" <<'RMDIR'
+#!/usr/bin/env bash
+set -e
+real=${DOT_TEST_REAL_RMDIR:?}
+case ${1:-} in
+  "$HOME"/.dot-init-entry.*)
+    if [[ ${DOT_TEST_KILL_ENTRY_CLEANUP:-} == 1 ]]; then
+      kill -KILL "$PPID"
+      exit 137
+    fi
+    ;;
+esac
+exec "$real" "$@"
+RMDIR
+chmod 0755 "$changed_stage_bin/rmdir"
+
+fixture_repo resumed-published-stage main value $'managed\n' 100644
+resumed_stage_origin=$REPLY
+fixture_home resumed-published-stage
+resumed_stage_home=$REPLY
+resumed_stage_state=$DOT_TEST_TMP/resumed-published-stage-state
+set +e
+PATH="$changed_stage_bin:$PATH" DOT_TEST_REAL_RMDIR=$real_rmdir \
+  DOT_TEST_KILL_ENTRY_CLEANUP=1 \
+  run_dot "$resumed_stage_home" "$resumed_stage_state" init --yes \
+  "file://$resumed_stage_origin" >/dev/null 2>&1
+resumed_stage_first=$?
+set -e
+[[ $resumed_stage_first -ne 0 ]] || fail 'resumable published stage fixture unexpectedly completed'
+resumed_stage_candidates=("$resumed_stage_home"/.dot-init-entry.*)
+[[ -d ${resumed_stage_candidates[0]} && ! -L ${resumed_stage_candidates[0]} ]] ||
+  fail 'resumable published stage fixture retained no cleanup stage'
+[[ ! -e ${resumed_stage_candidates[0]}/.dot-init-stage-claim-v1 &&
+  ! -L ${resumed_stage_candidates[0]}/.dot-init-stage-claim-v1 ]] ||
+  fail 'resumable published stage fixture stopped before claim removal'
+run_dot "$resumed_stage_home" "$resumed_stage_state" init --yes \
+  "file://$resumed_stage_origin" >/dev/null
+assert_eq managed "$(<"$resumed_stage_home/value")" \
+  'retry preserves the published candidate after cleanup interruption'
+[[ ! -e ${resumed_stage_candidates[0]} && ! -L ${resumed_stage_candidates[0]} ]] ||
+  fail 'retry retained an exact claimless published stage'
+
+set +e
+PATH="$changed_stage_bin:$PATH" DOT_TEST_REAL_RMDIR=$real_rmdir \
+  DOT_TEST_KILL_ENTRY_CLEANUP=1 \
+  run_dot "$changed_stage_home" "$changed_stage_state" init --yes \
+  "file://$changed_stage_origin" >/dev/null 2>&1
+changed_stage_first=$?
+set -e
+[[ $changed_stage_first -ne 0 ]] || fail 'published entry stage fixture unexpectedly completed'
+changed_stage_candidates=("$changed_stage_home"/.dot-init-entry.*)
+[[ -d ${changed_stage_candidates[0]} && ! -L ${changed_stage_candidates[0]} ]] ||
+  fail 'published entry stage fixture retained no cleanup stage'
+assert_eq managed "$(<"$changed_stage_home/value")" \
+  'published entry stage fixture moved the candidate leaf'
+chmod 0755 "${changed_stage_candidates[0]}"
+set +e
+run_dot "$changed_stage_home" "$changed_stage_state" init --yes \
+  "file://$changed_stage_origin" >/dev/null 2>&1
+changed_stage_retry=$?
+set -e
+assert_eq 1 "$changed_stage_retry" 'retry rejects a mode-changed published stage'
+[[ -d ${changed_stage_candidates[0]} && ! -L ${changed_stage_candidates[0]} ]] ||
+  fail 'retry removed a mode-changed published stage'
+
+# Parent creation follows the same write-ahead rule. Kill the second
+# parent-intent publication: the pending record must already exist before the
+# same-parent directory stage is created, allowing rollback to remove it.
+fixture_repo pending-parent-stage main newdir/value $'managed\n' 100644
+pending_parent_origin=$REPLY
+fixture_home pending-parent-stage
+pending_parent_home=$REPLY
+pending_parent_state=$DOT_TEST_TMP/pending-parent-state
+pending_parent_bin=$DOT_TEST_TMP/pending-parent-bin
+mkdir -p "$pending_parent_bin"
+real_mktemp=$(type -P mktemp)
+cat >"$pending_parent_bin/mktemp" <<'MKTEMP'
+#!/usr/bin/env bash
+set -e
+real=${DOT_TEST_REAL_MKTEMP:?}
+case ${1:-} in
+  *'/parent-intent.'*'.tmp.'*)
+    stages=("$HOME"/.dot-init-parent.*)
+    if [[ -e ${stages[0]} || -L ${stages[0]} ]]; then
+      kill -KILL "$PPID"
+    fi
+    ;;
+esac
+exec "$real" "$@"
+MKTEMP
+chmod 0755 "$pending_parent_bin/mktemp"
+set +e
+PATH="$pending_parent_bin:$PATH" DOT_TEST_REAL_MKTEMP=$real_mktemp \
+  run_dot "$pending_parent_home" "$pending_parent_state" init --yes \
+  "file://$pending_parent_origin" >/dev/null 2>&1
+pending_parent_first=$?
+set -e
+[[ $pending_parent_first -ne 0 ]] || fail 'pending parent stage fixture unexpectedly completed'
+run_dot "$pending_parent_home" "$pending_parent_state" init --rollback >/dev/null
+pending_parent_stages=("$pending_parent_home"/.dot-init-parent.*)
+[[ ! -e ${pending_parent_stages[0]} && ! -L ${pending_parent_stages[0]} ]] ||
+  fail 'rollback retained a pending parent stage'
+
 fixture_repo absent-parent-rollback main newdir/value $'managed\n' 100644
 absent_parent_origin=$REPLY
 fixture_home absent-parent-rollback
@@ -572,6 +919,30 @@ assert_eq 1 "$replaced_parent_rollback" \
 [[ -d $replaced_parent_home/newdir && ! -L $replaced_parent_home/newdir ]] ||
   fail 'rollback removed a replacement parent directory'
 
+fixture_repo changed-parent-mode main newdir/value $'managed\n' 100644
+changed_parent_origin=$REPLY
+fixture_home changed-parent-mode
+changed_parent_home=$REPLY
+changed_parent_state=$DOT_TEST_TMP/changed-parent-state
+set +e
+PATH="$ancestor_kill_bin:$PATH" DOT_TEST_REAL_GIT=$real_git \
+  DOT_TEST_KILL_AFTER_READ_TREE=1 \
+  run_dot "$changed_parent_home" "$changed_parent_state" init --yes \
+  "file://$changed_parent_origin" >/dev/null 2>&1
+changed_parent_first=$?
+set -e
+[[ $changed_parent_first -ne 0 ]] || fail 'changed parent mode fixture unexpectedly completed'
+rm -f "$changed_parent_home/newdir/value"
+chmod 0755 "$changed_parent_home/newdir"
+set +e
+run_dot "$changed_parent_home" "$changed_parent_state" init --rollback >/dev/null 2>&1
+changed_parent_rollback=$?
+set -e
+assert_eq 1 "$changed_parent_rollback" \
+  'rollback rejects a mode-changed transaction-created parent'
+[[ -d $changed_parent_home/newdir && ! -L $changed_parent_home/newdir ]] ||
+  fail 'rollback removed a mode-changed parent directory'
+
 fixture_repo replaced-leaf-rollback main value $'managed\n' 100644
 replaced_leaf_origin=$REPLY
 fixture_home replaced-leaf-rollback
@@ -597,6 +968,129 @@ assert_eq 1 "$replaced_leaf_rollback" \
   'rollback rejects a byte-identical replacement leaf generation'
 assert_eq managed "$(<"$replaced_leaf_home/value")" \
   'rollback preserves a byte-identical replacement leaf'
+
+fixture_repo modified-leaf-rollback main value $'managed\n' 100644
+modified_leaf_origin=$REPLY
+fixture_home modified-leaf-rollback
+modified_leaf_home=$REPLY
+modified_leaf_state=$DOT_TEST_TMP/modified-leaf-state
+set +e
+PATH="$ancestor_kill_bin:$PATH" DOT_TEST_REAL_GIT=$real_git \
+  DOT_TEST_KILL_AFTER_READ_TREE=1 \
+  run_dot "$modified_leaf_home" "$modified_leaf_state" init --yes \
+  "file://$modified_leaf_origin" >/dev/null 2>&1
+modified_leaf_first=$?
+set -e
+[[ $modified_leaf_first -ne 0 ]] || fail 'modified leaf fixture unexpectedly completed'
+printf 'changed\n' >"$modified_leaf_home/value"
+set +e
+run_dot "$modified_leaf_home" "$modified_leaf_state" init --rollback >/dev/null 2>&1
+modified_leaf_rollback=$?
+set -e
+assert_eq 1 "$modified_leaf_rollback" \
+  'rollback rejects an in-place modified transaction-created leaf'
+assert_eq changed "$(<"$modified_leaf_home/value")" \
+  'rollback preserves an in-place modified leaf'
+
+# Rollback must select the exact generation it intends to delete with an
+# exclusive same-parent rename. These deterministic competitors publish a new
+# target immediately after that park. The old owned generation may be removed,
+# but the late leaf, parent, and Git-directory winners must survive and force a
+# fail-closed rollback instead of being deleted by a stale pathname check.
+delete_winner_bin=$DOT_TEST_TMP/delete-winner-bin
+mkdir -p "$delete_winner_bin"
+cat >"$delete_winner_bin/mv" <<'MV'
+#!/usr/bin/env bash
+set -e
+real=${DOT_TEST_REAL_MV:?}
+source=${@: -2:1}
+target=${!#}
+"$real" "$@"
+case ${DOT_TEST_DELETE_WINNER:-}:$source:$target in
+  leaf:"$HOME/value":"$HOME"/*/.dot-init-delete.* | \
+  leaf:"$HOME/value":"$HOME"/.dot-init-delete.*)
+    printf 'foreign leaf\n' >"$source"
+    ;;
+  parent:"$HOME/newdir":"$HOME"/.dot-init-delete.*)
+    mkdir "$source"
+    printf 'foreign parent\n' >"$source/evidence"
+    ;;
+  git:"$HOME/.dotfiles":"$HOME"/.dot-init-delete.*)
+    mkdir "$source"
+    printf 'foreign git\n' >"$source/evidence"
+    ;;
+esac
+MV
+chmod 0755 "$delete_winner_bin/mv"
+
+fixture_repo leaf-delete-winner main value $'managed\n' 100644
+leaf_delete_origin=$REPLY
+fixture_home leaf-delete-winner
+leaf_delete_home=$REPLY
+leaf_delete_state=$DOT_TEST_TMP/leaf-delete-winner-state
+set +e
+PATH="$ancestor_kill_bin:$PATH" DOT_TEST_REAL_GIT=$real_git \
+  DOT_TEST_KILL_AFTER_READ_TREE=1 \
+  run_dot "$leaf_delete_home" "$leaf_delete_state" init --yes \
+  "file://$leaf_delete_origin" >/dev/null 2>&1
+leaf_delete_first=$?
+set -e
+[[ $leaf_delete_first -ne 0 ]] || fail 'leaf deletion winner fixture unexpectedly completed'
+set +e
+PATH="$delete_winner_bin:$PATH" DOT_TEST_REAL_MV=$real_mv \
+  DOT_TEST_DELETE_WINNER=leaf \
+  run_dot "$leaf_delete_home" "$leaf_delete_state" init --rollback >/dev/null 2>&1
+leaf_delete_rollback=$?
+set -e
+assert_eq 1 "$leaf_delete_rollback" 'late leaf deletion winner fails rollback closed'
+assert_eq 'foreign leaf' "$(<"$leaf_delete_home/value")" \
+  'late leaf deletion winner is preserved'
+
+fixture_repo parent-delete-winner main newdir/value $'managed\n' 100644
+parent_delete_origin=$REPLY
+fixture_home parent-delete-winner
+parent_delete_home=$REPLY
+parent_delete_state=$DOT_TEST_TMP/parent-delete-winner-state
+set +e
+PATH="$ancestor_kill_bin:$PATH" DOT_TEST_REAL_GIT=$real_git \
+  DOT_TEST_KILL_AFTER_READ_TREE=1 \
+  run_dot "$parent_delete_home" "$parent_delete_state" init --yes \
+  "file://$parent_delete_origin" >/dev/null 2>&1
+parent_delete_first=$?
+set -e
+[[ $parent_delete_first -ne 0 ]] || fail 'parent deletion winner fixture unexpectedly completed'
+set +e
+PATH="$delete_winner_bin:$PATH" DOT_TEST_REAL_MV=$real_mv \
+  DOT_TEST_DELETE_WINNER=parent \
+  run_dot "$parent_delete_home" "$parent_delete_state" init --rollback >/dev/null 2>&1
+parent_delete_rollback=$?
+set -e
+assert_eq 1 "$parent_delete_rollback" 'late parent deletion winner fails rollback closed'
+assert_eq 'foreign parent' "$(<"$parent_delete_home/newdir/evidence")" \
+  'late parent deletion winner is preserved'
+
+fixture_repo git-delete-winner main value $'managed\n' 100644
+git_delete_origin=$REPLY
+fixture_home git-delete-winner
+git_delete_home=$REPLY
+git_delete_state=$DOT_TEST_TMP/git-delete-winner-state
+set +e
+PATH="$ancestor_kill_bin:$PATH" DOT_TEST_REAL_GIT=$real_git \
+  DOT_TEST_KILL_AFTER_READ_TREE=1 \
+  run_dot "$git_delete_home" "$git_delete_state" init --yes \
+  "file://$git_delete_origin" >/dev/null 2>&1
+git_delete_first=$?
+set -e
+[[ $git_delete_first -ne 0 ]] || fail 'Git deletion winner fixture unexpectedly completed'
+set +e
+PATH="$delete_winner_bin:$PATH" DOT_TEST_REAL_MV=$real_mv \
+  DOT_TEST_DELETE_WINNER=git \
+  run_dot "$git_delete_home" "$git_delete_state" init --rollback >/dev/null 2>&1
+git_delete_rollback=$?
+set -e
+assert_eq 1 "$git_delete_rollback" 'late Git deletion winner fails rollback closed'
+assert_eq 'foreign git' "$(<"$git_delete_home/.dotfiles/evidence")" \
+  'late Git deletion winner is preserved'
 
 # A kill after the final Git generation appears but before the phase update is
 # a normal resumable state, not a rollback dead end.
