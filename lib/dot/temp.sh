@@ -27,13 +27,21 @@ _dot_sanitized_git() (
   command git "$@"
 )
 
+# Read the selected Dot checkout without depending on whichever HOME or global
+# Git config a client operation installs. Container workspaces can be owned by
+# the host runner, so trust only this already-selected physical source root.
+_dot_source_git() {
+  local source_root=${DOT_SOURCE_ROOT:-$PWD}
+
+  _dot_sanitized_git -c "safe.directory=$source_root" \
+    -C "$source_root" "$@"
+}
+
 # Git is already a required Dot dependency and provides a raw, filter-free
 # content hash. Keep exact-content checks on that shared baseline so minimal
 # distributions do not also need a standalone `cmp` or `diff` executable.
 _dot_hash_object() {
-  local source_root=${DOT_SOURCE_ROOT:-$PWD}
-
-  _dot_sanitized_git -C "$source_root" hash-object "$@"
+  _dot_source_git hash-object "$@"
 }
 
 _dot_hash_pair_equal() {

@@ -4,6 +4,11 @@
 _DOT_DOCTOR_DIR=${BASH_SOURCE[0]%/*}/doctor
 _DOT_DOCTOR_LOADED=0
 
+if ! declare -F _dot_source_git >/dev/null 2>&1; then
+  # shellcheck source=temp.sh
+  . "${BASH_SOURCE[0]%/*}/temp.sh"
+fi
+
 if ! declare -F _dot_extension_worker_exec >/dev/null 2>&1; then
   # shellcheck source=extension-worker-launch.sh
   . "${BASH_SOURCE[0]%/*}/extension-worker-launch.sh"
@@ -36,7 +41,7 @@ _dr_check_runtime() {
   else
     _dr_fail 'Bash runtime is too old' 'Bash 4 or newer is required'
   fi
-  checkout_root=$(git -C "$DOT_SOURCE_ROOT" rev-parse --show-toplevel 2>/dev/null || true)
+  checkout_root=$(_dot_source_git rev-parse --show-toplevel 2>/dev/null || true)
   checkout_root=$(cd -P -- "$checkout_root" 2>/dev/null && pwd -P || true)
   source_root=$(cd -P -- "$DOT_SOURCE_ROOT" 2>/dev/null && pwd -P || true)
   if [[ -n $checkout_root && $checkout_root == "$source_root" ]]; then

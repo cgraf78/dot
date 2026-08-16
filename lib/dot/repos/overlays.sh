@@ -427,7 +427,7 @@ _overlay_replacement_git() {
 }
 
 _overlay_replacement_hash_object() {
-  _overlay_replacement_git -C "$DOT_SOURCE_ROOT" hash-object "$@"
+  _dot_hash_object "$@"
 }
 
 # A legacy record name may have been created while the caller exported a Git

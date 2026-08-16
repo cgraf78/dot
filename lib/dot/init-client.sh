@@ -250,7 +250,7 @@ _dot_init_write_record() {
   local destination=$1 phase=$2 origin=$3 identity=$4 branch=$5 backup=$6
   local git_dir=${7:-$HOME/.dotfiles} temporary dot_revision commit nonce git_dev git_ino
 
-  dot_revision=$(git -C "$DOT_SOURCE_ROOT" rev-parse HEAD 2>/dev/null) || return 1
+  dot_revision=$(_dot_source_git rev-parse HEAD 2>/dev/null) || return 1
   commit=${DOT_INIT_COMMIT:-0000000000000000000000000000000000000000}
   nonce=${DOT_INIT_NONCE:-legacy}
   git_dev=${DOT_INIT_GIT_DEV:--}

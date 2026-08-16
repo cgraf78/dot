@@ -36,6 +36,15 @@ after_revision=2222222222222222222222222222222222222222
 mkdir -p "$provider_home"
 printf '%s\n' "$before_revision" >"$revision_file"
 
+source_revision=$(git -C "$root" rev-parse HEAD)
+active_revision=$(
+  DOT_SOURCE_ROOT=$root GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+    _dot_active_revision
+)
+assert_eq "$source_revision" "$active_revision" \
+  'provider reads the selected source revision under dubious ownership'
+
 env_probe=$(
   HOME=$provider_home XDG_CONFIG_HOME='' DOT_FORCE=1 DOT_QUIET=1 \
     SHDEPS_INSTALL_DIR='' SHDEPS_BIN_DIR='' SHDEPS_GIT_DEV_DIR='' \

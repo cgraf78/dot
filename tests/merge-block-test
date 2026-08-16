@@ -14,6 +14,9 @@ compare_left=$DOT_TEST_TMP/compare-left
 compare_right=$DOT_TEST_TMP/compare-right
 ambient_repo=$DOT_TEST_TMP/ambient-git
 ambient_config=$DOT_TEST_TMP/ambient.gitconfig
+different_owner_bin=$DOT_TEST_TMP/different-owner-bin
+different_owner_marker=$DOT_TEST_TMP/different-owner-invoked
+DOT_TEST_REAL_GIT=$(type -P git)
 printf 'same\0bytes\n' >"$compare_left"
 printf 'same\0bytes\n' >"$compare_right"
 git init -q --object-format=sha256 "$ambient_repo"
@@ -21,8 +24,38 @@ cat >"$ambient_config" <<'CONFIG'
 [init]
   defaultBranch = ambient
 CONFIG
+mkdir "$different_owner_bin"
+cat >"$different_owner_bin/git" <<'GIT'
+#!/usr/bin/env bash
+safe=false
+source_repo=false
+previous=
+printf 'invoked\n' >"$DOT_TEST_GIT_INVOKED"
+for argument in "$@"; do
+  if [[ $previous == -c &&
+    $argument == "safe.directory=$DOT_TEST_EXPECTED_SAFE_ROOT" ]]; then
+    safe=true
+  fi
+  if [[ $previous == -C && $argument == "$DOT_TEST_EXPECTED_SAFE_ROOT" ]]; then
+    source_repo=true
+  fi
+  previous=$argument
+done
+if $source_repo && ! $safe; then
+  printf 'fatal: simulated dubious ownership in repository\n' >&2
+  exit 128
+fi
+exec "$DOT_TEST_REAL_GIT" "$@"
+GIT
+chmod 0755 "$different_owner_bin/git"
 
 with_hostile_git_selectors() (
+  # Container checkouts can be owned by the host runner rather than the user
+  # inside the container. GitHub registers the exact workspace as safe, but
+  # the engine's isolated Git boundary must not depend on ambient global config.
+  export DOT_SOURCE_ROOT=$root
+  export DOT_TEST_REAL_GIT DOT_TEST_EXPECTED_SAFE_ROOT=$root
+  export DOT_TEST_GIT_INVOKED=$different_owner_marker
   export GIT_OBJECT_DIRECTORY=/definitely/missing
   export GIT_ALTERNATE_OBJECT_DIRECTORIES=/definitely/missing
   export GIT_INDEX_FILE=/definitely/missing
@@ -35,18 +68,30 @@ with_hostile_git_selectors() (
   # shellcheck disable=SC2031 # Nested sanitized-Git subshells intentionally unset this hostile fixture value.
   export GIT_CONFIG_NOSYSTEM=0
   export GIT_DEFAULT_HASH=sha256
-  "$@"
+  PATH=$different_owner_bin:$PATH "$@"
 )
 
 set +e
+DOT_TEST_REAL_GIT=$DOT_TEST_REAL_GIT \
+  DOT_TEST_EXPECTED_SAFE_ROOT=$root \
+  DOT_TEST_GIT_INVOKED=$different_owner_marker \
+  "$different_owner_bin/git" -C "$root" rev-parse HEAD >/dev/null 2>&1
+unprotected_revision_status=$?
+rm -f "$different_owner_marker"
 with_hostile_git_selectors _dot_files_equal "$compare_left" "$compare_right"
 hostile_files_status=$?
 with_hostile_git_selectors _dot_stdin_matches_file "$compare_right" <"$compare_left"
 hostile_stdin_status=$?
+with_hostile_git_selectors _dot_source_git rev-parse HEAD >/dev/null
+hostile_revision_status=$?
 set -e
-assert_eq 'file=0 stdin=0' \
-  "file=$hostile_files_status stdin=$hostile_stdin_status" \
-  'content comparison ignores ambient Git selectors'
+assert_eq 128 "$unprotected_revision_status" \
+  'different-owner fixture rejects an unprotected source Git command'
+[[ -f $different_owner_marker ]] ||
+  fail 'different-owner fixture did not intercept source Git commands'
+assert_eq 'file=0 stdin=0 revision=0' \
+  "file=$hostile_files_status stdin=$hostile_stdin_status revision=$hostile_revision_status" \
+  'source Git ignores ambient selectors and missing global safe-directory state'
 
 engine_git_dir=$(git -C "$root" rev-parse --absolute-git-dir)
 sha1_hash=$(printf 'format probe' |

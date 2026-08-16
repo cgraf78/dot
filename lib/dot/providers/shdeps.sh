@@ -127,7 +127,7 @@ _ensure_shdeps() {
 }
 
 _dot_active_revision() {
-  git -C "$DOT_SOURCE_ROOT" rev-parse HEAD 2>/dev/null || true
+  _dot_source_git rev-parse HEAD 2>/dev/null || true
 }
 
 _dot_reexec_checkpoint_path() {
