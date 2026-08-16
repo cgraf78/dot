@@ -743,15 +743,23 @@ HOME=$legacy_recovery_home XDG_STATE_HOME=$legacy_recovery_state \
     OVERLAYS=()
 
     materialize_legacy() {
-      local name=$1 phase=$2 destination=$HOME/$1 target=new-$1
-      local expected physical parent_identity record transaction record_line
+      local name=$1 phase=$2 hash_git_dir=${3:-}
+      local destination=$HOME/$1 target=new-$1
+      local expected physical parent_identity record transaction record_line hash
       ln -s old-$name "$destination"
       expected=$(_dot_path_identity "$destination")
       _overlay_destination_context "$destination"
       physical=$OVERLAY_PHYSICAL_DESTINATION
       parent_identity=$OVERLAY_PARENT_IDENTITY
-      _overlay_replacement_record_path "$destination"
-      record=$REPLY
+      if [[ -n $hash_git_dir ]]; then
+        hash=$(printf "%s" "$destination" |
+          GIT_DIR=$hash_git_dir git hash-object --stdin)
+        [[ ${#hash} -eq 64 ]]
+        record=${DOT_OVERLAY_MANIFEST}.replace.$hash
+      else
+        _overlay_replacement_record_path "$destination"
+        record=$REPLY
+      fi
       transaction=${physical%/*}/.${physical##*/}.dot-overlay-replace-v1
       printf -v record_line "%s\t%s\t%s\t%s\t%s\t%s" \
         "$destination" "$physical" "$target" "$expected" \
@@ -798,6 +806,13 @@ HOME=$legacy_recovery_home XDG_STATE_HOME=$legacy_recovery_state \
     materialize_legacy legacy-committed committed
     materialize_legacy legacy-terminal terminal
 
+    # Before record hashing was engine-bound, an exported SHA-256 repository
+    # selected a 64-character record name. That released record must remain
+    # recoverable even though this checkout itself uses SHA-1.
+    legacy_hash_git_dir=$XDG_STATE_HOME/legacy-hash.git
+    git init -q --bare --object-format=sha256 "$legacy_hash_git_dir"
+    materialize_legacy legacy-sha256 prepared "$legacy_hash_git_dir"
+
     materialize_invalid_legacy() {
       local name=$1 expected=$2 destination=$HOME/$1 target=new-$1
       local physical parent_identity record transaction record_line
@@ -824,6 +839,35 @@ HOME=$legacy_recovery_home XDG_STATE_HOME=$legacy_recovery_state \
 
     materialize_invalid_legacy legacy-wrong-generation 999999:999999
     materialize_invalid_legacy legacy-malformed 1:2:3
+
+    materialize_invalid_legacy_suffix() {
+      local name=$1 suffix=$2 destination=$HOME/$1 target=new-$1
+      local expected physical parent_identity record transaction record_line
+      ln -s old-$name "$destination"
+      expected=$(_dot_path_identity "$destination")
+      _overlay_destination_context "$destination"
+      physical=$OVERLAY_PHYSICAL_DESTINATION
+      parent_identity=$OVERLAY_PARENT_IDENTITY
+      record=${DOT_OVERLAY_MANIFEST}.replace.$suffix
+      transaction=${physical%/*}/.${physical##*/}.dot-overlay-replace-v1
+      printf -v record_line "%s\t%s\t%s\t%s\t%s\t%s" \
+        "$destination" "$physical" "$target" "$expected" \
+        "$transaction" "$parent_identity"
+      _overlay_write_private_line "$record" "$record_line"
+      mkdir "$transaction"
+      chmod 0700 "$transaction"
+      ln -s "$target" "$transaction/next"
+      if _overlay_recover_replacement "$record"; then
+        return 1
+      fi
+      [[ -L $physical && $(readlink "$physical") == old-$name ]]
+      [[ -f $record && -d $transaction && -L $transaction/next ]]
+    }
+
+    materialize_invalid_legacy_suffix legacy-malformed-suffix not-a-hash
+    printf -v wrong_sha256_suffix "%064d" 0
+    materialize_invalid_legacy_suffix legacy-wrong-sha256-suffix \
+      "$wrong_sha256_suffix"
   '
 
 # Recovery must make the same parent-generation decision as live publication.

@@ -417,17 +417,69 @@ _overlay_private_directory() {
 }
 
 # Durable replacement identities and record names must not inherit the caller's
-# selected Git repository or configuration. Hash through the engine checkout in
-# a narrow sanitized subshell so its object format remains stable across crash
-# recovery even when dot was invoked from a different repository.
-_overlay_replacement_hash_object() (
+# selected Git repository or configuration. Keep every replacement hash command
+# behind one narrow sanitized Git boundary.
+_overlay_replacement_git() (
   unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
   unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE GIT_CONFIG
   unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT
   unset GIT_CONFIG_PARAMETERS GIT_CONFIG_NOSYSTEM GIT_DEFAULT_HASH
   export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
-  command git -C "$DOT_SOURCE_ROOT" hash-object "$@"
+  command git "$@"
 )
+
+_overlay_replacement_hash_object() {
+  _overlay_replacement_git -C "$DOT_SOURCE_ROOT" hash-object "$@"
+}
+
+# A legacy record name may have been created while the caller exported a Git
+# repository with the other supported object format. Recreate that exact Git
+# hash in a private throwaway repository; do not add another digest utility or
+# let legacy compatibility affect the format used by new publications.
+_overlay_replacement_hash_object_format() (
+  local object_format=$1 value=$2 temporary hash status=0
+
+  case $object_format in
+    sha1 | sha256) ;;
+    *) return 1 ;;
+  esac
+  temporary=$(umask 077 &&
+    mktemp -d "${TMPDIR:-/tmp}/dot-overlay-record-hash.XXXXXX") || return 1
+  if ! _overlay_replacement_git init -q --bare --template= \
+    --object-format="$object_format" "$temporary"; then
+    status=1
+  elif ! hash=$(printf '%s' "$value" |
+    _overlay_replacement_git --git-dir="$temporary" hash-object --stdin); then
+    status=1
+  fi
+  rm -rf -- "$temporary" || status=1
+  if [[ $status -eq 0 ]]; then
+    printf '%s\n' "$hash" || status=1
+  fi
+  return "$status"
+)
+
+_overlay_replacement_legacy_record_path_matches() {
+  local record=$1 destination=$2 current_hash=$3
+  local prefix suffix object_format alternate_hash
+
+  prefix=${DOT_OVERLAY_MANIFEST}.replace.
+  [[ $record == "$prefix"* ]] || return 1
+  suffix=${record#"$prefix"}
+  [[ ${#suffix} -ne ${#current_hash} ]] || return 1
+  if [[ $suffix =~ ^[0-9a-f]{40}$ ]]; then
+    object_format=sha1
+  elif [[ $suffix =~ ^[0-9a-f]{64}$ ]]; then
+    object_format=sha256
+  else
+    return 1
+  fi
+  alternate_hash=$(
+    _overlay_replacement_hash_object_format "$object_format" "$destination"
+  ) ||
+    return 1
+  [[ $suffix == "$alternate_hash" ]]
+}
 
 # Device and inode alone are not a generation identity: a filesystem may reuse
 # an inode immediately after a late writer unlinks the validated destination.
@@ -517,7 +569,11 @@ _overlay_replacement_read() {
   hash=$(printf '%s' "$destination" |
     _overlay_replacement_hash_object --stdin) || return 1
   expected_record=${DOT_OVERLAY_MANIFEST}.replace.$hash
-  [[ $record == "$expected_record" ]] || return 1
+  if [[ $record != "$expected_record" ]]; then
+    [[ $identity_kind == legacy ]] &&
+      _overlay_replacement_legacy_record_path_matches \
+        "$record" "$destination" "$hash" || return 1
+  fi
   expected_transaction=${physical%/*}/.${physical##*/}.dot-overlay-replace-v1
   [[ $transaction == "$expected_transaction" ]] || return 1
   OVERLAY_REPLACE_DESTINATION=$destination
