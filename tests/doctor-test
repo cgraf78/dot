@@ -28,6 +28,27 @@ baseline_output=$(run_dot "$home" "$state" doctor 2>&1)
 assert_contains 'client upstream' "$baseline_output" 'doctor reports configured upstream'
 assert_contains 'dot engine source' "$baseline_output" 'doctor reports active engine mode'
 
+# A client can intentionally use an ordinary checkout rooted at HOME. The
+# repository selector gives that topology a typed Git invocation; doctor must
+# not apply the separate-git-dir core.bare/core.worktree test to it.
+fixture_repo doctor-ordinary main README.md $'ordinary\n' 100644
+ordinary_origin=$REPLY
+fixture_home doctor-ordinary
+ordinary_home=$REPLY
+ordinary_state=$DOT_TEST_TMP/doctor-ordinary-state
+git clone -q "$ordinary_origin" "$ordinary_home"
+run_dot "$ordinary_home" "$ordinary_state" init --yes \
+  "file://$ordinary_origin" >/dev/null
+set +e
+ordinary_output=$(run_dot "$ordinary_home" "$ordinary_state" doctor 2>&1)
+ordinary_status=$?
+set -e
+assert_eq 0 "$ordinary_status" 'doctor accepts an ordinary HOME checkout'
+assert_contains 'ordinary client layout' "$ordinary_output" \
+  'doctor reports the selected ordinary client topology'
+[[ $ordinary_output != *'client Git directory has no worktree identity'* ]] ||
+  fail 'doctor applied separate-git-dir identity rules to an ordinary checkout'
+
 fixture_push doctor main README.md $'doctor updated\n' 100644
 git --git-dir="$home/.dotfiles" fetch -q origin
 behind_output=$(run_dot "$home" "$state" doctor 2>&1)

@@ -42,16 +42,23 @@ _dr_check_base_repo() {
   fi
   _dr_ok 'client Git directory exists' "$(_dr_tilde "$DOT_CLIENT_GIT_DIR")"
 
-  # shellcheck disable=SC2086 # Historical command prefix, intentionally split.
-  is_bare=$(_base_git config --get core.bare 2>/dev/null || printf false)
-  # shellcheck disable=SC2086 # Historical command prefix, intentionally split.
-  has_worktree=$(_base_git config --get core.worktree 2>/dev/null || true)
-  if [[ $is_bare == true ]]; then
-    _dr_ok 'legacy bare client layout'
-  elif [[ -n $has_worktree ]]; then
-    _dr_ok 'explicit-worktree client layout' "$(_dr_tilde "$has_worktree")"
+  if [[ $DOT_BASE_TOPOLOGY == ordinary ]]; then
+    # The typed selector already proved that this is the recorded HOME checkout;
+    # its worktree identity is the shared `git -C HOME` show-toplevel check
+    # below, not core.worktree (which ordinary repositories normally omit).
+    _dr_ok 'ordinary client layout'
   else
-    _dr_fail 'client Git directory has no worktree identity'
+    # shellcheck disable=SC2086 # Historical command prefix, intentionally split.
+    is_bare=$(_base_git config --get core.bare 2>/dev/null || printf false)
+    # shellcheck disable=SC2086 # Historical command prefix, intentionally split.
+    has_worktree=$(_base_git config --get core.worktree 2>/dev/null || true)
+    if [[ $is_bare == true ]]; then
+      _dr_ok 'legacy bare client layout'
+    elif [[ -n $has_worktree ]]; then
+      _dr_ok 'explicit-worktree client layout' "$(_dr_tilde "$has_worktree")"
+    else
+      _dr_fail 'client Git directory has no worktree identity'
+    fi
   fi
 
   # shellcheck disable=SC2086 # Historical command prefix, intentionally split.
