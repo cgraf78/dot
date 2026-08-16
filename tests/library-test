@@ -130,7 +130,7 @@ assert_eq "$fake_bin/gum" "$REPLY" 'Gum availability result'
 # hostile spelling whenever the host provides the locale that exposes it.
 utf8_locale=$(locale -a 2>/dev/null |
   awk 'tolower($0) ~ /^en_us.*utf/ && !found { value = $0; found = 1 }
-    END { if (found) print value }')
+    END { if (found) print value }') || utf8_locale=
 if [[ -n $utf8_locale ]]; then
   set +e
   unicode_output=$(LC_ALL=$utf8_locale dot_ui_color_hex '#Ａ00000')

@@ -12,7 +12,9 @@ assert_contains 'dot 0.1.0-dev' "$version" 'version product identity'
 assert_contains 'config 1; extensions 1; library 1' "$version" \
   'version interface inventory'
 
-source_revision=$(git -C "$DOT_TEST_ROOT" rev-parse HEAD)
+source_revision=$(
+  git -c "safe.directory=$DOT_TEST_ROOT" -C "$DOT_TEST_ROOT" rev-parse HEAD
+)
 set +e
 GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
