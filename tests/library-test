@@ -19,7 +19,7 @@ expected=$DOT_TEST_TMP/expected-functions
 docs=$DOT_TEST_ROOT/docs/library.md
 awk -F '\t' '!/^#/ && NF { print $1 }' "$inventory" | LC_ALL=C sort >"$expected"
 declare -F | awk '{ print $3 }' | awk '/^dot_/' | LC_ALL=C sort >"$actual"
-cmp -s "$expected" "$actual" || fail 'public function inventory drifted'
+assert_files_equal "$expected" "$actual" 'public function inventory drifted'
 while IFS=$'\t' read -r name arity status effects extra; do
   [[ $name == \#* || -z $name ]] && continue
   [[ -n $arity && -n $status && -n $effects && -z ${extra:-} ]] ||
@@ -43,8 +43,8 @@ awk -F '\t' '!/^#/ && NF { print $1 }' "$variable_inventory" |
     "$DOT_TEST_ROOT/lib/dot/public/ui.sh" |
     sed -E 's/^\$\{?//'
 } | LC_ALL=C sort -u >"$referenced_variables"
-cmp -s "$inventory_variables" "$referenced_variables" ||
-  fail 'public variable inventory drifted'
+assert_files_equal "$inventory_variables" "$referenced_variables" \
+  'public variable inventory drifted'
 while IFS=$'\t' read -r name kind direction contract extra; do
   [[ $name == \#* || -z $name ]] && continue
   [[ -n $kind && -n $direction && -n $contract && -z ${extra:-} ]] ||
@@ -129,7 +129,8 @@ assert_eq "$fake_bin/gum" "$REPLY" 'Gum availability result'
 # Public syntax is ASCII regardless of the caller's locale, so exercise that
 # hostile spelling whenever the host provides the locale that exposes it.
 utf8_locale=$(locale -a 2>/dev/null |
-  awk 'tolower($0) ~ /^en_us.*utf/ { print; exit }')
+  awk 'tolower($0) ~ /^en_us.*utf/ && !found { value = $0; found = 1 }
+    END { if (found) print value }')
 if [[ -n $utf8_locale ]]; then
   set +e
   unicode_output=$(LC_ALL=$utf8_locale dot_ui_color_hex '#Ａ00000')

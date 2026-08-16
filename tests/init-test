@@ -343,8 +343,9 @@ fixture_home adapter-init
 adapter_init_home=$REPLY
 run_dot "$adapter_init_home" "$DOT_TEST_TMP/adapter-init-state" init --yes \
   "file://$adapter_init_origin" >/dev/null
-cmp -s "$root/support/client-launcher.sh" "$adapter_init_home/.local/bin/dot" ||
-  fail 'exact generated client launcher was not accepted during initialization'
+assert_files_equal "$root/support/client-launcher.sh" \
+  "$adapter_init_home/.local/bin/dot" \
+  'exact generated client launcher was not accepted during initialization'
 [[ -x $adapter_init_home/.local/bin/dot ]] ||
   fail 'accepted client launcher lost executable mode'
 

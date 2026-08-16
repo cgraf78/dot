@@ -199,7 +199,8 @@ _dot_init_transaction_stage_owned() {
   links=$(stat -c '%h' "$marker" 2>/dev/null || stat -f '%l' "$marker" 2>/dev/null) ||
     return 1
   [[ $mode == 600 && $links == 1 ]] || return 1
-  printf 'cgraf78 dot initialization preparation v1\n' | cmp -s - "$marker"
+  printf 'cgraf78 dot initialization preparation v1\n' |
+    _dot_stdin_matches_file "$marker"
 }
 
 _dot_init_recover_transaction_stages() {
@@ -396,7 +397,7 @@ _dot_init_candidate_tree() {
       # door during initialization.
       if [[ $path == .local/bin/dot && $mode == 100755 ]] &&
         git -C "$repo" show "$branch:$path" 2>/dev/null |
-        cmp -s - "$DOT_SOURCE_ROOT/support/client-launcher.sh"; then
+        _dot_stdin_matches_file "$DOT_SOURCE_ROOT/support/client-launcher.sh"; then
         :
       else
         valid=0
@@ -430,12 +431,12 @@ _dot_init_candidate_matches_path() {
     120000)
       [[ -L $target ]] || return 1
       git -C "$repo" show "$branch:$path" 2>/dev/null |
-        cmp -s - <(printf '%s' "$(readlink "$target")")
+        _dot_stdin_matches_file <(printf '%s' "$(readlink "$target")")
       ;;
     100644 | 100755)
       [[ -f $target && ! -L $target ]] || return 1
-      git -C "$repo" show "$branch:$path" 2>/dev/null | cmp -s - "$target" ||
-        return 1
+      git -C "$repo" show "$branch:$path" 2>/dev/null |
+        _dot_stdin_matches_file "$target" || return 1
       actual_mode=$(stat -c '%a' "$target" 2>/dev/null || stat -f '%Lp' "$target" 2>/dev/null) ||
         return 1
       if [[ $mode == 100755 ]]; then
@@ -605,7 +606,7 @@ _dot_init_move_conflicts() {
   if [[ ! -e $backup/manifest && ! -L $backup/manifest ]]; then
     cp "$manifest" "$backup/manifest" || return 1
     chmod 0600 "$backup/manifest" || return 1
-  elif ! cmp -s "$manifest" "$backup/manifest"; then
+  elif ! _dot_files_equal "$manifest" "$backup/manifest"; then
     return 1
   fi
   while IFS=$'\t' read -r path kind dev ino mode size value; do
@@ -886,7 +887,7 @@ _dot_init_stage_claim_matches() {
   {
     printf 'cgraf78 dot publication stage claim v1\n'
     printf 'kind=%s\nnonce=%s\npath=%s\n' "$kind" "$DOT_INIT_NONCE" "$path"
-  } | cmp -s - "$marker"
+  } | _dot_stdin_matches_file "$marker"
 }
 
 _dot_init_stage_claim_write() {

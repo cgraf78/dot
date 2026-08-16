@@ -20,8 +20,8 @@ runs in a fresh invocation of the absolute Bash selected by the `dot` launcher;
 `--norc`, start in `$HOME`, close stdin, set `umask 077`, enable
 `errexit`/`nounset`/`pipefail`, clear every resettable trap, and start with
 `extglob`, `nocasematch`, and `nullglob` disabled. POSIX shell semantics do not
-let a shell reset a signal it inherited as ignored, so that one host
-disposition (notably GitHub runners' ignored `SIGPIPE`) can remain visible.
+let a shell reset signals it inherited as ignored, so those exact host
+dispositions (notably GitHub runners' ignored `SIGPIPE`) can remain visible.
 Each worker receives a different private `TMPDIR`.
 
 Ordinary exported client variables remain available because configuration

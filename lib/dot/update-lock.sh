@@ -22,11 +22,43 @@ _dot_update_lock_owner_file() {
   printf '%s/owner\n' "$1"
 }
 
+_dot_update_lock_process_start_proc() {
+  local pid=$1 line rest
+
+  IFS= read -r line 2>/dev/null <"/proc/$pid/stat" || return 1
+  [[ $line == "$pid ("* ]] || return 1
+  rest=${line##*) }
+  [[ $rest != "$line" ]] || return 1
+  # shellcheck disable=SC2086 # Kernel stat fields are intentionally tokenized.
+  set -- $rest
+  [[ $# -ge 20 && ${20} =~ ^[0-9]+$ ]] || return 1
+  printf 'proc:%s\n' "${20}"
+}
+
 _dot_update_lock_process_start() {
-  # `ps` provides the only portable process-birth identifier available to the
-  # supported shell environments. Treat it as an opaque OS identity token and
-  # force a stable locale/time zone so cron and interactive callers agree.
-  LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null
+  local pid=$1 expected=${2:-} start
+
+  # Once a lock records the procfs backend, keep using it for that generation.
+  # A later PATH change must not make the same live process appear stale just
+  # because a full `ps` became available between acquisition and validation.
+  if [[ $expected == proc:* ]]; then
+    _dot_update_lock_process_start_proc "$pid"
+    return
+  fi
+
+  # Preserve the existing portable identity when a full `ps` is available so
+  # an in-flight lock created by an older Dot remains readable across update.
+  if start=$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$pid" 2>/dev/null) &&
+    [[ -n $start ]]; then
+    printf '%s\n' "$start"
+    return 0
+  fi
+
+  # Minimal Linux images may omit `ps` or ship a BusyBox variant without
+  # lstart. Procfs field 22 is the kernel start tick and therefore supplies the
+  # same PID-reuse protection without growing the base package contract.
+  [[ -z $expected ]] || return 1
+  _dot_update_lock_process_start_proc "$pid"
 }
 
 _dot_update_lock_mtime() {
@@ -60,7 +92,8 @@ _dot_update_lock_read_owner() {
 _dot_update_lock_owner_is_active() {
   local start
   kill -0 "$DOT_UPDATE_LOCK_OWNER_PID" 2>/dev/null || return 1
-  start="$(_dot_update_lock_process_start "$DOT_UPDATE_LOCK_OWNER_PID")" || return 1
+  start="$(_dot_update_lock_process_start \
+    "$DOT_UPDATE_LOCK_OWNER_PID" "$DOT_UPDATE_LOCK_OWNER_START")" || return 1
   [[ "$start" == "$DOT_UPDATE_LOCK_OWNER_START" ]]
 }
 
@@ -189,7 +222,8 @@ _dot_update_lock_reenter() {
   _dot_update_lock_read_owner "$lock_dir" || return 1
   [[ "$DOT_UPDATE_LOCK_OWNER_PID" == "$$" ]] || return 1
   [[ "$DOT_UPDATE_LOCK_OWNER_TOKEN" == "$DOT_UPDATE_LOCK_TOKEN" ]] || return 1
-  start="$(_dot_update_lock_process_start "$$")" || return 1
+  start="$(_dot_update_lock_process_start \
+    "$$" "$DOT_UPDATE_LOCK_OWNER_START")" || return 1
   [[ "$start" == "$DOT_UPDATE_LOCK_OWNER_START" ]] || return 1
   _dot_update_lock_install_traps
 }

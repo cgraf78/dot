@@ -17,6 +17,8 @@ run_dot "$home" "$state" init --yes "file://$origin" >/dev/null
 extensions=$home/extensions
 mkdir -p "$home/.config/dot" "$extensions/pre-sync.d" \
   "$extensions/merge-hooks.d/lib"
+chmod 0755 "$extensions" "$extensions/pre-sync.d" \
+  "$extensions/merge-hooks.d" "$extensions/merge-hooks.d/lib"
 # shellcheck disable=SC2016 # Literal config grammar under test.
 printf '%s\n' \
   'version=1' \
@@ -174,11 +176,13 @@ merge() { printf 'later\n' >>"$HOME/hook.log"; }
 HOOK
 chmod 0644 "$extensions/merge-hooks.d"/*.sh
 set +e
-run_dot "$home" "$state" update >/dev/null 2>&1
+failing_hook_output=$(run_dot "$home" "$state" update 2>&1)
 failing_hook_status=$?
 set -e
 assert_eq 1 "$failing_hook_status" \
   'real failing merge hook normalizes aggregate update status to one'
+assert_contains 'warning: merge failed: 10-failing' "$failing_hook_output" \
+  'empty merge failure identifies its stable hook key'
 assert_eq $'failing\nlater' "$(<"$home/hook.log")" \
   'later merge hooks continue after an earlier hook fails'
 

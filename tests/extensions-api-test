@@ -98,6 +98,9 @@ mkdir -p "$active_overlay/home/${extension_rel%/*}" "$active_origin"
 git init -q --bare "$active_origin"
 git init -q "$active_overlay"
 git -C "$active_overlay" remote add origin "$active_origin"
+chmod 0755 "$active_overlay" "$active_overlay/home" \
+  "$active_overlay/home/${extension_rel%%/*}" \
+  "$active_overlay/home/${extension_rel%/*}"
 cat >"$active_overlay/home/$extension_rel" <<'HOOK'
 merge() {
   family=$(dot_hook_family example) || return 1
@@ -186,10 +189,7 @@ doctor() {
     return 1
   (((8#$mode & 077) == 0)) || return 1
   remaining_traps=$(trap -p)
-  case $remaining_traps in
-    '' | "trap -- '' SIGPIPE") ;;
-    *) return 1 ;;
-  esac
+  [[ $remaining_traps == "${DOT_TEST_EXPECTED_IGNORED_TRAPS:-}" ]] || return 1
   ! IFS= read -r _ || return 1
   display=$(dot_doctor_display_path "$HOME/example") || return 1
   [[ $display == '~/example' ]] || return 1
@@ -215,10 +215,12 @@ export BASH_ENV=$HOME/worker-bash-env
 shopt -s extglob
 export BASHOPTS
 (
-  # GitHub's runner enters the test shell with SIGPIPE ignored. Bash cannot
-  # reset a signal that was ignored when the interpreter started, so reproduce
-  # that host boundary even on local shells that begin with the default action.
-  trap '' PIPE
+  # Bash cannot reset any signal that was ignored when the interpreter
+  # started. Reproduce more than one such disposition and require the worker
+  # to preserve exactly that unavoidable host baseline, with no caught traps.
+  trap '' PIPE USR1
+  DOT_TEST_EXPECTED_IGNORED_TRAPS=$(trap -p)
+  export DOT_TEST_EXPECTED_IGNORED_TRAPS
   PATH="$HOME/fake-bin:$PATH" _dot_extension_worker_run doctor \
     "$trust_root/doctor.d/10-worker.sh" "$HOME/doctor-worker" \
     "$HOME/doctor-results"

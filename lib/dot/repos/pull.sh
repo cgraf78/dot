@@ -129,7 +129,7 @@ _repo_candidate_adapter_allowed() {
   shift 3
   [[ $path == .local/bin/dot && $mode == 100755 ]] || return 1
   "$@" show "$ref:$path" 2>/dev/null |
-    cmp -s - "$DOT_SOURCE_ROOT/support/client-launcher.sh"
+    _dot_stdin_matches_file "$DOT_SOURCE_ROOT/support/client-launcher.sh"
 }
 
 # Validate a fetched candidate before any checkout, rebase, or overlay link can

@@ -117,8 +117,8 @@ DOT_SOURCE_ROOT=$download_root
 PATH="$download_bin:$PATH" DOT_TEST_DOWNLOAD_SOURCE=$download_source \
   DOT_TEST_DOWNLOAD_LOG=$download_log _dot_shdeps_download_installer
 downloaded_installer=$REPLY
-cmp -s "$download_source" "$downloaded_installer" ||
-  fail 'pinned provider download changed installer bytes'
+assert_files_equal "$download_source" "$downloaded_installer" \
+  'pinned provider download changed installer bytes'
 assert_eq "https://raw.githubusercontent.com/cgraf78/shdeps/$download_revision/install.sh" \
   "$(<"$download_log")" 'provider download uses immutable reviewed revision'
 _dot_cleanup_remove_path "$downloaded_installer"

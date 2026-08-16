@@ -15,6 +15,52 @@ _dot_path_identity() {
   stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1" 2>/dev/null
 }
 
+# Internal Git policy must not inherit a caller's selected repository, object
+# store, hash default, or configuration. Keep that shared isolation boundary in
+# one place for content comparison and durable overlay identities.
+_dot_sanitized_git() (
+  unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
+  unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE GIT_CONFIG
+  unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT
+  unset GIT_CONFIG_PARAMETERS GIT_CONFIG_NOSYSTEM GIT_DEFAULT_HASH
+  export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+  command git "$@"
+)
+
+# Git is already a required Dot dependency and provides a raw, filter-free
+# content hash. Keep exact-content checks on that shared baseline so minimal
+# distributions do not also need a standalone `cmp` or `diff` executable.
+_dot_hash_object() {
+  local source_root=${DOT_SOURCE_ROOT:-$PWD}
+
+  _dot_sanitized_git -C "$source_root" hash-object "$@"
+}
+
+_dot_hash_pair_equal() {
+  local hashes=$1 first second
+
+  [[ $hashes == *$'\n'* ]] || return 1
+  first=${hashes%%$'\n'*}
+  second=${hashes#*$'\n'}
+  [[ $second != *$'\n'* ]] || return 1
+  [[ $first =~ ^[0-9a-f]{40}$ || $first =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ $second == "$first" ]]
+}
+
+_dot_files_equal() {
+  local hashes
+
+  hashes=$(_dot_hash_object --no-filters -- "$1" "$2" 2>/dev/null) || return 1
+  _dot_hash_pair_equal "$hashes"
+}
+
+_dot_stdin_matches_file() {
+  local hashes
+
+  hashes=$(_dot_hash_object --no-filters --stdin -- "$1" 2>/dev/null) || return 1
+  _dot_hash_pair_equal "$hashes"
+}
+
 _dot_detect_move_tool() {
   local probe source moved mv_bin
   mv_bin=$(type -P mv 2>/dev/null) || return 1

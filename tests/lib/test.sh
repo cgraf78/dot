@@ -44,3 +44,33 @@ assert_contains() {
   [[ "$haystack" == *"$needle"* ]] ||
     fail "$label: missing [$needle]"
 }
+
+assert_files_equal() {
+  local expected=$1 actual=$2 label=$3 expected_hash actual_hash
+
+  expected_hash=$(git hash-object --no-filters -- "$expected") ||
+    fail "$label: could not hash expected file"
+  actual_hash=$(git hash-object --no-filters -- "$actual") ||
+    fail "$label: could not hash actual file"
+  if [[ $actual_hash == "$expected_hash" ]]; then
+    return 0
+  fi
+  git diff --no-index --no-ext-diff --no-textconv -- \
+    "$expected" "$actual" >&2 || true
+  fail "$label"
+}
+
+process_is_live() {
+  local pid=$1 line rest
+
+  kill -0 "$pid" 2>/dev/null || return 1
+  # A container PID 1 may leave an already-terminated orphan as a zombie.
+  # `kill -0` still succeeds for that inert record, while the production
+  # cleanup contract consistently treats procfs state Z as no longer live.
+  if [[ -r /proc/$pid/stat ]] &&
+    IFS= read -r line 2>/dev/null <"/proc/$pid/stat"; then
+    rest=${line##*) }
+    [[ $rest == "$line" || ${rest%% *} != Z ]] || return 1
+  fi
+  return 0
+}

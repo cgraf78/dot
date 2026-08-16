@@ -39,8 +39,11 @@ awk -F '\t' '
 git -C "$root" ls-files install.sh bin lib/dot support tests |
   sort >"$temporary/actual"
 
-if ! cmp -s "$temporary/expected" "$temporary/actual"; then
-  diff -u "$temporary/expected" "$temporary/actual" >&2 || true
+expected_hash=$(git hash-object --no-filters -- "$temporary/expected")
+actual_hash=$(git hash-object --no-filters -- "$temporary/actual")
+if [[ $actual_hash != "$expected_hash" ]]; then
+  git diff --no-index --no-ext-diff --no-textconv -- \
+    "$temporary/expected" "$temporary/actual" >&2 || true
   printf 'provenance-test: source inventory drift\n' >&2
   exit 1
 fi

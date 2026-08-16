@@ -143,7 +143,7 @@ _merge_hook_commit_tmp() {
 _merge_hook_write_text_if_changed() {
   local dst="$1" text="$2" tmp
 
-  if printf '%s\n' "$text" | cmp -s - "$dst" 2>/dev/null; then
+  if printf '%s\n' "$text" | _dot_stdin_matches_file "$dst"; then
     return 0
   fi
 

@@ -89,9 +89,12 @@ _mb_finalize() {
   shift 2
   local -a blocks=("$@")
 
-  # Squeeze repeated blank lines, then strip leading/trailing whitespace.
-  # Prevents blank-line accumulation across repeated merges.
-  rest="$(printf '%s\n' "$rest" | cat -s)"
+  # Squeeze repeated empty lines, then strip leading/trailing whitespace.
+  # `cat -s` is not part of every BusyBox build used by minimal CI images.
+  rest="$(printf '%s\n' "$rest" | awk '
+    length($0) { blank = 0; print; next }
+    !blank { blank = 1; print }
+  ')"
   rest="${rest#"${rest%%[![:space:]]*}"}"
   rest="${rest%"${rest##*[![:space:]]}"}"
 
@@ -108,7 +111,8 @@ _mb_finalize() {
   result+=$'\n'
 
   # Skip write if nothing changed.
-  if [[ -f "$dst" ]] && printf '%s' "$result" | cmp -s - "$dst"; then
+  if [[ -f "$dst" ]] && printf '%s' "$result" |
+    _dot_stdin_matches_file "$dst"; then
     return 0
   fi
 

@@ -6,6 +6,9 @@
 # skip-worktree while the overlay owns them, then restore the tracked version
 # before pulling so Git never tries to merge through a symlink.
 
+# shellcheck source=../temp.sh
+. "${BASH_SOURCE[0]%/*}/../temp.sh"
+
 _overlay_link_target() {
   local rel="$1" name="$2" rest prefix=""
   rest="$rel"
@@ -418,15 +421,10 @@ _overlay_private_directory() {
 
 # Durable replacement identities and record names must not inherit the caller's
 # selected Git repository or configuration. Keep every replacement hash command
-# behind one narrow sanitized Git boundary.
-_overlay_replacement_git() (
-  unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
-  unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE GIT_CONFIG
-  unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT
-  unset GIT_CONFIG_PARAMETERS GIT_CONFIG_NOSYSTEM GIT_DEFAULT_HASH
-  export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
-  command git "$@"
-)
+# behind the shared sanitized Git boundary.
+_overlay_replacement_git() {
+  _dot_sanitized_git "$@"
+}
 
 _overlay_replacement_hash_object() {
   _overlay_replacement_git -C "$DOT_SOURCE_ROOT" hash-object "$@"

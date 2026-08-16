@@ -214,8 +214,15 @@ _print_merge_capture() {
   if [[ "${DOT_VERBOSE:-0}" -eq 1 && "${DOT_QUIET:-0}" -ne 1 ]]; then
     _print_merge_result "$_hook_key" "$_elapsed_ms" "$_prefix.log" "$_merge_status"
   elif [[ "$_merge_rc" -ne 0 ]]; then
-    _logfile_print "$_hook_key" "$_prefix.log"
-    _warn "  warning: merge failed"
+    if [[ -s $_prefix.log ]]; then
+      _logfile_print "$_hook_key" "$_prefix.log"
+      _warn "  warning: merge failed"
+    else
+      # A strict worker can exit at an errexit boundary without producing a
+      # diagnostic. Preserve the generic warning for logged failures, but give
+      # an empty one the stable hook key needed to find its source.
+      _warn "  warning: merge failed: $_hook_key"
+    fi
   fi
 
   return 0

@@ -10,6 +10,54 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=../lib/dot/merge-block.sh
 . "$root/lib/dot/merge-block.sh"
 
+compare_left=$DOT_TEST_TMP/compare-left
+compare_right=$DOT_TEST_TMP/compare-right
+ambient_repo=$DOT_TEST_TMP/ambient-git
+ambient_config=$DOT_TEST_TMP/ambient.gitconfig
+printf 'same\0bytes\n' >"$compare_left"
+printf 'same\0bytes\n' >"$compare_right"
+git init -q --object-format=sha256 "$ambient_repo"
+cat >"$ambient_config" <<'CONFIG'
+[init]
+  defaultBranch = ambient
+CONFIG
+
+with_hostile_git_selectors() (
+  export GIT_OBJECT_DIRECTORY=/definitely/missing
+  export GIT_ALTERNATE_OBJECT_DIRECTORIES=/definitely/missing
+  export GIT_INDEX_FILE=/definitely/missing
+  # shellcheck disable=SC2031 # Nested sanitized-Git subshells intentionally unset this hostile fixture value.
+  export GIT_CONFIG_GLOBAL=$ambient_config
+  export GIT_CONFIG_SYSTEM=$ambient_config
+  export GIT_CONFIG_COUNT=1
+  export GIT_CONFIG_KEY_0=init.defaultBranch
+  export GIT_CONFIG_VALUE_0=ambient-count
+  # shellcheck disable=SC2031 # Nested sanitized-Git subshells intentionally unset this hostile fixture value.
+  export GIT_CONFIG_NOSYSTEM=0
+  export GIT_DEFAULT_HASH=sha256
+  "$@"
+)
+
+set +e
+with_hostile_git_selectors _dot_files_equal "$compare_left" "$compare_right"
+hostile_files_status=$?
+with_hostile_git_selectors _dot_stdin_matches_file "$compare_right" <"$compare_left"
+hostile_stdin_status=$?
+set -e
+assert_eq 'file=0 stdin=0' \
+  "file=$hostile_files_status stdin=$hostile_stdin_status" \
+  'content comparison ignores ambient Git selectors'
+
+engine_git_dir=$(git -C "$root" rev-parse --absolute-git-dir)
+sha1_hash=$(printf 'format probe' |
+  GIT_DIR=$ambient_repo/.git GIT_WORK_TREE=$ambient_repo \
+    DOT_SOURCE_ROOT=$root _dot_hash_object --stdin)
+sha256_hash=$(printf 'format probe' |
+  GIT_DIR=$engine_git_dir GIT_WORK_TREE=$root \
+    DOT_SOURCE_ROOT=$ambient_repo _dot_hash_object --stdin)
+[[ $sha1_hash =~ ^[0-9a-f]{40}$ ]] || fail 'content hash did not use SHA-1 repository format'
+[[ $sha256_hash =~ ^[0-9a-f]{64}$ ]] || fail 'content hash did not use SHA-256 repository format'
+
 dot_body=$'  generated\n# vim: set ft=conf\n# -*- mode: conf -*-\n'
 block=$(_mb_build '# dot-managed:example' '/source/example' "$dot_body")
 assert_contains '# dot-managed:example begin' "$block" 'managed block begin marker'
@@ -43,9 +91,33 @@ assert_contains 'second generated' "$content" 'family merge publishes every curr
 mode=$(stat -c '%a' "$destination" 2>/dev/null || stat -f '%Lp' "$destination")
 assert_eq 600 "$mode" 'managed output is private'
 
+# Minimal images provide Git and awk but may omit `cmp` or BusyBox `cat -s`.
+# Make the unchanged-output path prove it stays on that shared baseline.
+real_cat=$(type -P cat)
+minimal_bin=$DOT_TEST_TMP/minimal-bin
+mkdir "$minimal_bin"
+cat >"$minimal_bin/cmp" <<'CMP'
+#!/usr/bin/env bash
+printf 'managed block invoked unavailable cmp\n' >&2
+exit 127
+CMP
+cat >"$minimal_bin/cat" <<'CAT'
+#!/usr/bin/env bash
+if [[ ${1:-} == -s ]]; then
+  printf 'managed block invoked unavailable cat -s\n' >&2
+  exit 127
+fi
+exec "$DOT_TEST_REAL_CAT" "$@"
+CAT
+chmod 0755 "$minimal_bin/cmp" "$minimal_bin/cat"
+saved_path=$PATH
+export DOT_TEST_REAL_CAT=$real_cat
+PATH=$minimal_bin:$PATH
 inode_before=$(stat -c '%i' "$destination" 2>/dev/null || stat -f '%i' "$destination")
 _mb_merge_family "$destination" '# dot-managed:family:' "$first" "$second"
 inode_after=$(stat -c '%i' "$destination" 2>/dev/null || stat -f '%i' "$destination")
+PATH=$saved_path
+unset DOT_TEST_REAL_CAT
 assert_eq "$inode_before" "$inode_after" 'unchanged managed output keeps its inode'
 
 foreign_dir=$DOT_TEST_TMP/foreign-directory

@@ -14,6 +14,14 @@ state=$DOT_TEST_TMP/lock-state
 ready=$DOT_TEST_TMP/lock-ready
 release=$DOT_TEST_TMP/lock-release
 
+# Minimal Linux images may omit procps or expose only BusyBox `ps`. Force that
+# boundary when procfs can supply the stronger kernel start identity instead.
+if [[ -r /proc/$$/stat ]]; then
+  # shellcheck disable=SC2329 # Exported for the fresh holder/runtime shells.
+  ps() { return 127; }
+  export -f ps
+fi
+
 HOME=$home XDG_STATE_HOME=$state DOT_SOURCE_ROOT=$DOT_TEST_ROOT \
   bash -c '
     set -euo pipefail
@@ -36,6 +44,13 @@ while [[ ! -e $ready && $remaining -gt 0 ]]; do
   remaining=$((remaining - 1))
 done
 [[ -e $ready ]] || fail 'lock holder did not become ready'
+
+# A lock created with the procfs fallback must retain that identity backend if
+# a full `ps` becomes available to a later contender.
+if declare -F ps >/dev/null; then
+  export -n -f ps
+  unset -f ps
+fi
 
 set +e
 run_dot "$home" "$state" update >/dev/null 2>&1

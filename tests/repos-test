@@ -246,8 +246,9 @@ git -C "$adapter_update_seed" add .local/bin/dot
 git -C "$adapter_update_seed" -c core.hooksPath=/dev/null commit -qm adapter
 git -C "$adapter_update_seed" push -q "$adapter_update_origin" HEAD:main
 run_dot "$adapter_update_home" "$adapter_update_state" update >/dev/null
-cmp -s "$root/support/client-launcher.sh" "$adapter_update_home/.local/bin/dot" ||
-  fail 'exact generated client launcher was not accepted during update'
+assert_files_equal "$root/support/client-launcher.sh" \
+  "$adapter_update_home/.local/bin/dot" \
+  'exact generated client launcher was not accepted during update'
 printf '# modified\n' >>"$adapter_update_seed/.local/bin/dot"
 git -C "$adapter_update_seed" add .local/bin/dot
 git -C "$adapter_update_seed" -c core.hooksPath=/dev/null commit -qm modified-adapter
@@ -258,8 +259,9 @@ adapter_update_status=$?
 set -e
 assert_eq 1 "$adapter_update_status" \
   'modified generated client launcher is rejected during update'
-cmp -s "$root/support/client-launcher.sh" "$adapter_update_home/.local/bin/dot" ||
-  fail 'modified adapter update replaced the accepted client launcher'
+assert_files_equal "$root/support/client-launcher.sh" \
+  "$adapter_update_home/.local/bin/dot" \
+  'modified adapter update replaced the accepted client launcher'
 
 fixture_repo provider-state main .testrc $'safe\n' 100644
 provider_origin=$REPLY
