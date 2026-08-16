@@ -4,8 +4,30 @@ set -euo pipefail
 
 root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 manifest=$root/docs/source-provenance-v1.tsv
+revisions=$root/docs/source-revisions-v1.tsv
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/dot-provenance.XXXXXX")
 trap 'rm -rf -- "$temporary"' EXIT
+
+[[ -r $revisions ]] || {
+  printf 'provenance-test: missing source revision inventory: %s\n' \
+    "$revisions" >&2
+  exit 1
+}
+
+awk -F '\t' '
+  /^#/ { next }
+  NF != 2 || $1 !~ /^[a-z][a-z0-9-]*$/ || $2 !~ /^[0-9a-f]{40}$/ { exit 1 }
+  seen[$1]++ { exit 1 }
+' "$revisions" || {
+  printf 'provenance-test: invalid source revision inventory\n' >&2
+  exit 1
+}
+
+dotfiles_revision=$(awk -F '\t' '$1 == "dotfiles-v1" { print $2 }' "$revisions")
+[[ $dotfiles_revision =~ ^[0-9a-f]{40}$ ]] || {
+  printf 'provenance-test: missing dotfiles-v1 source revision\n' >&2
+  exit 1
+}
 
 awk -F '\t' '
   /^#/ { next }
@@ -30,13 +52,24 @@ while IFS=$'\t' read -r path origin; do
     exit 1
   }
   case $origin in
-    standalone:new | dotfiles:* | actions:* | shdeps:*) ;;
+    standalone:new | actions:* | shdeps:*) ;;
+    dotfiles:*@dotfiles-v1 | dotfiles:*@dotfiles-v1+standalone) ;;
     *)
       printf 'provenance-test: unknown origin for %s: %s\n' "$path" "$origin" >&2
       exit 1
       ;;
   esac
 done <"$manifest"
+
+if grep -Eq '[0-9a-f]{40}' "$manifest"; then
+  printf 'provenance-test: source revision duplicated in path inventory\n' >&2
+  exit 1
+fi
+
+grep -Fq 'source-revisions-v1.tsv' "$root/docs/source-provenance.md" || {
+  printf 'provenance-test: source revision inventory is undocumented\n' >&2
+  exit 1
+}
 
 if grep -Eiq 'dotfiles-(work|personal)|private overlay repository' "$manifest"; then
   printf 'provenance-test: private source named in public inventory\n' >&2

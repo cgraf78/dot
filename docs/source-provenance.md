@@ -1,10 +1,10 @@
 # Source provenance
 
 This repository has fresh history. Public engine extraction used only the
-public `cgraf78/dotfiles` tree at commit
-`1f178787fbb7fc4dfdacbabea01fc196cf6aa462`; no implementation or fixture was
-copied from a private overlay repository. New standalone-only seams are marked
-as such below rather than being attributed to an older file.
+public `cgraf78/dotfiles` tree at the immutable `dotfiles-v1` revision recorded
+in [`source-revisions-v1.tsv`](source-revisions-v1.tsv); no implementation or
+fixture was copied from a private overlay repository. New standalone-only seams
+are marked as such below rather than being attributed to an older file.
 
 ## Generated and shared inputs
 
@@ -13,6 +13,7 @@ as such below rather than being attributed to an older file.
 | `install.sh` | `cgraf78/actions` checkout-installer at the revision in `.github/cgraf78-actions.lock` | Generated, never hand-edited |
 | `support/checkout-bash-v1.sh` | `actions:checkout-installer/bash-resolver-v1.sh.in` at the same locked revision | Generated from the resolver embedded in `install.sh` |
 | `support/shdeps.lock` | Its recorded immutable `cgraf78/shdeps` revision | Pins revision, installer digest, and ABI without duplicating that revision in this inventory |
+| `docs/source-revisions-v1.tsv` | Reviewed immutable public extraction inputs | Gives each source revision one stable name so per-path provenance does not duplicate commit hashes |
 
 ## Public runtime implementation
 
