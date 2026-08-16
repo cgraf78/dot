@@ -71,6 +71,17 @@ dot_install_exact_link() {
   [[ "$actual" == "$expected" ]]
 }
 
+dot_install_exact_file() {
+  local expected=$1 actual=$2
+
+  # Git is already required to obtain and run this checkout, while small
+  # bootstrap images may omit coreutils `cmp`. Disable both external diff and
+  # text conversion so the comparison is over the two files' literal bytes and
+  # cannot delegate to client configuration.
+  command git --no-pager diff --no-index --quiet --no-ext-diff --no-textconv \
+    -- "$expected" "$actual"
+}
+
 dot_install_remove_exact_link() {
   local path=$1 expected=$2
 
@@ -253,7 +264,8 @@ if [[ -e "$COMMAND_TARGET" || -L "$COMMAND_TARGET" ]]; then
   if dot_install_exact_link "$COMMAND_TARGET" "$COMMAND_SOURCE"; then
     :
   elif [[ -f "$COMMAND_TARGET" && ! -L "$COMMAND_TARGET" &&
-    -x "$COMMAND_TARGET" ]] && cmp -s "$CLIENT_ADAPTER" "$COMMAND_TARGET"; then
+    -x "$COMMAND_TARGET" ]] &&
+    dot_install_exact_file "$CLIENT_ADAPTER" "$COMMAND_TARGET"; then
     command_adapter=true
   else
     printf 'dot: refusing to replace existing command: %s\n' \
@@ -280,7 +292,7 @@ dot_install_publish_link "$LIBRARY_SOURCE" "$LIBRARY_TARGET"
 if [[ "$command_adapter" == true ]]; then
   if [[ ! -f "$COMMAND_TARGET" || -L "$COMMAND_TARGET" ||
     ! -x "$COMMAND_TARGET" ]] ||
-    ! cmp -s "$CLIENT_ADAPTER" "$COMMAND_TARGET"; then
+    ! dot_install_exact_file "$CLIENT_ADAPTER" "$COMMAND_TARGET"; then
     printf 'dot: client adapter changed during installation: %s\n' \
       "$COMMAND_TARGET" >&2
     exit 1

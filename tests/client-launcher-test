@@ -6,7 +6,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == 4fc4a57e1f3a09f6e8f97ea0f6c2dab3ce746c6a ]] ||
+[[ $(git hash-object "$launcher") == b620e4936d5579c8dcc6518629444e095d66835f ]] ||
   fail 'client launcher v1 changed in place; update its migration fixture deliberately'
 install_home=$DOT_TEST_TMP/install
 checkout=$install_home/cgraf78/dot
@@ -46,7 +46,17 @@ printf '%s\n' "$@" >>"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
 LEGACY
 chmod 0755 "$legacy"
 
-DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+# The retained adapter must run on the same minimal bootstrap images as its
+# installer. Git is present there, but a standalone `cmp` command may not be.
+no_cmp_bin=$DOT_TEST_TMP/no-cmp-bin
+mkdir -p "$no_cmp_bin"
+cat >"$no_cmp_bin/cmp" <<'CMP'
+#!/usr/bin/env bash
+printf 'client launcher invoked unavailable cmp\n' >&2
+exit 127
+CMP
+chmod 0755 "$no_cmp_bin/cmp"
+PATH="$no_cmp_bin:$PATH" DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
   DOT_CLIENT_CUTOVER_LOCK=$lock \
   DOT_CLIENT_HANDOFF_HELPER=$helper \

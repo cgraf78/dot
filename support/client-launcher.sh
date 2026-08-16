@@ -51,6 +51,16 @@ dot_client_git() (
   exec "$DOT_CLIENT_GIT" "$@"
 )
 
+dot_client_exact_file() {
+  local expected=$1 actual=$2
+
+  # Git is the launcher's existing trust primitive and is present on minimal
+  # bootstrap images that omit coreutils `cmp`. Suppress configurable diff
+  # delegates so this remains a literal byte comparison.
+  dot_client_git --no-pager diff --no-index --quiet --no-ext-diff --no-textconv \
+    -- "$expected" "$actual"
+}
+
 dot_client_standalone_ready() {
   local checkout=$1 runtime=$2 lock=$3 launcher=$4 template
   local checkout_physical top top_physical head lock_status=0
@@ -64,10 +74,10 @@ dot_client_standalone_ready() {
   [[ -f "$runtime" && ! -L "$runtime" && -x "$runtime" ]] || return 1
   template=$checkout/support/client-launcher.sh
   [[ -f "$template" && ! -L "$template" ]] || return 1
-  cmp -s "$launcher" "$template" || return 1
   DOT_CLIENT_GIT=$(type -P git 2>/dev/null) || return 1
   dot_client_normalized_absolute "$DOT_CLIENT_GIT" || return 1
   [[ -f "$DOT_CLIENT_GIT" && -x "$DOT_CLIENT_GIT" ]] || return 1
+  dot_client_exact_file "$launcher" "$template" || return 1
   checkout_physical=$(cd -P -- "$checkout" 2>/dev/null && pwd -P) || return 1
   top=$(dot_client_git -C "$checkout" rev-parse --show-toplevel 2>/dev/null) ||
     return 1
