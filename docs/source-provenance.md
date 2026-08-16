@@ -10,9 +10,9 @@ as such below rather than being attributed to an older file.
 
 | Standalone path | Public source or origin | Notes |
 | --- | --- | --- |
-| `install.sh` | `cgraf78/actions` checkout-installer at `d77303b78ba5db9efa1ac0d14a717ea1ea360d2d` | Generated, never hand-edited |
-| `support/checkout-bash-v1.sh` | `actions:checkout-installer/bash-resolver-v1.sh.in` at the same revision | Generated from the resolver embedded in `install.sh` |
-| `support/shdeps.lock` | `cgraf78/shdeps` at `a49dcb4d9d70d4f781053c90e42f52fe39400242` | Pins revision, installer digest, and ABI |
+| `install.sh` | `cgraf78/actions` checkout-installer at the revision in `.github/cgraf78-actions.lock` | Generated, never hand-edited |
+| `support/checkout-bash-v1.sh` | `actions:checkout-installer/bash-resolver-v1.sh.in` at the same locked revision | Generated from the resolver embedded in `install.sh` |
+| `support/shdeps.lock` | Its recorded immutable `cgraf78/shdeps` revision | Pins revision, installer digest, and ABI without duplicating that revision in this inventory |
 
 ## Public runtime implementation
 
@@ -49,7 +49,7 @@ as such below rather than being attributed to an older file.
 | `tests/{repos-test,resources-test,update-lock-test}` | Generic cases extracted from `dotfiles:.local/lib/dot/tests/{core-pull-test,core-overlays-test,core-update-test,core-resource-cleanup-test,xdg-test}` and `tests/core/commands.sh` | Expanded with standalone topology, reserved-path, cancellation, and crash-phase fixtures |
 | `tests/{families-test,merge-block-test,hooks-test,hook-api-test,extensions-api-test}` | Generic cases extracted from `core-merges-test`, `core-resource-cleanup-test`, and `tests/core/merges.sh` | Concrete application hook cases deliberately excluded |
 | `tests/{doctor-test,shdeps-provider-test}` | Generic cases extracted from `core-doctor-test`, `core-test`, `core-reexec-test`, and provider/UI portions of the public suite | Application and environment checks remain client-owned |
-| `tests/{init-test,cli-test,config-test,install-test,client-launcher-test,library-test,examples-test}` | New standalone acceptance suites, informed by public bootstrap/launcher/XDG characterization | Use only synthetic users, repositories, hosts, and paths |
+| `tests/{init-test,cli-test,config-test,install-test,client-launcher-test,library-test,examples-test,workflow-test}` | New standalone acceptance suites, informed by public bootstrap/launcher/XDG/workflow characterization | Use only synthetic users, repositories, hosts, and paths |
 | `tests/lib/{test.sh,repo.sh}` and `tests/run` | New standalone harness, adapted from public dotfiles test conventions | Checkout-local only; never invokes the private/client suite |
 
 Before first public visibility, CI compares this inventory with the tracked

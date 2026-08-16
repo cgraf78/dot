@@ -1,6 +1,6 @@
 # path	public origin
 bin/dot	standalone:new
-install.sh	actions:checkout-installer@d77303b78ba5db9efa1ac0d14a717ea1ea360d2d
+install.sh	actions:checkout-installer@.github/cgraf78-actions.lock
 lib/dot/commands.sh	standalone:new
 lib/dot/config.sh	standalone:new
 lib/dot/constants.sh	dotfiles:core/constants.sh@1f178787fbb7fc4dfdacbabea01fc196cf6aa462
@@ -53,11 +53,11 @@ lib/dot/runtime.sh	standalone:new
 lib/dot/temp.sh	dotfiles:core/temp.sh@1f178787fbb7fc4dfdacbabea01fc196cf6aa462
 lib/dot/update-lock.sh	dotfiles:core/update-lock.sh@1f178787fbb7fc4dfdacbabea01fc196cf6aa462
 lib/dot/update.sh	dotfiles:core/update.sh@1f178787fbb7fc4dfdacbabea01fc196cf6aa462
-support/checkout-bash-v1.sh	actions:checkout-installer/bash-resolver-v1.sh.in@d77303b78ba5db9efa1ac0d14a717ea1ea360d2d
+support/checkout-bash-v1.sh	actions:checkout-installer/bash-resolver-v1.sh.in@.github/cgraf78-actions.lock
 support/client-launcher.sh	standalone:new
 support/install-checkout.sh	standalone:new
 support/post-install.sh	standalone:new
-support/shdeps.lock	shdeps:installer@a49dcb4d9d70d4f781053c90e42f52fe39400242
+support/shdeps.lock	shdeps:installer-lock
 tests/cli-test	standalone:new
 tests/client-launcher-test	standalone:new
 tests/config-test	standalone:new
@@ -80,3 +80,4 @@ tests/resources-test	dotfiles:tests/core-resource-cleanup-test@1f178787fbb7fc4df
 tests/run	standalone:new
 tests/shdeps-provider-test	dotfiles:tests/core-test+core-reexec-test@1f178787fbb7fc4dfdacbabea01fc196cf6aa462+standalone
 tests/update-lock-test	dotfiles:tests/core-update-test@1f178787fbb7fc4dfdacbabea01fc196cf6aa462+standalone
+tests/workflow-test	standalone:new
