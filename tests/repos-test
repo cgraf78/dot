@@ -9,6 +9,8 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$root/tests/lib/repo.sh"
 # shellcheck source=../lib/dot/platform.sh
 . "$root/lib/dot/platform.sh"
+DOT_TEST_REAL_MV=$(type -P mv)
+export DOT_TEST_REAL_MV
 
 fixture_repo update topic .testrc $'one\n' 100644
 origin=$REPLY
@@ -486,22 +488,26 @@ printf 'sync=none\npath=%s\n' "$link_race_source" \
   >"$link_race_home/.config/dot/overlays.d/10-race.local.conf"
 link_race_bin=$DOT_TEST_TMP/link-race-bin
 mkdir -p "$link_race_bin"
+link_race_marker=$DOT_TEST_TMP/link-race-boundary
 cat >"$link_race_bin/mv" <<'MV'
 #!/usr/bin/env bash
 set -e
 last=${!#}
 if [[ $last == "$DOT_TEST_LINK_RACE_DEST" && ! -e $last && ! -L $last ]]; then
   mkdir -p "$last"
+  printf 'mv\n' >>"$DOT_TEST_LINK_RACE_MARKER"
 fi
-exec /usr/bin/mv "$@"
+exec "$DOT_TEST_REAL_MV" "$@"
 MV
 chmod +x "$link_race_bin/mv"
 set +e
 PATH="$link_race_bin:$PATH" \
   DOT_TEST_LINK_RACE_DEST="$link_race_home/.config/race/value" \
+  DOT_TEST_LINK_RACE_MARKER="$link_race_marker" \
   run_dot "$link_race_home" "$link_race_state" update >/dev/null 2>&1
 link_race_rc=$?
 set -e
+[[ -s $link_race_marker ]] || fail 'late overlay link race fixture did not run'
 assert_eq 1 "$link_race_rc" 'late overlay link directory aborts publication'
 [[ -d $link_race_home/.config/race/value &&
   ! -L $link_race_home/.config/race/value ]] ||
@@ -553,7 +559,7 @@ if [[ ! -e ${DOT_TEST_REPLACEMENT_RACE_DONE:-} &&
   unlink "$DOT_TEST_REPLACEMENT_RACE_DEST"
   printf 'foreign\n' >"$DOT_TEST_REPLACEMENT_RACE_DEST"
 fi
-exec /usr/bin/mv "$@"
+exec "$DOT_TEST_REAL_MV" "$@"
 MV
 cat >"$replacement_race_bin/stat" <<'STAT'
 #!/usr/bin/env bash
@@ -1008,7 +1014,7 @@ if [[ ! -e ${DOT_TEST_RETARGET_DONE:-} &&
   unlink "$HOME/alias"
   ln -s "$DOT_TEST_RETARGET_RESERVED" "$HOME/alias"
 fi
-exec /usr/bin/mv "$@"
+exec "$DOT_TEST_REAL_MV" "$@"
 MV
 chmod +x "$retarget_bin/mv"
 set +e
@@ -1056,7 +1062,7 @@ last=${!#}
 if [[ $last == "$DOT_TEST_MANIFEST_RACE_DEST" && ! -e $last && ! -L $last ]]; then
   mkdir -p "$last"
 fi
-exec /usr/bin/mv "$@"
+exec "$DOT_TEST_REAL_MV" "$@"
 MV
 chmod +x "$manifest_bin/mv"
 manifest_pending=$manifest_race_state/dot/overlay-links.pending
@@ -1093,7 +1099,7 @@ last=${!#}
 if [[ $last == "$DOT_TEST_MANIFEST_RACE_DEST" && ! -e $last && ! -L $last ]]; then
   mkdir -p "$last"
 fi
-exec /usr/bin/mv "$@"
+exec "$DOT_TEST_REAL_MV" "$@"
 MV
 chmod +x "$final_manifest_bin/mv"
 final_manifest_path=$final_manifest_state/dot/overlay-links
