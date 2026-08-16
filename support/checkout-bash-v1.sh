@@ -102,7 +102,8 @@ _checkout_bash_v1_read_hint() {
 }
 
 _checkout_bash_v1_detect_link_tool() {
-  local parent=$1 probe source ln_bin mv_bin move_destination nested
+  local parent=$1 probe source ln_bin mv_bin move_source='' move_target=''
+  local move_destination nested mv_supported=false
 
   ln_bin=$(type -P ln 2>/dev/null) || return 1
   probe=$(mktemp -d "$parent/.bash-v1.tools.XXXXXX") || return 1
@@ -119,17 +120,31 @@ _checkout_bash_v1_detect_link_tool() {
     else
       rm -f "$probe/link"
       mv_bin=$(type -P mv 2>/dev/null) || mv_bin=
+      move_source=$probe/move-source
+      move_target=$probe/move-target
       move_destination=$probe/destination
-      mkdir "$move_destination" || return 1
+      printf 'move probe\n' >"$move_source"
       if [[ -n "$mv_bin" ]] &&
-        "$mv_bin" -nT -- "$source" "$move_destination" 2>/dev/null &&
-        [[ -f "$source" && ! -L "$source" ]] &&
-        rmdir "$move_destination"; then
+        "$mv_bin" -nT -- "$move_source" "$move_target" 2>/dev/null &&
+        [[ ! -e "$move_source" && ! -L "$move_source" &&
+          -f "$move_target" && ! -L "$move_target" ]] &&
+        mkdir "$move_destination"; then
+        # GNU mv versions disagree about whether a preserved -n collision is
+        # success or failure. The filesystem postcondition is the contract:
+        # the source survives and the exact destination directory is untouched.
+        "$mv_bin" -nT -- "$move_target" "$move_destination" 2>/dev/null || true
+        if [[ -f "$move_target" && ! -L "$move_target" &&
+          -d "$move_destination" && ! -L "$move_destination" ]] &&
+          rmdir "$move_destination"; then
+          mv_supported=true
+        fi
+      fi
+      if [[ "$mv_supported" == true ]]; then
         _CHECKOUT_BASH_V1_LN_MODE=mv-T
         _CHECKOUT_BASH_V1_MV_BIN=$mv_bin
       else
-        nested=$move_destination/${source##*/}
-        rm -f "$nested" "$source"
+        nested=$move_destination/${move_target##*/}
+        rm -f "$nested" "$move_source" "$move_target" "$source"
         rmdir "$move_destination" 2>/dev/null || true
         rmdir "$probe" 2>/dev/null || true
         _checkout_bash_v1_error 'no exact-destination runtime-hint publication is available'
@@ -137,7 +152,7 @@ _checkout_bash_v1_detect_link_tool() {
       fi
     fi
   fi
-  rm -f "$probe/link" "$source"
+  rm -f "$probe/link" "$source" "$move_source" "$move_target"
   rmdir "$probe" || return 1
   _CHECKOUT_BASH_V1_LN_BIN=$ln_bin
 }
