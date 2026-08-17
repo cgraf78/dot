@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+# shellcheck source=lib/repo.sh
+. "$root/tests/lib/repo.sh"
+# shellcheck source=../lib/dot/public/xdg.sh
+. "$root/lib/dot/public/xdg.sh"
+_dot_xdg_path() { dot_xdg_path "$@"; }
+# shellcheck source=../lib/dot/update-lock.sh
+. "$root/lib/dot/update-lock.sh"
+
+fixture_repo doctor main README.md $'doctor\n' 100644
+origin=$REPLY
+fixture_home doctor
+home=$REPLY
+state=$DOT_TEST_TMP/doctor-state
+run_dot "$home" "$state" init --yes "file://$origin" >/dev/null
+extensions=$home/extensions
+# Termux runners may enter tests with a permissive umask. Establish the exact
+# trusted collection modes so the fixture tests extension behavior, not the
+# ambient process policy.
+(
+  umask 0000
+  mkdir -p "$home/.config/dot" "$extensions/doctor.d"
+)
+chmod 0700 "$extensions" "$extensions/doctor.d"
+# shellcheck disable=SC2016 # Literal config grammar under test.
+printf '%s\n' \
+  'version=1' \
+  'extension_api=1' \
+  'extensions_dir=$HOME/extensions' \
+  'dependency_provider=none' \
+  >"$home/.config/dot/config"
+
+baseline_output=$(run_dot "$home" "$state" doctor 2>&1)
+assert_contains 'client upstream' "$baseline_output" 'doctor reports configured upstream'
+assert_contains 'dot engine source' "$baseline_output" 'doctor reports active engine mode'
+
+# A client can intentionally use an ordinary checkout rooted at HOME. The
+# repository selector gives that topology a typed Git invocation; doctor must
+# not apply the separate-git-dir core.bare/core.worktree test to it.
+fixture_repo doctor-ordinary main README.md $'ordinary\n' 100644
+ordinary_origin=$REPLY
+fixture_home doctor-ordinary
+ordinary_home=$REPLY
+ordinary_state=$DOT_TEST_TMP/doctor-ordinary-state
+git clone -q "$ordinary_origin" "$ordinary_home"
+run_dot "$ordinary_home" "$ordinary_state" init --yes \
+  "file://$ordinary_origin" >/dev/null
+set +e
+ordinary_output=$(run_dot "$ordinary_home" "$ordinary_state" doctor 2>&1)
+ordinary_status=$?
+set -e
+assert_eq 0 "$ordinary_status" 'doctor accepts an ordinary HOME checkout'
+assert_contains 'ordinary client layout' "$ordinary_output" \
+  'doctor reports the selected ordinary client topology'
+[[ $ordinary_output != *'client Git directory has no worktree identity'* ]] ||
+  fail 'doctor applied separate-git-dir identity rules to an ordinary checkout'
+
+fixture_push doctor main README.md $'doctor updated\n' 100644
+git --git-dir="$home/.dotfiles" fetch -q origin
+behind_output=$(run_dot "$home" "$state" doctor 2>&1)
+assert_contains 'client is behind upstream' "$behind_output" \
+  'doctor classifies behind upstream state'
+run_dot "$home" "$state" update >/dev/null
+
+# Relative Git URLs are normalized from HOME by the update engine. Doctor must
+# compare against that same effective URL rather than report healthy clones as
+# drifted merely because Git records the resulting absolute spelling.
+fixture_repo doctor-relative main home/.config/relative/value $'relative\n' 100644
+relative_source=$REPLY
+mkdir -p "$home/remotes" "$home/.config/dot/overlays.d"
+git clone -q --bare "$relative_source" "$home/remotes/relative.git"
+git -C "$home/remotes/relative.git" symbolic-ref HEAD refs/heads/main
+printf 'url=remotes/relative.git\n' >"$home/.config/dot/overlays.d/10-relative.conf"
+
+# A linked worktree has a regular `.git` file. Every repository-aware doctor
+# path must use the shared worktree predicate rather than assuming `.git` is a
+# directory created by an ordinary clone.
+fixture_repo doctor-linked main home/.config/linked/value $'linked\n' 100644
+linked_origin=$REPLY
+linked_main=$DOT_TEST_TMP/doctor-linked-main
+git clone -q "$linked_origin" "$linked_main"
+git -C "$linked_main" worktree add -q --detach "$home/.dotfiles-linked" origin/main
+printf 'url=%s\n' "$linked_origin" >"$home/.config/dot/overlays.d/20-linked.conf"
+
+run_dot "$home" "$state" update >/dev/null
+set +e
+overlay_output=$(run_dot "$home" "$state" doctor 2>&1)
+overlay_status=$?
+set -e
+assert_eq 0 "$overlay_status" 'doctor accepts healthy linked-worktree overlay'
+assert_contains 'linked: cloned' "$overlay_output" 'doctor recognizes linked worktree'
+[[ $overlay_output != *'relative: remote URL drift'* ]] ||
+  fail 'doctor did not normalize relative overlay URL'
+
+cat >"$extensions/doctor.d/10-alpha.sh" <<'DOCTOR'
+doctor() {
+  if declare -F _base_git >/dev/null || declare -F _dot_doctor >/dev/null ||
+    declare -F _run_merges >/dev/null; then
+    dot_doctor_fail 'doctor extension inherited private engine functions'
+    return 1
+  fi
+  dot_doctor_section 'Alpha extension'
+  dot_doctor_ok 'doctor extension worker surface is isolated'
+  dot_doctor_ok 'alpha healthy' 'fixture'
+  leaked_doctor_state=1
+}
+DOCTOR
+cat >"$extensions/doctor.d/20-failing.sh" <<'DOCTOR'
+doctor() {
+  [[ -z ${leaked_doctor_state+x} ]]
+  dot_doctor_fail 'expected extension failure' 'fixture failure'
+  return 1
+}
+DOCTOR
+cat >"$extensions/doctor.d/30-after.sh" <<'DOCTOR'
+doctor() {
+  dot_doctor_ok 'later extension still ran'
+}
+DOCTOR
+chmod 0644 "$extensions/doctor.d"/*.sh
+set +e
+output=$(run_dot "$home" "$state" doctor 2>&1)
+doctor_status=$?
+set -e
+assert_eq 1 "$doctor_status" 'doctor aggregates extension failure'
+assert_contains 'client Git directory exists' "$output" 'core doctor runs first'
+assert_contains 'Alpha extension' "$output" 'doctor section result transport'
+assert_contains 'doctor extension worker surface is isolated' "$output" \
+  'doctor coordinator uses the fresh extension worker'
+assert_contains 'alpha healthy' "$output" 'doctor success result transport'
+assert_contains 'expected extension failure' "$output" 'doctor failure result transport'
+assert_contains 'later extension still ran' "$output" 'doctor continues after extension failure'
+
+# Scratch allocation failure is an extension failure, but it must also produce
+# a visible core result. A silent nonzero status gives the user no actionable
+# explanation and leaves the aggregate counters inconsistent with the exit.
+mkdir -p "$DOT_TEST_TMP/mktemp-fail-bin"
+cat >"$DOT_TEST_TMP/mktemp-fail-bin/mktemp" <<'SCRIPT'
+#!/usr/bin/env bash
+exit 1
+SCRIPT
+chmod 0755 "$DOT_TEST_TMP/mktemp-fail-bin/mktemp"
+set +e
+mktemp_output=$(PATH="$DOT_TEST_TMP/mktemp-fail-bin:$PATH" \
+  run_dot "$home" "$state" doctor 2>&1)
+mktemp_status=$?
+set -e
+assert_eq 1 "$mktemp_status" 'doctor reports extension scratch failure'
+assert_contains 'temporary directory unavailable' "$mktemp_output" \
+  'doctor explains extension scratch failure'
+
+rm -f "$extensions/doctor.d"/*.sh
+cat >"$extensions/doctor.d/10-duplicate.sh" <<'DOCTOR'
+doctor() { dot_doctor_ok first; }
+DOCTOR
+cat >"$extensions/doctor.d/20-duplicate.sh" <<'DOCTOR'
+doctor() { dot_doctor_ok second; }
+DOCTOR
+set +e
+output=$(run_dot "$home" "$state" doctor 2>&1)
+duplicate_status=$?
+set -e
+assert_eq 1 "$duplicate_status" 'duplicate doctor identity is fatal'
+assert_contains 'doctor extension discovery failed' "$output" \
+  'duplicate doctor identity is reported'
+[[ $output != *'first'* && $output != *'second'* ]] ||
+  fail 'duplicate doctor inventory ran an extension'
+
+rm -f "$extensions/doctor.d"/*.sh
+mv "$extensions/doctor.d" "$extensions/doctor-real"
+ln -s doctor-real "$extensions/doctor.d"
+set +e
+output=$(run_dot "$home" "$state" doctor 2>&1)
+unsafe_collection_status=$?
+set -e
+assert_eq 1 "$unsafe_collection_status" 'symlinked doctor collection is fatal'
+assert_contains 'doctor extension discovery failed' "$output" \
+  'unsafe doctor collection is reported'
+rm "$extensions/doctor.d"
+mv "$extensions/doctor-real" "$extensions/doctor.d"
+
+# Doctor is intentionally read-only, but it still needs to diagnose the lock
+# that would prevent the next mutation. A non-directory lock path is invalid
+# authority and must be a health failure rather than being ignored.
+fixture_repo doctor-lock main README.md $'lock\n' 100644
+lock_origin=$REPLY
+fixture_home doctor-lock
+lock_home=$REPLY
+lock_state=$DOT_TEST_TMP/doctor-lock-state
+run_dot "$lock_home" "$lock_state" init --yes "file://$lock_origin" >/dev/null
+mkdir -p "$lock_state/dot"
+ln -s "$DOT_TEST_TMP/foreign-lock" "$lock_state/dot/update.lock.d"
+set +e
+lock_output=$(run_dot "$lock_home" "$lock_state" doctor 2>&1)
+lock_status=$?
+set -e
+assert_eq 1 "$lock_status" 'doctor rejects unsafe update lock path'
+assert_contains 'update lock path is unsafe' "$lock_output" \
+  'doctor explains unsafe update lock path'
+
+rm "$lock_state/dot/update.lock.d"
+mkdir "$lock_state/dot/update.lock.d"
+lock_start=$(_dot_update_lock_process_start "$$")
+printf 'pid\t%s\nstart\t%s\ntoken\tfixture\n' "$$" "$lock_start" \
+  >"$lock_state/dot/update.lock.d/owner"
+active_lock_output=$(run_dot "$lock_home" "$lock_state" doctor 2>&1)
+assert_contains 'update is currently running' "$active_lock_output" \
+  'doctor reports active update lock'
+printf 'pid\t99999999\nstart\tmissing\ntoken\tfixture\n' \
+  >"$lock_state/dot/update.lock.d/owner"
+stale_lock_output=$(run_dot "$lock_home" "$lock_state" doctor 2>&1)
+assert_contains 'update lock owner is stale' "$stale_lock_output" \
+  'doctor reports stale update lock'
+
+# Selecting a provider makes its reviewed installer and ABI part of runtime
+# health. Doctor reports an unavailable provider without trying to bootstrap or
+# mutate it. The development bypass flag is also visible in the engine report.
+fixture_repo doctor-provider main README.md $'provider\n' 100644
+provider_origin=$REPLY
+fixture_home doctor-provider
+provider_home=$REPLY
+provider_state=$DOT_TEST_TMP/doctor-provider-state
+run_dot "$provider_home" "$provider_state" init --yes "file://$provider_origin" >/dev/null
+mkdir -p "$provider_home/.config/dot"
+printf 'version=1\ndependency_provider=shdeps\n' >"$provider_home/.config/dot/config"
+set +e
+provider_output=$(run_dot "$provider_home" "$provider_state" doctor 2>&1)
+provider_status=$?
+set -e
+assert_eq 1 "$provider_status" 'doctor fails for unavailable selected provider'
+assert_contains 'Shdeps provider is unavailable' "$provider_output" \
+  'doctor explains unavailable selected provider'
+
+printf 'version=1\ndependency_provider=none\n' >"$provider_home/.config/dot/config"
+bypass_output=$(HOME="$provider_home" XDG_STATE_HOME="$provider_state" XDG_CONFIG_HOME='' \
+  DOT_IGNORE_DEV_CHECKOUT=1 "$root/bin/dot" doctor 2>&1)
+assert_contains 'development checkout bypass enabled' "$bypass_output" \
+  'doctor reports development bypass mode'
+
+# The source classifier distinguishes both supported Shdeps checkout shapes.
+engine_home=$DOT_TEST_TMP/doctor-engine-home
+managed_root=$engine_home/share/cgraf78/dot
+development_root=$engine_home/git/dot
+mkdir -p "$managed_root" "$development_root"
+managed_output=$(HOME="$engine_home" SHDEPS_INSTALL_DIR="$engine_home/share" \
+  SHDEPS_GIT_DEV_DIR="$engine_home/git" DOT_TEST_ROOT="$root" \
+  DOT_TEST_ENGINE_ROOT="$managed_root" bash --noprofile --norc -c '
+    . "$DOT_TEST_ROOT/lib/dot/doctor/runtime.sh"
+    . "$DOT_TEST_ROOT/lib/dot/doctor/paths.sh"
+    . "$DOT_TEST_ROOT/lib/dot/doctor.sh"
+    DOT_SOURCE_ROOT=$DOT_TEST_ENGINE_ROOT
+    _dr_check_engine_source
+  ')
+assert_contains 'managed checkout' "$managed_output" 'doctor classifies managed engine source'
+development_output=$(HOME="$engine_home" SHDEPS_INSTALL_DIR="$engine_home/share" \
+  SHDEPS_GIT_DEV_DIR="$engine_home/git" DOT_TEST_ROOT="$root" \
+  DOT_TEST_ENGINE_ROOT="$development_root" bash --noprofile --norc -c '
+    . "$DOT_TEST_ROOT/lib/dot/doctor/runtime.sh"
+    . "$DOT_TEST_ROOT/lib/dot/doctor/paths.sh"
+    . "$DOT_TEST_ROOT/lib/dot/doctor.sh"
+    DOT_SOURCE_ROOT=$DOT_TEST_ENGINE_ROOT
+    _dr_check_engine_source
+  ')
+assert_contains 'development checkout' "$development_output" \
+  'doctor classifies development engine source'
+
+linked_engine=$DOT_TEST_TMP/dot-linked-worktree
+git -C "$root" worktree add -q --detach "$linked_engine" HEAD
+linked_engine_output=$(HOME=$engine_home DOT_TEST_ROOT=$root \
+  DOT_TEST_ENGINE_ROOT=$linked_engine bash --noprofile --norc -c '
+    . "$DOT_TEST_ROOT/lib/dot/doctor/runtime.sh"
+    . "$DOT_TEST_ROOT/lib/dot/doctor/paths.sh"
+    . "$DOT_TEST_ROOT/lib/dot/doctor.sh"
+    DOT_SOURCE_ROOT=$DOT_TEST_ENGINE_ROOT
+    _dr_check_runtime
+  ')
+assert_contains 'dot checkout exists' "$linked_engine_output" \
+  'doctor accepts a linked-worktree engine checkout'
+[[ $linked_engine_output != *'dot checkout is unavailable'* ]] ||
+  fail 'doctor rejected linked-worktree engine checkout'
+git -C "$root" worktree remove --force "$linked_engine"
+
+# Doctor workers always receive closed stdin, so they must use an owned process
+# group even when the caller has a controlling terminal. Force the portable
+# no-process-discovery backend and prove parent-only TERM still reaps a
+# TERM-ignoring extension descendant.
+cancel_home=$DOT_TEST_TMP/doctor-cancel-home
+cancel_extensions=$cancel_home/extensions
+(
+  umask 0000
+  mkdir -p "$cancel_extensions/doctor.d"
+)
+chmod 0700 "$cancel_extensions" "$cancel_extensions/doctor.d"
+cat >"$cancel_extensions/doctor.d/10-cancellable.sh" <<'DOCTOR'
+doctor() {
+  printf '%s\n' "$BASHPID" >"$HOME/doctor-worker.pid"
+  (
+    trap '' TERM
+    printf '%s\n' "$BASHPID" >"$HOME/doctor-child.pid"
+    while :; do sleep 1; done
+  ) &
+  wait "$!"
+}
+DOCTOR
+chmod 0644 "$cancel_extensions/doctor.d/10-cancellable.sh"
+HOME=$cancel_home DOT_SOURCE_ROOT=$root DOT_EXTENSIONS_DIR=$cancel_extensions \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/public/ui.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/resources.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/extension-trust.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/extension-worker-launch.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/doctor/runtime.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/doctor.sh"
+    _dot_cleanup_process_backend() { printf -v "$1" %s none; }
+    _dot_cleanup_has_controlling_tty() { return 0; }
+    _dot_cleanup_install_owner_traps
+    _dot_doctor_run_extension cancellable \
+      "$DOT_EXTENSIONS_DIR/doctor.d/10-cancellable.sh"
+  ' >"$cancel_home/output" 2>&1 &
+cancel_coordinator_pid=$!
+cancel_deadline=$((SECONDS + 5))
+while ((SECONDS < cancel_deadline)); do
+  [[ -s $cancel_home/doctor-worker.pid && -s $cancel_home/doctor-child.pid ]] && break
+  kill -0 "$cancel_coordinator_pid" 2>/dev/null || break
+  sleep 0.01
+done
+if [[ ! -s $cancel_home/doctor-worker.pid || ! -s $cancel_home/doctor-child.pid ]]; then
+  kill -TERM "$cancel_coordinator_pid" 2>/dev/null || true
+  wait "$cancel_coordinator_pid" 2>/dev/null || true
+  fail 'doctor cancellation fixture did not launch its descendant'
+fi
+cancel_worker_pid=$(<"$cancel_home/doctor-worker.pid")
+cancel_child_pid=$(<"$cancel_home/doctor-child.pid")
+kill -TERM "$cancel_coordinator_pid"
+set +e
+wait "$cancel_coordinator_pid"
+cancel_status=$?
+set -e
+assert_eq 143 "$cancel_status" 'doctor coordinator preserves TERM status'
+cancel_deadline=$((SECONDS + 5))
+while process_is_live "$cancel_worker_pid" && ((SECONDS < cancel_deadline)); do
+  sleep 0.01
+done
+if process_is_live "$cancel_worker_pid"; then
+  kill -KILL "$cancel_worker_pid" 2>/dev/null || true
+  fail 'doctor cancellation left its fresh Bash worker alive'
+fi
+cancel_deadline=$((SECONDS + 5))
+while process_is_live "$cancel_child_pid" && ((SECONDS < cancel_deadline)); do
+  sleep 0.01
+done
+if process_is_live "$cancel_child_pid"; then
+  kill -KILL "$cancel_child_pid" 2>/dev/null || true
+  fail 'doctor cancellation left a TERM-ignoring descendant alive'
+fi
+
+printf 'doctor-test: ok\n'

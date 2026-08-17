@@ -5,24 +5,137 @@ set -euo pipefail
 # shellcheck disable=SC1091 # Test helper path is resolved from this file.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
-[[ $(git hash-object "$DOT_TEST_ROOT/support/client-launcher.sh") == 153771e992e9259051e04678fb5c7acd0bc7001c ]] || fail 'client launcher v1 changed in place; update its migration fixture deliberately'
-
+launcher=$DOT_TEST_ROOT/support/client-launcher.sh
+[[ $(git hash-object "$launcher") == b620e4936d5579c8dcc6518629444e095d66835f ]] ||
+  fail 'client launcher v1 changed in place; update its migration fixture deliberately'
 install_home=$DOT_TEST_TMP/install
-runtime=$install_home/cgraf78/dot/bin/dot
+checkout=$install_home/cgraf78/dot
+runtime=$checkout/bin/dot
+lock=$DOT_TEST_TMP/dot-cutover.lock
+helper=$DOT_TEST_TMP/dot-library-handoff.sh
+legacy=$DOT_TEST_TMP/legacy-dot-launcher.sh
 log=$DOT_TEST_TMP/launcher.log
-mkdir -p "${runtime%/*}"
+helper_log=$DOT_TEST_TMP/helper.log
+
+mkdir -p "$checkout/bin" "$checkout/support"
+cp "$launcher" "$checkout/support/client-launcher.sh"
 cat >"$runtime" <<'RUNTIME'
 #!/usr/bin/env bash
-printf '%s\n' "$@" >"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
+printf 'standalone\n' >"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
+printf '%s\n' "$@" >>"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
 RUNTIME
 chmod 0755 "$runtime"
-DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
-  SHDEPS_INSTALL_DIR="$install_home/" \
-  "$DOT_TEST_ROOT/support/client-launcher.sh" first 'two words'
-assert_eq $'first\ntwo words' "$(cat "$log")" 'client launcher arguments'
+git -C "$checkout" init --quiet
+git -C "$checkout" config user.name 'Dot Test'
+git -C "$checkout" config user.email dot-test@example.invalid
+git -C "$checkout" add bin/dot support/client-launcher.sh
+git -c core.hooksPath= -C "$checkout" commit --quiet -m fixture
+minimum_revision=$(git -C "$checkout" rev-parse HEAD)
+printf 'cgraf78 dot client cutover v1\nminimum_revision=%s\n' \
+  "$minimum_revision" >"$lock"
 
-if SHDEPS_INSTALL_DIR=relative \
-  "$DOT_TEST_ROOT/support/client-launcher.sh" >/dev/null 2>&1; then
+cat >"$helper" <<'HELPER'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >>"${DOT_CLIENT_HANDOFF_TEST_LOG:?}"
+HELPER
+chmod 0755 "$helper"
+cat >"$legacy" <<'LEGACY'
+#!/usr/bin/env bash
+printf 'legacy\n' >"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
+printf '%s\n' "$@" >>"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
+LEGACY
+chmod 0755 "$legacy"
+
+# The retained adapter must run on the same minimal bootstrap images as its
+# installer. Git is present there, but a standalone `cmp` command may not be.
+no_cmp_bin=$DOT_TEST_TMP/no-cmp-bin
+mkdir -p "$no_cmp_bin"
+cat >"$no_cmp_bin/cmp" <<'CMP'
+#!/usr/bin/env bash
+printf 'client launcher invoked unavailable cmp\n' >&2
+exit 127
+CMP
+chmod 0755 "$no_cmp_bin/cmp"
+PATH="$no_cmp_bin:$PATH" DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock \
+  DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+  SHDEPS_INSTALL_DIR="$install_home/" \
+  "$launcher" first 'two words'
+assert_eq $'standalone\nfirst\ntwo words' "$(<"$log")" \
+  'client launcher standalone arguments'
+assert_eq recover "$(<"$helper_log")" \
+  'client launcher recovers library handoff before dispatch'
+
+# The forwarder lands before the capability lock and checkout on some hosts.
+# That enabling state must keep executing the exact retained embedded launcher.
+rm -f -- "$log" "$helper_log"
+DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_CUTOVER_LOCK=$DOT_TEST_TMP/missing-lock \
+  DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+  SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" fallback
+assert_eq $'legacy\nfallback' "$(<"$log")" \
+  'client launcher enabling fallback'
+assert_eq $'recover\nrestore' "$(<"$helper_log")" \
+  'client launcher restores the library before embedded fallback'
+
+# A lock whose required revision is not an ancestor of the checkout cannot
+# authorize cutover. Preserve command continuity through the embedded engine.
+foreign=$DOT_TEST_TMP/foreign
+git init --quiet "$foreign"
+git -C "$foreign" config user.name 'Dot Test'
+git -C "$foreign" config user.email dot-test@example.invalid
+printf 'foreign\n' >"$foreign/file"
+git -C "$foreign" add file
+git -c core.hooksPath= -C "$foreign" commit --quiet -m foreign
+foreign_revision=$(git -C "$foreign" rev-parse HEAD)
+printf 'cgraf78 dot client cutover v1\nminimum_revision=%s\n' \
+  "$foreign_revision" >"$lock"
+rm -f -- "$log" "$helper_log"
+DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock \
+  DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+  SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" stale
+assert_eq $'legacy\nstale' "$(<"$log")" \
+  'client launcher stale-cutover fallback'
+assert_eq $'recover\nrestore' "$(<"$helper_log")" \
+  'client launcher restores before stale-cutover fallback'
+
+# After the restoration horizon, an unavailable standalone target produces the
+# tested recovery command instead of pretending the embedded engine exists.
+rm -f -- "$legacy"
+if DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock \
+  DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+  SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" >/dev/null 2>"$DOT_TEST_TMP/recovery.err"; then
+  fail 'client launcher accepted an unavailable standalone runtime after cleanup'
+fi
+assert_contains 'curl -fsSL https://raw.githubusercontent.com/cgraf78/dot/main/install.sh | bash' \
+  "$(<"$DOT_TEST_TMP/recovery.err")" \
+  'client launcher recovery command'
+
+printf 'cgraf78 dot client cutover v1\nminimum_revision=malformed\n' >"$lock"
+if DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" >/dev/null 2>&1; then
+  fail 'client launcher accepted a malformed cutover lock'
+fi
+
+if SHDEPS_INSTALL_DIR=relative DOT_CLIENT_CUTOVER_LOCK=$lock \
+  DOT_CLIENT_HANDOFF_HELPER=$helper DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+  "$launcher" >/dev/null 2>&1; then
   fail 'client launcher accepted a relative install root'
 fi
 

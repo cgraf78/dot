@@ -11,6 +11,42 @@ version=$(HOME="$HOME" DOT_BASH="$BASH" "$DOT_TEST_ROOT/bin/dot" --version)
 assert_contains 'dot 0.1.0-dev' "$version" 'version product identity'
 assert_contains 'config 1; extensions 1; library 1' "$version" \
   'version interface inventory'
+
+source_revision=$(
+  git -c "safe.directory=$DOT_TEST_ROOT" -C "$DOT_TEST_ROOT" rev-parse HEAD
+)
+set +e
+GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+  git -C "$DOT_TEST_ROOT" rev-parse HEAD >/dev/null 2>&1
+untrusted_source_status=$?
+set -e
+assert_eq 128 "$untrusted_source_status" \
+  're-exec ownership fixture rejects an untrusted source checkout'
+
+reexec_version=$(
+  GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+    HOME="$HOME" DOT_REEXEC_EXPECTED_REVISION=$source_revision \
+    "$BASH" "$DOT_TEST_ROOT/lib/dot/main.sh" --version
+)
+assert_contains 'dot 0.1.0-dev' "$reexec_version" \
+  're-exec revision guard trusts the selected source checkout'
+
+set +e
+reexec_mismatch=$(
+  GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+    HOME="$HOME" DOT_REEXEC_EXPECTED_REVISION=0000000000000000000000000000000000000000 \
+    "$BASH" "$DOT_TEST_ROOT/lib/dot/main.sh" --version 2>&1
+)
+reexec_mismatch_status=$?
+set -e
+assert_eq 1 "$reexec_mismatch_status" \
+  're-exec revision guard rejects a mismatched source checkout'
+assert_contains 're-exec revision mismatch' "$reexec_mismatch" \
+  're-exec revision guard explains a mismatched source checkout'
+
 help=$(HOME="$HOME" DOT_BASH="$BASH" "$DOT_TEST_ROOT/bin/dot" --help)
 assert_contains 'usage: dot <command>' "$help" 'help usage'
 assert_contains 'init' "$help" 'help initialization command'
@@ -22,13 +58,33 @@ relative_version=$(
 assert_contains 'dot 0.1.0-dev' "$relative_version" \
   'relative launcher with inherited CDPATH'
 
+linked_admin=$DOT_TEST_TMP/linked-version-admin
+linked_root=$DOT_TEST_TMP/linked-version-root
+git init -q "$linked_admin"
+git -C "$linked_admin" config user.name fixture
+git -C "$linked_admin" config user.email fixture@example.invalid
+printf 'fixture\n' >"$linked_admin/README"
+git -C "$linked_admin" add README
+git -C "$linked_admin" -c core.hooksPath=/dev/null commit -qm fixture
+git -C "$linked_admin" worktree add -q -b linked-version "$linked_root"
+mkdir -p "$linked_root/lib/dot/public"
+cp "$DOT_TEST_ROOT/VERSION" "$linked_root/VERSION"
+cp "$DOT_TEST_ROOT/lib/dot/main.sh" "$linked_root/lib/dot/main.sh"
+cp "$DOT_TEST_ROOT/lib/dot/config.sh" "$linked_root/lib/dot/config.sh"
+cp "$DOT_TEST_ROOT/lib/dot/temp.sh" "$linked_root/lib/dot/temp.sh"
+cp "$DOT_TEST_ROOT/lib/dot/public/"*.sh "$linked_root/lib/dot/public/"
+linked_revision=$(git -C "$linked_root" rev-parse --short=12 HEAD)
+linked_version=$(HOME="$HOME" "$BASH" "$linked_root/lib/dot/main.sh" --version)
+assert_contains "source $linked_revision" "$linked_version" \
+  'linked-worktree runtime reports its source revision'
+
 set +e
 nocase_output=$(HOME="$HOME" DOT_BASH="$BASH" \
   bash -O nocasematch "$DOT_TEST_ROOT/lib/dot/main.sh" HELP 2>&1)
 nocase_status=$?
 set -e
 assert_eq 1 "$nocase_status" 'inherited nocasematch command status'
-assert_contains 'command is not available in this development build: HELP' \
+assert_contains 'unknown command: HELP' \
   "$nocase_output" 'case-sensitive command dispatch'
 
 printf 'cli-test: ok\n'

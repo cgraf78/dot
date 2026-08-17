@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+# shellcheck source=lib/repo.sh
+. "$root/tests/lib/repo.sh"
+
+fixture_repo hooks main README.md $'hooks\n' 100644
+origin=$REPLY
+fixture_home hooks
+home=$REPLY
+state=$DOT_TEST_TMP/hooks-state
+run_dot "$home" "$state" init --yes "file://$origin" >/dev/null
+extensions=$home/extensions
+mkdir -p "$home/.config/dot" "$extensions/pre-sync.d" \
+  "$extensions/merge-hooks.d/lib"
+chmod 0755 "$extensions" "$extensions/pre-sync.d" \
+  "$extensions/merge-hooks.d" "$extensions/merge-hooks.d/lib"
+# shellcheck disable=SC2016 # Literal config grammar under test.
+printf '%s\n' \
+  'version=1' \
+  'extension_api=1' \
+  'extensions_dir=$HOME/extensions' \
+  'dependency_provider=none' \
+  >"$home/.config/dot/config"
+cat >"$extensions/merge-hooks.d/lib/helper.sh" <<'HELPER'
+[[ $# -eq 0 ]] || return 1
+helper_value=loaded
+path=loaded-path
+relative=loaded-relative
+HELPER
+cat >"$extensions/pre-sync.d/10-prepare.sh" <<'HOOK'
+prepare() {
+  printf 'prepare\n' >>"$HOME/pre-sync.log"
+}
+HOOK
+cat >"$extensions/merge-hooks.d/10-alpha.sh" <<'HOOK'
+[[ $# -eq 0 ]] || return 1
+channel="$HOME/collided-channel"
+merge() {
+  [[ $(<"$HOME/pre-sync.log") == prepare ]] || return 1
+  dot_hook_source merge-hooks.d/lib/helper.sh || return 1
+  [[ $helper_value == loaded ]] || return 1
+  [[ $path == loaded-path ]] || return 1
+  [[ $relative == loaded-relative ]] || return 1
+  [[ ${DOT_TEST_INHERITED_VARIABLE:-} == present ]] || return 1
+  ! declare -F dot_test_inherited_function >/dev/null || return 1
+  ! declare -F _base_git >/dev/null || return 1
+  ! declare -F _link_overlays >/dev/null || return 1
+  ! declare -F _dot_doctor >/dev/null || return 1
+  ! shopt -q extglob || return 1
+  [[ -d $TMPDIR && -O $TMPDIR ]] || return 1
+  mode=$(stat -c '%a' "$TMPDIR" 2>/dev/null || stat -f '%Lp' "$TMPDIR") ||
+    return 1
+  (((8#$mode & 077) == 0)) || return 1
+  printf '%s\n' "$TMPDIR" >"$HOME/alpha.tmpdir"
+  printf 'alpha\n' >>"$HOME/hook.log"
+  export leaked_from_alpha=1
+  shopt -s nocasematch
+  printf 'Alpha label\n'
+}
+HOOK
+cat >"$extensions/merge-hooks.d/20-barrier.serial.sh" <<'HOOK'
+merge() {
+  [[ $(tail -n 1 "$HOME/hook.log") == alpha ]] || return 1
+  printf 'barrier\n' >>"$HOME/hook.log"
+  printf 'Barrier label\n'
+}
+HOOK
+cat >"$extensions/merge-hooks.d/30-beta.sh" <<'HOOK'
+merge() {
+  [[ $(tail -n 1 "$HOME/hook.log") == barrier ]] || return 1
+  [[ -z ${leaked_from_alpha+x} ]] || return 1
+  ! shopt -q nocasematch || return 1
+  [[ -d $TMPDIR && -O $TMPDIR ]] || return 1
+  mode=$(stat -c '%a' "$TMPDIR" 2>/dev/null || stat -f '%Lp' "$TMPDIR") ||
+    return 1
+  (((8#$mode & 077) == 0)) || return 1
+  [[ $TMPDIR != "$(<"$HOME/alpha.tmpdir")" ]] || return 1
+  printf '%s\n' "$TMPDIR" >"$HOME/beta.tmpdir"
+  ! IFS= read -r _ || return 1
+  [[ $PWD == "$HOME" ]] || return 1
+  printf 'beta\n' >>"$HOME/hook.log"
+  printf 'Beta label\n'
+}
+HOOK
+chmod 0644 "$extensions/pre-sync.d"/*.sh \
+  "$extensions/merge-hooks.d"/*.sh "$extensions/merge-hooks.d/lib/helper.sh"
+dot_test_inherited_function() { :; }
+export -f dot_test_inherited_function
+export DOT_TEST_INHERITED_VARIABLE=present
+shopt -s extglob
+export BASHOPTS
+set +e
+first_update_output=$(DOT_MERGE_JOBS=4 run_dot "$home" "$state" update 2>&1)
+first_update_status=$?
+set -e
+shopt -u extglob
+unset DOT_TEST_INHERITED_VARIABLE
+export -n -f dot_test_inherited_function
+assert_eq 0 "$first_update_status" \
+  "isolated merge-hook update succeeds: $first_update_output"
+assert_eq $'alpha\nbarrier\nbeta' "$(<"$home/hook.log")" \
+  'parallel hooks respect serial barrier and worker isolation'
+[[ $(<"$home/alpha.tmpdir") != "$(<"$home/beta.tmpdir")" ]] ||
+  fail 'parallel hooks shared one TMPDIR'
+[[ ! -e $home/collided-channel ]] ||
+  fail 'hook top-level variable redirected the engine result channel'
+
+# Pre-sync extensions are a strict serial gate before repository mutation.
+# A failure stops later preparation and leaves the base revision untouched.
+rm -f "$extensions/pre-sync.d"/*.sh "$home/pre-sync.log"
+cat >"$extensions/pre-sync.d/10-failing.sh" <<'HOOK'
+prepare() {
+  printf 'failing\n' >>"$HOME/pre-sync.log"
+  return 7
+}
+HOOK
+cat >"$extensions/pre-sync.d/20-later.sh" <<'HOOK'
+prepare() { printf 'later\n' >>"$HOME/pre-sync.log"; }
+HOOK
+chmod 0644 "$extensions/pre-sync.d"/*.sh
+head_before=$(git --git-dir="$home/.dotfiles" rev-parse HEAD)
+fixture_push hooks main README.md $'hooks-two\n' 100644
+set +e
+run_dot "$home" "$state" update >/dev/null 2>&1
+pre_sync_status=$?
+set -e
+assert_eq 1 "$pre_sync_status" 'failed pre-sync extension aborts update'
+assert_eq failing "$(<"$home/pre-sync.log")" \
+  'pre-sync failure stops later preparation extensions'
+assert_eq "$head_before" "$(git --git-dir="$home/.dotfiles" rev-parse HEAD)" \
+  'pre-sync failure occurs before repository mutation'
+rm -f "$extensions/pre-sync.d"/*.sh
+rm -f "$extensions/merge-hooks.d"/*.sh
+rm -f "$home/pre-sync.log"
+cat >"$extensions/pre-sync.d/10-prepare.sh" <<'HOOK'
+prepare() { printf 'prepare\n' >"$HOME/pre-sync.log"; }
+HOOK
+chmod 0644 "$extensions/pre-sync.d/10-prepare.sh"
+set +e
+catchup_output=$(run_dot "$home" "$state" update 2>&1)
+catchup_status=$?
+set -e
+assert_eq 0 "$catchup_status" \
+  "pre-sync recovery update succeeds: $catchup_output"
+rm -f "$extensions/pre-sync.d/10-prepare.sh"
+
+allocator_probe=$(DOT_TEST_ROOT=$root HOME=$home bash --noprofile --norc -c '
+  set -euo pipefail
+  . "$DOT_TEST_ROOT/lib/dot/public/xdg.sh"
+  . "$DOT_TEST_ROOT/lib/dot/resources.sh"
+  . "$DOT_TEST_ROOT/lib/dot/merges.sh"
+  _warn() { :; }
+  _dot_cleanup_mktemp() { return 1; }
+  DOT_MERGE_FAILED_COUNT=0
+  REPLY=unset
+  _run_merge_hook_batch $'"'"'10-alpha\t/unused'"'"'
+  printf "reply=%s\nfailures=%s\n" "$REPLY" "$DOT_MERGE_FAILED_COUNT"
+')
+assert_eq $'reply=0\nfailures=1' "$allocator_probe" \
+  'merge scratch allocation failure counts as an operational failure'
+
+rm -f "$extensions/merge-hooks.d"/*.sh "$home/hook.log"
+cat >"$extensions/merge-hooks.d/10-failing.sh" <<'HOOK'
+merge() {
+  printf 'failing\n' >>"$HOME/hook.log"
+  return 42
+}
+HOOK
+cat >"$extensions/merge-hooks.d/20-later.sh" <<'HOOK'
+merge() { printf 'later\n' >>"$HOME/hook.log"; }
+HOOK
+chmod 0644 "$extensions/merge-hooks.d"/*.sh
+set +e
+failing_hook_output=$(run_dot "$home" "$state" update 2>&1)
+failing_hook_status=$?
+set -e
+assert_eq 1 "$failing_hook_status" \
+  'real failing merge hook normalizes aggregate update status to one'
+assert_contains 'warning: merge failed: 10-failing' "$failing_hook_output" \
+  'empty merge failure identifies its stable hook key'
+assert_eq $'failing\nlater' "$(<"$home/hook.log")" \
+  'later merge hooks continue after an earlier hook fails'
+
+# Exercise the real update coordinator, not the run_dot shell helper: `$!`
+# must name dot itself so TERM proves the registered capture owns the exact
+# fresh-Bash worker rather than an intermediate wrapper.
+rm -f "$extensions/merge-hooks.d"/*.sh
+cat >"$extensions/merge-hooks.d/10-cancellable.sh" <<'HOOK'
+merge() {
+  printf '%s\n' "$BASHPID" >"$HOME/cancellable-hook.pid"
+  (
+    trap '' TERM
+    printf '%s\n' "$BASHPID" >"$HOME/cancellable-child.pid"
+    while :; do sleep 1; done
+  ) &
+  wait "$!"
+}
+HOOK
+chmod 0644 "$extensions/merge-hooks.d/10-cancellable.sh"
+HOME="$home" XDG_STATE_HOME="$state" XDG_CONFIG_HOME='' \
+  "$root/bin/dot" update >"$home/cancellable.out" 2>"$home/cancellable.err" &
+cancellable_dot_pid=$!
+cancellable_deadline=$((SECONDS + 5))
+while ((SECONDS < cancellable_deadline)); do
+  [[ -s $home/cancellable-hook.pid && -s $home/cancellable-child.pid ]] && break
+  kill -0 "$cancellable_dot_pid" 2>/dev/null || break
+  sleep 0.01
+done
+if [[ ! -s $home/cancellable-hook.pid || ! -s $home/cancellable-child.pid ]]; then
+  kill -TERM "$cancellable_dot_pid" 2>/dev/null || true
+  wait "$cancellable_dot_pid" 2>/dev/null || true
+  fail 'real update did not launch the cancellable merge worker'
+fi
+cancellable_hook_pid=$(<"$home/cancellable-hook.pid")
+cancellable_child_pid=$(<"$home/cancellable-child.pid")
+kill -TERM "$cancellable_dot_pid"
+set +e
+wait "$cancellable_dot_pid"
+cancellable_dot_status=$?
+set -e
+assert_eq 143 "$cancellable_dot_status" 'real update preserves TERM status'
+cancellable_deadline=$((SECONDS + 5))
+while process_is_live "$cancellable_hook_pid" &&
+  ((SECONDS < cancellable_deadline)); do
+  sleep 0.01
+done
+if process_is_live "$cancellable_hook_pid"; then
+  kill -KILL "$cancellable_hook_pid" 2>/dev/null || true
+  fail 'real update left the fresh Bash merge worker alive after TERM'
+fi
+cancellable_deadline=$((SECONDS + 5))
+while process_is_live "$cancellable_child_pid" &&
+  ((SECONDS < cancellable_deadline)); do
+  sleep 0.01
+done
+if process_is_live "$cancellable_child_pid"; then
+  kill -KILL "$cancellable_child_pid" 2>/dev/null || true
+  fail 'real update left a TERM-ignoring hook descendant alive after TERM'
+fi
+
+rm -f "$extensions/merge-hooks.d"/*.sh "$home/hook.log"
+cat >"$extensions/merge-hooks.d/10-duplicate.sh" <<'HOOK'
+merge() { printf 'first\n' >>"$HOME/hook.log"; }
+HOOK
+cat >"$extensions/merge-hooks.d/20-duplicate.serial.sh" <<'HOOK'
+merge() { printf 'second\n' >>"$HOME/hook.log"; }
+HOOK
+set +e
+run_dot "$home" "$state" update >/dev/null 2>&1
+duplicate_status=$?
+set -e
+assert_eq 1 "$duplicate_status" 'duplicate stripped hook identity is fatal'
+[[ ! -e $home/hook.log ]] || fail 'duplicate hook inventory ran a hook'
+
+rm -f "$extensions/merge-hooks.d"/*.sh
+cat >"$extensions/merge-hooks.d/10-unsafe.sh" <<'HOOK'
+merge() { printf 'unsafe\n' >>"$HOME/hook.log"; }
+HOOK
+chmod 0666 "$extensions/merge-hooks.d/10-unsafe.sh"
+set +e
+run_dot "$home" "$state" update >/dev/null 2>&1
+unsafe_status=$?
+set -e
+assert_eq 1 "$unsafe_status" 'group-writable hook is rejected'
+[[ ! -e $home/hook.log ]] || fail 'unsafe hook executed'
+
+chmod 0644 "$extensions/merge-hooks.d/10-unsafe.sh"
+chmod 0775 "$extensions"
+set +e
+run_dot "$home" "$state" update >/dev/null 2>&1
+unsafe_root_status=$?
+set -e
+assert_eq 1 "$unsafe_root_status" 'group-writable extension root is rejected'
+[[ ! -e $home/hook.log ]] || fail 'hook under unsafe extension root executed'
+chmod 0755 "$extensions"
+
+chmod 0775 "$extensions/merge-hooks.d"
+set +e
+run_dot "$home" "$state" update >/dev/null 2>&1
+unsafe_collection_status=$?
+set -e
+assert_eq 1 "$unsafe_collection_status" \
+  'group-writable merge-hook collection is rejected'
+[[ ! -e $home/hook.log ]] || fail 'hook under unsafe merge-hook collection executed'
+chmod 0755 "$extensions/merge-hooks.d"
+
+mv "$extensions" "$home/extensions-real"
+ln -s extensions-real "$extensions"
+set +e
+run_dot "$home" "$state" update >/dev/null 2>&1
+symlink_root_status=$?
+set -e
+assert_eq 1 "$symlink_root_status" 'symlinked extension root is rejected'
+[[ ! -e $home/hook.log ]] || fail 'hook under symlinked extension root executed'
+
+printf 'hooks-test: ok\n'

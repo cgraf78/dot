@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+
+# The provider coordinator deliberately resolves these fixture functions and
+# dynamically scoped variables at runtime. ShellCheck cannot see those calls or
+# distinguish the independent subshell environments used by each scenario.
+# shellcheck disable=SC2030,SC2031,SC2034,SC2329
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+
+# Load the provider through the same public XDG and temporary-file helpers used
+# by the runtime. Update dependencies are deliberately resolved at call time,
+# which lets this fixture replace only the external Shdeps operation.
+# shellcheck source=../lib/dot/public/xdg.sh
+. "$root/lib/dot/public/xdg.sh"
+# shellcheck source=../lib/dot/resources.sh
+. "$root/lib/dot/resources.sh"
+# shellcheck source=../lib/dot/temp.sh
+. "$root/lib/dot/temp.sh"
+# shellcheck source=../lib/dot/providers/shdeps.sh
+. "$root/lib/dot/providers/shdeps.sh"
+# shellcheck source=../lib/dot/update.sh
+. "$root/lib/dot/update.sh"
+
+_warn() { printf '%s\n' "$*" >&2; }
+
+provider_home=$DOT_TEST_TMP/provider-home
+provider_state=$DOT_TEST_TMP/provider-state
+revision_file=$DOT_TEST_TMP/provider-revision
+merge_marker=$DOT_TEST_TMP/provider-merge-ran
+double_output=$DOT_TEST_TMP/provider-double-output
+before_revision=1111111111111111111111111111111111111111
+after_revision=2222222222222222222222222222222222222222
+mkdir -p "$provider_home"
+printf '%s\n' "$before_revision" >"$revision_file"
+
+source_revision=$(git -C "$root" rev-parse HEAD)
+active_revision=$(
+  DOT_SOURCE_ROOT=$root GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+    _dot_active_revision
+)
+assert_eq "$source_revision" "$active_revision" \
+  'provider reads the selected source revision under dubious ownership'
+
+env_probe=$(
+  HOME=$provider_home XDG_CONFIG_HOME='' DOT_FORCE=1 DOT_QUIET=1 \
+    SHDEPS_INSTALL_DIR='' SHDEPS_BIN_DIR='' SHDEPS_GIT_DEV_DIR='' \
+    bash --noprofile --norc -c '
+      set -euo pipefail
+      . "$1/lib/dot/public/xdg.sh"
+      . "$1/lib/dot/providers/shdeps.sh"
+      _dot_shdeps_configure_env
+      printf "force=%s quiet=%s config=%s\n" \
+        "${SHDEPS_FORCE:-0}" "${SHDEPS_QUIET:-0}" "$SHDEPS_CONF_DIR"
+    ' -- "$root"
+)
+assert_eq "force=1 quiet=1 config=$provider_home/.config/shdeps" "$env_probe" \
+  'provider forwards force and quiet through resolved XDG config'
+
+jobs_probe=$(
+  DOT_UPDATE_JOBS=7 bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$1/lib/dot/update.sh"
+    _dot_update_prepare_shdeps_jobs
+    printf "default=%s\n" "$SHDEPS_JOBS"
+    SHDEPS_JOBS=3
+    _dot_update_prepare_shdeps_jobs
+    printf "explicit=%s\n" "$SHDEPS_JOBS"
+  ' -- "$root"
+)
+assert_eq $'default=7\nexplicit=3' "$jobs_probe" \
+  'provider job count inherits update policy without overriding an explicit value'
+
+option_probe=$(
+  DOT_TEST_ROOT=$root bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_TEST_ROOT/lib/dot/update.sh"
+    _preflight_local_overlays() { :; }
+    _ui_begin() { :; }
+    _is_worktree_dirty() { return 1; }
+    _run_pre_sync_extensions() { :; }
+    _dot_update_sync_repos() { printf "sync-args="; printf "<%s>" "$@"; printf "\n"; }
+    _dot_update_finalize() {
+      printf "quiet=%s shdeps_quiet=%s force=%s shdeps_force=%s\n" \
+        "${DOT_QUIET:-0}" "${SHDEPS_QUIET:-0}" \
+        "${DOT_FORCE:-0}" "${SHDEPS_FORCE:-0}"
+    }
+    _dot_update --cron --force passthrough
+  '
+)
+assert_eq $'sync-args=<passthrough>\nquiet=1 shdeps_quiet=1 force=1 shdeps_force=1' \
+  "$option_probe" 'cron and force options reach provider orchestration'
+
+download_root=$DOT_TEST_TMP/provider-download-root
+download_bin=$DOT_TEST_TMP/provider-download-bin
+download_source=$DOT_TEST_TMP/provider-download-installer
+download_log=$DOT_TEST_TMP/provider-download-url
+mkdir -p "$download_root/support" "$download_bin"
+printf '#!/usr/bin/env bash\nprintf "fixture installer\\n"\n' >"$download_source"
+chmod 0755 "$download_source"
+download_hash=$(_dot_shdeps_sha256 "$download_source")
+download_revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+printf 'revision=%s\ninstall_sha256=%s\nabi=1\n' \
+  "$download_revision" "$download_hash" >"$download_root/support/shdeps.lock"
+cat >"$download_bin/curl" <<'CURL'
+#!/usr/bin/env bash
+set -e
+output=''
+url=''
+while (($#)); do
+  case $1 in
+    -o) output=$2; shift 2 ;;
+    http*) url=$1; shift ;;
+    *) shift ;;
+  esac
+done
+cp "$DOT_TEST_DOWNLOAD_SOURCE" "$output"
+printf '%s\n' "$url" >"$DOT_TEST_DOWNLOAD_LOG"
+CURL
+chmod 0755 "$download_bin/curl"
+saved_source_root=${DOT_SOURCE_ROOT:-$root}
+DOT_SOURCE_ROOT=$download_root
+PATH="$download_bin:$PATH" DOT_TEST_DOWNLOAD_SOURCE=$download_source \
+  DOT_TEST_DOWNLOAD_LOG=$download_log _dot_shdeps_download_installer
+downloaded_installer=$REPLY
+assert_files_equal "$download_source" "$downloaded_installer" \
+  'pinned provider download changed installer bytes'
+assert_eq "https://raw.githubusercontent.com/cgraf78/shdeps/$download_revision/install.sh" \
+  "$(<"$download_log")" 'provider download uses immutable reviewed revision'
+_dot_cleanup_remove_path "$downloaded_installer"
+DOT_SOURCE_ROOT=$saved_source_root
+
+# A guarded second source revision must durably checkpoint the observed
+# generation and stop before any consumer merge hook can run.
+(
+  export HOME=$provider_home XDG_STATE_HOME=$provider_state
+  DOT_SOURCE_ROOT=$root
+  DOT_DEPENDENCY_PROVIDER=shdeps
+  DOT_REEXEC_ONCE=1
+  DOT_ORIGINAL_ARGV=(update --force)
+  DOT_UI_TOTAL=0
+
+  _dot_active_revision() {
+    IFS= read -r REPLY <"$revision_file"
+    printf '%s\n' "$REPLY"
+  }
+  _ensure_repo_config() { :; }
+  _link_overlays() { :; }
+  _ensure_shdeps() { return 0; }
+  shdeps_update() { :; }
+  _run_shdeps_update_ui() {
+    printf '%s\n' "$after_revision" >"$revision_file"
+    DOT_UI_SHDEPS_STATUS=changed
+    DOT_UI_SHDEPS_SUMMARY='1 changed'
+  }
+  _shdeps_print_group_summaries() { :; }
+  _run_merges() { : >"$merge_marker"; }
+  _base_repo_exists() { return 1; }
+  _normalize_filtered() { :; }
+  _ui_begin() { :; }
+  _ui_stage_start() { :; }
+  _ui_stage_finish() { :; }
+  _ui_done() { :; }
+
+  set +e
+  _dot_update_finalize 0 >"$double_output" 2>&1
+  status=$?
+  set -e
+  printf '%s\n' "$status" >"$DOT_TEST_TMP/provider-double-status"
+)
+
+assert_eq 1 "$(<"$DOT_TEST_TMP/provider-double-status")" \
+  'guarded second provider update fails'
+assert_contains 'dot changed twice during one update' "$(<"$double_output")" \
+  'guarded provider update explains recovery'
+assert_eq "$after_revision" "$(<"$revision_file")" \
+  'provider update ran without an obsolete capability gate'
+[[ ! -e $merge_marker ]] || fail 'guarded second provider update ran merge hooks'
+checkpoint=$provider_state/dot/provider-reexec-failed
+[[ -f $checkpoint && ! -L $checkpoint ]] || fail 'guarded provider update omitted checkpoint'
+assert_eq $'cgraf78 dot provider reexec checkpoint v1\nbefore=1111111111111111111111111111111111111111\nafter=2222222222222222222222222222222222222222' \
+  "$(<"$checkpoint")" 'provider checkpoint content'
+checkpoint_mode=$(stat -c '%a' "$checkpoint" 2>/dev/null || stat -f '%Lp' "$checkpoint")
+assert_eq 600 "$checkpoint_mode" 'provider checkpoint mode'
+
+# A fresh invocation validates and consumes the exact checkpoint before normal
+# convergence. This makes the record recovery authority instead of an ignored
+# warning file that accumulates forever.
+recovered_marker=$DOT_TEST_TMP/provider-recovered-merge
+(
+  export HOME=$provider_home XDG_STATE_HOME=$provider_state
+  DOT_SOURCE_ROOT=$root
+  DOT_DEPENDENCY_PROVIDER=none
+  DOT_UI_TOTAL=0
+
+  _dot_active_revision() { printf '%s\n' "$after_revision"; }
+  _ensure_repo_config() { :; }
+  _link_overlays() { :; }
+  _run_merges() { : >"$recovered_marker"; }
+  _base_repo_exists() { return 1; }
+  _normalize_filtered() { :; }
+  _ui_begin() { :; }
+  _ui_stage_start() { :; }
+  _ui_stage_finish() { :; }
+  _ui_done() { :; }
+
+  _dot_update_finalize 0
+)
+[[ ! -e $checkpoint && ! -L $checkpoint ]] || fail 'valid provider checkpoint was not consumed'
+[[ -f $recovered_marker ]] || fail 'checkpoint recovery did not resume convergence'
+
+# Malformed state must fail closed and remain available for diagnosis. Update
+# must not silently discard an unbound source generation and run extensions.
+mkdir -p "${checkpoint%/*}"
+printf 'malformed\n' >"$checkpoint"
+chmod 0600 "$checkpoint"
+malformed_merge=$DOT_TEST_TMP/provider-malformed-merge
+(
+  export HOME=$provider_home XDG_STATE_HOME=$provider_state
+  DOT_SOURCE_ROOT=$root
+  DOT_DEPENDENCY_PROVIDER=none
+  DOT_UI_TOTAL=0
+
+  _dot_active_revision() { printf '%s\n' "$after_revision"; }
+  _ensure_repo_config() { :; }
+  _link_overlays() { :; }
+  _run_merges() { : >"$malformed_merge"; }
+  _base_repo_exists() { return 1; }
+  _normalize_filtered() { :; }
+  _ui_begin() { :; }
+  _ui_stage_start() { :; }
+  _ui_stage_finish() { :; }
+  _ui_done() { :; }
+
+  set +e
+  _dot_update_finalize 0 >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s\n' "$status" >"$DOT_TEST_TMP/provider-malformed-status"
+)
+assert_eq 1 "$(<"$DOT_TEST_TMP/provider-malformed-status")" \
+  'malformed provider checkpoint fails closed'
+[[ -f $checkpoint ]] || fail 'malformed provider checkpoint was discarded'
+[[ ! -e $malformed_merge ]] || fail 'malformed provider checkpoint ran merge hooks'
+
+invalid_revision_output=$DOT_TEST_TMP/provider-invalid-revision-output
+set +e
+(
+  HOME=$provider_home
+  XDG_STATE_HOME=$provider_state
+  DOT_SOURCE_ROOT=$root
+  _dot_active_revision() { printf 'not-a-revision\n'; }
+  _dot_provider_maybe_reexec "$before_revision"
+) >"$invalid_revision_output" 2>&1
+invalid_revision_status=$?
+set -e
+assert_eq 1 "$invalid_revision_status" \
+  'provider fails closed when the active revision disappears'
+assert_contains 'active dot revision is unavailable after provider update' \
+  "$(<"$invalid_revision_output")" \
+  'provider explains an invalid post-update checkout'
+
+missing_revision_output=$DOT_TEST_TMP/provider-missing-revision-output
+set +e
+(
+  HOME=$provider_home
+  XDG_STATE_HOME=$provider_state
+  DOT_SOURCE_ROOT=$root
+  _dot_active_revision() { :; }
+  _dot_provider_maybe_reexec "$before_revision"
+) >"$missing_revision_output" 2>&1
+missing_revision_status=$?
+set -e
+assert_eq 1 "$missing_revision_status" \
+  'provider fails closed when the post-update revision is missing'
+assert_contains 'active dot revision is unavailable after provider update' \
+  "$(<"$missing_revision_output")" \
+  'provider explains a missing post-update checkout revision'
+
+# The re-exec target is checkout-relative and argv remains an array. A fake
+# Graphviz `dot` first on PATH must never be consulted by this handoff.
+reexec_root=$DOT_TEST_TMP/reexec-root
+reexec_record=$DOT_TEST_TMP/reexec-record
+graphviz_marker=$DOT_TEST_TMP/graphviz-ran
+mkdir -p "$reexec_root/lib/dot" "$DOT_TEST_TMP/fake-bin"
+cat >"$reexec_root/lib/dot/main.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+{
+  printf 'expected=%s\n' "${DOT_REEXEC_EXPECTED_REVISION:-}"
+  printf 'once=%s\n' "${DOT_REEXEC_ONCE:-}"
+  printf 'argv='
+  printf '<%s>' "$@"
+  printf '\n'
+} >"$DOT_TEST_REEXEC_RECORD"
+SCRIPT
+chmod 0755 "$reexec_root/lib/dot/main.sh"
+cat >"$DOT_TEST_TMP/fake-bin/dot" <<'SCRIPT'
+#!/usr/bin/env bash
+: >"$DOT_TEST_GRAPHVIZ_MARKER"
+exit 99
+SCRIPT
+chmod 0755 "$DOT_TEST_TMP/fake-bin/dot"
+git -C "$reexec_root" init -q
+git -C "$reexec_root" config user.name fixture
+git -C "$reexec_root" config user.email fixture@example.invalid
+git -C "$reexec_root" add lib/dot/main.sh
+git -C "$reexec_root" -c core.hooksPath=/dev/null commit -qm runtime
+reexec_revision=$(git -C "$reexec_root" rev-parse HEAD)
+(
+  export HOME=$provider_home XDG_STATE_HOME=$provider_state
+  export DOT_TEST_REEXEC_RECORD=$reexec_record
+  export DOT_TEST_GRAPHVIZ_MARKER=$graphviz_marker
+  PATH=$DOT_TEST_TMP/fake-bin:$PATH
+  export PATH
+  DOT_SOURCE_ROOT=$reexec_root
+  DOT_ORIGINAL_ARGV=(update --force 'two words')
+  unset DOT_REEXEC_ONCE DOT_REEXEC_EXPECTED_REVISION
+  _dot_provider_maybe_reexec 0000000000000000000000000000000000000000
+)
+assert_eq $'expected='"$reexec_revision"$'\nonce=1\nargv=<update><--force><two words>' \
+  "$(<"$reexec_record")" 'provider reexec preserves runtime and argv'
+[[ ! -e $graphviz_marker ]] || fail 'provider reexec resolved dot through PATH'
+
+# A reviewed development checkout is selected by exact revision and installer
+# bytes. Dirtiness outside those executable surfaces remains allowed locally.
+provider_fixture=$DOT_TEST_TMP/provider-fixture
+dev_root=$DOT_TEST_TMP/dev-root
+dev_checkout=$dev_root/shdeps
+mkdir -p "$provider_fixture/support" "$dev_checkout"
+printf '# fixture installer\n' >"$dev_checkout/install.sh"
+printf '# fixture library\n' >"$dev_checkout/shdeps.sh"
+git -C "$dev_checkout" init -q
+git -C "$dev_checkout" config user.name fixture
+git -C "$dev_checkout" config user.email fixture@example.invalid
+git -C "$dev_checkout" add install.sh shdeps.sh
+git -C "$dev_checkout" -c core.hooksPath=/dev/null commit -qm shdeps
+dev_revision=$(git -C "$dev_checkout" rev-parse HEAD)
+dev_hash=$(_dot_shdeps_sha256 "$dev_checkout/install.sh")
+printf 'revision=%s\ninstall_sha256=%s\nabi=1\n' "$dev_revision" "$dev_hash" \
+  >"$provider_fixture/support/shdeps.lock"
+printf 'dirty but trusted development note\n' >"$dev_checkout/NOTES"
+unset SHDEPS_LIB
+DOT_SOURCE_ROOT=$provider_fixture
+SHDEPS_GIT_DEV_DIR=$dev_root
+HOME=$provider_home
+_dot_shdeps_installer
+assert_eq "$dev_checkout/install.sh" "$REPLY" 'development provider installer selection'
+assert_eq "$dev_checkout/shdeps.sh" "$SHDEPS_LIB" 'development provider library selection'
+
+# Doctor uses the same reviewed installer selection but does not bootstrap or
+# mutate it. A sibling/development binary satisfying the pinned ABI is healthy.
+mkdir -p "$dev_checkout/target/debug"
+cat >"$dev_checkout/target/debug/shdeps" <<'SCRIPT'
+#!/usr/bin/env bash
+if [[ ${1:-} == __api && ${2:-} == version ]]; then
+  printf 'abi:1\n'
+  exit 0
+fi
+exit 2
+SCRIPT
+chmod 0755 "$dev_checkout/target/debug/shdeps"
+# shellcheck source=../lib/dot/doctor/runtime.sh
+. "$root/lib/dot/doctor/runtime.sh"
+# shellcheck source=../lib/dot/doctor/paths.sh
+. "$root/lib/dot/doctor/paths.sh"
+# shellcheck source=../lib/dot/doctor/provider.sh
+. "$root/lib/dot/doctor/provider.sh"
+DOT_DEPENDENCY_PROVIDER=shdeps
+provider_doctor_output=$(_dr_check_provider)
+assert_contains 'Shdeps installer is reviewed' "$provider_doctor_output" \
+  'doctor accepts reviewed development installer'
+assert_contains 'Shdeps provider ABI' "$provider_doctor_output" \
+  'doctor accepts pinned provider ABI'
+
+printf 'shdeps-provider-test: ok\n'

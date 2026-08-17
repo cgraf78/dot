@@ -270,8 +270,11 @@ checkout_lock_stat_private() {
 checkout_lock_even_hex() {
   local value=$1 max_length=$2
 
+  # Bash 3.2 interprets ranges through the active collation locale, where
+  # `[a-f]` can also match uppercase letters. Enumerate the wire alphabet so
+  # lowercase hexadecimal remains exact on stock macOS Bash.
   [[ -n "$value" && ${#value} -le "$max_length" &&
-    $((${#value} % 2)) -eq 0 && "$value" != *[!0-9a-f]* ]]
+    $((${#value} % 2)) -eq 0 && "$value" != *[!0123456789abcdef]* ]]
 }
 
 checkout_lock_record_has_exact_text_framing() {
@@ -512,6 +515,18 @@ checkout_lock_discard_unpublished_owner() {
     ! -L "$lock_owner_dir" ]] || return 0
   rm -f -- "$lock_owner_dir/owner-v1" || return 1
   rmdir "$lock_owner_dir"
+}
+
+checkout_lock_cleanup_nested_publication() {
+  local nested_name nested
+
+  [[ -d "$lock_dir" && ! -L "$lock_dir" ]] || return 1
+  nested_name=${lock_owner_target%/.}
+  nested_name=${nested_name##*/}
+  nested="$lock_dir/$nested_name"
+  [[ -L "$nested" &&
+    $(readlink "$nested" 2>/dev/null) == "$lock_owner_target" ]] || return 1
+  rm -f -- "$nested"
 }
 
 checkout_lock_prepare_claim() {
@@ -1028,13 +1043,20 @@ acquire_checkout_lock_v1() {
           lock_claim_dir=
           checkout_lock_prepare_owner || return 1
           if ln -s "$lock_owner_target" "$lock_dir"; then
-            [[ -L "$lock_dir" &&
-              $(readlink "$lock_dir") == "$lock_owner_target" ]] || return 1
-            checkout_lock_load_record \
-              "$lock_owner_dir/owner-v1" owner "$lock_owner_nonce" '' ||
-              return 1
-            lock_held=1
-            return 0
+            if [[ -L "$lock_dir" &&
+              $(readlink "$lock_dir") == "$lock_owner_target" ]]; then
+              checkout_lock_load_record \
+                "$lock_owner_dir/owner-v1" owner "$lock_owner_nonce" '' ||
+                return 1
+              lock_held=1
+              return 0
+            fi
+            # BSD ln treats an existing real directory as a container even
+            # for the nonce-bound `owner/.` wire target. Remove only the exact
+            # nested symlink that this publication attempt can have created;
+            # the winning directory itself remains untouched and is then
+            # classified as the legacy lock shape.
+            checkout_lock_cleanup_nested_publication || return 1
           fi
           checkout_lock_discard_unpublished_owner || true
         elif [[ "$cleanup_status" -ne 2 ]]; then
@@ -1114,6 +1136,9 @@ _checkout_bash_v1_probe() {
 
   _checkout_bash_v1_normalized_absolute "$candidate" || return 1
   [[ -f "$candidate" && -x "$candidate" ]] || return 1
+  # Probe the interpreter itself, not caller-selected noninteractive startup
+  # policy. In particular, never execute BASH_ENV or ENV merely while deciding
+  # whether this candidate is suitable.
   # shellcheck disable=SC2016 # Expanded only by the candidate interpreter.
   output=$(BASH_ENV='' ENV='' "$candidate" --noprofile --norc -c \
     'printf "cgraf78-checkout-bash-v1:%s\n" "${BASH_VERSINFO[0]-}"' \
@@ -1187,7 +1212,8 @@ _checkout_bash_v1_read_hint() {
 }
 
 _checkout_bash_v1_detect_link_tool() {
-  local parent=$1 probe source ln_bin
+  local parent=$1 probe source ln_bin mv_bin move_source='' move_target=''
+  local move_destination nested mv_supported=false
 
   ln_bin=$(type -P ln 2>/dev/null) || return 1
   probe=$(mktemp -d "$parent/.bash-v1.tools.XXXXXX") || return 1
@@ -1202,23 +1228,52 @@ _checkout_bash_v1_detect_link_tool() {
       [[ "$source" -ef "$probe/link" ]]; then
       _CHECKOUT_BASH_V1_LN_MODE=h
     else
-      rm -f "$probe/link" "$source"
-      rmdir "$probe" 2>/dev/null || true
-      _checkout_bash_v1_error 'ln lacks exact-destination hard-link publication'
-      return 1
+      rm -f "$probe/link"
+      mv_bin=$(type -P mv 2>/dev/null) || mv_bin=
+      move_source=$probe/move-source
+      move_target=$probe/move-target
+      move_destination=$probe/destination
+      printf 'move probe\n' >"$move_source"
+      if [[ -n "$mv_bin" ]] &&
+        "$mv_bin" -nT -- "$move_source" "$move_target" 2>/dev/null &&
+        [[ ! -e "$move_source" && ! -L "$move_source" &&
+          -f "$move_target" && ! -L "$move_target" ]] &&
+        mkdir "$move_destination"; then
+        # GNU mv versions disagree about whether a preserved -n collision is
+        # success or failure. The filesystem postcondition is the contract:
+        # the source survives and the exact destination directory is untouched.
+        "$mv_bin" -nT -- "$move_target" "$move_destination" 2>/dev/null || true
+        if [[ -f "$move_target" && ! -L "$move_target" &&
+          -d "$move_destination" && ! -L "$move_destination" ]] &&
+          rmdir "$move_destination"; then
+          mv_supported=true
+        fi
+      fi
+      if [[ "$mv_supported" == true ]]; then
+        _CHECKOUT_BASH_V1_LN_MODE=mv-T
+        _CHECKOUT_BASH_V1_MV_BIN=$mv_bin
+      else
+        nested=$move_destination/${move_target##*/}
+        rm -f "$nested" "$move_source" "$move_target" "$source"
+        rmdir "$move_destination" 2>/dev/null || true
+        rmdir "$probe" 2>/dev/null || true
+        _checkout_bash_v1_error 'no exact-destination runtime-hint publication is available'
+        return 1
+      fi
     fi
   fi
-  rm -f "$probe/link" "$source"
+  rm -f "$probe/link" "$source" "$move_source" "$move_target"
   rmdir "$probe" || return 1
   _CHECKOUT_BASH_V1_LN_BIN=$ln_bin
 }
 
 _checkout_bash_v1_link_exact() {
-  if [[ $_CHECKOUT_BASH_V1_LN_MODE == T ]]; then
-    "$_CHECKOUT_BASH_V1_LN_BIN" -T -- "$1" "$2"
-  else
-    "$_CHECKOUT_BASH_V1_LN_BIN" -h "$1" "$2"
-  fi
+  case $_CHECKOUT_BASH_V1_LN_MODE in
+    T) "$_CHECKOUT_BASH_V1_LN_BIN" -T -- "$1" "$2" ;;
+    h) "$_CHECKOUT_BASH_V1_LN_BIN" -h "$1" "$2" ;;
+    mv-T) "$_CHECKOUT_BASH_V1_MV_BIN" -nT -- "$1" "$2" ;;
+    *) return 1 ;;
+  esac
 }
 
 _checkout_bash_v1_cleanup_nested_link() {
@@ -1741,6 +1796,29 @@ checkout_bash_v1_bind() {
     ln -s "$identity" "$marker"
   }
 
+  create_development_identity_marker() {
+    local identity=$1 marker=$2
+
+    if ln "$identity" "$marker" 2>/dev/null; then
+      return 0
+    fi
+    [[ ! -e "$marker" && ! -L "$marker" ]] || return 1
+    # The candidate is still private and disposable here. Android app-data
+    # filesystems reject hard links, so publish an independent regular copy
+    # before any user-owned link moves. Unlike the generic symlink fallback,
+    # this copy remains usable if recovery later retires the transaction-side
+    # identity immediately before an uncatchable process death.
+    # Bash noclobber gives this fallback the same fail-if-present publication
+    # property as ln: a late regular file, symlink, or directory is preserved.
+    (
+      umask 077
+      set -C
+      command cat "$identity" >"$marker"
+    ) || return 1
+    [[ -f "$marker" && ! -L "$marker" ]] || return 1
+    development_identity_matches "$marker"
+  }
+
   validate_managed_checkout() {
     local candidate=$1 top branch origin status
 
@@ -1862,6 +1940,9 @@ checkout_bash_v1_bind() {
       development_validation_error="tracked path is not a live regular file: $relative"
       return 1
     fi
+    # This proves repository ownership and path type, not byte equality.
+    # Development mode intentionally executes tracked live edits, including
+    # dirty or staged delegate changes.
     entry=$(development_git -C "$candidate" ls-tree HEAD -- \
       "$relative" 2>/dev/null) || {
       development_validation_error="cannot inspect tracked path at HEAD: $relative"
@@ -1943,6 +2024,9 @@ checkout_bash_v1_bind() {
     local link=$1 expected=$2 encoded actual
 
     [[ -L "$link" ]] || return 1
+    # Command substitution strips trailing newlines. Append a non-newline
+    # sentinel so readlink's terminator remains observable and a newline-bearing
+    # target cannot normalize to the expected path.
     encoded=$({ readlink "$link" && printf '\034'; }) || return 1
     case $encoded in
       *$'\034') encoded=${encoded%$'\034'} ;;
@@ -2042,6 +2126,45 @@ checkout_bash_v1_bind() {
       "$update_identity" -ef "$marker" ]]
   }
 
+  development_identity_matches() {
+    local marker=$1 line index
+    local -a identity_lines=() marker_lines=()
+
+    [[ -f "$update_identity" && ! -L "$update_identity" &&
+      -f "$marker" && ! -L "$marker" ]] || return 1
+    if update_identity_matches "$marker"; then
+      return 0
+    fi
+    # Validate both records with the existing seven-line grammar in subshells
+    # so a rejected candidate cannot replace the transaction's loaded delegate
+    # state. Then compare every line with Bash builtins; this avoids adding a
+    # bootstrap utility dependency while still catching a valid record whose
+    # delegate or post-delegate differs.
+    (load_development_identity "$update_identity") &&
+      (load_development_identity "$marker") || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      identity_lines[${#identity_lines[@]}]=$line
+    done <"$update_identity"
+    line=
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      marker_lines[${#marker_lines[@]}]=$line
+    done <"$marker"
+    [[ ${#identity_lines[@]} -eq ${#marker_lines[@]} ]] || return 1
+    for ((index = 0; index < ${#identity_lines[@]}; index++)); do
+      [[ "${identity_lines[index]}" == "${marker_lines[index]}" ]] ||
+        return 1
+    done
+  }
+
+  reclaim_nested_development_checkout() {
+    local nested=$1 destination=$2 marker=$3
+
+    [[ ! -e "$destination" && ! -L "$destination" ]] || return 1
+    development_identity_matches "$nested/$marker" || return 1
+    mv -n "$nested" "$destination" || return 1
+    development_identity_matches "$destination/$marker"
+  }
+
   reclaim_nested_update_checkout() {
     local nested=$1 destination=$2 marker=$3
 
@@ -2078,6 +2201,7 @@ checkout_bash_v1_bind() {
 
   recover_development_preparation() {
     local entry name preparation_count=0 current_marker
+    local candidate_head_present=false
 
     current_marker="$checkout_dir/$update_next_marker"
     for entry in "$update_transaction"/* "$update_transaction"/.[!.]* \
@@ -2089,7 +2213,11 @@ checkout_bash_v1_bind() {
           [[ -f "$entry" && ! -L "$entry" ]] || return 1
           preparation_count=$((preparation_count + 1))
           ;;
-        identity.* | next | previous | candidate-head)
+        candidate-head)
+          [[ -f "$entry" && ! -L "$entry" ]] || return 1
+          candidate_head_present=true
+          ;;
+        identity.* | next | previous)
           return 2
           ;;
         *) return 2 ;;
@@ -2100,11 +2228,17 @@ checkout_bash_v1_bind() {
       -d "$checkout_dir" && ! -L "$checkout_dir" &&
       -f "$current_marker" && ! -L "$current_marker" ]] &&
       load_development_identity "$current_marker"; then
-      validate_managed_checkout "$checkout_dir" || return 1
-      require_tracked_delegate "$checkout_dir" "$update_recorded_delegate"
-      if [[ -n "$update_recorded_post_install_delegate" ]]; then
-        require_tracked_post_install_delegate \
-          "$checkout_dir" "$update_recorded_post_install_delegate"
+      if [[ "$candidate_head_present" == true ]]; then
+        validate_recorded_checkout \
+          "$checkout_dir" "$update_candidate_head" true || return 1
+        rm -f -- "$update_candidate_head" || return 1
+      else
+        validate_managed_checkout "$checkout_dir" || return 1
+        require_tracked_delegate "$checkout_dir" "$update_recorded_delegate"
+        if [[ -n "$update_recorded_post_install_delegate" ]]; then
+          require_tracked_post_install_delegate \
+            "$checkout_dir" "$update_recorded_post_install_delegate"
+        fi
       fi
       rmdir "$update_transaction" || return 1
       rm -f -- "$current_marker" || return 1
@@ -2197,8 +2331,8 @@ checkout_bash_v1_bind() {
 
     if [[ ! -e "$update_next" && ! -L "$update_next" &&
       -d "$nested_next" && ! -L "$nested_next" ]] &&
-      update_identity_matches "$nested_next/$update_next_marker"; then
-      reclaim_nested_update_checkout "$nested_next" "$update_next" \
+      development_identity_matches "$nested_next/$update_next_marker"; then
+      reclaim_nested_development_checkout "$nested_next" "$update_next" \
         "$update_next_marker" || return 1
     fi
     reclaim_nested_development_links || return 1
@@ -2210,7 +2344,7 @@ checkout_bash_v1_bind() {
           "$update_previous" >&2
         return 1
       fi
-      if update_identity_matches "$current_marker"; then
+      if development_identity_matches "$current_marker"; then
         validate_recorded_checkout \
           "$checkout_dir" "$update_candidate_head" true || return 1
         committed=true
@@ -2232,7 +2366,7 @@ checkout_bash_v1_bind() {
     elif development_symlink_matches \
       "$checkout_dir" "$development_recorded_target"; then
       :
-    elif update_identity_matches "$current_marker"; then
+    elif development_identity_matches "$current_marker"; then
       validate_recorded_checkout \
         "$checkout_dir" "$update_candidate_head" true || return 1
       committed=true
@@ -2247,8 +2381,21 @@ checkout_bash_v1_bind() {
       rm -rf -- "$update_next" || return 1
     fi
     [[ ! -e "$update_previous" && ! -L "$update_previous" ]] || return 1
-    rm -f -- "$update_candidate_head" "$update_previous_head" || return 1
-    rm -f -- "$update_identity" || return 1
+    if [[ "$committed" == true ]]; then
+      # Once publication commits, the regular candidate marker owns the exact
+      # generation. Retire the transaction-side identity first, while the head
+      # proof remains available to validate a crash at this boundary. A later
+      # death after head removal leaves an empty transaction that the same
+      # marker can finish retiring.
+      rm -f -- "$update_identity" || return 1
+      rm -f -- "$update_candidate_head" "$update_previous_head" || return 1
+    else
+      # Before publication the transaction identity is the only authority for
+      # its staged candidate, so keep it until that candidate's head record is
+      # gone.
+      rm -f -- "$update_candidate_head" "$update_previous_head" || return 1
+      rm -f -- "$update_identity" || return 1
+    fi
     rmdir "$update_transaction" || return 1
     update_transaction_created=0
     if [[ "$committed" == true ]]; then
@@ -2431,14 +2578,13 @@ checkout_bash_v1_bind() {
       die "cannot resolve managed recovery revision: $update_next"
     printf '%s\n' "$candidate_head" >"$update_candidate_head" ||
       die "cannot record managed recovery revision: $candidate_head"
-    # Recovery may need this proof after the transaction-side identity has
-    # already been retired. A hard link remains a regular, self-contained
-    # record; the general publication helper's symlink fallback would dangle at
-    # exactly that crash boundary. Both paths are siblings on one filesystem,
-    # so fail before touching the user-owned development link if hard links are
-    # unavailable.
-    ln "$update_identity" "$update_next/$update_next_marker" ||
-      die 'cannot hard-link managed recovery candidate identity'
+    # Make candidate authority self-contained while the clone is still private
+    # and before the user-owned development link moves. The development helper
+    # preserves inode identity where supported and uses a verified regular copy
+    # on Android filesystems that reject hard links.
+    create_development_identity_marker \
+      "$update_identity" "$update_next/$update_next_marker" ||
+      die 'cannot prepare managed recovery candidate identity'
 
     mv -n "$checkout_dir" "$update_previous" ||
       die "cannot park development checkout link: $checkout_dir"
@@ -2453,12 +2599,12 @@ checkout_bash_v1_bind() {
     mv -n "$update_next" "$checkout_dir" ||
       die "cannot publish managed recovery checkout: $checkout_dir"
     current_marker="$checkout_dir/$update_next_marker"
-    if ! update_identity_matches "$current_marker"; then
+    if ! development_identity_matches "$current_marker"; then
       nested_next="$checkout_dir/${update_next##*/}"
       if [[ ! -e "$update_next" && ! -L "$update_next" &&
         -d "$nested_next" && ! -L "$nested_next" ]] &&
-        update_identity_matches "$nested_next/$update_next_marker"; then
-        reclaim_nested_update_checkout "$nested_next" "$update_next" \
+        development_identity_matches "$nested_next/$update_next_marker"; then
+        reclaim_nested_development_checkout "$nested_next" "$update_next" \
           "$update_next_marker" || true
       fi
       die "cannot verify published managed recovery checkout: $checkout_dir"

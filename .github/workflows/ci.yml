@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@8ed24ec2f6955aa3bf1177ecab2e88ca19bd6f7d
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@fd7e2050a529b311b2b2c88b6f66b3d60e07e00d
     with:
       matrix-set: full
       profiles: base,python
@@ -64,13 +64,13 @@ jobs:
         shell: /bin/bash {0}
         run: |-
           set -euo pipefail
-          if modern_prefix=$(brew --prefix bash 2>/dev/null); then
-            :
-          else
+          modern_prefix=$(brew --prefix bash 2>/dev/null || true)
+          modern_bash=${modern_prefix:+$modern_prefix/bin/bash}
+          if [[ -z "$modern_bash" || ! -x "$modern_bash" ]]; then
             brew install bash
             modern_prefix=$(brew --prefix bash)
+            modern_bash="$modern_prefix/bin/bash"
           fi
-          modern_bash="$modern_prefix/bin/bash"
           "$modern_bash" --noprofile --norc -c \
             'test "${BASH_VERSINFO[0]}" -ge 4'
           printf 'DOT_TEST_MODERN_BASH=%s\n' "$modern_bash" >>"$GITHUB_ENV"
@@ -83,6 +83,7 @@ jobs:
 
           origin="$RUNNER_TEMP/dot-origin.git"
           git init --quiet --bare "$origin"
+          git -C "$origin" config receive.shallowUpdate true
           git -C "$origin" symbolic-ref HEAD refs/heads/main
           git push --quiet "$origin" HEAD:refs/heads/main
 
@@ -125,4 +126,4 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@8ed24ec2f6955aa3bf1177ecab2e88ca19bd6f7d
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@fd7e2050a529b311b2b2c88b6f66b3d60e07e00d

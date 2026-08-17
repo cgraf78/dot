@@ -18,5 +18,12 @@ dot_config_load \
 assert_eq "$HOME/.local/lib/dotfiles" "$DOT_EXTENSIONS_DIR" \
   'extension example path'
 assert_eq none "$DOT_DEPENDENCY_PROVIDER" 'extension example provider'
+[[ -f "$DOT_TEST_ROOT/examples/extension-dotfiles/home/.local/lib/dotfiles/merge-hooks.d/10-example.sh" ]] ||
+  fail 'extension example merge hook is missing'
+[[ -f "$DOT_TEST_ROOT/examples/extension-dotfiles/home/.local/lib/dotfiles/doctor.d/10-example.sh" ]] ||
+  fail 'extension example doctor hook is missing'
+bash -n \
+  "$DOT_TEST_ROOT/examples/extension-dotfiles/home/.local/lib/dotfiles/merge-hooks.d/10-example.sh" \
+  "$DOT_TEST_ROOT/examples/extension-dotfiles/home/.local/lib/dotfiles/doctor.d/10-example.sh"
 
 printf 'examples-test: ok\n'

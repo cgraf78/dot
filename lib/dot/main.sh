@@ -17,6 +17,19 @@ fi
 
 DOT_SOURCE_ROOT=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 export DOT_SOURCE_ROOT
+# shellcheck source=temp.sh
+. "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+# shellcheck disable=SC2034 # Sourced provider and repository modules consume the original argv.
+DOT_ORIGINAL_ARGV=("$@")
+if [[ -n ${DOT_REEXEC_EXPECTED_REVISION:-} ]]; then
+  _dot_reexec_observed=$(_dot_source_git rev-parse HEAD 2>/dev/null || true)
+  if [[ $_dot_reexec_observed != "$DOT_REEXEC_EXPECTED_REVISION" ]]; then
+    printf 'dot: re-exec revision mismatch: expected %s, found %s\n' \
+      "$DOT_REEXEC_EXPECTED_REVISION" "${_dot_reexec_observed:-<missing>}" >&2
+    exit 1
+  fi
+  unset _dot_reexec_observed
+fi
 
 # shellcheck disable=SC1091 # Runtime root is resolved above.
 . "$DOT_SOURCE_ROOT/lib/dot/public/api-version.sh"
@@ -31,8 +44,8 @@ dot_version() {
   local version revision=unknown
 
   IFS= read -r version <"$DOT_SOURCE_ROOT/VERSION" || version=unknown
-  if [[ -d "$DOT_SOURCE_ROOT/.git" ]] && command -v git >/dev/null 2>&1; then
-    revision=$(git -C "$DOT_SOURCE_ROOT" rev-parse --short=12 HEAD 2>/dev/null) ||
+  if command -v git >/dev/null 2>&1; then
+    revision=$(_dot_source_git rev-parse --short=12 HEAD 2>/dev/null) ||
       revision=unknown
   fi
   printf 'dot %s (source %s; config 1; extensions 1; library 1)\n' \
@@ -68,13 +81,10 @@ case ${1:-help} in
     ;;
   *)
     dot_config_load || exit 2
-    if [[ -f "$DOT_SOURCE_ROOT/lib/dot/commands.sh" ]]; then
-      # shellcheck source=/dev/null
-      . "$DOT_SOURCE_ROOT/lib/dot/commands.sh"
-      dot_command_dispatch "$@"
-    else
-      printf 'dot: command is not available in this development build: %s\n' "$1" >&2
-      exit 1
-    fi
+    # shellcheck source=runtime.sh
+    . "$DOT_SOURCE_ROOT/lib/dot/runtime.sh"
+    # shellcheck source=commands.sh
+    . "$DOT_SOURCE_ROOT/lib/dot/commands.sh"
+    dot_command_dispatch "$@"
     ;;
 esac

@@ -90,6 +90,28 @@ HOME="$HOME" PREFIX="$adapter" "$DOT_TEST_ROOT/support/install-checkout.sh" \
 [[ -L "$adapter/lib/dot" ]] ||
   fail 'adapter install did not publish the public library'
 
+# Minimal bootstrap images do not necessarily ship coreutils `cmp`. Git is
+# already an installer prerequisite, so prove exact adapter recognition does
+# not accidentally grow a second comparison dependency.
+adapter_without_cmp=$DOT_TEST_TMP/adapter-without-cmp
+adapter_without_cmp_bin=$DOT_TEST_TMP/adapter-without-cmp-bin
+mkdir -p "$adapter_without_cmp/bin" "$adapter_without_cmp_bin"
+cp "$DOT_TEST_ROOT/support/client-launcher.sh" "$adapter_without_cmp/bin/dot"
+chmod 0755 "$adapter_without_cmp/bin/dot"
+cat >"$adapter_without_cmp_bin/cmp" <<'CMP'
+#!/usr/bin/env bash
+printf 'installer invoked unavailable cmp\n' >&2
+exit 127
+CMP
+chmod 0755 "$adapter_without_cmp_bin/cmp"
+HOME="$HOME" PREFIX="$adapter_without_cmp" \
+  PATH="$adapter_without_cmp_bin:$PATH" \
+  "$DOT_TEST_ROOT/support/install-checkout.sh" >/dev/null
+[[ -f "$adapter_without_cmp/bin/dot" && ! -L "$adapter_without_cmp/bin/dot" ]] ||
+  fail 'installer replaced the exact client adapter without cmp'
+[[ -L "$adapter_without_cmp/lib/dot" ]] ||
+  fail 'adapter install without cmp did not publish the public library'
+
 # Tool behavior, rather than uname, selects exact-destination flags. This
 # models macOS with Homebrew coreutils ahead of /bin and prevents a future
 # platform-name shortcut from choosing unsupported BSD flags for GNU tools.

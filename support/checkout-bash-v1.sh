@@ -29,6 +29,9 @@ _checkout_bash_v1_probe() {
 
   _checkout_bash_v1_normalized_absolute "$candidate" || return 1
   [[ -f "$candidate" && -x "$candidate" ]] || return 1
+  # Probe the interpreter itself, not caller-selected noninteractive startup
+  # policy. In particular, never execute BASH_ENV or ENV merely while deciding
+  # whether this candidate is suitable.
   # shellcheck disable=SC2016 # Expanded only by the candidate interpreter.
   output=$(BASH_ENV='' ENV='' "$candidate" --noprofile --norc -c \
     'printf "cgraf78-checkout-bash-v1:%s\n" "${BASH_VERSINFO[0]-}"' \
@@ -102,7 +105,8 @@ _checkout_bash_v1_read_hint() {
 }
 
 _checkout_bash_v1_detect_link_tool() {
-  local parent=$1 probe source ln_bin
+  local parent=$1 probe source ln_bin mv_bin move_source='' move_target=''
+  local move_destination nested mv_supported=false
 
   ln_bin=$(type -P ln 2>/dev/null) || return 1
   probe=$(mktemp -d "$parent/.bash-v1.tools.XXXXXX") || return 1
@@ -117,23 +121,52 @@ _checkout_bash_v1_detect_link_tool() {
       [[ "$source" -ef "$probe/link" ]]; then
       _CHECKOUT_BASH_V1_LN_MODE=h
     else
-      rm -f "$probe/link" "$source"
-      rmdir "$probe" 2>/dev/null || true
-      _checkout_bash_v1_error 'ln lacks exact-destination hard-link publication'
-      return 1
+      rm -f "$probe/link"
+      mv_bin=$(type -P mv 2>/dev/null) || mv_bin=
+      move_source=$probe/move-source
+      move_target=$probe/move-target
+      move_destination=$probe/destination
+      printf 'move probe\n' >"$move_source"
+      if [[ -n "$mv_bin" ]] &&
+        "$mv_bin" -nT -- "$move_source" "$move_target" 2>/dev/null &&
+        [[ ! -e "$move_source" && ! -L "$move_source" &&
+          -f "$move_target" && ! -L "$move_target" ]] &&
+        mkdir "$move_destination"; then
+        # GNU mv versions disagree about whether a preserved -n collision is
+        # success or failure. The filesystem postcondition is the contract:
+        # the source survives and the exact destination directory is untouched.
+        "$mv_bin" -nT -- "$move_target" "$move_destination" 2>/dev/null || true
+        if [[ -f "$move_target" && ! -L "$move_target" &&
+          -d "$move_destination" && ! -L "$move_destination" ]] &&
+          rmdir "$move_destination"; then
+          mv_supported=true
+        fi
+      fi
+      if [[ "$mv_supported" == true ]]; then
+        _CHECKOUT_BASH_V1_LN_MODE=mv-T
+        _CHECKOUT_BASH_V1_MV_BIN=$mv_bin
+      else
+        nested=$move_destination/${move_target##*/}
+        rm -f "$nested" "$move_source" "$move_target" "$source"
+        rmdir "$move_destination" 2>/dev/null || true
+        rmdir "$probe" 2>/dev/null || true
+        _checkout_bash_v1_error 'no exact-destination runtime-hint publication is available'
+        return 1
+      fi
     fi
   fi
-  rm -f "$probe/link" "$source"
+  rm -f "$probe/link" "$source" "$move_source" "$move_target"
   rmdir "$probe" || return 1
   _CHECKOUT_BASH_V1_LN_BIN=$ln_bin
 }
 
 _checkout_bash_v1_link_exact() {
-  if [[ $_CHECKOUT_BASH_V1_LN_MODE == T ]]; then
-    "$_CHECKOUT_BASH_V1_LN_BIN" -T -- "$1" "$2"
-  else
-    "$_CHECKOUT_BASH_V1_LN_BIN" -h "$1" "$2"
-  fi
+  case $_CHECKOUT_BASH_V1_LN_MODE in
+    T) "$_CHECKOUT_BASH_V1_LN_BIN" -T -- "$1" "$2" ;;
+    h) "$_CHECKOUT_BASH_V1_LN_BIN" -h "$1" "$2" ;;
+    mv-T) "$_CHECKOUT_BASH_V1_MV_BIN" -nT -- "$1" "$2" ;;
+    *) return 1 ;;
+  esac
 }
 
 _checkout_bash_v1_cleanup_nested_link() {
