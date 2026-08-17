@@ -6,7 +6,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == de52d90df35cfcc6f951246587b02b61820f07e1 ]] ||
+[[ $(git hash-object "$launcher") == 73a219e4c8d2f6173dcaa2381f4b969061673860 ]] ||
   fail 'client launcher v2 changed in place; update its migration fixture deliberately'
 install_home=$DOT_TEST_TMP/install
 checkout=$install_home/cgraf78/dot
@@ -139,6 +139,7 @@ assert_eq $'legacy\nfront-door='"$launcher"$'\nupdate\n--skip-pull\n--cron' \
 # The forwarder lands before the capability lock and checkout on some hosts.
 # That enabling state must keep executing the exact retained embedded launcher.
 rm -f -- "$log" "$helper_log"
+unset DOT_CLIENT_READY
 DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
   DOT_CLIENT_CUTOVER_LOCK=$DOT_TEST_TMP/missing-lock \
@@ -150,6 +151,7 @@ assert_eq $'legacy\nfront-door='"$launcher"$'\nfallback' "$(<"$log")" \
   'client launcher enabling fallback'
 assert_eq restore "$(<"$helper_log")" \
   'client launcher restores the library before embedded fallback'
+export DOT_CLIENT_READY=$ready
 
 # A lock whose required revision is not an ancestor of the checkout cannot
 # authorize cutover. Preserve command continuity through the embedded engine.

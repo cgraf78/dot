@@ -158,7 +158,10 @@ if [[ $standalone_status -eq 2 ]]; then
   dot_client_error "malformed cutover lock: $cutover_lock"
   exit 2
 fi
-ready=${ready_override:-$state_home/dot/client-ready-v2/$DOT_CLIENT_MINIMUM_REVISION}
+ready=''
+if [[ $standalone_status -eq 0 ]]; then
+  ready=${ready_override:-$state_home/dot/client-ready-v2/$DOT_CLIENT_MINIMUM_REVISION}
+fi
 # The tracked phase is the fleet-visible deployment gate. `prepare` may stage a
 # complete checkout, but cannot activate it. An embedded updater also re-execs
 # this front door with its private --skip-pull flag; keep that exact invocation
