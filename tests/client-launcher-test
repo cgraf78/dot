@@ -6,7 +6,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == 742cd395e8fde884aa566a0a735ad48d561009d1 ]] ||
+[[ $(git hash-object "$launcher") == de52d90df35cfcc6f951246587b02b61820f07e1 ]] ||
   fail 'client launcher v2 changed in place; update its migration fixture deliberately'
 install_home=$DOT_TEST_TMP/install
 checkout=$install_home/cgraf78/dot
@@ -41,8 +41,10 @@ write_lock() {
 
 write_lock active "$minimum_revision"
 write_ready() {
-  printf 'cgraf78 dot client readiness v2\nminimum_revision=%s\n' \
-    "$1" >"$ready"
+  local _revision=$1
+
+  [[ $_revision == "$minimum_revision" ]] || fail 'unexpected readiness revision'
+  mkdir -p "$ready"
 }
 write_ready "$minimum_revision"
 export DOT_CLIENT_READY=$ready
@@ -102,10 +104,11 @@ assert_eq restore "$(<"$helper_log")" \
   'client launcher restores before prepare-phase fallback'
 
 # Tracked activation alone is insufficient. The preparation update writes a
-# private readiness record only after client convergence succeeds; without it,
+# private readiness directory only after client convergence succeeds; without it,
 # even a complete and otherwise valid checkout must remain dormant.
 write_lock active "$minimum_revision"
-rm -f -- "$ready" "$log" "$helper_log"
+rm -rf -- "$ready"
+rm -f -- "$log" "$helper_log"
 DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
   DOT_CLIENT_CUTOVER_LOCK=$lock \
@@ -173,6 +176,7 @@ assert_eq restore "$(<"$helper_log")" \
   'client launcher restores before stale-cutover fallback'
 
 write_lock active "$minimum_revision"
+rm -rf -- "$ready"
 printf 'malformed readiness\n' >"$ready"
 rm -f -- "$log" "$helper_log"
 DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
@@ -184,6 +188,7 @@ DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   "$launcher" malformed-ready
 assert_eq $'legacy\nfront-door='"$launcher"$'\nmalformed-ready' "$(<"$log")" \
   'client launcher treats malformed readiness as legacy-only'
+rm -f -- "$ready"
 write_ready "$minimum_revision"
 
 # After the restoration horizon, an unavailable standalone target produces the

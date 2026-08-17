@@ -51,27 +51,6 @@ dot_client_read_lock() {
   [[ $DOT_CLIENT_MINIMUM_REVISION =~ ^[0-9a-f]{40}$ ]] || return 2
 }
 
-dot_client_read_ready() {
-  local ready=$1 size header revision_line extra=''
-
-  [[ -f "$ready" && ! -L "$ready" ]] || return 1
-  size=$(wc -c <"$ready" 2>/dev/null) || return 1
-  size=${size//[[:space:]]/}
-  case $size in
-    '' | *[!0-9]*) return 1 ;;
-  esac
-  [[ ${#size} -le 4 && $size -le 1024 ]] || return 1
-  {
-    IFS= read -r header || return 1
-    IFS= read -r revision_line || return 1
-    if IFS= read -r extra || [[ -n $extra ]]; then
-      return 1
-    fi
-  } <"$ready"
-  [[ $header == 'cgraf78 dot client readiness v2' &&
-    $revision_line == "minimum_revision=$DOT_CLIENT_MINIMUM_REVISION" ]]
-}
-
 dot_client_git() (
   unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
   unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE GIT_CONFIG
@@ -132,13 +111,20 @@ launcher=$launcher_parent/${BASH_SOURCE[0]##*/}
 cutover_lock=${DOT_CLIENT_CUTOVER_LOCK:-$HOME/.local/lib/dotfiles/dot-cutover.lock}
 handoff_helper=${DOT_CLIENT_HANDOFF_HELPER:-$HOME/.local/lib/dotfiles/dot-library-handoff.sh}
 legacy_launcher=${DOT_CLIENT_LEGACY_LAUNCHER:-$HOME/.local/lib/dotfiles/legacy-dot-launcher.sh}
-ready=${DOT_CLIENT_READY:-${XDG_STATE_HOME:-$HOME/.local/state}/dot/client-ready-v2}
-for client_path in "$cutover_lock" "$handoff_helper" "$legacy_launcher" "$ready"; do
+ready_override=${DOT_CLIENT_READY:-}
+state_home=${XDG_STATE_HOME:-$HOME/.local/state}
+for client_path in "$cutover_lock" "$handoff_helper" "$legacy_launcher" "$state_home"; do
   dot_client_normalized_absolute "$client_path" || {
     dot_client_error "client migration path must be normalized and absolute: $client_path"
     exit 1
   }
 done
+if [[ -n $ready_override ]]; then
+  dot_client_normalized_absolute "$ready_override" || {
+    dot_client_error "client readiness path must be normalized and absolute: $ready_override"
+    exit 1
+  }
+fi
 
 if [[ -e "$handoff_helper" || -L "$handoff_helper" ]]; then
   [[ -f "$handoff_helper" && ! -L "$handoff_helper" && -x "$handoff_helper" ]] || {
@@ -172,13 +158,14 @@ if [[ $standalone_status -eq 2 ]]; then
   dot_client_error "malformed cutover lock: $cutover_lock"
   exit 2
 fi
+ready=${ready_override:-$state_home/dot/client-ready-v2/$DOT_CLIENT_MINIMUM_REVISION}
 # The tracked phase is the fleet-visible deployment gate. `prepare` may stage a
 # complete checkout, but cannot activate it. An embedded updater also re-execs
 # this front door with its private --skip-pull flag; keep that exact invocation
 # on the retained launcher because standalone Dot deliberately does not own the
 # old engine's private flag.
 if [[ $standalone_status -eq 0 && $DOT_CLIENT_PHASE == active &&
-  ${DOT_REEXEC:-0} != 1 ]] && dot_client_read_ready "$ready"; then
+  ${DOT_REEXEC:-0} != 1 && -d $ready && ! -L $ready ]]; then
   if dot_client_standalone_ready "$checkout" "$dot_runtime" "$launcher"; then
     standalone_authorized=1
   else
