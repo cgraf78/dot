@@ -40,7 +40,9 @@ validates standalone Dot. The `active` phase additionally requires a private,
 revision-keyed host-readiness directory and proves that the lock's minimum
 revision is an ancestor of the active checkout. Re-execs inherited from the
 embedded updater also stay on that launcher because its private arguments are
-not standalone API. Before any embedded fallback, the adapter asks the
+not standalone API. Missing or malformed activation authority denies the
+standalone path but does not interrupt an available embedded fallback. Before
+any embedded fallback, the adapter asks the
 client-owned handoff helper to restore a recoverable legacy tree. After the
 restoration horizon it keeps the same bytes and prints the recovery installer
 when neither runtime is available.

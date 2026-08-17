@@ -6,7 +6,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == 73a219e4c8d2f6173dcaa2381f4b969061673860 ]] ||
+[[ $(git hash-object "$launcher") == eac6f06a18d6716e420b4a69f2f0a7c1e437b93e ]] ||
   fail 'client launcher v2 changed in place; update its migration fixture deliberately'
 install_home=$DOT_TEST_TMP/install
 checkout=$install_home/cgraf78/dot
@@ -45,9 +45,27 @@ write_ready() {
 
   [[ $_revision == "$minimum_revision" ]] || fail 'unexpected readiness revision'
   mkdir -p "$ready"
+  chmod 0700 "$ready"
 }
 write_ready "$minimum_revision"
 export DOT_CLIENT_READY=$ready
+
+relative_home=$DOT_TEST_TMP/relative-state-home
+relative_ready=$relative_home/.local/state/dot/client-ready-v2/$minimum_revision
+mkdir -p "$relative_ready"
+chmod 0700 "$relative_ready"
+rm -f -- "$log" "$helper_log"
+env -u DOT_CLIENT_READY \
+  HOME="$relative_home" XDG_STATE_HOME=relative/state \
+  DOT_CLIENT_LAUNCHER_TEST_LOG="$log" \
+  DOT_CLIENT_HANDOFF_TEST_LOG="$helper_log" \
+  DOT_CLIENT_CUTOVER_LOCK="$lock" \
+  DOT_CLIENT_HANDOFF_HELPER="$helper" \
+  DOT_CLIENT_LEGACY_LAUNCHER="$legacy" \
+  SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" relative-state-active
+assert_eq $'standalone\nrelative-state-active' "$(<"$log")" \
+  'client launcher resolves relative XDG state through HOME fallback'
 
 cat >"$helper" <<'HELPER'
 #!/usr/bin/env bash
@@ -74,11 +92,11 @@ printf 'client launcher invoked unavailable cmp\n' >&2
 exit 127
 CMP
 chmod 0755 "$no_cmp_bin/cmp"
-PATH="$no_cmp_bin:$PATH" DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
-  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
-  DOT_CLIENT_CUTOVER_LOCK=$lock \
-  DOT_CLIENT_HANDOFF_HELPER=$helper \
-  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+PATH="$no_cmp_bin:$PATH" DOT_CLIENT_LAUNCHER_TEST_LOG="$log" \
+  DOT_CLIENT_HANDOFF_TEST_LOG="$helper_log" \
+  DOT_CLIENT_CUTOVER_LOCK="$lock" \
+  DOT_CLIENT_HANDOFF_HELPER="$helper" \
+  DOT_CLIENT_LEGACY_LAUNCHER="$legacy" \
   SHDEPS_INSTALL_DIR="$install_home/" \
   "$launcher" first 'two words'
 assert_eq $'standalone\nfirst\ntwo words' "$(<"$log")" \
@@ -103,6 +121,21 @@ assert_eq $'legacy\nfront-door='"$launcher"$'\nprepared' "$(<"$log")" \
 assert_eq restore "$(<"$helper_log")" \
   'client launcher restores before prepare-phase fallback'
 
+# Preparation does not consume standalone state. Keep legacy continuity for a
+# relative XDG value that the embedded engine resolves through HOME fallback.
+rm -f -- "$log" "$helper_log"
+unset DOT_CLIENT_READY
+XDG_STATE_HOME=relative/state DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock \
+  DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+  SHDEPS_INSTALL_DIR=relative \
+  "$launcher" prepared-relative-state
+assert_eq $'legacy\nfront-door='"$launcher"$'\nprepared-relative-state' \
+  "$(<"$log")" 'client launcher prepare phase ignores standalone-only paths'
+export DOT_CLIENT_READY=$ready
+
 # Tracked activation alone is insufficient. The preparation update writes a
 # private readiness directory only after client convergence succeeds; without it,
 # even a complete and otherwise valid checkout must remain dormant.
@@ -118,6 +151,36 @@ DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   "$launcher" unready
 assert_eq $'legacy\nfront-door='"$launcher"$'\nunready' "$(<"$log")" \
   'client launcher requires private host readiness'
+write_ready "$minimum_revision"
+
+chmod 0755 "$ready"
+rm -f -- "$log" "$helper_log"
+DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock \
+  DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+  SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" public-ready
+assert_eq $'legacy\nfront-door='"$launcher"$'\npublic-ready' "$(<"$log")" \
+  'client launcher rejects non-private readiness authority'
+chmod 0700 "$ready"
+
+rm -rf -- "$ready"
+mkdir -p "$DOT_TEST_TMP/ready-target"
+chmod 0700 "$DOT_TEST_TMP/ready-target"
+ln -s "$DOT_TEST_TMP/ready-target" "$ready"
+rm -f -- "$log" "$helper_log"
+DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock \
+  DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+  SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" symlink-ready
+assert_eq $'legacy\nfront-door='"$launcher"$'\nsymlink-ready' "$(<"$log")" \
+  'client launcher rejects symlinked readiness authority'
+rm -f -- "$ready"
 write_ready "$minimum_revision"
 
 # An old embedded updater re-execs the newly pulled front door with a private
@@ -140,7 +203,7 @@ assert_eq $'legacy\nfront-door='"$launcher"$'\nupdate\n--skip-pull\n--cron' \
 # That enabling state must keep executing the exact retained embedded launcher.
 rm -f -- "$log" "$helper_log"
 unset DOT_CLIENT_READY
-DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+XDG_STATE_HOME=relative/state DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
   DOT_CLIENT_CUTOVER_LOCK=$DOT_TEST_TMP/missing-lock \
   DOT_CLIENT_HANDOFF_HELPER=$helper \
@@ -152,6 +215,17 @@ assert_eq $'legacy\nfront-door='"$launcher"$'\nfallback' "$(<"$log")" \
 assert_eq restore "$(<"$helper_log")" \
   'client launcher restores the library before embedded fallback'
 export DOT_CLIENT_READY=$ready
+
+printf 'cgraf78 dot client cutover v2\nphase=unknown\nminimum_revision=%s\n' \
+  "$minimum_revision" >"$lock"
+rm -f -- "$log" "$helper_log"
+DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" malformed-lock
+assert_eq $'legacy\nfront-door='"$launcher"$'\nmalformed-lock' "$(<"$log")" \
+  'client launcher treats malformed activation authority as legacy-only'
 
 # A lock whose required revision is not an ancestor of the checkout cannot
 # authorize cutover. Preserve command continuity through the embedded engine.
