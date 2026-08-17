@@ -22,7 +22,7 @@ dot_client_normalized_absolute() {
 }
 
 dot_client_read_lock() {
-  local lock=$1 size header revision_line extra=''
+  local lock=$1 size header phase_line revision_line extra=''
 
   [[ -f "$lock" && ! -L "$lock" ]] || return 1
   size=$(wc -c <"$lock" 2>/dev/null) || return 2
@@ -33,15 +33,43 @@ dot_client_read_lock() {
   [[ ${#size} -le 4 && $size -le 1024 ]] || return 2
   {
     IFS= read -r header || return 2
+    IFS= read -r phase_line || return 2
     IFS= read -r revision_line || return 2
     if IFS= read -r extra || [[ -n $extra ]]; then
       return 2
     fi
   } <"$lock"
-  [[ $header == 'cgraf78 dot client cutover v1' &&
+  [[ $header == 'cgraf78 dot client cutover v2' &&
+    $phase_line == phase=* &&
     $revision_line == minimum_revision=* ]] || return 2
+  DOT_CLIENT_PHASE=${phase_line#phase=}
+  case $DOT_CLIENT_PHASE in
+    prepare | active) ;;
+    *) return 2 ;;
+  esac
   DOT_CLIENT_MINIMUM_REVISION=${revision_line#minimum_revision=}
   [[ $DOT_CLIENT_MINIMUM_REVISION =~ ^[0-9a-f]{40}$ ]] || return 2
+}
+
+dot_client_read_ready() {
+  local ready=$1 size header revision_line extra=''
+
+  [[ -f "$ready" && ! -L "$ready" ]] || return 1
+  size=$(wc -c <"$ready" 2>/dev/null) || return 1
+  size=${size//[[:space:]]/}
+  case $size in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [[ ${#size} -le 4 && $size -le 1024 ]] || return 1
+  {
+    IFS= read -r header || return 1
+    IFS= read -r revision_line || return 1
+    if IFS= read -r extra || [[ -n $extra ]]; then
+      return 1
+    fi
+  } <"$ready"
+  [[ $header == 'cgraf78 dot client readiness v2' &&
+    $revision_line == "minimum_revision=$DOT_CLIENT_MINIMUM_REVISION" ]]
 }
 
 dot_client_git() (
@@ -62,15 +90,9 @@ dot_client_exact_file() {
 }
 
 dot_client_standalone_ready() {
-  local checkout=$1 runtime=$2 lock=$3 launcher=$4 template
-  local checkout_physical top top_physical head lock_status=0
+  local checkout=$1 runtime=$2 launcher=$3 template
+  local checkout_physical top top_physical head
 
-  dot_client_read_lock "$lock" || lock_status=$?
-  if [[ $lock_status -ne 0 ]]; then
-    [[ $lock_status -eq 1 ]] && return 1
-    dot_client_error "malformed cutover lock: $lock"
-    return 2
-  fi
   [[ -f "$runtime" && ! -L "$runtime" && -x "$runtime" ]] || return 1
   template=$checkout/support/client-launcher.sh
   [[ -f "$template" && ! -L "$template" ]] || return 1
@@ -110,7 +132,8 @@ launcher=$launcher_parent/${BASH_SOURCE[0]##*/}
 cutover_lock=${DOT_CLIENT_CUTOVER_LOCK:-$HOME/.local/lib/dotfiles/dot-cutover.lock}
 handoff_helper=${DOT_CLIENT_HANDOFF_HELPER:-$HOME/.local/lib/dotfiles/dot-library-handoff.sh}
 legacy_launcher=${DOT_CLIENT_LEGACY_LAUNCHER:-$HOME/.local/lib/dotfiles/legacy-dot-launcher.sh}
-for client_path in "$cutover_lock" "$handoff_helper" "$legacy_launcher"; do
+ready=${DOT_CLIENT_READY:-${XDG_STATE_HOME:-$HOME/.local/state}/dot/client-ready-v2}
+for client_path in "$cutover_lock" "$handoff_helper" "$legacy_launcher" "$ready"; do
   dot_client_normalized_absolute "$client_path" || {
     dot_client_error "client migration path must be normalized and absolute: $client_path"
     exit 1
@@ -120,10 +143,6 @@ done
 if [[ -e "$handoff_helper" || -L "$handoff_helper" ]]; then
   [[ -f "$handoff_helper" && ! -L "$handoff_helper" && -x "$handoff_helper" ]] || {
     dot_client_error "library handoff helper is unsafe: $handoff_helper"
-    exit 1
-  }
-  "$handoff_helper" recover || {
-    dot_client_error 'library handoff recovery failed'
     exit 1
   }
 fi
@@ -147,10 +166,31 @@ esac
 dot_runtime=$checkout/bin/dot
 
 standalone_status=0
-dot_client_standalone_ready \
-  "$checkout" "$dot_runtime" "$cutover_lock" "$launcher" || standalone_status=$?
+standalone_authorized=0
+dot_client_read_lock "$cutover_lock" || standalone_status=$?
+if [[ $standalone_status -eq 2 ]]; then
+  dot_client_error "malformed cutover lock: $cutover_lock"
+  exit 2
+fi
+# The tracked phase is the fleet-visible deployment gate. `prepare` may stage a
+# complete checkout, but cannot activate it. An embedded updater also re-execs
+# this front door with its private --skip-pull flag; keep that exact invocation
+# on the retained launcher because standalone Dot deliberately does not own the
+# old engine's private flag.
+if [[ $standalone_status -eq 0 && $DOT_CLIENT_PHASE == active &&
+  ${DOT_REEXEC:-0} != 1 ]] && dot_client_read_ready "$ready"; then
+  if dot_client_standalone_ready "$checkout" "$dot_runtime" "$launcher"; then
+    standalone_authorized=1
+  else
+    standalone_status=$?
+  fi
+fi
 case $standalone_status in
-  0) exec "$dot_runtime" "$@" ;;
+  0)
+    if [[ $standalone_authorized -eq 1 ]]; then
+      exec "$dot_runtime" "$@"
+    fi
+    ;;
   1) ;;
   *) exit "$standalone_status" ;;
 esac
@@ -164,6 +204,8 @@ if [[ -f "$legacy_launcher" && ! -L "$legacy_launcher" &&
       exit 1
     }
   fi
+  DOT_CLIENT_FRONT_DOOR=$launcher
+  export DOT_CLIENT_FRONT_DOOR
   exec "$legacy_launcher" "$@"
 fi
 if [[ -e "$legacy_launcher" || -L "$legacy_launcher" ]]; then

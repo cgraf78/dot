@@ -6,14 +6,15 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == b620e4936d5579c8dcc6518629444e095d66835f ]] ||
-  fail 'client launcher v1 changed in place; update its migration fixture deliberately'
+[[ $(git hash-object "$launcher") == 742cd395e8fde884aa566a0a735ad48d561009d1 ]] ||
+  fail 'client launcher v2 changed in place; update its migration fixture deliberately'
 install_home=$DOT_TEST_TMP/install
 checkout=$install_home/cgraf78/dot
 runtime=$checkout/bin/dot
 lock=$DOT_TEST_TMP/dot-cutover.lock
 helper=$DOT_TEST_TMP/dot-library-handoff.sh
 legacy=$DOT_TEST_TMP/legacy-dot-launcher.sh
+ready=$DOT_TEST_TMP/client-ready-v2
 log=$DOT_TEST_TMP/launcher.log
 helper_log=$DOT_TEST_TMP/helper.log
 
@@ -31,8 +32,20 @@ git -C "$checkout" config user.email dot-test@example.invalid
 git -C "$checkout" add bin/dot support/client-launcher.sh
 git -c core.hooksPath= -C "$checkout" commit --quiet -m fixture
 minimum_revision=$(git -C "$checkout" rev-parse HEAD)
-printf 'cgraf78 dot client cutover v1\nminimum_revision=%s\n' \
-  "$minimum_revision" >"$lock"
+write_lock() {
+  local phase=$1 revision=$2
+
+  printf 'cgraf78 dot client cutover v2\nphase=%s\nminimum_revision=%s\n' \
+    "$phase" "$revision" >"$lock"
+}
+
+write_lock active "$minimum_revision"
+write_ready() {
+  printf 'cgraf78 dot client readiness v2\nminimum_revision=%s\n' \
+    "$1" >"$ready"
+}
+write_ready "$minimum_revision"
+export DOT_CLIENT_READY=$ready
 
 cat >"$helper" <<'HELPER'
 #!/usr/bin/env bash
@@ -42,9 +55,12 @@ chmod 0755 "$helper"
 cat >"$legacy" <<'LEGACY'
 #!/usr/bin/env bash
 printf 'legacy\n' >"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
+printf 'front-door=%s\n' "${DOT_CLIENT_FRONT_DOOR:-unset}" \
+  >>"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
 printf '%s\n' "$@" >>"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
 LEGACY
 chmod 0755 "$legacy"
+: >"$helper_log"
 
 # The retained adapter must run on the same minimal bootstrap images as its
 # installer. Git is present there, but a standalone `cmp` command may not be.
@@ -65,8 +81,57 @@ PATH="$no_cmp_bin:$PATH" DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   "$launcher" first 'two words'
 assert_eq $'standalone\nfirst\ntwo words' "$(<"$log")" \
   'client launcher standalone arguments'
-assert_eq recover "$(<"$helper_log")" \
-  'client launcher recovers library handoff before dispatch'
+assert_eq '' "$(<"$helper_log")" \
+  'client launcher leaves handoff recovery to the locked standalone runtime'
+
+# The preparation revision may stage and validate a complete standalone
+# checkout, but it must remain dormant until a later fleet-visible revision
+# changes the single lock authority to active.
+write_lock prepare "$minimum_revision"
+rm -f -- "$log" "$helper_log"
+DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock \
+  DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+  SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" prepared
+assert_eq $'legacy\nfront-door='"$launcher"$'\nprepared' "$(<"$log")" \
+  'client launcher prepare phase remains on embedded Dot'
+assert_eq restore "$(<"$helper_log")" \
+  'client launcher restores before prepare-phase fallback'
+
+# Tracked activation alone is insufficient. The preparation update writes a
+# private readiness record only after client convergence succeeds; without it,
+# even a complete and otherwise valid checkout must remain dormant.
+write_lock active "$minimum_revision"
+rm -f -- "$ready" "$log" "$helper_log"
+DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock \
+  DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+  SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" unready
+assert_eq $'legacy\nfront-door='"$launcher"$'\nunready' "$(<"$log")" \
+  'client launcher requires private host readiness'
+write_ready "$minimum_revision"
+
+# An old embedded updater re-execs the newly pulled front door with a private
+# --skip-pull flag. Standalone Dot deliberately does not own that flag, so the
+# adapter must fence the entire inherited re-exec through the legacy launcher
+# even after activation.
+write_lock active "$minimum_revision"
+rm -f -- "$log" "$helper_log"
+DOT_REEXEC=1 DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock \
+  DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+  SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" update --skip-pull --cron
+assert_eq $'legacy\nfront-door='"$launcher"$'\nupdate\n--skip-pull\n--cron' \
+  "$(<"$log")" 'client launcher fences an embedded updater re-exec'
 
 # The forwarder lands before the capability lock and checkout on some hosts.
 # That enabling state must keep executing the exact retained embedded launcher.
@@ -78,9 +143,9 @@ DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
   SHDEPS_INSTALL_DIR="$install_home" \
   "$launcher" fallback
-assert_eq $'legacy\nfallback' "$(<"$log")" \
+assert_eq $'legacy\nfront-door='"$launcher"$'\nfallback' "$(<"$log")" \
   'client launcher enabling fallback'
-assert_eq $'recover\nrestore' "$(<"$helper_log")" \
+assert_eq restore "$(<"$helper_log")" \
   'client launcher restores the library before embedded fallback'
 
 # A lock whose required revision is not an ancestor of the checkout cannot
@@ -93,8 +158,7 @@ printf 'foreign\n' >"$foreign/file"
 git -C "$foreign" add file
 git -c core.hooksPath= -C "$foreign" commit --quiet -m foreign
 foreign_revision=$(git -C "$foreign" rev-parse HEAD)
-printf 'cgraf78 dot client cutover v1\nminimum_revision=%s\n' \
-  "$foreign_revision" >"$lock"
+write_lock active "$foreign_revision"
 rm -f -- "$log" "$helper_log"
 DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   DOT_CLIENT_CUTOVER_LOCK=$lock \
@@ -103,13 +167,28 @@ DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
   SHDEPS_INSTALL_DIR="$install_home" \
   "$launcher" stale
-assert_eq $'legacy\nstale' "$(<"$log")" \
+assert_eq $'legacy\nfront-door='"$launcher"$'\nstale' "$(<"$log")" \
   'client launcher stale-cutover fallback'
-assert_eq $'recover\nrestore' "$(<"$helper_log")" \
+assert_eq restore "$(<"$helper_log")" \
   'client launcher restores before stale-cutover fallback'
+
+write_lock active "$minimum_revision"
+printf 'malformed readiness\n' >"$ready"
+rm -f -- "$log" "$helper_log"
+DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock \
+  DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+  SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" malformed-ready
+assert_eq $'legacy\nfront-door='"$launcher"$'\nmalformed-ready' "$(<"$log")" \
+  'client launcher treats malformed readiness as legacy-only'
+write_ready "$minimum_revision"
 
 # After the restoration horizon, an unavailable standalone target produces the
 # tested recovery command instead of pretending the embedded engine exists.
+write_lock active "$foreign_revision"
 rm -f -- "$legacy"
 if DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   DOT_CLIENT_CUTOVER_LOCK=$lock \
@@ -124,7 +203,8 @@ assert_contains 'curl -fsSL https://raw.githubusercontent.com/cgraf78/dot/main/i
   "$(<"$DOT_TEST_TMP/recovery.err")" \
   'client launcher recovery command'
 
-printf 'cgraf78 dot client cutover v1\nminimum_revision=malformed\n' >"$lock"
+printf 'cgraf78 dot client cutover v2\nphase=unknown\nminimum_revision=%s\n' \
+  "$minimum_revision" >"$lock"
 if DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
   DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
   DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR="$install_home" \
