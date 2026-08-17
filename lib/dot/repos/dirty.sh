@@ -164,7 +164,14 @@ _normalize_filtered() {
   for record in "${records[@]+"${records[@]}"}"; do
     IFS='|' read -r entry path <<<"$record"
     _dot_cleanup_begin_job_launch
-    _normalize_repo "$entry" "$path" <&"$DOT_CLEANUP_LAUNCH_STDIN_FD" &
+    (
+      # The launch handshake uses monitor mode only long enough to create this
+      # owned process group. Clear it in the worker before Git or a caller
+      # override can start nested jobs in unregistered groups that the
+      # coordinator's later group escalation cannot reach.
+      _dot_cleanup_prepare_subshell
+      _normalize_repo "$entry" "$path"
+    ) <&"$DOT_CLEANUP_LAUNCH_STDIN_FD" &
     pid=$!
     _dot_cleanup_finish_job_launch "$pid"
     pids+=("$pid")
