@@ -591,6 +591,9 @@ _dot_init_plan_summary() {
     IFS=$'\t' read -r provider extensions <<<"$result"
     [[ -n $extensions ]] || extensions=disabled
   fi
+  if [[ ${DOT_INIT_SKIP_PROVIDER:-0} == 1 && $provider != none ]]; then
+    provider="$provider (skipped for this invocation)"
+  fi
   printf 'dot init plan:\n' >&2
   printf '  repository: %s\n' "$identity" >&2
   printf '  branch: %s\n' "$branch" >&2
@@ -1316,6 +1319,13 @@ _dot_init_forward_converge() {
   local status=0
   _dot_client_select
   dot_config_load || return 1
+  if [[ ${DOT_INIT_SKIP_PROVIDER:-0} == 1 ]]; then
+    # Shared bootstrap environments install their explicit prerequisites
+    # separately from client policy. Keep this override invocation-scoped: the
+    # committed config is still parsed and remains authoritative on later runs.
+    local DOT_DEPENDENCY_PROVIDER=none
+    export DOT_DEPENDENCY_PROVIDER
+  fi
   _discover_overlays || return 1
   _preflight_local_overlays || return 1
   _ui_begin 5
@@ -1763,6 +1773,13 @@ dot_init_command() {
       [[ -z $origin && -z $branch ]] || return 2
       _dot_init_rollback
       return
+      ;;
+  esac
+  case ${DOT_INIT_SKIP_PROVIDER:-0} in
+    0 | 1) ;;
+    *)
+      printf 'dot init: DOT_INIT_SKIP_PROVIDER must be 0 or 1\n' >&2
+      return 2
       ;;
   esac
   [[ -n $origin ]] || {
