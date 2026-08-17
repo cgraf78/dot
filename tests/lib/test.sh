@@ -60,17 +60,41 @@ assert_files_equal() {
   fail "$label"
 }
 
+process_identity() {
+  local pid=$1 output_name=$2 line rest
+
+  printf -v "$output_name" '%s' ''
+  [[ -r /proc/$pid/stat ]] || return 1
+  IFS= read -r line 2>/dev/null <"/proc/$pid/stat" || return 1
+  rest=${line##*) }
+  [[ $rest != "$line" ]] || return 1
+  # shellcheck disable=SC2086  # Kernel stat fields are intentionally tokenized.
+  set -- $rest
+  [[ $# -ge 20 && ${20} =~ ^[0-9]+$ ]] || return 1
+  printf -v "$output_name" 'proc:%s' "${20}"
+}
+
 process_is_live() {
-  local pid=$1 line rest
+  local pid=$1 expected_identity=${2:-} line rest identity=''
 
   kill -0 "$pid" 2>/dev/null || return 1
   # A container PID 1 may leave an already-terminated orphan as a zombie.
   # `kill -0` still succeeds for that inert record, while the production
   # cleanup contract consistently treats procfs state Z as no longer live.
+  # Bind procfs-backed checks to the captured start tick as well: a busy CI
+  # host can reuse the numeric PID after the owner has reaped its exact worker.
   if [[ -r /proc/$pid/stat ]] &&
     IFS= read -r line 2>/dev/null <"/proc/$pid/stat"; then
     rest=${line##*) }
-    [[ $rest == "$line" || ${rest%% *} != Z ]] || return 1
+    [[ $rest != "$line" ]] || return 1
+    # shellcheck disable=SC2086  # Kernel stat fields are intentionally tokenized.
+    set -- $rest
+    [[ $# -ge 20 && ${20} =~ ^[0-9]+$ ]] || return 1
+    identity=proc:${20}
+    [[ -z $expected_identity || $identity == "$expected_identity" ]] || return 1
+    [[ $1 != Z ]] || return 1
+  elif [[ -n $expected_identity ]]; then
+    return 1
   fi
   return 0
 }

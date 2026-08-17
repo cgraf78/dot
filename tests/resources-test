@@ -8,6 +8,16 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=../lib/dot/resources.sh
 . "$root/lib/dot/resources.sh"
 
+self_identity=""
+if [[ -r /proc/$$/stat ]]; then
+  process_identity "$$" self_identity
+  process_is_live "$$" "$self_identity" ||
+    fail 'process identity rejected its exact live generation'
+  if process_is_live "$$" "${self_identity%:*}:0"; then
+    fail 'process identity accepted a different PID generation'
+  fi
+fi
+
 TMPDIR=$DOT_TEST_TMP/allocator
 mkdir -p "$TMPDIR"
 export TMPDIR
@@ -62,18 +72,26 @@ done
 }
 worker=$(<"$case_root/worker.pid")
 child=$(<"$case_root/child.pid")
+worker_identity=""
+child_identity=""
+process_identity "$worker" worker_identity || worker_identity=""
+process_identity "$child" child_identity || child_identity=""
 kill -TERM "$owner"
 set +e
 wait "$owner"
 owner_status=$?
 set -e
 assert_eq 143 "$owner_status" 'resource owner preserves TERM status'
-for pid in "$worker" "$child"; do
+resource_pids=("$worker" "$child")
+resource_identities=("$worker_identity" "$child_identity")
+for index in "${!resource_pids[@]}"; do
+  pid=${resource_pids[$index]}
+  identity=${resource_identities[$index]}
   deadline=$((SECONDS + 5))
-  while process_is_live "$pid" && ((SECONDS < deadline)); do
+  while process_is_live "$pid" "$identity" && ((SECONDS < deadline)); do
     sleep 0.01
   done
-  if process_is_live "$pid"; then
+  if process_is_live "$pid" "$identity"; then
     kill -KILL "$pid" 2>/dev/null || true
     fail "resource cleanup retained process $pid"
   fi
@@ -126,6 +144,8 @@ done
   fail 'concurrent pull cancellation fixture did not start'
 }
 pull_child=$(<"$pull_root/pull-child.pid")
+pull_child_identity=""
+process_identity "$pull_child" pull_child_identity || pull_child_identity=""
 kill -TERM "$pull_owner"
 set +e
 wait "$pull_owner"
@@ -133,10 +153,10 @@ pull_status=$?
 set -e
 assert_eq 143 "$pull_status" 'concurrent pull preserves TERM status'
 deadline=$((SECONDS + 5))
-while process_is_live "$pull_child" && ((SECONDS < deadline)); do
+while process_is_live "$pull_child" "$pull_child_identity" && ((SECONDS < deadline)); do
   sleep 0.01
 done
-if process_is_live "$pull_child"; then
+if process_is_live "$pull_child" "$pull_child_identity"; then
   kill -KILL "$pull_child" 2>/dev/null || true
   fail 'concurrent pull left a TERM-ignoring descendant alive'
 fi
