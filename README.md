@@ -34,12 +34,18 @@ It publishes:
 Both destinations are no-clobber. An existing regular `dot` command is
 preserved only when it is byte-identical to the generated client adapter in
 `support/client-launcher.sh`; other regular files and directories are rejected.
-The optional adapter reads a client-owned cutover lock, validates that its
-minimum standalone revision is an ancestor of the active checkout, and invokes
-a client-owned library-handoff recovery helper before dispatch. During a
-fleet migration it falls back to the retained embedded launcher; after that
+The optional adapter reads a client-owned phased cutover lock. The `prepare`
+phase always uses the retained embedded launcher while the client installs and
+validates standalone Dot. The `active` phase additionally requires a private,
+revision-keyed host-readiness directory and proves that the lock's minimum
+revision is an ancestor of the active checkout. Re-execs inherited from the
+embedded updater also stay on that launcher because its private arguments are
+not standalone API. Missing or malformed activation authority denies the
+standalone path but does not interrupt an available embedded fallback. Before
+any embedded fallback, the adapter asks the
+client-owned handoff helper to restore a recoverable legacy tree. After the
 restoration horizon it keeps the same bytes and prints the recovery installer
-when the standalone checkout is unavailable.
+when neither runtime is available.
 
 ## Runtime model
 
