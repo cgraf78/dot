@@ -425,14 +425,22 @@ DOT_TEST_ROOT=$root DOT_TEST_NORMALIZE_PROBE=$normalize_probe \
     . "$DOT_TEST_ROOT/lib/dot/resources.sh"
     . "$DOT_TEST_ROOT/lib/dot/repos/dirty.sh"
     _dot_cleanup_install_owner_traps
+    # Exercise the noninteractive owned-group path even when a developer runs
+    # this test from a terminal. The regression is monitor-mode containment,
+    # not whether this particular caller happens to have /dev/tty.
+    _dot_cleanup_has_controlling_tty() { return 1; }
     _base_repo_exists() { return 0; }
     _overlay_is_worktree() { return 0; }
     OVERLAYS=("fixture|$HOME/overlay||||git")
     _normalize_repo() {
       if [[ $1 == base ]]; then
         printf "%s\n" "$BASHPID" >"$DOT_TEST_NORMALIZE_PROBE/worker.pid"
+        printf "%s\n" "$-" >"$DOT_TEST_NORMALIZE_PROBE/worker.flags"
         (
-          trap "" TERM
+          # HUP from an exiting intermediate shell is incidental, not cleanup
+          # authority. Ignore it so this fixture proves the owned KILL
+          # escalation reaches the descendant itself.
+          trap "" HUP TERM
           printf "%s\n" "$BASHPID" >"$DOT_TEST_NORMALIZE_PROBE/child.pid"
           while :; do sleep 1; done
         ) &
@@ -446,15 +454,18 @@ DOT_TEST_ROOT=$root DOT_TEST_NORMALIZE_PROBE=$normalize_probe \
 normalize_owner=$!
 normalize_deadline=$((SECONDS + 5))
 while ((SECONDS < normalize_deadline)); do
-  [[ -s $normalize_probe/worker.pid && -s $normalize_probe/child.pid ]] && break
+  [[ -s $normalize_probe/worker.pid && -s $normalize_probe/worker.flags &&
+    -s $normalize_probe/child.pid ]] && break
   kill -0 "$normalize_owner" 2>/dev/null || break
   sleep 0.01
 done
-[[ -s $normalize_probe/worker.pid && -s $normalize_probe/child.pid ]] || {
+[[ -s $normalize_probe/worker.pid && -s $normalize_probe/worker.flags &&
+  -s $normalize_probe/child.pid ]] || {
   kill -TERM "$normalize_owner" 2>/dev/null || true
   wait "$normalize_owner" 2>/dev/null || true
   fail 'normalization cancellation fixture did not start'
 }
+normalize_worker_flags=$(<"$normalize_probe/worker.flags")
 normalize_child=$(<"$normalize_probe/child.pid")
 kill -TERM "$normalize_owner"
 set +e
@@ -471,6 +482,8 @@ if process_is_live "$normalize_child"; then
   kill -KILL "$normalize_child" 2>/dev/null || true
   fail 'normalization left a TERM-ignoring descendant alive'
 fi
+[[ $normalize_worker_flags != *m* ]] ||
+  fail 'normalization worker retained monitor mode inside its owned group'
 
 # Link publication must not follow or populate a directory that appears after
 # destination classification.
