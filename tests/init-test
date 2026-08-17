@@ -388,28 +388,88 @@ assert_eq 1 "$unsafe_symlink_status" \
 [[ ! -e $unsafe_symlink_home/bad-link && ! -L $unsafe_symlink_home/bad-link ]] ||
   fail 'unsafe symlink target was materialized'
 
-# Initialization convergence includes required Git overlays, not only link and
-# provider finalization.
+# Shared CI installs its explicit prerequisites separately from client policy.
+# The operation-scoped override must still parse the committed config and run
+# non-provider convergence, while skipping only this invocation's provider
+# stage. A later ordinary init must honor the committed provider again.
 fixture_repo init-overlay main home/.config/example/value $'overlay\n' 100644
 init_overlay_origin=$REPLY
 fixture_repo init-with-overlay main README.md $'base\n' 100644
 init_overlay_base_origin=$REPLY
 mkdir -p "$DOT_TEST_TMP/init-with-overlay-seed/.config/dot/overlays.d"
+printf 'version=1\ndependency_provider=shdeps\n' \
+  >"$DOT_TEST_TMP/init-with-overlay-seed/.config/dot/config"
 printf 'url=file://%s\n' "$init_overlay_origin" \
   >"$DOT_TEST_TMP/init-with-overlay-seed/.config/dot/overlays.d/10-alpha.conf"
-git -C "$DOT_TEST_TMP/init-with-overlay-seed" add .config/dot/overlays.d/10-alpha.conf
+git -C "$DOT_TEST_TMP/init-with-overlay-seed" add \
+  .config/dot/config .config/dot/overlays.d/10-alpha.conf
 git -C "$DOT_TEST_TMP/init-with-overlay-seed" -c core.hooksPath=/dev/null \
   commit -qm overlay-config
 git -C "$DOT_TEST_TMP/init-with-overlay-seed" push -q \
   "$init_overlay_base_origin" HEAD:main
+
+fixture_home init-skip-provider-invalid
+init_skip_invalid_home=$REPLY
+init_skip_invalid_state=$DOT_TEST_TMP/init-skip-provider-invalid-state
+set +e
+DOT_INIT_SKIP_PROVIDER=invalid \
+  run_dot "$init_skip_invalid_home" "$init_skip_invalid_state" init --yes \
+  "file://$init_overlay_base_origin" >/dev/null 2>&1
+init_skip_invalid_status=$?
+set -e
+assert_eq 2 "$init_skip_invalid_status" \
+  'invalid provider suppression value is rejected'
+[[ ! -e $init_skip_invalid_home/.dotfiles &&
+  ! -L $init_skip_invalid_home/.dotfiles ]] ||
+  fail 'invalid provider suppression value mutated client Git state'
+[[ ! -e $init_skip_invalid_state/dot/init &&
+  ! -L $init_skip_invalid_state/dot/init ]] ||
+  fail 'invalid provider suppression value mutated initialization state'
+
 fixture_home init-with-overlay
 init_overlay_home=$REPLY
-run_dot "$init_overlay_home" "$DOT_TEST_TMP/init-with-overlay-state" init --yes \
-  "file://$init_overlay_base_origin" >/dev/null
+init_overlay_state=$DOT_TEST_TMP/init-with-overlay-state
+init_skip_bin=$DOT_TEST_TMP/init-skip-provider-bin
+init_skip_marker=$DOT_TEST_TMP/init-skip-provider-curl
+init_skip_plan=$DOT_TEST_TMP/init-skip-provider-plan
+mkdir -p "$init_skip_bin"
+cat >"$init_skip_bin/curl" <<'CURL'
+#!/usr/bin/env bash
+set -u
+printf 'called\n' >"${DOT_TEST_PROVIDER_CURL_MARKER:?}"
+exit 86
+CURL
+chmod 0755 "$init_skip_bin/curl"
+PATH="$init_skip_bin:$PATH" DOT_INIT_SKIP_PROVIDER=1 \
+  DOT_TEST_PROVIDER_CURL_MARKER=$init_skip_marker \
+  run_dot "$init_overlay_home" "$init_overlay_state" init --yes \
+  "file://$init_overlay_base_origin" >/dev/null 2>"$init_skip_plan"
+[[ ! -e $init_skip_marker ]] ||
+  fail 'provider-suppressed init attempted provider bootstrap'
+assert_contains 'dependency provider: shdeps (skipped for this invocation)' \
+  "$(<"$init_skip_plan")" \
+  'provider-suppressed init plan describes the invocation override'
+assert_contains 'phase=complete' \
+  "$(<"$init_overlay_state/dot/init/completed")" \
+  'provider-suppressed init completed its durable transaction'
+assert_eq $'version=1\ndependency_provider=shdeps' \
+  "$(<"$init_overlay_home/.config/dot/config")" \
+  'provider suppression did not rewrite committed config'
 [[ -d $init_overlay_home/.dotfiles-alpha/.git ]] ||
-  fail 'init convergence did not clone required Git overlay'
+  fail 'provider-suppressed init did not clone required Git overlay'
 [[ -L $init_overlay_home/.config/example/value ]] ||
-  fail 'init convergence did not link required Git overlay'
+  fail 'provider-suppressed init did not link required Git overlay'
+
+set +e
+PATH="$init_skip_bin:$PATH" DOT_TEST_PROVIDER_CURL_MARKER=$init_skip_marker \
+  run_dot "$init_overlay_home" "$init_overlay_state" init --yes \
+  "file://$init_overlay_base_origin" >/dev/null 2>&1
+init_skip_ordinary_status=$?
+set -e
+assert_eq 1 "$init_skip_ordinary_status" \
+  'ordinary init restored the committed dependency provider'
+assert_eq called "$(<"$init_skip_marker")" \
+  'ordinary init attempted provider bootstrap'
 
 fixture_repo ordinary main .testrc $'ordinary\n' 100644
 ordinary_origin=$REPLY
