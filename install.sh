@@ -1136,6 +1136,9 @@ _checkout_bash_v1_probe() {
 
   _checkout_bash_v1_normalized_absolute "$candidate" || return 1
   [[ -f "$candidate" && -x "$candidate" ]] || return 1
+  # Probe the interpreter itself, not caller-selected noninteractive startup
+  # policy. In particular, never execute BASH_ENV or ENV merely while deciding
+  # whether this candidate is suitable.
   # shellcheck disable=SC2016 # Expanded only by the candidate interpreter.
   output=$(BASH_ENV='' ENV='' "$candidate" --noprofile --norc -c \
     'printf "cgraf78-checkout-bash-v1:%s\n" "${BASH_VERSINFO[0]-}"' \
@@ -1937,6 +1940,9 @@ checkout_bash_v1_bind() {
       development_validation_error="tracked path is not a live regular file: $relative"
       return 1
     fi
+    # This proves repository ownership and path type, not byte equality.
+    # Development mode intentionally executes tracked live edits, including
+    # dirty or staged delegate changes.
     entry=$(development_git -C "$candidate" ls-tree HEAD -- \
       "$relative" 2>/dev/null) || {
       development_validation_error="cannot inspect tracked path at HEAD: $relative"
@@ -2018,6 +2024,9 @@ checkout_bash_v1_bind() {
     local link=$1 expected=$2 encoded actual
 
     [[ -L "$link" ]] || return 1
+    # Command substitution strips trailing newlines. Append a non-newline
+    # sentinel so readlink's terminator remains observable and a newline-bearing
+    # target cannot normalize to the expected path.
     encoded=$({ readlink "$link" && printf '\034'; }) || return 1
     case $encoded in
       *$'\034') encoded=${encoded%$'\034'} ;;

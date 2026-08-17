@@ -29,6 +29,9 @@ _checkout_bash_v1_probe() {
 
   _checkout_bash_v1_normalized_absolute "$candidate" || return 1
   [[ -f "$candidate" && -x "$candidate" ]] || return 1
+  # Probe the interpreter itself, not caller-selected noninteractive startup
+  # policy. In particular, never execute BASH_ENV or ENV merely while deciding
+  # whether this candidate is suitable.
   # shellcheck disable=SC2016 # Expanded only by the candidate interpreter.
   output=$(BASH_ENV='' ENV='' "$candidate" --noprofile --norc -c \
     'printf "cgraf78-checkout-bash-v1:%s\n" "${BASH_VERSINFO[0]-}"' \
