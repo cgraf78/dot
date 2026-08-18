@@ -15,12 +15,14 @@ _DOT_REPOS_DIR="${BASH_SOURCE[0]%/*}"
 
 # Source order matters:
 # - config/git define repo policy and bare-vs-overlay dispatch primitives.
+# - extension-modes canonicalizes only tracked executable-authority surfaces.
 # - dirty is needed by pull and simple commands before they touch repo state.
 # - pull defines progress helpers shared by overlay linking.
 # - overlays defines skip-worktree restoration used by pull at runtime.
 # - commands is last because it is the public simple-command surface.
 . "$_DOT_REPOS_DIR/config.sh"
 . "$_DOT_REPOS_DIR/git.sh"
+. "$_DOT_REPOS_DIR/extension-modes.sh"
 . "$_DOT_REPOS_DIR/dirty.sh"
 . "$_DOT_REPOS_DIR/pull.sh"
 . "$_DOT_REPOS_DIR/overlays.sh"
