@@ -22,6 +22,24 @@ if [[ -r /proc/$$/stat ]]; then
   export -f ps
 fi
 
+# A re-exec remains in the same process. It must keep the first ownership
+# token instead of racing itself through the stale-lock recovery path.
+reentry_output=$(HOME=$home XDG_STATE_HOME=$state DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/constants.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/update-lock.sh"
+    _dot_update_lock_acquire
+    first=$DOT_UPDATE_LOCK_TOKEN
+    _dot_update_lock_acquire --cron
+    printf "%s/%s\n" "$first" "$DOT_UPDATE_LOCK_TOKEN"
+  ')
+assert_eq "${reentry_output%%/*}/${reentry_output%%/*}" "$reentry_output" \
+  'same-process lock reentry retains its owner token'
+[[ ! -e $state/dot/update.lock.d ]] ||
+  fail 'reentered lock was not released on process exit'
+
 HOME=$home XDG_STATE_HOME=$state DOT_SOURCE_ROOT=$DOT_TEST_ROOT \
   bash -c '
     set -euo pipefail
@@ -65,5 +83,57 @@ assert_contains 'initialization: not started' "$status_output" \
 wait "$holder"
 run_dot "$home" "$state" update >/dev/null
 [[ ! -e $state/dot/update.lock.d ]] || fail 'operation lock was not released'
+
+# SIGKILL bypasses the owner's EXIT trap. The next process must validate that
+# exact recorded generation as dead, reclaim it, and release its new claim.
+rm -f -- "$ready" "$release"
+HOME=$home XDG_STATE_HOME=$state DOT_SOURCE_ROOT=$DOT_TEST_ROOT \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/constants.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/update-lock.sh"
+    _dot_update_lock_acquire
+    : >"$1"
+    while :; do sleep 1; done
+  ' -- "$ready" &
+holder=$!
+remaining=1000
+while [[ ! -e $ready && $remaining -gt 0 ]]; do
+  kill -0 "$holder" 2>/dev/null || fail 'SIGKILL lock holder exited before readiness'
+  sleep 0.01
+  remaining=$((remaining - 1))
+done
+[[ -e $ready ]] || fail 'SIGKILL lock holder did not become ready'
+kill -KILL "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+[[ -d $state/dot/update.lock.d ]] || fail 'SIGKILL did not leave recoverable lock state'
+reclaimed=$(HOME=$home XDG_STATE_HOME=$state DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/constants.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/update-lock.sh"
+    _dot_update_lock_acquire
+    printf "reclaimed\n"
+  ')
+assert_eq reclaimed "$reclaimed" 'stale SIGKILL owner is reclaimed'
+[[ ! -e $state/dot/update.lock.d ]] || fail 'reclaimed lock was not released'
+
+# A crash can happen after mkdir and before the owner record is published.
+# Once its initialization grace has elapsed, that empty lock is recoverable.
+mkdir -p "$state/dot/update.lock.d"
+touch -t 200001010000 "$state/dot/update.lock.d"
+reclaimed=$(HOME=$home XDG_STATE_HOME=$state DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/constants.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/update-lock.sh"
+    _dot_update_lock_acquire
+    printf "reclaimed-empty\n"
+  ')
+assert_eq reclaimed-empty "$reclaimed" 'abandoned empty lock is reclaimed'
+[[ ! -e $state/dot/update.lock.d ]] || fail 'abandoned empty lock was not released'
 
 printf 'update-lock-test: ok\n'
