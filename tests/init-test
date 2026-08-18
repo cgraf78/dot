@@ -8,6 +8,17 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=lib/repo.sh
 . "$root/tests/lib/repo.sh"
 
+mode_of() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+assert_not_group_other_writable() {
+  local path=$1 label=$2 mode
+  mode=$(mode_of "$path") || fail "$label: cannot read mode"
+  (((8#$mode & 022) == 0)) ||
+    fail "$label: group/other writable mode [$mode]"
+}
+
 fixture_repo nonmain trunk .testrc $'hello\n' 100644
 origin=$REPLY
 fixture_home nonmain
@@ -481,6 +492,105 @@ assert_eq 1 "$unsafe_symlink_status" \
   fail 'unsafe symlink target created client Git state'
 [[ ! -e $unsafe_symlink_home/bad-link && ! -L $unsafe_symlink_home/bad-link ]] ||
   fail 'unsafe symlink target was materialized'
+
+# Extension entry points are executable authority. Publish their tracked files
+# and directory chain with canonical non-writable modes even when the caller's
+# cooperative umask would make an ordinary Git checkout group-writable.
+fixture_repo trusted-modes main \
+  .config/dot/config \
+  $'version=1\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' \
+  100644 \
+  .local/lib/dotfiles/merge-hooks.d/mode.serial.sh \
+  $'merge() { printf "clean\\n" >"$HOME/.trusted-mode-hook"; }\n' \
+  100644
+trusted_modes_origin=$REPLY
+fixture_home trusted-modes-clean
+trusted_modes_clean_home=$REPLY
+trusted_modes_clean_state=$DOT_TEST_TMP/trusted-modes-clean-state
+(
+  umask 0002
+  run_dot "$trusted_modes_clean_home" "$trusted_modes_clean_state" init --yes \
+    "file://$trusted_modes_origin" >/dev/null
+)
+assert_not_group_other_writable \
+  "$trusted_modes_clean_home/.local/lib/dotfiles" \
+  'clean init publishes a trusted extension root'
+assert_not_group_other_writable \
+  "$trusted_modes_clean_home/.local/lib/dotfiles/merge-hooks.d" \
+  'clean init publishes a trusted extension directory'
+assert_eq 644 \
+  "$(mode_of "$trusted_modes_clean_home/.local/lib/dotfiles/merge-hooks.d/mode.serial.sh")" \
+  'clean init publishes the extension file with canonical mode'
+assert_eq clean "$(<"$trusted_modes_clean_home/.trusted-mode-hook")" \
+  'clean init executes the trusted extension'
+
+# Clamping a cooperative umask must not broaden a caller's stricter policy.
+# Init's direct blob publication follows the retained mask just like Git does.
+fixture_home trusted-modes-private
+trusted_modes_private_home=$REPLY
+trusted_modes_private_state=$DOT_TEST_TMP/trusted-modes-private-state
+(
+  umask 0077
+  run_dot "$trusted_modes_private_home" "$trusted_modes_private_state" init --yes \
+    "file://$trusted_modes_origin" >/dev/null
+)
+assert_eq 700 "$(mode_of "$trusted_modes_private_home/.local/lib/dotfiles")" \
+  'clean init retains a private extension root'
+assert_eq 600 \
+  "$(mode_of "$trusted_modes_private_home/.local/lib/dotfiles/merge-hooks.d/mode.serial.sh")" \
+  'clean init retains a private extension file'
+
+# Git overlays are cloned by Dot and therefore must receive the same canonical
+# trusted modes instead of inheriting 0775/0664 from the caller's umask.
+fixture_repo trusted-overlay main \
+  home/.local/lib/dotfiles/merge-hooks.d/overlay.serial.sh \
+  $'merge() { printf "overlay\\n" >"$HOME/.trusted-overlay-hook"; }\n' \
+  100644
+trusted_overlay_origin=$REPLY
+fixture_repo trusted-overlay-base main README.md $'base\n' 100644
+trusted_overlay_base_origin=$REPLY
+mkdir -p "$DOT_TEST_TMP/trusted-overlay-base-seed/.config/dot/overlays.d"
+# shellcheck disable=SC2016 # The config intentionally retains the HOME token.
+printf 'version=1\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' \
+  >"$DOT_TEST_TMP/trusted-overlay-base-seed/.config/dot/config"
+printf 'url=file://%s\n' "$trusted_overlay_origin" \
+  >"$DOT_TEST_TMP/trusted-overlay-base-seed/.config/dot/overlays.d/10-trusted.conf"
+git -C "$DOT_TEST_TMP/trusted-overlay-base-seed" add \
+  .config/dot/config .config/dot/overlays.d/10-trusted.conf
+git -C "$DOT_TEST_TMP/trusted-overlay-base-seed" -c core.hooksPath=/dev/null \
+  commit -qm trusted-overlay
+git -C "$DOT_TEST_TMP/trusted-overlay-base-seed" push -q \
+  "$trusted_overlay_base_origin" HEAD:main
+fixture_home trusted-overlay
+trusted_overlay_home=$REPLY
+trusted_overlay_state=$DOT_TEST_TMP/trusted-overlay-state
+trusted_overlay_log=$DOT_TEST_TMP/trusted-overlay.log
+set +e
+(
+  umask 0002
+  run_dot "$trusted_overlay_home" "$trusted_overlay_state" init --yes \
+    "file://$trusted_overlay_base_origin" >"$trusted_overlay_log" 2>&1
+)
+trusted_overlay_status=$?
+set -e
+if [[ $trusted_overlay_status -ne 0 ]]; then
+  sed -n '1,160p' "$trusted_overlay_log" >&2
+fi
+assert_eq 0 "$trusted_overlay_status" \
+  'init canonicalizes a Git overlay cloned under umask 0002'
+assert_eq 755 \
+  "$(mode_of "$trusted_overlay_home/.dotfiles-trusted/home/.local/lib/dotfiles")" \
+  'overlay extension root has canonical mode'
+assert_eq 755 \
+  "$(mode_of "$trusted_overlay_home/.dotfiles-trusted/home/.local/lib/dotfiles/merge-hooks.d")" \
+  'overlay extension directory has canonical mode'
+assert_eq 644 \
+  "$(mode_of "$trusted_overlay_home/.dotfiles-trusted/home/.local/lib/dotfiles/merge-hooks.d/overlay.serial.sh")" \
+  'overlay extension file has canonical mode'
+assert_eq 755 "$(mode_of "$trusted_overlay_home/.local/lib/dotfiles")" \
+  'linked extension root has canonical mode'
+assert_eq overlay "$(<"$trusted_overlay_home/.trusted-overlay-hook")" \
+  'canonical overlay extension executes'
 
 # Shared CI installs its explicit prerequisites separately from client policy.
 # The operation-scoped override must still parse the committed config and run

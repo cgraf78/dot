@@ -5,6 +5,11 @@
 set -euo pipefail
 CDPATH=
 
+# Git and init publication honor the process umask when materializing tracked
+# worktree paths. Extension entry points must never become group/other writable,
+# but retain a stricter caller policy such as 0077 instead of replacing it.
+umask g-w,o-w
+
 # BASHOPTS may be exported by the caller. Strict command and config tokens are
 # byte-sensitive interfaces, so an inherited interactive convenience option
 # must not make their case matching permissive.
