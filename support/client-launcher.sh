@@ -71,6 +71,7 @@ dot_client_config_path() {
 
 dot_client_resolve_checkout() {
   local install_home=${SHDEPS_INSTALL_DIR:-$HOME/.local/share}
+  local dev_home dev_checkout dev_physical
 
   while [[ $install_home != / && $install_home == */ ]]; do
     install_home=${install_home%/}
@@ -79,10 +80,30 @@ dot_client_resolve_checkout() {
     '' | *//* | */./* | */. | */../* | */.. | *$'\n'* | *$'\r'*)
       return 1
       ;;
-    /) DOT_CLIENT_CHECKOUT=/cgraf78/dot ;;
-    /*) DOT_CLIENT_CHECKOUT=$install_home/cgraf78/dot ;;
+    /) DOT_CLIENT_INSTALL_CHECKOUT=/cgraf78/dot ;;
+    /*) DOT_CLIENT_INSTALL_CHECKOUT=$install_home/cgraf78/dot ;;
     *) return 1 ;;
   esac
+  DOT_CLIENT_CHECKOUT=$DOT_CLIENT_INSTALL_CHECKOUT
+  if [[ -L $DOT_CLIENT_INSTALL_CHECKOUT ]]; then
+    dev_home=${SHDEPS_GIT_DEV_DIR:-$HOME/git}
+    while [[ $dev_home != / && $dev_home == */ ]]; do
+      dev_home=${dev_home%/}
+    done
+    case $dev_home in
+      /) dev_checkout=/dot ;;
+      /*) dev_checkout=$dev_home/dot ;;
+      *) return 1 ;;
+    esac
+    dot_client_normalized_absolute "$dev_checkout" || return 1
+    [[ -d $dev_checkout && $DOT_CLIENT_INSTALL_CHECKOUT -ef $dev_checkout ]] ||
+      return 1
+    DOT_CLIENT_CHECKOUT=$(cd -P -- "$DOT_CLIENT_INSTALL_CHECKOUT" 2>/dev/null &&
+      pwd -P) || return 1
+    dev_physical=$(cd -P -- "$dev_checkout" 2>/dev/null && pwd -P) || return 1
+    [[ $DOT_CLIENT_CHECKOUT == "$dev_physical" ]] || return 1
+    dot_client_normalized_absolute "$DOT_CLIENT_CHECKOUT" || return 1
+  fi
   DOT_CLIENT_RUNTIME=$DOT_CLIENT_CHECKOUT/bin/dot
 }
 
@@ -370,7 +391,8 @@ dot_client_standalone_ready() {
   dot_client_checkout_authorized "$checkout" "$launcher" || return 1
   dot_client_config_path || return 1
   dot_client_read_ready "$ready" || return 1
-  dot_client_exact_link "$HOME/.local/lib/dot" "$checkout/lib/dot/public"
+  dot_client_exact_link \
+    "$HOME/.local/lib/dot" "$DOT_CLIENT_INSTALL_CHECKOUT/lib/dot/public"
 }
 
 client_validation_mode=0

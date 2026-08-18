@@ -6,7 +6,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == 99e3bbeabc1a44d30447f3f591bf459bd62a395f ]] ||
+[[ $(git hash-object "$launcher") == 97c3115ac834aa633d418d0e467e737afe54ec74 ]] ||
   fail 'client launcher v4 changed in place; update its migration fixture deliberately'
 
 head_tree_complete=0
@@ -245,10 +245,26 @@ git --git-dir="$checkout/.git" config core.worktree "$foreign_worktree"
 assert_internal_validation_rejected 'mismatched checkout top'
 git --git-dir="$checkout/.git" config --unset-all core.worktree
 
+dev_root=$DOT_TEST_TMP/dev-clones
+dev_checkout=$dev_root/dot
+mkdir -p "$dev_root"
+mv "$checkout" "$dev_checkout"
+ln -s "$dev_checkout" "$checkout"
+rm -f -- "$validation_out" "$validation_err"
+SHDEPS_GIT_DEV_DIR=$dev_root run_internal_validation ||
+  fail 'client checkout validation rejected the selected Shdeps local clone'
+assert_eq '' "$(<"$validation_out")" \
+  'local-clone checkout validation keeps stdout silent'
+assert_eq '' "$(<"$validation_err")" \
+  'local-clone checkout validation keeps stderr silent'
+rm -f -- "$checkout"
+mv "$dev_checkout" "$checkout"
+
 checkout_real=$checkout-real
 mv "$checkout" "$checkout_real"
-ln -s "${checkout_real##*/}" "$checkout"
-assert_internal_validation_rejected 'symlinked managed checkout'
+ln -s "$checkout_real" "$checkout"
+SHDEPS_GIT_DEV_DIR=$dev_root \
+  assert_internal_validation_rejected 'foreign symlinked managed checkout'
 rm -f -- "$checkout"
 mv "$checkout_real" "$checkout"
 
@@ -519,6 +535,22 @@ DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
 assert_eq $'legacy\nfront-door='"$launcher"$'\nunready' "$(<"$log")" \
   'client launcher requires private host readiness'
 write_ready "$minimum_revision"
+
+# github:repo deliberately publishes an exact symlink to the selected local
+# development checkout. The same validated tree must remain usable after the
+# fleet phase activates without broadening acceptance to arbitrary symlinks.
+mv "$checkout" "$dev_checkout"
+ln -s "$dev_checkout" "$checkout"
+rm -f -- "$log" "$helper_log"
+SHDEPS_GIT_DEV_DIR=$dev_root DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR=$install_home \
+  "$launcher" local-clone-active
+assert_eq $'standalone\nlocal-clone-active' "$(<"$log")" \
+  'client launcher accepts the selected Shdeps local clone after activation'
+rm -f -- "$checkout"
+mv "$dev_checkout" "$checkout"
 
 chmod 0644 "$ready"
 rm -f -- "$log" "$helper_log"
