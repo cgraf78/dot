@@ -6,15 +6,16 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == eac6f06a18d6716e420b4a69f2f0a7c1e437b93e ]] ||
-  fail 'client launcher v2 changed in place; update its migration fixture deliberately'
+[[ $(git hash-object "$launcher") == fda0f1464d7fe2c636ba442e4e5eac5ff6284772 ]] ||
+  fail 'client launcher v3 changed in place; update its migration fixture deliberately'
 install_home=$DOT_TEST_TMP/install
 checkout=$install_home/cgraf78/dot
 runtime=$checkout/bin/dot
 lock=$DOT_TEST_TMP/dot-cutover.lock
 helper=$DOT_TEST_TMP/dot-library-handoff.sh
 legacy=$DOT_TEST_TMP/legacy-dot-launcher.sh
-ready=$DOT_TEST_TMP/client-ready-v2
+readiness_generation=client-topology-v1
+ready=$DOT_TEST_TMP/client-ready-v3
 log=$DOT_TEST_TMP/launcher.log
 helper_log=$DOT_TEST_TMP/helper.log
 
@@ -33,10 +34,10 @@ git -C "$checkout" add bin/dot support/client-launcher.sh
 git -c core.hooksPath= -C "$checkout" commit --quiet -m fixture
 minimum_revision=$(git -C "$checkout" rev-parse HEAD)
 write_lock() {
-  local phase=$1 revision=$2
+  local phase=$1 revision=$2 generation=${3:-$readiness_generation}
 
-  printf 'cgraf78 dot client cutover v2\nphase=%s\nminimum_revision=%s\n' \
-    "$phase" "$revision" >"$lock"
+  printf 'cgraf78 dot client cutover v3\nphase=%s\nminimum_revision=%s\nreadiness_generation=%s\n' \
+    "$phase" "$revision" "$generation" >"$lock"
 }
 
 write_lock active "$minimum_revision"
@@ -51,7 +52,7 @@ write_ready "$minimum_revision"
 export DOT_CLIENT_READY=$ready
 
 relative_home=$DOT_TEST_TMP/relative-state-home
-relative_ready=$relative_home/.local/state/dot/client-ready-v2/$minimum_revision
+relative_ready=$relative_home/.local/state/dot/client-ready-v3/$readiness_generation/$minimum_revision
 mkdir -p "$relative_ready"
 chmod 0700 "$relative_ready"
 rm -f -- "$log" "$helper_log"
@@ -216,8 +217,26 @@ assert_eq restore "$(<"$helper_log")" \
   'client launcher restores the library before embedded fallback'
 export DOT_CLIENT_READY=$ready
 
-printf 'cgraf78 dot client cutover v2\nphase=unknown\nminimum_revision=%s\n' \
-  "$minimum_revision" >"$lock"
+generation_home=$DOT_TEST_TMP/generation-state-home
+stale_generation_ready=$generation_home/.local/state/dot/client-ready-v3/old-topology/$minimum_revision
+mkdir -p "$stale_generation_ready"
+chmod 0700 "$stale_generation_ready"
+write_lock active "$minimum_revision" "$readiness_generation"
+rm -f -- "$log" "$helper_log"
+env -u DOT_CLIENT_READY \
+  HOME="$generation_home" \
+  DOT_CLIENT_LAUNCHER_TEST_LOG="$log" \
+  DOT_CLIENT_CUTOVER_LOCK="$lock" \
+  DOT_CLIENT_HANDOFF_HELPER="$helper" \
+  DOT_CLIENT_HANDOFF_TEST_LOG="$helper_log" \
+  DOT_CLIENT_LEGACY_LAUNCHER="$legacy" \
+  SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" stale-readiness-generation
+assert_eq $'legacy\nfront-door='"$launcher"$'\nstale-readiness-generation' \
+  "$(<"$log")" 'client launcher requires the selected readiness generation'
+
+printf 'cgraf78 dot client cutover v3\nphase=unknown\nminimum_revision=%s\nreadiness_generation=%s\n' \
+  "$minimum_revision" "$readiness_generation" >"$lock"
 rm -f -- "$log" "$helper_log"
 DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
@@ -226,6 +245,53 @@ DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   "$launcher" malformed-lock
 assert_eq $'legacy\nfront-door='"$launcher"$'\nmalformed-lock' "$(<"$log")" \
   'client launcher treats malformed activation authority as legacy-only'
+
+write_lock active "$minimum_revision" '../foreign'
+rm -f -- "$log" "$helper_log"
+DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" malformed-generation
+assert_eq $'legacy\nfront-door='"$launcher"$'\nmalformed-generation' "$(<"$log")" \
+  'client launcher rejects an unsafe readiness generation'
+
+# Some UTF-8 collation tables let a fullwidth digit match `[0-9]`. Cutover
+# authority is ASCII regardless of the invoking host's locale.
+utf8_locale=$(locale -a 2>/dev/null |
+  awk 'tolower($0) ~ /^en_us.*utf/ && !found { value = $0; found = 1 }
+    END { if (found) print value }') || utf8_locale=
+if [[ -n $utf8_locale ]]; then
+  unicode_home=$DOT_TEST_TMP/unicode-generation-home
+  unicode_generation='client-topology-v１'
+  unicode_ready=$unicode_home/.local/state/dot/client-ready-v3/$unicode_generation/$minimum_revision
+  mkdir -p "$unicode_ready"
+  chmod 0700 "$unicode_ready"
+  write_lock active "$minimum_revision" "$unicode_generation"
+  rm -f -- "$log" "$helper_log"
+  env -u DOT_CLIENT_READY \
+    LC_ALL="$utf8_locale" HOME="$unicode_home" \
+    DOT_CLIENT_LAUNCHER_TEST_LOG="$log" \
+    DOT_CLIENT_CUTOVER_LOCK="$lock" \
+    DOT_CLIENT_HANDOFF_HELPER="$helper" \
+    DOT_CLIENT_HANDOFF_TEST_LOG="$helper_log" \
+    DOT_CLIENT_LEGACY_LAUNCHER="$legacy" \
+    SHDEPS_INSTALL_DIR="$install_home" \
+    "$launcher" unicode-generation
+  assert_eq $'legacy\nfront-door='"$launcher"$'\nunicode-generation' \
+    "$(<"$log")" 'client launcher keeps generation syntax ASCII'
+fi
+
+printf 'cgraf78 dot client cutover v3\nphase=ACTIVE\nminimum_revision=%s\nreadiness_generation=%s\n' \
+  "$minimum_revision" "$readiness_generation" >"$lock"
+rm -f -- "$log" "$helper_log"
+DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR="$install_home" \
+  bash -O nocasematch "$launcher" inherited-nocasematch
+assert_eq $'legacy\nfront-door='"$launcher"$'\ninherited-nocasematch' "$(<"$log")" \
+  'client launcher keeps cutover tokens case-sensitive'
 
 # A lock whose required revision is not an ancestor of the checkout cannot
 # authorize cutover. Preserve command continuity through the embedded engine.
@@ -284,8 +350,8 @@ assert_contains 'curl -fsSL https://raw.githubusercontent.com/cgraf78/dot/main/i
   "$(<"$DOT_TEST_TMP/recovery.err")" \
   'client launcher recovery command'
 
-printf 'cgraf78 dot client cutover v2\nphase=unknown\nminimum_revision=%s\n' \
-  "$minimum_revision" >"$lock"
+printf 'cgraf78 dot client cutover v3\nphase=unknown\nminimum_revision=%s\nreadiness_generation=%s\n' \
+  "$minimum_revision" "$readiness_generation" >"$lock"
 if DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
   DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
   DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR="$install_home" \

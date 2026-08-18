@@ -6,6 +6,7 @@
 
 set -euo pipefail
 CDPATH=
+shopt -u nocasematch 2>/dev/null || true
 
 dot_client_error() {
   printf 'dot: %s\n' "$*" >&2
@@ -70,7 +71,8 @@ dot_client_resolve_checkout() {
 }
 
 dot_client_read_lock() {
-  local lock=$1 size header phase_line revision_line extra=''
+  local LC_ALL=C
+  local lock=$1 size header phase_line revision_line generation_line extra=''
 
   [[ -f "$lock" && ! -L "$lock" ]] || return 1
   size=$(wc -c <"$lock" 2>/dev/null) || return 2
@@ -83,13 +85,15 @@ dot_client_read_lock() {
     IFS= read -r header || return 2
     IFS= read -r phase_line || return 2
     IFS= read -r revision_line || return 2
+    IFS= read -r generation_line || return 2
     if IFS= read -r extra || [[ -n $extra ]]; then
       return 2
     fi
   } <"$lock"
-  [[ $header == 'cgraf78 dot client cutover v2' &&
+  [[ $header == 'cgraf78 dot client cutover v3' &&
     $phase_line == phase=* &&
-    $revision_line == minimum_revision=* ]] || return 2
+    $revision_line == minimum_revision=* &&
+    $generation_line == readiness_generation=* ]] || return 2
   DOT_CLIENT_PHASE=${phase_line#phase=}
   case $DOT_CLIENT_PHASE in
     prepare | active) ;;
@@ -97,6 +101,8 @@ dot_client_read_lock() {
   esac
   DOT_CLIENT_MINIMUM_REVISION=${revision_line#minimum_revision=}
   [[ $DOT_CLIENT_MINIMUM_REVISION =~ ^[0-9a-f]{40}$ ]] || return 2
+  DOT_CLIENT_READINESS_GENERATION=${generation_line#readiness_generation=}
+  [[ $DOT_CLIENT_READINESS_GENERATION =~ ^[0-9a-z][0-9a-z-]{0,63}$ ]] || return 2
 }
 
 dot_client_git() (
@@ -194,10 +200,12 @@ if [[ $standalone_status -eq 0 && $DOT_CLIENT_PHASE == active &&
       standalone_status=1
     fi
   elif dot_client_state_home; then
+    # The symbolic generation lets a client invalidate obsolete convergence
+    # proofs when its topology changes without inventing a second runtime pin.
     if [[ $DOT_CLIENT_STATE_HOME == / ]]; then
-      ready=/dot/client-ready-v2/$DOT_CLIENT_MINIMUM_REVISION
+      ready=/dot/client-ready-v3/$DOT_CLIENT_READINESS_GENERATION/$DOT_CLIENT_MINIMUM_REVISION
     else
-      ready=$DOT_CLIENT_STATE_HOME/dot/client-ready-v2/$DOT_CLIENT_MINIMUM_REVISION
+      ready=$DOT_CLIENT_STATE_HOME/dot/client-ready-v3/$DOT_CLIENT_READINESS_GENERATION/$DOT_CLIENT_MINIMUM_REVISION
     fi
   else
     standalone_status=1
