@@ -1,6 +1,15 @@
 # shellcheck shell=bash
 # Dynamic control-plane paths that client repositories and overlays may not own.
 
+_dot_client_launcher_templates() {
+  # Temporary fleet bridge. Candidate validation accepts only exact bytes from
+  # these two release-owned files; remove v4 after every client has crossed to
+  # the permanent launcher.
+  printf '%s\n' \
+    "$DOT_SOURCE_ROOT/support/client-launcher.sh" \
+    "$DOT_SOURCE_ROOT/support/client-launcher-v4.sh"
+}
+
 _dot_path_within() {
   [[ "$1" == "$2" || "$1" == "$2"/* ]]
 }

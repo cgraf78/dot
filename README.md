@@ -31,25 +31,17 @@ It publishes:
 - `~/.local/bin/dot` -> `<checkout>/bin/dot`
 - `~/.local/lib/dot` -> `<checkout>/lib/dot/public`
 
-Both destinations are no-clobber. An existing regular `dot` command is
-preserved only when it is byte-identical to the generated client adapter in
-`support/client-launcher.sh`; other regular files and directories are rejected.
-The optional adapter reads a client-owned phased cutover lock. The `prepare`
-phase always uses the retained embedded launcher while the client installs and
-validates standalone Dot. The `active` phase additionally requires a private,
-generation- and revision-keyed host-readiness record and proves that the
-lock's minimum revision is an ancestor of the active checkout. The record binds
-the exact config path and bytes, and the adapter requires the public library to
-target that same checkout. The symbolic generation lets a client invalidate
-old topology proofs without duplicating or changing the reviewed runtime
-commit floor. Re-execs inherited from the
-embedded updater also stay on that launcher because its private arguments are
-not standalone API. Missing or malformed activation authority denies the
-standalone path but does not interrupt an available embedded fallback. Before
-any embedded fallback, the adapter asks the
-client-owned handoff helper to restore a recoverable legacy tree. After the
-restoration horizon it keeps the same bytes and prints the recovery installer
-when neither runtime is available.
+Both destinations are no-clobber. A client repository may retain a regular
+`~/.local/bin/dot` only when it is byte-identical to the generated permanent
+front door in `support/client-launcher.sh`. That front door derives the same
+official install root, requires `~/.local/lib/dot` to resolve to that checkout's
+public library, and then executes its standalone runtime without sourcing
+client or checkout code itself. Missing topology reports the reinstall command.
+
+`support/client-launcher-v4.sh` remains an exact second exception only for the
+bounded fleet transition from the phased cutover adapter. It and its candidate
+acceptance branch are removed after every client carries the permanent front
+door. Other regular files and directories are rejected throughout.
 
 ## Runtime model
 
