@@ -73,6 +73,21 @@ _dot_init_select_host_git() {
   return 1
 }
 
+_dot_init_bind_host_git() {
+  local host_git
+
+  _dot_init_select_host_git ||
+    _dot_init_error 'host Git is unavailable outside HOME and the Dot checkout' ||
+    return
+  host_git=$REPLY
+  if declare -F git >/dev/null 2>&1; then
+    _dot_init_error 'a shell function named git cannot be used during initialization'
+    return 1
+  fi
+  set -h
+  hash -p "$host_git" git
+}
+
 _dot_init_repo_identity() {
   local url=$1 rest host path userinfo
 
@@ -1771,7 +1786,7 @@ _dot_init_resume_transaction() {
   rm -rf -- "$transaction"
 }
 
-_dot_init_command() {
+dot_init_command() {
   local branch='' yes=false mode=run origin='' identity transaction record
   local state_root candidate tree prior conflicts backup completed commit
 
@@ -1937,26 +1952,4 @@ _dot_init_command() {
   record=$transaction/record
   rm -rf "$candidate"
   _dot_init_resume_transaction "$transaction" "$record"
-}
-
-dot_init_command() {
-  local host_git previous_git='' status=0 hashall_was_set=0
-
-  _dot_init_select_host_git ||
-    _dot_init_error 'host Git is unavailable outside HOME and the Dot checkout' ||
-    return
-  host_git=$REPLY
-  if declare -F git >/dev/null 2>&1; then
-    _dot_init_error 'a shell function named git cannot be used during initialization'
-    return 1
-  fi
-  [[ $- == *h* ]] && hashall_was_set=1
-  previous_git=$(hash -t git 2>/dev/null || true)
-  set -h
-  hash -p "$host_git" git || return 1
-  _dot_init_command "$@" || status=$?
-  hash -d git 2>/dev/null || true
-  [[ -z $previous_git ]] || hash -p "$previous_git" git || status=1
-  [[ $hashall_was_set -eq 1 ]] || set +h
-  return "$status"
 }
