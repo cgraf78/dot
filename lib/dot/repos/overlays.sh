@@ -227,10 +227,17 @@ _overlay_path_is_authority() {
   local rel="$1" pending
   _overlay_pending_manifest_path
   pending="$REPLY"
-  [[ "$HOME/$rel" == "$DOT_OVERLAY_MANIFEST" ||
+  if [[ "$HOME/$rel" == "$DOT_OVERLAY_MANIFEST" ||
     "$HOME/$rel" == "$DOT_OVERLAY_LEGACY_MANIFEST" ||
-    "$HOME/$rel" == "$pending" ]] ||
+    "$HOME/$rel" == "$pending" ]]; then
+    return 0
+  fi
+  if [[ ${_overlay_reserved_roots+x} ]]; then
+    _dot_candidate_path_is_reserved_from_roots \
+      "$HOME/$rel" "$_overlay_reserved_roots"
+  else
     dot_candidate_path_is_reserved "$HOME/$rel"
+  fi
 }
 
 _overlay_append_manifest_records() {
@@ -984,7 +991,9 @@ _link_overlay() {
 
 # Link all active overlays and clean up stale symlinks from removed overlays.
 _link_overlays() {
-  local manifest="$DOT_OVERLAY_MANIFEST" pending
+  local manifest="$DOT_OVERLAY_MANIFEST" pending _overlay_reserved_roots
+  _dot_reserved_roots_snapshot || return 1
+  _overlay_reserved_roots=$REPLY
   if ! _preflight_local_overlays; then
     return 1
   fi
@@ -1156,6 +1165,12 @@ _link_overlays() {
         _warn "  skip (stale overlay link was replaced): $rel"
         continue
       fi
+      if dot_candidate_path_is_reserved "$dst"; then
+        _warn "  warning: refusing to clean a reserved overlay path: $rel"
+        rm -f -- "$_overlay_manifest_new"
+        rm -rf -- "$inventory_root"
+        return 1
+      fi
       if ! _overlay_destination_outside_local_sources "$rel"; then
         _warn "  warning: refusing to clean a link inside a local overlay source: ${REPLY:-$rel}"
         rm -f -- "$_overlay_manifest_new"
@@ -1190,6 +1205,13 @@ _link_overlays() {
       fi
     fi
   done
+
+  if ! _dot_reserved_roots_snapshot || [[ $REPLY != "$_overlay_reserved_roots" ]]; then
+    _warn "  warning: reserved paths changed while linking overlays; recovery authority retained: $pending"
+    rm -f -- "$_overlay_manifest_new"
+    rm -rf -- "$inventory_root"
+    return 1
+  fi
 
   # Commit final state before retiring either recovery authority. Checking the
   # inode closes portable mv's "destination became a directory" behavior and
