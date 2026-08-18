@@ -41,7 +41,6 @@ program	lib/dot/repos/api.sh
 program	lib/dot/repos/commands.sh
 program	lib/dot/repos/config.sh
 program	lib/dot/repos/dirty.sh
-program	lib/dot/repos/extension-modes.sh
 program	lib/dot/repos/git.sh
 program	lib/dot/repos/model.sh
 program	lib/dot/repos/overlays.sh

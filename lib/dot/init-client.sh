@@ -1174,8 +1174,7 @@ _dot_init_publish_one() {
     case $mode in
       100644 | 100755)
         git --git-dir="$git_dir" show "$commit:$path" >"$next" || return 1
-        if [[ $mode == 100755 ]]; then chmod 0755 "$next"; else chmod 0644 "$next"; fi ||
-          return 1
+        if [[ $mode == 100755 ]]; then chmod +x "$next" || return 1; fi
         ;;
       120000)
         link_target=$(
@@ -1339,7 +1338,6 @@ _dot_init_forward_converge() {
   fi
   _discover_overlays || return 1
   _preflight_local_overlays || return 1
-  _dot_extension_modes_normalize || return 1
   _ui_begin 5
   _run_pre_sync_extensions || return 1
   _dot_update_sync_repos || status=1

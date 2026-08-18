@@ -42,7 +42,6 @@ lib/dot/repos/api.sh	dotfiles:core/repos/api.sh@dotfiles-v1
 lib/dot/repos/commands.sh	dotfiles:core/repos/commands.sh@dotfiles-v1
 lib/dot/repos/config.sh	dotfiles:core/repos/config.sh@dotfiles-v1
 lib/dot/repos/dirty.sh	dotfiles:core/repos/dirty.sh@dotfiles-v1
-lib/dot/repos/extension-modes.sh	standalone:new
 lib/dot/repos/git.sh	dotfiles:core/repos/git.sh@dotfiles-v1
 lib/dot/repos/model.sh	standalone:new
 lib/dot/repos/overlays.sh	dotfiles:core/repos/overlays.sh@dotfiles-v1

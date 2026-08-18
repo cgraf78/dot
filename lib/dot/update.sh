@@ -88,7 +88,6 @@ _dot_update_finalize() {
   fi
   _ensure_repo_config
   _link_overlays || update_status=1
-  _dot_extension_modes_normalize || update_status=1
   if [[ "${DOT_DEPENDENCY_PROVIDER:-none}" == shdeps ]]; then
     if _ensure_shdeps; then
       shdeps_ready=1
@@ -166,10 +165,6 @@ _dot_update() {
   # here for sourced callers so SSH, repository, and HOME mutations cannot
   # precede validation of an active filesystem overlay.
   _preflight_local_overlays || return 1
-
-  # Existing trusted extensions must be safe before pre-sync code runs. A
-  # second pass after repository/link convergence handles newly cloned files.
-  _dot_extension_modes_normalize || return 1
 
   _ui_begin 5
 

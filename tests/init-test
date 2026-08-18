@@ -12,6 +12,13 @@ mode_of() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 
+assert_not_group_other_writable() {
+  local path=$1 label=$2 mode
+  mode=$(mode_of "$path") || fail "$label: cannot read mode"
+  (((8#$mode & 022) == 0)) ||
+    fail "$label: group/other writable mode [$mode]"
+}
+
 fixture_repo nonmain trunk .testrc $'hello\n' 100644
 origin=$REPLY
 fixture_home nonmain
@@ -431,53 +438,33 @@ trusted_modes_clean_state=$DOT_TEST_TMP/trusted-modes-clean-state
   run_dot "$trusted_modes_clean_home" "$trusted_modes_clean_state" init --yes \
     "file://$trusted_modes_origin" >/dev/null
 )
-assert_eq 755 "$(mode_of "$trusted_modes_clean_home/.local/lib/dotfiles")" \
-  'clean init publishes the extension root with canonical mode'
-assert_eq 755 \
-  "$(mode_of "$trusted_modes_clean_home/.local/lib/dotfiles/merge-hooks.d")" \
-  'clean init publishes the extension directory with canonical mode'
+assert_not_group_other_writable \
+  "$trusted_modes_clean_home/.local/lib/dotfiles" \
+  'clean init publishes a trusted extension root'
+assert_not_group_other_writable \
+  "$trusted_modes_clean_home/.local/lib/dotfiles/merge-hooks.d" \
+  'clean init publishes a trusted extension directory'
 assert_eq 644 \
   "$(mode_of "$trusted_modes_clean_home/.local/lib/dotfiles/merge-hooks.d/mode.serial.sh")" \
   'clean init publishes the extension file with canonical mode'
 assert_eq clean "$(<"$trusted_modes_clean_home/.trusted-mode-hook")" \
   'clean init executes the trusted extension'
 
-# Existing byte-identical client files may come from a checkout created under
-# umask 0002. They should be normalized in place instead of being retained as
-# an unusable 0664/0775 extension surface and stranding init in converging.
-fixture_home trusted-modes-existing
-trusted_modes_existing_home=$REPLY
-trusted_modes_existing_state=$DOT_TEST_TMP/trusted-modes-existing-state
-mkdir -p "$trusted_modes_existing_home/.config/dot" \
-  "$trusted_modes_existing_home/.local/lib/dotfiles/merge-hooks.d"
-cp "$DOT_TEST_TMP/trusted-modes-seed/.config/dot/config" \
-  "$trusted_modes_existing_home/.config/dot/config"
-cp "$DOT_TEST_TMP/trusted-modes-seed/.local/lib/dotfiles/merge-hooks.d/mode.serial.sh" \
-  "$trusted_modes_existing_home/.local/lib/dotfiles/merge-hooks.d/mode.serial.sh"
-chmod 0775 "$trusted_modes_existing_home/.local" \
-  "$trusted_modes_existing_home/.local/lib" \
-  "$trusted_modes_existing_home/.local/lib/dotfiles" \
-  "$trusted_modes_existing_home/.local/lib/dotfiles/merge-hooks.d"
-chmod 0664 "$trusted_modes_existing_home/.config/dot/config" \
-  "$trusted_modes_existing_home/.local/lib/dotfiles/merge-hooks.d/mode.serial.sh"
-set +e
+# Clamping a cooperative umask must not broaden a caller's stricter policy.
+# Init's direct blob publication follows the retained mask just like Git does.
+fixture_home trusted-modes-private
+trusted_modes_private_home=$REPLY
+trusted_modes_private_state=$DOT_TEST_TMP/trusted-modes-private-state
 (
-  umask 0002
-  run_dot "$trusted_modes_existing_home" "$trusted_modes_existing_state" \
-    init --yes "file://$trusted_modes_origin" >/dev/null 2>&1
+  umask 0077
+  run_dot "$trusted_modes_private_home" "$trusted_modes_private_state" init --yes \
+    "file://$trusted_modes_origin" >/dev/null
 )
-trusted_modes_existing_status=$?
-set -e
-assert_eq 0 "$trusted_modes_existing_status" \
-  'init repairs a retained group-writable extension surface'
-assert_eq 755 "$(mode_of "$trusted_modes_existing_home/.local/lib/dotfiles")" \
-  'retained extension root is normalized'
-assert_eq 755 \
-  "$(mode_of "$trusted_modes_existing_home/.local/lib/dotfiles/merge-hooks.d")" \
-  'retained extension directory is normalized'
-assert_eq 644 \
-  "$(mode_of "$trusted_modes_existing_home/.local/lib/dotfiles/merge-hooks.d/mode.serial.sh")" \
-  'retained extension file is normalized'
+assert_eq 700 "$(mode_of "$trusted_modes_private_home/.local/lib/dotfiles")" \
+  'clean init retains a private extension root'
+assert_eq 600 \
+  "$(mode_of "$trusted_modes_private_home/.local/lib/dotfiles/merge-hooks.d/mode.serial.sh")" \
+  'clean init retains a private extension file'
 
 # Git overlays are cloned by Dot and therefore must receive the same canonical
 # trusted modes instead of inheriting 0775/0664 from the caller's umask.
