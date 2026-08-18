@@ -26,9 +26,12 @@ _dot_host() {
 }
 
 _dot_match_specs() {
-  local spec=$1 case_mode=$2 current=$3 item normalized
+  local spec=$1 case_mode=$2 item normalized current
   local has_include=false
-  local -a items=()
+  local -a items=() current_values=()
+
+  shift 2
+  current_values=("$@")
 
   [[ -n $spec ]] || return 0
   IFS=, read -r -a items <<<"$spec"
@@ -40,13 +43,17 @@ _dot_match_specs() {
       normalized=$item
     fi
     [[ $normalized == '!'* ]] || has_include=true
-    [[ $normalized == "!$current" ]] && return 1
+    for current in "${current_values[@]}"; do
+      [[ $normalized == "!$current" ]] && return 1
+    done
   done
   [[ $has_include == false ]] && return 0
   for item in "${items[@]}"; do
     [[ -n $item ]] || continue
     [[ $case_mode == lowercase ]] && item=${item,,}
-    [[ $item == "$current" ]] && return 0
+    for current in "${current_values[@]}"; do
+      [[ $item == "$current" ]] && return 0
+    done
   done
   return 1
 }
@@ -55,13 +62,13 @@ dot_platform_match() {
   local platform
   [[ $# -eq 1 ]] || return 2
   platform=$(_dot_platform) || return 1
-  _dot_match_specs "$1" exact "$platform" && return 0
   # Termux is Linux at the kernel boundary and Android at the userspace
   # boundary. Preserve both durable identities, matching the provider ABI.
   if [[ -n ${PREFIX:-} && $PREFIX == */com.termux/* ]]; then
-    _dot_match_specs "$1" exact android && return 0
+    _dot_match_specs "$1" exact "$platform" android
+  else
+    _dot_match_specs "$1" exact "$platform"
   fi
-  return 1
 }
 
 dot_host_match() {
