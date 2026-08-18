@@ -90,21 +90,6 @@ HOME="$HOME" PREFIX="$adapter" "$DOT_TEST_ROOT/support/install-checkout.sh" \
 [[ -L "$adapter/lib/dot" ]] ||
   fail 'adapter install did not publish the public library'
 
-# During the fleet transition, both the activated v4 adapter and its permanent
-# replacement are exact client-owned front doors. The compatibility exception
-# is intentionally limited to these two tracked templates.
-v4_adapter=$DOT_TEST_TMP/v4-adapter
-mkdir -p "$v4_adapter/bin"
-cp "$DOT_TEST_ROOT/support/client-launcher-v4.sh" "$v4_adapter/bin/dot"
-chmod 0755 "$v4_adapter/bin/dot"
-HOME="$HOME" PREFIX="$v4_adapter" \
-  "$DOT_TEST_ROOT/support/install-checkout.sh" >/dev/null
-assert_files_equal "$DOT_TEST_ROOT/support/client-launcher-v4.sh" \
-  "$v4_adapter/bin/dot" 'installer preserves the exact v4 client adapter'
-[[ -f "$v4_adapter/bin/dot" && ! -L "$v4_adapter/bin/dot" &&
-  -L "$v4_adapter/lib/dot" ]] ||
-  fail 'v4 adapter install did not preserve the command and publish the library'
-
 # Minimal bootstrap images do not necessarily ship coreutils `cmp`. Git is
 # already an installer prerequisite, so prove exact adapter recognition does
 # not accidentally grow a second comparison dependency.

@@ -54,14 +54,12 @@ lib/dot/temp.sh	dotfiles:core/temp.sh@dotfiles-v1
 lib/dot/update-lock.sh	dotfiles:core/update-lock.sh@dotfiles-v1
 lib/dot/update.sh	dotfiles:core/update.sh@dotfiles-v1
 support/checkout-bash-v1.sh	actions:checkout-installer/bash-resolver-v1.sh.in@.github/cgraf78-actions.lock
-support/client-launcher-v4.sh	standalone:new
 support/client-launcher.sh	standalone:new
 support/install-checkout.sh	standalone:new
 support/post-install.sh	standalone:new
 support/shdeps.lock	shdeps:installer-lock
 tests/cli-test	standalone:new
 tests/client-launcher-test	standalone:new
-tests/client-launcher-v4-test	standalone:new
 tests/config-test	standalone:new
 tests/doctor-test	dotfiles:tests/core-doctor-test@dotfiles-v1+standalone
 tests/examples-test	standalone:new

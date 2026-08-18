@@ -357,19 +357,6 @@ _dot_init_read_record() {
   fi
 }
 
-_dot_init_candidate_adapter_allowed() {
-  local repo=$1 branch=$2 path=$3 mode=$4 template
-
-  [[ $path == .local/bin/dot && $mode == 100755 ]] || return 1
-  while IFS= read -r template; do
-    if git -C "$repo" show "$branch:$path" 2>/dev/null |
-      _dot_stdin_matches_file "$template"; then
-      return 0
-    fi
-  done < <(_dot_client_launcher_templates)
-  return 1
-}
-
 _dot_init_candidate_tree() {
   local repo=$1 branch=$2 output=$3 entry header mode type oid path count=0
   local raw valid=1
@@ -408,7 +395,9 @@ _dot_init_candidate_tree() {
       # command adapter. Its exact bytes are checked against this release so a
       # repository cannot smuggle another executable into the reserved front
       # door during initialization.
-      if _dot_init_candidate_adapter_allowed "$repo" "$branch" "$path" "$mode"; then
+      if [[ $path == .local/bin/dot && $mode == 100755 ]] &&
+        git -C "$repo" show "$branch:$path" 2>/dev/null |
+        _dot_stdin_matches_file "$DOT_SOURCE_ROOT/support/client-launcher.sh"; then
         :
       else
         valid=0
