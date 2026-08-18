@@ -258,6 +258,9 @@ if [[ ! -x $host_git || -L $host_git ]]; then
 fi
 [[ -f $host_git && ! -L $host_git && -x $host_git ]] ||
   fail 'client launcher test requires a regular host Git'
+host_bash_dir=${BASH%/*}
+[[ $host_bash_dir == /* && -x $host_bash_dir/bash ]] ||
+  fail 'client launcher test requires its invoking Bash directory'
 home_git_dir=$HOME/.local/bin
 home_git=$home_git_dir/git
 symlink_git_dir=$DOT_TEST_TMP/symlink-git-bin
@@ -274,7 +277,7 @@ HOME_GIT
 chmod 0755 "$home_git"
 ln -s "$home_git" "$symlink_git_dir/git"
 run_home_git_validation() {
-  PATH="$home_git_dir:$symlink_git_dir:${host_git%/*}" \
+  PATH="$home_git_dir:$symlink_git_dir:${host_git%/*}:$host_bash_dir" \
     DOT_CLIENT_TEST_HOME_GIT_LOG=$home_git_log \
     DOT_CLIENT_TEST_DIRTY_XDG=$public_xdg \
     DOT_CLIENT_TEST_DIRTY_XDG_LOG=$dirty_xdg_log \
