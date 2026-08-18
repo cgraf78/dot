@@ -125,8 +125,19 @@ dot_client_git() (
   unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
   unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE GIT_CONFIG
   unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT
+  export GIT_NO_REPLACE_OBJECTS=1
   exec "$DOT_CLIENT_GIT" "$@"
 )
+
+dot_client_git_metadata_safe() {
+  local checkout=$1 git_dir=$1/.git grafts=$1/.git/info/grafts
+
+  # A managed install is a standalone clone, never a linked worktree. Keep its
+  # admin directory local, disable replace refs in dot_client_git, and reject
+  # legacy grafts, which have no equivalent environment switch.
+  [[ -d $git_dir && ! -L $git_dir && -O $git_dir ]] || return 1
+  [[ ! -e $grafts && ! -L $grafts ]]
+}
 
 dot_client_exact_file() {
   local expected=$1 actual=$2
@@ -178,6 +189,101 @@ dot_client_read_ready() {
   [[ $actual_oid == "$DOT_CLIENT_CONFIG_OID" ]]
 }
 
+dot_client_safe_tracked_path() {
+  local path=$1 component
+  local -a components=()
+
+  case $path in
+    '' | /* | . | .. | ./* | ../* | */./* | */../* | */. | */.. | */ | *//* | *$'\t'* | *$'\n'* | *$'\r'*)
+      return 1
+      ;;
+  esac
+  IFS=/ read -r -a components <<<"$path"
+  for component in "${components[@]}"; do
+    [[ $component != .git ]] || return 1
+  done
+}
+
+dot_client_tracked_parents_regular() {
+  local checkout=$1 path=$2 component index limit prefix=''
+  local -a components=()
+
+  IFS=/ read -r -a components <<<"$path"
+  limit=$((${#components[@]} - 1))
+  for ((index = 0; index < limit; index++)); do
+    component=${components[$index]}
+    if [[ -n $prefix ]]; then
+      prefix=$prefix/$component
+    else
+      prefix=$component
+    fi
+    [[ -d $checkout/$prefix && ! -L $checkout/$prefix ]] || return 1
+  done
+}
+
+dot_client_tracked_tree_matches() {
+  local LC_ALL=C
+  local checkout=$1 head=$2 entry header path mode type oid extra=''
+  local actual hash_complete=0 hash_count=0 tree_complete=0
+  local count=0 valid=1
+  local -a paths=() expected_oids=()
+
+  # The managed runtime currently tracks regular files only. Keep that narrow
+  # contract fail-closed so a new type or pathname requires deliberate review.
+  # The final empty record proves that ls-tree completed; process substitution
+  # otherwise does not expose whether its producer yielded only a partial tree.
+  while IFS= read -r -d '' entry; do
+    if [[ -z $entry ]]; then
+      tree_complete=1
+      continue
+    fi
+    [[ $tree_complete -eq 0 && $entry == *$'\t'* ]] || return 1
+    header=${entry%%$'\t'*}
+    path=${entry#*$'\t'}
+    read -r mode type oid extra <<<"$header"
+    [[ -z $extra && $type == blob &&
+      $mode =~ ^(100644|100755)$ && $oid =~ ^[0-9a-f]{40}$ ]] || return 1
+    dot_client_safe_tracked_path "$path" || return 1
+    dot_client_tracked_parents_regular "$checkout" "$path" || return 1
+    actual=$checkout/$path
+    [[ -f $actual && ! -L $actual && -O $actual ]] || return 1
+    case $mode in
+      100644) [[ ! -x $actual ]] || return 1 ;;
+      100755) [[ -x $actual ]] || return 1 ;;
+    esac
+    paths[count]=$path
+    expected_oids[count]=$oid
+    count=$((count + 1))
+  done < <(
+    if dot_client_git -C "$checkout" ls-tree -r -z --full-tree \
+      "$head" 2>/dev/null; then
+      printf '\0'
+    fi
+  )
+  [[ $tree_complete -eq 1 && $count -gt 0 ]] || return 1
+
+  # Hash all literal worktree bytes in one Git process. Besides avoiding clean
+  # filters, batching keeps this per-command authority check inexpensive.
+  while IFS= read -r actual; do
+    if [[ -z $actual ]]; then
+      hash_complete=1
+      continue
+    fi
+    if [[ $hash_complete -eq 1 || $hash_count -ge $count ||
+      $actual != "${expected_oids[$hash_count]}" ]]; then
+      valid=0
+    fi
+    hash_count=$((hash_count + 1))
+  done < <(
+    if printf '%s\n' "${paths[@]}" |
+      dot_client_git -C "$checkout" hash-object --no-filters \
+        --stdin-paths 2>/dev/null; then
+      printf '\n'
+    fi
+  )
+  [[ $hash_complete -eq 1 && $valid -eq 1 && $hash_count -eq $count ]]
+}
+
 dot_client_standalone_ready() {
   local checkout=$1 runtime=$2 launcher=$3 ready=$4 template
   local checkout_physical top top_physical head
@@ -188,6 +294,7 @@ dot_client_standalone_ready() {
   DOT_CLIENT_GIT=$(type -P git 2>/dev/null) || return 1
   dot_client_normalized_absolute "$DOT_CLIENT_GIT" || return 1
   [[ -f "$DOT_CLIENT_GIT" && -x "$DOT_CLIENT_GIT" ]] || return 1
+  dot_client_git_metadata_safe "$checkout" || return 1
   dot_client_config_path || return 1
   dot_client_read_ready "$ready" || return 1
   dot_client_exact_file "$launcher" "$template" || return 1
@@ -205,6 +312,10 @@ dot_client_standalone_ready() {
     "$DOT_CLIENT_MINIMUM_REVISION" "$head" >/dev/null 2>&1; then
     return 1
   fi
+  # Readiness proves convergence at one point in time. Recheck the complete
+  # tracked tree immediately before dispatch so later content or type changes
+  # cannot become the standalone execution authority.
+  dot_client_tracked_tree_matches "$checkout" "$head"
 }
 
 [[ -n ${HOME:-} ]] || {
