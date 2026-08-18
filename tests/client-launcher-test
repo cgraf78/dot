@@ -6,8 +6,37 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == 2bc386fd807fdbc43901641e82c8a1a1d169a4e5 ]] ||
+[[ $(git hash-object "$launcher") == 246ba9118bcbe6db9690ef70ed6f899cf5edf6be ]] ||
   fail 'client launcher v4 changed in place; update its migration fixture deliberately'
+
+head_tree_complete=0
+head_tree_count=0
+while IFS= read -r -d '' entry; do
+  if [[ -z $entry ]]; then
+    head_tree_complete=1
+    continue
+  fi
+  [[ $head_tree_complete -eq 0 && $entry == *$'\t'* ]] ||
+    fail 'repository HEAD emitted a malformed tracked-tree record'
+  header=${entry%%$'\t'*}
+  path=${entry#*$'\t'}
+  read -r mode type _ <<<"$header"
+  [[ $type == blob && $mode =~ ^(100644|100755)$ ]] ||
+    fail "repository HEAD added an unsupported tracked type: $path"
+  case $path in
+    '' | /* | . | .. | ./* | ../* | */./* | */../* | */. | */.. | */ | *//* | *$'\t'* | *$'\n'* | *$'\r'* | .git | .git/* | */.git | */.git/*)
+      fail "repository HEAD added an unsupported tracked path: $path"
+      ;;
+  esac
+  head_tree_count=$((head_tree_count + 1))
+done < <(
+  if git -C "$DOT_TEST_ROOT" ls-tree -r -z --full-tree HEAD; then
+    printf '\0'
+  fi
+)
+[[ $head_tree_complete -eq 1 && $head_tree_count -gt 0 ]] ||
+  fail 'repository HEAD tracked-tree inventory was incomplete'
+
 client_home=$DOT_TEST_TMP/home
 mkdir -p "$client_home"
 HOME=$client_home
@@ -15,6 +44,7 @@ export HOME
 install_home=$DOT_TEST_TMP/install
 checkout=$install_home/cgraf78/dot
 runtime=$checkout/bin/dot
+public_api=$checkout/lib/dot/public/api-version.sh
 lock=$DOT_TEST_TMP/dot-cutover.lock
 helper=$DOT_TEST_TMP/dot-library-handoff.sh
 legacy=$DOT_TEST_TMP/legacy-dot-launcher.sh
@@ -33,6 +63,7 @@ printf 'standalone\n' >"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
 printf '%s\n' "$@" >>"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
 RUNTIME
 chmod 0755 "$runtime"
+printf 'DOT_EXTENSION_API_VERSION=1\n' >"$public_api"
 mkdir -p "$(dirname "$config_path")" "$(dirname "$public_link")"
 cat >"$config_path" <<'CONFIG'
 version=1
@@ -44,7 +75,8 @@ ln -s "$checkout/lib/dot/public" "$public_link"
 git -C "$checkout" init --quiet
 git -C "$checkout" config user.name 'Dot Test'
 git -C "$checkout" config user.email dot-test@example.invalid
-git -C "$checkout" add bin/dot support/client-launcher.sh
+git -C "$checkout" add \
+  bin/dot lib/dot/public/api-version.sh support/client-launcher.sh
 git -c core.hooksPath= -C "$checkout" commit --quiet -m fixture
 minimum_revision=$(git -C "$checkout" rev-parse HEAD)
 write_lock() {
@@ -104,6 +136,21 @@ LEGACY
 chmod 0755 "$legacy"
 : >"$helper_log"
 
+assert_checkout_change_falls_back() {
+  local argument=$1 label=$2
+
+  rm -f -- "$log" "$helper_log"
+  DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+    DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+    DOT_CLIENT_CUTOVER_LOCK=$lock \
+    DOT_CLIENT_HANDOFF_HELPER=$helper \
+    DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+    SHDEPS_INSTALL_DIR="$install_home" \
+    "$launcher" "$argument"
+  assert_eq $'legacy\nfront-door='"$launcher"$'\n'"$argument" \
+    "$(<"$log")" "$label"
+}
+
 # The retained adapter must run on the same minimal bootstrap images as its
 # installer. Git is present there, but a standalone `cmp` command may not be.
 no_cmp_bin=$DOT_TEST_TMP/no-cmp-bin
@@ -125,6 +172,104 @@ assert_eq $'standalone\nfirst\ntwo words' "$(<"$log")" \
   'client launcher standalone arguments'
 assert_eq '' "$(<"$helper_log")" \
   'client launcher leaves handoff recovery to the locked standalone runtime'
+
+printf 'benign\n' >"$checkout/benign"
+git -C "$checkout" add benign
+git -c core.hooksPath= -C "$checkout" commit --quiet -m selected-head
+selected_revision=$(git -C "$checkout" rev-parse HEAD)
+printf 'DOT_EXTENSION_API_VERSION=2\n' >"$public_api"
+git -C "$checkout" add lib/dot/public/api-version.sh
+replacement_tree=$(git -C "$checkout" write-tree)
+replacement_revision=$(printf 'replacement fixture\n' |
+  git -c core.hooksPath= -C "$checkout" commit-tree \
+    -p "$minimum_revision" "$replacement_tree")
+git -C "$checkout" reset --hard --quiet "$selected_revision"
+git -C "$checkout" replace "$selected_revision" "$replacement_revision"
+printf 'DOT_EXTENSION_API_VERSION=2\n' >"$public_api"
+assert_checkout_change_falls_back replaced-head-tree \
+  'client launcher ignores local replace refs when validating HEAD'
+git -C "$checkout" replace -d "$selected_revision" >/dev/null
+git -C "$checkout" reset --hard --quiet "$minimum_revision"
+
+printf 'DOT_EXTENSION_API_VERSION=2\n' >"$public_api"
+git -C "$checkout" add lib/dot/public/api-version.sh
+grafted_tree=$(git -C "$checkout" write-tree)
+grafted_revision=$(printf 'grafted fixture\n' |
+  git -c core.hooksPath= -C "$checkout" commit-tree "$grafted_tree")
+git -C "$checkout" reset --hard --quiet "$grafted_revision"
+grafts=$(git -C "$checkout" rev-parse --git-path info/grafts)
+case $grafts in
+  /*) ;;
+  *) grafts=$checkout/$grafts ;;
+esac
+printf '%s %s\n' "$grafted_revision" "$minimum_revision" >"$grafts"
+assert_checkout_change_falls_back grafted-ancestry \
+  'client launcher rejects local grafts that rewrite minimum ancestry'
+rm -f -- "$grafts"
+git -C "$checkout" reset --hard --quiet "$minimum_revision"
+
+fsmonitor=$DOT_TEST_TMP/client-fsmonitor
+fsmonitor_log=$DOT_TEST_TMP/client-fsmonitor.log
+cat >"$fsmonitor" <<'FSMONITOR'
+#!/usr/bin/env bash
+printf 'called\n' >>"${DOT_CLIENT_FSMONITOR_TEST_LOG:?}"
+printf 'client-launcher-test-token\n'
+FSMONITOR
+chmod 0755 "$fsmonitor"
+git -C "$checkout" config core.fsmonitor "$fsmonitor"
+rm -f -- "$log" "$helper_log" "$fsmonitor_log"
+DOT_CLIENT_FSMONITOR_TEST_LOG=$fsmonitor_log \
+  DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock \
+  DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+  SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" configured-fsmonitor
+assert_eq $'standalone\nconfigured-fsmonitor' "$(<"$log")" \
+  'client launcher accepts a clean checkout with configured fsmonitor'
+[[ ! -e $fsmonitor_log ]] ||
+  fail 'client launcher executed configured fsmonitor during authority check'
+git -C "$checkout" config --unset-all core.fsmonitor
+
+clean_filter=$DOT_TEST_TMP/client-clean-filter
+cat >"$clean_filter" <<'FILTER'
+#!/usr/bin/env bash
+sed 's/DOT_EXTENSION_API_VERSION=2/DOT_EXTENSION_API_VERSION=1/'
+FILTER
+chmod 0755 "$clean_filter"
+printf 'lib/dot/public/api-version.sh filter=client-clean\n' \
+  >"$checkout/.gitattributes"
+git -C "$checkout" config filter.client-clean.clean "$clean_filter"
+printf 'DOT_EXTENSION_API_VERSION=2\n' >"$public_api"
+assert_checkout_change_falls_back filtered-public-library \
+  'client launcher compares literal bytes instead of filtered Git content'
+git -C "$checkout" checkout -- lib/dot/public/api-version.sh
+git -C "$checkout" config --unset-all filter.client-clean.clean
+rm -f -- "$checkout/.gitattributes"
+
+git -C "$checkout" update-index --skip-worktree \
+  lib/dot/public/api-version.sh
+printf 'DOT_EXTENSION_API_VERSION=2\n' >"$public_api"
+assert_checkout_change_falls_back dirty-public-library \
+  'client launcher rejects a dirty library hidden by index metadata'
+git -C "$checkout" update-index --no-skip-worktree \
+  lib/dot/public/api-version.sh
+git -C "$checkout" checkout -- lib/dot/public/api-version.sh
+
+git -C "$checkout" update-index --assume-unchanged bin/dot
+printf '\n# dirty runtime\n' >>"$runtime"
+assert_checkout_change_falls_back dirty-runtime \
+  'client launcher rejects a dirty runtime hidden by index metadata'
+git -C "$checkout" update-index --no-assume-unchanged bin/dot
+git -C "$checkout" checkout -- bin/dot
+
+cp "$public_api" "$DOT_TEST_TMP/public-api-target"
+rm -f -- "$public_api"
+ln -s "$DOT_TEST_TMP/public-api-target" "$public_api"
+assert_checkout_change_falls_back typechanged-public-library \
+  'client launcher rejects a tracked file replaced by a symlink'
+git -C "$checkout" checkout -- lib/dot/public/api-version.sh
 
 # The preparation revision may stage and validate a complete standalone
 # checkout, but it must remain dormant until a later fleet-visible revision
