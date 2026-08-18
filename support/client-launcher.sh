@@ -71,6 +71,7 @@ dot_client_resolve_checkout() {
 }
 
 dot_client_read_lock() {
+  local LC_ALL=C
   local lock=$1 size header phase_line revision_line generation_line extra=''
 
   [[ -f "$lock" && ! -L "$lock" ]] || return 1

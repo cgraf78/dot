@@ -6,7 +6,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == 8c051aadee55a64bcc76e47f5c65fd9fdfadeddc ]] ||
+[[ $(git hash-object "$launcher") == fda0f1464d7fe2c636ba442e4e5eac5ff6284772 ]] ||
   fail 'client launcher v3 changed in place; update its migration fixture deliberately'
 install_home=$DOT_TEST_TMP/install
 checkout=$install_home/cgraf78/dot
@@ -255,6 +255,32 @@ DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   "$launcher" malformed-generation
 assert_eq $'legacy\nfront-door='"$launcher"$'\nmalformed-generation' "$(<"$log")" \
   'client launcher rejects an unsafe readiness generation'
+
+# Some UTF-8 collation tables let a fullwidth digit match `[0-9]`. Cutover
+# authority is ASCII regardless of the invoking host's locale.
+utf8_locale=$(locale -a 2>/dev/null |
+  awk 'tolower($0) ~ /^en_us.*utf/ && !found { value = $0; found = 1 }
+    END { if (found) print value }') || utf8_locale=
+if [[ -n $utf8_locale ]]; then
+  unicode_home=$DOT_TEST_TMP/unicode-generation-home
+  unicode_generation='client-topology-v１'
+  unicode_ready=$unicode_home/.local/state/dot/client-ready-v3/$unicode_generation/$minimum_revision
+  mkdir -p "$unicode_ready"
+  chmod 0700 "$unicode_ready"
+  write_lock active "$minimum_revision" "$unicode_generation"
+  rm -f -- "$log" "$helper_log"
+  env -u DOT_CLIENT_READY \
+    LC_ALL="$utf8_locale" HOME="$unicode_home" \
+    DOT_CLIENT_LAUNCHER_TEST_LOG="$log" \
+    DOT_CLIENT_CUTOVER_LOCK="$lock" \
+    DOT_CLIENT_HANDOFF_HELPER="$helper" \
+    DOT_CLIENT_HANDOFF_TEST_LOG="$helper_log" \
+    DOT_CLIENT_LEGACY_LAUNCHER="$legacy" \
+    SHDEPS_INSTALL_DIR="$install_home" \
+    "$launcher" unicode-generation
+  assert_eq $'legacy\nfront-door='"$launcher"$'\nunicode-generation' \
+    "$(<"$log")" 'client launcher keeps generation syntax ASCII'
+fi
 
 printf 'cgraf78 dot client cutover v3\nphase=ACTIVE\nminimum_revision=%s\nreadiness_generation=%s\n' \
   "$minimum_revision" "$readiness_generation" >"$lock"
