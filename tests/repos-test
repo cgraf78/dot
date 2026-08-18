@@ -138,7 +138,7 @@ HOME=$reserved_resolution_home XDG_STATE_HOME=$reserved_resolution_state \
     OVERLAYS=()
     ! dot_candidate_path_is_reserved "$HOME/.config/ordinary/value"
   '
-assert_eq 1 "$(wc -l <"$reserved_resolution_log")" \
+assert_eq 1 "$(awk 'END { print NR }' "$reserved_resolution_log")" \
   'candidate validation canonicalizes one symlinked reserved root once'
 
 # A fetched tree is inert until validation completes, so one stable root
@@ -167,7 +167,7 @@ HOME=$reserved_resolution_home XDG_STATE_HOME=$reserved_resolution_state \
     _repo_validate_candidate_tree base HEAD \
       git --git-dir="$DOT_TEST_RESERVED_RESOLUTION_ORIGIN"
   '
-assert_eq 2 "$(wc -l <"$reserved_resolution_log")" \
+assert_eq 2 "$(awk 'END { print NR }' "$reserved_resolution_log")" \
   'candidate tree validation snapshots reserved roots before and after its scan'
 
 # Replacement identities are durable recovery data and therefore must use the
