@@ -8,6 +8,62 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=../lib/dot/resources.sh
 . "$root/lib/dot/resources.sh"
 
+wait_for_test_file() {
+  local path=$1 deadline=$((SECONDS + 5))
+  while ((SECONDS < deadline)); do
+    [[ -e $path ]] && return 0
+    sleep 0.01
+  done
+  return 1
+}
+
+fail_running_test_process() {
+  local pid=$1 message=$2 child_file=${3:-} child=''
+  if [[ -n $child_file && -s $child_file ]]; then
+    child=$(<"$child_file")
+    if [[ $child =~ ^[1-9][0-9]*$ ]]; then
+      kill -KILL -- "-$child" 2>/dev/null ||
+        kill -KILL "$child" 2>/dev/null || true
+    fi
+  fi
+  kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  fail "$message"
+}
+
+wait_for_test_process() {
+  local pid=$1 state='' deadline=$((SECONDS + 5))
+  DOT_TEST_WAIT_STATUS=0
+  while ((SECONDS < deadline)); do
+    if ! process_is_live "$pid"; then
+      if wait "$pid"; then DOT_TEST_WAIT_STATUS=0; else DOT_TEST_WAIT_STATUS=$?; fi
+      return 0
+    fi
+    # Minimal Linux images expose procfs but only BusyBox ps, which lacks -p.
+    # The helper above handles procfs zombies; consult portable BSD ps only on
+    # systems without procfs.
+    if [[ ! -r /proc/$pid/stat ]] &&
+      state=$(ps -o stat= -p "$pid" 2>/dev/null) &&
+      [[ $state =~ ^[[:space:]]*Z ]]; then
+      if wait "$pid"; then DOT_TEST_WAIT_STATUS=0; else DOT_TEST_WAIT_STATUS=$?; fi
+      return 0
+    fi
+    sleep 0.01
+  done
+  kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 1
+}
+
+directory_entry_count() {
+  local directory=$1
+  local -a entries=()
+  shopt -s nullglob dotglob
+  entries=("$directory"/*)
+  shopt -u nullglob dotglob
+  printf '%s\n' "${#entries[@]}"
+}
+
 self_identity=""
 if [[ -r /proc/$$/stat ]]; then
   process_identity "$$" self_identity
@@ -34,6 +90,288 @@ assert_eq 700 "$dir_mode" 'owned temporary directory is private'
 _dot_cleanup_all
 [[ ! -e $owned_file && ! -L $owned_file ]] || fail 'cleanup retained temporary file'
 [[ ! -e $owned_dir && ! -L $owned_dir ]] || fail 'cleanup retained temporary directory'
+
+# Signals can arrive after allocation/launch but before the parent publishes
+# either ownership record. Registration depth must defer cleanup until both
+# resources are visible, then preserve the first signal and clean both.
+registration_root=$DOT_TEST_TMP/registration-race
+mkdir -p "$registration_root/tmp"
+cat >"$registration_root/fixture.sh" <<'REGISTRATION_FIXTURE'
+#!/usr/bin/env bash
+set -u
+. "$DOT_TEST_ROOT/lib/dot/resources.sh"
+_dot_cleanup_install_owner_traps
+on_term() {
+  _dot_cleanup_signal 143
+  : >"$DOT_TEST_CASE_ROOT/term-seen"
+}
+on_hup() {
+  _dot_cleanup_signal 129
+  : >"$DOT_TEST_CASE_ROOT/hup-seen"
+}
+trap on_term TERM
+trap on_hup HUP
+
+_dot_cleanup_begin_job_launch
+owned=$(mktemp -d "$TMPDIR/race.XXXXXXXX") || exit 1
+(
+  while [[ ! -e $DOT_TEST_CASE_ROOT/child-release ]]; do sleep 0.01; done
+) <&"$DOT_CLEANUP_LAUNCH_STDIN_FD" &
+child=$!
+printf '%s\n' "$child" >"$DOT_TEST_CASE_ROOT/child.pid"
+: >"$DOT_TEST_CASE_ROOT/ready"
+while [[ ! -e $DOT_TEST_CASE_ROOT/publish ]]; do sleep 0.01; done
+_dot_cleanup_register_path "$owned"
+_dot_cleanup_finish_job_launch "$child"
+exit 99
+REGISTRATION_FIXTURE
+chmod 0755 "$registration_root/fixture.sh"
+had_monitor=0
+[[ $- == *m* ]] && had_monitor=1
+set -m
+DOT_TEST_ROOT=$root DOT_TEST_CASE_ROOT=$registration_root \
+  TMPDIR=$registration_root/tmp bash "$registration_root/fixture.sh" &
+registration_owner=$!
+[[ $had_monitor -eq 1 ]] || set +m
+wait_for_test_file "$registration_root/ready" ||
+  fail_running_test_process "$registration_owner" \
+    'registration race fixture did not become ready' \
+    "$registration_root/child.pid"
+registration_child=$(<"$registration_root/child.pid")
+kill -TERM "$registration_owner"
+wait_for_test_file "$registration_root/term-seen" ||
+  fail_running_test_process "$registration_owner" \
+    'registration race did not observe the deferred TERM' \
+    "$registration_root/child.pid"
+kill -HUP "$registration_owner"
+wait_for_test_file "$registration_root/hup-seen" ||
+  fail_running_test_process "$registration_owner" \
+    'registration race did not observe the later HUP' \
+    "$registration_root/child.pid"
+: >"$registration_root/publish"
+wait_for_test_process "$registration_owner" ||
+  fail_running_test_process "$registration_owner" \
+    'registration race fixture did not exit' \
+    "$registration_root/child.pid"
+assert_eq 143 "$DOT_TEST_WAIT_STATUS" 'registration race preserves TERM status'
+if process_is_live "$registration_child"; then
+  fail_running_test_process "$registration_owner" \
+    'registration race retained the unpublished worker' \
+    "$registration_root/child.pid"
+fi
+assert_eq 0 "$(directory_entry_count "$registration_root/tmp")" \
+  'registration race removes scratch allocated before publication'
+
+# A discovered descendant PID is signal authority only when its recorded
+# generation still matches. Simulate PID reuse and prove cleanup fails closed.
+if [[ -r /proc/$$/stat ]]; then
+  identity_root=$DOT_TEST_TMP/identity-mismatch
+  mkdir -p "$identity_root"
+  DOT_TEST_ROOT=$root DOT_TEST_CASE_ROOT=$identity_root \
+    bash --noprofile --norc -c '
+      set -euo pipefail
+      . "$DOT_TEST_ROOT/lib/dot/resources.sh"
+      sleep 30 &
+      root=$!
+      _dot_cleanup_register_pid "$root"
+      sleep 30 &
+      unrelated=$!
+      _dot_cleanup_descendant_records() {
+        printf "%s\t%s\t1\n" "$unrelated" stale-generation
+      }
+      _dot_cleanup_all
+      kill -0 "$unrelated" 2>/dev/null && : >"$DOT_TEST_CASE_ROOT/survived"
+      kill -KILL "$unrelated" 2>/dev/null || true
+      wait "$unrelated" 2>/dev/null || true
+    '
+  [[ -e $identity_root/survived ]] ||
+    fail 'cleanup signalled a descendant with a mismatched PID generation'
+fi
+
+# Once an owned name has been removed, a new object created at that pathname
+# belongs to its creator. A signal during removal must not make EXIT cleanup
+# delete the replacement as though it were still Dot scratch.
+recreated_root=$DOT_TEST_TMP/recreated-path
+mkdir -p "$recreated_root/owned"
+DOT_TEST_ROOT=$root DOT_TEST_CASE_ROOT=$recreated_root \
+  bash --noprofile --norc -c '
+    set -u
+    . "$DOT_TEST_ROOT/lib/dot/resources.sh"
+    owned=$DOT_TEST_CASE_ROOT/owned
+    rm_calls=0
+    rm() {
+      rm_calls=$((rm_calls + 1))
+      command rm "$@"
+      if [[ $rm_calls -eq 1 ]]; then
+        mkdir -p "$owned"
+        printf "replacement\n" >"$owned/sentinel"
+        builtin kill -TERM "$BASHPID"
+      fi
+    }
+    _dot_cleanup_register_path "$owned"
+    _dot_cleanup_install_owner_traps
+    _dot_cleanup_remove_path "$owned"
+    exit 99
+  ' || recreated_status=$?
+assert_eq 143 "${recreated_status:-0}" 'recreated path preserves TERM status'
+assert_eq replacement "$(<"$recreated_root/owned/sentinel")" \
+  'cleanup preserves a replacement at a formerly owned path'
+
+# PID, identity, and group arrays form one ownership record. A signal between
+# their individual unsets must be deferred until the remaining record is whole.
+unregister_root=$DOT_TEST_TMP/unregister-race
+mkdir -p "$unregister_root"
+DOT_TEST_ROOT=$root DOT_TEST_CASE_ROOT=$unregister_root \
+  bash --noprofile --norc -c '
+    set -uT
+    . "$DOT_TEST_ROOT/lib/dot/resources.sh"
+    DOT_CLEANUP_PIDS=(101 202)
+    DOT_CLEANUP_PID_IDENTITIES=(identity-101 identity-202)
+    DOT_CLEANUP_PID_GROUPS=(101 202)
+    _dot_cleanup_owned() {
+      printf "pids=%s\nidentities=%s\ngroups=%s\n" \
+        "${DOT_CLEANUP_PIDS[*]}" "${DOT_CLEANUP_PID_IDENTITIES[*]}" \
+        "${DOT_CLEANUP_PID_GROUPS[*]}" >"$DOT_TEST_CASE_ROOT/snapshot"
+    }
+    _dot_cleanup_install_owner_traps
+    debug_fired=0
+    signal_between_fields() {
+      if [[ $debug_fired -eq 0 &&
+        $BASH_COMMAND == '\''unset "DOT_CLEANUP_PID_IDENTITIES[$index]"'\'' ]]; then
+        debug_fired=1
+        trap - DEBUG
+        kill -TERM "$BASHPID"
+      fi
+    }
+    trap signal_between_fields DEBUG
+    _dot_cleanup_unregister_pid 101
+    exit 99
+  ' || unregister_status=$?
+assert_eq 143 "${unregister_status:-0}" 'PID unregister preserves deferred TERM status'
+assert_eq $'pids=202\nidentities=identity-202\ngroups=202' \
+  "$(<"$unregister_root/snapshot")" \
+  'PID unregister keeps ownership fields paired'
+
+# The allocator publishes a path after filesystem creation. Isolating that
+# short-lived job must let the parent register and remove the path even when a
+# terminal-group signal lands between those two moments.
+publication_root=$DOT_TEST_TMP/publication-race
+mkdir -p "$publication_root/bin" "$publication_root/tmp"
+real_mktemp=$(type -P mktemp)
+cat >"$publication_root/bin/mktemp" <<'MKTEMP_SHIM'
+#!/usr/bin/env bash
+set -u
+path=$("$DOT_TEST_REAL_MKTEMP" "$@") || exit $?
+printf '%s\n' "$path" >"$DOT_TEST_ALLOCATED_PATH"
+kill -TERM -- "-$DOT_TEST_PARENT_PGID"
+printf '%s\n' "$path"
+MKTEMP_SHIM
+chmod 0755 "$publication_root/bin/mktemp"
+cat >"$publication_root/fixture.sh" <<'PUBLICATION_FIXTURE'
+#!/usr/bin/env bash
+set -u
+. "$DOT_TEST_ROOT/lib/dot/resources.sh"
+_dot_cleanup_install_owner_traps
+# The outer harness starts this asynchronous job under monitor mode, so Bash
+# owns the portable invariant PGID == job leader PID without consulting ps.
+DOT_TEST_PARENT_PGID=${BASHPID:-$$}
+export DOT_TEST_PARENT_PGID
+_dot_cleanup_mktemp -d "$TMPDIR/atomic.XXXXXXXX"
+exit 99
+PUBLICATION_FIXTURE
+chmod 0755 "$publication_root/fixture.sh"
+had_monitor=0
+[[ $- == *m* ]] && had_monitor=1
+set -m
+PATH="$publication_root/bin:$PATH" DOT_TEST_ROOT=$root \
+  DOT_TEST_REAL_MKTEMP=$real_mktemp \
+  DOT_TEST_ALLOCATED_PATH=$publication_root/allocated.path \
+  TMPDIR=$publication_root/tmp bash "$publication_root/fixture.sh" &
+publication_owner=$!
+[[ $had_monitor -eq 1 ]] || set +m
+wait_for_test_process "$publication_owner" ||
+  fail 'mktemp publication fixture did not exit'
+assert_eq 143 "$DOT_TEST_WAIT_STATUS" 'mktemp publication preserves TERM status'
+published_path=''
+[[ ! -f $publication_root/allocated.path ]] ||
+  published_path=$(<"$publication_root/allocated.path")
+[[ -n $published_path && ! -e $published_path ]] ||
+  fail 'mktemp publication did not clean the allocated path'
+
+# A cooperative group leader may exit after TERM while its child ignores it.
+# Retain the validated group claim through bounded KILL escalation.
+group_root=$DOT_TEST_TMP/group-escalation
+mkdir -p "$group_root"
+cat >"$group_root/leaf.py" <<'PYTHON_LEAF'
+import os
+import pathlib
+import signal
+import sys
+import time
+
+root = pathlib.Path(sys.argv[1])
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+(root / "leaf.pid").write_text(f"{os.getpid()}\n", encoding="ascii")
+(root / "ready").touch()
+while True:
+    time.sleep(1)
+PYTHON_LEAF
+DOT_TEST_ROOT=$root DOT_TEST_CASE_ROOT=$group_root \
+  bash --noprofile --norc -c '
+    set -u
+    . "$DOT_TEST_ROOT/lib/dot/resources.sh"
+    had_monitor=0
+    [[ $- == *m* ]] && had_monitor=1
+    set -m
+    (
+      set +m
+      trap "exit 0" TERM
+      python3 "$DOT_TEST_CASE_ROOT/leaf.py" "$DOT_TEST_CASE_ROOT" &
+      wait "$!"
+    ) &
+    leader=$!
+    [[ $had_monitor -eq 1 ]] || set +m
+    _dot_cleanup_register_pid "$leader" "$leader"
+    deadline=$((SECONDS + 5))
+    while [[ ! -e $DOT_TEST_CASE_ROOT/ready && $SECONDS -lt $deadline ]]; do
+      sleep 0.01
+    done
+    if [[ ! -e $DOT_TEST_CASE_ROOT/ready ]]; then
+      kill -KILL -- "-$leader" 2>/dev/null || true
+      exit 91
+    fi
+    leaf=$(<"$DOT_TEST_CASE_ROOT/leaf.pid")
+    _dot_cleanup_all
+    backend=none
+    _dot_cleanup_process_backend backend
+    leaf_alive=1
+    for ((attempt = 0; attempt < 100; attempt++)); do
+      if ! kill -0 "$leaf" 2>/dev/null; then
+        leaf_alive=0
+        break
+      fi
+      if [[ $backend == proc ]]; then
+        if ! _dot_cleanup_observe_process "$backend" "$leaf" ||
+          [[ $DOT_CLEANUP_OBS_STATE == Z ]]; then
+          leaf_alive=0
+          break
+        fi
+      else
+        state=$(ps -o stat= -p "$leaf" 2>/dev/null || true)
+        if [[ $state =~ ^[[:space:]]*Z ]]; then
+          leaf_alive=0
+          break
+        fi
+      fi
+      sleep 0.01
+    done
+    printf "leaf_alive=%s\npids=%s\ngroups=%s\n" "$leaf_alive" \
+      "${#DOT_CLEANUP_PIDS[@]}" "${#DOT_CLEANUP_PID_GROUPS[@]}" \
+      >"$DOT_TEST_CASE_ROOT/report"
+    kill -KILL "$leaf" 2>/dev/null || true
+  '
+assert_eq $'leaf_alive=0\npids=0\ngroups=0' "$(<"$group_root/report")" \
+  'owned group escalation removes a TERM-resistant child after leader exit'
 
 case_root=$DOT_TEST_TMP/cancellation
 mkdir -p "$case_root"

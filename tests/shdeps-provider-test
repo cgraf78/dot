@@ -15,6 +15,10 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 # which lets this fixture replace only the external Shdeps operation.
 # shellcheck source=../lib/dot/public/xdg.sh
 . "$root/lib/dot/public/xdg.sh"
+# shellcheck source=../lib/dot/log.sh
+. "$root/lib/dot/log.sh"
+# shellcheck source=../lib/dot/progress-ui.sh
+. "$root/lib/dot/progress-ui.sh"
 # shellcheck source=../lib/dot/resources.sh
 . "$root/lib/dot/resources.sh"
 # shellcheck source=../lib/dot/temp.sh
@@ -23,6 +27,8 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$root/lib/dot/providers/shdeps.sh"
 # shellcheck source=../lib/dot/update.sh
 . "$root/lib/dot/update.sh"
+# shellcheck source=../lib/dot/providers/shdeps-ui.sh
+. "$root/lib/dot/providers/shdeps-ui.sh"
 
 _warn() { printf '%s\n' "$*" >&2; }
 
@@ -93,6 +99,66 @@ option_probe=$(
 )
 assert_eq $'sync-args=<passthrough>\nquiet=1 shdeps_quiet=1 force=1 shdeps_force=1' \
   "$option_probe" 'cron and force options reach provider orchestration'
+
+# Keep a compact characterization of the real Shdeps progress adapter here.
+# These cases protect user-visible recovery detail and the two synchronization
+# boundaries that are easiest to lose when the provider UI is refactored.
+(
+  DOT_VERBOSE=0
+  DOT_QUIET=0
+  DOT_UPDATE_SUBPHASE_THRESHOLD_MS=0
+  _shdeps_ui_reset
+  _handle_shdeps_event \
+    '{"event":"item","group":"github-repos","status":"warning","name":"cgraf78/cmdblocks","detail":"pull failed (no fast-forward; local clone)"}'
+  _handle_shdeps_event \
+    '{"event":"group_summary","group":"github-repos","label":"GitHub","status":"warning","changed":0,"warnings":1,"current":4,"skipped":0,"failed":0,"elapsed_ms":900}'
+  _handle_shdeps_event \
+    '{"event":"summary","status":"warning","changed":0,"warnings":1,"current":4,"skipped":0,"failed":0}'
+  warning_output=$(_shdeps_print_group_summaries)
+  assert_contains 'GitHub: 1 warning, 4 current' "$warning_output" \
+    'provider UI retains warning count'
+  assert_contains 'warning  cgraf78/cmdblocks' "$warning_output" \
+    'provider UI names warning dependency'
+  assert_contains 'pull failed (no fast-forward; local clone)' "$warning_output" \
+    'provider UI retains actionable warning detail'
+  assert_eq '1 warning, 4 current' "$DOT_UI_SHDEPS_SUMMARY" \
+    'provider UI retains aggregate warning count'
+
+  _shdeps_ui_reset
+  DOT_UI_LIVE_ACTIVE=1
+  prompt_output=$(
+    printf '[sudo] password for chris:'
+    _handle_shdeps_event \
+      '{"event":"prompt","status":"running","detail":"waiting for sudo authentication"}'
+    printf '\nactive=%s' "$DOT_UI_SHDEPS_PROMPT_ACTIVE"
+  )
+  assert_contains 'active=1' "$prompt_output" \
+    'provider UI pauses redraw for an interactive prompt'
+  [[ "$prompt_output" != *$'\r\033[K'* ]] ||
+    fail 'provider UI cleared an interactive prompt'
+
+  # The producer writes this summary without a trailing newline. Its explicit
+  # completion marker must still share and terminate the FIFO record without
+  # falling back to timeout-based process polling.
+  # shellcheck disable=SC2329  # _run_shdeps_update_ui invokes this fixture.
+  shdeps_update() {
+    printf '%s' \
+      '{"event":"summary","status":"ok","changed":0,"current":0,"skipped":0,"failed":0}'
+  }
+  eval "$(declare -f _shdeps_update_finished |
+    sed '1s/_shdeps_update_finished/_original_shdeps_update_finished/')"
+  completion_poll_log=$DOT_TEST_TMP/provider-completion-poll
+  : >"$completion_poll_log"
+  # shellcheck disable=SC2329  # _run_shdeps_update_ui invokes this seam.
+  _shdeps_update_finished() {
+    printf 'polled\n' >>"$completion_poll_log"
+    _original_shdeps_update_finished "$@"
+  }
+  DOT_UI_TICK_SECONDS=2
+  _run_shdeps_update_ui >/dev/null 2>&1
+  assert_eq '' "$(<"$completion_poll_log")" \
+    'provider UI consumes normal completion marker without timeout polling'
+)
 
 download_root=$DOT_TEST_TMP/provider-download-root
 download_bin=$DOT_TEST_TMP/provider-download-bin
