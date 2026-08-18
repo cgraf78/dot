@@ -64,6 +64,7 @@ _dot_normalize_absolute_path() {
 
 _dot_physical_directory_candidate() {
   local candidate=${1:-} suffix='' part parent physical
+  local original_pwd=$PWD original_oldpwd='' oldpwd_was_set=0
   _dot_normalize_absolute_path "$candidate" || return 1
   candidate=$REPLY
   while [[ ! -d $candidate ]]; do
@@ -76,7 +77,18 @@ _dot_physical_directory_candidate() {
     [[ $parent != "$candidate" ]] || return 1
     candidate=$parent
   done
-  physical=$(cd -P -- "$candidate" 2>/dev/null && pwd -P) || return 1
+  [[ ${OLDPWD+x} ]] && {
+    oldpwd_was_set=1
+    original_oldpwd=$OLDPWD
+  }
+  builtin cd -P -- "$candidate" 2>/dev/null || return 1
+  physical=$PWD
+  builtin cd -L -- "$original_pwd" 2>/dev/null || return 1
+  if [[ $oldpwd_was_set -eq 1 ]]; then
+    OLDPWD=$original_oldpwd
+  else
+    unset OLDPWD
+  fi
   if [[ $physical == / ]]; then
     REPLY=/${suffix#/}
   else
@@ -105,48 +117,18 @@ _dot_physical_leaf_candidate() {
 }
 
 _dot_reserved_root() {
-  local requested=$1 normalized physical candidate suffix='' part parent
-  local original_pwd=$PWD original_oldpwd='' oldpwd_was_set=0
+  local requested=$1 normalized physical
   _dot_normalize_absolute_path "$requested" || return 1
   normalized=$REPLY
   printf '%s\n' "$normalized"
 
   # Leaf symlinks need full canonicalization, but ordinary roots can resolve
-  # their deepest existing directory ancestor with Bash builtins. This helper
-  # runs inside the reserved-root producer's command substitution, so changing
-  # and restoring that disposable process's cwd avoids one realpath process per
-  # root without weakening physical-parent validation.
+  # their deepest existing directory ancestor with the builtin-only helper.
   if [[ -L $normalized ]] && physical=$(realpath "$normalized" 2>/dev/null); then
     :
   else
-    candidate=$normalized
-    while [[ ! -d $candidate ]]; do
-      [[ $candidate != / ]] || return 1
-      part=${candidate##*/}
-      [[ -n $part ]] || return 1
-      suffix=/$part$suffix
-      parent=${candidate%/*}
-      [[ -n $parent ]] || parent=/
-      [[ $parent != "$candidate" ]] || return 1
-      candidate=$parent
-    done
-    [[ ${OLDPWD+x} ]] && {
-      oldpwd_was_set=1
-      original_oldpwd=$OLDPWD
-    }
-    builtin cd -P -- "$candidate" 2>/dev/null || return 1
-    physical=$PWD
-    builtin cd -L -- "$original_pwd" 2>/dev/null || return 1
-    if [[ $oldpwd_was_set -eq 1 ]]; then
-      OLDPWD=$original_oldpwd
-    else
-      unset OLDPWD
-    fi
-    if [[ $physical == / ]]; then
-      physical=/${suffix#/}
-    else
-      physical=$physical$suffix
-    fi
+    _dot_physical_directory_candidate "$normalized" || return 1
+    physical=$REPLY
   fi
   [[ $physical == "$normalized" ]] || printf '%s\n' "$physical"
 }
