@@ -38,19 +38,35 @@ dot_client_state_home() {
   esac
 }
 
-dot_client_private_directory() {
-  local path=$1 output uid mode
+dot_client_private_file() {
+  local path=$1 output uid mode links
 
-  [[ -d $path && ! -L $path ]] || return 1
-  if output=$(stat -c '%u %a' "$path" 2>/dev/null); then
+  [[ -f $path && ! -L $path ]] || return 1
+  if output=$(stat -c '%u %a %h' "$path" 2>/dev/null); then
     :
-  elif output=$(stat -f '%u %Lp' "$path" 2>/dev/null); then
+  elif output=$(stat -f '%u %Lp %l' "$path" 2>/dev/null); then
     :
   else
     return 1
   fi
-  read -r uid mode <<<"$output"
-  [[ $uid == "$(id -u)" && $mode == 700 ]]
+  read -r uid mode links <<<"$output"
+  [[ $uid == "$(id -u)" && $mode == 600 && $links == 1 ]]
+}
+
+dot_client_config_path() {
+  local value=${XDG_CONFIG_HOME:-}
+
+  case $value in
+    /) DOT_CLIENT_CONFIG_PATH=/dot/config ;;
+    /*)
+      dot_client_normalized_absolute "$value" || return 1
+      DOT_CLIENT_CONFIG_PATH=$value/dot/config
+      ;;
+    *)
+      DOT_CLIENT_CONFIG_PATH=$HOME/.config/dot/config
+      dot_client_normalized_absolute "$DOT_CLIENT_CONFIG_PATH"
+      ;;
+  esac
 }
 
 dot_client_resolve_checkout() {
@@ -90,7 +106,7 @@ dot_client_read_lock() {
       return 2
     fi
   } <"$lock"
-  [[ $header == 'cgraf78 dot client cutover v3' &&
+  [[ $header == 'cgraf78 dot client cutover v4' &&
     $phase_line == phase=* &&
     $revision_line == minimum_revision=* &&
     $generation_line == readiness_generation=* ]] || return 2
@@ -122,8 +138,44 @@ dot_client_exact_file() {
     -- "$expected" "$actual"
 }
 
+dot_client_exact_link() {
+  local path=$1 expected=$2 actual
+
+  [[ -L $path ]] || return 1
+  actual=$(readlink "$path") || return 1
+  [[ $actual == "$expected" ]]
+}
+
+dot_client_read_ready() {
+  local ready=$1 size header config_line oid_line extra='' actual_oid
+
+  dot_client_private_file "$ready" || return 1
+  size=$(wc -c <"$ready" 2>/dev/null) || return 1
+  size=${size//[[:space:]]/}
+  case $size in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [[ ${#size} -le 4 && $size -le 4096 ]] || return 1
+  {
+    IFS= read -r header || return 1
+    IFS= read -r config_line || return 1
+    IFS= read -r oid_line || return 1
+    if IFS= read -r extra || [[ -n $extra ]]; then
+      return 1
+    fi
+  } <"$ready"
+  [[ $header == 'cgraf78 dot client readiness v4' &&
+    $config_line == config_path=* && $oid_line == config_oid=* ]] || return 1
+  [[ ${config_line#config_path=} == "$DOT_CLIENT_CONFIG_PATH" ]] || return 1
+  DOT_CLIENT_CONFIG_OID=${oid_line#config_oid=}
+  [[ $DOT_CLIENT_CONFIG_OID =~ ^[0-9a-f]{40}$ ]] || return 1
+  actual_oid=$(dot_client_git -C "$DOT_CLIENT_CHECKOUT" hash-object \
+    --no-filters -- "$DOT_CLIENT_CONFIG_PATH" 2>/dev/null) || return 1
+  [[ $actual_oid == "$DOT_CLIENT_CONFIG_OID" ]]
+}
+
 dot_client_standalone_ready() {
-  local checkout=$1 runtime=$2 launcher=$3 template
+  local checkout=$1 runtime=$2 launcher=$3 ready=$4 template
   local checkout_physical top top_physical head
 
   [[ -f "$runtime" && ! -L "$runtime" && -x "$runtime" ]] || return 1
@@ -132,7 +184,11 @@ dot_client_standalone_ready() {
   DOT_CLIENT_GIT=$(type -P git 2>/dev/null) || return 1
   dot_client_normalized_absolute "$DOT_CLIENT_GIT" || return 1
   [[ -f "$DOT_CLIENT_GIT" && -x "$DOT_CLIENT_GIT" ]] || return 1
+  dot_client_config_path || return 1
+  dot_client_read_ready "$ready" || return 1
   dot_client_exact_file "$launcher" "$template" || return 1
+  dot_client_exact_link "$HOME/.local/lib/dot" "$checkout/lib/dot/public" ||
+    return 1
   checkout_physical=$(cd -P -- "$checkout" 2>/dev/null && pwd -P) || return 1
   top=$(dot_client_git -C "$checkout" rev-parse --show-toplevel 2>/dev/null) ||
     return 1
@@ -203,18 +259,17 @@ if [[ $standalone_status -eq 0 && $DOT_CLIENT_PHASE == active &&
     # The symbolic generation lets a client invalidate obsolete convergence
     # proofs when its topology changes without inventing a second runtime pin.
     if [[ $DOT_CLIENT_STATE_HOME == / ]]; then
-      ready=/dot/client-ready-v3/$DOT_CLIENT_READINESS_GENERATION/$DOT_CLIENT_MINIMUM_REVISION
+      ready=/dot/client-ready-v4/$DOT_CLIENT_READINESS_GENERATION/$DOT_CLIENT_MINIMUM_REVISION
     else
-      ready=$DOT_CLIENT_STATE_HOME/dot/client-ready-v3/$DOT_CLIENT_READINESS_GENERATION/$DOT_CLIENT_MINIMUM_REVISION
+      ready=$DOT_CLIENT_STATE_HOME/dot/client-ready-v4/$DOT_CLIENT_READINESS_GENERATION/$DOT_CLIENT_MINIMUM_REVISION
     fi
   else
     standalone_status=1
   fi
   if [[ $standalone_status -eq 0 ]] &&
-    dot_client_private_directory "$ready" &&
     dot_client_resolve_checkout &&
     dot_client_standalone_ready \
-      "$DOT_CLIENT_CHECKOUT" "$DOT_CLIENT_RUNTIME" "$launcher"; then
+      "$DOT_CLIENT_CHECKOUT" "$DOT_CLIENT_RUNTIME" "$launcher" "$ready"; then
     checkout=$DOT_CLIENT_CHECKOUT
     dot_runtime=$DOT_CLIENT_RUNTIME
     standalone_authorized=1

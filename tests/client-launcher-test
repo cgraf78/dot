@@ -6,8 +6,12 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == fda0f1464d7fe2c636ba442e4e5eac5ff6284772 ]] ||
-  fail 'client launcher v3 changed in place; update its migration fixture deliberately'
+[[ $(git hash-object "$launcher") == 1ab57ee319b74e0ce851f1cddad9341424f6c2d5 ]] ||
+  fail 'client launcher v4 changed in place; update its migration fixture deliberately'
+client_home=$DOT_TEST_TMP/home
+mkdir -p "$client_home"
+HOME=$client_home
+export HOME
 install_home=$DOT_TEST_TMP/install
 checkout=$install_home/cgraf78/dot
 runtime=$checkout/bin/dot
@@ -15,11 +19,13 @@ lock=$DOT_TEST_TMP/dot-cutover.lock
 helper=$DOT_TEST_TMP/dot-library-handoff.sh
 legacy=$DOT_TEST_TMP/legacy-dot-launcher.sh
 readiness_generation=client-topology-v1
-ready=$DOT_TEST_TMP/client-ready-v3
+ready=$DOT_TEST_TMP/client-ready-v4
 log=$DOT_TEST_TMP/launcher.log
 helper_log=$DOT_TEST_TMP/helper.log
+config_path=$HOME/.config/dot/config
+public_link=$HOME/.local/lib/dot
 
-mkdir -p "$checkout/bin" "$checkout/support"
+mkdir -p "$checkout/bin" "$checkout/support" "$checkout/lib/dot/public"
 cp "$launcher" "$checkout/support/client-launcher.sh"
 cat >"$runtime" <<'RUNTIME'
 #!/usr/bin/env bash
@@ -27,6 +33,14 @@ printf 'standalone\n' >"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
 printf '%s\n' "$@" >>"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
 RUNTIME
 chmod 0755 "$runtime"
+mkdir -p "$(dirname "$config_path")" "$(dirname "$public_link")"
+cat >"$config_path" <<'CONFIG'
+version=1
+extension_api=1
+extensions_dir=$HOME/.local/lib/dotfiles
+dependency_provider=shdeps
+CONFIG
+ln -s "$checkout/lib/dot/public" "$public_link"
 git -C "$checkout" init --quiet
 git -C "$checkout" config user.name 'Dot Test'
 git -C "$checkout" config user.email dot-test@example.invalid
@@ -36,25 +50,32 @@ minimum_revision=$(git -C "$checkout" rev-parse HEAD)
 write_lock() {
   local phase=$1 revision=$2 generation=${3:-$readiness_generation}
 
-  printf 'cgraf78 dot client cutover v3\nphase=%s\nminimum_revision=%s\nreadiness_generation=%s\n' \
+  printf 'cgraf78 dot client cutover v4\nphase=%s\nminimum_revision=%s\nreadiness_generation=%s\n' \
     "$phase" "$revision" "$generation" >"$lock"
 }
 
 write_lock active "$minimum_revision"
 write_ready() {
-  local _revision=$1
+  local _revision=$1 _ready=${2:-$ready} _config=${3:-$config_path} oid
 
   [[ $_revision == "$minimum_revision" ]] || fail 'unexpected readiness revision'
-  mkdir -p "$ready"
-  chmod 0700 "$ready"
+  mkdir -p "$(dirname "$_ready")"
+  chmod 0700 "$(dirname "$_ready")"
+  oid=$(git -C "$checkout" hash-object --no-filters "$_config")
+  printf 'cgraf78 dot client readiness v4\nconfig_path=%s\nconfig_oid=%s\n' \
+    "$_config" "$oid" >"$_ready"
+  chmod 0600 "$_ready"
 }
 write_ready "$minimum_revision"
 export DOT_CLIENT_READY=$ready
 
 relative_home=$DOT_TEST_TMP/relative-state-home
-relative_ready=$relative_home/.local/state/dot/client-ready-v3/$readiness_generation/$minimum_revision
-mkdir -p "$relative_ready"
-chmod 0700 "$relative_ready"
+relative_config=$relative_home/.config/dot/config
+relative_ready=$relative_home/.local/state/dot/client-ready-v4/$readiness_generation/$minimum_revision
+mkdir -p "$(dirname "$relative_config")" "$relative_home/.local/lib"
+cp "$config_path" "$relative_config"
+ln -s "$checkout/lib/dot/public" "$relative_home/.local/lib/dot"
+write_ready "$minimum_revision" "$relative_ready" "$relative_config"
 rm -f -- "$log" "$helper_log"
 env -u DOT_CLIENT_READY \
   HOME="$relative_home" XDG_STATE_HOME=relative/state \
@@ -138,10 +159,10 @@ assert_eq $'legacy\nfront-door='"$launcher"$'\nprepared-relative-state' \
 export DOT_CLIENT_READY=$ready
 
 # Tracked activation alone is insufficient. The preparation update writes a
-# private readiness directory only after client convergence succeeds; without it,
+# private readiness record only after client convergence succeeds; without it,
 # even a complete and otherwise valid checkout must remain dormant.
 write_lock active "$minimum_revision"
-rm -rf -- "$ready"
+rm -f -- "$ready"
 rm -f -- "$log" "$helper_log"
 DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
@@ -154,7 +175,7 @@ assert_eq $'legacy\nfront-door='"$launcher"$'\nunready' "$(<"$log")" \
   'client launcher requires private host readiness'
 write_ready "$minimum_revision"
 
-chmod 0755 "$ready"
+chmod 0644 "$ready"
 rm -f -- "$log" "$helper_log"
 DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   DOT_CLIENT_CUTOVER_LOCK=$lock \
@@ -165,11 +186,11 @@ DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   "$launcher" public-ready
 assert_eq $'legacy\nfront-door='"$launcher"$'\npublic-ready' "$(<"$log")" \
   'client launcher rejects non-private readiness authority'
-chmod 0700 "$ready"
+chmod 0600 "$ready"
 
-rm -rf -- "$ready"
-mkdir -p "$DOT_TEST_TMP/ready-target"
-chmod 0700 "$DOT_TEST_TMP/ready-target"
+rm -f -- "$ready"
+printf 'foreign readiness\n' >"$DOT_TEST_TMP/ready-target"
+chmod 0600 "$DOT_TEST_TMP/ready-target"
 ln -s "$DOT_TEST_TMP/ready-target" "$ready"
 rm -f -- "$log" "$helper_log"
 DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
@@ -183,6 +204,65 @@ assert_eq $'legacy\nfront-door='"$launcher"$'\nsymlink-ready' "$(<"$log")" \
   'client launcher rejects symlinked readiness authority'
 rm -f -- "$ready"
 write_ready "$minimum_revision"
+
+cp "$config_path" "$DOT_TEST_TMP/config.original"
+printf 'version=1\ndependency_provider=none\n' >"$config_path"
+rm -f -- "$log" "$helper_log"
+DOT_CLIENT_LAUNCHER_TEST_LOG="$log" \
+  DOT_CLIENT_CUTOVER_LOCK="$lock" DOT_CLIENT_HANDOFF_HELPER="$helper" \
+  DOT_CLIENT_HANDOFF_TEST_LOG="$helper_log" \
+  DOT_CLIENT_LEGACY_LAUNCHER="$legacy" SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" changed-config
+assert_eq $'legacy\nfront-door='"$launcher"$'\nchanged-config' "$(<"$log")" \
+  'client launcher binds readiness to exact config content'
+cp "$DOT_TEST_TMP/config.original" "$config_path"
+
+alternate_config_home=$HOME/alternate-config
+alternate_config=$alternate_config_home/dot/config
+mkdir -p "$(dirname "$alternate_config")"
+cp "$config_path" "$alternate_config"
+rm -f -- "$log" "$helper_log"
+XDG_CONFIG_HOME=$alternate_config_home DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" different-config-root
+assert_eq $'legacy\nfront-door='"$launcher"$'\ndifferent-config-root' \
+  "$(<"$log")" 'client launcher binds readiness to its config path'
+
+write_ready "$minimum_revision" "$ready" "$alternate_config"
+rm -f -- "$log" "$helper_log"
+env -u XDG_CONFIG_HOME \
+  DOT_CLIENT_LAUNCHER_TEST_LOG="$log" \
+  DOT_CLIENT_CUTOVER_LOCK="$lock" DOT_CLIENT_HANDOFF_HELPER="$helper" \
+  DOT_CLIENT_HANDOFF_TEST_LOG="$helper_log" \
+  DOT_CLIENT_LEGACY_LAUNCHER="$legacy" SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" default-after-alternate
+assert_eq $'legacy\nfront-door='"$launcher"$'\ndefault-after-alternate' \
+  "$(<"$log")" 'client launcher rejects alternate-root readiness by default'
+
+write_ready "$minimum_revision"
+rm -f -- "$log" "$helper_log"
+XDG_CONFIG_HOME=relative/config DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" relative-config-root
+assert_eq $'standalone\nrelative-config-root' "$(<"$log")" \
+  'client launcher resolves relative XDG config through HOME fallback'
+
+rm -f -- "$public_link"
+ln -s "$DOT_TEST_TMP/foreign-public" "$public_link"
+rm -f -- "$log" "$helper_log"
+DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" foreign-public-link
+assert_eq $'legacy\nfront-door='"$launcher"$'\nforeign-public-link' "$(<"$log")" \
+  'client launcher binds the public library to the selected checkout'
+rm -f -- "$public_link"
+ln -s "$checkout/lib/dot/public" "$public_link"
 
 # An old embedded updater re-execs the newly pulled front door with a private
 # --skip-pull flag. Standalone Dot deliberately does not own that flag, so the
@@ -218,9 +298,8 @@ assert_eq restore "$(<"$helper_log")" \
 export DOT_CLIENT_READY=$ready
 
 generation_home=$DOT_TEST_TMP/generation-state-home
-stale_generation_ready=$generation_home/.local/state/dot/client-ready-v3/old-topology/$minimum_revision
-mkdir -p "$stale_generation_ready"
-chmod 0700 "$stale_generation_ready"
+stale_generation_ready=$generation_home/.local/state/dot/client-ready-v4/old-topology/$minimum_revision
+write_ready "$minimum_revision" "$stale_generation_ready" "$config_path"
 write_lock active "$minimum_revision" "$readiness_generation"
 rm -f -- "$log" "$helper_log"
 env -u DOT_CLIENT_READY \
@@ -235,7 +314,7 @@ env -u DOT_CLIENT_READY \
 assert_eq $'legacy\nfront-door='"$launcher"$'\nstale-readiness-generation' \
   "$(<"$log")" 'client launcher requires the selected readiness generation'
 
-printf 'cgraf78 dot client cutover v3\nphase=unknown\nminimum_revision=%s\nreadiness_generation=%s\n' \
+printf 'cgraf78 dot client cutover v4\nphase=unknown\nminimum_revision=%s\nreadiness_generation=%s\n' \
   "$minimum_revision" "$readiness_generation" >"$lock"
 rm -f -- "$log" "$helper_log"
 DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
@@ -264,9 +343,8 @@ utf8_locale=$(locale -a 2>/dev/null |
 if [[ -n $utf8_locale ]]; then
   unicode_home=$DOT_TEST_TMP/unicode-generation-home
   unicode_generation='client-topology-v１'
-  unicode_ready=$unicode_home/.local/state/dot/client-ready-v3/$unicode_generation/$minimum_revision
-  mkdir -p "$unicode_ready"
-  chmod 0700 "$unicode_ready"
+  unicode_ready=$unicode_home/.local/state/dot/client-ready-v4/$unicode_generation/$minimum_revision
+  write_ready "$minimum_revision" "$unicode_ready" "$config_path"
   write_lock active "$minimum_revision" "$unicode_generation"
   rm -f -- "$log" "$helper_log"
   env -u DOT_CLIENT_READY \
@@ -282,7 +360,7 @@ if [[ -n $utf8_locale ]]; then
     "$(<"$log")" 'client launcher keeps generation syntax ASCII'
 fi
 
-printf 'cgraf78 dot client cutover v3\nphase=ACTIVE\nminimum_revision=%s\nreadiness_generation=%s\n' \
+printf 'cgraf78 dot client cutover v4\nphase=ACTIVE\nminimum_revision=%s\nreadiness_generation=%s\n' \
   "$minimum_revision" "$readiness_generation" >"$lock"
 rm -f -- "$log" "$helper_log"
 DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
@@ -318,8 +396,9 @@ assert_eq restore "$(<"$helper_log")" \
   'client launcher restores before stale-cutover fallback'
 
 write_lock active "$minimum_revision"
-rm -rf -- "$ready"
+rm -f -- "$ready"
 printf 'malformed readiness\n' >"$ready"
+chmod 0600 "$ready"
 rm -f -- "$log" "$helper_log"
 DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
   DOT_CLIENT_CUTOVER_LOCK=$lock \
@@ -350,7 +429,7 @@ assert_contains 'curl -fsSL https://raw.githubusercontent.com/cgraf78/dot/main/i
   "$(<"$DOT_TEST_TMP/recovery.err")" \
   'client launcher recovery command'
 
-printf 'cgraf78 dot client cutover v3\nphase=unknown\nminimum_revision=%s\nreadiness_generation=%s\n' \
+printf 'cgraf78 dot client cutover v4\nphase=unknown\nminimum_revision=%s\nreadiness_generation=%s\n' \
   "$minimum_revision" "$readiness_generation" >"$lock"
 if DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
   DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
