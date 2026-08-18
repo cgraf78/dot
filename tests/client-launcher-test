@@ -6,7 +6,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == a72bdf9c955d027f42ef9d2a7cbc072e51dd9b7e ]] ||
+[[ $(git hash-object "$launcher") == 6115bea77876e833df114b06e89546be73e6d828 ]] ||
   fail 'client launcher v4 changed in place; update its migration fixture deliberately'
 
 head_tree_complete=0
@@ -629,6 +629,64 @@ assert_eq $'legacy\nfront-door='"$launcher"$'\nretargeted-local-clone' \
   "$(<"$log")" \
   'client launcher rejects a public link retargeted after checkout validation'
 rm -f -- "$checkout"
+
+swap_checkout=$DOT_TEST_TMP/swap-dot
+swapped_dev_checkout=$DOT_TEST_TMP/swapped-dev-dot
+swap_git_dir=$DOT_TEST_TMP/swap-git-bin
+swap_git=$swap_git_dir/git
+swap_log=$DOT_TEST_TMP/swap-git.log
+cp -R "$dev_checkout" "$swap_checkout"
+cat >"$swap_checkout/bin/dot" <<'SWAPPED_RUNTIME'
+#!/usr/bin/env bash
+printf 'swapped\n' >"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
+printf '%s\n' "$@" >>"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
+SWAPPED_RUNTIME
+chmod 0755 "$swap_checkout/bin/dot"
+mkdir -p "$swap_git_dir"
+cat >"$swap_git" <<'SWAP_GIT'
+#!/usr/bin/env bash
+saw_hash=0
+saw_stdin_paths=0
+for argument in "$@"; do
+  case $argument in
+    hash-object) saw_hash=1 ;;
+    --stdin-paths) saw_stdin_paths=1 ;;
+  esac
+done
+"${DOT_CLIENT_TEST_HOST_GIT:?}" "$@"
+status=$?
+if [[ $status -eq 0 && $saw_hash -eq 1 && $saw_stdin_paths -eq 1 &&
+  ! -e ${DOT_CLIENT_TEST_SWAP_LOG:?} ]]; then
+  printf 'swapped\n' >"$DOT_CLIENT_TEST_SWAP_LOG"
+  mv "${DOT_CLIENT_TEST_DEV_CHECKOUT:?}" \
+    "${DOT_CLIENT_TEST_SWAPPED_DEV_CHECKOUT:?}" || exit 1
+  mv "${DOT_CLIENT_TEST_SWAP_CHECKOUT:?}" \
+    "$DOT_CLIENT_TEST_DEV_CHECKOUT" || exit 1
+fi
+exit "$status"
+SWAP_GIT
+chmod 0755 "$swap_git"
+ln -s "$dev_checkout" "$checkout"
+rm -f -- "$log" "$helper_log" "$swap_log"
+PATH="$swap_git_dir:${host_git%/*}:${host_readlink%/*}:$host_bash_dir:$PATH" \
+  DOT_CLIENT_TEST_HOST_GIT=$host_git \
+  DOT_CLIENT_TEST_DEV_CHECKOUT=$dev_checkout \
+  DOT_CLIENT_TEST_SWAPPED_DEV_CHECKOUT=$swapped_dev_checkout \
+  DOT_CLIENT_TEST_SWAP_CHECKOUT=$swap_checkout \
+  DOT_CLIENT_TEST_SWAP_LOG=$swap_log \
+  SHDEPS_GIT_DEV_DIR=$dev_root DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR=$install_home \
+  "$launcher" swapped-local-clone
+[[ -e $swap_log ]] ||
+  fail 'client launcher test did not swap the validated development checkout'
+assert_eq $'legacy\nfront-door='"$launcher"$'\nswapped-local-clone' \
+  "$(<"$log")" \
+  'client launcher rejects a development checkout swapped after validation'
+rm -f -- "$checkout"
+rm -rf -- "$dev_checkout"
+mv "$swapped_dev_checkout" "$dev_checkout"
 mv "$dev_checkout" "$checkout"
 
 chmod 0644 "$ready"
