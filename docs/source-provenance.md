@@ -50,7 +50,7 @@ are marked as such below rather than being attributed to an older file.
 | `tests/{repos-test,resources-test,update-lock-test}` | Generic cases extracted from `dotfiles:.local/lib/dot/tests/{core-pull-test,core-overlays-test,core-update-test,core-resource-cleanup-test,xdg-test}` and `tests/core/commands.sh` | Expanded with standalone topology, reserved-path, cancellation, and crash-phase fixtures |
 | `tests/{families-test,merge-block-test,hooks-test,hook-api-test,extensions-api-test}` | Generic cases extracted from `core-merges-test`, `core-resource-cleanup-test`, and `tests/core/merges.sh` | Concrete application hook cases deliberately excluded |
 | `tests/{doctor-test,shdeps-provider-test}` | Generic cases extracted from `core-doctor-test`, `core-test`, `core-reexec-test`, and provider/UI portions of the public suite | Application and environment checks remain client-owned |
-| `tests/{init-test,cli-test,config-test,install-test,client-launcher-test,library-test,examples-test,workflow-test}` | New standalone acceptance suites, informed by public bootstrap/launcher/XDG/workflow characterization | Use only synthetic users, repositories, hosts, and paths |
+| `tests/{init-test,cli-test,config-test,install-test,client-launcher-test,client-launcher-v4-test,library-test,examples-test,workflow-test}` | New standalone acceptance suites, informed by public bootstrap/launcher/XDG/workflow characterization | Use only synthetic users, repositories, hosts, and paths |
 | `tests/lib/{test.sh,repo.sh}` and `tests/run` | New standalone harness, adapted from public dotfiles test conventions | Checkout-local only; never invokes the private/client suite |
 
 Before first public visibility, CI compares this inventory with the tracked

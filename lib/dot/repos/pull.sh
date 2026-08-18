@@ -125,11 +125,16 @@ _repo_head() {
 }
 
 _repo_candidate_adapter_allowed() {
-  local ref=$1 path=$2 mode=$3
+  local ref=$1 path=$2 mode=$3 template
   shift 3
   [[ $path == .local/bin/dot && $mode == 100755 ]] || return 1
-  "$@" show "$ref:$path" 2>/dev/null |
-    _dot_stdin_matches_file "$DOT_SOURCE_ROOT/support/client-launcher.sh"
+  while IFS= read -r template; do
+    if "$@" show "$ref:$path" 2>/dev/null |
+      _dot_stdin_matches_file "$template"; then
+      return 0
+    fi
+  done < <(_dot_client_launcher_templates)
+  return 1
 }
 
 # Validate a fetched candidate before any checkout, rebase, or overlay link can
