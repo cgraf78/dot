@@ -6,7 +6,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == 99e3bbeabc1a44d30447f3f591bf459bd62a395f ]] ||
+[[ $(git hash-object "$launcher") == 6115bea77876e833df114b06e89546be73e6d828 ]] ||
   fail 'client launcher v4 changed in place; update its migration fixture deliberately'
 
 head_tree_complete=0
@@ -245,12 +245,43 @@ git --git-dir="$checkout/.git" config core.worktree "$foreign_worktree"
 assert_internal_validation_rejected 'mismatched checkout top'
 git --git-dir="$checkout/.git" config --unset-all core.worktree
 
-checkout_real=$checkout-real
-mv "$checkout" "$checkout_real"
-ln -s "${checkout_real##*/}" "$checkout"
-assert_internal_validation_rejected 'symlinked managed checkout'
+dev_root=$DOT_TEST_TMP/dev-clones
+dev_checkout=$dev_root/dot
+mkdir -p "$dev_root"
+mv "$checkout" "$dev_checkout"
+ln -s "$dev_checkout" "$checkout"
+rm -f -- "$validation_out" "$validation_err"
+SHDEPS_GIT_DEV_DIR=$dev_root run_internal_validation ||
+  fail 'client checkout validation rejected the selected Shdeps local clone'
+assert_eq '' "$(<"$validation_out")" \
+  'local-clone checkout validation keeps stdout silent'
+assert_eq '' "$(<"$validation_err")" \
+  'local-clone checkout validation keeps stderr silent'
+
+alternate_dev_checkout=$DOT_TEST_TMP/alternate-dev-dot
 rm -f -- "$checkout"
-mv "$checkout_real" "$checkout"
+ln -s "$dev_checkout" "$alternate_dev_checkout"
+ln -s "$alternate_dev_checkout" "$checkout"
+SHDEPS_GIT_DEV_DIR=$dev_root \
+  assert_internal_validation_rejected \
+  'alternate spelling of the selected Shdeps local clone'
+
+newline_dev_checkout=$dev_checkout$'\n'
+ln -s "$dev_checkout" "$newline_dev_checkout"
+rm -f -- "$checkout"
+ln -s "$newline_dev_checkout" "$checkout"
+SHDEPS_GIT_DEV_DIR=$dev_root \
+  assert_internal_validation_rejected \
+  'newline-suffixed spelling of the selected Shdeps local clone'
+
+checkout_real=$checkout-real
+mkdir -p "$checkout_real"
+rm -f -- "$checkout"
+ln -s "$checkout_real" "$checkout"
+SHDEPS_GIT_DEV_DIR=$dev_root \
+  assert_internal_validation_rejected 'foreign symlinked managed checkout'
+rm -f -- "$checkout"
+mv "$dev_checkout" "$checkout"
 
 host_git=/usr/bin/git
 if [[ ! -x $host_git || -L $host_git ]]; then
@@ -258,6 +289,12 @@ if [[ ! -x $host_git || -L $host_git ]]; then
 fi
 [[ -f $host_git && ! -L $host_git && -x $host_git ]] ||
   fail 'client launcher test requires a regular host Git'
+host_readlink=/usr/bin/readlink
+if [[ ! -f $host_readlink || ! -x $host_readlink ]]; then
+  host_readlink=$(command -v readlink)
+fi
+[[ -f $host_readlink && -x $host_readlink ]] ||
+  fail 'client launcher test requires a host readlink'
 host_bash_dir=${BASH%/*}
 [[ $host_bash_dir == /* && -x $host_bash_dir/bash ]] ||
   fail 'client launcher test requires its invoking Bash directory'
@@ -519,6 +556,138 @@ DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
 assert_eq $'legacy\nfront-door='"$launcher"$'\nunready' "$(<"$log")" \
   'client launcher requires private host readiness'
 write_ready "$minimum_revision"
+
+# github:repo deliberately publishes an exact symlink to the selected local
+# development checkout. The same validated tree must remain usable after the
+# fleet phase activates without broadening acceptance to arbitrary symlinks.
+mv "$checkout" "$dev_checkout"
+ln -s "$dev_checkout" "$checkout"
+home_readlink=$home_git_dir/readlink
+home_readlink_log=$DOT_TEST_TMP/home-readlink.log
+cat >"$home_readlink" <<'HOME_READLINK'
+#!/usr/bin/env bash
+printf 'invoked\n' >"${DOT_CLIENT_TEST_HOME_READLINK_LOG:?}"
+exec "${DOT_CLIENT_TEST_HOST_READLINK:?}" "$@"
+HOME_READLINK
+chmod 0755 "$home_readlink"
+rm -f -- "$log" "$helper_log" "$home_readlink_log"
+PATH="$home_git_dir:${host_git%/*}:${host_readlink%/*}:$host_bash_dir:$PATH" \
+  DOT_CLIENT_TEST_HOME_READLINK_LOG=$home_readlink_log \
+  DOT_CLIENT_TEST_HOST_READLINK=$host_readlink \
+  SHDEPS_GIT_DEV_DIR=$dev_root DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR=$install_home \
+  "$launcher" local-clone-active
+assert_eq $'standalone\nlocal-clone-active' "$(<"$log")" \
+  'client launcher accepts the selected Shdeps local clone after activation'
+[[ ! -e $home_readlink_log ]] ||
+  fail 'client launcher executed the HOME readlink wrapper'
+rm -f -- "$home_readlink"
+
+retarget_checkout=$DOT_TEST_TMP/retarget-dot
+retarget_git_dir=$DOT_TEST_TMP/retarget-git-bin
+retarget_git=$retarget_git_dir/git
+retarget_log=$DOT_TEST_TMP/retarget-git.log
+mkdir -p "$retarget_checkout/lib/dot/public" "$retarget_git_dir"
+cat >"$retarget_git" <<'RETARGET_GIT'
+#!/usr/bin/env bash
+saw_hash=0
+saw_stdin_paths=0
+for argument in "$@"; do
+  case $argument in
+    hash-object) saw_hash=1 ;;
+    --stdin-paths) saw_stdin_paths=1 ;;
+  esac
+done
+"${DOT_CLIENT_TEST_HOST_GIT:?}" "$@"
+status=$?
+if [[ $status -eq 0 && $saw_hash -eq 1 && $saw_stdin_paths -eq 0 &&
+  ! -e ${DOT_CLIENT_TEST_RETARGET_LOG:?} ]]; then
+  printf 'retargeted\n' >"$DOT_CLIENT_TEST_RETARGET_LOG"
+  rm -f -- "${DOT_CLIENT_TEST_INSTALL_CHECKOUT:?}" || exit 1
+  ln -s "${DOT_CLIENT_TEST_RETARGET_CHECKOUT:?}" \
+    "$DOT_CLIENT_TEST_INSTALL_CHECKOUT" || exit 1
+fi
+exit "$status"
+RETARGET_GIT
+chmod 0755 "$retarget_git"
+rm -f -- "$log" "$helper_log" "$retarget_log"
+PATH="$retarget_git_dir:${host_git%/*}:${host_readlink%/*}:$host_bash_dir:$PATH" \
+  DOT_CLIENT_TEST_HOST_GIT=$host_git \
+  DOT_CLIENT_TEST_INSTALL_CHECKOUT=$checkout \
+  DOT_CLIENT_TEST_RETARGET_CHECKOUT=$retarget_checkout \
+  DOT_CLIENT_TEST_RETARGET_LOG=$retarget_log \
+  SHDEPS_GIT_DEV_DIR=$dev_root DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR=$install_home \
+  "$launcher" retargeted-local-clone
+[[ -e $retarget_log ]] ||
+  fail 'client launcher test did not retarget after checkout validation'
+assert_eq $'legacy\nfront-door='"$launcher"$'\nretargeted-local-clone' \
+  "$(<"$log")" \
+  'client launcher rejects a public link retargeted after checkout validation'
+rm -f -- "$checkout"
+
+swap_checkout=$DOT_TEST_TMP/swap-dot
+swapped_dev_checkout=$DOT_TEST_TMP/swapped-dev-dot
+swap_git_dir=$DOT_TEST_TMP/swap-git-bin
+swap_git=$swap_git_dir/git
+swap_log=$DOT_TEST_TMP/swap-git.log
+cp -R "$dev_checkout" "$swap_checkout"
+cat >"$swap_checkout/bin/dot" <<'SWAPPED_RUNTIME'
+#!/usr/bin/env bash
+printf 'swapped\n' >"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
+printf '%s\n' "$@" >>"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
+SWAPPED_RUNTIME
+chmod 0755 "$swap_checkout/bin/dot"
+mkdir -p "$swap_git_dir"
+cat >"$swap_git" <<'SWAP_GIT'
+#!/usr/bin/env bash
+saw_hash=0
+saw_stdin_paths=0
+for argument in "$@"; do
+  case $argument in
+    hash-object) saw_hash=1 ;;
+    --stdin-paths) saw_stdin_paths=1 ;;
+  esac
+done
+"${DOT_CLIENT_TEST_HOST_GIT:?}" "$@"
+status=$?
+if [[ $status -eq 0 && $saw_hash -eq 1 && $saw_stdin_paths -eq 1 &&
+  ! -e ${DOT_CLIENT_TEST_SWAP_LOG:?} ]]; then
+  printf 'swapped\n' >"$DOT_CLIENT_TEST_SWAP_LOG"
+  mv "${DOT_CLIENT_TEST_DEV_CHECKOUT:?}" \
+    "${DOT_CLIENT_TEST_SWAPPED_DEV_CHECKOUT:?}" || exit 1
+  mv "${DOT_CLIENT_TEST_SWAP_CHECKOUT:?}" \
+    "$DOT_CLIENT_TEST_DEV_CHECKOUT" || exit 1
+fi
+exit "$status"
+SWAP_GIT
+chmod 0755 "$swap_git"
+ln -s "$dev_checkout" "$checkout"
+rm -f -- "$log" "$helper_log" "$swap_log"
+PATH="$swap_git_dir:${host_git%/*}:${host_readlink%/*}:$host_bash_dir:$PATH" \
+  DOT_CLIENT_TEST_HOST_GIT=$host_git \
+  DOT_CLIENT_TEST_DEV_CHECKOUT=$dev_checkout \
+  DOT_CLIENT_TEST_SWAPPED_DEV_CHECKOUT=$swapped_dev_checkout \
+  DOT_CLIENT_TEST_SWAP_CHECKOUT=$swap_checkout \
+  DOT_CLIENT_TEST_SWAP_LOG=$swap_log \
+  SHDEPS_GIT_DEV_DIR=$dev_root DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+  DOT_CLIENT_CUTOVER_LOCK=$lock DOT_CLIENT_HANDOFF_HELPER=$helper \
+  DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+  DOT_CLIENT_LEGACY_LAUNCHER=$legacy SHDEPS_INSTALL_DIR=$install_home \
+  "$launcher" swapped-local-clone
+[[ -e $swap_log ]] ||
+  fail 'client launcher test did not swap the validated development checkout'
+assert_eq $'legacy\nfront-door='"$launcher"$'\nswapped-local-clone' \
+  "$(<"$log")" \
+  'client launcher rejects a development checkout swapped after validation'
+rm -f -- "$checkout"
+rm -rf -- "$dev_checkout"
+mv "$swapped_dev_checkout" "$dev_checkout"
+mv "$dev_checkout" "$checkout"
 
 chmod 0644 "$ready"
 rm -f -- "$log" "$helper_log"
