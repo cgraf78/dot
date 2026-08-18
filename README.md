@@ -37,8 +37,10 @@ preserved only when it is byte-identical to the generated client adapter in
 The optional adapter reads a client-owned phased cutover lock. The `prepare`
 phase always uses the retained embedded launcher while the client installs and
 validates standalone Dot. The `active` phase additionally requires a private,
-revision-keyed host-readiness directory and proves that the lock's minimum
-revision is an ancestor of the active checkout. Re-execs inherited from the
+generation- and revision-keyed host-readiness directory and proves that the
+lock's minimum revision is an ancestor of the active checkout. The symbolic
+generation lets a client invalidate old topology proofs without duplicating or
+changing the reviewed runtime commit floor. Re-execs inherited from the
 embedded updater also stay on that launcher because its private arguments are
 not standalone API. Missing or malformed activation authority denies the
 standalone path but does not interrupt an available embedded fallback. Before
