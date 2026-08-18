@@ -7,6 +7,14 @@ set -euo pipefail
 CDPATH=
 shopt -u nocasematch
 
+# Public XDG resolution treats a relative state root as unset. Apply that
+# fallback before the Bash resolver uses the same variable for its private
+# interpreter hint, so trampoline and runtime cannot disagree about validity.
+case ${XDG_STATE_HOME:-} in
+  '' | /*) ;;
+  *) unset XDG_STATE_HOME ;;
+esac
+
 dot_trampoline_source() {
   local source=${BASH_SOURCE[0]} directory target hops=0
 

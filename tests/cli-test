@@ -12,6 +12,13 @@ assert_contains 'dot 0.1.0-dev' "$version" 'version product identity'
 assert_contains 'config 1; extensions 1; library 1' "$version" \
   'version interface inventory'
 
+relative_state_version=$(
+  HOME="$HOME" XDG_STATE_HOME=relative/state DOT_BASH="$BASH" \
+    "$DOT_TEST_ROOT/bin/dot" --version
+)
+assert_contains 'dot 0.1.0-dev' "$relative_state_version" \
+  'relative XDG state falls back through HOME before Bash resolution'
+
 source_revision=$(
   git -c "safe.directory=$DOT_TEST_ROOT" -C "$DOT_TEST_ROOT" rev-parse HEAD
 )
