@@ -65,8 +65,33 @@ for filter in '' fixture-host '!fixture-host' 'fixture-host,!other'; do
     "hook host matcher conforms for [$filter]"
 done
 
+_dot_platform() { printf 'linux\n'; }
 _dot_hook_platform() { printf 'linux\n'; }
 _dot_hook_host() { printf 'fixture-host\n'; }
+
+# Termux has both Linux kernel and Android userspace identities. Match the
+# complete set at once so either identity can include or exclude the runtime.
+while IFS=' ' read -r expected filter; do
+  for matcher in dot_platform_match dot_hook_platform_match; do
+    platform_status=0
+    PREFIX=/data/data/com.termux/files/usr "$matcher" "$filter" ||
+      platform_status=$?
+    assert_eq "$expected" "$platform_status" \
+      "$matcher matches Termux filter [$filter]"
+  done
+done <<'TERMUX_PLATFORM_CASES'
+0 linux
+0 android
+0 linux,macos
+0 !macos
+1 !android
+1 !linux
+1 !android,!macos
+1 linux,!android
+1 android,!linux
+1 macos,!freebsd
+TERMUX_PLATFORM_CASES
+
 dot_hook_platform_match linux || fail 'hook platform matcher rejected current platform'
 if dot_hook_platform_match macos; then
   fail 'hook platform matcher accepted a different platform'
