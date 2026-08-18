@@ -25,6 +25,8 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$root/lib/dot/temp.sh"
 # shellcheck source=../lib/dot/providers/shdeps.sh
 . "$root/lib/dot/providers/shdeps.sh"
+# shellcheck source=../lib/dot/repos/extension-modes.sh
+. "$root/lib/dot/repos/extension-modes.sh"
 # shellcheck source=../lib/dot/update.sh
 . "$root/lib/dot/update.sh"
 # shellcheck source=../lib/dot/providers/shdeps-ui.sh
@@ -83,6 +85,7 @@ assert_eq $'default=7\nexplicit=3' "$jobs_probe" \
 option_probe=$(
   DOT_TEST_ROOT=$root bash --noprofile --norc -c '
     set -euo pipefail
+    . "$DOT_TEST_ROOT/lib/dot/repos/extension-modes.sh"
     . "$DOT_TEST_ROOT/lib/dot/update.sh"
     _preflight_local_overlays() { :; }
     _ui_begin() { :; }
