@@ -105,17 +105,48 @@ _dot_physical_leaf_candidate() {
 }
 
 _dot_reserved_root() {
-  local requested=$1 normalized physical
+  local requested=$1 normalized physical candidate suffix='' part parent
+  local original_pwd=$PWD original_oldpwd='' oldpwd_was_set=0
   _dot_normalize_absolute_path "$requested" || return 1
   normalized=$REPLY
   printf '%s\n' "$normalized"
-  # BSD realpath requires the complete path to exist, while reserved roots
-  # frequently name state that dot has not created yet. Resolve the deepest
-  # existing directory ancestor as a portable fallback so a symlinked parent
-  # cannot hide the physical control-plane path during candidate validation.
-  if ! physical=$(realpath "$normalized" 2>/dev/null); then
-    _dot_physical_directory_candidate "$normalized" || return 1
-    physical=$REPLY
+
+  # Leaf symlinks need full canonicalization, but ordinary roots can resolve
+  # their deepest existing directory ancestor with Bash builtins. This helper
+  # runs inside the reserved-root producer's command substitution, so changing
+  # and restoring that disposable process's cwd avoids one realpath process per
+  # root without weakening physical-parent validation.
+  if [[ -L $normalized ]] && physical=$(realpath "$normalized" 2>/dev/null); then
+    :
+  else
+    candidate=$normalized
+    while [[ ! -d $candidate ]]; do
+      [[ $candidate != / ]] || return 1
+      part=${candidate##*/}
+      [[ -n $part ]] || return 1
+      suffix=/$part$suffix
+      parent=${candidate%/*}
+      [[ -n $parent ]] || parent=/
+      [[ $parent != "$candidate" ]] || return 1
+      candidate=$parent
+    done
+    [[ ${OLDPWD+x} ]] && {
+      oldpwd_was_set=1
+      original_oldpwd=$OLDPWD
+    }
+    builtin cd -P -- "$candidate" 2>/dev/null || return 1
+    physical=$PWD
+    builtin cd -L -- "$original_pwd" 2>/dev/null || return 1
+    if [[ $oldpwd_was_set -eq 1 ]]; then
+      OLDPWD=$original_oldpwd
+    else
+      unset OLDPWD
+    fi
+    if [[ $physical == / ]]; then
+      physical=/${suffix#/}
+    else
+      physical=$physical$suffix
+    fi
   fi
   [[ $physical == "$normalized" ]] || printf '%s\n' "$physical"
 }
@@ -156,18 +187,17 @@ _dot_reserved_roots() {
   fi
 }
 
-dot_path_is_reserved() {
-  local path=${1:-} root checkout parent name base matched=1
+_dot_reserved_roots_snapshot() {
+  local roots
+  if ! roots=$(_dot_reserved_roots); then
+    REPLY=''
+    return 1
+  fi
+  REPLY=$roots
+}
 
-  [[ $# -eq 1 && $path == /* ]] || return 2
-  _dot_init_recovery_path_reserved "$path" && return 0
-  while IFS= read -r root; do
-    [[ -n "$root" ]] || continue
-    if _dot_path_within "$path" "$root"; then
-      matched=0
-    fi
-  done < <(_dot_reserved_roots)
-  [[ $matched -eq 1 ]] || return 0
+_dot_install_path_is_reserved() {
+  local path=$1 checkout parent name base
 
   checkout=${SHDEPS_INSTALL_DIR:-$HOME/.local/share}/cgraf78/dot
   parent=${checkout%/*}
@@ -187,20 +217,43 @@ dot_path_is_reserved() {
   return 1
 }
 
+_dot_path_is_reserved_from_roots() {
+  local path=$1 roots=$2 root matched=1
+
+  _dot_init_recovery_path_reserved "$path" && return 0
+  while IFS= read -r root; do
+    [[ -n "$root" ]] || continue
+    if _dot_path_within "$path" "$root"; then
+      matched=0
+    fi
+  done <<<"$roots"
+  [[ $matched -eq 1 ]] || return 0
+  _dot_install_path_is_reserved "$path"
+}
+
+dot_path_is_reserved() {
+  local path=${1:-} roots
+
+  [[ $# -eq 1 && $path == /* ]] || return 2
+  _dot_reserved_roots_snapshot || return 0
+  roots=$REPLY
+  _dot_path_is_reserved_from_roots "$path" "$roots"
+}
+
 # Candidate inventories contain only leaf entries. A leaf is unsafe when it is
 # inside a reserved root or when it would replace an ancestor directory on the
 # route to one (for example a tracked `.local` symlink). Normal Git directory
 # ancestors are absent from a recursive tree listing and remain allowed.
-dot_candidate_path_is_reserved() {
-  local path=${1:-} root physical matched=1
+_dot_candidate_path_is_reserved_from_roots() {
+  local path=$1 roots=$2 root physical matched=1
 
-  [[ $# -eq 1 && $path == /* ]] || return 2
+  _dot_init_recovery_path_reserved "$path" && return 0
   while IFS= read -r root; do
     [[ -n $root ]] || continue
     if _dot_path_within "$path" "$root" || _dot_path_within "$root" "$path"; then
       matched=0
     fi
-  done < <(_dot_reserved_roots)
+  done <<<"$roots"
   [[ $matched -eq 1 ]] || return 0
 
   # Candidate validation often runs before its parent directories exist. Map
@@ -216,7 +269,7 @@ dot_candidate_path_is_reserved() {
       if _dot_path_within "$physical" "$root" || _dot_path_within "$root" "$physical"; then
         matched=0
       fi
-    done < <(_dot_reserved_roots)
+    done <<<"$roots"
     [[ $matched -eq 1 ]] || return 0
   else
     return 0
@@ -225,5 +278,14 @@ dot_candidate_path_is_reserved() {
   case $path in
     "$HOME/.dotfiles-"*) return 0 ;;
   esac
-  dot_path_is_reserved "$path"
+  _dot_install_path_is_reserved "$path"
+}
+
+dot_candidate_path_is_reserved() {
+  local path=${1:-} roots
+
+  [[ $# -eq 1 && $path == /* ]] || return 2
+  _dot_reserved_roots_snapshot || return 0
+  roots=$REPLY
+  _dot_candidate_path_is_reserved_from_roots "$path" "$roots"
 }
