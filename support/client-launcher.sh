@@ -169,6 +169,10 @@ dot_client_read_ready() {
   [[ ${config_line#config_path=} == "$DOT_CLIENT_CONFIG_PATH" ]] || return 1
   DOT_CLIENT_CONFIG_OID=${oid_line#config_oid=}
   [[ $DOT_CLIENT_CONFIG_OID =~ ^[0-9a-f]{40}$ ]] || return 1
+  # The writer validated a regular config file. Recheck that type before Git
+  # hashes current bytes; hash-object follows symlinks, while the runtime's
+  # strict config parser deliberately rejects them.
+  [[ -f $DOT_CLIENT_CONFIG_PATH && ! -L $DOT_CLIENT_CONFIG_PATH ]] || return 1
   actual_oid=$(dot_client_git -C "$DOT_CLIENT_CHECKOUT" hash-object \
     --no-filters -- "$DOT_CLIENT_CONFIG_PATH" 2>/dev/null) || return 1
   [[ $actual_oid == "$DOT_CLIENT_CONFIG_OID" ]]

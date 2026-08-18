@@ -6,7 +6,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == 1ab57ee319b74e0ce851f1cddad9341424f6c2d5 ]] ||
+[[ $(git hash-object "$launcher") == 2bc386fd807fdbc43901641e82c8a1a1d169a4e5 ]] ||
   fail 'client launcher v4 changed in place; update its migration fixture deliberately'
 client_home=$DOT_TEST_TMP/home
 mkdir -p "$client_home"
@@ -216,6 +216,19 @@ DOT_CLIENT_LAUNCHER_TEST_LOG="$log" \
 assert_eq $'legacy\nfront-door='"$launcher"$'\nchanged-config' "$(<"$log")" \
   'client launcher binds readiness to exact config content'
 cp "$DOT_TEST_TMP/config.original" "$config_path"
+
+mv "$config_path" "$DOT_TEST_TMP/config.target"
+ln -s "$DOT_TEST_TMP/config.target" "$config_path"
+rm -f -- "$log" "$helper_log"
+DOT_CLIENT_LAUNCHER_TEST_LOG="$log" \
+  DOT_CLIENT_CUTOVER_LOCK="$lock" DOT_CLIENT_HANDOFF_HELPER="$helper" \
+  DOT_CLIENT_HANDOFF_TEST_LOG="$helper_log" \
+  DOT_CLIENT_LEGACY_LAUNCHER="$legacy" SHDEPS_INSTALL_DIR="$install_home" \
+  "$launcher" symlinked-config
+assert_eq $'legacy\nfront-door='"$launcher"$'\nsymlinked-config' "$(<"$log")" \
+  'client launcher rejects a symlinked config authority'
+rm -f -- "$config_path"
+mv "$DOT_TEST_TMP/config.target" "$config_path"
 
 alternate_config_home=$HOME/alternate-config
 alternate_config=$alternate_config_home/dot/config
