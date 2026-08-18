@@ -170,6 +170,32 @@ HOME=$reserved_resolution_home XDG_STATE_HOME=$reserved_resolution_state \
 assert_eq 2 "$(wc -l <"$reserved_resolution_log")" \
   'candidate tree validation snapshots reserved roots before and after its scan'
 
+# Physical candidate resolution is sourceable library behavior. Preserve the
+# caller's logical cwd and OLDPWD even when the path crosses a symlink and its
+# missing suffix must be appended to the physical directory.
+physical_candidate_home=$DOT_TEST_TMP/physical-candidate-home
+physical_candidate_target=$DOT_TEST_TMP/physical-candidate-target
+mkdir -p "$physical_candidate_home" "$physical_candidate_target"
+ln -s "$physical_candidate_target" "$physical_candidate_home/alias"
+physical_candidate_result=$(HOME=$physical_candidate_home \
+  DOT_SOURCE_ROOT=$root DOT_TEST_PHYSICAL_TARGET=$physical_candidate_target \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    cd -L -- "$HOME/alias"
+    OLDPWD=$HOME/original-oldpwd
+    before=$PWD
+    _dot_physical_directory_candidate "$HOME/alias/missing/leaf"
+    printf "before=%s\nafter=%s\noldpwd=%s\nreply=%s\n" \
+      "$before" "$PWD" "$OLDPWD" "$REPLY"
+  ')
+assert_eq "before=$physical_candidate_home/alias
+after=$physical_candidate_home/alias
+oldpwd=$physical_candidate_home/original-oldpwd
+reply=$physical_candidate_target/missing/leaf" \
+  "$physical_candidate_result" \
+  'physical candidate resolution preserves caller directory state'
+
 # Replacement identities are durable recovery data and therefore must use the
 # engine checkout's object format, not an exported repository selection from
 # the shell that happened to invoke dot. A SHA-256 decoy makes that drift
