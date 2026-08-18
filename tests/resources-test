@@ -17,6 +17,20 @@ wait_for_test_file() {
   return 1
 }
 
+fail_running_test_process() {
+  local pid=$1 message=$2 child_file=${3:-} child=''
+  if [[ -n $child_file && -s $child_file ]]; then
+    child=$(<"$child_file")
+    if [[ $child =~ ^[1-9][0-9]*$ ]]; then
+      kill -KILL -- "-$child" 2>/dev/null ||
+        kill -KILL "$child" 2>/dev/null || true
+    fi
+  fi
+  kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  fail "$message"
+}
+
 wait_for_test_process() {
   local pid=$1 state='' deadline=$((SECONDS + 5))
   DOT_TEST_WAIT_STATUS=0
@@ -91,7 +105,12 @@ on_term() {
   _dot_cleanup_signal 143
   : >"$DOT_TEST_CASE_ROOT/term-seen"
 }
+on_hup() {
+  _dot_cleanup_signal 129
+  : >"$DOT_TEST_CASE_ROOT/hup-seen"
+}
 trap on_term TERM
+trap on_hup HUP
 
 _dot_cleanup_begin_job_launch
 owned=$(mktemp -d "$TMPDIR/race.XXXXXXXX") || exit 1
@@ -115,17 +134,31 @@ DOT_TEST_ROOT=$root DOT_TEST_CASE_ROOT=$registration_root \
 registration_owner=$!
 [[ $had_monitor -eq 1 ]] || set +m
 wait_for_test_file "$registration_root/ready" ||
-  fail 'registration race fixture did not become ready'
+  fail_running_test_process "$registration_owner" \
+    'registration race fixture did not become ready' \
+    "$registration_root/child.pid"
 registration_child=$(<"$registration_root/child.pid")
 kill -TERM "$registration_owner"
 wait_for_test_file "$registration_root/term-seen" ||
-  fail 'registration race did not observe the deferred signal'
+  fail_running_test_process "$registration_owner" \
+    'registration race did not observe the deferred TERM' \
+    "$registration_root/child.pid"
+kill -HUP "$registration_owner"
+wait_for_test_file "$registration_root/hup-seen" ||
+  fail_running_test_process "$registration_owner" \
+    'registration race did not observe the later HUP' \
+    "$registration_root/child.pid"
 : >"$registration_root/publish"
 wait_for_test_process "$registration_owner" ||
-  fail 'registration race fixture did not exit'
+  fail_running_test_process "$registration_owner" \
+    'registration race fixture did not exit' \
+    "$registration_root/child.pid"
 assert_eq 143 "$DOT_TEST_WAIT_STATUS" 'registration race preserves TERM status'
-kill -0 "$registration_child" 2>/dev/null &&
-  fail 'registration race retained the unpublished worker'
+if process_is_live "$registration_child"; then
+  fail_running_test_process "$registration_owner" \
+    'registration race retained the unpublished worker' \
+    "$registration_root/child.pid"
+fi
 assert_eq 0 "$(directory_entry_count "$registration_root/tmp")" \
   'registration race removes scratch allocated before publication'
 

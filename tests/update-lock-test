@@ -22,6 +22,13 @@ if [[ -r /proc/$$/stat ]]; then
   export -f ps
 fi
 
+fail_lock_holder() {
+  local pid=$1 message=$2
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  fail "$message"
+}
+
 # A re-exec remains in the same process. It must keep the first ownership
 # token instead of racing itself through the stale-lock recovery path.
 reentry_output=$(HOME=$home XDG_STATE_HOME=$state DOT_SOURCE_ROOT=$root \
@@ -57,11 +64,13 @@ holder=$!
 
 remaining=1000
 while [[ ! -e $ready && $remaining -gt 0 ]]; do
-  kill -0 "$holder" 2>/dev/null || fail 'lock holder exited before readiness'
+  kill -0 "$holder" 2>/dev/null ||
+    fail_lock_holder "$holder" 'lock holder exited before readiness'
   sleep 0.01
   remaining=$((remaining - 1))
 done
-[[ -e $ready ]] || fail 'lock holder did not become ready'
+[[ -e $ready ]] ||
+  fail_lock_holder "$holder" 'lock holder did not become ready'
 
 # A lock created with the procfs fallback must retain that identity backend if
 # a full `ps` becomes available to a later contender.
@@ -100,11 +109,13 @@ HOME=$home XDG_STATE_HOME=$state DOT_SOURCE_ROOT=$DOT_TEST_ROOT \
 holder=$!
 remaining=1000
 while [[ ! -e $ready && $remaining -gt 0 ]]; do
-  kill -0 "$holder" 2>/dev/null || fail 'SIGKILL lock holder exited before readiness'
+  kill -0 "$holder" 2>/dev/null ||
+    fail_lock_holder "$holder" 'SIGKILL lock holder exited before readiness'
   sleep 0.01
   remaining=$((remaining - 1))
 done
-[[ -e $ready ]] || fail 'SIGKILL lock holder did not become ready'
+[[ -e $ready ]] ||
+  fail_lock_holder "$holder" 'SIGKILL lock holder did not become ready'
 kill -KILL "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
 [[ -d $state/dot/update.lock.d ]] || fail 'SIGKILL did not leave recoverable lock state'
