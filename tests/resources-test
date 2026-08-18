@@ -21,12 +21,16 @@ wait_for_test_process() {
   local pid=$1 state='' deadline=$((SECONDS + 5))
   DOT_TEST_WAIT_STATUS=0
   while ((SECONDS < deadline)); do
-    if ! kill -0 "$pid" 2>/dev/null; then
+    if ! process_is_live "$pid"; then
       if wait "$pid"; then DOT_TEST_WAIT_STATUS=0; else DOT_TEST_WAIT_STATUS=$?; fi
       return 0
     fi
-    state=$(ps -o stat= -p "$pid" 2>/dev/null || true)
-    if [[ $state =~ ^[[:space:]]*Z ]]; then
+    # Minimal Linux images expose procfs but only BusyBox ps, which lacks -p.
+    # The helper above handles procfs zombies; consult portable BSD ps only on
+    # systems without procfs.
+    if [[ ! -r /proc/$pid/stat ]] &&
+      state=$(ps -o stat= -p "$pid" 2>/dev/null) &&
+      [[ $state =~ ^[[:space:]]*Z ]]; then
       if wait "$pid"; then DOT_TEST_WAIT_STATUS=0; else DOT_TEST_WAIT_STATUS=$?; fi
       return 0
     fi
@@ -235,9 +239,9 @@ cat >"$publication_root/fixture.sh" <<'PUBLICATION_FIXTURE'
 set -u
 . "$DOT_TEST_ROOT/lib/dot/resources.sh"
 _dot_cleanup_install_owner_traps
-parent_pid=${BASHPID:-$$}
-DOT_TEST_PARENT_PGID=$(ps -o pgid= -p "$parent_pid")
-DOT_TEST_PARENT_PGID=${DOT_TEST_PARENT_PGID//[[:space:]]/}
+# The outer harness starts this asynchronous job under monitor mode, so Bash
+# owns the portable invariant PGID == job leader PID without consulting ps.
+DOT_TEST_PARENT_PGID=${BASHPID:-$$}
 export DOT_TEST_PARENT_PGID
 _dot_cleanup_mktemp -d "$TMPDIR/atomic.XXXXXXXX"
 exit 99
@@ -305,11 +309,29 @@ DOT_TEST_ROOT=$root DOT_TEST_CASE_ROOT=$group_root \
     fi
     leaf=$(<"$DOT_TEST_CASE_ROOT/leaf.pid")
     _dot_cleanup_all
-    state=$(ps -o stat= -p "$leaf" 2>/dev/null || true)
-    leaf_alive=0
-    if kill -0 "$leaf" 2>/dev/null && [[ ! $state =~ ^[[:space:]]*Z ]]; then
-      leaf_alive=1
-    fi
+    backend=none
+    _dot_cleanup_process_backend backend
+    leaf_alive=1
+    for ((attempt = 0; attempt < 100; attempt++)); do
+      if ! kill -0 "$leaf" 2>/dev/null; then
+        leaf_alive=0
+        break
+      fi
+      if [[ $backend == proc ]]; then
+        if ! _dot_cleanup_observe_process "$backend" "$leaf" ||
+          [[ $DOT_CLEANUP_OBS_STATE == Z ]]; then
+          leaf_alive=0
+          break
+        fi
+      else
+        state=$(ps -o stat= -p "$leaf" 2>/dev/null || true)
+        if [[ $state =~ ^[[:space:]]*Z ]]; then
+          leaf_alive=0
+          break
+        fi
+      fi
+      sleep 0.01
+    done
     printf "leaf_alive=%s\npids=%s\ngroups=%s\n" "$leaf_alive" \
       "${#DOT_CLEANUP_PIDS[@]}" "${#DOT_CLEANUP_PID_GROUPS[@]}" \
       >"$DOT_TEST_CASE_ROOT/report"
