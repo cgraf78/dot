@@ -38,6 +38,41 @@ _dot_init_safe_relative_path() {
   done
 }
 
+# Client launchers live below HOME and may depend on tracked helpers that init
+# moves before the replacement generation is ready. Select a regular Git from
+# the host PATH outside both client-controlled roots, then bind that exact
+# executable for the complete transaction instead of re-resolving PATH between
+# conflict moves.
+_dot_init_select_host_git() {
+  local home_physical source_physical directory physical_directory candidate
+  local -a path_directories=()
+
+  REPLY=
+  home_physical=$(cd -P -- "$HOME" 2>/dev/null && pwd -P) || return 1
+  source_physical=$(cd -P -- "$DOT_SOURCE_ROOT" 2>/dev/null && pwd -P) ||
+    return 1
+  IFS=: read -r -a path_directories <<<"${PATH:-}"
+  for directory in "${path_directories[@]}"; do
+    [[ $directory == /* ]] || continue
+    physical_directory=$(cd -P -- "$directory" 2>/dev/null && pwd -P) ||
+      continue
+    candidate=${physical_directory%/}/git
+    [[ $physical_directory == / ]] && candidate=/git
+    [[ -f $candidate && ! -L $candidate && -x $candidate ]] || continue
+    if [[ $home_physical == / || $candidate == "$home_physical" ||
+      $candidate == "$home_physical/"* ]]; then
+      continue
+    fi
+    if [[ $source_physical == / || $candidate == "$source_physical" ||
+      $candidate == "$source_physical/"* ]]; then
+      continue
+    fi
+    REPLY=$candidate
+    return 0
+  done
+  return 1
+}
+
 _dot_init_repo_identity() {
   local url=$1 rest host path userinfo
 
@@ -1736,7 +1771,7 @@ _dot_init_resume_transaction() {
   rm -rf -- "$transaction"
 }
 
-dot_init_command() {
+_dot_init_command() {
   local branch='' yes=false mode=run origin='' identity transaction record
   local state_root candidate tree prior conflicts backup completed commit
 
@@ -1902,4 +1937,26 @@ dot_init_command() {
   record=$transaction/record
   rm -rf "$candidate"
   _dot_init_resume_transaction "$transaction" "$record"
+}
+
+dot_init_command() {
+  local host_git previous_git='' status=0 hashall_was_set=0
+
+  _dot_init_select_host_git ||
+    _dot_init_error 'host Git is unavailable outside HOME and the Dot checkout' ||
+    return
+  host_git=$REPLY
+  if declare -F git >/dev/null 2>&1; then
+    _dot_init_error 'a shell function named git cannot be used during initialization'
+    return 1
+  fi
+  [[ $- == *h* ]] && hashall_was_set=1
+  previous_git=$(hash -t git 2>/dev/null || true)
+  set -h
+  hash -p "$host_git" git || return 1
+  _dot_init_command "$@" || status=$?
+  hash -d git 2>/dev/null || true
+  [[ -z $previous_git ]] || hash -p "$previous_git" git || status=1
+  [[ $hashall_was_set -eq 1 ]] || set +h
+  return "$status"
 }
