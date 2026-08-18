@@ -31,6 +31,12 @@ _DOT_RUNTIME_DIR=${BASH_SOURCE[0]%/*}
 . "$_DOT_RUNTIME_DIR/hook-api.sh"
 # shellcheck source=init-client.sh
 . "$_DOT_RUNTIME_DIR/init-client.sh"
+# Initialization may inspect a durable transaction while the prior client Git
+# launcher is already missing its tracked helper. Bind one host Git before the
+# repository model reads that record, then retain it for the whole process.
+if [[ ${DOT_ORIGINAL_ARGV[0]:-} == init ]]; then
+  _dot_init_bind_host_git
+fi
 # shellcheck source=repos/model.sh
 . "$_DOT_RUNTIME_DIR/repos/model.sh"
 # shellcheck source=repos/api.sh

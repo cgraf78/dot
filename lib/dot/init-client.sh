@@ -38,6 +38,56 @@ _dot_init_safe_relative_path() {
   done
 }
 
+# Client launchers live below HOME and may depend on tracked helpers that init
+# moves before the replacement generation is ready. Select a regular Git from
+# the host PATH outside both client-controlled roots, then bind that exact
+# executable for the complete transaction instead of re-resolving PATH between
+# conflict moves.
+_dot_init_select_host_git() {
+  local home_physical source_physical directory physical_directory candidate
+  local -a path_directories=()
+
+  REPLY=
+  home_physical=$(cd -P -- "$HOME" 2>/dev/null && pwd -P) || return 1
+  source_physical=$(cd -P -- "$DOT_SOURCE_ROOT" 2>/dev/null && pwd -P) ||
+    return 1
+  IFS=: read -r -a path_directories <<<"${PATH:-}"
+  for directory in "${path_directories[@]}"; do
+    [[ $directory == /* ]] || continue
+    physical_directory=$(cd -P -- "$directory" 2>/dev/null && pwd -P) ||
+      continue
+    candidate=${physical_directory%/}/git
+    [[ $physical_directory == / ]] && candidate=/git
+    [[ -f $candidate && ! -L $candidate && -x $candidate ]] || continue
+    if [[ $home_physical == / || $candidate == "$home_physical" ||
+      $candidate == "$home_physical/"* ]]; then
+      continue
+    fi
+    if [[ $source_physical == / || $candidate == "$source_physical" ||
+      $candidate == "$source_physical/"* ]]; then
+      continue
+    fi
+    REPLY=$candidate
+    return 0
+  done
+  return 1
+}
+
+_dot_init_bind_host_git() {
+  local host_git
+
+  _dot_init_select_host_git ||
+    _dot_init_error 'host Git is unavailable outside HOME and the Dot checkout' ||
+    return
+  host_git=$REPLY
+  if declare -F git >/dev/null 2>&1; then
+    _dot_init_error 'a shell function named git cannot be used during initialization'
+    return 1
+  fi
+  set -h
+  hash -p "$host_git" git
+}
+
 _dot_init_repo_identity() {
   local url=$1 rest host path userinfo
 
