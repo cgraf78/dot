@@ -77,6 +77,21 @@ _dot_physical_directory_candidate() {
     [[ $parent != "$candidate" ]] || return 1
     candidate=$parent
   done
+
+  # A pull can remove the directory from which dot was invoked while the shell
+  # still owns that open cwd. Keep resolution in a subshell when PWD no longer
+  # names the caller's directory; the normal stable-path case stays builtin-only.
+  if [[ ! -d $original_pwd || ! $original_pwd -ef . ]]; then
+    physical=$(builtin cd -P -- "$candidate" 2>/dev/null && printf '%s\n' "$PWD") ||
+      return 1
+    if [[ $physical == / ]]; then
+      REPLY=/${suffix#/}
+    else
+      REPLY=$physical$suffix
+    fi
+    return 0
+  fi
+
   [[ ${OLDPWD+x} ]] && {
     oldpwd_was_set=1
     original_oldpwd=$OLDPWD
