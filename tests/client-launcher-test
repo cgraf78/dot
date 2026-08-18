@@ -6,7 +6,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
-[[ $(git hash-object "$launcher") == 246ba9118bcbe6db9690ef70ed6f899cf5edf6be ]] ||
+[[ $(git hash-object "$launcher") == 99e3bbeabc1a44d30447f3f591bf459bd62a395f ]] ||
   fail 'client launcher v4 changed in place; update its migration fixture deliberately'
 
 head_tree_complete=0
@@ -44,7 +44,9 @@ export HOME
 install_home=$DOT_TEST_TMP/install
 checkout=$install_home/cgraf78/dot
 runtime=$checkout/bin/dot
+config_parser=$checkout/lib/dot/config.sh
 public_api=$checkout/lib/dot/public/api-version.sh
+public_xdg=$checkout/lib/dot/public/xdg.sh
 lock=$DOT_TEST_TMP/dot-cutover.lock
 helper=$DOT_TEST_TMP/dot-library-handoff.sh
 legacy=$DOT_TEST_TMP/legacy-dot-launcher.sh
@@ -63,7 +65,9 @@ printf 'standalone\n' >"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
 printf '%s\n' "$@" >>"${DOT_CLIENT_LAUNCHER_TEST_LOG:?}"
 RUNTIME
 chmod 0755 "$runtime"
+printf 'dot_config_load() { :; }\n' >"$config_parser"
 printf 'DOT_EXTENSION_API_VERSION=1\n' >"$public_api"
+printf 'dot_xdg_path() { :; }\n' >"$public_xdg"
 mkdir -p "$(dirname "$config_path")" "$(dirname "$public_link")"
 cat >"$config_path" <<'CONFIG'
 version=1
@@ -76,7 +80,9 @@ git -C "$checkout" init --quiet
 git -C "$checkout" config user.name 'Dot Test'
 git -C "$checkout" config user.email dot-test@example.invalid
 git -C "$checkout" add \
-  bin/dot lib/dot/public/api-version.sh support/client-launcher.sh
+  bin/dot lib/dot/config.sh lib/dot/public/api-version.sh \
+  lib/dot/public/xdg.sh \
+  support/client-launcher.sh
 git -c core.hooksPath= -C "$checkout" commit --quiet -m fixture
 minimum_revision=$(git -C "$checkout" rev-parse HEAD)
 write_lock() {
@@ -136,9 +142,198 @@ LEGACY
 chmod 0755 "$legacy"
 : >"$helper_log"
 
+validation_out=$DOT_TEST_TMP/client-validation.out
+validation_err=$DOT_TEST_TMP/client-validation.err
+run_internal_validation() {
+  DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+    DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+    DOT_CLIENT_CUTOVER_LOCK=$lock \
+    DOT_CLIENT_HANDOFF_HELPER=$helper \
+    DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+    SHDEPS_INSTALL_DIR="$install_home" \
+    "$launcher" __client validate-checkout \
+    >"$validation_out" 2>"$validation_err"
+}
+assert_internal_validation_rejected() {
+  local label=$1
+
+  rm -f -- "$log" "$helper_log" "$validation_out" "$validation_err"
+  if run_internal_validation; then
+    fail "$label: checkout validation unexpectedly succeeded"
+  fi
+  assert_eq '' "$(<"$validation_out")" "$label: stdout remains silent"
+  assert_eq '' "$(<"$validation_err")" "$label: stderr remains silent"
+  [[ ! -e $log && ! -e $helper_log ]] ||
+    fail "$label: checkout validation dispatched a runtime"
+}
+assert_internal_syntax_rejected() {
+  local label=$1 status
+  shift
+
+  rm -f -- "$log" "$helper_log" "$validation_out" "$validation_err"
+  if DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
+    DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
+    DOT_CLIENT_CUTOVER_LOCK=$lock \
+    DOT_CLIENT_HANDOFF_HELPER=$helper \
+    DOT_CLIENT_LEGACY_LAUNCHER=$legacy \
+    SHDEPS_INSTALL_DIR="$install_home" \
+    "$launcher" "$@" >"$validation_out" 2>"$validation_err"; then
+    status=0
+  else
+    status=$?
+  fi
+  assert_eq 2 "$status" "$label: exact internal argv is required"
+  assert_eq '' "$(<"$validation_out")" "$label: stdout remains silent"
+  assert_eq '' "$(<"$validation_err")" "$label: stderr remains silent"
+  [[ ! -e $log && ! -e $helper_log ]] ||
+    fail "$label: malformed internal command dispatched a runtime"
+}
+
+# The readiness writer must be able to validate the selected standalone tree
+# while the fleet lock is still prepare, without dispatching either engine.
+write_lock prepare "$minimum_revision"
+rm -f -- "$ready"
+rm -f -- "$log" "$helper_log" "$validation_out" "$validation_err"
+run_internal_validation ||
+  fail 'client checkout validation rejected a clean prepare-phase checkout'
+assert_eq '' "$(<"$validation_out")" \
+  'client checkout validation keeps stdout silent'
+assert_eq '' "$(<"$validation_err")" \
+  'client checkout validation keeps stderr silent'
+[[ ! -e $log && ! -e $helper_log ]] ||
+  fail 'client checkout validation dispatched a runtime'
+assert_internal_syntax_rejected 'missing validation verb' __client
+assert_internal_syntax_rejected 'extra validation argument' \
+  __client validate-checkout extra
+assert_internal_syntax_rejected 'unknown validation verb' __client status
+
+printf 'cgraf78 dot client cutover v4\nphase=prepare\nminimum_revision=%s\n' \
+  "$minimum_revision" >"$lock"
+assert_internal_validation_rejected 'malformed client lock'
+write_lock prepare "$minimum_revision"
+
+unrelated_tree=$(git -C "$checkout" write-tree)
+unrelated_revision=$(printf 'unrelated fixture\n' |
+  git -c core.hooksPath= -C "$checkout" commit-tree "$unrelated_tree")
+external_grafts=$DOT_TEST_TMP/external-grafts
+printf '%s %s\n' "$minimum_revision" "$unrelated_revision" >"$external_grafts"
+write_lock prepare "$unrelated_revision"
+export GIT_GRAFT_FILE=$external_grafts
+assert_internal_validation_rejected 'inherited external Git graft file'
+unset GIT_GRAFT_FILE
+write_lock prepare "$minimum_revision"
+
+printf '\n# dirty adapter template\n' >>"$checkout/support/client-launcher.sh"
+assert_internal_validation_rejected 'dirty adapter template'
+git -C "$checkout" checkout -- support/client-launcher.sh
+
+mv "$checkout/.git" "$checkout/.git-owned"
+ln -s .git-owned "$checkout/.git"
+assert_internal_validation_rejected 'symlinked checkout metadata'
+rm -f -- "$checkout/.git"
+mv "$checkout/.git-owned" "$checkout/.git"
+
+external_common=$DOT_TEST_TMP/external-common.git
+cp -R "$checkout/.git" "$external_common"
+printf '%s\n' "$external_common" >"$checkout/.git/commondir"
+assert_internal_validation_rejected 'external checkout common directory'
+rm -f -- "$checkout/.git/commondir"
+
+foreign_worktree=$DOT_TEST_TMP/foreign-worktree
+mkdir -p "$foreign_worktree"
+git --git-dir="$checkout/.git" config core.worktree "$foreign_worktree"
+assert_internal_validation_rejected 'mismatched checkout top'
+git --git-dir="$checkout/.git" config --unset-all core.worktree
+
+checkout_real=$checkout-real
+mv "$checkout" "$checkout_real"
+ln -s "${checkout_real##*/}" "$checkout"
+assert_internal_validation_rejected 'symlinked managed checkout'
+rm -f -- "$checkout"
+mv "$checkout_real" "$checkout"
+
+host_git=/usr/bin/git
+if [[ ! -x $host_git || -L $host_git ]]; then
+  host_git=$(command -v git)
+fi
+[[ -f $host_git && ! -L $host_git && -x $host_git ]] ||
+  fail 'client launcher test requires a regular host Git'
+host_bash_dir=${BASH%/*}
+[[ $host_bash_dir == /* && -x $host_bash_dir/bash ]] ||
+  fail 'client launcher test requires its invoking Bash directory'
+home_git_dir=$HOME/.local/bin
+home_git=$home_git_dir/git
+symlink_git_dir=$DOT_TEST_TMP/symlink-git-bin
+home_git_log=$DOT_TEST_TMP/home-git.log
+dirty_xdg_log=$DOT_TEST_TMP/dirty-xdg.log
+mkdir -p "$home_git_dir" "$symlink_git_dir"
+cat >"$home_git" <<'HOME_GIT'
+#!/usr/bin/env bash
+printf 'invoked\n' >"${DOT_CLIENT_TEST_HOME_GIT_LOG:?}"
+# shellcheck source=/dev/null
+. "${DOT_CLIENT_TEST_DIRTY_XDG:?}"
+exec "${DOT_CLIENT_TEST_HOST_GIT:?}" "$@"
+HOME_GIT
+chmod 0755 "$home_git"
+ln -s "$home_git" "$symlink_git_dir/git"
+run_home_git_validation() {
+  PATH="$home_git_dir:$symlink_git_dir:${host_git%/*}:$host_bash_dir" \
+    DOT_CLIENT_TEST_HOME_GIT_LOG=$home_git_log \
+    DOT_CLIENT_TEST_DIRTY_XDG=$public_xdg \
+    DOT_CLIENT_TEST_DIRTY_XDG_LOG=$dirty_xdg_log \
+    DOT_CLIENT_TEST_HOST_GIT=$host_git \
+    run_internal_validation
+}
+rm -f -- "$log" "$helper_log" "$validation_out" "$validation_err" \
+  "$home_git_log" "$dirty_xdg_log"
+run_home_git_validation ||
+  fail 'client checkout validation did not select the regular host Git'
+[[ ! -e $home_git_log ]] ||
+  fail 'clean checkout validation executed the HOME Git wrapper'
+[[ ! -e $dirty_xdg_log ]] ||
+  fail 'clean checkout validation executed public XDG code'
+assert_eq '' "$(<"$validation_out")" \
+  'host-Git validation keeps stdout silent'
+assert_eq '' "$(<"$validation_err")" \
+  'host-Git validation keeps stderr silent'
+
+# shellcheck disable=SC2016 # The injected fixture expands only if sourced.
+printf 'printf "executed\\n" >"${DOT_CLIENT_TEST_DIRTY_XDG_LOG:?}"\n' \
+  >>"$public_xdg"
+rm -f -- "$log" "$helper_log" "$validation_out" "$validation_err" \
+  "$home_git_log" "$dirty_xdg_log"
+if run_home_git_validation; then
+  fail 'client checkout validation accepted dirty public XDG code'
+fi
+[[ ! -e $home_git_log ]] ||
+  fail 'client checkout validation executed the HOME Git wrapper'
+[[ ! -e $dirty_xdg_log ]] ||
+  fail 'client checkout validation executed dirty public XDG code'
+assert_eq '' "$(<"$validation_out")" \
+  'HOME-wrapper rejection keeps checkout validation stdout silent'
+assert_eq '' "$(<"$validation_err")" \
+  'HOME-wrapper rejection keeps checkout validation stderr silent'
+git -C "$checkout" checkout -- lib/dot/public/xdg.sh
+rm -f -- "$home_git"
+
+dirty_config_log=$DOT_TEST_TMP/dirty-config.log
+# shellcheck disable=SC2016 # The injected fixture expands only if sourced.
+printf 'printf "executed\\n" >"${DOT_CLIENT_TEST_DIRTY_CONFIG_LOG:?}"\n' \
+  >>"$config_parser"
+export DOT_CLIENT_TEST_DIRTY_CONFIG_LOG=$dirty_config_log
+assert_internal_validation_rejected 'dirty tracked config parser'
+[[ ! -e $dirty_config_log ]] ||
+  fail 'client checkout validation executed a dirty tracked config parser'
+unset DOT_CLIENT_TEST_DIRTY_CONFIG_LOG
+git -C "$checkout" checkout -- lib/dot/config.sh
+write_lock active "$minimum_revision"
+write_ready "$minimum_revision"
+: >"$helper_log"
+
 assert_checkout_change_falls_back() {
   local argument=$1 label=$2
 
+  assert_internal_validation_rejected "$label: internal authority"
   rm -f -- "$log" "$helper_log"
   DOT_CLIENT_LAUNCHER_TEST_LOG=$log \
     DOT_CLIENT_HANDOFF_TEST_LOG=$helper_log \
@@ -185,11 +380,16 @@ replacement_revision=$(printf 'replacement fixture\n' |
     -p "$minimum_revision" "$replacement_tree")
 git -C "$checkout" reset --hard --quiet "$selected_revision"
 git -C "$checkout" replace "$selected_revision" "$replacement_revision"
+assert_internal_validation_rejected 'local replacement metadata'
 printf 'DOT_EXTENSION_API_VERSION=2\n' >"$public_api"
 assert_checkout_change_falls_back replaced-head-tree \
-  'client launcher ignores local replace refs when validating HEAD'
+  'client launcher rejects local replace metadata before validating HEAD'
 git -C "$checkout" replace -d "$selected_revision" >/dev/null
 git -C "$checkout" reset --hard --quiet "$minimum_revision"
+
+write_lock prepare "$selected_revision"
+assert_internal_validation_rejected 'checkout below locked minimum'
+write_lock active "$minimum_revision"
 
 printf 'DOT_EXTENSION_API_VERSION=2\n' >"$public_api"
 git -C "$checkout" add lib/dot/public/api-version.sh

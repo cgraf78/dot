@@ -121,22 +121,72 @@ dot_client_read_lock() {
   [[ $DOT_CLIENT_READINESS_GENERATION =~ ^[0-9a-z][0-9a-z-]{0,63}$ ]] || return 2
 }
 
+dot_client_path_within() {
+  local path=$1 root=$2
+
+  [[ $root == / || $path == "$root" || $path == "$root/"* ]]
+}
+
+dot_client_select_host_git() {
+  local checkout_physical=$1 home_physical directory physical_directory candidate
+  local -a path_directories=()
+
+  home_physical=$(cd -P -- "$HOME" 2>/dev/null && pwd -P) || return 1
+  if [[ $home_physical != / ]]; then
+    dot_client_normalized_absolute "$home_physical" || return 1
+  fi
+  IFS=: read -r -a path_directories <<<"${PATH:-}"
+  for directory in "${path_directories[@]}"; do
+    # PATH remains the host/toolchain trust boundary. During this temporary
+    # migration, skip relative entries and anything physically below HOME or
+    # the managed checkout, where client launchers and unchecked code live.
+    [[ $directory == /* ]] || continue
+    physical_directory=$(cd -P -- "$directory" 2>/dev/null && pwd -P) ||
+      continue
+    if [[ $physical_directory == / ]]; then
+      candidate=/git
+    else
+      dot_client_normalized_absolute "$physical_directory" || continue
+      candidate=$physical_directory/git
+    fi
+    dot_client_normalized_absolute "$candidate" || continue
+    # A symlink target cannot be inspected without another external tool.
+    # Skip it and continue scanning for a native host Git; this keeps macOS,
+    # Linux, and Termux path discovery data-driven and fails closed otherwise.
+    [[ -f $candidate && ! -L $candidate && -x $candidate ]] || continue
+    dot_client_path_within "$candidate" "$home_physical" && continue
+    dot_client_path_within "$candidate" "$checkout_physical" && continue
+    DOT_CLIENT_GIT=$candidate
+    return 0
+  done
+  return 1
+}
+
 dot_client_git() (
   unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
   unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE GIT_CONFIG
   unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT
-  export GIT_NO_REPLACE_OBJECTS=1
+  unset GIT_CONFIG_PARAMETERS GIT_EXEC_PATH GIT_NAMESPACE GIT_SHALLOW_FILE
+  unset GIT_GRAFT_FILE GIT_REPLACE_REF_BASE
+  unset GIT_EXTERNAL_DIFF GIT_DIFF_OPTS GIT_PREFIX GIT_INTERNAL_SUPER_PREFIX
+  export GIT_NO_LAZY_FETCH=1 GIT_NO_REPLACE_OBJECTS=1
   exec "$DOT_CLIENT_GIT" "$@"
 )
 
 dot_client_git_metadata_safe() {
-  local checkout=$1 git_dir=$1/.git grafts=$1/.git/info/grafts
+  local checkout=$1 git_dir=$1/.git commondir=$1/.git/commondir
+  local grafts=$1/.git/info/grafts replacements
 
   # A managed install is a standalone clone, never a linked worktree. Keep its
-  # admin directory local, disable replace refs in dot_client_git, and reject
-  # legacy grafts, which have no equivalent environment switch.
+  # admin directory local and reject both replacement mechanisms. The Git
+  # environment still disables replace refs so even the metadata probe cannot
+  # consume them before this explicit fail-closed check.
   [[ -d $git_dir && ! -L $git_dir && -O $git_dir ]] || return 1
-  [[ ! -e $grafts && ! -L $grafts ]]
+  [[ ! -e $commondir && ! -L $commondir ]] || return 1
+  [[ ! -e $grafts && ! -L $grafts ]] || return 1
+  replacements=$(dot_client_git -C "$checkout" for-each-ref --count=1 \
+    --format='%(refname)' refs/replace/ 2>/dev/null) || return 1
+  [[ -z $replacements ]]
 }
 
 dot_client_exact_file() {
@@ -146,7 +196,7 @@ dot_client_exact_file() {
   # bootstrap images that omit coreutils `cmp`. Suppress configurable diff
   # delegates so this remains a literal byte comparison.
   dot_client_git --no-pager diff --no-index --quiet --no-ext-diff --no-textconv \
-    -- "$expected" "$actual"
+    -- "$expected" "$actual" 2>/dev/null
 }
 
 dot_client_exact_link() {
@@ -284,23 +334,18 @@ dot_client_tracked_tree_matches() {
   [[ $hash_complete -eq 1 && $valid -eq 1 && $hash_count -eq $count ]]
 }
 
-dot_client_standalone_ready() {
-  local checkout=$1 runtime=$2 launcher=$3 ready=$4 template
+dot_client_checkout_authorized() {
+  local checkout=$1 launcher=$2 template
   local checkout_physical top top_physical head
 
-  [[ -f "$runtime" && ! -L "$runtime" && -x "$runtime" ]] || return 1
+  [[ -d "$checkout" && ! -L "$checkout" && -O "$checkout" ]] || return 1
+  checkout_physical=$(cd -P -- "$checkout" 2>/dev/null && pwd -P) || return 1
+  dot_client_normalized_absolute "$checkout_physical" || return 1
   template=$checkout/support/client-launcher.sh
   [[ -f "$template" && ! -L "$template" ]] || return 1
-  DOT_CLIENT_GIT=$(type -P git 2>/dev/null) || return 1
-  dot_client_normalized_absolute "$DOT_CLIENT_GIT" || return 1
-  [[ -f "$DOT_CLIENT_GIT" && -x "$DOT_CLIENT_GIT" ]] || return 1
+  dot_client_select_host_git "$checkout_physical" || return 1
   dot_client_git_metadata_safe "$checkout" || return 1
-  dot_client_config_path || return 1
-  dot_client_read_ready "$ready" || return 1
   dot_client_exact_file "$launcher" "$template" || return 1
-  dot_client_exact_link "$HOME/.local/lib/dot" "$checkout/lib/dot/public" ||
-    return 1
-  checkout_physical=$(cd -P -- "$checkout" 2>/dev/null && pwd -P) || return 1
   top=$(dot_client_git -C "$checkout" rev-parse --show-toplevel 2>/dev/null) ||
     return 1
   top_physical=$(cd -P -- "$top" 2>/dev/null && pwd -P) || return 1
@@ -318,22 +363,59 @@ dot_client_standalone_ready() {
   dot_client_tracked_tree_matches "$checkout" "$head"
 }
 
+dot_client_standalone_ready() {
+  local checkout=$1 runtime=$2 launcher=$3 ready=$4
+
+  [[ -f "$runtime" && ! -L "$runtime" && -x "$runtime" ]] || return 1
+  dot_client_checkout_authorized "$checkout" "$launcher" || return 1
+  dot_client_config_path || return 1
+  dot_client_read_ready "$ready" || return 1
+  dot_client_exact_link "$HOME/.local/lib/dot" "$checkout/lib/dot/public"
+}
+
+client_validation_mode=0
+if [[ ${1:-} == __client ]]; then
+  # Temporary fleet migration API. Keep one exact silent command so the
+  # preparation writer can reuse checkout authority without loading any bytes
+  # from the checkout or exposing a general-purpose internal command surface.
+  [[ $# -eq 2 ]] || exit 2
+  [[ $2 == validate-checkout ]] || exit 2
+  client_validation_mode=1
+fi
+
 [[ -n ${HOME:-} ]] || {
+  [[ $client_validation_mode -eq 0 ]] || exit 1
   dot_client_error 'HOME is not set'
   exit 1
 }
 
-launcher_parent=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || {
+launcher_source=${BASH_SOURCE[0]}
+case $launcher_source in
+  /* | */*) launcher_directory=${launcher_source%/*} ;;
+  *) launcher_directory=. ;;
+esac
+[[ -n $launcher_directory ]] || launcher_directory=/
+launcher_parent=$(cd -P -- "$launcher_directory" 2>/dev/null && pwd -P) || {
+  [[ $client_validation_mode -eq 0 ]] || exit 1
   dot_client_error 'cannot resolve the client launcher'
   exit 1
 }
 launcher=$launcher_parent/${BASH_SOURCE[0]##*/}
 [[ -f "$launcher" && ! -L "$launcher" ]] || {
+  [[ $client_validation_mode -eq 0 ]] || exit 1
   dot_client_error "client launcher is not a regular file: $launcher"
   exit 1
 }
 
 cutover_lock=${DOT_CLIENT_CUTOVER_LOCK:-$HOME/.local/lib/dotfiles/dot-cutover.lock}
+if [[ $client_validation_mode -eq 1 ]]; then
+  dot_client_normalized_absolute "$cutover_lock" || exit 1
+  dot_client_read_lock "$cutover_lock" || exit 1
+  dot_client_resolve_checkout || exit 1
+  dot_client_checkout_authorized "$DOT_CLIENT_CHECKOUT" "$launcher" || exit 1
+  exit 0
+fi
+
 handoff_helper=${DOT_CLIENT_HANDOFF_HELPER:-$HOME/.local/lib/dotfiles/dot-library-handoff.sh}
 legacy_launcher=${DOT_CLIENT_LEGACY_LAUNCHER:-$HOME/.local/lib/dotfiles/legacy-dot-launcher.sh}
 ready_override=${DOT_CLIENT_READY:-}
