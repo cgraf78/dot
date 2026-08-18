@@ -85,6 +85,7 @@ dot_client_resolve_checkout() {
     *) return 1 ;;
   esac
   DOT_CLIENT_CHECKOUT=$DOT_CLIENT_INSTALL_CHECKOUT
+  DOT_CLIENT_DEV_CHECKOUT=''
   if [[ -L $DOT_CLIENT_INSTALL_CHECKOUT ]]; then
     dev_home=${SHDEPS_GIT_DEV_DIR:-$HOME/git}
     while [[ $dev_home != / && $dev_home == */ ]]; do
@@ -103,6 +104,7 @@ dot_client_resolve_checkout() {
     dev_physical=$(cd -P -- "$dev_checkout" 2>/dev/null && pwd -P) || return 1
     [[ $DOT_CLIENT_CHECKOUT == "$dev_physical" ]] || return 1
     dot_client_normalized_absolute "$DOT_CLIENT_CHECKOUT" || return 1
+    DOT_CLIENT_DEV_CHECKOUT=$dev_checkout
   fi
   DOT_CLIENT_RUNTIME=$DOT_CLIENT_CHECKOUT/bin/dot
 }
@@ -148,10 +150,12 @@ dot_client_path_within() {
   [[ $root == / || $path == "$root" || $path == "$root/"* ]]
 }
 
-dot_client_select_host_git() {
-  local checkout_physical=$1 home_physical directory physical_directory candidate
+dot_client_select_host_tool() {
+  local checkout_physical=$1 tool=$2
+  local home_physical directory physical_directory candidate
   local -a path_directories=()
 
+  DOT_CLIENT_HOST_TOOL=''
   home_physical=$(cd -P -- "$HOME" 2>/dev/null && pwd -P) || return 1
   if [[ $home_physical != / ]]; then
     dot_client_normalized_absolute "$home_physical" || return 1
@@ -165,22 +169,49 @@ dot_client_select_host_git() {
     physical_directory=$(cd -P -- "$directory" 2>/dev/null && pwd -P) ||
       continue
     if [[ $physical_directory == / ]]; then
-      candidate=/git
+      candidate=/$tool
     else
       dot_client_normalized_absolute "$physical_directory" || continue
-      candidate=$physical_directory/git
+      candidate=$physical_directory/$tool
     fi
     dot_client_normalized_absolute "$candidate" || continue
-    # A symlink target cannot be inspected without another external tool.
-    # Skip it and continue scanning for a native host Git; this keeps macOS,
-    # Linux, and Termux path discovery data-driven and fails closed otherwise.
     [[ -f $candidate && ! -L $candidate && -x $candidate ]] || continue
     dot_client_path_within "$candidate" "$home_physical" && continue
     dot_client_path_within "$candidate" "$checkout_physical" && continue
-    DOT_CLIENT_GIT=$candidate
+    DOT_CLIENT_HOST_TOOL=$candidate
     return 0
   done
   return 1
+}
+
+dot_client_select_host_git() {
+  dot_client_select_host_tool "$1" git || return 1
+  DOT_CLIENT_GIT=$DOT_CLIENT_HOST_TOOL
+}
+
+dot_client_select_host_readlink() {
+  # Never execute a symlink that could point back into HOME or the checkout.
+  # Alpine-style systems expose readlink through a regular multicall binary;
+  # keep those fixed applet interfaces inside the same PATH trust boundary.
+  DOT_CLIENT_READLINK_APPLET=''
+  if dot_client_select_host_tool "$1" readlink; then
+    :
+  elif dot_client_select_host_tool "$1" busybox; then
+    DOT_CLIENT_READLINK_APPLET=readlink
+  elif dot_client_select_host_tool "$1" toybox; then
+    DOT_CLIENT_READLINK_APPLET=readlink
+  else
+    return 1
+  fi
+  DOT_CLIENT_READLINK=$DOT_CLIENT_HOST_TOOL
+}
+
+dot_client_read_link() {
+  if [[ -n ${DOT_CLIENT_READLINK_APPLET:-} ]]; then
+    "$DOT_CLIENT_READLINK" "$DOT_CLIENT_READLINK_APPLET" "$1"
+  else
+    "$DOT_CLIENT_READLINK" "$1"
+  fi
 }
 
 dot_client_git() (
@@ -224,8 +255,25 @@ dot_client_exact_link() {
   local path=$1 expected=$2 actual
 
   [[ -L $path ]] || return 1
-  actual=$(readlink "$path") || return 1
+  # Keep a non-newline sentinel last so command substitution cannot discard
+  # newline bytes that belong to the literal link target. Remove the sentinel
+  # and exactly one utility terminator before comparing the preserved target.
+  actual=$(dot_client_read_link "$path" && printf '\001') || return 1
+  [[ $actual == *$'\001' ]] || return 1
+  actual=${actual%$'\001'}
+  [[ $actual == *$'\n' ]] || return 1
+  actual=${actual%$'\n'}
   [[ $actual == "$expected" ]]
+}
+
+dot_client_checkout_alias_bound() {
+  local checkout=$1
+
+  [[ -n ${DOT_CLIENT_DEV_CHECKOUT:-} ]] || return 0
+  dot_client_exact_link \
+    "$DOT_CLIENT_INSTALL_CHECKOUT" "$DOT_CLIENT_DEV_CHECKOUT" || return 1
+  [[ $DOT_CLIENT_INSTALL_CHECKOUT -ef $checkout &&
+    $DOT_CLIENT_DEV_CHECKOUT -ef $checkout ]]
 }
 
 dot_client_read_ready() {
@@ -365,6 +413,7 @@ dot_client_checkout_authorized() {
   template=$checkout/support/client-launcher.sh
   [[ -f "$template" && ! -L "$template" ]] || return 1
   dot_client_select_host_git "$checkout_physical" || return 1
+  dot_client_select_host_readlink "$checkout_physical" || return 1
   dot_client_git_metadata_safe "$checkout" || return 1
   dot_client_exact_file "$launcher" "$template" || return 1
   top=$(dot_client_git -C "$checkout" rev-parse --show-toplevel 2>/dev/null) ||
@@ -381,7 +430,8 @@ dot_client_checkout_authorized() {
   # Readiness proves convergence at one point in time. Recheck the complete
   # tracked tree immediately before dispatch so later content or type changes
   # cannot become the standalone execution authority.
-  dot_client_tracked_tree_matches "$checkout" "$head"
+  dot_client_tracked_tree_matches "$checkout" "$head" || return 1
+  dot_client_checkout_alias_bound "$checkout"
 }
 
 dot_client_standalone_ready() {
@@ -392,7 +442,10 @@ dot_client_standalone_ready() {
   dot_client_config_path || return 1
   dot_client_read_ready "$ready" || return 1
   dot_client_exact_link \
-    "$HOME/.local/lib/dot" "$DOT_CLIENT_INSTALL_CHECKOUT/lib/dot/public"
+    "$HOME/.local/lib/dot" "$DOT_CLIENT_INSTALL_CHECKOUT/lib/dot/public" ||
+    return 1
+  [[ $HOME/.local/lib/dot -ef $checkout/lib/dot/public ]] || return 1
+  dot_client_checkout_alias_bound "$checkout"
 }
 
 client_validation_mode=0
