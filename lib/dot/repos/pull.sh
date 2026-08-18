@@ -137,9 +137,11 @@ _repo_candidate_adapter_allowed() {
 # the repository's home/ subtree.
 _repo_validate_candidate_tree() {
   local kind=$1 ref=$2 entry header mode type oid path relative count=0
-  local raw valid=1
+  local raw valid=1 reserved_roots reserved_roots_after
   shift 2
 
+  _dot_reserved_roots_snapshot || return 1
+  reserved_roots=$REPLY
   _dot_cleanup_mktemp || return 1
   raw=$REPLY
   if ! "$@" ls-tree -rz --full-tree "$ref" >"$raw"; then
@@ -175,7 +177,8 @@ _repo_validate_candidate_tree() {
     else
       relative=$path
     fi
-    if dot_candidate_path_is_reserved "$HOME/$relative" &&
+    if _dot_candidate_path_is_reserved_from_roots \
+      "$HOME/$relative" "$reserved_roots" &&
       ! _repo_candidate_adapter_allowed "$ref" "$path" "$mode" "$@"; then
       _warn "  warning: candidate repository owns reserved path: $relative"
       valid=0
@@ -187,6 +190,14 @@ _repo_validate_candidate_tree() {
       break
     }
   done <"$raw"
+  if [[ $valid -eq 1 ]]; then
+    if ! _dot_reserved_roots_snapshot; then
+      valid=0
+    else
+      reserved_roots_after=$REPLY
+      [[ $reserved_roots_after == "$reserved_roots" ]] || valid=0
+    fi
+  fi
   _dot_cleanup_remove_path "$raw" || return 1
   [[ $valid -eq 1 ]]
 }

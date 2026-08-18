@@ -104,6 +104,127 @@ assert_eq 0 "$reserved_pipe_status" \
 assert_eq '' "$reserved_pipe_output" \
   'reserved-root lookup drains its producer without broken-pipe diagnostics'
 
+# Candidate inventories can contain hundreds of paths. Resolve the complete
+# reserved-root set once per candidate, and avoid an external canonicalizer for
+# ordinary roots whose leaf is not a symlink. The one symlink below still needs
+# physical resolution; repeated calls expose the process-spawn regression that
+# made warm repository and overlay convergence take minutes.
+reserved_resolution_home=$DOT_TEST_TMP/reserved-resolution-home
+reserved_resolution_state=$DOT_TEST_TMP/reserved-resolution-state
+reserved_resolution_target=$DOT_TEST_TMP/reserved-resolution-target
+reserved_resolution_bin=$DOT_TEST_TMP/reserved-resolution-bin
+reserved_resolution_log=$DOT_TEST_TMP/reserved-resolution.log
+reserved_resolution_realpath=$(type -P realpath)
+mkdir -p "$reserved_resolution_home/.local/lib" \
+  "$reserved_resolution_state" "$reserved_resolution_target" \
+  "$reserved_resolution_bin"
+ln -s "$reserved_resolution_target" \
+  "$reserved_resolution_home/.local/lib/dot"
+cat >"$reserved_resolution_bin/realpath" <<'REALPATH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >>"$DOT_TEST_RESERVED_RESOLUTION_LOG"
+exec "$DOT_TEST_RESERVED_RESOLUTION_REALPATH" "$@"
+REALPATH
+chmod +x "$reserved_resolution_bin/realpath"
+HOME=$reserved_resolution_home XDG_STATE_HOME=$reserved_resolution_state \
+  DOT_SOURCE_ROOT=$root \
+  DOT_TEST_RESERVED_RESOLUTION_LOG=$reserved_resolution_log \
+  DOT_TEST_RESERVED_RESOLUTION_REALPATH=$reserved_resolution_realpath \
+  PATH="$reserved_resolution_bin:$PATH" bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    OVERLAYS=()
+    ! dot_candidate_path_is_reserved "$HOME/.config/ordinary/value"
+  '
+assert_eq 1 "$(awk 'END { print NR }' "$reserved_resolution_log")" \
+  'candidate validation canonicalizes one symlinked reserved root once'
+
+# A fetched tree is inert until validation completes, so one stable root
+# snapshot can serve every entry. Re-read once after the scan to reject a root
+# topology change without multiplying canonicalization by tree size.
+fixture_repo reserved-resolution-tree main \
+  first $'one\n' 100644 \
+  second $'two\n' 100644 \
+  nested/third $'three\n' 100644
+reserved_resolution_origin=$REPLY
+: >"$reserved_resolution_log"
+HOME=$reserved_resolution_home XDG_STATE_HOME=$reserved_resolution_state \
+  DOT_SOURCE_ROOT=$root \
+  DOT_TEST_RESERVED_RESOLUTION_LOG=$reserved_resolution_log \
+  DOT_TEST_RESERVED_RESOLUTION_REALPATH=$reserved_resolution_realpath \
+  DOT_TEST_RESERVED_RESOLUTION_ORIGIN=$reserved_resolution_origin \
+  PATH="$reserved_resolution_bin:$PATH" bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/resources.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/init-client.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    OVERLAYS=()
+    _repo_validate_candidate_tree base HEAD \
+      git --git-dir="$DOT_TEST_RESERVED_RESOLUTION_ORIGIN"
+  '
+assert_eq 2 "$(awk 'END { print NR }' "$reserved_resolution_log")" \
+  'candidate tree validation snapshots reserved roots before and after its scan'
+
+# Physical candidate resolution is sourceable library behavior. Preserve the
+# caller's logical cwd and OLDPWD even when the path crosses a symlink and its
+# missing suffix must be appended to the physical directory.
+physical_candidate_home=$DOT_TEST_TMP/physical-candidate-home
+physical_candidate_target=$DOT_TEST_TMP/physical-candidate-target
+mkdir -p "$physical_candidate_home" "$physical_candidate_target"
+ln -s "$physical_candidate_target" "$physical_candidate_home/alias"
+physical_candidate_result=$(HOME=$physical_candidate_home \
+  DOT_SOURCE_ROOT=$root DOT_TEST_PHYSICAL_TARGET=$physical_candidate_target \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    cd -L -- "$HOME/alias"
+    OLDPWD=$HOME/original-oldpwd
+    before=$PWD
+    _dot_physical_directory_candidate "$HOME/alias/missing/leaf"
+    printf "before=%s\nafter=%s\noldpwd=%s\nreply=%s\n" \
+      "$before" "$PWD" "$OLDPWD" "$REPLY"
+  ')
+assert_eq "before=$physical_candidate_home/alias
+after=$physical_candidate_home/alias
+oldpwd=$physical_candidate_home/original-oldpwd
+reply=$physical_candidate_target/missing/leaf" \
+  "$physical_candidate_result" \
+  'physical candidate resolution preserves caller directory state'
+
+# A pull may remove the tracked directory from which the user launched dot.
+# The shell still owns that open cwd even though its pathname no longer exists;
+# physical resolution must not abandon it while inspecting another path.
+physical_candidate_unlinked=$DOT_TEST_TMP/physical-candidate-unlinked
+physical_candidate_unlinked_target=$DOT_TEST_TMP/physical-candidate-unlinked-target
+mkdir -p "$physical_candidate_unlinked" "$physical_candidate_unlinked_target"
+physical_candidate_unlinked_result=$(HOME=$physical_candidate_home \
+  DOT_SOURCE_ROOT=$root \
+  DOT_TEST_PHYSICAL_UNLINKED=$physical_candidate_unlinked \
+  DOT_TEST_PHYSICAL_TARGET=$physical_candidate_unlinked_target \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    cd -L -- "$DOT_TEST_PHYSICAL_UNLINKED"
+    rmdir "$DOT_TEST_PHYSICAL_UNLINKED"
+    before=$PWD
+    status=0
+    _dot_physical_directory_candidate \
+      "$DOT_TEST_PHYSICAL_TARGET/missing/leaf" || status=$?
+    printf "status=%s\nbefore=%s\nafter=%s\nreply=%s\n" \
+      "$status" "$before" "$PWD" "${REPLY-}"
+  ')
+assert_eq "status=0
+before=$physical_candidate_unlinked
+after=$physical_candidate_unlinked
+reply=$physical_candidate_unlinked_target/missing/leaf" \
+  "$physical_candidate_unlinked_result" \
+  'physical candidate resolution preserves an unlinked caller directory'
+
 # Replacement identities are durable recovery data and therefore must use the
 # engine checkout's object format, not an exported repository selection from
 # the shell that happened to invoke dot. A SHA-256 decoy makes that drift
