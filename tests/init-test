@@ -220,6 +220,80 @@ assert_eq managed "$(<"$conflict_home/.bashrc")" 'consented conflict is checked 
 backup=$(find "$conflict_home/.dot-backup" -type f -name .bashrc -print -quit)
 assert_eq local "$(<"$backup")" 'conflict backup preserves prior bytes'
 
+# Initialization must not depend on a client-owned Git wrapper. A prior client
+# generation can move the wrapper's helper while the transaction is still
+# hashing later conflicts, so every init phase must retain one ordinary host
+# Git selected outside HOME and this Dot checkout.
+fixture_repo host-git main \
+  .local/lib/dotfiles/launcher-real.sh $': managed helper\n' 100644 \
+  .local/lib/dotfiles/tests/README.md $'managed test docs\n' 100644
+host_git_origin=$REPLY
+fixture_home host-git
+host_git_home=$REPLY
+host_git_state=$DOT_TEST_TMP/host-git-state
+host_git_marker=$DOT_TEST_TMP/host-git-wrapper-called
+host_git_failure_marker=$DOT_TEST_TMP/host-git-failure-observed
+host_git_failure_bin=$DOT_TEST_TMP/host-git-failure-bin
+host_git_regular_bin=$DOT_TEST_TMP/host-git-regular-bin
+system_git=$(command -v git)
+[[ $system_git == /* && -x $system_git ]] ||
+  fail 'host Git fixture did not find an executable Git'
+mkdir -p "$host_git_home/.local/bin" "$host_git_failure_bin" \
+  "$host_git_regular_bin" \
+  "$host_git_home/.local/lib/dotfiles/tests"
+cat >"$host_git_regular_bin/git" <<'GIT'
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${DOT_TEST_REAL_GIT:?}" "$@"
+GIT
+chmod 0755 "$host_git_regular_bin/git"
+cat >"$host_git_home/.local/bin/git" <<'GIT'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ! -f $HOME/.local/lib/dotfiles/launcher-real.sh ]]; then
+  printf 'called without helper\n' >>"${DOT_TEST_GIT_WRAPPER_MARKER:?}"
+fi
+. "$HOME/.local/lib/dotfiles/launcher-real.sh"
+exec "${DOT_TEST_HOST_GIT:?}" "$@"
+GIT
+chmod 0755 "$host_git_home/.local/bin/git"
+cp "$host_git_home/.local/bin/git" "$host_git_failure_bin/git"
+printf ': old helper\n' >"$host_git_home/.local/lib/dotfiles/launcher-real.sh"
+printf 'old test docs\n' >"$host_git_home/.local/lib/dotfiles/tests/README.md"
+set +e
+PATH="$host_git_failure_bin:$host_git_regular_bin:$PATH" \
+  DOT_TEST_REAL_GIT=$system_git \
+  DOT_TEST_HOST_GIT=$host_git_regular_bin/git \
+  DOT_TEST_GIT_WRAPPER_MARKER=$host_git_failure_marker \
+  run_dot "$host_git_home" "$host_git_state" init --yes \
+  "file://$host_git_origin" >/dev/null 2>&1
+host_git_failure_status=$?
+set -e
+[[ $host_git_failure_status -ne 0 ]] ||
+  fail 'failure fixture unexpectedly completed initialization'
+assert_eq 'called without helper' "$(<"$host_git_failure_marker")" \
+  'failure fixture reached the moved-helper boundary'
+assert_contains 'phase=backing-up' \
+  "$(<"$host_git_state/dot/init/transaction/record")" \
+  'failure fixture retained a resumable transaction'
+
+set +e
+PATH="$host_git_home/.local/bin:$host_git_regular_bin:$PATH" \
+  DOT_TEST_REAL_GIT=$system_git \
+  DOT_TEST_HOST_GIT=$host_git_regular_bin/git \
+  DOT_TEST_GIT_WRAPPER_MARKER=$host_git_marker \
+  run_dot "$host_git_home" "$host_git_state" init --yes \
+  "file://$host_git_origin" >/dev/null 2>&1
+host_git_status=$?
+set -e
+assert_eq 0 "$host_git_status" \
+  'initialization resumes independently of a client Git wrapper'
+[[ ! -e $host_git_marker ]] ||
+  fail 'initialization executed the client Git wrapper after moving its helper'
+assert_contains 'phase=complete' \
+  "$(<"$host_git_state/dot/init/completed")" \
+  'host Git initialization completed its durable transaction'
+
 # The write-ahead conflict inventory binds the exact prior generation. A path
 # replaced after planning is not moved into the transaction backup.
 fixture_repo conflict-race main .profile $'managed\n' 100644
