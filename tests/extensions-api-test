@@ -22,6 +22,11 @@ dot_config_load
 # shellcheck source=/dev/null
 . "$root/lib/dot/runtime.sh"
 
+assert_eq "$HOME/.dotfiles" "$DOT_CLIENT_GIT_DIR" \
+  'runtime publishes the supported client Git directory'
+assert_eq '' "${DOTFILES+x}" \
+  'runtime does not publish legacy DOTFILES compatibility state'
+
 inventory_functions() {
   awk -F '\t' '!/^#/ && NF {print $1}' "$1" | LC_ALL=C sort
 }

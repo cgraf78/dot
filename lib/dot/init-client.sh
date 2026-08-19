@@ -1449,8 +1449,6 @@ _dot_init_adopt_existing() {
   DOT_BASE_TOPOLOGY=$topology
   # shellcheck disable=SC2034 # Consumed dynamically by repository helpers.
   DOT_CLIENT_GIT_DIR=$git_dir
-  # shellcheck disable=SC2034 # Compatibility display variable for diagnostics.
-  DOTFILES=$git_dir
   _dot_init_forward_converge || return 2
   _dot_init_write_record "$record" complete "$origin" "$identity" "$branch" - "$git_dir" ||
     return 2
