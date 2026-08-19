@@ -5,17 +5,17 @@
 # WSL. Unlike a PID-only lock, the owner record also carries the process start
 # identity, so a reused PID cannot keep a crashed update locked forever.
 
-if ! declare -F _dot_xdg_path >/dev/null 2>&1; then
-  # shellcheck source=xdg.sh disable=SC1091
-  . "${BASH_SOURCE[0]%/*}/xdg.sh"
+if ! declare -F dot_xdg_path >/dev/null 2>&1; then
+  # shellcheck source=public/xdg.sh
+  . "${BASH_SOURCE[0]%/*}/public/xdg.sh" || return
 fi
 if ! declare -F _dot_cleanup_all >/dev/null 2>&1; then
-  # shellcheck source=resources.sh disable=SC1091
-  . "${BASH_SOURCE[0]%/*}/resources.sh"
+  # shellcheck source=resources.sh
+  . "${BASH_SOURCE[0]%/*}/resources.sh" || return
 fi
 
 _dot_update_lock_path() {
-  _dot_xdg_path state "dot/update.lock.d"
+  dot_xdg_path state "dot/update.lock.d"
 }
 
 _dot_update_lock_owner_file() {
