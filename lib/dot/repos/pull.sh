@@ -228,26 +228,185 @@ _repo_prepare_overlay_upstream() {
   REPLY=$upstream
 }
 
-_repo_discard_prepared_parents() {
-  local manifest=$1 remove=${2:-false} path index
-  local -a paths=()
+_repo_materialization_record_header() {
+  local record=$1 header before_line after_line before after
 
+  {
+    IFS= read -r header || return 1
+    IFS= read -r before_line || return 1
+    IFS= read -r after_line || return 1
+  } <"$record"
+  [[ $header == 'cgraf78 dot pull materialization v1' &&
+    $before_line == before=* && $after_line == after=* ]] || return 1
+  before=${before_line#before=}
+  after=${after_line#after=}
+  [[ $before =~ ^[0-9a-fA-F]+$ && $after =~ ^[0-9a-fA-F]+$ &&
+    (${#before} -eq 40 || ${#before} -eq 64) &&
+    ${#after} -eq ${#before} ]] || return 1
+  REPLY_BEFORE=$before
+  REPLY_AFTER=$after
+}
+
+_repo_record_prepared_parent() {
+  local record=$1 kind=$2 relative=$3 path=$4 identity
+
+  [[ $kind == existing || $kind == created ]] || return 1
+  _dot_init_safe_relative_path "$relative" || return 1
+  identity=$(_dot_path_identity "$path") || return 1
+  printf 'parent\t%s\t%s\t%s\n' "$kind" "$identity" "$relative" >>"$record" ||
+    return 1
+  [[ $(_dot_path_identity "$path" 2>/dev/null || true) == "$identity" ]]
+}
+
+_repo_discard_prepared_parents() {
+  local root=$1 manifest=$2 remove=${3:-false}
+  local record_type kind identity relative extra path current_identity index valid=1
+  local -a paths=() identities=()
+
+  _repo_materialization_record_header "$manifest" || return 1
   if [[ $remove == true ]]; then
-    while IFS= read -r -d '' path; do
-      paths+=("$path")
-    done <"$manifest"
+    {
+      IFS= read -r _ || valid=0
+      IFS= read -r _ || valid=0
+      IFS= read -r _ || valid=0
+      while [[ $valid -eq 1 ]] &&
+        IFS=$'\t' read -r record_type kind identity relative extra; do
+        [[ $record_type == parent && ($kind == existing || $kind == created) &&
+          -z $extra ]] || {
+          valid=0
+          break
+        }
+        _dot_init_safe_relative_path "$relative" || {
+          valid=0
+          break
+        }
+        [[ $kind == created ]] || continue
+        path=$root/$relative
+        identities+=("$identity")
+        paths+=("$path")
+      done
+    } <"$manifest"
     for ((index = ${#paths[@]} - 1; index >= 0; index--)); do
+      current_identity=$(_dot_path_identity "${paths[$index]}" 2>/dev/null || true)
+      if [[ $current_identity != "${identities[$index]}" ]]; then
+        valid=0
+        continue
+      fi
       rmdir "${paths[$index]}" 2>/dev/null || true
     done
   fi
-  _dot_cleanup_remove_path "$manifest"
+  _dot_cleanup_remove_path "$manifest" || return 1
+  [[ $valid -eq 1 ]]
+}
+
+_repo_parent_was_existing() {
+  local manifest=$1 expected_relative=$2 expected_identity=$3
+  local record_type kind identity relative extra
+
+  _repo_materialization_record_header "$manifest" || return 2
+  {
+    IFS= read -r _ || return 2
+    IFS= read -r _ || return 2
+    IFS= read -r _ || return 2
+    while IFS=$'\t' read -r record_type kind identity relative extra; do
+      [[ $record_type == parent && ($kind == existing || $kind == created) &&
+        -z $extra ]] || return 2
+      if [[ $kind == existing && $relative == "$expected_relative" &&
+        $identity == "$expected_identity" ]]; then
+        return 0
+      fi
+    done
+  } <"$manifest"
+  return 1
+}
+
+_repo_materialization_pending_ref() {
+  printf '%s\n' refs/dot/materialization-pending-v1
+}
+
+_repo_publish_materialization_record() {
+  local record=$1 ref blob
+  shift
+
+  _repo_materialization_record_header "$record" || return 1
+  blob=$("$@" hash-object -w -- "$record" 2>/dev/null) || return 1
+  [[ $blob =~ ^[0-9a-fA-F]+$ &&
+    (${#blob} -eq 40 || ${#blob} -eq 64) ]] || return 1
+  ref=$(_repo_materialization_pending_ref)
+  "$@" update-ref "$ref" "$blob" '' || return 1
+  REPLY=$blob
+}
+
+_repo_load_materialization_record() {
+  local ref oid record
+
+  ref=$(_repo_materialization_pending_ref)
+  if ! oid=$("$@" rev-parse --verify "$ref" 2>/dev/null); then
+    REPLY=
+    REPLY_OID=
+    return 0
+  fi
+  [[ $oid =~ ^[0-9a-fA-F]+$ &&
+    (${#oid} -eq 40 || ${#oid} -eq 64) ]] || return 1
+  _dot_cleanup_mktemp || return 1
+  record=$REPLY
+  if ! "$@" cat-file blob "$oid" >"$record" 2>/dev/null ||
+    ! _repo_materialization_record_header "$record"; then
+    _dot_cleanup_remove_path "$record" || true
+    return 1
+  fi
+  REPLY=$record
+  REPLY_OID=$oid
+}
+
+_repo_clear_materialization_record() {
+  local oid=$1 ref
+  shift
+
+  ref=$(_repo_materialization_pending_ref)
+  "$@" update-ref -d "$ref" "$oid"
+}
+
+_repo_finish_materialization() {
+  local root=$1 kind=$2 record=$3 record_oid=$4 before=$5 after=$6
+  shift 6
+
+  _repo_normalize_updated_paths \
+    "$root" "$kind" "$before" "$after" "$record" "$@" || return 1
+  _repo_discard_prepared_parents "$root" "$record" || return 1
+  _repo_clear_materialization_record "$record_oid" "$@"
+}
+
+_repo_resume_materialization() {
+  local root=$1 kind=$2 record record_oid before after current
+  shift 2
+
+  _repo_load_materialization_record "$@" || return 1
+  record=$REPLY
+  record_oid=${REPLY_OID:-}
+  [[ -n $record ]] || return 0
+  _repo_materialization_record_header "$record" || return 1
+  before=$REPLY_BEFORE
+  after=$REPLY_AFTER
+  current=$(_repo_head "$@")
+  if [[ $current == "$before" ]]; then
+    _repo_discard_prepared_parents "$root" "$record" true || return 1
+    _repo_clear_materialization_record "$record_oid" "$@"
+    return
+  fi
+  [[ $current == "$after" ]] || return 1
+  _repo_finish_materialization \
+    "$root" "$kind" "$record" "$record_oid" "$before" "$after" "$@"
 }
 
 _repo_prepare_updated_path_parents() {
-  local root=$1 before=$2 after=$3 inventory manifest relative parent current component
+  local root=$1 before=$2 after=$3 inventory manifest relative parent
+  local current relative_current component
   local valid=1
   local -a components=()
   shift 3
+
+  after=$("$@" rev-parse --verify "$after^{commit}" 2>/dev/null) || return 1
 
   _dot_cleanup_mktemp || return 1
   inventory=$REPLY
@@ -256,6 +415,12 @@ _repo_prepare_updated_path_parents() {
     return 1
   }
   manifest=$REPLY
+  printf 'cgraf78 dot pull materialization v1\nbefore=%s\nafter=%s\n' \
+    "$before" "$after" >"$manifest" || {
+    _dot_cleanup_remove_path "$inventory" || true
+    _dot_cleanup_remove_path "$manifest" || true
+    return 1
+  }
   if ! "$@" diff --name-only --diff-filter=AMT --no-renames -z \
     "$before" "$after" -- >"$inventory"; then
     _dot_cleanup_remove_path "$inventory" || true
@@ -270,20 +435,33 @@ _repo_prepare_updated_path_parents() {
     parent=${relative%/*}
     [[ $parent != "$relative" ]] || continue
     current=$root
+    relative_current=
     IFS=/ read -r -a components <<<"$parent"
     for component in "${components[@]}"; do
       current=$current/$component
-      [[ -d $current ]] && continue
-      [[ ! -e $current && ! -L $current ]] || {
-        valid=0
-        break 2
-      }
+      if [[ -n $relative_current ]]; then
+        relative_current=$relative_current/$component
+      else
+        relative_current=$component
+      fi
+      if [[ -d $current && ! -L $current ]]; then
+        _repo_record_prepared_parent \
+          "$manifest" existing "$relative_current" "$current" || {
+          valid=0
+          break 2
+        }
+        continue
+      fi
+      # A tracked file or symlink may become a directory in the candidate
+      # commit. Let Git perform that type transition; precreation must neither
+      # reject it nor traverse the old symlink outside this worktree.
+      [[ ! -e $current && ! -L $current ]] || break
       _dot_mkdir_with_umask "$current" || {
         valid=0
         break 2
       }
-      printf '%s\0' "$current" >>"$manifest" || {
-        rmdir "$current" 2>/dev/null || true
+      _repo_record_prepared_parent \
+        "$manifest" created "$relative_current" "$current" || {
         valid=0
         break 2
       }
@@ -291,19 +469,85 @@ _repo_prepare_updated_path_parents() {
   done <"$inventory"
   _dot_cleanup_remove_path "$inventory" || valid=0
   if [[ $valid -ne 1 ]]; then
-    _repo_discard_prepared_parents "$manifest" true || true
+    _repo_discard_prepared_parents "$root" "$manifest" true || true
     return 1
   fi
   REPLY=$manifest
 }
 
+_repo_commit_path_type() {
+  local commit=$1 relative=$2 oid type
+  shift 2
+
+  if ! oid=$("$@" rev-parse --verify "$commit:$relative" 2>/dev/null); then
+    REPLY=missing
+    return 0
+  fi
+  type=$("$@" cat-file -t "$oid" 2>/dev/null) || return 1
+  case $type in
+    blob | tree) REPLY=$type ;;
+    *) return 1 ;;
+  esac
+}
+
+_repo_normalize_updated_path_parents() {
+  local root=$1 before=$2 after=$3 relative=$4 manifest=$5
+  local parent current relative_parent component before_type after_type
+  local identity mode final_mode existing_status
+  local -a components=()
+  shift 5
+
+  parent=${relative%/*}
+  [[ $parent != "$relative" ]] || return 0
+  current=$root
+  relative_parent=
+  IFS=/ read -r -a components <<<"$parent"
+  for component in "${components[@]}"; do
+    current=$current/$component
+    if [[ -n $relative_parent ]]; then
+      relative_parent=$relative_parent/$component
+    else
+      relative_parent=$component
+    fi
+    [[ -d $current && ! -L $current ]] || return 1
+    _repo_commit_path_type "$after" "$relative_parent" "$@" || return 1
+    after_type=$REPLY
+    [[ $after_type == tree ]] || return 1
+    _repo_commit_path_type "$before" "$relative_parent" "$@" || return 1
+    before_type=$REPLY
+    [[ $before_type != tree ]] || continue
+
+    identity=$(_dot_path_identity "$current") || return 1
+    existing_status=0
+    _repo_parent_was_existing \
+      "$manifest" "$relative_parent" "$identity" || existing_status=$?
+    case $existing_status in
+      0) continue ;;
+      1) ;;
+      *) return 1 ;;
+    esac
+
+    mode=$(stat -c '%a' "$current" 2>/dev/null || stat -f '%Lp' "$current" 2>/dev/null) ||
+      return 1
+    [[ $(_dot_path_identity "$current" 2>/dev/null || true) == "$identity" ]] ||
+      return 1
+    _dot_mode_with_umask_ceiling "$mode" 0777 || return 1
+    final_mode=$REPLY
+    chmod "$final_mode" "$current" || return 1
+    [[ $(_dot_path_identity "$current" 2>/dev/null || true) == "$identity" ]] ||
+      return 1
+  done
+}
+
 _repo_normalize_updated_path() {
-  local root=$1 kind=$2 relative=$3 mode=$4 oid=$5 after=$6
+  local root=$1 kind=$2 relative=$3 mode=$4 oid=$5 before=$6 after=$7 manifest=$8
   local target target_parent target_identity target_mode
   local prepared_root prepared prepared_identity final_mode current_oid ceiling
-  shift 6
+  shift 8
 
   _dot_init_safe_relative_path "$relative" || return 1
+  _repo_normalize_updated_path_parents \
+    "$root" "$before" "$after" "$relative" "$manifest" "$@" || return 1
   [[ $mode == 120000 ]] && return 0
   [[ $mode == 100644 || $mode == 100755 ]] || return 1
   if [[ $kind == base ]] && _overlay_active_link_matches "$relative"; then
@@ -324,9 +568,9 @@ _repo_normalize_updated_path() {
     return 1
 
   # The checkout may have been born group-writable under a default ACL. Build
-  # an exact replacement from the captured commit, then atomically replace the
-  # exposed inode so a writer that opened the unsafe generation cannot retain
-  # authority after the mode clamp.
+  # an exact replacement from the captured commit, then retire and replace the
+  # exposed inode inside a signal-deferred transaction so a writer that opened
+  # the unsafe generation cannot retain authority after the mode clamp.
   target_parent=${target%/*}
   [[ -n $target_parent && $target_parent != "$target" ]] || return 1
   _dot_cleanup_mktemp -d "$target_parent/.dot-normalize.XXXXXXXX" || return 1
@@ -360,10 +604,10 @@ _repo_normalize_updated_path() {
 }
 
 _repo_normalize_updated_paths() {
-  local root=$1 kind=$2 before=$3 after=$4
+  local root=$1 kind=$2 before=$3 after=$4 manifest=$5
   local inventory header relative old_mode new_mode old_oid new_oid status extra
   local valid=1
-  shift 4
+  shift 5
 
   [[ $(_repo_head "$@") == "$after" ]] || return 1
   _dot_cleanup_mktemp || return 1
@@ -392,7 +636,8 @@ _repo_normalize_updated_paths() {
     }
     [[ $new_mode != 000000 ]] || continue
     _repo_normalize_updated_path \
-      "$root" "$kind" "$relative" "$new_mode" "$new_oid" "$after" "$@" || {
+      "$root" "$kind" "$relative" "$new_mode" "$new_oid" \
+      "$before" "$after" "$manifest" "$@" || {
       valid=0
       break
     }
@@ -413,7 +658,11 @@ _pull_base() {
     REPLY_STATUS="skipped"
     return 0
   fi
-  local head_before head_after prepared_parents
+  local head_before head_after prepared_parents materialization_oid
+  _repo_resume_materialization "$HOME" base _base_git || {
+    REPLY_STATUS=failed
+    return 1
+  }
   head_before=$(_repo_head _base_git)
   local pull_rc=0
   local upstream
@@ -427,26 +676,42 @@ _pull_base() {
     return 1
   }
   prepared_parents=$REPLY
+  _repo_publish_materialization_record "$prepared_parents" _base_git || {
+    _repo_discard_prepared_parents "$HOME" "$prepared_parents" true || true
+    REPLY_STATUS=failed
+    return 1
+  }
+  materialization_oid=$REPLY
   _pull_repo "$HOME" _base_git rebase --autostash "$upstream" "$@" || pull_rc=$?
   if [[ "$pull_rc" -eq 0 ]]; then
     head_after=$(_repo_head _base_git)
     if [[ -n "$head_before" && -n "$head_after" && "$head_before" != "$head_after" ]]; then
-      if ! _repo_normalize_updated_paths "$HOME" base "$head_before" "$head_after" _base_git; then
-        _repo_discard_prepared_parents "$prepared_parents" || true
+      if ! _repo_finish_materialization \
+        "$HOME" base "$prepared_parents" "$materialization_oid" \
+        "$head_before" "$head_after" _base_git; then
+        _dot_cleanup_remove_path "$prepared_parents" || true
         REPLY_STATUS="failed"
         return 1
       fi
       REPLY_STATUS="changed"
     else
+      if ! _repo_discard_prepared_parents "$HOME" "$prepared_parents" ||
+        ! _repo_clear_materialization_record "$materialization_oid" _base_git; then
+        REPLY_STATUS="failed"
+        return 1
+      fi
       REPLY_STATUS="current"
-    fi
-    if ! _repo_discard_prepared_parents "$prepared_parents"; then
-      REPLY_STATUS="failed"
-      return 1
     fi
     return 0
   fi
-  _repo_discard_prepared_parents "$prepared_parents" true || true
+  head_after=$(_repo_head _base_git)
+  if [[ $head_after == "$head_before" ]]; then
+    if _repo_discard_prepared_parents "$HOME" "$prepared_parents" true; then
+      _repo_clear_materialization_record "$materialization_oid" _base_git || true
+    fi
+  else
+    _dot_cleanup_remove_path "$prepared_parents" || true
+  fi
   REPLY_STATUS="failed"
   return 1
 }
@@ -591,6 +856,24 @@ _repo_normalize_cloned_overlay_modes() {
   [[ $valid -eq 1 ]]
 }
 
+_repo_cloned_overlay_matches_commit() {
+  local root=$1 commit=$2 untracked
+
+  git -C "$root" diff --cached --quiet "$commit" -- || return 1
+  git -C "$root" diff --quiet "$commit" -- || return 1
+  _dot_cleanup_mktemp || return 1
+  untracked=$REPLY
+  if ! git -C "$root" ls-files --others -z >"$untracked"; then
+    _dot_cleanup_remove_path "$untracked" || true
+    return 1
+  fi
+  if [[ -s $untracked ]]; then
+    _dot_cleanup_remove_path "$untracked" || true
+    return 1
+  fi
+  _dot_cleanup_remove_path "$untracked"
+}
+
 _repo_clone_overlay_staged() {
   local url=$1 path=$2 parent name stage_root stage commit
   parent=${path%/*}
@@ -606,14 +889,14 @@ _repo_clone_overlay_staged() {
   fi
   commit=$(_repo_head git -C "$stage")
   if [[ -z $commit ]] ||
-    ! _repo_validate_candidate_tree overlay "$commit" git -C "$stage"; then
+    ! _repo_validate_candidate_tree overlay "$commit" git -C "$stage" ||
+    ! _repo_cloned_overlay_matches_commit "$stage" "$commit"; then
     _dot_cleanup_remove_path "$stage_root" || true
     return 1
   fi
   if ! _repo_normalize_cloned_overlay_modes "$stage" "$commit" ||
     [[ $(_repo_head git -C "$stage") != "$commit" ]] ||
-    ! git -C "$stage" diff --cached --quiet "$commit" -- ||
-    ! git -C "$stage" diff --quiet "$commit" --; then
+    ! _repo_cloned_overlay_matches_commit "$stage" "$commit"; then
     _dot_cleanup_remove_path "$stage_root" || true
     return 1
   fi
@@ -689,8 +972,12 @@ _pull_overlay() {
     REPLY_STATUS="skipped"
     return 0
   fi
-  local upstream prepared_parents head_before head_after
+  local upstream prepared_parents materialization_oid head_before head_after
   local prepare_rc=0
+  if ! _repo_resume_materialization "$path" overlay git -C "$path"; then
+    REPLY_STATUS=failed
+    return 0
+  fi
   _repo_prepare_overlay_upstream "$path" "$optional" || prepare_rc=$?
   if [[ $prepare_rc -ne 0 ]]; then
     [[ "$optional" == true ]] && return 0
@@ -712,6 +999,13 @@ _pull_overlay() {
     return 0
   }
   prepared_parents=$REPLY
+  if ! _repo_publish_materialization_record \
+    "$prepared_parents" git -C "$path"; then
+    _repo_discard_prepared_parents "$path" "$prepared_parents" true || true
+    REPLY_STATUS=failed
+    return 0
+  fi
+  materialization_oid=$REPLY
 
   if [[ "$optional" == "true" ]]; then
     local quiet_before quiet_was_set=0
@@ -721,7 +1015,15 @@ _pull_overlay() {
     fi
     DOT_QUIET=1
     if ! _pull_repo "$path" git -C "$path" rebase --autostash "$upstream" "$@"; then
-      _repo_discard_prepared_parents "$prepared_parents" true || true
+      head_after=$(_repo_head git -C "$path")
+      if [[ $head_after == "$head_before" ]]; then
+        if _repo_discard_prepared_parents "$path" "$prepared_parents" true; then
+          _repo_clear_materialization_record \
+            "$materialization_oid" git -C "$path" || true
+        fi
+      else
+        _dot_cleanup_remove_path "$prepared_parents" || true
+      fi
       if [[ "$quiet_was_set" -eq 1 ]]; then
         DOT_QUIET="$quiet_before"
       else
@@ -736,19 +1038,22 @@ _pull_overlay() {
     fi
     head_after=$(_repo_head git -C "$path")
     if [[ -n "$head_before" && -n "$head_after" && "$head_before" != "$head_after" ]]; then
-      if ! _repo_normalize_updated_paths \
-        "$path" overlay "$head_before" "$head_after" git -C "$path"; then
-        _repo_discard_prepared_parents "$prepared_parents" || true
+      if ! _repo_finish_materialization \
+        "$path" overlay "$prepared_parents" "$materialization_oid" \
+        "$head_before" "$head_after" git -C "$path"; then
+        _dot_cleanup_remove_path "$prepared_parents" || true
         REPLY_STATUS="failed"
         return 0
       fi
       REPLY_STATUS="changed"
     else
+      if ! _repo_discard_prepared_parents "$path" "$prepared_parents" ||
+        ! _repo_clear_materialization_record \
+          "$materialization_oid" git -C "$path"; then
+        REPLY_STATUS="failed"
+        return 0
+      fi
       REPLY_STATUS="current"
-    fi
-    if ! _repo_discard_prepared_parents "$prepared_parents"; then
-      REPLY_STATUS="failed"
-      return 0
     fi
     return 0
   fi
@@ -759,7 +1064,15 @@ _pull_overlay() {
     _log_header "==> Pulling $name dotfiles..."
   fi
   if ! _pull_repo "$path" git -C "$path" rebase --autostash "$upstream" "$@"; then
-    _repo_discard_prepared_parents "$prepared_parents" true || true
+    head_after=$(_repo_head git -C "$path")
+    if [[ $head_after == "$head_before" ]]; then
+      if _repo_discard_prepared_parents "$path" "$prepared_parents" true; then
+        _repo_clear_materialization_record \
+          "$materialization_oid" git -C "$path" || true
+      fi
+    else
+      _dot_cleanup_remove_path "$prepared_parents" || true
+    fi
     if [[ "${DOT_UI_TOTAL:-0}" -gt 0 ]]; then
       _ui_status warning "$name dotfiles pull failed"
     else
@@ -770,9 +1083,10 @@ _pull_overlay() {
   fi
   head_after=$(_repo_head git -C "$path")
   if [[ -n "$head_before" && -n "$head_after" && "$head_before" != "$head_after" ]]; then
-    if ! _repo_normalize_updated_paths \
-      "$path" overlay "$head_before" "$head_after" git -C "$path"; then
-      _repo_discard_prepared_parents "$prepared_parents" || true
+    if ! _repo_finish_materialization \
+      "$path" overlay "$prepared_parents" "$materialization_oid" \
+      "$head_before" "$head_after" git -C "$path"; then
+      _dot_cleanup_remove_path "$prepared_parents" || true
       _warn "  warning: $name dotfiles mode normalization failed"
       REPLY_STATUS="failed"
       return 0
@@ -780,12 +1094,14 @@ _pull_overlay() {
     [[ "${DOT_UI_TOTAL:-0}" -gt 0 && "${DOT_VERBOSE:-0}" -eq 1 ]] && _ui_status changed "$name dotfiles updated"
     REPLY_STATUS="changed"
   else
+    if ! _repo_discard_prepared_parents "$path" "$prepared_parents" ||
+      ! _repo_clear_materialization_record \
+        "$materialization_oid" git -C "$path"; then
+      REPLY_STATUS="failed"
+      return 0
+    fi
     [[ "${DOT_UI_TOTAL:-0}" -gt 0 && "${DOT_VERBOSE:-0}" -eq 1 ]] && _ui_status ok "$name dotfiles current"
     REPLY_STATUS="current"
-  fi
-  if ! _repo_discard_prepared_parents "$prepared_parents"; then
-    REPLY_STATUS="failed"
-    return 0
   fi
   return 0
 }

@@ -57,7 +57,8 @@ _dot_mkdir_with_umask() {
   mkdir -m 0700 "$path" || return 1
   identity=$(_dot_path_identity "$path") || return 1
   if chmod '=rwx' "$path"; then
-    return 0
+    [[ $(_dot_path_identity "$path" 2>/dev/null || true) == "$identity" ]]
+    return
   fi
   if [[ $(_dot_path_identity "$path" 2>/dev/null || true) == "$identity" ]]; then
     rmdir "$path" 2>/dev/null || true
@@ -212,14 +213,9 @@ _dot_restore_retired_regular() {
   _dot_cleanup_remove_path "$transaction" || true
 }
 
-_dot_publish_prepared_expected_regular() {
-  local source=$1 target=$2 expected_identity=$3
-  local directory transaction retired retired_identity
-
-  directory=${target%/*}
-  [[ -n $directory && $directory != "$target" ]] || return 1
-  _dot_cleanup_mktemp -d "$directory/.dot-publish.XXXXXXXX" || return 1
-  transaction=$REPLY
+_dot_publish_prepared_expected_regular_locked() {
+  local source=$1 target=$2 expected_identity=$3 transaction=$4
+  local retired retired_identity next
   retired=$transaction/previous
 
   # Retire the currently named generation into private storage before
@@ -231,6 +227,10 @@ _dot_publish_prepared_expected_regular() {
     else
       _dot_cleanup_remove_path "$transaction" || true
     fi
+    return 1
+  fi
+  if [[ ${DOT_CLEANUP_PENDING_STATUS:-0} -ne 0 ]]; then
+    _dot_restore_retired_regular "$transaction" "$retired" "$target" || true
     return 1
   fi
   retired_identity=$(_dot_path_identity "$retired") || {
@@ -250,7 +250,35 @@ _dot_publish_prepared_expected_regular() {
     _dot_restore_retired_regular "$transaction" "$retired" "$target" || true
     return 1
   fi
+  if [[ ${DOT_CLEANUP_PENDING_STATUS:-0} -ne 0 ]]; then
+    next=$transaction/next
+    if _dot_move_noreplace "$target" "$next"; then
+      _dot_restore_retired_regular "$transaction" "$retired" "$target" || true
+    else
+      _dot_cleanup_unregister_path "$transaction"
+    fi
+    return 1
+  fi
   _dot_cleanup_remove_path "$transaction"
+}
+
+_dot_publish_prepared_expected_regular() {
+  local source=$1 target=$2 expected_identity=$3
+  local directory transaction status=0
+
+  directory=${target%/*}
+  [[ -n $directory && $directory != "$target" ]] || return 1
+  _dot_cleanup_mktemp -d "$directory/.dot-publish.XXXXXXXX" || return 1
+  transaction=$REPLY
+
+  # Defer handled termination across the retire/publish pair. The locked helper
+  # observes a pending signal and restores the retired generation before this
+  # boundary releases the owner trap.
+  _dot_cleanup_begin_registration
+  _dot_publish_prepared_expected_regular_locked \
+    "$source" "$target" "$expected_identity" "$transaction" || status=$?
+  _dot_cleanup_end_registration
+  return "$status"
 }
 
 _dot_publish_prepared_regular() {
