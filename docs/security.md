@@ -31,8 +31,8 @@ Client materialization reapplies the effective process umask after filesystem
 creation, including on filesystems whose inherited default ACL would otherwise
 grant broader access. Initialization and staged overlay clones normalize the
 new generation before publication. Successful base and overlay pulls rebuild
-only changed regular paths from the captured commit, preserving a stricter
-existing mode while closing inherited group or other write authority.
+only changed regular paths from the captured commit and prevent the pulled
+generation from retaining inherited group or other write authority.
 
 Initialization and overlay replacement use private, generation-bound recovery
 records. Rollback removes or restores only the exact leaf, parent, staged, and

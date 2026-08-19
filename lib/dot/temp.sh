@@ -31,28 +31,37 @@ _dot_apply_tracked_file_mode() {
 }
 
 _dot_apply_umask_ceiling() {
-  local path=$1 ceiling=${2:-07777} mode mask normalized
+  local path=$1 ceiling=${2:-07777} mode
 
   mode=$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null) ||
     return 1
+  _dot_mode_with_umask_ceiling "$mode" "$ceiling" || return 1
+  chmod "$REPLY" "$path"
+}
+
+_dot_mode_with_umask_ceiling() {
+  local mode=$1 ceiling=${2:-07777} mask
+
   mask=$(umask) || return 1
   [[ $mode != *[!0-7]* && $mask != *[!0-7]* && $ceiling != *[!0-7]* ]] ||
     return 1
-  printf -v normalized '%04o' \
+  printf -v REPLY '%04o' \
     "$((8#$mode & 8#$ceiling & ~(8#$mask & 0777)))"
-  chmod "$normalized" "$path"
 }
 
 _dot_mkdir_with_umask() {
-  local path=$1
+  local path=$1 identity
 
   # Start private so a failed mode adjustment never leaves default-ACL write
   # authority behind for a retry to mistake as a pre-existing directory.
   mkdir -m 0700 "$path" || return 1
+  identity=$(_dot_path_identity "$path") || return 1
   if chmod '=rwx' "$path"; then
     return 0
   fi
-  rmdir "$path" 2>/dev/null || true
+  if [[ $(_dot_path_identity "$path" 2>/dev/null || true) == "$identity" ]]; then
+    rmdir "$path" 2>/dev/null || true
+  fi
   return 1
 }
 
@@ -190,6 +199,56 @@ _dot_move_replace_nodir() {
 # no-follow identity still matches the generation validated here; an absent
 # destination uses exclusive publication and therefore preserves every late
 # winner.
+_dot_restore_retired_regular() {
+  local transaction=$1 retired=$2 target=$3
+
+  if ! _dot_move_noreplace "$retired" "$target"; then
+    # A late winner owns the public name. Keep the retired generation in its
+    # private recovery directory rather than deleting data the caller did not
+    # publish.
+    _dot_cleanup_unregister_path "$transaction"
+    return 1
+  fi
+  _dot_cleanup_remove_path "$transaction" || true
+}
+
+_dot_publish_prepared_expected_regular() {
+  local source=$1 target=$2 expected_identity=$3
+  local directory transaction retired retired_identity
+
+  directory=${target%/*}
+  [[ -n $directory && $directory != "$target" ]] || return 1
+  _dot_cleanup_mktemp -d "$directory/.dot-publish.XXXXXXXX" || return 1
+  transaction=$REPLY
+  retired=$transaction/previous
+
+  # Retire the currently named generation into private storage before
+  # publishing. If the name changed at the move boundary, put that winner back
+  # instead of overwriting it with the prepared bytes.
+  if ! _dot_move_noreplace "$target" "$retired"; then
+    if [[ -e $retired || -L $retired ]]; then
+      _dot_restore_retired_regular "$transaction" "$retired" "$target" || true
+    else
+      _dot_cleanup_remove_path "$transaction" || true
+    fi
+    return 1
+  fi
+  retired_identity=$(_dot_path_identity "$retired") || {
+    _dot_restore_retired_regular "$transaction" "$retired" "$target" || true
+    return 1
+  }
+  if [[ $retired_identity != "$expected_identity" ]]; then
+    _dot_restore_retired_regular "$transaction" "$retired" "$target" || true
+    return 1
+  fi
+
+  if ! _dot_move_noreplace "$source" "$target"; then
+    _dot_restore_retired_regular "$transaction" "$retired" "$target" || true
+    return 1
+  fi
+  _dot_cleanup_remove_path "$transaction"
+}
+
 _dot_publish_prepared_regular() {
   local source=$1 target=$2 expected_identity=${3:-} current_identity
   [[ -f $source && ! -L $source ]] || return 1
@@ -200,8 +259,13 @@ _dot_publish_prepared_regular() {
     expected_identity=$current_identity
     [[ $(_dot_path_identity "$target" 2>/dev/null || true) == "$expected_identity" ]] ||
       return 1
-    _dot_move_replace_nodir "$source" "$target"
+    if [[ -n ${3:-} ]]; then
+      _dot_publish_prepared_expected_regular "$source" "$target" "$expected_identity"
+    else
+      _dot_move_replace_nodir "$source" "$target"
+    fi
   else
+    [[ -z ${3:-} ]] || return 1
     _dot_move_noreplace "$source" "$target"
   fi
 }
