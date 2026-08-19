@@ -49,3 +49,21 @@ _repo_git() {
       ;;
   esac
 }
+
+# A user-requested fetch retains Git's conventional FETCH_HEAD side effect.
+# Git does not apply core.sharedRepository to that scratch file, so close any
+# broader default-ACL grant before returning control to the caller.
+_repo_git_fetch() {
+  local kind=$1 path=$2 rc=0 git_dir fetch_head
+  shift 2
+
+  _repo_git "$kind" "$path" fetch "$@" || rc=$?
+  git_dir=$(_repo_git "$kind" "$path" rev-parse --absolute-git-dir 2>/dev/null) ||
+    return 1
+  fetch_head=$git_dir/FETCH_HEAD
+  if [[ -e $fetch_head || -L $fetch_head ]]; then
+    [[ -f $fetch_head && ! -L $fetch_head && -O $fetch_head ]] || return 1
+    _dot_apply_umask_ceiling "$fetch_head" 0600 || return 1
+  fi
+  return "$rc"
+}

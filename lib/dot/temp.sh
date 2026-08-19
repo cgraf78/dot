@@ -15,6 +15,63 @@ _dot_path_identity() {
   stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1" 2>/dev/null
 }
 
+_dot_apply_tracked_file_mode() {
+  local path=$1 mode=$2
+
+  [[ -f $path && ! -L $path ]] || return 1
+  case $mode in
+    100644 | 100755)
+      # Omitted-who symbolic modes honor the effective umask even when a
+      # parent default ACL granted broader permissions at file creation.
+      chmod '=rw' "$path" || return 1
+      [[ $mode == 100644 ]] || chmod +x "$path"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+_dot_apply_umask_ceiling() {
+  local path=$1 ceiling=${2:-07777} identity mode mask normalized
+
+  identity=$(_dot_path_identity "$path") || return 1
+  mode=$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null) ||
+    return 1
+  mask=$(umask) || return 1
+  [[ $mode != *[!0-7]* && $mask != *[!0-7]* && $ceiling != *[!0-7]* ]] ||
+    return 1
+  printf -v normalized '%04o' \
+    "$((8#$mode & 8#$ceiling & ~(8#$mask & 0777)))"
+  [[ $(_dot_path_identity "$path" 2>/dev/null || true) == "$identity" ]] ||
+    return 1
+  chmod "$normalized" "$path" || return 1
+  [[ $(_dot_path_identity "$path" 2>/dev/null || true) == "$identity" ]]
+}
+
+_dot_apply_git_metadata_modes() {
+  local root=$1 inventory path valid=1
+
+  [[ -d $root && ! -L $root ]] || return 1
+  _dot_cleanup_mktemp || return 1
+  inventory=$REPLY
+  if ! find "$root" -print0 >"$inventory"; then
+    _dot_cleanup_remove_path "$inventory" || true
+    return 1
+  fi
+  while IFS= read -r -d '' path; do
+    if [[ (-d $path || -f $path) && ! -L $path ]]; then
+      _dot_apply_umask_ceiling "$path" || {
+        valid=0
+        break
+      }
+    else
+      valid=0
+      break
+    fi
+  done <"$inventory"
+  _dot_cleanup_remove_path "$inventory" || return 1
+  [[ $valid -eq 1 ]]
+}
+
 # Internal Git policy must not inherit a caller's selected repository, object
 # store, hash default, or configuration. Keep that shared isolation boundary in
 # one place for content comparison and durable overlay identities.

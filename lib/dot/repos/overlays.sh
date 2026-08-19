@@ -779,6 +779,26 @@ _overlay_publish_link() {
   [[ -L $physical && $(readlink "$physical") == "$target" ]]
 }
 
+_overlay_ensure_destination_parent() {
+  local parent=$1 relative current component
+  local -a components=()
+
+  [[ $parent == "$HOME" ]] && return 0
+  [[ $parent == "$HOME/"* ]] || return 1
+  relative=${parent#"$HOME/"}
+  _dot_init_safe_relative_path "$relative" || return 1
+  IFS=/ read -r -a components <<<"$relative"
+  current=$HOME
+  for component in "${components[@]}"; do
+    current=$current/$component
+    [[ -d $current ]] && continue
+    [[ ! -e $current && ! -L $current ]] || return 1
+    # A symbolic mode without an explicit who applies the retained process
+    # umask at creation time, even when the parent carries a broader default ACL.
+    mkdir -m '=rwx' "$current" || return 1
+  done
+}
+
 _overlay_record_final() {
   local rel="$1" owner="$2" target="$3"
   printf '%s\t%s\t%s\n' "$rel" "$owner" "$target" \
@@ -899,7 +919,7 @@ _link_overlay() {
     # `-d` deliberately follows a symlink to a directory, matching mkdir -p's
     # support for user-owned parent-directory indirection documented below.
     local dst_parent="${dst%/*}"
-    [[ -d "$dst_parent" ]] || mkdir -p "$dst_parent" || return 1
+    [[ -d "$dst_parent" ]] || _overlay_ensure_destination_parent "$dst_parent" || return 1
     local target replace_identity=''
     _overlay_record_link_target "$rel" "$name" "$path" "$sync" || return 1
     target="$REPLY"

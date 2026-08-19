@@ -27,6 +27,15 @@ tracked `support/client-launcher.sh` from this release. The permanent launcher
 derives the official Shdeps checkout root and requires the public library link
 to resolve into that same checkout before dispatch.
 
+Client materialization reapplies the effective process umask after filesystem
+creation, including on filesystems whose inherited default ACL would otherwise
+grant broader access. Initialization and staged overlay clones normalize
+tracked content and the Git control tree before publication, then configure
+future repository-authority writes to remain owner-only. Successful base and
+overlay pulls validate and normalize only paths changed by that pull; a mode
+normalization failure makes the update fail rather than extending authority to
+later extension execution.
+
 Initialization and overlay replacement use private, generation-bound recovery
 records. Rollback removes or restores only the exact leaf, parent, staged, and
 backup generations recorded before mutation. Tests materialize and recover
