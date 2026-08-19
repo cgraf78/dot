@@ -12,6 +12,10 @@ mode_of() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 
+identity_of() {
+  stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1"
+}
+
 assert_not_group_other_writable() {
   local path=$1 label=$2 mode
   mode=$(mode_of "$path") || fail "$label: cannot read mode"
@@ -742,6 +746,42 @@ run_dot "$legacy_home" "$DOT_TEST_TMP/legacy-separate-state" init --yes \
 run_dot "$legacy_home" "$DOT_TEST_TMP/legacy-separate-state" status >/dev/null
 assert_eq legacy "$(<"$legacy_home/.testrc")" \
   'supported legacy bare separate Git directory is adopted'
+
+# The public reinstall path is also the client-repository recovery path. When
+# the exact completed separate-Git-dir generation is simply absent, rerunning
+# the same init must build a new generation while preserving the moved one.
+fixture_repo missing-client main .testrc $'managed\n' 100644
+missing_origin=$REPLY
+fixture_home missing-client
+missing_home=$REPLY
+missing_state=$DOT_TEST_TMP/missing-client-state
+run_dot "$missing_home" "$missing_state" init --yes \
+  "file://$missing_origin" >/dev/null
+missing_first_identity=$(identity_of "$missing_home/.dotfiles")
+mv "$missing_home/.dotfiles" "$missing_home/.dotfiles.removed"
+run_dot "$missing_home" "$missing_state" init --yes \
+  "file://$missing_origin" >/dev/null
+missing_second_identity=$(identity_of "$missing_home/.dotfiles")
+[[ $missing_first_identity != "$missing_second_identity" ]] ||
+  fail 'missing completed client Git directory did not get a new generation'
+assert_eq "$missing_first_identity" \
+  "$(identity_of "$missing_home/.dotfiles.removed")" \
+  'manual recovery preserves the moved client Git generation'
+assert_contains 'initialization: complete' \
+  "$(run_dot "$missing_home" "$missing_state" init --status)" \
+  'rebuilt client Git generation publishes completion'
+mv "$missing_home/.dotfiles" "$missing_home/.dotfiles.rebuilt"
+git init -q "$missing_home"
+git -C "$missing_home" config marker.foreign true
+set +e
+run_dot "$missing_home" "$missing_state" init --yes \
+  "file://$missing_origin" >/dev/null 2>&1
+missing_with_git_status=$?
+set -e
+assert_eq 1 "$missing_with_git_status" \
+  'missing separate generation does not replace an ordinary HOME repository'
+assert_eq true "$(git -C "$missing_home" config marker.foreign)" \
+  'ordinary HOME repository is preserved during separate-generation recovery'
 
 # A completion marker is generation-bound. Replacing the client Git directory
 # must make the next exact init fail closed rather than authorize the new repo.

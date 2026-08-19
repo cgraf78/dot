@@ -1864,10 +1864,20 @@ dot_init_command() {
       _dot_init_error 'initialized client belongs to a different repository or branch' || return
     [[ $DOT_INIT_PHASE == complete ]] ||
       _dot_init_error 'completion record is not in the complete phase' || return
-    _dot_init_live_git_matches_record ||
-      _dot_init_error 'initialized client Git generation no longer matches its record' || return
-    _dot_init_forward_converge
-    return
+    if [[ $DOT_INIT_GIT_DIR == "$HOME/.dotfiles" &&
+      ! -e $DOT_INIT_GIT_DIR && ! -L $DOT_INIT_GIT_DIR &&
+      ! -e $HOME/.git && ! -L $HOME/.git ]]; then
+      # Removing the separate Git directory is the documented manual recovery
+      # boundary. Retire only this already-validated completion record, then
+      # let the normal transaction rebuild the client while preserving every
+      # existing worktree path through the conflict backup.
+      rm -f -- "$completed" || return 1
+    else
+      _dot_init_live_git_matches_record ||
+        _dot_init_error 'initialized client Git generation no longer matches its record' || return
+      _dot_init_forward_converge
+      return
+    fi
   fi
   local adoption_rc=0
   _dot_init_adopt_existing "$origin" "$identity" "$branch" || adoption_rc=$?
