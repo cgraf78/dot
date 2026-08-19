@@ -793,8 +793,7 @@ _overlay_ensure_destination_parent() {
     current=$current/$component
     [[ -d $current ]] && continue
     [[ ! -e $current && ! -L $current ]] || return 1
-    mkdir "$current" || return 1
-    _dot_apply_umask_ceiling "$current" || return 1
+    _dot_mkdir_with_umask "$current" || return 1
   done
 }
 

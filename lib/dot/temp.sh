@@ -43,6 +43,19 @@ _dot_apply_umask_ceiling() {
   chmod "$normalized" "$path"
 }
 
+_dot_mkdir_with_umask() {
+  local path=$1
+
+  # Start private so a failed mode adjustment never leaves default-ACL write
+  # authority behind for a retry to mistake as a pre-existing directory.
+  mkdir -m 0700 "$path" || return 1
+  if chmod '=rwx' "$path"; then
+    return 0
+  fi
+  rmdir "$path" 2>/dev/null || true
+  return 1
+}
+
 # Internal Git policy must not inherit a caller's selected repository, object
 # store, hash default, or configuration. Keep that shared isolation boundary in
 # one place for content comparison and durable overlay identities.
@@ -178,11 +191,13 @@ _dot_move_replace_nodir() {
 # destination uses exclusive publication and therefore preserves every late
 # winner.
 _dot_publish_prepared_regular() {
-  local source=$1 target=$2 expected_identity=''
+  local source=$1 target=$2 expected_identity=${3:-} current_identity
   [[ -f $source && ! -L $source ]] || return 1
   if [[ -e $target || -L $target ]]; then
     [[ -f $target && ! -L $target ]] || return 1
-    expected_identity=$(_dot_path_identity "$target") || return 1
+    current_identity=$(_dot_path_identity "$target") || return 1
+    [[ -z $expected_identity || $current_identity == "$expected_identity" ]] || return 1
+    expected_identity=$current_identity
     [[ $(_dot_path_identity "$target" 2>/dev/null || true) == "$expected_identity" ]] ||
       return 1
     _dot_move_replace_nodir "$source" "$target"

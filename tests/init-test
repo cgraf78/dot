@@ -519,7 +519,9 @@ assert_eq clean "$(<"$trusted_modes_clean_home/.trusted-mode-hook")" \
 # relying on the host filesystem to honor only the cooperative umask.
 fixture_home trusted-modes-default-acl
 trusted_modes_acl_home=$REPLY
+trusted_modes_acl_enabled=false
 if enable_group_writable_default_acl "$trusted_modes_acl_home"; then
+  trusted_modes_acl_enabled=true
   trusted_modes_acl_state=$DOT_TEST_TMP/trusted-modes-default-acl-state
   (
     umask 0022
@@ -543,8 +545,12 @@ if enable_group_writable_default_acl "$trusted_modes_acl_home"; then
   mkdir -p "$DOT_TEST_TMP/trusted-modes-seed/.local/lib/dotfiles/pre-sync.d"
   printf 'prepare() { :; }\n' \
     >"$DOT_TEST_TMP/trusted-modes-seed/.local/lib/dotfiles/pre-sync.d/acl-update.sh"
+  mkdir -p "$DOT_TEST_TMP/trusted-modes-seed/.acl-dir-probe"
+  printf 'tracked\n' \
+    >"$DOT_TEST_TMP/trusted-modes-seed/.acl-dir-probe/tracked"
   git -C "$DOT_TEST_TMP/trusted-modes-seed" add \
-    .local/lib/dotfiles/pre-sync.d/acl-update.sh
+    .local/lib/dotfiles/pre-sync.d/acl-update.sh \
+    .acl-dir-probe/tracked
   git -C "$DOT_TEST_TMP/trusted-modes-seed" -c core.hooksPath=/dev/null \
     commit -qm acl-update
   git -C "$DOT_TEST_TMP/trusted-modes-seed" push -q \
@@ -553,7 +559,69 @@ if enable_group_writable_default_acl "$trusted_modes_acl_home"; then
   assert_eq 644 \
     "$(mode_of "$trusted_modes_acl_home/.local/lib/dotfiles/pre-sync.d/acl-update.sh")" \
     'base pull reapplies the retained mode to a new tracked hook'
+  assert_eq 775 "$(mode_of "$trusted_modes_acl_home/.acl-dir-probe")" \
+    'base pull preserves a pre-existing user-owned parent mode'
+  assert_eq 644 "$(mode_of "$trusted_modes_acl_home/.acl-dir-probe/tracked")" \
+    'base pull normalizes a new file without narrowing its existing parent'
   run_dot "$trusted_modes_acl_home" "$trusted_modes_acl_state" update >/dev/null
+fi
+
+fixture_home trusted-parent-retry
+trusted_parent_retry_home=$REPLY
+if enable_group_writable_default_acl "$trusted_parent_retry_home"; then
+  trusted_parent_retry_bin=$DOT_TEST_TMP/trusted-parent-retry-bin
+  trusted_parent_retry_marker=$DOT_TEST_TMP/trusted-parent-retry-marker
+  trusted_parent_retry_target=$trusted_parent_retry_home/.local/lib
+  trusted_parent_retry_real_chmod=$(type -P chmod)
+  mkdir -p "$trusted_parent_retry_bin"
+  cat >"$trusted_parent_retry_bin/chmod" <<'CHMOD'
+#!/usr/bin/env bash
+target=${!#}
+if [[ $target == "$DOT_TEST_CHMOD_TARGET" && ! -e $DOT_TEST_CHMOD_MARKER ]]; then
+  : >"$DOT_TEST_CHMOD_MARKER"
+  exit 1
+fi
+exec "$DOT_TEST_REAL_CHMOD" "$@"
+CHMOD
+  chmod +x "$trusted_parent_retry_bin/chmod"
+  trusted_parent_retry_status=0
+  set +e
+  HOME=$trusted_parent_retry_home DOT_SOURCE_ROOT=$root \
+    PATH="$trusted_parent_retry_bin:$PATH" \
+    DOT_TEST_REAL_CHMOD=$trusted_parent_retry_real_chmod \
+    DOT_TEST_CHMOD_TARGET=$trusted_parent_retry_target \
+    DOT_TEST_CHMOD_MARKER=$trusted_parent_retry_marker \
+    bash --noprofile --norc -c '
+      set -euo pipefail
+      . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+      . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+      . "$DOT_SOURCE_ROOT/lib/dot/init-client.sh"
+      . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+      umask 0022
+      _overlay_ensure_destination_parent "$HOME/.local/lib/dotfiles"
+    '
+  trusted_parent_retry_status=$?
+  set -e
+  assert_eq 1 "$trusted_parent_retry_status" \
+    'overlay destination creation reports a mode-adjustment failure'
+  [[ ! -e $trusted_parent_retry_target && ! -L $trusted_parent_retry_target ]] ||
+    fail 'failed overlay destination creation left an unsafe directory'
+  HOME=$trusted_parent_retry_home DOT_SOURCE_ROOT=$root \
+    bash --noprofile --norc -c '
+      set -euo pipefail
+      . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+      . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+      . "$DOT_SOURCE_ROOT/lib/dot/init-client.sh"
+      . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+      umask 0022
+      _overlay_ensure_destination_parent "$HOME/.local/lib/dotfiles"
+    '
+  assert_eq 755 "$(mode_of "$trusted_parent_retry_home/.local")" \
+    'overlay destination retry retains the effective umask'
+  assert_eq 755 "$(mode_of "$trusted_parent_retry_home/.local/lib")" \
+    'overlay destination retry recreates the failed directory safely'
+  assert_eq 755 "$(mode_of "$trusted_parent_retry_home/.local/lib/dotfiles")" \
+    'overlay destination retry creates remaining directories safely'
 fi
 
 fixture_home trusted-modes-private-acl
@@ -621,6 +689,68 @@ assert_eq 600 \
   'clean init retains a private extension file'
 assert_eq 700 "$(mode_of "$trusted_modes_private_home/.local/bin/mode-probe")" \
   'clean init retains a private executable file'
+
+# A regular file that replaces the just-validated checkout generation must not
+# be overwritten or blessed with a trusted mode at the publication boundary.
+if [[ $trusted_modes_acl_enabled == true ]]; then
+  trusted_mode_race_target=$trusted_modes_acl_home/.local/lib/dotfiles/merge-hooks.d/race.serial.sh
+  # shellcheck disable=SC2016 # The fixture hook expands HOME when Dot executes it.
+  printf 'merge() { printf "executed\\n" >"$HOME/.trusted-mode-race-hook"; }\n' \
+    >"$DOT_TEST_TMP/trusted-modes-seed/.local/lib/dotfiles/merge-hooks.d/race.serial.sh"
+  git -C "$DOT_TEST_TMP/trusted-modes-seed" add \
+    .local/lib/dotfiles/merge-hooks.d/race.serial.sh
+  git -C "$DOT_TEST_TMP/trusted-modes-seed" -c core.hooksPath=/dev/null \
+    commit -qm mode-race
+  git -C "$DOT_TEST_TMP/trusted-modes-seed" push -q \
+    "$trusted_modes_origin" HEAD:main
+  trusted_mode_race_bin=$DOT_TEST_TMP/trusted-mode-race-bin
+  trusted_mode_race_count=$DOT_TEST_TMP/trusted-mode-race-count
+  trusted_mode_race_real_git=$(type -P git)
+  trusted_mode_race_real_mv=$(type -P mv)
+  mkdir -p "$trusted_mode_race_bin"
+  cat >"$trusted_mode_race_bin/git" <<'GIT'
+#!/usr/bin/env bash
+is_hash=false
+is_target=false
+for arg in "$@"; do
+  [[ $arg == hash-object ]] && is_hash=true
+  [[ $arg == "$DOT_TEST_TAMPER_TARGET" ]] && is_target=true
+done
+"$DOT_TEST_REAL_GIT" "$@"
+rc=$?
+if [[ $rc -eq 0 && $is_hash == true && $is_target == true ]]; then
+  count=0
+  [[ ! -f $DOT_TEST_TAMPER_COUNT ]] || read -r count <"$DOT_TEST_TAMPER_COUNT"
+  count=$((count + 1))
+  printf '%s\n' "$count" >"$DOT_TEST_TAMPER_COUNT"
+  if [[ $count -eq 2 ]]; then
+    printf 'foreign\n' >"$DOT_TEST_TAMPER_TARGET.foreign"
+    chmod 0644 "$DOT_TEST_TAMPER_TARGET.foreign"
+    "$DOT_TEST_REAL_MV" -f -- \
+      "$DOT_TEST_TAMPER_TARGET.foreign" "$DOT_TEST_TAMPER_TARGET"
+  fi
+fi
+exit "$rc"
+GIT
+  chmod +x "$trusted_mode_race_bin/git"
+  trusted_mode_race_status=0
+  set +e
+  PATH="$trusted_mode_race_bin:$PATH" \
+    DOT_TEST_REAL_GIT=$trusted_mode_race_real_git \
+    DOT_TEST_REAL_MV=$trusted_mode_race_real_mv \
+    DOT_TEST_TAMPER_TARGET=$trusted_mode_race_target \
+    DOT_TEST_TAMPER_COUNT=$trusted_mode_race_count \
+    run_dot "$trusted_modes_acl_home" "$trusted_modes_acl_state" update \
+    >/dev/null 2>&1
+  trusted_mode_race_status=$?
+  set -e
+  assert_eq 1 "$trusted_mode_race_status" \
+    'warm normalization rejects a replaced tracked file generation'
+  assert_eq foreign "$(<"$trusted_mode_race_target")" \
+    'warm normalization preserves the foreign replacement generation'
+  [[ ! -e $trusted_modes_acl_home/.trusted-mode-race-hook ]] ||
+    fail 'replaced extension generation executed after failed normalization'
+fi
 
 # Git overlays are cloned by Dot and therefore must receive the same canonical
 # trusted modes instead of inheriting 0775/0664 from the caller's umask.
@@ -702,6 +832,50 @@ assert_eq 644 \
 assert_eq updated "$(<"$trusted_overlay_home/.trusted-overlay-updated-hook")" \
   'newly pulled overlay hook executes after mode normalization'
 run_dot "$trusted_overlay_home" "$trusted_overlay_state" update >/dev/null
+
+fixture_home trusted-overlay-race
+trusted_overlay_race_home=$REPLY
+trusted_overlay_race_state=$DOT_TEST_TMP/trusted-overlay-race-state
+trusted_overlay_race_mode=$DOT_TEST_TMP/trusted-overlay-race-mode
+trusted_overlay_race_status=0
+set +e
+HOME=$trusted_overlay_race_home XDG_STATE_HOME=$trusted_overlay_race_state \
+  DOT_SOURCE_ROOT=$root DOT_TEST_OVERLAY_ORIGIN=$trusted_overlay_origin \
+  DOT_TEST_STAGE_MODE=$trusted_overlay_race_mode \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/resources.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/init-client.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    _dot_cleanup_install_owner_traps
+    OVERLAYS=()
+    definition=$(declare -f _repo_validate_candidate_tree)
+    definition=${definition/_repo_validate_candidate_tree ()/_repo_validate_candidate_tree_original ()}
+    eval "$definition"
+    _repo_validate_candidate_tree() {
+      _repo_validate_candidate_tree_original "$@" || return
+      local stage=${!#} target mode
+      target=$stage/home/.local/lib/dotfiles/merge-hooks.d/overlay.serial.sh
+      mode=$(stat -c "%a" "$stage" 2>/dev/null || stat -f "%Lp" "$stage")
+      printf "%s\n" "$mode" >"$DOT_TEST_STAGE_MODE"
+      printf "foreign\n" >"$target"
+    }
+    _repo_clone_overlay_staged \
+      "file://$DOT_TEST_OVERLAY_ORIGIN" "$HOME/.dotfiles-trusted"
+  ' >/dev/null 2>&1
+trusted_overlay_race_status=$?
+set -e
+assert_eq 1 "$trusted_overlay_race_status" \
+  'overlay clone rejects bytes changed after candidate validation'
+assert_eq 700 "$(<"$trusted_overlay_race_mode")" \
+  'overlay clone remains private throughout candidate validation'
+[[ ! -e $trusted_overlay_race_home/.dotfiles-trusted &&
+  ! -L $trusted_overlay_race_home/.dotfiles-trusted ]] ||
+  fail 'modified staged overlay clone was published'
 
 # Shared CI installs its explicit prerequisites separately from client policy.
 # The operation-scoped override must still parse the committed config and run
