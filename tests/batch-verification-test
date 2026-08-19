@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+# shellcheck source=lib/repo.sh
+. "$root/tests/lib/repo.sh"
+
+# Regression: post-update changed-path verification must be repository-batched,
+# not per updated file. Collect staged/worktree dirty inventories once per repo.
+
+fixture_repo batch-base main .testrc1 $'one\n' 100644 .testrc2 $'one\n' 100644 .testrc3 $'one\n' 100644
+batch_origin=$REPLY
+fixture_home batch-base
+batch_home=$REPLY
+batch_state=$DOT_TEST_TMP/batch-base-state
+run_dot "$batch_home" "$batch_state" init --yes "file://$batch_origin" >/dev/null
+
+# Modify 3 files in a single new commit to force 3 updated paths.
+batch_seed=$DOT_TEST_TMP/batch-base-seed
+printf 'two\n' >"$batch_seed/.testrc1"
+printf 'two\n' >"$batch_seed/.testrc2"
+printf 'two\n' >"$batch_seed/.testrc3"
+git -C "$batch_seed" add .testrc1 .testrc2 .testrc3
+git -C "$batch_seed" -c core.hooksPath=/dev/null commit -qm batch
+git -C "$batch_seed" push -q "$batch_origin" HEAD:main
+
+# Wrap git to log every invocation.
+batch_log=$DOT_TEST_TMP/batch-git.log
+: >"$batch_log"
+batch_real_git=$(type -P git)
+batch_bin=$DOT_TEST_TMP/batch-bin
+mkdir -p "$batch_bin"
+cat >"$batch_bin/git" <<'GIT'
+#!/usr/bin/env bash
+set -e
+# Log the full argument vector with %q for safe grep, one line per invocation.
+printf '%q ' "$@" >>"$DOT_TEST_BATCH_LOG"
+printf '\n' >>"$DOT_TEST_BATCH_LOG"
+exec "$DOT_TEST_BATCH_REAL_GIT" "$@"
+GIT
+chmod +x "$batch_bin/git"
+
+GIT_TRACE2_EVENT=/dev/null \
+  DOT_TEST_BATCH_LOG=$batch_log DOT_TEST_BATCH_REAL_GIT=$batch_real_git \
+  PATH="$batch_bin:$PATH" \
+  run_dot "$batch_home" "$batch_state" update >/dev/null
+
+# Count verification Git calls.
+# Before batching: 2 diff invocations per updated regular file (cached + worktree).
+# After batching: exactly 1 staged inventory + 1 worktree inventory per repo.
+# Hash batching is optional; we only enforce diff batching here.
+batch_cached_quiet=$(grep -c "diff.*--cached.*--quiet" "$batch_log" || true)
+# Batched verification must not spawn per-file --quiet checks.
+if [[ $batch_cached_quiet -ne 0 ]]; then
+  cat "$batch_log" >&2 || true
+  fail "batch verification still spawns per-file diff --cached --quiet (count=$batch_cached_quiet) expected 0"
+fi
+# Verification path must not use --quiet at all; other --quiet uses (e.g.,
+# diff-files) are excluded by requiring a commit hash.
+batch_verification_quiet=$(grep -Ec "diff.*--quiet.*[0-9a-f]{40}" "$batch_log" || true)
+if [[ $batch_verification_quiet -ne 0 ]]; then
+  cat "$batch_log" >&2 || true
+  fail "batch verification still spawns per-file diff --quiet with commit (count=$batch_verification_quiet) expected 0"
+fi
+
+# Must have exactly one staged and one worktree name-only inventory for the base.
+# Use precise pattern: verification uses single-commit --name-only -z <hash> --
+batch_worktree_verification=$(grep -Ec " diff --name-only -z [0-9a-f]{40,64} --" "$batch_log" || true)
+batch_staged_verification=$(grep -Ec " diff --cached --name-only -z [0-9a-f]{40,64} --" "$batch_log" || true)
+batch_pure_worktree=$batch_worktree_verification
+if [[ $batch_staged_verification -lt 1 ]]; then
+  cat "$batch_log" >&2 || true
+  fail "batch verification missing staged verification inventory (count=$batch_staged_verification)"
+fi
+if [[ $batch_pure_worktree -lt 1 ]]; then
+  cat "$batch_log" >&2 || true
+  fail "batch verification missing worktree verification inventory (count=$batch_pure_worktree)"
+fi
+
+# Ensure we did not accidentally multiply inventories per file (should be 1 each, not N).
+if [[ $batch_staged_verification -gt 1 ]]; then
+  cat "$batch_log" >&2 || true
+  fail "batch verification spawned too many staged inventories (count=$batch_staged_verification) expected 1"
+fi
+if [[ $batch_pure_worktree -gt 1 ]]; then
+  cat "$batch_log" >&2 || true
+  fail "batch verification spawned too many worktree inventories (count=$batch_pure_worktree) expected 1"
+fi
+
+# NUL safety: create file with space and verify batch still succeeds.
+fixture_repo nul-base main 'space file' $'one\n' 100644
+nul_origin=$REPLY
+fixture_home nul-base
+nul_home=$REPLY
+nul_state=$DOT_TEST_TMP/nul-base-state
+run_dot "$nul_home" "$nul_state" init --yes "file://$nul_origin" >/dev/null
+nul_seed=$DOT_TEST_TMP/nul-base-seed
+printf 'two\n' >"$nul_seed/space file"
+git -C "$nul_seed" add 'space file'
+git -C "$nul_seed" -c core.hooksPath=/dev/null commit -qm nul
+git -C "$nul_seed" push -q "$nul_origin" HEAD:main
+run_dot "$nul_home" "$nul_state" update >/dev/null
+assert_eq two "$(<"$nul_home/space file")" 'NUL-safe batch handles space in path'
+
+# Unrelated local dirty tracked file must remain allowed.
+fixture_repo unrelated-dirty main .a $'one\n' 100644 .b $'one\n' 100644
+unrelated_origin=$REPLY
+fixture_home unrelated-dirty
+unrelated_home=$REPLY
+unrelated_state=$DOT_TEST_TMP/unrelated-dirty-state
+run_dot "$unrelated_home" "$unrelated_state" init --yes "file://$unrelated_origin" >/dev/null
+unrelated_seed=$DOT_TEST_TMP/unrelated-dirty-seed
+printf 'two\n' >"$unrelated_seed/.a"
+git -C "$unrelated_seed" add .a
+git -C "$unrelated_seed" -c core.hooksPath=/dev/null commit -qm unrelated
+git -C "$unrelated_seed" push -q "$unrelated_origin" HEAD:main
+printf 'local-dirty\n' >"$unrelated_home/.b"
+run_dot "$unrelated_home" "$unrelated_state" update >/dev/null
+assert_eq two "$(<"$unrelated_home/.a")" 'unrelated dirty file does not block update'
+assert_eq 'local-dirty' "$(<"$unrelated_home/.b")" 'unrelated dirty file preserved'
+
+# Updated path dirty after rebase must fail normalization.
+fixture_repo dirty-updated main .a $'one\n' 100644
+dirty_origin=$REPLY
+fixture_home dirty-updated
+dirty_home=$REPLY
+dirty_state=$DOT_TEST_TMP/dirty-updated-state
+run_dot "$dirty_home" "$dirty_state" init --yes "file://$dirty_origin" >/dev/null
+dirty_seed=$DOT_TEST_TMP/dirty-updated-seed
+printf 'two\n' >"$dirty_seed/.a"
+git -C "$dirty_seed" add .a
+git -C "$dirty_seed" -c core.hooksPath=/dev/null commit -qm dirty
+git -C "$dirty_seed" push -q "$dirty_origin" HEAD:main
+# Make the updated path dirty in worktree before update fetch succeeds, then
+# dirty it again after rebase by racing the verification.
+# Simpler: locally dirty the file to not match upstream, but update will try
+# to rebase and then verification should detect dirty.
+printf 'local\n' >"$dirty_home/.a"
+# The base pull will fetch upstream, rebase will conflict? Use a wrapper that
+# dirties the file after successful rebase but before verification.
+dirty_bin=$DOT_TEST_TMP/dirty-updated-bin
+mkdir -p "$dirty_bin"
+dirty_real_git=$(type -P git)
+cat >"$dirty_bin/git" <<'GIT'
+#!/usr/bin/env bash
+set -e
+if [[ "$*" == *"diff --cached --name-only -z"* ]]; then
+  "$DOT_TEST_DIRTY_REAL_GIT" "$@"
+  rc=$?
+  printf 'dirty-after-staged\n' >"$DOT_TEST_DIRTY_HOME/.a"
+  exit $rc
+fi
+exec "$DOT_TEST_DIRTY_REAL_GIT" "$@"
+GIT
+chmod +x "$dirty_bin/git"
+set +e
+DOT_TEST_DIRTY_REAL_GIT=$dirty_real_git DOT_TEST_DIRTY_HOME=$dirty_home \
+  PATH="$dirty_bin:$PATH" run_dot "$dirty_home" "$dirty_state" update >/dev/null 2>&1
+dirty_rc=$?
+set -e
+if [[ $dirty_rc -eq 0 ]]; then
+  cat "$dirty_home/.dotfiles/logs" 2>/dev/null || true
+  fail "dirty updated path should have failed verification"
+fi
+# Restore for other tests
+printf 'one\n' >"$dirty_home/.a"
+git -C "$dirty_home/.dotfiles" checkout -q -- .a 2>/dev/null || true
+# Overlay batching is covered by existing repos-test; base batching above is sufficient
+# for the performance-structure assertion. Overlay verification uses the same
+# _repo_normalize_updated_paths path, so base coverage implies overlay.
+
+printf 'batch-verification-test: ok\n'
