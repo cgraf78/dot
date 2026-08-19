@@ -38,10 +38,7 @@ official install root, requires `~/.local/lib/dot` to resolve to that checkout's
 public library, and then executes its standalone runtime without sourcing
 client or checkout code itself. Missing topology reports the reinstall command.
 
-`support/client-launcher-v4.sh` remains an exact second exception only for the
-bounded fleet transition from the phased cutover adapter. It and its candidate
-acceptance branch are removed after every client carries the permanent front
-door. Other regular files and directories are rejected throughout.
+Other regular files and directories are rejected throughout.
 
 ## Runtime model
 

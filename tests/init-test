@@ -412,29 +412,9 @@ assert_eq 1 "$reserved_ancestor_status" \
 [[ ! -L $reserved_ancestor_home/.local ]] ||
   fail 'reserved ancestor candidate published a symlink'
 
-# The exact tracked client launchers are the only client-owned exceptions at
-# the reserved public command path. The v4 form remains accepted only for the
-# bounded fleet transition to the permanent form; modified lookalikes remain
-# forbidden.
-fixture_repo adapter-v4-init main README.md $'adapter\n' 100644
-adapter_v4_init_origin=$REPLY
-adapter_v4_init_seed=$DOT_TEST_TMP/adapter-v4-init-seed
-mkdir -p "$adapter_v4_init_seed/.local/bin"
-cp "$root/support/client-launcher-v4.sh" \
-  "$adapter_v4_init_seed/.local/bin/dot"
-chmod 0755 "$adapter_v4_init_seed/.local/bin/dot"
-git -C "$adapter_v4_init_seed" add .local/bin/dot
-git -C "$adapter_v4_init_seed" -c core.hooksPath=/dev/null \
-  commit -qm adapter-v4
-git -C "$adapter_v4_init_seed" push -q "$adapter_v4_init_origin" HEAD:main
-fixture_home adapter-v4-init
-adapter_v4_init_home=$REPLY
-run_dot "$adapter_v4_init_home" "$DOT_TEST_TMP/adapter-v4-init-state" \
-  init --yes "file://$adapter_v4_init_origin" >/dev/null
-assert_files_equal "$root/support/client-launcher-v4.sh" \
-  "$adapter_v4_init_home/.local/bin/dot" \
-  'exact v4 client launcher was not accepted during initialization'
-
+# The exact generated client launcher is the only client-owned exception at
+# the reserved public command path. Its tracked bytes and executable mode must
+# match this dot release; a modified lookalike remains forbidden.
 fixture_repo adapter-init main README.md $'adapter\n' 100644
 adapter_init_origin=$REPLY
 adapter_init_seed=$DOT_TEST_TMP/adapter-init-seed

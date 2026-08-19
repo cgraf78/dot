@@ -54,13 +54,11 @@ program	lib/dot/update-lock.sh
 program	lib/dot/update.sh
 program	scripts/checkout-installer.conf
 program	support/checkout-bash-v1.sh
-program	support/client-launcher-v4.sh
 program	support/client-launcher.sh
 program	support/install-checkout.sh
 program	support/post-install.sh
 program	tests/cli-test
 program	tests/client-launcher-test
-program	tests/client-launcher-v4-test
 program	tests/config-test
 program	tests/doctor-test
 program	tests/examples-test

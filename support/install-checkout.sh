@@ -51,9 +51,8 @@ LIBRARY_SOURCE=$LINK_ROOT/lib/dot/public
 COMMAND_TARGET=$BIN_DIR/dot
 LIBRARY_TARGET=$DOT_PUBLIC_LIB
 CLIENT_ADAPTER=$ROOT/support/client-launcher.sh
-CLIENT_ADAPTER_V4=$ROOT/support/client-launcher-v4.sh
 
-for source in "$COMMAND_PROVIDER" "$CLIENT_ADAPTER" "$CLIENT_ADAPTER_V4"; do
+for source in "$COMMAND_PROVIDER" "$CLIENT_ADAPTER"; do
   [[ -f "$source" && ! -L "$source" && -x "$source" ]] || {
     printf 'dot: required executable is missing: %s\n' "$source" >&2
     exit 1
@@ -81,20 +80,6 @@ dot_install_exact_file() {
   # cannot delegate to client configuration.
   command git --no-pager diff --no-index --quiet --no-ext-diff --no-textconv \
     -- "$expected" "$actual"
-}
-
-dot_install_exact_client_adapter() {
-  local actual=$1 expected
-
-  # Temporary fleet bridge: the activated v4 adapter and the permanent front
-  # door are the only regular commands the installer preserves. Remove the v4
-  # template and this loop after every client has crossed to the permanent one.
-  for expected in "$CLIENT_ADAPTER" "$CLIENT_ADAPTER_V4"; do
-    if dot_install_exact_file "$expected" "$actual"; then
-      return 0
-    fi
-  done
-  return 1
 }
 
 dot_install_remove_exact_link() {
@@ -280,7 +265,7 @@ if [[ -e "$COMMAND_TARGET" || -L "$COMMAND_TARGET" ]]; then
     :
   elif [[ -f "$COMMAND_TARGET" && ! -L "$COMMAND_TARGET" &&
     -x "$COMMAND_TARGET" ]] &&
-    dot_install_exact_client_adapter "$COMMAND_TARGET"; then
+    dot_install_exact_file "$CLIENT_ADAPTER" "$COMMAND_TARGET"; then
     command_adapter=true
   else
     printf 'dot: refusing to replace existing command: %s\n' \
@@ -307,7 +292,7 @@ dot_install_publish_link "$LIBRARY_SOURCE" "$LIBRARY_TARGET"
 if [[ "$command_adapter" == true ]]; then
   if [[ ! -f "$COMMAND_TARGET" || -L "$COMMAND_TARGET" ||
     ! -x "$COMMAND_TARGET" ]] ||
-    ! dot_install_exact_client_adapter "$COMMAND_TARGET"; then
+    ! dot_install_exact_file "$CLIENT_ADAPTER" "$COMMAND_TARGET"; then
     printf 'dot: client adapter changed during installation: %s\n' \
       "$COMMAND_TARGET" >&2
     exit 1

@@ -22,12 +22,10 @@ Before initialization, repository integration, or overlay publication, dot
 inspects the complete candidate inventory against its dynamic control-plane
 paths. The check covers lexical and physical containment, including a
 symlinked parent into dot or provider state. Publication revalidates the
-physical parent generation. The public-command exceptions are exact tracked
-launcher templates from this release: the permanent
-`support/client-launcher.sh` and, only during the bounded fleet transition, the
-retained `support/client-launcher-v4.sh`. The permanent launcher derives the
-official Shdeps checkout root and requires the public library link to resolve
-into that same checkout before dispatch.
+physical parent generation. The only public-command exception is the exact
+tracked `support/client-launcher.sh` from this release. The permanent launcher
+derives the official Shdeps checkout root and requires the public library link
+to resolve into that same checkout before dispatch.
 
 Initialization and overlay replacement use private, generation-bound recovery
 records. Rollback removes or restores only the exact leaf, parent, staged, and
