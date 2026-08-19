@@ -761,7 +761,10 @@ fi
 fixture_repo trusted-overlay main \
   home/.local/lib/dotfiles/merge-hooks.d/overlay.serial.sh \
   $'merge() { printf "overlay\\n" >"$HOME/.trusted-overlay-hook"; }\n' \
-  100644
+  100644 \
+  home/.local/bin/overlay-mode-probe \
+  $'#!/usr/bin/env bash\nexit 0\n' \
+  100755
 trusted_overlay_origin=$REPLY
 fixture_repo trusted-overlay-base main README.md $'base\n' 100644
 trusted_overlay_base_origin=$REPLY
@@ -814,6 +817,9 @@ assert_eq 755 \
 assert_eq 644 \
   "$(mode_of "$trusted_overlay_home/.dotfiles-trusted/home/.local/lib/dotfiles/merge-hooks.d/overlay.serial.sh")" \
   'overlay extension file has canonical mode'
+assert_eq 755 \
+  "$(mode_of "$trusted_overlay_home/.dotfiles-trusted/home/.local/bin/overlay-mode-probe")" \
+  'overlay executable file has canonical mode'
 assert_eq 755 "$(mode_of "$trusted_overlay_home/.local/lib/dotfiles")" \
   'linked extension root has canonical mode'
 assert_eq overlay "$(<"$trusted_overlay_home/.trusted-overlay-hook")" \
@@ -836,6 +842,48 @@ assert_eq 644 \
 assert_eq updated "$(<"$trusted_overlay_home/.trusted-overlay-updated-hook")" \
   'newly pulled overlay hook executes after mode normalization'
 run_dot "$trusted_overlay_home" "$trusted_overlay_state" update >/dev/null
+
+fixture_home trusted-overlay-private
+trusted_overlay_private_home=$REPLY
+trusted_overlay_private_state=$DOT_TEST_TMP/trusted-overlay-private-state
+enable_group_writable_default_acl "$trusted_overlay_private_home" || true
+(
+  umask 0077
+  run_dot "$trusted_overlay_private_home" "$trusted_overlay_private_state" init --yes \
+    "file://$trusted_overlay_base_origin" >/dev/null
+)
+assert_eq 700 \
+  "$(mode_of "$trusted_overlay_private_home/.dotfiles-trusted/home/.local/lib/dotfiles")" \
+  'private overlay clone retains a strict extension-root mode'
+assert_eq 600 \
+  "$(mode_of "$trusted_overlay_private_home/.dotfiles-trusted/home/.local/lib/dotfiles/merge-hooks.d/overlay.serial.sh")" \
+  'private overlay clone retains a strict regular-file mode'
+assert_eq 700 \
+  "$(mode_of "$trusted_overlay_private_home/.dotfiles-trusted/home/.local/bin/overlay-mode-probe")" \
+  'private overlay clone retains a strict executable mode'
+printf 'merge() { :; }\n' \
+  >"$DOT_TEST_TMP/trusted-overlay-seed/home/.local/lib/dotfiles/merge-hooks.d/private.serial.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' \
+  >"$DOT_TEST_TMP/trusted-overlay-seed/home/.local/bin/private-overlay-probe"
+chmod +x "$DOT_TEST_TMP/trusted-overlay-seed/home/.local/bin/private-overlay-probe"
+git -C "$DOT_TEST_TMP/trusted-overlay-seed" add \
+  home/.local/lib/dotfiles/merge-hooks.d/private.serial.sh \
+  home/.local/bin/private-overlay-probe
+git -C "$DOT_TEST_TMP/trusted-overlay-seed" -c core.hooksPath=/dev/null \
+  commit -qm private-acl-update
+git -C "$DOT_TEST_TMP/trusted-overlay-seed" push -q \
+  "$trusted_overlay_origin" HEAD:main
+(
+  umask 0077
+  run_dot "$trusted_overlay_private_home" "$trusted_overlay_private_state" update \
+    >/dev/null
+)
+assert_eq 600 \
+  "$(mode_of "$trusted_overlay_private_home/.dotfiles-trusted/home/.local/lib/dotfiles/merge-hooks.d/private.serial.sh")" \
+  'private overlay pull retains a strict regular-file mode'
+assert_eq 700 \
+  "$(mode_of "$trusted_overlay_private_home/.dotfiles-trusted/home/.local/bin/private-overlay-probe")" \
+  'private overlay pull retains a strict executable mode'
 
 fixture_home trusted-overlay-race
 trusted_overlay_race_home=$REPLY
