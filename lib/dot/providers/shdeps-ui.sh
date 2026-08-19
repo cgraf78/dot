@@ -358,7 +358,7 @@ _run_shdeps_update_ui() {
     return $?
   fi
   _shdeps_ui_reset
-  local line progress_fd child rc=0
+  local line partial='' progress_fd child rc=0
   _dot_cleanup_begin_registration
   exec {progress_fd}<>"$fifo"
   _dot_cleanup_register_fd "$progress_fd"
@@ -374,6 +374,8 @@ _run_shdeps_update_ui() {
   _dot_cleanup_finish_job_launch "$child"
   while :; do
     if IFS= read -r -t "${DOT_UI_TICK_SECONDS:-0.2}" -u "$progress_fd" line; then
+      line="${partial}${line}"
+      partial=''
       if [[ "$line" == *"$_SHDEPS_PROGRESS_COMPLETE" ]]; then
         line=${line%"$_SHDEPS_PROGRESS_COMPLETE"}
         [[ -z "$line" ]] || _handle_shdeps_event "$line"
@@ -382,6 +384,14 @@ _run_shdeps_update_ui() {
       _handle_shdeps_event "$line"
       continue
     fi
+    # Bash keeps bytes read before a timeout in the destination variable but
+    # returns nonzero. A FIFO is a byte stream, so dropping that value loses
+    # the first part of a JSONL event and makes its later suffix unparsable.
+    # Retain it until a later read supplies the terminating newline.
+    if [[ -n "$line" ]]; then
+      partial+="$line"
+      line=''
+    fi
     if _shdeps_update_finished "$child" "$status_file"; then
       # Child exited (cleanly or killed). Drain any complete lines still buffered
       # in the fifo, then stop. A normal child publishes status before exiting;
@@ -389,6 +399,8 @@ _run_shdeps_update_ui() {
       # Cover all three because the parent holds the fifo open R/W, so EOF cannot
       # distinguish completion. An empty status file becomes rc=1 below.
       while IFS= read -r -t "${DOT_UI_TICK_SECONDS:-0.2}" -u "$progress_fd" line; do
+        line="${partial}${line}"
+        partial=''
         if [[ "$line" == *"$_SHDEPS_PROGRESS_COMPLETE" ]]; then
           line=${line%"$_SHDEPS_PROGRESS_COMPLETE"}
           [[ -z "$line" ]] || _handle_shdeps_event "$line"

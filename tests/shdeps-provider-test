@@ -162,6 +162,60 @@ assert_eq $'sync-args=<passthrough>\nquiet=1 shdeps_quiet=1 force=1 shdeps_force
     'provider UI consumes normal completion marker without timeout polling'
 )
 
+# FIFO writes are a byte stream, not a record protocol. A timeout may return a
+# partial JSONL record with a nonzero status; the next read then begins at the
+# suffix. Keep that partial data until its newline arrives so a failed custom
+# dependency cannot disappear while its later group summary still renders.
+(
+  DOT_VERBOSE=0
+  DOT_QUIET=0
+  DOT_UPDATE_SUBPHASE_THRESHOLD_MS=0
+  DOT_UI_TICK_SECONDS=0.01
+  prefix_written_marker=$DOT_TEST_TMP/provider-prefix-written
+  partial_read_marker=$DOT_TEST_TMP/provider-partial-read
+  export DOT_TEST_PREFIX_WRITTEN_MARKER=$prefix_written_marker
+  export DOT_TEST_PARTIAL_READ_MARKER=$partial_read_marker
+  _shdeps_ui_reset
+  _ui_stage_tick() {
+    [[ -e $DOT_TEST_PREFIX_WRITTEN_MARKER ]] || return 0
+    # `line` is nonempty before the fix and `partial` is nonempty after it.
+    # Either proves this timed read consumed the prefix rather than merely
+    # racing before the producer wrote it.
+    [[ -n ${line:-} || -n ${partial:-} ]] || return 0
+    : >"$DOT_TEST_PARTIAL_READ_MARKER"
+  }
+  shdeps_update() {
+    printf '%s' \
+      '{"event":"item","group":"custom","status":"failed","name":"cmakelang",'
+    : >"$DOT_TEST_PREFIX_WRITTEN_MARKER"
+    # Do not release the suffix until the reader's timeout path has run. This
+    # distinguishes the real partial-read regression from a merely slow test.
+    local attempt
+    for ((attempt = 0; attempt < 100; attempt++)); do
+      [[ -e $DOT_TEST_PARTIAL_READ_MARKER ]] && break
+      sleep 0.01
+    done
+    [[ -e $DOT_TEST_PARTIAL_READ_MARKER ]] || return 2
+    printf '%s\n' \
+      '"detail":"custom install failed"}' \
+      '{"event":"group_summary","group":"custom","label":"Custom","status":"failed","changed":0,"warnings":0,"current":9,"skipped":0,"failed":1,"elapsed_ms":2400}' \
+      '{"event":"summary","status":"failed","changed":0,"warnings":0,"current":89,"skipped":0,"failed":1}'
+    return 1
+  }
+  set +e
+  _run_shdeps_update_ui >/dev/null 2>&1
+  chunked_status=$?
+  set -e
+  assert_eq 1 "$chunked_status" 'chunked failed provider update remains nonzero'
+  [[ -e $partial_read_marker ]] ||
+    fail 'provider UI did not observe the partial FIFO record'
+  chunked_output=$(_shdeps_print_group_summaries)
+  assert_contains 'failed   cmakelang' "$chunked_output" \
+    'provider UI retains a failed item split across FIFO reads'
+  assert_contains 'custom install failed' "$chunked_output" \
+    'provider UI retains split failed-item detail'
+)
+
 download_root=$DOT_TEST_TMP/provider-download-root
 download_bin=$DOT_TEST_TMP/provider-download-bin
 download_source=$DOT_TEST_TMP/provider-download-installer
