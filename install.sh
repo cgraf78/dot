@@ -20,6 +20,10 @@
   checkout_ref='main'
   checkout_delegate='support/install-checkout.sh'
   checkout_default_destination='shdeps'
+  checkout_git_timeout_default=300
+  checkout_git_kill_after_default=5
+  checkout_git_retries_default=3
+  checkout_git_retry_delay_default=5
   checkout_force_managed=false
   if [[ ${1:-} == --managed ]]; then
     checkout_force_managed=true
@@ -1059,6 +1063,7 @@ checkout_lock_parse_timeout() {
 acquire_checkout_lock_v1() {
   local timeout_input=${CGRAF78_CHECKOUT_INSTALL_LOCK_TIMEOUT_SECS:-$checkout_lock_timeout_default}
   local timeout cleanup_status
+  local recovery_state recovery_target recovery_nonce
   local started=$SECONDS waiting_reported=0 elapsed
 
   checkout_lock_parse_timeout "$timeout_input" || {
@@ -1101,12 +1106,30 @@ acquire_checkout_lock_v1() {
         fi
         ;;
       owner-dead)
+        recovery_state=$CHECKOUT_LOCK_STATE
+        recovery_target=$CHECKOUT_LOCK_CLASSIFIED_OWNER_TARGET
+        recovery_nonce=$CHECKOUT_LOCK_CLASSIFIED_OWNER_NONCE
         if checkout_lock_recover_dead_owner; then
+          continue
+        fi
+        checkout_lock_classify || return 1
+        if [[ "$CHECKOUT_LOCK_STATE" != "$recovery_state" ||
+          ${CHECKOUT_LOCK_CLASSIFIED_OWNER_TARGET:-} != "$recovery_target" ||
+          ${CHECKOUT_LOCK_CLASSIFIED_OWNER_NONCE:-} != "$recovery_nonce" ]]; then
           continue
         fi
         ;;
       claim-dead)
+        recovery_state=$CHECKOUT_LOCK_STATE
+        recovery_target=$CHECKOUT_LOCK_CLASSIFIED_OWNER_TARGET
+        recovery_nonce=$CHECKOUT_LOCK_CLASSIFIED_OWNER_NONCE
         if checkout_lock_recover_dead_claim; then
+          continue
+        fi
+        checkout_lock_classify || return 1
+        if [[ "$CHECKOUT_LOCK_STATE" != "$recovery_state" ||
+          ${CHECKOUT_LOCK_CLASSIFIED_OWNER_TARGET:-} != "$recovery_target" ||
+          ${CHECKOUT_LOCK_CLASSIFIED_OWNER_NONCE:-} != "$recovery_nonce" ]]; then
           continue
         fi
         ;;
@@ -1583,12 +1606,110 @@ checkout_bash_v1_bind() {
   }
 
   network_git() {
-    local status
+    local attempt=1 status delay
+
+    while :; do
+      if network_git_attempt "$@"; then
+        return 0
+      else
+        status=$?
+      fi
+      reset_network_git_attempt ||
+        die 'cannot remove failed Git network attempt'
+      if [[ "$attempt" -ge "$checkout_git_retries" ]]; then
+        return "$status"
+      fi
+      delay=$((checkout_git_retry_delay * attempt))
+      printf 'install.sh: Git network operation failed (attempt %s/%s, exit %s); retrying in %ss\n' \
+        "$attempt" "$checkout_git_retries" "$status" "$delay" >&2
+      command sleep "$delay"
+      attempt=$((attempt + 1))
+    done
+  }
+
+  network_git_process_running() {
+    local pid=$1 completion=${2:-} state
+
+    # The supervised group leader publishes this marker only after the Git
+    # command has returned and immediately before it exits. That gives shells
+    # with an incompatible `ps -o stat=` a positive, portable completion
+    # signal instead of mistaking an unreaped zombie for a live child until the
+    # network deadline.
+    [[ -n "$completion" && -f "$completion" && ! -L "$completion" ]] &&
+      return 1
+
+    kill -0 "$pid" 2>/dev/null || return 1
+    # `kill -0` already proved the process exists. Treat an unavailable or
+    # incompatible `ps` conservatively: reporting it stopped would enter a
+    # bare wait and discard the supervisor deadline on that platform.
+    if ! state=$(command ps -o stat= -p "$pid" 2>/dev/null); then
+      return 0
+    fi
+    state=${state//[[:space:]]/}
+    [[ -z "$state" || "$state" != Z* ]]
+  }
+
+  network_git_stop_group() {
+    local pid=$1 completion=${3:-} started=$SECONDS reaped=false
+
+    # The supervised wrapper owns a nested Git process group and reaps it from
+    # its TERM handler. Signal only the wrapper here: killing both generations
+    # at once can orphan Git as a zombie under minimal container init systems.
+    kill -s TERM "$pid" 2>/dev/null || true
+    while ((SECONDS - started < checkout_git_kill_after)); do
+      if [[ "$reaped" == false ]] &&
+        ! network_git_process_running "$pid" "$completion"; then
+        wait "$pid" 2>/dev/null || true
+        reaped=true
+      fi
+      if [[ "$reaped" == true ]]; then
+        return 0
+      fi
+      command sleep 0.05
+    done
+    signal_process_tree "$pid" KILL || true
+    kill -s KILL "$pid" 2>/dev/null || true
+    [[ "$reaped" == true ]] || wait "$pid" 2>/dev/null || true
+  }
+
+  # shellcheck disable=SC2329 # Reached by the supervised wrapper's signal traps.
+  network_git_wrapper_stop() {
+    local pid=$1 pgid=$2 status=$3 started=$SECONDS
+
+    trap - HUP INT TERM
+    kill -s TERM -- "-$pgid" 2>/dev/null || true
+    while network_git_process_running "$pid"; do
+      ((SECONDS - started < checkout_git_kill_after)) || break
+      command sleep 0.05
+    done
+    if network_git_process_running "$pid"; then
+      kill -s KILL -- "-$pgid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+    exit "$status"
+  }
+
+  reset_network_git_attempt() {
+    local candidate
+
+    for candidate in "${staging:-}" "${update_next:-}"; do
+      [[ -n "$candidate" && -d "$candidate" && ! -L "$candidate" ]] ||
+        continue
+      rm -rf -- "$candidate" || return 1
+    done
+  }
+
+  network_git_attempt() {
+    local status started completion completion_tmp git_pid git_pgid
 
     active_git_home=$(mktemp -d \
       "${TMPDIR:-/tmp}/cgraf78-checkout-installer.git.XXXXXX") ||
       die 'cannot create isolated Git configuration home'
+    completion=$active_git_home/network-complete
+    completion_tmp=$active_git_home/network-complete.tmp
 
+    # The outer child is a reap-capable Bash wrapper. It owns the one process
+    # group boundary below, around Git and its descendants.
     (
       GIT_ASKPASS=/bin/false
       SSH_ASKPASS=/bin/false
@@ -1596,14 +1717,52 @@ checkout_bash_v1_bind() {
       CHECKOUT_INSTALLER_GIT_HOME=$active_git_home
       export CHECKOUT_INSTALLER_GIT_HOME
       export GIT_ASKPASS SSH_ASKPASS GIT_SSH_COMMAND
-      exec_bootstrap_git -c credential.helper= "$@"
+      set -m
+      exec_bootstrap_git -c credential.helper= "$@" &
+      git_pid=$!
+      set +m
+      # Job control assigns this asynchronous child its own process group. Use
+      # the child PID directly instead of racing a `ps` lookup after a fast Git
+      # command has already exited.
+      git_pgid=$git_pid
+      trap 'network_git_wrapper_stop "$git_pid" "$git_pgid" 129' HUP
+      trap 'network_git_wrapper_stop "$git_pid" "$git_pgid" 130' INT
+      trap 'network_git_wrapper_stop "$git_pid" "$git_pgid" 143' TERM
+      if wait "$git_pid"; then
+        status=0
+      else
+        status=$?
+      fi
+      trap - HUP INT TERM
+      printf 'complete\n' >"$completion_tmp" || exit 125
+      mv "$completion_tmp" "$completion" || exit 125
+      exit "$status"
     ) </dev/null &
     active_child_pid=$!
+    # This is a presence flag for the signal trap. The stop helper tracks the
+    # wrapper PID directly; only the inner Git child needs a dedicated PGID.
+    active_child_pgid=$active_child_pid
+    started=$SECONDS
+    while network_git_process_running "$active_child_pid" "$completion"; do
+      if ((SECONDS - started >= checkout_git_timeout)); then
+        printf 'install.sh: Git network operation timed out after %ss\n' \
+          "$checkout_git_timeout" >&2
+        network_git_stop_group \
+          "$active_child_pid" "$active_child_pgid" "$completion"
+        active_child_pid=
+        active_child_pgid=
+        rm -rf -- "$active_git_home"
+        active_git_home=
+        return 124
+      fi
+      command sleep 0.05
+    done
     set +e
     wait "$active_child_pid"
     status=$?
-    active_child_pid=
     set -e
+    active_child_pid=
+    active_child_pgid=
     rm -rf -- "$active_git_home"
     active_git_home=
     return "$status"
@@ -1732,6 +1891,26 @@ checkout_bash_v1_bind() {
     exec_delegate "$script_dir" "$@"
   fi
 
+  checkout_git_timeout=${CGRAF78_CHECKOUT_INSTALL_GIT_TIMEOUT_SECS:-$checkout_git_timeout_default}
+  checkout_git_kill_after=${CGRAF78_CHECKOUT_INSTALL_GIT_KILL_AFTER_SECS:-$checkout_git_kill_after_default}
+  checkout_git_retries=${CGRAF78_CHECKOUT_INSTALL_GIT_RETRIES:-$checkout_git_retries_default}
+  checkout_git_retry_delay=${CGRAF78_CHECKOUT_INSTALL_GIT_RETRY_DELAY_SECS:-$checkout_git_retry_delay_default}
+  for checkout_git_number in \
+    "$checkout_git_timeout" "$checkout_git_kill_after" \
+    "$checkout_git_retry_delay"; do
+    case $checkout_git_number in
+      '' | *[!0-9]* | ??????????*)
+        die 'Git timeout, kill grace, and retry delay must be nonnegative decimal integers of at most nine digits'
+        ;;
+    esac
+  done
+  [[ $checkout_git_timeout -gt 0 && $checkout_git_kill_after -gt 0 ]] ||
+    die 'Git timeout and kill grace must be greater than zero'
+  case $checkout_git_retries in
+    [1-9]) ;;
+    *) die 'Git retries must be a decimal integer from 1 through 9' ;;
+  esac
+
   repo_url=${CGRAF78_CHECKOUT_INSTALL_REPO_URL:-$default_repo_url}
   checkout_dir=${CGRAF78_CHECKOUT_INSTALL_DIR:-}
   if [[ -z "$checkout_dir" ]]; then
@@ -1765,6 +1944,7 @@ checkout_bash_v1_bind() {
   staging=
   publish_identity=
   active_child_pid=
+  active_child_pgid=
   active_git_home=
   lock_dir="$checkout_parent/.${checkout_name}.install.lock"
   update_transaction="$checkout_parent/.${checkout_name}.install.transaction"
@@ -2741,7 +2921,10 @@ checkout_bash_v1_bind() {
       # Use a catchable termination signal for those owned children while the
       # bootstrap still reports the conventional interrupt status to callers.
       [[ "$signal" == INT ]] && child_signal=TERM
-      if ! signal_process_tree "$active_child_pid" "$child_signal"; then
+      if [[ -n ${active_child_pgid:-} ]]; then
+        network_git_stop_group "$active_child_pid" "$active_child_pgid"
+        active_child_pgid=
+      elif ! signal_process_tree "$active_child_pid" "$child_signal"; then
         printf 'install.sh: process-tree cleanup was incomplete after %s\n' \
           "$signal" >&2
       fi
