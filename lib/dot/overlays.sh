@@ -43,7 +43,7 @@ _overlay_conf_invalid() {
 
 # Directory holding overlay descriptor files.
 _overlay_conf_dir() {
-  _dot_xdg_path config dot/overlays.d || return
+  dot_xdg_path config dot/overlays.d || return
   printf '%s\n' "$REPLY"
 }
 

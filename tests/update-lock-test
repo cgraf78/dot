@@ -29,13 +29,59 @@ fail_lock_holder() {
   fail "$message"
 }
 
+# The lock library is independently sourceable by doctor and test consumers.
+# A clean shell must load both required siblings itself instead of relying on
+# the full runtime's earlier imports, and a missing sibling must not be masked
+# by later top-level declarations returning success.
+set +e
+clean_load_output=$(HOME=$home XDG_STATE_HOME=$state \
+  bash --noprofile --norc -c '
+    . "$1"
+    load_status=$?
+    resolver=missing
+    path=missing
+    if declare -F dot_xdg_path >/dev/null 2>&1; then
+      resolver=loaded
+      if dot_xdg_path state dot/update.lock.d; then
+        path=$REPLY
+      fi
+    fi
+    printf "source=%s\nresolver=%s\npath=%s\n" \
+      "$load_status" "$resolver" "$path"
+    exit "$load_status"
+  ' -- "$root/lib/dot/update-lock.sh" 2>&1)
+clean_load_status=$?
+set -e
+assert_eq 0 "$clean_load_status" 'clean update-lock source succeeds'
+assert_eq \
+  "source=0
+resolver=loaded
+path=$state/dot/update.lock.d" \
+  "$clean_load_output" \
+  'clean update-lock source loads public XDG without missing-file output'
+
+for missing_sibling in public/xdg.sh resources.sh; do
+  missing_root=$DOT_TEST_TMP/update-lock-missing-${missing_sibling//\//-}
+  mkdir -p "$missing_root/public"
+  cp "$root/lib/dot/update-lock.sh" "$missing_root/update-lock.sh"
+  cp "$root/lib/dot/public/xdg.sh" "$missing_root/public/xdg.sh"
+  cp "$root/lib/dot/resources.sh" "$missing_root/resources.sh"
+  rm "$missing_root/$missing_sibling"
+  set +e
+  HOME=$home XDG_STATE_HOME=$state \
+    bash --noprofile --norc -c '. "$1"' -- \
+    "$missing_root/update-lock.sh" >/dev/null 2>&1
+  missing_status=$?
+  set -e
+  [[ $missing_status -ne 0 ]] ||
+    fail "update-lock source succeeded without required sibling: $missing_sibling"
+done
+
 # A re-exec remains in the same process. It must keep the first ownership
 # token instead of racing itself through the stale-lock recovery path.
 reentry_output=$(HOME=$home XDG_STATE_HOME=$state DOT_SOURCE_ROOT=$root \
   bash --noprofile --norc -c '
     set -euo pipefail
-    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
-    . "$DOT_SOURCE_ROOT/lib/dot/constants.sh"
     . "$DOT_SOURCE_ROOT/lib/dot/update-lock.sh"
     _dot_update_lock_acquire
     first=$DOT_UPDATE_LOCK_TOKEN
@@ -99,8 +145,6 @@ rm -f -- "$ready" "$release"
 HOME=$home XDG_STATE_HOME=$state DOT_SOURCE_ROOT=$DOT_TEST_ROOT \
   bash --noprofile --norc -c '
     set -euo pipefail
-    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
-    . "$DOT_SOURCE_ROOT/lib/dot/constants.sh"
     . "$DOT_SOURCE_ROOT/lib/dot/update-lock.sh"
     _dot_update_lock_acquire
     : >"$1"
@@ -122,8 +166,6 @@ wait "$holder" 2>/dev/null || true
 reclaimed=$(HOME=$home XDG_STATE_HOME=$state DOT_SOURCE_ROOT=$root \
   bash --noprofile --norc -c '
     set -euo pipefail
-    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
-    . "$DOT_SOURCE_ROOT/lib/dot/constants.sh"
     . "$DOT_SOURCE_ROOT/lib/dot/update-lock.sh"
     _dot_update_lock_acquire
     printf "reclaimed\n"
@@ -138,8 +180,6 @@ touch -t 200001010000 "$state/dot/update.lock.d"
 reclaimed=$(HOME=$home XDG_STATE_HOME=$state DOT_SOURCE_ROOT=$root \
   bash --noprofile --norc -c '
     set -euo pipefail
-    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
-    . "$DOT_SOURCE_ROOT/lib/dot/constants.sh"
     . "$DOT_SOURCE_ROOT/lib/dot/update-lock.sh"
     _dot_update_lock_acquire
     printf "reclaimed-empty\n"

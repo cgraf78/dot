@@ -1,13 +1,6 @@
 # shellcheck shell=bash
 # Private runtime constants derived from the active client and XDG roots.
 
-# Older embedded modules used a private XDG helper. Keep one internal adapter
-# while the extracted code is moved in reviewable pieces; the public resolver
-# remains the single implementation of fallback and validation semantics.
-_dot_xdg_path() {
-  dot_xdg_path "$@"
-}
-
 dot_xdg_path state dot/overlay-links || return
 DOT_OVERLAY_MANIFEST=$REPLY
 DOT_OVERLAY_LEGACY_MANIFEST=$HOME/.local/state/dot/overlay-links
