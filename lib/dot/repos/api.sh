@@ -7,9 +7,9 @@
 # normalization), and this file is the reviewable dependency order for those
 # pieces.
 #
-# Keep the module dir in a repos-specific variable. `init.sh` sources this file
-# in the middle of its own source list, so clobbering its `_dir` variable would
-# make later runtime modules resolve relative to `lib/dot/repos/` instead of
+# Keep the module dir in a repos-specific variable. `runtime.sh` sources this
+# file in the middle of its dependency list, so clobbering `_DOT_RUNTIME_DIR`
+# would make later modules resolve relative to `lib/dot/repos/` instead of
 # `lib/dot/`.
 
 _DOT_REPOS_DIR="${BASH_SOURCE[0]%/*}"
