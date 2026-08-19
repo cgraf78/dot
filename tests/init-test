@@ -12,6 +12,11 @@ mode_of() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 
+enable_group_writable_default_acl() {
+  command -v setfacl >/dev/null 2>&1 &&
+    setfacl -m d:u::rwx,d:g::rwx,d:o::rx "$1" 2>/dev/null
+}
+
 assert_not_group_other_writable() {
   local path=$1 label=$2 mode
   mode=$(mode_of "$path") || fail "$label: cannot read mode"
@@ -482,7 +487,10 @@ fixture_repo trusted-modes main \
   100644 \
   .local/lib/dotfiles/merge-hooks.d/mode.serial.sh \
   $'merge() { printf "clean\\n" >"$HOME/.trusted-mode-hook"; }\n' \
-  100644
+  100644 \
+  .local/bin/mode-probe \
+  $'#!/usr/bin/env bash\nexit 0\n' \
+  100755
 trusted_modes_origin=$REPLY
 fixture_home trusted-modes-clean
 trusted_modes_clean_home=$REPLY
@@ -501,8 +509,100 @@ assert_not_group_other_writable \
 assert_eq 644 \
   "$(mode_of "$trusted_modes_clean_home/.local/lib/dotfiles/merge-hooks.d/mode.serial.sh")" \
   'clean init publishes the extension file with canonical mode'
+assert_eq 755 "$(mode_of "$trusted_modes_clean_home/.local/bin/mode-probe")" \
+  'clean init publishes executable files with canonical mode'
 assert_eq clean "$(<"$trusted_modes_clean_home/.trusted-mode-hook")" \
   'clean init executes the trusted extension'
+
+# A default ACL can grant group write even when the process umask is 0022.
+# Publication must remove that authority from regular tracked files without
+# relying on the host filesystem to honor only the cooperative umask.
+fixture_home trusted-modes-default-acl
+trusted_modes_acl_home=$REPLY
+if enable_group_writable_default_acl "$trusted_modes_acl_home"; then
+  trusted_modes_acl_state=$DOT_TEST_TMP/trusted-modes-default-acl-state
+  (
+    umask 0022
+    mkdir "$trusted_modes_acl_home/.acl-dir-probe"
+    : >"$trusted_modes_acl_home/.acl-file-probe"
+  )
+  assert_eq 775 "$(mode_of "$trusted_modes_acl_home/.acl-dir-probe")" \
+    'default ACL fixture grants group write to an ordinary directory'
+  assert_eq 664 "$(mode_of "$trusted_modes_acl_home/.acl-file-probe")" \
+    'default ACL fixture grants group write to an ordinary file'
+  (
+    umask 0022
+    run_dot "$trusted_modes_acl_home" "$trusted_modes_acl_state" init --yes \
+      "file://$trusted_modes_origin" >/dev/null
+  )
+  assert_eq 644 \
+    "$(mode_of "$trusted_modes_acl_home/.local/lib/dotfiles/merge-hooks.d/mode.serial.sh")" \
+    'default ACL cannot make a tracked extension group-writable'
+  assert_eq 755 "$(mode_of "$trusted_modes_acl_home/.local/bin/mode-probe")" \
+    'default ACL cannot make a tracked executable group-writable'
+  mkdir -p "$DOT_TEST_TMP/trusted-modes-seed/.local/lib/dotfiles/pre-sync.d"
+  printf 'prepare() { :; }\n' \
+    >"$DOT_TEST_TMP/trusted-modes-seed/.local/lib/dotfiles/pre-sync.d/acl-update.sh"
+  git -C "$DOT_TEST_TMP/trusted-modes-seed" add \
+    .local/lib/dotfiles/pre-sync.d/acl-update.sh
+  git -C "$DOT_TEST_TMP/trusted-modes-seed" -c core.hooksPath=/dev/null \
+    commit -qm acl-update
+  git -C "$DOT_TEST_TMP/trusted-modes-seed" push -q \
+    "$trusted_modes_origin" HEAD:main
+  run_dot "$trusted_modes_acl_home" "$trusted_modes_acl_state" update >/dev/null
+  assert_eq 644 \
+    "$(mode_of "$trusted_modes_acl_home/.local/lib/dotfiles/pre-sync.d/acl-update.sh")" \
+    'base pull reapplies the retained mode to a new tracked hook'
+  run_dot "$trusted_modes_acl_home" "$trusted_modes_acl_state" update >/dev/null
+fi
+
+fixture_home trusted-modes-private-acl
+trusted_modes_private_acl_home=$REPLY
+if enable_group_writable_default_acl "$trusted_modes_private_acl_home"; then
+  trusted_modes_private_acl_state=$DOT_TEST_TMP/trusted-modes-private-acl-state
+  (
+    umask 0077
+    mkdir "$trusted_modes_private_acl_home/.acl-dir-probe"
+    : >"$trusted_modes_private_acl_home/.acl-file-probe"
+  )
+  assert_eq 775 "$(mode_of "$trusted_modes_private_acl_home/.acl-dir-probe")" \
+    'default ACL overrides a strict umask for an ordinary directory'
+  assert_eq 664 "$(mode_of "$trusted_modes_private_acl_home/.acl-file-probe")" \
+    'default ACL overrides a strict umask for an ordinary file'
+  (
+    umask 0077
+    run_dot "$trusted_modes_private_acl_home" \
+      "$trusted_modes_private_acl_state" init --yes \
+      "file://$trusted_modes_origin" >/dev/null
+  )
+  assert_eq 600 \
+    "$(mode_of "$trusted_modes_private_acl_home/.local/lib/dotfiles/merge-hooks.d/mode.serial.sh")" \
+    'default ACL cannot broaden a private tracked extension'
+  assert_eq 700 \
+    "$(mode_of "$trusted_modes_private_acl_home/.local/bin/mode-probe")" \
+    'default ACL cannot broaden a private tracked executable'
+  printf 'prepare() { :; }\n' \
+    >"$DOT_TEST_TMP/trusted-modes-seed/.local/lib/dotfiles/pre-sync.d/private-acl-update.sh"
+  git -C "$DOT_TEST_TMP/trusted-modes-seed" add \
+    .local/lib/dotfiles/pre-sync.d/private-acl-update.sh
+  git -C "$DOT_TEST_TMP/trusted-modes-seed" -c core.hooksPath=/dev/null \
+    commit -qm private-acl-update
+  git -C "$DOT_TEST_TMP/trusted-modes-seed" push -q \
+    "$trusted_modes_origin" HEAD:main
+  (
+    umask 0077
+    run_dot "$trusted_modes_private_acl_home" \
+      "$trusted_modes_private_acl_state" update >/dev/null
+  )
+  assert_eq 600 \
+    "$(mode_of "$trusted_modes_private_acl_home/.local/lib/dotfiles/pre-sync.d/private-acl-update.sh")" \
+    'warm pull cannot broaden a private tracked extension'
+  (
+    umask 0077
+    run_dot "$trusted_modes_private_acl_home" \
+      "$trusted_modes_private_acl_state" update >/dev/null
+  )
+fi
 
 # Clamping a cooperative umask must not broaden a caller's stricter policy.
 # Init's direct blob publication follows the retained mask just like Git does.
@@ -519,6 +619,8 @@ assert_eq 700 "$(mode_of "$trusted_modes_private_home/.local/lib/dotfiles")" \
 assert_eq 600 \
   "$(mode_of "$trusted_modes_private_home/.local/lib/dotfiles/merge-hooks.d/mode.serial.sh")" \
   'clean init retains a private extension file'
+assert_eq 700 "$(mode_of "$trusted_modes_private_home/.local/bin/mode-probe")" \
+  'clean init retains a private executable file'
 
 # Git overlays are cloned by Dot and therefore must receive the same canonical
 # trusted modes instead of inheriting 0775/0664 from the caller's umask.
@@ -545,6 +647,17 @@ fixture_home trusted-overlay
 trusted_overlay_home=$REPLY
 trusted_overlay_state=$DOT_TEST_TMP/trusted-overlay-state
 trusted_overlay_log=$DOT_TEST_TMP/trusted-overlay.log
+if enable_group_writable_default_acl "$trusted_overlay_home"; then
+  (
+    umask 0022
+    mkdir "$trusted_overlay_home/.acl-dir-probe"
+    : >"$trusted_overlay_home/.acl-file-probe"
+  )
+  assert_eq 775 "$(mode_of "$trusted_overlay_home/.acl-dir-probe")" \
+    'overlay ACL fixture grants group write to an ordinary directory'
+  assert_eq 664 "$(mode_of "$trusted_overlay_home/.acl-file-probe")" \
+    'overlay ACL fixture grants group write to an ordinary file'
+fi
 set +e
 (
   umask 0002
@@ -571,6 +684,24 @@ assert_eq 755 "$(mode_of "$trusted_overlay_home/.local/lib/dotfiles")" \
   'linked extension root has canonical mode'
 assert_eq overlay "$(<"$trusted_overlay_home/.trusted-overlay-hook")" \
   'canonical overlay extension executes'
+mkdir -p \
+  "$DOT_TEST_TMP/trusted-overlay-seed/home/.local/lib/dotfiles/merge-hooks.d"
+# shellcheck disable=SC2016 # The fixture hook expands HOME when Dot executes it.
+printf 'merge() { printf "updated\\n" >"$HOME/.trusted-overlay-updated-hook"; }\n' \
+  >"$DOT_TEST_TMP/trusted-overlay-seed/home/.local/lib/dotfiles/merge-hooks.d/updated.serial.sh"
+git -C "$DOT_TEST_TMP/trusted-overlay-seed" add \
+  home/.local/lib/dotfiles/merge-hooks.d/updated.serial.sh
+git -C "$DOT_TEST_TMP/trusted-overlay-seed" -c core.hooksPath=/dev/null \
+  commit -qm acl-update
+git -C "$DOT_TEST_TMP/trusted-overlay-seed" push -q \
+  "$trusted_overlay_origin" HEAD:main
+run_dot "$trusted_overlay_home" "$trusted_overlay_state" update >/dev/null
+assert_eq 644 \
+  "$(mode_of "$trusted_overlay_home/.dotfiles-trusted/home/.local/lib/dotfiles/merge-hooks.d/updated.serial.sh")" \
+  'overlay pull reapplies the retained mode to a new tracked hook'
+assert_eq updated "$(<"$trusted_overlay_home/.trusted-overlay-updated-hook")" \
+  'newly pulled overlay hook executes after mode normalization'
+run_dot "$trusted_overlay_home" "$trusted_overlay_state" update >/dev/null
 
 # Shared CI installs its explicit prerequisites separately from client policy.
 # The operation-scoped override must still parse the committed config and run

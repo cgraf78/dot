@@ -228,6 +228,116 @@ _repo_prepare_overlay_upstream() {
   REPLY=$upstream
 }
 
+_repo_apply_path_parent_modes() {
+  local root=$1 relative=$2 parent current component
+  local -a components=()
+
+  parent=${relative%/*}
+  [[ $parent != "$relative" ]] || return 0
+  current=$root
+  IFS=/ read -r -a components <<<"$parent"
+  for component in "${components[@]}"; do
+    current=$current/$component
+    [[ -d $current && ! -L $current ]] || return 1
+    _dot_apply_umask_ceiling "$current" || return 1
+  done
+}
+
+_repo_normalize_updated_path() {
+  local root=$1 kind=$2 relative=$3 mode=$4 oid=$5 after=$6
+  local target prepared prepared_identity final_mode current_oid ceiling
+  shift 6
+
+  _dot_init_safe_relative_path "$relative" || return 1
+  _repo_apply_path_parent_modes "$root" "$relative" || return 1
+  [[ $mode == 120000 ]] && return 0
+  [[ $mode == 100644 || $mode == 100755 ]] || return 1
+  if [[ $kind == base ]] && _overlay_active_link_matches "$relative"; then
+    return 0
+  fi
+  target=$root/$relative
+  [[ -f $target && ! -L $target ]] || return 1
+  "$@" diff --cached --quiet "$after" -- "$relative" || return 1
+  "$@" diff --quiet "$after" -- "$relative" || return 1
+  current_oid=$("$@" hash-object --no-filters -- "$target" 2>/dev/null) || return 1
+  [[ $current_oid == "$oid" ]] || return 1
+
+  # The checkout may have been born group-writable under a default ACL. Build
+  # an exact replacement from the captured commit, then atomically replace the
+  # exposed inode so a writer that opened the unsafe generation cannot retain
+  # authority after the mode clamp.
+  _dot_sibling_tmp_for "$target" || return 1
+  prepared=$REPLY
+  _dot_cleanup_register_path "$prepared"
+  "$@" show "$after:$relative" >"$prepared" || return 1
+  current_oid=$("$@" hash-object --no-filters -- "$prepared" 2>/dev/null) || return 1
+  [[ $current_oid == "$oid" ]] || return 1
+
+  if [[ $mode == 100755 ]]; then
+    ceiling=0777
+  else
+    ceiling=0666
+  fi
+  _dot_apply_umask_ceiling "$target" "$ceiling" || return 1
+  final_mode=$(stat -c '%a' "$target" 2>/dev/null || stat -f '%Lp' "$target" 2>/dev/null) ||
+    return 1
+  chmod "$final_mode" "$prepared" || return 1
+  prepared_identity=$(_dot_path_identity "$prepared") || return 1
+  current_oid=$("$@" hash-object --no-filters -- "$target" 2>/dev/null) || return 1
+  [[ $current_oid == "$oid" ]] || return 1
+  _dot_publish_prepared_regular "$prepared" "$target" || return 1
+  [[ $(_dot_path_identity "$target" 2>/dev/null || true) == "$prepared_identity" ]] ||
+    return 1
+  _dot_cleanup_unregister_path "$prepared"
+  current_oid=$("$@" hash-object --no-filters -- "$target" 2>/dev/null) || return 1
+  [[ $current_oid == "$oid" ]]
+}
+
+_repo_normalize_updated_paths() {
+  local root=$1 kind=$2 before=$3 after=$4
+  local inventory header relative old_mode new_mode old_oid new_oid status extra
+  local valid=1
+  shift 4
+
+  [[ $(_repo_head "$@") == "$after" ]] || return 1
+  _dot_cleanup_mktemp || return 1
+  inventory=$REPLY
+  if ! "$@" diff --raw --no-renames --abbrev=64 -z "$before" "$after" -- >"$inventory"; then
+    _dot_cleanup_remove_path "$inventory" || true
+    return 1
+  fi
+  while IFS= read -r -d '' header; do
+    IFS= read -r -d '' relative || {
+      valid=0
+      break
+    }
+    [[ $header == :* ]] || {
+      valid=0
+      break
+    }
+    read -r old_mode new_mode old_oid new_oid status extra <<<"${header#:}"
+    [[ -z $extra && $old_mode =~ ^(000000|100644|100755|120000)$ &&
+      $new_mode =~ ^(000000|100644|100755|120000)$ &&
+      $old_oid =~ ^[0-9a-fA-F]+$ && $new_oid =~ ^[0-9a-fA-F]+$ &&
+      (${#old_oid} -eq 40 || ${#old_oid} -eq 64) &&
+      ${#new_oid} -eq ${#old_oid} && $status =~ ^[AMDT]$ ]] || {
+      valid=0
+      break
+    }
+    [[ $new_mode != 000000 ]] || continue
+    _repo_normalize_updated_path \
+      "$root" "$kind" "$relative" "$new_mode" "$new_oid" "$after" "$@" || {
+      valid=0
+      break
+    }
+  done <"$inventory"
+  if [[ $valid -eq 1 && $(_repo_head "$@") != "$after" ]]; then
+    valid=0
+  fi
+  _dot_cleanup_remove_path "$inventory" || return 1
+  [[ $valid -eq 1 ]]
+}
+
 # Pull the base repo. Reports the outcome through the REPLY_STATUS enum
 # (changed|current|skipped|failed|blocked) rather than a display string, so callers
 # branch on a stable key instead of parsing prose.
@@ -250,6 +360,10 @@ _pull_base() {
   if [[ "$pull_rc" -eq 0 ]]; then
     head_after=$(_repo_head _base_git)
     if [[ -n "$head_before" && -n "$head_after" && "$head_before" != "$head_after" ]]; then
+      if ! _repo_normalize_updated_paths "$HOME" base "$head_before" "$head_after" _base_git; then
+        REPLY_STATUS="failed"
+        return 1
+      fi
       REPLY_STATUS="changed"
     else
       REPLY_STATUS="current"
@@ -325,6 +439,46 @@ _dot_maybe_stage_progress() {
   _ui_stage_update "$(_dot_progress_detail "$label" "$done" "$total")"
 }
 
+_repo_cloned_overlay_path_modes() {
+  local root=$1 relative=$2 target executable=0
+
+  _dot_init_safe_relative_path "$relative" || return 1
+  _repo_apply_path_parent_modes "$root" "$relative" || return 1
+
+  target=$root/$relative
+  [[ -L $target ]] && return 0
+  [[ -f $target && ! -L $target ]] || return 1
+  [[ -x $target ]] && executable=1
+  if [[ $executable -eq 1 ]]; then
+    _dot_apply_tracked_file_mode "$target" 100755
+  else
+    _dot_apply_tracked_file_mode "$target" 100644
+  fi
+}
+
+_repo_normalize_cloned_overlay_modes() {
+  local root=$1 relative inventory valid=1
+
+  # The staged checkout is not yet public, so every tracked byte is the exact
+  # validated clone generation. Reapply the retained umask to its worktree
+  # once; this removes default-ACL grants without a recurring warm-path scan.
+  chmod 0700 "$root" || return 1
+  _dot_cleanup_mktemp || return 1
+  inventory=$REPLY
+  if ! git -C "$root" ls-files -z >"$inventory"; then
+    _dot_cleanup_remove_path "$inventory" || true
+    return 1
+  fi
+  while IFS= read -r -d '' relative; do
+    _repo_cloned_overlay_path_modes "$root" "$relative" || {
+      valid=0
+      break
+    }
+  done <"$inventory"
+  _dot_cleanup_remove_path "$inventory" || return 1
+  [[ $valid -eq 1 ]]
+}
+
 _repo_clone_overlay_staged() {
   local url=$1 path=$2 parent name stage
   parent=${path%/*}
@@ -339,6 +493,10 @@ _repo_clone_overlay_staged() {
     return 1
   fi
   if ! _repo_validate_candidate_tree overlay HEAD git -C "$stage"; then
+    _dot_cleanup_remove_path "$stage" || true
+    return 1
+  fi
+  if ! _repo_normalize_cloned_overlay_modes "$stage"; then
     _dot_cleanup_remove_path "$stage" || true
     return 1
   fi
@@ -454,6 +612,11 @@ _pull_overlay() {
     fi
     head_after=$(_repo_head git -C "$path")
     if [[ -n "$head_before" && -n "$head_after" && "$head_before" != "$head_after" ]]; then
+      if ! _repo_normalize_updated_paths \
+        "$path" overlay "$head_before" "$head_after" git -C "$path"; then
+        REPLY_STATUS="failed"
+        return 0
+      fi
       REPLY_STATUS="changed"
     else
       REPLY_STATUS="current"
@@ -479,6 +642,12 @@ _pull_overlay() {
   fi
   head_after=$(_repo_head git -C "$path")
   if [[ -n "$head_before" && -n "$head_after" && "$head_before" != "$head_after" ]]; then
+    if ! _repo_normalize_updated_paths \
+      "$path" overlay "$head_before" "$head_after" git -C "$path"; then
+      _warn "  warning: $name dotfiles mode normalization failed"
+      REPLY_STATUS="failed"
+      return 0
+    fi
     [[ "${DOT_UI_TOTAL:-0}" -gt 0 && "${DOT_VERBOSE:-0}" -eq 1 ]] && _ui_status changed "$name dotfiles updated"
     REPLY_STATUS="changed"
   else
