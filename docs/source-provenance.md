@@ -1,10 +1,10 @@
 # Source provenance
 
-This repository has fresh history. Public engine extraction used only the
-public `cgraf78/dotfiles` tree at the immutable `dotfiles-v1` revision recorded
-in [`source-revisions-v1.tsv`](source-revisions-v1.tsv); no implementation or
-fixture was copied from a private overlay repository. New standalone-only seams
-are marked as such below rather than being attributed to an older file.
+This repository has fresh history. Paths adapted from the public
+`cgraf78/dotfiles` tree are attributed to the immutable `dotfiles-v1` revision
+recorded in [`source-revisions-v1.tsv`](source-revisions-v1.tsv). New
+standalone-only seams are marked as such below rather than being attributed to
+an older file.
 
 ## Generated and shared inputs
 
@@ -51,12 +51,14 @@ are marked as such below rather than being attributed to an older file.
 | `tests/{families-test,merge-block-test,hooks-test,hook-api-test,extensions-api-test}` | Generic cases extracted from `core-merges-test`, `core-resource-cleanup-test`, and `tests/core/merges.sh` | Concrete application hook cases deliberately excluded |
 | `tests/{doctor-test,shdeps-provider-test}` | Generic cases extracted from `core-doctor-test`, `core-test`, `core-reexec-test`, and provider/UI portions of the public suite | Application and environment checks remain client-owned |
 | `tests/{init-test,cli-test,config-test,install-test,client-launcher-test,library-test,examples-test,workflow-test}` | New standalone acceptance suites, informed by public bootstrap/launcher/XDG/workflow characterization | Use only synthetic users, repositories, hosts, and paths |
-| `tests/lib/{test.sh,repo.sh}` and `tests/run` | New standalone harness, adapted from public dotfiles test conventions | Checkout-local only; never invokes the private/client suite |
+| `tests/lib/{test.sh,repo.sh}` and `tests/run` | New standalone harness, adapted from public dotfiles test conventions | Checkout-local only; does not invoke client-owned tests |
 
-Before first public visibility, CI compares this inventory with the tracked
-standalone implementation and test inventory, runs a repository-wide
-work/private deny-list scan, and verifies that every generated artifact still
-matches its pinned public provider revision.
+`tests/provenance-test` validates the revision and per-path inventories. It
+requires named full commit IDs in the revision inventory, compares the manifest
+with the tracked `install.sh`, `bin`, `lib/dot`, `support`, and `tests` files,
+verifies each listed path and accepted origin form, and keeps full revisions out
+of the per-path manifest. The test is limited to these inventories; other
+repository content and generated-artifact freshness are outside its contract.
 
 The exact one-row-per-path inventory used by that gate is
 [`source-provenance-v1.tsv`](source-provenance-v1.tsv). Any added, removed, or

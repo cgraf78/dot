@@ -5,6 +5,7 @@ set -euo pipefail
 root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 manifest=$root/docs/source-provenance-v1.tsv
 revisions=$root/docs/source-revisions-v1.tsv
+documentation=$root/docs/source-provenance.md
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/dot-provenance.XXXXXX")
 trap 'rm -rf -- "$temporary"' EXIT
 
@@ -69,13 +70,13 @@ if grep -Eq '[0-9a-f]{40}' "$manifest"; then
   exit 1
 fi
 
-grep -Fq 'source-revisions-v1.tsv' "$root/docs/source-provenance.md" || {
+grep -Fq 'source-revisions-v1.tsv' "$documentation" || {
   printf 'provenance-test: source revision inventory is undocumented\n' >&2
   exit 1
 }
 
-if grep -Eiq 'dotfiles-(work|personal)|private overlay repository' "$manifest"; then
-  printf 'provenance-test: private source named in public inventory\n' >&2
+if grep -Eiq 'repository-wide|deny-?list|every generated artifact' "$documentation"; then
+  printf 'provenance-test: documentation overstates the manifest checks\n' >&2
   exit 1
 fi
 

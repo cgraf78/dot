@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Overlay link and skip-worktree management.
 #
-# Overlays intentionally shadow selected base-dotfiles paths with symlinks from
+# Overlays intentionally shadow selected base-client paths with symlinks from
 # their configured `home/` source. The base repo must mark those tracked paths
 # skip-worktree while the overlay owns them, then restore the tracked version
 # before pulling so Git never tries to merge through a symlink.

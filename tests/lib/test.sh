@@ -8,15 +8,15 @@ DOT_TEST_TMP=$(cd -P -- "$DOT_TEST_TMP" && pwd -P)
 export DOT_TEST_ROOT DOT_TEST_TMP
 trap 'rm -rf "$DOT_TEST_TMP"' EXIT HUP INT TERM
 
-# Public-engine tests own their complete synthetic HOME/XDG topology. CI
+# Standalone Dot tests own their complete synthetic HOME/XDG topology. CI
 # runners may export host-specific XDG roots, which would otherwise make a
 # fixture read configuration or state outside its isolated HOME and produce
 # platform-dependent path identities.
 unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_RUNTIME_DIR
 
-# Public-engine fixtures must not inherit a client repository's PATH-visible
+# Standalone fixtures must not inherit a client repository's PATH-visible
 # Git launcher. That launcher intentionally interprets synthetic HOME values as
-# dotfiles work trees and would make isolated generic tests exercise private
+# client work trees and would make isolated generic tests exercise ambient
 # client policy. Keep the first ordinary Git directory ahead of the caller's
 # PATH; individual tests can still prepend their own fakes.
 while IFS= read -r dot_test_git; do
