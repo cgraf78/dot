@@ -28,6 +28,110 @@ assert_eq no "$(git --git-dir="$home/.dotfiles" config status.showUntrackedFiles
 assert_eq '' "$(git --git-dir="$home/.dotfiles" config --local --get pull.rebase 2>/dev/null || true)" \
   'base update does not write pull policy'
 
+# A fetch can confirm that the active commit is already the exact upstream
+# generation. That result must return current before candidate validation,
+# snapshotting, or an empty rebase; those checks only protect a new generation
+# that could become visible beneath HOME.
+fixture_repo unchanged-base main .testrc $'current\n' 100644
+unchanged_base_origin=$REPLY
+fixture_home unchanged-base
+unchanged_base_home=$REPLY
+unchanged_base_state=$DOT_TEST_TMP/unchanged-base-state
+unchanged_base_trace=$DOT_TEST_TMP/unchanged-base-trace.json
+run_dot "$unchanged_base_home" "$unchanged_base_state" init --yes \
+  "file://$unchanged_base_origin" >/dev/null
+GIT_TRACE2_EVENT=$unchanged_base_trace \
+  run_dot "$unchanged_base_home" "$unchanged_base_state" update >/dev/null
+unchanged_base_fetch=$(grep -Fc '"name":"fetch"' "$unchanged_base_trace" || true)
+unchanged_base_ls_tree=$(grep -Fc '"name":"ls-tree"' "$unchanged_base_trace" || true)
+unchanged_base_rebase=$(grep -Fc '"name":"rebase"' "$unchanged_base_trace" || true)
+assert_eq 1 "$unchanged_base_fetch" \
+  'unchanged base still fetches before taking the fast path'
+assert_eq 0 "$unchanged_base_ls_tree" \
+  'unchanged base skips candidate-tree validation after fetch'
+assert_eq 0 "$unchanged_base_rebase" \
+  'unchanged base skips an empty rebase after fetch'
+
+# Fetch is an external boundary. A direct Git operation can move HEAD while it
+# runs even though Dot serializes its own updates, so the equality decision must
+# use a fresh HEAD read after fetch rather than a snapshot from before it.
+unchanged_base_head=$(git --git-dir="$unchanged_base_home/.dotfiles" rev-parse HEAD)
+unchanged_base_tree=$(git --git-dir="$unchanged_base_home/.dotfiles" \
+  rev-parse 'HEAD^{tree}')
+unchanged_base_moved=$(printf 'out-of-band move\n' |
+  git --git-dir="$unchanged_base_home/.dotfiles" \
+    -c user.name=fixture -c user.email=fixture@example.invalid \
+    commit-tree "$unchanged_base_tree" -p "$unchanged_base_head")
+unchanged_base_race_bin=$DOT_TEST_TMP/unchanged-base-race-bin
+unchanged_base_race_trace=$DOT_TEST_TMP/unchanged-base-race-trace.json
+unchanged_base_race_marker=$DOT_TEST_TMP/unchanged-base-race-marker
+unchanged_base_real_git=$(type -P git)
+mkdir -p "$unchanged_base_race_bin"
+cat >"$unchanged_base_race_bin/git" <<'GIT'
+#!/usr/bin/env bash
+set -e
+is_fetch=0
+for arg in "$@"; do
+  [[ $arg == fetch ]] && is_fetch=1
+done
+"$DOT_TEST_HEAD_RACE_REAL_GIT" "$@"
+status=$?
+if [[ $status -eq 0 && $is_fetch -eq 1 && ! -e $DOT_TEST_HEAD_RACE_MARKER ]]; then
+  "$DOT_TEST_HEAD_RACE_REAL_GIT" --git-dir="$DOT_TEST_HEAD_RACE_GIT_DIR" \
+    update-ref HEAD "$DOT_TEST_HEAD_RACE_MOVED" "$DOT_TEST_HEAD_RACE_EXPECTED"
+  : >"$DOT_TEST_HEAD_RACE_MARKER"
+fi
+exit "$status"
+GIT
+chmod +x "$unchanged_base_race_bin/git"
+GIT_TRACE2_EVENT=$unchanged_base_race_trace \
+  DOT_TEST_HEAD_RACE_REAL_GIT=$unchanged_base_real_git \
+  DOT_TEST_HEAD_RACE_GIT_DIR="$unchanged_base_home/.dotfiles" \
+  DOT_TEST_HEAD_RACE_MOVED=$unchanged_base_moved \
+  DOT_TEST_HEAD_RACE_EXPECTED=$unchanged_base_head \
+  DOT_TEST_HEAD_RACE_MARKER=$unchanged_base_race_marker \
+  PATH="$unchanged_base_race_bin:$PATH" \
+  run_dot "$unchanged_base_home" "$unchanged_base_state" update >/dev/null
+[[ -e $unchanged_base_race_marker ]] || fail 'base fetch-boundary race fixture did not run'
+unchanged_base_race_ls_tree=$(grep -Fc '"name":"ls-tree"' \
+  "$unchanged_base_race_trace" || true)
+unchanged_base_race_rebase=$(grep -Fc '"name":"rebase"' \
+  "$unchanged_base_race_trace" || true)
+assert_eq 1 "$unchanged_base_race_ls_tree" \
+  'base HEAD move during fetch bypasses the unchanged fast path'
+assert_eq 1 "$unchanged_base_race_rebase" \
+  'base HEAD move during fetch follows the ordinary pull path'
+
+# Exercise the same fast path through a real overlay checkout. The base test
+# above isolates its own branch; with both repositories current, no candidate
+# tree or rebase command should be needed for either synchronization unit.
+fixture_repo unchanged-overlay-base main .testrc $'base\n' 100644
+unchanged_overlay_base_origin=$REPLY
+fixture_repo unchanged-overlay main home/.config/overlay/value $'overlay\n' 100644
+unchanged_overlay_origin=$REPLY
+fixture_home unchanged-overlay
+unchanged_overlay_home=$REPLY
+unchanged_overlay_state=$DOT_TEST_TMP/unchanged-overlay-state
+unchanged_overlay_trace=$DOT_TEST_TMP/unchanged-overlay-trace.json
+run_dot "$unchanged_overlay_home" "$unchanged_overlay_state" init --yes \
+  "file://$unchanged_overlay_base_origin" >/dev/null
+mkdir -p "$unchanged_overlay_home/.config/dot/overlays.d"
+printf 'url=file://%s\n' "$unchanged_overlay_origin" \
+  >"$unchanged_overlay_home/.config/dot/overlays.d/10-unchanged-overlay.conf"
+run_dot "$unchanged_overlay_home" "$unchanged_overlay_state" update >/dev/null
+: >"$unchanged_overlay_trace"
+GIT_TRACE2_EVENT=$unchanged_overlay_trace \
+  run_dot "$unchanged_overlay_home" "$unchanged_overlay_state" update >/dev/null
+unchanged_overlay_fetch=$(grep -Fc '"name":"fetch"' "$unchanged_overlay_trace" || true)
+unchanged_overlay_ls_tree=$(grep -Fc '"name":"ls-tree"' "$unchanged_overlay_trace" || true)
+unchanged_overlay_rebase=$(grep -Fc '"name":"rebase"' "$unchanged_overlay_trace" || true)
+assert_eq 2 "$unchanged_overlay_fetch" \
+  'unchanged base and overlay still fetch before taking their fast paths'
+assert_eq 0 "$unchanged_overlay_ls_tree" \
+  'unchanged overlay skips candidate-tree validation after fetch'
+assert_eq 0 "$unchanged_overlay_rebase" \
+  'unchanged overlay skips an empty rebase after fetch'
+
 # Client trees may not occupy deterministic same-parent init staging or
 # rollback namespaces. Candidate inventories contain leaves, so cover both a
 # direct file and a descendant below a stage-shaped directory at root/nested
@@ -485,6 +589,41 @@ set -e
 assert_eq 1 "$unsafe_overlay_rc" 'overlay candidate reserved ancestor is rejected'
 [[ ! -e $unsafe_overlay_home/.dotfiles-unsafe ]] ||
   fail 'unsafe overlay candidate was published'
+
+# Candidate validation must remain on the changed-generation path after an
+# overlay has already been accepted and cloned. A later reserved path is fetched
+# but cannot advance the checkout or replace the currently published content.
+fixture_repo unsafe-overlay-update main \
+  home/.config/unsafe-overlay-update/value $'safe\n' 100644
+unsafe_overlay_update_origin=$REPLY
+fixture_repo unsafe-overlay-update-base main README.md $'base\n' 100644
+unsafe_overlay_update_base_origin=$REPLY
+fixture_home unsafe-overlay-update
+unsafe_overlay_update_home=$REPLY
+unsafe_overlay_update_state=$DOT_TEST_TMP/unsafe-overlay-update-state
+run_dot "$unsafe_overlay_update_home" "$unsafe_overlay_update_state" init --yes \
+  "file://$unsafe_overlay_update_base_origin" >/dev/null
+mkdir -p "$unsafe_overlay_update_home/.config/dot/overlays.d"
+printf 'url=file://%s\n' "$unsafe_overlay_update_origin" \
+  >"$unsafe_overlay_update_home/.config/dot/overlays.d/10-unsafe-update.conf"
+run_dot "$unsafe_overlay_update_home" "$unsafe_overlay_update_state" update >/dev/null
+unsafe_overlay_update_head=$(git \
+  -C "$unsafe_overlay_update_home/.dotfiles-unsafe-update" rev-parse HEAD)
+fixture_push unsafe-overlay-update main home/.local /tmp/foreign 120000
+set +e
+run_dot "$unsafe_overlay_update_home" "$unsafe_overlay_update_state" \
+  update >/dev/null 2>&1
+unsafe_overlay_update_rc=$?
+set -e
+assert_eq 1 "$unsafe_overlay_update_rc" \
+  'changed overlay generation with reserved ancestor is rejected'
+assert_eq "$unsafe_overlay_update_head" "$(git \
+  -C "$unsafe_overlay_update_home/.dotfiles-unsafe-update" rev-parse HEAD)" \
+  'rejected changed overlay preserves its accepted HEAD'
+assert_eq safe "$(<"$unsafe_overlay_update_home/.config/unsafe-overlay-update/value")" \
+  'rejected changed overlay preserves its published content'
+[[ ! -e $unsafe_overlay_update_home/.dotfiles-unsafe-update/home/.local ]] ||
+  fail 'rejected changed overlay populated the reserved checkout path'
 
 fixture_repo filtered-base main README.md $'base\n' 100644
 filtered_origin=$REPLY

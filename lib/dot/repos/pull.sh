@@ -209,7 +209,7 @@ _repo_prepare_base_upstream() {
   remote=${upstream%%/*}
   [[ -n $remote && $remote != "$upstream" ]] || return 1
   _base_git fetch --quiet --no-write-fetch-head "$remote" || return 2
-  _repo_validate_candidate_tree base "$upstream" _base_git || return 3
+  upstream=$(_base_git rev-parse --verify "$upstream^{commit}" 2>/dev/null) || return 3
   REPLY=$upstream
 }
 
@@ -225,7 +225,8 @@ _repo_prepare_overlay_upstream() {
   else
     git -C "$path" fetch --quiet --no-write-fetch-head "$remote" || return 2
   fi
-  _repo_validate_candidate_tree overlay "$upstream" git -C "$path" || return 3
+  upstream=$(git -C "$path" rev-parse --verify "$upstream^{commit}" 2>/dev/null) ||
+    return 2
   REPLY=$upstream
 }
 
@@ -443,7 +444,6 @@ _pull_base() {
     return 0
   fi
   local head_before head_after parent_snapshot
-  head_before=$(_repo_head _base_git)
   local pull_rc=0
   local upstream
   _repo_prepare_base_upstream || {
@@ -451,6 +451,18 @@ _pull_base() {
     return 1
   }
   upstream=$REPLY
+  head_before=$(_repo_head _base_git)
+  # The active commit is already an accepted generation. When fetch resolves
+  # the upstream to those exact bytes, no candidate can become visible and the
+  # validation, parent snapshot, and rebase path has no work to protect.
+  if [[ -n $head_before && $head_before == "$upstream" ]]; then
+    REPLY_STATUS=current
+    return 0
+  fi
+  _repo_validate_candidate_tree base "$upstream" _base_git || {
+    REPLY_STATUS=failed
+    return 1
+  }
   _repo_snapshot_updated_path_parents \
     "$HOME" "$head_before" "$upstream" _base_git || {
     REPLY_STATUS=failed
@@ -746,9 +758,7 @@ _pull_overlay() {
   _repo_prepare_overlay_upstream "$path" "$optional" || prepare_rc=$?
   if [[ $prepare_rc -ne 0 ]]; then
     [[ "$optional" == true ]] && return 0
-    if [[ $prepare_rc -eq 3 ]]; then
-      _warn "  warning: $name overlay candidate failed reserved-path validation"
-    elif [[ "${DOT_UI_TOTAL:-0}" -gt 0 ]]; then
+    if [[ "${DOT_UI_TOTAL:-0}" -gt 0 ]]; then
       _ui_status warning "$name dotfiles pull failed"
     else
       _warn "  warning: $name dotfiles pull failed"
@@ -758,6 +768,18 @@ _pull_overlay() {
   fi
   upstream=$REPLY
   head_before=$(_repo_head git -C "$path")
+  # Match the base fast path: an identical immutable commit is already the
+  # accepted overlay generation, so no new tree can reach the client worktree.
+  if [[ -n $head_before && $head_before == "$upstream" ]]; then
+    REPLY_STATUS=current
+    return 0
+  fi
+  if ! _repo_validate_candidate_tree overlay "$upstream" git -C "$path"; then
+    [[ "$optional" == true ]] && return 0
+    _warn "  warning: $name overlay candidate failed reserved-path validation"
+    REPLY_STATUS=failed
+    return 0
+  fi
   _repo_snapshot_updated_path_parents \
     "$path" "$head_before" "$upstream" git -C "$path" || {
     REPLY_STATUS=failed
