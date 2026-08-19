@@ -241,6 +241,10 @@ _dot_publish_prepared_expected_regular() {
     _dot_restore_retired_regular "$transaction" "$retired" "$target" || true
     return 1
   fi
+  if ! _dot_files_equal "$retired" "$source"; then
+    _dot_restore_retired_regular "$transaction" "$retired" "$target" || true
+    return 1
+  fi
 
   if ! _dot_move_noreplace "$source" "$target"; then
     _dot_restore_retired_regular "$transaction" "$retired" "$target" || true

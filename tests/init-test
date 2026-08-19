@@ -872,6 +872,53 @@ assert_eq foreign "$(<"$prepared_publish_race_dir/target")" \
 assert_eq 664 "$(mode_of "$prepared_publish_race_dir/target")" \
   'prepared publication preserves the replacement mode'
 
+prepared_publish_content_dir=$DOT_TEST_TMP/prepared-publish-content-race
+prepared_publish_content_bin=$DOT_TEST_TMP/prepared-publish-content-race-bin
+prepared_publish_content_marker=$DOT_TEST_TMP/prepared-publish-content-race-marker
+prepared_publish_content_real_mv=$(type -P mv)
+mkdir -p "$prepared_publish_content_dir" "$prepared_publish_content_bin"
+printf 'expected\n' >"$prepared_publish_content_dir/target"
+printf 'expected\n' >"$prepared_publish_content_dir/prepared"
+prepared_publish_content_identity=$(identity_of "$prepared_publish_content_dir/target")
+cat >"$prepared_publish_content_bin/mv" <<'MV'
+#!/usr/bin/env bash
+previous=
+last=
+for arg in "$@"; do
+  previous=$last
+  last=$arg
+done
+if [[ ! -e $DOT_TEST_RACE_MARKER && $previous == "$DOT_TEST_RACE_TARGET" ]]; then
+  : >"$DOT_TEST_RACE_MARKER"
+  printf 'foreign\n' >"$DOT_TEST_RACE_TARGET"
+fi
+exec "$DOT_TEST_REAL_MV" "$@"
+MV
+chmod +x "$prepared_publish_content_bin/mv"
+prepared_publish_content_status=0
+set +e
+HOME=$prepared_publish_content_dir DOT_SOURCE_ROOT=$root \
+  PATH="$prepared_publish_content_bin:$PATH" \
+  DOT_TEST_REAL_MV=$prepared_publish_content_real_mv \
+  DOT_TEST_RACE_TARGET=$prepared_publish_content_dir/target \
+  DOT_TEST_RACE_MARKER=$prepared_publish_content_marker \
+  DOT_TEST_PREPARED_DIR=$prepared_publish_content_dir \
+  DOT_TEST_EXPECTED_IDENTITY=$prepared_publish_content_identity \
+  bash --noprofile --norc -c '
+    . "$DOT_SOURCE_ROOT/lib/dot/resources.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    _dot_cleanup_install_owner_traps
+    _dot_publish_prepared_regular \
+      "$DOT_TEST_PREPARED_DIR/prepared" "$DOT_TEST_PREPARED_DIR/target" \
+      "$DOT_TEST_EXPECTED_IDENTITY"
+  '
+prepared_publish_content_status=$?
+set -e
+assert_eq 1 "$prepared_publish_content_status" \
+  'prepared publication rejects in-place content change at the move boundary'
+assert_eq foreign "$(<"$prepared_publish_content_dir/target")" \
+  'prepared publication restores the move-boundary content change'
+
 # Git overlays are cloned by Dot and therefore must receive the same canonical
 # trusted modes instead of inheriting 0775/0664 from the caller's umask.
 fixture_repo trusted-overlay main \
