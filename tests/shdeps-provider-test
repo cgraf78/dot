@@ -127,11 +127,13 @@ assert_eq $'sync-args=<passthrough>\nquiet=1 shdeps_quiet=1 force=1 shdeps_force
   _shdeps_ui_reset
   DOT_UI_LIVE_ACTIVE=1
   prompt_output=$(
-    printf '[sudo] password for chris:'
+    printf '[sudo] password for fixture-user:'
     _handle_shdeps_event \
       '{"event":"prompt","status":"running","detail":"waiting for sudo authentication"}'
     printf '\nactive=%s' "$DOT_UI_SHDEPS_PROMPT_ACTIVE"
   )
+  assert_contains '[sudo] password for fixture-user:' "$prompt_output" \
+    'provider UI prompt fixture uses a synthetic identity'
   assert_contains 'active=1' "$prompt_output" \
     'provider UI pauses redraw for an interactive prompt'
   [[ "$prompt_output" != *$'\r\033[K'* ]] ||

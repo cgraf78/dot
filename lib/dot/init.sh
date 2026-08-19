@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Sourceable private runtime entry used by tests and the client forwarder.
+# Sourceable private runtime entry used by tests and the client launcher.
 
 _DOT_INIT_DIR=${BASH_SOURCE[0]%/*}
 DOT_SOURCE_ROOT=$(cd -P -- "$_DOT_INIT_DIR/../.." && pwd -P) || return 1

@@ -1,12 +1,12 @@
 # shellcheck shell=bash
 # Repo-set iteration and Git invocation helpers.
 #
-# The base dotfiles repo is bare with $HOME as its work tree, while overlays
-# are normal Git repos. Keep that command-shape difference centralized so
-# higher-level operations can work with repo records instead of reimplementing
-# bare-vs-normal Git dispatch.
+# The base client may use a separate Git directory with $HOME as its work tree
+# or an ordinary checkout rooted at $HOME, while overlays are ordinary Git
+# repositories. Keep topology dispatch centralized so higher-level operations
+# can work with repo records instead of reimplementing those command shapes.
 
-# Run a callback for every repo that already exists locally: the base dotfiles
+# Run a callback for every repo that already exists locally: the base client
 # repo first, followed by cloned overlays in discovery order. Missing overlays
 # are deliberately skipped here; cloning is pull/update behavior, while simple
 # commands like status, diff, fetch, and push should only operate on installed
@@ -30,8 +30,8 @@ _repo_each_existing() {
 }
 
 # Execute git for a repo record emitted by _repo_each_existing. Keeping this as
-# a helper avoids scattering the base repo's bare-repo command shape beside
-# normal `git -C` overlay commands.
+# a helper avoids scattering base-topology dispatch beside `git -C` overlay
+# commands.
 _repo_git() {
   local kind="$1" path="$2"
   shift 2
