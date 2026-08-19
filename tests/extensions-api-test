@@ -10,6 +10,7 @@ HOME=$DOT_TEST_TMP/home
 mkdir -p "$HOME"
 DOT_SOURCE_ROOT=$root
 export HOME DOT_SOURCE_ROOT
+unset DOTFILES
 # shellcheck source=/dev/null
 . "$root/lib/dot/public/api-version.sh"
 # shellcheck source=/dev/null
@@ -21,6 +22,28 @@ export HOME DOT_SOURCE_ROOT
 dot_config_load
 # shellcheck source=/dev/null
 . "$root/lib/dot/runtime.sh"
+
+assert_eq "$HOME/.dotfiles" "$DOT_CLIENT_GIT_DIR" \
+  'runtime publishes the supported client Git directory'
+assert_eq '' "${DOTFILES+x}" \
+  'runtime does not publish legacy DOTFILES compatibility state'
+
+inherited_dotfiles=$(
+  HOME="$HOME" DOT_SOURCE_ROOT="$root" DOTFILES=caller-sentinel \
+    bash --noprofile --norc -c '
+      set -euo pipefail
+      root=$1
+      . "$root/lib/dot/public/api-version.sh"
+      . "$root/lib/dot/public/xdg.sh"
+      . "$root/lib/dot/public/ui.sh"
+      . "$root/lib/dot/config.sh"
+      dot_config_load
+      . "$root/lib/dot/runtime.sh"
+      printf "%s\n" "$DOTFILES"
+    ' -- "$root"
+)
+assert_eq caller-sentinel "$inherited_dotfiles" \
+  'runtime preserves caller-owned DOTFILES state'
 
 inventory_functions() {
   awk -F '\t' '!/^#/ && NF {print $1}' "$1" | LC_ALL=C sort
