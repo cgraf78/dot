@@ -47,7 +47,8 @@ _try_resolve_dirty() {
   if _base_repo_exists && ! _base_git diff-index --quiet HEAD 2>/dev/null; then
     upstream=$(_repo_configured_upstream _base_git) || upstream=''
     remote=${upstream%%/*}
-    [[ -z $upstream ]] || _base_git fetch --quiet "$remote" 2>/dev/null || true
+    [[ -z $upstream ]] ||
+      _base_git fetch --quiet --no-write-fetch-head "$remote" 2>/dev/null || true
     if [[ -n $upstream ]] && _dirty_files_match_ref "$HOME" "$upstream" _base_git; then
       # shellcheck disable=SC2086  # _base_git is intentionally word-split
       _checkout_dirty_files _base_git
@@ -65,7 +66,9 @@ _try_resolve_dirty() {
       ! git -C "$path" diff-index --quiet HEAD 2>/dev/null; then
       upstream=$(_repo_configured_upstream git -C "$path") || upstream=''
       remote=${upstream%%/*}
-      [[ -z $upstream ]] || git -C "$path" fetch --quiet "$remote" 2>/dev/null || true
+      [[ -z $upstream ]] ||
+        git -C "$path" fetch --quiet --no-write-fetch-head "$remote" \
+          2>/dev/null || true
       if [[ -n $upstream ]] &&
         _dirty_files_match_ref "$path" "$upstream" git -C "$path"; then
         _checkout_dirty_files git -C "$path"

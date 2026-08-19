@@ -208,7 +208,7 @@ _repo_prepare_base_upstream() {
     return 1
   remote=${upstream%%/*}
   [[ -n $remote && $remote != "$upstream" ]] || return 1
-  _base_git fetch --quiet "$remote" || return 2
+  _base_git fetch --quiet --no-write-fetch-head "$remote" || return 2
   _repo_validate_candidate_tree base "$upstream" _base_git || return 3
   REPLY=$upstream
 }
@@ -220,12 +220,217 @@ _repo_prepare_overlay_upstream() {
   remote=${upstream%%/*}
   [[ -n $remote && $remote != "$upstream" ]] || return 1
   if [[ $quiet_errors == true ]]; then
-    git -C "$path" fetch --quiet "$remote" >/dev/null 2>&1 || return 2
+    git -C "$path" fetch --quiet --no-write-fetch-head "$remote" \
+      >/dev/null 2>&1 || return 2
   else
-    git -C "$path" fetch --quiet "$remote" || return 2
+    git -C "$path" fetch --quiet --no-write-fetch-head "$remote" || return 2
   fi
   _repo_validate_candidate_tree overlay "$upstream" git -C "$path" || return 3
   REPLY=$upstream
+}
+
+_repo_snapshot_updated_path_parents() {
+  local root=$1 before=$2 after=$3 inventory snapshot relative parent
+  local current relative_current component identity valid=1
+  local -a components=()
+  shift 3
+
+  after=$("$@" rev-parse --verify "$after^{commit}" 2>/dev/null) || return 1
+  _dot_cleanup_mktemp || return 1
+  inventory=$REPLY
+  _dot_cleanup_mktemp || {
+    _dot_cleanup_remove_path "$inventory" || true
+    return 1
+  }
+  snapshot=$REPLY
+  if ! "$@" diff --name-only --diff-filter=AMT --no-renames -z \
+    "$before" "$after" -- >"$inventory"; then
+    _dot_cleanup_remove_path "$inventory" || true
+    _dot_cleanup_remove_path "$snapshot" || true
+    return 1
+  fi
+  while IFS= read -r -d '' relative; do
+    _dot_init_safe_relative_path "$relative" || {
+      valid=0
+      break
+    }
+    parent=${relative%/*}
+    [[ $parent != "$relative" ]] || continue
+    current=$root
+    relative_current=
+    IFS=/ read -r -a components <<<"$parent"
+    for component in "${components[@]}"; do
+      current=$current/$component
+      relative_current=${relative_current:+$relative_current/}$component
+      if [[ -d $current && ! -L $current ]]; then
+        identity=$(_dot_path_identity "$current") || {
+          valid=0
+          break 2
+        }
+        printf '%s\t%s\n' "$identity" "$relative_current" >>"$snapshot" || {
+          valid=0
+          break 2
+        }
+        [[ $(_dot_path_identity "$current" 2>/dev/null || true) == "$identity" ]] || {
+          valid=0
+          break 2
+        }
+        continue
+      fi
+      # A file or symlink can become a directory in the fetched commit. Do not
+      # traverse or pre-create through that old generation; Git owns the type
+      # transition and post-pull normalization handles the resulting directory.
+      break
+    done
+  done <"$inventory"
+  _dot_cleanup_remove_path "$inventory" || valid=0
+  if [[ $valid -ne 1 ]]; then
+    _dot_cleanup_remove_path "$snapshot" || true
+    return 1
+  fi
+  REPLY=$snapshot
+}
+
+_repo_snapshot_parent_status() {
+  local snapshot=$1 expected_relative=$2 expected_identity=$3
+  local identity relative extra found=0
+
+  while IFS=$'\t' read -r identity relative extra; do
+    [[ -z $extra && $identity =~ ^[0-9]+:[0-9]+$ ]] || return 2
+    _dot_init_safe_relative_path "$relative" || return 2
+    [[ $relative == "$expected_relative" ]] || continue
+    [[ $identity == "$expected_identity" ]] || return 2
+    found=1
+  done <"$snapshot"
+  [[ $found -eq 1 ]]
+}
+
+_repo_commit_path_type() {
+  local commit=$1 relative=$2 oid type
+  shift 2
+
+  if ! oid=$("$@" rev-parse --verify "$commit:$relative" 2>/dev/null); then
+    REPLY=missing
+    return 0
+  fi
+  type=$("$@" cat-file -t "$oid" 2>/dev/null) || return 1
+  case $type in
+    blob | tree) REPLY=$type ;;
+    *) return 1 ;;
+  esac
+}
+
+_repo_normalize_updated_path_parents() {
+  local root=$1 before=$2 after=$3 relative=$4 snapshot=$5
+  local parent current relative_parent component before_type after_type
+  local identity snapshot_status
+  local -a components=()
+  shift 5
+
+  parent=${relative%/*}
+  [[ $parent != "$relative" ]] || return 0
+  current=$root
+  relative_parent=
+  IFS=/ read -r -a components <<<"$parent"
+  for component in "${components[@]}"; do
+    current=$current/$component
+    relative_parent=${relative_parent:+$relative_parent/}$component
+    [[ -d $current && ! -L $current ]] || return 1
+    _repo_commit_path_type "$after" "$relative_parent" "$@" || return 1
+    after_type=$REPLY
+    [[ $after_type == tree ]] || return 1
+    _repo_commit_path_type "$before" "$relative_parent" "$@" || return 1
+    before_type=$REPLY
+    [[ $before_type != tree ]] || continue
+
+    identity=$(_dot_path_identity "$current") || return 1
+    snapshot_status=0
+    _repo_snapshot_parent_status \
+      "$snapshot" "$relative_parent" "$identity" || snapshot_status=$?
+    case $snapshot_status in
+      0) continue ;;
+      1) _dot_apply_umask_ceiling "$current" || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+_repo_normalize_updated_path() {
+  local root=$1 kind=$2 relative=$3 mode=$4 oid=$5 before=$6 after=$7 snapshot=$8
+  local target identity current_oid ceiling
+  shift 8
+
+  _dot_init_safe_relative_path "$relative" || return 1
+  _repo_normalize_updated_path_parents \
+    "$root" "$before" "$after" "$relative" "$snapshot" "$@" || return 1
+  [[ $mode == 120000 ]] && return 0
+  [[ $mode == 100644 || $mode == 100755 ]] || return 1
+  if [[ $kind == base ]] && _overlay_active_link_matches "$relative"; then
+    return 0
+  fi
+  target=$root/$relative
+  [[ -f $target && ! -L $target ]] || return 1
+  "$@" diff --cached --quiet "$after" -- "$relative" || return 1
+  "$@" diff --quiet "$after" -- "$relative" || return 1
+  identity=$(_dot_path_identity "$target") || return 1
+  current_oid=$("$@" hash-object --no-filters -- "$target" 2>/dev/null) || return 1
+  [[ $current_oid == "$oid" ]] || return 1
+  if [[ $mode == 100755 ]]; then
+    ceiling=0777
+  else
+    ceiling=0666
+  fi
+  _dot_apply_umask_ceiling "$target" "$ceiling" || return 1
+  [[ $(_dot_path_identity "$target" 2>/dev/null || true) == "$identity" ]] ||
+    return 1
+  current_oid=$("$@" hash-object --no-filters -- "$target" 2>/dev/null) || return 1
+  [[ $current_oid == "$oid" ]]
+}
+
+_repo_normalize_updated_paths() {
+  local root=$1 kind=$2 before=$3 after=$4 snapshot=$5
+  local inventory header relative old_mode new_mode old_oid new_oid status extra
+  local valid=1
+  shift 5
+
+  [[ $(_repo_head "$@") == "$after" ]] || return 1
+  _dot_cleanup_mktemp || return 1
+  inventory=$REPLY
+  if ! "$@" diff --raw --no-renames --abbrev=64 -z "$before" "$after" -- >"$inventory"; then
+    _dot_cleanup_remove_path "$inventory" || true
+    return 1
+  fi
+  while IFS= read -r -d '' header; do
+    IFS= read -r -d '' relative || {
+      valid=0
+      break
+    }
+    [[ $header == :* ]] || {
+      valid=0
+      break
+    }
+    read -r old_mode new_mode old_oid new_oid status extra <<<"${header#:}"
+    [[ -z $extra && $old_mode =~ ^(000000|100644|100755|120000)$ &&
+      $new_mode =~ ^(000000|100644|100755|120000)$ &&
+      $old_oid =~ ^[0-9a-fA-F]+$ && $new_oid =~ ^[0-9a-fA-F]+$ &&
+      (${#old_oid} -eq 40 || ${#old_oid} -eq 64) &&
+      ${#new_oid} -eq ${#old_oid} && $status =~ ^[AMDT]$ ]] || {
+      valid=0
+      break
+    }
+    [[ $new_mode != 000000 ]] || continue
+    _repo_normalize_updated_path \
+      "$root" "$kind" "$relative" "$new_mode" "$new_oid" \
+      "$before" "$after" "$snapshot" "$@" || {
+      valid=0
+      break
+    }
+  done <"$inventory"
+  if [[ $valid -eq 1 && $(_repo_head "$@") != "$after" ]]; then
+    valid=0
+  fi
+  _dot_cleanup_remove_path "$inventory" || return 1
+  [[ $valid -eq 1 ]]
 }
 
 # Pull the base repo. Reports the outcome through the REPLY_STATUS enum
@@ -237,7 +442,7 @@ _pull_base() {
     REPLY_STATUS="skipped"
     return 0
   fi
-  local head_before head_after
+  local head_before head_after parent_snapshot
   head_before=$(_repo_head _base_git)
   local pull_rc=0
   local upstream
@@ -246,16 +451,33 @@ _pull_base() {
     return 1
   }
   upstream=$REPLY
+  _repo_snapshot_updated_path_parents \
+    "$HOME" "$head_before" "$upstream" _base_git || {
+    REPLY_STATUS=failed
+    return 1
+  }
+  parent_snapshot=$REPLY
   _pull_repo "$HOME" _base_git rebase --autostash "$upstream" "$@" || pull_rc=$?
   if [[ "$pull_rc" -eq 0 ]]; then
     head_after=$(_repo_head _base_git)
     if [[ -n "$head_before" && -n "$head_after" && "$head_before" != "$head_after" ]]; then
+      if ! _repo_normalize_updated_paths \
+        "$HOME" base "$head_before" "$head_after" "$parent_snapshot" _base_git; then
+        _dot_cleanup_remove_path "$parent_snapshot" || true
+        REPLY_STATUS="failed"
+        return 1
+      fi
       REPLY_STATUS="changed"
     else
       REPLY_STATUS="current"
     fi
+    if ! _dot_cleanup_remove_path "$parent_snapshot"; then
+      REPLY_STATUS=failed
+      return 1
+    fi
     return 0
   fi
+  _dot_cleanup_remove_path "$parent_snapshot" || true
   REPLY_STATUS="failed"
   return 1
 }
@@ -325,28 +547,133 @@ _dot_maybe_stage_progress() {
   _ui_stage_update "$(_dot_progress_detail "$label" "$done" "$total")"
 }
 
+_repo_cloned_overlay_path_modes() {
+  local root=$1 relative=$2 mode=$3 oid=$4
+  local target parent current component current_oid link_target
+  local -a components=()
+
+  _dot_init_safe_relative_path "$relative" || return 1
+  parent=${relative%/*}
+  current=$root
+  if [[ $parent != "$relative" ]]; then
+    IFS=/ read -r -a components <<<"$parent"
+    for component in "${components[@]}"; do
+      current=$current/$component
+      [[ -d $current && ! -L $current ]] || return 1
+      _dot_apply_umask_ceiling "$current" || return 1
+    done
+  fi
+
+  target=$root/$relative
+  if [[ $mode == 120000 ]]; then
+    [[ -L $target ]] || return 1
+    link_target=$(readlink "$target") || return 1
+    current_oid=$(printf '%s' "$link_target" | git -C "$root" hash-object --stdin) ||
+      return 1
+    [[ $current_oid == "$oid" ]]
+    return
+  fi
+  [[ -f $target && ! -L $target ]] || return 1
+  current_oid=$(git -C "$root" hash-object --no-filters -- "$target" 2>/dev/null) ||
+    return 1
+  [[ $current_oid == "$oid" ]] || return 1
+  _dot_apply_tracked_file_mode "$target" "$mode" || return 1
+  current_oid=$(git -C "$root" hash-object --no-filters -- "$target" 2>/dev/null) ||
+    return 1
+  [[ $current_oid == "$oid" ]]
+}
+
+_repo_normalize_cloned_overlay_modes() {
+  local root=$1 commit=$2 entry header relative mode type oid extra inventory valid=1
+
+  # The staged checkout is not yet public, so every tracked byte is the exact
+  # validated clone generation. Reapply the retained umask to its worktree
+  # once; this removes default-ACL grants without a recurring warm-path scan.
+  git -C "$root" config core.sharedRepository 0700 || return 1
+  _dot_apply_git_metadata_modes "$root/.git" || return 1
+  _dot_apply_umask_ceiling "$root" || return 1
+  git -C "$root" diff --cached --quiet "$commit" -- || return 1
+  _dot_cleanup_mktemp || return 1
+  inventory=$REPLY
+  if ! git -C "$root" ls-tree -rz --full-tree "$commit" >"$inventory"; then
+    _dot_cleanup_remove_path "$inventory" || true
+    return 1
+  fi
+  while IFS= read -r -d '' entry; do
+    [[ $entry == *$'\t'* ]] || {
+      valid=0
+      break
+    }
+    header=${entry%%$'\t'*}
+    relative=${entry#*$'\t'}
+    read -r mode type oid extra <<<"$header"
+    [[ -z $extra && $type == blob && $mode =~ ^(100644|100755|120000)$ &&
+      $oid =~ ^[0-9a-fA-F]+$ && (${#oid} -eq 40 || ${#oid} -eq 64) ]] || {
+      valid=0
+      break
+    }
+    _repo_cloned_overlay_path_modes "$root" "$relative" "$mode" "$oid" || {
+      valid=0
+      break
+    }
+  done <"$inventory"
+  if [[ $valid -eq 1 ]] && ! git -C "$root" diff --cached --quiet "$commit" --; then
+    valid=0
+  fi
+  _dot_cleanup_remove_path "$inventory" || return 1
+  [[ $valid -eq 1 ]]
+}
+
+_repo_cloned_overlay_matches_commit() {
+  local root=$1 commit=$2 untracked
+
+  git -C "$root" diff --cached --quiet "$commit" -- || return 1
+  git -C "$root" diff --quiet "$commit" -- || return 1
+  _dot_cleanup_mktemp || return 1
+  untracked=$REPLY
+  if ! git -C "$root" ls-files --others -z >"$untracked"; then
+    _dot_cleanup_remove_path "$untracked" || true
+    return 1
+  fi
+  if [[ -s $untracked ]]; then
+    _dot_cleanup_remove_path "$untracked" || true
+    return 1
+  fi
+  _dot_cleanup_remove_path "$untracked"
+}
+
 _repo_clone_overlay_staged() {
-  local url=$1 path=$2 parent name stage
+  local url=$1 path=$2 parent name stage_root stage commit
   parent=${path%/*}
   name=${path##*/}
   [[ -n $parent && $parent != "$path" ]] || return 1
   mkdir -p "$parent" || return 1
-  stage=$(mktemp -d "$parent/.$name.clone.XXXXXX") || return 1
-  rmdir "$stage" || return 1
-  _dot_cleanup_register_path "$stage"
-  if ! git clone --quiet -- "$url" "$stage"; then
-    _dot_cleanup_remove_path "$stage" || true
+  _dot_cleanup_mktemp -d "$parent/.$name.clone.XXXXXXXX" || return 1
+  stage_root=$REPLY
+  stage=$stage_root/checkout
+  if ! git -c core.sharedRepository=0700 clone \
+    --quiet --no-hardlinks -- "$url" "$stage"; then
+    _dot_cleanup_remove_path "$stage_root" || true
     return 1
   fi
-  if ! _repo_validate_candidate_tree overlay HEAD git -C "$stage"; then
-    _dot_cleanup_remove_path "$stage" || true
+  commit=$(_repo_head git -C "$stage")
+  if [[ -z $commit ]] ||
+    ! _repo_validate_candidate_tree overlay "$commit" git -C "$stage" ||
+    ! _repo_cloned_overlay_matches_commit "$stage" "$commit"; then
+    _dot_cleanup_remove_path "$stage_root" || true
+    return 1
+  fi
+  if ! _repo_normalize_cloned_overlay_modes "$stage" "$commit" ||
+    [[ $(_repo_head git -C "$stage") != "$commit" ]] ||
+    ! _repo_cloned_overlay_matches_commit "$stage" "$commit"; then
+    _dot_cleanup_remove_path "$stage_root" || true
     return 1
   fi
   if ! _dot_move_noreplace "$stage" "$path"; then
-    _dot_cleanup_remove_path "$stage" || true
+    _dot_cleanup_remove_path "$stage_root" || true
     return 1
   fi
-  _dot_cleanup_unregister_path "$stage"
+  _dot_cleanup_remove_path "$stage_root"
 }
 
 # Pull a single overlay repo, cloning it first if missing.
@@ -414,7 +741,7 @@ _pull_overlay() {
     REPLY_STATUS="skipped"
     return 0
   fi
-  local upstream
+  local upstream head_before head_after parent_snapshot
   local prepare_rc=0
   _repo_prepare_overlay_upstream "$path" "$optional" || prepare_rc=$?
   if [[ $prepare_rc -ne 0 ]]; then
@@ -430,10 +757,16 @@ _pull_overlay() {
     return 0
   fi
   upstream=$REPLY
+  head_before=$(_repo_head git -C "$path")
+  _repo_snapshot_updated_path_parents \
+    "$path" "$head_before" "$upstream" git -C "$path" || {
+    REPLY_STATUS=failed
+    return 0
+  }
+  parent_snapshot=$REPLY
 
   if [[ "$optional" == "true" ]]; then
-    local head_before head_after quiet_before quiet_was_set=0
-    head_before=$(_repo_head git -C "$path")
+    local quiet_before quiet_was_set=0
     if [[ -n "${DOT_QUIET+x}" ]]; then
       quiet_was_set=1
       quiet_before="$DOT_QUIET"
@@ -445,6 +778,7 @@ _pull_overlay() {
       else
         unset DOT_QUIET
       fi
+      _dot_cleanup_remove_path "$parent_snapshot" || true
       return 0
     fi
     if [[ "$quiet_was_set" -eq 1 ]]; then
@@ -454,9 +788,19 @@ _pull_overlay() {
     fi
     head_after=$(_repo_head git -C "$path")
     if [[ -n "$head_before" && -n "$head_after" && "$head_before" != "$head_after" ]]; then
+      if ! _repo_normalize_updated_paths \
+        "$path" overlay "$head_before" "$head_after" "$parent_snapshot" \
+        git -C "$path"; then
+        _dot_cleanup_remove_path "$parent_snapshot" || true
+        REPLY_STATUS="failed"
+        return 0
+      fi
       REPLY_STATUS="changed"
     else
       REPLY_STATUS="current"
+    fi
+    if ! _dot_cleanup_remove_path "$parent_snapshot"; then
+      REPLY_STATUS=failed
     fi
     return 0
   fi
@@ -466,9 +810,8 @@ _pull_overlay() {
   else
     _log_header "==> Pulling $name dotfiles..."
   fi
-  local head_before head_after
-  head_before=$(_repo_head git -C "$path")
   if ! _pull_repo "$path" git -C "$path" rebase --autostash "$upstream" "$@"; then
+    _dot_cleanup_remove_path "$parent_snapshot" || true
     if [[ "${DOT_UI_TOTAL:-0}" -gt 0 ]]; then
       _ui_status warning "$name dotfiles pull failed"
     else
@@ -479,11 +822,22 @@ _pull_overlay() {
   fi
   head_after=$(_repo_head git -C "$path")
   if [[ -n "$head_before" && -n "$head_after" && "$head_before" != "$head_after" ]]; then
+    if ! _repo_normalize_updated_paths \
+      "$path" overlay "$head_before" "$head_after" "$parent_snapshot" \
+      git -C "$path"; then
+      _dot_cleanup_remove_path "$parent_snapshot" || true
+      _warn "  warning: $name dotfiles mode normalization failed"
+      REPLY_STATUS="failed"
+      return 0
+    fi
     [[ "${DOT_UI_TOTAL:-0}" -gt 0 && "${DOT_VERBOSE:-0}" -eq 1 ]] && _ui_status changed "$name dotfiles updated"
     REPLY_STATUS="changed"
   else
     [[ "${DOT_UI_TOTAL:-0}" -gt 0 && "${DOT_VERBOSE:-0}" -eq 1 ]] && _ui_status ok "$name dotfiles current"
     REPLY_STATUS="current"
+  fi
+  if ! _dot_cleanup_remove_path "$parent_snapshot"; then
+    REPLY_STATUS=failed
   fi
   return 0
 }

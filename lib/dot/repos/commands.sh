@@ -25,7 +25,7 @@ _repo_fetch_one() {
   local kind="$1" name="$2" path="$3"
   shift 4
   _repo_simple_header fetch "$kind" "$name"
-  _repo_git "$kind" "$path" fetch "$@"
+  _repo_git_fetch "$kind" "$path" "$@"
 }
 
 _repo_push_one() {

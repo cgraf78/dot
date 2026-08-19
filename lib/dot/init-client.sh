@@ -775,6 +775,16 @@ _dot_init_set_git_identity() {
   DOT_INIT_GIT_INO=${identity#*:}
 }
 
+_dot_init_configure_git_metadata_modes() {
+  local git_dir=$1
+
+  # Git's numeric shared-repository policy reapplies owner-only access to
+  # metadata created after this staged generation is published. The one-time
+  # walk closes any broader default-ACL grants inherited during the clone.
+  git --git-dir="$git_dir" config core.sharedRepository 0700 || return 1
+  _dot_apply_git_metadata_modes "$git_dir"
+}
+
 _dot_init_record_phase() {
   local record=$1 phase=$2
   _dot_init_write_record "$record" "$phase" "$DOT_INIT_ORIGIN" \
@@ -807,12 +817,14 @@ _dot_init_stage_git() {
   _dot_init_record_phase "$record" git-staging || return 1
   if [[ -e $DOT_INIT_GIT_DIR || -L $DOT_INIT_GIT_DIR ]]; then
     _dot_init_generation_matches "$DOT_INIT_GIT_DIR" || return 1
+    _dot_init_configure_git_metadata_modes "$DOT_INIT_GIT_DIR" || return 1
     _dot_init_set_git_identity "$DOT_INIT_GIT_DIR" || return 1
     _dot_init_record_phase "$record" git-staged
     return
   fi
   if [[ -e $repo || -L $repo ]]; then
     if _dot_init_generation_matches "$repo"; then
+      _dot_init_configure_git_metadata_modes "$repo" || return 1
       _dot_init_set_git_identity "$repo" || return 1
       _dot_init_record_phase "$record" git-staged
       return
@@ -820,7 +832,8 @@ _dot_init_stage_git() {
     [[ -d $repo && ! -L $repo ]] || return 1
     rm -rf -- "$repo" || return 1
   fi
-  git clone --quiet --bare --branch "$DOT_INIT_BRANCH" --single-branch -- \
+  git -c core.sharedRepository=0700 clone \
+    --quiet --bare --no-hardlinks --branch "$DOT_INIT_BRANCH" --single-branch -- \
     "$DOT_INIT_ORIGIN" "$repo" || return 1
   current=$(git --git-dir="$repo" rev-parse "refs/heads/$DOT_INIT_BRANCH" 2>/dev/null) ||
     return 1
@@ -837,6 +850,7 @@ _dot_init_stage_git() {
   git --git-dir="$repo" config "branch.$DOT_INIT_BRANCH.merge" \
     "refs/heads/$DOT_INIT_BRANCH" || return 1
   _dot_init_write_generation_marker "$repo" || return 1
+  _dot_init_configure_git_metadata_modes "$repo" || return 1
   _dot_init_set_git_identity "$repo" || return 1
   _dot_init_record_phase "$record" git-staged
 }
@@ -1213,7 +1227,7 @@ _dot_init_publish_one() {
     case $mode in
       100644 | 100755)
         git --git-dir="$git_dir" show "$commit:$path" >"$next" || return 1
-        if [[ $mode == 100755 ]]; then chmod +x "$next" || return 1; fi
+        _dot_apply_tracked_file_mode "$next" "$mode" || return 1
         ;;
       120000)
         link_target=$(

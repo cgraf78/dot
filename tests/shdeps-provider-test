@@ -280,6 +280,40 @@ recovered_marker=$DOT_TEST_TMP/provider-recovered-merge
 [[ ! -e $checkpoint && ! -L $checkpoint ]] || fail 'valid provider checkpoint was not consumed'
 [[ -f $recovered_marker ]] || fail 'checkpoint recovery did not resume convergence'
 
+# Repository synchronization is the authority boundary for all later dynamic
+# client code. A failed repo stage must skip both provider and merge execution.
+sync_failed_provider=$DOT_TEST_TMP/provider-sync-failed-tools
+sync_failed_merge=$DOT_TEST_TMP/provider-sync-failed-merge
+(
+  export HOME=$provider_home XDG_STATE_HOME=$provider_state
+  DOT_SOURCE_ROOT=$root
+  DOT_DEPENDENCY_PROVIDER=shdeps
+  DOT_UI_TOTAL=0
+
+  _ensure_repo_config() { :; }
+  _link_overlays() { :; }
+  _ensure_shdeps() { : >"$sync_failed_provider"; }
+  _run_merges() { : >"$sync_failed_merge"; }
+  _base_repo_exists() { return 1; }
+  _normalize_filtered() { :; }
+  _ui_begin() { :; }
+  _ui_stage_start() { :; }
+  _ui_stage_finish() { :; }
+  _ui_done() { :; }
+
+  set +e
+  _dot_update_finalize 1
+  status=$?
+  set -e
+  printf '%s\n' "$status" >"$DOT_TEST_TMP/provider-sync-failed-status"
+)
+assert_eq 1 "$(<"$DOT_TEST_TMP/provider-sync-failed-status")" \
+  'repository sync failure remains nonzero'
+[[ ! -e $sync_failed_provider ]] ||
+  fail 'repository sync failure ran the dependency provider'
+[[ ! -e $sync_failed_merge ]] ||
+  fail 'repository sync failure ran merge hooks'
+
 # Malformed state must fail closed and remain available for diagnosis. Update
 # must not silently discard an unbound source generation and run extensions.
 mkdir -p "${checkpoint%/*}"
