@@ -36,6 +36,43 @@
     exit 1
   }
 
+  checkout_installer_git=
+  select_bootstrap_git() {
+    local home_physical directory physical_directory candidate
+    local -a path_directories=()
+
+    checkout_installer_git=
+    case $HOME in
+      '' | */ | *//* | */./* | */. | */../* | */.. | *$'\n'* | *$'\r'*)
+        return 1
+        ;;
+      /*) ;;
+      *) return 1 ;;
+    esac
+    home_physical=$(cd -P -- "$HOME" 2>/dev/null && pwd -P) ||
+      home_physical=$HOME
+    IFS=: read -r -a path_directories <<<"${PATH:-}"
+    for directory in "${path_directories[@]}"; do
+      [[ $directory == /* ]] || continue
+      physical_directory=$(cd -P -- "$directory" 2>/dev/null && pwd -P) ||
+        continue
+      candidate=${physical_directory%/}/git
+      [[ $physical_directory == / ]] && candidate=/git
+      [[ -f $candidate && ! -L $candidate && -x $candidate ]] || continue
+      if [[ $home_physical == / || $candidate == "$home_physical" ||
+        $candidate == "$home_physical/"* ]]; then
+        continue
+      fi
+      checkout_installer_git=$candidate
+      return 0
+    done
+    return 1
+  }
+
+  [[ -n ${HOME:-} ]] || die 'HOME is not set'
+  select_bootstrap_git ||
+    die 'host Git is unavailable outside HOME'
+
   resolve_default_checkout_dir() {
     local data_home install_home
 
@@ -1509,7 +1546,7 @@ checkout_bash_v1_bind() {
       GIT_TERMINAL_PROMPT=0 \
       HOME="$CHECKOUT_INSTALLER_GIT_HOME" \
       XDG_CONFIG_HOME="$CHECKOUT_INSTALLER_GIT_HOME/xdg" \
-      exec git \
+      exec "$checkout_installer_git" \
       -c core.hooksPath=/dev/null \
       -c core.fsmonitor=false \
       -c submodule.recurse=false \
@@ -1694,9 +1731,6 @@ checkout_bash_v1_bind() {
     run_direct_install_with_post "$script_dir" "$@"
     exec_delegate "$script_dir" "$@"
   fi
-
-  command -v git >/dev/null 2>&1 || die 'git is required for a piped install'
-  [[ -n ${HOME:-} ]] || die 'HOME is not set'
 
   repo_url=${CGRAF78_CHECKOUT_INSTALL_REPO_URL:-$default_repo_url}
   checkout_dir=${CGRAF78_CHECKOUT_INSTALL_DIR:-}
