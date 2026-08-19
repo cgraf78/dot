@@ -23,7 +23,7 @@ an older file.
 | `lib/dot/public/ui.sh` | `dotfiles:.local/lib/dot/core/ui.sh` | Public names, deterministic caller-state behavior, and API inventory added |
 | `lib/dot/public/{api-version.sh,api-v1.tsv,variables-v1.tsv}` | New standalone interface | Machine-readable public ABI and drift checks |
 | `lib/dot/{log.sh,progress-ui.sh,resources.sh,run.sh,temp.sh,update-lock.sh}` | Same-named files under `dotfiles:.local/lib/dot/core/` | Generic runtime and cleanup behavior extracted; client policy removed |
-| `lib/dot/constants.sh` | `dotfiles:.local/lib/dot/core/constants.sh` | Reduced to standalone/XDG runtime state |
+| `lib/dot/constants.sh` | `dotfiles:.local/lib/dot/core/constants.sh` | Reduced to standalone runtime state using the public XDG API |
 | `lib/dot/platform.sh` | `dotfiles:.local/lib/dot/core/platform.sh` | Only generic platform and host filtering retained |
 | `lib/dot/pre-sync.sh` | New standalone extension lifecycle | Runs trusted client prerequisites before repository network or checkout mutation |
 | `lib/dot/overlays.sh` | `dotfiles:.local/lib/dot/core/overlays.sh` | Generic descriptor and local-source validation retained; SSH application policy removed |

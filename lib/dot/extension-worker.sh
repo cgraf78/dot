@@ -21,8 +21,6 @@ _dot_extension_worker_discover_overlays() {
     # and publish only the already-validated records as NUL-delimited data.
     # shellcheck source=public/xdg.sh
     . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
-    # shellcheck disable=SC2329 # Sourced descriptor code calls this compatibility alias.
-    _dot_xdg_path() { dot_xdg_path "$@"; }
     # shellcheck source=log.sh
     . "$DOT_SOURCE_ROOT/lib/dot/log.sh"
     # shellcheck source=platform.sh

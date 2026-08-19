@@ -7,9 +7,6 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$root/tests/lib/test.sh"
 # shellcheck source=lib/repo.sh
 . "$root/tests/lib/repo.sh"
-# shellcheck source=../lib/dot/public/xdg.sh
-. "$root/lib/dot/public/xdg.sh"
-_dot_xdg_path() { dot_xdg_path "$@"; }
 # shellcheck source=../lib/dot/update-lock.sh
 . "$root/lib/dot/update-lock.sh"
 
