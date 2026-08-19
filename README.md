@@ -48,6 +48,11 @@ directory with an explicit absolute `core.worktree=$HOME`. Existing legacy
 bare clients and identified ordinary checkouts rooted at `$HOME` remain
 supported.
 
+If the separate client Git directory is lost, remove or move aside
+`~/.dotfiles` and rerun the same `dot init` command. When no ordinary
+`$HOME/.git` repository is present, Dot retires the matching completed record,
+backs up existing worktree paths, and rebuilds a fresh client generation.
+
 `dot` shadows Graphviz's command of the same name when `~/.local/bin` precedes
 the system path. Invoke Graphviz by its explicit system path when both tools
 are installed.
