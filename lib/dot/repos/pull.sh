@@ -371,8 +371,8 @@ _repo_normalize_updated_path() {
   fi
   target=$root/$relative
   [[ -f $target && ! -L $target ]] || return 1
-  "$@" diff --cached --quiet "$after" -- "$relative" || return 1
-  "$@" diff --quiet "$after" -- "$relative" || return 1
+  # Dirty verification is performed once per repository via staged/worktree
+  # inventories collected in _repo_normalize_updated_paths; no per-path diff here.
   identity=$(_dot_path_identity "$target") || return 1
   current_oid=$("$@" hash-object --no-filters -- "$target" 2>/dev/null) || return 1
   [[ $current_oid == "$oid" ]] || return 1
@@ -401,6 +401,42 @@ _repo_normalize_updated_paths() {
     _dot_cleanup_remove_path "$inventory" || true
     return 1
   fi
+  # Batch dirty verification: collect staged and worktree dirty sets once per
+  # repository so we test changed paths against inventories rather than spawning
+  # two git diff --quiet invocations per updated file. NUL-delimited inventories
+  # preserve arbitrary path safety (spaces, newlines).
+  local staged_inventory worktree_inventory
+  _dot_cleanup_mktemp || {
+    _dot_cleanup_remove_path "$inventory" || true
+    return 1
+  }
+  staged_inventory=$REPLY
+  _dot_cleanup_mktemp || {
+    _dot_cleanup_remove_path "$inventory" || true
+    _dot_cleanup_remove_path "$staged_inventory" || true
+    return 1
+  }
+  worktree_inventory=$REPLY
+  if ! "$@" diff --cached --name-only -z "$after" -- >"$staged_inventory"; then
+    _dot_cleanup_remove_path "$inventory" || true
+    _dot_cleanup_remove_path "$staged_inventory" || true
+    _dot_cleanup_remove_path "$worktree_inventory" || true
+    return 1
+  fi
+  if ! "$@" diff --name-only -z "$after" -- >"$worktree_inventory"; then
+    _dot_cleanup_remove_path "$inventory" || true
+    _dot_cleanup_remove_path "$staged_inventory" || true
+    _dot_cleanup_remove_path "$worktree_inventory" || true
+    return 1
+  fi
+  local -A _staged_dirty=() _worktree_dirty=()
+  local _dirty_path
+  while IFS= read -r -d '' _dirty_path; do
+    _staged_dirty["$_dirty_path"]=1
+  done <"$staged_inventory"
+  while IFS= read -r -d '' _dirty_path; do
+    _worktree_dirty["$_dirty_path"]=1
+  done <"$worktree_inventory"
   while IFS= read -r -d '' header; do
     IFS= read -r -d '' relative || {
       valid=0
@@ -420,6 +456,12 @@ _repo_normalize_updated_paths() {
       break
     }
     [[ $new_mode != 000000 ]] || continue
+    # Fail if an updated path is dirty against $after: staged or worktree
+    # inventory already contains the exact set, so test by lookup.
+    if [[ -n ${_staged_dirty["$relative"]+x} || -n ${_worktree_dirty["$relative"]+x} ]]; then
+      valid=0
+      break
+    fi
     _repo_normalize_updated_path \
       "$root" "$kind" "$relative" "$new_mode" "$new_oid" \
       "$before" "$after" "$snapshot" "$@" || {
@@ -430,7 +472,9 @@ _repo_normalize_updated_paths() {
   if [[ $valid -eq 1 && $(_repo_head "$@") != "$after" ]]; then
     valid=0
   fi
-  _dot_cleanup_remove_path "$inventory" || return 1
+  _dot_cleanup_remove_path "$inventory" || valid=0
+  _dot_cleanup_remove_path "$staged_inventory" || valid=0
+  _dot_cleanup_remove_path "$worktree_inventory" || valid=0
   [[ $valid -eq 1 ]]
 }
 
