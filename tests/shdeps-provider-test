@@ -162,6 +162,75 @@ assert_eq $'sync-args=<passthrough>\nquiet=1 shdeps_quiet=1 force=1 shdeps_force
     'provider UI consumes normal completion marker without timeout polling'
 )
 
+# Verbose CI is non-interactive, so it cannot redraw Dot's live status line.
+# Preserve the grouped dependency report at completion while proving real
+# Shdeps phase events produce safe newline progress before that report.
+(
+  DOT_QUIET=0
+  DOT_UI_FORCE_LIVE=0
+  DOT_UI_TICK_SECONDS=0.01
+  _ui_begin 5
+  _ui_stage_start Tools 'checking configured dependencies' >/dev/null
+  verbose_output_file=$DOT_TEST_TMP/provider-verbose-nonlive-output
+  producer_release=$DOT_TEST_TMP/provider-verbose-producer-release
+
+  # shellcheck disable=SC2329  # _run_shdeps_update_ui invokes this fixture.
+  shdeps_update() {
+    printf '%s\n' \
+      '{"event":"phase","group":"github-repos","label":"GitHub","done":1,"total":2,"detail":"https://token@example.invalid/private","secret":"progress-secret-sentinel"}'
+    local attempt
+    for ((attempt = 0; attempt < 200; attempt++)); do
+      [[ -e $producer_release ]] && break
+      sleep 0.01
+    done
+    [[ -e $producer_release ]] || return 2
+    printf '%s\n' \
+      '{"event":"item","group":"github-repos","status":"changed","name":"cgraf78/agentguard","detail":"updated -- commit 1234567"}' \
+      '{"event":"phase","group":"github-repos","label":"GitHub","done":2,"total":2}' \
+      '{"event":"group_summary","group":"github-repos","label":"GitHub","status":"changed","changed":1,"warnings":0,"current":1,"skipped":0,"failed":0,"elapsed_ms":1200}' \
+      '{"event":"summary","status":"changed","changed":1,"warnings":0,"current":1,"skipped":0,"failed":0}'
+  }
+
+  DOT_VERBOSE=1
+  _shdeps_ui_reset
+  _run_shdeps_update_ui >"$verbose_output_file" &
+  verbose_provider_pid=$!
+  for _ in {1..100}; do
+    grep -Fq '1/2' "$verbose_output_file" 2>/dev/null && break
+    sleep 0.01
+  done
+  if ! grep -Fq '1/2' "$verbose_output_file" 2>/dev/null; then
+    : >"$producer_release"
+    wait "$verbose_provider_pid" 2>/dev/null || true
+    fail 'verbose non-live provider buffered the first phase until completion'
+  fi
+  : >"$producer_release"
+  wait "$verbose_provider_pid"
+  verbose_nonlive_output=$(<"$verbose_output_file")
+  assert_contains '1/2' "$verbose_nonlive_output" \
+    'verbose non-live provider shows the first real phase update'
+  assert_contains '2/2' "$verbose_nonlive_output" \
+    'verbose non-live provider shows the completed phase update'
+  assert_contains 'changed  cgraf78/agentguard' "$verbose_nonlive_output" \
+    'verbose non-live provider preserves the grouped final item report'
+  case $verbose_nonlive_output in
+    *'1/2'*'2/2'*'changed  cgraf78/agentguard'*) ;;
+    *) fail 'verbose non-live progress did not precede the grouped final report' ;;
+  esac
+  [[ $verbose_nonlive_output != *token@example.invalid* &&
+    $verbose_nonlive_output != *progress-secret-sentinel* ]] ||
+    fail 'verbose non-live progress exposed ignored event fields'
+  tick_output=$(_ui_stage_tick)
+  assert_eq '' "$tick_output" \
+    'verbose non-live provider does not print timer-only ticks'
+
+  DOT_VERBOSE=0
+  _shdeps_ui_reset
+  default_nonlive_output=$(_run_shdeps_update_ui)
+  assert_eq '' "$default_nonlive_output" \
+    'default non-live provider output remains unchanged'
+)
+
 # FIFO writes are a byte stream, not a record protocol. A timeout may return a
 # partial JSONL record with a nonzero status; the next read then begins at the
 # suffix. Keep that partial data until its newline arrives so a failed custom
