@@ -129,9 +129,12 @@ _dot_shdeps_installer() {
   local development=$SHDEPS_GIT_DEV_DIR/shdeps
   local development_revision expected_revision
 
+  _DOT_SHDEPS_INSTALLER_SOURCE=unavailable
+
   if [[ -n ${SHDEPS_LIB:-} && -f ${SHDEPS_LIB%/*}/install.sh ]] &&
     _dot_shdeps_installer_hash_matches "${SHDEPS_LIB%/*}/install.sh"; then
     REPLY=${SHDEPS_LIB%/*}/install.sh
+    _DOT_SHDEPS_INSTALLER_SOURCE=explicit
     return 0
   fi
   development_revision=$(_dot_sanitized_git -C "$development" \
@@ -144,6 +147,7 @@ _dot_shdeps_installer() {
     SHDEPS_LIB=$development/shdeps.sh
     export SHDEPS_LIB
     REPLY=$development/install.sh
+    _DOT_SHDEPS_INSTALLER_SOURCE=pinned-dev
     return 0
   fi
   if [[ "${DOT_SHDEPS_UPDATE_POLICY:-pinned}" == latest ]] &&
@@ -151,11 +155,13 @@ _dot_shdeps_installer() {
     SHDEPS_LIB=$development/shdeps.sh
     export SHDEPS_LIB
     REPLY=$development/install.sh
+    _DOT_SHDEPS_INSTALLER_SOURCE=latest-dev
     return 0
   fi
   if [[ -f "$installed/install.sh" && -f "$installed/shdeps.sh" ]] &&
     _dot_shdeps_installer_hash_matches "$installed/install.sh"; then
     REPLY=$installed/install.sh
+    _DOT_SHDEPS_INSTALLER_SOURCE=managed
     return 0
   fi
   return 1

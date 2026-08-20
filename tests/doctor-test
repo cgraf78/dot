@@ -234,6 +234,114 @@ set -e
 assert_eq 1 "$provider_status" 'doctor fails for unavailable selected provider'
 assert_contains 'Shdeps provider is unavailable' "$provider_output" \
   'doctor explains unavailable selected provider'
+assert_contains 'Shdeps update policy (pinned)' "$provider_output" \
+  'doctor reports the default pinned provider policy'
+
+# Latest policy deliberately follows a validated user-controlled development
+# checkout without requiring its revision or installer digest to match Dot's
+# fallback lock. Doctor must report that explicit trust choice rather than call
+# the rolling installer reviewed or pinned.
+provider_dev_root=$DOT_TEST_TMP/doctor-provider-dev
+provider_dev=$provider_dev_root/shdeps
+provider_managed=$DOT_TEST_TMP/doctor-provider-managed
+mkdir -p "$provider_dev" "$provider_managed"
+cat >"$provider_dev/install.sh" <<'SCRIPT'
+case ${1:-} in
+  --bootstrap) ;;
+esac
+SCRIPT
+printf '# fixture Shdeps library\n' >"$provider_dev/shdeps.sh"
+cat >"$provider_dev/shdeps" <<'SCRIPT'
+#!/usr/bin/env bash
+if [[ ${1:-} == __api && ${2:-} == version ]]; then
+  printf 'abi:1\n'
+  exit 0
+fi
+exit 2
+SCRIPT
+chmod 0755 "$provider_dev/shdeps"
+git -C "$provider_dev" init -q
+git -C "$provider_dev" config user.name fixture
+git -C "$provider_dev" config user.email fixture@example.invalid
+git -C "$provider_dev" remote add origin https://github.com/cgraf78/shdeps.git
+git -C "$provider_dev" add install.sh shdeps.sh shdeps
+git -C "$provider_dev" -c core.hooksPath=/dev/null commit -qm rolling
+chmod 0755 "$provider_dev" "$provider_dev/.git"
+chmod 0644 "$provider_dev/install.sh" "$provider_dev/shdeps.sh"
+printf 'version=1\ndependency_provider=shdeps\nshdeps_update_policy=latest\n' \
+  >"$provider_home/.config/dot/config"
+set +e
+latest_provider_output=$(SHDEPS_LIB='' SHDEPS_GIT_DEV_DIR="$provider_dev_root" \
+  SHDEPS_DIR="$provider_managed" \
+  run_dot "$provider_home" "$provider_state" doctor 2>&1)
+latest_provider_status=$?
+set -e
+assert_eq 0 "$latest_provider_status" \
+  'doctor accepts a validated rolling Shdeps checkout in latest mode'
+assert_contains 'Shdeps update policy (latest)' "$latest_provider_output" \
+  'doctor reports the latest update policy'
+assert_contains 'Shdeps provider source (trusted development checkout:' \
+  "$latest_provider_output" 'doctor reports the latest checkout trust boundary'
+assert_contains \
+  'trusted unpinned revision differs from Dot lock; accepted by latest policy' \
+  "$latest_provider_output" 'doctor reports accepted revision divergence'
+[[ $latest_provider_output != *'Shdeps installer is reviewed'* ]] ||
+  fail 'doctor called the unpinned latest checkout reviewed'
+assert_contains 'Shdeps provider ABI (abi:1)' "$latest_provider_output" \
+  'doctor still validates the latest checkout provider ABI'
+
+# A checkout at the conventional path produces a visible warning when latest
+# mode cannot validate its identity. Doctor then follows update behavior by
+# checking the managed fallback, which remains a failure when none is usable.
+git -C "$provider_dev" remote set-url origin https://github.com/example/shdeps.git
+set +e
+wrong_origin_output=$(SHDEPS_LIB='' SHDEPS_GIT_DEV_DIR="$provider_dev_root" \
+  SHDEPS_DIR="$provider_managed" \
+  run_dot "$provider_home" "$provider_state" doctor 2>&1)
+wrong_origin_status=$?
+set -e
+assert_eq 1 "$wrong_origin_status" \
+  'doctor rejects a wrong-origin latest development checkout'
+assert_contains 'Shdeps development checkout ignored' \
+  "$wrong_origin_output" \
+  'doctor explains the invalid latest checkout'
+assert_contains 'Shdeps provider is unavailable' "$wrong_origin_output" \
+  'doctor still fails when an invalid checkout has no managed fallback'
+git -C "$provider_dev" remote set-url origin https://github.com/cgraf78/shdeps.git
+
+chmod 0775 "$provider_dev"
+set +e
+unsafe_checkout_output=$(SHDEPS_LIB='' SHDEPS_GIT_DEV_DIR="$provider_dev_root" \
+  SHDEPS_DIR="$provider_managed" \
+  run_dot "$provider_home" "$provider_state" doctor 2>&1)
+unsafe_checkout_status=$?
+set -e
+assert_eq 1 "$unsafe_checkout_status" \
+  'doctor rejects an unsafe latest development checkout'
+assert_contains 'Shdeps development checkout ignored' \
+  "$unsafe_checkout_output" \
+  'doctor reports the unsafe latest checkout'
+chmod 0755 "$provider_dev"
+
+cat >"$provider_dev/shdeps" <<'SCRIPT'
+#!/usr/bin/env bash
+if [[ ${1:-} == __api && ${2:-} == version ]]; then
+  printf 'abi:2\n'
+  exit 0
+fi
+exit 2
+SCRIPT
+chmod 0755 "$provider_dev/shdeps"
+set +e
+latest_abi_output=$(SHDEPS_LIB='' SHDEPS_GIT_DEV_DIR="$provider_dev_root" \
+  SHDEPS_DIR="$provider_managed" \
+  run_dot "$provider_home" "$provider_state" doctor 2>&1)
+latest_abi_status=$?
+set -e
+assert_eq 1 "$latest_abi_status" \
+  'doctor rejects a latest development checkout ABI mismatch'
+assert_contains 'Shdeps provider ABI mismatch' "$latest_abi_output" \
+  'doctor preserves provider ABI mismatch diagnostics in latest mode'
 
 printf 'version=1\ndependency_provider=none\n' >"$provider_home/.config/dot/config"
 bypass_output=$(HOME="$provider_home" XDG_STATE_HOME="$provider_state" XDG_CONFIG_HOME='' \
