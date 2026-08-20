@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@53b11877db22bac7c070abc200c03e8991408389
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@9b9c023fbe5f47be5f70f5a82bd8e2f298f6a1b1
     with:
       matrix-set: full
       profiles: base,python
@@ -126,4 +126,4 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@53b11877db22bac7c070abc200c03e8991408389
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@9b9c023fbe5f47be5f70f5a82bd8e2f298f6a1b1
