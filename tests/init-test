@@ -1126,6 +1126,47 @@ assert_eq true \
 assert_eq all \
   "$(git --git-dir="$legacy_home/.dotfiles" config status.showUntrackedFiles)" \
   'failed adoption does not mutate legacy status policy before authority'
+
+fixture_repo legacy-convergence main \
+  .config/dot/config $'version=1\ndependency_provider=shdeps\n' 100644 \
+  .testrc $'legacy convergence\n' 100644
+legacy_convergence_origin=$REPLY
+fixture_home legacy-convergence
+legacy_convergence_home=$REPLY
+legacy_convergence_state=$DOT_TEST_TMP/legacy-convergence-state
+legacy_convergence_bin=$DOT_TEST_TMP/legacy-convergence-bin
+legacy_convergence_curl_marker=$DOT_TEST_TMP/legacy-convergence-curl
+mkdir -p "$legacy_convergence_home/.config/dot" "$legacy_convergence_bin"
+git clone -q --bare "$legacy_convergence_origin" \
+  "$legacy_convergence_home/.dotfiles"
+git --git-dir="$legacy_convergence_home/.dotfiles" \
+  show HEAD:.config/dot/config >"$legacy_convergence_home/.config/dot/config"
+printf 'legacy convergence\n' >"$legacy_convergence_home/.testrc"
+cat >"$legacy_convergence_bin/curl" <<'CURL'
+#!/usr/bin/env bash
+set -u
+printf 'called\n' >"${DOT_TEST_PROVIDER_CURL_MARKER:?}"
+exit 86
+CURL
+chmod 0755 "$legacy_convergence_bin/curl"
+set +e
+legacy_convergence_output=$(
+  PATH="$legacy_convergence_bin:$PATH" DOT_VERBOSE=1 \
+    DOT_TEST_PROVIDER_CURL_MARKER=$legacy_convergence_curl_marker \
+    run_dot "$legacy_convergence_home" "$legacy_convergence_state" init --yes \
+    "file://$legacy_convergence_origin" 2>&1
+)
+legacy_convergence_status=$?
+set -e
+assert_eq 1 "$legacy_convergence_status" \
+  'matched legacy adoption preserves dependency convergence failure status'
+assert_eq called "$(<"$legacy_convergence_curl_marker")" \
+  'matched legacy adoption reaches dependency convergence'
+assert_contains 'Done with errors' "$legacy_convergence_output" \
+  'matched legacy adoption preserves dependency convergence diagnostics'
+[[ $legacy_convergence_output != *'existing client repository does not match the requested origin and branch'* ]] ||
+  fail 'matched legacy adoption mislabeled dependency convergence as a repository mismatch'
+
 run_dot "$legacy_home" "$DOT_TEST_TMP/legacy-separate-state" init --yes \
   "file://$legacy_origin" >/dev/null
 run_dot "$legacy_home" "$DOT_TEST_TMP/legacy-separate-state" status >/dev/null
