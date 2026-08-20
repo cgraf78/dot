@@ -1414,7 +1414,8 @@ _dot_init_single_origin() {
 
 # Adopt a previously supported client layout only after the exact origin and
 # active branch have been bound to the requested initialization identity.
-# Returns 1 when no repository exists and 2 for a present but untrusted shape.
+# Returns 1 when no repository exists, 2 for a present but untrusted shape, and
+# 3 when an exactly matched repository could not finish the adoption workflow.
 _dot_init_adopt_existing() {
   local origin=$1 identity=$2 branch=$3 topology='' git_dir='' recorded_origin=''
   local recorded_identity='' active_branch='' transaction record commit git_identity stage
@@ -1450,23 +1451,23 @@ _dot_init_adopt_existing() {
   DOT_INIT_GIT_DEV=${git_identity%%:*}
   DOT_INIT_GIT_INO=${git_identity#*:}
 
-  _dot_init_transaction_dir || return 2
+  _dot_init_transaction_dir || return 3
   transaction=$REPLY
-  _dot_init_prepare_transaction "$transaction" || return 2
+  _dot_init_prepare_transaction "$transaction" || return 3
   stage=$REPLY
   record=$stage/record
   _dot_init_write_record "$record" converging "$origin" "$identity" "$branch" - "$git_dir" ||
-    return 2
-  _dot_init_publish_transaction "$stage" "$transaction" || return 2
+    return 3
+  _dot_init_publish_transaction "$stage" "$transaction" || return 3
   record=$transaction/record
   # shellcheck disable=SC2034 # Consumed dynamically by repository helpers.
   DOT_BASE_TOPOLOGY=$topology
   # shellcheck disable=SC2034 # Consumed dynamically by repository helpers.
   DOT_CLIENT_GIT_DIR=$git_dir
-  _dot_init_forward_converge || return 2
+  _dot_init_forward_converge || return 3
   _dot_init_write_record "$record" complete "$origin" "$identity" "$branch" - "$git_dir" ||
-    return 2
-  _dot_init_publish_completed "$record" || return 2
+    return 3
+  _dot_init_publish_completed "$record" || return 3
   rm -rf "$transaction"
 }
 
@@ -1899,6 +1900,8 @@ dot_init_command() {
     return 0
   elif [[ $adoption_rc -eq 2 ]]; then
     _dot_init_error 'existing client repository does not match the requested origin and branch'
+    return 1
+  elif [[ $adoption_rc -eq 3 ]]; then
     return 1
   fi
 
