@@ -621,7 +621,7 @@ _dot_init_confirm() {
 
 _dot_init_plan_summary() {
   local candidate=$1 branch=$2 tree=$3 backup=$4 identity=$5
-  local count provider=none extensions=disabled preview result
+  local count provider=none policy=pinned extensions=disabled preview result
 
   count=$(LC_ALL=C wc -l <"$tree" | tr -d '[:space:]') || return 1
   preview=$candidate/dot-config.preview
@@ -634,11 +634,12 @@ _dot_init_plan_summary() {
           set -euo pipefail
           . "$DOT_SOURCE_ROOT/lib/dot/config.sh"
           dot_config_load "$1"
-          printf "%s\t%s\n" "$DOT_DEPENDENCY_PROVIDER" \
+          printf "%s\t%s\t%s\n" "$DOT_DEPENDENCY_PROVIDER" \
+            "$DOT_SHDEPS_UPDATE_POLICY" \
             "${DOT_EXTENSION_API:+enabled}"
         ' -- "$preview"
     ) || return 1
-    IFS=$'\t' read -r provider extensions <<<"$result"
+    IFS=$'\t' read -r provider policy extensions <<<"$result"
     [[ -n $extensions ]] || extensions=disabled
   fi
   if [[ ${DOT_INIT_SKIP_PROVIDER:-0} == 1 && $provider != none ]]; then
@@ -650,6 +651,7 @@ _dot_init_plan_summary() {
   printf '  tracked paths: %s\n' "$count" >&2
   printf '  backup: %s\n' "$backup" >&2
   printf '  dependency provider: %s\n' "$provider" >&2
+  printf '  shdeps update policy: %s\n' "$policy" >&2
   printf '  extensions: %s\n' "$extensions" >&2
 }
 

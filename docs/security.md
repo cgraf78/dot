@@ -7,9 +7,12 @@ present one as verification.
 
 The installer validates and publishes one ordinary checkout, uses a shared
 owner-recorded mutation lock with Shdeps, and refuses foreign destinations. A
-selected Shdeps development checkout is explicit source trust: it may be dirty
-but its repository identity and tracked executable surfaces are revalidated.
-`install.sh --managed` bypasses and never executes that development target.
+selected Shdeps development checkout is explicit source trust. Dot validates
+its user-owned root, bootstrap entrypoints, Git metadata, and official origin
+to prevent accidental foreign selection, then treats the whole checkout as
+executable developer input, including existing binaries and Cargo inputs.
+Those identity checks are not a recursive content sandbox. `install.sh
+--managed` bypasses and never executes that development target.
 
 Client configuration is parsed as data. Extension discovery is versioned and
 rejects unsafe roots, path components, file types, ownership, modes, duplicate
