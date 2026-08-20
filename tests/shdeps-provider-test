@@ -351,6 +351,33 @@ assert_eq 1 "$invalid_policy_status" \
     'provider UI retains split failed-item detail'
 )
 
+lock_schema_root=$DOT_TEST_TMP/provider-lock-schema
+mkdir -p "$lock_schema_root/support"
+lock_schema_file=$lock_schema_root/support/shdeps.lock
+saved_source_root=${DOT_SOURCE_ROOT:-$root}
+DOT_SOURCE_ROOT=$lock_schema_root
+printf '%s\n' \
+  'revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'install_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+  'abi=1' >"$lock_schema_file"
+assert_eq aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  "$(_dot_shdeps_lock_value revision)" \
+  'provider lock parser accepts the canonical schema'
+
+for invalid_lock in \
+  $'revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nrevision=cccccccccccccccccccccccccccccccccccccccc\ninstall_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nabi=1' \
+  $'revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ninstall_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nunknown=value\nabi=1' \
+  $'install_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nrevision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nabi=1' \
+  $'revision=short\ninstall_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nabi=1' \
+  $'revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ninstall_sha256=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\nabi=1' \
+  $'revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ninstall_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nabi=0'; do
+  printf '%s\n' "$invalid_lock" >"$lock_schema_file"
+  if _dot_shdeps_lock_value revision >/dev/null; then
+    fail 'provider lock parser accepted a noncanonical schema'
+  fi
+done
+DOT_SOURCE_ROOT=$saved_source_root
+
 download_root=$DOT_TEST_TMP/provider-download-root
 download_bin=$DOT_TEST_TMP/provider-download-bin
 download_source=$DOT_TEST_TMP/provider-download-installer
@@ -1183,6 +1210,49 @@ unsafe_latest_result=$(
 assert_eq rejected "$unsafe_latest_result" \
   'latest policy rejects a group-writable development checkout'
 chmod 0755 "$latest_dev"
+
+git -C "$latest_dev" remote set-url --add origin \
+  git@github.com:cgraf78/shdeps.git
+if _dot_shdeps_development_checkout_valid "$latest_dev"; then
+  fail 'latest policy accepted multiple development checkout origin URLs'
+fi
+git -C "$latest_dev" config --local --unset-all remote.origin.url
+git -C "$latest_dev" config --local remote.origin.url \
+  https://github.com/cgraf78/shdeps.git
+
+git -C "$latest_dev" config --local \
+  url.https://github.com/example/.insteadOf https://github.com/cgraf78/
+if _dot_shdeps_development_checkout_valid "$latest_dev"; then
+  fail 'latest policy accepted an origin rewritten away from cgraf78/shdeps'
+fi
+git -C "$latest_dev" config --local --unset-all \
+  url.https://github.com/example/.insteadOf
+
+for allowed_origin in \
+  https://github.com/cgraf78/shdeps \
+  https://github.com/cgraf78/shdeps.git \
+  git@github.com:cgraf78/shdeps \
+  git@github.com:cgraf78/shdeps.git \
+  ssh://git@github.com/cgraf78/shdeps \
+  ssh://git@github.com/cgraf78/shdeps.git; do
+  git -C "$latest_dev" config --local remote.origin.url "$allowed_origin"
+  _dot_shdeps_development_checkout_valid "$latest_dev" ||
+    fail "latest policy rejected an allowed development origin: $allowed_origin"
+done
+git -C "$latest_dev" config --local remote.origin.url \
+  https://github.com/cgraf78/shdeps.git
+
+linked_latest=$DOT_TEST_TMP/latest-linked-worktree
+git -C "$latest_dev" worktree add -q --detach "$linked_latest" "$latest_revision"
+linked_latest_git_dir=$(git -C "$linked_latest" rev-parse --absolute-git-dir)
+linked_latest_common_dir=$(git -C "$linked_latest" \
+  rev-parse --path-format=absolute --git-common-dir)
+chmod 0755 "$linked_latest"
+chmod 0755 "$linked_latest_git_dir" "$linked_latest_common_dir"
+chmod 0644 "$linked_latest/.git" \
+  "$linked_latest/install.sh" "$linked_latest/shdeps.sh"
+_dot_shdeps_development_checkout_valid "$linked_latest" ||
+  fail 'latest policy rejected a valid linked development worktree'
 
 # Fleet clients commonly have only a managed release install. Latest mode must
 # force its bootstrap freshness check even when no development checkout exists.
