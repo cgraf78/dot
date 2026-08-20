@@ -119,7 +119,11 @@ _dr_check_provider() {
   fi
   binary=$REPLY
   expected=$(_dot_shdeps_lock_value abi 2>/dev/null || true)
-  actual=$(command "$binary" __api version 2>/dev/null || true)
+  if _dot_shdeps_binary_abi_version "$binary"; then
+    actual=$REPLY
+  else
+    actual=''
+  fi
   if [[ -n $expected && $actual == "abi:$expected" ]]; then
     _dr_ok 'Shdeps provider ABI' "$actual"
   else

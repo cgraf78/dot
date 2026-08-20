@@ -355,6 +355,9 @@ download_root=$DOT_TEST_TMP/provider-download-root
 download_bin=$DOT_TEST_TMP/provider-download-bin
 download_source=$DOT_TEST_TMP/provider-download-installer
 download_log=$DOT_TEST_TMP/provider-download-url
+download_output_log=$DOT_TEST_TMP/provider-download-output
+download_attempt_log=$DOT_TEST_TMP/provider-download-attempts
+download_retry_log=$DOT_TEST_TMP/provider-download-retries
 mkdir -p "$download_root/support" "$download_bin"
 printf '#!/usr/bin/env bash\nprintf "fixture installer\\n"\n' >"$download_source"
 chmod 0755 "$download_source"
@@ -367,28 +370,221 @@ cat >"$download_bin/curl" <<'CURL'
 set -e
 output=''
 url=''
+connect_timeout=''
+max_time=''
+speed_limit=''
+speed_time=''
 while (($#)); do
   case $1 in
     -o) output=$2; shift 2 ;;
+    --connect-timeout) connect_timeout=$2; shift 2 ;;
+    --max-time) max_time=$2; shift 2 ;;
+    --speed-limit) speed_limit=$2; shift 2 ;;
+    --speed-time) speed_time=$2; shift 2 ;;
     http*) url=$1; shift ;;
     *) shift ;;
   esac
 done
+attempt=0
+[[ ! -s $DOT_TEST_DOWNLOAD_ATTEMPT_LOG ]] || attempt=$(<"$DOT_TEST_DOWNLOAD_ATTEMPT_LOG")
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" >"$DOT_TEST_DOWNLOAD_ATTEMPT_LOG"
+printf '%s\n' "$output" >"$DOT_TEST_DOWNLOAD_OUTPUT_LOG"
+if ((attempt <= ${DOT_TEST_DOWNLOAD_FAIL_COUNT:-0})); then
+  printf 'partial bootstrap\n' >"$output"
+  printf 'curl fixture: transfer timed out\n' >&2
+  exit 28
+fi
 cp "$DOT_TEST_DOWNLOAD_SOURCE" "$output"
-printf '%s\n' "$url" >"$DOT_TEST_DOWNLOAD_LOG"
+printf '%s\n%s\n%s\n%s\n%s\n' \
+  "$url" "$connect_timeout" "$max_time" "$speed_limit" "$speed_time" \
+  >"$DOT_TEST_DOWNLOAD_LOG"
 CURL
 chmod 0755 "$download_bin/curl"
 saved_source_root=${DOT_SOURCE_ROOT:-$root}
 DOT_SOURCE_ROOT=$download_root
+: >"$download_attempt_log"
 PATH="$download_bin:$PATH" DOT_TEST_DOWNLOAD_SOURCE=$download_source \
-  DOT_TEST_DOWNLOAD_LOG=$download_log DOT_SHDEPS_UPDATE_POLICY=latest \
+  DOT_TEST_DOWNLOAD_LOG=$download_log \
+  DOT_TEST_DOWNLOAD_OUTPUT_LOG=$download_output_log \
+  DOT_TEST_DOWNLOAD_ATTEMPT_LOG=$download_attempt_log \
+  DOT_SHDEPS_UPDATE_POLICY=latest \
   _dot_shdeps_download_installer
 downloaded_installer=$REPLY
 assert_files_equal "$download_source" "$downloaded_installer" \
   'pinned provider download changed installer bytes'
-assert_eq "https://raw.githubusercontent.com/cgraf78/shdeps/$download_revision/install.sh" \
+assert_eq "https://raw.githubusercontent.com/cgraf78/shdeps/$download_revision/install.sh"$'\n10\n30\n1024\n15' \
   "$(<"$download_log")" 'provider download uses immutable reviewed revision'
+assert_eq 1 "$(<"$download_attempt_log")" \
+  'successful provider bootstrap download does not retry'
 _dot_cleanup_remove_path "$downloaded_installer"
+
+: >"$download_attempt_log"
+PATH="$download_bin:$PATH" DOT_TEST_DOWNLOAD_SOURCE=$download_source \
+  DOT_TEST_DOWNLOAD_LOG=$download_log \
+  DOT_TEST_DOWNLOAD_OUTPUT_LOG=$download_output_log \
+  DOT_TEST_DOWNLOAD_ATTEMPT_LOG=$download_attempt_log \
+  DOT_TEST_DOWNLOAD_FAIL_COUNT=2 \
+  _DOT_SHDEPS_DOWNLOAD_RETRY_DELAY_SECONDS=0 \
+  DOT_SHDEPS_UPDATE_POLICY=latest \
+  _dot_shdeps_download_installer 2>"$download_retry_log"
+retried_installer=$REPLY
+assert_files_equal "$download_source" "$retried_installer" \
+  'transient provider bootstrap retries changed installer bytes'
+assert_eq 3 "$(<"$download_attempt_log")" \
+  'provider bootstrap retries transient transport failures twice'
+assert_contains 'curl fixture: transfer timed out' "$(<"$download_retry_log")" \
+  'provider bootstrap preserves transport diagnostics while retrying'
+_dot_cleanup_remove_path "$retried_installer"
+
+: >"$download_attempt_log"
+set +e
+download_failure_output=$(
+  PATH="$download_bin:$PATH" DOT_TEST_DOWNLOAD_SOURCE=$download_source \
+    DOT_TEST_DOWNLOAD_LOG=$download_log \
+    DOT_TEST_DOWNLOAD_OUTPUT_LOG=$download_output_log \
+    DOT_TEST_DOWNLOAD_ATTEMPT_LOG=$download_attempt_log \
+    DOT_TEST_DOWNLOAD_FAIL_COUNT=3 \
+    _DOT_SHDEPS_DOWNLOAD_RETRY_DELAY_SECONDS=0 \
+    DOT_SHDEPS_UPDATE_POLICY=latest \
+    _dot_shdeps_download_installer 2>&1
+)
+download_failure_status=$?
+set -e
+assert_eq 1 "$download_failure_status" \
+  'failed provider bootstrap download remains nonzero'
+assert_contains 'Shdeps bootstrap download failed' "$download_failure_output" \
+  'failed provider bootstrap download names its phase'
+assert_eq 3 "$(<"$download_attempt_log")" \
+  'provider bootstrap stops after its bounded retry budget'
+failed_download_output=$(<"$download_output_log")
+[[ ! -e $failed_download_output && ! -L $failed_download_output ]] ||
+  fail 'failed provider bootstrap download retained a partial artifact'
+
+bounded_root=$DOT_TEST_TMP/provider-bounded-command
+bounded_parent=$bounded_root/parent
+bounded_child=$bounded_root/child
+bounded_fifo=$bounded_root/block
+bounded_script=$bounded_root/hang
+mkdir -p "$bounded_root"
+mkfifo "$bounded_fifo"
+cat >"$bounded_script" <<'SCRIPT'
+#!/usr/bin/env bash
+trap '' TERM
+printf '%s\n' "$BASHPID" >"$DOT_TEST_BOUNDED_PARENT"
+(
+  trap '' TERM
+  printf '%s\n' "$BASHPID" >"$DOT_TEST_BOUNDED_CHILD"
+  printf 'provider-child-secret-stderr\n' >&2
+  exec 9<"$DOT_TEST_BOUNDED_FIFO"
+) &
+wait
+SCRIPT
+chmod 0755 "$bounded_script"
+set +e
+bounded_output=$(
+  DOT_TEST_BOUNDED_PARENT=$bounded_parent \
+    DOT_TEST_BOUNDED_CHILD=$bounded_child \
+    DOT_TEST_BOUNDED_FIFO=$bounded_fifo \
+    _dot_shdeps_run_bounded 1 'provider ABI probe' discard-stderr \
+    "$bounded_script" 2>&1
+)
+bounded_status=$?
+set -e
+assert_eq 124 "$bounded_status" \
+  'bounded provider command reports the timeout status'
+assert_contains 'Shdeps provider ABI probe timed out after 1s' "$bounded_output" \
+  'bounded provider command reports its safe phase label'
+[[ $bounded_output != *provider-child-secret-stderr* ]] ||
+  fail 'bounded provider command exposed discarded child stderr'
+[[ -s $bounded_parent && -s $bounded_child ]] ||
+  fail 'bounded provider fixture did not start its process tree'
+bounded_parent_pid=$(<"$bounded_parent")
+bounded_child_pid=$(<"$bounded_child")
+process_is_live "$bounded_parent_pid" &&
+  fail 'bounded provider command retained its process leader'
+process_is_live "$bounded_child_pid" &&
+  fail 'bounded provider command retained its descendant'
+
+pipeholder_script=$bounded_root/pipeholder
+pipeholder_child=$bounded_root/pipeholder-child
+cat >"$pipeholder_script" <<'SCRIPT'
+#!/usr/bin/env bash
+(
+  trap '' TERM
+  printf '%s\n' "$BASHPID" >"$DOT_TEST_PIPEHOLDER_CHILD"
+  sleep 5
+) &
+printf 'abi:1\n'
+SCRIPT
+chmod 0755 "$pipeholder_script"
+pipeholder_started=$(_ui_now_ms)
+_DOT_SHDEPS_ABI_TIMEOUT_SECONDS=1
+if DOT_TEST_PIPEHOLDER_CHILD=$pipeholder_child \
+  _dot_shdeps_binary_abi_version "$pipeholder_script"; then
+  pipeholder_status=0
+else
+  pipeholder_status=$?
+fi
+pipeholder_elapsed=$(($(_ui_now_ms) - pipeholder_started))
+assert_eq 0 "$pipeholder_status" \
+  'successful provider ABI result survives descendant cleanup'
+assert_eq abi:1 "$REPLY" \
+  'successful provider ABI output survives bounded capture'
+((pipeholder_elapsed <= 3000)) ||
+  fail "provider ABI pipe holder exceeded deadline and cleanup grace: ${pipeholder_elapsed}ms"
+[[ -s $pipeholder_child ]] ||
+  fail 'provider ABI pipe-holder fixture did not start its descendant'
+pipeholder_child_pid=$(<"$pipeholder_child")
+process_is_live "$pipeholder_child_pid" &&
+  fail 'successful provider ABI probe retained its stdout-holding descendant'
+
+abi_parent=$bounded_root/abi-parent
+abi_child=$bounded_root/abi-child
+abi_status=$bounded_root/abi-status
+abi_output=$bounded_root/abi-output
+rm -f "$abi_parent" "$abi_child" "$abi_status" "$abi_output"
+(
+  abi_rc=0
+  _DOT_SHDEPS_ABI_TIMEOUT_SECONDS=1
+  _SHDEPSW_BIN=$bounded_script
+  if DOT_TEST_BOUNDED_PARENT=$abi_parent \
+    DOT_TEST_BOUNDED_CHILD=$abi_child \
+    DOT_TEST_BOUNDED_FIFO=$bounded_fifo \
+    _dot_shdeps_binary_abi >"$abi_output" 2>&1; then
+    abi_rc=0
+  else
+    abi_rc=$?
+  fi
+  printf '%s\n' "$abi_rc" >"$abi_status"
+) &
+abi_probe_pid=$!
+abi_deadline=$((SECONDS + 5))
+while [[ ! -s $abi_status ]] && process_is_live "$abi_probe_pid" &&
+  ((SECONDS < abi_deadline)); do
+  sleep 0.01
+done
+if [[ ! -s $abi_status ]]; then
+  for pid_file in "$abi_child" "$abi_parent"; do
+    [[ -s $pid_file ]] || continue
+    kill -KILL "$(<"$pid_file")" 2>/dev/null || true
+  done
+  kill -KILL "$abi_probe_pid" 2>/dev/null || true
+  wait "$abi_probe_pid" 2>/dev/null || true
+  fail 'provider ABI probe did not enforce its own deadline'
+fi
+wait "$abi_probe_pid"
+assert_eq 1 "$(<"$abi_status")" \
+  'timed-out provider ABI probe remains unhealthy'
+assert_contains 'Shdeps provider ABI probe timed out after 1s' \
+  "$(<"$abi_output")" \
+  'provider ABI probe reports its bounded phase'
+abi_parent_pid=$(<"$abi_parent")
+abi_child_pid=$(<"$abi_child")
+process_is_live "$abi_parent_pid" &&
+  fail 'provider ABI timeout retained its process leader'
+process_is_live "$abi_child_pid" &&
+  fail 'provider ABI timeout retained its descendant'
 DOT_SOURCE_ROOT=$saved_source_root
 
 # A provider-driven Dot re-exec must discard only values that Dot derived from

@@ -183,16 +183,116 @@ _dot_shdeps_installer_hash_matches() {
   [[ $actual == "$expected" ]]
 }
 
+_dot_shdeps_run_bounded() (
+  local timeout_seconds=$1 label=$2 stderr_mode=$3
+  local child deadline rc=1 tmpdir output_file status_file
+  shift 3
+
+  [[ $timeout_seconds =~ ^[1-9][0-9]*$ && -n $label && $# -gt 0 ]] || return 2
+  case $stderr_mode in
+    inherit-stderr | discard-stderr) ;;
+    *) return 2 ;;
+  esac
+
+  # This synchronous supervisor must own a distinct group even when called
+  # from a larger worker. Its wrapper remains the group leader after the real
+  # command exits, so an inherited-output descendant cannot escape the bound.
+  unset DOT_CLEANUP_INHERIT_GROUP
+  _dot_cleanup_prepare_subshell
+  _dot_cleanup_mktemp -d || return 1
+  tmpdir=$REPLY
+  output_file=$tmpdir/output
+  status_file=$tmpdir/status
+
+  _dot_cleanup_begin_job_launch closed-stdin
+  if [[ $DOT_CLEANUP_LAUNCH_ISOLATED -ne 1 ]]; then
+    _dot_cleanup_end_registration
+    _dot_cleanup_remove_path "$tmpdir" || true
+    return 1
+  fi
+  (
+    local command_status=0
+    _dot_cleanup_prepare_subshell
+    if [[ $stderr_mode == discard-stderr ]]; then
+      if "$@" >"$output_file" 2>/dev/null; then
+        command_status=0
+      else
+        command_status=$?
+      fi
+    elif "$@" >"$output_file"; then
+      command_status=0
+    else
+      command_status=$?
+    fi
+    printf '%s\n' "$command_status" >"$status_file"
+    while :; do
+      sleep 3600 || true
+    done
+  ) <&"$DOT_CLEANUP_LAUNCH_STDIN_FD" &
+  child=$!
+  _dot_cleanup_finish_job_launch "$child"
+
+  deadline=$((SECONDS + timeout_seconds))
+  while [[ ! -s $status_file ]]; do
+    if ((SECONDS >= deadline)); then
+      printf '  warning: Shdeps %s timed out after %ss\n' \
+        "$label" "$timeout_seconds" >&2
+      _dot_cleanup_all
+      return 124
+    fi
+    _dot_cleanup_job_matches "$child" active || {
+      _dot_cleanup_all
+      return 1
+    }
+    sleep 0.05 || true
+  done
+
+  rc=$(<"$status_file")
+  [[ $rc =~ ^([0-9]|[1-9][0-9]{1,2})$ && $rc -le 255 ]] || {
+    _dot_cleanup_all
+    return 1
+  }
+  _dot_cleanup_group_job_active "$child" "$child" || {
+    _dot_cleanup_all
+    return 1
+  }
+  kill -KILL -- "-$child" 2>/dev/null || {
+    _dot_cleanup_all
+    return 1
+  }
+  wait "$child" 2>/dev/null || true
+  _dot_cleanup_unregister_pid "$child"
+  command cat "$output_file" || {
+    _dot_cleanup_remove_path "$tmpdir" || true
+    return 1
+  }
+  _dot_cleanup_remove_path "$tmpdir" || return 1
+  return "$rc"
+)
+
 _dot_shdeps_download_installer() {
-  local revision temporary url
+  local revision temporary url attempt curl_status=1
+  local retry_delay=${_DOT_SHDEPS_DOWNLOAD_RETRY_DELAY_SECONDS:-1}
 
   revision=$(_dot_shdeps_lock_value revision) || return 1
   [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ $retry_delay =~ ^[0-9]+$ ]] || retry_delay=1
   _dot_cleanup_mktemp || return 1
   temporary=$REPLY
   url=https://raw.githubusercontent.com/cgraf78/shdeps/$revision/install.sh
-  if ! curl -fsSL "$url" -o "$temporary"; then
+  for attempt in 1 2 3; do
+    if curl --connect-timeout 10 --max-time 30 \
+      --speed-limit 1024 --speed-time 15 -fsSL "$url" -o "$temporary"; then
+      curl_status=0
+      break
+    else
+      curl_status=$?
+    fi
+    [[ $attempt -eq 3 ]] || sleep "$retry_delay"
+  done
+  if [[ $curl_status -ne 0 ]]; then
     _dot_cleanup_remove_path "$temporary" || true
+    _warn '  warning: Shdeps bootstrap download failed'
     return 1
   fi
   if ! _dot_shdeps_installer_hash_matches "$temporary"; then
@@ -204,12 +304,24 @@ _dot_shdeps_download_installer() {
   REPLY=$temporary
 }
 
+_dot_shdeps_binary_abi_version() {
+  local binary=$1 timeout_seconds=${_DOT_SHDEPS_ABI_TIMEOUT_SECONDS:-10}
+
+  [[ $timeout_seconds =~ ^[1-9][0-9]*$ ]] || timeout_seconds=10
+  [[ -n $binary && -x $binary ]] || return 1
+  if ! REPLY=$(_dot_shdeps_run_bounded "$timeout_seconds" \
+    'provider ABI probe' discard-stderr "$binary" __api version); then
+    REPLY=''
+    return 1
+  fi
+}
+
 _dot_shdeps_binary_abi() {
   local binary=${_SHDEPSW_BIN:-} expected
 
   expected=$(_dot_shdeps_lock_value abi) || return 1
-  [[ -n "$binary" && -x "$binary" ]] || return 1
-  [[ "$(command "$binary" __api version 2>/dev/null)" == "abi:$expected" ]]
+  _dot_shdeps_binary_abi_version "$binary" || return 1
+  [[ $REPLY == "abi:$expected" ]]
 }
 
 _ensure_shdeps() {
