@@ -64,6 +64,13 @@ strict data, not sourced shell. A missing file enables no provider and no
 extensions. See [configuration.md](docs/configuration.md) and
 [extensions.md](docs/extensions.md).
 
+Clients using Shdeps can keep Dot's default immutable provider selection with
+`shdeps_update_policy=pinned`, or opt into a freshness check on every update
+with `shdeps_update_policy=latest`. Latest mode follows a validated local
+`cgraf78/shdeps` development checkout when present, treating that user-owned
+checkout's contents as trusted executable developer input. Otherwise it
+refreshes the managed release through Dot's pinned bootstrap trust anchor.
+
 Only the versioned modules under `lib/dot/public` are sourceable APIs. All
 other shell files are private runtime implementation. See
 [library.md](docs/library.md).

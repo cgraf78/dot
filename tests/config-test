@@ -7,6 +7,7 @@ set -euo pipefail
 # shellcheck disable=SC1091 # Repository root comes from the test helper.
 . "$DOT_TEST_ROOT/lib/dot/public/xdg.sh"
 # shellcheck disable=SC1091 # Repository root comes from the test helper.
+unset DOT_SHDEPS_UPDATE_POLICY
 . "$DOT_TEST_ROOT/lib/dot/config.sh"
 
 HOME=$DOT_TEST_TMP/home
@@ -15,6 +16,8 @@ mkdir -p "$HOME"
 dot_config_load "$DOT_TEST_TMP/missing"
 assert_eq none "$DOT_DEPENDENCY_PROVIDER" 'missing config provider default'
 assert_eq '' "$DOT_EXTENSIONS_DIR" 'missing config extension default'
+assert_eq pinned "$DOT_SHDEPS_UPDATE_POLICY" \
+  'missing config Shdeps update policy default'
 
 config=$DOT_TEST_TMP/config
 # shellcheck disable=SC2016 # The config parser, not this test shell, expands it.
@@ -22,11 +25,56 @@ printf '%s\n' \
   'version=1' \
   'extension_api=1' \
   'extensions_dir=${HOME}/.local/lib/dotfiles' \
-  'dependency_provider=shdeps' >"$config"
+  'dependency_provider=shdeps' \
+  'shdeps_update_policy=latest' >"$config"
 dot_config_load "$config"
 assert_eq "$HOME/.local/lib/dotfiles" "$DOT_EXTENSIONS_DIR" \
   'HOME expansion'
 assert_eq shdeps "$DOT_DEPENDENCY_PROVIDER" 'provider selection'
+assert_eq latest "$DOT_SHDEPS_UPDATE_POLICY" 'Shdeps update policy selection'
+
+# A config-derived value must not turn into an environment override across
+# Dot's provider re-exec. The new process should re-read a policy changed by the
+# repository update that triggered the handoff.
+reexec_config=$DOT_TEST_TMP/reexec-config
+printf '%s\n' 'version=1' 'shdeps_update_policy=latest' >"$reexec_config"
+dot_config_load "$reexec_config"
+printf '%s\n' 'version=1' 'shdeps_update_policy=pinned' >"$reexec_config"
+reexec_policy=$(HOME="$HOME" bash --noprofile --norc -c '
+  set -euo pipefail
+  . "$1/lib/dot/public/xdg.sh"
+  . "$1/lib/dot/config.sh"
+  dot_config_load "$2"
+  printf "%s\n" "$DOT_SHDEPS_UPDATE_POLICY"
+' -- "$DOT_TEST_ROOT" "$reexec_config")
+assert_eq pinned "$reexec_policy" \
+  'provider re-exec reloads a changed config-derived Shdeps policy'
+
+env_config=$DOT_TEST_TMP/env-config
+printf '%s\n' 'version=1' 'shdeps_update_policy=pinned' >"$env_config"
+env_policy=$(DOT_SHDEPS_UPDATE_POLICY=latest HOME="$HOME" bash --noprofile --norc -c '
+  set -euo pipefail
+  . "$1/lib/dot/public/xdg.sh"
+  . "$1/lib/dot/config.sh"
+  dot_config_load "$2"
+  printf "%s\n" "$DOT_SHDEPS_UPDATE_POLICY"
+' -- "$DOT_TEST_ROOT" "$env_config")
+assert_eq latest "$env_policy" 'Shdeps update policy environment override'
+
+set +e
+invalid_env_output=$(DOT_SHDEPS_UPDATE_POLICY=invalid HOME="$HOME" bash --noprofile --norc -c '
+  set -euo pipefail
+  . "$1/lib/dot/public/xdg.sh"
+  . "$1/lib/dot/config.sh"
+  dot_config_load "$2"
+' -- "$DOT_TEST_ROOT" "$config" 2>&1)
+invalid_env_status=$?
+set -e
+if [[ $invalid_env_status -eq 0 ]]; then
+  fail 'accepted invalid Shdeps update policy environment override'
+fi
+assert_contains 'must be pinned or latest' "$invalid_env_output" \
+  'invalid Shdeps update policy environment remediation'
 
 saved_home=$HOME
 unset HOME
@@ -47,6 +95,8 @@ for invalid in \
   'dependency_provider=none' \
   $'version=1\nunknown=value' \
   $'version=1\nversion=1' \
+  $'version=1\nshdeps_update_policy=invalid' \
+  $'version=1\nshdeps_update_policy=pinned\nshdeps_update_policy=latest' \
   $'version=1\nextensions_dir=relative' \
   $'version=1\nextensions_dir=/tmp/extensions' \
   $'version=1\nextensions_dir=$PATH' \

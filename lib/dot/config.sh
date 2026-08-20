@@ -3,6 +3,13 @@
 # parser expands only documented HOME spellings and rejects unknown syntax
 # before any extension or dependency provider can execute.
 
+# Capture the process environment before config loading publishes the resolved
+# value. Dot loads configuration once in production, while tests may call the
+# parser repeatedly in one shell; keeping the original override separate makes
+# both cases deterministic.
+_DOT_CONFIG_ENV_SHDEPS_UPDATE_POLICY=${DOT_SHDEPS_UPDATE_POLICY:-}
+unset DOT_SHDEPS_UPDATE_POLICY
+
 _dot_config_error() {
   printf 'dot: config: %s\n' "$*" >&2
   return 1
@@ -66,13 +73,25 @@ dot_config_load() {
   local config_path=${1:-} line key value size line_number=0 saw_value=false
   local seen_version=false seen_extension_api=false
   local seen_extensions_dir=false seen_dependency_provider=false
+  local seen_shdeps_update_policy=false configured_shdeps_update_policy=pinned
 
   DOT_CONFIG_VERSION=1
   DOT_EXTENSION_API=
   DOT_EXTENSIONS_DIR=
   DOT_DEPENDENCY_PROVIDER=none
+  case $_DOT_CONFIG_ENV_SHDEPS_UPDATE_POLICY in
+    '' | pinned | latest) ;;
+    *)
+      _dot_config_error \
+        "DOT_SHDEPS_UPDATE_POLICY must be pinned or latest, found: $_DOT_CONFIG_ENV_SHDEPS_UPDATE_POLICY" || return
+      ;;
+  esac
+  DOT_SHDEPS_UPDATE_POLICY=${_DOT_CONFIG_ENV_SHDEPS_UPDATE_POLICY:-pinned}
   export DOT_CONFIG_VERSION DOT_EXTENSION_API DOT_EXTENSIONS_DIR
   export DOT_DEPENDENCY_PROVIDER
+  if [[ -n $_DOT_CONFIG_ENV_SHDEPS_UPDATE_POLICY ]]; then
+    export DOT_SHDEPS_UPDATE_POLICY
+  fi
 
   if [[ -z "$config_path" ]]; then
     dot_xdg_path config dot/config ||
@@ -140,6 +159,18 @@ dot_config_load() {
           *) _dot_config_error "unsupported dependency_provider: $value" || return ;;
         esac
         ;;
+      shdeps_update_policy)
+        [[ "$seen_shdeps_update_policy" == false ]] ||
+          _dot_config_error 'duplicate shdeps_update_policy' || return
+        seen_shdeps_update_policy=true
+        case $value in
+          pinned | latest) configured_shdeps_update_policy=$value ;;
+          *)
+            _dot_config_error \
+              "shdeps_update_policy must be pinned or latest, found: $value" || return
+            ;;
+        esac
+        ;;
       *) _dot_config_error "unknown key: $key" || return ;;
     esac
   done <"$config_path"
@@ -148,5 +179,8 @@ dot_config_load() {
     _dot_config_error 'missing version=1' || return
   if [[ "$seen_extensions_dir" == true && "$DOT_EXTENSION_API" != 1 ]]; then
     _dot_config_error 'extensions_dir requires extension_api=1' || return
+  fi
+  if [[ -z $_DOT_CONFIG_ENV_SHDEPS_UPDATE_POLICY ]]; then
+    DOT_SHDEPS_UPDATE_POLICY=$configured_shdeps_update_policy
   fi
 }

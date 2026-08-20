@@ -20,7 +20,10 @@ _dot_shdeps_configure_env() {
   SHDEPS_GIT_DEV_DIR=${SHDEPS_GIT_DEV_DIR:-$HOME/git}
   export SHDEPS_CONF_DIR SHDEPS_HOOKS_DIR SHDEPS_INSTALL_DIR
   export SHDEPS_BIN_DIR SHDEPS_GIT_DEV_DIR
-  [[ "${DOT_FORCE:-0}" -eq 1 ]] && export SHDEPS_FORCE=1
+  if [[ "${DOT_FORCE:-0}" -eq 1 ||
+    "${DOT_SHDEPS_UPDATE_POLICY:-pinned}" == latest ]]; then
+    export SHDEPS_FORCE=1
+  fi
   [[ "${DOT_QUIET:-0}" -eq 1 ]] && export SHDEPS_QUIET=1
   # Optional flag propagation must not become the function's result. Provider
   # setup is successful when the roots above resolved, including the ordinary
@@ -28,8 +31,79 @@ _dot_shdeps_configure_env() {
   return 0
 }
 
+_dot_shdeps_path_owned() {
+  local path=$1 output uid mode
+
+  if output=$(command stat -c '%u %a' "$path" 2>/dev/null); then
+    :
+  elif output=$(command stat -f '%u %Lp' "$path" 2>/dev/null); then
+    :
+  else
+    return 1
+  fi
+  read -r uid mode <<<"$output"
+  [[ $uid == "$EUID" && $mode != *[!0-7]* ]] || return 1
+  (((8#$mode & 022) == 0))
+}
+
+_dot_shdeps_origin_allowed() {
+  case $1 in
+    https://github.com/cgraf78/shdeps | \
+      https://github.com/cgraf78/shdeps.git | \
+      git@github.com:cgraf78/shdeps | \
+      git@github.com:cgraf78/shdeps.git | \
+      ssh://git@github.com/cgraf78/shdeps | \
+      ssh://git@github.com/cgraf78/shdeps.git)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+_dot_shdeps_development_checkout_valid() {
+  local checkout=$1 physical root git_dir common_dir
+  local -a origins=() effective_origins=()
+
+  # Latest mode is an explicit developer-checkout trust decision. These checks
+  # bind that decision to the expected user-owned root, bootstrap entrypoints,
+  # Git metadata, and official origin; they do not recursively sandbox source,
+  # prebuilt binaries, or Cargo inputs inside the selected checkout.
+  [[ -d $checkout && ! -L $checkout ]] || return 1
+  _dot_shdeps_path_owned "$checkout" || return 1
+  [[ -f $checkout/install.sh && ! -L $checkout/install.sh ]] || return 1
+  _dot_shdeps_path_owned "$checkout/install.sh" || return 1
+  [[ -f $checkout/shdeps.sh && ! -L $checkout/shdeps.sh ]] || return 1
+  _dot_shdeps_path_owned "$checkout/shdeps.sh" || return 1
+  [[ (-d $checkout/.git || -f $checkout/.git) && ! -L $checkout/.git ]] || return 1
+  _dot_shdeps_path_owned "$checkout/.git" || return 1
+
+  physical=$(cd -P -- "$checkout" 2>/dev/null && pwd -P) || return 1
+  root=$(_dot_sanitized_git -C "$physical" \
+    rev-parse --show-toplevel 2>/dev/null) || return 1
+  root=$(cd -P -- "$root" 2>/dev/null && pwd -P) || return 1
+  [[ $root == "$physical" ]] || return 1
+  git_dir=$(_dot_sanitized_git -C "$physical" \
+    rev-parse --absolute-git-dir 2>/dev/null) || return 1
+  git_dir=$(cd -P -- "$git_dir" 2>/dev/null && pwd -P) || return 1
+  _dot_shdeps_path_owned "$git_dir" || return 1
+  common_dir=$(_dot_sanitized_git -C "$physical" \
+    rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  common_dir=$(cd -P -- "$common_dir" 2>/dev/null && pwd -P) || return 1
+  _dot_shdeps_path_owned "$common_dir" || return 1
+
+  mapfile -t origins < <(_dot_sanitized_git -C "$physical" \
+    config --local --get-all remote.origin.url 2>/dev/null)
+  [[ ${#origins[@]} -eq 1 ]] || return 1
+  _dot_shdeps_origin_allowed "${origins[0]}" || return 1
+  mapfile -t effective_origins < <(_dot_sanitized_git -C "$physical" \
+    remote get-url --all origin 2>/dev/null)
+  [[ ${#effective_origins[@]} -eq 1 ]] || return 1
+  _dot_shdeps_origin_allowed "${effective_origins[0]}"
+}
+
 _dot_shdeps_installer() {
   local installed=${SHDEPS_DIR:-$HOME/.local/share/shdeps}
+  local development=$SHDEPS_GIT_DEV_DIR/shdeps
   local development_revision expected_revision
 
   if [[ -n ${SHDEPS_LIB:-} && -f ${SHDEPS_LIB%/*}/install.sh ]] &&
@@ -37,15 +111,23 @@ _dot_shdeps_installer() {
     REPLY=${SHDEPS_LIB%/*}/install.sh
     return 0
   fi
-  development_revision=$(git -C "$SHDEPS_GIT_DEV_DIR/shdeps" rev-parse HEAD 2>/dev/null || true)
+  development_revision=$(_dot_sanitized_git -C "$development" \
+    rev-parse HEAD 2>/dev/null || true)
   expected_revision=$(_dot_shdeps_lock_value revision) || expected_revision=''
-  if [[ -f "$SHDEPS_GIT_DEV_DIR/shdeps/install.sh" &&
-    -f "$SHDEPS_GIT_DEV_DIR/shdeps/shdeps.sh" &&
+  if [[ -f "$development/install.sh" &&
+    -f "$development/shdeps.sh" &&
     -n "$expected_revision" && "$development_revision" == "$expected_revision" ]] &&
-    _dot_shdeps_installer_hash_matches "$SHDEPS_GIT_DEV_DIR/shdeps/install.sh"; then
-    SHDEPS_LIB=$SHDEPS_GIT_DEV_DIR/shdeps/shdeps.sh
+    _dot_shdeps_installer_hash_matches "$development/install.sh"; then
+    SHDEPS_LIB=$development/shdeps.sh
     export SHDEPS_LIB
-    REPLY=$SHDEPS_GIT_DEV_DIR/shdeps/install.sh
+    REPLY=$development/install.sh
+    return 0
+  fi
+  if [[ "${DOT_SHDEPS_UPDATE_POLICY:-pinned}" == latest ]] &&
+    _dot_shdeps_development_checkout_valid "$development"; then
+    SHDEPS_LIB=$development/shdeps.sh
+    export SHDEPS_LIB
+    REPLY=$development/install.sh
     return 0
   fi
   if [[ -f "$installed/install.sh" && -f "$installed/shdeps.sh" ]] &&
@@ -102,10 +184,11 @@ _dot_shdeps_binary_abi() {
 }
 
 _ensure_shdeps() {
-  local installer temporary=false
+  local installer temporary=false development
 
   [[ "${DOT_DEPENDENCY_PROVIDER:-none}" == shdeps ]] || return 0
   _dot_shdeps_configure_env || return 1
+  development=$SHDEPS_GIT_DEV_DIR/shdeps
   if _dot_shdeps_installer; then
     installer=$REPLY
   else
@@ -115,6 +198,15 @@ _ensure_shdeps() {
     }
     installer=$REPLY
     temporary=true
+  fi
+
+  # A pinned or latest-policy validation failure must not be bypassed by the
+  # downloaded/installed bootstrap rediscovering the rejected checkout on its
+  # own. The selected development installer remains visible; every other
+  # source gets an explicitly empty development root for this sourced call.
+  if [[ $installer != "$development/install.sh" ]]; then
+    local SHDEPS_GIT_DEV_DIR=/dev/null
+    export SHDEPS_GIT_DEV_DIR
   fi
 
   # shellcheck source=/dev/null
