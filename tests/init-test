@@ -1022,6 +1022,9 @@ PATH="$init_skip_bin:$PATH" DOT_INIT_SKIP_PROVIDER=1 \
 assert_contains 'dependency provider: shdeps (skipped for this invocation)' \
   "$(<"$init_skip_plan")" \
   'provider-suppressed init plan describes the invocation override'
+assert_contains 'shdeps update policy: pinned' \
+  "$(<"$init_skip_plan")" \
+  'init plan reports the default effective Shdeps update policy'
 assert_contains 'phase=complete' \
   "$(<"$init_overlay_state/dot/init/completed")" \
   'provider-suppressed init completed its durable transaction'
@@ -1032,6 +1035,17 @@ assert_eq $'version=1\ndependency_provider=shdeps' \
   fail 'provider-suppressed init did not clone required Git overlay'
 [[ -L $init_overlay_home/.config/example/value ]] ||
   fail 'provider-suppressed init did not link required Git overlay'
+
+fixture_home init-with-overlay-latest-policy
+init_latest_policy_home=$REPLY
+init_latest_policy_state=$DOT_TEST_TMP/init-with-overlay-latest-policy-state
+init_latest_policy_plan=$DOT_TEST_TMP/init-with-overlay-latest-policy-plan
+DOT_INIT_SKIP_PROVIDER=1 DOT_SHDEPS_UPDATE_POLICY=latest \
+  run_dot "$init_latest_policy_home" "$init_latest_policy_state" init --yes \
+  "file://$init_overlay_base_origin" >/dev/null 2>"$init_latest_policy_plan"
+assert_contains 'shdeps update policy: latest' \
+  "$(<"$init_latest_policy_plan")" \
+  'init plan reports the process-local effective Shdeps update policy'
 
 set +e
 PATH="$init_skip_bin:$PATH" DOT_TEST_PROVIDER_CURL_MARKER=$init_skip_marker \
