@@ -79,6 +79,7 @@ tests/provenance-test	standalone:new
 tests/repos-test	dotfiles:tests/core-pull-test+core-overlays-test@dotfiles-v1+standalone
 tests/resources-test	dotfiles:tests/core-resource-cleanup-test@dotfiles-v1+standalone
 tests/run	standalone:new
+tests/shdeps-lock-verifier-test	standalone:new
 tests/shdeps-provider-test	dotfiles:tests/core-test+core-reexec-test@dotfiles-v1+standalone
 tests/update-lock-test	dotfiles:tests/core-update-test@dotfiles-v1+standalone
 tests/workflow-test	standalone:new

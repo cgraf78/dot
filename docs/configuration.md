@@ -58,3 +58,12 @@ config or environment values fail before any provider or extension runs. A
 network or metadata failure retains an already-compatible managed release when
 Shdeps can do so safely; if no usable provider can be activated, `dot update`
 returns failure.
+
+Maintainers update `support/shdeps.lock` by selecting a reviewed immutable
+revision and recording the SHA-256 digest of that revision's raw `install.sh`.
+`scripts/verify-shdeps-lock` checks the canonical lock schema and fetches the
+raw installer at that exact revision, proving both that the revision and path
+exist and that the bytes match the recorded digest. CI always reports one
+singleton lock check, but performs that bounded remote verification only when
+the lock changes (or for a manual run); it never selects or advances the
+revision automatically.

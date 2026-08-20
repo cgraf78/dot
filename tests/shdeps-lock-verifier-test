@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+
+verifier=$DOT_TEST_ROOT/scripts/verify-shdeps-lock
+[[ -x $verifier ]] || fail 'Shdeps lock verifier is missing or not executable'
+
+fixture=$DOT_TEST_TMP/repository
+fake_bin=$DOT_TEST_TMP/bin
+curl_log=$DOT_TEST_TMP/curl.log
+installer=$DOT_TEST_TMP/install.sh
+verify_tmp=$DOT_TEST_TMP/verifier-tmp
+mkdir -p "$fixture/scripts" "$fixture/support" "$fake_bin" "$verify_tmp"
+cp "$verifier" "$fixture/scripts/verify-shdeps-lock"
+tool_path=$PATH
+printf '#!/usr/bin/env bash\nprintf "fixture installer\\n"\n' >"$installer"
+chmod 0755 "$installer"
+if command -v sha256sum >/dev/null 2>&1; then
+  installer_hash=$(sha256sum "$installer" | awk '{print $1}')
+else
+  installer_hash=$(shasum -a 256 "$installer" | awk '{print $1}')
+fi
+revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+cat >"$fake_bin/curl" <<'CURL'
+#!/usr/bin/env bash
+set -euo pipefail
+
+connect_timeout=
+max_time=
+retry=
+retry_delay=
+retry_max_time=
+retry_all_errors=false
+speed_limit=
+speed_time=
+output=
+url=
+while (($#)); do
+  case $1 in
+    --connect-timeout) connect_timeout=$2; shift 2 ;;
+    --max-time) max_time=$2; shift 2 ;;
+    --retry) retry=$2; shift 2 ;;
+    --retry-delay) retry_delay=$2; shift 2 ;;
+    --retry-max-time) retry_max_time=$2; shift 2 ;;
+    --retry-all-errors) retry_all_errors=true; shift ;;
+    --speed-limit) speed_limit=$2; shift 2 ;;
+    --speed-time) speed_time=$2; shift 2 ;;
+    --output) output=$2; shift 2 ;;
+    --fail | --silent | --show-error | --location) shift ;;
+    http*) url=$1; shift ;;
+    *) printf 'unexpected curl argument: %s\n' "$1" >&2; exit 96 ;;
+  esac
+done
+
+[[ $connect_timeout == 10 && $max_time == 30 && $retry == 2 &&
+  $retry_delay == 2 && $retry_max_time == 65 &&
+  $retry_all_errors == true && $speed_limit == 1024 && $speed_time == 15 ]] || {
+  printf 'curl bounds mismatch\n' >&2
+  exit 97
+}
+[[ -n $output && -n $url ]] || exit 98
+printf '%s\n' "$url" >>"$DOT_TEST_CURL_LOG"
+
+case $url in
+  https://raw.githubusercontent.com/cgraf78/shdeps/*/install.sh)
+    [[ ${DOT_TEST_CURL_MODE:-success} != unavailable ]] || exit 22
+    cp "$DOT_TEST_INSTALLER" "$output"
+    ;;
+  *)
+    printf 'unexpected curl URL: %s\n' "$url" >&2
+    exit 99
+    ;;
+esac
+CURL
+chmod 0755 "$fake_bin/curl"
+
+write_lock() {
+  printf 'revision=%s\ninstall_sha256=%s\nabi=1\n' \
+    "$revision" "$installer_hash" >"$fixture/support/shdeps.lock"
+}
+
+run_verifier() {
+  PATH="$fake_bin:$tool_path" \
+    TMPDIR=$verify_tmp \
+    DOT_TEST_CURL_LOG=$curl_log \
+    DOT_TEST_INSTALLER=$installer \
+    "$fixture/scripts/verify-shdeps-lock" "$@"
+}
+
+write_lock
+git -C "$fixture" init --quiet
+git -C "$fixture" add support/shdeps.lock
+: >"$curl_log"
+output=$(run_verifier)
+assert_contains "verified $revision" "$output" \
+  'verifier reports the reviewed Shdeps revision'
+assert_eq \
+  "https://raw.githubusercontent.com/cgraf78/shdeps/$revision/install.sh" \
+  "$(<"$curl_log")" \
+  'verifier fetches the raw installer at the exact revision'
+[[ -z $(ls -A "$verify_tmp") ]] || fail 'successful verification leaked a temporary file'
+
+for invalid_lock in \
+  $'revision=short\ninstall_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nabi=1' \
+  $'revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ninstall_sha256=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\nabi=1' \
+  $'revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ninstall_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nabi=0' \
+  $'install_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nrevision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nabi=1' \
+  $'revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ninstall_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nunknown=value\nabi=1'; do
+  printf '%s\n' "$invalid_lock" >"$fixture/support/shdeps.lock"
+  : >"$curl_log"
+  if run_verifier >/dev/null 2>&1; then
+    fail 'verifier accepted a noncanonical Shdeps lock'
+  fi
+  [[ ! -s $curl_log ]] || fail 'invalid lock reached the network'
+done
+
+printf 'revision=%s\ninstall_sha256=%s\nabi=1' \
+  "$revision" "$installer_hash" >"$fixture/support/shdeps.lock"
+if run_verifier >/dev/null 2>&1; then
+  fail 'verifier accepted a lock without a final newline'
+fi
+
+write_lock
+chmod 0755 "$fixture/support/shdeps.lock"
+if run_verifier >/dev/null 2>&1; then
+  fail 'verifier accepted an executable Shdeps lock'
+fi
+chmod 0644 "$fixture/support/shdeps.lock"
+
+mv "$fixture/support/shdeps.lock" "$fixture/support/real-lock"
+ln -s real-lock "$fixture/support/shdeps.lock"
+if run_verifier >/dev/null 2>&1; then
+  fail 'verifier accepted a symlinked Shdeps lock'
+fi
+rm "$fixture/support/shdeps.lock"
+mv "$fixture/support/real-lock" "$fixture/support/shdeps.lock"
+
+: >"$curl_log"
+set +e
+missing_output=$(DOT_TEST_CURL_MODE=unavailable run_verifier 2>&1)
+missing_status=$?
+set -e
+[[ $missing_status -ne 0 ]] || fail 'unavailable Shdeps revision passed verification'
+assert_contains 'revision or install.sh is not available' "$missing_output" \
+  'unavailable revision failure is actionable'
+[[ -z $(ls -A "$verify_tmp") ]] || fail 'failed download leaked a temporary file'
+
+printf '#!/usr/bin/env bash\nprintf "different installer\\n"\n' >"$installer"
+: >"$curl_log"
+set +e
+digest_output=$(run_verifier 2>&1)
+digest_status=$?
+set -e
+[[ $digest_status -ne 0 ]] || fail 'mismatched installer digest passed verification'
+assert_contains 'installer digest mismatch' "$digest_output" \
+  'digest mismatch failure is actionable'
+[[ -z $(ls -A "$verify_tmp") ]] || fail 'digest mismatch leaked a temporary file'
+
+printf '#!/usr/bin/env bash\nprintf "fixture installer\\n"\n' >"$installer"
+write_lock
+git -C "$fixture" config user.name test
+git -C "$fixture" config user.email test@example.invalid
+git -C "$fixture" add scripts/verify-shdeps-lock support/shdeps.lock
+git -C "$fixture" -c core.hooksPath=/dev/null commit --quiet -m base
+git -C "$fixture" branch -M main
+base=$(git -C "$fixture" rev-parse HEAD)
+
+: >"$curl_log"
+unchanged_output=$(run_verifier --if-changed pull_request "$base")
+assert_contains 'unchanged; remote verification skipped' "$unchanged_output" \
+  'unchanged pull request skips remote verification'
+[[ ! -s $curl_log ]] || fail 'unchanged pull request reached the network'
+
+: >"$curl_log"
+schedule_output=$(run_verifier --if-changed schedule '')
+assert_contains 'scheduled run; remote verification skipped' "$schedule_output" \
+  'scheduled run skips remote verification'
+[[ ! -s $curl_log ]] || fail 'scheduled run reached the network'
+
+printf 'unrelated\n' >"$fixture/README"
+git -C "$fixture" add README
+git -C "$fixture" -c core.hooksPath=/dev/null commit --quiet -m unrelated
+: >"$curl_log"
+unchanged_output=$(run_verifier --if-changed push "$base")
+assert_contains 'unchanged; remote verification skipped' "$unchanged_output" \
+  'unrelated push skips remote verification'
+[[ ! -s $curl_log ]] || fail 'unrelated push reached the network'
+
+pr_base=$(git -C "$fixture" rev-parse HEAD)
+git -C "$fixture" switch --quiet -c lock-change
+revision=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+write_lock
+git -C "$fixture" add support/shdeps.lock
+git -C "$fixture" -c core.hooksPath=/dev/null commit --quiet -m lock-change
+git -C "$fixture" switch --quiet main
+git -C "$fixture" -c core.hooksPath=/dev/null merge --quiet --no-ff \
+  lock-change -m merge
+: >"$curl_log"
+changed_output=$(run_verifier --if-changed pull_request "$pr_base")
+assert_contains "verified $revision" "$changed_output" \
+  'lock-changing pull request merge ref performs remote verification'
+
+: >"$curl_log"
+manual_output=$(run_verifier --if-changed workflow_dispatch '')
+assert_contains "verified $revision" "$manual_output" \
+  'manual run performs remote verification'
+
+: >"$curl_log"
+first_push_output=$(run_verifier --if-changed push \
+  0000000000000000000000000000000000000000)
+assert_contains "verified $revision" "$first_push_output" \
+  'first push performs remote verification'
+
+set +e
+invalid_base_output=$(run_verifier --if-changed pull_request not-a-sha 2>&1)
+invalid_base_status=$?
+set -e
+[[ $invalid_base_status -ne 0 ]] || fail 'invalid comparison base skipped verification'
+assert_contains 'comparison base must be a full commit SHA' "$invalid_base_output" \
+  'invalid comparison base fails closed'
+
+printf 'shdeps-lock-verifier-test: ok\n'

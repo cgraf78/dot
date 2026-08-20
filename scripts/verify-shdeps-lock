@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+die() {
+  printf 'shdeps-lock: %s\n' "$*" >&2
+  exit 1
+}
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+lock=$root/support/shdeps.lock
+
+case $# in
+  0) ;;
+  3)
+    [[ $1 == --if-changed ]] ||
+      die 'usage: scripts/verify-shdeps-lock [--if-changed EVENT BASE_SHA]'
+    event=$2
+    base=$3
+    case $event in
+      workflow_dispatch) base= ;;
+      schedule)
+        printf '%s\n' 'shdeps-lock: scheduled run; remote verification skipped'
+        exit 0
+        ;;
+      push)
+        [[ $base != 0000000000000000000000000000000000000000 ]] || base=
+        ;;
+      pull_request) ;;
+      *) die "unsupported CI event: $event" ;;
+    esac
+    if [[ -n $base ]]; then
+      [[ $base =~ ^[0-9a-f]{40}$ ]] ||
+        die 'comparison base must be a full commit SHA'
+      git -C "$root" cat-file -e "$base^{commit}" 2>/dev/null ||
+        die "comparison base is not available locally: $base"
+      set +e
+      git -C "$root" diff --quiet "$base" HEAD -- support/shdeps.lock
+      changed=$?
+      set -e
+      case $changed in
+        0)
+          printf '%s\n' 'shdeps-lock: unchanged; remote verification skipped'
+          exit 0
+          ;;
+        1) ;;
+        *) die 'could not compare support/shdeps.lock with the event base' ;;
+      esac
+    fi
+    ;;
+  *) die 'usage: scripts/verify-shdeps-lock [--if-changed EVENT BASE_SHA]' ;;
+esac
+
+[[ -f $lock && ! -L $lock ]] ||
+  die 'support/shdeps.lock must be a regular non-symlink file'
+[[ ! -x $lock ]] || die 'support/shdeps.lock must not be executable'
+git -C "$root" ls-files --error-unmatch support/shdeps.lock >/dev/null 2>&1 ||
+  die 'support/shdeps.lock must be tracked'
+
+exec 3<"$lock"
+IFS= read -r revision_line <&3 || die 'support/shdeps.lock is not canonical'
+IFS= read -r digest_line <&3 || die 'support/shdeps.lock is not canonical'
+IFS= read -r abi_line <&3 || die 'support/shdeps.lock is not canonical'
+extra=
+if IFS= read -r extra <&3 || [[ -n $extra ]]; then
+  die 'support/shdeps.lock is not canonical'
+fi
+exec 3<&-
+
+[[ $revision_line =~ ^revision=([0-9a-f]{40})$ ]] ||
+  die 'support/shdeps.lock has an invalid revision'
+revision=${BASH_REMATCH[1]}
+[[ $digest_line =~ ^install_sha256=([0-9a-f]{64})$ ]] ||
+  die 'support/shdeps.lock has an invalid install_sha256'
+expected_digest=${BASH_REMATCH[1]}
+[[ $abi_line =~ ^abi=([1-9][0-9]*)$ ]] ||
+  die 'support/shdeps.lock has an invalid abi'
+
+command -v curl >/dev/null 2>&1 || die 'curl is required'
+
+# Three attempts can consume at most about 95 seconds: retry-max-time may begin
+# one final 30-second transfer after its 65-second retry window. The request
+# therefore remains well below the workflow's five-minute cap.
+curl_args=(
+  --fail
+  --silent
+  --show-error
+  --location
+  --connect-timeout 10
+  --max-time 30
+  --retry 2
+  --retry-delay 2
+  --retry-max-time 65
+  --retry-all-errors
+  --speed-limit 1024
+  --speed-time 15
+)
+
+tmpdir=${TMPDIR:-/tmp}
+installer=$(mktemp "$tmpdir/dot-shdeps-install.XXXXXXXX") ||
+  die 'could not create a temporary installer file'
+trap 'rm -f -- "$installer"' EXIT
+installer_url="https://raw.githubusercontent.com/cgraf78/shdeps/$revision/install.sh"
+if ! curl "${curl_args[@]}" --output "$installer" "$installer_url"; then
+  die "revision or install.sh is not available from cgraf78/shdeps: $revision"
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+  actual_digest=$(sha256sum "$installer" | awk '{print $1}') ||
+    die 'could not hash downloaded install.sh'
+elif command -v shasum >/dev/null 2>&1; then
+  actual_digest=$(shasum -a 256 "$installer" | awk '{print $1}') ||
+    die 'could not hash downloaded install.sh'
+else
+  die 'sha256sum or shasum is required'
+fi
+
+[[ $actual_digest == "$expected_digest" ]] ||
+  die "installer digest mismatch for revision $revision"
+
+printf 'shdeps-lock: verified %s\n' "$revision"

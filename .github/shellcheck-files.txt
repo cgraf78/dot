@@ -53,6 +53,7 @@ program	lib/dot/temp.sh
 program	lib/dot/update-lock.sh
 program	lib/dot/update.sh
 program	scripts/checkout-installer.conf
+program	scripts/verify-shdeps-lock
 program	support/checkout-bash-v1.sh
 program	support/client-launcher.sh
 program	support/install-checkout.sh
@@ -79,5 +80,6 @@ program	tests/repos-test
 program	tests/resources-test
 program	tests/run
 program	tests/shdeps-provider-test
+program	tests/shdeps-lock-verifier-test
 program	tests/update-lock-test
 program	tests/workflow-test
