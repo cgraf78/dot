@@ -315,7 +315,8 @@ chmod 0755 "$download_bin/curl"
 saved_source_root=${DOT_SOURCE_ROOT:-$root}
 DOT_SOURCE_ROOT=$download_root
 PATH="$download_bin:$PATH" DOT_TEST_DOWNLOAD_SOURCE=$download_source \
-  DOT_TEST_DOWNLOAD_LOG=$download_log _dot_shdeps_download_installer
+  DOT_TEST_DOWNLOAD_LOG=$download_log DOT_SHDEPS_UPDATE_POLICY=latest \
+  _dot_shdeps_download_installer
 downloaded_installer=$REPLY
 assert_files_equal "$download_source" "$downloaded_installer" \
   'pinned provider download changed installer bytes'
@@ -567,7 +568,7 @@ dev_hash=$(_dot_shdeps_sha256 "$dev_checkout/install.sh")
 printf 'revision=%s\ninstall_sha256=%s\nabi=1\n' "$dev_revision" "$dev_hash" \
   >"$provider_fixture/support/shdeps.lock"
 printf 'dirty but trusted development note\n' >"$dev_checkout/NOTES"
-unset SHDEPS_LIB
+SHDEPS_LIB=''
 DOT_SOURCE_ROOT=$provider_fixture
 SHDEPS_GIT_DEV_DIR=$dev_root
 HOME=$provider_home
@@ -599,5 +600,238 @@ assert_contains 'Shdeps installer is reviewed' "$provider_doctor_output" \
   'doctor accepts reviewed development installer'
 assert_contains 'Shdeps provider ABI' "$provider_doctor_output" \
   'doctor accepts pinned provider ABI'
+
+# The default policy keeps the immutable revision boundary. An otherwise
+# usable development checkout at a newer commit must not become executable
+# unless the client explicitly opts into following latest Shdeps.
+latest_fixture=$DOT_TEST_TMP/latest-provider-fixture
+latest_dev_root=$DOT_TEST_TMP/latest-dev-root
+latest_dev=$latest_dev_root/shdeps
+latest_installed=$DOT_TEST_TMP/latest-installed
+latest_force_marker=$DOT_TEST_TMP/latest-force
+latest_curl_marker=$DOT_TEST_TMP/latest-curl
+latest_bin=$DOT_TEST_TMP/latest-bin
+mkdir -p "$latest_fixture/support" "$latest_dev" "$latest_installed" "$latest_bin"
+cat >"$latest_dev/install.sh" <<'SCRIPT'
+case ${1:-} in
+  --bootstrap)
+    printf '%s\n' "${SHDEPS_FORCE:-0}" >"$DOT_TEST_LATEST_FORCE_MARKER"
+    _SHDEPSW_BIN=${BASH_SOURCE[0]%/*}/shdeps
+    shdeps_update() { :; }
+    ;;
+esac
+SCRIPT
+printf '# fixture library\n' >"$latest_dev/shdeps.sh"
+cat >"$latest_dev/shdeps" <<'SCRIPT'
+#!/usr/bin/env bash
+if [[ ${1:-} == __api && ${2:-} == version ]]; then
+  printf 'abi:1\n'
+  exit 0
+fi
+exit 2
+SCRIPT
+chmod 0755 "$latest_dev/shdeps"
+git -C "$latest_dev" init -q
+git -C "$latest_dev" config user.name fixture
+git -C "$latest_dev" config user.email fixture@example.invalid
+git -C "$latest_dev" remote add origin https://github.com/cgraf78/shdeps.git
+git -C "$latest_dev" add install.sh shdeps.sh shdeps
+git -C "$latest_dev" -c core.hooksPath=/dev/null commit -qm pinned
+latest_pinned_revision=$(git -C "$latest_dev" rev-parse HEAD)
+latest_pinned_hash=$(_dot_shdeps_sha256 "$latest_dev/install.sh")
+printf '# newer reviewed checkout installer\n' >>"$latest_dev/install.sh"
+printf 'ahead\n' >"$latest_dev/README"
+git -C "$latest_dev" add install.sh README
+git -C "$latest_dev" -c core.hooksPath=/dev/null commit -qm ahead
+latest_revision=$(git -C "$latest_dev" rev-parse HEAD)
+# CI environments are allowed to use a collaborative umask. Make this trusted
+# checkout fixture satisfy the production ownership/mode contract explicitly
+# instead of inheriting platform-specific group-write bits.
+chmod 0755 "$latest_dev" "$latest_dev/.git"
+chmod 0644 "$latest_dev/install.sh" "$latest_dev/shdeps.sh"
+printf 'revision=%s\ninstall_sha256=%s\nabi=1\n' \
+  "$latest_pinned_revision" "$latest_pinned_hash" \
+  >"$latest_fixture/support/shdeps.lock"
+cat >"$latest_bin/curl" <<'SCRIPT'
+#!/usr/bin/env bash
+: >"$DOT_TEST_LATEST_CURL_MARKER"
+exit 1
+SCRIPT
+chmod 0755 "$latest_bin/curl"
+
+pinned_ahead_result=$(
+  unset SHDEPS_LIB
+  DOT_SOURCE_ROOT=$latest_fixture
+  SHDEPS_GIT_DEV_DIR=$latest_dev_root
+  SHDEPS_DIR=$latest_installed
+  DOT_SHDEPS_UPDATE_POLICY=pinned
+  if _dot_shdeps_installer; then
+    printf 'selected\n'
+  else
+    printf 'rejected\n'
+  fi
+)
+assert_eq rejected "$pinned_ahead_result" \
+  'pinned policy rejects an ahead development checkout'
+
+latest_cron_output=$(
+  unset SHDEPS_LIB SHDEPS_FORCE DOT_FORCE
+  export DOT_SOURCE_ROOT=$latest_fixture
+  export SHDEPS_GIT_DEV_DIR=$latest_dev_root
+  export SHDEPS_DIR=$latest_installed
+  export DOT_SHDEPS_UPDATE_POLICY=latest
+  export DOT_TEST_LATEST_FORCE_MARKER=$latest_force_marker
+  export DOT_TEST_LATEST_CURL_MARKER=$latest_curl_marker
+  PATH="$latest_bin:$PATH"
+  export PATH
+  OVERLAYS=()
+  DOT_DEPENDENCY_PROVIDER=shdeps
+  _preflight_local_overlays() { :; }
+  _is_worktree_dirty() { return 1; }
+  _run_pre_sync_extensions() { :; }
+  _dot_update_sync_repos() { :; }
+  _dot_provider_consume_checkpoint() { :; }
+  _ensure_repo_config() { :; }
+  _link_overlays() { :; }
+  _run_shdeps_update_ui() {
+    DOT_UI_SHDEPS_STATUS=ok
+    DOT_UI_SHDEPS_SUMMARY='dependencies checked'
+  }
+  _shdeps_print_group_summaries() { :; }
+  _dot_active_revision() { printf '%s\n' "$latest_revision"; }
+  _dot_provider_maybe_reexec() { :; }
+  _run_merges() { :; }
+  _base_repo_exists() { return 1; }
+  _dot_update --cron
+)
+assert_eq '' "$latest_cron_output" \
+  'latest development checkout cron path remains quiet'
+assert_eq 1 "$(<"$latest_force_marker")" \
+  'latest development checkout forces Shdeps freshness without dot force'
+[[ ! -e $latest_curl_marker ]] ||
+  fail 'latest development checkout used the network bootstrap fallback'
+
+cat >"$latest_dev/shdeps" <<'SCRIPT'
+#!/usr/bin/env bash
+if [[ ${1:-} == __api && ${2:-} == version ]]; then
+  printf 'abi:2\n'
+  exit 0
+fi
+exit 2
+SCRIPT
+chmod 0755 "$latest_dev/shdeps"
+latest_abi_result=$(
+  unset SHDEPS_LIB SHDEPS_FORCE DOT_FORCE _SHDEPSW_BIN
+  export DOT_SOURCE_ROOT=$latest_fixture
+  export SHDEPS_GIT_DEV_DIR=$latest_dev_root
+  export SHDEPS_DIR=$latest_installed
+  export DOT_SHDEPS_UPDATE_POLICY=latest
+  export DOT_TEST_LATEST_FORCE_MARKER=$latest_force_marker
+  HOME=$provider_home
+  if _ensure_shdeps; then
+    printf 'accepted\n'
+  else
+    printf 'rejected\n'
+  fi
+)
+assert_eq rejected "$latest_abi_result" \
+  'latest development checkout still enforces the provider ABI'
+cat >"$latest_dev/shdeps" <<'SCRIPT'
+#!/usr/bin/env bash
+if [[ ${1:-} == __api && ${2:-} == version ]]; then
+  printf 'abi:1\n'
+  exit 0
+fi
+exit 2
+SCRIPT
+chmod 0755 "$latest_dev/shdeps"
+
+# Latest mode deliberately trusts the selected development checkout's contents,
+# but it must not select an arbitrary checkout merely because that checkout
+# occupies the conventional path. Repository identity remains a separate guard.
+git -C "$latest_dev" remote set-url origin https://github.com/example/shdeps.git
+foreign_latest_result=$(
+  unset SHDEPS_LIB
+  DOT_SOURCE_ROOT=$latest_fixture
+  SHDEPS_GIT_DEV_DIR=$latest_dev_root
+  SHDEPS_DIR=$latest_installed
+  DOT_SHDEPS_UPDATE_POLICY=latest
+  if _dot_shdeps_installer; then
+    printf 'selected\n'
+  else
+    printf 'rejected\n'
+  fi
+)
+assert_eq rejected "$foreign_latest_result" \
+  'latest policy rejects a foreign development checkout origin'
+git -C "$latest_dev" remote set-url origin https://github.com/cgraf78/shdeps.git
+
+chmod 0775 "$latest_dev"
+unsafe_latest_result=$(
+  unset SHDEPS_LIB
+  DOT_SOURCE_ROOT=$latest_fixture
+  SHDEPS_GIT_DEV_DIR=$latest_dev_root
+  SHDEPS_DIR=$latest_installed
+  DOT_SHDEPS_UPDATE_POLICY=latest
+  if _dot_shdeps_installer; then
+    printf 'selected\n'
+  else
+    printf 'rejected\n'
+  fi
+)
+assert_eq rejected "$unsafe_latest_result" \
+  'latest policy rejects a group-writable development checkout'
+chmod 0755 "$latest_dev"
+
+# Fleet clients commonly have only a managed release install. Latest mode must
+# force its bootstrap freshness check even when no development checkout exists.
+managed_fixture=$DOT_TEST_TMP/managed-provider-fixture
+managed_dev_root=$DOT_TEST_TMP/managed-dev-root
+managed_install=$DOT_TEST_TMP/managed-install/shdeps
+managed_force_marker=$DOT_TEST_TMP/managed-force
+managed_untrusted_marker=$DOT_TEST_TMP/managed-untrusted-dev
+mkdir -p "$managed_fixture/support" "$managed_dev_root" "$managed_install"
+cat >"$managed_install/install.sh" <<'SCRIPT'
+case ${1:-} in
+  --bootstrap)
+    printf '%s\n' "${SHDEPS_FORCE:-0}" >"$DOT_TEST_MANAGED_FORCE_MARKER"
+    if [[ -f $SHDEPS_GIT_DEV_DIR/shdeps/shdeps.sh ]]; then
+      : >"$DOT_TEST_MANAGED_UNTRUSTED_MARKER"
+    fi
+    _SHDEPSW_BIN=${BASH_SOURCE[0]%/*}/shdeps
+    shdeps_update() { :; }
+    ;;
+esac
+SCRIPT
+printf '# fixture library\n' >"$managed_install/shdeps.sh"
+cat >"$managed_install/shdeps" <<'SCRIPT'
+#!/usr/bin/env bash
+if [[ ${1:-} == __api && ${2:-} == version ]]; then
+  printf 'abi:1\n'
+  exit 0
+fi
+exit 2
+SCRIPT
+chmod 0755 "$managed_install/shdeps"
+managed_hash=$(_dot_shdeps_sha256 "$managed_install/install.sh")
+printf 'revision=%s\ninstall_sha256=%s\nabi=1\n' \
+  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$managed_hash" \
+  >"$managed_fixture/support/shdeps.lock"
+git clone -q "$latest_dev" "$managed_dev_root/shdeps"
+(
+  unset SHDEPS_LIB SHDEPS_FORCE DOT_FORCE
+  export DOT_SOURCE_ROOT=$managed_fixture
+  export SHDEPS_GIT_DEV_DIR=$managed_dev_root
+  export SHDEPS_DIR=$managed_install
+  export DOT_SHDEPS_UPDATE_POLICY=latest
+  export DOT_TEST_MANAGED_FORCE_MARKER=$managed_force_marker
+  export DOT_TEST_MANAGED_UNTRUSTED_MARKER=$managed_untrusted_marker
+  HOME=$provider_home
+  _ensure_shdeps
+)
+assert_eq 1 "$(<"$managed_force_marker")" \
+  'latest managed release forces freshness without dot force'
+[[ ! -e $managed_untrusted_marker ]] ||
+  fail 'managed release bootstrap rediscovered an untrusted development checkout'
 
 printf 'shdeps-provider-test: ok\n'
