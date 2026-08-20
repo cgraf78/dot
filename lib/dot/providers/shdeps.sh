@@ -1,6 +1,29 @@
 # shellcheck shell=bash
 # Optional Shdeps provider bootstrap pinned by the active dot release.
 
+# Provider selection mutates and exports these variables for Shdeps. Preserve
+# the process inputs separately so a later Dot re-exec can distinguish genuine
+# caller policy from values derived by the configuration being replaced.
+_DOT_SHDEPS_CALLER_FORCE_SET=${SHDEPS_FORCE+x}
+_DOT_SHDEPS_CALLER_FORCE=${SHDEPS_FORCE-}
+_DOT_SHDEPS_CALLER_LIB_SET=${SHDEPS_LIB+x}
+_DOT_SHDEPS_CALLER_LIB=${SHDEPS_LIB-}
+
+_dot_shdeps_restore_caller_env() {
+  if [[ $_DOT_SHDEPS_CALLER_FORCE_SET == x ]]; then
+    SHDEPS_FORCE=$_DOT_SHDEPS_CALLER_FORCE
+    export SHDEPS_FORCE
+  else
+    unset SHDEPS_FORCE
+  fi
+  if [[ $_DOT_SHDEPS_CALLER_LIB_SET == x ]]; then
+    SHDEPS_LIB=$_DOT_SHDEPS_CALLER_LIB
+    export SHDEPS_LIB
+  else
+    unset SHDEPS_LIB
+  fi
+}
+
 _dot_shdeps_lock_value() {
   local key=$1 line
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -369,6 +392,7 @@ _dot_provider_maybe_reexec() {
   # shellcheck disable=SC2016 # Evaluated by the selected interpreter.
   "$interpreter" --noprofile --norc -c \
     '[[ ${BASH_VERSINFO[0]} -ge 4 ]]' || return 1
+  _dot_shdeps_restore_caller_env
   export DOT_REEXEC_ONCE=1 DOT_REEXEC_EXPECTED_REVISION=$after
   exec "$interpreter" "$DOT_SOURCE_ROOT/lib/dot/main.sh" \
     "${DOT_ORIGINAL_ARGV[@]}"
