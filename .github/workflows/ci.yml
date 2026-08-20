@@ -100,22 +100,44 @@ jobs:
           HOME="$RUNNER_TEMP/home" XDG_STATE_HOME="$state" \
             /bin/bash "$prefix/bin/dot" --version
 
+  shdeps-lock:
+    name: Verify Shdeps lock
+    runs-on: ubuntu-24.04
+    # The raw installer fetch has a roughly 95-second inner maximum. Keep the
+    # singleton job bounded while leaving ample checkout and runner margin.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify changed Shdeps lock
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+        run: scripts/verify-shdeps-lock --if-changed "$EVENT_NAME" "$BASE_SHA"
+
   required:
     name: Required
     if: ${{ always() }}
-    needs: [shell, macos-bash32]
+    needs: [shell, macos-bash32, shdeps-lock]
     runs-on: ubuntu-24.04
     env:
       SHELL_RESULT: ${{ needs.shell.result }}
       BASH32_RESULT: ${{ needs.macos-bash32.result }}
+      SHDEPS_LOCK_RESULT: ${{ needs.shdeps-lock.result }}
     steps:
       - name: Require all compatibility checks
         shell: bash
         run: |-
           printf 'Shared shell CI: %s\n' "$SHELL_RESULT"
           printf 'Stock macOS Bash 3.2: %s\n' "$BASH32_RESULT"
+          printf 'Shdeps lock: %s\n' "$SHDEPS_LOCK_RESULT"
           test "$SHELL_RESULT" = success
           test "$BASH32_RESULT" = success
+          test "$SHDEPS_LOCK_RESULT" = success
 
   actions-sync:
     name: cgraf78/actions sync

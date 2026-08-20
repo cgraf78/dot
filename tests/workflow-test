@@ -15,4 +15,26 @@ if ! grep -Fq 'git -C "$origin" config receive.shallowUpdate true' "$workflow"; 
   fail 'the disposable installer origin must accept a depth-1 CI checkout'
 fi
 
+assert_eq 1 "$(grep -Fc 'name: Verify Shdeps lock' "$workflow")" \
+  'CI exposes exactly one stable singleton Shdeps lock check'
+grep -Fq 'fetch-depth: 0' "$workflow" ||
+  fail 'Shdeps lock change detection must have complete history'
+# shellcheck disable=SC2016 # The workflow must retain these literal expressions.
+grep -Fq 'EVENT_NAME: ${{ github.event_name }}' "$workflow" ||
+  fail 'Shdeps lock check must identify the triggering event'
+# shellcheck disable=SC2016 # The workflow must retain these literal expressions.
+grep -Fq "BASE_SHA: \${{ github.event.pull_request.base.sha || github.event.before || '' }}" "$workflow" ||
+  fail 'Shdeps lock check must compare the exact PR or push base'
+# shellcheck disable=SC2016 # The workflow must retain these literal shell variables.
+grep -Fq 'run: scripts/verify-shdeps-lock --if-changed "$EVENT_NAME" "$BASE_SHA"' \
+  "$workflow" || fail 'CI must delegate lock change detection to the verifier'
+grep -Fq 'needs: [shell, macos-bash32, shdeps-lock]' "$workflow" ||
+  fail 'Required must wait for the Shdeps lock check'
+# shellcheck disable=SC2016 # The workflow must retain this literal expression.
+grep -Fq 'SHDEPS_LOCK_RESULT: ${{ needs.shdeps-lock.result }}' "$workflow" ||
+  fail 'Required must receive the Shdeps lock result'
+# shellcheck disable=SC2016 # The workflow must retain this literal shell variable.
+grep -Fq 'test "$SHDEPS_LOCK_RESULT" = success' "$workflow" ||
+  fail 'Required must reject a failed Shdeps lock check'
+
 printf 'workflow-test: ok\n'
