@@ -25,13 +25,24 @@ _dot_shdeps_restore_caller_env() {
 }
 
 _dot_shdeps_lock_value() {
-  local key=$1 line
+  local key=$1 line index=0 revision='' install_sha256='' abi=''
   while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ "$line" == "$key="* ]] || continue
-    printf '%s\n' "${line#*=}"
-    return 0
+    index=$((index + 1))
+    case $index:$line in
+      1:revision=*) revision=${line#*=} ;;
+      2:install_sha256=*) install_sha256=${line#*=} ;;
+      3:abi=*) abi=${line#*=} ;;
+      *) return 1 ;;
+    esac
   done <"$DOT_SOURCE_ROOT/support/shdeps.lock"
-  return 1
+  [[ $index -eq 3 && $revision =~ ^[0-9a-f]{40}$ &&
+    $install_sha256 =~ ^[0-9a-f]{64}$ && $abi =~ ^[1-9][0-9]*$ ]] || return 1
+  case $key in
+    revision) printf '%s\n' "$revision" ;;
+    install_sha256) printf '%s\n' "$install_sha256" ;;
+    abi) printf '%s\n' "$abi" ;;
+    *) return 1 ;;
+  esac
 }
 
 _dot_shdeps_configure_env() {
