@@ -46,15 +46,13 @@ fi
 . "$DOT_SOURCE_ROOT/lib/dot/config.sh"
 
 dot_version() {
-  local version revision=unknown
+  local revision=unknown
 
-  IFS= read -r version <"$DOT_SOURCE_ROOT/VERSION" || version=unknown
   if command -v git >/dev/null 2>&1; then
     revision=$(_dot_source_git rev-parse --short=12 HEAD 2>/dev/null) ||
       revision=unknown
   fi
-  printf 'dot %s (source %s; config 1; extensions 1; library 1)\n' \
-    "$version" "$revision"
+  printf 'dot commit %s (config 1; extensions 1; library 1)\n' "$revision"
 }
 
 dot_help() {

@@ -7,8 +7,13 @@ set -euo pipefail
 
 HOME=$DOT_TEST_TMP/home
 mkdir -p "$HOME"
+source_revision=$(
+  git -c "safe.directory=$DOT_TEST_ROOT" -C "$DOT_TEST_ROOT" \
+    rev-parse --short=12 HEAD
+)
 version=$(HOME="$HOME" DOT_BASH="$BASH" "$DOT_TEST_ROOT/bin/dot" --version)
-assert_contains 'dot 0.1.0-dev' "$version" 'version product identity'
+assert_contains "dot commit $source_revision" "$version" \
+  'version product identity'
 assert_contains 'config 1; extensions 1; library 1' "$version" \
   'version interface inventory'
 
@@ -16,10 +21,10 @@ relative_state_version=$(
   HOME="$HOME" XDG_STATE_HOME=relative/state DOT_BASH="$BASH" \
     "$DOT_TEST_ROOT/bin/dot" --version
 )
-assert_contains 'dot 0.1.0-dev' "$relative_state_version" \
+assert_contains "dot commit $source_revision" "$relative_state_version" \
   'relative XDG state falls back through HOME before Bash resolution'
 
-source_revision=$(
+source_revision_full=$(
   git -c "safe.directory=$DOT_TEST_ROOT" -C "$DOT_TEST_ROOT" rev-parse HEAD
 )
 set +e
@@ -34,10 +39,10 @@ assert_eq 128 "$untrusted_source_status" \
 reexec_version=$(
   GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
-    HOME="$HOME" DOT_REEXEC_EXPECTED_REVISION=$source_revision \
+    HOME="$HOME" DOT_REEXEC_EXPECTED_REVISION=$source_revision_full \
     "$BASH" "$DOT_TEST_ROOT/lib/dot/main.sh" --version
 )
-assert_contains 'dot 0.1.0-dev' "$reexec_version" \
+assert_contains "dot commit $source_revision" "$reexec_version" \
   're-exec revision guard trusts the selected source checkout'
 
 set +e
@@ -62,7 +67,7 @@ relative_version=$(
   cd "$DOT_TEST_ROOT"
   CDPATH=.:/tmp HOME="$HOME" DOT_BASH="$BASH" bin/dot --version
 )
-assert_contains 'dot 0.1.0-dev' "$relative_version" \
+assert_contains "dot commit $source_revision" "$relative_version" \
   'relative launcher with inherited CDPATH'
 
 linked_admin=$DOT_TEST_TMP/linked-version-admin
@@ -75,15 +80,24 @@ git -C "$linked_admin" add README
 git -C "$linked_admin" -c core.hooksPath=/dev/null commit -qm fixture
 git -C "$linked_admin" worktree add -q -b linked-version "$linked_root"
 mkdir -p "$linked_root/lib/dot/public"
-cp "$DOT_TEST_ROOT/VERSION" "$linked_root/VERSION"
 cp "$DOT_TEST_ROOT/lib/dot/main.sh" "$linked_root/lib/dot/main.sh"
 cp "$DOT_TEST_ROOT/lib/dot/config.sh" "$linked_root/lib/dot/config.sh"
 cp "$DOT_TEST_ROOT/lib/dot/temp.sh" "$linked_root/lib/dot/temp.sh"
 cp "$DOT_TEST_ROOT/lib/dot/public/"*.sh "$linked_root/lib/dot/public/"
 linked_revision=$(git -C "$linked_root" rev-parse --short=12 HEAD)
 linked_version=$(HOME="$HOME" "$BASH" "$linked_root/lib/dot/main.sh" --version)
-assert_contains "source $linked_revision" "$linked_version" \
+assert_contains "dot commit $linked_revision" "$linked_version" \
   'linked-worktree runtime reports its source revision'
+
+non_git_root=$DOT_TEST_TMP/non-git-version-root
+mkdir -p "$non_git_root/lib/dot/public"
+cp "$DOT_TEST_ROOT/lib/dot/main.sh" "$non_git_root/lib/dot/main.sh"
+cp "$DOT_TEST_ROOT/lib/dot/config.sh" "$non_git_root/lib/dot/config.sh"
+cp "$DOT_TEST_ROOT/lib/dot/temp.sh" "$non_git_root/lib/dot/temp.sh"
+cp "$DOT_TEST_ROOT/lib/dot/public/"*.sh "$non_git_root/lib/dot/public/"
+non_git_version=$(HOME="$HOME" "$BASH" "$non_git_root/lib/dot/main.sh" --version)
+assert_contains 'dot commit unknown' "$non_git_version" \
+  'non-Git runtime reports an unknown commit'
 
 set +e
 nocase_output=$(HOME="$HOME" DOT_BASH="$BASH" \
