@@ -151,6 +151,17 @@ _ui_stage_update() {
       running \
       "$detail" \
       "$(_ui_elapsed "${DOT_UI_STAGE_STARTED:-${SECONDS:-0}}")"
+  elif [[ "${DOT_VERBOSE:-0}" -eq 1 ]]; then
+    # Non-interactive verbose callers cannot see carriage-return redraws.
+    # Emit only real state updates as newline progress; timer ticks remain
+    # silent, so CI gains evidence without a stream of duplicate heartbeats.
+    _ui_line \
+      "${DOT_UI_INDEX:-0}" \
+      "${DOT_UI_TOTAL:-0}" \
+      "${DOT_UI_STAGE_LABEL:-}" \
+      running \
+      "$detail" \
+      "$(_ui_elapsed "${DOT_UI_STAGE_STARTED:-${SECONDS:-0}}")"
   fi
 }
 
