@@ -191,7 +191,17 @@ _dot_update() {
 
   _run_pre_sync_extensions || return 1
 
-  _dot_update_sync_repos "$@" || update_status=1
+  if _dot_update_sync_repos "$@"; then
+    # The base pull may replace client policy. Reload it before overlay linking
+    # or provider selection so this invocation cannot continue under stale
+    # permissions or freshness policy.
+    if ! dot_config_load; then
+      _ui_done 1
+      return 1
+    fi
+  else
+    update_status=1
+  fi
   _dot_update_finalize "$update_status" || update_status=1
   return "$update_status"
 }

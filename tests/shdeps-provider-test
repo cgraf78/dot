@@ -85,6 +85,7 @@ option_probe=$(
     set -euo pipefail
     . "$DOT_TEST_ROOT/lib/dot/update.sh"
     _preflight_local_overlays() { :; }
+    dot_config_load() { :; }
     _ui_begin() { :; }
     _is_worktree_dirty() { return 1; }
     _run_pre_sync_extensions() { :; }
@@ -99,6 +100,71 @@ option_probe=$(
 )
 assert_eq $'sync-args=<passthrough>\nquiet=1 shdeps_quiet=1 force=1 shdeps_force=1' \
   "$option_probe" 'cron and force options reach provider orchestration'
+
+# A successful repository sync can replace the client configuration. Provider
+# selection in this same invocation must use the newly pulled policy rather
+# than the value loaded by main before the pull began.
+policy_sync_home=$DOT_TEST_TMP/provider-policy-sync-home
+policy_sync_config=$policy_sync_home/.config/dot/config
+mkdir -p "${policy_sync_config%/*}"
+
+policy_transition() (
+  local before=$1 after=$2
+  unset DOT_SHDEPS_UPDATE_POLICY SHDEPS_FORCE SHDEPS_LIB
+  # shellcheck source=../lib/dot/config.sh
+  . "$root/lib/dot/config.sh"
+  HOME=$policy_sync_home
+  export HOME
+  printf 'version=1\ndependency_provider=shdeps\nshdeps_update_policy=%s\n' \
+    "$before" >"$policy_sync_config"
+  dot_config_load
+
+  _preflight_local_overlays() { :; }
+  _ui_begin() { :; }
+  _run_pre_sync_extensions() { :; }
+  _dot_update_sync_repos() {
+    printf 'version=1\ndependency_provider=shdeps\nshdeps_update_policy=%s\n' \
+      "$after" >"$policy_sync_config"
+  }
+  _dot_update_finalize() {
+    _dot_shdeps_configure_env
+    printf 'policy=%s force=%s\n' \
+      "$DOT_SHDEPS_UPDATE_POLICY" "${SHDEPS_FORCE:-unset}"
+  }
+
+  _dot_update
+)
+
+assert_eq 'policy=latest force=1' "$(policy_transition pinned latest)" \
+  'repository sync applies pinned-to-latest policy before provider execution'
+assert_eq 'policy=pinned force=unset' "$(policy_transition latest pinned)" \
+  'repository sync applies latest-to-pinned policy before provider execution'
+
+invalid_policy_finalize=$DOT_TEST_TMP/provider-invalid-policy-finalize
+invalid_policy_status=0
+(
+  unset DOT_SHDEPS_UPDATE_POLICY SHDEPS_FORCE SHDEPS_LIB
+  # shellcheck source=../lib/dot/config.sh
+  . "$root/lib/dot/config.sh"
+  HOME=$policy_sync_home
+  export HOME
+  printf 'version=1\nshdeps_update_policy=pinned\n' >"$policy_sync_config"
+  dot_config_load
+
+  _preflight_local_overlays() { :; }
+  _ui_begin() { :; }
+  _run_pre_sync_extensions() { :; }
+  _dot_update_sync_repos() {
+    printf 'version=1\nshdeps_update_policy=invalid\n' >"$policy_sync_config"
+  }
+  _dot_update_finalize() { : >"$invalid_policy_finalize"; }
+
+  _dot_update
+) >/dev/null 2>&1 || invalid_policy_status=$?
+assert_eq 1 "$invalid_policy_status" \
+  'invalid policy pulled during repository sync fails the update'
+[[ ! -e $invalid_policy_finalize ]] ||
+  fail 'invalid pulled policy reached provider finalization'
 
 # Keep a compact characterization of the real Shdeps progress adapter here.
 # These cases protect user-visible recovery detail and the two synchronization
@@ -324,6 +390,48 @@ assert_eq "https://raw.githubusercontent.com/cgraf78/shdeps/$download_revision/i
   "$(<"$download_log")" 'provider download uses immutable reviewed revision'
 _dot_cleanup_remove_path "$downloaded_installer"
 DOT_SOURCE_ROOT=$saved_source_root
+
+# A provider-driven Dot re-exec must discard only values that Dot derived from
+# the prior policy. Otherwise a latest-to-pinned config transition can carry a
+# development library and forced freshness into the new pinned process.
+reexec_env_root=$DOT_TEST_TMP/provider-reexec-env-root
+reexec_derived_lib=$DOT_TEST_TMP/provider-derived/shdeps.sh
+mkdir -p "$reexec_env_root/lib/dot" "${reexec_derived_lib%/*}"
+: >"$reexec_derived_lib"
+cat >"$reexec_env_root/lib/dot/main.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+printf 'force=%s lib=%s\n' "${SHDEPS_FORCE-unset}" "${SHDEPS_LIB-unset}"
+SCRIPT
+chmod 0755 "$reexec_env_root/lib/dot/main.sh"
+
+derived_reexec_output=$(
+  export DOT_SOURCE_ROOT=$reexec_env_root
+  export SHDEPS_FORCE=1 SHDEPS_LIB=$reexec_derived_lib
+  DOT_ORIGINAL_ARGV=(update)
+  _dot_active_revision() {
+    printf '%s\n' 2222222222222222222222222222222222222222
+  }
+  _dot_provider_maybe_reexec 1111111111111111111111111111111111111111
+)
+assert_eq 'force=unset lib=unset' "$derived_reexec_output" \
+  'provider re-exec drops policy-derived Shdeps environment'
+
+caller_reexec_output=$(
+  SHDEPS_FORCE=0 SHDEPS_LIB=/caller/shdeps.sh \
+    bash --noprofile --norc -c '
+      set -euo pipefail
+      . "$1/lib/dot/providers/shdeps.sh"
+      export SHDEPS_FORCE=1 SHDEPS_LIB="$3"
+      DOT_SOURCE_ROOT=$2
+      DOT_ORIGINAL_ARGV=(update)
+      _dot_active_revision() {
+        printf "%s\n" 2222222222222222222222222222222222222222
+      }
+      _dot_provider_maybe_reexec 1111111111111111111111111111111111111111
+    ' bash "$root" "$reexec_env_root" "$reexec_derived_lib"
+)
+assert_eq 'force=0 lib=/caller/shdeps.sh' "$caller_reexec_output" \
+  'provider re-exec preserves caller-supplied Shdeps environment'
 
 # A guarded second source revision must durably checkpoint the observed
 # generation and stop before any consumer merge hook can run.
@@ -687,6 +795,7 @@ latest_cron_output=$(
   OVERLAYS=()
   DOT_DEPENDENCY_PROVIDER=shdeps
   _preflight_local_overlays() { :; }
+  dot_config_load() { :; }
   _is_worktree_dirty() { return 1; }
   _run_pre_sync_extensions() { :; }
   _dot_update_sync_repos() { :; }
