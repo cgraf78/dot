@@ -683,6 +683,19 @@ HOME=$provider_home
 _dot_shdeps_installer
 assert_eq "$dev_checkout/install.sh" "$REPLY" 'development provider installer selection'
 assert_eq "$dev_checkout/shdeps.sh" "$SHDEPS_LIB" 'development provider library selection'
+assert_eq pinned-dev "$_DOT_SHDEPS_INSTALLER_SOURCE" \
+  'development provider records pinned selector provenance'
+(
+  unset SHDEPS_LIB
+  _DOT_SHDEPS_INSTALLER_SOURCE=stale
+  SHDEPS_GIT_DEV_DIR=$DOT_TEST_TMP/provider-missing-dev
+  SHDEPS_DIR=$DOT_TEST_TMP/provider-missing-managed
+  if _dot_shdeps_installer; then
+    fail 'missing provider unexpectedly selected an installer'
+  fi
+  assert_eq unavailable "$_DOT_SHDEPS_INSTALLER_SOURCE" \
+    'failed provider selection clears stale provenance'
+)
 
 # Doctor uses the same reviewed installer selection but does not bootstrap or
 # mutate it. A sibling/development binary satisfying the pinned ABI is healthy.
@@ -708,6 +721,89 @@ assert_contains 'Shdeps installer is reviewed' "$provider_doctor_output" \
   'doctor accepts reviewed development installer'
 assert_contains 'Shdeps provider ABI' "$provider_doctor_output" \
   'doctor accepts pinned provider ABI'
+
+# Latest policy reports whether the trusted development revision still matches
+# Dot's fallback lock rather than describing every development checkout as
+# unpinned. This fixture is the exact reviewed revision above.
+latest_matching_doctor_output=$(
+  unset SHDEPS_LIB
+  DOT_SHDEPS_UPDATE_POLICY=latest
+  _dr_check_provider
+)
+assert_contains 'Shdeps update policy (latest)' "$latest_matching_doctor_output" \
+  'doctor reports latest policy for a matching development checkout'
+assert_contains 'Shdeps provider source (development checkout selected by Dot lock:' \
+  "$latest_matching_doctor_output" \
+  'doctor reports pinned development source for a matching checkout'
+assert_contains 'Shdeps development revision (matches Dot lock:' \
+  "$latest_matching_doctor_output" \
+  'doctor reports a latest development checkout matching the lock'
+
+# An invalid conventional development directory is warning-worthy, but update
+# ignores it and uses a reviewed managed provider when one is available. Doctor
+# must preserve both parts of that state instead of returning before validating
+# the provider that update will actually use.
+managed_doctor=$DOT_TEST_TMP/provider-managed
+invalid_doctor_dev_root=$DOT_TEST_TMP/provider-invalid-dev-root
+mkdir -p "$managed_doctor/target/debug" "$invalid_doctor_dev_root/shdeps"
+cp "$dev_checkout/install.sh" "$managed_doctor/install.sh"
+cp "$dev_checkout/shdeps.sh" "$managed_doctor/shdeps.sh"
+cp "$dev_checkout/target/debug/shdeps" "$managed_doctor/target/debug/shdeps"
+latest_managed_doctor_output=$(
+  SHDEPS_LIB=''
+  DOT_SHDEPS_UPDATE_POLICY=latest
+  SHDEPS_GIT_DEV_DIR=$invalid_doctor_dev_root
+  SHDEPS_DIR=$managed_doctor
+  _dr_check_provider
+)
+assert_contains 'Shdeps development checkout ignored' \
+  "$latest_managed_doctor_output" \
+  'doctor warns when latest policy ignores an invalid checkout'
+assert_contains 'Shdeps provider source (managed release via reviewed bootstrap)' \
+  "$latest_managed_doctor_output" \
+  'doctor continues with the managed provider after the warning'
+assert_contains 'Shdeps installer is reviewed' "$latest_managed_doctor_output" \
+  'doctor preserves reviewed installer diagnostics for managed latest mode'
+assert_contains 'Shdeps provider ABI' "$latest_managed_doctor_output" \
+  'doctor validates the managed fallback ABI after the warning'
+
+# Explicit SHDEPS_LIB is first-priority caller authority when its adjacent
+# installer still matches Dot's digest. Its provenance must remain explicit
+# even when the path happens to be the conventional, invalid development root.
+git -C "$dev_checkout" remote add origin https://github.com/example/shdeps.git
+explicit_dev_doctor_output=$(
+  SHDEPS_LIB=$dev_checkout/shdeps.sh
+  DOT_SHDEPS_UPDATE_POLICY=latest
+  SHDEPS_GIT_DEV_DIR=$dev_root
+  SHDEPS_DIR=$managed_doctor
+  _dr_check_provider
+)
+assert_contains 'Shdeps provider source (caller-selected reviewed installer:' \
+  "$explicit_dev_doctor_output" \
+  'doctor preserves explicit provider provenance at the development path'
+[[ $explicit_dev_doctor_output != *'trusted development checkout:'* ]] ||
+  fail 'doctor mislabeled an invalid explicit checkout as trusted latest source'
+[[ $explicit_dev_doctor_output != *'development checkout ignored'* ]] ||
+  fail 'doctor claimed the explicitly selected development checkout was ignored'
+git -C "$dev_checkout" remote remove origin
+
+explicit_provider=$DOT_TEST_TMP/provider-explicit
+mkdir -p "$explicit_provider/target/debug"
+cp "$dev_checkout/install.sh" "$explicit_provider/install.sh"
+cp "$dev_checkout/shdeps.sh" "$explicit_provider/shdeps.sh"
+cp "$dev_checkout/target/debug/shdeps" "$explicit_provider/target/debug/shdeps"
+explicit_external_doctor_output=$(
+  SHDEPS_LIB=$explicit_provider/shdeps.sh
+  DOT_SHDEPS_UPDATE_POLICY=latest
+  SHDEPS_GIT_DEV_DIR=$DOT_TEST_TMP/provider-no-dev-root
+  SHDEPS_DIR=$managed_doctor
+  _dr_check_provider
+)
+assert_contains 'Shdeps provider source (caller-selected reviewed installer:' \
+  "$explicit_external_doctor_output" \
+  'doctor reports explicit provider provenance outside managed locations'
+[[ $explicit_external_doctor_output != *'managed release via reviewed bootstrap'* ]] ||
+  fail 'doctor mislabeled an explicit provider as a managed release'
 
 # The default policy keeps the immutable revision boundary. An otherwise
 # usable development checkout at a newer commit must not become executable
