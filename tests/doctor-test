@@ -154,10 +154,10 @@ assert_contains 'temporary directory unavailable' "$mktemp_output" \
 
 rm -f "$extensions/doctor.d"/*.sh
 cat >"$extensions/doctor.d/10-duplicate.sh" <<'DOCTOR'
-doctor() { dot_doctor_ok first; }
+doctor() { dot_doctor_ok duplicate-extension-first-ran; }
 DOCTOR
 cat >"$extensions/doctor.d/20-duplicate.sh" <<'DOCTOR'
-doctor() { dot_doctor_ok second; }
+doctor() { dot_doctor_ok duplicate-extension-second-ran; }
 DOCTOR
 set +e
 output=$(run_dot "$home" "$state" doctor 2>&1)
@@ -166,7 +166,8 @@ set -e
 assert_eq 1 "$duplicate_status" 'duplicate doctor identity is fatal'
 assert_contains 'doctor extension discovery failed' "$output" \
   'duplicate doctor identity is reported'
-[[ $output != *'first'* && $output != *'second'* ]] ||
+[[ $output != *'duplicate-extension-first-ran'* &&
+  $output != *'duplicate-extension-second-ran'* ]] ||
   fail 'duplicate doctor inventory ran an extension'
 
 rm -f "$extensions/doctor.d"/*.sh
