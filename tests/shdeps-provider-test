@@ -66,6 +66,19 @@ env_probe=$(
 assert_eq "force=1 quiet=1 config=$provider_home/.config/shdeps" "$env_probe" \
   'provider forwards force and quiet through resolved XDG config'
 
+latest_env_probe=$(
+  HOME=$provider_home XDG_CONFIG_HOME='' DOT_SHDEPS_UPDATE_POLICY=latest \
+    bash --noprofile --norc -c '
+      set -euo pipefail
+      . "$1/lib/dot/public/xdg.sh"
+      . "$1/lib/dot/providers/shdeps.sh"
+      _dot_shdeps_configure_env
+      printf "force=%s\n" "${SHDEPS_FORCE:-unset}"
+    ' -- "$root"
+)
+assert_eq 'force=unset' "$latest_env_probe" \
+  'latest provider policy does not force dependency updates'
+
 jobs_probe=$(
   DOT_UPDATE_JOBS=7 bash --noprofile --norc -c '
     set -euo pipefail
@@ -135,8 +148,8 @@ policy_transition() (
   _dot_update
 )
 
-assert_eq 'policy=latest force=1' "$(policy_transition pinned latest)" \
-  'repository sync applies pinned-to-latest policy before provider execution'
+assert_eq 'policy=latest force=unset' "$(policy_transition pinned latest)" \
+  'repository sync applies latest policy without forcing dependency updates'
 assert_eq 'policy=pinned force=unset' "$(policy_transition latest pinned)" \
   'repository sync applies latest-to-pinned policy before provider execution'
 
@@ -1036,14 +1049,19 @@ latest_dev_root=$DOT_TEST_TMP/latest-dev-root
 latest_dev=$latest_dev_root/shdeps
 latest_installed=$DOT_TEST_TMP/latest-installed
 latest_force_marker=$DOT_TEST_TMP/latest-force
+latest_dependency_force_marker=$DOT_TEST_TMP/latest-dependency-force
+latest_bootstrap_force_marker=$DOT_TEST_TMP/latest-bootstrap-force
 latest_curl_marker=$DOT_TEST_TMP/latest-curl
 latest_bin=$DOT_TEST_TMP/latest-bin
 mkdir -p "$latest_fixture/support" "$latest_dev" "$latest_installed" "$latest_bin"
 cat >"$latest_dev/install.sh" <<'SCRIPT'
 case ${1:-} in
   --bootstrap)
-    printf '%s\n' "${SHDEPS_FORCE:-0}" >"$DOT_TEST_LATEST_FORCE_MARKER"
+    printf '%s\n' "${SHDEPS_BOOTSTRAP_FORCE:-0}" \
+      >"$DOT_TEST_LATEST_FORCE_MARKER"
+    _SHDEPSW_FORCE=${SHDEPS_FORCE:-0}
     _SHDEPSW_BIN=${BASH_SOURCE[0]%/*}/shdeps
+    shdeps_force() { [[ "${SHDEPS_FORCE:-${_SHDEPSW_FORCE:-0}}" == 1 ]]; }
     shdeps_update() { :; }
     ;;
 esac
@@ -1107,7 +1125,10 @@ latest_cron_output=$(
   export SHDEPS_GIT_DEV_DIR=$latest_dev_root
   export SHDEPS_DIR=$latest_installed
   export DOT_SHDEPS_UPDATE_POLICY=latest
+  export SHDEPS_BOOTSTRAP_FORCE=0
   export DOT_TEST_LATEST_FORCE_MARKER=$latest_force_marker
+  export DOT_TEST_LATEST_DEPENDENCY_FORCE_MARKER=$latest_dependency_force_marker
+  export DOT_TEST_LATEST_BOOTSTRAP_FORCE_MARKER=$latest_bootstrap_force_marker
   export DOT_TEST_LATEST_CURL_MARKER=$latest_curl_marker
   PATH="$latest_bin:$PATH"
   export PATH
@@ -1122,6 +1143,13 @@ latest_cron_output=$(
   _ensure_repo_config() { :; }
   _link_overlays() { :; }
   _run_shdeps_update_ui() {
+    printf '%s\n' "${SHDEPS_BOOTSTRAP_FORCE:-unset}" \
+      >"$DOT_TEST_LATEST_BOOTSTRAP_FORCE_MARKER"
+    if shdeps_force; then
+      printf 'forced\n' >"$DOT_TEST_LATEST_DEPENDENCY_FORCE_MARKER"
+    else
+      printf 'normal\n' >"$DOT_TEST_LATEST_DEPENDENCY_FORCE_MARKER"
+    fi
     DOT_UI_SHDEPS_STATUS=ok
     DOT_UI_SHDEPS_SUMMARY='dependencies checked'
   }
@@ -1136,6 +1164,10 @@ assert_eq '' "$latest_cron_output" \
   'latest development checkout cron path remains quiet'
 assert_eq 1 "$(<"$latest_force_marker")" \
   'latest development checkout forces Shdeps freshness without dot force'
+assert_eq normal "$(<"$latest_dependency_force_marker")" \
+  'latest development checkout does not force dependency updates'
+assert_eq 0 "$(<"$latest_bootstrap_force_marker")" \
+  'latest development checkout restores the caller bootstrap force value'
 [[ ! -e $latest_curl_marker ]] ||
   fail 'latest development checkout used the network bootstrap fallback'
 
@@ -1265,7 +1297,8 @@ mkdir -p "$managed_fixture/support" "$managed_dev_root" "$managed_install"
 cat >"$managed_install/install.sh" <<'SCRIPT'
 case ${1:-} in
   --bootstrap)
-    printf '%s\n' "${SHDEPS_FORCE:-0}" >"$DOT_TEST_MANAGED_FORCE_MARKER"
+    printf '%s\n' "${SHDEPS_BOOTSTRAP_FORCE:-0}" \
+      >"$DOT_TEST_MANAGED_FORCE_MARKER"
     if [[ -f $SHDEPS_GIT_DEV_DIR/shdeps/shdeps.sh ]]; then
       : >"$DOT_TEST_MANAGED_UNTRUSTED_MARKER"
     fi
