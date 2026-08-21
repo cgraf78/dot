@@ -37,6 +37,12 @@ _SHDEPS_KNOWN_GROUPS=(packages github-releases github-repos cargo go uv npm cust
 # conservative process/status polling fallback below.
 _SHDEPS_PROGRESS_COMPLETE=$'\036dot-shdeps-progress-complete'
 
+# Interactive prompts cross two output channels: JSONL reaches this adapter,
+# while sudo writes directly to the controlling terminal. A private FIFO lets
+# shdeps wait until Dot has stopped redrawing and cleared its live row. Keep the
+# FIFO open read/write in the parent so opening either side cannot deadlock and
+# an older shdeps that ignores the environment variable remains compatible.
+
 _shdeps_summary_text() {
   local changed="$1" current="$2" skipped="$3" failed="$4" warnings="${5:-0}"
   local -a parts=()
@@ -50,6 +56,11 @@ _shdeps_summary_text() {
 
 _shdeps_prompt_pause() {
   DOT_UI_SHDEPS_PROMPT_ACTIVE=1
+  _ui_clear_live
+  if [[ ${DOT_UI_SHDEPS_PROMPT_ACK_FD:-} =~ ^[0-9]+$ ]]; then
+    # This token is the cross-project protocol; Shdeps rejects anything else.
+    printf 'ready\n' >&"$DOT_UI_SHDEPS_PROMPT_ACK_FD"
+  fi
 }
 
 _shdeps_prompt_resume() {
@@ -62,6 +73,7 @@ _shdeps_ui_reset() {
   DOT_UI_SHDEPS_HAS_JQ=0
   command -v jq >/dev/null 2>&1 && DOT_UI_SHDEPS_HAS_JQ=1
   _shdeps_prompt_resume
+  unset DOT_UI_SHDEPS_PROMPT_ACK_FD
   DOT_UI_SHDEPS_GROUP_ORDER=()
   declare -gA DOT_UI_SHDEPS_GROUP_SEEN=()
   declare -gA DOT_UI_SHDEPS_GROUP_LABELS=()
@@ -343,7 +355,7 @@ _shdeps_update_finished() {
 }
 
 _run_shdeps_update_ui() {
-  local status_file="" fifo="" tmpdir=""
+  local status_file="" fifo="" prompt_ack_fifo="" tmpdir=""
   _dot_update_prepare_shdeps_jobs
   if ! _dot_cleanup_mktemp -d 2>/dev/null; then
     _run_shdeps_update_command
@@ -352,21 +364,26 @@ _run_shdeps_update_ui() {
   tmpdir=$REPLY
   status_file="$tmpdir/status"
   fifo="$tmpdir/progress"
-  if ! mkfifo "$fifo" 2>/dev/null; then
+  prompt_ack_fifo="$tmpdir/prompt-ack"
+  if ! mkfifo "$fifo" "$prompt_ack_fifo" 2>/dev/null; then
     _dot_cleanup_remove_path "$tmpdir" || true
+    _ui_clear_live
     _run_shdeps_update_command
     return $?
   fi
   _shdeps_ui_reset
-  local line partial='' progress_fd child rc=0
+  local line partial='' progress_fd prompt_ack_fd child rc=0
   _dot_cleanup_begin_registration
   exec {progress_fd}<>"$fifo"
   _dot_cleanup_register_fd "$progress_fd"
+  exec {prompt_ack_fd}<>"$prompt_ack_fifo"
+  _dot_cleanup_register_fd "$prompt_ack_fd"
   _dot_cleanup_end_registration
+  DOT_UI_SHDEPS_PROMPT_ACK_FD=$prompt_ack_fd
   _dot_cleanup_begin_job_launch
   (
     _dot_cleanup_prepare_subshell
-    _run_shdeps_update_command jsonl >"$fifo"
+    _run_shdeps_update_command jsonl "$prompt_ack_fifo" >"$fifo"
     printf '%s' "$?" >"$status_file"
     printf '%s\n' "$_SHDEPS_PROGRESS_COMPLETE" >"$fifo"
   ) <&"$DOT_CLEANUP_LAUNCH_STDIN_FD" &
@@ -415,6 +432,8 @@ _run_shdeps_update_ui() {
   wait "$child" 2>/dev/null || true
   _dot_cleanup_unregister_pid "$child"
   _dot_cleanup_close_fd "$progress_fd"
+  unset DOT_UI_SHDEPS_PROMPT_ACK_FD
+  _dot_cleanup_close_fd "$prompt_ack_fd"
   _shdeps_print_verbose_items
   rc=$(cat "$status_file" 2>/dev/null || printf '1')
   _dot_cleanup_remove_path "$tmpdir" || true
@@ -423,14 +442,25 @@ _run_shdeps_update_ui() {
 
 _run_shdeps_update_command() {
   local progress_mode="${1:-}"
+  local prompt_ack_fifo="${2:-}"
   if [[ "${DOT_SHDEPS_ALLOW_GH_AUTH_TOKEN:-0}" -eq 1 && -z "${SHDEPS_ALLOW_GH_AUTH_TOKEN+x}" ]]; then
     if [[ "$progress_mode" == "jsonl" ]]; then
-      SHDEPS_ALLOW_GH_AUTH_TOKEN=1 SHDEPS_NESTED=1 SHDEPS_PROGRESS=jsonl shdeps_update
+      if [[ -n "$prompt_ack_fifo" ]]; then
+        SHDEPS_ALLOW_GH_AUTH_TOKEN=1 SHDEPS_NESTED=1 SHDEPS_PROGRESS=jsonl \
+          SHDEPS_PROGRESS_PROMPT_ACK="$prompt_ack_fifo" shdeps_update
+      else
+        SHDEPS_ALLOW_GH_AUTH_TOKEN=1 SHDEPS_NESTED=1 SHDEPS_PROGRESS=jsonl shdeps_update
+      fi
     else
       SHDEPS_ALLOW_GH_AUTH_TOKEN=1 SHDEPS_NESTED=1 shdeps_update
     fi
   elif [[ "$progress_mode" == "jsonl" ]]; then
-    SHDEPS_NESTED=1 SHDEPS_PROGRESS=jsonl shdeps_update
+    if [[ -n "$prompt_ack_fifo" ]]; then
+      SHDEPS_NESTED=1 SHDEPS_PROGRESS=jsonl \
+        SHDEPS_PROGRESS_PROMPT_ACK="$prompt_ack_fifo" shdeps_update
+    else
+      SHDEPS_NESTED=1 SHDEPS_PROGRESS=jsonl shdeps_update
+    fi
   else
     SHDEPS_NESTED=1 shdeps_update
   fi
