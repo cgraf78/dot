@@ -205,18 +205,57 @@ assert_eq 1 "$invalid_policy_status" \
 
   _shdeps_ui_reset
   DOT_UI_LIVE_ACTIVE=1
-  prompt_output=$(
-    printf '[sudo] password for fixture-user:'
-    _handle_shdeps_event \
+  prompt_ack_fifo=$DOT_TEST_TMP/provider-prompt-ack-direct
+  prompt_output_file=$DOT_TEST_TMP/provider-prompt-output-direct
+  mkfifo "$prompt_ack_fifo"
+  exec {prompt_ack_fd}<>"$prompt_ack_fifo"
+  DOT_UI_SHDEPS_PROMPT_ACK_FD=$prompt_ack_fd
+  _handle_shdeps_event \
+    '{"event":"prompt","status":"running","detail":"waiting for sudo authentication"}' \
+    >"$prompt_output_file"
+  IFS= read -r -t 1 prompt_ack_token <&"$prompt_ack_fd" ||
+    fail 'provider UI did not acknowledge the prompt event'
+  assert_eq ready "$prompt_ack_token" \
+    'provider UI acknowledges prompt readiness with the protocol token'
+  assert_eq $'\r\033[K' "$(<"$prompt_output_file")" \
+    'provider UI clears the live row before acknowledging the prompt'
+  assert_eq 1 "$DOT_UI_SHDEPS_PROMPT_ACTIVE" \
+    'provider UI pauses redraw before an interactive prompt'
+  exec {prompt_ack_fd}>&-
+  unset DOT_UI_SHDEPS_PROMPT_ACK_FD
+
+  # The adapter owns the rendezvous FIFO and passes its path only to the
+  # nested JSONL update. Shdeps must not start terminal output until Dot has
+  # cleared its live row and returned the exact readiness token.
+  prompt_sync_output=$DOT_TEST_TMP/provider-prompt-sync-output
+  prompt_sync_observed=$DOT_TEST_TMP/provider-prompt-sync-observed
+  export DOT_TEST_PROMPT_SYNC_OUTPUT=$prompt_sync_output
+  export DOT_TEST_PROMPT_SYNC_OBSERVED=$prompt_sync_observed
+  shdeps_update() {
+    [[ -p ${SHDEPS_PROGRESS_PROMPT_ACK:-} ]] || return 21
+    printf '%s\n' \
       '{"event":"prompt","status":"running","detail":"waiting for sudo authentication"}'
-    printf '\nactive=%s' "$DOT_UI_SHDEPS_PROMPT_ACTIVE"
-  )
-  assert_contains '[sudo] password for fixture-user:' "$prompt_output" \
-    'provider UI prompt fixture uses a synthetic identity'
-  assert_contains 'active=1' "$prompt_output" \
-    'provider UI pauses redraw for an interactive prompt'
-  [[ "$prompt_output" != *$'\r\033[K'* ]] ||
-    fail 'provider UI cleared an interactive prompt'
+    local token=''
+    IFS= read -r -t 2 token <"$SHDEPS_PROGRESS_PROMPT_ACK" || return 22
+    [[ $token == ready ]] || return 23
+    grep -Fq $'\r\033[K' "$DOT_TEST_PROMPT_SYNC_OUTPUT" || return 24
+    printf 'ready\n' >"$DOT_TEST_PROMPT_SYNC_OBSERVED"
+    printf '%s\n' \
+      '{"event":"summary","status":"ok","changed":0,"current":0,"skipped":0,"failed":0}'
+  }
+  unset SHDEPS_PROGRESS_PROMPT_ACK
+  DOT_UI_FORCE_LIVE=1
+  DOT_UI_TICK_SECONDS=0.01
+  _ui_begin 5
+  _ui_stage_start Tools 'checking configured dependencies' >"$prompt_sync_output"
+  prompt_sync_status=0
+  _run_shdeps_update_ui >>"$prompt_sync_output" || prompt_sync_status=$?
+  assert_eq 0 "$prompt_sync_status" \
+    'provider UI completes a synchronized prompt rendezvous'
+  assert_eq ready "$(<"$prompt_sync_observed")" \
+    'provider UI clears live progress before releasing Shdeps to prompt'
+  [[ -z ${SHDEPS_PROGRESS_PROMPT_ACK+x} ]] ||
+    fail 'provider UI leaked its private prompt rendezvous path to the caller'
 
   # The producer writes this summary without a trailing newline. Its explicit
   # completion marker must still share and terminate the FIFO record without
