@@ -50,7 +50,10 @@ content sandbox. Shdeps checks and updates that checkout and rebuilds its
 binary when the checked-out revision changes. Without a valid development
 checkout, Dot keeps the locked installer digest as its bootstrap trust anchor
 and forces the managed release path to check for and activate the newest
-available release. Use `pinned` unless you control and trust the local checkout.
+available release. That force is scoped to provider bootstrap: ordinary
+dependency convergence still uses Shdeps' normal cache and update policy unless
+the caller explicitly requests `dot update --force` or sets `SHDEPS_FORCE`.
+Use `pinned` unless you control and trust the local checkout.
 
 Set `DOT_SHDEPS_UPDATE_POLICY` to `pinned` or `latest` for a process-local
 override; the environment value takes precedence over the config file. Invalid

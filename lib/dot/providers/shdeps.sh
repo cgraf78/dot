@@ -54,8 +54,7 @@ _dot_shdeps_configure_env() {
   SHDEPS_GIT_DEV_DIR=${SHDEPS_GIT_DEV_DIR:-$HOME/git}
   export SHDEPS_CONF_DIR SHDEPS_HOOKS_DIR SHDEPS_INSTALL_DIR
   export SHDEPS_BIN_DIR SHDEPS_GIT_DEV_DIR
-  if [[ "${DOT_FORCE:-0}" -eq 1 ||
-    "${DOT_SHDEPS_UPDATE_POLICY:-pinned}" == latest ]]; then
+  if [[ "${DOT_FORCE:-0}" -eq 1 ]]; then
     export SHDEPS_FORCE=1
   fi
   [[ "${DOT_QUIET:-0}" -eq 1 ]] && export SHDEPS_QUIET=1
@@ -336,7 +335,8 @@ _dot_shdeps_binary_abi() {
 }
 
 _ensure_shdeps() {
-  local installer temporary=false development
+  local installer temporary=false development bootstrap_status=0
+  local bootstrap_force_set bootstrap_force
 
   [[ "${DOT_DEPENDENCY_PROVIDER:-none}" == shdeps ]] || return 0
   _dot_shdeps_configure_env || return 1
@@ -361,8 +361,28 @@ _ensure_shdeps() {
     export SHDEPS_GIT_DEV_DIR
   fi
 
+  # Latest governs provider freshness, not dependency convergence. Use the
+  # installer-only control so the sourced Shdeps API never snapshots a global
+  # dependency force request.
+  bootstrap_force_set=${SHDEPS_BOOTSTRAP_FORCE+x}
+  bootstrap_force=${SHDEPS_BOOTSTRAP_FORCE-}
+  if [[ "${DOT_SHDEPS_UPDATE_POLICY:-pinned}" == latest ]]; then
+    export SHDEPS_BOOTSTRAP_FORCE=1
+  fi
+
   # shellcheck source=/dev/null
-  if ! . "$installer" --bootstrap; then
+  if . "$installer" --bootstrap; then
+    :
+  else
+    bootstrap_status=$?
+  fi
+  if [[ $bootstrap_force_set == x ]]; then
+    SHDEPS_BOOTSTRAP_FORCE=$bootstrap_force
+    export SHDEPS_BOOTSTRAP_FORCE
+  else
+    unset SHDEPS_BOOTSTRAP_FORCE
+  fi
+  if [[ $bootstrap_status -ne 0 ]]; then
     [[ "$temporary" == false ]] || _dot_cleanup_remove_path "$installer" || true
     return 1
   fi

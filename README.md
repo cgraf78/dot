@@ -70,6 +70,8 @@ with `shdeps_update_policy=latest`. Latest mode follows a validated local
 `cgraf78/shdeps` development checkout when present, treating that user-owned
 checkout's contents as trusted executable developer input. Otherwise it
 refreshes the managed release through Dot's pinned bootstrap trust anchor.
+This freshness check does not force every configured dependency to be checked;
+use `dot update --force` when dependency-wide forced convergence is intended.
 
 Only the versioned modules under `lib/dot/public` are sourceable APIs. All
 other shell files are private runtime implementation. See
