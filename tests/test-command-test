@@ -70,13 +70,87 @@ chmod 0755 "$extensions/tests"/*-test
 
 help=$(HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
   "$root/bin/dot" --help)
-assert_contains 'test             Run built-in and configured extension tests' \
+assert_contains 'test             Run configured tests; provider suite is opt-in' \
   "$help" 'help documents test command'
+test_help=$(HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+  "$root/bin/dot" test --help)
+assert_contains 'DOT_TEST_INCLUDE_PROVIDER=1' "$test_help" \
+  'test help documents provider opt-in'
 
 list=$(HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
   "$root/bin/dot" test --list)
 assert_eq $'dot\nduplicate\nfail\nincomplete\nmalformed\npass\nskip\ntrailing' "$list" \
   'test list includes built-in and extension suites deterministically'
+
+provider_root=$DOT_TEST_TMP/provider-root
+provider_home=$DOT_TEST_TMP/provider-home
+provider_extensions=$provider_home/extensions
+provider_marker=$DOT_TEST_TMP/provider-ran
+cp -R "$root" "$provider_root"
+mkdir -p "$provider_home/.config/dot" "$provider_extensions/tests"
+chmod 0700 "$provider_extensions" "$provider_extensions/tests"
+# shellcheck disable=SC2016 # Literal strict-config spelling under test.
+printf '%s\n' \
+  'version=1' \
+  'extension_api=1' \
+  'extensions_dir=$HOME/extensions' \
+  'dependency_provider=none' \
+  >"$provider_home/.config/dot/config"
+cat >"$provider_root/tests/run" <<'SUITE'
+#!/usr/bin/env bash
+set -euo pipefail
+: >"$DOT_TEST_PROVIDER_MARKER"
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+cat >"$provider_extensions/tests/client-test" <<'SUITE'
+#!/usr/bin/env bash
+set -euo pipefail
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+chmod 0755 \
+  "$provider_root/tests/run" \
+  "$provider_extensions/tests/client-test"
+
+default_output=$(HOME="$provider_home" XDG_STATE_HOME="$state" \
+  DOT_BASH="$BASH" DOT_TEST_PROVIDER_MARKER="$provider_marker" \
+  DOT_TEST_NO_COLOR=1 "$provider_root/bin/dot" test 2>&1)
+assert_contains 'client-test' "$default_output" \
+  'default test command runs configured client suites'
+[[ $default_output != *$'\n  ✓ dot '* ]] ||
+  fail 'default test command rendered the provider suite'
+[[ ! -e $provider_marker ]] ||
+  fail 'default test command ran the provider suite'
+
+explicit_provider_output=$(HOME="$provider_home" XDG_STATE_HOME="$state" \
+  DOT_BASH="$BASH" DOT_TEST_PROVIDER_MARKER="$provider_marker" \
+  DOT_TEST_NO_COLOR=1 "$provider_root/bin/dot" test dot 2>&1)
+assert_contains 'dot (' "$explicit_provider_output" \
+  'explicit provider selection runs the built-in suite'
+[[ -e $provider_marker ]] ||
+  fail 'explicit provider selection did not run the built-in suite'
+
+rm -f "$provider_marker"
+included_provider_output=$(HOME="$provider_home" XDG_STATE_HOME="$state" \
+  DOT_BASH="$BASH" DOT_TEST_PROVIDER_MARKER="$provider_marker" \
+  DOT_TEST_INCLUDE_PROVIDER=1 DOT_TEST_NO_COLOR=1 \
+  "$provider_root/bin/dot" test 2>&1)
+assert_contains 'client-test' "$included_provider_output" \
+  'provider opt-in retains configured client suites'
+assert_contains 'dot (' "$included_provider_output" \
+  'provider opt-in adds the built-in suite'
+[[ -e $provider_marker ]] ||
+  fail 'provider opt-in did not run the built-in suite'
+
+set +e
+invalid_provider_opt_in=$(HOME="$provider_home" XDG_STATE_HOME="$state" \
+  DOT_BASH="$BASH" DOT_TEST_INCLUDE_PROVIDER=yes DOT_TEST_NO_COLOR=1 \
+  "$provider_root/bin/dot" test 2>&1)
+invalid_provider_opt_in_status=$?
+set -e
+assert_eq 2 "$invalid_provider_opt_in_status" \
+  'provider opt-in rejects noncanonical values'
+assert_contains 'DOT_TEST_INCLUDE_PROVIDER must be 0 or 1' \
+  "$invalid_provider_opt_in" 'invalid provider opt-in is diagnosed'
 
 output=$(HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
   DOT_TEST_NO_COLOR=1 \
@@ -225,5 +299,75 @@ assert_eq 2 "$copied_status" \
   'copied linked-worktree metadata is not an authorized source home'
 assert_contains 'source home does not match the configured base repository' \
   "$copied_output" 'copied linked-worktree source home is diagnosed'
+
+parallel_root=$DOT_TEST_TMP/parallel-provider-root
+parallel_ready=$DOT_TEST_TMP/parallel-provider-ready
+parallel_explicit_home=$DOT_TEST_TMP/parallel-provider-home
+cp -R "$root" "$parallel_root"
+rm -f "$parallel_root"/tests/*-test
+mkdir -p "$parallel_ready" "$parallel_explicit_home"
+git config --file "$parallel_root/.gitconfig" --add safe.directory \
+  "$parallel_root"
+cat >"$parallel_root/tests/parallel-a-test" <<'SUITE'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -z ${DOT_TEST_SOURCE_HOME:-} ]]
+[[ -z ${DOT_TEST_RESULT_FILE:-} ]]
+[[ $HOME == "$DOT_PROVIDER_TEST_EXPECTED_HOME" ]]
+if [[ ${DOT_PROVIDER_VERIFY_SAFE_HOME:-0} == 1 ]]; then
+  GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
+    git -C "$DOT_PROVIDER_TEST_ROOT/.." rev-parse --is-inside-work-tree >/dev/null
+fi
+: >"$DOT_PROVIDER_PARALLEL_READY/a"
+deadline=$((SECONDS + 3))
+while [[ ! -e $DOT_PROVIDER_PARALLEL_READY/b && $SECONDS -lt $deadline ]]; do
+  sleep 0.05
+done
+[[ -e $DOT_PROVIDER_PARALLEL_READY/b ]]
+SUITE
+cat >"$parallel_root/tests/parallel-b-test" <<'SUITE'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -z ${DOT_TEST_SOURCE_HOME:-} ]]
+[[ -z ${DOT_TEST_RESULT_FILE:-} ]]
+[[ $HOME == "$DOT_PROVIDER_TEST_EXPECTED_HOME" ]]
+if [[ ${DOT_PROVIDER_VERIFY_SAFE_HOME:-0} == 1 ]]; then
+  GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
+    git -C "$DOT_PROVIDER_TEST_ROOT/.." rev-parse --is-inside-work-tree >/dev/null
+fi
+: >"$DOT_PROVIDER_PARALLEL_READY/b"
+deadline=$((SECONDS + 3))
+while [[ ! -e $DOT_PROVIDER_PARALLEL_READY/a && $SECONDS -lt $deadline ]]; do
+  sleep 0.05
+done
+[[ -e $DOT_PROVIDER_PARALLEL_READY/a ]]
+SUITE
+chmod 0755 "$parallel_root/tests/parallel-a-test" \
+  "$parallel_root/tests/parallel-b-test"
+set +e
+parallel_output=$(HOME="$parallel_explicit_home" \
+  DOT_PROVIDER_PARALLEL_READY="$parallel_ready" \
+  DOT_PROVIDER_TEST_EXPECTED_HOME="$parallel_explicit_home" \
+  "$parallel_root/bin/dot" test -v dot 2>&1)
+parallel_status=$?
+set -e
+assert_eq 0 "$parallel_status" \
+  'provider test entry point runs independent tests concurrently'
+assert_contains '2 passed' "$parallel_output" \
+  'parallel provider tests use the shared coordinator summary'
+
+rm -f "$parallel_ready/a" "$parallel_ready/b"
+set +e
+parallel_ci_output=$(HOME="$parallel_root" TMPDIR="$DOT_TEST_TMP/" \
+  DOT_PROVIDER_PARALLEL_READY="$parallel_ready" \
+  DOT_PROVIDER_TEST_EXPECTED_HOME="$parallel_root" \
+  DOT_PROVIDER_VERIFY_SAFE_HOME=1 \
+  "$parallel_root/tests/run" 2>&1)
+parallel_ci_status=$?
+set -e
+assert_eq 0 "$parallel_ci_status" \
+  'provider CI entry point isolates a checkout-valued HOME'
+assert_contains '2 passed' "$parallel_ci_output" \
+  'provider CI entry point retains parallel coordination'
 
 printf 'test-command-test: ok\n'

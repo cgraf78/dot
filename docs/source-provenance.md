@@ -55,7 +55,7 @@ an older file.
 | `tests/{doctor-test,shdeps-provider-test}` | Generic cases extracted from `core-doctor-test`, `core-test`, `core-reexec-test`, and provider/UI portions of the public suite | Application and environment checks remain client-owned |
 | `tests/{init-test,cli-test,config-test,install-test,client-launcher-test,library-test,examples-test,test-command-test,workflow-test}` | New standalone acceptance suites, informed by public bootstrap/launcher/XDG/workflow characterization | Use only synthetic users, repositories, hosts, and paths |
 | `tests/test-lifecycle-test` | Generic cases extracted from `dotfiles:.local/lib/dotfiles/tests/core/runner.sh` at `dotfiles-v2` | Covers filtering, priority, stdin closure, timeout, descendant cleanup, concurrent temp ownership, and CLI failures |
-| `tests/lib/{test.sh,repo.sh}` and `tests/run` | New standalone harness, adapted from public dotfiles test conventions | Checkout-local only; does not invoke client-owned tests |
+| `tests/lib/{test.sh,repo.sh}`, `tests/run`, and `tests/provider-suite-wrapper` | New standalone harness, adapted from public dotfiles test conventions | Checkout-local only; delegates provider files to the shared parallel coordinator and does not invoke client-owned tests |
 
 `tests/provenance-test` validates the revision and per-path inventories. It
 requires named full commit IDs in the revision inventory, compares the manifest

@@ -91,6 +91,12 @@ _run_suite() {
       "MISE_CACHE_DIR=${MISE_CACHE_DIR:-$DOT_TEST_HOST_HOME/.cache/mise}"
     )
   fi
+  if [[ ${suite_sources[$script]} == provider ]]; then
+    # The provider suite delegates to this same coordinator. Preserve an
+    # explicit caller cap without passing the outer scheduler's clamped value
+    # (one worker when `dot` is the only selected suite) into the nested run.
+    env_cmd+=("DOT_TEST_REQUESTED_JOBS=$requested_jobs")
+  fi
 
   suite_timeout=$(_dot_test_suite_timeout "${suite_sources[$script]}")
   timeout_supervisor=$DOT_SOURCE_ROOT/lib/dot/public/test-timeout-v1

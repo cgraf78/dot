@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+
+set -u
+
+name=${0##*/}
+test_file=${DOT_PROVIDER_TEST_ROOT:?DOT_PROVIDER_TEST_ROOT is required}/$name
+provider_home=${DOT_PROVIDER_TEST_HOME:?DOT_PROVIDER_TEST_HOME is required}
+reporter=${DOT_TEST_REPORTER:?DOT_TEST_REPORTER is required}
+
+# Provider tests are standalone programs, not nested client suites. Keep the
+# coordinator's result channel in this adapter and prevent its source-home,
+# scheduler, and timeout metadata from changing tests that launch Dot again.
+test_env=(
+  env
+  -u DOT_CLIENT_GIT_DIR
+  -u DOT_PROVIDER_TEST_HOME
+  -u DOT_TEST
+  -u DOT_TEST_DOT_ROOT
+  -u DOT_TEST_HOST_HOME
+  -u DOT_TEST_INCLUDE_PROVIDER
+  -u DOT_TEST_JOBS
+  -u DOT_TEST_PARALLEL
+  -u DOT_TEST_REPORTER
+  -u DOT_TEST_REQUESTED_JOBS
+  -u DOT_TEST_RESULT_FILE
+  -u DOT_TEST_SOURCE_HOME
+  -u DOT_TEST_STYLE
+  -u DOT_TEST_SUITE_TIMEOUT_SECONDS
+  -u DOT_TEST_SYSTEM_GIT
+  -u DOT_TEST_TESTS_DIR
+  -u DOT_TEST_TIMEOUT
+  "HOME=$provider_home"
+)
+status=0
+"${test_env[@]}" "$test_file" || status=$?
+
+if [[ $status -eq 0 ]]; then
+  "$reporter" complete 1 0
+else
+  "$reporter" complete 0 1
+fi
+exit "$status"
