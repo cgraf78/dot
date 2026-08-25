@@ -3,6 +3,21 @@
 # shellcheck disable=SC2034,SC2329
 
 _DOT_TEST_DIR=${BASH_SOURCE[0]%/*}/test
+
+_dot_test_suite_timeout() {
+  local source=$1
+
+  if [[ -n ${DOT_TEST_SUITE_TIMEOUT_SECONDS:-} ]]; then
+    printf '%s\n' "$DOT_TEST_SUITE_TIMEOUT_SECONDS"
+  elif [[ $source == provider ]]; then
+    # The built-in identity aggregates Dot's complete provider test corpus.
+    # Give slower macOS runners enough headroom while retaining a finite bound.
+    printf '900\n'
+  else
+    printf '300\n'
+  fi
+}
+
 # Built-in and client-extension test coordinator.
 #
 # Auto-discovers and runs all *-test scripts in ~/.local/lib/dotfiles/tests/.

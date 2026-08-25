@@ -92,7 +92,7 @@ _run_suite() {
     )
   fi
 
-  suite_timeout="${DOT_TEST_SUITE_TIMEOUT_SECONDS:-300}"
+  suite_timeout=$(_dot_test_suite_timeout "${suite_sources[$script]}")
   timeout_supervisor=$DOT_SOURCE_ROOT/lib/dot/public/test-timeout-v1
   if ! command -v python3 >/dev/null 2>&1 || [[ ! -x "$timeout_supervisor" ]]; then
     echo "dot test: suite timeout requires python3 and $timeout_supervisor" >&2
