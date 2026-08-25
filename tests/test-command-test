@@ -8,6 +8,16 @@ umask 077
 root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=lib/test.sh
 . "$root/tests/lib/test.sh"
+# shellcheck source=lib/dot/test.sh
+. "$root/lib/dot/test.sh"
+
+assert_eq 900 "$(_dot_test_suite_timeout provider)" \
+  'provider suite receives an aggregate-test timeout budget'
+assert_eq 300 "$(_dot_test_suite_timeout extension)" \
+  'extension suite keeps the standard timeout budget'
+assert_eq 7 "$(DOT_TEST_SUITE_TIMEOUT_SECONDS=7 \
+  _dot_test_suite_timeout provider)" \
+  'explicit suite timeout overrides provider policy'
 
 home=$DOT_TEST_TMP/home
 state=$DOT_TEST_TMP/state
