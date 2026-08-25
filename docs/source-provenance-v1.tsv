@@ -35,6 +35,8 @@ lib/dot/providers/shdeps-ui.sh	dotfiles:core/shdeps-ui.sh@dotfiles-v1
 lib/dot/providers/shdeps.sh	standalone:new
 lib/dot/public/api-v1.tsv	standalone:new
 lib/dot/public/api-version.sh	standalone:new
+lib/dot/public/test-reporter-v1	standalone:new
+lib/dot/public/test-timeout-v1	dotfiles:.local/lib/dotfiles/tests/timeout.py@dotfiles-v2
 lib/dot/public/ui.sh	dotfiles:core/ui.sh@dotfiles-v1
 lib/dot/public/variables-v1.tsv	standalone:new
 lib/dot/public/xdg.sh	dotfiles:core/xdg.sh@dotfiles-v1
@@ -50,6 +52,11 @@ lib/dot/reserved.sh	standalone:new
 lib/dot/resources.sh	dotfiles:core/resources.sh@dotfiles-v1
 lib/dot/run.sh	dotfiles:core/run.sh@dotfiles-v1
 lib/dot/runtime.sh	standalone:new
+lib/dot/test-api-v1.tsv	standalone:new
+lib/dot/test.sh	standalone:new
+lib/dot/test/discovery.sh	dotfiles:.local/lib/dotfiles/tests/run@dotfiles-v2+standalone
+lib/dot/test/runner.sh	dotfiles:.local/lib/dotfiles/tests/run@dotfiles-v2+standalone
+lib/dot/test/source.sh	dotfiles:.local/lib/dotfiles/tests/run@dotfiles-v2+standalone
 lib/dot/temp.sh	dotfiles:core/temp.sh@dotfiles-v1
 lib/dot/update-lock.sh	dotfiles:core/update-lock.sh@dotfiles-v1
 lib/dot/update.sh	dotfiles:core/update.sh@dotfiles-v1
@@ -81,5 +88,7 @@ tests/resources-test	dotfiles:tests/core-resource-cleanup-test@dotfiles-v1+stand
 tests/run	standalone:new
 tests/shdeps-lock-verifier-test	standalone:new
 tests/shdeps-provider-test	dotfiles:tests/core-test+core-reexec-test@dotfiles-v1+standalone
+tests/test-command-test	standalone:new
+tests/test-lifecycle-test	dotfiles:.local/lib/dotfiles/tests/core/runner.sh@dotfiles-v2+standalone
 tests/update-lock-test	dotfiles:tests/core-update-test@dotfiles-v1+standalone
 tests/workflow-test	standalone:new

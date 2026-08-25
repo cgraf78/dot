@@ -8,9 +8,10 @@ Version 1 discovers only these collections beneath that directory:
 - `pre-sync.d/`
 - `merge-hooks.d/`
 - `doctor.d/`
+- `tests/`
 
-Other directories—including client-owned `git-hooks/`, `sley-hooks/`, helper
-libraries, and tests—are ignored by the standalone engine.
+Other directories—including client-owned `git-hooks/`, `sley-hooks/`, and
+helper libraries—are ignored by the standalone engine.
 
 Hook names use an optional numeric ordering prefix plus a lowercase identity.
 `NAME.serial.sh` adds a barrier without changing the identity or lexical sort
@@ -63,6 +64,7 @@ reference:
 
 - [`hook-api-v1.tsv`](../lib/dot/hook-api-v1.tsv)
 - [`doctor-api-v1.tsv`](../lib/dot/doctor-api-v1.tsv)
+- [`test-api-v1.tsv`](../lib/dot/test-api-v1.tsv)
 
 Arguments are positional and must match the inventory exactly; fixed-arity
 helpers return 2 for misuse. Values printed by a helper go to stdout. Allocation
@@ -142,6 +144,30 @@ doctor() {
 The coordinator owns rendering, counters, ordering, and aggregate exit status;
 extensions must not inspect or mutate those internals. `dot_doctor_display_path`
 only formats a path for human output and has no filesystem side effects.
+
+Test extensions are executable `tests/*-test` programs. `dot test` runs the
+provider-owned `dot` suite plus those client suites, in parallel by default;
+exact and prefix filters select a subset. Each suite receives isolated temp,
+cache, and state roots, closed stdin, `DOT_TEST_HOST_HOME`,
+`DOT_TEST_SOURCE_HOME`, and an absolute `DOT_TEST_REPORTER`.
+`DOT_TEST_TIMEOUT` names the same portable, versioned timeout command used by
+the coordinator for suites that need bounded subcommands; its first argument
+must be a finite positive duration in seconds, optionally suffixed with `s`,
+`m`, `h`, or `d`. Set `DOT_TEST_TIMEOUT_EXPIRED_FILE` to a private path when a
+caller must distinguish an enforced deadline from a child that itself exits
+124; the command clears stale marker state before launch, removes the variable
+from the child's environment, and creates the marker only for an actual
+timeout. A suite must invoke the reporter exactly once with
+`complete PASSED FAILED` or `skip [REASON]`. Exit zero without a valid record is
+an incomplete failure, so display prose is never parsed as machine state. The
+runner enforces a bounded timeout and terminates the suite process session on
+timeout or cancellation.
+
+The optional header `# dot-suite-priority: early` places a suite in the first
+parallel worker wave without changing deterministic order within that wave.
+Extensions execute as standalone programs with their declared interpreter and
+normal user authority; they are trust-validated and isolated from one another,
+not sandboxed.
 
 The inventories remain machine-readable so CI can reject accidental additions,
 removals, or signature drift. Extensions execute with the full authority of the

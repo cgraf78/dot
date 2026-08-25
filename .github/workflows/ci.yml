@@ -43,6 +43,7 @@ jobs:
             support/install-checkout.sh \
             support/post-install.sh \
             lib/dot/public/api-version.sh \
+            lib/dot/public/test-reporter-v1 \
             lib/dot/public/ui.sh \
             lib/dot/public/xdg.sh; do
             /bin/bash -n "$script"

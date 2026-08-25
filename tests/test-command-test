@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Trust fixtures must be secure independent of the caller's ambient umask.
+umask 077
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+
+home=$DOT_TEST_TMP/home
+state=$DOT_TEST_TMP/state
+extensions=$home/extensions
+mkdir -p "$home/.config/dot" "$extensions/tests"
+chmod 0700 "$extensions" "$extensions/tests"
+# shellcheck disable=SC2016 # Literal strict-config spelling under test.
+printf '%s\n' \
+  'version=1' \
+  'extension_api=1' \
+  'extensions_dir=$HOME/extensions' \
+  'dependency_provider=none' \
+  >"$home/.config/dot/config"
+
+cat >"$extensions/tests/pass-test" <<'SUITE'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'pass output\n'
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+cat >"$extensions/tests/skip-test" <<'SUITE'
+#!/usr/bin/env bash
+set -euo pipefail
+"$DOT_TEST_REPORTER" skip 'fixture unavailable'
+SUITE
+cat >"$extensions/tests/incomplete-test" <<'SUITE'
+#!/usr/bin/env bash
+printf 'human output is not a machine result\n'
+SUITE
+cat >"$extensions/tests/fail-test" <<'SUITE'
+#!/usr/bin/env bash
+set -euo pipefail
+"$DOT_TEST_REPORTER" complete 0 1
+SUITE
+cat >"$extensions/tests/malformed-test" <<'SUITE'
+#!/usr/bin/env bash
+printf 'not-a-result\n' >"$DOT_TEST_RESULT_FILE"
+SUITE
+cat >"$extensions/tests/duplicate-test" <<'SUITE'
+#!/usr/bin/env bash
+set -euo pipefail
+"$DOT_TEST_REPORTER" complete 1 0
+"$DOT_TEST_REPORTER" skip duplicate
+SUITE
+cat >"$extensions/tests/trailing-test" <<'SUITE'
+#!/usr/bin/env bash
+printf 'complete\t1\t0\n\n' >"$DOT_TEST_RESULT_FILE"
+SUITE
+chmod 0755 "$extensions/tests"/*-test
+
+help=$(HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+  "$root/bin/dot" --help)
+assert_contains 'test             Run built-in and configured extension tests' \
+  "$help" 'help documents test command'
+
+list=$(HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+  "$root/bin/dot" test --list)
+assert_eq $'dot\nduplicate\nfail\nincomplete\nmalformed\npass\nskip\ntrailing' "$list" \
+  'test list includes built-in and extension suites deterministically'
+
+output=$(HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+  DOT_TEST_NO_COLOR=1 \
+  "$root/bin/dot" test pass skip 2>&1)
+assert_contains 'pass-test' "$output" 'passing extension ran'
+assert_contains 'skip-test' "$output" 'skipping extension ran'
+assert_contains 'fixture unavailable' "$output" \
+  'structured skip reason is rendered'
+assert_contains '1 passed, 1 skipped' "$output" \
+  'structured extension results are summarized'
+
+set +e
+incomplete=$(HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+  DOT_TEST_NO_COLOR=1 \
+  "$root/bin/dot" test incomplete 2>&1)
+incomplete_status=$?
+set -e
+assert_eq 1 "$incomplete_status" 'missing machine result fails closed'
+assert_contains 'completed without a structured result' "$incomplete" \
+  'incomplete extension is diagnosed without parsing display text'
+
+set +e
+reported_failure=$(HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+  DOT_TEST_NO_COLOR=1 "$root/bin/dot" test fail 2>&1)
+reported_failure_status=$?
+set -e
+assert_eq 1 "$reported_failure_status" 'reported failure fails the command'
+assert_contains 'fail-test' "$reported_failure" \
+  'reported failure names the suite'
+
+for invalid_name in malformed duplicate trailing; do
+  set +e
+  invalid=$(HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+    DOT_TEST_NO_COLOR=1 "$root/bin/dot" test "$invalid_name" 2>&1)
+  invalid_status=$?
+  set -e
+  assert_eq 1 "$invalid_status" "$invalid_name result fails the command"
+  assert_contains "$invalid_name-test" "$invalid" \
+    "$invalid_name result names the suite"
+  if [[ $invalid_name == malformed || $invalid_name == trailing ]]; then
+    assert_contains 'emitted an invalid structured result' "$invalid" \
+      'malformed result is diagnosed'
+  fi
+done
+
+chmod 0777 "$extensions/tests/pass-test"
+set +e
+unsafe=$(HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+  "$root/bin/dot" test --list 2>&1)
+unsafe_status=$?
+set -e
+chmod 0755 "$extensions/tests/pass-test"
+assert_eq 1 "$unsafe_status" 'unsafe extension mode fails discovery'
+assert_contains 'unsafe test extension' "$unsafe" \
+  'unsafe extension mode is explained'
+
+protocol_result=$DOT_TEST_TMP/protocol-result
+: >"$protocol_result"
+chmod 0600 "$protocol_result"
+set +e
+DOT_TEST_RESULT_FILE=$protocol_result \
+  "$root/lib/dot/public/test-reporter-v1" complete 1 08
+noncanonical_status=$?
+set -e
+assert_eq 2 "$noncanonical_status" \
+  'result reporter rejects noncanonical numeric counts'
+assert_eq '' "$(<"$protocol_result")" \
+  'invalid result leaves the channel empty'
+
+seed=$DOT_TEST_TMP/source-seed
+origin=$DOT_TEST_TMP/source-origin.git
+client_home=$DOT_TEST_TMP/source-client
+source_home=$DOT_TEST_TMP/source-worktree
+mkdir -p "$seed/.local/lib/dotfiles/tests"
+git init -q "$seed"
+git -C "$seed" config user.name fixture
+git -C "$seed" config user.email fixture@example.invalid
+printf '# fixture helper\n' >"$seed/.local/lib/dotfiles/tests/helpers.sh"
+cat >"$seed/.local/lib/dotfiles/tests/source-test" <<'SUITE'
+#!/usr/bin/env bash
+printf 'HOME=%s\n' "$HOME"
+printf 'SOURCE=%s\n' "$DOT_TEST_SOURCE_HOME"
+printf 'HOST=%s\n' "$DOT_TEST_HOST_HOME"
+printf 'PATH=%s\n' "$PATH"
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+chmod 0755 "$seed/.local/lib/dotfiles/tests/source-test"
+git -C "$seed" add .local
+git -C "$seed" -c core.hooksPath=/dev/null commit -qm fixture
+git clone --bare -q "$seed" "$origin"
+git clone -q --separate-git-dir="$client_home/.dotfiles" \
+  "$origin" "$client_home"
+git --git-dir="$client_home/.dotfiles" config core.worktree "$client_home"
+git -C "$client_home" worktree add -q -b source-fixture "$source_home"
+
+source_output=''
+if ! source_output=$(
+  cd "$source_home"
+  HOME="$client_home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+    DOT_TEST_NO_COLOR=1 "$root/bin/dot" test -s source 2>&1
+); then
+  fail "cwd-discovered source suite failed: $source_output"
+fi
+assert_contains "HOME=$source_home" "$source_output" \
+  'cwd-discovered suite HOME is the linked worktree'
+assert_contains "SOURCE=$source_home" "$source_output" \
+  'cwd-discovered suite exports its source home'
+assert_contains "HOST=$client_home" "$source_output" \
+  'cwd-discovered suite preserves the client home'
+assert_contains "PATH=$source_home/.local/bin:" "$source_output" \
+  'cwd-discovered suite prefers source launchers'
+assert_contains ":$client_home/.local/bin" "$source_output" \
+  'cwd-discovered suite retains host launchers'
+
+explicit_output=$(HOME="$client_home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+  DOT_TEST_HOST_HOME="$DOT_TEST_TMP/forged-host" \
+  DOT_TEST_SOURCE_HOME="$source_home" DOT_TEST_NO_COLOR=1 \
+  "$root/bin/dot" test -s source 2>&1)
+assert_contains "HOME=$source_home" "$explicit_output" \
+  'explicit source home selects the linked worktree'
+assert_contains "HOST=$client_home" "$explicit_output" \
+  'caller HOME remains the authoritative host home'
+
+unrelated=$DOT_TEST_TMP/unrelated-source
+mkdir -p "$unrelated/.local/lib/dotfiles/tests"
+printf '# unrelated helper\n' >"$unrelated/.local/lib/dotfiles/tests/helpers.sh"
+git init -q "$unrelated"
+set +e
+unrelated_output=$(HOME="$client_home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+  DOT_TEST_SOURCE_HOME="$unrelated" "$root/bin/dot" test --list 2>&1)
+unrelated_status=$?
+set -e
+assert_eq 2 "$unrelated_status" \
+  'explicit source home must match the configured base repository'
+assert_contains 'source home does not match the configured base repository' \
+  "$unrelated_output" 'unrelated explicit source home is diagnosed'
+
+copied_source=$DOT_TEST_TMP/copied-source
+cp -R "$source_home" "$copied_source"
+set +e
+copied_output=$(HOME="$client_home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+  DOT_TEST_SOURCE_HOME="$copied_source" "$root/bin/dot" test --list 2>&1)
+copied_status=$?
+set -e
+assert_eq 2 "$copied_status" \
+  'copied linked-worktree metadata is not an authorized source home'
+assert_contains 'source home does not match the configured base repository' \
+  "$copied_output" 'copied linked-worktree source home is diagnosed'
+
+printf 'test-command-test: ok\n'

@@ -3,10 +3,34 @@
 set -euo pipefail
 
 root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+outer_result_file=${DOT_TEST_RESULT_FILE:-}
+outer_reporter=${DOT_TEST_REPORTER:-}
+
+# The built-in suite may itself be launched by `dot test` from a client
+# worktree. Provider tests create their own HOME and runner fixtures, so outer
+# coordinator metadata must not redirect those nested Dot invocations back to
+# the client under test.
+unset DOT_BASE_TOPOLOGY DOT_CLIENT_GIT_DIR DOT_CONFIG_VERSION
+unset DOT_DEPENDENCY_PROVIDER DOT_EXTENSION_API DOT_EXTENSIONS_DIR
+unset DOT_SHDEPS_UPDATE_POLICY
+unset DOT_TEST DOT_TEST_DOT_ROOT DOT_TEST_HOST_HOME DOT_TEST_JOBS
+unset DOT_TEST_PARALLEL DOT_TEST_REPORTER DOT_TEST_RESULT_FILE
+unset DOT_TEST_SOURCE_HOME DOT_TEST_STYLE DOT_TEST_SUITE_TIMEOUT_SECONDS
+unset DOT_TEST_SYSTEM_GIT DOT_TEST_TESTS_DIR DOT_TEST_TIMEOUT
+
 status=0
 for test_file in "$root"/tests/*-test; do
   [[ -f "$test_file" && -x "$test_file" ]] || continue
   printf '==> %s\n' "${test_file##*/}"
   "$test_file" || status=1
 done
+if [[ -n $outer_result_file ]]; then
+  if [[ $status -eq 0 ]]; then
+    DOT_TEST_RESULT_FILE=$outer_result_file \
+      "${outer_reporter:?DOT_TEST_REPORTER is required}" complete 1 0
+  else
+    DOT_TEST_RESULT_FILE=$outer_result_file \
+      "${outer_reporter:?DOT_TEST_REPORTER is required}" complete 0 1
+  fi
+fi
 exit "$status"

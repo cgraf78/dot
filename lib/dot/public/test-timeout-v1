@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Run one command under a portable process-group timeout."""
+
+from __future__ import annotations
+
+import math
+import os
+import signal
+import subprocess
+import sys
+import time
+from collections.abc import Sequence
+from pathlib import Path
+from types import FrameType
+
+process: subprocess.Popen | None = None
+interrupted_signal: int | None = None
+handled_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+PROCESS_SNAPSHOT_TIMEOUT_SECONDS = 1
+
+
+class ForwardedSignal(Exception):
+    """Indicate that the supervisor received a cancellation signal."""
+
+
+def parse_timeout(value: str) -> float:
+    """Convert a timeout value with an optional s, m, h, or d suffix."""
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    multiplier = units.get(value[-1:], 1)
+    if value[-1:] in units:
+        value = value[:-1]
+    timeout = float(value) * multiplier
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be finite and positive")
+    return timeout
+
+
+def capture_signal(signum: int, _frame: FrameType | None) -> None:
+    """Record cancellation and interrupt a blocking wait once a child exists."""
+    global interrupted_signal
+    interrupted_signal = signum
+    if process is not None:
+        raise ForwardedSignal
+
+
+def mark_timeout_expired() -> None:
+    """Record that the supervisor, rather than the child, produced status 124."""
+    marker = os.environ.get("DOT_TEST_TIMEOUT_EXPIRED_FILE")
+    if not marker:
+        return
+    try:
+        Path(marker).write_text("", encoding="utf-8")
+    except OSError:
+        # Failure to publish optional retry metadata must not replace the
+        # command's authoritative timeout status.
+        pass
+
+
+def clear_timeout_marker() -> bool:
+    """Remove stale marker state before starting a new supervised command."""
+    marker = os.environ.get("DOT_TEST_TIMEOUT_EXPIRED_FILE")
+    if not marker:
+        return True
+    try:
+        Path(marker).unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+def list_proc_session_pids(
+    session_id: int, proc_root: Path = Path("/proc")
+) -> list[int] | None:
+    """Return one Linux session's PIDs, or None when procfs is unavailable."""
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+
+    pids: list[int] = []
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            stat = (entry / "stat").read_bytes()
+        except FileNotFoundError:
+            # Processes can disappear while the snapshot is being collected.
+            continue
+        except OSError:
+            # A partial snapshot is not authoritative. Let the caller use its
+            # platform fallback instead of silently omitting a live member.
+            return None
+
+        # The command name is parenthesized arbitrary bytes and may itself
+        # contain spaces or parentheses. Split after its final closing
+        # delimiter; the remaining fields begin with state, parent PID,
+        # process group, and session ID.
+        delimiter = stat.rfind(b") ")
+        if delimiter < 0:
+            return None
+        fields = stat[delimiter + 2 :].split()
+        if len(fields) < 4:
+            return None
+        try:
+            pid = int(entry.name)
+            member_session = int(fields[3])
+        except ValueError:
+            return None
+        if member_session == session_id:
+            pids.append(pid)
+    return sorted(pids)
+
+
+def list_session_pids(session_id: int) -> list[int] | None:
+    """Return a portable PID snapshot for one session, or None when unavailable."""
+    pids = list_proc_session_pids(session_id)
+    if pids is not None:
+        return pids
+
+    try:
+        result = subprocess.run(
+            ["ps", "-A", "-o", "pid="],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+
+    pids = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 1:
+            return None
+        try:
+            pid = int(fields[0])
+        except ValueError:
+            return None
+        try:
+            if os.getsid(pid) == session_id:
+                pids.append(pid)
+        except (PermissionError, ProcessLookupError):
+            pass
+    return pids
+
+
+def stop_process_group(first_signal: int) -> None:
+    """Stop the entire child session, then reap its leader."""
+    assert process is not None
+    for handled_signal in handled_signals:
+        signal.signal(handled_signal, signal.SIG_IGN)
+
+    def send_process_group_signal(signum: int) -> bool:
+        """Signal the original process group when session enumeration is unavailable."""
+        # Once the leader has been reaped, its numeric process-group identity
+        # is no longer owned and may be reused. Fail closed instead of risking
+        # a signal to an unrelated same-user group.
+        if process.poll() is not None:
+            return False
+        try:
+            if os.getsid(process.pid) != process.pid:
+                return False
+        except (PermissionError, ProcessLookupError):
+            return False
+        try:
+            os.killpg(process.pid, signum)
+        except AttributeError:
+            try:
+                process.send_signal(signum)
+            except (PermissionError, ProcessLookupError):
+                return False
+        except (PermissionError, ProcessLookupError):
+            return False
+        return True
+
+    def send_signal(signum: int) -> bool:
+        """Signal revalidated members of the child session."""
+        pids = list_session_pids(process.pid)
+        if pids is None:
+            return send_process_group_signal(signum)
+
+        found_member = False
+        for pid in pids:
+            try:
+                # The snapshot is only a candidate. Re-check the SID
+                # immediately before signaling to reduce the PID-reuse window.
+                if os.getsid(pid) != process.pid:
+                    continue
+                found_member = True
+                os.kill(pid, signum)
+            except (PermissionError, ProcessLookupError):
+                pass
+        if found_member:
+            return True
+
+        # A portable PID snapshot can race with a still-running leader. The
+        # original process group remains a safe fallback because this wrapper
+        # created that leader and session itself.
+        if process.poll() is None:
+            return send_process_group_signal(signum)
+        return False
+
+    if not send_signal(first_signal):
+        process.wait()
+        return
+    time.sleep(1)
+    send_signal(signal.SIGKILL)
+    process.wait()
+
+
+def main(argv: Sequence[str]) -> int:
+    """Run the requested command and return a shell-compatible status."""
+    global process
+
+    if len(argv) < 3:
+        print("usage: test-timeout-v1 TIMEOUT COMMAND [ARG ...]", file=sys.stderr)
+        return 2
+    try:
+        timeout = parse_timeout(argv[1])
+    except (ValueError, OverflowError):
+        print(f"test-timeout-v1: invalid timeout: {argv[1]}", file=sys.stderr)
+        return 2
+    if not clear_timeout_marker():
+        print("test-timeout-v1: could not clear timeout marker", file=sys.stderr)
+        return 2
+    for handled_signal in handled_signals:
+        signal.signal(handled_signal, capture_signal)
+
+    child_env = os.environ.copy()
+    child_env.pop("DOT_TEST_TIMEOUT_EXPIRED_FILE", None)
+    try:
+        process = subprocess.Popen(argv[2:], start_new_session=True, env=child_env)
+    except FileNotFoundError:
+        return 127
+    except OSError:
+        return 126
+
+    try:
+        if interrupted_signal is not None:
+            raise ForwardedSignal
+        status = process.wait(timeout=timeout)
+    except ForwardedSignal:
+        assert interrupted_signal is not None
+        stop_process_group(interrupted_signal)
+        return 128 + interrupted_signal
+    except subprocess.TimeoutExpired:
+        mark_timeout_expired()
+        stop_process_group(signal.SIGTERM)
+        return 124
+
+    stop_process_group(signal.SIGTERM)
+    return status if status >= 0 else 128 - status
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

@@ -1,0 +1,634 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Trust fixtures must be secure independent of the caller's ambient umask.
+umask 077
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+
+home=$DOT_TEST_TMP/home
+state=$DOT_TEST_TMP/state
+mkdir -p "$home"
+
+run_tests() {
+  local tests=$1
+  shift
+  HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+    DOT_TEST_TESTS_DIR="$tests" DOT_TEST_NO_COLOR=1 \
+    "$root/bin/dot" test "$@"
+}
+
+timeout_command=$root/lib/dot/public/test-timeout-v1
+set +e
+"$timeout_command" >/dev/null 2>&1
+missing_timeout_status=$?
+"$timeout_command" nan true >/dev/null 2>&1
+nan_timeout_status=$?
+"$timeout_command" 0 true >/dev/null 2>&1
+zero_timeout_status=$?
+"$timeout_command" -1 true >/dev/null 2>&1
+negative_timeout_status=$?
+set -e
+assert_eq 2 "$missing_timeout_status" 'timeout command requires arguments'
+assert_eq 2 "$nan_timeout_status" 'timeout command rejects NaN'
+assert_eq 2 "$zero_timeout_status" 'timeout command rejects zero'
+assert_eq 2 "$negative_timeout_status" 'timeout command rejects negative values'
+
+timeout_fixture=$DOT_TEST_TMP/timeout-helper
+timeout_expired=$timeout_fixture/expired
+timeout_descendant_pid=$timeout_fixture/descendant.pid
+mkdir -p "$timeout_fixture"
+cat >"$timeout_fixture/child.py" <<'PY'
+#!/usr/bin/env python3
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+time.sleep(30)
+PY
+cat >"$timeout_fixture/parent.sh" <<'SUITE'
+#!/usr/bin/env bash
+trap 'exit 0' TERM
+python3 "$DOT_TEST_TIMEOUT_CHILD" "$DOT_TEST_TIMEOUT_DESCENDANT_PID" &
+wait
+SUITE
+chmod 0755 "$timeout_fixture/child.py" "$timeout_fixture/parent.sh"
+set +e
+DOT_TEST_TIMEOUT_EXPIRED_FILE=$timeout_expired \
+  DOT_TEST_TIMEOUT_CHILD=$timeout_fixture/child.py \
+  DOT_TEST_TIMEOUT_DESCENDANT_PID=$timeout_descendant_pid \
+  "$timeout_command" 1 "$timeout_fixture/parent.sh"
+timeout_status=$?
+set -e
+assert_eq 124 "$timeout_status" 'timeout command reports deadline expiration'
+[[ -e $timeout_expired ]] || fail 'timeout command did not publish expiration'
+timeout_descendant=$(<"$timeout_descendant_pid")
+deadline=$((SECONDS + 5))
+while process_is_live "$timeout_descendant" && ((SECONDS < deadline)); do
+  sleep 0.05
+done
+process_is_live "$timeout_descendant" &&
+  fail 'timeout command left a TERM-ignoring descendant running'
+
+printf 'stale\n' >"$timeout_expired"
+set +e
+DOT_TEST_TIMEOUT_EXPIRED_FILE=$timeout_expired \
+  "$timeout_command" 5 bash -c 'exit 124'
+child_124_status=$?
+set -e
+assert_eq 124 "$child_124_status" 'timeout command preserves child status 124'
+[[ ! -e $timeout_expired ]] ||
+  fail 'timeout command retained a stale expiration marker'
+# The child shell must receive the parameter expansion literally.
+# shellcheck disable=SC2016
+DOT_TEST_TIMEOUT_EXPIRED_FILE=$timeout_expired \
+  "$timeout_command" 5 bash -c \
+  '[[ -z ${DOT_TEST_TIMEOUT_EXPIRED_FILE+x} ]]'
+
+set +e
+"$timeout_command" 1 "$timeout_fixture/missing" \
+  2>"$timeout_fixture/exec-error"
+missing_command_status=$?
+set -e
+assert_eq 127 "$missing_command_status" \
+  'timeout command preserves missing executable status'
+assert_eq '' "$(<"$timeout_fixture/exec-error")" \
+  'missing executable does not emit a traceback'
+: >"$timeout_fixture/non-executable"
+chmod 0644 "$timeout_fixture/non-executable"
+set +e
+"$timeout_command" 1 "$timeout_fixture/non-executable" \
+  2>"$timeout_fixture/exec-error"
+non_executable_status=$?
+set -e
+assert_eq 126 "$non_executable_status" \
+  'timeout command preserves non-executable status'
+assert_eq '' "$(<"$timeout_fixture/exec-error")" \
+  'non-executable command does not emit a traceback'
+
+rm -f "$timeout_descendant_pid"
+DOT_TEST_TIMEOUT_CHILD=$timeout_fixture/child.py \
+  DOT_TEST_TIMEOUT_DESCENDANT_PID=$timeout_descendant_pid \
+  "$timeout_command" 30 "$timeout_fixture/parent.sh" &
+timeout_call_pid=$!
+deadline=$((SECONDS + 5))
+while [[ ! -s $timeout_descendant_pid && $SECONDS -lt $deadline ]]; do
+  sleep 0.05
+done
+[[ -s $timeout_descendant_pid ]] ||
+  fail 'timeout cancellation fixture did not start'
+kill -TERM "$timeout_call_pid"
+timeout_cancel_status=0
+wait "$timeout_call_pid" || timeout_cancel_status=$?
+assert_eq 143 "$timeout_cancel_status" \
+  'timeout cancellation preserves signal status'
+timeout_descendant=$(<"$timeout_descendant_pid")
+deadline=$((SECONDS + 5))
+while process_is_live "$timeout_descendant" && ((SECONDS < deadline)); do
+  sleep 0.05
+done
+process_is_live "$timeout_descendant" &&
+  fail 'timeout cancellation left a descendant running'
+
+python3 - "$timeout_command" <<'PY'
+import importlib.util
+import signal
+import subprocess
+import sys
+import tempfile
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+loader = SourceFileLoader("dot_timeout", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+
+with tempfile.TemporaryDirectory() as temporary:
+    proc_root = Path(temporary)
+    for pid, name, session in (
+        (123, "leader", 123),
+        (125, "other", 125),
+    ):
+        proc_dir = proc_root / str(pid)
+        proc_dir.mkdir()
+        (proc_dir / "stat").write_bytes(
+            f"{pid} ({name}) S 1 2 {session} 0 0 0\n".encode()
+        )
+    proc_dir = proc_root / "124"
+    proc_dir.mkdir()
+    (proc_dir / "stat").write_bytes(b"124 (worker \xff (nested)) S 1 2 123 0\n")
+    (proc_root / "not-a-pid").mkdir()
+    (proc_root / "126").mkdir()
+    assert module.list_proc_session_pids(123, proc_root) == [123, 124]
+
+with tempfile.TemporaryDirectory() as temporary:
+    proc_root = Path(temporary)
+    proc_dir = proc_root / "123"
+    proc_dir.mkdir()
+    (proc_dir / "stat").write_bytes(b"malformed\n")
+    assert module.list_proc_session_pids(123, proc_root) is None
+
+with tempfile.TemporaryDirectory() as temporary:
+    proc_root = Path(temporary)
+    proc_dir = proc_root / "123"
+    proc_dir.mkdir()
+    (proc_dir / "stat").write_bytes(b"123 (leader) S 1 2 123 0\n")
+    proc_dir = proc_root / "124"
+    proc_dir.mkdir()
+    (proc_dir / "stat").mkdir()
+    assert module.list_proc_session_pids(123, proc_root) is None
+
+assert module.list_proc_session_pids(123, Path("/missing/proc/root")) is None
+module.list_proc_session_pids = lambda _session_id: [123, 124]
+module.subprocess.run = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+    AssertionError("ps should not run when procfs is available")
+)
+assert module.list_session_pids(123) == [123, 124]
+module.list_proc_session_pids = lambda _session_id: None
+
+
+class PsResult:
+    stdout = "123\n124\n125\n"
+
+
+def run_ps(argv, **_kwargs):
+    assert argv == ["ps", "-A", "-o", "pid="]
+    return PsResult()
+
+
+module.subprocess.run = run_ps
+module.os.getsid = lambda pid: 123 if pid in (123, 124) else 125
+assert module.list_session_pids(123) == [123, 124]
+
+
+def timeout_ps(argv, **kwargs):
+    assert argv == ["ps", "-A", "-o", "pid="]
+    raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+
+module.subprocess.run = timeout_ps
+assert module.list_session_pids(123) is None
+
+
+class Process:
+    pid = 123
+    waited = False
+
+    def poll(self):
+        return None
+
+    def wait(self):
+        self.waited = True
+
+
+process = Process()
+module.process = process
+module.time.sleep = lambda _: None
+module.list_session_pids = lambda _session_id: []
+signals = []
+
+
+def killpg(_pid, signum):
+    signals.append(signum)
+    if signum == signal.SIGKILL:
+        raise PermissionError
+
+
+module.os.killpg = killpg
+module.stop_process_group(signal.SIGTERM)
+assert process.waited
+assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+process.poll = lambda: 0
+signals.clear()
+module.list_session_pids = lambda _session_id: None
+module.stop_process_group(signal.SIGTERM)
+assert signals == []
+PY
+
+suites=$DOT_TEST_TMP/suites
+mkdir -p "$suites"
+cat >"$suites/stdin-test" <<'SUITE'
+#!/usr/bin/env bash
+set -euo pipefail
+if IFS= read -r leaked; then
+  printf 'stdin leaked: %s\n' "$leaked" >&2
+  exit 1
+fi
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+chmod 0755 "$suites/stdin-test"
+printf 'caller input\n' >"$DOT_TEST_TMP/input"
+parallel=''
+if ! parallel=$(run_tests "$suites" stdin <"$DOT_TEST_TMP/input" 2>&1); then
+  fail "parallel closed-stdin suite failed: $parallel"
+fi
+assert_contains '1 passed' "$parallel" 'parallel suite receives closed stdin'
+sequential=$(run_tests "$suites" -s stdin <"$DOT_TEST_TMP/input" 2>&1)
+assert_contains '1 passed' "$sequential" 'sequential suite receives closed stdin'
+
+filters=$DOT_TEST_TMP/filters
+mkdir -p "$filters"
+for name in alpha alpha-extra; do
+  cat >"$filters/$name-test" <<'SUITE'
+#!/usr/bin/env bash
+set -euo pipefail
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+  chmod 0755 "$filters/$name-test"
+done
+filtered=$(run_tests "$filters" alpha alpha-extra 2>&1)
+assert_contains '2 passed' "$filtered" 'overlapping filters run each suite once'
+
+jobs=$DOT_TEST_TMP/jobs
+fake_bin=$DOT_TEST_TMP/jobs-bin
+mkdir -p "$jobs" "$fake_bin"
+for index in {1..25}; do
+  cat >"$jobs/job-$index-test" <<'SUITE'
+#!/usr/bin/env bash
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+  chmod 0755 "$jobs/job-$index-test"
+done
+cat >"$fake_bin/getconf" <<'SCRIPT'
+#!/usr/bin/env bash
+printf '64\n'
+SCRIPT
+chmod 0755 "$fake_bin/getconf"
+default_jobs=$(
+  unset DOT_TEST_JOBS
+  PATH="$fake_bin:$PATH" run_tests "$jobs" 2>&1
+)
+assert_contains 'Running 25 test suites with up to 24 jobs' "$default_jobs" \
+  'automatic worker selection is capped'
+explicit_jobs=$(PATH="$fake_bin:$PATH" DOT_TEST_JOBS=25 \
+  run_tests "$jobs" 2>&1)
+assert_contains 'Running 25 test suites with up to 25 jobs' "$explicit_jobs" \
+  'explicit worker selection overrides the cap'
+
+priority=$DOT_TEST_TMP/priority
+order=$DOT_TEST_TMP/order
+mkdir -p "$priority"
+cat >"$priority/alpha-test" <<'SUITE'
+#!/usr/bin/env bash
+printf 'alpha\n' >>"$DOT_TEST_ORDER"
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+cat >"$priority/zeta-test" <<'SUITE'
+#!/usr/bin/env bash
+# dot-suite-priority: early
+printf 'zeta\n' >>"$DOT_TEST_ORDER"
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+chmod 0755 "$priority"/*-test
+DOT_TEST_ORDER=$order DOT_TEST_JOBS=1 run_tests "$priority" >/dev/null
+assert_eq $'zeta\nalpha' "$(<"$order")" 'early suite enters first worker wave'
+: >"$order"
+DOT_TEST_ORDER=$order run_tests "$priority" -s >/dev/null
+assert_eq $'alpha\nzeta' "$(<"$order")" \
+  'sequential suite order remains lexical'
+
+race=$DOT_TEST_TMP/revalidate
+race_ready=$race/ready
+race_release=$race/release
+race_output=$race/output
+mkdir -p "$race"
+cat >"$race/alpha-test" <<'SUITE'
+#!/usr/bin/env bash
+: >"$DOT_TEST_RACE_READY"
+deadline=$((SECONDS + 5))
+while [[ ! -e $DOT_TEST_RACE_RELEASE && $SECONDS -lt $deadline ]]; do
+  sleep 0.05
+done
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+cat >"$race/beta-test" <<'SUITE'
+#!/usr/bin/env bash
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+chmod 0755 "$race"/*-test
+HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+  DOT_TEST_TESTS_DIR="$race" DOT_TEST_RACE_READY="$race_ready" \
+  DOT_TEST_RACE_RELEASE="$race_release" DOT_TEST_NO_COLOR=1 DOT_TEST_JOBS=1 \
+  "$root/bin/dot" test >"$race_output" 2>&1 &
+race_pid=$!
+deadline=$((SECONDS + 5))
+while [[ ! -e $race_ready && $SECONDS -lt $deadline ]]; do sleep 0.05; done
+[[ -e $race_ready ]] || fail 'launch revalidation fixture did not start'
+chmod 0777 "$race/beta-test"
+: >"$race_release"
+race_status=0
+wait "$race_pid" || race_status=$?
+assert_eq 1 "$race_status" 'unsafe replacement fails before execution'
+assert_contains 'test suite changed after discovery: beta-test' \
+  "$(<"$race_output")" 'launch boundary revalidates suite trust'
+
+abrupt=$DOT_TEST_TMP/abrupt
+mkdir -p "$abrupt"
+cat >"$abrupt/abrupt-test" <<'SUITE'
+#!/usr/bin/env bash
+root=${DOT_TEST_RESULT_FILE%/*}
+name=${DOT_TEST_RESULT_FILE##*/}
+name=${name%.result}
+mkdir "$root/$name.rc"
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+chmod 0755 "$abrupt/abrupt-test"
+set +e
+abrupt_output=$(
+  "$timeout_command" 10 env HOME="$home" XDG_STATE_HOME="$state" \
+    DOT_BASH="$BASH" DOT_TEST_TESTS_DIR="$abrupt" DOT_TEST_NO_COLOR=1 \
+    "$root/bin/dot" test abrupt 2>&1
+)
+abrupt_status=$?
+set -e
+assert_eq 1 "$abrupt_status" \
+  'worker publication failure fails instead of hanging'
+assert_contains 'worker exited before publishing a result' "$abrupt_output" \
+  'worker publication failure is diagnosed'
+
+timeout_suites=$DOT_TEST_TMP/timeout-suites
+mkdir -p "$timeout_suites"
+cat >"$timeout_suites/hang-test" <<'SUITE'
+#!/usr/bin/env bash
+while :; do sleep 1; done
+SUITE
+chmod 0755 "$timeout_suites/hang-test"
+set +e
+timeout_output=$(DOT_TEST_SUITE_TIMEOUT_SECONDS=1 \
+  run_tests "$timeout_suites" hang 2>&1)
+timeout_status=$?
+set -e
+assert_eq 1 "$timeout_status" 'timed-out suite fails the aggregate'
+assert_contains 'Failed: hang-test' "$timeout_output" \
+  'timed-out suite is named'
+
+assert_cancellation() {
+  local mode=$1
+  shift
+  local cancel_suites=$DOT_TEST_TMP/cancel-$mode
+  local pid_file=$cancel_suites/suite.pid
+  local output=$cancel_suites/output
+  local runner_pid suite_pid status=0 deadline
+  mkdir -p "$cancel_suites"
+  cat >"$cancel_suites/cancel-test" <<'SUITE'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >"$DOT_TEST_CANCEL_PID_FILE"
+while :; do sleep 1; done
+SUITE
+  chmod 0755 "$cancel_suites/cancel-test"
+  (
+    exec env HOME="$home" XDG_STATE_HOME="$state" DOT_BASH="$BASH" \
+      DOT_TEST_TESTS_DIR="$cancel_suites" \
+      DOT_TEST_CANCEL_PID_FILE="$pid_file" DOT_TEST_NO_COLOR=1 \
+      "$root/bin/dot" test "$@"
+  ) >"$output" 2>&1 &
+  runner_pid=$!
+  deadline=$((SECONDS + 5))
+  while [[ ! -s $pid_file && $SECONDS -lt $deadline ]]; do sleep 0.05; done
+  [[ -s $pid_file ]] || fail "$mode cancellation fixture did not start"
+  kill -TERM "$runner_pid"
+  wait "$runner_pid" || status=$?
+  assert_eq 143 "$status" "$mode cancellation preserves signal status"
+  suite_pid=$(<"$pid_file")
+  deadline=$((SECONDS + 5))
+  while process_is_live "$suite_pid" && ((SECONDS < deadline)); do sleep 0.05; done
+  if process_is_live "$suite_pid"; then
+    kill -KILL "$suite_pid" 2>/dev/null || true
+    fail "$mode cancellation left the active suite running"
+  fi
+}
+
+assert_cancellation parallel
+assert_cancellation sequential -s
+
+descendants=$DOT_TEST_TMP/descendants
+descendant_pid_file=$DOT_TEST_TMP/descendant.pid
+mkdir -p "$descendants"
+cat >"$descendants/descendant-test" <<'SUITE'
+#!/usr/bin/env bash
+python3 - "$DOT_TEST_DESCENDANT_PID_FILE" <<'PY' &
+import os
+import sys
+import time
+from pathlib import Path
+
+os.setpgid(0, 0)
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+time.sleep(300)
+PY
+deadline=$((SECONDS + 5))
+while [[ ! -s $DOT_TEST_DESCENDANT_PID_FILE && $SECONDS -lt $deadline ]]; do
+  sleep 0.05
+done
+[[ -s $DOT_TEST_DESCENDANT_PID_FILE ]] || exit 1
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+chmod 0755 "$descendants/descendant-test"
+DOT_TEST_DESCENDANT_PID_FILE=$descendant_pid_file \
+  run_tests "$descendants" -s descendant >/dev/null
+descendant_pid=$(<"$descendant_pid_file")
+deadline=$((SECONDS + 5))
+while process_is_live "$descendant_pid" && ((SECONDS < deadline)); do
+  sleep 0.05
+done
+if process_is_live "$descendant_pid"; then
+  kill -KILL "$descendant_pid" 2>/dev/null || true
+  fail 'successful suite left its descendant running'
+fi
+
+no_setsid_bin=$DOT_TEST_TMP/no-setsid-bin
+session_suites=$DOT_TEST_TMP/session-suites
+session_log=$DOT_TEST_TMP/session.log
+mkdir -p "$no_setsid_bin" "$session_suites"
+for tool in awk bash cat chmod date dirname env git head ln mkdir mkfifo \
+  mktemp od python3 readlink realpath rm sleep sort stat tail tee tr uname wc; do
+  tool_path=$(type -P "$tool") || fail "missing fixture tool: $tool"
+  ln -s "$tool_path" "$no_setsid_bin/$tool"
+done
+PATH=$no_setsid_bin command -v setsid >/dev/null 2>&1 &&
+  fail 'no-setsid fixture unexpectedly exposes setsid'
+cat >"$session_suites/session-test" <<'SUITE'
+#!/usr/bin/env bash
+python3 - "$DOT_TEST_SESSION_LOG" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+parent = os.getppid()
+Path(sys.argv[1]).write_text(
+    f"{parent}\t{os.getsid(parent)}\n", encoding="utf-8"
+)
+PY
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+chmod 0755 "$session_suites/session-test"
+caller_sid=$(python3 -c 'import os; print(os.getsid(0))')
+DOT_TEST_SESSION_LOG=$session_log PATH=$no_setsid_bin \
+  run_tests "$session_suites" session >/dev/null
+IFS=$'\t' read -r supervisor_pid supervisor_sid <"$session_log"
+[[ $supervisor_pid =~ ^[1-9][0-9]*$ ]] ||
+  fail 'python detacher did not record the timeout supervisor'
+[[ $supervisor_sid != "$caller_sid" ]] ||
+  fail 'python detacher did not isolate the supervisor session without setsid'
+
+escaped=$DOT_TEST_TMP/escaped
+escaped_pid_file=$escaped/escaped.pid
+mkdir -p "$escaped"
+cat >"$escaped/escaped-test" <<'SUITE'
+#!/usr/bin/env bash
+python3 - "$DOT_TEST_ESCAPED_PID_FILE" <<'PY'
+import subprocess
+import sys
+from pathlib import Path
+
+process = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(12)"],
+    start_new_session=True,
+)
+Path(sys.argv[1]).write_text(str(process.pid), encoding="utf-8")
+PY
+while :; do sleep 1; done
+SUITE
+chmod 0755 "$escaped/escaped-test"
+SECONDS=0
+set +e
+escaped_output=$(PATH=$no_setsid_bin \
+  DOT_TEST_ESCAPED_PID_FILE=$escaped_pid_file \
+  DOT_TEST_SUITE_TIMEOUT_SECONDS=1 run_tests "$escaped" -s escaped 2>&1)
+escaped_status=$?
+set -e
+escaped_elapsed=$SECONDS
+if [[ -s $escaped_pid_file ]]; then
+  # The fixture deliberately creates a new session outside the suite's owned
+  # session. Its inherited writer must not hold the runner's display pipe open;
+  # remove it explicitly after measuring that bounded-output contract.
+  escaped_pid=$(<"$escaped_pid_file")
+  kill -KILL "$escaped_pid" 2>/dev/null || true
+fi
+assert_eq 1 "$escaped_status" 'escaped writer suite still times out'
+assert_contains 'Failed: escaped-test' "$escaped_output" \
+  'escaped writer timeout is reported'
+[[ $escaped_elapsed -le 8 ]] ||
+  fail "escaped writer delayed timeout reporting for ${escaped_elapsed}s"
+
+stale_parent=$DOT_TEST_TMP/stale-parent
+stale_root=$stale_parent/dot-suite-runs.$EUID
+old_dead=$stale_root/run.old-dead
+recent_dead=$stale_root/run.recent-dead
+old_live=$stale_root/run.old-live
+unmarked=$stale_root/run.unmarked
+malformed=$stale_root/run.malformed
+malformed_time=$stale_root/run.malformed-time
+symlink_path=$stale_root/run.symlink
+symlink_target=$stale_parent/symlink-target
+mkdir -p "$old_dead" "$recent_dead" "$old_live" "$unmarked" \
+  "$malformed" "$malformed_time" "$symlink_target"
+ln -s "$symlink_target" "$symlink_path"
+now=$(date +%s)
+printf '%s\t%s\n' 9999999999 1 >"$old_dead/.dot-suite-owner-v3"
+printf '%s\t%s\n' 9999999999 "$now" >"$recent_dead/.dot-suite-owner-v3"
+printf '%s\t%s\n' "$$" 1 >"$old_live/.dot-suite-owner-v3"
+printf 'not-a-pid\tnot-a-time\n' >"$malformed/.dot-suite-owner-v3"
+printf '%s\tnot-a-time\n' 9999999999 \
+  >"$malformed_time/.dot-suite-owner-v3"
+TMPDIR=$stale_parent run_tests "$suites" -s stdin >/dev/null
+[[ ! -e $old_dead ]] || fail 'old dead invocation root was not reclaimed'
+for preserved in "$recent_dead" "$old_live" "$unmarked" "$malformed" \
+  "$malformed_time"; do
+  [[ -d $preserved ]] || fail "protected stale root was removed: $preserved"
+done
+[[ -L $symlink_path && -d $symlink_target ]] ||
+  fail 'symlink stale root or its target was removed'
+
+concurrent=$DOT_TEST_TMP/concurrent
+shared_tmp=$DOT_TEST_TMP/shared-tmp
+mkdir -p "$concurrent" "$shared_tmp"
+cat >"$concurrent/quick-test" <<'SUITE'
+#!/usr/bin/env bash
+"$DOT_TEST_REPORTER" complete 1 0
+SUITE
+chmod 0755 "$concurrent/quick-test"
+TMPDIR=$shared_tmp run_tests "$concurrent" quick >/dev/null &
+first=$!
+TMPDIR=$shared_tmp run_tests "$concurrent" quick >/dev/null &
+second=$!
+wait "$first"
+wait "$second"
+remaining=0
+for candidate in "$shared_tmp/dot-suite-runs.$EUID"/run.*; do
+  [[ -e $candidate || -L $candidate ]] || continue
+  remaining=$((remaining + 1))
+done
+assert_eq 0 "$remaining" 'concurrent invocations remove only owned roots'
+
+set +e
+run_tests "$suites" --jobs >/dev/null 2>&1
+missing_jobs_status=$?
+run_tests "$suites" --jobs nope >/dev/null 2>&1
+invalid_jobs_status=$?
+run_tests "$suites" --jobs 08 >/dev/null 2>&1
+noncanonical_jobs_status=$?
+run_tests "$suites" --jobs 99999999999999999999 >/dev/null 2>&1
+oversized_jobs_status=$?
+run_tests "$suites" missing >/dev/null 2>&1
+unknown_status=$?
+set -e
+assert_eq 2 "$missing_jobs_status" 'missing jobs value is usage failure'
+assert_eq 2 "$invalid_jobs_status" 'invalid jobs value is usage failure'
+assert_eq 2 "$noncanonical_jobs_status" \
+  'noncanonical jobs value is usage failure'
+assert_eq 2 "$oversized_jobs_status" 'oversized jobs value is usage failure'
+assert_eq 2 "$unknown_status" 'unknown suite is usage failure'
+
+printf 'test-lifecycle-test: ok\n'

@@ -40,6 +40,11 @@ dot_command_dispatch() {
       _discover_overlays || true
       _dot_doctor
       ;;
+    test)
+      _dot_cleanup_install_owner_traps
+      _discover_overlays || return 1
+      dot_test_command "$@" || rc=$?
+      ;;
     init)
       _dot_cleanup_install_owner_traps
       case ${1:-} in

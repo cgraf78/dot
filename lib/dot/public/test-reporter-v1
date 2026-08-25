@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Language-neutral terminal result reporter for Dot test extension API 1.
+
+set -euo pipefail
+CDPATH=
+shopt -u nocasematch
+
+kind=${1:-}
+case $kind in
+  complete)
+    [[ $# -eq 3 && $2 =~ ^(0|[1-9][0-9]*)$ &&
+      $3 =~ ^(0|[1-9][0-9]*)$ ]] || exit 2
+    record=$(printf 'complete\t%s\t%s' "$2" "$3")
+    ;;
+  skip)
+    [[ $# -ge 1 && $# -le 2 ]] || exit 2
+    detail=${2:-}
+    [[ $detail != *$'\t'* && $detail != *$'\n'* &&
+      $detail != *$'\r'* ]] || exit 2
+    record=$(printf 'skip\t%s' "$detail")
+    ;;
+  *) exit 2 ;;
+esac
+case ${DOT_TEST_RESULT_FILE:-} in
+  /*) ;;
+  *) exit 1 ;;
+esac
+[[ -f $DOT_TEST_RESULT_FILE && ! -L $DOT_TEST_RESULT_FILE &&
+  -O $DOT_TEST_RESULT_FILE && ! -s $DOT_TEST_RESULT_FILE ]] || exit 1
+printf '%s\n' "$record" >>"$DOT_TEST_RESULT_FILE"

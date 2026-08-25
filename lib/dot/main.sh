@@ -68,6 +68,7 @@ Commands:
   diff             Show base and overlay differences
   cron             Show the installed user crontab
   doctor           Run core and configured extension health checks
+  test             Run built-in and configured extension tests
   init             Initialize or resume a client dotfiles repository
   help             Show this command summary
 

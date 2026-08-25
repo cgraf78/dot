@@ -35,6 +35,7 @@ program	lib/dot/progress-ui.sh
 program	lib/dot/providers/shdeps-ui.sh
 program	lib/dot/providers/shdeps.sh
 program	lib/dot/public/api-version.sh
+program	lib/dot/public/test-reporter-v1
 program	lib/dot/public/ui.sh
 program	lib/dot/public/xdg.sh
 program	lib/dot/repos/api.sh
@@ -49,6 +50,10 @@ program	lib/dot/reserved.sh
 program	lib/dot/resources.sh
 program	lib/dot/run.sh
 program	lib/dot/runtime.sh
+program	lib/dot/test.sh
+program	lib/dot/test/discovery.sh
+program	lib/dot/test/runner.sh
+program	lib/dot/test/source.sh
 program	lib/dot/temp.sh
 program	lib/dot/update-lock.sh
 program	lib/dot/update.sh
@@ -81,5 +86,7 @@ program	tests/resources-test
 program	tests/run
 program	tests/shdeps-provider-test
 program	tests/shdeps-lock-verifier-test
+program	tests/test-command-test
+program	tests/test-lifecycle-test
 program	tests/update-lock-test
 program	tests/workflow-test

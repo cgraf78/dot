@@ -24,11 +24,14 @@ awk -F '\t' '
   exit 1
 }
 
-dotfiles_revision=$(awk -F '\t' '$1 == "dotfiles-v1" { print $2 }' "$revisions")
-[[ $dotfiles_revision =~ ^[0-9a-f]{40}$ ]] || {
-  printf 'provenance-test: missing dotfiles-v1 source revision\n' >&2
-  exit 1
-}
+for source_name in dotfiles-v1 dotfiles-v2; do
+  dotfiles_revision=$(awk -F '\t' -v source="$source_name" \
+    '$1 == source { print $2 }' "$revisions")
+  [[ $dotfiles_revision =~ ^[0-9a-f]{40}$ ]] || {
+    printf 'provenance-test: missing %s source revision\n' "$source_name" >&2
+    exit 1
+  }
+done
 
 awk -F '\t' '
   /^#/ { next }
@@ -57,7 +60,9 @@ while IFS=$'\t' read -r path origin; do
   }
   case $origin in
     standalone:new | actions:* | shdeps:*) ;;
-    dotfiles:*@dotfiles-v1 | dotfiles:*@dotfiles-v1+standalone) ;;
+    dotfiles:*@dotfiles-v1 | dotfiles:*@dotfiles-v1+standalone | \
+      dotfiles:*@dotfiles-v2 | dotfiles:*@dotfiles-v2+standalone)
+      ;;
     *)
       printf 'provenance-test: unknown origin for %s: %s\n' "$path" "$origin" >&2
       exit 1

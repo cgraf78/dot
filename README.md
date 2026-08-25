@@ -77,6 +77,11 @@ Only the versioned modules under `lib/dot/public` are sourceable APIs. All
 other shell files are private runtime implementation. See
 [library.md](docs/library.md).
 
+`dot doctor` runs built-in health checks plus configured `doctor.d` extensions.
+`dot test` similarly runs the provider's built-in suite plus trusted executable
+test extensions from the configured `tests` directory. Use `dot test --list`
+to inspect the suite inventory or `dot test NAME` for an exact/prefix subset.
+
 ## Development
 
 ```bash
