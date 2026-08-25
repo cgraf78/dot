@@ -1,4 +1,5 @@
 reporter	DOT_TEST_REPORTER complete PASSED FAILED	record one completed suite with assertion counts
 reporter	DOT_TEST_REPORTER skip [reason]	record one skipped suite
+environment	DOT_TEST_INCLUDE_PROVIDER=0|1	include the provider suite in an unfiltered dot test run when set to 1
 environment	DOT_TEST_TIMEOUT SECONDS COMMAND [ARG ...]	run one command under the provider timeout supervisor with finite positive SECONDS
 environment	DOT_TEST_TIMEOUT_EXPIRED_FILE	optional private marker created only when the provider deadline expires

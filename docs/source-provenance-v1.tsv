@@ -82,6 +82,7 @@ tests/lib/test.sh	standalone:new
 tests/library-test	standalone:new
 tests/license-test	standalone:new
 tests/merge-block-test	dotfiles:tests/core-merges-test@dotfiles-v1
+tests/provider-suite-wrapper	standalone:new
 tests/provenance-test	standalone:new
 tests/repos-test	dotfiles:tests/core-pull-test+core-overlays-test@dotfiles-v1+standalone
 tests/resources-test	dotfiles:tests/core-resource-cleanup-test@dotfiles-v1+standalone

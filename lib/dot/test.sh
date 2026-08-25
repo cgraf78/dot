@@ -18,13 +18,14 @@ _dot_test_suite_timeout() {
   fi
 }
 
-# Built-in and client-extension test coordinator.
+# Provider and client-extension test coordinator.
 #
 # Auto-discovers and runs all *-test scripts in ~/.local/lib/dotfiles/tests/.
 # Runs in parallel by default for faster execution.
 #
 # Usage:
-#   dot test                  run all tests in parallel
+#   dot test                  run configured tests in parallel
+#   dot test dot              run the provider test corpus
 #   dot test core bootstrap   run named tests only
 #   dot test -s               run sequentially (stream output)
 #   dot test -v               verbose: show all output in parallel mode
@@ -107,8 +108,12 @@ dot_test_command() {
         shift
         ;;
       -h | --help)
-        printf '%s\n' \
-          'usage: dot test [-s|--sequential] [-v|--verbose] [-j N|--jobs N] [--list] [name ...]'
+        cat <<'EOF'
+usage: dot test [-s|--sequential] [-v|--verbose] [-j N|--jobs N] [--list] [name ...]
+
+Set DOT_TEST_INCLUDE_PROVIDER=1 to include the provider suite in an
+unfiltered run. Select `dot` by name to run only the provider suite.
+EOF
         exit 0
         ;;
       -*)
@@ -121,6 +126,15 @@ dot_test_command() {
         ;;
     esac
   done
+  requested_jobs=$max_jobs
+
+  case ${DOT_TEST_INCLUDE_PROVIDER:-0} in
+    0 | 1) ;;
+    *)
+      echo 'DOT_TEST_INCLUDE_PROVIDER must be 0 or 1' >&2
+      exit 2
+      ;;
+  esac
 
   # Detect gum for styled output. Test suites set NO_COLOR to keep underlying
   # tool output deterministic; Dot owns its own presentation layer, with a

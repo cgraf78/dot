@@ -145,10 +145,12 @@ The coordinator owns rendering, counters, ordering, and aggregate exit status;
 extensions must not inspect or mutate those internals. `dot_doctor_display_path`
 only formats a path for human output and has no filesystem side effects.
 
-Test extensions are executable `tests/*-test` programs. `dot test` runs the
-provider-owned `dot` suite plus those client suites, in parallel by default;
-exact and prefix filters select a subset. Each suite receives isolated temp,
-cache, and state roots, closed stdin, `DOT_TEST_HOST_HOME`,
+Test extensions are executable `tests/*-test` programs. By default, `dot test`
+runs those client suites in parallel. The provider-owned `dot` suite remains
+available through `dot test dot`, or alongside client suites in an unfiltered
+run when `DOT_TEST_INCLUDE_PROVIDER=1`; exact and prefix filters otherwise
+select a subset. Each suite receives isolated temp, cache, and state roots,
+closed stdin, `DOT_TEST_HOST_HOME`,
 `DOT_TEST_SOURCE_HOME`, and an absolute `DOT_TEST_REPORTER`.
 `DOT_TEST_TIMEOUT` names the same portable, versioned timeout command used by
 the coordinator for suites that need bounded subcommands; its first argument

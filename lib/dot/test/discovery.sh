@@ -128,6 +128,10 @@ if [[ ${#filter[@]} -gt 0 ]]; then
   done
 else
   for i in "${!available_names[@]}"; do
+    if [[ ${available_names[$i]} == dot &&
+      ${DOT_TEST_INCLUDE_PROVIDER:-0} != 1 ]]; then
+      continue
+    fi
     f=${available_scripts[$i]}
     scripts+=("$f")
     suite_names[$f]=${available_names[$i]}

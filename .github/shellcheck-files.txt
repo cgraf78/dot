@@ -80,6 +80,7 @@ program	tests/lib/repo.sh
 program	tests/lib/test.sh
 program	tests/license-test
 program	tests/merge-block-test
+program	tests/provider-suite-wrapper
 program	tests/provenance-test
 program	tests/repos-test
 program	tests/resources-test

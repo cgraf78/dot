@@ -78,15 +78,20 @@ other shell files are private runtime implementation. See
 [library.md](docs/library.md).
 
 `dot doctor` runs built-in health checks plus configured `doctor.d` extensions.
-`dot test` similarly runs the provider's built-in suite plus trusted executable
-test extensions from the configured `tests` directory. Use `dot test --list`
-to inspect the suite inventory or `dot test NAME` for an exact/prefix subset.
+`dot test` runs trusted executable test extensions from the configured `tests`
+directory. The provider-owned `dot` suite remains visible in `dot test --list`
+and can be selected explicitly with `dot test dot`; set
+`DOT_TEST_INCLUDE_PROVIDER=1` to include it in an unfiltered run. Other names
+select exact or prefix subsets.
 
 ## Development
 
 ```bash
 tests/run
 ```
+
+The provider entry point runs its independent test files concurrently through
+the same bounded coordinator used by `dot test`.
 
 The project uses the full shared Linux, macOS, and Termux shell matrix plus a
 stock macOS Bash 3.2 bootstrap job.
