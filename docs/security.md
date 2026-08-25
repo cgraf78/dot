@@ -16,10 +16,17 @@ Those identity checks are not a recursive content sandbox. `install.sh
 
 Client configuration is parsed as data. Extension discovery is versioned and
 rejects unsafe roots, path components, file types, ownership, modes, duplicate
-identities, control bytes, unknown grammar, and unbounded input before a fresh
-worker Bash sources client code. Hook and doctor workers receive only their
-documented API and private temporary storage; cancellation owns their process
-groups and descendants.
+identities, control bytes, unknown grammar, and unbounded input. Hook and doctor
+extensions then run in a fresh worker Bash with only their documented API and
+private temporary storage.
+
+Test extensions are different by design: they are standalone executables that
+run under their declared interpreter with normal user authority and the client
+environment needed for integration coverage. Dot revalidates each executable
+at launch, gives it private temp, cache, and state roots, closes stdin,
+supervises its process session, and accepts completion only through the
+versioned result reporter. These boundaries provide trust validation and
+lifecycle isolation, not a sandbox against same-user code.
 
 Before initialization, repository integration, or overlay publication, dot
 inspects the complete candidate inventory against its dynamic control-plane

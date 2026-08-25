@@ -1,8 +1,8 @@
 # Source provenance
 
 This repository has fresh history. Paths adapted from the public
-`cgraf78/dotfiles` tree are attributed to the immutable `dotfiles-v1` revision
-recorded in [`source-revisions-v1.tsv`](source-revisions-v1.tsv). New
+`cgraf78/dotfiles` tree are attributed to immutable named revisions recorded in
+[`source-revisions-v1.tsv`](source-revisions-v1.tsv). New
 standalone-only seams are marked as such below rather than being attributed to
 an older file.
 
@@ -42,6 +42,9 @@ an older file.
 | `lib/dot/reserved.sh` | New standalone security seam | Dynamic Actions/Shdeps/provider/client control-plane inventory |
 | `lib/dot/update.sh` | `dotfiles:.local/lib/dot/core/update.sh` | Provider-neutral orchestration; client integrations removed |
 | `lib/dot/{commands.sh,init.sh,main.sh,runtime.sh,config.sh}` | New standalone composition around the extracted public engine | CLI, strict config, loading order, and product/version boundary |
+| `lib/dot/test.sh` and `lib/dot/test/{source,discovery,runner}.sh` | `dotfiles:.local/lib/dotfiles/tests/run` at `dotfiles-v2`, plus standalone composition | Generic scheduling, cancellation, source-worktree selection, and result coordination moved into focused provider modules; client policy removed |
+| `lib/dot/public/test-timeout-v1` | `dotfiles:.local/lib/dotfiles/tests/timeout.py` at `dotfiles-v2` | Versioned portable timeout command for suites and provider-owned descendant cleanup |
+| `lib/dot/{test-api-v1.tsv,public/test-reporter-v1}` | New standalone interface | Language-neutral, single-terminal-record result transport for executable suites |
 
 ## Test provenance
 
@@ -50,7 +53,8 @@ an older file.
 | `tests/{repos-test,resources-test,update-lock-test}` | Generic cases extracted from `dotfiles:.local/lib/dot/tests/{core-pull-test,core-overlays-test,core-update-test,core-resource-cleanup-test,xdg-test}` and `tests/core/commands.sh` | Expanded with standalone topology, reserved-path, cancellation, and crash-phase fixtures |
 | `tests/{families-test,merge-block-test,hooks-test,hook-api-test,extensions-api-test}` | Generic cases extracted from `core-merges-test`, `core-resource-cleanup-test`, and `tests/core/merges.sh` | Concrete application hook cases deliberately excluded |
 | `tests/{doctor-test,shdeps-provider-test}` | Generic cases extracted from `core-doctor-test`, `core-test`, `core-reexec-test`, and provider/UI portions of the public suite | Application and environment checks remain client-owned |
-| `tests/{init-test,cli-test,config-test,install-test,client-launcher-test,library-test,examples-test,workflow-test}` | New standalone acceptance suites, informed by public bootstrap/launcher/XDG/workflow characterization | Use only synthetic users, repositories, hosts, and paths |
+| `tests/{init-test,cli-test,config-test,install-test,client-launcher-test,library-test,examples-test,test-command-test,workflow-test}` | New standalone acceptance suites, informed by public bootstrap/launcher/XDG/workflow characterization | Use only synthetic users, repositories, hosts, and paths |
+| `tests/test-lifecycle-test` | Generic cases extracted from `dotfiles:.local/lib/dotfiles/tests/core/runner.sh` at `dotfiles-v2` | Covers filtering, priority, stdin closure, timeout, descendant cleanup, concurrent temp ownership, and CLI failures |
 | `tests/lib/{test.sh,repo.sh}` and `tests/run` | New standalone harness, adapted from public dotfiles test conventions | Checkout-local only; does not invoke client-owned tests |
 
 `tests/provenance-test` validates the revision and per-path inventories. It

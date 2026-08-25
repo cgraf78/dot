@@ -57,4 +57,6 @@ fi
 . "$_DOT_RUNTIME_DIR/doctor-api.sh"
 # shellcheck source=doctor.sh
 . "$_DOT_RUNTIME_DIR/doctor.sh"
+# shellcheck source=test.sh
+. "$_DOT_RUNTIME_DIR/test.sh"
 unset _DOT_RUNTIME_DIR
