@@ -419,10 +419,13 @@ assert_cancellation() {
   local cancel_suites=$DOT_TEST_TMP/cancel-$mode
   local pid_file=$cancel_suites/suite.pid
   local output=$cancel_suites/output
-  local runner_pid suite_pid status=0 deadline
+  local runner_pid suite_pid suite_identity='' status=0 deadline
   mkdir -p "$cancel_suites"
   cat >"$cancel_suites/cancel-test" <<'SUITE'
 #!/usr/bin/env bash
+# Cancellation may tear down suite-owned fixtures before the coordinator exits.
+# The harness must retain the observed process identity before inducing that.
+trap 'rm -f "$DOT_TEST_CANCEL_PID_FILE"; exit 143' TERM
 printf '%s\n' "$$" >"$DOT_TEST_CANCEL_PID_FILE"
 while :; do sleep 1; done
 SUITE
@@ -437,13 +440,17 @@ SUITE
   deadline=$((SECONDS + 5))
   while [[ ! -s $pid_file && $SECONDS -lt $deadline ]]; do sleep 0.05; done
   [[ -s $pid_file ]] || fail "$mode cancellation fixture did not start"
+  suite_pid=$(<"$pid_file")
+  process_identity "$suite_pid" suite_identity || suite_identity=''
   kill -TERM "$runner_pid"
   wait "$runner_pid" || status=$?
   assert_eq 143 "$status" "$mode cancellation preserves signal status"
-  suite_pid=$(<"$pid_file")
+  [[ ! -e $pid_file ]] ||
+    fail "$mode cancellation did not run suite TERM cleanup"
   deadline=$((SECONDS + 5))
-  while process_is_live "$suite_pid" && ((SECONDS < deadline)); do sleep 0.05; done
-  if process_is_live "$suite_pid"; then
+  while process_is_live "$suite_pid" "$suite_identity" &&
+    ((SECONDS < deadline)); do sleep 0.05; done
+  if process_is_live "$suite_pid" "$suite_identity"; then
     kill -KILL "$suite_pid" 2>/dev/null || true
     fail "$mode cancellation left the active suite running"
   fi
