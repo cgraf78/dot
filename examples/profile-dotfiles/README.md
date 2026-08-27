@@ -17,8 +17,13 @@ personal overlay may provide private selectors below
 
 Selector fields are exact matches. `user` is case-sensitive. `host` is compared
 after ASCII lowercasing and removal of one trailing dot. All supplied fields
-must match. Multiple matches may agree; conflicting profile choices fail.
-With no match, Dot selects `base`.
+must match. A selector containing both `user` and `host` is more specific than
+a user-only or host-only selector and overrides broader matches. This permits a
+user-wide default with per-host exceptions: the tracked `example-user.conf`
+selects `editor`, while local `combined.conf` selects `dev` for that user on
+`example-host`. Multiple matches at the same specificity may agree;
+conflicting choices at the same specificity fail. With no match, Dot selects
+`base`.
 
 All identities and URLs here are reserved examples. They do not describe a
 real machine, user, or private repository.

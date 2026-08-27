@@ -105,10 +105,15 @@ profile=editor
 At least one of `user` or `host` is required, and every supplied field must
 match. User names come from `id -un` and compare exactly and case-sensitively.
 Short hostnames come from `hostname -s`; both configured and current values are
-ASCII-lowercased after removing one trailing dot. Multiple matching records may
-agree on a profile. Conflicting matches are a configuration error.
+ASCII-lowercased after removing one trailing dot. A selector containing both
+`user` and `host` is more specific than a selector containing only one field,
+and the most-specific matching level wins. This permits a user-wide default
+with per-host exceptions. Multiple matches at the winning specificity may
+agree on a profile; conflicting choices at that same specificity are a
+configuration error. Less-specific disagreements are ignored.
 
-Selector sources are read in this order, without precedence:
+Selector sources are read in this order; source location does not affect
+precedence:
 
 1. tracked root files in `.config/dot/profile-selectors.d/`;
 2. untracked machine-local files in

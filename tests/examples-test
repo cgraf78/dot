@@ -77,6 +77,15 @@ assert_eq 'base editor dev' "${INCLUDED_PROFILES[*]}" \
 assert_eq 'personal nvim dev work' "${SELECTED_OVERLAY_NAMES[*]}" \
   'profile example overlay aggregation'
 
+_dot_profile_resolve \
+  "$profile_example/root/.config/dot/profile-selectors.d" \
+  "$example_local" \
+  "$DOT_TEST_TMP/no-personal-selectors"
+assert_eq dev "$SELECTED_PROFILE" \
+  'profile example host exception overrides user-wide editor default'
+assert_eq 2 "${#DOT_PROFILE_SELECTOR_MATCHES[@]}" \
+  'profile example records broad and specific matches'
+
 # Exercise the checked-in profile, descriptor, and personal-selector tree
 # through the real lifecycle resolver. Inspection sees the optional personal
 # overlay as unavailable without transport; convergence activates it and then

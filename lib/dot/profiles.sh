@@ -11,6 +11,7 @@ INCLUDED_PROFILES=()
 SELECTED_OVERLAY_NAMES=()
 DOT_PROFILE_SELECTOR_MATCHES=()
 DOT_PROFILE_SELECTOR_RECORDS=()
+_DOT_PROFILE_SELECTOR_CANDIDATES=()
 
 declare -A _DOT_PROFILE_PARENTS=()
 declare -A _DOT_PROFILE_OVERLAYS=()
@@ -336,6 +337,7 @@ _dot_profile_selector_parse() {
 
 _dot_profile_read_selector_dir() {
   local source_class=$1 directory=$2 file user host profile matched=false
+  local specificity
   local nullglob_was_set=0
 
   [[ -n $directory ]] || return 0
@@ -367,18 +369,38 @@ _dot_profile_read_selector_dir() {
       DOT_PROFILE_SELECTOR_MATCHES+=(
         "$source_class:${file##*/}:$profile"
       )
-      if [[ -z $SELECTED_PROFILE ]]; then
-        SELECTED_PROFILE=$profile
-      elif [[ $SELECTED_PROFILE != "$profile" ]]; then
-        DOT_PROFILE_SELECTION_STATE=conflict
-        [[ $nullglob_was_set -eq 1 ]] || shopt -u nullglob
-        _dot_profile_error \
-          "conflicting selectors choose $SELECTED_PROFILE and $profile"
-        return
-      fi
+      specificity=0
+      [[ -z $user ]] || specificity=$((specificity + 1))
+      [[ -z $host ]] || specificity=$((specificity + 1))
+      _DOT_PROFILE_SELECTOR_CANDIDATES+=("$specificity|$profile")
     fi
   done
   [[ $nullglob_was_set -eq 1 ]] || shopt -u nullglob
+}
+
+_dot_profile_choose_selector() {
+  local candidate specificity profile
+  local selected_specificity=0
+
+  SELECTED_PROFILE=
+  for candidate in "${_DOT_PROFILE_SELECTOR_CANDIDATES[@]}"; do
+    IFS='|' read -r specificity profile <<<"$candidate"
+    if ((specificity > selected_specificity)); then
+      selected_specificity=$specificity
+    fi
+  done
+  for candidate in "${_DOT_PROFILE_SELECTOR_CANDIDATES[@]}"; do
+    IFS='|' read -r specificity profile <<<"$candidate"
+    ((specificity == selected_specificity)) || continue
+    if [[ -z $SELECTED_PROFILE ]]; then
+      SELECTED_PROFILE=$profile
+    elif [[ $SELECTED_PROFILE != "$profile" ]]; then
+      DOT_PROFILE_SELECTION_STATE=conflict
+      _dot_profile_error \
+        "equally specific selectors choose $SELECTED_PROFILE and $profile"
+      return
+    fi
+  done
 }
 
 _dot_profile_resolve() {
@@ -401,12 +423,14 @@ _dot_profile_resolve() {
   DOT_PROFILE_SELECTION_STATE=implicit-base
   DOT_PROFILE_SELECTOR_MATCHES=()
   DOT_PROFILE_SELECTOR_RECORDS=()
+  _DOT_PROFILE_SELECTOR_CANDIDATES=()
 
   _dot_profile_read_selector_dir root "$root_dir" || return
   _dot_profile_read_selector_dir local "$local_dir" || return
   for personal_dir in "$@"; do
     _dot_profile_read_selector_dir personal "$personal_dir" || return
   done
+  _dot_profile_choose_selector || return
   if [[ -z $SELECTED_PROFILE ]]; then
     SELECTED_PROFILE=base
   else

@@ -82,20 +82,23 @@ run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selec
 assert_eq editor "$SELECTED_PROFILE" 'host-only selector normalizes case and trailing dot'
 
 rm "$root_selectors/host.conf"
-write_selector "$root_selectors" combined $'version=1\nuser=example-user\nhost=example-host.\nprofile=dev'
+write_selector "$root_selectors" user-default $'version=1\nuser=example-user\nprofile=editor'
+write_selector "$root_selectors" host-default $'version=1\nhost=example-host\nprofile=base'
+write_selector "$local_selectors" combined $'version=1\nuser=example-user\nhost=example-host.\nprofile=dev'
+chmod 0600 "$local_selectors/combined.conf"
 run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
-assert_eq dev "$SELECTED_PROFILE" 'combined selector'
+assert_eq dev "$SELECTED_PROFILE" \
+  'combined selector overrides disagreeing broader defaults'
 assert_eq 'base editor dev' "${INCLUDED_PROFILES[*]}" 'recursive additive inclusion'
 assert_eq 'personal nvim dev work' "${SELECTED_OVERLAY_NAMES[*]}" \
   'overlay order and deduplication'
 
-write_selector "$local_selectors" agree $'version=1\nuser=example-user\nprofile=dev'
-chmod 0600 "$local_selectors/agree.conf"
+write_selector "$personal_selectors" agree $'version=1\nuser=example-user\nhost=example-host\nprofile=dev'
 run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
 assert_eq dev "$SELECTED_PROFILE" 'agreeing matches are accepted'
-assert_eq 2 "${#DOT_PROFILE_SELECTOR_MATCHES[@]}" 'agreeing matches recorded'
+assert_eq 4 "${#DOT_PROFILE_SELECTOR_MATCHES[@]}" 'all matches are recorded'
 
-write_selector "$personal_selectors" conflict $'version=1\nhost=example-host\nprofile=editor'
+write_selector "$personal_selectors" conflict $'version=1\nuser=example-user\nhost=example-host\nprofile=editor'
 if run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors" \
   >/dev/null 2>&1; then
   fail 'accepted conflicting matching selectors'
@@ -127,7 +130,8 @@ SH
 rm -rf "$personal_selectors"
 run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
 assert_eq dev "$SELECTED_PROFILE" 'local match survives unavailable personal source'
-rm "$local_selectors/agree.conf" "$root_selectors/combined.conf"
+rm "$local_selectors/combined.conf" "$root_selectors/user-default.conf" \
+  "$root_selectors/host-default.conf"
 run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
 assert_eq base "$SELECTED_PROFILE" 'unavailable personal source preserves base fallback'
 
