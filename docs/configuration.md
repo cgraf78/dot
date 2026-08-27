@@ -70,3 +70,59 @@ exist and that the bytes match the recorded digest. CI always reports one
 singleton lock check, but performs that bounded remote verification only when
 the lock changes (or for a manual run); it never selects or advances the
 revision automatically.
+
+## Overlay profiles
+
+Clients may define additive overlay profiles in
+`${resolved_config_home}/dot/profiles.d/<name>.conf`:
+
+```text
+version=1
+profiles=base
+overlays=nvim
+```
+
+`profiles=` and `overlays=` are comma-separated lowercase identifiers. A
+profile may include other profiles, but cycles and unknown parents are errors.
+Included profiles are expanded before the including profile, and duplicate
+overlay names are removed without changing descriptor order. Every flattened
+profile must select at least one overlay. The client/root repository is always
+active and must not appear in `overlays=`.
+
+When `profiles.d` exists, it must define `base`. With no matching selector, Dot
+selects `base`. When `profiles.d` does not exist, Dot retains its legacy
+behavior and considers every overlay descriptor.
+
+Selectors use strict data files with this schema:
+
+```text
+version=1
+user=example-user
+host=example-host
+profile=editor
+```
+
+At least one of `user` or `host` is required, and every supplied field must
+match. User names come from `id -un` and compare exactly and case-sensitively.
+Short hostnames come from `hostname -s`; both configured and current values are
+ASCII-lowercased after removing one trailing dot. Multiple matching records may
+agree on a profile. Conflicting matches are a configuration error.
+
+Selector sources are read in this order, without precedence:
+
+1. tracked root files in `.config/dot/profile-selectors.d/`;
+2. untracked machine-local files in
+   `.config/dot/profile-selectors.local.d/`;
+3. repository-only `dot/profile-selectors.d/` files from active overlays
+   selected by `base`.
+
+Machine-local selector directories and files must be owned by the current user,
+must not be symlinks, and must have no group/other permission bits. Use `0700`
+for the directory and `0600` for files. Client repositories should ignore the
+exact path `.config/dot/profile-selectors.local.d/`; Dot also rejects that path
+from every base or overlay candidate. Overlays cannot publish linked
+`profiles.d` or `profile-selectors.d` paths.
+
+Profile selection has no environment-variable override and no mutation command.
+See the executable, sanitized scenarios in
+[`examples/profile-dotfiles/`](../examples/profile-dotfiles/).

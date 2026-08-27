@@ -2,15 +2,48 @@
 # dot doctor: Overlays checks.
 
 _dr_check_overlays() {
-  local conf_dir conf_count=0 manifest="$DOT_OVERLAY_MANIFEST"
-  conf_dir="$(_overlay_conf_dir)"
-  [[ -d "$conf_dir" ]] && conf_count=$(find "$conf_dir" -maxdepth 1 -name '*.conf' -type f 2>/dev/null | wc -l | tr -d ' ')
+  local conf_count=${#CONFIGURED_OVERLAY_NAMES[@]} manifest="$DOT_OVERLAY_MANIFEST"
+  local entry name path url optional sync lifecycle state source
+  local selector source_class selector_path _selector_user _selector_host selector_profile matched
+
+  _dr_section 'Profiles'
+  if [[ ${DOT_PROFILES_PRESENT:-0} -eq 0 ]]; then
+    _dr_skip 'profile selection disabled' 'no profiles.d directory; using legacy overlay discovery'
+  else
+    if [[ -n ${DOT_PROFILE_CONFIGURATION_ERROR:-} ]]; then
+      _dr_fail 'profile configuration invalid' "$DOT_PROFILE_CONFIGURATION_ERROR"
+    fi
+    if [[ -n ${DOT_PROFILE_CURRENT_USER:-} && -n ${DOT_PROFILE_CURRENT_HOST:-} ]]; then
+      _dr_ok 'profile identity' "$DOT_PROFILE_CURRENT_USER@$DOT_PROFILE_CURRENT_HOST"
+    fi
+    if [[ -n ${SELECTED_PROFILE:-} ]]; then
+      _dr_ok 'selected profile' "$SELECTED_PROFILE (${DOT_PROFILE_SELECTION_STATE:-unknown})"
+    fi
+    if ((${#INCLUDED_PROFILES[@]} > 0)); then
+      _dr_ok 'included profiles' "${INCLUDED_PROFILES[*]}"
+    fi
+    if ((${#PHASE_ONE_SELECTED_OVERLAY_NAMES[@]} > 0)); then
+      _dr_ok 'phase-one overlays' "${PHASE_ONE_SELECTED_OVERLAY_NAMES[*]}"
+    fi
+    for selector in "${DOT_PROFILE_SELECTOR_RECORDS[@]+"${DOT_PROFILE_SELECTOR_RECORDS[@]}"}"; do
+      IFS='|' read -r source_class selector_path _selector_user _selector_host \
+        selector_profile matched <<<"$selector"
+      [[ $matched == true ]] || continue
+      case $source_class in
+        root) source='root' ;;
+        local) source='machine-local' ;;
+        personal) source='active personal overlay' ;;
+        *) source=$source_class ;;
+      esac
+      _dr_ok "matching selector (${source})" \
+        "${selector_path##*/} -> $selector_profile"
+    done
+  fi
+
   _dr_section "Overlays ($conf_count configured)"
 
-  local discovery_invalid=0
   if [[ -n "${DOT_OVERLAY_DISCOVERY_ERROR:-}" ]]; then
     _dr_fail "overlay descriptor invalid" "$DOT_OVERLAY_DISCOVERY_ERROR"
-    discovery_invalid=1
   fi
 
   if [[ "$conf_count" -eq 0 && ! -f "$manifest" ]]; then
@@ -20,36 +53,48 @@ _dr_check_overlays() {
     _dr_skip "no active overlay descriptors"
   fi
 
-  # Walk each conf, check against the parsed OVERLAYS array (filtered set).
   declare -A overlay_paths=() overlay_syncs=()
-  local f name want_url descriptor_sync
-  for f in "$conf_dir"/*.conf; do
-    [[ "$discovery_invalid" -eq 0 ]] || break
-    [[ -f "$f" ]] || continue
-    descriptor_sync=$(awk -F= '/^sync=/ {sub(/^sync=/, ""); print; exit}' "$f")
-    name=$(_overlay_name "$f" "${descriptor_sync:-git}")
-    # Extract URL from conf directly (OVERLAYS may have filtered it out).
-    want_url=$(awk -F= '/^url=/ {sub(/^url=/, ""); print; exit}' "$f")
-
-    # Is this overlay active for this host?
-    local active=0 entry path _conf optional sync
-    for entry in "${OVERLAYS[@]+"${OVERLAYS[@]}"}"; do
-      IFS='|' read -r n path _ _conf optional sync <<<"$entry"
-      sync="${sync:-git}"
-      if [[ "$n" == "$name" && "$_conf" == "$f" ]]; then
-        active=1
-        break
-      fi
-    done
-
-    if [[ "$active" -eq 0 ]]; then
-      _dr_skip "$name" "filtered out for this machine"
+  declare -A active_records=()
+  for entry in "${ACTIVE_OVERLAYS[@]+"${ACTIVE_OVERLAYS[@]}"}"; do
+    name=${entry%%|*}
+    active_records["$name"]=$entry
+  done
+  for lifecycle in "${DOT_OVERLAY_LIFECYCLE[@]+"${DOT_OVERLAY_LIFECYCLE[@]}"}"; do
+    IFS='|' read -r name state _descriptor <<<"$lifecycle"
+    case $state in
+      not-selected)
+        _dr_skip "$name: not selected"
+        continue
+        ;;
+      selected-ineligible)
+        _dr_skip "$name: selected but host/platform ineligible"
+        continue
+        ;;
+      selected-optional-unavailable)
+        _dr_warn "$name: selected optional but unavailable"
+        continue
+        ;;
+      selected-unavailable)
+        _dr_fail "$name: selected but unavailable"
+        continue
+        ;;
+      active) ;;
+      *)
+        _dr_fail "$name: unknown overlay lifecycle state" "$state"
+        continue
+        ;;
+    esac
+    entry=${active_records[$name]:-}
+    [[ -n $entry ]] || {
+      _dr_fail "$name: active lifecycle record missing"
       continue
-    fi
-    overlay_paths["$name"]="$path"
-    overlay_syncs["$name"]="$sync"
+    }
+    IFS='|' read -r name path url _descriptor optional sync <<<"$entry"
+    sync=${sync:-git}
+    overlay_paths["$name"]=$path
+    overlay_syncs["$name"]=$sync
 
-    if [[ "$sync" == "none" ]]; then
+    if [[ $sync == none ]]; then
       if _overlay_local_source_validate "$path"; then
         _dr_ok "$name: local source available" "$(_dr_tilde "$path")"
       else
@@ -69,9 +114,8 @@ _dr_check_overlays() {
     fi
     _dr_ok "$name: cloned" "$(_dr_tilde "$path")"
 
-    # Origin URL matches conf
     local actual_url expected_url
-    _overlay_effective_url "$want_url"
+    _overlay_effective_url "$url"
     expected_url=$REPLY
     if _overlay_origin_matches "$path" "$expected_url"; then
       _dr_ok "$name: remote.origin.url matches conf"

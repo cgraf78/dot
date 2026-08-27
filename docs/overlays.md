@@ -29,3 +29,53 @@ restoration and normal relinking, independent of the current descriptor set.
 The generic engine does not write SSH configuration or interpret deploy-key
 policy. A client that needs host aliases, keys, or other transport setup owns
 that behavior in its extensions or environment before repository sync.
+
+## Profile-aware lifecycle
+
+When profiles are configured, profile membership is evaluated before descriptor
+contents. Dot first enumerates safe descriptor filenames, maps them to logical
+overlay names, and rejects ambiguous names. It opens and validates only
+descriptors selected by the flattened profile; malformed unselected descriptor
+contents and their transport companions are not consulted.
+
+The lifecycle uses three distinct sets:
+
+- **selected** names come from the flattened profile;
+- **eligible** records have valid selected descriptors and match the current
+  platform and host, before source availability;
+- **active** records have a validated synchronized Git checkout or a validated
+  `sync=none` source.
+
+Profile membership never strengthens `optional=true`. A missing key,
+unreachable remote, failed optional clone, or failed optional pull remains an
+advisory skip, and a later update can activate the same profile without changing
+configuration. Platform/host-ineligible records expose neither component files
+nor transport companions.
+
+Convergence is two-phase. Dot reloads root configuration after pulling the base
+repository, expands `base`, and passes its eligible records to pre-sync
+extensions with `DOT_PRE_SYNC_STAGE=prepare`. That stage may add or refresh
+supplied transport state but must preserve unmentioned managed entries. After
+active phase-one overlays contribute repository-only selectors, Dot resolves
+the final profile, validates all selected descriptors, and passes the final
+eligible set with `DOT_PRE_SYNC_STAGE=reconcile`. Only this validated final
+stage may prune entries that are no longer eligible. Merge and component-doctor
+extensions receive final active records only.
+
+Each extension worker receives its exact eligible or active records through a
+private, one-use, versioned context. The worker validates and consumes that
+context before client code runs; it never rediscovers descriptors, selectors,
+or membership from an old installed manifest.
+
+Command side effects are explicit:
+
+- `init` and `update` converge both phases and may clone or pull selected
+  overlays;
+- `status`, `diff`, `doctor`, and `test` inspect validated existing state only;
+- `fetch` fetches the root and selected existing Git checkouts without cloning
+  or updating a worktree;
+- `push` performs no preparatory clone, pull, or fetch and pushes only the root
+  plus selected existing Git checkouts.
+
+Changing profiles removes only exact managed links during the next successful
+convergence. Cached checkouts and native packages are retained.

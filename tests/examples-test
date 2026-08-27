@@ -76,5 +76,17 @@ assert_eq 'base editor dev' "${INCLUDED_PROFILES[*]}" \
   'profile example additive inheritance'
 assert_eq 'personal nvim dev work' "${SELECTED_OVERLAY_NAMES[*]}" \
   'profile example overlay aggregation'
+assert_contains 'profile-selectors.local.d' \
+  "$(<"$DOT_TEST_ROOT/docs/configuration.md")" \
+  'configuration docs describe machine-local selectors'
+assert_contains 'selected' "$(<"$DOT_TEST_ROOT/docs/overlays.md")" \
+  'overlay docs describe selected lifecycle state'
+assert_contains 'eligible' "$(<"$DOT_TEST_ROOT/docs/overlays.md")" \
+  'overlay docs describe eligible lifecycle state'
+assert_contains 'active' "$(<"$DOT_TEST_ROOT/docs/overlays.md")" \
+  'overlay docs describe active lifecycle state'
+assert_contains 'inspect validated existing state only' \
+  "$(<"$DOT_TEST_ROOT/docs/overlays.md")" \
+  'overlay docs describe offline inspection'
 
 printf 'examples-test: ok\n'
