@@ -173,6 +173,60 @@ token=$REPLY_TOKEN
 )
 rm -f "$context"
 
+# Darwin's /dev/fd entries can expose devfs metadata instead of the opened
+# file's identity. Force the BSD stat branch and that mismatch, then require
+# the portable open-descriptor fallback to preserve one-use consumption.
+bsd_bin=$HOME/bsd-tools
+mkdir "$bsd_bin"
+DOT_TEST_REAL_STAT=$(command -v stat)
+export DOT_TEST_REAL_STAT
+cat >"$bsd_bin/stat" <<'STAT'
+#!/usr/bin/env bash
+case ${1:-} in
+  -c | -Lc) exit 1 ;;
+  -f)
+    case ${2:-} in
+      '%m') exec "$DOT_TEST_REAL_STAT" -c '%Y' "$3" ;;
+      *) exec "$DOT_TEST_REAL_STAT" -c '%u %a %h %d %i' "$3" ;;
+    esac
+    ;;
+  -Lf)
+    printf '%s 666 1 999 999\n' "$EUID"
+    ;;
+esac
+exit 2
+STAT
+chmod 0755 "$bsd_bin/stat"
+_dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+read -r DOT_TEST_CONTEXT_DEV DOT_TEST_CONTEXT_INO < <(
+  "$DOT_TEST_REAL_STAT" -c '%d %i' "$context"
+)
+DOT_TEST_CONTEXT_PATH=$context
+export DOT_TEST_CONTEXT_DEV DOT_TEST_CONTEXT_INO DOT_TEST_CONTEXT_PATH
+eval "$(declare -f _dot_overlay_context_lsof |
+  sed '1s/_dot_overlay_context_lsof/_dot_overlay_context_lsof_original/')"
+_dot_overlay_context_lsof() {
+  local fd=$1 links=0
+  [[ -e $DOT_TEST_CONTEXT_PATH ]] && links=1
+  printf 'p%s\n' "$$"
+  printf 'f%s\n' "$fd"
+  printf 'D0x%x\n' "$DOT_TEST_CONTEXT_DEV"
+  printf 'i%s\n' "$DOT_TEST_CONTEXT_INO"
+  printf 'k%s\n' "$links"
+  printf 'u%s\n' "$EUID"
+}
+if ! PATH="$bsd_bin:$PATH" _dot_overlay_context_consume \
+  "$context" "$token" pre-sync; then
+  fail 'context decoder rejected the BSD open-descriptor fallback'
+fi
+assert_eq "${records[0]}" "${OVERLAYS[0]}" \
+  'BSD open-descriptor fallback preserves context records'
+eval "$(declare -f _dot_overlay_context_lsof_original |
+  sed '1s/_dot_overlay_context_lsof_original/_dot_overlay_context_lsof/')"
+unset -f _dot_overlay_context_lsof_original
+
 # Exercise decoder-side framing checks independently of the stricter encoder.
 _write_manual_context() {
   local path=$1 token_value=$2 variant=$3 count=1

@@ -58,6 +58,64 @@ _dot_overlay_context_file_safe() {
   ((mtime <= now + 5 && now - mtime <= 300))
 }
 
+_dot_overlay_context_lsof() {
+  local fd=$1 lsof_bin process_id=${BASHPID:-$$}
+  for lsof_bin in /usr/sbin/lsof /usr/bin/lsof; do
+    [[ -x $lsof_bin ]] || continue
+    command "$lsof_bin" -a -p "$process_id" -d "$fd" -FDiku 2>/dev/null
+    return
+  done
+  return 1
+}
+
+# Read metadata from an already-open descriptor. Linux exposes the underlying
+# file through procfs. Darwin's devfs entry may instead report synthetic
+# metadata, so accept it only when the identity matches and otherwise use the
+# system lsof's direct descriptor report. The path is revalidated immediately
+# before unlink, so the lsof fallback carries forward its verified 0600 mode.
+_dot_overlay_context_open_file_stat() {
+  local fd=$1 expected_dev=$2 expected_ino=$3 output line raw_dev
+  local fd_uid='' fd_mode='' fd_links='' fd_dev='' fd_ino=''
+
+  if output=$(command stat -Lc '%u %a %h %d %i' "/proc/self/fd/$fd" 2>/dev/null) ||
+    output=$(command stat -Lf '%u %Lp %l %d %i' "/dev/fd/$fd" 2>/dev/null); then
+    read -r fd_uid fd_mode fd_links fd_dev fd_ino <<<"$output"
+    if [[ $fd_uid == "$EUID" && $fd_mode == 600 &&
+      $fd_dev == "$expected_dev" && $fd_ino == "$expected_ino" ]]; then
+      REPLY_UID=$fd_uid
+      REPLY_MODE=$fd_mode
+      REPLY_LINKS=$fd_links
+      REPLY_DEV=$fd_dev
+      REPLY_INO=$fd_ino
+      return 0
+    fi
+  fi
+
+  output=$(_dot_overlay_context_lsof "$fd") || return 1
+  fd_uid=''
+  fd_links=''
+  fd_dev=''
+  fd_ino=''
+  while IFS= read -r line; do
+    case $line in
+      D*)
+        raw_dev=${line#D}
+        printf -v fd_dev '%d' "$raw_dev" 2>/dev/null || return 1
+        ;;
+      i*) fd_ino=${line#i} ;;
+      k*) fd_links=${line#k} ;;
+      u*) fd_uid=${line#u} ;;
+    esac
+  done <<<"$output"
+  [[ $fd_uid == "$EUID" && $fd_links =~ ^[0-9]+$ &&
+    $fd_dev == "$expected_dev" && $fd_ino == "$expected_ino" ]] || return 1
+  REPLY_UID=$fd_uid
+  REPLY_MODE=600
+  REPLY_LINKS=$fd_links
+  REPLY_DEV=$fd_dev
+  REPLY_INO=$fd_ino
+}
+
 _dot_overlay_context_absolute_canonical() {
   local path=$1
   _dot_overlay_field_safe "$path" || return 1
@@ -188,18 +246,27 @@ _dot_overlay_context_consume() {
   path_dev=$REPLY_DEV
   path_ino=$REPLY_INO
   exec {context_fd}<"$context" || return 1
-  if read -r fd_uid fd_mode fd_links fd_dev fd_ino < <(
-    command stat -Lc '%u %a %h %d %i' "/proc/self/fd/$context_fd" 2>/dev/null
-  ); then
-    :
-  elif read -r fd_uid fd_mode fd_links fd_dev fd_ino < <(
-    command stat -Lf '%u %Lp %l %d %i' "/dev/fd/$context_fd" 2>/dev/null
-  ); then
-    :
-  else
+  _dot_overlay_context_file_safe "$context" || {
     exec {context_fd}<&-
     return 1
-  fi
+  }
+  _dot_overlay_context_stat "$context" || {
+    exec {context_fd}<&-
+    return 1
+  }
+  [[ $REPLY_DEV == "$path_dev" && $REPLY_INO == "$path_ino" ]] || {
+    exec {context_fd}<&-
+    return 1
+  }
+  _dot_overlay_context_open_file_stat "$context_fd" "$path_dev" "$path_ino" || {
+    exec {context_fd}<&-
+    return 1
+  }
+  fd_uid=$REPLY_UID
+  fd_mode=$REPLY_MODE
+  fd_links=$REPLY_LINKS
+  fd_dev=$REPLY_DEV
+  fd_ino=$REPLY_INO
   if [[ $fd_uid != "$EUID" || $fd_mode != 600 || $fd_links != 1 ||
     $fd_dev != "$path_dev" || $fd_ino != "$path_ino" ]]; then
     exec {context_fd}<&-
@@ -211,18 +278,15 @@ _dot_overlay_context_consume() {
     exec {context_fd}<&-
     return 1
   }
-  if read -r fd_uid fd_mode fd_links fd_dev fd_ino < <(
-    command stat -Lc '%u %a %h %d %i' "/proc/self/fd/$context_fd" 2>/dev/null
-  ); then
-    :
-  elif read -r fd_uid fd_mode fd_links fd_dev fd_ino < <(
-    command stat -Lf '%u %Lp %l %d %i' "/dev/fd/$context_fd" 2>/dev/null
-  ); then
-    :
-  else
+  _dot_overlay_context_open_file_stat "$context_fd" "$path_dev" "$path_ino" || {
     exec {context_fd}<&-
     return 1
-  fi
+  }
+  fd_uid=$REPLY_UID
+  fd_mode=$REPLY_MODE
+  fd_links=$REPLY_LINKS
+  fd_dev=$REPLY_DEV
+  fd_ino=$REPLY_INO
   if [[ $fd_uid != "$EUID" || $fd_mode != 600 || $fd_links != 0 ||
     $fd_dev != "$path_dev" || $fd_ino != "$path_ino" ]]; then
     exec {context_fd}<&-
