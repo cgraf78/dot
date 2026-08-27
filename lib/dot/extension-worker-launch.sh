@@ -8,25 +8,55 @@
 # extension entry point is validated. Remove only that control plane, then let
 # the worker establish the documented option/trap baseline itself.
 
+if ! declare -F _dot_overlay_context_create >/dev/null 2>&1; then
+  # shellcheck source=overlay-context.sh
+  . "${BASH_SOURCE[0]%/*}/overlay-context.sh"
+fi
+
 _dot_extension_worker_exec() {
   local mode=${1:-} script=${2:-} temporary=${3:-} channel=${4:-}
+  local context=${5:-} token=${6:-}
   local bash_path=${BASH:-} function_name kind temporary_mode
 
-  [[ $# -eq 4 ]] || return 2
+  [[ $# -eq 6 ]] || return 2
   case $mode in
     merge | pre-sync | doctor) ;;
-    *) return 2 ;;
+    *)
+      rm -f -- "$context" 2>/dev/null || true
+      return 2
+      ;;
   esac
   case $bash_path in
-    /*) [[ -x $bash_path ]] || return 1 ;;
-    *) return 1 ;;
+    /*) [[ -x $bash_path ]] || {
+      rm -f -- "$context" 2>/dev/null || true
+      return 1
+    } ;;
+    *)
+      rm -f -- "$context" 2>/dev/null || true
+      return 1
+      ;;
   esac
-  [[ -d $temporary && ! -L $temporary && -O $temporary ]] || return 1
+  [[ -d $temporary && ! -L $temporary && -O $temporary ]] || {
+    rm -f -- "$context" 2>/dev/null || true
+    return 1
+  }
   temporary_mode=$(command stat -c '%a' "$temporary" 2>/dev/null ||
-    command stat -f '%Lp' "$temporary" 2>/dev/null) || return 1
-  [[ $temporary_mode != *[!0-7]* ]] || return 1
-  (((8#$temporary_mode & 077) == 0)) || return 1
-  [[ -n $channel ]] || return 1
+    command stat -f '%Lp' "$temporary" 2>/dev/null) || {
+    rm -f -- "$context" 2>/dev/null || true
+    return 1
+  }
+  [[ $temporary_mode != *[!0-7]* ]] || {
+    rm -f -- "$context" 2>/dev/null || true
+    return 1
+  }
+  (((8#$temporary_mode & 077) == 0)) || {
+    rm -f -- "$context" 2>/dev/null || true
+    return 1
+  }
+  [[ -n $channel && -n $context && -n $token ]] || {
+    rm -f -- "$context" 2>/dev/null || true
+    return 1
+  }
 
   # Exported Bash functions are encoded as environment records during exec.
   # Removing their export attribute in this launcher subshell preserves the
@@ -67,7 +97,7 @@ _dot_extension_worker_exec() {
   exec </dev/null
   exec "$bash_path" --noprofile --norc \
     "$DOT_SOURCE_ROOT/lib/dot/extension-worker.sh" \
-    "$mode" "$script" "$channel"
+    "$mode" "$script" "$channel" "$context" "$token"
 }
 
 # Synchronous callers must survive the worker's exec so they can record status

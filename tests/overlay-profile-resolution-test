@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/public/xdg.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/log.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/temp.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/platform.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/profiles.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/overlays.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/repos/config.sh"
+
+HOME=$DOT_TEST_TMP/home
+XDG_CONFIG_HOME=$HOME/.config
+mkdir -p "$XDG_CONFIG_HOME/dot/profiles.d" \
+  "$XDG_CONFIG_HOME/dot/overlays.d" \
+  "$XDG_CONFIG_HOME/dot/profile-selectors.d" \
+  "$XDG_CONFIG_HOME/dot/profile-selectors.local.d"
+chmod 0700 "$XDG_CONFIG_HOME/dot/profile-selectors.local.d"
+
+printf 'version=1\noverlays=personal\n' \
+  >"$XDG_CONFIG_HOME/dot/profiles.d/base.conf"
+printf 'version=1\nprofiles=base\noverlays=nvim\n' \
+  >"$XDG_CONFIG_HOME/dot/profiles.d/editor.conf"
+printf 'version=1\nprofiles=editor\noverlays=dev,work\n' \
+  >"$XDG_CONFIG_HOME/dot/profiles.d/dev.conf"
+printf 'url=https://example.invalid/personal.git\noptional=true\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/80-personal.conf"
+printf 'url=https://example.invalid/nvim.git\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/20-nvim.conf"
+printf 'this selected descriptor is malformed\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/30-dev.conf"
+printf 'url=https://example.invalid/work.git\noptional=true\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/90-work.conf"
+
+fake_bin=$DOT_TEST_TMP/bin
+mkdir "$fake_bin"
+cat >"$fake_bin/id" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' example-user
+SH
+cat >"$fake_bin/hostname" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' example-host
+SH
+chmod +x "$fake_bin/id" "$fake_bin/hostname"
+PATH=$fake_bin:$PATH
+
+_dot_resolve_overlays inspect
+assert_eq base "$SELECTED_PROFILE" 'inspect defaults to base'
+assert_eq personal "${SELECTED_OVERLAY_NAMES[*]}" 'base selection ignores other descriptors'
+assert_eq personal "${ELIGIBLE_OVERLAY_NAMES[*]}" 'base eligible overlay'
+assert_eq '' "${ACTIVE_OVERLAY_NAMES[*]}" 'missing optional overlay is unavailable'
+assert_eq '' "${OVERLAYS[*]}" 'inspect publishes active overlays only'
+assert_contains 'dev|not-selected|' "${DOT_OVERLAY_LIFECYCLE[*]}" \
+  'unselected malformed descriptor is classified without parsing'
+
+printf 'version=1\nuser=example-user\nprofile=editor\n' \
+  >"$XDG_CONFIG_HOME/dot/profile-selectors.local.d/editor.conf"
+chmod 0600 "$XDG_CONFIG_HOME/dot/profile-selectors.local.d/editor.conf"
+_dot_resolve_overlays inspect
+assert_eq editor "$SELECTED_PROFILE" 'inspect resolves machine-local selector'
+assert_eq 'personal nvim' "${SELECTED_OVERLAY_NAMES[*]}" 'editor selected overlays'
+assert_eq 'nvim personal' "${ELIGIBLE_OVERLAY_NAMES[*]}" \
+  'descriptor order remains authoritative'
+
+printf 'version=1\nuser=example-user\nprofile=dev\n' \
+  >"$XDG_CONFIG_HOME/dot/profile-selectors.local.d/editor.conf"
+if _dot_resolve_overlays inspect >/dev/null 2>&1; then
+  fail 'selected malformed dev descriptor did not fail'
+fi
+
+printf 'version=1\nuser=example-user\nprofile=editor\n' \
+  >"$XDG_CONFIG_HOME/dot/profile-selectors.local.d/editor.conf"
+mv "$XDG_CONFIG_HOME/dot/overlays.d/20-nvim.conf" \
+  "$XDG_CONFIG_HOME/dot/overlays.d/20-editor.conf"
+if _dot_resolve_overlays inspect >/dev/null 2>&1; then
+  fail 'missing selected descriptor did not fail'
+fi
+mv "$XDG_CONFIG_HOME/dot/overlays.d/20-editor.conf" \
+  "$XDG_CONFIG_HOME/dot/overlays.d/20-nvim.conf"
+
+printf 'url=https://example.invalid/duplicate.git\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/21-nvim.local.conf"
+if _dot_resolve_overlays inspect >/dev/null 2>&1; then
+  fail 'ambiguous descriptor filenames did not fail'
+fi
+rm "$XDG_CONFIG_HOME/dot/overlays.d/21-nvim.local.conf"
+
+# Legacy clients without profiles continue to discover every valid descriptor.
+rm -rf "$XDG_CONFIG_HOME/dot/profiles.d"
+rm "$XDG_CONFIG_HOME/dot/overlays.d/30-dev.conf"
+_dot_resolve_overlays inspect
+assert_eq 0 "$DOT_PROFILES_PRESENT" 'legacy resolver mode'
+assert_eq 'nvim personal work' "${ELIGIBLE_OVERLAY_NAMES[*]}" \
+  'legacy resolver keeps all-descriptor behavior'
+
+# Converge resolves profile selection only after the phase-one optional source
+# has had a chance to become active and provide repository-only selectors.
+converge_home=$DOT_TEST_TMP/converge-home
+HOME=$converge_home
+XDG_CONFIG_HOME=$HOME/.config
+mkdir -p "$XDG_CONFIG_HOME/dot/profiles.d" "$XDG_CONFIG_HOME/dot/overlays.d"
+printf 'version=1\noverlays=personal\n' >"$XDG_CONFIG_HOME/dot/profiles.d/base.conf"
+printf 'version=1\nprofiles=base\noverlays=nvim\n' >"$XDG_CONFIG_HOME/dot/profiles.d/editor.conf"
+printf 'version=1\nprofiles=editor\noverlays=dev,work\n' \
+  >"$XDG_CONFIG_HOME/dot/profiles.d/dev.conf"
+for spec in \
+  '20-nvim:https://example.invalid/nvim.git:false' \
+  '30-dev:https://example.invalid/dev.git:false' \
+  '80-personal:https://example.invalid/personal.git:true' \
+  '90-work:https://example.invalid/work.git:true'; do
+  prefix=${spec%%:*}
+  rest=${spec#*:}
+  optional=${rest##*:}
+  url=${rest%:*}
+  printf 'url=%s\noptional=%s\n' "$url" "$optional" \
+    >"$XDG_CONFIG_HOME/dot/overlays.d/$prefix.conf"
+done
+events=$DOT_TEST_TMP/converge-events
+: >"$events"
+_run_pre_sync_extensions() {
+  local stage=$1
+  shift
+  printf 'pre-sync:%s:%s\n' "$stage" "$*" >>"$events"
+}
+_pull_overlays() {
+  local entry name path
+  printf 'pull:%s\n' "${OVERLAYS[*]}" >>"$events"
+  for entry in "${OVERLAYS[@]+"${OVERLAYS[@]}"}"; do
+    IFS='|' read -r name path _ <<<"$entry"
+    mkdir -p "$path/.git" "$path/dot/profile-selectors.d"
+    if [[ $name == personal ]]; then
+      printf 'version=1\nuser=example-user\nprofile=dev\n' \
+        >"$path/dot/profile-selectors.d/dev.conf"
+    fi
+  done
+  # shellcheck disable=SC2034 # Consumed dynamically by the convergence helper.
+  DOT_PULL_OVERLAY_FAILED=0
+}
+_overlay_record_active_existing() {
+  local record=$1 path
+  IFS='|' read -r _ path _ <<<"$record"
+  [[ -d $path/.git ]]
+}
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/update.sh"
+_dot_converge_overlays
+assert_eq dev "$SELECTED_PROFILE" 'phase-one personal selector chooses final profile'
+assert_eq 'nvim dev personal work' "${ACTIVE_OVERLAY_NAMES[*]}" \
+  'final active set retains descriptor precedence'
+converge_log=$(<"$events")
+assert_contains 'pre-sync:prepare:personal|' "$converge_log" \
+  'phase-one prepare sees only base-selected eligible records'
+assert_contains 'pre-sync:reconcile:nvim|' "$converge_log" \
+  'final reconcile sees the final eligible records'
+pull_count=$(grep -c '^pull:' "$events")
+assert_eq 2 "$pull_count" 'converge has phase-one and additions sync passes'
+second_pull=$(grep '^pull:' "$events" | tail -1)
+[[ $second_pull != *'personal|'* ]] ||
+  fail 'phase-one overlay was synchronized twice'
+
+# Real command dispatch keeps inspection offline and fetch/push scoped to an
+# existing selected checkout. The unselected malformed descriptor is never
+# opened by any of these commands.
+command_home=$DOT_TEST_TMP/command-home
+command_state=$DOT_TEST_TMP/command-state
+command_bin=$DOT_TEST_TMP/command-bin
+command_log=$DOT_TEST_TMP/command-git.log
+mkdir -p "$command_home/.config/dot/profiles.d" \
+  "$command_home/.config/dot/overlays.d" \
+  "$command_home/.config/dot/profile-selectors.local.d" "$command_bin"
+chmod 0700 "$command_home/.config/dot/profile-selectors.local.d"
+printf 'version=1\noverlays=personal\n' \
+  >"$command_home/.config/dot/profiles.d/base.conf"
+printf 'version=1\nprofiles=base\noverlays=nvim\n' \
+  >"$command_home/.config/dot/profiles.d/editor.conf"
+printf 'version=1\nprofiles=editor\noverlays=dev\n' \
+  >"$command_home/.config/dot/profiles.d/dev.conf"
+printf 'url=https://example.invalid/nvim.git\n' \
+  >"$command_home/.config/dot/overlays.d/20-nvim.conf"
+printf 'malformed and unselected\n' \
+  >"$command_home/.config/dot/overlays.d/30-dev.conf"
+printf 'url=https://example.invalid/personal.git\noptional=true\n' \
+  >"$command_home/.config/dot/overlays.d/80-personal.conf"
+printf 'version=1\nuser=example-user\nprofile=editor\n' \
+  >"$command_home/.config/dot/profile-selectors.local.d/editor.conf"
+chmod 0600 "$command_home/.config/dot/profile-selectors.local.d/editor.conf"
+git init -q "$command_home/.dotfiles-nvim"
+git -C "$command_home/.dotfiles-nvim" remote add origin \
+  https://example.invalid/nvim.git
+real_git=$(type -P git)
+cat >"$command_bin/git" <<'GIT'
+#!/usr/bin/env bash
+set -e
+for arg in "$@"; do
+  case $arg in
+    clone | pull)
+      printf 'forbidden:%s\n' "$*" >>"$DOT_TEST_GIT_LOG"
+      exit 99
+      ;;
+    fetch | push)
+      printf '%s:%s\n' "$arg" "$*" >>"$DOT_TEST_GIT_LOG"
+      exit 0
+      ;;
+  esac
+done
+exec "$DOT_TEST_REAL_GIT" "$@"
+GIT
+chmod +x "$command_bin/git"
+for command in status diff doctor 'test --list'; do
+  : >"$command_log"
+  # shellcheck disable=SC2086 # Exercise the documented command words.
+  PATH="$fake_bin:$command_bin:$PATH" HOME=$command_home \
+    XDG_STATE_HOME=$command_state DOT_TEST_REAL_GIT=$real_git \
+    DOT_TEST_GIT_LOG=$command_log "$DOT_TEST_ROOT/bin/dot" $command \
+    >/dev/null 2>&1 || [[ $command == doctor ]]
+  assert_eq '' "$(<"$command_log")" "$command performs no network operation"
+done
+for command in fetch push; do
+  : >"$command_log"
+  PATH="$fake_bin:$command_bin:$PATH" HOME=$command_home \
+    XDG_STATE_HOME=$command_state DOT_TEST_REAL_GIT=$real_git \
+    DOT_TEST_GIT_LOG=$command_log "$DOT_TEST_ROOT/bin/dot" "$command" \
+    >/dev/null 2>&1
+  assert_contains "$command:-C $command_home/.dotfiles-nvim $command" \
+    "$(<"$command_log")" "$command includes selected existing overlay"
+  [[ $(<"$command_log") != *'.dotfiles-dev'* ]] ||
+    fail "$command included an unselected overlay"
+done
+
+printf 'overlay-profile-resolution-test: ok\n'

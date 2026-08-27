@@ -132,6 +132,18 @@ _repo_candidate_adapter_allowed() {
     _dot_stdin_matches_file "$DOT_SOURCE_ROOT/support/client-launcher.sh"
 }
 
+_repo_overlay_control_path_reserved() {
+  local path=$1 root
+  for root in \
+    .config/dot/profiles.d \
+    .config/dot/profile-selectors.d; do
+    if [[ $path == "$root" || $path == "$root"/* || $root == "$path"/* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Validate a fetched candidate before any checkout, rebase, or overlay link can
 # expose its tree beneath HOME. Base paths map directly; overlay paths map only
 # the repository's home/ subtree.
@@ -176,6 +188,11 @@ _repo_validate_candidate_tree() {
       esac
     else
       relative=$path
+    fi
+    if [[ $kind == overlay ]] && _repo_overlay_control_path_reserved "$relative"; then
+      _warn "  warning: overlay candidate owns reserved control-plane path: $relative"
+      valid=0
+      break
     fi
     if _dot_candidate_path_is_reserved_from_roots \
       "$HOME/$relative" "$reserved_roots" &&

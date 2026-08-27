@@ -1391,10 +1391,7 @@ _dot_init_forward_converge() {
     local DOT_DEPENDENCY_PROVIDER=none
     export DOT_DEPENDENCY_PROVIDER
   fi
-  _discover_overlays || return 1
-  _preflight_local_overlays || return 1
   _ui_begin 5
-  _run_pre_sync_extensions || return 1
   _dot_update_sync_repos || status=1
   _dot_update_finalize "$status"
 }

@@ -18,6 +18,7 @@ declare -A _DOT_PROFILE_STATES=()
 declare -A _DOT_PROFILE_NAMES=()
 
 _dot_profile_error() {
+  DOT_PROFILE_CONFIGURATION_ERROR=$*
   printf 'dot: profile: %s\n' "$*" >&2
   return 1
 }
@@ -136,12 +137,21 @@ _dot_profile_parse_definition() {
 
 _dot_profile_append_unique() {
   local array_name=$1 value=$2 existing
-  local -n array_ref=$array_name
-
-  for existing in "${array_ref[@]+"${array_ref[@]}"}"; do
-    [[ $existing != "$value" ]] || return 0
-  done
-  array_ref+=("$value")
+  case $array_name in
+    INCLUDED_PROFILES)
+      for existing in "${INCLUDED_PROFILES[@]+"${INCLUDED_PROFILES[@]}"}"; do
+        [[ $existing != "$value" ]] || return 0
+      done
+      INCLUDED_PROFILES+=("$value")
+      ;;
+    SELECTED_OVERLAY_NAMES)
+      for existing in "${SELECTED_OVERLAY_NAMES[@]+"${SELECTED_OVERLAY_NAMES[@]}"}"; do
+        [[ $existing != "$value" ]] || return 0
+      done
+      SELECTED_OVERLAY_NAMES+=("$value")
+      ;;
+    *) return 2 ;;
+  esac
 }
 
 _dot_profile_expand() {
@@ -193,6 +203,7 @@ _dot_profiles_load() {
   SELECTED_OVERLAY_NAMES=()
   DOT_PROFILE_SELECTOR_MATCHES=()
   DOT_PROFILE_SELECTOR_RECORDS=()
+  unset DOT_PROFILE_CONFIGURATION_ERROR
   _DOT_PROFILE_PARENTS=()
   _DOT_PROFILE_OVERLAYS=()
   _DOT_PROFILE_STATES=()
@@ -363,8 +374,10 @@ _dot_profile_read_selector_dir() {
 }
 
 _dot_profile_resolve() {
-  local root_dir=${1:-} local_dir=${2:-} personal_dir=${3:-}
+  local root_dir=${1:-} local_dir=${2:-}
   local identity host
+  local personal_dir
+  shift 2 || true
 
   [[ $DOT_PROFILES_PRESENT -eq 1 ]] || return 0
   identity=$(id -un 2>/dev/null) || _dot_profile_error 'cannot determine current user' || return
@@ -383,7 +396,9 @@ _dot_profile_resolve() {
 
   _dot_profile_read_selector_dir root "$root_dir" || return
   _dot_profile_read_selector_dir local "$local_dir" || return
-  _dot_profile_read_selector_dir personal "$personal_dir" || return
+  for personal_dir in "$@"; do
+    _dot_profile_read_selector_dir personal "$personal_dir" || return
+  done
   if [[ -z $SELECTED_PROFILE ]]; then
     SELECTED_PROFILE=base
   else
@@ -391,4 +406,36 @@ _dot_profile_resolve() {
     DOT_PROFILE_SELECTION_STATE=agreed-match
   fi
   _dot_profile_flatten "$SELECTED_PROFILE"
+}
+
+_dot_profiles_load_default() {
+  dot_xdg_path config dot/profiles.d || return
+  _dot_profiles_load "$REPLY"
+}
+
+_dot_profile_select_base() {
+  [[ $DOT_PROFILES_PRESENT -eq 1 ]] || return 0
+  SELECTED_PROFILE=base
+  DOT_PROFILE_SELECTION_STATE=phase-one
+  DOT_PROFILE_SELECTOR_MATCHES=()
+  DOT_PROFILE_SELECTOR_RECORDS=()
+  _dot_profile_flatten base
+}
+
+_dot_profile_resolve_default() {
+  local entry path
+  local -a personal_dirs=()
+
+  dot_xdg_path config dot/profile-selectors.d || return
+  local root_dir=$REPLY
+  dot_xdg_path config dot/profile-selectors.local.d || return
+  local local_dir=$REPLY
+  for entry in "${ACTIVE_OVERLAYS[@]+"${ACTIVE_OVERLAYS[@]}"}"; do
+    IFS='|' read -r _ path _ <<<"$entry"
+    [[ -d $path/dot/profile-selectors.d && ! -L $path/dot/profile-selectors.d ]] ||
+      continue
+    personal_dirs+=("$path/dot/profile-selectors.d")
+  done
+  _dot_profile_resolve "$root_dir" "$local_dir" \
+    "${personal_dirs[@]+"${personal_dirs[@]}"}"
 }

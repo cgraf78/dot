@@ -1013,10 +1013,13 @@ printf 'called\n' >"${DOT_TEST_PROVIDER_CURL_MARKER:?}"
 exit 86
 CURL
 chmod 0755 "$init_skip_bin/curl"
-PATH="$init_skip_bin:$PATH" DOT_INIT_SKIP_PROVIDER=1 \
+if ! PATH="$init_skip_bin:$PATH" DOT_INIT_SKIP_PROVIDER=1 \
   DOT_TEST_PROVIDER_CURL_MARKER=$init_skip_marker \
   run_dot "$init_overlay_home" "$init_overlay_state" init --yes \
-  "file://$init_overlay_base_origin" >/dev/null 2>"$init_skip_plan"
+  "file://$init_overlay_base_origin" >/dev/null 2>"$init_skip_plan"; then
+  sed -n '1,200p' "$init_skip_plan" >&2
+  fail 'provider-suppressed init failed'
+fi
 [[ ! -e $init_skip_marker ]] ||
   fail 'provider-suppressed init attempted provider bootstrap'
 assert_contains 'dependency provider: shdeps (skipped for this invocation)' \

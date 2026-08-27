@@ -49,20 +49,79 @@ _dot_update_prepare_shdeps_jobs() {
   export SHDEPS_JOBS
 }
 
+_dot_converge_overlays() {
+  local entry name phase_status=0 final_status=0
+  local -A phase_one_names=()
+  local -a additions=()
+
+  _dot_profiles_load_default || return 1
+  if [[ $DOT_PROFILES_PRESENT -eq 0 ]]; then
+    _discover_overlays || return 1
+    _run_pre_sync_extensions reconcile \
+      "${ELIGIBLE_OVERLAYS[@]+"${ELIGIBLE_OVERLAYS[@]}"}" || return 1
+    _dot_overlay_use_set eligible
+    _pull_overlays "$@" || phase_status=$?
+    [[ ${DOT_PULL_OVERLAY_FAILED:-0} -eq 0 ]] || phase_status=1
+    _discover_overlays || return 1
+    _dot_overlay_use_set active
+    return "$phase_status"
+  fi
+
+  _dot_profile_select_base || return 1
+  _discover_overlays || return 1
+  _preflight_local_overlays || return 1
+  # shellcheck disable=SC2034 # Published for lifecycle doctor reporting.
+  PHASE_ONE_SELECTED_OVERLAY_NAMES=(
+    "${SELECTED_OVERLAY_NAMES[@]+"${SELECTED_OVERLAY_NAMES[@]}"}"
+  )
+  PHASE_ONE_ELIGIBLE_OVERLAYS=(
+    "${ELIGIBLE_OVERLAYS[@]+"${ELIGIBLE_OVERLAYS[@]}"}"
+  )
+  _run_pre_sync_extensions prepare \
+    "${PHASE_ONE_ELIGIBLE_OVERLAYS[@]+"${PHASE_ONE_ELIGIBLE_OVERLAYS[@]}"}" ||
+    return 1
+  _dot_overlay_use_set eligible
+  _pull_overlays "$@" || phase_status=$?
+  [[ ${DOT_PULL_OVERLAY_FAILED:-0} -eq 0 ]] || phase_status=1
+  _discover_overlays || return 1
+  # shellcheck disable=SC2034 # Published for lifecycle doctor reporting.
+  PHASE_ONE_ACTIVE_OVERLAYS=(
+    "${ACTIVE_OVERLAYS[@]+"${ACTIVE_OVERLAYS[@]}"}"
+  )
+  _dot_overlay_use_set active
+
+  _dot_profile_resolve_default || return 1
+  _discover_overlays || return 1
+  _run_pre_sync_extensions reconcile \
+    "${ELIGIBLE_OVERLAYS[@]+"${ELIGIBLE_OVERLAYS[@]}"}" || return 1
+  for entry in "${PHASE_ONE_ELIGIBLE_OVERLAYS[@]+"${PHASE_ONE_ELIGIBLE_OVERLAYS[@]}"}"; do
+    name=${entry%%|*}
+    phase_one_names["$name"]=1
+  done
+  for entry in "${ELIGIBLE_OVERLAYS[@]+"${ELIGIBLE_OVERLAYS[@]}"}"; do
+    name=${entry%%|*}
+    [[ -n ${phase_one_names[$name]+x} ]] || additions+=("$entry")
+  done
+  OVERLAYS=("${additions[@]+"${additions[@]}"}")
+  _pull_overlays "$@" || final_status=$?
+  [[ ${DOT_PULL_OVERLAY_FAILED:-0} -eq 0 ]] || final_status=1
+  _discover_overlays || return 1
+  _dot_overlay_use_set active
+  [[ $phase_status -eq 0 && $final_status -eq 0 ]]
+}
+
 _dot_update_sync_repos() {
   local sync_status=0
   if _base_repo_exists; then
+    # shellcheck disable=SC2034 # Repository helpers consume the selected set dynamically.
+    OVERLAYS=()
     if _repo_pull_all "$@"; then
       :
     else
       sync_status=$?
     fi
   else
-    if _dot_update_no_base_pull; then
-      :
-    else
-      sync_status=$?
-    fi
+    _ensure_repo_config
   fi
 
   if [[ "$sync_status" -ne 0 ]]; then
@@ -75,6 +134,15 @@ _dot_update_sync_repos() {
     return "$sync_status"
   fi
 
+  # A base pull may replace profile and descriptor policy. Reload data from the
+  # accepted generation before either phase is resolved or any overlay
+  # transport preparation runs.
+  dot_config_load || return 1
+  if [[ ${DOT_INIT_SKIP_PROVIDER:-0} == 1 ]]; then
+    DOT_DEPENDENCY_PROVIDER=none
+    export DOT_DEPENDENCY_PROVIDER
+  fi
+  _dot_converge_overlays "$@"
 }
 
 _dot_update_finalize() {
@@ -173,11 +241,6 @@ _dot_update() {
     esac
   done
 
-  # The launcher performs this before entering update. Keep a defensive gate
-  # here for sourced callers so SSH, repository, and HOME mutations cannot
-  # precede validation of an active filesystem overlay.
-  _preflight_local_overlays || return 1
-
   _ui_begin 5
 
   # Cron updates must never fight with active local edits. First discard
@@ -189,16 +252,11 @@ _dot_update() {
     fi
   fi
 
-  _run_pre_sync_extensions || return 1
-
   if _dot_update_sync_repos "$@"; then
     # The base pull may replace client policy. Reload it before overlay linking
     # or provider selection so this invocation cannot continue under stale
     # permissions or freshness policy.
-    if ! dot_config_load; then
-      _ui_done 1
-      return 1
-    fi
+    :
   else
     update_status=1
   fi

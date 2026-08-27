@@ -159,6 +159,7 @@ _dot_reserved_roots() {
     "$HOME/.local/lib/.dot.dot-install-stage-v1" \
     "$HOME/.local/bin/dot" \
     "$HOME/.local/lib/dot" \
+    "$HOME/.config/dot/profile-selectors.local.d" \
     "$checkout" \
     "$parent/.$name.install.lock" \
     "$parent/.$name.install.transaction" \

@@ -29,6 +29,7 @@ program	lib/dot/merge-block.sh
 program	lib/dot/merge-hooks.sh
 program	lib/dot/merges.sh
 program	lib/dot/overlays.sh
+program	lib/dot/overlay-context.sh
 program	lib/dot/platform.sh
 program	lib/dot/profiles.sh
 program	lib/dot/pre-sync.sh
@@ -71,6 +72,7 @@ program	tests/config-test
 program	tests/doctor-test
 program	tests/examples-test
 program	tests/extensions-api-test
+program	tests/extension-worker-context-test
 program	tests/families-test
 program	tests/hook-api-test
 program	tests/hooks-test
@@ -81,6 +83,7 @@ program	tests/lib/repo.sh
 program	tests/lib/test.sh
 program	tests/license-test
 program	tests/merge-block-test
+program	tests/overlay-profile-resolution-test
 program	tests/provider-suite-wrapper
 program	tests/provenance-test
 program	tests/profiles-test

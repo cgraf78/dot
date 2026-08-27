@@ -38,7 +38,11 @@ _dot_pre_sync_specs() {
 }
 
 _run_pre_sync_extensions() {
-  local specs key script temporary result status=0
+  local stage=${1:-} specs key script temporary result status=0 context token
+  shift || true
+  local -a records=("$@")
+
+  case $stage in prepare | reconcile) ;; *) return 2 ;; esac
 
   specs=$(_dot_pre_sync_specs) || return 1
   [[ -n $specs ]] || return 0
@@ -49,7 +53,12 @@ _run_pre_sync_extensions() {
     result=$temporary/result
     : >"$result" || return 1
     chmod 0600 "$result" || return 1
-    if ! _dot_extension_worker_run pre-sync "$script" "$temporary" "$result"; then
+    _dot_overlay_context_create "$temporary" pre-sync eligible "$stage" \
+      "${records[@]+"${records[@]}"}" || return 1
+    context=$REPLY_PATH
+    token=$REPLY_TOKEN
+    if ! _dot_extension_worker_run pre-sync "$script" "$temporary" "$result" \
+      "$context" "$token"; then
       _warn "  warning: pre-sync extension failed: ${script##*/}"
       status=1
       _dot_cleanup_remove_path "$temporary" || true

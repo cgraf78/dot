@@ -23,6 +23,8 @@ _DOT_RUNTIME_DIR=${BASH_SOURCE[0]%/*}
 . "$_DOT_RUNTIME_DIR/profiles.sh"
 # shellcheck source=overlays.sh
 . "$_DOT_RUNTIME_DIR/overlays.sh"
+# shellcheck source=overlay-context.sh
+. "$_DOT_RUNTIME_DIR/overlay-context.sh"
 # shellcheck source=merge-block.sh
 . "$_DOT_RUNTIME_DIR/merge-block.sh"
 # shellcheck source=families.sh

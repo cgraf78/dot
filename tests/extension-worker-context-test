@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+
+HOME=$DOT_TEST_TMP/home
+DOT_SOURCE_ROOT=$DOT_TEST_ROOT
+DOT_EXTENSIONS_DIR=$HOME/extensions
+export HOME DOT_SOURCE_ROOT DOT_EXTENSIONS_DIR
+mkdir -p "$DOT_EXTENSIONS_DIR/pre-sync.d" "$DOT_EXTENSIONS_DIR/merge-hooks.d" \
+  "$DOT_EXTENSIONS_DIR/doctor.d"
+chmod 0700 "$DOT_EXTENSIONS_DIR" "$DOT_EXTENSIONS_DIR"/*
+
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/public/xdg.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/temp.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/overlay-context.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/extension-worker-launch.sh"
+
+descriptor=$HOME/.config/dot/overlays.d/10-example.conf
+overlay=$HOME/.dotfiles-example
+origin=https://example.invalid/example.git
+mkdir -p "${descriptor%/*}" "$overlay"
+printf 'url=%s\n' "$origin" >"$descriptor"
+records=("example|$overlay|$origin|$descriptor|true|git")
+
+pre_sync=$DOT_EXTENSIONS_DIR/pre-sync.d/10-context.sh
+cat >"$pre_sync" <<'HOOK'
+prepare() {
+  [[ $DOT_PRE_SYNC_STAGE == prepare ]]
+  [[ ${#OVERLAYS[@]} -eq 1 ]]
+  [[ ${OVERLAYS[0]} == "example|$HOME/.dotfiles-example|https://example.invalid/example.git|$HOME/.config/dot/overlays.d/10-example.conf|true|git" ]]
+}
+HOOK
+chmod 0600 "$pre_sync"
+
+temporary=$HOME/worker
+mkdir "$temporary"
+chmod 0700 "$temporary"
+result=$temporary/result
+: >"$result"
+chmod 0600 "$result"
+_dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+_dot_extension_worker_run pre-sync "$pre_sync" "$temporary" "$result" \
+  "$context" "$token"
+assert_eq 1 "$(<"$result")" 'pre-sync worker ran with decoded context'
+[[ ! -e $context && ! -L $context ]] || fail 'worker did not consume context'
+
+for case_name in token tamper unsafe-mode expired symlink wrong-mode wrong-kind wrong-stage reuse; do
+  : >"$result"
+  _dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
+  context=$REPLY_PATH
+  token=$REPLY_TOKEN
+  case $case_name in
+    token) token=wrong-token ;;
+    tamper) printf 'trailing' >>"$context" ;;
+    unsafe-mode) chmod 0644 "$context" ;;
+    expired) touch -t 200001010000 "$context" ;;
+    symlink)
+      saved_context=$temporary/saved-context
+      mv "$context" "$saved_context"
+      ln -s "$saved_context" "$context"
+      ;;
+    wrong-mode) ;;
+    wrong-kind)
+      rm "$context"
+      if _dot_overlay_context_create "$temporary" pre-sync active prepare \
+        "${records[@]}" >/dev/null 2>&1; then
+        fail 'context encoder accepted wrong set kind'
+      fi
+      continue
+      context=$REPLY_PATH
+      token=$REPLY_TOKEN
+      ;;
+    wrong-stage)
+      rm "$context"
+      if _dot_overlay_context_create "$temporary" pre-sync eligible none \
+        "${records[@]}" >/dev/null 2>&1; then
+        fail 'context encoder accepted wrong stage'
+      fi
+      continue
+      context=$REPLY_PATH
+      token=$REPLY_TOKEN
+      ;;
+    reuse) ;;
+  esac
+  worker_mode=pre-sync
+  [[ $case_name != wrong-mode ]] || worker_mode=merge
+  if [[ $case_name == reuse ]]; then
+    _dot_extension_worker_run pre-sync "$pre_sync" "$temporary" "$result" \
+      "$context" "$token"
+    if _dot_extension_worker_run pre-sync "$pre_sync" "$temporary" "$result" \
+      "$context" "$token" >/dev/null 2>&1; then
+      fail 'worker reused consumed context'
+    fi
+    continue
+  fi
+  if _dot_extension_worker_run "$worker_mode" "$pre_sync" "$temporary" "$result" \
+    "$context" "$token" >/dev/null 2>&1; then
+    fail "worker accepted invalid context case: $case_name"
+  fi
+  rm -f "$context"
+done
+
+if _dot_overlay_context_create "$temporary" pre-sync eligible prepare \
+  "${records[0]}" "${records[0]}" >/dev/null 2>&1; then
+  fail 'context encoder accepted duplicate overlay records'
+fi
+invalid_records=("example|relative|$origin|$descriptor|true|git")
+if _dot_overlay_context_create "$temporary" pre-sync eligible prepare \
+  "${invalid_records[@]}" >/dev/null 2>&1; then
+  fail 'context encoder accepted an invalid overlay record'
+fi
+
+# A descriptor record must survive the real encoder/decoder byte-for-byte.
+roundtrip=$HOME/roundtrip
+mkdir "$roundtrip"
+chmod 0700 "$roundtrip"
+_dot_overlay_context_create "$roundtrip" pre-sync eligible reconcile "${records[@]}"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+OVERLAYS=()
+_dot_overlay_context_consume "$context" "$token" pre-sync
+assert_eq "${records[0]}" "${OVERLAYS[0]}" 'six-field context roundtrip'
+assert_eq reconcile "$REPLY_STAGE" 'context stage roundtrip'
+
+printf 'extension-worker-context-test: ok\n'

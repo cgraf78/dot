@@ -1412,4 +1412,65 @@ set -e
 assert_eq 1 "$partial_tree_status" \
   'update candidate validation rejects a failed ls-tree producer'
 
+# Profile definitions and tracked selectors are base-owned control plane.
+# Machine-local selectors are user-owned and no repository may publish them;
+# overlays may publish only repository-local selector fragments outside home/.
+fixture_repo profile-control-plane main \
+  .config/dot/profiles.d/base.conf $'version=1\noverlays=personal\n' 100644 \
+  .config/dot/profile-selectors.d/example.conf \
+  $'version=1\nuser=example-user\nprofile=base\n' 100644 \
+  home/.config/dot/profiles.d/base.conf $'version=1\noverlays=personal\n' 100644 \
+  home/.config/dot/profile-selectors.d/example.conf \
+  $'version=1\nuser=example-user\nprofile=base\n' 100644 \
+  dot/profile-selectors.d/private.conf \
+  $'version=1\nuser=example-user\nprofile=base\n' 100644
+profile_control_home=$DOT_TEST_TMP/profile-control-home
+mkdir -p "$profile_control_home"
+HOME=$profile_control_home DOT_SOURCE_ROOT=$root bash --noprofile --norc -c '
+  set -euo pipefail
+  . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/resources.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/init-client.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+  OVERLAYS=()
+  _repo_validate_candidate_tree base main git -C "$1"
+' -- "$DOT_TEST_TMP/profile-control-plane-seed" ||
+  fail 'base rejected tracked profile control-plane paths'
+if HOME=$profile_control_home DOT_SOURCE_ROOT=$root bash --noprofile --norc -c '
+  set -euo pipefail
+  . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/resources.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/init-client.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+  OVERLAYS=()
+  _repo_validate_candidate_tree overlay main git -C "$1"
+' -- "$DOT_TEST_TMP/profile-control-plane-seed" >/dev/null 2>&1; then
+  fail 'overlay accepted linked profile control-plane paths'
+fi
+
+fixture_repo profile-local-reserved main \
+  .config/dot/profile-selectors.local.d/host.conf \
+  $'version=1\nhost=example-host\nprofile=base\n' 100644 \
+  home/.config/dot/profile-selectors.local.d/host.conf \
+  $'version=1\nhost=example-host\nprofile=base\n' 100644
+for kind in base overlay; do
+  if HOME=$profile_control_home DOT_SOURCE_ROOT=$root bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/resources.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/init-client.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    OVERLAYS=()
+    _repo_validate_candidate_tree "$1" main git -C "$2"
+  ' -- "$kind" "$DOT_TEST_TMP/profile-local-reserved-seed" >/dev/null 2>&1; then
+    fail "$kind accepted machine-local selector ownership"
+  fi
+done
+
 printf 'repos-test: ok\n'
