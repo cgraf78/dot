@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/public/xdg.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/profiles.sh"
+
+write_profile() {
+  local root=$1 name=$2 body=$3
+  mkdir -p "$root"
+  printf '%s\n' "$body" >"$root/$name.conf"
+}
+
+write_selector() {
+  local root=$1 name=$2 body=$3
+  mkdir -p "$root"
+  printf '%s\n' "$body" >"$root/$name.conf"
+}
+
+run_resolution() {
+  local profiles=$1 root_selectors=$2 local_selectors=$3 personal_selectors=$4
+  _dot_profiles_load "$profiles"
+  _dot_profile_resolve "$root_selectors" "$local_selectors" "$personal_selectors"
+}
+
+HOME=$DOT_TEST_TMP/home
+mkdir -p "$HOME"
+chmod 0700 "$HOME"
+
+missing=$DOT_TEST_TMP/missing
+_dot_profiles_load "$missing"
+assert_eq 0 "$DOT_PROFILES_PRESENT" 'missing profiles retain legacy mode'
+assert_eq '' "${SELECTED_PROFILE:-}" 'legacy mode has no selected profile'
+
+profiles=$DOT_TEST_TMP/profiles
+root_selectors=$DOT_TEST_TMP/root-selectors
+local_selectors=$DOT_TEST_TMP/local-selectors
+personal_selectors=$DOT_TEST_TMP/personal-selectors
+mkdir -p "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+chmod 0700 "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+write_profile "$profiles" base $'version=1\noverlays=personal'
+write_profile "$profiles" editor $'version=1\nprofiles=base\noverlays=nvim'
+write_profile "$profiles" dev $'version=1\nprofiles=editor\noverlays=dev,work,nvim'
+
+fake_bin=$DOT_TEST_TMP/bin
+mkdir "$fake_bin"
+cat >"$fake_bin/id" <<'SH'
+#!/usr/bin/env bash
+[[ ${1:-} == -un ]] || exit 2
+printf '%s\n' example-user
+SH
+cat >"$fake_bin/hostname" <<'SH'
+#!/usr/bin/env bash
+[[ ${1:-} == -s ]] || exit 2
+printf '%s\n' 'Example-Host.'
+SH
+chmod +x "$fake_bin/id" "$fake_bin/hostname"
+PATH=$fake_bin:$PATH
+
+run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+assert_eq base "$SELECTED_PROFILE" 'no selector defaults to base'
+assert_eq base "${INCLUDED_PROFILES[*]}" 'base inclusion chain'
+assert_eq personal "${SELECTED_OVERLAY_NAMES[*]}" 'base overlay selection'
+assert_eq implicit-base "$DOT_PROFILE_SELECTION_STATE" 'implicit base state'
+
+write_selector "$root_selectors" user $'version=1\nuser=example-user\nprofile=editor'
+run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+assert_eq editor "$SELECTED_PROFILE" 'user-only selector'
+assert_eq 'base editor' "${INCLUDED_PROFILES[*]}" 'editor inclusion order'
+assert_eq 'personal nvim' "${SELECTED_OVERLAY_NAMES[*]}" 'editor overlay selection'
+assert_eq agreed-match "$DOT_PROFILE_SELECTION_STATE" 'matched state'
+assert_contains 'root:user.conf:editor' "${DOT_PROFILE_SELECTOR_MATCHES[*]}" \
+  'root selector provenance'
+
+rm "$root_selectors/user.conf"
+write_selector "$root_selectors" host $'version=1\nhost=example-host\nprofile=editor'
+run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+assert_eq editor "$SELECTED_PROFILE" 'host-only selector normalizes case and trailing dot'
+
+rm "$root_selectors/host.conf"
+write_selector "$root_selectors" combined $'version=1\nuser=example-user\nhost=example-host.\nprofile=dev'
+run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+assert_eq dev "$SELECTED_PROFILE" 'combined selector'
+assert_eq 'base editor dev' "${INCLUDED_PROFILES[*]}" 'recursive additive inclusion'
+assert_eq 'personal nvim dev work' "${SELECTED_OVERLAY_NAMES[*]}" \
+  'overlay order and deduplication'
+
+write_selector "$local_selectors" agree $'version=1\nuser=example-user\nprofile=dev'
+chmod 0600 "$local_selectors/agree.conf"
+run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+assert_eq dev "$SELECTED_PROFILE" 'agreeing matches are accepted'
+assert_eq 2 "${#DOT_PROFILE_SELECTOR_MATCHES[@]}" 'agreeing matches recorded'
+
+write_selector "$personal_selectors" conflict $'version=1\nhost=example-host\nprofile=editor'
+if run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors" \
+  >/dev/null 2>&1; then
+  fail 'accepted conflicting matching selectors'
+fi
+assert_eq conflict "$DOT_PROFILE_SELECTION_STATE" 'conflict state retained'
+rm "$personal_selectors/conflict.conf"
+
+write_selector "$root_selectors" wrong-case $'version=1\nuser=Example-User\nprofile=editor'
+run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+assert_eq dev "$SELECTED_PROFILE" 'user matching remains case-sensitive'
+rm "$root_selectors/wrong-case.conf"
+
+# One host may select independently for two users. Replace the identity command
+# between runs rather than adding a production-only environment override.
+write_selector "$root_selectors" second-user $'version=1\nuser=example-user-2\nhost=example-host\nprofile=editor'
+cat >"$fake_bin/id" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' example-user-2
+SH
+run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+assert_eq editor "$SELECTED_PROFILE" 'second user on same host'
+cat >"$fake_bin/id" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' example-user
+SH
+
+# An unavailable personal source is ignored; root/local matches still decide,
+# and no match still selects base.
+rm -rf "$personal_selectors"
+run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+assert_eq dev "$SELECTED_PROFILE" 'local match survives unavailable personal source'
+rm "$local_selectors/agree.conf" "$root_selectors/combined.conf"
+run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+assert_eq base "$SELECTED_PROFILE" 'unavailable personal source preserves base fallback'
+
+# Parent-only profiles are valid when their expansion is non-empty.
+write_profile "$profiles" parent-only $'version=1\nprofiles=base'
+write_selector "$root_selectors" parent-only $'version=1\nuser=example-user\nprofile=parent-only'
+run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+assert_eq personal "${SELECTED_OVERLAY_NAMES[*]}" 'parent-only profile expands'
+rm "$root_selectors/parent-only.conf" "$profiles/parent-only.conf"
+
+for invalid_case in unknown-parent direct-cycle indirect-cycle empty explicit-empty empty-expansion invalid-profile-name invalid-overlay-name; do
+  invalid_profiles=$DOT_TEST_TMP/profiles-$invalid_case
+  invalid_selectors=$DOT_TEST_TMP/selectors-$invalid_case
+  mkdir -p "$invalid_profiles" "$invalid_selectors"
+  case $invalid_case in
+    unknown-parent)
+      write_profile "$invalid_profiles" base $'version=1\nprofiles=missing'
+      ;;
+    direct-cycle)
+      write_profile "$invalid_profiles" base $'version=1\nprofiles=base'
+      ;;
+    indirect-cycle)
+      write_profile "$invalid_profiles" base $'version=1\nprofiles=editor'
+      write_profile "$invalid_profiles" editor $'version=1\nprofiles=base'
+      ;;
+    empty)
+      write_profile "$invalid_profiles" base 'version=1'
+      ;;
+    explicit-empty)
+      write_profile "$invalid_profiles" base $'version=1\noverlays='
+      ;;
+    empty-expansion)
+      write_profile "$invalid_profiles" base $'version=1\nprofiles=empty'
+      write_profile "$invalid_profiles" empty 'version=1'
+      ;;
+    invalid-profile-name)
+      write_profile "$invalid_profiles" 'Bad_Name' $'version=1\noverlays=personal'
+      ;;
+    invalid-overlay-name)
+      write_profile "$invalid_profiles" base $'version=1\noverlays=../personal'
+      ;;
+  esac
+  if _dot_profiles_load "$invalid_profiles" >/dev/null 2>&1; then
+    fail "accepted invalid profile case: $invalid_case"
+  fi
+done
+
+unknown_selected_profiles=$DOT_TEST_TMP/profiles-unknown-selected
+unknown_selected_selectors=$DOT_TEST_TMP/selectors-unknown-selected
+mkdir -p "$unknown_selected_profiles" "$unknown_selected_selectors"
+write_profile "$unknown_selected_profiles" base $'version=1\noverlays=personal'
+write_selector "$unknown_selected_selectors" unknown $'version=1\nuser=example-user\nprofile=missing'
+_dot_profiles_load "$unknown_selected_profiles"
+if _dot_profile_resolve "$unknown_selected_selectors" "$DOT_TEST_TMP/no-local" \
+  "$DOT_TEST_TMP/no-personal" >/dev/null 2>&1; then
+  fail 'accepted selector naming an unknown profile'
+fi
+
+for invalid in \
+  $'profile:version=1\nunknown=value' \
+  $'profile:version=1\nversion=1\noverlays=personal' \
+  $'selector:version=1\nprofile=base' \
+  $'selector:version=1\nuser=example-user\nuser=example-user\nprofile=base' \
+  $'selector:version=1\nuser=example-user\nprofile=base\nunknown=value'; do
+  kind=${invalid%%:*}
+  body=${invalid#*:}
+  invalid_root=$DOT_TEST_TMP/invalid-${RANDOM}-${RANDOM}
+  mkdir -p "$invalid_root"
+  if [[ $kind == profile ]]; then
+    write_profile "$invalid_root" base "$body"
+    if _dot_profiles_load "$invalid_root" >/dev/null 2>&1; then
+      fail "accepted malformed profile: $body"
+    fi
+  else
+    write_profile "$invalid_root/profiles" base $'version=1\noverlays=personal'
+    write_selector "$invalid_root/selectors" bad "$body"
+    _dot_profiles_load "$invalid_root/profiles"
+    if _dot_profile_resolve "$invalid_root/selectors" "$DOT_TEST_TMP/no-local" \
+      "$DOT_TEST_TMP/no-personal" >/dev/null 2>&1; then
+      fail "accepted malformed selector: $body"
+    fi
+  fi
+done
+
+security_profiles=$DOT_TEST_TMP/security-profiles
+mkdir -p "$security_profiles"
+write_profile "$security_profiles" base $'version=1\noverlays=personal'
+ln -s base.conf "$security_profiles/editor.conf"
+if _dot_profiles_load "$security_profiles" >/dev/null 2>&1; then
+  fail 'accepted symlinked profile'
+fi
+rm "$security_profiles/editor.conf"
+printf 'version=1\noverlays=personal\0bad\n' >"$security_profiles/control.conf"
+if _dot_profiles_load "$security_profiles" >/dev/null 2>&1; then
+  fail 'accepted profile control bytes'
+fi
+rm "$security_profiles/control.conf"
+dd if=/dev/zero of="$security_profiles/large.conf" bs=65537 count=1 2>/dev/null
+if _dot_profiles_load "$security_profiles" >/dev/null 2>&1; then
+  fail 'accepted oversized profile'
+fi
+
+local_security=$DOT_TEST_TMP/local-security
+mkdir -m 700 "$local_security"
+write_selector "$local_security" match $'version=1\nuser=example-user\nprofile=base'
+chmod 0660 "$local_security/match.conf"
+_dot_profiles_load "$profiles"
+if _dot_profile_resolve "$DOT_TEST_TMP/no-root" "$local_security" \
+  "$DOT_TEST_TMP/no-personal" >/dev/null 2>&1; then
+  fail 'accepted group-writable machine-local selector'
+fi
+chmod 0600 "$local_security/match.conf"
+chmod 0770 "$local_security"
+if _dot_profile_resolve "$DOT_TEST_TMP/no-root" "$local_security" \
+  "$DOT_TEST_TMP/no-personal" >/dev/null 2>&1; then
+  fail 'accepted group-writable machine-local selector directory'
+fi
+
+printf 'profiles-test: ok\n'

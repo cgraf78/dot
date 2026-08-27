@@ -19,6 +19,8 @@ _DOT_RUNTIME_DIR=${BASH_SOURCE[0]%/*}
 . "$_DOT_RUNTIME_DIR/temp.sh"
 # shellcheck source=platform.sh
 . "$_DOT_RUNTIME_DIR/platform.sh"
+# shellcheck source=profiles.sh
+. "$_DOT_RUNTIME_DIR/profiles.sh"
 # shellcheck source=overlays.sh
 . "$_DOT_RUNTIME_DIR/overlays.sh"
 # shellcheck source=merge-block.sh

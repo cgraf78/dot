@@ -30,6 +30,7 @@ program	lib/dot/merge-hooks.sh
 program	lib/dot/merges.sh
 program	lib/dot/overlays.sh
 program	lib/dot/platform.sh
+program	lib/dot/profiles.sh
 program	lib/dot/pre-sync.sh
 program	lib/dot/progress-ui.sh
 program	lib/dot/providers/shdeps-ui.sh
@@ -82,6 +83,7 @@ program	tests/license-test
 program	tests/merge-block-test
 program	tests/provider-suite-wrapper
 program	tests/provenance-test
+program	tests/profiles-test
 program	tests/repos-test
 program	tests/resources-test
 program	tests/run
