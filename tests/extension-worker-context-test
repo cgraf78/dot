@@ -178,17 +178,23 @@ rm -f "$context"
 # the portable open-descriptor fallback to preserve one-use consumption.
 bsd_bin=$HOME/bsd-tools
 mkdir "$bsd_bin"
-DOT_TEST_REAL_STAT=$(command -v stat)
-export DOT_TEST_REAL_STAT
 cat >"$bsd_bin/stat" <<'STAT'
 #!/usr/bin/env bash
 case ${1:-} in
   -c | -Lc) exit 1 ;;
   -f)
     case ${2:-} in
-      '%m') exec "$DOT_TEST_REAL_STAT" -c '%Y' "$3" ;;
-      *) exec "$DOT_TEST_REAL_STAT" -c '%u %a %h %d %i' "$3" ;;
+      '%m') date +%s ;;
+      *)
+        if [[ $3 == "$DOT_TEST_CONTEXT_PATH" ]]; then
+          printf '%s 600 1 %s %s\n' \
+            "$EUID" "$DOT_TEST_CONTEXT_DEV" "$DOT_TEST_CONTEXT_INO"
+        else
+          printf '%s 700 1 1 1\n' "$EUID"
+        fi
+        ;;
     esac
+    exit 0
     ;;
   -Lf)
     printf '%s 666 1 999 999\n' "$EUID"
@@ -200,9 +206,9 @@ chmod 0755 "$bsd_bin/stat"
 _dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
 context=$REPLY_PATH
 token=$REPLY_TOKEN
-read -r DOT_TEST_CONTEXT_DEV DOT_TEST_CONTEXT_INO < <(
-  "$DOT_TEST_REAL_STAT" -c '%d %i' "$context"
-)
+_dot_overlay_context_stat "$context"
+DOT_TEST_CONTEXT_DEV=$REPLY_DEV
+DOT_TEST_CONTEXT_INO=$REPLY_INO
 DOT_TEST_CONTEXT_PATH=$context
 export DOT_TEST_CONTEXT_DEV DOT_TEST_CONTEXT_INO DOT_TEST_CONTEXT_PATH
 eval "$(declare -f _dot_overlay_context_lsof |
