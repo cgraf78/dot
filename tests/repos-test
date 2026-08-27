@@ -1011,6 +1011,54 @@ HOME=$replacement_recovery_home XDG_STATE_HOME=$replacement_recovery_state \
     [[ -f $record && -d $transaction && -f $transaction/foreign ]]
   '
 
+# Update snapshots run before unstash. They must first recover an interrupted
+# per-path replacement, then capture the exact restored live target from the
+# installed authority union so a later policy failure can roll it back.
+rollback_recovery_home=$DOT_TEST_TMP/rollback-recovery-home
+rollback_recovery_state=$DOT_TEST_TMP/rollback-recovery-state
+mkdir -p "$rollback_recovery_home" "$rollback_recovery_state"
+HOME=$rollback_recovery_home XDG_STATE_HOME=$rollback_recovery_state \
+  DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$rollback_recovery_state/overlay-links \
+  DOT_OVERLAY_LEGACY_MANIFEST=$rollback_recovery_state/legacy-links \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _overlay_skip_worktree() { return 0; }
+    dot_candidate_path_is_reserved() { return 1; }
+
+    destination=$HOME/value
+    target=.dotfiles-example/home/value
+    ln -s "$target" "$destination"
+    printf "value\texample\t%s\n" "$target" >"$DOT_OVERLAY_MANIFEST"
+    chmod 0600 "$DOT_OVERLAY_MANIFEST"
+
+    expected=$(_overlay_replacement_identity "$destination")
+    _overlay_destination_context "$destination"
+    physical=$OVERLAY_PHYSICAL_DESTINATION
+    parent_identity=$OVERLAY_PARENT_IDENTITY
+    _overlay_replacement_record_path "$destination"
+    record=$REPLY
+    transaction=${physical%/*}/.${physical##*/}.dot-overlay-replace-v1
+    printf -v record_line "%s\t%s\t%s\t%s\t%s\t%s" \
+      "$destination" "$physical" replacement-target "$expected" \
+      "$transaction" "$parent_identity"
+    _overlay_write_private_line "$record" "$record_line"
+    mkdir "$transaction"
+    chmod 0700 "$transaction"
+    ln -s replacement-target "$transaction/next"
+    mv "$physical" "$transaction/previous"
+
+    _overlay_snapshot_installed_links
+    [[ -L $destination && $(readlink "$destination") == "$target" ]]
+    [[ ! -e $record && ! -L $record && ! -e $transaction && ! -L $transaction ]]
+    [[ ${DOT_OVERLAY_ROLLBACK_PATHS[*]} == value ]]
+    [[ ${DOT_OVERLAY_ROLLBACK_TARGETS[*]} == "$target" ]]
+  '
+
 # The previous released transaction format recorded only device and inode.
 # An upgrade can encounter any crash phase from those bytes, so recovery must
 # converge each exact engine-owned shape without making the legacy identity a

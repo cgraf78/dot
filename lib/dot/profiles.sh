@@ -62,6 +62,14 @@ _dot_profile_private_path_safe() {
   (((8#$mode & 077) == 0))
 }
 
+_dot_profile_owned_directory_safe() {
+  local path=$1 uid
+  [[ -d $path && ! -L $path ]] || return 1
+  uid=$(command stat -c '%u' "$path" 2>/dev/null ||
+    command stat -f '%u' "$path" 2>/dev/null) || return 1
+  [[ $uid == "$EUID" ]]
+}
+
 _dot_profile_list_validate() {
   local value=$1 kind=$2 item
   local -a items=()
@@ -249,7 +257,7 @@ _dot_profile_host_normalize() {
   local host=$1
   host=${host%.}
   [[ -n $host && $host =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || return 1
-  REPLY=${host,,}
+  REPLY=$(printf '%s' "$host" | LC_ALL=C tr '[:upper:]' '[:lower:]') || return 1
 }
 
 _dot_profile_user_valid() {
@@ -423,7 +431,7 @@ _dot_profile_select_base() {
 }
 
 _dot_profile_resolve_default() {
-  local entry path
+  local entry path dot_dir selector_dir
   local -a personal_dirs=()
 
   dot_xdg_path config dot/profile-selectors.d || return
@@ -432,9 +440,16 @@ _dot_profile_resolve_default() {
   local local_dir=$REPLY
   for entry in "${ACTIVE_OVERLAYS[@]+"${ACTIVE_OVERLAYS[@]}"}"; do
     IFS='|' read -r _ path _ <<<"$entry"
-    [[ -d $path/dot/profile-selectors.d && ! -L $path/dot/profile-selectors.d ]] ||
-      continue
-    personal_dirs+=("$path/dot/profile-selectors.d")
+    dot_dir=$path/dot
+    selector_dir=$dot_dir/profile-selectors.d
+    [[ -e $dot_dir || -L $dot_dir ]] || continue
+    _dot_profile_owned_directory_safe "$path" &&
+      _dot_profile_owned_directory_safe "$dot_dir" ||
+      _dot_profile_error "unsafe personal selector ancestry: $dot_dir" || return
+    [[ -e $selector_dir || -L $selector_dir ]] || continue
+    _dot_profile_owned_directory_safe "$selector_dir" ||
+      _dot_profile_error "unsafe personal selector directory: $selector_dir" || return
+    personal_dirs+=("$selector_dir")
   done
   _dot_profile_resolve "$root_dir" "$local_dir" \
     "${personal_dirs[@]+"${personal_dirs[@]}"}"

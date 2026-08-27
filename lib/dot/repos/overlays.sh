@@ -9,6 +9,9 @@
 # shellcheck source=../temp.sh
 . "${BASH_SOURCE[0]%/*}/../temp.sh"
 
+DOT_OVERLAY_ROLLBACK_PATHS=()
+DOT_OVERLAY_ROLLBACK_TARGETS=()
+
 _overlay_link_target() {
   local rel="$1" name="$2" rest prefix=""
   rest="$rel"
@@ -826,6 +829,73 @@ _overlay_restore_tracked_path() {
     _warn "  warning: could not restore overlay base path: $rel"
     return 1
   fi
+}
+
+# Snapshot the installed generation without consulting current descriptors or
+# profiles. A path is rollback-authorized only when the private installed
+# manifest and the exact live symlink target agree before unstash mutates it.
+_overlay_snapshot_installed_links() {
+  local manifest line rel target dst live_target REPLY_REL REPLY_OWNER REPLY_TARGET
+  local -A seen_targets=()
+  local -a OVERLAY_AUTHORITY_MANIFESTS=()
+  DOT_OVERLAY_ROLLBACK_PATHS=()
+  DOT_OVERLAY_ROLLBACK_TARGETS=()
+  if ! _overlay_recover_replacements; then
+    _warn "  warning: unsafe overlay replacement recovery record: $REPLY"
+    return 1
+  fi
+  if ! _overlay_authority_files; then
+    _warn "  warning: unsafe installed overlay manifest: $REPLY"
+    return 1
+  fi
+  for manifest in "${OVERLAY_AUTHORITY_MANIFESTS[@]+"${OVERLAY_AUTHORITY_MANIFESTS[@]}"}"; do
+    while IFS= read -r line || [[ -n $line ]]; do
+      _overlay_parse_manifest_record "$line" || return 1
+      rel=$REPLY_REL
+      target=$REPLY_TARGET
+      _overlay_path_is_authority "$rel" && continue
+      _overlay_skip_worktree "$rel" || continue
+      dst=$HOME/$rel
+      [[ -L $dst ]] || continue
+      live_target=$(readlink "$dst") || return 1
+      [[ $live_target == "$target" ]] || continue
+      if [[ -n ${seen_targets[$rel]+x} ]]; then
+        [[ ${seen_targets[$rel]} == "$target" ]] || return 1
+        continue
+      fi
+      seen_targets["$rel"]=$target
+      DOT_OVERLAY_ROLLBACK_PATHS+=("$rel")
+      DOT_OVERLAY_ROLLBACK_TARGETS+=("$target")
+    done <"$manifest"
+  done
+}
+
+# Restore only the exact links captured above. The base path must still be
+# absent or an unmodified tracked file from the just-pulled generation; any
+# intervening user change wins and makes rollback fail closed.
+_overlay_restore_installed_links() {
+  local index rel target dst replace_identity=''
+  [[ ${#DOT_OVERLAY_ROLLBACK_PATHS[@]} -eq ${#DOT_OVERLAY_ROLLBACK_TARGETS[@]} ]] ||
+    return 1
+  for ((index = 0; index < ${#DOT_OVERLAY_ROLLBACK_PATHS[@]}; index++)); do
+    rel=${DOT_OVERLAY_ROLLBACK_PATHS[index]}
+    target=${DOT_OVERLAY_ROLLBACK_TARGETS[index]}
+    dst=$HOME/$rel
+    if [[ -L $dst && $(readlink "$dst") == "$target" ]]; then
+      continue
+    fi
+    [[ ! -L $dst && ! -d $dst ]] || return 1
+    replace_identity=''
+    if [[ -e $dst ]]; then
+      _overlay_tracked_path_clean "$rel" || return 1
+      replace_identity=$(_overlay_replacement_identity "$dst") || return 1
+    fi
+    _overlay_ensure_destination_parent "${dst%/*}" || return 1
+    _overlay_publish_link "$target" "$dst" "$replace_identity" || return 1
+    if _base_git ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+      _base_git update-index --skip-worktree "$rel" 2>/dev/null || return 1
+    fi
+  done
 }
 
 _unstash_overlay_overrides() {

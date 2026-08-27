@@ -1,6 +1,11 @@
 # shellcheck shell=bash
 # Overlay discovery helpers shared by dot commands.
 
+if ! declare -F _dot_overlay_field_safe >/dev/null 2>&1; then
+  # shellcheck source=overlay-context.sh
+  . "${BASH_SOURCE[0]%/*}/overlay-context.sh"
+fi
+
 # Active overlays, populated by _discover_overlays. Each entry:
 # "name|path|url|conf|optional|sync". A missing final field means `git`; `none` means
 # the source tree already exists locally and repository synchronization is
@@ -31,9 +36,7 @@ _overlay_name() {
 }
 
 _overlay_descriptor_value_safe() {
-  local value="$1"
-  [[ "$value" != *'|'* && "$value" != *$'\t'* &&
-    "$value" != *$'\n'* && "$value" != *$'\r'* ]]
+  _dot_overlay_field_safe "$1"
 }
 
 _overlay_relative_path_safe() {
@@ -189,6 +192,15 @@ _parse_overlay_conf() {
     fi
     _overlay_descriptor_value_safe "$url" ||
       _overlay_conf_invalid "$file" "unrepresentable url" || return
+    case $optional in
+      '' | true | false) ;;
+      *)
+        if [[ ${DOT_OVERLAY_STRICT_SELECTED:-0} == 1 ]]; then
+          _overlay_conf_invalid "$file" "unknown optional value: $optional" || return
+        fi
+        _warn "  warning: unknown optional value in $file: $optional"
+        ;;
+    esac
   fi
 
   if [[ -n "$platforms" ]]; then
@@ -202,17 +214,6 @@ _parse_overlay_conf() {
       DOT_OVERLAY_PARSE_STATE=ineligible
       return 1
     fi
-  fi
-  if [[ "$sync" == "git" ]]; then
-    case "$optional" in
-      "" | true | false) ;;
-      *)
-        if [[ ${DOT_OVERLAY_STRICT_SELECTED:-0} == 1 ]]; then
-          _overlay_conf_invalid "$file" "unknown optional value: $optional" || return
-        fi
-        _warn "  warning: unknown optional value in $file: $optional"
-        ;;
-    esac
   fi
   # Optional overlays declare private or context-specific repos in the base
   # config without making every machine prove access to them. Store the flag on
@@ -406,8 +407,8 @@ _preflight_local_overlays() {
 # Return success when an overlay record has a currently usable source without
 # performing network access or mutating either repository or worktree state.
 _overlay_record_active_existing() {
-  local record=$1 name path url descriptor optional sync
-  IFS='|' read -r name path url descriptor optional sync <<<"$record"
+  local record=$1 name path url _descriptor optional sync
+  IFS='|' read -r name path url _descriptor optional sync <<<"$record"
   case ${sync:-git} in
     git) _overlay_checkout_matches "$path" "$url" ;;
     none) _overlay_local_source_validate "$path" ;;
@@ -452,10 +453,14 @@ _discover_overlays() {
     name=$(_overlay_name "$file")
     if ! _dot_profile_identifier_valid "$name"; then
       DOT_OVERLAY_DISCOVERY_ERROR="invalid overlay descriptor filename: ${file##*/}"
+      [[ ${DOT_OVERLAY_DISCOVERY_SILENT:-0} == 1 ]] ||
+        printf 'dot: overlay: %s\n' "$DOT_OVERLAY_DISCOVERY_ERROR" >&2
       return 2
     fi
     if [[ -n ${descriptors[$name]+x} ]]; then
       DOT_OVERLAY_DISCOVERY_ERROR="duplicate overlay name '$name' in ${descriptors[$name]} and $file"
+      [[ ${DOT_OVERLAY_DISCOVERY_SILENT:-0} == 1 ]] ||
+        printf 'dot: overlay: %s\n' "$DOT_OVERLAY_DISCOVERY_ERROR" >&2
       return 2
     fi
     descriptors["$name"]=$file
@@ -467,6 +472,8 @@ _discover_overlays() {
       selected_names["$name"]=1
       if [[ -z ${descriptors[$name]+x} ]]; then
         DOT_OVERLAY_DISCOVERY_ERROR="selected overlay has no descriptor: $name"
+        [[ ${DOT_OVERLAY_DISCOVERY_SILENT:-0} == 1 ]] ||
+          printf 'dot: overlay: %s\n' "$DOT_OVERLAY_DISCOVERY_ERROR" >&2
         return 2
       fi
     done
@@ -537,12 +544,15 @@ _dot_resolve_overlays() {
 
   _dot_profile_select_base || return
   _discover_overlays || return
+  # shellcheck disable=SC2034 # Published for lifecycle doctor reporting.
   PHASE_ONE_SELECTED_OVERLAY_NAMES=(
     "${SELECTED_OVERLAY_NAMES[@]+"${SELECTED_OVERLAY_NAMES[@]}"}"
   )
+  # shellcheck disable=SC2034 # Published for lifecycle doctor reporting.
   PHASE_ONE_ELIGIBLE_OVERLAYS=(
     "${ELIGIBLE_OVERLAYS[@]+"${ELIGIBLE_OVERLAYS[@]}"}"
   )
+  # shellcheck disable=SC2034 # Published for lifecycle doctor reporting.
   PHASE_ONE_ACTIVE_OVERLAYS=(
     "${ACTIVE_OVERLAYS[@]+"${ACTIVE_OVERLAYS[@]}"}"
   )

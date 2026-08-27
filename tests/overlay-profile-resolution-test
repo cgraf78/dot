@@ -4,6 +4,8 @@ set -euo pipefail
 
 # shellcheck disable=SC1091 # Test helper path is resolved from this file.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$DOT_TEST_ROOT/tests/lib/repo.sh"
 # shellcheck disable=SC1091 # Repository root comes from the test helper.
 . "$DOT_TEST_ROOT/lib/dot/public/xdg.sh"
 # shellcheck disable=SC1091 # Repository root comes from the test helper.
@@ -78,6 +80,13 @@ printf 'version=1\nuser=example-user\nprofile=dev\n' \
 if _dot_resolve_overlays inspect >/dev/null 2>&1; then
   fail 'selected malformed dev descriptor did not fail'
 fi
+printf 'url=https://example.invalid/dev.git\nhosts=another-host\noptional=invalid\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/30-dev.conf"
+if _dot_resolve_overlays inspect >/dev/null 2>&1; then
+  fail 'selected ineligible descriptor bypassed invalid optional validation'
+fi
+printf 'this selected descriptor is malformed\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/30-dev.conf"
 
 printf 'version=1\nuser=example-user\nprofile=editor\n' \
   >"$XDG_CONFIG_HOME/dot/profile-selectors.local.d/editor.conf"
@@ -103,6 +112,12 @@ _dot_resolve_overlays inspect
 assert_eq 0 "$DOT_PROFILES_PRESENT" 'legacy resolver mode'
 assert_eq 'nvim personal work' "${ELIGIBLE_OVERLAY_NAMES[*]}" \
   'legacy resolver keeps all-descriptor behavior'
+printf 'url=https://example.invalid/%slegacy.git\n' $'\033' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/40-control.conf"
+if _dot_resolve_overlays inspect >/dev/null 2>&1; then
+  fail 'legacy resolver accepted a descriptor control byte'
+fi
+rm "$XDG_CONFIG_HOME/dot/overlays.d/40-control.conf"
 
 # Converge resolves profile selection only after the phase-one optional source
 # has had a chance to become active and provide repository-only selectors.
@@ -128,14 +143,47 @@ for spec in \
 done
 events=$DOT_TEST_TMP/converge-events
 : >"$events"
+# shellcheck disable=SC2034 # Read dynamically by progress helpers.
+DOT_UI_TOTAL=4
+# shellcheck disable=SC2034 # Read dynamically by update orchestration.
+DOT_REPO_STAGE_DEFERRED_ACTIVE=1
+DOT_REPO_PROGRESS_DONE=1
+DOT_REPO_PROGRESS_TOTAL=1
+# shellcheck disable=SC2034 # Read dynamically by update orchestration.
+DOT_REPO_AGG_CURRENT=1
+# shellcheck disable=SC2034 # Read dynamically by update orchestration.
+DOT_REPO_AGG_CHANGED=0
+# shellcheck disable=SC2034 # Read dynamically by update orchestration.
+DOT_REPO_AGG_FAILED=0
+# shellcheck disable=SC2034 # Read dynamically by update orchestration.
+DOT_REPO_AGG_SKIPPED=0
+# shellcheck disable=SC2034 # Read dynamically by update orchestration.
+DOT_REPO_AGG_CHANGED_ITEMS=''
+_ui_stage_update() {
+  printf 'ui-update:%s\n' "$1" >>"$events"
+}
 _run_pre_sync_extensions() {
   local stage=$1
   shift
   printf 'pre-sync:%s:%s\n' "$stage" "$*" >>"$events"
 }
+_pull_overlay_count() {
+  local record count=0 sync
+  for record in "${OVERLAYS[@]+"${OVERLAYS[@]}"}"; do
+    IFS='|' read -r _ _ _ _ _ sync <<<"$record"
+    [[ ${sync:-git} == git ]] && count=$((count + 1))
+  done
+  printf '%s' "$count"
+}
+_dot_progress_detail() {
+  printf '%s %s/%s' "$1" "$2" "$3"
+}
 # shellcheck disable=SC2329 # Invoked dynamically by _dot_converge_overlays.
 _pull_overlays() {
   local entry name path
+  printf 'progress:%s/%s\n' \
+    "${DOT_REPO_PROGRESS_DONE:-unset}" "${DOT_REPO_PROGRESS_TOTAL:-unset}" \
+    >>"$events"
   printf 'pull:%s\n' "${OVERLAYS[*]}" >>"$events"
   for entry in "${OVERLAYS[@]+"${OVERLAYS[@]}"}"; do
     IFS='|' read -r name path _ <<<"$entry"
@@ -147,6 +195,15 @@ _pull_overlays() {
   done
   # shellcheck disable=SC2034 # Consumed dynamically by the convergence helper.
   DOT_PULL_OVERLAY_FAILED=0
+  # shellcheck disable=SC2034 # Read dynamically by update orchestration.
+  DOT_PULL_OVERLAY_CURRENT=${#OVERLAYS[@]}
+  # shellcheck disable=SC2034 # Read dynamically by update orchestration.
+  DOT_PULL_OVERLAY_CHANGED=0
+  # shellcheck disable=SC2034 # Read dynamically by update orchestration.
+  DOT_PULL_OVERLAY_CHANGED_ITEMS=''
+  # shellcheck disable=SC2034 # Read dynamically by update orchestration.
+  DOT_PULL_OVERLAY_SKIPPED=0
+  DOT_REPO_PROGRESS_DONE=$((DOT_REPO_PROGRESS_DONE + ${#OVERLAYS[@]}))
 }
 _overlay_record_active_existing() {
   local record=$1 path
@@ -169,6 +226,12 @@ assert_eq 2 "$pull_count" 'converge has phase-one and additions sync passes'
 second_pull=$(grep '^pull:' "$events" | tail -1)
 [[ $second_pull != *'personal|'* ]] ||
   fail 'phase-one overlay was synchronized twice'
+assert_contains 'progress:1/2' "$converge_log" \
+  'phase-one progress total is recomputed after base selection'
+assert_contains 'progress:2/5' "$converge_log" \
+  'final progress total is recomputed after selector resolution'
+assert_contains 'ui-update:' "$converge_log" \
+  'post-rediscovery overlay synchronization remains visible'
 
 failure_home=$DOT_TEST_TMP/converge-failure-home
 HOME=$failure_home
@@ -261,5 +324,123 @@ for command in fetch push; do
   [[ $(<"$command_log") != *'.dotfiles-dev'* ]] ||
     fail "$command included an unselected overlay"
 done
+
+mv "$command_home/.config/dot/overlays.d/20-nvim.conf" \
+  "$command_home/.config/dot/overlays.d/20-editor.conf"
+set +e
+missing_descriptor_output=$(PATH="$fake_bin:$command_bin:$PATH" HOME=$command_home \
+  XDG_STATE_HOME=$command_state DOT_TEST_REAL_GIT=$real_git \
+  DOT_TEST_GIT_LOG=$command_log "$DOT_TEST_ROOT/bin/dot" status 2>&1)
+missing_descriptor_status=$?
+set -e
+assert_eq 1 "$missing_descriptor_status" \
+  'status rejects a selected overlay with no descriptor'
+assert_contains 'selected overlay has no descriptor: nvim' \
+  "$missing_descriptor_output" 'status explains the missing selected descriptor'
+mv "$command_home/.config/dot/overlays.d/20-editor.conf" \
+  "$command_home/.config/dot/overlays.d/20-nvim.conf"
+
+# Both legacy and profile-aware convergence must reject selected sync=none
+# sources before pre-sync reconciliation or repository synchronization.
+for local_mode in legacy profile; do
+  local_home=$DOT_TEST_TMP/local-preflight-$local_mode
+  mkdir -p "$local_home/.config/dot/overlays.d"
+  printf 'sync=none\npath=%s\n' "$local_home/missing-local" \
+    >"$local_home/.config/dot/overlays.d/40-local.conf"
+  if [[ $local_mode == profile ]]; then
+    mkdir -p "$local_home/.config/dot/profiles.d" \
+      "$local_home/.config/dot/profile-selectors.local.d"
+    chmod 0700 "$local_home/.config/dot/profile-selectors.local.d"
+    printf 'version=1\noverlays=personal\n' \
+      >"$local_home/.config/dot/profiles.d/base.conf"
+    printf 'version=1\nprofiles=base\noverlays=local\n' \
+      >"$local_home/.config/dot/profiles.d/dev.conf"
+    printf 'url=https://example.invalid/personal.git\noptional=true\n' \
+      >"$local_home/.config/dot/overlays.d/80-personal.conf"
+    printf 'version=1\nuser=example-user\nprofile=dev\n' \
+      >"$local_home/.config/dot/profile-selectors.local.d/dev.conf"
+    chmod 0600 "$local_home/.config/dot/profile-selectors.local.d/dev.conf"
+  fi
+  if (
+    HOME=$local_home
+    XDG_CONFIG_HOME=$HOME/.config
+    # shellcheck disable=SC2329 # Invoked dynamically by convergence.
+    _run_pre_sync_extensions() { :; }
+    # shellcheck disable=SC2034,SC2329 # Invoked/read dynamically by convergence.
+    _pull_overlays() { DOT_PULL_OVERLAY_FAILED=0; }
+    _dot_converge_overlays
+  ) >/dev/null 2>&1; then
+    fail "$local_mode convergence accepted an unavailable sync=none source"
+  fi
+done
+
+# A base update temporarily restores shadowed paths before pulling. If the new
+# selector generation conflicts, the previously active link generation must be
+# restored instead of being left as an unlinked base file.
+fixture_repo rollback-overlay main home/.config/profile/value $'overlay\n' 100644
+rollback_overlay_origin=$REPLY
+fixture_repo rollback-base main \
+  .config/profile/value $'base\n' 100644 \
+  .config/dot/profiles.d/base.conf $'version=1\noverlays=nvim\n' 100644 \
+  .config/dot/profiles.d/editor.conf $'version=1\nprofiles=base\n' 100644 \
+  .config/dot/profiles.d/dev.conf $'version=1\noverlays=dev\n' 100644 \
+  .config/dot/overlays.d/20-nvim.conf \
+  "url=file://$rollback_overlay_origin"$'\n' 100644 \
+  .config/dot/overlays.d/30-dev.conf $'malformed selected descriptor\n' 100644
+rollback_base_origin=$REPLY
+fixture_home rollback-profile
+rollback_home=$REPLY
+rollback_state=$DOT_TEST_TMP/rollback-profile-state
+mkdir -p "$rollback_home/.config/dot/profile-selectors.local.d"
+chmod 0700 "$rollback_home/.config/dot/profile-selectors.local.d"
+printf 'version=1\nuser=example-user\nprofile=editor\n' \
+  >"$rollback_home/.config/dot/profile-selectors.local.d/editor.conf"
+chmod 0600 "$rollback_home/.config/dot/profile-selectors.local.d/editor.conf"
+PATH="$fake_bin:$PATH" run_dot "$rollback_home" "$rollback_state" init --yes \
+  "file://$rollback_base_origin" >/dev/null
+[[ -L $rollback_home/.config/profile/value ]] ||
+  fail 'rollback fixture did not install its overlay link'
+assert_eq overlay "$(<"$rollback_home/.config/profile/value")" \
+  'rollback fixture starts with overlay content'
+fixture_push rollback-base main .config/dot/profile-selectors.d/conflict.conf \
+  $'version=1\nuser=example-user\nprofile=dev\n' 100644
+set +e
+PATH="$fake_bin:$PATH" run_dot "$rollback_home" "$rollback_state" update \
+  >/dev/null 2>&1
+rollback_status=$?
+set -e
+assert_eq 1 "$rollback_status" 'selector conflict fails update'
+[[ -L $rollback_home/.config/profile/value ]] ||
+  fail 'selector conflict left the previous overlay generation unstashed'
+assert_eq overlay "$(<"$rollback_home/.config/profile/value")" \
+  'selector conflict restores previous overlay content'
+
+# The next update must be able to pull a repaired policy even though the
+# currently checked-out generation is malformed. Pre-pull rollback authority
+# comes from the installed manifest and exact live link, not current profiles.
+fixture_push rollback-base main .config/dot/profile-selectors.d/conflict.conf \
+  $'version=1\nuser=another-example-user\nprofile=dev\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$rollback_home" "$rollback_state" update \
+  >/dev/null
+[[ -L $rollback_home/.config/profile/value ]] ||
+  fail 'repaired upstream policy did not converge the prior overlay link'
+assert_eq overlay "$(<"$rollback_home/.config/profile/value")" \
+  'repaired upstream policy converges without pre-pull profile parsing'
+
+# A malformed newly pulled Dot config fails even earlier than profile
+# resolution. That post-pull failure must restore the same installed link
+# generation and freeze final link reconciliation.
+fixture_push rollback-base main .config/dot/config \
+  $'version=999\ndependency_provider=none\n' 100644
+set +e
+PATH="$fake_bin:$PATH" run_dot "$rollback_home" "$rollback_state" update \
+  >/dev/null 2>&1
+rollback_config_status=$?
+set -e
+assert_eq 1 "$rollback_config_status" 'malformed pulled Dot config fails update'
+[[ -L $rollback_home/.config/profile/value ]] ||
+  fail 'malformed pulled Dot config left the previous overlay generation unstashed'
+assert_eq overlay "$(<"$rollback_home/.config/profile/value")" \
+  'malformed pulled Dot config restores previous overlay content'
 
 printf 'overlay-profile-resolution-test: ok\n'

@@ -49,6 +49,62 @@ _dot_update_prepare_shdeps_jobs() {
   export SHDEPS_JOBS
 }
 
+_dot_update_pull_overlay_phase() {
+  local label=$1 count rc=0
+  shift
+  if [[ ${DOT_REPO_STAGE_DEFERRED_ACTIVE:-0} != 1 ]]; then
+    _pull_overlays "$@"
+    return
+  fi
+
+  count=$(_pull_overlay_count)
+  DOT_REPO_PROGRESS_DONE=${DOT_REPO_PROGRESS_DONE:-1}
+  DOT_REPO_PROGRESS_TOTAL=$((DOT_REPO_PROGRESS_DONE + count))
+  if [[ $count -gt 0 ]]; then
+    _ui_stage_update "$(_dot_progress_detail \
+      "$label" "$((DOT_REPO_PROGRESS_DONE + 1))" "$DOT_REPO_PROGRESS_TOTAL")"
+  fi
+  _pull_overlays "$@" || rc=$?
+  DOT_REPO_AGG_CURRENT=$((${DOT_REPO_AGG_CURRENT:-0} + ${DOT_PULL_OVERLAY_CURRENT:-0}))
+  DOT_REPO_AGG_CHANGED=$((${DOT_REPO_AGG_CHANGED:-0} + ${DOT_PULL_OVERLAY_CHANGED:-0}))
+  DOT_REPO_AGG_FAILED=$((${DOT_REPO_AGG_FAILED:-0} + ${DOT_PULL_OVERLAY_FAILED:-0}))
+  DOT_REPO_AGG_SKIPPED=$((${DOT_REPO_AGG_SKIPPED:-0} + ${DOT_PULL_OVERLAY_SKIPPED:-0}))
+  DOT_REPO_AGG_CHANGED_ITEMS+=${DOT_PULL_OVERLAY_CHANGED_ITEMS:-}
+  [[ $rc -eq 0 && ${DOT_PULL_OVERLAY_FAILED:-0} -eq 0 ]]
+}
+
+_dot_update_repo_stage_finish() {
+  local forced_failure=${1:-0} status=ok summary item
+  local -a parts=()
+  [[ ${DOT_REPO_STAGE_DEFERRED_ACTIVE:-0} == 1 ]] || return 0
+  if [[ $forced_failure -eq 1 || ${DOT_REPO_AGG_FAILED:-0} -gt 0 ]]; then
+    status=failed
+  elif [[ ${DOT_REPO_AGG_CHANGED:-0} -gt 0 ]]; then
+    status=changed
+  fi
+  [[ ${DOT_REPO_AGG_CHANGED:-0} -eq 0 ]] ||
+    parts+=("$(_ui_count_phrase "$DOT_REPO_AGG_CHANGED" repo repos) changed")
+  if [[ ${DOT_REPO_AGG_CURRENT:-0} -gt 0 ||
+    (${DOT_REPO_AGG_FAILED:-0} -eq 0 && ${DOT_REPO_AGG_SKIPPED:-0} -eq 0) ]]; then
+    parts+=("$(_ui_count_phrase "${DOT_REPO_AGG_CURRENT:-0}" repo repos) current")
+  fi
+  [[ ${DOT_REPO_AGG_FAILED:-0} -eq 0 ]] ||
+    parts+=("$(_ui_count_phrase "$DOT_REPO_AGG_FAILED" repo repos) failed")
+  [[ ${DOT_REPO_AGG_SKIPPED:-0} -eq 0 ]] ||
+    parts+=("$(_ui_count_phrase "$DOT_REPO_AGG_SKIPPED" repo repos) skipped")
+  summary=$(_join_comma "${parts[@]}")
+  _ui_stage_finish "$status" "$summary"
+  if [[ ${DOT_VERBOSE:-0} -eq 0 ]]; then
+    while IFS= read -r item; do
+      [[ -n $item ]] || continue
+      _ui_stage_note changed "$item"
+    done <<<"${DOT_REPO_AGG_CHANGED_ITEMS:-}"
+  fi
+  unset DOT_REPO_STAGE_DEFERRED_ACTIVE DOT_REPO_AGG_CURRENT \
+    DOT_REPO_AGG_CHANGED DOT_REPO_AGG_FAILED DOT_REPO_AGG_SKIPPED \
+    DOT_REPO_AGG_CHANGED_ITEMS DOT_REPO_PROGRESS_DONE DOT_REPO_PROGRESS_TOTAL
+}
+
 _dot_converge_overlays() {
   local entry name phase_status=0 final_status=0
   local -A phase_one_names=()
@@ -57,10 +113,11 @@ _dot_converge_overlays() {
   _dot_profiles_load_default || return 1
   if [[ $DOT_PROFILES_PRESENT -eq 0 ]]; then
     _discover_overlays || return 1
+    _preflight_local_overlays || return 1
     _run_pre_sync_extensions reconcile \
       "${ELIGIBLE_OVERLAYS[@]+"${ELIGIBLE_OVERLAYS[@]}"}" || return 1
     _dot_overlay_use_set eligible
-    _pull_overlays "$@" || phase_status=$?
+    _dot_update_pull_overlay_phase overlays "$@" || phase_status=$?
     [[ ${DOT_PULL_OVERLAY_FAILED:-0} -eq 0 ]] || phase_status=1
     _discover_overlays || return 1
     _dot_overlay_use_set active
@@ -81,7 +138,7 @@ _dot_converge_overlays() {
     "${PHASE_ONE_ELIGIBLE_OVERLAYS[@]+"${PHASE_ONE_ELIGIBLE_OVERLAYS[@]}"}" ||
     return 1
   _dot_overlay_use_set eligible
-  _pull_overlays "$@" || phase_status=$?
+  _dot_update_pull_overlay_phase phase-one "$@" || phase_status=$?
   [[ ${DOT_PULL_OVERLAY_FAILED:-0} -eq 0 ]] || phase_status=1
   _discover_overlays || return 1
   # shellcheck disable=SC2034 # Published for lifecycle doctor reporting.
@@ -93,6 +150,7 @@ _dot_converge_overlays() {
 
   _dot_profile_resolve_default || return 1
   _discover_overlays || return 1
+  _preflight_local_overlays || return 1
   _run_pre_sync_extensions reconcile \
     "${ELIGIBLE_OVERLAYS[@]+"${ELIGIBLE_OVERLAYS[@]}"}" || return 1
   for entry in "${PHASE_ONE_ELIGIBLE_OVERLAYS[@]+"${PHASE_ONE_ELIGIBLE_OVERLAYS[@]}"}"; do
@@ -104,7 +162,7 @@ _dot_converge_overlays() {
     [[ -n ${phase_one_names[$name]+x} ]] || additions+=("$entry")
   done
   OVERLAYS=("${additions[@]+"${additions[@]}"}")
-  _pull_overlays "$@" || final_status=$?
+  _dot_update_pull_overlay_phase selected "$@" || final_status=$?
   [[ ${DOT_PULL_OVERLAY_FAILED:-0} -eq 0 ]] || final_status=1
   _discover_overlays || return 1
   _dot_overlay_use_set active
@@ -114,8 +172,17 @@ _dot_converge_overlays() {
 _dot_update_sync_repos() {
   local sync_status=0
   if _base_repo_exists; then
-    # shellcheck disable=SC2034 # Repository helpers consume the selected set dynamically.
+    # Capture only the already-installed link generation before pull restores
+    # its shadowed base paths. Current profile/descriptor policy may itself be
+    # malformed and must never prevent pulling a repaired base generation.
+    _overlay_snapshot_installed_links || {
+      DOT_OVERLAY_LINKS_FROZEN=1
+      return 1
+    }
+    # shellcheck disable=SC2034 # Repository helpers consume these dynamically.
     OVERLAYS=()
+    # shellcheck disable=SC2034 # Read dynamically by _repo_pull_all.
+    local DOT_PULL_DEFER_FINISH=1
     if _repo_pull_all "$@"; then
       :
     else
@@ -126,24 +193,35 @@ _dot_update_sync_repos() {
   fi
 
   if [[ "$sync_status" -ne 0 ]]; then
-    # Pull validation can reject an overlay after its previous links were
-    # unstashed. Reconcile the manifest before returning so untracked links do
-    # not remain attached to a checkout that no longer owns the configured URL.
-    if ! _link_overlays; then
-      _warn "  warning: overlay link cleanup failed after repository sync failure"
-    fi
+    _dot_update_repo_stage_finish 1
+    _overlay_restore_installed_links ||
+      _warn '  warning: could not restore the previous overlay-link generation'
+    DOT_OVERLAY_LINKS_FROZEN=1
     return "$sync_status"
   fi
 
   # A base pull may replace profile and descriptor policy. Reload data from the
   # accepted generation before either phase is resolved or any overlay
   # transport preparation runs.
-  dot_config_load || return 1
+  if ! dot_config_load; then
+    _dot_update_repo_stage_finish 1
+    _overlay_restore_installed_links ||
+      _warn '  warning: could not restore the previous overlay-link generation'
+    DOT_OVERLAY_LINKS_FROZEN=1
+    return 1
+  fi
   if [[ ${DOT_INIT_SKIP_PROVIDER:-0} == 1 ]]; then
     DOT_DEPENDENCY_PROVIDER=none
     export DOT_DEPENDENCY_PROVIDER
   fi
-  _dot_converge_overlays "$@"
+  if ! _dot_converge_overlays "$@"; then
+    _dot_update_repo_stage_finish 1
+    _overlay_restore_installed_links ||
+      _warn '  warning: could not restore the previous overlay-link generation'
+    DOT_OVERLAY_LINKS_FROZEN=1
+    return 1
+  fi
+  _dot_update_repo_stage_finish 0
 }
 
 _dot_update_finalize() {
@@ -158,7 +236,12 @@ _dot_update_finalize() {
     return 1
   fi
   _ensure_repo_config
-  if ! _link_overlays; then
+  if [[ ${DOT_OVERLAY_LINKS_FROZEN:-0} == 1 ]]; then
+    _ui_stage_start "Overlays" "preserving installed overlay links"
+    _ui_stage_finish warning "profile resolution or repository sync failed"
+    update_status=1
+    inputs_ready=0
+  elif ! _link_overlays; then
     update_status=1
     inputs_ready=0
   fi
@@ -214,6 +297,7 @@ _dot_update_finalize() {
 
 _dot_update() {
   local cron_mode=0 update_status=0
+  unset DOT_OVERLAY_LINKS_FROZEN
 
   while [[ "${1:-}" == -* ]]; do
     case "$1" in

@@ -1183,6 +1183,27 @@ _repo_pull_all() {
       _repo_changed_items+=("$_changed_item")
     done <<<"$DOT_PULL_OVERLAY_CHANGED_ITEMS"
   fi
+  if [[ ${DOT_PULL_DEFER_FINISH:-0} == 1 ]]; then
+    # shellcheck disable=SC2034 # Consumed dynamically by update orchestration.
+    DOT_REPO_STAGE_DEFERRED_ACTIVE=1
+    # shellcheck disable=SC2034 # Consumed dynamically by update orchestration.
+    DOT_REPO_AGG_CURRENT=$_repo_current
+    # shellcheck disable=SC2034 # Consumed dynamically by update orchestration.
+    DOT_REPO_AGG_CHANGED=$_repo_changed
+    # shellcheck disable=SC2034 # Consumed dynamically by update orchestration.
+    DOT_REPO_AGG_FAILED=$_repo_failed
+    # shellcheck disable=SC2034 # Consumed dynamically by update orchestration.
+    DOT_REPO_AGG_SKIPPED=$_repo_skipped
+    DOT_REPO_AGG_CHANGED_ITEMS=''
+    local _deferred_item
+    for _deferred_item in "${_repo_changed_items[@]+"${_repo_changed_items[@]}"}"; do
+      DOT_REPO_AGG_CHANGED_ITEMS+="$_deferred_item"$'\n'
+    done
+    DOT_REPO_PROGRESS_DONE=1
+    DOT_REPO_PROGRESS_TOTAL=1
+    [[ "$_repo_status" != "failed" ]]
+    return
+  fi
   unset DOT_REPO_PROGRESS_DONE DOT_REPO_PROGRESS_TOTAL
 
   local _summary

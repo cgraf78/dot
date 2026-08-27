@@ -35,6 +35,8 @@ dot_command_dispatch() {
       ;;
     doctor)
       _dot_cleanup_install_owner_traps
+      # shellcheck disable=SC2034 # Read dynamically by overlay discovery.
+      local DOT_OVERLAY_DISCOVERY_SILENT=1
       _dot_resolve_overlays inspect || true
       _dot_doctor
       ;;

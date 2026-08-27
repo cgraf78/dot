@@ -11,6 +11,17 @@ _dot_overlay_context_error() {
   return 1
 }
 
+# Overlay descriptors and worker contexts share one field representation.
+# Reject the record delimiter plus every C0 control byte and DEL before a
+# value crosses either boundary. Bash strings cannot contain NUL, but the byte
+# scan deliberately covers it for callers that feed raw data through printf.
+_dot_overlay_field_safe() {
+  local value=${1:-}
+  [[ $value != *'|'* ]] || return 1
+  LC_ALL=C printf '%s' "$value" | LC_ALL=C od -An -t u1 |
+    awk '{ for (i = 1; i <= NF; i++) if ($i < 32 || $i == 127) exit 1 }'
+}
+
 _dot_overlay_context_stat() {
   local path=$1 output
   if output=$(command stat -c '%u %a %h %d %i' "$path" 2>/dev/null); then
@@ -49,8 +60,9 @@ _dot_overlay_context_file_safe() {
 
 _dot_overlay_context_absolute_canonical() {
   local path=$1
+  _dot_overlay_field_safe "$path" || return 1
   case $path in
-    '' | / | */ | *//* | */./* | */. | */../* | */.. | *$'\n'* | *$'\r'* | *$'\t'*)
+    '' | / | */ | *//* | */./* | */. | */../* | */..)
       return 1
       ;;
     /*) ;;
@@ -62,6 +74,10 @@ _dot_overlay_record_validate() {
   local record=$1 name path url descriptor optional sync extra
   IFS='|' read -r name path url descriptor optional sync extra <<<"$record"
   [[ -z $extra && -n $sync ]] || return 1
+  _dot_overlay_field_safe "$name" &&
+    _dot_overlay_field_safe "$url" &&
+    _dot_overlay_field_safe "$optional" &&
+    _dot_overlay_field_safe "$sync" || return 1
   [[ $name =~ ^[a-z][a-z0-9-]*$ && $name != dotfiles ]] || return 1
   _dot_overlay_context_absolute_canonical "$path" || return 1
   _dot_overlay_context_absolute_canonical "$descriptor" || return 1
@@ -74,8 +90,7 @@ _dot_overlay_record_validate() {
   case $optional in true | false) ;; *) return 1 ;; esac
   case $sync in
     git)
-      [[ -n $url && $url != *'|'* && $url != *$'\t'* &&
-        $url != *$'\n'* && $url != *$'\r'* ]] || return 1
+      [[ -n $url ]] || return 1
       [[ $path == "$HOME/.dotfiles-$name" ]] || return 1
       ;;
     none)
@@ -157,7 +172,7 @@ _dot_overlay_context_consume() {
   local context=$1 token=$2 expected_mode=$3
   local parent field='' magic version stored_token mode set_kind stage count
   local index offset=0 record name path url descriptor optional sync
-  local context_fd path_dev path_ino fd_dev fd_ino
+  local context_fd path_dev path_ino fd_uid fd_mode fd_links fd_dev fd_ino
   local REPLY_UID REPLY_MODE REPLY_LINKS REPLY_DEV REPLY_INO
   local -a fields=() decoded=()
   local -A seen=()
@@ -170,11 +185,11 @@ _dot_overlay_context_consume() {
   path_dev=$REPLY_DEV
   path_ino=$REPLY_INO
   exec {context_fd}<"$context" || return 1
-  if read -r _ _ _ fd_dev fd_ino < <(
+  if read -r fd_uid fd_mode fd_links fd_dev fd_ino < <(
     command stat -Lc '%u %a %h %d %i' "/proc/self/fd/$context_fd" 2>/dev/null
   ); then
     :
-  elif read -r _ _ _ fd_dev fd_ino < <(
+  elif read -r fd_uid fd_mode fd_links fd_dev fd_ino < <(
     command stat -Lf '%u %Lp %l %d %i' "/dev/fd/$context_fd" 2>/dev/null
   ); then
     :
@@ -182,7 +197,8 @@ _dot_overlay_context_consume() {
     exec {context_fd}<&-
     return 1
   fi
-  if [[ $fd_dev != "$path_dev" || $fd_ino != "$path_ino" ]]; then
+  if [[ $fd_uid != "$EUID" || $fd_mode != 600 || $fd_links != 1 ||
+    $fd_dev != "$path_dev" || $fd_ino != "$path_ino" ]]; then
     exec {context_fd}<&-
     return 1
   fi
@@ -192,6 +208,23 @@ _dot_overlay_context_consume() {
     exec {context_fd}<&-
     return 1
   }
+  if read -r fd_uid fd_mode fd_links fd_dev fd_ino < <(
+    command stat -Lc '%u %a %h %d %i' "/proc/self/fd/$context_fd" 2>/dev/null
+  ); then
+    :
+  elif read -r fd_uid fd_mode fd_links fd_dev fd_ino < <(
+    command stat -Lf '%u %Lp %l %d %i' "/dev/fd/$context_fd" 2>/dev/null
+  ); then
+    :
+  else
+    exec {context_fd}<&-
+    return 1
+  fi
+  if [[ $fd_uid != "$EUID" || $fd_mode != 600 || $fd_links != 0 ||
+    $fd_dev != "$path_dev" || $fd_ino != "$path_ino" ]]; then
+    exec {context_fd}<&-
+    return 1
+  fi
   while IFS= read -r -d '' field; do
     fields+=("$field")
   done <&"$context_fd"

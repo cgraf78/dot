@@ -7,12 +7,11 @@ _dr_check_overlays() {
   local selector source_class selector_path _selector_user _selector_host selector_profile matched
 
   _dr_section 'Profiles'
-  if [[ ${DOT_PROFILES_PRESENT:-0} -eq 0 ]]; then
+  if [[ -n ${DOT_PROFILE_CONFIGURATION_ERROR:-} ]]; then
+    _dr_fail 'profile configuration invalid' "$DOT_PROFILE_CONFIGURATION_ERROR"
+  elif [[ ${DOT_PROFILES_PRESENT:-0} -eq 0 ]]; then
     _dr_skip 'profile selection disabled' 'no profiles.d directory; using legacy overlay discovery'
   else
-    if [[ -n ${DOT_PROFILE_CONFIGURATION_ERROR:-} ]]; then
-      _dr_fail 'profile configuration invalid' "$DOT_PROFILE_CONFIGURATION_ERROR"
-    fi
     if [[ -n ${DOT_PROFILE_CURRENT_USER:-} && -n ${DOT_PROFILE_CURRENT_HOST:-} ]]; then
       _dr_ok 'profile identity' "$DOT_PROFILE_CURRENT_USER@$DOT_PROFILE_CURRENT_HOST"
     fi

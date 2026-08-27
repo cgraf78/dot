@@ -246,4 +246,48 @@ if _dot_profile_resolve "$DOT_TEST_TMP/no-root" "$local_security" \
   fail 'accepted group-writable machine-local selector directory'
 fi
 
+# Personal selector fragments are trusted only from within the validated
+# checkout. Every existing directory component from the checkout root through
+# dot/profile-selectors.d must be current-user-owned and non-symlinked.
+personal_ancestor_home=$DOT_TEST_TMP/personal-ancestor-home
+personal_ancestor_external=$DOT_TEST_TMP/personal-ancestor-external
+mkdir -p "$personal_ancestor_home/.config/dot" \
+  "$personal_ancestor_external/profile-selectors.d"
+cp -R "$profiles" "$personal_ancestor_home/.config/dot/profiles.d"
+write_selector "$personal_ancestor_external/profile-selectors.d" match \
+  $'version=1\nuser=example-user\nprofile=dev'
+for unsafe_component in dot selector-dir selector-file; do
+  checkout=$personal_ancestor_home/.dotfiles-personal
+  rm -rf "$checkout" "$personal_ancestor_external/profile-selectors.d"
+  mkdir -p "$checkout" "$personal_ancestor_external/profile-selectors.d"
+  write_selector "$personal_ancestor_external/profile-selectors.d" match \
+    $'version=1\nuser=example-user\nprofile=dev'
+  case $unsafe_component in
+    dot)
+      ln -s "$personal_ancestor_external" "$checkout/dot"
+      ;;
+    selector-dir)
+      mkdir "$checkout/dot"
+      ln -s "$personal_ancestor_external/profile-selectors.d" \
+        "$checkout/dot/profile-selectors.d"
+      ;;
+    selector-file)
+      mkdir -p "$checkout/dot/profile-selectors.d"
+      ln -s "$personal_ancestor_external/profile-selectors.d/match.conf" \
+        "$checkout/dot/profile-selectors.d/match.conf"
+      ;;
+  esac
+  HOME=$personal_ancestor_home
+  # shellcheck disable=SC2034 # Read dynamically by dot_xdg_path.
+  XDG_CONFIG_HOME=$HOME/.config
+  _dot_profiles_load_default
+  # shellcheck disable=SC2034 # Read dynamically by profile resolution.
+  ACTIVE_OVERLAYS=(
+    "personal|$checkout|https://example.invalid/personal.git|$HOME/.config/dot/overlays.d/80-personal.conf|true|git"
+  )
+  if _dot_profile_resolve_default >/dev/null 2>&1; then
+    fail "accepted personal selector through symlinked $unsafe_component"
+  fi
+done
+
 printf 'profiles-test: ok\n'

@@ -444,6 +444,23 @@ assert_contains 'personal: selected optional but unavailable' "$profile_doctor" 
 assert_contains 'nvim: selected but unavailable' "$profile_doctor" \
   'doctor reports required unavailability'
 
+# Invalid profile container types must remain visible as configuration
+# failures. They are not the same as an absent profiles.d legacy client.
+rm -rf "$profile_home/.config/dot/profiles.d"
+mkdir "$profile_home/.config/dot/profiles-real"
+ln -s profiles-real "$profile_home/.config/dot/profiles.d"
+set +e
+invalid_profile_doctor=$(PATH="$profile_bin:$PATH" HOME=$profile_home \
+  XDG_STATE_HOME=$profile_state "$root/bin/dot" doctor 2>&1)
+invalid_profile_doctor_status=$?
+set -e
+assert_eq 1 "$invalid_profile_doctor_status" \
+  'doctor rejects a symlinked profiles.d container'
+assert_contains 'profile configuration invalid' "$invalid_profile_doctor" \
+  'doctor reports the invalid profile container'
+[[ $invalid_profile_doctor != *'profile selection disabled'* ]] ||
+  fail 'doctor misreported an invalid profile container as legacy mode'
+
 # Doctor workers always receive closed stdin, so they must use an owned process
 # group even when the caller has a controlling terminal. Force the portable
 # no-process-discovery backend and prove parent-only TERM still reaps a

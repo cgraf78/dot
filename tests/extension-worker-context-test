@@ -119,6 +119,38 @@ if _dot_overlay_context_create "$temporary" pre-sync eligible prepare \
   "${invalid_records[@]}" >/dev/null 2>&1; then
   fail 'context encoder accepted an invalid overlay record'
 fi
+for control_name in escape delete; do
+  case $control_name in
+    escape) control_byte=$'\033' ;;
+    delete) control_byte=$'\177' ;;
+  esac
+  invalid_records=("example|$overlay|https://example.invalid/${control_byte}example.git|$descriptor|true|git")
+  if _dot_overlay_context_create "$temporary" pre-sync eligible prepare \
+    "${invalid_records[@]}" >/dev/null 2>&1; then
+    fail "context encoder accepted a $control_name control byte"
+  fi
+done
+
+# Reproduce a hard-link race after the pathname check but before the open-file
+# identity check. The opened descriptor must still have exactly one link; an
+# alternate pathname must never preserve reusable authority through parsing.
+_dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+hardlink=$temporary/context-hardlink
+eval "$(declare -f _dot_overlay_context_file_safe |
+  sed '1s/_dot_overlay_context_file_safe/_dot_overlay_context_file_safe_original/')"
+_dot_overlay_context_file_safe() {
+  _dot_overlay_context_file_safe_original "$@" || return
+  ln "$1" "$hardlink"
+}
+if _dot_overlay_context_consume "$context" "$token" pre-sync >/dev/null 2>&1; then
+  fail 'context decoder accepted a post-check hardlink'
+fi
+rm -f "$context" "$hardlink"
+eval "$(declare -f _dot_overlay_context_file_safe_original |
+  sed '1s/_dot_overlay_context_file_safe_original/_dot_overlay_context_file_safe/')"
+unset -f _dot_overlay_context_file_safe_original
 
 # A descriptor record must survive the real encoder/decoder byte-for-byte.
 roundtrip=$HOME/roundtrip
