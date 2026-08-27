@@ -1724,13 +1724,31 @@ assert_eq changed "$(<"$modified_leaf_home/value")" \
 # fail-closed rollback instead of being deleted by a stale pathname check.
 delete_winner_bin=$DOT_TEST_TMP/delete-winner-bin
 mkdir -p "$delete_winner_bin"
+# Keep the regression independent of the host mv implementation by forcing
+# the status/side-effect split that Dot's no-replace helper must tolerate.
+move_effect_failure_bin=$DOT_TEST_TMP/move-effect-failure-bin
+mkdir -p "$move_effect_failure_bin"
+cat >"$move_effect_failure_bin/mv" <<'MV'
+#!/usr/bin/env bash
+set -e
+target=${!#}
+"${DOT_TEST_BASE_MV:?}" "$@"
+case ${target##*/} in
+  .dot-init-delete.*.leaf.*) exit 1 ;;
+esac
+MV
+chmod 0755 "$move_effect_failure_bin/mv"
 cat >"$delete_winner_bin/mv" <<'MV'
 #!/usr/bin/env bash
 set -e
 real=${DOT_TEST_REAL_MV:?}
 source=${@: -2:1}
 target=${!#}
-"$real" "$@"
+# Dot judges no-replace moves by their filesystem postcondition rather than
+# the utility status. Preserve that contract in the interceptor before
+# publishing the simulated late winner.
+"$real" "$@" || true
+[[ ! -e $source && ! -L $source && (-e $target || -L $target) ]] || exit 0
 case ${DOT_TEST_DELETE_WINNER:-}:$source:$target in
   leaf:"$HOME/value":"$HOME"/*/.dot-init-delete.* | \
   leaf:"$HOME/value":"$HOME"/.dot-init-delete.*)
@@ -1762,7 +1780,8 @@ leaf_delete_first=$?
 set -e
 [[ $leaf_delete_first -ne 0 ]] || fail 'leaf deletion winner fixture unexpectedly completed'
 set +e
-PATH="$delete_winner_bin:$PATH" DOT_TEST_REAL_MV=$real_mv \
+PATH="$delete_winner_bin:$PATH" DOT_TEST_REAL_MV=$move_effect_failure_bin/mv \
+  DOT_TEST_BASE_MV=$real_mv \
   DOT_TEST_DELETE_WINNER=leaf \
   run_dot "$leaf_delete_home" "$leaf_delete_state" init --rollback >/dev/null 2>&1
 leaf_delete_rollback=$?
