@@ -413,7 +413,7 @@ _dot_profile_resolve() {
   identity=$(id -un 2>/dev/null) || _dot_profile_error 'cannot determine current user' || return
   _dot_profile_user_valid "$identity" ||
     _dot_profile_error "invalid current user: $identity" || return
-  host=$(hostname -s 2>/dev/null) ||
+  host=$(_dot_host) ||
     _dot_profile_error 'cannot determine current short hostname' || return
   _dot_profile_host_normalize "$host" ||
     _dot_profile_error "invalid current short hostname: $host" || return

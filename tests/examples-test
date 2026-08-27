@@ -9,6 +9,8 @@ set -euo pipefail
 # shellcheck disable=SC1091 # Repository root comes from the test helper.
 . "$DOT_TEST_ROOT/lib/dot/config.sh"
 # shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/platform.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
 . "$DOT_TEST_ROOT/lib/dot/profiles.sh"
 
 [[ -f "$DOT_TEST_ROOT/examples/minimal-dotfiles/home/.bashrc" ]] ||
