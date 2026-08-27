@@ -1749,16 +1749,15 @@ target=${!#}
 # publishing the simulated late winner.
 "$real" "$@" || true
 [[ ! -e $source && ! -L $source && (-e $target || -L $target) ]] || exit 0
-case ${DOT_TEST_DELETE_WINNER:-}:$source:$target in
-  leaf:"$HOME/value":"$HOME"/*/.dot-init-delete.* | \
-  leaf:"$HOME/value":"$HOME"/.dot-init-delete.*)
+case ${DOT_TEST_DELETE_WINNER:-}:${target##*/} in
+  leaf:.dot-init-delete.*.leaf.*)
     printf 'foreign leaf\n' >"$source"
     ;;
-  parent:"$HOME/newdir":"$HOME"/.dot-init-delete.*)
+  parent:.dot-init-delete.*.parent.*)
     mkdir "$source"
     printf 'foreign parent\n' >"$source/evidence"
     ;;
-  git:"$HOME/.dotfiles":"$HOME"/.dot-init-delete.*)
+  git:.dot-init-delete.*.git.*)
     mkdir "$source"
     printf 'foreign git\n' >"$source/evidence"
     ;;
