@@ -9,12 +9,22 @@ _dot_test_suite_timeout() {
 
   if [[ -n ${DOT_TEST_SUITE_TIMEOUT_SECONDS:-} ]]; then
     printf '%s\n' "$DOT_TEST_SUITE_TIMEOUT_SECONDS"
-  elif [[ $source == provider ]]; then
-    # The built-in identity aggregates Dot's complete provider test corpus.
-    # Give slower macOS runners enough headroom while retaining a finite bound.
-    printf '900\n'
   else
-    printf '300\n'
+    case $source in
+      provider)
+        # The built-in identity aggregates Dot's complete provider test corpus.
+        # Give slower macOS runners enough headroom while retaining a finite
+        # bound.
+        printf '900\n'
+        ;;
+      local)
+        # Repository verification includes substantially heavier lifecycle and
+        # filesystem fixtures than a normal client extension. In particular,
+        # the full init suite can exceed five minutes under macOS CI contention.
+        printf '600\n'
+        ;;
+      *) printf '300\n' ;;
+    esac
   fi
 }
 
