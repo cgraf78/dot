@@ -253,10 +253,17 @@ _dot_update() {
   fi
 
   if _dot_update_sync_repos "$@"; then
-    # The base pull may replace client policy. Reload it before overlay linking
-    # or provider selection so this invocation cannot continue under stale
-    # permissions or freshness policy.
-    :
+    # Keep a final defensive reload for sourced/test callers that replace the
+    # repository-sync adapter. The real adapter already reloads before profile
+    # resolution, but provider selection must never continue with stale policy.
+    if ! dot_config_load; then
+      _ui_done 1
+      return 1
+    fi
+    if [[ ${DOT_INIT_SKIP_PROVIDER:-0} == 1 ]]; then
+      DOT_DEPENDENCY_PROVIDER=none
+      export DOT_DEPENDENCY_PROVIDER
+    fi
   else
     update_status=1
   fi
