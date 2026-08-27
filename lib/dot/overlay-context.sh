@@ -12,9 +12,9 @@ _dot_overlay_context_error() {
 }
 
 # Overlay descriptors and worker contexts share one field representation.
-# Reject the record delimiter plus every C0 control byte and DEL before a
-# value crosses either boundary. Bash strings cannot contain NUL, but the byte
-# scan deliberately covers it for callers that feed raw data through printf.
+# Reject the record delimiter plus every representable C0 control byte and DEL
+# before a value crosses either boundary. Bash strings cannot contain NUL; the
+# NUL-framed decoder validates that byte separately as structure.
 _dot_overlay_field_safe() {
   local value=${1:-}
   [[ $value != *'|'* ]] || return 1
@@ -122,6 +122,8 @@ _dot_overlay_context_create() {
   local -a records=("$@")
   local -A seen=()
 
+  [[ $directory == /* ]] ||
+    _dot_overlay_context_error "context directory is not absolute: $directory" || return
   _dot_overlay_context_directory_safe "$directory" ||
     _dot_overlay_context_error "unsafe context directory: $directory" || return
   _dot_overlay_context_matrix_valid "$mode" "$set_kind" "$stage" ||
@@ -178,6 +180,7 @@ _dot_overlay_context_consume() {
   local -A seen=()
 
   [[ $# -eq 3 ]] || return 2
+  [[ $context == /* ]] || return 1
   parent=${context%/*}
   _dot_overlay_context_directory_safe "$parent" || return 1
   _dot_overlay_context_file_safe "$context" || return 1

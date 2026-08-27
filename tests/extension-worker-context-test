@@ -152,6 +152,109 @@ eval "$(declare -f _dot_overlay_context_file_safe_original |
   sed '1s/_dot_overlay_context_file_safe_original/_dot_overlay_context_file_safe/')"
 unset -f _dot_overlay_context_file_safe_original
 
+# Context capabilities are passed across an exec boundary and must never be
+# interpreted relative to a worker-controlled current directory.
+(
+  cd "$HOME"
+  if _dot_overlay_context_create worker pre-sync eligible prepare \
+    "${records[@]}" >/dev/null 2>&1; then
+    fail 'context encoder accepted a relative directory'
+  fi
+)
+_dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+(
+  cd "$HOME"
+  if _dot_overlay_context_consume "${context#"$HOME/"}" "$token" pre-sync \
+    >/dev/null 2>&1; then
+    fail 'context decoder accepted a relative pathname'
+  fi
+)
+rm -f "$context"
+
+# Exercise decoder-side framing checks independently of the stricter encoder.
+_write_manual_context() {
+  local path=$1 token_value=$2 variant=$3 count=1
+  case $variant in
+    duplicate | count-mismatch) count=2 ;;
+  esac
+  {
+    printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0' \
+      DOT_OVERLAY_CONTEXT 1 "$token_value" pre-sync eligible prepare "$count"
+    case $variant in
+      duplicate)
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+          example "$overlay" "$origin" "$descriptor" true git
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+          example "$overlay" "$origin" "$descriptor" true git
+        ;;
+      truncated)
+        printf '%s\0%s\0%s\0%s\0%s\0%s' \
+          example "$overlay" "$origin" "$descriptor" true git
+        ;;
+      trailing-nul)
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0\0' \
+          example "$overlay" "$origin" "$descriptor" true git
+        ;;
+      count-mismatch)
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+          example "$overlay" "$origin" "$descriptor" true git
+        ;;
+    esac
+  } >"$path"
+  chmod 0600 "$path"
+}
+
+for malformed_case in duplicate count-mismatch truncated trailing-nul; do
+  token=$(_dot_overlay_context_token)
+  context=$temporary/manual-$malformed_case
+  _write_manual_context "$context" "$token" "$malformed_case"
+  if _dot_overlay_context_consume "$context" "$token" pre-sync \
+    >/dev/null 2>&1; then
+    fail "context decoder accepted malformed framing: $malformed_case"
+  fi
+  rm -f "$context"
+done
+
+unsafe_parent=$HOME/unsafe-context-parent
+mkdir "$unsafe_parent"
+chmod 0700 "$unsafe_parent"
+_dot_overlay_context_create "$unsafe_parent" pre-sync eligible prepare \
+  "${records[@]}"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+chmod 0755 "$unsafe_parent"
+if _dot_overlay_context_consume "$context" "$token" pre-sync \
+  >/dev/null 2>&1; then
+  fail 'context decoder accepted an unsafe parent directory mode'
+fi
+chmod 0700 "$unsafe_parent"
+rm -f "$context"
+
+_dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+wrong_owner_context=$context
+eval "$(declare -f _dot_overlay_context_stat |
+  sed '1s/_dot_overlay_context_stat/_dot_overlay_context_stat_original/')"
+_dot_overlay_context_stat() {
+  _dot_overlay_context_stat_original "$@" || return
+  if [[ $1 == "$wrong_owner_context" ]]; then
+    # shellcheck disable=SC2034 # Simulates the stat helper's dynamic output.
+    REPLY_UID=$((EUID + 1))
+    return 1
+  fi
+}
+if _dot_overlay_context_consume "$context" "$token" pre-sync \
+  >/dev/null 2>&1; then
+  fail 'context decoder accepted a wrong-owner context file'
+fi
+rm -f "$context"
+eval "$(declare -f _dot_overlay_context_stat_original |
+  sed '1s/_dot_overlay_context_stat_original/_dot_overlay_context_stat/')"
+unset -f _dot_overlay_context_stat_original
+
 # A descriptor record must survive the real encoder/decoder byte-for-byte.
 roundtrip=$HOME/roundtrip
 mkdir "$roundtrip"
