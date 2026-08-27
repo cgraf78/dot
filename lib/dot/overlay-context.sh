@@ -155,8 +155,10 @@ _dot_overlay_context_create() {
 
 _dot_overlay_context_consume() {
   local context=$1 token=$2 expected_mode=$3
-  local parent size field='' magic version stored_token mode set_kind stage count
+  local parent field='' magic version stored_token mode set_kind stage count
   local index offset=0 record name path url descriptor optional sync
+  local context_fd path_dev path_ino fd_dev fd_ino
+  local REPLY_UID REPLY_MODE REPLY_LINKS REPLY_DEV REPLY_INO
   local -a fields=() decoded=()
   local -A seen=()
 
@@ -164,16 +166,40 @@ _dot_overlay_context_consume() {
   parent=${context%/*}
   _dot_overlay_context_directory_safe "$parent" || return 1
   _dot_overlay_context_file_safe "$context" || return 1
-  size=$(LC_ALL=C wc -c <"$context" 2>/dev/null | tr -d '[:space:]') || return 1
-  while IFS= read -r -d '' field; do
-    fields+=("$field")
-  done <"$context"
-  [[ -z $field ]] || {
-    rm -f -- "$context"
+  _dot_overlay_context_stat "$context" || return 1
+  path_dev=$REPLY_DEV
+  path_ino=$REPLY_INO
+  exec {context_fd}<"$context" || return 1
+  if read -r _ _ _ fd_dev fd_ino < <(
+    command stat -Lc '%u %a %h %d %i' "/proc/self/fd/$context_fd" 2>/dev/null
+  ); then
+    :
+  elif read -r _ _ _ fd_dev fd_ino < <(
+    command stat -Lf '%u %Lp %l %d %i' "/dev/fd/$context_fd" 2>/dev/null
+  ); then
+    :
+  else
+    exec {context_fd}<&-
+    return 1
+  fi
+  if [[ $fd_dev != "$path_dev" || $fd_ino != "$path_ino" ]]; then
+    exec {context_fd}<&-
+    return 1
+  fi
+  # Remove the pathname before parsing the already-bound descriptor so
+  # replacement or reuse cannot grant later authority.
+  rm -f -- "$context" || {
+    exec {context_fd}<&-
     return 1
   }
-  rm -f -- "$context" || return 1
-  [[ $size -gt 0 && ${#fields[@]} -ge 7 ]] || return 1
+  while IFS= read -r -d '' field; do
+    fields+=("$field")
+  done <&"$context_fd"
+  exec {context_fd}<&-
+  [[ -z $field ]] || {
+    return 1
+  }
+  [[ ${#fields[@]} -ge 7 ]] || return 1
   magic=${fields[0]}
   version=${fields[1]}
   stored_token=${fields[2]}

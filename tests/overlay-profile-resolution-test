@@ -133,6 +133,7 @@ _run_pre_sync_extensions() {
   shift
   printf 'pre-sync:%s:%s\n' "$stage" "$*" >>"$events"
 }
+# shellcheck disable=SC2329 # Invoked dynamically by _dot_converge_overlays.
 _pull_overlays() {
   local entry name path
   printf 'pull:%s\n' "${OVERLAYS[*]}" >>"$events"
@@ -168,6 +169,29 @@ assert_eq 2 "$pull_count" 'converge has phase-one and additions sync passes'
 second_pull=$(grep '^pull:' "$events" | tail -1)
 [[ $second_pull != *'personal|'* ]] ||
   fail 'phase-one overlay was synchronized twice'
+
+failure_home=$DOT_TEST_TMP/converge-failure-home
+HOME=$failure_home
+XDG_CONFIG_HOME=$HOME/.config
+mkdir -p "$XDG_CONFIG_HOME/dot"
+cp -R "$converge_home/.config/dot/profiles.d" \
+  "$XDG_CONFIG_HOME/dot/profiles.d"
+cp -R "$converge_home/.config/dot/overlays.d" \
+  "$XDG_CONFIG_HOME/dot/overlays.d"
+: >"$events"
+# shellcheck disable=SC2329 # Invoked dynamically by _dot_converge_overlays.
+_pull_overlays() {
+  printf 'pull:%s\n' "${OVERLAYS[*]}" >>"$events"
+  # shellcheck disable=SC2034 # Consumed dynamically by the convergence helper.
+  DOT_PULL_OVERLAY_FAILED=1
+}
+if _dot_converge_overlays >/dev/null 2>&1; then
+  fail 'required phase-one synchronization failure did not fail convergence'
+fi
+assert_contains 'pre-sync:prepare:' "$(<"$events")" \
+  'phase-one failure still runs prepare'
+[[ $(<"$events") != *'pre-sync:reconcile:'* ]] ||
+  fail 'phase-one failure reached final reconcile'
 
 # Real command dispatch keeps inspection offline and fetch/push scoped to an
 # existing selected checkout. The unselected malformed descriptor is never

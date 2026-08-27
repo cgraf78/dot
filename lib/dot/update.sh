@@ -89,6 +89,7 @@ _dot_converge_overlays() {
     "${ACTIVE_OVERLAYS[@]+"${ACTIVE_OVERLAYS[@]}"}"
   )
   _dot_overlay_use_set active
+  [[ $phase_status -eq 0 ]] || return "$phase_status"
 
   _dot_profile_resolve_default || return 1
   _discover_overlays || return 1
