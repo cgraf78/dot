@@ -374,6 +374,72 @@ for local_mode in legacy profile; do
   fi
 done
 
+# Changing the configured no-selector fallback is a stateful profile
+# transition, not just a parser choice. Preserve cached repositories and
+# unmanaged files while exact managed links move down and back up the stack.
+fixture_repo default-personal main \
+  home/.config/profile/personal-only $'personal\n' 100644
+default_personal_origin=$REPLY
+fixture_repo default-nvim main \
+  home/.config/profile/editor-only $'editor\n' 100644
+default_nvim_origin=$REPLY
+fixture_repo default-dev main \
+  home/.config/profile/value $'dev\n' 100644
+default_dev_origin=$REPLY
+fixture_repo default-base main \
+  .config/profile/value $'base\n' 100644 \
+  .config/dot/config $'version=1\ndefault_profile=dev\ndependency_provider=none\n' 100644 \
+  .config/dot/profiles.d/base.conf $'version=1\noverlays=personal\n' 100644 \
+  .config/dot/profiles.d/editor.conf $'version=1\nprofiles=base\noverlays=nvim\n' 100644 \
+  .config/dot/profiles.d/dev.conf $'version=1\nprofiles=editor\noverlays=dev\n' 100644 \
+  .config/dot/overlays.d/20-nvim.conf \
+  "url=file://$default_nvim_origin"$'\n' 100644 \
+  .config/dot/overlays.d/30-dev.conf \
+  "url=file://$default_dev_origin"$'\n' 100644 \
+  .config/dot/overlays.d/80-personal.conf \
+  "url=file://$default_personal_origin"$'\n' 100644
+default_base_origin=$REPLY
+fixture_home default-transition
+default_home=$REPLY
+default_state=$DOT_TEST_TMP/default-transition-state
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" init --yes \
+  "file://$default_base_origin" >/dev/null
+[[ -L $default_home/.config/profile/value ]] ||
+  fail 'configured dev default did not shadow the base path'
+assert_eq dev "$(<"$default_home/.config/profile/value")" \
+  'configured dev default installs the dev overlay'
+[[ -L $default_home/.config/profile/editor-only ]] ||
+  fail 'configured dev default did not install the editor overlay'
+printf '%s\n' unmanaged >"$default_home/unmanaged-profile-file"
+
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=base\ndependency_provider=none\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+[[ ! -e $default_home/.config/profile/editor-only ]] ||
+  fail 'dev to base default transition retained an editor link'
+[[ ! -L $default_home/.config/profile/value ]] ||
+  fail 'dev to base default transition retained the dev link'
+assert_eq base "$(<"$default_home/.config/profile/value")" \
+  'dev to base default transition restores the root file'
+assert_eq unmanaged "$(<"$default_home/unmanaged-profile-file")" \
+  'dev to base default transition preserves unmanaged files'
+[[ -d $default_home/.dotfiles-nvim/.git ]] ||
+  fail 'dev to base default transition removed the cached editor checkout'
+[[ -d $default_home/.dotfiles-dev/.git ]] ||
+  fail 'dev to base default transition removed the cached dev checkout'
+
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=dev\ndependency_provider=none\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+[[ -L $default_home/.config/profile/value ]] ||
+  fail 'base to dev default transition did not restore the dev link'
+assert_eq dev "$(<"$default_home/.config/profile/value")" \
+  'base to dev default transition reactivates the dev overlay'
+[[ -L $default_home/.config/profile/editor-only ]] ||
+  fail 'base to dev default transition did not restore the editor overlay'
+assert_eq unmanaged "$(<"$default_home/unmanaged-profile-file")" \
+  'base to dev default transition preserves unmanaged files'
+
 # A base update temporarily restores shadowed paths before pulling. If the new
 # selector generation conflicts, the previously active link generation must be
 # restored instead of being left as an unlinked base file.

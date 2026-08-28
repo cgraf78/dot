@@ -62,8 +62,9 @@ are installed.
 Configuration lives at `${XDG_CONFIG_HOME:-$HOME/.config}/dot/config` and is
 strict data, not sourced shell. A missing file enables no provider and no
 extensions. Optional profile definitions select additive overlay sets by exact
-user/host records; the root client remains always active, and no matching
-selector defaults to `base`. See [configuration.md](docs/configuration.md),
+user/host records; the root client remains always active. With no matching
+selector, `default_profile` chooses the configured fallback and defaults to
+`base` when omitted. See [configuration.md](docs/configuration.md),
 [overlays.md](docs/overlays.md), the sanitized
 [profile examples](examples/profile-dotfiles/), and
 [extensions.md](docs/extensions.md).

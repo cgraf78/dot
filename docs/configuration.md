@@ -11,6 +11,7 @@ version=1
 extension_api=1
 extensions_dir=$HOME/.local/lib/dotfiles
 dependency_provider=shdeps
+default_profile=dev
 shdeps_update_policy=pinned
 ```
 
@@ -23,6 +24,7 @@ Supported keys are:
 | `extension_api` | `1` |
 | `extensions_dir` | Normalized absolute path after a leading `~`, `$HOME`, or `${HOME}` expansion |
 | `dependency_provider` | `none` or `shdeps` |
+| `default_profile` | Lowercase profile name (default: `base`) |
 | `shdeps_update_policy` | `pinned` or `latest` (default: `pinned`) |
 
 `extensions_dir` requires `extension_api=1`. Unknown keys, control bytes,
@@ -90,8 +92,10 @@ profile must select at least one overlay. The client/root repository is always
 active and must not appear in `overlays=`.
 
 When `profiles.d` exists, it must define `base`. With no matching selector, Dot
-selects `base`. When `profiles.d` does not exist, Dot retains its legacy
-behavior and considers every overlay descriptor.
+selects `default_profile` from the client configuration; omitting that setting
+selects `base`. The configured name must identify a defined profile. When
+`profiles.d` does not exist, Dot retains its legacy behavior and considers every
+overlay descriptor.
 
 Selectors use strict data files with this schema:
 

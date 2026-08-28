@@ -31,6 +31,7 @@ program	lib/dot/merges.sh
 program	lib/dot/overlays.sh
 program	lib/dot/overlay-context.sh
 program	lib/dot/platform.sh
+program	lib/dot/profile-format.sh
 program	lib/dot/profiles.sh
 program	lib/dot/pre-sync.sh
 program	lib/dot/progress-ui.sh

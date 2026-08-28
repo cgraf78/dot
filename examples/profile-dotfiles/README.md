@@ -23,7 +23,8 @@ user-wide default with per-host exceptions: the tracked `example-user.conf`
 selects `editor`, while local `combined.conf` selects `dev` for that user on
 `example-host`. Multiple matches at the same specificity may agree;
 conflicting choices at the same specificity fail. With no match, Dot selects
-`base`.
+the `default_profile` configured by the client, or `base` when that setting is
+omitted. The example intentionally omits it to demonstrate the generic fallback.
 
 All identities and URLs here are reserved examples. They do not describe a
 real machine, user, or private repository.

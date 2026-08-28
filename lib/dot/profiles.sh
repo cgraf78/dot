@@ -1,6 +1,9 @@
 # shellcheck shell=bash
 # Strict, data-only profile definitions and user/host selector resolution.
 
+# shellcheck source=profile-format.sh
+. "${BASH_SOURCE[0]%/*}/profile-format.sh"
+
 # shellcheck disable=SC2034 # Published internal state consumed by other modules.
 DOT_PROFILES_PRESENT=0
 SELECTED_PROFILE=
@@ -19,13 +22,10 @@ declare -A _DOT_PROFILE_STATES=()
 declare -A _DOT_PROFILE_NAMES=()
 
 _dot_profile_error() {
+  # shellcheck disable=SC2034 # Published internal state consumed by doctor.
   DOT_PROFILE_CONFIGURATION_ERROR=$*
   printf 'dot: profile: %s\n' "$*" >&2
   return 1
-}
-
-_dot_profile_identifier_valid() {
-  [[ ${1:-} =~ ^[a-z][a-z0-9-]*$ ]]
 }
 
 _dot_profile_value_safe() {
@@ -246,6 +246,11 @@ _dot_profiles_load() {
 
   [[ -n ${_DOT_PROFILE_NAMES[base]+x} ]] ||
     _dot_profile_error 'profiles.d must define base' || return
+  _dot_profile_identifier_valid "${DOT_DEFAULT_PROFILE:-base}" ||
+    _dot_profile_error "invalid default profile: ${DOT_DEFAULT_PROFILE:-}" || return
+  [[ -n ${_DOT_PROFILE_NAMES[${DOT_DEFAULT_PROFILE:-base}]+x} ]] ||
+    _dot_profile_error \
+      "unknown default profile: ${DOT_DEFAULT_PROFILE:-base}" || return
   for profile in "${!_DOT_PROFILE_NAMES[@]}"; do
     _dot_profile_flatten "$profile" || return
   done
@@ -420,7 +425,7 @@ _dot_profile_resolve() {
   DOT_PROFILE_CURRENT_USER=$identity
   DOT_PROFILE_CURRENT_HOST=$REPLY
   SELECTED_PROFILE=
-  DOT_PROFILE_SELECTION_STATE=implicit-base
+  DOT_PROFILE_SELECTION_STATE=implicit-default
   DOT_PROFILE_SELECTOR_MATCHES=()
   DOT_PROFILE_SELECTOR_RECORDS=()
   _DOT_PROFILE_SELECTOR_CANDIDATES=()
@@ -432,7 +437,7 @@ _dot_profile_resolve() {
   done
   _dot_profile_choose_selector || return
   if [[ -z $SELECTED_PROFILE ]]; then
-    SELECTED_PROFILE=base
+    SELECTED_PROFILE=${DOT_DEFAULT_PROFILE:-base}
   else
     # shellcheck disable=SC2034 # Published internal state consumed by doctor.
     DOT_PROFILE_SELECTION_STATE=agreed-match
@@ -448,6 +453,7 @@ _dot_profiles_load_default() {
 _dot_profile_select_base() {
   [[ $DOT_PROFILES_PRESENT -eq 1 ]] || return 0
   SELECTED_PROFILE=base
+  # shellcheck disable=SC2034 # Published internal state consumed by doctor.
   DOT_PROFILE_SELECTION_STATE=phase-one
   DOT_PROFILE_SELECTOR_MATCHES=()
   DOT_PROFILE_SELECTOR_RECORDS=()

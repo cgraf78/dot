@@ -38,6 +38,13 @@ overlay names, and rejects ambiguous names. It opens and validates only
 descriptors selected by the flattened profile; malformed unselected descriptor
 contents and their transport companions are not consulted.
 
+If no selector matches, Dot selects the client configuration's
+`default_profile`; that setting defaults to `base` when omitted. A selector
+always overrides the configured fallback. Changing either the fallback or the
+winning selector takes effect on the next successful convergence: newly
+selected overlays are activated, deselected managed links are removed, and
+cached checkouts and installed packages remain available for a later upgrade.
+
 The lifecycle uses three distinct sets:
 
 - **selected** names come from the flattened profile;

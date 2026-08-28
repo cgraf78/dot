@@ -67,7 +67,16 @@ run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selec
 assert_eq base "$SELECTED_PROFILE" 'no selector defaults to base'
 assert_eq base "${INCLUDED_PROFILES[*]}" 'base inclusion chain'
 assert_eq personal "${SELECTED_OVERLAY_NAMES[*]}" 'base overlay selection'
-assert_eq implicit-base "$DOT_PROFILE_SELECTION_STATE" 'implicit base state'
+assert_eq implicit-default "$DOT_PROFILE_SELECTION_STATE" 'implicit default state'
+
+DOT_DEFAULT_PROFILE=dev
+run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+assert_eq dev "$SELECTED_PROFILE" 'configured default selects dev without a selector'
+assert_eq 'base editor dev' "${INCLUDED_PROFILES[*]}" \
+  'configured default retains additive profile inheritance'
+assert_eq 'personal nvim dev work' "${SELECTED_OVERLAY_NAMES[*]}" \
+  'configured default selects the full dev overlay set'
+DOT_DEFAULT_PROFILE=base
 
 cat >"$fake_bin/hostname" <<'SH'
 #!/usr/bin/env bash
@@ -199,6 +208,17 @@ for invalid_case in unknown-parent direct-cycle indirect-cycle empty explicit-em
     fail "accepted invalid profile case: $invalid_case"
   fi
 done
+
+DOT_DEFAULT_PROFILE=missing
+if _dot_profiles_load "$profiles" >/dev/null 2>&1; then
+  fail 'accepted a configured default naming an unknown profile'
+fi
+DOT_DEFAULT_PROFILE=Bad_Name
+if _dot_profiles_load "$profiles" >/dev/null 2>&1; then
+  fail 'accepted an invalid configured default profile identifier'
+fi
+# shellcheck disable=SC2034 # Read dynamically by the profile resolver.
+DOT_DEFAULT_PROFILE=base
 
 unknown_selected_profiles=$DOT_TEST_TMP/profiles-unknown-selected
 unknown_selected_selectors=$DOT_TEST_TMP/selectors-unknown-selected
