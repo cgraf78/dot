@@ -174,3 +174,45 @@ _dot_extension_file_validate() {
   [[ -f $resolved && ! -L $resolved ]] || return 1
   _dot_extension_file_stat "$resolved"
 }
+
+# Validate the one repository-owned lifecycle entry point that is deliberately
+# not linked into HOME. A retiring overlay is no longer active, so its saved
+# Git identity is the authority; accepting extension-dir symlinks here would
+# let the new profile silently replace the cleanup code for the old one.
+_dot_profile_deactivation_validate() {
+  local record=${1:-} script=${2:-}
+  local name path url _descriptor _optional sync
+
+  [[ $# -eq 2 ]] || return 2
+  _dot_overlay_record_validate "$record" || return 1
+  IFS='|' read -r name path url _descriptor _optional sync <<<"$record"
+  [[ $sync == git && $path == "$HOME/.dotfiles-$name" ]] || return 1
+  [[ $script == "$path/dot/profile-deactivate" ]] || return 1
+  _overlay_checkout_matches "$path" "$url" || return 1
+  [[ -f $script && ! -L $script ]] || return 1
+  _dot_extension_owned_parent_components_validate "$path" "$script" ||
+    return 1
+  _dot_extension_file_stat "$script"
+}
+
+# Resolve a support file from the already validated retiring checkout. The
+# worker publishes the checkout root as readonly state only after validating
+# the saved Git identity and fixed deactivation entry point.
+dot_retiring_overlay_file() {
+  local relative=${1:-} root=${DOT_RETIRING_OVERLAY_ROOT:-} path
+
+  [[ $# -eq 1 ]] || return 2
+  case $relative in
+    '' | /* | . | .. | ./* | ../* | */./* | */../* | */. | */.. | */ | \
+      *//* | *$'\n'* | *$'\r'*)
+      return 2
+      ;;
+  esac
+  [[ -n $root && -d $root && ! -L $root ]] || return 1
+  path=$root/$relative
+  _dot_extension_owned_parent_components_validate "$root" "$path" ||
+    return 1
+  [[ -f $path && ! -L $path && -r $path ]] || return 1
+  _dot_extension_file_stat "$path" || return 1
+  REPLY=$path
+}

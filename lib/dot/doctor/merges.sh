@@ -5,7 +5,7 @@ _dr_check_merges() {
   local root count=0
 
   _dr_section 'Extensions'
-  if [[ ${DOT_EXTENSION_API:-} != 1 || -z ${DOT_EXTENSIONS_DIR:-} ]]; then
+  if ! _dot_extensions_enabled; then
     _dr_skip 'no extension root configured'
     return 0
   fi

@@ -20,7 +20,7 @@ _dot_extension_worker_exec() {
 
   [[ $# -eq 6 ]] || return 2
   case $mode in
-    merge | pre-sync | doctor) ;;
+    merge | pre-sync | deactivate | doctor) ;;
     *)
       rm -f -- "$context" 2>/dev/null || true
       return 2

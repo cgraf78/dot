@@ -25,6 +25,10 @@ _dot_config_control_bytes() {
     awk '{ for (i = 1; i <= NF; i++) if (($i < 32 && $i != 10) || $i == 127) exit 1 }'
 }
 
+_dot_extensions_enabled() {
+  [[ ${DOT_EXTENSION_API:-} == 1 && -n ${DOT_EXTENSIONS_DIR:-} ]]
+}
+
 _dot_config_expand_path() {
   local value=$1 home suffix
 

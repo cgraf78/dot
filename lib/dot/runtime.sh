@@ -45,6 +45,8 @@ fi
 . "$_DOT_RUNTIME_DIR/repos/model.sh"
 # shellcheck source=repos/api.sh
 . "$_DOT_RUNTIME_DIR/repos/api.sh"
+# shellcheck source=profile-lifecycle.sh
+. "$_DOT_RUNTIME_DIR/profile-lifecycle.sh"
 # shellcheck source=merges.sh
 . "$_DOT_RUNTIME_DIR/merges.sh"
 # shellcheck source=pre-sync.sh

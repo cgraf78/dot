@@ -108,10 +108,17 @@ rm "$XDG_CONFIG_HOME/dot/overlays.d/21-nvim.local.conf"
 # Legacy clients without profiles continue to discover every valid descriptor.
 rm -rf "$XDG_CONFIG_HOME/dot/profiles.d"
 rm "$XDG_CONFIG_HOME/dot/overlays.d/30-dev.conf"
+printf 'url=https://example.invalid/team.git\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/05-Team_One.conf"
+printf 'url=https://example.invalid/alpha.git\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/06-alpha.local.conf"
 _dot_resolve_overlays inspect
 assert_eq 0 "$DOT_PROFILES_PRESENT" 'legacy resolver mode'
-assert_eq 'nvim personal work' "${ELIGIBLE_OVERLAY_NAMES[*]}" \
+assert_eq 'Team_One alpha.local nvim personal work' \
+  "${ELIGIBLE_OVERLAY_NAMES[*]}" \
   'legacy resolver keeps all-descriptor behavior'
+rm "$XDG_CONFIG_HOME/dot/overlays.d/05-Team_One.conf" \
+  "$XDG_CONFIG_HOME/dot/overlays.d/06-alpha.local.conf"
 printf 'url=https://example.invalid/%slegacy.git\n' $'\033' \
   >"$XDG_CONFIG_HOME/dot/overlays.d/40-control.conf"
 if _dot_resolve_overlays inspect >/dev/null 2>&1; then
@@ -378,17 +385,26 @@ done
 # transition, not just a parser choice. Preserve cached repositories and
 # unmanaged files while exact managed links move down and back up the stack.
 fixture_repo default-personal main \
-  home/.config/profile/personal-only $'personal\n' 100644
+  home/.config/profile/personal-only $'personal\n' 100644 \
+  home/.local/lib/dotfiles/merge-hooks.d/20-personal-state.sh \
+  $'merge() { printf "personal\\n" >>"$HOME/personal-merges"; }\n' 100644
 default_personal_origin=$REPLY
 fixture_repo default-nvim main \
   home/.config/profile/editor-only $'editor\n' 100644
 default_nvim_origin=$REPLY
+default_deactivate_content=$'deactivate() {\n  [[ ${DOT_RETIRING_OVERLAY:-} == dev && ${#OVERLAYS[@]} -eq 0 ]] || return 1\n  [[ ! -e $HOME/block-dev-retirement ]] || return 1\n  rm -f -- "$HOME/generated-dev-state"\n  printf "retired\\n" >>"$HOME/dev-retirements"\n}\n'
 fixture_repo default-dev main \
-  home/.config/profile/value $'dev\n' 100644
+  home/.config/profile/value $'dev\n' 100644 \
+  home/.local/lib/dotfiles/merge-hooks.d/30-dev-state.sh \
+  $'merge() { printf "managed-dev\\n" >"$HOME/generated-dev-state"; }\n' \
+  100644 \
+  dot/profile-deactivate \
+  "$default_deactivate_content" \
+  100644
 default_dev_origin=$REPLY
 fixture_repo default-base main \
   .config/profile/value $'base\n' 100644 \
-  .config/dot/config $'version=1\ndefault_profile=dev\ndependency_provider=none\n' 100644 \
+  .config/dot/config $'version=1\ndefault_profile=dev\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644 \
   .config/dot/profiles.d/base.conf $'version=1\noverlays=personal\n' 100644 \
   .config/dot/profiles.d/editor.conf $'version=1\nprofiles=base\noverlays=nvim\n' 100644 \
   .config/dot/profiles.d/dev.conf $'version=1\nprofiles=editor\noverlays=dev\n' 100644 \
@@ -404,16 +420,19 @@ default_home=$REPLY
 default_state=$DOT_TEST_TMP/default-transition-state
 PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" init --yes \
   "file://$default_base_origin" >/dev/null
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
 [[ -L $default_home/.config/profile/value ]] ||
   fail 'configured dev default did not shadow the base path'
 assert_eq dev "$(<"$default_home/.config/profile/value")" \
   'configured dev default installs the dev overlay'
 [[ -L $default_home/.config/profile/editor-only ]] ||
   fail 'configured dev default did not install the editor overlay'
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'configured dev default runs the dev merge hook'
 printf '%s\n' unmanaged >"$default_home/unmanaged-profile-file"
 
 fixture_push default-base main .config/dot/config \
-  $'version=1\ndefault_profile=base\ndependency_provider=none\n' 100644
+  $'version=1\ndefault_profile=base\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644
 PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
 [[ ! -e $default_home/.config/profile/editor-only ]] ||
   fail 'dev to base default transition retained an editor link'
@@ -423,13 +442,23 @@ assert_eq base "$(<"$default_home/.config/profile/value")" \
   'dev to base default transition restores the root file'
 assert_eq unmanaged "$(<"$default_home/unmanaged-profile-file")" \
   'dev to base default transition preserves unmanaged files'
+[[ ! -e $default_home/generated-dev-state ]] ||
+  fail 'dev to base default transition retained generated dev state'
+assert_eq retired "$(<"$default_home/dev-retirements")" \
+  'dev to base default transition invokes the retiring overlay once'
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+assert_eq retired "$(<"$default_home/dev-retirements")" \
+  'repeated base convergence does not repeat a completed retirement'
+if grep -Fq 'dev|' "$default_state/dot/profile-overlay-lifecycle-v1"; then
+  fail 'completed retirement remained in the lifecycle ledger'
+fi
 [[ -d $default_home/.dotfiles-nvim/.git ]] ||
   fail 'dev to base default transition removed the cached editor checkout'
 [[ -d $default_home/.dotfiles-dev/.git ]] ||
   fail 'dev to base default transition removed the cached dev checkout'
 
 fixture_push default-base main .config/dot/config \
-  $'version=1\ndefault_profile=dev\ndependency_provider=none\n' 100644
+  $'version=1\ndefault_profile=dev\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644
 PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
 [[ -L $default_home/.config/profile/value ]] ||
   fail 'base to dev default transition did not restore the dev link'
@@ -439,6 +468,140 @@ assert_eq dev "$(<"$default_home/.config/profile/value")" \
   fail 'base to dev default transition did not restore the editor overlay'
 assert_eq unmanaged "$(<"$default_home/unmanaged-profile-file")" \
   'base to dev default transition preserves unmanaged files'
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'base to dev default transition recreates generated dev state'
+assert_eq retired "$(<"$default_home/dev-retirements")" \
+  'reactivation does not repeat a completed retirement'
+
+# Once link convergence has selected the smaller profile, a failed cleanup is
+# retained in the lifecycle ledger and retried on the next update.
+touch "$default_home/block-dev-retirement"
+personal_merges_before=$(wc -l <"$default_home/personal-merges" | tr -d ' ')
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=base\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644
+if PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update \
+  >/dev/null 2>&1; then
+  fail 'profile downgrade ignored a failed deactivation hook'
+fi
+[[ ! -L $default_home/.config/profile/value ]] ||
+  fail 'failed deactivation prevented the selected base link generation'
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'failed deactivation retains generated state for retry'
+grep -Fq 'dev|' "$default_state/dot/profile-overlay-lifecycle-v1" ||
+  fail 'failed deactivation was dropped from the lifecycle ledger'
+set +e
+pending_output=$(PATH="$fake_bin:$PATH" run_dot "$default_home" \
+  "$default_state" doctor 2>&1)
+pending_status=$?
+set -e
+assert_eq 1 "$pending_status" 'doctor fails while profile cleanup is pending'
+assert_contains 'profile deactivation pending' "$pending_output" \
+  'doctor reports the retiring overlay that needs a retry'
+assert_eq "$personal_merges_before" \
+  "$(wc -l <"$default_home/personal-merges" | tr -d ' ')" \
+  'failed deactivation suppresses new-profile merge hooks'
+rm "$default_home/block-dev-retirement"
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+[[ ! -e $default_home/generated-dev-state ]] ||
+  fail 'retried deactivation retained generated dev state'
+assert_eq $'retired\nretired' "$(<"$default_home/dev-retirements")" \
+  'retried deactivation runs once after the failure clears'
+
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=dev\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'second reactivation recreates generated dev state'
+
+# Selection alone is not activation: a host-ineligible overlay must retire its
+# persistent state even though the flattened profile still names it.
+fixture_push default-base main .config/dot/overlays.d/30-dev.conf \
+  "url=file://$default_dev_origin"$'\nhosts=never-matches.invalid\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+[[ ! -e $default_home/generated-dev-state ]] ||
+  fail 'selected host-ineligible overlay retained generated state'
+assert_eq $'retired\nretired\nretired' \
+  "$(<"$default_home/dev-retirements")" \
+  'selected host-ineligible overlay is retired once'
+fixture_push default-base main .config/dot/overlays.d/30-dev.conf \
+  "url=file://$default_dev_origin"$'\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'host-eligible overlay reactivation recreates generated state'
+
+# API selection without an extension root does not authorize executable
+# lifecycle hooks. A downgrade fails before link mutation and keeps the ledger
+# for a later update after extensions are re-enabled.
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=base\nextension_api=1\ndependency_provider=none\n' 100644
+if PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update \
+  >/dev/null 2>&1; then
+  fail 'profile deactivation ran without a configured extension root'
+fi
+[[ -L $default_home/.config/profile/value ]] ||
+  fail 'disabled lifecycle extensions changed the installed dev links'
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'disabled lifecycle extensions preserve generated state'
+assert_eq $'retired\nretired\nretired' \
+  "$(<"$default_home/dev-retirements")" \
+  'disabled lifecycle extensions do not invoke deactivation'
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=dev\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+
+# An active overlay may not silently drop cleanup authority while its generated
+# state remains. Fail closed until a later overlay revision restores the hook.
+git -C "$DOT_TEST_TMP/default-dev-seed" rm -q dot/profile-deactivate
+git -C "$DOT_TEST_TMP/default-dev-seed" -c core.hooksPath=/dev/null \
+  commit -qm 'Remove deactivation hook'
+git -C "$DOT_TEST_TMP/default-dev-seed" push -q \
+  "$DOT_TEST_TMP/default-dev.git" HEAD:main
+if PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update \
+  >/dev/null 2>&1; then
+  fail 'active overlay silently removed its deactivation authority'
+fi
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'missing deactivation authority preserves generated state'
+set +e
+missing_authority_output=$(PATH="$fake_bin:$PATH" run_dot "$default_home" \
+  "$default_state" doctor 2>&1)
+missing_authority_status=$?
+set -e
+assert_eq 1 "$missing_authority_status" \
+  'doctor fails for missing active deactivation authority'
+assert_contains 'active profile deactivation authority unsafe' \
+  "$missing_authority_output" \
+  'doctor reports missing active deactivation authority'
+fixture_push default-dev main dot/profile-deactivate \
+  "$default_deactivate_content" 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+
+# A saved retirement record is executable authority. If the cached checkout no
+# longer has the recorded origin, reject the transition before changing links
+# or generated state, then retry cleanly once identity is restored.
+git -C "$default_home/.dotfiles-dev" config remote.origin.url \
+  "file://$DOT_TEST_TMP/wrong-dev-origin.git"
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=base\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644
+if PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update \
+  >/dev/null 2>&1; then
+  fail 'profile downgrade accepted a retiring checkout with the wrong origin'
+fi
+[[ -L $default_home/.config/profile/value ]] ||
+  fail 'unsafe retirement changed the active dev link generation'
+assert_eq dev "$(<"$default_home/.config/profile/value")" \
+  'unsafe retirement preserves the active dev profile'
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'unsafe retirement preserves generated dev state'
+
+git -C "$default_home/.dotfiles-dev" config remote.origin.url \
+  "file://$default_dev_origin"
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+[[ ! -e $default_home/generated-dev-state ]] ||
+  fail 'retried safe downgrade retained generated dev state'
+assert_eq $'retired\nretired\nretired\nretired' \
+  "$(<"$default_home/dev-retirements")" \
+  'retried safe downgrade invokes one additional retirement'
 
 # A base update temporarily restores shadowed paths before pulling. If the new
 # selector generation conflicts, the previously active link generation must be

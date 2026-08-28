@@ -356,6 +356,10 @@ _dot_profile_read_selector_dir() {
   shopt -q nullglob && nullglob_was_set=1
   shopt -s nullglob
   for file in "$directory"/*.conf; do
+    _dot_profile_value_safe "${file##*/}" || {
+      [[ $nullglob_was_set -eq 1 ]] || shopt -u nullglob
+      _dot_profile_error "unsafe selector filename: ${file##*/}" || return
+    }
     _dot_profile_selector_parse "$file" "$source_class" || {
       [[ $nullglob_was_set -eq 1 ]] || shopt -u nullglob
       return 1

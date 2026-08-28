@@ -61,11 +61,12 @@ _dot_extension_worker_main() {
   local mode=${1:-} script=${2:-}
   local _dot_extension_worker_result=${3:-}
   local context=${4:-} token=${5:-}
+  local retiring_record
 
   [[ $# -eq 5 ]] || return 2
   readonly _dot_extension_worker_result
   case $mode in
-    merge | pre-sync | doctor) ;;
+    merge | pre-sync | deactivate | doctor) ;;
     *) return 2 ;;
   esac
   case ${DOT_SOURCE_ROOT:-} in
@@ -108,12 +109,33 @@ _dot_extension_worker_main() {
   _dot_extension_worker_load_overlay_protocol || return 1
   # shellcheck source=extension-trust.sh
   . "$DOT_SOURCE_ROOT/lib/dot/extension-trust.sh"
-  _dot_extension_file_validate "$script" || return 1
-  unset -f merge doctor 2>/dev/null || true
+  if [[ $mode == deactivate ]]; then
+    local _retiring_name _retiring_path _retiring_url _retiring_descriptor
+    local _retiring_optional _retiring_sync
+    [[ $REPLY_SET_KIND == retiring && ${#OVERLAYS[@]} -eq 1 ]] || return 1
+    retiring_record=${OVERLAYS[0]}
+    _dot_profile_deactivation_validate "$retiring_record" "$script" ||
+      return 1
+    IFS='|' read -r _retiring_name _retiring_path _retiring_url \
+      _retiring_descriptor _retiring_optional _retiring_sync <<<"$retiring_record"
+    DOT_RETIRING_OVERLAY=${retiring_record%%|*}
+    DOT_RETIRING_OVERLAY_ROOT=$_retiring_path
+    readonly DOT_RETIRING_OVERLAY
+    readonly DOT_RETIRING_OVERLAY_ROOT
+    export DOT_RETIRING_OVERLAY DOT_RETIRING_OVERLAY_ROOT
+    # Retiring authority validates only the saved repository entry point. It
+    # must not make old fragment families visible to cleanup code, because that
+    # would let a downgrade accidentally regenerate the state being removed.
+    OVERLAYS=()
+    readonly -a OVERLAYS
+  else
+    _dot_extension_file_validate "$script" || return 1
+  fi
+  unset -f merge prepare deactivate doctor 2>/dev/null || true
 
   # shellcheck disable=SC2031 # The readonly engine result path survives sourced client code.
   case $mode in
-    merge | pre-sync)
+    merge | pre-sync | deactivate)
       _dot_extension_worker_load_merge_api || return 1
       unset -f _dot_extension_worker_load_overlay_protocol \
         _dot_extension_worker_load_merge_api \
@@ -128,7 +150,10 @@ _dot_extension_worker_main() {
         return 1
       fi
       local entry_point=merge
-      [[ $mode == pre-sync ]] && entry_point=prepare
+      case $mode in
+        pre-sync) entry_point=prepare ;;
+        deactivate) entry_point=deactivate ;;
+      esac
       if ! declare -F "$entry_point" >/dev/null; then
         printf '0' >"$_dot_extension_worker_result"
         return 1

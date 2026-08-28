@@ -1,6 +1,56 @@
 # shellcheck shell=bash
 # dot doctor: Overlays checks.
 
+_dr_check_profile_lifecycle() {
+  local record name pending_count=0
+  local -a pending=()
+  local -A eligible=() active=()
+
+  [[ ${DOT_PROFILES_PRESENT:-0} -eq 1 ]] || return 0
+  if ! _dot_profile_lifecycle_load; then
+    _dr_fail 'profile lifecycle state unsafe' \
+      'run dot update after repairing the lifecycle ledger'
+    return 0
+  fi
+  for name in "${ELIGIBLE_OVERLAY_NAMES[@]}"; do
+    eligible["$name"]=1
+  done
+  for record in "${ACTIVE_OVERLAYS[@]}"; do
+    active["${record%%|*}"]=$record
+  done
+  for record in "${DOT_PROFILE_LIFECYCLE_RECORDS[@]}"; do
+    name=${record%%|*}
+    if [[ -n ${eligible[$name]+x} ]]; then
+      if [[ -n ${active[$name]+x} ]]; then
+        if ! _dot_profile_deactivation_script "${active[$name]}" >/dev/null; then
+          _dr_fail "$name: active profile deactivation authority unsafe"
+        fi
+      elif ! _dot_profile_deactivation_script "$record" >/dev/null; then
+        _dr_warn "$name: retained profile deactivation authority unavailable" \
+          'selected optional overlay is not currently active'
+      fi
+      continue
+    fi
+    pending_count=$((pending_count + 1))
+    pending+=("$name")
+    if ! _dot_extensions_enabled; then
+      _dr_fail 'profile deactivation pending while extensions are disabled' "$name"
+      continue
+    fi
+    if ! _dot_profile_deactivation_script "$record" >/dev/null; then
+      _dr_fail "$name: retiring overlay authority unsafe" \
+        'restore the recorded checkout identity, then run dot update'
+      continue
+    fi
+  done
+  if ((pending_count > 0)); then
+    _dr_fail 'profile deactivation pending' \
+      "${pending[*]} (run dot update to retry)"
+  else
+    _dr_ok 'profile lifecycle state' 'no pending deactivations'
+  fi
+}
+
 _dr_check_overlays() {
   local conf_count=${#CONFIGURED_OVERLAY_NAMES[@]} manifest="$DOT_OVERLAY_MANIFEST"
   local entry name path url optional sync lifecycle state source
@@ -37,6 +87,7 @@ _dr_check_overlays() {
       _dr_ok "matching selector (${source})" \
         "${selector_path##*/} -> $selector_profile"
     done
+    _dr_check_profile_lifecycle
   fi
 
   _dr_section "Overlays ($conf_count configured)"

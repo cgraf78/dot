@@ -54,6 +54,163 @@ _dot_extension_worker_run pre-sync "$pre_sync" "$temporary" "$result" \
 assert_eq 1 "$(<"$result")" 'pre-sync worker ran with decoded context'
 [[ ! -e $context && ! -L $context ]] || fail 'worker did not consume context'
 
+# Profile deactivation receives one saved Git authority record, but old
+# overlays are intentionally hidden from the ordinary active-family API.
+retiring=$HOME/.dotfiles-retiring
+retiring_descriptor=$HOME/.config/dot/overlays.d/20-retiring.conf
+retiring_origin=https://example.invalid/retiring.git
+mkdir -p "$retiring/dot" "$retiring/support"
+cat >"$retiring/support/helper.sh" <<'HELPER'
+retiring_support_run() {
+  printf '%s|%s\n' "$DOT_RETIRING_OVERLAY" "${#OVERLAYS[@]}" \
+    >"$HOME/deactivation-observed"
+}
+HELPER
+cat >"$retiring/dot/profile-deactivate" <<'HOOK'
+deactivate() {
+  dot_retiring_overlay_file support/helper.sh || return
+  # shellcheck source=/dev/null
+  . "$REPLY" || return
+  retiring_support_run
+}
+HOOK
+chmod 0600 "$retiring/dot/profile-deactivate" "$retiring/support/helper.sh"
+git -C "$retiring" init -q
+git -C "$retiring" config user.name 'Dot Test'
+git -C "$retiring" config user.email dot-test@example.invalid
+git -C "$retiring" add dot/profile-deactivate support/helper.sh
+git -C "$retiring" commit -qm 'Add profile deactivation fixture'
+git -C "$retiring" remote add origin "$retiring_origin"
+printf 'url=%s\n' "$retiring_origin" >"$retiring_descriptor"
+retiring_record="retiring|$retiring|$retiring_origin|$retiring_descriptor|true|git"
+: >"$result"
+_dot_overlay_context_create "$temporary" deactivate retiring none \
+  "$retiring_record"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+_dot_extension_worker_run deactivate "$retiring/dot/profile-deactivate" \
+  "$temporary" "$result" "$context" "$token"
+assert_eq 1 "$(<"$result")" 'deactivation worker ran with saved authority'
+assert_eq 'retiring|0' "$(<"$HOME/deactivation-observed")" \
+  'deactivation worker exposes identity without active overlays'
+
+# The repository-only entry point is a fixed, single-link, non-writable file
+# below the exact recorded Git checkout. Exercise each trust boundary directly.
+# shellcheck source=../lib/dot/repos/config.sh
+. "$DOT_TEST_ROOT/lib/dot/repos/config.sh"
+# shellcheck source=../lib/dot/repos/overlays.sh
+. "$DOT_TEST_ROOT/lib/dot/repos/overlays.sh"
+# shellcheck source=../lib/dot/extension-trust.sh
+. "$DOT_TEST_ROOT/lib/dot/extension-trust.sh"
+# shellcheck disable=SC2034 # Read dynamically by the retiring-overlay lookup.
+DOT_RETIRING_OVERLAY_ROOT=$retiring
+dot_retiring_overlay_file support/helper.sh ||
+  fail 'rejected a trusted retiring-overlay support file'
+assert_eq "$retiring/support/helper.sh" "$REPLY" \
+  'retiring-overlay support lookup returns the validated path'
+mv "$retiring/support/helper.sh" "$retiring/support/helper.sh.real"
+ln -s helper.sh.real "$retiring/support/helper.sh"
+if dot_retiring_overlay_file support/helper.sh; then
+  fail 'accepted a symlinked retiring-overlay support file'
+fi
+rm "$retiring/support/helper.sh"
+mv "$retiring/support/helper.sh.real" "$retiring/support/helper.sh"
+ln "$retiring/support/helper.sh" "$retiring/support/helper.sh.hardlink"
+if dot_retiring_overlay_file support/helper.sh; then
+  fail 'accepted a hard-linked retiring-overlay support file'
+fi
+rm "$retiring/support/helper.sh.hardlink"
+deactivate_script=$retiring/dot/profile-deactivate
+mv "$deactivate_script" "$deactivate_script.real"
+ln -s profile-deactivate.real "$deactivate_script"
+if _dot_profile_deactivation_validate "$retiring_record" "$deactivate_script"; then
+  fail 'accepted a symlinked profile deactivation entry point'
+fi
+rm "$deactivate_script"
+mv "$deactivate_script.real" "$deactivate_script"
+ln "$deactivate_script" "$retiring/dot/profile-deactivate.hardlink"
+if _dot_profile_deactivation_validate "$retiring_record" "$deactivate_script"; then
+  fail 'accepted a hard-linked profile deactivation entry point'
+fi
+rm "$retiring/dot/profile-deactivate.hardlink"
+chmod 0666 "$deactivate_script"
+if _dot_profile_deactivation_validate "$retiring_record" "$deactivate_script"; then
+  fail 'accepted a writable profile deactivation entry point'
+fi
+chmod 0600 "$deactivate_script"
+chmod 0777 "$retiring/dot"
+if _dot_profile_deactivation_validate "$retiring_record" "$deactivate_script"; then
+  fail 'accepted a profile deactivation entry point below a writable parent'
+fi
+chmod 0700 "$retiring/dot"
+printf 'safe but misplaced\n' >"$retiring/other"
+chmod 0600 "$retiring/other"
+if _dot_profile_deactivation_validate "$retiring_record" "$retiring/other"; then
+  fail 'accepted a profile deactivation entry point at the wrong path'
+fi
+local_descriptor=$HOME/.config/dot/overlays.d/30-local.conf
+printf 'sync=none\npath=%s\n' "$HOME/local-overlay" >"$local_descriptor"
+local_record="local|$HOME/local-overlay||$local_descriptor|false|none"
+if _dot_profile_deactivation_validate "$local_record" \
+  "$HOME/local-overlay/dot/profile-deactivate"; then
+  fail 'accepted executable deactivation authority from sync=none'
+fi
+
+# Lifecycle authority is private durable state. Reject alternate names,
+# aliases, permissive files, malformed framing, duplicates, and oversized data.
+# shellcheck source=../lib/dot/profile-lifecycle.sh
+. "$DOT_TEST_ROOT/lib/dot/profile-lifecycle.sh"
+_warn() { :; }
+lifecycle_dir=$HOME/lifecycle
+mkdir "$lifecycle_dir"
+chmod 0700 "$lifecycle_dir"
+DOT_PROFILE_LIFECYCLE_LEDGER=$lifecycle_dir/ledger
+printf 'version=1\n%s\n' "$retiring_record" >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+chmod 0600 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+_dot_profile_lifecycle_load || fail 'rejected a valid lifecycle ledger'
+for ledger_case in symlink hardlink mode malformed duplicate control oversize; do
+  rm -f "$DOT_PROFILE_LIFECYCLE_LEDGER" "$lifecycle_dir/alias"
+  case $ledger_case in
+    symlink)
+      printf 'version=1\n' >"$lifecycle_dir/alias"
+      chmod 0600 "$lifecycle_dir/alias"
+      ln -s alias "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ;;
+    hardlink)
+      printf 'version=1\n' >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+      chmod 0600 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ln "$DOT_PROFILE_LIFECYCLE_LEDGER" "$lifecycle_dir/alias"
+      ;;
+    mode)
+      printf 'version=1\n' >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+      chmod 0644 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ;;
+    malformed)
+      printf 'version=2\n' >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+      chmod 0600 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ;;
+    duplicate)
+      printf 'version=1\n%s\n%s\n' "$retiring_record" "$retiring_record" >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+      chmod 0600 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ;;
+    control)
+      printf 'version=1\n%s\n' "${retiring_record/example/example$'\033'}" >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+      chmod 0600 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ;;
+    oversize)
+      {
+        printf 'version=1\n'
+        head -c 1048576 /dev/zero | tr '\0' x
+      } >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+      chmod 0600 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ;;
+  esac
+  if _dot_profile_lifecycle_load >/dev/null 2>&1; then
+    fail "accepted unsafe lifecycle ledger: $ledger_case"
+  fi
+done
+rm -f "$DOT_PROFILE_LIFECYCLE_LEDGER" "$lifecycle_dir/alias"
+
 for case_name in token tamper unsafe-mode expired symlink wrong-mode wrong-kind wrong-stage reuse; do
   : >"$result"
   _dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"

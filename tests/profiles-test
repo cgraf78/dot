@@ -291,6 +291,17 @@ if _dot_profile_resolve "$DOT_TEST_TMP/no-root" "$local_security" \
   fail 'accepted group-writable machine-local selector directory'
 fi
 
+unsafe_selector_name=$DOT_TEST_TMP/unsafe-selector-name
+mkdir "$unsafe_selector_name"
+write_selector "$unsafe_selector_name" 'bad|name' \
+  $'version=1\nuser=example-user\nprofile=base'
+chmod 0600 "$unsafe_selector_name/bad|name.conf"
+chmod 0700 "$unsafe_selector_name"
+if _dot_profile_resolve "$DOT_TEST_TMP/no-root" "$unsafe_selector_name" \
+  "$DOT_TEST_TMP/no-personal" >/dev/null 2>&1; then
+  fail 'accepted a selector filename that corrupts diagnostic records'
+fi
+
 # Personal selector fragments are trusted only from within the validated
 # checkout. Every existing directory component from the checkout root through
 # dot/profile-selectors.d must be current-user-owned and non-symlinked.

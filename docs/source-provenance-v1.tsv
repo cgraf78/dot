@@ -30,6 +30,8 @@ lib/dot/merges.sh	dotfiles:core/merges.sh@dotfiles-v1
 lib/dot/overlay-context.sh	standalone:new
 lib/dot/overlays.sh	dotfiles:core/overlays.sh@dotfiles-v1
 lib/dot/platform.sh	dotfiles:core/platform.sh@dotfiles-v1
+lib/dot/profile-format.sh	standalone:new
+lib/dot/profile-lifecycle.sh	standalone:new
 lib/dot/profiles.sh	standalone:new
 lib/dot/pre-sync.sh	standalone:new
 lib/dot/progress-ui.sh	dotfiles:core/progress-ui.sh@dotfiles-v1

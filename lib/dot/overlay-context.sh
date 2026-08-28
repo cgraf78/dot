@@ -162,7 +162,7 @@ _dot_overlay_context_matrix_valid() {
   local mode=$1 set_kind=$2 stage=$3
   case $mode:$set_kind:$stage in
     pre-sync:eligible:prepare | pre-sync:eligible:reconcile | \
-      merge:active:none | doctor:active:none)
+      merge:active:none | deactivate:retiring:none | doctor:active:none)
       return 0
       ;;
   esac

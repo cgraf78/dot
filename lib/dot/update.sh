@@ -7,6 +7,11 @@
 # update/pull behavior should live here so cron, reexec, repo sync, and final
 # convergence stay in one readable state machine.
 
+if ! declare -F _dot_profile_lifecycle_prepare >/dev/null 2>&1; then
+  # shellcheck source=profile-lifecycle.sh
+  . "${BASH_SOURCE[0]%/*}/profile-lifecycle.sh"
+fi
+
 _dot_update_no_base_pull() {
   _ensure_repo_config
   _ui_stage_start "Repos" "checking repositories"
@@ -221,7 +226,24 @@ _dot_update_sync_repos() {
     DOT_OVERLAY_LINKS_FROZEN=1
     return 1
   fi
+  if ! _dot_profile_lifecycle_prepare; then
+    _dot_update_repo_stage_finish 1
+    if _base_repo_exists; then
+      _overlay_restore_installed_links ||
+        _warn '  warning: could not restore the previous overlay-link generation'
+    fi
+    DOT_OVERLAY_LINKS_FROZEN=1
+    return 1
+  fi
   _dot_update_repo_stage_finish 0
+}
+
+_dot_update_skip_inputs() {
+  local reason=$1
+  _ui_stage_start "Tools" "skipping configured dependencies"
+  _ui_stage_finish warning "$reason; dependencies skipped"
+  _ui_stage_start "Configs" "skipping config hooks"
+  _ui_stage_finish warning "$reason; config hooks skipped"
 }
 
 _dot_update_finalize() {
@@ -246,42 +268,51 @@ _dot_update_finalize() {
     inputs_ready=0
   fi
   if [[ $inputs_ready -eq 0 ]]; then
-    _ui_stage_start "Tools" "skipping configured dependencies"
-    _ui_stage_finish warning "repository synchronization failed; dependencies skipped"
-    _ui_stage_start "Configs" "skipping config hooks"
-    _ui_stage_finish warning "repository synchronization failed; config hooks skipped"
+    _dot_update_skip_inputs 'repository synchronization failed'
   else
-    if [[ "${DOT_DEPENDENCY_PROVIDER:-none}" == shdeps ]]; then
-      if _ensure_shdeps; then
-        shdeps_ready=1
-      else
-        update_status=1
+    if ! _dot_profile_lifecycle_retire; then
+      update_status=1
+      inputs_ready=0
+      _dot_update_skip_inputs 'profile deactivation failed'
+    else
+      if [[ "${DOT_DEPENDENCY_PROVIDER:-none}" == shdeps ]]; then
+        if _ensure_shdeps; then
+          shdeps_ready=1
+        else
+          update_status=1
+        fi
       fi
-    fi
-    if [[ "${DOT_DEPENDENCY_PROVIDER:-none}" == none ]]; then
-      _ui_stage_start "Tools" "checking configured dependencies"
-      _ui_stage_finish ok "no dependency provider"
-    elif [[ "$shdeps_ready" -eq 1 ]] && declare -f shdeps_update &>/dev/null; then
-      _ui_stage_start "Tools" "checking configured dependencies"
-      provider_revision_before=$(_dot_active_revision)
-      if _run_shdeps_update_ui; then
-        _ui_stage_finish "${DOT_UI_SHDEPS_STATUS:-ok}" "${DOT_UI_SHDEPS_SUMMARY:-dependencies checked}"
-        _shdeps_print_group_summaries
-        if ! _dot_provider_maybe_reexec "$provider_revision_before"; then
-          _ui_done 1
-          return 1
+      if [[ "${DOT_DEPENDENCY_PROVIDER:-none}" == none ]]; then
+        _ui_stage_start "Tools" "checking configured dependencies"
+        _ui_stage_finish ok "no dependency provider"
+      elif [[ "$shdeps_ready" -eq 1 ]] && declare -f shdeps_update &>/dev/null; then
+        _ui_stage_start "Tools" "checking configured dependencies"
+        provider_revision_before=$(_dot_active_revision)
+        if _run_shdeps_update_ui; then
+          _ui_stage_finish "${DOT_UI_SHDEPS_STATUS:-ok}" "${DOT_UI_SHDEPS_SUMMARY:-dependencies checked}"
+          _shdeps_print_group_summaries
+          if ! _dot_provider_maybe_reexec "$provider_revision_before"; then
+            _ui_done 1
+            return 1
+          fi
+        else
+          update_status=1
+          _ui_stage_finish failed "${DOT_UI_SHDEPS_SUMMARY:-dependency update failed}"
+          _shdeps_print_group_summaries
         fi
       else
         update_status=1
-        _ui_stage_finish failed "${DOT_UI_SHDEPS_SUMMARY:-dependency update failed}"
-        _shdeps_print_group_summaries
+        _ui_stage_start "Tools" "checking configured dependencies"
+        _ui_stage_finish failed "shdeps unavailable; dependency install skipped"
       fi
-    else
-      update_status=1
-      _ui_stage_start "Tools" "checking configured dependencies"
-      _ui_stage_finish failed "shdeps unavailable; dependency install skipped"
+      _run_merges || update_status=1
     fi
-    _run_merges || update_status=1
+  fi
+  if [[ $inputs_ready -eq 1 && $update_status -eq 0 ]]; then
+    if ! _dot_profile_lifecycle_commit; then
+      _warn '  warning: could not commit profile lifecycle state'
+      update_status=1
+    fi
   fi
   if _base_repo_exists; then
     _ui_stage_start "Cleanup" "normalizing worktree"

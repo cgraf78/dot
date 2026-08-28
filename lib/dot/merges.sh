@@ -38,8 +38,7 @@ _merge_hook_specs() {
   local _key _identity _script _root
   local -A _seen=()
 
-  [[ "${DOT_EXTENSION_API:-}" == 1 && -n "${DOT_EXTENSIONS_DIR:-}" ]] ||
-    return 0
+  _dot_extensions_enabled || return 0
   if ! _dot_extension_root_validate; then
     printf 'dot: unsafe extension root: %s\n' "$DOT_EXTENSIONS_DIR" >&2
     return 1

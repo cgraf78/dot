@@ -28,10 +28,22 @@ PHASE_ONE_ACTIVE_OVERLAYS=()
 # Extract overlay name from conf filename: "10-work.conf" → "work"
 _overlay_name() {
   local base="${1##*/}"
+  local sync="${2:-git}"
+  base="${base%.conf}"
+  [[ "$sync" == "none" ]] && base="${base%.local}"
+  [[ "$base" =~ ^[0-9]+-(.+)$ ]] && base="${BASH_REMATCH[1]}"
+  # printf, not echo: a name beginning with a dash would be eaten as an echo flag.
+  printf '%s\n' "$base"
+}
+
+# Profile definitions need an identity before a selected descriptor is opened.
+# `.local.conf` is the canonical profile-aware spelling for a sync=none
+# descriptor, so normalize that suffix without depending on descriptor content.
+_overlay_profile_name() {
+  local base="${1##*/}"
   base="${base%.conf}"
   base="${base%.local}"
   [[ "$base" =~ ^[0-9]+-(.+)$ ]] && base="${BASH_REMATCH[1]}"
-  # printf, not echo: a name beginning with a dash would be eaten as an echo flag.
   printf '%s\n' "$base"
 }
 
@@ -424,6 +436,54 @@ _dot_overlay_use_set() {
   esac
 }
 
+# Preserve pre-profile discovery semantics exactly when profiles.d is absent.
+# In particular, Git descriptors retain a literal `.local` suffix and legacy
+# names are not constrained to the stricter profile identifier grammar.
+_discover_legacy_overlays() {
+  local file name record parse_rc state seen_names=""
+  for file in "$@"; do
+    [[ -f $file || -L $file ]] || continue
+    parse_rc=0
+    DOT_OVERLAY_STRICT_SELECTED=0
+    if _parse_overlay_conf "$file"; then
+      record=$REPLY
+      name=${record%%|*}
+      if [[ " $seen_names " == *" $name "* ]]; then
+        _warn "  warning: duplicate overlay name '$name' in $file — skipping"
+        continue
+      fi
+      seen_names="$seen_names $name"
+      CONFIGURED_OVERLAY_NAMES+=("$name")
+      SELECTED_OVERLAY_NAMES+=("$name")
+      ELIGIBLE_OVERLAY_NAMES+=("$name")
+      ELIGIBLE_OVERLAYS+=("$record")
+      if _overlay_record_active_existing "$record"; then
+        ACTIVE_OVERLAY_NAMES+=("$name")
+        ACTIVE_OVERLAYS+=("$record")
+        DOT_OVERLAY_LIFECYCLE+=("$name|active|$file")
+      else
+        IFS='|' read -r _ _ _ _ selected _ <<<"$record"
+        if [[ $selected == true ]]; then
+          state='selected-optional-unavailable'
+        else
+          state='selected-unavailable'
+        fi
+        DOT_OVERLAY_LIFECYCLE+=("$name|$state|$file")
+      fi
+    else
+      parse_rc=$?
+      [[ $parse_rc -eq 1 ]] && continue
+      DOT_OVERLAY_DISCOVERY_ERROR=${REPLY:-"invalid overlay descriptor: $file"}
+      ELIGIBLE_OVERLAYS=()
+      ACTIVE_OVERLAYS=()
+      unset DOT_OVERLAY_STRICT_SELECTED
+      return "${parse_rc:-2}"
+    fi
+  done
+  unset DOT_OVERLAY_STRICT_SELECTED
+  _dot_overlay_use_set eligible
+}
+
 # Discover selected overlay descriptors. Filename-derived identities are
 # validated globally before any descriptor content is opened. In legacy mode,
 # where profiles.d is absent, every descriptor retains its historical implicit
@@ -448,9 +508,15 @@ _discover_overlays() {
   shopt -s nullglob
   descriptor_files=("$conf_dir"/*.conf)
   [[ $nullglob_was_set -eq 1 ]] || shopt -u nullglob
+
+  if [[ ${DOT_PROFILES_PRESENT:-0} -ne 1 ]]; then
+    _discover_legacy_overlays "${descriptor_files[@]+"${descriptor_files[@]}"}"
+    return
+  fi
+
   for file in "${descriptor_files[@]+"${descriptor_files[@]}"}"; do
     [[ -f $file || -L $file ]] || continue
-    name=$(_overlay_name "$file")
+    name=$(_overlay_profile_name "$file")
     if ! _dot_profile_identifier_valid "$name"; then
       DOT_OVERLAY_DISCOVERY_ERROR="invalid overlay descriptor filename: ${file##*/}"
       [[ ${DOT_OVERLAY_DISCOVERY_SILENT:-0} == 1 ]] ||
@@ -467,22 +533,15 @@ _discover_overlays() {
     CONFIGURED_OVERLAY_NAMES+=("$name")
   done
 
-  if [[ ${DOT_PROFILES_PRESENT:-0} -eq 1 ]]; then
-    for name in "${SELECTED_OVERLAY_NAMES[@]+"${SELECTED_OVERLAY_NAMES[@]}"}"; do
-      selected_names["$name"]=1
-      if [[ -z ${descriptors[$name]+x} ]]; then
-        DOT_OVERLAY_DISCOVERY_ERROR="selected overlay has no descriptor: $name"
-        [[ ${DOT_OVERLAY_DISCOVERY_SILENT:-0} == 1 ]] ||
-          printf 'dot: overlay: %s\n' "$DOT_OVERLAY_DISCOVERY_ERROR" >&2
-        return 2
-      fi
-    done
-  else
-    for name in "${CONFIGURED_OVERLAY_NAMES[@]+"${CONFIGURED_OVERLAY_NAMES[@]}"}"; do
-      selected_names["$name"]=1
-      SELECTED_OVERLAY_NAMES+=("$name")
-    done
-  fi
+  for name in "${SELECTED_OVERLAY_NAMES[@]+"${SELECTED_OVERLAY_NAMES[@]}"}"; do
+    selected_names["$name"]=1
+    if [[ -z ${descriptors[$name]+x} ]]; then
+      DOT_OVERLAY_DISCOVERY_ERROR="selected overlay has no descriptor: $name"
+      [[ ${DOT_OVERLAY_DISCOVERY_SILENT:-0} == 1 ]] ||
+        printf 'dot: overlay: %s\n' "$DOT_OVERLAY_DISCOVERY_ERROR" >&2
+      return 2
+    fi
+  done
 
   for name in "${CONFIGURED_OVERLAY_NAMES[@]+"${CONFIGURED_OVERLAY_NAMES[@]}"}"; do
     file=${descriptors[$name]}
@@ -491,7 +550,7 @@ _discover_overlays() {
       continue
     fi
     parse_rc=0
-    DOT_OVERLAY_STRICT_SELECTED=${DOT_PROFILES_PRESENT:-0}
+    DOT_OVERLAY_STRICT_SELECTED=1
     if _parse_overlay_conf "$file"; then
       record=$REPLY
       ELIGIBLE_OVERLAY_NAMES+=("$name")
@@ -513,9 +572,6 @@ _discover_overlays() {
       parse_rc=$?
       if [[ $parse_rc -eq 1 && ${DOT_OVERLAY_PARSE_STATE:-} == ineligible ]]; then
         DOT_OVERLAY_LIFECYCLE+=("$name|selected-ineligible|$file")
-        continue
-      fi
-      if [[ $parse_rc -eq 1 && ${DOT_PROFILES_PRESENT:-0} -eq 0 ]]; then
         continue
       fi
       DOT_OVERLAY_DISCOVERY_ERROR=${REPLY:-"invalid selected overlay descriptor: $file"}

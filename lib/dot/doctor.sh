@@ -89,7 +89,7 @@ _dot_doctor_extension_specs() {
   local root script key identity
   local -A seen=()
 
-  [[ ${DOT_EXTENSION_API:-} == 1 && -n ${DOT_EXTENSIONS_DIR:-} ]] || return 0
+  _dot_extensions_enabled || return 0
   _dot_extension_root_validate || return 1
   root=$DOT_EXTENSIONS_DIR/doctor.d
   if [[ ! -e $root && ! -L $root ]]; then

@@ -84,5 +84,10 @@ Command side effects are explicit:
 - `push` performs no preparatory clone, pull, or fetch and pushes only the root
   plus selected existing Git checkouts.
 
-Changing profiles removes only exact managed links during the next successful
-convergence. Cached checkouts and native packages are retained.
+Changing profiles removes exact managed links during the next convergence.
+Git-backed overlays may additionally provide an idempotent
+`dot/profile-deactivate` hook for persistent generated state that cannot be
+removed with the links themselves. Dot keeps a private lifecycle ledger so a
+failed cleanup is diagnosed and retried; it validates the saved repository
+identity before changing the installed link generation. Cached checkouts,
+native packages, credentials, and unmanaged files are retained.
