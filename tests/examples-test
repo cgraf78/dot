@@ -40,6 +40,7 @@ for path in \
   root/.config/dot/overlays.d/30-dev.conf \
   root/.config/dot/overlays.d/80-personal.conf \
   root/.config/dot/overlays.d/90-work.conf \
+  root/.config/dot/profile-selectors.d/00-default.conf \
   root/.config/dot/profile-selectors.d/example-user.conf \
   local/user-only.conf \
   local/host-only.conf \
@@ -85,7 +86,7 @@ _dot_profile_resolve \
   "$DOT_TEST_TMP/no-personal-selectors"
 assert_eq dev "$SELECTED_PROFILE" \
   'profile example host exception overrides user-wide editor default'
-assert_eq 2 "${#DOT_PROFILE_SELECTOR_MATCHES[@]}" \
+assert_eq 3 "${#DOT_PROFILE_SELECTOR_MATCHES[@]}" \
   'profile example records broad and specific matches'
 
 # Exercise the checked-in profile, descriptor, and personal-selector tree

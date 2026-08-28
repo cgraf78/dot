@@ -333,8 +333,9 @@ _dot_profile_selector_parse() {
   done <"$path"
   [[ $seen_version -eq 1 ]] || _dot_profile_error "$path: missing version=1" || return
   [[ $seen_profile -eq 1 ]] || _dot_profile_error "$path: missing profile" || return
-  [[ $seen_user -eq 1 || $seen_host -eq 1 ]] ||
-    _dot_profile_error "$path: selector requires user or host" || return
+  if [[ $seen_user -eq 0 && $seen_host -eq 0 && $source_class != root ]]; then
+    _dot_profile_error "$path: non-root selector requires user or host" || return
+  fi
   [[ -n ${_DOT_PROFILE_NAMES[$profile]+x} ]] ||
     _dot_profile_error "$path: unknown profile: $profile" || return
   REPLY="$user|$host|$profile"

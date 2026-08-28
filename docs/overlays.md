@@ -39,8 +39,9 @@ descriptors selected by the flattened profile; malformed unselected descriptor
 contents and their transport companions are not consulted.
 
 If no selector matches, Dot selects the client configuration's
-`default_profile`; that setting defaults to `base` when omitted. A selector
-always overrides the configured fallback. Changing either the fallback or the
+`default_profile`; that setting defaults to `base` when omitted. A tracked root
+selector with no user or host may provide a compatibility default, and any
+more-specific selector overrides it. Changing either the fallback or the
 winning selector takes effect on the next successful convergence: newly
 selected overlays are activated, deselected managed links are removed, and
 cached checkouts and installed packages remain available for a later upgrade.

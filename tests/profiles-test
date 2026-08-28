@@ -69,6 +69,32 @@ assert_eq base "${INCLUDED_PROFILES[*]}" 'base inclusion chain'
 assert_eq personal "${SELECTED_OVERLAY_NAMES[*]}" 'base overlay selection'
 assert_eq implicit-default "$DOT_PROFILE_SELECTION_STATE" 'implicit default state'
 
+write_selector "$root_selectors" global-default $'version=1\nprofile=dev'
+run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+assert_eq dev "$SELECTED_PROFILE" 'tracked root selector may define a global default'
+assert_eq 'root:global-default.conf:dev' "${DOT_PROFILE_SELECTOR_MATCHES[*]}" \
+  'global root selector provenance'
+
+write_selector "$root_selectors" user $'version=1\nuser=example-user\nprofile=editor'
+run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
+assert_eq editor "$SELECTED_PROFILE" 'user selector overrides global root default'
+rm "$root_selectors/global-default.conf" "$root_selectors/user.conf"
+
+write_selector "$local_selectors" invalid-global $'version=1\nprofile=dev'
+chmod 0600 "$local_selectors/invalid-global.conf"
+if run_resolution "$profiles" "$root_selectors" "$local_selectors" \
+  "$personal_selectors" >/dev/null 2>&1; then
+  fail 'accepted a machine-local selector without user or host'
+fi
+rm "$local_selectors/invalid-global.conf"
+
+write_selector "$personal_selectors" invalid-global $'version=1\nprofile=dev'
+if run_resolution "$profiles" "$root_selectors" "$local_selectors" \
+  "$personal_selectors" >/dev/null 2>&1; then
+  fail 'accepted a personal selector without user or host'
+fi
+rm "$personal_selectors/invalid-global.conf"
+
 DOT_DEFAULT_PROFILE=dev
 run_resolution "$profiles" "$root_selectors" "$local_selectors" "$personal_selectors"
 assert_eq dev "$SELECTED_PROFILE" 'configured default selects dev without a selector'
@@ -234,7 +260,6 @@ fi
 for invalid in \
   $'profile:version=1\nunknown=value' \
   $'profile:version=1\nversion=1\noverlays=personal' \
-  $'selector:version=1\nprofile=base' \
   $'selector:version=1\nuser=example-user\nuser=example-user\nprofile=base' \
   $'selector:version=1\nuser=example-user\nprofile=base\nunknown=value'; do
   kind=${invalid%%:*}
