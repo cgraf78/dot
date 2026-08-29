@@ -83,6 +83,11 @@ git -C "$retiring" commit -qm 'Add profile deactivation fixture'
 git -C "$retiring" remote add origin "$retiring_origin"
 printf 'url=%s\n' "$retiring_origin" >"$retiring_descriptor"
 retiring_record="retiring|$retiring|$retiring_origin|$retiring_descriptor|true|git"
+hardlinks_supported=false
+if ln "$retiring/support/helper.sh" "$temporary/hardlink-probe" 2>/dev/null; then
+  hardlinks_supported=true
+  rm "$temporary/hardlink-probe"
+fi
 : >"$result"
 _dot_overlay_context_create "$temporary" deactivate retiring none \
   "$retiring_record"
@@ -115,11 +120,13 @@ if dot_retiring_overlay_file support/helper.sh; then
 fi
 rm "$retiring/support/helper.sh"
 mv "$retiring/support/helper.sh.real" "$retiring/support/helper.sh"
-ln "$retiring/support/helper.sh" "$retiring/support/helper.sh.hardlink"
-if dot_retiring_overlay_file support/helper.sh; then
-  fail 'accepted a hard-linked retiring-overlay support file'
+if $hardlinks_supported; then
+  ln "$retiring/support/helper.sh" "$retiring/support/helper.sh.hardlink"
+  if dot_retiring_overlay_file support/helper.sh; then
+    fail 'accepted a hard-linked retiring-overlay support file'
+  fi
+  rm "$retiring/support/helper.sh.hardlink"
 fi
-rm "$retiring/support/helper.sh.hardlink"
 deactivate_script=$retiring/dot/profile-deactivate
 mv "$deactivate_script" "$deactivate_script.real"
 ln -s profile-deactivate.real "$deactivate_script"
@@ -128,11 +135,13 @@ if _dot_profile_deactivation_validate "$retiring_record" "$deactivate_script"; t
 fi
 rm "$deactivate_script"
 mv "$deactivate_script.real" "$deactivate_script"
-ln "$deactivate_script" "$retiring/dot/profile-deactivate.hardlink"
-if _dot_profile_deactivation_validate "$retiring_record" "$deactivate_script"; then
-  fail 'accepted a hard-linked profile deactivation entry point'
+if $hardlinks_supported; then
+  ln "$deactivate_script" "$retiring/dot/profile-deactivate.hardlink"
+  if _dot_profile_deactivation_validate "$retiring_record" "$deactivate_script"; then
+    fail 'accepted a hard-linked profile deactivation entry point'
+  fi
+  rm "$retiring/dot/profile-deactivate.hardlink"
 fi
-rm "$retiring/dot/profile-deactivate.hardlink"
 chmod 0666 "$deactivate_script"
 if _dot_profile_deactivation_validate "$retiring_record" "$deactivate_script"; then
   fail 'accepted a writable profile deactivation entry point'
@@ -168,7 +177,9 @@ DOT_PROFILE_LIFECYCLE_LEDGER=$lifecycle_dir/ledger
 printf 'version=1\n%s\n' "$retiring_record" >"$DOT_PROFILE_LIFECYCLE_LEDGER"
 chmod 0600 "$DOT_PROFILE_LIFECYCLE_LEDGER"
 _dot_profile_lifecycle_load || fail 'rejected a valid lifecycle ledger'
-for ledger_case in symlink hardlink mode malformed duplicate control oversize; do
+ledger_cases=(symlink mode malformed duplicate control oversize)
+if $hardlinks_supported; then ledger_cases+=(hardlink); fi
+for ledger_case in "${ledger_cases[@]}"; do
   rm -f "$DOT_PROFILE_LIFECYCLE_LEDGER" "$lifecycle_dir/alias"
   case $ledger_case in
     symlink)
@@ -289,25 +300,28 @@ for control_name in escape delete; do
 done
 
 # Reproduce a hard-link race after the pathname check but before the open-file
-# identity check. The opened descriptor must still have exactly one link; an
-# alternate pathname must never preserve reusable authority through parsing.
-_dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
-context=$REPLY_PATH
-token=$REPLY_TOKEN
-hardlink=$temporary/context-hardlink
-eval "$(declare -f _dot_overlay_context_file_safe |
-  sed '1s/_dot_overlay_context_file_safe/_dot_overlay_context_file_safe_original/')"
-_dot_overlay_context_file_safe() {
-  _dot_overlay_context_file_safe_original "$@" || return
-  ln "$1" "$hardlink"
-}
-if _dot_overlay_context_consume "$context" "$token" pre-sync >/dev/null 2>&1; then
-  fail 'context decoder accepted a post-check hardlink'
+# identity check where the filesystem supports hard links. Some Android
+# application filesystems reject link(2), which removes this attack primitive;
+# the regular Linux and macOS lanes retain the adversarial coverage.
+if $hardlinks_supported; then
+  _dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
+  context=$REPLY_PATH
+  token=$REPLY_TOKEN
+  hardlink=$temporary/context-hardlink
+  eval "$(declare -f _dot_overlay_context_file_safe |
+    sed '1s/_dot_overlay_context_file_safe/_dot_overlay_context_file_safe_original/')"
+  _dot_overlay_context_file_safe() {
+    _dot_overlay_context_file_safe_original "$@" || return
+    ln "$1" "$hardlink"
+  }
+  if _dot_overlay_context_consume "$context" "$token" pre-sync >/dev/null 2>&1; then
+    fail 'context decoder accepted a post-check hardlink'
+  fi
+  rm -f "$context" "$hardlink"
+  eval "$(declare -f _dot_overlay_context_file_safe_original |
+    sed '1s/_dot_overlay_context_file_safe_original/_dot_overlay_context_file_safe/')"
+  unset -f _dot_overlay_context_file_safe_original
 fi
-rm -f "$context" "$hardlink"
-eval "$(declare -f _dot_overlay_context_file_safe_original |
-  sed '1s/_dot_overlay_context_file_safe_original/_dot_overlay_context_file_safe/')"
-unset -f _dot_overlay_context_file_safe_original
 
 # Context capabilities are passed across an exec boundary and must never be
 # interpreted relative to a worker-controlled current directory.
