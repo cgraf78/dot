@@ -92,3 +92,35 @@ removed with the links themselves. Dot keeps a private lifecycle ledger so a
 failed cleanup is diagnosed and retried; it validates the saved repository
 identity before changing the installed link generation. Cached checkouts,
 native packages, credentials, and unmanaged files are retained.
+
+## Moving paths between repositories
+
+Tracked paths may move from the base repository to an overlay, from an overlay
+to the base, or between overlays. A successful `dot update` converges the live
+path to its new owner, removes stale managed links, and retains old overlay
+checkouts as caches. When the base starts tracking an exact installed overlay
+link, Dot recognizes that link from its private ownership manifest and adopts
+the path without creating a conflict-backup copy. Unrelated untracked files
+remain user-owned and are backed up normally.
+
+For the strongest failure isolation across independently published
+repositories, use a two-release handoff:
+
+1. add the path to the destination while the source still provides it;
+2. after that generation has converged on every intended client, remove it
+   from the source.
+
+Overlay precedence keeps one owner live during the overlap. A one-release
+transfer converges when every required repository is available, but repository
+pulls are independent synchronization units rather than one cross-repository
+Git transaction. Do not retire the source until every intended client has
+successfully converged the overlap release. In particular, an optional overlay
+must not become the sole owner merely because its destination commit has been
+published.
+
+If synchronization, policy resolution, or later convergence fails, Dot first
+restores the exact previous managed link when its source still exists. If an
+independently updated source has already removed that path, Dot preserves a
+currently available active-overlay fallback or a clean tracked base version
+instead of publishing a dangling link. The update still reports failure, and
+the next successful update retries the transfer.

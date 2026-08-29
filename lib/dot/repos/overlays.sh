@@ -389,6 +389,44 @@ _overlay_publish_pending() {
   REPLY="$pending"
 }
 
+_overlay_publish_fallback_authority() {
+  local rel=$1 owner=$2 target=$3 pending build manifest line
+  local pending_exists=0 REPLY_REL REPLY_OWNER REPLY_TARGET
+  _overlay_authority_files || return 1
+  pending=$REPLY
+  for manifest in "${OVERLAY_AUTHORITY_MANIFESTS[@]+"${OVERLAY_AUTHORITY_MANIFESTS[@]}"}"; do
+    while IFS= read -r line || [[ -n $line ]]; do
+      _overlay_parse_manifest_record "$line" || return 1
+      if [[ $REPLY_REL == "$rel" && $REPLY_OWNER == "$owner" &&
+        $REPLY_TARGET == "$target" ]]; then
+        return 0
+      fi
+    done <"$manifest"
+  done
+  [[ -e $pending || -L $pending ]] && pending_exists=1
+  build=$(mktemp "${pending}.tmp.XXXXXX" 2>/dev/null) || return 1
+  if ! chmod 600 "$build"; then
+    rm -f -- "$build"
+    return 1
+  fi
+  for manifest in "${OVERLAY_AUTHORITY_MANIFESTS[@]+"${OVERLAY_AUTHORITY_MANIFESTS[@]}"}"; do
+    if ! _overlay_append_manifest_records "$manifest" "$build"; then
+      rm -f -- "$build"
+      return 1
+    fi
+  done
+  if ! printf '%s\t%s\t%s\n' "$rel" "$owner" "$target" >>"$build"; then
+    rm -f -- "$build"
+    return 1
+  fi
+  if { [[ $pending_exists -eq 0 ]] && ! _dot_move_noreplace "$build" "$pending"; } ||
+    { [[ $pending_exists -eq 1 ]] && ! _dot_move_replace_nodir "$build" "$pending"; }; then
+    rm -f -- "$build"
+    return 1
+  fi
+  _overlay_pending_manifest_safe "$pending"
+}
+
 _overlay_destination_context() {
   local destination=$1
   if dot_candidate_path_is_reserved "$destination"; then
@@ -833,7 +871,10 @@ _overlay_restore_tracked_path() {
 
 # Snapshot the installed generation without consulting current descriptors or
 # profiles. A path is rollback-authorized only when the private installed
-# manifest and the exact live symlink target agree before unstash mutates it.
+# manifest and the exact live symlink target agree before repository sync
+# mutates it. Include both base-shadowing links and overlay-only links: an
+# incoming base generation may begin tracking the latter, and a failed
+# ownership transfer must still be able to restore the previous generation.
 _overlay_snapshot_installed_links() {
   local manifest line rel target dst live_target REPLY_REL REPLY_OWNER REPLY_TARGET
   local -A seen_targets=()
@@ -854,7 +895,6 @@ _overlay_snapshot_installed_links() {
       rel=$REPLY_REL
       target=$REPLY_TARGET
       _overlay_path_is_authority "$rel" && continue
-      _overlay_skip_worktree "$rel" || continue
       dst=$HOME/$rel
       [[ -L $dst ]] || continue
       live_target=$(readlink "$dst") || return 1
@@ -870,32 +910,221 @@ _overlay_snapshot_installed_links() {
   done
 }
 
+_overlay_rollback_target() {
+  local rel=$1 index
+  [[ ${#DOT_OVERLAY_ROLLBACK_PATHS[@]} -eq ${#DOT_OVERLAY_ROLLBACK_TARGETS[@]} ]] ||
+    return 1
+  for ((index = 0; index < ${#DOT_OVERLAY_ROLLBACK_PATHS[@]}; index++)); do
+    [[ ${DOT_OVERLAY_ROLLBACK_PATHS[index]} == "$rel" ]] || continue
+    REPLY=${DOT_OVERLAY_ROLLBACK_TARGETS[index]}
+    return 0
+  done
+  return 1
+}
+
+# Park an exact rollback-authorized link with a same-parent rename before a
+# base pull adopts its path. Returning 1 means the current leaf is not the
+# snapshotted managed generation and must be treated as user-owned. Returning
+# 2 means an authorized generation raced or could not be quarantined safely,
+# so the caller must not retry Git.
+_overlay_quarantine_rollback_link() {
+  local rel=$1 destination=$HOME/$1 target physical parent parent_identity
+  local expected stage parked parked_identity move_status=0
+  _overlay_rollback_target "$rel" || return 1
+  target=$REPLY
+  _overlay_destination_context "$destination" || return 2
+  physical=$OVERLAY_PHYSICAL_DESTINATION
+  parent=$OVERLAY_PHYSICAL_PARENT
+  parent_identity=$OVERLAY_PARENT_IDENTITY
+  [[ -L $physical && $(readlink "$physical") == "$target" ]] || return 1
+  expected=$(_overlay_replacement_identity "$physical") || return 2
+  stage=$(umask 077 &&
+    mktemp -d "$parent/.${physical##*/}.dot-overlay-adopt.XXXXXXXX") || return 2
+  chmod 0700 "$stage" || {
+    rmdir "$stage" 2>/dev/null || true
+    return 2
+  }
+  parked=$stage/previous
+  _dot_move_noreplace "$physical" "$parked" || move_status=$?
+  if [[ $move_status -ne 0 ]]; then
+    parked_identity=$(_overlay_replacement_identity "$parked" 2>/dev/null || true)
+    if [[ $parked_identity == "$expected" ]]; then
+      :
+    elif [[ $(_overlay_replacement_identity "$physical" 2>/dev/null || true) == "$expected" ]]; then
+      rmdir "$stage" 2>/dev/null || true
+      return 2
+    else
+      _warn "  warning: managed overlay path stranded during quarantine: $stage"
+      return 2
+    fi
+  fi
+  parked_identity=$(_overlay_replacement_identity "$parked" 2>/dev/null || true)
+  if [[ $parked_identity != "$expected" || ! -L $parked ||
+    $(readlink "$parked" 2>/dev/null || true) != "$target" ]] ||
+    ! _overlay_destination_context "$destination" ||
+    [[ $OVERLAY_PHYSICAL_DESTINATION != "$physical" ||
+      $OVERLAY_PHYSICAL_PARENT != "$parent" ||
+      $OVERLAY_PARENT_IDENTITY != "$parent_identity" ]]; then
+    if [[ ! -e $physical && ! -L $physical ]] &&
+      _dot_move_noreplace "$parked" "$physical"; then
+      rmdir "$stage" 2>/dev/null || true
+    else
+      _warn "  warning: preserved raced overlay path in quarantine: $parked"
+    fi
+    return 2
+  fi
+  # shellcheck disable=SC2034 # Dynamically scoped outputs consumed by pull.sh.
+  OVERLAY_ADOPTION_PHYSICAL=$physical
+  # shellcheck disable=SC2034 # Dynamically scoped outputs consumed by pull.sh.
+  OVERLAY_ADOPTION_PARKED=$parked
+  # shellcheck disable=SC2034 # Dynamically scoped outputs consumed by pull.sh.
+  OVERLAY_ADOPTION_STAGE=$stage
+  # shellcheck disable=SC2034 # Dynamically scoped outputs consumed by pull.sh.
+  OVERLAY_ADOPTION_EXPECTED=$expected
+}
+
+_overlay_restore_quarantined_link() {
+  local physical=$1 parked=$2 stage=$3 expected=$4
+  [[ $(_overlay_replacement_identity "$parked" 2>/dev/null || true) == "$expected" ]] ||
+    return 1
+  [[ ! -e $physical && ! -L $physical ]] || return 1
+  _dot_move_noreplace "$parked" "$physical" || return 1
+  rmdir "$stage" 2>/dev/null || return 1
+}
+
+_overlay_commit_quarantined_link() {
+  local parked=$1 stage=$2 expected=$3
+  [[ $(_overlay_replacement_identity "$parked" 2>/dev/null || true) == "$expected" ]] ||
+    return 1
+  rm -f -- "$parked" || return 1
+  rmdir "$stage" || return 1
+}
+
+_overlay_link_target_available() {
+  local rel=$1 target=$2 destination=$HOME/$1 source
+  if [[ $target == /* ]]; then
+    source=$target
+  else
+    source=${destination%/*}/$target
+  fi
+  [[ -f $source || -L $source ]]
+}
+
+_overlay_active_fallback_target() {
+  local rel=$1 excluded=$2 entry name path sync candidate=''
+  for entry in "${ACTIVE_OVERLAYS[@]+"${ACTIVE_OVERLAYS[@]}"}"; do
+    IFS='|' read -r name path _ _ _ sync <<<"$entry"
+    sync=${sync:-git}
+    [[ -f $path/home/$rel || -L $path/home/$rel ]] || continue
+    _overlay_record_link_target "$rel" "$name" "$path" "$sync" || continue
+    [[ $REPLY != "$excluded" ]] || continue
+    candidate=$REPLY
+    REPLY_OWNER=$name
+  done
+  [[ -n $candidate ]] || return 1
+  REPLY=$candidate
+}
+
 # Restore only the exact links captured above. The base path must still be
 # absent or an unmodified tracked file from the just-pulled generation; any
 # intervening user change wins and makes rollback fail closed.
 _overlay_restore_installed_links() {
-  local index rel target dst replace_identity=''
+  local index rel target dst replace_identity='' fallback tracked=0 status=0
   [[ ${#DOT_OVERLAY_ROLLBACK_PATHS[@]} -eq ${#DOT_OVERLAY_ROLLBACK_TARGETS[@]} ]] ||
     return 1
   for ((index = 0; index < ${#DOT_OVERLAY_ROLLBACK_PATHS[@]}; index++)); do
     rel=${DOT_OVERLAY_ROLLBACK_PATHS[index]}
     target=${DOT_OVERLAY_ROLLBACK_TARGETS[index]}
     dst=$HOME/$rel
-    if [[ -L $dst && $(readlink "$dst") == "$target" ]]; then
+    tracked=0
+    _base_git ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 && tracked=1
+    if [[ -L $dst && $(readlink "$dst") == "$target" ]] &&
+      _overlay_link_target_available "$rel" "$target"; then
+      if [[ $tracked -eq 1 ]] &&
+        ! _base_git update-index --skip-worktree "$rel" 2>/dev/null; then
+        status=1
+      fi
       continue
     fi
-    [[ ! -L $dst && ! -d $dst ]] || return 1
+    if ! _overlay_link_target_available "$rel" "$target"; then
+      if _overlay_active_fallback_target "$rel" "$target"; then
+        fallback=$REPLY
+        local fallback_owner=$REPLY_OWNER
+        if ! _overlay_publish_fallback_authority \
+          "$rel" "$fallback_owner" "$fallback"; then
+          status=1
+          continue
+        fi
+        if [[ -L $dst && $(readlink "$dst") == "$fallback" ]] &&
+          _overlay_link_target_available "$rel" "$fallback"; then
+          if [[ $tracked -eq 1 ]] &&
+            ! _base_git update-index --skip-worktree "$rel" 2>/dev/null; then
+            status=1
+          fi
+          continue
+        fi
+        replace_identity=''
+        if [[ -L $dst && $(readlink "$dst") == "$target" ]]; then
+          replace_identity=$(_overlay_replacement_identity "$dst") || {
+            status=1
+            continue
+          }
+        elif [[ -e $dst || -L $dst ]]; then
+          if [[ $tracked -ne 1 || -L $dst ]] ||
+            ! _overlay_tracked_path_clean "$rel"; then
+            status=1
+            continue
+          fi
+          replace_identity=$(_overlay_replacement_identity "$dst") || {
+            status=1
+            continue
+          }
+        fi
+        if ! _overlay_ensure_destination_parent "${dst%/*}" ||
+          ! _overlay_publish_link "$fallback" "$dst" "$replace_identity"; then
+          status=1
+          continue
+        fi
+        if [[ $tracked -eq 1 ]] &&
+          ! _base_git update-index --skip-worktree "$rel" 2>/dev/null; then
+          status=1
+        fi
+        continue
+      fi
+      if [[ $tracked -eq 1 ]]; then
+        if [[ ! -L $dst ]] && _overlay_tracked_path_clean "$rel"; then
+          continue
+        fi
+      fi
+      status=1
+      continue
+    fi
+    if [[ -L $dst || -d $dst ]]; then
+      status=1
+      continue
+    fi
     replace_identity=''
     if [[ -e $dst ]]; then
-      _overlay_tracked_path_clean "$rel" || return 1
-      replace_identity=$(_overlay_replacement_identity "$dst") || return 1
+      if [[ $tracked -ne 1 ]] || ! _overlay_tracked_path_clean "$rel"; then
+        status=1
+        continue
+      fi
+      replace_identity=$(_overlay_replacement_identity "$dst") || {
+        status=1
+        continue
+      }
     fi
-    _overlay_ensure_destination_parent "${dst%/*}" || return 1
-    _overlay_publish_link "$target" "$dst" "$replace_identity" || return 1
-    if _base_git ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
-      _base_git update-index --skip-worktree "$rel" 2>/dev/null || return 1
+    if ! _overlay_ensure_destination_parent "${dst%/*}" ||
+      ! _overlay_publish_link "$target" "$dst" "$replace_identity"; then
+      status=1
+      continue
+    fi
+    if [[ $tracked -eq 1 ]] &&
+      ! _base_git update-index --skip-worktree "$rel" 2>/dev/null; then
+      status=1
     fi
   done
+  return "$status"
 }
 
 _unstash_overlay_overrides() {

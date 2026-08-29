@@ -86,6 +86,7 @@ program	tests/lib/test.sh
 program	tests/license-test
 program	tests/merge-block-test
 program	tests/overlay-profile-resolution-test
+program	tests/ownership-transfer-test
 program	tests/provider-suite-wrapper
 program	tests/provenance-test
 program	tests/profiles-test

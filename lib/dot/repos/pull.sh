@@ -42,29 +42,153 @@ _backup_pull_conflicts() {
   files=$(_pull_conflicts_from_log "$log") || true
   [[ -n "$files" ]] || return 1
 
-  local backup=""
-  if ! _backup_dir; then
-    return 1
-  fi
-  backup="$REPLY"
-
-  local file count=0
+  local backup="" file backed_up=0 adopted=0 adoption_rc=0 failed=0
+  local index parent source_identity target_identity nested
+  local committed_adoption=0 recovery_failed=0 move_status=0
+  local -a adoption_physicals=() adoption_parked=() adoption_stages=()
+  local -a adoption_expected=() backed_relatives=()
   while IFS= read -r file; do
     [[ -n "$file" ]] || continue
     if [[ -e "$root/$file" || -L "$root/$file" ]]; then
-      mkdir -p "$backup/$(dirname "$file")"
-      mv "$root/$file" "$backup/$file"
-      ((count++)) || true
+      # A base candidate can intentionally adopt a path that the installed
+      # overlay generation currently owns. The private manifest plus exact
+      # live target authorize removing that symlink; treating it as user data
+      # would create a useless conflict backup for every transferred file.
+      # The update-level rollback snapshot recreates it if the retry or later
+      # convergence fails.
+      if [[ $root == "$HOME" ]] &&
+        declare -F _overlay_quarantine_rollback_link >/dev/null 2>&1; then
+        adoption_rc=0
+        _overlay_quarantine_rollback_link "$file" || adoption_rc=$?
+        case $adoption_rc in
+          0)
+            adoption_physicals+=("$OVERLAY_ADOPTION_PHYSICAL")
+            adoption_parked+=("$OVERLAY_ADOPTION_PARKED")
+            adoption_stages+=("$OVERLAY_ADOPTION_STAGE")
+            adoption_expected+=("$OVERLAY_ADOPTION_EXPECTED")
+            adopted=$((adopted + 1))
+            continue
+            ;;
+          1) ;;
+          *)
+            failed=1
+            break
+            ;;
+        esac
+      fi
+      if [[ -z $backup ]]; then
+        if ! _backup_dir; then
+          failed=1
+          break
+        fi
+        backup=$REPLY
+      fi
+      parent=$backup
+      [[ $file != */* ]] || parent=$backup/${file%/*}
+      if ! mkdir -p "$parent"; then
+        failed=1
+        break
+      fi
+      source_identity=$(_dot_path_identity "$root/$file") || {
+        failed=1
+        break
+      }
+      move_status=0
+      _dot_move_noreplace "$root/$file" "$backup/$file" || move_status=$?
+      target_identity=$(_dot_path_identity "$backup/$file" 2>/dev/null || true)
+      if [[ $target_identity == "$source_identity" ]]; then
+        backed_relatives+=("$file")
+        backed_up=$((backed_up + 1))
+        continue
+      fi
+      if [[ $(_dot_path_identity "$root/$file" 2>/dev/null || true) != "$source_identity" ]]; then
+        nested=$backup/$file/${file##*/}
+        if [[ $(_dot_path_identity "$nested" 2>/dev/null || true) == "$source_identity" ]]; then
+          _warn "  warning: user conflict stranded during backup: $nested"
+        else
+          _warn "  warning: user conflict move became ambiguous: $file"
+        fi
+        recovery_failed=1
+      fi
+      [[ $move_status -ne 0 ]] || recovery_failed=1
+      failed=1
+      break
     fi
   done <<<"$files"
 
-  if [[ "$count" -eq 0 ]]; then
-    rmdir "$backup" 2>/dev/null || true
+  if [[ $failed -eq 0 ]]; then
+    for ((index = 0; index < ${#adoption_parked[@]}; index++)); do
+      if ! _overlay_commit_quarantined_link \
+        "${adoption_parked[index]}" \
+        "${adoption_stages[index]}" \
+        "${adoption_expected[index]}"; then
+        failed=1
+        break
+      fi
+    done
+  fi
+
+  if [[ $failed -eq 1 ]]; then
+    for ((index = ${#adoption_parked[@]} - 1; index >= 0; index--)); do
+      if [[ ! -e ${adoption_parked[index]} && ! -L ${adoption_parked[index]} ]]; then
+        committed_adoption=1
+        if [[ -d ${adoption_stages[index]} ]] &&
+          ! rmdir "${adoption_stages[index]}" 2>/dev/null; then
+          recovery_failed=1
+          _warn "  warning: managed-link quarantine retained at ${adoption_stages[index]}"
+        fi
+        continue
+      fi
+      if ! _overlay_restore_quarantined_link \
+        "${adoption_physicals[index]}" \
+        "${adoption_parked[index]}" \
+        "${adoption_stages[index]}" \
+        "${adoption_expected[index]}"; then
+        recovery_failed=1
+        _warn "  warning: managed-link quarantine retained at ${adoption_stages[index]}"
+      fi
+    done
+    if [[ $committed_adoption -eq 1 ]] && ! _overlay_restore_installed_links; then
+      recovery_failed=1
+    fi
+    for ((index = ${#backed_relatives[@]} - 1; index >= 0; index--)); do
+      file=${backed_relatives[index]}
+      if [[ ! -e $root/$file && ! -L $root/$file ]]; then
+        _dot_move_noreplace "$backup/$file" "$root/$file" || recovery_failed=1
+      else
+        recovery_failed=1
+      fi
+    done
+    if [[ -n $backup ]]; then
+      for file in "${backed_relatives[@]+"${backed_relatives[@]}"}"; do
+        [[ $file == */* ]] || continue
+        parent=$backup/${file%/*}
+        while [[ $parent == "$backup/"* ]]; do
+          rmdir "$parent" 2>/dev/null || break
+          parent=${parent%/*}
+        done
+      done
+      rmdir "$backup" 2>/dev/null || true
+    fi
+    if [[ $recovery_failed -eq 1 ]]; then
+      _warn "  warning: conflict recovery incomplete; preserved backup at ${backup:-see quarantine warning above}"
+    fi
     return 1
   fi
 
-  _warn "  backed up $count conflicting untracked files to $backup"
-  REPLY="$backup"
+  if [[ "$backed_up" -eq 0 && "$adopted" -eq 0 ]]; then
+    return 1
+  fi
+
+  if [[ "$backed_up" -gt 0 ]]; then
+    _warn "  backed up $backed_up conflicting untracked files to $backup"
+  fi
+  if [[ "$adopted" -eq 1 ]]; then
+    _warn '  adopted 1 managed overlay path for the base repository'
+  elif [[ "$adopted" -gt 1 ]]; then
+    _warn "  adopted $adopted managed overlay paths for the base repository"
+  fi
+  REPLY="${backup:-}"
   return 0
 }
 
