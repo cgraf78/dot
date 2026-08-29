@@ -89,6 +89,21 @@ dot_commit_tmp() {
   _merge_hook_commit_tmp "$1" "$2"
 }
 
+dot_file_generation() {
+  [[ $# -eq 1 ]] || return 2
+  _dot_file_generation "$1"
+}
+
+dot_commit_tmp_if_generation() {
+  [[ $# -eq 3 ]] || return 2
+  _dot_commit_tmp_if_generation "$1" "$2" "$3"
+}
+
+dot_remove_if_generation() {
+  [[ $# -eq 2 ]] || return 2
+  _dot_remove_if_generation "$1" "$2"
+}
+
 dot_json_available() {
   [[ $# -eq 0 ]] || return 2
   _merge_hook_jq_available

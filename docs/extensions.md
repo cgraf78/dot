@@ -91,6 +91,17 @@ returned by `dot_sibling_tmp_for` belongs to the caller until
 `dot_commit_tmp TEMP DESTINATION` consumes that prepared sibling or the caller
 removes it after failure.
 
+Retirement hooks that derive a new file from an existing destination must use
+the generation helpers so a user edit cannot be overwritten between read and
+publication. Capture with `generation=$(dot_file_generation "$destination")`,
+then publish through
+`dot_commit_tmp_if_generation "$temporary" "$destination" "$generation"` or
+remove through `dot_remove_if_generation "$destination" "$generation"`.
+These conditional mutations fail when the file, parent directory, or supported
+file type changed. A prepared temporary may be consumed even when publication
+fails, so callers should remove it with `rm -f` on the failure path. Recovery
+uses a private same-directory journal and preserves any late winner.
+
 This merge hook exercises every hook API surface. Real hooks normally use only
 the subset owned by their target format:
 
