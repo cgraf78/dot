@@ -11,6 +11,20 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=lib/repo.sh
 . "$root/tests/lib/repo.sh"
 
+# Some minimal distribution images do not install `hostname`. Keep profile
+# resolution deterministic without making this ownership suite depend on an
+# unrelated base package.
+fixture_bin=$DOT_TEST_TMP/bin
+mkdir -p "$fixture_bin"
+# shellcheck disable=SC2016 # The generated helper expands its own argument.
+printf '%s\n' \
+  '#!/bin/sh' \
+  'case ${1:-} in ""|-s) printf "%s\\n" ownership.invalid ;; *) exit 2 ;; esac' \
+  >"$fixture_bin/hostname"
+chmod +x "$fixture_bin/hostname"
+PATH=$fixture_bin:$PATH
+export PATH
+
 commit_seed() {
   local name=$1 message=$2 branch=${3:-main}
   local seed=$DOT_TEST_TMP/$name-seed origin=$DOT_TEST_TMP/$name.git
