@@ -1744,22 +1744,24 @@ set -e
 real=${DOT_TEST_REAL_MV:?}
 source=${@: -2:1}
 target=${!#}
+winner=${DOT_TEST_DELETE_WINNER_PATH:?}
 # Dot judges no-replace moves by their filesystem postcondition rather than
 # the utility status. Preserve that contract in the interceptor before
 # publishing the simulated late winner.
 "$real" "$@" || true
 [[ ! -e $source && ! -L $source && (-e $target || -L $target) ]] || exit 0
+[[ ! -e $winner && ! -L $winner ]] || exit 0
 case ${DOT_TEST_DELETE_WINNER:-}:${target##*/} in
   leaf:.dot-init-delete.*.leaf.*)
-    printf 'foreign leaf\n' >"$source"
+    printf 'foreign leaf\n' >"$winner"
     ;;
   parent:.dot-init-delete.*.parent.*)
-    mkdir "$source"
-    printf 'foreign parent\n' >"$source/evidence"
+    mkdir "$winner"
+    printf 'foreign parent\n' >"$winner/evidence"
     ;;
   git:.dot-init-delete.*.git.*)
-    mkdir "$source"
-    printf 'foreign git\n' >"$source/evidence"
+    mkdir "$winner"
+    printf 'foreign git\n' >"$winner/evidence"
     ;;
 esac
 MV
@@ -1782,6 +1784,7 @@ set +e
 PATH="$delete_winner_bin:$PATH" DOT_TEST_REAL_MV=$move_effect_failure_bin/mv \
   DOT_TEST_BASE_MV=$real_mv \
   DOT_TEST_DELETE_WINNER=leaf \
+  DOT_TEST_DELETE_WINNER_PATH=$leaf_delete_home/value \
   run_dot "$leaf_delete_home" "$leaf_delete_state" init --rollback >/dev/null 2>&1
 leaf_delete_rollback=$?
 set -e
@@ -1805,6 +1808,7 @@ set -e
 set +e
 PATH="$delete_winner_bin:$PATH" DOT_TEST_REAL_MV=$real_mv \
   DOT_TEST_DELETE_WINNER=parent \
+  DOT_TEST_DELETE_WINNER_PATH=$parent_delete_home/newdir \
   run_dot "$parent_delete_home" "$parent_delete_state" init --rollback >/dev/null 2>&1
 parent_delete_rollback=$?
 set -e
@@ -1828,6 +1832,7 @@ set -e
 set +e
 PATH="$delete_winner_bin:$PATH" DOT_TEST_REAL_MV=$real_mv \
   DOT_TEST_DELETE_WINNER=git \
+  DOT_TEST_DELETE_WINNER_PATH=$git_delete_home/.dotfiles \
   run_dot "$git_delete_home" "$git_delete_state" init --rollback >/dev/null 2>&1
 git_delete_rollback=$?
 set -e
