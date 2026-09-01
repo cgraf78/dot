@@ -40,6 +40,13 @@ unchanged_base_state=$DOT_TEST_TMP/unchanged-base-state
 unchanged_base_trace=$DOT_TEST_TMP/unchanged-base-trace.json
 run_dot "$unchanged_base_home" "$unchanged_base_state" init --yes \
   "file://$unchanged_base_origin" >/dev/null
+# The fetch-boundary fixture deliberately forces a real rebase below. Give its
+# synthetic client repository an identity instead of inheriting the operator's
+# global Git config, which CI intentionally isolates by setting HOME to the
+# checkout.
+git --git-dir="$unchanged_base_home/.dotfiles" config user.name fixture
+git --git-dir="$unchanged_base_home/.dotfiles" config user.email \
+  fixture@example.invalid
 GIT_TRACE2_EVENT=$unchanged_base_trace \
   run_dot "$unchanged_base_home" "$unchanged_base_state" update >/dev/null
 unchanged_base_fetch=$(grep -Fc '"name":"fetch"' "$unchanged_base_trace" || true)
