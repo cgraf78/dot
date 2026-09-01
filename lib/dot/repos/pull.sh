@@ -260,6 +260,12 @@ _repo_head_contains_upstream() {
     "$@" merge-base --is-ancestor "$upstream" "$head" 2>/dev/null
 }
 
+_repo_head_is() {
+  local expected=$1
+  shift
+  [[ -n $expected && $(_repo_head "$@") == "$expected" ]]
+}
+
 _repo_candidate_adapter_allowed() {
   local ref=$1 path=$2 mode=$3
   shift 3
@@ -268,16 +274,38 @@ _repo_candidate_adapter_allowed() {
     _dot_stdin_matches_file "$DOT_SOURCE_ROOT/support/client-launcher.sh"
 }
 
-_repo_overlay_control_path_reserved() {
-  local path=$1 root
-  for root in \
-    .config/dot/profiles.d \
-    .config/dot/profile-selectors.d; do
-    if [[ $path == "$root" || $path == "$root"/* || $root == "$path"/* ]]; then
-      return 0
-    fi
-  done
-  return 1
+# Apply the candidate-tree policy to one Git leaf. REPLY is empty for overlay
+# metadata outside home/ and otherwise contains the path as it would appear
+# beneath HOME. Keeping this policy in one helper ensures full upstream trees
+# and local-ahead deltas cannot drift apart.
+_repo_validate_candidate_entry() {
+  local kind=$1 ref=$2 mode=$3 type=$4 oid=$5 path=$6 reserved_roots=$7
+  local relative
+  shift 7
+  REPLY=
+  [[ $type == blob && $mode =~ ^(100644|100755|120000)$ &&
+    $oid =~ ^[0-9a-fA-F]{40,64}$ ]] || return 1
+  _dot_init_safe_relative_path "$path" || return 1
+  if [[ $kind == overlay ]]; then
+    case $path in
+      home/*) relative=${path#home/} ;;
+      home) return 1 ;;
+      *) return 0 ;;
+    esac
+  else
+    relative=$path
+  fi
+  if [[ $kind == overlay ]] && _dot_overlay_control_path_reserved "$relative"; then
+    _warn "  warning: overlay candidate owns reserved control-plane path: $relative"
+    return 1
+  fi
+  if _dot_candidate_path_is_reserved_from_roots \
+    "$HOME/$relative" "$reserved_roots" &&
+    ! _repo_candidate_adapter_allowed "$ref" "$path" "$mode" "$@"; then
+    _warn "  warning: candidate repository owns reserved path: $relative"
+    return 1
+  fi
+  REPLY=$relative
 }
 
 # Validate a fetched candidate before any checkout, rebase, or overlay link can
@@ -304,39 +332,13 @@ _repo_validate_candidate_tree() {
     header=${entry%%$'\t'*}
     path=${entry#*$'\t'}
     read -r mode type oid <<<"$header"
-    [[ $type == blob && $mode =~ ^(100644|100755|120000)$ &&
-      $oid =~ ^[0-9a-fA-F]{40,64}$ ]] || {
-      valid=0
-      break
-    }
-    _dot_init_safe_relative_path "$path" || {
-      valid=0
-      break
-    }
-    if [[ $kind == overlay ]]; then
-      case $path in
-        home/*) relative=${path#home/} ;;
-        home)
-          valid=0
-          break
-          ;;
-        *) continue ;;
-      esac
-    else
-      relative=$path
-    fi
-    if [[ $kind == overlay ]] && _repo_overlay_control_path_reserved "$relative"; then
-      _warn "  warning: overlay candidate owns reserved control-plane path: $relative"
+    if ! _repo_validate_candidate_entry \
+      "$kind" "$ref" "$mode" "$type" "$oid" "$path" "$reserved_roots" "$@"; then
       valid=0
       break
     fi
-    if _dot_candidate_path_is_reserved_from_roots \
-      "$HOME/$relative" "$reserved_roots" &&
-      ! _repo_candidate_adapter_allowed "$ref" "$path" "$mode" "$@"; then
-      _warn "  warning: candidate repository owns reserved path: $relative"
-      valid=0
-      break
-    fi
+    relative=$REPLY
+    [[ -n $relative ]] || continue
     count=$((count + 1))
     [[ $count -le 100000 ]] || {
       valid=0
@@ -353,6 +355,74 @@ _repo_validate_candidate_tree() {
   fi
   _dot_cleanup_remove_path "$raw" || return 1
   [[ $valid -eq 1 ]]
+}
+
+# A local checkout may intentionally be ahead of its fetched upstream during a
+# staged rollout. Validate only the local delta instead of rescanning the full
+# accepted tree; this preserves the fast path without trusting unpublished
+# commits to bypass reserved-path policy.
+_repo_validate_ahead_delta() {
+  local kind=$1 upstream=$2 head=$3 header path old_mode mode old_oid oid status extra
+  local raw valid=1 relative count=0 reserved_roots reserved_roots_after
+  shift 3
+
+  _dot_reserved_roots_snapshot || return 1
+  reserved_roots=$REPLY
+  _dot_cleanup_mktemp || return 1
+  raw=$REPLY
+  if ! "$@" diff-tree -r --no-commit-id --raw -z --no-renames \
+    --diff-filter=ACMT "$upstream" "$head" >"$raw"; then
+    _dot_cleanup_remove_path "$raw" || true
+    return 1
+  fi
+  while IFS= read -r -d '' header; do
+    if ! IFS= read -r -d '' path || [[ $header != :* ]]; then
+      valid=0
+      break
+    fi
+    read -r old_mode mode old_oid oid status extra <<<"${header#:}"
+    if [[ -n $extra || ! $old_mode =~ ^[0-7]{6}$ ||
+      ! $old_oid =~ ^[0-9a-fA-F]{40,64}$ || $status != [ACMT] ]]; then
+      valid=0
+      break
+    fi
+    if ! _repo_validate_candidate_entry \
+      "$kind" "$head" "$mode" blob "$oid" "$path" "$reserved_roots" "$@"; then
+      valid=0
+      break
+    fi
+    relative=$REPLY
+    [[ -n $relative ]] || continue
+    count=$((count + 1))
+    [[ $count -le 100000 ]] || {
+      valid=0
+      break
+    }
+  done <"$raw"
+  if [[ $valid -eq 1 ]]; then
+    if ! _dot_reserved_roots_snapshot; then
+      valid=0
+    else
+      reserved_roots_after=$REPLY
+      [[ $reserved_roots_after == "$reserved_roots" ]] || valid=0
+    fi
+  fi
+  _dot_cleanup_remove_path "$raw" || return 1
+  [[ $valid -eq 1 ]]
+}
+
+# Return 0 when the live generation can safely be treated as current, 1 when
+# the fetched upstream is not contained and needs the ordinary pull path, and
+# 2 when a contained generation is invalid or changed during inspection.
+_repo_accept_current_generation() {
+  local kind=$1 head=$2 upstream=$3
+  shift 3
+  [[ -n $head && -n $upstream ]] || return 2
+  if [[ $head != "$upstream" ]]; then
+    _repo_head_contains_upstream "$head" "$upstream" "$@" || return 1
+    _repo_validate_ahead_delta "$kind" "$upstream" "$head" "$@" || return 2
+  fi
+  _repo_head_is "$head" "$@" || return 2
 }
 
 _repo_prepare_base_upstream() {
@@ -640,7 +710,7 @@ _pull_base() {
     REPLY_STATUS="skipped"
     return 0
   fi
-  local head_before head_after parent_snapshot
+  local head_before head_after parent_snapshot current_rc=0
   local pull_rc=0
   local upstream
   _repo_prepare_base_upstream || {
@@ -649,26 +719,22 @@ _pull_base() {
   }
   upstream=$REPLY
   head_before=$(_repo_head _base_git)
-  # The active commit is already an accepted generation. When it contains the
-  # fetched upstream, no candidate can become visible and the validation,
-  # parent snapshot, and rebase path has no work to protect.
-  if _repo_head_contains_upstream "$head_before" "$upstream" _base_git; then
-    REPLY_STATUS=current
-    return 0
-  fi
-  # Fetch is read-only with respect to HOME. Delay rollback capture and
-  # overlay unstash until the fetched upstream proves that this invocation may
-  # change the base worktree, keeping unchanged updates proportional to Git's
-  # fetch rather than to the number of installed overlay links.
-  _overlay_snapshot_installed_links || {
-    REPLY_STATUS=failed
-    return 1
-  }
-  _normalize_filtered
-  if ! _unstash_overlay_overrides; then
-    REPLY_STATUS=failed
-    return 1
-  fi
+  # An exact upstream match needs no tree scan. Intentional local-ahead
+  # generations validate only their unpublished delta before taking the same
+  # fast path. Both decisions are bound to a final HEAD read.
+  _repo_accept_current_generation \
+    base "$head_before" "$upstream" _base_git || current_rc=$?
+  case $current_rc in
+    0)
+      REPLY_STATUS=current
+      return 0
+      ;;
+    1) ;;
+    *)
+      REPLY_STATUS=failed
+      return 1
+      ;;
+  esac
   _repo_validate_candidate_tree base "$upstream" _base_git || {
     REPLY_STATUS=failed
     return 1
@@ -679,6 +745,11 @@ _pull_base() {
     return 1
   }
   parent_snapshot=$REPLY
+  if ! _repo_head_is "$head_before" _base_git; then
+    _dot_cleanup_remove_path "$parent_snapshot" || true
+    REPLY_STATUS=failed
+    return 1
+  fi
   _pull_repo "$HOME" _base_git rebase --autostash "$upstream" "$@" || pull_rc=$?
   if [[ "$pull_rc" -eq 0 ]]; then
     head_after=$(_repo_head _base_git)
@@ -963,7 +1034,7 @@ _pull_overlay() {
     REPLY_STATUS="skipped"
     return 0
   fi
-  local upstream head_before head_after parent_snapshot
+  local upstream head_before head_after parent_snapshot current_rc=0
   local prepare_rc=0
   _repo_prepare_overlay_upstream "$path" "$optional" || prepare_rc=$?
   if [[ $prepare_rc -ne 0 ]]; then
@@ -978,13 +1049,22 @@ _pull_overlay() {
   fi
   upstream=$REPLY
   head_before=$(_repo_head git -C "$path")
-  # Match the base fast path: an accepted generation that contains the fetched
-  # upstream cannot expose a new tree to the client worktree.
-  if _repo_head_contains_upstream \
-    "$head_before" "$upstream" git -C "$path"; then
-    REPLY_STATUS=current
-    return 0
-  fi
+  # Match the base fast path, including local-delta policy and a final HEAD
+  # generation check before accepting the checkout as current.
+  _repo_accept_current_generation \
+    overlay "$head_before" "$upstream" git -C "$path" || current_rc=$?
+  case $current_rc in
+    0)
+      REPLY_STATUS=current
+      return 0
+      ;;
+    1) ;;
+    *)
+      _warn "  warning: $name overlay local generation failed validation or changed during synchronization"
+      REPLY_STATUS=failed
+      return 0
+      ;;
+  esac
   if ! _repo_validate_candidate_tree overlay "$upstream" git -C "$path"; then
     [[ "$optional" == true ]] && return 0
     _warn "  warning: $name overlay candidate failed reserved-path validation"
@@ -997,6 +1077,12 @@ _pull_overlay() {
     return 0
   }
   parent_snapshot=$REPLY
+  if ! _repo_head_is "$head_before" git -C "$path"; then
+    _dot_cleanup_remove_path "$parent_snapshot" || true
+    _warn "  warning: $name overlay changed during synchronization"
+    REPLY_STATUS=failed
+    return 0
+  fi
 
   if [[ "$optional" == "true" ]]; then
     local quiet_before quiet_was_set=0
@@ -1261,6 +1347,10 @@ _pull_overlays() {
 # hooks, and cron installation after the repo set is current.
 _repo_pull_all() {
   _ensure_repo_config
+  _normalize_filtered
+  if ! _unstash_overlay_overrides; then
+    return 1
+  fi
 
   local _repo_total
   _repo_total=$((1 + $(_pull_overlay_count)))

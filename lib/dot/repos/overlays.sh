@@ -234,7 +234,9 @@ _overlay_path_is_authority() {
   fi
   _overlay_pending_manifest_path
   pending="$REPLY"
-  if [[ "$HOME/$rel" == "$DOT_OVERLAY_MANIFEST" ||
+  if _dot_overlay_control_path_reserved "$rel"; then
+    status=0
+  elif [[ "$HOME/$rel" == "$DOT_OVERLAY_MANIFEST" ||
     "$HOME/$rel" == "$DOT_OVERLAY_LEGACY_MANIFEST" ||
     "$HOME/$rel" == "$pending" ]]; then
     status=0
@@ -897,15 +899,15 @@ _overlay_snapshot_installed_links() {
   local -a OVERLAY_AUTHORITY_MANIFESTS=()
   DOT_OVERLAY_ROLLBACK_PATHS=()
   DOT_OVERLAY_ROLLBACK_TARGETS=()
-  # Repository sync cannot change the reserved-root set until after this
-  # snapshot finishes. Resolve it once instead of repeating the same physical
-  # path walk for every installed overlay record.
-  _dot_reserved_roots_snapshot || return 1
-  _overlay_reserved_roots=$REPLY
   if ! _overlay_recover_replacements; then
     _warn "  warning: unsafe overlay replacement recovery record: $REPLY"
     return 1
   fi
+  # Recovery can restore a parent symlink and therefore change physical root
+  # resolution. Snapshot only after it converges, then reuse that stable view
+  # instead of walking the same roots for every installed overlay record.
+  _dot_reserved_roots_snapshot || return 1
+  _overlay_reserved_roots=$REPLY
   if ! _overlay_authority_files; then
     _warn "  warning: unsafe installed overlay manifest: $REPLY"
     return 1
@@ -1151,17 +1153,15 @@ _overlay_restore_installed_links() {
 _unstash_overlay_overrides() {
   _base_repo_exists || return 0
 
-  # The installed generation and control-plane roots are stable throughout
-  # unstash. Reuse one snapshot while loading its authority instead of
-  # rediscovering identical roots for every manifest record.
   local _overlay_reserved_roots
-  _dot_reserved_roots_snapshot || return 1
-  _overlay_reserved_roots=$REPLY
-
   if ! _overlay_recover_replacements; then
     _warn "  warning: unsafe overlay replacement recovery record: $REPLY"
     return 1
   fi
+  # Recovery may restore a parent symlink used while resolving reserved roots.
+  # Capture the converged generation once for the authority load below.
+  _dot_reserved_roots_snapshot || return 1
+  _overlay_reserved_roots=$REPLY
 
   local -A _overlay_authority_paths=()
   local -A _overlay_authority_targets=()
@@ -1341,17 +1341,19 @@ _link_overlays() {
   local manifest="$DOT_OVERLAY_MANIFEST" pending _overlay_reserved_roots
   local _overlay_path_authority_cache_enabled=1
   local -A _overlay_path_authority_cache=()
-  _dot_reserved_roots_snapshot || return 1
-  _overlay_reserved_roots=$REPLY
-  if ! _preflight_local_overlays; then
-    return 1
-  fi
   if ! mkdir -p "${manifest%/*}"; then
     _warn "  warning: could not create overlay manifest directory: ${manifest%/*}"
     return 1
   fi
   if ! _overlay_recover_replacements; then
     _warn "  warning: unsafe overlay replacement recovery record: $REPLY"
+    return 1
+  fi
+  # Recovery is the only startup step here that may restore a parent symlink.
+  # Resolve and cache reserved roots from that converged filesystem generation.
+  _dot_reserved_roots_snapshot || return 1
+  _overlay_reserved_roots=$REPLY
+  if ! _preflight_local_overlays; then
     return 1
   fi
   if [[ (-e "$manifest" || -L "$manifest") &&

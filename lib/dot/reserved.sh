@@ -5,6 +5,22 @@ _dot_path_within() {
   [[ "$1" == "$2" || "$1" == "$2"/* ]]
 }
 
+# Overlay payloads may not define the policy that selects overlays. Keep this
+# lexical rule separate from dynamic reserved roots because the base repository
+# legitimately owns these directories while every overlay source type must be
+# rejected at both candidate-validation and link-inventory boundaries.
+_dot_overlay_control_path_reserved() {
+  local path=$1 root
+  for root in \
+    .config/dot/profiles.d \
+    .config/dot/profile-selectors.d; do
+    if [[ $path == "$root" || $path == "$root"/* || $root == "$path"/* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 _dot_init_recovery_path_reserved() {
   local path=$1 relative component
   local -a components=()

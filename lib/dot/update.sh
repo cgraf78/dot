@@ -176,14 +176,21 @@ _dot_converge_overlays() {
 
 _dot_update_sync_repos() {
   local sync_status=0
+  # Sourced callers may run more than one update in a process. Rollback
+  # authority belongs only to this invocation, including when no base checkout
+  # exists and a later configuration step fails.
+  # shellcheck disable=SC2034 # Rollback helpers consume these dynamically.
+  DOT_OVERLAY_ROLLBACK_PATHS=()
+  # shellcheck disable=SC2034 # Rollback helpers consume these dynamically.
+  DOT_OVERLAY_ROLLBACK_TARGETS=()
   if _base_repo_exists; then
-    # Sourced callers may run more than one update in a process. The pull
-    # adapter fills these only when a fetched base generation can actually
-    # mutate HOME; never let a prior run authorize rollback in a later one.
-    # shellcheck disable=SC2034 # Rollback helpers consume these dynamically.
-    DOT_OVERLAY_ROLLBACK_PATHS=()
-    # shellcheck disable=SC2034 # Rollback helpers consume these dynamically.
-    DOT_OVERLAY_ROLLBACK_TARGETS=()
+    # Capture only the already-installed link generation before pull restores
+    # its shadowed base paths. Current profile/descriptor policy may itself be
+    # malformed and must never prevent pulling a repaired base generation.
+    _overlay_snapshot_installed_links || {
+      DOT_OVERLAY_LINKS_FROZEN=1
+      return 1
+    }
     # shellcheck disable=SC2034 # Repository helpers consume these dynamically.
     OVERLAYS=()
     # shellcheck disable=SC2034 # Read dynamically by _repo_pull_all.
