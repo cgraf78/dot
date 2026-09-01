@@ -248,6 +248,18 @@ _repo_head() {
   "$@" rev-parse --verify HEAD 2>/dev/null || true
 }
 
+# An upstream already contained by the checked-out generation cannot expose a
+# new tree. Keep the equality check builtin-fast for the common case; the
+# ancestry probe serves intentional local-ahead branches used during staged
+# rollouts and ordinary unpublished work.
+_repo_head_contains_upstream() {
+  local head=$1 upstream=$2
+  shift 2
+  [[ -n $head && -n $upstream ]] || return 1
+  [[ $head == "$upstream" ]] ||
+    "$@" merge-base --is-ancestor "$upstream" "$head" 2>/dev/null
+}
+
 _repo_candidate_adapter_allowed() {
   local ref=$1 path=$2 mode=$3
   shift 3
@@ -637,12 +649,25 @@ _pull_base() {
   }
   upstream=$REPLY
   head_before=$(_repo_head _base_git)
-  # The active commit is already an accepted generation. When fetch resolves
-  # the upstream to those exact bytes, no candidate can become visible and the
-  # validation, parent snapshot, and rebase path has no work to protect.
-  if [[ -n $head_before && $head_before == "$upstream" ]]; then
+  # The active commit is already an accepted generation. When it contains the
+  # fetched upstream, no candidate can become visible and the validation,
+  # parent snapshot, and rebase path has no work to protect.
+  if _repo_head_contains_upstream "$head_before" "$upstream" _base_git; then
     REPLY_STATUS=current
     return 0
+  fi
+  # Fetch is read-only with respect to HOME. Delay rollback capture and
+  # overlay unstash until the fetched upstream proves that this invocation may
+  # change the base worktree, keeping unchanged updates proportional to Git's
+  # fetch rather than to the number of installed overlay links.
+  _overlay_snapshot_installed_links || {
+    REPLY_STATUS=failed
+    return 1
+  }
+  _normalize_filtered
+  if ! _unstash_overlay_overrides; then
+    REPLY_STATUS=failed
+    return 1
   fi
   _repo_validate_candidate_tree base "$upstream" _base_git || {
     REPLY_STATUS=failed
@@ -953,9 +978,10 @@ _pull_overlay() {
   fi
   upstream=$REPLY
   head_before=$(_repo_head git -C "$path")
-  # Match the base fast path: an identical immutable commit is already the
-  # accepted overlay generation, so no new tree can reach the client worktree.
-  if [[ -n $head_before && $head_before == "$upstream" ]]; then
+  # Match the base fast path: an accepted generation that contains the fetched
+  # upstream cannot expose a new tree to the client worktree.
+  if _repo_head_contains_upstream \
+    "$head_before" "$upstream" git -C "$path"; then
     REPLY_STATUS=current
     return 0
   fi
@@ -1235,10 +1261,6 @@ _pull_overlays() {
 # hooks, and cron installation after the repo set is current.
 _repo_pull_all() {
   _ensure_repo_config
-  _normalize_filtered
-  if ! _unstash_overlay_overrides; then
-    return 1
-  fi
 
   local _repo_total
   _repo_total=$((1 + $(_pull_overlay_count)))

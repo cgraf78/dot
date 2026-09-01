@@ -227,20 +227,35 @@ _overlay_authority_link_matches() {
 }
 
 _overlay_path_is_authority() {
-  local rel="$1" pending
+  local rel="$1" pending status
+  if [[ ${_overlay_path_authority_cache_enabled:-0} == 1 &&
+    ${_overlay_path_authority_cache["$rel"]+x} ]]; then
+    return "${_overlay_path_authority_cache["$rel"]}"
+  fi
   _overlay_pending_manifest_path
   pending="$REPLY"
   if [[ "$HOME/$rel" == "$DOT_OVERLAY_MANIFEST" ||
     "$HOME/$rel" == "$DOT_OVERLAY_LEGACY_MANIFEST" ||
     "$HOME/$rel" == "$pending" ]]; then
-    return 0
-  fi
-  if [[ ${_overlay_reserved_roots+x} ]]; then
-    _dot_candidate_path_is_reserved_from_roots \
-      "$HOME/$rel" "$_overlay_reserved_roots"
+    status=0
+  elif [[ ${_overlay_reserved_roots+x} ]]; then
+    if _dot_candidate_path_is_reserved_from_roots \
+      "$HOME/$rel" "$_overlay_reserved_roots"; then
+      status=0
+    else
+      status=$?
+    fi
   else
-    dot_candidate_path_is_reserved "$HOME/$rel"
+    if dot_candidate_path_is_reserved "$HOME/$rel"; then
+      status=0
+    else
+      status=$?
+    fi
   fi
+  if [[ ${_overlay_path_authority_cache_enabled:-0} == 1 ]]; then
+    _overlay_path_authority_cache["$rel"]=$status
+  fi
+  return "$status"
 }
 
 _overlay_append_manifest_records() {
@@ -877,10 +892,16 @@ _overlay_restore_tracked_path() {
 # ownership transfer must still be able to restore the previous generation.
 _overlay_snapshot_installed_links() {
   local manifest line rel target dst live_target REPLY_REL REPLY_OWNER REPLY_TARGET
+  local _overlay_reserved_roots
   local -A seen_targets=()
   local -a OVERLAY_AUTHORITY_MANIFESTS=()
   DOT_OVERLAY_ROLLBACK_PATHS=()
   DOT_OVERLAY_ROLLBACK_TARGETS=()
+  # Repository sync cannot change the reserved-root set until after this
+  # snapshot finishes. Resolve it once instead of repeating the same physical
+  # path walk for every installed overlay record.
+  _dot_reserved_roots_snapshot || return 1
+  _overlay_reserved_roots=$REPLY
   if ! _overlay_recover_replacements; then
     _warn "  warning: unsafe overlay replacement recovery record: $REPLY"
     return 1
@@ -1130,6 +1151,13 @@ _overlay_restore_installed_links() {
 _unstash_overlay_overrides() {
   _base_repo_exists || return 0
 
+  # The installed generation and control-plane roots are stable throughout
+  # unstash. Reuse one snapshot while loading its authority instead of
+  # rediscovering identical roots for every manifest record.
+  local _overlay_reserved_roots
+  _dot_reserved_roots_snapshot || return 1
+  _overlay_reserved_roots=$REPLY
+
   if ! _overlay_recover_replacements; then
     _warn "  warning: unsafe overlay replacement recovery record: $REPLY"
     return 1
@@ -1311,6 +1339,8 @@ _link_overlay() {
 # Link all active overlays and clean up stale symlinks from removed overlays.
 _link_overlays() {
   local manifest="$DOT_OVERLAY_MANIFEST" pending _overlay_reserved_roots
+  local _overlay_path_authority_cache_enabled=1
+  local -A _overlay_path_authority_cache=()
   _dot_reserved_roots_snapshot || return 1
   _overlay_reserved_roots=$REPLY
   if ! _preflight_local_overlays; then
@@ -1420,6 +1450,14 @@ _link_overlays() {
     rm -rf -- "$inventory_root"
     return 1
   fi
+
+  # Everything above inspects one immutable pre-mutation filesystem
+  # generation, so repeated records can share their reserved-path result.
+  # Linking can change destination ancestry; drop the cache before the first
+  # mutation so each live destination is validated again.
+  unset \
+    _overlay_path_authority_cache_enabled \
+    _overlay_path_authority_cache
 
   local entry
   local _overlay_done=0
