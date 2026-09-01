@@ -62,6 +62,10 @@ unchanged_base_moved=$(printf 'out-of-band move\n' |
   git --git-dir="$unchanged_base_home/.dotfiles" \
     -c user.name=fixture -c user.email=fixture@example.invalid \
     commit-tree "$unchanged_base_tree" -p "$unchanged_base_head")
+# Advance the remote independently so the fetched generation and the
+# out-of-band local commit are siblings. A fresh ancestry check must reject
+# the fast path and follow ordinary validation/rebase.
+fixture_push unchanged-base main .remote $'remote\n' 100644
 unchanged_base_race_bin=$DOT_TEST_TMP/unchanged-base-race-bin
 unchanged_base_race_trace=$DOT_TEST_TMP/unchanged-base-race-trace.json
 unchanged_base_race_marker=$DOT_TEST_TMP/unchanged-base-race-marker
@@ -131,6 +135,128 @@ assert_eq 0 "$unchanged_overlay_ls_tree" \
   'unchanged overlay skips candidate-tree validation after fetch'
 assert_eq 0 "$unchanged_overlay_rebase" \
   'unchanged overlay skips an empty rebase after fetch'
+
+# A local branch may intentionally contain reviewed commits ahead of its
+# configured upstream, as during a staged rollout. The fetched upstream is
+# already part of that accepted generation, so validation and an empty rebase
+# would add work without exposing any new tree.
+fixture_repo ahead-base main .testrc $'base\n' 100644
+ahead_base_origin=$REPLY
+fixture_home ahead-base
+ahead_base_home=$REPLY
+ahead_base_state=$DOT_TEST_TMP/ahead-base-state
+ahead_base_trace=$DOT_TEST_TMP/ahead-base-trace.json
+run_dot "$ahead_base_home" "$ahead_base_state" init --yes \
+  "file://$ahead_base_origin" >/dev/null
+printf 'local\n' >"$ahead_base_home/.local-ahead"
+git --git-dir="$ahead_base_home/.dotfiles" --work-tree="$ahead_base_home" \
+  add .local-ahead
+git --git-dir="$ahead_base_home/.dotfiles" --work-tree="$ahead_base_home" \
+  -c user.name=fixture -c user.email=fixture@example.invalid \
+  -c core.hooksPath=/dev/null commit -qm local-ahead
+GIT_TRACE2_EVENT=$ahead_base_trace \
+  run_dot "$ahead_base_home" "$ahead_base_state" update >/dev/null
+ahead_base_fetch=$(grep -Fc '"name":"fetch"' "$ahead_base_trace" || true)
+ahead_base_ls_tree=$(grep -Fc '"name":"ls-tree"' "$ahead_base_trace" || true)
+ahead_base_rebase=$(grep -Fc '"name":"rebase"' "$ahead_base_trace" || true)
+assert_eq 1 "$ahead_base_fetch" \
+  'ahead base still fetches before taking the ancestor fast path'
+assert_eq 0 "$ahead_base_ls_tree" \
+  'ahead base skips validation for an upstream already in its history'
+assert_eq 0 "$ahead_base_rebase" \
+  'ahead base skips an empty rebase onto its ancestor'
+
+fixture_repo ahead-overlay-base main .testrc $'base\n' 100644
+ahead_overlay_base_origin=$REPLY
+fixture_repo ahead-overlay main home/.config/overlay/value $'overlay\n' 100644
+ahead_overlay_origin=$REPLY
+fixture_home ahead-overlay
+ahead_overlay_home=$REPLY
+ahead_overlay_state=$DOT_TEST_TMP/ahead-overlay-state
+ahead_overlay_trace=$DOT_TEST_TMP/ahead-overlay-trace.json
+run_dot "$ahead_overlay_home" "$ahead_overlay_state" init --yes \
+  "file://$ahead_overlay_base_origin" >/dev/null
+mkdir -p "$ahead_overlay_home/.config/dot/overlays.d"
+printf 'url=file://%s\n' "$ahead_overlay_origin" \
+  >"$ahead_overlay_home/.config/dot/overlays.d/10-ahead-overlay.conf"
+run_dot "$ahead_overlay_home" "$ahead_overlay_state" update >/dev/null
+printf 'local\n' >"$ahead_overlay_home/.dotfiles-ahead-overlay/local-ahead"
+git -C "$ahead_overlay_home/.dotfiles-ahead-overlay" add local-ahead
+git -C "$ahead_overlay_home/.dotfiles-ahead-overlay" \
+  -c user.name=fixture -c user.email=fixture@example.invalid \
+  -c core.hooksPath=/dev/null commit -qm local-ahead
+: >"$ahead_overlay_trace"
+GIT_TRACE2_EVENT=$ahead_overlay_trace \
+  run_dot "$ahead_overlay_home" "$ahead_overlay_state" update >/dev/null
+ahead_overlay_fetch=$(grep -Fc '"name":"fetch"' "$ahead_overlay_trace" || true)
+ahead_overlay_ls_tree=$(grep -Fc '"name":"ls-tree"' "$ahead_overlay_trace" || true)
+ahead_overlay_rebase=$(grep -Fc '"name":"rebase"' "$ahead_overlay_trace" || true)
+assert_eq 2 "$ahead_overlay_fetch" \
+  'ahead overlay and base still fetch before their fast paths'
+assert_eq 0 "$ahead_overlay_ls_tree" \
+  'ahead overlay skips validation for an upstream already in its history'
+assert_eq 0 "$ahead_overlay_rebase" \
+  'ahead overlay skips an empty rebase onto its ancestor'
+
+# An unchanged base fetch must not pay for rollback capture or temporarily
+# restore overlay-shadowed paths. The pull adapter owns those preparations and
+# invokes them only after it proves that a new base generation may be applied.
+deferred_snapshot_status=0
+HOME=$DOT_TEST_TMP/deferred-snapshot-home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/update.sh"
+    OVERLAYS=()
+    snapshots=0
+    _base_repo_exists() { return 0; }
+    _overlay_snapshot_installed_links() { snapshots=$((snapshots + 1)); }
+    _repo_pull_all() { return 0; }
+    dot_config_load() { return 0; }
+    _dot_converge_overlays() { return 0; }
+    _dot_profile_lifecycle_prepare() { return 0; }
+    _dot_update_repo_stage_finish() { return 0; }
+
+    _dot_update_sync_repos
+    [[ $snapshots -eq 0 ]]
+  ' || deferred_snapshot_status=$?
+assert_eq 0 "$deferred_snapshot_status" \
+  'unchanged base synchronization defers rollback snapshotting to the pull adapter'
+
+# Once a fetched upstream can change the base worktree, capture rollback
+# authority before normalizing or unstashing any live overlay path.
+changed_base_prepare_status=0
+HOME=$DOT_TEST_TMP/changed-base-prepare-home DOT_SOURCE_ROOT=$root \
+  DOT_TEST_PARENT_SNAPSHOT=$DOT_TEST_TMP/changed-base-parent-snapshot \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    events=
+    REPLY_STATUS=
+    DOT_QUIET=1
+    _repo_has_upstream() { return 0; }
+    _repo_prepare_base_upstream() { REPLY=upstream; }
+    _repo_head() { printf "local\n"; }
+    _repo_head_contains_upstream() { return 1; }
+    _overlay_snapshot_installed_links() { events="${events}snapshot "; }
+    _normalize_filtered() { events="${events}normalize "; }
+    _unstash_overlay_overrides() { events="${events}unstash "; }
+    _repo_validate_candidate_tree() { events="${events}validate "; }
+    _repo_snapshot_updated_path_parents() {
+      events="${events}parents "
+      : >"$DOT_TEST_PARENT_SNAPSHOT"
+      REPLY=$DOT_TEST_PARENT_SNAPSHOT
+    }
+    _pull_repo() { events="${events}pull "; }
+    _dot_cleanup_remove_path() {
+      events="${events}cleanup "
+      rm -f -- "$1"
+    }
+
+    _pull_base
+    [[ $events == "snapshot normalize unstash validate parents pull cleanup " ]]
+  ' || changed_base_prepare_status=$?
+assert_eq 0 "$changed_base_prepare_status" \
+  'changed base captures rollback authority before worktree preparation'
 
 # Client trees may not occupy deterministic same-parent init staging or
 # rollback namespaces. Candidate inventories contain leaves, so cover both a
@@ -273,6 +399,134 @@ HOME=$reserved_resolution_home XDG_STATE_HOME=$reserved_resolution_state \
   '
 assert_eq 2 "$(awk 'END { print NR }' "$reserved_resolution_log")" \
   'candidate tree validation snapshots reserved roots before and after its scan'
+
+# Installed overlay authority can contain hundreds of records. Snapshot and
+# unstash operate against one stable pre-pull filesystem generation, so each
+# operation must resolve the reserved-root set once rather than once per path.
+overlay_authority_perf_home=$DOT_TEST_TMP/overlay-authority-perf-home
+overlay_authority_perf_state=$DOT_TEST_TMP/overlay-authority-perf-state
+mkdir -p "$overlay_authority_perf_home/nested" "$overlay_authority_perf_state"
+ln -s .dotfiles-alpha/home/one "$overlay_authority_perf_home/one"
+ln -s ../.dotfiles-alpha/home/nested/two \
+  "$overlay_authority_perf_home/nested/two"
+printf '%s\n' \
+  $'one\talpha\t.dotfiles-alpha/home/one' \
+  $'nested/two\talpha\t../.dotfiles-alpha/home/nested/two' \
+  >"$overlay_authority_perf_state/overlay-links"
+chmod 0600 "$overlay_authority_perf_state/overlay-links"
+
+overlay_snapshot_perf_status=0
+HOME=$overlay_authority_perf_home XDG_STATE_HOME=$overlay_authority_perf_state \
+  DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$overlay_authority_perf_state/overlay-links \
+  DOT_OVERLAY_LEGACY_MANIFEST=$overlay_authority_perf_state/legacy-links \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    OVERLAYS=()
+    reserved_snapshots=0
+    _dot_reserved_roots_snapshot() {
+      reserved_snapshots=$((reserved_snapshots + 1))
+      REPLY=$HOME/.reserved
+    }
+    _overlay_snapshot_installed_links
+    [[ $reserved_snapshots -eq 1 ]]
+    [[ ${#DOT_OVERLAY_ROLLBACK_PATHS[@]} -eq 2 ]]
+  ' || overlay_snapshot_perf_status=$?
+assert_eq 0 "$overlay_snapshot_perf_status" \
+  'rollback snapshot resolves reserved roots once per installed generation'
+
+overlay_unstash_perf_status=0
+HOME=$overlay_authority_perf_home XDG_STATE_HOME=$overlay_authority_perf_state \
+  DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$overlay_authority_perf_state/overlay-links \
+  DOT_OVERLAY_LEGACY_MANIFEST=$overlay_authority_perf_state/legacy-links \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    OVERLAYS=()
+    reserved_snapshots=0
+    _base_repo_exists() { return 0; }
+    _base_git() { return 0; }
+    _dot_reserved_roots_snapshot() {
+      reserved_snapshots=$((reserved_snapshots + 1))
+      REPLY=$HOME/.reserved
+    }
+
+    _unstash_overlay_overrides
+    [[ $reserved_snapshots -eq 1 ]]
+  ' || overlay_unstash_perf_status=$?
+assert_eq 0 "$overlay_unstash_perf_status" \
+  'overlay unstash resolves reserved roots once per installed generation'
+
+# Pending recovery publication and both authority loads inspect the same
+# immutable pre-mutation paths. Cache those classifications until linking
+# begins, then revalidate each destination against the live filesystem once.
+overlay_classification_perf_home=$DOT_TEST_TMP/overlay-classification-perf-home
+overlay_classification_perf_state=$DOT_TEST_TMP/overlay-classification-perf-state
+overlay_classification_perf_source=$DOT_TEST_TMP/overlay-classification-perf-source
+mkdir -p \
+  "$overlay_classification_perf_home/nested" \
+  "$overlay_classification_perf_state" \
+  "$overlay_classification_perf_source/home/nested"
+printf 'one\n' >"$overlay_classification_perf_source/home/one"
+printf 'two\n' >"$overlay_classification_perf_source/home/nested/two"
+ln -s .dotfiles-alpha/home/one "$overlay_classification_perf_home/one"
+ln -s ../.dotfiles-alpha/home/nested/two \
+  "$overlay_classification_perf_home/nested/two"
+printf '%s\n' \
+  $'one\talpha\t.dotfiles-alpha/home/one' \
+  $'nested/two\talpha\t../.dotfiles-alpha/home/nested/two' \
+  >"$overlay_classification_perf_state/overlay-links"
+chmod 0600 "$overlay_classification_perf_state/overlay-links"
+
+overlay_classification_perf_status=0
+HOME=$overlay_classification_perf_home \
+  XDG_STATE_HOME=$overlay_classification_perf_state \
+  DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$overlay_classification_perf_state/overlay-links \
+  DOT_OVERLAY_LEGACY_MANIFEST=$overlay_classification_perf_state/legacy-links \
+  DOT_TEST_OVERLAY_SOURCE=$overlay_classification_perf_source \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/progress-ui.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/overlays.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    OVERLAYS=("alpha|$DOT_TEST_OVERLAY_SOURCE|file:///unused|0|0|git")
+    DOT_QUIET=1
+    DOT_VERBOSE=0
+    DOT_UI_TOTAL=0
+    candidate_checks=0
+    _base_repo_exists() { return 1; }
+    _overlay_is_worktree() { return 0; }
+    _overlay_checkout_matches() { return 0; }
+    _preflight_local_overlays() { return 0; }
+    _dot_maybe_stage_progress() { return 0; }
+    _dot_reserved_roots_snapshot() {
+      REPLY=$HOME/.reserved
+    }
+    _dot_candidate_path_is_reserved_from_roots() {
+      candidate_checks=$((candidate_checks + 1))
+      return 1
+    }
+
+    _link_overlays
+    [[ $candidate_checks -eq 4 ]]
+    [[ $(readlink "$HOME/one") == .dotfiles-alpha/home/one ]]
+    [[ $(readlink "$HOME/nested/two") == ../.dotfiles-alpha/home/nested/two ]]
+  ' || overlay_classification_perf_status=$?
+assert_eq 0 "$overlay_classification_perf_status" \
+  'overlay convergence classifies each path once per stable filesystem phase'
 
 # Physical candidate resolution is sourceable library behavior. Preserve the
 # caller's logical cwd and OLDPWD even when the path crosses a symlink and its
