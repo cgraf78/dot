@@ -95,6 +95,32 @@ assert_contains 'linked: cloned' "$overlay_output" 'doctor recognizes linked wor
 [[ $overlay_output != *'relative: remote URL drift'* ]] ||
   fail 'doctor did not normalize relative overlay URL'
 
+# Optional overlays are intentionally allowed to be absent. Legacy clients
+# selected every eligible descriptor, but never treated an unavailable
+# optional repository as a health warning.
+fixture_repo doctor-legacy-optional main \
+  .config/dot/overlays.d/90-optional.conf \
+  "url=file://$DOT_TEST_TMP/doctor-legacy-overlay-unavailable.git
+optional=true" 100644
+legacy_optional_origin=$REPLY
+fixture_home doctor-legacy-optional
+legacy_optional_home=$REPLY
+legacy_optional_state=$DOT_TEST_TMP/doctor-legacy-optional-state
+run_dot "$legacy_optional_home" "$legacy_optional_state" init --yes \
+  "file://$legacy_optional_origin" >/dev/null
+set +e
+legacy_optional_output=$(run_dot "$legacy_optional_home" \
+  "$legacy_optional_state" doctor 2>&1)
+legacy_optional_status=$?
+set -e
+assert_eq 0 "$legacy_optional_status" \
+  'doctor accepts an unavailable optional overlay in legacy mode'
+assert_contains '· optional: selected optional but unavailable' \
+  "$legacy_optional_output" \
+  'doctor skips an unavailable optional overlay in legacy mode'
+[[ $legacy_optional_output != *'⚠ optional: selected optional but unavailable'* ]] ||
+  fail 'doctor warns for an unavailable optional overlay in legacy mode'
+
 cat >"$extensions/doctor.d/10-alpha.sh" <<'DOCTOR'
 doctor() {
   if declare -F _base_git >/dev/null || declare -F _dot_doctor >/dev/null ||
@@ -441,6 +467,10 @@ assert_contains 'dev: not selected' "$profile_doctor" \
   'doctor does not parse an unselected malformed descriptor'
 assert_contains 'personal: selected optional but unavailable' "$profile_doctor" \
   'doctor reports optional unavailability'
+assert_contains '· personal: selected optional but unavailable' "$profile_doctor" \
+  'doctor skips optional unavailability in profile mode'
+[[ $profile_doctor != *'⚠ personal: selected optional but unavailable'* ]] ||
+  fail 'doctor warns for optional unavailability in profile mode'
 assert_contains 'nvim: selected but unavailable' "$profile_doctor" \
   'doctor reports required unavailability'
 

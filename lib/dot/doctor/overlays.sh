@@ -121,7 +121,7 @@ _dr_check_overlays() {
         continue
         ;;
       selected-optional-unavailable)
-        _dr_warn "$name: selected optional but unavailable"
+        _dr_skip "$name: selected optional but unavailable"
         continue
         ;;
       selected-unavailable)
