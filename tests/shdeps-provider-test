@@ -791,6 +791,7 @@ recovered_marker=$DOT_TEST_TMP/provider-recovered-merge
 # client code. A failed repo stage must skip both provider and merge execution.
 sync_failed_provider=$DOT_TEST_TMP/provider-sync-failed-tools
 sync_failed_merge=$DOT_TEST_TMP/provider-sync-failed-merge
+sync_failed_links=$DOT_TEST_TMP/provider-sync-failed-links
 (
   export HOME=$provider_home XDG_STATE_HOME=$provider_state
   DOT_SOURCE_ROOT=$root
@@ -798,7 +799,7 @@ sync_failed_merge=$DOT_TEST_TMP/provider-sync-failed-merge
   DOT_UI_TOTAL=0
 
   _ensure_repo_config() { :; }
-  _link_overlays() { :; }
+  _link_overlays() { : >"$sync_failed_links"; }
   _ensure_shdeps() { : >"$sync_failed_provider"; }
   _run_merges() { : >"$sync_failed_merge"; }
   _base_repo_exists() { return 1; }
@@ -809,7 +810,7 @@ sync_failed_merge=$DOT_TEST_TMP/provider-sync-failed-merge
   _ui_done() { :; }
 
   set +e
-  _dot_update_finalize 1
+  DOT_OVERLAY_LINKS_FROZEN=1 _dot_update_finalize 1
   status=$?
   set -e
   printf '%s\n' "$status" >"$DOT_TEST_TMP/provider-sync-failed-status"
@@ -820,6 +821,8 @@ assert_eq 1 "$(<"$DOT_TEST_TMP/provider-sync-failed-status")" \
   fail 'repository sync failure ran the dependency provider'
 [[ ! -e $sync_failed_merge ]] ||
   fail 'repository sync failure ran merge hooks'
+[[ ! -e $sync_failed_links ]] ||
+  fail 'repository sync failure reconciled overlay links'
 
 # Malformed state must fail closed and remain available for diagnosis. Update
 # must not silently discard an unbound source generation and run extensions.

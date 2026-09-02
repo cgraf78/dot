@@ -13,6 +13,8 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 assert_eq 900 "$(_dot_test_suite_timeout provider)" \
   'provider suite receives an aggregate-test timeout budget'
+assert_eq 600 "$(_dot_test_suite_timeout local)" \
+  'repository-local suites receive a compatibility-test timeout budget'
 assert_eq 300 "$(_dot_test_suite_timeout extension)" \
   'extension suite keeps the standard timeout budget'
 assert_eq 7 "$(DOT_TEST_SUITE_TIMEOUT_SECONDS=7 \

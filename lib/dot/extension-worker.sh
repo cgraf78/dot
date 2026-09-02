@@ -10,40 +10,6 @@ umask 077
 shopt -u extglob nocasematch nullglob
 trap - EXIT HUP INT QUIT TERM PIPE ALRM USR1 USR2 ERR DEBUG RETURN
 
-_dot_extension_worker_discover_overlays() {
-  local context=$TMPDIR/.dot-extension-overlays entry rc=0
-
-  : >"$context" || return 1
-  chmod 0600 "$context" || return 1
-  (
-    # Discovery needs platform predicates and descriptor parsing, but client
-    # code does not. Keep those private functions in this short-lived process
-    # and publish only the already-validated records as NUL-delimited data.
-    # shellcheck source=public/xdg.sh
-    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
-    # shellcheck source=log.sh
-    . "$DOT_SOURCE_ROOT/lib/dot/log.sh"
-    # shellcheck source=platform.sh
-    . "$DOT_SOURCE_ROOT/lib/dot/platform.sh"
-    # shellcheck source=overlays.sh
-    . "$DOT_SOURCE_ROOT/lib/dot/overlays.sh"
-    _discover_overlays || exit 1
-    for entry in "${OVERLAYS[@]+"${OVERLAYS[@]}"}"; do
-      printf '%s\0' "$entry"
-    done
-  ) >"$context" || rc=$?
-  [[ $rc -eq 0 ]] || {
-    rm -f -- "$context"
-    return "$rc"
-  }
-
-  OVERLAYS=()
-  while IFS= read -r -d '' entry; do
-    OVERLAYS+=("$entry")
-  done <"$context"
-  rm -f -- "$context"
-}
-
 _dot_extension_worker_load_overlay_protocol() {
   local function_name
   local -A existing_functions=()
@@ -94,11 +60,13 @@ _dot_extension_worker_load_doctor_api() {
 _dot_extension_worker_main() {
   local mode=${1:-} script=${2:-}
   local _dot_extension_worker_result=${3:-}
+  local context=${4:-} token=${5:-}
+  local retiring_record
 
-  [[ $# -eq 3 ]] || return 2
+  [[ $# -eq 5 ]] || return 2
   readonly _dot_extension_worker_result
   case $mode in
-    merge | pre-sync | doctor) ;;
+    merge | pre-sync | deactivate | doctor) ;;
     *) return 2 ;;
   esac
   case ${DOT_SOURCE_ROOT:-} in
@@ -108,6 +76,11 @@ _dot_extension_worker_main() {
   [[ -d $DOT_SOURCE_ROOT/lib/dot && ! -L $DOT_SOURCE_ROOT/lib/dot ]] ||
     return 1
   [[ -n $_dot_extension_worker_result ]] || return 1
+  # The context is a one-use capability. Remove its pathname even when
+  # validation fails before the decoder can consume it.
+  _DOT_OVERLAY_CONTEXT_PATH=$context
+  readonly _DOT_OVERLAY_CONTEXT_PATH
+  trap 'rm -f -- "${_DOT_OVERLAY_CONTEXT_PATH:-}" 2>/dev/null || true' EXIT
   cd "$HOME" || return 1
 
   # Clear the launcher's arguments before client code is sourced. Extension
@@ -119,22 +92,52 @@ _dot_extension_worker_main() {
   # only after the entry script has passed revalidation.
   # shellcheck source=public/xdg.sh
   . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+  # shellcheck source=overlay-context.sh
+  . "$DOT_SOURCE_ROOT/lib/dot/overlay-context.sh"
+  # shellcheck disable=SC2034 # Context decoder publishes records for trust and extensions.
+  OVERLAYS=()
+  _dot_overlay_context_consume "$context" "$token" "$mode" || return 1
+  trap - EXIT
+  if [[ $mode == pre-sync ]]; then
+    DOT_PRE_SYNC_STAGE=$REPLY_STAGE
+    readonly DOT_PRE_SYNC_STAGE
+    export DOT_PRE_SYNC_STAGE
+  fi
   dot_xdg_path state dot/overlay-links || return 1
   DOT_OVERLAY_MANIFEST=$REPLY
   export DOT_OVERLAY_MANIFEST
   _dot_extension_worker_load_overlay_protocol || return 1
   # shellcheck source=extension-trust.sh
   . "$DOT_SOURCE_ROOT/lib/dot/extension-trust.sh"
-  _dot_extension_worker_discover_overlays || return 1
-  _dot_extension_file_validate "$script" || return 1
-  unset -f merge doctor 2>/dev/null || true
+  if [[ $mode == deactivate ]]; then
+    local _retiring_name _retiring_path _retiring_url _retiring_descriptor
+    local _retiring_optional _retiring_sync
+    [[ $REPLY_SET_KIND == retiring && ${#OVERLAYS[@]} -eq 1 ]] || return 1
+    retiring_record=${OVERLAYS[0]}
+    _dot_profile_deactivation_validate "$retiring_record" "$script" ||
+      return 1
+    IFS='|' read -r _retiring_name _retiring_path _retiring_url \
+      _retiring_descriptor _retiring_optional _retiring_sync <<<"$retiring_record"
+    DOT_RETIRING_OVERLAY=${retiring_record%%|*}
+    DOT_RETIRING_OVERLAY_ROOT=$_retiring_path
+    readonly DOT_RETIRING_OVERLAY
+    readonly DOT_RETIRING_OVERLAY_ROOT
+    export DOT_RETIRING_OVERLAY DOT_RETIRING_OVERLAY_ROOT
+    # Retiring authority validates only the saved repository entry point. It
+    # must not make old fragment families visible to cleanup code, because that
+    # would let a downgrade accidentally regenerate the state being removed.
+    OVERLAYS=()
+    readonly -a OVERLAYS
+  else
+    _dot_extension_file_validate "$script" || return 1
+  fi
+  unset -f merge prepare deactivate doctor 2>/dev/null || true
 
   # shellcheck disable=SC2031 # The readonly engine result path survives sourced client code.
   case $mode in
-    merge | pre-sync)
+    merge | pre-sync | deactivate)
       _dot_extension_worker_load_merge_api || return 1
-      unset -f _dot_extension_worker_discover_overlays \
-        _dot_extension_worker_load_overlay_protocol \
+      unset -f _dot_extension_worker_load_overlay_protocol \
         _dot_extension_worker_load_merge_api \
         _dot_extension_worker_load_doctor_api \
         _dot_extension_worker_main 2>/dev/null || true
@@ -147,7 +150,10 @@ _dot_extension_worker_main() {
         return 1
       fi
       local entry_point=merge
-      [[ $mode == pre-sync ]] && entry_point=prepare
+      case $mode in
+        pre-sync) entry_point=prepare ;;
+        deactivate) entry_point=deactivate ;;
+      esac
       if ! declare -F "$entry_point" >/dev/null; then
         printf '0' >"$_dot_extension_worker_result"
         return 1
@@ -157,8 +163,7 @@ _dot_extension_worker_main() {
       ;;
     doctor)
       _dot_extension_worker_load_doctor_api || return 1
-      unset -f _dot_extension_worker_discover_overlays \
-        _dot_extension_worker_load_overlay_protocol \
+      unset -f _dot_extension_worker_load_overlay_protocol \
         _dot_extension_worker_load_merge_api \
         _dot_extension_worker_load_doctor_api \
         _dot_extension_worker_main 2>/dev/null || true

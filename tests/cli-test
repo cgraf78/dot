@@ -82,6 +82,7 @@ git -C "$linked_admin" worktree add -q -b linked-version "$linked_root"
 mkdir -p "$linked_root/lib/dot/public"
 cp "$DOT_TEST_ROOT/lib/dot/main.sh" "$linked_root/lib/dot/main.sh"
 cp "$DOT_TEST_ROOT/lib/dot/config.sh" "$linked_root/lib/dot/config.sh"
+cp "$DOT_TEST_ROOT/lib/dot/profile-format.sh" "$linked_root/lib/dot/profile-format.sh"
 cp "$DOT_TEST_ROOT/lib/dot/temp.sh" "$linked_root/lib/dot/temp.sh"
 cp "$DOT_TEST_ROOT/lib/dot/public/"*.sh "$linked_root/lib/dot/public/"
 linked_revision=$(git -C "$linked_root" rev-parse --short=12 HEAD)
@@ -93,6 +94,7 @@ non_git_root=$DOT_TEST_TMP/non-git-version-root
 mkdir -p "$non_git_root/lib/dot/public"
 cp "$DOT_TEST_ROOT/lib/dot/main.sh" "$non_git_root/lib/dot/main.sh"
 cp "$DOT_TEST_ROOT/lib/dot/config.sh" "$non_git_root/lib/dot/config.sh"
+cp "$DOT_TEST_ROOT/lib/dot/profile-format.sh" "$non_git_root/lib/dot/profile-format.sh"
 cp "$DOT_TEST_ROOT/lib/dot/temp.sh" "$non_git_root/lib/dot/temp.sh"
 cp "$DOT_TEST_ROOT/lib/dot/public/"*.sh "$non_git_root/lib/dot/public/"
 non_git_version=$(HOME="$HOME" "$BASH" "$non_git_root/lib/dot/main.sh" --version)

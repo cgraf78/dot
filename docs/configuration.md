@@ -11,6 +11,7 @@ version=1
 extension_api=1
 extensions_dir=$HOME/.local/lib/dotfiles
 dependency_provider=shdeps
+default_profile=dev
 shdeps_update_policy=pinned
 ```
 
@@ -23,6 +24,7 @@ Supported keys are:
 | `extension_api` | `1` |
 | `extensions_dir` | Normalized absolute path after a leading `~`, `$HOME`, or `${HOME}` expansion |
 | `dependency_provider` | `none` or `shdeps` |
+| `default_profile` | Lowercase profile name (default: `base`) |
 | `shdeps_update_policy` | `pinned` or `latest` (default: `pinned`) |
 
 `extensions_dir` requires `extension_api=1`. Unknown keys, control bytes,
@@ -70,3 +72,70 @@ exist and that the bytes match the recorded digest. CI always reports one
 singleton lock check, but performs that bounded remote verification only when
 the lock changes (or for a manual run); it never selects or advances the
 revision automatically.
+
+## Overlay profiles
+
+Clients may define additive overlay profiles in
+`${resolved_config_home}/dot/profiles.d/<name>.conf`:
+
+```text
+version=1
+profiles=base
+overlays=nvim
+```
+
+`profiles=` and `overlays=` are comma-separated lowercase identifiers. A
+profile may include other profiles, but cycles and unknown parents are errors.
+Included profiles are expanded before the including profile, and duplicate
+overlay names are removed without changing descriptor order. Every flattened
+profile must select at least one overlay. The client/root repository is always
+active and must not appear in `overlays=`.
+
+When `profiles.d` exists, it must define `base`. With no matching selector, Dot
+selects `default_profile` from the client configuration; omitting that setting
+selects `base`. The configured name must identify a defined profile. When
+`profiles.d` does not exist, Dot retains its legacy behavior and considers every
+overlay descriptor.
+
+Selectors use strict data files with this schema:
+
+```text
+version=1
+user=example-user
+host=example-host
+profile=editor
+```
+
+Tracked root selectors may omit both `user` and `host` to define a global
+default that overrides `default_profile`. Machine-local and personal selectors
+must include at least one of those fields. Every supplied field must match.
+User names come from `id -un` and compare exactly and case-sensitively.
+Short hostnames come from `hostname -s`; both configured and current values are
+ASCII-lowercased after removing one trailing dot. A selector containing both
+`user` and `host` is more specific than a selector containing only one field,
+and the most-specific matching level wins. A user-only or host-only record
+overrides a global root selector, and a combined record overrides either. This
+permits a fleet-wide compatibility default, a user-wide default, and per-host
+exceptions. Multiple matches at the winning specificity may agree on a
+profile; conflicting choices at that same specificity are a configuration
+error. Less-specific disagreements are ignored.
+
+Selector sources are read in this order; source location does not affect
+precedence:
+
+1. tracked root files in `.config/dot/profile-selectors.d/`;
+2. untracked machine-local files in
+   `.config/dot/profile-selectors.local.d/`;
+3. repository-only `dot/profile-selectors.d/` files from active overlays
+   selected by `base`.
+
+Machine-local selector directories and files must be owned by the current user,
+must not be symlinks, and must have no group/other permission bits. Use `0700`
+for the directory and `0600` for files. Client repositories should ignore the
+exact path `.config/dot/profile-selectors.local.d/`; Dot also rejects that path
+from every base or overlay candidate. Overlays cannot publish linked
+`profiles.d` or `profile-selectors.d` paths.
+
+Profile selection has no environment-variable override and no mutation command.
+See the executable, sanitized scenarios in
+[`examples/profile-dotfiles/`](../examples/profile-dotfiles/).

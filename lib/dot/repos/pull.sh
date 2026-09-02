@@ -42,29 +42,153 @@ _backup_pull_conflicts() {
   files=$(_pull_conflicts_from_log "$log") || true
   [[ -n "$files" ]] || return 1
 
-  local backup=""
-  if ! _backup_dir; then
-    return 1
-  fi
-  backup="$REPLY"
-
-  local file count=0
+  local backup="" file backed_up=0 adopted=0 adoption_rc=0 failed=0
+  local index parent source_identity target_identity nested
+  local committed_adoption=0 recovery_failed=0 move_status=0
+  local -a adoption_physicals=() adoption_parked=() adoption_stages=()
+  local -a adoption_expected=() backed_relatives=()
   while IFS= read -r file; do
     [[ -n "$file" ]] || continue
     if [[ -e "$root/$file" || -L "$root/$file" ]]; then
-      mkdir -p "$backup/$(dirname "$file")"
-      mv "$root/$file" "$backup/$file"
-      ((count++)) || true
+      # A base candidate can intentionally adopt a path that the installed
+      # overlay generation currently owns. The private manifest plus exact
+      # live target authorize removing that symlink; treating it as user data
+      # would create a useless conflict backup for every transferred file.
+      # The update-level rollback snapshot recreates it if the retry or later
+      # convergence fails.
+      if [[ $root == "$HOME" ]] &&
+        declare -F _overlay_quarantine_rollback_link >/dev/null 2>&1; then
+        adoption_rc=0
+        _overlay_quarantine_rollback_link "$file" || adoption_rc=$?
+        case $adoption_rc in
+          0)
+            adoption_physicals+=("$OVERLAY_ADOPTION_PHYSICAL")
+            adoption_parked+=("$OVERLAY_ADOPTION_PARKED")
+            adoption_stages+=("$OVERLAY_ADOPTION_STAGE")
+            adoption_expected+=("$OVERLAY_ADOPTION_EXPECTED")
+            adopted=$((adopted + 1))
+            continue
+            ;;
+          1) ;;
+          *)
+            failed=1
+            break
+            ;;
+        esac
+      fi
+      if [[ -z $backup ]]; then
+        if ! _backup_dir; then
+          failed=1
+          break
+        fi
+        backup=$REPLY
+      fi
+      parent=$backup
+      [[ $file != */* ]] || parent=$backup/${file%/*}
+      if ! mkdir -p "$parent"; then
+        failed=1
+        break
+      fi
+      source_identity=$(_dot_path_identity "$root/$file") || {
+        failed=1
+        break
+      }
+      move_status=0
+      _dot_move_noreplace "$root/$file" "$backup/$file" || move_status=$?
+      target_identity=$(_dot_path_identity "$backup/$file" 2>/dev/null || true)
+      if [[ $target_identity == "$source_identity" ]]; then
+        backed_relatives+=("$file")
+        backed_up=$((backed_up + 1))
+        continue
+      fi
+      if [[ $(_dot_path_identity "$root/$file" 2>/dev/null || true) != "$source_identity" ]]; then
+        nested=$backup/$file/${file##*/}
+        if [[ $(_dot_path_identity "$nested" 2>/dev/null || true) == "$source_identity" ]]; then
+          _warn "  warning: user conflict stranded during backup: $nested"
+        else
+          _warn "  warning: user conflict move became ambiguous: $file"
+        fi
+        recovery_failed=1
+      fi
+      [[ $move_status -ne 0 ]] || recovery_failed=1
+      failed=1
+      break
     fi
   done <<<"$files"
 
-  if [[ "$count" -eq 0 ]]; then
-    rmdir "$backup" 2>/dev/null || true
+  if [[ $failed -eq 0 ]]; then
+    for ((index = 0; index < ${#adoption_parked[@]}; index++)); do
+      if ! _overlay_commit_quarantined_link \
+        "${adoption_parked[index]}" \
+        "${adoption_stages[index]}" \
+        "${adoption_expected[index]}"; then
+        failed=1
+        break
+      fi
+    done
+  fi
+
+  if [[ $failed -eq 1 ]]; then
+    for ((index = ${#adoption_parked[@]} - 1; index >= 0; index--)); do
+      if [[ ! -e ${adoption_parked[index]} && ! -L ${adoption_parked[index]} ]]; then
+        committed_adoption=1
+        if [[ -d ${adoption_stages[index]} ]] &&
+          ! rmdir "${adoption_stages[index]}" 2>/dev/null; then
+          recovery_failed=1
+          _warn "  warning: managed-link quarantine retained at ${adoption_stages[index]}"
+        fi
+        continue
+      fi
+      if ! _overlay_restore_quarantined_link \
+        "${adoption_physicals[index]}" \
+        "${adoption_parked[index]}" \
+        "${adoption_stages[index]}" \
+        "${adoption_expected[index]}"; then
+        recovery_failed=1
+        _warn "  warning: managed-link quarantine retained at ${adoption_stages[index]}"
+      fi
+    done
+    if [[ $committed_adoption -eq 1 ]] && ! _overlay_restore_installed_links; then
+      recovery_failed=1
+    fi
+    for ((index = ${#backed_relatives[@]} - 1; index >= 0; index--)); do
+      file=${backed_relatives[index]}
+      if [[ ! -e $root/$file && ! -L $root/$file ]]; then
+        _dot_move_noreplace "$backup/$file" "$root/$file" || recovery_failed=1
+      else
+        recovery_failed=1
+      fi
+    done
+    if [[ -n $backup ]]; then
+      for file in "${backed_relatives[@]+"${backed_relatives[@]}"}"; do
+        [[ $file == */* ]] || continue
+        parent=$backup/${file%/*}
+        while [[ $parent == "$backup/"* ]]; do
+          rmdir "$parent" 2>/dev/null || break
+          parent=${parent%/*}
+        done
+      done
+      rmdir "$backup" 2>/dev/null || true
+    fi
+    if [[ $recovery_failed -eq 1 ]]; then
+      _warn "  warning: conflict recovery incomplete; preserved backup at ${backup:-see quarantine warning above}"
+    fi
     return 1
   fi
 
-  _warn "  backed up $count conflicting untracked files to $backup"
-  REPLY="$backup"
+  if [[ "$backed_up" -eq 0 && "$adopted" -eq 0 ]]; then
+    return 1
+  fi
+
+  if [[ "$backed_up" -gt 0 ]]; then
+    _warn "  backed up $backed_up conflicting untracked files to $backup"
+  fi
+  if [[ "$adopted" -eq 1 ]]; then
+    _warn '  adopted 1 managed overlay path for the base repository'
+  elif [[ "$adopted" -gt 1 ]]; then
+    _warn "  adopted $adopted managed overlay paths for the base repository"
+  fi
+  REPLY="${backup:-}"
   return 0
 }
 
@@ -124,12 +248,64 @@ _repo_head() {
   "$@" rev-parse --verify HEAD 2>/dev/null || true
 }
 
+# An upstream already contained by the checked-out generation cannot expose a
+# new tree. Keep the equality check builtin-fast for the common case; the
+# ancestry probe serves intentional local-ahead branches used during staged
+# rollouts and ordinary unpublished work.
+_repo_head_contains_upstream() {
+  local head=$1 upstream=$2
+  shift 2
+  [[ -n $head && -n $upstream ]] || return 1
+  [[ $head == "$upstream" ]] ||
+    "$@" merge-base --is-ancestor "$upstream" "$head" 2>/dev/null
+}
+
+_repo_head_is() {
+  local expected=$1
+  shift
+  [[ -n $expected && $(_repo_head "$@") == "$expected" ]]
+}
+
 _repo_candidate_adapter_allowed() {
   local ref=$1 path=$2 mode=$3
   shift 3
   [[ $path == .local/bin/dot && $mode == 100755 ]] || return 1
   "$@" show "$ref:$path" 2>/dev/null |
     _dot_stdin_matches_file "$DOT_SOURCE_ROOT/support/client-launcher.sh"
+}
+
+# Apply the candidate-tree policy to one Git leaf. REPLY is empty for overlay
+# metadata outside home/ and otherwise contains the path as it would appear
+# beneath HOME. Keeping this policy in one helper ensures full upstream trees
+# and local-ahead deltas cannot drift apart.
+_repo_validate_candidate_entry() {
+  local kind=$1 ref=$2 mode=$3 type=$4 oid=$5 path=$6 reserved_roots=$7
+  local relative
+  shift 7
+  REPLY=
+  [[ $type == blob && $mode =~ ^(100644|100755|120000)$ &&
+    $oid =~ ^[0-9a-fA-F]{40,64}$ ]] || return 1
+  _dot_init_safe_relative_path "$path" || return 1
+  if [[ $kind == overlay ]]; then
+    case $path in
+      home/*) relative=${path#home/} ;;
+      home) return 1 ;;
+      *) return 0 ;;
+    esac
+  else
+    relative=$path
+  fi
+  if [[ $kind == overlay ]] && _dot_overlay_control_path_reserved "$relative"; then
+    _warn "  warning: overlay candidate owns reserved control-plane path: $relative"
+    return 1
+  fi
+  if _dot_candidate_path_is_reserved_from_roots \
+    "$HOME/$relative" "$reserved_roots" &&
+    ! _repo_candidate_adapter_allowed "$ref" "$path" "$mode" "$@"; then
+    _warn "  warning: candidate repository owns reserved path: $relative"
+    return 1
+  fi
+  REPLY=$relative
 }
 
 # Validate a fetched candidate before any checkout, rebase, or overlay link can
@@ -156,34 +332,13 @@ _repo_validate_candidate_tree() {
     header=${entry%%$'\t'*}
     path=${entry#*$'\t'}
     read -r mode type oid <<<"$header"
-    [[ $type == blob && $mode =~ ^(100644|100755|120000)$ &&
-      $oid =~ ^[0-9a-fA-F]{40,64}$ ]] || {
-      valid=0
-      break
-    }
-    _dot_init_safe_relative_path "$path" || {
-      valid=0
-      break
-    }
-    if [[ $kind == overlay ]]; then
-      case $path in
-        home/*) relative=${path#home/} ;;
-        home)
-          valid=0
-          break
-          ;;
-        *) continue ;;
-      esac
-    else
-      relative=$path
-    fi
-    if _dot_candidate_path_is_reserved_from_roots \
-      "$HOME/$relative" "$reserved_roots" &&
-      ! _repo_candidate_adapter_allowed "$ref" "$path" "$mode" "$@"; then
-      _warn "  warning: candidate repository owns reserved path: $relative"
+    if ! _repo_validate_candidate_entry \
+      "$kind" "$ref" "$mode" "$type" "$oid" "$path" "$reserved_roots" "$@"; then
       valid=0
       break
     fi
+    relative=$REPLY
+    [[ -n $relative ]] || continue
     count=$((count + 1))
     [[ $count -le 100000 ]] || {
       valid=0
@@ -200,6 +355,74 @@ _repo_validate_candidate_tree() {
   fi
   _dot_cleanup_remove_path "$raw" || return 1
   [[ $valid -eq 1 ]]
+}
+
+# A local checkout may intentionally be ahead of its fetched upstream during a
+# staged rollout. Validate only the local delta instead of rescanning the full
+# accepted tree; this preserves the fast path without trusting unpublished
+# commits to bypass reserved-path policy.
+_repo_validate_ahead_delta() {
+  local kind=$1 upstream=$2 head=$3 header path old_mode mode old_oid oid status extra
+  local raw valid=1 relative count=0 reserved_roots reserved_roots_after
+  shift 3
+
+  _dot_reserved_roots_snapshot || return 1
+  reserved_roots=$REPLY
+  _dot_cleanup_mktemp || return 1
+  raw=$REPLY
+  if ! "$@" diff-tree -r --no-commit-id --raw -z --no-renames \
+    --diff-filter=ACMT "$upstream" "$head" >"$raw"; then
+    _dot_cleanup_remove_path "$raw" || true
+    return 1
+  fi
+  while IFS= read -r -d '' header; do
+    if ! IFS= read -r -d '' path || [[ $header != :* ]]; then
+      valid=0
+      break
+    fi
+    read -r old_mode mode old_oid oid status extra <<<"${header#:}"
+    if [[ -n $extra || ! $old_mode =~ ^[0-7]{6}$ ||
+      ! $old_oid =~ ^[0-9a-fA-F]{40,64}$ || $status != [ACMT] ]]; then
+      valid=0
+      break
+    fi
+    if ! _repo_validate_candidate_entry \
+      "$kind" "$head" "$mode" blob "$oid" "$path" "$reserved_roots" "$@"; then
+      valid=0
+      break
+    fi
+    relative=$REPLY
+    [[ -n $relative ]] || continue
+    count=$((count + 1))
+    [[ $count -le 100000 ]] || {
+      valid=0
+      break
+    }
+  done <"$raw"
+  if [[ $valid -eq 1 ]]; then
+    if ! _dot_reserved_roots_snapshot; then
+      valid=0
+    else
+      reserved_roots_after=$REPLY
+      [[ $reserved_roots_after == "$reserved_roots" ]] || valid=0
+    fi
+  fi
+  _dot_cleanup_remove_path "$raw" || return 1
+  [[ $valid -eq 1 ]]
+}
+
+# Return 0 when the live generation can safely be treated as current, 1 when
+# the fetched upstream is not contained and needs the ordinary pull path, and
+# 2 when a contained generation is invalid or changed during inspection.
+_repo_accept_current_generation() {
+  local kind=$1 head=$2 upstream=$3
+  shift 3
+  [[ -n $head && -n $upstream ]] || return 2
+  if [[ $head != "$upstream" ]]; then
+    _repo_head_contains_upstream "$head" "$upstream" "$@" || return 1
+    _repo_validate_ahead_delta "$kind" "$upstream" "$head" "$@" || return 2
+  fi
+  _repo_head_is "$head" "$@" || return 2
 }
 
 _repo_prepare_base_upstream() {
@@ -487,7 +710,7 @@ _pull_base() {
     REPLY_STATUS="skipped"
     return 0
   fi
-  local head_before head_after parent_snapshot
+  local head_before head_after parent_snapshot current_rc=0
   local pull_rc=0
   local upstream
   _repo_prepare_base_upstream || {
@@ -496,13 +719,22 @@ _pull_base() {
   }
   upstream=$REPLY
   head_before=$(_repo_head _base_git)
-  # The active commit is already an accepted generation. When fetch resolves
-  # the upstream to those exact bytes, no candidate can become visible and the
-  # validation, parent snapshot, and rebase path has no work to protect.
-  if [[ -n $head_before && $head_before == "$upstream" ]]; then
-    REPLY_STATUS=current
-    return 0
-  fi
+  # An exact upstream match needs no tree scan. Intentional local-ahead
+  # generations validate only their unpublished delta before taking the same
+  # fast path. Both decisions are bound to a final HEAD read.
+  _repo_accept_current_generation \
+    base "$head_before" "$upstream" _base_git || current_rc=$?
+  case $current_rc in
+    0)
+      REPLY_STATUS=current
+      return 0
+      ;;
+    1) ;;
+    *)
+      REPLY_STATUS=failed
+      return 1
+      ;;
+  esac
   _repo_validate_candidate_tree base "$upstream" _base_git || {
     REPLY_STATUS=failed
     return 1
@@ -513,6 +745,11 @@ _pull_base() {
     return 1
   }
   parent_snapshot=$REPLY
+  if ! _repo_head_is "$head_before" _base_git; then
+    _dot_cleanup_remove_path "$parent_snapshot" || true
+    REPLY_STATUS=failed
+    return 1
+  fi
   _pull_repo "$HOME" _base_git rebase --autostash "$upstream" "$@" || pull_rc=$?
   if [[ "$pull_rc" -eq 0 ]]; then
     head_after=$(_repo_head _base_git)
@@ -797,7 +1034,7 @@ _pull_overlay() {
     REPLY_STATUS="skipped"
     return 0
   fi
-  local upstream head_before head_after parent_snapshot
+  local upstream head_before head_after parent_snapshot current_rc=0
   local prepare_rc=0
   _repo_prepare_overlay_upstream "$path" "$optional" || prepare_rc=$?
   if [[ $prepare_rc -ne 0 ]]; then
@@ -812,12 +1049,22 @@ _pull_overlay() {
   fi
   upstream=$REPLY
   head_before=$(_repo_head git -C "$path")
-  # Match the base fast path: an identical immutable commit is already the
-  # accepted overlay generation, so no new tree can reach the client worktree.
-  if [[ -n $head_before && $head_before == "$upstream" ]]; then
-    REPLY_STATUS=current
-    return 0
-  fi
+  # Match the base fast path, including local-delta policy and a final HEAD
+  # generation check before accepting the checkout as current.
+  _repo_accept_current_generation \
+    overlay "$head_before" "$upstream" git -C "$path" || current_rc=$?
+  case $current_rc in
+    0)
+      REPLY_STATUS=current
+      return 0
+      ;;
+    1) ;;
+    *)
+      _warn "  warning: $name overlay local generation failed validation or changed during synchronization"
+      REPLY_STATUS=failed
+      return 0
+      ;;
+  esac
   if ! _repo_validate_candidate_tree overlay "$upstream" git -C "$path"; then
     [[ "$optional" == true ]] && return 0
     _warn "  warning: $name overlay candidate failed reserved-path validation"
@@ -830,6 +1077,12 @@ _pull_overlay() {
     return 0
   }
   parent_snapshot=$REPLY
+  if ! _repo_head_is "$head_before" git -C "$path"; then
+    _dot_cleanup_remove_path "$parent_snapshot" || true
+    _warn "  warning: $name overlay changed during synchronization"
+    REPLY_STATUS=failed
+    return 0
+  fi
 
   if [[ "$optional" == "true" ]]; then
     local quiet_before quiet_was_set=0
@@ -1165,6 +1418,27 @@ _repo_pull_all() {
       [[ -n "$_changed_item" ]] || continue
       _repo_changed_items+=("$_changed_item")
     done <<<"$DOT_PULL_OVERLAY_CHANGED_ITEMS"
+  fi
+  if [[ ${DOT_PULL_DEFER_FINISH:-0} == 1 ]]; then
+    # shellcheck disable=SC2034 # Consumed dynamically by update orchestration.
+    DOT_REPO_STAGE_DEFERRED_ACTIVE=1
+    # shellcheck disable=SC2034 # Consumed dynamically by update orchestration.
+    DOT_REPO_AGG_CURRENT=$_repo_current
+    # shellcheck disable=SC2034 # Consumed dynamically by update orchestration.
+    DOT_REPO_AGG_CHANGED=$_repo_changed
+    # shellcheck disable=SC2034 # Consumed dynamically by update orchestration.
+    DOT_REPO_AGG_FAILED=$_repo_failed
+    # shellcheck disable=SC2034 # Consumed dynamically by update orchestration.
+    DOT_REPO_AGG_SKIPPED=$_repo_skipped
+    DOT_REPO_AGG_CHANGED_ITEMS=''
+    local _deferred_item
+    for _deferred_item in "${_repo_changed_items[@]+"${_repo_changed_items[@]}"}"; do
+      DOT_REPO_AGG_CHANGED_ITEMS+="$_deferred_item"$'\n'
+    done
+    DOT_REPO_PROGRESS_DONE=1
+    DOT_REPO_PROGRESS_TOTAL=1
+    [[ "$_repo_status" != "failed" ]]
+    return
   fi
   unset DOT_REPO_PROGRESS_DONE DOT_REPO_PROGRESS_TOTAL
 

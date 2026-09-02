@@ -8,6 +8,10 @@ set -euo pipefail
 . "$DOT_TEST_ROOT/lib/dot/public/xdg.sh"
 # shellcheck disable=SC1091 # Repository root comes from the test helper.
 . "$DOT_TEST_ROOT/lib/dot/config.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/platform.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/profiles.sh"
 
 [[ -f "$DOT_TEST_ROOT/examples/minimal-dotfiles/home/.bashrc" ]] ||
   fail 'minimal example is missing its one-file payload'
@@ -25,5 +29,143 @@ assert_eq none "$DOT_DEPENDENCY_PROVIDER" 'extension example provider'
 bash -n \
   "$DOT_TEST_ROOT/examples/extension-dotfiles/home/.local/lib/dotfiles/merge-hooks.d/10-example.sh" \
   "$DOT_TEST_ROOT/examples/extension-dotfiles/home/.local/lib/dotfiles/doctor.d/10-example.sh"
+
+profile_example=$DOT_TEST_ROOT/examples/profile-dotfiles
+for path in \
+  README.md \
+  root/.config/dot/profiles.d/base.conf \
+  root/.config/dot/profiles.d/editor.conf \
+  root/.config/dot/profiles.d/dev.conf \
+  root/.config/dot/overlays.d/20-nvim.conf \
+  root/.config/dot/overlays.d/30-dev.conf \
+  root/.config/dot/overlays.d/80-personal.conf \
+  root/.config/dot/overlays.d/90-work.conf \
+  root/.config/dot/profile-selectors.d/00-default.conf \
+  root/.config/dot/profile-selectors.d/example-user.conf \
+  local/user-only.conf \
+  local/host-only.conf \
+  local/combined.conf \
+  local/two-users-user-1.conf \
+  local/two-users-user-2.conf \
+  local/conflict-a.conf \
+  local/conflict-b.conf \
+  local/no-match.conf \
+  personal/dot/profile-selectors.d/dev.conf; do
+  [[ -f $profile_example/$path ]] || fail "profile example is missing $path"
+done
+
+example_bin=$DOT_TEST_TMP/example-bin
+example_local=$DOT_TEST_TMP/example-local
+mkdir -m 700 "$example_bin" "$example_local"
+cat >"$example_bin/id" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' example-user
+SH
+cat >"$example_bin/hostname" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' Example-Host.
+SH
+chmod +x "$example_bin/id" "$example_bin/hostname"
+cp "$profile_example/local/combined.conf" "$example_local/combined.conf"
+chmod 0600 "$example_local/combined.conf"
+PATH=$example_bin:$PATH
+_dot_profiles_load "$profile_example/root/.config/dot/profiles.d"
+_dot_profile_resolve \
+  "$DOT_TEST_TMP/no-root-selectors" \
+  "$example_local" \
+  "$DOT_TEST_TMP/no-personal-selectors"
+assert_eq dev "$SELECTED_PROFILE" 'profile example combined selector'
+assert_eq 'base editor dev' "${INCLUDED_PROFILES[*]}" \
+  'profile example additive inheritance'
+assert_eq 'personal nvim dev work' "${SELECTED_OVERLAY_NAMES[*]}" \
+  'profile example overlay aggregation'
+
+_dot_profile_resolve \
+  "$profile_example/root/.config/dot/profile-selectors.d" \
+  "$example_local" \
+  "$DOT_TEST_TMP/no-personal-selectors"
+assert_eq dev "$SELECTED_PROFILE" \
+  'profile example host exception overrides user-wide editor default'
+assert_eq 3 "${#DOT_PROFILE_SELECTOR_MATCHES[@]}" \
+  'profile example records broad and specific matches'
+
+# Exercise the checked-in profile, descriptor, and personal-selector tree
+# through the real lifecycle resolver. Inspection sees the optional personal
+# overlay as unavailable without transport; convergence activates it and then
+# loads its repository-only selector source.
+example_lifecycle_home=$DOT_TEST_TMP/example-lifecycle-home
+mkdir -p "$example_lifecycle_home/.config"
+cp -R "$profile_example/root/.config/dot" \
+  "$example_lifecycle_home/.config/dot"
+cat >"$example_bin/hostname" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' another-example-host
+SH
+chmod +x "$example_bin/hostname"
+HOME=$example_lifecycle_home
+# shellcheck disable=SC2034 # Read dynamically by dot_xdg_path.
+XDG_CONFIG_HOME=$HOME/.config
+# shellcheck disable=SC1091 # Real lifecycle modules under test.
+. "$DOT_TEST_ROOT/lib/dot/log.sh"
+# shellcheck disable=SC1091 # Real lifecycle modules under test.
+. "$DOT_TEST_ROOT/lib/dot/temp.sh"
+# shellcheck disable=SC1091 # Real lifecycle modules under test.
+. "$DOT_TEST_ROOT/lib/dot/platform.sh"
+# shellcheck disable=SC1091 # Real lifecycle modules under test.
+. "$DOT_TEST_ROOT/lib/dot/overlays.sh"
+# shellcheck disable=SC1091 # Real repository identity helpers under test.
+. "$DOT_TEST_ROOT/lib/dot/repos/config.sh"
+# shellcheck disable=SC1091 # Real overlay checkout helpers under test.
+. "$DOT_TEST_ROOT/lib/dot/repos/overlays.sh"
+# shellcheck disable=SC1091 # Real convergence helper under test.
+. "$DOT_TEST_ROOT/lib/dot/update.sh"
+_dot_resolve_overlays inspect
+assert_eq editor "$SELECTED_PROFILE" \
+  'checked-in root selector selects editor before optional activation'
+assert_contains 'personal|selected-optional-unavailable|' \
+  "${DOT_OVERLAY_LIFECYCLE[*]}" \
+  'checked-in optional descriptor begins unavailable'
+example_lifecycle_events=$DOT_TEST_TMP/example-lifecycle-events
+: >"$example_lifecycle_events"
+_run_pre_sync_extensions() { :; }
+_pull_overlays() {
+  local record name path url
+  for record in "${OVERLAYS[@]+"${OVERLAYS[@]}"}"; do
+    IFS='|' read -r name path url _ <<<"$record"
+    if [[ ! -d $path/.git ]]; then
+      git init -q "$path"
+      git -C "$path" remote add origin "$url"
+    fi
+    if [[ $name == personal ]]; then
+      mkdir -p "$path/dot"
+      cp -R "$profile_example/personal/dot/profile-selectors.d" \
+        "$path/dot/profile-selectors.d"
+    fi
+    printf '%s\n' "$name" >>"$example_lifecycle_events"
+  done
+  # shellcheck disable=SC2034 # Read dynamically by convergence orchestration.
+  DOT_PULL_OVERLAY_FAILED=0
+}
+_dot_converge_overlays
+assert_eq editor "$SELECTED_PROFILE" \
+  'unmatched checked-in personal selector preserves root selection'
+assert_contains personal "${ACTIVE_OVERLAY_NAMES[*]}" \
+  'converge activates the checked-in optional personal descriptor'
+assert_contains nvim "${ACTIVE_OVERLAY_NAMES[*]}" \
+  'converge activates the checked-in final editor descriptor'
+assert_eq $'personal\nnvim' "$(<"$example_lifecycle_events")" \
+  'checked-in example converges phase-one then final additions'
+assert_contains 'profile-selectors.local.d' \
+  "$(<"$DOT_TEST_ROOT/docs/configuration.md")" \
+  'configuration docs describe machine-local selectors'
+assert_contains 'selected' "$(<"$DOT_TEST_ROOT/docs/overlays.md")" \
+  'overlay docs describe selected lifecycle state'
+assert_contains 'eligible' "$(<"$DOT_TEST_ROOT/docs/overlays.md")" \
+  'overlay docs describe eligible lifecycle state'
+assert_contains 'active' "$(<"$DOT_TEST_ROOT/docs/overlays.md")" \
+  'overlay docs describe active lifecycle state'
+assert_contains 'inspect validated existing state only' \
+  "$(<"$DOT_TEST_ROOT/docs/overlays.md")" \
+  'overlay docs describe offline inspection'
 
 printf 'examples-test: ok\n'

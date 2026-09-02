@@ -392,6 +392,75 @@ assert_contains 'dot checkout exists' "$linked_engine_output" \
   fail 'doctor rejected linked-worktree engine checkout'
 git -C "$root" worktree remove --force "$linked_engine"
 
+# Profile and overlay lifecycle reporting uses structured inspect-mode state.
+profile_home=$DOT_TEST_TMP/profile-doctor-home
+profile_state=$DOT_TEST_TMP/profile-doctor-state
+profile_bin=$DOT_TEST_TMP/profile-doctor-bin
+mkdir -p "$profile_home/.config/dot/profiles.d" \
+  "$profile_home/.config/dot/overlays.d" \
+  "$profile_home/.config/dot/profile-selectors.local.d" "$profile_bin"
+chmod 0700 "$profile_home/.config/dot/profile-selectors.local.d"
+printf 'version=1\noverlays=personal\n' \
+  >"$profile_home/.config/dot/profiles.d/base.conf"
+printf 'version=1\nprofiles=base\noverlays=nvim\n' \
+  >"$profile_home/.config/dot/profiles.d/editor.conf"
+printf 'version=1\nprofiles=editor\noverlays=dev\n' \
+  >"$profile_home/.config/dot/profiles.d/dev.conf"
+printf 'url=https://example.invalid/personal.git\noptional=true\n' \
+  >"$profile_home/.config/dot/overlays.d/80-personal.conf"
+printf 'url=https://example.invalid/nvim.git\n' \
+  >"$profile_home/.config/dot/overlays.d/20-nvim.conf"
+printf 'malformed but unselected\n' \
+  >"$profile_home/.config/dot/overlays.d/30-dev.conf"
+printf 'version=1\nuser=example-user\nprofile=editor\n' \
+  >"$profile_home/.config/dot/profile-selectors.local.d/editor.conf"
+chmod 0600 "$profile_home/.config/dot/profile-selectors.local.d/editor.conf"
+cat >"$profile_bin/id" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' example-user
+SH
+cat >"$profile_bin/hostname" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' Example-Host.
+SH
+chmod +x "$profile_bin/id" "$profile_bin/hostname"
+set +e
+profile_doctor=$(PATH="$profile_bin:$PATH" HOME=$profile_home \
+  XDG_STATE_HOME=$profile_state "$root/bin/dot" doctor 2>&1)
+profile_doctor_status=$?
+set -e
+assert_eq 1 "$profile_doctor_status" \
+  'missing selected required overlay makes doctor unhealthy'
+assert_contains 'selected profile' "$profile_doctor" 'doctor reports selected profile'
+assert_contains 'editor' "$profile_doctor" 'doctor renders selected editor profile'
+assert_contains 'example-user@example-host' "$profile_doctor" \
+  'doctor reports normalized identity'
+assert_contains 'machine-local' "$profile_doctor" \
+  'doctor reports selector source class'
+assert_contains 'dev: not selected' "$profile_doctor" \
+  'doctor does not parse an unselected malformed descriptor'
+assert_contains 'personal: selected optional but unavailable' "$profile_doctor" \
+  'doctor reports optional unavailability'
+assert_contains 'nvim: selected but unavailable' "$profile_doctor" \
+  'doctor reports required unavailability'
+
+# Invalid profile container types must remain visible as configuration
+# failures. They are not the same as an absent profiles.d legacy client.
+rm -rf "$profile_home/.config/dot/profiles.d"
+mkdir "$profile_home/.config/dot/profiles-real"
+ln -s profiles-real "$profile_home/.config/dot/profiles.d"
+set +e
+invalid_profile_doctor=$(PATH="$profile_bin:$PATH" HOME=$profile_home \
+  XDG_STATE_HOME=$profile_state "$root/bin/dot" doctor 2>&1)
+invalid_profile_doctor_status=$?
+set -e
+assert_eq 1 "$invalid_profile_doctor_status" \
+  'doctor rejects a symlinked profiles.d container'
+assert_contains 'profile configuration invalid' "$invalid_profile_doctor" \
+  'doctor reports the invalid profile container'
+[[ $invalid_profile_doctor != *'profile selection disabled'* ]] ||
+  fail 'doctor misreported an invalid profile container as legacy mode'
+
 # Doctor workers always receive closed stdin, so they must use an owned process
 # group even when the caller has a controlling terminal. Force the portable
 # no-process-discovery backend and prove parent-only TERM still reaps a

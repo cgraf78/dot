@@ -6,18 +6,27 @@ if ! declare -F _dot_extension_file_validate >/dev/null 2>&1; then
   . "${BASH_SOURCE[0]%/*}/extension-trust.sh"
 fi
 
-dot_hook_source() {
-  local _dot_hook_source_relative=${1:-} _dot_hook_source_path
+dot_hook_file() {
+  local relative=${1:-} path
 
   [[ $# -eq 1 ]] || return 2
-  case $_dot_hook_source_relative in
+  case $relative in
     '' | /* | . | .. | ./* | ../* | */./* | */../* | */. | */.. | */ | *//* | *$'\n'* | *$'\r'*)
       return 2
       ;;
   esac
-  _dot_hook_source_path=$DOT_EXTENSIONS_DIR/$_dot_hook_source_relative
+  path=$DOT_EXTENSIONS_DIR/$relative
+  _dot_extension_file_validate "$path" || return 1
+  REPLY=$path
+}
+
+dot_hook_source() {
+  local _dot_hook_source_relative=${1:-} _dot_hook_source_path
+
+  [[ $# -eq 1 ]] || return 2
+  dot_hook_file "$_dot_hook_source_relative" || return 1
+  _dot_hook_source_path=$REPLY
   readonly _dot_hook_source_relative _dot_hook_source_path
-  _dot_extension_file_validate "$_dot_hook_source_path" || return 1
   # Support code shares the worker's global scope, but it must observe the same
   # empty positional-parameter baseline as the entry hook. Top-level `local`
   # remains inappropriate in sourced support modules because the loader itself
@@ -78,6 +87,21 @@ dot_write_text_if_changed() {
 dot_commit_tmp() {
   [[ $# -eq 2 ]] || return 2
   _merge_hook_commit_tmp "$1" "$2"
+}
+
+dot_file_generation() {
+  [[ $# -eq 1 ]] || return 2
+  _dot_file_generation "$1"
+}
+
+dot_commit_tmp_if_generation() {
+  [[ $# -eq 3 ]] || return 2
+  _dot_commit_tmp_if_generation "$1" "$2" "$3"
+}
+
+dot_remove_if_generation() {
+  [[ $# -eq 2 ]] || return 2
+  _dot_remove_if_generation "$1" "$2"
 }
 
 dot_json_available() {

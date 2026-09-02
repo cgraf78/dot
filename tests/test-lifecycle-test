@@ -22,6 +22,8 @@ run_tests() {
 }
 
 timeout_command=$root/lib/dot/public/test-timeout-v1
+timeout_python=$(command -v python3)
+[[ ! -x /usr/bin/python3 ]] || timeout_python=/usr/bin/python3
 set +e
 "$timeout_command" >/dev/null 2>&1
 missing_timeout_status=$?
@@ -93,7 +95,7 @@ DOT_TEST_TIMEOUT_EXPIRED_FILE=$timeout_expired \
   '[[ -z ${DOT_TEST_TIMEOUT_EXPIRED_FILE+x} ]]'
 
 set +e
-"$timeout_command" 1 "$timeout_fixture/missing" \
+"$timeout_python" "$timeout_command" 1 "$timeout_fixture/missing" \
   2>"$timeout_fixture/exec-error"
 missing_command_status=$?
 set -e
@@ -104,7 +106,7 @@ assert_eq '' "$(<"$timeout_fixture/exec-error")" \
 : >"$timeout_fixture/non-executable"
 chmod 0644 "$timeout_fixture/non-executable"
 set +e
-"$timeout_command" 1 "$timeout_fixture/non-executable" \
+"$timeout_python" "$timeout_command" 1 "$timeout_fixture/non-executable" \
   2>"$timeout_fixture/exec-error"
 non_executable_status=$?
 set -e

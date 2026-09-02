@@ -19,8 +19,12 @@ _DOT_RUNTIME_DIR=${BASH_SOURCE[0]%/*}
 . "$_DOT_RUNTIME_DIR/temp.sh"
 # shellcheck source=platform.sh
 . "$_DOT_RUNTIME_DIR/platform.sh"
+# shellcheck source=profiles.sh
+. "$_DOT_RUNTIME_DIR/profiles.sh"
 # shellcheck source=overlays.sh
 . "$_DOT_RUNTIME_DIR/overlays.sh"
+# shellcheck source=overlay-context.sh
+. "$_DOT_RUNTIME_DIR/overlay-context.sh"
 # shellcheck source=merge-block.sh
 . "$_DOT_RUNTIME_DIR/merge-block.sh"
 # shellcheck source=families.sh
@@ -41,6 +45,8 @@ fi
 . "$_DOT_RUNTIME_DIR/repos/model.sh"
 # shellcheck source=repos/api.sh
 . "$_DOT_RUNTIME_DIR/repos/api.sh"
+# shellcheck source=profile-lifecycle.sh
+. "$_DOT_RUNTIME_DIR/profile-lifecycle.sh"
 # shellcheck source=merges.sh
 . "$_DOT_RUNTIME_DIR/merges.sh"
 # shellcheck source=pre-sync.sh

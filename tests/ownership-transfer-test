@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+# Verify that tracked content can move between the base and overlays without
+# leaving stale links, losing rollback authority, or backing up managed links
+# as though they were user-owned conflicts.
+
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+# shellcheck source=lib/repo.sh
+. "$root/tests/lib/repo.sh"
+
+# Some minimal distribution images do not install `hostname`. Keep profile
+# resolution deterministic without making this ownership suite depend on an
+# unrelated base package.
+fixture_bin=$DOT_TEST_TMP/bin
+mkdir -p "$fixture_bin"
+# shellcheck disable=SC2016 # The generated helper expands its own argument.
+printf '%s\n' \
+  '#!/bin/sh' \
+  'case ${1:-} in ""|-s) printf "%s\\n" ownership.invalid ;; *) exit 2 ;; esac' \
+  >"$fixture_bin/hostname"
+chmod +x "$fixture_bin/hostname"
+PATH=$fixture_bin:$PATH
+export PATH
+
+commit_seed() {
+  local name=$1 message=$2 branch=${3:-main}
+  local seed=$DOT_TEST_TMP/$name-seed origin=$DOT_TEST_TMP/$name.git
+
+  git -C "$seed" add -A
+  git -C "$seed" -c core.hooksPath=/dev/null commit -qm "$message"
+  git -C "$seed" push -q "$origin" "HEAD:$branch"
+}
+
+assert_link_owner() {
+  local home=$1 relative=$2 owner=$3 label=$4 target
+  [[ -L $home/$relative ]] || fail "$label: destination is not a symlink"
+  target=$(readlink "$home/$relative") || fail "$label: cannot read symlink"
+  assert_contains ".dotfiles-$owner/home/$relative" "$target" "$label"
+}
+
+assert_no_pull_backup() {
+  local home=$1 label=$2 candidate
+  for candidate in "$home"/.dot-backup/pull/*; do
+    [[ ! -e $candidate && ! -L $candidate ]] ||
+      fail "$label: unexpected pull backup: $candidate"
+  done
+}
+
+printf '%s\n' '=== base to overlay ==='
+fixture_repo base-to-overlay-target main README.md $'target\n' 100644
+base_to_overlay_target_origin=$REPLY
+fixture_repo base-to-overlay-base main \
+  .config/dot/overlays.d/20-target.conf \
+  "url=file://$base_to_overlay_target_origin" 100644 \
+  .config/base-to-overlay/value $'base\n' 100644
+base_to_overlay_origin=$REPLY
+fixture_home base-to-overlay
+base_to_overlay_home=$REPLY
+base_to_overlay_state=$DOT_TEST_TMP/base-to-overlay-state
+run_dot "$base_to_overlay_home" "$base_to_overlay_state" init --yes \
+  "file://$base_to_overlay_origin" >/dev/null
+[[ -f $base_to_overlay_home/.config/base-to-overlay/value &&
+  ! -L $base_to_overlay_home/.config/base-to-overlay/value ]] ||
+  fail 'base-to-overlay fixture did not start with a base-owned file'
+
+fixture_push base-to-overlay-target main \
+  home/.config/base-to-overlay/value $'overlay\n' 100644
+rm "$DOT_TEST_TMP/base-to-overlay-base-seed/.config/base-to-overlay/value"
+commit_seed base-to-overlay-base extract
+run_dot "$base_to_overlay_home" "$base_to_overlay_state" update -f >/dev/null
+assert_link_owner "$base_to_overlay_home" .config/base-to-overlay/value target \
+  'base-to-overlay transfer publishes the target link'
+assert_eq overlay "$(<"$base_to_overlay_home/.config/base-to-overlay/value")" \
+  'base-to-overlay transfer publishes target content'
+assert_no_pull_backup "$base_to_overlay_home" \
+  'base-to-overlay transfer avoids conflict backups'
+
+printf '%s\n' '=== overlay to base ==='
+fixture_repo overlay-to-base-source main \
+  home/.config/overlay-to-base/value $'overlay\n' 100644
+overlay_to_base_source_origin=$REPLY
+fixture_repo overlay-to-base-base main \
+  .config/dot/overlays.d/20-source.conf \
+  "url=file://$overlay_to_base_source_origin" 100644 \
+  README.md $'base\n' 100644
+overlay_to_base_origin=$REPLY
+fixture_home overlay-to-base
+overlay_to_base_home=$REPLY
+overlay_to_base_state=$DOT_TEST_TMP/overlay-to-base-state
+run_dot "$overlay_to_base_home" "$overlay_to_base_state" init --yes \
+  "file://$overlay_to_base_origin" >/dev/null
+assert_link_owner "$overlay_to_base_home" .config/overlay-to-base/value source \
+  'overlay-to-base fixture starts with the source link'
+
+overlay_to_base_seed=$DOT_TEST_TMP/overlay-to-base-base-seed
+rm "$overlay_to_base_seed/.config/dot/overlays.d/20-source.conf"
+mkdir -p "$overlay_to_base_seed/.config/overlay-to-base"
+printf 'base\n' >"$overlay_to_base_seed/.config/overlay-to-base/value"
+commit_seed overlay-to-base-base adopt
+overlay_to_base_log=$DOT_TEST_TMP/overlay-to-base.log
+run_dot "$overlay_to_base_home" "$overlay_to_base_state" update -f \
+  >"$overlay_to_base_log" 2>&1
+[[ -f $overlay_to_base_home/.config/overlay-to-base/value &&
+  ! -L $overlay_to_base_home/.config/overlay-to-base/value ]] ||
+  fail 'overlay-to-base transfer did not publish the base-owned file'
+assert_eq base "$(<"$overlay_to_base_home/.config/overlay-to-base/value")" \
+  'overlay-to-base transfer publishes base content'
+[[ -d $overlay_to_base_home/.dotfiles-source/.git ]] ||
+  fail 'overlay-to-base transfer removed the cached source checkout'
+assert_no_pull_backup "$overlay_to_base_home" \
+  'overlay-to-base transfer avoids managed-link backups'
+assert_contains 'adopted 1 managed overlay path for the base repository' \
+  "$(<"$overlay_to_base_log")" \
+  'overlay-to-base transfer reports base adoption'
+
+fixture_push overlay-to-base-source main \
+  home/.config/overlay-to-base/value $'overlay-returned\n' 100644
+rm "$overlay_to_base_seed/.config/overlay-to-base/value"
+mkdir -p "$overlay_to_base_seed/.config/dot/overlays.d"
+printf 'url=file://%s\n' "$overlay_to_base_source_origin" \
+  >"$overlay_to_base_seed/.config/dot/overlays.d/20-source.conf"
+commit_seed overlay-to-base-base return-to-overlay
+run_dot "$overlay_to_base_home" "$overlay_to_base_state" update -f >/dev/null
+assert_link_owner "$overlay_to_base_home" .config/overlay-to-base/value source \
+  'reverse transfer reuses the retained source checkout'
+assert_eq overlay-returned \
+  "$(<"$overlay_to_base_home/.config/overlay-to-base/value")" \
+  'reverse transfer publishes the updated overlay content'
+assert_no_pull_backup "$overlay_to_base_home" \
+  'reverse transfer avoids conflict backups'
+
+printf '%s\n' '=== user replacement at a formerly managed path ==='
+fixture_repo replaced-managed-source main \
+  home/.config/replaced-managed/value $'overlay\n' 100644
+replaced_managed_source_origin=$REPLY
+fixture_repo replaced-managed-base main \
+  .config/dot/overlays.d/20-source.conf \
+  "url=file://$replaced_managed_source_origin" 100644 \
+  README.md $'base\n' 100644
+replaced_managed_origin=$REPLY
+fixture_home replaced-managed
+replaced_managed_home=$REPLY
+replaced_managed_state=$DOT_TEST_TMP/replaced-managed-state
+run_dot "$replaced_managed_home" "$replaced_managed_state" init --yes \
+  "file://$replaced_managed_origin" >/dev/null
+rm "$replaced_managed_home/.config/replaced-managed/value"
+printf 'user replacement\n' \
+  >"$replaced_managed_home/.config/replaced-managed/value"
+
+replaced_managed_seed=$DOT_TEST_TMP/replaced-managed-base-seed
+rm "$replaced_managed_seed/.config/dot/overlays.d/20-source.conf"
+mkdir -p "$replaced_managed_seed/.config/replaced-managed"
+printf 'base\n' >"$replaced_managed_seed/.config/replaced-managed/value"
+commit_seed replaced-managed-base adopt-replaced-path
+replaced_managed_log=$DOT_TEST_TMP/replaced-managed.log
+run_dot "$replaced_managed_home" "$replaced_managed_state" update -f \
+  >"$replaced_managed_log" 2>&1
+assert_eq base \
+  "$(<"$replaced_managed_home/.config/replaced-managed/value")" \
+  'user-replaced path converges to base content'
+replaced_managed_backup=''
+for candidate in "$replaced_managed_home"/.dot-backup/pull/*; do
+  [[ -d $candidate ]] || continue
+  if [[ -f $candidate/.config/replaced-managed/value ]]; then
+    replaced_managed_backup=$candidate/.config/replaced-managed/value
+  fi
+done
+[[ -n $replaced_managed_backup ]] ||
+  fail 'user replacement was not preserved in a pull backup'
+assert_eq 'user replacement' "$(<"$replaced_managed_backup")" \
+  'pull backup preserves replacement bytes'
+[[ $(<"$replaced_managed_log") != *'adopted 1 managed overlay path'* ]] ||
+  fail 'user replacement was incorrectly classified as managed adoption'
+
+printf '%s\n' '=== mixed managed and user-owned base conflicts ==='
+fixture_repo mixed-conflict-source main \
+  home/.config/mixed-conflict/managed $'overlay\n' 100644
+mixed_conflict_source_origin=$REPLY
+fixture_repo mixed-conflict-base main \
+  .config/dot/overlays.d/20-source.conf \
+  "url=file://$mixed_conflict_source_origin" 100644 \
+  README.md $'base\n' 100644
+mixed_conflict_origin=$REPLY
+fixture_home mixed-conflict
+mixed_conflict_home=$REPLY
+mixed_conflict_state=$DOT_TEST_TMP/mixed-conflict-state
+run_dot "$mixed_conflict_home" "$mixed_conflict_state" init --yes \
+  "file://$mixed_conflict_origin" >/dev/null
+mkdir -p "$mixed_conflict_home/.config/mixed-conflict"
+printf 'user\n' >"$mixed_conflict_home/.config/mixed-conflict/user"
+
+mixed_conflict_seed=$DOT_TEST_TMP/mixed-conflict-base-seed
+rm "$mixed_conflict_seed/.config/dot/overlays.d/20-source.conf"
+mkdir -p "$mixed_conflict_seed/.config/mixed-conflict"
+printf 'base-managed\n' >"$mixed_conflict_seed/.config/mixed-conflict/managed"
+printf 'base-user\n' >"$mixed_conflict_seed/.config/mixed-conflict/user"
+commit_seed mixed-conflict-base adopt-with-user-conflict
+mixed_conflict_log=$DOT_TEST_TMP/mixed-conflict.log
+run_dot "$mixed_conflict_home" "$mixed_conflict_state" update -f \
+  >"$mixed_conflict_log" 2>&1
+assert_eq base-managed \
+  "$(<"$mixed_conflict_home/.config/mixed-conflict/managed")" \
+  'managed conflict converges to base content'
+assert_eq base-user \
+  "$(<"$mixed_conflict_home/.config/mixed-conflict/user")" \
+  'user conflict converges to base content'
+mixed_conflict_backup_count=0
+mixed_conflict_user_backup=''
+for candidate in "$mixed_conflict_home"/.dot-backup/pull/*; do
+  [[ -d $candidate ]] || continue
+  mixed_conflict_backup_count=$((mixed_conflict_backup_count + 1))
+  mixed_conflict_user_backup=$candidate/.config/mixed-conflict/user
+  [[ ! -e $candidate/.config/mixed-conflict/managed &&
+    ! -L $candidate/.config/mixed-conflict/managed ]] ||
+    fail 'managed overlay link leaked into the user-conflict backup'
+done
+assert_eq 1 "$mixed_conflict_backup_count" \
+  'mixed conflicts create one backup generation'
+assert_eq user "$(<"$mixed_conflict_user_backup")" \
+  'mixed conflicts preserve user-owned content in the backup'
+assert_contains 'backed up 1 conflicting untracked files' \
+  "$(<"$mixed_conflict_log")" \
+  'mixed conflicts report only the user-owned backup'
+assert_contains 'adopted 1 managed overlay path for the base repository' \
+  "$(<"$mixed_conflict_log")" \
+  'mixed conflicts report managed adoption separately'
+
+printf '%s\n' '=== overlay to base rollback and retry ==='
+fixture_repo overlay-rollback-source main \
+  home/.config/overlay-rollback/value $'overlay\n' 100644
+overlay_rollback_source_origin=$REPLY
+fixture_repo overlay-rollback-common main \
+  home/.config/overlay-rollback-common/value $'common\n' 100644
+overlay_rollback_common_origin=$REPLY
+fixture_repo overlay-rollback-base main \
+  .config/dot/overlays.d/20-source.conf \
+  "url=file://$overlay_rollback_source_origin" 100644 \
+  README.md $'base\n' 100644
+overlay_rollback_origin=$REPLY
+fixture_home overlay-rollback
+overlay_rollback_home=$REPLY
+overlay_rollback_state=$DOT_TEST_TMP/overlay-rollback-state
+run_dot "$overlay_rollback_home" "$overlay_rollback_state" init --yes \
+  "file://$overlay_rollback_origin" >/dev/null
+overlay_rollback_target=$(readlink \
+  "$overlay_rollback_home/.config/overlay-rollback/value")
+
+overlay_rollback_seed=$DOT_TEST_TMP/overlay-rollback-base-seed
+rm "$overlay_rollback_seed/.config/dot/overlays.d/20-source.conf"
+mkdir -p "$overlay_rollback_seed/.config/overlay-rollback" \
+  "$overlay_rollback_seed/.config/dot/overlays.d" \
+  "$overlay_rollback_seed/.config/dot/profiles.d" \
+  "$overlay_rollback_seed/.config/dot/profile-selectors.d"
+printf 'base\n' >"$overlay_rollback_seed/.config/overlay-rollback/value"
+printf 'version=1\ndefault_profile=base\n' \
+  >"$overlay_rollback_seed/.config/dot/config"
+printf 'url=file://%s\n' "$overlay_rollback_common_origin" \
+  >"$overlay_rollback_seed/.config/dot/overlays.d/10-common.conf"
+printf 'version=1\noverlays=common\n' \
+  >"$overlay_rollback_seed/.config/dot/profiles.d/base.conf"
+printf 'version=1\nprofiles=base\n' \
+  >"$overlay_rollback_seed/.config/dot/profiles.d/editor.conf"
+printf 'version=1\nprofile=base\n' \
+  >"$overlay_rollback_seed/.config/dot/profile-selectors.d/10-base.conf"
+printf 'version=1\nprofile=editor\n' \
+  >"$overlay_rollback_seed/.config/dot/profile-selectors.d/20-editor.conf"
+commit_seed overlay-rollback-base broken-adoption
+
+overlay_rollback_log=$DOT_TEST_TMP/overlay-rollback.log
+overlay_rollback_status=0
+run_dot "$overlay_rollback_home" "$overlay_rollback_state" update -f \
+  >"$overlay_rollback_log" 2>&1 || overlay_rollback_status=$?
+assert_eq 1 "$overlay_rollback_status" \
+  'failed overlay-to-base transfer reports failure'
+assert_contains 'adopted 1 managed overlay path for the base repository' \
+  "$(<"$overlay_rollback_log")" \
+  'failed transfer reached managed-link adoption before rollback'
+[[ -L $overlay_rollback_home/.config/overlay-rollback/value ]] ||
+  fail 'failed overlay-to-base transfer did not restore the source link'
+assert_eq "$overlay_rollback_target" \
+  "$(readlink "$overlay_rollback_home/.config/overlay-rollback/value")" \
+  'failed overlay-to-base transfer restores the exact source target'
+assert_eq overlay "$(<"$overlay_rollback_home/.config/overlay-rollback/value")" \
+  'failed overlay-to-base transfer restores source content'
+assert_no_pull_backup "$overlay_rollback_home" \
+  'failed overlay-to-base transfer avoids managed-link backups'
+
+rm "$overlay_rollback_seed/.config/dot/profile-selectors.d/20-editor.conf"
+commit_seed overlay-rollback-base repair-adoption
+run_dot "$overlay_rollback_home" "$overlay_rollback_state" update -f >/dev/null
+[[ -f $overlay_rollback_home/.config/overlay-rollback/value &&
+  ! -L $overlay_rollback_home/.config/overlay-rollback/value ]] ||
+  fail 'repaired overlay-to-base transfer did not publish the base file'
+assert_eq base "$(<"$overlay_rollback_home/.config/overlay-rollback/value")" \
+  'repaired overlay-to-base transfer converges'
+assert_no_pull_backup "$overlay_rollback_home" \
+  'repaired overlay-to-base transfer avoids managed-link backups'
+
+printf '%s\n' '=== two-release overlay to base failure fallback ==='
+fixture_repo base-fallback-source main \
+  home/.config/base-fallback/value $'source\n' 100644
+base_fallback_source_origin=$REPLY
+fixture_repo base-fallback-blocker main \
+  home/.config/base-fallback-blocker/value $'blocker\n' 100644
+base_fallback_blocker_origin=$REPLY
+fixture_repo base-fallback-base main \
+  .config/dot/overlays.d/20-source.conf \
+  "url=file://$base_fallback_source_origin" 100644 \
+  .config/dot/overlays.d/30-blocker.conf \
+  "url=file://$base_fallback_blocker_origin" 100644
+base_fallback_origin=$REPLY
+fixture_home base-fallback
+base_fallback_home=$REPLY
+base_fallback_state=$DOT_TEST_TMP/base-fallback-state
+run_dot "$base_fallback_home" "$base_fallback_state" init --yes \
+  "file://$base_fallback_origin" >/dev/null
+
+base_fallback_seed=$DOT_TEST_TMP/base-fallback-base-seed
+mkdir -p "$base_fallback_seed/.config/base-fallback"
+printf 'base destination\n' >"$base_fallback_seed/.config/base-fallback/value"
+commit_seed base-fallback-base publish-destination
+run_dot "$base_fallback_home" "$base_fallback_state" update -f >/dev/null
+assert_link_owner "$base_fallback_home" .config/base-fallback/value source \
+  'source overlay keeps precedence during base handoff overlap'
+
+rm "$DOT_TEST_TMP/base-fallback-source-seed/home/.config/base-fallback/value"
+commit_seed base-fallback-source retire-source
+mv "$base_fallback_blocker_origin" "$base_fallback_blocker_origin.offline"
+base_fallback_status=0
+run_dot "$base_fallback_home" "$base_fallback_state" update -f \
+  >/dev/null 2>&1 || base_fallback_status=$?
+assert_eq 1 "$base_fallback_status" \
+  'unavailable required overlay fails the second handoff release'
+[[ -f $base_fallback_home/.config/base-fallback/value &&
+  ! -L $base_fallback_home/.config/base-fallback/value ]] ||
+  fail 'failed handoff did not retain the available base destination'
+assert_eq 'base destination' \
+  "$(<"$base_fallback_home/.config/base-fallback/value")" \
+  'failed handoff keeps base destination content available'
+mv "$base_fallback_blocker_origin.offline" "$base_fallback_blocker_origin"
+run_dot "$base_fallback_home" "$base_fallback_state" update -f >/dev/null
+assert_eq 'base destination' \
+  "$(<"$base_fallback_home/.config/base-fallback/value")" \
+  'base handoff retry converges'
+
+printf '%s\n' '=== two-release overlay to overlay failure fallback ==='
+fixture_repo overlay-fallback-target main \
+  home/.config/overlay-fallback/target $'target-existing\n' 100644
+overlay_fallback_target_origin=$REPLY
+fixture_repo overlay-fallback-source main \
+  home/.config/overlay-fallback/value $'source\n' 100644
+overlay_fallback_source_origin=$REPLY
+fixture_repo overlay-fallback-blocker main \
+  home/.config/overlay-fallback-blocker/value $'blocker\n' 100644
+overlay_fallback_blocker_origin=$REPLY
+fixture_repo overlay-fallback-base main \
+  .config/dot/overlays.d/20-target.conf \
+  "url=file://$overlay_fallback_target_origin" 100644 \
+  .config/dot/overlays.d/30-source.conf \
+  "url=file://$overlay_fallback_source_origin" 100644 \
+  .config/dot/overlays.d/40-blocker.conf \
+  "url=file://$overlay_fallback_blocker_origin" 100644
+overlay_fallback_origin=$REPLY
+fixture_home overlay-fallback
+overlay_fallback_home=$REPLY
+overlay_fallback_state=$DOT_TEST_TMP/overlay-fallback-state
+run_dot "$overlay_fallback_home" "$overlay_fallback_state" init --yes \
+  "file://$overlay_fallback_origin" >/dev/null
+
+fixture_push overlay-fallback-target main \
+  home/.config/overlay-fallback/value $'target\n' 100644
+run_dot "$overlay_fallback_home" "$overlay_fallback_state" update -f >/dev/null
+assert_link_owner "$overlay_fallback_home" .config/overlay-fallback/value source \
+  'source overlay keeps precedence during overlay handoff overlap'
+
+rm "$DOT_TEST_TMP/overlay-fallback-source-seed/home/.config/overlay-fallback/value"
+commit_seed overlay-fallback-source retire-source
+mv "$overlay_fallback_blocker_origin" "$overlay_fallback_blocker_origin.offline"
+overlay_fallback_status=0
+run_dot "$overlay_fallback_home" "$overlay_fallback_state" update -f \
+  >/dev/null 2>&1 || overlay_fallback_status=$?
+assert_eq 1 "$overlay_fallback_status" \
+  'unavailable required overlay fails the overlay handoff release'
+assert_link_owner "$overlay_fallback_home" .config/overlay-fallback/value target \
+  'failed overlay handoff selects the available destination fallback'
+assert_eq target \
+  "$(<"$overlay_fallback_home/.config/overlay-fallback/value")" \
+  'failed overlay handoff keeps destination content available'
+mv "$overlay_fallback_blocker_origin.offline" "$overlay_fallback_blocker_origin"
+run_dot "$overlay_fallback_home" "$overlay_fallback_state" update -f >/dev/null
+assert_link_owner "$overlay_fallback_home" .config/overlay-fallback/value target \
+  'overlay handoff retry converges'
+
+printf '%s\n' '=== one-release fallback authority and cleanup ==='
+fixture_repo fallback-authority-target main \
+  home/.config/fallback-authority/target $'target-existing\n' 100644
+fallback_authority_target_origin=$REPLY
+fixture_repo fallback-authority-source main \
+  home/.config/fallback-authority/value $'source\n' 100644
+fallback_authority_source_origin=$REPLY
+fixture_repo fallback-authority-blocker main \
+  home/.config/fallback-authority-blocker/value $'blocker\n' 100644
+fallback_authority_blocker_origin=$REPLY
+fixture_repo fallback-authority-base main \
+  .config/dot/overlays.d/20-target.conf \
+  "url=file://$fallback_authority_target_origin" 100644 \
+  .config/dot/overlays.d/30-source.conf \
+  "url=file://$fallback_authority_source_origin" 100644 \
+  .config/dot/overlays.d/40-blocker.conf \
+  "url=file://$fallback_authority_blocker_origin" 100644
+fallback_authority_origin=$REPLY
+fixture_home fallback-authority
+fallback_authority_home=$REPLY
+fallback_authority_state=$DOT_TEST_TMP/fallback-authority-state
+run_dot "$fallback_authority_home" "$fallback_authority_state" init --yes \
+  "file://$fallback_authority_origin" >/dev/null
+
+fixture_push fallback-authority-target main \
+  home/.config/fallback-authority/value $'target\n' 100644
+rm "$DOT_TEST_TMP/fallback-authority-source-seed/home/.config/fallback-authority/value"
+commit_seed fallback-authority-source retire-source
+mv "$fallback_authority_blocker_origin" \
+  "$fallback_authority_blocker_origin.offline"
+fallback_authority_status=0
+run_dot "$fallback_authority_home" "$fallback_authority_state" update -f \
+  >/dev/null 2>&1 || fallback_authority_status=$?
+assert_eq 1 "$fallback_authority_status" \
+  'one-release partial handoff reports repository failure'
+assert_link_owner "$fallback_authority_home" \
+  .config/fallback-authority/value target \
+  'one-release partial handoff publishes the available fallback'
+
+fallback_authority_seed=$DOT_TEST_TMP/fallback-authority-base-seed
+rm "$fallback_authority_seed/.config/dot/overlays.d/20-target.conf" \
+  "$fallback_authority_seed/.config/dot/overlays.d/40-blocker.conf"
+commit_seed fallback-authority-base deselect-fallback
+run_dot "$fallback_authority_home" "$fallback_authority_state" update -f \
+  >/dev/null
+[[ ! -e $fallback_authority_home/.config/fallback-authority/value &&
+  ! -L $fallback_authority_home/.config/fallback-authority/value ]] ||
+  fail 'successful retry did not remove the deselected fallback link'
+[[ -d $fallback_authority_home/.dotfiles-target/.git ]] ||
+  fail 'fallback cleanup removed the cached target checkout'
+
+printf '%s\n' '=== overlay extraction across profiles ==='
+fixture_repo profile-common main home/.config/profile-common/value $'common\n' 100644
+profile_common_origin=$REPLY
+fixture_repo profile-source main \
+  home/.config/profile-transfer/retained $'source-retained\n' 100644 \
+  home/.config/profile-transfer/value $'source\n' 100644
+profile_source_origin=$REPLY
+fixture_repo profile-target main home/.config/profile-target/value $'target\n' 100644
+profile_target_origin=$REPLY
+fixture_repo profile-transfer-base main \
+  .config/dot/config $'version=1\ndefault_profile=editor\n' 100644 \
+  .config/dot/overlays.d/10-common.conf \
+  "url=file://$profile_common_origin" 100644 \
+  .config/dot/overlays.d/20-source.conf \
+  "url=file://$profile_source_origin" 100644 \
+  .config/dot/overlays.d/30-target.conf \
+  "url=file://$profile_target_origin" 100644 \
+  .config/dot/profiles.d/base.conf $'version=1\noverlays=common\n' 100644 \
+  .config/dot/profiles.d/editor.conf $'version=1\nprofiles=base\noverlays=source\n' 100644 \
+  .config/dot/profiles.d/dev.conf $'version=1\nprofiles=editor\noverlays=target\n' 100644
+profile_transfer_origin=$REPLY
+fixture_home profile-transfer-editor
+profile_editor_home=$REPLY
+fixture_home profile-transfer-dev
+profile_dev_home=$REPLY
+profile_editor_state=$DOT_TEST_TMP/profile-transfer-editor-state
+profile_dev_state=$DOT_TEST_TMP/profile-transfer-dev-state
+run_dot "$profile_editor_home" "$profile_editor_state" init --yes \
+  "file://$profile_transfer_origin" >/dev/null
+run_dot "$profile_dev_home" "$profile_dev_state" init --yes \
+  "file://$profile_transfer_origin" >/dev/null
+mkdir -p "$profile_dev_home/.config/dot/profile-selectors.local.d"
+chmod 0700 "$profile_dev_home/.config/dot/profile-selectors.local.d"
+printf 'version=1\nuser=%s\nprofile=dev\n' "$(id -un)" \
+  >"$profile_dev_home/.config/dot/profile-selectors.local.d/profile.conf"
+chmod 0600 "$profile_dev_home/.config/dot/profile-selectors.local.d/profile.conf"
+run_dot "$profile_dev_home" "$profile_dev_state" update >/dev/null
+[[ ! -e $profile_editor_home/.dotfiles-target &&
+  ! -L $profile_editor_home/.dotfiles-target ]] ||
+  fail 'editor cloned a dev-only target overlay'
+assert_link_owner "$profile_editor_home" .config/profile-transfer/value source \
+  'editor starts with the source overlay path'
+assert_link_owner "$profile_dev_home" .config/profile-transfer/value source \
+  'dev starts with the inherited source overlay path'
+assert_link_owner "$profile_editor_home" .config/profile-transfer/retained source \
+  'editor starts with the retained source path'
+assert_link_owner "$profile_dev_home" .config/profile-transfer/retained source \
+  'dev starts with the inherited retained source path'
+assert_link_owner "$profile_dev_home" .config/profile-target/value target \
+  'dev starts with the target overlay pre-existing path'
+
+rm "$DOT_TEST_TMP/profile-source-seed/home/.config/profile-transfer/value"
+commit_seed profile-source extract-to-target
+fixture_push profile-target main \
+  home/.config/profile-transfer/value $'target\n' 100644
+run_dot "$profile_editor_home" "$profile_editor_state" update >/dev/null
+run_dot "$profile_dev_home" "$profile_dev_state" update >/dev/null
+[[ ! -e $profile_editor_home/.config/profile-transfer/value &&
+  ! -L $profile_editor_home/.config/profile-transfer/value ]] ||
+  fail 'editor retained a path extracted into the dev-only target overlay'
+assert_link_owner "$profile_dev_home" .config/profile-transfer/value target \
+  'dev retargets an extracted path to the destination overlay'
+assert_eq target "$(<"$profile_dev_home/.config/profile-transfer/value")" \
+  'dev exposes the destination overlay content'
+assert_link_owner "$profile_editor_home" .config/profile-transfer/retained source \
+  'editor retains unrelated source-overlay ownership'
+assert_link_owner "$profile_dev_home" .config/profile-transfer/retained source \
+  'dev retains inherited source-overlay ownership'
+assert_link_owner "$profile_dev_home" .config/profile-target/value target \
+  'target overlay retains its pre-existing path'
+assert_no_pull_backup "$profile_editor_home" \
+  'editor overlay extraction avoids conflict backups'
+assert_no_pull_backup "$profile_dev_home" \
+  'dev overlay extraction avoids conflict backups'
+
+printf '%s\n' '=== merge one overlay into another ==='
+fixture_repo overlay-merge-source main \
+  home/.config/overlay-merge/one $'one-source\n' 100644 \
+  home/.config/overlay-merge/two $'two-source\n' 100644
+overlay_merge_source_origin=$REPLY
+fixture_repo overlay-merge-target main \
+  home/.config/overlay-merge/target $'target-original\n' 100644
+overlay_merge_target_origin=$REPLY
+fixture_repo overlay-merge-base main \
+  .config/dot/overlays.d/20-source.conf \
+  "url=file://$overlay_merge_source_origin" 100644 \
+  .config/dot/overlays.d/30-target.conf \
+  "url=file://$overlay_merge_target_origin" 100644
+overlay_merge_origin=$REPLY
+fixture_home overlay-merge
+overlay_merge_home=$REPLY
+overlay_merge_state=$DOT_TEST_TMP/overlay-merge-state
+run_dot "$overlay_merge_home" "$overlay_merge_state" init --yes \
+  "file://$overlay_merge_origin" >/dev/null
+assert_link_owner "$overlay_merge_home" .config/overlay-merge/one source \
+  'overlay merge starts with source ownership'
+
+fixture_push overlay-merge-target main \
+  home/.config/overlay-merge/one $'one-target\n' 100644
+fixture_push overlay-merge-target main \
+  home/.config/overlay-merge/two $'two-target\n' 100644
+rm "$DOT_TEST_TMP/overlay-merge-base-seed/.config/dot/overlays.d/20-source.conf"
+commit_seed overlay-merge-base retire-source
+run_dot "$overlay_merge_home" "$overlay_merge_state" update -f >/dev/null
+for relative in .config/overlay-merge/one .config/overlay-merge/two; do
+  assert_link_owner "$overlay_merge_home" "$relative" target \
+    'merged overlay path belongs to the destination checkout'
+done
+assert_eq one-target "$(<"$overlay_merge_home/.config/overlay-merge/one")" \
+  'merged overlay exposes destination content'
+assert_link_owner "$overlay_merge_home" .config/overlay-merge/target target \
+  'merged overlay retains its pre-existing path'
+[[ -d $overlay_merge_home/.dotfiles-source/.git ]] ||
+  fail 'overlay merge removed the cached source checkout'
+assert_no_pull_backup "$overlay_merge_home" \
+  'overlay merge avoids conflict backups'
+
+run_dot "$overlay_merge_home" "$overlay_merge_state" update -f >/dev/null
+for relative in .config/overlay-merge/one .config/overlay-merge/two; do
+  assert_link_owner "$overlay_merge_home" "$relative" target \
+    'no-op update preserves destination ownership'
+done
+
+printf 'ownership-transfer-test: ok\n'

@@ -9,27 +9,25 @@ dot_command_dispatch() {
     update)
       _dot_cleanup_install_owner_traps
       _dot_update_lock_acquire "$@" || return $?
-      _discover_overlays || return 1
-      _preflight_local_overlays || return 1
       _dot_update "$@"
       ;;
     pull)
       dot_command_dispatch update "$@"
       ;;
     fetch)
-      _discover_overlays || return 1
+      _dot_resolve_overlays fetch || return 1
       _repo_fetch_all "$@"
       ;;
     push)
-      _discover_overlays || return 1
+      _dot_resolve_overlays inspect || return 1
       _repo_push_all "$@"
       ;;
     status)
-      _discover_overlays || return 1
+      _dot_resolve_overlays inspect || return 1
       _repo_status_all "$@"
       ;;
     diff)
-      _discover_overlays || return 1
+      _dot_resolve_overlays inspect || return 1
       _repo_diff_all "$@"
       ;;
     cron)
@@ -37,12 +35,14 @@ dot_command_dispatch() {
       ;;
     doctor)
       _dot_cleanup_install_owner_traps
-      _discover_overlays || true
+      # shellcheck disable=SC2034 # Read dynamically by overlay discovery.
+      local DOT_OVERLAY_DISCOVERY_SILENT=1
+      _dot_resolve_overlays inspect || true
       _dot_doctor
       ;;
     test)
       _dot_cleanup_install_owner_traps
-      _discover_overlays || return 1
+      _dot_resolve_overlays inspect || return 1
       dot_test_command "$@" || rc=$?
       ;;
     init)

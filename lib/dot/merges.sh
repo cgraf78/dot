@@ -38,8 +38,7 @@ _merge_hook_specs() {
   local _key _identity _script _root
   local -A _seen=()
 
-  [[ "${DOT_EXTENSION_API:-}" == 1 && -n "${DOT_EXTENSIONS_DIR:-}" ]] ||
-    return 0
+  _dot_extensions_enabled || return 0
   if ! _dot_extension_root_validate; then
     printf 'dot: unsafe extension root: %s\n' "$DOT_EXTENSIONS_DIR" >&2
     return 1
@@ -152,6 +151,7 @@ _merge_result_prefix() {
 _run_merge_hook_capture() {
   local _idx="$1" _script="$2" _result_dir="$3"
   local _prefix _started_ms _elapsed_ms _merge_rc=0 _hook_pid _worker_tmp
+  local _context _token
   _dot_cleanup_prepare_subshell
   _prefix="$(_merge_result_prefix "$_result_dir" "$_idx")"
   _worker_tmp="$_result_dir/worker.$_idx"
@@ -172,21 +172,36 @@ _run_merge_hook_capture() {
     # anchor, which left orphan zombies on container runners with a passive PID
     # 1. Interactive capture workers still use the nested path below so a
     # parent-only signal can cancel work outside a private group.
-    _dot_extension_worker_run merge "$_script" "$_worker_tmp" \
-      "$_prefix.has_merge" >"$_prefix.log" 2>&1 || _merge_rc=$?
-  else
-    _dot_cleanup_begin_job_launch
-    _dot_extension_worker_exec merge "$_script" "$_worker_tmp" \
-      "$_prefix.has_merge" <&"$DOT_CLEANUP_LAUNCH_STDIN_FD" \
-      >"$_prefix.log" 2>&1 &
-    _hook_pid=$!
-    _dot_cleanup_finish_job_launch "$_hook_pid"
-    if wait "$_hook_pid"; then
-      _merge_rc=0
+    if _dot_overlay_context_create "$_worker_tmp" merge active none \
+      "${ACTIVE_OVERLAYS[@]+"${ACTIVE_OVERLAYS[@]}"}"; then
+      _context=$REPLY_PATH
+      _token=$REPLY_TOKEN
+      _dot_extension_worker_run merge "$_script" "$_worker_tmp" \
+        "$_prefix.has_merge" "$_context" "$_token" \
+        >"$_prefix.log" 2>&1 || _merge_rc=$?
     else
-      _merge_rc=$?
+      _merge_rc=1
     fi
-    _dot_cleanup_unregister_pid "$_hook_pid"
+  else
+    if _dot_overlay_context_create "$_worker_tmp" merge active none \
+      "${ACTIVE_OVERLAYS[@]+"${ACTIVE_OVERLAYS[@]}"}"; then
+      _context=$REPLY_PATH
+      _token=$REPLY_TOKEN
+      _dot_cleanup_begin_job_launch
+      _dot_extension_worker_exec merge "$_script" "$_worker_tmp" \
+        "$_prefix.has_merge" "$_context" "$_token" \
+        <&"$DOT_CLEANUP_LAUNCH_STDIN_FD" >"$_prefix.log" 2>&1 &
+      _hook_pid=$!
+      _dot_cleanup_finish_job_launch "$_hook_pid"
+      if wait "$_hook_pid"; then
+        _merge_rc=0
+      else
+        _merge_rc=$?
+      fi
+      _dot_cleanup_unregister_pid "$_hook_pid"
+    else
+      _merge_rc=1
+    fi
   fi
 
   _elapsed_ms=$(($(_ui_now_ms) - _started_ms))

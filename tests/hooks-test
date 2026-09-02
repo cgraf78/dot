@@ -110,8 +110,8 @@ assert_eq $'alpha\nbarrier\nbeta' "$(<"$home/hook.log")" \
 [[ ! -e $home/collided-channel ]] ||
   fail 'hook top-level variable redirected the engine result channel'
 
-# Pre-sync extensions are a strict serial gate before repository mutation.
-# A failure stops later preparation and leaves the base revision untouched.
+# The base updates before profile policy is reloaded. Pre-sync is then a strict
+# serial gate before any selected overlay transport or later convergence.
 rm -f "$extensions/pre-sync.d"/*.sh "$home/pre-sync.log"
 cat >"$extensions/pre-sync.d/10-failing.sh" <<'HOOK'
 prepare() {
@@ -132,8 +132,8 @@ set -e
 assert_eq 1 "$pre_sync_status" 'failed pre-sync extension aborts update'
 assert_eq failing "$(<"$home/pre-sync.log")" \
   'pre-sync failure stops later preparation extensions'
-assert_eq "$head_before" "$(git --git-dir="$home/.dotfiles" rev-parse HEAD)" \
-  'pre-sync failure occurs before repository mutation'
+[[ $head_before != "$(git --git-dir="$home/.dotfiles" rev-parse HEAD)" ]] ||
+  fail 'base did not update before pre-sync policy was reloaded'
 rm -f "$extensions/pre-sync.d"/*.sh
 rm -f "$extensions/merge-hooks.d"/*.sh
 rm -f "$home/pre-sync.log"

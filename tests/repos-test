@@ -40,6 +40,13 @@ unchanged_base_state=$DOT_TEST_TMP/unchanged-base-state
 unchanged_base_trace=$DOT_TEST_TMP/unchanged-base-trace.json
 run_dot "$unchanged_base_home" "$unchanged_base_state" init --yes \
   "file://$unchanged_base_origin" >/dev/null
+# The fetch-boundary fixture deliberately forces a real rebase below. Give its
+# synthetic client repository an identity instead of inheriting the operator's
+# global Git config, which CI intentionally isolates by setting HOME to the
+# checkout.
+git --git-dir="$unchanged_base_home/.dotfiles" config user.name fixture
+git --git-dir="$unchanged_base_home/.dotfiles" config user.email \
+  fixture@example.invalid
 GIT_TRACE2_EVENT=$unchanged_base_trace \
   run_dot "$unchanged_base_home" "$unchanged_base_state" update >/dev/null
 unchanged_base_fetch=$(grep -Fc '"name":"fetch"' "$unchanged_base_trace" || true)
@@ -62,6 +69,10 @@ unchanged_base_moved=$(printf 'out-of-band move\n' |
   git --git-dir="$unchanged_base_home/.dotfiles" \
     -c user.name=fixture -c user.email=fixture@example.invalid \
     commit-tree "$unchanged_base_tree" -p "$unchanged_base_head")
+# Advance the remote independently so the fetched generation and the
+# out-of-band local commit are siblings. A fresh ancestry check must reject
+# the fast path and follow ordinary validation/rebase.
+fixture_push unchanged-base main .remote $'remote\n' 100644
 unchanged_base_race_bin=$DOT_TEST_TMP/unchanged-base-race-bin
 unchanged_base_race_trace=$DOT_TEST_TMP/unchanged-base-race-trace.json
 unchanged_base_race_marker=$DOT_TEST_TMP/unchanged-base-race-marker
@@ -102,6 +113,205 @@ assert_eq 1 "$unchanged_base_race_ls_tree" \
 assert_eq 1 "$unchanged_base_race_rebase" \
   'base HEAD move during fetch follows the ordinary pull path'
 
+# The post-fetch HEAD read is still an external observation. Bind a fast-path
+# decision to the same generation immediately before returning so a direct Git
+# writer cannot move the checkout during the ancestry decision unnoticed.
+base_fast_path_head_race_status=0
+HOME=$DOT_TEST_TMP/base-fast-path-head-race-home DOT_SOURCE_ROOT=$root \
+  DOT_TEST_HEAD_MARKER=$DOT_TEST_TMP/base-fast-path-head-race-marker \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    DOT_QUIET=1
+    _repo_has_upstream() { return 0; }
+    _repo_prepare_base_upstream() { REPLY=upstream; }
+    _repo_head() {
+      if [[ ! -e $DOT_TEST_HEAD_MARKER ]]; then
+        printf "local\n"
+      else
+        printf "moved\n"
+      fi
+    }
+    _repo_head_contains_upstream() {
+      : >"$DOT_TEST_HEAD_MARKER"
+      return 0
+    }
+    _repo_validate_ahead_delta() { return 0; }
+
+    if _pull_base; then
+      exit 1
+    fi
+    [[ $REPLY_STATUS == failed ]]
+  ' || base_fast_path_head_race_status=$?
+assert_eq 0 "$base_fast_path_head_race_status" \
+  'base fast path fails closed when HEAD moves after capture'
+
+overlay_fast_path_head_race_status=0
+overlay_fast_path_head_race_home=$DOT_TEST_TMP/overlay-fast-path-head-race-home
+mkdir -p "$overlay_fast_path_head_race_home/checkout"
+HOME=$overlay_fast_path_head_race_home DOT_SOURCE_ROOT=$root \
+  DOT_TEST_HEAD_MARKER=$DOT_TEST_TMP/overlay-fast-path-head-race-marker \
+  DOT_TEST_OVERLAY_PATH=$overlay_fast_path_head_race_home/checkout \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    DOT_QUIET=1
+    DOT_UI_TOTAL=0
+    _warn() { :; }
+    _overlay_effective_url() { REPLY=$1; }
+    _overlay_is_worktree() { return 0; }
+    _overlay_origin_matches() { return 0; }
+    _repo_has_upstream() { return 0; }
+    _repo_prepare_overlay_upstream() { REPLY=upstream; }
+    _repo_head() {
+      if [[ ! -e $DOT_TEST_HEAD_MARKER ]]; then
+        printf "local\n"
+      else
+        printf "moved\n"
+      fi
+    }
+    _repo_head_contains_upstream() {
+      : >"$DOT_TEST_HEAD_MARKER"
+      return 0
+    }
+    _repo_validate_ahead_delta() { return 0; }
+
+    _pull_overlay example "$DOT_TEST_OVERLAY_PATH" file:///unused false
+    [[ $REPLY_STATUS == failed ]]
+  ' || overlay_fast_path_head_race_status=$?
+assert_eq 0 "$overlay_fast_path_head_race_status" \
+  'overlay fast path fails closed when HEAD moves after capture'
+
+# The non-fast path snapshots parent generations against head_before. Confirm
+# that same generation is still checked out immediately before pull mutates the
+# worktree; otherwise its normalization and rollback evidence is stale.
+base_pull_head_race_status=0
+HOME=$DOT_TEST_TMP/base-pull-head-race-home DOT_SOURCE_ROOT=$root \
+  DOT_TEST_HEAD_MARKER=$DOT_TEST_TMP/base-pull-head-race-marker \
+  DOT_TEST_PARENT_SNAPSHOT=$DOT_TEST_TMP/base-pull-head-race-parents \
+  DOT_TEST_PULL_MARKER=$DOT_TEST_TMP/base-pull-head-race-pulled \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    DOT_QUIET=1
+    _repo_has_upstream() { return 0; }
+    _repo_prepare_base_upstream() { REPLY=upstream; }
+    _repo_head() {
+      if [[ ! -e $DOT_TEST_HEAD_MARKER ]]; then
+        : >"$DOT_TEST_HEAD_MARKER"
+        printf "local\n"
+      else
+        printf "moved\n"
+      fi
+    }
+    _repo_head_contains_upstream() { return 1; }
+    _repo_validate_candidate_tree() { return 0; }
+    _repo_snapshot_updated_path_parents() {
+      : >"$DOT_TEST_PARENT_SNAPSHOT"
+      REPLY=$DOT_TEST_PARENT_SNAPSHOT
+    }
+    _pull_repo() {
+      : >"$DOT_TEST_PULL_MARKER"
+      return 0
+    }
+    _repo_normalize_updated_paths() { return 0; }
+    _dot_cleanup_remove_path() { rm -f -- "$1"; }
+
+    if _pull_base; then
+      exit 1
+    fi
+    [[ $REPLY_STATUS == failed ]]
+    [[ ! -e $DOT_TEST_PULL_MARKER ]]
+  ' || base_pull_head_race_status=$?
+assert_eq 0 "$base_pull_head_race_status" \
+  'base pull rejects a stale pre-mutation HEAD snapshot'
+
+overlay_pull_head_race_status=0
+overlay_pull_head_race_home=$DOT_TEST_TMP/overlay-pull-head-race-home
+mkdir -p "$overlay_pull_head_race_home/checkout"
+HOME=$overlay_pull_head_race_home DOT_SOURCE_ROOT=$root \
+  DOT_TEST_HEAD_MARKER=$DOT_TEST_TMP/overlay-pull-head-race-marker \
+  DOT_TEST_OVERLAY_PATH=$overlay_pull_head_race_home/checkout \
+  DOT_TEST_PARENT_SNAPSHOT=$DOT_TEST_TMP/overlay-pull-head-race-parents \
+  DOT_TEST_PULL_MARKER=$DOT_TEST_TMP/overlay-pull-head-race-pulled \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    DOT_QUIET=1
+    DOT_UI_TOTAL=0
+    _warn() { :; }
+    _overlay_effective_url() { REPLY=$1; }
+    _overlay_is_worktree() { return 0; }
+    _overlay_origin_matches() { return 0; }
+    _repo_has_upstream() { return 0; }
+    _repo_prepare_overlay_upstream() { REPLY=upstream; }
+    _repo_head() {
+      if [[ ! -e $DOT_TEST_HEAD_MARKER ]]; then
+        : >"$DOT_TEST_HEAD_MARKER"
+        printf "local\n"
+      else
+        printf "moved\n"
+      fi
+    }
+    _repo_head_contains_upstream() { return 1; }
+    _repo_validate_candidate_tree() { return 0; }
+    _repo_snapshot_updated_path_parents() {
+      : >"$DOT_TEST_PARENT_SNAPSHOT"
+      REPLY=$DOT_TEST_PARENT_SNAPSHOT
+    }
+    _pull_repo() {
+      : >"$DOT_TEST_PULL_MARKER"
+      return 0
+    }
+    _repo_normalize_updated_paths() { return 0; }
+    _dot_cleanup_remove_path() { rm -f -- "$1"; }
+
+    _pull_overlay example "$DOT_TEST_OVERLAY_PATH" file:///unused false
+    [[ $REPLY_STATUS == failed ]]
+    [[ ! -e $DOT_TEST_PULL_MARKER ]]
+  ' || overlay_pull_head_race_status=$?
+assert_eq 0 "$overlay_pull_head_race_status" \
+  'overlay pull rejects a stale pre-mutation HEAD snapshot'
+
+# update.sh is sourceable, so one process can run more than one synchronization
+# cycle. A later no-base failure must never inherit rollback authority captured
+# by an earlier successful call.
+rollback_generation_reset_status=0
+HOME=$DOT_TEST_TMP/rollback-generation-reset-home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/update.sh"
+    base_present=1
+    config_loads=0
+    restored=-1
+    _base_repo_exists() { [[ $base_present -eq 1 ]]; }
+    _overlay_snapshot_installed_links() {
+      DOT_OVERLAY_ROLLBACK_PATHS=(old)
+      DOT_OVERLAY_ROLLBACK_TARGETS=(old-target)
+    }
+    _repo_pull_all() { return 0; }
+    _ensure_repo_config() { :; }
+    dot_config_load() {
+      config_loads=$((config_loads + 1))
+      [[ $config_loads -eq 1 ]]
+    }
+    _dot_converge_overlays() { return 0; }
+    _dot_profile_lifecycle_prepare() { return 0; }
+    _dot_update_repo_stage_finish() { :; }
+    _overlay_restore_installed_links() {
+      restored=${#DOT_OVERLAY_ROLLBACK_PATHS[@]}
+    }
+
+    _dot_update_sync_repos
+    base_present=0
+    if _dot_update_sync_repos; then
+      exit 1
+    fi
+    [[ $restored -eq 0 ]]
+  ' || rollback_generation_reset_status=$?
+assert_eq 0 "$rollback_generation_reset_status" \
+  'each sourced repository sync starts with empty rollback authority'
+
 # Exercise the same fast path through a real overlay checkout. The base test
 # above isolates its own branch; with both repositories current, no candidate
 # tree or rebase command should be needed for either synchronization unit.
@@ -131,6 +341,179 @@ assert_eq 0 "$unchanged_overlay_ls_tree" \
   'unchanged overlay skips candidate-tree validation after fetch'
 assert_eq 0 "$unchanged_overlay_rebase" \
   'unchanged overlay skips an empty rebase after fetch'
+
+# A local branch may intentionally contain reviewed commits ahead of its
+# configured upstream, as during a staged rollout. The fetched upstream is
+# already part of that accepted generation, so validation and an empty rebase
+# would add work without exposing any new tree.
+fixture_repo ahead-base main .testrc $'base\n' 100644
+ahead_base_origin=$REPLY
+fixture_home ahead-base
+ahead_base_home=$REPLY
+ahead_base_state=$DOT_TEST_TMP/ahead-base-state
+ahead_base_trace=$DOT_TEST_TMP/ahead-base-trace.json
+run_dot "$ahead_base_home" "$ahead_base_state" init --yes \
+  "file://$ahead_base_origin" >/dev/null
+printf 'local\n' >"$ahead_base_home/.local-ahead"
+git --git-dir="$ahead_base_home/.dotfiles" --work-tree="$ahead_base_home" \
+  add .local-ahead
+git --git-dir="$ahead_base_home/.dotfiles" --work-tree="$ahead_base_home" \
+  -c user.name=fixture -c user.email=fixture@example.invalid \
+  -c core.hooksPath=/dev/null commit -qm local-ahead
+GIT_TRACE2_EVENT=$ahead_base_trace \
+  run_dot "$ahead_base_home" "$ahead_base_state" update >/dev/null
+ahead_base_fetch=$(grep -Fc '"name":"fetch"' "$ahead_base_trace" || true)
+ahead_base_ls_tree=$(grep -Fc '"name":"ls-tree"' "$ahead_base_trace" || true)
+ahead_base_diff_tree=$(grep -Fc '"name":"diff-tree"' "$ahead_base_trace" || true)
+ahead_base_rebase=$(grep -Fc '"name":"rebase"' "$ahead_base_trace" || true)
+assert_eq 1 "$ahead_base_fetch" \
+  'ahead base still fetches before taking the ancestor fast path'
+assert_eq 0 "$ahead_base_ls_tree" \
+  'ahead base skips full-tree validation for an upstream already in its history'
+assert_eq 1 "$ahead_base_diff_tree" \
+  'ahead base validates only its unpublished local delta'
+assert_eq 0 "$ahead_base_rebase" \
+  'ahead base skips an empty rebase onto its ancestor'
+
+fixture_repo ahead-overlay-base main .testrc $'base\n' 100644
+ahead_overlay_base_origin=$REPLY
+fixture_repo ahead-overlay main home/.config/overlay/value $'overlay\n' 100644
+ahead_overlay_origin=$REPLY
+fixture_home ahead-overlay
+ahead_overlay_home=$REPLY
+ahead_overlay_state=$DOT_TEST_TMP/ahead-overlay-state
+ahead_overlay_trace=$DOT_TEST_TMP/ahead-overlay-trace.json
+run_dot "$ahead_overlay_home" "$ahead_overlay_state" init --yes \
+  "file://$ahead_overlay_base_origin" >/dev/null
+mkdir -p "$ahead_overlay_home/.config/dot/overlays.d"
+printf 'url=file://%s\n' "$ahead_overlay_origin" \
+  >"$ahead_overlay_home/.config/dot/overlays.d/10-ahead-overlay.conf"
+run_dot "$ahead_overlay_home" "$ahead_overlay_state" update >/dev/null
+printf 'local\n' >"$ahead_overlay_home/.dotfiles-ahead-overlay/local-ahead"
+git -C "$ahead_overlay_home/.dotfiles-ahead-overlay" add local-ahead
+git -C "$ahead_overlay_home/.dotfiles-ahead-overlay" \
+  -c user.name=fixture -c user.email=fixture@example.invalid \
+  -c core.hooksPath=/dev/null commit -qm local-ahead
+: >"$ahead_overlay_trace"
+GIT_TRACE2_EVENT=$ahead_overlay_trace \
+  run_dot "$ahead_overlay_home" "$ahead_overlay_state" update >/dev/null
+ahead_overlay_fetch=$(grep -Fc '"name":"fetch"' "$ahead_overlay_trace" || true)
+ahead_overlay_ls_tree=$(grep -Fc '"name":"ls-tree"' "$ahead_overlay_trace" || true)
+ahead_overlay_diff_tree=$(grep -Fc '"name":"diff-tree"' "$ahead_overlay_trace" || true)
+ahead_overlay_rebase=$(grep -Fc '"name":"rebase"' "$ahead_overlay_trace" || true)
+assert_eq 2 "$ahead_overlay_fetch" \
+  'ahead overlay and base still fetch before their fast paths'
+assert_eq 0 "$ahead_overlay_ls_tree" \
+  'ahead overlay skips full-tree validation for an upstream already in its history'
+assert_eq 1 "$ahead_overlay_diff_tree" \
+  'ahead overlay validates only its unpublished local delta'
+assert_eq 0 "$ahead_overlay_rebase" \
+  'ahead overlay skips an empty rebase onto its ancestor'
+
+# The ancestor fast path trusts the fetched upstream, not arbitrary local
+# commits layered on top. Validate that local delta before accepting an ahead
+# checkout so reserved base paths and overlay control-plane paths cannot bypass
+# the normal candidate policy.
+fixture_repo ahead-unsafe-base main .testrc $'base\n' 100644
+ahead_unsafe_base_origin=$REPLY
+fixture_home ahead-unsafe-base
+ahead_unsafe_base_home=$REPLY
+ahead_unsafe_base_state=$DOT_TEST_TMP/ahead-unsafe-base-state
+run_dot "$ahead_unsafe_base_home" "$ahead_unsafe_base_state" init --yes \
+  "file://$ahead_unsafe_base_origin" >/dev/null
+mkdir -p "$ahead_unsafe_base_home/.dotfiles-foreign"
+printf 'unsafe\n' >"$ahead_unsafe_base_home/.dotfiles-foreign/value"
+git --git-dir="$ahead_unsafe_base_home/.dotfiles" \
+  --work-tree="$ahead_unsafe_base_home" add .dotfiles-foreign/value
+git --git-dir="$ahead_unsafe_base_home/.dotfiles" \
+  --work-tree="$ahead_unsafe_base_home" \
+  -c user.name=fixture -c user.email=fixture@example.invalid \
+  -c core.hooksPath=/dev/null commit -qm local-reserved-path
+ahead_unsafe_base_status=0
+run_dot "$ahead_unsafe_base_home" "$ahead_unsafe_base_state" update \
+  >/dev/null 2>&1 || ahead_unsafe_base_status=$?
+assert_eq 1 "$ahead_unsafe_base_status" \
+  'ahead base rejects a local commit that owns a reserved path'
+
+fixture_repo ahead-unsafe-overlay-base main .testrc $'base\n' 100644
+ahead_unsafe_overlay_base_origin=$REPLY
+fixture_repo ahead-unsafe-overlay main home/.config/overlay/value $'overlay\n' 100644
+ahead_unsafe_overlay_origin=$REPLY
+fixture_home ahead-unsafe-overlay
+ahead_unsafe_overlay_home=$REPLY
+ahead_unsafe_overlay_state=$DOT_TEST_TMP/ahead-unsafe-overlay-state
+run_dot "$ahead_unsafe_overlay_home" "$ahead_unsafe_overlay_state" init --yes \
+  "file://$ahead_unsafe_overlay_base_origin" >/dev/null
+mkdir -p "$ahead_unsafe_overlay_home/.config/dot/overlays.d"
+printf 'url=file://%s\n' "$ahead_unsafe_overlay_origin" \
+  >"$ahead_unsafe_overlay_home/.config/dot/overlays.d/10-ahead-unsafe.conf"
+run_dot "$ahead_unsafe_overlay_home" "$ahead_unsafe_overlay_state" update >/dev/null
+mkdir -p \
+  "$ahead_unsafe_overlay_home/.dotfiles-ahead-unsafe/home/.config/dot/profiles.d"
+: >"$ahead_unsafe_overlay_home/.dotfiles-ahead-unsafe/home/.config/dot/profiles.d/evil.conf"
+git -C "$ahead_unsafe_overlay_home/.dotfiles-ahead-unsafe" \
+  add home/.config/dot/profiles.d/evil.conf
+git -C "$ahead_unsafe_overlay_home/.dotfiles-ahead-unsafe" \
+  -c user.name=fixture -c user.email=fixture@example.invalid \
+  -c core.hooksPath=/dev/null commit -qm local-control-path
+ahead_unsafe_overlay_status=0
+run_dot "$ahead_unsafe_overlay_home" "$ahead_unsafe_overlay_state" update \
+  >/dev/null 2>&1 || ahead_unsafe_overlay_status=$?
+assert_eq 1 "$ahead_unsafe_overlay_status" \
+  'ahead overlay rejects a local commit that owns profile control state'
+[[ ! -e $ahead_unsafe_overlay_home/.config/dot/profiles.d/evil.conf &&
+  ! -L $ahead_unsafe_overlay_home/.config/dot/profiles.d/evil.conf ]] ||
+  fail 'ahead overlay linked an unvalidated local control-plane path'
+
+# Link-time policy must cover source inventory that Git candidate validation
+# cannot see, including untracked files in an otherwise-current checkout.
+fixture_repo untracked-control-base main .testrc $'base\n' 100644
+untracked_control_base_origin=$REPLY
+fixture_repo untracked-control main home/.config/overlay/value $'overlay\n' 100644
+untracked_control_origin=$REPLY
+fixture_home untracked-control
+untracked_control_home=$REPLY
+untracked_control_state=$DOT_TEST_TMP/untracked-control-state
+run_dot "$untracked_control_home" "$untracked_control_state" init --yes \
+  "file://$untracked_control_base_origin" >/dev/null
+mkdir -p "$untracked_control_home/.config/dot/overlays.d"
+printf 'url=file://%s\n' "$untracked_control_origin" \
+  >"$untracked_control_home/.config/dot/overlays.d/10-untracked-control.conf"
+run_dot "$untracked_control_home" "$untracked_control_state" update >/dev/null
+mkdir -p \
+  "$untracked_control_home/.dotfiles-untracked-control/home/.config/dot/profiles.d"
+: >"$untracked_control_home/.dotfiles-untracked-control/home/.config/dot/profiles.d/evil.conf"
+untracked_control_status=0
+run_dot "$untracked_control_home" "$untracked_control_state" update \
+  >/dev/null 2>&1 || untracked_control_status=$?
+assert_eq 1 "$untracked_control_status" \
+  'Git overlay inventory rejects untracked profile control state'
+[[ ! -e $untracked_control_home/.config/dot/profiles.d/evil.conf &&
+  ! -L $untracked_control_home/.config/dot/profiles.d/evil.conf ]] ||
+  fail 'Git overlay linked untracked profile control state'
+
+fixture_repo local-control-base main .testrc $'base\n' 100644
+local_control_base_origin=$REPLY
+fixture_home local-control
+local_control_home=$REPLY
+local_control_state=$DOT_TEST_TMP/local-control-state
+local_control_source=$DOT_TEST_TMP/local-control-source
+run_dot "$local_control_home" "$local_control_state" init --yes \
+  "file://$local_control_base_origin" >/dev/null
+mkdir -p \
+  "$local_control_home/.config/dot/overlays.d" \
+  "$local_control_source/home/.config/dot/profile-selectors.d"
+: >"$local_control_source/home/.config/dot/profile-selectors.d/evil.conf"
+printf 'sync=none\npath=%s\n' "$local_control_source" \
+  >"$local_control_home/.config/dot/overlays.d/10-local-control.local.conf"
+local_control_status=0
+run_dot "$local_control_home" "$local_control_state" update \
+  >/dev/null 2>&1 || local_control_status=$?
+assert_eq 1 "$local_control_status" \
+  'filesystem overlay inventory rejects profile selector state'
+[[ ! -e $local_control_home/.config/dot/profile-selectors.d/evil.conf &&
+  ! -L $local_control_home/.config/dot/profile-selectors.d/evil.conf ]] ||
+  fail 'filesystem overlay linked profile selector state'
 
 # Client trees may not occupy deterministic same-parent init staging or
 # rollback namespaces. Candidate inventories contain leaves, so cover both a
@@ -273,6 +656,188 @@ HOME=$reserved_resolution_home XDG_STATE_HOME=$reserved_resolution_state \
   '
 assert_eq 2 "$(awk 'END { print NR }' "$reserved_resolution_log")" \
   'candidate tree validation snapshots reserved roots before and after its scan'
+
+# Installed overlay authority can contain hundreds of records. Snapshot and
+# unstash operate against one stable pre-pull filesystem generation, so each
+# operation must resolve the reserved-root set once rather than once per path.
+overlay_authority_perf_home=$DOT_TEST_TMP/overlay-authority-perf-home
+overlay_authority_perf_state=$DOT_TEST_TMP/overlay-authority-perf-state
+mkdir -p "$overlay_authority_perf_home/nested" "$overlay_authority_perf_state"
+ln -s .dotfiles-alpha/home/one "$overlay_authority_perf_home/one"
+ln -s ../.dotfiles-alpha/home/nested/two \
+  "$overlay_authority_perf_home/nested/two"
+printf '%s\n' \
+  $'one\talpha\t.dotfiles-alpha/home/one' \
+  $'nested/two\talpha\t../.dotfiles-alpha/home/nested/two' \
+  >"$overlay_authority_perf_state/overlay-links"
+chmod 0600 "$overlay_authority_perf_state/overlay-links"
+
+overlay_snapshot_perf_status=0
+HOME=$overlay_authority_perf_home XDG_STATE_HOME=$overlay_authority_perf_state \
+  DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$overlay_authority_perf_state/overlay-links \
+  DOT_OVERLAY_LEGACY_MANIFEST=$overlay_authority_perf_state/legacy-links \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    OVERLAYS=()
+    recovered=0
+    reserved_snapshots=0
+    _overlay_recover_replacements() { recovered=1; }
+    _dot_reserved_roots_snapshot() {
+      [[ $recovered -eq 1 ]]
+      reserved_snapshots=$((reserved_snapshots + 1))
+      REPLY=$HOME/.reserved
+    }
+    _overlay_snapshot_installed_links
+    [[ $reserved_snapshots -eq 1 ]]
+    [[ ${#DOT_OVERLAY_ROLLBACK_PATHS[@]} -eq 2 ]]
+  ' || overlay_snapshot_perf_status=$?
+assert_eq 0 "$overlay_snapshot_perf_status" \
+  'rollback snapshot resolves reserved roots once per installed generation'
+
+# Interrupted replacement recovery can restore symlinked parents used by XDG
+# and overlay paths. Reserved-root authority must be derived from the recovered
+# filesystem generation, not from the transient pre-recovery mapping.
+recovered_roots_home=$DOT_TEST_TMP/recovered-roots-home
+recovered_roots_a=$DOT_TEST_TMP/recovered-roots-a
+recovered_roots_b=$DOT_TEST_TMP/recovered-roots-b
+recovered_roots_manifest=$DOT_TEST_TMP/recovered-roots-manifest
+mkdir -p \
+  "$recovered_roots_home" \
+  "$recovered_roots_a/dot" \
+  "$recovered_roots_b/dot"
+ln -s "$recovered_roots_a" "$recovered_roots_home/state-link"
+ln -s "$recovered_roots_a" "$recovered_roots_home/other-link"
+ln -s overlay-target "$recovered_roots_b/dot/owned"
+printf '%s\n' $'other-link/dot/owned\talpha\toverlay-target' \
+  >"$recovered_roots_manifest"
+recovered_roots_status=0
+HOME=$recovered_roots_home XDG_STATE_HOME=$recovered_roots_home/state-link \
+  DOT_SOURCE_ROOT=$root DOT_TEST_ROOT_B=$recovered_roots_b \
+  DOT_TEST_AUTHORITY_MANIFEST=$recovered_roots_manifest \
+  DOT_OVERLAY_MANIFEST=$DOT_TEST_TMP/recovered-roots-state/overlay-links \
+  DOT_OVERLAY_LEGACY_MANIFEST=$DOT_TEST_TMP/recovered-roots-state/legacy-links \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    OVERLAYS=()
+    _overlay_recover_replacements() {
+      rm -f -- "$HOME/state-link" "$HOME/other-link"
+      ln -s "$DOT_TEST_ROOT_B" "$HOME/state-link"
+      ln -s "$DOT_TEST_ROOT_B" "$HOME/other-link"
+    }
+    _overlay_authority_files() {
+      OVERLAY_AUTHORITY_MANIFESTS=("$DOT_TEST_AUTHORITY_MANIFEST")
+    }
+
+    _overlay_snapshot_installed_links
+    [[ ${#DOT_OVERLAY_ROLLBACK_PATHS[@]} -eq 0 ]]
+    dot_candidate_path_is_reserved "$HOME/other-link/dot/owned"
+  ' || recovered_roots_status=$?
+assert_eq 0 "$recovered_roots_status" \
+  'rollback authority snapshots reserved roots after replacement recovery'
+
+overlay_unstash_perf_status=0
+HOME=$overlay_authority_perf_home XDG_STATE_HOME=$overlay_authority_perf_state \
+  DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$overlay_authority_perf_state/overlay-links \
+  DOT_OVERLAY_LEGACY_MANIFEST=$overlay_authority_perf_state/legacy-links \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    OVERLAYS=()
+    recovered=0
+    reserved_snapshots=0
+    _base_repo_exists() { return 0; }
+    _base_git() { return 0; }
+    _overlay_recover_replacements() { recovered=1; }
+    _dot_reserved_roots_snapshot() {
+      [[ $recovered -eq 1 ]]
+      reserved_snapshots=$((reserved_snapshots + 1))
+      REPLY=$HOME/.reserved
+    }
+
+    _unstash_overlay_overrides
+    [[ $reserved_snapshots -eq 1 ]]
+  ' || overlay_unstash_perf_status=$?
+assert_eq 0 "$overlay_unstash_perf_status" \
+  'overlay unstash resolves reserved roots once per installed generation'
+
+# Pending recovery publication and both authority loads inspect the same
+# immutable pre-mutation paths. Cache those classifications until linking
+# begins, then revalidate each destination against the live filesystem once.
+overlay_classification_perf_home=$DOT_TEST_TMP/overlay-classification-perf-home
+overlay_classification_perf_state=$DOT_TEST_TMP/overlay-classification-perf-state
+overlay_classification_perf_source=$DOT_TEST_TMP/overlay-classification-perf-source
+mkdir -p \
+  "$overlay_classification_perf_home/nested" \
+  "$overlay_classification_perf_state" \
+  "$overlay_classification_perf_source/home/nested"
+printf 'one\n' >"$overlay_classification_perf_source/home/one"
+printf 'two\n' >"$overlay_classification_perf_source/home/nested/two"
+ln -s .dotfiles-alpha/home/one "$overlay_classification_perf_home/one"
+ln -s ../.dotfiles-alpha/home/nested/two \
+  "$overlay_classification_perf_home/nested/two"
+printf '%s\n' \
+  $'one\talpha\t.dotfiles-alpha/home/one' \
+  $'nested/two\talpha\t../.dotfiles-alpha/home/nested/two' \
+  >"$overlay_classification_perf_state/overlay-links"
+chmod 0600 "$overlay_classification_perf_state/overlay-links"
+
+overlay_classification_perf_status=0
+HOME=$overlay_classification_perf_home \
+  XDG_STATE_HOME=$overlay_classification_perf_state \
+  DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$overlay_classification_perf_state/overlay-links \
+  DOT_OVERLAY_LEGACY_MANIFEST=$overlay_classification_perf_state/legacy-links \
+  DOT_TEST_OVERLAY_SOURCE=$overlay_classification_perf_source \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/progress-ui.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/overlays.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    OVERLAYS=("alpha|$DOT_TEST_OVERLAY_SOURCE|file:///unused|0|0|git")
+    DOT_QUIET=1
+    DOT_VERBOSE=0
+    DOT_UI_TOTAL=0
+    candidate_checks=0
+    recovered=0
+    _base_repo_exists() { return 1; }
+    _overlay_is_worktree() { return 0; }
+    _overlay_checkout_matches() { return 0; }
+    _preflight_local_overlays() { return 0; }
+    _overlay_recover_replacements() { recovered=1; }
+    _dot_maybe_stage_progress() { return 0; }
+    _dot_reserved_roots_snapshot() {
+      [[ $recovered -eq 1 ]]
+      REPLY=$HOME/.reserved
+    }
+    _dot_candidate_path_is_reserved_from_roots() {
+      candidate_checks=$((candidate_checks + 1))
+      return 1
+    }
+
+    _link_overlays
+    [[ $candidate_checks -eq 4 ]]
+    [[ $(readlink "$HOME/one") == .dotfiles-alpha/home/one ]]
+    [[ $(readlink "$HOME/nested/two") == ../.dotfiles-alpha/home/nested/two ]]
+  ' || overlay_classification_perf_status=$?
+assert_eq 0 "$overlay_classification_perf_status" \
+  'overlay convergence classifies each path once per stable filesystem phase'
 
 # Physical candidate resolution is sourceable library behavior. Preserve the
 # caller's logical cwd and OLDPWD even when the path crosses a symlink and its
@@ -1011,6 +1576,614 @@ HOME=$replacement_recovery_home XDG_STATE_HOME=$replacement_recovery_state \
     [[ -f $record && -d $transaction && -f $transaction/foreign ]]
   '
 
+# Update snapshots run before unstash. They must first recover an interrupted
+# per-path replacement, then capture the exact restored live target from the
+# installed authority union so a later policy failure can roll it back.
+rollback_recovery_home=$DOT_TEST_TMP/rollback-recovery-home
+rollback_recovery_state=$DOT_TEST_TMP/rollback-recovery-state
+mkdir -p "$rollback_recovery_home" "$rollback_recovery_state"
+HOME=$rollback_recovery_home XDG_STATE_HOME=$rollback_recovery_state \
+  DOT_SOURCE_ROOT=$root \
+  DOT_OVERLAY_MANIFEST=$rollback_recovery_state/overlay-links \
+  DOT_OVERLAY_LEGACY_MANIFEST=$rollback_recovery_state/legacy-links \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _overlay_skip_worktree() { return 0; }
+    dot_candidate_path_is_reserved() { return 1; }
+
+    destination=$HOME/value
+    target=.dotfiles-example/home/value
+    ln -s "$target" "$destination"
+    printf "value\texample\t%s\n" "$target" >"$DOT_OVERLAY_MANIFEST"
+    chmod 0600 "$DOT_OVERLAY_MANIFEST"
+
+    expected=$(_overlay_replacement_identity "$destination")
+    _overlay_destination_context "$destination"
+    physical=$OVERLAY_PHYSICAL_DESTINATION
+    parent_identity=$OVERLAY_PARENT_IDENTITY
+    _overlay_replacement_record_path "$destination"
+    record=$REPLY
+    transaction=${physical%/*}/.${physical##*/}.dot-overlay-replace-v1
+    printf -v record_line "%s\t%s\t%s\t%s\t%s\t%s" \
+      "$destination" "$physical" replacement-target "$expected" \
+      "$transaction" "$parent_identity"
+    _overlay_write_private_line "$record" "$record_line"
+    mkdir "$transaction"
+    chmod 0700 "$transaction"
+    ln -s replacement-target "$transaction/next"
+    mv "$physical" "$transaction/previous"
+
+    _overlay_snapshot_installed_links
+    [[ -L $destination && $(readlink "$destination") == "$target" ]]
+    [[ ! -e $record && ! -L $record && ! -e $transaction && ! -L $transaction ]]
+    [[ ${DOT_OVERLAY_ROLLBACK_PATHS[*]} == value ]]
+    [[ ${DOT_OVERLAY_ROLLBACK_TARGETS[*]} == "$target" ]]
+  '
+
+# Overlay-only paths are not tracked by the base repository. If a user replaces
+# one after the snapshot, rollback must fail closed rather than treating an
+# untracked regular file as a clean base generation and overwriting it.
+rollback_untracked_home=$DOT_TEST_TMP/rollback-untracked-home
+mkdir -p "$rollback_untracked_home"
+HOME=$rollback_untracked_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    git -C "$HOME" init -q
+    git -C "$HOME" config user.name fixture
+    git -C "$HOME" config user.email fixture@example.invalid
+    printf "base\n" >"$HOME/README"
+    git -C "$HOME" add README
+    git -C "$HOME" -c core.hooksPath=/dev/null commit -qm seed
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _base_git() { git -C "$HOME" "$@"; }
+    _overlay_destination_outside_local_sources() { return 0; }
+    OVERLAYS=()
+    DOT_OVERLAY_MANIFEST="$HOME/.state/manifest"
+    DOT_OVERLAY_LEGACY_MANIFEST="$HOME/.state/legacy"
+    mkdir -p "$HOME/.state" "$HOME/.dotfiles-source/home"
+    printf "overlay source\n" >"$HOME/.dotfiles-source/home/value"
+    DOT_OVERLAY_ROLLBACK_PATHS=(value)
+    DOT_OVERLAY_ROLLBACK_TARGETS=(.dotfiles-source/home/value)
+    printf "USER DATA MUST SURVIVE\n" >"$HOME/value"
+
+    status=0
+    _overlay_restore_installed_links || status=$?
+    [[ $status -ne 0 ]]
+    [[ -f $HOME/value && ! -L $HOME/value ]]
+    [[ $(<"$HOME/value") == "USER DATA MUST SURVIVE" ]]
+  '
+
+# A failed update may invoke rollback more than once. Once a missing prior
+# owner has been replaced by an available active fallback, repeated recovery
+# must accept that same fallback as already converged.
+rollback_fallback_home=$DOT_TEST_TMP/rollback-fallback-home
+mkdir -p "$rollback_fallback_home"
+HOME=$rollback_fallback_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    git -C "$HOME" init -q
+    git -C "$HOME" config user.name fixture
+    git -C "$HOME" config user.email fixture@example.invalid
+    printf "base\n" >"$HOME/README"
+    git -C "$HOME" add README
+    git -C "$HOME" -c core.hooksPath=/dev/null commit -qm seed
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _base_git() { git -C "$HOME" "$@"; }
+    DOT_OVERLAY_MANIFEST="$HOME/.state/manifest"
+    DOT_OVERLAY_LEGACY_MANIFEST="$HOME/.state/legacy"
+    mkdir -p "$HOME/.state" "$HOME/.dotfiles-target/home"
+    printf "fallback\n" >"$HOME/.dotfiles-target/home/value"
+    ACTIVE_OVERLAYS=("target|$HOME/.dotfiles-target|||false|git")
+    DOT_OVERLAY_ROLLBACK_PATHS=(value)
+    DOT_OVERLAY_ROLLBACK_TARGETS=(.dotfiles-source/home/value)
+
+    _overlay_restore_installed_links
+    [[ -L $HOME/value &&
+      $(readlink "$HOME/value") == .dotfiles-target/home/value ]]
+    _overlay_restore_installed_links
+    [[ -L $HOME/value &&
+      $(readlink "$HOME/value") == .dotfiles-target/home/value ]]
+  '
+
+# If publishing a fallback succeeds but restoring the base index bit fails,
+# the next rollback pass must retry the index repair instead of accepting the
+# link alone as complete.
+rollback_index_retry_home=$DOT_TEST_TMP/rollback-index-retry-home
+mkdir -p "$rollback_index_retry_home"
+HOME=$rollback_index_retry_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    git -C "$HOME" init -q
+    git -C "$HOME" config user.name fixture
+    git -C "$HOME" config user.email fixture@example.invalid
+    printf "base value\n" >"$HOME/value"
+    git -C "$HOME" add value
+    git -C "$HOME" -c core.hooksPath=/dev/null commit -qm seed
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    update_index_attempts=0
+    _base_git() {
+      if [[ $1 == update-index && $2 == --skip-worktree ]]; then
+        update_index_attempts=$((update_index_attempts + 1))
+        [[ $update_index_attempts -gt 1 ]] || return 1
+      fi
+      git -C "$HOME" "$@"
+    }
+    DOT_OVERLAY_MANIFEST="$HOME/.state/manifest"
+    DOT_OVERLAY_LEGACY_MANIFEST="$HOME/.state/legacy"
+    mkdir -p "$HOME/.state" "$HOME/.dotfiles-target/home"
+    printf "fallback\n" >"$HOME/.dotfiles-target/home/value"
+    ACTIVE_OVERLAYS=("target|$HOME/.dotfiles-target|||false|git")
+    DOT_OVERLAY_ROLLBACK_PATHS=(value)
+    DOT_OVERLAY_ROLLBACK_TARGETS=(.dotfiles-source/home/value)
+
+    status=0
+    _overlay_restore_installed_links || status=$?
+    [[ $status -ne 0 ]]
+    [[ -L $HOME/value &&
+      $(readlink "$HOME/value") == .dotfiles-target/home/value ]]
+    _overlay_restore_installed_links
+    [[ $(git -C "$HOME" ls-files -v -- value) == "S value" ]]
+  '
+
+# Eligible overlays that failed active-source validation cannot become
+# rollback fallbacks. In particular, a dangling sync=none source must not be
+# republished merely because it remained in the eligible set.
+rollback_inactive_home=$DOT_TEST_TMP/rollback-inactive-home
+mkdir -p "$rollback_inactive_home"
+HOME=$rollback_inactive_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    git -C "$HOME" init -q
+    git -C "$HOME" config user.name fixture
+    git -C "$HOME" config user.email fixture@example.invalid
+    printf "base\n" >"$HOME/README"
+    git -C "$HOME" add README
+    git -C "$HOME" -c core.hooksPath=/dev/null commit -qm seed
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _base_git() { git -C "$HOME" "$@"; }
+    DOT_OVERLAY_MANIFEST="$HOME/.state/manifest"
+    DOT_OVERLAY_LEGACY_MANIFEST="$HOME/.state/legacy"
+    mkdir -p "$HOME/.state" "$HOME/local-overlay/home"
+    ln -s missing "$HOME/local-overlay/home/value"
+    OVERLAYS=("local|$HOME/local-overlay|||false|none")
+    ACTIVE_OVERLAYS=()
+    DOT_OVERLAY_ROLLBACK_PATHS=(value)
+    DOT_OVERLAY_ROLLBACK_TARGETS=(.dotfiles-source/home/value)
+
+    status=0
+    _overlay_restore_installed_links || status=$?
+    [[ $status -ne 0 ]]
+    [[ ! -e $HOME/value && ! -L $HOME/value ]]
+  '
+
+rollback_directory_home=$DOT_TEST_TMP/rollback-directory-home
+mkdir -p "$rollback_directory_home"
+HOME=$rollback_directory_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    git -C "$HOME" init -q
+    git -C "$HOME" config user.name fixture
+    git -C "$HOME" config user.email fixture@example.invalid
+    printf "base\n" >"$HOME/README"
+    git -C "$HOME" add README
+    git -C "$HOME" -c core.hooksPath=/dev/null commit -qm seed
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _base_git() { git -C "$HOME" "$@"; }
+    DOT_OVERLAY_MANIFEST="$HOME/.state/manifest"
+    DOT_OVERLAY_LEGACY_MANIFEST="$HOME/.state/legacy"
+    mkdir -p "$HOME/.state" "$HOME/.dotfiles-target/home/value"
+    printf "child\n" >"$HOME/.dotfiles-target/home/value/child"
+    ACTIVE_OVERLAYS=("target|$HOME/.dotfiles-target|||false|git")
+    DOT_OVERLAY_ROLLBACK_PATHS=(value)
+    DOT_OVERLAY_ROLLBACK_TARGETS=(.dotfiles-source/home/value)
+
+    status=0
+    _overlay_restore_installed_links || status=$?
+    [[ $status -ne 0 ]]
+    [[ ! -e $HOME/value && ! -L $HOME/value ]]
+  '
+
+# A former file owner that now exposes a directory cannot satisfy rollback.
+# Prefer the clean tracked base version rather than retaining a type-changing
+# live symlink that normal overlay inventory would never publish.
+rollback_source_directory_home=$DOT_TEST_TMP/rollback-source-directory-home
+mkdir -p "$rollback_source_directory_home"
+HOME=$rollback_source_directory_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    git -C "$HOME" init -q
+    git -C "$HOME" config user.name fixture
+    git -C "$HOME" config user.email fixture@example.invalid
+    printf "base value\n" >"$HOME/value"
+    git -C "$HOME" add value
+    git -C "$HOME" -c core.hooksPath=/dev/null commit -qm seed
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _base_git() { git -C "$HOME" "$@"; }
+    OVERLAYS=()
+    ACTIVE_OVERLAYS=()
+    DOT_OVERLAY_MANIFEST="$HOME/.state/manifest"
+    DOT_OVERLAY_LEGACY_MANIFEST="$HOME/.state/legacy"
+    mkdir -p "$HOME/.state" "$HOME/.dotfiles-source/home/value"
+    printf "child\n" >"$HOME/.dotfiles-source/home/value/child"
+    DOT_OVERLAY_ROLLBACK_PATHS=(value)
+    DOT_OVERLAY_ROLLBACK_TARGETS=(.dotfiles-source/home/value)
+
+    _overlay_restore_installed_links
+    [[ -f $HOME/value && ! -L $HOME/value ]]
+    [[ $(<"$HOME/value") == "base value" ]]
+  '
+
+# Git-tracked symlink payloads are valid overlay leaves even when their own
+# referent is absent. Rollback must preserve that file type for both the prior
+# owner and an explicitly active fallback.
+rollback_dangling_home=$DOT_TEST_TMP/rollback-dangling-home
+mkdir -p "$rollback_dangling_home"
+HOME=$rollback_dangling_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    git -C "$HOME" init -q
+    git -C "$HOME" config user.name fixture
+    git -C "$HOME" config user.email fixture@example.invalid
+    printf "base\n" >"$HOME/README"
+    git -C "$HOME" add README
+    git -C "$HOME" -c core.hooksPath=/dev/null commit -qm seed
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _base_git() { git -C "$HOME" "$@"; }
+    OVERLAYS=()
+    ACTIVE_OVERLAYS=()
+    DOT_OVERLAY_MANIFEST="$HOME/.state/manifest"
+    DOT_OVERLAY_LEGACY_MANIFEST="$HOME/.state/legacy"
+    mkdir -p "$HOME/.state" "$HOME/.dotfiles-source/home"
+    ln -s missing "$HOME/.dotfiles-source/home/value"
+    DOT_OVERLAY_ROLLBACK_PATHS=(value)
+    DOT_OVERLAY_ROLLBACK_TARGETS=(.dotfiles-source/home/value)
+
+    _overlay_restore_installed_links
+    [[ -L $HOME/value &&
+      $(readlink "$HOME/value") == .dotfiles-source/home/value ]]
+  '
+
+rollback_dangling_fallback_home=$DOT_TEST_TMP/rollback-dangling-fallback-home
+mkdir -p "$rollback_dangling_fallback_home"
+HOME=$rollback_dangling_fallback_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    git -C "$HOME" init -q
+    git -C "$HOME" config user.name fixture
+    git -C "$HOME" config user.email fixture@example.invalid
+    printf "base\n" >"$HOME/README"
+    git -C "$HOME" add README
+    git -C "$HOME" -c core.hooksPath=/dev/null commit -qm seed
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _base_git() { git -C "$HOME" "$@"; }
+    DOT_OVERLAY_MANIFEST="$HOME/.state/manifest"
+    DOT_OVERLAY_LEGACY_MANIFEST="$HOME/.state/legacy"
+    mkdir -p "$HOME/.state" "$HOME/.dotfiles-target/home"
+    ln -s missing "$HOME/.dotfiles-target/home/value"
+    ACTIVE_OVERLAYS=("target|$HOME/.dotfiles-target|||false|git")
+    DOT_OVERLAY_ROLLBACK_PATHS=(value)
+    DOT_OVERLAY_ROLLBACK_TARGETS=(.dotfiles-source/home/value)
+
+    _overlay_restore_installed_links
+    [[ -L $HOME/value &&
+      $(readlink "$HOME/value") == .dotfiles-target/home/value ]]
+  '
+
+# One user-owned conflict must not prevent later independent paths in the
+# captured generation from being restored safely.
+rollback_bulk_home=$DOT_TEST_TMP/rollback-bulk-home
+mkdir -p "$rollback_bulk_home"
+HOME=$rollback_bulk_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    git -C "$HOME" init -q
+    git -C "$HOME" config user.name fixture
+    git -C "$HOME" config user.email fixture@example.invalid
+    printf "base\n" >"$HOME/README"
+    git -C "$HOME" add README
+    git -C "$HOME" -c core.hooksPath=/dev/null commit -qm seed
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _base_git() { git -C "$HOME" "$@"; }
+    OVERLAYS=()
+    DOT_OVERLAY_MANIFEST="$HOME/.state/manifest"
+    DOT_OVERLAY_LEGACY_MANIFEST="$HOME/.state/legacy"
+    mkdir -p "$HOME/.state" "$HOME/.dotfiles-source/home"
+    printf "managed b\n" >"$HOME/.dotfiles-source/home/b"
+    DOT_OVERLAY_ROLLBACK_PATHS=(a b)
+    DOT_OVERLAY_ROLLBACK_TARGETS=(
+      .dotfiles-source/home/a
+      .dotfiles-source/home/b
+    )
+    printf "USER A\n" >"$HOME/a"
+
+    status=0
+    _overlay_restore_installed_links || status=$?
+    [[ $status -ne 0 ]]
+    [[ -f $HOME/a && ! -L $HOME/a && $(<"$HOME/a") == "USER A" ]]
+    [[ -L $HOME/b &&
+      $(readlink "$HOME/b") == .dotfiles-source/home/b ]]
+  '
+
+# Managed-link adoption must not delete a user replacement that wins a race
+# after authorization, including through a swapped parent symlink.
+adoption_race_home=$DOT_TEST_TMP/adoption-race-home
+mkdir -p "$adoption_race_home"
+HOME=$adoption_race_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    _warn() { :; }
+    DOT_OVERLAY_ROLLBACK_PATHS=(value)
+    DOT_OVERLAY_ROLLBACK_TARGETS=(managed-target)
+    ln -s managed-target "$HOME/value"
+    log=$HOME/pull.log
+    printf "%s\n" \
+      "error: The following untracked working tree files would be overwritten by checkout:" \
+      "        value" \
+      "Please move or remove them before you switch branches." >"$log"
+    eval "$(declare -f _dot_move_noreplace |
+      sed "1s/_dot_move_noreplace/_dot_move_noreplace_original/")"
+    _dot_move_noreplace() {
+      if [[ $1 == "$HOME/value" && -L $HOME/value ]]; then
+        command rm -f -- "$HOME/value"
+        printf "USER DATA WON THE RACE\n" >"$HOME/value"
+      fi
+      _dot_move_noreplace_original "$@"
+    }
+    status=0
+    _backup_pull_conflicts "$log" "$HOME" || status=$?
+    [[ $status -ne 0 ]]
+    [[ -f $HOME/value && ! -L $HOME/value ]]
+    [[ $(<"$HOME/value") == "USER DATA WON THE RACE" ]]
+  '
+
+adoption_parent_race_home=$DOT_TEST_TMP/adoption-parent-race-home
+mkdir -p "$adoption_parent_race_home/a" "$adoption_parent_race_home/outside"
+HOME=$adoption_parent_race_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    _warn() { :; }
+    DOT_OVERLAY_ROLLBACK_PATHS=(a/value)
+    DOT_OVERLAY_ROLLBACK_TARGETS=(managed-target)
+    ln -s managed-target "$HOME/a/value"
+    printf "OUTSIDE USER DATA\n" >"$HOME/outside/value"
+    log=$HOME/pull.log
+    printf "%s\n" \
+      "error: The following untracked working tree files would be overwritten by checkout:" \
+      "        a/value" \
+      "Please move or remove them before you switch branches." >"$log"
+    eval "$(declare -f _dot_move_noreplace |
+      sed "1s/_dot_move_noreplace/_dot_move_noreplace_original/")"
+    _dot_move_noreplace() {
+      if [[ $1 == "$HOME/a/value" && -L $HOME/a/value ]]; then
+        command mv "$HOME/a" "$HOME/a.original"
+        command ln -s "$HOME/outside" "$HOME/a"
+      fi
+      _dot_move_noreplace_original "$@"
+    }
+    status=0
+    _backup_pull_conflicts "$log" "$HOME" || status=$?
+    [[ $status -ne 0 ]]
+    [[ -f $HOME/outside/value ]]
+    [[ $(<"$HOME/outside/value") == "OUTSIDE USER DATA" ]]
+    [[ -L $HOME/a.original/value ]]
+  '
+
+# A move helper can report failure after the exact managed link reached its
+# quarantine destination. Bind the outcome to the pre-move identity so that
+# this false negative is still recoverable rather than silently stranded.
+adoption_move_false_negative_home=$DOT_TEST_TMP/adoption-move-false-negative-home
+mkdir -p "$adoption_move_false_negative_home"
+HOME=$adoption_move_false_negative_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    _warn() { :; }
+    DOT_OVERLAY_ROLLBACK_PATHS=(value)
+    DOT_OVERLAY_ROLLBACK_TARGETS=(managed-target)
+    ln -s managed-target "$HOME/value"
+    _dot_move_noreplace() {
+      command mv "$1" "$2"
+      return 1
+    }
+
+    _overlay_quarantine_rollback_link value
+    [[ ! -e $HOME/value && ! -L $HOME/value ]]
+    [[ -L $OVERLAY_ADOPTION_PARKED ]]
+    command mv "$OVERLAY_ADOPTION_PARKED" "$HOME/value"
+    rmdir "$OVERLAY_ADOPTION_STAGE"
+    [[ -L $HOME/value && $(readlink "$HOME/value") == managed-target ]]
+  '
+
+# Backup setup or movement failures must prevent a retry and must not report
+# success. Mixed conflicts must also restore any managed links already parked.
+backup_failure_home=$DOT_TEST_TMP/backup-failure-home
+mkdir -p "$backup_failure_home"
+HOME=$backup_failure_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    _warn() { :; }
+    printf "USER DATA\n" >"$HOME/value"
+    log=$HOME/pull.log
+    printf "%s\n" \
+      "error: The following untracked working tree files would be overwritten by checkout:" \
+      "        value" \
+      "Please move or remove them before you switch branches." >"$log"
+    _dot_move_noreplace() { return 1; }
+    status=0
+    _backup_pull_conflicts "$log" "$HOME" || status=$?
+    [[ $status -ne 0 ]]
+    [[ -f $HOME/value && $(<"$HOME/value") == "USER DATA" ]]
+  '
+
+backup_nested_failure_home=$DOT_TEST_TMP/backup-nested-failure-home
+mkdir -p "$backup_nested_failure_home"
+HOME=$backup_nested_failure_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    warnings=$HOME/warnings
+    _warn() { printf "%s\n" "$*" >>"$warnings"; }
+    printf "USER DATA\n" >"$HOME/value"
+    log=$HOME/pull.log
+    printf "%s\n" \
+      "error: The following untracked working tree files would be overwritten by checkout:" \
+      "        value" \
+      "Please move or remove them before you switch branches." >"$log"
+    _dot_move_noreplace() {
+      command mkdir "$2"
+      command mv "$1" "$2/${1##*/}"
+      return 1
+    }
+    status=0
+    _backup_pull_conflicts "$log" "$HOME" || status=$?
+    [[ $status -ne 0 ]]
+    nested=""
+    for candidate in "$HOME"/.dot-backup/pull/*/value/value; do
+      [[ -f $candidate ]] || continue
+      nested=$candidate
+      break
+    done
+    [[ -n $nested ]]
+    [[ -f $nested && $(<"$nested") == "USER DATA" ]]
+    [[ $(<"$warnings") == *"$nested"* ]]
+  '
+
+backup_mkdir_failure_home=$DOT_TEST_TMP/backup-mkdir-failure-home
+mkdir -p "$backup_mkdir_failure_home/nested"
+HOME=$backup_mkdir_failure_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    _warn() { :; }
+    printf "USER DATA\n" >"$HOME/nested/value"
+    log=$HOME/pull.log
+    printf "%s\n" \
+      "error: The following untracked working tree files would be overwritten by checkout:" \
+      "        nested/value" \
+      "Please move or remove them before you switch branches." >"$log"
+    mkdir() {
+      if [[ ${*: -1} == */nested ]]; then
+        return 1
+      fi
+      command mkdir "$@"
+    }
+    status=0
+    _backup_pull_conflicts "$log" "$HOME" || status=$?
+    [[ $status -ne 0 ]]
+    [[ -f $HOME/nested/value && $(<"$HOME/nested/value") == "USER DATA" ]]
+  '
+
+mixed_backup_failure_home=$DOT_TEST_TMP/mixed-backup-failure-home
+mkdir -p "$mixed_backup_failure_home"
+HOME=$mixed_backup_failure_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    _warn() { :; }
+    DOT_OVERLAY_ROLLBACK_PATHS=(managed)
+    DOT_OVERLAY_ROLLBACK_TARGETS=(managed-target)
+    ln -s managed-target "$HOME/managed"
+    printf "USER DATA\n" >"$HOME/user"
+    log=$HOME/pull.log
+    printf "%s\n" \
+      "error: The following untracked working tree files would be overwritten by checkout:" \
+      "        managed" \
+      "        user" \
+      "Please move or remove them before you switch branches." >"$log"
+    _dot_move_noreplace() {
+      [[ $2 == */user ]] && return 1
+      command mv -n -- "$1" "$2"
+    }
+    status=0
+    _backup_pull_conflicts "$log" "$HOME" || status=$?
+    [[ $status -ne 0 ]]
+    [[ -L $HOME/managed && $(readlink "$HOME/managed") == managed-target ]]
+    [[ -f $HOME/user && $(<"$HOME/user") == "USER DATA" ]]
+  '
+
+commit_failure_home=$DOT_TEST_TMP/commit-failure-home
+mkdir -p "$commit_failure_home/.dotfiles-source/home"
+HOME=$commit_failure_home DOT_SOURCE_ROOT=$root \
+  bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/overlays.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    _warn() { :; }
+    target=.dotfiles-source/home/managed
+    printf "MANAGED DATA\n" >"$HOME/$target"
+    DOT_OVERLAY_ROLLBACK_PATHS=(managed)
+    DOT_OVERLAY_ROLLBACK_TARGETS=("$target")
+    ln -s "$target" "$HOME/managed"
+    printf "USER DATA\n" >"$HOME/user"
+    log=$HOME/pull.log
+    printf "%s\n" \
+      "error: The following untracked working tree files would be overwritten by checkout:" \
+      "        managed" \
+      "        user" \
+      "Please move or remove them before you switch branches." >"$log"
+    _overlay_commit_quarantined_link() { return 1; }
+    status=0
+    _backup_pull_conflicts "$log" "$HOME" || status=$?
+    [[ $status -ne 0 ]]
+    [[ -L $HOME/managed && $(readlink "$HOME/managed") == "$target" ]]
+    [[ -f $HOME/user && $(<"$HOME/user") == "USER DATA" ]]
+  '
+
 # The previous released transaction format recorded only device and inode.
 # An upgrade can encounter any crash phase from those bytes, so recovery must
 # converge each exact engine-owned shape without making the legacy identity a
@@ -1411,5 +2584,66 @@ partial_tree_status=$?
 set -e
 assert_eq 1 "$partial_tree_status" \
   'update candidate validation rejects a failed ls-tree producer'
+
+# Profile definitions and tracked selectors are base-owned control plane.
+# Machine-local selectors are user-owned and no repository may publish them;
+# overlays may publish only repository-local selector fragments outside home/.
+fixture_repo profile-control-plane main \
+  .config/dot/profiles.d/base.conf $'version=1\noverlays=personal\n' 100644 \
+  .config/dot/profile-selectors.d/example.conf \
+  $'version=1\nuser=example-user\nprofile=base\n' 100644 \
+  home/.config/dot/profiles.d/base.conf $'version=1\noverlays=personal\n' 100644 \
+  home/.config/dot/profile-selectors.d/example.conf \
+  $'version=1\nuser=example-user\nprofile=base\n' 100644 \
+  dot/profile-selectors.d/private.conf \
+  $'version=1\nuser=example-user\nprofile=base\n' 100644
+profile_control_home=$DOT_TEST_TMP/profile-control-home
+mkdir -p "$profile_control_home"
+HOME=$profile_control_home DOT_SOURCE_ROOT=$root bash --noprofile --norc -c '
+  set -euo pipefail
+  . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/resources.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/init-client.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+  OVERLAYS=()
+  _repo_validate_candidate_tree base main git -C "$1"
+' -- "$DOT_TEST_TMP/profile-control-plane-seed" ||
+  fail 'base rejected tracked profile control-plane paths'
+if HOME=$profile_control_home DOT_SOURCE_ROOT=$root bash --noprofile --norc -c '
+  set -euo pipefail
+  . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/resources.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/init-client.sh"
+  . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+  OVERLAYS=()
+  _repo_validate_candidate_tree overlay main git -C "$1"
+' -- "$DOT_TEST_TMP/profile-control-plane-seed" >/dev/null 2>&1; then
+  fail 'overlay accepted linked profile control-plane paths'
+fi
+
+fixture_repo profile-local-reserved main \
+  .config/dot/profile-selectors.local.d/host.conf \
+  $'version=1\nhost=example-host\nprofile=base\n' 100644 \
+  home/.config/dot/profile-selectors.local.d/host.conf \
+  $'version=1\nhost=example-host\nprofile=base\n' 100644
+for kind in base overlay; do
+  if HOME=$profile_control_home DOT_SOURCE_ROOT=$root bash --noprofile --norc -c '
+    set -euo pipefail
+    . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/resources.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/reserved.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/init-client.sh"
+    . "$DOT_SOURCE_ROOT/lib/dot/repos/pull.sh"
+    OVERLAYS=()
+    _repo_validate_candidate_tree "$1" main git -C "$2"
+  ' -- "$kind" "$DOT_TEST_TMP/profile-local-reserved-seed" >/dev/null 2>&1; then
+    fail "$kind accepted machine-local selector ownership"
+  fi
+done
 
 printf 'repos-test: ok\n'

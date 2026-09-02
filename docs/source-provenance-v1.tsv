@@ -27,8 +27,12 @@ lib/dot/main.sh	standalone:new
 lib/dot/merge-block.sh	dotfiles:core/merge-block.sh@dotfiles-v1
 lib/dot/merge-hooks.sh	dotfiles:core/merge-hooks.sh@dotfiles-v1
 lib/dot/merges.sh	dotfiles:core/merges.sh@dotfiles-v1
+lib/dot/overlay-context.sh	standalone:new
 lib/dot/overlays.sh	dotfiles:core/overlays.sh@dotfiles-v1
 lib/dot/platform.sh	dotfiles:core/platform.sh@dotfiles-v1
+lib/dot/profile-format.sh	standalone:new
+lib/dot/profile-lifecycle.sh	standalone:new
+lib/dot/profiles.sh	standalone:new
 lib/dot/pre-sync.sh	standalone:new
 lib/dot/progress-ui.sh	dotfiles:core/progress-ui.sh@dotfiles-v1
 lib/dot/providers/shdeps-ui.sh	dotfiles:core/shdeps-ui.sh@dotfiles-v1
@@ -71,6 +75,7 @@ tests/client-launcher-test	standalone:new
 tests/config-test	standalone:new
 tests/doctor-test	dotfiles:tests/core-doctor-test@dotfiles-v1+standalone
 tests/examples-test	standalone:new
+tests/extension-worker-context-test	standalone:new
 tests/extensions-api-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/families-test	dotfiles:tests/core-merges-test@dotfiles-v1
 tests/hook-api-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
@@ -82,8 +87,11 @@ tests/lib/test.sh	standalone:new
 tests/library-test	standalone:new
 tests/license-test	standalone:new
 tests/merge-block-test	dotfiles:tests/core-merges-test@dotfiles-v1
+tests/overlay-profile-resolution-test	standalone:new
+tests/ownership-transfer-test	standalone:new
 tests/provider-suite-wrapper	standalone:new
 tests/provenance-test	standalone:new
+tests/profiles-test	standalone:new
 tests/repos-test	dotfiles:tests/core-pull-test+core-overlays-test@dotfiles-v1+standalone
 tests/resources-test	dotfiles:tests/core-resource-cleanup-test@dotfiles-v1+standalone
 tests/run	standalone:new

@@ -89,7 +89,7 @@ _dot_doctor_extension_specs() {
   local root script key identity
   local -A seen=()
 
-  [[ ${DOT_EXTENSION_API:-} == 1 && -n ${DOT_EXTENSIONS_DIR:-} ]] || return 0
+  _dot_extensions_enabled || return 0
   _dot_extension_root_validate || return 1
   root=$DOT_EXTENSIONS_DIR/doctor.d
   if [[ ! -e $root && ! -L $root ]]; then
@@ -133,7 +133,7 @@ _dot_doctor_render_records() {
 }
 
 _dot_doctor_run_extension() {
-  local key=$1 script=$2 temporary result log rc=0 worker_pid
+  local key=$1 script=$2 temporary result log context token rc=0 worker_pid
 
   if ! _dot_cleanup_mktemp -d; then
     _dr_fail "$key doctor extension temporary directory unavailable" \
@@ -145,8 +145,17 @@ _dot_doctor_run_extension() {
   log=$temporary/output
   : >"$result"
   chmod 0600 "$result"
+  if ! _dot_overlay_context_create "$temporary" doctor active none \
+    "${ACTIVE_OVERLAYS[@]+"${ACTIVE_OVERLAYS[@]}"}"; then
+    _dr_fail "$key doctor extension context unavailable"
+    _dot_cleanup_remove_path "$temporary" || true
+    return 1
+  fi
+  context=$REPLY_PATH
+  token=$REPLY_TOKEN
   _dot_cleanup_begin_job_launch closed-stdin
   _dot_extension_worker_exec doctor "$script" "$temporary" "$result" \
+    "$context" "$token" \
     <&"$DOT_CLEANUP_LAUNCH_STDIN_FD" >"$log" 2>&1 &
   worker_pid=$!
   _dot_cleanup_finish_job_launch "$worker_pid"

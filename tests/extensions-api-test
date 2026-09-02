@@ -146,7 +146,7 @@ printf '%s\t%s\t%s\n' "$extension_rel" example "$active_target" \
   >"$DOT_OVERLAY_MANIFEST"
 chmod 0600 "$DOT_OVERLAY_MANIFEST"
 # shellcheck disable=SC2034 # Consumed dynamically by the sourced validator.
-OVERLAYS=("example|$active_overlay|$active_origin|fixture|false|git")
+OVERLAYS=("example|$active_overlay|$active_origin|$HOME/.config/dot/overlays.d/10-example.conf|false|git")
 _dot_extension_file_validate "$extension_link" ||
   fail 'active owned overlay implementation symlink was rejected'
 
@@ -155,8 +155,12 @@ chmod 0700 "$HOME/overlay-worker"
 printf 'url=%s\n' "$active_origin" \
   >"$HOME/.config/dot/overlays.d/10-example.conf"
 chmod 0644 "$HOME/.config/dot/overlays.d/10-example.conf"
+_dot_overlay_context_create "$HOME/overlay-worker" merge active none \
+  "${OVERLAYS[@]}"
+overlay_context=$REPLY_PATH
+overlay_token=$REPLY_TOKEN
 _dot_extension_worker_run merge "$extension_link" "$HOME/overlay-worker" \
-  "$HOME/overlay-worker-result" ||
+  "$HOME/overlay-worker-result" "$overlay_context" "$overlay_token" ||
   fail 'fresh worker rejected an active overlay implementation symlink'
 assert_eq 1 "$(<"$HOME/overlay-worker-result")" \
   'fresh worker records an active overlay merge entry point'
@@ -231,6 +235,9 @@ printf '%s\n' sourced >"$HOME/worker-bash-env-ran"
 BASH_ENV_FILE
 : >"$HOME/doctor-results"
 chmod 0600 "$HOME/doctor-results"
+_dot_overlay_context_create "$HOME/doctor-worker" doctor active none
+doctor_context=$REPLY_PATH
+doctor_token=$REPLY_TOKEN
 dot_test_inherited_function() { :; }
 export -f dot_test_inherited_function
 export DOT_TEST_INHERITED_VARIABLE=present
@@ -246,7 +253,7 @@ export BASHOPTS
   export DOT_TEST_EXPECTED_IGNORED_TRAPS
   PATH="$HOME/fake-bin:$PATH" _dot_extension_worker_run doctor \
     "$trust_root/doctor.d/10-worker.sh" "$HOME/doctor-worker" \
-    "$HOME/doctor-results"
+    "$HOME/doctor-results" "$doctor_context" "$doctor_token"
 ) || fail 'isolated doctor worker failed'
 shopt -u extglob
 unset BASH_ENV DOT_TEST_INHERITED_VARIABLE
@@ -268,9 +275,15 @@ doctor() {
 }
 DOCTOR
 chmod 0644 "$trust_root/doctor.d/20-public-temp.sh"
+private_context_dir=$HOME/private-context
+mkdir "$private_context_dir"
+chmod 0700 "$private_context_dir"
+_dot_overlay_context_create "$private_context_dir" doctor active none
+public_context=$REPLY_PATH
+public_token=$REPLY_TOKEN
 if _dot_extension_worker_run doctor \
   "$trust_root/doctor.d/20-public-temp.sh" "$HOME/public-worker" \
-  "$HOME/doctor-results"; then
+  "$HOME/doctor-results" "$public_context" "$public_token"; then
   fail 'doctor worker accepted non-private temporary storage'
 fi
 [[ ! -e $HOME/public-worker-ran ]] ||
@@ -285,9 +298,12 @@ doctor() {
 }
 DOCTOR
 chmod 0644 "$trust_root/doctor.d/30-cancellable.sh"
+_dot_overlay_context_create "$HOME/cancellable-worker" doctor active none
+cancellable_context=$REPLY_PATH
+cancellable_token=$REPLY_TOKEN
 _dot_extension_worker_exec doctor \
   "$trust_root/doctor.d/30-cancellable.sh" "$HOME/cancellable-worker" \
-  "$HOME/doctor-results" &
+  "$HOME/doctor-results" "$cancellable_context" "$cancellable_token" &
 cancellable_pid=$!
 worker_deadline=$((SECONDS + 5))
 while ((SECONDS < worker_deadline)); do

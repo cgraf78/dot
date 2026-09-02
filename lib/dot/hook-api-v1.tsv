@@ -1,4 +1,5 @@
 # function	arguments	status	result and side effects
+dot_hook_file	RELATIVE_PATH	0 validated; 1 unsafe or unavailable; 2 invalid arguments	sets REPLY to one validated client support file without sourcing it
 dot_hook_source	RELATIVE_PATH	0 sourced; 1 unsafe or unavailable; 2 invalid arguments	sources one validated client support module in the current isolated worker
 dot_hook_family	FAMILY	0 success; 2 invalid arguments	prints the XDG client fragment-family directory
 dot_hook_family_files	FAMILY	0 success; 2 invalid arguments	prints the ordered aggregate and .replace winner stream for one client family
@@ -12,6 +13,9 @@ dot_expand_home	VALUE	0 success; 2 invalid arguments	prints only documented HOME
 dot_sibling_tmp_for	DESTINATION	0 allocated; 1 failure; 2 invalid arguments	sets REPLY to an exclusive sibling temporary file
 dot_write_text_if_changed	DESTINATION TEXT	0 success; 1 failure; 2 invalid arguments	atomically writes changed text and preserves an unchanged inode
 dot_commit_tmp	TEMP DESTINATION	0 success; 1 failure; 2 invalid arguments	atomically replaces DESTINATION with a prepared sibling
+dot_file_generation	DESTINATION	0 captured; 1 unsupported or unavailable; 2 invalid arguments	prints an opaque regular-file or absent generation for conditional mutation
+dot_commit_tmp_if_generation	TEMP DESTINATION GENERATION	0 committed; 1 stale or failed; 2 invalid arguments	atomically publishes TEMP only while DESTINATION still matches GENERATION
+dot_remove_if_generation	DESTINATION GENERATION	0 removed; 1 stale or failed; 2 invalid arguments	removes DESTINATION only while it still matches GENERATION
 dot_json_available	-	0 available; 1 unavailable; 2 invalid arguments	no output
 dot_json_layer	LABEL SOURCE DESTINATION FILTER	0 success; 1 failure; 2 invalid arguments	merges one validated JSON layer through jq
 dot_managed_block_build	MARKER SOURCE BODY	0 success; 2 invalid arguments	prints one managed block

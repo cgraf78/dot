@@ -7,10 +7,11 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$root/tests/lib/test.sh"
 
 HOME=$DOT_TEST_TMP/home
+DOT_TEST=1
 DOT_SOURCE_ROOT=$root
 DOT_EXTENSIONS_DIR=$HOME/extensions
 mkdir -p "$HOME" "$DOT_EXTENSIONS_DIR" "$DOT_TEST_TMP/bin"
-export HOME DOT_SOURCE_ROOT DOT_EXTENSIONS_DIR
+export HOME DOT_TEST DOT_SOURCE_ROOT DOT_EXTENSIONS_DIR
 # shellcheck source=../lib/dot/public/xdg.sh
 . "$root/lib/dot/public/xdg.sh"
 # shellcheck source=../lib/dot/temp.sh
@@ -109,6 +110,289 @@ inode_before=$(stat -c '%i' "$text_target" 2>/dev/null || stat -f '%i' "$text_ta
 dot_write_text_if_changed "$text_target" $'alpha\nbeta'
 inode_after=$(stat -c '%i' "$text_target" 2>/dev/null || stat -f '%i' "$text_target")
 assert_eq "$inode_before" "$inode_after" 'unchanged text helper preserves inode'
+
+transaction_target=$HOME/generated/transaction.conf
+printf 'managed\n' >"$transaction_target"
+transaction_generation=$(dot_file_generation "$transaction_target")
+dot_sibling_tmp_for "$transaction_target"
+transaction_tmp=$REPLY
+printf 'updated\n' >"$transaction_tmp"
+dot_commit_tmp_if_generation \
+  "$transaction_tmp" "$transaction_target" "$transaction_generation"
+assert_eq 'updated' "$(<"$transaction_target")" \
+  'generation commit replaces the captured regular file'
+
+transaction_generation=$(dot_file_generation "$transaction_target")
+printf 'user replacement\n' >"$transaction_target"
+dot_sibling_tmp_for "$transaction_target"
+transaction_tmp=$REPLY
+printf 'stale update\n' >"$transaction_tmp"
+if dot_commit_tmp_if_generation \
+  "$transaction_tmp" "$transaction_target" "$transaction_generation"; then
+  fail 'generation commit accepted a stale destination'
+fi
+assert_eq 'user replacement' "$(<"$transaction_target")" \
+  'generation commit preserves a late replacement'
+rm -f "$transaction_tmp"
+
+transaction_generation=$(dot_file_generation "$transaction_target")
+dot_remove_if_generation "$transaction_target" "$transaction_generation"
+[[ ! -e $transaction_target && ! -L $transaction_target ]] ||
+  fail 'generation remove did not delete the captured regular file'
+
+transaction_generation=$(dot_file_generation "$transaction_target")
+printf 'late creation\n' >"$transaction_target"
+if dot_remove_if_generation "$transaction_target" "$transaction_generation"; then
+  fail 'generation remove accepted a stale absent destination'
+fi
+assert_eq 'late creation' "$(<"$transaction_target")" \
+  'generation remove preserves a late creation'
+
+if dot_remove_if_generation "$transaction_target" 'v1|forged'; then
+  fail 'generation remove accepted a malformed token'
+fi
+assert_eq 'late creation' "$(<"$transaction_target")" \
+  'malformed generation cannot mutate a destination'
+
+transaction_link=$HOME/generated/transaction-link
+ln -s "$transaction_target" "$transaction_link"
+if dot_file_generation "$transaction_link" >/dev/null; then
+  fail 'file generation accepted a symlink destination'
+fi
+rm "$transaction_link"
+
+mkdir "$HOME/parent-a" "$HOME/parent-b"
+printf 'parent a\n' >"$HOME/parent-a/config"
+printf 'parent b\n' >"$HOME/parent-b/config"
+ln -s "$HOME/parent-a" "$HOME/selected-parent"
+parent_generation=$(dot_file_generation "$HOME/selected-parent/config")
+rm "$HOME/selected-parent"
+ln -s "$HOME/parent-b" "$HOME/selected-parent"
+dot_sibling_tmp_for "$HOME/selected-parent/config"
+parent_tmp=$REPLY
+printf 'redirected update\n' >"$parent_tmp"
+if dot_commit_tmp_if_generation \
+  "$parent_tmp" "$HOME/selected-parent/config" "$parent_generation"; then
+  fail 'generation commit followed a replaced parent symlink'
+fi
+assert_eq 'parent a' "$(<"$HOME/parent-a/config")" \
+  'parent swap preserves the originally captured file'
+assert_eq 'parent b' "$(<"$HOME/parent-b/config")" \
+  'parent swap preserves the replacement parent file'
+rm -f "$parent_tmp"
+
+printf 'managed\n' >"$transaction_target"
+transaction_generation=$(dot_file_generation "$transaction_target")
+dot_sibling_tmp_for "$transaction_target"
+transaction_tmp=$REPLY
+printf 'candidate\n' >"$transaction_tmp"
+move_noreplace_definition=$(declare -f _dot_move_noreplace)
+eval "${move_noreplace_definition/_dot_move_noreplace/_dot_move_noreplace_original}"
+late_publish_injected=0
+# shellcheck disable=SC2329 # Invoked indirectly by the transaction helper.
+_dot_move_noreplace() {
+  if [[ $1 == */candidate && $2 == "$transaction_target" &&
+    $late_publish_injected -eq 0 ]]; then
+    printf 'late winner\n' >"$2"
+    late_publish_injected=1
+  fi
+  _dot_move_noreplace_original "$@"
+}
+if dot_commit_tmp_if_generation \
+  "$transaction_tmp" "$transaction_target" "$transaction_generation"; then
+  fail 'generation commit replaced a late publication winner'
+fi
+eval "$move_noreplace_definition"
+unset -f _dot_move_noreplace_original
+assert_eq 'late winner' "$(<"$transaction_target")" \
+  'generation commit preserves a publication winner'
+[[ ! -e $HOME/generated/.transaction.conf.dot-file-transaction-v1 ]] ||
+  fail 'publication conflict left transaction debris'
+
+printf 'managed\n' >"$transaction_target"
+transaction_generation=$(dot_file_generation "$transaction_target")
+dot_sibling_tmp_for "$transaction_target"
+transaction_tmp=$REPLY
+printf 'candidate\n' >"$transaction_tmp"
+move_noreplace_definition=$(declare -f _dot_move_noreplace)
+eval "${move_noreplace_definition/_dot_move_noreplace/_dot_move_noreplace_original}"
+late_quarantine_injected=0
+# shellcheck disable=SC2329 # Invoked indirectly by the transaction helper.
+_dot_move_noreplace() {
+  if [[ $1 == "$transaction_target" && $2 == */previous &&
+    $late_quarantine_injected -eq 0 ]]; then
+    printf 'quarantine winner\n' >"$1"
+    late_quarantine_injected=1
+  fi
+  _dot_move_noreplace_original "$@"
+}
+if dot_commit_tmp_if_generation \
+  "$transaction_tmp" "$transaction_target" "$transaction_generation"; then
+  fail 'generation commit accepted a quarantine-boundary replacement'
+fi
+eval "$move_noreplace_definition"
+unset -f _dot_move_noreplace_original
+assert_eq 'quarantine winner' "$(<"$transaction_target")" \
+  'generation commit restores a quarantine-boundary replacement'
+[[ ! -e $HOME/generated/.transaction.conf.dot-file-transaction-v1 ]] ||
+  fail 'quarantine conflict left transaction debris'
+
+printf 'before crash\n' >"$transaction_target"
+transaction_generation=$(dot_file_generation "$transaction_target")
+dot_sibling_tmp_for "$transaction_target"
+transaction_tmp=$REPLY
+printf 'after crash\n' >"$transaction_tmp"
+set +e
+(
+  _dot_file_transaction_prepare replace "$transaction_tmp" \
+    "$transaction_target" "$transaction_generation" || exit 1
+  # shellcheck disable=SC2034 # Read dynamically by the transaction helper.
+  DOT_FILE_TRANSACTION_OPERATION=replace
+  _dot_file_transaction_quarantine || exit 1
+  kill -KILL "$BASHPID"
+) 2>/dev/null
+crash_status=$?
+set -e
+[[ $crash_status -ne 0 ]] || fail 'pre-commit crash fixture did not terminate'
+dot_file_generation "$transaction_target" >/dev/null
+assert_eq 'before crash' "$(<"$transaction_target")" \
+  'recovery restores the previous file after a pre-commit crash'
+
+transaction_generation=$(dot_file_generation "$transaction_target")
+dot_sibling_tmp_for "$transaction_target"
+transaction_tmp=$REPLY
+printf 'committed before crash\n' >"$transaction_tmp"
+set +e
+(
+  _dot_file_transaction_prepare replace "$transaction_tmp" \
+    "$transaction_target" "$transaction_generation" || exit 1
+  # shellcheck disable=SC2034 # Read dynamically by the transaction helper.
+  DOT_FILE_TRANSACTION_OPERATION=replace
+  _dot_file_transaction_quarantine || exit 1
+  _dot_move_noreplace "$DOT_FILE_TRANSACTION_PATH/candidate" \
+    "$DOT_FILE_TRANSACTION_DESTINATION" || exit 1
+  kill -KILL "$BASHPID"
+) 2>/dev/null
+crash_status=$?
+set -e
+[[ $crash_status -ne 0 ]] || fail 'post-commit crash fixture did not terminate'
+dot_file_generation "$transaction_target" >/dev/null
+assert_eq 'committed before crash' "$(<"$transaction_target")" \
+  'recovery retains a published file after a post-commit crash'
+[[ ! -e $HOME/generated/.transaction.conf.dot-file-transaction-v1 ]] ||
+  fail 'crash recovery left transaction debris'
+
+printf 'remove before crash\n' >"$transaction_target"
+transaction_generation=$(dot_file_generation "$transaction_target")
+set +e
+(
+  _dot_file_transaction_prepare remove '' \
+    "$transaction_target" "$transaction_generation" || exit 1
+  # shellcheck disable=SC2034 # Read dynamically by the transaction helper.
+  DOT_FILE_TRANSACTION_OPERATION=remove
+  _dot_file_transaction_quarantine || exit 1
+  kill -KILL "$BASHPID"
+) 2>/dev/null
+crash_status=$?
+set -e
+[[ $crash_status -ne 0 ]] || fail 'remove pre-commit crash fixture did not terminate'
+dot_file_generation "$transaction_target" >/dev/null
+assert_eq 'remove before crash' "$(<"$transaction_target")" \
+  'remove recovery restores the file after a pre-commit crash'
+
+transaction_generation=$(dot_file_generation "$transaction_target")
+set +e
+(
+  _dot_file_transaction_prepare remove '' \
+    "$transaction_target" "$transaction_generation" || exit 1
+  # shellcheck disable=SC2034 # Read dynamically by the transaction helper.
+  DOT_FILE_TRANSACTION_OPERATION=remove
+  _dot_file_transaction_quarantine || exit 1
+  _dot_file_transaction_record_write "$DOT_FILE_TRANSACTION_PATH" \
+    remove committed "$DOT_FILE_TRANSACTION_EXPECTED" - || exit 1
+  kill -KILL "$BASHPID"
+) 2>/dev/null
+crash_status=$?
+set -e
+[[ $crash_status -ne 0 ]] || fail 'remove post-commit crash fixture did not terminate'
+dot_file_generation "$transaction_target" >/dev/null
+[[ ! -e $transaction_target && ! -L $transaction_target ]] ||
+  fail 'remove recovery restored a file after its commit point'
+
+printf 'remove managed\n' >"$transaction_target"
+transaction_generation=$(dot_file_generation "$transaction_target")
+_dot_file_transaction_prepare remove '' \
+  "$transaction_target" "$transaction_generation"
+# shellcheck disable=SC2034 # Read dynamically by the transaction helper.
+DOT_FILE_TRANSACTION_OPERATION=remove
+_dot_file_transaction_quarantine
+printf 'remove winner\n' >"$transaction_target"
+dot_file_generation "$transaction_target" >/dev/null
+assert_eq 'remove winner' "$(<"$transaction_target")" \
+  'remove recovery preserves a late creation'
+[[ ! -e $HOME/generated/.transaction.conf.dot-file-transaction-v1 ]] ||
+  fail 'remove recovery left transaction debris'
+
+transaction_generation=$(dot_file_generation "$transaction_target")
+dot_sibling_tmp_for "$transaction_target"
+transaction_tmp=$REPLY
+printf 'cleanup retry\n' >"$transaction_tmp"
+cleanup_definition=$(declare -f _dot_file_transaction_cleanup)
+eval "${cleanup_definition/_dot_file_transaction_cleanup/_dot_file_transaction_cleanup_original}"
+_dot_file_transaction_cleanup() { return 1; }
+if dot_commit_tmp_if_generation \
+  "$transaction_tmp" "$transaction_target" "$transaction_generation"; then
+  fail 'generation commit hid a transaction cleanup failure'
+fi
+eval "$cleanup_definition"
+unset -f _dot_file_transaction_cleanup_original
+assert_eq 'cleanup retry' "$(<"$transaction_target")" \
+  'cleanup failure does not roll back committed content'
+dot_file_generation "$transaction_target" >/dev/null
+[[ ! -e $HOME/generated/.transaction.conf.dot-file-transaction-v1 ]] ||
+  fail 'later generation capture did not finish transaction cleanup'
+
+transaction_dir=$HOME/generated/.transaction.conf.dot-file-transaction-v1
+mkdir -m 700 "$transaction_dir"
+if dot_file_generation "$transaction_target" >/dev/null; then
+  fail 'generation recovery trusted an unmarked transaction directory'
+fi
+[[ -d $transaction_dir ]] ||
+  fail 'generation recovery removed an unmarked transaction directory'
+rmdir "$transaction_dir"
+
+mkdir -m 755 "$transaction_dir"
+if dot_file_generation "$transaction_target" >/dev/null; then
+  fail 'generation recovery trusted a non-private transaction directory'
+fi
+[[ -d $transaction_dir ]] ||
+  fail 'generation recovery removed an untrusted transaction directory'
+chmod 700 "$transaction_dir"
+rmdir "$transaction_dir"
+
+transaction_generation=$(dot_file_generation "$transaction_target")
+dot_sibling_tmp_for "$transaction_target"
+transaction_tmp=$REPLY
+printf 'chmod failure\n' >"$transaction_tmp"
+(
+  # shellcheck disable=SC2329 # Invoked indirectly by the transaction helper.
+  chmod() { return 1; }
+  ! dot_commit_tmp_if_generation \
+    "$transaction_tmp" "$transaction_target" "$transaction_generation"
+) || fail 'generation commit ignored private-directory chmod failure'
+assert_eq 'cleanup retry' "$(<"$transaction_target")" \
+  'private-directory setup failure preserves the destination'
+rm -f "$transaction_tmp"
+if compgen -G "$HOME/generated/.*.dot-file-transaction-v1.init.*" >/dev/null; then
+  fail 'private-directory setup failure left initialization debris'
+fi
+
+unset DOT_TEST
+if dot_file_generation "$transaction_target" >/dev/null; then
+  fail 'generation capture ran without the outer update lock'
+fi
+DOT_TEST=1
+export DOT_TEST
 
 directory_target=$HOME/generated/directory
 mkdir "$directory_target"

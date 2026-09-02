@@ -16,6 +16,7 @@ mkdir -p "$HOME"
 dot_config_load "$DOT_TEST_TMP/missing"
 assert_eq none "$DOT_DEPENDENCY_PROVIDER" 'missing config provider default'
 assert_eq '' "$DOT_EXTENSIONS_DIR" 'missing config extension default'
+assert_eq base "$DOT_DEFAULT_PROFILE" 'missing config profile default'
 assert_eq pinned "$DOT_SHDEPS_UPDATE_POLICY" \
   'missing config Shdeps update policy default'
 
@@ -26,12 +27,19 @@ printf '%s\n' \
   'extension_api=1' \
   'extensions_dir=${HOME}/.local/lib/dotfiles' \
   'dependency_provider=shdeps' \
+  'default_profile=dev' \
   'shdeps_update_policy=latest' >"$config"
 dot_config_load "$config"
 assert_eq "$HOME/.local/lib/dotfiles" "$DOT_EXTENSIONS_DIR" \
   'HOME expansion'
 assert_eq shdeps "$DOT_DEPENDENCY_PROVIDER" 'provider selection'
+assert_eq dev "$DOT_DEFAULT_PROFILE" 'configured profile default'
 assert_eq latest "$DOT_SHDEPS_UPDATE_POLICY" 'Shdeps update policy selection'
+
+DOT_DEFAULT_PROFILE=dev
+dot_config_load "$DOT_TEST_TMP/missing"
+assert_eq base "$DOT_DEFAULT_PROFILE" \
+  'profile default has no environment override'
 
 # A config-derived value must not turn into an environment override across
 # Dot's provider re-exec. The new process should re-read a policy changed by the
@@ -95,6 +103,8 @@ for invalid in \
   'dependency_provider=none' \
   $'version=1\nunknown=value' \
   $'version=1\nversion=1' \
+  $'version=1\ndefault_profile=Bad_Name' \
+  $'version=1\ndefault_profile=base\ndefault_profile=dev' \
   $'version=1\nshdeps_update_policy=invalid' \
   $'version=1\nshdeps_update_policy=pinned\nshdeps_update_policy=latest' \
   $'version=1\nextensions_dir=relative' \

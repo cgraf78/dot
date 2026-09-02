@@ -36,6 +36,19 @@ reach the coordinator or another extension. Merge hooks define `merge()`;
 pre-sync extensions define `prepare()`; doctor extensions define `doctor()`.
 All entry points receive no arguments.
 
+A Git-backed overlay may also provide the repository-only entry point
+`dot/profile-deactivate`, defining `deactivate()`. Dot records only validated
+Git overlays that provide this file. When a later profile deselects one, the
+saved checkout identity is revalidated and the hook runs after the smaller
+link generation is installed but before active merge hooks run.
+`DOT_RETIRING_OVERLAY` names the overlay and the ordinary `OVERLAYS` family is
+empty, so cleanup cannot accidentally treat retired fragments as active. The
+hook must be idempotent and remove only state it can prove it owns; packages,
+caches, credentials, and other user state should normally remain. A failure is
+reported by `dot update`, remains visible in `dot doctor`, and is retried on the
+next update. Filesystem-backed `sync=none` overlays cannot register executable
+deactivation hooks.
+
 Pre-sync extensions run serially in lexical order after candidate and local-
 overlay preflight but before any repository fetch, pull, clone, or checkout
 mutation. The first failure aborts repository synchronization. They use the
@@ -53,9 +66,11 @@ active Git overlay with the expected origin, and the resolved file remains
 inside that owned checkout's `home/` tree. Stale manifest entries and symlinked
 directory components are rejected. Support modules are loaded with
 `dot_hook_source RELATIVE_PATH`, which applies the same validation immediately
-before sourcing. They share the worker's global scope and see no positional
-arguments; use ordinary assignments or functions at top level, not `local`,
-which is meaningful only inside a function body.
+before sourcing. Non-shell helpers use `dot_hook_file RELATIVE_PATH`; it
+applies the same validation and sets `REPLY` to the trusted path without
+executing it. Sourced modules share the worker's global scope and see no
+positional arguments; use ordinary assignments or functions at top level, not
+`local`, which is meaningful only inside a function body.
 
 ## API contract
 
@@ -76,11 +91,24 @@ returned by `dot_sibling_tmp_for` belongs to the caller until
 `dot_commit_tmp TEMP DESTINATION` consumes that prepared sibling or the caller
 removes it after failure.
 
+Retirement hooks that derive a new file from an existing destination must use
+the generation helpers so a user edit cannot be overwritten between read and
+publication. Capture with `generation=$(dot_file_generation "$destination")`,
+then publish through
+`dot_commit_tmp_if_generation "$temporary" "$destination" "$generation"` or
+remove through `dot_remove_if_generation "$destination" "$generation"`.
+These conditional mutations fail when the file, parent directory, or supported
+file type changed. A prepared temporary may be consumed even when publication
+fails, so callers should remove it with `rm -f` on the failure path. Recovery
+uses a private same-directory journal and preserves any late winner.
+
 This merge hook exercises every hook API surface. Real hooks normally use only
 the subset owned by their target format:
 
 ```bash
 merge() {
+  dot_hook_file merge-hooks.d/lib/renderer.py || return
+  renderer=$REPLY
   dot_hook_source merge-hooks.d/lib/parser.sh || return
   family=$(dot_hook_family example) || return
   dot_hook_family_files example >/dev/null || return

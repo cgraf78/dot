@@ -3,6 +3,9 @@
 # parser expands only documented HOME spellings and rejects unknown syntax
 # before any extension or dependency provider can execute.
 
+# shellcheck source=profile-format.sh
+. "${BASH_SOURCE[0]%/*}/profile-format.sh"
+
 # Capture the process environment before config loading publishes the resolved
 # value. Dot loads configuration once in production, while tests may call the
 # parser repeatedly in one shell; keeping the original override separate makes
@@ -20,6 +23,10 @@ _dot_config_control_bytes() {
 
   LC_ALL=C od -An -t u1 "$path" 2>/dev/null |
     awk '{ for (i = 1; i <= NF; i++) if (($i < 32 && $i != 10) || $i == 127) exit 1 }'
+}
+
+_dot_extensions_enabled() {
+  [[ ${DOT_EXTENSION_API:-} == 1 && -n ${DOT_EXTENSIONS_DIR:-} ]]
 }
 
 _dot_config_expand_path() {
@@ -73,12 +80,15 @@ dot_config_load() {
   local config_path=${1:-} line key value size line_number=0 saw_value=false
   local seen_version=false seen_extension_api=false
   local seen_extensions_dir=false seen_dependency_provider=false
-  local seen_shdeps_update_policy=false configured_shdeps_update_policy=pinned
+  local seen_default_profile=false seen_shdeps_update_policy=false
+  local configured_shdeps_update_policy=pinned
 
   DOT_CONFIG_VERSION=1
   DOT_EXTENSION_API=
   DOT_EXTENSIONS_DIR=
   DOT_DEPENDENCY_PROVIDER=none
+  # shellcheck disable=SC2034 # Published configuration consumed by profiles.sh.
+  DOT_DEFAULT_PROFILE=base
   case $_DOT_CONFIG_ENV_SHDEPS_UPDATE_POLICY in
     '' | pinned | latest) ;;
     *)
@@ -158,6 +168,15 @@ dot_config_load() {
           none | shdeps) DOT_DEPENDENCY_PROVIDER=$value ;;
           *) _dot_config_error "unsupported dependency_provider: $value" || return ;;
         esac
+        ;;
+      default_profile)
+        [[ "$seen_default_profile" == false ]] ||
+          _dot_config_error 'duplicate default_profile' || return
+        seen_default_profile=true
+        _dot_profile_identifier_valid "$value" ||
+          _dot_config_error "invalid default_profile: $value" || return
+        # shellcheck disable=SC2034 # Published configuration consumed by profiles.sh.
+        DOT_DEFAULT_PROFILE=$value
         ;;
       shdeps_update_policy)
         [[ "$seen_shdeps_update_policy" == false ]] ||
