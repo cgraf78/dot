@@ -269,8 +269,8 @@ fn stat_helpers_match_shell() {
         &[],
         None,
         "printf '%s|%s|%s|%s' \
-          \"$(stat -c '%a' \"$2\")\" \"$(stat -c '%s' \"$2\")\" \
-          \"$(stat -c '%u' \"$2\")\" \"$(stat -c '%h' \"$2\")\"",
+          \"$(_dot_file_stat_mode \"$2\")\" \"$(_dot_file_stat_size \"$2\")\" \
+          \"$(_dot_path_uid \"$2\")\" \"$(_dot_path_nlink \"$2\")\"",
     );
     assert_eq!(code, 0, "shell stat");
     let shell = String::from_utf8(out).expect("stat text");
@@ -284,11 +284,17 @@ fn stat_helpers_match_shell() {
     assert_eq!(rust, shell, "stat fields match");
     // A second hard link is visible on both sides.
     std::fs::hard_link(&file, root.join("app.link")).expect("hard link");
-    let (code, out) = shell_run(root, &[file.as_os_str()], &[], None, "stat -c '%h' \"$2\"");
+    let (code, out) = shell_run(
+        root,
+        &[file.as_os_str()],
+        &[],
+        None,
+        "printf '%s' \"$(_dot_path_nlink \"$2\")\"",
+    );
     assert_eq!(code, 0, "shell nlink");
     let shell = String::from_utf8(out).expect("nlink text");
     assert_eq!(
-        format!("{}\n", temp::path_nlink(&file).expect("rust nlink")),
+        temp::path_nlink(&file).expect("rust nlink").to_string(),
         shell,
         "link count follows hard links"
     );
