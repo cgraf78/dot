@@ -35,8 +35,14 @@ jobs:
       # default PATH, where the checkout resolver's walk finds it; other
       # platforms ship a new enough Bash natively.
       setup-command: |
-        if [ "$(uname -s)" = Darwin ] && ! brew --prefix bash >/dev/null 2>&1; then
-          brew install bash
+        # `brew --prefix` alone is not a reliable installed-check, so
+        # require the executable itself (same pattern as the macos-bash32
+        # job below).
+        if [ "$(uname -s)" = Darwin ]; then
+          brew_prefix=$(brew --prefix bash 2>/dev/null || true)
+          if [ -z "$brew_prefix" ] || [ ! -x "$brew_prefix/bin/bash" ]; then
+            brew install bash
+          fi
         fi
       # Slice 1 has no release/packaging scripts yet, so the Android and
       # Termux gates validate what exists: cross-compilation and the
