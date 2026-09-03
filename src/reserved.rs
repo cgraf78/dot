@@ -298,10 +298,11 @@ pub fn reserved_root(requested: &str, pwd: &str) -> Result<Vec<String>, Error> {
         } else {
             physical_directory_candidate(&normalized, pwd).ok()
         };
-    if let Some(physical) = physical
-        && physical != normalized
-    {
-        roots.push(physical);
+    // No let-chains (MSRV 1.85): nested `if`s instead.
+    if let Some(physical) = physical {
+        if physical != normalized {
+            roots.push(physical);
+        }
     }
     Ok(roots)
 }

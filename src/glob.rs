@@ -131,16 +131,17 @@ fn class_match(class: &[u8], byte: u8) -> Option<usize> {
             return if matched != negate { Some(ix) } else { None };
         }
         first = false;
-        if current == b'\\'
-            && let Some(&escaped) = class.get(ix + 1)
-        {
-            // Escaped member: scores like an ordinary one and stages
-            // as a range start (`[\--0]` spans from `-`).
-            matched |= !dash_shadow && prev.is_some_and(|start| start == byte);
-            prev = Some(escaped);
-            dash_shadow = false;
-            ix += 2;
-            continue;
+        // No let-chains (MSRV 1.85): nested `if`s instead.
+        if current == b'\\' {
+            if let Some(&escaped) = class.get(ix + 1) {
+                // Escaped member: scores like an ordinary one and stages
+                // as a range start (`[\--0]` spans from `-`).
+                matched |= !dash_shadow && prev.is_some_and(|start| start == byte);
+                prev = Some(escaped);
+                dash_shadow = false;
+                ix += 2;
+                continue;
+            }
         }
         if current == b'-' {
             match (prev, class.get(ix + 1)) {

@@ -4,10 +4,24 @@
 //! byte-ordered stream (including a non-UTF8 filename probe).
 
 use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, Stdio};
 
 use dot::families::family_files;
+
+/// Raw bytes of an `OsStr` for byte-exact comparisons. Unix: lossless.
+/// Elsewhere: lossy (the byte-level probes are `#[cfg(unix)]`-gated;
+/// only UTF-8 fixtures reach this helper there).
+#[cfg(unix)]
+fn raw_bytes(value: &OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    value.as_bytes().to_vec()
+}
+
+/// Non-Unix fallback for [`raw_bytes`].
+#[cfg(not(unix))]
+fn raw_bytes(value: &OsStr) -> Vec<u8> {
+    value.to_string_lossy().into_owned().into_bytes()
+}
 
 fn bash_bin() -> &'static str {
     for candidate in ["/usr/bin/bash", "/bin/bash"] {
@@ -77,7 +91,13 @@ impl Fixture {
             std::fs::write(root.join(name), b"payload").expect("write");
         }
         // Non-UTF8 filename: byte-level candidacy and ordering.
-        std::fs::write(root.join(OsStr::from_bytes(b"bad\xffname.sh")), b"payload").expect("write");
+        // Unix-only: non-UTF8 names have no portable spelling.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::fs::write(root.join(OsStr::from_bytes(b"bad\xffname.sh")), b"payload")
+                .expect("write");
+        }
         let group = root.join("05-group.replace");
         std::fs::create_dir(&group).expect("mkdir");
         for name in ["01-low.sh", "02-high.sh", "skip~", ".hidden-in-group"] {
@@ -105,12 +125,12 @@ impl Fixture {
     fn check(&self, matching: bool, patterns: &[&OsStr]) {
         let dir = self.dir.path().as_os_str();
         let (shell_code, shell_out) = shell_family(dir, matching, patterns);
-        let owned: Vec<Vec<u8>> = patterns.iter().map(|p| p.as_bytes().to_vec()).collect();
+        let owned: Vec<Vec<u8>> = patterns.iter().map(|p| raw_bytes(p)).collect();
         let borrowed: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
         let rust = family_files(Some(self.dir.path()), &borrowed).expect("arity ok");
         let mut rust_out = Vec::new();
         for path in &rust {
-            rust_out.extend_from_slice(path.as_os_str().as_bytes());
+            rust_out.extend_from_slice(&raw_bytes(path.as_os_str()));
             rust_out.push(b'\n');
         }
         assert_eq!(
@@ -164,7 +184,9 @@ fn missing_and_file_directories_are_empty() {
 /// with the pattern arriving via a variable, exactly like
 /// `_dot_family_key_matches`. Whatever bash says here rules; the
 /// unit tests in `src/glob.rs` must agree with this matrix.
+/// Unix-only: byte-exact argv have no portable spelling.
 #[test]
+#[cfg(unix)]
 fn glob_exotics_match_shell_case() {
     use dot::glob::matches;
     // (pattern, key) pairs; the verdict comes from bash at runtime.
@@ -259,8 +281,8 @@ fn glob_exotics_match_shell_case() {
             .arg("-c")
             .arg("key=$1; pat=$2; case $key in $pat) exit 0;; *) exit 1;; esac")
             .arg("dot-test-sh")
-            .arg(OsStr::from_bytes(key))
-            .arg(OsStr::from_bytes(pattern))
+            .arg(os_arg(key))
+            .arg(os_arg(pattern))
             .env_clear()
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
@@ -277,19 +299,28 @@ fn glob_exotics_match_shell_case() {
     }
 }
 
+/// Build an argv element from raw bytes (Unix-only: byte-exact argv
+/// have no portable spelling).
+#[cfg(unix)]
+fn os_arg(bytes: &[u8]) -> &OsStr {
+    use std::os::unix::ffi::OsStrExt;
+    OsStr::from_bytes(bytes)
+}
+
 #[test]
+#[cfg(unix)]
 fn non_utf8_name_is_byte_exact() {
     let fixture = Fixture::build();
     let dir = fixture.dir.path().as_os_str();
     let (_, shell_out) = shell_family(dir, true, &[OsStr::new("bad*")]);
-    let mut expected = dir.as_bytes().to_vec();
+    let mut expected = raw_bytes(dir);
     expected.extend_from_slice(b"/bad\xffname.sh\n");
     assert_eq!(shell_out, expected, "shell fixture sanity");
     let patterns: Vec<&[u8]> = vec![b"bad*"];
     let rust = family_files(Some(fixture.dir.path()), &patterns).expect("ok");
     assert_eq!(rust.len(), 1);
     assert_eq!(
-        rust[0].as_os_str().as_bytes(),
-        &expected[..expected.len() - 1]
+        raw_bytes(rust[0].as_os_str()),
+        expected[..expected.len() - 1]
     );
 }
