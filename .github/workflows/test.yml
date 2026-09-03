@@ -43,9 +43,15 @@ jobs:
       # scripts arrive with the release workflow in a later slice.
       termux-command: scripts/termux-ci.sh
       termux-host-command: |
-        cargo build --release --locked --target "$RUST_TARGET"
+        # Build outside the checkout: the emulator copy step tars the
+        # whole caller tree, and in-tree target/ hardlinks break that
+        # copy with permission errors (sibling convention uses
+        # $RUNNER_TEMP target dirs for the same reason).
+        CARGO_TARGET_DIR="$RUNNER_TEMP/dot-termux-target" \
+          cargo build --release --locked --target "$RUST_TARGET"
         mkdir -p .termux-ci
-        cp "target/$RUST_TARGET/release/dot" .termux-ci/dot
+        cp "$RUNNER_TEMP/dot-termux-target/$RUST_TARGET/release/dot" \
+          .termux-ci/dot
 
   shell:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@b97bd729afec784785bd01ebd43321225ef47bb7
