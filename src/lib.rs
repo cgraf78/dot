@@ -20,6 +20,8 @@ pub mod log;
 pub mod merge_block;
 pub mod merge_hooks;
 pub mod merges;
+pub mod overlay_context;
+pub mod overlays;
 pub mod platform;
 pub mod profiles;
 pub mod reserved;
