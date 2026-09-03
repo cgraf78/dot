@@ -30,13 +30,19 @@ grep -Fq "BASE_SHA: \${{ github.event.pull_request.base.sha || github.event.befo
 # shellcheck disable=SC2016 # The workflow must retain these literal shell variables.
 grep -Fq 'run: scripts/verify-shdeps-lock --if-changed "$EVENT_NAME" "$BASE_SHA"' \
   "$workflow" || fail 'CI must delegate lock change detection to the verifier'
-grep -Fq 'needs: [shell, macos-bash32, shdeps-lock]' "$workflow" ||
-  fail 'Required must wait for the Shdeps lock check'
+grep -Fq 'needs: [shell, macos-bash32, shdeps-lock, rust]' "$workflow" ||
+  fail 'Required must wait for the Shdeps lock check and the Rust port'
 # shellcheck disable=SC2016 # The workflow must retain this literal expression.
 grep -Fq 'SHDEPS_LOCK_RESULT: ${{ needs.shdeps-lock.result }}' "$workflow" ||
   fail 'Required must receive the Shdeps lock result'
 # shellcheck disable=SC2016 # The workflow must retain this literal shell variable.
 grep -Fq 'test "$SHDEPS_LOCK_RESULT" = success' "$workflow" ||
   fail 'Required must reject a failed Shdeps lock check'
+# shellcheck disable=SC2016 # The workflow must retain this literal expression.
+grep -Fq 'RUST_RESULT: ${{ needs.rust.result }}' "$workflow" ||
+  fail 'Required must receive the Rust port result'
+# shellcheck disable=SC2016 # The workflow must retain this literal shell variable.
+grep -Fq 'test "$RUST_RESULT" = success' "$workflow" ||
+  fail 'Required must reject a failed Rust port'
 
 printf 'workflow-test: ok\n'
