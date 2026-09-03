@@ -70,6 +70,7 @@ support/install-checkout.sh	standalone:new
 support/post-install.sh	standalone:new
 support/shdeps.lock	shdeps:installer-lock
 tests/batch-verification-test	standalone:new
+tests/cleanup.rs	standalone:new
 tests/cli-test	standalone:new
 tests/cli.rs	standalone:new
 tests/client-launcher-test	standalone:new
