@@ -93,6 +93,8 @@ tests/library-test	standalone:new
 tests/license-test	standalone:new
 tests/log.rs	standalone:new
 tests/merge-block-test	dotfiles:tests/core-merges-test@dotfiles-v1
+tests/merge_block.rs	standalone:new
+tests/merge_hooks.rs	standalone:new
 tests/overlay-profile-resolution-test	standalone:new
 tests/ownership-transfer-test	standalone:new
 tests/perf_budget.rs	standalone:new
