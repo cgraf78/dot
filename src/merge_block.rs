@@ -37,8 +37,10 @@ fn is_shell_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
 }
 
-/// Trim shell whitespace from both ends, byte-exact.
-fn trim_shell_space(text: &str) -> &str {
+/// Trim shell whitespace from both ends, byte-exact. Shared with
+/// [`crate::merges`]: the shell repeats this `${var%%...}`
+/// idiom in every merge helper.
+pub fn trim_shell_space(text: &str) -> &str {
     let bytes = text.as_bytes();
     let mut start = 0;
     let mut end = bytes.len();

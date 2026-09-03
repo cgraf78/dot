@@ -128,6 +128,7 @@ tests; the binary is still not on PATH and no shell behavior changed):
 | `temp` | `temp.sh` | generation tokens (verbatim string compares, trailing-delimiter quirk); prepare/quarantine/commit/remove with shell-identical unwinds; `mv` via the same probed binary (BSD nesting recovery); git-sha digests under the sanitized binding; umask read from the process; sorted tree walk (deterministic; success end-state order-free) |
 | `merge_block` | `merge-block.sh` | modeline strip + shell-whitespace trim; every `sed`-range strip (same-line ranges stay open); family strips; squeeze-join-finalize with digest-skipped 600 publish; re-merge is mtime-identical |
 | `merge_hooks` | `merge-hooks.sh` | XDG hooks root; family stream/markers/relpaths; narrow `${HOME}`/`$HOME`/`~` expansion; text writes; `jq` layer with stderr-forwarded warnings and corrupt rebuilds |
+| `merges` | `merges.sh` (pure half) | label derivation; serial detection; job counts (verbatim counts, signed warning math, `getconf`/`sysctl` chain); summaries; `%03d` result prefixes; batch/capture/run stay shell until the progress-UI/worker/context slices |
 | `version::LIBRARY_API` | `public/api-version.sh` | `DOT_LIBRARY_API=1` pinned on both sides |
 
 ## 6. Non-contract (explicitly out of slice 1)
