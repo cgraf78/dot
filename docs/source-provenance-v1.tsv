@@ -92,6 +92,7 @@ tests/merge-block-test	dotfiles:tests/core-merges-test@dotfiles-v1
 tests/overlay-profile-resolution-test	standalone:new
 tests/ownership-transfer-test	standalone:new
 tests/perf_budget.rs	standalone:new
+tests/perf_update.rs	standalone:new
 tests/provider-suite-wrapper	standalone:new
 tests/provenance-test	standalone:new
 tests/profiles-test	standalone:new
