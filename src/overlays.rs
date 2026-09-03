@@ -459,7 +459,7 @@ pub fn parse_conf(
 
 /// `_overlay_is_worktree`: a directory whose `.git` entry exists
 /// and whose physical directory is the `git` top level.
-fn is_worktree(path: &Path) -> bool {
+pub fn is_worktree(path: &Path) -> bool {
     if !path.is_dir() {
         return false;
     }
@@ -492,7 +492,7 @@ fn is_worktree(path: &Path) -> bool {
 /// `_overlay_effective_url`: resolve local relative URLs from
 /// `$HOME` before comparison, keeping scp/colon, scheme,
 /// absolute, and Windows-drive spellings as configured.
-fn effective_url(url: &str, home: &str) -> String {
+pub fn effective_url(url: &str, home: &str) -> String {
     if url == "~" {
         return home.to_string();
     }
@@ -515,7 +515,7 @@ fn effective_url(url: &str, home: &str) -> String {
 /// against the configured spelling. Returns the recorded URL on a
 /// match, or the `<missing>` / `<multiple origin URLs>`
 /// diagnostic the shell stores in `REPLY`.
-fn origin_matches(path: &Path, expected: &str) -> Result<String, String> {
+pub fn origin_matches(path: &Path, expected: &str) -> Result<String, String> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(path)
