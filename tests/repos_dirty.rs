@@ -517,23 +517,17 @@ fn stage_listed_matching(work: &Path) -> Vec<u8> {
 }
 
 /// Bump a file's mtime without changing content (stat-dirty but
-/// content-clean), preserving a minimum 1s granularity step.
+/// content-clean) via `set_modified`: no subprocess, portable
+/// across the suite platforms, with a +2s step for coarse
+/// filesystem granularity.
 fn filetime_touch(path: &Path, mtime: std::time::SystemTime) {
     let later = mtime + std::time::Duration::from_secs(2);
-    let unix = later
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("mtime range")
-        .as_secs() as i64;
-    // `touch -d @epoch` is portable across the suite platforms.
-    let status = Command::new("touch")
-        .arg("-d")
-        .arg(format!("@{unix}"))
-        .arg(path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("touch");
-    assert!(status.success(), "touch {}", path.display());
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for mtime")
+        .set_modified(later)
+        .expect("set mtime");
 }
 
 #[test]
