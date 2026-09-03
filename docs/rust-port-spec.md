@@ -130,6 +130,8 @@ tests; the binary is still not on PATH and no shell behavior changed):
 | `merge_hooks` | `merge-hooks.sh` | XDG hooks root; family stream/markers/relpaths; narrow `${HOME}`/`$HOME`/`~` expansion; text writes; `jq` layer with stderr-forwarded warnings and corrupt rebuilds |
 | `merges` | `merges.sh` (pure half) | label derivation; serial detection; job counts (verbatim counts, signed warning math, `getconf`/`sysctl` chain); summaries; `%03d` result prefixes; batch/capture/run stay shell until the progress-UI/worker/context slices |
 | `profiles` | `profile-format.sh` + `profiles.sh` (load/select) | definition parse; include expansion with cycle detection; selector matching by specificity; default resolution; `od`-star fail-closed replication; sorted validation order (shell hash order only affects multi-error precedence) |
+| `overlay_context` | `overlay-context.sh` | NUL-framed one-use contexts; field/path/record/matrix validators; ownership-gated file safety; `od` repeat-marker fail-closed; cross-engine frame compatibility both directions |
+| `overlays` | `overlays.sh` (+ `repos/config.sh` checkout match) | descriptor parse; strict/legacy discovery with selection echo; name derivation mirroring bash `=~` `$` newline anchoring; glob-exact `*.conf` filter (dotfiles skipped); `mapfile`-empty origin semantics; warning-text discovery errors (never announced) |
 | `version::LIBRARY_API` | `public/api-version.sh` | `DOT_LIBRARY_API=1` pinned on both sides |
 
 ## 6. Non-contract (explicitly out of slice 1)
