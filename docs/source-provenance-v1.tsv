@@ -88,6 +88,7 @@ tests/lib/repo.sh	standalone:new
 tests/lib/test.sh	standalone:new
 tests/library-test	standalone:new
 tests/license-test	standalone:new
+tests/log.rs	standalone:new
 tests/merge-block-test	dotfiles:tests/core-merges-test@dotfiles-v1
 tests/overlay-profile-resolution-test	standalone:new
 tests/ownership-transfer-test	standalone:new
