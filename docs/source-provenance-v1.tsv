@@ -109,6 +109,9 @@ tests/provider-suite-wrapper	standalone:new
 tests/provenance-test	standalone:new
 tests/profiles-test	standalone:new
 tests/repos-test	dotfiles:tests/core-pull-test+core-overlays-test@dotfiles-v1+standalone
+tests/repos_base.rs	standalone:new
+tests/repos_config.rs	standalone:new
+tests/repos_dirty.rs	standalone:new
 tests/repos_overlays.rs	standalone:new
 tests/reserved.rs	standalone:new
 tests/resources-test	dotfiles:tests/core-resource-cleanup-test@dotfiles-v1+standalone
