@@ -13,37 +13,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use dot::config::{Provider, Request, UpdatePolicy, load};
+use dot::test_support::TempDir;
 
-/// Isolated scratch root, removed on drop.
-struct Scratch {
-    path: PathBuf,
-}
-
-impl Scratch {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "dot-config-diff-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).expect("scratch dir");
-        Self { path }
-    }
-
-    fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
-        let path = self.path.join(name);
-        std::fs::write(&path, bytes).expect("write fixture");
-        path
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
+/// Fail loudly (not as a byte-diff) when scratch storage loses a
+/// fixture between setup and engine invocation: a missing file parses
+/// as defaults on both sides, which would otherwise masquerade as a
+/// parser divergence.
+fn require_fixture(path: &Path, context: &str) {
+    assert!(
+        path.is_file(),
+        "fixture vanished before {context}: {}",
+        path.display()
+    );
 }
 
 /// Outcome of one parse, normalized so shell and Rust compare directly:
@@ -177,14 +158,16 @@ const ENV_POLICIES: &[Option<&str>] = &[None, Some("pinned"), Some("latest"), So
 #[test]
 fn rust_matches_shell_on_valid_corpus() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let scratch = Scratch::new();
-    let home = scratch.path.join("home");
+    let scratch = TempDir::new("config-diff").expect("scratch dir");
+    let home = scratch.path().join("home");
     std::fs::create_dir_all(&home).expect("home dir");
     let home_str = home.to_str().expect("home utf8");
     for (index, body) in VALID_CORPUS.iter().enumerate() {
         let path = scratch.write(&format!("valid-{index}"), body.as_bytes());
         for env_policy in ENV_POLICIES {
+            require_fixture(&path, "shell parse");
             let shell = shell_parse(&manifest, &path, &home, *env_policy);
+            require_fixture(&path, "rust parse");
             let rust = rust_parse(&path, home_str, *env_policy);
             assert_eq!(
                 rust, shell,
@@ -197,13 +180,15 @@ fn rust_matches_shell_on_valid_corpus() {
 #[test]
 fn rust_matches_shell_on_invalid_corpus() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let scratch = Scratch::new();
-    let home = scratch.path.join("home");
+    let scratch = TempDir::new("config-diff").expect("scratch dir");
+    let home = scratch.path().join("home");
     std::fs::create_dir_all(&home).expect("home dir");
     let home_str = home.to_str().expect("home utf8");
     for (index, body) in INVALID_CORPUS.iter().enumerate() {
         let path = scratch.write(&format!("invalid-{index}"), body.as_bytes());
+        require_fixture(&path, "shell parse");
         let shell = shell_parse(&manifest, &path, &home, None);
+        require_fixture(&path, "rust parse");
         let rust = rust_parse(&path, home_str, None);
         assert_eq!(
             rust, shell,
@@ -215,11 +200,11 @@ fn rust_matches_shell_on_invalid_corpus() {
 #[test]
 fn rust_matches_shell_on_missing_file() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let scratch = Scratch::new();
-    let home = scratch.path.join("home");
+    let scratch = TempDir::new("config-diff").expect("scratch dir");
+    let home = scratch.path().join("home");
     std::fs::create_dir_all(&home).expect("home dir");
     let home_str = home.to_str().expect("home utf8");
-    let missing = scratch.path.join("does-not-exist");
+    let missing = scratch.path().join("does-not-exist");
     let shell = shell_parse(&manifest, &missing, &home, None);
     let rust = rust_parse(&missing, home_str, None);
     assert_eq!(rust, shell);
@@ -229,7 +214,7 @@ fn rust_matches_shell_on_missing_file() {
 /// assert the shape explicitly so a stderr/stdout swap cannot hide.
 #[test]
 fn rejection_shape_is_stderr_and_exit_1() {
-    let scratch = Scratch::new();
+    let scratch = TempDir::new("config-diff").expect("scratch dir");
     let path = scratch.write("bad", b"version=2\n");
     match rust_parse(&path, "/home/u", None) {
         Outcome::Err(code, stderr) => {

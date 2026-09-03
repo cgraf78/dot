@@ -13,8 +13,7 @@ pub mod cli;
 pub mod config;
 pub mod errors;
 pub mod log;
-#[cfg(test)]
-mod test_support;
+pub mod test_support;
 pub mod ui;
 pub mod version;
 pub mod xdg;
