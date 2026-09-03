@@ -130,10 +130,11 @@ fn rust_matches_shell_on_ui_matrix() {
 fn gum_branch_invokes_identical_argv() {
     use std::os::unix::fs::PermissionsExt;
 
-    // Counter-based scratch (see `dot::test_support`): unique across
-    // parallel tests and CI phases without wall-clock reads; the guard
-    // removes it on drop, replacing the manual pid-dir cleanup.
-    let scratch = dot::test_support::TempDir::new("ui-gum").expect("fixture dir");
+    // Exec-capable scratch (see `dot::test_support::TempDir::new_exec`):
+    // the fixture must RUN (the shell's `style --help` gate), and the
+    // system temp dir is `noexec` on some CI images. The guard removes
+    // it on drop.
+    let scratch = dot::test_support::TempDir::new_exec("ui-gum").expect("fixture dir");
     let dir = scratch.path();
     let log = dir.join("argv.log");
     let fixture = dir.join("gum");
