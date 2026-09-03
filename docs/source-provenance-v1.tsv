@@ -97,6 +97,8 @@ tests/merge_block.rs	standalone:new
 tests/merge_hooks.rs	standalone:new
 tests/merges.rs	standalone:new
 tests/overlay-profile-resolution-test	standalone:new
+tests/overlay_context.rs	standalone:new
+tests/overlays.rs	standalone:new
 tests/ownership-transfer-test	standalone:new
 tests/perf_budget.rs	standalone:new
 tests/perf_update.rs	standalone:new
