@@ -70,6 +70,7 @@ support/install-checkout.sh	standalone:new
 support/post-install.sh	standalone:new
 support/shdeps.lock	shdeps:installer-lock
 tests/batch-verification-test	standalone:new
+tests/cleanup.rs	standalone:new
 tests/cli-test	standalone:new
 tests/cli.rs	standalone:new
 tests/client-launcher-test	standalone:new
@@ -106,5 +107,6 @@ tests/test-command-test	standalone:new
 tests/test-lifecycle-test	dotfiles:.local/lib/dotfiles/tests/core/runner.sh@dotfiles-v2+standalone
 tests/ui.rs	standalone:new
 tests/update-lock-test	dotfiles:tests/core-update-test@dotfiles-v1+standalone
+tests/update_lock.rs	standalone:new
 tests/workflow-test	standalone:new
 tests/xdg.rs	standalone:new
