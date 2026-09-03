@@ -103,6 +103,7 @@ tests/shdeps-lock-verifier-test	standalone:new
 tests/shdeps-provider-test	dotfiles:tests/core-test+core-reexec-test@dotfiles-v1+standalone
 tests/test-command-test	standalone:new
 tests/test-lifecycle-test	dotfiles:.local/lib/dotfiles/tests/core/runner.sh@dotfiles-v2+standalone
+tests/ui.rs	standalone:new
 tests/update-lock-test	dotfiles:tests/core-update-test@dotfiles-v1+standalone
 tests/workflow-test	standalone:new
 tests/xdg.rs	standalone:new
