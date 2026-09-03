@@ -875,8 +875,8 @@ impl State {
     }
 
     /// `_dot_profile_resolve` with the identity already determined
-    /// (pure; the thin [`resolve`] wrapper runs `id -un` and the
-    /// platform hostname first).
+    /// (pure; the thin [`State::resolve`] wrapper runs `id -un` and
+    /// the platform hostname first).
     pub fn resolve_with(
         &mut self,
         root: &Path,
