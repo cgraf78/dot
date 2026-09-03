@@ -175,13 +175,16 @@ fn remove_one(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Send SIGTERM via the `kill` CLI (std cannot address SIGTERM).
-/// Failures are best-effort (`|| true` in the shell): the grace loop
-/// and KILL escalation below handle uncooperative children.
+/// Send SIGTERM via the shell's `kill` builtin (std cannot address
+/// SIGTERM, and the external `kill` binary is absent from minimal
+/// images where the shell still works). Failures are best-effort
+/// (`|| true` in the shell): the grace loop and KILL escalation below
+/// handle uncooperative children. The pid is a u32, so no quoting is
+/// needed.
 fn terminate(pid: u32) {
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -TERM {pid}"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();

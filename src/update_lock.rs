@@ -181,11 +181,17 @@ pub fn process_start_ps(pid: u32) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-/// Foreign-pid liveness via `kill -0` (std cannot send signal 0).
+/// Foreign-pid liveness via the shell's `kill -0` builtin (std cannot
+/// send signal 0, and the external `kill` binary is absent from
+/// minimal images that the shell still supports: there `kill` is a
+/// builtin, so invoke it through `sh`, exactly like the shell's own
+/// `kill -0 "$pid" 2>/dev/null`. The pid is a u32, so no quoting is
+/// needed. A missing `sh` degrades to inactive, like every other
+/// unreadable-identity path.
 fn pid_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -0 {pid}"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
