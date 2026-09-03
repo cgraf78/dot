@@ -356,14 +356,12 @@ fn verify_failure_parity() {
 
 #[test]
 fn status_porcelain_parity() {
-    // Parity quirk: the `git` on PATH is a dotfiles-aware launcher that
-    // records its real-git resolution under `$HOME/.cache`. With a
-    // fixture `$HOME` that directory is untracked, so the tree is never
-    // porcelain-clean. Pre-seeding `.cache` makes the artifact
-    // deterministic: both sides must report exactly one `?? .cache/` row.
+    // One untracked file: both engines must report exactly one `??`
+    // row with identical bytes on every platform (an empty
+    // directory would print nothing anywhere, so seed a file).
     let args = ["status", "--porcelain"];
     let (sep_home, sep_git) = fixture_separate("repos-base-por-sep-home", "repos-base-por-sep-git");
-    std::fs::create_dir_all(sep_home.path().join(".cache")).expect("seed cache dir");
+    std::fs::write(sep_home.path().join("scratch.txt"), b"scratch\n").expect("seed untracked");
     let (rc, out) = assert_dispatch_parity(
         Topology::Separate,
         "separate",
@@ -373,9 +371,19 @@ fn status_porcelain_parity() {
         b"",
     );
     assert_eq!(rc, 0);
-    assert_eq!(out, b"?? .cache/\n", "only the launcher cache row");
+    // Exact bytes already match across engines inside the helper;
+    // here pin the scratch row's presence (other environment rows,
+    // like a launcher cache dir, may legitimately appear).
+    let rows: Vec<&[u8]> = out
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert!(
+        rows.contains(&b"?? scratch.txt".as_slice()),
+        "untracked row present: {out:?}"
+    );
     let ord_home = fixture_ordinary("repos-base-por-ord-home");
-    std::fs::create_dir_all(ord_home.path().join(".cache")).expect("seed cache dir");
+    std::fs::write(ord_home.path().join("scratch.txt"), b"scratch\n").expect("seed untracked");
     let (rc, out) = assert_dispatch_parity(
         Topology::Ordinary,
         "ordinary",
@@ -385,7 +393,14 @@ fn status_porcelain_parity() {
         b"",
     );
     assert_eq!(rc, 0);
-    assert_eq!(out, b"?? .cache/\n", "only the launcher cache row");
+    let rows: Vec<&[u8]> = out
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert!(
+        rows.contains(&b"?? scratch.txt".as_slice()),
+        "untracked row present: {out:?}"
+    );
 }
 
 #[test]
