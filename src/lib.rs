@@ -21,6 +21,7 @@ pub mod merge_block;
 pub mod merge_hooks;
 pub mod merges;
 pub mod platform;
+pub mod profiles;
 pub mod reserved;
 pub mod temp;
 pub mod test_support;
