@@ -17,6 +17,8 @@ pub mod errors;
 pub mod families;
 pub mod glob;
 pub mod log;
+pub mod merge_block;
+pub mod merge_hooks;
 pub mod platform;
 pub mod reserved;
 pub mod temp;
