@@ -14,6 +14,7 @@ pub mod config;
 pub mod errors;
 #[cfg(test)]
 mod test_support;
+pub mod ui;
 pub mod version;
 pub mod xdg;
 
