@@ -7,13 +7,10 @@ use std::process::{Command, Stdio};
 use dot::constants::resolve;
 use dot::version::LIBRARY_API;
 
-fn bash_bin() -> &'static str {
-    for candidate in ["/usr/bin/bash", "/bin/bash"] {
-        if std::path::Path::new(candidate).is_file() {
-            return candidate;
-        }
-    }
-    panic!("no bash interpreter found");
+/// Oracle interpreter, shared with the other differential harnesses (see
+/// `dot::test_support::bash`).
+fn bash_bin() -> &'static std::path::Path {
+    dot::test_support::bash()
 }
 
 /// Source `xdg.sh` + `api-version.sh` + `constants.sh` under the given

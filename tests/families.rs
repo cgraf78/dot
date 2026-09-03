@@ -23,15 +23,12 @@ fn raw_bytes(value: &OsStr) -> Vec<u8> {
     value.to_string_lossy().into_owned().into_bytes()
 }
 
-/// PATH-resolved `bash`: this harness never overrides PATH, so resolution
-/// matches the shell suite (`#!/usr/bin/env bash`) and the engine's
-/// `DOT_BASH` runtime exactly. That matters on macOS, where the fixed
-/// `/bin/bash` is the 3.2 trampoline (whose case-pattern quirks, e.g.
-/// a trailing lone backslash, differ from the 5.x engine runtime the
-/// port targets) — resolving via PATH finds the same modern bash the
-/// oracle suite runs under.
+/// Oracle interpreter: absolute path resolved once from the parent PATH
+/// (see `dot::test_support::bash`), so hermetic children spawn the
+/// engine runtime even under `env_clear` — a bare `bash` would follow
+/// the child's env and fall back to the macOS 3.2 trampoline.
 fn bash_cmd() -> Command {
-    Command::new("bash")
+    Command::new(dot::test_support::bash())
 }
 
 /// Run `dot_family_files` / `dot_family_files_matching` on `dir` with
