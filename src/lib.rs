@@ -15,5 +15,6 @@ pub mod errors;
 #[cfg(test)]
 mod test_support;
 pub mod version;
+pub mod xdg;
 
 pub use errors::{Error, Result};
