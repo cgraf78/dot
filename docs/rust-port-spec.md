@@ -125,6 +125,7 @@ tests; the binary is still not on PATH and no shell behavior changed):
 | `reserved` | `reserved.sh` | roots inventory compared line-for-line; ancestor-swallowing candidate rule; leaf symlinks resolve `realpath`-style (dangling included) |
 | `families` | `families.sh` | byte-ordered stream incl. non-UTF8 names; patterns filter before `.replace` selection |
 | `constants` | `constants.sh` | `${VAR:-0}` substitutes on empty too |
+| `temp` | `temp.sh` | generation tokens (verbatim string compares, trailing-delimiter quirk); prepare/quarantine/commit/remove with shell-identical unwinds; `mv` via the same probed binary (BSD nesting recovery); git-sha digests under the sanitized binding; umask read from the process; sorted tree walk (deterministic; success end-state order-free) |
 | `version::LIBRARY_API` | `public/api-version.sh` | `DOT_LIBRARY_API=1` pinned on both sides |
 
 ## 6. Non-contract (explicitly out of slice 1)

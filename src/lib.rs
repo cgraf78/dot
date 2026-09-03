@@ -19,6 +19,7 @@ pub mod glob;
 pub mod log;
 pub mod platform;
 pub mod reserved;
+pub mod temp;
 pub mod test_support;
 pub mod ui;
 pub mod update_lock;
