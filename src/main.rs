@@ -13,13 +13,16 @@
 //! This adapter itself performs no fallible setup, so it cannot fail
 //! before `run` takes over.
 
-use std::io::{stderr, stdout};
+use std::io::{Write, stderr, stdout};
 
 fn main() {
-    let code = dot::cli::run(
-        std::env::args_os().skip(1),
-        &mut stdout().lock(),
-        &mut stderr().lock(),
-    );
-    std::process::exit(code);
+    let mut out = stdout().lock();
+    let mut err = stderr().lock();
+    let code = dot::cli::run(std::env::args_os().skip(1), &mut out, &mut err);
+    // `process::exit` runs no destructors and flushes nothing; `StdoutLock`
+    // is line-buffered, so a future write without a trailing newline would
+    // be silently truncated without this. A flush failure here means the
+    // output did not land, which is itself a failure to report.
+    let flushed = out.flush().is_ok() && err.flush().is_ok();
+    std::process::exit(if flushed { code } else { 1 });
 }

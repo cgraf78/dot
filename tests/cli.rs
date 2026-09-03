@@ -64,21 +64,42 @@ fn binary_version_shape() {
 #[test]
 fn binary_version_agrees_with_shell_in_same_checkout() {
     // Both implementations resolve the revision from the same checkout,
-    // so their outputs must be identical here. If the shell cannot run
-    // (no Bash 4+), skip rather than fail: shell parity is owned by
-    // `bash tests/run`, not this pin.
+    // so their outputs must be identical here. Skips are LOUD (stderr):
+    // a silent pass would hide a broken shell path or a stale baked
+    // revision. Shell parity itself is owned by `bash tests/run`.
+    // Known race: a commit landing between compile time (baked SHA) and
+    // this run fails despite both sides being correct; likewise an
+    // explicit DOT_BUILD_COMMIT/GITHUB_SHA stamping intentionally
+    // disagrees with run-time `git rev-parse HEAD`.
     let shell = Command::new("bash")
         .arg("bin/dot")
         .arg("version")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output();
-    let Ok(shell) = shell else { return };
+    let Ok(shell) = shell else {
+        eprintln!("SKIP: cannot spawn bash for shell agreement check");
+        return;
+    };
     if !shell.status.success() {
+        eprintln!("SKIP: shell `dot version` failed; shell parity is owned by tests/run");
         return;
     }
     let rust = bin().arg("version").output().expect("run dot version");
     assert!(rust.status.success());
     assert_eq!(rust.stdout, shell.stdout);
+}
+
+/// The exact `printf` format in the shell dispatcher. Unlike HELP (a
+/// heredoc with stable boundaries), this is one line inside a function,
+/// so the pin asserts the shell still contains the literal rather than
+/// re-extracting it: a wording drift in `commands.sh` must fail here.
+fn shell_unknown_command_format() -> &'static str {
+    let source = include_str!("../lib/dot/commands.sh");
+    assert!(
+        source.contains("printf 'dot: unknown command: %s\\n'"),
+        "shell dispatcher changed its unknown-command wording"
+    );
+    "dot: unknown command: frobnicate\n"
 }
 
 #[test]
@@ -91,6 +112,21 @@ fn binary_unknown_command_fails_like_shell() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr UTF-8"),
-        "dot: unknown command: frobnicate\n"
+        shell_unknown_command_format()
     );
+}
+
+#[test]
+fn binary_help_flags_match_shell() {
+    let expected = shell_help();
+    for flag in ["-h", "--help"] {
+        let output = bin().arg(flag).output().expect("run dot flag");
+        assert!(output.status.success(), "flag: {flag}");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout UTF-8"),
+            expected,
+            "flag: {flag}"
+        );
+        assert!(output.stderr.is_empty(), "flag: {flag}");
+    }
 }

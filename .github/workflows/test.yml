@@ -21,6 +21,14 @@ jobs:
       # missing-doc lint, fmt, audit, and the default `cargo test --locked`
       # invocation; local copies would drift.
       msrv-toolchain: "1.85"
+      # Perf budgets are calibrated on a fast host and must run at
+      # multiplier 1 in CI, including the #[ignore]-gated heavy tests
+      # (none in slice 1; the slice-2 update harness joins them
+      # automatically). The multiplier env exists for slow developer
+      # hosts only and gate jobs must not raise it.
+      test-command: >-
+        cargo test --locked &&
+        DOT_PERF_BUDGET_MULTIPLIER=1 cargo test --locked -- --ignored
       # Slice 1 has no release/packaging scripts yet, so the Android and
       # Termux gates validate what exists: cross-compilation and the
       # native test suite. Packaging smoke arrives with the release
@@ -28,7 +36,10 @@ jobs:
       android-package-smoke-command: |
         cargo build --locked --target "$RUST_TARGET"
         test -x "target/$RUST_TARGET/debug/dot"
-      termux-command: cargo test --locked
+      # Termux hardware is too slow and variable for wall-clock perf
+      # budgets (p95-over-30 at 25/30ms), so the emulator runs unit and
+      # CLI-parity tests only; perf budgets are a fast-host gate.
+      termux-command: cargo test --locked --lib --bins --test cli
 
   shell:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@b97bd729afec784785bd01ebd43321225ef47bb7
@@ -141,12 +152,13 @@ jobs:
   required:
     name: Required
     if: ${{ always() }}
-    needs: [shell, macos-bash32, shdeps-lock]
+    needs: [shell, macos-bash32, shdeps-lock, rust]
     runs-on: ubuntu-24.04
     env:
       SHELL_RESULT: ${{ needs.shell.result }}
       BASH32_RESULT: ${{ needs.macos-bash32.result }}
       SHDEPS_LOCK_RESULT: ${{ needs.shdeps-lock.result }}
+      RUST_RESULT: ${{ needs.rust.result }}
     steps:
       - name: Require all compatibility checks
         shell: bash
@@ -154,9 +166,11 @@ jobs:
           printf 'Shared shell CI: %s\n' "$SHELL_RESULT"
           printf 'Stock macOS Bash 3.2: %s\n' "$BASH32_RESULT"
           printf 'Shdeps lock: %s\n' "$SHDEPS_LOCK_RESULT"
+          printf 'Rust port: %s\n' "$RUST_RESULT"
           test "$SHELL_RESULT" = success
           test "$BASH32_RESULT" = success
           test "$SHDEPS_LOCK_RESULT" = success
+          test "$RUST_RESULT" = success
 
   actions-sync:
     name: cgraf78/actions sync

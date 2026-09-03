@@ -13,29 +13,40 @@ wins and this spec gets amended.
   `unknown` when no revision is available (no git, thin checkout, or
   `DOT_BUILD_COMMIT` unset and unresolvable). This matches `dot_version()`
   in `lib/dot/main.sh`, including the `unknown` fallback.
-- `build.rs` provides `DOT_BUILD_COMMIT` / `DOT_BUILD_VERSION` via
-  `cargo:rustc-env`, resolved as: `$DOT_BUILD_COMMIT` → `$GITHUB_SHA` →
-  `git rev-parse HEAD` in the source checkout → `unknown` (unlike shdeps,
-  never panic: the shell contract defines `unknown`).
-- `DOT_BUILD_VERSION` is `YYYYMMDD-HHMMSS-8hex`, validated
-  (`8digit-6digit-8hex`); falls back to `unknown`.
-- `src/version.rs` exposes `commit()`, `version()`, `description()`,
-  `line()` (`"dot <version>"`) with unit tests asserting shape and
-  `version[15..23] == commit[..8]` when both are known.
+- `build.rs` provides `DOT_BUILD_COMMIT` / `DOT_BUILD_SHORT_COMMIT` /
+  `DOT_BUILD_VERSION` via `cargo:rustc-env`, resolved as:
+  `$DOT_BUILD_COMMIT` → `$GITHUB_SHA` → `git rev-parse HEAD` walking up
+  from the manifest dir → `unknown` (unlike shdeps, never panic: the
+  shell contract defines `unknown`). The short commit is the lowercased
+  first 12 hex chars, else `unknown`.
+- `DOT_BUILD_VERSION` accepts any non-empty `$DOT_BUILD_VERSION`,
+  else `unknown`. The shared `YYYYMMDD-HHMMSS-8hex` scheme and its
+  validation arrive with the release workflow in a later slice.
+- `src/version.rs` exposes `COMMIT` / `SHORT_COMMIT` / `VERSION`
+  consts plus `version_line()` (exact `dot version` text) and
+  `description()`, with unit tests asserting the revision is `unknown`
+  or 12 hex chars.
 
 ## 2. CLI surface (slice 1)
 
 Commands owned by the Rust binary in this slice: `help` (default,
-`-h`, `--help`), `version` (`--version`). All other commands exit via
-the existing shell implementation (the binary is not yet on PATH).
+`-h`, `--help`), `version` (`--version`). The binary is not yet on
+PATH, so the shell remains the entry point; direct invocations of
+unported commands (`update`, `status`, …) yield the shell's
+`unknown command` / exit 1 until their owning slice lands.
 
+- Unknown command exits 1 **when config loads** (the shell runs
+  `dot_config_load || exit 2` before dispatch, so an unloadable config
+  exits 2 for ANY command — specified in forward contracts, tested in
+  slice 2 with the config parser).
 - `dot help` prints the exact `dot_help` heredoc from `lib/dot/main.sh`
   (byte-identical; pinned by `tests/cli.rs` against the shell source).
 - Unknown command: `dot: unknown command: <arg>\n` on stderr, exit 1.
 - `version` output goes to stdout; errors to stderr; exit 0 on success.
-- I/O streams are injected (`run(args, stdout, stderr) -> Result<i32>`)
+- I/O streams are injected (`run(args, stdout, stderr) -> i32`)
   so parity tests capture text without subprocesses (shdeps `cli.rs`
-  pattern).
+  pattern). (`Result` is reserved for fallible engine operations in
+  later slices; slice-1 dispatch is infallible by construction.)
 
 ## 3. Performance budgets (slice 1)
 
@@ -43,10 +54,15 @@ Measured on the reference host; enforced by `tests/perf_budget.rs`
 (p95 over runs, CLI-level including process startup, following
 `hive-memory` `tests/perf_budget.rs`):
 
-| Operation | Shell baseline | Rust budget (p95) |
-|---|---|---|
-| `help` | ~18ms | 25ms |
-| `version` (warm, git available) | ~26ms | 30ms |
+| Operation | Shell baseline (warm) | Rust budget (p95) | Rust expected |
+|---|---|---|---|
+| `help` | ~18ms (parse+probes) | 25ms | ~2-5ms |
+| `version` | ~26ms (incl. one `git rev-parse` fork; Rust bakes the revision, no fork) | 30ms | ~2-5ms |
+
+Budgets are CI-variance ceilings, not targets: the port must beat them
+by an order of magnitude on the reference host; a change that merely
+squeaks under budget without improving on the shell has failed the
+point of the port even if the gate is green.
 
 - Multiplier env `DOT_PERF_BUDGET_MULTIPLIER` (float, default 1.0) exists
   for slow developer hosts only. Gate CI jobs run perf tests explicitly
@@ -81,7 +97,7 @@ Full command table (`lib/dot/commands.sh`, `lib/dot/main.sh`):
 | `doctor` | resolve tolerated + `_dot_doctor` | 0/1 |
 | `test` | resolve + `dot_test_command` (`-s -v -j N --list [names]`) | runner codes |
 | `init` | lock (except `--status/--help/-h`) + `dot_init_command` | 0/1/2 (unknown `--*`), 75 |
-| unknown | `dot: unknown command: %s` on stderr | 1 |
+| unknown | `dot: unknown command: %s` on stderr | 1 (2 if config unloadable — config load precedes dispatch) |
 
 Environment (precedence: process env wins; captured at load): `DOT_BASH`,
 `DOT_FORCE`/`SHDEPS_FORCE`, `DOT_QUIET`/`SHDEPS_QUIET`,

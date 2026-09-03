@@ -153,6 +153,52 @@ Module-to-slice assignment (every file owned): 1: docs/CI/scaffold;
 - Budgets cover warm AND cold paths; update budgets assert against the
   slice-2 fixture ceiling (improvement required, not just a ceiling).
 
+## Deployment + migration (fleet rollout)
+
+Two corrected premises (verified live on nas, 2026-09-02):
+
+- Fleet cron runs `dot update --cron`, NOT `-f` (`*/30 * * * * dot
+  update --cron && shdeps prune -y`). `--cron` = quiet + exit 0 when
+  dirty; `-f` only sets `DOT_FORCE`/`SHDEPS_FORCE` (best-effort
+  re-download), it is not the deploy mechanism.
+- `dot update` NEVER touches the engine today: it syncs base +
+  overlays only. Engine upgrades require re-running `install.sh`
+  out-of-band; update merely *survives* engine changes via re-exec
+  (`DOT_REEXEC_ONCE`, expected-revision guard, one-generation
+  checkpoint). nas itself uses a dev-checkout symlink and does not
+  self-update.
+
+Therefore seamless fleet deployment needs a NEW engine self-update
+stage (design decision, requires explicit approval before slice 6):
+new first stage in `_dot_update` (before repo sync) fetching a pinned
+release asset via a `support/dot-release.lock` (version/revision +
+sha256, mirroring `shdeps.lock` + `verify-shdeps-lock`), staged
+`mv -n` publish keeping the last working binary until the new one
+passes its `__api version` probe, then the existing re-exec path
+(generalized from git-HEAD to binary version). `DOT_FORCE=1` maps to
+force re-download, exactly like `SHDEPS_FORCE`.
+
+Migration cases (each needs a passing test before cutover): fresh
+install (curl+shasum only); managed FF update; dirty/detached/foreign
+checkout fails closed; dev-checkout symlink hosts never "upgraded";
+in-flight update during upgrade (single re-exec, double-change
+checkpoint); lock held (exit 75, silent cron); macOS bash3.2
+trampoline + `DOT_BASH` strict override preserved; rollback on bad
+binary (never delete last working binary first); adapter preservation
+(byte-identical `~/.local/bin/dot`); offline/air-gapped (warn, never
+brick — links stay intact).
+
+Live end-to-end gates (run on nas hardware, isolated HOME — never the
+live HOME — before any cutover PR): full `init` of a fixture client
+followed by `update` converging base+overlays+hooks against local
+fixture remotes; cron-mode run (`--cron`) asserting silence and exit 0
+on dirty/clean; engine self-update run (old binary → new binary
+mid-update, asserting single re-exec and identical final links);
+rollback run (bad binary published, asserting previous binary restored
+and links untouched). Each gate compares the final HOME tree
+byte-for-byte against the shell implementation's result on the same
+fixture. No cutover slice merges while any gate diverges.
+
 ## Reference inputs
 
 - `bin/dot`, `lib/dot/*.sh`, `lib/dot/{repos,providers,doctor,test}/`,

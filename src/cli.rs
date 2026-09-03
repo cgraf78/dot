@@ -15,16 +15,32 @@ use std::io::Write;
 
 use crate::version;
 
+/// Native argv bytes for command matching.
+///
+/// On Unix this is the exact argv encoding: command names are pure
+/// ASCII, so non-UTF8 input falls through to "unknown command" and the
+/// diagnostic echoes the original bytes (not U+FFFD replacements,
+/// which would break stderr byte parity with the shell). Elsewhere the
+/// platform has no byte argv to be faithful to, so lossy text is the
+/// only available behavior.
+#[cfg(unix)]
+fn argv_bytes(arg: &OsString) -> Vec<u8> {
+    // `OsStr::as_encoded_bytes` is inherent (no trait import needed):
+    // the exact argv bytes, no UTF-8 validation involved.
+    arg.as_os_str().as_encoded_bytes().to_vec()
+}
+
+/// Fallback where argv has no byte form to preserve (see above).
+#[cfg(not(unix))]
+fn argv_bytes(arg: &OsString) -> Vec<u8> {
+    arg.to_string_lossy().into_owned().into_bytes()
+}
+
 /// Exact bytes of the shell `dot_help` heredoc, including trailing newline.
 ///
-/// Help text is user-visible contract: wrappers, docs, and the shell
-/// test suite quote it, so the Rust port must emit it byte-for-byte
-/// rather than "improving" alignment or wording. One literal per line
-/// via `concat!`: a `\`-continued literal would strip the two-space
-/// command indent (continuations eat leading whitespace), which is
-/// exactly the kind of silent drift this constant exists to prevent.
-/// Pinned by `tests/cli.rs` against the shell source: any drift in
-/// `lib/dot/main.sh` must update this constant in the same commit.
+/// Exact bytes of the shell `dot_help` heredoc. One literal per line:
+/// a `\`-continued literal would strip the two-space command indent.
+/// Pinned by `tests/cli.rs` against `lib/dot/main.sh`.
 pub const HELP: &str = concat!(
     "usage: dot <command> [<args>]\n",
     "\n",
@@ -51,11 +67,8 @@ pub const HELP: &str = concat!(
 /// arrive only with their owning slice (the lock's `75` is not defined
 /// until the lock module lands).
 pub const EXIT_SUCCESS: i32 = 0;
-/// Generic failure: unknown command today; ports of `fetch`/`push`/
-/// `status`/`diff`/`doctor`/`init` repo failures reuse it per the shell
-/// `return 1` paths. Kept distinct from `EXIT_SUCCESS` even though no
-/// slice-1 caller needs the name yet, so later slices cannot silently
-/// invent a second "error" value.
+/// Generic failure (unknown command today; repo-failure paths reuse it
+/// per the shell `return 1` sites). Named so later slices share one value.
 pub const EXIT_ERROR: i32 = 1;
 
 /// Run the CLI writing to the given streams; returns the exit code.
@@ -76,29 +89,42 @@ pub fn run(
 ) -> i32 {
     let mut args = args.into_iter();
     let command = args.next().unwrap_or_default();
-    // Lossy conversion mirrors the shell, which matches on raw bytes
-    // without validating encoding: an undecodable argv element can never
-    // equal a command name, so it falls through to "unknown command"
-    // instead of aborting. `to_string_lossy` produces exactly that
-    // fall-through (replacement chars never match ASCII arms).
-    let command = command.to_string_lossy();
+    let command = argv_bytes(&command);
+    let command = command.as_slice();
     // Shell matches `${1:-help}`: empty or missing command shows help.
     // The empty-string arm matters because `run([])` (no argv at all,
     // as in tests) must behave like bare `dot`, not like an error.
-    match command.as_ref() {
-        "" | "help" | "-h" | "--help" => {
-            let _ = stdout.write_all(HELP.as_bytes());
+    // NOTE: the shell runs `dot_config_load || exit 2` BEFORE dispatch
+    // (main.sh), so with an unloadable config even `frobnicate` exits 2.
+    // This binary does not load config yet (slice 2); the exit-2 path is
+    // specified in the forward contracts and tested when config lands.
+    let mut failed = false;
+    let code = match command {
+        b"" | b"help" | b"-h" | b"--help" => {
+            if stdout.write_all(HELP.as_bytes()).is_err() {
+                failed = true;
+            }
             EXIT_SUCCESS
         }
-        "version" | "--version" => {
-            let _ = writeln!(stdout, "{}", version::version_line());
+        b"version" | b"--version" => {
+            if writeln!(stdout, "{}", version::version_line()).is_err() {
+                failed = true;
+            }
             EXIT_SUCCESS
         }
         _ => {
-            let _ = writeln!(stderr, "dot: unknown command: {command}");
+            // A closed stderr here leaves nothing to report to; the exit
+            // code still carries the failure.
+            let _ = stderr.write_all(b"dot: unknown command: ");
+            let _ = stderr.write_all(command);
+            let _ = stderr.write_all(b"\n");
             EXIT_ERROR
         }
-    }
+    };
+    // A closed pipe must not report success for undelivered output.
+    // (The shell dies on SIGPIPE; Rust reports failure via exit code —
+    // same signal to the caller, different mechanism, pinned by test.)
+    if failed { EXIT_ERROR } else { code }
 }
 
 #[cfg(test)]
@@ -156,5 +182,53 @@ mod tests {
         assert_eq!(code, EXIT_ERROR);
         assert!(out.is_empty());
         assert_eq!(err, "dot: unknown command: frobnicate\n");
+    }
+
+    #[test]
+    fn explicit_empty_command_means_help() {
+        // Distinct from no-arg only at the argv level (`$1` set-but-empty
+        // hits the same `${1:-help}` default); pinned so a future
+        // refactor cannot turn it into "unknown command".
+        let (code, out, err) = run_text(&[""]);
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(out, HELP);
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn closed_stdout_reports_failure_not_success() {
+        struct Failing;
+        impl std::io::Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let owned = vec![OsString::from("help")];
+        let mut err = Vec::new();
+        let code = run(owned, &mut Failing, &mut err);
+        assert_eq!(code, EXIT_ERROR);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_command_echoes_raw_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = vec![0x66, 0x6F, 0xFF, 0x62]; // "fo\xFFb"
+        let owned = vec![OsString::from_vec(raw.clone())];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(owned, &mut out, &mut err);
+        assert_eq!(code, EXIT_ERROR);
+        assert!(out.is_empty());
+        let mut expected = b"dot: unknown command: ".to_vec();
+        expected.extend_from_slice(&raw);
+        expected.push(b'\n');
+        assert_eq!(err, expected);
     }
 }
