@@ -21,7 +21,37 @@
 use std::path::{Path, PathBuf};
 
 use crate::glob;
-use std::os::unix::ffi::OsStrExt;
+
+/// Raw bytes of an `OsStr` for byte-oriented matching and sorting.
+///
+/// Unix (the only engine platform: lossless, the parity contract).
+/// Elsewhere this falls back to lossy decoding so the crate still
+/// compiles; output there is explicitly not byte-exact. Owned return
+/// keeps both configurations behind one signature.
+#[cfg(unix)]
+fn os_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    name.as_bytes().to_vec()
+}
+
+/// Non-Unix fallback for [`os_bytes`]: lossy, never byte-exact.
+#[cfg(not(unix))]
+fn os_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
+    name.to_string_lossy().into_owned().into_bytes()
+}
+
+/// Rebuild a path from raw bytes (inverse of [`os_bytes`]).
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+}
+
+/// Non-Unix fallback for [`path_from_bytes`]: lossy, never exact.
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
 
 /// Family discovery failure. The shell reports a missing directory
 /// argument with exit 2 and treats every other hiccup (missing
@@ -79,11 +109,10 @@ fn is_candidate_file(dir: &Path, base: &[u8]) -> bool {
     if !is_candidate_name(base) {
         return false;
     }
-    let mut path = dir.as_os_str().as_bytes().to_vec();
+    let mut path = os_bytes(dir.as_os_str());
     path.push(b'/');
     path.extend_from_slice(base);
-    std::fs::metadata(Path::new(std::ffi::OsStr::from_bytes(&path)))
-        .is_ok_and(|meta| meta.is_file())
+    std::fs::metadata(path_from_bytes(&path)).is_ok_and(|meta| meta.is_file())
 }
 
 /// Direct children of the family directory form aggregate layers.
@@ -96,8 +125,8 @@ fn direct_keys(dir: &Path, patterns: &[&[u8]]) -> Vec<Vec<u8>> {
     };
     let mut keys = Vec::new();
     for entry in entries.flatten() {
-        let base = entry.file_name();
-        let base = base.as_bytes();
+        let base = os_bytes(&entry.file_name());
+        let base = base.as_slice();
         // Hidden names never match the shell's `*` glob (`dotglob`
         // off); the candidate filter would reject dotfiles anyway,
         // but hidden `.replace` directories must not even compete.
@@ -123,15 +152,15 @@ fn replace_keys(dir: &Path, patterns: &[&[u8]]) -> Vec<Vec<u8>> {
     };
     let mut groups: Vec<Vec<u8>> = Vec::new();
     for entry in entries.flatten() {
-        let base = entry.file_name();
-        let base = base.as_bytes();
+        let base = os_bytes(&entry.file_name());
+        let base = base.as_slice();
         if base.first() == Some(&b'.') || !base.ends_with(b".replace") {
             continue;
         }
-        let mut group = dir.as_os_str().as_bytes().to_vec();
+        let mut group = os_bytes(dir.as_os_str());
         group.push(b'/');
         group.extend_from_slice(base);
-        let group_path = Path::new(std::ffi::OsStr::from_bytes(&group));
+        let group_path = path_from_bytes(&group);
         // `[[ -d ]]` follows symlinks, like the file check above.
         if !group_path.is_dir() {
             continue;
@@ -140,22 +169,22 @@ fn replace_keys(dir: &Path, patterns: &[&[u8]]) -> Vec<Vec<u8>> {
     }
     let mut selected = Vec::new();
     for group in groups {
-        let mut group_path = dir.as_os_str().as_bytes().to_vec();
+        let mut group_path = os_bytes(dir.as_os_str());
         group_path.push(b'/');
         group_path.extend_from_slice(&group);
-        let group_dir = Path::new(std::ffi::OsStr::from_bytes(&group_path));
-        let members = match std::fs::read_dir(group_dir) {
+        let group_dir = path_from_bytes(&group_path);
+        let members = match std::fs::read_dir(&group_dir) {
             Ok(members) => members,
             Err(_) => continue,
         };
         let mut winner: Option<Vec<u8>> = None;
         for member in members.flatten() {
-            let base = member.file_name();
-            let base = base.as_bytes();
+            let base = os_bytes(&member.file_name());
+            let base = base.as_slice();
             if base.first() == Some(&b'.') {
                 continue;
             }
-            if !is_candidate_file(group_dir, base) {
+            if !is_candidate_file(&group_dir, base) {
                 continue;
             }
             let mut key = group.clone();
@@ -195,15 +224,15 @@ pub fn family_files(dir: Option<&Path>, patterns: &[&[u8]]) -> Result<Vec<PathBu
     keys.extend(replace_keys(dir, patterns));
     keys.sort();
     keys.dedup();
-    let prefix = dir.as_os_str().as_bytes();
+    let prefix = os_bytes(dir.as_os_str());
     Ok(keys
         .into_iter()
         .filter(|key| !key.is_empty())
         .map(|key| {
-            let mut full = prefix.to_vec();
+            let mut full = prefix.clone();
             full.push(b'/');
             full.extend_from_slice(&key);
-            PathBuf::from(std::ffi::OsStr::from_bytes(&full))
+            path_from_bytes(&full)
         })
         .collect())
 }

@@ -87,12 +87,17 @@ pub fn host_name(raw: &str) -> String {
 /// plain `hostname` exactly like the shell's `||` chain.
 pub fn detect_host() -> Result<String, Error> {
     for args in [&["-s"][..], &[][..]] {
-        if let Ok(output) = std::process::Command::new("hostname").args(args).output()
-            && output.status.success()
-        {
-            let raw = String::from_utf8_lossy(&output.stdout);
-            return Ok(host_name(raw.trim_end_matches(['\r', '\n'])));
+        // No let-chains: the crate MSRV is 1.85 and let-chains need
+        // 1.88. Same for the other two sites like this one.
+        let output = match std::process::Command::new("hostname").args(args).output() {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+        if !output.status.success() {
+            continue;
         }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        return Ok(host_name(raw.trim_end_matches(['\r', '\n'])));
     }
     Err(Error::Unavailable)
 }
