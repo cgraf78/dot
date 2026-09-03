@@ -41,31 +41,9 @@ fn budget_ms(base: u128) -> u128 {
     ((base as f64) * multiplier) as u128
 }
 
-/// Isolated scratch root, removed on drop.
-struct Scratch {
-    path: PathBuf,
-}
-
-impl Scratch {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "dot-perf-update-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).expect("scratch dir");
-        Self { path }
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+/// Shared counter-based scratch (see `dot::test_support`): pid plus a
+/// monotonic counter, no wall-clock reads.
+type Scratch = dot::test_support::TempDir;
 
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -84,7 +62,7 @@ fn git(dir: &Path, args: &[&str]) {
 /// publish their `home/` tree; the base publishes its root), return its
 /// bare remote path.
 fn seed_remote(scratch: &Scratch, name: &str, branch: &str, prefix: &str, files: usize) -> PathBuf {
-    let seed = scratch.path.join(format!("{name}-seed"));
+    let seed = scratch.path().join(format!("{name}-seed"));
     let root = seed.join(prefix);
     std::fs::create_dir_all(&root).expect("seed dir");
     git(&seed, &["init", "-q"]);
@@ -97,7 +75,7 @@ fn seed_remote(scratch: &Scratch, name: &str, branch: &str, prefix: &str, files:
     }
     git(&seed, &["commit", "-qm", "seed"]);
     git(&seed, &["branch", "-M", branch]);
-    let origin = scratch.path.join(format!("{name}.git"));
+    let origin = scratch.path().join(format!("{name}.git"));
     let status = Command::new("git")
         .arg("clone")
         .arg("-q")
@@ -160,7 +138,7 @@ fn p95_ms(samples: &mut [u128]) -> u128 {
 /// Build the fixture client: base remote with `overlays.d/*.conf`
 /// pointing at the overlay remotes, then `init --yes`.
 fn fixture_client(scratch: &Scratch) -> (PathBuf, PathBuf) {
-    let base_seed = scratch.path.join("base-seed");
+    let base_seed = scratch.path().join("base-seed");
     std::fs::create_dir_all(base_seed.join("overlays.d")).expect("overlays.d");
     git(&base_seed, &["init", "-q"]);
     git(&base_seed, &["config", "user.name", "fixture"]);
@@ -187,7 +165,7 @@ fn fixture_client(scratch: &Scratch) -> (PathBuf, PathBuf) {
     git(&base_seed, &["add", "-A"]);
     git(&base_seed, &["commit", "-qm", "seed"]);
     git(&base_seed, &["branch", "-M", "main"]);
-    let base_origin = scratch.path.join("base.git");
+    let base_origin = scratch.path().join("base.git");
     let status = Command::new("git")
         .arg("clone")
         .arg("-q")
@@ -201,8 +179,8 @@ fn fixture_client(scratch: &Scratch) -> (PathBuf, PathBuf) {
     assert!(status.success());
     git(&base_origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
-    let home = scratch.path.join("home");
-    let state = scratch.path.join("state");
+    let home = scratch.path().join("home");
+    let state = scratch.path().join("state");
     std::fs::create_dir_all(&home).expect("home");
     std::fs::create_dir_all(&state).expect("state");
     run_dot(
@@ -252,7 +230,7 @@ fn snapshot_tree(home: &Path) -> Vec<(String, Vec<u8>)> {
 #[test]
 #[ignore = "CI runs this explicitly: it builds a fixture client and times shell updates"]
 fn clean_and_dirty_update_within_budget() {
-    let scratch = Scratch::new();
+    let scratch = Scratch::new("perf-update").expect("scratch dir");
     let (home, state) = fixture_client(&scratch);
 
     // Warm-up: first update populates caches exactly like cron does.
@@ -267,7 +245,7 @@ fn clean_and_dirty_update_within_budget() {
     eprintln!("clean update p95: {clean_p95}ms over {RUNS} runs");
 
     // Dirty: push one changed file to overlay-0's remote, converge it.
-    let overlay_seed = scratch.path.join("overlay-0-seed");
+    let overlay_seed = scratch.path().join("overlay-0-seed");
     std::fs::write(
         overlay_seed.join("home/file-000.txt"),
         "overlay-0 payload CHANGED\n",
@@ -275,7 +253,7 @@ fn clean_and_dirty_update_within_budget() {
     .expect("write");
     git(&overlay_seed, &["add", "home/file-000.txt"]);
     git(&overlay_seed, &["commit", "-qm", "change"]);
-    let origin = scratch.path.join("overlay-0.git");
+    let origin = scratch.path().join("overlay-0.git");
     git(
         &overlay_seed,
         &["push", "-q", &origin.to_string_lossy(), "HEAD:main"],

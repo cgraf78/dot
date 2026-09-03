@@ -1,9 +1,12 @@
-//! Shared test helpers: isolated temp directories.
+//! Test-only helpers: isolated temp directories for differential harnesses.
 //!
-//! Mirrors the `shdeps` `test_support` pattern with std only (no
-//! `tempfile` dev-dependency in slice 1): pid plus an atomic counter
-//! keeps parallel tests collision-free, paths are canonicalized, and the
-//! guard removes the directory on drop.
+//! Public so integration tests under `tests/` share one isolation
+//! convention; never used by the shipped engine. Mirrors the `shdeps`
+//! `test_support` pattern with std only (no `tempfile` dev-dependency
+//! in slice 1): pid plus a process-wide atomic counter keeps parallel
+//! tests collision-free without wall-clock reads (immune to NTP steps
+//! and coarse clocks), paths are canonicalized, and the guard removes
+//! the directory on drop.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,6 +51,24 @@ impl TempDir {
     /// Isolated directory path.
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Write fixture `bytes` to `name` inside the directory and return
+    /// its path. `name` is a single path segment (same rules as labels);
+    /// the post-write metadata check turns a vanished scratch dir into
+    /// an explicit environmental panic instead of a misleading
+    /// engine-output diff downstream.
+    pub fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
+        if name.is_empty() || name.contains(['/', '\\', '\0']) || name == "." || name == ".." {
+            panic!("unsafe fixture name: {name:?}");
+        }
+        let path = self.path.join(name);
+        std::fs::write(&path, bytes).expect("write fixture");
+        // Post-write stat: the file must be visible before either engine
+        // runs; if scratch storage is flaky the failure points here.
+        let size = std::fs::metadata(&path).expect("fixture visible").len();
+        assert_eq!(size, bytes.len() as u64, "fixture short write: {name:?}");
+        path
     }
 }
 

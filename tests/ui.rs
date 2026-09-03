@@ -130,9 +130,11 @@ fn rust_matches_shell_on_ui_matrix() {
 fn gum_branch_invokes_identical_argv() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = std::env::temp_dir().join(format!("dot-ui-gum-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("fixture dir");
+    // Counter-based scratch (see `dot::test_support`): unique across
+    // parallel tests and CI phases without wall-clock reads; the guard
+    // removes it on drop, replacing the manual pid-dir cleanup.
+    let scratch = dot::test_support::TempDir::new("ui-gum").expect("fixture dir");
+    let dir = scratch.path();
     let log = dir.join("argv.log");
     let fixture = dir.join("gum");
     // `style --help` must succeed (the shell's third gate); log only
@@ -157,7 +159,7 @@ fn gum_branch_invokes_identical_argv() {
             cmd.arg(arg);
         }
         let output = cmd
-            .env("PATH", &dir)
+            .env("PATH", dir)
             .env("NO_COLOR", "")
             .env_remove("TERM")
             .stdout(Stdio::piped())
@@ -197,5 +199,5 @@ fn gum_branch_invokes_identical_argv() {
         assert_eq!(rust, shell, "gum output divergence {function}");
         assert_eq!(rust_argv, shell_argv, "gum argv divergence {function}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    // `scratch` drops here and removes the fixture dir.
 }
