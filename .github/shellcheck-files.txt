@@ -62,6 +62,7 @@ program	lib/dot/temp.sh
 program	lib/dot/update-lock.sh
 program	lib/dot/update.sh
 program	scripts/checkout-installer.conf
+program	scripts/termux-ci.sh
 program	scripts/verify-shdeps-lock
 program	support/checkout-bash-v1.sh
 program	support/client-launcher.sh
