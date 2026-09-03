@@ -74,6 +74,7 @@ tests/cli-test	standalone:new
 tests/cli.rs	standalone:new
 tests/client-launcher-test	standalone:new
 tests/config-test	standalone:new
+tests/config.rs	standalone:new
 tests/doctor-test	dotfiles:tests/core-doctor-test@dotfiles-v1+standalone
 tests/examples-test	standalone:new
 tests/extension-worker-context-test	standalone:new

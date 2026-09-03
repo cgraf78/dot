@@ -10,6 +10,7 @@
 #![deny(missing_docs)]
 
 pub mod cli;
+pub mod config;
 pub mod errors;
 #[cfg(test)]
 mod test_support;
