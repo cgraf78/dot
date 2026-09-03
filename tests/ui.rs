@@ -16,18 +16,13 @@ use dot::ui::{Renderer, color_hex, hex_to_rgb, summary_box, title};
 /// deterministic, so the burst and the fixture gate never overlap.
 static SPAWN_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Absolute bash: the child environment overrides PATH (to neutralize
-/// `gum`), and `execvp` lookup would use that same PATH — so resolve
-/// the interpreter before spawning.
-fn bash_bin() -> &'static str {
-    // Probe Linux and macOS locations (no PATH lookup: the child env
-    // overrides PATH, and `Command` would inherit that for resolution).
-    for candidate in ["/usr/bin/bash", "/bin/bash"] {
-        if std::path::Path::new(candidate).is_file() {
-            return candidate;
-        }
-    }
-    panic!("no bash interpreter found");
+/// Oracle interpreter, shared with the other differential harnesses (see
+/// `dot::test_support::bash`): the child environment overrides PATH (to
+/// neutralize `gum`), so the interpreter is resolved from the parent
+/// PATH before spawning — fixed `/usr/bin`/`/bin` candidates would pin
+/// the macOS 3.2 trampoline instead of the engine runtime.
+fn bash_bin() -> &'static std::path::Path {
+    dot::test_support::bash()
 }
 
 /// Run one shell UI function with piped stdout (never a tty) and empty

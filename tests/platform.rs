@@ -14,15 +14,13 @@ use dot::platform;
 /// make detection fail spuriously (load-dependent CI flake).
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Absolute bash: some children override PATH, and `execvp` lookup
-/// would use that same PATH — so resolve the interpreter first.
-fn bash_bin() -> &'static str {
-    for candidate in ["/usr/bin/bash", "/bin/bash"] {
-        if std::path::Path::new(candidate).is_file() {
-            return candidate;
-        }
-    }
-    panic!("no bash interpreter found");
+/// Oracle interpreter, shared with the other differential harnesses (see
+/// `dot::test_support::bash`): absolute path resolved from the parent
+/// PATH, since some children override PATH and `execvp` lookup would
+/// use that same PATH — and fixed `/usr/bin`/`/bin` candidates would
+/// pin the macOS 3.2 trampoline instead of the engine runtime.
+fn bash_bin() -> &'static std::path::Path {
+    dot::test_support::bash()
 }
 
 /// Run one shell platform function; `extra_env` sets (`Some`) or

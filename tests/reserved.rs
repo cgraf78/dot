@@ -8,13 +8,10 @@ use dot::reserved::{
     RootsInput, candidate_path_is_reserved_from_roots, path_is_reserved_from_roots, reserved_roots,
 };
 
-fn bash_bin() -> &'static str {
-    for candidate in ["/usr/bin/bash", "/bin/bash"] {
-        if std::path::Path::new(candidate).is_file() {
-            return candidate;
-        }
-    }
-    panic!("no bash interpreter found");
+/// Oracle interpreter, shared with the other differential harnesses (see
+/// `dot::test_support::bash`).
+fn bash_bin() -> &'static std::path::Path {
+    dot::test_support::bash()
 }
 
 /// Fixture client root: a real dotfiles dir behind a symlink (to pin
