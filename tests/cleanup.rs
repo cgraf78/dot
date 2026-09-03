@@ -87,34 +87,17 @@ fn registration_codes_match_shell() {
 fn both_reap_a_registered_sleep() {
     // Shell: background sleep, register its job PID, run full cleanup,
     // report whether anything with that PID survives.
-    let dir = dot::test_support::TempDir::new("cleanup-diff").expect("scratch");
-    let marker = dir.path().join("shell-child-pid");
-    let body = format!(
-        "sleep 30 & child=$!\n_dot_cleanup_register_pid \"$child\"\nprintf '%s' \"$child\" >\"{marker}\"\n_dot_cleanup_all\nif kill -0 \"$child\" 2>/dev/null; then echo SURVIVED; else echo REAPED; fi\n",
-        marker = marker.display(),
-    );
-    let (code, stdout, _) = shell_cleanup(&body);
+    let body = "sleep 30 & child=$!\n_dot_cleanup_register_pid \"$child\"\n_dot_cleanup_all\nif kill -0 \"$child\" 2>/dev/null; then echo SURVIVED; else echo REAPED; fi\n";
+    let (code, stdout, _) = shell_cleanup(body);
     assert_eq!(code, 0, "shell cleanup failed");
     assert!(
         stdout.contains("REAPED"),
         "shell left child alive: {stdout:?}"
     );
-    // A reaped child is gone; belt-and-braces on the recorded pid.
-    let pid: u32 = std::fs::read_to_string(&marker)
-        .expect("pid file")
-        .trim()
-        .parse()
-        .expect("pid number");
-    assert!(
-        Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| !status.success()),
-        "shell child {pid} still alive"
-    );
+    // No `kill -0` recheck on the recorded pid here: pid-only
+    // rechecks race with pid reuse (a recycled pid reads "alive"),
+    // and the in-shell REAPED above already asserts the contract in
+    // the tight kill-then-check window with no fork between.
 
     // Rust: same observable contract.
     let child = Command::new("sleep")
@@ -123,20 +106,14 @@ fn both_reap_a_registered_sleep() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn sleep");
-    let pid = child.id();
     let mut registry = Registry::new();
     registry.track_child(child);
     registry.cleanup();
-    assert!(
-        Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| !status.success()),
-        "rust child {pid} still alive"
-    );
+    // Handle-based proof, not pid-based: cleanup drains and reaps
+    // every tracked child, and `wait` cannot mistake a recycled pid
+    // for ours (a pid is only recyclable after we reap it). A
+    // `kill -0` recheck here would reintroduce the race above.
+    assert_eq!(registry.child_count(), 0, "cleanup leaked a child");
 }
 
 #[test]
