@@ -106,7 +106,8 @@ pub struct State {
     /// `DOT_OVERLAY_LIFECYCLE` (`name|state|file`).
     pub lifecycle: Vec<String>,
     /// `SELECTED_OVERLAY_NAMES` (appended by legacy discovery;
-    /// cleared by [`State::discover`] like `_dot_profiles_load`).
+    /// assigned verbatim from the inputs by [`discover`], like
+    /// `_dot_profiles_load` keeps the shell array).
     pub selected: Vec<String>,
     /// `DOT_OVERLAY_DISCOVERY_ERROR`.
     pub discovery_error: Option<String>,
