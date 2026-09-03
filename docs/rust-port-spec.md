@@ -120,7 +120,7 @@ tests; the binary is still not on PATH and no shell behavior changed):
 
 | Rust module | Shell source | Parity notes |
 |---|---|---|
-| `glob` | `case`-pattern semantics (shared) | byte-oriented C-locale matcher; `\|` from variables is literal; descending ranges void; post-void dash stages shadowed |
+| `glob` | `case`-pattern semantics (shared) | byte-oriented C-locale matcher; `\|` from variables is literal; descending ranges void; post-void dash stages shadowed; pinned to bash 5.x (`DOT_BASH`); macOS system bash 3.2 trailing-`\` corner differs, not a supported engine runtime |
 | `platform` | `platform.sh` | `command -v` needs no exec bit; `[[ "" -eq 0 ]]` id coercion replicated in `require_sudo`; spec sides both literal (quoted RHS), first line only (`read -a`) |
 | `reserved` | `reserved.sh` | roots inventory compared line-for-line; ancestor-swallowing candidate rule; leaf symlinks resolve `realpath`-style (dangling included) |
 | `families` | `families.sh` | byte-ordered stream incl. non-UTF8 names; patterns filter before `.replace` selection |

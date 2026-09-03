@@ -7,6 +7,13 @@ use std::process::{Command, Stdio};
 
 use dot::platform;
 
+/// Serializes every test in this file. The sudo ladder swaps the
+/// process-global PATH to run both engines under identical lookup
+/// conditions, while other tests spawn `uname`/`hostname`/`id`
+/// through that same PATH; without serialization a swap window can
+/// make detection fail spuriously (load-dependent CI flake).
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Absolute bash: some children override PATH, and `execvp` lookup
 /// would use that same PATH — so resolve the interpreter first.
 fn bash_bin() -> &'static str {
@@ -76,6 +83,7 @@ fn ambient_shell(function: &str, args: &[&str]) -> (i32, String) {
 
 #[test]
 fn rust_matches_shell_on_live_platform_and_host() {
+    let _serial = SERIAL.lock().expect("platform serial");
     // Both engines read the same machine (ambient environment,
     // osrelease file, `uname -s`/`hostname`) with nothing overridden.
     let shell = ambient_shell("_dot_platform", &[]);
@@ -101,6 +109,7 @@ fn rust_matches_shell_on_live_platform_and_host() {
 
 #[test]
 fn rust_matches_shell_on_wsl_markers() {
+    let _serial = SERIAL.lock().expect("platform serial");
     let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok();
     // (distro, interop) marker matrix; the shell child gets the same
     // markers, the Rust side composes the same inputs explicitly, and
@@ -138,6 +147,7 @@ fn rust_matches_shell_on_wsl_markers() {
 
 #[test]
 fn rust_matches_shell_on_spec_matrix() {
+    let _serial = SERIAL.lock().expect("platform serial");
     let platform = platform::detect_platform().expect("live platform");
     let specs = [
         "",
@@ -187,6 +197,7 @@ fn rust_matches_shell_on_spec_matrix() {
 /// pattern; the shell quotes both right-hand sides.)
 #[test]
 fn rust_matches_shell_on_raw_spec_matrix() {
+    let _serial = SERIAL.lock().expect("platform serial");
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     struct Case {
@@ -331,6 +342,7 @@ fn rust_matches_shell_on_raw_spec_matrix() {
 
 #[test]
 fn rust_matches_shell_on_host_specs() {
+    let _serial = SERIAL.lock().expect("platform serial");
     let host = match platform::detect_host() {
         Ok(host) => host,
         Err(_) => return,
@@ -364,6 +376,7 @@ fn rust_matches_shell_on_host_specs() {
 
 #[test]
 fn rust_matches_shell_on_tool_lookup() {
+    let _serial = SERIAL.lock().expect("platform serial");
     let dir = dot::test_support::TempDir::new("tool-present").expect("temp dir");
     #[cfg(unix)]
     {
@@ -418,6 +431,7 @@ fn rust_matches_shell_on_tool_lookup() {
 
 #[test]
 fn rust_matches_shell_on_sudo_ladder() {
+    let _serial = SERIAL.lock().expect("platform serial");
     // stdin is null on both sides: the interactive `sudo true`
     // branch fails fast instead of prompting, keeping the test
     // hermetic. The scrubbed-PATH variant pins the shell's
@@ -447,13 +461,10 @@ fn rust_matches_shell_on_sudo_ladder() {
     }
 }
 
-/// Run `f` with the process PATH set to `path`.
-///
-/// Serialized: PATH is process-global, so this mutex keeps parallel
-/// tests from observing the swap.
+/// Run `f` with the process PATH set to `path`. The file-wide
+/// `SERIAL` lock already excludes every other test, so no second
+/// mutex is needed here.
 fn with_path<R>(path: &str, f: impl FnOnce() -> R) -> R {
-    static PATH_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = PATH_SERIAL.lock().expect("path mutex");
     let old = std::env::var_os("PATH");
     // SAFETY: the mutex above serializes every PATH swap in this
     // test binary, so no other thread observes the transition.

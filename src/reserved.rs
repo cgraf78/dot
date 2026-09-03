@@ -13,7 +13,7 @@
 //! The shell reports wrong arity with exit 2; Rust surfaces the same
 //! split as [`Error`] so callers map to identical exit codes.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Reserved-path failure, mirroring the shell exit codes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,59 +230,27 @@ pub fn physical_leaf_candidate(path: &str, pwd: &str) -> Result<LeafCandidate, E
     })
 }
 
-/// `realpath` for a leaf that may dangle: GNU `realpath` resolves
-/// every symlink on the route textually and only requires the PARENT
-/// chain to exist, so a dangling leaf resolves to its target's
-/// physical location (never to the link's own name). `canonicalize`
-/// instead demands full existence, which would collapse the shell's
-/// two-line root listing for dangling links into one. Loops and
-/// unresolvable parents yield `None`, and the caller falls back to
-/// the ancestor walk — exactly the shell's `realpath ... || fallback`
-/// shape.
+/// Resolve a leaf symlink exactly like the shell's `realpath` call:
+/// by invoking the same `realpath` binary off PATH. A native
+/// reimplementation would have to track GNU-vs-BSD acceptance of
+/// dangling leaves (macOS fails where GNU resolves to the target
+/// location), so parity-by-construction wins over saving one fork per
+/// symlink root — and the shell pays the same fork. A missing or
+/// failing `realpath` falls through to the ancestor walk, which is
+/// the shell's `||` fallback verbatim.
 fn realpath_leaf(path: &str) -> Option<String> {
-    let mut current = PathBuf::from(path);
-    // Follow chains textually (`a -> b -> c`), resolving each relative
-    // target against its link's parent, like the kernel would.
-    for _ in 0..40 {
-        let target = std::fs::read_link(&current).ok()?;
-        current = if target.is_absolute() {
-            target
-        } else {
-            match current.parent() {
-                Some(parent) => parent.join(&target),
-                None => target,
-            }
-        };
-        if !std::fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            break;
-        }
-    }
-    if std::fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+    let output = std::process::Command::new("realpath")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
         return None;
     }
-    // Collapse `.`/`..` textually (a target may end in `..`, which has
-    // no file name). Deliberately byte-blind: link targets bypass the
-    // newline filter that guards requested paths.
-    let mut parts: Vec<std::ffi::OsString> = Vec::new();
-    for component in current.components() {
-        use std::path::Component;
-        match component {
-            Component::RootDir => parts.clear(),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                parts.pop();
-            }
-            Component::Prefix(prefix) => parts.push(prefix.as_os_str().to_os_string()),
-            Component::Normal(part) => parts.push(part.to_os_string()),
-        }
+    let mut resolved = output.stdout;
+    while resolved.last() == Some(&b'\n') {
+        resolved.pop();
     }
-    let mut cleaned = PathBuf::from("/");
-    cleaned.extend(parts);
-    let base = cleaned.file_name().map(|base| base.to_os_string())?;
-    let parent = cleaned.parent()?;
-    let mut resolved = std::fs::canonicalize(parent).ok()?;
-    resolved.push(base);
-    Some(resolved.to_string_lossy().into_owned())
+    Some(String::from_utf8_lossy(&resolved).into_owned())
 }
 
 /// `_dot_reserved_root`: the normalized request plus, when different,
@@ -535,21 +503,19 @@ mod tests {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&real, dir.path().join("link")).expect("symlink");
-            std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("dangling"))
-                .expect("symlink");
         }
-        // Valid leaf link: normalized request plus the target.
+        // Valid leaf link: normalized request plus the target
+        // (`realpath` succeeds on live links everywhere).
+        // Unix-only: the fixture link above is never created elsewhere.
+        #[cfg(unix)]
         assert_eq!(
             reserved_root(&link_name("link"), &pwd).expect("ok"),
             vec![link_name("link"), link_name("real")]
         );
-        // Dangling leaf link: normalized request plus the TARGET's
-        // location — never the link's own name (GNU `realpath` only
-        // requires the parent chain to exist).
-        assert_eq!(
-            reserved_root(&link_name("dangling"), &pwd).expect("ok"),
-            vec![link_name("dangling"), link_name("missing")]
-        );
+        // Dangling leaves differ by platform (GNU resolves, BSD
+        // fails into the ancestor fallback), so they are pinned only
+        // by the differential snapshot test, which compares against
+        // the live shell per platform.
         // Ordinary directory: just itself.
         assert_eq!(
             reserved_root(&link_name("real"), &pwd).expect("ok"),

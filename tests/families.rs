@@ -23,13 +23,15 @@ fn raw_bytes(value: &OsStr) -> Vec<u8> {
     value.to_string_lossy().into_owned().into_bytes()
 }
 
-fn bash_bin() -> &'static str {
-    for candidate in ["/usr/bin/bash", "/bin/bash"] {
-        if std::path::Path::new(candidate).is_file() {
-            return candidate;
-        }
-    }
-    panic!("no bash interpreter found");
+/// PATH-resolved `bash`: this harness never overrides PATH, so resolution
+/// matches the shell suite (`#!/usr/bin/env bash`) and the engine's
+/// `DOT_BASH` runtime exactly. That matters on macOS, where the fixed
+/// `/bin/bash` is the 3.2 trampoline (whose case-pattern quirks, e.g.
+/// a trailing lone backslash, differ from the 5.x engine runtime the
+/// port targets) — resolving via PATH finds the same modern bash the
+/// oracle suite runs under.
+fn bash_cmd() -> Command {
+    Command::new("bash")
 }
 
 /// Run `dot_family_files` / `dot_family_files_matching` on `dir` with
@@ -38,7 +40,7 @@ fn shell_family(dir: &OsStr, matching: bool, patterns: &[&OsStr]) -> (i32, Vec<u
     // $0 dummy, $1 family dir, $2 tree root, $3 mode, $4+ patterns.
     // No `shift` juggling (`shift` never moves `$0`); `"${@:4}"`
     // keeps the callee argv exact in both modes.
-    let mut cmd = Command::new(bash_bin());
+    let mut cmd = bash_cmd();
     cmd.arg("--noprofile").arg("--norc").arg("-c").arg(
         ". \"$2/lib/dot/families.sh\"\n\
          if [ \"$3\" = matching ]; then dot_family_files_matching \"$1\" \"${@:4}\";\n\
@@ -91,8 +93,10 @@ impl Fixture {
             std::fs::write(root.join(name), b"payload").expect("write");
         }
         // Non-UTF8 filename: byte-level candidacy and ordering.
-        // Unix-only: non-UTF8 names have no portable spelling.
-        #[cfg(unix)]
+        // Unix-only and never macOS: non-UTF8 names have no portable
+        // spelling, and APFS rejects them at creation outright (the
+        // byte-exactness probe runs on Linux CI instead).
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             use std::os::unix::ffi::OsStrExt;
             std::fs::write(root.join(OsStr::from_bytes(b"bad\xffname.sh")), b"payload")
@@ -275,7 +279,7 @@ fn glob_exotics_match_shell_case() {
         (b"\\*\\?\\[", b"*?["),
     ];
     for (pattern, key) in pairs {
-        let output = Command::new(bash_bin())
+        let output = bash_cmd()
             .arg("--noprofile")
             .arg("--norc")
             .arg("-c")
@@ -308,7 +312,7 @@ fn os_arg(bytes: &[u8]) -> &OsStr {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn non_utf8_name_is_byte_exact() {
     let fixture = Fixture::build();
     let dir = fixture.dir.path().as_os_str();
