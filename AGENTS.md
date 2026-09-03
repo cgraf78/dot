@@ -20,11 +20,13 @@ cuts over, the Rust crate must not change any shell behavior.
 ## Testing
 
 - Rust: `cargo test --locked` (unit + integration + perf budgets).
-- Perf-heavy: `cargo test --locked -- --ignored` (update harness,
-  slice 2+), gate jobs pin `DOT_PERF_BUDGET_MULTIPLIER=1`.
+- Perf-heavy: `cargo test --locked -- --ignored` (no ignored tests in
+  slice 1; update harness joins in slice 2+), gate jobs pin
+  `DOT_PERF_BUDGET_MULTIPLIER=1`.
 - Shell oracle (must stay 28/28 green): `bash tests/run`.
 - Lints: `cargo clippy --locked --all-targets --all-features -- -D warnings`
-  (also enforced by `[lints.rust] warnings = "deny"`).
+  (`[lints.rust] warnings = "deny"` covers rustc lints locally; Clippy
+  itself is enforced by the CI flag).
 - ShellCheck inventory: `.github/shellcheck-files.txt` (do not regress).
 
 ## Rules for port slices

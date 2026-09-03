@@ -71,6 +71,7 @@ support/post-install.sh	standalone:new
 support/shdeps.lock	shdeps:installer-lock
 tests/batch-verification-test	standalone:new
 tests/cli-test	standalone:new
+tests/cli.rs	standalone:new
 tests/client-launcher-test	standalone:new
 tests/config-test	standalone:new
 tests/doctor-test	dotfiles:tests/core-doctor-test@dotfiles-v1+standalone
@@ -89,6 +90,7 @@ tests/license-test	standalone:new
 tests/merge-block-test	dotfiles:tests/core-merges-test@dotfiles-v1
 tests/overlay-profile-resolution-test	standalone:new
 tests/ownership-transfer-test	standalone:new
+tests/perf_budget.rs	standalone:new
 tests/provider-suite-wrapper	standalone:new
 tests/provenance-test	standalone:new
 tests/profiles-test	standalone:new

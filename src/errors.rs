@@ -11,6 +11,11 @@ use std::io;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Infrastructure failure kinds.
+///
+/// Scaffolding for slice 2+: no slice-1 path constructs these yet (only
+/// the self-tests below touch them). The shape is settled now so the
+/// lock/config/git-callers arriving in slices 2-3 share one error type
+/// instead of each inventing their own.
 #[derive(Debug)]
 pub enum Error {
     /// Filesystem or process I/O failure with context.

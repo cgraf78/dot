@@ -19,6 +19,9 @@ const RUNS: usize = 30;
 const PERF_BUDGET_MULTIPLIER_ENV: &str = "DOT_PERF_BUDGET_MULTIPLIER";
 
 fn budget_ms(base: u128) -> u128 {
+    // An unset or malformed multiplier means "no scaling" (1.0), not an
+    // error: failing loudly here would turn an unrelated env typo into a
+    // perf failure, hiding the real signal. Gate jobs pin the value to 1.
     let multiplier: f64 = std::env::var(PERF_BUDGET_MULTIPLIER_ENV)
         .ok()
         .and_then(|raw| raw.parse().ok())
@@ -32,7 +35,6 @@ fn repeat(n: usize, mut op: impl FnMut() -> Duration) -> Vec<u128> {
     for _ in 0..n {
         samples.push(op().as_millis());
     }
-    samples.sort_unstable();
     samples
 }
 
@@ -77,25 +79,24 @@ fn startup_stays_within_warm_budget() {
 }
 
 #[test]
-fn cold_start_with_cleared_caches_stays_reasonable() {
-    // Cold page cache is host-state dependent, so this asserts a loose
-    // ceiling (4x the warm budget), not parity: it catches linked-in
+fn first_run_stays_within_loose_ceiling() {
+    // No cache eviction is performed (no vmtouch-style control here), so
+    // "first run" means first spawn in this test, not a cold page cache:
+    // the name says exactly that. The ceiling is loose (4x warm) because
+    // first-run latency is host-state dependent; this catches linked-in
     // bloat (debug symbols, huge static constructors), not scheduling.
-    // `vmtouch`style eviction is unavailable; drop nothing and accept
-    // that "cold" here means first-run-in-this-test.
     let start = Instant::now();
     let status = Command::new(env!("CARGO_BIN_EXE_dot"))
         .arg("help")
-        .env("DOT_PERF_COLD_RUN", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .expect("run dot binary");
     assert!(status.success());
     let elapsed = start.elapsed().as_millis();
-    eprintln!("dot help cold: {elapsed}ms");
+    eprintln!("dot help first run: {elapsed}ms");
     assert!(
         elapsed <= budget_ms(HELP_WARM_BUDGET_MS * 4),
-        "cold help {elapsed}ms exceeds ceiling"
+        "first-run help {elapsed}ms exceeds ceiling"
     );
 }

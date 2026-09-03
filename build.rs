@@ -17,11 +17,13 @@ const PREFIX: &str = "DOT_BUILD";
 /// Ordering is precedence, highest first: a release build stamps an exact
 /// commit via `DOT_BUILD_COMMIT` (reproducible even from an exported
 /// tarball with no `.git`), CI falls back to `GITHUB_SHA`, and only local
-/// developer builds shell out to git. The directory walk exists because
-/// `cargo build` may run in a subdirectory of the checkout; probing only
-/// `CARGO_MANIFEST_DIR` would miss the owning repo when the crate moves
-/// into a workspace layout later.
-fn resolve_commit() -> String {
+/// developer builds shell out to git. git itself resolves the owning repo
+/// from the manifest dir (worktrees, submodules, ceilings included) —
+///
+/// the script must NOT walk up manually: climbing past the owning repo
+/// would silently bake an unrelated parent checkout's SHA into the
+/// binary (e.g. a crate copy nested inside another repo).
+fn resolve_commit(manifest_dir: &std::path::Path) -> String {
     if let Ok(commit) = env::var(format!("{PREFIX}_COMMIT")) {
         if !commit.trim().is_empty() {
             return commit.trim().to_string();
@@ -32,30 +34,48 @@ fn resolve_commit() -> String {
             return sha.trim().to_string();
         }
     }
-    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
-    // Walk up so workspace checkouts resolve the owning repo, not a subdir.
-    let mut dir = Some(manifest.as_path());
-    while let Some(current) = dir {
-        let output = Command::new("git")
-            .arg("rev-parse")
-            .arg("HEAD")
-            .current_dir(current)
-            .output();
-        if let Ok(output) = output {
-            if output.status.success() {
-                let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !sha.is_empty() {
-                    return sha;
-                }
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .current_dir(manifest_dir)
+        .output();
+    if let Ok(output) = output {
+        if output.status.success() {
+            let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !sha.is_empty() {
+                return sha;
             }
         }
-        dir = current.parent();
     }
     // Shell contract: `dot version` prints `unknown`, never fails here.
     "unknown".to_string()
 }
 
-/// A usable revision is at least 8 lowercase hex chars.
+/// Resolve the git dir owning the manifest (worktree gitfiles included)
+/// so rebuild tracking watches the real HEAD, not a dangling path.
+fn resolve_git_dir(manifest_dir: &std::path::Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--git-dir")
+        .current_dir(manifest_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let git_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if git_dir.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(git_dir);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        manifest_dir.join(path)
+    })
+}
+
+/// A usable revision is the lowercased first 12 hex chars of the SHA.
 fn short_revision(commit: &str) -> String {
     let short: String = commit.chars().take(12).collect();
     if short.len() == 12 && short.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -82,10 +102,25 @@ fn main() {
     println!("cargo:rerun-if-env-changed={PREFIX}_COMMIT");
     println!("cargo:rerun-if-env-changed={PREFIX}_VERSION");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/packed-refs");
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()));
+    // In a linked worktree `.git` is a file, not a dir, so watching the
+    // literal `.git/HEAD` would never fire and the binary would report a
+    // stale SHA. Watch the resolved git dir instead. (Thin checkouts whose
+    // HEAD moves without touching these paths still need an explicit
+    // `DOT_BUILD_COMMIT`; that limitation is inherent to mtime tracking.)
+    match resolve_git_dir(&manifest_dir) {
+        Some(git_dir) => {
+            println!("cargo:rerun-if-changed={}/HEAD", git_dir.display());
+            println!("cargo:rerun-if-changed={}/packed-refs", git_dir.display());
+        }
+        None => {
+            println!("cargo:rerun-if-changed=.git/HEAD");
+            println!("cargo:rerun-if-changed=.git/packed-refs");
+        }
+    }
 
-    let commit = resolve_commit();
+    let commit = resolve_commit(&manifest_dir);
     let short = short_revision(&commit);
     let version = resolve_version();
     println!("cargo:rustc-env={PREFIX}_COMMIT={commit}");
