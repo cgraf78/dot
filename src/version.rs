@@ -12,6 +12,10 @@ pub const SHORT_COMMIT: &str = env!("DOT_BUILD_SHORT_COMMIT");
 /// Release version stamp, or `unknown` until the shared
 /// `YYYYMMDD-HHMMSS-8hex` scheme lands in a later slice.
 pub const VERSION: &str = env!("DOT_BUILD_VERSION");
+/// Public standalone-dot library ABI (`DOT_LIBRARY_API` in
+/// `lib/dot/public/api-version.sh`). Consumers check this before
+/// relying on any exported function.
+pub const LIBRARY_API: u32 = 1;
 
 /// The exact `dot version` output line (without trailing newline).
 pub fn version_line() -> String {
@@ -26,6 +30,14 @@ pub fn description() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_api_is_one() {
+        // `lib/dot/public/api-version.sh` exports `DOT_LIBRARY_API=1`;
+        // the differential test in `tests/constants.rs` pins the two
+        // together so the ABI can never drift silently.
+        assert_eq!(LIBRARY_API, 1);
+    }
 
     #[test]
     fn revision_is_hex_or_unknown() {
