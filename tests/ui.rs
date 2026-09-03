@@ -7,6 +7,15 @@ use std::process::{Command, Stdio};
 
 use dot::ui::{Renderer, color_hex, hex_to_rgb, summary_box, title};
 
+/// Serializes the two tests in this file. One spawns a steady burst
+/// of shells while the other execs a freshly-written fixture, and
+/// that overlap intermittently fails the fixture exec with ETXTBSY
+/// (observed ~1/10 locally and on CI; a retry milliseconds later
+/// succeeds). The engine degrades gracefully there (falls back to
+/// plain rendering for one call), but the parity oracle must be
+/// deterministic, so the burst and the fixture gate never overlap.
+static SPAWN_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Absolute bash: the child environment overrides PATH (to neutralize
 /// `gum`), and `execvp` lookup would use that same PATH — so resolve
 /// the interpreter before spawning.
@@ -92,6 +101,7 @@ fn rust_ui_plain(function: &str, args: &[&str]) -> (i32, String) {
 
 #[test]
 fn rust_matches_shell_on_ui_matrix() {
+    let _serial = SPAWN_SERIAL.lock().expect("ui spawn lock");
     // NO_COLOR="" keeps the shell on its ANSI-capable path only when a
     // tty is present; piped here, both sides render Plain — except the
     // shell still prints ANSI when... no: `[[ -t 1 ]]` is false under a
@@ -174,6 +184,7 @@ fn gum_branch_invokes_identical_argv() {
     };
 
     // Sanity: the fixture passes the shell's own usability gate.
+    let _serial = SPAWN_SERIAL.lock().expect("ui spawn lock");
     assert!(dot::ui::find_gum(&dir.to_string_lossy()).is_some());
     let gum = dot::ui::find_gum(&dir.to_string_lossy()).expect("fixture gum");
     let renderer = Renderer::Gum { binary: gum };
