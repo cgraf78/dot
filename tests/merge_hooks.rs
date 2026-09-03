@@ -61,6 +61,18 @@ fn shell_run(
     )
 }
 
+/// Drop bash's own exec-failure notice (`file: line N: jq: command
+/// not found`) from shell stderr before comparing. It is shell
+/// interpreter noise, not engine output: the path and line number
+/// shift with the source file, so no port can reproduce it. `jq`'s
+/// own diagnostics (when `jq` runs) still compare verbatim.
+fn without_exec_noise<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
+    lines
+        .filter(|line| !line.contains(": jq: command not found"))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Write `bytes` to `dir/name`, creating parents.
 fn stage(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
     let path = dir.join(name);
@@ -311,18 +323,20 @@ fn jq_layer_twins_agree() {
         // Warning texts agree up to the fixture root both sides embed.
         let normalize =
             |root: &Path, text: &str| text.replace(&root.to_string_lossy().into_owned(), "<root>");
-        let shell_warn: Vec<String> = String::from_utf8_lossy(&serr)
-            .lines()
-            .map(|line| normalize(sdir.path(), line))
+        let shell_warn: Vec<String> = without_exec_noise(String::from_utf8_lossy(&serr).lines())
+            .into_iter()
+            .map(|line| normalize(sdir.path(), &line))
             .collect();
         let rust_warn: Vec<String> = warnings
             .iter()
             .map(|line| normalize(rdir.path(), line))
             .collect();
         assert_eq!(rust_warn, shell_warn, "jq warnings for {label}");
+        // Absent `jq` installs nothing on either side: compare
+        // presence and bytes together.
         assert_eq!(
-            std::fs::read(&dst_r).expect("rust dst"),
-            std::fs::read(&dst_s).expect("shell dst"),
+            std::fs::read(&dst_r).ok(),
+            std::fs::read(&dst_s).ok(),
             "jq bytes for {label}"
         );
     }
@@ -360,8 +374,8 @@ fn jq_layer_twins_agree() {
     assert_eq!(rcode.is_ok(), scode == 0, "bad filter code");
     // `jq` diagnostics plus the skip warning agree line for line
     // (fixture roots normalized).
-    let shell_warn: Vec<String> = String::from_utf8_lossy(&serr)
-        .lines()
+    let shell_warn: Vec<String> = without_exec_noise(String::from_utf8_lossy(&serr).lines())
+        .into_iter()
         .map(|line| line.replace(&sdir.path().to_string_lossy().into_owned(), "<root>"))
         .collect();
     let rust_warn: Vec<String> = warnings
@@ -369,10 +383,12 @@ fn jq_layer_twins_agree() {
         .map(|line| line.replace(&rdir.path().to_string_lossy().into_owned(), "<root>"))
         .collect();
     assert_eq!(rust_warn, shell_warn, "bad filter warnings");
+    // Without `jq` the failed rebuild deletes the destination on
+    // both sides; with `jq` the failed merge leaves it alone.
     assert_eq!(
-        std::fs::read(&dst_r).expect("rust dst"),
-        std::fs::read(&dst_s).expect("shell dst"),
-        "bad filter leaves dst"
+        std::fs::read(&dst_r).ok(),
+        std::fs::read(&dst_s).ok(),
+        "bad filter dst"
     );
 }
 
