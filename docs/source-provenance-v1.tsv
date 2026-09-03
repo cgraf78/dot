@@ -76,11 +76,13 @@ tests/cli.rs	standalone:new
 tests/client-launcher-test	standalone:new
 tests/config-test	standalone:new
 tests/config.rs	standalone:new
+tests/constants.rs	standalone:new
 tests/doctor-test	dotfiles:tests/core-doctor-test@dotfiles-v1+standalone
 tests/examples-test	standalone:new
 tests/extension-worker-context-test	standalone:new
 tests/extensions-api-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/families-test	dotfiles:tests/core-merges-test@dotfiles-v1
+tests/families.rs	standalone:new
 tests/hook-api-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/hooks-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/init-test	standalone:new
@@ -95,10 +97,12 @@ tests/overlay-profile-resolution-test	standalone:new
 tests/ownership-transfer-test	standalone:new
 tests/perf_budget.rs	standalone:new
 tests/perf_update.rs	standalone:new
+tests/platform.rs	standalone:new
 tests/provider-suite-wrapper	standalone:new
 tests/provenance-test	standalone:new
 tests/profiles-test	standalone:new
 tests/repos-test	dotfiles:tests/core-pull-test+core-overlays-test@dotfiles-v1+standalone
+tests/reserved.rs	standalone:new
 tests/resources-test	dotfiles:tests/core-resource-cleanup-test@dotfiles-v1+standalone
 tests/run	standalone:new
 tests/shdeps-lock-verifier-test	standalone:new

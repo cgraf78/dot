@@ -5,15 +5,11 @@
 
 use std::process::{Command, Stdio};
 
-/// Absolute bash: the child environment is scrubbed, and `execvp`
-/// lookup would use that scrubbed PATH — see `tests/ui.rs`.
-fn bash_bin() -> &'static str {
-    for candidate in ["/usr/bin/bash", "/bin/bash"] {
-        if std::path::Path::new(candidate).is_file() {
-            return candidate;
-        }
-    }
-    panic!("no bash interpreter found");
+/// Oracle interpreter, shared with the other differential harnesses (see
+/// `dot::test_support::bash`): the child environment is scrubbed, and
+/// `execvp` lookup would use that scrubbed PATH.
+fn bash_bin() -> &'static std::path::Path {
+    dot::test_support::bash()
 }
 
 /// Run one shell log function; `quiet`/`no_color` of `None` mean unset.

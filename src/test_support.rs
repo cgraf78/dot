@@ -9,9 +9,71 @@
 //! the directory on drop.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+static BASH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Absolute path to the engine-runtime `bash` for differential harnesses.
+///
+/// Resolved once from the parent test process PATH — never from a
+/// child's scrubbed or swapped env — so hermetic children still spawn
+/// the interpreter the shell suite runs under (`#!/usr/bin/env bash`)
+/// and the `DOT_BASH` engine runtime resolves. A bare `bash` looked up
+/// at spawn time instead follows the child's env: under `env_clear`
+/// without PATH that falls back to the OS default lookup, which finds
+/// the macOS 3.2 trampoline whose `case`-pattern corners (e.g. a
+/// trailing lone backslash) differ from the pinned 5.x runtime — a
+/// silent wrong oracle surfacing as a mystery divergence.
+///
+/// The first `bash` on PATH reporting major version 4+ wins; with no
+/// such binary resolution panics instead of testing the wrong runtime.
+pub fn bash() -> &'static std::path::Path {
+    BASH.get_or_init(|| {
+        let mut tried: Vec<PathBuf> = Vec::new();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        for dir in std::env::split_paths(&path) {
+            // Empty entries mean "cwd" to the shell, but a relative
+            // interpreter would resolve against whatever directory a
+            // later child sets — skip them rather than bind the oracle
+            // to a test's working directory.
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let candidate = dir.join("bash");
+            if candidate.is_file() {
+                if bash_major(&candidate) >= 4 {
+                    return candidate;
+                }
+                tried.push(candidate);
+            }
+        }
+        panic!(
+            "no bash 4+ on PATH for the differential oracle (saw: {tried:?}); \
+             install bash 5.x, the pinned engine runtime",
+        );
+    })
+}
+
+/// Major version from `$BASH_VERSION` (`5.2.37(1)-release` -> 5);
+/// 0 when the binary cannot be asked (treated as unusable above).
+fn bash_major(candidate: &std::path::Path) -> u64 {
+    let Ok(output) = std::process::Command::new(candidate)
+        .arg("-c")
+        .arg("echo $BASH_VERSION")
+        .output()
+    else {
+        return 0;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
 
 /// Owned isolated temp directory, removed on drop.
 ///
@@ -131,6 +193,20 @@ mod tests {
             assert!(output.status.success());
             assert_eq!(output.stdout, b"ok\n");
         }
+    }
+
+    #[test]
+    fn oracle_bash_is_absolute_and_modern() {
+        // Regression pin for the macOS CI failure where a bare `bash`
+        // under `env_clear` fell back to the 3.2 trampoline: the oracle
+        // must be an absolute 4+ binary resolved from the parent PATH.
+        let bash = super::bash();
+        assert!(bash.is_absolute(), "oracle bash must be absolute");
+        assert!(
+            super::bash_major(bash) >= 4,
+            "oracle bash must be 4+, got: {}",
+            bash.display()
+        );
     }
 
     #[test]

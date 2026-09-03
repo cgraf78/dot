@@ -12,13 +12,10 @@ use std::process::{Child, Command, Stdio};
 use dot::log::Log;
 
 /// Absolute bash (see `tests/ui.rs`).
-fn bash_bin() -> &'static str {
-    for candidate in ["/usr/bin/bash", "/bin/bash"] {
-        if std::path::Path::new(candidate).is_file() {
-            return candidate;
-        }
-    }
-    panic!("no bash interpreter found");
+/// Oracle interpreter, shared with the other differential harnesses (see
+/// `dot::test_support::bash`).
+fn bash_bin() -> &'static std::path::Path {
+    dot::test_support::bash()
 }
 
 /// Shell lock prelude: sources the log module (owns `_warn`) then the
