@@ -1,0 +1,18 @@
+//! `dot`: fast declarative dotfiles manager.
+//!
+//! The Rust crate owns the implementation. The shell tree under `lib/`
+//! remains the behavior owner until each slice cuts over; `tests/*-test`
+//! (run via `bash tests/run`) is the parity oracle and must stay green.
+//! Public shell API boundaries (`lib/dot/public/*`, `hook-api-v1.tsv`,
+//! `doctor-api-v1.tsv`, `test-api-v1.tsv`) are compatibility constraints,
+//! not implementation details to mirror.
+
+#![deny(missing_docs)]
+
+pub mod cli;
+pub mod errors;
+#[cfg(test)]
+mod test_support;
+pub mod version;
+
+pub use errors::{Error, Result};

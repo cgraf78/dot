@@ -12,6 +12,24 @@ permissions:
   contents: read
 
 jobs:
+  rust:
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@b97bd729afec784785bd01ebd43321225ef47bb7
+    with:
+      # rust-version is a compatibility promise, so exercise it inside the
+      # shared required gate instead of leaving it aspirational. The shared
+      # defaults own Clippy's locked all-target/all-feature scope, rustdoc
+      # missing-doc lint, fmt, audit, and the default `cargo test --locked`
+      # invocation; local copies would drift.
+      msrv-toolchain: "1.85"
+      # Slice 1 has no release/packaging scripts yet, so the Android and
+      # Termux gates validate what exists: cross-compilation and the
+      # native test suite. Packaging smoke arrives with the release
+      # workflow in a later slice.
+      android-package-smoke-command: |
+        cargo build --locked --target "$RUST_TARGET"
+        test -x "target/$RUST_TARGET/debug/dot"
+      termux-command: cargo test --locked
+
   shell:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@b97bd729afec784785bd01ebd43321225ef47bb7
     with:
