@@ -1,14 +1,20 @@
 //! Shell `case`-pattern matching over bytes (C locale).
 //!
 //! Shared by family-key filtering (`families.sh`, where caller patterns
-//! arrive via an unquoted `$pattern`) and spec exclusion checks
-//! (`platform.sh`, where the `!$current` right-hand side is likewise an
-//! unquoted pattern). Byte-oriented because the shell operates on bytes
-//! under `LC_ALL=C`: `*`, `?`, and `[...]` classes apply per byte, and
-//! `/` has no special status inside `case` patterns (unlike pathname
-//! expansion). `|` from a variable is literal — alternation is `case`
-//! syntax parsed before expansion, so an expanded `a|b` never splits
-//! (pinned by `pipe_from_variable_is_literal`).
+//! arrive via an unquoted `$pattern`). Byte-oriented because the shell
+//! operates on bytes under `LC_ALL=C`: `*`, `?`, and `[...]` classes
+//! apply per byte, and `/` has no special status inside `case`
+//! patterns (unlike pathname expansion). `|` from a variable is
+//! literal — alternation is `case` syntax parsed before expansion, so
+//! an expanded `a|b` never splits (pinned by
+//! `pipe_from_variable_is_literal`).
+//!
+//! Pinned against bash 5.x, the engine's runtime (resolved via
+//! `DOT_BASH`). The macOS system bash 3.2 trampoline differs in at
+//! least one corner — a trailing lone backslash (`a\` matches `a\`
+//! on 5.x, not on 3.2) — and is not a supported engine runtime, so
+//! the differential harness resolves bash via PATH exactly like the
+//! shell suite does.
 
 /// Match `text` against shell glob `pattern`.
 ///
