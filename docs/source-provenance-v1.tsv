@@ -116,6 +116,7 @@ tests/repos_dirty.rs	standalone:new
 tests/repos_git.rs	standalone:new
 tests/repos_overlays.rs	standalone:new
 tests/repos_overlays_bsd.rs	standalone:new
+tests/repos_quarantine.rs	standalone:new
 tests/repos_pull_queries.rs	standalone:new
 tests/repos_pull_support.rs	standalone:new
 tests/reserved.rs	standalone:new
