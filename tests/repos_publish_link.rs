@@ -463,11 +463,19 @@ fn recover_replacement_agrees() {
                     stage(&fixture.transaction, "previous", b"changed");
                 }
                 "parent-changed" => {
+                    // Swap in a directory that coexisted with the
+                    // original parent: its identity provably differs
+                    // on every filesystem. Delete-plus-recreate
+                    // cannot do that — ext4 reuses both inodes, so
+                    // the "change" is unobservable there and the two
+                    // sides can legitimately disagree.
                     let parent = fixture.physical.parent().expect("parent").to_path_buf();
+                    let swap = root.join("work-swap");
+                    std::fs::create_dir_all(&swap).expect("swap parent");
+                    std::fs::write(swap.join("app.conf"), b"old").expect("swap file");
                     std::fs::remove_file(&fixture.physical).expect("remove file");
                     std::fs::remove_dir(&parent).expect("remove parent");
-                    std::fs::create_dir_all(&parent).expect("new parent");
-                    std::fs::write(&fixture.physical, b"old").expect("rewrite");
+                    std::fs::rename(&swap, &parent).expect("swap parent");
                 }
                 "transaction-unsafe" => {
                     std::fs::create_dir_all(&fixture.transaction).expect("txn");
