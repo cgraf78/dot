@@ -91,10 +91,16 @@ fn strict_resolve(path: &Path) -> Option<PathBuf> {
 /// parent (while two missing components, or a `..` past a missing
 /// directory, fail). `canonicalize` demands the whole path, hence
 /// the strict-parent fallback; a trailing `..`/`.` with nothing
-/// resolvable refuses, like the shell.
+/// resolvable refuses, like the shell. The shell forks the platform
+/// tool, and BSD `realpath` on macOS requires the path to exist
+/// outright — so the fallback is GNU-only and macOS refuses any
+/// missing path, exactly like the production shell there.
 fn realpath_default(path: &str) -> Option<PathBuf> {
     if let Ok(resolved) = std::fs::canonicalize(path) {
         return Some(resolved);
+    }
+    if cfg!(target_os = "macos") {
+        return None;
     }
     let path = Path::new(path);
     let leaf = path.file_name()?;
@@ -227,8 +233,9 @@ fn lower_host(host: &str) -> String {
 
 /// `_dot_init_repo_identity`: normalize a repository URL to its
 /// canonical identity. `file://` URLs and absolute paths resolve
-/// through `realpath` (with its missing-leaf tolerance, see the
-/// private helper below) and print as `file://<resolved>`;
+/// through `realpath` (with its missing-leaf tolerance on GNU, see
+/// the private helper below; macOS refuses missing paths like its
+/// BSD tool) and print as `file://<resolved>`;
 /// `http(s)://`, `ssh://`, and scp-like `host:path` shapes print
 /// as `git://<lowercased-host>/<cleaned-path>`. Only lowercase
 /// scheme prefixes special-case — an uppercase `SSH://` falls
