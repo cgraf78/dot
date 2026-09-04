@@ -25,6 +25,7 @@ pub mod overlay_context;
 pub mod overlays;
 pub mod platform;
 pub mod profiles;
+pub mod progress_ui;
 pub mod repos_base;
 pub mod repos_commands;
 pub mod repos_config;
