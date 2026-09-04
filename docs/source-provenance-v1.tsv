@@ -138,6 +138,7 @@ tests/shdeps-provider-test	dotfiles:tests/core-test+core-reexec-test@dotfiles-v1
 tests/temp.rs	standalone:new
 tests/test-command-test	standalone:new
 tests/test-lifecycle-test	dotfiles:.local/lib/dotfiles/tests/core/runner.sh@dotfiles-v2+standalone
+tests/test_suites.rs	standalone:new
 tests/ui.rs	standalone:new
 tests/update-lock-test	dotfiles:tests/core-update-test@dotfiles-v1+standalone
 tests/update.rs	standalone:new
