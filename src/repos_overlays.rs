@@ -1,6 +1,7 @@
-//! Read-only manifest helpers from `lib/dot/repos/overlays.sh`:
-//! link-target derivation, manifest record parsing, and the manifest
-//! safety gate.
+//! Manifest, replacement-identity, and quarantine helpers from
+//! `lib/dot/repos/overlays.sh`: link-target derivation, manifest
+//! record parsing, the manifest safety gate, the managed-generation
+//! fingerprint, and the restore/commit halves of quarantined links.
 //!
 //! Two engine boundaries apply. Values cross from bytes to `String`
 //! via lossy conversion (the `profiles` precedent), so a non-UTF8
@@ -13,8 +14,12 @@
 //! existing owned unreadable manifest reads safe (with bash's own
 //! redirect error on stderr, which carries no engine meaning).
 
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
+
+use crate::errors::{Error, Result};
+use crate::temp;
 
 /// `_overlay_link_target`: the generated symlink target for `rel`
 /// inside overlay `name`. One `../` per `/` in `rel`, so deeper
@@ -227,4 +232,139 @@ pub fn link_target_available(rel: &str, target: &str, home: &str) -> bool {
     let source = Path::new(&source);
     std::fs::symlink_metadata(source).is_ok_and(|meta| meta.file_type().is_symlink())
         || std::fs::metadata(source).is_ok_and(|meta| meta.is_file())
+}
+
+/// Leaf identity plus `mode:size` for one path: the two halves
+/// `_overlay_replacement_identity` rechecks after hashing.
+fn live_generation(path: &Path) -> Result<(String, String)> {
+    // No `-L` anywhere in this domain: plain `stat` reports the leaf
+    // itself, so a link carries its own device, inode, raw mode, and
+    // target-byte length — never its target's.
+    let meta = std::fs::symlink_metadata(path).map_err(|source| Error::Io {
+        context: "stat replacement generation",
+        source,
+    })?;
+    Ok((
+        format!("{}:{}", meta.dev(), meta.ino()),
+        format!("{:x}:{}", meta.mode(), meta.size()),
+    ))
+}
+
+/// `_overlay_replacement_identity`: the `dev:ino:modehex:size:digest`
+/// fingerprint binding one managed path to its exact generation.
+/// Symlinks digest their target bytes; regular files digest content
+/// filter-free. Device and inode alone would miss an unlink-and-reuse
+/// race, so the before/after metadata recheck rejects a generation
+/// that changes while its fingerprint is being computed.
+pub fn replacement_identity(source_root: &Path, path: &Path) -> Result<String> {
+    let (identity, metadata) = live_generation(path)?;
+    let kind = std::fs::symlink_metadata(path)
+        .map_err(|source| Error::Io {
+            context: "stat replacement file type",
+            source,
+        })?
+        .file_type();
+    let digest = if kind.is_symlink() {
+        let target = std::fs::read_link(path).map_err(|source| Error::Io {
+            context: "read replacement link target",
+            source,
+        })?;
+        // `$(readlink)` strips every trailing newline before the
+        // target bytes reach `hash-object --stdin`.
+        let mut bytes = target.as_os_str().as_bytes();
+        while let Some(rest) = bytes.strip_suffix(b"\n".as_slice()) {
+            bytes = rest;
+        }
+        temp::file_text_digest(source_root, bytes)?
+    } else if kind.is_file() {
+        // `_dot_source_git hash-object --no-filters -- path`: the
+        // `--` separator is unreachable for the absolute engine paths
+        // here, so [`temp::file_digest`] hashes identically.
+        temp::file_digest(source_root, path)?
+    } else {
+        return Err(Error::Usage {
+            message: "replacement identity needs a file or symlink",
+        });
+    };
+    let (identity_after, metadata_after) = live_generation(path)?;
+    if identity_after != identity || metadata_after != metadata {
+        return Err(Error::Usage {
+            message: "replacement path changed during fingerprinting",
+        });
+    }
+    Ok(format!("{identity}:{metadata}:{digest}"))
+}
+
+/// The fingerprint check both quarantine halves share:
+/// `$(... 2>/dev/null || true)` reads a failed fingerprint as empty,
+/// which only matches a degenerate empty expectation — compare the
+/// same way instead of failing early.
+fn quarantined_unchanged(source_root: &Path, parked: &Path, expected: &str) -> Result<()> {
+    let actual = replacement_identity(source_root, parked).unwrap_or_default();
+    if actual != expected {
+        return Err(Error::Usage {
+            message: "quarantined link generation changed",
+        });
+    }
+    Ok(())
+}
+
+/// `_overlay_restore_quarantined_link`: move the parked generation
+/// back only when it still matches `expected` and the physical path
+/// is still fully absent (no file and no link — a late writer wins).
+/// A late or non-empty stage directory fails the restore.
+///
+/// Known safe-direction divergence: the shell verifies the quarantine
+/// move with lstat, so it restores a link whose target dangles;
+/// [`temp::move_noreplace_with`] verifies by following, so that shape
+/// reports failure (after the rename lands) instead of validating an
+/// unresolvable generation.
+pub fn restore_quarantined_link(
+    source_root: &Path,
+    physical: &Path,
+    parked: &Path,
+    stage: &Path,
+    expected: &str,
+    tool: &temp::MoveTool,
+) -> Result<()> {
+    quarantined_unchanged(source_root, parked, expected)?;
+    if std::fs::symlink_metadata(physical).is_ok() {
+        return Err(Error::Usage {
+            message: "quarantine destination reappeared",
+        });
+    }
+    temp::move_noreplace_with(parked, physical, tool)?;
+    // `rmdir ... 2>/dev/null`: only the emptied stage removes.
+    std::fs::remove_dir(stage).map_err(|source| Error::Io {
+        context: "remove quarantine stage",
+        source,
+    })?;
+    Ok(())
+}
+
+/// `_overlay_commit_quarantined_link`: drop the parked generation
+/// once it still matches `expected`. Like `rm -f`, a missing parked
+/// link still removes; like `rmdir`, a non-empty stage fails loudly.
+pub fn commit_quarantined_link(
+    source_root: &Path,
+    parked: &Path,
+    stage: &Path,
+    expected: &str,
+) -> Result<()> {
+    quarantined_unchanged(source_root, parked, expected)?;
+    match std::fs::remove_file(parked) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(Error::Io {
+                context: "remove quarantined link",
+                source,
+            });
+        }
+    }
+    std::fs::remove_dir(stage).map_err(|source| Error::Io {
+        context: "remove quarantine stage",
+        source,
+    })?;
+    Ok(())
 }
