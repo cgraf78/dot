@@ -669,3 +669,175 @@ fn prepare_overlay_upstream_matches_shell() {
         }
     }
 }
+
+use dot::progress_ui::Palette;
+use dot::repos_pull_support::{OriginMismatch, origin_mismatch, shell_quote};
+use std::os::unix::ffi::OsStrExt;
+
+/// Marker palette for mismatch rows: the harness overrides the two
+/// colors the rows read.
+fn mismatch_palette() -> Palette {
+    Palette {
+        reset: "<R>".to_string(),
+        bold: String::new(),
+        dim: String::new(),
+        green: String::new(),
+        yellow: "<Y>".to_string(),
+        red: String::new(),
+        blue: String::new(),
+        cyan: String::new(),
+        white: String::new(),
+    }
+}
+
+#[test]
+fn shell_quote_matches_printf_q() {
+    // Byte inputs; the shell truth comes from live `printf %q`
+    // under the harness C locale, including invalid UTF-8.
+    let cases: &[&[u8]] = &[
+        b"",
+        b"abc",
+        b"a b",
+        b"it's",
+        b"a\"b",
+        b"a$b",
+        b"a`b",
+        b"a\\b",
+        b"a\nb",
+        b"a\tb",
+        b"!",
+        b"~",
+        b"~user",
+        b"#",
+        b"*",
+        b"?",
+        b"[",
+        b"a]b",
+        b"{a}",
+        b"a;b",
+        b"a&b",
+        b"a|b",
+        b"a<b",
+        b"a(b",
+        b"a=b",
+        "é".as_bytes(),
+        b"\x01",
+        b"\x7f",
+        b"\xff",
+        b"/tmp/x y",
+        b"https://a/b?c=d&e=f",
+        b"a\x1bb",
+        b"a\x07b",
+        b"a\x01b",
+        b"a'b\nc",
+    ];
+    for input in cases {
+        let dir = TempDir::new("pull-quote").expect("fixture dir");
+        let arg = std::ffi::OsStr::from_bytes(input);
+        let (code, out, _) = shell_run(dir.path(), &[arg], &[], "printf '%q' \"$2\"");
+        assert_eq!(code, 0, "shell %q for {input:?}");
+        assert_eq!(
+            shell_quote(input),
+            String::from_utf8(out).expect("quote utf8"),
+            "%q parity for {input:?}"
+        );
+    }
+}
+
+#[test]
+fn origin_mismatch_branches_agree() {
+    let palette = mismatch_palette();
+    // `_warn` lives in log.sh, outside the shared SOURCES.
+    // `_ui_status` lives in progress-ui.sh, also outside SOURCES.
+    let colors = ". \"$1/lib/dot/progress-ui.sh\"; . \"$1/lib/dot/log.sh\"; _C_YELLOW='<Y>'; _C_RESET='<R>'; ";
+    // (total, quiet, actual, name, path, expected).
+    let cases = [
+        (None, None, "<missing>", "ovl", "/tmp/plain", "https://x/y"),
+        (
+            Some("1"),
+            None,
+            "<missing>",
+            "ovl",
+            "/tmp/plain",
+            "https://x/y",
+        ),
+        (
+            Some("0"),
+            None,
+            "<multiple origin URLs>",
+            "ovl",
+            "/tmp/plain",
+            "https://x/y",
+        ),
+        (
+            Some("abc"),
+            None,
+            "https://other/z",
+            "ovl",
+            "/tmp/plain",
+            "https://x/y",
+        ),
+        (
+            None,
+            Some("1"),
+            "<missing>",
+            "ovl",
+            "/tmp/plain",
+            "https://x/y",
+        ),
+        (
+            Some("1"),
+            Some("1"),
+            "https://other/z",
+            "ovl",
+            "/tmp/plain",
+            "https://x/y",
+        ),
+        (
+            Some("1"),
+            None,
+            "https://other/z",
+            "my ovl",
+            "/tmp/my ovl",
+            "weird \"q\" $url",
+        ),
+        (
+            None,
+            None,
+            "<multiple origin URLs>",
+            "my ovl",
+            "/tmp/it's",
+            "https://x/y",
+        ),
+    ];
+    for (total, quiet, actual, name, path, expected) in cases {
+        let dir = TempDir::new("pull-mismatch").expect("fixture dir");
+        // Nasty values travel via argv so shell quoting cannot
+        // mangle them before the function sees them.
+        let argv = [
+            std::ffi::OsStr::new(name),
+            std::ffi::OsStr::new(path),
+            std::ffi::OsStr::new(expected),
+            std::ffi::OsStr::new(actual),
+        ];
+        let (code, out, err) = shell_run(
+            dir.path(),
+            &argv,
+            &[("DOT_UI_TOTAL", total), ("DOT_QUIET", quiet)],
+            &format!("{colors}_overlay_origin_mismatch \"$2\" \"$3\" \"$4\" \"$5\""),
+        );
+        assert_eq!(code, 0, "shell mismatch for {actual:?}");
+        let details = OriginMismatch {
+            name,
+            path,
+            expected,
+            actual,
+            ui_total: total,
+            quiet,
+        };
+        let (rust_out, rust_err, live) = origin_mismatch(&palette, false, false, &details);
+        assert!(!live, "mismatch drains the live flag");
+        assert_eq!(rust_out, out, "mismatch stdout for {actual:?}");
+        assert_eq!(rust_err, err, "mismatch stderr for {actual:?}");
+    }
+}
