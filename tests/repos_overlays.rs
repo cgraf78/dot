@@ -268,3 +268,115 @@ fn gates_agree() {
         }
     }
 }
+
+/// Drive the shell `_overlay_rollback_target` against explicit
+/// snapshot arrays, reporting `rc` plus `REPLY`.
+fn shell_rollback_target(home: &Path, paths: &[&str], targets: &[&str], rel: &str) -> String {
+    let setup = paths
+        .iter()
+        .map(|path| format!("'{path}'"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let setup_targets = targets
+        .iter()
+        .map(|target| format!("'{target}'"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let snippet = format!(
+        "DOT_OVERLAY_ROLLBACK_PATHS=({setup}); \
+         DOT_OVERLAY_ROLLBACK_TARGETS=({setup_targets}); \
+         if _overlay_rollback_target '{rel}'; then printf 'rc=0 reply=%s\\n' \"$REPLY\"; else printf 'rc=1 reply=%s\\n' \"$REPLY\"; fi\n"
+    );
+    let (code, out, serr) = shell_run(home, &[], &snippet);
+    assert_eq!(code, 0, "harness exit");
+    assert!(
+        serr.is_empty(),
+        "snippet stderr: {:?}",
+        String::from_utf8_lossy(&serr)
+    );
+    String::from_utf8(out).expect("rollback dump")
+}
+
+#[test]
+fn rollback_target_looks_up_snapshot_or_refuses() {
+    let home = TempDir::new("rollback-target").expect("fixture dir");
+    let snapshot = repos_overlays::RollbackSnapshot {
+        paths: vec!["a/link".to_string(), "b/link".to_string()],
+        targets: vec![".files/a".to_string(), ".files/b".to_string()],
+    };
+    // Hit, miss, and ragged arrays (the shell length guard refuses).
+    for (rel, want) in [
+        ("a/link", Some(".files/a")),
+        ("b/link", Some(".files/b")),
+        ("c/link", None),
+        ("", None),
+    ] {
+        let shell_dump = shell_rollback_target(
+            home.path(),
+            &["a/link", "b/link"],
+            &[".files/a", ".files/b"],
+            rel,
+        );
+        let rust = repos_overlays::rollback_target(&snapshot, rel);
+        assert_eq!(rust, want, "rust lookup for {rel:?}");
+        match want {
+            Some(target) => assert_eq!(
+                shell_dump,
+                format!("rc=0 reply={target}\n"),
+                "shell lookup for {rel:?}"
+            ),
+            None => assert!(
+                shell_dump.starts_with("rc=1 reply="),
+                "shell refuses {rel:?}: {shell_dump:?}"
+            ),
+        }
+    }
+    let ragged = repos_overlays::RollbackSnapshot {
+        paths: vec!["a/link".to_string()],
+        targets: vec![],
+    };
+    assert_eq!(repos_overlays::rollback_target(&ragged, "a/link"), None);
+    let shell_dump = shell_rollback_target(home.path(), &["a/link"], &[], "a/link");
+    assert!(
+        shell_dump.starts_with("rc=1 reply="),
+        "shell refuses ragged arrays: {shell_dump:?}"
+    );
+}
+
+#[test]
+fn link_target_available_checks_file_or_link() {
+    let home = TempDir::new("link-target").expect("fixture dir");
+    let home_text = home.path().to_string_lossy().into_owned();
+    std::fs::create_dir_all(home.path().join("sub")).expect("subdir");
+    std::fs::write(home.path().join("abs.txt"), b"x\n").expect("abs file");
+    std::fs::write(home.path().join("sub/rel.txt"), b"y\n").expect("rel file");
+    std::os::unix::fs::symlink("rel.txt", home.path().join("sub/anchor")).expect("symlink");
+    // Absolute targets hit anything file-or-link; relative ones
+    // resolve against the link's own parent directory.
+    let abs = home.path().join("abs.txt").to_string_lossy().into_owned();
+    for (rel, target, want) in [
+        ("sub/anchor", abs.as_str(), true),
+        ("sub/anchor", "/nonexistent-dot-test-target", false),
+        ("sub/anchor", "rel.txt", true),
+        ("sub/anchor", "missing.txt", false),
+        ("sub/anchor", "../abs.txt", true),
+    ] {
+        let snippet = format!(
+            "if _overlay_link_target_available '{rel}' '{target}'; then echo yes; else echo no; fi\n"
+        );
+        let (code, out, serr) = shell_run(home.path(), &[], &snippet);
+        assert_eq!(code, 0, "harness exit");
+        assert!(
+            serr.is_empty(),
+            "snippet stderr: {:?}",
+            String::from_utf8_lossy(&serr)
+        );
+        let shell_yes = out.starts_with(b"yes\n");
+        assert_eq!(shell_yes, want, "shell for {rel}/{target}");
+        assert_eq!(
+            repos_overlays::link_target_available(rel, target, &home_text),
+            want,
+            "rust for {rel}/{target}"
+        );
+    }
+}

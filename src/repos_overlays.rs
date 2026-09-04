@@ -182,3 +182,49 @@ pub fn manifest_safe(path: &Path, euid: u32) -> bool {
 pub fn pending_manifest_safe(path: &Path, euid: u32) -> bool {
     private_regular_file(path, euid) && manifest_safe(path, euid)
 }
+
+/// Snapshot of installed managed links for rollback lookup,
+/// replacing the shell's `DOT_OVERLAY_ROLLBACK_PATHS` /
+/// `DOT_OVERLAY_ROLLBACK_TARGETS` globals with an explicit value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RollbackSnapshot {
+    /// Installed relative paths, parallel to [`RollbackSnapshot::targets`].
+    pub paths: Vec<String>,
+    /// Managed generation each path pointed at when snapshotted.
+    pub targets: Vec<String>,
+}
+
+/// `_overlay_rollback_target`: the snapshotted managed generation
+/// for `rel`, or `None` when absent — including ragged snapshots,
+/// where the shell's length guard refuses before searching.
+pub fn rollback_target<'a>(snapshot: &'a RollbackSnapshot, rel: &'a str) -> Option<&'a str> {
+    if snapshot.paths.len() != snapshot.targets.len() {
+        return None;
+    }
+    snapshot
+        .paths
+        .iter()
+        .position(|path| path == rel)
+        .map(|index| snapshot.targets[index].as_str())
+}
+
+/// `_overlay_link_target_available`: whether `target` names something
+/// usable from the link at `home/rel` — a regular file or any
+/// symlink for absolute targets, or the same resolved against the
+/// link's own parent directory for relative ones.
+pub fn link_target_available(rel: &str, target: &str, home: &str) -> bool {
+    // `${destination%/*}` string semantics (not path parenting), so
+    // an empty `HOME` still resolves against the filesystem root
+    // exactly like the shell.
+    let source = if Path::new(target).is_absolute() {
+        target.to_string()
+    } else {
+        let destination = format!("{home}/{rel}");
+        let parent = destination.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let parent = if parent.is_empty() { "/" } else { parent };
+        format!("{parent}/{target}")
+    };
+    let source = Path::new(&source);
+    std::fs::symlink_metadata(source).is_ok_and(|meta| meta.file_type().is_symlink())
+        || std::fs::metadata(source).is_ok_and(|meta| meta.is_file())
+}
