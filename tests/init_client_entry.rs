@@ -169,7 +169,13 @@ fn valid_row(tag: &str, build: &dyn Fn(&Path), identity: Option<&str>, shell_ext
     let dir = TempDir::new(tag).expect("temp dir");
     build(dir.path());
     let identity_arg = match identity {
-        Some("live") => "\"$(stat -c '%d:%i' stage)\"".to_string(),
+        // Portable identity read (mirrors `_dot_path_identity`):
+        // bare GNU `stat -c` fails on BSD macOS, which silently
+        // empties the identity and vacuous-passes this row.
+        Some("live") => {
+            "\"$(stat -c '%d:%i' stage 2>/dev/null || stat -f '%d:%i' stage 2>/dev/null)\""
+                .to_string()
+        }
         Some(fixed) => sq(fixed),
         None => String::new(),
     };
@@ -873,7 +879,7 @@ fn seed_staged(home: &Path, mode: &str, oid: &str, path: &str) {
         " && stage=$REPLY && mkdir \"$stage\" && chmod 0700 \"$stage\"",
         " && _dot_init_stage_claim_write \"$stage\" entry ",
         &sq(path),
-        " && id=$(stat -c '%d:%i' \"$stage\") && dev=${id%%:*} && ino=${id#*:}",
+        " && id=$(stat -c '%d:%i' \"$stage\" 2>/dev/null || stat -f '%d:%i' \"$stage\" 2>/dev/null) && dev=${id%%:*} && ino=${id#*:}",
         " && line=$(printf 'staged\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t-\\t-' ",
         &sq(mode),
         " ",
