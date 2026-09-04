@@ -483,12 +483,24 @@ fn identity_resolves_file_urls() {
         ("/".to_string(), Some("file:///".to_string())),
         ("file://relative".to_string(), None),
         ("file://".to_string(), None),
-        // Missing leaf, existing parent: still an identity.
+        // Missing leaf, existing parent: still an identity on
+        // GNU, refused on macOS like its BSD `realpath`.
         (
             format!("file://{missing}"),
-            Some(format!("file://{missing}")),
+            if cfg!(target_os = "macos") {
+                None
+            } else {
+                Some(format!("file://{missing}"))
+            },
         ),
-        (missing.clone(), Some(format!("file://{missing}"))),
+        (
+            missing.clone(),
+            if cfg!(target_os = "macos") {
+                None
+            } else {
+                Some(format!("file://{missing}"))
+            },
+        ),
         (format!("{root}/no1/no2"), None),
         (format!("{root}/missing/../real"), None),
         (format!("{real}/f/leaf"), None),
@@ -548,7 +560,15 @@ fn identity_normalizes_network_shapes() {
         // Absolute paths resolve like `realpath`: a missing leaf
         // under `/` is still an identity, and the absolute arm wins
         // over the scp-like `host:path` reading of the colon.
-        ("/abs:with:colon", Some("file:///abs:with:colon")),
+        // Missing absolute path: GNU resolves, macOS refuses.
+        (
+            "/abs:with:colon",
+            if cfg!(target_os = "macos") {
+                None
+            } else {
+                Some("file:///abs:with:colon")
+            },
+        ),
         ("justastring", None),
         ("a/b/c", None),
         (":x", None),
