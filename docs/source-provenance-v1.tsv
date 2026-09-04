@@ -85,6 +85,7 @@ tests/extensions-api-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/families-test	dotfiles:tests/core-merges-test@dotfiles-v1
 tests/families.rs	standalone:new
 tests/hook-api-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
+tests/hook_api.rs	standalone:new
 tests/hooks-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/init-test	standalone:new
 tests/install-test	standalone:new
