@@ -49,6 +49,7 @@ pub mod repos_pull_support;
 pub mod reserved;
 pub mod run;
 pub mod shdeps;
+pub mod shdeps_ui;
 pub mod temp;
 pub mod test_support;
 pub mod ui;
