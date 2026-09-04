@@ -72,7 +72,7 @@
 //! `IFS=$'\t' read -r` semantics — leading tabs stripped, tab runs
 //! collapsing between fields, the last variable keeping the raw
 //! remainder with its tabs intact, missing variables reading empty —
-//! not a plain tab split, which mis-assigns rows with leading or
+//! not a plain tab split, which misassigns rows with leading or
 //! doubled tabs (see `read_row`). Loop framing matches the
 //! ingestion: `while read` bodies never run for an unterminated
 //! final line (direct reads and `sort -r` output alike — `sort`
@@ -221,7 +221,7 @@ fn cut_lines(content: &str) -> Vec<&str> {
 /// is either the phantom after a trailing newline or an
 /// unterminated tail whose variables `read` assigns but whose body
 /// never runs (probed against bash with both pipes and file
-/// redirects; the sibling split-and-keep convention mis-runs such
+/// redirects; the sibling split-and-keep convention misruns such
 /// tails). Feeds [`move_conflicts`], which reads its journal
 /// directly. NUL bytes never survive
 /// `read` (bash drops them silently, probed), so they are stripped
@@ -248,7 +248,7 @@ fn sort_loop_lines(content: &str) -> Vec<String> {
 /// Mirror of `IFS=$'\t' read -r v1..vN`: leading tabs are stripped,
 /// tab runs collapse between fields, the last slot keeps the raw
 /// remainder with its tabs intact, and missing slots read empty. A
-/// plain `splitn` mis-assigns rows with leading or doubled tabs
+/// plain `splitn` misassigns rows with leading or doubled tabs
 /// (probed against bash: `'\tp\tk'` reads `p`,`k` and
 /// `'p\t\tk'` reads `p`,`k`, while `splitn` yields a spurious
 /// empty first or second field), so the manifest loops use this
