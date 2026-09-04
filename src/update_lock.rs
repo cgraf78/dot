@@ -1,9 +1,10 @@
 //! Process-wide `dot update` serialization (slice 3).
 //!
 //! Ports `lib/dot/update-lock.sh`. `mkdir` atomicity, the owner record
-//! (`pid\t…/start\t…/token\t…`), stale-claim-by-rename, the empty-guard
-//! protocol, and the 3-attempt acquire loop are transliterated. Two
-//! deliberate replacements (same rationale as `cleanup`):
+//! (`pid\t…/start\t…/token\t…`), lock/owner path resolution,
+//! stale-claim-by-rename, the empty-guard protocol, and the 3-attempt
+//! acquire loop are transliterated. Two deliberate replacements (same
+//! rationale as `cleanup`):
 //!
 //! - Process identity uses the same two backends (procfs field 22,
 //!   `ps -o lstart=`), read through std/`Command` — no change needed.
@@ -50,6 +51,24 @@ pub const ACQUIRE_ATTEMPTS: u32 = 3;
 /// Shell exit code when another valid owner holds the lock.
 pub const EXIT_LOCK_BUSY: i32 = 75;
 
+/// Lock directory under an already-resolved XDG state home:
+/// `<state_dir>/dot/update.lock.d`.
+///
+/// Ports `_dot_update_lock_path` (`dot_xdg_path state
+/// "dot/update.lock.d"`): the `dot/` segment and the `update.lock.d`
+/// leaf are this module's contract, while resolving the state home
+/// from the environment stays a caller concern (see [`acquire`]).
+pub fn lock_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(DOT_DIR_NAME).join(LOCK_DIR_NAME)
+}
+
+/// Owner record inside a lock dir: `<lock_dir>/owner`.
+///
+/// Ports `_dot_update_lock_owner_file` (`printf '%s/owner\n' "$1"`).
+pub fn owner_file(lock_dir: &Path) -> PathBuf {
+    lock_dir.join(OWNER_FILE_NAME)
+}
+
 /// Parsed owner record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Owner {
@@ -66,7 +85,7 @@ pub struct Owner {
 /// proceeds to reclaim, exactly like the shell's `|| return 1` flow
 /// (a corrupt owner file must never wedge updates forever).
 pub fn read_owner(lock_dir: &Path) -> Option<Owner> {
-    let text = std::fs::read_to_string(lock_dir.join(OWNER_FILE_NAME)).ok()?;
+    let text = std::fs::read_to_string(owner_file(lock_dir)).ok()?;
     parse_owner(&text)
 }
 
@@ -238,7 +257,7 @@ pub fn is_initializing(lock_dir: &Path) -> bool {
 /// Remove the owner file then the lock dir (best-effort rmdir, like the
 /// shell: a recreated dir must not fail the releaser).
 fn remove_dir(lock_dir: &Path) {
-    let _ = std::fs::remove_file(lock_dir.join(OWNER_FILE_NAME));
+    let _ = std::fs::remove_file(owner_file(lock_dir));
     let _ = std::fs::remove_dir(lock_dir);
 }
 
@@ -319,9 +338,9 @@ fn reclaim_empty(lock_dir: &Path) -> bool {
 /// Reclaim a stale lock (dead owner, or none). Mirrors
 /// `_dot_update_lock_reclaim_stale`.
 fn reclaim_stale(lock_dir: &Path) -> bool {
-    let owner_file = lock_dir.join(OWNER_FILE_NAME);
-    if is_plain_file(&owner_file) {
-        let Some(claim) = claim_file(&owner_file) else {
+    let owner = owner_file(lock_dir);
+    if is_plain_file(&owner) {
+        let Some(claim) = claim_file(&owner) else {
             return false;
         };
         if !is_plain_file(&claim) || std::fs::remove_file(&claim).is_err() {
@@ -358,19 +377,15 @@ fn write_owner(lock_dir: &Path) -> Result<String> {
         start,
         token: token.clone(),
     };
-    std::fs::write(lock_dir.join(OWNER_FILE_NAME), format_owner(&owner)).map_err(|source| {
-        Error::Io {
-            context: "lock could not write its owner record",
-            source,
-        }
+    std::fs::write(owner_file(lock_dir), format_owner(&owner)).map_err(|source| Error::Io {
+        context: "lock could not write its owner record",
+        source,
     })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            lock_dir.join(OWNER_FILE_NAME),
-            std::fs::Permissions::from_mode(0o600),
-        );
+        let _ =
+            std::fs::set_permissions(owner_file(lock_dir), std::fs::Permissions::from_mode(0o600));
     }
     Ok(token)
 }
@@ -406,7 +421,7 @@ impl LockGuard {
             Some(owner)
                 if owner.pid == self.pid
                     && owner.token == self.token
-                    && std::fs::remove_file(self.lock_dir.join(OWNER_FILE_NAME)).is_ok() =>
+                    && std::fs::remove_file(owner_file(&self.lock_dir)).is_ok() =>
             {
                 std::fs::remove_dir(&self.lock_dir).is_ok()
             }
@@ -497,7 +512,7 @@ pub fn acquire(
     prior_token: Option<&str>,
     warn_sink: &mut dyn std::io::Write,
 ) -> Result<LockGuard> {
-    let lock_dir = state_dir.join(DOT_DIR_NAME).join(LOCK_DIR_NAME);
+    let lock_dir = lock_path(state_dir);
     std::fs::create_dir_all(lock_dir.parent().unwrap_or(state_dir)).map_err(|source| {
         Error::Io {
             context: "lock could not create its state directory",
@@ -591,6 +606,19 @@ mod tests {
 
     fn test_log() -> Log {
         Log::new(false, false)
+    }
+
+    #[test]
+    fn lock_paths_are_pure_suffixes() {
+        let state = Path::new("/tmp/example-state");
+        assert_eq!(
+            lock_path(state),
+            Path::new("/tmp/example-state/dot/update.lock.d")
+        );
+        assert_eq!(
+            owner_file(&lock_path(state)),
+            Path::new("/tmp/example-state/dot/update.lock.d/owner")
+        );
     }
 
     #[test]

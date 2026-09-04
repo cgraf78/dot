@@ -6,7 +6,7 @@
 //! Like `tests/cleanup.rs`, these compare EXIT CODES, streams, and
 //! filesystem OUTCOMES — never internals (tokens are opaque).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use dot::log::Log;
@@ -53,12 +53,6 @@ fn test_log() -> Log {
     Log::new(false, false)
 }
 
-fn lock_dir_of(state: &Path) -> PathBuf {
-    state
-        .join(dot::update_lock::DOT_DIR_NAME)
-        .join(dot::update_lock::LOCK_DIR_NAME)
-}
-
 /// Owner-format interop: each engine reads the other's live lock and
 /// agrees it is active. Compared by OUTCOME (parsed pid, ACTIVE
 /// verdict, busy contender code) — tokens stay opaque, and everything
@@ -74,8 +68,8 @@ fn shell_lock_is_readable_by_rust_and_vice_versa() {
     std::fs::create_dir_all(shell_state.join("home")).expect("home");
     let mut holder = spawn_shell_holder(&shell_state);
     wait_for_lock(&shell_state);
-    let owner =
-        dot::update_lock::read_owner(&lock_dir_of(&shell_state)).expect("rust reads shell owner");
+    let owner = dot::update_lock::read_owner(&dot::update_lock::lock_path(&shell_state))
+        .expect("rust reads shell owner");
     assert_eq!(owner.pid, holder.id(), "rust parsed the wrong owner pid");
     assert!(
         dot::update_lock::owner_is_active(&owner),
@@ -251,7 +245,7 @@ fn stale_lock_is_reclaimed() {
 
     // Rust-held lock, process gone (drop releases... so instead plant a
     // stale owner record with a dead pid directly): shell must reclaim.
-    let dir = lock_dir_of(&state);
+    let dir = dot::update_lock::lock_path(&state);
     std::fs::create_dir_all(&dir).expect("lock dir");
     std::fs::write(
         dir.join("owner"),
@@ -271,7 +265,7 @@ fn initializing_vs_aged_empty_lock() {
 
     let fresh_state = scratch.path().join("fresh");
     std::fs::create_dir_all(fresh_state.join("home")).expect("home");
-    let fresh_dir = lock_dir_of(&fresh_state);
+    let fresh_dir = dot::update_lock::lock_path(&fresh_state);
     std::fs::create_dir_all(&fresh_dir).expect("empty lock");
     let mut warnings = Vec::new();
     match dot::update_lock::acquire(&fresh_state, false, &log, None, &mut warnings) {
@@ -288,7 +282,7 @@ fn initializing_vs_aged_empty_lock() {
     // Aged via POSIX `touch -t` (portable, unlike `-d`).
     let aged_state = scratch.path().join("aged");
     std::fs::create_dir_all(aged_state.join("home")).expect("home");
-    let aged_dir = lock_dir_of(&aged_state);
+    let aged_dir = dot::update_lock::lock_path(&aged_state);
     std::fs::create_dir_all(&aged_dir).expect("empty lock");
     let status = Command::new("touch")
         .arg("-t")
@@ -310,7 +304,7 @@ fn file_at_lock_path_is_error() {
     let scratch = dot::test_support::TempDir::new("lock-filepath").expect("scratch");
     let state = scratch.path().join("state");
     std::fs::create_dir_all(state.join("home")).expect("home");
-    let dir = lock_dir_of(&state);
+    let dir = dot::update_lock::lock_path(&state);
     std::fs::create_dir_all(dir.parent().expect("parent")).expect("parent");
     std::fs::write(&dir, b"not a dir").expect("plant file");
 
@@ -326,6 +320,73 @@ fn file_at_lock_path_is_error() {
         Err(_) => {}
         Ok(_) => panic!("acquired over a file"),
     }
+}
+
+/// Lock and owner paths match the shell byte-for-byte under a
+/// scrubbed environment: `XDG_STATE_HOME` pins resolution on both
+/// engines, so the comparison covers the suffix contract
+/// (`dot/update.lock.d`, `owner`), not env lookup. Compared by
+/// OUTCOME (printed paths), never internals.
+#[test]
+fn lock_paths_match_shell() {
+    let scratch = dot::test_support::TempDir::new("lock-paths").expect("scratch");
+    let state = scratch.path().join("state");
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+
+    let expected_lock = dot::update_lock::lock_path(&state);
+    let expected_owner = dot::update_lock::owner_file(&expected_lock);
+
+    let repo = env!("CARGO_MANIFEST_DIR");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let tmpdir = std::env::var_os("TMPDIR")
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
+    let output = Command::new(bash_bin())
+        .arg("--noprofile")
+        .arg("--norc")
+        .arg("-c")
+        .arg(concat!(
+            "set -u\n",
+            ". \"$1/lib/dot/log.sh\"\n",
+            ". \"$1/lib/dot/update-lock.sh\"\n",
+            "_dot_update_lock_path\n",
+            "lock=$REPLY\n",
+            "owner=$(_dot_update_lock_owner_file \"$lock\")\n",
+            "printf 'lock=%s\\n' \"$lock\"\n",
+            "printf 'owner=%s\\n' \"$owner\"\n",
+        ))
+        .arg("dot-test-sh")
+        .arg(repo)
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", &path)
+        .env("TMPDIR", &tmpdir)
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn bash");
+    assert!(
+        output.status.success(),
+        "shell path probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("lock={}\n", expected_lock.display())),
+        "lock path mismatch: {stdout:?}"
+    );
+    assert!(
+        stdout.contains(&format!("owner={}\n", expected_owner.display())),
+        "owner path mismatch: {stdout:?}"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "path probe warned: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Spawn `bash` that acquires the lock under `state` and sleeps while
