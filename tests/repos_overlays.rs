@@ -1,7 +1,8 @@
-//! Differential parity tests for the `repos/overlays.sh` manifest
-//! subset against the live shell: link-target derivation, manifest
-//! record parsing, and the safety gates — including the unreadable
-//! fail-open quirk and bash redirect noise.
+//! Differential parity tests for `repos/overlays.sh` against the
+//! live shell: link-target derivation, manifest record parsing, the
+//! safety gates — including the unreadable fail-open quirk and bash
+//! redirect noise — plus inventory revalidation, replacement
+//! hashing, and tracked-path restore with real git fixtures.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -54,6 +55,47 @@ fn stage(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
     path
 }
 
+/// Run one shell snippet with both overlay libraries sourced:
+/// the link layer plus the local-source validators that live
+/// in `lib/dot/overlays.sh`.
+fn shell_run_links(
+    home: &Path,
+    argv: &[&std::ffi::OsStr],
+    snippet: &str,
+) -> (i32, Vec<u8>, Vec<u8>) {
+    let repo = env!("CARGO_MANIFEST_DIR");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let tmpdir = std::env::var_os("TMPDIR")
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
+    let mut cmd = Command::new(dot::test_support::bash());
+    cmd.arg("--noprofile")
+        .arg("--norc")
+        .arg("-c")
+        .arg(format!(
+                ". \"$1/lib/dot/repos/overlays.sh\"\n. \"$1/lib/dot/overlays.sh\"\n. \"$1/lib/dot/log.sh\"\n{snippet}",
+            ));
+    cmd.arg("dot-test-sh").arg(repo);
+    for arg in argv {
+        cmd.arg(arg);
+    }
+    cmd.env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", &path)
+        .env("TMPDIR", &tmpdir)
+        .env("HOME", home)
+        .env("DOT_TEST", "1")
+        .current_dir(home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = cmd.output().expect("spawn bash");
+    (
+        output.status.code().unwrap_or(99),
+        output.stdout,
+        output.stderr,
+    )
+}
 /// Current euid for ownership-gated checks.
 fn euid() -> u32 {
     dot::temp::current_uid().expect("current uid")
@@ -664,5 +706,365 @@ fn commit_quarantined_link_agrees() {
             shell,
             "commit aftermath for {case}"
         );
+    }
+}
+
+#[test]
+fn file_identity_agrees() {
+    let dir = TempDir::new("ov-file-ident").expect("fixture dir");
+    let home = dir.path();
+    let file = stage(home, "a.txt", b"data");
+    let sub = home.join("sub");
+    std::fs::create_dir(&sub).expect("fixture dir");
+    let link = home.join("link.txt");
+    std::os::unix::fs::symlink(&file, &link).expect("fixture link");
+    let missing = home.join("gone.txt");
+    for candidate in [&file, &sub, &link, &missing] {
+        let (code, out, serr) = shell_run(
+            home,
+            &[candidate.as_os_str()],
+            "_overlay_file_identity \"$2\"; printf 'rc=%s reply=%s' \"$?\" \"$REPLY\"",
+        );
+        assert_eq!(code, 0, "shell harness identity");
+        assert_eq!(serr, b"", "identity stderr");
+        let want = match repos_overlays::file_identity(candidate) {
+            Some(identity) => format!("rc=0 reply={identity}"),
+            None => "rc=1 reply=".to_string(),
+        };
+        assert_eq!(
+            want,
+            String::from_utf8(out).expect("identity dump"),
+            "identity parity",
+        );
+    }
+}
+
+#[test]
+fn local_source_snapshot_matches_agrees() {
+    let dir = TempDir::new("ov-snapshot").expect("fixture dir");
+    let home = dir.path();
+    let ov = home.join("ov");
+    let ov_home = ov.join("home");
+    std::fs::create_dir_all(&ov_home).expect("fixture home");
+    stage(&ov_home, "file.txt", b"x");
+    let real = ov_home.canonicalize().expect("real root");
+    let real_str = real.to_string_lossy().into_owned();
+    let identity = repos_overlays::file_identity(&real).expect("root identity");
+    let ov2 = home.join("ov2");
+    std::fs::create_dir(&ov2).expect("fixture overlay");
+    std::os::unix::fs::symlink(&real, ov2.join("home")).expect("fixture home link");
+    let missing = home.join("nope");
+    let slashed = format!("{real_str}/");
+    // (overlay path, expected root, expected identity).
+    let cases: Vec<(&Path, &str, &str)> = vec![
+        (&ov, &real_str, &identity),
+        (&ov, "", ""),
+        (&ov, &real_str, ""),
+        (&ov, "/elsewhere", &identity),
+        (&ov, &slashed, &identity),
+        (&ov, &real_str, "0:0"),
+        (&missing, "/x", "1:2"),
+        (&ov2, &real_str, &identity),
+    ];
+    for (path, root, ident) in &cases {
+        let path_str = path.to_string_lossy().into_owned();
+        let (code, out, serr) = shell_run(
+            home,
+            &[
+                std::ffi::OsStr::new(&path_str),
+                std::ffi::OsStr::new(root),
+                std::ffi::OsStr::new(ident),
+            ],
+            "_overlay_local_source_snapshot_matches \"$2\" \"$3\" \"$4\"; printf 'rc=%s reply=%s' \"$?\" \"$REPLY\"",
+        );
+        assert_eq!(code, 0, "shell harness snapshot");
+        assert_eq!(serr, b"", "snapshot stderr");
+        let want = match repos_overlays::local_source_snapshot_matches(&path_str, root, ident) {
+            Ok(()) => "rc=0 reply=".to_string(),
+            Err(diagnostic) => format!("rc=1 reply={diagnostic}"),
+        };
+        assert_eq!(
+            want,
+            String::from_utf8(out).expect("snapshot dump"),
+            "snapshot parity for {path_str:?}",
+        );
+    }
+}
+
+#[test]
+fn local_inventory_entry_current_agrees() {
+    let dir = TempDir::new("ov-entry").expect("fixture dir");
+    let home = dir.path();
+    let ov = home.join("ov");
+    let ov_home = ov.join("home");
+    std::fs::create_dir_all(&ov_home).expect("fixture home");
+    let src = stage(&ov_home, "file.txt", b"x");
+    let real = ov_home.canonicalize().expect("real root");
+    let real_str = real.to_string_lossy().into_owned();
+    let identity = repos_overlays::file_identity(&real).expect("root identity");
+    let home_str = home.to_string_lossy().into_owned();
+    let path_str = ov.to_string_lossy().into_owned();
+    let src_str = src.to_string_lossy().into_owned();
+    // (src, rel, root, identity): the snapshot failure
+    // short-circuits before the entry validator runs.
+    let cases = [
+        (
+            src_str.as_str(),
+            "file",
+            real_str.as_str(),
+            identity.as_str(),
+        ),
+        (src_str.as_str(), "file", real_str.as_str(), "9:9"),
+        (
+            src_str.as_str(),
+            "other",
+            real_str.as_str(),
+            identity.as_str(),
+        ),
+    ];
+    for (src_arg, rel, root, ident) in &cases {
+        let (code, out, serr) = shell_run_links(
+            home,
+            &[
+                std::ffi::OsStr::new(&path_str),
+                std::ffi::OsStr::new(src_arg),
+                std::ffi::OsStr::new(rel),
+                std::ffi::OsStr::new(root),
+                std::ffi::OsStr::new(ident),
+            ],
+            "OVERLAYS=(); _overlay_local_inventory_entry_current \"$2\" \"$3\" \"$4\" \"$5\" \"$6\"; printf 'rc=%s reply=%s' \"$?\" \"$REPLY\"",
+        );
+        assert_eq!(code, 0, "shell harness entry");
+        assert_eq!(serr, b"", "entry stderr for {rel:?}");
+        let rust = repos_overlays::local_inventory_entry_current(
+            &path_str,
+            std::path::Path::new(src_arg),
+            rel,
+            root,
+            ident,
+            &[],
+            &home_str,
+        );
+        let want = match rust {
+            Ok(()) => "rc=0 reply=".to_string(),
+            Err(diagnostic) => format!("rc=1 reply={diagnostic}"),
+        };
+        assert_eq!(
+            want,
+            String::from_utf8(out).expect("entry dump"),
+            "entry parity for {rel:?}",
+        );
+    }
+}
+
+#[test]
+fn replacement_hash_object_agrees() {
+    let dir = TempDir::new("ov-hashobj").expect("fixture dir");
+    let home = dir.path();
+    let doc = stage(home, "doc.txt", b"hash me\n");
+    let doc_str = doc.to_string_lossy().into_owned();
+    // (git args, stdin): the source root binds `$PWD`, like
+    // `DOT_SOURCE_ROOT` falling back in the shell.
+    let file_args = vec![
+        "--no-filters".to_string(),
+        "--".to_string(),
+        doc_str.clone(),
+    ];
+    let cases: Vec<(Vec<String>, Option<&[u8]>)> = vec![
+        (vec!["--stdin".to_string()], Some(b"hello".as_slice())),
+        (vec!["--stdin".to_string()], Some(b"".as_slice())),
+        (file_args, None),
+    ];
+    for (args, stdin) in &cases {
+        let argv: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
+        let stdin_text = std::str::from_utf8(stdin.unwrap_or_default()).expect("ascii stdin");
+        let mut full_argv = vec![std::ffi::OsStr::new(stdin_text)];
+        full_argv.extend(argv);
+        let (code, out, serr) = shell_run(
+            home,
+            &full_argv,
+            "DOT_STDIN=\"$2\"; shift 2; export DOT_SOURCE_ROOT=\"$PWD\"; printf '%s' \"$DOT_STDIN\" | _overlay_replacement_hash_object \"$@\" >hash.out; rc=$?; printf 'rc=%s hash=%s' \"$rc\" \"$(cat hash.out)\"",
+        );
+        assert_eq!(code, 0, "shell harness hash");
+        assert_eq!(serr, b"", "hash stderr");
+        let rust = repos_overlays::replacement_hash_object(home, args, *stdin);
+        let want = match rust {
+            Some(hash) => format!("rc=0 hash={hash}"),
+            None => "rc=1 hash=".to_string(),
+        };
+        assert_eq!(
+            want,
+            String::from_utf8(out).expect("hash dump"),
+            "hash parity for {args:?}",
+        );
+    }
+}
+
+/// Run git for fixtures with a pinned identity and no global
+/// or system config, so the client hooks never load.
+fn git(repo: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn git");
+    assert!(status.success(), "git {args:?}");
+}
+
+/// A base repo with two tracked files; the work tree doubles
+/// as `$HOME` for the ordinary topology.
+fn restore_repo(dir: &Path) -> PathBuf {
+    git(dir, &["init", "-q", "."]);
+    git(dir, &["config", "user.email", "t@t"]);
+    git(dir, &["config", "user.name", "t"]);
+    std::fs::write(dir.join("tracked.txt"), "tracked\n").expect("stage tracked");
+    std::fs::write(dir.join("shadow.txt"), "shadow\n").expect("stage shadow");
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-qm", "init"]);
+    dir.to_path_buf()
+}
+
+/// An empty-warning palette: colors stay off under a pipe,
+/// like `log.sh` with no terminal.
+fn plain_palette() -> dot::progress_ui::Palette {
+    dot::progress_ui::Palette {
+        reset: String::new(),
+        bold: String::new(),
+        dim: String::new(),
+        green: String::new(),
+        yellow: String::new(),
+        red: String::new(),
+        blue: String::new(),
+        cyan: String::new(),
+        white: String::new(),
+    }
+}
+
+/// Make `repo` read-only (`lock`) or writable again.
+fn set_readonly(repo: &Path, readonly: bool) {
+    let mode = if readonly { 0o555 } else { 0o755 };
+    std::fs::set_permissions(repo, std::fs::Permissions::from_mode(mode)).expect("fixture modes");
+}
+#[test]
+fn restore_tracked_path_agrees() {
+    let palette = plain_palette();
+    for setup in [
+        "restore-modified",
+        "clear-fails",
+        "checkout-fails",
+        "refused",
+    ] {
+        // Each engine gets its own repo: the restore mutates
+        // the work tree it runs in.
+        let shell_dir = TempDir::new("ov-restore-sh").expect("fixture dir");
+        let shell_repo = restore_repo(shell_dir.path());
+        let rust_dir = TempDir::new("ov-restore-rs").expect("fixture dir");
+        let rust_repo = restore_repo(rust_dir.path());
+        let shell_home = shell_repo.to_string_lossy().into_owned();
+        let rust_home = rust_repo.to_string_lossy().into_owned();
+        let mut shell_overlays: Vec<String> = Vec::new();
+        let mut rust_overlays: Vec<String> = Vec::new();
+        let rel: &str;
+        let mut want_content: Option<&str> = None;
+        match setup {
+            "restore-modified" => {
+                rel = "tracked.txt";
+                std::fs::write(shell_repo.join(rel), "changed\n").expect("dirty shell");
+                std::fs::write(rust_repo.join(rel), "changed\n").expect("dirty rust");
+                want_content = Some("tracked\n");
+            }
+            "clear-fails" => {
+                rel = "untracked.txt";
+                std::fs::write(shell_repo.join(rel), "new\n").expect("stage shell");
+                std::fs::write(rust_repo.join(rel), "new\n").expect("stage rust");
+            }
+            "checkout-fails" => {
+                rel = "tracked.txt";
+                for repo in [&shell_repo, &rust_repo] {
+                    std::fs::remove_file(repo.join(rel)).expect("remove tracked");
+                    set_readonly(repo, true);
+                }
+            }
+            _ => {
+                rel = "loc/home/evil";
+                for (repo, store) in [
+                    (&shell_repo, &mut shell_overlays),
+                    (&rust_repo, &mut rust_overlays),
+                ] {
+                    let loc = repo.join("loc");
+                    std::fs::create_dir_all(loc.join("home")).expect("local source");
+                    store.push(format!("o|{}/loc|u|x|x|none", repo.to_string_lossy()));
+                }
+            }
+        }
+        let mut argv: Vec<&std::ffi::OsStr> =
+            vec![std::ffi::OsStr::new(&shell_home), std::ffi::OsStr::new(rel)];
+        argv.extend(shell_overlays.iter().map(std::ffi::OsStr::new));
+        let (code, out, serr) = shell_run_links(
+            &shell_repo,
+            &argv,
+            "REPO=\"$2\"; REL=\"$3\"; OVERLAYS=(\"${@:4}\"); _base_git() { command git -C \"$REPO\" \"$@\"; }; _overlay_restore_tracked_path \"$REL\"; rc=$?; chmod u+w \"$REPO\" 2>/dev/null; printf 'rc=%s' \"$rc\"",
+        );
+        assert_eq!(code, 0, "shell harness restore {setup}");
+        let shell_text = String::from_utf8(out).expect("restore dump");
+        let shell_rc: i32 = shell_text
+            .strip_prefix("rc=")
+            .expect("rc prefix")
+            .parse()
+            .expect("rc number");
+        let base = dot::repos_base::Base {
+            topology: dot::repos_base::Topology::Ordinary,
+            client_git_dir: String::new(),
+            home: rust_home.clone(),
+        };
+        let (ok, warnings) =
+            repos_overlays::restore_tracked_path(&palette, &base, &rust_overlays, &rust_home, rel);
+        // Warnings name only the relative path, except the
+        // refusal diagnostic, which carries each tree root:
+        // compare each engine against its own tree.
+        let refusing = format!(
+            "  warning: refusing to restore a base path inside a local overlay source: {}/loc/home (destination resolves inside source: loc/home/evil)\n",
+            rust_home
+        );
+        let want_warnings = match setup {
+            "restore-modified" => Vec::new(),
+            "clear-fails" => {
+                b"  warning: could not clear overlay index state: untracked.txt\n".to_vec()
+            }
+            "checkout-fails" => {
+                b"  warning: could not restore overlay base path: tracked.txt\n".to_vec()
+            }
+            _ => refusing.into_bytes(),
+        };
+        let shell_refusing = format!(
+            "  warning: refusing to restore a base path inside a local overlay source: {}/loc/home (destination resolves inside source: loc/home/evil)\n",
+            shell_home
+        );
+        let shell_want = match setup {
+            "restore-modified" => Vec::new(),
+            "clear-fails" => {
+                b"  warning: could not clear overlay index state: untracked.txt\n".to_vec()
+            }
+            "checkout-fails" => {
+                b"  warning: could not restore overlay base path: tracked.txt\n".to_vec()
+            }
+            _ => shell_refusing.into_bytes(),
+        };
+        assert_eq!(shell_rc == 0, ok, "restore rc {setup}");
+        assert_eq!(serr, shell_want, "shell warnings {setup}");
+        assert_eq!(warnings, want_warnings, "restore warnings {setup}");
+        if let Some(content) = want_content {
+            let shell_back = std::fs::read_to_string(shell_repo.join(rel)).expect("shell content");
+            let rust_back = std::fs::read_to_string(rust_repo.join(rel)).expect("rust content");
+            assert_eq!(shell_back, content, "shell restores {setup}");
+            assert_eq!(rust_back, content, "rust restores {setup}");
+        }
     }
 }
