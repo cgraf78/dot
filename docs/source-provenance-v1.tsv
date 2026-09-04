@@ -123,6 +123,7 @@ tests/repos_publish.rs	standalone:new
 tests/repos_quarantine.rs	standalone:new
 tests/repos_pull_queries.rs	standalone:new
 tests/repos_pull_support.rs	standalone:new
+tests/progress_ui.rs	standalone:new
 tests/reserved.rs	standalone:new
 tests/resources-test	dotfiles:tests/core-resource-cleanup-test@dotfiles-v1+standalone
 tests/run	standalone:new

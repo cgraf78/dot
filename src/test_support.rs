@@ -187,9 +187,22 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod");
-            let output = std::process::Command::new(&script)
-                .output()
-                .expect("spawn fixture");
+            // Under parallel load the kernel can report the
+            // just-written script busy (ETXTBSY) on first exec;
+            // retry that transient only, with a bounded deadline.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let output = loop {
+                match std::process::Command::new(&script).output() {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    result => break result.expect("spawn fixture"),
+                }
+            };
             assert!(output.status.success());
             assert_eq!(output.stdout, b"ok\n");
         }
