@@ -241,7 +241,7 @@ fn prepare_creates_owned_stage() {
     let twins = Twins::build("init-txn-prepare");
     let txn_sh = twins.shell_home.join("transaction");
     let snippet = format!(
-        "txn={txn}\n_dot_init_prepare_transaction \"$txn\"; echo \"code=$?\"\nstage=$REPLY; base=${{stage##*/}}; suffix=${{base#transaction.prepare.}}\necho \"prefix=${{base%.$suffix}}\"\necho \"suffix-len=${{#suffix}}\"\n_dot_init_transaction_stage_owned \"$stage\" 2>/dev/null; echo \"owned=$?\"\nstat -c '%a' \"$stage\" 2>/dev/null || stat -f '%Lp' \"$stage\" 2>/dev/null\nstat -c '%a' \"$stage/.dot-transaction-stage-v1\" 2>/dev/null || stat -f '%Lp' \"$stage/.dot-transaction-stage-v1\" 2>/dev/null\ncmp -s <(printf 'cgraf78 dot initialization preparation v1\\n') \"$stage/.dot-transaction-stage-v1\"; echo \"marker=$?\"\n",
+        "txn={txn}\n_dot_init_prepare_transaction \"$txn\"; echo \"code=$?\"\nstage=$REPLY; base=${{stage##*/}}; suffix=${{base#transaction.prepare.}}\necho \"prefix=${{base%.$suffix}}\"\necho \"suffix-len=${{#suffix}}\"\n_dot_init_transaction_stage_owned \"$stage\" 2>/dev/null; echo \"owned=$?\"\nstat -c '%a' \"$stage\" 2>/dev/null || stat -f '%Lp' \"$stage\" 2>/dev/null\nstat -c '%a' \"$stage/.dot-transaction-stage-v1\" 2>/dev/null || stat -f '%Lp' \"$stage/.dot-transaction-stage-v1\" 2>/dev/null\nif [[ $(cat \"$stage/.dot-transaction-stage-v1\") == 'cgraf78 dot initialization preparation v1' ]]; then echo \"marker=0\"; else echo \"marker=1\"; fi\n",
         txn = sq(&txn_sh.to_string_lossy()),
     );
     let (code, out, _) = shell_run(&twins.shell_home, &snippet);
