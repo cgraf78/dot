@@ -367,11 +367,8 @@ fn quarantined_unchanged(source_root: &Path, parked: &Path, expected: &str) -> R
 /// is still fully absent (no file and no link — a late writer wins).
 /// A late or non-empty stage directory fails the restore.
 ///
-/// Known safe-direction divergence: the shell verifies the quarantine
-/// move with lstat, so it restores a link whose target dangles;
-/// [`temp::move_noreplace_with`] verifies by following, so that shape
-/// reports failure (after the rename lands) instead of validating an
-/// unresolvable generation.
+/// Move verification lstates like the shell, so a parked link whose
+/// target dangles still restores (its own identity verifies).
 pub fn restore_quarantined_link(
     source_root: &Path,
     physical: &Path,
@@ -468,23 +465,7 @@ pub struct DestinationContext {
 /// reserved-roots snapshot reads reserved (fail closed), exactly
 /// like `_dot_reserved_roots_snapshot || return 0`.
 pub fn destination_context(rel: &str, inputs: &DestinationInputs) -> Option<DestinationContext> {
-    let destination = format!("{}/{}", inputs.home, rel);
-    let roots = reserved_roots_for(inputs)?;
-    if reserved::candidate_path_is_reserved_from_roots(
-        &destination,
-        &roots,
-        &inputs.home,
-        &checkout_for(inputs),
-        &inputs.pwd,
-    ) {
-        return None;
-    }
-    let leaf = reserved::physical_leaf_candidate(&destination, &inputs.pwd).ok()?;
-    Some(DestinationContext {
-        physical: PathBuf::from(leaf.path),
-        parent: PathBuf::from(leaf.physical_parent),
-        parent_identity: leaf.parent_identity,
-    })
+    destination_context_for(&format!("{}/{}", inputs.home, rel), inputs)
 }
 
 /// One quarantined generation, replacing the shell's
@@ -1778,4 +1759,532 @@ pub fn replacement_cleanup(record: &Path, transaction: &Path, target: &str) -> b
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(_) => false,
     }
+}
+
+/// `_dot_init_safe_value`: nonempty with no tab or newline bytes.
+fn init_safe_value(value: &str) -> bool {
+    !value.is_empty() && !value.contains(['\t', '\n', '\r'])
+}
+
+/// `_dot_init_safe_relative_path`: a home-relative path with no
+/// escapes and no `.git` component. Case folds ASCII-only like
+/// the shell `${component,,}` under `LC_ALL=C` (never the Unicode
+/// Kelvin-sign fold `to_lowercase` would add).
+pub fn init_safe_relative_path(path: &str) -> bool {
+    if !init_safe_value(path) {
+        return false;
+    }
+    if path.starts_with('/')
+        || path == "."
+        || path == ".."
+        || path.starts_with("./")
+        || path.starts_with("../")
+        || path.contains("/./")
+        || path.contains("/../")
+        || path.ends_with('/')
+        || path.ends_with("/.")
+        || path.ends_with("/..")
+        || path.contains("//")
+    {
+        return false;
+    }
+    !path
+        .split('/')
+        .any(|component| component.eq_ignore_ascii_case(".git"))
+}
+
+/// `_overlay_ensure_destination_parent`: create every missing
+/// component of `parent` under `home`. `mkdir -m '=rwx'` without
+/// an explicit who honors the process umask, exactly like
+/// `DirBuilder`. An existing directory (links followed, like
+/// `mkdir -p`) is kept; any other occupant fails.
+pub fn ensure_destination_parent(home: &str, parent: &str) -> bool {
+    use std::os::unix::fs::DirBuilderExt as _;
+    if parent == home {
+        return true;
+    }
+    let relative = match parent.strip_prefix(home) {
+        Some(relative) if relative.starts_with('/') => &relative[1..],
+        _ => return false,
+    };
+    if !init_safe_relative_path(relative) {
+        return false;
+    }
+    let mut current = PathBuf::from(home);
+    for component in relative.split('/') {
+        current.push(component);
+        // `-d` follows symlinks, matching `mkdir -p` support for
+        // user-owned parent indirection.
+        if std::fs::metadata(&current).is_ok_and(|meta| meta.is_dir()) {
+            continue;
+        }
+        if current.symlink_metadata().is_ok() {
+            return false;
+        }
+        if std::fs::DirBuilder::new()
+            .mode(0o777)
+            .create(&current)
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// `_overlay_record_final`: append one installed record and mark
+/// its rel current. A failed append records nothing, like the
+/// shell `|| return 1` before the map assignment.
+pub fn record_final(
+    rel: &str,
+    owner: &str,
+    target: &str,
+    manifest_new: &Path,
+    current: &mut HashSet<String>,
+) -> bool {
+    use std::io::Write as _;
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(manifest_new)
+    {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    if writeln!(file, "{rel}\t{owner}\t{target}").is_err() {
+        return false;
+    }
+    current.insert(rel.to_string());
+    true
+}
+
+/// `rm -f`: a missing path still succeeds.
+fn remove_optional(path: &Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
+/// The guarded destination behind both [`destination_context`]
+/// and the recovery publisher: reserved check plus physical-leaf
+/// resolution for one absolute `destination`.
+fn destination_context_for(
+    destination: &str,
+    inputs: &DestinationInputs,
+) -> Option<DestinationContext> {
+    let roots = reserved_roots_for(inputs)?;
+    if reserved::candidate_path_is_reserved_from_roots(
+        destination,
+        &roots,
+        &inputs.home,
+        &checkout_for(inputs),
+        &inputs.pwd,
+    ) {
+        return None;
+    }
+    let leaf = reserved::physical_leaf_candidate(destination, &inputs.pwd).ok()?;
+    Some(DestinationContext {
+        physical: PathBuf::from(leaf.path),
+        parent: PathBuf::from(leaf.physical_parent),
+        parent_identity: leaf.parent_identity,
+    })
+}
+
+/// `_overlay_recover_replacement`: converge one crash record —
+/// restore the parked generation or drop the settled one. Every
+/// branch below mirrors one shell outcome, including which
+/// artifacts each failure leaves behind. `pwd` resolves the
+/// destination's physical leaf, like the shell working directory.
+pub fn recover_replacement(
+    record: &Path,
+    manifest: &str,
+    euid: u32,
+    source_root: &Path,
+    tmp: &Path,
+    pwd: &str,
+    tool: &temp::MoveTool,
+) -> bool {
+    let fields = match replacement_read(record, manifest, euid, source_root, tmp) {
+        Some(fields) => fields,
+        None => return false,
+    };
+    let physical = PathBuf::from(&fields.physical);
+    let transaction = PathBuf::from(&fields.transaction);
+    let previous = transaction.join("previous");
+    let physical_parent = match physical.parent() {
+        Some(parent) => parent.to_path_buf(),
+        None => return false,
+    };
+    // The shell `stat` has no `-P`: the recorded parent identity
+    // is compared following, and a vanished parent reads empty
+    // (which never equals the shaped expectation).
+    if temp::path_identity(&physical_parent)
+        .map(temp::identity_string)
+        .unwrap_or_default()
+        != fields.parent_identity
+    {
+        return false;
+    }
+    // Lexical freshness: the destination still resolves at the
+    // recorded physical leaf under the recorded parent.
+    let mut lexical_parent_current = false;
+    if let Ok(leaf) = reserved::physical_leaf_candidate(&fields.destination, pwd) {
+        if leaf.path == fields.physical && leaf.parent_identity == fields.parent_identity {
+            lexical_parent_current = true;
+        }
+    }
+    if !any_presence(&transaction) {
+        if !replacement_generation_matches(
+            &physical,
+            &fields.expected,
+            fields.identity_kind.as_str(),
+            source_root,
+        ) {
+            return false;
+        }
+        return remove_optional(record);
+    }
+    if !replacement_transaction_safe(&transaction, euid) {
+        return false;
+    }
+    let next = transaction.join("next");
+    if any_presence(&next) {
+        let staged = std::fs::symlink_metadata(&next)
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+            && readlink_stripped(&next).is_some_and(|link| link == fields.target.as_bytes());
+        if !staged {
+            return false;
+        }
+    }
+    if any_presence(&previous) {
+        if !replacement_generation_matches(
+            &previous,
+            &fields.expected,
+            fields.identity_kind.as_str(),
+            source_root,
+        ) {
+            return false;
+        }
+        let previous_identity = match replacement_identity(source_root, &previous) {
+            Ok(identity) => identity,
+            Err(_) => return false,
+        };
+        if !any_presence(&physical) {
+            if temp::move_noreplace_with(&previous, &physical, tool).is_err() {
+                return false;
+            }
+            // `$(... || true)`: a failed recheck reads empty and
+            // only matches a degenerate empty parked identity.
+            if replacement_identity(source_root, &physical).unwrap_or_default() != previous_identity
+            {
+                return false;
+            }
+            return replacement_cleanup(record, &transaction, &fields.target);
+        }
+        if std::fs::symlink_metadata(&physical).is_ok_and(|meta| meta.file_type().is_symlink())
+            && readlink_stripped(&physical).is_some_and(|link| link == fields.target.as_bytes())
+        {
+            if lexical_parent_current {
+                if std::fs::remove_file(&previous).is_err() {
+                    return false;
+                }
+            } else {
+                // The desired link landed under a stale lexical
+                // parent: park it before restoring the old
+                // generation, so a late third-party winner survives
+                // every exclusive move.
+                if any_presence(&next) {
+                    return false;
+                }
+                if temp::move_noreplace_with(&physical, &next, tool).is_err() {
+                    return false;
+                }
+                if !std::fs::symlink_metadata(&next).is_ok_and(|meta| meta.file_type().is_symlink())
+                    || readlink_stripped(&next).is_some_and(|link| link != fields.target.as_bytes())
+                {
+                    let _ = temp::move_noreplace_with(&next, &physical, tool);
+                    return false;
+                }
+                if temp::move_noreplace_with(&previous, &physical, tool).is_err() {
+                    return false;
+                }
+            }
+            return replacement_cleanup(record, &transaction, &fields.target);
+        }
+        return false;
+    }
+    if replacement_generation_matches(
+        &physical,
+        &fields.expected,
+        fields.identity_kind.as_str(),
+        source_root,
+    ) || std::fs::symlink_metadata(&physical).is_ok_and(|meta| meta.file_type().is_symlink())
+        && readlink_stripped(&physical).is_some_and(|link| link == fields.target.as_bytes())
+    {
+        return replacement_cleanup(record, &transaction, &fields.target);
+    }
+    false
+}
+
+/// `_overlay_recover_replacements`: converge every
+/// `<manifest>.replace.*` record in byte-sorted glob order
+/// (nullglob, no dotglob: a literal leading dot in the manifest
+/// name still matches). The error names the first failing record
+/// (`REPLY`), and later records stay untouched.
+pub fn recover_replacements(
+    manifest: &str,
+    euid: u32,
+    source_root: &Path,
+    tmp: &Path,
+    pwd: &str,
+    tool: &temp::MoveTool,
+) -> std::result::Result<(), String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let manifest_path = Path::new(manifest);
+    let dir = match manifest_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let prefix = match manifest_path.file_name() {
+        Some(name) => format!("{}.replace.", name.to_string_lossy()),
+        None => return Ok(()),
+    };
+    let mut records: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name())
+                .filter(|name| {
+                    let bytes = name.as_bytes();
+                    bytes.starts_with(prefix.as_bytes())
+                        && (!bytes.starts_with(b".") || prefix.starts_with('.'))
+                })
+                .map(|name| dir.join(name))
+                .collect()
+        })
+        .unwrap_or_default();
+    records.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+    for record in &records {
+        if !recover_replacement(record, manifest, euid, source_root, tmp, pwd, tool) {
+            return Err(record.to_string_lossy().into_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Owned inputs for [`publish_link`]: the shell's positional
+/// parameters plus the environment the transactional publisher
+/// reads (destination context, manifest, caller uid, Git source
+/// root, hash throwaway base, and move tool).
+#[derive(Debug)]
+pub struct PublishLinkInputs<'a> {
+    /// Link target to install.
+    pub target: &'a str,
+    /// Absolute destination path.
+    pub destination: &'a str,
+    /// Pinned generation, if the caller replaces one (an empty
+    /// pin publishes fresh, like the shell `${3:-}`).
+    pub expected: Option<&'a str>,
+    /// Reserved-roots environment for destination resolution.
+    pub inputs: &'a DestinationInputs,
+    /// Selected manifest for the recovery record name.
+    pub manifest: &'a str,
+    /// Caller uid for the private record writer.
+    pub euid: u32,
+    /// Sanitized Git source root for fingerprints.
+    pub source_root: &'a Path,
+    /// Base for the legacy-hash throwaway repository.
+    pub tmp: &'a Path,
+    /// Probed move tool.
+    pub tool: &'a temp::MoveTool,
+}
+
+/// `_overlay_publish_link`: install the target at the destination,
+/// transactionally when the inputs pin the generation being
+/// replaced. Every early return below leaks exactly what the
+/// shell leaves behind on that path: stage-only failures clean
+/// the stage, while record/transaction failures after the write
+/// keep the recovery trail.
+pub fn publish_link(link: &PublishLinkInputs<'_>) -> bool {
+    let target = link.target;
+    let destination = link.destination;
+    let inputs = link.inputs;
+    let context = match destination_context_for(destination, inputs) {
+        Some(context) => context,
+        None => return false,
+    };
+    let physical = context.physical;
+    let parent = context.parent;
+    let parent_identity = context.parent_identity;
+    let base = match Path::new(destination).file_name() {
+        Some(base) => base.to_os_string(),
+        None => return false,
+    };
+    let mut stage_name = std::ffi::OsString::from(".");
+    stage_name.push(&base);
+    stage_name.push(".overlay-link.");
+    let stage = match stage_private_dir(&parent, &stage_name.to_string_lossy()) {
+        Some(stage) => stage,
+        None => return false,
+    };
+    let staged = stage.join("link");
+    if std::os::unix::fs::symlink(target, &staged).is_err() {
+        let _ = std::fs::remove_file(&staged);
+        let _ = std::fs::remove_dir(&stage);
+        return false;
+    }
+    if let Some(expected) = link.expected.filter(|identity| !identity.is_empty()) {
+        return publish_link_replace(
+            link,
+            expected,
+            &physical,
+            &parent,
+            &parent_identity,
+            &stage,
+            &staged,
+        );
+    }
+    if temp::move_noreplace_with(&staged, &physical, link.tool).is_err() {
+        let _ = std::fs::remove_file(&staged);
+        let _ = std::fs::remove_dir(&stage);
+        return false;
+    }
+    let _ = std::fs::remove_dir(&stage);
+    let current = match destination_context_for(destination, inputs) {
+        Some(current) => current,
+        None => return false,
+    };
+    if current.parent != parent || current.parent_identity != parent_identity {
+        if std::fs::symlink_metadata(&physical).is_ok_and(|meta| meta.file_type().is_symlink())
+            && readlink_stripped(&physical).is_some_and(|link| link == target.as_bytes())
+        {
+            let _ = std::fs::remove_file(&physical);
+        }
+        return false;
+    }
+    std::fs::symlink_metadata(&physical).is_ok_and(|meta| meta.file_type().is_symlink())
+        && readlink_stripped(&physical).is_some_and(|link| link == target.as_bytes())
+}
+
+/// The transactional half of [`publish_link`]: `expected` pins the
+/// live generation, so every mutation is recoverable.
+fn publish_link_replace(
+    link: &PublishLinkInputs<'_>,
+    expected: &str,
+    physical: &Path,
+    parent: &Path,
+    parent_identity: &str,
+    stage: &Path,
+    staged: &Path,
+) -> bool {
+    let target = link.target;
+    let destination = link.destination;
+    let inputs = link.inputs;
+    let manifest = link.manifest;
+    let euid = link.euid;
+    let source_root = link.source_root;
+    let tmp = link.tmp;
+    let tool = link.tool;
+    let clean_stage = |stage: &Path| {
+        let _ = std::fs::remove_dir(stage);
+    };
+    // `$(... || true)`: only a degenerate empty pin matches a
+    // failed recheck, and pins are nonempty here.
+    if replacement_identity(source_root, Path::new(destination)).unwrap_or_default() != expected {
+        let _ = std::fs::remove_file(staged);
+        clean_stage(stage);
+        return false;
+    }
+    let record = match replacement_record_path(destination, manifest, source_root) {
+        Some(record) => PathBuf::from(record),
+        // Like the shell `|| return 1`, the stage leaks here.
+        None => return false,
+    };
+    if any_presence(&record)
+        && !recover_replacement(&record, manifest, euid, source_root, tmp, &inputs.pwd, tool)
+    {
+        return false;
+    }
+    let physical_base = match physical.file_name() {
+        Some(base) => base.to_string_lossy().into_owned(),
+        None => return false,
+    };
+    let transaction = parent.join(format!(".{physical_base}.dot-overlay-replace-v1"));
+    if any_presence(&transaction) {
+        return false;
+    }
+    let line = format!(
+        "{destination}\t{}\t{target}\t{expected}\t{}\t{parent_identity}",
+        physical.to_string_lossy(),
+        transaction.to_string_lossy(),
+    );
+    if !write_private_line(&record, &line, euid, tool) {
+        return false;
+    }
+    // The directory becomes durable recovery authority as soon as
+    // creation succeeds: no cleanup past this point except through
+    // recovery itself.
+    use std::os::unix::fs::PermissionsExt as _;
+    if std::fs::create_dir(&transaction).is_err()
+        || std::fs::set_permissions(&transaction, std::fs::Permissions::from_mode(0o700)).is_err()
+    {
+        return false;
+    }
+    let next = transaction.join("next");
+    if temp::move_noreplace_with(staged, &next, tool).is_err() {
+        return false;
+    }
+    if std::fs::remove_dir(stage).is_err() {
+        return false;
+    }
+    let previous = transaction.join("previous");
+    if temp::move_noreplace_with(physical, &previous, tool).is_err() {
+        let _ = recover_replacement(&record, manifest, euid, source_root, tmp, &inputs.pwd, tool);
+        return false;
+    }
+    // A failed fingerprint aborts without recovery, like the
+    // shell `|| return 1` (the parked generation stays).
+    let parked_identity = match replacement_identity(source_root, &previous) {
+        Ok(identity) => identity,
+        Err(_) => return false,
+    };
+    if parked_identity != expected {
+        if temp::move_noreplace_with(&previous, physical, tool).is_err() {
+            return false;
+        }
+        let _ = replacement_cleanup(&record, &transaction, target);
+        return false;
+    }
+    if temp::move_noreplace_with(&next, physical, tool).is_err() {
+        let _ = recover_replacement(&record, manifest, euid, source_root, tmp, &inputs.pwd, tool);
+        return false;
+    }
+    if !(std::fs::symlink_metadata(physical).is_ok_and(|meta| meta.file_type().is_symlink())
+        && readlink_stripped(physical).is_some_and(|link| link == target.as_bytes()))
+    {
+        return false;
+    }
+    let current = match destination_context_for(destination, inputs) {
+        Some(current) => current,
+        None => return false,
+    };
+    if current.parent != *parent || current.parent_identity != *parent_identity {
+        if temp::move_noreplace_with(physical, &next, tool).is_err() {
+            return false;
+        }
+        if temp::move_noreplace_with(&previous, physical, tool).is_err() {
+            return false;
+        }
+        let _ = replacement_cleanup(&record, &transaction, target);
+        return false;
+    }
+    if std::fs::remove_file(&previous).is_err() {
+        return false;
+    }
+    if !replacement_cleanup(&record, &transaction, target) {
+        return false;
+    }
+    true
 }

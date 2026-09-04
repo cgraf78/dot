@@ -559,13 +559,12 @@ fn restore_quarantined_link_agrees() {
 }
 
 #[test]
-fn restore_dangling_target_fails_closed() {
-    // A parked link whose target resolves nowhere: the shell verifies
-    // the quarantine move with lstat, so it restores rc=0, while the
-    // Rust move verifies by following and reports failure (after the
-    // rename itself lands). Failing closed is the safe direction for
-    // a generation that cannot be validated; this pins the property
-    // on the Rust side and records the shell contrast explicitly.
+fn restore_dangling_target_agrees() {
+    // A parked link whose target resolves nowhere: both engines
+    // verify the quarantine move with lstat, so both restore rc=0
+    // (the link's own identity verifies). Move verification used to
+    // follow and fail this shape closed; the transactional link
+    // publisher stages dangling links by design, so parity won.
     let dir = TempDir::new("ovlink-dangling").expect("fixture dir");
     let home = dir.path();
     let mut moves = dot::temp::MoveCache::default();
@@ -596,8 +595,17 @@ fn restore_dangling_target_fails_closed() {
                 repos_overlays::restore_quarantined_link(
                     home, &physical, &parked, &stage_dir, &expected, &tool
                 )
-                .is_err(),
-                "rust fails closed on a dangling restore"
+                .is_ok(),
+                "rust restores a dangling link like the shell"
+            );
+            assert_eq!(
+                std::fs::read_link(&physical).expect("restored link"),
+                PathBuf::from("gone-target"),
+                "dangling target preserved"
+            );
+            assert!(
+                stage_dir.symlink_metadata().is_err(),
+                "emptied stage removed"
             );
         }
     }
