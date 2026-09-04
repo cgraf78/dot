@@ -217,6 +217,16 @@ pub fn relative_path_safe(rel: &[u8]) -> bool {
     segments.all(|segment| !segment.is_empty() && segment != b"." && segment != b"..")
 }
 
+/// `_overlay_conf_invalid`: an invalid-descriptor diagnostic —
+/// `REPLY` becomes `invalid overlay descriptor {file}: {detail}`
+/// with the `  warning: ...` line on stderr (exit 2). The library
+/// never prints: returns [`Error::Warning`] carrying the message,
+/// which [`Error::code`] maps to 2 and [`Error`] `Display` renders
+/// as the stderr line for engine callers to reproduce.
+pub fn conf_invalid(file: &str, detail: &str) -> Error {
+    Error::Warning(format!("invalid overlay descriptor {file}: {detail}"))
+}
+
 /// Mirror of the shell `od -An -t u1 | awk` descriptor-file scan:
 /// regular non-symlink file, at most 65536 bytes, newline the only
 /// accepted control byte, DEL rejected — and, like the shell,
@@ -1125,4 +1135,167 @@ fn discover_legacy(
         }
     }
     use_set(state, "eligible")
+}
+
+/// Environment-derived resolution inputs for [`resolve`].
+#[derive(Debug, Clone)]
+pub struct ResolveInputs {
+    /// `$HOME` (tilde expansion, git-descriptor home paths).
+    pub home: String,
+    /// `$XDG_CONFIG_HOME` (empty means the default).
+    pub xdg_config: String,
+    /// `DOT_OVERLAY_DISCOVERY_SILENT=1`.
+    pub discovery_silent: bool,
+    /// `DOT_DEFAULT_PROFILE` (`None` means unset, defaulting to
+    /// `base` at load time).
+    pub default_profile: Option<String>,
+    /// Login name for selector resolution (`None` reproduces a
+    /// failed `id -un` determination).
+    pub user: Option<String>,
+    /// Short hostname for selector resolution and descriptor
+    /// matching (`None` filters gated descriptors and reproduces a
+    /// failed hostname determination).
+    pub host: Option<String>,
+    /// Detected platform for descriptor matching (`None` filters,
+    /// like failed detection on the shell side).
+    pub platform: Option<String>,
+    /// Termux dual `linux`+`android` identity for matching.
+    pub termux: bool,
+    /// Current euid for ownership-gated checks.
+    pub euid: u32,
+}
+
+/// `_dot_resolve_overlays`: top-level overlay resolution across
+/// legacy and profile-aware discovery. `mode` is one of
+/// `converge`, `inspect`, or `fetch` — empty takes the shell
+/// `${1:-inspect}` default; anything else is [`Error::Usage`]
+/// (silent, exit 2).
+///
+/// Legacy clients (no `profiles.d`) discover once, then publish
+/// the eligible set under converge but the active set otherwise.
+/// Profile clients select `base`, discover, snapshot the phase-one
+/// sets, publish `active`, resolve selectors from the active
+/// personal directories, rediscover with the final selection, and
+/// publish eligible under converge but active otherwise. The
+/// second discovery resets the published sets like the shell, so
+/// the phase-one snapshot is carried across it — on the shell
+/// side those variables live outside the rediscovered globals.
+/// Profile failures surface as [`Error::Failed`] carrying the full
+/// `dot: profile: ...` line (exit 1); an unresolvable profiles
+/// base stays silent as [`Error::Unresolvable`] (exit 1), like the
+/// shell's `dot_xdg_path ... || return` propagation.
+pub fn resolve(
+    state: &mut State,
+    profiles: &mut crate::profiles::State,
+    mode: &str,
+    inputs: &ResolveInputs,
+) -> Result<(), Error> {
+    let mode = if mode.is_empty() { "inspect" } else { mode };
+    match mode {
+        "converge" | "inspect" | "fetch" => (),
+        _ => return Err(Error::Usage),
+    }
+    let profiles_dir = match crate::xdg::path(
+        crate::xdg::Kind::Config,
+        "dot/profiles.d",
+        &inputs.xdg_config,
+        &inputs.home,
+    ) {
+        Ok(dir) => dir,
+        Err(crate::xdg::Error::Unresolvable) => return Err(Error::Unresolvable),
+        Err(crate::xdg::Error::Usage) => return Err(Error::Usage),
+    };
+    profiles
+        .load(
+            Some(Path::new(&profiles_dir)),
+            &inputs.xdg_config,
+            &inputs.home,
+            inputs.default_profile.as_deref(),
+        )
+        .map_err(|error| Error::Failed(format!("dot: profile: {}", error.message)))?;
+    let matches = MatchInputs {
+        platform: inputs.platform.clone(),
+        termux: inputs.termux,
+        host: inputs.host.clone(),
+    };
+    let mut discover_inputs = Inputs {
+        home: inputs.home.clone(),
+        xdg_config: inputs.xdg_config.clone(),
+        discovery_silent: inputs.discovery_silent,
+        profiles_present: profiles.present,
+        selected: profiles.overlay_names.clone(),
+        platform: inputs.platform.clone(),
+        termux: inputs.termux,
+        host: inputs.host.clone(),
+        euid: inputs.euid,
+    };
+    let conf = conf_dir(&inputs.xdg_config, &inputs.home);
+    // A missing base reads as an absent directory, which discovery
+    // passes cleanly like the shell's `[[ -d ... ]] || return 0`.
+    let (conf_path, conf_text) = match &conf {
+        Some(dir) => (PathBuf::from(dir), dir.clone()),
+        None => (PathBuf::new(), String::new()),
+    };
+    if !profiles.present {
+        discover(state, &conf_path, &conf_text, &discover_inputs, &matches)?;
+        // Legacy discovery appends every name to the shared
+        // `SELECTED_OVERLAY_NAMES` global, which the profiles load
+        // above cleared — mirror that publication on the profiles
+        // side, where the global is declared.
+        profiles.overlay_names = state.selected.clone();
+        if mode != "converge" {
+            use_set(state, "active")?;
+        }
+        return Ok(());
+    }
+    profiles
+        .select_base()
+        .map_err(|error| Error::Failed(format!("dot: profile: {}", error.message)))?;
+    discover_inputs.selected = profiles.overlay_names.clone();
+    discover(state, &conf_path, &conf_text, &discover_inputs, &matches)?;
+    state.phase_one_selected = profiles.overlay_names.clone();
+    state.phase_one_eligible = state.eligible.clone();
+    state.phase_one_active = state.active.clone();
+    use_set(state, "active")?;
+    let user = match &inputs.user {
+        Some(user) => user.clone(),
+        None => {
+            return Err(Error::Failed(
+                "dot: profile: cannot determine current user".to_string(),
+            ));
+        }
+    };
+    let host = match &inputs.host {
+        Some(host) => host.clone(),
+        None => {
+            return Err(Error::Failed(
+                "dot: profile: cannot determine current short hostname".to_string(),
+            ));
+        }
+    };
+    let active: Vec<&str> = state.active.iter().map(String::as_str).collect();
+    profiles
+        .resolve_default(
+            &inputs.xdg_config,
+            &inputs.home,
+            &active,
+            &user,
+            &host,
+            inputs.euid,
+        )
+        .map_err(|error| Error::Failed(format!("dot: profile: {}", error.message)))?;
+    discover_inputs.selected = profiles.overlay_names.clone();
+    let phase_one_selected = state.phase_one_selected.clone();
+    let phase_one_eligible = state.phase_one_eligible.clone();
+    let phase_one_active = state.phase_one_active.clone();
+    discover(state, &conf_path, &conf_text, &discover_inputs, &matches)?;
+    state.phase_one_selected = phase_one_selected;
+    state.phase_one_eligible = phase_one_eligible;
+    state.phase_one_active = phase_one_active;
+    if mode == "converge" {
+        use_set(state, "eligible")?;
+    } else {
+        use_set(state, "active")?;
+    }
+    Ok(())
 }
