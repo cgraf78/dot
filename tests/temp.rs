@@ -1563,3 +1563,108 @@ fn lock_gate_and_source_root_from_env() {
         }
     }
 }
+
+/// Save the process-global Git environment this test pollutes.
+struct GitEnv {
+    home: Option<std::ffi::OsString>,
+    dir: Option<std::ffi::OsString>,
+    work_tree: Option<std::ffi::OsString>,
+}
+
+impl GitEnv {
+    /// Pollute `HOME` (poisoned global config), `GIT_DIR`, and
+    /// `GIT_WORK_TREE` exactly like a hostile caller environment.
+    /// Holds no lock itself: callers take `SERIAL` first.
+    fn pollute(home: &Path) -> Self {
+        let saved = Self {
+            home: std::env::var_os("HOME"),
+            dir: std::env::var_os("GIT_DIR"),
+            work_tree: std::env::var_os("GIT_WORK_TREE"),
+        };
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::set_var("GIT_DIR", "/nonexistent-dot-test-git-dir");
+            std::env::set_var("GIT_WORK_TREE", "/nonexistent-dot-test-work-tree");
+        }
+        saved
+    }
+}
+
+impl Drop for GitEnv {
+    fn drop(&mut self) {
+        unsafe {
+            match self.home.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.dir.take() {
+                Some(value) => std::env::set_var("GIT_DIR", value),
+                None => std::env::remove_var("GIT_DIR"),
+            }
+            match self.work_tree.take() {
+                Some(value) => std::env::set_var("GIT_WORK_TREE", value),
+                None => std::env::remove_var("GIT_WORK_TREE"),
+            }
+        }
+    }
+}
+
+#[test]
+fn sanitized_git_ignores_caller_git_environment() {
+    let _serial = SERIAL.lock().expect("temp serial");
+    let dir = TempDir::new("sanitized-git").expect("fixture dir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["init", "-q"])
+        .status()
+        .expect("git init");
+    assert!(status.success(), "fixture init");
+    // Poisoned global config: any unsanitized git fails reading it.
+    std::fs::write(
+        dir.path().join(".gitconfig"),
+        "[include]\n\tpath = /nonexistent-dot-test-include\n",
+    )
+    .expect("poison config");
+    let repo_text = repo.to_string_lossy().into_owned();
+    let snippet = format!(
+        "git -C {repo_text} rev-parse --show-toplevel >/dev/null 2>&1; printf 'plain=%d\\n' $?\n\
+         _dot_sanitized_git -C {repo_text} rev-parse --show-toplevel 2>/dev/null\n"
+    );
+    let poison_home = dir.path().to_string_lossy().into_owned();
+    let (code, out) = shell_run(
+        dir.path(),
+        &[],
+        &[
+            ("HOME", Some(poison_home.as_str())),
+            ("GIT_DIR", Some("/nonexistent-dot-test-git-dir")),
+            ("GIT_WORK_TREE", Some("/nonexistent-dot-test-work-tree")),
+        ],
+        None,
+        &snippet,
+    );
+    assert_eq!(code, 0, "harness exit");
+    let shell_text = String::from_utf8_lossy(&out).into_owned();
+    assert!(
+        shell_text.starts_with("plain=128\n"),
+        "plain git must choke on the poison: {shell_text:?}"
+    );
+    assert!(
+        shell_text.ends_with(&format!("{repo_text}\n")),
+        "sanitized git prints the toplevel: {shell_text:?}"
+    );
+    // Same pollution process-wide: the Rust boundary (which also
+    // binds `-C source_root`, covering `_dot_source_git`) must scrub it.
+    let _polluted = GitEnv::pollute(dir.path());
+    let output = temp::sanitized_git(&repo, &["rev-parse", "--show-toplevel"])
+        .output()
+        .expect("sanitized git runs");
+    assert!(output.status.success(), "sanitized git succeeds");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim_end(),
+        repo_text,
+        "sanitized git prints the toplevel"
+    );
+}
