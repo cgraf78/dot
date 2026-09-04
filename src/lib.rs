@@ -17,6 +17,7 @@ pub mod errors;
 pub mod extension_trust;
 pub mod families;
 pub mod glob;
+pub mod init_client_candidate;
 pub mod log;
 pub mod merge_block;
 pub mod merge_hooks;
