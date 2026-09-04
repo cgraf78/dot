@@ -268,3 +268,162 @@ pub fn prepare_overlay_upstream(path: &std::path::Path, quiet_errors: bool) -> R
     let tip = format!("{upstream}^{{commit}}");
     rev_parse(&prefix, &["--verify", tip.as_str()]).ok_or(2u8)
 }
+
+/// One word of `printf %q` quoting, mirroring C-locale bash on raw
+/// bytes: empty reads `''`, words of `[A-Za-z0-9_@%+=:,./-]` stay
+/// literal, other printable bytes take bare backslash escapes, and
+/// anything else (controls, DEL, non-ASCII) takes the `$'...'`
+/// form with C mnemonics (`\a\b\E\f\n\r\t\v`) or octal escapes.
+/// Non-ASCII bytes always take octal here; under a UTF-8 locale bash
+/// would print them literally, but both spellings re-parse to the
+/// same bytes, so the quoted command stays correct everywhere.
+pub fn shell_quote(text: &[u8]) -> String {
+    fn safe(byte: u8) -> bool {
+        matches!(
+            byte,
+            b'a'..=b'z'
+                | b'A'..=b'Z'
+                | b'0'..=b'9'
+                | b'_'
+                | b'@'
+                | b'%'
+                | b'+'
+                | b'='
+                | b':'
+                | b','
+                | b'.'
+                | b'/'
+                | b'-'
+        )
+    }
+    if text.is_empty() {
+        return "''".to_string();
+    }
+    if text.iter().all(|byte| safe(*byte)) {
+        return String::from_utf8_lossy(text).into_owned();
+    }
+    if text.iter().all(|byte| (0x20..0x7f).contains(byte)) {
+        let mut out = String::new();
+        for byte in text {
+            if safe(*byte) {
+                out.push(*byte as char);
+            } else {
+                out.push('\\');
+                out.push(*byte as char);
+            }
+        }
+        return out;
+    }
+    let mut out = String::from("$'");
+    for byte in text {
+        match byte {
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x09 => out.push_str("\\t"),
+            0x0a => out.push_str("\\n"),
+            0x0b => out.push_str("\\v"),
+            0x0c => out.push_str("\\f"),
+            0x0d => out.push_str("\\r"),
+            0x1b => out.push_str("\\E"),
+            b'\'' => out.push_str("\\'"),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(*byte as char),
+            _ => out.push_str(&format!("\\{byte:03o}")),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// The adoption command for an origin mismatch: `remote add` for a
+/// missing origin, `config --replace-all` for multiple URLs, else
+/// `remote set-url`. Paths and URLs go through [`shell_quote`].
+pub fn adopt_command(path: &str, expected: &str, actual: &str) -> String {
+    let path = shell_quote(path.as_bytes());
+    let expected = shell_quote(expected.as_bytes());
+    match actual {
+        "<missing>" => format!("git -C {path} remote add origin {expected}"),
+        "<multiple origin URLs>" => {
+            format!("git -C {path} config --replace-all remote.origin.url {expected}")
+        }
+        _ => format!("git -C {path} remote set-url origin {expected}"),
+    }
+}
+
+/// Inputs for [`origin_mismatch`]: the overlay identity, the
+/// observed state, and the raw UI flags.
+pub struct OriginMismatch<'a> {
+    /// Overlay name for messages.
+    pub name: &'a str,
+    /// Checkout path, quoted into the adopt command.
+    pub path: &'a str,
+    /// Configured URL, quoted into the adopt command.
+    pub expected: &'a str,
+    /// Observed state: `<missing>`, `<multiple origin URLs>`, or a URL.
+    pub actual: &'a str,
+    /// `DOT_UI_TOTAL`: counted UI takes status rows when `> 0`.
+    pub ui_total: Option<&'a str>,
+    /// `DOT_QUIET`: status rows stay silent at arithmetic 1, like
+    /// `_ui_status`; warnings always print.
+    pub quiet: Option<&'a str>,
+}
+
+/// `_overlay_origin_mismatch`: explain the mismatch and show the
+/// adoption command, as warning status rows under counted UI or as
+/// stderr warnings otherwise. Returns `(stdout, stderr,
+/// live_active)`; the flag always drains because both rows clear
+/// through it in turn.
+pub fn origin_mismatch(
+    palette: &crate::progress_ui::Palette,
+    live_active: bool,
+    multibyte: bool,
+    details: &OriginMismatch<'_>,
+) -> (Vec<u8>, Vec<u8>, bool) {
+    let adopt = adopt_command(details.path, details.expected, details.actual);
+    let quiet = crate::progress_ui::arith_value(details.quiet.unwrap_or("0")) == Some(1);
+    if details
+        .ui_total
+        .and_then(crate::progress_ui::arith_value)
+        .is_some_and(|total| total > 0)
+    {
+        let first = format!(
+            "{} overlay origin mismatch: expected {}, found {}",
+            details.name, details.expected, details.actual
+        );
+        let second = format!("verify the checkout, then adopt it with: {adopt}");
+        let (mut out, live) = crate::progress_ui::status(
+            palette,
+            quiet,
+            live_active,
+            b"warning",
+            first.as_bytes(),
+            multibyte,
+        );
+        let (rest, live) = crate::progress_ui::status(
+            palette,
+            quiet,
+            live,
+            b"warning",
+            second.as_bytes(),
+            multibyte,
+        );
+        out.extend_from_slice(&rest);
+        return (out, Vec::new(), live);
+    }
+    let mut err = Vec::new();
+    for line in [
+        format!(
+            "  warning: {} overlay origin does not match its configured URL",
+            details.name
+        ),
+        format!("    expected: {}", details.expected),
+        format!("    found:    {}", details.actual),
+        format!("    verify the checkout, then adopt it with: {adopt}"),
+    ] {
+        err.extend_from_slice(palette.yellow.as_bytes());
+        err.extend_from_slice(line.as_bytes());
+        err.extend_from_slice(palette.reset.as_bytes());
+        err.push(b'\n');
+    }
+    (Vec::new(), err, live_active)
+}
