@@ -26,6 +26,7 @@ pub mod init_client_candidate;
 pub mod init_client_entry;
 pub mod init_client_generation;
 pub mod init_client_identity;
+pub mod init_client_record;
 pub mod init_client_records;
 pub mod init_client_transaction;
 pub mod log;
