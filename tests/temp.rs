@@ -1668,3 +1668,113 @@ fn sanitized_git_ignores_caller_git_environment() {
         "sanitized git prints the toplevel"
     );
 }
+
+#[test]
+fn source_git_binds_source_root() {
+    let _serial = SERIAL.lock().expect("temp serial");
+    // SAFETY: serialized with every other env-touching test; the var
+    // is restored before returning.
+    let old_root = std::env::var_os("DOT_SOURCE_ROOT");
+    let old_git_dir = std::env::var_os("GIT_DIR");
+    let restore = |old: &Option<std::ffi::OsString>, key: &str| {
+        // SAFETY: same serialization as above.
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    };
+    let dir = TempDir::new("source-git").expect("fixture dir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["init", "-q"])
+        .status()
+        .expect("git init");
+    assert!(status.success(), "fixture init");
+    let repo_text = repo.to_string_lossy().into_owned();
+    // Explicit root plus a poisoned GIT_DIR on both sides: the
+    // composition must resolve DOT_SOURCE_ROOT and inherit the
+    // sanitized isolation.
+    let (code, out) = shell_run(
+        dir.path(),
+        &[],
+        &[
+            ("DOT_SOURCE_ROOT", Some(repo_text.as_str())),
+            ("GIT_DIR", Some("/nonexistent-dot-test-git-dir")),
+        ],
+        None,
+        "_dot_source_git rev-parse --show-toplevel",
+    );
+    assert_eq!(code, 0, "shell source git runs");
+    // SAFETY: serialized (see above).
+    unsafe {
+        std::env::set_var("DOT_SOURCE_ROOT", &repo);
+        std::env::set_var("GIT_DIR", "/nonexistent-dot-test-git-dir");
+    }
+    let output = temp::source_git(&["rev-parse", "--show-toplevel"])
+        .expect("source git builds")
+        .output()
+        .expect("source git runs");
+    restore(&old_root, "DOT_SOURCE_ROOT");
+    restore(&old_git_dir, "GIT_DIR");
+    assert!(output.status.success(), "rust source git succeeds");
+    assert_eq!(output.stdout, out, "source git parity for explicit root");
+    // Unset root falls back to the process directory on both sides:
+    // run the shell twin in this process's directory with the var
+    // removed so both bind the same checkout.
+    let cwd = std::env::current_dir().expect("test cwd");
+    let (code, out) = shell_run(
+        &cwd,
+        &[],
+        &[("DOT_SOURCE_ROOT", None), ("GIT_DIR", None)],
+        None,
+        "_dot_source_git rev-parse --show-toplevel",
+    );
+    assert_eq!(code, 0, "shell fallback runs (test cwd is a checkout)");
+    // SAFETY: serialized (see above).
+    unsafe {
+        std::env::remove_var("DOT_SOURCE_ROOT");
+        std::env::remove_var("GIT_DIR");
+    }
+    let output = temp::source_git(&["rev-parse", "--show-toplevel"])
+        .expect("fallback builds")
+        .output()
+        .expect("fallback runs");
+    restore(&old_root, "DOT_SOURCE_ROOT");
+    restore(&old_git_dir, "GIT_DIR");
+    assert!(output.status.success(), "rust fallback succeeds");
+    assert_eq!(output.stdout, out, "source git parity for cwd fallback");
+    // Failing git surfaces the same status on both sides (`rev-parse`
+    // echoes unknown args with rc 0, so a bogus subcommand is the
+    // deterministic failure).
+    let (scode, sout) = shell_run(
+        dir.path(),
+        &[],
+        &[("DOT_SOURCE_ROOT", Some(repo_text.as_str()))],
+        None,
+        "_dot_source_git this-is-no-dot-test-subcommand; printf 'rc=%d' $?",
+    );
+    // SAFETY: serialized (see above).
+    unsafe {
+        std::env::set_var("DOT_SOURCE_ROOT", &repo);
+    }
+    let output = temp::source_git(&["this-is-no-dot-test-subcommand"])
+        .expect("failing build")
+        .output()
+        .expect("failing run");
+    restore(&old_root, "DOT_SOURCE_ROOT");
+    let shell_rc = String::from_utf8(sout).expect("rc text");
+    assert!(
+        !output.status.success(),
+        "rust reports git failure: {shell_rc:?}"
+    );
+    assert!(
+        shell_rc.starts_with("rc=") && !shell_rc.starts_with("rc=0"),
+        "shell reports git failure: {shell_rc:?}"
+    );
+    assert_eq!(scode, 0, "harness exit");
+}
