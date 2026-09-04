@@ -41,6 +41,7 @@ pub mod repos_pull_support;
 pub mod reserved;
 pub mod run;
 pub mod temp;
+pub mod test_suites;
 pub mod test_support;
 pub mod ui;
 pub mod update;
