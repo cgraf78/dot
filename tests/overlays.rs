@@ -1265,3 +1265,306 @@ fn conf_dir_agrees() {
         }
     }
 }
+
+/// Shell twin of [`dump_resolve`]: the overlay dump plus profile
+/// selection and phase-one sets.
+const SHELL_RESOLVE_TAIL: &str = r#"printf 'profile=%s\n' "$SELECTED_PROFILE"; printf 'selected=%s\n' "${SELECTED_OVERLAY_NAMES[*]}"; for e in ${PHASE_ONE_SELECTED_OVERLAY_NAMES[@]+"${PHASE_ONE_SELECTED_OVERLAY_NAMES[@]}"}; do printf 'P1S|%s\n' "$e"; done; for e in ${PHASE_ONE_ELIGIBLE_OVERLAYS[@]+"${PHASE_ONE_ELIGIBLE_OVERLAYS[@]}"}; do printf 'P1E|%s\n' "$e"; done; for e in ${PHASE_ONE_ACTIVE_OVERLAYS[@]+"${PHASE_ONE_ACTIVE_OVERLAYS[@]}"}; do printf 'P1A|%s\n' "$e"; done"#;
+
+/// Dump overlay state plus profile selection and phase-one sets in
+/// the canonical comparison shape.
+fn dump_resolve(state: &overlays::State, profiles: &dot::profiles::State) -> String {
+    let mut out = dump(state);
+    out.push_str(&format!("profile={}\n", profiles.selected));
+    out.push_str(&format!("selected={}\n", profiles.overlay_names.join(" ")));
+    for (tag, values) in [
+        ("P1S", &state.phase_one_selected),
+        ("P1E", &state.phase_one_eligible),
+        ("P1A", &state.phase_one_active),
+    ] {
+        for value in values {
+            out.push_str(&format!("{tag}|{value}\n"));
+        }
+    }
+    out
+}
+
+/// Stage resolve fixtures under a temp home with a `config` XDG
+/// root: an active `sync=none` tree plus an inactive git
+/// descriptor, optionally with a `base` profile selecting only the
+/// local tree (plus an unselected malformed descriptor discovery
+/// must never open). Returns the XDG config dir text.
+fn stage_resolve_base(home: &Path, with_profiles: bool) -> String {
+    let config = home.join("config");
+    let confd = config.join("dot/overlays.d");
+    stage(home, "trees/alpha/home/app.conf", b"alpha\n");
+    stage(&confd, "10-alpha.conf", b"sync=none\npath=~/trees/alpha\n");
+    stage(
+        &confd,
+        "20-beta.conf",
+        b"url=https://example.com/beta.git\n",
+    );
+    if with_profiles {
+        stage(
+            home,
+            "config/dot/profiles.d/base.conf",
+            b"version=1\noverlays=alpha\n",
+        );
+        stage(&confd, "30-gamma.conf", b"this descriptor is malformed\n");
+    }
+    config.to_string_lossy().into_owned()
+}
+
+/// Run one resolve twin and assert parity: shell
+/// `_dot_resolve_overlays` vs Rust `overlays::resolve`, comparing
+/// code, the full state dump, and stderr. Live user/host feed the
+/// Rust side so selector resolution agrees with the shell's
+/// internal `id -un` / hostname detection.
+fn run_resolve(home: &Path, xdg: &str, mode: &str, default_profile: Option<&str>) {
+    let mode_arg: &std::ffi::OsStr = mode.as_ref();
+    let env: Vec<(&str, Option<&str>)> = vec![
+        ("XDG_CONFIG_HOME", Some(xdg)),
+        ("DOT_DEFAULT_PROFILE", default_profile),
+    ];
+    let (_, sout, serr) = shell_run(
+        home,
+        &[mode_arg],
+        &env,
+        &format!(
+            "_dot_resolve_overlays \"$2\"; rc=$?; printf 'rc=%s\\n' \"$rc\"; {SHELL_DUMP}; {SHELL_RESOLVE_TAIL}"
+        ),
+    );
+    let live_user = dot::profiles::current_user().expect("login name");
+    let live = live_matches();
+    let live_host = live.host.clone().expect("hostname");
+    let inputs = overlays::ResolveInputs {
+        home: home.to_string_lossy().into_owned(),
+        xdg_config: xdg.to_string(),
+        discovery_silent: false,
+        default_profile: default_profile.map(str::to_string),
+        user: Some(live_user),
+        host: Some(live_host),
+        platform: live.platform.clone(),
+        termux: live.termux,
+        euid: euid(),
+    };
+    let mut state = overlays::State::default();
+    let mut profiles = dot::profiles::State::default();
+    let rout = overlays::resolve(&mut state, &mut profiles, mode, &inputs);
+    let rcode = match &rout {
+        Ok(()) => 0,
+        Err(error) => error.code(),
+    };
+    let scode = dump_rc(&sout);
+    assert_eq!(scode, rcode, "resolve code for mode {mode:?}");
+    assert_eq!(
+        format!("rc={rcode}\n{}", dump_resolve(&state, &profiles)),
+        String::from_utf8(sout).expect("resolve dump"),
+        "resolve dump for mode {mode:?}"
+    );
+    assert_eq!(
+        String::from_utf8(serr).expect("resolve stderr"),
+        render_stderr(&state.warnings, rout.as_ref().err()),
+        "resolve stderr for mode {mode:?}"
+    );
+}
+
+/// Differential parity for `_overlay_conf_invalid` against the live
+/// shell oracle: `REPLY` carries
+/// `invalid overlay descriptor {file}: {detail}`, stderr carries
+/// the `  warning: ...` line, and the exit is 2.
+#[test]
+fn conf_invalid_agrees() {
+    let dir = TempDir::new("ov-confinvalid").expect("fixture dir");
+    let home = dir.path();
+    let cases = [
+        ("/x/10-a.conf", "missing url"),
+        ("/x/10-b.conf", "duplicate sync"),
+        ("relative.conf", ""),
+        ("/x/10-c.conf", "unknown key: frobnicate"),
+    ];
+    for (file, detail) in cases {
+        let (_, sout, serr) = shell_run(
+            home,
+            &[file.as_ref(), detail.as_ref()],
+            &[],
+            "_overlay_conf_invalid \"$2\" \"$3\"; rc=$?; printf 'rc=%s\\nreply=%s\\n' \"$rc\" \"$REPLY\"",
+        );
+        let shell = String::from_utf8(sout).expect("conf_invalid dump");
+        let mut lines = shell.lines();
+        let scode: i32 = lines
+            .next()
+            .unwrap_or("")
+            .trim_start_matches("rc=")
+            .parse()
+            .expect("rc");
+        let reply = lines
+            .next()
+            .unwrap_or("")
+            .trim_start_matches("reply=")
+            .to_string();
+        let error = overlays::conf_invalid(file, detail);
+        assert_eq!(error.code(), scode, "conf_invalid code for {file:?}");
+        assert_eq!(scode, 2, "shell code for {file:?}");
+        let expected = format!("invalid overlay descriptor {file}: {detail}");
+        assert_eq!(reply, expected, "shell REPLY for {file:?}");
+        match &error {
+            overlays::Error::Warning(message) => {
+                assert_eq!(
+                    message.as_str(),
+                    expected.as_str(),
+                    "rust message for {file:?}"
+                );
+            }
+            other => panic!("conf_invalid error shape for {file:?}: {other:?}"),
+        }
+        assert_eq!(
+            error.to_string(),
+            format!("  warning: {expected}"),
+            "rust display for {file:?}"
+        );
+        assert_eq!(
+            String::from_utf8(serr).expect("conf_invalid stderr"),
+            format!("  warning: {expected}\n"),
+            "shell stderr for {file:?}"
+        );
+    }
+}
+
+#[test]
+fn resolve_legacy_agrees() {
+    // No `profiles.d`: every descriptor is implicitly selected.
+    // Inspect/fetch publish the active set, converge the eligible
+    // set, bogus modes fail silent with code 2, and the empty mode
+    // takes the shell `${1:-inspect}` default.
+    for mode in ["", "inspect", "fetch", "converge", "bogus"] {
+        let dir = TempDir::new("ov-res-leg").expect("fixture dir");
+        let home = dir.path();
+        let xdg = stage_resolve_base(home, false);
+        run_resolve(home, &xdg, mode, None);
+    }
+}
+
+#[test]
+fn resolve_profile_agrees() {
+    // `base` selects only the local tree; the unselected malformed
+    // descriptor is classified without parsing.
+    for mode in ["", "inspect", "fetch", "converge", "bogus"] {
+        let dir = TempDir::new("ov-res-prof").expect("fixture dir");
+        let home = dir.path();
+        let xdg = stage_resolve_base(home, true);
+        run_resolve(home, &xdg, mode, None);
+    }
+    // A selected overlay with no descriptor fails on both sides.
+    let dir = TempDir::new("ov-res-missing").expect("fixture dir");
+    let home = dir.path();
+    let xdg = stage_resolve_base(home, true);
+    stage(
+        home,
+        "config/dot/profiles.d/base.conf",
+        b"version=1\noverlays=nosuch\n",
+    );
+    run_resolve(home, &xdg, "inspect", None);
+}
+
+#[test]
+fn resolve_selector_agrees() {
+    // A machine-local selector moves the final selection from
+    // `base` to `web` while phase one still snapshots `base`.
+    let dir = TempDir::new("ov-res-sel").expect("fixture dir");
+    let home = dir.path();
+    let xdg = stage_resolve_base(home, true);
+    let user = dot::profiles::current_user().expect("login name");
+    stage(home, "trees/beta/home/app.conf", b"beta\n");
+    stage(
+        home,
+        "config/dot/overlays.d/20-beta.conf",
+        b"sync=none\npath=~/trees/beta\n",
+    );
+    stage(
+        home,
+        "config/dot/profiles.d/web.conf",
+        b"version=1\nprofiles=base\noverlays=beta\n",
+    );
+    let locald = home.join("config/dot/profile-selectors.local.d");
+    std::fs::create_dir_all(&locald).expect("selector dir");
+    std::fs::set_permissions(&locald, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let selector = stage(
+        &locald,
+        "10-u.conf",
+        format!("version=1\nuser={user}\nprofile=web\n").as_bytes(),
+    );
+    std::fs::set_permissions(&selector, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    for mode in ["inspect", "converge"] {
+        run_resolve(home, &xdg, mode, None);
+    }
+}
+
+#[test]
+fn resolve_inputs_refuse() {
+    // Degenerate inputs with no live shell twin: failed identity
+    // determination reproduces the shell's `dot: profile: ...`
+    // lines with code 1, and an unresolvable profiles base stays
+    // silent with code 1 like the shell's `|| return` propagation.
+    let dir = TempDir::new("ov-res-refuse").expect("fixture dir");
+    let home = dir.path();
+    let xdg = stage_resolve_base(home, true);
+    let live = live_matches();
+    let base = || overlays::ResolveInputs {
+        home: home.to_string_lossy().into_owned(),
+        xdg_config: xdg.clone(),
+        discovery_silent: false,
+        default_profile: None,
+        user: Some(dot::profiles::current_user().expect("login name")),
+        host: live.host.clone(),
+        platform: live.platform.clone(),
+        termux: live.termux,
+        euid: euid(),
+    };
+    let mut state = overlays::State::default();
+    let mut profiles = dot::profiles::State::default();
+    let error = overlays::resolve(
+        &mut state,
+        &mut profiles,
+        "inspect",
+        &overlays::ResolveInputs {
+            user: None,
+            ..base()
+        },
+    )
+    .expect_err("missing user fails");
+    assert_eq!(error.code(), 1, "missing user code");
+    assert_eq!(
+        error.to_string(),
+        "dot: profile: cannot determine current user",
+        "missing user line"
+    );
+    let error = overlays::resolve(
+        &mut state,
+        &mut profiles,
+        "inspect",
+        &overlays::ResolveInputs {
+            host: None,
+            ..base()
+        },
+    )
+    .expect_err("missing host fails");
+    assert_eq!(error.code(), 1, "missing host code");
+    assert_eq!(
+        error.to_string(),
+        "dot: profile: cannot determine current short hostname",
+        "missing host line"
+    );
+    let error = overlays::resolve(
+        &mut state,
+        &mut profiles,
+        "inspect",
+        &overlays::ResolveInputs {
+            home: "relative".to_string(),
+            xdg_config: "relative".to_string(),
+            ..base()
+        },
+    )
+    .expect_err("unresolvable base fails");
+    assert_eq!(error.code(), 1, "unresolvable code");
+    assert_eq!(error.to_string(), "", "unresolvable stays silent");
+}

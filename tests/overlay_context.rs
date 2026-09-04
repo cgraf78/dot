@@ -928,3 +928,93 @@ fn crafted_frames_refuse_both() {
         );
     }
 }
+
+/// Differential parity for `_dot_overlay_context_stat` against the
+/// live shell oracle: GNU `stat -c` else BSD `stat -f`, with the
+/// `REPLY_*` identity tuple gated on owner and octal-only mode.
+/// Portable: fixtures use only the standard library plus the shell
+/// oracle itself — never a bare GNU `stat -c` spelling.
+#[test]
+fn stat_agrees() {
+    let dir = TempDir::new("ovctx-stat").expect("fixture dir");
+    let home = dir.path();
+    let uid = euid();
+    let file = stage(home, "a.txt", b"hello\n");
+    let subdir = home.join("sub");
+    std::fs::create_dir_all(&subdir).expect("subdir");
+    std::os::unix::fs::symlink("a.txt", home.join("link.txt")).expect("symlink");
+    std::os::unix::fs::symlink("gone-target", home.join("dangling.txt")).expect("dangling");
+    let missing = home.join("missing.txt");
+    let cases: Vec<(&str, PathBuf)> = vec![
+        ("file", file.clone()),
+        ("dir", subdir.clone()),
+        ("symlink", home.join("link.txt")),
+        ("dangling", home.join("dangling.txt")),
+        ("missing", missing.clone()),
+    ];
+    for (label, path) in &cases {
+        let (_, sout, serr) = shell_run(
+            home,
+            &[path.as_os_str()],
+            &[],
+            "_dot_overlay_context_stat \"$2\"; rc=$?; printf 'rc=%s\\nuid=%s\\nmode=%s\\nlinks=%s\\ndev=%s\\nino=%s\\n' \"$rc\" \"$REPLY_UID\" \"$REPLY_MODE\" \"$REPLY_LINKS\" \"$REPLY_DEV\" \"$REPLY_INO\"",
+        );
+        assert_eq!(serr, b"", "{label} shell stderr");
+        let shell = String::from_utf8(sout).expect("stat dump");
+        let mut lines = shell.lines();
+        let rc: i32 = lines
+            .next()
+            .unwrap_or("")
+            .trim_start_matches("rc=")
+            .parse()
+            .expect("rc");
+        let get = |lines: &mut std::str::Lines<'_>, key: &str| {
+            lines
+                .next()
+                .unwrap_or("")
+                .trim_start_matches(&format!("{key}="))
+                .to_string()
+        };
+        let shell_uid = get(&mut lines, "uid");
+        let shell_mode = get(&mut lines, "mode");
+        let shell_links = get(&mut lines, "links");
+        let shell_dev = get(&mut lines, "dev");
+        let shell_ino = get(&mut lines, "ino");
+        let rust = overlay_context::stat(path, uid);
+        assert_eq!(rust.is_some(), rc == 0, "stat code for {label}");
+        if rc == 0 {
+            let (uid, mode, links, dev, ino) = rust.expect("stat tuple");
+            assert_eq!(uid.to_string(), shell_uid, "stat uid for {label}");
+            assert_eq!(
+                u32::from_str_radix(&shell_mode, 8).expect("octal mode"),
+                mode,
+                "stat mode for {label}"
+            );
+            assert_eq!(links.to_string(), shell_links, "stat links for {label}");
+            assert_eq!(dev.to_string(), shell_dev, "stat dev for {label}");
+            assert_eq!(ino.to_string(), shell_ino, "stat ino for {label}");
+        }
+    }
+    // An empty path fails the `stat` probe on both sides.
+    let (_, sout, _) = shell_run(
+        home,
+        &[],
+        &[],
+        "_dot_overlay_context_stat; rc=$?; printf 'rc=%s\\n' \"$rc\"",
+    );
+    assert_eq!(
+        String::from_utf8(sout).expect("empty dump"),
+        "rc=1\n",
+        "empty shell refuses"
+    );
+    assert!(
+        overlay_context::stat(Path::new(""), uid).is_none(),
+        "empty rust refuses"
+    );
+    // A foreign owner refuses without parsing: Rust-only, since the
+    // shell reads the live `$EUID` and no second uid exists here.
+    assert!(
+        overlay_context::stat(&file, uid.wrapping_add(1)).is_none(),
+        "foreign owner refuses"
+    );
+}
