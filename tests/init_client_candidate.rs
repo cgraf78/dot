@@ -726,15 +726,22 @@ fn snapshot_shapes() {
         check_snapshot(&twins, rel, 0);
     }
     // The mode travels in the frozen line: 644 stays 644, 755 stays
-    // 755, links freeze 777 over the target-name length.
+    // 755, links freeze the symlink mode over the target-name
+    // length — 777 on Linux, 755 on macOS (lstat reports the
+    // platform mode and both engines agree there).
     let line = candidate::snapshot_path(&twins.rust_home.join("exec.sh")).expect("exec line");
     assert!(
         line.starts_with("regular\t") && line.contains("\t755\t"),
         "exec mode frozen: {line}"
     );
     let line = candidate::snapshot_path(&twins.rust_home.join("ptr")).expect("link line");
+    let link_mode = if cfg!(target_os = "macos") {
+        "755"
+    } else {
+        "777"
+    };
     assert!(
-        line.starts_with("symlink\t") && line.ends_with("\t777\t8\tfile.txt"),
+        line.starts_with("symlink\t") && line.ends_with(&format!("\t{link_mode}\t8\tfile.txt")),
         "link lstat shape frozen: {line}"
     );
 }
