@@ -204,14 +204,18 @@ fn physical_path_rows_agree() {
     let root = &fixture.root;
     let root_bytes = root.as_os_str();
     let slash_foo = OsStr::from_bytes(b"/foo");
+    // Non-UTF8 leaf: APFS rejects invalid UTF-8 names at creation,
+    // so this row lives on non-macOS Unix only (the families.rs
+    // precedent); the byte-exactness probe runs on Linux CI instead.
+    #[cfg(all(unix, not(target_os = "macos")))]
     let non_utf8 = {
         let mut name = root.as_os_str().to_os_string();
         name.push("/name-");
         name.push(OsStr::from_bytes(b"\xff"));
+        std::fs::write(Path::new(&name), b"x\n").expect("non-UTF8 leaf");
         name
     };
-    std::fs::write(Path::new(&non_utf8), b"x\n").expect("non-UTF8 leaf");
-    let cases: Vec<(&str, OsString)> = vec![
+    let mut cases: Vec<(&str, OsString)> = vec![
         ("root", OsString::from("/")),
         ("root-dir-slash-foo", slash_foo.to_os_string()),
         ("fixture-root", root_bytes.to_os_string()),
@@ -235,9 +239,14 @@ fn physical_path_rows_agree() {
             join_bytes(root, &["symdir", "inner"]),
         ),
         ("spaced-dir", join_bytes(root, &["with space"])),
-        ("non-utf8-leaf", non_utf8),
     ];
-    assert_eq!(cases.len(), 13, "physical row inventory");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    cases.push(("non-utf8-leaf", non_utf8));
+    assert_eq!(
+        cases.len(),
+        if cfg!(target_os = "macos") { 12 } else { 13 },
+        "physical row inventory"
+    );
     for (label, input) in &cases {
         fixture.check_physical(label, input.as_os_str());
     }
