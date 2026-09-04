@@ -15,6 +15,7 @@ pub mod config;
 pub mod constants;
 pub mod errors;
 pub mod extension_trust;
+pub mod extension_worker;
 pub mod families;
 pub mod glob;
 pub mod log;

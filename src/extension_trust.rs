@@ -197,6 +197,19 @@ pub fn parent_components_validate(path: &Path, extensions_dir: &str, euid: u32) 
     walk_parent_components(extensions_dir, &text, euid)
 }
 
+/// `_dot_extension_directory_validate`: `path` under the extensions
+/// root with a clean component walk that is itself a stat-clean
+/// non-symlink directory.
+pub fn directory_validate(path: &Path, extensions_dir: &str, euid: u32) -> bool {
+    if !parent_components_validate(path, extensions_dir, euid) {
+        return false;
+    }
+    if !dir_not_link(path) {
+        return false;
+    }
+    directory_stat(path, euid)
+}
+
 /// `_dot_extension_owned_parent_components_validate`: the same walk
 /// under an explicit root (which carries its own dir/stat gate
 /// instead of the extensions-root shape rules).
