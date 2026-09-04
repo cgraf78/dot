@@ -227,10 +227,10 @@ pub fn validate_candidate_entry(
     EntryVerdict::Accept(relative)
 }
 
-/// NUL-terminated records of one `git ls-tree -z` capture, mirroring
+/// NUL-terminated records of one `git -z` capture, mirroring
 /// `while IFS= read -r -d '' entry`: only chunks followed by a NUL
 /// are records, so a trailing unterminated tail is ignored.
-fn terminated_records(output: &[u8]) -> Vec<&[u8]> {
+pub(crate) fn terminated_records(output: &[u8]) -> Vec<&[u8]> {
     let mut records = Vec::new();
     let mut rest = output;
     while let Some(ix) = rest.iter().position(|byte| *byte == 0) {
