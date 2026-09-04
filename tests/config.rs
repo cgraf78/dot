@@ -12,7 +12,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use dot::config::{Provider, Request, UpdatePolicy, load};
+use dot::config::{
+    Config, Provider, Request, UpdatePolicy, config_control_bytes, config_error,
+    extensions_enabled, load,
+};
 use dot::test_support::TempDir;
 
 /// Fail loudly (not as a byte-diff) when scratch storage loses a
@@ -208,6 +211,181 @@ fn rust_matches_shell_on_missing_file() {
     let shell = shell_parse(&manifest, &missing, &home, None);
     let rust = rust_parse(&missing, home_str, None);
     assert_eq!(rust, shell);
+}
+
+/// Run the shell `_dot_config_error` helper with the given words and
+/// capture its (exit code, stderr text), mirroring `shell_parse`.
+fn shell_error(manifest_dir: &Path, words: &[&str]) -> Outcome {
+    let script = r#"
+set -uo pipefail
+. "$1/lib/dot/config.sh"
+shift
+_dot_config_error "$@"
+"#;
+    let mut cmd = Command::new("bash");
+    cmd.arg("--noprofile")
+        .arg("--norc")
+        .arg("-c")
+        .arg(script)
+        .arg("dot-test-sh")
+        .arg(manifest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for word in words {
+        cmd.arg(word);
+    }
+    let output = cmd.output().expect("spawn bash");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(stdout, "", "error helper must print nothing on stdout");
+    match output.status.code() {
+        Some(code) => Outcome::Err(code, stderr),
+        None => panic!("shell killed by signal: {stderr}"),
+    }
+}
+
+/// Run the shell `_dot_config_control_bytes` helper on one path: `Ok`
+/// carries no payload (only the pass/fail bit matters), so normalize to
+/// a plain bool — true when the shell exits 0.
+fn shell_control_bytes(manifest_dir: &Path, path: &Path) -> bool {
+    let script = r#"
+set -uo pipefail
+. "$1/lib/dot/config.sh"
+if _dot_config_control_bytes "$2"; then exit 0; else exit 1; fi
+"#;
+    let output = Command::new("bash")
+        .arg("--noprofile")
+        .arg("--norc")
+        .arg("-c")
+        .arg(script)
+        .arg("dot-test-sh")
+        .arg(manifest_dir)
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn bash");
+    output.status.code() == Some(0)
+}
+
+/// Run the shell `_dot_extensions_enabled` helper under one env
+/// combination, setting each variable individually (never in bulk).
+fn shell_extensions_enabled(manifest_dir: &Path, api: Option<&str>, dir: Option<&str>) -> bool {
+    let script = r#"
+set -uo pipefail
+. "$1/lib/dot/config.sh"
+if _dot_extensions_enabled; then exit 0; else exit 1; fi
+"#;
+    let mut cmd = Command::new("bash");
+    cmd.arg("--noprofile")
+        .arg("--norc")
+        .arg("-c")
+        .arg(script)
+        .arg("dot-test-sh")
+        .arg(manifest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove("DOT_EXTENSION_API")
+        .env_remove("DOT_EXTENSIONS_DIR");
+    if let Some(api) = api {
+        cmd.env("DOT_EXTENSION_API", api);
+    }
+    if let Some(dir) = dir {
+        cmd.env("DOT_EXTENSIONS_DIR", dir);
+    }
+    let output = cmd.output().expect("spawn bash");
+    output.status.code() == Some(0)
+}
+
+/// The resolved inputs behind one extensions-gate case: the shell reads
+/// `DOT_EXTENSION_API`/`DOT_EXTENSIONS_DIR` from the environment, while
+/// Rust takes the already-resolved [`Config`].
+fn rust_gate(api: bool, dir: Option<&str>) -> bool {
+    extensions_enabled(&Config {
+        version: 1,
+        extension_api: api,
+        extensions_dir: dir.map(str::to_string),
+        provider: Provider::None,
+        default_profile: "base".to_string(),
+        shdeps_update_policy: UpdatePolicy::Pinned,
+        policy_from_env: false,
+    })
+}
+
+/// Differential: `config_error` must render the shell's exact stderr
+/// diagnostic and fail like `_dot_config_error` (exit 1, `$*` joining).
+#[test]
+fn config_error_matches_shell_oracle() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cases: &[&[&str]] = &[&["hello world"], &["a", "b", "c"], &[]];
+    for words in cases {
+        let shell = shell_error(&manifest, words);
+        let joined = words.join(" ");
+        match shell {
+            Outcome::Err(code, stderr) => {
+                assert_eq!(code, 1, "words {words:?}");
+                assert_eq!(stderr, format!("dot: config: {joined}\n"));
+                assert_eq!(format!("{}\n", config_error(joined)), stderr);
+            }
+            Outcome::Ok(_) => panic!("shell error helper must fail: {words:?}"),
+        }
+    }
+}
+
+/// Differential: `config_control_bytes` must agree with the shell
+/// `od | awk` scan on every byte class, including paths `od` cannot
+/// read (production `pipefail` fails the pipeline, so those fail).
+#[test]
+fn config_control_bytes_matches_shell_oracle() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = TempDir::new("config-control-diff").expect("scratch dir");
+    let bodies: &[&[u8]] = &[
+        b"",
+        b"abc\n",
+        b" ~\n",
+        b"\xff\xfe\x80\n",
+        b"a\tb\n",
+        b"a\rb\n",
+        b"a\x00b",
+        b"a\x7fb",
+        b"a\x1fb",
+    ];
+    for (index, body) in bodies.iter().enumerate() {
+        let path = scratch.write(&format!("control-{index}"), body);
+        require_fixture(&path, "shell control scan");
+        let shell = shell_control_bytes(&manifest, &path);
+        require_fixture(&path, "rust control scan");
+        assert_eq!(
+            config_control_bytes(&path),
+            shell,
+            "divergence on control case {index} body {body:?}"
+        );
+    }
+    // Unreadable paths fail on both sides (production `pipefail`
+    // propagates the failed `od`); assert the agreement, not just the
+    // Rust value, so a shell change would fail here.
+    let missing = scratch.path().join("does-not-exist");
+    assert!(!shell_control_bytes(&manifest, &missing));
+    assert!(!config_control_bytes(&missing));
+    assert!(!shell_control_bytes(&manifest, scratch.path()));
+    assert!(!config_control_bytes(scratch.path()));
+}
+
+/// Differential: `extensions_enabled` must agree with
+/// `_dot_extensions_enabled` over the env matrix (only `1` plus a
+/// non-empty dir enables).
+#[test]
+fn extensions_enabled_matches_shell_oracle() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let apis: &[Option<&str>] = &[None, Some(""), Some("1"), Some("2")];
+    let dirs: &[Option<&str>] = &[None, Some(""), Some("/x")];
+    for api in apis {
+        for dir in dirs {
+            let shell = shell_extensions_enabled(&manifest, *api, *dir);
+            let rust = rust_gate(*api == Some("1"), dir.filter(|d| !d.is_empty()));
+            assert_eq!(rust, shell, "divergence on api {api:?} dir {dir:?}");
+        }
+    }
 }
 
 /// The shell prints nothing on stdout for rejections and returns 1;
