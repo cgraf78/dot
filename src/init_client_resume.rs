@@ -81,8 +81,8 @@ pub type PathIdentity<'a> = dyn Fn(&Path) -> Result<String> + 'a;
 pub type GenerationMatches<'a> = dyn Fn(&Path) -> bool + 'a;
 
 /// Repository identity normalization: `_dot_init_repo_identity`,
-/// owned by the identity lane. Fails on unparseable origins the way
-/// the shell's `|| return 1` does.
+/// owned by the identity lane. Refuses origins it cannot normalize,
+/// like the shell's `|| return 1` does.
 pub type RepoIdentity<'a> = dyn Fn(&str) -> Result<String> + 'a;
 
 /// Journal advance: `_dot_init_record_phase`, owned by the record
