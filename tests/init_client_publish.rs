@@ -167,22 +167,13 @@ fn git_run(args: &[&str]) {
     assert!(status.success(), "git {args:?}");
 }
 
-/// `stat -c '%d:%i'` spelling for fixture identities.
+/// `stat -c '%d:%i'` identity string of one path, read in-process:
+/// GNU `stat` has no macOS spelling and the BSD fallback differs, so
+/// shelling out breaks the macOS gate (lane-67 `MetadataExt` pattern).
 fn identity_of(path: &Path) -> String {
-    let output = Command::new("stat")
-        .arg("-c")
-        .arg("%d:%i")
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .expect("spawn stat");
-    assert!(output.status.success(), "stat {}", path.display());
-    String::from_utf8(output.stdout)
-        .expect("stat text")
-        .trim()
-        .to_string()
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path).expect("stat fixture");
+    format!("{}:{}", meta.dev(), meta.ino())
 }
 
 /// Lexical existence: the observable end-state of a row on one side.
