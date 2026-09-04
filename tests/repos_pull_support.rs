@@ -296,3 +296,201 @@ fn pull_cmd_propagates_child_exit_code() {
     assert_eq!(shell_rc, 7, "shell propagates 7");
     assert_eq!(pull_cmd(false, "sh", &["-c", "exit 7"]), 7);
 }
+
+use dot::repos_pull_support::{
+    PullTally, overlay_active, overlay_count, record_status, result_prefix,
+};
+
+/// Make `path` a real Git worktree root for `_overlay_is_worktree`.
+fn git_init(path: &Path) {
+    let status = Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn git init");
+    assert!(status.success(), "git init fixture");
+}
+
+#[test]
+fn result_prefix_zero_pads_index() {
+    let dir = TempDir::new("pull-prefix").expect("fixture dir");
+    for (idx, expected) in [
+        (0, "out/000"),
+        (7, "out/007"),
+        (42, "out/042"),
+        (1234, "out/1234"),
+    ] {
+        let (code, out, _) = shell_run(
+            dir.path(),
+            &[],
+            &[],
+            &format!("_pull_overlay_result_prefix out {idx}"),
+        );
+        assert_eq!(code, 0, "shell result prefix {idx}");
+        assert_eq!(out, expected.as_bytes(), "shell prefix bytes {idx}");
+        assert_eq!(
+            result_prefix("out", idx),
+            expected,
+            "prefix parity for {idx}"
+        );
+    }
+}
+
+#[test]
+fn record_status_tallies_and_summarizes() {
+    // (name, status): counters start nonzero to prove increments.
+    for (name, status) in [
+        ("ovl", ""),
+        ("ovl", "failed"),
+        ("ovl", "changed"),
+        ("ovl", "cloned"),
+        ("ovl", "skipped"),
+        ("ovl", "current"),
+        ("ovl", "bogus"),
+        ("my ovl", "changed"),
+    ] {
+        let dir = TempDir::new("pull-tally").expect("fixture dir");
+        let (code, out, _) = shell_run(
+            dir.path(),
+            &[],
+            &[],
+            &format!(
+                "DOT_PULL_OVERLAY_FAILED=1; DOT_PULL_OVERLAY_CHANGED=2; \
+                 DOT_PULL_OVERLAY_SKIPPED=3; DOT_PULL_OVERLAY_CURRENT=4; \
+                 DOT_PULL_OVERLAY_CHANGED_ITEMS=$'prior\\n'; _summaries=(); \
+                 _pull_overlay_record_status \"{name}\" \"{status}\"; \
+                 printf 'F=%s C=%s S=%s U=%s N=%s\\n' \"$DOT_PULL_OVERLAY_FAILED\" \
+                 \"$DOT_PULL_OVERLAY_CHANGED\" \"$DOT_PULL_OVERLAY_SKIPPED\" \
+                 \"$DOT_PULL_OVERLAY_CURRENT\" \"${{#_summaries[@]}}\"; \
+                 printf 'SUM=[%s]\\n' \"${{_summaries[*]}}\"; \
+                 printf 'ITEMS<<<%s>>>' \"$DOT_PULL_OVERLAY_CHANGED_ITEMS\""
+            ),
+        );
+        assert_eq!(code, 0, "shell record status {name:?} {status:?}");
+        let mut tally = PullTally {
+            failed: 1,
+            changed: 2,
+            skipped: 3,
+            current: 4,
+            changed_items: "prior\n".to_string(),
+        };
+        let summary = record_status(name, status, &mut tally);
+        let summaries = summary.map_or_else(Vec::new, |line| vec![line]);
+        let expected = format!(
+            "F={} C={} S={} U={} N={}\nSUM=[{}]\nITEMS<<<{}>>>",
+            tally.failed,
+            tally.changed,
+            tally.skipped,
+            tally.current,
+            summaries.len(),
+            summaries.join(" "),
+            tally.changed_items,
+        );
+        assert_eq!(
+            String::from_utf8(out).expect("tally utf8"),
+            expected,
+            "tally parity for {name:?} {status:?}"
+        );
+    }
+}
+
+#[test]
+fn overlay_active_needs_worktree_or_url() {
+    let dir = TempDir::new("pull-active").expect("fixture dir");
+    let worktree = dir.path().join("wt");
+    let plain = dir.path().join("plain");
+    std::fs::create_dir_all(&worktree).expect("worktree dir");
+    std::fs::create_dir_all(&plain).expect("plain dir");
+    git_init(&worktree);
+    // (path, url, optional): name/optional never decide.
+    let cases = [
+        (
+            worktree.to_string_lossy().into_owned(),
+            "https://x/y",
+            "false",
+            true,
+        ),
+        (worktree.to_string_lossy().into_owned(), "", "true", true),
+        (
+            plain.to_string_lossy().into_owned(),
+            "https://x/y",
+            "false",
+            true,
+        ),
+        (plain.to_string_lossy().into_owned(), "", "true", false),
+    ];
+    for (path, url, optional, expected) in cases {
+        let (code, out, _) = shell_run(
+            dir.path(),
+            &[],
+            &[],
+            &format!(
+                ". \"$1/lib/dot/repos/config.sh\"; _pull_overlay_active name \"{path}\" \"{url}\" \"{optional}\" && printf yes || printf no"
+            ),
+        );
+        assert_eq!(code, 0, "shell overlay active {path:?}");
+        assert_eq!(
+            out,
+            if expected {
+                b"yes".as_slice()
+            } else {
+                b"no".as_slice()
+            },
+            "shell active for {path:?}"
+        );
+        assert_eq!(
+            overlay_active(Path::new(&path), url),
+            expected,
+            "active parity for {path:?} {url:?} {optional:?}"
+        );
+    }
+}
+
+#[test]
+fn overlay_count_skips_inactive_and_nongit() {
+    let dir = TempDir::new("pull-count").expect("fixture dir");
+    let worktree = dir.path().join("wt");
+    let plain = dir.path().join("plain");
+    std::fs::create_dir_all(&worktree).expect("worktree dir");
+    std::fs::create_dir_all(&plain).expect("plain dir");
+    git_init(&worktree);
+    let wt = worktree.to_string_lossy();
+    let pl = plain.to_string_lossy();
+    // (sync, path, url, counted): empty sync defaults to git.
+    let rows = [
+        ("git", wt.as_ref(), "https://x/y", true),
+        ("git", pl.as_ref(), "https://x/y", true),
+        ("git", pl.as_ref(), "", false),
+        ("none", wt.as_ref(), "https://x/y", false),
+        ("", wt.as_ref(), "https://x/y", true),
+        ("hg", wt.as_ref(), "https://x/y", false),
+    ];
+    let entries: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (sync, path, url, _))| format!("ovl{i}|{path}|{url}|x||{sync}"))
+        .collect();
+    let quoted: Vec<String> = entries.iter().map(|e| format!("'{e}'")).collect();
+    let (code, out, _) = shell_run(
+        dir.path(),
+        &[],
+        &[],
+        &format!(
+            ". \"$1/lib/dot/repos/config.sh\"; OVERLAYS=({}); _pull_overlay_count",
+            quoted.join(" ")
+        ),
+    );
+    assert_eq!(code, 0, "shell overlay count");
+    let wanted = rows.iter().filter(|(_, _, _, c)| *c).count();
+    assert_eq!(
+        String::from_utf8(out).expect("count utf8"),
+        wanted.to_string(),
+        "shell count counts actives"
+    );
+    let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+    assert_eq!(overlay_count(&refs), wanted, "count parity");
+}
