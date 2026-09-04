@@ -38,6 +38,7 @@ pub mod reserved;
 pub mod temp;
 pub mod test_support;
 pub mod ui;
+pub mod update;
 pub mod update_lock;
 pub mod version;
 pub mod xdg;

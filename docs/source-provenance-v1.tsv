@@ -134,6 +134,7 @@ tests/test-command-test	standalone:new
 tests/test-lifecycle-test	dotfiles:.local/lib/dotfiles/tests/core/runner.sh@dotfiles-v2+standalone
 tests/ui.rs	standalone:new
 tests/update-lock-test	dotfiles:tests/core-update-test@dotfiles-v1+standalone
+tests/update.rs	standalone:new
 tests/update_lock.rs	standalone:new
 tests/workflow-test	standalone:new
 tests/xdg.rs	standalone:new
