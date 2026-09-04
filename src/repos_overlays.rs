@@ -1,7 +1,8 @@
 //! Manifest, replacement-identity, and quarantine helpers from
 //! `lib/dot/repos/overlays.sh`: link-target derivation, manifest
 //! record parsing, the manifest safety gate, the managed-generation
-//! fingerprint, and the restore/commit halves of quarantined links.
+//! fingerprint, the destination context, the quarantine orchestrator,
+//! and the restore/commit halves of quarantined links.
 //!
 //! Two engine boundaries apply. Values cross from bytes to `String`
 //! via lossy conversion (the `profiles` precedent), so a non-UTF8
@@ -16,10 +17,12 @@
 
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::errors::{Error, Result};
+use crate::reserved;
 use crate::temp;
+use crate::xdg;
 
 /// `_overlay_link_target`: the generated symlink target for `rel`
 /// inside overlay `name`. One `../` per `/` in `rel`, so deeper
@@ -411,4 +414,279 @@ pub fn commit_quarantined_link(
         source,
     })?;
     Ok(())
+}
+
+/// Env-derived inputs for [`destination_context`], replacing the
+/// shell's `HOME`, `OVERLAYS`, and reserved-roots environment with
+/// explicit values (the [`RollbackSnapshot`] precedent). Every field
+/// mirrors one shell lookup: `home` is `$HOME`, the three `Option`s
+/// are `$XDG_STATE_HOME` / `$SHDEPS_INSTALL_DIR` / `$SHDEPS_STATE_DIR`
+/// (`None` selects the same `$HOME` fallbacks), `overlay_paths` are
+/// the path fields of the `OVERLAYS` records, `init_backup` is
+/// `$DOT_INIT_BACKUP` (`None` covers unset and `-`), and `pwd` is
+/// the physical working directory for candidate resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestinationInputs {
+    /// Client home directory.
+    pub home: String,
+    /// `$XDG_STATE_HOME` when exported.
+    pub xdg_state_home: Option<String>,
+    /// `$SHDEPS_INSTALL_DIR` when exported.
+    pub install_dir: Option<String>,
+    /// `$SHDEPS_STATE_DIR` when exported.
+    pub state_dir: Option<String>,
+    /// Overlay link paths.
+    pub overlay_paths: Vec<String>,
+    /// `$DOT_INIT_BACKUP` when set and not `-`.
+    pub init_backup: Option<String>,
+    /// Physical working directory.
+    pub pwd: String,
+}
+
+/// The resolved destination: `_overlay_destination_context`'s
+/// `OVERLAY_PHYSICAL_DESTINATION`, `OVERLAY_PHYSICAL_PARENT`, and
+/// `OVERLAY_PARENT_IDENTITY` as one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestinationContext {
+    /// Guarded destination path.
+    pub physical: PathBuf,
+    /// Its physical parent directory.
+    pub parent: PathBuf,
+    /// `dev:ino` of the physical parent.
+    pub parent_identity: String,
+}
+
+/// `_overlay_destination_context`: the guarded destination for a
+/// home-relative path, or `None` wherever the shell returns 1 — a
+/// reserved destination or an unresolvable leaf. A failed
+/// reserved-roots snapshot reads reserved (fail closed), exactly
+/// like `_dot_reserved_roots_snapshot || return 0`.
+pub fn destination_context(rel: &str, inputs: &DestinationInputs) -> Option<DestinationContext> {
+    let destination = format!("{}/{}", inputs.home, rel);
+    let state_home = xdg::base(
+        xdg::Kind::State,
+        inputs.xdg_state_home.as_deref().unwrap_or(""),
+        &inputs.home,
+    )
+    .ok()?;
+    let install_root = inputs
+        .install_dir
+        .clone()
+        .unwrap_or_else(|| format!("{}/.local/share", inputs.home));
+    let checkout = format!("{install_root}/cgraf78/dot");
+    let provider_state = inputs
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| format!("{state_home}/shdeps"));
+    let roots = match reserved::reserved_roots(
+        &reserved::RootsInput {
+            home: inputs.home.clone(),
+            state_home,
+            install_root,
+            provider_state,
+            overlay_paths: inputs.overlay_paths.clone(),
+            init_backup: inputs.init_backup.clone(),
+        },
+        &inputs.pwd,
+    ) {
+        Ok(roots) => roots,
+        Err(_) => return None,
+    };
+    if reserved::candidate_path_is_reserved_from_roots(
+        &destination,
+        &roots,
+        &inputs.home,
+        &checkout,
+        &inputs.pwd,
+    ) {
+        return None;
+    }
+    let leaf = reserved::physical_leaf_candidate(&destination, &inputs.pwd).ok()?;
+    Some(DestinationContext {
+        physical: PathBuf::from(leaf.path),
+        parent: PathBuf::from(leaf.physical_parent),
+        parent_identity: leaf.parent_identity,
+    })
+}
+
+/// One quarantined generation, replacing the shell's
+/// `OVERLAY_ADOPTION_*` dynamically scoped outputs with an explicit
+/// value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adoption {
+    /// The managed path the link was parked from.
+    pub physical: PathBuf,
+    /// `stage/previous`: the parked link.
+    pub parked: PathBuf,
+    /// The quarantine stage directory.
+    pub stage: PathBuf,
+    /// Fingerprint the parked generation must still match.
+    pub expected: String,
+}
+
+/// `_overlay_quarantine_rollback_link` outcome: adopted (shell 0),
+/// the leaf is not the snapshotted generation (shell 1), or an
+/// authorized generation raced or could not be quarantined safely
+/// (shell 2 — the caller must not retry Git).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuarantineOutcome {
+    /// Parked safely; carries the adoption.
+    Adopt(Adoption),
+    /// Not the snapshotted managed generation: user-owned.
+    NotManaged,
+    /// Raced or unsafe: do not retry.
+    Unsafe,
+}
+
+impl QuarantineOutcome {
+    /// Shell exit code for this outcome.
+    pub fn code(&self) -> i32 {
+        match self {
+            QuarantineOutcome::Adopt(_) => 0,
+            QuarantineOutcome::NotManaged => 1,
+            QuarantineOutcome::Unsafe => 2,
+        }
+    }
+}
+
+/// Owned inputs for [`quarantine_rollback_link`]: the installed-link
+/// snapshot, the destination environment, the probed move tool (the
+/// shell caches `DOT_MOVE_BIN`/`DOT_MOVE_MODE`), and the source root
+/// for the sanitized `hash-object` binding.
+#[derive(Debug, Clone)]
+pub struct QuarantineInputs {
+    /// Installed managed links and their generations.
+    pub snapshot: RollbackSnapshot,
+    /// Home, reserved-roots env, and working directory.
+    pub context: DestinationInputs,
+    /// Probed move tool.
+    pub tool: temp::MoveTool,
+    /// Source root for the sanitized `hash-object` binding.
+    pub source_root: PathBuf,
+}
+
+/// `$(readlink)` bytes with every trailing newline stripped, or
+/// `None` when the leaf is not a readable link — command
+/// substitution strips trailing newlines before the shell compares.
+fn readlink_stripped(path: &Path) -> Option<Vec<u8>> {
+    let target = std::fs::read_link(path).ok()?;
+    let mut bytes = target.as_os_str().as_bytes();
+    while let Some(rest) = bytes.strip_suffix(b"\n".as_slice()) {
+        bytes = rest;
+    }
+    Some(bytes.to_vec())
+}
+
+/// `mktemp -d "$parent/.$base.dot-overlay-adopt.XXXXXXXX"` plus the
+/// enforcing `chmod 0700`, with `/dev/urandom` suffixes retried like
+/// the overlay-context staging. The suffix alphabet differs
+/// (hex vs `mktemp` alphanumerics); only the prefix, mode, and
+/// uniqueness are contractual.
+fn create_stage(parent: &Path, base: &std::ffi::OsStr) -> Option<PathBuf> {
+    use std::io::Read as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    for _ in 0..16 {
+        let mut suffix = [0u8; 8];
+        let random = std::fs::File::open("/dev/urandom")
+            .ok()
+            .and_then(|mut random| random.read_exact(&mut suffix).ok())
+            .is_some();
+        if !random {
+            return None;
+        }
+        let mut name = std::ffi::OsString::from(".");
+        name.push(base);
+        name.push(".dot-overlay-adopt.");
+        for byte in suffix {
+            name.push(format!("{byte:02x}"));
+        }
+        let stage = parent.join(&name);
+        match std::fs::create_dir(&stage) {
+            Ok(()) => {
+                if std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700)).is_ok()
+                {
+                    return Some(stage);
+                }
+                let _ = std::fs::remove_dir(&stage);
+                return None;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// `_overlay_quarantine_rollback_link`: park the exact
+/// rollback-authorized link with a same-parent rename before a base
+/// pull adopts its path. `NotManaged` means the current leaf is not
+/// the snapshotted managed generation; `Unsafe` means an authorized
+/// generation raced or could not be quarantined safely.
+///
+/// The shell warns on the stranded/quarantine-lost paths; warnings
+/// carry no engine meaning and neither branch retries, so only the
+/// filesystem aftermath is contractual there.
+pub fn quarantine_rollback_link(rel: &str, inputs: &QuarantineInputs) -> QuarantineOutcome {
+    use QuarantineOutcome::{Adopt, NotManaged, Unsafe};
+    let target = match rollback_target(&inputs.snapshot, rel) {
+        Some(target) => target,
+        None => return NotManaged,
+    };
+    let context = match destination_context(rel, &inputs.context) {
+        Some(context) => context,
+        None => return Unsafe,
+    };
+    let physical = &context.physical;
+    let managed = std::fs::symlink_metadata(physical)
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+        && readlink_stripped(physical).is_some_and(|link| link == target.as_bytes());
+    if !managed {
+        return NotManaged;
+    }
+    let expected = match replacement_identity(&inputs.source_root, physical) {
+        Ok(expected) => expected,
+        Err(_) => return Unsafe,
+    };
+    let base = physical.file_name().unwrap_or_default().to_os_string();
+    let stage = match create_stage(&context.parent, &base) {
+        Some(stage) => stage,
+        None => return Unsafe,
+    };
+    let parked = stage.join("previous");
+    if temp::move_noreplace_with(physical, &parked, &inputs.tool).is_err() {
+        // The move reports failure, but a raced `mv` may still have
+        // landed the source: only the fingerprint decides.
+        if replacement_identity(&inputs.source_root, &parked).unwrap_or_default() != expected {
+            if replacement_identity(&inputs.source_root, physical).unwrap_or_default() == expected {
+                let _ = std::fs::remove_dir(&stage);
+            }
+            return Unsafe;
+        }
+    }
+    let stable = replacement_identity(&inputs.source_root, &parked).unwrap_or_default() == expected
+        && std::fs::symlink_metadata(&parked).is_ok_and(|meta| meta.file_type().is_symlink())
+        && readlink_stripped(&parked).is_some_and(|link| link == target.as_bytes())
+        && matches!(
+            destination_context(rel, &inputs.context),
+            Some(next)
+                if next.physical == context.physical
+                    && next.parent == context.parent
+                    && next.parent_identity == context.parent_identity
+        );
+    if !stable {
+        // Move the parked generation back when the physical path is
+        // still free; either way the caller must not proceed.
+        if std::fs::symlink_metadata(physical).is_err()
+            && temp::move_noreplace_with(&parked, physical, &inputs.tool).is_ok()
+        {
+            let _ = std::fs::remove_dir(&stage);
+        }
+        return Unsafe;
+    }
+    Adopt(Adoption {
+        physical: physical.clone(),
+        parked,
+        stage,
+        expected,
+    })
 }
