@@ -486,6 +486,174 @@ fn load_twins_agree() {
 }
 
 #[test]
+fn load_default_twins_agree() {
+    // `_dot_profiles_load_default` resolves `dot/profiles.d` through
+    // XDG and loads it: twin trees under separate XDG roots plus a
+    // decoy HOME prove the resolution, and the dump shape is shared
+    // with [`load_twins_agree`].
+    let tree: &[(&str, &[u8])] = &[
+        ("base.conf", b"version=1\noverlays=core\n"),
+        ("web.conf", b"version=1\nprofiles=base\noverlays=websvc\n"),
+    ];
+    for default in ["base", "web"] {
+        let sdir = TempDir::new("prof-default-shell").expect("shell dir");
+        let rdir = TempDir::new("prof-default-rust").expect("rust dir");
+        for (name, body) in tree {
+            stage(sdir.path(), &format!("xdg/dot/profiles.d/{name}"), body);
+            stage(rdir.path(), &format!("xdg/dot/profiles.d/{name}"), body);
+        }
+        let sxdg = sdir.path().join("xdg");
+        let rxdg = rdir.path().join("xdg");
+        let shome = sdir.path().join("home");
+        let rhome = rdir.path().join("home");
+        let env = [
+            ("XDG_CONFIG_HOME", Some(sxdg.to_string_lossy().into_owned())),
+            ("HOME", Some(shome.to_string_lossy().into_owned())),
+            ("DOT_DEFAULT_PROFILE", Some(default.to_string())),
+        ];
+        let env_ref: Vec<(&str, Option<&str>)> = env
+            .iter()
+            .map(|(key, value)| (*key, value.as_deref()))
+            .collect();
+        let (scode, sout, _) = shell_run(
+            sdir.path(),
+            &[],
+            &env_ref,
+            &format!("_dot_profiles_load_default; printf 'rc=%s\\n' \"$?\"; {DUMP}"),
+        );
+        let mut state = profiles::State::default();
+        let rcode = state.load_default(
+            &rxdg.to_string_lossy(),
+            &rhome.to_string_lossy(),
+            Some(default),
+        );
+        let rust = format!(
+            "rc={}\n{}",
+            if rcode.is_ok() { "0" } else { "1" },
+            dump(&state)
+        );
+        let shell = String::from_utf8(sout).expect("dump text");
+        assert_eq!(scode, 0, "shell harness runs for {default}");
+        assert_eq!(
+            normalize_roots(&rust, sdir.path(), rdir.path()),
+            normalize_roots(&shell, sdir.path(), rdir.path()),
+            "load_default parity for {default}"
+        );
+    }
+    // Unset default falls back to `base` on both sides.
+    let sdir = TempDir::new("prof-default-base-shell").expect("shell dir");
+    let rdir = TempDir::new("prof-default-base-rust").expect("rust dir");
+    for (name, body) in tree {
+        stage(sdir.path(), &format!("xdg/dot/profiles.d/{name}"), body);
+        stage(rdir.path(), &format!("xdg/dot/profiles.d/{name}"), body);
+    }
+    let sxdg = sdir.path().join("xdg");
+    let rxdg = rdir.path().join("xdg");
+    let env = [
+        ("XDG_CONFIG_HOME", Some(sxdg.to_string_lossy().into_owned())),
+        ("DOT_DEFAULT_PROFILE", None),
+    ];
+    let env_ref: Vec<(&str, Option<&str>)> = env
+        .iter()
+        .map(|(key, value)| (*key, value.as_deref()))
+        .collect();
+    let (scode, sout, _) = shell_run(
+        sdir.path(),
+        &[],
+        &env_ref,
+        &format!("_dot_profiles_load_default; printf 'rc=%s\\n' \"$?\"; {DUMP}"),
+    );
+    let mut state = profiles::State::default();
+    let rcode = state.load_default(&rxdg.to_string_lossy(), "/nonexistent-home", None);
+    assert_eq!(scode, 0, "shell harness runs for implicit base");
+    let rust = format!(
+        "rc={}\n{}",
+        if rcode.is_ok() { "0" } else { "1" },
+        dump(&state)
+    );
+    let shell = String::from_utf8(sout).expect("dump text");
+    assert_eq!(
+        normalize_roots(&rust, sdir.path(), rdir.path()),
+        normalize_roots(&shell, sdir.path(), rdir.path()),
+        "load_default parity for implicit base"
+    );
+    // Missing profiles.d is a clean empty state; a file is an error.
+    for label in ["absent", "file"] {
+        let sdir = TempDir::new(&format!("prof-default-{label}-shell")).expect("shell dir");
+        let rdir = TempDir::new(&format!("prof-default-{label}-rust")).expect("rust dir");
+        let sxdg = sdir.path().join("xdg");
+        let rxdg = rdir.path().join("xdg");
+        std::fs::create_dir_all(&sxdg).expect("shell xdg");
+        std::fs::create_dir_all(&rxdg).expect("rust xdg");
+        if label == "file" {
+            stage(sdir.path(), "xdg/dot/profiles.d", b"x");
+            stage(rdir.path(), "xdg/dot/profiles.d", b"x");
+        }
+        let env = [("XDG_CONFIG_HOME", Some(sxdg.to_string_lossy().into_owned()))];
+        let env_ref: Vec<(&str, Option<&str>)> = env
+            .iter()
+            .map(|(key, value)| (*key, value.as_deref()))
+            .collect();
+        let (scode, sout, _) = shell_run(
+            sdir.path(),
+            &[],
+            &env_ref,
+            &format!("_dot_profiles_load_default; printf 'rc=%s\\n' \"$?\"; {DUMP}"),
+        );
+        let mut state = profiles::State::default();
+        let rcode = state.load_default(&rxdg.to_string_lossy(), "/nonexistent-home", Some("base"));
+        assert_eq!(scode, 0, "shell harness for {label}");
+        let rust = format!(
+            "rc={}\n{}",
+            if rcode.is_ok() { "0" } else { "1" },
+            dump(&state)
+        );
+        let shell = String::from_utf8(sout).expect("dump");
+        assert_eq!(
+            normalize_roots(&rust, sdir.path(), rdir.path()),
+            normalize_roots(&shell, sdir.path(), rdir.path()),
+            "load_default parity for {label}"
+        );
+    }
+    // Unresolvable XDG base fails on both sides (shell `dot_xdg_path`
+    // exit 1, Rust `Err`) with prior state intact: both sides load a
+    // valid tree first, then fail, proving the shell's early return
+    // (before `load`'s reset) is reproduced.
+    let dir = TempDir::new("prof-default-unresolvable").expect("fixture dir");
+    for (name, body) in tree {
+        stage(dir.path(), &format!("xdg/dot/profiles.d/{name}"), body);
+    }
+    let good = dir.path().join("xdg");
+    let (scode, sout, _) = shell_run(
+        dir.path(),
+        &[good.as_os_str()],
+        &[],
+        &format!(
+            "XDG_CONFIG_HOME=\"$2\" _dot_profiles_load_default || exit 1; XDG_CONFIG_HOME=relative HOME=relative _dot_profiles_load_default; printf 'rc=%s\\n' \"$?\"; {DUMP}"
+        ),
+    );
+    let mut state = profiles::State::default();
+    state
+        .load_default(&good.to_string_lossy(), "/nonexistent-home", Some("base"))
+        .expect("seed load");
+    let seeded = dump(&state);
+    let rcode = state.load_default("relative", "relative", Some("base"));
+    assert_eq!(scode, 0, "shell harness runs for unresolvable");
+    assert_eq!(dump(&state), seeded, "rust keeps prior state");
+    let rust = format!(
+        "rc={}\n{}",
+        if rcode.is_ok() { "0" } else { "1" },
+        dump(&state)
+    );
+    let shell = String::from_utf8(sout).expect("dump");
+    assert_eq!(
+        normalize_roots(&rust, dir.path(), dir.path()),
+        normalize_roots(&shell, dir.path(), dir.path()),
+        "load_default parity for unresolvable base"
+    );
+}
+
+#[test]
 fn flatten_and_select_agree() {
     let dir = TempDir::new("prof-flatten").expect("fixture dir");
     let root = dir.path();

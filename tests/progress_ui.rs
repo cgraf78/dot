@@ -14,14 +14,15 @@
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt as _;
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use dot::log;
 use dot::progress_ui::{
     Palette, ascii_mode, cell, clear_live, color, count_phrase, detail, duration_ms, elapsed, fit,
-    item, join_comma, line, live_enabled, live_line, pad, progress_bar, progress_detail,
-    progress_detail_with_label, section, status, utf8_locale,
+    item, join_comma, json_get, json_num, line, live_enabled, live_line, now_ms, pad, progress_bar,
+    progress_detail, progress_detail_with_label, section, status, utf8_locale,
 };
 use dot::test_support::TempDir;
 
@@ -1254,6 +1255,269 @@ fn normal_shell_name_matrix_agrees() {
             None => "no\n".to_string(),
         };
         assert_eq!(expected, shell, "name parity for {path:?}");
+    }
+}
+
+/// Write an executable `date` shim replaying `$DOT_TEST_FAKE_DATE`
+/// with exit `$DOT_TEST_FAKE_DATE_RC` (default 0), returning a bindir
+/// holding only that shim. `_ui_now_ms` calls nothing but `date`, so
+/// a shim-only PATH pins the clock read byte-exactly. The bindir is
+/// exec-capable (see [`TempDir::new_exec`]).
+fn fake_date_bindir(label: &str) -> TempDir {
+    let dir = TempDir::new_exec(label).expect("bindir");
+    let shim = dir.path().join("date");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\nprintf '%s' \"$DOT_TEST_FAKE_DATE\"\nexit \"${DOT_TEST_FAKE_DATE_RC:-0}\"\n",
+    )
+    .expect("shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    dir
+}
+
+#[test]
+fn now_ms_pinned_clock_agrees() {
+    // (fake `date` output, fake `date` exit, SECONDS seed). The shim
+    // pins the `date +%s%3N` read; the shell falls back to
+    // SECONDS*1000 whenever the read is not all digits (or `date`
+    // fails). SECONDS is seeded in-snippet (a fresh child starts at 0
+    // but sourcing takes milliseconds, so an inherited value would be
+    // timing-dependent); the suffix reports the live value, which
+    // absorbs any tick landing before the function's own read. Only
+    // a tick in the microsecond gap after that read miscompares —
+    // loudly, by exactly 1000 — instead of passing wrong.
+    let cases: &[(&str, &str, i64)] = &[
+        ("1757068800123", "0", 7),
+        ("0", "0", 99),
+        ("0007", "0", 3),
+        ("", "0", 7),
+        ("", "1", 7),
+        ("abc", "0", 7),
+        ("12a34", "0", 7),
+        (" 12", "0", 7),
+        ("12 ", "0", 7),
+        ("+12", "0", 7),
+        ("-12", "0", 7),
+        ("1\n2", "0", 7),
+        ("12.5", "0", 7),
+    ];
+    for (stamp, rc, seconds) in cases.iter().copied() {
+        let dir = TempDir::new("ui-now").expect("fixture dir");
+        let bindir = fake_date_bindir("ui-now-date");
+        let bindir_text = bindir.path().to_string_lossy().into_owned();
+        let (code, out) = shell_run(
+            dir.path(),
+            &[],
+            &[
+                ("PATH", Some(bindir_text.as_str())),
+                ("DOT_TEST_FAKE_DATE", Some(stamp)),
+                ("DOT_TEST_FAKE_DATE_RC", Some(rc)),
+            ],
+            &format!("SECONDS={seconds}; _ui_now_ms; printf '|%s' \"$SECONDS\""),
+        );
+        assert_eq!(code, 0, "shell now for {stamp:?} rc {rc}");
+        // The printed stamp is digits only, so the last `|` opens
+        // the suffix.
+        let split = out
+            .iter()
+            .rposition(|byte| *byte == b'|')
+            .expect("seconds suffix");
+        let (printed, suffix) = out.split_at(split);
+        let reported: i64 = String::from_utf8(suffix[1..].to_vec())
+            .expect("seconds digits")
+            .parse()
+            .expect("seconds number");
+        let effective = if rc == "0" { stamp } else { "" };
+        assert_eq!(
+            now_ms(effective, reported),
+            printed,
+            "now parity for {stamp:?} rc {rc} seconds {reported}"
+        );
+    }
+    // Nonzero fallback arithmetic without the shell clock (the
+    // `'%ss'` precedent in `elapsed_formats_second_differences`):
+    // the differential matrix above proves the branch, this pins
+    // the `* 1000` the branch computes.
+    assert_eq!(now_ms("", 7), b"7000".as_slice());
+    assert_eq!(now_ms("12a", 100), b"100000".as_slice());
+}
+
+#[test]
+fn now_ms_live_shaped_value_agrees() {
+    // A real `date +%s%3N` stamp replayed through the shim: both twins
+    // echo the same live-shaped digits with no race (one captured read
+    // feeds both sides).
+    let probe = Command::new("date")
+        .arg("+%s%3N")
+        .output()
+        .expect("date probe");
+    let stamp = String::from_utf8_lossy(&probe.stdout).trim_end().to_owned();
+    if stamp.is_empty() || !stamp.bytes().all(|byte| byte.is_ascii_digit()) {
+        // No GNU `date` here (BSD prints `%3N` through): the pinned
+        // matrix above already covers the fallback arm.
+        return;
+    }
+    let dir = TempDir::new("ui-now-live").expect("fixture dir");
+    let bindir = fake_date_bindir("ui-now-live-date");
+    let bindir_text = bindir.path().to_string_lossy().into_owned();
+    let (code, out) = shell_run(
+        dir.path(),
+        &[],
+        &[
+            ("PATH", Some(bindir_text.as_str())),
+            ("DOT_TEST_FAKE_DATE", Some(stamp.as_str())),
+        ],
+        "_ui_now_ms",
+    );
+    assert_eq!(code, 0, "shell live now");
+    assert_eq!(now_ms(&stamp, 0), out, "live now parity");
+}
+
+/// Bindir holding only a `sed` link, so `command -v jq` fails and the
+/// shell takes its `sed` fallback. `sed` is located off the live PATH
+/// (no hardcoded directories) and linked, never copied.
+fn sed_only_bindir(label: &str) -> TempDir {
+    let live_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut origin: Option<PathBuf> = None;
+    for dir in std::env::split_paths(&live_path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join("sed");
+        if candidate.is_file() {
+            origin = Some(candidate);
+            break;
+        }
+    }
+    let origin = origin.expect("sed on PATH for the fallback oracle");
+    let dir = TempDir::new_exec(label).expect("bindir");
+    std::os::unix::fs::symlink(&origin, dir.path().join("sed")).expect("link sed");
+    dir
+}
+
+/// Assert the shell takes the expected JSON branch (`jq` present or
+/// the `sed` fallback) so a silent branch mismatch cannot pass as
+/// parity.
+fn assert_json_branch(fixture: &Path, extra_env: &[(&str, Option<&str>)], present: bool) {
+    let (code, out) = shell_run(
+        fixture,
+        &[],
+        extra_env,
+        "if command -v jq >/dev/null 2>&1; then echo present; else echo fallback; fi",
+    );
+    assert_eq!(code, 0, "branch probe runs");
+    assert_eq!(
+        out,
+        if present {
+            b"present\n".as_slice()
+        } else {
+            b"fallback\n".as_slice()
+        },
+        "json branch premise"
+    );
+}
+
+#[test]
+fn json_get_twins_agree() {
+    let dir = TempDir::new("ui-json-get").expect("fixture dir");
+    assert_json_branch(dir.path(), &[], true);
+    let fallback = sed_only_bindir("ui-json-get-sed");
+    let fallback_path = fallback.path().to_string_lossy().into_owned();
+    let fallback_env = [("PATH", Some(fallback_path.as_str()))];
+    assert_json_branch(dir.path(), &fallback_env, false);
+    let cases: &[(&str, &str)] = &[
+        ("{\"event\":\"done\",\"index\":3}", "event"),
+        ("{\"event\":\"done\",\"index\":3}", "index"),
+        ("{\"event\":\"done\",\"index\":3}", "missing"),
+        ("{\"msg\":\"a\\\"b\"}", "msg"),
+        ("{\"e\":\"\"}", "e"),
+        ("{\"n\":42}", "n"),
+        ("{\"n\":1.5}", "n"),
+        ("{\"b\":true}", "b"),
+        ("{\"v\":null}", "v"),
+        ("{\"o\":{\"a\":1}}", "o"),
+        ("{\"a\":[1,2]}", "a"),
+        ("not json", "event"),
+        ("", "event"),
+        ("{\"k\":\"first\",\"k\":\"second\"}", "k"),
+        ("{\"k\" : \"spaced\"}", "k"),
+        ("{\"n\":-5}", "n"),
+        ("[1,2]", "0"),
+    ];
+    for (line, key) in cases.iter().copied() {
+        let argv = [OsStr::new(key), OsStr::from_bytes(line.as_bytes())];
+        let (code, out) = shell_run(dir.path(), &argv, &[], "_json_get \"$2\" \"$3\"");
+        // `jq` fails loudly (nonzero) on unparsable input or a type
+        // error while printing nothing; every caller uses `$(...)`
+        // and only reads stdout, so a bare nonzero-with-output would
+        // be the real divergence. (`jq` exit codes vary by release,
+        // so only the emptiness companion is pinned.)
+        assert!(
+            code == 0 || out.is_empty(),
+            "shell json_get rc {code} with output for {line:?} key {key:?}"
+        );
+        assert_eq!(
+            json_get(key, line.as_bytes(), true),
+            out,
+            "json_get jq parity for {line:?} key {key:?}"
+        );
+        let (code, out) = shell_run(dir.path(), &argv, &fallback_env, "_json_get \"$2\" \"$3\"");
+        assert_eq!(code, 0, "shell json_get fallback for {line:?} key {key:?}");
+        assert_eq!(
+            json_get(key, line.as_bytes(), false),
+            out,
+            "json_get fallback parity for {line:?} key {key:?}"
+        );
+    }
+}
+
+#[test]
+fn json_num_twins_agree() {
+    let dir = TempDir::new("ui-json-num").expect("fixture dir");
+    assert_json_branch(dir.path(), &[], true);
+    let fallback = sed_only_bindir("ui-json-num-sed");
+    let fallback_path = fallback.path().to_string_lossy().into_owned();
+    let fallback_env = [("PATH", Some(fallback_path.as_str()))];
+    assert_json_branch(dir.path(), &fallback_env, false);
+    let cases: &[(&str, &str)] = &[
+        ("{\"n\":42}", "n"),
+        ("{\"n\":0}", "n"),
+        ("{\"n\":1.5}", "n"),
+        ("{\"n\":-5}", "n"),
+        ("{\"n\":\"42\"}", "n"),
+        ("{\"n\":true}", "n"),
+        ("{\"n\":null}", "n"),
+        ("{\"n\":007}", "n"),
+        ("{\"n\":12345678901234567890123}", "n"),
+        ("{\"event\":\"done\"}", "n"),
+        ("{\"a\":1,\"n\":2}", "n"),
+        ("{\"n\":1,\"n\":2}", "n"),
+        ("not json", "n"),
+        ("", "n"),
+        ("{\"n\": 5}", "n"),
+        ("{\"n\":5 }", "n"),
+    ];
+    for (line, key) in cases.iter().copied() {
+        let argv = [OsStr::new(key), OsStr::from_bytes(line.as_bytes())];
+        let (code, out) = shell_run(dir.path(), &argv, &[], "_json_num \"$2\" \"$3\"");
+        // Same nonzero-on-empty contract as `_json_get` (see above):
+        // callers only ever read stdout through `$(...)`.
+        assert!(
+            code == 0 || out.is_empty(),
+            "shell json_num rc {code} with output for {line:?} key {key:?}"
+        );
+        assert_eq!(
+            json_num(key, line.as_bytes(), true),
+            out,
+            "json_num jq parity for {line:?} key {key:?}"
+        );
+        let (code, out) = shell_run(dir.path(), &argv, &fallback_env, "_json_num \"$2\" \"$3\"");
+        assert_eq!(code, 0, "shell json_num fallback for {line:?} key {key:?}");
+        assert_eq!(
+            json_num(key, line.as_bytes(), false),
+            out,
+            "json_num fallback parity for {line:?} key {key:?}"
+        );
     }
 }
 
