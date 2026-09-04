@@ -326,7 +326,7 @@ fn render_mode(bits: u32) -> String {
 /// us whose group/other permission bits are clear
 /// (`8#$mode & 077 == 0`, so setuid-only extras like `4700` pass
 /// the mask on both engines), with optional exact identity and
-/// mode-string checks. The mode renders through [`render_mode`],
+/// mode-string checks. The mode renders through `render_mode`
 /// so the `expected_mode` comparison is a plain string equality
 /// like the shell's quoted `==` — including a `4700` dir failing
 /// a `4700` expectation on macOS, exactly like the shell.
