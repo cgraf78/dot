@@ -59,8 +59,8 @@ fn is_abi(bytes: &[u8]) -> bool {
 /// `$source_root/support/shdeps.lock`, or `None` for every shell
 /// refusal: an unreadable file, any line count but three (a missing
 /// trailing newline still counts its line, exactly like the shell
-/// `read ... || [[ -n $line ]]` fallback), unordered or mis-prefixed
-/// lines, or a malformed value.
+/// `read ... || [[ -n $line ]]` fallback), unordered or wrongly
+/// prefixed lines, or a malformed value.
 fn lock_fields(source_root: &Path) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let content = std::fs::read(source_root.join("support/shdeps.lock")).ok()?;
     let mut lines: Vec<&[u8]> = content.split(|byte| *byte == b'\n').collect();
