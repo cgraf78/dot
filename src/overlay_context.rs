@@ -88,6 +88,25 @@ fn identity(meta: &std::fs::Metadata) -> (u32, u32, u64, u64, u64) {
     )
 }
 
+/// `_dot_overlay_context_stat`: owner/mode/link/device/inode
+/// identity without following the final component — the portable
+/// form of the shell's GNU `stat -c '%u %a %h %d %i'` else BSD
+/// `stat -f '%u %Lp %l %d %i'` probe. Returns
+/// `(uid, mode & 0o7777, nlink, dev, ino)` (the shell's `REPLY_*`
+/// tuple) when the file is owned by `euid`. The shell's
+/// octal-digit gate on `stat` output is upheld by construction:
+/// the typed API cannot produce non-octal modes. Like the
+/// extension-trust precedent, `symlink_metadata` reproduces the
+/// shell's no-`-L` refusal to dereference.
+pub fn stat(path: &Path, euid: u32) -> Option<(u32, u32, u64, u64, u64)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    let (uid, mode, links, dev, ino) = identity(&meta);
+    if uid != euid {
+        return None;
+    }
+    Some((uid, mode, links, dev, ino))
+}
+
 /// `_dot_overlay_context_directory_safe`: a real directory, never a
 /// symlink, owned by us with no group/other permission bits.
 pub fn directory_safe(path: &Path, euid: u32) -> bool {
