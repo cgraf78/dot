@@ -149,6 +149,13 @@ fn hook_paths_agree() {
         merge_hooks::hook_source(&hooks, OsStr::new("ssh")).display(),
         hooks.join("ssh").display(),
     );
+    // The `_merge_hook_family` line above already proves the join;
+    // pin the named alias to the same path.
+    assert_eq!(
+        merge_hooks::family(&hooks, OsStr::new("ssh")),
+        hooks.join("ssh"),
+        "family join"
+    );
     for path in merge_hooks::family_files(&fam).expect("rust files") {
         rust.push_str(&format!("{}\n", path.display()));
     }
