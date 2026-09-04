@@ -210,7 +210,9 @@ fn profile_identifier_valid(value: &str) -> bool {
 /// byte is < 32 except LF, or is DEL — so CR and TAB are rejected here.
 /// A path that cannot be read also fails: production runs under
 /// `set -o pipefail`, so a failed `od` fails the whole `od | awk`
-/// pipeline (probed: missing files and directories exit 1).
+/// pipeline (probed: missing files exit 1 everywhere; directories
+/// diverge by platform — BSD `od` exits 0 empty, GNU `od` fails —
+/// so directories are port-tested, not differential).
 pub fn config_control_bytes(path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
         return false;
