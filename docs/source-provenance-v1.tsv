@@ -170,3 +170,4 @@ tests/cron.rs	standalone:new
 tests/init_client_plan.rs	standalone:new
 tests/pre_sync.rs	standalone:new
 tests/shdeps_ui_render.rs	standalone:new
+tests/init_client_publish.rs	standalone:new
