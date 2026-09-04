@@ -1262,6 +1262,28 @@ pub fn move_noreplace_cached(source: &Path, target: &Path, cache: &mut MoveCache
     move_noreplace_with(source, target, &tool)
 }
 
+/// Unguarded `mkdir -p`: fork the same tool the shell pays for so
+/// its diagnostics match byte for byte, forwarding stderr verbatim
+/// to `warnings` while reporting success. Callers keep going after
+/// a failure exactly like the shell does past a failed `mkdir`.
+pub fn mkdir_forwarded(path: &Path, warnings: &mut dyn std::io::Write) -> bool {
+    match std::process::Command::new("mkdir")
+        .arg("-p")
+        .arg(path)
+        .output()
+    {
+        Ok(output) => {
+            if !output.status.success() {
+                let _ = warnings.write_all(&output.stderr);
+            }
+            output.status.success()
+        }
+        // No `mkdir` to leak from: the caller degrades like the
+        // shell past a failed lookup.
+        Err(_) => false,
+    }
+}
+
 /// Cached `_dot_move_replace_nodir`.
 pub fn move_replace_nodir_cached(
     source: &Path,

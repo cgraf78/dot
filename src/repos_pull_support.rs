@@ -70,19 +70,9 @@ fn date_stamp() -> Option<String> {
 pub fn backup_dir(home: &str, warnings: &mut dyn std::io::Write) -> Option<std::path::PathBuf> {
     use std::path::Path;
     let root = Path::new(home).join(".dot-backup/pull");
-    match std::process::Command::new("mkdir")
-        .arg("-p")
-        .arg(&root)
-        .output()
-    {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            let _ = warnings.write_all(&output.stderr);
-        }
-        // No `mkdir` to leak from: continue to the stamped attempt
-        // like the shell continues after a failed lookup.
-        Err(_) => {}
-    }
+    // Unguarded like the shell: diagnostics leak while creation
+    // continues below.
+    crate::temp::mkdir_forwarded(&root, warnings);
     let stamp = date_stamp().unwrap_or_default();
     let backup = root.join(stamp);
     if std::fs::create_dir(&backup).is_ok() {
