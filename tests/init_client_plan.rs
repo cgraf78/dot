@@ -344,7 +344,23 @@ fn confirm_listing_matches_cut_first() {
     let (shell_code, _, shell_err) = shell_run(dir.path(), &[], &body);
     assert_eq!(shell_code, 0, "shell listing");
     let rust = plan::confirm(&manifest, true, Path::new("/dev/tty")).expect("rust listing");
-    assert_eq!(rust, shell_err, "listing bytes");
+    // Compact divergence report: full byte arrays truncate in CI
+    // logs, so pinpoint the first differing offset instead.
+    if rust != shell_err {
+        let at = rust
+            .iter()
+            .zip(shell_err.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(rust.len().min(shell_err.len()));
+        let lo = at.saturating_sub(16);
+        panic!(
+            "listing bytes diverge at {at} (rust {}B, shell {}B): rust={:?} shell={:?}",
+            rust.len(),
+            shell_err.len(),
+            &rust[lo..(at + 16).min(rust.len())],
+            &shell_err[lo..(at + 16).min(shell_err.len())]
+        );
+    }
     let text = String::from_utf8_lossy(&rust);
     assert!(text.starts_with("dot init: conflicting paths will be backed up:\n"));
     assert!(text.contains("\n  file1\n"));
@@ -358,7 +374,13 @@ fn confirm_listing_matches_cut_first() {
     if !cfg!(target_os = "macos") {
         assert!(text.contains("\n  n\0ul\n"));
     }
-    assert!(text.contains("\n  tail-row\n"));
+    // BSD `sed` preserves a missing trailing newline while GNU
+    // `sed` terminates the final line (see `confirm`).
+    if cfg!(target_os = "macos") {
+        assert!(text.ends_with("\n  tail-row"));
+    } else {
+        assert!(text.contains("\n  tail-row\n"));
+    }
 }
 
 #[test]
