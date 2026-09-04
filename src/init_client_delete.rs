@@ -303,13 +303,33 @@ pub fn leaf_delete_matches(
     candidate_matches_git(git_dir, commit, mode, oid, home, &relative)
 }
 
+/// Render permission bits the way the shell's `stat` probe does.
+/// GNU `stat -c '%a'` prints the full 12-bit mode, but BSD
+/// `stat -f '%Lp'` — the fallback the shell forks on macOS —
+/// prints only the low nine permission bits (`L` selects user,
+/// group, and other, dropping suid/sgid/sticky). A `4700` staging
+/// dir therefore renders `4700` on Linux but `700` on macOS;
+/// match the platform tool, not the raw bits.
+#[cfg(target_os = "macos")]
+fn render_mode(bits: u32) -> String {
+    format!("{:o}", bits & 0o777)
+}
+
+/// GNU rendering for [`render_mode`]: the full 12-bit mode, like
+/// `stat -c '%a'`.
+#[cfg(not(target_os = "macos"))]
+fn render_mode(bits: u32) -> String {
+    format!("{:o}", bits)
+}
+
 /// `_dot_init_private_directory_matches`: a real directory owned by
 /// us whose group/other permission bits are clear
-/// (`8#$mode & 077 == 0`, so setuid-only extras like `4700` pass on
-/// both engines), with optional exact identity and mode-string
-/// checks. The mode renders minimal-octal (`{:o}`), exactly like
-/// `stat -c '%a'`, so the `expected_mode` comparison is a plain
-/// string equality like the shell's quoted `==`.
+/// (`8#$mode & 077 == 0`, so setuid-only extras like `4700` pass
+/// the mask on both engines), with optional exact identity and
+/// mode-string checks. The mode renders through [`render_mode`],
+/// so the `expected_mode` comparison is a plain string equality
+/// like the shell's quoted `==` — including a `4700` dir failing
+/// a `4700` expectation on macOS, exactly like the shell.
 pub fn private_directory_matches(
     path: &Path,
     expected_identity: Option<&str>,
@@ -326,7 +346,7 @@ pub fn private_directory_matches(
     if bits & 0o077 != 0 {
         return false;
     }
-    if expected_mode.is_some_and(|wanted| format!("{:o}", bits) != wanted) {
+    if expected_mode.is_some_and(|wanted| render_mode(bits) != wanted) {
         return false;
     }
     match expected_identity {
