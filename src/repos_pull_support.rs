@@ -2,9 +2,8 @@
 //!
 //! The conflict-log parser, the timestamped backup directory maker,
 //! the locale-pinned pull runner, the worker-fleet accounting, and
-//! the upstream preparation. The conflict-backup orchestrator stays
-//! shell-side until the overlay-quarantine helpers it calls are
-//! ported.
+//! the upstream preparation. The conflict-backup orchestrator lives
+//! in [`crate::repos_pull_backup`].
 
 /// `_pull_conflicts_from_log`: list the untracked files a failed pull
 /// names after its "untracked working tree files would be overwritten
@@ -61,12 +60,29 @@ fn date_stamp() -> Option<String> {
 /// `REPLY=""` plus exit 1. A failed `date` degrades exactly like the
 /// shell's empty command substitution (the join keeps the root, whose
 /// `mkdir` then succeeds on the existing directory).
-pub fn backup_dir(home: &str) -> Option<std::path::PathBuf> {
+///
+/// The shell's first `mkdir -p` is unguarded, so its diagnostics leak
+/// to stderr while creation continues below; the port forks the same
+/// tool and forwards those bytes to `warnings` verbatim (the
+/// `date_stamp` precedent: forking costs what the shell pays and keeps
+/// the bytes identical). The stamped `mkdir` and the `mktemp`
+/// fallback stay suppressed on both sides.
+pub fn backup_dir(home: &str, warnings: &mut dyn std::io::Write) -> Option<std::path::PathBuf> {
     use std::path::Path;
     let root = Path::new(home).join(".dot-backup/pull");
-    // Like the shell's unguarded `mkdir -p`: best effort, failures
-    // surface at the stamped `mkdir`/`mktemp` below.
-    let _ = std::fs::create_dir_all(&root);
+    match std::process::Command::new("mkdir")
+        .arg("-p")
+        .arg(&root)
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let _ = warnings.write_all(&output.stderr);
+        }
+        // No `mkdir` to leak from: continue to the stamped attempt
+        // like the shell continues after a failed lookup.
+        Err(_) => {}
+    }
     let stamp = date_stamp().unwrap_or_default();
     let backup = root.join(stamp);
     if std::fs::create_dir(&backup).is_ok() {

@@ -121,6 +121,7 @@ tests/repos_publish_link.rs	standalone:new
 tests/repos_publish_pending.rs	standalone:new
 tests/repos_publish.rs	standalone:new
 tests/repos_quarantine.rs	standalone:new
+tests/repos_pull_backup.rs	standalone:new
 tests/repos_pull_normalize.rs	standalone:new
 tests/repos_pull_queries.rs	standalone:new
 tests/repos_pull_support.rs	standalone:new
