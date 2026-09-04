@@ -447,10 +447,19 @@ pub fn confirm(manifest: &Path, yes: bool, tty: &Path) -> Result<Vec<u8>> {
     })?;
     let text = String::from_utf8_lossy(&content);
     let mut out = CONFIRM_HEADER.to_vec();
-    for line in cut_lines(&text) {
+    // GNU `sed` terminates the final listing line even when the
+    // manifest lacks a trailing newline (verified: `printf
+    // 'tail-row' | cut -f1 | sed 's/^/  /'` ends `0a`), while BSD
+    // `sed` preserves the bare tail. Replicate the per-platform
+    // shell bytes (lane-58 `render_mode` precedent).
+    let rows = cut_lines(&text);
+    let bare_tail = cfg!(target_os = "macos") && !content.ends_with(b"\n");
+    for (index, line) in rows.iter().enumerate() {
         out.extend_from_slice(b"  ");
         out.extend_from_slice(cut_first(line).as_bytes());
-        out.push(b'\n');
+        if index + 1 < rows.len() || !bare_tail {
+            out.push(b'\n');
+        }
     }
     if yes {
         return Ok(out);
