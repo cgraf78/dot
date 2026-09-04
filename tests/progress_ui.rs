@@ -1130,6 +1130,10 @@ fn done_message_and_hint_agree() {
     ] {
         let mut env: Vec<(&str, Option<&str>)> = vec![("DOT_QUIET", None)];
         env.push(("DOT_UPDATE_RELOADS_SHELL", checkpoint));
+        // The harness scrubs SHELL and bash backfills it from the login
+        // shell (host-dependent); empty it explicitly, which bash
+        // preserves, so the hint takes the deterministic HOME branch.
+        env.push(("SHELL", Some("")));
         let (code, out) = shell_run(
             dir.path(),
             &[],
