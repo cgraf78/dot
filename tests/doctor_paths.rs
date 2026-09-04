@@ -215,6 +215,9 @@ fn physical_path_rows_agree() {
         std::fs::write(Path::new(&name), b"x\n").expect("non-UTF8 leaf");
         name
     };
+    // `mut` only for the gated non-UTF8 push below; allow the
+    // macOS leftovers instead of cfg-duplicating the whole table.
+    #[allow(unused_mut)]
     let mut cases: Vec<(&str, OsString)> = vec![
         ("root", OsString::from("/")),
         ("root-dir-slash-foo", slash_foo.to_os_string()),
