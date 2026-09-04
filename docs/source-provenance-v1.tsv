@@ -135,6 +135,7 @@ tests/resources-test	dotfiles:tests/core-resource-cleanup-test@dotfiles-v1+stand
 tests/run	standalone:new
 tests/shdeps-lock-verifier-test	standalone:new
 tests/shdeps-provider-test	dotfiles:tests/core-test+core-reexec-test@dotfiles-v1+standalone
+tests/shdeps_ui_render.rs	standalone:new
 tests/temp.rs	standalone:new
 tests/test-command-test	standalone:new
 tests/test-lifecycle-test	dotfiles:.local/lib/dotfiles/tests/core/runner.sh@dotfiles-v2+standalone
