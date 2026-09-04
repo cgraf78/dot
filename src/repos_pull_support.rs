@@ -111,3 +111,90 @@ pub fn pull_cmd(quiet: bool, program: &str, args: &[&str]) -> i32 {
         Err(_) => 127,
     }
 }
+
+/// `_pull_overlay_result_prefix`: `<dir>/<idx>` with the worker
+/// index zero-padded to three, exactly like `printf %s/%03d`.
+/// `idx` is always a worker counter in practice.
+pub fn result_prefix(dir: &str, idx: i64) -> String {
+    format!("{dir}/{idx:03}")
+}
+
+/// Worker-fleet tally behind `_pull_overlay_record_status`:
+/// per-status counters plus the changed-items accumulator the
+/// deferred stage finish reports through.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PullTally {
+    /// `DOT_PULL_OVERLAY_FAILED`.
+    pub failed: u64,
+    /// `DOT_PULL_OVERLAY_CHANGED`.
+    pub changed: u64,
+    /// `DOT_PULL_OVERLAY_SKIPPED`.
+    pub skipped: u64,
+    /// `DOT_PULL_OVERLAY_CURRENT`.
+    pub current: u64,
+    /// `DOT_PULL_OVERLAY_CHANGED_ITEMS`, newline-terminated lines.
+    pub changed_items: String,
+}
+
+/// `_pull_overlay_record_status`: bump the tally for `status` and
+/// return the `"<name> <status>"` summary line, or `None` for an
+/// empty status (the shell returns before appending). Unknown
+/// statuses still summarize but tally nothing, like the shell's
+/// `case` fall-through.
+pub fn record_status(name: &str, status: &str, tally: &mut PullTally) -> Option<String> {
+    if status.is_empty() {
+        return None;
+    }
+    match status {
+        "failed" => tally.failed += 1,
+        "changed" => {
+            tally.changed += 1;
+            tally.changed_items.push_str(name);
+            tally.changed_items.push_str(" dotfiles updated\n");
+        }
+        "cloned" => {
+            tally.changed += 1;
+            tally.changed_items.push_str(name);
+            tally.changed_items.push_str(" dotfiles cloned\n");
+        }
+        "skipped" => tally.skipped += 1,
+        "current" => tally.current += 1,
+        _ => {}
+    }
+    Some(format!("{name} {status}"))
+}
+
+/// `_pull_overlay_active`: a live worktree, or any entry with a
+/// configured URL. The shell also receives the overlay name and the
+/// optional flag, but neither decides.
+pub fn overlay_active(path: &std::path::Path, url: &str) -> bool {
+    crate::overlays::is_worktree(path) || !url.is_empty()
+}
+
+/// `_pull_overlay_count`: entries with a `git` sync (the default
+/// when the field is empty) that are active. Entries split like
+/// `IFS='|' read ...` over `name|path|url|conf|optional|sync`,
+/// with any surplus fields folded into the sync field.
+pub fn overlay_count(entries: &[&str]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| {
+            let mut fields = entry.split('|');
+            let _name = fields.next().unwrap_or("");
+            let path = fields.next().unwrap_or("");
+            let url = fields.next().unwrap_or("");
+            let _conf = fields.next().unwrap_or("");
+            let _optional = fields.next().unwrap_or("");
+            let rest = fields.collect::<Vec<_>>().join("|");
+            let sync = if rest.is_empty() {
+                "git"
+            } else {
+                rest.as_str()
+            };
+            if sync != "git" {
+                return false;
+            }
+            overlay_active(std::path::Path::new(path), url)
+        })
+        .count()
+}
