@@ -1395,3 +1395,387 @@ pub fn active_fallback_target(
     }
     candidate.filter(|(target, _)| !target.is_empty())
 }
+
+/// How a replacement record pins its generation: the full
+/// content identity, or the weaker pre-content device/inode pair
+/// that new publications never create (`OVERLAY_REPLACE_IDENTITY_KIND`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceIdentityKind {
+    /// Full `dev:ino:mode:size:digest` fingerprint.
+    Content,
+    /// Legacy `dev:ino` pair only.
+    Legacy,
+}
+
+impl ReplaceIdentityKind {
+    /// The shell spelling carried in records and variables.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplaceIdentityKind::Content => "content",
+            ReplaceIdentityKind::Legacy => "legacy",
+        }
+    }
+}
+
+/// One validated replacement record: the seven
+/// `OVERLAY_REPLACE_*` values `_overlay_replacement_read`
+/// publishes as globals, as one owned value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceRecord {
+    /// Guarded destination path.
+    pub destination: String,
+    /// Physical leaf the destination resolved to.
+    pub physical: String,
+    /// Link target the transaction installs.
+    pub target: String,
+    /// Expected generation fingerprint.
+    pub expected: String,
+    /// Which fingerprint shape `expected` carries.
+    pub identity_kind: ReplaceIdentityKind,
+    /// The `.dot-overlay-replace-v1` directory.
+    pub transaction: String,
+    /// `dev:ino` of the physical parent at publish time.
+    pub parent_identity: String,
+}
+
+/// `_overlay_replacement_record_path`: the record name for
+/// `destination` beside `manifest`. The derivation never fails —
+/// only a failed hash does.
+pub fn replacement_record_path(
+    destination: &str,
+    manifest: &str,
+    source_root: &Path,
+) -> Option<String> {
+    // `printf '%s' "$destination" | _overlay_replacement_hash_object --stdin`.
+    let hash = temp::file_text_digest(source_root, destination.as_bytes()).ok()?;
+    Some(format!("{manifest}.replace.{hash}"))
+}
+
+/// `mktemp -d` under `tmp` with enforced `0700`, retrying
+/// `/dev/urandom` names like the sibling stagers (the shell's
+/// `umask 077 && mktemp -d`).
+fn stage_private_dir(tmp: &Path, prefix: &str) -> Option<PathBuf> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    for _ in 0..16 {
+        let mut suffix = [0u8; 8];
+        std::fs::File::open("/dev/urandom")
+            .ok()
+            .and_then(|mut random| random.read_exact(&mut suffix).ok())?;
+        let mut name = std::ffi::OsString::from(prefix);
+        for byte in suffix {
+            name.push(format!("{byte:02x}"));
+        }
+        let candidate = tmp.join(&name);
+        if std::fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(&candidate)
+            .is_err()
+        {
+            continue;
+        }
+        if std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700)).is_err() {
+            let _ = std::fs::remove_dir(&candidate);
+            continue;
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+/// Feed `value` to `hash-object --stdin` inside the bare `repo`
+/// and return the trimmed hash line.
+fn hash_stdin_in(repo: &Path, value: &str) -> Option<String> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let mut child = temp::sanitized_git(repo, &["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.as_mut()?.write_all(value.as_bytes()).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// `_overlay_replacement_hash_object_format`: the exact Git hash of
+/// `value` under another object format, computed in a private
+/// throwaway bare repository. Only the two formats Git supports
+/// are accepted; the throwaway is always removed.
+pub fn replacement_hash_object_format(
+    object_format: &str,
+    value: &str,
+    tmp: &Path,
+) -> Option<String> {
+    if object_format != "sha1" && object_format != "sha256" {
+        return None;
+    }
+    let temporary = stage_private_dir(tmp, "dot-overlay-record-hash.")?;
+    // The subshell body as one closure so every path removes the
+    // throwaway and reports failure, like `status=1` does.
+    let outcome = (|| {
+        let format = format!("--object-format={object_format}");
+        let initialized = temp::sanitized_git(
+            tmp,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "--template=",
+                format.as_str(),
+                temporary.to_string_lossy().as_ref(),
+            ],
+        )
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+        if !initialized {
+            return None;
+        }
+        let hash = hash_stdin_in(&temporary, value)?;
+        if hash.is_empty() {
+            return None;
+        }
+        Some(hash)
+    })();
+    let _ = std::fs::remove_dir_all(&temporary);
+    outcome
+}
+
+/// Lowercase hex only, like the shell `^[0-9a-f]{n}$` arms
+/// (uppercase never matches, unlike `is_ascii_hexdigit`).
+fn lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `_overlay_replacement_legacy_record_path_matches`: `record`
+/// names `destination` under the *other* object format. A suffix
+/// the length of the current hash is a current name, never a
+/// legacy one.
+pub fn replacement_legacy_record_path_matches(
+    record: &str,
+    destination: &str,
+    current_hash: &str,
+    manifest: &str,
+    tmp: &Path,
+) -> bool {
+    let prefix = format!("{manifest}.replace.");
+    let suffix = match record.strip_prefix(prefix.as_str()) {
+        Some(suffix) => suffix,
+        None => return false,
+    };
+    // Byte length is exact here: any multibyte suffix fails the
+    // ASCII hex arms below, exactly like the shell.
+    if suffix.len() == current_hash.len() {
+        return false;
+    }
+    let object_format = if lower_hex(suffix, 40) {
+        "sha1"
+    } else if lower_hex(suffix, 64) {
+        "sha256"
+    } else {
+        return false;
+    };
+    // The alternate hash derives from the destination itself,
+    // so a same-length twin cannot collide.
+    replacement_hash_object_format(object_format, destination, tmp)
+        .is_some_and(|alternate| alternate == suffix)
+}
+
+/// `_overlay_replacement_generation_matches`: the live generation
+/// at `path` still equals `expected` under `identity_kind`. A
+/// failed fingerprint fails (the shell `|| return 1`), unlike the
+/// quarantine halves' empty-compare shape.
+pub fn replacement_generation_matches(
+    path: &Path,
+    expected: &str,
+    identity_kind: &str,
+    source_root: &Path,
+) -> bool {
+    match identity_kind {
+        "content" => {
+            replacement_identity(source_root, path).is_ok_and(|observed| observed == expected)
+        }
+        // Plain `stat` never takes `-L` in this domain: like the
+        // content fingerprint's halves, the legacy pair is the
+        // leaf's own device and inode, so a link answers itself —
+        // never its target. (`temp::path_identity` follows and
+        // does not apply here.)
+        "legacy" => live_generation(path)
+            .map(|(identity, _)| identity)
+            .is_ok_and(|observed| observed == expected),
+        _ => false,
+    }
+}
+
+/// `_overlay_replacement_transaction_safe`: a private directory
+/// holding only the `next`/`previous` staging links. Directory
+/// listing includes dotfiles (the shell `dotglob`), but never
+/// `.`/`..` on either side.
+pub fn replacement_transaction_safe(transaction: &Path, euid: u32) -> bool {
+    if !private_directory(transaction, euid) {
+        return false;
+    }
+    std::fs::read_dir(transaction).is_ok_and(|entries| {
+        entries.filter_map(|entry| entry.ok()).all(|entry| {
+            matches!(
+                entry.file_name().to_string_lossy().as_ref(),
+                "next" | "previous"
+            )
+        })
+    })
+}
+
+/// ASCII digits, nonempty.
+fn digit_field(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// `dev:ino`: exactly two digit fields.
+fn legacy_identity_shape(value: &str) -> bool {
+    let mut fields = value.split(':');
+    matches!((fields.next(), fields.next(), fields.next()), (Some(dev), Some(ino), None) if digit_field(dev) && digit_field(ino))
+}
+
+/// `dev:ino:modehex:size:digest`: the content fingerprint shape.
+/// The metadata field accepts either hex case (like the shell
+/// `[0-9A-Fa-f]+` arm); the digest is lowercase only.
+fn content_identity_shape(value: &str) -> bool {
+    let fields: Vec<&str> = value.split(':').collect();
+    if fields.len() != 5 {
+        return false;
+    }
+    digit_field(fields[0])
+        && digit_field(fields[1])
+        && !fields[2].is_empty()
+        && fields[2].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && digit_field(fields[3])
+        && (lower_hex(fields[4], 40) || lower_hex(fields[4], 64))
+}
+
+/// `_overlay_replacement_read`: validate one private record file
+/// into its fields. `tmp` stages the throwaway repository behind
+/// the legacy-name check. Every shape below mirrors one shell
+/// gate, in order: private file, single line, six tab fields with
+/// an empty remainder, absolute paths, a clean target, a shaped
+/// parent identity, a shaped expectation, the record-name binding
+/// (or its legacy proof), and the derived transaction path.
+pub fn replacement_read(
+    record: &Path,
+    manifest: &str,
+    euid: u32,
+    source_root: &Path,
+    tmp: &Path,
+) -> Option<ReplaceRecord> {
+    if !private_regular_file(record, euid) {
+        return None;
+    }
+    let content = std::fs::read(record).ok()?;
+    // `line=$(<"$record")`: every trailing newline stripped, any
+    // other newline rejected.
+    let line = String::from_utf8_lossy(&content);
+    let line = line.trim_end_matches('\n');
+    if line.contains('\n') {
+        return None;
+    }
+    let mut fields = line.split('\t');
+    let destination = fields.next().unwrap_or("");
+    let physical = fields.next().unwrap_or("");
+    let target = fields.next().unwrap_or("");
+    let expected = fields.next().unwrap_or("");
+    let transaction = fields.next().unwrap_or("");
+    let parent_identity = fields.next().unwrap_or("");
+    // `read` parks surplus words in the last name with their
+    // delimiters, so the remainder must rejoin empty.
+    if !fields.collect::<Vec<_>>().join("\t").is_empty() {
+        return None;
+    }
+    if !destination.starts_with('/') || !physical.starts_with('/') || !transaction.starts_with('/')
+    {
+        return None;
+    }
+    if target.contains('\r') {
+        return None;
+    }
+    if !legacy_identity_shape(parent_identity) {
+        return None;
+    }
+    let identity_kind = if content_identity_shape(expected) {
+        ReplaceIdentityKind::Content
+    } else if legacy_identity_shape(expected) {
+        ReplaceIdentityKind::Legacy
+    } else {
+        return None;
+    };
+    // The record name binds the destination under the current
+    // hash; hashing failure fails like the shell `|| return 1`.
+    let current = temp::file_text_digest(source_root, destination.as_bytes()).ok()?;
+    let expected_record = format!("{manifest}.replace.{current}");
+    if record.as_os_str().as_bytes() != expected_record.as_bytes() {
+        if identity_kind != ReplaceIdentityKind::Legacy {
+            return None;
+        }
+        if !replacement_legacy_record_path_matches(
+            &record.to_string_lossy(),
+            destination,
+            &current,
+            manifest,
+            tmp,
+        ) {
+            return None;
+        }
+    }
+    // `${physical%/*}/.${physical##*/}.dot-overlay-replace-v1`.
+    let (parent, base) = physical.rsplit_once('/')?;
+    if transaction != format!("{parent}/.{base}.dot-overlay-replace-v1") {
+        return None;
+    }
+    Some(ReplaceRecord {
+        destination: destination.to_string(),
+        physical: physical.to_string(),
+        target: target.to_string(),
+        expected: expected.to_string(),
+        identity_kind,
+        transaction: transaction.to_string(),
+        parent_identity: parent_identity.to_string(),
+    })
+}
+
+/// `_overlay_replacement_cleanup`: drop a staged `next` link that
+/// still names `target`, then require `previous` absent and remove
+/// the transaction directory and the record. The final `rm -f`
+/// succeeds on a missing record, but reports real removals.
+pub fn replacement_cleanup(record: &Path, transaction: &Path, target: &str) -> bool {
+    let next = transaction.join("next");
+    if any_presence(&next) {
+        // `[[ -L ... && $(readlink) == ... ]]`: a non-link, an
+        // unreadable link, or a renamed target all fail.
+        let staged = std::fs::symlink_metadata(&next)
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+            && readlink_stripped(&next).is_some_and(|link| link == target.as_bytes());
+        if !staged || std::fs::remove_file(&next).is_err() {
+            return false;
+        }
+    }
+    if any_presence(&transaction.join("previous")) {
+        return false;
+    }
+    if std::fs::remove_dir(transaction).is_err() {
+        return false;
+    }
+    match std::fs::remove_file(record) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
