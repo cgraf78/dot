@@ -307,6 +307,9 @@ fn specs_rows_agree() {
         &[(b"10-foo.sh", b'f'), (b"10_foo.sh", b'f')],
     );
     // Non-UTF8 invalid name: the stderr message carries raw bytes.
+    // APFS rejects invalid UTF-8 names at creation, so this row
+    // lives on non-macOS Unix only.
+    #[cfg(all(unix, not(target_os = "macos")))]
     check_specs_row("specs-nonutf8", &[(b"aa.sh", b'f'), (b"\xff.sh", b'f')]);
 }
 
@@ -476,10 +479,13 @@ fn source_rows_agree() {
         ("source-space", &b"a b"[..]),
         ("source-tab", &b"a\tb"[..]),
         ("source-ext", &b"a.sh"[..]),
-        ("source-nonutf8", &b"a\xffb"[..]),
     ] {
         check_source_row(tag, relative, true, 0);
     }
+    // Non-UTF8 valid shape with fixture: APFS rejects invalid UTF-8
+    // names at creation, so this row lives on non-macOS Unix only.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    check_source_row("source-nonutf8", b"a\xffb", true, 0);
     // Rejected shapes (no fixture: rejection precedes any I/O).
     for (tag, relative) in [
         ("source-empty", &b""[..]),
