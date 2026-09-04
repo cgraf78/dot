@@ -320,7 +320,7 @@ fn each_group(order: &[Vec<u8>], mut visit: impl FnMut(&[u8])) {
 /// Whether the threshold branch fires: both sides parse canonical
 /// and elapsed reaches the threshold, like the shell
 /// `[[ -n "$threshold" && "$elapsed_ms" -ge "$threshold" ]]`. Any
-/// unparseable side reads false, matching the shell except for
+/// unparsable side reads false, matching the shell except for
 /// identifier-like spellings against a non-positive threshold, where
 /// the shell's unset-variable read fires the branch (the module
 /// header draws that rowed boundary). A shell arithmetic diagnostic,
