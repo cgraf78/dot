@@ -2,7 +2,9 @@
 //! `lib/dot/repos/overlays.sh`: link-target derivation, manifest
 //! record parsing, the manifest safety gate, the managed-generation
 //! fingerprint, the destination context, the quarantine orchestrator,
-//! and the restore/commit halves of quarantined links.
+//! the restore/commit halves of quarantined links, and the publish
+//! leaf layer (link recording and matching, ownership gates, and
+//! private writers).
 //!
 //! Two engine boundaries apply. Values cross from bytes to `String`
 //! via lossy conversion (the `profiles` precedent), so a non-UTF8
@@ -15,11 +17,13 @@
 //! existing owned unreadable manifest reads safe (with bash's own
 //! redirect error on stderr, which carries no engine meaning).
 
+use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::errors::{Error, Result};
+use crate::repos_base;
 use crate::reserved;
 use crate::temp;
 use crate::xdg;
@@ -463,40 +467,12 @@ pub struct DestinationContext {
 /// like `_dot_reserved_roots_snapshot || return 0`.
 pub fn destination_context(rel: &str, inputs: &DestinationInputs) -> Option<DestinationContext> {
     let destination = format!("{}/{}", inputs.home, rel);
-    let state_home = xdg::base(
-        xdg::Kind::State,
-        inputs.xdg_state_home.as_deref().unwrap_or(""),
-        &inputs.home,
-    )
-    .ok()?;
-    let install_root = inputs
-        .install_dir
-        .clone()
-        .unwrap_or_else(|| format!("{}/.local/share", inputs.home));
-    let checkout = format!("{install_root}/cgraf78/dot");
-    let provider_state = inputs
-        .state_dir
-        .clone()
-        .unwrap_or_else(|| format!("{state_home}/shdeps"));
-    let roots = match reserved::reserved_roots(
-        &reserved::RootsInput {
-            home: inputs.home.clone(),
-            state_home,
-            install_root,
-            provider_state,
-            overlay_paths: inputs.overlay_paths.clone(),
-            init_backup: inputs.init_backup.clone(),
-        },
-        &inputs.pwd,
-    ) {
-        Ok(roots) => roots,
-        Err(_) => return None,
-    };
+    let roots = reserved_roots_for(inputs)?;
     if reserved::candidate_path_is_reserved_from_roots(
         &destination,
         &roots,
         &inputs.home,
-        &checkout,
+        &checkout_for(inputs),
         &inputs.pwd,
     ) {
         return None;
@@ -689,4 +665,334 @@ pub fn quarantine_rollback_link(rel: &str, inputs: &QuarantineInputs) -> Quarant
         stage,
         expected,
     })
+}
+
+/// `_overlay_record_link_target`: the link target one overlay
+/// publishes for `rel`. `sync` selects the derivation (`None`
+/// applies the shell's `git` default); anything else is not a
+/// publishable source.
+pub fn record_link_target(rel: &str, name: &str, path: &str, sync: Option<&str>) -> Option<String> {
+    match sync.unwrap_or("git") {
+        // Like `_overlay_link_target`, the derivation never fails.
+        "git" => Some(link_target(rel, name)),
+        "none" => Some(format!("{path}/home/{rel}")),
+        _ => None,
+    }
+}
+
+/// `_overlay_link_matches`: the home link for `rel` reads back
+/// `target` — the explicit expectation, or the overlay derivation
+/// when `None`. Like `$(readlink)`, trailing newlines in the link
+/// bytes compare stripped.
+pub fn link_matches(home: &str, rel: &str, name: &str, target: Option<&str>) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let expected = match target {
+        Some(target) => target.to_string(),
+        None => link_target(rel, name),
+    };
+    if expected.is_empty() {
+        return false;
+    }
+    let destination = format!("{home}/{rel}");
+    std::fs::symlink_metadata(&destination).is_ok_and(|meta| meta.file_type().is_symlink())
+        && readlink_stripped(Path::new(&destination))
+            .is_some_and(|link| link == expected.as_bytes())
+}
+
+/// `_overlay_active_provides`: some overlay ships `rel` as a file or
+/// link, independent of any manifest. The sync discipline is
+/// deliberately ignored here, exactly like the shell loop.
+pub fn active_provides(overlays: &[String], rel: &str) -> bool {
+    overlays.iter().any(|entry| {
+        let (path, _) = repos_base::overlay_path_sync(entry);
+        let shipped = format!("{path}/home/{rel}");
+        std::fs::symlink_metadata(&shipped)
+            .is_ok_and(|meta| meta.is_file() || meta.file_type().is_symlink())
+    })
+}
+
+/// `_overlay_active_link_matches`: some overlay both ships `rel` and
+/// owns the live home link for it.
+pub fn active_link_matches(home: &str, overlays: &[String], rel: &str) -> bool {
+    overlays.iter().any(|entry| {
+        let name = entry.split('|').next().unwrap_or("");
+        let (path, sync) = repos_base::overlay_path_sync(entry);
+        let target = match record_link_target(rel, name, &path, Some(&sync)) {
+            Some(target) => target,
+            None => return false,
+        };
+        let shipped = format!("{path}/home/{rel}");
+        std::fs::symlink_metadata(&shipped)
+            .is_ok_and(|meta| meta.is_file() || meta.file_type().is_symlink())
+            && link_matches(home, rel, name, Some(&target))
+    })
+}
+
+/// `_overlay_authority_link_matches`: the live home link reads back
+/// a recorded `(rel, target)` authority pair.
+pub fn authority_link_matches(home: &str, targets: &[(String, String)], rel: &str) -> bool {
+    let destination = format!("{home}/{rel}");
+    let link = match readlink_stripped(Path::new(&destination)) {
+        Some(link) => link,
+        None => return false,
+    };
+    // `readlink` on a non-link fails, matching `[[ -L ]]` gating
+    // the shell's read.
+    if !std::fs::symlink_metadata(&destination).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return false;
+    }
+    targets
+        .iter()
+        .any(|(path, target)| path == rel && target.as_bytes() == link.as_slice())
+}
+
+/// `_overlay_pending_manifest_path`: the deterministic pending path
+/// beside the manifest, discoverable after an unclean exit.
+pub fn pending_manifest_path(manifest: &str) -> String {
+    format!("{manifest}.pending")
+}
+
+/// The per-rel authority verdict cache behind
+/// `_overlay_path_authority_cache`: while enabled, the first verdict
+/// pins later queries; while disabled, every query re-evaluates.
+#[derive(Debug, Clone, Default)]
+pub struct AuthorityCache {
+    enabled: bool,
+    entries: HashMap<String, bool>,
+}
+
+impl AuthorityCache {
+    /// Cache that re-evaluates every query.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Cache that pins the first verdict per rel.
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+/// Reserved roots for [`path_is_authority`]: the
+/// `_overlay_reserved_roots` newline-joined snapshot string, or the
+/// live inventory computed from `inputs` like
+/// `dot_candidate_path_is_reserved`.
+fn authority_roots(inputs: &DestinationInputs, roots: Option<&str>) -> Option<Vec<String>> {
+    match roots {
+        Some(snapshot) => Some(
+            snapshot
+                .split('\n')
+                .filter(|root| !root.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        None => reserved_roots_for(inputs),
+    }
+}
+
+/// The reserved-roots inventory behind both [`destination_context`]
+/// and [`path_is_authority`]: `None` reads reserved (fail closed),
+/// exactly like `_dot_reserved_roots_snapshot || return 0`.
+fn reserved_roots_for(inputs: &DestinationInputs) -> Option<Vec<String>> {
+    let state_home = xdg::base(
+        xdg::Kind::State,
+        inputs.xdg_state_home.as_deref().unwrap_or(""),
+        &inputs.home,
+    )
+    .ok()?;
+    let install_root = inputs
+        .install_dir
+        .clone()
+        .unwrap_or_else(|| format!("{}/.local/share", inputs.home));
+    let provider_state = inputs
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| format!("{state_home}/shdeps"));
+    reserved::reserved_roots(
+        &reserved::RootsInput {
+            home: inputs.home.clone(),
+            state_home,
+            install_root,
+            provider_state,
+            overlay_paths: inputs.overlay_paths.clone(),
+            init_backup: inputs.init_backup.clone(),
+        },
+        &inputs.pwd,
+    )
+    .ok()
+}
+
+/// Checkout root for the install-reserved check, shared by the
+/// destination and authority gates.
+fn checkout_for(inputs: &DestinationInputs) -> String {
+    let install_root = inputs
+        .install_dir
+        .clone()
+        .unwrap_or_else(|| format!("{}/.local/share", inputs.home));
+    format!("{install_root}/cgraf78/dot")
+}
+
+/// `_overlay_path_is_authority`: `rel` is overlay-owned — an overlay
+/// control path, the manifests themselves, or a reserved candidate.
+/// `roots` selects the `_overlay_reserved_roots` snapshot string or
+/// the live inventory; the shell's nonzero error shapes all read
+/// unauthoritative, so the verdict is a plain bool.
+pub fn path_is_authority(
+    home: &str,
+    rel: &str,
+    manifest: &str,
+    legacy_manifest: &str,
+    inputs: &DestinationInputs,
+    roots: Option<&str>,
+    cache: &mut AuthorityCache,
+) -> bool {
+    if cache.enabled {
+        if let Some(verdict) = cache.entries.get(rel) {
+            return *verdict;
+        }
+    }
+    let destination = format!("{home}/{rel}");
+    let pending = pending_manifest_path(manifest);
+    let verdict = if reserved::overlay_control_path_reserved(rel)
+        || destination == manifest
+        || destination == legacy_manifest
+        || destination == pending
+    {
+        true
+    } else {
+        match authority_roots(inputs, roots) {
+            Some(roots) => reserved::candidate_path_is_reserved_from_roots(
+                &destination,
+                &roots,
+                home,
+                &checkout_for(inputs),
+                &inputs.pwd,
+            ),
+            None => true,
+        }
+    };
+    if cache.enabled {
+        cache.entries.insert(rel.to_string(), verdict);
+    }
+    verdict
+}
+
+/// `_overlay_skip_worktree`: the base index carries a skip-worktree
+/// bit for `rel`. A missing topology (or failed `git`) reads
+/// unskipped, like the shell's empty `ls-files` capture.
+pub fn skip_worktree(base: &repos_base::Base, rel: &str) -> bool {
+    let prefix = match base.git_prefix() {
+        Some(prefix) => prefix,
+        None => return false,
+    };
+    repos_base::run_git(&prefix, &["ls-files", "-v", "--", rel])
+        .is_some_and(|output| output.stdout.get(..2) == Some(b"S ".as_slice()))
+}
+
+/// `_overlay_tracked_path_clean`: `rel` is visible to Git and
+/// unchanged from the index — no skip-worktree bit and a quiet
+/// diff. A failed `git` reads dirty.
+pub fn tracked_path_clean(base: &repos_base::Base, rel: &str) -> bool {
+    if skip_worktree(base, rel) {
+        return false;
+    }
+    let prefix = match base.git_prefix() {
+        Some(prefix) => prefix,
+        None => return false,
+    };
+    repos_base::run_git(&prefix, &["diff", "--quiet", "--", rel])
+        .is_some_and(|output| output.status.success())
+}
+
+/// `_overlay_write_private_line`: atomically create `destination`
+/// holding `line` plus a newline, mode `0600`, refusing existing
+/// files and links. The temporary sibling plus noreplace rename
+/// mirrors `mktemp` plus `_dot_move_noreplace`; the suffix alphabet
+/// differs, which is not contractual.
+pub fn write_private_line(
+    destination: &Path,
+    line: &str,
+    euid: u32,
+    tool: &temp::MoveTool,
+) -> bool {
+    if std::fs::symlink_metadata(destination).is_ok() {
+        return false;
+    }
+    let mut contents = line.to_string();
+    contents.push('\n');
+    let temporary = match stage_sibling(destination, contents.as_bytes()) {
+        Some(temporary) => temporary,
+        None => return false,
+    };
+    let done = temp::move_noreplace_with(&temporary, destination, tool).is_ok()
+        && private_regular_file(destination, euid);
+    if !done {
+        let _ = std::fs::remove_file(&temporary);
+        return false;
+    }
+    true
+}
+
+/// `mktemp "${destination}.tmp.XXXXXX"` plus `chmod 0600` and the
+/// line write: an exclusively-created `0600` sibling. Creation,
+/// chmod, then write matches the shell order, so no signal window
+/// leaves content at umask permissions.
+fn stage_sibling(destination: &Path, contents: &[u8]) -> Option<PathBuf> {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let parent = destination.parent()?;
+    let mut prefix = destination.file_name().unwrap_or_default().to_os_string();
+    prefix.push(".tmp.");
+    for _ in 0..16 {
+        let mut suffix = [0u8; 8];
+        std::fs::File::open("/dev/urandom")
+            .ok()
+            .and_then(|mut random| random.read_exact(&mut suffix).ok())?;
+        let mut name = prefix.clone();
+        for byte in suffix {
+            name.push(format!("{byte:02x}"));
+        }
+        let candidate = parent.join(&name);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        match options.open(&candidate) {
+            Ok(file) => drop(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+        if std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600)).is_err() {
+            let _ = std::fs::remove_file(&candidate);
+            return None;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&candidate)
+            .ok()?;
+        if file.write_all(contents).is_err() {
+            let _ = std::fs::remove_file(&candidate);
+            return None;
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+/// `_overlay_private_directory`: an owned real directory with no
+/// group/other permission bits. The shell's octal-digit guard is
+/// subsumed by computing the bits directly.
+pub fn private_directory(path: &Path, euid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return false,
+    };
+    meta.is_dir() && meta.uid() == euid && meta.mode() & 0o077 == 0
 }
