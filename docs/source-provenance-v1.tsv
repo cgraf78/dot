@@ -124,6 +124,7 @@ tests/repos_quarantine.rs	standalone:new
 tests/repos_pull_normalize.rs	standalone:new
 tests/repos_pull_queries.rs	standalone:new
 tests/repos_pull_support.rs	standalone:new
+tests/repos_restore.rs	standalone:new
 tests/run.rs	standalone:new
 tests/progress_ui.rs	standalone:new
 tests/reserved.rs	standalone:new
