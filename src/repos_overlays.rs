@@ -2,9 +2,11 @@
 //! `lib/dot/repos/overlays.sh`: link-target derivation, manifest
 //! record parsing, the manifest safety gate, the managed-generation
 //! fingerprint, the destination context, the quarantine orchestrator,
-//! the restore/commit halves of quarantined links, and the publish
-//! leaf layer (link recording and matching, ownership gates, and
-//! private writers).
+//! the restore/commit halves of quarantined links, the publish leaf
+//! layer (link recording and matching, ownership gates, and private
+//! writers), and the pending/fallback publishers (authority
+//! discovery and loading, candidate appending, and the pending and
+//! fallback-authority publishers).
 //!
 //! Two engine boundaries apply. Values cross from bytes to `String`
 //! via lossy conversion (the `profiles` precedent), so a non-UTF8
@@ -17,7 +19,7 @@
 //! existing owned unreadable manifest reads safe (with bash's own
 //! redirect error on stderr, which carries no engine meaning).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -995,4 +997,401 @@ pub fn private_directory(path: &Path, euid: u32) -> bool {
         Err(_) => return false,
     };
     meta.is_dir() && meta.uid() == euid && meta.mode() & 0o077 == 0
+}
+
+/// `_overlay_authority_files` selection: the pending path plus
+/// the existing regular manifests, in candidate order with
+/// duplicates removed (`OVERLAY_AUTHORITY_MANIFESTS`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityFiles {
+    /// The write-ahead manifest path (`REPLY`).
+    pub pending: String,
+    /// Existing safe manifests, selected/legacy/pending order.
+    pub manifests: Vec<String>,
+}
+
+/// `-e || -L`: any filesystem presence, dangling links included.
+fn any_presence(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// `-f && ! -L`: a real regular file, never a symlink (the lstat
+/// view already excludes links, so no follow is needed).
+fn regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
+/// `_overlay_authority_files`: the pending path plus every existing
+/// safe manifest. The error carries the unsafe path (`REPLY` on
+/// failure): the selected manifest, then the pending one, then
+/// whichever candidate fails the second pass.
+pub fn authority_files(
+    manifest: &str,
+    legacy_manifest: &str,
+    euid: u32,
+) -> std::result::Result<AuthorityFiles, String> {
+    let pending = pending_manifest_path(manifest);
+    let manifest_path = Path::new(manifest);
+    let pending_path = Path::new(&pending);
+    if any_presence(manifest_path) && !manifest_safe(manifest_path, euid) {
+        return Err(manifest.to_string());
+    }
+    if any_presence(pending_path) && !pending_manifest_safe(pending_path, euid) {
+        return Err(pending.clone());
+    }
+    let mut manifests = Vec::new();
+    for candidate in [manifest, legacy_manifest, pending.as_str()] {
+        let path = Path::new(candidate);
+        if !regular_file(path) {
+            continue;
+        }
+        let safe = if candidate == pending {
+            pending_manifest_safe(path, euid)
+        } else {
+            manifest_safe(path, euid)
+        };
+        if !safe {
+            return Err(candidate.to_string());
+        }
+        if !manifests.iter().any(|seen| seen == candidate) {
+            manifests.push(candidate.to_string());
+        }
+    }
+    Ok(AuthorityFiles { pending, manifests })
+}
+
+/// Shared authority context behind the publish entry points,
+/// replacing the shell's `HOME` / `DOT_OVERLAY_MANIFEST` /
+/// `DOT_OVERLAY_LEGACY_MANIFEST` / reserved-roots environment and
+/// the dynamically scoped authority maps with explicit values.
+#[derive(Debug)]
+pub struct AuthorityCtx<'a> {
+    /// Client home directory (`$HOME`).
+    pub home: &'a str,
+    /// Selected manifest (`$DOT_OVERLAY_MANIFEST`).
+    pub manifest: &'a str,
+    /// Legacy manifest (`$DOT_OVERLAY_LEGACY_MANIFEST`).
+    pub legacy_manifest: &'a str,
+    /// Reserved-roots inputs for authority verdicts.
+    pub inputs: &'a DestinationInputs,
+    /// `_overlay_reserved_roots` snapshot, or live inventory.
+    pub roots: Option<&'a str>,
+    /// Per-rel authority verdict cache.
+    pub cache: &'a mut AuthorityCache,
+    /// Caller uid for the manifest safety gates.
+    pub euid: u32,
+}
+
+/// `_overlay_load_authority` accumulation: live non-authority rels
+/// (`_overlay_authority_paths`) and their recorded `(rel, target)`
+/// pairs (`_overlay_authority_targets`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthorityData {
+    /// Live non-authority rels.
+    pub paths: HashSet<String>,
+    /// Recorded `(rel, target)` pairs for live rels.
+    pub targets: HashSet<(String, String)>,
+}
+
+/// `_overlay_load_authority`: union every authority manifest into
+/// owned sets, skipping authority-owned rels. A missing manifest
+/// read or an unparsable record fails with the pending path (the
+/// shell's untouched `REPLY`).
+pub fn load_authority(ctx: &mut AuthorityCtx<'_>) -> std::result::Result<AuthorityData, String> {
+    let found = authority_files(ctx.manifest, ctx.legacy_manifest, ctx.euid)?;
+    let mut data = AuthorityData::default();
+    for manifest in &found.manifests {
+        let content = std::fs::read(manifest).map_err(|_| found.pending.clone())?;
+        for line in stream_lines(&content) {
+            let record = parse_manifest_record(&line).ok_or_else(|| found.pending.clone())?;
+            if path_is_authority(
+                ctx.home,
+                &record.rel,
+                ctx.manifest,
+                ctx.legacy_manifest,
+                ctx.inputs,
+                ctx.roots,
+                ctx.cache,
+            ) {
+                continue;
+            }
+            data.paths.insert(record.rel.clone());
+            data.targets.insert((record.rel, record.target));
+        }
+    }
+    Ok(data)
+}
+
+/// Lazily-opened append handle: the shell `>>` creates the
+/// destination on the first record, so an empty source never
+/// touches it (and a missing parent with no records still reads
+/// success, like the shell loop).
+fn append_line(state: &mut Option<std::fs::File>, path: &Path, line: &str) -> bool {
+    use std::io::Write as _;
+    if state.is_none() {
+        *state = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok();
+    }
+    match state {
+        Some(file) => file
+            .write_all(line.as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .is_ok(),
+        None => false,
+    }
+}
+
+/// `_overlay_append_manifest_records`: copy every non-authority
+/// record from `source` to `destination`, re-printed from the
+/// parse (which derives two-column targets, like the shell
+/// `printf`). A bad record or a failed write stops after the
+/// lines already appended, exactly like the shell `return 1`; a
+/// missing source fails without touching the destination (the
+/// failed shell redirect).
+pub fn append_manifest_records(
+    source: &Path,
+    destination: &Path,
+    ctx: &mut AuthorityCtx<'_>,
+) -> bool {
+    let content = match std::fs::read(source) {
+        Ok(content) => content,
+        Err(_) => return false,
+    };
+    let mut out = None;
+    for line in stream_lines(&content) {
+        let record = match parse_manifest_record(&line) {
+            Some(record) => record,
+            None => return false,
+        };
+        if path_is_authority(
+            ctx.home,
+            &record.rel,
+            ctx.manifest,
+            ctx.legacy_manifest,
+            ctx.inputs,
+            ctx.roots,
+            ctx.cache,
+        ) {
+            continue;
+        }
+        if !append_line(
+            &mut out,
+            destination,
+            &format!("{}\t{}\t{}", record.rel, record.owner, record.target),
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// NUL-delimited inventory entries: every terminator-delimited
+/// chunk counts (even empty ones, like the shell `read -d ''`),
+/// while an unterminated tail drops with the final split piece —
+/// the shell loop's partial-read skip.
+fn nul_records(content: &[u8]) -> Vec<&[u8]> {
+    let mut pieces: Vec<&[u8]> = content.split(|byte| *byte == 0).collect();
+    pieces.pop();
+    pieces
+}
+
+/// `_overlay_append_candidates`: record one overlay's inventory
+/// into `destination`. `sync` selects the target derivation
+/// (`None` applies the shell's `git` default). An authority-owned
+/// entry or an unpublishable sync fails the whole call (the
+/// shell's immediate `return 1`); a bad derived record or a
+/// failed write stops after earlier lines, like the shell break.
+pub fn append_candidates(
+    destination: &Path,
+    name: &str,
+    path: &str,
+    inventory: &Path,
+    sync: Option<&str>,
+    ctx: &mut AuthorityCtx<'_>,
+) -> bool {
+    if !regular_file(inventory) {
+        return false;
+    }
+    let content = match std::fs::read(inventory) {
+        Ok(content) => content,
+        Err(_) => return false,
+    };
+    let prefix = format!("{path}/home/");
+    let mut out = None;
+    for src in nul_records(&content) {
+        let src = String::from_utf8_lossy(src);
+        let rel = src.strip_prefix(prefix.as_str()).unwrap_or(&src);
+        if path_is_authority(
+            ctx.home,
+            rel,
+            ctx.manifest,
+            ctx.legacy_manifest,
+            ctx.inputs,
+            ctx.roots,
+            ctx.cache,
+        ) {
+            return false;
+        }
+        let target = match record_link_target(rel, name, path, sync) {
+            Some(target) => target,
+            None => return false,
+        };
+        let line = format!("{rel}\t{name}\t{target}");
+        if parse_manifest_record(&line).is_none() || !append_line(&mut out, destination, &line) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `_overlay_publish_pending`: freeze old authority plus every
+/// exact link target this run may create into the pending
+/// manifest before the first mutation. Returns the pending path,
+/// or `None` wherever the shell returns 1. Failure carries no
+/// reply: the shell `$REPLY` residue after a failed publish is
+/// whatever helper ran last (a reserved-path probe, not the
+/// pending path), and neither in-engine caller reads it — both
+/// return without touching `REPLY`. A failed build is always
+/// removed.
+pub fn publish_pending(
+    ctx: &mut AuthorityCtx<'_>,
+    euid: u32,
+    overlays: &[String],
+    inventories: &HashMap<String, PathBuf>,
+    tool: &temp::MoveTool,
+) -> Option<String> {
+    let found = match authority_files(ctx.manifest, ctx.legacy_manifest, euid) {
+        Ok(found) => found,
+        Err(_) => return None,
+    };
+    let pending = PathBuf::from(&found.pending);
+    let pending_exists = any_presence(&pending);
+    // `mktemp "${pending}.tmp.XXXXXX"` plus `chmod 600`: the
+    // exclusive sibling `stage_sibling` already stages.
+    let build = stage_sibling(&pending, b"")?;
+    for manifest in &found.manifests {
+        if !append_manifest_records(Path::new(manifest), &build, ctx) {
+            let _ = std::fs::remove_file(&build);
+            return None;
+        }
+    }
+    for entry in overlays {
+        let name = entry.split('|').next().unwrap_or("");
+        let (path, sync) = repos_base::overlay_path_sync(entry);
+        let inventory = match inventories.get(name) {
+            Some(inventory) => inventory,
+            None => continue,
+        };
+        if !append_candidates(&build, name, &path, inventory, Some(&sync), ctx) {
+            let _ = std::fs::remove_file(&build);
+            return None;
+        }
+    }
+    let moved = if pending_exists {
+        temp::move_replace_nodir_with(&build, &pending, tool)
+    } else {
+        temp::move_noreplace_with(&build, &pending, tool)
+    };
+    if moved.is_err() {
+        let _ = std::fs::remove_file(&build);
+        return None;
+    }
+    if !pending_manifest_safe(&pending, euid) {
+        return None;
+    }
+    Some(found.pending)
+}
+
+/// `_overlay_publish_fallback_authority`: record one fallback
+/// `(rel, owner, target)` in the pending manifest. An exact hit
+/// in current authority is a no-op success that writes nothing.
+pub fn publish_fallback_authority(
+    rel: &str,
+    owner: &str,
+    target: &str,
+    ctx: &mut AuthorityCtx<'_>,
+    euid: u32,
+    tool: &temp::MoveTool,
+) -> bool {
+    let found = match authority_files(ctx.manifest, ctx.legacy_manifest, euid) {
+        Ok(found) => found,
+        Err(_) => return false,
+    };
+    for manifest in &found.manifests {
+        let content = match std::fs::read(manifest) {
+            Ok(content) => content,
+            Err(_) => return false,
+        };
+        for line in stream_lines(&content) {
+            let record = match parse_manifest_record(&line) {
+                Some(record) => record,
+                None => return false,
+            };
+            if record.rel == rel && record.owner == owner && record.target == target {
+                return true;
+            }
+        }
+    }
+    let pending = PathBuf::from(&found.pending);
+    let pending_exists = any_presence(&pending);
+    let build = match stage_sibling(&pending, b"") {
+        Some(build) => build,
+        None => return false,
+    };
+    for manifest in &found.manifests {
+        if !append_manifest_records(Path::new(manifest), &build, ctx) {
+            let _ = std::fs::remove_file(&build);
+            return false;
+        }
+    }
+    if !append_line(&mut None, &build, &format!("{rel}\t{owner}\t{target}")) {
+        let _ = std::fs::remove_file(&build);
+        return false;
+    }
+    let moved = if pending_exists {
+        temp::move_replace_nodir_with(&build, &pending, tool)
+    } else {
+        temp::move_noreplace_with(&build, &pending, tool)
+    };
+    if moved.is_err() {
+        let _ = std::fs::remove_file(&build);
+        return false;
+    }
+    pending_manifest_safe(&pending, euid)
+}
+
+/// `_overlay_active_fallback_target`: the last publishable target
+/// any active overlay ships for `rel`, skipping `excluded` (the
+/// just-lost generation). Returns the target with its owner
+/// (`REPLY` with `REPLY_OWNER`).
+pub fn active_fallback_target(
+    rel: &str,
+    excluded: &str,
+    overlays: &[String],
+) -> Option<(String, String)> {
+    let mut candidate: Option<(String, String)> = None;
+    for entry in overlays {
+        let name = entry.split('|').next().unwrap_or("");
+        let (path, sync) = repos_base::overlay_path_sync(entry);
+        let shipped = format!("{path}/home/{rel}");
+        // `[[ -f ... || -L ... ]]`: a file (links followed) or any
+        // link, broken included.
+        let ships = std::fs::metadata(&shipped).is_ok_and(|meta| meta.is_file())
+            || std::fs::symlink_metadata(&shipped).is_ok_and(|meta| meta.file_type().is_symlink());
+        if !ships {
+            continue;
+        }
+        let target = match record_link_target(rel, name, &path, Some(&sync)) {
+            Some(target) => target,
+            None => continue,
+        };
+        if target == excluded {
+            continue;
+        }
+        candidate = Some((target, name.to_string()));
+    }
+    candidate.filter(|(target, _)| !target.is_empty())
 }
