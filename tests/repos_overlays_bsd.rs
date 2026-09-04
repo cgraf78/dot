@@ -98,7 +98,16 @@ fn fake_bsd_stat() -> TempDir {
          elif [ -f \"$file\" ]; then type=100000\n\
          else exit 1; fi\n\
          mode() { perms=$(\"$REAL\" -c '%a' \"$file\") || exit 1\n\
-           printf '%o' \"$((8#$type | 8#$perms))\"; }\n\
+           case \"$perms\" in *[!0-7]*) exit 1;; esac\n\
+           while [ \"${#perms}\" -lt 3 ]; do perms=0$perms; done\n\
+           # The type field always ends in three zeroes and the\n\
+             # setuid/setgid/sticky digit never overlaps it, so the\n\
+             # leading type digits plus the full permission field\n\
+             # compose the exact rendering with string ops alone.\n\
+           case \"$perms\" in\n\
+             ???|????) printf '%s' \"${type%???}$perms\";;\n\
+             *) exit 1;;\n\
+           esac; }\n\
          case \"$fmt\" in\n\
            '%d:%i') exec \"$REAL\" -c '%d:%i' \"$file\" ;;\n\
            '%p') mode; printf '\\n' ;;\n\
@@ -107,7 +116,7 @@ fn fake_bsd_stat() -> TempDir {
            *) exit 1 ;;\n\
          esac\n"
         .replace("{REAL}", &quoted);
-    std::fs::write(&script, body).expect("write fake stat");
+    std::fs::write(&script, &body).expect("write fake stat");
     #[cfg(unix)]
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod fake");
     dir
@@ -129,8 +138,26 @@ fn bsd_stat_octal_mode_agrees() {
     }
     let dir = TempDir::new("ovlink-bsd").expect("fixture dir");
     let home = dir.path();
-    stage(home, "doc.txt", b"payload\n");
+    let doc = stage(home, "doc.txt", b"payload\n");
     std::os::unix::fs::symlink("doc.txt", home.join("link")).expect("symlink");
+    // Simulator self-checks: the fake must reject the GNU probe and
+    // render BSD shapes itself, or every mismatch below would blame
+    // the wrong engine.
+    let probe = Command::new("stat")
+        .args(["-c", "%f", "/"])
+        .output()
+        .expect("run fake stat probe");
+    assert!(!probe.status.success(), "fake stat must reject -c like BSD");
+    let rendered = Command::new("stat")
+        .args(["-f", "%p:%z"])
+        .arg(&doc)
+        .output()
+        .expect("run fake stat render");
+    assert_eq!(
+        String::from_utf8(rendered.stdout).expect("render text"),
+        "100644:8\n",
+        "fake stat must render BSD octal itself"
+    );
     // (name, BSD `%p` pin): octal proves the BSD branch — the GNU
     // branch would render `81a4` / `a1ff` here.
     for (name, mode_pin) in [("doc.txt", ":100644:8:"), ("link", ":120777:7:")] {
