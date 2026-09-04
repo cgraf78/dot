@@ -234,19 +234,63 @@ pub fn link_target_available(rel: &str, target: &str, home: &str) -> bool {
         || std::fs::metadata(source).is_ok_and(|meta| meta.is_file())
 }
 
+/// True when the host `stat` speaks GNU: `stat -c '%f'` renders the
+/// raw mode as lowercase hex, while the BSD `stat -f '%p'` fallback
+/// renders it as octal. Probed once per process in the shell's own
+/// `||` order (like [`temp::MoveCache`] probes the move tool), so the
+/// branch decision agrees with the shell on every host — including a
+/// host with neither flavor, which fails exactly where the shell's
+/// probe chain fails.
+fn gnu_stat_flavor() -> Result<bool> {
+    static FLAVOR: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    match FLAVOR.get_or_init(|| {
+        if stat_probe(&["-c", "%f"]) {
+            Some(true)
+        } else if stat_probe(&["-f", "%p"]) {
+            Some(false)
+        } else {
+            None
+        }
+    }) {
+        Some(gnu) => Ok(*gnu),
+        None => Err(Error::Usage {
+            message: "no working stat flavor",
+        }),
+    }
+}
+
+/// One branch of the `stat` probe against `/`, quietly: success
+/// decides, exactly like the shell's `2>/dev/null ||` chain.
+fn stat_probe(args: &[&str]) -> bool {
+    std::process::Command::new("stat")
+        .args(args)
+        .arg("/")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Leaf identity plus `mode:size` for one path: the two halves
 /// `_overlay_replacement_identity` rechecks after hashing.
 fn live_generation(path: &Path) -> Result<(String, String)> {
     // No `-L` anywhere in this domain: plain `stat` reports the leaf
     // itself, so a link carries its own device, inode, raw mode, and
-    // target-byte length — never its target's.
+    // target-byte length — never its target's. The mode rendering
+    // follows the probed flavor: GNU hex, BSD octal.
     let meta = std::fs::symlink_metadata(path).map_err(|source| Error::Io {
         context: "stat replacement generation",
         source,
     })?;
+    let mode = if gnu_stat_flavor()? {
+        format!("{:x}", meta.mode())
+    } else {
+        format!("{:o}", meta.mode())
+    };
     Ok((
         format!("{}:{}", meta.dev(), meta.ino()),
-        format!("{:x}:{}", meta.mode(), meta.size()),
+        format!("{mode}:{}", meta.size()),
     ))
 }
 
