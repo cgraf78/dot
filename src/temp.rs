@@ -33,7 +33,9 @@ use crate::errors::{Error, Result};
 const TMP_SUFFIX_LEN: usize = 6;
 /// Retries for a colliding sibling-temp name before giving up; the
 /// counter fallback below makes even one collision unlikely.
-const TMP_RETRIES: usize = 100;
+/// Crate-visible so the init transaction stage allocator shares the
+/// exact retry budget instead of inventing a second one.
+pub(crate) const TMP_RETRIES: usize = 100;
 
 /// True when `path` carries a byte the transaction layer rejects
 /// outright: newline, carriage return, or tab. The shell tests
@@ -95,7 +97,9 @@ pub fn sibling_tmp_for(dst: &Path) -> Result<PathBuf> {
 /// Six mktemp-alphabet characters from `/dev/urandom`; pid, time, and
 /// a process-wide counter mixed in when urandom is unavailable, so the
 /// fallback is still unique per call within a process.
-fn random_suffix() -> String {
+/// Crate-visible so the init transaction stage allocator draws from
+/// the same mktemp alphabet instead of duplicating the generator.
+pub(crate) fn random_suffix() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut bytes = [0u8; TMP_SUFFIX_LEN];
