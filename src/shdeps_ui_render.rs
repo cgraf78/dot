@@ -437,7 +437,9 @@ pub fn print_verbose_items(
         let (bytes, live) =
             crate::progress_ui::section(ui.palette, ui.quiet, live_active, &label, ui.multibyte);
         out.extend_from_slice(&bytes);
-        live_active = live;
+        // No store to `live_active` here: the next call threads the
+        // section's live flag directly, and the store below would
+        // overwrite it unread (`unused_assignments` on CI).
         let (rows, live) =
             print_verbose_group_rows(ui, live, order, items, labels, fallback, &label);
         out.extend_from_slice(&rows);
