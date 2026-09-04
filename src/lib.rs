@@ -17,6 +17,7 @@ pub mod doctor_paths;
 pub mod doctor_runtime;
 pub mod errors;
 pub mod extension_trust;
+pub mod extension_worker;
 pub mod families;
 pub mod glob;
 pub mod hook_api;
