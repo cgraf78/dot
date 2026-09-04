@@ -419,6 +419,206 @@ pub fn commit_quarantined_link(
     Ok(())
 }
 
+/// Inputs for [`restore_installed_links`], replacing the shell's
+/// `DOT_OVERLAY_ROLLBACK_PATHS` / `DOT_OVERLAY_ROLLBACK_TARGETS`
+/// arrays, `OVERLAYS`, manifest selection, and tool bindings with
+/// explicit values.
+pub struct RestoreInstalledInputs<'a> {
+    /// Base checkout for tracked queries and skip-worktree marking.
+    pub base: &'a repos_base::Base,
+    /// Client `$HOME`.
+    pub home: &'a str,
+    /// Rollback snapshot paths (`DOT_OVERLAY_ROLLBACK_PATHS`).
+    pub rels: &'a [String],
+    /// Rollback snapshot targets (`DOT_OVERLAY_ROLLBACK_TARGETS`).
+    pub targets: &'a [String],
+    /// Overlay records (`OVERLAYS`).
+    pub overlays: &'a [String],
+    /// Reserved-roots environment for destination resolution.
+    pub dest: &'a DestinationInputs,
+    /// Selected manifest (`$DOT_OVERLAY_MANIFEST`).
+    pub manifest: &'a str,
+    /// Legacy manifest (`$DOT_OVERLAY_LEGACY_MANIFEST`).
+    pub legacy_manifest: &'a str,
+    /// Caller uid for the private record writer.
+    pub euid: u32,
+    /// Sanitized Git source root for fingerprints.
+    pub source_root: &'a Path,
+    /// Base for the legacy-hash throwaway repository.
+    pub tmp: &'a Path,
+    /// Probed move tool.
+    pub tool: &'a temp::MoveTool,
+}
+
+/// Whether `rel` is tracked in the base checkout, like
+/// `_base_git ls-files --error-unmatch` succeeding (a missing
+/// topology reads untracked, like the shell's rc 128).
+fn restore_tracked(base: &repos_base::Base, rel: &str) -> bool {
+    match base.git_prefix() {
+        Some(prefix) => repos_base::run_git(&prefix, &["ls-files", "--error-unmatch", "--", rel])
+            .is_some_and(|output| output.status.success()),
+        None => false,
+    }
+}
+
+/// Whether the base checkout takes the skip-worktree bit for `rel`.
+fn restore_mark_skip(base: &repos_base::Base, rel: &str) -> bool {
+    match base.git_prefix() {
+        Some(prefix) => repos_base::run_git(&prefix, &["update-index", "--skip-worktree", rel])
+            .is_some_and(|output| output.status.success()),
+        None => false,
+    }
+}
+
+/// Whether the live `$HOME/rel` link reads back `want`, like
+/// `[[ -L $dst && $(readlink $dst) == ... ]]` (command substitution
+/// strips trailing newlines before the compare).
+fn restore_link_points(home: &str, rel: &str, want: &str) -> bool {
+    let dst = Path::new(home).join(rel);
+    std::fs::symlink_metadata(&dst).is_ok_and(|meta| meta.file_type().is_symlink())
+        && std::fs::read_link(&dst)
+            .is_ok_and(|link| link.to_string_lossy().trim_end_matches('\n') == want)
+}
+
+/// Parent directory with `${dst%/*}` string semantics.
+fn restore_parent(dst: &str) -> &str {
+    dst.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+/// Publish `target` at `dst`, marking skip-worktree for tracked
+/// paths like the shell's trailing gate.
+fn restore_publish(
+    inputs: &RestoreInstalledInputs<'_>,
+    dst: &str,
+    target: &str,
+    replace_identity: Option<&str>,
+    tracked: bool,
+    rel: &str,
+) -> bool {
+    if !ensure_destination_parent(inputs.home, restore_parent(dst)) {
+        return false;
+    }
+    let link = PublishLinkInputs {
+        target,
+        destination: dst,
+        expected: replace_identity,
+        inputs: inputs.dest,
+        manifest: inputs.manifest,
+        euid: inputs.euid,
+        source_root: inputs.source_root,
+        tmp: inputs.tmp,
+        tool: inputs.tool,
+    };
+    if !publish_link(&link) {
+        return false;
+    }
+    !tracked || restore_mark_skip(inputs.base, rel)
+}
+
+/// One rollback record of [`restore_installed_links`].
+fn restore_one(
+    inputs: &RestoreInstalledInputs<'_>,
+    authority: &mut AuthorityCtx<'_>,
+    rel: &str,
+    target: &str,
+) -> bool {
+    let dst = format!("{}/{}", inputs.home, rel);
+    let dst_path = Path::new(&dst);
+    let tracked = restore_tracked(inputs.base, rel);
+    let points_at = |want: &str| restore_link_points(inputs.home, rel, want);
+    if points_at(target) && link_target_available(rel, target, inputs.home) {
+        return !tracked || restore_mark_skip(inputs.base, rel);
+    }
+    if !link_target_available(rel, target, inputs.home) {
+        if let Some((fallback, owner)) = active_fallback_target(rel, target, inputs.overlays) {
+            if !publish_fallback_authority(
+                rel,
+                &owner,
+                &fallback,
+                authority,
+                inputs.euid,
+                inputs.tool,
+            ) {
+                return false;
+            }
+            if points_at(&fallback) && link_target_available(rel, &fallback, inputs.home) {
+                return !tracked || restore_mark_skip(inputs.base, rel);
+            }
+            let mut replace_identity = None;
+            let owned;
+            if points_at(target) {
+                owned = match replacement_identity(inputs.source_root, dst_path) {
+                    Ok(identity) => identity,
+                    Err(_) => return false,
+                };
+                replace_identity = Some(owned.as_str());
+            } else if dst_path.exists() || restore_is_link(dst_path) {
+                if !tracked || restore_is_link(dst_path) {
+                    return false;
+                }
+                if !tracked_path_clean(inputs.base, rel) {
+                    return false;
+                }
+            }
+            return restore_publish(inputs, &dst, &fallback, replace_identity, tracked, rel);
+        }
+        if tracked && !restore_is_link(dst_path) && tracked_path_clean(inputs.base, rel) {
+            return true;
+        }
+        return false;
+    }
+    if restore_is_link(dst_path) || dst_path.is_dir() {
+        return false;
+    }
+    let mut replace_identity = None;
+    let owned;
+    if dst_path.exists() {
+        if !tracked || !tracked_path_clean(inputs.base, rel) {
+            return false;
+        }
+        owned = match replacement_identity(inputs.source_root, dst_path) {
+            Ok(identity) => identity,
+            Err(_) => return false,
+        };
+        replace_identity = Some(owned.as_str());
+    }
+    restore_publish(inputs, &dst, target, replace_identity, tracked, rel)
+}
+
+/// Whether `path` is a symlink (never following it).
+fn restore_is_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// `_overlay_restore_installed_links`: walk the rollback snapshot
+/// arrays and re-converge every installed link — confirming live
+/// generations, publishing fallbacks with recorded authority, and
+/// publishing available targets over absent or replaced paths.
+/// Returns false on the first record needing operator attention,
+/// like the shell's sticky `status`.
+pub fn restore_installed_links(inputs: &RestoreInstalledInputs<'_>) -> bool {
+    if inputs.rels.len() != inputs.targets.len() {
+        return false;
+    }
+    let mut cache = AuthorityCache::disabled();
+    let mut authority = AuthorityCtx {
+        home: inputs.home,
+        manifest: inputs.manifest,
+        legacy_manifest: inputs.legacy_manifest,
+        inputs: inputs.dest,
+        roots: None,
+        cache: &mut cache,
+        euid: inputs.euid,
+    };
+    let mut ok = true;
+    for (rel, target) in inputs.rels.iter().zip(inputs.targets.iter()) {
+        if !restore_one(inputs, &mut authority, rel, target) {
+            ok = false;
+        }
+    }
+    ok
+}
+
 /// Env-derived inputs for [`destination_context`], replacing the
 /// shell's `HOME`, `OVERLAYS`, and reserved-roots environment with
 /// explicit values (the [`RollbackSnapshot`] precedent). Every field
