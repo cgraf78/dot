@@ -117,6 +117,7 @@ tests/repos_git.rs	standalone:new
 tests/repos_overlays.rs	standalone:new
 tests/repos_overlays_bsd.rs	standalone:new
 tests/repos_replacement.rs	standalone:new
+tests/repos_publish_link.rs	standalone:new
 tests/repos_publish_pending.rs	standalone:new
 tests/repos_publish.rs	standalone:new
 tests/repos_quarantine.rs	standalone:new

@@ -1173,13 +1173,14 @@ fn run_mv(mv_bin: &Path, flags: &[&str], source: &Path, target: &Path) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Identity of a path for move verification: `stat` (following) like
-/// `_dot_path_identity`, missing as `None` so a vanished target
-/// compares unequal. Following matters: a target symlink pointing at
-/// the source itself reports the source identity, and the shell calls
-/// that shape success.
+/// Identity of a path for move verification: plain `stat` (never
+/// `-L`) like `_dot_path_identity`, missing as `None` so a vanished
+/// target compares unequal. No-follow matters both ways: a dangling
+/// staged link still has an identity to verify by (the shell moves
+/// those fine), and a late symlink reports its own identity, never
+/// its target's.
 fn move_identity(path: &Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
+    let meta = std::fs::symlink_metadata(path).ok()?;
     use std::os::unix::fs::MetadataExt as _;
     Some(identity_string((meta.dev(), meta.ino())))
 }
