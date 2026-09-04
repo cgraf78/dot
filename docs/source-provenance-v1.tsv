@@ -87,6 +87,9 @@ tests/families.rs	standalone:new
 tests/hook-api-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/hooks-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/init-test	standalone:new
+tests/init_client_parent.rs	standalone:new
+tests/init_client_publish_intent.rs	standalone:new
+tests/init_client_safe_path.rs	standalone:new
 tests/install-test	standalone:new
 tests/lib/repo.sh	standalone:new
 tests/lib/test.sh	standalone:new
