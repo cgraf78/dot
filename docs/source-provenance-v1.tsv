@@ -153,3 +153,4 @@ tests/xdg.rs	standalone:new
 tests/repos_pull_overlay.rs	standalone:new
 tests/shdeps_checkpoint.rs	standalone:new
 tests/init_client_identity.rs	standalone:new
+tests/init_client_generation.rs	standalone:new
