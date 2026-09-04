@@ -76,17 +76,21 @@ fn seed_remote(scratch: &Scratch, name: &str, branch: &str, prefix: &str, files:
     git(&seed, &["commit", "-qm", "seed"]);
     git(&seed, &["branch", "-M", branch]);
     let origin = scratch.path().join(format!("{name}.git"));
-    let status = Command::new("git")
+    let output = Command::new("git")
         .arg("clone")
         .arg("-q")
         .arg("--bare")
         .arg(&seed)
         .arg(&origin)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .expect("clone bare");
-    assert!(status.success());
+    assert!(
+        output.status.success(),
+        "clone bare {seed:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     git(
         &origin,
         &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
@@ -166,17 +170,21 @@ fn fixture_client(scratch: &Scratch) -> (PathBuf, PathBuf) {
     git(&base_seed, &["commit", "-qm", "seed"]);
     git(&base_seed, &["branch", "-M", "main"]);
     let base_origin = scratch.path().join("base.git");
-    let status = Command::new("git")
+    let output = Command::new("git")
         .arg("clone")
         .arg("-q")
         .arg("--bare")
         .arg(&base_seed)
         .arg(&base_origin)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .expect("clone bare");
-    assert!(status.success());
+    assert!(
+        output.status.success(),
+        "clone bare {base_seed:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     git(&base_origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
     let home = scratch.path().join("home");
