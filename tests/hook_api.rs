@@ -168,8 +168,8 @@ fn hook_relative_shape_matrix_agrees() {
             "rust shape for {relative:?}"
         );
     }
-    // Arity is shell-only (the Rust signature cannot mis-fire), but
-    // the exit-2 contract still pins here.
+    // Arity is shell-only (the Rust signature takes exactly one
+    // relative), but the exit-2 contract still pins here.
     for snippet in [
         "dot_hook_file; printf 'code=%s\\n' \"$?\"",
         "dot_hook_file a b; printf 'code=%s\\n' \"$?\"",
