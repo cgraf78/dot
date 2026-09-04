@@ -620,10 +620,25 @@ fn decimal_value(text: &str) -> Option<i64> {
     Some(if negative { -value } else { value })
 }
 
+/// Bash `[[ ]]` arithmetic value: trimmed decimals (one optional
+/// sign) literally; a bare variable name or the empty string reads
+/// as unset (zero); anything else is unrepresentable (`None`), and
+/// the shell errors falsy there.
+pub(crate) fn arith_value(text: &str) -> Option<i64> {
+    if let Some(value) = decimal_value(text) {
+        return Some(value);
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() || is_bare_name(trimmed) {
+        return Some(0);
+    }
+    None
+}
+
 /// `[[ $text -gt 0 ]]` for canonical and normalized spellings;
 /// malformed input is falsy (the shell errors).
 fn int_gt_zero(text: &str) -> bool {
-    decimal_value(text).is_some_and(|value| value > 0)
+    arith_value(text).is_some_and(|value| value > 0)
 }
 
 /// `[[ $text -eq 0 ]]`: decimals compare literally; anything else
@@ -631,11 +646,7 @@ fn int_gt_zero(text: &str) -> bool {
 /// the empty string are zero), while malformed arithmetic such as
 /// `1abc` errors falsy.
 fn int_is_zero(text: &str) -> bool {
-    if let Some(value) = decimal_value(text) {
-        return value == 0;
-    }
-    let trimmed = text.trim();
-    trimmed.is_empty() || is_bare_name(trimmed)
+    arith_value(text).is_some_and(|value| value == 0)
 }
 
 /// Bash arithmetic resolves a bare `name` token as a variable; no
