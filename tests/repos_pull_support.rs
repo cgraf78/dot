@@ -158,8 +158,10 @@ fn backup_dir_creates_timestamped_dir_and_reports_it() {
     let shell_path = Path::new(shell_reply);
     assert!(shell_path.is_dir(), "shell backup dir exists");
     let home = rust_dir.path();
-    let rust_reply = backup_dir(&home.to_string_lossy()).expect("rust backup dir");
+    let mut warnings = Vec::new();
+    let rust_reply = backup_dir(&home.to_string_lossy(), &mut warnings).expect("rust backup dir");
     assert!(rust_reply.is_dir(), "rust backup dir exists");
+    assert!(warnings.is_empty(), "clean creation stays silent");
     // Same shape on both sides (timestamps may straddle a second
     // boundary, so names compare by shape, not equality): a 14-digit
     // stamp directly under each `$HOME/.dot-backup/pull`.
@@ -190,9 +192,22 @@ fn backup_dir_reports_none_when_nothing_is_creatable() {
     let home = dir.path();
     std::fs::write(home.join(".dot-backup"), b"blocker\n").expect("blocker file");
     let snippet = "_backup_dir; rc=$?\nprintf 'rc=%d reply=%s\\n' \"$rc\" \"$REPLY\"\n";
-    // The shell failure path is noisy on stderr (mkdir/mktemp
-    // diagnostics); only the exit code and empty reply are pinned.
-    let (shell_status, shell_out, _) = shell_run(home, &[], &[], snippet);
+    // The shell failure path is noisy on stderr (the unguarded
+    // `mkdir -p` leaks before the suppressed attempts fail); the
+    // port forwards those bytes, so both the exit code and the noise
+    // are pinned. The leak speaks the ambient locale, which the
+    // pinned `LC_ALL=C` would otherwise fork from the Rust side, so
+    // the harness locale overrides it back to ambient for this row.
+    let locale_vars: Vec<(String, Option<String>)> =
+        ["LANG", "LC_ALL", "LC_MESSAGES", "LC_CTYPE", "LANGUAGE"]
+            .into_iter()
+            .map(|key| (key.to_string(), std::env::var(key).ok()))
+            .collect();
+    let extra_env: Vec<(&str, Option<&str>)> = locale_vars
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_deref()))
+        .collect();
+    let (shell_status, shell_out, shell_err) = shell_run(home, &[], &extra_env, snippet);
     assert_eq!(shell_status, 0, "harness exit");
     let shell_text = String::from_utf8_lossy(&shell_out).into_owned();
     assert_eq!(
@@ -200,11 +215,13 @@ fn backup_dir_reports_none_when_nothing_is_creatable() {
         "rc=1 reply=",
         "shell reports failure: {shell_text:?}"
     );
+    let mut warnings = Vec::new();
     assert_eq!(
-        backup_dir(&home.to_string_lossy()),
+        backup_dir(&home.to_string_lossy(), &mut warnings),
         None,
         "rust reports failure"
     );
+    assert_eq!(warnings, shell_err, "rust forwards the mkdir leak");
 }
 
 use dot::repos_pull_support::pull_cmd;
