@@ -742,3 +742,50 @@ fn retiring_overlay_file_agrees() {
     );
     assert_eq!(serr, b"", "locked stderr");
 }
+
+#[test]
+fn directory_validate_agrees() {
+    let dir = TempDir::new("ext-dirval").expect("fixture dir");
+    let home = dir.path();
+    let uid = euid();
+    let ext = mkdir_mode(home, "ext", 0o700);
+    let ext_text = ext.to_string_lossy().into_owned();
+    mkdir_mode(&ext, "ok/sub", 0o700);
+    mkdir_mode(&ext, "open", 0o755);
+    stage_mode(&ext, "afile", b"x", 0o600);
+    std::os::unix::fs::symlink("ok", ext.join("link")).expect("symlink");
+    // Leaf directories pass only with a clean walk plus a clean
+    // directory stat; files, links, and missing paths refuse.
+    for leaf in [
+        "ok",
+        "ok/sub",
+        "open",
+        "afile",
+        "link",
+        "gone",
+        "ok/tool",
+        "gone/tool",
+    ] {
+        let path = format!("{ext_text}/{leaf}");
+        let (code, out, serr) = shell_run(
+            home,
+            &[path.as_ref()],
+            &[],
+            "DOT_EXTENSIONS_DIR=\"$HOME/ext\"; if _dot_extension_directory_validate \"$2\"; then printf 'rc=0\\n'; else printf 'rc=1\\n'; fi",
+        );
+        assert_eq!(code, 0, "shell harness dirval {leaf:?}");
+        assert_eq!(
+            format!(
+                "rc={}\n",
+                i32::from(!extension_trust::directory_validate(
+                    Path::new(&path),
+                    &ext_text,
+                    uid
+                ))
+            ),
+            String::from_utf8(out).expect("dirval dump"),
+            "dirval code for {leaf:?}"
+        );
+        assert_eq!(serr, b"", "dirval stderr for {leaf:?}");
+    }
+}
