@@ -31,6 +31,8 @@ pub mod repos_config;
 pub mod repos_dirty;
 pub mod repos_git;
 pub mod repos_overlays;
+pub mod repos_pull_queries;
+pub mod repos_pull_support;
 pub mod reserved;
 pub mod temp;
 pub mod test_support;
