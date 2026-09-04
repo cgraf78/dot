@@ -33,6 +33,7 @@ pub mod init_client_plan;
 pub mod init_client_publish;
 pub mod init_client_record;
 pub mod init_client_records;
+pub mod init_client_rollback;
 pub mod init_client_transaction;
 pub mod log;
 pub mod merge_block;
