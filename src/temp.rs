@@ -412,8 +412,10 @@ pub fn sanitized_git<S: AsRef<std::ffi::OsStr>>(
 }
 
 /// Run `git hash-object` under the sanitized binding; `stdin` feeds
-/// `--stdin` when present. Returns the raw hash line.
-fn hash_object<S: AsRef<std::ffi::OsStr>>(
+/// `--stdin` when present. Returns the raw hash line. Crate-visible
+/// for the `_overlay_replacement_hash_object` port, which is this
+/// same `_dot_hash_object` boundary under its overlay name.
+pub(crate) fn hash_object<S: AsRef<std::ffi::OsStr>>(
     source_root: &Path,
     args: &[S],
     stdin: Option<&[u8]>,

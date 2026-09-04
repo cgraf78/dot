@@ -1019,6 +1019,18 @@ pub fn reload_hint(
     }
 }
 
+/// `_warn`: one yellow warning line, always printed (stderr in
+/// shell): the message wrapped in the warning color, like
+/// `echo "${_C_YELLOW}$*${_C_RESET}" >&2`.
+pub fn warn_line(palette: &Palette, message: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(palette.yellow.as_bytes());
+    out.extend_from_slice(message);
+    out.extend_from_slice(palette.reset.as_bytes());
+    out.push(b'\n');
+    out
+}
+
 /// `_ui_normal_shell_name`: basename without one leading dash, kept
 /// only for `bash`/`zsh`.
 pub fn normal_shell_name(path: &str) -> Option<&str> {
