@@ -1395,6 +1395,14 @@ fn sed_only_bindir(label: &str) -> TempDir {
     dir
 }
 
+/// Whether the ambient PATH offers a `jq` binary: the jq-present
+/// parity arm needs the real tool while the `sed` fallback arm runs
+/// hermetically, so minimal images without `jq` skip the former.
+fn have_jq() -> bool {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .any(|dir| dir.join("jq").is_file())
+}
+
 /// Assert the shell takes the expected JSON branch (`jq` present or
 /// the `sed` fallback) so a silent branch mismatch cannot pass as
 /// parity.
@@ -1420,7 +1428,12 @@ fn assert_json_branch(fixture: &Path, extra_env: &[(&str, Option<&str>)], presen
 #[test]
 fn json_get_twins_agree() {
     let dir = TempDir::new("ui-json-get").expect("fixture dir");
-    assert_json_branch(dir.path(), &[], true);
+    let jq_present = have_jq();
+    if jq_present {
+        assert_json_branch(dir.path(), &[], true);
+    } else {
+        eprintln!("no jq on PATH: skipping jq-present parity");
+    }
     let fallback = sed_only_bindir("ui-json-get-sed");
     let fallback_path = fallback.path().to_string_lossy().into_owned();
     let fallback_env = [("PATH", Some(fallback_path.as_str()))];
@@ -1446,21 +1459,23 @@ fn json_get_twins_agree() {
     ];
     for (line, key) in cases.iter().copied() {
         let argv = [OsStr::new(key), OsStr::from_bytes(line.as_bytes())];
-        let (code, out) = shell_run(dir.path(), &argv, &[], "_json_get \"$2\" \"$3\"");
-        // `jq` fails loudly (nonzero) on unparsable input or a type
-        // error while printing nothing; every caller uses `$(...)`
-        // and only reads stdout, so a bare nonzero-with-output would
-        // be the real divergence. (`jq` exit codes vary by release,
-        // so only the emptiness companion is pinned.)
-        assert!(
-            code == 0 || out.is_empty(),
-            "shell json_get rc {code} with output for {line:?} key {key:?}"
-        );
-        assert_eq!(
-            json_get(key, line.as_bytes(), true),
-            out,
-            "json_get jq parity for {line:?} key {key:?}"
-        );
+        if jq_present {
+            let (code, out) = shell_run(dir.path(), &argv, &[], "_json_get \"$2\" \"$3\"");
+            // `jq` fails loudly (nonzero) on unparsable input or a type
+            // error while printing nothing; every caller uses `$(...)`
+            // and only reads stdout, so a bare nonzero-with-output would
+            // be the real divergence. (`jq` exit codes vary by release,
+            // so only the emptiness companion is pinned.)
+            assert!(
+                code == 0 || out.is_empty(),
+                "shell json_get rc {code} with output for {line:?} key {key:?}"
+            );
+            assert_eq!(
+                json_get(key, line.as_bytes(), true),
+                out,
+                "json_get jq parity for {line:?} key {key:?}"
+            );
+        }
         let (code, out) = shell_run(dir.path(), &argv, &fallback_env, "_json_get \"$2\" \"$3\"");
         assert_eq!(code, 0, "shell json_get fallback for {line:?} key {key:?}");
         assert_eq!(
@@ -1474,7 +1489,12 @@ fn json_get_twins_agree() {
 #[test]
 fn json_num_twins_agree() {
     let dir = TempDir::new("ui-json-num").expect("fixture dir");
-    assert_json_branch(dir.path(), &[], true);
+    let jq_present = have_jq();
+    if jq_present {
+        assert_json_branch(dir.path(), &[], true);
+    } else {
+        eprintln!("no jq on PATH: skipping jq-present parity");
+    }
     let fallback = sed_only_bindir("ui-json-num-sed");
     let fallback_path = fallback.path().to_string_lossy().into_owned();
     let fallback_env = [("PATH", Some(fallback_path.as_str()))];
@@ -1499,18 +1519,20 @@ fn json_num_twins_agree() {
     ];
     for (line, key) in cases.iter().copied() {
         let argv = [OsStr::new(key), OsStr::from_bytes(line.as_bytes())];
-        let (code, out) = shell_run(dir.path(), &argv, &[], "_json_num \"$2\" \"$3\"");
-        // Same nonzero-on-empty contract as `_json_get` (see above):
-        // callers only ever read stdout through `$(...)`.
-        assert!(
-            code == 0 || out.is_empty(),
-            "shell json_num rc {code} with output for {line:?} key {key:?}"
-        );
-        assert_eq!(
-            json_num(key, line.as_bytes(), true),
-            out,
-            "json_num jq parity for {line:?} key {key:?}"
-        );
+        if jq_present {
+            let (code, out) = shell_run(dir.path(), &argv, &[], "_json_num \"$2\" \"$3\"");
+            // Same nonzero-on-empty contract as `_json_get` (see above):
+            // callers only ever read stdout through `$(...)`.
+            assert!(
+                code == 0 || out.is_empty(),
+                "shell json_num rc {code} with output for {line:?} key {key:?}"
+            );
+            assert_eq!(
+                json_num(key, line.as_bytes(), true),
+                out,
+                "json_num jq parity for {line:?} key {key:?}"
+            );
+        }
         let (code, out) = shell_run(dir.path(), &argv, &fallback_env, "_json_num \"$2\" \"$3\"");
         assert_eq!(code, 0, "shell json_num fallback for {line:?} key {key:?}");
         assert_eq!(
