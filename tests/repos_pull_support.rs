@@ -494,3 +494,178 @@ fn overlay_count_skips_inactive_and_nongit() {
     let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
     assert_eq!(overlay_count(&refs), wanted, "count parity");
 }
+
+use dot::repos_base::{Base, Topology};
+use dot::repos_pull_support::{prepare_base_upstream, prepare_overlay_upstream};
+
+/// Run `git` in `cwd`, asserting success; returns trimmed stdout.
+fn git_ok(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .expect("spawn git");
+    assert!(output.status.success(), "git {args:?} in {}", cwd.display());
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Fresh one-commit repo on `main` under `dir`, no remotes.
+fn lonely_repo(dir: &TempDir, name: &str) -> std::path::PathBuf {
+    let path = dir.path().join(name);
+    git_ok(dir.path(), &["init", "--quiet", "-b", "main", name]);
+    git_ok(&path, &["config", "user.email", "t@t"]);
+    git_ok(&path, &["config", "user.name", "t"]);
+    std::fs::write(path.join("file"), "hi\n").expect("fixture file");
+    git_ok(&path, &["add", "file"]);
+    git_ok(&path, &["commit", "--quiet", "-m", "init"]);
+    path
+}
+
+/// Clone `remote` into `wt`, commit, and push with upstream set.
+fn pushed_clone(dir: &TempDir, remote: &Path, name: &str) -> std::path::PathBuf {
+    let path = dir.path().join(name);
+    git_ok(
+        dir.path(),
+        &["clone", "--quiet", &remote.to_string_lossy(), name],
+    );
+    git_ok(&path, &["config", "user.email", "t@t"]);
+    git_ok(&path, &["config", "user.name", "t"]);
+    std::fs::write(path.join("file"), "hi\n").expect("fixture file");
+    git_ok(&path, &["add", "file"]);
+    git_ok(&path, &["commit", "--quiet", "-m", "init"]);
+    git_ok(&path, &["push", "--quiet", "-u", "origin", "HEAD"]);
+    path
+}
+
+fn fmt_upstream(result: Result<String, u8>) -> String {
+    match result {
+        Ok(sha) => format!("rc=0 reply={sha}"),
+        Err(code) => format!("rc={code} reply="),
+    }
+}
+
+#[test]
+fn prepare_base_upstream_matches_shell() {
+    let dir = TempDir::new("pull-upstream-base").expect("fixture dir");
+    git_ok(dir.path(), &["init", "--quiet", "--bare", "remote.git"]);
+    let remote = dir.path().join("remote.git");
+
+    // (setup, want): each setup leaves the worktree in place.
+    let lonely = lonely_repo(&dir, "lonely");
+    let pushed = pushed_clone(&dir, &remote, "wt");
+    let unfetchable = lonely_repo(&dir, "unfetchable");
+    git_ok(
+        &unfetchable,
+        &["remote", "add", "origin", "/nonexistent/dot-remote.git"],
+    );
+    git_ok(&unfetchable, &["config", "branch.main.remote", "origin"]);
+    git_ok(
+        &unfetchable,
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+    let unresolvable = lonely_repo(&dir, "unresolvable");
+    git_ok(
+        &unresolvable,
+        &["remote", "add", "origin", &remote.to_string_lossy()],
+    );
+    git_ok(&unresolvable, &["config", "branch.main.remote", "origin"]);
+    git_ok(
+        &unresolvable,
+        &["config", "branch.main.merge", "refs/heads/ghost"],
+    );
+
+    for (path, topology) in [
+        (lonely, "ordinary"),
+        (pushed, "ordinary"),
+        (unfetchable, "ordinary"),
+        (unresolvable, "ordinary"),
+        (dir.path().join("missing"), "missing"),
+    ] {
+        let home = path.to_string_lossy().into_owned();
+        // A missing checkout has no directory; run the shell from the
+        // fixture root instead (the snippet overrides HOME anyway).
+        let cwd = if path.is_dir() {
+            path.clone()
+        } else {
+            dir.path().to_path_buf()
+        };
+        let base = Base {
+            topology: if topology == "missing" {
+                Topology::Missing
+            } else {
+                Topology::Ordinary
+            },
+            client_git_dir: String::new(),
+            home: home.clone(),
+        };
+        // The harness HOME is the fixture root; run the shell with the
+        // worktree as HOME through the snippet instead.
+        let (code, out, _) = shell_run(
+            &cwd,
+            &[],
+            &[],
+            &format!(
+                "export DOT_BASE_TOPOLOGY={topology}; HOME=\"$PWD\"; _repo_prepare_base_upstream; rc=$?; printf 'rc=%s reply=%s' \"$rc\" \"${{REPLY:-}}\""
+            ),
+        );
+        assert_eq!(code, 0, "shell base upstream at {home:?}");
+        assert_eq!(
+            fmt_upstream(prepare_base_upstream(&base)),
+            String::from_utf8(out).expect("upstream utf8"),
+            "base upstream parity for {home:?} {topology:?}"
+        );
+    }
+}
+
+#[test]
+fn prepare_overlay_upstream_matches_shell() {
+    let dir = TempDir::new("pull-upstream-overlay").expect("fixture dir");
+    git_ok(dir.path(), &["init", "--quiet", "--bare", "remote.git"]);
+    let remote = dir.path().join("remote.git");
+
+    let lonely = lonely_repo(&dir, "lonely");
+    let pushed = pushed_clone(&dir, &remote, "wt");
+    let unfetchable = lonely_repo(&dir, "unfetchable");
+    git_ok(
+        &unfetchable,
+        &["remote", "add", "origin", "/nonexistent/dot-remote.git"],
+    );
+    git_ok(&unfetchable, &["config", "branch.main.remote", "origin"]);
+    git_ok(
+        &unfetchable,
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+    let unresolvable = lonely_repo(&dir, "unresolvable");
+    git_ok(
+        &unresolvable,
+        &["remote", "add", "origin", &remote.to_string_lossy()],
+    );
+    git_ok(&unresolvable, &["config", "branch.main.remote", "origin"]);
+    git_ok(
+        &unresolvable,
+        &["config", "branch.main.merge", "refs/heads/ghost"],
+    );
+
+    for path in [lonely, pushed, unfetchable, unresolvable] {
+        for quiet in [false, true] {
+            let home = path.to_string_lossy().into_owned();
+            let (code, out, _) = shell_run(
+                dir.path(),
+                &[],
+                &[],
+                &format!(
+                    "_repo_prepare_overlay_upstream \"{home}\" {quiet}; rc=$?; printf 'rc=%s reply=%s' \"$rc\" \"${{REPLY:-}}\""
+                ),
+            );
+            assert_eq!(code, 0, "shell overlay upstream {home:?}");
+            assert_eq!(
+                fmt_upstream(prepare_overlay_upstream(Path::new(&home), quiet)),
+                String::from_utf8(out).expect("upstream utf8"),
+                "overlay upstream parity for {home:?} quiet {quiet}"
+            );
+        }
+    }
+}
