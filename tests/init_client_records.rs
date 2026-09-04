@@ -1336,11 +1336,14 @@ fn state_matches_tracks_mutation() {
     chmod(&file, 0o600);
     assert!(!shell_matches(&home, &file, &snap));
     assert!(!records::path_state_matches(&file, &snap, &source_root()));
-    // And a replaced inode.
-    chmod(&file, 0o644);
-    std::fs::remove_file(&file).expect("remove");
-    std::fs::write(&file, "hello\n").expect("rewrite");
-    chmod(&file, 0o644);
+    // And a replaced inode. Unlink-plus-recreate may recycle the
+    // inode number on some filesystems, so atomically rename a live
+    // sibling over the path instead: its inode is distinct while
+    // both files exist, and the rename preserves it.
+    let sibling = home.join("sibling.txt");
+    std::fs::write(&sibling, "hello\n").expect("sibling");
+    chmod(&sibling, 0o644);
+    std::fs::rename(&sibling, &file).expect("replace");
     assert!(!shell_matches(&home, &file, &snap));
     assert!(!records::path_state_matches(&file, &snap, &source_root()));
 }
