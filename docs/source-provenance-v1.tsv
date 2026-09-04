@@ -165,3 +165,4 @@ tests/doctor_records.rs	standalone:new
 tests/init_client_record.rs	standalone:new
 tests/init_client_delete.rs	standalone:new
 tests/doctor_coordinator.rs	standalone:new
+tests/cron.rs	standalone:new
