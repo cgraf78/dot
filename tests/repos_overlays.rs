@@ -931,6 +931,29 @@ fn restore_repo(dir: &Path) -> PathBuf {
     dir.to_path_buf()
 }
 
+/// Read-only dir bits do not stop root, so the checkout-fails
+/// row drops the blob object instead: `update-index` only stats
+/// the work tree and passes, while `checkout` cannot materialize
+/// the missing object and fails for every uid.
+fn drop_blob(repo: &Path, rev: &str) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", rev])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("spawn git rev-parse");
+    assert!(output.status.success(), "rev-parse {rev}");
+    let oid = String::from_utf8(output.stdout).expect("rev-parse dump");
+    let oid = oid.trim_end();
+    assert!(oid.len() >= 4, "rev-parse oid {rev}");
+    let (fan, rest) = oid.split_at(2);
+    std::fs::remove_file(repo.join(".git/objects").join(fan).join(rest)).expect("drop blob");
+}
+
 /// An empty-warning palette: colors stay off under a pipe,
 /// like `log.sh` with no terminal.
 fn plain_palette() -> dot::progress_ui::Palette {
@@ -947,11 +970,6 @@ fn plain_palette() -> dot::progress_ui::Palette {
     }
 }
 
-/// Make `repo` read-only (`lock`) or writable again.
-fn set_readonly(repo: &Path, readonly: bool) {
-    let mode = if readonly { 0o555 } else { 0o755 };
-    std::fs::set_permissions(repo, std::fs::Permissions::from_mode(mode)).expect("fixture modes");
-}
 #[test]
 fn restore_tracked_path_agrees() {
     let palette = plain_palette();
@@ -989,7 +1007,7 @@ fn restore_tracked_path_agrees() {
                 rel = "tracked.txt";
                 for repo in [&shell_repo, &rust_repo] {
                     std::fs::remove_file(repo.join(rel)).expect("remove tracked");
-                    set_readonly(repo, true);
+                    drop_blob(repo, "HEAD:tracked.txt");
                 }
             }
             _ => {
