@@ -290,14 +290,26 @@ impl Engine {
 /// `state`, filled by the identity closure and exported by the
 /// record closure — the integrator threads the same state through
 /// the same closures, so this harness is the wiring preview.
+/// Owned live collaborators: boxed because the harness owns one
+/// slot per cross-lane helper and refusal rows swap slots
+/// individually. The aliases keep `type_complexity` quiet the way
+/// the port's own closure aliases do.
+type LiveProvision = Box<dyn Fn(&Path) -> dot::Result<()>>;
+/// Generation check, owned (answers false for every refusal).
+type LiveGeneration = Box<dyn Fn(&Path) -> bool>;
+/// Exclusive move, owned.
+type LiveMove = Box<dyn Fn(&Path, &Path) -> dot::Result<()>>;
+/// Phase journal, owned.
+type LiveRecord = Box<dyn Fn(&Path, &str) -> dot::Result<()>>;
+
 struct Harness {
-    ensure_private_dir: Box<dyn Fn(&Path) -> dot::Result<()>>,
-    generation_matches: Box<dyn Fn(&Path) -> bool>,
-    configure_metadata_modes: Box<dyn Fn(&Path) -> dot::Result<()>>,
-    set_git_identity: Box<dyn Fn(&Path) -> dot::Result<()>>,
-    write_generation_marker: Box<dyn Fn(&Path) -> dot::Result<()>>,
-    move_noreplace: Box<dyn Fn(&Path, &Path) -> dot::Result<()>>,
-    record_phase: Box<dyn Fn(&Path, &str) -> dot::Result<()>>,
+    ensure_private_dir: LiveProvision,
+    generation_matches: LiveGeneration,
+    configure_metadata_modes: LiveProvision,
+    set_git_identity: LiveProvision,
+    write_generation_marker: LiveProvision,
+    move_noreplace: LiveMove,
+    record_phase: LiveRecord,
 }
 
 /// Refusal diagnostic for stubbed collaborators.
@@ -909,7 +921,7 @@ fn run_publish(case: &Case, harness: &Harness, prelude: &str) -> ((i32, Vec<u8>)
 }
 
 /// Stub one path-taking collaborator with a refusal.
-fn stub_path(slot: &'static str) -> Box<dyn Fn(&Path) -> dot::Result<()>> {
+fn stub_path(slot: &'static str) -> LiveProvision {
     Box::new(move |_| Err(refused(slot)))
 }
 

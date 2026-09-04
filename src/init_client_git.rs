@@ -245,7 +245,7 @@ fn has_full_line(content: &[u8], needle: &[u8]) -> bool {
     let lines = grep_lines(content);
     needle
         .split(|byte| *byte == b'\n')
-        .any(|piece| lines.iter().any(|line| *line == piece))
+        .any(|piece| lines.contains(&piece))
 }
 
 /// Strip every trailing newline, like command substitution: the
