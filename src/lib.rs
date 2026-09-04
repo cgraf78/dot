@@ -13,6 +13,7 @@ pub mod cleanup;
 pub mod cli;
 pub mod config;
 pub mod constants;
+pub mod doctor_records;
 pub mod errors;
 pub mod extension_trust;
 pub mod families;
