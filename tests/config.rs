@@ -367,7 +367,11 @@ fn config_control_bytes_matches_shell_oracle() {
     let missing = scratch.path().join("does-not-exist");
     assert!(!shell_control_bytes(&manifest, &missing));
     assert!(!config_control_bytes(&missing));
-    assert!(!shell_control_bytes(&manifest, scratch.path()));
+    // Directories are not differential: BSD `od` exits 0 with empty
+    // output on directories while GNU `od` fails, so the shell
+    // verdict differs by platform (missing files fail identically
+    // everywhere and stay differential above). The port reports no
+    // control bytes for anything it cannot read.
     assert!(!config_control_bytes(scratch.path()));
 }
 
