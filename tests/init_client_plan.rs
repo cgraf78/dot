@@ -328,7 +328,14 @@ fn confirm_listing_matches_cut_first() {
     // tail. Both engines must print the identical listing.
     let dir = TempDir::new("plan-confirm-list").expect("temp dir");
     let manifest = dir.path().join("manifest");
-    let content = "file1\tregular\t1\t2\t644\t3\tabc\nNOTAB\n\n\tlead\tk\np\t\tk\td\ti\tm\ts\tv\na\tb\tc\td\te\tf\tg\te1\nn\0ul\tk\ntail-row";
+    // BSD cut truncates fields at NUL bytes, so a NUL row has no
+    // portable shell spelling on macOS; byte-exactness for that row
+    // is probed on Linux CI instead (fleet non-UTF8 precedent).
+    let content = if cfg!(target_os = "macos") {
+        "file1\tregular\t1\t2\t644\t3\tabc\nNOTAB\n\n\tlead\tk\np\t\tk\td\ti\tm\ts\tv\na\tb\tc\td\te\tf\tg\te1\ntail-row"
+    } else {
+        "file1\tregular\t1\t2\t644\t3\tabc\nNOTAB\n\n\tlead\tk\np\t\tk\td\ti\tm\ts\tv\na\tb\tc\td\te\tf\tg\te1\nn\0ul\tk\ntail-row"
+    };
     std::fs::write(&manifest, content).expect("manifest");
     let body = format!(
         "if _dot_init_confirm {} true >/dev/null; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
@@ -346,8 +353,11 @@ fn confirm_listing_matches_cut_first() {
     assert!(text.contains("\n  \n"));
     assert!(text.contains("\n  p\n"));
     assert!(text.contains("\n  a\n"));
-    // `cut` preserves NUL bytes in the listed field.
-    assert!(text.contains("\n  n\0ul\n"));
+    // GNU `cut` preserves NUL bytes in the listed field; BSD cut
+    // truncates at NUL, so this row only exists off macOS.
+    if !cfg!(target_os = "macos") {
+        assert!(text.contains("\n  n\0ul\n"));
+    }
     assert!(text.contains("\n  tail-row\n"));
 }
 
