@@ -1,9 +1,10 @@
 //! Pull support primitives from `lib/dot/repos/pull.sh`.
 //!
 //! The conflict-log parser, the timestamped backup directory maker,
-//! and the locale-pinned pull runner. The conflict-backup
-//! orchestrator stays shell-side until the overlay-quarantine
-//! helpers it calls are ported.
+//! the locale-pinned pull runner, the worker-fleet accounting, and
+//! the upstream preparation. The conflict-backup orchestrator stays
+//! shell-side until the overlay-quarantine helpers it calls are
+//! ported.
 
 /// `_pull_conflicts_from_log`: list the untracked files a failed pull
 /// names after its "untracked working tree files would be overwritten
@@ -197,4 +198,73 @@ pub fn overlay_count(entries: &[&str]) -> usize {
             overlay_active(std::path::Path::new(path), url)
         })
         .count()
+}
+
+/// Resolve `@{u}` to its remote name, or `None` when there is no
+/// usable `remote/branch` shape (missing slash, empty remote).
+fn upstream_remote(upstream: &str) -> Option<&str> {
+    let (remote, branch) = upstream.split_once('/')?;
+    if remote.is_empty() || branch.is_empty() {
+        return None;
+    }
+    Some(remote)
+}
+
+/// Run `git rev-parse` under `prefix`, returning trimmed stdout on
+/// success (empty on any failure, like `$(... || true)` downstream
+/// of an `|| return`).
+fn rev_parse(prefix: &[std::ffi::OsString], args: &[&str]) -> Option<String> {
+    let mut full = vec!["rev-parse"];
+    full.extend_from_slice(args);
+    let output = crate::repos_base::run_git(prefix, &full)?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
+/// `_repo_prepare_base_upstream`: fetch the base checkout's upstream
+/// remote and resolve the fetched tip. Returns the commit id, or the
+/// shell's numeric failure: 1 for no usable upstream, 2 for a failed
+/// fetch, 3 for an unresolvable tip.
+pub fn prepare_base_upstream(base: &crate::repos_base::Base) -> Result<String, u8> {
+    let prefix = base.git_prefix().ok_or(1u8)?;
+    let upstream =
+        rev_parse(&prefix, &["--abbrev-ref", "--symbolic-full-name", "@{u}"]).ok_or(1u8)?;
+    let remote = upstream_remote(&upstream).ok_or(1u8)?;
+    if crate::repos_git::run_git_streaming(
+        &prefix,
+        &["fetch", "--quiet", "--no-write-fetch-head", remote],
+    ) != 0
+    {
+        return Err(2);
+    }
+    let tip = format!("{upstream}^{{commit}}");
+    rev_parse(&prefix, &["--verify", tip.as_str()]).ok_or(3u8)
+}
+
+/// `_repo_prepare_overlay_upstream`: fetch one overlay's upstream
+/// remote and resolve the fetched tip. Same shape as
+/// [`prepare_base_upstream`], except an unresolvable tip is also a 2
+/// and fetch diagnostics stay quiet when `quiet_errors` holds.
+pub fn prepare_overlay_upstream(path: &std::path::Path, quiet_errors: bool) -> Result<String, u8> {
+    let prefix = vec![std::ffi::OsString::from("-C"), path.as_os_str().to_owned()];
+    let upstream =
+        rev_parse(&prefix, &["--abbrev-ref", "--symbolic-full-name", "@{u}"]).ok_or(1u8)?;
+    let remote = upstream_remote(&upstream).ok_or(1u8)?;
+    let fetch = ["fetch", "--quiet", "--no-write-fetch-head", remote];
+    let fetched = if quiet_errors {
+        crate::repos_base::run_git(&prefix, &fetch).is_some_and(|output| output.status.success())
+    } else {
+        crate::repos_git::run_git_streaming(&prefix, &fetch) == 0
+    };
+    if !fetched {
+        return Err(2);
+    }
+    let tip = format!("{upstream}^{{commit}}");
+    rev_parse(&prefix, &["--verify", tip.as_str()]).ok_or(2u8)
 }
