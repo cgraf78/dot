@@ -978,12 +978,15 @@ fn private_dir_permissive_modes_rejected() {
 #[test]
 fn private_dir_setuid_only_accepted() {
     // Group/other bits are clear, so the `077` mask passes; the
-    // mode string renders `4700` on both engines.
+    // mode string renders `4700` on both engines. On macOS the
+    // setuid bit may not survive on a directory (chmod succeeds
+    // but the mode reads back without it), so both engines reject
+    // the `4700` expectation there instead.
     check_dir_pair(
         "delete-priv-suid",
         "stage",
         build_4700_empty,
-        true,
+        !cfg!(target_os = "macos"),
         |dir| probe_private_mode(dir, "4700"),
         |path| delete::private_directory_matches(path, None, Some("4700")),
     );
