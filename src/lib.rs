@@ -14,6 +14,7 @@ pub mod cli;
 pub mod config;
 pub mod constants;
 pub mod cron;
+pub mod doctor_checks;
 pub mod doctor_coordinator;
 pub mod doctor_orchestrator;
 pub mod doctor_paths;
