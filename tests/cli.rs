@@ -506,9 +506,10 @@ fn binary_unknown_non_utf8_matches_oracle() {
 fn binary_kernel_arms_report_not_implemented() {
     // Interim contract until each kernel slice lands: known commands
     // exit generic-failure with their own diagnostic — never the
-    // unknown-command one, and never success.
+    // unknown-command one, and never success. (`init` left this set
+    // when its slice wired it; see the `binary_init_*` tests below.)
     for command in [
-        "update", "pull", "fetch", "push", "status", "diff", "doctor", "test", "init",
+        "update", "pull", "fetch", "push", "status", "diff", "doctor", "test",
     ] {
         let rust = bin().arg(command).output().expect("run dot command");
         assert_eq!(rust.status.code(), Some(1), "command: {command}");
@@ -519,4 +520,175 @@ fn binary_kernel_arms_report_not_implemented() {
             "command: {command}"
         );
     }
+}
+
+/// Extract the `_dot_init_usage` heredoc body from the shell source,
+/// like [`shell_help`] does for the dispatcher help.
+fn shell_init_usage() -> String {
+    let source = include_str!("../lib/dot/init-client.sh");
+    let marker = "_dot_init_usage() {\n  cat <<'EOF'\n";
+    let start = source.find(marker).expect("init usage marker") + marker.len();
+    let rest = &source[start..];
+    let end = rest.find("\nEOF\n").expect("init usage terminator");
+    format!("{}\n", &rest[..end])
+}
+
+/// `dot init` under a controlled client: a cleared environment plus a
+/// twin home/state pair, so rows never touch the developer's own
+/// checkout, provider state, or ambient variables.
+fn init_env(cmd: &mut Command, home: &TempDir, state: &TempDir) {
+    let repo = env!("CARGO_MANIFEST_DIR");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let tmpdir = std::env::var_os("TMPDIR")
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
+    // One `.env` per variable (never `.envs`), matching the oracle
+    // convention above.
+    cmd.env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", &path)
+        .env("TMPDIR", &tmpdir)
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("DOT_SOURCE_ROOT", repo)
+        .current_dir(home.path());
+}
+
+/// The Rust binary's `init` with a controlled client.
+fn init_bin(home: &TempDir, state: &TempDir) -> Command {
+    let mut cmd = bin();
+    init_env(&mut cmd, home, state);
+    cmd
+}
+
+/// The production shell binary (`bin/dot`, under its own
+/// `set -euo pipefail`) with the same controlled client: the
+/// strongest oracle for the wired arm, comparing process observables
+/// end to end rather than function text.
+fn shell_dot(argv: &[&str], home: &TempDir, state: &TempDir) -> std::process::Output {
+    let mut cmd = Command::new("bash");
+    cmd.arg("bin/dot");
+    for arg in argv {
+        cmd.arg(arg);
+    }
+    init_env(&mut cmd, home, state);
+    cmd.current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.output().expect("run bin/dot")
+}
+
+/// One wired-arm row: the Rust binary and the production shell agree
+/// on exit code and both streams byte for byte.
+fn check_init(argv: &[&str]) {
+    let home = TempDir::new("cli-init-rust").expect("twin home");
+    let state = TempDir::new("cli-init-state").expect("twin state");
+    let rust = init_bin(&home, &state)
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run dot init");
+    let shell = shell_dot(argv, &home, &state);
+    assert_eq!(rust.status.code(), shell.status.code(), "argv: {argv:?}");
+    assert_eq!(rust.stdout, shell.stdout, "argv: {argv:?}");
+    assert_eq!(rust.stderr, shell.stderr, "argv: {argv:?}");
+}
+
+#[test]
+fn binary_init_help_matches_shell_usage() {
+    assert_eq!(
+        dot::init_client_adopt::usage(),
+        shell_init_usage().into_bytes()
+    );
+    for argv in [vec!["init", "--help"], vec!["init", "-h"]] {
+        check_init(&argv);
+    }
+    let home = TempDir::new("cli-init-help").expect("twin home");
+    let state = TempDir::new("cli-init-help-state").expect("twin state");
+    let rust = init_bin(&home, &state)
+        .args(["init", "--help"])
+        .output()
+        .expect("run dot init --help");
+    assert_eq!(rust.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(rust.stdout).expect("stdout UTF-8"),
+        shell_init_usage()
+    );
+    assert!(rust.stderr.is_empty());
+}
+
+#[test]
+fn binary_init_matches_production_on_early_paths() {
+    // Parsing, mode gates, the provider gate, and the resolvable
+    // failures: none reach the interim closures, so the production
+    // shell is the exact oracle — including the errexit-shaped codes
+    // (`--bogus` exits `1`, never the dead `return 2`).
+    for argv in [
+        vec!["init", "--bogus"],
+        vec!["init"],
+        vec!["init", "--branch"],
+        vec!["init", "--status", "some-origin"],
+        vec!["init", "--status"],
+        vec!["init", "--branch", "main", "notaurl"],
+        vec!["init", "--branch", "bad..name", "notaurl"],
+    ] {
+        check_init(&argv);
+    }
+}
+
+#[test]
+fn binary_init_early_codes_match_production_shape() {
+    // Static pins beside the oracle comparison above, so a future
+    // drift reads as an explicit contract change, not a silent
+    // byte shift.
+    let home = TempDir::new("cli-init-codes").expect("twin home");
+    let state = TempDir::new("cli-init-codes-state").expect("twin state");
+    let cases: &[(&[&str], i32, &[u8])] = &[
+        (
+            &["init", "--bogus"],
+            1,
+            b"dot init: unknown option: --bogus\n",
+        ),
+        (&["init", "--branch"], 2, b""),
+        (&["init", "--status"], 0, b""),
+    ];
+    for (argv, code, stderr) in cases {
+        let rust = init_bin(&home, &state)
+            .args(*argv)
+            .output()
+            .expect("run dot init");
+        assert_eq!(rust.status.code(), Some(*code), "argv: {argv:?}");
+        assert_eq!(rust.stderr, *stderr, "argv: {argv:?}");
+    }
+    let rust = init_bin(&home, &state)
+        .args(["init", "--status"])
+        .output()
+        .expect("run dot init --status");
+    assert_eq!(
+        rust.stdout,
+        b"initialization: not started\n".to_vec(),
+        "status report"
+    );
+}
+
+#[test]
+fn binary_init_rollback_names_the_gap() {
+    // The deep rollback tree is the next slice: the interim closure
+    // names the gap with the legacy dispatcher-level text, keeping
+    // the kernel's failure code per the production contract.
+    let home = TempDir::new("cli-init-gap").expect("twin home");
+    let state = TempDir::new("cli-init-gap-state").expect("twin state");
+    let rust = init_bin(&home, &state)
+        .args(["init", "--rollback"])
+        .output()
+        .expect("run dot init --rollback");
+    assert_eq!(rust.status.code(), Some(1));
+    assert!(rust.stdout.is_empty());
+    assert_eq!(
+        rust.stderr,
+        b"dot init: initialization rollback is not yet implemented\n".to_vec()
+    );
 }
