@@ -17,12 +17,18 @@
 //! through the sequencer's flag parser
 //! ([`crate::update::parse_update_flags`]): the shell loop's exports
 //! land in the process environment while the engine (sync/finalize)
-//! stays shell-owned, so the interim diagnostic remains. The shell
+//! stays shell-owned, so the interim diagnostic remains; slice 79
+//! drives `init` through [`init_client_command::run`]. The shell
 //! `bin/dot` remains the entry point and never routes here yet.
 
 use std::ffi::OsString;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
+use crate::errors::Error;
+use crate::init_client_command;
+use crate::init_client_identity as identity;
+use crate::init_client_record::TransactionRecord;
 use crate::version;
 
 /// Native argv bytes for command matching.
@@ -133,8 +139,17 @@ pub enum Command {
     /// `init`: owner traps, then [`init_acquires_lock`] decides the
     /// nested `case ${1:-}` — `_dot_update_lock_acquire` unless the
     /// first argument is `--status`, `--help`, or `-h` (lock failure
-    /// returns its status) — then `dot_init_command "$@"` whose status
-    /// is ignored (`0` regardless). Kernel lives in another lane.
+    /// returns its status) — then `dot_init_command "$@"`, wired to
+    /// [`init_client_command::run`] (see `run_init` below).
+    ///
+    /// Exit-code note: the dispatcher text ignores the kernel status
+    /// (`0` regardless), but production runs under `set -euo pipefail`
+    /// (`bin/dot`, `lib/dot/main.sh`), so a failing kernel exits the
+    /// process with its own code before the dispatcher resumes —
+    /// `dot init --bogus` exits `1`, pinned against `bin/dot`.
+    /// [`run`] therefore reports the kernel's code directly. Lock
+    /// acquisition still arrives with its slice: until then every
+    /// `init` proceeds without locking, like every other arm here.
     Init,
     /// Anything else: `dot: unknown command: %s` on stderr, `1`.
     Unknown,
@@ -232,6 +247,10 @@ pub fn run(
                 let rest: Vec<OsString> = args.collect();
                 run_update(other, &rest, stderr)
             }
+            Command::Init => {
+                let rest: Vec<Vec<u8>> = args.map(|arg| argv_bytes(&arg)).collect();
+                run_init(&rest, stdout, stderr, &mut failed)
+            }
             Command::Unknown => {
                 // A closed stderr here leaves nothing to report to; the
                 // exit code still carries the failure.
@@ -325,6 +344,80 @@ fn run_cron(stdout: &mut dyn Write, failed: &mut bool) -> i32 {
         *failed = true;
     }
     EXIT_SUCCESS
+}
+
+/// The [`Command::Init`] arm: `dot_init_command "$@"` through
+/// [`init_client_command::run`].
+///
+/// Process environment is read here — the dispatcher is the engine
+/// boundary, so ambient reads live in this arm while the command
+/// module itself takes explicit parameters (its [`CommandEnv`][init_client_command::CommandEnv]).
+/// Effect-free helpers run as the real ports inside the module; the
+/// network default-branch probe binds its ported helper with a
+/// `TMPDIR` scratch, while the deep resume and rollback trees plus
+/// the line-1872+ fresh tail stay interim "not yet implemented"
+/// closures until their slices fill them in. The arm reports the
+/// kernel's own code, matching the production process under
+/// `set -euo pipefail` (pinned against `bin/dot`; see the
+/// [`Command::Init`] contract).
+fn run_init(
+    args: &[Vec<u8>],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    failed: &mut bool,
+) -> i32 {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let xdg_state_home = std::env::var("XDG_STATE_HOME").unwrap_or_default();
+    let skip_provider = std::env::var("DOT_INIT_SKIP_PROVIDER").ok();
+    let source_root = std::env::var_os("DOT_SOURCE_ROOT").map(PathBuf::from);
+    // Degraded-env ownership root: without a source checkout the
+    // stage-ownership hash cannot verify, so recovery preserves
+    // every stage (fail closed), like the shell's failed probe.
+    let fallback = PathBuf::from("/nonexistent-dot-source-root");
+    let source_root = source_root.as_deref().unwrap_or(&fallback);
+    let scratch = std::env::var_os("TMPDIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let remote_default_branch =
+        |url: &str| -> Option<String> { identity::remote_default_branch(url, &scratch) };
+    let resume = |_: &Path, _: &Path, _: &TransactionRecord| -> Result<(), Error> {
+        Err(Error::Usage {
+            message: "initialization resume is not yet implemented",
+        })
+    };
+    let rollback = |_: &Path| -> Result<(), Error> {
+        Err(Error::Usage {
+            message: "initialization rollback is not yet implemented",
+        })
+    };
+    let fresh = |_: &init_client_command::FreshInputs| -> init_client_command::InitReport {
+        init_client_command::InitReport {
+            stdout: Vec::new(),
+            stderr: b"dot: command 'init' is not yet implemented\n".to_vec(),
+            code: EXIT_ERROR,
+        }
+    };
+    let env = init_client_command::CommandEnv {
+        home: &home,
+        xdg_state_home: &xdg_state_home,
+        skip_provider: skip_provider.as_deref(),
+        source_root,
+    };
+    let engine = init_client_command::CommandEngine {
+        remote_default_branch: &remote_default_branch,
+        resume: &resume,
+        rollback: &rollback,
+        fresh: &fresh,
+    };
+    let report = init_client_command::run(&env, &engine, args);
+    if stdout.write_all(&report.stdout).is_err() {
+        *failed = true;
+    }
+    if stderr.write_all(&report.stderr).is_err() {
+        *failed = true;
+    }
+    report.code
 }
 
 #[cfg(test)]
@@ -482,8 +575,10 @@ mod tests {
         // dispatch decision is final, so they must never fall through
         // to the unknown-command diagnostic. Interim exit is the
         // generic failure until the owning slice wires the kernel.
+        // (`init` left this set when slice 79 wired it; see the
+        // `init_*` tests below.)
         for command in [
-            "update", "pull", "fetch", "push", "status", "diff", "doctor", "test", "init",
+            "update", "pull", "fetch", "push", "status", "diff", "doctor", "test",
         ] {
             let (code, out, err) = run_text(&[command]);
             assert_eq!(code, EXIT_ERROR, "command: {command}");
@@ -494,6 +589,48 @@ mod tests {
                 "command: {command}"
             );
         }
+    }
+
+    #[test]
+    fn init_help_drives_usage_successfully() {
+        // Wired slice: `init --help` prints the init usage (not the
+        // dispatcher help, not "not yet implemented"). These paths
+        // never consult process environment values, so they stay
+        // deterministic in-process.
+        for argv in [vec!["init", "--help"], vec!["init", "-h"]] {
+            let (code, out, err) = run_text(&argv);
+            assert_eq!(code, EXIT_SUCCESS, "argv: {argv:?}");
+            assert_eq!(
+                out,
+                String::from_utf8(crate::init_client_adopt::usage()).expect("usage UTF-8"),
+                "argv: {argv:?}"
+            );
+            assert!(err.is_empty(), "argv: {argv:?}");
+        }
+    }
+
+    #[test]
+    fn init_unknown_option_reports_with_kernel_code() {
+        // The kernel's own code crosses the dispatcher: production
+        // runs under `set -euo pipefail`, so the shell exits `1`
+        // inside `_dot_init_error` (pinned against `bin/dot`), and
+        // so does this arm — never the dispatcher's ignore-status
+        // default, never the interim text.
+        let (code, out, err) = run_text(&["init", "--bogus"]);
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        assert_eq!(err, "dot init: unknown option: --bogus\n");
+    }
+
+    #[test]
+    fn init_identity_failure_reports_with_kernel_code() {
+        // Past parsing, the first resolvable failure also crosses
+        // with its code (identity here; the fresh tail stays
+        // interim).
+        let (code, out, err) = run_text(&["init", "--branch", "main", "notaurl"]);
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        assert_eq!(err, "dot init: unsupported repository URL: notaurl\n");
     }
 
     #[cfg(unix)]
