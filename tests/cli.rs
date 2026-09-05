@@ -2136,6 +2136,21 @@ fn update_native_matches_shell_byte_for_byte() {
     // retire, the empty merges close, commit, and normalize.
     let shell_client = stage_repos_client();
     let shell = repos_shell(&shell_client, &["update"]);
+    // TEMPORARY flake probe (revert before merge): dump exactly what
+    // the shell twin's hint decision saw.
+    {
+        let mut probe = Command::new(dot::test_support::bash());
+        probe.arg("-c");
+        probe.arg(
+            "echo \"DBG shell-env SHELL=[$SHELL] RELOADS=[$DOT_UPDATE_RELOADS_SHELL] PPID=$PPID\"; \
+             echo \"DBG parent-comm:\"; cat \"/proc/$PPID/comm\" 2>/dev/null || echo DBG-no-proc; \
+             echo \"DBG home listing:\"; ls -a \"$HOME\"; \
+             echo \"DBG bashrc/zshrc:\"; ls -a \"$HOME/.bashrc\" \"$HOME/.zshrc\" 2>&1",
+        );
+        repos_env(&mut probe, &shell_client, false);
+        let probe = probe.output().expect("probe shell twin env");
+        eprintln!("DBG probe:\n{}", String::from_utf8_lossy(&probe.stdout));
+    }
     assert_eq!(
         shell.status.code(),
         Some(0),
