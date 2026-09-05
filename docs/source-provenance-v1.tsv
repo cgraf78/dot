@@ -119,6 +119,7 @@ tests/ownership-transfer-test	standalone:new
 tests/perf_budget.rs	standalone:new
 tests/perf_update.rs	standalone:new
 tests/platform.rs	standalone:new
+tests/pre_sync.rs	standalone:new
 tests/profile_lifecycle.rs	standalone:new
 tests/profiles.rs	standalone:new
 tests/provider-suite-wrapper	standalone:new

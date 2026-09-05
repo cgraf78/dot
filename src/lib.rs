@@ -39,6 +39,7 @@ pub mod merges;
 pub mod overlay_context;
 pub mod overlays;
 pub mod platform;
+pub mod pre_sync;
 pub mod profile_lifecycle;
 pub mod profiles;
 pub mod progress_ui;
