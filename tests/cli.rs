@@ -14,7 +14,7 @@
 //! the Rust interim "not yet implemented" behavior — never conflated.
 
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use dot::cli::{Command as Decision, dispatch, init_acquires_lock};
@@ -618,10 +618,10 @@ fn binary_kernel_arms_report_not_implemented() {
     // Interim contract until each kernel slice lands: known commands
     // exit generic-failure with their own diagnostic — never the
     // unknown-command one, and never success. (`init` left this set
-    // when its slice wired it; see the `binary_init_*` tests below.)
-    for command in [
-        "update", "pull", "fetch", "push", "status", "diff", "doctor", "test",
-    ] {
+    // when its slice wired it, and `fetch`/`push`/`status`/`diff`
+    // when slice 82 wired them; see the `binary_init_*` tests and
+    // the `repos_*` rows below.)
+    for command in ["update", "pull", "doctor", "test"] {
         let rust = bin().arg(command).output().expect("run dot command");
         assert_eq!(rust.status.code(), Some(1), "command: {command}");
         assert!(rust.stdout.is_empty(), "command: {command}");
@@ -802,4 +802,711 @@ fn binary_init_rollback_names_the_gap() {
         rust.stderr,
         b"dot init: initialization rollback is not yet implemented\n".to_vec()
     );
+}
+
+/// Synthetic file:// client for the fetch/push/status/diff wiring
+/// rows (slice 82): a legacy-separate base (`$HOME/.dotfiles`, bare,
+/// one file:// origin, worktree materialized at `$HOME`) plus one
+/// git overlay with a matching descriptor, all under one TempDir
+/// scope. Origins and seed clones live beside — never inside — the
+/// twin home, so `status` sees only worktree files.
+struct ReposClient {
+    /// Temp scope owning every path below (held for the test).
+    #[allow(dead_code)]
+    scope: TempDir,
+    home: PathBuf,
+    xdg: PathBuf,
+    base_git_dir: PathBuf,
+    base_origin: PathBuf,
+    base_seed: PathBuf,
+    base_branch: String,
+    overlay: PathBuf,
+    overlay_origin: PathBuf,
+    overlay_seed: PathBuf,
+    overlay_branch: String,
+}
+
+/// Run `git -C dir args` silenced, asserting success. Fixed
+/// author/committer dates keep fixture SHAs deterministic;
+/// `DOT_GIT_REAL` bypasses any machine-local git launcher shim
+/// (the `shell_run` convention in tests/repos_commands.rs).
+fn repos_git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("DOT_GIT_REAL", "1")
+        .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00+00:00")
+        .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00+00:00")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn fixture git");
+    assert!(status.success(), "git {args:?} in {}", dir.display());
+}
+
+/// Run `git --git-dir=<git_dir> --work-tree=<work> args` silenced
+/// (separate-topology base fixtures), asserting success.
+fn repos_git_prefix(git_dir: &Path, work: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg(format!("--git-dir={}", git_dir.display()))
+        .arg(format!("--work-tree={}", work.display()))
+        .args(args)
+        .env("DOT_GIT_REAL", "1")
+        .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00+00:00")
+        .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00+00:00")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn fixture prefix git");
+    assert!(
+        status.success(),
+        "prefix git {args:?} in {}",
+        git_dir.display()
+    );
+}
+
+/// Capture one `git -C dir args` stdout line, trimmed.
+fn repos_git_line(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("DOT_GIT_REAL", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .expect("spawn fixture git");
+    assert!(output.status.success(), "git {args:?} in {}", dir.display());
+    String::from_utf8(output.stdout)
+        .expect("git line UTF-8")
+        .trim_end_matches('\n')
+        .to_string()
+}
+
+/// Seed a bare file:// origin with one commit via a scratch clone.
+/// Returns the origin path and its branch name (queried, never
+/// assumed: the default branch depends on the machine git).
+fn seed_bare_origin(scope: &Path, name: &str) -> (PathBuf, PathBuf, String) {
+    let origin = scope.join(format!("{name}.git"));
+    std::fs::create_dir_all(&origin).expect("origin dir");
+    repos_git(&origin, &["init", "--bare", "-q"]);
+    let seed = scope.join(format!("{name}-seed"));
+    let status = Command::new("git")
+        .arg("clone")
+        .arg("-q")
+        .arg(&origin)
+        .arg(&seed)
+        .env("DOT_GIT_REAL", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("clone seed");
+    assert!(status.success(), "clone seed {}", seed.display());
+    std::fs::write(seed.join("tracked.txt"), b"v1\n").expect("seed file");
+    repos_git(
+        &seed,
+        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
+    );
+    repos_git(
+        &seed,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "seed",
+        ],
+    );
+    repos_git(&seed, &["push", "-q", "origin", "HEAD"]);
+    let branch = repos_git_line(&seed, &["symbolic-ref", "--short", "HEAD"]);
+    (origin, seed, branch)
+}
+
+/// Commit one more file revision on a seed clone and push it, so
+/// the client falls behind its file:// origin.
+fn seed_advance(seed: &Path, file: &str, body: &[u8]) {
+    std::fs::write(seed.join(file), body).expect("advance file");
+    repos_git(
+        seed,
+        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
+    );
+    repos_git(
+        seed,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "advance",
+        ],
+    );
+    repos_git(seed, &["push", "-q", "origin", "HEAD"]);
+}
+
+/// Stage the full client: bare file:// origins, a legacy-separate
+/// base cloned bare into `$HOME/.dotfiles` (single origin, valid
+/// branch, worktree checked out at `$HOME` tracking its origin),
+/// and one overlay clone with a matching descriptor under a twin
+/// XDG config home (kept outside `$HOME` so status stays clean).
+fn stage_repos_client() -> ReposClient {
+    let scope = TempDir::new("cli-repos").expect("repos scope");
+    let home = scope.path().join("home");
+    let xdg = scope.path().join("xdg");
+    let origins = scope.path().join("origins");
+    std::fs::create_dir_all(&home).expect("twin home");
+    let (base_origin, base_seed, base_branch) = seed_bare_origin(&origins, "dotfiles");
+    let base_url = format!("file://{}", base_origin.display());
+    let base_git_dir = home.join(".dotfiles");
+    std::fs::create_dir_all(&base_git_dir).expect("base git dir");
+    repos_git(&base_git_dir, &["init", "--bare", "-q"]);
+    repos_git(&base_git_dir, &["config", "remote.origin.url", &base_url]);
+    repos_git(
+        &base_git_dir,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    repos_git_prefix(&base_git_dir, &home, &["fetch", "-q", "origin"]);
+    repos_git_prefix(
+        &base_git_dir,
+        &home,
+        &[
+            "checkout",
+            "-q",
+            "-b",
+            &base_branch,
+            &format!("origin/{base_branch}"),
+        ],
+    );
+    let (overlay_origin, overlay_seed, overlay_branch) = seed_bare_origin(&origins, "alpha");
+    let overlay_url = format!("file://{}", overlay_origin.display());
+    let confd = xdg.join("dot/overlays.d");
+    std::fs::create_dir_all(&confd).expect("overlay conf dir");
+    std::fs::write(confd.join("10-alpha.conf"), format!("url={overlay_url}\n"))
+        .expect("overlay descriptor");
+    let overlay = home.join(".dotfiles-alpha");
+    let status = Command::new("git")
+        .arg("clone")
+        .arg("-q")
+        .arg(&overlay_url)
+        .arg(&overlay)
+        .env("DOT_GIT_REAL", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("clone overlay");
+    assert!(status.success(), "clone overlay {}", overlay.display());
+    ReposClient {
+        scope,
+        home,
+        xdg,
+        base_git_dir,
+        base_origin,
+        base_seed,
+        base_branch,
+        overlay,
+        overlay_origin,
+        overlay_seed,
+        overlay_branch,
+    }
+}
+
+/// Controlled environment for the repo wiring rows: a cleared
+/// environment plus the twin home/XDG pair, so rows never touch the
+/// developer's own checkout or ambient variables. The Rust side
+/// additionally receives the shell-computed topology publication
+/// (`_dot_client_select` stays shell-owned; see `base_from_env`);
+/// the shell side computes it from the fixture itself. One `.env`
+/// per variable (never `.envs`), matching the oracle convention.
+fn repos_env(cmd: &mut Command, client: &ReposClient, topology: bool) {
+    let repo = env!("CARGO_MANIFEST_DIR");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let tmpdir = std::env::var_os("TMPDIR")
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
+    let shim_cache = PathBuf::from(&tmpdir).join("dot-git-shim-cache");
+    cmd.env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", &path)
+        .env("TMPDIR", &tmpdir)
+        .env("HOME", &client.home)
+        .env("XDG_CONFIG_HOME", &client.xdg)
+        .env("XDG_CACHE_HOME", &shim_cache)
+        .env("DOT_GIT_REAL", "1")
+        .env("DOT_SOURCE_ROOT", repo)
+        .current_dir(&client.home);
+    if topology {
+        cmd.env("DOT_BASE_TOPOLOGY", "separate").env(
+            "DOT_CLIENT_GIT_DIR",
+            client.base_git_dir.to_string_lossy().into_owned(),
+        );
+    }
+}
+
+/// The production shell (`bin/dot` under `set -euo pipefail`) over
+/// the fixture: the strongest oracle for the wired arms, comparing
+/// process observables end to end.
+fn repos_shell(client: &ReposClient, argv: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(dot::test_support::bash());
+    cmd.arg("bin/dot");
+    for arg in argv {
+        cmd.arg(arg);
+    }
+    repos_env(&mut cmd, client, false);
+    cmd.current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.output().expect("run bin/dot")
+}
+
+/// The Rust binary over the same fixture.
+fn repos_rust(client: &ReposClient, argv: &[&str]) -> std::process::Output {
+    let mut cmd = bin();
+    for arg in argv {
+        cmd.arg(arg);
+    }
+    repos_env(&mut cmd, client, true);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.output().expect("run dot binary")
+}
+
+/// One wired-arm row: the Rust binary and the production shell agree
+/// on exit code and both streams byte for byte.
+fn check_repos(client: &ReposClient, argv: &[&str]) {
+    let shell = repos_shell(client, argv);
+    let rust = repos_rust(client, argv);
+    assert_eq!(
+        rust.status.code(),
+        shell.status.code(),
+        "argv: {argv:?}\n shell stdout: {}\n shell stderr: {}",
+        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    assert_eq!(rust.stdout, shell.stdout, "argv: {argv:?} stdout");
+    assert_eq!(rust.stderr, shell.stderr, "argv: {argv:?} stderr");
+}
+
+#[test]
+fn repos_status_clean_matches_shell() {
+    let client = stage_repos_client();
+    let shell = repos_shell(&client, &["status"]);
+    assert_eq!(shell.status.code(), Some(0), "oracle status code");
+    assert!(
+        String::from_utf8_lossy(&shell.stdout).contains("==> dotfiles"),
+        "oracle sees the base: {}",
+        String::from_utf8_lossy(&shell.stdout),
+    );
+    assert!(
+        String::from_utf8_lossy(&shell.stdout).contains("==> alpha dotfiles"),
+        "oracle sees the overlay: {}",
+        String::from_utf8_lossy(&shell.stdout),
+    );
+    check_repos(&client, &["status"]);
+}
+
+#[test]
+fn repos_status_dirty_matches_shell() {
+    let client = stage_repos_client();
+    // Base: modified tracked file plus one untracked file.
+    std::fs::write(client.home.join("tracked.txt"), b"v1-dirty\n").expect("dirty base");
+    std::fs::write(client.home.join("new.txt"), b"untracked\n").expect("untracked base");
+    // Overlay: modified tracked file.
+    std::fs::write(client.overlay.join("tracked.txt"), b"v1-dirty\n").expect("dirty overlay");
+    let shell = repos_shell(&client, &["status"]);
+    assert_eq!(shell.status.code(), Some(0), "oracle status code");
+    check_repos(&client, &["status"]);
+}
+
+#[test]
+fn repos_status_ahead_behind_matches_shell() {
+    let client = stage_repos_client();
+    // Base moves ahead of its origin.
+    std::fs::write(client.home.join("tracked.txt"), b"v1-ahead\n").expect("ahead file");
+    repos_git_prefix(
+        &client.base_git_dir,
+        &client.home,
+        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
+    );
+    repos_git_prefix(
+        &client.base_git_dir,
+        &client.home,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "ahead",
+        ],
+    );
+    // Overlay falls behind its origin (fetch refreshes the
+    // remote-tracking ref so plain `status` reports behind).
+    seed_advance(&client.overlay_seed, "tracked.txt", b"v1-origin\n");
+    repos_git(&client.overlay, &["fetch", "-q", "origin"]);
+    let shell = repos_shell(&client, &["status"]);
+    assert_eq!(shell.status.code(), Some(0), "oracle status code");
+    let text = String::from_utf8_lossy(&shell.stdout).into_owned();
+    assert!(text.contains("ahead"), "oracle reports ahead: {text}");
+    assert!(text.contains("behind"), "oracle reports behind: {text}");
+    check_repos(&client, &["status"]);
+}
+
+#[test]
+fn repos_status_extra_args_forwarded_like_shell() {
+    let client = stage_repos_client();
+    std::fs::write(client.home.join("tracked.txt"), b"v1-dirty\n").expect("dirty base");
+    check_repos(&client, &["status", "--short", "--branch"]);
+}
+
+#[test]
+fn repos_diff_dirty_matches_shell() {
+    let client = stage_repos_client();
+    // Base dirty (shows a hunks), overlay clean (header only).
+    std::fs::write(client.home.join("tracked.txt"), b"v1\nv2\n").expect("dirty base");
+    let shell = repos_shell(&client, &["diff"]);
+    assert_eq!(shell.status.code(), Some(0), "oracle diff code");
+    assert!(
+        String::from_utf8_lossy(&shell.stdout).contains("==> dotfiles"),
+        "oracle sees the base",
+    );
+    check_repos(&client, &["diff"]);
+    // Both dirty: the overlay section carries its own hunk.
+    std::fs::write(client.overlay.join("tracked.txt"), b"v1\nv2\n").expect("dirty overlay");
+    check_repos(&client, &["diff"]);
+}
+
+#[test]
+fn repos_diff_clean_matches_shell() {
+    let client = stage_repos_client();
+    let shell = repos_shell(&client, &["diff"]);
+    assert_eq!(shell.status.code(), Some(0), "oracle diff code");
+    // No hunks anywhere: headers only, no git output.
+    assert!(shell.stderr.is_empty(), "clean diff is silent on stderr");
+    check_repos(&client, &["diff"]);
+}
+
+/// Capture one separate-topology `git --git-dir/--work-tree` stdout
+/// line, trimmed.
+fn repos_prefix_line(git_dir: &Path, work: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg(format!("--git-dir={}", git_dir.display()))
+        .arg(format!("--work-tree={}", work.display()))
+        .args(args)
+        .env("DOT_GIT_REAL", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .expect("spawn fixture prefix git");
+    assert!(
+        output.status.success(),
+        "prefix git {args:?} in {}",
+        git_dir.display()
+    );
+    String::from_utf8(output.stdout)
+        .expect("git line UTF-8")
+        .trim_end_matches('\n')
+        .to_string()
+}
+
+#[test]
+fn repos_fetch_matches_shell() {
+    let client = stage_repos_client();
+    // Both origins advance while the client stays stale, so `fetch`
+    // prints its update lines on both repos.
+    seed_advance(&client.base_seed, "tracked.txt", b"v1-origin\n");
+    seed_advance(&client.overlay_seed, "tracked.txt", b"v1-origin\n");
+    let base_before = repos_prefix_line(
+        &client.base_git_dir,
+        &client.home,
+        &[
+            "rev-parse",
+            &format!("refs/remotes/origin/{}", client.base_branch),
+        ],
+    );
+    let overlay_before = repos_git_line(
+        &client.overlay,
+        &[
+            "rev-parse",
+            &format!("refs/remotes/origin/{}", client.overlay_branch),
+        ],
+    );
+    let shell = repos_shell(&client, &["fetch"]);
+    assert_eq!(shell.status.code(), Some(0), "oracle fetch code");
+    assert!(
+        String::from_utf8_lossy(&shell.stderr).contains("From file://"),
+        "oracle fetch reports its remotes: {}",
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    // Rewind the oracle's fetch so the Rust run sees the same update.
+    repos_git_prefix(
+        &client.base_git_dir,
+        &client.home,
+        &[
+            "update-ref",
+            &format!("refs/remotes/origin/{}", client.base_branch),
+            &base_before,
+        ],
+    );
+    repos_git(
+        &client.overlay,
+        &[
+            "update-ref",
+            &format!("refs/remotes/origin/{}", client.overlay_branch),
+            &overlay_before,
+        ],
+    );
+    let rust = repos_rust(&client, &["fetch"]);
+    assert_eq!(rust.status.code(), shell.status.code(), "fetch code");
+    assert_eq!(rust.stdout, shell.stdout, "fetch stdout");
+    assert_eq!(rust.stderr, shell.stderr, "fetch stderr");
+}
+
+#[test]
+fn repos_push_matches_shell() {
+    let client = stage_repos_client();
+    // Both repos move ahead of their origins.
+    std::fs::write(client.home.join("tracked.txt"), b"v1-ahead\n").expect("ahead base");
+    repos_git_prefix(
+        &client.base_git_dir,
+        &client.home,
+        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
+    );
+    repos_git_prefix(
+        &client.base_git_dir,
+        &client.home,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "ahead",
+        ],
+    );
+    std::fs::write(client.overlay.join("tracked.txt"), b"v1-ahead\n").expect("ahead overlay");
+    repos_git(
+        &client.overlay,
+        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
+    );
+    repos_git(
+        &client.overlay,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "ahead",
+        ],
+    );
+    // Save the origin and remote-tracking refs the push advances.
+    let base_origin_before = repos_git_line(
+        &client.base_origin,
+        &["rev-parse", &format!("refs/heads/{}", client.base_branch)],
+    );
+    let base_tracking_before = repos_prefix_line(
+        &client.base_git_dir,
+        &client.home,
+        &[
+            "rev-parse",
+            &format!("refs/remotes/origin/{}", client.base_branch),
+        ],
+    );
+    let overlay_origin_before = repos_git_line(
+        &client.overlay_origin,
+        &[
+            "rev-parse",
+            &format!("refs/heads/{}", client.overlay_branch),
+        ],
+    );
+    let overlay_tracking_before = repos_git_line(
+        &client.overlay,
+        &[
+            "rev-parse",
+            &format!("refs/remotes/origin/{}", client.overlay_branch),
+        ],
+    );
+    let shell = repos_shell(&client, &["push"]);
+    assert_eq!(shell.status.code(), Some(0), "oracle push code");
+    assert!(
+        String::from_utf8_lossy(&shell.stderr).contains("To file://"),
+        "oracle push reports its remotes: {}",
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    // Rewind the oracle's push so the Rust run publishes the same update.
+    repos_git(
+        &client.base_origin,
+        &[
+            "update-ref",
+            &format!("refs/heads/{}", client.base_branch),
+            &base_origin_before,
+        ],
+    );
+    repos_git_prefix(
+        &client.base_git_dir,
+        &client.home,
+        &[
+            "update-ref",
+            &format!("refs/remotes/origin/{}", client.base_branch),
+            &base_tracking_before,
+        ],
+    );
+    repos_git(
+        &client.overlay_origin,
+        &[
+            "update-ref",
+            &format!("refs/heads/{}", client.overlay_branch),
+            &overlay_origin_before,
+        ],
+    );
+    repos_git(
+        &client.overlay,
+        &[
+            "update-ref",
+            &format!("refs/remotes/origin/{}", client.overlay_branch),
+            &overlay_tracking_before,
+        ],
+    );
+    let rust = repos_rust(&client, &["push"]);
+    assert_eq!(rust.status.code(), shell.status.code(), "push code");
+    assert_eq!(rust.stdout, shell.stdout, "push stdout");
+    assert_eq!(rust.stderr, shell.stderr, "push stderr");
+}
+
+#[test]
+fn repos_push_rejected_matches_shell() {
+    let client = stage_repos_client();
+    // Diverge the base: a local commit plus an origin advance the
+    // client never fetches, so the base push is rejected. The
+    // dispatcher text ignores kernel status, but production runs
+    // under `set -euo pipefail`, so the failing kernel exits the
+    // process with its own code on both sides.
+    std::fs::write(client.home.join("tracked.txt"), b"v1-local\n").expect("local base");
+    repos_git_prefix(
+        &client.base_git_dir,
+        &client.home,
+        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
+    );
+    repos_git_prefix(
+        &client.base_git_dir,
+        &client.home,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "local",
+        ],
+    );
+    seed_advance(&client.base_seed, "tracked.txt", b"v1-origin\n");
+    let shell = repos_shell(&client, &["push"]);
+    assert_eq!(
+        shell.status.code(),
+        Some(1),
+        "rejected base push exits 1 under errexit: {}",
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&shell.stderr).contains("rejected"),
+        "oracle reports the rejection: {}",
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    // Rejected pushes mutate nothing, so the oracle output compares directly.
+    let rust = repos_rust(&client, &["push"]);
+    assert_eq!(rust.status.code(), shell.status.code(), "push code");
+    assert_eq!(rust.stdout, shell.stdout, "push stdout");
+    assert_eq!(rust.stderr, shell.stderr, "push stderr");
+}
+
+#[test]
+fn repos_resolve_failure_matches_shell() {
+    let client = stage_repos_client();
+    // An invalid descriptor fails overlay resolution before any
+    // kernel runs: both sides exit 1 with the same diagnostics.
+    std::fs::write(
+        client.xdg.join("dot/overlays.d/90-bad.conf"),
+        b"url=x\nsync=hg\n",
+    )
+    .expect("bad descriptor");
+    let shell = repos_shell(&client, &["status"]);
+    assert_eq!(
+        shell.status.code(),
+        Some(1),
+        "oracle resolve-failure code: {}",
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    let rust = repos_rust(&client, &["status"]);
+    assert_eq!(rust.status.code(), shell.status.code(), "status code");
+    assert_eq!(rust.stdout, shell.stdout, "status stdout");
+    assert_eq!(rust.stderr, shell.stderr, "status stderr");
+}
+
+#[test]
+fn repos_status_missing_topology_matches_shell() {
+    // No base repo and no descriptors: resolution succeeds empty
+    // and every kernel no-ops, so both sides exit 0 silently. The
+    // Rust side exports no topology at all here, pinning the
+    // missing default end to end.
+    let scope = TempDir::new("cli-repos-empty").expect("empty scope");
+    let home = scope.path().join("home");
+    let xdg = scope.path().join("xdg");
+    std::fs::create_dir_all(&home).expect("twin home");
+    let repo = env!("CARGO_MANIFEST_DIR");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let tmpdir = std::env::var_os("TMPDIR")
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
+    let mut shell_cmd = Command::new(dot::test_support::bash());
+    shell_cmd.arg("bin/dot").arg("status");
+    shell_cmd
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", &path)
+        .env("TMPDIR", &tmpdir)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("DOT_GIT_REAL", "1")
+        .env("DOT_SOURCE_ROOT", repo)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let shell = shell_cmd.output().expect("run bin/dot");
+    assert_eq!(shell.status.code(), Some(0), "oracle empty status code");
+    assert!(shell.stdout.is_empty(), "oracle empty status is silent");
+    let mut rust_cmd = bin();
+    rust_cmd.arg("status");
+    rust_cmd
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", &path)
+        .env("TMPDIR", &tmpdir)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("DOT_GIT_REAL", "1")
+        .env("DOT_SOURCE_ROOT", repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let rust = rust_cmd.output().expect("run dot binary");
+    assert_eq!(rust.status.code(), shell.status.code(), "status code");
+    assert_eq!(rust.stdout, shell.stdout, "status stdout");
+    assert_eq!(rust.stderr, shell.stderr, "status stderr");
 }
