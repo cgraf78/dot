@@ -1061,10 +1061,13 @@ fn test_suite_pass_matches_shell() {
     // supervisor (`python3` plus `test-timeout-v1`), which some
     // platforms (e.g. the Debian CI image, whose test prerequisites
     // the rust jobs skip) do not provide. The oracle reports the
-    // missing prerequisite itself, so a silent pass can never hide
-    // behind it (the `binary_version_agrees_with_shell_in_same_checkout`
-    // precedent for environment-dependent oracles).
-    if String::from_utf8_lossy(&shell.stderr).contains("suite timeout requires python3") {
+    // missing prerequisite itself — via the suite fifo on stdout,
+    // or stderr — so a silent pass can never hide behind it (the
+    // `binary_version_agrees_with_shell_in_same_checkout` precedent
+    // for environment-dependent oracles).
+    if String::from_utf8_lossy(&shell.stdout).contains("suite timeout requires python3")
+        || String::from_utf8_lossy(&shell.stderr).contains("suite timeout requires python3")
+    {
         eprintln!(
             "SKIP: no python3 suite supervisor here; suite parity is owned by platforms with the test prerequisites"
         );
@@ -1099,8 +1102,11 @@ fn test_suite_fail_matches_shell() {
     // Same loud skip as the pass row above: without the timeout
     // supervisor neither side can execute a suite, so there is no
     // propagation to compare (a coincidental code match would hide
-    // the missing coverage).
-    if String::from_utf8_lossy(&shell.stderr).contains("suite timeout requires python3") {
+    // the missing coverage). Either stream carries the oracle's
+    // report (see above).
+    if String::from_utf8_lossy(&shell.stdout).contains("suite timeout requires python3")
+        || String::from_utf8_lossy(&shell.stderr).contains("suite timeout requires python3")
+    {
         eprintln!(
             "SKIP: no python3 suite supervisor here; suite parity is owned by platforms with the test prerequisites"
         );
