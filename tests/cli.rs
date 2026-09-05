@@ -815,22 +815,46 @@ fn binary_init_early_codes_match_production_shape() {
     );
 }
 
+/// One stateful wired-arm row: the Rust binary and the production
+/// shell agree on exit code and both streams byte for byte, each on
+/// its own twin home/state pair (unlike [`check_init`], whose
+/// shared pair only suits stateless rows).
+fn check_init_twins(argv: &[&str]) {
+    let rust_home = TempDir::new("cli-init-rust").expect("rust home");
+    let rust_state = TempDir::new("cli-init-rust-state").expect("rust state");
+    let shell_home = TempDir::new("cli-init-shell").expect("shell home");
+    let shell_state = TempDir::new("cli-init-shell-state").expect("shell state");
+    let rust = init_bin(&rust_home, &rust_state)
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run dot init");
+    let shell = shell_dot(argv, &shell_home, &shell_state);
+    assert_eq!(rust.status.code(), shell.status.code(), "argv: {argv:?}");
+    assert_eq!(rust.stdout, shell.stdout, "argv: {argv:?}");
+    assert_eq!(rust.stderr, shell.stderr, "argv: {argv:?}");
+}
+
 #[test]
-fn binary_init_rollback_names_the_gap() {
-    // The deep rollback tree is the next slice: the interim closure
-    // names the gap with the legacy dispatcher-level text, keeping
-    // the kernel's failure code per the production contract.
-    let home = TempDir::new("cli-init-gap").expect("twin home");
-    let state = TempDir::new("cli-init-gap-state").expect("twin state");
-    let rust = init_bin(&home, &state)
+fn binary_init_rollback_matches_production() {
+    // The rollback tree runs the real ports now: refusal rows and
+    // the journal-free success row agree with `bin/dot` end to
+    // end (rollback never converges, so streams compare exactly).
+    check_init_twins(&["init", "--rollback"]);
+    let rust_home = TempDir::new("cli-init-rb").expect("rust home");
+    let rust_state = TempDir::new("cli-init-rb-state").expect("rust state");
+    let rust = init_bin(&rust_home, &rust_state)
         .args(["init", "--rollback"])
+        .stdin(Stdio::null())
         .output()
         .expect("run dot init --rollback");
     assert_eq!(rust.status.code(), Some(1));
     assert!(rust.stdout.is_empty());
     assert_eq!(
         rust.stderr,
-        b"dot init: initialization rollback is not yet implemented\n".to_vec()
+        b"dot init: no recoverable transaction\n".to_vec()
     );
 }
 
@@ -1539,4 +1563,13 @@ fn repos_status_missing_topology_matches_shell() {
     assert_eq!(rust.status.code(), shell.status.code(), "status code");
     assert_eq!(rust.stdout, shell.stdout, "status stdout");
     assert_eq!(rust.stderr, shell.stderr, "status stderr");
+}
+
+#[test]
+fn binary_init_fresh_failures_match_production() {
+    // Fresh-tail failures before convergence agree with `bin/dot`
+    // byte for byte: the missing-repository clone fails silently,
+    // and the unknown option keeps its errexit-shaped code.
+    check_init_twins(&["init", "--branch", "main", "file:///nonexistent-origin.git"]);
+    check_init_twins(&["init", "--bogus"]);
 }
