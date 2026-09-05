@@ -15,6 +15,7 @@ pub mod config;
 pub mod constants;
 pub mod cron;
 pub mod doctor_coordinator;
+pub mod doctor_orchestrator;
 pub mod doctor_paths;
 pub mod doctor_records;
 pub mod doctor_runtime;
