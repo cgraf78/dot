@@ -63,10 +63,34 @@ pub struct Request<'a> {
     pub env_policy: Option<&'a str>,
 }
 
-fn reject(message: impl Into<String>) -> Error {
+/// Whether extensions are enabled, mirroring `_dot_extensions_enabled`.
+///
+/// The shell tests the published environment (`DOT_EXTENSION_API == 1`
+/// with a non-empty `DOT_EXTENSIONS_DIR`); by the time Rust runs, those
+/// values have arrived resolved on [`Config`], so this takes the struct
+/// instead of reading the environment.
+pub fn extensions_enabled(config: &Config) -> bool {
+    config.extension_api
+        && config
+            .extensions_dir
+            .as_deref()
+            .is_some_and(|dir| !dir.is_empty())
+}
+
+/// Build a config rejection exactly like `_dot_config_error`.
+///
+/// The shell prints `dot: config: %s` for `$*` to stderr and returns 1;
+/// the engine carries the same payload in [`Error::Config`] (whose
+/// `Display` adds the prefix) and lets the CLI render it to stderr with
+/// the failing exit, so words arrive here already joined with spaces.
+pub fn config_error(message: impl Into<String>) -> Error {
     Error::Config {
         message: message.into(),
     }
+}
+
+fn reject(message: impl Into<String>) -> Error {
+    config_error(message)
 }
 
 /// Validate a HOME value for expansion (mirrors the shell `case`).
@@ -176,6 +200,24 @@ fn profile_identifier_valid(value: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Scan a config file for control bytes, mirroring
+/// `_dot_config_control_bytes` (`od -An -t u1` piped to an `awk` scan).
+///
+/// Returns `true` when the file is clean (shell exit 0): every byte is
+/// LF, printable, or >= 128. Returns `false` (shell exit 1) when any
+/// byte is < 32 except LF, or is DEL — so CR and TAB are rejected here.
+/// A path that cannot be read also fails: production runs under
+/// `set -o pipefail`, so a failed `od` fails the whole `od | awk`
+/// pipeline (probed: missing files exit 1 everywhere; directories
+/// diverge by platform — BSD `od` exits 0 empty, GNU `od` fails —
+/// so directories are port-tested, not differential).
+pub fn config_control_bytes(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    !bytes.iter().any(|b| (*b < 32 && *b != b'\n') || *b == 127)
 }
 
 /// Parse one config file with shell defaults for a missing path.
@@ -570,6 +612,86 @@ mod tests {
             env_policy: None,
         }));
         assert!(text.contains("file exceeds 65536 bytes"), "{text}");
+    }
+
+    #[test]
+    fn config_error_renders_shell_diagnostic() {
+        // The shell prints `dot: config: %s` for `$*`; words arrive
+        // already joined here, and the CLI renders the error to stderr.
+        assert_eq!(
+            format!("{}", config_error("duplicate version")),
+            "dot: config: duplicate version"
+        );
+        assert_eq!(
+            format!("{}", config_error(["a", "b", "c"].join(" "))),
+            "dot: config: a b c"
+        );
+        assert_eq!(format!("{}", config_error("")), "dot: config: ");
+    }
+
+    #[test]
+    fn control_bytes_scan_matches_shell_od_awk() {
+        // (body, clean): TAB/CR/NUL/DEL/US fail; LF, space, tilde,
+        // and high bytes pass — the shell probe agrees on each.
+        let cases: &[(&[u8], bool)] = &[
+            (b"", true),
+            (b"abc\n", true),
+            (b" ~\n", true),
+            (b"\xff\xfe\x80\n", true),
+            (b"a\tb\n", false),
+            (b"a\rb\n", false),
+            (b"a\x00b", false),
+            (b"a\x7fb", false),
+            (b"a\x1fb", false),
+        ];
+        for (index, (body, expected)) in cases.iter().enumerate() {
+            let fx = fixture(body);
+            assert_eq!(
+                config_control_bytes(&fx.path),
+                *expected,
+                "case {index} body {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_bytes_unreadable_paths_fail_closed() {
+        // Production runs under `set -o pipefail`, so a failed `od`
+        // fails the whole `od | awk` pipeline: missing paths and
+        // directories exit 1 (verified against the live oracle).
+        let dir = TempDir::new("config-control").expect("temp dir");
+        assert!(!config_control_bytes(&dir.path().join("does-not-exist")));
+        assert!(!config_control_bytes(dir.path()));
+    }
+
+    #[test]
+    fn control_bytes_follow_symlinks_like_od() {
+        let dir = TempDir::new("config-controllink").expect("temp dir");
+        let target = dir.path().join("real");
+        std::fs::write(&target, b"version=1\n\x01\n").expect("write");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(!config_control_bytes(&link));
+    }
+
+    #[test]
+    fn extensions_gate_needs_api_and_dir() {
+        fn gate(api: bool, dir: Option<&str>) -> bool {
+            extensions_enabled(&Config {
+                version: 1,
+                extension_api: api,
+                extensions_dir: dir.map(str::to_string),
+                provider: Provider::None,
+                default_profile: "base".to_string(),
+                shdeps_update_policy: UpdatePolicy::Pinned,
+                policy_from_env: false,
+            })
+        }
+        assert!(!gate(false, None));
+        assert!(!gate(true, None));
+        assert!(!gate(true, Some("")));
+        assert!(!gate(false, Some("/x")));
+        assert!(gate(true, Some("/x")));
     }
 
     #[test]
