@@ -77,6 +77,7 @@ tests/client-launcher-test	standalone:new
 tests/config-test	standalone:new
 tests/config.rs	standalone:new
 tests/constants.rs	standalone:new
+tests/cron.rs	standalone:new
 tests/doctor_runtime.rs	standalone:new
 tests/doctor-test	dotfiles:tests/core-doctor-test@dotfiles-v1+standalone
 tests/doctor_coordinator.rs	standalone:new
