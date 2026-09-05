@@ -1057,6 +1057,19 @@ fn test_suite_pass_matches_shell() {
         ("DOT_TEST_TESTS_DIR", dir.as_str()),
     ];
     let (shell, rust) = run_engine_pair(&home, &state, &["test", "-s", "pass"], &extra);
+    // Skips are LOUD (stderr): suite execution needs the timeout
+    // supervisor (`python3` plus `test-timeout-v1`), which some
+    // platforms (e.g. the Debian CI image, whose test prerequisites
+    // the rust jobs skip) do not provide. The oracle reports the
+    // missing prerequisite itself, so a silent pass can never hide
+    // behind it (the `binary_version_agrees_with_shell_in_same_checkout`
+    // precedent for environment-dependent oracles).
+    if String::from_utf8_lossy(&shell.stderr).contains("suite timeout requires python3") {
+        eprintln!(
+            "SKIP: no python3 suite supervisor here; suite parity is owned by platforms with the test prerequisites"
+        );
+        return;
+    }
     assert_eq!(
         shell.status.code(),
         Some(0),
@@ -1083,6 +1096,16 @@ fn test_suite_fail_matches_shell() {
         ("DOT_TEST_TESTS_DIR", dir.as_str()),
     ];
     let (shell, rust) = run_engine_pair(&home, &state, &["test", "-s", "fail"], &extra);
+    // Same loud skip as the pass row above: without the timeout
+    // supervisor neither side can execute a suite, so there is no
+    // propagation to compare (a coincidental code match would hide
+    // the missing coverage).
+    if String::from_utf8_lossy(&shell.stderr).contains("suite timeout requires python3") {
+        eprintln!(
+            "SKIP: no python3 suite supervisor here; suite parity is owned by platforms with the test prerequisites"
+        );
+        return;
+    }
     assert_eq!(
         shell.status.code(),
         Some(1),
