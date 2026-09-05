@@ -28,6 +28,7 @@ pub mod glob;
 pub mod hook_api;
 pub mod init_client_adopt;
 pub mod init_client_candidate;
+pub mod init_client_command;
 pub mod init_client_delete;
 pub mod init_client_entry;
 pub mod init_client_generation;

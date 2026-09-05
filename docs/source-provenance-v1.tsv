@@ -180,3 +180,4 @@ tests/doctor_checks.rs	standalone:new
 tests/init_client_parent.rs	standalone:new
 tests/init_client_publish_intent.rs	standalone:new
 tests/init_client_safe_path.rs	standalone:new
+tests/init_client_command.rs	standalone:new
