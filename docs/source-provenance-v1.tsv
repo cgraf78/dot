@@ -150,6 +150,7 @@ tests/progress_ui.rs	standalone:new
 tests/reserved.rs	standalone:new
 tests/resources-test	dotfiles:tests/core-resource-cleanup-test@dotfiles-v1+standalone
 tests/run	standalone:new
+tests/shdeps_env_abi.rs	standalone:new
 tests/shdeps-lock-verifier-test	standalone:new
 tests/shdeps-provider-test	dotfiles:tests/core-test+core-reexec-test@dotfiles-v1+standalone
 tests/shdeps.rs	standalone:new
