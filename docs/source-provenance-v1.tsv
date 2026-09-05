@@ -94,6 +94,7 @@ tests/hook-api-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/hook_api.rs	standalone:new
 tests/hooks-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/init-test	standalone:new
+tests/init_client_adopt.rs	standalone:new
 tests/init_client_candidate.rs	standalone:new
 tests/init_client_delete.rs	standalone:new
 tests/init_client_entry.rs	standalone:new
