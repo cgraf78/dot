@@ -100,6 +100,7 @@ tests/init_client_adopt.rs	standalone:new
 tests/init_client_candidate.rs	standalone:new
 tests/init_client_command.rs	standalone:new
 tests/init_client_delete.rs	standalone:new
+tests/init_client_engine.rs	standalone:new
 tests/init_client_entry.rs	standalone:new
 tests/init_client_generation.rs	standalone:new
 tests/init_client_git.rs	standalone:new
