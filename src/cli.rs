@@ -651,7 +651,7 @@ fn run_init(
 /// (empty falls back to `$HOME/.dotfiles`, like the shell's
 /// `${DOT_CLIENT_GIT_DIR:-...}`). The topology slice fills in the
 /// computation; until then the arm honors the environment.
-fn base_from_env(home: &str) -> crate::repos_base::Base {
+pub(crate) fn base_from_env(home: &str) -> crate::repos_base::Base {
     let topology = match std::env::var("DOT_BASE_TOPOLOGY").ok().as_deref() {
         Some("separate") => crate::repos_base::Topology::Separate,
         Some("ordinary") => crate::repos_base::Topology::Ordinary,

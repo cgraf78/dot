@@ -174,7 +174,7 @@ pub fn run(
         std::env::set_var("DOT_UPDATE_LOCK_TOKEN", guard.token());
     }
     let root = source_root();
-    let code = run_engine(command, args, &root, stdout, stderr, failed);
+    let code = run_update_or_engine(command, args, &root, &state, stdout, stderr, failed);
     // Explicit verified release (never silent removal of a lock that
     // no longer names us): removal failures warn through `log` into
     // stderr, like the shell's EXIT-trap release.
@@ -183,6 +183,46 @@ pub fn run(
         std::env::remove_var("DOT_UPDATE_LOCK_TOKEN");
     }
     code
+}
+
+/// Native update behind `DOT_UPDATE_NATIVE=1`, shell adapter
+/// otherwise — and whenever the native envelope declines (the
+/// engine returns `None`) or the ambient cannot be captured. The
+/// flag is opt-in until differential runs prove the native driver
+/// byte-identical; the shell path stays the default so behavior
+/// never changes silently.
+fn run_update_or_engine(
+    command: &[u8],
+    args: &[OsString],
+    root: &Path,
+    state: &Path,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    failed: &mut bool,
+) -> i32 {
+    let native = std::env::var("DOT_UPDATE_NATIVE").ok().as_deref() == Some("1");
+    if native {
+        if let Some(state_home) = state.to_str() {
+            if let Some(gathered) = crate::update_engine::gather(args, root, state_home) {
+                let inputs = gathered.inputs();
+                let now = crate::update_engine::now_secs();
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                if let Some(code) =
+                    crate::update_engine::run_update(&inputs, &mut out, &mut err, now)
+                {
+                    if stdout.write_all(&out).is_err() {
+                        *failed = true;
+                    }
+                    if stderr.write_all(&err).is_err() {
+                        *failed = true;
+                    }
+                    return code;
+                }
+            }
+        }
+    }
+    run_engine(command, args, root, stdout, stderr, failed)
 }
 
 /// Execute the shell engine adapter and forward its streams byte for

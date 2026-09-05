@@ -2063,3 +2063,155 @@ fn binary_init_fresh_failures_match_production() {
     check_init_twins(&["init", "--branch", "main", "file:///nonexistent-origin.git"]);
     check_init_twins(&["init", "--bogus"]);
 }
+
+/// The Rust binary over the same fixture with the native update
+/// driver opted in (`DOT_UPDATE_NATIVE=1`): the flag flips to
+/// default once every envelope lane proves out the same way.
+fn repos_rust_native(client: &ReposClient, argv: &[&str]) -> std::process::Output {
+    let mut cmd = bin();
+    for arg in argv {
+        cmd.arg(arg);
+    }
+    repos_env(&mut cmd, client, true);
+    cmd.env("DOT_UPDATE_NATIVE", "1");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.output().expect("run dot binary")
+}
+
+/// Scrub one twin's temp scope (every home, XDG, origin, and state
+/// path lives under it) so twin outputs compare on behavior, not
+/// machine paths.
+fn scrub_scope(bytes: &[u8], scope: &std::path::Path) -> Vec<u8> {
+    String::from_utf8_lossy(bytes)
+        .replace(&scope.to_string_lossy().into_owned(), "@SCOPE@")
+        .into_bytes()
+}
+
+/// Scrub update elapsed stamps (trailing `0s`, `1s`) after
+/// asserting each is sane: wall-clock jitter between twins is
+/// expected, but a garbage stamp (an unstarted stage clock) must
+/// still fail loudly. (The suite `(Ns)` marks use the existing
+/// [`scrub_elapsed`] instead.)
+fn scrub_update_elapsed(bytes: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    let mut scrubbed = String::with_capacity(text.len());
+    let mut digits = String::new();
+    for cell in text.chars() {
+        if cell.is_ascii_digit() {
+            digits.push(cell);
+            continue;
+        }
+        if cell == 's' && !digits.is_empty() {
+            let seconds: i64 = digits.parse().expect("elapsed digits parse");
+            assert!(
+                (0..10).contains(&seconds),
+                "elapsed stamp out of sane range: {seconds}s",
+            );
+            scrubbed.push_str("@ELAPSED@s");
+            digits.clear();
+            continue;
+        }
+        scrubbed.push_str(&digits);
+        digits.clear();
+        scrubbed.push(cell);
+    }
+    scrubbed.push_str(&digits);
+    scrubbed.into_bytes()
+}
+
+/// Twin outputs compared on behavior: scope paths, then elapsed
+/// stamps, scrubbed identically on both sides.
+fn scrub_twin(bytes: &[u8], scope: &std::path::Path) -> Vec<u8> {
+    scrub_update_elapsed(&scrub_scope(bytes, scope))
+}
+
+#[test]
+fn update_native_matches_shell_byte_for_byte() {
+    // Twin staged clients (base plus one overlay, both current):
+    // the shell side runs the default adapter, the Rust side the
+    // native driver. Pulls are no-ops, so the run exercises the
+    // deferred close with real counts, discovery, the link phase,
+    // retire, the empty merges close, commit, and normalize.
+    let shell_client = stage_repos_client();
+    let shell = repos_shell(&shell_client, &["update"]);
+    assert_eq!(
+        shell.status.code(),
+        Some(0),
+        "oracle update code\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    let native_client = stage_repos_client();
+    let native = repos_rust_native(&native_client, &["update"]);
+    assert_eq!(
+        native.status.code(),
+        shell.status.code(),
+        "update code\nshell stdout: {}\nshell stderr: {}\nnative stdout: {}\nnative stderr: {}",
+        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&shell.stderr),
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&native.stderr),
+    );
+    assert_eq!(
+        scrub_twin(&native.stdout, native_client.scope.path()),
+        scrub_twin(&shell.stdout, shell_client.scope.path()),
+        "update stdout",
+    );
+    assert_eq!(
+        scrub_twin(&native.stderr, native_client.scope.path()),
+        scrub_twin(&shell.stderr, shell_client.scope.path()),
+        "update stderr",
+    );
+}
+
+#[test]
+fn update_native_failure_matches_shell_byte_for_byte() {
+    // Twin staged clients with a broken base origin: the base
+    // pull fails, so the run exercises the failed deferred close
+    // with real counts, the generation restore, the frozen
+    // preservation rows, and the skipped-inputs close.
+    let break_origin = |client: &ReposClient| {
+        repos_git(
+            &client.base_git_dir,
+            &[
+                "config",
+                "remote.origin.url",
+                "file:///nonexistent-origin.git",
+            ],
+        );
+    };
+    let shell_client = stage_repos_client();
+    break_origin(&shell_client);
+    let shell = repos_shell(&shell_client, &["update"]);
+    assert_ne!(
+        shell.status.code(),
+        Some(0),
+        "oracle update must fail\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    let native_client = stage_repos_client();
+    break_origin(&native_client);
+    let native = repos_rust_native(&native_client, &["update"]);
+    assert_eq!(
+        native.status.code(),
+        shell.status.code(),
+        "failed update code\nshell stdout: {}\nshell stderr: {}\nnative stdout: {}\nnative stderr: {}",
+        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&shell.stderr),
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&native.stderr),
+    );
+    assert_eq!(
+        scrub_twin(&native.stdout, native_client.scope.path()),
+        scrub_twin(&shell.stdout, shell_client.scope.path()),
+        "failed update stdout",
+    );
+    assert_eq!(
+        scrub_twin(&native.stderr, native_client.scope.path()),
+        scrub_twin(&shell.stderr, shell_client.scope.path()),
+        "failed update stderr",
+    );
+}
