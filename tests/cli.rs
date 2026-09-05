@@ -2182,14 +2182,20 @@ fn update_native_failure_matches_shell_byte_for_byte() {
     // Twin staged clients with a broken base origin: the base
     // pull fails, so the run exercises the failed deferred close
     // with real counts, the generation restore, the frozen
-    // preservation rows, and the skipped-inputs close.
+    // preservation rows, and the skipped-inputs close. The dead
+    // target must EXIST: client selection canonicalizes the origin
+    // with `realpath`, and BSD `realpath` (macOS) rejects missing
+    // paths that GNU tolerates — an existing non-repo directory
+    // fails the fetch identically everywhere instead.
     let break_origin = |client: &ReposClient| {
+        let dead = client.scope.path().join("dead-origin");
+        std::fs::create_dir_all(&dead).expect("dead origin dir");
         repos_git(
             &client.base_git_dir,
             &[
                 "config",
                 "remote.origin.url",
-                "file:///nonexistent-origin.git",
+                &format!("file://{}", dead.display()),
             ],
         );
     };
