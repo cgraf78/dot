@@ -1581,6 +1581,13 @@ fn repos_env(cmd: &mut Command, client: &ReposClient, topology: bool) {
         .env("LC_ALL", "C")
         .env("PATH", &path)
         .env("TMPDIR", &tmpdir)
+        // Pin an unknown shell: production always exports `SHELL`
+        // (and bash backfills it from the login shell when it does
+        // not), but this cleared harness env has none — without the
+        // pin the reload hint would read each machine's login shell
+        // on the shell side and nothing on the Rust side. `/bin/sh`
+        // keeps both twins on the rc-files fallback deterministically.
+        .env("SHELL", "/bin/sh")
         .env("HOME", &client.home)
         .env("XDG_CONFIG_HOME", &client.xdg)
         .env("XDG_CACHE_HOME", &shim_cache)
@@ -2136,21 +2143,6 @@ fn update_native_matches_shell_byte_for_byte() {
     // retire, the empty merges close, commit, and normalize.
     let shell_client = stage_repos_client();
     let shell = repos_shell(&shell_client, &["update"]);
-    // TEMPORARY flake probe (revert before merge): dump exactly what
-    // the shell twin's hint decision saw.
-    {
-        let mut probe = Command::new(dot::test_support::bash());
-        probe.arg("-c");
-        probe.arg(
-            "echo \"DBG shell-env SHELL=[$SHELL] RELOADS=[$DOT_UPDATE_RELOADS_SHELL] PPID=$PPID\"; \
-             echo \"DBG parent-comm:\"; cat \"/proc/$PPID/comm\" 2>/dev/null || echo DBG-no-proc; \
-             echo \"DBG home listing:\"; ls -a \"$HOME\"; \
-             echo \"DBG bashrc/zshrc:\"; ls -a \"$HOME/.bashrc\" \"$HOME/.zshrc\" 2>&1",
-        );
-        repos_env(&mut probe, &shell_client, false);
-        let probe = probe.output().expect("probe shell twin env");
-        eprintln!("DBG probe:\n{}", String::from_utf8_lossy(&probe.stdout));
-    }
     assert_eq!(
         shell.status.code(),
         Some(0),
