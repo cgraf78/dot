@@ -415,6 +415,17 @@ pub fn sanitized_git<S: AsRef<std::ffi::OsStr>>(
     cmd
 }
 
+/// `_dot_source_git`: Git bound to the already-selected physical
+/// source root (`${DOT_SOURCE_ROOT:-$PWD}`). A thin composition of
+/// the ported pieces: [`source_root`] resolves the root and
+/// [`sanitized_git`] binds the isolation plus `-c`/`-C` prefix, so
+/// the returned command only needs running (stdio stays inherited,
+/// like the shell function).
+pub fn source_git<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Result<std::process::Command> {
+    let root = source_root()?;
+    Ok(sanitized_git(&root, args))
+}
+
 /// Run `git hash-object` under the sanitized binding; `stdin` feeds
 /// `--stdin` when present. Returns the raw hash line. Crate-visible
 /// for the `_overlay_replacement_hash_object` port, which is this

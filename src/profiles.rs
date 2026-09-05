@@ -636,6 +636,34 @@ impl State {
         Ok(())
     }
 
+    /// `_dot_profiles_load_default`: resolve the default profiles
+    /// directory through XDG (`dot/profiles.d` under the config base)
+    /// and [`State::load`] it. A thin composition of those ported
+    /// pieces (`crate::xdg::path` plus [`State::load`]): the resolve
+    /// happens before `load`'s reset, because the shell returns out
+    /// of `dot_xdg_path` before `_dot_profiles_load` touches any
+    /// state — an unresolvable base leaves prior state (and the
+    /// configuration error) intact. The failure message reuses
+    /// `load`'s vocabulary for engine callers but is deliberately
+    /// not recorded, matching the shell's silent return.
+    pub fn load_default(
+        &mut self,
+        xdg_config: &str,
+        home: &str,
+        default_profile: Option<&str>,
+    ) -> Result<(), Error> {
+        let dir =
+            match crate::xdg::path(crate::xdg::Kind::Config, "dot/profiles.d", xdg_config, home) {
+                Ok(dir) => PathBuf::from(dir),
+                Err(_) => {
+                    return Err(Error::named(
+                        "cannot resolve profiles directory".to_string(),
+                    ));
+                }
+            };
+        self.load(Some(&dir), xdg_config, home, default_profile)
+    }
+
     /// Parse one selector file into [`Selector`].
     pub fn selector_parse(
         &mut self,
