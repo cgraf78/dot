@@ -18,10 +18,14 @@
 //! ([`crate::update::parse_update_flags`]): the shell loop's exports
 //! land in the process environment while the engine (sync/finalize)
 //! stays shell-owned, so the interim diagnostic remains; slice 79
-//! drives `init` through [`init_client_command::run`]. The shell
-//! `bin/dot` remains the entry point and never routes here yet.
+//! drives `init` through [`init_client_command::run`]; slice 82
+//! drives `fetch`/`push`/`status`/`diff` through overlay resolution
+//! ([`crate::overlays::resolve`]) plus the matching
+//! [`crate::repos_commands`] kernel. The shell `bin/dot` remains
+//! the entry point and never routes here yet.
 
 use std::ffi::OsString;
+use std::io::IsTerminal as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -108,21 +112,38 @@ pub enum Command {
     /// `cleanup`).
     Update,
     /// `fetch`: `_dot_resolve_overlays fetch` (failure returns `1`),
-    /// then `_repo_fetch_all "$@"` (status ignored → `0`).
-    /// Kernel [`crate::repos_commands::fetch_all`] is ported; overlay
-    /// resolution lives in another lane.
+    /// then `_repo_fetch_all "$@"`. Wired by slice 82 through
+    /// `run_repos`: the ported [`crate::overlays::resolve`] plus
+    /// [`crate::repos_commands::fetch_all`].
+    ///
+    /// Exit-code note: the dispatcher text ignores the kernel status
+    /// (`0` regardless), but production runs under `set -euo
+    /// pipefail` (`bin/dot`, `lib/dot/main.sh`), so a failing kernel
+    /// exits the process with its own code before the dispatcher
+    /// resumes — a rejected base push exits `1`, pinned against
+    /// `bin/dot`. `run_repos` therefore reports the kernel's code
+    /// directly (the [`Command::Init`] precedent).
     Fetch,
     /// `push`: `_dot_resolve_overlays inspect` (failure returns `1`),
-    /// then `_repo_push_all "$@"` (status ignored → `0`).
-    /// Kernel [`crate::repos_commands::push_all`] is ported.
+    /// then `_repo_push_all "$@"`. Wired by slice 82 through
+    /// `run_repos`: the ported [`crate::overlays::resolve`] plus
+    /// [`crate::repos_commands::push_all`]. Kernel codes cross the
+    /// process boundary under `set -euo pipefail` (see
+    /// [`Command::Fetch`]).
     Push,
     /// `status`: `_dot_resolve_overlays inspect` (failure returns
-    /// `1`), then `_repo_status_all "$@"` (status ignored → `0`).
-    /// Kernel [`crate::repos_commands::status_all`] is ported.
+    /// `1`), then `_repo_status_all "$@"`. Wired by slice 82 through
+    /// `run_repos`: the ported [`crate::overlays::resolve`] plus
+    /// [`crate::repos_commands::status_all`]. Kernel codes cross the
+    /// process boundary under `set -euo pipefail` (see
+    /// [`Command::Fetch`]).
     Status,
     /// `diff`: `_dot_resolve_overlays inspect` (failure returns `1`),
-    /// then `_repo_diff_all "$@"` (status ignored → `0`).
-    /// Kernel [`crate::repos_commands::diff_all`] is ported.
+    /// then `_repo_diff_all "$@"`. Wired by slice 82 through
+    /// `run_repos`: the ported [`crate::overlays::resolve`] plus
+    /// [`crate::repos_commands::diff_all`]. Kernel codes cross the
+    /// process boundary under `set -euo pipefail` (see
+    /// [`Command::Fetch`]).
     Diff,
     /// `cron`: `crontab -l`, falling back to `no crontab installed`
     /// (always `0`). Executed in [`run`] — no kernel, owned here.
@@ -250,6 +271,10 @@ pub fn run(
             Command::Init => {
                 let rest: Vec<Vec<u8>> = args.map(|arg| argv_bytes(&arg)).collect();
                 run_init(&rest, stdout, stderr, &mut failed)
+            }
+            command @ (Command::Fetch | Command::Push | Command::Status | Command::Diff) => {
+                let rest: Vec<OsString> = args.collect();
+                run_repos(command, &rest, stdout, stderr)
             }
             Command::Unknown => {
                 // A closed stderr here leaves nothing to report to; the
@@ -420,6 +445,152 @@ fn run_init(
     report.code
 }
 
+/// Base topology for the repo arms, read off the `model.sh`
+/// publication at the dispatcher boundary (exactly like
+/// [`run_init`] reads its ambient inputs).
+///
+/// `_dot_client_select` itself stays shell-owned — it reads the
+/// init identity, which has no topology port yet — so this consumes
+/// only what `model.sh` exports: `DOT_BASE_TOPOLOGY` (an unset or
+/// foreign value reads as missing, the shell's
+/// `DOT_BASE_TOPOLOGY=missing` default) and `DOT_CLIENT_GIT_DIR`
+/// (empty falls back to `$HOME/.dotfiles`, like the shell's
+/// `${DOT_CLIENT_GIT_DIR:-...}`). The topology slice fills in the
+/// computation; until then the arm honors the environment.
+fn base_from_env(home: &str) -> crate::repos_base::Base {
+    let topology = match std::env::var("DOT_BASE_TOPOLOGY").ok().as_deref() {
+        Some("separate") => crate::repos_base::Topology::Separate,
+        Some("ordinary") => crate::repos_base::Topology::Ordinary,
+        _ => crate::repos_base::Topology::Missing,
+    };
+    let git_dir = std::env::var("DOT_CLIENT_GIT_DIR")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or_else(|| format!("{home}/.dotfiles"));
+    crate::repos_base::Base {
+        topology,
+        client_git_dir: git_dir,
+        home: home.to_string(),
+    }
+}
+
+/// The [`Command::Fetch`], [`Command::Push`], [`Command::Status`],
+/// and [`Command::Diff`] arms: `_dot_resolve_overlays fetch` for
+/// fetch, `inspect` for the rest (`|| return 1`), then the matching
+/// [`crate::repos_commands`] kernel over `"$@"`.
+///
+/// The dispatcher text ignores the kernel status (`return "$rc"`
+/// with `rc=0`), but production runs under `set -euo pipefail`, so
+/// a failing kernel exits the process with its own code before the
+/// dispatcher resumes — the arm reports the kernel's code directly
+/// (the [`Command::Init`] precedent, pinned against `bin/dot`).
+///
+/// Process environment is read here — the dispatcher is the engine
+/// boundary, so ambient reads live in this arm while the kernel
+/// modules take explicit parameters. Resolution diagnostics replay
+/// the shell's stderr (collected warnings plus the failure line,
+/// when the shell prints one); kernel headers go to `stdout`,
+/// overlay push warnings to `stderr`, and git's own output streams
+/// to the terminal through the kernel, exactly like the shell's
+/// inherited stdio. Color follows fd 1 (`[[ -t 1 ]]`), not the
+/// injected stream, so piped runs stay byte-identical on both
+/// sides. Extra arguments pass through to `git` verbatim.
+fn run_repos(
+    command: Command,
+    args: &[OsString],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    if !matches!(
+        command,
+        Command::Fetch | Command::Push | Command::Status | Command::Diff
+    ) {
+        return EXIT_ERROR;
+    }
+    let mode = if command == Command::Fetch {
+        "fetch"
+    } else {
+        "inspect"
+    };
+    let home = std::env::var("HOME").unwrap_or_default();
+    let prefix = std::env::var_os("PREFIX").unwrap_or_default();
+    let prefix = prefix.to_string_lossy();
+    let inputs = crate::overlays::ResolveInputs {
+        home: home.clone(),
+        xdg_config: std::env::var("XDG_CONFIG_HOME").unwrap_or_default(),
+        discovery_silent: std::env::var("DOT_OVERLAY_DISCOVERY_SILENT")
+            .map(|value| value == "1")
+            .unwrap_or(false),
+        default_profile: std::env::var("DOT_DEFAULT_PROFILE")
+            .ok()
+            .filter(|value| !value.is_empty()),
+        user: crate::profiles::current_user(),
+        host: crate::platform::detect_host().ok(),
+        platform: crate::platform::detect_platform().ok(),
+        termux: !prefix.is_empty() && prefix.contains("/com.termux/"),
+        euid: match crate::temp::current_uid() {
+            Some(uid) => uid,
+            None => return EXIT_ERROR,
+        },
+    };
+    let mut state = crate::overlays::State::default();
+    let mut profiles = crate::profiles::State::default();
+    if let Err(error) = crate::overlays::resolve(&mut state, &mut profiles, mode, &inputs) {
+        for warning in &state.warnings {
+            let _ = writeln!(stderr, "{warning}");
+        }
+        let rendered = error.to_string();
+        if !rendered.is_empty() {
+            let _ = writeln!(stderr, "{rendered}");
+        }
+        return EXIT_ERROR;
+    }
+    let base = base_from_env(&home);
+    // The shell checks `[[ -t 1 && -z ${NO_COLOR:-} ]]` on the real
+    // fd 1; the injected stream may be a capture buffer, so color
+    // follows the process stdout instead.
+    let log = crate::log::Log::from_env(
+        std::io::stdout().is_terminal(),
+        std::env::var("NO_COLOR").ok().as_deref(),
+        std::env::var("DOT_QUIET").ok().as_deref(),
+    );
+    match command {
+        Command::Fetch => {
+            // The shell pays the same fork (`mask=$(umask)`); the
+            // fallback is unreachable without a working `sh`, where
+            // git is gone too.
+            let mask = crate::temp::read_umask().unwrap_or(0o022);
+            crate::repos_commands::fetch_all(
+                &log,
+                stdout,
+                &base,
+                &state.overlays,
+                &home,
+                args,
+                mask,
+            )
+        }
+        Command::Push => crate::repos_commands::push_all(
+            &log,
+            stdout,
+            stderr,
+            &base,
+            &state.overlays,
+            &home,
+            args,
+        ),
+        Command::Status => {
+            crate::repos_commands::status_all(&log, stdout, &base, &state.overlays, &home, args)
+        }
+        Command::Diff => {
+            crate::repos_commands::diff_all(&log, stdout, &base, &state.overlays, &home, args)
+        }
+        // Decided above; kept as generic failure, never a panic
+        // (panics would break the stderr byte contract).
+        _ => EXIT_ERROR,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,16 +741,114 @@ mod tests {
     }
 
     #[test]
+    fn base_from_env_honors_model_publication() {
+        // The `model.sh` publication read at the dispatcher boundary:
+        // known topologies pass through, anything else (unset,
+        // `missing`, foreign) reads as missing, and an empty git dir
+        // falls back to `$HOME/.dotfiles` like `${VAR:-...}`.
+        // Process env is shared with sibling threads, so the case
+        // captures the entry state, then restores it before asserting.
+        let keys = ["DOT_BASE_TOPOLOGY", "DOT_CLIENT_GIT_DIR"];
+        let saved: Vec<(String, Option<OsString>)> = keys
+            .iter()
+            .map(|key| (key.to_string(), std::env::var_os(key)))
+            .collect();
+        let restore = || {
+            // `unsafe` in edition 2024; the case is the only writer
+            // of these keys while it runs, and it restores entry state.
+            unsafe {
+                for (key, value) in &saved {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        };
+        let cases: &[(
+            Option<&str>,
+            Option<&str>,
+            crate::repos_base::Topology,
+            &str,
+        )] = &[
+            (
+                Some("separate"),
+                Some("/h/.dotfiles"),
+                crate::repos_base::Topology::Separate,
+                "/h/.dotfiles",
+            ),
+            (
+                Some("ordinary"),
+                Some("/h/.git"),
+                crate::repos_base::Topology::Ordinary,
+                "/h/.git",
+            ),
+            (
+                None,
+                None,
+                crate::repos_base::Topology::Missing,
+                "/h/.dotfiles",
+            ),
+            (
+                Some("missing"),
+                None,
+                crate::repos_base::Topology::Missing,
+                "/h/.dotfiles",
+            ),
+            (
+                Some("bogus"),
+                Some("/h/.git"),
+                crate::repos_base::Topology::Missing,
+                "/h/.git",
+            ),
+            (
+                Some("separate"),
+                Some(""),
+                crate::repos_base::Topology::Separate,
+                "/h/.dotfiles",
+            ),
+            (
+                Some("separate"),
+                None,
+                crate::repos_base::Topology::Separate,
+                "/h/.dotfiles",
+            ),
+        ];
+        let mut observed = Vec::new();
+        unsafe {
+            for (topology, git_dir, _, _) in cases {
+                match topology {
+                    Some(value) => std::env::set_var("DOT_BASE_TOPOLOGY", value),
+                    None => std::env::remove_var("DOT_BASE_TOPOLOGY"),
+                }
+                match git_dir {
+                    Some(value) => std::env::set_var("DOT_CLIENT_GIT_DIR", value),
+                    None => std::env::remove_var("DOT_CLIENT_GIT_DIR"),
+                }
+                let base = base_from_env("/h");
+                observed.push((base.topology, base.client_git_dir, base.home));
+            }
+        }
+        restore();
+        for (index, (_, _, want_topology, want_git_dir)) in cases.iter().enumerate() {
+            let (got_topology, got_git_dir, got_home) = &observed[index];
+            assert_eq!(got_topology, want_topology, "case: {index}");
+            assert_eq!(got_git_dir, want_git_dir, "case: {index}");
+            assert_eq!(got_home, "/h", "case: {index}");
+        }
+    }
+
+    #[test]
     fn kernel_commands_report_not_implemented_not_unknown() {
         // Known commands whose kernels live in other lanes: the
         // dispatch decision is final, so they must never fall through
         // to the unknown-command diagnostic. Interim exit is the
         // generic failure until the owning slice wires the kernel.
-        // (`init` left this set when slice 79 wired it; see the
-        // `init_*` tests below.)
-        for command in [
-            "update", "pull", "fetch", "push", "status", "diff", "doctor", "test",
-        ] {
+        // (`init` left this set when slice 79 wired it, and
+        // `fetch`/`push`/`status`/`diff` when slice 82 wired them;
+        // see the `init_*` tests and the `repos_*` rows in
+        // `tests/cli.rs`.)
+        for command in ["update", "pull", "doctor", "test"] {
             let (code, out, err) = run_text(&[command]);
             assert_eq!(code, EXIT_ERROR, "command: {command}");
             assert!(out.is_empty(), "command: {command}");
