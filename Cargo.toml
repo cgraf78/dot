@@ -1,0 +1,28 @@
+[package]
+name = "dot"
+# Cargo requires SemVer here and prints it during local builds. The public
+# `dot version` identity still comes from build.rs so binaries stay
+# commit-traceable, but the package version should look intentional in
+# Cargo output instead of leaking a placeholder.
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Fast declarative dotfiles manager (Rust port of the dot engine)"
+build = "build.rs"
+
+[lib]
+name = "dot"
+
+[[bin]]
+name = "dot"
+path = "src/main.rs"
+
+# Treat compiler warnings as build errors. CI runs `cargo clippy --locked
+# --all-targets --all-features -- -D warnings`, but ordinary local builds
+# and tests used to silently produce warnings that masked real regressions.
+# Promoting warnings to errors here makes those regressions visible at edit
+# time rather than at CI time. Granular overrides (e.g.,
+# `#[allow(dead_code)]` on a specific item) still work.
+[lints.rust]
+warnings = "deny"
