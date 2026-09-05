@@ -183,4 +183,5 @@ tests/update_lock.rs	standalone:new
 tests/workflow-test	standalone:new
 tests/xdg.rs	standalone:new
 tests/repos_pull_overlay.rs	standalone:new
+tests/update_parpull.rs	standalone:new
 tests/update_run.rs	standalone:new

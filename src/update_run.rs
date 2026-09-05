@@ -37,6 +37,16 @@
 //! - Colors and live progress follow the child's pipes (never a tty),
 //!   so interactive-terminal cosmetics match a piped shell run rather
 //!   than a direct-to-tty one; rows and codes are unaffected.
+//!
+//! Overlay pull parallelism rides along unchanged: the child's
+//! `_pull_overlays` fans checkouts out within the `_dot_update_jobs`
+//! bound (`DOT_UPDATE_JOBS`, else the CPU count), and the native
+//! equivalent ([`crate::repos_pull_fleet::pull_overlays`], scoped
+//! threads under [`crate::merges::update_jobs`]) already pins the
+//! same ordered replay and tally. `tests/update_parpull.rs` holds the
+//! end-to-end differential contract — exit codes `0`/`1`/`2`/`75`,
+//! byte-identical converged trees, and wall-clock medians — that the
+//! final native wiring must preserve.
 
 use std::ffi::OsString;
 use std::io::Write;
