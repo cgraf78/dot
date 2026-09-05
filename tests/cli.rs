@@ -12,6 +12,12 @@
 //! lands, so for kernel-backed arms the tests pin the oracle's trace
 //! and exit code (the contract the kernel slice inherits) alongside
 //! the Rust interim "not yet implemented" behavior — never conflated.
+//!
+//! Slice 83 wires the last two arms (`doctor`, `test`) end to end:
+//! the engine rows below compare the Rust binary against the live
+//! `bin/dot` on fixtures — exit code plus both streams, byte for
+//! byte — so the interim set is empty and no known command reports
+//! "not yet implemented" anymore.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -641,26 +647,481 @@ fn update_applies_flag_exports_before_engine() {
     restore();
 }
 
+/// The production shell over the twin home (unlike [`shell_dot`],
+/// whose checkout cwd would change test source selection): the
+/// strongest oracle for the wired doctor/test arms, comparing
+/// process observables end to end on the same env and cwd.
+fn engine_shell(
+    home: &TempDir,
+    state: &TempDir,
+    argv: &[&str],
+    extra: &[(&str, &str)],
+) -> std::process::Output {
+    // Absolute launcher path: `cwd` is the twin home below (not
+    // the checkout like `shell_dot`), so a relative script would
+    // not resolve.
+    let launcher = Path::new(env!("CARGO_MANIFEST_DIR")).join("bin/dot");
+    let mut cmd = Command::new(dot::test_support::bash());
+    cmd.arg(&launcher);
+    for arg in argv {
+        cmd.arg(arg);
+    }
+    init_env(&mut cmd, home, state);
+    for (key, value) in extra {
+        cmd.env(key, value);
+    }
+    cmd.current_dir(home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.output().expect("run bin/dot")
+}
+
+/// The Rust binary over the same fixture.
+fn engine_rust(
+    home: &TempDir,
+    state: &TempDir,
+    argv: &[&str],
+    extra: &[(&str, &str)],
+) -> std::process::Output {
+    let mut cmd = bin();
+    for arg in argv {
+        cmd.arg(arg);
+    }
+    init_env(&mut cmd, home, state);
+    for (key, value) in extra {
+        cmd.env(key, value);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.output().expect("run dot binary")
+}
+
+/// One engine-arm row: the shell runs first (the oracle), then the
+/// Rust binary on the same home/state — the rows below are read-only
+/// (doctor) or hermetic to their own suite dirs (test), so the
+/// second run observes the same client — and exit code plus both
+/// streams must agree byte for byte.
+fn run_engine_pair(
+    home: &TempDir,
+    state: &TempDir,
+    argv: &[&str],
+    extra: &[(&str, &str)],
+) -> (std::process::Output, std::process::Output) {
+    let shell = engine_shell(home, state, argv, extra);
+    let rust = engine_rust(home, state, argv, extra);
+    (shell, rust)
+}
+
+/// Assert one engine-arm row: exit code and both streams, byte for byte.
+fn check_engine_pair(shell: &std::process::Output, rust: &std::process::Output, argv: &[&str]) {
+    assert_eq!(
+        rust.status.code(),
+        shell.status.code(),
+        "argv: {argv:?}\n shell stdout: {}\n shell stderr: {}",
+        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    assert_eq!(rust.stdout, shell.stdout, "argv: {argv:?} stdout");
+    assert_eq!(rust.stderr, shell.stderr, "argv: {argv:?} stderr");
+}
+
+/// Trust one fixture path exactly like the shell suites do (`umask
+/// 077` there): the ambient test umask may be permissive, so modes
+/// are set explicitly rather than inherited.
+#[cfg(unix)]
+fn seal(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("seal fixture");
+}
+
 #[test]
-fn binary_kernel_arms_report_not_implemented() {
-    // Interim contract until each kernel slice lands: known commands
-    // exit generic-failure with their own diagnostic — never the
-    // unknown-command one, and never success. (`init` left this set
-    // when its slice wired it, `fetch`/`push`/`status`/`diff` when
-    // slice 82 wired them, and `update`/`pull` when slice 80 wired
-    // them, leaving only `doctor`/`test` — see the
-    // `binary_init_*` tests below, the `repos_*` rows, and
-    // `tests/update_run.rs`.)
-    for command in ["doctor", "test"] {
-        let rust = bin().arg(command).output().expect("run dot command");
-        assert_eq!(rust.status.code(), Some(1), "command: {command}");
-        assert!(rust.stdout.is_empty(), "command: {command}");
-        assert_eq!(
-            rust.stderr,
-            format!("dot: command '{command}' is not yet implemented\n").into_bytes(),
-            "command: {command}"
+fn doctor_empty_home_matches_shell() {
+    // No client checkout: the base-repo check fails, so doctor
+    // reports the failure rows and exits 1 — nothing to stage.
+    let home = TempDir::new("cli-doctor-empty").expect("twin home");
+    let state = TempDir::new("cli-doctor-empty-state").expect("twin state");
+    let (shell, rust) = run_engine_pair(&home, &state, &["doctor"], &[]);
+    assert_eq!(
+        shell.status.code(),
+        Some(1),
+        "oracle fails without a client: {}",
+        String::from_utf8_lossy(&shell.stdout),
+    );
+    assert!(
+        String::from_utf8_lossy(&shell.stdout).contains("client repository is missing"),
+        "oracle names the missing client: {}",
+        String::from_utf8_lossy(&shell.stdout),
+    );
+    assert!(shell.stderr.is_empty(), "clean doctor is silent on stderr");
+    check_engine_pair(&shell, &rust, &["doctor"]);
+}
+
+/// Initialized file:// client for the doctor pass/extension rows: a
+/// one-commit bare origin plus a shell `init --yes` (the oracle
+/// stages the client, like the shell suites do — the arm under test
+/// below is doctor, compared row by row).
+fn stage_doctor_client() -> (TempDir, TempDir, TempDir) {
+    let scope = TempDir::new("cli-doctor-origin").expect("origin scope");
+    let (origin, _seed, _branch) = seed_bare_origin(scope.path(), "dotfiles");
+    let home = TempDir::new("cli-doctor-client").expect("twin home");
+    let state = TempDir::new("cli-doctor-client-state").expect("twin state");
+    let url = format!("file://{}", origin.display());
+    let staged = engine_shell(&home, &state, &["init", "--yes", &url], &[]);
+    assert_eq!(
+        staged.status.code(),
+        Some(0),
+        "oracle stages the client: {}",
+        String::from_utf8_lossy(&staged.stderr),
+    );
+    (scope, home, state)
+}
+
+#[test]
+fn doctor_init_client_matches_shell() {
+    // Healthy client, no extensions: warnings stay (the worktree
+    // checkout is outside the managed locations), failures clear,
+    // exit 0.
+    let (_scope, home, state) = stage_doctor_client();
+    let (shell, rust) = run_engine_pair(&home, &state, &["doctor"], &[]);
+    assert_eq!(
+        shell.status.code(),
+        Some(0),
+        "oracle passes on a healthy client: {} {}",
+        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&shell.stdout).contains("0 failed"),
+        "oracle reports zero failures: {}",
+        String::from_utf8_lossy(&shell.stdout),
+    );
+    assert!(
+        shell.stderr.is_empty(),
+        "passing doctor is silent on stderr"
+    );
+    check_engine_pair(&shell, &rust, &["doctor"]);
+}
+
+/// Home whose overlay resolution fails: the dispatcher prints the
+/// resolve warning on stderr, then doctor still runs (`|| true`)
+/// while test refuses (`|| return 1`).
+fn stage_bad_descriptor() -> (TempDir, TempDir) {
+    let home = TempDir::new("cli-bad-desc").expect("twin home");
+    let state = TempDir::new("cli-bad-desc-state").expect("twin state");
+    let confd = home.path().join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&confd).expect("overlay conf dir");
+    std::fs::write(home.path().join(".config/dot/config"), b"version=1\n").expect("config");
+    std::fs::write(confd.join("90-bad.conf"), b"url=x\nsync=hg\n").expect("bad descriptor");
+    (home, state)
+}
+
+#[test]
+fn doctor_resolve_failure_matches_shell() {
+    let (home, state) = stage_bad_descriptor();
+    let (shell, rust) = run_engine_pair(&home, &state, &["doctor"], &[]);
+    assert_eq!(
+        shell.status.code(),
+        Some(1),
+        "oracle doctor still reports its checks: {}",
+        String::from_utf8_lossy(&shell.stdout),
+    );
+    assert!(
+        String::from_utf8_lossy(&shell.stderr).contains("unknown sync value: hg"),
+        "oracle prints the resolve warning: {}",
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&shell.stdout).contains("dot runtime"),
+        "oracle doctor still ran: {}",
+        String::from_utf8_lossy(&shell.stdout),
+    );
+    check_engine_pair(&shell, &rust, &["doctor"]);
+}
+
+#[test]
+fn test_resolve_failure_matches_shell() {
+    let (home, state) = stage_bad_descriptor();
+    let (shell, rust) = run_engine_pair(&home, &state, &["test"], &[]);
+    assert_eq!(
+        shell.status.code(),
+        Some(1),
+        "oracle test refuses without resolution: {}",
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    assert!(
+        shell.stdout.is_empty(),
+        "refused test prints nothing on stdout"
+    );
+    assert!(
+        String::from_utf8_lossy(&shell.stderr).contains("unknown sync value: hg"),
+        "oracle prints the resolve warning: {}",
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    check_engine_pair(&shell, &rust, &["test"]);
+}
+
+/// One failing doctor extension on an initialized client, mirroring
+/// the shell-suite trust recipe (0700 extension dirs, sealed
+/// scripts, explicit extension config): the worker failure marks
+/// `status=1`, so doctor exits 1 after the core rows.
+fn stage_doctor_extension(home: &TempDir) {
+    let extd = home.path().join("extensions/doctor.d");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config dir");
+    std::fs::create_dir_all(&extd).expect("extension dir");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=none\n",
+    )
+    .expect("extension config");
+    std::fs::write(
+        extd.join("20-failing.sh"),
+        b"doctor() {\n  dot_doctor_fail 'expected extension failure' 'fixture failure'\n  return 1\n}\n",
+    )
+    .expect("failing extension");
+    #[cfg(unix)]
+    {
+        seal(&home.path().join("extensions"), 0o700);
+        seal(&extd, 0o700);
+        seal(&extd.join("20-failing.sh"), 0o644);
+    }
+}
+
+#[test]
+fn doctor_extension_failure_matches_shell() {
+    let (_scope, home, state) = stage_doctor_client();
+    stage_doctor_extension(&home);
+    let (shell, rust) = run_engine_pair(&home, &state, &["doctor"], &[]);
+    assert_eq!(
+        shell.status.code(),
+        Some(1),
+        "oracle aggregates the extension failure: {}",
+        String::from_utf8_lossy(&shell.stdout),
+    );
+    assert!(
+        String::from_utf8_lossy(&shell.stdout).contains("expected extension failure"),
+        "oracle carries the extension record: {}",
+        String::from_utf8_lossy(&shell.stdout),
+    );
+    check_engine_pair(&shell, &rust, &["doctor"]);
+}
+
+#[test]
+fn test_help_matches_shell() {
+    // Static pin beside the oracle comparison, so a future wording
+    // drift reads as an explicit contract change.
+    let home = TempDir::new("cli-test-help").expect("twin home");
+    let state = TempDir::new("cli-test-help-state").expect("twin state");
+    let (shell, rust) = run_engine_pair(&home, &state, &["test", "--help"], &[]);
+    assert_eq!(shell.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&shell.stdout),
+        "usage: dot test [-s|--sequential] [-v|--verbose] [-j N|--jobs N] [--list] [name ...]\n\
+         \n\
+         Set DOT_TEST_INCLUDE_PROVIDER=1 to include the provider suite in an\n\
+         unfiltered run. Select `dot` by name to run only the provider suite.\n",
+    );
+    assert!(shell.stderr.is_empty());
+    check_engine_pair(&shell, &rust, &["test", "--help"]);
+}
+
+#[test]
+fn test_unknown_option_matches_shell() {
+    let home = TempDir::new("cli-test-opt").expect("twin home");
+    let state = TempDir::new("cli-test-opt-state").expect("twin state");
+    let (shell, rust) = run_engine_pair(&home, &state, &["test", "--bogus"], &[]);
+    assert_eq!(shell.status.code(), Some(2));
+    assert!(shell.stdout.is_empty());
+    assert_eq!(shell.stderr, b"unknown option: --bogus\n");
+    check_engine_pair(&shell, &rust, &["test", "--bogus"]);
+}
+
+#[test]
+fn test_list_matches_shell() {
+    // No suites configured: only the provider identity lists.
+    let home = TempDir::new("cli-test-list").expect("twin home");
+    let state = TempDir::new("cli-test-list-state").expect("twin state");
+    let (shell, rust) = run_engine_pair(&home, &state, &["test", "-l"], &[]);
+    assert_eq!(shell.status.code(), Some(0));
+    assert_eq!(shell.stdout, b"dot\n");
+    assert!(shell.stderr.is_empty());
+    check_engine_pair(&shell, &rust, &["test", "-l"]);
+}
+
+/// Local `*-test` suites for the propagation rows: one passing
+/// (`complete` record, exit 0), one failing (exit 3, no record).
+/// Discovery runs through `DOT_TEST_TESTS_DIR`, so no client
+/// checkout is needed; the scope lives in an exec-capable dir (the
+/// system temp dir may be `noexec`) with sealed modes, mirroring
+/// the shell-suite trust recipe.
+struct SuiteFixture {
+    /// Temp scope owning every path below (held for the test).
+    #[allow(dead_code)]
+    scope: TempDir,
+    dir: PathBuf,
+}
+
+fn stage_suites() -> SuiteFixture {
+    let scope = TempDir::new_exec("cli-test-suites").expect("suite scope");
+    let dir = scope.path().join("suites");
+    std::fs::create_dir_all(&dir).expect("suite dir");
+    std::fs::write(
+        dir.join("pass-test"),
+        b"#!/usr/bin/env bash\nprintf 'complete\\t0\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"\nexit 0\n",
+    )
+    .expect("pass suite");
+    std::fs::write(dir.join("fail-test"), b"#!/usr/bin/env bash\nexit 3\n").expect("fail suite");
+    #[cfg(unix)]
+    {
+        seal(&dir, 0o700);
+        seal(&dir.join("pass-test"), 0o755);
+        seal(&dir.join("fail-test"), 0o755);
+    }
+    SuiteFixture { scope, dir }
+}
+
+/// Scrub suite elapsed marks (` (0s)`, ` (12s)`) from one stream
+/// before comparing: the runner stamps `$SECONDS` (integer
+/// precision), so a loaded machine can tip a mark across a second
+/// boundary on one side only. Codes, glyphs, labels, ordering, and
+/// summaries still compare exactly — only wall-clock is excluded
+/// from byte parity. The digit run keeps `(1 total)`-style clauses
+/// (digits followed by a space, never `s)`) intact.
+fn scrub_elapsed(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let mut end = index + 2;
+        while bytes.get(end).is_some_and(|byte| byte.is_ascii_digit()) {
+            end += 1;
+        }
+        let mark = bytes.get(index) == Some(&b' ')
+            && bytes.get(index + 1) == Some(&b'(')
+            && end > index + 2
+            && bytes.get(end) == Some(&b's')
+            && bytes.get(end + 1) == Some(&b')');
+        if mark {
+            out.extend_from_slice(b" (Ns)");
+            index = end + 2;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+#[test]
+fn scrub_elapsed_keeps_counts_but_not_wall_clock() {
+    assert_eq!(
+        scrub_elapsed("  ✓ pass-test (0s)\nSuites: 1 passed (1 total)\n".as_bytes()),
+        "  ✓ pass-test (Ns)\nSuites: 1 passed (1 total)\n".as_bytes(),
+    );
+    assert_eq!(
+        scrub_elapsed("  ✗ fail-test (12s)\n".as_bytes()),
+        "  ✗ fail-test (Ns)\n".as_bytes(),
+    );
+    assert_eq!(scrub_elapsed(b"no marks here\n"), b"no marks here\n");
+}
+
+/// One suite-propagation row: exit code plus stderr compare exactly;
+/// stdout compares with elapsed marks scrubbed (see
+/// [`scrub_elapsed`]).
+fn check_suite_pair(shell: &std::process::Output, rust: &std::process::Output, argv: &[&str]) {
+    assert_eq!(
+        rust.status.code(),
+        shell.status.code(),
+        "argv: {argv:?}\n shell stdout: {}\n shell stderr: {}",
+        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    assert_eq!(
+        scrub_elapsed(&rust.stdout),
+        scrub_elapsed(&shell.stdout),
+        "argv: {argv:?} stdout",
+    );
+    assert_eq!(rust.stderr, shell.stderr, "argv: {argv:?} stderr");
+}
+
+#[test]
+fn test_suite_pass_matches_shell() {
+    // `DOT_TEST_NO_COLOR=1` selects the plain rendering both sides
+    // share regardless of gum.
+    let fixture = stage_suites();
+    let home = TempDir::new("cli-test-pass").expect("twin home");
+    let state = TempDir::new("cli-test-pass-state").expect("twin state");
+    let dir = fixture.dir.to_string_lossy().into_owned();
+    let extra = [
+        ("DOT_TEST_NO_COLOR", "1"),
+        ("DOT_TEST_TESTS_DIR", dir.as_str()),
+    ];
+    let (shell, rust) = run_engine_pair(&home, &state, &["test", "-s", "pass"], &extra);
+    assert_eq!(
+        shell.status.code(),
+        Some(0),
+        "oracle passes the passing suite: {} {}",
+        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&shell.stdout).contains("Suites: 1 passed (1 total)"),
+        "oracle prints the pass summary: {}",
+        String::from_utf8_lossy(&shell.stdout),
+    );
+    check_suite_pair(&shell, &rust, &["test", "-s", "pass"]);
+}
+
+#[test]
+fn test_suite_fail_matches_shell() {
+    let fixture = stage_suites();
+    let home = TempDir::new("cli-test-fail").expect("twin home");
+    let state = TempDir::new("cli-test-fail-state").expect("twin state");
+    let dir = fixture.dir.to_string_lossy().into_owned();
+    let extra = [
+        ("DOT_TEST_NO_COLOR", "1"),
+        ("DOT_TEST_TESTS_DIR", dir.as_str()),
+    ];
+    let (shell, rust) = run_engine_pair(&home, &state, &["test", "-s", "fail"], &extra);
+    assert_eq!(
+        shell.status.code(),
+        Some(1),
+        "oracle fails the failing suite: {} {}",
+        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&shell.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&shell.stdout).contains("1 failed"),
+        "oracle prints the fail summary: {}",
+        String::from_utf8_lossy(&shell.stdout),
+    );
+    check_suite_pair(&shell, &rust, &["test", "-s", "fail"]);
+}
+
+#[test]
+fn binary_doctor_test_wired_past_interim() {
+    // Slice 83: the interim set is empty — every `Command` variant
+    // has a dedicated arm in `run`, so no known command may report
+    // "not yet implemented" (routing finality is pinned by
+    // `dispatch_names_every_shell_arm`, execution parity by the
+    // engine rows above). This smoke asserts the diagnostic is gone
+    // on the cheapest deterministic rows.
+    let home = TempDir::new("cli-wired").expect("twin home");
+    let state = TempDir::new("cli-wired-state").expect("twin state");
+    for argv in [&["test", "--help"][..], &["test", "--bogus"][..]] {
+        let rust = engine_rust(&home, &state, argv, &[]);
+        let combined = [rust.stdout.as_slice(), rust.stderr.as_slice()].concat();
+        assert!(
+            !combined.windows(19).any(|w| w == b"not yet implemented"),
+            "argv: {argv:?}",
         );
     }
+    let rust = engine_rust(&home, &state, &["doctor"], &[]);
+    let combined = [rust.stdout.as_slice(), rust.stderr.as_slice()].concat();
+    assert!(
+        !combined.windows(19).any(|w| w == b"not yet implemented"),
+        "doctor is wired",
+    );
 }
 
 /// Extract the `_dot_init_usage` heredoc body from the shell source,
