@@ -503,12 +503,14 @@ fn binary_unknown_non_utf8_matches_oracle() {
 }
 
 #[test]
-fn update_applies_flag_exports_before_pending_engine() {
-    // Slice 78 drives `Command::Update` through the sequencer's flag
-    // parser: the shell loop's exports land in the process
-    // environment, while the engine (sync/finalize) stays
-    // shell-owned, so the interim diagnostic and generic-failure
-    // code remain. Process env is shared with sibling threads, so
+fn update_applies_flag_exports_before_engine() {
+    // Slice 80 runs `Command::Update` end to end: the shell loop's
+    // exports land in the process environment (via the sequencer's
+    // flag parser), then the engine runs for real — exit `0` on the
+    // empty-HOME fixture, never the interim diagnostic. The engine
+    // reads the ambient client, so the case redirects HOME, state,
+    // and config at an isolated pair first (never the developer's
+    // own checkout). Process env is shared with sibling threads, so
     // the case captures every touched variable, then restores the
     // entry state before asserting.
     use dot::cli::run;
@@ -521,6 +523,12 @@ fn update_applies_flag_exports_before_pending_engine() {
         "DOT_VERBOSE",
         "SHDEPS_LOG_LEVEL",
         "DOT_OVERLAY_LINKS_FROZEN",
+        "HOME",
+        "XDG_STATE_HOME",
+        "XDG_CONFIG_HOME",
+        "DOT_SOURCE_ROOT",
+        "DOT_BASH",
+        "DOT_UPDATE_LOCK_TOKEN",
     ];
     let saved: Vec<(String, Option<OsString>)> = keys
         .iter()
@@ -538,8 +546,8 @@ fn update_applies_flag_exports_before_pending_engine() {
             }
         }
     };
-    // (argv, expected exports): `None` reads as unset.
-    type FlagCase<'a> = (&'a [&'a str], &'a [(&'a str, Option<&'a str>)]);
+    // (argv, expected exports, quiet run): `None` reads as unset.
+    type FlagCase<'a> = (&'a [&'a str], &'a [(&'a str, Option<&'a str>)], bool);
     let cases: &[FlagCase<'_>] = &[
         (
             &["update", "--cron"],
@@ -551,6 +559,7 @@ fn update_applies_flag_exports_before_pending_engine() {
                 ("DOT_VERBOSE", None),
                 ("SHDEPS_LOG_LEVEL", None),
             ],
+            true,
         ),
         (
             &["pull", "-f", "--verbose"],
@@ -562,6 +571,7 @@ fn update_applies_flag_exports_before_pending_engine() {
                 ("DOT_VERBOSE", Some("1")),
                 ("SHDEPS_LOG_LEVEL", Some("2")),
             ],
+            false,
         ),
         (
             &["update", "--quiet", "-x"],
@@ -573,14 +583,21 @@ fn update_applies_flag_exports_before_pending_engine() {
                 ("DOT_VERBOSE", None),
                 ("SHDEPS_LOG_LEVEL", None),
             ],
+            true,
         ),
     ];
-    for (argv, expected) in cases {
+    for (argv, expected, quiet) in cases {
+        let home = TempDir::new("cli-update-home").expect("isolated home");
+        let state = TempDir::new("cli-update-state").expect("isolated state");
         unsafe {
             for key in keys {
                 std::env::remove_var(key);
             }
             std::env::set_var("DOT_OVERLAY_LINKS_FROZEN", "1");
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("XDG_STATE_HOME", state.path());
+            std::env::set_var("XDG_CONFIG_HOME", "");
+            std::env::set_var("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"));
         }
         let owned: Vec<OsString> = argv.iter().map(OsString::from).collect();
         let mut out = Vec::new();
@@ -592,13 +609,24 @@ fn update_applies_flag_exports_before_pending_engine() {
             .collect();
         let frozen = std::env::var_os("DOT_OVERLAY_LINKS_FROZEN");
         restore();
-        assert_eq!(code, 1, "argv: {argv:?}");
-        assert!(out.is_empty(), "argv: {argv:?}");
-        assert_eq!(
-            err,
-            format!("dot: command '{}' is not yet implemented\n", argv[0]).into_bytes(),
+        // An empty HOME has no base repo and nothing to converge:
+        // the shell succeeds with its no-base rows (pinned against
+        // `bin/dot`), so the wired arm reports `0` — never the
+        // interim diagnostic.
+        assert_eq!(code, 0, "argv: {argv:?}");
+        assert!(err.is_empty(), "argv: {argv:?}");
+        assert!(
+            !out.windows(19).any(|w| w == b"not yet implemented"),
             "argv: {argv:?}"
         );
+        if *quiet {
+            assert!(out.is_empty(), "argv: {argv:?}");
+        } else {
+            assert!(
+                out.windows(17).any(|w| w == b"Reload your shell"),
+                "argv: {argv:?}"
+            );
+        }
         for ((key, want), (_, got)) in expected.iter().zip(observed) {
             assert_eq!(
                 got.as_deref(),
@@ -618,10 +646,10 @@ fn binary_kernel_arms_report_not_implemented() {
     // Interim contract until each kernel slice lands: known commands
     // exit generic-failure with their own diagnostic — never the
     // unknown-command one, and never success. (`init` left this set
-    // when its slice wired it; see the `binary_init_*` tests below.)
-    for command in [
-        "update", "pull", "fetch", "push", "status", "diff", "doctor", "test",
-    ] {
+    // when its slice wired it, and `update`/`pull` left when slice
+    // 80 wired them — see the `binary_init_*` tests below and
+    // `tests/update_run.rs`.)
+    for command in ["fetch", "push", "status", "diff", "doctor", "test"] {
         let rust = bin().arg(command).output().expect("run dot command");
         assert_eq!(rust.status.code(), Some(1), "command: {command}");
         assert!(rust.stdout.is_empty(), "command: {command}");

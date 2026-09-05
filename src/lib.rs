@@ -81,6 +81,7 @@ pub mod test_support;
 pub mod ui;
 pub mod update;
 pub mod update_lock;
+pub mod update_run;
 pub mod version;
 pub mod xdg;
 

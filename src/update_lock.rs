@@ -431,7 +431,7 @@ impl LockGuard {
             log.warn(
                 warn_sink,
                 &format!(
-                    "warning: unable to remove dot update lock state: {}",
+                    "  warning: unable to remove dot update lock state: {}",
                     self.lock_dir.display()
                 ),
             );
@@ -560,7 +560,7 @@ pub fn acquire(
             log.warn(
                 warn_sink,
                 &format!(
-                    "warning: dot update lock path is not a directory: {}",
+                    "  warning: dot update lock path is not a directory: {}",
                     lock_dir.display()
                 ),
             );
@@ -575,14 +575,14 @@ pub fn acquire(
 
         if let Some(owner) = read_owner(&lock_dir) {
             if owner_is_active(&owner) {
-                let message = format!("warning: dot update already running (pid {})", owner.pid);
+                let message = format!("  warning: dot update already running (pid {})", owner.pid);
                 if !cron {
                     log.warn(warn_sink, &message);
                 }
                 return Err(Error::LockBusy { message });
             }
         } else if is_initializing(&lock_dir) {
-            let message = "warning: dot update lock is initializing".to_string();
+            let message = "  warning: dot update lock is initializing".to_string();
             if !cron {
                 log.warn(warn_sink, &message);
             }
@@ -591,12 +591,12 @@ pub fn acquire(
 
         if !reclaim_stale(&lock_dir) {
             return Err(Error::LockBusy {
-                message: "warning: dot update already running".to_string(),
+                message: "  warning: dot update already running".to_string(),
             });
         }
     }
     Err(Error::LockBusy {
-        message: "warning: dot update already running".to_string(),
+        message: "  warning: dot update already running".to_string(),
     })
 }
 
