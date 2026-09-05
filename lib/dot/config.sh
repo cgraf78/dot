@@ -77,6 +77,12 @@ _dot_config_expand_path() {
 }
 
 dot_config_load() {
+  # Byte-exact validation: letter ranges in patterns (`[!a-z_]`, regexes
+  # in callees) follow collation order, and on macOS UTF-8 locales `a-z`
+  # spans uppercase (so `Bad_Key` misreported as "unknown key"). Pin C
+  # locale for this load; dynamically scoped, so helpers called below
+  # (`_dot_config_expand_path`, `_dot_profile_identifier_valid`) share it.
+  local LC_ALL=C
   local config_path=${1:-} line key value size line_number=0 saw_value=false
   local seen_version=false seen_extension_api=false
   local seen_extensions_dir=false seen_dependency_provider=false
