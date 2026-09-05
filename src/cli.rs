@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use crate::errors::Error;
 use crate::init_client_command;
+use crate::init_client_engine;
 use crate::init_client_identity as identity;
 use crate::init_client_record::TransactionRecord;
 use crate::version;
@@ -354,12 +355,14 @@ fn run_cron(stdout: &mut dyn Write, failed: &mut bool) -> i32 {
 /// module itself takes explicit parameters (its [`CommandEnv`][init_client_command::CommandEnv]).
 /// Effect-free helpers run as the real ports inside the module; the
 /// network default-branch probe binds its ported helper with a
-/// `TMPDIR` scratch, while the deep resume and rollback trees plus
-/// the line-1872+ fresh tail stay interim "not yet implemented"
-/// closures until their slices fill them in. The arm reports the
-/// kernel's own code, matching the production process under
-/// `set -euo pipefail` (pinned against `bin/dot`; see the
-/// [`Command::Init`] contract).
+/// `TMPDIR` scratch, and the resume, rollback, and fresh-tail steps
+/// bind the production wiring
+/// ([`init_client_engine::Production`]). Only the update-engine
+/// convergence stays behind its fail-closed boundary (see
+/// [`init_client_engine::CONVERGE_PENDING`]) until its lanes land.
+/// The arm reports the kernel's own code, matching the production
+/// process under `set -euo pipefail` (pinned against `bin/dot`;
+/// see the [`Command::Init`] contract).
 fn run_init(
     args: &[Vec<u8>],
     stdout: &mut dyn Write,
@@ -369,6 +372,13 @@ fn run_init(
     let home = std::env::var("HOME").unwrap_or_default();
     let xdg_state_home = std::env::var("XDG_STATE_HOME").unwrap_or_default();
     let skip_provider = std::env::var("DOT_INIT_SKIP_PROVIDER").ok();
+    // The command gate already rejected every spelling but `0` and
+    // `1` before the engine runs; anything else never reaches it.
+    let skip_provider_flag = skip_provider
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("0")
+        == "1";
     let source_root = std::env::var_os("DOT_SOURCE_ROOT").map(PathBuf::from);
     // Degraded-env ownership root: without a source checkout the
     // stage-ownership hash cannot verify, so recovery preserves
@@ -379,24 +389,34 @@ fn run_init(
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
+    // The shell inherits its working directory; a deleted one can
+    // never serve the reserved probe, so fall back to the client
+    // root there (fail closed on the lookup, never on the run).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(&home));
     let remote_default_branch =
         |url: &str| -> Option<String> { identity::remote_default_branch(url, &scratch) };
-    let resume = |_: &Path, _: &Path, _: &TransactionRecord| -> Result<(), Error> {
+    let converge_pending = || -> Result<(), Error> {
         Err(Error::Usage {
-            message: "initialization resume is not yet implemented",
+            message: init_client_engine::CONVERGE_PENDING,
         })
     };
-    let rollback = |_: &Path| -> Result<(), Error> {
-        Err(Error::Usage {
-            message: "initialization rollback is not yet implemented",
-        })
-    };
-    let fresh = |_: &init_client_command::FreshInputs| -> init_client_command::InitReport {
-        init_client_command::InitReport {
-            stdout: Vec::new(),
-            stderr: b"dot: command 'init' is not yet implemented\n".to_vec(),
-            code: EXIT_ERROR,
-        }
+    let production = init_client_engine::Production::new(
+        init_client_engine::EngineCtx {
+            home: &home,
+            xdg_state_home: &xdg_state_home,
+            source_root,
+            skip_provider: skip_provider_flag,
+            cwd: &cwd,
+        },
+        &converge_pending,
+    );
+    let resume = |transaction: &Path,
+                  record: &Path,
+                  journal: &TransactionRecord|
+     -> Result<(), Error> { production.resume(transaction, record, journal) };
+    let rollback = |at: &Path| -> Result<(), Error> { production.rollback(at) };
+    let fresh = |inputs: &init_client_command::FreshInputs| -> init_client_command::InitReport {
+        production.run_fresh(inputs)
     };
     let env = init_client_command::CommandEnv {
         home: &home,
