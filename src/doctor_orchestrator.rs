@@ -43,6 +43,11 @@
 
 use std::path::{Path, PathBuf};
 
+/// Summary helpers owned by the coordinator lane
+/// ([`crate::doctor_coordinator`]), re-exported here so orchestrator
+/// callers keep one import path.
+pub use crate::doctor_coordinator::{SummaryColor, overall_ok, summary_color, summary_line};
+
 /// One doctor result row, mirroring a single `_dr_*` call.
 ///
 /// `detail` mirrors the shell `$#` arity: `None` renders no
@@ -685,46 +690,6 @@ pub fn doctor_title() -> Vec<u8> {
     b"\ndot doctor\n\n".to_vec()
 }
 
-/// The summary rule of `_dot_doctor`: `%d passed · %d warnings ·
-/// %d failed` over the final counters.
-pub fn summary_line(pass: u64, warn: u64, fail: u64) -> String {
-    format!("{pass} passed · {warn} warnings · {fail} failed")
-}
-
-/// The box color selector of `_dot_doctor`: red when anything
-/// failed, yellow on warnings only, green when clean.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SummaryColor {
-    /// `_DR_FAIL_COUNT -gt 0`.
-    Red,
-    /// No failures, `_DR_WARN_COUNT -gt 0`.
-    Yellow,
-    /// No failures and no warnings.
-    Green,
-}
-
-impl SummaryColor {
-    /// The color name `_dot_doctor` hands to `dot_ui_summary_box`.
-    pub fn name(self) -> &'static str {
-        match self {
-            SummaryColor::Red => "red",
-            SummaryColor::Yellow => "yellow",
-            SummaryColor::Green => "green",
-        }
-    }
-}
-
-/// Select the summary [`SummaryColor`] from the final counters.
-pub fn summary_color(fail_count: u64, warn_count: u64) -> SummaryColor {
-    if fail_count > 0 {
-        SummaryColor::Red
-    } else if warn_count > 0 {
-        SummaryColor::Yellow
-    } else {
-        SummaryColor::Green
-    }
-}
-
 /// `dot_ui_summary_box` under the pipe projection (no gum,
 /// non-tty): the 32-wide `═` rule, the summary line, and the rule
 /// again. The color travels only to gum/tty styling, owned by the
@@ -742,12 +707,6 @@ pub fn summary_box(summary: &[u8]) -> Vec<u8> {
     }
     out.push(b'\n');
     out
-}
-
-/// The exit rule of `_dot_doctor`:
-/// `[[ $_DR_FAIL_COUNT -eq 0 && $status -eq 0 ]]`.
-pub fn overall_ok(fail_count: u64, status: i32) -> bool {
-    fail_count == 0 && status == 0
 }
 
 /// One raw discovery line of `_dot_doctor`'s specs loop:
