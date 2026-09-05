@@ -31,8 +31,8 @@ pub enum Error {
     /// again. Display renders the warning text for contexts that did not
     /// go through `update_lock::acquire`.
     LockBusy {
-        /// The already-emitted warning, e.g. `dot update already
-        /// running (pid 123)`.
+        /// The already-emitted warning, e.g. `  warning: dot update
+        /// already running (pid 123)` (two-space `_warn` indent).
         message: String,
     },
     /// Config rejection with the exact shell diagnostic text (without

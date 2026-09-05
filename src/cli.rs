@@ -18,8 +18,11 @@
 //! ([`crate::update::parse_update_flags`]): the shell loop's exports
 //! land in the process environment while the engine (sync/finalize)
 //! stays shell-owned, so the interim diagnostic remains; slice 79
-//! drives `init` through [`init_client_command::run`]; slice 82
-//! drives `fetch`/`push`/`status`/`diff` through overlay resolution
+//! drives `init` through [`init_client_command::run`]; slice 80
+//! drives [`Command::Update`] end to end through
+//! [`update_run::run`](crate::update_run::run) (native lock plus the
+//! shell engine adapter — exit `0` on success); slice 82 drives
+//! `fetch`/`push`/`status`/`diff` through overlay resolution
 //! ([`crate::overlays::resolve`]) plus the matching
 //! [`crate::repos_commands`] kernel. Slice 84 runs the startup
 //! prelude ([`crate::startup`]) at the top of [`run`]: the re-exec
@@ -114,11 +117,19 @@ pub const EXIT_USAGE: i32 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     /// `update`, plus `pull` (the shell recurses into the `update`
-    /// arm): owner traps, `_dot_update_lock_acquire "$@"` (failure
-    /// returns its status, e.g. lock-busy), then `_dot_update "$@"`
-    /// whose status is ignored — success is `0` regardless.
-    /// Kernels live in other lanes (`update`, `update_lock`,
-    /// `cleanup`).
+    /// arm): owner traps, native `_dot_update_lock_acquire` (failure
+    /// returns its status, e.g. lock-busy `75`), then `_dot_update`
+    /// through the engine adapter, wired to
+    /// [`update_run::run`](crate::update_run::run).
+    ///
+    /// Exit-code note: the dispatcher text ignores the kernel status
+    /// (`0` regardless), but production runs under `set -euo pipefail`
+    /// (`bin/dot`, `lib/dot/main.sh`), so a failing kernel exits the
+    /// process with its own code before the dispatcher resumes —
+    /// `dot update` reports a failure as `1`, pinned against
+    /// `bin/dot`; see the [`Command::Init`] contract. Lock
+    /// acquisition is native here (unlike `init`, whose lock still
+    /// arrives with its slice).
     Update,
     /// `fetch`: `_dot_resolve_overlays fetch` (failure returns `1`),
     /// then `_repo_fetch_all "$@"`. Wired by slice 82 through
@@ -287,7 +298,7 @@ pub fn run(
             Command::Cron => run_cron(stdout, &mut failed),
             Command::Update => {
                 let rest: Vec<OsString> = args.collect();
-                run_update(other, &rest, stderr)
+                run_update(other, &rest, stdout, stderr, &mut failed)
             }
             Command::Init => {
                 let rest: Vec<Vec<u8>> = args.map(|arg| argv_bytes(&arg)).collect();
@@ -323,20 +334,27 @@ pub fn run(
     if failed { EXIT_ERROR } else { code }
 }
 
-/// The [`Command::Update`] arm (slice 78): parse the leading flags
-/// through the sequencer kernel and apply the shell loop's exports,
-/// then report the pending engine.
+/// The [`Command::Update`] arm (slice 80): parse the leading flags
+/// through the sequencer kernel, apply the shell loop's exports,
+/// then run the update end to end and report its exit code (`0` on
+/// success).
 ///
 /// `_dot_update` (`lib/dot/update.sh`) consumes `--cron --quiet
 /// -f`/`--force -v`/`--verbose` up front — exporting the
 /// quiet/force/verbose pairs and unsetting `DOT_OVERLAY_LINKS_FROZEN`
-/// — before the repo sync and finalize steps run. Those steps stay
-/// shell-owned until their slices land, so this arm stops after the
-/// flag side effects with the interim not-yet-implemented diagnostic
-/// ([`EXIT_ERROR`]) — never success, since no engine ran.
-/// `command` names the invoked spelling (`update` or its `pull`
-/// alias) for the diagnostic.
-fn run_update(command: &[u8], args: &[OsString], stderr: &mut dyn Write) -> i32 {
+/// — before the repo sync and finalize steps run. Step execution
+/// stays shell-owned until its slices land, so after the flag side
+/// effects this arm hands the residue to
+/// [`update_run::run`](crate::update_run::run): native lock plus the
+/// shell engine adapter. `command` names the invoked spelling
+/// (`update` or its `pull` alias) for the adapter's original argv.
+fn run_update(
+    command: &[u8],
+    args: &[OsString],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    failed: &mut bool,
+) -> i32 {
     let raw: Vec<Vec<u8>> = args.iter().map(argv_bytes).collect();
     let refs: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
     let parsed = crate::update::parse_update_flags(&refs);
@@ -362,10 +380,13 @@ fn run_update(command: &[u8], args: &[OsString], stderr: &mut dyn Write) -> i32 
             std::env::set_var("SHDEPS_LOG_LEVEL", "2");
         }
     }
-    let _ = stderr.write_all(b"dot: command '");
-    let _ = stderr.write_all(command);
-    let _ = stderr.write_all(b"' is not yet implemented\n");
-    EXIT_ERROR
+    // The engine's own code crosses the dispatcher: production runs
+    // under `set -euo pipefail`, so the shell exits with the
+    // kernel's code (`0` success, `1` failure, `2` config rejection,
+    // `75` lock busy — pinned against `bin/dot`), and so does this
+    // arm. Only undelivered output flips `failed`, which [`run`]
+    // turns into [`EXIT_ERROR`] like the other arms.
+    crate::update_run::run(command, args, stdout, stderr, failed)
 }
 
 /// The [`Command::Cron`] arm: `crontab -l`, falling back to the
@@ -865,11 +886,13 @@ mod tests {
         // dispatch decision is final, so they must never fall through
         // to the unknown-command diagnostic. Interim exit is the
         // generic failure until the owning slice wires the kernel.
-        // (`init` left this set when slice 79 wired it, and
-        // `fetch`/`push`/`status`/`diff` when slice 82 wired them;
-        // see the `init_*` tests and the `repos_*` rows in
-        // `tests/cli.rs`.)
-        for command in ["update", "pull", "doctor", "test"] {
+        // (`init` left this set when slice 79 wired it,
+        // `fetch`/`push`/`status`/`diff` when slice 82 wired them,
+        // and `update`/`pull` when slice 80 wired them, leaving only
+        // `doctor`/`test`; see the `init_*` tests below, the
+        // `repos_*` rows in `tests/cli.rs`, and
+        // `tests/update_run.rs`.)
+        for command in ["doctor", "test"] {
             let (code, out, err) = run_text(&[command]);
             assert_eq!(code, EXIT_ERROR, "command: {command}");
             assert!(out.is_empty(), "command: {command}");
