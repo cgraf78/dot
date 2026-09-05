@@ -83,6 +83,7 @@ tests/doctor_paths.rs	standalone:new
 tests/examples-test	standalone:new
 tests/extension-worker-context-test	standalone:new
 tests/extension_trust.rs	standalone:new
+tests/extension_worker.rs	standalone:new
 tests/extensions-api-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/families-test	dotfiles:tests/core-merges-test@dotfiles-v1
 tests/families.rs	standalone:new
