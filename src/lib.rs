@@ -75,6 +75,7 @@ pub mod shdeps;
 pub mod shdeps_env_abi;
 pub mod shdeps_ui;
 pub mod shdeps_ui_render;
+pub mod startup;
 pub mod temp;
 pub mod test_suites;
 pub mod test_support;
