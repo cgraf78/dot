@@ -57,6 +57,7 @@ pub mod run;
 pub mod shdeps;
 pub mod shdeps_ui;
 pub mod temp;
+pub mod test_suites;
 pub mod test_support;
 pub mod ui;
 pub mod update;
