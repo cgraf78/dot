@@ -19,6 +19,7 @@ pub mod extension_trust;
 pub mod families;
 pub mod glob;
 pub mod hook_api;
+pub mod init_client_identity;
 pub mod init_client_transaction;
 pub mod log;
 pub mod merge_block;
