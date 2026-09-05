@@ -100,6 +100,7 @@ tests/init_client_entry.rs	standalone:new
 tests/init_client_generation.rs	standalone:new
 tests/init_client_identity.rs	standalone:new
 tests/init_client_plan.rs	standalone:new
+tests/init_client_publish.rs	standalone:new
 tests/init_client_record.rs	standalone:new
 tests/init_client_records.rs	standalone:new
 tests/init_client_transaction.rs	standalone:new
