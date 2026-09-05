@@ -120,6 +120,7 @@ tests/lib/repo.sh	standalone:new
 tests/lib/test.sh	standalone:new
 tests/library-test	standalone:new
 tests/license-test	standalone:new
+tests/link_all.rs	standalone:new
 tests/link_exec.rs	standalone:new
 tests/link_prep.rs	standalone:new
 tests/log.rs	standalone:new
