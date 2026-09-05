@@ -103,6 +103,7 @@ tests/init_client_plan.rs	standalone:new
 tests/init_client_publish.rs	standalone:new
 tests/init_client_record.rs	standalone:new
 tests/init_client_records.rs	standalone:new
+tests/init_client_rollback.rs	standalone:new
 tests/init_client_transaction.rs	standalone:new
 tests/install-test	standalone:new
 tests/lib/repo.sh	standalone:new
