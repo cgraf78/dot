@@ -503,6 +503,117 @@ fn binary_unknown_non_utf8_matches_oracle() {
 }
 
 #[test]
+fn update_applies_flag_exports_before_pending_engine() {
+    // Slice 78 drives `Command::Update` through the sequencer's flag
+    // parser: the shell loop's exports land in the process
+    // environment, while the engine (sync/finalize) stays
+    // shell-owned, so the interim diagnostic and generic-failure
+    // code remain. Process env is shared with sibling threads, so
+    // the case captures every touched variable, then restores the
+    // entry state before asserting.
+    use dot::cli::run;
+    use std::ffi::OsString;
+    let keys = [
+        "DOT_QUIET",
+        "SHDEPS_QUIET",
+        "DOT_FORCE",
+        "SHDEPS_FORCE",
+        "DOT_VERBOSE",
+        "SHDEPS_LOG_LEVEL",
+        "DOT_OVERLAY_LINKS_FROZEN",
+    ];
+    let saved: Vec<(String, Option<OsString>)> = keys
+        .iter()
+        .map(|key| (key.to_string(), std::env::var_os(key)))
+        .collect();
+    let restore = || {
+        // `unsafe` in edition 2024; the case is the only writer of
+        // these keys while it runs, and it restores entry state.
+        unsafe {
+            for (key, value) in &saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    };
+    // (argv, expected exports): `None` reads as unset.
+    type FlagCase<'a> = (&'a [&'a str], &'a [(&'a str, Option<&'a str>)]);
+    let cases: &[FlagCase<'_>] = &[
+        (
+            &["update", "--cron"],
+            &[
+                ("DOT_QUIET", Some("1")),
+                ("SHDEPS_QUIET", Some("1")),
+                ("DOT_FORCE", None),
+                ("SHDEPS_FORCE", None),
+                ("DOT_VERBOSE", None),
+                ("SHDEPS_LOG_LEVEL", None),
+            ],
+        ),
+        (
+            &["pull", "-f", "--verbose"],
+            &[
+                ("DOT_QUIET", None),
+                ("SHDEPS_QUIET", None),
+                ("DOT_FORCE", Some("1")),
+                ("SHDEPS_FORCE", Some("1")),
+                ("DOT_VERBOSE", Some("1")),
+                ("SHDEPS_LOG_LEVEL", Some("2")),
+            ],
+        ),
+        (
+            &["update", "--quiet", "-x"],
+            &[
+                ("DOT_QUIET", Some("1")),
+                ("SHDEPS_QUIET", Some("1")),
+                ("DOT_FORCE", None),
+                ("SHDEPS_FORCE", None),
+                ("DOT_VERBOSE", None),
+                ("SHDEPS_LOG_LEVEL", None),
+            ],
+        ),
+    ];
+    for (argv, expected) in cases {
+        unsafe {
+            for key in keys {
+                std::env::remove_var(key);
+            }
+            std::env::set_var("DOT_OVERLAY_LINKS_FROZEN", "1");
+        }
+        let owned: Vec<OsString> = argv.iter().map(OsString::from).collect();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(owned, &mut out, &mut err);
+        let observed: Vec<(&str, Option<OsString>)> = expected
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        let frozen = std::env::var_os("DOT_OVERLAY_LINKS_FROZEN");
+        restore();
+        assert_eq!(code, 1, "argv: {argv:?}");
+        assert!(out.is_empty(), "argv: {argv:?}");
+        assert_eq!(
+            err,
+            format!("dot: command '{}' is not yet implemented\n", argv[0]).into_bytes(),
+            "argv: {argv:?}"
+        );
+        for ((key, want), (_, got)) in expected.iter().zip(observed) {
+            assert_eq!(
+                got.as_deref(),
+                want.map(OsString::from).as_deref(),
+                "argv: {argv:?} var: {key}"
+            );
+        }
+        // The sequencer clears rollback authority on entry, like the
+        // shell's `unset DOT_OVERLAY_LINKS_FROZEN`.
+        assert_eq!(frozen, None, "argv: {argv:?} frozen link generation");
+    }
+    restore();
+}
+
+#[test]
 fn binary_kernel_arms_report_not_implemented() {
     // Interim contract until each kernel slice lands: known commands
     // exit generic-failure with their own diagnostic — never the
