@@ -61,6 +61,7 @@ pub mod repos_commands;
 pub mod repos_config;
 pub mod repos_dirty;
 pub mod repos_git;
+pub mod repos_link_prep;
 pub mod repos_overlays;
 pub mod repos_pull;
 pub mod repos_pull_backup;
