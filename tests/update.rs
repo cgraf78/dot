@@ -1635,14 +1635,22 @@ fn finalize_fold_agrees() {
                 // back to the shdeps defaults, like `${VAR:-...}`.
                 let (expected, expected_err, outcome) =
                     dot::update::finalize_fold(&palette, false, false, false, true, &inputs, 0);
-                assert_eq!(shell_rc, outcome.rc, "finalize rc {index}");
-                assert_eq!(expected_err, err, "finalize stderr {index}");
-                let mut rows = rows.to_vec();
-                rows.extend_from_slice(format!("rc={shell_rc}").as_bytes());
-                let mut want = expected;
-                want.extend_from_slice(format!("rc={}", outcome.rc).as_bytes());
-                assert_eq!(want, rows, "finalize stdout {index}");
-                (want, rows)
+                // Pack every compared observable (exit code, stderr,
+                // stdout rows) into the returned blobs instead of
+                // asserting here: the `_ui_done` row measures bash
+                // `$SECONDS` at 1s granularity, so a run straddling a
+                // second tick legitimately differs, and the
+                // `assert_bytes_stable` wrapper can only retry what
+                // the closure returns rather than what it panics on.
+                let mut actual = format!("rc={shell_rc}\n").into_bytes();
+                actual.extend_from_slice(&err);
+                actual.extend_from_slice(rows);
+                actual.extend_from_slice(format!("rc={shell_rc}").as_bytes());
+                let mut ideal = format!("rc={}\n", outcome.rc).into_bytes();
+                ideal.extend_from_slice(&expected_err);
+                ideal.extend_from_slice(&expected);
+                ideal.extend_from_slice(format!("rc={}", outcome.rc).as_bytes());
+                (ideal, actual)
             },
             &format!("finalize parity case {index}"),
         );
