@@ -1648,3 +1648,297 @@ fn finalize_fold_agrees() {
         );
     }
 }
+
+/// One `_dot_update` sequencing row: the leading argv, the stubbed
+/// step outcomes (`"0"` reads as success), and the preset provider.
+struct SequenceCase {
+    /// Leading argv for `_dot_update`, including non-flag residue.
+    argv: &'static [&'static str],
+    /// `_is_worktree_dirty` (`"0"` = dirty).
+    dirty: &'static str,
+    /// `_try_resolve_dirty`.
+    resolve: &'static str,
+    /// `_dot_update_sync_repos`.
+    sync: &'static str,
+    /// `dot_config_load` (defensive reload on the sync-ok path).
+    config: &'static str,
+    /// `DOT_INIT_SKIP_PROVIDER=1`.
+    skip: bool,
+    /// `_dot_update_finalize`.
+    finalize: &'static str,
+}
+
+/// Quote one argv word for the shell repro (test data stays free of
+/// single quotes).
+fn quote_arg(arg: &str) -> String {
+    format!("'{arg}'")
+}
+
+/// Run the live `_dot_update` with every step stubbed as a trace
+/// token, then dump the exit code plus the exported environment.
+/// The cron `exit 0` path ends the process before the dump, so the
+/// dump is absent there and the process code carries `rc`.
+fn shell_sequence(case: &SequenceCase) -> (i32, Vec<String>, Vec<(String, String)>) {
+    let dir = TempDir::new("update-sequence").expect("fixture dir");
+    let args = case
+        .argv
+        .iter()
+        .map(|arg| quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let env: Vec<(&str, Option<&str>)> = vec![
+        ("DOT_QUIET", None),
+        ("SHDEPS_QUIET", None),
+        ("DOT_FORCE", None),
+        ("SHDEPS_FORCE", None),
+        ("DOT_VERBOSE", None),
+        ("SHDEPS_LOG_LEVEL", None),
+        ("DOT_DEPENDENCY_PROVIDER", Some("old")),
+        ("DOT_OVERLAY_LINKS_FROZEN", Some("1")),
+        (
+            "DOT_INIT_SKIP_PROVIDER",
+            Some(if case.skip { "1" } else { "0" }),
+        ),
+        ("STUB_DIRTY", Some(case.dirty)),
+        ("STUB_RESOLVE", Some(case.resolve)),
+        ("STUB_SYNC", Some(case.sync)),
+        ("STUB_CONFIG", Some(case.config)),
+        ("STUB_FINALIZE", Some(case.finalize)),
+    ];
+    let (code, out) = shell_run(
+        dir.path(),
+        &env,
+        &format!(
+            "_ui_begin() {{ printf 'BEGIN:%s\\n' \"$*\"; }}\n_ui_done() {{ printf 'DONE:%s\\n' \"$1\"; }}\n_is_worktree_dirty() {{ printf 'DIRTY-CALLED\\n'; return \"$STUB_DIRTY\"; }}\n_try_resolve_dirty() {{ printf 'RESOLVE-CALLED\\n'; return \"$STUB_RESOLVE\"; }}\n_dot_update_sync_repos() {{ printf 'SYNC:%s\\n' \"$*\"; return \"$STUB_SYNC\"; }}\ndot_config_load() {{ printf 'CONFIG-CALLED\\n'; return \"$STUB_CONFIG\"; }}\n_dot_update_finalize() {{ printf 'FINALIZE:%s\\n' \"$1\"; return \"$STUB_FINALIZE\"; }}\n_dot_update {args}; rc=$?; printf 'rc=%s\\n' \"$rc\"\nprintf 'DUMP:\\n'\nprintf 'quiet=%s\\n' \"${{DOT_QUIET:-<unset>}}\"\nprintf 'squiet=%s\\n' \"${{SHDEPS_QUIET:-<unset>}}\"\nprintf 'force=%s\\n' \"${{DOT_FORCE:-<unset>}}\"\nprintf 'sforce=%s\\n' \"${{SHDEPS_FORCE:-<unset>}}\"\nprintf 'verbose=%s\\n' \"${{DOT_VERBOSE:-<unset>}}\"\nprintf 'slevel=%s\\n' \"${{SHDEPS_LOG_LEVEL:-<unset>}}\"\nprintf 'provider=%s\\n' \"${{DOT_DEPENDENCY_PROVIDER:-<unset>}}\"\nprintf 'frozen=%s\\n' \"${{DOT_OVERLAY_LINKS_FROZEN:-<unset>}}\""
+        ),
+    );
+    let text = String::from_utf8(out).expect("sequence dump utf8");
+    let mut tokens = Vec::new();
+    let mut dump = Vec::new();
+    let mut in_dump = false;
+    let mut rc = code;
+    for line in text.lines() {
+        if line == "DUMP:" {
+            in_dump = true;
+            continue;
+        }
+        if in_dump {
+            let (key, value) = line.split_once('=').expect("dump pair");
+            dump.push((key.to_string(), value.to_string()));
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("rc=") {
+            rc = value.parse().expect("rc number");
+            continue;
+        }
+        tokens.push(line.to_string());
+    }
+    (rc, tokens, dump)
+}
+
+/// Drive the Rust sequencer kernels over one row and rebuild the
+/// shell-equivalent trace, exports, and exit code.
+fn rust_sequence(argv: &[&str], case: &SequenceCase) -> (i32, Vec<String>, Vec<(String, String)>) {
+    use dot::update::{CronGate, SequenceInputs, cron_gate, parse_update_flags, sequence_update};
+    let bytes: Vec<&[u8]> = argv.iter().map(|arg| arg.as_bytes()).collect();
+    let parsed = parse_update_flags(&bytes);
+    let remaining = argv[parsed.consumed..].join(" ");
+    let mut tokens = vec!["BEGIN:5".to_string()];
+    // Flag exports mirror the shell loop arm for arm, including
+    // `--cron` implying quiet on both providers.
+    let env = |key: &str, set: bool| {
+        (
+            key.to_string(),
+            if set {
+                "1".to_string()
+            } else {
+                "<unset>".to_string()
+            },
+        )
+    };
+    let mut dump = vec![
+        env("quiet", parsed.quiet),
+        env("squiet", parsed.quiet),
+        env("force", parsed.force),
+        env("sforce", parsed.force),
+        env("verbose", parsed.verbose),
+        ("slevel".to_string(), {
+            if parsed.verbose {
+                "2".to_string()
+            } else {
+                "<unset>".to_string()
+            }
+        }),
+    ];
+    let dirty = case.dirty == "0";
+    let resolved = case.resolve == "0";
+    if cron_gate(parsed.cron_mode, dirty, resolved) == CronGate::ExitSilent {
+        tokens.push("DIRTY-CALLED".to_string());
+        tokens.push("RESOLVE-CALLED".to_string());
+        // The shell `exit 0` ends the process before the dump: the
+        // exports are unobservable there by construction.
+        return (0, tokens, Vec::new());
+    }
+    if parsed.cron_mode {
+        tokens.push("DIRTY-CALLED".to_string());
+        if dirty {
+            tokens.push("RESOLVE-CALLED".to_string());
+        }
+    }
+    tokens.push(format!("SYNC:{remaining}"));
+    let sync_ok = case.sync == "0";
+    let config_ok = case.config == "0";
+    let outcome = sequence_update(&SequenceInputs {
+        sync_ok,
+        config_ok,
+        skip_provider: case.skip,
+        finalize_rc: case.finalize.parse().expect("stub finalize"),
+    });
+    if sync_ok {
+        tokens.push("CONFIG-CALLED".to_string());
+    }
+    let mut provider = "old".to_string();
+    if outcome.provider_none {
+        provider = "none".to_string();
+    }
+    match outcome.finalize_arg {
+        Some(arg) => tokens.push(format!("FINALIZE:{arg}")),
+        None => tokens.push("DONE:1".to_string()),
+    }
+    dump.push(("provider".to_string(), provider));
+    dump.push(("frozen".to_string(), "<unset>".to_string()));
+    (outcome.rc, tokens, dump)
+}
+
+#[test]
+fn update_sequencing_agrees() {
+    // Flag parse rows (clean tree, sync/config/finalize green):
+    // each leading flag is consumed once, `--cron` implies quiet,
+    // and the first non-flag (including `-`, `--`, and `--flag=x`
+    // spellings) stops the loop with the residue forwarded to sync.
+    // Gate rows: cron + dirty + unresolvable exits silently after
+    // `_ui_begin 5`. Sequence rows: sync failure finalizes as failed,
+    // config failure closes via `_ui_done 1` without finalizing, and
+    // the skip-provider export runs only after the reload.
+    let cases = [
+        SequenceCase {
+            argv: &[],
+            dirty: "1",
+            resolve: "1",
+            sync: "0",
+            config: "0",
+            skip: false,
+            finalize: "0",
+        },
+        SequenceCase {
+            argv: &["--cron", "--quiet", "-f", "--verbose", "--", "pos"],
+            dirty: "1",
+            resolve: "1",
+            sync: "0",
+            config: "0",
+            skip: true,
+            finalize: "0",
+        },
+        SequenceCase {
+            argv: &["--force", "-v", "pos", "--cron"],
+            dirty: "1",
+            resolve: "1",
+            sync: "0",
+            config: "0",
+            skip: false,
+            finalize: "0",
+        },
+        SequenceCase {
+            argv: &["-x", "--cron"],
+            dirty: "0",
+            resolve: "1",
+            sync: "0",
+            config: "0",
+            skip: false,
+            finalize: "0",
+        },
+        SequenceCase {
+            argv: &["-"],
+            dirty: "1",
+            resolve: "1",
+            sync: "0",
+            config: "0",
+            skip: false,
+            finalize: "0",
+        },
+        SequenceCase {
+            argv: &["--quiet=x"],
+            dirty: "1",
+            resolve: "1",
+            sync: "0",
+            config: "0",
+            skip: false,
+            finalize: "0",
+        },
+        SequenceCase {
+            argv: &["--cron"],
+            dirty: "0",
+            resolve: "1",
+            sync: "0",
+            config: "0",
+            skip: false,
+            finalize: "0",
+        },
+        SequenceCase {
+            argv: &["--cron", "pos"],
+            dirty: "0",
+            resolve: "0",
+            sync: "0",
+            config: "0",
+            skip: true,
+            finalize: "0",
+        },
+        SequenceCase {
+            argv: &[],
+            dirty: "1",
+            resolve: "1",
+            sync: "3",
+            config: "0",
+            skip: true,
+            finalize: "0",
+        },
+        SequenceCase {
+            argv: &[],
+            dirty: "1",
+            resolve: "1",
+            sync: "3",
+            config: "0",
+            skip: false,
+            finalize: "3",
+        },
+        SequenceCase {
+            argv: &[],
+            dirty: "1",
+            resolve: "1",
+            sync: "0",
+            config: "2",
+            skip: true,
+            finalize: "0",
+        },
+        SequenceCase {
+            argv: &[],
+            dirty: "1",
+            resolve: "1",
+            sync: "0",
+            config: "0",
+            skip: true,
+            finalize: "3",
+        },
+    ];
+    for (index, case) in cases.iter().enumerate() {
+        let (shell_rc, shell_tokens, shell_dump) = shell_sequence(case);
+        let (rust_rc, rust_tokens, rust_dump) = rust_sequence(case.argv, case);
+        assert_eq!(shell_rc, rust_rc, "sequence rc {index}");
+        assert_eq!(shell_tokens, rust_tokens, "sequence trace {index}");
+        assert_eq!(
+            shell_dump, rust_dump,
+            "sequence exports {index} for {:?}",
+            case.argv
+        );
+    }
+}

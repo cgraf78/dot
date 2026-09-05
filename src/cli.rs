@@ -13,8 +13,12 @@
 //! execute here with byte-exact shell parity; the remaining commands
 //! report "not yet implemented" until their kernel slices land (their
 //! dispatch decision is final — a later slice only fills in the call,
-//! never re-decides the routing). The shell `bin/dot` remains the
-//! entry point and never routes here yet.
+//! never re-decides the routing). Slice 78 drives [`Command::Update`]
+//! through the sequencer's flag parser
+//! ([`crate::update::parse_update_flags`]): the shell loop's exports
+//! land in the process environment while the engine (sync/finalize)
+//! stays shell-owned, so the interim diagnostic remains. The shell
+//! `bin/dot` remains the entry point and never routes here yet.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -224,6 +228,10 @@ pub fn run(
         // everything else is `dot_command_dispatch` (`commands.sh`).
         other => match dispatch(other) {
             Command::Cron => run_cron(stdout, &mut failed),
+            Command::Update => {
+                let rest: Vec<OsString> = args.collect();
+                run_update(other, &rest, stderr)
+            }
             Command::Unknown => {
                 // A closed stderr here leaves nothing to report to; the
                 // exit code still carries the failure.
@@ -248,6 +256,51 @@ pub fn run(
     // (The shell dies on SIGPIPE; Rust reports failure via exit code —
     // same signal to the caller, different mechanism, pinned by test.)
     if failed { EXIT_ERROR } else { code }
+}
+
+/// The [`Command::Update`] arm (slice 78): parse the leading flags
+/// through the sequencer kernel and apply the shell loop's exports,
+/// then report the pending engine.
+///
+/// `_dot_update` (`lib/dot/update.sh`) consumes `--cron --quiet
+/// -f`/`--force -v`/`--verbose` up front — exporting the
+/// quiet/force/verbose pairs and unsetting `DOT_OVERLAY_LINKS_FROZEN`
+/// — before the repo sync and finalize steps run. Those steps stay
+/// shell-owned until their slices land, so this arm stops after the
+/// flag side effects with the interim not-yet-implemented diagnostic
+/// ([`EXIT_ERROR`]) — never success, since no engine ran.
+/// `command` names the invoked spelling (`update` or its `pull`
+/// alias) for the diagnostic.
+fn run_update(command: &[u8], args: &[OsString], stderr: &mut dyn Write) -> i32 {
+    let raw: Vec<Vec<u8>> = args.iter().map(argv_bytes).collect();
+    let refs: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
+    let parsed = crate::update::parse_update_flags(&refs);
+    // Entry side effects, in shell order: rollback authority first,
+    // then the flag exports. One `set_var` per variable (never a
+    // batch): each entry stays auditable, matching the repo
+    // differential-test convention. Process env mutation is
+    // `unsafe` in edition 2024; `run` is the single-flight command
+    // entry path (like the shell's own exports), so no other thread
+    // observes a half-applied flag set.
+    unsafe {
+        std::env::remove_var("DOT_OVERLAY_LINKS_FROZEN");
+        if parsed.quiet {
+            std::env::set_var("DOT_QUIET", "1");
+            std::env::set_var("SHDEPS_QUIET", "1");
+        }
+        if parsed.force {
+            std::env::set_var("DOT_FORCE", "1");
+            std::env::set_var("SHDEPS_FORCE", "1");
+        }
+        if parsed.verbose {
+            std::env::set_var("DOT_VERBOSE", "1");
+            std::env::set_var("SHDEPS_LOG_LEVEL", "2");
+        }
+    }
+    let _ = stderr.write_all(b"dot: command '");
+    let _ = stderr.write_all(command);
+    let _ = stderr.write_all(b"' is not yet implemented\n");
+    EXIT_ERROR
 }
 
 /// The [`Command::Cron`] arm: `crontab -l`, falling back to the

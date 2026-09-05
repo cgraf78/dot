@@ -5,8 +5,10 @@
 //! Step execution (pull, profiles, merges, lifecycle) stays in shell
 //! until its slices land: the folds take each step's observed
 //! outcome as data and pin the order, branches, and statuses.
-//! `_dot_update` itself (flag parsing plus `exit`) stays in shell:
-//! a library kernel cannot own process exit.
+//! `_dot_update` sequencing (flag parsing, the cron dirty gate, and
+//! the sync/reload/finalize order) lives here as data kernels; only
+//! step execution and process exit stay with the caller — the cron
+//! `exit 0` arrives as a [`CronGate::ExitSilent`] decision.
 
 use crate::progress_ui::{
     Palette, Stage, arith_value, count_phrase, done, join_comma, progress_detail, warn_line,
@@ -807,5 +809,140 @@ fn shdeps_or<'a>(value: Option<&'a [u8]>, fallback: &'a [u8]) -> &'a [u8] {
     match value {
         Some(text) if !text.is_empty() => text,
         _ => fallback,
+    }
+}
+
+/// Leading-flag parse of `_dot_update`: the
+/// `while [[ "${1:-}" == -* ]]` loop consumes `--cron`, `--quiet`,
+/// `-f`/`--force`, and `-v`/`--verbose` exactly; anything else —
+/// including `-`, `--`, and `--flag=value` spellings — stops the
+/// loop with the residue forwarded to the repo sync. Callers apply
+/// the exports (`DOT_QUIET`/`SHDEPS_QUIET`, `DOT_FORCE`/
+/// `SHDEPS_FORCE`, `DOT_VERBOSE`/`SHDEPS_LOG_LEVEL=2`) and unset
+/// `DOT_OVERLAY_LINKS_FROZEN` on entry, like the shell.
+pub struct UpdateFlagParse {
+    /// `--cron` was seen (implies quiet on both providers).
+    pub cron_mode: bool,
+    /// `--cron` or `--quiet` was seen.
+    pub quiet: bool,
+    /// `-f` or `--force` was seen.
+    pub force: bool,
+    /// `-v` or `--verbose` was seen.
+    pub verbose: bool,
+    /// Leading arguments consumed; the rest forwards to sync.
+    pub consumed: usize,
+}
+
+/// Parse the leading `_dot_update` flags over raw argv bytes (never
+/// decoded: names are pure ASCII, like the shell `case`).
+pub fn parse_update_flags(args: &[&[u8]]) -> UpdateFlagParse {
+    let mut parsed = UpdateFlagParse {
+        cron_mode: false,
+        quiet: false,
+        force: false,
+        verbose: false,
+        consumed: 0,
+    };
+    while let Some(arg) = args.get(parsed.consumed) {
+        if arg.is_empty() || arg[0] != b'-' {
+            break;
+        }
+        match *arg {
+            b"--cron" => {
+                parsed.cron_mode = true;
+                parsed.quiet = true;
+                parsed.consumed += 1;
+            }
+            b"--quiet" => {
+                parsed.quiet = true;
+                parsed.consumed += 1;
+            }
+            b"-f" | b"--force" => {
+                parsed.force = true;
+                parsed.consumed += 1;
+            }
+            b"-v" | b"--verbose" => {
+                parsed.verbose = true;
+                parsed.consumed += 1;
+            }
+            _ => break,
+        }
+    }
+    parsed
+}
+
+/// `_dot_update` cron dirty gate: cron runs must never fight active
+/// local edits, so a dirty tree the resolver cannot clean ends the
+/// run silently. The shell spells that `exit 0`; the kernel returns
+/// a decision and the caller owns the exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronGate {
+    /// The run ends silently with status `0` before repo sync.
+    ExitSilent,
+    /// The run continues into repo sync.
+    Proceed,
+}
+
+/// Decide the cron dirty gate from the observed step outcomes:
+/// `cron_mode` is the parsed `--cron` flag, `dirty` is
+/// `_is_worktree_dirty`, and `resolved` is `_try_resolve_dirty`.
+pub fn cron_gate(cron_mode: bool, dirty: bool, resolved: bool) -> CronGate {
+    if cron_mode && dirty && !resolved {
+        CronGate::ExitSilent
+    } else {
+        CronGate::Proceed
+    }
+}
+
+/// Inputs for [`sequence_update`]: the observed outcome of each
+/// `_dot_update` step after flag parsing and the cron gate, in call
+/// order. Step execution stays in shell until its slices land.
+pub struct SequenceInputs {
+    /// `_dot_update_sync_repos`.
+    pub sync_ok: bool,
+    /// The defensive `dot_config_load` (sync-ok path only).
+    pub config_ok: bool,
+    /// `DOT_INIT_SKIP_PROVIDER == 1`.
+    pub skip_provider: bool,
+    /// `_dot_update_finalize` exit status (finalize paths only).
+    pub finalize_rc: i32,
+}
+
+/// Outcome of [`sequence_update`].
+pub struct SequenceOutcome {
+    /// The function exit status.
+    pub rc: i32,
+    /// `DOT_DEPENDENCY_PROVIDER=none` was exported (sync-ok plus
+    /// reloaded config plus the provider skip).
+    pub provider_none: bool,
+    /// Argument for `_dot_update_finalize`; `None` when the failed
+    /// reload closes via `_ui_done 1` before finalizing.
+    pub finalize_arg: Option<i32>,
+}
+
+/// `_dot_update` sequencing after the cron gate: run the repo sync,
+/// defensively reload policy before provider selection continues,
+/// export the provider skip, and finalize with the carried status.
+/// A failed sync finalizes as failed; a failed reload closes
+/// without finalizing; otherwise the finalize status decides.
+pub fn sequence_update(inputs: &SequenceInputs) -> SequenceOutcome {
+    if !inputs.sync_ok {
+        return SequenceOutcome {
+            rc: 1,
+            provider_none: false,
+            finalize_arg: Some(1),
+        };
+    }
+    if !inputs.config_ok {
+        return SequenceOutcome {
+            rc: 1,
+            provider_none: false,
+            finalize_arg: None,
+        };
+    }
+    SequenceOutcome {
+        rc: if inputs.finalize_rc == 0 { 0 } else { 1 },
+        provider_none: inputs.skip_provider,
+        finalize_arg: Some(0),
     }
 }
