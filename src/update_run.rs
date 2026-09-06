@@ -209,9 +209,13 @@ fn run_update_or_engine(
         == Some("1");
     if native {
         if let Some(state_home) = context.state.to_str() {
-            if let Some(gathered) =
-                crate::update_engine::gather(args, context.runtime.source_root(), state_home)
-            {
+            if let Some(gathered) = crate::update_engine::gather(
+                args,
+                context.runtime.source_root(),
+                state_home,
+                context.env,
+                context.runtime.cwd(),
+            ) {
                 let inputs = gathered.inputs();
                 let now = crate::update_engine::now_secs();
                 let mut out = Vec::new();

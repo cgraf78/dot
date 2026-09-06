@@ -671,14 +671,6 @@ fn run_init(
 /// (empty falls back to `$HOME/.dotfiles`, like the shell's
 /// `${DOT_CLIENT_GIT_DIR:-...}`). The topology slice fills in the
 /// computation; until then the arm honors the environment.
-pub(crate) fn base_from_env(home: &str) -> crate::repos_base::Base {
-    base_from_values(
-        home,
-        std::env::var("DOT_BASE_TOPOLOGY").ok().as_deref(),
-        std::env::var("DOT_CLIENT_GIT_DIR").ok().as_deref(),
-    )
-}
-
 fn base_from_runtime(runtime: &crate::app::Runtime, home: &str) -> crate::repos_base::Base {
     base_from_values(
         home,
@@ -687,7 +679,7 @@ fn base_from_runtime(runtime: &crate::app::Runtime, home: &str) -> crate::repos_
     )
 }
 
-fn base_from_values(
+pub(crate) fn base_from_values(
     home: &str,
     topology_value: Option<&str>,
     git_dir_value: Option<&str>,
@@ -973,30 +965,11 @@ mod tests {
     }
 
     #[test]
-    fn base_from_env_honors_model_publication() {
+    fn base_from_values_honors_model_publication() {
         // The `model.sh` publication read at the dispatcher boundary:
         // known topologies pass through, anything else (unset,
         // `missing`, foreign) reads as missing, and an empty git dir
         // falls back to `$HOME/.dotfiles` like `${VAR:-...}`.
-        // Process env is shared with sibling threads, so the case
-        // captures the entry state, then restores it before asserting.
-        let keys = ["DOT_BASE_TOPOLOGY", "DOT_CLIENT_GIT_DIR"];
-        let saved: Vec<(String, Option<OsString>)> = keys
-            .iter()
-            .map(|key| (key.to_string(), std::env::var_os(key)))
-            .collect();
-        let restore = || {
-            // `unsafe` in edition 2024; the case is the only writer
-            // of these keys while it runs, and it restores entry state.
-            unsafe {
-                for (key, value) in &saved {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-        };
         let cases: &[(
             Option<&str>,
             Option<&str>,
@@ -1047,21 +1020,10 @@ mod tests {
             ),
         ];
         let mut observed = Vec::new();
-        unsafe {
-            for (topology, git_dir, _, _) in cases {
-                match topology {
-                    Some(value) => std::env::set_var("DOT_BASE_TOPOLOGY", value),
-                    None => std::env::remove_var("DOT_BASE_TOPOLOGY"),
-                }
-                match git_dir {
-                    Some(value) => std::env::set_var("DOT_CLIENT_GIT_DIR", value),
-                    None => std::env::remove_var("DOT_CLIENT_GIT_DIR"),
-                }
-                let base = base_from_env("/h");
-                observed.push((base.topology, base.client_git_dir, base.home));
-            }
+        for (topology, git_dir, _, _) in cases {
+            let base = base_from_values("/h", *topology, *git_dir);
+            observed.push((base.topology, base.client_git_dir, base.home));
         }
-        restore();
         for (index, (_, _, want_topology, want_git_dir)) in cases.iter().enumerate() {
             let (got_topology, got_git_dir, got_home) = &observed[index];
             assert_eq!(got_topology, want_topology, "case: {index}");

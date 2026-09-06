@@ -30,6 +30,8 @@
 //! shell adapter, so this lane changes no behavior (the integrator
 //! owns the wiring, starting with [`should_go_native`]).
 
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use crate::log::Log;
@@ -112,6 +114,18 @@ pub struct EngineInputs<'a> {
     pub log: &'a Log,
     /// Extensions root (`$DOT_EXTENSIONS_DIR`) for hook discovery.
     pub extensions_dir: &'a str,
+    /// `DOT_OVERLAY_LINKS_FROZEN=1` at invocation entry.
+    pub overlay_links_frozen: bool,
+    /// `$PREFIX` for Termux overlay matching.
+    pub prefix: &'a str,
+    /// `DOT_UPDATE_RELOADS_SHELL` for the final reload hint.
+    pub reloads_shell: Option<&'a str>,
+    /// `$SHELL` for the final reload hint.
+    pub shell: Option<&'a str>,
+    /// `DOT_SHDEPS_UPDATE_POLICY` for the defensive config reload.
+    pub shdeps_update_policy: Option<&'a str>,
+    /// `DOT_REEXEC_EXPECTED_REVISION` for the defensive reload.
+    pub reexec_expected: Option<&'a str>,
 }
 
 /// Why the v1 driver declines a run (the caller runs the shell
@@ -176,7 +190,7 @@ pub fn should_go_native(inputs: &EngineInputs<'_>) -> Result<(), Fallback> {
     if has_hook_dir(inputs.home, ".config/dot/merges") {
         return Err(Fallback::MergesPresent);
     }
-    if std::env::var("DOT_OVERLAY_LINKS_FROZEN").ok().as_deref() == Some("1") {
+    if inputs.overlay_links_frozen {
         return Err(Fallback::FsReplaceBlocked);
     }
     Ok(())
@@ -596,7 +610,8 @@ pub fn sync_repos(
     // A base pull may replace policy: reload before either phase
     // resolves or any transport preparation runs (the loader
     // prints its own diagnostic on failure).
-    if let Err(failure) = crate::startup::check_ambient() {
+    let startup = startup_inputs(inputs);
+    if let Err(failure) = crate::startup::preflight(&startup) {
         err.extend_from_slice(failure.line().as_bytes());
         err.push(b'\n');
         let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose, now_secs);
@@ -876,7 +891,6 @@ fn discover_active(
         Some(dir) if Path::new(&dir).is_dir() => dir,
         _ => return Ok(()),
     };
-    let prefix = std::env::var("PREFIX").unwrap_or_default();
     let discover_inputs = crate::overlays::Inputs {
         home: inputs.home.to_string(),
         xdg_config,
@@ -884,13 +898,13 @@ fn discover_active(
         profiles_present: false,
         selected: Vec::new(),
         platform: crate::platform::detect_platform().ok(),
-        termux: crate::hook_api::is_termux(&prefix),
+        termux: crate::hook_api::is_termux(inputs.prefix),
         host: crate::platform::detect_host().ok(),
         euid: inputs.euid,
     };
     let matches = crate::overlays::MatchInputs {
         platform: crate::platform::detect_platform().ok(),
-        termux: crate::hook_api::is_termux(&prefix),
+        termux: crate::hook_api::is_termux(inputs.prefix),
         host: crate::platform::detect_host().ok(),
     };
     match crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches) {
@@ -1152,10 +1166,9 @@ fn quiet(inputs: &EngineInputs<'_>) -> bool {
     inputs.flags.quiet || inputs.flags.cron || crate::log::is_quiet(inputs.dot_quiet)
 }
 
-/// `_ui_shell_reload_hint` inputs from the live environment.
+/// `_ui_shell_reload_hint` inputs from this invocation.
 fn reload_hint(inputs: &EngineInputs<'_>) -> Vec<u8> {
-    let reloads = std::env::var("DOT_UPDATE_RELOADS_SHELL").ok();
-    let shell_name = std::env::var("SHELL").ok().and_then(|shell| {
+    let shell_name = inputs.shell.and_then(|shell| {
         Path::new(&shell)
             .file_name()
             .and_then(|name| name.to_str())
@@ -1163,14 +1176,25 @@ fn reload_hint(inputs: &EngineInputs<'_>) -> Vec<u8> {
     });
     let home = Path::new(inputs.home);
     crate::progress_ui::reload_hint(
-        reloads.as_deref(),
+        inputs.reloads_shell,
         shell_name.as_deref(),
         home.join(".bashrc").exists(),
         home.join(".zshrc").exists(),
     )
 }
 
-/// Owned ambient capture for [`run_update`]: everything the shell
+/// Defensive config reload inputs from the immutable native invocation.
+fn startup_inputs<'a>(inputs: &EngineInputs<'a>) -> crate::startup::Inputs<'a> {
+    crate::startup::Inputs {
+        home: inputs.home,
+        xdg_config_home: inputs.config_home,
+        env_policy: inputs.shdeps_update_policy,
+        reexec_expected: inputs.reexec_expected,
+        source_root: inputs.source_root_git,
+    }
+}
+
+/// Owned invocation capture for [`run_update`]: everything the shell
 /// adapter preamble exports (`constants.sh` defaults plus the flag
 /// loop) resolved before the first stage opens. [`Gathered::inputs`]
 /// from here, so one value lives through the whole run.
@@ -1201,6 +1225,12 @@ pub struct Gathered {
     source_root_git: std::path::PathBuf,
     checkout_root: String,
     extensions_dir: String,
+    overlay_links_frozen: bool,
+    prefix: String,
+    reloads_shell: Option<String>,
+    shell: Option<String>,
+    shdeps_update_policy: Option<String>,
+    reexec_expected: Option<String>,
 }
 
 impl Gathered {
@@ -1234,14 +1264,23 @@ impl Gathered {
             bar_width: &self.bar_width,
             extensions_dir: &self.extensions_dir,
             checkout_root: &self.checkout_root,
+            overlay_links_frozen: self.overlay_links_frozen,
+            prefix: &self.prefix,
+            reloads_shell: self.reloads_shell.as_deref(),
+            shell: self.shell.as_deref(),
+            shdeps_update_policy: self.shdeps_update_policy.as_deref(),
+            reexec_expected: self.reexec_expected.as_deref(),
         }
     }
 }
 
 /// Non-empty environment value (unset and empty read the same,
 /// like `${VAR:-}` defaults).
-fn env_value(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
+fn env_value(env: &BTreeMap<OsString, OsString>, name: &str) -> Option<String> {
+    env.get(OsStr::new(name))
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// Parse the `_dot_update` leading-flag loop: `--cron`, `--quiet`,
@@ -1276,12 +1315,15 @@ fn parse_flags(args: &[std::ffi::OsString]) -> (UpdateFlags, Vec<std::ffi::OsStr
 /// shell loop runs under bash), else the `id -u` equivalent. `None`
 /// fails closed to the shell adapter — the checks must never run
 /// under a guessed identity.
-fn resolve_euid() -> Option<u32> {
-    if let Some(euid) = env_value("EUID").and_then(|value| value.parse::<u32>().ok()) {
+fn resolve_euid(env: &BTreeMap<OsString, OsString>) -> Option<u32> {
+    if let Some(euid) = env_value(env, "EUID").and_then(|value| value.parse::<u32>().ok()) {
         return Some(euid);
     }
-    std::process::Command::new("id")
-        .arg("-u")
+    let mut command = std::process::Command::new("id");
+    command.arg("-u");
+    command.env_clear();
+    command.envs(env);
+    command
         .output()
         .ok()
         .and_then(|output| String::from_utf8(output.stdout).ok())
@@ -1290,54 +1332,41 @@ fn resolve_euid() -> Option<u32> {
 
 /// Locale for the ASCII probe: `${LC_ALL:-${LC_CTYPE:-${LANG:-}}}`,
 /// like `_ui_ascii_mode`.
-fn locale_name() -> String {
-    env_value("LC_ALL")
-        .or_else(|| env_value("LC_CTYPE"))
-        .or_else(|| env_value("LANG"))
+fn locale_name(env: &BTreeMap<OsString, OsString>) -> String {
+    env_value(env, "LC_ALL")
+        .or_else(|| env_value(env, "LC_CTYPE"))
+        .or_else(|| env_value(env, "LANG"))
         .unwrap_or_default()
 }
 
-/// Capture the adapter ambient for one native run: flag exports
-/// first (the shell loop exports before `_ui_begin`, so rows and
-/// children read them), then every `constants.sh` default the
-/// driver consumes. `state_home` is the resolved XDG state dir from
-/// the caller (already trampoline-normalized); `source_root` is
-/// `$DOT_SOURCE_ROOT`. Returns `None` whenever the surroundings
-/// cannot support the native envelope — the caller runs the shell
-/// adapter instead.
+/// Capture one native invocation from the command's derived environment.
+/// The dispatcher already applies the shell flag exports before this point;
+/// `state_home` is its trampoline-normalized XDG state dir and `source_root`
+/// is `$DOT_SOURCE_ROOT`. Returns `None` whenever those explicit inputs
+/// cannot support the native envelope — the caller runs the shell adapter.
 pub fn gather(
     args: &[std::ffi::OsString],
     source_root: &std::path::Path,
     state_home: &str,
+    env: &BTreeMap<OsString, OsString>,
+    cwd: &Path,
 ) -> Option<Gathered> {
     use std::io::IsTerminal as _;
     let (flags, extra) = parse_flags(args);
-    // Mirror the flag-loop exports (single-flight command entry,
-    // like the lock-token publish in `update_run::run`).
-    unsafe {
-        if flags.cron || flags.quiet {
-            std::env::set_var("DOT_QUIET", "1");
-        }
-        if flags.force {
-            std::env::set_var("DOT_FORCE", "1");
-        }
-        if flags.verbose {
-            std::env::set_var("DOT_VERBOSE", "1");
-        }
-    }
-    let home = env_value("HOME")?;
+    let home = env_value(env, "HOME")?;
     if !home.starts_with('/') {
         return None;
     }
-    let config_home = env_value("XDG_CONFIG_HOME").unwrap_or_else(|| format!("{home}/.config"));
-    let manifest = env_value("DOT_OVERLAY_MANIFEST")
+    let config_home =
+        env_value(env, "XDG_CONFIG_HOME").unwrap_or_else(|| format!("{home}/.config"));
+    let manifest = env_value(env, "DOT_OVERLAY_MANIFEST")
         .unwrap_or_else(|| format!("{state_home}/dot/overlay-links"));
-    let legacy_manifest = env_value("DOT_OVERLAY_LEGACY_MANIFEST")
+    let legacy_manifest = env_value(env, "DOT_OVERLAY_LEGACY_MANIFEST")
         .unwrap_or_else(|| format!("{home}/.local/state/dot/overlay-links"));
     let mut moves = crate::temp::MoveCache::default();
     let tool = moves.tool().ok()?;
     let stdout_tty = std::io::stdout().is_terminal();
-    let no_color = env_value("NO_COLOR");
+    let no_color = env_value(env, "NO_COLOR");
     let no_color_ref = no_color.as_deref().filter(|value| !value.is_empty());
     let colored = stdout_tty && no_color_ref.is_none();
     let palette = if colored {
@@ -1355,35 +1384,36 @@ pub fn gather(
     } else {
         crate::progress_ui::Palette::empty()
     };
-    let dot_quiet = env_value("DOT_QUIET");
-    let dot_verbose = env_value("DOT_VERBOSE");
+    let dot_quiet = env_value(env, "DOT_QUIET");
+    let dot_verbose = env_value(env, "DOT_VERBOSE");
     let log = crate::log::Log::from_env(stdout_tty, no_color.as_deref(), dot_quiet.as_deref());
     let quiet = flags.quiet || flags.cron || crate::log::is_quiet(dot_quiet.as_deref());
     let live = crate::progress_ui::live_enabled(
         quiet,
         stdout_tty,
-        env_value("DOT_UI_FORCE_LIVE").as_deref(),
+        env_value(env, "DOT_UI_FORCE_LIVE").as_deref(),
     );
-    let locale = locale_name();
+    let locale = locale_name(env);
     let multibyte = crate::progress_ui::utf8_locale(&locale);
-    let ascii =
-        crate::progress_ui::ascii_mode(env_value("DOT_UI_ASCII").as_deref(), &locale, multibyte);
-    let mut provider = env_value("DOT_DEPENDENCY_PROVIDER").unwrap_or_else(|| "none".to_string());
-    let skip_provider = env_value("DOT_INIT_SKIP_PROVIDER").as_deref() == Some("1");
+    let ascii = crate::progress_ui::ascii_mode(
+        env_value(env, "DOT_UI_ASCII").as_deref(),
+        &locale,
+        multibyte,
+    );
+    let mut provider =
+        env_value(env, "DOT_DEPENDENCY_PROVIDER").unwrap_or_else(|| "none".to_string());
+    let skip_provider = env_value(env, "DOT_INIT_SKIP_PROVIDER").as_deref() == Some("1");
     if skip_provider {
         provider = "none".to_string();
     }
-    let pwd = std::env::current_dir()
-        .ok()
-        .and_then(|path| path.to_str().map(str::to_string))
-        .unwrap_or_else(|| home.clone());
+    let pwd = cwd.to_str().unwrap_or(&home).to_string();
     let dest = crate::repos_overlays::DestinationInputs {
         home: home.clone(),
-        xdg_state_home: env_value("XDG_STATE_HOME"),
-        install_dir: env_value("SHDEPS_INSTALL_DIR"),
-        state_dir: env_value("SHDEPS_STATE_DIR"),
+        xdg_state_home: env_value(env, "XDG_STATE_HOME"),
+        install_dir: env_value(env, "SHDEPS_INSTALL_DIR"),
+        state_dir: env_value(env, "SHDEPS_STATE_DIR"),
         overlay_paths: Vec::new(),
-        init_backup: env_value("DOT_INIT_BACKUP").filter(|value| value != "-"),
+        init_backup: env_value(env, "DOT_INIT_BACKUP").filter(|value| value != "-"),
         pwd,
     };
     Some(Gathered {
@@ -1398,24 +1428,36 @@ pub fn gather(
         tool,
         log,
         palette,
-        base: Some(crate::cli::base_from_env(&home)),
-        bar_width: env_value("DOT_UI_PROGRESS_WIDTH").unwrap_or_else(|| "8".to_string()),
+        base: Some(crate::cli::base_from_values(
+            &home,
+            env_value(env, "DOT_BASE_TOPOLOGY").as_deref(),
+            env_value(env, "DOT_CLIENT_GIT_DIR").as_deref(),
+        )),
+        bar_width: env_value(env, "DOT_UI_PROGRESS_WIDTH").unwrap_or_else(|| "8".to_string()),
         dot_verbose,
         dot_quiet,
-        update_jobs: env_value("DOT_UPDATE_JOBS"),
+        update_jobs: env_value(env, "DOT_UPDATE_JOBS"),
         provider,
         skip_provider,
         live,
         multibyte,
         ascii,
-        euid: resolve_euid()?,
-        tmp: std::env::var_os("TMPDIR")
+        euid: resolve_euid(env)?,
+        tmp: env
+            .get(OsStr::new("TMPDIR"))
+            .cloned()
             .filter(|value| !value.is_empty())
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp")),
         source_root_git: source_root.to_path_buf(),
         checkout_root: source_root.to_str()?.to_string(),
-        extensions_dir: env_value("DOT_EXTENSIONS_DIR").unwrap_or_default(),
+        extensions_dir: env_value(env, "DOT_EXTENSIONS_DIR").unwrap_or_default(),
+        overlay_links_frozen: env_value(env, "DOT_OVERLAY_LINKS_FROZEN").as_deref() == Some("1"),
+        prefix: env_value(env, "PREFIX").unwrap_or_default(),
+        reloads_shell: env_value(env, "DOT_UPDATE_RELOADS_SHELL"),
+        shell: env_value(env, "SHELL"),
+        shdeps_update_policy: env_value(env, "DOT_SHDEPS_UPDATE_POLICY"),
+        reexec_expected: env_value(env, "DOT_REEXEC_EXPECTED_REVISION"),
     })
 }
 
@@ -1469,7 +1511,8 @@ pub fn run_update(
     // Defensive reload before provider selection continues (a
     // failure closes without finalizing, like the shell: the
     // loader prints its own diagnostic, then `_ui_done 1`).
-    if let Err(failure) = crate::startup::check_ambient() {
+    let startup = startup_inputs(inputs);
+    if let Err(failure) = crate::startup::preflight(&startup) {
         err.extend_from_slice(failure.line().as_bytes());
         err.push(b'\n');
         let close = crate::progress_ui::done(
