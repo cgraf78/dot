@@ -19,9 +19,11 @@
 //! byte — so the interim set is empty and no known command reports
 //! "not yet implemented" anymore.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 
 use dot::cli::{Command as Decision, dispatch, init_acquires_lock};
 use dot::test_support::TempDir;
@@ -41,44 +43,97 @@ fn bin() -> Command {
 }
 
 #[test]
-fn app_runs_independent_contexts_without_mutating_process_environment() {
-    use std::collections::BTreeMap;
+fn native_update_flag_capture_does_not_mutate_parent_environment() {
+    // `--force` deliberately declines the native engine after its capture, so
+    // this RED case reaches the old ambient capture without ever allowing it
+    // to operate on this developer's real HOME. The shell fallback remains
+    // fixture-scoped. The final concurrent test below covers a native run.
+    let parent = native_parent_snapshot();
+    let first_client = stage_repos_client();
+    let second_client = stage_repos_client();
+    let first_state = first_client.scope.path().join("state");
+    let second_state = second_client.scope.path().join("state");
+    let first = runtime_for_native_update(&first_client, &first_state);
+    let second = runtime_for_native_update(&second_client, &second_state);
+    let args = [
+        OsString::from("update"),
+        OsString::from("--quiet"),
+        OsString::from("--force"),
+    ];
 
-    let original_home = std::env::var_os("HOME");
-    let first_home = TempDir::new("runtime-first-home").expect("first home");
-    let second_home = TempDir::new("runtime-second-home").expect("second home");
-    let first_env = BTreeMap::from([(
-        OsString::from("HOME"),
-        first_home.path().as_os_str().to_owned(),
-    )]);
-    let second_env = BTreeMap::from([(
-        OsString::from("HOME"),
-        second_home.path().as_os_str().to_owned(),
-    )]);
-    let first = dot::app::Runtime::from_env(&first_env, first_home.path()).expect("first runtime");
-    let second =
-        dot::app::Runtime::from_env(&second_env, second_home.path()).expect("second runtime");
-    let mut first_stdout = Vec::new();
-    let mut first_stderr = Vec::new();
-    let mut first_streams = dot::app::Streams::new(&mut first_stdout, &mut first_stderr);
-    let mut second_stdout = Vec::new();
-    let mut second_stderr = Vec::new();
-    let mut second_streams = dot::app::Streams::new(&mut second_stdout, &mut second_stderr);
+    for runtime in [&first, &second] {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            dot::app::run(
+                runtime,
+                &args,
+                &mut dot::app::Streams::new(&mut stdout, &mut stderr),
+            ),
+            0,
+            "fixture update stderr: {}",
+            String::from_utf8_lossy(&stderr),
+        );
+    }
+    assert_eq!(native_parent_snapshot(), parent);
+}
 
-    assert_eq!(
-        dot::app::run(&first, &[OsString::from("help")], &mut first_streams),
-        0
-    );
-    assert_eq!(
-        dot::app::run(&second, &[OsString::from("help")], &mut second_streams),
-        0
-    );
-    assert_eq!(first.home(), first_home.path());
-    assert_eq!(second.home(), second_home.path());
-    assert_eq!(std::env::var_os("HOME"), original_home);
-    assert_eq!(first_stdout, second_stdout);
-    assert!(first_stderr.is_empty());
-    assert!(second_stderr.is_empty());
+#[test]
+fn app_runs_concurrent_native_contexts_without_mutating_process_environment() {
+    // These are independent invocations, not two command calls serialized by
+    // a test lock: their distinct HOME, XDG state/config roots, topology, and
+    // update locks must remain visible all the way through the native lane.
+    let parent = native_parent_snapshot();
+    let first_client = stage_repos_client();
+    let second_client = stage_repos_client();
+    let first_state = first_client.scope.path().join("state");
+    let second_state = second_client.scope.path().join("state");
+    let first = runtime_for_native_update(&first_client, &first_state);
+    let second = runtime_for_native_update(&second_client, &second_state);
+
+    let run = |runtime: dot::app::Runtime| {
+        thread::spawn(move || {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = dot::app::run(
+                &runtime,
+                &[OsString::from("update")],
+                &mut dot::app::Streams::new(&mut stdout, &mut stderr),
+            );
+            (runtime, code, stdout, stderr)
+        })
+    };
+    let first = run(first);
+    let second = run(second);
+    let first = first.join().expect("first native invocation");
+    let second = second.join().expect("second native invocation");
+
+    for (name, (runtime, code, stdout, stderr)) in [("first", first), ("second", second)] {
+        assert_eq!(
+            code,
+            0,
+            "{name} stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(
+            !stdout.is_empty(),
+            "{name} native update produced no stage output"
+        );
+        assert!(
+            stderr.is_empty(),
+            "{name} stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(
+            runtime.state_home().join("dot").is_dir(),
+            "{name} state root"
+        );
+        assert!(
+            !runtime.state_home().join("dot/update.lock").exists(),
+            "{name} released its own update lock"
+        );
+    }
+    assert_eq!(native_parent_snapshot(), parent);
 }
 
 #[test]
@@ -1364,6 +1419,78 @@ struct ReposClient {
     overlay_origin: PathBuf,
     overlay_seed: PathBuf,
     overlay_branch: String,
+}
+
+/// Explicit native-update runtime for one staged repository fixture.
+///
+/// The map is deliberately complete for the native engine's environment
+/// inputs. In particular, it points the topology publication and the XDG
+/// state/config roots at this fixture rather than at the test process.
+fn runtime_for_native_update(client: &ReposClient, state: &Path) -> dot::app::Runtime {
+    let path = std::env::var_os("PATH").expect("test PATH");
+    let tmp = std::env::var_os("TMPDIR").unwrap_or_else(|| OsString::from("/tmp"));
+    let env = BTreeMap::from([
+        (OsString::from("HOME"), client.home.as_os_str().to_owned()),
+        (
+            OsString::from("XDG_CONFIG_HOME"),
+            client.xdg.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("XDG_STATE_HOME"),
+            state.as_os_str().to_owned(),
+        ),
+        (OsString::from("PATH"), path),
+        (OsString::from("TMPDIR"), tmp),
+        (OsString::from("LC_ALL"), OsString::from("C")),
+        (OsString::from("SHELL"), OsString::from("/bin/sh")),
+        (OsString::from("DOT_GIT_REAL"), OsString::from("1")),
+        (
+            OsString::from("DOT_SOURCE_ROOT"),
+            OsString::from(env!("CARGO_MANIFEST_DIR")),
+        ),
+        (OsString::from("DOT_UPDATE_NATIVE"), OsString::from("1")),
+        (
+            OsString::from("DOT_BASE_TOPOLOGY"),
+            OsString::from("separate"),
+        ),
+        (
+            OsString::from("DOT_CLIENT_GIT_DIR"),
+            client.base_git_dir.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("DOT_DEPENDENCY_PROVIDER"),
+            OsString::from("none"),
+        ),
+        (
+            OsString::from("DOT_UPDATE_RELOADS_SHELL"),
+            OsString::from("0"),
+        ),
+    ]);
+    dot::app::Runtime::from_env(&env, &client.home).expect("native runtime")
+}
+
+/// Ambient values the old engine accidentally captured or changed. The test
+/// never writes them: preserving this snapshot proves two explicit runtimes
+/// are isolated even while they run concurrently.
+fn native_parent_snapshot() -> BTreeMap<OsString, Option<OsString>> {
+    [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "DOT_UPDATE_NATIVE",
+        "DOT_QUIET",
+        "DOT_FORCE",
+        "DOT_VERBOSE",
+        "DOT_OVERLAY_LINKS_FROZEN",
+        "DOT_BASE_TOPOLOGY",
+        "DOT_CLIENT_GIT_DIR",
+        "PREFIX",
+        "TMPDIR",
+        "SHELL",
+    ]
+    .into_iter()
+    .map(|key| (OsString::from(key), std::env::var_os(key)))
+    .collect()
 }
 
 /// Run `git -C dir args` silenced, asserting success. Fixed
