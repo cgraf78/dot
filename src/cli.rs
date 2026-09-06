@@ -18,8 +18,8 @@
 //! exhaustive). Slice 78 drives [`Command::Update`]
 //! through the sequencer's flag parser
 //! ([`crate::update::parse_update_flags`]): the shell loop's exports
-//! land in the process environment while the engine (sync/finalize)
-//! stays shell-owned, so the interim diagnostic remains; slice 79
+//! stay in the invocation environment supplied to the adapter while
+//! the engine (sync/finalize) stays shell-owned; slice 79
 //! drives `init` through [`init_client_command::run`]; slice 80
 //! drives [`Command::Update`] end to end through
 //! [`update_run::run`](crate::update_run::run) (native lock plus the
@@ -43,7 +43,7 @@
 //! from the shell `case` order). The shell `bin/dot` remains the
 //! entry point and never routes here yet.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -277,7 +277,26 @@ pub fn run(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
-    let mut args = args.into_iter();
+    let env = std::env::vars_os().collect();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let runtime = crate::app::Runtime::from_env(&env, &cwd)
+        .expect("the current directory fallback is absolute");
+    let args = args.into_iter().collect::<Vec<_>>();
+    crate::app::run(
+        &runtime,
+        &args,
+        &mut crate::app::Streams::new(stdout, stderr),
+    )
+}
+
+/// Run the CLI with a preconstructed immutable runtime.
+pub(crate) fn run_with_runtime(
+    runtime: &crate::app::Runtime,
+    args: &[OsString],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let mut args = args.iter().cloned();
     let command = args.next().unwrap_or_default();
     let command = argv_bytes(&command);
     let command = command.as_slice();
@@ -292,7 +311,7 @@ pub fn run(
     // is otherwise invisible (validated, then discarded until the
     // slices consuming each field land), so wired commands behave
     // exactly as before whenever config loads.
-    match crate::startup::check_ambient() {
+    match crate::startup::check(runtime) {
         Ok(_) => {}
         Err(failure) => {
             let _ = stderr.write_all(failure.line().as_bytes());
@@ -320,19 +339,19 @@ pub fn run(
             Command::Cron => run_cron(stdout, &mut failed),
             Command::Update => {
                 let rest: Vec<OsString> = args.collect();
-                run_update(other, &rest, stdout, stderr, &mut failed)
+                run_update(runtime, other, &rest, stdout, stderr, &mut failed)
             }
             Command::Init => {
                 let rest: Vec<Vec<u8>> = args.map(|arg| argv_bytes(&arg)).collect();
-                run_init(&rest, stdout, stderr, &mut failed)
+                run_init(runtime, &rest, stdout, stderr, &mut failed)
             }
             command @ (Command::Fetch | Command::Push | Command::Status | Command::Diff) => {
                 let rest: Vec<OsString> = args.collect();
-                run_repos(command, &rest, stdout, stderr)
+                run_repos(runtime, command, &rest, stdout, stderr)
             }
             Command::Doctor | Command::Test => {
                 let rest: Vec<OsString> = args.collect();
-                run_engine_arm(other, &rest, stdout, stderr, &mut failed)
+                run_engine_arm(runtime, other, &rest, stdout, stderr, &mut failed)
             }
             Command::Unknown => {
                 // A closed stderr here leaves nothing to report to; the
@@ -365,6 +384,7 @@ pub fn run(
 /// shell engine adapter. `command` names the invoked spelling
 /// (`update` or its `pull` alias) for the adapter's original argv.
 fn run_update(
+    runtime: &crate::app::Runtime,
     command: &[u8],
     args: &[OsString],
     stdout: &mut dyn Write,
@@ -374,27 +394,22 @@ fn run_update(
     let raw: Vec<Vec<u8>> = args.iter().map(argv_bytes).collect();
     let refs: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
     let parsed = crate::update::parse_update_flags(&refs);
-    // Entry side effects, in shell order: rollback authority first,
-    // then the flag exports. One `set_var` per variable (never a
-    // batch): each entry stays auditable, matching the repo
-    // differential-test convention. Process env mutation is
-    // `unsafe` in edition 2024; `run` is the single-flight command
-    // entry path (like the shell's own exports), so no other thread
-    // observes a half-applied flag set.
-    unsafe {
-        std::env::remove_var("DOT_OVERLAY_LINKS_FROZEN");
-        if parsed.quiet {
-            std::env::set_var("DOT_QUIET", "1");
-            std::env::set_var("SHDEPS_QUIET", "1");
-        }
-        if parsed.force {
-            std::env::set_var("DOT_FORCE", "1");
-            std::env::set_var("SHDEPS_FORCE", "1");
-        }
-        if parsed.verbose {
-            std::env::set_var("DOT_VERBOSE", "1");
-            std::env::set_var("SHDEPS_LOG_LEVEL", "2");
-        }
+    // The shell exports these values before the engine runs. Keep that
+    // behavior inside this invocation's child environment instead of
+    // publishing transient command state to other callers in this process.
+    let mut env = runtime.env().clone();
+    env.remove(OsStr::new("DOT_OVERLAY_LINKS_FROZEN"));
+    if parsed.quiet {
+        env.insert(OsString::from("DOT_QUIET"), OsString::from("1"));
+        env.insert(OsString::from("SHDEPS_QUIET"), OsString::from("1"));
+    }
+    if parsed.force {
+        env.insert(OsString::from("DOT_FORCE"), OsString::from("1"));
+        env.insert(OsString::from("SHDEPS_FORCE"), OsString::from("1"));
+    }
+    if parsed.verbose {
+        env.insert(OsString::from("DOT_VERBOSE"), OsString::from("1"));
+        env.insert(OsString::from("SHDEPS_LOG_LEVEL"), OsString::from("2"));
     }
     // The engine's own code crosses the dispatcher: production runs
     // under `set -euo pipefail`, so the shell exits with the
@@ -402,7 +417,7 @@ fn run_update(
     // `75` lock busy — pinned against `bin/dot`), and so does this
     // arm. Only undelivered output flips `failed`, which [`run`]
     // turns into [`EXIT_ERROR`] like the other arms.
-    crate::update_run::run(command, args, stdout, stderr, failed)
+    crate::update_run::run(runtime, &env, command, args, stdout, stderr, failed)
 }
 
 /// Engine adapter script shared by the [`Command::Doctor`] and
@@ -471,6 +486,7 @@ dot_command_dispatch "$0" "$@"
 /// dies on SIGPIPE; Rust reports failure via exit code — same signal
 /// to the caller, different mechanism).
 fn run_engine_arm(
+    runtime: &crate::app::Runtime,
     command: &[u8],
     args: &[OsString],
     stdout: &mut dyn Write,
@@ -483,14 +499,14 @@ fn run_engine_arm(
     // environment. Unlike [`update_run`](crate::update_run), no
     // native step here reads XDG state, so the removal stays on the
     // child command instead of mutating the parent process.
-    let relative_state = std::env::var("XDG_STATE_HOME")
-        .ok()
-        .is_some_and(|value| !value.is_empty() && !value.starts_with('/'));
-    let program = std::env::var("DOT_BASH")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "bash".to_string());
-    let root = crate::update_run::source_root();
+    let relative_state = runtime
+        .value("XDG_STATE_HOME")
+        .is_some_and(|value| !Path::new(value).is_absolute());
+    let program = runtime
+        .value("DOT_BASH")
+        .and_then(OsStr::to_str)
+        .unwrap_or("bash");
+    let root = runtime.source_root();
     let mut cmd = std::process::Command::new(program);
     cmd.arg("--noprofile");
     cmd.arg("--norc");
@@ -500,9 +516,9 @@ fn run_engine_arm(
     for arg in args {
         cmd.arg(arg);
     }
-    // One `env` per variable (never `envs`): each entry stays
-    // auditable, matching the repo differential-test convention.
-    cmd.env("DOT_SOURCE_ROOT", &root);
+    cmd.env_clear();
+    cmd.envs(runtime.env());
+    cmd.env("DOT_SOURCE_ROOT", root);
     if relative_state {
         cmd.env_remove("XDG_STATE_HOME");
     }
@@ -549,9 +565,9 @@ fn run_cron(stdout: &mut dyn Write, failed: &mut bool) -> i32 {
 /// The [`Command::Init`] arm: `dot_init_command "$@"` through
 /// [`init_client_command::run`].
 ///
-/// Process environment is read here — the dispatcher is the engine
-/// boundary, so ambient reads live in this arm while the command
-/// module itself takes explicit parameters (its [`CommandEnv`][init_client_command::CommandEnv]).
+/// Runtime inputs are read here — the dispatcher is the engine
+/// boundary, so command modules receive explicit parameters (its
+/// [`CommandEnv`][init_client_command::CommandEnv]).
 /// Effect-free helpers run as the real ports inside the module; the
 /// network default-branch probe binds its ported helper with a
 /// `TMPDIR` scratch, and the resume, rollback, and fresh-tail steps
@@ -563,35 +579,39 @@ fn run_cron(stdout: &mut dyn Write, failed: &mut bool) -> i32 {
 /// process under `set -euo pipefail` (pinned against `bin/dot`;
 /// see the [`Command::Init`] contract).
 fn run_init(
+    runtime: &crate::app::Runtime,
     args: &[Vec<u8>],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     failed: &mut bool,
 ) -> i32 {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let xdg_state_home = std::env::var("XDG_STATE_HOME").unwrap_or_default();
-    let skip_provider = std::env::var("DOT_INIT_SKIP_PROVIDER").ok();
+    let home = runtime
+        .value("HOME")
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    let xdg_state_home = runtime
+        .value("XDG_STATE_HOME")
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    let skip_provider = runtime
+        .value("DOT_INIT_SKIP_PROVIDER")
+        .and_then(OsStr::to_str);
     // The command gate already rejected every spelling but `0` and
     // `1` before the engine runs; anything else never reaches it.
     let skip_provider_flag = skip_provider
-        .as_deref()
         .filter(|value| !value.is_empty())
         .unwrap_or("0")
         == "1";
-    let source_root = std::env::var_os("DOT_SOURCE_ROOT").map(PathBuf::from);
-    // Degraded-env ownership root: without a source checkout the
-    // stage-ownership hash cannot verify, so recovery preserves
-    // every stage (fail closed), like the shell's failed probe.
-    let fallback = PathBuf::from("/nonexistent-dot-source-root");
-    let source_root = source_root.as_deref().unwrap_or(&fallback);
-    let scratch = std::env::var_os("TMPDIR")
+    let source_root = runtime.source_root();
+    let scratch = runtime
+        .value("TMPDIR")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     // The shell inherits its working directory; a deleted one can
     // never serve the reserved probe, so fall back to the client
     // root there (fail closed on the lookup, never on the run).
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(&home));
+    let cwd = runtime.cwd();
     let remote_default_branch =
         |url: &str| -> Option<String> { identity::remote_default_branch(url, &scratch) };
     let converge_pending = || -> Result<(), Error> {
@@ -601,11 +621,11 @@ fn run_init(
     };
     let production = init_client_engine::Production::new(
         init_client_engine::EngineCtx {
-            home: &home,
-            xdg_state_home: &xdg_state_home,
+            home,
+            xdg_state_home,
             source_root,
             skip_provider: skip_provider_flag,
-            cwd: &cwd,
+            cwd,
         },
         &converge_pending,
     );
@@ -618,9 +638,9 @@ fn run_init(
         production.run_fresh(inputs)
     };
     let env = init_client_command::CommandEnv {
-        home: &home,
-        xdg_state_home: &xdg_state_home,
-        skip_provider: skip_provider.as_deref(),
+        home,
+        xdg_state_home,
+        skip_provider,
         source_root,
     };
     let engine = init_client_command::CommandEngine {
@@ -652,14 +672,34 @@ fn run_init(
 /// `${DOT_CLIENT_GIT_DIR:-...}`). The topology slice fills in the
 /// computation; until then the arm honors the environment.
 pub(crate) fn base_from_env(home: &str) -> crate::repos_base::Base {
-    let topology = match std::env::var("DOT_BASE_TOPOLOGY").ok().as_deref() {
+    base_from_values(
+        home,
+        std::env::var("DOT_BASE_TOPOLOGY").ok().as_deref(),
+        std::env::var("DOT_CLIENT_GIT_DIR").ok().as_deref(),
+    )
+}
+
+fn base_from_runtime(runtime: &crate::app::Runtime, home: &str) -> crate::repos_base::Base {
+    base_from_values(
+        home,
+        runtime.value("DOT_BASE_TOPOLOGY").and_then(OsStr::to_str),
+        runtime.value("DOT_CLIENT_GIT_DIR").and_then(OsStr::to_str),
+    )
+}
+
+fn base_from_values(
+    home: &str,
+    topology_value: Option<&str>,
+    git_dir_value: Option<&str>,
+) -> crate::repos_base::Base {
+    let topology = match topology_value {
         Some("separate") => crate::repos_base::Topology::Separate,
         Some("ordinary") => crate::repos_base::Topology::Ordinary,
         _ => crate::repos_base::Topology::Missing,
     };
-    let git_dir = std::env::var("DOT_CLIENT_GIT_DIR")
-        .ok()
+    let git_dir = git_dir_value
         .filter(|dir| !dir.is_empty())
+        .map(str::to_string)
         .unwrap_or_else(|| format!("{home}/.dotfiles"));
     crate::repos_base::Base {
         topology,
@@ -679,9 +719,8 @@ pub(crate) fn base_from_env(home: &str) -> crate::repos_base::Base {
 /// dispatcher resumes — the arm reports the kernel's code directly
 /// (the [`Command::Init`] precedent, pinned against `bin/dot`).
 ///
-/// Process environment is read here — the dispatcher is the engine
-/// boundary, so ambient reads live in this arm while the kernel
-/// modules take explicit parameters. Resolution diagnostics replay
+/// Runtime inputs are read here — the dispatcher is the engine
+/// boundary, so kernel modules receive explicit parameters. Resolution diagnostics replay
 /// the shell's stderr (collected warnings plus the failure line,
 /// when the shell prints one); kernel headers go to `stdout`,
 /// overlay push warnings to `stderr`, and git's own output streams
@@ -690,6 +729,7 @@ pub(crate) fn base_from_env(home: &str) -> crate::repos_base::Base {
 /// injected stream, so piped runs stay byte-identical on both
 /// sides. Extra arguments pass through to `git` verbatim.
 fn run_repos(
+    runtime: &crate::app::Runtime,
     command: Command,
     args: &[OsString],
     stdout: &mut dyn Write,
@@ -706,18 +746,24 @@ fn run_repos(
     } else {
         "inspect"
     };
-    let home = std::env::var("HOME").unwrap_or_default();
-    let prefix = std::env::var_os("PREFIX").unwrap_or_default();
+    let home = runtime
+        .value("HOME")
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    let prefix = runtime.value("PREFIX").unwrap_or_default();
     let prefix = prefix.to_string_lossy();
     let inputs = crate::overlays::ResolveInputs {
-        home: home.clone(),
-        xdg_config: std::env::var("XDG_CONFIG_HOME").unwrap_or_default(),
-        discovery_silent: std::env::var("DOT_OVERLAY_DISCOVERY_SILENT")
-            .map(|value| value == "1")
-            .unwrap_or(false),
-        default_profile: std::env::var("DOT_DEFAULT_PROFILE")
-            .ok()
-            .filter(|value| !value.is_empty()),
+        home: home.to_string(),
+        xdg_config: runtime
+            .value("XDG_CONFIG_HOME")
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+            .to_string(),
+        discovery_silent: runtime.value("DOT_OVERLAY_DISCOVERY_SILENT") == Some(OsStr::new("1")),
+        default_profile: runtime
+            .value("DOT_DEFAULT_PROFILE")
+            .and_then(OsStr::to_str)
+            .map(str::to_string),
         user: crate::profiles::current_user(),
         host: crate::platform::detect_host().ok(),
         platform: crate::platform::detect_platform().ok(),
@@ -739,14 +785,14 @@ fn run_repos(
         }
         return EXIT_ERROR;
     }
-    let base = base_from_env(&home);
+    let base = base_from_runtime(runtime, home);
     // The shell checks `[[ -t 1 && -z ${NO_COLOR:-} ]]` on the real
     // fd 1; the injected stream may be a capture buffer, so color
     // follows the process stdout instead.
     let log = crate::log::Log::from_env(
         std::io::stdout().is_terminal(),
-        std::env::var("NO_COLOR").ok().as_deref(),
-        std::env::var("DOT_QUIET").ok().as_deref(),
+        runtime.value("NO_COLOR").and_then(OsStr::to_str),
+        runtime.value("DOT_QUIET").and_then(OsStr::to_str),
     );
     match command {
         Command::Fetch => {
@@ -754,15 +800,7 @@ fn run_repos(
             // fallback is unreachable without a working `sh`, where
             // git is gone too.
             let mask = crate::temp::read_umask().unwrap_or(0o022);
-            crate::repos_commands::fetch_all(
-                &log,
-                stdout,
-                &base,
-                &state.overlays,
-                &home,
-                args,
-                mask,
-            )
+            crate::repos_commands::fetch_all(&log, stdout, &base, &state.overlays, home, args, mask)
         }
         Command::Push => crate::repos_commands::push_all(
             &log,
@@ -770,14 +808,14 @@ fn run_repos(
             stderr,
             &base,
             &state.overlays,
-            &home,
+            home,
             args,
         ),
         Command::Status => {
-            crate::repos_commands::status_all(&log, stdout, &base, &state.overlays, &home, args)
+            crate::repos_commands::status_all(&log, stdout, &base, &state.overlays, home, args)
         }
         Command::Diff => {
-            crate::repos_commands::diff_all(&log, stdout, &base, &state.overlays, &home, args)
+            crate::repos_commands::diff_all(&log, stdout, &base, &state.overlays, home, args)
         }
         // Decided above; kept as generic failure, never a panic
         // (panics would break the stderr byte contract).

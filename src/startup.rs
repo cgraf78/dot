@@ -1,8 +1,8 @@
 //! Binary startup prelude for `dot` (slice 84).
 //!
 //! Ports the `lib/dot/main.sh` prelude plus the `bin/dot` entry
-//! contract into the Rust binary startup path (`cli::run` calls
-//! [`check_ambient`]; `main.rs` binds [`ambient_source_root`]).
+//! contract into the Rust binary startup path (`app::run` calls
+//! [`check`] with its snapshotted runtime).
 //! Reuses the already-ported [`crate::config`], [`crate::xdg`], and
 //! [`crate::version`] modules plus the existing `cli::HELP` text —
 //! nothing here re-ports their internals.
@@ -29,7 +29,7 @@
 //!
 //! A loaded config is otherwise invisible: [`preflight`] validates
 //! and returns the [`Config`] for future slices, while
-//! [`check_ambient`] (the `cli::run` entry) discards it
+//! [`check`] (the application entry) discards it
 //! — no process environment is published yet, so already-wired
 //! commands behave exactly as before whenever config loads.
 
@@ -232,25 +232,42 @@ pub fn preflight(inputs: &Inputs<'_>) -> Result<Config, Failure> {
     }
 }
 
-/// Run [`preflight`] against ambient process state (`HOME`,
-/// `XDG_CONFIG_HOME`, `DOT_SHDEPS_UPDATE_POLICY`,
-/// `DOT_REEXEC_EXPECTED_REVISION`, and the [`ambient_source_root`]
-/// checkout). The single-flight command entry path, like the shell's
-/// own exports.
-pub fn check_ambient() -> Result<Config, Failure> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let xdg_config_home = std::env::var("XDG_CONFIG_HOME").unwrap_or_default();
-    let env_policy = std::env::var("DOT_SHDEPS_UPDATE_POLICY").ok();
-    let reexec_expected = std::env::var("DOT_REEXEC_EXPECTED_REVISION").ok();
-    let root = ambient_source_root();
+/// Run [`preflight`] against an immutable invocation runtime.
+pub fn check(runtime: &crate::app::Runtime) -> Result<Config, Failure> {
+    let home = runtime
+        .value("HOME")
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    let xdg_config_home = runtime
+        .value("XDG_CONFIG_HOME")
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    let env_policy = runtime
+        .value("DOT_SHDEPS_UPDATE_POLICY")
+        .and_then(OsStr::to_str);
+    let reexec_expected = runtime
+        .value("DOT_REEXEC_EXPECTED_REVISION")
+        .and_then(OsStr::to_str);
     let inputs = Inputs {
-        home: &home,
-        xdg_config_home: &xdg_config_home,
-        env_policy: env_policy.as_deref(),
-        reexec_expected: reexec_expected.as_deref(),
-        source_root: &root,
+        home,
+        xdg_config_home,
+        env_policy,
+        reexec_expected,
+        source_root: runtime.source_root(),
     };
     preflight(&inputs)
+}
+
+/// Run [`check`] against a one-time snapshot of the ambient process state.
+///
+/// Compatibility-only native callers that have not yet received an explicit
+/// runtime use this adapter; command dispatch enters through [`crate::app`].
+pub fn check_ambient() -> Result<Config, Failure> {
+    let env = std::env::vars_os().collect();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let runtime = crate::app::Runtime::from_env(&env, &cwd)
+        .expect("the current directory fallback is absolute");
+    check(&runtime)
 }
 
 #[cfg(test)]

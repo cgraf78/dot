@@ -6,10 +6,10 @@
 //! status, e.g. lock-busy `75`), then `_dot_update "$@"` whose status
 //! becomes the process exit code (`0` on success).
 //!
-//! The flag side effects stay native in [`crate::cli`] through
+//! The flag side effects are captured in [`crate::cli`] through
 //! [`parse_update_flags`](crate::update::parse_update_flags): the shell
-//! loop's exports land in the process environment before anything
-//! else runs. The lock is fully native too ([`update_lock::acquire`]
+//! loop's exports are passed to the adapter child before anything else
+//! runs. The lock is fully native too ([`update_lock::acquire`]
 //! with the `--cron` scan over all arguments, exactly like the
 //! shell): the guard is held across the engine and released
 //! explicitly, so a stolen lock is never removed and removal
@@ -48,7 +48,8 @@
 //! byte-identical converged trees, and wall-clock medians — that the
 //! final native wiring must preserve.
 
-use std::ffi::OsString;
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -92,34 +93,22 @@ _dot_cleanup_install_owner_traps
 _dot_update "$@"
 "#;
 
-/// Resolve the source checkout carrying `bin/dot` and `lib/dot`:
-/// `$DOT_SOURCE_ROOT` when non-empty, otherwise the checkout this
-/// binary was built from. Tests set `DOT_SOURCE_ROOT` explicitly;
-/// production follows the built-in checkout until the install
-/// layout owns the engine natively.
-pub fn source_root() -> PathBuf {
-    let from_env = std::env::var_os("DOT_SOURCE_ROOT").unwrap_or_default();
-    if from_env.is_empty() {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    } else {
-        PathBuf::from(from_env)
-    }
-}
-
 /// Resolve the XDG state home exactly like the shell bootstrap:
 /// `bin/dot` unsets a relative `$XDG_STATE_HOME` before the
 /// resolver runs, so relative reads as unset (HOME fallback) here
 /// too. Returns `None` when neither yields an absolute base, which
 /// the shell's `_dot_update_lock_path` reports as a silent `1`.
-fn state_dir() -> Option<PathBuf> {
-    let raw = std::env::var("XDG_STATE_HOME").unwrap_or_default();
-    let xdg_value = if raw.starts_with('/') {
-        raw
-    } else {
-        String::new()
-    };
-    let home = std::env::var("HOME").unwrap_or_default();
-    xdg::base(xdg::Kind::State, &xdg_value, &home)
+fn state_dir(env: &BTreeMap<OsString, OsString>) -> Option<PathBuf> {
+    let raw = env
+        .get(OsStr::new("XDG_STATE_HOME"))
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let xdg_value = if raw.starts_with('/') { raw } else { "" };
+    let home = env
+        .get(OsStr::new("HOME"))
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    xdg::base(xdg::Kind::State, xdg_value, home)
         .ok()
         .map(PathBuf::from)
 }
@@ -136,11 +125,12 @@ fn is_cron(args: &[OsString]) -> bool {
 /// report the engine's exit code (`0` on success).
 ///
 /// `command` names the invoked spelling for `DOT_ORIGINAL_ARGV`;
-/// `args` is the residue after it. Process environment mutation is
-/// `unsafe` in edition 2024; this runs on the single-flight command
-/// entry path (like the shell's own exports), so no other thread
-/// observes a half-applied update.
+/// `args` is the residue after it. The adapter receives all command
+/// environment changes explicitly, so concurrent callers cannot
+/// observe a half-applied update.
 pub fn run(
+    runtime: &crate::app::Runtime,
+    env: &BTreeMap<OsString, OsString>,
     command: &[u8],
     args: &[OsString],
     stdout: &mut dyn Write,
@@ -150,48 +140,45 @@ pub fn run(
     // Trampoline normalization first (like `bin/dot`): a relative
     // state root must read as unset for both the native lock path
     // and the engine child inheriting this environment.
-    let relative_state = std::env::var("XDG_STATE_HOME")
-        .ok()
-        .is_some_and(|value| !value.is_empty() && !value.starts_with('/'));
+    let mut child_env = env.clone();
+    let relative_state = child_env
+        .get(OsStr::new("XDG_STATE_HOME"))
+        .is_some_and(|value| !value.is_empty() && !Path::new(value).is_absolute());
     if relative_state {
-        // `unsafe` (see above): single-flight entry path.
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-        }
+        child_env.remove(OsStr::new("XDG_STATE_HOME"));
     }
-    let Some(state) = state_dir() else {
+    let Some(state) = state_dir(&child_env) else {
         return crate::cli::EXIT_ERROR;
     };
     // Lock warnings are never quiet-gated (`_warn` semantics) and the
     // injected streams are never a tty, so color is always off here —
     // exactly what the shell renders into a pipe.
     let log = Log::new(false, false);
-    let prior_token = std::env::var("DOT_UPDATE_LOCK_TOKEN").unwrap_or_default();
-    let prior = if prior_token.is_empty() {
-        None
-    } else {
-        Some(prior_token.as_str())
-    };
+    let prior = child_env
+        .get(OsStr::new("DOT_UPDATE_LOCK_TOKEN"))
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty());
     let guard = match update_lock::acquire(&state, is_cron(args), &log, prior, stderr) {
         Ok(guard) => guard,
         Err(Error::LockBusy { .. }) => return update_lock::EXIT_LOCK_BUSY,
         Err(_) => return crate::cli::EXIT_ERROR,
     };
-    // Publish the claim for nested engine steps (the shell exports
-    // `DOT_UPDATE_LOCK_TOKEN` on acquisition); the child inherits
-    // this environment.
-    unsafe {
-        std::env::set_var("DOT_UPDATE_LOCK_TOKEN", guard.token());
-    }
-    let root = source_root();
-    let code = run_update_or_engine(command, args, &root, &state, stdout, stderr, failed);
+    // The shell publishes the claim for nested engine steps. The adapter gets
+    // the same value explicitly, without changing its parent's environment.
+    child_env.insert(
+        OsString::from("DOT_UPDATE_LOCK_TOKEN"),
+        OsString::from(guard.token()),
+    );
+    let context = UpdateContext {
+        runtime,
+        state: &state,
+        env: &child_env,
+    };
+    let code = run_update_or_engine(&context, command, args, stdout, stderr, failed);
     // Explicit verified release (never silent removal of a lock that
     // no longer names us): removal failures warn through `log` into
     // stderr, like the shell's EXIT-trap release.
     guard.release(&log, stderr);
-    unsafe {
-        std::env::remove_var("DOT_UPDATE_LOCK_TOKEN");
-    }
     code
 }
 
@@ -201,19 +188,30 @@ pub fn run(
 /// flag is opt-in until differential runs prove the native driver
 /// byte-identical; the shell path stays the default so behavior
 /// never changes silently.
+struct UpdateContext<'a> {
+    runtime: &'a crate::app::Runtime,
+    state: &'a Path,
+    env: &'a BTreeMap<OsString, OsString>,
+}
+
 fn run_update_or_engine(
+    context: &UpdateContext<'_>,
     command: &[u8],
     args: &[OsString],
-    root: &Path,
-    state: &Path,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     failed: &mut bool,
 ) -> i32 {
-    let native = std::env::var("DOT_UPDATE_NATIVE").ok().as_deref() == Some("1");
+    let native = context
+        .env
+        .get(OsStr::new("DOT_UPDATE_NATIVE"))
+        .and_then(|value| value.to_str())
+        == Some("1");
     if native {
-        if let Some(state_home) = state.to_str() {
-            if let Some(gathered) = crate::update_engine::gather(args, root, state_home) {
+        if let Some(state_home) = context.state.to_str() {
+            if let Some(gathered) =
+                crate::update_engine::gather(args, context.runtime.source_root(), state_home)
+            {
                 let inputs = gathered.inputs();
                 let now = crate::update_engine::now_secs();
                 let mut out = Vec::new();
@@ -232,7 +230,15 @@ fn run_update_or_engine(
             }
         }
     }
-    run_engine(command, args, root, stdout, stderr, failed)
+    run_engine(
+        command,
+        args,
+        context.runtime.source_root(),
+        context.env,
+        stdout,
+        stderr,
+        failed,
+    )
 }
 
 /// Execute the shell engine adapter and forward its streams byte for
@@ -244,6 +250,7 @@ fn run_engine(
     command: &[u8],
     args: &[OsString],
     root: &Path,
+    env: &BTreeMap<OsString, OsString>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     failed: &mut bool,
@@ -253,10 +260,11 @@ fn run_engine(
     } else {
         ENGINE_ARGV0
     };
-    let program = std::env::var("DOT_BASH")
-        .ok()
+    let program = env
+        .get(OsStr::new("DOT_BASH"))
+        .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "bash".to_string());
+        .unwrap_or("bash");
     let mut cmd = Command::new(program);
     cmd.arg("--noprofile");
     cmd.arg("--norc");
@@ -266,6 +274,8 @@ fn run_engine(
     for arg in args {
         cmd.arg(arg);
     }
+    cmd.env_clear();
+    cmd.envs(env);
     cmd.env("DOT_SOURCE_ROOT", root);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
@@ -305,23 +315,14 @@ mod tests {
         // `bin/dot` unsets a relative `$XDG_STATE_HOME` before the
         // resolver runs; anything else would make lock ownership
         // depend on cwd.
-        let saved_xdg = std::env::var_os("XDG_STATE_HOME");
-        let saved_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", "relative/state");
-            std::env::set_var("HOME", "/home/fixture");
-        }
-        let resolved = state_dir();
-        unsafe {
-            match saved_xdg {
-                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-            match saved_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-        }
+        let env = BTreeMap::from([
+            (
+                OsString::from("XDG_STATE_HOME"),
+                OsString::from("relative/state"),
+            ),
+            (OsString::from("HOME"), OsString::from("/home/fixture")),
+        ]);
+        let resolved = state_dir(&env);
         assert_eq!(resolved, Some(PathBuf::from("/home/fixture/.local/state")));
     }
 
