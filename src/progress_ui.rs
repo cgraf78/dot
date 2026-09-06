@@ -255,6 +255,96 @@ pub fn elapsed(seconds_now: i64, started_secs: i64) -> Vec<u8> {
     format!("{}s", seconds_now - started_secs).into_bytes()
 }
 
+/// Normalize only elapsed stamps in captured progress output for
+/// shell/Rust differential tests.  Progress rows end with `Ns`; the
+/// completion summary spells the same value as `Done in Ns.`.  Other
+/// numbers — including counts, diagnostics, labels, and ordering —
+/// remain byte-significant.
+pub fn normalize_elapsed(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut line_start = 0;
+    while line_start < bytes.len() {
+        let line_end = bytes[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |offset| line_start + offset);
+        let line = &bytes[line_start..line_end];
+        if is_progress_row(line) {
+            normalize_stage_elapsed(line, &mut normalized);
+        } else {
+            normalize_done_elapsed(line, &mut normalized);
+        }
+        if line_end < bytes.len() {
+            normalized.push(b'\n');
+        }
+        line_start = line_end.saturating_add(1);
+    }
+    normalized
+}
+
+/// True only for the progress-line prefix `[<digits>/<digits>] `.
+fn is_progress_row(line: &[u8]) -> bool {
+    let Some(after_open) = line.strip_prefix(b"[") else {
+        return false;
+    };
+    let index_digits = after_open
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if index_digits == 0 || after_open.get(index_digits) != Some(&b'/') {
+        return false;
+    }
+    let after_slash = &after_open[index_digits + 1..];
+    let total_digits = after_slash
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    total_digits > 0
+        && after_slash.get(total_digits) == Some(&b']')
+        && after_slash.get(total_digits + 1) == Some(&b' ')
+}
+
+/// Copy one bracketed stage row, replacing only its final `Ns` token.
+fn normalize_stage_elapsed(line: &[u8], normalized: &mut Vec<u8>) {
+    let Some(space) = line.iter().rposition(|byte| *byte == b' ') else {
+        normalized.extend_from_slice(line);
+        return;
+    };
+    let stamp = &line[space + 1..];
+    if stamp.len() > 1
+        && stamp[..stamp.len() - 1]
+            .iter()
+            .all(|byte| byte.is_ascii_digit())
+        && stamp.last() == Some(&b's')
+    {
+        normalized.extend_from_slice(&line[..space + 1]);
+        normalized.extend_from_slice(b"Ns");
+    } else {
+        normalized.extend_from_slice(line);
+    }
+}
+
+/// Copy a completion row, replacing only its `Done in Ns.` value.
+fn normalize_done_elapsed(line: &[u8], normalized: &mut Vec<u8>) {
+    const PREFIX: &[u8] = b"Done in ";
+    if !line.starts_with(PREFIX) {
+        normalized.extend_from_slice(line);
+        return;
+    }
+    let stamp = &line[PREFIX.len()..];
+    let digits = stamp
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits > 0 && stamp[digits..].starts_with(b"s.") {
+        normalized.extend_from_slice(PREFIX);
+        normalized.extend_from_slice(b"Ns.");
+        normalized.extend_from_slice(&stamp[digits + 2..]);
+    } else {
+        normalized.extend_from_slice(line);
+    }
+}
+
 /// `_ui_now_ms`: millisecond clock for durations. `date_output` is the
 /// command-substitution-stripped `date +%s%3N` read (empty when `date`
 /// is missing or its `%3N` is unsupported, like BSD `date`); pure
