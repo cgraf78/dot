@@ -150,7 +150,7 @@ fn normalize_elapsed(text: &str) -> String {
 fn elapsed_normalizer_uses_the_progress_row_contract() {
     assert_eq!(
         normalize_elapsed("[1/4] Repos      ok       1 repo current                     0s\n"),
-        "[1/4] Repos      ok       1 repo current                     Ns\n"
+        "[1/4] Repos      ok       1 repo current @ELAPSED@\n"
     );
     assert_ne!(
         normalize_elapsed("[error] retry after 0s\n"),
