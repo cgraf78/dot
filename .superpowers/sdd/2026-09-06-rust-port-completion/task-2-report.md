@@ -277,3 +277,7 @@ The prior concern saying native update process-environment mutation was safely
 deferred to Task 3 is superseded by this review round: reachable native update
 now executes in the Runtime's isolated child process. No remote, pull request,
 restack, merge, close, or auto-merge operation was performed.
+
+### Commit
+
+- `0f0cfda Isolate embedded native runtime execution`
