@@ -2175,7 +2175,11 @@ fn update_native_matches_shell_byte_for_byte() {
     assert_eq!(
         scrub_twin(&native.stdout, native_client.scope.path()),
         scrub_twin(&shell.stdout, shell_client.scope.path()),
-        "update stdout",
+        "update stdout\ncodes: native={} shell={}\nshell stderr: {}\nnative stderr: {}",
+        native.status.code().unwrap_or(-1),
+        shell.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&shell.stderr),
+        String::from_utf8_lossy(&native.stderr),
     );
     assert_eq!(
         scrub_twin(&native.stderr, native_client.scope.path()),
@@ -2225,7 +2229,11 @@ fn update_native_failure_matches_shell_byte_for_byte() {
     assert_eq!(
         scrub_twin(&native.stdout, native_client.scope.path()),
         scrub_twin(&shell.stdout, shell_client.scope.path()),
-        "failed update stdout",
+        "failed update stdout\ncodes: native={} shell={}\nshell stderr: {}\nnative stderr: {}",
+        native.status.code().unwrap_or(-1),
+        shell.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&shell.stderr),
+        String::from_utf8_lossy(&native.stderr),
     );
     assert_eq!(
         scrub_twin(&native.stderr, native_client.scope.path()),
