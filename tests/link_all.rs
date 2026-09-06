@@ -63,31 +63,66 @@ fn sq(word: &str) -> String {
 }
 
 /// Replace one side root with `{SIDE}` so twin dumps compare, and
-/// scrub stage-row elapsed stamps (each side reads its own clock).
+/// normalize elapsed stamps (each side reads its own clock).
 fn scrub(dump: &str, root: &Path) -> String {
     let dump = dump.replace(&root.to_string_lossy().into_owned(), "{SIDE}");
-    let mut scrubbed = String::with_capacity(dump.len());
-    let bytes = dump.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'(' {
-            let mut end = index + 1;
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end > index + 1 && end < bytes.len() && bytes[end] == b's' {
-                let close = end + 1;
-                if close < bytes.len() && bytes[close] == b')' {
-                    scrubbed.push_str("(STAMP)");
-                    index = close + 1;
-                    continue;
-                }
-            }
-        }
-        scrubbed.push(bytes[index] as char);
-        index += 1;
+    let (prefix, output) = dump.split_once("out=").expect("output dump marker");
+    let (output, suffix) = output.split_once("err=").expect("error dump marker");
+    let output = String::from_utf8(dot::progress_ui::normalize_elapsed(output.as_bytes()))
+        .expect("progress output is UTF-8");
+    format!("{prefix}out={output}err={suffix}")
+}
+
+#[test]
+fn elapsed_normalization_keeps_status_text_significant() {
+    let left = b"[1/4] Overlays   ok       1 overlay current                          0s\n";
+    let right = b"[1/4] Overlays   ok       1 overlay current                          1s\n";
+    assert_eq!(
+        dot::progress_ui::normalize_elapsed(left),
+        dot::progress_ui::normalize_elapsed(right)
+    );
+    assert_ne!(
+        dot::progress_ui::normalize_elapsed(left),
+        dot::progress_ui::normalize_elapsed(
+            b"[1/4] Overlays   changed  1 overlay changed                          0s\n"
+        ),
+        "normalization must not hide status or detail changes"
+    );
+    assert_ne!(
+        dot::progress_ui::normalize_elapsed(b"warning: retry after 0s\n"),
+        dot::progress_ui::normalize_elapsed(b"warning: retry after 1s\n"),
+        "normalization must not hide diagnostics"
+    );
+    assert_ne!(
+        dot::progress_ui::normalize_elapsed(b"warning: Done in 0s.\n"),
+        dot::progress_ui::normalize_elapsed(b"warning: Done in 1s.\n"),
+        "normalization must not hide diagnostic wording that resembles completion"
+    );
+    assert_ne!(
+        dot::progress_ui::normalize_elapsed(b"[error] retry after 0s\n"),
+        dot::progress_ui::normalize_elapsed(b"[error] retry after 1s\n"),
+        "normalization must not hide bracketed diagnostics"
+    );
+    assert_ne!(
+        dot::progress_ui::normalize_elapsed(b"[1/4]diagnostic 0s\n"),
+        dot::progress_ui::normalize_elapsed(b"[1/4]diagnostic 1s\n"),
+        "a complete header without its separator is still diagnostic text"
+    );
+    for malformed in [
+        b"[1/] retry after ".as_slice(),
+        b"[1/4 retry after ".as_slice(),
+    ] {
+        let mut zero = malformed.to_vec();
+        zero.extend_from_slice(b"0s\n");
+        let mut one = malformed.to_vec();
+        one.extend_from_slice(b"1s\n");
+        assert_ne!(
+            dot::progress_ui::normalize_elapsed(&zero),
+            dot::progress_ui::normalize_elapsed(&one),
+            "malformed progress prefix must stay significant: {}",
+            String::from_utf8_lossy(malformed)
+        );
     }
-    scrubbed
 }
 
 /// Run `git` hermetically inside `cwd` (no user or system config).
