@@ -24,6 +24,10 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use dot::cli::{Command as Decision, dispatch, init_acquires_lock};
 use dot::test_support::TempDir;
@@ -44,52 +48,94 @@ fn bin() -> Command {
 
 #[test]
 fn native_update_flag_capture_does_not_mutate_parent_environment() {
-    // `--force` deliberately declines the native engine after its capture, so
-    // this RED case reaches the old ambient capture without ever allowing it
-    // to operate on this developer's real HOME. The shell fallback remains
-    // fixture-scoped. The final concurrent test below covers a native run.
+    // `--force` deliberately declines the native engine after its capture.
+    // Its shell adapter must retain semantic stream, user-tree, and state
+    // parity when an embedded Runtime re-execs the real binary.
     let parent = native_parent_snapshot();
-    let first_client = stage_repos_client();
-    let second_client = stage_repos_client();
-    let first_state = first_client.scope.path().join("state");
-    let second_state = second_client.scope.path().join("state");
-    let first = runtime_for_native_update(&first_client, &first_state);
-    let second = runtime_for_native_update(&second_client, &second_state);
+    let shell_client = stage_repos_client();
+    let native_client = stage_repos_client();
+    let runtime = runtime_for_force_fallback(&native_client);
     let args = [
         OsString::from("update"),
         OsString::from("--quiet"),
         OsString::from("--force"),
     ];
+    let shell = repos_shell(&shell_client, &["update", "--quiet", "--force"]);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = dot::app::run(
+        &runtime,
+        &args,
+        &mut dot::app::Streams::new(&mut stdout, &mut stderr),
+    );
 
-    for runtime in [&first, &second] {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        assert_eq!(
-            dot::app::run(
-                runtime,
-                &args,
-                &mut dot::app::Streams::new(&mut stdout, &mut stderr),
-            ),
-            0,
-            "fixture update stderr: {}",
-            String::from_utf8_lossy(&stderr),
-        );
-    }
+    assert_eq!(code, shell.status.code().expect("shell exit"));
+    assert_eq!(
+        scrub_twin(&stdout, native_client.scope.path()),
+        scrub_twin(&shell.stdout, shell_client.scope.path()),
+        "force fallback stdout",
+    );
+    assert_eq!(
+        scrub_twin(&stderr, native_client.scope.path()),
+        scrub_twin(&shell.stderr, shell_client.scope.path()),
+        "force fallback stderr",
+    );
+    assert_eq!(
+        semantic_tree(&native_client.home, true),
+        semantic_tree(&shell_client.home, true),
+        "force fallback user tree",
+    );
+    assert_eq!(
+        semantic_tree(runtime.state_home(), false),
+        semantic_tree(&shell_client.home.join(".local/state"), false),
+        "force fallback state",
+    );
     assert_eq!(native_parent_snapshot(), parent);
 }
 
 #[test]
 fn app_runs_concurrent_native_contexts_without_mutating_process_environment() {
-    // These are independent invocations, not two command calls serialized by
-    // a test lock: their distinct HOME, XDG state/config roots, topology, and
-    // update locks must remain visible all the way through the native lane.
+    // Two embedded Runtime calls must become separate `dot` processes. Their
+    // fake PATH entries hold actual overlay workers at the same test seam;
+    // differing TMPDIR/WSL values prove the child inherits its Runtime map,
+    // never this test process's ambient environment.
     let parent = native_parent_snapshot();
     let first_client = stage_repos_client();
     let second_client = stage_repos_client();
     let first_state = first_client.scope.path().join("state");
     let second_state = second_client.scope.path().join("state");
-    let first = runtime_for_native_update(&first_client, &first_state);
-    let second = runtime_for_native_update(&second_client, &second_state);
+    let barrier = first_client.scope.path().join("runtime-barrier");
+    std::fs::create_dir_all(&barrier).expect("barrier dir");
+    let first_tmp = first_client.scope.path().join("runtime-first-tmp");
+    let second_tmp = second_client.scope.path().join("runtime-second-tmp");
+    std::fs::create_dir_all(&first_tmp).expect("first tmp dir");
+    std::fs::create_dir_all(&second_tmp).expect("second tmp dir");
+    let first_bin = first_client.scope.path().join("runtime-first-bin");
+    let second_bin = second_client.scope.path().join("runtime-second-bin");
+    let first_trace = first_client.scope.path().join("runtime-first.trace");
+    let second_trace = second_client.scope.path().join("runtime-second.trace");
+    install_runtime_shims(&first_bin);
+    install_runtime_shims(&second_bin);
+    let first = runtime_for_native_update_with_process(
+        &first_client,
+        &first_state,
+        &first_bin,
+        &first_tmp,
+        "first",
+        Some("first-wsl"),
+        &barrier,
+        &first_trace,
+    );
+    let second = runtime_for_native_update_with_process(
+        &second_client,
+        &second_state,
+        &second_bin,
+        &second_tmp,
+        "second",
+        None,
+        &barrier,
+        &second_trace,
+    );
 
     let run = |runtime: dot::app::Runtime| {
         thread::spawn(move || {
@@ -105,8 +151,43 @@ fn app_runs_concurrent_native_contexts_without_mutating_process_environment() {
     };
     let first = run(first);
     let second = run(second);
+    let ready = wait_for_runtime_workers(&barrier, &["first", "second"]);
+    let scratch = [(&first_tmp, "first"), (&second_tmp, "second")]
+        .into_iter()
+        .all(|(root, _name)| {
+            std::fs::read_dir(root).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().starts_with("dot."))
+            })
+        });
+    std::fs::write(barrier.join("release"), b"release\n").expect("release workers");
     let first = first.join().expect("first native invocation");
     let second = second.join().expect("second native invocation");
+
+    assert!(ready, "embedded Runtime children missed the Git barrier");
+    assert!(
+        scratch,
+        "fleet scratch did not use both Runtime TMPDIR values"
+    );
+    for (name, trace, tmp, wsl) in [
+        ("first", &first_trace, &first_tmp, "first-wsl"),
+        ("second", &second_trace, &second_tmp, ""),
+    ] {
+        let trace = std::fs::read_to_string(trace).expect("runtime trace");
+        assert!(
+            trace.contains(&format!("{name}|git|{}|{wsl}", tmp.display())),
+            "{name} git context: {trace}"
+        );
+        assert!(
+            trace.contains(&format!("{name}|uname|{}|{wsl}", tmp.display())),
+            "{name} uname context: {trace}"
+        );
+        assert!(
+            trace.contains(&format!("{name}|mv|{}|{wsl}", tmp.display())),
+            "{name} mv context: {trace}"
+        );
+    }
 
     for (name, (runtime, code, stdout, stderr)) in [("first", first), ("second", second)] {
         assert_eq!(
@@ -134,6 +215,30 @@ fn app_runs_concurrent_native_contexts_without_mutating_process_environment() {
         );
     }
     assert_eq!(native_parent_snapshot(), parent);
+}
+
+#[test]
+fn embedded_runtime_reports_unresolvable_executable() {
+    let mut env = std::env::vars_os().collect::<BTreeMap<_, _>>();
+    env.insert(
+        OsString::from("DOT_RUNTIME_EXECUTABLE"),
+        OsString::from("/nonexistent/dot-runtime-child"),
+    );
+    let cwd = std::env::current_dir().expect("test cwd");
+    let runtime = dot::app::Runtime::from_env(&env, &cwd).expect("embedded runtime");
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = dot::app::run(
+        &runtime,
+        &[OsString::from("help")],
+        &mut dot::app::Streams::new(&mut stdout, &mut stderr),
+    );
+    assert_eq!(code, 1);
+    assert!(stdout.is_empty());
+    assert_eq!(
+        stderr,
+        b"dot: cannot re-exec runtime executable: /nonexistent/dot-runtime-child\n"
+    );
 }
 
 #[test]
@@ -1426,10 +1531,10 @@ struct ReposClient {
 /// The map is deliberately complete for the native engine's environment
 /// inputs. In particular, it points the topology publication and the XDG
 /// state/config roots at this fixture rather than at the test process.
-fn runtime_for_native_update(client: &ReposClient, state: &Path) -> dot::app::Runtime {
+fn native_update_env(client: &ReposClient, state: &Path) -> BTreeMap<OsString, OsString> {
     let path = std::env::var_os("PATH").expect("test PATH");
     let tmp = std::env::var_os("TMPDIR").unwrap_or_else(|| OsString::from("/tmp"));
-    let env = BTreeMap::from([
+    BTreeMap::from([
         (OsString::from("HOME"), client.home.as_os_str().to_owned()),
         (
             OsString::from("XDG_CONFIG_HOME"),
@@ -1465,8 +1570,175 @@ fn runtime_for_native_update(client: &ReposClient, state: &Path) -> dot::app::Ru
             OsString::from("DOT_UPDATE_RELOADS_SHELL"),
             OsString::from("0"),
         ),
-    ]);
-    dot::app::Runtime::from_env(&env, &client.home).expect("native runtime")
+        (
+            OsString::from("DOT_RUNTIME_EXECUTABLE"),
+            OsString::from(env!("CARGO_BIN_EXE_dot")),
+        ),
+    ])
+}
+
+/// The shell harness defaults state beneath HOME and keeps Git's launcher
+/// cache outside it. Mirror that for the force-fallback oracle.
+fn runtime_for_force_fallback(client: &ReposClient) -> dot::app::Runtime {
+    let state = client.home.join(".local/state");
+    let mut env = native_update_env(client, &state);
+    env.remove(OsStr::new("XDG_STATE_HOME"));
+    env.insert(
+        OsString::from("XDG_CACHE_HOME"),
+        client.scope.path().join("cache").into_os_string(),
+    );
+    dot::app::Runtime::from_env(&env, &client.home).expect("force fallback runtime")
+}
+
+/// A Runtime-only child environment. Its test executable override is the
+/// intentional embedding seam: ordinary `main` snapshots match ambient and
+/// execute directly, while this caller must re-exec the production binary.
+#[allow(clippy::too_many_arguments)]
+fn runtime_for_native_update_with_process(
+    client: &ReposClient,
+    state: &Path,
+    bin: &Path,
+    tmp: &Path,
+    marker: &str,
+    wsl: Option<&str>,
+    barrier: &Path,
+    trace: &Path,
+) -> dot::app::Runtime {
+    let mut env = native_update_env(client, state);
+    let parent_path = env.get(OsStr::new("PATH")).expect("native PATH");
+    let mut entries = vec![bin.to_path_buf()];
+    entries.extend(std::env::split_paths(parent_path));
+    env.insert(
+        OsString::from("PATH"),
+        std::env::join_paths(entries).expect("shim PATH"),
+    );
+    env.insert(OsString::from("TMPDIR"), tmp.as_os_str().to_owned());
+    env.insert(OsString::from("DOT_RUNTIME_MARKER"), OsString::from(marker));
+    env.insert(
+        OsString::from("DOT_RUNTIME_BARRIER"),
+        barrier.as_os_str().to_owned(),
+    );
+    env.insert(
+        OsString::from("DOT_RUNTIME_TRACE"),
+        trace.as_os_str().to_owned(),
+    );
+    env.insert(
+        OsString::from("DOT_RUNTIME_OVERLAY_PATH"),
+        client.overlay.as_os_str().to_owned(),
+    );
+    for tool in ["git", "uname", "mv"] {
+        env.insert(
+            OsString::from(format!("DOT_RUNTIME_REAL_{}", tool.to_ascii_uppercase())),
+            real_tool(tool).into_os_string(),
+        );
+    }
+    env.insert(
+        OsString::from("DOT_RUNTIME_EXECUTABLE"),
+        OsString::from(env!("CARGO_BIN_EXE_dot")),
+    );
+    match wsl {
+        Some(value) => {
+            env.insert(OsString::from("WSL_DISTRO_NAME"), OsString::from(value));
+        }
+        None => {
+            env.remove(OsStr::new("WSL_DISTRO_NAME"));
+        }
+    }
+    dot::app::Runtime::from_env(&env, &client.home).expect("native child runtime")
+}
+
+/// Test-only command recorder. It blocks only a real overlay Git command,
+/// after fleet scratch is allocated; production code gets no test hook.
+fn install_runtime_shims(bin: &Path) {
+    std::fs::create_dir_all(bin).expect("shim bin dir");
+    for tool in ["git", "uname", "mv"] {
+        let variable = tool.to_ascii_uppercase();
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s|{tool}|%s|%s\n' "${{DOT_RUNTIME_MARKER-}}" "${{TMPDIR-}}" "${{WSL_DISTRO_NAME-}}" >> "${{DOT_RUNTIME_TRACE}}"
+if [ '{tool}' = git ] && [ -n "${{DOT_RUNTIME_OVERLAY_PATH-}}" ]; then
+    case "$*" in
+        *"${{DOT_RUNTIME_OVERLAY_PATH}}"*fetch*--no-write-fetch-head*)
+            : > "${{DOT_RUNTIME_BARRIER}}/${{DOT_RUNTIME_MARKER}}-ready"
+            while [ ! -e "${{DOT_RUNTIME_BARRIER}}/release" ]; do sleep 0.01; done
+            ;;
+    esac
+fi
+exec "${{DOT_RUNTIME_REAL_{variable}}}" "$@"
+"#,
+        );
+        let path = bin.join(tool);
+        std::fs::write(&path, script).expect("write shim");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("mark shim executable");
+    }
+}
+
+fn real_tool(tool: &str) -> PathBuf {
+    let launcher = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".local/bin").join(tool));
+    std::env::split_paths(&std::env::var_os("PATH").expect("test PATH"))
+        .map(|dir| dir.join(tool))
+        .find(|candidate| candidate.is_file() && Some(candidate) != launcher.as_ref())
+        .expect("real native tool")
+}
+
+fn wait_for_runtime_workers(barrier: &Path, markers: &[&str]) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if markers
+            .iter()
+            .all(|marker| barrier.join(format!("{marker}-ready")).exists())
+        {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// Snapshot semantic user/state files. The production shell launcher writes
+/// only `dot/bash-v1` bootstrap metadata before dispatch; the Rust binary
+/// intentionally does not own that obsolete launcher cache, so this exact
+/// one path is classified rather than recreated or broadly normalized.
+fn semantic_tree(root: &Path, home_tree: bool) -> Vec<(String, Vec<u8>)> {
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut entries = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("semantic tree dir") {
+            let entry = entry.expect("semantic tree entry");
+            let path = entry.path();
+            let kind = entry.file_type().expect("semantic tree type");
+            let relative = path
+                .strip_prefix(root)
+                .expect("semantic child")
+                .to_string_lossy()
+                .into_owned();
+            let bootstrap = if home_tree {
+                relative == ".local/state/dot/bash-v1"
+            } else {
+                relative == "dot/bash-v1"
+            };
+            let checkout = home_tree
+                && path.file_name().is_some_and(|name| {
+                    name == ".git" || name == ".dotfiles" || name == ".dot-backup"
+                });
+            if kind.is_dir() {
+                if !checkout {
+                    stack.push(path);
+                }
+            } else if (kind.is_file() || kind.is_symlink()) && !checkout && !bootstrap {
+                entries.push((relative, std::fs::read(path).unwrap_or_default()));
+            }
+        }
+    }
+    entries.sort();
+    entries
 }
 
 /// Ambient values the old engine accidentally captured or changed. The test
@@ -1485,8 +1757,10 @@ fn native_parent_snapshot() -> BTreeMap<OsString, Option<OsString>> {
         "DOT_BASE_TOPOLOGY",
         "DOT_CLIENT_GIT_DIR",
         "PREFIX",
+        "PATH",
         "TMPDIR",
         "SHELL",
+        "WSL_DISTRO_NAME",
     ]
     .into_iter()
     .map(|key| (OsString::from(key), std::env::var_os(key)))

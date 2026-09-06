@@ -7,6 +7,12 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// Optional executable for an embedded Runtime. Production enters through
+/// `main`, whose snapshot matches its process and never reads this override;
+/// embedding tests and hosts can name the exact `dot` executable to re-exec.
+const RUNTIME_EXECUTABLE: &str = "DOT_RUNTIME_EXECUTABLE";
 
 /// Immutable process inputs for one Dot invocation.
 #[derive(Debug, Clone)]
@@ -97,7 +103,64 @@ impl<'a> Streams<'a> {
 
 /// Dispatch one command using only the supplied runtime and streams.
 pub fn run(runtime: &Runtime, args: &[OsString], streams: &mut Streams<'_>) -> i32 {
+    if !runtime.matches_process() {
+        return reexec(runtime, args, streams);
+    }
     crate::cli::run_with_runtime(runtime, args, streams.stdout, streams.stderr)
+}
+
+impl Runtime {
+    /// Whether this Runtime is the direct process entry snapshot.
+    fn matches_process(&self) -> bool {
+        std::env::current_dir().is_ok_and(|cwd| cwd == self.cwd)
+            && std::env::vars_os().collect::<BTreeMap<_, _>>() == self.env
+    }
+}
+
+/// Execute an embedded Runtime in a child whose real ambient namespace is its
+/// immutable snapshot. This lets existing native helpers retain ordinary
+/// process semantics while concurrent Runtime callers cannot share PATH,
+/// TMPDIR, WSL markers, or child environment inheritance.
+fn reexec(runtime: &Runtime, args: &[OsString], streams: &mut Streams<'_>) -> i32 {
+    let executable = runtime
+        .value(RUNTIME_EXECUTABLE)
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(std::env::current_exe);
+    let executable = match executable {
+        Ok(path) => path,
+        Err(_) => {
+            let _ = streams
+                .stderr
+                .write_all(b"dot: cannot resolve runtime executable\n");
+            return 1;
+        }
+    };
+    let display = executable.to_string_lossy().into_owned();
+    let output = match Command::new(&executable)
+        .args(args)
+        .env_clear()
+        .envs(runtime.env())
+        .current_dir(runtime.cwd())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => {
+            let _ = streams.stderr.write_all(
+                format!("dot: cannot re-exec runtime executable: {display}\n").as_bytes(),
+            );
+            return 1;
+        }
+    };
+    let mut failed = streams.stdout.write_all(&output.stdout).is_err();
+    failed |= streams.stderr.write_all(&output.stderr).is_err();
+    if failed {
+        return 1;
+    }
+    output.status.code().unwrap_or(1)
 }
 
 fn value<'a>(env: &'a BTreeMap<OsString, OsString>, key: &str) -> Option<&'a OsStr> {
