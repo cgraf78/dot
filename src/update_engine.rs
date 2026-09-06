@@ -56,6 +56,8 @@ pub struct UpdateFlags {
 /// shell `_dot_update` tree reads, plus the UI/logger handles the
 /// pull and link lanes thread the same way.
 pub struct EngineInputs<'a> {
+    /// Immutable process boundary for leaf workers launched during this update.
+    pub runtime: &'a crate::app::Runtime,
     /// Parsed flags.
     pub flags: UpdateFlags,
     /// Residue after flags (forwarded to the pull phases).
@@ -904,26 +906,6 @@ fn pre_sync_empty(inputs: &EngineInputs<'_>, eligible: &[String]) -> Result<(), 
     }
 }
 
-/// Null lifecycle worker: retire short-circuits before running
-/// anything without profiles, but the trait object still travels.
-struct NullWorker;
-
-impl crate::profile_lifecycle::WorkerRun for NullWorker {
-    fn run(
-        &mut self,
-        _script: &Path,
-        _result_dir: &Path,
-        _result_file: &Path,
-        _context: &Path,
-        _token: &str,
-    ) -> crate::profile_lifecycle::WorkerOutcome {
-        crate::profile_lifecycle::WorkerOutcome {
-            rc: 1,
-            output: Vec::new(),
-        }
-    }
-}
-
 /// `_dot_update_skip_inputs`: the Tools/Configs warning close for
 /// a failed input side.
 fn skip_inputs_rows(stage: &mut Stage, out: &mut Vec<u8>, reason: &str, now_secs: i64) {
@@ -1030,7 +1012,7 @@ pub fn finalize(
     if !inputs_ready {
         skip_inputs_rows(stage, out, "repository synchronization failed", now_secs);
     } else {
-        let mut worker = NullWorker;
+        let mut worker = crate::hook_worker::Worker::new(inputs.runtime);
         let retired = crate::profile_lifecycle::retire(
             &crate::profile_lifecycle::RetireInputs {
                 present: false,
@@ -1170,6 +1152,7 @@ fn startup_inputs<'a>(inputs: &EngineInputs<'a>) -> crate::startup::Inputs<'a> {
 /// loop) resolved before the first stage opens. [`Gathered::inputs`]
 /// from here, so one value lives through the whole run.
 pub struct Gathered {
+    runtime: crate::app::Runtime,
     flags: UpdateFlags,
     extra: Vec<std::ffi::OsString>,
     home: String,
@@ -1207,6 +1190,7 @@ impl Gathered {
     /// Borrow the driver inputs from this capture.
     pub fn inputs(&self) -> EngineInputs<'_> {
         EngineInputs {
+            runtime: &self.runtime,
             flags: self.flags,
             extra_args: &self.extra,
             base: self.base.as_ref(),
@@ -1315,6 +1299,7 @@ fn locale_name(env: &BTreeMap<OsString, OsString>) -> String {
 /// shell adapter; invalid XDG inputs return a typed error and never invoke it.
 pub fn gather(
     args: &[std::ffi::OsString],
+    runtime: &crate::app::Runtime,
     source_root: &std::path::Path,
     state_home: &str,
     env: &BTreeMap<OsString, OsString>,
@@ -1397,6 +1382,7 @@ pub fn gather(
         None => return Ok(None),
     };
     Ok(Some(Gathered {
+        runtime: runtime.clone(),
         flags,
         extra,
         home: home.clone(),
@@ -1633,8 +1619,11 @@ mod tests {
                 OsString::from("1"),
             ),
         ]);
+        let runtime =
+            crate::app::Runtime::from_env(&env, Path::new("/tmp")).expect("absolute fixture cwd");
         let gathered = gather(
             &[],
+            &runtime,
             Path::new(env!("CARGO_MANIFEST_DIR")),
             "/tmp",
             &env,

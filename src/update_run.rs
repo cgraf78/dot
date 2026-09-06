@@ -210,6 +210,7 @@ fn run_update_or_engine(
         if let Some(state_home) = context.state.to_str() {
             match crate::update_engine::gather(
                 args,
+                context.runtime,
                 context.runtime.source_root(),
                 state_home,
                 context.env,
