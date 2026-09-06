@@ -136,23 +136,27 @@ fn normalize(text: &str, home: &str, origin: &str) -> String {
     out
 }
 
-/// Replace the trailing elapsed stamp (` 0s`, ` 12s`) on stage
-/// lines so wall-clock timing never flakes the comparison.
+/// Adapt the canonical byte normalizer for this text-only fleet dump.
+///
+/// Fleet rows use the same `[<digits>/<digits>] ... Ns` grammar as
+/// the update and link differential suites, so a local parser would
+/// risk accepting diagnostics the shared contract keeps significant.
 fn normalize_elapsed(text: &str) -> String {
-    let mut out = String::new();
-    for line in text.split_inclusive('\n') {
-        if line.starts_with('[') {
-            if let Some(stripped) = line.strip_suffix('\n') {
-                if let Some((head, _)) = stripped.rsplit_once(' ') {
-                    out.push_str(head);
-                    out.push_str(" @ELAPSED@\n");
-                    continue;
-                }
-            }
-        }
-        out.push_str(line);
-    }
-    out
+    String::from_utf8(dot::progress_ui::normalize_elapsed(text.as_bytes()))
+        .expect("fleet dump is UTF-8")
+}
+
+#[test]
+fn elapsed_normalizer_uses_the_progress_row_contract() {
+    assert_eq!(
+        normalize_elapsed("[1/4] Repos      ok       1 repo current                     0s\n"),
+        "[1/4] Repos      ok       1 repo current                     Ns\n"
+    );
+    assert_ne!(
+        normalize_elapsed("[error] retry after 0s\n"),
+        normalize_elapsed("[error] retry after 1s\n"),
+        "bracketed diagnostics are not progress rows"
+    );
 }
 
 /// Candidate environment mirroring the shell preamble.
