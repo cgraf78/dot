@@ -16,8 +16,6 @@
 //! native only inside a conservative envelope, and the caller
 //! falls back to the shell adapter outside it:
 //!
-//! - `--cron` stays shell (the dirty-tree resolver has no native
-//!   port yet).
 //! - A `profiles.d` directory stays shell (the two-phase profile
 //!   converge has no native port yet).
 //! - `DOT_DEPENDENCY_PROVIDER=shdeps` stays shell (ensure plus the
@@ -26,9 +24,9 @@
 //!   no native port yet; the empty case renders its stage rows
 //!   natively).
 //!
-//! Nothing is wired yet: the update command still drives the
-//! shell adapter, so this lane changes no behavior (the integrator
-//! owns the wiring, starting with [`should_go_native`]).
+//! `DOT_UPDATE_NATIVE=1` selects this lane when the envelope accepts
+//! the invocation; the caller runs the shell adapter for every
+//! declined case.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -114,8 +112,6 @@ pub struct EngineInputs<'a> {
     pub log: &'a Log,
     /// Extensions root (`$DOT_EXTENSIONS_DIR`) for hook discovery.
     pub extensions_dir: &'a str,
-    /// `DOT_OVERLAY_LINKS_FROZEN=1` at invocation entry.
-    pub overlay_links_frozen: bool,
     /// `$PREFIX` for Termux overlay matching.
     pub prefix: &'a str,
     /// `DOT_UPDATE_RELOADS_SHELL` for the final reload hint.
@@ -132,13 +128,6 @@ pub struct EngineInputs<'a> {
 /// adapter instead). Every reason names the missing native port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fallback {
-    /// `--cron`: the dirty-tree resolver is shell-only.
-    Cron,
-    /// `--force` on pull: the fetch remotes reset is shell-only.
-    ForcePull,
-    /// Missing or relative `$HOME`: trust checks need an
-    /// absolute client root.
-    NoHome,
     /// `profiles.d` exists: two-phase profile converge is shell-only.
     Profiles,
     /// Present `merge-hooks.d`: the merge runner is shell-only.
@@ -149,32 +138,17 @@ pub enum Fallback {
     /// updater UI are shell-only (anything but `none` also covers
     /// the shell's `shdeps unavailable` close).
     ShdepsProvider,
-    /// A cron dirty tree the resolver could not cleanly discard:
-    /// silent exit 0 stays shell-side.
-    CronDirty,
     /// `DOT_INIT_SKIP_PROVIDER` set without the `1` spelling: the
     /// provider is unknown, so the shell's `shdeps unavailable`
     /// close owns it.
     ProviderUnavailable,
     /// Present `merges.sh` hooks: the merge runner is shell-only.
     MergesPresent,
-    /// `DOT_OVERLAY_LINKS_FROZEN` already set: a sourced caller is
-    /// mid-flight, so the shell owns the frozen close.
-    FsReplaceBlocked,
 }
 
 /// Native envelope check for one run: `Ok(())` runs
 /// [`run_update`], `Err(reason)` runs the shell adapter.
 pub fn should_go_native(inputs: &EngineInputs<'_>) -> Result<(), Fallback> {
-    if inputs.flags.cron {
-        return Err(Fallback::Cron);
-    }
-    if inputs.flags.force {
-        return Err(Fallback::ForcePull);
-    }
-    if inputs.home.is_empty() || !inputs.home.starts_with('/') {
-        return Err(Fallback::NoHome);
-    }
     if profiles_present(inputs.config_home) {
         return Err(Fallback::Profiles);
     }
@@ -189,9 +163,6 @@ pub fn should_go_native(inputs: &EngineInputs<'_>) -> Result<(), Fallback> {
     }
     if has_hook_dir(inputs.home, ".config/dot/merges") {
         return Err(Fallback::MergesPresent);
-    }
-    if inputs.overlay_links_frozen {
-        return Err(Fallback::FsReplaceBlocked);
     }
     Ok(())
 }
@@ -1225,7 +1196,6 @@ pub struct Gathered {
     source_root_git: std::path::PathBuf,
     checkout_root: String,
     extensions_dir: String,
-    overlay_links_frozen: bool,
     prefix: String,
     reloads_shell: Option<String>,
     shell: Option<String>,
@@ -1264,7 +1234,6 @@ impl Gathered {
             bar_width: &self.bar_width,
             extensions_dir: &self.extensions_dir,
             checkout_root: &self.checkout_root,
-            overlay_links_frozen: self.overlay_links_frozen,
             prefix: &self.prefix,
             reloads_shell: self.reloads_shell.as_deref(),
             shell: self.shell.as_deref(),
@@ -1342,29 +1311,32 @@ fn locale_name(env: &BTreeMap<OsString, OsString>) -> String {
 /// Capture one native invocation from the command's derived environment.
 /// The dispatcher already applies the shell flag exports before this point;
 /// `state_home` is its trampoline-normalized XDG state dir and `source_root`
-/// is `$DOT_SOURCE_ROOT`. Returns `None` whenever those explicit inputs
-/// cannot support the native envelope — the caller runs the shell adapter.
+/// is `$DOT_SOURCE_ROOT`. Unsupported native lanes return `Ok(None)` for the
+/// shell adapter; invalid XDG inputs return a typed error and never invoke it.
 pub fn gather(
     args: &[std::ffi::OsString],
     source_root: &std::path::Path,
     state_home: &str,
     env: &BTreeMap<OsString, OsString>,
     cwd: &Path,
-) -> Option<Gathered> {
+) -> Result<Option<Gathered>, crate::xdg::Error> {
     use std::io::IsTerminal as _;
     let (flags, extra) = parse_flags(args);
-    let home = env_value(env, "HOME")?;
-    if !home.starts_with('/') {
-        return None;
-    }
-    let config_home =
-        env_value(env, "XDG_CONFIG_HOME").unwrap_or_else(|| format!("{home}/.config"));
+    let home = env_value(env, "HOME").unwrap_or_default();
+    // `dot_xdg_home state` is the canonical HOME validity check. It keeps
+    // this entry error in the same typed XDG vocabulary as the lock path.
+    crate::xdg::base(crate::xdg::Kind::State, "", &home)?;
+    let config_value = env_value(env, "XDG_CONFIG_HOME").unwrap_or_default();
+    let config_home = crate::xdg::base(crate::xdg::Kind::Config, &config_value, &home)?;
     let manifest = env_value(env, "DOT_OVERLAY_MANIFEST")
         .unwrap_or_else(|| format!("{state_home}/dot/overlay-links"));
     let legacy_manifest = env_value(env, "DOT_OVERLAY_LEGACY_MANIFEST")
         .unwrap_or_else(|| format!("{home}/.local/state/dot/overlay-links"));
     let mut moves = crate::temp::MoveCache::default();
-    let tool = moves.tool().ok()?;
+    let tool = match moves.tool() {
+        Ok(tool) => tool,
+        Err(_) => return Ok(None),
+    };
     let stdout_tty = std::io::stdout().is_terminal();
     let no_color = env_value(env, "NO_COLOR");
     let no_color_ref = no_color.as_deref().filter(|value| !value.is_empty());
@@ -1416,7 +1388,15 @@ pub fn gather(
         init_backup: env_value(env, "DOT_INIT_BACKUP").filter(|value| value != "-"),
         pwd,
     };
-    Some(Gathered {
+    let euid = match resolve_euid(env) {
+        Some(euid) => euid,
+        None => return Ok(None),
+    };
+    let checkout_root = match source_root.to_str() {
+        Some(root) => root.to_string(),
+        None => return Ok(None),
+    };
+    Ok(Some(Gathered {
         flags,
         extra,
         home: home.clone(),
@@ -1442,7 +1422,7 @@ pub fn gather(
         live,
         multibyte,
         ascii,
-        euid: resolve_euid(env)?,
+        euid,
         tmp: env
             .get(OsStr::new("TMPDIR"))
             .cloned()
@@ -1450,15 +1430,14 @@ pub fn gather(
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp")),
         source_root_git: source_root.to_path_buf(),
-        checkout_root: source_root.to_str()?.to_string(),
+        checkout_root,
         extensions_dir: env_value(env, "DOT_EXTENSIONS_DIR").unwrap_or_default(),
-        overlay_links_frozen: env_value(env, "DOT_OVERLAY_LINKS_FROZEN").as_deref() == Some("1"),
         prefix: env_value(env, "PREFIX").unwrap_or_default(),
         reloads_shell: env_value(env, "DOT_UPDATE_RELOADS_SHELL"),
         shell: env_value(env, "SHELL"),
         shdeps_update_policy: env_value(env, "DOT_SHDEPS_UPDATE_POLICY"),
         reexec_expected: env_value(env, "DOT_REEXEC_EXPECTED_REVISION"),
-    })
+    }))
 }
 
 /// Wall-clock seconds for stage rows (`date +%s` equivalent).
@@ -1482,6 +1461,20 @@ pub fn run_update(
     use std::io::Write as _;
     if should_go_native(inputs).is_err() {
         return None;
+    }
+    // The shell resolves cron dirt before `_ui_begin`: unresolved edits return
+    // 0 with no rows, while matching-upstream files are repaired before sync.
+    // These probes are intentionally silent, so the early return preserves
+    // the historical cron contract byte for byte.
+    let base = inputs
+        .base
+        .filter(|base| base.exists())
+        .and_then(crate::repos_base::Base::git_prefix);
+    if inputs.flags.cron
+        && crate::repos_dirty::is_worktree_dirty(base.as_deref(), inputs.entries)
+        && !crate::repos_dirty::try_resolve_dirty(inputs.home, base.as_deref(), inputs.entries)
+    {
+        return Some(0);
     }
     // `_ui_begin 5`: the update always runs counted (the assignment
     // overwrites any ambient total, like the shell).
@@ -1616,5 +1609,39 @@ fn quarantine_inputs(
         context: inputs.dest.clone(),
         tool: inputs.tool.clone(),
         source_root: inputs.source_root_git.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_frozen_marker_does_not_decline_native_capture() {
+        // `_dot_update` clears this command-local marker before a new run.
+        // Capturing it as a top-level fallback would incorrectly preserve a
+        // prior failed run instead of letting the fresh generation replace it.
+        let env = BTreeMap::from([
+            (OsString::from("HOME"), OsString::from("/tmp")),
+            (OsString::from("EUID"), OsString::from("0")),
+            (
+                OsString::from("DOT_DEPENDENCY_PROVIDER"),
+                OsString::from("none"),
+            ),
+            (
+                OsString::from("DOT_OVERLAY_LINKS_FROZEN"),
+                OsString::from("1"),
+            ),
+        ]);
+        let gathered = gather(
+            &[],
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            "/tmp",
+            &env,
+            Path::new("/tmp"),
+        )
+        .expect("valid native XDG inputs")
+        .expect("capture supports this fixture");
+        assert!(should_go_native(&gathered.inputs()).is_ok());
     }
 }
