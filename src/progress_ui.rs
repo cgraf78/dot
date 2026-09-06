@@ -304,7 +304,7 @@ fn is_progress_row(line: &[u8]) -> bool {
         && after_slash.get(total_digits + 1) == Some(&b' ')
 }
 
-/// Copy one bracketed stage row, replacing only its final `Ns` token.
+/// Copy one bracketed stage row, replacing its trailing fixed-width elapsed field.
 fn normalize_stage_elapsed(line: &[u8], normalized: &mut Vec<u8>) {
     let Some(space) = line.iter().rposition(|byte| *byte == b' ') else {
         normalized.extend_from_slice(line);
@@ -317,8 +317,14 @@ fn normalize_stage_elapsed(line: &[u8], normalized: &mut Vec<u8>) {
             .all(|byte| byte.is_ascii_digit())
         && stamp.last() == Some(&b's')
     {
-        normalized.extend_from_slice(&line[..space + 1]);
-        normalized.extend_from_slice(b"Ns");
+        // The renderer right-aligns this field. Crossing `9s` to `11s`
+        // therefore changes both the token and one padding byte.
+        let field_start = line[..space]
+            .iter()
+            .rposition(|byte| *byte != b' ')
+            .map_or(0, |index| index + 1);
+        normalized.extend_from_slice(&line[..field_start]);
+        normalized.extend_from_slice(b" @ELAPSED@");
     } else {
         normalized.extend_from_slice(line);
     }
