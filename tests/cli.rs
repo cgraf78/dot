@@ -2545,6 +2545,208 @@ impl NativeUpdateFixture {
         }
     }
 
+    /// Add the smallest profile-aware policy to the otherwise clean native
+    /// repository fixture. The existing `alpha` descriptor stays selected in
+    /// phase one, so an exit through the poisoned adapter proves the profile
+    /// fallback rather than a missing descriptor or repository error.
+    fn with_base_profile(self) -> Self {
+        let profiles = self.client.xdg.join("dot/profiles.d");
+        std::fs::create_dir_all(&profiles).expect("profile directory");
+        std::fs::write(profiles.join("base.conf"), b"version=1\noverlays=alpha\n")
+            .expect("base profile");
+        self
+    }
+
+    /// Create two matching selectors that disagree after the base-only pass.
+    /// The update must fail natively and preserve the existing generation;
+    /// reaching the poison instead would mean profiles still escaped to Bash.
+    fn with_conflicting_profile_selectors(self) -> Self {
+        let profiles = self.client.xdg.join("dot/profiles.d");
+        let root = self.client.xdg.join("dot/profile-selectors.d");
+        let local = self.client.xdg.join("dot/profile-selectors.local.d");
+        std::fs::create_dir_all(&profiles).expect("profile directory");
+        std::fs::create_dir_all(&root).expect("root selector directory");
+        std::fs::create_dir_all(&local).expect("local selector directory");
+        let user = dot::profiles::current_user().expect("current user");
+        std::fs::write(profiles.join("base.conf"), b"version=1\noverlays=alpha\n")
+            .expect("base profile");
+        std::fs::write(profiles.join("dev.conf"), b"version=1\noverlays=alpha\n")
+            .expect("dev profile");
+        std::fs::write(
+            root.join("base.conf"),
+            format!("version=1\nuser={user}\nprofile=base\n"),
+        )
+        .expect("root selector");
+        std::fs::write(
+            local.join("dev.conf"),
+            format!("version=1\nuser={user}\nprofile=dev\n"),
+        )
+        .expect("local selector");
+        #[cfg(unix)]
+        {
+            for dir in [&root, &local] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                    .expect("private selector directory");
+            }
+            for file in [root.join("base.conf"), local.join("dev.conf")] {
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+                    .expect("private selector file");
+            }
+        }
+        self
+    }
+
+    /// Stage a base-to-dev profile transition whose alpha hook leaves a
+    /// durable marker. The second profile has no selected alpha descriptor,
+    /// so a successful native update must retire alpha and remove it from the
+    /// lifecycle ledger after linking the new generation.
+    fn with_profile_retirement(self) -> Self {
+        let profiles = self.client.xdg.join("dot/profiles.d");
+        let config = self.client.xdg.join("dot/config");
+        let extensions = self.client.home.join("extensions");
+        std::fs::create_dir_all(&profiles).expect("profile directory");
+        std::fs::create_dir_all(&extensions).expect("extensions directory");
+        std::fs::write(profiles.join("base.conf"), b"version=1\noverlays=alpha\n")
+            .expect("base profile");
+        std::fs::write(profiles.join("dev.conf"), b"version=1\noverlays=beta\n")
+            .expect("dev profile");
+        std::fs::write(
+            &config,
+            b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=base\n",
+        )
+        .expect("extension config");
+        std::fs::create_dir_all(self.client.overlay_seed.join("dot")).expect("alpha hook dir");
+        seed_advance(
+            &self.client.overlay_seed,
+            "dot/profile-deactivate",
+            b"deactivate() { printf retired >\"$HOME/alpha-retired\"; }\n",
+        );
+        let origins = self.client.scope.path().join("origins");
+        let (beta_origin, _beta_seed, _branch) = seed_bare_origin(&origins, "beta");
+        std::fs::write(
+            self.client.xdg.join("dot/overlays.d/20-beta.conf"),
+            format!("url=file://{}\n", beta_origin.display()),
+        )
+        .expect("beta descriptor");
+        #[cfg(unix)]
+        std::fs::set_permissions(&extensions, std::fs::Permissions::from_mode(0o700))
+            .expect("private extension directory");
+        self
+    }
+
+    /// Publish profile policy only in the next base generation. The process
+    /// starts with no policy at its XDG root, so this proves that the native
+    /// driver reloads config and discovers an additions-only overlay phase
+    /// *after* the base pull rather than relying on startup's stale config.
+    fn with_base_discovered_profile_addition(self) -> Self {
+        let base_dot = self.client.base_seed.join(".config/dot");
+        std::fs::create_dir_all(base_dot.join("profiles.d")).expect("base profiles directory");
+        std::fs::create_dir_all(base_dot.join("overlays.d")).expect("base overlays directory");
+        std::fs::create_dir_all(self.client.base_seed.join(".config/profile"))
+            .expect("base profile tree");
+        std::fs::create_dir_all(self.client.overlay_seed.join("home/.config/profile"))
+            .expect("alpha profile tree");
+        std::fs::write(
+            self.client.overlay_seed.join("home/.config/profile/value"),
+            b"alpha\n",
+        )
+        .expect("alpha profile value");
+        seed_advance(
+            &self.client.overlay_seed,
+            "home/.config/profile/value",
+            b"alpha\n",
+        );
+
+        let origins = self.client.scope.path().join("origins");
+        let (beta_origin, beta_seed, _branch) = seed_bare_origin(&origins, "beta");
+        std::fs::create_dir_all(beta_seed.join("home/.config/profile")).expect("beta profile tree");
+        seed_advance(&beta_seed, "home/.config/profile/value", b"beta\n");
+
+        seed_advance(&self.client.base_seed, ".config/profile/value", b"base\n");
+        seed_advance(
+            &self.client.base_seed,
+            ".config/dot/config",
+            b"version=1\ndefault_profile=dev\n",
+        );
+        seed_advance(
+            &self.client.base_seed,
+            ".config/dot/profiles.d/base.conf",
+            b"version=1\noverlays=alpha\n",
+        );
+        seed_advance(
+            &self.client.base_seed,
+            ".config/dot/profiles.d/dev.conf",
+            b"version=1\noverlays=beta\n",
+        );
+        seed_advance(
+            &self.client.base_seed,
+            ".config/dot/overlays.d/10-alpha.conf",
+            format!("url=file://{}\n", self.client.overlay_origin.display()).as_bytes(),
+        );
+        seed_advance(
+            &self.client.base_seed,
+            ".config/dot/overlays.d/20-beta.conf",
+            format!("url=file://{}\n", beta_origin.display()).as_bytes(),
+        );
+        self
+    }
+
+    /// Publish a base profile that initially selects alpha. A private local
+    /// selector agrees with that default; the caller can later publish a
+    /// conflicting base selector to verify snapshot restoration after pull.
+    fn with_base_profile_rollback(self) -> Self {
+        let base_dot = self.client.base_seed.join(".config/dot");
+        std::fs::create_dir_all(base_dot.join("profiles.d")).expect("base profiles directory");
+        std::fs::create_dir_all(base_dot.join("overlays.d")).expect("base overlays directory");
+        std::fs::create_dir_all(self.client.base_seed.join(".config/profile"))
+            .expect("base profile tree");
+        std::fs::create_dir_all(self.client.overlay_seed.join("home/.config/profile"))
+            .expect("alpha profile tree");
+        seed_advance(
+            &self.client.overlay_seed,
+            "home/.config/profile/value",
+            b"overlay\n",
+        );
+        seed_advance(&self.client.base_seed, ".config/profile/value", b"base\n");
+        seed_advance(
+            &self.client.base_seed,
+            ".config/dot/config",
+            b"version=1\ndefault_profile=base\n",
+        );
+        seed_advance(
+            &self.client.base_seed,
+            ".config/dot/profiles.d/base.conf",
+            b"version=1\noverlays=alpha\n",
+        );
+        seed_advance(
+            &self.client.base_seed,
+            ".config/dot/profiles.d/dev.conf",
+            b"version=1\noverlays=alpha\n",
+        );
+        seed_advance(
+            &self.client.base_seed,
+            ".config/dot/overlays.d/10-alpha.conf",
+            format!("url=file://{}\n", self.client.overlay_origin.display()).as_bytes(),
+        );
+        let selectors = self
+            .client
+            .home
+            .join(".config/dot/profile-selectors.local.d");
+        std::fs::create_dir_all(&selectors).expect("local selector directory");
+        let selector = selectors.join("base.conf");
+        let user = dot::profiles::current_user().expect("current user");
+        std::fs::write(&selector, format!("version=1\nuser={user}\nprofile=base\n"))
+            .expect("local base selector");
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(&selectors, std::fs::Permissions::from_mode(0o700))
+                .expect("private selector directory");
+            std::fs::set_permissions(&selector, std::fs::Permissions::from_mode(0o600))
+                .expect("private selector file");
+        }
+        self
+    }
+
     fn break_shell_engine(&self) {
         std::fs::write(
             &self.shell_poison,
@@ -2697,6 +2899,238 @@ fn update_native_force_with_provider_stays_on_the_shell_adapter() {
     assert_eq!(output.status.code(), Some(97));
     assert_eq!(output.stdout, b"");
     assert_eq!(output.stderr, b"OLD-UPDATE-ENGINE\n");
+}
+
+#[test]
+fn update_native_configured_pre_sync_hook_stays_on_the_shell_adapter() {
+    // Hook presence is configuration-owned, not an optional ambient export.
+    // Until Task 5 ports pre-sync coordination, a configured hook directory
+    // must choose the adapter before the native engine starts a partial run.
+    let fixture = NativeUpdateFixture::stage();
+    let extensions = fixture.client.home.join("extensions/pre-sync.d");
+    std::fs::create_dir_all(&extensions).expect("pre-sync directory");
+    std::fs::write(extensions.join("10-hook.sh"), b"pre_sync() { :; }\n").expect("pre-sync hook");
+    std::fs::create_dir_all(fixture.client.xdg.join("dot")).expect("config directory");
+    std::fs::write(
+        fixture.client.xdg.join("dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\n",
+    )
+    .expect("extension config");
+    fixture.break_shell_engine();
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_eq!(output.status.code(), Some(97));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(output.stderr, b"OLD-UPDATE-ENGINE\n");
+}
+
+#[test]
+fn update_native_profile_base_selection_does_not_invoke_shell_engine() {
+    // A native profile run must complete with the legacy adapter impossible
+    // to invoke. Before Task 4, `Fallback::Profiles` selects that adapter and
+    // this assertion observes its unmistakable 97 exit instead.
+    let fixture = NativeUpdateFixture::stage().with_base_profile();
+    fixture.break_shell_engine();
+    assert_native_silent(
+        &fixture.rust_dot(&["update", "--quiet"]),
+        "profile base selection",
+    );
+}
+
+#[test]
+fn update_native_profile_addition_discovered_after_base_pull_stays_native() {
+    let fixture = NativeUpdateFixture::stage().with_base_discovered_profile_addition();
+    fixture.break_shell_engine();
+    assert_native_silent(
+        &fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
+            cmd.env("XDG_CONFIG_HOME", fixture.client.home.join(".config"));
+        }),
+        "profile addition after base pull",
+    );
+    let target = fixture.client.home.join(".config/profile/value");
+    assert!(target.is_symlink(), "final profile value is a managed link");
+    assert_eq!(
+        std::fs::read(&target).expect("final profile value"),
+        b"beta\n"
+    );
+    assert!(
+        fixture.client.home.join(".dotfiles-beta/.git").is_dir(),
+        "additions phase cloned beta"
+    );
+    let manifest = fixture.client.home.join(".local/state/dot/overlay-links");
+    assert!(
+        std::fs::read_to_string(manifest)
+            .expect("overlay manifest")
+            .contains("beta"),
+        "final manifest names the post-base addition"
+    );
+}
+
+#[test]
+fn update_native_profile_selector_conflict_does_not_invoke_shell_engine() {
+    // This is the post-base selector phase: both selectors are valid and
+    // trusted, but their different profiles must freeze the generation with a
+    // profile error rather than fall back to the legacy update engine.
+    let fixture = NativeUpdateFixture::stage().with_conflicting_profile_selectors();
+    fixture.break_shell_engine();
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_eq!(output.status.code(), Some(1), "selector conflict status");
+    assert!(
+        output
+            .stderr
+            .starts_with(b"dot: profile: equally specific selectors choose base and dev"),
+        "selector conflict stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output
+            .stderr
+            .windows(b"OLD-UPDATE-ENGINE".len())
+            .any(|window| { window == b"OLD-UPDATE-ENGINE" })
+    );
+}
+
+#[test]
+fn update_native_profile_downgrade_retires_lifecycle_state_without_shell_engine() {
+    // First establish alpha's lifecycle authority. Then switch the persisted
+    // default profile to beta: the native two-phase driver must link beta,
+    // execute alpha's trusted deactivation hook, and commit the emptied ledger.
+    let fixture = NativeUpdateFixture::stage().with_profile_retirement();
+    fixture.break_shell_engine();
+    assert_native_silent(&fixture.rust_dot(&["update", "--quiet"]), "profile setup");
+    let ledger = fixture
+        .client
+        .home
+        .join(".local/state/dot/profile-overlay-lifecycle-v1");
+    assert!(
+        std::fs::read_to_string(&ledger)
+            .expect("setup ledger")
+            .contains("alpha|")
+    );
+    std::fs::write(
+        fixture.client.xdg.join("dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
+    )
+    .expect("switch profile");
+
+    assert_native_silent(
+        &fixture.rust_dot(&["update", "--quiet"]),
+        "profile downgrade",
+    );
+    assert_eq!(
+        std::fs::read(fixture.client.home.join("alpha-retired")).expect("retirement marker"),
+        b"retired"
+    );
+    assert!(
+        !std::fs::read_to_string(&ledger)
+            .expect("committed ledger")
+            .contains("alpha|")
+    );
+    assert!(
+        fixture.client.home.join(".dotfiles-beta/.git").is_dir(),
+        "beta checkout"
+    );
+}
+
+#[test]
+fn update_native_profile_failed_retirement_keeps_ledger_without_shell_engine() {
+    let fixture = NativeUpdateFixture::stage().with_profile_retirement();
+    fixture.break_shell_engine();
+    assert_native_silent(&fixture.rust_dot(&["update", "--quiet"]), "profile setup");
+    seed_advance(
+        &fixture.client.overlay_seed,
+        "dot/profile-deactivate",
+        b"deactivate() { printf failed >&2; return 7; }\n",
+    );
+    std::fs::write(
+        fixture.client.xdg.join("dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
+    )
+    .expect("switch profile");
+
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_eq!(output.status.code(), Some(1), "failed retirement status");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("profile deactivation failed"),
+        "native failure stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output
+            .stderr
+            .windows(b"OLD-UPDATE-ENGINE".len())
+            .any(|row| row == b"OLD-UPDATE-ENGINE")
+    );
+    let ledger = fixture
+        .client
+        .home
+        .join(".local/state/dot/profile-overlay-lifecycle-v1");
+    assert!(
+        std::fs::read_to_string(ledger)
+            .expect("retained ledger")
+            .contains("alpha|")
+    );
+}
+
+#[test]
+fn update_native_profile_conflict_after_base_pull_restores_prior_generation() {
+    let fixture = NativeUpdateFixture::stage().with_base_profile_rollback();
+    fixture.break_shell_engine();
+    let run = || {
+        fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
+            cmd.env("XDG_CONFIG_HOME", fixture.client.home.join(".config"));
+        })
+    };
+    assert_native_silent(&run(), "rollback fixture setup");
+    let target = fixture.client.home.join(".config/profile/value");
+    assert!(target.is_symlink(), "setup profile value is a managed link");
+    assert_eq!(
+        std::fs::read(&target).expect("setup profile value"),
+        b"overlay\n"
+    );
+    let manifest = fixture.client.home.join(".local/state/dot/overlay-links");
+    let manifest_before = std::fs::read(&manifest).expect("setup manifest");
+
+    let selectors = fixture
+        .client
+        .base_seed
+        .join(".config/dot/profile-selectors.d");
+    std::fs::create_dir_all(&selectors).expect("base selector directory");
+    let user = dot::profiles::current_user().expect("current user");
+    seed_advance(
+        &fixture.client.base_seed,
+        ".config/dot/profile-selectors.d/conflict.conf",
+        format!("version=1\nuser={user}\nprofile=dev\n").as_bytes(),
+    );
+
+    let output = run();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "new selector conflict status"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("equally specific selectors choose dev and base"),
+        "native conflict stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output
+            .stderr
+            .windows(b"OLD-UPDATE-ENGINE".len())
+            .any(|row| row == b"OLD-UPDATE-ENGINE"),
+        "profile conflict must not escape to the shell adapter"
+    );
+    assert!(target.is_symlink(), "rollback restores the managed link");
+    assert_eq!(
+        std::fs::read(&target).expect("restored profile value"),
+        b"overlay\n"
+    );
+    assert_eq!(
+        std::fs::read(&manifest).expect("restored manifest"),
+        manifest_before,
+        "rollback keeps the prior manifest generation"
+    );
 }
 
 /// Scrub one twin's temp scope (every home, XDG, origin, and state

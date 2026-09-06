@@ -308,17 +308,16 @@ pub(crate) fn run_with_runtime(
     // `docs/rust-port-spec.md` — the shell `case` exempts
     // help/version, but the spec requires ANY command to exit 2
     // here), preceded by the re-exec guard (exit 1). A loaded config
-    // is otherwise invisible (validated, then discarded until the
-    // slices consuming each field land), so wired commands behave
-    // exactly as before whenever config loads.
-    match crate::startup::check(runtime) {
-        Ok(_) => {}
+    // is retained by native command slices that consume configuration
+    // semantics, while shell-backed paths keep their existing behavior.
+    let config = match crate::startup::check(runtime) {
+        Ok(config) => config,
         Err(failure) => {
             let _ = stderr.write_all(failure.line().as_bytes());
             let _ = stderr.write_all(b"\n");
             return failure.code();
         }
-    }
+    };
     let mut failed = false;
     let code = match command {
         b"" | b"help" | b"-h" | b"--help" => {
@@ -339,7 +338,7 @@ pub(crate) fn run_with_runtime(
             Command::Cron => run_cron(stdout, &mut failed),
             Command::Update => {
                 let rest: Vec<OsString> = args.collect();
-                run_update(runtime, other, &rest, stdout, stderr, &mut failed)
+                run_update(runtime, &config, other, &rest, stdout, stderr, &mut failed)
             }
             Command::Init => {
                 let rest: Vec<Vec<u8>> = args.map(|arg| argv_bytes(&arg)).collect();
@@ -385,6 +384,7 @@ pub(crate) fn run_with_runtime(
 /// (`update` or its `pull` alias) for the adapter's original argv.
 fn run_update(
     runtime: &crate::app::Runtime,
+    config: &crate::config::Config,
     command: &[u8],
     args: &[OsString],
     stdout: &mut dyn Write,
@@ -417,7 +417,15 @@ fn run_update(
     // `75` lock busy — pinned against `bin/dot`), and so does this
     // arm. Only undelivered output flips `failed`, which [`run`]
     // turns into [`EXIT_ERROR`] like the other arms.
-    crate::update_run::run(runtime, &env, command, args, stdout, stderr, failed)
+    crate::update_run::run(
+        runtime,
+        config,
+        &env,
+        crate::update_run::Request { command, args },
+        stdout,
+        stderr,
+        failed,
+    )
 }
 
 /// Engine adapter script shared by the [`Command::Doctor`] and

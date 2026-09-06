@@ -519,6 +519,21 @@ pub fn acquire(
             source,
         }
     })?;
+    // The lifecycle ledger shares `<state>/dot`. It requires the directory
+    // to be private before publishing trusted records, so the lock must not
+    // leave its earlier `create_dir_all` default mode as an unsafe ancestor.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            lock_dir.parent().unwrap_or(state_dir),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .map_err(|source| Error::Io {
+            context: "lock could not secure its state directory",
+            source,
+        })?;
+    }
     if let Some(token) = prior_token {
         if let Some(guard) = try_reenter(&lock_dir, token) {
             return Ok(guard);
