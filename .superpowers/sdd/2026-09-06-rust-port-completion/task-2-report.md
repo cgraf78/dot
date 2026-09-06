@@ -173,7 +173,7 @@ sites, concurrent fixture behavior, parent-state isolation, public API scope,
 and final diff hygiene. No independent reviewer was dispatched because the
 controller expressly prohibited subagents.
 
-### Commit
+### Round-1 correction commit
 
 - `74c2759 Isolate native \`update\` runtime context`
 
@@ -277,6 +277,10 @@ deferred to Task 3 is superseded by this review round: reachable native update
 now executes in the Runtime's isolated child process. No remote, pull request,
 restack, merge, close, or auto-merge operation was performed.
 
+### Round-2 process-isolation commit
+
+- `0f0cfda Isolate embedded native runtime execution`
+
 ## Review round 3 — explicit embedding authority
 
 The third review found that the round-2 direct-path decision still read the
@@ -330,6 +334,6 @@ recursive-child prevention, fallback parity classification, and the concurrent
 native seam. No independent reviewer was dispatched because the controller
 expressly prohibited subagents.
 
-### Commit
+### Round-3 commit
 
-- `0f0cfda Isolate embedded native runtime execution`
+- `9d61550 Require explicit embedded runtime executables`
