@@ -162,29 +162,11 @@ fn cleanup(manifest_new: Option<&Path>, inventory_root: Option<&Path>) {
     }
 }
 
-/// `_dot_reserved_roots_snapshot`: the newline-joined inventory (no
-/// trailing newline — command substitution strips it), or `None`
-/// like the bare `return 1`. Overlay link paths come from the
-/// `OVERLAYS` records exactly like the shell loop, skipping empty
-/// paths.
+/// `_dot_reserved_roots_snapshot`: overlay link paths come from
+/// the `OVERLAYS` records exactly like the shell loop, skipping
+/// empty paths (shared with the update driver through
+/// [`repos_overlays::reserved_snapshot_vec`]).
 fn reserved_snapshot(inputs: &Inputs<'_>) -> Option<Vec<String>> {
-    use crate::xdg;
-    let state_home = xdg::base(
-        xdg::Kind::State,
-        inputs.dest.xdg_state_home.as_deref().unwrap_or(""),
-        inputs.home,
-    )
-    .ok()?;
-    let install_root = inputs
-        .dest
-        .install_dir
-        .clone()
-        .unwrap_or_else(|| format!("{}/.local/share", inputs.home));
-    let provider_state = inputs
-        .dest
-        .state_dir
-        .clone()
-        .unwrap_or_else(|| format!("{state_home}/shdeps"));
     let mut overlay_paths = Vec::new();
     for entry in inputs.entries {
         let (_, path, _, _) = split_entry(entry);
@@ -192,22 +174,7 @@ fn reserved_snapshot(inputs: &Inputs<'_>) -> Option<Vec<String>> {
             overlay_paths.push(path);
         }
     }
-    let mut init_backup = inputs.dest.init_backup.clone();
-    if init_backup.as_deref() == Some("-") {
-        init_backup = None;
-    }
-    reserved::reserved_roots(
-        &reserved::RootsInput {
-            home: inputs.home.to_string(),
-            state_home,
-            install_root,
-            provider_state,
-            overlay_paths,
-            init_backup,
-        },
-        &inputs.dest.pwd,
-    )
-    .ok()
+    repos_overlays::reserved_snapshot_vec(inputs.home, inputs.dest, &overlay_paths)
 }
 
 /// Snapshot string form: lines joined with `\n`, like the
@@ -281,42 +248,17 @@ fn create_inventory_root(manifest: &str) -> Option<PathBuf> {
     None
 }
 
-/// `_overlay_recover_replacements`: every
-/// `$manifest.replace.*` record in glob (sorted) order. `Err`
-/// carries the failing record (the shell `REPLY`).
+/// `_overlay_recover_replacements` (shared with the update
+/// driver through [`repos_overlays::recover_replacements`]).
 fn recover_replacements(inputs: &Inputs<'_>) -> Result<(), String> {
-    let manifest_path = Path::new(inputs.manifest);
-    let parent = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = manifest_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(inputs.manifest);
-    let prefix = format!("{file_name}.replace.");
-    let mut records = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with(&prefix) {
-                    records.push(entry.path());
-                }
-            }
-        }
-    }
-    records.sort();
-    for record in records {
-        if !repos_overlays::recover_replacement(
-            &record,
-            inputs.manifest,
-            inputs.euid,
-            inputs.source_root_git,
-            inputs.tmp,
-            &inputs.dest.pwd,
-            inputs.tool,
-        ) {
-            return Err(record.to_string_lossy().into_owned());
-        }
-    }
-    Ok(())
+    repos_overlays::recover_replacements(
+        inputs.manifest,
+        inputs.euid,
+        inputs.source_root_git,
+        inputs.tmp,
+        &inputs.dest.pwd,
+        inputs.tool,
+    )
 }
 
 /// `_dot_candidate_path_is_reserved`: absolute paths only (anything
