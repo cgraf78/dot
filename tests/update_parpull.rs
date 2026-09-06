@@ -121,7 +121,9 @@ fn shell_dot(
     cmd.output().expect("run bin/dot")
 }
 
-/// The Rust binary with the same controlled client.
+/// The Rust CLI adapter with the same controlled client.  This suite
+/// deliberately leaves `DOT_UPDATE_NATIVE` unset, so its results are
+/// adapter parity only and cannot be cited as native-engine proof.
 fn rust_dot(
     argv: &[&str],
     home: &Path,
@@ -277,30 +279,6 @@ fn twin_client(
     (home, state)
 }
 
-/// Blank the wall-clock stamps the UI rows carry (`0s`, `Done in
-/// 12s`): the only bytes allowed to differ between two identical
-/// updates. Counts (`1 repo current`, `[1/5]`, `1/1`) never match
-/// `<digits>s` at a word boundary the way stamps do, except the
-/// `s`-suffixed plural `repos` — which has no leading digit run of
-/// its own (`1 repos` keeps its digit: only the stamp form
-/// `<digits>s` with no intervening space is replaced).
-fn blank_timing(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let rest = &bytes[index..];
-        let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
-        if digits > 0 && rest.get(digits) == Some(&b's') {
-            out.extend_from_slice(b"Ns");
-            index += digits + 1;
-        } else {
-            out.push(rest[0]);
-            index += 1;
-        }
-    }
-    out
-}
-
 /// Blank every occurrence of `needle` (a twin HOME path) so failure
 /// diagnostics that quote checkout paths compare across twins.
 fn blank_home(bytes: &[u8], needle: &[u8]) -> Vec<u8> {
@@ -321,7 +299,7 @@ fn blank_home(bytes: &[u8], needle: &[u8]) -> Vec<u8> {
 /// Normalize a captured stream for cross-twin comparison: timing
 /// stamps first, then both twin HOME paths.
 fn normalize(bytes: &[u8], home_a: &Path, home_b: &Path) -> Vec<u8> {
-    let timed = blank_timing(bytes);
+    let timed = dot::progress_ui::normalize_elapsed(bytes);
     let no_a = blank_home(&timed, home_a.to_string_lossy().as_bytes());
     blank_home(&no_a, home_b.to_string_lossy().as_bytes())
 }
