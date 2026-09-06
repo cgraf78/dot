@@ -81,6 +81,13 @@ fn elapsed_normalization_keeps_status_text_significant() {
         dot::progress_ui::normalize_elapsed(left),
         dot::progress_ui::normalize_elapsed(right)
     );
+    let single_digit = b"[1/4] Overlays   ok       1 overlay current                          9s\n";
+    let double_digit = b"[1/4] Overlays   ok       1 overlay current                         11s\n";
+    assert_eq!(
+        dot::progress_ui::normalize_elapsed(single_digit),
+        dot::progress_ui::normalize_elapsed(double_digit),
+        "the fixed-width elapsed field may cross a digit boundary"
+    );
     assert_ne!(
         dot::progress_ui::normalize_elapsed(left),
         dot::progress_ui::normalize_elapsed(
