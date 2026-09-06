@@ -282,7 +282,7 @@ pub fn run(
     let runtime = crate::app::Runtime::from_env(&env, &cwd)
         .expect("the current directory fallback is absolute");
     let args = args.into_iter().collect::<Vec<_>>();
-    crate::app::run(
+    crate::app::run_direct(
         &runtime,
         &args,
         &mut crate::app::Streams::new(stdout, stderr),
