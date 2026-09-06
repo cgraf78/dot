@@ -19,7 +19,7 @@
 //! byte — so the interim set is empty and no known command reports
 //! "not yet implemented" anymore.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -38,6 +38,47 @@ fn shell_help() -> String {
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_dot"))
+}
+
+#[test]
+fn app_runs_independent_contexts_without_mutating_process_environment() {
+    use std::collections::BTreeMap;
+
+    let original_home = std::env::var_os("HOME");
+    let first_home = TempDir::new("runtime-first-home").expect("first home");
+    let second_home = TempDir::new("runtime-second-home").expect("second home");
+    let first_env = BTreeMap::from([(
+        OsString::from("HOME"),
+        first_home.path().as_os_str().to_owned(),
+    )]);
+    let second_env = BTreeMap::from([(
+        OsString::from("HOME"),
+        second_home.path().as_os_str().to_owned(),
+    )]);
+    let first = dot::app::Runtime::from_env(&first_env, first_home.path()).expect("first runtime");
+    let second =
+        dot::app::Runtime::from_env(&second_env, second_home.path()).expect("second runtime");
+    let mut first_stdout = Vec::new();
+    let mut first_stderr = Vec::new();
+    let mut first_streams = dot::app::Streams::new(&mut first_stdout, &mut first_stderr);
+    let mut second_stdout = Vec::new();
+    let mut second_stderr = Vec::new();
+    let mut second_streams = dot::app::Streams::new(&mut second_stdout, &mut second_stderr);
+
+    assert_eq!(
+        dot::app::run(&first, &[OsString::from("help")], &mut first_streams),
+        0
+    );
+    assert_eq!(
+        dot::app::run(&second, &[OsString::from("help")], &mut second_streams),
+        0
+    );
+    assert_eq!(first.home(), first_home.path());
+    assert_eq!(second.home(), second_home.path());
+    assert_eq!(std::env::var_os("HOME"), original_home);
+    assert_eq!(first_stdout, second_stdout);
+    assert!(first_stderr.is_empty());
+    assert!(second_stderr.is_empty());
 }
 
 #[test]
@@ -509,16 +550,12 @@ fn binary_unknown_non_utf8_matches_oracle() {
 }
 
 #[test]
-fn update_applies_flag_exports_before_engine() {
+fn update_passes_flag_exports_to_child_without_mutating_parent() {
     // Slice 80 runs `Command::Update` end to end: the shell loop's
-    // exports land in the process environment (via the sequencer's
-    // flag parser), then the engine runs for real — exit `0` on the
-    // empty-HOME fixture, never the interim diagnostic. The engine
-    // reads the ambient client, so the case redirects HOME, state,
-    // and config at an isolated pair first (never the developer's
-    // own checkout). Process env is shared with sibling threads, so
-    // the case captures every touched variable, then restores the
-    // entry state before asserting.
+    // exports reach its child adapter, then the engine runs for real
+    // — exit `0` on the empty-HOME fixture, never the interim
+    // diagnostic. The same exports must not leak back into this test
+    // process, which may construct another runtime immediately.
     use dot::cli::run;
     use std::ffi::OsString;
     let keys = [
@@ -552,47 +589,12 @@ fn update_applies_flag_exports_before_engine() {
             }
         }
     };
-    // (argv, expected exports, quiet run): `None` reads as unset.
-    type FlagCase<'a> = (&'a [&'a str], &'a [(&'a str, Option<&'a str>)], bool);
-    let cases: &[FlagCase<'_>] = &[
-        (
-            &["update", "--cron"],
-            &[
-                ("DOT_QUIET", Some("1")),
-                ("SHDEPS_QUIET", Some("1")),
-                ("DOT_FORCE", None),
-                ("SHDEPS_FORCE", None),
-                ("DOT_VERBOSE", None),
-                ("SHDEPS_LOG_LEVEL", None),
-            ],
-            true,
-        ),
-        (
-            &["pull", "-f", "--verbose"],
-            &[
-                ("DOT_QUIET", None),
-                ("SHDEPS_QUIET", None),
-                ("DOT_FORCE", Some("1")),
-                ("SHDEPS_FORCE", Some("1")),
-                ("DOT_VERBOSE", Some("1")),
-                ("SHDEPS_LOG_LEVEL", Some("2")),
-            ],
-            false,
-        ),
-        (
-            &["update", "--quiet", "-x"],
-            &[
-                ("DOT_QUIET", Some("1")),
-                ("SHDEPS_QUIET", Some("1")),
-                ("DOT_FORCE", None),
-                ("SHDEPS_FORCE", None),
-                ("DOT_VERBOSE", None),
-                ("SHDEPS_LOG_LEVEL", None),
-            ],
-            true,
-        ),
+    let cases = [
+        (&["update", "--cron"][..], true),
+        (&["pull", "-f", "--verbose"][..], false),
+        (&["update", "--quiet", "-x"][..], true),
     ];
-    for (argv, expected, quiet) in cases {
+    for (argv, quiet) in cases {
         let home = TempDir::new("cli-update-home").expect("isolated home");
         let state = TempDir::new("cli-update-state").expect("isolated state");
         unsafe {
@@ -608,12 +610,15 @@ fn update_applies_flag_exports_before_engine() {
         let owned: Vec<OsString> = argv.iter().map(OsString::from).collect();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run(owned, &mut out, &mut err);
-        let observed: Vec<(&str, Option<OsString>)> = expected
+        let before: Vec<(&str, Option<OsString>)> = keys
             .iter()
-            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .map(|key| (*key, std::env::var_os(key)))
             .collect();
-        let frozen = std::env::var_os("DOT_OVERLAY_LINKS_FROZEN");
+        let code = run(owned, &mut out, &mut err);
+        let after: Vec<(&str, Option<OsString>)> = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
         restore();
         // An empty HOME has no base repo and nothing to converge:
         // the shell succeeds with its no-base rows (pinned against
@@ -625,7 +630,7 @@ fn update_applies_flag_exports_before_engine() {
             !out.windows(19).any(|w| w == b"not yet implemented"),
             "argv: {argv:?}"
         );
-        if *quiet {
+        if quiet {
             assert!(out.is_empty(), "argv: {argv:?}");
         } else {
             assert!(
@@ -633,16 +638,7 @@ fn update_applies_flag_exports_before_engine() {
                 "argv: {argv:?}"
             );
         }
-        for ((key, want), (_, got)) in expected.iter().zip(observed) {
-            assert_eq!(
-                got.as_deref(),
-                want.map(OsString::from).as_deref(),
-                "argv: {argv:?} var: {key}"
-            );
-        }
-        // The sequencer clears rollback authority on entry, like the
-        // shell's `unset DOT_OVERLAY_LINKS_FROZEN`.
-        assert_eq!(frozen, None, "argv: {argv:?} frozen link generation");
+        assert_eq!(after, before, "argv: {argv:?} leaked command environment");
     }
     restore();
 }
