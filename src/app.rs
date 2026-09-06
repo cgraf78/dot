@@ -9,10 +9,26 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Optional executable for an embedded Runtime. Production enters through
-/// `main`, whose snapshot matches its process and never reads this override;
-/// embedding tests and hosts can name the exact `dot` executable to re-exec.
-const RUNTIME_EXECUTABLE: &str = "DOT_RUNTIME_EXECUTABLE";
+/// An absolute `dot` executable explicitly authorized for an embedded runtime.
+///
+/// [`run`] never resolves an executable from the host process. An embedding
+/// caller must opt in to re-execution by constructing this capability and
+/// attaching it with [`Runtime::with_executable`].
+#[derive(Debug, Clone)]
+pub struct RuntimeExecutable(PathBuf);
+
+impl RuntimeExecutable {
+    /// Validate an absolute executable path for embedded execution.
+    pub fn new(path: PathBuf) -> std::io::Result<Self> {
+        if !path.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "dot runtime executable must be an absolute path",
+            ));
+        }
+        Ok(Self(path))
+    }
+}
 
 /// Immutable process inputs for one Dot invocation.
 #[derive(Debug, Clone)]
@@ -23,6 +39,7 @@ pub struct Runtime {
     cwd: PathBuf,
     source_root: PathBuf,
     env: BTreeMap<OsString, OsString>,
+    executable: Option<RuntimeExecutable>,
 }
 
 impl Runtime {
@@ -52,7 +69,14 @@ impl Runtime {
             cwd: cwd.to_path_buf(),
             source_root,
             env: env.clone(),
+            executable: None,
         })
+    }
+
+    /// Attach the explicit executable capability required by [`run`].
+    pub fn with_executable(mut self, executable: RuntimeExecutable) -> Self {
+        self.executable = Some(executable);
+        self
     }
 
     /// Return the snapshotted home directory.
@@ -102,19 +126,21 @@ impl<'a> Streams<'a> {
 }
 
 /// Dispatch one command using only the supplied runtime and streams.
+///
+/// This public embedding boundary always isolates the invocation in a child
+/// process. The ordinary binary entry calls [`run_direct`] after capturing its
+/// Runtime once, so it never reads the environment or working directory again.
 pub fn run(runtime: &Runtime, args: &[OsString], streams: &mut Streams<'_>) -> i32 {
-    if !runtime.matches_process() {
-        return reexec(runtime, args, streams);
-    }
-    crate::cli::run_with_runtime(runtime, args, streams.stdout, streams.stderr)
+    reexec(runtime, args, streams)
 }
 
-impl Runtime {
-    /// Whether this Runtime is the direct process entry snapshot.
-    fn matches_process(&self) -> bool {
-        std::env::current_dir().is_ok_and(|cwd| cwd == self.cwd)
-            && std::env::vars_os().collect::<BTreeMap<_, _>>() == self.env
-    }
+/// Dispatch an already-captured direct process entry without re-executing.
+///
+/// This is public only because the package binary is a separate Rust crate;
+/// it is an implementation entry, not an embedding API.
+#[doc(hidden)]
+pub fn run_direct(runtime: &Runtime, args: &[OsString], streams: &mut Streams<'_>) -> i32 {
+    crate::cli::run_with_runtime(runtime, args, streams.stdout, streams.stderr)
 }
 
 /// Execute an embedded Runtime in a child whose real ambient namespace is its
@@ -122,22 +148,17 @@ impl Runtime {
 /// process semantics while concurrent Runtime callers cannot share PATH,
 /// TMPDIR, WSL markers, or child environment inheritance.
 fn reexec(runtime: &Runtime, args: &[OsString], streams: &mut Streams<'_>) -> i32 {
-    let executable = runtime
-        .value(RUNTIME_EXECUTABLE)
-        .map(PathBuf::from)
-        .map(Ok)
-        .unwrap_or_else(std::env::current_exe);
-    let executable = match executable {
-        Ok(path) => path,
-        Err(_) => {
+    let executable = match runtime.executable.as_ref() {
+        Some(executable) => &executable.0,
+        None => {
             let _ = streams
                 .stderr
-                .write_all(b"dot: cannot resolve runtime executable\n");
+                .write_all(b"dot: embedded runtime requires an executable\n");
             return 1;
         }
     };
     let display = executable.to_string_lossy().into_owned();
-    let output = match Command::new(&executable)
+    let output = match Command::new(executable)
         .args(args)
         .env_clear()
         .envs(runtime.env())

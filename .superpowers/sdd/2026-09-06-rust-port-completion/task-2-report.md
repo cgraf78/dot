@@ -32,7 +32,7 @@ Running the repository formatter produced no semantic edits.
 - Added `src/app.rs` with the intentionally public test/embedding interface:
   immutable `Runtime`, borrowed `Streams`, and `run`.
 - `main` snapshots `vars_os` and `current_dir` once, constructs `Runtime`, and
-  invokes `app::run`; it no longer mutates `DOT_SOURCE_ROOT`.
+  invokes the direct dispatch entry; it no longer mutates `DOT_SOURCE_ROOT`.
 - `cli` keeps `run` as a temporary ambient compatibility adapter, while the
   production path enters `run_with_runtime` and all routed commands consume the
   supplied runtime.
@@ -122,7 +122,7 @@ native_update_flag_capture_does_not_mutate_parent_environment -- --exact
 --nocapture` exited `101`. The assertion showed the process parent changed
 `DOT_QUIET` and `DOT_FORCE` from absent to `"1"`.
 
-### GREEN implementation
+### GREEN implementation (superseded by review round 3)
 
 - `update_run` now passes its derived child environment and immutable Runtime
   cwd into `update_engine::gather`.
@@ -215,17 +215,17 @@ child-launch error.
 
 ### GREEN implementation
 
-- `app::run` now compares its immutable Runtime snapshot with the actual
-  process environment and cwd. The normal `main` snapshot matches and calls
-  `cli::run_with_runtime` directly, with no spawn or performance cost.
+- This round initially made `app::run` compare its immutable Runtime snapshot
+  with the actual process environment and cwd before choosing a direct path.
+  Review round 3 replaced that ambient comparison with explicit direct entry
+  dispatch from `main`.
 - A differing/embedded Runtime re-execs the Rust `dot` executable with
   `Command::env_clear().envs(runtime.env()).current_dir(runtime.cwd())`, then
   forwards the exact captured stdout, stderr, and exit status. The child
   snapshots that same process and therefore takes the direct path, preventing
   recursion.
-- `DOT_RUNTIME_EXECUTABLE` is the narrow embedding/test executable-resolution
-  input; production defaults to `current_exe`. Resolution and launch failures
-  return a clear diagnostic and exit `1`.
+- This round initially used `DOT_RUNTIME_EXECUTABLE` plus a `current_exe`
+  fallback. Review round 3 removed that ambient authority entirely.
 - The concurrency regression uses the actual compiled `dot` binary, a bounded
   barrier at a real native overlay-fetch seam, and per-context shim traces. It
   proves overlapping workers see their own `PATH`, `TMPDIR`, and WSL markers,
@@ -262,14 +262,13 @@ All statuses below were captured after the process-isolation replacement.
 
 ### Final self-review
 
-Named self-review covered the direct-versus-embedded recursion guard,
+Named self-review covered the then-current direct-versus-embedded recursion guard,
 complete-environment equality, executable resolution and error forwarding,
 byte-preserving stream forwarding, force-fallback bootstrap classification,
 the real concurrent native seam, parent non-mutation, public API size, and
 the absence of remote changes. No independent reviewer was dispatched because
-the controller expressly prohibited subagents. The direct process path remains
-the existing runtime behavior; only callers supplying a differing immutable
-Runtime incur a child process.
+the controller expressly prohibited subagents. Those direct-path and
+embedding-cost claims were corrected by review round 3 below.
 
 ### Delivery
 
@@ -277,6 +276,59 @@ The prior concern saying native update process-environment mutation was safely
 deferred to Task 3 is superseded by this review round: reachable native update
 now executes in the Runtime's isolated child process. No remote, pull request,
 restack, merge, close, or auto-merge operation was performed.
+
+## Review round 3 — explicit embedding authority
+
+The third review found that the round-2 direct-path decision still read the
+ambient process a second time to compare a Runtime snapshot, and that
+`DOT_RUNTIME_EXECUTABLE` gave arbitrary environment input authority over the
+embedded child. Both findings are fixed at the application boundary.
+
+### RED evidence
+
+Before the production change, the new typed-capability tests failed to compile
+with exit `101`: `app::RuntimeExecutable` and
+`Runtime::with_executable` did not exist. The intended tests cover a missing
+capability, a rejected relative path, and a non-existent absolute executable.
+
+### GREEN implementation
+
+- `RuntimeExecutable` is the narrow, documented public capability. Its
+  constructor rejects non-absolute paths, and `Runtime::with_executable`
+  consumes the Runtime to attach that immutable capability.
+- Public `app::run` always uses process isolation. Without a capability it
+  returns `dot: embedded runtime requires an executable` with exit `1`; it
+  never compares the host environment/cwd or resolves `current_exe`.
+- `main` captures its environment and cwd once and calls `run_direct` with the
+  resulting Runtime. `run_direct` is `#[doc(hidden)] pub` only because the
+  package binary is a separate Rust crate; it is the crate's intended private
+  direct-entry implementation, not the embedding API.
+- The env-cleared child snapshots its own process and `main` uses direct
+  dispatch, so re-execution cannot recurse.
+
+### GREEN verification
+
+- typed-capability RED — exit `101`; GREEN missing/unresolvable tests —
+  `2 passed`, exit `0`.
+- relative executable rejection — `1 passed`, exit `0`.
+- deterministic native Runtime overlap — `1 passed`, exit `0` (4.46s).
+- `cargo test --locked --test cli` — `55 passed`, exit `0` (8.37s).
+- `cargo test --locked --test update_parpull` — `9 passed`, exit `0`
+  (58.61s).
+- `cargo test --locked --test repos_pull_fleet` — `8 passed`, exit `0`
+  (37.19s).
+- `cargo test --locked` — exit `0`, including doc-tests.
+- `bash tests/run` — `28 passed (28 total)`, exit `0`.
+- `cargo fmt --check`, strict Clippy, and rustdoc — all exit `0`.
+
+### Final self-review
+
+Named self-review checked the direct entry's single env/cwd capture, absence
+of `DOT_RUNTIME_EXECUTABLE` and runtime ambient comparison, capability path
+validation, missing/launch failure diagnostics, child stream/status forwarding,
+recursive-child prevention, fallback parity classification, and the concurrent
+native seam. No independent reviewer was dispatched because the controller
+expressly prohibited subagents.
 
 ### Commit
 

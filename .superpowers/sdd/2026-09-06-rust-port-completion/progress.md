@@ -75,20 +75,22 @@ Task 2 beyond the smallest useful slice, but accepting a dishonest boundary
 would create concurrency bugs and force later rework.
 
 Ruling: Abandon the transitive `_with` wrapper implementation after its
-16-file, +706/-151-line stop audit. Use process isolation for Runtime snapshots
-that differ from the current process: re-exec the Rust binary with an
-environment-cleared snapshot and cwd, while the ordinary matching CLI path
-runs directly with no extra spawn. This keeps ambient native helpers correct
-inside the isolated child and avoids plumbing execution parameters through the
-entire repository graph. Treat the shell launcher's `bash-v1` state marker as
+16-file, +706/-151-line stop audit. Public embedded Runtime calls always
+re-exec only an explicitly attached, validated executable with an
+environment-cleared snapshot and cwd; they never compare or consult host
+environment/cwd state. The ordinary binary entry captures env/cwd once and
+uses direct dispatch. This keeps ambient native helpers correct inside the
+isolated child and avoids plumbing execution parameters through the entire
+repository graph. Treat the shell launcher's `bash-v1` state marker as
 bootstrap metadata, not converged CLI state, in fallback parity. If wrong, an
-embedding-specific child-spawn cost or executable-resolution contract may need
+embedding-specific child-spawn cost or executable-capability contract may need
 reconsideration; ordinary CLI performance remains unaffected.
 
 - Task 2 — LOCAL IMPLEMENTATION COMPLETE, pending controller review. The
-  final process-isolation correction keeps matching `main` Runtime snapshots
-  direct and re-execs only differing embedded Runtime snapshots with an
-  env-cleared map and cwd. Deterministic native overlap, force-fallback
+  final process-isolation correction has `main` capture env/cwd once and enter
+  direct dispatch, while public embedded Runtime calls require an explicit
+  executable capability and always re-exec with an env-cleared map and cwd.
+  Deterministic native overlap, force-fallback
   semantic parity, focused update/fleet tests, full Rust tests, ignored CI
   performance coverage, shell oracle, formatter, Clippy, rustdoc, and diff
   checks all have explicit local exit-0 evidence. No remote operation was

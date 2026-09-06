@@ -219,13 +219,9 @@ fn app_runs_concurrent_native_contexts_without_mutating_process_environment() {
 
 #[test]
 fn embedded_runtime_reports_unresolvable_executable() {
-    let mut env = std::env::vars_os().collect::<BTreeMap<_, _>>();
-    env.insert(
-        OsString::from("DOT_RUNTIME_EXECUTABLE"),
-        OsString::from("/nonexistent/dot-runtime-child"),
-    );
+    let env = std::env::vars_os().collect::<BTreeMap<_, _>>();
     let cwd = std::env::current_dir().expect("test cwd");
-    let runtime = dot::app::Runtime::from_env(&env, &cwd).expect("embedded runtime");
+    let runtime = embedded_runtime(&env, &cwd, Path::new("/nonexistent/dot-runtime-child"));
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let code = dot::app::run(
@@ -238,6 +234,34 @@ fn embedded_runtime_reports_unresolvable_executable() {
     assert_eq!(
         stderr,
         b"dot: cannot re-exec runtime executable: /nonexistent/dot-runtime-child\n"
+    );
+}
+
+#[test]
+fn embedded_runtime_requires_explicit_executable() {
+    let env = std::env::vars_os().collect::<BTreeMap<_, _>>();
+    let cwd = std::env::current_dir().expect("test cwd");
+    let runtime = dot::app::Runtime::from_env(&env, &cwd).expect("embedded runtime");
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = dot::app::run(
+        &runtime,
+        &[OsString::from("help")],
+        &mut dot::app::Streams::new(&mut stdout, &mut stderr),
+    );
+    assert_eq!(code, 1);
+    assert!(stdout.is_empty());
+    assert_eq!(stderr, b"dot: embedded runtime requires an executable\n");
+}
+
+#[test]
+fn embedded_executable_rejects_relative_path() {
+    let error = dot::app::RuntimeExecutable::new(PathBuf::from("dot"))
+        .expect_err("relative executable must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "dot runtime executable must be an absolute path"
     );
 }
 
@@ -1570,11 +1594,22 @@ fn native_update_env(client: &ReposClient, state: &Path) -> BTreeMap<OsString, O
             OsString::from("DOT_UPDATE_RELOADS_SHELL"),
             OsString::from("0"),
         ),
-        (
-            OsString::from("DOT_RUNTIME_EXECUTABLE"),
-            OsString::from(env!("CARGO_BIN_EXE_dot")),
-        ),
     ])
+}
+
+/// Build an embedding Runtime with an explicit production-binary capability.
+/// `app::run` never consults a process environment variable for this authority.
+fn embedded_runtime(
+    env: &BTreeMap<OsString, OsString>,
+    cwd: &Path,
+    executable: &Path,
+) -> dot::app::Runtime {
+    dot::app::Runtime::from_env(env, cwd)
+        .expect("embedded runtime")
+        .with_executable(
+            dot::app::RuntimeExecutable::new(executable.to_path_buf())
+                .expect("absolute runtime executable"),
+        )
 }
 
 /// The shell harness defaults state beneath HOME and keeps Git's launcher
@@ -1587,12 +1622,11 @@ fn runtime_for_force_fallback(client: &ReposClient) -> dot::app::Runtime {
         OsString::from("XDG_CACHE_HOME"),
         client.scope.path().join("cache").into_os_string(),
     );
-    dot::app::Runtime::from_env(&env, &client.home).expect("force fallback runtime")
+    embedded_runtime(&env, &client.home, Path::new(env!("CARGO_BIN_EXE_dot")))
 }
 
-/// A Runtime-only child environment. Its test executable override is the
-/// intentional embedding seam: ordinary `main` snapshots match ambient and
-/// execute directly, while this caller must re-exec the production binary.
+/// A Runtime-only child environment with the explicit production-binary
+/// capability required by the embedding boundary.
 #[allow(clippy::too_many_arguments)]
 fn runtime_for_native_update_with_process(
     client: &ReposClient,
@@ -1632,10 +1666,6 @@ fn runtime_for_native_update_with_process(
             real_tool(tool).into_os_string(),
         );
     }
-    env.insert(
-        OsString::from("DOT_RUNTIME_EXECUTABLE"),
-        OsString::from(env!("CARGO_BIN_EXE_dot")),
-    );
     match wsl {
         Some(value) => {
             env.insert(OsString::from("WSL_DISTRO_NAME"), OsString::from(value));
@@ -1644,7 +1674,7 @@ fn runtime_for_native_update_with_process(
             env.remove(OsStr::new("WSL_DISTRO_NAME"));
         }
     }
-    dot::app::Runtime::from_env(&env, &client.home).expect("native child runtime")
+    embedded_runtime(&env, &client.home, Path::new(env!("CARGO_BIN_EXE_dot")))
 }
 
 /// Test-only command recorder. It blocks only a real overlay Git command,

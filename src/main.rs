@@ -28,7 +28,7 @@ fn main() {
     let mut err = stderr().lock();
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     let mut streams = dot::app::Streams::new(&mut out, &mut err);
-    let code = dot::app::run(&runtime, &args, &mut streams);
+    let code = dot::app::run_direct(&runtime, &args, &mut streams);
     // `process::exit` runs no destructors and flushes nothing; `StdoutLock`
     // is line-buffered, so a future write without a trailing newline would
     // be silently truncated without this. A flush failure here means the
