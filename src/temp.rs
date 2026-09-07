@@ -10,7 +10,7 @@
 //! through the same `mv` binary with the same `-nT`/`-nh` capability
 //! probe (GNU and BSD `mv` differ on late directories, and the probe
 //! matrix is exactly what the shell suite pins), and the process umask
-//! is read through the Unix ABI under a process-wide lock. Callers thread
+//! is read without mutating process state. Callers thread
 //! [`LockCtx`] (the `DOT_TEST` /
 //! `DOT_UPDATE_LOCK_TOKEN` gate), `source_root` (the
 //! `DOT_SOURCE_ROOT` binding, see [`source_root`]), the umask, and a
@@ -24,7 +24,6 @@
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use crate::errors::{Error, Result};
 
@@ -36,11 +35,6 @@ const TMP_SUFFIX_LEN: usize = 6;
 /// Crate-visible so the init transaction stage allocator shares the
 /// exact retry budget instead of inventing a second one.
 pub(crate) const TMP_RETRIES: usize = 100;
-
-/// `umask(2)` changes process-global state even when it is used only to read
-/// the current mask. Serialize the set-and-restore pair, and use the most
-/// restrictive temporary mask so an unrelated creation can only fail closed.
-static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
 /// True when `path` carries a byte the transaction layer rejects
 /// outright: newline, carriage return, or tab. The shell tests
@@ -245,17 +239,75 @@ pub fn private_control_file_validate(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read the engine process umask without spawning a shell.
+/// Parse the numeric form emitted by `/proc/self/status` and `sh -c umask`.
+fn parse_umask(value: &str) -> Option<u32> {
+    let value = value.trim_matches(|ch: char| ch.is_ascii_whitespace());
+    if value.is_empty() || value.len() > 4 || !value.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
+    {
+        return None;
+    }
+    let mask = u32::from_str_radix(value, 8).ok()?;
+    (mask <= 0o777).then_some(mask)
+}
+
+/// Read the engine process umask without mutating process-global state.
 pub fn read_umask() -> Result<u32> {
-    let _guard = UMASK_LOCK.lock().map_err(|_| Error::Usage {
-        message: "umask lock poisoned",
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        if let Some(mask) = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Umask:").and_then(parse_umask))
+        {
+            return Ok(mask);
+        }
+    }
+
+    let shell = if Path::new("/bin/sh").is_file() {
+        "/bin/sh"
+    } else {
+        "sh"
+    };
+    let output = std::process::Command::new(shell)
+        .args(["-c", "umask"])
+        .output()
+        .map_err(|source| Error::Io {
+            context: "read umask",
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(Error::Usage {
+            message: "cannot read umask",
+        });
+    }
+    let value = String::from_utf8(output.stdout).map_err(|_| Error::Usage {
+        message: "invalid umask output",
     })?;
-    // SAFETY: `umask` accepts every mode value. The first call returns the
-    // previous mask; the second restores it while the process-wide lock is
-    // still held.
-    let mask = unsafe { libc::umask(0o777) };
-    unsafe { libc::umask(mask) };
-    Ok(mask as u32 & 0o777)
+    parse_umask(&value).ok_or(Error::Usage {
+        message: "invalid umask output",
+    })
+}
+
+#[cfg(test)]
+mod umask_tests {
+    use super::parse_umask;
+
+    #[test]
+    fn numeric_umask_parser_is_strict() {
+        for (value, expected) in [
+            ("0022", Some(0o022)),
+            (" 0077\n", Some(0o077)),
+            ("0", Some(0)),
+            ("0777", Some(0o777)),
+            ("", None),
+            ("Umask:\t0022", None),
+            ("00022", None),
+            ("0788", None),
+            ("1000", None),
+            ("u=rwx,g=rx,o=rx", None),
+        ] {
+            assert_eq!(parse_umask(value), expected, "{value:?}");
+        }
+    }
 }
 
 /// `_dot_apply_tracked_file_mode`: force a git-tracked mode (`100644`

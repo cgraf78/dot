@@ -1,6 +1,7 @@
 //! Native contracts for fetch, push, diff, and status repository commands.
 
 use std::ffi::OsString;
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -57,16 +58,22 @@ fn git(dir: &Path, args: &[&str]) -> Output {
 
 fn write_wrapper(scope: &Path) -> PathBuf {
     let wrapper = scope.join("git-wrapper");
+    let stage = scope.join(".git-wrapper.stage");
     let real = real_git().to_string_lossy().replace('\'', "'\\''");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nexec '{real}' -c core.hooksPath=/dev/null -c commit.gpgsign=false -c tag.gpgsign=false -c user.name=fixture -c user.email=fixture@example.invalid \"$@\"\n"
-        ),
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stage)
+        .expect("stage git wrapper");
+    write!(
+        file,
+        "#!/bin/sh\nexec '{real}' -c core.hooksPath=/dev/null -c commit.gpgsign=false -c tag.gpgsign=false -c user.name=fixture -c user.email=fixture@example.invalid \"$@\"\n"
     )
-    .expect("git wrapper");
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
-        .expect("wrapper mode");
+    .expect("write git wrapper");
+    file.flush().expect("flush git wrapper");
+    drop(file);
+    std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o755)).expect("wrapper mode");
+    std::fs::rename(stage, &wrapper).expect("publish git wrapper");
     wrapper
 }
 
