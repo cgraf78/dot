@@ -75,6 +75,87 @@ fn shell_run(
     )
 }
 
+/// Recognize the isolated Bash job-control race observed on macOS runners.
+fn bash_setpgid_race(status: i32, stdout: &[u8], stderr: &[u8]) -> bool {
+    if status != 0 || stdout != b"ok\n" {
+        return false;
+    }
+    let Ok(stderr) = std::str::from_utf8(stderr) else {
+        return false;
+    };
+    let Some(line) = stderr.strip_suffix('\n') else {
+        return false;
+    };
+    let Some((source, group)) = line.split_once(": child setpgid (") else {
+        return false;
+    };
+    let Some(group) = group.strip_suffix("): Operation not permitted") else {
+        return false;
+    };
+    let Some((child, target)) = group.split_once(" to ") else {
+        return false;
+    };
+    source.ends_with("/lib/dot/resources.sh")
+        && child == target
+        && !child.is_empty()
+        && child.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Retry only when Bash itself loses the short-lived coprocess group race.
+fn without_setpgid_race(
+    mut run: impl FnMut() -> (i32, Vec<u8>, Vec<u8>),
+) -> (i32, Vec<u8>, Vec<u8>) {
+    let mut result = run();
+    for _ in 1..8 {
+        if !bash_setpgid_race(result.0, &result.1, &result.2) {
+            break;
+        }
+        result = run();
+    }
+    result
+}
+
+#[test]
+fn retries_only_bash_setpgid_race() {
+    assert!(bash_setpgid_race(
+        0,
+        b"ok\n",
+        b"/tmp/lib/dot/resources.sh: child setpgid (123 to 123): Operation not permitted\n"
+    ));
+    assert!(!bash_setpgid_race(
+        1,
+        b"ok\n",
+        b"/tmp/lib/dot/resources.sh: child setpgid (123 to 123): Operation not permitted\n"
+    ));
+    assert!(!bash_setpgid_race(
+        0,
+        b"reject\n",
+        b"normalization failed\n"
+    ));
+    assert!(!bash_setpgid_race(
+        0,
+        b"ok\n",
+        b"/tmp/lib/dot/resources.sh: child setpgid (123 to 123): Operation not permitted\nother\n"
+    ));
+
+    let mut attempts = 0;
+    let result = without_setpgid_race(|| {
+        attempts += 1;
+        if attempts == 1 {
+            (
+                0,
+                b"ok\n".to_vec(),
+                b"/tmp/lib/dot/resources.sh: child setpgid (123 to 123): Operation not permitted\n"
+                    .to_vec(),
+            )
+        } else {
+            (0, b"ok\n".to_vec(), Vec::new())
+        }
+    });
+    assert_eq!(attempts, 2);
+    assert_eq!(result, (0, b"ok\n".to_vec(), Vec::new()));
+}
+
 /// Run `git -C dir args`, silenced, asserting success.
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -632,7 +713,9 @@ fn normalize_updated_paths_matches_shell() {
     let snap_text = snap_path.to_string_lossy().into_owned();
     let snap_os = std::ffi::OsString::from(&snap_text);
     let repo_os = std::ffi::OsString::from(fixture.repo_text());
-    let (status, out, err) = shell_run(&fixture.home, &[&root_os, &snap_os, &repo_os], &[], &probe);
+    let (status, out, err) = without_setpgid_race(|| {
+        shell_run(&fixture.home, &[&root_os, &snap_os, &repo_os], &[], &probe)
+    });
     assert_eq!(status, 0, "harness exit");
     assert!(err.is_empty(), "shell stderr: {err:?}");
     assert_eq!(out, b"ok\n", "shell accepts clean tree");
