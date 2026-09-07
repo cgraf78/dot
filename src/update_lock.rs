@@ -69,6 +69,99 @@ pub fn owner_file(lock_dir: &Path) -> PathBuf {
     lock_dir.join(OWNER_FILE_NAME)
 }
 
+/// Validate the state-owned parent before treating it as the lock namespace.
+/// In particular, never chmod through a `dot` symlink: it could change an
+/// unrelated target before the lock operation has even begun.
+#[cfg(unix)]
+fn secure_parent(state_dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let parent = state_dir.join(DOT_DIR_NAME);
+    match std::fs::symlink_metadata(&parent) {
+        Ok(meta) => {
+            if !meta.is_dir()
+                || meta.file_type().is_symlink()
+                || meta.uid() != crate::temp::current_uid().unwrap_or(u32::MAX)
+            {
+                return Err(Error::Io {
+                    context: "lock state directory is unsafe",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        parent.display().to_string(),
+                    ),
+                });
+            }
+            // The shell has always repaired a pre-existing, user-owned
+            // state directory.  Keep that compatibility, but only after the
+            // lstat above has ruled out a link or foreign owner.
+            if meta.permissions().mode() & 0o077 != 0 {
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |source| Error::Io {
+                        context: "lock could not secure its state directory",
+                        source,
+                    },
+                )?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(state_dir).map_err(|source| Error::Io {
+                context: "lock could not create its state directory",
+                source,
+            })?;
+            match std::fs::create_dir(&parent) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return secure_parent(state_dir);
+                }
+                Err(source) => {
+                    return Err(Error::Io {
+                        context: "lock could not create its state directory",
+                        source,
+                    });
+                }
+            }
+            // We created it, but still lstat before chmod so a concurrent
+            // replacement cannot redirect permission changes through a link.
+            let meta = std::fs::symlink_metadata(&parent).map_err(|source| Error::Io {
+                context: "lock could not inspect its state directory",
+                source,
+            })?;
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                return Err(Error::Io {
+                    context: "lock state directory is unsafe",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        parent.display().to_string(),
+                    ),
+                });
+            }
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |source| Error::Io {
+                    context: "lock could not secure its state directory",
+                    source,
+                },
+            )?;
+        }
+        Err(source) => {
+            return Err(Error::Io {
+                context: "lock could not inspect its state directory",
+                source,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_parent(state_dir: &Path) -> Result<()> {
+    let parent = state_dir.join(DOT_DIR_NAME);
+    std::fs::create_dir_all(&parent).map_err(|source| Error::Io {
+        context: "lock could not create its state directory",
+        source,
+    })?;
+    Ok(())
+}
+
 /// Parsed owner record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Owner {
@@ -513,27 +606,7 @@ pub fn acquire(
     warn_sink: &mut dyn std::io::Write,
 ) -> Result<LockGuard> {
     let lock_dir = lock_path(state_dir);
-    std::fs::create_dir_all(lock_dir.parent().unwrap_or(state_dir)).map_err(|source| {
-        Error::Io {
-            context: "lock could not create its state directory",
-            source,
-        }
-    })?;
-    // The lifecycle ledger shares `<state>/dot`. It requires the directory
-    // to be private before publishing trusted records, so the lock must not
-    // leave its earlier `create_dir_all` default mode as an unsafe ancestor.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            lock_dir.parent().unwrap_or(state_dir),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .map_err(|source| Error::Io {
-            context: "lock could not secure its state directory",
-            source,
-        })?;
-    }
+    secure_parent(state_dir)?;
     if let Some(token) = prior_token {
         if let Some(guard) = try_reenter(&lock_dir, token) {
             return Ok(guard);
@@ -745,5 +818,37 @@ mod tests {
             }
             other => panic!("expected busy, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_refuses_a_symlinked_state_parent_without_touching_target() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let scratch = crate::test_support::TempDir::new("lock-parent-link").expect("scratch");
+        let target = scratch.path().join("unrelated-target");
+        std::fs::create_dir(&target).expect("target directory");
+        let sentinel = target.join("sentinel");
+        std::fs::write(&sentinel, b"must survive").expect("target content");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("target mode");
+        symlink(&target, scratch.path().join(DOT_DIR_NAME)).expect("state symlink");
+
+        let result = acquire(scratch.path(), false, &test_log(), None, &mut Vec::new());
+
+        assert!(result.is_err(), "symlinked state parent must be refused");
+        assert_eq!(
+            std::fs::read(&sentinel).expect("target content"),
+            b"must survive"
+        );
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "refusal must not chmod the symlink target"
+        );
     }
 }

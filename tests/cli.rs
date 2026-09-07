@@ -1569,6 +1569,10 @@ fn native_update_env(client: &ReposClient, state: &Path) -> BTreeMap<OsString, O
             state.as_os_str().to_owned(),
         ),
         (OsString::from("PATH"), path),
+        (
+            OsString::from("BASH"),
+            dot::test_support::bash().as_os_str().to_owned(),
+        ),
         (OsString::from("TMPDIR"), tmp),
         (OsString::from("LC_ALL"), OsString::from("C")),
         (OsString::from("SHELL"), OsString::from("/bin/sh")),
@@ -2007,6 +2011,7 @@ fn repos_env(cmd: &mut Command, client: &ReposClient, topology: bool) {
     cmd.env_clear()
         .env("LC_ALL", "C")
         .env("PATH", &path)
+        .env("BASH", dot::test_support::bash())
         .env("TMPDIR", &tmpdir)
         // Pin an unknown shell: production always exports `SHELL`
         // (and bash backfills it from the login shell when it does
@@ -2644,6 +2649,8 @@ impl NativeUpdateFixture {
         std::fs::create_dir_all(base_dot.join("overlays.d")).expect("base overlays directory");
         std::fs::create_dir_all(self.client.base_seed.join(".config/profile"))
             .expect("base profile tree");
+        std::fs::create_dir_all(self.client.base_seed.join("extensions/pre-sync.d"))
+            .expect("base pre-sync directory");
         std::fs::create_dir_all(self.client.overlay_seed.join("home/.config/profile"))
             .expect("alpha profile tree");
         std::fs::write(
@@ -2666,7 +2673,12 @@ impl NativeUpdateFixture {
         seed_advance(
             &self.client.base_seed,
             ".config/dot/config",
-            b"version=1\ndefault_profile=dev\n",
+            b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
+        );
+        seed_advance(
+            &self.client.base_seed,
+            "extensions/pre-sync.d/10-after-base.sh",
+            b"# shellcheck shell=bash\nprepare() { printf '%s' \"$DOT_PRE_SYNC_STAGE\" >\"$HOME/post-base-pre-sync\"; }\n",
         );
         seed_advance(
             &self.client.base_seed,
@@ -2681,7 +2693,14 @@ impl NativeUpdateFixture {
         seed_advance(
             &self.client.base_seed,
             ".config/dot/overlays.d/10-alpha.conf",
-            format!("url=file://{}\n", self.client.overlay_origin.display()).as_bytes(),
+            // Deliberately differs from the entry-generation descriptor.
+            // The second phase must identify alpha by name, not re-pull it
+            // because the refreshed record makes this source optional.
+            format!(
+                "url=file://{}\noptional=true\n",
+                self.client.overlay_origin.display()
+            )
+            .as_bytes(),
         );
         seed_advance(
             &self.client.base_seed,
@@ -2782,10 +2801,35 @@ impl NativeUpdateFixture {
             .stderr(Stdio::piped());
         cmd.output().expect("run native update")
     }
+
+    fn shell_dot_with(
+        &self,
+        argv: &[&str],
+        configure: impl FnOnce(&mut Command),
+    ) -> std::process::Output {
+        let mut cmd = Command::new(dot::test_support::bash());
+        cmd.arg("bin/dot");
+        for arg in argv {
+            cmd.arg(arg);
+        }
+        repos_env(&mut cmd, &self.client, false);
+        configure(&mut cmd);
+        cmd.current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.output().expect("run shell update")
+    }
 }
 
 fn assert_native_silent(output: &std::process::Output, label: &str) {
-    assert_eq!(output.status.code(), Some(0), "{label} status");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{label} status; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output.stdout.is_empty(), "{label} stdout");
     assert!(output.stderr.is_empty(), "{label} stderr");
 }
@@ -2902,25 +2946,44 @@ fn update_native_force_with_provider_stays_on_the_shell_adapter() {
 }
 
 #[test]
-fn update_native_configured_pre_sync_hook_stays_on_the_shell_adapter() {
-    // Hook presence is configuration-owned, not an optional ambient export.
-    // Until Task 5 ports pre-sync coordination, a configured hook directory
-    // must choose the adapter before the native engine starts a partial run.
+fn update_native_configured_pre_sync_hook_uses_the_hardened_worker() {
+    // A configured hook must remain native and run only after the worker has
+    // validated its one-use context. Poisoning the old update adapter makes a
+    // fallback unmistakable while the marker proves the hook actually ran.
     let fixture = NativeUpdateFixture::stage();
     let extensions = fixture.client.home.join("extensions/pre-sync.d");
     std::fs::create_dir_all(&extensions).expect("pre-sync directory");
-    std::fs::write(extensions.join("10-hook.sh"), b"pre_sync() { :; }\n").expect("pre-sync hook");
+    let hook = extensions.join("10-hook.sh");
+    std::fs::write(
+        &hook,
+        b"prepare() { printf prepared >\"$HOME/pre-sync-ran\"; }\n",
+    )
+    .expect("pre-sync hook");
     std::fs::create_dir_all(fixture.client.xdg.join("dot")).expect("config directory");
     std::fs::write(
         fixture.client.xdg.join("dot/config"),
         b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\n",
     )
     .expect("extension config");
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(
+            fixture.client.home.join("extensions"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("private extension root");
+        std::fs::set_permissions(&extensions, std::fs::Permissions::from_mode(0o700))
+            .expect("private pre-sync directory");
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700))
+            .expect("executable pre-sync hook");
+    }
     fixture.break_shell_engine();
     let output = fixture.rust_dot(&["update", "--quiet"]);
-    assert_eq!(output.status.code(), Some(97));
-    assert_eq!(output.stdout, b"");
-    assert_eq!(output.stderr, b"OLD-UPDATE-ENGINE\n");
+    assert_native_silent(&output, "configured pre-sync hook");
+    assert_eq!(
+        std::fs::read(fixture.client.home.join("pre-sync-ran")).expect("pre-sync marker"),
+        b"prepared"
+    );
 }
 
 #[test]
@@ -2962,6 +3025,12 @@ fn update_native_profile_addition_discovered_after_base_pull_stays_native() {
             .expect("overlay manifest")
             .contains("beta"),
         "final manifest names the post-base addition"
+    );
+    assert_eq!(
+        std::fs::read(fixture.client.home.join("post-base-pre-sync"))
+            .expect("post-base hook marker"),
+        b"reconcile",
+        "a hook introduced by the base refresh runs in final reconcile"
     );
 }
 
@@ -3130,6 +3199,257 @@ fn update_native_profile_conflict_after_base_pull_restores_prior_generation() {
         std::fs::read(&manifest).expect("restored manifest"),
         manifest_before,
         "rollback keeps the prior manifest generation"
+    );
+}
+
+/// A profile update has mutable repository, manifest, and lifecycle state, so
+/// it needs separate fixture scopes on each side of the oracle.  The process
+/// streams contain only scope-specific paths and stage elapsed stamps; those
+/// are normalized by [`scrub_twin`] after their shape has been checked.
+fn assert_profile_pair(
+    shell: &std::process::Output,
+    native: &std::process::Output,
+    shell_fixture: &NativeUpdateFixture,
+    native_fixture: &NativeUpdateFixture,
+    label: &str,
+) {
+    assert_eq!(
+        native.status.code(),
+        shell.status.code(),
+        "{label} status\nshell stdout: {}\nshell stderr: {}\nnative stdout: {}\nnative stderr: {}",
+        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&shell.stderr),
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&native.stderr),
+    );
+    assert_eq!(
+        scrub_twin(&native.stdout, native_fixture.client.scope.path()),
+        scrub_twin(&shell.stdout, shell_fixture.client.scope.path()),
+        "{label} stdout",
+    );
+    assert_eq!(
+        scrub_twin(&native.stderr, native_fixture.client.scope.path()),
+        scrub_twin(&shell.stderr, shell_fixture.client.scope.path()),
+        "{label} stderr",
+    );
+
+    for relative in [
+        ".local/state/dot/overlay-links",
+        ".local/state/dot/profile-overlay-lifecycle-v1",
+    ] {
+        let shell_path = shell_fixture.client.home.join(relative);
+        let native_path = native_fixture.client.home.join(relative);
+        assert_eq!(
+            native_path.exists(),
+            shell_path.exists(),
+            "{label} {relative} presence",
+        );
+        if shell_path.exists() {
+            assert_eq!(
+                scrub_scope(
+                    &std::fs::read(&native_path).expect("native state"),
+                    native_fixture.client.scope.path()
+                ),
+                scrub_scope(
+                    &std::fs::read(&shell_path).expect("shell state"),
+                    shell_fixture.client.scope.path()
+                ),
+                "{label} {relative}",
+            );
+        }
+    }
+}
+
+fn assert_profile_twin(
+    shell_fixture: &NativeUpdateFixture,
+    native_fixture: &NativeUpdateFixture,
+    label: &str,
+) {
+    let shell = repos_shell(&shell_fixture.client, &["update", "--quiet"]);
+    let native = native_fixture.rust_dot(&["update", "--quiet"]);
+    assert_profile_pair(&shell, &native, shell_fixture, native_fixture, label);
+}
+
+fn git_porcelain(client: &ReposClient) -> Vec<u8> {
+    let output = Command::new("git")
+        .arg(format!("--git-dir={}", client.base_git_dir.display()))
+        .arg(format!("--work-tree={}", client.home.display()))
+        // The separate bare Git directory, checkouts, and shell-only runtime
+        // stamps all live under this synthetic worktree.  Compare tracked
+        // changes only: that is the Git state the profile convergence owns.
+        .args(["status", "--porcelain=v1", "--untracked-files=no"])
+        .env("DOT_GIT_REAL", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("read profile worktree status");
+    assert!(
+        output.status.success(),
+        "profile worktree status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn assert_profile_tree_twin(
+    shell_fixture: &NativeUpdateFixture,
+    native_fixture: &NativeUpdateFixture,
+    relative: &str,
+    label: &str,
+) {
+    let shell = shell_fixture.client.home.join(relative);
+    let native = native_fixture.client.home.join(relative);
+    assert_eq!(
+        native.is_symlink(),
+        shell.is_symlink(),
+        "{label} link shape"
+    );
+    assert_eq!(
+        std::fs::read(&native).ok(),
+        std::fs::read(&shell).ok(),
+        "{label} link content"
+    );
+    assert_eq!(
+        git_porcelain(&native_fixture.client),
+        git_porcelain(&shell_fixture.client),
+        "{label} base worktree status"
+    );
+}
+
+#[test]
+fn update_native_profile_selection_matches_shell_twin() {
+    // This is deliberately not an adapter-poison test: each implementation
+    // gets an independently staged client, then we compare process behavior
+    // and the profile generation it published.
+    let shell = NativeUpdateFixture::stage().with_base_profile();
+    let native = NativeUpdateFixture::stage().with_base_profile();
+
+    assert_profile_twin(&shell, &native, "base profile selection");
+}
+
+#[test]
+fn update_native_profile_selector_conflict_matches_shell_twin() {
+    // An equally-specific conflict is a semantic profile error.  The native
+    // lane must preserve the shell's failure code and diagnostic rather than
+    // merely reporting any native failure.
+    let shell = NativeUpdateFixture::stage().with_conflicting_profile_selectors();
+    let native = NativeUpdateFixture::stage().with_conflicting_profile_selectors();
+
+    assert_profile_twin(&shell, &native, "selector conflict");
+}
+
+#[test]
+fn update_native_profile_descriptor_refresh_matches_shell_twin() {
+    // The base refresh changes alpha's descriptor before it selects beta.  A
+    // full-record difference must not make alpha an additions-only pull; the
+    // shell and native outputs plus generated state remain the oracle.
+    let shell = NativeUpdateFixture::stage().with_base_discovered_profile_addition();
+    let native = NativeUpdateFixture::stage().with_base_discovered_profile_addition();
+    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |cmd| {
+        cmd.env("XDG_CONFIG_HOME", shell.client.home.join(".config"));
+    });
+    let native_run = native.rust_dot_with(&["update", "--quiet"], |cmd| {
+        cmd.env("XDG_CONFIG_HOME", native.client.home.join(".config"));
+    });
+
+    assert_profile_pair(
+        &shell_run,
+        &native_run,
+        &shell,
+        &native,
+        "descriptor refresh",
+    );
+    assert_profile_tree_twin(
+        &shell,
+        &native,
+        ".config/profile/value",
+        "descriptor refresh",
+    );
+}
+
+#[test]
+fn update_native_profile_retirement_matches_shell_twin() {
+    let shell = NativeUpdateFixture::stage().with_profile_retirement();
+    let native = NativeUpdateFixture::stage().with_profile_retirement();
+    assert_profile_twin(&shell, &native, "retirement setup");
+
+    for fixture in [&shell, &native] {
+        std::fs::write(
+            fixture.client.xdg.join("dot/config"),
+            b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
+        )
+        .expect("switch profile");
+    }
+    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
+    let native_run = native.rust_dot(&["update", "--quiet"]);
+
+    assert_profile_pair(&shell_run, &native_run, &shell, &native, "retirement");
+    assert_eq!(
+        std::fs::read(native.client.home.join("alpha-retired")).expect("native retirement marker"),
+        std::fs::read(shell.client.home.join("alpha-retired")).expect("shell retirement marker"),
+        "retirement hook result"
+    );
+    assert_eq!(
+        native.client.home.join(".dotfiles-beta/.git").is_dir(),
+        shell.client.home.join(".dotfiles-beta/.git").is_dir(),
+        "retirement beta checkout"
+    );
+}
+
+#[test]
+fn update_native_profile_rollback_matches_shell_twin() {
+    let shell = NativeUpdateFixture::stage().with_base_profile_rollback();
+    let native = NativeUpdateFixture::stage().with_base_profile_rollback();
+    let run_shell = || {
+        shell.shell_dot_with(&["update", "--quiet"], |cmd| {
+            cmd.env("XDG_CONFIG_HOME", shell.client.home.join(".config"));
+        })
+    };
+    let run_native = || {
+        native.rust_dot_with(&["update", "--quiet"], |cmd| {
+            cmd.env("XDG_CONFIG_HOME", native.client.home.join(".config"));
+        })
+    };
+    let shell_setup = run_shell();
+    let native_setup = run_native();
+    assert_profile_pair(
+        &shell_setup,
+        &native_setup,
+        &shell,
+        &native,
+        "rollback setup",
+    );
+
+    let user = dot::profiles::current_user().expect("current user");
+    for fixture in [&shell, &native] {
+        std::fs::create_dir_all(
+            fixture
+                .client
+                .base_seed
+                .join(".config/dot/profile-selectors.d"),
+        )
+        .expect("base selector directory");
+        seed_advance(
+            &fixture.client.base_seed,
+            ".config/dot/profile-selectors.d/conflict.conf",
+            format!("version=1\nuser={user}\nprofile=dev\n").as_bytes(),
+        );
+    }
+    let shell_conflict = run_shell();
+    let native_conflict = run_native();
+
+    assert_profile_pair(
+        &shell_conflict,
+        &native_conflict,
+        &shell,
+        &native,
+        "rollback conflict",
+    );
+    assert_profile_tree_twin(
+        &shell,
+        &native,
+        ".config/profile/value",
+        "rollback conflict",
     );
 }
 

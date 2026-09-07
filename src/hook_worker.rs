@@ -1,5 +1,8 @@
 //! Runtime-owned launcher for the versioned extension worker.
 
+use std::ffi::OsStr;
+use std::fs::OpenOptions;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -30,6 +33,7 @@ const STARTUP_CONTROLS: [&str; 8] = [
 /// tied to the invocation Runtime rather than the parent process.
 pub(crate) struct Worker {
     runtime: Runtime,
+    extensions_dir: Option<PathBuf>,
 }
 
 impl Worker {
@@ -37,36 +41,129 @@ impl Worker {
     pub(crate) fn new(runtime: &Runtime) -> Self {
         Self {
             runtime: runtime.clone(),
+            extensions_dir: None,
         }
+    }
+
+    /// Bind the refreshed configuration's extension root for a pre-sync
+    /// worker. Runtime remains the source for every other child input.
+    pub(crate) fn with_extensions(runtime: &Runtime, extensions_dir: &str) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            extensions_dir: (!extensions_dir.is_empty()).then(|| PathBuf::from(extensions_dir)),
+        }
+    }
+
+    /// Run the native pre-sync coordinator's one-use call through the same
+    /// sanitized launcher used for lifecycle retirement.
+    pub(crate) fn pre_sync(&mut self, call: &crate::pre_sync::Call) -> WorkerOutcome {
+        self.launch(
+            "pre-sync",
+            &call.script,
+            &call.temporary,
+            &call.result,
+            &call.context,
+            &call.token,
+        )
+    }
+
+    fn launch(
+        &self,
+        mode: &str,
+        script: &Path,
+        result_dir: &Path,
+        result_file: &Path,
+        context: &Path,
+        token: &str,
+    ) -> WorkerOutcome {
+        let source_root = self.runtime.source_root();
+        let source_root_text = match source_root.to_str() {
+            Some(text) => text,
+            None => {
+                return WorkerOutcome {
+                    rc: 1,
+                    output: Vec::new(),
+                };
+            }
+        };
+        let result_text = match result_file.to_str() {
+            Some(text) => text,
+            None => {
+                return WorkerOutcome {
+                    rc: 1,
+                    output: Vec::new(),
+                };
+            }
+        };
+        if crate::extension_worker::main_precheck(5, mode, source_root_text, result_text).is_err()
+            || (mode == "deactivate"
+                && !crate::extension_worker::deactivate_set_valid("retiring", 1))
+        {
+            return WorkerOutcome {
+                rc: 1,
+                output: Vec::new(),
+            };
+        }
+        let Some(bash) = bash_path(&self.runtime) else {
+            return WorkerOutcome {
+                rc: 1,
+                output: Vec::new(),
+            };
+        };
+        let (Some(cache), Some(data)) = (
+            xdg_home(&self.runtime, "XDG_CACHE_HOME", ".cache"),
+            xdg_home(&self.runtime, "XDG_DATA_HOME", ".local/share"),
+        ) else {
+            return WorkerOutcome {
+                rc: 1,
+                output: Vec::new(),
+            };
+        };
+        let worker = source_root.join("lib/dot/extension-worker.sh");
+        let mut command = Command::new(bash);
+        command
+            .arg("--noprofile")
+            .arg("--norc")
+            .arg(worker)
+            .arg(mode)
+            .arg(script)
+            .arg(result_file)
+            .arg(context)
+            .arg(token)
+            .env_clear()
+            .envs(self.runtime.env())
+            .env("HOME", self.runtime.home())
+            .env("DOT_SOURCE_ROOT", source_root)
+            .env("TMPDIR", result_dir)
+            .env("XDG_CONFIG_HOME", self.runtime.config_home())
+            .env("XDG_STATE_HOME", self.runtime.state_home())
+            .env("XDG_CACHE_HOME", cache)
+            .env("XDG_DATA_HOME", data)
+            .current_dir(self.runtime.cwd())
+            .stdin(Stdio::null());
+        if let Some(extensions_dir) = &self.extensions_dir {
+            command.env("DOT_EXTENSIONS_DIR", extensions_dir);
+        }
+        for key in STARTUP_CONTROLS {
+            command.env_remove(key);
+        }
+        command.env_remove("SHELLOPTS");
+        for key in self.runtime.env().keys() {
+            if exported_function(key) {
+                command.env_remove(key);
+            }
+        }
+        combined(&mut command, result_dir)
     }
 }
 
-/// Resolve a usable Bash executable exclusively from the Runtime snapshot.
-/// Shell launchers normally supply their own absolute `$BASH`; the binary has
-/// no such shell variable, so searching its snapshotted PATH is the matching
-/// explicit authority. Relative PATH entries resolve under the captured cwd,
-/// never the parent process's current directory.
+/// Resolve the shell-authorized absolute Bash executable from the Runtime.
+/// The launcher rejects PATH lookup, a relative `$BASH`, and a non-executable
+/// target before it ever starts the worker; the native boundary has the same
+/// authority rule rather than silently selecting a different interpreter.
 fn bash_path(runtime: &Runtime) -> Option<PathBuf> {
-    if let Some(value) = runtime.value("BASH") {
-        let path = PathBuf::from(value);
-        if executable(&path) {
-            return Some(path);
-        }
-    }
-    let path = runtime.value("PATH")?.to_str()?;
-    for entry in path.split(':').filter(|entry| !entry.is_empty()) {
-        let entry = Path::new(entry);
-        let entry = if entry.is_absolute() {
-            entry.to_path_buf()
-        } else {
-            runtime.cwd().join(entry)
-        };
-        let candidate = entry.join("bash");
-        if executable(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    let path = PathBuf::from(runtime.value("BASH")?);
+    (path.is_absolute() && executable(&path)).then_some(path)
 }
 
 /// A regular executable file, matching the launcher’s absolute executable
@@ -98,17 +195,52 @@ fn xdg_home(runtime: &Runtime, key: &str, fallback: &str) -> Option<PathBuf> {
     }
 }
 
-/// Append stderr after stdout, the portable approximation of the shell
-/// launcher’s `2>&1` capture. The worker's protocol emits its own structured
-/// result in `result_file`; lifecycle text itself is line-oriented and tests
-/// cover both channels.
-fn combined(output: std::process::Output) -> WorkerOutcome {
-    let mut bytes = output.stdout;
-    bytes.extend_from_slice(&output.stderr);
+/// Bash's `2>&1` gives both streams one open file description, so writes keep
+/// their observable order. A private scratch file gives `Command` the same
+/// property without racing independent stdout/stderr readers.
+fn combined(command: &mut Command, result_dir: &Path) -> WorkerOutcome {
+    let path = result_dir.join("worker-output");
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(_) => {
+            return WorkerOutcome {
+                rc: 1,
+                output: Vec::new(),
+            };
+        }
+    };
+    let stdout = match file.try_clone() {
+        Ok(file) => file,
+        Err(_) => {
+            return WorkerOutcome {
+                rc: 1,
+                output: Vec::new(),
+            };
+        }
+    };
+    command
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(file));
+    let status = command.status();
+    let output = std::fs::read(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(path);
     WorkerOutcome {
-        rc: output.status.code().unwrap_or(1),
-        output: bytes,
+        rc: status.ok().and_then(|status| status.code()).unwrap_or(1),
+        output,
     }
+}
+
+/// True for Bash's serialized exported-function environment keys. They are
+/// evaluated while Bash initializes, before the versioned worker can establish
+/// its own protocol, so the launch boundary must remove every such record.
+fn exported_function(key: &OsStr) -> bool {
+    let bytes = key.as_bytes();
+    bytes.starts_with(b"BASH_FUNC_") && bytes.ends_with(b"%%")
 }
 
 impl WorkerRun for Worker {
@@ -120,84 +252,14 @@ impl WorkerRun for Worker {
         context: &Path,
         token: &str,
     ) -> WorkerOutcome {
-        let source_root = self.runtime.source_root();
-        let source_root_text = match source_root.to_str() {
-            Some(text) => text,
-            None => {
-                return WorkerOutcome {
-                    rc: 1,
-                    output: Vec::new(),
-                };
-            }
-        };
-        let result_text = match result_file.to_str() {
-            Some(text) => text,
-            None => {
-                return WorkerOutcome {
-                    rc: 1,
-                    output: Vec::new(),
-                };
-            }
-        };
-        if crate::extension_worker::main_precheck(5, "deactivate", source_root_text, result_text)
-            .is_err()
-            || !crate::extension_worker::deactivate_set_valid("retiring", 1)
-        {
-            return WorkerOutcome {
-                rc: 1,
-                output: Vec::new(),
-            };
-        }
-        let Some(bash) = bash_path(&self.runtime) else {
-            return WorkerOutcome {
-                rc: 1,
-                output: Vec::new(),
-            };
-        };
-        let (Some(cache), Some(data)) = (
-            xdg_home(&self.runtime, "XDG_CACHE_HOME", ".cache"),
-            xdg_home(&self.runtime, "XDG_DATA_HOME", ".local/share"),
-        ) else {
-            return WorkerOutcome {
-                rc: 1,
-                output: Vec::new(),
-            };
-        };
-        let worker = source_root.join("lib/dot/extension-worker.sh");
-        let mut command = Command::new(bash);
-        command
-            .arg("--noprofile")
-            .arg("--norc")
-            .arg(worker)
-            .arg("deactivate")
-            .arg(script)
-            .arg(result_file)
-            .arg(context)
-            .arg(token)
-            .env_clear()
-            .envs(self.runtime.env())
-            .env("HOME", self.runtime.home())
-            .env("DOT_SOURCE_ROOT", source_root)
-            .env("TMPDIR", result_dir)
-            .env("XDG_CONFIG_HOME", self.runtime.config_home())
-            .env("XDG_STATE_HOME", self.runtime.state_home())
-            .env("XDG_CACHE_HOME", cache)
-            .env("XDG_DATA_HOME", data)
-            .current_dir(self.runtime.cwd())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for key in STARTUP_CONTROLS {
-            command.env_remove(key);
-        }
-        command.env_remove("SHELLOPTS");
-        match command.output() {
-            Ok(output) => combined(output),
-            Err(_) => WorkerOutcome {
-                rc: 1,
-                output: Vec::new(),
-            },
-        }
+        self.launch(
+            "deactivate",
+            script,
+            result_dir,
+            result_file,
+            context,
+            token,
+        )
     }
 }
 
@@ -271,6 +333,10 @@ mod tests {
                 state.as_os_str().to_owned(),
             ),
             (OsString::from("PATH"), path),
+            (
+                OsString::from("BASH"),
+                crate::test_support::bash().as_os_str().to_owned(),
+            ),
             (OsString::from("BASH_ENV"), bash_env.as_os_str().to_owned()),
             (
                 OsString::from("DOT_SOURCE_ROOT"),
@@ -355,5 +421,83 @@ mod tests {
         assert_eq!(rc, 7);
         assert!(out.is_empty());
         assert_eq!(warnings, b"deactivation-failed\n");
+    }
+
+    #[test]
+    fn worker_scrubs_exported_function_and_command_shadow_records() {
+        let scope = TempDir::new("hook-worker-functions").expect("fixture directory");
+        let home = scope.path().join("home");
+        let state = scope.path().join("state");
+        std::fs::create_dir(&home).expect("home directory");
+        std::fs::create_dir(&state).expect("state directory");
+        let poison = scope.path().join("bash-env");
+        std::fs::write(&poison, b":\n").expect("BASH_ENV");
+        let record = checkout(&home, b"deactivate() { helper; printf 'safe\\n'; }\n");
+        let mut env = runtime(&home, &state, &poison).env().clone();
+        env.insert(
+            OsString::from("BASH_FUNC_helper%%"),
+            OsString::from(format!(
+                "() {{ touch {}/function-imported; }}",
+                home.display()
+            )),
+        );
+        env.insert(
+            OsString::from("BASH_FUNC_printf%%"),
+            OsString::from(format!(
+                "() {{ touch {}/command-shadowed; }}",
+                home.display()
+            )),
+        );
+        let runtime = Runtime::from_env(&env, &home).expect("runtime");
+
+        let (rc, out, warnings) = run(&runtime, &home, &record);
+
+        assert_eq!(rc, 127, "missing helper must not be imported");
+        assert!(out.is_empty());
+        assert!(
+            warnings
+                .windows(b"helper: command not found".len())
+                .any(|row| { row == b"helper: command not found" })
+        );
+        assert!(!home.join("function-imported").exists());
+        assert!(!home.join("command-shadowed").exists());
+    }
+
+    #[test]
+    fn worker_keeps_stdout_and_stderr_interleaved() {
+        let scope = TempDir::new("hook-worker-interleave").expect("fixture directory");
+        let home = scope.path().join("home");
+        let state = scope.path().join("state");
+        std::fs::create_dir(&home).expect("home directory");
+        std::fs::create_dir(&state).expect("state directory");
+        let poison = scope.path().join("bash-env");
+        std::fs::write(&poison, b":\n").expect("BASH_ENV");
+        let record = checkout(
+            &home,
+            b"deactivate() { printf one; printf two >&2; printf three; printf four >&2; }\n",
+        );
+        let runtime = runtime(&home, &state, &poison);
+
+        let (rc, out, warnings) = run(&runtime, &home, &record);
+
+        assert_eq!(rc, 0);
+        assert!(warnings.is_empty());
+        assert_eq!(out, b"onetwothreefour\n");
+    }
+
+    #[test]
+    fn worker_requires_the_shell_authorized_absolute_bash() {
+        let scope = TempDir::new("hook-worker-bash").expect("fixture directory");
+        let home = scope.path().join("home");
+        let state = scope.path().join("state");
+        std::fs::create_dir(&home).expect("home directory");
+        std::fs::create_dir(&state).expect("state directory");
+        let poison = scope.path().join("bash-env");
+        std::fs::write(&poison, b":\n").expect("BASH_ENV");
+        let mut env = runtime(&home, &state, &poison).env().clone();
+        env.insert(OsString::from("BASH"), OsString::from("bash"));
+        let runtime = Runtime::from_env(&env, &home).expect("runtime");
+
+        assert!(super::bash_path(&runtime).is_none());
     }
 }

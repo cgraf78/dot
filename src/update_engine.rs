@@ -26,7 +26,7 @@
 //! the invocation; the caller runs the shell adapter for every
 //! declined case.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
@@ -132,8 +132,6 @@ pub struct EngineInputs<'a> {
 pub enum Fallback {
     /// Present `merge-hooks.d`: the merge runner is shell-only.
     MergeHooks,
-    /// Present `pre-sync.d`: the reconcile runner is shell-only.
-    PreSyncHooks,
     /// `DOT_DEPENDENCY_PROVIDER` is not `none`: ensure plus the
     /// updater UI are shell-only (anything but `none` also covers
     /// the shell's `shdeps unavailable` close).
@@ -154,9 +152,6 @@ pub fn should_go_native(inputs: &EngineInputs<'_>) -> Result<(), Fallback> {
     }
     if has_hook_dir(inputs.extensions_dir, "merge-hooks.d") {
         return Err(Fallback::MergeHooks);
-    }
-    if has_hook_dir(inputs.extensions_dir, "pre-sync.d") {
-        return Err(Fallback::PreSyncHooks);
     }
     if has_hook_dir(inputs.home, ".config/dot/merges") {
         return Err(Fallback::MergesPresent);
@@ -316,12 +311,11 @@ struct UpdateState {
     prior: Vec<String>,
     /// Prepared ledger records retained through retirement and commit.
     retained: Vec<String>,
-    /// Final descriptor lifecycle rows for diagnostics and future hook phases.
-    lifecycle: Vec<String>,
     /// Active records from the base-only discovery pass.
     phase_one: Vec<String>,
-    /// Eligible records from the base-only pass, used to isolate additions.
-    phase_one_eligible: Vec<String>,
+    /// Overlay identities from the base-only pass, used to isolate additions.
+    /// Descriptor changes do not make an already-pulled overlay an addition.
+    phase_one_names: BTreeSet<String>,
 }
 
 /// Mutable update streams shared by the sync, converge, and finalize phases.
@@ -342,9 +336,8 @@ impl UpdateState {
             active: Vec::new(),
             prior: Vec::new(),
             retained: Vec::new(),
-            lifecycle: Vec::new(),
             phase_one: Vec::new(),
-            phase_one_eligible: Vec::new(),
+            phase_one_names: BTreeSet::new(),
         }
     }
 
@@ -355,7 +348,6 @@ impl UpdateState {
         self.selected = overlays.selected.clone();
         self.eligible = overlays.eligible.clone();
         self.active = overlays.active.clone();
-        self.lifecycle = overlays.lifecycle.clone();
     }
 
     fn ledger(&self, inputs: &EngineInputs<'_>) -> std::path::PathBuf {
@@ -876,7 +868,16 @@ fn converge_overlays(
         update.active = entries;
         return fail(update, overlay);
     }
-    if pre_sync_empty(inputs, update.config.extensions_dir.as_deref(), &entries).is_err() {
+    if pre_sync(
+        inputs,
+        update.config.extensions_dir.as_deref(),
+        &entries,
+        "reconcile",
+        now_secs,
+        io.err,
+    )
+    .is_err()
+    {
         update.active = entries;
         return fail(update, overlay);
     }
@@ -959,7 +960,11 @@ fn converge_profiles(
     if discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err).is_err() {
         return fail(update, overlay);
     }
-    update.phase_one_eligible = state.eligible.clone();
+    update.phase_one_names = state
+        .eligible
+        .iter()
+        .filter_map(|record| record_name(record).map(str::to_owned))
+        .collect();
     update.phase_one = state.active.clone();
     update.capture(&state);
     let mut entries = use_set(&mut state, "eligible");
@@ -973,7 +978,16 @@ fn converge_profiles(
         update.active = entries;
         return fail(update, overlay);
     }
-    if pre_sync_empty(inputs, update.config.extensions_dir.as_deref(), &entries).is_err() {
+    if pre_sync(
+        inputs,
+        update.config.extensions_dir.as_deref(),
+        &entries,
+        "prepare",
+        now_secs,
+        io.err,
+    )
+    .is_err()
+    {
         update.active = entries;
         return fail(update, overlay);
     }
@@ -1072,17 +1086,23 @@ fn converge_profiles(
         update.active = entries;
         return fail(update, overlay);
     }
-    if pre_sync_empty(inputs, update.config.extensions_dir.as_deref(), &entries).is_err() {
+    if pre_sync(
+        inputs,
+        update.config.extensions_dir.as_deref(),
+        &entries,
+        "reconcile",
+        now_secs,
+        io.err,
+    )
+    .is_err()
+    {
         update.active = entries;
         return fail(update, overlay);
     }
     let additions: Vec<String> = entries
         .iter()
         .filter(|record| {
-            !update
-                .phase_one_eligible
-                .iter()
-                .any(|prior| prior == *record)
+            !record_name(record).is_some_and(|name| update.phase_one_names.contains(name))
         })
         .cloned()
         .collect();
@@ -1213,25 +1233,71 @@ fn discover_selected(
     }
 }
 
-/// Pre-sync reconcile gate: empty specs run nothing (the envelope
-/// guarantees no `pre-sync.d`; a listing failure still fails).
-fn pre_sync_empty(
+/// Run pre-sync hooks through the same worker boundary as lifecycle hooks.
+/// The listing and context protocol remain owned by `pre_sync`; this engine
+/// layer supplies only the Runtime-bound process runner and warning stream.
+fn pre_sync(
     inputs: &EngineInputs<'_>,
     configured_root: Option<&str>,
     eligible: &[String],
+    stage: &str,
+    now_secs: i64,
+    err: &mut Vec<u8>,
 ) -> Result<(), ()> {
+    let extensions_dir = configured_root.unwrap_or(inputs.extensions_dir);
     let trust = crate::extension_trust::Inputs {
         euid: inputs.euid,
         home: inputs.home.to_string(),
-        extensions_dir: configured_root.unwrap_or(inputs.extensions_dir).to_string(),
+        extensions_dir: extensions_dir.to_string(),
         manifest: inputs.manifest.to_string(),
         retiring_root: String::new(),
     };
-    match crate::pre_sync::specs(&trust, eligible) {
-        Ok(found) if found.is_empty() => Ok(()),
-        Ok(_) => Err(()),
-        Err(_) => Err(()),
+    let records: Vec<Vec<u8>> = eligible
+        .iter()
+        .map(|record| record.as_bytes().to_vec())
+        .collect();
+    let mut worker = crate::hook_worker::Worker::with_extensions(inputs.runtime, extensions_dir);
+    let mut worker_output = Vec::new();
+    let mut runner = |call: &crate::pre_sync::Call| {
+        let outcome = worker.pre_sync(call);
+        worker_output.extend_from_slice(&outcome.output);
+        outcome.rc == 0
+    };
+    match crate::pre_sync::run(
+        stage,
+        &records,
+        &trust,
+        eligible,
+        now_secs,
+        inputs.tmp,
+        &mut runner,
+    ) {
+        Ok(outcome) if outcome.status == 0 => Ok(()),
+        Ok(outcome) => {
+            err.extend_from_slice(&worker_output);
+            for warning in outcome.warnings {
+                inputs.log.warn(err, &warning);
+            }
+            Err(())
+        }
+        Err(crate::pre_sync::Error::Invalid(message)) => {
+            err.extend_from_slice(message.as_bytes());
+            err.push(b'\n');
+            Err(())
+        }
+        Err(crate::pre_sync::Error::Usage | crate::pre_sync::Error::Refused) => Err(()),
     }
+}
+
+/// Overlay records are stable by name across a descriptor refresh. The shell
+/// records `entry%%|*` in an associative set before choosing additions; using
+/// the same identity prevents a changed URL or descriptor path from fetching
+/// an already-processed overlay twice.
+fn record_name(record: &str) -> Option<&str> {
+    record
+        .split_once('|')
+        .map(|(name, _)| name)
+        .filter(|name| !name.is_empty())
 }
 
 /// `_dot_update_skip_inputs`: the Tools/Configs warning close for
@@ -1943,6 +2009,25 @@ fn quarantine_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn additions_identity_ignores_same_name_descriptor_mutation() {
+        let phase_one = BTreeSet::from([String::from("alpha")]);
+        let refreshed = [
+            String::from("alpha|/new/path|file:///new|/new/descriptor|false|git"),
+            String::from("beta|/beta|file:///beta|/beta/descriptor|false|git"),
+        ];
+        let additions: Vec<&str> = refreshed
+            .iter()
+            .filter(|record| !record_name(record).is_some_and(|name| phase_one.contains(name)))
+            .map(String::as_str)
+            .collect();
+
+        assert_eq!(
+            additions,
+            ["beta|/beta|file:///beta|/beta/descriptor|false|git"]
+        );
+    }
 
     #[test]
     fn stale_frozen_marker_does_not_decline_native_capture() {
