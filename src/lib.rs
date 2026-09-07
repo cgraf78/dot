@@ -36,6 +36,7 @@ pub mod repos_pull;
 pub mod repos_pull_backup;
 pub mod repos_pull_clone;
 pub mod repos_pull_normalize;
+pub mod repos_pull_overlay;
 pub mod repos_pull_queries;
 pub mod repos_pull_support;
 pub mod reserved;
