@@ -1820,53 +1820,13 @@ fn locale_name(env: &BTreeMap<OsString, OsString>) -> String {
 /// place in globals before dispatch. A completed init record is authoritative;
 /// the legacy separate checkout remains the record-free compatibility shape.
 fn base_client(
+    runtime: &crate::app::Runtime,
     home: &str,
     state_home: &str,
-    env: &BTreeMap<OsString, OsString>,
 ) -> Result<Base, GatherError> {
-    let published = env_value(env, "DOT_BASE_TOPOLOGY");
-    if published.is_some() {
-        return Ok(crate::cli::base_from_values(
-            home,
-            published.as_deref(),
-            env_value(env, "DOT_CLIENT_GIT_DIR").as_deref(),
-        ));
-    }
-    let completed = Path::new(state_home).join("dot/init/completed");
-    if std::fs::symlink_metadata(&completed).is_ok() {
-        let record =
-            crate::init_client_record::read_record(&completed, Path::new(home)).map_err(|_| {
-                GatherError::Diagnostic(b"dot: malformed initialization identity record\n")
-            })?;
-        if record.phase != "complete" {
-            return Err(GatherError::Diagnostic(
-                b"dot: malformed initialization identity record\n",
-            ));
-        }
-        let topology = if record.git_dir == format!("{home}/.dotfiles") {
-            Some("separate")
-        } else if record.git_dir == format!("{home}/.git") {
-            Some("ordinary")
-        } else {
-            None
-        };
-        if topology.is_some() {
-            return Ok(crate::cli::base_from_values(
-                home,
-                topology,
-                Some(&record.git_dir),
-            ));
-        }
-        return Err(GatherError::Diagnostic(
-            b"dot: initialization identity names an unsupported Git directory\n",
-        ));
-    }
-    let legacy = Path::new(home).join(".dotfiles");
-    Ok(crate::cli::base_from_values(
-        home,
-        legacy.is_dir().then_some("separate"),
-        legacy.to_str(),
-    ))
+    let mut diagnostic = Vec::new();
+    crate::repos_base::select(runtime, home, state_home, &mut diagnostic)
+        .map_err(|()| GatherError::Diagnostic(diagnostic))
 }
 
 /// A complete request for one native update invocation.
@@ -1881,15 +1841,15 @@ pub struct UpdateRequest<'a> {
     pub state_home: &'a Path,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum GatherError {
     Xdg(crate::xdg::Error),
-    Diagnostic(&'static [u8]),
+    Diagnostic(Vec<u8>),
     Unavailable,
 }
 
 impl GatherError {
-    fn code(self) -> i32 {
+    fn code(&self) -> i32 {
         match self {
             Self::Xdg(error) => error.code(),
             Self::Diagnostic(_) => 1,
@@ -1897,7 +1857,7 @@ impl GatherError {
         }
     }
 
-    fn write(self, stderr: &mut dyn std::io::Write) {
+    fn write(&self, stderr: &mut dyn std::io::Write) {
         if let Self::Diagnostic(line) = self {
             let _ = stderr.write_all(line);
         }
@@ -2010,7 +1970,7 @@ fn gather(
         tool,
         log,
         palette,
-        base: Some(base_client(&home, state_home, env)?),
+        base: Some(base_client(runtime, &home, state_home)?),
         bar_width: env_value(env, "DOT_UI_PROGRESS_WIDTH").unwrap_or_else(|| "8".to_string()),
         dot_verbose,
         dot_quiet,
@@ -2331,7 +2291,7 @@ mod tests {
 
     #[test]
     fn malformed_completed_identity_fails_instead_of_becoming_legacy() {
-        let scratch = crate::test_support::TempDir::new("update-base-malformed")
+        let scratch = dot_test_support::TempDir::new("update-base-malformed")
             .expect("create temporary directory");
         let home = scratch.path().join("home");
         let state = scratch.path().join("state");
@@ -2339,10 +2299,18 @@ mod tests {
         std::fs::create_dir_all(state.join("dot/init")).expect("init state");
         std::fs::write(state.join("dot/init/completed"), b"not-a-record\n")
             .expect("malformed completed record");
+        let env = BTreeMap::from([
+            (OsString::from("HOME"), home.as_os_str().to_owned()),
+            (
+                OsString::from("XDG_STATE_HOME"),
+                state.as_os_str().to_owned(),
+            ),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, scratch.path()).expect("runtime");
         let error = base_client(
+            &runtime,
             home.to_str().expect("UTF-8 home"),
             state.to_str().expect("UTF-8 state"),
-            &BTreeMap::new(),
         )
         .expect_err("completed identity stays authoritative");
         assert!(matches!(error, GatherError::Diagnostic(_)));
@@ -2350,7 +2318,7 @@ mod tests {
 
     #[test]
     fn stderr_is_delivered_even_when_stdout_delivery_fails() {
-        let scratch = crate::test_support::TempDir::new("update-stream-failure")
+        let scratch = dot_test_support::TempDir::new("update-stream-failure")
             .expect("create temporary directory");
         let home = scratch.path().join("home");
         let state = scratch.path().join("state");

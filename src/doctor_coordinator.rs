@@ -1,15 +1,11 @@
-//! Doctor coordinator helpers (slice 56: doctor layer, part 4).
+//! Doctor coordinator helpers.
 //!
-//! Ports the pure decision points of the `_dot_doctor` pipeline from
-//! `lib/dot/doctor.sh` plus the one unclaimed validator from
-//! `lib/dot/doctor-api.sh`. Taken lanes own the neighboring pieces
-//! and are deliberately not duplicated here: part 1 (`doctor_runtime`)
+//! Owns extension discovery, result dispatch, and run summaries. Neighboring
+//! modules remain authoritative for their focused responsibilities:
+//! `doctor_runtime`
 //! owns the `_dr_*` result rendering and counters, part 2
 //! (`doctor_paths`) owns the path abbreviators, and part 3
-//! (`doctor_records`) owns the extension-side record sink. This module
-//! owns what sits between them: how the coordinator discovers
-//! extension specs, how it dispatches result rows back to renderers,
-//! and how it summarizes the run.
+//! (`doctor_records`) owns the extension-side record sink.
 //!
 //! Parity decisions:
 //! - The discovery loop in `_dot_doctor_extension_specs` ends in
@@ -21,7 +17,7 @@
 //!   listing, never as an `Err` — instead of "fixing" the swallowed
 //!   status the shell suite pins.
 //! - Per-file trust validation (`_dot_extension_file_validate`) belongs to the
-//!   extension-trust lane. [`collect_specs_with`] accepts that predicate so
+//!   extension-trust module. [`collect_specs_with`] accepts that predicate so
 //!   trust and identity failures retain the shell loop's first-failure order;
 //!   [`collect_specs`] supplies the trusted test seam used by focused rows.
 //! - Names travel as `&[u8]` throughout (byte sort is `LC_ALL=C`

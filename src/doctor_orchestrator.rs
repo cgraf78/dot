@@ -1,17 +1,17 @@
-//! Doctor orchestration (`lib/dot/doctor.sh`): the load boundary,
+//! Doctor orchestration: the load boundary,
 //! the runtime and engine-source checks, one extension run, and the
 //! `_dot_doctor` coordinator.
 //!
-//! Ports exactly five functions and nothing else: `_dot_doctor_load`
+//! Owns `_dot_doctor_load`
 //! (~line 17), `_dr_check_runtime` (~line 36),
 //! `_dr_check_engine_source` (~line 62),
 //! `_dot_doctor_run_extension` (~line 135), and `_dot_doctor`
-//! (~line 179). The neighboring pieces stay with their own lanes:
+//! (~line 179). Neighboring pieces stay with their focused modules:
 //! `_dot_doctor_extension_specs` and `_dot_doctor_render_records`
 //! (discovery and result dispatch), the `_dr_*` color/tty rendering
-//! (`doctor_runtime` lane), `_dr_tilde` (`doctor_paths` lane), the
+//! (`doctor_runtime`), `_dr_tilde` (`doctor_paths`), the
 //! kernel checks (`repos`, `lock`, `provider`, `overlays`, `merges`
-//! lanes), and the worker spawn (`extension-worker` lane).
+//! modules), and the worker spawn (`extension_worker`).
 //!
 //! Parity decisions:
 //! - Results flow as re-exported canonical [`Record`] rows (kind, message, detail) with
@@ -32,11 +32,11 @@
 //! - Worker execution and result-file dispatch arrive as injected
 //!   seams (the `worker` hook taking [`WorkerInvocation`] and the
 //!   `render` hook): the worker spawn and the record-file parser
-//!   belong to other lanes, but
+//!   belong to other modules, but
 //!   the temp lifecycle, context step, tail records, and cleanup
 //!   sequencing here are real.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 
 use std::path::{Path, PathBuf};
@@ -264,9 +264,14 @@ pub struct RuntimeSnapshot {
     pub bash_version: Vec<u8>,
     /// `${BASH_VERSINFO[0]}` for the Bash 4 gate.
     pub bash_major: u64,
+    /// Whether configured user hooks make Bash part of this invocation's
+    /// runtime. The native engine itself has no Bash dependency.
+    pub bash_required: bool,
     /// Canonicalized `rev-parse --show-toplevel`, `None` when the
     /// shell would leave `checkout_root` empty.
     pub checkout_root: Option<Vec<u8>>,
+    /// Whether the selected source is a packaged native release root.
+    pub release_root: bool,
     /// `$DOT_SOURCE_ROOT` verbatim (the fail detail uses this raw).
     pub source_raw: Vec<u8>,
     /// Canonicalized `$DOT_SOURCE_ROOT` (possibly empty on failure,
@@ -291,7 +296,9 @@ pub fn check_runtime(
     home: &[u8],
 ) {
     rec.section(b"dot runtime");
-    if snapshot.bash_major >= 4 {
+    if !snapshot.bash_required {
+        rec.skip(b"Bash runtime is not required", None);
+    } else if snapshot.bash_major >= 4 {
         rec.ok(b"Bash runtime", Some(&snapshot.bash_version));
     } else {
         rec.fail(
@@ -303,7 +310,10 @@ pub fn check_runtime(
         Some(root) => !root.is_empty() && *root == snapshot.source_root,
         None => false,
     };
-    if checkout_ok {
+    if snapshot.release_root {
+        let display = tilde(&snapshot.source_raw, home);
+        rec.ok(b"dot release exists", Some(&display));
+    } else if checkout_ok {
         let display = tilde(&snapshot.source_raw, home);
         rec.ok(b"dot checkout exists", Some(&display));
     } else {

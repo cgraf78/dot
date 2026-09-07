@@ -1,9 +1,9 @@
-//! Test-only helpers: isolated temp directories for differential harnesses.
+//! Test-only helpers shared by Dot's integration-test binaries.
 //!
 //! Public so integration tests under `tests/` share one isolation
 //! convention; never used by the shipped engine. Mirrors the `shdeps`
-//! `test_support` pattern with std only (no `tempfile` dev-dependency
-//! in slice 1): pid plus a process-wide atomic counter keeps parallel
+//! `test_support` pattern with std only (no `tempfile` dev-dependency):
+//! pid plus a process-wide atomic counter keeps parallel
 //! tests collision-free without wall-clock reads (immune to NTP steps
 //! and coarse clocks), paths are canonicalized, and the guard removes
 //! the directory on drop.
@@ -77,9 +77,7 @@ fn bash_major(candidate: &std::path::Path) -> u64 {
 
 /// Owned isolated temp directory, removed on drop.
 ///
-/// Scaffolding for slice 2 (first consumer: config-parser tests); kept
-/// rather than re-added so the naming/isolation convention is settled
-/// before the slices that depend on it.
+/// Shared fixture directory with deterministic naming and isolation.
 #[derive(Debug)]
 pub struct TempDir {
     path: PathBuf,

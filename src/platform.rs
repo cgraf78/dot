@@ -1,6 +1,6 @@
-//! Platform, host, and executable predicates (slice 2 foundations).
+//! Platform, host, and executable predicates.
 //!
-//! Ports `lib/dot/platform.sh` exactly: WSL detection (env vars or a
+//! Owns WSL detection (env vars or a
 //! case-insensitive `microsoft` in the kernel osrelease), `uname -s`
 //! platform names (`darwin` canonicalized to `macos`), short-hostname
 //! detection, comma-spec matching with `!` exclusions, Termux's dual

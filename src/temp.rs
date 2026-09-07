@@ -9,10 +9,9 @@
 //! shell uses (Git is already a required engine dependency), moves go
 //! through the same `mv` binary with the same `-nT`/`-nh` capability
 //! probe (GNU and BSD `mv` differ on late directories, and the probe
-//! matrix is exactly what the shell suite pins), and `umask` is read
-//! from the engine process the way the shell reads its own —
-//! `std` offers no `umask(2)` binding, and the shell pays a fork per
-//! read too. Callers thread [`LockCtx`] (the `DOT_TEST` /
+//! matrix is exactly what the shell suite pins), and the process umask
+//! is read through the Unix ABI under a process-wide lock. Callers thread
+//! [`LockCtx`] (the `DOT_TEST` /
 //! `DOT_UPDATE_LOCK_TOKEN` gate), `source_root` (the
 //! `DOT_SOURCE_ROOT` binding, see [`source_root`]), the umask, and a
 //! [`MoveCache`] explicitly so differential tests can pin every knob
@@ -25,6 +24,7 @@
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::errors::{Error, Result};
 
@@ -36,6 +36,11 @@ const TMP_SUFFIX_LEN: usize = 6;
 /// Crate-visible so the init transaction stage allocator shares the
 /// exact retry budget instead of inventing a second one.
 pub(crate) const TMP_RETRIES: usize = 100;
+
+/// `umask(2)` changes process-global state even when it is used only to read
+/// the current mask. Serialize the set-and-restore pair, and use the most
+/// restrictive temporary mask so an unrelated creation can only fail closed.
+static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
 /// True when `path` carries a byte the transaction layer rejects
 /// outright: newline, carriage return, or tab. The shell tests
@@ -183,15 +188,10 @@ pub fn path_nlink(path: &Path) -> Result<u64> {
     Ok(meta.nlink())
 }
 
-/// Current effective uid, forked from `id -u` exactly like the shell
-/// (see `platform::require_sudo`): no libc binding for parity.
+/// Current effective uid from the Unix process credentials.
 pub fn current_uid() -> Option<u32> {
-    std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+    // SAFETY: `geteuid` has no preconditions and does not dereference memory.
+    Some(unsafe { libc::geteuid() })
 }
 
 /// `_dot_private_dir_validate`: a real directory (never a symlink)
@@ -245,33 +245,17 @@ pub fn private_control_file_validate(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read the engine process umask by asking `sh` (whose builtin reports
-/// the inherited mask): `std` has no `umask(2)` binding, and the shell
-/// pays the same fork with `mask=$(umask)`.
+/// Read the engine process umask without spawning a shell.
 pub fn read_umask() -> Result<u32> {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("umask")
-        .output()
-        .map_err(|source| Error::Io {
-            context: "read umask",
-            source,
-        })?;
-    if !output.status.success() {
-        return Err(Error::Usage {
-            message: "umask query failed",
-        });
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let digits = text.trim();
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(Error::Usage {
-            message: "umask query returned non-octal output",
-        });
-    }
-    u32::from_str_radix(digits, 8).map_err(|_| Error::Usage {
-        message: "umask query returned non-octal output",
-    })
+    let _guard = UMASK_LOCK.lock().map_err(|_| Error::Usage {
+        message: "umask lock poisoned",
+    })?;
+    // SAFETY: `umask` accepts every mode value. The first call returns the
+    // previous mask; the second restores it while the process-wide lock is
+    // still held.
+    let mask = unsafe { libc::umask(0o777) };
+    unsafe { libc::umask(mask) };
+    Ok(mask as u32 & 0o777)
 }
 
 /// `_dot_apply_tracked_file_mode`: force a git-tracked mode (`100644`
@@ -381,7 +365,7 @@ pub fn sanitized_git<S: AsRef<std::ffi::OsStr>>(
     source_root: &Path,
     args: &[S],
 ) -> std::process::Command {
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = crate::init_client_identity::host_git_command();
     sanitize_git_env(&mut cmd);
     bind_source_git(&mut cmd, source_root);
     cmd.args(args);

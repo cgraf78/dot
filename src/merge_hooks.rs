@@ -1,13 +1,13 @@
-//! Merge-hook shared mechanics (slice 6: merge layer start).
+//! Merge-hook shared mechanics.
 //!
-//! Ports `lib/dot/merge-hooks.sh` exactly: the merge-hooks source
+//! Owns the merge-hooks source
 //! root under XDG config, family discovery (via [`crate::families`]),
 //! marker-safe names, narrow home-placeholder expansion, and the
 //! sibling-temp write paths including the `jq` JSON layer. File
 //! effects reuse [`crate::temp`]; the `jq` probe and the XDG inputs
 //! stay explicit so tests inject fixtures deterministically.
 //!
-//! Shell warnings (`_warn`, yellow to stderr, always printed) arrive
+//! Warnings (yellow stderr, always printed) arrive
 //! as a caller-supplied `warn` callback carrying the same text, so
 //! engine callers decide where diagnostics go.
 

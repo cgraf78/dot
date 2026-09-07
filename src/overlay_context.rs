@@ -1,11 +1,11 @@
-//! One-use authorization contexts for isolated workers (slice 9).
+//! One-use authorization contexts for isolated workers.
 //!
-//! Ports `lib/dot/overlay-context.sh`: the shared field gate, path
+//! Owns the shared field gate, path
 //! and record validators, the mode/set/stage matrix, random tokens,
 //! and NUL-framed context file creation and single-use consumption
 //! with open-descriptor TOCTOU checks.
 //!
-//! Like the earlier ports the library never prints: failures carry
+//! The library never prints: failures carry
 //! the message the shell emits after `dot: overlay context: `, and
 //! message-less shell `return 1` paths surface as
 //! [`Error::Refused`]. `stat`-based identity uses

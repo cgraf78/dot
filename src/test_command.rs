@@ -83,6 +83,14 @@ fn prepare<'a>(
     let config = crate::startup::check(runtime)
         .map_err(|failure| (failure.code(), failure.line().to_string()))?;
     let uid = crate::cleanup::euid();
+    let home = canonical(runtime.home());
+    let base = crate::repos_base::select(
+        runtime,
+        &home.to_string_lossy(),
+        &runtime.state_home().to_string_lossy(),
+        streams.stderr,
+    )
+    .map_err(|()| (1, String::new()))?;
     // Test differs from doctor: an inspect resolution failure gates all work.
     let mut overlays = crate::overlays::State::default();
     let mut profiles = crate::profiles::State::default();
@@ -104,14 +112,6 @@ fn prepare<'a>(
         }
         return Err((1, error.to_string()));
     }
-    let home = canonical(runtime.home());
-    let base = crate::repos_base::select(
-        runtime,
-        &home.to_string_lossy(),
-        &runtime.state_home().to_string_lossy(),
-        streams.stderr,
-    )
-    .map_err(|()| (1, String::new()))?;
     let source_home = source_home(runtime, &home, &base)?;
     let mut parallel = true;
     let mut verbose = runtime.value("GITHUB_ACTIONS").is_some();

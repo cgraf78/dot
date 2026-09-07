@@ -1,6 +1,6 @@
-//! Live-progress formatting leaves (slice 20).
+//! Live-progress formatting helpers.
 //!
-//! Ports the pure helpers from `lib/dot/progress-ui.sh` exactly:
+//! Owns
 //! status colors, ASCII detection, cell fitting, and the summary
 //! phrases the update stages report through. Text flows as bytes:
 //! bash counts string length in characters under a working UTF-8

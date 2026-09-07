@@ -1,10 +1,10 @@
-//! End-to-end parity for the native Shdeps provider coordinator.
+//! End-to-end native contracts for the Shdeps provider coordinator.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use dot::test_support::TempDir;
+use dot_test_support::TempDir;
 
 fn write_exec(path: &Path, body: &[u8]) {
     std::fs::write(path, body).expect("write executable fixture");
@@ -32,10 +32,6 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// Locate a real host command for the deliberately closed fixture PATH.
-///
-/// The dotfiles-aware Git launcher in `~/.local/bin` uses `dot` itself, which
-/// would recurse when the shell oracle runs under its synthetic environment.
-/// Prefer the next ordinary command on PATH instead.
 fn fixture_command(name: &str) -> Option<PathBuf> {
     let local_bin = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin"));
     for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
@@ -62,7 +58,6 @@ struct Fixture {
     home: PathBuf,
     state: PathBuf,
     provider: PathBuf,
-    poison: PathBuf,
 }
 
 impl Fixture {
@@ -76,14 +71,6 @@ impl Fixture {
         std::fs::create_dir_all(home.join(".config/dot")).expect("config");
         std::fs::create_dir_all(&state).expect("state");
         std::fs::create_dir_all(&provider).expect("provider");
-        let copied = Command::new("cp")
-            .arg("-a")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("lib"))
-            .arg(&root)
-            .status()
-            .expect("copy shell oracle");
-        assert!(copied.success(), "copy shell oracle");
-
         let installer = provider.join("install.sh");
         write_exec(
             &installer,
@@ -201,32 +188,19 @@ esac
         git(&root, &["init", "-q"]);
         git(&root, &["config", "user.name", "fixture"]);
         git(&root, &["config", "user.email", "fixture@example.invalid"]);
-        git(&root, &["add", "support/shdeps.lock", "lib"]);
+        git(&root, &["add", "support/shdeps.lock"]);
         git(&root, &["commit", "-qm", "fixture"]);
-
-        let poison = scratch.path().join("poison-bash");
-        write_exec(
-            &poison,
-            b"#!/bin/sh\nprintf 'legacy provider adapter executed\\n' >&2\nexit 97\n",
-        );
         Self {
             _scratch: scratch,
             root,
             home,
             state,
             provider,
-            poison,
         }
     }
 
-    fn command(&self, rust: bool) -> Command {
-        let mut command = if rust {
-            Command::new(env!("CARGO_BIN_EXE_dot"))
-        } else {
-            let mut shell = Command::new(dot::test_support::bash());
-            shell.arg(self.root.join("lib/dot/main.sh"));
-            shell
-        };
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dot"));
         let path = std::env::var_os("PATH").unwrap_or_default();
         command
             .arg("update")
@@ -239,6 +213,7 @@ esac
             .env("DOT_SOURCE_ROOT", &self.root)
             .env("DOT_DEPENDENCY_PROVIDER", "shdeps")
             .env("DOT_SHDEPS_UPDATE_POLICY", "pinned")
+            .env("DOT_UPDATE_JOBS", "2")
             .env("SHDEPS_LIB", self.provider.join("shdeps.sh"))
             .env("SHDEPS_DIR", &self.provider)
             .env("DOT_TEST_PROVIDER_DIR", &self.provider)
@@ -246,26 +221,31 @@ esac
                 "DOT_TEST_PROVIDER_RECORD",
                 self.home.join("provider-record"),
             )
-            .env("BASH", dot::test_support::bash())
+            .env("BASH", dot_test_support::bash())
             // Bash fills an absent SHELL with its own path. Pin it explicitly
             // so both engines produce the same final reload hint.
-            .env("SHELL", dot::test_support::bash())
+            .env("SHELL", dot_test_support::bash())
             .env("GIT_AUTHOR_NAME", "fixture")
             .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
             .env("GIT_COMMITTER_NAME", "fixture")
             .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "/bin/false")
+            .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+            .env("GIT_CONFIG_COUNT", "3")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", "/dev/null")
+            .env("GIT_CONFIG_KEY_1", "commit.gpgSign")
+            .env("GIT_CONFIG_VALUE_1", "false")
+            .env("GIT_CONFIG_KEY_2", "tag.gpgSign")
+            .env("GIT_CONFIG_VALUE_2", "false")
             .current_dir(&self.home)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if rust {
-            command.env("DOT_BASH", &self.poison);
-        }
         command
-    }
-
-    fn run(&self, rust: bool) -> Output {
-        self.command(rust).output().expect("run dot update")
     }
 
     fn curl_path(&self) -> std::ffi::OsString {
@@ -306,7 +286,7 @@ cp "$DOT_TEST_PROVIDER_DIR/install.sh" "$out"
         std::env::join_paths(paths).expect("fixture PATH")
     }
 
-    /// Rebuild the inherited command path without `jq`. The shell intentionally
+    /// Rebuild the inherited command path without `jq`. The provider intentionally
     /// falls back to its bootstrap JSON parser in this mode, so this must not
     /// depend on whether a host image happens to install jq.
     fn without_jq_path(&self) -> std::ffi::OsString {
@@ -315,7 +295,7 @@ cp "$DOT_TEST_PROVIDER_DIR/install.sh" "$out"
         // Bash is the fixture's only execution prerequisite. Every other
         // candidate is copied only when available: keeping PATH closed still
         // proves jq is absent, while an optional platform helper such as ps
-        // remains absent for the real shell/native oracle to handle.
+        // remains absent so the native fallback owns the result.
         let bash = fixture_command("bash").expect("no-jq fixture requires `bash` in the host PATH");
         write_exec(
             &bin.join("bash"),
@@ -357,9 +337,9 @@ cp "$DOT_TEST_PROVIDER_DIR/install.sh" "$out"
         bin.into_os_string()
     }
 
-    /// Supply the shell's jq branch directly rather than borrowing a package
+    /// Supply the documented jq progress-frame ABI rather than borrowing a package
     /// from the host image. The fixture emits only the documented progress
-    /// records below, and this NUL frame is the shell parser ABI.
+    /// records below, and this NUL frame is the documented parser ABI.
     fn jq_path(&self) -> std::ffi::OsString {
         let bin = self.home.join("jq-bin");
         std::fs::create_dir_all(&bin).expect("jq bin");
@@ -558,6 +538,60 @@ fn process_running(pid: &str) -> bool {
             .starts_with('Z')
 }
 
+const CHANGED: &[u8] =
+    b"[1/5] Overlays   running  checking overlay links                         Ns\n\
+[1/5] Overlays   ok       0 overlays current                             Ns\n\
+[2/5] Tools      running  checking configured dependencies               Ns\n\
+[2/5] Tools      changed  1 changed                                      Ns\n\
+\x20\x20changed  Cargo: 1 changed\n\
+\x20\x20changed  ripgrep                      installed\n\
+[3/5] Configs    running  checking config hooks                          Ns\n\
+[3/5] Configs    ok       no config hooks                                Ns\n\
+[4/5] Cleanup    running  normalizing worktree                           Ns\n\
+[4/5] Cleanup    ok       no base repo                                   Ns\n\
+Done in Ns. Reload your shell: source ~/.bashrc\n";
+
+const UNAVAILABLE: &[u8] =
+    b"[1/5] Overlays   running  checking overlay links                         Ns\n\
+[1/5] Overlays   ok       0 overlays current                             Ns\n\
+[2/5] Tools      running  checking configured dependencies               Ns\n\
+[2/5] Tools      failed   shdeps unavailable; dependency install ski     Ns\n\
+[3/5] Configs    running  checking config hooks                          Ns\n\
+[3/5] Configs    ok       no config hooks                                Ns\n\
+[4/5] Cleanup    running  normalizing worktree                           Ns\n\
+[4/5] Cleanup    ok       no base repo                                   Ns\n\
+Done with errors in Ns. Reload your shell: source ~/.bashrc\n";
+
+const FAILED_UPDATE: &[u8] =
+    b"[1/5] Overlays   running  checking overlay links                         Ns\n\
+[1/5] Overlays   ok       0 overlays current                             Ns\n\
+[2/5] Tools      running  checking configured dependencies               Ns\n\
+[2/5] Tools      failed   1 failed                                       Ns\n\
+\x20\x20failed   Cargo: 1 failed, 12ms\n\
+\x20\x20failed   ripgrep                      network unavailable\n\
+[3/5] Configs    running  checking config hooks                          Ns\n\
+[3/5] Configs    ok       no config hooks                                Ns\n\
+[4/5] Cleanup    running  normalizing worktree                           Ns\n\
+[4/5] Cleanup    ok       no base repo                                   Ns\n\
+Done with errors in Ns. Reload your shell: source ~/.bashrc\n";
+
+const CHECKED: &[u8] =
+    b"[1/5] Overlays   running  checking overlay links                         Ns\n\
+[1/5] Overlays   ok       0 overlays current                             Ns\n\
+[2/5] Tools      running  checking configured dependencies               Ns\n\
+[2/5] Tools      ok       dependencies checked                           Ns\n\
+[3/5] Configs    running  checking config hooks                          Ns\n\
+[3/5] Configs    ok       no config hooks                                Ns\n\
+[4/5] Cleanup    running  normalizing worktree                           Ns\n\
+[4/5] Cleanup    ok       no base repo                                   Ns\n\
+Done in Ns. Reload your shell: source ~/.bashrc\n";
+
+fn assert_cli(output: &Output, status: i32, stdout: &[u8], stderr: &[u8]) {
+    assert_eq!(output.status.code(), Some(status));
+    assert_eq!(normalize_elapsed(&output.stdout), stdout);
+    assert_eq!(output.stderr, stderr);
+}
+
 #[test]
 fn bounded_output_reaps_a_timed_out_process_session() {
     let scratch = TempDir::new("shdeps-provider-timeout").expect("scratch");
@@ -609,32 +643,26 @@ fn elapsed_normalization_changes_only_ui_elapsed_positions() {
 
 #[test]
 fn explicit_reviewed_provider_runs_natively() {
-    let shell = Fixture::new("shdeps-provider-shell");
-    let rust = Fixture::new("shdeps-provider-rust");
-    let shell_output = shell.run(false);
-    assert!(
-        shell_output.status.success(),
-        "shell stderr: {}",
-        String::from_utf8_lossy(&shell_output.stderr)
-    );
-    let rust_output = rust.run(true);
-    assert_eq!(rust_output.status.code(), shell_output.status.code());
-    assert_eq!(
-        normalize_elapsed(&rust_output.stdout),
-        normalize_elapsed(&shell_output.stdout)
-    );
-    assert_eq!(rust_output.stderr, shell_output.stderr);
+    let rust = Fixture::new("shdeps-provider-explicit");
+    // A process launched directly from the native executable does not inherit
+    // Bash's shell-local BASH variable. The provider must resolve its retained
+    // bootstrap interpreter from the snapshotted PATH in that normal case.
+    let rust_output = rust
+        .command()
+        .env_remove("BASH")
+        .output()
+        .expect("run native provider without BASH");
+    assert_cli(&rust_output, 0, CHANGED, b"");
     assert_eq!(
         std::fs::read(rust.home.join("provider-record")).expect("native provider record"),
-        std::fs::read(shell.home.join("provider-record")).expect("shell provider record")
+        b"force=0 quiet=0 nested=1 jobs=2\n"
     );
 }
 
 #[test]
 fn bootstrap_selected_binary_is_the_only_executable_authority() {
-    let shell = Fixture::new("shdeps-provider-selected-bin-shell");
-    let rust = Fixture::new("shdeps-provider-selected-bin-rust");
-    let run = |fixture: &Fixture, native: bool| {
+    let rust = Fixture::new("shdeps-provider-selected-bin");
+    let run = |fixture: &Fixture| {
         let alternate = fixture.home.join("provider-bin/shdeps");
         std::fs::create_dir_all(alternate.parent().expect("binary parent"))
             .expect("binary directory");
@@ -647,41 +675,35 @@ fn bootstrap_selected_binary_is_the_only_executable_authority() {
             .as_bytes(),
         );
         fixture
-            .command(native)
+            .command()
             .env("DOT_TEST_BOOTSTRAP_BIN", &alternate)
             .env("DOT_TEST_RECORD_BINARY_MARKER", "1")
             .output()
             .expect("selected provider binary")
     };
-    let shell_output = run(&shell, false);
-    let rust_output = run(&rust, true);
-    assert_eq!(rust_output.status.code(), shell_output.status.code());
+    let rust_output = run(&rust);
+    assert_cli(&rust_output, 0, CHANGED, b"");
     assert_eq!(
         std::fs::read(rust.home.join("provider-record")).expect("native binary marker"),
-        std::fs::read(shell.home.join("provider-record")).expect("shell binary marker")
+        b"force=0 quiet=0 nested=1 jobs=2\nbinary=selected\n"
     );
 
-    let shell = Fixture::new("shdeps-provider-rejected-bin-shell");
-    let rust = Fixture::new("shdeps-provider-rejected-bin-rust");
-    let run = |fixture: &Fixture, native: bool| {
+    let rust = Fixture::new("shdeps-provider-rejected-bin");
+    let run = |fixture: &Fixture| {
         fixture
-            .command(native)
+            .command()
             .env("DOT_TEST_BOOTSTRAP_BIN", "relative/shdeps")
             .output()
             .expect("rejected provider binary")
     };
-    assert_eq!(
-        run(&rust, true).status.code(),
-        run(&shell, false).status.code()
-    );
+    assert_cli(&run(&rust), 1, UNAVAILABLE, b"");
 }
 
 #[test]
 fn missing_provider_uses_reviewed_download_natively() {
-    let shell = Fixture::new("shdeps-provider-download-shell");
-    let rust = Fixture::new("shdeps-provider-download-rust");
-    let run = |fixture: &Fixture, native: bool| {
-        let mut command = fixture.command(native);
+    let rust = Fixture::new("shdeps-provider-download");
+    let run = |fixture: &Fixture| {
+        let mut command = fixture.command();
         command
             .env_remove("SHDEPS_LIB")
             .env("SHDEPS_DIR", fixture.home.join("managed-shdeps"))
@@ -690,32 +712,20 @@ fn missing_provider_uses_reviewed_download_natively() {
             .env("DOT_TEST_CURL_RECORD", fixture.home.join("curl-record"));
         command.output().expect("download update")
     };
-    let shell_output = run(&shell, false);
-    assert!(
-        shell_output.status.success(),
-        "shell stderr: {}",
-        String::from_utf8_lossy(&shell_output.stderr)
-    );
-    let rust_output = run(&rust, true);
-    assert_eq!(rust_output.status.code(), shell_output.status.code());
-    assert_eq!(
-        normalize_elapsed(&rust_output.stdout),
-        normalize_elapsed(&shell_output.stdout)
-    );
-    assert_eq!(rust_output.stderr, shell_output.stderr);
+    let rust_output = run(&rust);
+    assert_cli(&rust_output, 0, CHANGED, b"");
     assert_eq!(
         std::fs::read(rust.home.join("curl-record")).expect("native download record"),
-        std::fs::read(shell.home.join("curl-record")).expect("shell download record")
+        b"https://raw.githubusercontent.com/cgraf78/shdeps/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/install.sh\n"
     );
 }
 
 #[test]
 fn provider_source_change_reexecs_once_natively() {
-    let shell = Fixture::new("shdeps-provider-reexec-shell");
-    let rust = Fixture::new("shdeps-provider-reexec-rust");
-    let run = |fixture: &Fixture, native: bool| {
+    let rust = Fixture::new("shdeps-provider-reexec");
+    let run = |fixture: &Fixture| {
         fixture
-            .command(native)
+            .command()
             .env("DOT_TEST_PROVIDER_ADVANCE_SOURCE", "1")
             .env(
                 "DOT_TEST_PROVIDER_ADVANCED",
@@ -724,31 +734,21 @@ fn provider_source_change_reexecs_once_natively() {
             .output()
             .expect("reexec update")
     };
-    let shell_output = run(&shell, false);
-    assert!(
-        shell_output.status.success(),
-        "shell stderr: {}",
-        String::from_utf8_lossy(&shell_output.stderr)
-    );
-    let rust_output = run(&rust, true);
-    assert_eq!(rust_output.status.code(), shell_output.status.code());
-    assert_eq!(
-        normalize_elapsed(&rust_output.stdout),
-        normalize_elapsed(&shell_output.stdout)
-    );
-    assert_eq!(rust_output.stderr, shell_output.stderr);
+    let rust_output = run(&rust);
+    let mut expected = b"[1/5] Overlays   running  checking overlay links                         Ns\n[1/5] Overlays   ok       0 overlays current                             Ns\n[2/5] Tools      running  checking configured dependencies               Ns\n[2/5] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ripgrep                      installed\n".to_vec();
+    expected.extend_from_slice(CHANGED);
+    assert_cli(&rust_output, 0, &expected, b"");
     assert!(rust.home.join("provider-advanced").exists());
     assert!(!rust.state.join("dot/provider-reexec-failed").exists());
 }
 
 #[test]
 fn provider_abi_probe_obeys_its_deadline_natively() {
-    let shell = Fixture::new("shdeps-provider-abi-timeout-shell");
-    let rust = Fixture::new("shdeps-provider-abi-timeout-rust");
-    let run = |fixture: &Fixture, native: bool| {
+    let rust = Fixture::new("shdeps-provider-abi-timeout");
+    let run = |fixture: &Fixture| {
         let started = std::time::Instant::now();
         let output = fixture
-            .command(native)
+            .command()
             .env("DOT_TEST_PROVIDER_ABI_SLEEP", "1")
             // Keep the fixture's blocked child much longer than the generous
             // CI deadline, so this remains a no-hang assertion under load.
@@ -758,35 +758,16 @@ fn provider_abi_probe_obeys_its_deadline_natively() {
             .expect("timed ABI update");
         (output, started.elapsed())
     };
-    let (shell_output, shell_elapsed) = run(&shell, false);
-    assert_eq!(shell_output.status.code(), Some(1));
-    assert!(shell_elapsed < std::time::Duration::from_secs(10));
-    let timeout_warning = b"warning: Shdeps provider ABI probe timed out after 1s";
-    assert!(
-        shell_output
-            .stderr
-            .windows(timeout_warning.len())
-            .any(|row| row == timeout_warning),
-        "shell stderr: {}",
-        String::from_utf8_lossy(&shell_output.stderr),
-    );
-    let (rust_output, rust_elapsed) = run(&rust, true);
-    assert_eq!(rust_output.status.code(), shell_output.status.code());
+    let (rust_output, rust_elapsed) = run(&rust);
     assert!(
         rust_elapsed < std::time::Duration::from_secs(10),
         "native ABI probe ran for {rust_elapsed:?}"
     );
-    assert_eq!(
-        normalize_elapsed(&rust_output.stdout),
-        normalize_elapsed(&shell_output.stdout)
-    );
-    assert!(
-        rust_output
-            .stderr
-            .windows(timeout_warning.len())
-            .any(|row| row == timeout_warning),
-        "native stderr: {}",
-        String::from_utf8_lossy(&rust_output.stderr),
+    assert_cli(
+        &rust_output,
+        1,
+        UNAVAILABLE,
+        b"  warning: Shdeps provider ABI probe timed out after 1s\n",
     );
 }
 
@@ -794,12 +775,12 @@ fn provider_abi_probe_obeys_its_deadline_natively() {
 fn completed_abi_probe_cleans_inherited_stdout_descendants() {
     let rust = Fixture::new("shdeps-provider-abi-stdout-descendant");
     let pid_file = rust.home.join("abi-descendant-pid");
-    let mut command = rust.command(true);
+    let mut command = rust.command();
     command
         .env("DOT_TEST_PROVIDER_ABI_LEAK_STDOUT", "1")
         .env("DOT_TEST_PROVIDER_ABI_DESCENDANT_PID", &pid_file);
     let output = bounded_output(command, 10);
-    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert_cli(&output, 0, CHANGED, b"");
     let pid = std::fs::read_to_string(pid_file)
         .expect("ABI descendant pid")
         .trim()
@@ -816,11 +797,10 @@ fn completed_abi_probe_cleans_inherited_stdout_descendants() {
 
 #[test]
 fn force_and_quiet_reach_the_provider_natively() {
-    let shell = Fixture::new("shdeps-provider-flags-shell");
-    let rust = Fixture::new("shdeps-provider-flags-rust");
-    let run = |fixture: &Fixture, native: bool| {
+    let rust = Fixture::new("shdeps-provider-flags");
+    let run = |fixture: &Fixture| {
         fixture
-            .command(native)
+            .command()
             .arg("--force")
             .arg("--quiet")
             .env("DOT_UPDATE_JOBS", "3")
@@ -828,15 +808,8 @@ fn force_and_quiet_reach_the_provider_natively() {
             .output()
             .expect("quiet forced update")
     };
-    let shell_output = run(&shell, false);
-    let rust_output = run(&rust, true);
-    assert_eq!(rust_output.status.code(), shell_output.status.code());
-    assert_eq!(
-        normalize_elapsed(&rust_output.stdout),
-        normalize_elapsed(&shell_output.stdout)
-    );
-    assert_eq!(rust_output.stderr, shell_output.stderr);
-    assert_eq!(rust_output.stdout, b"");
+    let rust_output = run(&rust);
+    assert_cli(&rust_output, 0, b"", b"");
     assert_eq!(
         std::fs::read(rust.home.join("provider-record")).expect("native flags"),
         format!(
@@ -849,33 +822,24 @@ fn force_and_quiet_reach_the_provider_natively() {
 
 #[test]
 fn failed_provider_update_keeps_actionable_output_natively() {
-    let shell = Fixture::new("shdeps-provider-failure-shell");
-    let rust = Fixture::new("shdeps-provider-failure-rust");
-    let run = |fixture: &Fixture, native: bool| {
+    let rust = Fixture::new("shdeps-provider-failure");
+    let run = |fixture: &Fixture| {
         fixture
-            .command(native)
+            .command()
             .env("DOT_TEST_PROVIDER_FAIL", "1")
             .output()
             .expect("failed provider update")
     };
-    let shell_output = run(&shell, false);
-    let rust_output = run(&rust, true);
-    assert_eq!(rust_output.status.code(), shell_output.status.code());
-    assert_eq!(
-        normalize_elapsed(&rust_output.stdout),
-        normalize_elapsed(&shell_output.stdout)
-    );
-    assert_eq!(rust_output.stderr, shell_output.stderr);
-    assert!(String::from_utf8_lossy(&rust_output.stdout).contains("network unavailable"));
+    let rust_output = run(&rust);
+    assert_cli(&rust_output, 1, FAILED_UPDATE, b"");
 }
 
 #[test]
 fn second_provider_source_change_publishes_checkpoint_natively() {
-    let shell = Fixture::new("shdeps-provider-checkpoint-shell");
-    let rust = Fixture::new("shdeps-provider-checkpoint-rust");
-    let run = |fixture: &Fixture, native: bool| {
+    let rust = Fixture::new("shdeps-provider-checkpoint");
+    let run = |fixture: &Fixture| {
         fixture
-            .command(native)
+            .command()
             .env("DOT_TEST_PROVIDER_ADVANCE_TWICE", "1")
             .env(
                 "DOT_TEST_PROVIDER_ADVANCED",
@@ -884,28 +848,24 @@ fn second_provider_source_change_publishes_checkpoint_natively() {
             .output()
             .expect("double-change update")
     };
-    let shell_output = run(&shell, false);
-    let rust_output = run(&rust, true);
-    assert_eq!(rust_output.status.code(), shell_output.status.code());
-    assert_eq!(rust_output.status.code(), Some(1));
-    assert_eq!(
-        normalize_elapsed(&rust_output.stdout),
-        normalize_elapsed(&shell_output.stdout)
+    let rust_output = run(&rust);
+    let expected = b"[1/5] Overlays   running  checking overlay links                         Ns\n[1/5] Overlays   ok       0 overlays current                             Ns\n[2/5] Tools      running  checking configured dependencies               Ns\n[2/5] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ripgrep                      installed\n[1/5] Overlays   running  checking overlay links                         Ns\n[1/5] Overlays   ok       0 overlays current                             Ns\n[2/5] Tools      running  checking configured dependencies               Ns\n[2/5] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ripgrep                      installed\nDone with errors in Ns. Reload your shell: source ~/.bashrc\n";
+    assert_cli(
+        &rust_output,
+        1,
+        expected,
+        b"  warning: dot changed twice during one update; rerun to validate the provider checkpoint\n",
     );
-    assert_eq!(rust_output.stderr, shell_output.stderr);
-    let shell_checkpoint = shell.state.join("dot/provider-reexec-failed");
     let rust_checkpoint = rust.state.join("dot/provider-reexec-failed");
-    for checkpoint in [&rust_checkpoint, &shell_checkpoint] {
-        let body = std::fs::read_to_string(checkpoint).expect("checkpoint");
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "cgraf78 dot provider reexec checkpoint v1");
-        let before = lines[1].strip_prefix("before=").expect("before field");
-        let after = lines[2].strip_prefix("after=").expect("after field");
-        assert!(dot::shdeps::revision_valid(before));
-        assert!(dot::shdeps::revision_valid(after));
-        assert_ne!(before, after);
-    }
+    let body = std::fs::read_to_string(&rust_checkpoint).expect("checkpoint");
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0], "cgraf78 dot provider reexec checkpoint v1");
+    let before = lines[1].strip_prefix("before=").expect("before field");
+    let after = lines[2].strip_prefix("after=").expect("after field");
+    assert!(dot::shdeps::revision_valid(before));
+    assert!(dot::shdeps::revision_valid(after));
+    assert_ne!(before, after);
     assert_eq!(
         std::fs::metadata(rust_checkpoint)
             .expect("checkpoint metadata")
@@ -919,12 +879,10 @@ fn second_provider_source_change_publishes_checkpoint_natively() {
 #[test]
 fn managed_and_development_provider_sources_run_natively() {
     for (name, source) in [("managed", 0), ("pinned-dev", 1), ("latest-dev", 2)] {
-        let shell = Fixture::new(&format!("shdeps-provider-{name}-shell"));
-        let rust = Fixture::new(&format!("shdeps-provider-{name}-rust"));
-        let shell_dev = (source > 0).then(|| shell.development(source == 1));
+        let rust = Fixture::new(&format!("shdeps-provider-{name}"));
         let rust_dev = (source > 0).then(|| rust.development(source == 1));
-        let run = |fixture: &Fixture, native: bool, dev: Option<&PathBuf>| {
-            let mut command = fixture.command(native);
+        let run = |fixture: &Fixture, dev: Option<&PathBuf>| {
+            let mut command = fixture.command();
             command.env_remove("SHDEPS_LIB");
             if let Some(dev) = dev {
                 command
@@ -940,44 +898,25 @@ fn managed_and_development_provider_sources_run_natively() {
             }
             command.output().expect("provider source update")
         };
-        let shell_output = run(&shell, false, shell_dev.as_ref());
-        assert!(
-            shell_output.status.success(),
-            "{name} shell stderr: {}",
-            String::from_utf8_lossy(&shell_output.stderr)
-        );
-        let rust_output = run(&rust, true, rust_dev.as_ref());
-        assert_eq!(
-            rust_output.status.code(),
-            shell_output.status.code(),
-            "{name}"
-        );
-        assert_eq!(
-            normalize_elapsed(&rust_output.stdout),
-            normalize_elapsed(&shell_output.stdout),
-            "{name}"
-        );
-        assert_eq!(rust_output.stderr, shell_output.stderr, "{name}");
+        let rust_output = run(&rust, rust_dev.as_ref());
+        assert_cli(&rust_output, 0, CHANGED, b"");
     }
 }
 
 #[test]
-fn bootstrap_and_abi_failures_match_shell_natively() {
+fn bootstrap_and_abi_failures_are_actionable_natively() {
     for (name, bootstrap, abi) in [("bootstrap", true, false), ("abi", false, true)] {
-        let shell = Fixture::new(&format!("shdeps-provider-{name}-shell"));
-        let rust = Fixture::new(&format!("shdeps-provider-{name}-rust"));
+        let rust = Fixture::new(&format!("shdeps-provider-{name}"));
         if abi {
-            for fixture in [&shell, &rust] {
-                let binary = fixture.provider.join("shdeps");
-                let body = std::fs::read_to_string(&binary)
-                    .expect("provider binary")
-                    .replace("printf 'abi:1", "printf 'abi:2");
-                write_exec(&binary, body.as_bytes());
-            }
+            let binary = rust.provider.join("shdeps");
+            let body = std::fs::read_to_string(&binary)
+                .expect("provider binary")
+                .replace("printf 'abi:1", "printf 'abi:2");
+            write_exec(&binary, body.as_bytes());
         }
-        let run = |fixture: &Fixture, native: bool| {
+        let run = |fixture: &Fixture| {
             fixture
-                .command(native)
+                .command()
                 .env(
                     "DOT_TEST_PROVIDER_BOOTSTRAP_FAIL",
                     if bootstrap { "1" } else { "0" },
@@ -985,70 +924,35 @@ fn bootstrap_and_abi_failures_match_shell_natively() {
                 .output()
                 .expect("provider refusal")
         };
-        let shell_output = run(&shell, false);
-        let rust_output = run(&rust, true);
-        assert_eq!(
-            rust_output.status.code(),
-            shell_output.status.code(),
-            "{name}"
-        );
-        assert_eq!(rust_output.status.code(), Some(1), "{name}");
-        assert_eq!(
-            normalize_elapsed(&rust_output.stdout),
-            normalize_elapsed(&shell_output.stdout),
-            "{name}"
-        );
-        assert_eq!(rust_output.stderr, shell_output.stderr, "{name}");
+        assert_cli(&run(&rust), 1, UNAVAILABLE, b"");
     }
 }
 
 #[test]
 fn verbose_provider_events_render_in_order_natively() {
-    let shell = Fixture::new("shdeps-provider-verbose-shell");
-    let rust = Fixture::new("shdeps-provider-verbose-rust");
-    let run = |fixture: &Fixture, native: bool| {
+    let rust = Fixture::new("shdeps-provider-verbose");
+    let run = |fixture: &Fixture| {
         fixture
-            .command(native)
+            .command()
             .arg("--verbose")
             .env("DOT_TEST_PROVIDER_VERBOSE_EVENTS", "1")
             .output()
             .expect("verbose provider update")
     };
-    let shell_output = run(&shell, false);
-    let rust_output = run(&rust, true);
-    assert_eq!(rust_output.status.code(), shell_output.status.code());
-    assert_eq!(
-        normalize_elapsed(&rust_output.stdout),
-        normalize_elapsed(&shell_output.stdout)
-    );
-    assert_eq!(rust_output.stderr, shell_output.stderr);
+    let expected = b"[1/5] Overlays   running  checking overlay links                         Ns\n[1/5] Overlays   ok       0 overlays current                             Ns\n[2/5] Tools      running  checking configured dependencies               Ns\n[2/5] Tools      running  Resolving          [####----] 1/2              Ns\n  warning  provider warning\n  Cargo\n  changed  ripgrep                      installed\n[2/5] Tools      changed  1 changed                                      Ns\n[3/5] Configs    running  checking config hooks                          Ns\n[3/5] Configs    ok       no config hooks                                Ns\n[4/5] Cleanup    running  normalizing worktree                           Ns\n[4/5] Cleanup    ok       no base repo                                   Ns\nDone in Ns. Reload your shell: source ~/.bashrc\n";
+    assert_cli(&run(&rust), 0, expected, b"");
 }
-
-const PROMPT_CHANGED: &[u8] =
-    b"[1/5] Overlays   running  checking overlay links                         Ns\n\
-[1/5] Overlays   ok       0 overlays current                             Ns\n\
-[2/5] Tools      running  checking configured dependencies               Ns\n\
-[2/5] Tools      changed  1 changed                                      Ns\n\
-\x20\x20changed  Cargo: 1 changed\n\
-\x20\x20changed  ripgrep                      installed\n\
-[3/5] Configs    running  checking config hooks                          Ns\n\
-[3/5] Configs    ok       no config hooks                                Ns\n\
-[4/5] Cleanup    running  normalizing worktree                           Ns\n\
-[4/5] Cleanup    ok       no base repo                                   Ns\n\
-Done in Ns. Reload your shell: source ~/.bashrc\n";
 
 #[test]
 fn provider_prompt_rendezvous_acknowledges_natively() {
-    let rust = Fixture::new("shdeps-provider-prompt-rust");
-    let mut command = rust.command(true);
+    let rust = Fixture::new("shdeps-provider-prompt");
+    let mut command = rust.command();
     command.env("DOT_TEST_PROVIDER_PROMPT", "1").env(
         "DOT_TEST_PROVIDER_PROMPT_RECORD",
         rust.home.join("prompt-record"),
     );
     let output = bounded_output(command, 10);
-    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
-    assert_eq!(normalize_elapsed(&output.stdout), PROMPT_CHANGED);
-    assert!(output.stderr.is_empty());
+    assert_cli(&output, 0, CHANGED, b"");
     assert_eq!(
         std::fs::read(rust.home.join("prompt-record")).expect("native prompt acknowledgment"),
         b"ready\n"
@@ -1059,12 +963,12 @@ fn provider_prompt_rendezvous_acknowledges_natively() {
 fn provider_exit_does_not_wait_for_or_leak_stdout_descendants() {
     let rust = Fixture::new("shdeps-provider-stdout-descendant");
     let pid_file = rust.home.join("descendant-pid");
-    let mut command = rust.command(true);
+    let mut command = rust.command();
     command
         .env("DOT_TEST_PROVIDER_LEAK_STDOUT", "1")
         .env("DOT_TEST_PROVIDER_DESCENDANT_PID", &pid_file);
     let output = bounded_output(command, 10);
-    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert_cli(&output, 0, CHECKED, b"");
     let pid = std::fs::read_to_string(pid_file)
         .expect("descendant pid")
         .trim()
@@ -1080,106 +984,60 @@ fn provider_exit_does_not_wait_for_or_leak_stdout_descendants() {
 }
 
 #[test]
-fn escaped_unicode_provider_event_matches_shell_with_and_without_jq() {
+fn escaped_unicode_provider_event_is_literal_with_and_without_jq() {
     for (name, jq, expected) in [
         ("with-jq", true, b"caf\xc3\xa9".as_slice()),
         ("without-jq", false, b"caf\\u00e9".as_slice()),
     ] {
-        let shell = Fixture::new(&format!("shdeps-provider-unicode-{name}-shell"));
-        let rust = Fixture::new(&format!("shdeps-provider-unicode-{name}-rust"));
-        let run = |fixture: &Fixture, native: bool| {
+        let rust = Fixture::new(&format!("shdeps-provider-unicode-{name}"));
+        let run = |fixture: &Fixture| {
             let path = if jq {
                 fixture.jq_path()
             } else {
                 fixture.without_jq_path()
             };
             fixture
-                .command(native)
+                .command()
                 .env("PATH", path)
                 .env("DOT_TEST_PROVIDER_ESCAPED_EVENT", "1")
                 .output()
                 .expect("escaped provider event")
         };
-        let shell_output = run(&shell, false);
-        assert!(
-            shell_output
-                .stdout
-                .windows(expected.len())
-                .any(|row| row == expected),
-            "{name} shell stdout: {}; stderr: {}",
-            String::from_utf8_lossy(&shell_output.stdout),
-            String::from_utf8_lossy(&shell_output.stderr),
-        );
-        let rust_output = run(&rust, true);
-        assert_eq!(
-            rust_output.status.code(),
-            shell_output.status.code(),
-            "{name}; shell stdout={} stderr={}; native stdout={} stderr={}",
-            String::from_utf8_lossy(&shell_output.stdout),
-            String::from_utf8_lossy(&shell_output.stderr),
-            String::from_utf8_lossy(&rust_output.stdout),
-            String::from_utf8_lossy(&rust_output.stderr),
-        );
-        assert_eq!(
-            normalize_elapsed(&rust_output.stdout),
-            normalize_elapsed(&shell_output.stdout),
-            "{name}"
-        );
-        assert_eq!(rust_output.stderr, shell_output.stderr, "{name}");
+        let rust_output = run(&rust);
+        let mut stdout = b"[1/5] Overlays   running  checking overlay links                         Ns\n[1/5] Overlays   ok       0 overlays current                             Ns\n[2/5] Tools      running  checking configured dependencies               Ns\n[2/5] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ".to_vec();
+        stdout.extend_from_slice(expected);
+        stdout.extend_from_slice(if jq {
+            b"                        installed\n[3/5] Configs    running  checking config hooks                          Ns\n[3/5] Configs    ok       no config hooks                                Ns\n[4/5] Cleanup    running  normalizing worktree                           Ns\n[4/5] Cleanup    ok       no base repo                                   Ns\nDone in Ns. Reload your shell: source ~/.bashrc\n"
+        } else {
+            b"                    installed\n[3/5] Configs    running  checking config hooks                          Ns\n[3/5] Configs    ok       no config hooks                                Ns\n[4/5] Cleanup    running  normalizing worktree                           Ns\n[4/5] Cleanup    ok       no base repo                                   Ns\nDone in Ns. Reload your shell: source ~/.bashrc\n"
+        });
+        assert_cli(&rust_output, 0, &stdout, b"");
     }
 }
 
 #[test]
-fn escaped_quote_provider_detail_matches_shell_without_jq() {
-    let shell = Fixture::new("shdeps-provider-escaped-quote-shell");
-    let rust = Fixture::new("shdeps-provider-escaped-quote-rust");
-    let run = |fixture: &Fixture, native: bool| {
+fn escaped_quote_provider_detail_pins_fallback_parser_limit() {
+    let rust = Fixture::new("shdeps-provider-escaped-quote");
+    let run = |fixture: &Fixture| {
         fixture
-            .command(native)
+            .command()
             .env("PATH", fixture.without_jq_path())
             .env("DOT_TEST_PROVIDER_ESCAPED_QUOTE_DETAIL", "1")
             .output()
             .expect("escaped quote provider event")
     };
-    let shell_output = run(&shell, false);
-    assert!(
-        shell_output.status.success(),
-        "shell stderr: {:?}",
-        shell_output.stderr
-    );
+    let rust_output = run(&rust);
     // The bootstrap sed parser captures through the slash before the quote,
     // then its `[^\"]*` expression stops. Pin that observable limitation.
-    assert!(
-        shell_output
-            .stdout
-            .windows(b"said \\".len())
-            .any(|row| row == b"said \\"),
-        "shell stdout: {}",
-        String::from_utf8_lossy(&shell_output.stdout),
-    );
-    assert!(
-        !shell_output
-            .stdout
-            .windows(b"hello".len())
-            .any(|row| row == b"hello"),
-        "shell stdout retained text after escaped quote: {}",
-        String::from_utf8_lossy(&shell_output.stdout),
-    );
-    let rust_output = run(&rust, true);
-    assert_eq!(rust_output.status.code(), shell_output.status.code());
-    assert_eq!(
-        normalize_elapsed(&rust_output.stdout),
-        normalize_elapsed(&shell_output.stdout)
-    );
-    assert_eq!(rust_output.stderr, shell_output.stderr);
+    let expected = b"[1/5] Overlays   running  checking overlay links                         Ns\n[1/5] Overlays   ok       0 overlays current                             Ns\n[2/5] Tools      running  checking configured dependencies               Ns\n[2/5] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ripgrep                      said \\\n[3/5] Configs    running  checking config hooks                          Ns\n[3/5] Configs    ok       no config hooks                                Ns\n[4/5] Cleanup    running  normalizing worktree                           Ns\n[4/5] Cleanup    ok       no base repo                                   Ns\nDone in Ns. Reload your shell: source ~/.bashrc\n";
+    assert_cli(&rust_output, 0, expected, b"");
 }
 
 #[test]
 fn failed_reviewed_download_reports_and_stops_after_three_attempts() {
-    let shell = Fixture::new("shdeps-provider-download-fail-shell");
-    let rust = Fixture::new("shdeps-provider-download-fail-rust");
-    let run = |fixture: &Fixture, native: bool| {
-        let mut command = fixture.command(native);
+    let rust = Fixture::new("shdeps-provider-download-fail");
+    let run = |fixture: &Fixture| {
+        let mut command = fixture.command();
         command
             .env_remove("SHDEPS_LIB")
             .env("SHDEPS_DIR", fixture.home.join("missing-managed"))
@@ -1189,14 +1047,13 @@ fn failed_reviewed_download_reports_and_stops_after_three_attempts() {
             .env("_DOT_SHDEPS_DOWNLOAD_RETRY_DELAY_SECONDS", "0");
         command.output().expect("failed download update")
     };
-    let shell_output = run(&shell, false);
-    let rust_output = run(&rust, true);
-    assert_eq!(rust_output.status.code(), shell_output.status.code());
-    assert_eq!(
-        normalize_elapsed(&rust_output.stdout),
-        normalize_elapsed(&shell_output.stdout)
+    let rust_output = run(&rust);
+    assert_cli(
+        &rust_output,
+        1,
+        UNAVAILABLE,
+        b"  warning: Shdeps bootstrap download failed\n  warning: failed to fetch the reviewed Shdeps bootstrap\n",
     );
-    assert_eq!(rust_output.stderr, shell_output.stderr);
     assert_eq!(
         std::fs::read(rust.home.join("curl-record")).expect("native attempts"),
         b"attempt\nattempt\nattempt\n"

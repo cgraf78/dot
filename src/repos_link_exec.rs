@@ -1,13 +1,12 @@
-//! Native overlay link hot loop (engine link-exec lane).
+//! Native overlay link hot loop.
 //!
-//! Ports `_link_overlay` (`lib/dot/repos/overlays.sh`): one overlay's
+//! Owns single-overlay link convergence:
 //! `home/` inventory linked into `$HOME` with the shell's exact
 //! validation order, skip messages, link rows, manifest records, and
 //! failure points. The per-file cost that dominates converged updates
 //! (~160ms under bash: ~16 `stat` spawns, `readlink`/`git` spawns,
-//! and thousands of loop iterations) becomes native syscalls here;
-//! the orchestration (inventories, authority, stale cleanup, manifest
-//! commit) and the update wiring arrive in later slices.
+//! and thousands of loop iterations) becomes native syscalls here. The
+//! surrounding orchestration lives in [`crate::repos_link_all`].
 //!
 //! Composition notes:
 //!

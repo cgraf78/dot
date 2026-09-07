@@ -6,8 +6,13 @@ version = 4
 name = "dot"
 version = "0.1.0"
 dependencies = [
+ "dot-test-support",
  "libc",
 ]
+
+[[package]]
+name = "dot-test-support"
+version = "0.0.0"
 
 [[package]]
 name = "libc"

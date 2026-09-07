@@ -116,6 +116,21 @@ impl Runtime {
             })
     }
 
+    /// Resolve the Bash interpreter authorized by this invocation.
+    ///
+    /// An explicit `BASH` must already be absolute and executable. When it is
+    /// absent, direct native invocations select the first executable `bash` on
+    /// the snapshotted `PATH`; relative entries are anchored to [`Self::cwd`].
+    pub(crate) fn bash(&self) -> Option<PathBuf> {
+        match self.value("BASH") {
+            Some(value) => {
+                let path = PathBuf::from(value);
+                (path.is_absolute() && executable(&path)).then_some(path)
+            }
+            None => self.find_on_path("bash"),
+        }
+    }
+
     pub(crate) fn source_root(&self) -> &Path {
         &self.source_root
     }
@@ -127,6 +142,11 @@ impl Runtime {
     pub(crate) fn value(&self, key: &str) -> Option<&OsStr> {
         value(&self.env, key)
     }
+}
+
+fn executable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 /// Borrowed stdout and stderr for one Dot invocation.
@@ -183,7 +203,28 @@ pub fn run(runtime: &Runtime, args: &[OsString], streams: &mut Streams<'_>) -> i
 /// it is an implementation entry, not an embedding API.
 #[doc(hidden)]
 pub fn run_direct(runtime: &Runtime, args: &[OsString], streams: &mut Streams<'_>) -> i32 {
-    crate::cli::run_with_runtime(runtime, args, streams.stdout, streams.stderr)
+    let host_git = args
+        .first()
+        .filter(|arg| arg.as_os_str() == OsStr::new("init"))
+        .and_then(|_| runtime.value("HOME").and_then(OsStr::to_str))
+        .and_then(|home| {
+            runtime
+                .value("PATH")
+                .and_then(OsStr::to_str)
+                .and_then(|path| {
+                    crate::init_client_identity::select_host_git(
+                        home,
+                        &runtime.source_root().to_string_lossy(),
+                        path,
+                    )
+                })
+        });
+    match host_git {
+        Some(git) => crate::init_client_identity::with_host_git(Path::new(&git), || {
+            crate::cli::run_with_runtime(runtime, args, streams.stdout, streams.stderr)
+        }),
+        None => crate::cli::run_with_runtime(runtime, args, streams.stdout, streams.stderr),
+    }
 }
 
 /// Execute an embedded Runtime in a child whose real ambient namespace is its

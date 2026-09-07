@@ -763,15 +763,17 @@ fn run_batch(
     let root = state.root;
     let now_secs = state.now_secs;
     let overlays = state.overlays;
+    let first_index = state.merge_index - hooks.len();
     std::thread::scope(|scope| {
         // The shell never retains more PIDs than there are hooks. Do not let a
         // user-controlled but valid numeric job limit reserve unrelated memory.
         let mut workers = VecDeque::with_capacity(hooks.len().min(jobs.max(1)));
         for (index, hook) in hooks.iter().cloned().enumerate() {
+            let index = first_index + index + 1;
             let panic_hook = hook.clone();
             workers.push_back((
                 panic_hook,
-                scope.spawn(move || run_one(inputs, hook, index + 1, root, now_secs, overlays)),
+                scope.spawn(move || run_one(inputs, hook, index, root, now_secs, overlays)),
             ));
             // Bash waits for the oldest in-flight worker once the ceiling is
             // reached, then immediately launches the next hook. This is a FIFO
@@ -970,4 +972,30 @@ fn is_serial_os(script: &Path) -> bool {
     script
         .file_name()
         .is_some_and(|name| name.as_bytes().ends_with(b".serial.sh"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scratch;
+    use dot_test_support::TempDir;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn scratch_is_private_and_refuses_a_non_directory_root() {
+        let scope = TempDir::new("merge-scratch").expect("fixture");
+        let allocated = scratch(scope.path()).expect("private scratch");
+        assert_eq!(
+            std::fs::metadata(&allocated)
+                .expect("scratch metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        let blocked = scope.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory\n").expect("blocked root");
+        assert!(scratch(&blocked).is_none());
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"not a directory\n");
+    }
 }

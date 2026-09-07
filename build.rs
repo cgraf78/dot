@@ -85,9 +85,8 @@ fn short_revision(commit: &str) -> String {
     }
 }
 
-/// Resolve the release version: explicit env, else `unknown`.
-/// Slice 1 has no `scripts/release-version.sh` yet; later slices introduce
-/// the shared `YYYYMMDD-HHMMSS-8hex` scheme and validate it here.
+/// Resolve the release version supplied by the shared release pipeline,
+/// falling back to `unknown` for ordinary development builds.
 fn resolve_version() -> String {
     if let Ok(version) = env::var(format!("{PREFIX}_VERSION")) {
         let version = version.trim().to_string();

@@ -4,7 +4,7 @@
 //! Git directories before publishing a Base. Native doctor and test use this
 //! same authority boundary; repository commands consume its topology model.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -88,7 +88,7 @@ pub fn overlay_path_sync(entry: &str) -> (String, String) {
 /// nulled, stdin null. `None` on spawn failure (callers treat that
 /// like any other git failure).
 pub fn run_git(prefix: &[OsString], args: &[&str]) -> Option<Output> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::init_client_identity::host_git_command();
     cmd.args(prefix)
         .args(args)
         .stdin(Stdio::null())
@@ -103,13 +103,27 @@ pub(crate) fn select(
     state: &str,
     stderr: &mut dyn std::io::Write,
 ) -> Result<crate::repos_base::Base, ()> {
-    if let Some(topology) = runtime.value("DOT_BASE_TOPOLOGY").and_then(OsStr::to_str) {
-        return Ok(crate::cli::base_from_values(
-            home,
-            Some(topology),
-            runtime.value("DOT_CLIENT_GIT_DIR").and_then(OsStr::to_str),
-        ));
-    }
+    select_with(runtime, home, state, stderr, false)
+}
+
+/// Validate client identity for `dot init`, which may adopt an ordinary
+/// checkout that does not have a completed identity yet.
+pub(crate) fn select_for_init(
+    runtime: &crate::app::Runtime,
+    home: &str,
+    state: &str,
+    stderr: &mut dyn std::io::Write,
+) -> Result<crate::repos_base::Base, ()> {
+    select_with(runtime, home, state, stderr, true)
+}
+
+fn select_with(
+    runtime: &crate::app::Runtime,
+    home: &str,
+    state: &str,
+    stderr: &mut dyn std::io::Write,
+    allow_uninitialized_ordinary: bool,
+) -> Result<crate::repos_base::Base, ()> {
     let completed = Path::new(state).join("dot/init/completed");
     let transaction = Path::new(state).join("dot/init/transaction/record");
     let selected = if std::fs::symlink_metadata(&completed).is_ok() {
@@ -173,6 +187,13 @@ pub(crate) fn select(
         ));
     }
     if std::fs::symlink_metadata(Path::new(home).join(".git")).is_ok() {
+        if allow_uninitialized_ordinary {
+            return Ok(crate::cli::base_from_values(
+                home,
+                Some("ordinary"),
+                Some(&format!("{home}/.git")),
+            ));
+        }
         let _ = stderr
             .write_all(b"dot: ordinary HOME checkout requires a completed dot init identity\n");
         return Err(());

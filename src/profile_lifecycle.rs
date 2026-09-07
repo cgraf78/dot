@@ -7,13 +7,9 @@
 //! before a sync, [`retire`] runs the entry points the new profile
 //! drops, and [`commit`] records the survivors for next time.
 //!
-//! The worker spawn itself (`_dot_extension_worker_run`) belongs to
-//! a later slice, so [`run_one`] takes execution as a [`WorkerRun`]
-//! seam: the ported plumbing (script resolution, scratch directory,
-//! authorization context, exit-code/output relay, warning routing,
-//! cleanup) is exact, and only the leaf process spawn is injected.
-//! Differential tests inject the live shell worker there, so the
-//! comparison still covers everything this module owns.
+//! [`run_one`] accepts a [`WorkerRun`] so process execution remains separate
+//! from lifecycle policy. Production supplies the hardened worker; tests supply
+//! deterministic fixtures.
 //!
 //! Like the earlier ports the library never prints: `_warn` lines go
 //! to the caller's `warnings` buffer through [`Log::warn`] (which
@@ -88,7 +84,7 @@ pub struct WorkerOutcome {
 
 /// Executes one validated deactivation script under the worker
 /// protocol: the `_dot_extension_worker_run` leaf that belongs to a
-/// later slice. Arguments mirror its call in [`run_one`]: the fixed
+/// native worker. Arguments mirror its call in [`run_one`]: the fixed
 /// entry-point script, the scratch directory, the `has-deactivate`
 /// result file inside it, and the minted context path plus token.
 pub trait WorkerRun {

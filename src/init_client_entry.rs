@@ -1,41 +1,29 @@
-//! Per-entry publication staging for `lib/dot/init-client.sh`:
+//! Per-entry publication staging for the native init client:
 //! intent records, entry stage paths, stage claim markers,
 //! entry-stage validation, and single-entry publication.
 //!
-//! The shell file holds 79 functions — too big for one lane — so
-//! this module owns twelve functions in two chapters. The staging
-//! chapter (the `rust-port-slice-46` lane) owns the eight
+//! This module owns twelve functions in two chapters. The staging
+//! chapter owns the eight
 //! primitives from `_dot_init_write_private_line` through
 //! `_dot_init_stage_claim_remove`: the mode-600 single-line file
 //! publisher, the transaction-derived entry stage path, the intent
 //! record validator, and the five claim-marker helpers that prove a
 //! stage directory belongs to this run. The publication chapter
-//! (the `rust-port-slice-67` lane) owns the four contiguous
+//! owns the four contiguous
 //! functions from `_dot_init_entry_stage_valid` through
 //! `_dot_init_publish_one` in file order: the stage-directory gate
 //! ([`entry_stage_valid`]), the stage-content gate
 //! ([`entry_stage_only_next`]), the staged `next` cleanup
 //! ([`discard_staged_next`]), and the pending / staged publication
-//! driver ([`publish_one`]). The lanes merged by deduplication:
+//! driver ([`publish_one`]). Shared shapes used by both chapters:
 //! the shapes both chapters need ([`EntryIntent`],
 //! [`STAGE_CLAIM_NAME`], `owned_by_us`, `join_slash`) are defined
-//! once below. The file-generic `_dot_init_error` diagnostic stays
-//! unported (a bare `printf ... >&2; return 1` with no family
-//! state, absorbed into [`Result`] the way earlier slices absorb
-//! engine diagnostics).
-//! The transaction-directory lifecycle lives on
-//! `rust-port-slice-35` (`init_client_transaction`), the host-git
-//! identity family on `rust-port-slice-41`
-//! (`init_client_identity`), the git-generation binding on
-//! `rust-port-slice-43` (`init_client_generation`), and the record,
-//! publish, delete, and rollback families live on their own lanes
-//! (`init_client_record`, `init_client_records`,
-//! `init_client_publish`, `init_client_delete`,
-//! `init_client_rollback`). The prior-record reader above the
-//! publication chapter (`_dot_init_prior_record`) lives on another
-//! lane and is not touched here.
+//! once below. Diagnostics surface through the shared typed [`Result`].
+//! Neighboring transaction, identity, generation, record, publish,
+//! delete, and rollback contracts live in their corresponding
+//! `init_client_*` modules and are composed by the engine.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the run identity from the
@@ -50,10 +38,10 @@
 //! all (it lives inside the injected staging closures). Git runs
 //! plain like the shell's bare `git` (see
 //! [`crate::repos_base::run_git`]): blob bytes are
-//! locale-independent, and git's own diagnostics are not part of
-//! the ported surface. The umask the tracked-mode setter honors
+//! locale-independent, and git's own diagnostics are not part of the public
+//! contract. The umask the tracked-mode setter honors
 //! crosses as [`PublishOneInputs::mask`], the way the staged-clone
-//! lane takes its ceiling mask.
+//! is supplied explicitly.
 //!
 //! Byte-fidelity boundary: every `$HOME/$path` join concatenates
 //! bytes like the shell (see `join_slash`), preserving a doubled
@@ -470,45 +458,42 @@ pub const NEXT_NAME: &str = "next";
 
 /// `_dot_init_parent_directories`: ensure the published parents of
 /// `path` exist under the client root, recording each step in
-/// `transaction`. Injected because the transaction lane is
-/// unmerged; tests feed a closure running the live shell.
+/// `transaction`. Injected so the engine can compose the native
+/// transaction contract without coupling these modules.
 pub type EnsureParents<'a> = dyn Fn(&Path, &str) -> Result<()> + 'a;
 
 /// `_dot_init_entry_intent`: validate the intent record at `file`
-/// against the expected mode, object id, and path. Injected
-/// because the neighbor lane is unmerged; tests feed a closure
-/// running the live shell.
+/// against the expected mode, object id, and path. Injected so the
+/// engine can compose the native intent contract.
 pub type ReadIntent<'a> = dyn Fn(&Path, &str, &str, &str) -> Result<EntryIntent> + 'a;
 
 /// `_dot_init_stage_claim_matches` for kind `entry`: the claim
 /// marker under `stage` proves this run owns it for `path`.
-/// Injected because the claim lane is unmerged; tests feed a
-/// closure running the live shell.
+/// Injected so callers can bind the native claim contract.
 pub type ClaimMatches<'a> = dyn Fn(&Path, &str) -> bool + 'a;
 
 /// `_dot_init_stage_claim_write` for kind `entry`: publish the
-/// claim marker for (`stage`, `path`). Injected because the claim
-/// lane is unmerged; tests feed a closure running the live shell.
+/// claim marker for (`stage`, `path`). Injected so callers can bind
+/// the native claim contract.
 pub type ClaimWrite<'a> = dyn Fn(&Path, &str) -> Result<()> + 'a;
 
 /// `_dot_init_stage_claim_remove` for kind `entry`: drop the claim
-/// marker after it revalidates. Injected because the claim lane is
-/// unmerged; tests feed a closure running the live shell.
+/// marker after it revalidates. Injected so callers can bind the
+/// native claim contract.
 pub type ClaimRemove<'a> = dyn Fn(&Path, &str) -> Result<()> + 'a;
 
 /// `_dot_init_write_private_line`: publish one line at `file`,
-/// replacing when `replace` is set. Injected because the record
-/// lane is unmerged; tests feed a closure running the live shell.
+/// replacing when `replace` is set. Injected so callers can bind
+/// the native record contract.
 pub type WriteIntentLine<'a> = dyn Fn(&Path, &str, bool) -> Result<()> + 'a;
 
 /// `_dot_init_candidate_matches_git`: the home-relative `path`
-/// holds `mode`/`oid` from `commit` in `git_dir`. Injected
-/// because the candidate lane is unmerged; tests feed a closure
-/// running the live shell.
+/// holds `mode`/`oid` from `commit` in `git_dir`. Injected so
+/// callers can bind the native candidate contract.
 pub type CandidateMatches<'a> = dyn Fn(&str, &str, &str, &str, &str) -> bool + 'a;
 
 /// Inputs for [`publish_one`]: the publication coordinates plus
-/// the unmerged-lane closures above.
+/// the neighboring native contracts above.
 pub struct PublishOneInputs<'a> {
     /// Client root: the shell's `HOME`.
     pub home: &'a Path,

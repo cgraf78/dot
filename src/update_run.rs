@@ -1,6 +1,6 @@
 //! `dot update` end-to-end execution.
 //!
-//! Ports the `update`/`pull` arm of `dot_command_dispatch`
+//! Owns the `update`/`pull` command dispatch
 //! (`lib/dot/commands.sh`): owner-trap installation, native
 //! [`crate::update_lock`] acquisition (failure returns its
 //! status, e.g. lock-busy `75`), then `_dot_update "$@"` whose status

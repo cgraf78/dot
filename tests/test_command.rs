@@ -18,6 +18,72 @@ fn native_help_and_list_do_not_load_test_engine() {
 }
 
 #[test]
+fn native_provider_suite_is_explicitly_opted_in() {
+    let f = Fixture::new();
+    let extensions = f.scope.path().join("extensions");
+    fixture::executable(
+        &extensions.join("tests/client-test"),
+        "touch \"$HOME/client-ran\"; printf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
+    );
+    std::fs::create_dir_all(f.home.join(".config/dot")).unwrap();
+    std::fs::write(
+        f.home.join(".config/dot/config"),
+        format!(
+            "version=1\nextension_api=1\nextensions_dir={}\ndependency_provider=none\n",
+            extensions.display()
+        ),
+    )
+    .unwrap();
+    fixture::executable(
+        &f.root.join("tests/run"),
+        "touch \"$HOME/provider-ran\"; printf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
+    );
+
+    let output = fixture::finish(
+        f.command(&[])
+            .env_remove("DOT_TEST_TESTS_DIR")
+            .spawn()
+            .unwrap(),
+    );
+    success(&output);
+    assert!(f.home.join("client-ran").is_file());
+    assert!(!f.home.join("provider-ran").exists());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("dot ("));
+
+    let output = fixture::finish(
+        f.command(&["dot"])
+            .env_remove("DOT_TEST_TESTS_DIR")
+            .spawn()
+            .unwrap(),
+    );
+    success(&output);
+    assert!(f.home.join("provider-ran").is_file());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("dot ("));
+
+    std::fs::remove_file(f.home.join("provider-ran")).unwrap();
+    let output = fixture::finish(
+        f.command(&[])
+            .env_remove("DOT_TEST_TESTS_DIR")
+            .env("DOT_TEST_INCLUDE_PROVIDER", "1")
+            .spawn()
+            .unwrap(),
+    );
+    success(&output);
+    assert!(f.home.join("client-ran").is_file());
+    assert!(f.home.join("provider-ran").is_file());
+
+    let output = fixture::finish(
+        f.command(&[])
+            .env_remove("DOT_TEST_TESTS_DIR")
+            .env("DOT_TEST_INCLUDE_PROVIDER", "yes")
+            .spawn()
+            .unwrap(),
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stderr, b"DOT_TEST_INCLUDE_PROVIDER must be 0 or 1\n");
+}
+
+#[test]
 fn native_argument_errors_precede_execution() {
     let f = Fixture::new();
     f.suite("core", "exit 0");
@@ -138,6 +204,66 @@ fn native_revalidates_queued_suite_before_spawn() {
 }
 
 #[test]
+fn native_discovery_refuses_an_unsafe_suite_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new();
+    let extensions = f.scope.path().join("extensions");
+    fixture::executable(&extensions.join("tests/unsafe-test"), "exit 0");
+    std::fs::create_dir_all(f.home.join(".config/dot")).unwrap();
+    std::fs::write(
+        f.home.join(".config/dot/config"),
+        format!(
+            "version=1\nextension_api=1\nextensions_dir={}\ndependency_provider=none\n",
+            extensions.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        extensions.join("tests/unsafe-test"),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    let output = fixture::finish(
+        f.command(&["--list"])
+            .env_remove("DOT_TEST_TESTS_DIR")
+            .spawn()
+            .unwrap(),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        output.stderr,
+        format!(
+            "dot: unsafe test extension: {}\n",
+            extensions.join("tests/unsafe-test").display()
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
+fn public_result_reporter_rejects_noncanonical_counts_without_writing() {
+    let f = Fixture::new();
+    let result = f.scope.path().join("result");
+    std::fs::write(&result, b"").unwrap();
+    let output = std::process::Command::new(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lib/dot/public/test-reporter-v1"),
+    )
+    .args(["complete", "1", "08"])
+    .env_clear()
+    .env("PATH", std::env::var_os("PATH").unwrap())
+    .env("DOT_TEST_RESULT_FILE", &result)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(output.stderr, b"");
+    assert_eq!(std::fs::read(result).unwrap(), b"");
+}
+
+#[test]
 fn native_skip_detail_preserves_spaces() {
     let f = Fixture::new();
     f.suite(
@@ -147,14 +273,6 @@ fn native_skip_detail_preserves_spaces() {
     let output = f.run(&[]);
     success(&output);
     assert!(String::from_utf8_lossy(&output.stdout).contains(":   reason  \n"));
-}
-
-#[test]
-fn native_complete_shell_command_oracle_with_poisoned_engine() {
-    let f = Fixture::new();
-    let output = f.oracle("test-command-test");
-    success(&output);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("test-command-test: ok"));
 }
 
 #[test]
@@ -280,7 +398,7 @@ fn native_registered_source_keeps_non_utf8_path_identity() {
     std::fs::write(tests.join("helpers.sh"), "").unwrap();
     fixture::executable(
         &tests.join("source-test"),
-        "printf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
+        "printf 'HOME=%s\\nSOURCE=%s\\nHOST=%s\\nPATH=%s\\n' \"$HOME\" \"$DOT_TEST_SOURCE_HOME\" \"$DOT_TEST_HOST_HOME\" \"$PATH\"\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
     );
     git(vec![
         "-C".into(),
@@ -314,10 +432,53 @@ fn native_registered_source_keeps_non_utf8_path_identity() {
     let output = fixture::finish(
         f.command(&["--list"])
             .env_remove("DOT_TEST_TESTS_DIR")
-            .env("DOT_TEST_SOURCE_HOME", source)
+            .env("DOT_TEST_SOURCE_HOME", &source)
             .spawn()
             .unwrap(),
     );
     success(&output);
     assert_eq!(output.stdout, b"dot\nsource\n");
+
+    let output = fixture::finish(
+        f.command(&["-s", "-v", "source"])
+            .env_remove("DOT_TEST_TESTS_DIR")
+            .env("DOT_TEST_SOURCE_HOME", &source)
+            .spawn()
+            .unwrap(),
+    );
+    success(&output);
+    let mut home_line = b"HOME=".to_vec();
+    home_line.extend_from_slice(source.as_os_str().as_encoded_bytes());
+    home_line.push(b'\n');
+    assert!(
+        output
+            .stdout
+            .windows(home_line.len())
+            .any(|part| part == home_line)
+    );
+    let mut source_line = b"SOURCE=".to_vec();
+    source_line.extend_from_slice(source.as_os_str().as_encoded_bytes());
+    source_line.push(b'\n');
+    assert!(
+        output
+            .stdout
+            .windows(source_line.len())
+            .any(|part| part == source_line)
+    );
+    let host_line = format!("HOST={}\n", f.home.display());
+    assert!(
+        output
+            .stdout
+            .windows(host_line.len())
+            .any(|part| part == host_line.as_bytes())
+    );
+    let mut source_bin = b"PATH=".to_vec();
+    source_bin.extend_from_slice(source.as_os_str().as_encoded_bytes());
+    source_bin.extend_from_slice(b"/.local/bin:");
+    assert!(
+        output
+            .stdout
+            .windows(source_bin.len())
+            .any(|part| part == source_bin)
+    );
 }

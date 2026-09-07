@@ -1,15 +1,13 @@
 //! Client pre-sync extensions from `lib/dot/pre-sync.sh`.
 //!
-//! Ports `_dot_pre_sync_specs` (enumerate and validate the
+//! Owns pre-sync specification discovery (enumerate and validate the
 //! `pre-sync.d` entry points) and `_run_pre_sync_extensions` (run
 //! each entry point with a fresh one-use overlay context). The
-//! shell's worker spawn (`_dot_extension_worker_run` from
-//! `extension-worker-launch.sh`) belongs to a later slice, so
-//! [`run`] takes the spawn as a caller-supplied [`Runner`]
+//! [`run`] takes process execution as a caller-supplied [`Runner`]
 //! closure; everything around it — stage gate, spec enumeration,
 //! per-extension scratch directory plus `result` channel, context
 //! creation, the failure warning, and break-on-first-failure — is
-//! the port.
+//! is owned here. Production supplies the hardened worker implementation.
 //!
 //! Like the earlier ports the library never prints: spec identity
 //! failures carry the exact `dot: ...` line the shell emits, and

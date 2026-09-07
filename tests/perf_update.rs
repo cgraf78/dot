@@ -2,16 +2,16 @@
 //!
 //! Measures wall-clock `dot update` on a synthetic client (base + three
 //! overlays, local `file://` remotes) in two modes: clean (nothing
-//! changed — the cron steady state) and dirty (one pushed change to
-//! converge). This is the priority benchmark from the port plan:
+//! changed — the cron steady state) and dirty (a distinct pushed change to
+//! converge for every sample). This is the priority benchmark from the port plan:
 //! startup budgets in `tests/perf_budget.rs` cannot catch an update
 //! regression, only this harness can.
 //!
-//! Each mode runs on twin clients (one per engine) built from the same
-//! remotes, so the shell oracle (`bin/dot`) and the Rust binary converge
-//! byte-identical HOME trees from identical starting state without
-//! sharing mutable state. The overlays are REAL: descriptors live in a
-//! scratch `XDG_CONFIG_HOME/dot/overlays.d` per twin (kept outside
+//! Each mode runs on an isolated native client. Historical Bash comparison is
+//! performed separately against the pre-cutover revision, so this regression
+//! gate cannot accidentally compare the Rust binary with itself. The overlays
+//! are REAL: descriptors live in a scratch `XDG_CONFIG_HOME/dot/overlays.d`
+//! (kept outside
 //! `$HOME` so status stays clean, per the `tests/cli.rs` repos-client
 //! convention), and the harness asserts the overlay payloads actually
 //! landed in the converged tree. An earlier revision set
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 /// enough to run in CI without dominating the suite.
 const OVERLAYS: usize = 3;
 const FILES_PER_OVERLAY: usize = 20;
-const RUNS: usize = 5;
+const RUNS: usize = 20;
 /// Payload files are namespaced per overlay (`{name}-file-NNN.txt`):
 /// identical names across overlays would collide, and colliding stacks
 /// never settle — every update re-steals each link in descriptor order
@@ -42,30 +42,17 @@ const RUNS: usize = 5;
 /// steady state it exists to gate. Namespaced files keep the same
 /// per-file/per-repo costs while letting links settle to `current`.
 /// Ceilings calibrated on the reference host (nas, 2026-09-05) over
-/// three runs of 5 samples per engine per mode: clean p95 max 1899ms
-/// (shell 1866-1899, Rust 1819-1884), dirty-mix p95 max 2435ms (shell
-/// 2119-2184, Rust 2056-2435). Real overlay convergence costs ~6x the
+/// historical runs of the same fixture shape. Real overlay convergence costs ~6x the
 /// old hollow base-only numbers (clean p95 328ms with zero overlays
 /// discovered) — four `file://` fetches plus 60 link checks per update
 /// — so the ceilings move with the fixture, not with any implementation
 /// change. Budgets sit ~3-4x above measured (clean 6000ms = 3.2x,
-/// dirty 10000ms = 4.1x) to absorb CI variance; the dirty margin stays
-/// wider because its p95 rides on a single converging sample per twin.
-/// Later slices must drive the Rust implementation DURABLY under the
-/// shell numbers, not merely under these ceilings (see plan).
+/// dirty 10000ms) to absorb CI variance. Separate
+/// pre-cutover measurements prove the speedup; these ceilings prevent it from
+/// regressing afterward.
 const CLEAN_UPDATE_BUDGET_MS: u128 = 6_000;
 const DIRTY_UPDATE_BUDGET_MS: u128 = 10_000;
 const PERF_BUDGET_MULTIPLIER_ENV: &str = "DOT_PERF_BUDGET_MULTIPLIER";
-
-/// Engine under test: the shell oracle or the Rust binary. Each runs on
-/// its own twin client so timed updates never share mutable state.
-#[derive(Debug, Clone, Copy)]
-enum Engine {
-    /// The production shell (`bin/dot` under the pinned bash runtime).
-    Shell,
-    /// The Rust binary under test.
-    Rust,
-}
 
 fn budget_ms(base: u128) -> u128 {
     let multiplier: f64 = std::env::var(PERF_BUDGET_MULTIPLIER_ENV)
@@ -76,9 +63,9 @@ fn budget_ms(base: u128) -> u128 {
     ((base as f64) * multiplier) as u128
 }
 
-/// Shared counter-based scratch (see `dot::test_support`): pid plus a
+/// Shared counter-based scratch (see `dot_test_support`): pid plus a
 /// monotonic counter, no wall-clock reads.
-type Scratch = dot::test_support::TempDir;
+type Scratch = dot_test_support::TempDir;
 
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -133,18 +120,12 @@ fn seed_remote(scratch: &Scratch, name: &str, branch: &str, prefix: &str, files:
     origin
 }
 
-/// The production shell oracle: `bin/dot` under the pinned bash 4+
-/// runtime from `dot::test_support` (never a bare `bash`, which follows
-/// the child's env — see `test_support::bash`).
-fn shell_cmd() -> Command {
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin/dot"));
-    cmd
-}
-
-/// The Rust binary under test.
-fn rust_cmd() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_dot"))
+/// The engine under test. CI uses the just-built native binary; maintainers
+/// can supply an explicit historical executable to reproduce comparison data.
+fn dot_cmd() -> Command {
+    Command::new(
+        std::env::var_os("DOT_PERF_EXECUTABLE").unwrap_or_else(|| env!("CARGO_BIN_EXE_dot").into()),
+    )
 }
 
 /// Controlled client environment, mirroring `client_env` in
@@ -153,7 +134,8 @@ fn rust_cmd() -> Command {
 /// per variable (never `.envs`): MSRV-clean and matches the oracle
 /// convention in `tests/cli.rs`.
 fn client_env(cmd: &mut Command, home: &Path, state: &Path, xdg: &Path) {
-    let repo = env!("CARGO_MANIFEST_DIR");
+    let repo = std::env::var_os("DOT_PERF_SOURCE_ROOT")
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into());
     let path = std::env::var_os("PATH").unwrap_or_default();
     let tmpdir = std::env::var_os("TMPDIR")
         .filter(|dir| !dir.is_empty())
@@ -182,22 +164,13 @@ fn client_env(cmd: &mut Command, home: &Path, state: &Path, xdg: &Path) {
 /// (not inherited) so progress spam neither floods the log nor perturbs
 /// timing with terminal writes.
 fn run_dot(
-    engine: Engine,
     home: &Path,
     state: &Path,
     xdg: &Path,
     args: &[&str],
 ) -> (Duration, std::process::Output) {
-    let mut cmd = match engine {
-        Engine::Shell => shell_cmd(),
-        Engine::Rust => rust_cmd(),
-    };
+    let mut cmd = dot_cmd();
     client_env(&mut cmd, home, state, xdg);
-    if matches!(engine, Engine::Shell) {
-        // The oracle resolves its library relative to the checkout,
-        // exactly like the `shell_dot` rows in `tests/update_run.rs`.
-        cmd.current_dir(env!("CARGO_MANIFEST_DIR"));
-    }
     for arg in args {
         cmd.arg(arg);
     }
@@ -211,7 +184,7 @@ fn run_dot(
     let elapsed = start.elapsed();
     assert!(
         output.status.success(),
-        "{engine:?} dot {args:?} failed: {}",
+        "native dot {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     (elapsed, output)
@@ -223,12 +196,9 @@ fn p95_ms(samples: &mut [u128]) -> u128 {
     samples[index.saturating_sub(1).min(samples.len() - 1)]
 }
 
-/// One twin client: `init --yes` into a fresh home/state/XDG triple,
+/// One client: `init --yes` into a fresh home/state/XDG triple,
 /// then register the overlay descriptors where discovery reads them
-/// (`${XDG_CONFIG_HOME}/dot/overlays.d`, per `docs/overlays.md`). Init
-/// always runs through the shell oracle — init parity is owned by its
-/// own suites — so both twins start from identical state and only
-/// `update` differs by engine.
+/// (`${XDG_CONFIG_HOME}/dot/overlays.d`, per `docs/overlays.md`).
 fn twin_client(
     scratch: &Scratch,
     tag: &str,
@@ -248,7 +218,6 @@ fn twin_client(
         std::fs::write(conf_dir.join(format!("overlay-{index}.conf")), conf).expect("write conf");
     }
     run_dot(
-        Engine::Shell,
         &home,
         &state,
         &xdg,
@@ -373,105 +342,83 @@ fn assert_overlays_converged(home: &Path) {
 /// Assert one engine's warm-up update actually discovered the fixture
 /// overlays. The stdout count row is stamp-free, so it pins discovery
 /// without normalizing timing output.
-fn assert_overlays_discovered(engine: Engine, stdout: &[u8]) {
+fn assert_overlays_discovered(stdout: &[u8]) {
     let text = String::from_utf8_lossy(stdout);
     assert!(
         text.contains(&format!("{OVERLAYS} overlays current")),
-        "{engine:?} update discovered no overlays (hollow base-only path): {text}"
+        "native update discovered no overlays (hollow base-only path): {text}"
     );
 }
 
 /// Time `RUNS` updates of one engine on its twin; returns the p95.
-fn timed_block(engine: Engine, home: &Path, state: &Path, xdg: &Path) -> u128 {
+fn timed_block(home: &Path, state: &Path, xdg: &Path) -> u128 {
     let mut samples = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
-        samples.push(run_dot(engine, home, state, xdg, &["update"]).0.as_millis());
+        samples.push(run_dot(home, state, xdg, &["update"]).0.as_millis());
     }
     p95_ms(&mut samples)
 }
 
+/// Time updates that each have one distinct upstream commit to converge.
+/// Preparing and pushing the commit is deliberately outside the timed region;
+/// the measured work starts when `dot update` observes the changed remote.
+fn timed_dirty_block(
+    home: &Path,
+    state: &Path,
+    xdg: &Path,
+    seed: &Path,
+    origin: &Path,
+) -> (u128, Vec<u8>) {
+    let payload = seed.join("home/overlay-0-file-000.txt");
+    let mut samples = Vec::with_capacity(RUNS);
+    let mut expected = Vec::new();
+    for index in 0..RUNS {
+        expected = format!("overlay-0 payload change-{index:02}\n").into_bytes();
+        std::fs::write(&payload, &expected).expect("write dirty payload");
+        git(seed, &["add", "home/overlay-0-file-000.txt"]);
+        git(seed, &["commit", "-qm", &format!("change-{index:02}")]);
+        git(
+            seed,
+            &["push", "-q", &origin.to_string_lossy(), "HEAD:main"],
+        );
+        samples.push(run_dot(home, state, xdg, &["update"]).0.as_millis());
+    }
+    (p95_ms(&mut samples), expected)
+}
+
 #[test]
-#[ignore = "CI runs this explicitly: it builds a fixture client and times shell and Rust updates"]
+#[ignore = "CI runs this explicitly: it builds a fixture client and times native updates"]
 fn clean_and_dirty_update_within_budget() {
     let scratch = Scratch::new("perf-update").expect("scratch dir");
     let (overlay_origins, base_origin) = shared_remotes(&scratch);
-    let (home_shell, state_shell, xdg_shell) =
-        twin_client(&scratch, "shell", &overlay_origins, &base_origin);
-    let (home_rust, state_rust, xdg_rust) =
-        twin_client(&scratch, "rust", &overlay_origins, &base_origin);
+    let (home, state, xdg) = twin_client(&scratch, "native", &overlay_origins, &base_origin);
 
     // Warm-up: the first update converges the fresh clones (init only
     // fetches) and populates caches exactly like cron does; the second
     // reaches the clean steady state the timed block measures. Only the
     // steady-state wording is pinned — the first run reports `changed`.
-    for (engine, home, state, xdg) in [
-        (Engine::Shell, &home_shell, &state_shell, &xdg_shell),
-        (Engine::Rust, &home_rust, &state_rust, &xdg_rust),
-    ] {
-        run_dot(engine, home, state, xdg, &["update"]);
-        let (_, steady) = run_dot(engine, home, state, xdg, &["update"]);
-        assert_overlays_discovered(engine, &steady.stdout);
-    }
-    assert_overlays_converged(&home_shell);
-    assert_overlays_converged(&home_rust);
-    assert_eq!(
-        snapshot_tree(&home_rust),
-        snapshot_tree(&home_shell),
-        "shell and Rust converged trees differ after warm-up"
-    );
-    let before = snapshot_tree(&home_shell);
+    run_dot(&home, &state, &xdg, &["update"]);
+    let (_, steady) = run_dot(&home, &state, &xdg, &["update"]);
+    assert_overlays_discovered(&steady.stdout);
+    assert_overlays_converged(&home);
+    let before = snapshot_tree(&home);
 
-    let shell_clean_p95 = timed_block(Engine::Shell, &home_shell, &state_shell, &xdg_shell);
-    let rust_clean_p95 = timed_block(Engine::Rust, &home_rust, &state_rust, &xdg_rust);
-    eprintln!(
-        "clean update p95: shell {shell_clean_p95}ms, Rust {rust_clean_p95}ms over {RUNS} runs"
-    );
+    let clean_p95 = timed_block(&home, &state, &xdg);
+    eprintln!("engine clean update p95: {clean_p95}ms over {RUNS} runs");
 
-    // Dirty: push one changed file to overlay-0's remote (namespaced
-    // payloads mean no overlay shadows another, so the change is live in
-    // the converged tree), then converge it on both twins.
+    // Dirty: every timed sample receives a fresh change to overlay-0's remote.
+    // Namespaced payloads mean no overlay shadows another, so each change is
+    // observable in the converged tree.
     let overlay_seed = scratch.path().join("overlay-0-seed");
-    std::fs::write(
-        overlay_seed.join("home/overlay-0-file-000.txt"),
-        "overlay-0 payload CHANGED\n",
-    )
-    .expect("write");
-    git(&overlay_seed, &["add", "home/overlay-0-file-000.txt"]);
-    git(&overlay_seed, &["commit", "-qm", "change"]);
     let overlay_origin = overlay_origins[0].clone();
-    git(
-        &overlay_seed,
-        &["push", "-q", &overlay_origin.to_string_lossy(), "HEAD:main"],
-    );
+    let (dirty_p95, changed) =
+        timed_dirty_block(&home, &state, &xdg, &overlay_seed, &overlay_origin);
+    eprintln!("engine dirty update p95: {dirty_p95}ms over {RUNS} runs");
 
-    let shell_dirty_p95 = timed_block(Engine::Shell, &home_shell, &state_shell, &xdg_shell);
-    let rust_dirty_p95 = timed_block(Engine::Rust, &home_rust, &state_rust, &xdg_rust);
-    eprintln!(
-        "dirty-mix update p95: shell {shell_dirty_p95}ms, Rust {rust_dirty_p95}ms over {RUNS} runs"
-    );
-    // NOTE: after each twin's first dirty run there is nothing new to
-    // pull; subsequent samples measure the clean path again. The first
-    // sample per twin is the dirty one that matters; p95 over the mix
-    // still gates the ceiling while RUNS>1 keeps variance honest.
+    let actual = std::fs::read(home.join("overlay-0-file-000.txt")).expect("changed file");
+    assert_eq!(actual, changed, "native update did not converge the change");
 
-    // The dirty change reached both converged trees, identically.
-    let changed = b"overlay-0 payload CHANGED\n".to_vec();
-    for home in [&home_shell, &home_rust] {
-        let actual = std::fs::read(home.join("overlay-0-file-000.txt")).expect("changed file");
-        assert_eq!(
-            actual,
-            changed,
-            "{} did not converge the dirty change",
-            home.display()
-        );
-    }
-    assert_eq!(
-        snapshot_tree(&home_rust),
-        snapshot_tree(&home_shell),
-        "shell and Rust converged trees differ after dirty update"
-    );
-
-    let after = snapshot_tree(&home_shell);
+    let after = snapshot_tree(&home);
     assert_eq!(
         after.iter().map(|(p, _)| p).collect::<Vec<_>>(),
         before.iter().map(|(p, _)| p).collect::<Vec<_>>(),
@@ -479,19 +426,11 @@ fn clean_and_dirty_update_within_budget() {
     );
 
     assert!(
-        shell_clean_p95 <= budget_ms(CLEAN_UPDATE_BUDGET_MS),
-        "shell clean p95 {shell_clean_p95}ms exceeds budget"
+        clean_p95 <= budget_ms(CLEAN_UPDATE_BUDGET_MS),
+        "native clean p95 {clean_p95}ms exceeds budget"
     );
     assert!(
-        rust_clean_p95 <= budget_ms(CLEAN_UPDATE_BUDGET_MS),
-        "Rust clean p95 {rust_clean_p95}ms exceeds budget"
-    );
-    assert!(
-        shell_dirty_p95 <= budget_ms(DIRTY_UPDATE_BUDGET_MS),
-        "shell dirty p95 {shell_dirty_p95}ms exceeds budget"
-    );
-    assert!(
-        rust_dirty_p95 <= budget_ms(DIRTY_UPDATE_BUDGET_MS),
-        "Rust dirty p95 {rust_dirty_p95}ms exceeds budget"
+        dirty_p95 <= budget_ms(DIRTY_UPDATE_BUDGET_MS),
+        "native dirty p95 {dirty_p95}ms exceeds budget"
     );
 }

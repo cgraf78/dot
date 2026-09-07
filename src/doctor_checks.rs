@@ -1,25 +1,24 @@
-//! Doctor check family (slice 72).
+//! Built-in doctor checks.
 //!
-//! Ports the nine check functions in `lib/dot/doctor/lock.sh`,
+//! Owns the health checks formerly grouped in `lib/dot/doctor/lock.sh`,
 //! `lib/dot/doctor/merges.sh`, `lib/dot/doctor/overlays.sh`,
 //! `lib/dot/doctor/provider.sh`, and `lib/dot/doctor/repos.sh`:
 //! [`check_update_lock`], [`check_merges`],
 //! [`check_profile_lifecycle`], [`check_overlays`],
 //! [`shdeps_binary`], [`check_provider`],
 //! [`completed_identity_matches_home`], [`is_client_checkout`],
-//! and [`check_base_repo`]. The `doctor.sh` orchestrator
-//! (`_dot_doctor`) stays shell-side in another lane.
+//! and [`check_base_repo`]. [`crate::doctor`] owns orchestration.
 //!
 //! Everything here is a pure function of explicit inputs, the
-//! established slice convention: shell globals (`DOT_*`,
+//! established boundary: shell-era globals (`DOT_*`,
 //! `ACTIVE_OVERLAYS`, lifecycle arrays) arrive as parameters, and
-//! helper boundaries owned by other slices arrive either as data or
+//! helper boundaries owned by other modules arrive either as data or
 //! as small predicates documented per function. Filesystem and `git`
 //! probes the check itself performs (`-e`/`-d`/`-L` tests,
 //! `readlink`, `rev-parse`, manifest reads) run in-process so the
 //! differential tests observe both engines on the same fixtures.
 //!
-//! Reused sibling ports (not reimplemented):
+//! Reused sibling modules (not reimplemented):
 //!
 //! - [`crate::update_lock`] backs [`check_update_lock`] (owner
 //!   read, liveness, initializing window).
@@ -37,12 +36,12 @@
 //!   disabled so parity tests can byte-compare against the live shell.
 //! - `_dr_tilde` / `_dr_symlink_points_to` (`doctor/paths.sh`) are
 //!   mirrored as private helpers: display-only glue the checks need
-//!   to spell details, owned by the paths slice when it lands.
+//!   to spell details, with display policy owned by `doctor_paths`.
 //! - `local_validate` (`_overlay_local_source_validate`,
 //!   `find`-walk plus per-entry checks), the profile deactivation
 //!   probe, the shdeps installer selection, and the lifecycle ledger
 //!   load stay caller concerns: they encode trust policy owned by
-//!   other slices, so tests inject their outcomes.
+//!   other modules, so tests inject their outcomes.
 //! - The `_dr_check_merges` "inventory is invalid" branch only
 //!   fires when the `wc -l` pipeline itself fails (a bad inventory
 //!   still prints zero lines through `sort`, whose exit status

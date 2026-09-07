@@ -1,25 +1,17 @@
-//! Parallel overlay pull parity for `dot update` (engine-parallel-pull lane).
+//! Native parallel overlay pull coverage for `dot update`.
 //!
 //! The native parallel fan-out itself lives in [`dot::repos_pull_fleet`]
 //! (scoped threads bounded by `DOT_UPDATE_JOBS`, falling back to the
 //! serial path when scratch allocation fails); the `update`/`pull`
 //! dispatcher arm ([`dot::cli::run`] via `update_run`) drives that native
-//! implementation directly. This suite pins its differential contract
-//! against the frozen shell oracle on a three-overlay
-//! `file://` fixture (the speedup fixture):
+//! implementation directly. This suite exercises a three-overlay `file://`
+//! fixture (the speedup fixture):
 //!
-//! - clean and pushed-change updates agree with the shell (`bin/dot`)
-//!   on exit codes, streams, and converged HOME trees, both with the
-//!   default job bound and with `DOT_UPDATE_JOBS=2`;
-//! - the same fixture converges byte-identically when the shell and
-//!   the Rust binary update it in turn (shell-then-Rust, then shell
-//!   again for stability), not just on twin fixtures;
-//! - dirty overlays (an uncommitted local edit), fetch failures (a
-//!   missing overlay remote), config rejection (exit `2`), and a held
-//!   update lock (exit `75`) agree on codes and trees;
-//! - wall-clock medians for shell vs Rust updates on the fixture are
-//!   measured and reported (see `report_wall_clock`), so the lane's
-//!   speedup claim — or its absence — carries numbers.
+//! - clean and pushed-change updates converge with the default job bound and
+//!   with `DOT_UPDATE_JOBS=2`;
+//! - dirty overlays, fetch failures, config rejection (exit `2`), and a held
+//!   update lock (exit `75`) retain their native contracts;
+//! - clean wall-clock medians are reported as a native regression signal.
 //!
 //! Each twin side runs on its own HOME/state pair built from the same
 //! remotes, so the two updates never share mutable state. Stdout
@@ -43,13 +35,12 @@ const OVERLAYS: usize = 3;
 /// Payload files per overlay: enough fetch/pull substance to time,
 /// small enough to stay fast under CI.
 const FILES_PER_OVERLAY: usize = 12;
-/// Timed update iterations per engine in
-/// `report_wall_clock_three_overlay_shell_vs_rust`.
+/// Timed native update iterations in `report_native_wall_clock_three_overlay`.
 const TIMING_RUNS: usize = 3;
 
 /// Scratch helper shared with the other parity suites: pid plus a
 /// monotonic counter, no wall-clock reads.
-type Scratch = dot::test_support::TempDir;
+type Scratch = dot_test_support::TempDir;
 
 /// The Rust binary under test.
 fn bin() -> Command {
@@ -104,50 +95,21 @@ fn client_env(
 }
 
 #[test]
-fn twin_commands_pin_the_same_reload_shell() {
+fn command_pins_the_reload_shell() {
     let scratch = Scratch::new("parpull-shell-input").expect("scratch dir");
     let home = scratch.path().join("home");
     let state = scratch.path().join("state");
-    let mut shell = Command::new("bash");
-    let mut rust = bin();
-    client_env(&mut shell, &home, &state, None, None);
-    client_env(&mut rust, &home, &state, None, None);
-    let shell_value = shell
+    let mut command = bin();
+    client_env(&mut command, &home, &state, None, None);
+    let value = command
         .get_envs()
         .find(|(key, _)| *key == "SHELL")
         .and_then(|(_, value)| value);
-    let rust_value = rust
-        .get_envs()
-        .find(|(key, _)| *key == "SHELL")
-        .and_then(|(_, value)| value);
-    assert_eq!(shell_value, Some(OsStr::new("/bin/bash")));
-    assert_eq!(rust_value, shell_value);
-}
-
-/// The production shell oracle (`bin/dot`) with the same controlled
-/// client.
-fn shell_dot(
-    argv: &[&str],
-    home: &Path,
-    state: &Path,
-    jobs: Option<&str>,
-    policy: Option<&str>,
-) -> std::process::Output {
-    let mut cmd = Command::new("bash");
-    cmd.arg("bin/dot");
-    for arg in argv {
-        cmd.arg(arg);
-    }
-    client_env(&mut cmd, home, state, jobs, policy);
-    cmd.current_dir(env!("CARGO_MANIFEST_DIR"));
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.output().expect("run bin/dot")
+    assert_eq!(value, Some(OsStr::new("/bin/bash")));
 }
 
 /// The native Rust CLI with the same controlled client.
-fn rust_dot(
+fn dot(
     argv: &[&str],
     home: &Path,
     state: &Path,
@@ -162,7 +124,7 @@ fn rust_dot(
     }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd.output().expect("run Rust dot")
+    cmd.output().expect("run native dot")
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -278,7 +240,7 @@ fn twin_client(
     let state = scratch.path().join(format!("state-{tag}"));
     std::fs::create_dir_all(&home).expect("home");
     std::fs::create_dir_all(&state).expect("state");
-    let init = shell_dot(
+    let init = dot(
         &[
             "init",
             "--yes",
@@ -303,33 +265,8 @@ fn twin_client(
     (home, state)
 }
 
-/// Blank every occurrence of `needle` (a twin HOME path) so failure
-/// diagnostics that quote checkout paths compare across twins.
-fn blank_home(bytes: &[u8], needle: &[u8]) -> Vec<u8> {
-    if needle.is_empty() {
-        return bytes.to_vec();
-    }
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut rest = bytes;
-    while let Some(found) = rest.windows(needle.len()).position(|w| w == needle) {
-        out.extend_from_slice(&rest[..found]);
-        out.extend_from_slice(b"HOME");
-        rest = &rest[found + needle.len()..];
-    }
-    out.extend_from_slice(rest);
-    out
-}
-
-/// Normalize a captured stream for cross-twin comparison: timing
-/// stamps first, then both twin HOME paths.
-fn normalize(bytes: &[u8], home_a: &Path, home_b: &Path) -> Vec<u8> {
-    let timed = dot::progress_ui::normalize_elapsed(bytes);
-    let no_a = blank_home(&timed, home_a.to_string_lossy().as_bytes());
-    blank_home(&no_a, home_b.to_string_lossy().as_bytes())
-}
-
 /// Snapshot the converged HOME tree (regular files only, sorted) for
-/// byte comparison between shell and Rust runs. `.git` carries
+/// stability comparisons between native runs. `.git` carries
 /// checkout identity, `.dotfiles` carries the base checkout, and
 /// `.dot-backup` carries timestamped init-time safekeeping: none of
 /// them is converged content, so all three stay out of the
@@ -368,59 +305,19 @@ fn snapshot_tree(home: &Path) -> Vec<(String, Vec<u8>)> {
     entries
 }
 
-/// One parallel-pull row on twin clients: exit codes match, streams
-/// match after normalization, and the converged trees match byte for
-/// byte.
-fn check_update(
-    argv: &[&str],
-    home_shell: &Path,
-    state_shell: &Path,
-    home_rust: &Path,
-    state_rust: &Path,
-    jobs: Option<&str>,
-    policy: Option<&str>,
-) {
-    let shell = shell_dot(argv, home_shell, state_shell, jobs, policy);
-    let rust = rust_dot(argv, home_rust, state_rust, jobs, policy);
-    assert_eq!(rust.status.code(), shell.status.code(), "argv: {argv:?}");
-    assert_eq!(
-        normalize(&rust.stdout, home_shell, home_rust),
-        normalize(&shell.stdout, home_shell, home_rust),
-        "argv: {argv:?} stdout:\nrust:\n{}\nshell:\n{}",
-        String::from_utf8_lossy(&rust.stdout),
-        String::from_utf8_lossy(&shell.stdout),
+/// Run one update and require success.
+fn check_update(home: &Path, state: &Path, jobs: Option<&str>) -> std::process::Output {
+    let output = dot(&["update"], home, state, jobs, None);
+    assert!(
+        output.status.success(),
+        "update failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        normalize(&rust.stderr, home_shell, home_rust),
-        normalize(&shell.stderr, home_shell, home_rust),
-        "argv: {argv:?} stderr:\nrust:\n{}\nshell:\n{}",
-        String::from_utf8_lossy(&rust.stderr),
-        String::from_utf8_lossy(&shell.stderr),
-    );
-    assert_eq!(
-        snapshot_tree(home_rust),
-        snapshot_tree(home_shell),
-        "argv: {argv:?} converged trees differ"
-    );
+    output
 }
 
-/// Warm both twins into the clean steady state, like cron does, so
-/// the measured run converges nothing.
-fn warm_twins(
-    home_shell: &Path,
-    state_shell: &Path,
-    home_rust: &Path,
-    state_rust: &Path,
-    jobs: Option<&str>,
-) {
-    for (home, state) in [(home_shell, state_shell), (home_rust, state_rust)] {
-        let warm = shell_dot(&["update"], home, state, jobs, None);
-        assert!(
-            warm.status.success(),
-            "warm-up failed: {}",
-            String::from_utf8_lossy(&warm.stderr)
-        );
-    }
+fn warm(home: &Path, state: &Path, jobs: Option<&str>) {
+    check_update(home, state, jobs);
 }
 
 fn median_ms(samples: &mut [u128]) -> u128 {
@@ -428,69 +325,33 @@ fn median_ms(samples: &mut [u128]) -> u128 {
     samples[samples.len() / 2]
 }
 
-/// Time one `update` run; the caller asserts success.
-fn time_update(home: &Path, state: &Path, shell: bool, jobs: Option<&str>) -> Duration {
+fn time_update(home: &Path, state: &Path, jobs: Option<&str>) -> Duration {
     let start = Instant::now();
-    let output = if shell {
-        shell_dot(&["update"], home, state, jobs, None)
-    } else {
-        rust_dot(&["update"], home, state, jobs, None)
-    };
-    let elapsed = start.elapsed();
-    assert!(
-        output.status.success(),
-        "timed update failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    elapsed
+    check_update(home, state, jobs);
+    start.elapsed()
 }
 
 #[test]
-fn clean_three_overlay_update_matches_shell_and_converges() {
+fn clean_three_overlay_update_converges_and_is_stable() {
     let scratch = Scratch::new("parpull-clean").expect("scratch dir");
     let (overlays, base_origin) = shared_remotes(&scratch);
-    let (home_shell, state_shell) = twin_client(&scratch, "shell", &overlays, &base_origin, None);
-    let (home_rust, state_rust) = twin_client(&scratch, "rust", &overlays, &base_origin, None);
-    warm_twins(&home_shell, &state_shell, &home_rust, &state_rust, None);
-    check_update(
-        &["update"],
-        &home_shell,
-        &state_shell,
-        &home_rust,
-        &state_rust,
-        None,
-        None,
-    );
-    let rust = rust_dot(&["update"], &home_rust, &state_rust, None, None);
-    assert_eq!(rust.status.code(), Some(0));
+    let (home, state) = twin_client(&scratch, "native", &overlays, &base_origin, None);
+    warm(&home, &state, None);
+    let before = snapshot_tree(&home);
+    let output = check_update(&home, &state, None);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("current"));
+    assert_eq!(snapshot_tree(&home), before);
 }
 
 #[test]
-fn bounded_jobs_three_overlay_update_matches_shell() {
-    // The bounded fan-out (`DOT_UPDATE_JOBS=2`, like
-    // `_dot_update_jobs`) runs end to end on both engines: same
-    // bound, same codes, same converged trees.
+fn bounded_jobs_three_overlay_update_converges() {
     let scratch = Scratch::new("parpull-jobs").expect("scratch dir");
     let (overlays, base_origin) = shared_remotes(&scratch);
-    let (home_shell, state_shell) =
-        twin_client(&scratch, "shell", &overlays, &base_origin, Some("2"));
-    let (home_rust, state_rust) = twin_client(&scratch, "rust", &overlays, &base_origin, Some("2"));
-    warm_twins(
-        &home_shell,
-        &state_shell,
-        &home_rust,
-        &state_rust,
-        Some("2"),
-    );
-    check_update(
-        &["update"],
-        &home_shell,
-        &state_shell,
-        &home_rust,
-        &state_rust,
-        Some("2"),
-        None,
-    );
+    let (home, state) = twin_client(&scratch, "native", &overlays, &base_origin, Some("2"));
+    warm(&home, &state, Some("2"));
+    let before = snapshot_tree(&home);
+    check_update(&home, &state, Some("2"));
+    assert_eq!(snapshot_tree(&home), before);
 }
 
 #[test]
@@ -499,16 +360,7 @@ fn pushed_change_converges_on_three_overlays() {
     let (overlays, base_origin) = shared_remotes(&scratch);
     let overlay_seed = scratch.path().join("overlay-1-seed");
     let overlay_origin = scratch.path().join("overlay-1.git");
-    assert!(
-        overlays.iter().any(|origin| origin == &overlay_origin),
-        "fixture keeps overlay sharing its seed checkout"
-    );
-    let (home_shell, state_shell) = twin_client(&scratch, "shell", &overlays, &base_origin, None);
-    let (home_rust, state_rust) = twin_client(&scratch, "rust", &overlays, &base_origin, None);
-    // Push one new file to the shared overlay-1 remote: both twins
-    // converge the same change through the parallel fan-out. A new
-    // `only-1` file (not an edit of a shared `file-NNN` name) keeps
-    // later overlays from winning the same-path collision over it.
+    let (home, state) = twin_client(&scratch, "native", &overlays, &base_origin, None);
     std::fs::write(overlay_seed.join("home/only-1.txt"), "overlay-1 unique\n").expect("write");
     git(&overlay_seed, &["add", "home/only-1.txt"]);
     git(&overlay_seed, &["commit", "-qm", "change"]);
@@ -516,174 +368,67 @@ fn pushed_change_converges_on_three_overlays() {
         &overlay_seed,
         &["push", "-q", &overlay_origin.to_string_lossy(), "HEAD:main"],
     );
-    check_update(
-        &["update"],
-        &home_shell,
-        &state_shell,
-        &home_rust,
-        &state_rust,
-        None,
-        None,
-    );
-    for home in [&home_shell, &home_rust] {
-        let bytes = std::fs::read(home.join("only-1.txt")).expect("converged file");
-        assert_eq!(bytes, b"overlay-1 unique\n", "home: {home:?}");
-    }
-}
-
-#[test]
-fn same_fixture_shell_then_rust_converges_identically() {
-    // Same-fixture sequencing (not twins): the shell converges the
-    // fixture, a pushed change lands, the Rust binary converges the
-    // same fixture, and a final shell run proves the tree is stable
-    // across engines — byte-identical, not just equally successful.
-    let scratch = Scratch::new("parpull-same").expect("scratch dir");
-    let (_overlays, base_origin) = shared_remotes(&scratch);
-    let overlay_seed = scratch.path().join("overlay-2-seed");
-    let overlay_origin = scratch.path().join("overlay-2.git");
-    let home = scratch.path().join("home-same");
-    let state = scratch.path().join("state-same");
-    std::fs::create_dir_all(&home).expect("home");
-    std::fs::create_dir_all(&state).expect("state");
-    let init = shell_dot(
-        &[
-            "init",
-            "--yes",
-            &format!("file://{}", base_origin.display()),
-        ],
-        &home,
-        &state,
-        None,
-        None,
-    );
-    assert!(
-        init.status.success(),
-        "init failed: {}",
-        String::from_utf8_lossy(&init.stderr)
-    );
-    let conf_dir = home.join(".config/dot/overlays.d");
-    std::fs::create_dir_all(&conf_dir).expect("conf dir");
-    for index in 0..OVERLAYS {
-        let origin = scratch.path().join(format!("overlay-{index}.git"));
-        let conf = format!("url=file://{}\n", origin.display());
-        std::fs::write(conf_dir.join(format!("overlay-{index}.conf")), conf).expect("write conf");
-    }
-    let shell = shell_dot(&["update"], &home, &state, None, None);
-    assert!(
-        shell.status.success(),
-        "shell update failed: {}",
-        String::from_utf8_lossy(&shell.stderr)
-    );
-    let before = snapshot_tree(&home);
-    // Overlay-2 is the last overlay in descriptor order, so it wins
-    // the same-path collision on `file-001.txt` at `$HOME`.
-    std::fs::write(
-        overlay_seed.join("home/file-001.txt"),
-        "overlay-2 payload CHANGED\n",
-    )
-    .expect("write");
-    git(&overlay_seed, &["add", "home/file-001.txt"]);
-    git(&overlay_seed, &["commit", "-qm", "change"]);
-    git(
-        &overlay_seed,
-        &["push", "-q", &overlay_origin.to_string_lossy(), "HEAD:main"],
-    );
-    let rust = rust_dot(&["update"], &home, &state, None, None);
-    assert_eq!(rust.status.code(), shell.status.code());
-    assert!(
-        rust.status.success(),
-        "rust update failed: {}",
-        String::from_utf8_lossy(&rust.stderr)
-    );
-    let converged = snapshot_tree(&home);
-    assert_ne!(converged, before, "the pushed change must converge");
-    let bytes = std::fs::read(home.join("file-001.txt")).expect("converged file");
-    assert_eq!(bytes, b"overlay-2 payload CHANGED\n");
-    let again = shell_dot(&["update"], &home, &state, None, None);
-    assert!(again.status.success());
+    check_update(&home, &state, None);
     assert_eq!(
-        snapshot_tree(&home),
-        converged,
-        "shell re-update after the Rust update must be a byte-identical no-op"
+        std::fs::read(home.join("only-1.txt")).expect("converged file"),
+        b"overlay-1 unique\n"
     );
 }
 
 #[test]
-fn dirty_overlay_matches_shell() {
-    // An uncommitted local edit inside one overlay checkout: both
-    // engines see the same dirty worktree and must agree on the
-    // outcome (whatever the rebase/autostash path decides).
+fn repeated_native_updates_are_byte_stable() {
+    let scratch = Scratch::new("parpull-repeat").expect("scratch dir");
+    let (overlays, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "native", &overlays, &base_origin, None);
+    check_update(&home, &state, None);
+    let converged = snapshot_tree(&home);
+    check_update(&home, &state, None);
+    assert_eq!(snapshot_tree(&home), converged);
+}
+
+#[test]
+fn dirty_overlay_preserves_local_edit() {
     let scratch = Scratch::new("parpull-dirty").expect("scratch dir");
     let (overlays, base_origin) = shared_remotes(&scratch);
-    let (home_shell, state_shell) = twin_client(&scratch, "shell", &overlays, &base_origin, None);
-    let (home_rust, state_rust) = twin_client(&scratch, "rust", &overlays, &base_origin, None);
-    warm_twins(&home_shell, &state_shell, &home_rust, &state_rust, None);
-    for home in [&home_shell, &home_rust] {
-        let dirty = home.join(".dotfiles-overlay-1/home/file-002.txt");
-        std::fs::write(&dirty, "local dirty edit\n").expect("write dirty");
-    }
-    check_update(
-        &["update"],
-        &home_shell,
-        &state_shell,
-        &home_rust,
-        &state_rust,
-        None,
-        None,
+    let (home, state) = twin_client(&scratch, "native", &overlays, &base_origin, None);
+    warm(&home, &state, None);
+    let dirty = home.join(".dotfiles-overlay-1/home/file-002.txt");
+    std::fs::write(&dirty, "local dirty edit\n").expect("write dirty");
+    check_update(&home, &state, None);
+    assert_eq!(
+        std::fs::read(dirty).expect("dirty file"),
+        b"local dirty edit\n"
     );
 }
 
 #[test]
-fn fetch_failure_matches_shell() {
-    // A missing overlay remote fails the fetch on both engines: same
-    // exit code (nonzero), same converged trees.
+fn fetch_failure_is_nonzero_and_preserves_tree() {
     let scratch = Scratch::new("parpull-fetchfail").expect("scratch dir");
     let (overlays, base_origin) = shared_remotes(&scratch);
-    let (home_shell, state_shell) = twin_client(&scratch, "shell", &overlays, &base_origin, None);
-    let (home_rust, state_rust) = twin_client(&scratch, "rust", &overlays, &base_origin, None);
-    warm_twins(&home_shell, &state_shell, &home_rust, &state_rust, None);
+    let (home, state) = twin_client(&scratch, "native", &overlays, &base_origin, None);
+    warm(&home, &state, None);
+    let before = snapshot_tree(&home);
     let gone = scratch.path().join("overlay-2.git");
     let kept = scratch.path().join("overlay-2.git.kept");
-    assert!(
-        overlays.iter().any(|origin| origin == &gone),
-        "the removed remote backs overlay-2"
-    );
     std::fs::rename(&gone, &kept).expect("remove remote");
-    let shell = shell_dot(&["update"], &home_shell, &state_shell, None, None);
-    let rust = rust_dot(&["update"], &home_rust, &state_rust, None, None);
-    assert_eq!(rust.status.code(), shell.status.code());
-    assert_ne!(rust.status.code(), Some(0), "a missing remote must fail");
-    assert_eq!(
-        snapshot_tree(&home_rust),
-        snapshot_tree(&home_shell),
-        "failed-fetch trees differ"
-    );
+    let output = dot(&["update"], &home, &state, None, None);
+    assert!(!output.status.success());
+    assert_eq!(snapshot_tree(&home), before);
     std::fs::rename(&kept, &gone).expect("restore remote");
 }
 
 #[test]
-fn config_rejection_reports_2_like_shell() {
-    // `dot_config_load || exit 2`: a bogus shdeps policy rejects the
-    // run before any repository moves on both engines.
+fn config_rejection_reports_2() {
     let scratch = Scratch::new("parpull-config2").expect("scratch dir");
     let (overlays, base_origin) = shared_remotes(&scratch);
-    let (home_shell, state_shell) = twin_client(&scratch, "shell", &overlays, &base_origin, None);
-    let (home_rust, state_rust) = twin_client(&scratch, "rust", &overlays, &base_origin, None);
-    let shell = shell_dot(&["update"], &home_shell, &state_shell, None, Some("bogus"));
-    let rust = rust_dot(&["update"], &home_rust, &state_rust, None, Some("bogus"));
-    assert_eq!(shell.status.code(), Some(2));
-    assert_eq!(rust.status.code(), Some(2));
-    assert_eq!(
-        normalize(&rust.stderr, &home_shell, &home_rust),
-        normalize(&shell.stderr, &home_shell, &home_rust),
-    );
+    let (home, state) = twin_client(&scratch, "native", &overlays, &base_origin, None);
+    let output = dot(&["update"], &home, &state, None, Some("bogus"));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("DOT_SHDEPS_UPDATE_POLICY"));
 }
 
 #[test]
 fn lock_busy_reports_75_on_three_overlay_fixture() {
-    // Hold the update lock from this process (a live owner), then run
-    // both binaries against the same state: each must refuse with
-    // exit 75 and the shell's exact busy diagnostic, naming our pid.
     use dot::log::Log;
     let scratch = Scratch::new("parpull-busy").expect("scratch dir");
     let state = scratch.path().join("state");
@@ -693,48 +438,31 @@ fn lock_busy_reports_75_on_three_overlay_fixture() {
     let log = Log::new(false, false);
     let mut sink = Vec::new();
     let guard = dot::update_lock::acquire(&state, false, &log, None, &mut sink).expect("hold lock");
-    // A fresh acquisition warns nothing; the busy diagnostic below
-    // names this live owner.
     assert!(sink.is_empty());
-    let pid = std::process::id();
-    let expected = format!("  warning: dot update already running (pid {pid})\n");
-    let shell = shell_dot(&["update"], &home, &state, None, None);
-    assert_eq!(shell.status.code(), Some(75));
-    assert_eq!(shell.stderr, expected.as_bytes());
-    let rust = rust_dot(&["update"], &home, &state, None, None);
-    assert_eq!(rust.status.code(), Some(75));
-    assert_eq!(rust.stderr, expected.as_bytes());
-    assert!(rust.stdout.is_empty());
-    assert!(shell.stdout.is_empty());
+    let expected = format!(
+        "  warning: dot update already running (pid {})\n",
+        std::process::id()
+    );
+    let output = dot(&["update"], &home, &state, None, None);
+    assert_eq!(output.status.code(), Some(75));
+    assert_eq!(output.stderr, expected.as_bytes());
+    assert!(output.stdout.is_empty());
     let _ = guard;
 }
 
 #[test]
-fn report_wall_clock_three_overlay_shell_vs_rust() {
-    // Shell/native medians on the 3-overlay fixture prove the native driver's
-    // bounded fan-out with measured results rather than an assumed speedup.
-    // They print on `--nocapture` and land in the lane PR body.
+fn report_native_wall_clock_three_overlay() {
     let scratch = Scratch::new("parpull-timing").expect("scratch dir");
     let (overlays, base_origin) = shared_remotes(&scratch);
-    let (home_shell, state_shell) = twin_client(&scratch, "shell", &overlays, &base_origin, None);
-    let (home_rust, state_rust) = twin_client(&scratch, "rust", &overlays, &base_origin, None);
-    warm_twins(&home_shell, &state_shell, &home_rust, &state_rust, None);
-    let mut shell_ms = Vec::new();
-    let mut rust_ms = Vec::new();
+    let (home, state) = twin_client(&scratch, "native", &overlays, &base_origin, None);
+    warm(&home, &state, None);
+    let mut samples = Vec::with_capacity(TIMING_RUNS);
     for _ in 0..TIMING_RUNS {
-        shell_ms.push(time_update(&home_shell, &state_shell, true, None).as_millis());
-        rust_ms.push(time_update(&home_rust, &state_rust, false, None).as_millis());
+        samples.push(time_update(&home, &state, None).as_millis());
     }
-    let shell_median = median_ms(&mut shell_ms);
-    let rust_median = median_ms(&mut rust_ms);
+    let median = median_ms(&mut samples);
     eprintln!(
-        "parpull wall-clock on {OVERLAYS} overlays x {FILES_PER_OVERLAY} files \
-         ({TIMING_RUNS} clean updates each): shell median {shell_median}ms {shell_ms:?}, \
-         rust median {rust_median}ms {rust_ms:?}"
-    );
-    assert_eq!(
-        snapshot_tree(&home_rust),
-        snapshot_tree(&home_shell),
-        "timed runs must converge identically"
+        "native parpull wall-clock on {OVERLAYS} overlays x {FILES_PER_OVERLAY} files \
+         ({TIMING_RUNS} clean updates): median {median}ms {samples:?}"
     );
 }

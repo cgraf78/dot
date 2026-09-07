@@ -2,7 +2,7 @@
 //! modes, cloned mode normalization, the matches-commit gate, and
 //! the staged clone orchestrator.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 
 use std::ffi::OsString;
@@ -241,7 +241,7 @@ pub fn clone_overlay_staged(
     // redirects, so clone diagnostics reach the caller's stderr
     // (`warnings` here). A `--quiet` clone writes no stdout in
     // either outcome, so only stderr forwards.
-    let clone = std::process::Command::new("git")
+    let clone = crate::init_client_identity::host_git_command()
         .args([
             "-c",
             "core.sharedRepository=0700",

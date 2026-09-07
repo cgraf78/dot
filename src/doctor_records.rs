@@ -1,6 +1,6 @@
-//! Doctor extension result records (slice 52: doctor layer, part 3).
+//! Doctor extension result records.
 //!
-//! Ports the record family from `lib/dot/doctor-api.sh`: the private
+//! Owns the private
 //! `_dot_doctor_record` sink plus the five public wrappers built on
 //! it — `dot_doctor_section`, `dot_doctor_ok`, `dot_doctor_warn`,
 //! `dot_doctor_fail`, and `dot_doctor_skip`. Part 1 (`doctor_runtime`)

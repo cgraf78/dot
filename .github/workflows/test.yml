@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@b97bd729afec784785bd01ebd43321225ef47bb7
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@850305d507a2def2ec27fc1fc11e0705695bf2b4
     with:
       # rust-version is a compatibility promise, so exercise it inside the
       # shared required gate instead of leaving it aspirational. The shared
@@ -22,27 +22,24 @@ jobs:
       # invocation; local copies would drift.
       msrv-toolchain: "1.85"
       # Perf budgets are calibrated on a fast host and must run at
-      # multiplier 1 in CI, including the #[ignore]-gated heavy tests
-      # (none in slice 1; the slice-2 update harness joins them
-      # automatically). The multiplier env exists for slow developer
-      # hosts only and gate jobs must not raise it.
+      # multiplier 1 in CI, including the #[ignore]-gated heavy tests. The
+      # multiplier exists for slow developer hosts only; gate jobs must not
+      # raise it.
       test-command: |
         cargo test --locked
+        bash tests/run
         bash tests/release-scripts-test
         DOT_PERF_BUDGET_MULTIPLIER=1 cargo test --locked -- --ignored
       # Native integration tests retain the public Python timeout helper as an
       # external-suite compatibility boundary. Minimal Rust images do not
       # otherwise install its interpreter.
       profiles: python
-      # The slice-2 update harness shells out to the shell `dot` oracle
-      # for baseline timing and byte comparison, and the engine requires
-      # Bash 4+ (stock macOS Bash is 3.2). A brewed Bash lands on the
-      # default PATH, where the checkout resolver's walk finds it; other
-      # platforms ship a new enough Bash natively.
+      # User-authored hooks retain a versioned Bash 4+ API. A brewed Bash lands
+      # on the default macOS PATH; the native engine itself has no shell
+      # interpreter dependency.
       setup-command: |
-        # `brew --prefix` alone is not a reliable installed-check, so
-        # require the executable itself (same pattern as the macos-bash32
-        # job below).
+        # `brew --prefix` alone is not a reliable installed check, so require
+        # the executable itself.
         if [ "$(uname -s)" = Darwin ]; then
           brew_prefix=$(brew --prefix bash 2>/dev/null || true)
           if [ -z "$brew_prefix" ] || [ ! -x "$brew_prefix/bin/bash" ]; then
@@ -72,8 +69,13 @@ jobs:
         scripts/smoke-release.sh "$ASSET_PLATFORM"
       package-smoke-musl-target: x86_64-unknown-linux-musl
       package-smoke-command: |
-        scripts/package-release.sh "$RUST_TARGET" linux-x86_64-musl
+        archive=$(scripts/package-release.sh "$RUST_TARGET" linux-x86_64-musl)
         scripts/smoke-release.sh linux-x86_64-musl
+        install_root=$(mktemp -d "$RUNNER_TEMP/dot-install.XXXXXX")
+        HOME="$install_root/home" ./install.sh \
+          --archive "$archive" --checksum "$archive.sha256" \
+          --data-home "$install_root/data" --bin-dir "$install_root/bin"
+        "$install_root/bin/dot" version
       # Termux hardware is too slow and variable for wall-clock perf
       # budgets (p95-over-30 at 25/30ms), so the emulator runs the
       # transported release-mode binary's CLI contract only (no cargo in
@@ -91,93 +93,16 @@ jobs:
         tar -C .termux-ci -xzf "$archive" ./dot
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@b97bd729afec784785bd01ebd43321225ef47bb7
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@850305d507a2def2ec27fc1fc11e0705695bf2b4
     with:
       matrix-set: full
       profiles: base,python
       shellcheck-inventory-path: .github/shellcheck-files.txt
-      test-command: bash tests/run
+      # This job deliberately has no Rust toolchain. Exercise the retained
+      # sourceable shell API here; the native-backed full acceptance suite runs
+      # in the Rust platform job after Cargo has built `dot`.
+      test-command: bash tests/library-test
       termux-profiles: base,python
-
-  macos-bash32:
-    name: Stock macOS Bash 3.2 bootstrap
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Verify stock Bash cannot satisfy the runtime contract
-        shell: /bin/bash {0}
-        run: |-
-          set -euo pipefail
-          [[ ${BASH_VERSINFO[0]} -eq 3 && ${BASH_VERSINFO[1]} -eq 2 ]]
-
-          for script in \
-            install.sh \
-            bin/dot \
-            support/checkout-bash-v1.sh \
-            support/client-launcher.sh \
-            support/install-checkout.sh \
-            support/post-install.sh \
-            lib/dot/public/api-version.sh \
-            lib/dot/public/test-reporter-v1 \
-            lib/dot/public/ui.sh \
-            lib/dot/public/xdg.sh; do
-            /bin/bash -n "$script"
-          done
-
-          state="$RUNNER_TEMP/stock-only-state"
-          set +e
-          output=$(XDG_STATE_HOME="$state" /bin/bash -c '
-            . "$1"
-            checkout_bash_v1_select dot /bin/bash
-          ' -- support/checkout-bash-v1.sh 2>&1)
-          status=$?
-          set -e
-          [[ $status -ne 0 ]]
-          [[ $output == *'explicit interpreter is not Bash 4 or newer'* ]]
-          [[ ! -e "$state" && ! -L "$state" ]]
-
-      - name: Provision a separate modern Bash candidate
-        shell: /bin/bash {0}
-        run: |-
-          set -euo pipefail
-          modern_prefix=$(brew --prefix bash 2>/dev/null || true)
-          modern_bash=${modern_prefix:+$modern_prefix/bin/bash}
-          if [[ -z "$modern_bash" || ! -x "$modern_bash" ]]; then
-            brew install bash
-            modern_prefix=$(brew --prefix bash)
-            modern_bash="$modern_prefix/bin/bash"
-          fi
-          "$modern_bash" --noprofile --norc -c \
-            'test "${BASH_VERSINFO[0]}" -ge 4'
-          printf 'DOT_TEST_MODERN_BASH=%s\n' "$modern_bash" >>"$GITHUB_ENV"
-
-      - name: Pipe installer through stock Bash and run the trampoline
-        shell: /bin/bash {0}
-        run: |-
-          set -euo pipefail
-          [[ ${BASH_VERSINFO[0]} -eq 3 && ${BASH_VERSINFO[1]} -eq 2 ]]
-
-          origin="$RUNNER_TEMP/dot-origin.git"
-          git init --quiet --bare "$origin"
-          git -C "$origin" config receive.shallowUpdate true
-          git -C "$origin" symbolic-ref HEAD refs/heads/main
-          git push --quiet "$origin" HEAD:refs/heads/main
-
-          prefix="$RUNNER_TEMP/dot-bash32"
-          managed="$RUNNER_TEMP/managed/cgraf78/dot"
-          state="$RUNNER_TEMP/runtime-state"
-          HOME="$RUNNER_TEMP/home" PREFIX="$prefix" XDG_STATE_HOME="$state" \
-            CGRAF78_CHECKOUT_INSTALL_BASH="$DOT_TEST_MODERN_BASH" \
-            CGRAF78_CHECKOUT_INSTALL_DIR="$managed" \
-            CGRAF78_CHECKOUT_INSTALL_REPO_URL="file://$origin" \
-            /bin/bash -s <install.sh
-          [[ -d "$managed/.git" ]]
-          [[ -L "$prefix/bin/dot" ]]
-          HOME="$RUNNER_TEMP/home" XDG_STATE_HOME="$state" \
-            /bin/bash "$prefix/bin/dot" --version
 
   shdeps-lock:
     name: Verify Shdeps lock
@@ -201,11 +126,10 @@ jobs:
   required:
     name: Required
     if: ${{ always() }}
-    needs: [shell, macos-bash32, shdeps-lock, rust]
+    needs: [shell, shdeps-lock, rust]
     runs-on: ubuntu-24.04
     env:
       SHELL_RESULT: ${{ needs.shell.result }}
-      BASH32_RESULT: ${{ needs.macos-bash32.result }}
       SHDEPS_LOCK_RESULT: ${{ needs.shdeps-lock.result }}
       RUST_RESULT: ${{ needs.rust.result }}
     steps:
@@ -213,11 +137,9 @@ jobs:
         shell: bash
         run: |-
           printf 'Shared shell CI: %s\n' "$SHELL_RESULT"
-          printf 'Stock macOS Bash 3.2: %s\n' "$BASH32_RESULT"
           printf 'Shdeps lock: %s\n' "$SHDEPS_LOCK_RESULT"
           printf 'Rust port: %s\n' "$RUST_RESULT"
           test "$SHELL_RESULT" = success
-          test "$BASH32_RESULT" = success
           test "$SHDEPS_LOCK_RESULT" = success
           test "$RUST_RESULT" = success
 
@@ -230,4 +152,4 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@b97bd729afec784785bd01ebd43321225ef47bb7
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@850305d507a2def2ec27fc1fc11e0705695bf2b4

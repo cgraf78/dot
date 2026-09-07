@@ -1,6 +1,6 @@
-//! Strict client configuration parser (slice 2 foundations).
+//! Strict client configuration parser.
 //!
-//! Ports `lib/dot/config.sh` exactly: the file is data, never code —
+//! Configuration is data, never code:
 //! only documented HOME spellings expand, everything else is rejected
 //! before any extension or provider can execute. Error texts are
 //! byte-identical to the shell (`dot: config: …`, exit 2 at the CLI).
@@ -423,7 +423,7 @@ pub fn load(request: &Request<'_>) -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
+    use dot_test_support::TempDir;
 
     struct Fixture {
         _dir: TempDir,

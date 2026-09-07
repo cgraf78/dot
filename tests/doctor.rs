@@ -10,12 +10,12 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use dot::test_support::TempDir;
+use dot_test_support::TempDir;
 
 fn command(shell: bool, home: &TempDir, state: &TempDir, extra: &[(&str, &str)]) -> Command {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut command = if shell {
-        let mut command = Command::new(dot::test_support::bash());
+        let mut command = Command::new(dot_test_support::bash());
         command.arg(root.join("bin/dot"));
         command
     } else {
@@ -33,7 +33,7 @@ fn command(shell: bool, home: &TempDir, state: &TempDir, extra: &[(&str, &str)])
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", state.path())
         .env("DOT_SOURCE_ROOT", root)
-        .env("BASH", dot::test_support::bash())
+        .env("BASH", dot_test_support::bash())
         .current_dir(home.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -86,7 +86,7 @@ fn run_in_process_with_terminal(
         ),
         ("DOT_SOURCE_ROOT".into(), root.as_os_str().to_os_string()),
         ("PATH".into(), "/usr/bin:/bin".into()),
-        ("BASH".into(), dot::test_support::bash().into()),
+        ("BASH".into(), dot_test_support::bash().into()),
         ("LC_ALL".into(), "C".into()),
     ]);
     for (key, value) in extra {
@@ -213,7 +213,7 @@ fn origin(scope: &Path) -> std::path::PathBuf {
 
 fn init_client(home: &TempDir, state: &TempDir, origin: &Path) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let output = Command::new(dot::test_support::bash())
+    let output = Command::new(dot_test_support::bash())
         .arg(root.join("bin/dot"))
         .args(["init", "--yes"])
         .arg(format!("file://{}", origin.display()))
@@ -227,7 +227,7 @@ fn init_client(home: &TempDir, state: &TempDir, origin: &Path) {
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", state.path())
         .env("DOT_SOURCE_ROOT", root)
-        .env("BASH", dot::test_support::bash())
+        .env("BASH", dot_test_support::bash())
         .current_dir(home.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
