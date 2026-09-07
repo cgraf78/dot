@@ -26,8 +26,9 @@ jobs:
       # (none in slice 1; the slice-2 update harness joins them
       # automatically). The multiplier env exists for slow developer
       # hosts only and gate jobs must not raise it.
-      test-command: >-
-        cargo test --locked &&
+      test-command: |
+        cargo test --locked
+        bash tests/release-scripts-test
         DOT_PERF_BUDGET_MULTIPLIER=1 cargo test --locked -- --ignored
       # Native integration tests retain the public Python timeout helper as an
       # external-suite compatibility boundary. Minimal Rust images do not
@@ -66,29 +67,28 @@ jobs:
             exit 1
           fi
         fi
-      # Slice 1 has no release/packaging scripts yet, so the Android and
-      # Termux gates validate what exists: cross-compilation and the
-      # native test suite. Packaging smoke arrives with the release
-      # workflow in a later slice.
       android-package-smoke-command: |
-        cargo build --locked --target "$RUST_TARGET"
-        test -x "target/$RUST_TARGET/debug/dot"
+        scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
+        scripts/smoke-release.sh "$ASSET_PLATFORM"
+      package-smoke-musl-target: x86_64-unknown-linux-musl
+      package-smoke-command: |
+        scripts/package-release.sh "$RUST_TARGET" linux-x86_64-musl
+        scripts/smoke-release.sh linux-x86_64-musl
       # Termux hardware is too slow and variable for wall-clock perf
       # budgets (p95-over-30 at 25/30ms), so the emulator runs the
       # transported release-mode binary's CLI contract only (no cargo in
-      # the sandbox); perf budgets are a fast-host gate. Packaging
-      # scripts arrive with the release workflow in a later slice.
+      # the sandbox); perf budgets are a fast-host gate.
       termux-command: scripts/termux-ci.sh
       termux-host-command: |
         # Build outside the checkout: the emulator copy step tars the
         # whole caller tree, and in-tree target/ hardlinks break that
         # copy with permission errors (sibling convention uses
         # $RUNNER_TEMP target dirs for the same reason).
-        CARGO_TARGET_DIR="$RUNNER_TEMP/dot-termux-target" \
-          cargo build --release --locked --target "$RUST_TARGET"
+        export CARGO_TARGET_DIR="$RUNNER_TEMP/dot-termux-target"
+        archive=$(scripts/package-release.sh "$RUST_TARGET" android-x86_64)
+        scripts/smoke-release.sh android-x86_64
         mkdir -p .termux-ci
-        cp "$RUNNER_TEMP/dot-termux-target/$RUST_TARGET/release/dot" \
-          .termux-ci/dot
+        tar -C .termux-ci -xzf "$archive" ./dot
 
   shell:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@b750c292f00e079c2270df0d8f4c8bdaf43e0356
