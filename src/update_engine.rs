@@ -12,16 +12,9 @@
 //! [`crate::profile_lifecycle`], [`crate::pre_sync`],
 //! [`crate::merges`], and [`crate::shdeps`].
 //!
-//! Coverage boundary (documented, not hidden): the v1 driver goes
-//! native only inside a conservative envelope, and the caller
-//! falls back to the shell adapter outside it:
-//!
-//! - unknown dependency-provider values stay shell until the unconditional
-//!   update cutover; `none` and `shdeps` run natively.
-//!
-//! `DOT_UPDATE_NATIVE=1` selects this lane when the envelope accepts
-//! the invocation; the caller runs the shell adapter for every
-//! declined case.
+//! Every `update` and `pull` invocation runs this engine. Configuration is
+//! parsed before entry, so the provider is a closed enum rather than an
+//! open-ended shell value that needs a fallback lane.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -82,8 +75,6 @@ pub struct EngineInputs<'a> {
     pub bar_width: &'a str,
     /// `DOT_INIT_SKIP_PROVIDER == 1`.
     pub skip_provider: bool,
-    /// `DOT_DEPENDENCY_PROVIDER` (`"none"` or `"shdeps"`).
-    pub provider: &'a str,
     /// Selected manifest (`$DOT_OVERLAY_MANIFEST`).
     pub manifest: &'a str,
     /// Legacy manifest (`$DOT_OVERLAY_LEGACY_MANIFEST`).
@@ -125,25 +116,6 @@ pub struct EngineInputs<'a> {
     pub shdeps_update_policy: Option<&'a str>,
     /// `DOT_REEXEC_EXPECTED_REVISION` for the defensive reload.
     pub reexec_expected: Option<&'a str>,
-}
-
-/// Why the v1 driver declines a run (the caller runs the shell
-/// adapter instead). Every reason names the missing native port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fallback {
-    /// `DOT_INIT_SKIP_PROVIDER` set without the `1` spelling: the
-    /// provider is unknown, so the shell's `shdeps unavailable`
-    /// close owns it.
-    ProviderUnavailable,
-}
-
-/// Native envelope check for one run: `Ok(())` runs
-/// [`run_update`], `Err(reason)` runs the shell adapter.
-pub fn should_go_native(inputs: &EngineInputs<'_>) -> Result<(), Fallback> {
-    if !matches!(inputs.provider, "none" | "shdeps") {
-        return Err(Fallback::ProviderUnavailable);
-    }
-    Ok(())
 }
 
 /// Installed-link generation snapshot (`DOT_OVERLAY_ROLLBACK_PATHS`
@@ -1656,11 +1628,11 @@ fn provider_reexec(
         &env,
         runtime.cwd(),
     ) {
-        Ok(Some(gathered)) => gathered,
+        Ok(gathered) => gathered,
         _ => return 1,
     };
     let nested = gathered.inputs();
-    run_update(&nested, io.out, io.err, now_secs).unwrap_or(1)
+    run_gathered(&nested, io.out, io.err, now_secs)
 }
 
 /// Effective quiet for rows the shell gates on `DOT_QUIET` (the
@@ -1697,9 +1669,8 @@ fn startup_inputs<'a>(inputs: &EngineInputs<'a>) -> crate::startup::Inputs<'a> {
     }
 }
 
-/// Owned invocation capture for [`run_update`]: everything the shell
-/// adapter preamble exports (`constants.sh` defaults plus the flag
-/// loop) resolved before the first stage opens. [`Gathered::inputs`]
+/// Owned invocation capture for [`run_update`]: every constant and flag value
+/// is resolved before the first stage opens. [`Gathered::inputs`]
 /// from here, so one value lives through the whole run.
 pub struct Gathered {
     runtime: crate::app::Runtime,
@@ -1722,7 +1693,6 @@ pub struct Gathered {
     dot_quiet: Option<String>,
     update_jobs: Option<String>,
     merge_jobs: Option<String>,
-    provider: String,
     skip_provider: bool,
     live: bool,
     multibyte: bool,
@@ -1764,7 +1734,6 @@ impl Gathered {
             palette: &self.palette,
             dot_verbose: self.dot_verbose.as_deref(),
             dot_quiet: self.dot_quiet.as_deref(),
-            provider: &self.provider,
             skip_provider: self.skip_provider,
             update_jobs: self.update_jobs.as_deref(),
             merge_jobs: self.merge_jobs.as_deref(),
@@ -1822,8 +1791,7 @@ fn parse_flags(args: &[std::ffi::OsString]) -> (UpdateFlags, Vec<std::ffi::OsStr
 
 /// Effective uid for the trust checks: `$EUID` when numeric (the
 /// shell loop runs under bash), else the `id -u` equivalent. `None`
-/// fails closed to the shell adapter — the checks must never run
-/// under a guessed identity.
+/// fails closed — the checks must never run under a guessed identity.
 fn resolve_euid(env: &BTreeMap<OsString, OsString>) -> Option<u32> {
     if let Some(euid) = env_value(env, "EUID").and_then(|value| value.parse::<u32>().ok()) {
         return Some(euid);
@@ -1848,12 +1816,106 @@ fn locale_name(env: &BTreeMap<OsString, OsString>) -> String {
         .unwrap_or_default()
 }
 
+/// Resolve the base repository publication that `repos/model.sh` used to
+/// place in globals before dispatch. A completed init record is authoritative;
+/// the legacy separate checkout remains the record-free compatibility shape.
+fn base_client(
+    home: &str,
+    state_home: &str,
+    env: &BTreeMap<OsString, OsString>,
+) -> Result<Base, GatherError> {
+    let published = env_value(env, "DOT_BASE_TOPOLOGY");
+    if published.is_some() {
+        return Ok(crate::cli::base_from_values(
+            home,
+            published.as_deref(),
+            env_value(env, "DOT_CLIENT_GIT_DIR").as_deref(),
+        ));
+    }
+    let completed = Path::new(state_home).join("dot/init/completed");
+    if std::fs::symlink_metadata(&completed).is_ok() {
+        let record =
+            crate::init_client_record::read_record(&completed, Path::new(home)).map_err(|_| {
+                GatherError::Diagnostic(b"dot: malformed initialization identity record\n")
+            })?;
+        if record.phase != "complete" {
+            return Err(GatherError::Diagnostic(
+                b"dot: malformed initialization identity record\n",
+            ));
+        }
+        let topology = if record.git_dir == format!("{home}/.dotfiles") {
+            Some("separate")
+        } else if record.git_dir == format!("{home}/.git") {
+            Some("ordinary")
+        } else {
+            None
+        };
+        if topology.is_some() {
+            return Ok(crate::cli::base_from_values(
+                home,
+                topology,
+                Some(&record.git_dir),
+            ));
+        }
+        return Err(GatherError::Diagnostic(
+            b"dot: initialization identity names an unsupported Git directory\n",
+        ));
+    }
+    let legacy = Path::new(home).join(".dotfiles");
+    Ok(crate::cli::base_from_values(
+        home,
+        legacy.is_dir().then_some("separate"),
+        legacy.to_str(),
+    ))
+}
+
+/// A complete request for one native update invocation.
+pub struct UpdateRequest<'a> {
+    /// Parsed client configuration.
+    pub config: &'a crate::config::Config,
+    /// Command environment after update flag side effects.
+    pub env: &'a BTreeMap<OsString, OsString>,
+    /// Original update arguments, including flags.
+    pub args: &'a [OsString],
+    /// Trampoline-normalized XDG state home.
+    pub state_home: &'a Path,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GatherError {
+    Xdg(crate::xdg::Error),
+    Diagnostic(&'static [u8]),
+    Unavailable,
+}
+
+impl GatherError {
+    fn code(self) -> i32 {
+        match self {
+            Self::Xdg(error) => error.code(),
+            Self::Diagnostic(_) => 1,
+            Self::Unavailable => 1,
+        }
+    }
+
+    fn write(self, stderr: &mut dyn std::io::Write) {
+        if let Self::Diagnostic(line) = self {
+            let _ = stderr.write_all(line);
+        }
+    }
+}
+
+impl From<crate::xdg::Error> for GatherError {
+    fn from(error: crate::xdg::Error) -> Self {
+        Self::Xdg(error)
+    }
+}
+
 /// Capture one native invocation from the command's derived environment.
 /// The dispatcher already applies the shell flag exports before this point;
 /// `state_home` is its trampoline-normalized XDG state dir and `source_root`
-/// is `$DOT_SOURCE_ROOT`. Unsupported native lanes return `Ok(None)` for the
-/// shell adapter; invalid XDG inputs return a typed error and never invoke it.
-pub fn gather(
+/// is `$DOT_SOURCE_ROOT`. Capture failures are terminal: there is no legacy
+/// engine whose ambient process state can safely substitute for these values.
+fn gather(
     args: &[std::ffi::OsString],
     runtime: &crate::app::Runtime,
     config: &crate::config::Config,
@@ -1861,7 +1923,7 @@ pub fn gather(
     state_home: &str,
     env: &BTreeMap<OsString, OsString>,
     cwd: &Path,
-) -> Result<Option<Gathered>, crate::xdg::Error> {
+) -> Result<Gathered, GatherError> {
     use std::io::IsTerminal as _;
     let (flags, extra) = parse_flags(args);
     let home = env_value(env, "HOME").unwrap_or_default();
@@ -1877,7 +1939,7 @@ pub fn gather(
     let mut moves = crate::temp::MoveCache::default();
     let tool = match moves.tool() {
         Ok(tool) => tool,
-        Err(_) => return Ok(None),
+        Err(_) => return Err(GatherError::Unavailable),
     };
     let stdout_tty = std::io::stdout().is_terminal();
     let no_color = env_value(env, "NO_COLOR");
@@ -1914,14 +1976,7 @@ pub fn gather(
         &locale,
         multibyte,
     );
-    let mut provider = match config.provider {
-        crate::config::Provider::None => "none".to_string(),
-        crate::config::Provider::Shdeps => "shdeps".to_string(),
-    };
     let skip_provider = env_value(env, "DOT_INIT_SKIP_PROVIDER").as_deref() == Some("1");
-    if skip_provider {
-        provider = "none".to_string();
-    }
     let pwd = cwd.to_str().unwrap_or(&home).to_string();
     let dest = crate::repos_overlays::DestinationInputs {
         home: home.clone(),
@@ -1934,13 +1989,13 @@ pub fn gather(
     };
     let euid = match resolve_euid(env) {
         Some(euid) => euid,
-        None => return Ok(None),
+        None => return Err(GatherError::Unavailable),
     };
     let checkout_root = match source_root.to_str() {
         Some(root) => root.to_string(),
-        None => return Ok(None),
+        None => return Err(GatherError::Unavailable),
     };
-    Ok(Some(Gathered {
+    Ok(Gathered {
         runtime: runtime.clone(),
         config: config.clone(),
         flags,
@@ -1955,17 +2010,12 @@ pub fn gather(
         tool,
         log,
         palette,
-        base: Some(crate::cli::base_from_values(
-            &home,
-            env_value(env, "DOT_BASE_TOPOLOGY").as_deref(),
-            env_value(env, "DOT_CLIENT_GIT_DIR").as_deref(),
-        )),
+        base: Some(base_client(&home, state_home, env)?),
         bar_width: env_value(env, "DOT_UI_PROGRESS_WIDTH").unwrap_or_else(|| "8".to_string()),
         dot_verbose,
         dot_quiet,
         update_jobs: env_value(env, "DOT_UPDATE_JOBS"),
         merge_jobs: env_value(env, "DOT_MERGE_JOBS"),
-        provider,
         skip_provider,
         live,
         multibyte,
@@ -1981,7 +2031,7 @@ pub fn gather(
         checkout_root,
         // `dot_config_load` publishes this path before the shell chooses its
         // update lane. Native gathering receives the parsed config directly,
-        // so do not require a duplicate ambient export to notice shell-owned
+        // so do not require a duplicate ambient export to notice configured
         // hook directories.
         extensions_dir: config
             .extensions_dir
@@ -1992,7 +2042,7 @@ pub fn gather(
         shell: env_value(env, "SHELL"),
         shdeps_update_policy: env_value(env, "DOT_SHDEPS_UPDATE_POLICY"),
         reexec_expected: env_value(env, "DOT_REEXEC_EXPECTED_REVISION"),
-    }))
+    })
 }
 
 /// Wall-clock seconds for stage rows (`date +%s` equivalent).
@@ -2003,20 +2053,51 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Execute one native update through the typed runtime and stream boundary.
+pub fn run_update(
+    runtime: &crate::app::Runtime,
+    request: &UpdateRequest<'_>,
+    streams: &mut crate::app::Streams<'_>,
+) -> i32 {
+    let state_home = match request.state_home.to_str() {
+        Some(state_home) => state_home,
+        None => return 1,
+    };
+    let gathered = match gather(
+        request.args,
+        runtime,
+        request.config,
+        runtime.source_root(),
+        state_home,
+        request.env,
+        runtime.cwd(),
+    ) {
+        Ok(gathered) => gathered,
+        Err(error) => {
+            error.write(streams.stderr);
+            return error.code();
+        }
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run_gathered(&gathered.inputs(), &mut out, &mut err, now_secs());
+    let stdout_failed = streams.stdout.write_all(&out).is_err();
+    let stderr_failed = streams.stderr.write_all(&err).is_err();
+    if stdout_failed || stderr_failed {
+        return 1;
+    }
+    code
+}
+
 /// `_dot_update` natively: flag-driven stages around [`sync_repos`]
 /// and finalization with the defensive policy reload between them.
-/// Returns `None` outside the [`should_go_native`] envelope (the
-/// caller runs the shell adapter instead).
-pub fn run_update(
+fn run_gathered(
     inputs: &EngineInputs<'_>,
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
     now_secs: i64,
-) -> Option<i32> {
+) -> i32 {
     use std::io::Write as _;
-    if should_go_native(inputs).is_err() {
-        return None;
-    }
     // The shell resolves cron dirt before `_ui_begin`: unresolved edits return
     // 0 with no rows, while matching-upstream files are repaired before sync.
     // These probes are intentionally silent, so the early return preserves
@@ -2029,7 +2110,7 @@ pub fn run_update(
         && crate::repos_dirty::is_worktree_dirty(base.as_deref(), inputs.entries)
         && !crate::repos_dirty::try_resolve_dirty(inputs.home, base.as_deref(), inputs.entries)
     {
-        return Some(0);
+        return 0;
     }
     // `_ui_begin 5`: the update always runs counted (the assignment
     // overwrites any ambient total, like the shell).
@@ -2054,7 +2135,7 @@ pub fn run_update(
             1,
             sync.frozen,
         );
-        return Some(rc);
+        return rc;
     }
     // Defensive reload before provider selection continues (a
     // failure closes without finalizing, like the shell: the
@@ -2074,11 +2155,11 @@ pub fn run_update(
                 &reload_hint(inputs),
             );
             let _ = out.write_all(&close);
-            return Some(1);
+            return 1;
         }
     }
     let mut io = UpdateIo { out, err };
-    let rc = finalize(
+    finalize(
         inputs,
         &mut sync.state,
         &mut stage,
@@ -2086,8 +2167,7 @@ pub fn run_update(
         now_secs,
         0,
         sync.frozen,
-    );
-    Some(rc)
+    )
 }
 
 /// `IFS='|' read -r name path url _ _ sync`: six fields, the
@@ -2174,6 +2254,18 @@ fn quarantine_inputs(
 mod tests {
     use super::*;
 
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("closed stdout"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn additions_identity_ignores_same_name_descriptor_mutation() {
         let phase_one = BTreeSet::from([String::from("alpha")]);
@@ -2230,8 +2322,86 @@ mod tests {
             &env,
             Path::new("/tmp"),
         )
-        .expect("valid native XDG inputs")
-        .expect("capture supports this fixture");
-        assert!(should_go_native(&gathered.inputs()).is_ok());
+        .expect("valid native inputs");
+        assert!(matches!(
+            gathered.inputs().config.provider,
+            crate::config::Provider::None
+        ));
+    }
+
+    #[test]
+    fn malformed_completed_identity_fails_instead_of_becoming_legacy() {
+        let scratch = crate::test_support::TempDir::new("update-base-malformed")
+            .expect("create temporary directory");
+        let home = scratch.path().join("home");
+        let state = scratch.path().join("state");
+        std::fs::create_dir_all(home.join(".dotfiles")).expect("legacy-looking git directory");
+        std::fs::create_dir_all(state.join("dot/init")).expect("init state");
+        std::fs::write(state.join("dot/init/completed"), b"not-a-record\n")
+            .expect("malformed completed record");
+        let error = base_client(
+            home.to_str().expect("UTF-8 home"),
+            state.to_str().expect("UTF-8 state"),
+            &BTreeMap::new(),
+        )
+        .expect_err("completed identity stays authoritative");
+        assert!(matches!(error, GatherError::Diagnostic(_)));
+    }
+
+    #[test]
+    fn stderr_is_delivered_even_when_stdout_delivery_fails() {
+        let scratch = crate::test_support::TempDir::new("update-stream-failure")
+            .expect("create temporary directory");
+        let home = scratch.path().join("home");
+        let state = scratch.path().join("state");
+        let config_home = scratch.path().join("config");
+        std::fs::create_dir_all(config_home.join("dot")).expect("config directory");
+        std::fs::create_dir_all(&state).expect("state directory");
+        std::fs::write(config_home.join("dot/config"), b"version=broken\n")
+            .expect("rejected reload config");
+        let env = BTreeMap::from([
+            (OsString::from("HOME"), home.as_os_str().to_owned()),
+            (
+                OsString::from("XDG_STATE_HOME"),
+                state.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("XDG_CONFIG_HOME"),
+                config_home.as_os_str().to_owned(),
+            ),
+            (OsString::from("EUID"), OsString::from("0")),
+            (
+                OsString::from("DOT_BASE_TOPOLOGY"),
+                OsString::from("missing"),
+            ),
+            (
+                OsString::from("DOT_SOURCE_ROOT"),
+                OsString::from(env!("CARGO_MANIFEST_DIR")),
+            ),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, scratch.path()).expect("runtime");
+        let config = crate::config::Config {
+            version: 1,
+            extension_api: false,
+            extensions_dir: None,
+            provider: crate::config::Provider::None,
+            default_profile: "base".to_string(),
+            shdeps_update_policy: crate::config::UpdatePolicy::Pinned,
+            policy_from_env: false,
+        };
+        let mut stdout = FailingWriter;
+        let mut stderr = Vec::new();
+        let code = run_update(
+            &runtime,
+            &UpdateRequest {
+                config: &config,
+                env: &env,
+                args: &[],
+                state_home: &state,
+            },
+            &mut crate::app::Streams::new(&mut stdout, &mut stderr),
+        );
+        assert_eq!(code, 1);
+        assert_eq!(stderr, b"dot: config: unsupported version: broken\n");
     }
 }
