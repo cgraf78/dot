@@ -305,8 +305,7 @@ fn basename(path: &Path) -> String {
 /// `pre-sync`/`eligible` context. `records` are the
 /// `name|path|url|descriptor|optional|sync` rows sealed into
 /// each context; `scratch_root` is the `$TMPDIR` equivalent the
-/// shell's `mktemp -d` allocates under; `now_secs` is the
-/// `date +%s` instant.
+/// shell's `mktemp -d` allocates under.
 ///
 /// A failing worker records its warning, removes its scratch
 /// directory, and stops the run with status 1; a scratch
@@ -321,7 +320,6 @@ pub fn run(
     records: &[Vec<u8>],
     inputs: &Inputs,
     overlays: &[String],
-    now_secs: i64,
     scratch_root: &Path,
     runner: &mut Runner<'_>,
 ) -> Result<Outcome, Error> {
@@ -350,7 +348,7 @@ pub fn run(
         {
             return Err(Error::Refused);
         }
-        let (context, token) = match crate::overlay_context::create(
+        let (context, token) = match crate::overlay_context::create_current(
             &temporary,
             "pre-sync",
             "eligible",
@@ -358,7 +356,6 @@ pub fn run(
             records,
             &inputs.home,
             inputs.euid,
-            now_secs,
         ) {
             Ok(created) => created,
             Err(crate::overlay_context::Error::Invalid(message)) => {

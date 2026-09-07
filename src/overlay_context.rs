@@ -450,6 +450,32 @@ pub fn create(
     Ok((path, token))
 }
 
+/// Create a context using the clock at the authorization boundary.
+///
+/// Update stages may begin minutes before a hook runs. Production callers use
+/// this entry point so display timestamps cannot accidentally become security
+/// timestamps; [`create`] retains its explicit clock for deterministic protocol
+/// tests.
+pub fn create_current(
+    directory: &Path,
+    mode: &str,
+    set_kind: &str,
+    stage: &str,
+    records: &[Vec<u8>],
+    home: &str,
+    euid: u32,
+) -> Result<(PathBuf, String), Error> {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Error::Refused)?
+        .as_secs()
+        .try_into()
+        .map_err(|_| Error::Refused)?;
+    create(
+        directory, mode, set_kind, stage, records, home, euid, now_secs,
+    )
+}
+
 /// Whether `token` matches the `^[0-9a-f]{64}$` gate the shell
 /// applies to generated and presented tokens alike.
 fn is_token(token: &str) -> bool {

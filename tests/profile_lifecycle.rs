@@ -7,12 +7,6 @@ use std::path::Path;
 fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
-fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-}
 fn file(root: &Path, name: &str, body: &[u8], mode: u32) -> std::path::PathBuf {
     let p = root.join(name);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -292,7 +286,6 @@ fn run_one_mints_one_use_context_relays_status_output_and_cleans_scratch() {
                 home: &home,
                 euid: euid(),
                 tmpdir: d.path(),
-                now_secs: now(),
                 verbose,
                 log: &logger,
             },
@@ -349,7 +342,6 @@ fn retire_skips_eligible_runs_all_retiring_and_latches_failures() {
             home: &home,
             euid: euid(),
             tmpdir: d.path(),
-            now_secs: now(),
             verbose: false,
             log: &logger,
         },
@@ -377,7 +369,6 @@ fn retire_skips_eligible_runs_all_retiring_and_latches_failures() {
                 home: &home,
                 euid: euid(),
                 tmpdir: d.path(),
-                now_secs: now(),
                 verbose: false,
                 log: &logger
             },

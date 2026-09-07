@@ -22,7 +22,7 @@ fi
 
 # Print a message unless quiet mode is active.
 _log() {
-  [[ "$DOT_QUIET" -eq 1 ]] || echo "$@"
+  [[ "${DOT_QUIET:-0}" -eq 1 ]] || echo "$@"
 }
 
 # Section header (bright bold white, always prints).
@@ -32,17 +32,17 @@ _header() {
 
 # Section header (bright bold white, respects quiet mode).
 _log_header() {
-  [[ "$DOT_QUIET" -eq 1 ]] || echo "${_C_BOLD}${_C_WHITE}$*${_C_RESET}"
+  [[ "${DOT_QUIET:-0}" -eq 1 ]] || echo "${_C_BOLD}${_C_WHITE}$*${_C_RESET}"
 }
 
 # Success message (green, respects quiet mode).
 _log_ok() {
-  [[ "$DOT_QUIET" -eq 1 ]] || echo "${_C_GREEN}$*${_C_RESET}"
+  [[ "${DOT_QUIET:-0}" -eq 1 ]] || echo "${_C_GREEN}$*${_C_RESET}"
 }
 
 # Muted message (dim, respects quiet mode).
 _log_dim() {
-  [[ "$DOT_QUIET" -eq 1 ]] || echo "${_C_DIM}$*${_C_RESET}"
+  [[ "${DOT_QUIET:-0}" -eq 1 ]] || echo "${_C_DIM}$*${_C_RESET}"
 }
 
 # Warning message (yellow, always prints to stderr).
