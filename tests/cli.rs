@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,9 +33,13 @@ use std::os::unix::fs::PermissionsExt;
 use dot::cli::{Command as Decision, dispatch, init_acquires_lock};
 use dot::test_support::TempDir;
 
-// One legacy dispatch test must mutate process-global environment. Snapshot
-// tests share this lock so Rust's parallel runner cannot observe that fixture.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+static PROCESS_ENV: Mutex<()> = Mutex::new(());
+
+fn process_env_guard() -> MutexGuard<'static, ()> {
+    PROCESS_ENV
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 
 /// Extract the `dot_help` heredoc body from the shell source.
 fn shell_help() -> String {
@@ -53,7 +57,7 @@ fn bin() -> Command {
 
 #[test]
 fn native_update_flag_capture_does_not_mutate_parent_environment() {
-    let _env = ENV_LOCK.lock().expect("environment lock");
+    let _env = process_env_guard();
     // Provider `none` now keeps `--force` on the native path. The explicit
     // embedded runtime must still retain semantic stream, user-tree, and
     // state parity when it re-execs the real binary.
@@ -101,7 +105,7 @@ fn native_update_flag_capture_does_not_mutate_parent_environment() {
 
 #[test]
 fn app_runs_concurrent_native_contexts_without_mutating_process_environment() {
-    let _env = ENV_LOCK.lock().expect("environment lock");
+    let _env = process_env_guard();
     // Two embedded Runtime calls must become separate `dot` processes. Their
     // fake PATH entries hold actual overlay workers at the same test seam;
     // differing TMPDIR/WSL values prove the child inherits its Runtime map,
@@ -742,9 +746,9 @@ fn binary_unknown_non_utf8_matches_oracle() {
 
 #[test]
 fn update_passes_flag_exports_to_child_without_mutating_parent() {
-    let _env = ENV_LOCK.lock().expect("environment lock");
+    let _env = process_env_guard();
     // Slice 80 runs `Command::Update` end to end: the shell loop's
-    // exports reach its child adapter, then the engine runs for real
+    // values reach the native engine, which then runs for real
     // — exit `0` on the empty-HOME fixture, never the interim
     // diagnostic. The same exports must not leak back into this test
     // process, which may construct another runtime immediately.
@@ -1589,7 +1593,6 @@ fn native_update_env(client: &ReposClient, state: &Path) -> BTreeMap<OsString, O
             OsString::from("DOT_SOURCE_ROOT"),
             OsString::from(env!("CARGO_MANIFEST_DIR")),
         ),
-        (OsString::from("DOT_UPDATE_NATIVE"), OsString::from("1")),
         (
             OsString::from("DOT_BASE_TOPOLOGY"),
             OsString::from("separate"),
@@ -1791,7 +1794,6 @@ fn native_parent_snapshot() -> BTreeMap<OsString, Option<OsString>> {
         "HOME",
         "XDG_CONFIG_HOME",
         "XDG_STATE_HOME",
-        "DOT_UPDATE_NATIVE",
         "DOT_QUIET",
         "DOT_FORCE",
         "DOT_VERBOSE",
@@ -2032,6 +2034,10 @@ fn repos_env(cmd: &mut Command, client: &ReposClient, topology: bool) {
         .env("XDG_CONFIG_HOME", &client.xdg)
         .env("XDG_CACHE_HOME", &shim_cache)
         .env("DOT_GIT_REAL", "1")
+        // Status is read-only. Prevent Git from briefly creating index.lock
+        // inside the worktree's separate .dotfiles directory, where another
+        // status process can otherwise observe it as an untracked path.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("DOT_SOURCE_ROOT", repo)
         .current_dir(&client.home);
     if topology {
@@ -2040,6 +2046,94 @@ fn repos_env(cmd: &mut Command, client: &ReposClient, topology: bool) {
             client.base_git_dir.to_string_lossy().into_owned(),
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+fn shell_oracle_command() -> Command {
+    let mut cmd = Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/lib/dot/public/test-timeout-v1"
+    ));
+    // The existing timeout supervisor owns, bounds, terminates, and reaps the
+    // complete child session. Nested shell workers can therefore inherit that
+    // group instead of asking macOS Bash to create another group after a
+    // short-lived worker has crossed exec and racing with `setpgid`.
+    cmd.arg("120s").arg(dot::test_support::bash());
+    cmd
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn shell_oracle_uses_no_extra_runtime_dependency() {
+    let cmd = shell_oracle_command();
+    assert_eq!(cmd.get_program(), dot::test_support::bash());
+    assert!(
+        cmd.get_envs()
+            .all(|(key, _)| key != "DOT_CLEANUP_INHERIT_GROUP")
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shell_oracle_command() -> Command {
+    Command::new(dot::test_support::bash())
+}
+
+#[cfg(target_os = "macos")]
+fn inherit_supervised_group(cmd: &mut Command) {
+    cmd.env("DOT_CLEANUP_INHERIT_GROUP", "1");
+}
+
+#[test]
+fn repos_twins_disable_optional_git_locks() {
+    let client = stage_repos_client();
+    let mut shell = Command::new(dot::test_support::bash());
+    let mut rust = bin();
+    repos_env(&mut shell, &client, false);
+    repos_env(&mut rust, &client, true);
+    let shell_value = shell
+        .get_envs()
+        .find(|(key, _)| *key == "GIT_OPTIONAL_LOCKS")
+        .and_then(|(_, value)| value);
+    let rust_value = rust
+        .get_envs()
+        .find(|(key, _)| *key == "GIT_OPTIONAL_LOCKS")
+        .and_then(|(_, value)| value);
+    assert_eq!(shell_value, Some(OsStr::new("0")));
+    assert_eq!(rust_value, shell_value);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn shell_oracle_owns_one_inherited_process_group() {
+    let mut cmd = shell_oracle_command();
+    cmd.args([
+        "-c",
+        "parent=$(ps -o pgid= -p $$ | tr -d ' '); child=$(bash -c 'ps -o pgid= -p $$ | tr -d \" \"'); printf '%s|%s|%s|%s' \"$DOT_CLEANUP_INHERIT_GROUP\" \"$$\" \"$parent\" \"$child\"",
+    ]);
+    inherit_supervised_group(&mut cmd);
+    let output = cmd.output().expect("run isolated shell oracle probe");
+    assert!(
+        output.status.success(),
+        "probe status: {:?}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).expect("probe UTF-8");
+    let mut fields = text.split('|');
+    assert_eq!(fields.next(), Some("1"), "inherit marker: {text}");
+    let pid = fields.next().expect("shell pid");
+    let parent = fields.next().expect("parent process group");
+    let child = fields.next().expect("child process group");
+    assert!(
+        [pid, parent, child]
+            .iter()
+            .all(|value| value.parse::<u32>().is_ok_and(|value| value > 0)),
+        "valid numeric process identities: {text}; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(parent, pid, "oracle shell must lead its group: {text}");
+    assert_eq!(child, parent, "child process group: {text}");
+    assert!(fields.next().is_none(), "unexpected probe fields: {text}");
 }
 
 /// The production shell (`bin/dot` under `set -euo pipefail`) over
@@ -2522,23 +2616,24 @@ fn binary_init_fresh_failures_match_production() {
     check_init_twins(&["init", "--bogus"]);
 }
 
-/// The Rust binary over the same fixture with the native update
-/// driver opted in (`DOT_UPDATE_NATIVE=1`): the flag flips to
-/// default once every envelope lane proves out the same way.
+/// The Rust binary over the same fixture with the native update driver.
 fn repos_rust_native(client: &ReposClient, argv: &[&str]) -> std::process::Output {
     let mut cmd = bin();
     for arg in argv {
         cmd.arg(arg);
     }
     repos_env(&mut cmd, client, true);
-    cmd.env("DOT_UPDATE_NATIVE", "1");
+    cmd.env(
+        "DOT_BASH",
+        client.scope.path().join("absent-old-update-engine"),
+    );
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.output().expect("run dot binary")
 }
 
-/// A native-update client whose shell adapter can be made impossible to use.
+/// A native-update client whose former shell engine is poisoned.
 ///
 /// The sentinel is deliberately an executable rather than a missing command:
 /// a fallback then leaves an unambiguous byte in stderr instead of looking
@@ -2552,10 +2647,12 @@ impl NativeUpdateFixture {
     fn stage() -> Self {
         let client = stage_repos_client();
         let shell_poison = client.scope.path().join("old-update-engine");
-        Self {
+        let fixture = Self {
             client,
             shell_poison,
-        }
+        };
+        fixture.break_shell_engine();
+        fixture
     }
 
     /// Install one trusted pre-sync entry point in the fixture's configured
@@ -2624,8 +2721,8 @@ impl NativeUpdateFixture {
 
     /// Add the smallest profile-aware policy to the otherwise clean native
     /// repository fixture. The existing `alpha` descriptor stays selected in
-    /// phase one, so an exit through the poisoned adapter proves the profile
-    /// fallback rather than a missing descriptor or repository error.
+    /// phase one, so an old-engine failure identifies an accidental legacy
+    /// branch rather than a missing descriptor or repository error.
     fn with_base_profile(self) -> Self {
         let profiles = self.client.xdg.join("dot/profiles.d");
         std::fs::create_dir_all(&profiles).expect("profile directory");
@@ -2863,7 +2960,6 @@ impl NativeUpdateFixture {
             cmd.arg(arg);
         }
         repos_env(&mut cmd, &self.client, true);
-        cmd.env("DOT_UPDATE_NATIVE", "1");
         if self.shell_poison.exists() {
             cmd.env("DOT_BASH", &self.shell_poison);
         }
@@ -2879,12 +2975,14 @@ impl NativeUpdateFixture {
         argv: &[&str],
         configure: impl FnOnce(&mut Command),
     ) -> std::process::Output {
-        let mut cmd = Command::new(dot::test_support::bash());
+        let mut cmd = shell_oracle_command();
         cmd.arg("bin/dot");
         for arg in argv {
             cmd.arg(arg);
         }
         repos_env(&mut cmd, &self.client, false);
+        #[cfg(target_os = "macos")]
+        inherit_supervised_group(&mut cmd);
         configure(&mut cmd);
         cmd.current_dir(env!("CARGO_MANIFEST_DIR"))
             .stdin(Stdio::null())
@@ -2908,7 +3006,7 @@ fn assert_native_silent(output: &std::process::Output, label: &str) {
 
 #[test]
 fn update_native_entry_edges_do_not_invoke_shell_engine() {
-    // Each row poisons only update's legacy adapter. A passing assertion is
+    // Each row poisons only update's former shell engine. A passing assertion is
     // therefore native evidence, not an accidentally-green shell oracle.
     let clean = NativeUpdateFixture::stage();
     clean.break_shell_engine();
@@ -3005,7 +3103,7 @@ fn update_native_invalid_home_never_runs_shell_engine() {
 #[test]
 fn update_native_configured_pre_sync_hook_uses_the_hardened_worker() {
     // A configured hook must remain native and run only after the worker has
-    // validated its one-use context. Poisoning the old update adapter makes a
+    // validated its one-use context. Poisoning the old update engine makes a
     // fallback unmistakable while the marker proves the hook actually ran.
     let fixture = NativeUpdateFixture::stage();
     let extensions = fixture.client.home.join("extensions/pre-sync.d");
@@ -3087,7 +3185,7 @@ fn update_native_pre_sync_failure_streams_match_shell() {
 
 #[test]
 fn update_native_merge_hook_matches_shell_without_the_legacy_adapter() {
-    // This catches reinstating `Fallback::MergeHooks`: the shell oracle must
+    // This catches reinstating a legacy merge-hook branch: the shell oracle must
     // run one actual hook, while the native half has no usable old engine.
     let shell = NativeUpdateFixture::stage()
         .with_merge(b"merge() { printf merged >\"$HOME/merge-hook-ran\"; }\n");
@@ -3295,7 +3393,7 @@ fn update_native_merge_without_an_entry_point_matches_shell_failure() {
 #[test]
 fn update_native_unsafe_merge_hook_refusal_matches_shell() {
     // Discovery must reject an unsafe entry point before either engine runs it;
-    // poisoning the adapter still proves native handling of that refusal.
+    // poisoning the old engine still proves native handling of that refusal.
     let shell = NativeUpdateFixture::stage().with_merge(b"merge() { :; }\n");
     let native = NativeUpdateFixture::stage().with_merge(b"merge() { :; }\n");
     for fixture in [&shell, &native] {
@@ -3383,9 +3481,8 @@ fn update_native_merge_context_matches_shell() {
 
 #[test]
 fn update_native_profile_base_selection_does_not_invoke_shell_engine() {
-    // A native profile run must complete with the legacy adapter impossible
-    // to invoke. Before Task 4, `Fallback::Profiles` selects that adapter and
-    // this assertion observes its unmistakable 97 exit instead.
+    // A native profile run must complete with the former shell engine
+    // impossible to invoke; the poison makes any regression unmistakable.
     let fixture = NativeUpdateFixture::stage().with_base_profile();
     fixture.break_shell_engine();
     assert_native_silent(
@@ -3501,7 +3598,7 @@ fn update_native_profile_failed_retirement_matches_shell_twin() {
     let native = NativeUpdateFixture::stage().with_profile_retirement();
     // The twin stays an end-to-end oracle while making a native fallback
     // unmistakable. The versioned lifecycle worker uses Runtime's absolute
-    // BASH, not this legacy update-adapter selector.
+    // BASH, not a legacy update-engine selector.
     native.break_shell_engine();
     assert_profile_twin(&shell, &native, "failed retirement setup");
 
@@ -3610,7 +3707,7 @@ fn update_native_profile_conflict_after_base_pull_restores_prior_generation() {
             .stderr
             .windows(b"OLD-UPDATE-ENGINE".len())
             .any(|row| row == b"OLD-UPDATE-ENGINE"),
-        "profile conflict must not escape to the shell adapter"
+        "profile conflict must not escape to the former shell engine"
     );
     assert!(target.is_symlink(), "rollback restores the managed link");
     assert_eq!(
@@ -3855,7 +3952,7 @@ fn assert_profile_tree_twin(
 
 #[test]
 fn update_native_profile_selection_matches_shell_twin() {
-    // This is deliberately not an adapter-poison test: each implementation
+    // This is deliberately not an old-engine poison test: each implementation
     // gets an independently staged client, then we compare process behavior
     // and the profile generation it published.
     let shell = NativeUpdateFixture::stage().with_base_profile();
@@ -4178,8 +4275,8 @@ fn update_twin_duration_normalizers_cover_slow_ci_formats() {
 #[test]
 fn update_native_matches_shell_byte_for_byte() {
     // Twin staged clients (base plus one overlay, both current):
-    // the shell side runs the default adapter, the Rust side the
-    // native driver. Pulls are no-ops, so the run exercises the
+    // the shell side runs the oracle engine and the Rust side the native
+    // driver. Pulls are no-ops, so the run exercises the
     // deferred close with real counts, discovery, the link phase,
     // retire, the empty merges close, commit, and normalize.
     let shell_client = stage_repos_client();

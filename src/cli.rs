@@ -15,15 +15,11 @@
 //! (the dispatch decision is final — a later slice only fills in the
 //! call, never re-decides the routing — and slice 83 wires the last
 //! two, so the interim set is empty and the `run` match is
-//! exhaustive). Slice 78 drives [`Command::Update`]
-//! through the sequencer's flag parser
-//! ([`crate::update::parse_update_flags`]): the shell loop's exports
-//! stay in the invocation environment supplied to the adapter while
-//! the engine (sync/finalize) stays shell-owned; slice 79
-//! drives `init` through [`init_client_command::run`]; slice 80
-//! drives [`Command::Update`] end to end through
-//! [`update_run::run`](crate::update_run::run) (native lock plus the
-//! shell engine adapter — exit `0` on success); slice 82 drives
+//! exhaustive). [`Command::Update`] uses the sequencer's flag parser
+//! ([`crate::update::parse_update_flags`]) and runs end to end through
+//! [`update_run::run`](crate::update_run::run), with a native lock and
+//! native engine. Slice 79 drives `init` through
+//! [`init_client_command::run`]; slice 82 drives
 //! `fetch`/`push`/`status`/`diff` through overlay resolution
 //! ([`crate::overlays::resolve`]) plus the matching
 //! [`crate::repos_commands`] kernel. Slice 83 drives
@@ -31,10 +27,9 @@
 //! shared `ENGINE_SCRIPT` adapter below: the child mirrors the
 //! `*)` arm of `lib/dot/main.sh` and calls `dot_command_dispatch`,
 //! so the shell arm bodies (traps, resolve gating, kernels) run
-//! exactly as production runs them — exit codes plus output parity,
-//! resolve-failure paths included — while step execution stays
-//! shell-owned until its slices land (the [`Command::Update`]
-//! precedent through [`update_run::run`](crate::update_run::run)).
+//! exactly as production runs them — exit codes plus output parity and
+//! resolve-failure paths included. This adapter is not reachable from the
+//! native [`Command::Update`] arm.
 //! Slice 84 runs the startup
 //! prelude ([`crate::startup`]) at the top of [`run`]: the re-exec
 //! guard (exit 1) then `dot_config_load || exit 2` before dispatch
@@ -129,9 +124,8 @@ pub const EXIT_USAGE: i32 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     /// `update`, plus `pull` (the shell recurses into the `update`
-    /// arm): owner traps, native `_dot_update_lock_acquire` (failure
-    /// returns its status, e.g. lock-busy `75`), then `_dot_update`
-    /// through the engine adapter, wired to
+    /// arm): native update-lock acquisition (failure returns its status,
+    /// e.g. lock-busy `75`), then the native update engine, wired to
     /// [`update_run::run`](crate::update_run::run).
     ///
     /// Exit-code note: the dispatcher text ignores the kernel status
@@ -338,7 +332,7 @@ pub(crate) fn run_with_runtime(
             Command::Cron => run_cron(stdout, &mut failed),
             Command::Update => {
                 let rest: Vec<OsString> = args.collect();
-                run_update(runtime, &config, other, &rest, stdout, stderr, &mut failed)
+                run_update(runtime, &config, &rest, stdout, stderr)
             }
             Command::Init => {
                 let rest: Vec<Vec<u8>> = args.map(|arg| argv_bytes(&arg)).collect();
@@ -376,20 +370,15 @@ pub(crate) fn run_with_runtime(
 /// `_dot_update` (`lib/dot/update.sh`) consumes `--cron --quiet
 /// -f`/`--force -v`/`--verbose` up front — exporting the
 /// quiet/force/verbose pairs and unsetting `DOT_OVERLAY_LINKS_FROZEN`
-/// — before the repo sync and finalize steps run. Step execution
-/// stays shell-owned until its slices land, so after the flag side
-/// effects this arm hands the residue to
-/// [`update_run::run`](crate::update_run::run): native lock plus the
-/// shell engine adapter. `command` names the invoked spelling
-/// (`update` or its `pull` alias) for the adapter's original argv.
+/// — before the repo sync and finalize steps run. This arm hands the
+/// residue to [`update_run::run`](crate::update_run::run): native lock plus
+/// the native engine.
 fn run_update(
     runtime: &crate::app::Runtime,
     config: &crate::config::Config,
-    command: &[u8],
     args: &[OsString],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-    failed: &mut bool,
 ) -> i32 {
     let raw: Vec<Vec<u8>> = args.iter().map(argv_bytes).collect();
     let refs: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
@@ -411,20 +400,15 @@ fn run_update(
         env.insert(OsString::from("DOT_VERBOSE"), OsString::from("1"));
         env.insert(OsString::from("SHDEPS_LOG_LEVEL"), OsString::from("2"));
     }
-    // The engine's own code crosses the dispatcher: production runs
-    // under `set -euo pipefail`, so the shell exits with the
-    // kernel's code (`0` success, `1` failure, `2` config rejection,
-    // `75` lock busy — pinned against `bin/dot`), and so does this
-    // arm. Only undelivered output flips `failed`, which [`run`]
-    // turns into [`EXIT_ERROR`] like the other arms.
+    // Preserve the kernel's codes (`0` success, `1` failure, `2` config
+    // rejection, `75` lock busy) across the typed stream boundary.
     crate::update_run::run(
         runtime,
         config,
         &env,
-        crate::update_run::Request { command, args },
+        crate::update_run::Request { args },
         stdout,
         stderr,
-        failed,
     )
 }
 
