@@ -3170,42 +3170,55 @@ fn update_native_profile_downgrade_retires_lifecycle_state_without_shell_engine(
 }
 
 #[test]
-fn update_native_profile_failed_retirement_keeps_ledger_without_shell_engine() {
-    let fixture = NativeUpdateFixture::stage().with_profile_retirement();
-    fixture.break_shell_engine();
-    assert_native_silent(&fixture.rust_dot(&["update", "--quiet"]), "profile setup");
-    seed_advance(
-        &fixture.client.overlay_seed,
-        "dot/profile-deactivate",
-        b"deactivate() { printf failed >&2; return 7; }\n",
-    );
-    std::fs::write(
-        fixture.client.xdg.join("dot/config"),
-        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
-    )
-    .expect("switch profile");
+fn update_native_profile_failed_retirement_matches_shell_twin() {
+    let shell = NativeUpdateFixture::stage().with_profile_retirement();
+    let native = NativeUpdateFixture::stage().with_profile_retirement();
+    // The twin stays an end-to-end oracle while making a native fallback
+    // unmistakable. The versioned lifecycle worker uses Runtime's absolute
+    // BASH, not this legacy update-adapter selector.
+    native.break_shell_engine();
+    assert_profile_twin(&shell, &native, "failed retirement setup");
 
-    let output = fixture.rust_dot(&["update", "--quiet"]);
-    assert_eq!(output.status.code(), Some(1), "failed retirement status");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("profile deactivation failed"),
-        "native failure stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+    for fixture in [&shell, &native] {
+        seed_advance(
+            &fixture.client.overlay_seed,
+            "dot/profile-deactivate",
+            b"deactivate() { printf failed >&2; return 7; }\n",
+        );
+        std::fs::write(
+            fixture.client.xdg.join("dot/config"),
+            b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
+        )
+        .expect("switch profile");
+    }
+    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
+    let native_run = native.rust_dot(&["update", "--quiet"]);
+
+    assert_profile_pair(
+        &shell_run,
+        &native_run,
+        &shell,
+        &native,
+        "failed retirement",
     );
-    assert!(
-        !output
-            .stderr
-            .windows(b"OLD-UPDATE-ENGINE".len())
-            .any(|row| row == b"OLD-UPDATE-ENGINE")
-    );
-    let ledger = fixture
-        .client
-        .home
-        .join(".local/state/dot/profile-overlay-lifecycle-v1");
-    assert!(
-        std::fs::read_to_string(ledger)
-            .expect("retained ledger")
-            .contains("alpha|")
+    for fixture in [&shell, &native] {
+        let ledger = fixture
+            .client
+            .home
+            .join(".local/state/dot/profile-overlay-lifecycle-v1");
+        assert!(
+            std::fs::read_to_string(ledger)
+                .expect("retained ledger")
+                .contains("alpha|"),
+            "failed retirement keeps alpha in the lifecycle ledger"
+        );
+    }
+    assert_profile_tree_twin(
+        &shell,
+        &native,
+        ".config/profile",
+        &["alpha", "beta"],
+        "failed retirement",
     );
 }
 
