@@ -331,6 +331,7 @@ fn staged_clone_does_not_replace_an_existing_destination() {
     assert!(!fixture.leaked_stage());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn staged_clone_canonicalizes_acl_inherited_extension_and_git_modes() {
     let fixture = CloneFixture::new("acl-modes", false);

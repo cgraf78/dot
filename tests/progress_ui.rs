@@ -312,7 +312,8 @@ fn completion_reload_shell_clock_and_json_contracts() {
     assert_eq!(now_ms("1700000000123", 1), b"1700000000123");
     assert_eq!(now_ms("bad", 42), b"42000");
     let json = br#"{"name":"dot","count":12,"zero":0,"negative":-2}"#;
-    for jq in [false, true] {
+    let have_jq = dot::merge_hooks::jq_available();
+    for jq in [false, true].into_iter().filter(|jq| !*jq || have_jq) {
         let expected = |value: &[u8]| [value, b"\n"].concat();
         assert_eq!(json_get("name", json, jq), expected(b"dot"));
         assert_eq!(json_num("count", json, jq), expected(b"12"));
@@ -413,7 +414,8 @@ fn clock_and_json_edge_matrices_are_explicit() {
     ] {
         assert_eq!(now_ms(stamp, seconds), expected.as_bytes(), "{stamp:?}");
     }
-    for (line, key, fallback, jq) in [
+    let have_jq = dot::merge_hooks::jq_available();
+    for (line, key, fallback, jq_expected) in [
         (
             r#"{"event":"done","index":3}"#,
             "event",
@@ -432,9 +434,11 @@ fn clock_and_json_edge_matrices_are_explicit() {
         ("not json", "event", b"", b""),
     ] {
         assert_eq!(json_get(key, line.as_bytes(), false), fallback);
-        assert_eq!(json_get(key, line.as_bytes(), true), jq);
+        if have_jq {
+            assert_eq!(json_get(key, line.as_bytes(), true), jq_expected);
+        }
     }
-    for (line, fallback, jq) in [
+    for (line, fallback, jq_expected) in [
         (r#"{"n":42}"#, b"42\n".as_slice(), b"42\n".as_slice()),
         (r#"{"n":0}"#, b"0\n", b"0\n"),
         (r#"{"n":1.5}"#, b"1\n", b"1.5\n"),
@@ -445,6 +449,8 @@ fn clock_and_json_edge_matrices_are_explicit() {
         ("not json", b"", b""),
     ] {
         assert_eq!(json_num("n", line.as_bytes(), false), fallback);
-        assert_eq!(json_num("n", line.as_bytes(), true), jq);
+        if have_jq {
+            assert_eq!(json_num("n", line.as_bytes(), true), jq_expected);
+        }
     }
 }
