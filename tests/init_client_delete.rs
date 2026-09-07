@@ -22,7 +22,7 @@ fn git_init(p: &Path) {
     let s = Command::new("git")
         .arg("-C")
         .arg(p)
-        .args(["init", "-q"])
+        .args(["init", "-q", "-b", "main"])
         .status()
         .unwrap();
     assert!(s.success())
