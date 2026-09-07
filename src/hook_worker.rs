@@ -34,6 +34,7 @@ const STARTUP_CONTROLS: [&str; 8] = [
 pub(crate) struct Worker {
     runtime: Runtime,
     extensions_dir: Option<PathBuf>,
+    bash: Option<PathBuf>,
 }
 
 /// One pre-sync worker's separately routed process streams.
@@ -49,6 +50,7 @@ impl Worker {
         Self {
             runtime: runtime.clone(),
             extensions_dir: None,
+            bash: None,
         }
     }
 
@@ -58,6 +60,19 @@ impl Worker {
         Self {
             runtime: runtime.clone(),
             extensions_dir: (!extensions_dir.is_empty()).then(|| PathBuf::from(extensions_dir)),
+            bash: None,
+        }
+    }
+
+    /// Bind an already-resolved absolute Bash for doctor extensions. A native
+    /// CLI process does not inherit Bash's non-exported `BASH` variable, while
+    /// the former shell coordinator did; the coordinator therefore passes the
+    /// interpreter capability it used for the runtime health probe.
+    pub(crate) fn with_doctor(runtime: &Runtime, extensions_dir: &str, bash: PathBuf) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            extensions_dir: Some(PathBuf::from(extensions_dir)),
+            bash: Some(bash),
         }
     }
 
@@ -94,6 +109,19 @@ impl Worker {
         self.launch("merge", script, temporary, result, context, token)
     }
 
+    /// Run one doctor extension through the same sanitized, authenticated
+    /// worker boundary used by lifecycle and merge hooks.
+    pub(crate) fn doctor(
+        &mut self,
+        script: &Path,
+        temporary: &Path,
+        result: &Path,
+        context: &Path,
+        token: &str,
+    ) -> WorkerOutcome {
+        self.launch("doctor", script, temporary, result, context, token)
+    }
+
     fn command(
         &self,
         mode: &str,
@@ -112,7 +140,11 @@ impl Worker {
         {
             return None;
         }
-        let bash = bash_path(&self.runtime)?;
+        let bash = self
+            .bash
+            .clone()
+            .or_else(|| bash_path(&self.runtime))
+            .filter(|path| path.is_absolute() && executable(path))?;
         let (cache, data) = (
             xdg_home(&self.runtime, "XDG_CACHE_HOME", ".cache"),
             xdg_home(&self.runtime, "XDG_DATA_HOME", ".local/share"),
