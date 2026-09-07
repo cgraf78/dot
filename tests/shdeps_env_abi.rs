@@ -294,7 +294,7 @@ fn bounded_run_passthrough() {
         0,
         b"a\nb\n",
     );
-    assert_bounded("5", "true", "discard-stderr", &["/bin/true"], 0, b"");
+    assert_bounded("5", "true", "discard-stderr", &["/usr/bin/true"], 0, b"");
     assert_bounded(
         "5",
         "exit three",
