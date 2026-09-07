@@ -3192,6 +3192,20 @@ fn update_native_profile_failed_retirement_matches_shell_twin() {
         .expect("switch profile");
     }
     let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
+    assert_eq!(
+        shell_run.status.code(),
+        Some(1),
+        "shell failed-retirement status"
+    );
+    assert!(
+        String::from_utf8_lossy(&shell_run.stderr).contains("profile deactivation failed: alpha"),
+        "shell failed-retirement stderr: {}",
+        String::from_utf8_lossy(&shell_run.stderr)
+    );
+    assert!(
+        shell.client.home.join(".dotfiles-beta/.git").is_dir(),
+        "shell finalization reaches the selected beta generation before retirement fails"
+    );
     let native_run = native.rust_dot(&["update", "--quiet"]);
 
     assert_profile_pair(
