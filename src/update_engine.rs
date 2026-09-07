@@ -874,6 +874,7 @@ fn converge_overlays(
         &entries,
         "reconcile",
         now_secs,
+        io.out,
         io.err,
     )
     .is_err()
@@ -984,6 +985,7 @@ fn converge_profiles(
         &entries,
         "prepare",
         now_secs,
+        io.out,
         io.err,
     )
     .is_err()
@@ -1092,6 +1094,7 @@ fn converge_profiles(
         &entries,
         "reconcile",
         now_secs,
+        io.out,
         io.err,
     )
     .is_err()
@@ -1242,6 +1245,7 @@ fn pre_sync(
     eligible: &[String],
     stage: &str,
     now_secs: i64,
+    out: &mut Vec<u8>,
     err: &mut Vec<u8>,
 ) -> Result<(), ()> {
     let extensions_dir = configured_root.unwrap_or(inputs.extensions_dir);
@@ -1257,10 +1261,10 @@ fn pre_sync(
         .map(|record| record.as_bytes().to_vec())
         .collect();
     let mut worker = crate::hook_worker::Worker::with_extensions(inputs.runtime, extensions_dir);
-    let mut worker_output = Vec::new();
     let mut runner = |call: &crate::pre_sync::Call| {
         let outcome = worker.pre_sync(call);
-        worker_output.extend_from_slice(&outcome.output);
+        out.extend_from_slice(&outcome.stdout);
+        err.extend_from_slice(&outcome.stderr);
         outcome.rc == 0
     };
     match crate::pre_sync::run(
@@ -1274,7 +1278,6 @@ fn pre_sync(
     ) {
         Ok(outcome) if outcome.status == 0 => Ok(()),
         Ok(outcome) => {
-            err.extend_from_slice(&worker_output);
             for warning in outcome.warnings {
                 inputs.log.warn(err, &warning);
             }

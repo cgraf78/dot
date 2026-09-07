@@ -2550,6 +2550,33 @@ impl NativeUpdateFixture {
         }
     }
 
+    /// Install one trusted pre-sync entry point in the fixture's configured
+    /// extension root. The shell and native update lanes must relay the hook's
+    /// stdout and stderr to their respective update streams.
+    fn with_pre_sync(self, script: &[u8]) -> Self {
+        let extensions = self.client.home.join("extensions");
+        let hooks = extensions.join("pre-sync.d");
+        std::fs::create_dir_all(&hooks).expect("pre-sync directory");
+        let hook = hooks.join("10-streams.sh");
+        std::fs::write(&hook, script).expect("pre-sync hook");
+        std::fs::create_dir_all(self.client.xdg.join("dot")).expect("config directory");
+        std::fs::write(
+            self.client.xdg.join("dot/config"),
+            b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\n",
+        )
+        .expect("extension config");
+        #[cfg(unix)]
+        {
+            for path in [&extensions, &hooks] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                    .expect("private extension directory");
+            }
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700))
+                .expect("private pre-sync hook");
+        }
+        self
+    }
+
     /// Add the smallest profile-aware policy to the otherwise clean native
     /// repository fixture. The existing `alpha` descriptor stays selected in
     /// phase one, so an exit through the poisoned adapter proves the profile
@@ -2987,6 +3014,48 @@ fn update_native_configured_pre_sync_hook_uses_the_hardened_worker() {
 }
 
 #[test]
+fn update_native_pre_sync_success_streams_match_shell() {
+    let shell = NativeUpdateFixture::stage().with_pre_sync(
+        b"prepare() { printf 'pre-sync stdout\\n'; printf 'pre-sync stderr\\n' >&2; }\n",
+    );
+    let native = NativeUpdateFixture::stage().with_pre_sync(
+        b"prepare() { printf 'pre-sync stdout\\n'; printf 'pre-sync stderr\\n' >&2; }\n",
+    );
+
+    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
+    assert_eq!(shell_run.status.code(), Some(0), "shell pre-sync success");
+    assert!(has_bytes(&shell_run.stdout, b"pre-sync stdout\n"));
+    assert!(has_bytes(&shell_run.stderr, b"pre-sync stderr\n"));
+    let native_run = native.rust_dot(&["update", "--quiet"]);
+
+    assert_update_pair(
+        &shell_run,
+        &native_run,
+        &shell,
+        &native,
+        "successful pre-sync",
+    );
+}
+
+#[test]
+fn update_native_pre_sync_failure_streams_match_shell() {
+    let shell = NativeUpdateFixture::stage().with_pre_sync(
+        b"prepare() { printf 'pre-sync stdout\\n'; printf 'pre-sync stderr\\n' >&2; return 7; }\n",
+    );
+    let native = NativeUpdateFixture::stage().with_pre_sync(
+        b"prepare() { printf 'pre-sync stdout\\n'; printf 'pre-sync stderr\\n' >&2; return 7; }\n",
+    );
+
+    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
+    assert_eq!(shell_run.status.code(), Some(1), "shell pre-sync failure");
+    assert!(has_bytes(&shell_run.stdout, b"pre-sync stdout\n"));
+    assert!(has_bytes(&shell_run.stderr, b"pre-sync stderr\n"));
+    let native_run = native.rust_dot(&["update", "--quiet"]);
+
+    assert_update_pair(&shell_run, &native_run, &shell, &native, "failed pre-sync");
+}
+
+#[test]
 fn update_native_profile_base_selection_does_not_invoke_shell_engine() {
     // A native profile run must complete with the legacy adapter impossible
     // to invoke. Before Task 4, `Fallback::Profiles` selects that adapter and
@@ -3202,11 +3271,10 @@ fn update_native_profile_conflict_after_base_pull_restores_prior_generation() {
     );
 }
 
-/// A profile update has mutable repository, manifest, and lifecycle state, so
-/// it needs separate fixture scopes on each side of the oracle.  The process
-/// streams contain only scope-specific paths and stage elapsed stamps; those
-/// are normalized by [`scrub_twin`] after their shape has been checked.
-fn assert_profile_pair(
+/// Compare the process contract of independently staged shell and native
+/// updates. Scope-specific paths and elapsed stamps normalize only after each
+/// lane's exit status is established.
+fn assert_update_pair(
     shell: &std::process::Output,
     native: &std::process::Output,
     shell_fixture: &NativeUpdateFixture,
@@ -3232,7 +3300,18 @@ fn assert_profile_pair(
         scrub_twin(&shell.stderr, shell_fixture.client.scope.path()),
         "{label} stderr",
     );
+}
 
+/// A profile update also owns mutable manifest and lifecycle records, so its
+/// oracle extends the process contract with those persisted generations.
+fn assert_profile_pair(
+    shell: &std::process::Output,
+    native: &std::process::Output,
+    shell_fixture: &NativeUpdateFixture,
+    native_fixture: &NativeUpdateFixture,
+    label: &str,
+) {
+    assert_update_pair(shell, native, shell_fixture, native_fixture, label);
     for relative in [
         ".local/state/dot/overlay-links",
         ".local/state/dot/profile-overlay-lifecycle-v1",
@@ -3270,50 +3349,155 @@ fn assert_profile_twin(
     assert_profile_pair(&shell, &native, shell_fixture, native_fixture, label);
 }
 
-fn git_porcelain(client: &ReposClient) -> Vec<u8> {
+#[derive(Debug, PartialEq, Eq)]
+struct CheckoutSnapshot {
+    head_at_upstream: bool,
+    porcelain: Vec<u8>,
+}
+
+fn git_base_output(client: &ReposClient, args: &[&str]) -> Vec<u8> {
     let output = Command::new("git")
         .arg(format!("--git-dir={}", client.base_git_dir.display()))
         .arg(format!("--work-tree={}", client.home.display()))
-        // The separate bare Git directory, checkouts, and shell-only runtime
-        // stamps all live under this synthetic worktree.  Compare tracked
-        // changes only: that is the Git state the profile convergence owns.
-        .args(["status", "--porcelain=v1", "--untracked-files=no"])
+        .args(args)
         .env("DOT_GIT_REAL", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("read profile worktree status");
+        .expect("read profile base checkout");
     assert!(
         output.status.success(),
-        "profile worktree status: {}",
+        "profile base checkout: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout
+}
+
+fn git_checkout_output(checkout: &Path, args: &[&str]) -> Vec<u8> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(args)
+        .env("DOT_GIT_REAL", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("read profile checkout");
+    assert!(
+        output.status.success(),
+        "profile checkout {}: {}",
+        checkout.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn base_snapshot(client: &ReposClient) -> CheckoutSnapshot {
+    // The separate bare Git directory, checkouts, and shell-only runtime
+    // stamps all live under this synthetic worktree. Compare tracked changes
+    // only: that is the Git state profile convergence owns.
+    let head = git_base_output(client, &["rev-parse", "HEAD"]);
+    let upstream = git_base_output(client, &["rev-parse", "@{upstream}"]);
+    CheckoutSnapshot {
+        head_at_upstream: head == upstream,
+        porcelain: git_base_output(
+            client,
+            &["status", "--porcelain=v1", "--untracked-files=no"],
+        ),
+    }
+}
+
+fn checkout_snapshot(checkout: &Path) -> Option<CheckoutSnapshot> {
+    checkout.join(".git").is_dir().then(|| {
+        let head = git_checkout_output(checkout, &["rev-parse", "HEAD"]);
+        let upstream = git_checkout_output(checkout, &["rev-parse", "@{upstream}"]);
+        CheckoutSnapshot {
+            head_at_upstream: head == upstream,
+            porcelain: git_checkout_output(
+                checkout,
+                &["status", "--porcelain=v1", "--untracked-files=no"],
+            ),
+        }
+    })
+}
+
+fn profile_checkout(client: &ReposClient, name: &str) -> PathBuf {
+    match name {
+        "alpha" => client.overlay.clone(),
+        "beta" => client.home.join(".dotfiles-beta"),
+        _ => panic!("unknown profile fixture checkout: {name}"),
+    }
+}
+
+fn managed_tree(root: &Path) -> Vec<(String, bool, Vec<u8>)> {
+    if !root.exists() {
+        return Vec::new();
+    }
+    let mut tree = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("managed tree directory") {
+            let entry = entry.expect("managed tree entry");
+            let path = entry.path();
+            let kind = std::fs::symlink_metadata(&path).expect("managed tree metadata");
+            let relative = path
+                .strip_prefix(root)
+                .expect("managed tree child")
+                .to_string_lossy()
+                .into_owned();
+            if kind.is_dir() && !kind.file_type().is_symlink() {
+                stack.push(path);
+            } else if kind.file_type().is_symlink() {
+                tree.push((
+                    relative,
+                    true,
+                    std::fs::read_link(path)
+                        .expect("managed link target")
+                        .into_os_string()
+                        .into_encoded_bytes(),
+                ));
+            } else if kind.is_file() {
+                tree.push((relative, false, std::fs::read(path).expect("managed file")));
+            }
+        }
+    }
+    tree.sort();
+    tree
+}
+
+fn normalized_managed_tree(root: &Path, scope: &Path) -> Vec<(String, bool, Vec<u8>)> {
+    managed_tree(root)
+        .into_iter()
+        .map(|(relative, link, bytes)| (relative, link, scrub_scope(&bytes, scope)))
+        .collect()
 }
 
 fn assert_profile_tree_twin(
     shell_fixture: &NativeUpdateFixture,
     native_fixture: &NativeUpdateFixture,
     relative: &str,
+    checkouts: &[&str],
     label: &str,
 ) {
     let shell = shell_fixture.client.home.join(relative);
     let native = native_fixture.client.home.join(relative);
     assert_eq!(
-        native.is_symlink(),
-        shell.is_symlink(),
-        "{label} link shape"
+        normalized_managed_tree(&native, native_fixture.client.scope.path()),
+        normalized_managed_tree(&shell, shell_fixture.client.scope.path()),
+        "{label} managed tree"
     );
     assert_eq!(
-        std::fs::read(&native).ok(),
-        std::fs::read(&shell).ok(),
-        "{label} link content"
+        base_snapshot(&native_fixture.client),
+        base_snapshot(&shell_fixture.client),
+        "{label} base checkout"
     );
-    assert_eq!(
-        git_porcelain(&native_fixture.client),
-        git_porcelain(&shell_fixture.client),
-        "{label} base worktree status"
-    );
+    for name in checkouts {
+        assert_eq!(
+            checkout_snapshot(&profile_checkout(&native_fixture.client, name)),
+            checkout_snapshot(&profile_checkout(&shell_fixture.client, name)),
+            "{label} {name} checkout"
+        );
+    }
 }
 
 #[test]
@@ -3325,6 +3509,13 @@ fn update_native_profile_selection_matches_shell_twin() {
     let native = NativeUpdateFixture::stage().with_base_profile();
 
     assert_profile_twin(&shell, &native, "base profile selection");
+    assert_profile_tree_twin(
+        &shell,
+        &native,
+        ".config/profile",
+        &["alpha"],
+        "base profile selection",
+    );
 }
 
 #[test]
@@ -3336,6 +3527,13 @@ fn update_native_profile_selector_conflict_matches_shell_twin() {
     let native = NativeUpdateFixture::stage().with_conflicting_profile_selectors();
 
     assert_profile_twin(&shell, &native, "selector conflict");
+    assert_profile_tree_twin(
+        &shell,
+        &native,
+        ".config/profile",
+        &["alpha"],
+        "selector conflict",
+    );
 }
 
 #[test]
@@ -3345,10 +3543,10 @@ fn update_native_profile_descriptor_refresh_matches_shell_twin() {
     // shell and native outputs plus generated state remain the oracle.
     let shell = NativeUpdateFixture::stage().with_base_discovered_profile_addition();
     let native = NativeUpdateFixture::stage().with_base_discovered_profile_addition();
-    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |cmd| {
+    let shell_run = shell.shell_dot_with(&["update"], |cmd| {
         cmd.env("XDG_CONFIG_HOME", shell.client.home.join(".config"));
     });
-    let native_run = native.rust_dot_with(&["update", "--quiet"], |cmd| {
+    let native_run = native.rust_dot_with(&["update"], |cmd| {
         cmd.env("XDG_CONFIG_HOME", native.client.home.join(".config"));
     });
 
@@ -3362,7 +3560,8 @@ fn update_native_profile_descriptor_refresh_matches_shell_twin() {
     assert_profile_tree_twin(
         &shell,
         &native,
-        ".config/profile/value",
+        ".config/profile",
+        &["alpha", "beta"],
         "descriptor refresh",
     );
 }
@@ -3393,6 +3592,13 @@ fn update_native_profile_retirement_matches_shell_twin() {
         native.client.home.join(".dotfiles-beta/.git").is_dir(),
         shell.client.home.join(".dotfiles-beta/.git").is_dir(),
         "retirement beta checkout"
+    );
+    assert_profile_tree_twin(
+        &shell,
+        &native,
+        ".config/profile",
+        &["alpha", "beta"],
+        "retirement",
     );
 }
 
@@ -3448,7 +3654,8 @@ fn update_native_profile_rollback_matches_shell_twin() {
     assert_profile_tree_twin(
         &shell,
         &native,
-        ".config/profile/value",
+        ".config/profile",
+        &["alpha"],
         "rollback conflict",
     );
 }
@@ -3460,6 +3667,10 @@ fn scrub_scope(bytes: &[u8], scope: &std::path::Path) -> Vec<u8> {
     String::from_utf8_lossy(bytes)
         .replace(&scope.to_string_lossy().into_owned(), "@SCOPE@")
         .into_bytes()
+}
+
+fn has_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|row| row == needle)
 }
 
 /// Scrub update elapsed stamps (trailing `0s`, `1s`) after
