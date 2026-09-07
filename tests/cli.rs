@@ -1595,6 +1595,7 @@ fn repos_git(dir: &Path, args: &[&str]) {
     let status = command
         .arg("-C")
         .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .env("DOT_GIT_REAL", "1")
         .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00+00:00")
