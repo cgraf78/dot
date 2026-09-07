@@ -1,47 +1,11 @@
-//! Production engine bindings for `dot_init_command`
-//! (`lib/dot/init-client.sh`, lines 1789-1967): the `resume`,
-//! `rollback`, and `fresh` closures `run_init` binds,
-//! composed from the already-ported `init_client_*` modules.
+//! Production bindings for the native init-client command.
 //!
-//! The shell file holds 79 functions — too big for one lane — so
-//! this module owns only the integration wiring the dispatcher
-//! needs: the resume-orchestrator dependencies
-//! ([`resume::resume_transaction`]),
-//! the rollback-orchestrator dependencies
-//! ([`rollback::rollback`]),
-//! and the line-1872+ fresh tail (completed-file branch, adoption,
-//! candidate build, plan review, confirmation, staging, and the
-//! closing resume) as [`Production::run_fresh`]. Nothing is
-//! re-ported here: every step delegates to its owning lane, and
-//! this module only adapts shapes (byte/string splits, struct
-//! projections, reply re-serialization) at the boundaries.
-//!
-//! Lane map, so the integrator can stack without overlap: argument
-//! parsing and mode dispatch stay on `rust-port-slice-79`
-//! ([`crate::init_client_command`]), usage and status on
-//! `rust-port-slice-73` ([`crate::init_client_adopt`]), identity and
-//! branch validation on `rust-port-slice-41`
-//! ([`crate::init_client_identity`]), the transaction lifecycle on
-//! `rust-port-slice-35`
-//! ([`crate::init_client_transaction`]), the record journal on
-//! `rust-port-slice-51` / `rust-port-slice-54`
-//! ([`crate::init_client_record`]), resume on `rust-port-slice-70`
-//! ([`crate::init_client_resume`]), rollback on `rust-port-slice-66`
-//! ([`crate::init_client_rollback`]), adoption on
-//! `rust-port-slice-69` ([`crate::init_client_adopt`]), the plan
-//! review on `rust-port-slice-62`
-//! ([`crate::init_client_plan`]), the git stage on
-//! `rust-port-slice-43` / `rust-port-slice-68`
-//! ([`crate::init_client_generation`],
-//! [`crate::init_client_git`]), publication on `rust-port-slice-65`
-//! ([`crate::init_client_publish`],
-//! [`crate::init_client_publish_intent`]), entries on
-//! `rust-port-slice-46` ([`crate::init_client_entry`]), deletion
-//! parking on `rust-port-slice-55` / `rust-port-slice-58`
-//! ([`crate::init_client_delete`]), candidates on
-//! `rust-port-slice-48` ([`crate::init_client_candidate`]), and
-//! parents on `rust-port-slice-73`
-//! ([`crate::init_client_parent`]).
+//! This module owns the orchestration wiring for resume, rollback,
+//! and fresh initialization. The underlying identity, transaction,
+//! journal, plan, generation, publication, entry, deletion,
+//! candidate, and parent operations remain in their focused
+//! `init_client_*` modules. This boundary adapts their data shapes
+//! without duplicating their behavior.
 //!
 //! The port stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
@@ -137,6 +101,8 @@ pub struct EngineCtx<'a> {
     pub source_root: &'a Path,
     /// `DOT_INIT_SKIP_PROVIDER` is `1`.
     pub skip_provider: bool,
+    /// Captured process-local Shdeps policy override.
+    pub shdeps_update_policy: Option<&'a str>,
     /// Process working directory: anchors the reserved-roots probe
     /// and the publish git binding, like the shell's inherited cwd
     /// (the dispatcher reads it; it is process state, like `HOME`).
@@ -158,6 +124,7 @@ pub struct Production<'a> {
     xdg_state_home: &'a str,
     source_root: &'a Path,
     skip_provider: bool,
+    shdeps_update_policy: Option<&'a str>,
     cwd: &'a Path,
     /// Current staged git identity (`DOT_INIT_GIT_DEV` /
     /// `DOT_INIT_GIT_INO`): seeded from the journal, refreshed by
@@ -169,6 +136,86 @@ pub struct Production<'a> {
 }
 
 impl<'a> Production<'a> {
+    /// Bind the parent publisher to the same native collaborators used by the
+    /// production engine. Keeping this crate-private builder beside the
+    /// orchestration prevents tests and callers from reconstructing subtly
+    /// different claim and identity semantics.
+    fn parent_hooks<'b>(&'b self, journal: &'b TransactionRecord) -> parent::ParentHooks<'b> {
+        parent::ParentHooks {
+            parent_record: Box::new(|transaction: &Path, relative: &[u8]| {
+                let relative = std::str::from_utf8(relative).map_err(|_| Error::Usage {
+                    message: "parent path is not UTF-8",
+                })?;
+                record::parent_record(
+                    transaction,
+                    relative,
+                    &self.home,
+                    &journal.nonce,
+                    self.source_root,
+                )
+                .map(|found| parent_reply(&found))
+            }),
+            write_private_line: Box::new(|file: &Path, line: &[u8], replace: bool| {
+                let line = std::str::from_utf8(line).map_err(|_| Error::Usage {
+                    message: "intent line is not UTF-8",
+                })?;
+                let mut cache = temp::MoveCache::default();
+                entry::write_private_line(file, line, replace, &mut cache)
+            }),
+            stage_claim_write: Box::new(|stage: &Path, kind: &str, path: &[u8]| {
+                let path = std::str::from_utf8(path).map_err(|_| Error::Usage {
+                    message: "claim path is not UTF-8",
+                })?;
+                let mut cache = temp::MoveCache::default();
+                entry::stage_claim_write(
+                    stage,
+                    kind,
+                    path,
+                    &journal.nonce,
+                    self.source_root,
+                    &mut cache,
+                )
+            }),
+            stage_claim_matches: Box::new(|stage: &Path, kind: &str, path: &[u8]| {
+                let path = std::str::from_utf8(path).map_err(|_| Error::Usage {
+                    message: "claim path is not UTF-8",
+                })?;
+                matched(
+                    entry::stage_claim_matches(stage, kind, path, &journal.nonce, self.source_root),
+                    "stage claim does not match",
+                )
+            }),
+            stage_claim_only: Box::new(|stage: &Path| {
+                matched(
+                    entry::entry_stage_only_next(stage),
+                    "stage is not claim-only",
+                )
+            }),
+            stage_claim_remove: Box::new(|stage: &Path, kind: &str, path: &[u8]| {
+                let path = std::str::from_utf8(path).map_err(|_| Error::Usage {
+                    message: "claim path is not UTF-8",
+                })?;
+                entry::stage_claim_remove(stage, kind, path, &journal.nonce, self.source_root)
+            }),
+            private_directory_matches: Box::new(
+                |path: &Path, identity: Option<&str>, mode: Option<&str>| {
+                    matched(
+                        delete::private_directory_matches(path, identity, mode),
+                        "private directory does not match",
+                    )
+                },
+            ),
+            private_empty_directory_matches: Box::new(
+                |path: &Path, identity: Option<&str>, mode: Option<&str>| {
+                    matched(
+                        delete::private_empty_directory_matches(path, identity, mode),
+                        "private directory is not empty",
+                    )
+                },
+            ),
+        }
+    }
+
     /// Bind one run: explicit process inputs plus the convergence
     /// closure. No filesystem or process touch happens here; every
     /// effect runs inside [`Production::resume`],
@@ -180,6 +227,7 @@ impl<'a> Production<'a> {
             xdg_state_home: ctx.xdg_state_home,
             source_root: ctx.source_root,
             skip_provider: ctx.skip_provider,
+            shdeps_update_policy: ctx.shdeps_update_policy,
             cwd: ctx.cwd,
             git_identity: RefCell::new((String::from("-"), String::from("-"))),
             on_converge,
@@ -192,9 +240,11 @@ impl<'a> Production<'a> {
     }
 
     /// `DOT_BIN` for journal writes: `$DOT_SOURCE_ROOT/bin/dot`,
-    /// like `lib/dot/constants.sh` derives it.
+    /// like a development checkout derives it. Standalone releases record the
+    /// verified packaged binary at the release root.
     fn dot_bin(&self) -> PathBuf {
-        self.source_root.join("bin/dot")
+        crate::startup::release_binary(self.source_root)
+            .unwrap_or_else(|| self.source_root.join("bin/dot"))
     }
 }
 
@@ -308,6 +358,11 @@ fn silent_refusal(step: &'static str) -> Error {
         command: step.to_string(),
         status: None,
     }
+}
+
+/// Effective publication mask after the startup `g-w,o-w` ceiling.
+fn publication_mask(mask: u32) -> u32 {
+    crate::startup::ensure_umask_ceiling(mask)
 }
 
 /// Remove one path like `rm -rf`: missing paths succeed, symlinks
@@ -654,85 +709,7 @@ impl<'a> Production<'a> {
         journal: &TransactionRecord,
     ) -> Result<()> {
         let ensure_parents = |transaction: &Path, relative: &str| {
-            let hooks = parent::ParentHooks {
-                parent_record: Box::new(|transaction: &Path, relative: &[u8]| {
-                    let relative = std::str::from_utf8(relative).map_err(|_| Error::Usage {
-                        message: "parent path is not UTF-8",
-                    })?;
-                    record::parent_record(
-                        transaction,
-                        relative,
-                        &self.home,
-                        &journal.nonce,
-                        self.source_root,
-                    )
-                    .map(|found| parent_reply(&found))
-                }),
-                write_private_line: Box::new(|file: &Path, line: &[u8], replace: bool| {
-                    let line = std::str::from_utf8(line).map_err(|_| Error::Usage {
-                        message: "intent line is not UTF-8",
-                    })?;
-                    let mut cache = temp::MoveCache::default();
-                    entry::write_private_line(file, line, replace, &mut cache)
-                }),
-                stage_claim_write: Box::new(|stage: &Path, kind: &str, path: &[u8]| {
-                    let path = std::str::from_utf8(path).map_err(|_| Error::Usage {
-                        message: "claim path is not UTF-8",
-                    })?;
-                    let mut cache = temp::MoveCache::default();
-                    entry::stage_claim_write(
-                        stage,
-                        kind,
-                        path,
-                        &journal.nonce,
-                        self.source_root,
-                        &mut cache,
-                    )
-                }),
-                stage_claim_matches: Box::new(|stage: &Path, kind: &str, path: &[u8]| {
-                    let path = std::str::from_utf8(path).map_err(|_| Error::Usage {
-                        message: "claim path is not UTF-8",
-                    })?;
-                    matched(
-                        entry::stage_claim_matches(
-                            stage,
-                            kind,
-                            path,
-                            &journal.nonce,
-                            self.source_root,
-                        ),
-                        "stage claim does not match",
-                    )
-                }),
-                stage_claim_only: Box::new(|stage: &Path| {
-                    matched(
-                        entry::entry_stage_only_next(stage),
-                        "stage is not claim-only",
-                    )
-                }),
-                stage_claim_remove: Box::new(|stage: &Path, kind: &str, path: &[u8]| {
-                    let path = std::str::from_utf8(path).map_err(|_| Error::Usage {
-                        message: "claim path is not UTF-8",
-                    })?;
-                    entry::stage_claim_remove(stage, kind, path, &journal.nonce, self.source_root)
-                }),
-                private_directory_matches: Box::new(
-                    |path: &Path, identity: Option<&str>, mode: Option<&str>| {
-                        matched(
-                            delete::private_directory_matches(path, identity, mode),
-                            "private directory does not match",
-                        )
-                    },
-                ),
-                private_empty_directory_matches: Box::new(
-                    |path: &Path, identity: Option<&str>, mode: Option<&str>| {
-                        matched(
-                            delete::private_empty_directory_matches(path, identity, mode),
-                            "private directory is not empty",
-                        )
-                    },
-                ),
-            };
+            let hooks = self.parent_hooks(journal);
             let mut cache = temp::MoveCache::default();
             parent::parent_directories(
                 &hooks,
@@ -790,7 +767,7 @@ impl<'a> Production<'a> {
             mode,
             oid,
             path,
-            mask: temp::read_umask()?,
+            mask: publication_mask(temp::read_umask()?),
             ensure_parents: &ensure_parents,
             read_intent: &read_intent,
             claim_matches: &claim_matches,
@@ -1075,17 +1052,13 @@ enum AdoptOutcome {
 }
 
 impl<'a> Production<'a> {
-    /// Derive the adoption selector from `DOT_BASE_TOPOLOGY`: only
-    /// an explicit non-`missing` value takes the separate path,
-    /// exactly like the shell's `[[ $DOT_BASE_TOPOLOGY != missing
-    /// ]]`. An unset variable reads as the model default
-    /// (`missing`), since the binary never sources the model that
-    /// would set it. Note an exported `ordinary` still takes the
-    /// separate path on both engines — the shell tests `!=
-    /// missing`, never `== separate`.
-    fn selected_topology() -> Topology {
-        match std::env::var("DOT_BASE_TOPOLOGY") {
-            Ok(topology) if topology != "missing" => Topology::Separate,
+    /// Select the legacy separate Git directory directly from the client.
+    /// Ordinary adoption remains the `Missing` branch in `adopt_existing`,
+    /// which validates `$HOME/.git` and its exact worktree root.
+    fn selected_topology(&self) -> Topology {
+        let dotfiles = join_leaf(&self.home, ".dotfiles");
+        match std::fs::symlink_metadata(dotfiles) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Topology::Separate,
             _ => Topology::Missing,
         }
     }
@@ -1171,7 +1144,7 @@ impl<'a> Production<'a> {
         };
         match adopt::adopt_existing(
             &self.home,
-            Self::selected_topology(),
+            self.selected_topology(),
             &inputs.origin,
             &inputs.identity,
             &inputs.branch,
@@ -1457,8 +1430,8 @@ impl<'a> Production<'a> {
             backup: backup_text.as_ref(),
             identity: &inputs.identity,
             home: &self.home,
-            source_root: self.source_root,
             skip_provider: self.skip_provider,
+            env_policy: self.shdeps_update_policy,
         }) {
             Ok(report) => out_stderr.extend_from_slice(&report),
             Err(_) => {
@@ -1589,7 +1562,7 @@ impl<'a> Production<'a> {
 /// shell, so they are captured here and merged into the report
 /// streams by the caller (never dropped, never bypassed).
 fn git_clone(origin: &str, branch: &str, candidate: &Path) -> CloneReport {
-    match Command::new("git")
+    match identity::host_git_command()
         .arg("clone")
         .arg("--quiet")
         .arg("--no-checkout")
@@ -1636,7 +1609,7 @@ struct CloneReport {
 /// substitution chomping: the locked commit, or `None` when git
 /// cannot report it.
 fn git_rev_parse(candidate: &Path, branch: &str) -> Option<String> {
-    let output = Command::new("git")
+    let output = identity::host_git_command()
         .arg("-C")
         .arg(candidate)
         .arg("rev-parse")
@@ -1753,4 +1726,268 @@ fn confirm_listing(manifest: &Path) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod parent_hook_tests {
+    use std::io::Write as _;
+    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::process::{Command, Stdio};
+
+    use super::*;
+    use dot_test_support::TempDir;
+
+    #[test]
+    fn publication_mask_enforces_the_startup_write_ceiling() {
+        assert_eq!(publication_mask(0o002), 0o022);
+        assert_eq!(publication_mask(0o077), 0o077);
+    }
+
+    fn journal(home: &Path) -> TransactionRecord {
+        TransactionRecord {
+            phase: "prepared".into(),
+            origin: "https://example.invalid/dotfiles.git".into(),
+            identity: "https://example.invalid/dotfiles".into(),
+            branch: "main".into(),
+            commit: "a".repeat(40),
+            git_dir: home.join(".dotfiles").to_string_lossy().into_owned(),
+            worktree: home.to_string_lossy().into_owned(),
+            backup: "-".into(),
+            dot: env!("CARGO_MANIFEST_DIR").to_owned() + "/bin/dot",
+            dot_revision: "b".repeat(40),
+            nonce: "parent-test".into(),
+            git_dev: "-".into(),
+            git_ino: "-".into(),
+        }
+    }
+
+    fn with_parent_fixture(test: impl FnOnce(&Production<'_>, &TransactionRecord, &Path, &Path)) {
+        let root = TempDir::new("engine-parent-hooks").expect("fixture root");
+        let home = root.path().join("home");
+        let state = root.path().join("state");
+        let transaction = state.join("transaction");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&transaction).expect("transaction");
+        let home_text = home.to_string_lossy().into_owned();
+        let state_text = state.to_string_lossy().into_owned();
+        let converge = || Ok(());
+        let production = Production::new(
+            EngineCtx {
+                home: &home_text,
+                xdg_state_home: &state_text,
+                source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
+                skip_provider: false,
+                shdeps_update_policy: None,
+                cwd: &home,
+            },
+            &converge,
+        );
+        let record = journal(&home);
+        test(&production, &record, &home, &transaction);
+    }
+
+    fn ensure(
+        production: &Production<'_>,
+        record: &TransactionRecord,
+        transaction: &Path,
+        path: &[u8],
+    ) -> Result<()> {
+        let hooks = production.parent_hooks(record);
+        let mut cache = temp::MoveCache::default();
+        parent::parent_directories(
+            &hooks,
+            transaction,
+            path,
+            &production.home,
+            &record.nonce,
+            &mut cache,
+        )
+    }
+
+    fn hash(bytes: &[u8]) -> String {
+        let mut child = Command::new("git")
+            .args(["hash-object", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn git hash-object");
+        child.stdin.as_mut().unwrap().write_all(bytes).unwrap();
+        let output = child.wait_with_output().expect("hash output");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn stage_rel(parent: &str, nonce: &str) -> String {
+        let directory = parent
+            .rsplit_once('/')
+            .map_or("", |(directory, _)| directory);
+        let leaf = format!(".dot-init-parent.{nonce}.{}", hash(parent.as_bytes()));
+        if directory.is_empty() {
+            leaf
+        } else {
+            format!("{directory}/{leaf}")
+        }
+    }
+
+    fn intent(transaction: &Path, parent: &str, line: &str) -> PathBuf {
+        let path = transaction.join(format!("parent-intent.{}", hash(parent.as_bytes())));
+        std::fs::write(&path, line).expect("intent");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    #[test]
+    fn production_parent_hooks_publish_nested_parents_and_rerun() {
+        with_parent_fixture(|production, record, home, transaction| {
+            ensure(production, record, transaction, b"a/b/file").expect("first publish");
+            ensure(production, record, transaction, b"a/b/file").expect("stable rerun");
+            assert!(home.join("a").is_dir());
+            assert!(home.join("a/b").is_dir());
+        });
+    }
+
+    #[test]
+    fn production_parent_hooks_refuse_file_and_symlink_occupants() {
+        with_parent_fixture(|production, record, home, transaction| {
+            std::fs::write(home.join("file"), b"occupied").expect("file occupant");
+            assert!(ensure(production, record, transaction, b"file/child").is_err());
+
+            symlink("missing", home.join("link")).expect("dangling link");
+            assert!(ensure(production, record, transaction, b"link/child").is_err());
+        });
+    }
+
+    #[test]
+    fn parent_top_level_is_noop() {
+        with_parent_fixture(|p, r, home, tx| {
+            ensure(p, r, tx, b"file").unwrap();
+            assert!(std::fs::read_dir(home).unwrap().next().is_none());
+        });
+    }
+
+    #[test]
+    fn parent_empty_path_is_noop() {
+        with_parent_fixture(|p, r, home, tx| {
+            ensure(p, r, tx, b"").unwrap();
+            assert!(std::fs::read_dir(home).unwrap().next().is_none());
+        });
+    }
+
+    #[test]
+    fn parent_root_path_is_noop() {
+        with_parent_fixture(|p, r, home, tx| {
+            ensure(p, r, tx, b"/").unwrap();
+            assert!(std::fs::read_dir(home).unwrap().next().is_none());
+        });
+    }
+
+    #[test]
+    fn parent_single_missing_level_is_published() {
+        with_parent_fixture(|p, r, home, tx| {
+            ensure(p, r, tx, b"a/file").unwrap();
+            assert!(home.join("a").is_dir());
+        });
+    }
+
+    #[test]
+    fn parent_trailing_slash_publishes_named_directory() {
+        with_parent_fixture(|p, r, home, tx| {
+            ensure(p, r, tx, b"a/").unwrap();
+            assert!(home.join("a").is_dir());
+        });
+    }
+
+    #[test]
+    fn parent_existing_directory_is_preserved() {
+        with_parent_fixture(|p, r, home, tx| {
+            std::fs::create_dir(home.join("a")).unwrap();
+            std::fs::set_permissions(home.join("a"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            ensure(p, r, tx, b"a/b/file").unwrap();
+            assert_eq!(temp::file_mode(&home.join("a")).unwrap(), 0o755);
+            assert!(home.join("a/b").is_dir());
+        });
+    }
+
+    #[test]
+    fn parent_directory_symlink_is_refused() {
+        with_parent_fixture(|p, r, home, tx| {
+            std::fs::create_dir(home.join("target")).unwrap();
+            symlink("target", home.join("a")).unwrap();
+            assert!(ensure(p, r, tx, b"a/file").is_err());
+        });
+    }
+
+    #[test]
+    fn parent_pending_record_resumes() {
+        with_parent_fixture(|p, r, home, tx| {
+            let stage = stage_rel("a", &r.nonce);
+            intent(tx, "a", &format!("pending\ta\t{stage}\t-\t-\t-\n"));
+            ensure(p, r, tx, b"a/file").unwrap();
+            assert!(home.join("a").is_dir());
+        });
+    }
+
+    #[test]
+    fn parent_foreign_stage_is_refused() {
+        with_parent_fixture(|p, r, home, tx| {
+            std::fs::create_dir(home.join(stage_rel("a", &r.nonce))).unwrap();
+            assert!(ensure(p, r, tx, b"a/file").is_err());
+        });
+    }
+
+    #[test]
+    fn parent_stale_record_is_refused() {
+        with_parent_fixture(|p, r, _home, tx| {
+            let stage = stage_rel("a", "another-run");
+            intent(tx, "a", &format!("pending\ta\t{stage}\t-\t-\t-\n"));
+            assert!(ensure(p, r, tx, b"a/file").is_err());
+        });
+    }
+
+    #[test]
+    fn parent_intent_directory_is_refused() {
+        with_parent_fixture(|p, r, _home, tx| {
+            std::fs::create_dir(tx.join(format!("parent-intent.{}", hash(b"a")))).unwrap();
+            assert!(ensure(p, r, tx, b"a/file").is_err());
+        });
+    }
+
+    #[test]
+    fn parent_prepared_stage_resumes_and_removes_claim() {
+        with_parent_fixture(|p, r, home, tx| {
+            let relative = stage_rel("a", &r.nonce);
+            let stage = home.join(&relative);
+            std::fs::create_dir(&stage).unwrap();
+            std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut cache = temp::MoveCache::default();
+            entry::stage_claim_write(&stage, "parent", "a", &r.nonce, p.source_root, &mut cache)
+                .unwrap();
+            let metadata = std::fs::metadata(&stage).unwrap();
+            intent(
+                tx,
+                "a",
+                &format!(
+                    "prepared\ta\t{relative}\t{}\t{}\t{:o}\n",
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.permissions().mode() & 0o7777
+                ),
+            );
+            ensure(p, r, tx, b"a/file").unwrap();
+            assert!(home.join("a").is_dir());
+            assert!(!entry::stage_claim_file(&home.join("a")).exists());
+        });
+    }
+
+    #[test]
+    fn parent_mid_tree_file_is_refused_after_preserving_ancestor() {
+        with_parent_fixture(|p, r, home, tx| {
+            std::fs::create_dir(home.join("a")).unwrap();
+            std::fs::write(home.join("a/b"), b"occupied").unwrap();
+            assert!(ensure(p, r, tx, b"a/b/file").is_err());
+            assert!(home.join("a").is_dir());
+        });
+    }
 }

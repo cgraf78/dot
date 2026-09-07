@@ -1,6 +1,6 @@
-//! Process-wide `dot update` serialization (slice 3).
+//! Process-wide `dot update` serialization.
 //!
-//! Ports `lib/dot/update-lock.sh`. `mkdir` atomicity, the owner record
+//! Uses `mkdir` atomicity, an owner record,
 //! (`pid\t…/start\t…/token\t…`), lock/owner path resolution,
 //! stale-claim-by-rename, the empty-guard protocol, and the 3-attempt
 //! acquire loop are transliterated. Two deliberate replacements (same
@@ -8,8 +8,8 @@
 //!
 //! - Process identity uses the same two backends (procfs field 22,
 //!   `ps -o lstart=`), read through std/`Command` — no change needed.
-//! - Liveness probing (`kill -0`) goes through the `kill` CLI (std has
-//!   no `kill(pid, 0)`); rare path only, no new dependency.
+//! - Liveness probing uses native `kill(pid, 0)` through the existing Unix
+//!   ABI dependency, avoiding a shell process on lock inspection.
 //! - The lock TOKEN format differs (`pid.nanos.counter` instead of
 //!   `$$.${SECONDS}.${RANDOM}`): tokens are opaque, and wall-clock
 //!   seconds plus `$RANDOM` are weaker uniqueness than a monotonic
@@ -17,7 +17,7 @@
 //! - Signal-trap installation (`_dot_update_lock_install_traps`) is
 //!   EXCLUDED: [`LockGuard`] releases on drop (RAII), which is strictly
 //!   stronger than EXIT-trap release (it also covers early returns and
-//!   panics). A signal-handler story is a later slice.
+//!   panics). Process-level signal handling stays at the CLI boundary.
 //! - `DOT_UPDATE_LOCK_TOKEN`/`DOT_UPDATE_LOCK_CRON_MODE` globals become
 //!   explicit parameters and return values.
 
@@ -293,21 +293,19 @@ pub fn process_start_ps(pid: u32) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-/// Foreign-pid liveness via the shell's `kill -0` builtin (std cannot
-/// send signal 0, and the external `kill` binary is absent from
-/// minimal images that the shell still supports: there `kill` is a
-/// builtin, so invoke it through `sh`, exactly like the shell's own
-/// `kill -0 "$pid" 2>/dev/null`. The pid is a u32, so no quoting is
-/// needed. A missing `sh` degrades to inactive, like every other
-/// unreadable-identity path.
+/// Foreign-pid liveness through the native Unix signal-zero probe.
 fn pid_alive(pid: u32) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("kill -0 {pid}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal zero performs permission/existence validation only and
+    // does not deliver a signal. `pid` is a checked positive process id.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    // EPERM still proves that the process exists; we merely lack permission
+    // to signal it.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Whether a recorded owner still holds the lock: process alive AND
@@ -771,7 +769,7 @@ mod tests {
 
     #[test]
     fn acquire_release_cycle() {
-        let scratch = crate::test_support::TempDir::new("lock-cycle").expect("scratch");
+        let scratch = dot_test_support::TempDir::new("lock-cycle").expect("scratch");
         let log = test_log();
         let mut warnings = Vec::new();
         let guard = acquire(scratch.path(), false, &log, None, &mut warnings).expect("acquire");
@@ -794,7 +792,7 @@ mod tests {
 
     #[test]
     fn drop_releases_unreleased_guard() {
-        let scratch = crate::test_support::TempDir::new("lock-drop").expect("scratch");
+        let scratch = dot_test_support::TempDir::new("lock-drop").expect("scratch");
         let log = test_log();
         let dir = scratch.path().join(DOT_DIR_NAME).join(LOCK_DIR_NAME);
         {
@@ -806,7 +804,7 @@ mod tests {
 
     #[test]
     fn initializing_empty_lock_reports_busy() {
-        let scratch = crate::test_support::TempDir::new("lock-init").expect("scratch");
+        let scratch = dot_test_support::TempDir::new("lock-init").expect("scratch");
         let dir = scratch.path().join(DOT_DIR_NAME).join(LOCK_DIR_NAME);
         std::fs::create_dir_all(&dir).expect("empty lock");
         assert!(is_initializing(&dir));
@@ -825,7 +823,7 @@ mod tests {
     fn acquire_refuses_a_symlinked_state_parent_without_touching_target() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-        let scratch = crate::test_support::TempDir::new("lock-parent-link").expect("scratch");
+        let scratch = dot_test_support::TempDir::new("lock-parent-link").expect("scratch");
         let target = scratch.path().join("unrelated-target");
         std::fs::create_dir(&target).expect("target directory");
         let sentinel = target.join("sentinel");

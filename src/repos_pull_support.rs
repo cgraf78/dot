@@ -9,7 +9,7 @@
 /// names after its "untracked working tree files would be overwritten
 /// by" marker, one per line.
 ///
-/// Ports the embedded awk program line for line: lines before the
+/// Preserves the established line-filter contract: lines before the
 /// marker are ignored; a line of leading whitespace followed by a
 /// non-space character emits with the whitespace run stripped; the
 /// first other line after the marker ends the listing (like awk's

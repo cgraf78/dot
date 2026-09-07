@@ -2,7 +2,7 @@
 //! logged pull with conflict-backup retry, and the base
 //! orchestrator built on it.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 
 use std::ffi::OsString;
@@ -325,7 +325,7 @@ pub fn pull_base(
     }
     // The prefix carries only the topology flags; `_base_git`
     // supplies the `git` binary itself.
-    let mut command: Vec<OsString> = vec![OsString::from("git")];
+    let mut command: Vec<OsString> = vec![crate::init_client_identity::host_git_program()];
     command.extend(prefix.iter().cloned());
     command.push(OsString::from("rebase"));
     command.push(OsString::from("--autostash"));
@@ -358,19 +358,21 @@ pub fn pull_base(
     let mut status = PullStatus::Current;
     if !head_before.is_empty() && !head_after.is_empty() && head_before != head_after {
         let snapshot_text = snapshot.to_string_lossy().into_owned();
-        let normalized = read_umask().is_ok_and(|mask| {
-            normalize_updated_paths(
-                &prefix,
-                &inputs.base.home,
-                "base",
-                &head_before,
-                &head_after,
-                &snapshot_text,
-                &inputs.base.home,
-                inputs.overlays,
-                mask,
-            )
-        });
+        let normalized = read_umask()
+            .map(crate::startup::ensure_umask_ceiling)
+            .is_ok_and(|mask| {
+                normalize_updated_paths(
+                    &prefix,
+                    &inputs.base.home,
+                    "base",
+                    &head_before,
+                    &head_after,
+                    &snapshot_text,
+                    &inputs.base.home,
+                    inputs.overlays,
+                    mask,
+                )
+            });
         if !normalized {
             let mut cleanup = Registry::new();
             let _ = cleanup.remove_path(&snapshot);

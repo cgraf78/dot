@@ -204,14 +204,6 @@ fn native_cancellation_does_not_stop_another_invocation() {
 }
 
 #[test]
-fn native_complete_shell_lifecycle_oracle_with_poisoned_engine() {
-    let f = Fixture::new();
-    let output = f.oracle("test-lifecycle-test");
-    success(&output);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("test-lifecycle-test: ok"));
-}
-
-#[test]
 fn native_parallel_cancellation_has_one_shared_grace_deadline() {
     let f = Fixture::new();
     for index in 0..8 {

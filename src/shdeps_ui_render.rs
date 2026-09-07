@@ -8,44 +8,38 @@
 //! `_shdeps_print_verbose_items`,
 //! `_shdeps_print_group_items_with_status`,
 //! `_shdeps_print_group_summaries`). Part 1 (the group vocabulary and
-//! record) lives on the unmerged `rust-port-slice-44` lane as
-//! `shdeps_ui`; this module stacks beside it once both land, which is
-//! why the renderers take the record as plain maps plus a display
-//! fallback instead of borrowing that lane's `State`.
+//! record) lives in `shdeps_ui`; renderers take the record as plain maps plus
+//! a display fallback to keep the presentation boundary explicit.
 //!
-//! Later lanes own the remainder of the file: the JSONL event layer
+//! The provider coordinator owns the JSONL event layer
 //! (`_shdeps_parse_event`, `_handle_shdeps_event`), the child
 //! liveness probes (`_shdeps_proc_state`, `_shdeps_update_finished`),
 //! and the FIFO update orchestration (`_run_shdeps_update_ui`,
-//! `_run_shdeps_update_command`). A different lane family
-//! (`shdeps_env_abi` on the unmerged `rust-port-slice-59` lane, the
-//! lock reader and checkpoint record on `rust-port-slice-37` /
-//! `rust-port-slice-40`) owns the sibling
-//! `lib/dot/providers/shdeps.sh` provider; nothing here duplicates
-//! any of them.
+//! `_run_shdeps_update_command`). `shdeps_env_abi`, the lock reader, and
+//! checkpoint modules own provider state; nothing here duplicates them.
 //!
 //! Engine boundaries: text flows as bytes, like the sibling
 //! [`crate::progress_ui`] helpers and the part-1 record, so item
 //! names outside UTF-8 pass through verbatim on both sides. Every
-//! `_ui_*` effect goes through the already ported
+//! Every `_ui_*` effect goes through
 //! [`crate::progress_ui`] twins with the same marker palette the
 //! progress tests pin, so only this family's control flow is new:
 //! the known-group order plus discovery order with the shell's
 //! dedup gate, the per-label section merge, the wanted-status
 //! filter, and the threshold branch. The dedup gate quotes the
 //! group (`*" $group "*`), so metacharacters match literally: a
-//! group spelling `c*` never swallows `cargo`, and the port is a
+//! group spelling `c*` never swallows `cargo`; this is a
 //! plain substring search. Shell `_warn` diagnostics fold into the
 //! data refusal like parts before them. Counts and elapsed values
 //! arrive canonical from shell arithmetic upstream, matching the
 //! precedent in [`crate::progress_ui`] and `merges::summary`, so
 //! only `i64` is modeled; other arithmetic spellings stay
 //! unreproduced and unrowed, like the decimal-only flags on the
-//! `rust-port-slice-59` lane. Concretely: identifier-like elapsed
+//! provider ABI. Concretely: identifier-like elapsed
 //! values read as unset shell variables (`0`) with no diagnostic,
 //! so `abc` against a positive threshold agrees false; against a
-//! zero threshold the shell would read true, which agrees with the
-//! port only for statuses whose note is threshold-invariant
+//! zero threshold the shell would read true, which agrees only for statuses
+//! whose note is threshold-invariant
 //! (`failed`, `warning`, and unknown — rows pin `failed`) and stays
 //! unrowed for the rest; invalid-octal spellings like `08` print an
 //! arithmetic diagnostic and read false on both sides (rows pin the
@@ -77,7 +71,7 @@ pub const KNOWN_GROUPS: &[&[u8]] = &[
 /// Session globals this family writes, mirroring the
 /// `DOT_UI_SHDEPS_*` scalars `_shdeps_ui_reset` establishes. The
 /// group maps the reset also clears belong to the part-1 record
-/// (the unmerged `rust-port-slice-44` lane's `State::new()`); the
+/// (`shdeps_ui::State::new()`); the
 /// prompt acknowledgment descriptor belongs to the FIFO lane, which
 /// passes its raw value into [`prompt_pause`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,7 +277,7 @@ fn first_line(blob: &[u8]) -> &[u8] {
 /// group has no recorded non-empty label, like the shell
 /// `${...:-...}` fallback in `_shdeps_display_label`. The fallback
 /// vocabulary (the part-1 `_shdeps_group_label`) arrives injected so
-/// this module never re-types the unmerged record lane; once the
+/// this module never re-types the record model; once the
 /// lanes stack, the caller passes that lane's display resolver here.
 fn display_label(
     labels: &HashMap<Vec<u8>, Vec<u8>>,

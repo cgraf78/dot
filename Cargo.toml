@@ -23,6 +23,9 @@ path = "src/main.rs"
 # Keep Unix ABI definitions in libc rather than duplicating platform layouts.
 libc = "0.2"
 
+[dev-dependencies]
+dot-test-support = { path = "test-support" }
+
 # Treat compiler warnings as build errors. CI runs `cargo clippy --locked
 # --all-targets --all-features -- -D warnings`, but ordinary local builds
 # and tests used to silently produce warnings that masked real regressions.

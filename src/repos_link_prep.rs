@@ -1,6 +1,6 @@
 //! Parallel inventory preparation for overlay linking (engine link-prep lane).
 //!
-//! Ports `_overlay_prepare_inventories` (`lib/dot/repos/overlays.sh`): one
+//! Owns overlay inventory preparation: one
 //! NUL-delimited inventory per included overlay under a caller-owned root,
 //! plus the frozen source-root identities for filesystem (non-`git`)
 //! overlays. The link engine later publishes recovery authority and links

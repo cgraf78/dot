@@ -1,879 +1,495 @@
-//! Differential parity tests for profile loading and selection
-//! against `lib/dot/profiles.sh` (+ `profile-format.sh`): validators,
-//! definition parsing, include expansion, selector matching, and the
-//! load/resolve/select entry points — including every error message.
-
+//! Native contracts for profile definitions, selection, and conflicts.
+use dot::profiles::{self, MemberKind, SelectorClass, State};
+use dot_test_support::TempDir;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-
-use dot::profiles;
-use dot::test_support::TempDir;
-
-/// Run one shell snippet with the profile libraries sourced. `argv`
-/// arrives as `$2..`; `extra_env` sets (`Some`) or removes (`None`)
-/// variables. Returns exit code, stdout, and stderr.
-fn shell_run(
-    fixture: &Path,
-    argv: &[&std::ffi::OsStr],
-    extra_env: &[(&str, Option<&str>)],
-    snippet: &str,
-) -> (i32, Vec<u8>, Vec<u8>) {
-    let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let tmpdir = std::env::var_os("TMPDIR")
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg("--noprofile").arg("--norc").arg("-c").arg(format!(
-        ". \"$1/lib/dot/public/xdg.sh\"\n. \"$1/lib/dot/platform.sh\"\n. \"$1/lib/dot/profiles.sh\"\n{snippet}"
-    ));
-    cmd.arg("dot-test-sh").arg(repo);
-    for arg in argv {
-        cmd.arg(arg);
-    }
-    cmd.env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", &path)
-        .env("TMPDIR", &tmpdir)
-        .env("DOT_TEST", "1")
-        .env("DOT_SOURCE_ROOT", fixture)
-        .current_dir(fixture)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in extra_env {
-        match value {
-            Some(value) => {
-                cmd.env(key, value);
-            }
-            None => {
-                cmd.env_remove(key);
-            }
-        }
-    }
-    let output = cmd.output().expect("spawn bash");
-    (
-        output.status.code().unwrap_or(99),
-        output.stdout,
-        output.stderr,
-    )
-}
-
-/// Write `bytes` to `dir/name`, creating parents.
-fn stage(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
-    let path = dir.join(name);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("fixture parents");
-    }
-    std::fs::write(&path, bytes).expect("write fixture");
-    path
-}
-
-/// Current euid for ownership-gated checks (fixtures are self-owned).
+use std::path::Path;
 fn euid() -> u32 {
-    dot::temp::current_uid().expect("current uid")
+    unsafe { libc::geteuid() }
+}
+fn file(root: &Path, name: &str, body: &[u8], mode: u32) -> std::path::PathBuf {
+    let p = root.join(name);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, body).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    p
 }
 
-/// Dump a loaded shell state in the canonical comparison shape.
-const DUMP: &str = r#"printf 'present=%s\nselected=%s\nstate=%s\nincluded=%s\noverlays=%s\nuser=%s\nhost=%s\nmatches=%s\nrecords=%s\nconfig-error=%s\n' "$DOT_PROFILES_PRESENT" "$SELECTED_PROFILE" "$DOT_PROFILE_SELECTION_STATE" "$(IFS=,; printf '%s' "${INCLUDED_PROFILES[*]}")" "$(IFS=,; printf '%s' "${SELECTED_OVERLAY_NAMES[*]}")" "$DOT_PROFILE_CURRENT_USER" "$DOT_PROFILE_CURRENT_HOST" "$(IFS=,; printf '%s' "${DOT_PROFILE_SELECTOR_MATCHES[*]}")" "$(IFS='|'; printf '%s' "${DOT_PROFILE_SELECTOR_RECORDS[*]}")" "${DOT_PROFILE_CONFIGURATION_ERROR:-}""#;
-
-/// Normalize the per-twin fixture roots both sides embed in error
-/// messages (definition paths), so twin dumps compare.
-fn normalize_roots(text: &str, shell_root: &Path, rust_root: &Path) -> String {
-    text.replace(&shell_root.to_string_lossy().into_owned(), "<root>")
-        .replace(&rust_root.to_string_lossy().into_owned(), "<root>")
+#[test]
+fn scalar_and_list_validators_cover_full_grammar() {
+    for (v, ok) in [
+        (b"base".as_slice(), true),
+        (b"a1-b", true),
+        (b"", false),
+        (b"Base", false),
+        (b"1a", false),
+        (b"a_b", false),
+    ] {
+        assert_eq!(profiles::identifier_valid(v), ok)
+    }
+    for (v, ok) in [
+        (b"safe".as_slice(), true),
+        (b"", true),
+        (b"a|b", false),
+        (b"a\tb", false),
+        (b"a\nb", false),
+        (b"a\rb", false),
+    ] {
+        assert_eq!(profiles::value_safe(v), ok)
+    }
+    assert!(profiles::list_valid(b"base,work", MemberKind::Profile));
+    assert!(!profiles::list_valid(b"base,,work", MemberKind::Profile));
+    assert!(!profiles::list_valid(b"dotfiles", MemberKind::Overlay));
+    assert!(profiles::list_valid(b"work,personal", MemberKind::Overlay));
+    for (h, want) in [
+        (b"Host.".as_slice(), Some("host")),
+        (b"a-b.example", Some("a-b.example")),
+        (b"", None),
+        (b".bad", None),
+        (b"bad_", None),
+    ] {
+        assert_eq!(profiles::host_normalize(h), want.map(str::to_string))
+    }
+    for (u, ok) in [
+        (b"user".as_slice(), true),
+        (b"_svc", true),
+        (b"A.b-1", true),
+        (b"", false),
+        (b"1user", false),
+        (b"bad/x", false),
+    ] {
+        assert_eq!(profiles::user_valid(u), ok)
+    }
 }
 
-/// Dump a Rust [`profiles::State`] in the same shape.
-fn dump(state: &profiles::State) -> String {
-    format!(
-        "present={}\nselected={}\nstate={}\nincluded={}\noverlays={}\nuser={}\nhost={}\nmatches={}\nrecords={}\nconfig-error={}\n",
-        if state.present { "1" } else { "0" },
-        state.selected,
-        state.selection_state,
-        state.included.join(","),
-        state.overlay_names.join(","),
-        state.current_user,
-        state.current_host,
-        state.selector_matches.join(","),
-        state.selector_records.join("|"),
-        state.config_error.as_deref().unwrap_or(""),
+#[test]
+fn profile_files_enforce_shape_size_controls_and_private_ownership() {
+    let d = TempDir::new("profiles-safe").unwrap();
+    let p = file(d.path(), "ok.conf", b"version=1\noverlays=work\n", 0o600);
+    assert!(profiles::file_safe(&p).is_ok());
+    assert!(profiles::private_path_safe(&p, euid()));
+    for (name, body) in [
+        ("nul", b"a\0b".as_slice()),
+        ("tab", b"a\tb"),
+        ("del", b"a\x7fb"),
+        ("repeat", b"0123456789abcdef0123456789abcdef"),
+    ] {
+        let p = file(d.path(), name, body, 0o600);
+        assert!(profiles::file_safe(&p).is_err())
+    }
+    let large = file(d.path(), "large", &vec![b'x'; 65537], 0o600);
+    assert!(profiles::file_safe(&large).is_err());
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!profiles::private_path_safe(&p, euid()));
+    std::os::unix::fs::symlink(&p, d.path().join("link")).unwrap();
+    assert!(profiles::file_safe(&d.path().join("link")).is_err());
+}
+
+#[test]
+fn definition_and_selector_errors_are_explicit() {
+    let path = Path::new("profile.conf");
+    let good = profiles::parse_definition(
+        path,
+        b"# comment\nversion=1\nprofiles=base\noverlays=work,personal\n",
     )
-}
-
-#[test]
-fn scalar_validators_agree() {
-    let dir = TempDir::new("prof-valid").expect("fixture dir");
-    let root = dir.path();
-    let identifiers = ["base", "a", "a-b", "a1", "A", "1a", "", "a_b", "a b", "-a"];
-    for name in identifiers {
-        let (code, _, _) = shell_run(
-            root,
-            &[name.as_ref()],
-            &[],
-            "_dot_profile_identifier_valid \"$2\"",
-        );
-        assert_eq!(
-            profiles::identifier_valid(name.as_bytes()),
-            code == 0,
-            "identifier {name:?}"
-        );
+    .unwrap();
+    assert_eq!(good.parents, "base");
+    assert_eq!(good.overlays, "work,personal");
+    for body in [
+        b"overlays=work\n".as_slice(),
+        b"version=2\n",
+        b"version=1\nversion=1\n",
+        b"version=1\nunknown=x\n",
+        b"version=1\noverlays=dotfiles\n",
+        b"version=1\nkey",
+        b"version=1\noverlays=x\\\n",
+    ] {
+        assert!(profiles::parse_definition(path, body).is_err())
     }
-    let values: &[&[u8]] = &[
-        b"ok",
-        b"a=b",
-        b"",
-        b"a|b",
-        b"a\tb",
-        b"a\rb",
-        b"\xc3\xa9",
-        b"a\x00b",
-    ];
-    for value in values {
-        let expected = !value
-            .iter()
-            .any(|b| matches!(b, b'|' | b'\t' | b'\n' | b'\r'));
-        assert_eq!(
-            profiles::value_safe(value),
-            expected,
-            "rust value for {value:?}"
-        );
-        if value.contains(&0) {
-            // NUL cannot survive argv or environment; the shell side
-            // is untestable here, and the Rust rule is literal.
-            continue;
-        }
-        let lossy = String::from_utf8_lossy(value);
-        let (code, _, _) = shell_run(
-            root,
-            &[lossy.as_ref().as_ref()],
-            &[],
-            "_dot_profile_value_safe \"$2\"",
-        );
-        assert_eq!(code == 0, expected, "shell value for {value:?}");
-    }
-    let users = ["amy", "_x", "a.b-c_d9", "", "1a", "a b", "-a"];
-    for user in users {
-        let (code, _, _) = shell_run(
-            root,
-            &[user.as_ref()],
-            &[],
-            "_dot_profile_user_valid \"$2\"",
-        );
-        assert_eq!(
-            profiles::user_valid(user.as_bytes()),
-            code == 0,
-            "user {user:?}"
-        );
-    }
-    let hosts = [
-        "web1",
-        "Web1.Example.COM",
-        "h.",
-        "",
-        "-x",
-        "a_b",
-        "a..b",
-        "a-",
-    ];
-    for host in hosts {
-        // The oracle reports through `REPLY`, not stdout.
-        let (code, out, _) = shell_run(
-            root,
-            &[host.as_ref()],
-            &[],
-            "_dot_profile_host_normalize \"$2\" && printf '%s' \"$REPLY\"",
-        );
-        let shell = (code == 0).then(|| String::from_utf8(out).expect("host text"));
-        let rust = profiles::host_normalize(host.as_bytes());
-        assert_eq!(rust.as_deref(), shell.as_deref(), "host {host:?}");
-    }
-}
-
-#[test]
-fn file_safe_cases_agree() {
-    let dir = TempDir::new("prof-file").expect("fixture dir");
-    let root = dir.path();
-    let big = vec![b'x'; 65537];
-    let exact = vec![b'y'; 65536];
-    let cases: &[(&str, Option<&[u8]>)] = &[
-        ("ok.conf", Some(b"version=1\noverlays=x\n")),
-        ("empty.conf", Some(b"")),
-        ("exact.conf", Some(&exact)),
-        ("big.conf", Some(&big)),
-        ("nul.conf", Some(b"a\x00b\n")),
-        ("tab.conf", Some(b"a\tb\n")),
-        ("cr.conf", Some(b"a\rb\n")),
-        ("del.conf", Some(b"a\x7fb\n")),
-        ("high.conf", Some(b"\xc3\xa9\n")),
-        ("missing.conf", None),
-    ];
-    stage(root, "adir/child", b"x");
-    std::os::unix::fs::symlink("ok.conf", root.join("link.conf")).expect("symlink");
-    for (name, body) in cases {
-        let path = match body {
-            Some(body) => stage(root, name, body),
-            None => root.join(name),
-        };
-        let (code, _, serr) = shell_run(
-            root,
-            &[path.as_os_str()],
-            &[],
-            "_dot_profile_file_safe \"$2\"",
-        );
-        let shell_err = String::from_utf8_lossy(&serr).into_owned();
-        let rust = profiles::file_safe(&path);
-        assert_eq!(rust.is_ok(), code == 0, "file_safe code for {name}");
-        let rust_err = rust
-            .err()
-            .map(|error| format!("dot: profile: {}\n", error.message));
-        assert_eq!(
-            rust_err.unwrap_or_default(),
-            shell_err,
-            "file_safe message for {name}"
-        );
-    }
-    for (name, arg) in [("dir", "adir"), ("symlink", "link.conf")] {
-        let path = root.join(arg);
-        let (code, _, serr) = shell_run(
-            root,
-            &[path.as_os_str()],
-            &[],
-            "_dot_profile_file_safe \"$2\"",
-        );
-        assert_ne!(code, 0, "shell rejects {name}");
-        assert!(profiles::file_safe(&path).is_err(), "rust rejects {name}");
+    let d = TempDir::new("profile-selector").unwrap();
+    file(d.path(), "base.conf", b"version=1\noverlays=base\n", 0o600);
+    let mut state = State::default();
+    state.load(Some(d.path()), "", "/home/test", None).unwrap();
+    let selector = state
+        .selector_parse(
+            Path::new("selector.conf"),
+            b"version=1\nuser=Chris\nhost=HOST.\nprofile=base\n",
+            SelectorClass::Local,
+        )
+        .unwrap();
+    assert_eq!(selector.user, "Chris");
+    assert_eq!(selector.host, "host");
+    for body in [
+        b"profile=base\n".as_slice(),
+        b"version=1\n",
+        b"version=1\nprofile=missing\n",
+        b"version=1\nprofile=base\n",
+        b"version=1\nuser=bad/x\nprofile=base\n",
+    ] {
         assert!(
-            String::from_utf8_lossy(&serr).contains("not a regular file"),
-            "message for {name}"
-        );
+            state
+                .selector_parse(Path::new("bad.conf"), body, SelectorClass::Local)
+                .is_err()
+        )
     }
 }
 
-#[test]
-fn ownership_gates_agree() {
-    let dir = TempDir::new("prof-owned").expect("fixture dir");
-    let root = dir.path();
-    let uid = euid();
-    let file = stage(root, "f", b"x");
-    let sub = root.join("sub");
-    std::fs::create_dir(&sub).expect("mkdir");
-    std::os::unix::fs::symlink("f", root.join("l")).expect("symlink");
-    for (label, path, mode) in [
-        ("file-600", file.clone(), 0o600),
-        ("file-644", file.clone(), 0o644),
-    ] {
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-        let (code, _, _) = shell_run(
-            root,
-            &[path.as_os_str()],
-            &[],
-            "_dot_profile_private_path_safe \"$2\"",
-        );
-        assert_eq!(
-            profiles::private_path_safe(&path, uid),
-            code == 0,
-            "private {label}"
-        );
-    }
-    // (private expectation, owned expectation) per path: links,
-    // files, and missing paths fail both; the owned directory
-    // passes the directory gate only.
-    for (label, name, private, owned) in [
-        ("link", "l", false, false),
-        ("dir", "sub", false, true),
-        ("missing", "nope", false, false),
-    ] {
-        let path = root.join(name);
-        let (code, _, _) = shell_run(
-            root,
-            &[path.as_os_str()],
-            &[],
-            "_dot_profile_private_path_safe \"$2\"",
-        );
-        assert_eq!(code == 0, private, "shell private {label}");
-        assert_eq!(
-            profiles::private_path_safe(&path, uid),
-            private,
-            "rust private {label}"
-        );
-        let (code, _, _) = shell_run(
-            root,
-            &[path.as_os_str()],
-            &[],
-            "_dot_profile_owned_directory_safe \"$2\"",
-        );
-        assert_eq!(code == 0, owned, "shell owned {label}");
-        assert_eq!(
-            profiles::owned_directory_safe(&path, uid),
-            owned,
-            "rust owned {label}"
-        );
-    }
+fn definitions() -> TempDir {
+    let d = TempDir::new("profile-defs").unwrap();
+    file(d.path(), "base.conf", b"version=1\noverlays=base\n", 0o600);
+    file(
+        d.path(),
+        "work.conf",
+        b"version=1\nprofiles=base\noverlays=work,base\n",
+        0o600,
+    );
+    file(
+        d.path(),
+        "personal.conf",
+        b"version=1\nprofiles=work\noverlays=personal\n",
+        0o600,
+    );
+    d
 }
 
 #[test]
-fn definition_errors_agree() {
-    let dir = TempDir::new("prof-parse").expect("fixture dir");
-    let root = dir.path();
-    let cases = [
-        ("good", "version=1\nprofiles=base\noverlays=x\n"),
-        ("comments", "# top\n\nversion=1\n# mid\noverlays=x\n"),
-        ("no-trailing-nl", "version=1\noverlays=x"),
-        ("continuation", "version=1\\\noverlays=x\n"),
-        ("bare", "version=1\nhello\n"),
-        ("bad-key", "version=1\nOverlays=x\n"),
-        ("empty-key", "version=1\n=x\n"),
-        ("unsafe-value", "version=1\noverlays=a|b\n"),
-        ("late-version", "overlays=x\nversion=1\n"),
-        ("dup-version", "version=1\nversion=1\noverlays=x\n"),
-        ("bad-version", "version=2\noverlays=x\n"),
-        ("dup-profiles", "version=1\nprofiles=a\nprofiles=b\n"),
-        ("bad-profiles", "version=1\nprofiles=Base\n"),
-        ("dotfiles-overlay", "version=1\noverlays=dotfiles\n"),
-        ("unknown-key", "version=1\nfrobnicate=1\n"),
-        ("missing-version", "overlays=x\n"),
-        ("no-members", "version=1\n"),
-        ("empty", ""),
-        ("equals-value", "version=1\noverlays=x\nextra=a=b\n"),
-    ];
-    for (label, body) in cases {
-        let path = stage(root, &format!("{label}.conf"), body.as_bytes());
-        // Production arity is (file, name) with `$3` unset, so
-        // `missing version` / `no members` report the path: pass
-        // the file as the (otherwise unused-here) name too.
-        let (code, _, serr) = shell_run(
-            root,
-            &[path.as_os_str()],
-            &[],
-            "_dot_profile_parse_definition \"$2\" \"$2\"",
-        );
-        let shell_err = String::from_utf8_lossy(&serr).into_owned();
-        let rust = profiles::parse_definition(&path, body.as_bytes());
-        assert_eq!(rust.is_ok(), code == 0, "parse code for {label}");
-        let rust_err = rust
-            .err()
-            .map(|error| format!("dot: profile: {}\n", error.message));
-        assert_eq!(
-            rust_err.unwrap_or_default(),
-            shell_err,
-            "parse message for {label}"
-        );
-    }
+fn load_default_flatten_and_phase_one_preserve_order() {
+    let d = definitions();
+    let mut s = State::default();
+    s.load(Some(d.path()), "", "/home/test", Some("work"))
+        .unwrap();
+    assert!(s.present);
+    s.flatten("personal").unwrap();
+    assert_eq!(s.included, ["base", "work", "personal"]);
+    assert_eq!(s.overlay_names, ["base", "work", "personal"]);
+    s.select_base().unwrap();
+    assert_eq!(s.selected, "base");
+    assert_eq!(s.selection_state, "phase-one");
+    assert_eq!(s.overlay_names, ["base"]);
+    assert!(s.flatten("missing").is_err());
 }
 
 #[test]
-fn load_twins_agree() {
-    // Valid tree shared by the happy paths.
-    let tree: &[(&str, &[u8])] = &[
-        ("base.conf", b"version=1\noverlays=core\n"),
-        ("web.conf", b"version=1\nprofiles=base\noverlays=websvc\n"),
-    ];
-    // Happy path plus single-fault variants (one fault each keeps
-    // shell hash-order nondeterminism out of the messages).
-    type Fault<'a> = (&'a str, &'a [(&'a str, &'a [u8])]);
-    let faults: &[Fault<'_>] = &[
-        ("ok", &[]),
-        ("bad-file", &[("broken.conf", b"version=1\nbogus\n")]),
-        ("bad-name", &[("BAD.conf", b"version=1\noverlays=x\n")]),
-        (
-            "cycle",
-            &[("loop.conf", b"version=1\nprofiles=loop\noverlays=x\n")],
-        ),
+fn selectors_choose_specific_match_default_and_conflict() {
+    let d = definitions();
+    let root = TempDir::new("selectors-root").unwrap();
+    file(
+        root.path(),
+        "10-default.conf",
+        b"version=1\nprofile=work\n",
+        0o600,
+    );
+    file(
+        root.path(),
+        "20-specific.conf",
+        b"version=1\nuser=chris\nhost=nas\nprofile=personal\n",
+        0o600,
+    );
+    let local = TempDir::new("selectors-local").unwrap();
+    std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut s = State::default();
+    s.load(Some(d.path()), "", "/home/test", Some("base"))
+        .unwrap();
+    s.resolve_with(root.path(), local.path(), &[], "chris", "NAS.", euid())
+        .unwrap();
+    assert_eq!(s.selected, "personal");
+    assert_eq!(s.selection_state, "agreed-match");
+    assert_eq!(s.overlay_names, ["base", "work", "personal"]);
+    let empty = TempDir::new("selectors-empty").unwrap();
+    let mut s = State::default();
+    s.load(Some(d.path()), "", "/home/test", Some("work"))
+        .unwrap();
+    s.resolve_with(empty.path(), local.path(), &[], "chris", "nas", euid())
+        .unwrap();
+    assert_eq!(s.selected, "work");
+    assert_eq!(s.selection_state, "implicit-default");
+    file(
+        local.path(),
+        "one.conf",
+        b"version=1\nuser=chris\nprofile=work\n",
+        0o600,
+    );
+    file(
+        local.path(),
+        "two.conf",
+        b"version=1\nuser=chris\nprofile=personal\n",
+        0o600,
+    );
+    let mut s = State::default();
+    s.load(Some(d.path()), "", "/home/test", None).unwrap();
+    assert!(
+        s.resolve_with(empty.path(), local.path(), &[], "chris", "nas", euid())
+            .is_err()
+    );
+    assert_eq!(s.selection_state, "conflict");
+}
+
+#[test]
+fn load_rejects_missing_base_cycles_bad_defaults_and_unsafe_local_selectors() {
+    let d = TempDir::new("profiles-invalid").unwrap();
+    file(d.path(), "work.conf", b"version=1\noverlays=work\n", 0o600);
+    assert!(
+        State::default()
+            .load(Some(d.path()), "", "/home/test", None)
+            .is_err()
+    );
+    file(
+        d.path(),
+        "base.conf",
+        b"version=1\nprofiles=work\noverlays=base\n",
+        0o600,
+    );
+    file(
+        d.path(),
+        "work.conf",
+        b"version=1\nprofiles=base\noverlays=work\n",
+        0o600,
+    );
+    assert!(
+        State::default()
+            .load(Some(d.path()), "", "/home/test", None)
+            .is_err()
+    );
+    let d = definitions();
+    assert!(
+        State::default()
+            .load(Some(d.path()), "", "/home/test", Some("missing"))
+            .is_err()
+    );
+}
+
+#[test]
+fn parent_only_profiles_expand_and_invalid_definitions_fail_closed() {
+    let d = TempDir::new("profile-expansion-errors").unwrap();
+    file(
+        d.path(),
+        "base.conf",
+        b"version=1\noverlays=personal\n",
+        0o600,
+    );
+    file(
+        d.path(),
+        "parent-only.conf",
+        b"version=1\nprofiles=base\n",
+        0o600,
+    );
+    let mut state = State::default();
+    state.load(Some(d.path()), "", "/home/test", None).unwrap();
+    state.flatten("parent-only").unwrap();
+    assert_eq!(state.included, ["base", "parent-only"]);
+    assert_eq!(state.overlay_names, ["personal"]);
+
+    for (name, files) in [
         (
             "unknown-parent",
-            &[("orphan.conf", b"version=1\nprofiles=ghost\noverlays=x\n")],
+            vec![("base.conf", "version=1\nprofiles=missing\n")],
         ),
-    ];
-    for (label, extra) in faults {
-        for default in ["base", "web"] {
-            let sdir = TempDir::new(&format!("prof-load-{label}-shell")).expect("shell dir");
-            let rdir = TempDir::new(&format!("prof-load-{label}-rust")).expect("rust dir");
-            for (name, body) in tree.iter().chain(extra.iter()) {
-                stage(sdir.path(), &format!("profiles.d/{name}"), body);
-                stage(rdir.path(), &format!("profiles.d/{name}"), body);
-            }
-            let pd_s = sdir.path().join("profiles.d");
-            let pd_r = rdir.path().join("profiles.d");
-            let env = [("DOT_DEFAULT_PROFILE", Some(default))];
-            let (scode, sout, _) = shell_run(
-                sdir.path(),
-                &[pd_s.as_os_str()],
-                &env,
-                &format!("_dot_profiles_load \"$2\"; printf 'rc=%s\\n' \"$?\"; {DUMP}"),
-            );
-            let mut state = profiles::State::default();
-            let rcode = state.load(Some(&pd_r), "", "", Some(default));
-            let rust = format!(
-                "rc={}\n{}",
-                if rcode.is_ok() { "0" } else { "1" },
-                dump(&state)
-            );
-            let shell = String::from_utf8(sout).expect("dump text");
-            assert_eq!(scode, 0, "shell harness runs for {label}/{default}");
-            assert_eq!(
-                normalize_roots(&rust, sdir.path(), rdir.path()),
-                normalize_roots(&shell, sdir.path(), rdir.path()),
-                "load parity for {label}/{default}"
-            );
+        (
+            "direct-cycle",
+            vec![("base.conf", "version=1\nprofiles=base\n")],
+        ),
+        ("empty", vec![("base.conf", "version=1\n")]),
+        (
+            "explicit-empty",
+            vec![("base.conf", "version=1\noverlays=\n")],
+        ),
+        (
+            "invalid-overlay",
+            vec![("base.conf", "version=1\noverlays=../personal\n")],
+        ),
+    ] {
+        let invalid = TempDir::new(name).unwrap();
+        for (path, body) in files {
+            file(invalid.path(), path, body.as_bytes(), 0o600);
         }
-    }
-    // Missing directory is a clean empty state; a file is an error.
-    for label in ["absent", "file"] {
-        let sdir = TempDir::new(&format!("prof-load-{label}-shell")).expect("shell dir");
-        let rdir = TempDir::new(&format!("prof-load-{label}-rust")).expect("rust dir");
-        let pd_s = sdir.path().join("profiles.d");
-        let pd_r = rdir.path().join("profiles.d");
-        if label == "file" {
-            stage(sdir.path(), "profiles.d", b"x");
-            stage(rdir.path(), "profiles.d", b"x");
-        }
-        let (scode, sout, _) = shell_run(
-            sdir.path(),
-            &[pd_s.as_os_str()],
-            &[],
-            &format!("_dot_profiles_load \"$2\"; printf 'rc=%s\\n' \"$?\"; {DUMP}"),
-        );
-        let mut state = profiles::State::default();
-        let rcode = state.load(Some(&pd_r), "", "", Some("base"));
-        assert_eq!(scode, 0, "shell harness for {label}");
-        let rust = format!(
-            "rc={}\n{}",
-            if rcode.is_ok() { "0" } else { "1" },
-            dump(&state)
-        );
-        let shell = String::from_utf8(sout).expect("dump");
-        assert_eq!(
-            normalize_roots(&rust, sdir.path(), rdir.path()),
-            normalize_roots(&shell, sdir.path(), rdir.path()),
-            "load parity for {label}"
+        assert!(
+            State::default()
+                .load(Some(invalid.path()), "", "/home/test", None)
+                .is_err(),
+            "accepted {name}"
         );
     }
-    // No base definition fails even when everything else is valid.
-    let sdir = TempDir::new("prof-load-nobase-shell").expect("shell dir");
-    let rdir = TempDir::new("prof-load-nobase-rust").expect("rust dir");
-    stage(
-        sdir.path(),
-        "profiles.d/solo.conf",
-        b"version=1\noverlays=x\n",
-    );
-    stage(
-        rdir.path(),
-        "profiles.d/solo.conf",
-        b"version=1\noverlays=x\n",
-    );
-    let (scode, sout, _) = shell_run(
-        sdir.path(),
-        &[sdir.path().join("profiles.d").as_os_str()],
-        &[],
-        &format!("_dot_profiles_load \"$2\"; printf 'rc=%s\\n' \"$?\"; {DUMP}"),
-    );
-    let mut state = profiles::State::default();
-    let rcode = state.load(Some(&rdir.path().join("profiles.d")), "", "", Some("base"));
-    assert_eq!(scode, 0, "shell harness nobase");
-    let rust = format!(
-        "rc={}\n{}",
-        if rcode.is_ok() { "0" } else { "1" },
-        dump(&state)
-    );
-    let shell = String::from_utf8(sout).expect("dump");
-    assert_eq!(
-        normalize_roots(&rust, sdir.path(), rdir.path()),
-        normalize_roots(&shell, sdir.path(), rdir.path()),
-        "nobase parity"
-    );
 }
 
 #[test]
-fn load_default_twins_agree() {
-    // `_dot_profiles_load_default` resolves `dot/profiles.d` through
-    // XDG and loads it: twin trees under separate XDG roots plus a
-    // decoy HOME prove the resolution, and the dump shape is shared
-    // with [`load_twins_agree`].
-    let tree: &[(&str, &[u8])] = &[
-        ("base.conf", b"version=1\noverlays=core\n"),
-        ("web.conf", b"version=1\nprofiles=base\noverlays=websvc\n"),
-    ];
-    for default in ["base", "web"] {
-        let sdir = TempDir::new("prof-default-shell").expect("shell dir");
-        let rdir = TempDir::new("prof-default-rust").expect("rust dir");
-        for (name, body) in tree {
-            stage(sdir.path(), &format!("xdg/dot/profiles.d/{name}"), body);
-            stage(rdir.path(), &format!("xdg/dot/profiles.d/{name}"), body);
-        }
-        let sxdg = sdir.path().join("xdg");
-        let rxdg = rdir.path().join("xdg");
-        let shome = sdir.path().join("home");
-        let rhome = rdir.path().join("home");
-        let env = [
-            ("XDG_CONFIG_HOME", Some(sxdg.to_string_lossy().into_owned())),
-            ("HOME", Some(shome.to_string_lossy().into_owned())),
-            ("DOT_DEFAULT_PROFILE", Some(default.to_string())),
-        ];
-        let env_ref: Vec<(&str, Option<&str>)> = env
-            .iter()
-            .map(|(key, value)| (*key, value.as_deref()))
-            .collect();
-        let (scode, sout, _) = shell_run(
-            sdir.path(),
-            &[],
-            &env_ref,
-            &format!("_dot_profiles_load_default; printf 'rc=%s\\n' \"$?\"; {DUMP}"),
-        );
-        let mut state = profiles::State::default();
-        let rcode = state.load_default(
-            &rxdg.to_string_lossy(),
-            &rhome.to_string_lossy(),
-            Some(default),
-        );
-        let rust = format!(
-            "rc={}\n{}",
-            if rcode.is_ok() { "0" } else { "1" },
-            dump(&state)
-        );
-        let shell = String::from_utf8(sout).expect("dump text");
-        assert_eq!(scode, 0, "shell harness runs for {default}");
-        assert_eq!(
-            normalize_roots(&rust, sdir.path(), rdir.path()),
-            normalize_roots(&shell, sdir.path(), rdir.path()),
-            "load_default parity for {default}"
-        );
-    }
-    // Unset default falls back to `base` on both sides.
-    let sdir = TempDir::new("prof-default-base-shell").expect("shell dir");
-    let rdir = TempDir::new("prof-default-base-rust").expect("rust dir");
-    for (name, body) in tree {
-        stage(sdir.path(), &format!("xdg/dot/profiles.d/{name}"), body);
-        stage(rdir.path(), &format!("xdg/dot/profiles.d/{name}"), body);
-    }
-    let sxdg = sdir.path().join("xdg");
-    let rxdg = rdir.path().join("xdg");
-    let env = [
-        ("XDG_CONFIG_HOME", Some(sxdg.to_string_lossy().into_owned())),
-        ("DOT_DEFAULT_PROFILE", None),
-    ];
-    let env_ref: Vec<(&str, Option<&str>)> = env
-        .iter()
-        .map(|(key, value)| (*key, value.as_deref()))
-        .collect();
-    let (scode, sout, _) = shell_run(
-        sdir.path(),
-        &[],
-        &env_ref,
-        &format!("_dot_profiles_load_default; printf 'rc=%s\\n' \"$?\"; {DUMP}"),
+fn selector_sources_enforce_local_modes_names_and_missing_personal_fallback() {
+    let definitions = definitions();
+    let root = TempDir::new("selector-security-root").unwrap();
+    let local = TempDir::new("selector-security-local").unwrap();
+    std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    file(
+        local.path(),
+        "bad|name.conf",
+        b"version=1\nuser=chris\nprofile=base\n",
+        0o600,
     );
-    let mut state = profiles::State::default();
-    let rcode = state.load_default(&rxdg.to_string_lossy(), "/nonexistent-home", None);
-    assert_eq!(scode, 0, "shell harness runs for implicit base");
-    let rust = format!(
-        "rc={}\n{}",
-        if rcode.is_ok() { "0" } else { "1" },
-        dump(&state)
-    );
-    let shell = String::from_utf8(sout).expect("dump text");
-    assert_eq!(
-        normalize_roots(&rust, sdir.path(), rdir.path()),
-        normalize_roots(&shell, sdir.path(), rdir.path()),
-        "load_default parity for implicit base"
-    );
-    // Missing profiles.d is a clean empty state; a file is an error.
-    for label in ["absent", "file"] {
-        let sdir = TempDir::new(&format!("prof-default-{label}-shell")).expect("shell dir");
-        let rdir = TempDir::new(&format!("prof-default-{label}-rust")).expect("rust dir");
-        let sxdg = sdir.path().join("xdg");
-        let rxdg = rdir.path().join("xdg");
-        std::fs::create_dir_all(&sxdg).expect("shell xdg");
-        std::fs::create_dir_all(&rxdg).expect("rust xdg");
-        if label == "file" {
-            stage(sdir.path(), "xdg/dot/profiles.d", b"x");
-            stage(rdir.path(), "xdg/dot/profiles.d", b"x");
-        }
-        let env = [("XDG_CONFIG_HOME", Some(sxdg.to_string_lossy().into_owned()))];
-        let env_ref: Vec<(&str, Option<&str>)> = env
-            .iter()
-            .map(|(key, value)| (*key, value.as_deref()))
-            .collect();
-        let (scode, sout, _) = shell_run(
-            sdir.path(),
-            &[],
-            &env_ref,
-            &format!("_dot_profiles_load_default; printf 'rc=%s\\n' \"$?\"; {DUMP}"),
-        );
-        let mut state = profiles::State::default();
-        let rcode = state.load_default(&rxdg.to_string_lossy(), "/nonexistent-home", Some("base"));
-        assert_eq!(scode, 0, "shell harness for {label}");
-        let rust = format!(
-            "rc={}\n{}",
-            if rcode.is_ok() { "0" } else { "1" },
-            dump(&state)
-        );
-        let shell = String::from_utf8(sout).expect("dump");
-        assert_eq!(
-            normalize_roots(&rust, sdir.path(), rdir.path()),
-            normalize_roots(&shell, sdir.path(), rdir.path()),
-            "load_default parity for {label}"
-        );
-    }
-    // Unresolvable XDG base fails on both sides (shell `dot_xdg_path`
-    // exit 1, Rust `Err`) with prior state intact: both sides load a
-    // valid tree first, then fail, proving the shell's early return
-    // (before `load`'s reset) is reproduced.
-    let dir = TempDir::new("prof-default-unresolvable").expect("fixture dir");
-    for (name, body) in tree {
-        stage(dir.path(), &format!("xdg/dot/profiles.d/{name}"), body);
-    }
-    let good = dir.path().join("xdg");
-    let (scode, sout, _) = shell_run(
-        dir.path(),
-        &[good.as_os_str()],
-        &[],
-        &format!(
-            "XDG_CONFIG_HOME=\"$2\" _dot_profiles_load_default || exit 1; XDG_CONFIG_HOME=relative HOME=relative _dot_profiles_load_default; printf 'rc=%s\\n' \"$?\"; {DUMP}"
-        ),
-    );
-    let mut state = profiles::State::default();
+    let mut state = State::default();
     state
-        .load_default(&good.to_string_lossy(), "/nonexistent-home", Some("base"))
-        .expect("seed load");
-    let seeded = dump(&state);
-    let rcode = state.load_default("relative", "relative", Some("base"));
-    assert_eq!(scode, 0, "shell harness runs for unresolvable");
-    assert_eq!(dump(&state), seeded, "rust keeps prior state");
-    let rust = format!(
-        "rc={}\n{}",
-        if rcode.is_ok() { "0" } else { "1" },
-        dump(&state)
+        .load(Some(definitions.path()), "", "/home/test", None)
+        .unwrap();
+    assert!(
+        state
+            .resolve_with(root.path(), local.path(), &[], "chris", "host", euid())
+            .is_err()
     );
-    let shell = String::from_utf8(sout).expect("dump");
-    assert_eq!(
-        normalize_roots(&rust, dir.path(), dir.path()),
-        normalize_roots(&shell, dir.path(), dir.path()),
-        "load_default parity for unresolvable base"
+
+    std::fs::remove_file(local.path().join("bad|name.conf")).unwrap();
+    file(
+        local.path(),
+        "match.conf",
+        b"version=1\nuser=chris\nprofile=work\n",
+        0o660,
     );
+    let mut state = State::default();
+    state
+        .load(Some(definitions.path()), "", "/home/test", None)
+        .unwrap();
+    assert!(
+        state
+            .resolve_with(root.path(), local.path(), &[], "chris", "host", euid())
+            .is_err()
+    );
+
+    std::fs::remove_file(local.path().join("match.conf")).unwrap();
+    let missing = local.path().join("missing-personal");
+    let mut state = State::default();
+    state
+        .load(Some(definitions.path()), "", "/home/test", None)
+        .unwrap();
+    state
+        .resolve_with(
+            root.path(),
+            local.path(),
+            &[&missing],
+            "chris",
+            "host",
+            euid(),
+        )
+        .unwrap();
+    assert_eq!(state.selected, "base");
+    assert_eq!(state.selection_state, "implicit-default");
 }
 
 #[test]
-fn flatten_and_select_agree() {
-    let dir = TempDir::new("prof-flatten").expect("fixture dir");
-    let root = dir.path();
-    stage(root, "profiles.d/base.conf", b"version=1\noverlays=core\n");
-    stage(
-        root,
-        "profiles.d/web.conf",
-        b"version=1\nprofiles=base\noverlays=websvc,metrics\n",
-    );
-    for name in ["web", "base", "ghost"] {
-        let (scode, sout, _) = shell_run(
-            root,
-            &[root.join("profiles.d").as_os_str(), name.as_ref()],
-            &[],
-            &format!(
-                "_dot_profiles_load \"$2\" && _dot_profile_flatten \"$3\"; printf 'rc=%s\\n' \"$?\"; {DUMP}"
-            ),
+fn personal_selector_ancestry_rejects_symlinked_components() {
+    for component in ["dot", "selector-dir", "selector-file"] {
+        let fixture = TempDir::new(component).unwrap();
+        let config = fixture.path().join("config");
+        let checkout = fixture.path().join("personal");
+        let external = fixture.path().join("external");
+        std::fs::create_dir_all(config.join("dot")).unwrap();
+        std::fs::create_dir_all(external.join("profile-selectors.d")).unwrap();
+        file(
+            &config.join("dot/profiles.d"),
+            "base.conf",
+            b"version=1\noverlays=personal\n",
+            0o600,
         );
-        let mut state = profiles::State::default();
-        let rcode = state
-            .load(Some(&root.join("profiles.d")), "", "", Some("base"))
-            .and_then(|_| state.flatten(name));
-        assert_eq!(scode, 0, "shell harness flatten {name}");
-        assert_eq!(
-            format!(
-                "rc={}\n{}",
-                if rcode.is_ok() { "0" } else { "1" },
-                dump(&state)
-            ),
-            String::from_utf8(sout).expect("dump"),
-            "flatten parity for {name}"
+        file(
+            &external.join("profile-selectors.d"),
+            "match.conf",
+            b"version=1\nuser=chris\nprofile=base\n",
+            0o600,
         );
-    }
-    // Phase-one base selection on a loaded state.
-    let (scode, sout, _) = shell_run(
-        root,
-        &[root.join("profiles.d").as_os_str()],
-        &[],
-        &format!(
-            "_dot_profiles_load \"$2\" && _dot_profile_select_base; printf 'rc=%s\\n' \"$?\"; {DUMP}"
-        ),
-    );
-    let mut state = profiles::State::default();
-    let rcode = state
-        .load(Some(&root.join("profiles.d")), "", "", Some("base"))
-        .and_then(|_| state.select_base());
-    assert_eq!(scode, 0, "shell harness select_base");
-    assert_eq!(
-        format!(
-            "rc={}\n{}",
-            if rcode.is_ok() { "0" } else { "1" },
-            dump(&state)
-        ),
-        String::from_utf8(sout).expect("dump"),
-        "select_base parity"
-    );
-}
-
-#[test]
-fn resolve_twins_agree() {
-    let user = profiles::current_user().expect("login name");
-    let host = dot::platform::detect_host().expect("hostname");
-    // Selector bodies per label, built from the live identity.
-    let bodies = |kind: &str| -> Vec<(&'static str, String)> {
-        match kind {
-            "user" => vec![(
-                "10-u.conf",
-                format!("version=1\nuser={user}\nprofile=web\n"),
-            )],
-            "host" => vec![(
-                "10-h.conf",
-                format!("version=1\nhost={}\nprofile=web\n", host.to_uppercase()),
-            )],
-            "both" => vec![(
-                "10-b.conf",
-                format!("version=1\nuser={user}\nhost={host}\nprofile=web\n"),
-            )],
-            "tie" => vec![
-                (
-                    "10-a.conf",
-                    format!("version=1\nuser={user}\nprofile=web\n"),
-                ),
-                (
-                    "20-b.conf",
-                    format!("version=1\nuser={user}\nprofile=base\n"),
-                ),
-            ],
-            "specific" => vec![
-                (
-                    "10-u.conf",
-                    format!("version=1\nuser={user}\nprofile=base\n"),
-                ),
-                (
-                    "20-uh.conf",
-                    format!("version=1\nuser={user}\nhost={host}\nprofile=web\n"),
-                ),
-            ],
-            _ => vec![],
-        }
-    };
-    for label in ["none", "user", "host", "both", "tie", "specific"] {
-        let sdir = TempDir::new(&format!("prof-res-{label}-shell")).expect("shell dir");
-        let rdir = TempDir::new(&format!("prof-res-{label}-rust")).expect("rust dir");
-        for base in [&sdir, &rdir] {
-            stage(
-                base.path(),
-                "profiles.d/base.conf",
-                b"version=1\noverlays=core\n",
-            );
-            stage(
-                base.path(),
-                "profiles.d/web.conf",
-                b"version=1\nprofiles=base\noverlays=websvc\n",
-            );
-            for (name, body) in bodies(label) {
-                stage(
-                    base.path(),
-                    &format!("selectors/root/{name}"),
-                    body.as_bytes(),
-                );
+        std::fs::create_dir_all(&checkout).unwrap();
+        match component {
+            "dot" => std::os::unix::fs::symlink(&external, checkout.join("dot")).unwrap(),
+            "selector-dir" => {
+                std::fs::create_dir(checkout.join("dot")).unwrap();
+                std::os::unix::fs::symlink(
+                    external.join("profile-selectors.d"),
+                    checkout.join("dot/profile-selectors.d"),
+                )
+                .unwrap();
+            }
+            _ => {
+                std::fs::create_dir_all(checkout.join("dot/profile-selectors.d")).unwrap();
+                std::os::unix::fs::symlink(
+                    external.join("profile-selectors.d/match.conf"),
+                    checkout.join("dot/profile-selectors.d/match.conf"),
+                )
+                .unwrap();
             }
         }
-        let snippet = format!(
-            "_dot_profiles_load \"$2\" && _dot_profile_resolve \"$3\" \"$4\"; printf 'rc=%s\\n' \"$?\"; {DUMP}"
+        let mut state = State::default();
+        state
+            .load(
+                Some(&config.join("dot/profiles.d")),
+                config.to_str().unwrap(),
+                fixture.path().to_str().unwrap(),
+                None,
+            )
+            .unwrap();
+        let overlay = format!(
+            "personal|{}|https://example.invalid/personal.git|config|true|git",
+            checkout.display()
         );
-        let (scode, sout, _) = shell_run(
-            sdir.path(),
-            &[
-                sdir.path().join("profiles.d").as_os_str(),
-                sdir.path().join("selectors/root").as_os_str(),
-                sdir.path().join("selectors/local").as_os_str(),
-            ],
-            &[],
-            &snippet,
-        );
-        let mut state = profiles::State::default();
-        let rcode = state
-            .load(Some(&rdir.path().join("profiles.d")), "", "", Some("base"))
-            .and_then(|_| {
-                state.resolve_with(
-                    &rdir.path().join("selectors/root"),
-                    &rdir.path().join("selectors/local"),
-                    &[],
-                    &user,
-                    &host,
-                    euid(),
+        assert!(
+            state
+                .resolve_default(
+                    config.to_str().unwrap(),
+                    fixture.path().to_str().unwrap(),
+                    &[&overlay],
+                    "chris",
+                    "host",
+                    euid()
                 )
-            });
-        assert_eq!(scode, 0, "shell harness resolve {label}");
-        let rust = format!(
-            "rc={}\n{}",
-            if rcode.is_ok() { "0" } else { "1" },
-            dump(&state)
-        );
-        let shell = String::from_utf8(sout).expect("dump");
-        assert_eq!(
-            normalize_roots(&rust, sdir.path(), rdir.path()),
-            normalize_roots(&shell, sdir.path(), rdir.path()),
-            "resolve parity for {label}"
+                .is_err(),
+            "accepted symlinked {component}"
         );
     }
-    // Machine-local selectors: valid file wins; bad mode fails.
-    for (label, mode) in [("local-ok", 0o600), ("local-bad", 0o644)] {
-        let sdir = TempDir::new(&format!("prof-local-{label}-shell")).expect("shell dir");
-        let rdir = TempDir::new(&format!("prof-local-{label}-rust")).expect("rust dir");
-        for base in [&sdir, &rdir] {
-            stage(
-                base.path(),
-                "profiles.d/base.conf",
-                b"version=1\noverlays=core\n",
-            );
-            stage(
-                base.path(),
-                "profiles.d/web.conf",
-                b"version=1\nprofiles=base\noverlays=websvc\n",
-            );
-            let path = stage(
-                base.path(),
-                "selectors/local/10-l.conf",
-                format!("version=1\nuser={user}\nprofile=web\n").as_bytes(),
-            );
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-        }
-        let snippet = format!(
-            "_dot_profiles_load \"$2\" && _dot_profile_resolve \"$3\" \"$4\"; printf 'rc=%s\\n' \"$?\"; {DUMP}"
-        );
-        let (scode, sout, _) = shell_run(
-            sdir.path(),
-            &[
-                sdir.path().join("profiles.d").as_os_str(),
-                sdir.path().join("selectors/root").as_os_str(),
-                sdir.path().join("selectors/local").as_os_str(),
-            ],
+}
+
+#[test]
+fn checked_in_profile_example_resolves_combined_identity_natively() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/profile-dotfiles");
+    let definitions = root.join("root/.config/dot/profiles.d");
+    let selectors = root.join("root/.config/dot/profile-selectors.d");
+    let local = TempDir::new("profile-example-local").unwrap();
+    std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let combined = std::fs::read(root.join("local/combined.conf")).unwrap();
+    file(local.path(), "combined.conf", &combined, 0o600);
+
+    let mut state = State::default();
+    state
+        .load(Some(&definitions), "", "/home/example", None)
+        .unwrap();
+    state
+        .resolve_with(
+            &selectors,
+            local.path(),
             &[],
-            &snippet,
+            "example-user",
+            "Example-Host.",
+            euid(),
+        )
+        .unwrap();
+    assert_eq!(state.selected, "dev");
+    assert_eq!(state.included, ["base", "editor", "dev"]);
+    assert_eq!(state.overlay_names, ["personal", "nvim", "dev", "work"]);
+
+    for relative in [
+        "README.md",
+        "root/.config/dot/overlays.d/20-nvim.conf",
+        "root/.config/dot/overlays.d/30-dev.conf",
+        "root/.config/dot/overlays.d/80-personal.conf",
+        "root/.config/dot/overlays.d/90-work.conf",
+        "personal/dot/profile-selectors.d/dev.conf",
+    ] {
+        assert!(
+            root.join(relative).is_file(),
+            "missing profile example {relative}"
         );
-        let mut state = profiles::State::default();
-        let rcode = state
-            .load(Some(&rdir.path().join("profiles.d")), "", "", Some("base"))
-            .and_then(|_| {
-                state.resolve_with(
-                    &rdir.path().join("selectors/root"),
-                    &rdir.path().join("selectors/local"),
-                    &[],
-                    &user,
-                    &host,
-                    euid(),
-                )
-            });
-        assert_eq!(scode, 0, "shell harness local {label}");
-        let rust = format!(
-            "rc={}\n{}",
-            if rcode.is_ok() { "0" } else { "1" },
-            dump(&state)
-        );
-        let shell = String::from_utf8(sout).expect("dump");
-        assert_eq!(
-            normalize_roots(&rust, sdir.path(), rdir.path()),
-            normalize_roots(&shell, sdir.path(), rdir.path()),
-            "local parity for {label}"
-        );
+    }
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let configuration = std::fs::read_to_string(repo.join("docs/configuration.md")).unwrap();
+    assert!(configuration.contains("profile-selectors.local.d"));
+    let overlays = std::fs::read_to_string(repo.join("docs/overlays.md")).unwrap();
+    for term in [
+        "selected",
+        "eligible",
+        "active",
+        "inspect validated existing state only",
+    ] {
+        assert!(overlays.contains(term), "overlay docs lost `{term}`");
     }
 }

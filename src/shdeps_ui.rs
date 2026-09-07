@@ -1,13 +1,12 @@
-//! Shdeps update group labels, summary text, and group record (slice 44).
+//! Shdeps update group labels, summary text, and group records.
 //!
-//! Ports the first coherent family from
-//! `lib/dot/providers/shdeps-ui.sh`: the group display vocabulary
+//! Owns the group display vocabulary
 //! (`_shdeps_group_label`, `_shdeps_summary_text`) and the in-memory
 //! group record the event adapter accumulates
 //! (`_shdeps_remember_group`, `_shdeps_record_item`,
 //! `_shdeps_record_group_summary`, `_shdeps_display_label`).
 //!
-//! Later lanes own the remainder of that file: the prompt
+//! [`crate::shdeps_ui_render`] owns prompt
 //! pause/resume pair and the UI reset (`_shdeps_prompt_pause`,
 //! `_shdeps_prompt_resume`, `_shdeps_ui_reset`), the verbose and
 //! summary renderers (`_shdeps_print_verbose_group_rows`,
@@ -17,10 +16,8 @@
 //! (`_shdeps_parse_event`, `_handle_shdeps_event`), the child
 //! liveness probes (`_shdeps_proc_state`, `_shdeps_update_finished`),
 //! and the FIFO update orchestration (`_run_shdeps_update_ui`,
-//! `_run_shdeps_update_command`). A different lane family
-//! (`src/shdeps.rs` on the unmerged `rust-port-slice-37`/`40`
-//! lanes) owns the sibling `lib/dot/providers/shdeps.sh`
-//! provider; nothing here duplicates it.
+//! `_run_shdeps_update_command`). [`crate::shdeps`] owns provider policy;
+//! nothing here duplicates it.
 //!
 //! Engine boundaries: text flows as bytes, like the sibling
 //! [`crate::progress_ui`] helpers, so group keys outside the known

@@ -3,7 +3,7 @@
 //! upstream fetch, generation fast path, candidate validation,
 //! parent snapshot, pull with backup retry, mode normalization).
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`. Unlike `_pull_base`, the shell always returns 0
 //! here; every outcome rides `REPLY_STATUS`, including the empty
 //! status for quiet optional short-circuits.
@@ -161,7 +161,7 @@ fn clone_suppressed(
     effective: &str,
     moves: &mut MoveCache,
 ) -> bool {
-    let Ok(mask) = read_umask() else {
+    let Ok(mask) = read_umask().map(crate::startup::ensure_umask_ceiling) else {
         return false;
     };
     let clone_inputs = CloneOverlayInputs {
@@ -416,7 +416,7 @@ pub fn pull_overlay(
     // The prefix carries `-C <path>`; the pull command supplies the
     // `git` binary itself.
     let mut command: Vec<OsString> = vec![
-        OsString::from("git"),
+        crate::init_client_identity::host_git_program(),
         OsString::from("-C"),
         OsString::from(inputs.path),
         OsString::from("rebase"),
@@ -453,19 +453,21 @@ pub fn pull_overlay(
         let head_after = repo_head(&prefix);
         let mut status = PullOverlayStatus::Current;
         if !head_before.is_empty() && !head_after.is_empty() && head_before != head_after {
-            let normalized = read_umask().is_ok_and(|mask| {
-                normalize_updated_paths(
-                    &prefix,
-                    inputs.path,
-                    "overlay",
-                    &head_before,
-                    &head_after,
-                    &snapshot,
-                    inputs.home,
-                    inputs.overlays,
-                    mask,
-                )
-            });
+            let normalized = read_umask()
+                .map(crate::startup::ensure_umask_ceiling)
+                .is_ok_and(|mask| {
+                    normalize_updated_paths(
+                        &prefix,
+                        inputs.path,
+                        "overlay",
+                        &head_before,
+                        &head_after,
+                        &snapshot,
+                        inputs.home,
+                        inputs.overlays,
+                        mask,
+                    )
+                });
             if !normalized {
                 remove_snapshot(Path::new(&snapshot));
                 return done(PullOverlayStatus::Failed, live);
@@ -535,19 +537,21 @@ pub fn pull_overlay(
     let head_after = repo_head(&prefix);
     let mut status = PullOverlayStatus::Current;
     if !head_before.is_empty() && !head_after.is_empty() && head_before != head_after {
-        let normalized = read_umask().is_ok_and(|mask| {
-            normalize_updated_paths(
-                &prefix,
-                inputs.path,
-                "overlay",
-                &head_before,
-                &head_after,
-                &snapshot,
-                inputs.home,
-                inputs.overlays,
-                mask,
-            )
-        });
+        let normalized = read_umask()
+            .map(crate::startup::ensure_umask_ceiling)
+            .is_ok_and(|mask| {
+                normalize_updated_paths(
+                    &prefix,
+                    inputs.path,
+                    "overlay",
+                    &head_before,
+                    &head_after,
+                    &snapshot,
+                    inputs.home,
+                    inputs.overlays,
+                    mask,
+                )
+            });
         if !normalized {
             remove_snapshot(Path::new(&snapshot));
             inputs.log.warn(

@@ -1,32 +1,23 @@
-//! `dot update` end-to-end execution parity (slice 80).
+//! Native `dot update` end-to-end execution coverage.
 //!
 //! The dispatcher arm ([`dot::cli::run`] with `update`/`pull`) runs the
-//! update lifecycle for real and reports its exit code, instead of the
-//! interim not-yet-implemented diagnostic. These tests pin the wired arm
-//! against the production shell (`bin/dot`) on synthetic `file://`
-//! fixtures, in both steady states:
+//! update lifecycle for real and reports its exit code. These tests exercise
+//! the wired arm on synthetic `file://` fixtures in both steady states:
 //!
 //! - clean: nothing changed since `init` (the cron steady state);
 //! - dirty: one pushed overlay change waiting to converge.
 //!
-//! Each side runs on its own twin HOME/state pair built from the same
-//! remotes, so the two updates never share mutable state. Stdout carries
-//! wall-clock stamps (`0s`, `Done in 0s`) that legitimately differ run to
-//! run; [`normalize_timing`] blanks those before the byte comparison while
-//! leaving every other byte exact. Stderr is compared byte for byte with
-//! no normalization. The converged HOME trees are compared with the
-//! byte-comparison technique from `tests/perf_update.rs` (regular files
-//! only, sorted; `.git`, `.dotfiles`, and the timestamped init-time
-//! `.dot-backup` are excluded because they carry clock or checkout
-//! identity rather than converged content).
+//! The historical Bash implementation is benchmarked separately from its
+//! pre-cutover revision; this suite contains no hidden second engine.
 
 use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Scratch helper shared with the other parity suites: pid plus a
 /// monotonic counter, no wall-clock reads.
-type Scratch = dot::test_support::TempDir;
+type Scratch = dot_test_support::TempDir;
 
 /// The Rust binary under test.
 fn bin() -> Command {
@@ -114,44 +105,179 @@ fn client_env(cmd: &mut Command, home: &Path, state: &Path) {
 }
 
 #[test]
-fn twin_commands_pin_the_same_reload_shell() {
+fn command_pins_the_reload_shell() {
     let scratch = Scratch::new("update-shell-input").expect("scratch dir");
     let home = scratch.path().join("home");
     let state = scratch.path().join("state");
-    let mut shell = Command::new("bash");
-    let mut rust = bin();
-    client_env(&mut shell, &home, &state);
-    client_env(&mut rust, &home, &state);
-    let shell_value = shell
+    let mut command = bin();
+    client_env(&mut command, &home, &state);
+    let value = command
         .get_envs()
         .find(|(key, _)| *key == "SHELL")
         .and_then(|(_, value)| value);
-    let rust_value = rust
-        .get_envs()
-        .find(|(key, _)| *key == "SHELL")
-        .and_then(|(_, value)| value);
-    assert_eq!(shell_value, Some(OsStr::new("/bin/bash")));
-    assert_eq!(rust_value, shell_value);
+    assert_eq!(value, Some(OsStr::new("/bin/bash")));
 }
 
-/// The production shell oracle (`bin/dot` under `set -euo pipefail`)
-/// with the same controlled client.
-fn shell_dot(argv: &[&str], home: &Path, state: &Path) -> std::process::Output {
-    let mut cmd = Command::new("bash");
-    cmd.arg("bin/dot");
-    for arg in argv {
-        cmd.arg(arg);
+#[test]
+fn update_rejects_ambient_topology_for_an_uninitialized_checkout() {
+    let scratch = Scratch::new("update-topology-injection").expect("scratch dir");
+    let home = scratch.path().join("home");
+    let state = scratch.path().join("state");
+    std::fs::create_dir_all(&home).expect("home");
+    git(&home, &["init", "-q"]);
+    git(&home, &["config", "user.name", "fixture"]);
+    git(&home, &["config", "user.email", "fixture@example.invalid"]);
+    std::fs::write(home.join("tracked"), b"content\n").expect("tracked file");
+    git(&home, &["add", "tracked"]);
+    git(&home, &["commit", "-qm", "seed"]);
+
+    let mut command = bin();
+    client_env(&mut command, &home, &state);
+    let output = command
+        .arg("update")
+        .env("DOT_BASE_TOPOLOGY", "ordinary")
+        .env("DOT_CLIENT_GIT_DIR", home.join(".git"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run update");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        output.stderr,
+        b"dot: ordinary HOME checkout requires a completed dot init identity\n"
+    );
+}
+
+fn assert_selector_failure(home: &Path, state: &Path, expected: &[u8]) {
+    for argv in [&["status"][..], &["update", "--quiet"][..]] {
+        let output = dot(argv, home, state);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "dot {argv:?} unexpectedly accepted the client"
+        );
+        assert_eq!(output.stderr, expected, "dot {argv:?} diagnostic");
     }
-    client_env(&mut cmd, home, state);
-    cmd.current_dir(env!("CARGO_MANIFEST_DIR"));
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.output().expect("run bin/dot")
 }
 
-/// The Rust binary with the same controlled client.
-fn rust_dot(argv: &[&str], home: &Path, state: &Path) -> std::process::Output {
+#[test]
+fn repository_commands_and_update_share_client_identity_rejections() {
+    let scratch = Scratch::new("client-selector-rejections").expect("scratch dir");
+
+    let malformed_home = scratch.path().join("malformed-home");
+    let malformed_state = scratch.path().join("malformed-state");
+    std::fs::create_dir_all(&malformed_home).expect("malformed home");
+    std::fs::create_dir_all(malformed_state.join("dot/init")).expect("malformed state");
+    std::fs::write(
+        malformed_state.join("dot/init/completed"),
+        b"not a record\n",
+    )
+    .expect("malformed record");
+    assert_selector_failure(
+        &malformed_home,
+        &malformed_state,
+        b"dot: malformed initialization identity record\n",
+    );
+
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (tampered_home, tampered_state) =
+        twin_client(&scratch, "tampered", &overlay_origin, &base_origin);
+    let completed = tampered_state.join("dot/init/completed");
+    let record = std::fs::read_to_string(&completed)
+        .expect("completion record")
+        .lines()
+        .map(|line| {
+            if line.starts_with("nonce=") {
+                "nonce=tampered"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&completed, record).expect("tampered completion record");
+    assert_selector_failure(
+        &tampered_home,
+        &tampered_state,
+        b"dot: client Git directory no longer matches initialization identity\n",
+    );
+
+    let foreign_home = scratch.path().join("foreign-home");
+    let foreign_state = scratch.path().join("foreign-state");
+    std::fs::create_dir_all(foreign_home.join(".dotfiles")).expect("foreign client directory");
+    assert_selector_failure(
+        &foreign_home,
+        &foreign_state,
+        format!(
+            "dot: unsupported or foreign client Git directory: {}\n",
+            foreign_home.join(".dotfiles").display()
+        )
+        .as_bytes(),
+    );
+
+    let linked_home = scratch.path().join("linked-home");
+    let linked_state = scratch.path().join("linked-state");
+    let linked_target = scratch.path().join("linked-target");
+    std::fs::create_dir_all(&linked_home).expect("linked home");
+    std::fs::create_dir_all(&linked_target).expect("linked target");
+    std::os::unix::fs::symlink(&linked_target, linked_home.join(".dotfiles"))
+        .expect("linked legacy client");
+    assert_selector_failure(
+        &linked_home,
+        &linked_state,
+        format!(
+            "dot: unsupported or foreign client Git directory: {}\n",
+            linked_home.join(".dotfiles").display()
+        )
+        .as_bytes(),
+    );
+
+    let ordinary_home = scratch.path().join("ordinary-home");
+    let ordinary_state = scratch.path().join("ordinary-state");
+    std::fs::create_dir_all(&ordinary_home).expect("ordinary home");
+    git(&ordinary_home, &["init", "-q"]);
+    assert_selector_failure(
+        &ordinary_home,
+        &ordinary_state,
+        b"dot: ordinary HOME checkout requires a completed dot init identity\n",
+    );
+}
+
+#[test]
+fn repository_commands_and_update_accept_an_in_progress_identity() {
+    let scratch = Scratch::new("client-selector-transaction").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "transaction", &overlay_origin, &base_origin);
+    let completed = state.join("dot/init/completed");
+    let transaction = state.join("dot/init/transaction/record");
+    std::fs::create_dir_all(transaction.parent().expect("transaction parent"))
+        .expect("transaction directory");
+    std::fs::set_permissions(
+        transaction.parent().expect("transaction parent"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("private transaction directory");
+    let record = std::fs::read_to_string(&completed)
+        .expect("completion record")
+        .replace("phase=complete\n", "phase=converging\n");
+    std::fs::write(&transaction, record).expect("transaction record");
+    std::fs::set_permissions(&transaction, std::fs::Permissions::from_mode(0o600))
+        .expect("private transaction record");
+    std::fs::remove_file(completed).expect("remove completion record");
+
+    for argv in [&["status"][..], &["update", "--quiet"][..]] {
+        let output = dot(argv, &home, &state);
+        assert!(
+            output.status.success(),
+            "dot {argv:?} rejected the transaction identity: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Run the native binary with the same controlled client.
+fn dot(argv: &[&str], home: &Path, state: &Path) -> std::process::Output {
     let mut cmd = bin();
     client_env(&mut cmd, home, state);
     cmd.env("DOT_BASH", home.join("absent-old-update-engine"));
@@ -160,7 +286,7 @@ fn rust_dot(argv: &[&str], home: &Path, state: &Path) -> std::process::Output {
     }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd.output().expect("run Rust dot")
+    cmd.output().expect("run native dot")
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -227,7 +353,7 @@ fn twin_client(
     let state = scratch.path().join(format!("state-{tag}"));
     std::fs::create_dir_all(&home).expect("home");
     std::fs::create_dir_all(&state).expect("state");
-    let shell = shell_dot(
+    let output = dot(
         &[
             "init",
             "--yes",
@@ -237,9 +363,9 @@ fn twin_client(
         &state,
     );
     assert!(
-        shell.status.success(),
+        output.status.success(),
         "twin {tag} init failed: {}",
-        String::from_utf8_lossy(&shell.stderr)
+        String::from_utf8_lossy(&output.stderr)
     );
     let conf_dir = home.join(".config/dot/overlays.d");
     std::fs::create_dir_all(&conf_dir).expect("conf dir");
@@ -311,7 +437,7 @@ fn normalize_timing(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Snapshot the converged HOME tree (regular files only, sorted) for
-/// byte comparison between shell and Rust runs. `.git` carries
+/// stable comparisons across independent native clients. `.git` carries
 /// checkout identity, `.dotfiles` carries the base checkout, and
 /// `.dot-backup` carries timestamped init-time safekeeping: none of
 /// them is converged content, so all three stay out of the
@@ -350,71 +476,35 @@ fn snapshot_tree(home: &Path) -> Vec<(String, Vec<u8>)> {
     entries
 }
 
-/// One wired-arm row on twin clients: exit codes match, stdout
-/// matches after timing normalization, stderr matches byte for byte,
-/// and the converged trees match byte for byte.
-fn check_update(
-    argv: &[&str],
-    home_shell: &Path,
-    state_shell: &Path,
-    home_rust: &Path,
-    state_rust: &Path,
-) {
-    let shell = shell_dot(argv, home_shell, state_shell);
-    let rust = rust_dot(argv, home_rust, state_rust);
-    assert_eq!(rust.status.code(), shell.status.code(), "argv: {argv:?}");
-    assert_eq!(
-        normalize_timing(&rust.stdout),
-        normalize_timing(&shell.stdout),
-        "argv: {argv:?}\nrust:\n{}\nshell:\n{}",
-        String::from_utf8_lossy(&rust.stdout),
-        String::from_utf8_lossy(&shell.stdout),
+fn check_update(argv: &[&str], home: &Path, state: &Path) -> std::process::Output {
+    let output = dot(argv, home, state);
+    assert!(
+        output.status.success(),
+        "dot {argv:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(rust.stderr, shell.stderr, "argv: {argv:?}");
-    assert_eq!(
-        snapshot_tree(home_rust),
-        snapshot_tree(home_shell),
-        "argv: {argv:?} converged trees differ"
-    );
+    output
 }
 
 #[test]
-fn clean_update_matches_shell_and_converges() {
+fn clean_update_converges_and_is_stable() {
     let scratch = Scratch::new("update-run-clean").expect("scratch dir");
     let (overlay_origin, base_origin) = shared_remotes(&scratch);
-    let (home_shell, state_shell) = twin_client(&scratch, "shell", &overlay_origin, &base_origin);
-    let (home_rust, state_rust) = twin_client(&scratch, "rust", &overlay_origin, &base_origin);
-    // Warm-up converges both twins like cron does, so the measured
-    // run is the clean steady state.
-    for (home, state) in [(&home_shell, &state_shell), (&home_rust, &state_rust)] {
-        let warm = shell_dot(&["update"], home, state);
-        assert!(
-            warm.status.success(),
-            "warm-up failed: {}",
-            String::from_utf8_lossy(&warm.stderr)
-        );
-    }
-    check_update(
-        &["update"],
-        &home_shell,
-        &state_shell,
-        &home_rust,
-        &state_rust,
-    );
-    let rust = rust_dot(&["update"], &home_rust, &state_rust);
-    assert_eq!(rust.status.code(), Some(0));
+    let (home, state) = twin_client(&scratch, "native", &overlay_origin, &base_origin);
+    check_update(&["update"], &home, &state);
+    let before = snapshot_tree(&home);
+    let clean = check_update(&["update"], &home, &state);
+    assert!(String::from_utf8_lossy(&clean.stdout).contains("current"));
+    assert_eq!(snapshot_tree(&home), before);
 }
 
 #[test]
-fn dirty_update_matches_shell_and_converges() {
+fn dirty_update_converges() {
     let scratch = Scratch::new("update-run-dirty").expect("scratch dir");
     let (_overlay_origin, base_origin) = shared_remotes(&scratch);
     let overlay_seed = scratch.path().join("overlay-0-seed");
     let overlay_origin = scratch.path().join("overlay-0.git");
-    let (home_shell, state_shell) = twin_client(&scratch, "shell", &overlay_origin, &base_origin);
-    let (home_rust, state_rust) = twin_client(&scratch, "rust", &overlay_origin, &base_origin);
-    // Push one changed file to the shared overlay remote: both twins
-    // converge the same change.
+    let (home, state) = twin_client(&scratch, "native", &overlay_origin, &base_origin);
     std::fs::write(
         overlay_seed.join("home/file-000.txt"),
         "overlay-0 payload CHANGED\n",
@@ -426,54 +516,32 @@ fn dirty_update_matches_shell_and_converges() {
         &overlay_seed,
         &["push", "-q", &overlay_origin.to_string_lossy(), "HEAD:main"],
     );
-    check_update(
-        &["update"],
-        &home_shell,
-        &state_shell,
-        &home_rust,
-        &state_rust,
-    );
-    for home in [&home_shell, &home_rust] {
-        let bytes = std::fs::read(home.join("file-000.txt")).expect("converged file");
-        assert_eq!(bytes, b"overlay-0 payload CHANGED\n", "home: {home:?}");
-    }
+    check_update(&["update"], &home, &state);
+    let bytes = std::fs::read(home.join("file-000.txt")).expect("converged file");
+    assert_eq!(bytes, b"overlay-0 payload CHANGED\n");
 }
 
 #[test]
-fn pull_alias_matches_shell_update() {
+fn pull_alias_matches_update() {
     let scratch = Scratch::new("update-run-pull").expect("scratch dir");
     let (overlay_origin, base_origin) = shared_remotes(&scratch);
-    let (home_shell, state_shell) = twin_client(&scratch, "shell", &overlay_origin, &base_origin);
-    let (home_rust, state_rust) = twin_client(&scratch, "rust", &overlay_origin, &base_origin);
-    // Warm-up converges both twins, so `pull` meets the clean steady
-    // state exactly like `update` does.
-    for (home, state) in [(&home_shell, &state_shell), (&home_rust, &state_rust)] {
-        let warm = shell_dot(&["update"], home, state);
-        assert!(
-            warm.status.success(),
-            "warm-up failed: {}",
-            String::from_utf8_lossy(&warm.stderr)
-        );
-    }
-    let shell = shell_dot(&["update"], &home_shell, &state_shell);
-    assert!(shell.status.success());
-    let rust = rust_dot(&["pull"], &home_rust, &state_rust);
-    assert_eq!(rust.status.code(), shell.status.code());
+    let (home_update, state_update) =
+        twin_client(&scratch, "update", &overlay_origin, &base_origin);
+    let (home_pull, state_pull) = twin_client(&scratch, "pull", &overlay_origin, &base_origin);
+    let update = check_update(&["update"], &home_update, &state_update);
+    let pull = check_update(&["pull"], &home_pull, &state_pull);
     assert_eq!(
-        normalize_timing(&rust.stdout),
-        normalize_timing(&shell.stdout),
-        "pull vs update:\nrust:\n{}\nshell:\n{}",
-        String::from_utf8_lossy(&rust.stdout),
-        String::from_utf8_lossy(&shell.stdout),
+        normalize_timing(&pull.stdout),
+        normalize_timing(&update.stdout)
     );
-    assert_eq!(rust.stderr, shell.stderr);
+    assert_eq!(pull.stderr, update.stderr);
+    assert_eq!(snapshot_tree(&home_pull), snapshot_tree(&home_update));
 }
 
 #[test]
-fn lock_busy_reports_75_like_shell() {
-    // Hold the update lock from this process (a live owner), then run
-    // both binaries against the same state: each must refuse with
-    // exit 75 and the shell's exact busy diagnostic, naming our pid.
+fn lock_busy_reports_75() {
+    // Hold the update lock from this process; the child must refuse and name
+    // the live owner without mutating the client.
     use dot::log::Log;
     let scratch = Scratch::new("update-run-busy").expect("scratch dir");
     let state = scratch.path().join("state");
@@ -488,13 +556,9 @@ fn lock_busy_reports_75_like_shell() {
     assert!(sink.is_empty());
     let pid = std::process::id();
     let expected = format!("  warning: dot update already running (pid {pid})\n");
-    let shell = shell_dot(&["update"], &home, &state);
-    assert_eq!(shell.status.code(), Some(75));
-    assert_eq!(shell.stderr, expected.as_bytes());
-    let rust = rust_dot(&["update"], &home, &state);
-    assert_eq!(rust.status.code(), Some(75));
-    assert_eq!(rust.stderr, expected.as_bytes());
-    assert!(rust.stdout.is_empty());
-    assert!(shell.stdout.is_empty());
+    let output = dot(&["update"], &home, &state);
+    assert_eq!(output.status.code(), Some(75));
+    assert_eq!(output.stderr, expected.as_bytes());
+    assert!(output.stdout.is_empty());
     let _ = guard;
 }

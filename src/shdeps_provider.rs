@@ -339,10 +339,7 @@ fn bootstrap(
     installer: &Path,
     env: &BTreeMap<OsString, OsString>,
 ) -> Result<PathBuf, ()> {
-    let bash = runtime.value("BASH").map(PathBuf::from).ok_or(())?;
-    if !bash.is_absolute() || !executable(&bash) {
-        return Err(());
-    }
+    let bash = runtime.bash().ok_or(())?;
     // The reviewed installer is the authority that selects the CLI. Keep its
     // shell-local `_SHDEPSW_BIN` across the process boundary with a strict,
     // NUL-framed protocol; installer stdout is intentionally not protocol.

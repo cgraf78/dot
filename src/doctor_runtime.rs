@@ -1,10 +1,9 @@
-//! Doctor result rendering and counters (slice 39: doctor layer, part 1).
+//! Doctor result rendering and counters.
 //!
-//! Ports the five reporting helpers from `lib/dot/doctor/runtime.sh`
-//! exactly: the `ok` / `warn` / `fail` / `skip` result lines, the
+//! Owns the `ok` / `warn` / `fail` / `skip` result lines, the
 //! `section` titles, and the pass/warn/fail counters the section
-//! modules report through. Later doctor slices (paths, repos, lock,
-//! provider, overlays, merges, and the `_dot_doctor` coordinator)
+//! modules report through. Path, repository, lock, provider, overlay, merge,
+//! and coordinator modules
 //! call into this API instead of reimplementing the layout.
 //!
 //! Text flows as bytes: `printf '%s'` copies its arguments verbatim,

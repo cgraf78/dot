@@ -231,10 +231,19 @@ impl Signals {
     }
 
     pub(crate) fn received(&self) -> Option<i32> {
-        match INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
-            0 => None,
-            signal => Some(signal),
-        }
+        received_signal()
+    }
+}
+
+/// Return the signal captured by the invocation owner, if any.
+///
+/// Worker threads cannot borrow the guard that owns the process handler, but
+/// they must still stop their isolated child sessions before the top-level
+/// command returns the conventional `128 + signal` status.
+pub(crate) fn received_signal() -> Option<i32> {
+    match INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => None,
+        signal => Some(signal),
     }
 }
 
@@ -687,7 +696,7 @@ mod tests {
 
     #[test]
     fn snapshot_collects_successful_process_output() {
-        let mut command = Command::new(crate::test_support::bash());
+        let mut command = Command::new(dot_test_support::bash());
         command.args(["-c", "printf 'snapshot\\n'"]);
         assert_eq!(
             snapshot(command, Instant::now() + Duration::from_secs(1)),
@@ -781,9 +790,9 @@ mod tests {
 
     #[test]
     fn snapshot_deadline_covers_child_that_closes_stdout_early() {
-        let root = crate::test_support::TempDir::new("snapshot-deadline").unwrap();
+        let root = dot_test_support::TempDir::new("snapshot-deadline").unwrap();
         let marker = root.path().join("pid");
-        let mut command = Command::new(crate::test_support::bash());
+        let mut command = Command::new(dot_test_support::bash());
         command
             .args([
                 "-c",

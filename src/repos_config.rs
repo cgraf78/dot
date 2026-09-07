@@ -1,4 +1,4 @@
-//! Slice-11 config track: `lib/dot/repos/config.sh` port.
+//! Repository configuration validation and repair.
 //!
 //! `is_worktree`, `effective_url`, and the origin-comparison logic
 //! are owned by [`crate::overlays`] (reused here, not duplicated);

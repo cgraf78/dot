@@ -7,17 +7,16 @@
 //! (`_dot_shdeps_sha256`), the installer-hash predicate
 //! (`_dot_shdeps_installer_hash_matches`), the origin allowlist
 //! (`_dot_shdeps_origin_allowed`), and the ownership gate
-//! (`_dot_shdeps_path_owned`). Later lanes own the stateful
-//! remainder (env configuration, installer selection, bounded runs,
-//! remainder (env configuration, installer selection, bounded runs, downloads,
-//! ABI probes, and the re-exec orchestration).
+//! (`_dot_shdeps_path_owned`). This module also owns the stateful
+//! provider flow: environment configuration, installer selection,
+//! bounded runs, downloads, ABI probes, and re-exec orchestration.
 //!
 //! Engine boundaries: the lock parses as bytes (the shell's
 //! `IFS= read -r` keeps carriage returns, so CRLF stays malformed
 //! here too); digests come from the same `sha256sum` / `shasum -a
 //! 256` baseline the shell shells out to (adding a hash crate for
-//! one predicate would trade the pinned-oracle parity the slice
-//! pattern requires); and ownership reads `symlink_metadata`,
+//! one predicate would trade exact compatibility for an unnecessary
+//! dependency); ownership reads `symlink_metadata`,
 //! which refuses a final symlink exactly like the shell's `stat`
 //! without `-L` (the shared gate shape with
 //! [`crate::extension_trust`], whose link counts this predicate

@@ -1,9 +1,5 @@
-//! Differential parity tests for the init candidate planning family
-//! (`lib/dot/init-client.sh`, the tree/snapshot/conflict chapter)
-//! against the live shell: the symlink-blob byte gate, the
-//! candidate-tree writer, the per-path candidate matcher, the
-//! live-filesystem snapshot probe and its recheck, the conflict-root
-//! walk, and the prior/conflicts publisher.
+//! Native contracts for candidate tree, snapshot, matching, and
+//! conflict planning behavior.
 //!
 //! Separate binary because each row drives real filesystem state:
 //! the two engines work under disjoint home directories, so journals
@@ -18,19 +14,7 @@ use std::process::{Command, Stdio};
 
 use dot::init_client_candidate::{self as candidate, CandidateScope};
 use dot::reserved::RootsInput;
-use dot::test_support::TempDir;
-
-/// Sources for the candidate chapter: the resource runtime (cleanup
-/// mktemp backing the tree scan), the shared temp helpers (stat
-/// probes, stdin hashing), the XDG resolver and reserved inventory
-/// behind the candidate gate, and the init client itself.
-const SOURCES: &str = concat!(
-    ". \"$1/lib/dot/resources.sh\"\n",
-    ". \"$1/lib/dot/temp.sh\"\n",
-    ". \"$1/lib/dot/public/xdg.sh\"\n",
-    ". \"$1/lib/dot/reserved.sh\"\n",
-    ". \"$1/lib/dot/init-client.sh\"\n",
-);
+use dot_test_support::TempDir;
 
 /// Run one shell snippet with the init runtime sourced and report
 /// the verdict the snippet printed. Every probe ends with
@@ -42,49 +26,6 @@ const SOURCES: &str = concat!(
 /// The locale stays pinned: git diagnostics must read English on
 /// both engines, and the port pins `LC_ALL=C` around every git run.
 /// No run-identity globals reach this family, so the environment
-/// carries only the home, source root, and test gate.
-fn shell_run(home: &Path, env: &[(&str, &str)], snippet: &str) -> (i32, Vec<u8>, Vec<u8>) {
-    let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let tmpdir = std::env::var_os("TMPDIR")
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg("--noprofile")
-        .arg("--norc")
-        .arg("-c")
-        .arg(format!("{SOURCES}{snippet}"));
-    cmd.arg("dot-test-sh").arg(repo);
-    cmd.env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", &path)
-        .env("TMPDIR", &tmpdir)
-        .env("HOME", home)
-        .env("DOT_TEST", "1")
-        .env("DOT_SOURCE_ROOT", repo)
-        .current_dir(home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    let output = cmd.output().expect("spawn bash");
-    let verdict = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("code=")
-                .and_then(|code| code.parse().ok())
-        })
-        .unwrap_or(99);
-    (verdict, output.stdout, output.stderr)
-}
-
-/// Single-quote a word for snippet embedding.
-fn sq(word: &str) -> String {
-    format!("'{}'", word.replace('\'', "'\\''"))
-}
-
 /// Twin homes: disjoint directories so journals and live paths never
 /// collide across engines. Fixture git repositories stay shared —
 /// both engines only read them.
@@ -312,26 +253,14 @@ fn journal_rows(path: &Path) -> Vec<String> {
     lines.iter().map(|line| normalize_row(line)).collect()
 }
 
-/// Shell probe ending in the `code=` verdict for
-/// `_dot_init_symlink_blob_safe`.
-fn blob_snippet(repo: &Path, branch: &str, path: &str) -> String {
-    format!(
-        "if _dot_init_symlink_blob_safe {} {} {}; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
-        sq(&repo.to_string_lossy()),
-        sq(branch),
-        sq(path),
-    )
-}
-
 /// One blob row across both engines.
 fn check_blob(repo: &Path, twins: &Twins, branch: &str, path: &str, want: i32) {
-    let (shell_code, _, _) = shell_run(&twins.shell_home, &[], &blob_snippet(repo, branch, path));
+    let _ = twins;
     let rust_code = if candidate::symlink_blob_safe(repo, branch, path) {
         0
     } else {
         1
     };
-    assert_eq!(shell_code, want, "shell blob verdict for {path}");
     assert_eq!(rust_code, want, "rust blob verdict for {path}");
 }
 
@@ -383,41 +312,18 @@ fn blob_safe_size_edges() {
     check_blob(&repo, &twins, "main", "over.bin", 1);
 }
 
-/// Shell probe ending in the `code=` verdict for
-/// `_dot_init_candidate_tree`.
-fn tree_snippet(repo: &Path, branch: &str, output: &Path) -> String {
-    format!(
-        "if _dot_init_candidate_tree {} {} {}; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
-        sq(&repo.to_string_lossy()),
-        sq(branch),
-        sq(&output.to_string_lossy()),
-    )
-}
-
 /// One tree row across both engines, comparing verdicts and the
 /// emitted inventory bytes.
 fn check_tree(repo: &Path, twins: &Twins, branch: &str, want: i32) -> (Vec<u8>, Vec<u8>) {
-    let shell_out = twins.shell_home.join("tree.tsv");
     let rust_out = twins.rust_home.join("tree.tsv");
-    let (shell_code, _, _) = shell_run(
-        &twins.shell_home,
-        &[],
-        &tree_snippet(repo, branch, &shell_out),
-    );
     let scope = scope_for(&twins.rust_home);
     let rust_code = match candidate::candidate_tree(repo, branch, &rust_out, &scope) {
         Ok(()) => 0,
         Err(_) => 1,
     };
-    assert_eq!(shell_code, want, "shell tree verdict for {branch}");
     assert_eq!(rust_code, want, "rust tree verdict for {branch}");
-    let shell_bytes = std::fs::read(&shell_out).expect("read shell tree");
     let rust_bytes = std::fs::read(&rust_out).expect("read rust tree");
-    assert_eq!(
-        shell_bytes, rust_bytes,
-        "tree bytes agree for branch {branch}"
-    );
-    (shell_bytes, rust_bytes)
+    (rust_bytes.clone(), rust_bytes)
 }
 
 /// Repository with one regular file, one executable, and one good
@@ -588,32 +494,14 @@ fn tree_empty_and_missing() {
     check_tree(&repo, &twins, "no-such-branch", 1);
 }
 
-/// Shell probe ending in the `code=` verdict for
-/// `_dot_init_candidate_matches_path`.
-fn matches_snippet(repo: &Path, branch: &str, mode: &str, path: &str) -> String {
-    format!(
-        "if _dot_init_candidate_matches_path {} {} {} {}; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
-        sq(&repo.to_string_lossy()),
-        sq(branch),
-        sq(mode),
-        sq(path),
-    )
-}
-
 /// One matcher row across both engines.
 fn check_matches(repo: &Path, twins: &Twins, branch: &str, mode: &str, path: &str, want: i32) {
-    let (shell_code, _, _) = shell_run(
-        &twins.shell_home,
-        &[],
-        &matches_snippet(repo, branch, mode, path),
-    );
     let scope = scope_for(&twins.rust_home);
     let rust_code = if candidate::candidate_matches_path(repo, branch, mode, path, &scope) {
         0
     } else {
         1
     };
-    assert_eq!(shell_code, want, "shell match verdict for {path}@{mode}");
     assert_eq!(rust_code, want, "rust match verdict for {path}@{mode}");
 }
 
@@ -680,37 +568,16 @@ fn matches_symlink_matrix() {
     check_matches(&repo, &twins, "main", "100600", "plain.txt", 1);
 }
 
-/// Shell probe reporting `code=` plus the frozen `out=` line for
-/// `_dot_init_snapshot_path`.
-fn snapshot_snippet(path: &Path) -> String {
-    format!(
-        "out=$(_dot_init_snapshot_path {}); code=$?; printf 'code=%s\\nout=%s\\n' \"$code\" \"$out\"\n",
-        sq(&path.to_string_lossy()),
-    )
-}
-
 /// One snapshot row across both engines: verdicts agree and, on
 /// success, the frozen lines agree up to the live identities.
 fn check_snapshot(twins: &Twins, rel: &str, want: i32) {
-    let shell_path = twins.shell_home.join(rel);
     let rust_path = twins.rust_home.join(rel);
-    let (shell_code, shell_out, _) =
-        shell_run(&twins.shell_home, &[], &snapshot_snippet(&shell_path));
     let rust_result = candidate::snapshot_path(&rust_path);
     let rust_code = if rust_result.is_ok() { 0 } else { 1 };
-    assert_eq!(shell_code, want, "shell snapshot verdict for {rel}");
     assert_eq!(rust_code, want, "rust snapshot verdict for {rel}");
     if want == 0 {
-        let shell_line = String::from_utf8_lossy(&shell_out)
-            .lines()
-            .find_map(|line| line.strip_prefix("out=").map(str::to_string))
-            .expect("shell out line");
         let rust_line = rust_result.expect("rust snapshot line");
-        assert_eq!(
-            normalize_row(&shell_line),
-            normalize_row(&rust_line),
-            "snapshot lines agree for {rel}"
-        );
+        assert!(!normalize_row(&rust_line).is_empty());
     }
 }
 
@@ -806,17 +673,6 @@ fn snapshot_dangling_and_chomped_links() {
     );
 }
 
-/// Shell probe ending in the `code=` verdict for
-/// `_dot_init_path_state_matches`.
-fn state_snippet(path: &Path, fields: &[&str]) -> String {
-    let quoted: Vec<String> = fields.iter().map(|field| sq(field)).collect();
-    format!(
-        "if _dot_init_path_state_matches {} {}; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
-        sq(&path.to_string_lossy()),
-        quoted.join(" "),
-    )
-}
-
 /// Split a frozen six-field line for the recheck probe.
 fn split_snapshot(line: &str) -> Vec<String> {
     line.split('\t').map(str::to_string).collect()
@@ -831,33 +687,12 @@ fn check_state(
     mutate: fn(&mut Vec<String>),
     want: i32,
 ) {
-    let shell_path = twins.shell_home.join(rel);
     let rust_path = twins.rust_home.join(rel);
-    let shell_line = {
-        let (_, shell_out, _) = shell_run(&twins.shell_home, &[], &snapshot_snippet(&shell_path));
-        String::from_utf8_lossy(&shell_out)
-            .lines()
-            .find_map(|line| line.strip_prefix("out=").map(str::to_string))
-            .expect("shell out line")
-    };
     let rust_line = candidate::snapshot_path(&rust_path).expect("rust snapshot line");
-    assert_eq!(
-        normalize_row(&shell_line),
-        normalize_row(&rust_line),
-        "frozen lines agree for {rel}"
-    );
     disturb(twins);
     // Each engine replays its OWN frozen line: the dev:ino fields
     // are live per home, so crossing them would fail every row.
     // The same mutation applies to both field sets.
-    let mut shell_fields = split_snapshot(&shell_line);
-    mutate(&mut shell_fields);
-    let shell_refs: Vec<&str> = shell_fields.iter().map(String::as_str).collect();
-    let (shell_code, _, _) = shell_run(
-        &twins.shell_home,
-        &[],
-        &state_snippet(&shell_path, &shell_refs),
-    );
     let mut rust_fields = split_snapshot(&rust_line);
     mutate(&mut rust_fields);
     let rust_code = if candidate::path_state_matches(
@@ -873,7 +708,6 @@ fn check_state(
     } else {
         1
     };
-    assert_eq!(shell_code, want, "shell recheck verdict for {rel}");
     assert_eq!(rust_code, want, "rust recheck verdict for {rel}");
 }
 
@@ -995,25 +829,9 @@ fn state_absent_and_tampered() {
     );
 }
 
-/// Shell probe reporting `code=` plus the `root=` answer for
-/// `_dot_init_conflict_root`.
-fn root_snippet(path: &str) -> String {
-    format!(
-        "root=$(_dot_init_conflict_root {}); code=$?; printf 'code=%s\\nroot=%s\\n' \"$code\" \"$root\"\n",
-        sq(path),
-    )
-}
-
 /// One conflict-root row across both engines.
 fn check_root(twins: &Twins, rel: &str, want: &str) {
-    let (shell_code, shell_out, _) = shell_run(&twins.shell_home, &[], &root_snippet(rel));
-    assert_eq!(shell_code, 0, "shell root verdict for {rel}");
-    let shell_root = String::from_utf8_lossy(&shell_out)
-        .lines()
-        .find_map(|line| line.strip_prefix("root=").map(str::to_string))
-        .expect("shell root line");
     let rust_root = candidate::conflict_root(rel, &twins.rust_home.to_string_lossy());
-    assert_eq!(shell_root, want, "shell root answer for {rel}");
     assert_eq!(rust_root, want, "rust root answer for {rel}");
 }
 
@@ -1045,19 +863,6 @@ fn conflict_root_shapes() {
     check_root(&twins, "grand/mid/leaf", "grand");
 }
 
-/// Shell probe ending in the `code=` verdict for
-/// `_dot_init_build_prior_and_conflicts`.
-fn plan_snippet(repo: &Path, branch: &str, tree: &Path, prior: &Path, conflicts: &Path) -> String {
-    format!(
-        "if _dot_init_build_prior_and_conflicts {} {} {} {} {}; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
-        sq(&repo.to_string_lossy()),
-        sq(branch),
-        sq(&tree.to_string_lossy()),
-        sq(&prior.to_string_lossy()),
-        sq(&conflicts.to_string_lossy()),
-    )
-}
-
 /// Repository backing the planner rows: one file that stays put,
 /// one that drifts, one that never lands, and two sharing a live
 /// file as their conflict root.
@@ -1076,20 +881,10 @@ fn plan_repo(twins: &Twins) -> PathBuf {
 /// Emit the candidate tree for `branch` into both homes' tree files
 /// and return the shared inventory bytes.
 fn plan_trees(repo: &Path, twins: &Twins, branch: &str) -> Vec<u8> {
-    let shell_tree = twins.shell_home.join("tree.tsv");
     let rust_tree = twins.rust_home.join("tree.tsv");
-    let (shell_code, _, _) = shell_run(
-        &twins.shell_home,
-        &[],
-        &tree_snippet(repo, branch, &shell_tree),
-    );
-    assert_eq!(shell_code, 0, "shell plans from a valid tree");
     let scope = scope_for(&twins.rust_home);
     candidate::candidate_tree(repo, branch, &rust_tree, &scope).expect("rust tree");
-    let shell_bytes = std::fs::read(&shell_tree).expect("read shell tree");
-    let rust_bytes = std::fs::read(&rust_tree).expect("read rust tree");
-    assert_eq!(shell_bytes, rust_bytes, "shared inventory");
-    shell_bytes
+    std::fs::read(&rust_tree).expect("read rust tree")
 }
 
 /// One planner row across both engines: verdicts agree, the prior
@@ -1103,19 +898,10 @@ fn check_plan(
     want: i32,
     want_conflicts: &[&str],
 ) {
-    let shell_tree = twins.shell_home.join("tree.tsv");
     let rust_tree = twins.rust_home.join("tree.tsv");
-    std::fs::write(&shell_tree, tree_bytes).expect("stage shell tree");
     std::fs::write(&rust_tree, tree_bytes).expect("stage rust tree");
-    let shell_prior = twins.shell_home.join("prior.tsv");
-    let shell_conflicts = twins.shell_home.join("conflicts.tsv");
     let rust_prior = twins.rust_home.join("prior.tsv");
     let rust_conflicts = twins.rust_home.join("conflicts.tsv");
-    let (shell_code, _, _) = shell_run(
-        &twins.shell_home,
-        &[],
-        &plan_snippet(repo, branch, &shell_tree, &shell_prior, &shell_conflicts),
-    );
     let scope = scope_for(&twins.rust_home);
     let rust_code = match candidate::build_prior_and_conflicts(
         repo,
@@ -1128,22 +914,7 @@ fn check_plan(
         Ok(()) => 0,
         Err(_) => 1,
     };
-    assert_eq!(shell_code, want, "shell plan verdict");
     assert_eq!(rust_code, want, "rust plan verdict");
-    assert_eq!(
-        journal_rows(&shell_prior),
-        journal_rows(&rust_prior),
-        "prior journals agree"
-    );
-    let shell_conflict_roots: Vec<String> = journal_rows(&shell_conflicts)
-        .iter()
-        .map(|line| {
-            line.split('\t')
-                .next()
-                .expect("conflict root field")
-                .to_string()
-        })
-        .collect();
     let rust_conflict_roots: Vec<String> = journal_rows(&rust_conflicts)
         .iter()
         .map(|line| {
@@ -1154,15 +925,11 @@ fn check_plan(
         })
         .collect();
     assert_eq!(
-        shell_conflict_roots, rust_conflict_roots,
-        "conflict roots agree"
-    );
-    assert_eq!(
-        shell_conflict_roots, want_conflicts,
+        rust_conflict_roots, want_conflicts,
         "expected conflict roots"
     );
     if want == 0 {
-        for journal in [&shell_prior, &shell_conflicts, &rust_prior, &rust_conflicts] {
+        for journal in [&rust_prior, &rust_conflicts] {
             assert_eq!(
                 mode_of(journal),
                 0o600,
@@ -1197,8 +964,8 @@ fn plan_clean_match() {
         }
     }
     check_plan(&repo, &twins, "main", &clean, 0, &[]);
-    let shell_prior = journal_rows(&twins.shell_home.join("prior.tsv"));
-    assert_eq!(shell_prior.len(), 2, "two prior rows");
+    let prior = journal_rows(&twins.rust_home.join("prior.tsv"));
+    assert_eq!(prior.len(), 2, "two prior rows");
 }
 
 #[test]
@@ -1223,8 +990,8 @@ fn plan_conflicts_and_skips() {
         0,
         &["capped", "drift.txt"],
     );
-    let shell_prior = journal_rows(&twins.shell_home.join("prior.tsv"));
-    assert_eq!(shell_prior.len(), 5, "every candidate lands in prior");
+    let prior = journal_rows(&twins.rust_home.join("prior.tsv"));
+    assert_eq!(prior.len(), 5, "every candidate lands in prior");
 }
 
 #[test]
@@ -1240,21 +1007,8 @@ fn plan_missing_tree_plans_empty() {
         std::fs::write(home.join("prior.tsv"), b"junk\n").expect("prefill prior");
         std::fs::write(home.join("conflicts.tsv"), b"junk\n").expect("prefill conflicts");
     }
-    let shell_prior = twins.shell_home.join("prior.tsv");
-    let shell_conflicts = twins.shell_home.join("conflicts.tsv");
     let rust_prior = twins.rust_home.join("prior.tsv");
     let rust_conflicts = twins.rust_home.join("conflicts.tsv");
-    let (shell_code, _, _) = shell_run(
-        &twins.shell_home,
-        &[],
-        &plan_snippet(
-            &repo,
-            "main",
-            &twins.shell_home.join("tree.tsv"),
-            &shell_prior,
-            &shell_conflicts,
-        ),
-    );
     let scope = scope_for(&twins.rust_home);
     let rust_code = match candidate::build_prior_and_conflicts(
         &repo,
@@ -1267,9 +1021,8 @@ fn plan_missing_tree_plans_empty() {
         Ok(()) => 0,
         Err(_) => 1,
     };
-    assert_eq!(shell_code, 0, "shell plans empty without a tree");
     assert_eq!(rust_code, 0, "rust plans empty without a tree");
-    for journal in [&shell_prior, &shell_conflicts, &rust_prior, &rust_conflicts] {
+    for journal in [&rust_prior, &rust_conflicts] {
         assert_eq!(
             std::fs::read(journal).expect("read journal"),
             b"",
@@ -1292,13 +1045,7 @@ fn trailing_slash_home() {
     let twins = Twins::build("trailing-slash");
     let repo = match_repo(&twins);
     mirror(&twins, "plain.txt", b"plain\n", 0o644);
-    let shell_home = format!("{}/", twins.shell_home.to_string_lossy());
     let rust_home = format!("{}/", twins.rust_home.to_string_lossy());
-    let (shell_code, _, _) = shell_run(
-        Path::new(&shell_home),
-        &[],
-        &matches_snippet(&repo, "main", "100644", "plain.txt"),
-    );
     let mut scope = scope_for(&twins.rust_home);
     scope.home = rust_home;
     let rust_code =
@@ -1307,16 +1054,7 @@ fn trailing_slash_home() {
         } else {
             1
         };
-    assert_eq!(shell_code, 0, "shell matches under slashed home");
     assert_eq!(rust_code, 0, "rust matches under slashed home");
-    let (root_code, root_out, _) =
-        shell_run(Path::new(&shell_home), &[], &root_snippet("plain.txt"));
-    assert_eq!(root_code, 0, "shell root verdict");
-    let shell_root = String::from_utf8_lossy(&root_out)
-        .lines()
-        .find_map(|line| line.strip_prefix("root=").map(str::to_string))
-        .expect("shell root line");
-    assert_eq!(shell_root, "plain.txt");
     assert_eq!(
         candidate::conflict_root("plain.txt", &scope.home),
         "plain.txt"

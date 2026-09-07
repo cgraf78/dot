@@ -1,12 +1,9 @@
-//! Differential parity tests for `src/repos_pull_queries.rs` against
-//! the live shell (`lib/dot/repos/pull.sh`): the checked-out
-//! generation query, upstream containment, generation identity, and
-//! the candidate-tree validation cluster (adapter gate, entry
-//! policy, full-tree and ahead-delta scans, generation acceptance).
+//! Native contracts for repository generation and candidate-tree queries.
 
-use std::ffi::OsStr;
+use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use dot::log::Log;
 use dot::repos_pull_queries::{
@@ -14,893 +11,654 @@ use dot::repos_pull_queries::{
     repo_head_contains_upstream, repo_head_is, validate_ahead_delta, validate_candidate_entry,
     validate_candidate_tree,
 };
+use dot::reserved::{RootsInput, reserved_roots};
+use dot_test_support::TempDir;
 
-/// Non-tty logger: warning bytes match the shell exactly.
-fn test_log() -> Log {
-    Log::new(false, false)
-}
-use dot::test_support::TempDir;
-
-/// Sources plus the init stub `model.sh` needs at source time.
-const SOURCES: &str = concat!(
-    "dot_xdg_path() { return 1; }\n",
-    ". \"$1/lib/dot/resources.sh\"\n",
-    ". \"$1/lib/dot/repos/model.sh\" 2>/dev/null\n",
-    ". \"$1/lib/dot/temp.sh\"\n",
-    ". \"$1/lib/dot/repos/pull.sh\"\n",
-);
-
-/// Run one shell snippet with the repos libraries sourced.
-fn shell_run(
-    home: &Path,
-    argv: &[&OsStr],
-    extra_env: &[(&str, Option<&str>)],
-    snippet: &str,
-) -> (i32, Vec<u8>, Vec<u8>) {
-    let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let tmpdir = std::env::var_os("TMPDIR")
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg("--noprofile")
-        .arg("--norc")
-        .arg("-c")
-        .arg(format!("{SOURCES}{snippet}"));
-    cmd.arg("dot-test-sh").arg(repo);
-    for arg in argv {
-        cmd.arg(arg);
-    }
-    cmd.env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", &path)
-        .env("TMPDIR", &tmpdir)
-        .env("HOME", home)
-        .env("DOT_TEST", "1")
-        .current_dir(home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in extra_env {
-        match value {
-            Some(value) => {
-                cmd.env(key, value);
-            }
-            None => {
-                cmd.env_remove(key);
-            }
-        }
-    }
-    let output = cmd.output().expect("spawn bash");
-    (
-        output.status.code().unwrap_or(99),
-        output.stdout,
-        output.stderr,
-    )
+fn log() -> Log {
+    Log::new(false, true)
 }
 
-/// Run `git -C dir args`, silenced, asserting success.
-fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(dir)
+fn git_program() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("host git")
+}
+
+fn git(repo: &Path, args: &[&str]) -> Output {
+    let output = Command::new(git_program())
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "tag.gpgsign=false",
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-C",
+        ])
+        .arg(repo)
         .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("spawn git");
-    assert!(status.success(), "git {args:?} in {}", dir.display());
-}
-
-/// `git init` plus one tracked committed file.
-fn seed_repo(dir: &Path) {
-    std::fs::create_dir_all(dir).expect("repo dir");
-    git(dir, &["init", "-q"]);
-    std::fs::write(dir.join("tracked.txt"), b"v1\n").expect("seed file");
-    git(
-        dir,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
-    );
-    git(
-        dir,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "seed",
-        ],
-    );
-}
-
-/// HEAD sha of a fixture, via direct git.
-fn head_of(dir: &Path) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["rev-parse", "--verify", "HEAD"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
-        .expect("spawn git");
-    assert!(output.status.success(), "rev-parse HEAD");
-    String::from_utf8_lossy(&output.stdout)
-        .trim_end()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn prefix(repo: &Path) -> Vec<OsString> {
+    [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "tag.gpgsign=false",
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-C",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .chain(std::iter::once(repo.as_os_str().to_owned()))
+    .collect()
+}
+
+fn head(repo: &Path) -> String {
+    String::from_utf8(git(repo, &["rev-parse", "HEAD"]).stdout)
+        .expect("ASCII oid")
+        .trim()
         .to_string()
 }
 
-#[test]
-fn repo_head_reports_generation_or_empty() {
-    let dir = TempDir::new("pull-head").expect("fixture dir");
-    let repo = dir.path().join("repo");
-    seed_repo(&repo);
-    let repo_text = repo.to_string_lossy().into_owned();
-    let missing = dir.path().join("gone");
-    let missing_text = missing.to_string_lossy().into_owned();
-    let snippet = format!(
-        "echo \"have=$(_repo_head git -C {repo_text})\"\n\
-         echo \"missing=$(_repo_head git -C {missing_text})\"\n"
-    );
-    let (shell_status, shell_out, shell_err) = shell_run(dir.path(), &[], &[], &snippet);
-    assert_eq!(shell_status, 0, "harness exit");
-    assert!(shell_err.is_empty(), "shell stderr: {shell_err:?}");
-    let shell_text = String::from_utf8_lossy(&shell_out).into_owned();
-    let prefix = ["-C".to_string(), repo_text.clone()];
-    let prefix_os: Vec<std::ffi::OsString> = prefix.iter().map(std::ffi::OsString::from).collect();
-    let rust_head = repo_head(&prefix_os);
-    assert_eq!(rust_head, head_of(&repo), "head sha parity");
-    assert!(
-        shell_text.contains(&format!("have={rust_head}\n")),
-        "shell reports same sha: {shell_text:?}"
-    );
-    assert!(
-        shell_text.contains("missing=\n"),
-        "shell reports empty for missing repo: {shell_text:?}"
-    );
-    let missing_prefix: Vec<std::ffi::OsString> = ["-C", &missing_text]
-        .iter()
-        .map(std::ffi::OsString::from)
-        .collect();
-    assert_eq!(
-        repo_head(&missing_prefix),
-        "",
-        "rust reports empty for missing repo"
-    );
+fn commit_all(repo: &Path, message: &str) {
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-qm", message]);
 }
 
-#[test]
-fn head_contains_upstream_matches_shell_gate() {
-    let dir = TempDir::new("pull-contains").expect("fixture dir");
-    let repo = dir.path().join("repo");
-    seed_repo(&repo);
-    let head = head_of(&repo);
-    // Second commit: the first generation is a true ancestor.
-    std::fs::write(repo.join("tracked.txt"), b"v2\n").expect("advance file");
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qam",
-            "second",
-        ],
-    );
-    let child = head_of(&repo);
-    assert_ne!(head, child, "fixture must advance");
-    let repo_text = repo.to_string_lossy().into_owned();
-    let prefix = ["-C".to_string(), repo_text.clone()];
-    let prefix_os: Vec<std::ffi::OsString> = prefix.iter().map(std::ffi::OsString::from).collect();
-    // (head, upstream, shell-expect): equality short-circuits true,
-    // empties refuse, ancestry probes git, strangers fail.
-    for (have, upstream, want) in [
-        (child.clone(), child.clone(), true),
-        (String::new(), child.clone(), false),
-        (child.clone(), String::new(), false),
-        (child.clone(), head.clone(), true),
-        (head.clone(), child.clone(), false),
-    ] {
-        let snippet = format!(
-            "if _repo_head_contains_upstream \"{have}\" \"{upstream}\" git -C {repo_text}; then echo yes; else echo no; fi\n"
-        );
-        let (shell_status, shell_out, shell_err) = shell_run(dir.path(), &[], &[], &snippet);
-        assert_eq!(shell_status, 0, "harness exit");
-        assert!(shell_err.is_empty(), "shell stderr: {shell_err:?}");
-        let shell_yes = shell_out.starts_with(b"yes\n");
-        assert_eq!(shell_yes, want, "shell gate for {have}/{upstream}");
-        assert_eq!(
-            repo_head_contains_upstream(&prefix_os, &have, &upstream),
-            want,
-            "rust gate for {have}/{upstream}"
-        );
+fn seed(repo: &Path, files: &[(&str, &[u8], bool)]) {
+    std::fs::create_dir_all(repo).expect("repo dir");
+    git(repo, &["init", "-q"]);
+    for (relative, bytes, executable) in files {
+        let path = repo.join(relative);
+        std::fs::create_dir_all(path.parent().expect("file parent")).expect("file parent");
+        std::fs::write(&path, bytes).expect("fixture file");
+        if *executable {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("executable mode");
+        }
     }
-    // Identity pins through `_repo_head_is` on both sides.
-    let snippet = format!(
-        "if _repo_head_is \"{child}\" git -C {repo_text}; then echo yes; else echo no; fi\n\
-         if _repo_head_is \"{head}\" git -C {repo_text}; then echo yes; else echo no; fi\n\
-         if _repo_head_is \"\" git -C {repo_text}; then echo yes; else echo no; fi\n"
-    );
-    let (shell_status, shell_out, _) = shell_run(dir.path(), &[], &[], &snippet);
-    assert_eq!(shell_status, 0, "harness exit");
-    assert_eq!(shell_out, b"yes\nno\nno\n", "shell identity rows");
-    assert!(repo_head_is(&prefix_os, &child));
-    assert!(!repo_head_is(&prefix_os, &head));
-    assert!(!repo_head_is(&prefix_os, ""));
+    commit_all(repo, "seed");
 }
 
-// ---------------------------------------------------------------------------
-// Candidate validation cluster.
-// ---------------------------------------------------------------------------
-
-/// Sources for the validation cluster: the base set plus XDG lookup,
-/// logging, the safe-relative gate, and the reserved inventory.
-const VALIDATE_SOURCES: &str = concat!(
-    "dot_xdg_path() { return 1; }\n",
-    ". \"$1/lib/dot/public/xdg.sh\"\n",
-    ". \"$1/lib/dot/resources.sh\"\n",
-    ". \"$1/lib/dot/repos/model.sh\" 2>/dev/null\n",
-    ". \"$1/lib/dot/temp.sh\"\n",
-    ". \"$1/lib/dot/log.sh\"\n",
-    ". \"$1/lib/dot/init-client.sh\"\n",
-    ". \"$1/lib/dot/reserved.sh\"\n",
-    ". \"$1/lib/dot/repos/pull.sh\"\n",
-);
-
-/// Run one shell snippet with the validation libraries sourced and
-/// the reserved-inventory environment pinned to `home`.
-fn shell_validate(home: &Path, snippet: &str) -> (i32, Vec<u8>, Vec<u8>) {
-    let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let tmpdir = std::env::var_os("TMPDIR")
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    let home_text = home.to_string_lossy().into_owned();
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg("--noprofile")
-        .arg("--norc")
-        .arg("-c")
-        .arg(format!("{VALIDATE_SOURCES}{snippet}"));
-    cmd.arg("dot-test-sh").arg(repo);
-    cmd.env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", &path)
-        .env("TMPDIR", &tmpdir)
-        .env("HOME", home)
-        .env("DOT_TEST", "1")
-        .env("DOT_SOURCE_ROOT", repo)
-        .env("XDG_STATE_HOME", format!("{home_text}/.local/state"))
-        .env("SHDEPS_INSTALL_DIR", format!("{home_text}/.local/share"))
-        .current_dir(home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = cmd.output().expect("spawn bash");
-    (
-        output.status.code().unwrap_or(99),
-        output.stdout,
-        output.stderr,
-    )
+fn commit_symlink(repo: &Path, relative: &str, target: &str) {
+    let path = repo.join(relative);
+    std::fs::create_dir_all(path.parent().expect("link parent")).expect("link parent");
+    std::os::unix::fs::symlink(target, path).expect("fixture symlink");
+    commit_all(repo, "link");
 }
 
-/// Validation fixture: an isolated `$HOME` plus the [`CandidateEnv`]
-/// mirroring the shell environment above.
-struct ValidateFixture {
-    _dir: TempDir,
-    home: PathBuf,
+struct Fixture {
+    dir: TempDir,
     env: CandidateEnv,
 }
 
-impl ValidateFixture {
-    fn build(tag: &str) -> Self {
+impl Fixture {
+    fn new(tag: &str) -> Self {
         let dir = TempDir::new(tag).expect("fixture dir");
         let home = dir.path().join("home");
-        std::fs::create_dir_all(&home).expect("fixture home");
-        let home_text = home.to_string_lossy().into_owned();
+        let state = home.join(".local/state");
+        let install = home.join(".local/share");
+        let checkout = install.join("cgraf78/dot");
+        std::fs::create_dir_all(&checkout).expect("checkout");
+        std::fs::create_dir_all(&state).expect("state");
+        let text = |path: &Path| path.to_string_lossy().into_owned();
         let env = CandidateEnv {
-            home: home_text.clone(),
-            checkout: format!("{home_text}/.local/share/cgraf78/dot"),
-            pwd: home_text.clone(),
+            home: text(&home),
+            checkout: text(&checkout),
+            pwd: text(dir.path()),
             source_root: env!("CARGO_MANIFEST_DIR").to_string(),
-            state_home: format!("{home_text}/.local/state"),
-            install_root: format!("{home_text}/.local/share"),
-            provider_state: format!("{home_text}/.local/state/shdeps"),
+            state_home: text(&state),
+            install_root: text(&install),
+            provider_state: text(&state.join("shdeps")),
             overlay_paths: Vec::new(),
             init_backup: None,
         };
-        ValidateFixture {
-            _dir: dir,
-            home,
-            env,
-        }
+        Self { dir, env }
     }
 
-    fn prefix(&self, repo: &Path) -> Vec<std::ffi::OsString> {
-        ["-C".to_string(), repo.to_string_lossy().into_owned()]
-            .iter()
-            .map(std::ffi::OsString::from)
-            .collect()
+    fn repo(&self) -> PathBuf {
+        self.dir.path().join("repo")
     }
-}
 
-/// Commit `files` (path, bytes, executable) into a fresh repo.
-fn seed_tree(repo: &Path, files: &[(&str, &[u8], bool)]) {
-    std::fs::create_dir_all(repo).expect("repo dir");
-    git(repo, &["init", "-q"]);
-    for (name, bytes, executable) in files {
-        let path = repo.join(name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("fixture parents");
-        }
-        std::fs::write(&path, bytes).expect("seed file");
-        if *executable {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mut perms = std::fs::metadata(&path).expect("meta").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod");
-        }
+    fn roots(&self) -> Vec<String> {
+        reserved_roots(
+            &RootsInput {
+                home: self.env.home.clone(),
+                state_home: self.env.state_home.clone(),
+                install_root: self.env.install_root.clone(),
+                provider_state: self.env.provider_state.clone(),
+                overlay_paths: self.env.overlay_paths.clone(),
+                init_backup: self.env.init_backup.clone(),
+            },
+            &self.env.pwd,
+        )
+        .expect("reserved roots")
     }
-    git(
-        repo,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
-    );
-    git(
-        repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "seed",
-        ],
-    );
-}
-
-/// Tracked symlink commit (mode 120000).
-fn commit_symlink(repo: &Path, name: &str, target: &str) {
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, repo.join(name)).expect("symlink");
-    git(
-        repo,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
-    );
-    git(
-        repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "link",
-        ],
-    );
 }
 
 fn launcher_bytes() -> Vec<u8> {
     std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("support/client-launcher.sh"))
-        .expect("launcher fixture")
+        .expect("launcher bytes")
+}
+
+fn write_program(path: &Path, body: &str) {
+    std::fs::write(path, body).expect("write fixture program");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("fixture program mode");
+}
+
+fn shell_word(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
 #[test]
-fn candidate_adapter_allowed_matches_shell() {
-    let fixture = ValidateFixture::build("pull-adapter");
-    let repo = fixture.home.join("repo");
-    let launcher = launcher_bytes();
-    seed_tree(&repo, &[(".local/bin/dot", &launcher, true)]);
-    let repo_text = repo.to_string_lossy().into_owned();
-    let head = head_of(&repo);
-    let prefix = fixture.prefix(&repo);
-    // (path, mode, tamper, shell-expect): only the exact launcher
-    // payload at 100755 passes.
-    for (path, mode, tamper, want) in [
-        (".local/bin/dot", "100755", false, true),
-        (".local/bin/dot", "100644", false, false),
-        (".local/bin/other", "100755", false, false),
-        (".local/bin/dot", "100755", true, false),
+fn repo_head_reports_exact_generation_and_empty_failures() {
+    let fixture = Fixture::new("repo-head");
+    let repo = fixture.repo();
+    seed(&repo, &[("tracked", b"one\n", false)]);
+    assert_eq!(repo_head(&prefix(&repo)), head(&repo));
+    assert_eq!(repo_head(&prefix(&fixture.dir.path().join("missing"))), "");
+    let unborn = fixture.dir.path().join("unborn");
+    std::fs::create_dir(&unborn).expect("unborn dir");
+    git(&unborn, &["init", "-q"]);
+    assert_eq!(repo_head(&prefix(&unborn)), "");
+}
+
+#[test]
+fn containment_and_identity_cover_equal_ancestor_unrelated_and_empty() {
+    let fixture = Fixture::new("repo-containment");
+    let repo = fixture.repo();
+    seed(&repo, &[("tracked", b"one\n", false)]);
+    let base = head(&repo);
+    std::fs::write(repo.join("tracked"), b"two\n").expect("advance");
+    commit_all(&repo, "advance");
+    let ahead = head(&repo);
+    git(&repo, &["checkout", "-q", "--orphan", "unrelated"]);
+    git(&repo, &["rm", "-q", "-rf", "."]);
+    std::fs::write(repo.join("other"), b"other\n").expect("other file");
+    commit_all(&repo, "unrelated");
+    let unrelated = head(&repo);
+    git(&repo, &["checkout", "-q", &ahead]);
+    let p = prefix(&repo);
+    for (have, upstream, expected) in [
+        (ahead.as_str(), ahead.as_str(), true),
+        (&ahead, &base, true),
+        (&base, &ahead, false),
+        (&ahead, &unrelated, false),
+        ("", &base, false),
+        (&ahead, "", false),
     ] {
-        if tamper {
-            let tampered = [launcher.clone(), b"# tamper\n".to_vec()].concat();
-            std::fs::write(repo.join(".local/bin/dot"), tampered).expect("tamper");
-            git(
-                &repo,
-                &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
-            );
-            git(
-                &repo,
-                &[
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "commit",
-                    "-qm",
-                    "tamper",
-                ],
-            );
-        }
-        let current = head_of(&repo);
-        assert_eq!(tamper, current != head, "tamper fixture state");
-        let snippet = format!(
-            "if _repo_candidate_adapter_allowed \"{current}\" \"{path}\" \"{mode}\" git -C {repo_text}; then echo yes; else echo no; fi\n"
-        );
-        let (status, out, err) = shell_validate(&fixture.home, &snippet);
-        assert_eq!(status, 0, "harness exit");
-        assert!(err.is_empty(), "shell stderr: {err:?}");
-        let shell_yes = out.starts_with(b"yes\n");
-        assert_eq!(shell_yes, want, "shell adapter for {path}@{mode}");
+        assert_eq!(repo_head_contains_upstream(&p, have, upstream), expected);
+    }
+    assert!(repo_head_is(&p, &ahead));
+    assert!(!repo_head_is(&p, &base));
+    assert!(!repo_head_is(&p, ""));
+}
+
+#[test]
+fn adapter_requires_exact_path_mode_and_launcher_bytes() {
+    let fixture = Fixture::new("repo-adapter");
+    let repo = fixture.repo();
+    let launcher = launcher_bytes();
+    seed(&repo, &[(".local/bin/dot", &launcher, true)]);
+    let p = prefix(&repo);
+    let generation = head(&repo);
+    for (path, mode, expected) in [
+        (".local/bin/dot", "100755", true),
+        (".local/bin/dot", "100644", false),
+        (".local/bin/other", "100755", false),
+    ] {
         let mut warnings = Vec::new();
         assert_eq!(
-            candidate_adapter_allowed(&prefix, &current, path, mode, &fixture.env, &mut warnings),
-            want,
-            "rust adapter for {path}@{mode}"
+            candidate_adapter_allowed(&p, &generation, path, mode, &fixture.env, &mut warnings),
+            expected
         );
-        assert!(warnings.is_empty(), "adapter warnings: {warnings:?}");
+        assert!(warnings.is_empty());
     }
+    std::fs::write(
+        repo.join(".local/bin/dot"),
+        [launcher, b"# modified\n".to_vec()].concat(),
+    )
+    .expect("modify launcher");
+    commit_all(&repo, "modify launcher");
+    assert!(!candidate_adapter_allowed(
+        &p,
+        &head(&repo),
+        ".local/bin/dot",
+        "100755",
+        &fixture.env,
+        &mut Vec::new(),
+    ));
 }
 
 #[test]
-fn validate_candidate_entry_matches_shell() {
-    let fixture = ValidateFixture::build("pull-entry");
-    let repo = fixture.home.join("repo");
-    seed_tree(
-        &repo,
-        &[
-            ("clean.txt", b"v1\n", false),
-            (".local/bin/dot", &launcher_bytes(), true),
-        ],
-    );
-    let head = head_of(&repo);
-    let prefix = fixture.prefix(&repo);
-    let shell_roots = String::from_utf8(
-        shell_validate(
-            &fixture.home,
-            "_dot_reserved_roots_snapshot || exit 99\nprintf '%s' \"$REPLY\"\n",
-        )
-        .1,
-    )
-    .expect("roots utf8");
-    assert!(!shell_roots.is_empty(), "shell roots snapshot");
-    // (kind, mode, type, oid-shape, path, shell-expect): verdict and
-    // warning bytes must match exactly.
-    let clean_oid = "a".repeat(40);
-    let rows: Vec<(&str, &str, &str, String, &str, bool)> = vec![
+fn entry_policy_pins_modes_profiles_and_reserved_roots() {
+    let mut fixture = Fixture::new("repo-entry");
+    let repo = fixture.repo();
+    seed(&repo, &[("clean", b"one\n", false)]);
+    let generation = head(&repo);
+    let p = prefix(&repo);
+    let oid = "a".repeat(40);
+    let rows = [
         (
             "base",
             "100644",
             "blob",
-            clean_oid.clone(),
-            "clean.txt",
-            true,
+            oid.as_str(),
+            "clean",
+            EntryVerdict::Accept("clean".into()),
         ),
         (
             "base",
             "100755",
             "blob",
-            clean_oid.clone(),
-            "clean.txt",
-            true,
+            oid.as_str(),
+            "run",
+            EntryVerdict::Accept("run".into()),
         ),
         (
             "base",
             "120000",
             "blob",
-            clean_oid.clone(),
-            "clean.txt",
-            true,
-        ),
-        (
-            "base",
-            "100644",
-            "blob",
-            clean_oid.clone(),
-            ".dotfiles/evil",
-            false,
-        ),
-        (
-            "base",
-            "100644",
-            "commit",
-            clean_oid.clone(),
-            "clean.txt",
-            false,
+            oid.as_str(),
+            "link",
+            EntryVerdict::Accept("link".into()),
         ),
         (
             "base",
             "100600",
             "blob",
-            clean_oid.clone(),
-            "clean.txt",
-            false,
+            oid.as_str(),
+            "bad-mode",
+            EntryVerdict::Reject,
+        ),
+        (
+            "base",
+            "100644",
+            "commit",
+            oid.as_str(),
+            "submodule",
+            EntryVerdict::Reject,
         ),
         (
             "base",
             "100644",
             "blob",
-            "xyz".to_string(),
-            "clean.txt",
-            false,
+            "xyz",
+            "bad-oid",
+            EntryVerdict::Reject,
         ),
         (
             "base",
             "100644",
             "blob",
-            clean_oid.clone(),
+            oid.as_str(),
             "../escape",
-            false,
+            EntryVerdict::Reject,
         ),
         (
             "base",
             "100644",
             "blob",
-            clean_oid.clone(),
-            ".git/evil",
-            false,
+            oid.as_str(),
+            ".config/dot/profiles.d/base.conf",
+            EntryVerdict::Accept(".config/dot/profiles.d/base.conf".into()),
+        ),
+        (
+            "base",
+            "100644",
+            "blob",
+            oid.as_str(),
+            ".config/dot/profile-selectors.d/host.conf",
+            EntryVerdict::Accept(".config/dot/profile-selectors.d/host.conf".into()),
+        ),
+        (
+            "base",
+            "100644",
+            "blob",
+            oid.as_str(),
+            ".config/dot/profile-selectors.local.d/host.conf",
+            EntryVerdict::Reject,
         ),
         (
             "overlay",
             "100644",
             "blob",
-            clean_oid.clone(),
-            "home/clean.txt",
-            true,
+            oid.as_str(),
+            ".config/dot/profiles.d/base.conf",
+            EntryVerdict::Skip,
         ),
         (
             "overlay",
             "100644",
             "blob",
-            clean_oid.clone(),
-            "outside.txt",
-            true,
-        ),
-        // Overlay metadata outside home/ skips with an empty reply.
-        (
-            "overlay",
-            "100644",
-            "blob",
-            clean_oid.clone(),
-            ".config/dot/profiles.d/x",
-            true,
-        ),
-        // The control-plane gate applies beneath home/.
-        (
-            "overlay",
-            "100644",
-            "blob",
-            clean_oid.clone(),
-            "home/.config/dot/profiles.d/x",
-            false,
+            oid.as_str(),
+            "home/.config/dot/profiles.d/base.conf",
+            EntryVerdict::Reject,
         ),
         (
             "overlay",
             "100644",
             "blob",
-            clean_oid.clone(),
-            "home/.dotfiles/evil",
-            false,
+            oid.as_str(),
+            "home/.config/dot/profile-selectors.d/host.conf",
+            EntryVerdict::Reject,
         ),
         (
             "overlay",
             "100644",
             "blob",
-            clean_oid.clone(),
+            oid.as_str(),
+            "home/.config/dot/profile-selectors.local.d/host.conf",
+            EntryVerdict::Reject,
+        ),
+        (
+            "overlay",
+            "100644",
+            "blob",
+            oid.as_str(),
+            "home/ordinary",
+            EntryVerdict::Accept("ordinary".into()),
+        ),
+        (
+            "overlay",
+            "100644",
+            "blob",
+            oid.as_str(),
             "home",
-            false,
+            EntryVerdict::Reject,
         ),
     ];
-    for (kind, mode, entry_type, oid, path, want_ok) in &rows {
-        let snippet = format!(
-            "if _repo_validate_candidate_entry \"{kind}\" \"{head}\" \"{mode}\" \"{entry_type}\" \"{oid}\" \"{path}\" \"$2\" git -C \"$3\"; then echo \"rc=0 reply=$REPLY\"; else echo \"rc=1 reply=$REPLY\"; fi\n"
-        );
-        let roots_os = std::ffi::OsString::from(&shell_roots);
-        let repo_os = std::ffi::OsString::from(repo.to_string_lossy().as_ref());
-        let mut cmd = Command::new(dot::test_support::bash());
-        cmd.arg("--noprofile")
-            .arg("--norc")
-            .arg("-c")
-            .arg(format!("{VALIDATE_SOURCES}{snippet}"));
-        cmd.arg("dot-test-sh")
-            .arg(env!("CARGO_MANIFEST_DIR"))
-            .arg(roots_os)
-            .arg(repo_os);
-        let home_text = fixture.home.to_string_lossy().into_owned();
-        cmd.env_clear()
-            .env("LC_ALL", "C")
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("TMPDIR", std::env::var_os("TMPDIR").unwrap_or_default())
-            .env("HOME", &fixture.home)
-            .env("DOT_TEST", "1")
-            .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
-            .env("XDG_STATE_HOME", format!("{home_text}/.local/state"))
-            .env("SHDEPS_INSTALL_DIR", format!("{home_text}/.local/share"))
-            .current_dir(&fixture.home)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let output = cmd.output().expect("spawn bash");
-        assert_eq!(output.status.code(), Some(0), "harness exit for {path}");
-        let rust_roots: Vec<String> = shell_roots.lines().map(str::to_string).collect();
-        let mut warnings = Vec::new();
-        let rust = validate_candidate_entry(
-            &prefix,
+    let roots = fixture.roots();
+    for (kind, mode, entry_type, object, path, expected) in rows {
+        let actual = validate_candidate_entry(
+            &p,
             kind,
-            &head,
+            &generation,
             mode,
             entry_type,
-            oid,
+            object,
             path,
-            &rust_roots,
+            &roots,
             &fixture.env,
-            &test_log(),
-            &mut warnings,
+            &log(),
+            &mut Vec::new(),
         );
-        let rust_line = match &rust {
-            EntryVerdict::Accept(relative) => format!("rc=0 reply={relative}\n"),
-            EntryVerdict::Skip => "rc=0 reply=\n".to_string(),
-            EntryVerdict::Reject => "rc=1 reply=\n".to_string(),
-        };
+        assert_eq!(actual, expected, "candidate {kind}:{path}");
+    }
+
+    let provider = PathBuf::from(&fixture.env.provider_state);
+    std::fs::create_dir_all(&provider).expect("provider state");
+    let alias = PathBuf::from(&fixture.env.home).join("provider-alias");
+    std::os::unix::fs::symlink(&provider, &alias).expect("provider alias");
+    fixture
+        .env
+        .overlay_paths
+        .push(alias.to_string_lossy().into_owned());
+    let roots = fixture.roots();
+    for relative in [
+        ".local/state/shdeps/cache",
+        "provider-alias/cache",
+        ".dotfiles/config",
+        ".local/share/cgraf78/dot/source",
+    ] {
+        let mut warnings = Vec::new();
         assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            rust_line,
-            "verdict parity for {kind}:{path}"
+            validate_candidate_entry(
+                &p,
+                "base",
+                &generation,
+                "100644",
+                "blob",
+                &oid,
+                relative,
+                &roots,
+                &fixture.env,
+                &log(),
+                &mut warnings,
+            ),
+            EntryVerdict::Reject
         );
-        assert_eq!(output.stderr, warnings, "warning parity for {kind}:{path}");
         assert_eq!(
-            rust != EntryVerdict::Reject,
-            *want_ok,
-            "rust verdict for {kind}:{path}"
+            String::from_utf8(warnings).expect("warning UTF-8"),
+            format!("  warning: candidate repository owns reserved path: {relative}\n")
         );
     }
 }
 
 #[test]
-fn validate_candidate_tree_matches_shell() {
-    // Clean tree: regular file, executable, symlink, and the exact
-    // launcher payload all validate.
-    let fixture = ValidateFixture::build("pull-tree-clean");
-    let repo = fixture.home.join("repo");
-    seed_tree(
+fn tree_scan_accepts_git_shapes_and_rejects_unsafe_or_failed_producers() {
+    let fixture = Fixture::new("repo-tree");
+    let repo = fixture.repo();
+    let launcher = launcher_bytes();
+    seed(
         &repo,
         &[
-            ("clean.txt", b"v1\n", false),
-            ("run.sh", b"#!/bin/sh\n", true),
-            (".local/bin/dot", &launcher_bytes(), true),
+            ("plain", b"plain\n", false),
+            ("run", b"#!/bin/sh\n", true),
+            (".local/bin/dot", &launcher, true),
         ],
     );
-    commit_symlink(&repo, "link", "clean.txt");
-    let repo_text = repo.to_string_lossy().into_owned();
-    let snippet = format!(
-        "if _repo_validate_candidate_tree base HEAD git -C {repo_text}; then echo ok; else echo reject; fi\n"
-    );
-    let (status, out, err) = shell_validate(&fixture.home, &snippet);
-    assert_eq!(status, 0, "harness exit");
-    assert_eq!(out, b"ok\n", "shell accepts clean tree: {out:?}");
-    assert!(err.is_empty(), "shell warnings: {err:?}");
-    let prefix = fixture.prefix(&repo);
+    commit_symlink(&repo, "link", "plain");
+    let p = prefix(&repo);
     let mut warnings = Vec::new();
-    assert!(
-        validate_candidate_tree(
-            &prefix,
-            "base",
-            "HEAD",
-            &fixture.env,
-            &test_log(),
-            &mut warnings
-        ),
-        "rust accepts clean tree"
-    );
-    assert!(warnings.is_empty(), "rust warnings: {warnings:?}");
+    assert!(validate_candidate_tree(
+        &p,
+        "base",
+        "HEAD",
+        &fixture.env,
+        &log(),
+        &mut warnings
+    ));
+    assert!(warnings.is_empty());
 
-    // Reserved destination inside the tree rejects with a warning.
-    let dirty = ValidateFixture::build("pull-tree-dirty");
-    let dirty_repo = dirty.home.join("repo");
-    seed_tree(
-        &dirty_repo,
-        &[
-            ("clean.txt", b"v1\n", false),
-            (".dotfiles/evil", b"x\n", false),
-        ],
-    );
-    let dirty_text = dirty_repo.to_string_lossy().into_owned();
-    let snippet = format!(
-        "if _repo_validate_candidate_tree base HEAD git -C {dirty_text}; then echo ok; else echo reject; fi\n"
-    );
-    let (status, out, shell_warnings) = shell_validate(&dirty.home, &snippet);
-    assert_eq!(status, 0, "harness exit");
-    assert_eq!(out, b"reject\n", "shell rejects reserved tree");
-    assert!(!shell_warnings.is_empty(), "shell warns");
-    let dirty_prefix = dirty.prefix(&dirty_repo);
-    let mut warnings = Vec::new();
-    assert!(
-        !validate_candidate_tree(
-            &dirty_prefix,
-            "base",
-            "HEAD",
-            &dirty.env,
-            &test_log(),
-            &mut warnings
-        ),
-        "rust rejects reserved tree"
-    );
-    assert_eq!(warnings, shell_warnings, "warning bytes parity");
-
-    // Unknown ref rejects without warnings.
-    let snippet = format!(
-        "if _repo_validate_candidate_tree base no-such-ref git -C {repo_text}; then echo ok; else echo reject; fi\n"
-    );
-    let (status, out, err) = shell_validate(&fixture.home, &snippet);
-    assert_eq!(status, 0, "harness exit");
-    assert_eq!(out, b"reject\n", "shell rejects unknown ref");
-    let mut warnings = Vec::new();
-    assert!(
-        !validate_candidate_tree(
-            &prefix,
-            "base",
-            "no-such-ref",
-            &fixture.env,
-            &test_log(),
-            &mut warnings
-        ),
-        "rust rejects unknown ref"
-    );
-    assert_eq!(warnings, err, "no warnings either side");
-}
-
-#[test]
-fn validate_ahead_delta_matches_shell() {
-    let fixture = ValidateFixture::build("pull-delta");
-    let repo = fixture.home.join("repo");
-    seed_tree(&repo, &[("clean.txt", b"v1\n", false)]);
-    let base = head_of(&repo);
-    // Clean ahead commit validates; reserved-path commit does not.
-    std::fs::write(repo.join("next.txt"), b"v2\n").expect("advance");
-    git(
-        &repo,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
-    );
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "ahead",
-        ],
-    );
-    let ahead = head_of(&repo);
     std::fs::create_dir_all(repo.join(".dotfiles")).expect("reserved dir");
-    std::fs::write(repo.join(".dotfiles/evil"), b"x\n").expect("reserved file");
-    git(
-        &repo,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
+    std::fs::write(repo.join(".dotfiles/evil"), b"unsafe\n").expect("reserved file");
+    commit_all(&repo, "unsafe");
+    let mut warnings = Vec::new();
+    assert!(!validate_candidate_tree(
+        &p,
+        "base",
+        "HEAD",
+        &fixture.env,
+        &log(),
+        &mut warnings
+    ));
+    assert_eq!(
+        String::from_utf8(warnings).unwrap(),
+        "  warning: candidate repository owns reserved path: .dotfiles/evil\n"
     );
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "dirty",
-        ],
+
+    let wrapper = fixture.dir.path().join("partial-git");
+    write_program(
+        &wrapper,
+        &format!(
+            "#!/bin/sh\nfor arg do\n  if [ \"$arg\" = ls-tree ]; then\n    printf '100644 blob {}\\tplain\\0'\n    exit 1\n  fi\ndone\nexec {} \"$@\"\n",
+            "a".repeat(40),
+            shell_word(&git_program()),
+        ),
     );
-    let dirty = head_of(&repo);
-    let repo_text = repo.to_string_lossy().into_owned();
-    let prefix = fixture.prefix(&repo);
-    for (upstream, head, want) in [
-        (base.clone(), ahead.clone(), true),
-        (base.clone(), dirty.clone(), false),
-    ] {
-        let snippet = format!(
-            "if _repo_validate_ahead_delta base \"{upstream}\" \"{head}\" git -C {repo_text}; then echo ok; else echo reject; fi\n"
-        );
-        let (status, out, shell_warnings) = shell_validate(&fixture.home, &snippet);
-        assert_eq!(status, 0, "harness exit");
-        let shell_ok = out == b"ok\n";
-        assert_eq!(shell_ok, want, "shell delta {upstream}..{head}");
-        let mut warnings = Vec::new();
-        let rust_ok = validate_ahead_delta(
-            &prefix,
-            "base",
-            &upstream,
-            &head,
-            &fixture.env,
-            &test_log(),
-            &mut warnings,
-        );
-        assert_eq!(rust_ok, want, "rust delta {upstream}..{head}");
-        assert_eq!(warnings, shell_warnings, "warning parity");
-    }
+    let accepted = dot::init_client_identity::with_host_git(&wrapper, || {
+        validate_candidate_tree(&p, "base", "HEAD", &fixture.env, &log(), &mut Vec::new())
+    });
+    assert!(!accepted, "valid prefix cannot authorize failed producer");
 }
 
 #[test]
-fn accept_current_generation_matches_shell() {
-    let fixture = ValidateFixture::build("pull-accept");
-    let repo = fixture.home.join("repo");
-    seed_tree(&repo, &[("clean.txt", b"v1\n", false)]);
-    let base = head_of(&repo);
-    std::fs::write(repo.join("next.txt"), b"v2\n").expect("advance");
-    git(
-        &repo,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
+fn ahead_delta_accepts_clean_changes_and_rejects_reserved_control_paths() {
+    let fixture = Fixture::new("repo-delta");
+    let repo = fixture.repo();
+    seed(&repo, &[("plain", b"one\n", false)]);
+    let base = head(&repo);
+    std::fs::write(repo.join("next"), b"two\n").expect("clean delta");
+    commit_all(&repo, "clean delta");
+    let clean = head(&repo);
+    std::fs::create_dir_all(repo.join(".dotfiles")).expect("reserved dir");
+    std::fs::write(repo.join(".dotfiles/evil"), b"unsafe\n").expect("reserved file");
+    commit_all(&repo, "reserved delta");
+    let p = prefix(&repo);
+    assert!(validate_ahead_delta(
+        &p,
+        "base",
+        &base,
+        &clean,
+        &fixture.env,
+        &log(),
+        &mut Vec::new()
+    ));
+    let mut warnings = Vec::new();
+    assert!(!validate_ahead_delta(
+        &p,
+        "base",
+        &base,
+        &head(&repo),
+        &fixture.env,
+        &log(),
+        &mut warnings
+    ));
+    assert!(String::from_utf8_lossy(&warnings).contains(".dotfiles/evil"));
+
+    let overlay = fixture.dir.path().join("overlay");
+    seed(&overlay, &[("home/ordinary", b"one\n", false)]);
+    let old = head(&overlay);
+    std::fs::create_dir_all(overlay.join("home/.config/dot/profiles.d")).unwrap();
+    std::fs::write(
+        overlay.join("home/.config/dot/profiles.d/unsafe.conf"),
+        b"version=1\n",
+    )
+    .unwrap();
+    commit_all(&overlay, "control delta");
+    let mut warnings = Vec::new();
+    assert!(!validate_ahead_delta(
+        &prefix(&overlay),
+        "overlay",
+        &old,
+        &head(&overlay),
+        &fixture.env,
+        &log(),
+        &mut warnings,
+    ));
+    assert_eq!(
+        String::from_utf8(warnings).unwrap(),
+        "  warning: overlay candidate owns reserved control-plane path: .config/dot/profiles.d/unsafe.conf\n"
     );
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "ahead",
-        ],
-    );
-    let ahead = head_of(&repo);
-    git(&repo, &["checkout", "-q", "--orphan", "stranger"]);
+}
+
+#[test]
+fn generation_acceptance_pins_equal_ahead_unrelated_empty_and_head_race() {
+    let fixture = Fixture::new("repo-accept");
+    let repo = fixture.repo();
+    seed(&repo, &[("plain", b"one\n", false)]);
+    let base = head(&repo);
+    std::fs::write(repo.join("next"), b"two\n").expect("ahead file");
+    commit_all(&repo, "ahead");
+    let ahead = head(&repo);
+    git(&repo, &["checkout", "-q", "--orphan", "unrelated"]);
     git(&repo, &["rm", "-q", "-rf", "."]);
-    std::fs::write(repo.join("other.txt"), b"z\n").expect("stranger file");
-    git(
-        &repo,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
-    );
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "stranger",
-        ],
-    );
-    let stranger = head_of(&repo);
-    // Settle back on the ahead generation: the equal/contained rows
-    // bind their final HEAD read to the live checkout.
+    std::fs::write(repo.join("other"), b"other\n").expect("other file");
+    commit_all(&repo, "unrelated");
+    let unrelated = head(&repo);
     git(&repo, &["checkout", "-q", &ahead]);
-    assert_eq!(head_of(&repo), ahead, "checkout settles on ahead");
-    let repo_text = repo.to_string_lossy().into_owned();
-    let prefix = fixture.prefix(&repo);
-    // (head, upstream, shell-expect): equal is current, contained
-    // clean delta is current, unrelated needs pull, empties fail.
-    for (head, upstream, want) in [
-        (ahead.clone(), ahead.clone(), 0),
-        (ahead.clone(), base.clone(), 0),
-        (ahead.clone(), stranger.clone(), 1),
-        (String::new(), base.clone(), 2),
-        (ahead.clone(), String::new(), 2),
+    let p = prefix(&repo);
+    for (have, upstream, expected) in [
+        (ahead.as_str(), ahead.as_str(), 0),
+        (&ahead, &base, 0),
+        (&ahead, &unrelated, 1),
+        ("", &base, 2),
+        (&ahead, "", 2),
     ] {
-        let snippet = format!(
-            "_repo_accept_current_generation base \"{head}\" \"{upstream}\" git -C {repo_text}; echo \"rc=$?\"\n"
+        assert_eq!(
+            accept_current_generation(
+                &p,
+                "base",
+                have,
+                upstream,
+                &fixture.env,
+                &log(),
+                &mut Vec::new()
+            ),
+            expected
         );
-        let (status, out, shell_warnings) = shell_validate(&fixture.home, &snippet);
-        assert_eq!(status, 0, "harness exit");
-        assert_eq!(out, format!("rc={want}\n").into_bytes(), "shell rc");
-        let mut warnings = Vec::new();
-        let rust_rc = accept_current_generation(
-            &prefix,
-            "base",
-            &head,
-            &upstream,
-            &fixture.env,
-            &test_log(),
-            &mut warnings,
-        );
-        assert_eq!(rust_rc, want, "rust rc");
-        assert_eq!(warnings, shell_warnings, "warning parity");
     }
+
+    let tree = String::from_utf8(git(&repo, &["rev-parse", "HEAD^{tree}"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let moved_output = Command::new(git_program())
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-C",
+        ])
+        .arg(&repo)
+        .args(["commit-tree", &tree, "-p", &ahead, "-m", "moved"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("commit-tree");
+    assert!(moved_output.status.success());
+    let moved = String::from_utf8(moved_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let wrapper = fixture.dir.path().join("racing-git");
+    write_program(
+        &wrapper,
+        &format!(
+            "#!/bin/sh\nrace=0\nfor arg do [ \"$arg\" = merge-base ] && race=1; done\n{} \"$@\"\nrc=$?\nif [ \"$rc\" -eq 0 ] && [ \"$race\" -eq 1 ]; then\n  {} -c core.hooksPath=/dev/null -C {} update-ref HEAD {moved} {ahead}\nfi\nexit \"$rc\"\n",
+            shell_word(&git_program()),
+            shell_word(&git_program()),
+            shell_word(&repo),
+        ),
+    );
+    let outcome = dot::init_client_identity::with_host_git(&wrapper, || {
+        accept_current_generation(
+            &p,
+            "base",
+            &ahead,
+            &base,
+            &fixture.env,
+            &log(),
+            &mut Vec::new(),
+        )
+    });
+    assert_eq!(outcome, 2, "moved HEAD invalidates fast path");
+    assert_eq!(head(&repo), moved);
 }

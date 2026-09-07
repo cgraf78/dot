@@ -1,6 +1,6 @@
 //! Native `_link_overlays` link phase (engine link-all lane).
 //!
-//! Ports `_link_overlays` (`lib/dot/repos/overlays.sh`): manifest
+//! Owns aggregate overlay link convergence: manifest
 //! directory setup, replacement recovery, the reserved-roots
 //! snapshot, local preflight, authority load (plus the legacy
 //! adopt scan), the inventory build, pending-authority publication,
