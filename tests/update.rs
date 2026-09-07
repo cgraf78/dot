@@ -95,6 +95,16 @@ fn assert_bytes_stable(make: impl Fn() -> (Vec<u8>, Vec<u8>), what: &str) {
     assert_eq!(last.0, last.1, "{what}");
 }
 
+/// Length-frame a finalize result so bytes cannot move between output
+/// channels while still satisfying the retry comparison.
+fn frame_finalize_observables(rc: i32, stderr: &[u8], stdout: &[u8]) -> Vec<u8> {
+    let mut frame = format!("rc={rc}\nstderr={}\n", stderr.len()).into_bytes();
+    frame.extend_from_slice(stderr);
+    frame.extend_from_slice(format!("stdout={}\n", stdout.len()).as_bytes());
+    frame.extend_from_slice(stdout);
+    frame
+}
+
 #[test]
 fn prepare_shdeps_jobs_sets_and_keeps() {
     // (preset SHDEPS_JOBS, DOT_UPDATE_JOBS): an already-set value
@@ -1635,16 +1645,31 @@ fn finalize_fold_agrees() {
                 // back to the shdeps defaults, like `${VAR:-...}`.
                 let (expected, expected_err, outcome) =
                     dot::update::finalize_fold(&palette, false, false, false, true, &inputs, 0);
-                assert_eq!(shell_rc, outcome.rc, "finalize rc {index}");
-                assert_eq!(expected_err, err, "finalize stderr {index}");
-                let mut rows = rows.to_vec();
-                rows.extend_from_slice(format!("rc={shell_rc}").as_bytes());
-                let mut want = expected;
-                want.extend_from_slice(format!("rc={}", outcome.rc).as_bytes());
-                assert_eq!(want, rows, "finalize stdout {index}");
-                (want, rows)
+                // Pack every compared observable (exit code, stderr,
+                // stdout rows) into the returned blobs instead of
+                // asserting here: the `_ui_done` row measures bash
+                // `$SECONDS` at 1s granularity, so a run straddling a
+                // second tick legitimately differs, and the
+                // `assert_bytes_stable` wrapper can only retry what
+                // the closure returns rather than what it panics on.
+                let mut actual_stdout = rows.to_vec();
+                actual_stdout.extend_from_slice(format!("rc={shell_rc}").as_bytes());
+                let mut ideal_stdout = expected;
+                ideal_stdout.extend_from_slice(format!("rc={}", outcome.rc).as_bytes());
+                (
+                    frame_finalize_observables(outcome.rc, &expected_err, &ideal_stdout),
+                    frame_finalize_observables(shell_rc, &err, &actual_stdout),
+                )
             },
             &format!("finalize parity case {index}"),
         );
     }
+}
+
+#[test]
+fn finalize_observables_keep_stream_boundaries() {
+    assert_ne!(
+        frame_finalize_observables(0, b"a", b"b"),
+        frame_finalize_observables(0, b"", b"ab"),
+    );
 }
