@@ -39,6 +39,7 @@ program	tests/library-test
 program	tests/lib/repo.sh
 program	tests/lib/test.sh
 program	tests/license-test
+program	tests/no-private-engine-test
 program	tests/ownership-transfer-test
 program	tests/provider-suite-wrapper
 program	tests/provenance-test
