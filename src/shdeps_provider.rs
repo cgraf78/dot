@@ -13,12 +13,6 @@ use std::process::{Command, Stdio};
 
 use crate::app::Runtime;
 
-unsafe extern "C" {
-    fn kill(pid: i32, signal: i32) -> i32;
-}
-
-const SIGKILL: i32 = 9;
-
 /// Inputs retained across provider selection, bootstrap, ABI validation, and update.
 pub(crate) struct Inputs<'a> {
     pub(crate) runtime: &'a Runtime,
@@ -454,17 +448,7 @@ fn binary_abi(
 }
 
 fn kill_group(pid: u32) {
-    if pid == 0 {
-        return;
-    }
-    let Ok(pid) = i32::try_from(pid) else {
-        return;
-    };
-    // SAFETY: a negative, nonzero pid addresses only the process group created
-    // by `CommandExt::process_group(0)` for this owned child. SIGKILL is the
-    // POSIX value 9 on every supported Unix target. Delivery failure is normal
-    // when the group has already exited, so it has no additional error path.
-    let _ = unsafe { kill(-pid, SIGKILL) };
+    crate::cleanup::signal_group(pid, libc::SIGKILL);
 }
 
 enum AbiResult {
