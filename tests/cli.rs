@@ -1540,6 +1540,257 @@ fn binary_init_rollback_matches_production() {
     );
 }
 
+#[cfg(unix)]
+fn poison_curl(scope: &Path) -> (OsString, PathBuf) {
+    let poison_dir = scope.join("poison-path");
+    let record = scope.join("provider-invoked");
+    std::fs::create_dir_all(&poison_dir).expect("poison path");
+    let executable = poison_dir.join("curl");
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf invoked >'{}'\nexit 97\n",
+            record.display()
+        ),
+    )
+    .expect("poison curl");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+        .expect("poison curl mode");
+    let mut path = poison_dir.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    (path, record)
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_init_fresh_converges_natively() {
+    let scope = TempDir::new("cli-init-native-origin").expect("origin scope");
+    let (origin, seed, branch) = seed_bare_origin(scope.path(), "dotfiles");
+    std::fs::create_dir_all(seed.join(".config/dot")).expect("config parent");
+    seed_advance(
+        &seed,
+        ".config/dot/config",
+        b"version=1\ndependency_provider=shdeps\n",
+    );
+    let home = TempDir::new("cli-init-native-home").expect("home");
+    let state = TempDir::new("cli-init-native-state").expect("state");
+    let url = format!("file://{}", origin.display());
+    let (path, poison_record) = poison_curl(scope.path());
+
+    let output = init_bin(&home, &state)
+        .args(["init", "--yes", "--branch", &branch, &url])
+        .env("DOT_INIT_SKIP_PROVIDER", "1")
+        .env("DOT_BASH", "/definitely/missing/bash-engine")
+        .env("PATH", &path)
+        .output()
+        .expect("run native init");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "native init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("converge is not yet implemented"),
+        "pending convergence escaped: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(state.path().join("dot/init/completed").is_file());
+    assert!(!state.path().join("dot/init/transaction").exists());
+    assert!(!poison_record.exists(), "Shdeps provider was not skipped");
+    let first_home = semantic_tree(home.path(), true);
+    let first_state = semantic_tree(state.path(), false);
+
+    for argv in [
+        vec!["init", "--yes", "--branch", &branch, &url],
+        vec!["update"],
+    ] {
+        let repeated = init_bin(&home, &state)
+            .args(&argv)
+            .env("DOT_INIT_SKIP_PROVIDER", "1")
+            .env("DOT_BASH", "/definitely/missing/bash-engine")
+            .env("PATH", &path)
+            .output()
+            .expect("repeat native convergence");
+        assert_eq!(
+            repeated.status.code(),
+            Some(0),
+            "repeat {argv:?} failed: {}",
+            String::from_utf8_lossy(&repeated.stderr)
+        );
+    }
+    assert_eq!(semantic_tree(home.path(), true), first_home);
+    assert_eq!(semantic_tree(state.path(), false), first_state);
+    assert!(!poison_record.exists(), "repeat invoked Shdeps provider");
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_init_reloads_the_configuration_it_just_cloned() {
+    let scope = TempDir::new("cli-init-reload-origin").expect("origin scope");
+    let (origin, seed, branch) = seed_bare_origin(scope.path(), "dotfiles");
+    std::fs::create_dir_all(seed.join(".config/dot")).expect("config parent");
+    seed_advance(
+        &seed,
+        ".config/dot/config",
+        b"version=1\ndependency_provider=shdeps\n",
+    );
+    let home = TempDir::new("cli-init-reload-home").expect("home");
+    let state = TempDir::new("cli-init-reload-state").expect("state");
+    let url = format!("file://{}", origin.display());
+    let (path, poison_record) = poison_curl(scope.path());
+
+    let output = init_bin(&home, &state)
+        .args(["init", "--yes", "--branch", &branch, &url])
+        .env("DOT_BASH", "/definitely/missing/bash-engine")
+        .env("PATH", path)
+        .output()
+        .expect("run native init with cloned config");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        poison_record.is_file(),
+        "convergence retained the pre-clone provider=none configuration"
+    );
+    assert!(state.path().join("dot/init/transaction").is_dir());
+    assert!(!state.path().join("dot/init/completed").exists());
+}
+
+#[test]
+fn binary_init_holds_the_operation_lock_and_read_only_modes_skip_it() {
+    let home = TempDir::new("cli-init-lock-home").expect("home");
+    let state = TempDir::new("cli-init-lock-state").expect("state");
+    let log = dot::log::Log::new(false, false);
+    let mut warnings = Vec::new();
+    let guard = dot::update_lock::acquire(state.path(), false, &log, None, &mut warnings)
+        .expect("hold fixture lock");
+
+    let blocked = init_bin(&home, &state)
+        .args(["init", "--bogus"])
+        .output()
+        .expect("run locked init");
+    assert_eq!(
+        blocked.status.code(),
+        Some(dot::update_lock::EXIT_LOCK_BUSY)
+    );
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("dot update already running"));
+
+    for mode in ["--status", "--help", "-h"] {
+        let probe = init_bin(&home, &state)
+            .args(["init", mode])
+            .output()
+            .expect("run read-only init mode");
+        assert_eq!(probe.status.code(), Some(0), "mode {mode}");
+        assert!(
+            !String::from_utf8_lossy(&probe.stderr).contains("already running"),
+            "mode {mode} acquired the lock"
+        );
+    }
+    guard.release(&log, &mut warnings);
+}
+
+#[test]
+fn binary_init_adopts_and_converges_without_the_bash_engine() {
+    let scope = TempDir::new("cli-init-adopt-origin").expect("origin scope");
+    let (origin, _seed, branch) = seed_bare_origin(scope.path(), "dotfiles");
+    let home = TempDir::new("cli-init-adopt-home").expect("home");
+    let state = TempDir::new("cli-init-adopt-state").expect("state");
+    let url = format!("file://{}", origin.display());
+    let clone = Command::new("git")
+        .args(["clone", "-q", "--branch", &branch, &url])
+        .arg(home.path())
+        .status()
+        .expect("clone adopt fixture");
+    assert!(clone.success());
+
+    let before = semantic_tree(home.path(), true);
+    let output = init_bin(&home, &state)
+        .args(["init", "--yes", "--branch", &branch, &url])
+        .env("DOT_INIT_SKIP_PROVIDER", "1")
+        .env("DOT_BASH", "/definitely/missing/bash-engine")
+        .output()
+        .expect("run native adopt");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "native adopt failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after: Vec<_> = semantic_tree(home.path(), true)
+        .into_iter()
+        .filter(|(path, _)| path != ".cache/dotfiles/git-real")
+        .collect();
+    assert_eq!(after, before);
+    assert!(state.path().join("dot/init/completed").is_file());
+    assert!(!state.path().join("dot/init/transaction").exists());
+}
+
+#[test]
+fn binary_init_resumes_live_transaction_and_converges_without_bash() {
+    let scope = TempDir::new("cli-init-resume-origin").expect("origin scope");
+    let (origin, _seed, branch) = seed_bare_origin(scope.path(), "dotfiles");
+    let home = TempDir::new("cli-init-resume-home").expect("home");
+    let state = TempDir::new("cli-init-resume-state").expect("state");
+    let url = format!("file://{}", origin.display());
+    let argv = ["init", "--yes", "--branch", &branch, &url];
+
+    let initial = init_bin(&home, &state)
+        .args(argv)
+        .env("DOT_INIT_SKIP_PROVIDER", "1")
+        .env("DOT_BASH", "/definitely/missing/bash-engine")
+        .output()
+        .expect("initial native init");
+    assert_eq!(initial.status.code(), Some(0));
+    let completed = state.path().join("dot/init/completed");
+    let transaction = state.path().join("dot/init/transaction");
+    std::fs::create_dir_all(&transaction).expect("transaction dir");
+    std::fs::set_permissions(&transaction, std::fs::Permissions::from_mode(0o700))
+        .expect("transaction permissions");
+    let complete_record = std::fs::read(&completed).expect("completion record");
+    let checkout_record = complete_record
+        .windows(b"phase=complete\n".len())
+        .position(|window| window == b"phase=complete\n")
+        .map(|at| {
+            let mut bytes = complete_record.clone();
+            bytes.splice(
+                at..at + b"phase=complete\n".len(),
+                b"phase=checkout\n".iter().copied(),
+            );
+            bytes
+        })
+        .expect("complete phase");
+    let record = transaction.join("record");
+    std::fs::write(&record, checkout_record).expect("checkout record");
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600))
+        .expect("record permissions");
+    std::fs::remove_file(&completed).expect("remove completed marker");
+    let before = semantic_tree(home.path(), true);
+
+    let resumed = init_bin(&home, &state)
+        .args(argv)
+        .env("DOT_INIT_SKIP_PROVIDER", "1")
+        .env("DOT_BASH", "/definitely/missing/bash-engine")
+        .output()
+        .expect("resume native init");
+    assert_eq!(
+        resumed.status.code(),
+        Some(0),
+        "native resume failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(semantic_tree(home.path(), true), before);
+    assert!(completed.is_file());
+    assert!(!transaction.exists());
+    assert!(
+        std::fs::read(completed)
+            .expect("completed record")
+            .windows(b"phase=complete\n".len())
+            .any(|window| window == b"phase=complete\n")
+    );
+}
+
 /// Synthetic file:// client for the fetch/push/status/diff wiring
 /// rows (slice 82): a legacy-separate base (`$HOME/.dotfiles`, bare,
 /// one file:// origin, worktree materialized at `$HOME`) plus one
