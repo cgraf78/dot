@@ -573,11 +573,12 @@ fn conflict_manifest(home: &Path) -> Vec<u8> {
 }
 
 /// Shell side of a move row: move, move again for idempotency, then
-/// report both verdicts plus the stored-manifest comparison and a
-/// home dump (which includes the backup subtree).
+/// report both verdicts plus a home dump (which includes the backup
+/// subtree). Compare the stored manifest in Rust so this test does not
+/// require a utility that the shell implementation itself never uses.
 fn shell_move_twice(home: &Path, home_text: &str) -> (i32, i32, String, String, String) {
     let snippet = format!(
-        "manifest={} backup={}; _dot_init_move_conflicts \"$manifest\" \"$backup\"; code=$?; printf 'code=%s\\n' \"$code\"; _dot_init_move_conflicts \"$manifest\" \"$backup\"; code2=$?; if cmp -s \"$manifest\" \"$backup/manifest\"; then stored=same; else stored=diff; fi; printf 'code2=%s stored=%s\\n' \"$code2\" \"$stored\"; dump_tree {};",
+        "cmp() {{ return 127; }}; manifest={} backup={}; _dot_init_move_conflicts \"$manifest\" \"$backup\"; code=$?; printf 'code=%s\\n' \"$code\"; _dot_init_move_conflicts \"$manifest\" \"$backup\"; code2=$?; printf 'code2=%s\\n' \"$code2\"; dump_tree {};",
         sq(&format!("{home_text}/conflicts.tsv")),
         sq(&format!("{home_text}/backup")),
         sq(home_text),
@@ -588,17 +589,20 @@ fn shell_move_twice(home: &Path, home_text: &str) -> (i32, i32, String, String, 
     let code2_line = text
         .lines()
         .find(|line| line.starts_with("code2="))
-        .unwrap_or("code2=99 stored=??");
+        .unwrap_or("code2=99");
     let code2 = code2_line
         .strip_prefix("code2=")
         .and_then(|head| head.split(' ').next())
         .and_then(|code| code.parse().ok())
         .unwrap_or(99);
-    let stored = code2_line
-        .split(' ')
-        .find_map(|word| word.strip_prefix("stored="))
-        .unwrap_or("??")
-        .to_string();
+    let stored = match (
+        std::fs::read(home.join("conflicts.tsv")),
+        std::fs::read(home.join("backup/manifest")),
+    ) {
+        (Ok(left), Ok(right)) if left == right => "same",
+        _ => "diff",
+    }
+    .to_string();
     let dump = text
         .lines()
         .skip_while(|line| !line.starts_with("code2="))
