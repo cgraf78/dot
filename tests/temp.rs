@@ -178,12 +178,10 @@ fn target_generation_and_signature_bind_path_parent_and_content() {
         .state,
         "absent"
     );
-    for bad in [
-        "",
-        "v2|bad",
-        &(token.clone() + "\n"),
-        &(token[..token.len() - 1].to_string() + "0"),
-    ] {
+    let mut corrupt = token.clone();
+    let last = corrupt.pop().unwrap();
+    corrupt.push(if last == '0' { '1' } else { '0' });
+    for bad in ["", "v2|bad", &(token.clone() + "\n"), &corrupt] {
         assert!(temp::generation_validate(dir.path(), bad).is_err());
     }
     assert!(temp::file_target_resolve(dir.path(), Path::new("relative")).is_err());
