@@ -256,4 +256,19 @@ impl State {
             _ => group_label(group),
         }
     }
+
+    /// Borrow the recorded item map for the native provider renderer.
+    pub(crate) fn items(&self) -> &HashMap<Vec<u8>, Vec<u8>> {
+        &self.items
+    }
+
+    /// Borrow the recorded label map for the native provider renderer.
+    pub(crate) fn labels(&self) -> &HashMap<Vec<u8>, Vec<u8>> {
+        &self.labels
+    }
+
+    /// Borrow the recorded summary map for the native provider renderer.
+    pub(crate) fn summaries(&self) -> &HashMap<Vec<u8>, Vec<u8>> {
+        &self.summaries
+    }
 }

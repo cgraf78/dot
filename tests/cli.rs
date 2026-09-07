@@ -3003,21 +3003,6 @@ fn update_native_invalid_home_never_runs_shell_engine() {
 }
 
 #[test]
-fn update_native_force_with_provider_stays_on_the_shell_adapter() {
-    // Task 3 removes the force-only fallback, not Task 6's provider lane.
-    // Here the poison is the expected result: it proves a configured provider
-    // still selects the shell adapter even when --force is also present.
-    let fixture = NativeUpdateFixture::stage();
-    fixture.break_shell_engine();
-    let output = fixture.rust_dot_with(&["update", "--quiet", "--force"], |cmd| {
-        cmd.env("DOT_DEPENDENCY_PROVIDER", "shdeps");
-    });
-    assert_eq!(output.status.code(), Some(97));
-    assert_eq!(output.stdout, b"");
-    assert_eq!(output.stderr, b"OLD-UPDATE-ENGINE\n");
-}
-
-#[test]
 fn update_native_configured_pre_sync_hook_uses_the_hardened_worker() {
     // A configured hook must remain native and run only after the worker has
     // validated its one-use context. Poisoning the old update adapter makes a
