@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::Write;
+use std::io::{IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -116,12 +116,38 @@ impl Runtime {
 pub struct Streams<'a> {
     pub(crate) stdout: &'a mut dyn Write,
     pub(crate) stderr: &'a mut dyn Write,
+    stdout_terminal: bool,
 }
 
 impl<'a> Streams<'a> {
     /// Bind stdout and stderr for one Dot invocation.
     pub fn new(stdout: &'a mut dyn Write, stderr: &'a mut dyn Write) -> Self {
-        Self { stdout, stderr }
+        Self {
+            stdout,
+            stderr,
+            stdout_terminal: std::io::stdout().is_terminal(),
+        }
+    }
+
+    /// Bind streams with an explicit stdout terminal observation.
+    ///
+    /// This is an embedding and test seam for callers whose writer is not the
+    /// process-global stdout handle.
+    #[doc(hidden)]
+    pub fn with_terminal(
+        stdout: &'a mut dyn Write,
+        stderr: &'a mut dyn Write,
+        stdout_terminal: bool,
+    ) -> Self {
+        Self {
+            stdout,
+            stderr,
+            stdout_terminal,
+        }
+    }
+
+    pub(crate) fn stdout_is_terminal(&self) -> bool {
+        self.stdout_terminal
     }
 }
 

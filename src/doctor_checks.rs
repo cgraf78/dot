@@ -32,12 +32,9 @@
 //!
 //! Parity decisions:
 //!
-//! - Checks emit [`Record`]s instead of calling the `_dr_*`
-//!   emitters; [`render`] formats them byte-identical to
-//!   `doctor/runtime.sh` with color disabled (piped stdout, where
-//!   `[[ -t 1 ]]` is false). The canonical renderer stays with the
-//!   runtime slice; this copy exists so parity tests can
-//!   byte-compare against the live shell functions.
+//! - Checks emit the canonical [`Record`]s instead of calling the `_dr_*`
+//!   emitters; [`render`] delegates to the runtime renderer with color
+//!   disabled so parity tests can byte-compare against the live shell.
 //! - `_dr_tilde` / `_dr_symlink_points_to` (`doctor/paths.sh`) are
 //!   mirrored as private helpers: display-only glue the checks need
 //!   to spell details, owned by the paths slice when it lands.
@@ -69,80 +66,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-/// Which `_dr_*` emitter produced a [`Record`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    /// `_dr_section`: a section heading, never carrying a detail.
-    Section,
-    /// `_dr_ok`: a passing check.
-    Ok,
-    /// `_dr_warn`: a warning check.
-    Warn,
-    /// `_dr_fail`: a failing check.
-    Fail,
-    /// `_dr_skip`: a skipped check.
-    Skip,
-}
-
-/// One doctor result line: the emitter plus its `$1` label and
-/// optional `$2` detail. `detail: None` means the shell call passed
-/// exactly one argument (`[[ $# -gt 1 ]]` false).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Record {
-    /// Emitting `_dr_*` function.
-    pub kind: Kind,
-    /// The `$1` label.
-    pub message: String,
-    /// The optional `$2` detail.
-    pub detail: Option<String>,
-}
-
-impl Record {
-    /// A section heading (`_dr_section "$message"`).
-    pub fn section(message: impl Into<String>) -> Self {
-        Self {
-            kind: Kind::Section,
-            message: message.into(),
-            detail: None,
-        }
-    }
-
-    /// A passing check (`_dr_ok "$message" ["$detail"]`).
-    pub fn ok(message: impl Into<String>, detail: Option<String>) -> Self {
-        Self {
-            kind: Kind::Ok,
-            message: message.into(),
-            detail,
-        }
-    }
-
-    /// A warning check (`_dr_warn "$message" ["$detail"]`).
-    pub fn warn(message: impl Into<String>, detail: Option<String>) -> Self {
-        Self {
-            kind: Kind::Warn,
-            message: message.into(),
-            detail,
-        }
-    }
-
-    /// A failing check (`_dr_fail "$message" ["$detail"]`).
-    pub fn fail(message: impl Into<String>, detail: Option<String>) -> Self {
-        Self {
-            kind: Kind::Fail,
-            message: message.into(),
-            detail,
-        }
-    }
-
-    /// A skipped check (`_dr_skip "$message" ["$detail"]`).
-    pub fn skip(message: impl Into<String>, detail: Option<String>) -> Self {
-        Self {
-            kind: Kind::Skip,
-            message: message.into(),
-            detail,
-        }
-    }
-}
+pub use crate::doctor_runtime::{Kind, Record};
 
 /// Render records byte-identical to `doctor/runtime.sh` with color
 /// disabled (piped stdout: every color variable is empty):
@@ -151,55 +75,11 @@ impl Record {
 /// - ok/skip: `  ✓/· {message}[ ({detail})]\n`
 /// - warn/fail: `  ⚠/✗ {message}[\n    {detail}]\n`
 pub fn render(records: &[Record]) -> String {
-    let mut out = String::new();
-    for record in records {
-        match record.kind {
-            Kind::Section => {
-                out.push('\n');
-                out.push_str(&record.message);
-                out.push('\n');
-            }
-            Kind::Ok => {
-                out.push_str("  \u{2713} ");
-                out.push_str(&record.message);
-                if let Some(detail) = &record.detail {
-                    out.push_str(" (");
-                    out.push_str(detail);
-                    out.push(')');
-                }
-                out.push('\n');
-            }
-            Kind::Warn => {
-                out.push_str("  \u{26a0} ");
-                out.push_str(&record.message);
-                if let Some(detail) = &record.detail {
-                    out.push_str("\n    ");
-                    out.push_str(detail);
-                }
-                out.push('\n');
-            }
-            Kind::Fail => {
-                out.push_str("  \u{2717} ");
-                out.push_str(&record.message);
-                if let Some(detail) = &record.detail {
-                    out.push_str("\n    ");
-                    out.push_str(detail);
-                }
-                out.push('\n');
-            }
-            Kind::Skip => {
-                out.push_str("  \u{b7} ");
-                out.push_str(&record.message);
-                if let Some(detail) = &record.detail {
-                    out.push_str(" (");
-                    out.push_str(detail);
-                    out.push(')');
-                }
-                out.push('\n');
-            }
-        }
-    }
-    out
+    String::from_utf8(crate::doctor_runtime::render(
+        records,
+        &crate::doctor_runtime::Palette::empty(),
+    ))
+    .expect("doctor checks emit UTF-8 text")
 }
 
 /// `_dr_tilde`: abbreviate `path` under `home` with `~`. Mirrors

@@ -1064,7 +1064,7 @@ fn resolve_path(runtime: &Runtime, raw: &OsStr, name: &str) -> Option<PathBuf> {
         .find(|path| executable(path))
 }
 
-fn development_checkout_valid(checkout: &Path) -> bool {
+pub(crate) fn development_checkout_valid(checkout: &Path) -> bool {
     development_checkout(checkout).unwrap_or(false)
 }
 

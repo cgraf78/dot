@@ -189,3 +189,4 @@ tests/startup.rs	standalone:new
 tests/update_run.rs	standalone:new
 tests/init_client_engine.rs	standalone:new
 tests/update_parpull.rs	standalone:new
+tests/doctor.rs	standalone:new
