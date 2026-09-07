@@ -7,26 +7,6 @@
 //! [`crate::version`] modules plus the existing `cli::HELP` text —
 //! nothing here re-ports their internals.
 //!
-//! Shell line map (`bin/dot` is 59 lines, `lib/dot/main.sh` 94):
-//!
-//! | Shell | Rust |
-//! |---|---|
-//! | `CDPATH=` | No equivalent needed: the engine builds absolute paths only (`source_root` / `xdg` joins); no `cd`-relative lookup exists to perturb. |
-//! | `set -euo pipefail` | No equivalent needed: fallibility is typed (`Result`, explicit `Option`) instead of dynamic. |
-//! | `umask g-w,o-w` | [`ensure_umask_ceiling`]: the same `mask \| 0o022` as a pure function. The process mask itself is never mutated (no `std` binding exists — see `temp::read_umask` — and a global mutation would race every thread); creation sites already carry explicit modes (`temp::sibling_tmp_for` uses `0o600`, plus `temp::apply_umask_ceiling`). |
-//! | `shopt -u nocasematch` | No equivalent needed: Rust `match` on argv bytes is always byte-exact and case-sensitive (pinned by test against both entry files). |
-//! | Bash-4+ gate (`dot: Bash 4 or newer is required`, exit 1) | No equivalent needed: the compiled binary has no interpreter to version-gate. Test fixtures still require Bash 4+ for compatibility checks. |
-//! | `DOT_SOURCE_ROOT=$(cd -P …/lib/dot/main.sh …/../..)` + export | [`resolve_source_root`] / [`ambient_source_root`]: an explicit `DOT_SOURCE_ROOT` wins verbatim; otherwise the executable's canonical path is walked up to a source checkout or native release root; otherwise the cwd applies. |
-//! | `. lib/dot/temp.sh` | No sourcing step: `temp` is linked statically and called directly ([`observed_revision`] uses `temp::sanitized_git`). |
-//! | `DOT_ORIGINAL_ARGV=("$@")` | No global: argv is threaded explicitly (`cli::run` takes `args`). |
-//! | `DOT_REEXEC_EXPECTED_REVISION` guard (exit 1) | [`check_reexec_revision`] + [`observed_revision`], same order (before config), same bytes including the `${var:-<missing>}` spelling. |
-//! | `. public/api-version.sh` | [`crate::version::LIBRARY_API`] (already pinned to `DOT_LIBRARY_API=1` by `tests/constants.rs`). |
-//! | `. public/xdg.sh` | [`crate::xdg`] (relative XDG values already fall back, exactly like the shell). |
-//! | `. public/ui.sh` | [`crate::ui`] (already ported; startup performs no presentation). |
-//! | `. lib/dot/config.sh` + `dot_config_load \|\| exit 2` | [`load_default_config`]: the XDG-default `dot/config` through `config::load`; any rejection becomes exit 2 with byte-identical diagnostics. Runs BEFORE dispatch for EVERY command per the forward contracts in `docs/rust-port-spec.md` ("an unloadable config exits 2 for ANY command") — the shell `case` currently exempts `help`/`version`, and that divergence is deliberate and pinned in `tests/startup.rs`. |
-//! | `REPLY` global | No equivalent: every helper returns values (the `xdg` precedent). |
-//! | `dot_version` / `dot_help` | `version::version_line` / `cli::HELP` (byte parity already pinned by `tests/cli.rs`; the startup suite re-pins `version` end to end so the prelude cannot perturb it). |
-//!
 //! [`preflight`] validates and returns the loaded [`Config`] to native command
 //! dispatch. No process environment is published; consumers receive the
 //! immutable configuration explicitly.
