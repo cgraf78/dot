@@ -681,6 +681,7 @@ fn base_repo_upstream_current_ahead_behind_and_diverged() {
         ],
     );
     git(&home, &["push", "-q", "-u", "origin", "main"]);
+    git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     let git_dir = home.join(".git");
     let inputs = || base("ordinary", &git_dir, &home);
     assert!(render(&check_base_repo(&inputs())).contains("origin/main (current)"));
