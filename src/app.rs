@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{IsTerminal as _, Write};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -97,6 +98,22 @@ impl Runtime {
     /// Return the snapshotted working directory.
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    pub(crate) fn find_on_path(&self, name: &str) -> Option<PathBuf> {
+        let path = self.value("PATH")?;
+        std::env::split_paths(path)
+            .map(|directory| {
+                if directory.is_absolute() {
+                    directory.join(name)
+                } else {
+                    self.cwd().join(directory).join(name)
+                }
+            })
+            .find(|path| {
+                std::fs::metadata(path)
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            })
     }
 
     pub(crate) fn source_root(&self) -> &Path {

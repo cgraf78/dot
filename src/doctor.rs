@@ -9,7 +9,6 @@
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::ffi::OsStringExt as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -52,7 +51,7 @@ fn run_configured(
     let Some(euid) = current_uid(runtime) else {
         return 1;
     };
-    let base = match select_base(runtime, &home, &state, streams.stderr) {
+    let base = match crate::repos_base::select(runtime, &home, &state, streams.stderr) {
         Ok(base) => base,
         Err(()) => return 1,
     };
@@ -279,7 +278,7 @@ fn bash_version(runtime: &crate::app::Runtime) -> (Vec<u8>, u64) {
         .value("BASH")
         .filter(|path| Path::new(path).is_absolute())
         .map(PathBuf::from)
-        .or_else(|| find_on_path(runtime, "bash"));
+        .or_else(|| runtime.find_on_path("bash"));
     let Some(bash) = bash else {
         return (Vec::new(), 0);
     };
@@ -342,191 +341,6 @@ fn canonical_or_raw(path: &str) -> Vec<u8> {
 fn canonical_dir(path: &str) -> Option<Vec<u8>> {
     let path = std::fs::canonicalize(path).ok()?;
     path.is_dir().then(|| path.as_os_str().as_bytes().to_vec())
-}
-
-fn select_base(
-    runtime: &crate::app::Runtime,
-    home: &str,
-    state: &str,
-    stderr: &mut dyn std::io::Write,
-) -> Result<crate::repos_base::Base, ()> {
-    if let Some(topology) = runtime.value("DOT_BASE_TOPOLOGY").and_then(OsStr::to_str) {
-        return Ok(crate::cli::base_from_values(
-            home,
-            Some(topology),
-            runtime.value("DOT_CLIENT_GIT_DIR").and_then(OsStr::to_str),
-        ));
-    }
-    let completed = Path::new(state).join("dot/init/completed");
-    let transaction = Path::new(state).join("dot/init/transaction/record");
-    let selected = if std::fs::symlink_metadata(&completed).is_ok() {
-        Some((&completed, true))
-    } else if std::fs::symlink_metadata(&transaction).is_ok() {
-        Some((&transaction, false))
-    } else {
-        None
-    };
-    if let Some((record_path, completed_record)) = selected {
-        let record = match crate::init_client_record::read_record(record_path, Path::new(home)) {
-            Ok(record) if !completed_record || record.phase == "complete" => record,
-            _ => {
-                let _ = stderr.write_all(b"dot: malformed initialization identity record\n");
-                return Err(());
-            }
-        };
-        let topology = if record.git_dir == format!("{home}/.dotfiles") {
-            "separate"
-        } else if record.git_dir == format!("{home}/.git") {
-            "ordinary"
-        } else {
-            let _ = stderr
-                .write_all(b"dot: initialization identity names an unsupported Git directory\n");
-            return Err(());
-        };
-        let live_exists = std::fs::symlink_metadata(&record.git_dir).is_ok();
-        if topology == "separate" && !live_exists {
-            return Ok(crate::cli::base_from_values(home, Some("missing"), None));
-        }
-        if !client_matches(&record, Path::new(home)) {
-            let line = if topology == "ordinary" {
-                b"dot: ordinary HOME checkout no longer matches initialization identity\n"
-                    .as_slice()
-            } else {
-                b"dot: client Git directory no longer matches initialization identity\n".as_slice()
-            };
-            let _ = stderr.write_all(line);
-            return Err(());
-        }
-        return Ok(crate::cli::base_from_values(
-            home,
-            Some(topology),
-            Some(&record.git_dir),
-        ));
-    }
-    let legacy = Path::new(home).join(".dotfiles");
-    if std::fs::symlink_metadata(&legacy).is_ok() {
-        if !legacy_client_valid(runtime, &legacy, home) {
-            let _ = writeln!(
-                stderr,
-                "dot: unsupported or foreign client Git directory: {}",
-                legacy.display()
-            );
-            return Err(());
-        }
-        return Ok(crate::cli::base_from_values(
-            home,
-            Some("separate"),
-            legacy.to_str(),
-        ));
-    }
-    if std::fs::symlink_metadata(Path::new(home).join(".git")).is_ok() {
-        let _ = stderr
-            .write_all(b"dot: ordinary HOME checkout requires a completed dot init identity\n");
-        return Err(());
-    }
-    Ok(crate::cli::base_from_values(home, Some("missing"), None))
-}
-
-fn legacy_client_valid(runtime: &crate::app::Runtime, git_dir: &Path, home: &str) -> bool {
-    let meta = match std::fs::symlink_metadata(git_dir) {
-        Ok(meta) => meta,
-        Err(_) => return false,
-    };
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        return false;
-    }
-    let Some(absolute) = git_dir_output(runtime, git_dir, &["rev-parse", "--absolute-git-dir"])
-    else {
-        return false;
-    };
-    let absolute = PathBuf::from(OsString::from_vec(chomp_newlines(absolute)));
-    if std::fs::canonicalize(absolute).ok() != std::fs::canonicalize(git_dir).ok() {
-        return false;
-    }
-    let Some(urls) = git_dir_output(
-        runtime,
-        git_dir,
-        &["config", "--get-all", "remote.origin.url"],
-    ) else {
-        return false;
-    };
-    let urls = output_lines(&urls);
-    if urls.len() != 1
-        || std::str::from_utf8(urls[0])
-            .ok()
-            .and_then(crate::init_client_identity::repo_identity)
-            .is_none()
-    {
-        return false;
-    }
-    let Some(branch) = git_dir_output(runtime, git_dir, &["symbolic-ref", "--short", "HEAD"])
-    else {
-        return false;
-    };
-    if !std::str::from_utf8(&chomp_newlines(branch))
-        .is_ok_and(crate::init_client_identity::branch_valid)
-    {
-        return false;
-    }
-    let Some(bare) = git_dir_output(runtime, git_dir, &["config", "--bool", "core.bare"]) else {
-        return false;
-    };
-    match chomp_newlines(bare).as_slice() {
-        b"true" => true,
-        b"false" => git_dir_output(runtime, git_dir, &["config", "core.worktree"])
-            .is_some_and(|worktree| chomp_newlines(worktree) == home.as_bytes()),
-        _ => false,
-    }
-}
-
-fn output_lines(output: &[u8]) -> Vec<&[u8]> {
-    let output = output.strip_suffix(b"\n").unwrap_or(output);
-    if output.is_empty() {
-        Vec::new()
-    } else {
-        output.split(|byte| *byte == b'\n').collect()
-    }
-}
-
-fn chomp_newlines(mut output: Vec<u8>) -> Vec<u8> {
-    while output.last() == Some(&b'\n') {
-        output.pop();
-    }
-    output
-}
-
-fn client_matches(record: &crate::init_client_record::TransactionRecord, home: &Path) -> bool {
-    let git_dir = Path::new(&record.git_dir);
-    let path_identity =
-        |path: &Path| crate::temp::path_identity(path).map(crate::temp::identity_string);
-    let generation_matches = |path: &Path| {
-        crate::init_client_generation::generation_marker_matches(
-            path,
-            &record.nonce,
-            &record.commit,
-            &record.identity,
-        )
-    };
-    let repo_identity = |origin: &str| {
-        crate::init_client_identity::repo_identity(origin).ok_or(crate::errors::Error::Usage {
-            message: "unsupported repository URL",
-        })
-    };
-    let inputs = crate::init_client_resume::LiveGitInputs {
-        git_dir,
-        git_dev: &record.git_dev,
-        git_ino: &record.git_ino,
-        nonce: &record.nonce,
-        identity: &record.identity,
-        branch: &record.branch,
-        home,
-    };
-    let deps = crate::init_client_resume::LiveGitDeps {
-        path_identity: &path_identity,
-        generation_matches: &generation_matches,
-        repo_identity: &repo_identity,
-    };
-    crate::init_client_resume::live_git_matches_record(&inputs, &deps)
 }
 
 fn topology_name(topology: crate::repos_base::Topology) -> &'static str {
@@ -853,28 +667,12 @@ fn value_or(runtime: &crate::app::Runtime, key: &str, fallback: &str) -> String 
         .to_string()
 }
 
-fn find_on_path(runtime: &crate::app::Runtime, name: &str) -> Option<PathBuf> {
-    let path = runtime.value("PATH")?;
-    std::env::split_paths(path)
-        .map(|directory| {
-            if directory.is_absolute() {
-                directory.join(name)
-            } else {
-                runtime.cwd().join(directory).join(name)
-            }
-        })
-        .find(|path| {
-            std::fs::metadata(path)
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        })
-}
-
 fn doctor_bash(runtime: &crate::app::Runtime) -> Option<PathBuf> {
     runtime
         .value("BASH")
         .filter(|path| Path::new(path).is_absolute())
         .map(PathBuf::from)
-        .or_else(|| find_on_path(runtime, "bash"))
+        .or_else(|| runtime.find_on_path("bash"))
 }
 
 fn command(runtime: &crate::app::Runtime, program: &Path) -> Command {
@@ -888,7 +686,7 @@ fn command(runtime: &crate::app::Runtime, program: &Path) -> Command {
 }
 
 fn command_output(runtime: &crate::app::Runtime, program: &str, args: &[&str]) -> Option<Vec<u8>> {
-    let program = find_on_path(runtime, program)?;
+    let program = runtime.find_on_path(program)?;
     let output = command(runtime, &program).args(args).output().ok()?;
     output.status.success().then(|| {
         output
@@ -938,7 +736,7 @@ fn current_platform(runtime: &crate::app::Runtime) -> Option<String> {
 }
 
 fn git_output(runtime: &crate::app::Runtime, cwd: &Path, args: &[&str]) -> Option<PathBuf> {
-    let program = find_on_path(runtime, "git")?;
+    let program = runtime.find_on_path("git")?;
     let mut command = command(runtime, &program);
     crate::temp::sanitize_git_env(&mut command);
     crate::temp::bind_source_git(&mut command, cwd);
@@ -952,18 +750,6 @@ fn git_output(runtime: &crate::app::Runtime, cwd: &Path, args: &[&str]) -> Optio
                 .to_vec(),
         ))
     })
-}
-
-fn git_dir_output(runtime: &crate::app::Runtime, git_dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let program = find_on_path(runtime, "git")?;
-    let output = command(runtime, &program)
-        .arg("--git-dir")
-        .arg(git_dir)
-        .args(args)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    output.status.success().then_some(output.stdout)
 }
 
 #[cfg(test)]

@@ -22,12 +22,8 @@
 //! [`init_client_command::run`]; slice 82 drives
 //! `fetch`/`push`/`status`/`diff` through overlay resolution
 //! ([`crate::overlays::resolve`]) plus the matching
-//! [`crate::repos_commands`] kernel. Slice 83 drives [`Command::Test`]
-//! end to end through the `ENGINE_SCRIPT` adapter below: the child mirrors the
-//! `*)` arm of `lib/dot/main.sh` and calls `dot_command_dispatch`,
-//! so the shell test body runs exactly as production runs it — exit codes plus
-//! output parity and resolve-failure paths included. This adapter is not
-//! reachable from the native [`Command::Doctor`] or [`Command::Update`] arms.
+//! [`crate::repos_commands`] kernel. Native [`Command::Test`] owns discovery,
+//! scheduling, result collection, timeout and cancellation directly.
 //! Slice 84 runs the startup
 //! prelude ([`crate::startup`]) at the top of [`run`]: the re-exec
 //! guard (exit 1) then `dot_config_load || exit 2` before dispatch
@@ -181,13 +177,9 @@ pub enum Command {
     /// precedent, pinned against `bin/dot`). The native coordinator owns the
     /// complete check, extension, and rendering path.
     Doctor,
-    /// `test`: owner traps, `_dot_resolve_overlays inspect` (failure
-    /// returns `1`), then `dot_test_command "$@"` whose status becomes
-    /// the dispatcher's code (`rc=$?`). Wired by slice 83 through
-    /// `run_engine_arm`: the adapter child runs the shell arm body
-    /// exactly as production does (the `|| rc=$?` handoff already
-    /// suppresses `errexit`, so the code crosses directly), while
-    /// suite scheduling stays shell-owned until its slice lands.
+    /// Native suite supervisor: inspect resolution gates discovery; argument
+    /// validation, trusted launch, bounded scheduling and owned cancellation
+    /// report their aggregate status directly.
     Test,
     /// `init`: owner traps, then [`init_acquires_lock`] decides the
     /// nested `case ${1:-}` — `_dot_update_lock_acquire` unless the
@@ -343,7 +335,11 @@ pub(crate) fn run_with_runtime(
             }
             Command::Test => {
                 let rest: Vec<OsString> = args.collect();
-                run_engine_arm(runtime, other, &rest, stdout, stderr, &mut failed)
+                crate::test_command::run(
+                    runtime,
+                    &rest,
+                    &mut crate::app::Streams::new(stdout, stderr),
+                )
             }
             Command::Unknown => {
                 // A closed stderr here leaves nothing to report to; the
@@ -409,113 +405,6 @@ fn run_update(
         stdout,
         stderr,
     )
-}
-
-/// Engine adapter script for the [`Command::Test`] arm (slice 83): mirrors the `*)` arm of
-/// `lib/dot/main.sh` with the final `dot_command_dispatch` kept, so the shell test body — owner
-/// traps, resolve gating, and kernel — runs exactly as production runs it. `$0` is the `test`
-/// command spelling and `$@` is the residue after it, so
-/// `DOT_ORIGINAL_ARGV=("$0" "$@")` reproduces the production
-/// original argv exactly (the [`update_run`](crate::update_run)
-/// adapter precedent) — and the dispatch call reads the spelling
-/// back out of `$0`, which `bash -c` consumes outside `"$@"`.
-///
-/// Two adapter gaps are documented, not hidden:
-///
-/// - The adapter uses `${DOT_BASH:-bash}` from `PATH` instead of the
-///   checkout-bash resolver: a fully-native test slice removes the subprocess entirely.
-/// - Colors and live progress follow the child's pipes (never a tty),
-///   so interactive-terminal cosmetics match a piped shell run rather
-///   than a direct-to-tty one; rows and codes are unaffected.
-const ENGINE_SCRIPT: &str = r#"set -euo pipefail
-CDPATH=
-shopt -u nocasematch
-umask g-w,o-w
-. "$DOT_SOURCE_ROOT/lib/dot/temp.sh"
-DOT_ORIGINAL_ARGV=("$0" "$@")
-if [[ -n ${DOT_REEXEC_EXPECTED_REVISION:-} ]]; then
-  _dot_reexec_observed=$(_dot_source_git rev-parse HEAD 2>/dev/null || true)
-  if [[ $_dot_reexec_observed != "$DOT_REEXEC_EXPECTED_REVISION" ]]; then
-    printf 'dot: re-exec revision mismatch: expected %s, found %s\n' "$DOT_REEXEC_EXPECTED_REVISION" "${_dot_reexec_observed:-<missing>}" >&2
-    exit 1
-  fi
-  unset _dot_reexec_observed
-fi
-. "$DOT_SOURCE_ROOT/lib/dot/public/api-version.sh"
-. "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
-. "$DOT_SOURCE_ROOT/lib/dot/public/ui.sh"
-. "$DOT_SOURCE_ROOT/lib/dot/config.sh"
-dot_config_load || exit 2
-. "$DOT_SOURCE_ROOT/lib/dot/runtime.sh"
-. "$DOT_SOURCE_ROOT/lib/dot/commands.sh"
-# `bash -c` consumes the argv0-style name into `$0`, outside `"$@"`:
-# dispatch takes the spelling from `$0` so the residue still forwards
-# exactly like production's `dot_command_dispatch "$@"` (whose `$1`
-# is the command). `DOT_ORIGINAL_ARGV` above keeps the production
-# shape (`$0` first), so the `[0] == init` gates and the shdeps argv
-# replay observe the invoked spelling once, never doubled.
-dot_command_dispatch "$0" "$@"
-"#;
-
-/// The [`Command::Test`] arm: execute the engine adapter and report its exit code.
-///
-/// `command` names the invoked spelling for `DOT_ORIGINAL_ARGV`;
-/// `args` is the residue parsed by `dot_test_command`. A closed pipe must not report success for
-/// undelivered output, so forwarding failures flip `failed`, which
-/// [`run`] turns into [`EXIT_ERROR`] like the other arms (the shell
-/// dies on SIGPIPE; Rust reports failure via exit code — same signal
-/// to the caller, different mechanism).
-fn run_engine_arm(
-    runtime: &crate::app::Runtime,
-    command: &[u8],
-    args: &[OsString],
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-    failed: &mut bool,
-) -> i32 {
-    debug_assert_eq!(command, b"test");
-    // Trampoline normalization (like `bin/dot`): a relative state
-    // root must read as unset for the engine child inheriting this
-    // environment. Unlike [`update_run`](crate::update_run), no
-    // native step here reads XDG state, so the removal stays on the
-    // child command instead of mutating the parent process.
-    let relative_state = runtime
-        .value("XDG_STATE_HOME")
-        .is_some_and(|value| !Path::new(value).is_absolute());
-    let program = runtime
-        .value("DOT_BASH")
-        .and_then(OsStr::to_str)
-        .unwrap_or("bash");
-    let root = runtime.source_root();
-    let mut cmd = std::process::Command::new(program);
-    cmd.arg("--noprofile");
-    cmd.arg("--norc");
-    cmd.arg("-c");
-    cmd.arg(ENGINE_SCRIPT);
-    cmd.arg("test");
-    for arg in args {
-        cmd.arg(arg);
-    }
-    cmd.env_clear();
-    cmd.envs(runtime.env());
-    cmd.env("DOT_SOURCE_ROOT", root);
-    if relative_state {
-        cmd.env_remove("XDG_STATE_HOME");
-    }
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    let output = match cmd.output() {
-        Ok(output) => output,
-        Err(_) => return EXIT_ERROR,
-    };
-    if stdout.write_all(&output.stdout).is_err() {
-        *failed = true;
-    }
-    if stderr.write_all(&output.stderr).is_err() {
-        *failed = true;
-    }
-    output.status.code().unwrap_or(EXIT_ERROR)
 }
 
 /// The [`Command::Cron`] arm: `crontab -l`, falling back to the
@@ -1133,33 +1022,6 @@ mod tests {
             assert_eq!(got_git_dir, want_git_dir, "case: {index}");
             assert_eq!(got_home, "/h", "case: {index}");
         }
-    }
-
-    #[test]
-    fn doctor_test_arms_execute_past_interim() {
-        // Slice 83 wires the last two arms, so the interim
-        // "not yet implemented" set is empty: the fallback write is
-        // gone and the `run` match is exhaustive over [`Command`]
-        // (the compiler rejects a new variant without a dedicated
-        // arm). Execution parity lives in `tests/cli.rs` (subprocess,
-        // controlled env); what stays unit-testable here is the
-        // adapter contract both arms share.
-        // `"$0"` carries the spelling `bash -c` consumed out of
-        // `"$@"` (see the script comment); the residue still
-        // forwards exactly like production.
-        assert!(ENGINE_SCRIPT.contains("\ndot_command_dispatch \"$0\" \"$@\"\n"));
-        assert!(ENGINE_SCRIPT.contains(". \"$DOT_SOURCE_ROOT/lib/dot/commands.sh\""));
-        assert!(ENGINE_SCRIPT.contains(". \"$DOT_SOURCE_ROOT/lib/dot/runtime.sh\""));
-        assert!(ENGINE_SCRIPT.contains("dot_config_load || exit 2"));
-        assert!(ENGINE_SCRIPT.contains("DOT_ORIGINAL_ARGV=(\"$0\" \"$@\")"));
-        // Neither arm acquires the update lock (no `init`-style
-        // nested gate, no lock-busy `75`): traps and resolve gating
-        // run inside the dispatched arm, like production.
-        assert!(!ENGINE_SCRIPT.contains("_dot_update_lock_acquire"));
-        // The silent-discovery export stays inside the shell `doctor`
-        // arm (the oracle pins `SILENT:1` there); the shared prelude
-        // must not leak it into `test` (`SILENT:unset`).
-        assert!(!ENGINE_SCRIPT.contains("DOT_OVERLAY_DISCOVERY_SILENT"));
     }
 
     #[test]

@@ -29,8 +29,9 @@ jobs:
       test-command: >-
         cargo test --locked &&
         DOT_PERF_BUDGET_MULTIPLIER=1 cargo test --locked -- --ignored
-      # Provider integration tests use the public Python timeout supervisor.
-      # Minimal platform images do not otherwise install its interpreter.
+      # Native integration tests retain the public Python timeout helper as an
+      # external-suite compatibility boundary. Minimal Rust images do not
+      # otherwise install its interpreter.
       profiles: python
       # The slice-2 update harness shells out to the shell `dot` oracle
       # for baseline timing and byte comparison, and the engine requires
