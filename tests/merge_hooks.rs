@@ -225,27 +225,13 @@ fn jq_layer_install_merge_and_failure_contracts_are_literal() {
                 _ => unreachable!(),
             }
         } else {
-            match label {
-                "install" => assert_eq!(actual, None),
-                "merge" | "bad-src" => {
-                    assert_eq!(actual, original, "failed merge preserves destination")
-                }
-                "corrupt" | "empty" => {
-                    assert_eq!(actual, None, "failed rebuild removes corrupt destination")
-                }
-                _ => unreachable!(),
-            }
-            let operation = if label == "install" || label == "corrupt" || label == "empty" {
-                "copy"
-            } else {
-                "merge"
-            };
+            assert_eq!(actual, None, "jq-free copy or rebuild installs nothing");
             assert!(
                 warnings
                     .iter()
-                    .any(|line| line.contains(&format!("{label} {operation} failed — skipping")))
+                    .any(|line| line.contains(&format!("{label} copy failed — skipping")))
             );
-            if label == "corrupt" || label == "empty" {
+            if dst_body.is_some() {
                 assert!(
                     warnings
                         .iter()
@@ -271,12 +257,21 @@ fn jq_layer_install_merge_and_failure_contracts_are_literal() {
         },
     )
     .expect("skip failure");
-    assert_eq!(std::fs::read(&dst).expect("preserved destination"), b"{}\n");
-    assert!(
-        warnings
-            .iter()
-            .any(|line| line.contains("bad-filter merge failed — skipping"))
-    );
+    if merge_hooks::jq_available() {
+        assert_eq!(std::fs::read(&dst).expect("preserved destination"), b"{}\n");
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("bad-filter merge failed — skipping"))
+        );
+    } else {
+        assert!(!dst.exists(), "jq-free failed rebuild removes destination");
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("bad-filter copy failed — skipping"))
+        );
+    }
 }
 
 #[test]
