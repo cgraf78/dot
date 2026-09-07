@@ -258,12 +258,13 @@ fn realpath_leaf(path: &str) -> Option<String> {
 pub fn reserved_root(requested: &str, pwd: &str) -> Result<Vec<String>, Error> {
     let normalized = normalize_absolute_path(requested, pwd)?;
     let mut roots = vec![normalized.clone()];
-    let physical =
-        if std::fs::symlink_metadata(&normalized).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            realpath_leaf(&normalized)
-        } else {
-            physical_directory_candidate(&normalized, pwd).ok()
-        };
+    let physical = if std::fs::symlink_metadata(&normalized)
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        realpath_leaf(&normalized).or_else(|| physical_directory_candidate(&normalized, pwd).ok())
+    } else {
+        physical_directory_candidate(&normalized, pwd).ok()
+    };
     // No let-chains (MSRV 1.85): nested `if`s instead.
     if let Some(physical) = physical {
         if physical != normalized {
