@@ -36,6 +36,13 @@ pub(crate) struct Worker {
     extensions_dir: Option<PathBuf>,
 }
 
+/// One pre-sync worker's separately routed process streams.
+pub(crate) struct PreSyncOutcome {
+    pub(crate) rc: i32,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
 impl Worker {
     /// Bind this worker to one immutable invocation runtime.
     pub(crate) fn new(runtime: &Runtime) -> Self {
@@ -56,18 +63,25 @@ impl Worker {
 
     /// Run the native pre-sync coordinator's one-use call through the same
     /// sanitized launcher used for lifecycle retirement.
-    pub(crate) fn pre_sync(&mut self, call: &crate::pre_sync::Call) -> WorkerOutcome {
-        self.launch(
+    pub(crate) fn pre_sync(&mut self, call: &crate::pre_sync::Call) -> PreSyncOutcome {
+        let Some(mut command) = self.command(
             "pre-sync",
             &call.script,
             &call.temporary,
             &call.result,
             &call.context,
             &call.token,
-        )
+        ) else {
+            return PreSyncOutcome {
+                rc: 1,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            };
+        };
+        separate(&mut command, &call.temporary)
     }
 
-    fn launch(
+    fn command(
         &self,
         mode: &str,
         script: &Path,
@@ -75,50 +89,22 @@ impl Worker {
         result_file: &Path,
         context: &Path,
         token: &str,
-    ) -> WorkerOutcome {
+    ) -> Option<Command> {
         let source_root = self.runtime.source_root();
-        let source_root_text = match source_root.to_str() {
-            Some(text) => text,
-            None => {
-                return WorkerOutcome {
-                    rc: 1,
-                    output: Vec::new(),
-                };
-            }
-        };
-        let result_text = match result_file.to_str() {
-            Some(text) => text,
-            None => {
-                return WorkerOutcome {
-                    rc: 1,
-                    output: Vec::new(),
-                };
-            }
-        };
+        let source_root_text = source_root.to_str()?;
+        let result_text = result_file.to_str()?;
         if crate::extension_worker::main_precheck(5, mode, source_root_text, result_text).is_err()
             || (mode == "deactivate"
                 && !crate::extension_worker::deactivate_set_valid("retiring", 1))
         {
-            return WorkerOutcome {
-                rc: 1,
-                output: Vec::new(),
-            };
+            return None;
         }
-        let Some(bash) = bash_path(&self.runtime) else {
-            return WorkerOutcome {
-                rc: 1,
-                output: Vec::new(),
-            };
-        };
-        let (Some(cache), Some(data)) = (
+        let bash = bash_path(&self.runtime)?;
+        let (cache, data) = (
             xdg_home(&self.runtime, "XDG_CACHE_HOME", ".cache"),
             xdg_home(&self.runtime, "XDG_DATA_HOME", ".local/share"),
-        ) else {
-            return WorkerOutcome {
-                rc: 1,
-                output: Vec::new(),
-            };
-        };
+        );
+        let (cache, data) = (cache?, data?);
         let worker = source_root.join("lib/dot/extension-worker.sh");
         let mut command = Command::new(bash);
         command
@@ -153,6 +139,25 @@ impl Worker {
                 command.env_remove(key);
             }
         }
+        Some(command)
+    }
+
+    fn launch(
+        &self,
+        mode: &str,
+        script: &Path,
+        result_dir: &Path,
+        result_file: &Path,
+        context: &Path,
+        token: &str,
+    ) -> WorkerOutcome {
+        let Some(mut command) = self.command(mode, script, result_dir, result_file, context, token)
+        else {
+            return WorkerOutcome {
+                rc: 1,
+                output: Vec::new(),
+            };
+        };
         combined(&mut command, result_dir)
     }
 }
@@ -232,6 +237,58 @@ fn combined(command: &mut Command, result_dir: &Path) -> WorkerOutcome {
     WorkerOutcome {
         rc: status.ok().and_then(|status| status.code()).unwrap_or(1),
         output,
+    }
+}
+
+/// Allocate one private capture file under the worker's already-private
+/// temporary directory. `create_new` keeps a malicious hook from replacing a
+/// stream path before the parent opens it.
+fn stream_file(result_dir: &Path, name: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let path = result_dir.join(name);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    Ok((path, file))
+}
+
+/// Capture pre-sync stdout and stderr independently, matching the shell's
+/// inherited streams. Files avoid pipe backpressure deadlock; the surrounding
+/// update engine already buffers its command streams, so this adds no output
+/// limit beyond that established update boundary.
+fn separate(command: &mut Command, result_dir: &Path) -> PreSyncOutcome {
+    let (stdout_path, stdout) = match stream_file(result_dir, "worker-stdout") {
+        Ok(capture) => capture,
+        Err(_) => return failed_pre_sync(),
+    };
+    let (stderr_path, stderr) = match stream_file(result_dir, "worker-stderr") {
+        Ok(capture) => capture,
+        Err(_) => {
+            let _ = std::fs::remove_file(stdout_path);
+            return failed_pre_sync();
+        }
+    };
+    command
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    let status = command.status();
+    let stdout = std::fs::read(&stdout_path).unwrap_or_default();
+    let stderr = std::fs::read(&stderr_path).unwrap_or_default();
+    let _ = std::fs::remove_file(stdout_path);
+    let _ = std::fs::remove_file(stderr_path);
+    PreSyncOutcome {
+        rc: status.ok().and_then(|status| status.code()).unwrap_or(1),
+        stdout,
+        stderr,
+    }
+}
+
+fn failed_pre_sync() -> PreSyncOutcome {
+    PreSyncOutcome {
+        rc: 1,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
     }
 }
 
