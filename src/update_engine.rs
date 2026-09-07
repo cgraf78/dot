@@ -18,9 +18,6 @@
 //!
 //! - `DOT_DEPENDENCY_PROVIDER=shdeps` stays shell (ensure plus the
 //!   updater UI have no native ports yet; `none` runs natively).
-//! - A non-empty `merge-hooks.d` stays shell (the merge driver has
-//!   no native port yet; the empty case renders its stage rows
-//!   natively).
 //!
 //! `DOT_UPDATE_NATIVE=1` selects this lane when the envelope accepts
 //! the invocation; the caller runs the shell adapter for every
@@ -73,6 +70,8 @@ pub struct EngineInputs<'a> {
     pub entries: &'a [String],
     /// `DOT_UPDATE_JOBS`: numeric bound, else the CPU count.
     pub update_jobs: Option<&'a str>,
+    /// `DOT_MERGE_JOBS`: merge-hook parallel bound, else update jobs.
+    pub merge_jobs: Option<&'a str>,
     /// `DOT_VERBOSE` (in addition to the flag; either enables).
     pub dot_verbose: Option<&'a str>,
     /// `DOT_QUIET` (in addition to the flag; either quiets).
@@ -130,8 +129,6 @@ pub struct EngineInputs<'a> {
 /// adapter instead). Every reason names the missing native port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fallback {
-    /// Present `merge-hooks.d`: the merge runner is shell-only.
-    MergeHooks,
     /// `DOT_DEPENDENCY_PROVIDER` is not `none`: ensure plus the
     /// updater UI are shell-only (anything but `none` also covers
     /// the shell's `shdeps unavailable` close).
@@ -140,8 +137,6 @@ pub enum Fallback {
     /// provider is unknown, so the shell's `shdeps unavailable`
     /// close owns it.
     ProviderUnavailable,
-    /// Present `merges.sh` hooks: the merge runner is shell-only.
-    MergesPresent,
 }
 
 /// Native envelope check for one run: `Ok(())` runs
@@ -150,25 +145,7 @@ pub fn should_go_native(inputs: &EngineInputs<'_>) -> Result<(), Fallback> {
     if inputs.provider != "none" {
         return Err(Fallback::ShdepsProvider);
     }
-    if has_hook_dir(inputs.extensions_dir, "merge-hooks.d") {
-        return Err(Fallback::MergeHooks);
-    }
-    if has_hook_dir(inputs.home, ".config/dot/merges") {
-        return Err(Fallback::MergesPresent);
-    }
     Ok(())
-}
-
-/// Hook directory presence: `_merge_hook_specs` and
-/// `_dot_pre_sync_specs` yield nothing when their directories are
-/// absent, so only a present directory needs the shell driver.
-/// Any symlink metadata (even to a missing target) counts, like
-/// the shell's existence test before listing.
-fn has_hook_dir(root: &str, name: &str) -> bool {
-    if root.is_empty() {
-        return false;
-    }
-    std::fs::symlink_metadata(Path::new(root).join(name)).is_ok()
 }
 
 /// Installed-link generation snapshot (`DOT_OVERLAY_ROLLBACK_PATHS`
@@ -1441,17 +1418,40 @@ fn finalize(
             let _ = io.out.write_all(&open);
             let close = stage.finish(b"ok", b"no dependency provider", now_secs);
             let _ = io.out.write_all(&close);
-            // Merge hooks are absent by envelope, so the driver
-            // renders the empty close directly.
-            let open = stage.start(
-                b"Configs",
-                Some(b"checking config hooks"),
+            let extensions_dir = state
+                .config
+                .extensions_dir
+                .as_deref()
+                .unwrap_or(inputs.extensions_dir);
+            let merged = crate::merges::run(
+                &crate::merges::RunInputs {
+                    runtime: inputs.runtime,
+                    extension_inputs: crate::extension_trust::Inputs {
+                        euid: inputs.euid,
+                        home: inputs.home.to_string(),
+                        extensions_dir: extensions_dir.to_string(),
+                        manifest: inputs.manifest.to_string(),
+                        retiring_root: String::new(),
+                    },
+                    extensions_enabled: crate::config::extensions_enabled(&state.config),
+                    overlays: &state.active,
+                    tmp: inputs.tmp,
+                    update_jobs: inputs.update_jobs,
+                    merge_jobs: inputs.merge_jobs,
+                    verbose: inputs.flags.verbose || crate::log::is_quiet(inputs.dot_verbose),
+                    quiet: quiet(inputs),
+                    palette: inputs.palette,
+                    multibyte: inputs.multibyte,
+                    log: inputs.log,
+                },
+                stage,
+                io.out,
+                io.err,
                 now_secs,
-                inputs.dot_verbose,
             );
-            let _ = io.out.write_all(&open);
-            let close = stage.finish(b"ok", b"no config hooks", now_secs);
-            let _ = io.out.write_all(&close);
+            if merged.status != 0 {
+                status = 1;
+            }
         }
     }
     if inputs_ready && status == 0 {
@@ -1567,6 +1567,7 @@ pub struct Gathered {
     dot_verbose: Option<String>,
     dot_quiet: Option<String>,
     update_jobs: Option<String>,
+    merge_jobs: Option<String>,
     provider: String,
     skip_provider: bool,
     live: bool,
@@ -1611,6 +1612,7 @@ impl Gathered {
             provider: &self.provider,
             skip_provider: self.skip_provider,
             update_jobs: self.update_jobs.as_deref(),
+            merge_jobs: self.merge_jobs.as_deref(),
             live: self.live,
             multibyte: self.multibyte,
             ascii: self.ascii,
@@ -1804,6 +1806,7 @@ pub fn gather(
         dot_verbose,
         dot_quiet,
         update_jobs: env_value(env, "DOT_UPDATE_JOBS"),
+        merge_jobs: env_value(env, "DOT_MERGE_JOBS"),
         provider,
         skip_provider,
         live,
