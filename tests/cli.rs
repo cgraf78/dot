@@ -2656,6 +2656,8 @@ impl NativeUpdateFixture {
         let extensions = self.client.home.join("extensions");
         std::fs::create_dir_all(&profiles).expect("profile directory");
         std::fs::create_dir_all(&extensions).expect("extensions directory");
+        let support = extensions.join("retirement-support");
+        std::fs::write(&support, b"support\n").expect("retirement support file");
         std::fs::write(profiles.join("base.conf"), b"version=1\noverlays=alpha\n")
             .expect("base profile");
         std::fs::write(profiles.join("dev.conf"), b"version=1\noverlays=beta\n")
@@ -2669,7 +2671,7 @@ impl NativeUpdateFixture {
         seed_advance(
             &self.client.overlay_seed,
             "dot/profile-deactivate",
-            b"deactivate() { printf '%s|%s' \"$DOT_RETIRING_OVERLAY\" \"${#OVERLAYS[@]}\" >\"$HOME/alpha-retired\"; }\n",
+            b"deactivate() { dot_hook_file retirement-support || return; [[ -f $REPLY ]] || return; printf '%s|%s' \"$DOT_RETIRING_OVERLAY\" \"${#OVERLAYS[@]}\" >\"$HOME/alpha-retired\"; }\n",
         );
         let origins = self.client.scope.path().join("origins");
         let (beta_origin, _beta_seed, _branch) = seed_bare_origin(&origins, "beta");
@@ -2679,8 +2681,12 @@ impl NativeUpdateFixture {
         )
         .expect("beta descriptor");
         #[cfg(unix)]
-        std::fs::set_permissions(&extensions, std::fs::Permissions::from_mode(0o700))
-            .expect("private extension directory");
+        {
+            std::fs::set_permissions(&extensions, std::fs::Permissions::from_mode(0o700))
+                .expect("private extension directory");
+            std::fs::set_permissions(&support, std::fs::Permissions::from_mode(0o600))
+                .expect("private support file");
+        }
         self
     }
 
@@ -3224,6 +3230,56 @@ fn update_native_merge_hook_receives_active_overlay_context() {
 }
 
 #[test]
+fn update_native_merge_hook_receives_overlay_manifest() {
+    let script = b"merge() { [[ -n ${DOT_OVERLAY_MANIFEST:-} ]] || return 8; printf '%s' \"$DOT_OVERLAY_MANIFEST\" >\"$HOME/merge-manifest\"; }\n";
+    let fixture = NativeUpdateFixture::stage().with_merge(script);
+    let manifest = fixture.client.home.join("selected-overlay-links");
+    let output = fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
+        cmd.env("DOT_OVERLAY_MANIFEST", &manifest);
+    });
+    assert_native_silent(&output, "merge manifest");
+    assert_eq!(
+        std::fs::read_to_string(fixture.client.home.join("merge-manifest")).unwrap(),
+        manifest.to_string_lossy()
+    );
+}
+
+#[test]
+fn update_native_merge_hook_logging_defaults_to_not_quiet() {
+    let fixture = NativeUpdateFixture::stage().with_merge(
+        b"merge() { [[ ${DOT_VERBOSE:-} == 1 && ${SHDEPS_LOG_LEVEL:-} == 2 ]] || return 8; _log hook-log; }\n",
+    );
+    let output = fixture.rust_dot(&["update", "--verbose"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(has_bytes(&output.stdout, b"hook-log"));
+    assert_eq!(output.stderr, b"");
+}
+
+#[test]
+fn update_native_merge_hook_receives_quiet_flag() {
+    let fixture = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { [[ ${DOT_QUIET:-} == 1 && ${SHDEPS_QUIET:-} == 1 ]]; }\n");
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_native_silent(&output, "merge quiet flag");
+}
+
+#[test]
+fn update_native_merge_hook_receives_force_flags() {
+    let fixture = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { [[ ${DOT_FORCE:-} == 1 && ${SHDEPS_FORCE:-} == 1 ]]; }\n");
+    let output = fixture.rust_dot(&["update", "--force", "--quiet"]);
+    assert_native_silent(&output, "merge force flags");
+}
+
+#[test]
+fn update_native_merge_hook_receives_update_lock_token() {
+    let fixture = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { [[ -n ${DOT_UPDATE_LOCK_TOKEN:-} ]]; }\n");
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_native_silent(&output, "merge update lock token");
+}
+
+#[test]
 fn update_native_profile_base_selection_rejects_fallback() {
     let fixture = NativeUpdateFixture::stage().with_base_profile();
     fixture.reject_fallback();
@@ -3300,6 +3356,10 @@ fn update_native_profile_downgrade_retires_lifecycle_state() {
     let fixture = NativeUpdateFixture::stage().with_profile_retirement();
     fixture.reject_fallback();
     assert_native_silent(&fixture.rust_dot(&["update", "--quiet"]), "profile setup");
+    assert!(
+        !fixture.client.home.join("alpha-retired").exists(),
+        "an eligible active overlay must not be deactivated during setup"
+    );
     let ledger = fixture
         .client
         .home
@@ -3309,9 +3369,22 @@ fn update_native_profile_downgrade_retires_lifecycle_state() {
             .expect("setup ledger")
             .contains("alpha|")
     );
+    let refreshed_extensions = fixture.client.home.join("extensions-next");
+    std::fs::create_dir(&refreshed_extensions).expect("refreshed extensions directory");
+    std::fs::rename(
+        fixture.client.home.join("extensions/retirement-support"),
+        refreshed_extensions.join("retirement-support"),
+    )
+    .expect("move retirement support to refreshed root");
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &refreshed_extensions,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("private refreshed extensions directory");
     std::fs::write(
         fixture.client.xdg.join("dot/config"),
-        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions-next\ndefault_profile=dev\n",
     )
     .expect("switch profile");
 

@@ -102,7 +102,7 @@ fn normalize_jobs(raw: &str, fallback: &str) -> String {
 
 /// Pure kernel of `_dot_update_cpu_count`: pick from the already-run
 /// `getconf _NPROCESSORS_ONLN` output, `uname -s`, and `sysctl -n
-/// hw.ncpu` output. Unparseable means four workers.
+/// hw.ncpu` output. Unparsable means four workers.
 pub fn cpu_count_select(getconf: &str, uname_s: &str, sysctl: &str) -> String {
     let mut probed = getconf;
     if probed.is_empty() && uname_s == "Darwin" {
@@ -532,6 +532,7 @@ pub(crate) struct DiscoveryError(String);
 /// trust envelope; the worker owns only a previously validated entry point.
 pub(crate) struct RunInputs<'a> {
     pub(crate) runtime: &'a crate::app::Runtime,
+    pub(crate) update_lock_token: Option<&'a str>,
     pub(crate) extension_inputs: crate::extension_trust::Inputs,
     pub(crate) extensions_enabled: bool,
     pub(crate) overlays: &'a [String],
@@ -540,6 +541,7 @@ pub(crate) struct RunInputs<'a> {
     pub(crate) merge_jobs: Option<&'a str>,
     pub(crate) verbose: bool,
     pub(crate) quiet: bool,
+    pub(crate) force: bool,
     pub(crate) palette: &'a Palette,
     pub(crate) multibyte: bool,
     pub(crate) log: &'a crate::log::Log,
@@ -671,7 +673,6 @@ fn run_one(
     hook: Hook,
     index: usize,
     root: &Path,
-    now_secs: i64,
     overlays: &[Vec<u8>],
 ) -> ResultRecord {
     let temporary = root.join(format!("worker.{index}"));
@@ -692,7 +693,7 @@ fn run_one(
     // Serial barriers reuse the batch-local worker numbers. A failed worker
     // must not inherit a prior batch's marker and look as though it ran.
     let _ = std::fs::remove_file(&result);
-    let created = crate::overlay_context::create(
+    let created = crate::overlay_context::create_current(
         &temporary,
         "merge",
         "active",
@@ -700,14 +701,20 @@ fn run_one(
         overlays,
         &inputs.extension_inputs.home,
         inputs.extension_inputs.euid,
-        now_secs,
     );
     let started = Instant::now();
     let (rc, output) = match created {
         Ok((context, token)) => {
-            let mut worker = crate::hook_worker::Worker::with_extensions(
+            let mut worker = crate::hook_worker::Worker::for_update(
                 inputs.runtime,
-                &inputs.extension_inputs.extensions_dir,
+                &crate::hook_worker::UpdateEnvironment {
+                    extensions_dir: &inputs.extension_inputs.extensions_dir,
+                    overlay_manifest: &inputs.extension_inputs.manifest,
+                    update_lock_token: inputs.update_lock_token,
+                    quiet: inputs.quiet,
+                    force: inputs.force,
+                    verbose: inputs.verbose,
+                },
             );
             let outcome = worker.merge(&hook.script, &temporary, &result, &context, &token);
             (outcome.rc, outcome.output)
@@ -761,7 +768,6 @@ fn run_batch(
     .unwrap_or(1);
     let mut records = Vec::with_capacity(hooks.len());
     let root = state.root;
-    let now_secs = state.now_secs;
     let overlays = state.overlays;
     let first_index = state.merge_index - hooks.len();
     std::thread::scope(|scope| {
@@ -773,7 +779,7 @@ fn run_batch(
             let panic_hook = hook.clone();
             workers.push_back((
                 panic_hook,
-                scope.spawn(move || run_one(inputs, hook, index, root, now_secs, overlays)),
+                scope.spawn(move || run_one(inputs, hook, index, root, overlays)),
             ));
             // Bash waits for the oldest in-flight worker once the ceiling is
             // reached, then immediately launches the next hook. This is a FIFO

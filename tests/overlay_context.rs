@@ -185,6 +185,37 @@ fn create_and_consume_are_single_use_and_preserve_context() {
 }
 
 #[test]
+fn current_creation_clock_is_independent_of_a_stale_stage_clock() {
+    let dir = private_dir("context-current-clock");
+    let home = "/home/test";
+    assert!(
+        context::create(
+            dir.path(),
+            "merge",
+            "active",
+            "none",
+            &records(home),
+            home,
+            euid(),
+            now() - 60,
+        )
+        .is_err(),
+        "the explicit protocol seam must reject a stale authorization clock"
+    );
+    let (path, token) = context::create_current(
+        dir.path(),
+        "merge",
+        "active",
+        "none",
+        &records(home),
+        home,
+        euid(),
+    )
+    .expect("production creation samples its own clock");
+    context::consume(&path, &token, "merge", home, euid(), now()).expect("freshly minted context");
+}
+
+#[test]
 fn consume_refuses_wrong_token_mode_permissions_links_and_frames() {
     let home = "/home/test";
     for mutation in ["token", "mode", "permissions", "hardlink", "frame"] {

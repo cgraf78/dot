@@ -36,7 +36,22 @@ const STARTUP_CONTROLS: [&str; 8] = [
 pub(crate) struct Worker {
     runtime: Runtime,
     extensions_dir: Option<PathBuf>,
+    overlay_manifest: Option<PathBuf>,
+    update_lock_token: Option<String>,
+    quiet: bool,
+    force: bool,
+    verbose: bool,
     bash: Option<PathBuf>,
+}
+
+/// Resolved update-generation values exported to public hook APIs.
+pub(crate) struct UpdateEnvironment<'a> {
+    pub(crate) extensions_dir: &'a str,
+    pub(crate) overlay_manifest: &'a str,
+    pub(crate) update_lock_token: Option<&'a str>,
+    pub(crate) quiet: bool,
+    pub(crate) force: bool,
+    pub(crate) verbose: bool,
 }
 
 /// One pre-sync worker's separately routed process streams.
@@ -47,21 +62,22 @@ pub(crate) struct PreSyncOutcome {
 }
 
 impl Worker {
-    /// Bind this worker to one immutable invocation runtime.
-    pub(crate) fn new(runtime: &Runtime) -> Self {
-        Self {
-            runtime: runtime.clone(),
-            extensions_dir: None,
-            bash: None,
-        }
-    }
-
     /// Bind the refreshed configuration's extension root for a pre-sync
     /// worker. Runtime remains the source for every other child input.
-    pub(crate) fn with_extensions(runtime: &Runtime, extensions_dir: &str) -> Self {
+    pub(crate) fn for_update(runtime: &Runtime, env: &UpdateEnvironment<'_>) -> Self {
         Self {
             runtime: runtime.clone(),
-            extensions_dir: (!extensions_dir.is_empty()).then(|| PathBuf::from(extensions_dir)),
+            extensions_dir: (!env.extensions_dir.is_empty())
+                .then(|| PathBuf::from(env.extensions_dir)),
+            overlay_manifest: (!env.overlay_manifest.is_empty())
+                .then(|| PathBuf::from(env.overlay_manifest)),
+            update_lock_token: env
+                .update_lock_token
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            quiet: env.quiet,
+            force: env.force,
+            verbose: env.verbose,
             bash: None,
         }
     }
@@ -74,6 +90,11 @@ impl Worker {
         Self {
             runtime: runtime.clone(),
             extensions_dir: Some(PathBuf::from(extensions_dir)),
+            overlay_manifest: None,
+            update_lock_token: None,
+            quiet: false,
+            force: false,
+            verbose: false,
             bash: Some(bash),
         }
     }
@@ -150,7 +171,10 @@ impl Worker {
         let home = self.runtime.home().to_str()?;
         let decoded =
             crate::overlay_context::consume(context, token, mode, home, euid, now_secs).ok()?;
-        let manifest = self.runtime.state_home().join("dot/overlay-links");
+        let manifest = self
+            .overlay_manifest
+            .clone()
+            .unwrap_or_else(|| self.runtime.state_home().join("dot/overlay-links"));
         let extensions_dir = self.extensions_dir.as_deref().unwrap_or(Path::new(""));
         let trust = crate::extension_trust::Inputs {
             euid,
@@ -223,10 +247,26 @@ impl Worker {
             .env("XDG_STATE_HOME", self.runtime.state_home())
             .env("XDG_CACHE_HOME", cache)
             .env("XDG_DATA_HOME", data)
+            // Public hook helpers use the manifest to validate overlay links.
+            // Reassert it after `env_clear` so hooks see the same resolved
+            // path the native engine used to build their context.
+            .env("DOT_OVERLAY_MANIFEST", manifest)
             .current_dir(self.runtime.cwd())
             .stdin(Stdio::null());
         if let Some(extensions_dir) = &self.extensions_dir {
             command.env("DOT_EXTENSIONS_DIR", extensions_dir);
+        }
+        if let Some(token) = &self.update_lock_token {
+            command.env("DOT_UPDATE_LOCK_TOKEN", token);
+        }
+        if self.quiet {
+            command.env("DOT_QUIET", "1").env("SHDEPS_QUIET", "1");
+        }
+        if self.force {
+            command.env("DOT_FORCE", "1").env("SHDEPS_FORCE", "1");
+        }
+        if self.verbose {
+            command.env("DOT_VERBOSE", "1").env("SHDEPS_LOG_LEVEL", "2");
         }
         for key in STARTUP_CONTROLS {
             command.env_remove(key);
@@ -444,7 +484,7 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    use super::Worker;
+    use super::{UpdateEnvironment, Worker};
     use crate::app::Runtime;
     use crate::log::Log;
     use crate::profile_lifecycle;
@@ -522,7 +562,18 @@ mod tests {
 
     fn run(runtime: &Runtime, home: &Path, record: &str) -> (i32, Vec<u8>, Vec<u8>) {
         let log = Log::new(false, false);
-        let mut worker = Worker::new(runtime);
+        let manifest = runtime.state_home().join("dot/overlay-links");
+        let mut worker = Worker::for_update(
+            runtime,
+            &UpdateEnvironment {
+                extensions_dir: "",
+                overlay_manifest: manifest.to_str().expect("manifest text"),
+                update_lock_token: None,
+                quiet: false,
+                force: false,
+                verbose: false,
+            },
+        );
         let mut out = Vec::new();
         let mut warnings = Vec::new();
         let tmpdir = home.join("scratch");
@@ -532,10 +583,6 @@ mod tests {
             home: home.to_str().expect("home text"),
             euid: crate::temp::current_uid().expect("current uid"),
             tmpdir: &tmpdir,
-            now_secs: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_secs() as i64,
             verbose: true,
             log: &log,
         };

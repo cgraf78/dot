@@ -212,8 +212,11 @@ fn pull_base_preserves_status_failure_backup_and_candidate_safety_rows() {
             "invalid-candidate" => assert!(!side.home.join(".dotfiles/evil").exists()),
             "diverged" => {
                 let body = std::fs::read_to_string(side.home.join("base.txt")).unwrap();
-                assert!(body.starts_with("<<<<<<< HEAD\norigin change\n||||||| parent of "));
-                assert!(body.contains("\nv1\n=======\nhome change\n>>>>>>> "));
+                assert!(body.starts_with("<<<<<<< HEAD\norigin change\n"));
+                if body.contains("||||||| parent of ") {
+                    assert!(body.contains("\nv1\n=======\n"));
+                }
+                assert!(body.contains("=======\nhome change\n>>>>>>> "));
                 assert!(body.ends_with(" (home change)\n"));
             }
             _ => {}

@@ -15,6 +15,26 @@ All fixtures used local Git repositories, so network latency is excluded.
 | clean full update, p95 of 20 | 1,962 ms | 641 ms | 3.06x faster |
 | dirty full update, p95 of 20 | 2,267 ms | 804 ms | 2.82x faster |
 
+## Live workload
+
+The cutover binary was also measured against the installed `nas` workload,
+where an update checks four repositories, three active overlays, 89 current
+tools (plus one intentionally skipped tool), and 26 configuration hooks. The
+installed pre-cutover Bash client and the release Rust binary were run with
+`update --quiet`; every recorded sample exited zero with empty stdout and
+stderr.
+
+| Implementation | Samples | Median |
+| --- | --- | ---: |
+| Bash | 21,690 ms; 22,086 ms; 22,150 ms | 22,086 ms |
+| Rust | 11,046 ms; 11,362 ms; 11,637 ms | 11,362 ms |
+
+The live median is **1.94x faster**, reducing end-to-end wall time by about
+49%. Unlike the synthetic fixture, this includes the machine's real provider
+inventory and configuration hooks. The alternating runs were performed only
+after both implementations completed the same workload successfully; failed
+parity-diagnostic runs were excluded.
+
 The full-update figures are the primary result: the native engine reduces p95
 latency by about 67% for a clean fixture and 65% when converging an upstream
 change. Startup measurements used `hyperfine --warmup 10 --runs 50

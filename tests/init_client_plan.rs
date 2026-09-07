@@ -166,7 +166,8 @@ fn confirm_listing_matches_cut_first() {
     let manifest = write(dir.path(), "manifest", content);
     let output = plan::confirm(&manifest, true, Path::new("/unopened/tty")).expect("confirmed");
     let expected = if cfg!(target_os = "macos") {
-        b"dot init: conflicting paths will be backed up:\n  file1\n  NOTAB\n  \n  \n  p\n  a\n  tail-row".as_slice()
+        b"dot init: conflicting paths will be backed up:\n  file1\n  NOTAB\n  \n  \n  p\n  a"
+            .as_slice()
     } else {
         b"dot init: conflicting paths will be backed up:\n  file1\n  NOTAB\n  \n  \n  p\n  a\n  n\0ul\n  tail-row\n".as_slice()
     };

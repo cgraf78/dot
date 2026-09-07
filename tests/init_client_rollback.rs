@@ -1987,10 +1987,14 @@ fn published_unreadable_tree_rolls_on() {
         chmod(&transaction.join("tree.tsv"), 0o000);
         sides.push((rec, transaction, ()));
     }
-    assert!(
-        std::fs::read(sides[0].1.join("tree.tsv")).is_err(),
-        "fixture requires unreadable tree.tsv"
-    );
+    if std::fs::read(sides[0].1.join("tree.tsv")).is_ok() {
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "only a privileged runner may bypass mode 000"
+        );
+        return;
+    }
     let (_expected_rec, _expected_tx, _) = &sides[0];
     let (actual_rec, actual_tx, _) = &sides[1];
     let expected_code = 0;

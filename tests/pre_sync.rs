@@ -176,7 +176,6 @@ fn drive(
         records,
         &inputs(home, ext),
         &[],
-        timestamp,
         &scratch,
         &mut runner,
     );
@@ -198,7 +197,6 @@ fn run_stage_and_empty_agree() {
                 &[],
                 &inputs(dir.path(), &ext),
                 &[],
-                now(),
                 dir.path(),
                 &mut never
             ),
@@ -271,7 +269,6 @@ fn run_create_failure_agrees() {
         &[b"bogus".to_vec()],
         &inputs(dir.path(), &ext),
         &[],
-        now(),
         &scratch,
         &mut never,
     );
