@@ -6,7 +6,16 @@
 //! layer (link recording and matching, ownership gates, and private
 //! writers), and the pending/fallback publishers (authority
 //! discovery and loading, candidate appending, and the pending and
-//! fallback-authority publishers).
+//! fallback-authority publishers), plus the local-inventory
+//! revalidation pair (source snapshot, inventory entry) and the
+//! replacement hash boundary. `_overlay_replacement_git` stays a
+//! shell alias for the shared sanitized boundary already ported as
+//! `temp::sanitized_git`; `_overlay_prepare_inventories`,
+//! `_overlay_snapshot_installed_links`, `_overlay_restore_tracked_path`,
+//! `_unstash_overlay_overrides`, `_link_overlay`, and `_link_overlays`
+//! stay in shell until their reserved-roots and link-execution
+//! layers land.
+
 //!
 //! Two engine boundaries apply. Values cross from bytes to `String`
 //! via lossy conversion (the `profiles` precedent), so a non-UTF8
@@ -1668,20 +1677,7 @@ fn stage_private_dir(tmp: &Path, prefix: &str) -> Option<PathBuf> {
 /// Feed `value` to `hash-object --stdin` inside the bare `repo`
 /// and return the trimmed hash line.
 fn hash_stdin_in(repo: &Path, value: &str) -> Option<String> {
-    use std::io::Write as _;
-    use std::process::Stdio;
-    let mut child = temp::sanitized_git(repo, &["hash-object", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    child.stdin.as_mut()?.write_all(value.as_bytes()).ok()?;
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    replacement_hash_object(repo, &["--stdin"], Some(value.as_bytes()))
 }
 
 /// `_overlay_replacement_hash_object_format`: the exact Git hash of
@@ -2487,4 +2483,125 @@ fn publish_link_replace(
         return false;
     }
     true
+}
+
+/// `_overlay_file_identity`: the `dev:ino` pair identifying one
+/// filesystem object. Plain `stat` reports the link itself, so
+/// this reads the link metadata without following the final
+/// component. `None` when nothing answers, like the failing
+/// command substitution.
+pub fn file_identity(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some(format!("{}:{}", meta.dev(), meta.ino()))
+}
+
+/// `_overlay_local_source_snapshot_matches`: revalidate one
+/// filesystem overlay's frozen source root and identity before
+/// its inventory is trusted again. `Ok(())` keeps the inventory;
+/// `Err` carries the `REPLY` diagnostic.
+pub fn local_source_snapshot_matches(
+    path: &str,
+    expected_root: &str,
+    expected_identity: &str,
+) -> std::result::Result<(), String> {
+    let home = format!("{path}/home");
+    if expected_root.is_empty() || expected_identity.is_empty() {
+        return Err(format!("{home} (missing inventory identity)"));
+    }
+    // `cd -P` plus `pwd -P`: the physical root or the home path
+    // itself when the directory is gone.
+    let current_root = std::fs::canonicalize(&home).map_err(|_| home.clone())?;
+    let current_root = current_root.to_string_lossy();
+    if current_root != expected_root {
+        return Err(format!("{home} (source root changed)"));
+    }
+    match file_identity(Path::new(current_root.as_ref())) {
+        Some(identity) if identity == expected_identity => Ok(()),
+        _ => Err(format!("{home} (source root replaced)")),
+    }
+}
+
+/// `_overlay_local_inventory_entry_current`: revalidate one
+/// inventory entry against its frozen source root and identity,
+/// then the entry itself. `Err` carries the `REPLY` diagnostic.
+#[allow(clippy::too_many_arguments)]
+pub fn local_inventory_entry_current(
+    path: &str,
+    src: &Path,
+    rel: &str,
+    expected_root: &str,
+    expected_identity: &str,
+    overlays: &[String],
+    home: &str,
+) -> std::result::Result<(), String> {
+    local_source_snapshot_matches(path, expected_root, expected_identity)?;
+    crate::overlays::source_entry_validate(path, src, rel, expected_root, overlays, home)
+}
+
+/// `_overlay_replacement_hash_object`: `hash-object` behind the
+/// shared sanitized boundary (`_dot_hash_object` with its source
+/// root made explicit). `None` on any failure, like the
+/// `$(...) || return 1` call sites.
+pub fn replacement_hash_object<S: AsRef<std::ffi::OsStr>>(
+    source_root: &Path,
+    args: &[S],
+    stdin: Option<&[u8]>,
+) -> Option<String> {
+    temp::hash_object(source_root, args, stdin).ok()
+}
+
+/// Run one base `git` step, silenced like `2>/dev/null`: a
+/// missing topology reads as failure, like the shell's rc 128.
+fn base_git_ok(base: &repos_base::Base, args: &[&str]) -> bool {
+    match base.git_prefix() {
+        Some(prefix) => {
+            repos_base::run_git(&prefix, args).is_some_and(|output| output.status.success())
+        }
+        None => false,
+    }
+}
+
+/// `_overlay_restore_tracked_path`: hand one path back to the
+/// base checkout: refuse paths inside local overlay sources,
+/// clear the overlay index state, then check out the tracked
+/// version. Returns success plus the stderr warnings.
+pub fn restore_tracked_path(
+    palette: &crate::progress_ui::Palette,
+    base: &repos_base::Base,
+    overlays: &[String],
+    home: &str,
+    rel: &str,
+) -> (bool, Vec<u8>) {
+    if let Err(diagnostic) = crate::overlays::destination_outside_local_sources(rel, overlays, home)
+    {
+        // `${REPLY:-$rel}`: the guard always reports, but an
+        // empty diagnostic still falls back to the path.
+        let whose = if diagnostic.is_empty() {
+            rel.to_string()
+        } else {
+            diagnostic
+        };
+        let warning = format!(
+            "  warning: refusing to restore a base path inside a local overlay source: {whose}"
+        );
+        return (
+            false,
+            crate::progress_ui::warn_line(palette, warning.as_bytes()),
+        );
+    }
+    if !base_git_ok(base, &["update-index", "--no-skip-worktree", rel]) {
+        let warning = format!("  warning: could not clear overlay index state: {rel}");
+        return (
+            false,
+            crate::progress_ui::warn_line(palette, warning.as_bytes()),
+        );
+    }
+    if !base_git_ok(base, &["checkout", "--", rel]) {
+        let warning = format!("  warning: could not restore overlay base path: {rel}");
+        return (
+            false,
+            crate::progress_ui::warn_line(palette, warning.as_bytes()),
+        );
+    }
+    (true, Vec::new())
 }
