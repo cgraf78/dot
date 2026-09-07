@@ -95,6 +95,7 @@ fn ensure_destination_parent_enforces_home_relative_safe_components() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn ensure_destination_parent_clamps_default_acl_group_write() {
     let scope = TempDir::new("publish-parent-acl").unwrap();
