@@ -128,13 +128,12 @@ pub fn origin_allowed(origin: &str) -> bool {
 
 /// `_dot_shdeps_path_owned`: whether `path` stats to the caller
 /// with octal-only permission bits carrying no group/other write
-/// bit. `stat` without `-L` reports a symlink argument itself
-/// (mode `0777`, tripping the write-bit gate), so
-/// `symlink_metadata` reproduces that refusal exactly — a link to
-/// a clean file still fails, like the shell. GNU `%a` and BSD
-/// `%Lp` both report permission bits only, so masking `st_mode`
-/// with `0o022` reproduces the shell `((8#$mode & 022))` gate;
-/// file-type bits never intersect it.
+/// bit. `stat` without `-L` reports a symlink argument itself, so
+/// `symlink_metadata` preserves the host contract: GNU reports
+/// symlinks as `0777` while macOS BSD reports owner-only bits. The
+/// enclosing checkout trust gate rejects symlinks independently.
+/// Masking `st_mode` with `0o022` reproduces the shell
+/// `((8#$mode & 022))` gate; file-type bits never intersect it.
 pub fn path_owned(path: &Path, euid: u32) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => meta.uid() == euid && meta.mode() & 0o022 == 0,

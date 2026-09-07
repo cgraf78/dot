@@ -119,6 +119,29 @@ fn read_umask_observes_the_inherited_process_mask() {
     assert!(command.status().unwrap().success());
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn reading_umask_never_changes_concurrent_creation_modes() {
+    let dir = TempDir::new("umask-concurrency").unwrap();
+    let mask = temp::read_umask().unwrap();
+    let expected = 0o777 & !mask;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let reader_barrier = barrier.clone();
+    let reader = std::thread::spawn(move || {
+        reader_barrier.wait();
+        for _ in 0..5_000 {
+            assert_eq!(temp::read_umask().unwrap(), mask);
+        }
+    });
+    barrier.wait();
+    for index in 0..5_000 {
+        let path = dir.path().join(format!("entry-{index}"));
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(mode(&path) & 0o777, expected, "entry {index}");
+    }
+    reader.join().unwrap();
+}
+
 #[test]
 fn git_digests_equality_and_hash_pair_contracts_are_byte_exact() {
     let dir = TempDir::new("temp-digest").unwrap();

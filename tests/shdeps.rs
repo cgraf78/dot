@@ -155,7 +155,7 @@ fn stage_mode(root: &Path, name: &str, mode: u32) -> PathBuf {
 }
 
 #[test]
-fn path_ownership_rejects_writable_links_missing_and_foreign_entries() {
+fn path_ownership_matches_host_link_modes_and_rejects_unsafe_entries() {
     let home = TempDir::new("shdeps-owned").expect("fixture directory");
     let euid = dot::temp::current_uid().expect("uid");
     let clean = stage_mode(home.path(), "clean", 0o644);
@@ -171,6 +171,11 @@ fn path_ownership_rejects_writable_links_missing_and_foreign_entries() {
     std::os::unix::fs::symlink(&group, &link_group).expect("symlink");
     let dangling = home.path().join("dangling");
     std::os::unix::fs::symlink(home.path().join("nowhere"), &dangling).expect("symlink");
+    // BSD `stat -f %Lp` reports owner-only link modes while GNU
+    // `stat -c %a` reports 0777. The native predicate deliberately
+    // follows that host metadata, like the retired shell engine; the
+    // enclosing checkout trust gate rejects links independently.
+    let link_owned = cfg!(target_os = "macos");
     for (label, path, expected) in [
         ("clean", clean.clone(), true),
         ("locked", locked, true),
@@ -178,9 +183,9 @@ fn path_ownership_rejects_writable_links_missing_and_foreign_entries() {
         ("other-writable", other, false),
         ("missing", home.path().join("missing"), false),
         ("directory", directory, true),
-        ("clean symlink", link_clean, false),
-        ("writable symlink", link_group, false),
-        ("dangling symlink", dangling, false),
+        ("clean symlink", link_clean, link_owned),
+        ("writable symlink", link_group, link_owned),
+        ("dangling symlink", dangling, link_owned),
     ] {
         assert_eq!(dot::shdeps::path_owned(&path, euid), expected, "{label}");
     }
