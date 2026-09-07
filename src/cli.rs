@@ -51,11 +51,9 @@ fn argv_bytes(arg: &OsString) -> Vec<u8> {
     arg.to_string_lossy().into_owned().into_bytes()
 }
 
-/// Exact bytes of the shell `dot_help` heredoc, including trailing newline.
-///
-/// Exact bytes of the shell `dot_help` heredoc. One literal per line:
+/// Exact help bytes, including the trailing newline. One literal per line:
 /// a `\`-continued literal would strip the two-space command indent.
-/// Pinned by `tests/cli.rs` against `lib/dot/main.sh`.
+/// Pinned directly by `tests/cli.rs`.
 pub const HELP: &str = concat!(
     "usage: dot <command> [<args>]\n",
     "\n",
@@ -75,7 +73,7 @@ pub const HELP: &str = concat!(
     "Run `dot init --help` for initialization and recovery syntax.\n",
 );
 
-/// Shell exit-code contract (`lib/dot/commands.sh`, `lib/dot/main.sh`):
+/// Public process exit-code contract:
 /// `0` success, `1` error/unknown command, `2` usage/config failure,
 /// `75` lock busy. Numeric codes cross the process boundary into
 /// scripts and CI gates, so they are named constants — never inline
@@ -89,7 +87,7 @@ pub const EXIT_ERROR: i32 = 1;
 /// Named so the startup gate shares one value with later usage errors.
 pub const EXIT_USAGE: i32 = 2;
 
-/// `dot_command_dispatch` decision (`lib/dot/commands.sh`).
+/// Command dispatch decision.
 ///
 /// One variant per shell `case` arm. Each variant names the kernel that
 /// executes it plus the shell's exit-code contract. The headline
@@ -97,8 +95,8 @@ pub const EXIT_USAGE: i32 = 2;
 /// `update`/`fetch`/`push`/`status`/`diff`/`doctor`/`init`/`cron` ignore
 /// their kernels' statuses and succeed whenever setup does; only the
 /// early `return` sites (lock/resolve failures) and `test` (which
-/// records `rc=$?`) propagate nonzero codes. Pinned differentially in
-/// `tests/cli.rs` against the live shell with stubbed kernels.
+/// records its runner status) propagate nonzero codes. Pinned directly in
+/// `tests/cli.rs` with stubbed kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     /// `update`, plus `pull` (the shell recurses into the `update`
