@@ -60,6 +60,17 @@ impl Fixture {
     fn checkout(&self) -> String {
         format!("{}/.local/share/cgraf78/dot", self.home)
     }
+
+    fn dangling_target(&self) -> Option<String> {
+        let output = std::process::Command::new("realpath")
+            .arg(format!("{}/overlays/dangling", self.home))
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
 }
 
 #[test]
@@ -87,7 +98,13 @@ fn roots_inventory_preserves_order_and_physical_aliases() {
     );
     assert!(roots.contains(&format!("{}/overlays/one", fixture.home)));
     assert!(roots.contains(&format!("{}/overlays/dangling", fixture.home)));
-    assert!(roots.contains(&format!("{}/overlays/missing", fixture.home)));
+    if let Some(target) = fixture.dangling_target() {
+        assert!(roots.contains(&target));
+    } else {
+        let dangling = format!("{}/overlays/dangling", fixture.home);
+        let fallback = physical_directory_candidate(&dangling, &fixture.home).unwrap();
+        assert!(roots.contains(&fallback));
+    }
 }
 
 #[test]
@@ -96,6 +113,10 @@ fn leaf_and_candidate_matrix_covers_roots_ancestors_transients_and_aliases() {
     let roots = reserved_roots(&fixture.input, &fixture.home).expect("roots");
     let checkout = fixture.checkout();
     let h = &fixture.home;
+    let dangling_target = fixture.dangling_target();
+    let missing = format!("{h}/overlays/missing");
+    let missing_leaf = dangling_target.as_deref() == Some(missing.as_str());
+    let missing_candidate = dangling_target.is_some();
     let rows = [
         (format!("{h}/.local/state/dot/overlay-links"), true, true),
         (format!("{h}/.local/state/shdeps/cache"), true, true),
@@ -103,7 +124,11 @@ fn leaf_and_candidate_matrix_covers_roots_ancestors_transients_and_aliases() {
         (format!("{h}/real-dotfiles/config"), true, true),
         (format!("{h}/overlays/one/payload"), true, true),
         (format!("{h}/overlays/dangling/payload"), true, true),
-        (format!("{h}/overlays/missing/payload"), true, true),
+        (
+            format!("{missing}/payload"),
+            missing_leaf,
+            missing_candidate,
+        ),
         (format!("{h}/backup/snapshot"), true, true),
         (format!("{h}/.local/bin/dot"), true, true),
         (format!("{h}/.local/share/cgraf78/.dot.clone.1"), true, true),

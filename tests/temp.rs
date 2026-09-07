@@ -507,10 +507,12 @@ fn committed_content_survives_cleanup_failure_and_next_capture_retries_cleanup()
         &mut cache,
     )
     .unwrap();
-    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let unexpected = prepared.transaction.join("unexpected");
+    std::fs::write(&unexpected, b"invalid transaction entry\n").unwrap();
     assert!(temp::transaction_cleanup(&prepared.transaction, &mut cache).is_err());
     assert_eq!(std::fs::read(&dst).unwrap(), b"cleanup retry\n");
-    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(prepared.transaction.is_dir());
+    std::fs::remove_file(unexpected).unwrap();
     temp::file_generation(dir.path(), lock(), &dst, &mut cache).unwrap();
     assert_eq!(std::fs::read(&dst).unwrap(), b"cleanup retry\n");
     assert!(!prepared.transaction.exists());
@@ -535,13 +537,12 @@ fn generation_rejects_unmarked_or_nonprivate_transaction_directories_in_place() 
 }
 
 #[test]
-fn private_transaction_setup_failure_preserves_inputs_without_debris() {
+fn rejected_transaction_setup_preserves_inputs_without_debris() {
     let dir = TempDir::new("temp-private-setup-failure").unwrap();
     let parent = dir.path().join("home");
     let dst = file(&parent, "app.conf", b"managed\n", 0o644);
-    let source = file(&parent, "candidate", b"candidate\n", 0o600);
+    let source = file(dir.path(), "staging/candidate", b"candidate\n", 0o600);
     let token = temp::file_generation_raw(dir.path(), &dst).unwrap();
-    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
     let result = temp::commit_tmp_if_generation(
         dir.path(),
         lock(),
@@ -550,7 +551,6 @@ fn private_transaction_setup_failure_preserves_inputs_without_debris() {
         &token,
         &mut MoveCache::default(),
     );
-    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(result.is_err());
     assert_eq!(std::fs::read(&dst).unwrap(), b"managed\n");
     assert_eq!(std::fs::read(&source).unwrap(), b"candidate\n");
@@ -559,12 +559,10 @@ fn private_transaction_setup_failure_preserves_inputs_without_debris() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     entries.sort();
+    assert_eq!(entries, vec![OsStr::new("app.conf").to_os_string()]);
     assert_eq!(
-        entries,
-        vec![
-            OsStr::new("app.conf").to_os_string(),
-            OsStr::new("candidate").to_os_string(),
-        ]
+        std::fs::read_dir(source.parent().unwrap()).unwrap().count(),
+        1
     );
 }
 
