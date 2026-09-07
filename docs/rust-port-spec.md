@@ -53,7 +53,7 @@ Measured on the reference host; enforced by `tests/perf_budget.rs`
 
 | Operation | Shell baseline (warm) | Rust budget (p95) | Rust expected |
 |---|---|---|---|
-| `help` | ~18ms (parse+probes) | 25ms | ~2-5ms |
+| `help` | ~18ms (parse+probes) | 25ms (30ms on macOS) | ~2-5ms |
 | `version` | ~26ms (incl. one `git rev-parse` fork; Rust bakes the revision, no fork) | 30ms | ~2-5ms |
 
 Budgets are CI-variance ceilings, not targets: the port must beat them
