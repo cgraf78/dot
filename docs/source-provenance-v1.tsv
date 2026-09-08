@@ -160,3 +160,4 @@ tests/shdeps_ui.rs	standalone:new
 tests/init_client_entry.rs	standalone:new
 tests/init_client_candidate.rs	standalone:new
 tests/init_client_records.rs	standalone:new
+tests/doctor_records.rs	standalone:new
