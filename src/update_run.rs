@@ -122,15 +122,22 @@ fn is_cron(args: &[OsString]) -> bool {
 /// lock natively, execute the engine adapter, release the lock, and
 /// report the engine's exit code (`0` on success).
 ///
-/// `command` names the invoked spelling for `DOT_ORIGINAL_ARGV`;
-/// `args` is the residue after it. The adapter receives all command
-/// environment changes explicitly, so concurrent callers cannot
-/// observe a half-applied update.
+/// Original command spelling and its residue. Keeping argv together prevents
+/// lock/stream orchestration from growing a positional parameter list.
+pub struct Request<'a> {
+    /// Invoked spelling for `DOT_ORIGINAL_ARGV`.
+    pub command: &'a [u8],
+    /// Residue after the command.
+    pub args: &'a [OsString],
+}
+
+/// The adapter receives all command environment changes explicitly, so
+/// concurrent callers cannot observe a half-applied update.
 pub fn run(
     runtime: &crate::app::Runtime,
+    config: &crate::config::Config,
     env: &BTreeMap<OsString, OsString>,
-    command: &[u8],
-    args: &[OsString],
+    request: Request<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     failed: &mut bool,
@@ -157,7 +164,7 @@ pub fn run(
         .get(OsStr::new("DOT_UPDATE_LOCK_TOKEN"))
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty());
-    let guard = match update_lock::acquire(&state, is_cron(args), &log, prior, stderr) {
+    let guard = match update_lock::acquire(&state, is_cron(request.args), &log, prior, stderr) {
         Ok(guard) => guard,
         Err(Error::LockBusy { .. }) => return update_lock::EXIT_LOCK_BUSY,
         Err(_) => return crate::cli::EXIT_ERROR,
@@ -170,10 +177,18 @@ pub fn run(
     );
     let context = UpdateContext {
         runtime,
+        config,
         state: &state,
         env: &child_env,
     };
-    let code = run_update_or_engine(&context, command, args, stdout, stderr, failed);
+    let code = run_update_or_engine(
+        &context,
+        request.command,
+        request.args,
+        stdout,
+        stderr,
+        failed,
+    );
     // Explicit verified release (never silent removal of a lock that
     // no longer names us): removal failures warn through `log` into
     // stderr, like the shell's EXIT-trap release.
@@ -189,6 +204,7 @@ pub fn run(
 /// never changes silently.
 struct UpdateContext<'a> {
     runtime: &'a crate::app::Runtime,
+    config: &'a crate::config::Config,
     state: &'a Path,
     env: &'a BTreeMap<OsString, OsString>,
 }
@@ -210,6 +226,8 @@ fn run_update_or_engine(
         if let Some(state_home) = context.state.to_str() {
             match crate::update_engine::gather(
                 args,
+                context.runtime,
+                context.config,
                 context.runtime.source_root(),
                 state_home,
                 context.env,

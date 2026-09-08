@@ -16,8 +16,6 @@
 //! native only inside a conservative envelope, and the caller
 //! falls back to the shell adapter outside it:
 //!
-//! - A `profiles.d` directory stays shell (the two-phase profile
-//!   converge has no native port yet).
 //! - `DOT_DEPENDENCY_PROVIDER=shdeps` stays shell (ensure plus the
 //!   updater UI have no native ports yet; `none` runs natively).
 //! - A non-empty `merge-hooks.d` stays shell (the merge driver has
@@ -28,7 +26,7 @@
 //! the invocation; the caller runs the shell adapter for every
 //! declined case.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
@@ -56,6 +54,10 @@ pub struct UpdateFlags {
 /// shell `_dot_update` tree reads, plus the UI/logger handles the
 /// pull and link lanes thread the same way.
 pub struct EngineInputs<'a> {
+    /// Immutable process boundary for leaf workers launched during this update.
+    pub runtime: &'a crate::app::Runtime,
+    /// Parsed client configuration for this update generation.
+    pub config: &'a crate::config::Config,
     /// Parsed flags.
     pub flags: UpdateFlags,
     /// Residue after flags (forwarded to the pull phases).
@@ -128,12 +130,8 @@ pub struct EngineInputs<'a> {
 /// adapter instead). Every reason names the missing native port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fallback {
-    /// `profiles.d` exists: two-phase profile converge is shell-only.
-    Profiles,
     /// Present `merge-hooks.d`: the merge runner is shell-only.
     MergeHooks,
-    /// Present `pre-sync.d`: the reconcile runner is shell-only.
-    PreSyncHooks,
     /// `DOT_DEPENDENCY_PROVIDER` is not `none`: ensure plus the
     /// updater UI are shell-only (anything but `none` also covers
     /// the shell's `shdeps unavailable` close).
@@ -149,33 +147,16 @@ pub enum Fallback {
 /// Native envelope check for one run: `Ok(())` runs
 /// [`run_update`], `Err(reason)` runs the shell adapter.
 pub fn should_go_native(inputs: &EngineInputs<'_>) -> Result<(), Fallback> {
-    if profiles_present(inputs.config_home) {
-        return Err(Fallback::Profiles);
-    }
     if inputs.provider != "none" {
         return Err(Fallback::ShdepsProvider);
     }
     if has_hook_dir(inputs.extensions_dir, "merge-hooks.d") {
         return Err(Fallback::MergeHooks);
     }
-    if has_hook_dir(inputs.extensions_dir, "pre-sync.d") {
-        return Err(Fallback::PreSyncHooks);
-    }
     if has_hook_dir(inputs.home, ".config/dot/merges") {
         return Err(Fallback::MergesPresent);
     }
     Ok(())
-}
-
-/// `profiles.d` presence: `_dot_profiles_load_default` sets
-/// `DOT_PROFILES_PRESENT=1` exactly when `$config/dot/profiles.d`
-/// exists (any type; the directory check errors later).
-fn profiles_present(config_home: &str) -> bool {
-    if config_home.is_empty() {
-        return false;
-    }
-    let dir = Path::new(config_home).join("dot/profiles.d");
-    std::fs::symlink_metadata(&dir).is_ok()
 }
 
 /// Hook directory presence: `_merge_hook_specs` and
@@ -303,8 +284,79 @@ pub struct SyncDone {
     pub rc: i32,
     /// `DOT_OVERLAY_LINKS_FROZEN=1` on the way out.
     pub frozen: bool,
-    /// Active `OVERLAYS` for the link phase.
-    pub entries: Vec<String>,
+    /// One owner for the generation resolved during repository sync.
+    state: UpdateState,
+}
+
+/// Profile-aware update data that must survive from repository sync through
+/// linking, retirement, and ledger commit.
+///
+/// The shell stores these values in globals that are reset by each discovery
+/// pass. Keeping them together makes the two-phase boundary explicit: base
+/// policy selects phase one, a refreshed base resolves selectors, and only the
+/// final set reaches lifecycle hooks and the link phase.
+#[derive(Debug)]
+struct UpdateState {
+    /// Configuration reloaded after the accepted base generation.
+    config: crate::config::Config,
+    /// Profile parsing and selector result for this generation.
+    profiles: crate::profiles::State,
+    /// Names selected by the final profile expansion.
+    selected: Vec<String>,
+    /// Final eligible overlay records.
+    eligible: Vec<String>,
+    /// Final active overlay records, used for links and cleanup.
+    active: Vec<String>,
+    /// Ledger records loaded before lifecycle preparation.
+    prior: Vec<String>,
+    /// Prepared ledger records retained through retirement and commit.
+    retained: Vec<String>,
+    /// Active records from the base-only discovery pass.
+    phase_one: Vec<String>,
+    /// Overlay identities from the base-only pass, used to isolate additions.
+    /// Descriptor changes do not make an already-pulled overlay an addition.
+    phase_one_names: BTreeSet<String>,
+}
+
+/// Mutable update streams shared by the sync, converge, and finalize phases.
+/// Keeping the paired streams together prevents orchestration signatures from
+/// growing a positional stdout/stderr tail.
+struct UpdateIo<'a> {
+    out: &'a mut Vec<u8>,
+    err: &'a mut Vec<u8>,
+}
+
+impl UpdateState {
+    fn new(config: crate::config::Config) -> Self {
+        Self {
+            config,
+            profiles: crate::profiles::State::default(),
+            selected: Vec::new(),
+            eligible: Vec::new(),
+            active: Vec::new(),
+            prior: Vec::new(),
+            retained: Vec::new(),
+            phase_one: Vec::new(),
+            phase_one_names: BTreeSet::new(),
+        }
+    }
+
+    /// Publish exactly one discovery pass. Callers preserve `phase_one` before
+    /// the selector refresh and overwrite the remaining records only after the
+    /// final discovery, matching the shell's resettable global arrays.
+    fn capture(&mut self, overlays: &crate::overlays::State) {
+        self.selected = overlays.selected.clone();
+        self.eligible = overlays.eligible.clone();
+        self.active = overlays.active.clone();
+    }
+
+    fn ledger(&self, inputs: &EngineInputs<'_>) -> std::path::PathBuf {
+        Path::new(inputs.state_home).join("dot/profile-overlay-lifecycle-v1")
+    }
+
+    fn extensions_enabled(&self) -> bool {
+        crate::config::extensions_enabled(&self.config)
+    }
 }
 
 /// Combined repo counts behind one deferred stage close: the base
@@ -406,7 +458,7 @@ impl Agg {
 /// deferred close. The close itself renders once in [`sync_tail`].
 struct ConvergeOut {
     rc: i32,
-    entries: Vec<String>,
+    state: UpdateState,
     overlay: Agg,
 }
 
@@ -515,6 +567,7 @@ pub fn sync_repos(
         crate::repos_config::ensure_repo_config(None);
         return sync_tail(
             inputs,
+            UpdateState::new(inputs.config.clone()),
             stage,
             moves,
             out,
@@ -535,7 +588,7 @@ pub fn sync_repos(
             return SyncDone {
                 rc: 1,
                 frozen: true,
-                entries: Vec::new(),
+                state: UpdateState::new(inputs.config.clone()),
             };
         }
     };
@@ -575,27 +628,31 @@ pub fn sync_repos(
         return SyncDone {
             rc: 1,
             frozen: true,
-            entries: Vec::new(),
+            state: UpdateState::new(inputs.config.clone()),
         };
     }
     // A base pull may replace policy: reload before either phase
     // resolves or any transport preparation runs (the loader
     // prints its own diagnostic on failure).
     let startup = startup_inputs(inputs);
-    if let Err(failure) = crate::startup::preflight(&startup) {
-        err.extend_from_slice(failure.line().as_bytes());
-        err.push(b'\n');
-        let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose, now_secs);
-        let _ = out.write_all(&close);
-        restore_generation(inputs, base, &snapshot, &[], err);
-        return SyncDone {
-            rc: 1,
-            frozen: true,
-            entries: Vec::new(),
-        };
-    }
+    let config = match crate::startup::preflight(&startup) {
+        Ok(config) => config,
+        Err(failure) => {
+            err.extend_from_slice(failure.line().as_bytes());
+            err.push(b'\n');
+            let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose, now_secs);
+            let _ = out.write_all(&close);
+            restore_generation(inputs, base, &snapshot, &[], err);
+            return SyncDone {
+                rc: 1,
+                frozen: true,
+                state: UpdateState::new(inputs.config.clone()),
+            };
+        }
+    };
     sync_tail(
         inputs,
+        UpdateState::new(config),
         stage,
         moves,
         out,
@@ -619,6 +676,7 @@ pub fn sync_repos(
 #[allow(clippy::too_many_arguments)]
 fn sync_tail(
     inputs: &EngineInputs<'_>,
+    state: UpdateState,
     stage: &mut Stage,
     moves: &mut crate::temp::MoveCache,
     out: &mut Vec<u8>,
@@ -630,62 +688,67 @@ fn sync_tail(
     close_active: bool,
 ) -> SyncDone {
     use std::io::Write as _;
-    let conv = converge_overlays(inputs, stage, moves, out, err, now_secs, base.is_some());
+    let mut io = UpdateIo { out, err };
+    let mut conv = converge_overlays(inputs, state, stage, moves, &mut io, now_secs);
     agg.fold_agg(&conv.overlay);
     if conv.rc != 0 {
         if close_active {
             let close = agg.close(stage, "1", inputs.dot_verbose, now_secs);
-            let _ = out.write_all(&close);
+            let _ = io.out.write_all(&close);
         }
         if let (Some(base), Some(snapshot)) = (base, snapshot.as_ref()) {
-            restore_generation(inputs, base, snapshot, &conv.entries, err);
+            restore_generation(inputs, base, snapshot, &conv.state.active, io.err);
         }
         return SyncDone {
             rc: 1,
             frozen: true,
-            entries: conv.entries,
+            state: conv.state,
         };
     }
-    // Lifecycle prepare records the post-converge set; without
-    // profiles it keeps `prior` and succeeds (the shell returns
-    // before touching the ledger).
+    // Lifecycle preparation owns the freshly resolved profile state, not the
+    // invocation's pre-pull config. Its retained records must be the same
+    // values later handed to retirement and commit.
+    let ledger = conv.state.ledger(inputs);
     let prepared = crate::profile_lifecycle::prepare(
         &crate::profile_lifecycle::PrepareInputs {
-            present: false,
-            extensions_enabled: false,
-            eligible: &[],
-            phase_one: &[],
-            active: &[],
-            prior: &[],
-            ledger: None,
+            present: conv.state.profiles.present,
+            extensions_enabled: conv.state.extensions_enabled(),
+            eligible: &conv.state.eligible,
+            phase_one: &conv.state.phase_one,
+            active: &conv.state.active,
+            prior: &conv.state.prior,
+            ledger: Some(&ledger),
             home: inputs.home,
             euid: inputs.euid,
             log: inputs.log,
         },
-        err,
+        io.err,
     );
-    if !prepared.succeeded {
+    let prepared_ok = prepared.succeeded;
+    conv.state.prior = prepared.prior;
+    conv.state.retained = prepared.records;
+    if !prepared_ok {
         if close_active {
             let close = agg.close(stage, "1", inputs.dot_verbose, now_secs);
-            let _ = out.write_all(&close);
+            let _ = io.out.write_all(&close);
         }
         if let (Some(base), Some(snapshot)) = (base, snapshot.as_ref()) {
-            restore_generation(inputs, base, snapshot, &conv.entries, err);
+            restore_generation(inputs, base, snapshot, &conv.state.active, io.err);
         }
         return SyncDone {
             rc: 1,
             frozen: true,
-            entries: conv.entries,
+            state: conv.state,
         };
     }
     if close_active {
         let close = agg.close(stage, "0", inputs.dot_verbose, now_secs);
-        let _ = out.write_all(&close);
+        let _ = io.out.write_all(&close);
     }
     SyncDone {
         rc: 0,
         frozen: false,
-        entries: conv.entries,
+        state: conv.state,
     }
 }
 
@@ -754,45 +817,70 @@ fn pull_overlays_only(
     )
 }
 
-/// `_dot_converge_overlays` for the profiles-absent envelope:
-/// discover, preflight, pre-sync reconcile, the eligible pull
-/// phase, rediscovery, and the active set. The shell always
+/// `_dot_converge_overlays` before profile selection: discover,
+/// preflight, pre-sync reconcile, the eligible pull phase,
+/// rediscovery, and the active set. Profile-aware runs hand off to
+/// [`converge_profiles`] after loading policy. The shell always
 /// rediscovers before returning, even on a failed phase. The
 /// deferred close renders once in [`sync_tail`], so this only
 /// reports the phase status, the current set, and the overlay
 /// counts.
 fn converge_overlays(
     inputs: &EngineInputs<'_>,
+    mut update: UpdateState,
     stage: &mut Stage,
     moves: &mut crate::temp::MoveCache,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
+    io: &mut UpdateIo<'_>,
     now_secs: i64,
-    based: bool,
 ) -> ConvergeOut {
     use std::io::Write as _;
-    let fail = |entries: Vec<String>, overlay: Agg| ConvergeOut {
+    let fail = |state: UpdateState, overlay: Agg| ConvergeOut {
         rc: 1,
-        entries,
+        state,
         overlay,
     };
     let mut overlay = Agg::zero();
-    let mut dstate = crate::overlays::State::default();
-    if discover_active(inputs, &mut dstate, err).is_err() {
-        return fail(Vec::new(), overlay);
+    if let Err(error) = update.profiles.load_default(
+        inputs.config_home,
+        inputs.home,
+        Some(&update.config.default_profile),
+    ) {
+        io.err
+            .extend_from_slice(format!("dot: profile: {}\n", error.message).as_bytes());
+        return fail(update, overlay);
     }
-    let mut entries = use_set(&mut dstate, "eligible");
+    if update.profiles.present {
+        return converge_profiles(inputs, stage, moves, io, now_secs, update, overlay);
+    }
+    let mut dstate = crate::overlays::State::default();
+    if discover_active(inputs, &mut dstate, io.err).is_err() {
+        return fail(update, overlay);
+    }
+    let entries = use_set(&mut dstate, "eligible");
+    update.capture(&dstate);
     let mut preflight_state = crate::overlays::State {
         overlays: entries.clone(),
         ..Default::default()
     };
     if let Err(warning) = crate::overlays::preflight(&mut preflight_state, inputs.home) {
-        err.extend_from_slice(warning.as_bytes());
-        err.push(b'\n');
-        return fail(entries, overlay);
+        io.err.extend_from_slice(warning.as_bytes());
+        io.err.push(b'\n');
+        update.active = entries;
+        return fail(update, overlay);
     }
-    if pre_sync_empty(inputs, &entries).is_err() {
-        return fail(entries, overlay);
+    if pre_sync(
+        inputs,
+        update.config.extensions_dir.as_deref(),
+        &entries,
+        "reconcile",
+        now_secs,
+        io.out,
+        io.err,
+    )
+    .is_err()
+    {
+        update.active = entries;
+        return fail(update, overlay);
     }
     // The eligible pull phase: the shell bumps `DONE` past the
     // base row first (a fresh process starts at zero without
@@ -808,7 +896,9 @@ fn converge_overlays(
             inputs.ascii,
             inputs.multibyte,
         );
-        let _ = out.write_all(&stage.update(&detail, now_secs, inputs.dot_verbose));
+        let _ = io
+            .out
+            .write_all(&stage.update(&detail, now_secs, inputs.dot_verbose));
     }
     let candidate = pull_candidate(inputs, &entries);
     let outcome = pull_overlays_only(
@@ -818,23 +908,241 @@ fn converge_overlays(
         &candidate,
         inputs.base.filter(|found| found.exists()),
         &entries,
-        out,
-        err,
-        if based { "1" } else { "0" },
+        io.out,
+        io.err,
+        if inputs.base.is_some_and(|base| base.exists()) {
+            "1"
+        } else {
+            "0"
+        },
         &(1 + count).to_string(),
     );
     overlay.fold_overlay(&outcome);
     let failed = outcome.tally.failed;
     let phase_ok = crate::update::overlay_phase_ok(outcome.rc, Some(&failed.to_string()));
     // Rediscover before returning, even on a failed phase.
-    if discover_active(inputs, &mut dstate, err).is_err() {
-        return fail(entries, overlay);
+    if discover_active(inputs, &mut dstate, io.err).is_err() {
+        update.active = entries;
+        return fail(update, overlay);
     }
-    entries = use_set(&mut dstate, "active");
+    let _ = use_set(&mut dstate, "active");
+    update.capture(&dstate);
     ConvergeOut {
         rc: if phase_ok { 0 } else { 1 },
-        entries,
+        state: update,
         overlay,
+    }
+}
+
+/// Two-phase profile convergence. Phase one deliberately sees only `base`;
+/// selector resolution waits until those repositories are refreshed, so a
+/// personal selector added by the base pull cannot influence its own fetch.
+fn converge_profiles(
+    inputs: &EngineInputs<'_>,
+    stage: &mut Stage,
+    moves: &mut crate::temp::MoveCache,
+    io: &mut UpdateIo<'_>,
+    now_secs: i64,
+    mut update: UpdateState,
+    mut overlay: Agg,
+) -> ConvergeOut {
+    use std::io::Write as _;
+    let fail = |state: UpdateState, overlay: Agg| ConvergeOut {
+        rc: 1,
+        state,
+        overlay,
+    };
+    if let Err(error) = update.profiles.select_base() {
+        io.err
+            .extend_from_slice(format!("dot: profile: {}\n", error.message).as_bytes());
+        return fail(update, overlay);
+    }
+    let mut state = crate::overlays::State::default();
+    if discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err).is_err() {
+        return fail(update, overlay);
+    }
+    update.phase_one_names = state
+        .eligible
+        .iter()
+        .filter_map(|record| record_name(record).map(str::to_owned))
+        .collect();
+    update.phase_one = state.active.clone();
+    update.capture(&state);
+    let mut entries = use_set(&mut state, "eligible");
+    let mut preflight_state = crate::overlays::State {
+        overlays: entries.clone(),
+        ..Default::default()
+    };
+    if let Err(warning) = crate::overlays::preflight(&mut preflight_state, inputs.home) {
+        io.err.extend_from_slice(warning.as_bytes());
+        io.err.push(b'\n');
+        update.active = entries;
+        return fail(update, overlay);
+    }
+    if pre_sync(
+        inputs,
+        update.config.extensions_dir.as_deref(),
+        &entries,
+        "prepare",
+        now_secs,
+        io.out,
+        io.err,
+    )
+    .is_err()
+    {
+        update.active = entries;
+        return fail(update, overlay);
+    }
+    let count = pull_overlay_count(&entries);
+    if count > 0 {
+        let detail = crate::progress_ui::progress_detail(
+            b"overlays",
+            2,
+            1 + count,
+            inputs.bar_width,
+            inputs.ascii,
+            inputs.multibyte,
+        );
+        let _ = io
+            .out
+            .write_all(&stage.update(&detail, now_secs, inputs.dot_verbose));
+    }
+    let candidate = pull_candidate(inputs, &entries);
+    let outcome = pull_overlays_only(
+        inputs,
+        stage,
+        moves,
+        &candidate,
+        inputs.base.filter(|found| found.exists()),
+        &entries,
+        io.out,
+        io.err,
+        if inputs.base.is_some_and(|base| base.exists()) {
+            "1"
+        } else {
+            "0"
+        },
+        &(1 + count).to_string(),
+    );
+    overlay.fold_overlay(&outcome);
+    let phase_ok =
+        crate::update::overlay_phase_ok(outcome.rc, Some(&outcome.tally.failed.to_string()));
+    // Shell re-discovers the phase-one state even after a failed pull.
+    if discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err).is_err() {
+        update.active = entries;
+        return fail(update, overlay);
+    }
+    let phase_one_active = state.active.clone();
+    update.phase_one = phase_one_active.clone();
+    update.capture(&state);
+    if !phase_ok {
+        let _ = use_set(&mut state, "active");
+        update.capture(&state);
+        return fail(update, overlay);
+    }
+    let user = match crate::profiles::current_user() {
+        Some(user) => user,
+        None => {
+            io.err
+                .extend_from_slice(b"dot: profile: cannot determine current user\n");
+            update.active = entries;
+            return fail(update, overlay);
+        }
+    };
+    let host = match crate::platform::detect_host() {
+        Ok(host) => host,
+        Err(_) => {
+            io.err
+                .extend_from_slice(b"dot: profile: cannot determine current short hostname\n");
+            update.active = entries;
+            return fail(update, overlay);
+        }
+    };
+    let phase_refs: Vec<&str> = phase_one_active.iter().map(String::as_str).collect();
+    if let Err(error) = update.profiles.resolve_default(
+        inputs.config_home,
+        inputs.home,
+        &phase_refs,
+        &user,
+        &host,
+        inputs.euid,
+    ) {
+        io.err
+            .extend_from_slice(format!("dot: profile: {}\n", error.message).as_bytes());
+        update.active = entries;
+        return fail(update, overlay);
+    }
+    if discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err).is_err() {
+        update.active = entries;
+        return fail(update, overlay);
+    }
+    entries = use_set(&mut state, "eligible");
+    update.capture(&state);
+    let mut preflight_state = crate::overlays::State {
+        overlays: entries.clone(),
+        ..Default::default()
+    };
+    if let Err(warning) = crate::overlays::preflight(&mut preflight_state, inputs.home) {
+        io.err.extend_from_slice(warning.as_bytes());
+        io.err.push(b'\n');
+        update.active = entries;
+        return fail(update, overlay);
+    }
+    if pre_sync(
+        inputs,
+        update.config.extensions_dir.as_deref(),
+        &entries,
+        "reconcile",
+        now_secs,
+        io.out,
+        io.err,
+    )
+    .is_err()
+    {
+        update.active = entries;
+        return fail(update, overlay);
+    }
+    let additions: Vec<String> = entries
+        .iter()
+        .filter(|record| {
+            !record_name(record).is_some_and(|name| update.phase_one_names.contains(name))
+        })
+        .cloned()
+        .collect();
+    let candidate = pull_candidate(inputs, &additions);
+    let outcome = pull_overlays_only(
+        inputs,
+        stage,
+        moves,
+        &candidate,
+        inputs.base.filter(|found| found.exists()),
+        &additions,
+        io.out,
+        io.err,
+        if inputs.base.is_some_and(|base| base.exists()) {
+            "1"
+        } else {
+            "0"
+        },
+        &(1 + pull_overlay_count(&additions)).to_string(),
+    );
+    overlay.fold_overlay(&outcome);
+    let additions_ok =
+        crate::update::overlay_phase_ok(outcome.rc, Some(&outcome.tally.failed.to_string()));
+    if discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err).is_err() {
+        update.active = entries;
+        return fail(update, overlay);
+    }
+    let _ = use_set(&mut state, "active");
+    update.capture(&state);
+    if additions_ok {
+        ConvergeOut {
+            rc: 0,
+            state: update,
+            overlay,
+        }
+    } else {
+        fail(update, overlay)
     }
 }
 
@@ -845,8 +1153,7 @@ fn use_set(state: &mut crate::overlays::State, kind: &str) -> Vec<String> {
     state.overlays.clone()
 }
 
-/// Run `_discover_overlays` natively (legacy path; profiles stay
-/// shell-backed through [`should_go_native`]).
+/// Run `_discover_overlays` natively for the profiles-absent branch.
 fn discover_active(
     inputs: &EngineInputs<'_>,
     state: &mut crate::overlays::State,
@@ -887,41 +1194,113 @@ fn discover_active(
     }
 }
 
-/// Pre-sync reconcile gate: empty specs run nothing (the envelope
-/// guarantees no `pre-sync.d`; a listing failure still fails).
-fn pre_sync_empty(inputs: &EngineInputs<'_>, eligible: &[String]) -> Result<(), ()> {
-    let trust = crate::extension_trust::Inputs {
-        euid: inputs.euid,
-        home: inputs.home.to_string(),
-        extensions_dir: inputs.extensions_dir.to_string(),
-        manifest: inputs.manifest.to_string(),
-        retiring_root: String::new(),
+/// Profile-aware discovery with a caller-owned selected list. The discovery
+/// kernel still owns descriptor parsing, eligibility, active-state and its
+/// diagnostics; this driver owns only which phase supplies the names.
+fn discover_selected(
+    inputs: &EngineInputs<'_>,
+    state: &mut crate::overlays::State,
+    selected: &[String],
+    err: &mut Vec<u8>,
+) -> Result<(), ()> {
+    let xdg_config = inputs.config_home.to_string();
+    let conf_dir = crate::overlays::conf_dir(&xdg_config, inputs.home);
+    let conf_path = match conf_dir {
+        Some(dir) if Path::new(&dir).is_dir() => dir,
+        _ => return Ok(()),
     };
-    match crate::pre_sync::specs(&trust, eligible) {
-        Ok(found) if found.is_empty() => Ok(()),
-        Ok(_) => Err(()),
-        Err(_) => Err(()),
+    let platform = crate::platform::detect_platform().ok();
+    let host = crate::platform::detect_host().ok();
+    let matches = crate::overlays::MatchInputs {
+        platform: platform.clone(),
+        termux: crate::hook_api::is_termux(inputs.prefix),
+        host: host.clone(),
+    };
+    let discover_inputs = crate::overlays::Inputs {
+        home: inputs.home.to_string(),
+        xdg_config,
+        discovery_silent: false,
+        profiles_present: true,
+        selected: selected.to_vec(),
+        platform,
+        termux: crate::hook_api::is_termux(inputs.prefix),
+        host,
+        euid: inputs.euid,
+    };
+    match crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            err.extend_from_slice(format!("{error}\n").as_bytes());
+            Err(())
+        }
     }
 }
 
-/// Null lifecycle worker: retire short-circuits before running
-/// anything without profiles, but the trait object still travels.
-struct NullWorker;
-
-impl crate::profile_lifecycle::WorkerRun for NullWorker {
-    fn run(
-        &mut self,
-        _script: &Path,
-        _result_dir: &Path,
-        _result_file: &Path,
-        _context: &Path,
-        _token: &str,
-    ) -> crate::profile_lifecycle::WorkerOutcome {
-        crate::profile_lifecycle::WorkerOutcome {
-            rc: 1,
-            output: Vec::new(),
+/// Run pre-sync hooks through the same worker boundary as lifecycle hooks.
+/// The listing and context protocol remain owned by `pre_sync`; this engine
+/// layer supplies only the Runtime-bound process runner and warning stream.
+fn pre_sync(
+    inputs: &EngineInputs<'_>,
+    configured_root: Option<&str>,
+    eligible: &[String],
+    stage: &str,
+    now_secs: i64,
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+) -> Result<(), ()> {
+    let extensions_dir = configured_root.unwrap_or(inputs.extensions_dir);
+    let trust = crate::extension_trust::Inputs {
+        euid: inputs.euid,
+        home: inputs.home.to_string(),
+        extensions_dir: extensions_dir.to_string(),
+        manifest: inputs.manifest.to_string(),
+        retiring_root: String::new(),
+    };
+    let records: Vec<Vec<u8>> = eligible
+        .iter()
+        .map(|record| record.as_bytes().to_vec())
+        .collect();
+    let mut worker = crate::hook_worker::Worker::with_extensions(inputs.runtime, extensions_dir);
+    let mut runner = |call: &crate::pre_sync::Call| {
+        let outcome = worker.pre_sync(call);
+        out.extend_from_slice(&outcome.stdout);
+        err.extend_from_slice(&outcome.stderr);
+        outcome.rc == 0
+    };
+    match crate::pre_sync::run(
+        stage,
+        &records,
+        &trust,
+        eligible,
+        now_secs,
+        inputs.tmp,
+        &mut runner,
+    ) {
+        Ok(outcome) if outcome.status == 0 => Ok(()),
+        Ok(outcome) => {
+            for warning in outcome.warnings {
+                inputs.log.warn(err, &warning);
+            }
+            Err(())
         }
+        Err(crate::pre_sync::Error::Invalid(message)) => {
+            err.extend_from_slice(message.as_bytes());
+            err.push(b'\n');
+            Err(())
+        }
+        Err(crate::pre_sync::Error::Usage | crate::pre_sync::Error::Refused) => Err(()),
     }
+}
+
+/// Overlay records are stable by name across a descriptor refresh. The shell
+/// records `entry%%|*` in an associative set before choosing additions; using
+/// the same identity prevents a changed URL or descriptor path from fetching
+/// an already-processed overlay twice.
+fn record_name(record: &str) -> Option<&str> {
+    record
+        .split_once('|')
+        .map(|(name, _)| name)
+        .filter(|name| !name.is_empty())
 }
 
 /// `_dot_update_skip_inputs`: the Tools/Configs warning close for
@@ -955,16 +1334,14 @@ fn skip_inputs_rows(stage: &mut Stage, out: &mut Vec<u8>, reason: &str, now_secs
 /// frozen preservation rows), lifecycle retire, the provider-none
 /// tools stage, the empty merges close, lifecycle commit, worktree
 /// normalize, and `_ui_done`. Returns the update status.
-#[allow(clippy::too_many_arguments)]
-pub fn finalize(
+fn finalize(
     inputs: &EngineInputs<'_>,
+    state: &mut UpdateState,
     stage: &mut Stage,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
+    io: &mut UpdateIo<'_>,
     now_secs: i64,
     update_status: i32,
     frozen: bool,
-    entries: &[String],
 ) -> i32 {
     use std::io::Write as _;
     let mut status = update_status;
@@ -979,7 +1356,7 @@ pub fn finalize(
             now_secs,
             &reload_hint(inputs),
         );
-        let _ = out.write_all(&close);
+        let _ = io.out.write_all(&close);
         return 1;
     }
     let base_prefix = inputs.base.as_ref().and_then(|base| base.git_prefix());
@@ -991,18 +1368,18 @@ pub fn finalize(
             now_secs,
             inputs.dot_verbose,
         );
-        let _ = out.write_all(&open);
+        let _ = io.out.write_all(&open);
         let close = stage.finish(
             b"warning",
             b"profile resolution or repository sync failed",
             now_secs,
         );
-        let _ = out.write_all(&close);
+        let _ = io.out.write_all(&close);
         status = 1;
         inputs_ready = false;
     } else {
         let link_inputs = crate::repos_link_all::Inputs {
-            entries,
+            entries: &state.active,
             home: inputs.home,
             manifest: inputs.manifest,
             legacy_manifest: inputs.legacy_manifest,
@@ -1021,22 +1398,23 @@ pub fn finalize(
             bar_width: inputs.bar_width,
             log: inputs.log,
         };
-        let outcome = crate::repos_link_all::link_overlays(&link_inputs, stage, out, err, now_secs);
+        let outcome =
+            crate::repos_link_all::link_overlays(&link_inputs, stage, io.out, io.err, now_secs);
         if outcome.rc != 0 {
             status = 1;
             inputs_ready = false;
         }
     }
     if !inputs_ready {
-        skip_inputs_rows(stage, out, "repository synchronization failed", now_secs);
+        skip_inputs_rows(stage, io.out, "repository synchronization failed", now_secs);
     } else {
-        let mut worker = NullWorker;
+        let mut worker = crate::hook_worker::Worker::new(inputs.runtime);
         let retired = crate::profile_lifecycle::retire(
             &crate::profile_lifecycle::RetireInputs {
-                present: false,
-                extensions_enabled: false,
-                retained: &[],
-                eligible: &[],
+                present: state.profiles.present,
+                extensions_enabled: state.extensions_enabled(),
+                retained: &state.retained,
+                eligible: &state.eligible,
                 home: inputs.home,
                 euid: inputs.euid,
                 tmpdir: inputs.tmp,
@@ -1045,12 +1423,12 @@ pub fn finalize(
                 log: inputs.log,
             },
             &mut worker,
-            out,
-            err,
+            io.out,
+            io.err,
         );
         if retired != 0 {
             status = 1;
-            skip_inputs_rows(stage, out, "profile deactivation failed", now_secs);
+            skip_inputs_rows(stage, io.out, "profile deactivation failed", now_secs);
         } else {
             // The shdeps provider stays shell-backed (see
             // `should_go_native`); `none` renders its stage here.
@@ -1060,9 +1438,9 @@ pub fn finalize(
                 now_secs,
                 inputs.dot_verbose,
             );
-            let _ = out.write_all(&open);
+            let _ = io.out.write_all(&open);
             let close = stage.finish(b"ok", b"no dependency provider", now_secs);
-            let _ = out.write_all(&close);
+            let _ = io.out.write_all(&close);
             // Merge hooks are absent by envelope, so the driver
             // renders the empty close directly.
             let open = stage.start(
@@ -1071,25 +1449,26 @@ pub fn finalize(
                 now_secs,
                 inputs.dot_verbose,
             );
-            let _ = out.write_all(&open);
+            let _ = io.out.write_all(&open);
             let close = stage.finish(b"ok", b"no config hooks", now_secs);
-            let _ = out.write_all(&close);
+            let _ = io.out.write_all(&close);
         }
     }
     if inputs_ready && status == 0 {
+        let ledger = state.ledger(inputs);
         let committed = crate::profile_lifecycle::commit(&crate::profile_lifecycle::CommitInputs {
-            present: false,
-            extensions_enabled: false,
-            retained: &[],
-            eligible: &[],
-            active: &[],
-            ledger: None,
+            present: state.profiles.present,
+            extensions_enabled: state.extensions_enabled(),
+            retained: &state.retained,
+            eligible: &state.eligible,
+            active: &state.active,
+            ledger: Some(&ledger),
             home: inputs.home,
             euid: inputs.euid,
         });
         if !committed {
             warn_row(
-                err,
+                io.err,
                 inputs.palette,
                 "  warning: could not commit profile lifecycle state",
             );
@@ -1104,10 +1483,10 @@ pub fn finalize(
             now_secs,
             inputs.dot_verbose,
         );
-        let _ = out.write_all(&open);
-        crate::repos_dirty::normalize_filtered(base_prefix.as_deref(), entries);
+        let _ = io.out.write_all(&open);
+        crate::repos_dirty::normalize_filtered(base_prefix.as_deref(), &state.active);
         let close = stage.finish(b"ok", b"worktree normalized", now_secs);
-        let _ = out.write_all(&close);
+        let _ = io.out.write_all(&close);
     } else {
         let open = stage.start(
             b"Cleanup",
@@ -1115,9 +1494,9 @@ pub fn finalize(
             now_secs,
             inputs.dot_verbose,
         );
-        let _ = out.write_all(&open);
+        let _ = io.out.write_all(&open);
         let close = stage.finish(b"ok", b"no base repo", now_secs);
-        let _ = out.write_all(&close);
+        let _ = io.out.write_all(&close);
     }
     let close = crate::progress_ui::done(
         inputs.palette,
@@ -1127,7 +1506,7 @@ pub fn finalize(
         now_secs,
         &reload_hint(inputs),
     );
-    let _ = out.write_all(&close);
+    let _ = io.out.write_all(&close);
     status
 }
 
@@ -1170,6 +1549,8 @@ fn startup_inputs<'a>(inputs: &EngineInputs<'a>) -> crate::startup::Inputs<'a> {
 /// loop) resolved before the first stage opens. [`Gathered::inputs`]
 /// from here, so one value lives through the whole run.
 pub struct Gathered {
+    runtime: crate::app::Runtime,
+    config: crate::config::Config,
     flags: UpdateFlags,
     extra: Vec<std::ffi::OsString>,
     home: String,
@@ -1207,6 +1588,8 @@ impl Gathered {
     /// Borrow the driver inputs from this capture.
     pub fn inputs(&self) -> EngineInputs<'_> {
         EngineInputs {
+            runtime: &self.runtime,
+            config: &self.config,
             flags: self.flags,
             extra_args: &self.extra,
             base: self.base.as_ref(),
@@ -1315,6 +1698,8 @@ fn locale_name(env: &BTreeMap<OsString, OsString>) -> String {
 /// shell adapter; invalid XDG inputs return a typed error and never invoke it.
 pub fn gather(
     args: &[std::ffi::OsString],
+    runtime: &crate::app::Runtime,
+    config: &crate::config::Config,
     source_root: &std::path::Path,
     state_home: &str,
     env: &BTreeMap<OsString, OsString>,
@@ -1397,6 +1782,8 @@ pub fn gather(
         None => return Ok(None),
     };
     Ok(Some(Gathered {
+        runtime: runtime.clone(),
+        config: config.clone(),
         flags,
         extra,
         home: home.clone(),
@@ -1431,7 +1818,14 @@ pub fn gather(
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp")),
         source_root_git: source_root.to_path_buf(),
         checkout_root,
-        extensions_dir: env_value(env, "DOT_EXTENSIONS_DIR").unwrap_or_default(),
+        // `dot_config_load` publishes this path before the shell chooses its
+        // update lane. Native gathering receives the parsed config directly,
+        // so do not require a duplicate ambient export to notice shell-owned
+        // hook directories.
+        extensions_dir: config
+            .extensions_dir
+            .clone()
+            .unwrap_or_else(|| env_value(env, "DOT_EXTENSIONS_DIR").unwrap_or_default()),
         prefix: env_value(env, "PREFIX").unwrap_or_default(),
         reloads_shell: env_value(env, "DOT_UPDATE_RELOADS_SHELL"),
         shell: env_value(env, "SHELL"),
@@ -1449,7 +1843,7 @@ pub fn now_secs() -> i64 {
 }
 
 /// `_dot_update` natively: flag-driven stages around [`sync_repos`]
-/// and [`finalize`] with the defensive policy reload between them.
+/// and finalization with the defensive policy reload between them.
 /// Returns `None` outside the [`should_go_native`] envelope (the
 /// caller runs the shell adapter instead).
 pub fn run_update(
@@ -1487,17 +1881,17 @@ pub fn run_update(
         inputs.ascii,
     );
     let mut moves = crate::temp::MoveCache::default();
-    let sync = sync_repos(inputs, &mut stage, &mut moves, out, err, now_secs);
+    let mut sync = sync_repos(inputs, &mut stage, &mut moves, out, err, now_secs);
     if sync.rc != 0 {
+        let mut io = UpdateIo { out, err };
         let rc = finalize(
             inputs,
+            &mut sync.state,
             &mut stage,
-            out,
-            err,
+            &mut io,
             now_secs,
             1,
             sync.frozen,
-            &sync.entries,
         );
         return Some(rc);
     }
@@ -1505,29 +1899,32 @@ pub fn run_update(
     // failure closes without finalizing, like the shell: the
     // loader prints its own diagnostic, then `_ui_done 1`).
     let startup = startup_inputs(inputs);
-    if let Err(failure) = crate::startup::preflight(&startup) {
-        err.extend_from_slice(failure.line().as_bytes());
-        err.push(b'\n');
-        let close = crate::progress_ui::done(
-            inputs.palette,
-            quiet(inputs),
-            Some("1"),
-            now_secs,
-            now_secs,
-            &reload_hint(inputs),
-        );
-        let _ = out.write_all(&close);
-        return Some(1);
+    match crate::startup::preflight(&startup) {
+        Ok(config) => sync.state.config = config,
+        Err(failure) => {
+            err.extend_from_slice(failure.line().as_bytes());
+            err.push(b'\n');
+            let close = crate::progress_ui::done(
+                inputs.palette,
+                quiet(inputs),
+                Some("1"),
+                now_secs,
+                now_secs,
+                &reload_hint(inputs),
+            );
+            let _ = out.write_all(&close);
+            return Some(1);
+        }
     }
+    let mut io = UpdateIo { out, err };
     let rc = finalize(
         inputs,
+        &mut sync.state,
         &mut stage,
-        out,
-        err,
+        &mut io,
         now_secs,
         0,
         sync.frozen,
-        &sync.entries,
     );
     Some(rc)
 }
@@ -1617,6 +2014,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn additions_identity_ignores_same_name_descriptor_mutation() {
+        let phase_one = BTreeSet::from([String::from("alpha")]);
+        let refreshed = [
+            String::from("alpha|/new/path|file:///new|/new/descriptor|false|git"),
+            String::from("beta|/beta|file:///beta|/beta/descriptor|false|git"),
+        ];
+        let additions: Vec<&str> = refreshed
+            .iter()
+            .filter(|record| !record_name(record).is_some_and(|name| phase_one.contains(name)))
+            .map(String::as_str)
+            .collect();
+
+        assert_eq!(
+            additions,
+            ["beta|/beta|file:///beta|/beta/descriptor|false|git"]
+        );
+    }
+
+    #[test]
     fn stale_frozen_marker_does_not_decline_native_capture() {
         // `_dot_update` clears this command-local marker before a new run.
         // Capturing it as a top-level fallback would incorrectly preserve a
@@ -1633,8 +2049,21 @@ mod tests {
                 OsString::from("1"),
             ),
         ]);
+        let runtime =
+            crate::app::Runtime::from_env(&env, Path::new("/tmp")).expect("absolute fixture cwd");
+        let config = crate::config::Config {
+            version: 1,
+            extension_api: false,
+            extensions_dir: None,
+            provider: crate::config::Provider::None,
+            default_profile: "base".to_string(),
+            shdeps_update_policy: crate::config::UpdatePolicy::Pinned,
+            policy_from_env: false,
+        };
         let gathered = gather(
             &[],
+            &runtime,
+            &config,
             Path::new(env!("CARGO_MANIFEST_DIR")),
             "/tmp",
             &env,
