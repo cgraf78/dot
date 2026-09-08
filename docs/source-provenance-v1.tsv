@@ -176,3 +176,4 @@ tests/init_client_git.rs	standalone:new
 tests/init_client_adopt.rs	standalone:new
 tests/init_client_resume.rs	standalone:new
 tests/doctor_orchestrator.rs	standalone:new
+tests/doctor_checks.rs	standalone:new
