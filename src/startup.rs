@@ -32,6 +32,19 @@ pub fn ensure_umask_ceiling(mask: u32) -> u32 {
     mask | UMASK_CEILING_BITS
 }
 
+/// Apply the shell-compatible write-permission ceiling to this process.
+///
+/// The binary calls this before starting worker threads or creating files, so
+/// the process-wide two-syscall read/update cannot race another Dot operation.
+pub fn apply_umask_ceiling() {
+    // SAFETY: `umask(2)` has no memory-safety preconditions. This function is
+    // called once at process entry before any threads are started.
+    unsafe {
+        let inherited = libc::umask(0) as u32;
+        libc::umask(ensure_umask_ceiling(inherited) as libc::mode_t);
+    }
+}
+
 /// Resolve the Dot checkout or release that owns `exe`.
 ///
 /// The executable is canonicalized before its recognized development or
