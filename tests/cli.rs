@@ -1105,7 +1105,7 @@ fn binary_init_reloads_the_configuration_it_just_cloned() {
 
     let output = init_bin(&home, &state)
         .args(["init", "--yes", "--branch", &branch, &url])
-        .env("DOT_BASH", "/definitely/missing/fallback")
+        .env("DOT_BASH", dot_test_support::bash())
         .env("PATH", path)
         .output()
         .expect("run native init with cloned config");
@@ -2835,6 +2835,23 @@ impl NativeUpdateFixture {
         self.rust_dot_with(argv, |_| {})
     }
 
+    fn rust_dot_with_bash(&self, argv: &[&str]) -> std::process::Output {
+        self.rust_dot_with(argv, |command| {
+            command.env("DOT_BASH", dot_test_support::bash());
+        })
+    }
+
+    fn rust_dot_with_bash_and(
+        &self,
+        argv: &[&str],
+        configure: impl FnOnce(&mut Command),
+    ) -> std::process::Output {
+        self.rust_dot_with(argv, |command| {
+            command.env("DOT_BASH", dot_test_support::bash());
+            configure(command);
+        })
+    }
+
     fn rust_dot_with(
         &self,
         argv: &[&str],
@@ -2966,9 +2983,8 @@ fn update_native_invalid_home_rejects_fallback() {
 
 #[test]
 fn update_native_configured_pre_sync_hook_uses_the_hardened_worker() {
-    // A configured hook must remain native and run only after the worker has
-    // validated its one-use context. The sentinel makes a fallback
-    // unmistakable while the marker proves the hook actually ran.
+    // A configured hook must run only after the native worker has validated
+    // its one-use context. The marker proves the hook actually ran.
     let fixture = NativeUpdateFixture::stage();
     let extensions = fixture.client.home.join("extensions/pre-sync.d");
     std::fs::create_dir_all(&extensions).expect("pre-sync directory");
@@ -2996,13 +3012,41 @@ fn update_native_configured_pre_sync_hook_uses_the_hardened_worker() {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700))
             .expect("executable pre-sync hook");
     }
-    fixture.reject_fallback();
-    let output = fixture.rust_dot(&["update", "--quiet"]);
+    let output = fixture.rust_dot_with_bash(&["update", "--quiet"]);
     assert_native_silent(&output, "configured pre-sync hook");
     assert_eq!(
         std::fs::read(fixture.client.home.join("pre-sync-ran")).expect("pre-sync marker"),
         b"prepared"
     );
+}
+
+#[test]
+fn update_native_pre_sync_reports_invalid_explicit_bash_once() {
+    let fixture = NativeUpdateFixture::stage()
+        .with_pre_sync(b"prepare() { printf prepared >\"$HOME/pre-sync-ran\"; }\n");
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    let expected = format!(
+        "checkout Bash resolver: explicit interpreter is not Bash 4 or newer: {}\n",
+        fixture.fallback_sentinel.display()
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(has_bytes(&output.stderr, expected.as_bytes()));
+    assert_eq!(
+        output
+            .stderr
+            .windows(expected.len())
+            .filter(|window| *window == expected.as_bytes())
+            .count(),
+        1,
+        "resolver failure must be emitted once per operation"
+    );
+    assert!(has_bytes(
+        &output.stderr,
+        b"warning: pre-sync extension failed: 10-streams.sh\n"
+    ));
+    assert!(!fixture.client.home.join("pre-sync-ran").exists());
 }
 
 #[test]
@@ -3030,8 +3074,7 @@ fn update_hook_runs_with_only_public_hook_assets() {
     );
     std::fs::write(release_root.join(".dot-install.json"), b"{}\n").expect("release metadata");
 
-    fixture.reject_fallback();
-    let output = fixture.rust_dot_with(&["update", "--quiet"], |command| {
+    let output = fixture.rust_dot_with_bash_and(&["update", "--quiet"], |command| {
         command.env("DOT_SOURCE_ROOT", &release_root);
     });
     assert_native_silent(&output, "release-only pre-sync hook");
@@ -3046,7 +3089,7 @@ fn update_native_pre_sync_success_relays_both_streams() {
     let fixture = NativeUpdateFixture::stage().with_pre_sync(
         b"prepare() { printf 'pre-sync stdout\\n'; printf 'pre-sync stderr\\n' >&2; }\n",
     );
-    let output = fixture.rust_dot(&["update", "--quiet"]);
+    let output = fixture.rust_dot_with_bash(&["update", "--quiet"]);
     assert_eq!(output.status.code(), Some(0));
     assert!(has_bytes(&output.stdout, b"pre-sync stdout\n"));
     assert!(has_bytes(&output.stderr, b"pre-sync stderr\n"));
@@ -3057,7 +3100,7 @@ fn update_native_pre_sync_failure_relays_both_streams() {
     let fixture = NativeUpdateFixture::stage().with_pre_sync(
         b"prepare() { printf 'pre-sync stdout\\n'; printf 'pre-sync stderr\\n' >&2; return 7; }\n",
     );
-    let output = fixture.rust_dot(&["update", "--quiet"]);
+    let output = fixture.rust_dot_with_bash(&["update", "--quiet"]);
     assert_eq!(output.status.code(), Some(1));
     assert!(has_bytes(&output.stdout, b"pre-sync stdout\n"));
     assert!(has_bytes(&output.stderr, b"pre-sync stderr\n"));
@@ -3067,7 +3110,7 @@ fn update_native_pre_sync_failure_relays_both_streams() {
 fn update_native_merge_hook_runs_with_a_large_job_limit() {
     let fixture = NativeUpdateFixture::stage()
         .with_merge(b"merge() { printf merged >\"$HOME/merge-hook-ran\"; }\n");
-    let output = fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
+    let output = fixture.rust_dot_with_bash_and(&["update", "--quiet"], |cmd| {
         cmd.env("DOT_MERGE_JOBS", "1000000000");
     });
     assert_native_silent(&output, "merge-hook success");
@@ -3105,7 +3148,7 @@ fn update_native_verbose_merge_replays_hook_output_in_declaration_order() {
         ),
     ];
     let fixture = NativeUpdateFixture::stage().with_merge_files(hooks);
-    let output = fixture.rust_dot_with(&["update", "--verbose"], |cmd| {
+    let output = fixture.rust_dot_with_bash_and(&["update", "--verbose"], |cmd| {
         // Force a two-worker batch even on a one-core runner. The serial hook
         // proves the whole batch joined before its barrier starts.
         cmd.env("DOT_UPDATE_JOBS", "1");
@@ -3158,7 +3201,7 @@ fn update_native_verbose_merge_replays_hook_output_in_declaration_order() {
 fn update_native_verbose_merge_preserves_non_utf8_output() {
     let script = b"merge() { printf 'Binary '; printf '\\377'; printf 'A\\0B\\n'; }\n";
     let fixture = NativeUpdateFixture::stage().with_merge(script);
-    let output = fixture.rust_dot(&["update", "--verbose"]);
+    let output = fixture.rust_dot_with_bash(&["update", "--verbose"]);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stderr, b"");
     assert!(
@@ -3177,7 +3220,7 @@ fn update_native_merge_without_an_entry_point_fails() {
     // A helper-looking `*.sh` is discovered, but the worker writes a zero
     // merge record and exits nonzero. It must still fail the aggregate stage.
     let fixture = NativeUpdateFixture::stage().with_merge(b"helper() { :; }\n");
-    let output = fixture.rust_dot(&["update", "--quiet"]);
+    let output = fixture.rust_dot_with_bash(&["update", "--quiet"]);
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(output.stdout, b"");
     assert_eq!(output.stderr, b"");
@@ -3207,7 +3250,7 @@ fn update_native_failed_merge_hook_reports_its_capture() {
     // still make the aggregate Configs stage fail.
     let script = b"merge() { printf 'merge stdout\\n'; printf 'merge stderr\\n' >&2; return 7; }\n";
     let fixture = NativeUpdateFixture::stage().with_merge(script);
-    let output = fixture.rust_dot(&["update", "--quiet"]);
+    let output = fixture.rust_dot_with_bash(&["update", "--quiet"]);
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(output.stdout, b"");
     assert!(has_bytes(&output.stderr, b"10-config output:"));
@@ -3216,12 +3259,50 @@ fn update_native_failed_merge_hook_reports_its_capture() {
 }
 
 #[test]
+fn update_native_merge_reports_invalid_explicit_bash() {
+    let fixture = NativeUpdateFixture::stage().with_merge_files(&[
+        (
+            "10-first.sh",
+            b"merge() { printf first >\"$HOME/merge-first-ran\"; }\n",
+        ),
+        (
+            "20-second.sh",
+            b"merge() { printf second >\"$HOME/merge-second-ran\"; }\n",
+        ),
+    ]);
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    let expected = format!(
+        "checkout Bash resolver: explicit interpreter is not Bash 4 or newer: {}\n",
+        fixture.fallback_sentinel.display()
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        has_bytes(&output.stderr, expected.as_bytes()),
+        "merge resolver stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output
+            .stderr
+            .windows(expected.len())
+            .filter(|window| *window == expected.as_bytes())
+            .count(),
+        1,
+        "resolver failure must be emitted once per operation"
+    );
+    assert!(!fixture.client.home.join("merge-first-ran").exists());
+    assert!(!fixture.client.home.join("merge-second-ran").exists());
+}
+
+#[test]
 fn update_native_merge_hook_receives_active_overlay_context() {
     // The hook observes the one-use active-overlay context inside the public
     // worker boundary.
     let script = b"merge() {\n  [[ $REPLY_SET_KIND == active && $REPLY_STAGE == none && ${#OVERLAYS[@]} -eq 1 && ${OVERLAYS[0]} == alpha\\|* ]] || return 8\n  printf '%s:%s:%s' \"$REPLY_SET_KIND\" \"$REPLY_STAGE\" \"${OVERLAYS[0]%%|*}\" >\"$HOME/merge-context\"\n}\n";
     let fixture = NativeUpdateFixture::stage().with_merge(script);
-    let output = fixture.rust_dot(&["update", "--quiet"]);
+    let output = fixture.rust_dot_with_bash(&["update", "--quiet"]);
     assert_native_silent(&output, "merge context");
     assert_eq!(
         std::fs::read(fixture.client.home.join("merge-context")).expect("merge context"),
@@ -3234,7 +3315,7 @@ fn update_native_merge_hook_receives_overlay_manifest() {
     let script = b"merge() { [[ -n ${DOT_OVERLAY_MANIFEST:-} ]] || return 8; printf '%s' \"$DOT_OVERLAY_MANIFEST\" >\"$HOME/merge-manifest\"; }\n";
     let fixture = NativeUpdateFixture::stage().with_merge(script);
     let manifest = fixture.client.home.join("selected-overlay-links");
-    let output = fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
+    let output = fixture.rust_dot_with_bash_and(&["update", "--quiet"], |cmd| {
         cmd.env("DOT_OVERLAY_MANIFEST", &manifest);
     });
     assert_native_silent(&output, "merge manifest");
@@ -3249,7 +3330,7 @@ fn update_native_merge_hook_logging_defaults_to_not_quiet() {
     let fixture = NativeUpdateFixture::stage().with_merge(
         b"merge() { [[ ${DOT_VERBOSE:-} == 1 && ${SHDEPS_LOG_LEVEL:-} == 2 ]] || return 8; _log hook-log; }\n",
     );
-    let output = fixture.rust_dot(&["update", "--verbose"]);
+    let output = fixture.rust_dot_with_bash(&["update", "--verbose"]);
     assert_eq!(output.status.code(), Some(0));
     assert!(has_bytes(&output.stdout, b"hook-log"));
     assert_eq!(output.stderr, b"");
@@ -3259,7 +3340,7 @@ fn update_native_merge_hook_logging_defaults_to_not_quiet() {
 fn update_native_merge_hook_receives_quiet_flag() {
     let fixture = NativeUpdateFixture::stage()
         .with_merge(b"merge() { [[ ${DOT_QUIET:-} == 1 && ${SHDEPS_QUIET:-} == 1 ]]; }\n");
-    let output = fixture.rust_dot(&["update", "--quiet"]);
+    let output = fixture.rust_dot_with_bash(&["update", "--quiet"]);
     assert_native_silent(&output, "merge quiet flag");
 }
 
@@ -3267,7 +3348,7 @@ fn update_native_merge_hook_receives_quiet_flag() {
 fn update_native_merge_hook_receives_force_flags() {
     let fixture = NativeUpdateFixture::stage()
         .with_merge(b"merge() { [[ ${DOT_FORCE:-} == 1 && ${SHDEPS_FORCE:-} == 1 ]]; }\n");
-    let output = fixture.rust_dot(&["update", "--force", "--quiet"]);
+    let output = fixture.rust_dot_with_bash(&["update", "--force", "--quiet"]);
     assert_native_silent(&output, "merge force flags");
 }
 
@@ -3275,7 +3356,7 @@ fn update_native_merge_hook_receives_force_flags() {
 fn update_native_merge_hook_receives_update_lock_token() {
     let fixture = NativeUpdateFixture::stage()
         .with_merge(b"merge() { [[ -n ${DOT_UPDATE_LOCK_TOKEN:-} ]]; }\n");
-    let output = fixture.rust_dot(&["update", "--quiet"]);
+    let output = fixture.rust_dot_with_bash(&["update", "--quiet"]);
     assert_native_silent(&output, "merge update lock token");
 }
 
@@ -3292,9 +3373,8 @@ fn update_native_profile_base_selection_rejects_fallback() {
 #[test]
 fn update_native_profile_addition_discovered_after_base_pull_stays_native() {
     let fixture = NativeUpdateFixture::stage().with_base_discovered_profile_addition();
-    fixture.reject_fallback();
     assert_native_silent(
-        &fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
+        &fixture.rust_dot_with_bash_and(&["update", "--quiet"], |cmd| {
             cmd.env("XDG_CONFIG_HOME", fixture.client.home.join(".config"));
         }),
         "profile addition after base pull",
@@ -3354,8 +3434,10 @@ fn update_native_profile_downgrade_retires_lifecycle_state() {
     // default profile to beta: the native two-phase driver must link beta,
     // execute alpha's trusted deactivation hook, and commit the emptied ledger.
     let fixture = NativeUpdateFixture::stage().with_profile_retirement();
-    fixture.reject_fallback();
-    assert_native_silent(&fixture.rust_dot(&["update", "--quiet"]), "profile setup");
+    assert_native_silent(
+        &fixture.rust_dot_with_bash(&["update", "--quiet"]),
+        "profile setup",
+    );
     assert!(
         !fixture.client.home.join("alpha-retired").exists(),
         "an eligible active overlay must not be deactivated during setup"
@@ -3389,7 +3471,7 @@ fn update_native_profile_downgrade_retires_lifecycle_state() {
     .expect("switch profile");
 
     assert_native_silent(
-        &fixture.rust_dot(&["update", "--quiet"]),
+        &fixture.rust_dot_with_bash(&["update", "--quiet"]),
         "profile downgrade",
     );
     assert_eq!(
@@ -3411,7 +3493,10 @@ fn update_native_profile_downgrade_retires_lifecycle_state() {
 #[test]
 fn update_native_profile_failed_retirement_preserves_lifecycle_authority() {
     let fixture = NativeUpdateFixture::stage().with_profile_retirement();
-    assert_native_silent(&fixture.rust_dot(&["update", "--quiet"]), "profile setup");
+    assert_native_silent(
+        &fixture.rust_dot_with_bash(&["update", "--quiet"]),
+        "profile setup",
+    );
     seed_advance(
         &fixture.client.overlay_seed,
         "dot/profile-deactivate",
@@ -3423,7 +3508,7 @@ fn update_native_profile_failed_retirement_preserves_lifecycle_authority() {
     )
     .expect("switch profile");
 
-    let output = fixture.rust_dot(&["update", "--quiet"]);
+    let output = fixture.rust_dot_with_bash(&["update", "--quiet"]);
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(output.stdout, b"");
     assert!(has_bytes(
@@ -3714,7 +3799,7 @@ fn update_native_profile_descriptor_refresh_selects_the_new_overlay() {
     // The base refresh changes alpha's descriptor before it selects beta.  A
     // full-record difference must not make alpha an additions-only pull.
     let fixture = NativeUpdateFixture::stage().with_base_discovered_profile_addition();
-    let output = fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
+    let output = fixture.rust_dot_with_bash_and(&["update", "--quiet"], |cmd| {
         cmd.env("XDG_CONFIG_HOME", fixture.client.home.join(".config"));
     });
     assert_native_silent(&output, "descriptor refresh");
@@ -3746,7 +3831,7 @@ fn update_native_profile_descriptor_refresh_selects_the_new_overlay() {
 fn update_native_profile_retirement_commits_the_selected_generation() {
     let fixture = NativeUpdateFixture::stage().with_profile_retirement();
     assert_native_silent(
-        &fixture.rust_dot(&["update", "--quiet"]),
+        &fixture.rust_dot_with_bash(&["update", "--quiet"]),
         "retirement setup",
     );
     std::fs::write(
@@ -3754,7 +3839,7 @@ fn update_native_profile_retirement_commits_the_selected_generation() {
         b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
     )
     .expect("switch profile");
-    let output = fixture.rust_dot(&["update", "--quiet"]);
+    let output = fixture.rust_dot_with_bash(&["update", "--quiet"]);
     assert_native_silent(&output, "retirement");
     assert_eq!(
         std::fs::read(fixture.client.home.join("alpha-retired")).unwrap(),

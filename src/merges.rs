@@ -908,6 +908,20 @@ pub(crate) fn run(
         ));
         return Outcome { status: 1 };
     };
+    // Resolve once before parallel launch so a shared capability failure is
+    // reported once rather than being duplicated or hidden by per-hook result
+    // files that cannot contain a `merge()` record. Scratch stays first to
+    // preserve the shell coordinator's failure precedence.
+    if let Err(error) = inputs.runtime.bash() {
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = err.write_all(&inputs.runtime.bash_error_line_once(&error));
+        let _ = out.write_all(&stage.finish(
+            b"warning",
+            warning_summary(0, i64::try_from(hooks.len()).unwrap_or(i64::MAX)).as_bytes(),
+            now_secs,
+        ));
+        return Outcome { status: 1 };
+    }
     let mut merged = 0;
     let mut failed = 0;
     // Overlay records are immutable hook context; encode them once for every
@@ -982,8 +996,10 @@ fn is_serial_os(script: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::scratch;
+    use super::{RunInputs, run, scratch};
     use dot_test_support::TempDir;
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
@@ -1003,5 +1019,87 @@ mod tests {
         std::fs::write(&blocked, b"not a directory\n").expect("blocked root");
         assert!(scratch(&blocked).is_none());
         assert_eq!(std::fs::read(&blocked).unwrap(), b"not a directory\n");
+    }
+
+    #[test]
+    fn scratch_failure_precedes_bash_resolution() {
+        let scope = TempDir::new("merge-scratch-precedence").expect("fixture");
+        let home = scope.path().join("home");
+        let extensions = home.join("extensions");
+        let hooks = extensions.join("merge-hooks.d");
+        std::fs::create_dir_all(&hooks).expect("merge-hook directory");
+        for directory in [&home, &extensions, &hooks] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                .expect("private fixture directory");
+        }
+        let hook = hooks.join("10-test.sh");
+        std::fs::write(&hook, b"merge() { :; }\n").expect("merge hook");
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700))
+            .expect("private merge hook");
+        let blocked = scope.path().join("blocked-tmp");
+        std::fs::write(&blocked, b"not a directory\n").expect("blocked scratch root");
+
+        let missing_bash = scope.path().join("missing-bash");
+        let env = BTreeMap::from([
+            (OsString::from("HOME"), home.as_os_str().to_owned()),
+            (
+                OsString::from("DOT_SOURCE_ROOT"),
+                OsString::from(env!("CARGO_MANIFEST_DIR")),
+            ),
+            (
+                OsString::from("DOT_BASH"),
+                missing_bash.as_os_str().to_owned(),
+            ),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, scope.path()).expect("runtime");
+        let euid = crate::temp::current_uid().expect("effective uid");
+        let extensions_text = extensions.to_str().expect("extensions path").to_string();
+        let home_text = home.to_str().expect("home path").to_string();
+        let palette = crate::progress_ui::Palette::empty();
+        let log = crate::log::Log::new(false, true);
+        let mut stage = crate::progress_ui::Stage::begin(
+            crate::progress_ui::Palette::empty(),
+            "1",
+            true,
+            false,
+            true,
+            true,
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let inputs = RunInputs {
+            runtime: &runtime,
+            update_lock_token: None,
+            extension_inputs: crate::extension_trust::Inputs {
+                euid,
+                home: home_text,
+                extensions_dir: extensions_text,
+                manifest: String::new(),
+                retiring_root: String::new(),
+            },
+            extensions_enabled: true,
+            overlays: &[],
+            tmp: &blocked,
+            update_jobs: None,
+            merge_jobs: None,
+            verbose: false,
+            quiet: true,
+            force: false,
+            palette: &palette,
+            multibyte: true,
+            log: &log,
+        };
+
+        let outcome = run(&inputs, &mut stage, &mut out, &mut err, 0);
+
+        assert_eq!(outcome.status, 1);
+        assert_eq!(
+            err,
+            b"  warning: could not allocate merge-hook scratch storage\n"
+        );
+        assert!(
+            !err.windows(23)
+                .any(|window| window == b"checkout Bash resolver:")
+        );
     }
 }

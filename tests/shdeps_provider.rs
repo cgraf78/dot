@@ -52,6 +52,22 @@ fn fixture_command(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Keep provider-boundary tests independent of developer command wrappers.
+fn isolated_tool_path() -> std::ffi::OsString {
+    let mut directories = Vec::new();
+    for name in ["bash", "git"] {
+        let command = fixture_command(name).unwrap_or_else(|| panic!("fixture requires {name}"));
+        let directory = command
+            .parent()
+            .expect("fixture command parent")
+            .to_path_buf();
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    std::env::join_paths(directories).expect("isolated tool PATH")
+}
+
 struct Fixture {
     _scratch: TempDir,
     root: PathBuf,
@@ -226,7 +242,7 @@ esac
                 "DOT_TEST_PROVIDER_RECORD",
                 self.home.join("provider-record"),
             )
-            .env("BASH", dot_test_support::bash())
+            .env("DOT_BASH", dot_test_support::bash())
             // Bash fills an absent SHELL with its own path. Pin it explicitly
             // so both engines produce the same final reload hint.
             .env("SHELL", dot_test_support::bash())
@@ -650,10 +666,11 @@ fn elapsed_normalization_changes_only_ui_elapsed_positions() {
 fn explicit_reviewed_provider_runs_natively() {
     let rust = Fixture::new("shdeps-provider-explicit");
     // A process launched directly from the native executable does not inherit
-    // Bash's shell-local BASH variable. The provider must resolve its retained
-    // bootstrap interpreter from the snapshotted PATH in that normal case.
+    // Bash's shell-local BASH variable. With no strict DOT_BASH override, the
+    // provider must resolve its retained bootstrap interpreter from PATH.
     let rust_output = rust
         .command()
+        .env_remove("DOT_BASH")
         .env_remove("BASH")
         .output()
         .expect("run native provider without BASH");
@@ -662,6 +679,89 @@ fn explicit_reviewed_provider_runs_natively() {
         std::fs::read(rust.home.join("provider-record")).expect("native provider record"),
         b"force=0 quiet=0 nested=1 jobs=2\n"
     );
+}
+
+#[test]
+fn invalid_explicit_bash_reports_the_resolver_failure() {
+    let rust = Fixture::new("shdeps-provider-invalid-bash");
+    let missing = rust.home.join("missing/bash");
+    let output = rust
+        .command()
+        .env("DOT_BASH", &missing)
+        .output()
+        .expect("run provider with invalid DOT_BASH");
+    let expected = format!(
+        "checkout Bash resolver: explicit interpreter is not Bash 4 or newer: {}\n",
+        missing.display()
+    );
+
+    assert_cli(&output, 1, UNAVAILABLE, expected.as_bytes());
+}
+
+#[test]
+fn invalid_explicit_bash_does_not_download_an_installer() {
+    let rust = Fixture::new("shdeps-provider-invalid-bash-no-download");
+    let missing_bash = rust.home.join("missing/bash");
+    let missing_provider = rust.home.join("missing/provider");
+    let curl_record = rust.home.join("curl-record");
+    let output = rust
+        .command()
+        .env("DOT_BASH", &missing_bash)
+        .env_remove("SHDEPS_LIB")
+        .env("SHDEPS_DIR", &missing_provider)
+        .env("PATH", rust.curl_path())
+        .env("DOT_TEST_CURL_RECORD", &curl_record)
+        .output()
+        .expect("run provider with invalid DOT_BASH");
+    let expected = format!(
+        "checkout Bash resolver: explicit interpreter is not Bash 4 or newer: {}\n",
+        missing_bash.display()
+    );
+
+    assert_cli(&output, 1, UNAVAILABLE, expected.as_bytes());
+    assert!(
+        !curl_record.exists(),
+        "invalid Bash must fail before provider download"
+    );
+}
+
+#[test]
+fn provider_processes_do_not_evaluate_bash_env() {
+    let rust = Fixture::new("shdeps-provider-bash-env");
+    let poison = rust.home.join("bash-env");
+    let marker = rust.home.join("bash-env-ran");
+    std::fs::write(&poison, format!("printf poison >>'{}'\n", marker.display()))
+        .expect("BASH_ENV poison");
+
+    let output = rust
+        .command()
+        .env("BASH_ENV", &poison)
+        .env("PATH", isolated_tool_path())
+        .output()
+        .expect("run provider with BASH_ENV");
+
+    assert_cli(&output, 0, CHANGED, b"");
+    assert!(!marker.exists(), "provider process evaluated BASH_ENV");
+}
+
+#[test]
+fn provider_processes_do_not_import_exported_functions() {
+    let rust = Fixture::new("shdeps-provider-exported-function");
+    let marker = rust.home.join("exported-function-ran");
+    let function = format!(
+        "() {{ command touch '{}'; builtin printf \"$@\"; }}",
+        marker.display()
+    );
+
+    let output = rust
+        .command()
+        .env("BASH_FUNC_printf%%", function)
+        .env("PATH", isolated_tool_path())
+        .output()
+        .expect("run provider with exported function");
+
+    assert_cli(&output, 0, CHANGED, b"");
+    assert!(!marker.exists(), "provider imported an exported function");
 }
 
 #[test]

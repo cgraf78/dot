@@ -90,9 +90,16 @@ impl Log {
 
     /// `_log`: plain message unless quiet (stdout).
     pub fn log(&self, out: &mut dyn Write, text: &str) {
-        if !self.quiet {
-            let _ = writeln!(out, "{text}");
+        self.log_bytes(out, text.as_bytes());
+    }
+
+    /// `_log`: byte-preserving message unless quiet (stdout).
+    pub fn log_bytes(&self, out: &mut dyn Write, text: &[u8]) {
+        if self.quiet {
+            return;
         }
+        let _ = out.write_all(text);
+        let _ = out.write_all(b"\n");
     }
 
     /// `_header`: bright bold-white header, always prints (stdout).
@@ -123,7 +130,19 @@ impl Log {
 
     /// `_warn`: yellow message, always prints (stderr).
     pub fn warn(&self, err_out: &mut dyn Write, text: &str) {
-        let _ = writeln!(err_out, "{}", self.paint(YELLOW, text));
+        self.warn_bytes(err_out, text.as_bytes());
+    }
+
+    /// `_warn`: byte-preserving yellow message, always prints (stderr).
+    pub fn warn_bytes(&self, err_out: &mut dyn Write, text: &[u8]) {
+        if self.colored {
+            let _ = err_out.write_all(YELLOW.as_bytes());
+        }
+        let _ = err_out.write_all(text);
+        if self.colored {
+            let _ = err_out.write_all(RESET.as_bytes());
+        }
+        let _ = err_out.write_all(b"\n");
     }
 }
 

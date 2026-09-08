@@ -9,6 +9,7 @@
 #![deny(missing_docs)]
 
 pub mod app;
+pub(crate) mod bash;
 pub mod cleanup;
 pub mod cli;
 pub mod config;

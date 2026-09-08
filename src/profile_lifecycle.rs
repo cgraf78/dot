@@ -744,17 +744,15 @@ pub fn run_one(
         },
     };
     let _ = std::fs::remove_dir_all(&result_dir);
-    // Worker bytes cross into warning/log text lossily (the engine
-    // string-boundary precedent); test fixtures stay ASCII.
-    let text = String::from_utf8_lossy(command_output(&outcome.output)).into_owned();
+    let output = command_output(&outcome.output);
     if outcome.rc != 0 {
-        if !text.is_empty() {
-            inputs.log.warn(warnings, &text);
+        if !output.is_empty() {
+            inputs.log.warn_bytes(warnings, output);
         }
         return outcome.rc;
     }
-    if !text.is_empty() && inputs.verbose {
-        inputs.log.log(out, &text);
+    if !output.is_empty() && inputs.verbose {
+        inputs.log.log_bytes(out, output);
     }
     0
 }

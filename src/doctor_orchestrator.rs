@@ -264,8 +264,9 @@ pub struct RuntimeSnapshot {
     pub bash_version: Vec<u8>,
     /// `${BASH_VERSINFO[0]}` for the Bash 4 gate.
     pub bash_major: u64,
-    /// Whether configured user hooks make Bash part of this invocation's
-    /// runtime. The native engine itself has no Bash dependency.
+    /// Whether configured user hooks or the Shdeps provider make Bash part of
+    /// this invocation's runtime. The native engine itself has no Bash
+    /// dependency.
     pub bash_required: bool,
     /// Canonicalized `rev-parse --show-toplevel`, `None` when the
     /// shell would leave `checkout_root` empty.
