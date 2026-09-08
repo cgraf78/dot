@@ -74,6 +74,8 @@ fn write_wrapper(scope: &Path) -> PathBuf {
     drop(file);
     std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o755)).expect("wrapper mode");
     std::fs::rename(stage, &wrapper).expect("publish git wrapper");
+    dot_test_support::wait_until_executable(&wrapper, &["--version"])
+        .expect("git wrapper executable");
     wrapper
 }
 
@@ -129,6 +131,36 @@ fn mode(path: &Path) -> u32 {
 
 fn bound<T>(scope: &Path, run: impl FnOnce() -> T) -> T {
     dot::init_client_identity::with_host_git(&write_wrapper(scope), run)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn executable_probe_retries_text_busy_until_writer_closes() {
+    let scope = TempDir::new_exec("commands-text-busy").expect("exec dir");
+    let script = scope.path().join("probe.sh");
+    let marker = scope.path().join("probe-ran");
+    std::fs::write(&script, "#!/bin/sh\nprintf ready >\"$1\"\n").expect("write");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let mut writer = Some(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .expect("hold executable open for writing"),
+    );
+    let mut saw_busy = false;
+
+    dot_test_support::wait_until_executable_with(
+        &script,
+        &[marker.to_str().expect("ASCII fixture path")],
+        || {
+            saw_busy = true;
+            drop(writer.take());
+        },
+    )
+    .expect("probe succeeds");
+
+    assert!(saw_busy, "probe must observe ETXTBSY before retrying");
+    assert_eq!(std::fs::read(&marker).expect("probe marker"), b"ready");
 }
 
 #[test]
