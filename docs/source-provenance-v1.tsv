@@ -172,3 +172,4 @@ tests/pre_sync.rs	standalone:new
 tests/shdeps_ui_render.rs	standalone:new
 tests/init_client_publish.rs	standalone:new
 tests/init_client_rollback.rs	standalone:new
+tests/init_client_git.rs	standalone:new

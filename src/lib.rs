@@ -28,6 +28,7 @@ pub mod init_client_candidate;
 pub mod init_client_delete;
 pub mod init_client_entry;
 pub mod init_client_generation;
+pub mod init_client_git;
 pub mod init_client_identity;
 pub mod init_client_plan;
 pub mod init_client_publish;
