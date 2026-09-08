@@ -3,9 +3,10 @@
 //! All behavior lives in `dot::cli` so integration tests exercise the
 //! same code path as the installed binary — a bug fixed in the library
 //! is fixed for every caller, and a behavior tested in-process holds on
-//! the command line. The adapter owns only four things: skipping
-//! `argv[0]`, snapshotting the ambient runtime (including the resolved source
-//! root; the shell `main.sh` derives it from its own path — see
+//! the command line. The adapter owns only four things: preserving
+//! `argv[0]` for executable-identity validation while excluding it from
+//! command dispatch, snapshotting the ambient runtime (including the resolved
+//! source root; the shell `main.sh` derives it from its own path — see
 //! `dot::startup` for the full entry-contract map), locking
 //! stdout/stderr once (one lock acquisition instead of per-write
 //! locking on every output call), and translating the returned code
@@ -22,10 +23,12 @@ use std::io::{Write, stderr, stdout};
 fn main() {
     let env = std::env::vars_os().collect::<BTreeMap<_, _>>();
     let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let mut process_args = std::env::args_os();
+    let argv0 = process_args.next();
+    let args = process_args.collect::<Vec<_>>();
     let mut out = stdout().lock();
     let mut err = stderr().lock();
-    let runtime = match dot::app::Runtime::from_process_args(&env, &cwd, &args) {
+    let runtime = match dot::app::Runtime::from_process_args(&env, &cwd, argv0.as_deref(), &args) {
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = writeln!(err, "dot: startup: {error}");

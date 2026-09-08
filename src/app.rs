@@ -49,7 +49,7 @@ impl Runtime {
     /// The working directory must be absolute so every derived path remains
     /// stable if another caller later changes its own process context. An
     /// explicit `DOT_SOURCE_ROOT` is an embedding capability here; the shipped
-    /// binary uses [`Self::from_process_env`] so ambient input cannot select
+    /// binary uses [`Self::from_process_args`] so ambient input cannot select
     /// executable hook code.
     pub fn from_env(env: &BTreeMap<OsString, OsString>, cwd: &Path) -> std::io::Result<Self> {
         validate_cwd(cwd)?;
@@ -72,27 +72,39 @@ impl Runtime {
         cwd: &Path,
     ) -> std::io::Result<Self> {
         validate_cwd(cwd)?;
-        let source_root = crate::startup::process_source_root()?;
+        let argv0 = std::env::args_os().next();
+        let executable = crate::startup::process_executable(
+            argv0.as_deref(),
+            value(env, crate::startup::TERMUX_EXECUTABLE_ENV),
+        )?;
+        let source_root = crate::startup::process_source_root(&executable)?;
         Ok(Self::process_snapshot(env, cwd, source_root))
     }
 
-    /// Snapshot a process entry, retaining standalone `help` and `version`
-    /// support when a packaged release's hook assets have been removed.
+    /// Snapshot a process entry, using application `argv[0]` to corroborate
+    /// executable identity under Termux and retaining standalone `help` and
+    /// `version` support when a packaged release's hook assets have been
+    /// removed.
     #[doc(hidden)]
     pub fn from_process_args(
         env: &BTreeMap<OsString, OsString>,
         cwd: &Path,
+        argv0: Option<&OsStr>,
         args: &[OsString],
     ) -> std::io::Result<Self> {
         validate_cwd(cwd)?;
+        let executable = crate::startup::process_executable(
+            argv0,
+            value(env, crate::startup::TERMUX_EXECUTABLE_ENV),
+        )?;
         let command = args
             .first()
             .map(|arg| arg.as_os_str().as_encoded_bytes())
             .unwrap_or_default();
-        let source_root = match crate::startup::process_source_root() {
+        let source_root = match crate::startup::process_source_root(&executable) {
             Ok(root) => root,
             Err(error) if crate::startup::informational_command(command) => {
-                crate::startup::process_owner_root().map_err(|_| error)?
+                crate::startup::process_owner_root(&executable).map_err(|_| error)?
             }
             Err(error) => return Err(error),
         };
