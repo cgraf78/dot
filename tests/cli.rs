@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,10 @@ use std::os::unix::fs::PermissionsExt;
 
 use dot::cli::{Command as Decision, dispatch, init_acquires_lock};
 use dot::test_support::TempDir;
+
+// One legacy dispatch test must mutate process-global environment. Snapshot
+// tests share this lock so Rust's parallel runner cannot observe that fixture.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Extract the `dot_help` heredoc body from the shell source.
 fn shell_help() -> String {
@@ -48,6 +53,7 @@ fn bin() -> Command {
 
 #[test]
 fn native_update_flag_capture_does_not_mutate_parent_environment() {
+    let _env = ENV_LOCK.lock().expect("environment lock");
     // Provider `none` now keeps `--force` on the native path. The explicit
     // embedded runtime must still retain semantic stream, user-tree, and
     // state parity when it re-execs the real binary.
@@ -95,6 +101,7 @@ fn native_update_flag_capture_does_not_mutate_parent_environment() {
 
 #[test]
 fn app_runs_concurrent_native_contexts_without_mutating_process_environment() {
+    let _env = ENV_LOCK.lock().expect("environment lock");
     // Two embedded Runtime calls must become separate `dot` processes. Their
     // fake PATH entries hold actual overlay workers at the same test seam;
     // differing TMPDIR/WSL values prove the child inherits its Runtime map,
@@ -735,6 +742,7 @@ fn binary_unknown_non_utf8_matches_oracle() {
 
 #[test]
 fn update_passes_flag_exports_to_child_without_mutating_parent() {
+    let _env = ENV_LOCK.lock().expect("environment lock");
     // Slice 80 runs `Command::Update` end to end: the shell loop's
     // exports reach its child adapter, then the engine runs for real
     // — exit `0` on the empty-HOME fixture, never the interim
@@ -2577,6 +2585,43 @@ impl NativeUpdateFixture {
         self
     }
 
+    /// Install one trusted merge hook in the configured extension root. The
+    /// hook runs through the worker's one-use active-overlay context during
+    /// finalization, after the native link pass.
+    fn with_merge(self, script: &[u8]) -> Self {
+        self.with_merge_files(&[("10-config.sh", script)])
+    }
+
+    /// Install an ordered merge-hook fixture. Names are part of the merge
+    /// scheduler contract, so callers supply them explicitly for barriers and
+    /// deterministic replay cases.
+    fn with_merge_files(self, files: &[(&str, &[u8])]) -> Self {
+        let extensions = self.client.home.join("extensions");
+        let hooks = extensions.join("merge-hooks.d");
+        std::fs::create_dir_all(&hooks).expect("merge-hook directory");
+        for (name, script) in files {
+            std::fs::write(hooks.join(name), script).expect("merge hook");
+        }
+        std::fs::create_dir_all(self.client.xdg.join("dot")).expect("config directory");
+        std::fs::write(
+            self.client.xdg.join("dot/config"),
+            b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\n",
+        )
+        .expect("extension config");
+        #[cfg(unix)]
+        {
+            for path in [&extensions, &hooks] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                    .expect("private extension directory");
+            }
+            for (name, _) in files {
+                std::fs::set_permissions(hooks.join(name), std::fs::Permissions::from_mode(0o700))
+                    .expect("private merge hook");
+            }
+        }
+        self
+    }
+
     /// Add the smallest profile-aware policy to the otherwise clean native
     /// repository fixture. The existing `alpha` descriptor stays selected in
     /// phase one, so an exit through the poisoned adapter proves the profile
@@ -3053,6 +3098,302 @@ fn update_native_pre_sync_failure_streams_match_shell() {
     let native_run = native.rust_dot(&["update", "--quiet"]);
 
     assert_update_pair(&shell_run, &native_run, &shell, &native, "failed pre-sync");
+}
+
+#[test]
+fn update_native_merge_hook_matches_shell_without_the_legacy_adapter() {
+    // This catches reinstating `Fallback::MergeHooks`: the shell oracle must
+    // run one actual hook, while the native half has no usable old engine.
+    let shell = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { printf merged >\"$HOME/merge-hook-ran\"; }\n");
+    let native = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { printf merged >\"$HOME/merge-hook-ran\"; }\n");
+
+    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |cmd| {
+        cmd.env("DOT_MERGE_JOBS", "1000000000");
+    });
+    assert_eq!(shell_run.status.code(), Some(0), "shell merge-hook status");
+    assert_eq!(
+        std::fs::read(shell.client.home.join("merge-hook-ran")).expect("shell merge marker"),
+        b"merged",
+        "shell merge hook ran"
+    );
+    native.break_shell_engine();
+    let native_run = native.rust_dot_with(&["update", "--quiet"], |cmd| {
+        cmd.env("DOT_MERGE_JOBS", "1000000000");
+    });
+
+    assert_update_pair(
+        &shell_run,
+        &native_run,
+        &shell,
+        &native,
+        "merge-hook success",
+    );
+    assert_eq!(
+        std::fs::read(native.client.home.join("merge-hook-ran")).expect("native merge marker"),
+        b"merged",
+        "native merge hook ran"
+    );
+}
+
+#[test]
+fn update_native_verbose_merge_replays_hook_output_in_declaration_order() {
+    // A missing stage update or replay would make the quiet happy-path pass
+    // while losing the human-visible hook result contract.
+    let hooks: &[(&str, &[u8])] = &[
+        (
+            "10-alpha.sh",
+            b"merge() { i=0; while [[ ! -e $HOME/beta-ready ]]; do (( i += 1 )); (( i < 200 )) || return 9; sleep 0.01; done; printf 'Alpha result\\nalpha detail\\n'; printf alpha >\"$HOME/alpha-done\"; }\n",
+        ),
+        (
+            "11-beta.sh",
+            b"merge() { printf ready >\"$HOME/beta-ready\"; i=0; while [[ ! -e $HOME/gamma-ready ]]; do (( i += 1 )); (( i < 200 )) || return 9; sleep 0.01; done; printf 'Beta result\\nbeta detail\\n'; printf beta >\"$HOME/beta-done\"; }\n",
+        ),
+        (
+            "12-gamma.sh",
+            b"merge() { printf ready >\"$HOME/gamma-ready\"; printf 'Gamma result\\ngamma detail\\n'; printf gamma >\"$HOME/gamma-done\"; }\n",
+        ),
+        (
+            "20-barrier.serial.sh",
+            b"merge() { [[ $(<\"$HOME/alpha-done\") == alpha && $(<\"$HOME/beta-done\") == beta && $(<\"$HOME/gamma-done\") == gamma ]] || return 9; printf 'Barrier result\\n'; printf barrier >\"$HOME/barrier-done\"; }\n",
+        ),
+        (
+            "30-delta.sh",
+            b"merge() { [[ $(<\"$HOME/barrier-done\") == barrier ]] || return 9; printf 'Delta result\\n'; printf delta >\"$HOME/delta-done\"; }\n",
+        ),
+    ];
+    let shell = NativeUpdateFixture::stage().with_merge_files(hooks);
+    let native = NativeUpdateFixture::stage().with_merge_files(hooks);
+
+    let shell_run = shell.shell_dot_with(&["update", "--verbose"], |cmd| {
+        // Force a two-worker batch even on a one-core runner. The serial hook
+        // proves the whole batch joined before its barrier starts.
+        cmd.env("DOT_UPDATE_JOBS", "1");
+        cmd.env("DOT_MERGE_JOBS", "2");
+    });
+    assert_eq!(
+        shell_run.status.code(),
+        Some(0),
+        "shell verbose merge status"
+    );
+    assert!(has_bytes(&shell_run.stdout, b"Alpha result"));
+    assert!(has_bytes(&shell_run.stdout, b"Beta result"));
+    assert!(has_bytes(&shell_run.stdout, b"Gamma result"));
+    assert!(has_bytes(&shell_run.stdout, b"Barrier result"));
+    assert!(has_bytes(&shell_run.stdout, b"Delta result"));
+    native.break_shell_engine();
+    let native_run = native.rust_dot_with(&["update", "--verbose"], |cmd| {
+        cmd.env("DOT_UPDATE_JOBS", "1");
+        cmd.env("DOT_MERGE_JOBS", "2");
+    });
+
+    assert_eq!(native_run.status.code(), shell_run.status.code());
+    let shell_stdout = scrub_twin(
+        &scrub_merge_durations(&shell_run.stdout),
+        shell.client.scope.path(),
+    );
+    let native_stdout = scrub_twin(
+        &scrub_merge_durations(&native_run.stdout),
+        native.client.scope.path(),
+    );
+    assert_eq!(native_stdout, shell_stdout, "verbose ordered merge stdout");
+    for output in [&shell_stdout, &native_stdout] {
+        let positions = [
+            "Alpha result",
+            "Beta result",
+            "Gamma result",
+            "Barrier result",
+            "Delta result",
+        ]
+        .map(|label| {
+            output
+                .windows(label.len())
+                .position(|window| window == label.as_bytes())
+                .expect("merge result label")
+        });
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "parallel captures replay in declaration order before and after the serial barrier: {output:?}"
+        );
+    }
+    assert_eq!(
+        scrub_twin(&native_run.stderr, native.client.scope.path()),
+        scrub_twin(&shell_run.stderr, shell.client.scope.path()),
+        "verbose ordered merge stderr",
+    );
+    for fixture in [&shell, &native] {
+        assert_eq!(
+            std::fs::read(fixture.client.home.join("delta-done")).expect("post-barrier marker"),
+            b"delta",
+            "post-barrier hook ran after the serial hook"
+        );
+    }
+}
+
+#[test]
+fn update_native_verbose_merge_preserves_non_utf8_output() {
+    let script = b"merge() { printf 'Binary '; printf '\\377'; printf 'A\\0B\\n'; }\n";
+    let shell = NativeUpdateFixture::stage().with_merge(script);
+    let native = NativeUpdateFixture::stage().with_merge(script);
+
+    let shell_run = shell.shell_dot_with(&["update", "--verbose"], |_| {});
+    assert_eq!(
+        shell_run.status.code(),
+        Some(0),
+        "shell binary-output status"
+    );
+    assert!(
+        shell_run.stdout.contains(&0xff),
+        "shell oracle preserves the non-UTF-8 byte"
+    );
+    assert!(
+        !shell_run.stdout.contains(&0),
+        "shell variables discard NUL bytes while parsing hook output"
+    );
+    assert!(has_bytes(&shell_run.stdout, b"AB"));
+    native.break_shell_engine();
+    let native_run = native.rust_dot(&["update", "--verbose"]);
+
+    assert_eq!(native_run.status.code(), shell_run.status.code());
+    assert_eq!(
+        scrub_twin(
+            &scrub_merge_durations(&native_run.stdout),
+            native.client.scope.path(),
+        ),
+        scrub_twin(
+            &scrub_merge_durations(&shell_run.stdout),
+            shell.client.scope.path(),
+        ),
+        "verbose binary merge stdout",
+    );
+    assert_eq!(
+        scrub_twin(&native_run.stderr, native.client.scope.path()),
+        scrub_twin(&shell_run.stderr, shell.client.scope.path()),
+        "verbose binary merge stderr",
+    );
+    assert!(
+        native_run.stdout.contains(&0xff),
+        "native replay preserves the non-UTF-8 byte"
+    );
+    assert!(
+        !native_run.stdout.contains(&0),
+        "native replay matches Bash variable NUL handling"
+    );
+}
+
+#[test]
+fn update_native_merge_without_an_entry_point_matches_shell_failure() {
+    // A helper-looking `*.sh` is discovered, but the worker writes a zero
+    // merge record and exits nonzero. It must still fail the aggregate stage.
+    let shell = NativeUpdateFixture::stage().with_merge(b"helper() { :; }\n");
+    let native = NativeUpdateFixture::stage().with_merge(b"helper() { :; }\n");
+
+    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
+    assert_eq!(
+        shell_run.status.code(),
+        Some(1),
+        "shell missing-entry status"
+    );
+    native.break_shell_engine();
+    let native_run = native.rust_dot(&["update", "--quiet"]);
+
+    assert_update_pair(
+        &shell_run,
+        &native_run,
+        &shell,
+        &native,
+        "missing merge entry point",
+    );
+}
+
+#[test]
+fn update_native_unsafe_merge_hook_refusal_matches_shell() {
+    // Discovery must reject an unsafe entry point before either engine runs it;
+    // poisoning the adapter still proves native handling of that refusal.
+    let shell = NativeUpdateFixture::stage().with_merge(b"merge() { :; }\n");
+    let native = NativeUpdateFixture::stage().with_merge(b"merge() { :; }\n");
+    for fixture in [&shell, &native] {
+        std::fs::set_permissions(
+            fixture
+                .client
+                .home
+                .join("extensions/merge-hooks.d/10-config.sh"),
+            std::fs::Permissions::from_mode(0o666),
+        )
+        .expect("make merge hook unsafe");
+    }
+
+    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
+    assert_eq!(shell_run.status.code(), Some(1), "shell unsafe-hook status");
+    assert!(has_bytes(&shell_run.stderr, b"unsafe merge hook"));
+    native.break_shell_engine();
+    let native_run = native.rust_dot(&["update", "--quiet"]);
+
+    assert_update_pair(
+        &shell_run,
+        &native_run,
+        &shell,
+        &native,
+        "unsafe merge hook",
+    );
+}
+
+#[test]
+fn update_native_failed_merge_hook_matches_shell() {
+    // Failed hooks retain their ordered capture for a non-verbose update and
+    // still make the aggregate Configs stage fail.
+    let script = b"merge() { printf 'merge stdout\\n'; printf 'merge stderr\\n' >&2; return 7; }\n";
+    let shell = NativeUpdateFixture::stage().with_merge(script);
+    let native = NativeUpdateFixture::stage().with_merge(script);
+
+    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
+    assert_eq!(
+        shell_run.status.code(),
+        Some(1),
+        "shell merge failure status"
+    );
+    assert!(has_bytes(&shell_run.stderr, b"10-config output:"));
+    assert!(has_bytes(&shell_run.stderr, b"merge stdout\n"));
+    assert!(has_bytes(&shell_run.stderr, b"merge stderr\n"));
+    native.break_shell_engine();
+    let native_run = native.rust_dot(&["update", "--quiet"]);
+
+    assert_update_pair(
+        &shell_run,
+        &native_run,
+        &shell,
+        &native,
+        "failed merge hook",
+    );
+}
+
+#[test]
+fn update_native_merge_context_matches_shell() {
+    // Merge hooks receive the one-use active-overlay context used by Bash;
+    // this oracle observes the values from inside the actual worker.
+    let script = b"merge() {\n  [[ $REPLY_SET_KIND == active && $REPLY_STAGE == none && ${#OVERLAYS[@]} -eq 1 && ${OVERLAYS[0]} == alpha\\|* ]] || return 8\n  printf '%s:%s:%s' \"$REPLY_SET_KIND\" \"$REPLY_STAGE\" \"${OVERLAYS[0]%%|*}\" >\"$HOME/merge-context\"\n}\n";
+    let shell = NativeUpdateFixture::stage().with_merge(script);
+    let native = NativeUpdateFixture::stage().with_merge(script);
+
+    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
+    assert_eq!(
+        shell_run.status.code(),
+        Some(0),
+        "shell merge context status"
+    );
+    assert_eq!(
+        std::fs::read(shell.client.home.join("merge-context")).expect("shell merge context"),
+        b"active:none:alpha"
+    );
+    native.break_shell_engine();
+    let native_run = native.rust_dot(&["update", "--quiet"]);
+
+    assert_update_pair(&shell_run, &native_run, &shell, &native, "merge context");
+    assert_eq!(
+        std::fs::read(native.client.home.join("merge-context")).expect("native merge context"),
+        b"active:none:alpha"
+    );
 }
 
 #[test]
@@ -3706,36 +4047,147 @@ fn has_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 /// still fail loudly. (The suite `(Ns)` marks use the existing
 /// [`scrub_elapsed`] instead.)
 fn scrub_update_elapsed(bytes: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(bytes).into_owned();
-    let mut scrubbed = String::with_capacity(text.len());
-    let mut digits = String::new();
-    for cell in text.chars() {
-        if cell.is_ascii_digit() {
-            digits.push(cell);
-            continue;
-        }
-        if cell == 's' && !digits.is_empty() {
-            let seconds: i64 = digits.parse().expect("elapsed digits parse");
+    let mut out = Vec::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let body_len = line.strip_suffix(b"\n").map_or(line.len(), <[u8]>::len);
+        let body = &line[..body_len];
+        let completion_prefix = [b"Done in ".as_slice(), b"Done with errors in ".as_slice()]
+            .into_iter()
+            .find(|prefix| body.starts_with(prefix));
+        let range = if let Some(prefix) = completion_prefix {
+            let tail = &body[prefix.len()..];
+            let digits = tail.iter().take_while(|byte| byte.is_ascii_digit()).count();
+            let suffix = &tail[digits..];
+            let valid_suffix = suffix == b"s"
+                || suffix == b"s. Reload your shell: source ~/.bashrc"
+                || suffix == b"s. Reload your shell: source ~/.zshrc";
+            (digits > 0 && valid_suffix).then_some((prefix.len(), prefix.len() + digits, None))
+        } else if body.starts_with(b"[") {
+            let close = body.iter().position(|byte| *byte == b']');
+            let valid_prefix = close.is_some_and(|close| {
+                let mut counts = body[1..close].split(|byte| *byte == b'/');
+                let done = counts.next().unwrap_or_default();
+                let total = counts.next().unwrap_or_default();
+                !done.is_empty()
+                    && done.iter().all(u8::is_ascii_digit)
+                    && !total.is_empty()
+                    && total.iter().all(u8::is_ascii_digit)
+                    && counts.next().is_none()
+                    && body.get(close + 1) == Some(&b' ')
+            });
+            let start = body
+                .iter()
+                .rposition(|byte| *byte == b' ')
+                .map_or(0, |index| index + 1);
+            let token = &body[start..];
+            token
+                .strip_suffix(b"s")
+                .filter(|digits| {
+                    valid_prefix && !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+                })
+                .map(|digits| {
+                    let gap_start = body[..start]
+                        .iter()
+                        .rposition(|byte| *byte != b' ')
+                        .map_or(0, |index| index + 1);
+                    (start, start + digits.len(), Some(gap_start))
+                })
+        } else {
+            None
+        };
+        if let Some((start, end, gap_start)) = range {
+            let seconds = std::str::from_utf8(&body[start..end])
+                .expect("elapsed ASCII digits")
+                .parse::<i64>()
+                .expect("elapsed digits parse");
             assert!(
-                (0..10).contains(&seconds),
+                (0..=120).contains(&seconds),
                 "elapsed stamp out of sane range: {seconds}s",
             );
-            scrubbed.push_str("@ELAPSED@s");
-            digits.clear();
-            continue;
+            out.extend_from_slice(&body[..gap_start.unwrap_or(start)]);
+            if gap_start.is_some() {
+                out.push(b' ');
+            }
+            out.extend_from_slice(b"@ELAPSED@");
+            out.extend_from_slice(&body[end..]);
+        } else {
+            out.extend_from_slice(body);
         }
-        scrubbed.push_str(&digits);
-        digits.clear();
-        scrubbed.push(cell);
+        if body_len != line.len() {
+            out.push(b'\n');
+        }
     }
-    scrubbed.push_str(&digits);
-    scrubbed.into_bytes()
+    out
+}
+
+/// Worker durations are per-process timing fields, so verbose merge twins
+/// compare their rendered shape after preserving the rest of each row exactly.
+fn scrub_merge_durations(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let body_len = line.strip_suffix(b"\n").map_or(line.len(), <[u8]>::len);
+        let body = &line[..body_len];
+        let is_result = body.starts_with(b"  ok ") || body.starts_with(b"  warning ");
+        let start = body
+            .iter()
+            .rposition(|byte| *byte == b' ')
+            .map_or(0, |index| index + 1);
+        let token = &body[start..];
+        let number = token
+            .strip_suffix(b"ms")
+            .or_else(|| token.strip_suffix(b"s"));
+        let valid = number.is_some_and(|number| {
+            let mut pieces = number.split(|byte| *byte == b'.');
+            let whole = pieces.next().unwrap_or_default();
+            let fraction = pieces.next();
+            !whole.is_empty()
+                && whole.iter().all(u8::is_ascii_digit)
+                && fraction
+                    .is_none_or(|part| !part.is_empty() && part.iter().all(u8::is_ascii_digit))
+                && pieces.next().is_none()
+        });
+        if is_result && valid {
+            out.extend_from_slice(&body[..start]);
+            out.extend_from_slice(b"@ELAPSED@s");
+        } else {
+            out.extend_from_slice(body);
+        }
+        if body_len != line.len() {
+            out.push(b'\n');
+        }
+    }
+    out
 }
 
 /// Twin outputs compared on behavior: scope paths, then elapsed
 /// stamps, scrubbed identically on both sides.
 fn scrub_twin(bytes: &[u8], scope: &std::path::Path) -> Vec<u8> {
     scrub_update_elapsed(&scrub_scope(bytes, scope))
+}
+
+#[test]
+fn update_twin_duration_normalizers_cover_slow_ci_formats() {
+    assert_eq!(
+        scrub_update_elapsed(
+            b"Done in 10s\nDone with errors in 10s\nDone in 10s. Reload your shell: source ~/.zshrc\n"
+        ),
+        b"Done in @ELAPSED@s\nDone with errors in @ELAPSED@s\nDone in @ELAPSED@s. Reload your shell: source ~/.zshrc\n"
+    );
+    assert_eq!(
+        scrub_update_elapsed(
+            b"[1/5] Repos      changed  3 repos changed, 0 repos current               9s\n\
+              [1/5] Repos      changed  3 repos changed, 0 repos current              10s\n"
+        ),
+        b"[1/5] Repos      changed  3 repos changed, 0 repos current @ELAPSED@s\n\
+          [1/5] Repos      changed  3 repos changed, 0 repos current @ELAPSED@s\n"
+    );
+    assert_eq!(
+        scrub_merge_durations(b"  ok Alpha 999ms\n  ok Beta 1.2s\n"),
+        b"  ok Alpha @ELAPSED@s\n  ok Beta @ELAPSED@s\n"
+    );
+    let semantic = b"[hook diagnostic] 10s\nDone in 10s ago\n[1/5] Repos 1 passed 10s ago\n    retry after 1.2s\nSuites: 10 passed\n\xff\n";
+    assert_eq!(scrub_update_elapsed(semantic), semantic);
+    assert_eq!(scrub_merge_durations(semantic), semantic);
 }
 
 #[test]

@@ -81,6 +81,19 @@ impl Worker {
         separate(&mut command, &call.temporary)
     }
 
+    /// Run one merge hook through the same authenticated worker boundary. Merge
+    /// output deliberately keeps Bash's ordered `2>&1` capture contract.
+    pub(crate) fn merge(
+        &mut self,
+        script: &Path,
+        temporary: &Path,
+        result: &Path,
+        context: &Path,
+        token: &str,
+    ) -> WorkerOutcome {
+        self.launch("merge", script, temporary, result, context, token)
+    }
+
     fn command(
         &self,
         mode: &str,
