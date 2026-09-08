@@ -22,14 +22,12 @@
 //! [`init_client_command::run`]; slice 82 drives
 //! `fetch`/`push`/`status`/`diff` through overlay resolution
 //! ([`crate::overlays::resolve`]) plus the matching
-//! [`crate::repos_commands`] kernel. Slice 83 drives
-//! [`Command::Doctor`] and [`Command::Test`] end to end through the
-//! shared `ENGINE_SCRIPT` adapter below: the child mirrors the
+//! [`crate::repos_commands`] kernel. Slice 83 drives [`Command::Test`]
+//! end to end through the `ENGINE_SCRIPT` adapter below: the child mirrors the
 //! `*)` arm of `lib/dot/main.sh` and calls `dot_command_dispatch`,
-//! so the shell arm bodies (traps, resolve gating, kernels) run
-//! exactly as production runs them — exit codes plus output parity and
-//! resolve-failure paths included. This adapter is not reachable from the
-//! native [`Command::Update`] arm.
+//! so the shell test body runs exactly as production runs it — exit codes plus
+//! output parity and resolve-failure paths included. This adapter is not
+//! reachable from the native [`Command::Doctor`] or [`Command::Update`] arms.
 //! Slice 84 runs the startup
 //! prelude ([`crate::startup`]) at the top of [`run`]: the re-exec
 //! guard (exit 1) then `dot_config_load || exit 2` before dispatch
@@ -180,10 +178,8 @@ pub enum Command {
     /// with `return "$rc"`, but production runs under `set -euo
     /// pipefail`, so a failing kernel exits the process with its own
     /// code before the dispatcher resumes — the [`Command::Init`]
-    /// precedent, pinned against `bin/dot`). Wired by slice 83
-    /// through `run_engine_arm`: the adapter child runs the shell
-    /// arm body exactly as production does, while step execution
-    /// (checks, workers) stays shell-owned until its slices land.
+    /// precedent, pinned against `bin/dot`). The native coordinator owns the
+    /// complete check, extension, and rendering path.
     Doctor,
     /// `test`: owner traps, `_dot_resolve_overlays inspect` (failure
     /// returns `1`), then `dot_test_command "$@"` whose status becomes
@@ -341,7 +337,11 @@ pub(crate) fn run_with_runtime(
                 let rest: Vec<OsString> = args.collect();
                 run_repos(runtime, command, &rest, stdout, stderr)
             }
-            Command::Doctor | Command::Test => {
+            Command::Doctor => {
+                let mut streams = crate::app::Streams::new(stdout, stderr);
+                crate::doctor::run(runtime, &mut streams)
+            }
+            Command::Test => {
                 let rest: Vec<OsString> = args.collect();
                 run_engine_arm(runtime, other, &rest, stdout, stderr, &mut failed)
             }
@@ -411,28 +411,19 @@ fn run_update(
     )
 }
 
-/// Engine adapter script shared by the [`Command::Doctor`] and
-/// [`Command::Test`] arms (slice 83): mirrors the `*)` arm of
-/// `lib/dot/main.sh` with the final `dot_command_dispatch` kept, so
-/// the shell arm bodies — owner traps, resolve gating
-/// (`DOT_OVERLAY_DISCOVERY_SILENT=1` plus `_dot_resolve_overlays
-/// inspect` for doctor, plain inspect for test), kernels — run
-/// exactly as production runs them. `$0` is the invoked command
-/// spelling (`doctor` or `test`), `$@` is the residue after it, so
+/// Engine adapter script for the [`Command::Test`] arm (slice 83): mirrors the `*)` arm of
+/// `lib/dot/main.sh` with the final `dot_command_dispatch` kept, so the shell test body — owner
+/// traps, resolve gating, and kernel — runs exactly as production runs it. `$0` is the `test`
+/// command spelling and `$@` is the residue after it, so
 /// `DOT_ORIGINAL_ARGV=("$0" "$@")` reproduces the production
 /// original argv exactly (the [`update_run`](crate::update_run)
 /// adapter precedent) — and the dispatch call reads the spelling
 /// back out of `$0`, which `bash -c` consumes outside `"$@"`.
 ///
-/// Two interim gaps are documented, not hidden:
+/// Two adapter gaps are documented, not hidden:
 ///
 /// - The adapter uses `${DOT_BASH:-bash}` from `PATH` instead of the
-///   checkout-bash resolver: a fully-native later slice removes the
-///   subprocess entirely (that slice assembles
-///   [`doctor_orchestrator::run_doctor`](crate::doctor_orchestrator::run_doctor)
-///   with the ported [`crate::doctor_checks`] kernels plus the
-///   [`crate::test_suites`] scheduler, reusing
-///   [`crate::overlay_context`] for resolution).
+///   checkout-bash resolver: a fully-native test slice removes the subprocess entirely.
 /// - Colors and live progress follow the child's pipes (never a tty),
 ///   so interactive-terminal cosmetics match a piped shell run rather
 ///   than a direct-to-tty one; rows and codes are unaffected.
@@ -466,12 +457,10 @@ dot_config_load || exit 2
 dot_command_dispatch "$0" "$@"
 "#;
 
-/// The [`Command::Doctor`] and [`Command::Test`] arms: execute the
-/// engine adapter and report its exit code.
+/// The [`Command::Test`] arm: execute the engine adapter and report its exit code.
 ///
 /// `command` names the invoked spelling for `DOT_ORIGINAL_ARGV`;
-/// `args` is the residue after it (ignored by the doctor arm, parsed
-/// by `dot_test_command`). A closed pipe must not report success for
+/// `args` is the residue parsed by `dot_test_command`. A closed pipe must not report success for
 /// undelivered output, so forwarding failures flip `failed`, which
 /// [`run`] turns into [`EXIT_ERROR`] like the other arms (the shell
 /// dies on SIGPIPE; Rust reports failure via exit code — same signal
@@ -484,7 +473,7 @@ fn run_engine_arm(
     stderr: &mut dyn Write,
     failed: &mut bool,
 ) -> i32 {
-    let spelling = if command == b"test" { "test" } else { "doctor" };
+    debug_assert_eq!(command, b"test");
     // Trampoline normalization (like `bin/dot`): a relative state
     // root must read as unset for the engine child inheriting this
     // environment. Unlike [`update_run`](crate::update_run), no
@@ -503,7 +492,7 @@ fn run_engine_arm(
     cmd.arg("--norc");
     cmd.arg("-c");
     cmd.arg(ENGINE_SCRIPT);
-    cmd.arg(spelling);
+    cmd.arg("test");
     for arg in args {
         cmd.arg(arg);
     }
