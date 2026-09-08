@@ -96,9 +96,9 @@ _dot_update "$@"
 /// Resolve the XDG state home exactly like the shell bootstrap:
 /// `bin/dot` unsets a relative `$XDG_STATE_HOME` before the
 /// resolver runs, so relative reads as unset (HOME fallback) here
-/// too. Returns `None` when neither yields an absolute base, which
-/// the shell's `_dot_update_lock_path` reports as a silent `1`.
-fn state_dir(env: &BTreeMap<OsString, OsString>) -> Option<PathBuf> {
+/// too. The typed XDG error carries the shell's silent status when
+/// neither value yields an absolute base.
+fn state_dir(env: &BTreeMap<OsString, OsString>) -> Result<PathBuf, crate::xdg::Error> {
     let raw = env
         .get(OsStr::new("XDG_STATE_HOME"))
         .and_then(|value| value.to_str())
@@ -108,9 +108,7 @@ fn state_dir(env: &BTreeMap<OsString, OsString>) -> Option<PathBuf> {
         .get(OsStr::new("HOME"))
         .and_then(|value| value.to_str())
         .unwrap_or_default();
-    xdg::base(xdg::Kind::State, xdg_value, home)
-        .ok()
-        .map(PathBuf::from)
+    xdg::base(xdg::Kind::State, xdg_value, home).map(PathBuf::from)
 }
 
 /// Whether the update runs in cron mode: the shell lock acquisition
@@ -147,8 +145,9 @@ pub fn run(
     if relative_state {
         child_env.remove(OsStr::new("XDG_STATE_HOME"));
     }
-    let Some(state) = state_dir(&child_env) else {
-        return crate::cli::EXIT_ERROR;
+    let state = match state_dir(&child_env) {
+        Ok(state) => state,
+        Err(error) => return error.code(),
     };
     // Lock warnings are never quiet-gated (`_warn` semantics) and the
     // injected streams are never a tty, so color is always off here —
@@ -209,28 +208,32 @@ fn run_update_or_engine(
         == Some("1");
     if native {
         if let Some(state_home) = context.state.to_str() {
-            if let Some(gathered) = crate::update_engine::gather(
+            match crate::update_engine::gather(
                 args,
                 context.runtime.source_root(),
                 state_home,
                 context.env,
                 context.runtime.cwd(),
             ) {
-                let inputs = gathered.inputs();
-                let now = crate::update_engine::now_secs();
-                let mut out = Vec::new();
-                let mut err = Vec::new();
-                if let Some(code) =
-                    crate::update_engine::run_update(&inputs, &mut out, &mut err, now)
-                {
-                    if stdout.write_all(&out).is_err() {
-                        *failed = true;
+                Ok(Some(gathered)) => {
+                    let inputs = gathered.inputs();
+                    let now = crate::update_engine::now_secs();
+                    let mut out = Vec::new();
+                    let mut err = Vec::new();
+                    if let Some(code) =
+                        crate::update_engine::run_update(&inputs, &mut out, &mut err, now)
+                    {
+                        if stdout.write_all(&out).is_err() {
+                            *failed = true;
+                        }
+                        if stderr.write_all(&err).is_err() {
+                            *failed = true;
+                        }
+                        return code;
                     }
-                    if stderr.write_all(&err).is_err() {
-                        *failed = true;
-                    }
-                    return code;
                 }
+                Ok(None) => {}
+                Err(error) => return error.code(),
             }
         }
     }
@@ -326,8 +329,8 @@ mod tests {
             ),
             (OsString::from("HOME"), OsString::from("/home/fixture")),
         ]);
-        let resolved = state_dir(&env);
-        assert_eq!(resolved, Some(PathBuf::from("/home/fixture/.local/state")));
+        let resolved = state_dir(&env).expect("relative state falls back to home");
+        assert_eq!(resolved, PathBuf::from("/home/fixture/.local/state"));
     }
 
     #[test]

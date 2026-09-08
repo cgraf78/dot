@@ -48,9 +48,9 @@ fn bin() -> Command {
 
 #[test]
 fn native_update_flag_capture_does_not_mutate_parent_environment() {
-    // `--force` deliberately declines the native engine after its capture.
-    // Its shell adapter must retain semantic stream, user-tree, and state
-    // parity when an embedded Runtime re-execs the real binary.
+    // Provider `none` now keeps `--force` on the native path. The explicit
+    // embedded runtime must still retain semantic stream, user-tree, and
+    // state parity when it re-execs the real binary.
     let parent = native_parent_snapshot();
     let shell_client = stage_repos_client();
     let native_client = stage_repos_client();
@@ -2523,6 +2523,180 @@ fn repos_rust_native(client: &ReposClient, argv: &[&str]) -> std::process::Outpu
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.output().expect("run dot binary")
+}
+
+/// A native-update client whose shell adapter can be made impossible to use.
+///
+/// The sentinel is deliberately an executable rather than a missing command:
+/// a fallback then leaves an unambiguous byte in stderr instead of looking
+/// like an unrelated launcher failure. Native rows must never execute it.
+struct NativeUpdateFixture {
+    client: ReposClient,
+    shell_poison: PathBuf,
+}
+
+impl NativeUpdateFixture {
+    fn stage() -> Self {
+        let client = stage_repos_client();
+        let shell_poison = client.scope.path().join("old-update-engine");
+        Self {
+            client,
+            shell_poison,
+        }
+    }
+
+    fn break_shell_engine(&self) {
+        std::fs::write(
+            &self.shell_poison,
+            b"#!/bin/sh\nprintf 'OLD-UPDATE-ENGINE\n' >&2\nexit 97\n",
+        )
+        .expect("write shell poison");
+        #[cfg(unix)]
+        std::fs::set_permissions(&self.shell_poison, std::fs::Permissions::from_mode(0o755))
+            .expect("mark shell poison executable");
+    }
+
+    fn rust_dot(&self, argv: &[&str]) -> std::process::Output {
+        self.rust_dot_with(argv, |_| {})
+    }
+
+    fn rust_dot_with(
+        &self,
+        argv: &[&str],
+        configure: impl FnOnce(&mut Command),
+    ) -> std::process::Output {
+        let mut cmd = bin();
+        for arg in argv {
+            cmd.arg(arg);
+        }
+        repos_env(&mut cmd, &self.client, true);
+        cmd.env("DOT_UPDATE_NATIVE", "1");
+        if self.shell_poison.exists() {
+            cmd.env("DOT_BASH", &self.shell_poison);
+        }
+        configure(&mut cmd);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.output().expect("run native update")
+    }
+}
+
+fn assert_native_silent(output: &std::process::Output, label: &str) {
+    assert_eq!(output.status.code(), Some(0), "{label} status");
+    assert!(output.stdout.is_empty(), "{label} stdout");
+    assert!(output.stderr.is_empty(), "{label} stderr");
+}
+
+#[test]
+fn update_native_entry_edges_do_not_invoke_shell_engine() {
+    // Each row poisons only update's legacy adapter. A passing assertion is
+    // therefore native evidence, not an accidentally-green shell oracle.
+    let clean = NativeUpdateFixture::stage();
+    clean.break_shell_engine();
+    assert_native_silent(&clean.rust_dot(&["update", "--cron"]), "clean cron");
+
+    let mtime = NativeUpdateFixture::stage();
+    let tracked = mtime.client.home.join("tracked.txt");
+    let modified = std::fs::metadata(&tracked)
+        .expect("stat tracked file")
+        .modified()
+        .expect("tracked mtime");
+    std::fs::File::options()
+        .write(true)
+        .open(&tracked)
+        .expect("open tracked file")
+        .set_modified(modified + Duration::from_secs(2))
+        .expect("bump tracked mtime");
+    mtime.break_shell_engine();
+    assert_native_silent(&mtime.rust_dot(&["update", "--cron"]), "mtime cron");
+
+    let unresolved = NativeUpdateFixture::stage();
+    std::fs::write(unresolved.client.home.join("tracked.txt"), b"local edit\n")
+        .expect("make unresolved edit");
+    unresolved.break_shell_engine();
+    assert_native_silent(
+        &unresolved.rust_dot(&["update", "--cron"]),
+        "unresolved cron",
+    );
+    assert_eq!(
+        std::fs::read(unresolved.client.home.join("tracked.txt")).expect("read unresolved edit"),
+        b"local edit\n",
+        "cron must leave a real local edit alone",
+    );
+
+    let force = NativeUpdateFixture::stage();
+    force.break_shell_engine();
+    assert_native_silent(
+        &force.rust_dot(&["update", "--quiet", "--force"]),
+        "force with provider none",
+    );
+
+    let frozen = NativeUpdateFixture::stage();
+    frozen.break_shell_engine();
+    assert_native_silent(
+        &frozen.rust_dot_with(&["update", "--quiet"], |cmd| {
+            cmd.env("DOT_OVERLAY_LINKS_FROZEN", "1");
+        }),
+        "stale frozen marker",
+    );
+}
+
+#[test]
+fn update_native_invalid_home_never_runs_shell_engine() {
+    for (label, home, state) in [
+        ("missing absolute state", None, Some("state")),
+        (
+            "relative absolute state",
+            Some("relative-home"),
+            Some("state"),
+        ),
+        ("missing absent state", None, None),
+        ("relative absent state", Some("relative-home"), None),
+    ] {
+        let fixture = NativeUpdateFixture::stage();
+        let state_path = fixture.client.scope.path().join("invalid-home-state");
+        fixture.break_shell_engine();
+        let output = fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
+            match home {
+                Some(home) => {
+                    cmd.env("HOME", home);
+                }
+                None => {
+                    cmd.env_remove("HOME");
+                }
+            }
+            // Keep startup's config lookup independently resolvable. The
+            // update entry itself, not config loading, owns this error row.
+            cmd.env("XDG_CONFIG_HOME", &fixture.client.xdg);
+            match state {
+                Some(_) => {
+                    cmd.env("XDG_STATE_HOME", &state_path);
+                }
+                None => {
+                    cmd.env_remove("XDG_STATE_HOME");
+                }
+            }
+        });
+        assert_eq!(output.status.code(), Some(1), "{label} status");
+        assert!(output.stdout.is_empty(), "{label} stdout");
+        assert!(output.stderr.is_empty(), "{label} stderr");
+    }
+}
+
+#[test]
+fn update_native_force_with_provider_stays_on_the_shell_adapter() {
+    // Task 3 removes the force-only fallback, not Task 6's provider lane.
+    // Here the poison is the expected result: it proves a configured provider
+    // still selects the shell adapter even when --force is also present.
+    let fixture = NativeUpdateFixture::stage();
+    fixture.break_shell_engine();
+    let output = fixture.rust_dot_with(&["update", "--quiet", "--force"], |cmd| {
+        cmd.env("DOT_DEPENDENCY_PROVIDER", "shdeps");
+    });
+    assert_eq!(output.status.code(), Some(97));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(output.stderr, b"OLD-UPDATE-ENGINE\n");
 }
 
 /// Scrub one twin's temp scope (every home, XDG, origin, and state
