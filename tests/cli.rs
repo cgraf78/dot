@@ -1136,7 +1136,14 @@ fn repos_status_ahead_behind_matches_shell() {
     repos_git_prefix(
         &client.base_git_dir,
         &client.home,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "add",
+            "tracked.txt",
+        ],
     );
     repos_git_prefix(
         &client.base_git_dir,
@@ -1160,6 +1167,10 @@ fn repos_status_ahead_behind_matches_shell() {
     let text = String::from_utf8_lossy(&shell.stdout).into_owned();
     assert!(text.contains("ahead"), "oracle reports ahead: {text}");
     assert!(text.contains("behind"), "oracle reports behind: {text}");
+    assert!(
+        !text.contains(".dotfiles/index"),
+        "fixture must not track its own Git metadata: {text}",
+    );
     check_repos(&client, &["status"]);
 }
 
