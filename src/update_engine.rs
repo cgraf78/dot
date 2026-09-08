@@ -16,8 +16,8 @@
 //! native only inside a conservative envelope, and the caller
 //! falls back to the shell adapter outside it:
 //!
-//! - `DOT_DEPENDENCY_PROVIDER=shdeps` stays shell (ensure plus the
-//!   updater UI have no native ports yet; `none` runs natively).
+//! - unknown dependency-provider values stay shell until the unconditional
+//!   update cutover; `none` and `shdeps` run natively.
 //!
 //! `DOT_UPDATE_NATIVE=1` selects this lane when the envelope accepts
 //! the invocation; the caller runs the shell adapter for every
@@ -59,6 +59,8 @@ pub struct EngineInputs<'a> {
     pub flags: UpdateFlags,
     /// Residue after flags (forwarded to the pull phases).
     pub extra_args: &'a [std::ffi::OsString],
+    /// Original update arguments, preserved for a provider-triggered re-entry.
+    pub original_args: &'a [std::ffi::OsString],
     /// Client `$HOME`.
     pub home: &'a str,
     /// Resolved XDG state home.
@@ -129,10 +131,6 @@ pub struct EngineInputs<'a> {
 /// adapter instead). Every reason names the missing native port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fallback {
-    /// `DOT_DEPENDENCY_PROVIDER` is not `none`: ensure plus the
-    /// updater UI are shell-only (anything but `none` also covers
-    /// the shell's `shdeps unavailable` close).
-    ShdepsProvider,
     /// `DOT_INIT_SKIP_PROVIDER` set without the `1` spelling: the
     /// provider is unknown, so the shell's `shdeps unavailable`
     /// close owns it.
@@ -142,8 +140,8 @@ pub enum Fallback {
 /// Native envelope check for one run: `Ok(())` runs
 /// [`run_update`], `Err(reason)` runs the shell adapter.
 pub fn should_go_native(inputs: &EngineInputs<'_>) -> Result<(), Fallback> {
-    if inputs.provider != "none" {
-        return Err(Fallback::ShdepsProvider);
+    if !matches!(inputs.provider, "none" | "shdeps") {
+        return Err(Fallback::ProviderUnavailable);
     }
     Ok(())
 }
@@ -1407,8 +1405,6 @@ fn finalize(
             status = 1;
             skip_inputs_rows(stage, io.out, "profile deactivation failed", now_secs);
         } else {
-            // The shdeps provider stays shell-backed (see
-            // `should_go_native`); `none` renders its stage here.
             let open = stage.start(
                 b"Tools",
                 Some(b"checking configured dependencies"),
@@ -1416,8 +1412,47 @@ fn finalize(
                 inputs.dot_verbose,
             );
             let _ = io.out.write_all(&open);
-            let close = stage.finish(b"ok", b"no dependency provider", now_secs);
-            let _ = io.out.write_all(&close);
+            let provider_enabled =
+                !inputs.skip_provider && state.config.provider == crate::config::Provider::Shdeps;
+            if !provider_enabled {
+                let close = stage.finish(b"ok", b"no dependency provider", now_secs);
+                let _ = io.out.write_all(&close);
+            } else {
+                let policy = match state.config.shdeps_update_policy {
+                    crate::config::UpdatePolicy::Pinned => "pinned",
+                    crate::config::UpdatePolicy::Latest => "latest",
+                };
+                let provider = crate::shdeps_provider::update(
+                    &crate::shdeps_provider::Inputs {
+                        runtime: inputs.runtime,
+                        source_root: inputs.source_root_git,
+                        home: inputs.home,
+                        config_home: inputs.config_home,
+                        state_home: inputs.state_home,
+                        policy,
+                        force: inputs.flags.force,
+                        quiet: quiet(inputs),
+                        verbose: inputs.flags.verbose || crate::log::is_quiet(inputs.dot_verbose),
+                        update_jobs: inputs.update_jobs,
+                        palette: inputs.palette,
+                        multibyte: inputs.multibyte,
+                        ascii: inputs.ascii,
+                        bar_width: inputs.bar_width,
+                    },
+                    stage,
+                    now_secs,
+                );
+                io.err.extend_from_slice(&provider.stderr);
+                io.out.extend_from_slice(&provider.during);
+                let close = stage.finish(&provider.stage_status, &provider.summary, now_secs);
+                let _ = io.out.write_all(&close);
+                io.out.extend_from_slice(&provider.details);
+                if provider.status != 0 {
+                    status = 1;
+                } else if let Some((before, after)) = provider.revision_change {
+                    return provider_reexec(inputs, io, &before, &after, now_secs);
+                }
+            }
             let extensions_dir = state
                 .config
                 .extensions_dir
@@ -1510,6 +1545,124 @@ fn finalize(
     status
 }
 
+/// Continue one provider-driven source-generation transition without touching
+/// the process-global environment or reacquiring the already-held update lock.
+fn provider_reexec(
+    inputs: &EngineInputs<'_>,
+    io: &mut UpdateIo<'_>,
+    before: &str,
+    after: &str,
+    now_secs: i64,
+) -> i32 {
+    use std::io::Write as _;
+    if !crate::shdeps::revision_valid(before) {
+        warn_row(
+            io.err,
+            inputs.palette,
+            "  warning: active dot revision was invalid before provider update",
+        );
+        let close = crate::progress_ui::done(
+            inputs.palette,
+            quiet(inputs),
+            Some("1"),
+            now_secs,
+            now_secs,
+            &reload_hint(inputs),
+        );
+        let _ = io.out.write_all(&close);
+        return 1;
+    }
+    if !crate::shdeps::revision_valid(after) {
+        warn_row(
+            io.err,
+            inputs.palette,
+            "  warning: active dot revision is unavailable after provider update",
+        );
+        let close = crate::progress_ui::done(
+            inputs.palette,
+            quiet(inputs),
+            Some("1"),
+            now_secs,
+            now_secs,
+            &reload_hint(inputs),
+        );
+        let _ = io.out.write_all(&close);
+        return 1;
+    }
+    if inputs
+        .runtime
+        .value("DOT_REEXEC_ONCE")
+        .and_then(OsStr::to_str)
+        == Some("1")
+    {
+        let path = Path::new(inputs.state_home).join("dot/provider-reexec-failed");
+        let mut moves = crate::temp::MoveCache::default();
+        if crate::shdeps::write_checkpoint(before, after, &path, &mut moves) {
+            warn_row(
+                io.err,
+                inputs.palette,
+                "  warning: dot changed twice during one update; rerun to validate the provider checkpoint",
+            );
+        } else {
+            warn_row(
+                io.err,
+                inputs.palette,
+                "  warning: dot changed twice and its provider checkpoint could not be published",
+            );
+        }
+        let close = crate::progress_ui::done(
+            inputs.palette,
+            quiet(inputs),
+            Some("1"),
+            now_secs,
+            now_secs,
+            &reload_hint(inputs),
+        );
+        let _ = io.out.write_all(&close);
+        return 1;
+    }
+    let mut env = inputs.runtime.env().clone();
+    env.insert(OsString::from("DOT_REEXEC_ONCE"), OsString::from("1"));
+    env.insert(
+        OsString::from("DOT_REEXEC_EXPECTED_REVISION"),
+        OsString::from(after),
+    );
+    let runtime = match crate::app::Runtime::from_env(&env, inputs.runtime.cwd()) {
+        Ok(runtime) => runtime,
+        Err(_) => return 1,
+    };
+    let policy = env_value(&env, "DOT_SHDEPS_UPDATE_POLICY");
+    let startup = crate::startup::Inputs {
+        home: inputs.home,
+        xdg_config_home: inputs.config_home,
+        env_policy: policy.as_deref(),
+        reexec_expected: Some(after),
+        source_root: inputs.source_root_git,
+    };
+    let config = match crate::startup::preflight(&startup) {
+        Ok(config) => config,
+        Err(failure) => {
+            io.err.extend_from_slice(failure.line().as_bytes());
+            io.err.push(b'\n');
+            return 1;
+        }
+    };
+    let gathered = match gather(
+        inputs.original_args,
+        &runtime,
+        &config,
+        inputs.source_root_git,
+        inputs.state_home,
+        &env,
+        runtime.cwd(),
+    ) {
+        Ok(Some(gathered)) => gathered,
+        _ => return 1,
+    };
+    let nested = gathered.inputs();
+    run_update(&nested, io.out, io.err, now_secs).unwrap_or(1)
+}
+
 /// Effective quiet for rows the shell gates on `DOT_QUIET` (the
 /// `--quiet`/`--cron` flag exports join the variable here).
 fn quiet(inputs: &EngineInputs<'_>) -> bool {
@@ -1552,6 +1705,7 @@ pub struct Gathered {
     runtime: crate::app::Runtime,
     config: crate::config::Config,
     flags: UpdateFlags,
+    args: Vec<std::ffi::OsString>,
     extra: Vec<std::ffi::OsString>,
     home: String,
     config_home: String,
@@ -1592,6 +1746,7 @@ impl Gathered {
             runtime: &self.runtime,
             config: &self.config,
             flags: self.flags,
+            original_args: &self.args,
             extra_args: &self.extra,
             base: self.base.as_ref(),
             entries: &[],
@@ -1759,8 +1914,10 @@ pub fn gather(
         &locale,
         multibyte,
     );
-    let mut provider =
-        env_value(env, "DOT_DEPENDENCY_PROVIDER").unwrap_or_else(|| "none".to_string());
+    let mut provider = match config.provider {
+        crate::config::Provider::None => "none".to_string(),
+        crate::config::Provider::Shdeps => "shdeps".to_string(),
+    };
     let skip_provider = env_value(env, "DOT_INIT_SKIP_PROVIDER").as_deref() == Some("1");
     if skip_provider {
         provider = "none".to_string();
@@ -1787,6 +1944,7 @@ pub fn gather(
         runtime: runtime.clone(),
         config: config.clone(),
         flags,
+        args: args.to_vec(),
         extra,
         home: home.clone(),
         config_home,
