@@ -20,6 +20,7 @@
 //! `.dot-backup` are excluded because they carry clock or checkout
 //! identity rather than converged content).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -37,6 +38,54 @@ fn bin() -> Command {
     cmd
 }
 
+#[test]
+fn update_has_no_legacy_engine_selector_or_adapter() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for relative in std::fs::read_dir(root.join("src")).expect("source directory") {
+        let relative = relative.expect("source entry").path();
+        if relative
+            .extension()
+            .is_none_or(|extension| extension != "rs")
+        {
+            continue;
+        }
+        let source = std::fs::read_to_string(&relative).expect("read production source");
+        let executable: String = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            !source.contains("DOT_UPDATE_NATIVE"),
+            "{} still selects an optional update lane",
+            relative.display()
+        );
+        if relative
+            .file_name()
+            .is_some_and(|name| name == "update_engine.rs" || name == "update_run.rs")
+        {
+            for legacy in [
+                "ENGINE_SCRIPT",
+                "run_update_or_engine",
+                "should_go_native",
+                "Fallback",
+            ] {
+                assert!(
+                    !executable.contains(legacy),
+                    "{} still contains legacy update engine dependency {legacy}",
+                    relative.display()
+                );
+            }
+        }
+    }
+    let cli = std::fs::read_to_string(root.join("src/cli.rs")).expect("CLI source");
+    let update = cli
+        .split_once("Command::Update =>")
+        .and_then(|(_, tail)| tail.split_once("Command::Init =>").map(|(arm, _)| arm))
+        .expect("bounded Update dispatch arm");
+    assert!(update.contains("run_update(runtime"));
+    assert!(!update.contains("run_engine_arm"));
+}
+
 /// Controlled client environment, mirroring `init_env` in
 /// `tests/cli.rs`: a cleared environment plus a twin home/state pair,
 /// so rows never touch the developer's own checkout.
@@ -51,6 +100,9 @@ fn client_env(cmd: &mut Command, home: &Path, state: &Path) {
     cmd.env("PATH", &path);
     cmd.env("TMPDIR", &tmpdir);
     cmd.env("HOME", home);
+    // Bash may synthesize this when absent while the native process preserves
+    // the cleared environment, so make the reload-hint input explicit.
+    cmd.env("SHELL", "/bin/bash");
     cmd.env("XDG_STATE_HOME", state);
     cmd.env("XDG_CONFIG_HOME", "");
     cmd.env("DOT_SOURCE_ROOT", repo);
@@ -59,6 +111,27 @@ fn client_env(cmd: &mut Command, home: &Path, state: &Path) {
     cmd.env("GIT_COMMITTER_NAME", "fixture");
     cmd.env("GIT_COMMITTER_EMAIL", "fixture@example.invalid");
     cmd.current_dir(home);
+}
+
+#[test]
+fn twin_commands_pin_the_same_reload_shell() {
+    let scratch = Scratch::new("update-shell-input").expect("scratch dir");
+    let home = scratch.path().join("home");
+    let state = scratch.path().join("state");
+    let mut shell = Command::new("bash");
+    let mut rust = bin();
+    client_env(&mut shell, &home, &state);
+    client_env(&mut rust, &home, &state);
+    let shell_value = shell
+        .get_envs()
+        .find(|(key, _)| *key == "SHELL")
+        .and_then(|(_, value)| value);
+    let rust_value = rust
+        .get_envs()
+        .find(|(key, _)| *key == "SHELL")
+        .and_then(|(_, value)| value);
+    assert_eq!(shell_value, Some(OsStr::new("/bin/bash")));
+    assert_eq!(rust_value, shell_value);
 }
 
 /// The production shell oracle (`bin/dot` under `set -euo pipefail`)
@@ -81,6 +154,7 @@ fn shell_dot(argv: &[&str], home: &Path, state: &Path) -> std::process::Output {
 fn rust_dot(argv: &[&str], home: &Path, state: &Path) -> std::process::Output {
     let mut cmd = bin();
     client_env(&mut cmd, home, state);
+    cmd.env("DOT_BASH", home.join("absent-old-update-engine"));
     for arg in argv {
         cmd.arg(arg);
     }

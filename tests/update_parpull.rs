@@ -3,10 +3,9 @@
 //! The native parallel fan-out itself lives in [`dot::repos_pull_fleet`]
 //! (scoped threads bounded by `DOT_UPDATE_JOBS`, falling back to the
 //! serial path when scratch allocation fails); the `update`/`pull`
-//! dispatcher arm ([`dot::cli::run`] via `update_run`) still drives the
-//! shell's `_dot_update`, which already fans overlay pulls out within
-//! the same `_dot_update_jobs` bound. This suite pins the differential
-//! contract the final native wiring must preserve, on a three-overlay
+//! dispatcher arm ([`dot::cli::run`] via `update_run`) drives that native
+//! implementation directly. This suite pins its differential contract
+//! against the frozen shell oracle on a three-overlay
 //! `file://` fixture (the speedup fixture):
 //!
 //! - clean and pushed-change updates agree with the shell (`bin/dot`)
@@ -34,6 +33,7 @@
 //! init-time `.dot-backup` are excluded because they carry clock or
 //! checkout identity rather than converged content).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -83,6 +83,10 @@ fn client_env(
     cmd.env("PATH", &path);
     cmd.env("TMPDIR", &tmpdir);
     cmd.env("HOME", home);
+    // Bash supplies its own shell identity on some platforms when `SHELL` is
+    // absent, while the native process correctly preserves the cleared map.
+    // Pin the semantic input so reload-hint parity never depends on the host.
+    cmd.env("SHELL", "/bin/bash");
     cmd.env("XDG_STATE_HOME", state);
     cmd.env("XDG_CONFIG_HOME", "");
     cmd.env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"));
@@ -97,6 +101,27 @@ fn client_env(
         cmd.env("DOT_SHDEPS_UPDATE_POLICY", policy);
     }
     cmd.current_dir(home);
+}
+
+#[test]
+fn twin_commands_pin_the_same_reload_shell() {
+    let scratch = Scratch::new("parpull-shell-input").expect("scratch dir");
+    let home = scratch.path().join("home");
+    let state = scratch.path().join("state");
+    let mut shell = Command::new("bash");
+    let mut rust = bin();
+    client_env(&mut shell, &home, &state, None, None);
+    client_env(&mut rust, &home, &state, None, None);
+    let shell_value = shell
+        .get_envs()
+        .find(|(key, _)| *key == "SHELL")
+        .and_then(|(_, value)| value);
+    let rust_value = rust
+        .get_envs()
+        .find(|(key, _)| *key == "SHELL")
+        .and_then(|(_, value)| value);
+    assert_eq!(shell_value, Some(OsStr::new("/bin/bash")));
+    assert_eq!(rust_value, shell_value);
 }
 
 /// The production shell oracle (`bin/dot`) with the same controlled
@@ -121,9 +146,7 @@ fn shell_dot(
     cmd.output().expect("run bin/dot")
 }
 
-/// The Rust CLI adapter with the same controlled client.  This suite
-/// deliberately leaves `DOT_UPDATE_NATIVE` unset, so its results are
-/// adapter parity only and cannot be cited as native-engine proof.
+/// The native Rust CLI with the same controlled client.
 fn rust_dot(
     argv: &[&str],
     home: &Path,
@@ -133,6 +156,7 @@ fn rust_dot(
 ) -> std::process::Output {
     let mut cmd = bin();
     client_env(&mut cmd, home, state, jobs, policy);
+    cmd.env("DOT_BASH", home.join("absent-old-update-engine"));
     for arg in argv {
         cmd.arg(arg);
     }
@@ -687,11 +711,8 @@ fn lock_busy_reports_75_on_three_overlay_fixture() {
 
 #[test]
 fn report_wall_clock_three_overlay_shell_vs_rust() {
-    // Measured before/after medians on the 3-overlay fixture. The
-    // Rust arm still drives the shell's `_dot_update` (with its own
-    // `_dot_update_jobs` fan-out) through the `update_run` adapter,
-    // so parity — not a speedup — is the expected reading here; the
-    // numbers below are the baseline the native wiring must beat.
+    // Shell/native medians on the 3-overlay fixture prove the native driver's
+    // bounded fan-out with measured results rather than an assumed speedup.
     // They print on `--nocapture` and land in the lane PR body.
     let scratch = Scratch::new("parpull-timing").expect("scratch dir");
     let (overlays, base_origin) = shared_remotes(&scratch);

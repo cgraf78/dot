@@ -237,7 +237,6 @@ esac
             .env("XDG_CONFIG_HOME", "")
             .env("XDG_STATE_HOME", &self.state)
             .env("DOT_SOURCE_ROOT", &self.root)
-            .env("DOT_UPDATE_NATIVE", "1")
             .env("DOT_DEPENDENCY_PROVIDER", "shdeps")
             .env("DOT_SHDEPS_UPDATE_POLICY", "pinned")
             .env("SHDEPS_LIB", self.provider.join("shdeps.sh"))
