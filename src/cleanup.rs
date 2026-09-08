@@ -632,9 +632,10 @@ pub(crate) fn stop_sessions(
     for session in &mut sessions {
         session.signal_group_once(first_signal);
     }
+    let mut consecutive_empty = 0;
     loop {
         let observed = observe_sessions(&mut sessions, deadline);
-        if observed == Some(true) {
+        if sessions_stably_empty(observed, &mut consecutive_empty) {
             break;
         }
         if Instant::now() >= deadline {
@@ -681,6 +682,19 @@ pub(crate) fn stop_sessions(
         );
     }
     results
+}
+
+/// Require two complete snapshots without a live session member. Process-table
+/// enumeration is not atomic: a member can fork a replacement and exit between
+/// entries, making one pass appear empty even though the owned session remains
+/// active. An unavailable snapshot is likewise not evidence of quiescence.
+fn sessions_stably_empty(observed: Option<bool>, consecutive_empty: &mut u8) -> bool {
+    if observed == Some(true) {
+        *consecutive_empty = consecutive_empty.saturating_add(1);
+    } else {
+        *consecutive_empty = 0;
+    }
+    *consecutive_empty >= 2
 }
 
 fn observe_sessions(sessions: &mut [Session], deadline: Instant) -> Option<bool> {
@@ -1015,6 +1029,21 @@ mod tests {
             child.wait().unwrap();
         }
         assert_eq!(observed, [true, true]);
+    }
+
+    #[test]
+    fn session_shutdown_requires_stable_empty_snapshots() {
+        let mut consecutive_empty = 0;
+
+        assert!(!sessions_stably_empty(Some(true), &mut consecutive_empty));
+        assert_eq!(consecutive_empty, 1);
+        assert!(!sessions_stably_empty(Some(false), &mut consecutive_empty));
+        assert_eq!(consecutive_empty, 0);
+        assert!(!sessions_stably_empty(Some(true), &mut consecutive_empty));
+        assert!(!sessions_stably_empty(None, &mut consecutive_empty));
+        assert_eq!(consecutive_empty, 0);
+        assert!(!sessions_stably_empty(Some(true), &mut consecutive_empty));
+        assert!(sessions_stably_empty(Some(true), &mut consecutive_empty));
     }
 
     #[test]

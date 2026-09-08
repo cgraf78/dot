@@ -42,8 +42,8 @@ if [[ $unknown_status -ne 1 ]]; then
   printf 'termux-ci: unknown command unexpectedly succeeded\n' >&2
   exit 1
 fi
-[[ $unknown_output == 'dot: startup: cannot resolve source root from executable' ]] || {
-  printf 'termux-ci: unexpected operational failure: %s\n' "$unknown_output" >&2
+[[ $unknown_output == 'dot: unknown command: frobnicate' ]] || {
+  printf 'termux-ci: unexpected unknown-command output: %s\n' "$unknown_output" >&2
   exit 1
 }
 
