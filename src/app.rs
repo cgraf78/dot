@@ -391,9 +391,15 @@ mod tests {
     fn fake_bash(root: &Path, relative: &str, body: &str) -> PathBuf {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().expect("bash parent")).expect("bash parent");
+        let body = body
+            .strip_prefix("#!/bin/sh\n")
+            .expect("fake Bash uses the fixture shell");
+        let body = format!("#!/bin/sh\n[ \"${{1-}}\" != --dot-fixture-ready ] || exit 0\n{body}");
         std::fs::write(&path, body).expect("fake Bash");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("fake Bash mode");
+        dot_test_support::wait_until_executable(&path, &["--dot-fixture-ready"])
+            .expect("fake Bash executable");
         path
     }
 
