@@ -4,8 +4,7 @@
 //! of `lib/dot/profiles.sh`: definition parsing, include expansion
 //! with cycle detection, selector parsing and matching, and default
 //! resolution. The profile lifecycle ledger
-//! (`profile-lifecycle.sh`) stays shell until the overlay-context,
-//! cleanup, and extension-trust slices land.
+//! (`profile-lifecycle.sh`) lives in [`crate::profile_lifecycle`].
 //!
 //! Shell globals become an explicit [`State`]; every rule that reads
 //! the filesystem takes paths, and every rule that reads the
