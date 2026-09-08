@@ -117,6 +117,7 @@ tests/profiles.rs	standalone:new
 tests/provider-suite-wrapper	standalone:new
 tests/provenance-test	standalone:new
 tests/profiles-test	standalone:new
+tests/release-scripts-test	standalone:new
 tests/repos-test	dotfiles:tests/core-pull-test+core-overlays-test@dotfiles-v1+standalone
 tests/repos_base.rs	standalone:new
 tests/repos_commands.rs	standalone:new
