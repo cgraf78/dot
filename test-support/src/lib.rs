@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 static BASH: OnceLock<PathBuf> = OnceLock::new();
+const EXEC_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const EXEC_READY_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Absolute path to the engine-runtime `bash` for differential harnesses.
 ///
@@ -66,10 +68,33 @@ pub fn bash() -> &'static std::path::Path {
 pub fn copy_dot_binary(source: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::copy(source, destination)?;
     std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o755))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    wait_until_executable(destination, &["--version"])
+}
+
+/// Probe a newly published fixture executable until the kernel accepts it.
+///
+/// Linux filesystems can transiently return `ETXTBSY` after a copy or rename.
+/// Retry only that condition with a bounded deadline; every other spawn error
+/// is immediately actionable. The child's exit status is irrelevant because
+/// callers use this only to establish exec readiness before the real test.
+pub fn wait_until_executable(program: &Path, args: &[&str]) -> std::io::Result<()> {
+    wait_until_executable_with(program, args, || {})
+}
+
+/// Run [`wait_until_executable`] while observing each busy retry.
+///
+/// Root integration tests use the callback to deterministically hold and then
+/// release a writer only after the kernel has reported `ETXTBSY`.
+#[doc(hidden)]
+pub fn wait_until_executable_with(
+    program: &Path,
+    args: &[&str],
+    mut on_busy: impl FnMut(),
+) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + EXEC_READY_TIMEOUT;
     loop {
-        match std::process::Command::new(destination)
-            .arg("--version")
+        match std::process::Command::new(program)
+            .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -83,7 +108,8 @@ pub fn copy_dot_binary(source: &Path, destination: &Path) -> std::io::Result<()>
                 if error.kind() == std::io::ErrorKind::ExecutableFileBusy
                     && std::time::Instant::now() < deadline =>
             {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                on_busy();
+                std::thread::sleep(EXEC_READY_POLL);
             }
             Err(error) => return Err(error),
         }
@@ -238,22 +264,10 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod");
-            // Under parallel load the kernel can report the
-            // just-written script busy (ETXTBSY) on first exec;
-            // retry that transient only, with a bounded deadline.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let output = loop {
-                match std::process::Command::new(&script).output() {
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::ExecutableFileBusy
-                            && std::time::Instant::now() < deadline =>
-                    {
-                        std::thread::yield_now();
-                        continue;
-                    }
-                    result => break result.expect("spawn fixture"),
-                }
-            };
+            wait_until_executable(&script, &[]).expect("fixture executable");
+            let output = std::process::Command::new(&script)
+                .output()
+                .expect("spawn fixture");
             assert!(output.status.success());
             assert_eq!(output.stdout, b"ok\n");
         }
