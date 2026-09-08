@@ -20,6 +20,11 @@
 //! stays shell-owned, so the interim diagnostic remains; slice 79
 //! drives `init` through [`init_client_command::run`]. The shell
 //! `bin/dot` remains the entry point and never routes here yet.
+//! Slice 84 runs the startup prelude ([`crate::startup`]) at the top
+//! of [`run`]: the re-exec guard (exit 1) then `dot_config_load ||
+//! exit 2` before dispatch for every command, per the forward
+//! contracts (see [`crate::startup`] for the deliberate help/version
+//! divergence from the shell `case` order).
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -77,15 +82,19 @@ pub const HELP: &str = concat!(
 );
 
 /// Shell exit-code contract (`lib/dot/commands.sh`, `lib/dot/main.sh`):
-/// `0` success, `1` error/unknown command, `2` usage, `75` lock busy.
-/// Numeric codes cross the process boundary into scripts and CI gates,
-/// so they are named constants — never inline literals — and new codes
-/// arrive only with their owning slice (the lock's `75` is not defined
-/// until the lock module lands).
+/// `0` success, `1` error/unknown command, `2` usage/config failure,
+/// `75` lock busy. Numeric codes cross the process boundary into
+/// scripts and CI gates, so they are named constants — never inline
+/// literals — and new codes arrive only with their owning slice (the
+/// lock's `75` is not defined until the lock module lands).
 pub const EXIT_SUCCESS: i32 = 0;
 /// Generic failure (unknown command today; repo-failure paths reuse it
 /// per the shell `return 1` sites). Named so later slices share one value.
 pub const EXIT_ERROR: i32 = 1;
+/// Config/usage failure (`dot_config_load || exit 2` in
+/// `lib/dot/main.sh`, owned by the [`crate::startup`] prelude).
+/// Named so the startup gate shares one value with later usage errors.
+pub const EXIT_USAGE: i32 = 2;
 
 /// `dot_command_dispatch` decision (`lib/dot/commands.sh`).
 ///
@@ -221,10 +230,22 @@ pub fn run(
     // Shell matches `${1:-help}`: empty or missing command shows help.
     // The empty-string arm matters because `run([])` (no argv at all,
     // as in tests) must behave like bare `dot`, not like an error.
-    // NOTE: the shell runs `dot_config_load || exit 2` BEFORE dispatch
-    // (main.sh), so with an unloadable config even `frobnicate` exits 2.
-    // This binary does not load config yet (slice 2); the exit-2 path is
-    // specified in the forward contracts and tested when config lands.
+    // Slice 84 startup prelude: `dot_config_load || exit 2` runs
+    // before dispatch for every command (forward-contract order from
+    // `docs/rust-port-spec.md` — the shell `case` exempts
+    // help/version, but the spec requires ANY command to exit 2
+    // here), preceded by the re-exec guard (exit 1). A loaded config
+    // is otherwise invisible (validated, then discarded until the
+    // slices consuming each field land), so wired commands behave
+    // exactly as before whenever config loads.
+    match crate::startup::check_ambient() {
+        Ok(_) => {}
+        Err(failure) => {
+            let _ = stderr.write_all(failure.line().as_bytes());
+            let _ = stderr.write_all(b"\n");
+            return failure.code();
+        }
+    }
     let mut failed = false;
     let code = match command {
         b"" | b"help" | b"-h" | b"--help" => {
