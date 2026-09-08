@@ -608,6 +608,10 @@ mod tests {
     }
 
     #[test]
+    // macOS rejects this filename at the filesystem boundary with EILSEQ;
+    // byte-preserving path behavior remains exercised on Unix filesystems
+    // that can create the fixture.
+    #[cfg(not(target_os = "macos"))]
     fn explicit_non_utf8_path_is_preserved() {
         let scope = TempDir::new_exec("bash-non-utf8").expect("scope");
         let name = OsString::from_vec(b"bash-\xff".to_vec());
