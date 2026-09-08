@@ -423,20 +423,27 @@ fn separate(command: &mut Command, result_dir: &Path) -> PreSyncOutcome {
 fn wait(command: &mut Command) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt as _;
 
+    if let Some(signal) = crate::cleanup::received_signal() {
+        return Some(128 + signal);
+    }
     crate::cleanup::isolate(command);
     let mut child = command.spawn().ok()?;
     loop {
         if let Some(signal) = crate::cleanup::received_signal() {
-            let status = crate::cleanup::stop_session(&mut child, signal).ok()?;
-            return Some(
-                status
-                    .code()
-                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(signal)),
-            );
+            // The shell cleanup contract always gives owned work TERM before
+            // bounded KILL escalation. The CLI retains the original signal
+            // separately for its conventional 128+signal exit status.
+            let _ = crate::cleanup::stop_session(&mut child, libc::SIGTERM).ok()?;
+            return Some(128 + signal);
         }
         match crate::cleanup::exited(&child) {
             Ok(true) => {
-                let status = child.wait().ok()?;
+                // Retain the exited leader as the session authority until
+                // descendants complete the normal TERM/KILL teardown.
+                let status = crate::cleanup::stop_session(&mut child, libc::SIGTERM).ok()?;
+                if let Some(signal) = crate::cleanup::received_signal() {
+                    return Some(128 + signal);
+                }
                 return Some(
                     status
                         .code()
@@ -488,7 +495,7 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    use super::{UpdateEnvironment, Worker};
+    use super::{UpdateEnvironment, Worker, wait};
     use crate::app::Runtime;
     use crate::log::Log;
     use crate::profile_lifecycle;
@@ -592,6 +599,201 @@ mod tests {
         };
         let rc = profile_lifecycle::run_one(&inputs, &mut worker, &mut out, &mut warnings);
         (rc, out, warnings)
+    }
+
+    #[test]
+    fn cancelled_worker_returns_the_parent_signal_status() {
+        const HELPER: &str = "DOT_HOOK_SIGNAL_STATUS_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "hook_worker::tests::cancelled_worker_returns_the_parent_signal_status",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "hook-signal helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let scope = TempDir::new("hook-worker-signal-status").expect("scope");
+        let ready = scope.path().join("ready");
+        let mut command = Command::new(dot_test_support::bash());
+        command
+            .args([
+                "-c",
+                "trap 'exit 0' TERM; : >\"$1\"; while :; do sleep 1; done",
+                "hook-signal",
+            ])
+            .arg(&ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let signals = crate::cleanup::Signals::install().unwrap();
+        let sender = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(ready.exists(), "hook signal fixture did not start");
+            // SAFETY: getpid returns this live helper and SIGHUP is handled.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGHUP) }, 0);
+        });
+        let status = wait(&mut command);
+        sender.join().unwrap();
+        assert_eq!(status, Some(128 + libc::SIGHUP));
+        let later = scope.path().join("later");
+        let mut later_command = Command::new(dot_test_support::bash());
+        later_command
+            .args(["-c", ": >\"$1\"", "later-hook"])
+            .arg(&later)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        assert_eq!(wait(&mut later_command), Some(128 + libc::SIGHUP));
+        assert!(!later.exists(), "a hook started after cancellation");
+        assert_eq!(signals.finish(0), 128 + libc::SIGHUP);
+    }
+
+    #[test]
+    fn signal_during_completed_worker_teardown_owns_status() {
+        const HELPER: &str = "DOT_HOOK_TEARDOWN_SIGNAL_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "hook_worker::tests::signal_during_completed_worker_teardown_owns_status",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "hook-teardown helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let scope = TempDir::new("hook-worker-teardown-signal").expect("scope");
+        let marker = scope.path().join("descendant");
+        let mut command = Command::new(dot_test_support::bash());
+        command
+            .args([
+                "-c",
+                "set -m; (trap 'kill -HUP \"$DOT_PARENT_PID\"; exit 0' TERM; echo $BASHPID >\"$1\"; while :; do sleep 1; done) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
+                "hook-teardown-signal",
+            ])
+            .arg(&marker)
+            .env("DOT_PARENT_PID", std::process::id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let signals = crate::cleanup::Signals::install().unwrap();
+        assert_eq!(wait(&mut command), Some(128 + libc::SIGHUP));
+        assert_eq!(signals.finish(0), 128 + libc::SIGHUP);
+    }
+
+    #[test]
+    fn completed_worker_stops_escaped_session_descendants() {
+        const HELPER: &str = "DOT_HOOK_DESCENDANT_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "hook_worker::tests::completed_worker_stops_escaped_session_descendants",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "hook-descendant helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let scope = TempDir::new("hook-worker-descendant").expect("scope");
+        let marker = scope.path().join("descendant");
+        let mut command = Command::new(dot_test_support::bash());
+        command
+            .args([
+                "-c",
+                "set -m; (trap '' TERM; echo $BASHPID >\"$1\"; while :; do sleep 1; done) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
+                "hook-descendant",
+            ])
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let status = wait(&mut command);
+        let pid = std::fs::read_to_string(&marker)
+            .expect("descendant marker")
+            .trim()
+            .parse::<i32>()
+            .expect("descendant pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_live(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let survived = process_live(pid);
+        if survived {
+            // SAFETY: set -m made this fixture descendant its group leader.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        assert_eq!(status, Some(0));
+        assert!(!survived, "completed hook left its descendant running");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn process_live(pid: i32) -> bool {
+        match std::fs::read(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                let end = stat
+                    .windows(2)
+                    .rposition(|part| part == b") ")
+                    .expect("well-formed proc stat");
+                stat.get(end + 2) != Some(&b'Z')
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => panic!("could not inspect process {pid}: {error}"),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn process_live(pid: i32) -> bool {
+        let output = Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap_or_else(|error| panic!("could not inspect process {pid}: {error}"));
+        if output.status.success() {
+            return !output.stdout.is_empty()
+                && !String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .starts_with('Z');
+        }
+        // SAFETY: a positive PID and signal zero only test existence.
+        if unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return false;
+        }
+        panic!(
+            "ps could not inspect live process {pid}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

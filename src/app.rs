@@ -43,6 +43,7 @@ pub struct Runtime {
     source_root: PathBuf,
     env: BTreeMap<OsString, OsString>,
     executable: Option<RuntimeExecutable>,
+    process_entry: bool,
     bash: Arc<OnceLock<Result<crate::bash::Resolved, crate::bash::Error>>>,
     bash_error_reported: Arc<AtomicBool>,
 }
@@ -125,7 +126,9 @@ impl Runtime {
             OsString::from("DOT_SOURCE_ROOT"),
             source_root.as_os_str().to_os_string(),
         );
-        Self::snapshot(env, cwd, source_root)
+        let mut runtime = Self::snapshot(env, cwd, source_root);
+        runtime.process_entry = true;
+        runtime
     }
 
     fn snapshot(env: BTreeMap<OsString, OsString>, cwd: &Path, source_root: PathBuf) -> Self {
@@ -140,6 +143,7 @@ impl Runtime {
             source_root,
             env,
             executable: None,
+            process_entry: false,
             bash: Arc::new(OnceLock::new()),
             bash_error_reported: Arc::new(AtomicBool::new(false)),
         }
@@ -209,6 +213,10 @@ impl Runtime {
 
     pub(crate) fn env(&self) -> &BTreeMap<OsString, OsString> {
         &self.env
+    }
+
+    pub(crate) fn is_process_entry(&self) -> bool {
+        self.process_entry
     }
 
     pub(crate) fn value(&self, key: &str) -> Option<&OsStr> {

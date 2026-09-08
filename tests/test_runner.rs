@@ -3,7 +3,19 @@
 mod fixture;
 use fixture::{Fixture, finish, poll, success};
 use std::fs;
+use std::io::{BufRead as _, Read as _};
+use std::path::Path;
 use std::process::{Command, Stdio};
+
+fn pid_marker(path: &Path) -> Option<String> {
+    let value = fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    value
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+        .map(|_| value.to_string())
+}
 
 fn live(pid: &str) -> bool {
     let Ok(pid) = pid.parse::<i32>() else {
@@ -21,17 +33,26 @@ fn live(pid: &str) -> bool {
         // `/bin/ps` is the OS process-table interface on macOS and the BSDs;
         // do not let a caller-controlled PATH turn a missing observer into a
         // false cleanup success.
-        return Command::new("/bin/ps")
+        let output = Command::new("/bin/ps")
             .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
-            .ok()
-            .is_some_and(|output| {
-                output.status.success()
-                    && !output.stdout.is_empty()
-                    && !String::from_utf8_lossy(&output.stdout)
-                        .trim()
-                        .starts_with('Z')
-            });
+            .unwrap_or_else(|error| panic!("could not inspect process {pid}: {error}"));
+        if output.status.success() {
+            return !output.stdout.is_empty()
+                && !String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .starts_with('Z');
+        }
+        // SAFETY: a positive PID and signal zero only test existence.
+        if unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return false;
+        }
+        panic!(
+            "ps could not inspect live process {pid}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     // SAFETY: a positive PID and signal zero only test process existence.
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -44,6 +65,59 @@ fn live(pid: &str) -> bool {
 fn signal(pid: u32, signal: i32) {
     // SAFETY: the fixture owns this positive child PID and uses valid signals.
     assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0);
+}
+
+fn await_output_start(
+    started: &std::sync::mpsc::Receiver<()>,
+    release: &std::sync::mpsc::Sender<()>,
+    child: &mut std::process::Child,
+    label: &str,
+) {
+    if started
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .is_ok()
+    {
+        return;
+    }
+    // Give the command's own signal path a chance to reap any suite session,
+    // then bound the emergency fallback so a failing test cannot leak it.
+    // SAFETY: the fixture owns this positive Dot child and SIGTERM is valid.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let _ = release.send(());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while child.try_wait().ok().flatten().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    panic!("{label} did not start");
+}
+
+fn stop_signal_fixture(child: &mut std::process::Child, home: &Path) {
+    // SAFETY: the fixture owns this positive Dot child and SIGTERM is valid.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while child.try_wait().ok().flatten().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    if let Some(leader) = pid_marker(&home.join("ready")) {
+        if live(&leader) {
+            // SAFETY: this fixture makes the worker its process-group leader.
+            unsafe { libc::kill(-leader.parse::<i32>().unwrap(), libc::SIGKILL) };
+        }
+    }
+    if let Some(member) = pid_marker(&home.join("member")) {
+        if live(&member) {
+            // SAFETY: this is a fixture-owned process identity.
+            unsafe { libc::kill(member.parse::<i32>().unwrap(), libc::SIGKILL) };
+        }
+    }
 }
 
 #[test]
@@ -224,18 +298,290 @@ fn native_parallel_cancellation_has_one_shared_grace_deadline() {
 }
 
 #[test]
-fn native_cancellation_preserves_hup_and_int_status() {
-    for (signal_number, code) in [(libc::SIGHUP, 129), (libc::SIGINT, 130)] {
+fn native_cancellation_preserves_signal_status_and_reaps_worker() {
+    for (signal_number, code) in [
+        (libc::SIGHUP, 129),
+        (libc::SIGINT, 130),
+        (libc::SIGQUIT, 131),
+        (libc::SIGTERM, 143),
+    ] {
         let f = Fixture::new();
         f.suite(
             "wait",
-            "echo $$ >\"$HOME/ready\"; while :; do sleep 1; done",
+            "trap '' HUP INT QUIT\ntrap 'printf \"%s\\n\" TERM >>\"$HOME/signal\"' TERM\n(\n  trap 'printf \"%s\\n\" TERM >>\"$HOME/member-signal\"' TERM\n  echo $BASHPID >\"$HOME/member\"\n  while :; do sleep 1; done\n) &\nuntil [[ -s $HOME/member ]]; do sleep 0.02; done\necho $$ >\"$HOME/ready\"; while :; do sleep 1; done",
         );
-        let child = f.command(&[]).spawn().unwrap();
-        poll(|| f.home.join("ready").exists());
-        let pid = fs::read_to_string(f.home.join("ready")).unwrap();
+        let mut child = f.command(&[]).spawn().unwrap();
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let (pid, member) = loop {
+            let pids = pid_marker(&f.home.join("ready")).zip(pid_marker(&f.home.join("member")));
+            if let Some(pids) = pids {
+                break pids;
+            }
+            if std::time::Instant::now() >= ready_deadline {
+                stop_signal_fixture(&mut child, &f.home);
+                panic!("signal lifecycle fixture did not start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         signal(child.id(), signal_number);
-        assert_eq!(finish(child).status.code(), Some(code));
-        poll(|| !live(pid.trim()));
+        let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= exit_deadline {
+                stop_signal_fixture(&mut child, &f.home);
+                panic!("test runner did not finish after signal {signal_number}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let observed = child.wait_with_output().unwrap().status.code();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (live(pid.trim()) || live(member.trim())) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let worker_survived = live(pid.trim());
+        let member_survived = live(member.trim());
+        if worker_survived || member_survived {
+            let leader = pid.trim().parse::<i32>().unwrap();
+            // Keep the intentionally failing RED run from leaking the owned
+            // fixture session when the CLI has not installed this signal yet.
+            unsafe { libc::kill(-leader, libc::SIGKILL) };
+            poll(|| !live(pid.trim()));
+        }
+        assert_eq!(observed, Some(code));
+        assert!(!worker_survived, "test worker survived cancellation");
+        assert!(!member_survived, "test worker member survived cancellation");
+        assert_eq!(
+            fs::read(f.home.join("signal")).expect("delivered signal marker"),
+            b"TERM\n",
+            "test worker did not receive exactly one cleanup TERM"
+        );
+        assert_eq!(
+            fs::read(f.home.join("member-signal")).expect("member signal marker"),
+            b"TERM\n",
+            "same-group member did not receive exactly one cleanup TERM"
+        );
     }
+}
+
+#[test]
+fn signal_during_parallel_replay_owns_final_status() {
+    let f = Fixture::new();
+    f.suite(
+        "replay",
+        "printf 'REPLAY-START\\n'\npython3 - <<'PY'\nimport sys\nsys.stdout.write('x' * (8 * 1024 * 1024))\nPY\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
+    );
+    let mut child = f
+        .command(&["-j", "1", "-v"])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().expect("test stdout");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "missing replay marker"
+            );
+            if line == "REPLAY-START\n" {
+                break;
+            }
+        }
+        started_tx.send(()).unwrap();
+        let mut remainder = Vec::new();
+        reader.read_to_end(&mut remainder).unwrap();
+    });
+    if started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .is_err()
+    {
+        // SAFETY: the fixture owns this positive Dot child and SIGTERM is valid.
+        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        let _ = child.wait();
+        panic!("parallel replay did not start");
+    }
+    signal(child.id(), libc::SIGHUP);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut observed = None;
+    while observed.is_none() && std::time::Instant::now() < deadline {
+        observed = child.try_wait().unwrap();
+        if observed.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    if observed.is_none() {
+        let _ = child.kill();
+    }
+    let status = observed.unwrap_or_else(|| child.wait().unwrap());
+    reader.join().unwrap();
+    assert_eq!(status.code(), Some(129));
+}
+
+#[test]
+fn signal_interrupts_backpressured_parallel_replay() {
+    let f = Fixture::new();
+    f.suite(
+        "backpressure",
+        "printf 'REPLAY-BLOCKED\\n'\npython3 - <<'PY'\nimport sys\nsys.stdout.write('x' * (8 * 1024 * 1024))\nPY\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
+    );
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut child = f
+        .command(&["-j", "1", "-v"])
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "missing replay marker"
+            );
+            if line == "REPLAY-BLOCKED\n" {
+                break;
+            }
+        }
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        let mut remainder = Vec::new();
+        reader.read_to_end(&mut remainder).unwrap();
+    });
+    await_output_start(&started_rx, &release_tx, &mut child, "parallel replay");
+    signal(child.id(), libc::SIGQUIT);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut observed = None;
+    while observed.is_none() && std::time::Instant::now() < deadline {
+        observed = child.try_wait().unwrap();
+        if observed.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let blocked = observed.is_none();
+    release_tx.send(()).unwrap();
+    let status = observed.unwrap_or_else(|| child.wait().unwrap());
+    reader.join().unwrap();
+    assert!(!blocked, "signal left replay blocked on an unread stdout");
+    assert_eq!(status.code(), Some(131));
+}
+
+#[test]
+fn signal_interrupts_backpressured_result_rendering() {
+    let f = Fixture::new();
+    f.suite(
+        "skip-backpressure",
+        "python3 - <<'PY'\nimport os\nwith open(os.environ['DOT_TEST_RESULT_FILE'], 'wb') as result:\n    result.write(b'skip\\t' + b'x' * (8 * 1024 * 1024) + b'\\t\\n')\nPY",
+    );
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut child = f
+        .command(&["-j", "1"])
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(reader);
+        let mut observed = Vec::new();
+        loop {
+            let mut byte = [0];
+            assert_ne!(reader.read(&mut byte).unwrap(), 0, "missing result marker");
+            observed.push(byte[0]);
+            if observed.ends_with(b"skip-backpressure-test") {
+                break;
+            }
+        }
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        reader.read_to_end(&mut observed).unwrap();
+    });
+    await_output_start(
+        &started_rx,
+        &release_tx,
+        &mut child,
+        "skip result rendering",
+    );
+    signal(child.id(), libc::SIGINT);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut observed = None;
+    while observed.is_none() && std::time::Instant::now() < deadline {
+        observed = child.try_wait().unwrap();
+        if observed.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let blocked = observed.is_none();
+    release_tx.send(()).unwrap();
+    let status = observed.unwrap_or_else(|| child.wait().unwrap());
+    reader.join().unwrap();
+    assert!(
+        !blocked,
+        "signal left result rendering blocked on an unread stdout"
+    );
+    assert_eq!(status.code(), Some(130));
+}
+
+#[test]
+fn signal_interrupts_backpressured_sequential_output() {
+    let f = Fixture::new();
+    f.suite(
+        "sequential-backpressure",
+        "printf 'SEQUENTIAL-BLOCKED\\n'\npython3 - <<'PY'\nimport sys\nsys.stdout.write('x' * (8 * 1024 * 1024))\nPY\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
+    );
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut child = f
+        .command(&["-s"])
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "missing output marker"
+            );
+            if line == "SEQUENTIAL-BLOCKED\n" {
+                break;
+            }
+        }
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        let mut remainder = Vec::new();
+        reader.read_to_end(&mut remainder).unwrap();
+    });
+    await_output_start(&started_rx, &release_tx, &mut child, "sequential output");
+    signal(child.id(), libc::SIGTERM);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut observed = None;
+    while observed.is_none() && std::time::Instant::now() < deadline {
+        observed = child.try_wait().unwrap();
+        if observed.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let blocked = observed.is_none();
+    release_tx.send(()).unwrap();
+    let status = observed.unwrap_or_else(|| child.wait().unwrap());
+    reader.join().unwrap();
+    assert!(
+        !blocked,
+        "signal left sequential output blocked on an unread stdout"
+    );
+    assert_eq!(status.code(), Some(143));
 }

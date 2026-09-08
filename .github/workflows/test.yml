@@ -90,7 +90,7 @@ jobs:
         archive=$(scripts/package-release.sh "$RUST_TARGET" android-x86_64)
         scripts/smoke-release.sh android-x86_64
         mkdir -p .termux-ci
-        tar -C .termux-ci -xzf "$archive" ./dot ./.dot-install.json
+        tar -C .termux-ci -xzf "$archive"
 
   shell:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@b750c292f00e079c2270df0d8f4c8bdaf43e0356
