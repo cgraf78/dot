@@ -279,6 +279,7 @@ fn binary_ignores_caller_supplied_source_root() {
     let untrusted_text = untrusted.path().to_str().expect("ASCII fixture path");
     let env = [
         ("DOT_SOURCE_ROOT", Some(untrusted_text)),
+        ("TERMUX_EXEC__PROC_SELF_EXE", Some(untrusted_text)),
         ("DOT_REEXEC_EXPECTED_REVISION", Some(observed.as_str())),
     ];
 
