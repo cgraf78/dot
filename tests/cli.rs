@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,10 @@ use std::os::unix::fs::PermissionsExt;
 
 use dot::cli::{Command as Decision, dispatch, init_acquires_lock};
 use dot::test_support::TempDir;
+
+// One legacy dispatch test must mutate process-global environment. Snapshot
+// tests share this lock so Rust's parallel runner cannot observe that fixture.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Extract the `dot_help` heredoc body from the shell source.
 fn shell_help() -> String {
@@ -48,6 +53,7 @@ fn bin() -> Command {
 
 #[test]
 fn native_update_flag_capture_does_not_mutate_parent_environment() {
+    let _env = ENV_LOCK.lock().expect("environment lock");
     // Provider `none` now keeps `--force` on the native path. The explicit
     // embedded runtime must still retain semantic stream, user-tree, and
     // state parity when it re-execs the real binary.
@@ -95,6 +101,7 @@ fn native_update_flag_capture_does_not_mutate_parent_environment() {
 
 #[test]
 fn app_runs_concurrent_native_contexts_without_mutating_process_environment() {
+    let _env = ENV_LOCK.lock().expect("environment lock");
     // Two embedded Runtime calls must become separate `dot` processes. Their
     // fake PATH entries hold actual overlay workers at the same test seam;
     // differing TMPDIR/WSL values prove the child inherits its Runtime map,
@@ -735,6 +742,7 @@ fn binary_unknown_non_utf8_matches_oracle() {
 
 #[test]
 fn update_passes_flag_exports_to_child_without_mutating_parent() {
+    let _env = ENV_LOCK.lock().expect("environment lock");
     // Slice 80 runs `Command::Update` end to end: the shell loop's
     // exports reach its child adapter, then the engine runs for real
     // — exit `0` on the empty-HOME fixture, never the interim
@@ -4053,7 +4061,7 @@ fn scrub_update_elapsed(bytes: &[u8]) -> Vec<u8> {
             let valid_suffix = suffix == b"s"
                 || suffix == b"s. Reload your shell: source ~/.bashrc"
                 || suffix == b"s. Reload your shell: source ~/.zshrc";
-            (digits > 0 && valid_suffix).then_some((prefix.len(), prefix.len() + digits))
+            (digits > 0 && valid_suffix).then_some((prefix.len(), prefix.len() + digits, None))
         } else if body.starts_with(b"[") {
             let close = body.iter().position(|byte| *byte == b']');
             let valid_prefix = close.is_some_and(|close| {
@@ -4077,11 +4085,17 @@ fn scrub_update_elapsed(bytes: &[u8]) -> Vec<u8> {
                 .filter(|digits| {
                     valid_prefix && !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
                 })
-                .map(|digits| (start, start + digits.len()))
+                .map(|digits| {
+                    let gap_start = body[..start]
+                        .iter()
+                        .rposition(|byte| *byte != b' ')
+                        .map_or(0, |index| index + 1);
+                    (start, start + digits.len(), Some(gap_start))
+                })
         } else {
             None
         };
-        if let Some((start, end)) = range {
+        if let Some((start, end, gap_start)) = range {
             let seconds = std::str::from_utf8(&body[start..end])
                 .expect("elapsed ASCII digits")
                 .parse::<i64>()
@@ -4090,7 +4104,10 @@ fn scrub_update_elapsed(bytes: &[u8]) -> Vec<u8> {
                 (0..=120).contains(&seconds),
                 "elapsed stamp out of sane range: {seconds}s",
             );
-            out.extend_from_slice(&body[..start]);
+            out.extend_from_slice(&body[..gap_start.unwrap_or(start)]);
+            if gap_start.is_some() {
+                out.push(b' ');
+            }
             out.extend_from_slice(b"@ELAPSED@");
             out.extend_from_slice(&body[end..]);
         } else {
@@ -4155,6 +4172,14 @@ fn update_twin_duration_normalizers_cover_slow_ci_formats() {
             b"Done in 10s\nDone with errors in 10s\nDone in 10s. Reload your shell: source ~/.zshrc\n"
         ),
         b"Done in @ELAPSED@s\nDone with errors in @ELAPSED@s\nDone in @ELAPSED@s. Reload your shell: source ~/.zshrc\n"
+    );
+    assert_eq!(
+        scrub_update_elapsed(
+            b"[1/5] Repos      changed  3 repos changed, 0 repos current               9s\n\
+              [1/5] Repos      changed  3 repos changed, 0 repos current              10s\n"
+        ),
+        b"[1/5] Repos      changed  3 repos changed, 0 repos current @ELAPSED@s\n\
+          [1/5] Repos      changed  3 repos changed, 0 repos current @ELAPSED@s\n"
     );
     assert_eq!(
         scrub_merge_durations(b"  ok Alpha 999ms\n  ok Beta 1.2s\n"),
