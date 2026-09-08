@@ -24,6 +24,7 @@ pub mod extension_worker;
 pub mod families;
 pub mod glob;
 pub mod hook_api;
+pub mod init_client_adopt;
 pub mod init_client_candidate;
 pub mod init_client_delete;
 pub mod init_client_entry;
