@@ -1,40 +1,31 @@
-//! Differential parity tests for the init plan-review and conflict-backup
-//! family (`lib/dot/init-client.sh`, `_dot_init_confirm` through
-//! `_dot_init_publish_completed`) against the live shell: the backup
-//! confirmation prompt, the plan summary, the conflict move into the
-//! backup, the backup restore, and the completion-record publication.
+//! Differential parity tests for the init plan-review and
+//! conflict-safekeeping family (`lib/dot/init-client.sh`) against the
+//! live shell: the plan summary, the confirmation gate, the conflict
+//! backup and restore pair, and the completion publication.
 //!
-//! Separate binary because each row drives real filesystem state: the
-//! two engines work under disjoint home directories, so moves, sibling
-//! temps, and completion markers never collide.
-//!
-//! Row inputs that embed device/inode identities (conflict manifests)
-//! are built per side by asking the live shell to snapshot that side's
-//! own files, so each engine always verifies identities it can meet.
-//! The tree matcher itself (`_dot_init_path_state_matches`, owned by
-//! the unmerged candidate lane) is invoked through the shell on both
-//! sides, keeping these rows about the move/restore logic rather than
-//! twinning another lane's verifier.
-//!
-//! The confirmation rows assume no controlling terminal (like CI): with
-//! an empty manifest or `--yes` nothing is read, while without `--yes`
-//! both engines take the non-interactive diagnostic path. Under a local
-//! terminal the last confirm row prompts on `/dev/tty` on both sides —
-//! answering `n` yields the expected verdict. The plan rows assume the
-//! ambient `DOT_SHDEPS_UPDATE_POLICY`/`DOT_EXTENSION_API`/
-//! `DOT_EXTENSIONS_DIR` overrides are unset, matching the cleared shell
-//! harness environment.
+//! Separate binary because each row drives real filesystem state:
+//! the two engines work under disjoint home directories, so
+//! manifests, backups, previews, and completion markers never
+//! collide. Cross-lane predicates (`_dot_init_path_state_matches`,
+//! `_dot_init_private_directory`) cross the port as closures; rows
+//! marked `live` feed a closure that runs the real shell predicate,
+//! while rows marked `record` override the shell predicate with a
+//! logging stub and compare the normalized call log plus the
+//! verdict, pinning field assignment on adversarial rows (leading
+//! tabs, doubled tabs, extra fields, blank lines, unterminated
+//! tails) that journals never carry but the parser must survive.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use dot::init_client_plan as plan;
 use dot::temp::MoveCache;
-use dot::test_support::{TempDir, bash};
+use dot::test_support::TempDir;
 
-/// Sources for the init plan chapter: the resource runtime, the shared
-/// temp helpers (sibling temps, moves, identity), the XDG resolver,
-/// and the init client itself.
+/// Sources for the plan chapter: the resource runtime, the shared
+/// temp helpers (hashing, exclusive moves), the XDG root, and the
+/// init client itself.
 const SOURCES: &str = concat!(
     ". \"$1/lib/dot/resources.sh\"\n",
     ". \"$1/lib/dot/temp.sh\"\n",
@@ -42,41 +33,26 @@ const SOURCES: &str = concat!(
     ". \"$1/lib/dot/init-client.sh\"\n",
 );
 
-/// Portable aftermath dump: one line per entry under `dir`, sorted by
-/// `find` plus `LC_ALL=C sort` on the shell side and the same byte
-/// order on the Rust side. Regular-file bytes print inline; fixtures
-/// stay ASCII so no normalization escapes are needed.
-const DUMP_FN: &str = concat!(
-    "dump_tree() { d=$1; find \"$d\" -mindepth 1 -print | LC_ALL=C sort | ",
-    "while IFS= read -r e; do rel=${e#\"$d\"/}; ",
-    "if [[ -L $e ]]; then printf 'L %s -> %s\\n' \"$rel\" \"$(readlink \"$e\")\"; ",
-    "elif [[ -d $e ]]; then printf 'D %s %s\\n' \"$rel\" ",
-    "\"$(stat -c '%a' \"$e\" 2>/dev/null || stat -f '%Lp' \"$e\" 2>/dev/null)\"; ",
-    "elif [[ -f $e ]]; then printf 'F %s %s ' \"$rel\" ",
-    "\"$(stat -c '%a' \"$e\" 2>/dev/null || stat -f '%Lp' \"$e\" 2>/dev/null)\"; ",
-    "cat \"$e\"; printf '\\n'; else printf '? %s\\n' \"$rel\"; fi; done; }\n",
-);
-
-/// Run one shell snippet with the init runtime sourced and report the
-/// verdict the snippet printed. Every probe ends with
-/// `printf 'code=%s\n' "$code"`, so the returned code is that verdict
-/// — not the process status, which only says the printer ran. A
-/// snippet that never reports (a harness bug, never a pass) yields 99.
+/// Run one shell snippet with the plan runtime sourced and report
+/// the verdict the snippet printed alongside both byte streams.
+/// Every probe ends with `printf 'code=%s\n' "$code"`, so the
+/// returned code is that verdict — not the process status, which
+/// only says the printer ran. A snippet that never reports (a
+/// harness bug, never a pass) yields 99.
 ///
-/// The locale stays pinned and the environment stays cleared, exactly
-/// like the established slice harness; run-identity values cross as
-/// explicit environment entries.
+/// The locale stays pinned: git diagnostics must read English on
+/// both engines, and the port pins `LC_ALL=C` around every git run.
 fn shell_run(home: &Path, env: &[(&str, &str)], snippet: &str) -> (i32, Vec<u8>, Vec<u8>) {
     let repo = env!("CARGO_MANIFEST_DIR");
     let path = std::env::var_os("PATH").unwrap_or_default();
     let tmpdir = std::env::var_os("TMPDIR")
         .filter(|dir| !dir.is_empty())
         .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    let mut cmd = Command::new(bash());
+    let mut cmd = Command::new(dot::test_support::bash());
     cmd.arg("--noprofile")
         .arg("--norc")
         .arg("-c")
-        .arg(format!("{SOURCES}{DUMP_FN}{snippet}"));
+        .arg(format!("{SOURCES}{snippet}"));
     cmd.arg("dot-test-sh").arg(repo);
     cmd.env_clear()
         .env("LC_ALL", "C")
@@ -103,29 +79,35 @@ fn shell_run(home: &Path, env: &[(&str, &str)], snippet: &str) -> (i32, Vec<u8>,
     (verdict, output.stdout, output.stderr)
 }
 
+/// Whether the ambient `/dev/tty` refuses a write from a scratch
+/// shell: only then can the live refusal row run without hanging a
+/// real terminal at the interactive read. Probes the prompt step
+/// (the shell fails there before ever reading), so a refusal here
+/// predicts a deterministic refusal there.
+fn tty_refuses_write() -> bool {
+    let probe = Command::new(dot::test_support::bash())
+        .arg("--noprofile")
+        .arg("--norc")
+        .arg("-c")
+        .arg("printf x >/dev/tty")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    !probe.is_ok_and(|output| output.status.success())
+}
+
 /// Single-quote a word for snippet embedding.
 fn sq(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
-/// Twin homes: disjoint directories so moves, sibling temps, and
-/// completion markers never collide across engines.
-/// Sort aftermath lines before comparing: sibling-temp names differ
-/// across engines (shell `mktemp` versus port temps), so raw dump
-/// order — correct per engine — cannot match. Sorting compares the
-/// same multiset instead; stderr keeps its order-sensitive compare.
-fn sorted_lines(text: &str) -> String {
-    let mut lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
-    lines.sort();
-    lines.join("\n")
-}
-
+/// Twin homes: disjoint directories so manifests and backups never
+/// collide across engines.
 struct Twins {
     _dir: TempDir,
     shell_home: PathBuf,
     rust_home: PathBuf,
-    shell_text: String,
-    rust_text: String,
 }
 
 impl Twins {
@@ -135,23 +117,46 @@ impl Twins {
         let rust_home = dir.path().join("rs-home");
         std::fs::create_dir_all(&shell_home).expect("shell home");
         std::fs::create_dir_all(&rust_home).expect("rust home");
-        let shell_text = shell_home.to_string_lossy().into_owned();
-        let rust_text = rust_home.to_string_lossy().into_owned();
         Self {
             _dir: dir,
             shell_home,
             rust_home,
-            shell_text,
-            rust_text,
         }
+    }
+
+    fn root(&self) -> &Path {
+        self._dir.path()
     }
 }
 
-/// Run git for fixtures, with a pinned identity for commits.
-fn git(repo: &Path, args: &[&str]) {
+/// `chmod` without following the test's own outcome plumbing.
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod fixture");
+}
+
+/// File mode bits (`stat %a` spelling) for assertions.
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::symlink_metadata(path)
+        .expect("fixture stat")
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+/// Write `bytes` to `dir/name`, creating parents.
+fn write(dir: &Path, name: &str, bytes: &[u8]) {
+    let path = dir.join(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("fixture parents");
+    }
+    std::fs::write(&path, bytes).expect("write fixture");
+}
+
+/// Run git for fixtures; asserts success, silences output.
+fn git(args: &[&str]) {
     let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .stdin(Stdio::null())
@@ -159,1034 +164,1598 @@ fn git(repo: &Path, args: &[&str]) {
         .stderr(Stdio::null())
         .status()
         .expect("spawn git");
-    assert!(status.success(), "git {args:?} in {}", repo.display());
+    assert!(status.success(), "git {args:?}");
 }
 
-/// Write `bytes` to `path`, creating parents, and force `mode`.
-fn place(path: &Path, bytes: &[u8], mode: u32) {
-    use std::os::unix::fs::PermissionsExt as _;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("fixture parents");
-    }
-    std::fs::write(path, bytes).expect("write fixture");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod fixture");
+/// Lexical existence plus bytes: the observable end-state of a row
+/// on one side. Symlinks report their target text.
+fn shape(path: &Path) -> (bool, Vec<u8>) {
+    let exists = std::fs::symlink_metadata(path).is_ok();
+    let content = std::fs::read_link(path)
+        .map(|target| target.as_os_str().as_encoded_bytes().to_vec())
+        .or_else(|_| std::fs::read(path))
+        .unwrap_or_default();
+    (exists, content)
 }
 
-/// Snapshot one home-relative path through the live shell: returns the
-/// `kind\tdev\tino\tmode\tsize\tvalue` state for a manifest row.
-fn snapshot_state(home: &Path, rel: &str) -> String {
-    let target = format!("{}/{}", home.to_string_lossy(), rel);
-    let snippet = format!(
-        "state=$(_dot_init_snapshot_path {}); code=$?; printf '%s\\n' \"$state\"; printf 'code=%s\\n' \"$code\";",
-        sq(&target),
+/// Snapshot one side-relative path the shell way, via the live
+/// `_dot_init_snapshot_path`: returns the manifest row
+/// (`rel\tkind\tdev\tino\tmode\tsize\tvalue`, no trailing
+/// newline) as the behavior-neutral oracle for row construction.
+/// Row bytes come from the shell on both sides, so only the
+/// orchestration under test can diverge.
+fn snapshot_row(home: &Path, rel: &str) -> String {
+    let body = format!(
+        "if row=$(_dot_init_snapshot_path {}); then code=0; else code=$?; row=; fi\nprintf 'row=%s\\ncode=%s\\n' \"$row\" \"$code\"\n",
+        sq(home.join(rel).to_str().expect("fixture path"))
     );
-    let (code, out, _) = shell_run(home, &[], &snippet);
+    let (code, out, _) = shell_run(home, &[], &body);
     assert_eq!(code, 0, "snapshot {rel}");
-    let text = String::from_utf8(out).expect("snapshot dump");
-    text.lines().next().expect("snapshot row").to_string()
-}
-
-/// One manifest row for `rel` under `home`.
-fn manifest_row(home: &Path, rel: &str) -> String {
-    format!("{rel}\t{}", snapshot_state(home, rel))
-}
-
-/// Ask the live shell whether the tree state matches: the candidate
-/// lane's matcher, used as the oracle behind the Rust closures so
-/// these rows exercise move/restore logic rather than a test-local
-/// twin of another lane's verifier.
-fn shell_matches(home: &Path, path: &Path, fields: &[&str; 6]) -> bool {
-    let snippet = format!(
-        "_dot_init_path_state_matches {} {} {} {} {} {} {}; code=$?; printf 'code=%s\\n' \"$code\";",
-        sq(&path.to_string_lossy()),
-        sq(fields[0]),
-        sq(fields[1]),
-        sq(fields[2]),
-        sq(fields[3]),
-        sq(fields[4]),
-        sq(fields[5]),
-    );
-    shell_run(home, &[], &snippet).0 == 0
-}
-
-/// Scrub device/inode identities from one dump line: manifest rows
-/// embed the snapshotting side's identities, so the `dev`/`ino`
-/// fields (positions 2 and 3 of a seven-field row with a known
-/// snapshot kind) collapse while mode, size, and value still compare.
-/// Other lines pass through untouched.
-fn scrub_manifest_identities(line: &str) -> String {
-    let fields: Vec<&str> = line.split('\t').collect();
-    if fields.len() == 7 && matches!(fields[1], "regular" | "symlink" | "directory" | "absent") {
-        [
-            fields[0], fields[1], "@DEV@", "@INO@", fields[4], fields[5], fields[6],
-        ]
-        .join("\t")
-    } else {
-        line.to_string()
-    }
-}
-
-/// Replace side-local paths and random sibling suffixes so twin dumps
-/// compare. Residue sibling temps carry random names on both engines,
-/// and even their fixed parts differ (shell `mktemp` versus the port's
-/// sibling temps); either whole shape collapses to `@RESIDUE@`.
-/// Manifest identities scrub positionally per line.
-fn normalize(text: &str, home: &str) -> String {
-    let text = text.replace(home, "@HOME@");
-    let text = text
+    let text = String::from_utf8_lossy(&out);
+    let row = text
         .lines()
-        .map(scrub_manifest_identities)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.is_empty() {
-        return text;
-    }
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let rest = &text[index..];
-        let mut consumed = None;
-        for shape in [".completed.", "completed.tmp."] {
-            if let Some(tail) = rest.strip_prefix(shape) {
-                let run: usize = tail
-                    .chars()
-                    .take_while(|ch| ch.is_ascii_alphanumeric())
-                    .map(|ch| ch.len_utf8())
-                    .sum();
-                if run >= 4 {
-                    out.push_str("@RESIDUE@");
-                    consumed = Some(shape.len() + run);
-                    break;
-                }
-            }
-        }
-        if let Some(skip) = consumed {
-            index += skip;
-        } else {
-            let next = rest.chars().next().expect("nonempty rest");
-            out.push(next);
-            index += next.len_utf8();
-        }
-    }
-    out
+        .find_map(|line| line.strip_prefix("row="))
+        .unwrap_or_default();
+    assert!(!row.is_empty(), "snapshot row {rel}");
+    format!("{rel}\t{row}")
 }
 
-/// Rust mirror of the shell `dump_tree` probe: same line shapes, same
-/// byte order as `LC_ALL=C sort` (relative-path bytes, matching the
-/// shell's full-path order under the shared directory prefix).
-fn rust_dump(dir: &Path) -> String {
-    let mut entries = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let read = match std::fs::read_dir(&current) {
-            Ok(read) => read,
-            Err(_) => continue,
-        };
-        for entry in read {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
-            let path = entry.path();
-            if path.is_dir() && !path.is_symlink() {
-                stack.push(path.clone());
-            }
-            let rel = path
-                .strip_prefix(dir)
-                .expect("dump rel")
-                .to_string_lossy()
-                .into_owned();
-            entries.push((rel, path));
+/// Live worktree-state matcher: runs the real shell predicate per
+/// call, so `live` rows exercise true end-to-end parity.
+fn live_matches(home: PathBuf) -> impl Fn(&Path, &str, &str, &str, &str, &str, &str) -> bool {
+    move |target, kind, dev, ino, mode, size, value| {
+        let body = format!(
+            "if _dot_init_path_state_matches {} {} {} {} {} {} {}; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
+            sq(target.to_str().expect("match path")),
+            sq(kind),
+            sq(dev),
+            sq(ino),
+            sq(mode),
+            sq(size),
+            sq(value)
+        );
+        shell_run(&home, &[], &body).0 == 0
+    }
+}
+
+/// Live private-directory provision: runs the real shell helper.
+fn live_private_dir(home: PathBuf) -> impl Fn(&Path) -> dot::Result<()> {
+    move |path| {
+        let body = format!(
+            "if _dot_init_private_directory {}; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
+            sq(path.to_str().expect("private path"))
+        );
+        if shell_run(&home, &[], &body).0 == 0 {
+            Ok(())
+        } else {
+            Err(dot::errors::Error::Usage {
+                message: "private directory refused",
+            })
         }
     }
-    entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
-    let mut out = String::new();
-    for (rel, path) in entries {
-        let meta = std::fs::symlink_metadata(&path).expect("dump stat");
-        use std::os::unix::fs::MetadataExt as _;
-        if meta.file_type().is_symlink() {
-            let target = std::fs::read_link(&path).expect("dump link");
-            out.push_str(&format!("L {rel} -> {}\n", target.to_string_lossy()));
-        } else if meta.is_dir() {
-            out.push_str(&format!("D {rel} {:o}\n", meta.mode() & 0o7777));
-        } else if meta.is_file() {
-            let bytes = std::fs::read(&path).expect("dump read");
-            out.push_str(&format!(
-                "F {rel} {:o} {}\n",
-                meta.mode() & 0o7777,
-                String::from_utf8_lossy(&bytes)
+}
+
+/// Failing provisioner for refusal rows.
+fn failing_private_dir() -> impl Fn(&Path) -> dot::Result<()> {
+    |_| {
+        Err(dot::errors::Error::Usage {
+            message: "private directory refused",
+        })
+    }
+}
+
+/// Recording matcher for `record` rows: logs normalized calls and
+/// answers from a script.
+struct Recorder {
+    calls: RefCell<Vec<String>>,
+    answers: RefCell<Vec<bool>>,
+}
+
+impl Recorder {
+    fn new(answers: Vec<bool>) -> Self {
+        Self {
+            calls: RefCell::new(Vec::new()),
+            answers: RefCell::new(answers),
+        }
+    }
+
+    fn matcher(&self) -> impl Fn(&Path, &str, &str, &str, &str, &str, &str) -> bool + '_ {
+        |target, kind, dev, ino, mode, size, value| {
+            self.calls.borrow_mut().push(format!(
+                "{}|{kind}|{dev}|{ino}|{mode}|{size}|{value}",
+                target.display()
             ));
-        } else {
-            out.push_str(&format!("? {rel}\n"));
+            if self.answers.borrow().is_empty() {
+                true
+            } else {
+                self.answers.borrow_mut().remove(0)
+            }
         }
     }
-    out
+
+    fn take(&self) -> Vec<String> {
+        self.calls.borrow().clone()
+    }
 }
 
-/// True when `/dev/tty` passes the access-bit gate but cannot be
-/// opened (a container shape with no controlling terminal behind a
-/// present node): the shell proceeds past its gate, so its own
-/// redirection diagnostics trail the listing — script path plus line
-/// numbers no port can reproduce byte for byte.
-fn tty_gate_without_terminal() -> bool {
-    let gate = Command::new("sh")
-        .arg("-c")
-        .arg("test -r /dev/tty && test -w /dev/tty")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    gate && std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .is_err()
-}
+/// Shell-side recording stub for `record` rows: overrides the live
+/// predicate with a logger that answers from `$STUB_ANSWERS`
+/// (`1`/`0` per call) and prints `call=` lines for the harness.
+const RECORD_STUB: &str = concat!(
+    "_dot_init_path_state_matches() {\n",
+    "  printf 'call=%s|%s|%s|%s|%s|%s|%s\\n' \"$1\" \"$2\" \"$3\" \"$4\" \"$5\" \"$6\" \"$7\"\n",
+    "  case $STUB_ANSWERS in\n",
+    "    1*) STUB_ANSWERS=${STUB_ANSWERS#1} ;;\n",
+    "    0*) STUB_ANSWERS=${STUB_ANSWERS#0}; return 1 ;;\n",
+    "    *) return 1 ;;\n",
+    "  esac\n",
+    "}\n",
+);
 
-/// Run `_dot_init_confirm` on both engines and compare the verdict
-/// plus stderr. `yes_arg` renders as the shell's second argument.
-fn check_confirm_row(tag: &str, manifest_bytes: Option<&[u8]>, yes_arg: &str) {
-    let twins = Twins::build(&format!("confirm-{tag}"));
-    for home in [&twins.shell_home, &twins.rust_home] {
-        if let Some(bytes) = manifest_bytes {
-            std::fs::write(home.join("conflicts.tsv"), bytes).expect("manifest");
-        }
-    }
-    let snippet = format!(
-        "manifest={}; _dot_init_confirm \"$manifest\" {}; code=$?; printf 'code=%s\\n' \"$code\";",
-        sq(&format!("{}/conflicts.tsv", twins.shell_text)),
-        yes_arg,
-    );
-    let (code, _, shell_err) = shell_run(&twins.shell_home, &[], &snippet);
-    assert_ne!(code, 99, "harness verdict for confirm {tag}");
-
-    let manifest = twins.rust_home.join("conflicts.tsv");
-    let mut rust_err = Vec::new();
-    let outcome = plan::confirm(&manifest, yes_arg == "true", &mut rust_err);
-    let rust_code = if outcome.is_ok() { 0 } else { 1 };
-    assert_eq!(rust_code, code, "confirm rc for {tag}");
-    let rust_text = String::from_utf8_lossy(&rust_err).into_owned();
-    let shell_text = String::from_utf8_lossy(&shell_err).into_owned();
-    if tag == "listed-no-yes-noninteractive" && tty_gate_without_terminal() {
-        assert!(
-            normalize(&shell_text, &twins.shell_text)
-                .starts_with(&normalize(&rust_text, &twins.rust_text)),
-            "shell listing still matches in the exotic terminal shape"
-        );
-        return;
-    }
-    assert_eq!(
-        normalize(&rust_text, &twins.rust_text),
-        normalize(&shell_text, &twins.shell_text),
-        "confirm stderr for {tag}"
-    );
+/// Normalize a recorded target path for cross-side comparison: the
+/// twin homes differ, so only the side-relative tail compares.
+fn normalize_call(call: &str, home: &Path) -> String {
+    let prefix = format!("{}/", home.to_str().expect("home text"));
+    call.replacen(&prefix, "HOME/", 1)
 }
 
 #[test]
-fn confirm_rows_agree() {
-    check_confirm_row("empty", Some(b""), "false");
-    check_confirm_row("missing", None, "false");
-    check_confirm_row(
-        "listed-yes",
-        Some(b"sub/file.txt\tregular\t1\t2\t644\t3\tabc\nweird-line\n\n"),
-        "true",
-    );
-    check_confirm_row(
-        "listed-no-yes-noninteractive",
-        Some(b"sub/file.txt\tregular\t1\t2\t644\t3\tabc\n"),
-        "false",
-    );
+fn confirm_empty_manifest_is_silent() {
+    for name in ["missing", "empty"] {
+        let dir = TempDir::new("plan-confirm-empty").expect("temp dir");
+        let manifest = dir.path().join("manifest");
+        if name == "empty" {
+            std::fs::write(&manifest, b"").expect("empty manifest");
+        }
+        // The listing goes to stderr; stdout carries only the verdict.
+        let listing_body = format!(
+            "if _dot_init_confirm {} true >/dev/null; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
+            sq(manifest.to_str().expect("manifest path")),
+        );
+        let (shell_code, _, shell_err) = shell_run(dir.path(), &[], &listing_body);
+        assert_eq!(shell_code, 0, "shell {name}");
+        assert!(shell_err.is_empty(), "shell {name} silent");
+        let rust = plan::confirm(&manifest, true, Path::new("/dev/tty")).expect("rust {name}");
+        assert!(rust.is_empty(), "rust {name} silent");
+    }
 }
 
-/// Candidate fixture: `git init -b main` plus one commit. With
-/// `config`, `.config/dot/config` carries those bytes.
-fn seed_candidate(dir: &Path, config: Option<&[u8]>) {
-    git(dir, &["init", "-q", "-b", "main"]);
-    if let Some(bytes) = config {
-        place(&dir.join(".config/dot/config"), bytes, 0o644);
+#[test]
+fn confirm_listing_matches_cut_first() {
+    // Adversarial manifest: a plain row, a path-less row, a blank
+    // line, a leading-tab row (`cut` reports empty, no stripping),
+    // a doubled-tab row, an extra-fields row, and an unterminated
+    // tail. Both engines must print the identical listing.
+    let dir = TempDir::new("plan-confirm-list").expect("temp dir");
+    let manifest = dir.path().join("manifest");
+    // BSD cut truncates fields at NUL bytes, so a NUL row has no
+    // portable shell spelling on macOS; byte-exactness for that row
+    // is probed on Linux CI instead (fleet non-UTF8 precedent).
+    let content = if cfg!(target_os = "macos") {
+        "file1\tregular\t1\t2\t644\t3\tabc\nNOTAB\n\n\tlead\tk\np\t\tk\td\ti\tm\ts\tv\na\tb\tc\td\te\tf\tg\te1\ntail-row"
     } else {
-        place(&dir.join("seed.txt"), b"seed\n", 0o644);
-    }
-    git(dir, &["add", "-A"]);
-    git(dir, &["commit", "-qm", "seed"]);
-}
-
-/// Run `_dot_init_plan_summary` on both engines and compare the
-/// verdict plus stderr. `compare_stderr` is false only for the
-/// unreadable-tree row, whose `wc` diagnostic is platform-specific
-/// (documented in [`plan::plan_summary`]).
-fn check_plan_row(
-    tag: &str,
-    tree_bytes: Option<&[u8]>,
-    config: Option<&[u8]>,
-    branch: &str,
-    skip_provider: bool,
-    compare_stderr: bool,
-) {
-    let twins = Twins::build(&format!("plan-{tag}"));
-    for home in [&twins.shell_home, &twins.rust_home] {
-        let candidate = home.join("candidate");
-        std::fs::create_dir_all(&candidate).expect("candidate dir");
-        if config.is_some() || tag != "plain-dir" {
-            seed_candidate(&candidate, config);
-        }
-        if let Some(bytes) = tree_bytes {
-            std::fs::write(home.join("tree.tsv"), bytes).expect("tree");
-        }
-    }
-    let skip_flag = if skip_provider { "1" } else { "0" };
-    let snippet = format!(
-        "DOT_INIT_SKIP_PROVIDER={skip_flag} _dot_init_plan_summary {} {} {} {} {}; code=$?; printf 'code=%s\\n' \"$code\";",
-        sq(&format!("{}/candidate", twins.shell_text)),
-        sq(branch),
-        sq(&format!("{}/tree.tsv", twins.shell_text)),
-        sq(&format!("{}/backup", twins.shell_text)),
-        sq("example.com/dot"),
-    );
-    let (code, _, shell_err) = shell_run(&twins.shell_home, &[], &snippet);
-    assert_ne!(code, 99, "harness verdict for plan {tag}");
-
-    let rust_candidate = twins.rust_home.join("candidate");
-    let rust_tree = twins.rust_home.join("tree.tsv");
-    let rust_backup = twins.rust_home.join("backup");
-    let inputs = plan::PlanInputs {
-        candidate: &rust_candidate,
-        branch,
-        tree: &rust_tree,
-        backup: &rust_backup,
-        identity: "example.com/dot",
-        home: &twins.rust_home,
-        source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
-        skip_provider,
+        "file1\tregular\t1\t2\t644\t3\tabc\nNOTAB\n\n\tlead\tk\np\t\tk\td\ti\tm\ts\tv\na\tb\tc\td\te\tf\tg\te1\nn\0ul\tk\ntail-row"
     };
-    let mut rust_err = Vec::new();
-    let outcome = plan::plan_summary(&inputs, &mut rust_err);
-    let rust_code = if outcome.is_ok() { 0 } else { 1 };
-    assert_eq!(rust_code, code, "plan rc for {tag}");
-    if compare_stderr {
-        assert_eq!(
-            normalize(&String::from_utf8_lossy(&rust_err), &twins.rust_text),
-            normalize(&String::from_utf8_lossy(&shell_err), &twins.shell_text),
-            "plan stderr for {tag}"
+    std::fs::write(&manifest, content).expect("manifest");
+    let body = format!(
+        "if _dot_init_confirm {} true >/dev/null; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
+        sq(manifest.to_str().expect("manifest path")),
+    );
+    let (shell_code, _, shell_err) = shell_run(dir.path(), &[], &body);
+    assert_eq!(shell_code, 0, "shell listing");
+    let rust = plan::confirm(&manifest, true, Path::new("/dev/tty")).expect("rust listing");
+    // Compact divergence report: full byte arrays truncate in CI
+    // logs, so pinpoint the first differing offset instead.
+    if rust != shell_err {
+        let at = rust
+            .iter()
+            .zip(shell_err.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(rust.len().min(shell_err.len()));
+        let lo = at.saturating_sub(16);
+        panic!(
+            "listing bytes diverge at {at} (rust {}B, shell {}B): rust={:?} shell={:?}",
+            rust.len(),
+            shell_err.len(),
+            &rust[lo..(at + 16).min(rust.len())],
+            &shell_err[lo..(at + 16).min(shell_err.len())]
         );
     }
+    let text = String::from_utf8_lossy(&rust);
+    assert!(text.starts_with("dot init: conflicting paths will be backed up:\n"));
+    assert!(text.contains("\n  file1\n"));
+    assert!(text.contains("\n  NOTAB\n"));
+    // Blank line and leading-tab row both list an empty field.
+    assert!(text.contains("\n  \n"));
+    assert!(text.contains("\n  p\n"));
+    assert!(text.contains("\n  a\n"));
+    // GNU `cut` preserves NUL bytes in the listed field; BSD cut
+    // truncates at NUL, so this row only exists off macOS.
+    if !cfg!(target_os = "macos") {
+        assert!(text.contains("\n  n\0ul\n"));
+    }
+    // BSD `sed` preserves a missing trailing newline while GNU
+    // `sed` terminates the final line (see `confirm`).
+    if cfg!(target_os = "macos") {
+        assert!(text.ends_with("\n  tail-row"));
+    } else {
+        assert!(text.contains("\n  tail-row\n"));
+    }
 }
 
 #[test]
-fn plan_summary_rows_agree() {
-    check_plan_row(
-        "plain-dir",
-        Some(b"100644 aaa f\n100755 bbb g\n"),
-        None,
-        "main",
-        false,
-        true,
-    );
-    check_plan_row(
-        "no-config",
-        Some(b"100644 aaa f\n"),
-        None,
-        "main",
-        false,
-        true,
-    );
-    check_plan_row(
-        "wrong-branch",
-        Some(b"100644 aaa f\n"),
-        None,
-        "other",
-        false,
-        true,
-    );
-    check_plan_row(
-        "minimal-config",
-        Some(b"100644 aaa f\n100644 bbb g"),
-        Some(b"version=1\n"),
-        "main",
-        false,
-        true,
-    );
-    check_plan_row(
-        "full-config",
-        Some(b"100644 aaa f\n"),
-        Some(
-            b"version=1\ndependency_provider=shdeps\nshdeps_update_policy=latest\nextension_api=1\nextensions_dir=ext\n",
-        ),
-        "main",
-        false,
-        true,
-    );
-    check_plan_row(
-        "skipped-provider",
-        Some(b"100644 aaa f\n"),
-        Some(b"version=1\ndependency_provider=shdeps\n"),
-        "main",
-        true,
-        true,
-    );
-    check_plan_row(
-        "skipped-none-provider",
-        Some(b"100644 aaa f\n"),
-        Some(b"version=1\n"),
-        "main",
-        true,
-        true,
-    );
-    check_plan_row(
-        "bad-config",
-        Some(b"100644 aaa f\n"),
-        Some(b"bogus\n"),
-        "main",
-        false,
-        true,
-    );
-    check_plan_row("missing-tree", None, None, "main", false, false);
-    check_plan_row("empty-tree", Some(b""), None, "main", false, true);
-}
-
-/// Seed conflicting home paths: a nested regular file, a nested
-/// symlink, and an empty directory. Manifest rows list them in this
-/// order so failure rows can park the early rows before failing.
-fn seed_conflicts(home: &Path) {
-    place(&home.join("sub/file.txt"), b"home bytes\n", 0o644);
-    std::os::unix::fs::symlink("file.txt", home.join("sub/link")).expect("symlink fixture");
-    std::fs::create_dir_all(home.join("emptydir")).expect("dir fixture");
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(
-        home.join("emptydir"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .expect("chmod fixture");
-}
-
-/// Manifest bytes for the conflict seed under `home`, snapshotted
-/// per side so device/inode identities always match that side.
-fn conflict_manifest(home: &Path) -> Vec<u8> {
-    let mut out = Vec::new();
-    for rel in ["emptydir", "sub/file.txt", "sub/link"] {
-        out.extend_from_slice(manifest_row(home, rel).as_bytes());
-        out.push(b'\n');
+fn confirm_without_yes_refuses() {
+    let dir = TempDir::new("plan-confirm-no").expect("temp dir");
+    let manifest = dir.path().join("manifest");
+    std::fs::write(&manifest, b"file1\tregular\t1\t2\t644\t3\tabc\n").expect("manifest");
+    // Live shell comparison only when the prompt step deterministically
+    // fails here: on a real terminal the shell would block reading the
+    // answer, which no test may do.
+    if tty_refuses_write() {
+        let body = format!(
+            "if _dot_init_confirm {} false >/dev/null; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
+            sq(manifest.to_str().expect("manifest path")),
+        );
+        let (shell_code, _, shell_err) = shell_run(dir.path(), &[], &body);
+        assert_eq!(shell_code, 1, "shell refuses");
+        let noise = String::from_utf8_lossy(&shell_err);
+        assert!(
+            shell_err.is_empty()
+                || noise.contains("conflicts require --yes")
+                || noise.contains("/dev/tty"),
+            "refusal noise is the gate diagnostic or bash's own redirection error, got: {noise}"
+        );
+        assert!(
+            plan::confirm(&manifest, false, Path::new("/dev/tty")).is_err(),
+            "rust refuses on the live terminal"
+        );
+    } else {
+        eprintln!("live terminal present: skipping live refusal comparison");
     }
-    out
-}
-
-/// Shell side of a move row: move, move again for idempotency, then
-/// report both verdicts plus a home dump (which includes the backup
-/// subtree). Compare the stored manifest in Rust so this test does not
-/// require a utility that the shell implementation itself never uses.
-fn shell_move_twice(home: &Path, home_text: &str) -> (i32, i32, String, String, String) {
-    let snippet = format!(
-        "cmp() {{ return 127; }}; manifest={} backup={}; _dot_init_move_conflicts \"$manifest\" \"$backup\"; code=$?; printf 'code=%s\\n' \"$code\"; _dot_init_move_conflicts \"$manifest\" \"$backup\"; code2=$?; printf 'code2=%s\\n' \"$code2\"; dump_tree {};",
-        sq(&format!("{home_text}/conflicts.tsv")),
-        sq(&format!("{home_text}/backup")),
-        sq(home_text),
-    );
-    let (code, out, err) = shell_run(home, &[], &snippet);
-    assert_ne!(code, 99, "harness verdict for move");
-    let text = String::from_utf8(out).expect("move dump");
-    let code2_line = text
-        .lines()
-        .find(|line| line.starts_with("code2="))
-        .unwrap_or("code2=99");
-    let code2 = code2_line
-        .strip_prefix("code2=")
-        .and_then(|head| head.split(' ').next())
-        .and_then(|code| code.parse().ok())
-        .unwrap_or(99);
-    let stored = match (
-        std::fs::read(home.join("conflicts.tsv")),
-        std::fs::read(home.join("backup/manifest")),
-    ) {
-        (Ok(left), Ok(right)) if left == right => "same",
-        _ => "diff",
-    }
-    .to_string();
-    let dump = text
-        .lines()
-        .skip_while(|line| !line.starts_with("code2="))
-        .skip(1)
-        .collect::<Vec<_>>()
-        .join("\n");
-    (
-        code,
-        code2,
-        stored,
-        dump,
-        String::from_utf8(err).expect("move err"),
-    )
-}
-
-/// Rust side of a move row, mirroring [`shell_move_twice`].
-fn rust_move_twice(home: &Path) -> (i32, i32, String, Vec<u8>) {
-    let manifest = home.join("conflicts.tsv");
-    let backup = home.join("backup");
-    let source_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let matches =
-        |path: &Path, kind: &str, dev: &str, ino: &str, mode: &str, size: &str, value: &str| {
-            shell_matches(home, path, &[kind, dev, ino, mode, size, value])
-        };
-    let mut cache = MoveCache::default();
-    let mut move_err = Vec::new();
-    let first = plan::move_conflicts(
-        &manifest,
-        &backup,
-        home,
-        source_root,
-        &matches,
-        &mut cache,
-        &mut move_err,
-    );
-    let second = plan::move_conflicts(
-        &manifest,
-        &backup,
-        home,
-        source_root,
-        &matches,
-        &mut cache,
-        &mut move_err,
-    );
-    let stored = match (
-        std::fs::read(&manifest),
-        std::fs::read(backup.join("manifest")),
-    ) {
-        (Ok(left), Ok(right)) if left == right => "same",
-        _ => "diff",
-    };
-    let mut dump = format!("code2={} stored={stored}\n", i32::from(second.is_err()));
-    dump.push_str(&rust_dump(home));
-    (
-        i32::from(first.is_err()),
-        i32::from(second.is_err()),
-        dump,
-        move_err,
-    )
-}
-
-#[test]
-fn move_conflicts_rows_agree() {
-    let twins = Twins::build("move-fresh");
-    for home in [&twins.shell_home, &twins.rust_home] {
-        seed_conflicts(home);
-        let manifest = conflict_manifest(home);
-        std::fs::write(home.join("conflicts.tsv"), &manifest).expect("manifest");
-    }
-    let (shell_code, shell_code2, shell_stored, shell_dump, _) =
-        shell_move_twice(&twins.shell_home, &twins.shell_text);
-    let (rust_code, rust_code2, rust_dump_text, rust_move_err) = rust_move_twice(&twins.rust_home);
-    assert_eq!(rust_code, shell_code, "move rc");
-    assert_eq!(rust_code2, shell_code2, "move rerun rc");
-    assert!(rust_move_err.is_empty(), "fresh moves stay silent");
-    assert_eq!(shell_stored, "same", "shell parks the stored manifest");
-    assert_eq!(
-        sorted_lines(&normalize(&rust_dump_text, &twins.rust_text)),
-        sorted_lines(&normalize(
-            &format!("code2={shell_code2} stored={shell_stored}\n{shell_dump}"),
-            &twins.shell_text
-        )),
-        "move aftermath"
-    );
-}
-
-/// Single-shot move rows with a per-row home mutation between the
-/// manifest snapshot and the move.
-fn check_move_row(tag: &str, mutate: fn(&Path), want_rc: i32) {
-    let twins = Twins::build(&format!("move-{tag}"));
-    for home in [&twins.shell_home, &twins.rust_home] {
-        seed_conflicts(home);
-        let manifest = conflict_manifest(home);
-        std::fs::write(home.join("conflicts.tsv"), &manifest).expect("manifest");
-        mutate(home);
-    }
-    let snippet = format!(
-        "_dot_init_move_conflicts {} {}; code=$?; printf 'code=%s\\n' \"$code\"; dump_tree {};",
-        sq(&format!("{}/conflicts.tsv", twins.shell_text)),
-        sq(&format!("{}/backup", twins.shell_text)),
-        sq(&twins.shell_text),
-    );
-    let (code, out, shell_err) = shell_run(&twins.shell_home, &[], &snippet);
-    assert_ne!(code, 99, "harness verdict for move {tag}");
-    assert_eq!(code, want_rc, "shell move rc for {tag}");
-    let shell_dump = String::from_utf8(out).expect("move dump");
-
-    let manifest = twins.rust_home.join("conflicts.tsv");
-    let backup = twins.rust_home.join("backup");
-    let source_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let home = twins.rust_home.clone();
-    let matches =
-        |path: &Path, kind: &str, dev: &str, ino: &str, mode: &str, size: &str, value: &str| {
-            shell_matches(&home, path, &[kind, dev, ino, mode, size, value])
-        };
-    let mut cache = MoveCache::default();
-    let mut rust_err = Vec::new();
-    let outcome = plan::move_conflicts(
-        &manifest,
-        &backup,
-        &twins.rust_home,
-        source_root,
-        &matches,
-        &mut cache,
-        &mut rust_err,
-    );
-    let rust_code = i32::from(outcome.is_err());
-    assert_eq!(rust_code, want_rc, "rust move rc for {tag}");
-    let rust_dump_text = rust_dump(&twins.rust_home);
-    let shell_aftermath = shell_dump
-        .lines()
-        .skip_while(|line| !line.starts_with("code="))
-        .skip(1)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(
-        sorted_lines(&normalize(&rust_dump_text, &twins.rust_text)),
-        sorted_lines(&normalize(&shell_aftermath, &twins.shell_text)),
-        "move aftermath for {tag}"
-    );
-    assert_eq!(
-        normalize(&String::from_utf8_lossy(&rust_err), &twins.rust_text),
-        normalize(&String::from_utf8_lossy(&shell_err), &twins.shell_text),
-        "move stderr for {tag}"
-    );
-}
-
-#[test]
-fn move_conflicts_failure_rows_agree() {
-    check_move_row(
-        "missing-manifest",
-        |home| {
-            std::fs::remove_file(home.join("conflicts.tsv")).expect("drop manifest");
-        },
-        1,
-    );
-    check_move_row(
-        "home-changed",
-        |home| {
-            place(&home.join("sub/file.txt"), b"changed\n", 0o644);
-        },
-        1,
-    );
-    check_move_row(
-        "dest-occupied",
-        |home| {
-            place(&home.join("backup/sub/file.txt"), b"squatter\n", 0o644);
-        },
-        1,
-    );
-    check_move_row(
-        "stored-differs",
-        |home| {
-            std::fs::create_dir_all(home.join("backup")).expect("backup dir");
-            std::fs::write(home.join("backup/manifest"), b"junk\n").expect("junk manifest");
-        },
-        1,
-    );
-}
-
-/// Move on both engines, then restore on both engines, comparing the
-/// restore verdict plus the final home and backup dumps. `disturb`
-/// runs between the move and the restore (per side) to shape failure
-/// rows; the roundtrip passes a no-op.
-fn check_restore_row(tag: &str, disturb: fn(&Path), want_rc: i32) {
-    let twins = Twins::build(&format!("restore-{tag}"));
-    for home in [&twins.shell_home, &twins.rust_home] {
-        seed_conflicts(home);
-        let manifest = conflict_manifest(home);
-        std::fs::write(home.join("conflicts.tsv"), &manifest).expect("manifest");
-    }
-    let snippet = format!(
-        "manifest={} backup={}; _dot_init_move_conflicts \"$manifest\" \"$backup\" || {{ code=$?; printf 'code=%s\\n' \"$code\"; exit 0; }}; dump_tree {} >/dev/null; ",
-        sq(&format!("{}/conflicts.tsv", twins.shell_text)),
-        sq(&format!("{}/backup", twins.shell_text)),
-        sq(&twins.shell_text),
-    );
-    let (move_code, _, _) = shell_run(
-        &twins.shell_home,
-        &[],
-        &format!("{snippet}printf 'code=0\\n';"),
-    );
-    assert_eq!(move_code, 0, "shell setup move for restore {tag}");
-    let source_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    {
-        let manifest = twins.rust_home.join("conflicts.tsv");
-        let backup = twins.rust_home.join("backup");
-        let home = twins.rust_home.clone();
-        let matches =
-            |path: &Path, kind: &str, dev: &str, ino: &str, mode: &str, size: &str, value: &str| {
-                shell_matches(&home, path, &[kind, dev, ino, mode, size, value])
-            };
-        let mut cache = MoveCache::default();
-        let mut setup_err = Vec::new();
-        plan::move_conflicts(
-            &manifest,
-            &backup,
-            &twins.rust_home,
-            source_root,
-            &matches,
-            &mut cache,
-            &mut setup_err,
-        )
-        .expect("rust setup move");
-        assert!(setup_err.is_empty(), "setup moves stay silent");
-    }
-    for home in [&twins.shell_home, &twins.rust_home] {
-        disturb(home);
-    }
-    let restore_snippet = format!(
-        "_dot_init_restore_backups {}; code=$?; printf 'code=%s\\n' \"$code\"; dump_tree {}; dump_tree {};",
-        sq(&format!("{}/backup", twins.shell_text)),
-        sq(&twins.shell_text),
-        sq(&format!("{}/backup", twins.shell_text)),
-    );
-    let (code, out, shell_err) = shell_run(&twins.shell_home, &[], &restore_snippet);
-    assert_ne!(code, 99, "harness verdict for restore {tag}");
-    assert_eq!(code, want_rc, "shell restore rc for {tag}");
-    let shell_dump = String::from_utf8(out).expect("restore dump");
-
-    let backup = twins.rust_home.join("backup");
-    let home = twins.rust_home.clone();
-    let matches =
-        |path: &Path, kind: &str, dev: &str, ino: &str, mode: &str, size: &str, value: &str| {
-            shell_matches(&home, path, &[kind, dev, ino, mode, size, value])
-        };
-    let mut cache = MoveCache::default();
-    let mut rust_err = Vec::new();
-    let outcome = plan::restore_backups(
-        &backup,
-        &twins.rust_home,
-        &matches,
-        &mut cache,
-        &mut rust_err,
-    );
-    let rust_code = i32::from(outcome.is_err());
-    assert_eq!(rust_code, want_rc, "rust restore rc for {tag}");
-    let mut rust_dump_text = rust_dump(&twins.rust_home);
-    rust_dump_text.push_str(&rust_dump(&backup));
-    let shell_aftermath = shell_dump
-        .lines()
-        .skip_while(|line| !line.starts_with("code="))
-        .skip(1)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(
-        sorted_lines(&normalize(&rust_dump_text, &twins.rust_text)),
-        sorted_lines(&normalize(&shell_aftermath, &twins.shell_text)),
-        "restore aftermath for {tag}"
-    );
-    assert_eq!(
-        normalize(&String::from_utf8_lossy(&rust_err), &twins.rust_text),
-        normalize(&String::from_utf8_lossy(&shell_err), &twins.shell_text),
-        "restore stderr for {tag}"
-    );
-}
-
-#[test]
-fn restore_backups_rows_agree() {
-    check_restore_row("roundtrip", |_| {}, 0);
-    check_restore_row(
-        "parked-changed",
-        |home| {
-            place(&home.join("backup/sub/file.txt"), b"tampered\n", 0o644);
-        },
-        1,
-    );
-    check_restore_row(
-        "home-occupied",
-        |home| {
-            place(&home.join("sub/file.txt"), b"squatter\n", 0o644);
-        },
-        1,
-    );
-}
-
-#[test]
-fn restore_backups_edge_rows_agree() {
-    let twins = Twins::build("restore-edge");
-    for home in [&twins.shell_home, &twins.rust_home] {
-        std::fs::create_dir_all(home.join("backup")).expect("backup dir");
-        std::fs::write(
-            home.join("backup/manifest"),
-            b"../evil\tdirectory\t1\t2\t700\t4096\t-\n",
-        )
-        .expect("evil manifest");
-    }
-    let snippet = format!(
-        "_dot_init_restore_backups {}; code=$?; printf 'code=%s\\n' \"$code\";",
-        sq(&format!("{}/backup", twins.shell_text)),
-    );
-    let (code, _, _) = shell_run(&twins.shell_home, &[], &snippet);
-    assert_eq!(code, 1, "shell rejects the unsafe path");
-    let backup = twins.rust_home.join("backup");
-    let home = twins.rust_home.clone();
-    let matches =
-        |path: &Path, kind: &str, dev: &str, ino: &str, mode: &str, size: &str, value: &str| {
-            shell_matches(&home, path, &[kind, dev, ino, mode, size, value])
-        };
-    let mut cache = MoveCache::default();
-    let mut edge_err = Vec::new();
+    // Deterministic refusal rows with a pinned terminal path: a
+    // missing node fails the open, and a regular file fails the
+    // read (the prompt write lands in the file, so the answer never
+    // matches). The shell hardcodes /dev/tty, so these pin the port
+    // alone — the three branches above carry the live comparison.
     assert!(
-        plan::restore_backups(
-            &backup,
+        plan::confirm(&manifest, false, &dir.path().join("no-such-tty")).is_err(),
+        "missing terminal refuses"
+    );
+    let regular = dir.path().join("regular-tty");
+    std::fs::write(&regular, b"yes\n").expect("regular tty");
+    assert!(
+        plan::confirm(&manifest, false, &regular).is_err(),
+        "regular file refuses"
+    );
+}
+
+/// One plan case: twin candidate checkouts (identical content, so
+/// previews compare) plus twin tree journals.
+struct PlanCase {
+    _dir: TempDir,
+    shell_candidate: PathBuf,
+    rust_candidate: PathBuf,
+    shell_tree: PathBuf,
+    rust_tree: PathBuf,
+}
+
+/// Build a candidate checkout holding `config` as
+/// `.config/dot/config` (or no config blob when `None`), plus twin
+/// tree journals with `tree_text`.
+fn plan_case(tag: &str, config: Option<&str>, tree_text: &str) -> PlanCase {
+    let dir = TempDir::new(tag).expect("temp dir");
+    let root = dir.path().to_path_buf();
+    let shell_candidate = root.join("sh-cand");
+    let rust_candidate = root.join("rs-cand");
+    for candidate in [&shell_candidate, &rust_candidate] {
+        git(&[
+            "init",
+            "--quiet",
+            "--initial-branch",
+            "main",
+            candidate.to_str().expect("candidate path"),
+        ]);
+        if let Some(body) = config {
+            write(candidate, ".config/dot/config", body.as_bytes());
+        } else {
+            write(candidate, "other.txt", b"unrelated\n");
+        }
+        let text = candidate.to_str().expect("candidate path").to_string();
+        git(&["-C", &text, "add", "-A"]);
+        git(&["-C", &text, "commit", "--quiet", "-m", "candidate"]);
+    }
+    let shell_tree = root.join("sh-tree");
+    let rust_tree = root.join("rs-tree");
+    std::fs::write(&shell_tree, tree_text).expect("shell tree");
+    std::fs::write(&rust_tree, tree_text).expect("rust tree");
+    PlanCase {
+        _dir: dir,
+        shell_candidate,
+        rust_candidate,
+        shell_tree,
+        rust_tree,
+    }
+}
+
+/// Preview bytes on one side, `None` when the summary wrote none.
+fn preview_of(candidate: &Path) -> Option<Vec<u8>> {
+    let preview = candidate.join("dot-config.preview");
+    std::fs::read(&preview).ok()
+}
+
+/// Run the shell summary over one candidate; returns the verdict
+/// plus the raw stderr report. Probes run under `set -o pipefail`,
+/// the engine flags from `lib/dot/main.sh`: without it the shell's
+/// `count=$(wc -l | tr ...)` masks a failed `wc` and reports an
+/// empty count where the engine (and the port) refuse. Every other
+/// pipeline in this family succeeds-or-fails identically either way,
+/// so the flag only affects the missing-tree row by design.
+fn shell_summary(
+    home: &Path,
+    candidate: &Path,
+    tree: &Path,
+    backup: &str,
+    identity: &str,
+    skip: bool,
+) -> (i32, Vec<u8>) {
+    let body = format!(
+        "set -o pipefail\nif _dot_init_plan_summary {} {} {} {} {} >/dev/null; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
+        sq(candidate.to_str().expect("candidate path")),
+        sq("main"),
+        sq(tree.to_str().expect("tree path")),
+        sq(backup),
+        sq(identity),
+    );
+    let env = [("DOT_INIT_SKIP_PROVIDER", if skip { "1" } else { "0" })];
+    let (code, _, err) = shell_run(home, &env, &body);
+    (code, err)
+}
+
+#[test]
+fn plan_summary_reports() {
+    let backup = "/home/u/.local/state/dot/init/backup";
+    let identity = "github.com/example/dot";
+    // No config blob: compiled-in defaults, no preview.
+    let case = plan_case("plan-defaults", None, "a\tb\nc\td\ne\tf\n");
+    let (shell_code, shell_err) = shell_summary(
+        case._dir.path(),
+        &case.shell_candidate,
+        &case.shell_tree,
+        backup,
+        identity,
+        false,
+    );
+    assert_eq!(shell_code, 0, "shell defaults");
+    let rust = plan::plan_summary(&plan::PlanInputs {
+        candidate: &case.rust_candidate,
+        branch: "main",
+        tree: &case.rust_tree,
+        backup,
+        identity,
+        home: case._dir.path(),
+        source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
+        skip_provider: false,
+    })
+    .expect("rust defaults");
+    assert_eq!(rust, shell_err, "defaults report");
+    assert!(String::from_utf8_lossy(&rust).contains("tracked paths: 3\n"));
+    assert_eq!(preview_of(&case.shell_candidate), None);
+    assert_eq!(preview_of(&case.rust_candidate), None);
+
+    // Minimal config: provider none, policy pinned, no extensions.
+    let case = plan_case("plan-minimal", Some("version=1\n"), "only\n");
+    let (shell_code, shell_err) = shell_summary(
+        case._dir.path(),
+        &case.shell_candidate,
+        &case.shell_tree,
+        backup,
+        identity,
+        false,
+    );
+    assert_eq!(shell_code, 0, "shell minimal");
+    let rust = plan::plan_summary(&plan::PlanInputs {
+        candidate: &case.rust_candidate,
+        branch: "main",
+        tree: &case.rust_tree,
+        backup,
+        identity,
+        home: case._dir.path(),
+        source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
+        skip_provider: false,
+    })
+    .expect("rust minimal");
+    assert_eq!(rust, shell_err, "minimal report");
+    let text = String::from_utf8_lossy(&rust);
+    assert!(text.contains("tracked paths: 1\n"));
+    assert!(text.contains("dependency provider: none\n"));
+    assert!(text.contains("shdeps update policy: pinned\n"));
+    assert!(text.contains("extensions: disabled\n"));
+    assert_eq!(
+        preview_of(&case.shell_candidate),
+        preview_of(&case.rust_candidate),
+        "preview bytes"
+    );
+    assert_eq!(
+        preview_of(&case.rust_candidate),
+        Some(b"version=1\n".to_vec()),
+        "preview content"
+    );
+
+    // Full config: non-default triple, counted tree.
+    let config =
+        "version=1\nextension_api=1\ndependency_provider=shdeps\nshdeps_update_policy=latest\n";
+    let case = plan_case("plan-full", Some(config), "a\nb\nc\nd\n");
+    let (shell_code, shell_err) = shell_summary(
+        case._dir.path(),
+        &case.shell_candidate,
+        &case.shell_tree,
+        backup,
+        identity,
+        false,
+    );
+    assert_eq!(shell_code, 0, "shell full");
+    let rust = plan::plan_summary(&plan::PlanInputs {
+        candidate: &case.rust_candidate,
+        branch: "main",
+        tree: &case.rust_tree,
+        backup,
+        identity,
+        home: case._dir.path(),
+        source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
+        skip_provider: false,
+    })
+    .expect("rust full");
+    assert_eq!(rust, shell_err, "full report");
+    let text = String::from_utf8_lossy(&rust);
+    assert!(text.contains("tracked paths: 4\n"));
+    assert!(text.contains("dependency provider: shdeps\n"));
+    assert!(text.contains("shdeps update policy: latest\n"));
+    assert!(text.contains("extensions: enabled\n"));
+
+    // Unterminated tree: `wc -l` counts newline bytes only.
+    let case = plan_case("plan-unterminated", None, "a\nb");
+    let (shell_code, shell_err) = shell_summary(
+        case._dir.path(),
+        &case.shell_candidate,
+        &case.shell_tree,
+        backup,
+        identity,
+        false,
+    );
+    assert_eq!(shell_code, 0, "shell unterminated");
+    let rust = plan::plan_summary(&plan::PlanInputs {
+        candidate: &case.rust_candidate,
+        branch: "main",
+        tree: &case.rust_tree,
+        backup,
+        identity,
+        home: case._dir.path(),
+        source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
+        skip_provider: false,
+    })
+    .expect("rust unterminated");
+    assert_eq!(rust, shell_err, "unterminated report");
+    assert!(
+        String::from_utf8_lossy(&rust).contains("tracked paths: 1\n"),
+        "newline count, not line count"
+    );
+}
+
+#[test]
+fn plan_summary_flags_and_failures() {
+    let backup = "/home/u/.local/state/dot/init/backup";
+    let identity = "github.com/example/dot";
+    let config =
+        "version=1\nextension_api=1\ndependency_provider=shdeps\nshdeps_update_policy=latest\n";
+
+    // Skip flag annotates a real provider.
+    let case = plan_case("plan-skip", Some(config), "a\n");
+    let (shell_code, shell_err) = shell_summary(
+        case._dir.path(),
+        &case.shell_candidate,
+        &case.shell_tree,
+        backup,
+        identity,
+        true,
+    );
+    assert_eq!(shell_code, 0, "shell skip");
+    let rust = plan::plan_summary(&plan::PlanInputs {
+        candidate: &case.rust_candidate,
+        branch: "main",
+        tree: &case.rust_tree,
+        backup,
+        identity,
+        home: case._dir.path(),
+        source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
+        skip_provider: true,
+    })
+    .expect("rust skip");
+    assert_eq!(rust, shell_err, "skip report");
+    assert!(
+        String::from_utf8_lossy(&rust)
+            .contains("dependency provider: shdeps (skipped for this invocation)\n")
+    );
+
+    // Skip flag leaves `none` alone.
+    let case = plan_case("plan-skip-none", Some("version=1\n"), "a\n");
+    let (shell_code, shell_err) = shell_summary(
+        case._dir.path(),
+        &case.shell_candidate,
+        &case.shell_tree,
+        backup,
+        identity,
+        true,
+    );
+    assert_eq!(shell_code, 0, "shell skip none");
+    let rust = plan::plan_summary(&plan::PlanInputs {
+        candidate: &case.rust_candidate,
+        branch: "main",
+        tree: &case.rust_tree,
+        backup,
+        identity,
+        home: case._dir.path(),
+        source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
+        skip_provider: true,
+    })
+    .expect("rust skip none");
+    assert_eq!(rust, shell_err, "skip none report");
+    assert!(
+        String::from_utf8_lossy(&rust).contains("dependency provider: none\n"),
+        "no annotation on none"
+    );
+
+    // Unreadable tree refuses on both engines.
+    let case = plan_case("plan-no-tree", None, "a\n");
+    std::fs::remove_file(&case.shell_tree).expect("remove shell tree");
+    std::fs::remove_file(&case.rust_tree).expect("remove rust tree");
+    let (shell_code, _) = shell_summary(
+        case._dir.path(),
+        &case.shell_candidate,
+        &case.shell_tree,
+        backup,
+        identity,
+        false,
+    );
+    assert_eq!(shell_code, 1, "shell refuses missing tree");
+    assert!(
+        plan::plan_summary(&plan::PlanInputs {
+            candidate: &case.rust_candidate,
+            branch: "main",
+            tree: &case.rust_tree,
+            backup,
+            identity,
+            home: case._dir.path(),
+            source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
+            skip_provider: false,
+        })
+        .is_err(),
+        "rust refuses missing tree"
+    );
+
+    // Garbage config: the child fails, both refuse, and the preview
+    // the `show` wrote stays behind with the blob bytes.
+    let case = plan_case("plan-garbage", Some("bogus\n"), "a\n");
+    let (shell_code, _) = shell_summary(
+        case._dir.path(),
+        &case.shell_candidate,
+        &case.shell_tree,
+        backup,
+        identity,
+        false,
+    );
+    assert_eq!(shell_code, 1, "shell refuses garbage config");
+    assert!(
+        plan::plan_summary(&plan::PlanInputs {
+            candidate: &case.rust_candidate,
+            branch: "main",
+            tree: &case.rust_tree,
+            backup,
+            identity,
+            home: case._dir.path(),
+            source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
+            skip_provider: false,
+        })
+        .is_err(),
+        "rust refuses garbage config"
+    );
+    assert_eq!(
+        preview_of(&case.shell_candidate),
+        preview_of(&case.rust_candidate),
+        "leftover preview"
+    );
+    assert_eq!(
+        preview_of(&case.rust_candidate),
+        Some(b"bogus\n".to_vec()),
+        "preview holds the blob"
+    );
+}
+
+/// Seed one conflict tree under `home`: two regular files (one
+/// nested), a directory with content, and a symlink.
+fn seed_conflict_tree(home: &Path) {
+    write(home, "file1", b"hello\n");
+    write(home, "sub/file2", b"nested\n");
+    write(home, "dir1/inner", b"inner\n");
+    std::os::unix::fs::symlink("file1", home.join("link1")).expect("fixture link");
+}
+
+/// Manifest text snapshotting `rels` under `home` the shell way,
+/// plus any `extra` rows appended verbatim.
+fn manifest_for(home: &Path, rels: &[&str], extra: &[&str]) -> String {
+    let mut text = String::new();
+    for rel in rels {
+        text.push_str(&snapshot_row(home, rel));
+        text.push('\n');
+    }
+    for row in extra {
+        text.push_str(row);
+        text.push('\n');
+    }
+    text
+}
+
+/// Run the shell move over one side; returns the verdict.
+fn shell_move(home: &Path, manifest: &Path, backup: &Path, prelude: &str) -> i32 {
+    let body = format!(
+        "{prelude}if _dot_init_move_conflicts {} {}; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
+        sq(manifest.to_str().expect("manifest path")),
+        sq(backup.to_str().expect("backup path")),
+    );
+    shell_run(home, &[], &body).0
+}
+
+/// Stored-manifest bytes on one side, `None` when absent.
+fn stored_manifest(backup: &Path) -> Option<Vec<u8>> {
+    std::fs::read(backup.join("manifest")).ok()
+}
+
+#[test]
+fn move_conflicts_parks_live_tree() {
+    let twins = Twins::build("plan-move-live");
+    let rels = ["file1", "sub/file2", "dir1", "link1"];
+    let extra = ["ghost.txt\tabsent\t-\t-\t-\t-\t-"];
+    for home in [&twins.shell_home, &twins.rust_home] {
+        seed_conflict_tree(home);
+    }
+    // Per-side manifests: device and inode bytes differ by home.
+    let shell_manifest = twins.root().join("sh-manifest");
+    let rust_manifest = twins.root().join("rs-manifest");
+    std::fs::write(
+        &shell_manifest,
+        manifest_for(&twins.shell_home, &rels, &extra),
+    )
+    .expect("shell manifest");
+    std::fs::write(
+        &rust_manifest,
+        manifest_for(&twins.rust_home, &rels, &extra),
+    )
+    .expect("rust manifest");
+    let shell_backup = twins.shell_home.join("backup");
+    let rust_backup = twins.rust_home.join("backup");
+    // Original bytes for the end-state comparison.
+    let mut originals = Vec::new();
+    for rel in rels {
+        originals.push((rel, shape(&twins.shell_home.join(rel))));
+    }
+
+    let shell_code = shell_move(&twins.shell_home, &shell_manifest, &shell_backup, "");
+    assert_eq!(shell_code, 0, "shell parks");
+    let mut cache = MoveCache::default();
+    plan::move_conflicts(
+        &rust_manifest,
+        &rust_backup,
+        &twins.rust_home,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        &live_matches(twins.rust_home.clone()),
+        &live_private_dir(twins.rust_home.clone()),
+        &mut cache,
+    )
+    .expect("rust parks");
+
+    // Stored manifests echo the input at mode 600 on both sides.
+    for (manifest, backup) in [
+        (&shell_manifest, &shell_backup),
+        (&rust_manifest, &rust_backup),
+    ] {
+        assert_eq!(
+            stored_manifest(backup),
+            Some(std::fs::read(manifest).expect("input manifest")),
+            "stored manifest"
+        );
+        assert_eq!(mode_of(&backup.join("manifest")), 0o600, "manifest mode");
+    }
+    // Every live path moved with its bytes; the absent row no-ops.
+    for (rel, (_, bytes)) in &originals {
+        assert_eq!(shape(&twins.shell_home.join(rel)), (false, Vec::new()));
+        assert_eq!(shape(&twins.rust_home.join(rel)), (false, Vec::new()));
+        assert_eq!(shape(&shell_backup.join(rel)), (true, bytes.clone()));
+        assert_eq!(shape(&rust_backup.join(rel)), (true, bytes.clone()));
+    }
+    for backup in [&shell_backup, &rust_backup] {
+        assert_eq!(
+            shape(&backup.join("dir1/inner")),
+            (true, b"inner\n".to_vec()),
+            "directory content follows"
+        );
+        assert_eq!(
+            shape(&backup.join("link1")),
+            (true, b"file1".to_vec()),
+            "link target text follows"
+        );
+    }
+
+    // A second run reuses the stored manifest and skips parked rows.
+    let shell_code = shell_move(&twins.shell_home, &shell_manifest, &shell_backup, "");
+    assert_eq!(shell_code, 0, "shell reuses");
+    let mut cache = MoveCache::default();
+    plan::move_conflicts(
+        &rust_manifest,
+        &rust_backup,
+        &twins.rust_home,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        &live_matches(twins.rust_home.clone()),
+        &live_private_dir(twins.rust_home.clone()),
+        &mut cache,
+    )
+    .expect("rust reuses");
+}
+
+#[test]
+fn move_conflicts_refuses() {
+    // Changed input after a stored manifest: the equality gate fires.
+    let twins = Twins::build("plan-move-changed");
+    for home in [&twins.shell_home, &twins.rust_home] {
+        seed_conflict_tree(home);
+    }
+    let shell_manifest = twins.root().join("sh-manifest");
+    let rust_manifest = twins.root().join("rs-manifest");
+    std::fs::write(
+        &shell_manifest,
+        manifest_for(&twins.shell_home, &["file1"], &[]),
+    )
+    .expect("manifest");
+    std::fs::write(
+        &rust_manifest,
+        manifest_for(&twins.rust_home, &["file1"], &[]),
+    )
+    .expect("manifest");
+    let shell_backup = twins.shell_home.join("backup");
+    let rust_backup = twins.rust_home.join("backup");
+    assert_eq!(
+        shell_move(&twins.shell_home, &shell_manifest, &shell_backup, ""),
+        0,
+        "shell first parks"
+    );
+    let mut cache = MoveCache::default();
+    plan::move_conflicts(
+        &rust_manifest,
+        &rust_backup,
+        &twins.rust_home,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        &live_matches(twins.rust_home.clone()),
+        &live_private_dir(twins.rust_home.clone()),
+        &mut cache,
+    )
+    .expect("rust first parks");
+    // Rewrite the inputs with an extra row: stored copies disagree.
+    std::fs::write(
+        &shell_manifest,
+        manifest_for(&twins.shell_home, &["sub/file2"], &[]),
+    )
+    .expect("rewrite");
+    std::fs::write(
+        &rust_manifest,
+        manifest_for(&twins.rust_home, &["sub/file2"], &[]),
+    )
+    .expect("rewrite");
+    assert_eq!(
+        shell_move(&twins.shell_home, &shell_manifest, &shell_backup, ""),
+        1,
+        "shell refuses changed manifest"
+    );
+    let mut cache = MoveCache::default();
+    assert!(
+        plan::move_conflicts(
+            &rust_manifest,
+            &rust_backup,
             &twins.rust_home,
-            &matches,
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &live_matches(twins.rust_home.clone()),
+            &live_private_dir(twins.rust_home.clone()),
             &mut cache,
-            &mut edge_err
         )
         .is_err(),
-        "rust rejects the unsafe path"
+        "rust refuses changed manifest"
     );
-    assert!(edge_err.is_empty(), "unsafe-path rejections stay silent");
+    // Nothing new parked on either side.
+    assert!(!exists_side(&shell_backup.join("sub/file2")));
+    assert!(!exists_side(&rust_backup.join("sub/file2")));
 
-    let absent = Twins::build("restore-absent");
-    let absent_snippet = format!(
-        "_dot_init_restore_backups {}; code=$?; printf 'code=%s\\n' \"$code\"; [[ -e {} ]] && dump_tree {};",
-        sq(&format!("{}/backup", absent.shell_text)),
-        sq(&format!("{}/backup", absent.shell_text)),
-        sq(&format!("{}/backup", absent.shell_text)),
+    // Changed home content: the home-state gate fires.
+    let twins = Twins::build("plan-move-mismatch");
+    for home in [&twins.shell_home, &twins.rust_home] {
+        seed_conflict_tree(home);
+    }
+    let shell_manifest = twins.root().join("sh-manifest");
+    let rust_manifest = twins.root().join("rs-manifest");
+    std::fs::write(
+        &shell_manifest,
+        manifest_for(&twins.shell_home, &["file1"], &[]),
+    )
+    .expect("manifest");
+    std::fs::write(
+        &rust_manifest,
+        manifest_for(&twins.rust_home, &["file1"], &[]),
+    )
+    .expect("manifest");
+    let shell_backup = twins.shell_home.join("backup");
+    let rust_backup = twins.rust_home.join("backup");
+    write(&twins.shell_home, "file1", b"tampered\n");
+    write(&twins.rust_home, "file1", b"tampered\n");
+    assert_eq!(
+        shell_move(&twins.shell_home, &shell_manifest, &shell_backup, ""),
+        1,
+        "shell refuses mismatch"
     );
-    let (absent_code, absent_out, _) = shell_run(&absent.shell_home, &[], &absent_snippet);
-    assert_eq!(absent_code, 0, "shell restores nothing without a backup");
-    let absent_dump = String::from_utf8(absent_out).expect("absent dump");
-    let absent_aftermath = absent_dump
-        .lines()
-        .skip_while(|line| !line.starts_with("code="))
-        .skip(1)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let missing = absent.rust_home.join("backup");
-    let missing_home = absent.rust_home.clone();
-    let missing_matches =
-        |path: &Path, kind: &str, dev: &str, ino: &str, mode: &str, size: &str, value: &str| {
-            shell_matches(&missing_home, path, &[kind, dev, ino, mode, size, value])
-        };
-    let mut missing_cache = MoveCache::default();
-    let mut missing_err = Vec::new();
+    let mut cache = MoveCache::default();
+    assert!(
+        plan::move_conflicts(
+            &rust_manifest,
+            &rust_backup,
+            &twins.rust_home,
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &live_matches(twins.rust_home.clone()),
+            &live_private_dir(twins.rust_home.clone()),
+            &mut cache,
+        )
+        .is_err(),
+        "rust refuses mismatch"
+    );
+    assert!(!exists_side(&shell_backup.join("file1")));
+    assert!(!exists_side(&rust_backup.join("file1")));
+
+    // Occupied destination with live home: parked elsewhere first.
+    let twins = Twins::build("plan-move-occupied");
+    for home in [&twins.shell_home, &twins.rust_home] {
+        seed_conflict_tree(home);
+    }
+    let shell_manifest = twins.root().join("sh-manifest");
+    let rust_manifest = twins.root().join("rs-manifest");
+    std::fs::write(
+        &shell_manifest,
+        manifest_for(&twins.shell_home, &["file1"], &[]),
+    )
+    .expect("manifest");
+    std::fs::write(
+        &rust_manifest,
+        manifest_for(&twins.rust_home, &["file1"], &[]),
+    )
+    .expect("manifest");
+    let shell_backup = twins.shell_home.join("backup");
+    let rust_backup = twins.rust_home.join("backup");
+    write(&shell_backup, "file1", b"squatter\n");
+    write(&rust_backup, "file1", b"squatter\n");
+    assert_eq!(
+        shell_move(&twins.shell_home, &shell_manifest, &shell_backup, ""),
+        1,
+        "shell refuses occupied destination"
+    );
+    let mut cache = MoveCache::default();
+    assert!(
+        plan::move_conflicts(
+            &rust_manifest,
+            &rust_backup,
+            &twins.rust_home,
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &live_matches(twins.rust_home.clone()),
+            &live_private_dir(twins.rust_home.clone()),
+            &mut cache,
+        )
+        .is_err(),
+        "rust refuses occupied destination"
+    );
+    // The manifest still stages first, on both engines.
+    assert_eq!(
+        stored_manifest(&shell_backup),
+        Some(std::fs::read(&shell_manifest).expect("input")),
+        "shell stages manifest before refusing"
+    );
+    assert_eq!(
+        stored_manifest(&rust_backup),
+        Some(std::fs::read(&rust_manifest).expect("input")),
+        "rust stages manifest before refusing"
+    );
+
+    // Unprovisionable backup root refuses before touching anything.
+    let twins = Twins::build("plan-move-noprivate");
+    for home in [&twins.shell_home, &twins.rust_home] {
+        seed_conflict_tree(home);
+    }
+    let shell_manifest = twins.root().join("sh-manifest");
+    let rust_manifest = twins.root().join("rs-manifest");
+    std::fs::write(
+        &shell_manifest,
+        manifest_for(&twins.shell_home, &["file1"], &[]),
+    )
+    .expect("manifest");
+    std::fs::write(
+        &rust_manifest,
+        manifest_for(&twins.rust_home, &["file1"], &[]),
+    )
+    .expect("manifest");
+    let shell_backup = twins.shell_home.join("backup");
+    let rust_backup = twins.rust_home.join("backup");
+    assert_eq!(
+        shell_move(
+            &twins.shell_home,
+            &shell_manifest,
+            &shell_backup,
+            "_dot_init_private_directory() { return 1; }\n",
+        ),
+        1,
+        "shell refuses unprovisionable root"
+    );
+    let mut cache = MoveCache::default();
+    assert!(
+        plan::move_conflicts(
+            &rust_manifest,
+            &rust_backup,
+            &twins.rust_home,
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &live_matches(twins.rust_home.clone()),
+            &failing_private_dir(),
+            &mut cache,
+        )
+        .is_err(),
+        "rust refuses unprovisionable root"
+    );
+    assert!(!exists_side(&shell_backup));
+    assert!(!exists_side(&rust_backup));
+}
+
+/// Lexical existence for assertions.
+fn exists_side(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// One recorded move row: manifest text, stub answers (`1` accept,
+/// `0` refuse, consumed left to right), expected verdict, and the
+/// expected normalized matcher calls.
+struct RecordRow {
+    name: &'static str,
+    manifest: &'static str,
+    answers: &'static str,
+    ok: bool,
+    calls: &'static [&'static str],
+}
+
+#[test]
+fn move_conflicts_record_rows() {
+    let rows = [
+        RecordRow {
+            name: "plain-accept",
+            manifest: "p\tk\td\ti\tm\ts\tv\n",
+            answers: "1",
+            ok: true,
+            calls: &["HOME/backup/p|k|d|i|m|s|v"],
+        },
+        RecordRow {
+            name: "plain-refuse",
+            manifest: "p\tk\td\ti\tm\ts\tv\n",
+            answers: "00",
+            ok: false,
+            calls: &["HOME/backup/p|k|d|i|m|s|v", "HOME/p|k|d|i|m|s|v"],
+        },
+        RecordRow {
+            name: "leading-tab-strips",
+            manifest: "\tp\tk\td\ti\tm\ts\tv\n",
+            answers: "1",
+            ok: true,
+            calls: &["HOME/backup/p|k|d|i|m|s|v"],
+        },
+        RecordRow {
+            name: "doubled-tab-collapses",
+            manifest: "p\t\tk\td\ti\tm\ts\tv\n",
+            answers: "1",
+            ok: true,
+            calls: &["HOME/backup/p|k|d|i|m|s|v"],
+        },
+        RecordRow {
+            name: "extra-fields-fold-right",
+            manifest: "a\tb\tc\td\te\tf\tg\te1\n",
+            answers: "1",
+            ok: true,
+            calls: &["HOME/backup/a|b|c|d|e|f|g\te1"],
+        },
+        RecordRow {
+            name: "blank-line-skips",
+            manifest: "\nq\tk2\td\ti\tm\ts\tv\n",
+            answers: "1",
+            ok: true,
+            calls: &["HOME/backup/q|k2|d|i|m|s|v"],
+        },
+        RecordRow {
+            name: "empty-fields-skip",
+            manifest: "\t\n",
+            answers: "",
+            ok: true,
+            calls: &[],
+        },
+        RecordRow {
+            name: "unterminated-tail-skips",
+            manifest: "p\tk\td\ti\tm\ts\tv",
+            answers: "",
+            ok: true,
+            calls: &[],
+        },
+        RecordRow {
+            name: "nul-bytes-strip",
+            manifest: "n\0p\tk\td\ti\tm\ts\tv\n",
+            answers: "1",
+            ok: true,
+            calls: &["HOME/backup/np|k|d|i|m|s|v"],
+        },
+    ];
+    for row in rows {
+        let twins = Twins::build("plan-move-record");
+        let manifest = twins.root().join("manifest");
+        std::fs::write(&manifest, row.manifest).expect("manifest");
+        let shell_backup = twins.shell_home.join("backup");
+        let rust_backup = twins.rust_home.join("backup");
+        let shell_body = format!(
+            "{RECORD_STUB}STUB_ANSWERS={}\nif _dot_init_move_conflicts {} {}; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n",
+            row.answers,
+            sq(manifest.to_str().expect("manifest path")),
+            sq(shell_backup.to_str().expect("backup path")),
+        );
+        let (shell_code, shell_out, _) = shell_run(&twins.shell_home, &[], &shell_body);
+        let shell_calls: Vec<String> = String::from_utf8_lossy(&shell_out)
+            .lines()
+            .filter_map(|line| line.strip_prefix("call="))
+            .map(|call| normalize_call(call, &twins.shell_home))
+            .collect();
+        let recorder = Recorder::new(row.answers.chars().map(|answer| answer == '1').collect());
+        let mut cache = MoveCache::default();
+        let rust = plan::move_conflicts(
+            &manifest,
+            &rust_backup,
+            &twins.rust_home,
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &recorder.matcher(),
+            &live_private_dir(twins.rust_home.clone()),
+            &mut cache,
+        );
+        let expected: Vec<String> = row.calls.iter().map(|call| call.to_string()).collect();
+        let rust_calls: Vec<String> = recorder
+            .take()
+            .iter()
+            .map(|call| normalize_call(call, &twins.rust_home))
+            .collect();
+        assert_eq!(shell_code == 0, rust.is_ok(), "{} verdict", row.name);
+        assert_eq!(shell_code == 0, row.ok, "{} shell oracle", row.name);
+        assert_eq!(rust_calls, expected, "{} rust calls", row.name);
+        assert_eq!(shell_calls, expected, "{} shell calls", row.name);
+    }
+}
+
+/// Run the shell restore over one side; returns the verdict.
+fn shell_restore(home: &Path, backup: &Path, prelude: &str) -> i32 {
+    let body = format!(
+        "{prelude}if _dot_init_restore_backups {}; then code=0; else code=$?; fi\nprintf 'code=%s\n' \"$code\"\n",
+        sq(backup.to_str().expect("backup path")),
+    );
+    shell_run(home, &[], &body).0
+}
+
+/// Seed one stash tree under `backup`: the mirror of
+/// [`seed_conflict_tree`], snapshotted for restore manifests.
+fn seed_stash(backup: &Path) {
+    write(backup, "file1", b"hello\n");
+    write(backup, "sub/file2", b"nested\n");
+    write(backup, "dir1/inner", b"inner\n");
+    std::os::unix::fs::symlink("file1", backup.join("link1")).expect("stash link");
+}
+
+#[test]
+fn restore_backups_restores_live_stash() {
+    let twins = Twins::build("plan-restore-live");
+    let rels = ["file1", "sub/file2", "dir1", "link1"];
+    let shell_backup = twins.shell_home.join("backup");
+    let rust_backup = twins.rust_home.join("backup");
+    seed_stash(&shell_backup);
+    seed_stash(&rust_backup);
+    // Manifests snapshot the stash sides, then land as the stored
+    // manifest the gate requires.
+    for backup in [&shell_backup, &rust_backup] {
+        let mut text = String::new();
+        for rel in rels {
+            text.push_str(&snapshot_row(backup, rel));
+            text.push('\n');
+        }
+        std::fs::write(backup.join("manifest"), &text).expect("stored manifest");
+    }
+    let mut originals = Vec::new();
+    for rel in rels {
+        originals.push((rel, shape(&shell_backup.join(rel))));
+    }
+
+    assert_eq!(
+        shell_restore(&twins.shell_home, &shell_backup, ""),
+        0,
+        "shell restores"
+    );
+    let mut cache = MoveCache::default();
+    plan::restore_backups(
+        &rust_backup,
+        &twins.rust_home,
+        &live_matches(twins.rust_home.clone()),
+        &mut cache,
+    )
+    .expect("rust restores");
+
+    for (rel, (_, bytes)) in &originals {
+        assert_eq!(shape(&shell_backup.join(rel)), (false, Vec::new()));
+        assert_eq!(shape(&rust_backup.join(rel)), (false, Vec::new()));
+        assert_eq!(shape(&twins.shell_home.join(rel)), (true, bytes.clone()));
+        assert_eq!(shape(&twins.rust_home.join(rel)), (true, bytes.clone()));
+    }
+    for home in [&twins.shell_home, &twins.rust_home] {
+        assert_eq!(
+            shape(&home.join("dir1/inner")),
+            (true, b"inner\n".to_vec()),
+            "directory content follows"
+        );
+    }
+}
+
+#[test]
+fn restore_backups_gates_and_refusals() {
+    // Missing backup root is a successful no-op.
+    let dir = TempDir::new("plan-restore-missing").expect("temp dir");
+    let missing = dir.path().join("no-backup");
+    let body = format!(
+        "if _dot_init_restore_backups {}; then code=0; else code=$?; fi\nprintf 'code=%s\n' \"$code\"\n",
+        sq(missing.to_str().expect("backup path")),
+    );
+    assert_eq!(shell_run(dir.path(), &[], &body).0, 0, "shell no-op");
+    let mut cache = MoveCache::default();
+    plan::restore_backups(
+        &missing,
+        dir.path(),
+        &live_matches(dir.path().to_path_buf()),
+        &mut cache,
+    )
+    .expect("rust no-op");
+
+    // A backup directory without a manifest is a no-op too.
+    let dir = TempDir::new("plan-restore-nomanifest").expect("temp dir");
+    let backup = dir.path().join("backup");
+    std::fs::create_dir_all(&backup).expect("backup dir");
+    let body = format!(
+        "if _dot_init_restore_backups {}; then code=0; else code=$?; fi\nprintf 'code=%s\n' \"$code\"\n",
+        sq(backup.to_str().expect("backup path")),
+    );
+    assert_eq!(shell_run(dir.path(), &[], &body).0, 0, "shell no-op");
+    let mut cache = MoveCache::default();
+    plan::restore_backups(
+        &backup,
+        dir.path(),
+        &live_matches(dir.path().to_path_buf()),
+        &mut cache,
+    )
+    .expect("rust no-op");
+
+    // Absent stashes skip without calling the matcher.
+    let twins = Twins::build("plan-restore-absent");
+    let shell_backup = twins.shell_home.join("backup");
+    let rust_backup = twins.rust_home.join("backup");
+    for backup in [&shell_backup, &rust_backup] {
+        std::fs::create_dir_all(backup).expect("backup dir");
+        std::fs::write(
+            backup.join("manifest"),
+            b"ghost\tregular\t1\t2\t644\t3\tabc\n",
+        )
+        .expect("manifest");
+    }
+    assert_eq!(
+        shell_restore(&twins.shell_home, &shell_backup, ""),
+        0,
+        "shell skips absent stash"
+    );
+    let mut cache = MoveCache::default();
+    plan::restore_backups(
+        &rust_backup,
+        &twins.rust_home,
+        &live_matches(twins.rust_home.clone()),
+        &mut cache,
+    )
+    .expect("rust skips absent stash");
+
+    // Changed stash content refuses; the stash stays put.
+    let twins = Twins::build("plan-restore-mismatch");
+    let shell_backup = twins.shell_home.join("backup");
+    let rust_backup = twins.rust_home.join("backup");
+    seed_stash(&shell_backup);
+    seed_stash(&rust_backup);
+    for backup in [&shell_backup, &rust_backup] {
+        let row = snapshot_row(backup, "file1");
+        std::fs::write(backup.join("manifest"), format!("{row}\n")).expect("manifest");
+    }
+    write(&shell_backup, "file1", b"tampered\n");
+    write(&rust_backup, "file1", b"tampered\n");
+    assert_eq!(
+        shell_restore(&twins.shell_home, &shell_backup, ""),
+        1,
+        "shell refuses mismatch"
+    );
+    let mut cache = MoveCache::default();
     assert!(
         plan::restore_backups(
-            &missing,
-            &absent.rust_home,
-            &missing_matches,
-            &mut missing_cache,
-            &mut missing_err
+            &rust_backup,
+            &twins.rust_home,
+            &live_matches(twins.rust_home.clone()),
+            &mut cache,
         )
-        .is_ok(),
-        "rust restores nothing without a backup"
+        .is_err(),
+        "rust refuses mismatch"
     );
-    assert!(missing_err.is_empty(), "absent restores stay silent");
-    assert_eq!(
-        sorted_lines(&normalize(&rust_dump(&absent.rust_home), &absent.rust_text)),
-        sorted_lines(&normalize(&absent_aftermath, &absent.shell_text)),
-        "absent restore aftermath"
-    );
-}
+    assert!(exists_side(&shell_backup.join("file1")));
+    assert!(exists_side(&rust_backup.join("file1")));
 
-/// Cross-engine lifecycle: the Rust move parks shell-side conflicts
-/// for the shell restore, and vice versa on the twin side.
-#[test]
-fn move_restore_interop_agrees() {
-    let twins = Twins::build("interop");
-    for home in [&twins.shell_home, &twins.rust_home] {
-        seed_conflicts(home);
-        let manifest = conflict_manifest(home);
-        std::fs::write(home.join("conflicts.tsv"), &manifest).expect("manifest");
+    // An occupied home path refuses before moving.
+    let twins = Twins::build("plan-restore-occupied");
+    let shell_backup = twins.shell_home.join("backup");
+    let rust_backup = twins.rust_home.join("backup");
+    seed_stash(&shell_backup);
+    seed_stash(&rust_backup);
+    for (backup, home) in [
+        (&shell_backup, &twins.shell_home),
+        (&rust_backup, &twins.rust_home),
+    ] {
+        let row = snapshot_row(backup, "file1");
+        std::fs::write(backup.join("manifest"), format!("{row}\n")).expect("manifest");
+        write(home, "file1", b"squatter\n");
     }
-    let source_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let shell_side = twins.shell_home.clone();
-    let shell_matches_here =
-        |path: &Path, kind: &str, dev: &str, ino: &str, mode: &str, size: &str, value: &str| {
-            shell_matches(&shell_side, path, &[kind, dev, ino, mode, size, value])
-        };
-    let mut cache = MoveCache::default();
-    let mut interop_err = Vec::new();
-    plan::move_conflicts(
-        &twins.shell_home.join("conflicts.tsv"),
-        &twins.shell_home.join("backup"),
-        &twins.shell_home,
-        source_root,
-        &shell_matches_here,
-        &mut cache,
-        &mut interop_err,
-    )
-    .expect("rust moves shell-side conflicts");
-    assert!(interop_err.is_empty(), "interop moves stay silent");
-    let restore_snippet = format!(
-        "_dot_init_restore_backups {}; code=$?; printf 'code=%s\\n' \"$code\"; dump_tree {};",
-        sq(&format!("{}/backup", twins.shell_text)),
-        sq(&twins.shell_text),
-    );
-    let (shell_code, shell_out, _) = shell_run(&twins.shell_home, &[], &restore_snippet);
-    assert_eq!(shell_code, 0, "shell restores rust-parked conflicts");
-
-    let move_snippet = format!(
-        "_dot_init_move_conflicts {} {}; code=$?; printf 'code=%s\\n' \"$code\";",
-        sq(&format!("{}/conflicts.tsv", twins.rust_text)),
-        sq(&format!("{}/backup", twins.rust_text)),
-    );
-    let (move_code, _, _) = shell_run(&twins.rust_home, &[], &move_snippet);
-    assert_eq!(move_code, 0, "shell moves rust-side conflicts");
-    let rust_side = twins.rust_home.clone();
-    let rust_matches_here =
-        |path: &Path, kind: &str, dev: &str, ino: &str, mode: &str, size: &str, value: &str| {
-            shell_matches(&rust_side, path, &[kind, dev, ino, mode, size, value])
-        };
-    let mut rust_cache = MoveCache::default();
-    let mut restore_err = Vec::new();
-    plan::restore_backups(
-        &twins.rust_home.join("backup"),
-        &twins.rust_home,
-        &rust_matches_here,
-        &mut rust_cache,
-        &mut restore_err,
-    )
-    .expect("rust restores shell-parked conflicts");
-    assert!(restore_err.is_empty(), "interop restores stay silent");
-
-    let shell_aftermath = String::from_utf8(shell_out).expect("interop dump");
-    let shell_dump = shell_aftermath
-        .lines()
-        .skip_while(|line| !line.starts_with("code="))
-        .skip(1)
-        .collect::<Vec<_>>()
-        .join("\n");
     assert_eq!(
-        sorted_lines(&normalize(&rust_dump(&twins.rust_home), &twins.rust_text)),
-        sorted_lines(&normalize(&shell_dump, &twins.shell_text)),
-        "interop aftermath"
-    );
-}
-
-/// Pre-state of the completion marker for publish rows.
-#[derive(Clone, Copy)]
-enum CompletedSeed {
-    /// No marker yet: the exclusive publish path.
-    Absent,
-    /// A stale regular marker we own: the replace path.
-    Stale,
-    /// A symlink marker: both engines refuse and leave residue.
-    Symlink,
-    /// A directory marker: both engines refuse and leave residue.
-    Dir,
-}
-
-/// Run `_dot_init_publish_completed` on both engines and compare the
-/// verdict plus the state-root dump (marker bytes, modes, and any
-/// sibling residue, normalized). With `use_xdg` the marker lives
-/// under `$XDG_STATE_HOME`; otherwise the home fallback applies.
-fn check_publish_row(
-    tag: &str,
-    use_xdg: bool,
-    record: Option<&[u8]>,
-    seed: CompletedSeed,
-    want_rc: i32,
-) {
-    let twins = Twins::build(&format!("publish-{tag}"));
-    for home in [&twins.shell_home, &twins.rust_home] {
-        let record_path = home.join("record");
-        if let Some(bytes) = record {
-            place(&record_path, bytes, 0o644);
-        }
-        let root = if use_xdg {
-            home.join("xdg-state/dot/init")
-        } else {
-            home.join(".local/state/dot/init")
-        };
-        let completed = root.join("completed");
-        match seed {
-            CompletedSeed::Absent => {}
-            CompletedSeed::Stale => {
-                place(&completed, b"stale marker\n", 0o600);
-            }
-            CompletedSeed::Symlink => {
-                place(&home.join("target"), b"target\n", 0o644);
-                std::fs::create_dir_all(&root).expect("marker parent");
-                std::os::unix::fs::symlink(home.join("target"), &completed)
-                    .expect("marker symlink");
-            }
-            CompletedSeed::Dir => {
-                std::fs::create_dir_all(&completed).expect("marker dir");
-            }
-        }
-    }
-    let shell_root = if use_xdg {
-        format!("{}/xdg-state", twins.shell_text)
-    } else {
-        format!("{}/.local/state", twins.shell_text)
-    };
-    let snippet = format!(
-        "record={}; _dot_init_publish_completed \"$record\"; code=$?; printf 'code=%s\\n' \"$code\"; [[ -e {} ]] && dump_tree {};",
-        sq(&format!("{}/record", twins.shell_text)),
-        sq(&shell_root),
-        sq(&shell_root),
-    );
-    let xdg_text = twins
-        .shell_home
-        .join("xdg-state")
-        .to_string_lossy()
-        .into_owned();
-    let shell_env: Vec<(&str, &str)> = if use_xdg {
-        vec![("XDG_STATE_HOME", xdg_text.as_str())]
-    } else {
-        Vec::new()
-    };
-    let (code, out, shell_err) = shell_run(&twins.shell_home, &shell_env, &snippet);
-    assert_ne!(code, 99, "harness verdict for publish {tag}");
-    assert_eq!(code, want_rc, "shell publish rc for {tag}");
-    let shell_dump = String::from_utf8(out).expect("publish dump");
-
-    let rust_xdg = twins.rust_home.join("xdg-state");
-    let xdg_value = if use_xdg {
-        rust_xdg.to_string_lossy().into_owned()
-    } else {
-        String::new()
-    };
-    let mut cache = MoveCache::default();
-    let mut rust_err = Vec::new();
-    let outcome = plan::publish_completed(
-        &twins.rust_home.join("record"),
-        &twins.rust_text,
-        &xdg_value,
-        &mut cache,
-        &mut rust_err,
-    );
-    let rust_code = i32::from(outcome.is_err());
-    assert_eq!(rust_code, want_rc, "rust publish rc for {tag}");
-    let rust_root = if use_xdg {
-        twins.rust_home.join("xdg-state")
-    } else {
-        twins.rust_home.join(".local/state")
-    };
-    let rust_dump_text = rust_dump(&rust_root);
-    let shell_aftermath = shell_dump
-        .lines()
-        .skip_while(|line| !line.starts_with("code="))
-        .skip(1)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(
-        sorted_lines(&normalize(&rust_dump_text, &twins.rust_text)),
-        sorted_lines(&normalize(&shell_aftermath, &twins.shell_text)),
-        "publish aftermath for {tag}"
-    );
-    assert_eq!(
-        normalize(&String::from_utf8_lossy(&rust_err), &twins.rust_text),
-        normalize(&String::from_utf8_lossy(&shell_err), &twins.shell_text),
-        "publish stderr for {tag}"
-    );
-}
-
-#[test]
-fn publish_completed_rows_agree() {
-    const RECORD: &[u8] = b"cgraf78 dot initialization transaction v1\nphase=complete\n";
-    check_publish_row("fresh", false, Some(RECORD), CompletedSeed::Absent, 0);
-    check_publish_row("replace", false, Some(RECORD), CompletedSeed::Stale, 0);
-    check_publish_row("xdg-state", true, Some(RECORD), CompletedSeed::Absent, 0);
-    check_publish_row(
-        "symlink-marker",
-        false,
-        Some(RECORD),
-        CompletedSeed::Symlink,
+        shell_restore(&twins.shell_home, &shell_backup, ""),
         1,
+        "shell refuses occupied home"
     );
-    check_publish_row("missing-record", false, None, CompletedSeed::Absent, 1);
-    check_publish_row("dir-marker", false, Some(RECORD), CompletedSeed::Dir, 1);
+    let mut cache = MoveCache::default();
+    assert!(
+        plan::restore_backups(
+            &rust_backup,
+            &twins.rust_home,
+            &live_matches(twins.rust_home.clone()),
+            &mut cache,
+        )
+        .is_err(),
+        "rust refuses occupied home"
+    );
+}
+
+#[test]
+fn restore_backups_sorts_descending_and_stops() {
+    // Rows process newest-first; the unsafe row sorts last, so the
+    // first row still moves before the run refuses. The call log
+    // pins the order on both engines.
+    let twins = Twins::build("plan-restore-order");
+    let shell_backup = twins.shell_home.join("backup");
+    let rust_backup = twins.rust_home.join("backup");
+    for backup in [&shell_backup, &rust_backup] {
+        std::fs::create_dir_all(backup.join("b")).expect("stash parent");
+        write(backup, "b/keep", b"kept\n");
+        let row = snapshot_row(backup, "b/keep");
+        let manifest =
+            format!("{row}\na/gone\tregular\t1\t2\t644\t1\tx\n../evil\tregular\t1\t2\t644\t1\tx");
+        std::fs::write(backup.join("manifest"), manifest).expect("manifest");
+    }
+    let shell_body = format!(
+        "{RECORD_STUB}STUB_ANSWERS=1\nif _dot_init_restore_backups {}; then code=0; else code=$?; fi\nprintf 'code=%s\n' \"$code\"\n",
+        sq(shell_backup.to_str().expect("backup path")),
+    );
+    let (shell_code, shell_out, _) = shell_run(&twins.shell_home, &[], &shell_body);
+    let shell_calls: Vec<String> = String::from_utf8_lossy(&shell_out)
+        .lines()
+        .filter_map(|line| line.strip_prefix("call="))
+        .map(|call| normalize_call(call, &twins.shell_home))
+        .collect();
+    let recorder = Recorder::new(vec![true]);
+    let mut cache = MoveCache::default();
+    let rust = plan::restore_backups(
+        &rust_backup,
+        &twins.rust_home,
+        &recorder.matcher(),
+        &mut cache,
+    );
+    assert_eq!(shell_code, 1, "shell stops at unsafe row");
+    assert!(rust.is_err(), "rust stops at unsafe row");
+    // Descending byte order puts b/keep first; the absent a/gone
+    // skips silently; the unsafe row refuses with no matcher call.
+    assert_eq!(shell_calls.len(), 1, "one shell matcher call");
+    let rust_calls: Vec<String> = recorder
+        .take()
+        .iter()
+        .map(|call| normalize_call(call, &twins.rust_home))
+        .collect();
+    assert_eq!(rust_calls.len(), 1, "one rust matcher call");
+    assert!(
+        shell_calls[0].starts_with("HOME/backup/b/keep|"),
+        "shell processes b/keep first"
+    );
+    assert!(
+        rust_calls[0].starts_with("HOME/backup/b/keep|"),
+        "rust processes b/keep first"
+    );
+    // The first row already moved home before the refusal.
+    assert_eq!(
+        shape(&twins.shell_home.join("b/keep")),
+        (true, b"kept\n".to_vec())
+    );
+    assert_eq!(
+        shape(&twins.rust_home.join("b/keep")),
+        (true, b"kept\n".to_vec())
+    );
+}
+
+/// Completed path for one side, via the live
+/// `_dot_init_completed_file` (owned by the transaction lane).
+fn completed_for(home: &Path) -> PathBuf {
+    let body = "if _dot_init_completed_file; then code=0; else code=$?; fi\nprintf 'completed=%s\ncode=%s\n' \"$REPLY\" \"$code\"\n";
+    let (code, out, _) = shell_run(home, &[], body);
+    assert_eq!(code, 0, "completed path");
+    let text = String::from_utf8_lossy(&out);
+    let completed = text
+        .lines()
+        .find_map(|line| line.strip_prefix("completed="))
+        .unwrap_or_default();
+    assert!(!completed.is_empty(), "completed value");
+    PathBuf::from(completed)
+}
+
+/// Run the shell publication over one side; returns the verdict.
+/// The shell derives the destination from `HOME` itself.
+fn shell_publish(home: &Path, record: &Path) -> i32 {
+    let body = format!(
+        "if _dot_init_publish_completed {}; then code=0; else code=$?; fi\nprintf 'code=%s\n' \"$code\"\n",
+        sq(record.to_str().expect("record path")),
+    );
+    shell_run(home, &[], &body).0
+}
+
+/// Leftover sibling temporaries (`.completed.*`) in `dir`.
+fn leftovers(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let entries = std::fs::read_dir(dir).expect("list dir");
+    for entry in entries {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        if text.starts_with(".completed.") {
+            found.push(entry.path());
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn publish_completed_publishes_live() {
+    // Fresh publication: parent provisioned, record stamped at 0600.
+    let twins = Twins::build("plan-publish-fresh");
+    let shell_record = twins.root().join("sh-record");
+    let rust_record = twins.root().join("rs-record");
+    std::fs::write(&shell_record, b"record-body\n").expect("shell record");
+    std::fs::write(&rust_record, b"record-body\n").expect("rust record");
+    let shell_completed = completed_for(&twins.shell_home);
+    let rust_completed = completed_for(&twins.rust_home);
+    assert_eq!(
+        shell_publish(&twins.shell_home, &shell_record),
+        0,
+        "shell publishes"
+    );
+    let mut cache = MoveCache::default();
+    plan::publish_completed(
+        &rust_record,
+        &rust_completed,
+        &live_private_dir(twins.rust_home.clone()),
+        &mut cache,
+    )
+    .expect("rust publishes");
+    for completed in [&shell_completed, &rust_completed] {
+        assert_eq!(
+            std::fs::read(completed).expect("completed bytes"),
+            b"record-body\n",
+            "completed content"
+        );
+        assert_eq!(mode_of(completed), 0o600, "completed mode");
+        let root = completed.parent().expect("completed parent");
+        assert_eq!(mode_of(root), 0o700, "completed root mode");
+        assert!(leftovers(root).is_empty(), "no leftovers");
+    }
+
+    // Replacement: an owned regular completion is swapped in place.
+    let twins = Twins::build("plan-publish-replace");
+    let shell_record = twins.root().join("sh-record");
+    let rust_record = twins.root().join("rs-record");
+    std::fs::write(&shell_record, b"next-body\n").expect("shell record");
+    std::fs::write(&rust_record, b"next-body\n").expect("rust record");
+    let shell_completed = completed_for(&twins.shell_home);
+    let rust_completed = completed_for(&twins.rust_home);
+    for completed in [&shell_completed.clone(), &rust_completed.clone()] {
+        let root = completed.parent().expect("root").to_path_buf();
+        std::fs::create_dir_all(&root).expect("root");
+        chmod(&root, 0o700);
+        std::fs::write(completed, b"stale-body\n").expect("stale completed");
+        chmod(completed, 0o600);
+    }
+    assert_eq!(
+        shell_publish(&twins.shell_home, &shell_record),
+        0,
+        "shell replaces"
+    );
+    let mut cache = MoveCache::default();
+    plan::publish_completed(
+        &rust_record,
+        &rust_completed,
+        &live_private_dir(twins.rust_home.clone()),
+        &mut cache,
+    )
+    .expect("rust replaces");
+    for completed in [&shell_completed, &rust_completed] {
+        assert_eq!(
+            std::fs::read(completed).expect("completed bytes"),
+            b"next-body\n",
+            "replaced content"
+        );
+        assert_eq!(mode_of(completed), 0o600, "replaced mode");
+        let root = completed.parent().expect("completed parent");
+        assert!(leftovers(root).is_empty(), "no leftovers");
+    }
+}
+
+#[test]
+fn publish_completed_refuses() {
+    // A directory at the destination refuses and leaves the sibling.
+    let twins = Twins::build("plan-publish-isdir");
+    let shell_record = twins.root().join("sh-record");
+    let rust_record = twins.root().join("rs-record");
+    std::fs::write(&shell_record, b"record-body\n").expect("shell record");
+    std::fs::write(&rust_record, b"record-body\n").expect("rust record");
+    let shell_completed = completed_for(&twins.shell_home);
+    let rust_completed = completed_for(&twins.rust_home);
+    std::fs::create_dir_all(&shell_completed).expect("shell completed dir");
+    std::fs::create_dir_all(&rust_completed).expect("rust completed dir");
+    assert_eq!(
+        shell_publish(&twins.shell_home, &shell_record),
+        1,
+        "shell refuses directory"
+    );
+    let mut cache = MoveCache::default();
+    assert!(
+        plan::publish_completed(
+            &rust_record,
+            &rust_completed,
+            &live_private_dir(twins.rust_home.clone()),
+            &mut cache,
+        )
+        .is_err(),
+        "rust refuses directory"
+    );
+    for completed in [&shell_completed, &rust_completed] {
+        assert!(completed.is_dir(), "destination untouched");
+        let root = completed.parent().expect("completed parent");
+        assert_eq!(leftovers(root).len(), 1, "one leftover sibling");
+    }
+
+    // A symlink at the destination refuses the same way.
+    let twins = Twins::build("plan-publish-islink");
+    let shell_record = twins.root().join("sh-record");
+    let rust_record = twins.root().join("rs-record");
+    std::fs::write(&shell_record, b"record-body\n").expect("shell record");
+    std::fs::write(&rust_record, b"record-body\n").expect("rust record");
+    let shell_completed = completed_for(&twins.shell_home);
+    let rust_completed = completed_for(&twins.rust_home);
+    for (completed, home) in [
+        (&shell_completed, &twins.shell_home),
+        (&rust_completed, &twins.rust_home),
+    ] {
+        let root = completed.parent().expect("root").to_path_buf();
+        std::fs::create_dir_all(&root).expect("root");
+        write(home, "decoy", b"decoy\n");
+        std::os::unix::fs::symlink(home.join("decoy"), completed).expect("completed link");
+    }
+    assert_eq!(
+        shell_publish(&twins.shell_home, &shell_record),
+        1,
+        "shell refuses symlink"
+    );
+    let mut cache = MoveCache::default();
+    assert!(
+        plan::publish_completed(
+            &rust_record,
+            &rust_completed,
+            &live_private_dir(twins.rust_home.clone()),
+            &mut cache,
+        )
+        .is_err(),
+        "rust refuses symlink"
+    );
+    for (completed, home) in [
+        (&shell_completed, &twins.shell_home),
+        (&rust_completed, &twins.rust_home),
+    ] {
+        let root = completed.parent().expect("completed parent");
+        assert_eq!(leftovers(root).len(), 1, "one leftover sibling");
+        assert_eq!(
+            std::fs::read_link(completed).expect("link intact"),
+            home.join("decoy").as_path(),
+            "link untouched"
+        );
+    }
+
+    // A missing record refuses after staging the sibling.
+    let twins = Twins::build("plan-publish-norecord");
+    let shell_record = twins.root().join("sh-record");
+    let rust_record = twins.root().join("rs-record");
+    let shell_completed = completed_for(&twins.shell_home);
+    let rust_completed = completed_for(&twins.rust_home);
+    assert_eq!(
+        shell_publish(&twins.shell_home, &shell_record),
+        1,
+        "shell refuses missing record"
+    );
+    let mut cache = MoveCache::default();
+    assert!(
+        plan::publish_completed(
+            &rust_record,
+            &rust_completed,
+            &live_private_dir(twins.rust_home.clone()),
+            &mut cache,
+        )
+        .is_err(),
+        "rust refuses missing record"
+    );
+    for completed in [&shell_completed, &rust_completed] {
+        assert!(!exists_side(completed), "no destination");
+        let root = completed.parent().expect("completed parent");
+        let found = leftovers(root);
+        assert_eq!(found.len(), 1, "one leftover sibling");
+        assert_eq!(
+            std::fs::read(&found[0]).expect("leftover bytes").len(),
+            0,
+            "leftover never filled"
+        );
+    }
+
+    // An unprovisionable root refuses before staging anything.
+    let twins = Twins::build("plan-publish-noprivate");
+    let shell_record = twins.root().join("sh-record");
+    let rust_record = twins.root().join("rs-record");
+    std::fs::write(&shell_record, b"record-body\n").expect("shell record");
+    std::fs::write(&rust_record, b"record-body\n").expect("rust record");
+    let shell_completed = completed_for(&twins.shell_home);
+    let rust_completed = completed_for(&twins.rust_home);
+    let shell_body = format!(
+        "_dot_init_private_directory() {{ return 1; }}\nif _dot_init_publish_completed {}; then code=0; else code=$?; fi\nprintf 'code=%s\n' \"$code\"\n",
+        sq(shell_record.to_str().expect("record path")),
+    );
+    assert_eq!(
+        shell_run(&twins.shell_home, &[], &shell_body).0,
+        1,
+        "shell refuses unprovisionable root"
+    );
+    let mut cache = MoveCache::default();
+    assert!(
+        plan::publish_completed(
+            &rust_record,
+            &rust_completed,
+            &failing_private_dir(),
+            &mut cache,
+        )
+        .is_err(),
+        "rust refuses unprovisionable root"
+    );
+    assert!(!exists_side(&shell_completed));
+    assert!(!exists_side(&rust_completed));
 }
