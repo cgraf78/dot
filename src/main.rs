@@ -13,8 +13,8 @@
 //! ignored (`let _ =`) rather than panicking: a closed pipe must
 //! surface as the command's normal exit path, never as a Rust panic
 //! message, since panics would break the stderr byte contract.
-//! This adapter itself performs no fallible setup, so it cannot fail
-//! before `run` takes over.
+//! Source-root discovery can fail before `run` takes over; that path emits one
+//! stable startup diagnostic instead of trusting ambient executable code.
 
 use std::collections::BTreeMap;
 use std::io::{Write, stderr, stdout};
@@ -22,11 +22,17 @@ use std::io::{Write, stderr, stdout};
 fn main() {
     let env = std::env::vars_os().collect::<BTreeMap<_, _>>();
     let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-    let runtime = dot::app::Runtime::from_env(&env, &cwd)
-        .expect("the current directory fallback is absolute");
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     let mut out = stdout().lock();
     let mut err = stderr().lock();
-    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let runtime = match dot::app::Runtime::from_process_args(&env, &cwd, &args) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(err, "dot: startup: {error}");
+            let _ = err.flush();
+            std::process::exit(1);
+        }
+    };
     let mut streams = dot::app::Streams::new(&mut out, &mut err);
     let code = dot::app::run_direct(&runtime, &args, &mut streams);
     // `process::exit` runs no destructors and flushes nothing; `StdoutLock`

@@ -28,7 +28,132 @@ pub fn ensure_umask_ceiling(mask: u32) -> u32 {
     mask | UMASK_CEILING_BITS
 }
 
-/// Resolve the selected Dot checkout.
+/// Resolve the Dot checkout or release that owns `exe`.
+///
+/// The executable is canonicalized before its recognized development or
+/// release layout is inspected, so an installed launcher symlink still binds
+/// the runtime to the payload it actually executes. A missing or incomplete
+/// root is an error: the binary must never fall back to caller-controlled
+/// process state when selecting code that hooks and providers may execute.
+pub fn executable_source_root(exe: &Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(exe).map_err(|_| source_root_error())?;
+    source_root_from_canonical(
+        &canonical,
+        Path::new(env!("OUT_DIR")),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        true,
+    )
+    .ok_or_else(source_root_error)
+}
+
+fn executable_owner_root(exe: &Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(exe).map_err(|_| source_root_error())?;
+    source_root_from_canonical(
+        &canonical,
+        Path::new(env!("OUT_DIR")),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        false,
+    )
+    .ok_or_else(source_root_error)
+}
+
+fn source_root_shape(root: &Path, require_public: bool) -> bool {
+    (root.join("Cargo.toml").is_file() || root.join(".dot-install.json").is_file())
+        && (!require_public || root.join("lib/dot/public").is_dir())
+}
+
+fn source_root_from_canonical(
+    executable: &Path,
+    out_dir: &Path,
+    manifest_dir: &Path,
+    require_public: bool,
+) -> Option<PathBuf> {
+    cargo_source_root_from(executable, out_dir, manifest_dir, require_public)
+        .or_else(|| physical_source_root(executable, require_public))
+}
+
+fn physical_source_root(executable: &Path, require_public: bool) -> Option<PathBuf> {
+    let parent = executable.parent()?;
+    if source_root_shape(parent, require_public) {
+        return Some(parent.to_path_buf());
+    }
+    if parent.file_name() == Some(OsStr::new("bin")) {
+        let root = parent.parent()?;
+        if source_root_shape(root, require_public) {
+            return Some(root.to_path_buf());
+        }
+    }
+    let target = if parent.file_name() == Some(OsStr::new("deps")) {
+        parent.parent()?.parent()?
+    } else {
+        parent.parent()?
+    };
+    if target.file_name() == Some(OsStr::new("target")) {
+        let root = target.parent()?;
+        if source_root_shape(root, require_public) {
+            return Some(root.to_path_buf());
+        }
+    }
+    None
+}
+
+fn cargo_source_root_from(
+    executable: &Path,
+    out_dir: &Path,
+    manifest_dir: &Path,
+    require_public: bool,
+) -> Option<PathBuf> {
+    // Cargo may place target artifacts outside the checkout. `OUT_DIR` and
+    // `CARGO_MANIFEST_DIR` are compile-time values, so unlike process
+    // environment they cannot redirect a built binary. Restrict the fallback
+    // to a direct binary or `deps/` artifact in the exact Cargo profile that
+    // produced this crate; a copied or installed binary must carry release
+    // metadata beside itself.
+    let profile = out_dir.ancestors().nth(3)?;
+    let profile = std::fs::canonicalize(profile).ok()?;
+    let relative = executable.strip_prefix(&profile).ok()?;
+    let mut components = relative.components();
+    let cargo_artifact = match (components.next(), components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None, None) => true,
+        (
+            Some(std::path::Component::Normal(directory)),
+            Some(std::path::Component::Normal(_)),
+            None,
+        ) => directory == OsStr::new("deps"),
+        _ => false,
+    };
+    if !cargo_artifact {
+        return None;
+    }
+    let manifest = std::fs::canonicalize(manifest_dir).ok()?;
+    source_root_shape(&manifest, require_public).then_some(manifest)
+}
+
+fn source_root_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "cannot resolve source root from executable",
+    )
+}
+
+pub(crate) fn process_source_root() -> std::io::Result<PathBuf> {
+    let executable = std::env::current_exe().map_err(|_| source_root_error())?;
+    executable_source_root(&executable)
+}
+
+pub(crate) fn process_owner_root() -> std::io::Result<PathBuf> {
+    let executable = std::env::current_exe().map_err(|_| source_root_error())?;
+    executable_owner_root(&executable)
+}
+
+pub(crate) fn informational_command(command: &[u8]) -> bool {
+    matches!(
+        command,
+        b"" | b"help" | b"-h" | b"--help" | b"version" | b"--version"
+    )
+}
+
+/// Resolve the selected Dot checkout for a trusted embedded runtime.
 ///
 /// `env_root` (explicit `DOT_SOURCE_ROOT`) wins verbatim when
 /// non-empty; otherwise the canonicalized `exe` path is walked up to
@@ -40,30 +165,10 @@ pub fn resolve_source_root(exe: &Path, env_root: Option<&OsStr>, cwd: &Path) -> 
             return PathBuf::from(root);
         }
     }
-    if let Ok(canonical) = std::fs::canonicalize(exe) {
-        for ancestor in canonical.ancestors() {
-            if (ancestor.join("Cargo.toml").is_file() && ancestor.join("lib/dot/public").is_dir())
-                || (ancestor.join(".dot-install.json").is_file()
-                    && ancestor.join("lib/dot/public").is_dir())
-            {
-                return ancestor.to_path_buf();
-            }
-        }
+    if let Ok(root) = executable_source_root(exe) {
+        return root;
     }
     cwd.to_path_buf()
-}
-
-/// Resolve the checkout from ambient process state: `DOT_SOURCE_ROOT`
-///, the current executable, and the working directory, in the
-/// [`resolve_source_root`] precedence. Unresolvable pieces degrade to
-/// inert placeholders (never an error: the re-exec probe then reports
-/// `<missing>` and config resolution falls back exactly like the
-/// shell's `${DOT_SOURCE_ROOT:-$PWD}`).
-pub fn ambient_source_root() -> PathBuf {
-    let env_root = std::env::var_os("DOT_SOURCE_ROOT");
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/nonexistent-dot-exe"));
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    resolve_source_root(&exe, env_root.as_deref(), &cwd)
 }
 
 /// Read the observed checkout revision: `git rev-parse HEAD` bound to
@@ -301,6 +406,7 @@ pub fn check_ambient() -> Result<Config, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dot_test_support::TempDir;
 
     #[test]
     fn umask_ceiling_ors_group_and_other_write() {
@@ -375,6 +481,41 @@ mod tests {
         assert_eq!(
             resolve_source_root(Path::new("/nonexistent/exe"), None, Path::new("/fallback")),
             PathBuf::from("/fallback")
+        );
+    }
+
+    #[test]
+    fn cargo_source_root_is_limited_to_its_compiled_profile() {
+        let scratch = TempDir::new("cargo-source-root").expect("scratch");
+        let manifest = scratch.path().join("checkout");
+        let decoy = scratch.path().join("decoy-checkout");
+        let profile = decoy.join("external-target/debug");
+        let out_dir = profile.join("build/dot-fixture/out");
+        let executable = profile.join("deps/dot-fixture");
+        let copied = scratch.path().join("copied-dot");
+        std::fs::create_dir_all(manifest.join("lib/dot/public")).expect("public API");
+        std::fs::write(manifest.join("Cargo.toml"), b"[package]\n").expect("manifest");
+        std::fs::create_dir_all(decoy.join("lib/dot/public")).expect("decoy public API");
+        std::fs::write(decoy.join("Cargo.toml"), b"[package]\n").expect("decoy manifest");
+        std::fs::create_dir_all(&out_dir).expect("Cargo OUT_DIR");
+        std::fs::create_dir_all(executable.parent().expect("executable parent"))
+            .expect("profile deps");
+        std::fs::write(&executable, b"binary").expect("profile executable");
+        std::fs::write(&copied, b"binary").expect("copied executable");
+
+        let executable = executable.canonicalize().expect("canonical executable");
+        assert_eq!(
+            cargo_source_root_from(&executable, &out_dir, &manifest, true),
+            Some(manifest.canonicalize().expect("canonical manifest"))
+        );
+        assert_eq!(
+            source_root_from_canonical(&executable, &out_dir, &manifest, true),
+            Some(manifest.canonicalize().expect("canonical manifest")),
+            "compiled ownership must win over a surrounding checkout"
+        );
+        assert_eq!(
+            cargo_source_root_from(&copied, &out_dir, &manifest, true),
+            None
         );
     }
 

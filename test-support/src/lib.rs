@@ -8,7 +8,8 @@
 //! and coarse clocks), paths are canonicalized, and the guard removes
 //! the directory on drop.
 
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -54,6 +55,58 @@ pub fn bash() -> &'static std::path::Path {
              install bash 5.x, the pinned engine runtime",
         );
     })
+}
+
+/// Copy a built Dot binary and wait until the kernel accepts it for execution.
+///
+/// Some filesystems transiently return `ETXTBSY` immediately after a copy.
+/// Probe `--version` until `exec` itself succeeds instead of guessing at a
+/// delay; the child's status is irrelevant because incomplete-root tests
+/// intentionally exercise startup failure.
+pub fn copy_dot_binary(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::copy(source, destination)?;
+    std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o755))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match std::process::Command::new(destination)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                child.wait()?;
+                return Ok(());
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Copy a built Dot binary into a minimal checkout-shaped fixture.
+///
+/// Production derives executable hook authority from the physical binary, so
+/// end-to-end fixtures that model a distinct source checkout must execute a
+/// binary owned by that checkout instead of injecting `DOT_SOURCE_ROOT`. Test
+/// callers use [`TempDir::new_exec`] so the resulting fixture is executable on
+/// hosts where the general temporary directory is mounted `noexec`.
+pub fn owned_dot_binary(root: &Path, source: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(root.join("lib/dot/public"))?;
+    std::fs::create_dir_all(root.join("target/debug"))?;
+    std::fs::write(
+        root.join("Cargo.toml"),
+        b"[package]\nname = 'dot-test-fixture'\nversion = '0.0.0'\n",
+    )?;
+    let binary = root.join("target/debug/dot");
+    copy_dot_binary(source, &binary)?;
+    Ok(binary)
 }
 
 /// Major version from `$BASH_VERSION` (`5.2.37(1)-release` -> 5);
