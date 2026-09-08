@@ -20,6 +20,7 @@ pub mod extension_trust;
 pub mod families;
 pub mod glob;
 pub mod hook_api;
+pub mod init_client_candidate;
 pub mod init_client_entry;
 pub mod init_client_generation;
 pub mod init_client_identity;
