@@ -2607,3 +2607,45 @@ pub fn restore_tracked_path(
     }
     (true, Vec::new())
 }
+
+/// `_dot_reserved_roots_snapshot` as a vector: the newline-joined
+/// inventory (no trailing newline — command substitution strips
+/// it), or `None` like the bare `return 1`. Overlay link paths
+/// come from the caller exactly like the shell `OVERLAYS` loop,
+/// skipping empty paths.
+pub fn reserved_snapshot_vec(
+    home: &str,
+    dest: &DestinationInputs,
+    overlay_paths: &[String],
+) -> Option<Vec<String>> {
+    let state_home = xdg::base(
+        xdg::Kind::State,
+        dest.xdg_state_home.as_deref().unwrap_or(""),
+        home,
+    )
+    .ok()?;
+    let install_root = dest
+        .install_dir
+        .clone()
+        .unwrap_or_else(|| format!("{home}/.local/share"));
+    let provider_state = dest
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| format!("{state_home}/shdeps"));
+    let mut init_backup = dest.init_backup.clone();
+    if init_backup.as_deref() == Some("-") {
+        init_backup = None;
+    }
+    reserved::reserved_roots(
+        &reserved::RootsInput {
+            home: home.to_string(),
+            state_home,
+            install_root,
+            provider_state,
+            overlay_paths: overlay_paths.to_vec(),
+            init_backup,
+        },
+        &dest.pwd,
+    )
+    .ok()
+}
