@@ -39,6 +39,9 @@ grep -Fq 'bash tests/library-test' <<<"$shell_job" ||
 # shellcheck disable=SC2016 # Workflow variables must remain literal.
 grep -Fq 'HOME="$install_root/home" ./install.sh' "$workflow" ||
   fail 'Linux package smoke must activate the musl artifact through install.sh'
+# shellcheck disable=SC2016 # Workflow variables must remain literal.
+grep -Fq 'tar -C .termux-ci -xzf "$archive" ./dot ./.dot-install.json' "$workflow" ||
+  fail 'Termux runtime smoke must transport the binary ownership metadata'
 # shellcheck disable=SC2016 # The workflow must retain this literal expression.
 grep -Fq 'SHDEPS_LOCK_RESULT: ${{ needs.shdeps-lock.result }}' "$workflow" ||
   fail 'Required must receive the Shdeps lock result'
