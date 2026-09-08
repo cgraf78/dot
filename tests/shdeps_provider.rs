@@ -504,15 +504,41 @@ fn elapsed_range(line: &[u8]) -> Option<std::ops::Range<usize>> {
         .then_some(start..start + digits.len())
 }
 
-fn bounded_output(mut command: Command, seconds: u64) -> Output {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = sender.send(command.output());
-    });
-    receiver
-        .recv_timeout(std::time::Duration::from_secs(seconds))
-        .expect("provider update exceeded bounded deadline")
-        .expect("bounded provider update")
+/// Run a closed provider fixture under the same session-aware supervisor used
+/// by the public test runner.
+///
+/// `Command` is not cloneable, so rebuild its observable program, arguments,
+/// environment, and working directory around the supervisor. This keeps the
+/// fixture hermetic while ensuring a timeout terminates and reaps descendants
+/// instead of abandoning a thread blocked in `Command::output`.
+fn bounded_output(command: Command, seconds: u64) -> Output {
+    let program = command.get_program().to_os_string();
+    let args: Vec<_> = command.get_args().map(ToOwned::to_owned).collect();
+    let env: Vec<_> = command
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.map(ToOwned::to_owned)))
+        .collect();
+    let current_dir = command.get_current_dir().map(Path::to_path_buf);
+    let mut bounded =
+        Command::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("lib/dot/public/test-timeout-v1"));
+    bounded
+        .arg(format!("{seconds}s"))
+        .arg(program)
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        match value {
+            Some(value) => bounded.env(key, value),
+            None => bounded.env_remove(key),
+        };
+    }
+    if let Some(current_dir) = current_dir {
+        bounded.current_dir(current_dir);
+    }
+    bounded.output().expect("run bounded provider update")
 }
 
 /// `kill -0` reports a zombie until an unrelated container PID 1 reaps it.
@@ -531,6 +557,46 @@ fn process_running(pid: &str) -> bool {
         && !String::from_utf8_lossy(&output.stdout)
             .trim_start()
             .starts_with('Z')
+}
+
+#[test]
+fn bounded_output_reaps_a_timed_out_process_session() {
+    let scratch = TempDir::new("shdeps-provider-timeout").expect("scratch");
+    let script = scratch.path().join("hang");
+    let leader = scratch.path().join("leader-pid");
+    let descendant = scratch.path().join("descendant-pid");
+    write_exec(
+        &script,
+        br#"#!/usr/bin/env bash
+printf '%s\n' "$$" >"$LEADER_PID"
+(sleep 30) &
+printf '%s\n' "$!" >"$DESCENDANT_PID"
+wait
+"#,
+    );
+    let mut command = Command::new(&script);
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("LEADER_PID", &leader)
+        .env("DESCENDANT_PID", &descendant)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = bounded_output(command, 1);
+    assert_eq!(
+        output.status.code(),
+        Some(124),
+        "stderr={:?}",
+        output.stderr
+    );
+    for pid_file in [&leader, &descendant] {
+        let pid = std::fs::read_to_string(pid_file)
+            .expect("timeout fixture pid")
+            .trim()
+            .to_string();
+        assert!(!process_running(&pid), "timed-out process {pid} survived");
+    }
 }
 
 #[test]
@@ -959,29 +1025,31 @@ fn verbose_provider_events_render_in_order_natively() {
     assert_eq!(rust_output.stderr, shell_output.stderr);
 }
 
+const PROMPT_CHANGED: &[u8] =
+    b"[1/5] Overlays   running  checking overlay links                         Ns\n\
+[1/5] Overlays   ok       0 overlays current                             Ns\n\
+[2/5] Tools      running  checking configured dependencies               Ns\n\
+[2/5] Tools      changed  1 changed                                      Ns\n\
+\x20\x20changed  Cargo: 1 changed\n\
+\x20\x20changed  ripgrep                      installed\n\
+[3/5] Configs    running  checking config hooks                          Ns\n\
+[3/5] Configs    ok       no config hooks                                Ns\n\
+[4/5] Cleanup    running  normalizing worktree                           Ns\n\
+[4/5] Cleanup    ok       no base repo                                   Ns\n\
+Done in Ns. Reload your shell: source ~/.bashrc\n";
+
 #[test]
-fn provider_prompt_rendezvous_matches_shell_natively() {
-    let shell = Fixture::new("shdeps-provider-prompt-shell");
+fn provider_prompt_rendezvous_acknowledges_natively() {
     let rust = Fixture::new("shdeps-provider-prompt-rust");
-    let run = |fixture: &Fixture, native: bool| {
-        fixture
-            .command(native)
-            .env("DOT_TEST_PROVIDER_PROMPT", "1")
-            .env(
-                "DOT_TEST_PROVIDER_PROMPT_RECORD",
-                fixture.home.join("prompt-record"),
-            )
-            .output()
-            .expect("prompt provider update")
-    };
-    let shell_output = run(&shell, false);
-    let rust_output = run(&rust, true);
-    assert_eq!(rust_output.status.code(), shell_output.status.code());
-    assert_eq!(
-        normalize_elapsed(&rust_output.stdout),
-        normalize_elapsed(&shell_output.stdout)
+    let mut command = rust.command(true);
+    command.env("DOT_TEST_PROVIDER_PROMPT", "1").env(
+        "DOT_TEST_PROVIDER_PROMPT_RECORD",
+        rust.home.join("prompt-record"),
     );
-    assert_eq!(rust_output.stderr, shell_output.stderr);
+    let output = bounded_output(command, 10);
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert_eq!(normalize_elapsed(&output.stdout), PROMPT_CHANGED);
+    assert!(output.stderr.is_empty());
     assert_eq!(
         std::fs::read(rust.home.join("prompt-record")).expect("native prompt acknowledgment"),
         b"ready\n"
