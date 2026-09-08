@@ -85,6 +85,8 @@ pub mod shdeps_ui;
 pub mod shdeps_ui_render;
 pub mod startup;
 pub mod temp;
+pub(crate) mod test_command;
+pub(crate) mod test_runner;
 pub mod test_suites;
 pub mod test_support;
 pub mod ui;
