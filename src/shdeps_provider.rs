@@ -92,6 +92,7 @@ pub(crate) fn update(
             details: Vec::new(),
             stderr: match failure {
                 EnsureFailure::Unavailable => Vec::new(),
+                EnsureFailure::Bash(error) => inputs.runtime.bash_error_line_once(&error),
                 EnsureFailure::AbiTimeout(seconds) => crate::progress_ui::warn_line(
                     inputs.palette,
                     format!("  warning: Shdeps provider ABI probe timed out after {seconds}s")
@@ -121,6 +122,7 @@ pub(crate) fn update(
 
 enum EnsureFailure {
     Unavailable,
+    Bash(crate::bash::Error),
     AbiTimeout(u64),
     Download(DownloadFailure),
 }
@@ -137,6 +139,10 @@ fn ensure(inputs: &Inputs<'_>) -> Result<Ready, EnsureFailure> {
             dot_quiet: if inputs.quiet { "1" } else { "0" },
         })
         .ok_or(EnsureFailure::Unavailable)?;
+    // Bash is a hard prerequisite for every provider source. Resolve it
+    // before installer selection so an invalid strict override cannot trigger
+    // a download that can never be used.
+    let bash = inputs.runtime.bash().map_err(EnsureFailure::Bash)?;
     let selected = match installer(inputs, &configured) {
         Some(selected) => selected,
         None => download_installer(inputs).map_err(EnsureFailure::Download)?,
@@ -165,11 +171,11 @@ fn ensure(inputs: &Inputs<'_>) -> Result<Ready, EnsureFailure> {
     ) {
         set(&mut env, "SHDEPS_GIT_DEV_DIR", "/dev/null");
     }
-    let bootstrapped = bootstrap(inputs.runtime, &selected.path, &env);
+    let bootstrapped = bootstrap(inputs.runtime, &bash, &selected.path, &env);
     if selected.temporary {
         let _ = std::fs::remove_file(&selected.path);
     }
-    let binary = bootstrapped.map_err(|_| EnsureFailure::Unavailable)?;
+    let binary = bootstrapped?;
     let directory = binary
         .parent()
         .ok_or(EnsureFailure::Unavailable)?
@@ -336,14 +342,16 @@ fn download_installer(inputs: &Inputs<'_>) -> Result<Installer, DownloadFailure>
 
 fn bootstrap(
     runtime: &Runtime,
+    bash: &crate::bash::Resolved,
     installer: &Path,
     env: &BTreeMap<OsString, OsString>,
-) -> Result<PathBuf, ()> {
-    let bash = runtime.bash().ok_or(())?;
+) -> Result<PathBuf, EnsureFailure> {
     // The reviewed installer is the authority that selects the CLI. Keep its
     // shell-local `_SHDEPSW_BIN` across the process boundary with a strict,
     // NUL-framed protocol; installer stdout is intentionally not protocol.
-    let output = Command::new(bash)
+    let mut command = Command::new(bash.path());
+    crate::bash::sanitized_env(&mut command, env);
+    let output = command
         .args([
             "--noprofile",
             "--norc",
@@ -352,26 +360,27 @@ fn bootstrap(
         ])
         .arg("dot-shdeps-bootstrap")
         .arg(installer)
-        .env_clear()
-        .envs(env)
         .current_dir(runtime.cwd())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()
-        .map_err(|_| ())?;
+        .map_err(|_| EnsureFailure::Unavailable)?;
     if !output.status.success() {
-        return Err(());
+        return Err(EnsureFailure::Unavailable);
     }
     let prefix = b"dot-shdeps-bootstrap-v1\0";
-    let path = output.stdout.strip_prefix(prefix).ok_or(())?;
-    let path = path.strip_suffix(b"\0").ok_or(())?;
+    let path = output
+        .stdout
+        .strip_prefix(prefix)
+        .ok_or(EnsureFailure::Unavailable)?;
+    let path = path.strip_suffix(b"\0").ok_or(EnsureFailure::Unavailable)?;
     if path.is_empty() || path.contains(&0) {
-        return Err(());
+        return Err(EnsureFailure::Unavailable);
     }
     let path = PathBuf::from(OsStr::from_bytes(path));
     if !path.is_absolute() || !executable(&path) {
-        return Err(());
+        return Err(EnsureFailure::Unavailable);
     }
     Ok(path)
 }
@@ -382,16 +391,40 @@ fn binary_abi(
     expected: &str,
     env: &BTreeMap<OsString, OsString>,
 ) -> AbiResult {
+    match probe_abi(runtime, binary, env) {
+        AbiProbe::Output(bytes)
+            if String::from_utf8_lossy(&bytes).trim_end_matches('\n')
+                == format!("abi:{expected}") =>
+        {
+            AbiResult::Match
+        }
+        AbiProbe::Output(_) | AbiProbe::Mismatch => AbiResult::Mismatch,
+        AbiProbe::Timeout(seconds) => AbiResult::Timeout(seconds),
+    }
+}
+
+/// Probe a selected provider for doctor using only the captured Runtime.
+pub(crate) fn doctor_abi_version(runtime: &Runtime, binary: &Path) -> Option<String> {
+    match probe_abi(runtime, binary, runtime.env()) {
+        AbiProbe::Output(bytes) => Some(
+            String::from_utf8_lossy(&bytes)
+                .trim_end_matches('\n')
+                .to_string(),
+        ),
+        AbiProbe::Mismatch | AbiProbe::Timeout(_) => None,
+    }
+}
+
+fn probe_abi(runtime: &Runtime, binary: &Path, env: &BTreeMap<OsString, OsString>) -> AbiProbe {
     let timeout = value(runtime, "_DOT_SHDEPS_ABI_TIMEOUT_SECONDS")
         .parse::<u64>()
         .ok()
         .filter(|seconds| *seconds > 0)
         .unwrap_or(10);
     let mut command = Command::new(binary);
+    crate::bash::sanitized_env(&mut command, env);
     command
         .args(["__api", "version"])
-        .env_clear()
-        .envs(env)
         .current_dir(runtime.cwd())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -399,12 +432,12 @@ fn binary_abi(
         .process_group(0);
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => return AbiResult::Mismatch,
+        Err(_) => return AbiProbe::Mismatch,
     };
     let Some(mut stdout) = child.stdout.take() else {
         kill_group(child.id());
         let _ = child.wait();
-        return AbiResult::Mismatch;
+        return AbiProbe::Mismatch;
     };
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -417,13 +450,10 @@ fn binary_abi(
             Ok(Some(status)) => {
                 kill_group(child.id());
                 let bytes = reader.join().unwrap_or_default();
-                if status.success()
-                    && String::from_utf8_lossy(&bytes).trim_end_matches('\n')
-                        == format!("abi:{expected}")
-                {
-                    return AbiResult::Match;
+                if status.success() {
+                    return AbiProbe::Output(bytes);
                 }
-                return AbiResult::Mismatch;
+                return AbiProbe::Mismatch;
             }
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -432,13 +462,13 @@ fn binary_abi(
                 kill_group(child.id());
                 let _ = child.wait();
                 let _ = reader.join();
-                return AbiResult::Timeout(timeout);
+                return AbiProbe::Timeout(timeout);
             }
             Err(_) => {
                 kill_group(child.id());
                 let _ = child.wait();
                 let _ = reader.join();
-                return AbiResult::Mismatch;
+                return AbiProbe::Mismatch;
             }
         }
     }
@@ -450,6 +480,12 @@ fn kill_group(pid: u32) {
 
 enum AbiResult {
     Match,
+    Mismatch,
+    Timeout(u64),
+}
+
+enum AbiProbe {
+    Output(Vec<u8>),
     Mismatch,
     Timeout(u64),
 }
@@ -490,10 +526,10 @@ fn run_update(
     {
         set(&mut env, "SHDEPS_ALLOW_GH_AUTH_TOKEN", "1");
     }
-    let child = Command::new(&ready.binary)
+    let mut command = Command::new(&ready.binary);
+    crate::bash::sanitized_env(&mut command, &env);
+    let child = command
         .arg("update")
-        .env_clear()
-        .envs(&env)
         .current_dir(&ready.directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

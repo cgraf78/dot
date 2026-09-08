@@ -29,8 +29,9 @@ The installer runs on stock macOS Bash 3.2, downloads the platform archive,
 verifies its published checksum and signer-aware attestation from
 `cgraf78/actions`, and atomically selects a versioned release under
 `${XDG_DATA_HOME:-$HOME/.local/share}/cgraf78`. The `dot` engine is a native
-executable and does not require Bash. Bash 4 or newer is needed only when a
-configured user hook uses the versioned shell extension API.
+executable and does not require Bash. Bash 4 or newer is resolved for configured
+shell capabilities: when a user hook or the reviewed Shdeps bootstrap must run,
+and when `dot doctor` validates either capability.
 
 It publishes the stable links:
 

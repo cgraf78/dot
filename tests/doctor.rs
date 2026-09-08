@@ -1,12 +1,11 @@
 //! End-to-end parity for the native `dot doctor` coordinator.
 //!
-//! Every Rust-side invocation poisons `DOT_BASH`, the former whole-engine
-//! adapter. Doctor extensions still receive an explicitly authorized Bash via
-//! `BASH`; that worker is part of the versioned extension protocol, not a
-//! fallback to Dot's legacy engine.
+//! Rust-side invocations select the retained hook boundary explicitly through
+//! `DOT_BASH`; the native engine itself remains independent of Bash.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -39,7 +38,7 @@ fn command(shell: bool, home: &TempDir, state: &TempDir, extra: &[(&str, &str)])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if !shell {
-        command.env("DOT_BASH", "/definitely/missing/old-dot-engine");
+        command.env("DOT_BASH", dot_test_support::bash());
     }
     for (key, value) in extra {
         command.env(key, value);
@@ -278,32 +277,41 @@ fn source_checkout_ignores_caller_git_selection() {
 
 #[test]
 fn extensions_disabled_doctor_does_not_execute_bash_startup_code() {
-    // Catches restoring a `bash -c` runtime probe: noninteractive Bash reads
-    // BASH_ENV before evaluating the probe even though no extension can run.
-    let home = TempDir::new("doctor-native-no-bash-code-home").expect("home");
+    let home = TempDir::new_exec("doctor-native-no-bash-code-home").expect("home");
     let state = TempDir::new("doctor-native-no-bash-code-state").expect("state");
-    let startup = home.path().join("startup.sh");
     let marker = home.path().join("startup-ran");
-    std::fs::write(&startup, format!("printf ran >'{}'\n", marker.display()))
-        .expect("startup script");
+    let bash = home.path().join("bash-probe");
+    std::fs::write(
+        &bash,
+        format!(
+            "#!/bin/sh\nprintf ran >'{}'\nexec '{}' \"$@\"\n",
+            marker.display(),
+            dot_test_support::bash().display()
+        ),
+    )
+    .expect("Bash probe");
+    std::fs::set_permissions(&bash, std::fs::Permissions::from_mode(0o755))
+        .expect("Bash probe mode");
 
     let native = command(
         false,
         &home,
         &state,
         &[
-            ("BASH_ENV", startup.to_str().expect("startup text")),
+            ("DOT_BASH", bash.to_str().expect("Bash path")),
             // Keep this regression about Dot's Bash probe. A developer PATH
-            // may itself contain Bash-script wrappers for otherwise native
-            // tools, which would be caller-supplied execution outside the
-            // fixture's scope.
+            // may contain script wrappers for otherwise native tools, which
+            // would be caller-supplied execution outside the fixture's scope.
             ("PATH", "/usr/bin:/bin"),
         ],
     )
     .output()
     .expect("native doctor");
     assert!(!native.status.success(), "missing client remains unhealthy");
-    assert!(!marker.exists(), "doctor executed BASH_ENV startup code");
+    assert!(
+        !marker.exists(),
+        "doctor probed Bash while it was not required"
+    );
 }
 
 #[test]
@@ -469,6 +477,91 @@ fn trusted_failing_extension_matches_without_the_old_engine() {
     let (shell, native) = pair(&home, &state);
     assert!(String::from_utf8_lossy(&shell.stdout).contains("expected extension failure"));
     assert_pair(&shell, &native);
+}
+
+#[test]
+fn invalid_explicit_bash_prevents_doctor_extension_execution() {
+    let home = TempDir::new("doctor-native-invalid-bash-home").expect("home");
+    let state = TempDir::new("doctor-native-invalid-bash-state").expect("state");
+    let root = home.path().join("extensions");
+    let directory = root.join("doctor.d");
+    let marker = home.path().join("extension-ran");
+    let missing = home.path().join("missing/bash");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
+    std::fs::create_dir_all(&directory).expect("doctor directory");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=none\n",
+    )
+    .expect("config");
+    std::fs::write(
+        directory.join("10-marker.sh"),
+        format!(
+            "doctor() {{ printf ran >'{}'; dot_doctor_ok marker; }}\n",
+            marker.display()
+        ),
+    )
+    .expect("extension");
+    seal(&root, 0o700);
+    seal(&directory, 0o700);
+    seal(&directory.join("10-marker.sh"), 0o644);
+
+    let (code, stdout, stderr) = run_in_process(
+        &home,
+        &state,
+        home.path(),
+        &[("DOT_BASH", missing.as_os_str())],
+    );
+    let expected = format!(
+        "checkout Bash resolver: explicit interpreter is not Bash 4 or newer: {}\n",
+        missing.display()
+    );
+
+    assert_eq!(code, 1);
+    assert_eq!(stderr, expected.as_bytes());
+    assert!(
+        String::from_utf8_lossy(&stdout).contains("Bash runtime is too old"),
+        "doctor output: {}",
+        String::from_utf8_lossy(&stdout)
+    );
+    assert!(!marker.exists(), "doctor extension ran without Bash 4+");
+}
+
+#[test]
+fn shdeps_provider_requires_bash_without_extensions() {
+    let home = TempDir::new("doctor-native-provider-bash-home").expect("home");
+    let state = TempDir::new("doctor-native-provider-bash-state").expect("state");
+    let missing = home.path().join("missing/bash");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\ndependency_provider=shdeps\n",
+    )
+    .expect("config");
+
+    let (code, stdout, stderr) = run_in_process(
+        &home,
+        &state,
+        home.path(),
+        &[("DOT_BASH", missing.as_os_str())],
+    );
+    let expected = format!(
+        "checkout Bash resolver: explicit interpreter is not Bash 4 or newer: {}\n",
+        missing.display()
+    );
+
+    assert_eq!(code, 1);
+    assert_eq!(stderr, expected.as_bytes());
+    assert!(
+        String::from_utf8_lossy(&stdout).contains("Bash runtime is too old"),
+        "doctor output: {}",
+        String::from_utf8_lossy(&stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&stdout).contains("Bash runtime is not required"),
+        "doctor output: {}",
+        String::from_utf8_lossy(&stdout)
+    );
 }
 
 #[test]
@@ -884,6 +977,45 @@ fn healthy_latest_provider_matches_without_the_old_engine() {
     assert!(output.contains("Shdeps provider source (trusted development checkout:"));
     assert!(output.contains("Shdeps provider ABI (abi:1)"));
     assert_pair(&shell, &native);
+}
+
+#[test]
+fn provider_abi_probe_does_not_evaluate_bash_env() {
+    let home = TempDir::new("doctor-native-provider-bash-env-home").expect("home");
+    let state = TempDir::new("doctor-native-provider-bash-env-state").expect("state");
+    let (root, managed) = latest_provider(&home);
+    let poison = home.path().join("bash-env");
+    let marker = home.path().join("bash-env-ran");
+    std::fs::write(&poison, format!("printf poison >'{}'\n", marker.display()))
+        .expect("BASH_ENV poison");
+
+    let native = command(
+        false,
+        &home,
+        &state,
+        &[
+            ("SHDEPS_LIB", ""),
+            ("SHDEPS_GIT_DEV_DIR", root.to_str().expect("provider root")),
+            ("SHDEPS_DIR", managed.to_str().expect("managed root")),
+            ("BASH_ENV", poison.to_str().expect("BASH_ENV path")),
+            // This test isolates the provider ABI boundary. A developer PATH
+            // may contain Bash-script wrappers for Git, which are separate
+            // caller-selected processes and would also evaluate BASH_ENV.
+            ("PATH", "/usr/bin:/bin"),
+        ],
+    )
+    .output()
+    .expect("native doctor");
+
+    assert!(
+        String::from_utf8_lossy(&native.stdout).contains("Shdeps provider ABI (abi:1)"),
+        "doctor stdout: {}",
+        String::from_utf8_lossy(&native.stdout)
+    );
+    assert!(
+        !marker.exists(),
+        "doctor provider ABI probe evaluated BASH_ENV"
+    );
 }
 
 #[test]

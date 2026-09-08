@@ -1,9 +1,7 @@
 //! Runtime-owned launcher for the versioned extension worker.
 
-use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11,21 +9,6 @@ use std::time::Duration;
 
 use crate::app::Runtime;
 use crate::profile_lifecycle::{WorkerOutcome, WorkerRun};
-
-/// The shell-control variables that must not affect a noninteractive worker
-/// before its versioned protocol has established its own baseline. This is
-/// the narrow control-plane scrub in `extension-worker-launch.sh`; ordinary
-/// runtime variables intentionally remain available to client hooks.
-const STARTUP_CONTROLS: [&str; 8] = [
-    "BASH_ENV",
-    "ENV",
-    "CDPATH",
-    "GLOBIGNORE",
-    "BASH_COMPAT",
-    "POSIXLY_CORRECT",
-    "BASH_XTRACEFD",
-    "BASHOPTS",
-];
 
 /// Executes lifecycle hooks through the one versioned shell worker.
 ///
@@ -59,6 +42,11 @@ pub(crate) struct PreSyncOutcome {
     pub(crate) rc: i32,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
+}
+
+enum CommandFailure {
+    Invalid,
+    Bash(crate::bash::Error),
 }
 
 impl Worker {
@@ -102,19 +90,19 @@ impl Worker {
     /// Run the native pre-sync coordinator's one-use call through the same
     /// sanitized launcher used for lifecycle retirement.
     pub(crate) fn pre_sync(&mut self, call: &crate::pre_sync::Call) -> PreSyncOutcome {
-        let Some(mut command) = self.command(
+        let mut command = match self.command(
             "pre-sync",
             &call.script,
             &call.temporary,
             &call.result,
             &call.context,
             &call.token,
-        ) else {
-            return PreSyncOutcome {
-                rc: 1,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            };
+        ) {
+            Ok(command) => command,
+            Err(CommandFailure::Invalid) => return failed_pre_sync(Vec::new()),
+            Err(CommandFailure::Bash(error)) => {
+                return failed_pre_sync(self.runtime.bash_error_line_once(&error));
+            }
         };
         separate(&mut command, &call.temporary)
     }
@@ -153,24 +141,29 @@ impl Worker {
         result_file: &Path,
         context: &Path,
         token: &str,
-    ) -> Option<Command> {
+    ) -> Result<Command, CommandFailure> {
         let source_root = self.runtime.source_root();
-        let source_root_text = source_root.to_str()?;
-        let result_text = result_file.to_str()?;
+        let source_root_text = source_root.to_str().ok_or(CommandFailure::Invalid)?;
+        let result_text = result_file.to_str().ok_or(CommandFailure::Invalid)?;
         if crate::extension_worker::main_precheck(5, mode, source_root_text, result_text).is_err()
             || (mode == "deactivate"
                 && !crate::extension_worker::deactivate_set_valid("retiring", 1))
         {
-            return None;
+            return Err(CommandFailure::Invalid);
         }
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
-            .and_then(|span| i64::try_from(span.as_secs()).ok())?;
-        let euid = crate::temp::current_uid()?;
-        let home = self.runtime.home().to_str()?;
-        let decoded =
-            crate::overlay_context::consume(context, token, mode, home, euid, now_secs).ok()?;
+            .and_then(|span| i64::try_from(span.as_secs()).ok())
+            .ok_or(CommandFailure::Invalid)?;
+        let euid = crate::temp::current_uid().ok_or(CommandFailure::Invalid)?;
+        let home = self
+            .runtime
+            .home()
+            .to_str()
+            .ok_or(CommandFailure::Invalid)?;
+        let decoded = crate::overlay_context::consume(context, token, mode, home, euid, now_secs)
+            .map_err(|_| CommandFailure::Invalid)?;
         let manifest = self
             .overlay_manifest
             .clone()
@@ -184,9 +177,10 @@ impl Worker {
             retiring_root: String::new(),
         };
         let (retiring_name, retiring_root) = if mode == "deactivate" {
-            let record = decoded.records.first()?;
-            crate::extension_trust::deactivation_validate(record, script.to_str()?, home, euid)
-                .ok()?;
+            let record = decoded.records.first().ok_or(CommandFailure::Invalid)?;
+            let script = script.to_str().ok_or(CommandFailure::Invalid)?;
+            crate::extension_trust::deactivation_validate(record, script, home, euid)
+                .map_err(|_| CommandFailure::Invalid)?;
             let mut fields = record.split('|');
             (
                 fields.next().unwrap_or("").to_string(),
@@ -194,7 +188,7 @@ impl Worker {
             )
         } else {
             if !crate::extension_trust::file_validate(script, &trust, &decoded.records) {
-                return None;
+                return Err(CommandFailure::Invalid);
             }
             (String::new(), String::new())
         };
@@ -205,7 +199,7 @@ impl Worker {
             .create_new(true)
             .mode(0o600)
             .open(&decoded_path)
-            .ok()?;
+            .map_err(|_| CommandFailure::Invalid)?;
         for field in [
             decoded.stage.as_str(),
             decoded.set_kind.as_str(),
@@ -213,23 +207,43 @@ impl Worker {
             retiring_root.as_str(),
             record_count.as_str(),
         ] {
-            decoded_file.write_all(field.as_bytes()).ok()?;
-            decoded_file.write_all(&[0]).ok()?;
+            decoded_file
+                .write_all(field.as_bytes())
+                .map_err(|_| CommandFailure::Invalid)?;
+            decoded_file
+                .write_all(&[0])
+                .map_err(|_| CommandFailure::Invalid)?;
         }
         for record in &decoded.records {
-            decoded_file.write_all(record.as_bytes()).ok()?;
-            decoded_file.write_all(&[0]).ok()?;
+            decoded_file
+                .write_all(record.as_bytes())
+                .map_err(|_| CommandFailure::Invalid)?;
+            decoded_file
+                .write_all(&[0])
+                .map_err(|_| CommandFailure::Invalid)?;
         }
-        decoded_file.flush().ok()?;
+        decoded_file.flush().map_err(|_| CommandFailure::Invalid)?;
         drop(decoded_file);
-        let bash = self.bash.clone().or_else(|| self.runtime.bash())?;
+        let bash = match self.bash.clone() {
+            Some(bash) => bash,
+            None => self
+                .runtime
+                .bash()
+                .map_err(CommandFailure::Bash)?
+                .path()
+                .to_path_buf(),
+        };
         let (cache, data) = (
             xdg_home(&self.runtime, "XDG_CACHE_HOME", ".cache"),
             xdg_home(&self.runtime, "XDG_DATA_HOME", ".local/share"),
         );
-        let (cache, data) = (cache?, data?);
+        let (cache, data) = (
+            cache.ok_or(CommandFailure::Invalid)?,
+            data.ok_or(CommandFailure::Invalid)?,
+        );
         let worker = source_root.join("lib/dot/public/hook-runtime-v1/worker.sh");
         let mut command = Command::new(bash);
+        crate::bash::sanitized_env(&mut command, self.runtime.env());
         command
             .arg("--noprofile")
             .arg("--norc")
@@ -238,8 +252,6 @@ impl Worker {
             .arg(script)
             .arg(result_file)
             .arg(decoded_path)
-            .env_clear()
-            .envs(self.runtime.env())
             .env("HOME", self.runtime.home())
             .env("DOT_SOURCE_ROOT", source_root)
             .env("TMPDIR", result_dir)
@@ -268,16 +280,7 @@ impl Worker {
         if self.verbose {
             command.env("DOT_VERBOSE", "1").env("SHDEPS_LOG_LEVEL", "2");
         }
-        for key in STARTUP_CONTROLS {
-            command.env_remove(key);
-        }
-        command.env_remove("SHELLOPTS");
-        for key in self.runtime.env().keys() {
-            if exported_function(key) {
-                command.env_remove(key);
-            }
-        }
-        Some(command)
+        Ok(command)
     }
 
     fn launch(
@@ -289,12 +292,21 @@ impl Worker {
         context: &Path,
         token: &str,
     ) -> WorkerOutcome {
-        let Some(mut command) = self.command(mode, script, result_dir, result_file, context, token)
-        else {
-            return WorkerOutcome {
-                rc: 1,
-                output: Vec::new(),
-            };
+        let mut command = match self.command(mode, script, result_dir, result_file, context, token)
+        {
+            Ok(command) => command,
+            Err(CommandFailure::Invalid) => {
+                return WorkerOutcome {
+                    rc: 1,
+                    output: Vec::new(),
+                };
+            }
+            Err(CommandFailure::Bash(error)) => {
+                return WorkerOutcome {
+                    rc: 1,
+                    output: self.runtime.bash_error_line_once(&error),
+                };
+            }
         };
         combined(&mut command, result_dir)
     }
@@ -381,13 +393,13 @@ fn stream_file(result_dir: &Path, name: &str) -> std::io::Result<(PathBuf, std::
 fn separate(command: &mut Command, result_dir: &Path) -> PreSyncOutcome {
     let (stdout_path, stdout) = match stream_file(result_dir, "worker-stdout") {
         Ok(capture) => capture,
-        Err(_) => return failed_pre_sync(),
+        Err(_) => return failed_pre_sync(Vec::new()),
     };
     let (stderr_path, stderr) = match stream_file(result_dir, "worker-stderr") {
         Ok(capture) => capture,
         Err(_) => {
             let _ = std::fs::remove_file(stdout_path);
-            return failed_pre_sync();
+            return failed_pre_sync(Vec::new());
         }
     };
     command
@@ -440,20 +452,12 @@ fn wait(command: &mut Command) -> Option<i32> {
     }
 }
 
-fn failed_pre_sync() -> PreSyncOutcome {
+fn failed_pre_sync(stderr: Vec<u8>) -> PreSyncOutcome {
     PreSyncOutcome {
         rc: 1,
         stdout: Vec::new(),
-        stderr: Vec::new(),
+        stderr,
     }
-}
-
-/// True for Bash's serialized exported-function environment keys. They are
-/// evaluated while Bash initializes, before the versioned worker can establish
-/// its own protocol, so the launch boundary must remove every such record.
-fn exported_function(key: &OsStr) -> bool {
-    let bytes = key.as_bytes();
-    bytes.starts_with(b"BASH_FUNC_") && bytes.ends_with(b"%%")
 }
 
 impl WorkerRun for Worker {
@@ -622,6 +626,70 @@ mod tests {
     }
 
     #[test]
+    fn worker_uses_strict_dot_bash_for_probe_and_execution() {
+        let scope = TempDir::new_exec("hook-worker-dot-bash").expect("fixture directory");
+        let home = scope.path().join("home");
+        let state = scope.path().join("state");
+        std::fs::create_dir(&home).expect("home directory");
+        std::fs::create_dir(&state).expect("state directory");
+        let poison = scope.path().join("bash-env");
+        std::fs::write(&poison, b":\n").expect("BASH_ENV");
+        let marker = scope.path().join("bash-invocations");
+        let wrapper = scope.path().join("bash-wrapper");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf x >>'{}'\nexec '{}' \"$@\"\n",
+                marker.display(),
+                dot_test_support::bash().display()
+            ),
+        )
+        .expect("Bash wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("Bash wrapper mode");
+        let record = checkout(&home, b"deactivate() { :; }\n");
+        let mut env = runtime(&home, &state, &poison).env().clone();
+        env.insert(OsString::from("DOT_BASH"), wrapper.as_os_str().to_owned());
+        let runtime = Runtime::from_env(&env, &home).expect("runtime");
+
+        let (rc, out, warnings) = run(&runtime, &home, &record);
+
+        assert_eq!(rc, 0);
+        assert!(out.is_empty());
+        assert!(warnings.is_empty());
+        assert_eq!(std::fs::read(marker).expect("Bash marker"), b"xx");
+    }
+
+    #[test]
+    fn worker_reports_invalid_strict_dot_bash() {
+        let scope = TempDir::new_exec("hook-worker-invalid-dot-bash").expect("fixture directory");
+        let home = scope.path().join("home");
+        let state = scope.path().join("state");
+        std::fs::create_dir(&home).expect("home directory");
+        std::fs::create_dir(&state).expect("state directory");
+        let poison = scope.path().join("bash-env");
+        std::fs::write(&poison, b":\n").expect("BASH_ENV");
+        let missing = scope.path().join("missing/bash");
+        let record = checkout(&home, b"deactivate() { :; }\n");
+        let mut env = runtime(&home, &state, &poison).env().clone();
+        env.insert(OsString::from("DOT_BASH"), missing.as_os_str().to_owned());
+        let runtime = Runtime::from_env(&env, &home).expect("runtime");
+
+        let (rc, out, warnings) = run(&runtime, &home, &record);
+
+        assert_eq!(rc, 1);
+        assert!(out.is_empty());
+        assert_eq!(
+            warnings,
+            format!(
+                "checkout Bash resolver: explicit interpreter is not Bash 4 or newer: {}\n",
+                missing.display()
+            )
+            .into_bytes()
+        );
+    }
+
+    #[test]
     fn worker_relays_hook_failure_without_treating_it_as_success() {
         let scope = TempDir::new("hook-worker-failure").expect("fixture directory");
         let home = scope.path().join("home");
@@ -706,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_requires_the_shell_authorized_absolute_bash() {
+    fn worker_treats_relative_ambient_bash_as_a_soft_hint() {
         let scope = TempDir::new("hook-worker-bash").expect("fixture directory");
         let home = scope.path().join("home");
         let state = scope.path().join("state");
@@ -718,7 +786,9 @@ mod tests {
         env.insert(OsString::from("BASH"), OsString::from("bash"));
         let runtime = Runtime::from_env(&env, &home).expect("runtime");
 
-        assert!(runtime.bash().is_none());
+        let bash = runtime.bash().expect("fallback Bash");
+        assert!(bash.path().is_absolute());
+        assert_ne!(bash.path(), Path::new("bash"));
     }
 
     #[test]
@@ -735,6 +805,6 @@ mod tests {
         let runtime = Runtime::from_env(&env, &home).expect("runtime");
 
         let bash = runtime.bash().expect("PATH bash");
-        assert!(bash.is_absolute());
+        assert!(bash.path().is_absolute());
     }
 }
