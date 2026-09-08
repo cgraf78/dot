@@ -176,7 +176,7 @@ fn header_table_is_literal_and_unknown_operations_are_silent() {
 
 #[test]
 fn fetch_one_prints_exact_headers_and_clamps_fetch_head_for_both_kinds() {
-    let scope = TempDir::new("commands-fetch-one").unwrap();
+    let scope = TempDir::new_exec("commands-fetch-one").unwrap();
     let (base_repo, _) = clone_repo(scope.path(), "base");
     let (overlay_repo, _) = clone_repo(scope.path(), "overlay");
     let model = base(&base_repo);
@@ -217,7 +217,7 @@ fn fetch_one_prints_exact_headers_and_clamps_fetch_head_for_both_kinds() {
 
 #[test]
 fn push_one_distinguishes_hard_base_failure_from_soft_overlay_warning() {
-    let scope = TempDir::new("commands-push-failure").unwrap();
+    let scope = TempDir::new_exec("commands-push-failure").unwrap();
     let repo = scope.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
     git(&repo, &["init", "-q"]);
@@ -262,7 +262,7 @@ fn push_one_distinguishes_hard_base_failure_from_soft_overlay_warning() {
 
 #[test]
 fn diff_one_propagates_exit_code_and_status_one_prints_even_when_quiet() {
-    let scope = TempDir::new("commands-inspect-one").unwrap();
+    let scope = TempDir::new_exec("commands-inspect-one").unwrap();
     let (repo, _) = clone_repo(scope.path(), "base");
     let model = base(&repo);
     bound(scope.path(), || {
@@ -314,7 +314,7 @@ fn diff_one_propagates_exit_code_and_status_one_prints_even_when_quiet() {
 
 #[test]
 fn all_commands_keep_base_then_overlay_order_and_skip_non_git_records() {
-    let scope = TempDir::new("commands-all-order").unwrap();
+    let scope = TempDir::new_exec("commands-all-order").unwrap();
     let (base_repo, _) = clone_repo(scope.path(), "base");
     let (one, _) = clone_repo(scope.path(), "one");
     let (two, _) = clone_repo(scope.path(), "two");
@@ -396,7 +396,7 @@ fn all_commands_keep_base_then_overlay_order_and_skip_non_git_records() {
 
 #[test]
 fn push_all_stops_after_base_failure_before_overlay_side_effects() {
-    let scope = TempDir::new("commands-push-stop").unwrap();
+    let scope = TempDir::new_exec("commands-push-stop").unwrap();
     let base_repo = scope.path().join("base");
     std::fs::create_dir(&base_repo).unwrap();
     git(&base_repo, &["init", "-q"]);
@@ -433,7 +433,7 @@ fn push_all_stops_after_base_failure_before_overlay_side_effects() {
 
 #[test]
 fn missing_base_and_empty_overlay_set_are_successful_noops() {
-    let scope = TempDir::new("commands-missing").unwrap();
+    let scope = TempDir::new_exec("commands-missing").unwrap();
     let model = Base {
         topology: Topology::Missing,
         client_git_dir: String::new(),
@@ -489,7 +489,7 @@ fn missing_base_and_empty_overlay_set_are_successful_noops() {
 
 #[test]
 fn extra_arguments_cross_as_distinct_git_words() {
-    let scope = TempDir::new("commands-extra-argv").unwrap();
+    let scope = TempDir::new_exec("commands-extra-argv").unwrap();
     let (repo, _) = clone_repo(scope.path(), "base");
     let model = base(&repo);
     bound(scope.path(), || {
