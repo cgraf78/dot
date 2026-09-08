@@ -44,6 +44,14 @@ pub fn hook_source(hooks_root: &Path, name: &OsStr) -> PathBuf {
     hooks_root.join(name)
 }
 
+/// `_merge_hook_family`: resolve a merge-hook source family
+/// directory by joining the family name to the hooks root. Same
+/// join as [`hook_source`]; the shell keeps a separate name so
+/// hook authors read family roots distinctly from single sources.
+pub fn family(hooks_root: &Path, name: &OsStr) -> PathBuf {
+    hook_source(hooks_root, name)
+}
+
 /// `_merge_hook_family_files`: ordered source stream for a family.
 pub fn family_files(family_dir: &Path) -> Result<Vec<PathBuf>, families::Error> {
     families::family_files(Some(family_dir), &[])
