@@ -59,16 +59,10 @@
 //! binary was probed), so each closure probes fresh instead of
 //! sharing one through the call tree.
 //!
-//! Converge boundary: the update-engine convergence
-//! (`_dot_client_select`, `dot_config_load`, `_ui_begin`,
-//! `_dot_update_sync_repos`, `_dot_update_finalize`) still executes
-//! in shell until its lanes land, so it crosses as the
-//! [`Production::new`] `on_converge` closure. Every other step runs
-//! the real ports. A converge refusal surfaces [`CONVERGE_PENDING`]
-//! (fail closed, never silent); [`Production::converge_used`]
-//! reports whether the run reached it, so callers can name the
-//! boundary even where an intermediate mapper would swallow the
-//! message.
+//! Convergence crosses as the [`Production::new`] `on_converge`
+//! application-service closure. Production binds the native update
+//! engine directly, while focused tests can inject a deterministic
+//! verdict without recursively invoking the CLI.
 //!
 //! Byte-fidelity boundary: `$HOME/...` joins concatenate bytes like
 //! the shell, preserving a doubled separator on trailing-slash
@@ -90,7 +84,7 @@
 //! diagnostics), and [`Production::run_fresh`] renders the fresh
 //! tail's own diagnostic sites directly.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
@@ -117,11 +111,6 @@ use crate::init_client_transaction as transaction;
 use crate::repos_base::Topology;
 use crate::temp;
 use crate::{reserved, xdg};
-
-/// Fail-closed diagnostic when a run reaches the not-yet-ported
-/// update-engine convergence: `dot init: {message}`, exit `1`,
-/// like every other engine diagnostic.
-pub const CONVERGE_PENDING: &str = "initialization converge is not yet implemented";
 
 /// The shell's fixed resume-failure text
 /// (`_dot_init_error 'initialization transaction could not be
@@ -175,10 +164,6 @@ pub struct Production<'a> {
     /// the `set_git_identity` adapters during staging, read by the
     /// record rewrites.
     git_identity: RefCell<(String, String)>,
-    /// Whether the run invoked `on_converge` (set before the call,
-    /// so callers observe it even when a mapper swallows the
-    /// refusal).
-    converge_used: Cell<bool>,
     /// Update-engine convergence (see the module docs).
     on_converge: &'a dyn Fn() -> Result<()>,
 }
@@ -197,21 +182,12 @@ impl<'a> Production<'a> {
             skip_provider: ctx.skip_provider,
             cwd: ctx.cwd,
             git_identity: RefCell::new((String::from("-"), String::from("-"))),
-            converge_used: Cell::new(false),
             on_converge,
         }
     }
 
-    /// Whether the run reached the convergence boundary (see the
-    /// module docs). Sticky: once set, later steps never clear it.
-    pub fn converge_used(&self) -> bool {
-        self.converge_used.get()
-    }
-
-    /// Run the update-engine convergence through the injected
-    /// closure, recording the boundary first.
+    /// Run update convergence through the injected application service.
     fn converge(&self) -> Result<()> {
-        self.converge_used.set(true);
         (self.on_converge)()
     }
 
@@ -401,9 +377,8 @@ impl<'a> Production<'a> {
     /// `_dot_init_resume_transaction` with every cross-lane step
     /// bound to its ported owner (see the module docs for the lane
     /// map). The shell prints its fixed resume text for every
-    /// failure here, so every error maps onto it — except the
-    /// convergence boundary, which stays loud (see
-    /// [`CONVERGE_PENDING`]).
+    /// failure here, so every error maps onto it. Convergence keeps
+    /// its own output in the application-service stream buffers.
     pub fn resume(
         &self,
         transaction: &Path,
@@ -651,9 +626,6 @@ impl<'a> Production<'a> {
         };
         match resume::resume_transaction(&inputs, &deps) {
             Ok(()) => Ok(()),
-            Err(Error::Usage { message }) if message == CONVERGE_PENDING => Err(Error::Usage {
-                message: CONVERGE_PENDING,
-            }),
             Err(_) => Err(Error::Usage {
                 message: RESUME_FAILED,
             }),
@@ -1284,8 +1256,8 @@ impl<'a> Production<'a> {
     /// resume. Reports carry the shell's streams: the plan and
     /// confirmation print to stderr as they run (so failures after
     /// them keep the printed bytes), while stdout stays empty —
-    /// only the convergence step prints there, and it stays behind
-    /// [`CONVERGE_PENDING`] until its lanes land.
+    /// only the convergence step prints there, through the caller's
+    /// application-service stream buffers.
     pub fn run_fresh(&self, inputs: &FreshInputs) -> InitReport {
         let transaction = match transaction::transaction_dir(self.home_text, self.xdg_state_home) {
             Ok(directory) => PathBuf::from(directory),
@@ -1363,7 +1335,7 @@ impl<'a> Production<'a> {
                 }
                 return match self.converge() {
                     Ok(()) => silent(0),
-                    Err(_) => diagnostic(CONVERGE_PENDING.as_bytes()),
+                    Err(_) => silent(1),
                 };
             }
         }
@@ -1376,9 +1348,6 @@ impl<'a> Production<'a> {
                 );
             }
             AdoptOutcome::Failed => {
-                if self.converge_used() {
-                    return diagnostic(CONVERGE_PENDING.as_bytes());
-                }
                 return silent(1);
             }
         }
@@ -1608,16 +1577,6 @@ impl<'a> Production<'a> {
                 stderr: out_stderr,
                 code: 0,
             },
-            Err(Error::Usage { message }) if message == CONVERGE_PENDING => {
-                out_stderr.extend_from_slice(b"dot init: ");
-                out_stderr.extend_from_slice(CONVERGE_PENDING.as_bytes());
-                out_stderr.push(b'\n');
-                InitReport {
-                    stdout: out_stdout,
-                    stderr: out_stderr,
-                    code: 1,
-                }
-            }
             Err(_) => carried(out_stderr),
         }
     }

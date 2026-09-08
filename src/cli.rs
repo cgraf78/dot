@@ -204,9 +204,8 @@ pub enum Command {
     /// (`bin/dot`, `lib/dot/main.sh`), so a failing kernel exits the
     /// process with its own code before the dispatcher resumes —
     /// `dot init --bogus` exits `1`, pinned against `bin/dot`.
-    /// [`run`] therefore reports the kernel's code directly. Lock
-    /// acquisition still arrives with its slice: until then every
-    /// `init` proceeds without locking, like every other arm here.
+    /// [`run`] therefore reports the kernel's code directly. Native
+    /// initialization holds one operation lock through convergence.
     Init,
     /// Anything else: `dot: unknown command: %s` on stderr, `1`.
     Unknown,
@@ -564,9 +563,9 @@ fn run_cron(stdout: &mut dyn Write, failed: &mut bool) -> i32 {
 /// network default-branch probe binds its ported helper with a
 /// `TMPDIR` scratch, and the resume, rollback, and fresh-tail steps
 /// bind the production wiring
-/// ([`init_client_engine::Production`]). Only the update-engine
-/// convergence stays behind its fail-closed boundary (see
-/// [`init_client_engine::CONVERGE_PENDING`]) until its lanes land.
+/// ([`init_client_engine::Production`]). Convergence calls the native
+/// update application service directly while the init operation lock
+/// remains held; it never recursively invokes the CLI.
 /// The arm reports the kernel's own code, matching the production
 /// process under `set -euo pipefail` (pinned against `bin/dot`;
 /// see the [`Command::Init`] contract).
@@ -606,10 +605,51 @@ fn run_init(
     let cwd = runtime.cwd();
     let remote_default_branch =
         |url: &str| -> Option<String> { identity::remote_default_branch(url, &scratch) };
-    let converge_pending = || -> Result<(), Error> {
-        Err(Error::Usage {
-            message: init_client_engine::CONVERGE_PENDING,
-        })
+    let log = crate::log::Log::new(false, false);
+    let guard = if init_acquires_lock(args.first().map(Vec::as_slice)) {
+        match crate::update_lock::acquire(runtime.state_home(), false, &log, None, stderr) {
+            Ok(guard) => Some(guard),
+            Err(Error::LockBusy { .. }) => return crate::update_lock::EXIT_LOCK_BUSY,
+            Err(_) => return EXIT_ERROR,
+        }
+    } else {
+        None
+    };
+    let mut update_env = runtime.env().clone();
+    if let Some(guard) = &guard {
+        update_env.insert(
+            OsString::from("DOT_UPDATE_LOCK_TOKEN"),
+            OsString::from(guard.token()),
+        );
+    }
+    let converge_stdout = std::cell::RefCell::new(Vec::new());
+    let converge_stderr = std::cell::RefCell::new(Vec::new());
+    let converge_called = std::cell::Cell::new(false);
+    let resume_converge_failed = std::cell::Cell::new(false);
+    let converge = || -> Result<(), Error> {
+        converge_called.set(true);
+        let mut out = converge_stdout.borrow_mut();
+        let mut err = converge_stderr.borrow_mut();
+        let config = init_config(runtime, &mut *err)?;
+        let mut streams = crate::app::Streams::new(&mut *out, &mut *err);
+        let code = crate::update_engine::run_update(
+            runtime,
+            &crate::update_engine::UpdateRequest {
+                config: &config,
+                env: &update_env,
+                args: &[],
+                state_home: runtime.state_home(),
+            },
+            &mut streams,
+        );
+        if code == EXIT_SUCCESS {
+            Ok(())
+        } else {
+            Err(Error::Command {
+                command: "native init convergence".to_string(),
+                status: Some(format!("exit status: {code}")),
+            })
+        }
     };
     let production = init_client_engine::Production::new(
         init_client_engine::EngineCtx {
@@ -619,12 +659,16 @@ fn run_init(
             skip_provider: skip_provider_flag,
             cwd,
         },
-        &converge_pending,
+        &converge,
     );
-    let resume = |transaction: &Path,
-                  record: &Path,
-                  journal: &TransactionRecord|
-     -> Result<(), Error> { production.resume(transaction, record, journal) };
+    let resume =
+        |transaction: &Path, record: &Path, journal: &TransactionRecord| -> Result<(), Error> {
+            let result = production.resume(transaction, record, journal);
+            if result.is_err() && converge_called.get() {
+                resume_converge_failed.set(true);
+            }
+            result
+        };
     let rollback = |at: &Path| -> Result<(), Error> { production.rollback(at) };
     let fresh = |inputs: &init_client_command::FreshInputs| -> init_client_command::InitReport {
         production.run_fresh(inputs)
@@ -642,13 +686,61 @@ fn run_init(
         fresh: &fresh,
     };
     let report = init_client_command::run(&env, &engine, args);
-    if stdout.write_all(&report.stdout).is_err() {
+    if write_init_output(
+        stdout,
+        stderr,
+        &report,
+        &converge_stdout.into_inner(),
+        &converge_stderr.into_inner(),
+        resume_converge_failed.get(),
+    )
+    .is_err()
+    {
         *failed = true;
     }
-    if stderr.write_all(&report.stderr).is_err() {
-        *failed = true;
+    if let Some(guard) = guard {
+        guard.release(&log, stderr);
     }
     report.code
+}
+
+/// Reload configuration after init publishes the candidate worktree. The
+/// Runtime freezes environment, not files, so this sees configuration cloned
+/// after process startup just like `dot_config_load` in the shell path.
+fn init_config(
+    runtime: &crate::app::Runtime,
+    stderr: &mut dyn Write,
+) -> Result<crate::config::Config, Error> {
+    crate::startup::check(runtime).map_err(|failure| {
+        let _ = stderr.write_all(failure.line().as_bytes());
+        let _ = stderr.write_all(b"\n");
+        Error::Command {
+            command: "native init configuration reload".to_string(),
+            status: Some(format!("exit status: {}", failure.code())),
+        }
+    })
+}
+
+/// Emit init and convergence streams in execution order. A resumed
+/// transaction prints the update failure before its wrapper diagnostic;
+/// fresh and completed paths contain only pre-convergence init output.
+fn write_init_output(
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    report: &init_client_command::InitReport,
+    converge_stdout: &[u8],
+    converge_stderr: &[u8],
+    resume_converge_failed: bool,
+) -> std::io::Result<()> {
+    stdout.write_all(&report.stdout)?;
+    stdout.write_all(converge_stdout)?;
+    if resume_converge_failed {
+        stderr.write_all(converge_stderr)?;
+        stderr.write_all(&report.stderr)
+    } else {
+        stderr.write_all(&report.stderr)?;
+        stderr.write_all(converge_stderr)
+    }
 }
 
 /// Base topology for the repo arms, read off the `model.sh`
@@ -810,12 +902,42 @@ fn run_repos(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn run_text(args: &[&str]) -> (i32, String, String) {
         let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run(owned, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8(out).expect("stdout is UTF-8"),
+            String::from_utf8(err).expect("stderr is UTF-8"),
+        )
+    }
+
+    fn run_init_text(args: &[&str]) -> (i32, String, String) {
+        let home = crate::test_support::TempDir::new("cli-unit-init-home").expect("home");
+        let state = crate::test_support::TempDir::new("cli-unit-init-state").expect("state");
+        let env = BTreeMap::from([
+            (
+                OsString::from("HOME"),
+                home.path().as_os_str().to_os_string(),
+            ),
+            (
+                OsString::from("XDG_STATE_HOME"),
+                state.path().as_os_str().to_os_string(),
+            ),
+            (
+                OsString::from("DOT_SOURCE_ROOT"),
+                OsString::from(env!("CARGO_MANIFEST_DIR")),
+            ),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, home.path()).expect("runtime");
+        let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_runtime(&runtime, &owned, &mut out, &mut err);
         (
             code,
             String::from_utf8(out).expect("stdout is UTF-8"),
@@ -1076,7 +1198,7 @@ mod tests {
         // inside `_dot_init_error` (pinned against `bin/dot`), and
         // so does this arm — never the dispatcher's ignore-status
         // default, never the interim text.
-        let (code, out, err) = run_text(&["init", "--bogus"]);
+        let (code, out, err) = run_init_text(&["init", "--bogus"]);
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert_eq!(err, "dot init: unknown option: --bogus\n");
@@ -1087,10 +1209,64 @@ mod tests {
         // Past parsing, the first resolvable failure also crosses
         // with its code (identity here; the fresh tail stays
         // interim).
-        let (code, out, err) = run_text(&["init", "--branch", "main", "notaurl"]);
+        let (code, out, err) = run_init_text(&["init", "--branch", "main", "notaurl"]);
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert_eq!(err, "dot init: unsupported repository URL: notaurl\n");
+    }
+
+    #[test]
+    fn resume_convergence_failure_preserves_stderr_execution_order() {
+        let report = init_client_command::InitReport {
+            stdout: Vec::new(),
+            stderr: b"dot init: initialization transaction could not be resumed safely\n".to_vec(),
+            code: 1,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        write_init_output(
+            &mut out,
+            &mut err,
+            &report,
+            b"update stdout\n",
+            b"update failed\n",
+            true,
+        )
+        .expect("write ordered streams");
+        assert_eq!(out, b"update stdout\n");
+        assert_eq!(
+            err,
+            b"update failed\ndot init: initialization transaction could not be resumed safely\n"
+        );
+    }
+
+    #[test]
+    fn init_convergence_reloads_config_created_after_runtime_capture() {
+        let home = crate::test_support::TempDir::new("cli-init-config-home").expect("home");
+        let state = crate::test_support::TempDir::new("cli-init-config-state").expect("state");
+        let env = BTreeMap::from([
+            (
+                OsString::from("HOME"),
+                home.path().as_os_str().to_os_string(),
+            ),
+            (
+                OsString::from("XDG_STATE_HOME"),
+                state.path().as_os_str().to_os_string(),
+            ),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, home.path()).expect("runtime");
+        let config_dir = home.path().join(".config/dot");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::write(
+            config_dir.join("config"),
+            b"version=1\ndependency_provider=shdeps\n",
+        )
+        .expect("post-capture config");
+
+        let mut err = Vec::new();
+        let config = init_config(&runtime, &mut err).expect("reload cloned config");
+        assert_eq!(config.provider, crate::config::Provider::Shdeps);
+        assert!(err.is_empty());
     }
 
     #[cfg(unix)]
