@@ -8,7 +8,9 @@ pub struct Fixture {
     pub scope: dot_test_support::TempDir,
     pub home: PathBuf,
     pub suites: PathBuf,
+    #[allow(dead_code)] // Only provider-selection cases inspect this shared fixture field.
     pub root: PathBuf,
+    binary: PathBuf,
 }
 
 impl Fixture {
@@ -21,11 +23,15 @@ impl Fixture {
             fs::create_dir_all(path).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
+        let binary =
+            dot_test_support::owned_dot_binary(&root, Path::new(env!("CARGO_BIN_EXE_dot")))
+                .unwrap();
         Self {
             scope,
             home,
             suites,
             root,
+            binary,
         }
     }
 
@@ -34,7 +40,7 @@ impl Fixture {
     }
 
     pub fn command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_dot"));
+        let mut cmd = Command::new(&self.binary);
         cmd.arg("test")
             .args(args)
             .env_clear()
@@ -44,7 +50,7 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_STATE_HOME", self.home.join(".local/state"))
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
-            .env("DOT_SOURCE_ROOT", &self.root)
+            .env("DOT_SOURCE_ROOT", self.home.join("untrusted-source-root"))
             .env("DOT_TEST_TESTS_DIR", &self.suites)
             .env("DOT_TEST_NO_COLOR", "1")
             .env("DOT_BASH", dot_test_support::bash())

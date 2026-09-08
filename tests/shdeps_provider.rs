@@ -55,6 +55,7 @@ fn fixture_command(name: &str) -> Option<PathBuf> {
 struct Fixture {
     _scratch: TempDir,
     root: PathBuf,
+    binary: PathBuf,
     home: PathBuf,
     state: PathBuf,
     provider: PathBuf,
@@ -62,12 +63,15 @@ struct Fixture {
 
 impl Fixture {
     fn new(tag: &str) -> Self {
-        let scratch = TempDir::new(tag).expect("scratch");
+        let scratch = TempDir::new_exec(tag).expect("scratch");
         let root = scratch.path().join("dot-source");
         let home = scratch.path().join("home");
         let state = scratch.path().join("state");
         let provider = scratch.path().join("provider");
         std::fs::create_dir_all(root.join("support")).expect("support");
+        let binary =
+            dot_test_support::owned_dot_binary(&root, Path::new(env!("CARGO_BIN_EXE_dot")))
+                .expect("fixture-owned binary");
         std::fs::create_dir_all(home.join(".config/dot")).expect("config");
         std::fs::create_dir_all(&state).expect("state");
         std::fs::create_dir_all(&provider).expect("provider");
@@ -193,6 +197,7 @@ esac
         Self {
             _scratch: scratch,
             root,
+            binary,
             home,
             state,
             provider,
@@ -200,7 +205,7 @@ esac
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_dot"));
+        let mut command = Command::new(&self.binary);
         let path = std::env::var_os("PATH").unwrap_or_default();
         command
             .arg("update")
@@ -210,7 +215,7 @@ esac
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", "")
             .env("XDG_STATE_HOME", &self.state)
-            .env("DOT_SOURCE_ROOT", &self.root)
+            .env("DOT_SOURCE_ROOT", self.home.join("untrusted-source-root"))
             .env("DOT_DEPENDENCY_PROVIDER", "shdeps")
             .env("DOT_SHDEPS_UPDATE_POLICY", "pinned")
             .env("DOT_UPDATE_JOBS", "2")
