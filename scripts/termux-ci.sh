@@ -91,6 +91,7 @@ cleanup_signal_test() {
 }
 trap cleanup_signal_test EXIT
 mkdir -p "$signal_home" "$signal_state" "$signal_suites"
+chmod 0700 "$signal_home" "$signal_state" "$signal_suites"
 cat >"$signal_suites/quit-test" <<EOF
 #!$PREFIX/bin/bash
 trap '' HUP INT QUIT TERM

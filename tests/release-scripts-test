@@ -131,6 +131,11 @@ case ${1:-} in
     exit 1
     ;;
   test)
+    mode=$(LC_ALL=C ls -ld "$DOT_TEST_TESTS_DIR")
+    [[ ${mode:0:10} == drwx------ ]] || {
+      printf '%s\n' 'synthetic runner rejected unsafe suite permissions' >&2
+      exit 24
+    }
     printf '%s\n' 'synthetic runner preflight failure' >&2
     exit 23
     ;;
@@ -146,6 +151,7 @@ termux_status=0
 set +e
 termux_output=$(
   cd "$termux_failure"
+  umask 002
   PREFIX=/usr TMPDIR=$termux_failure/tmp \
     "$BASH" "$DOT_TEST_ROOT/scripts/termux-ci.sh" 2>&1
 )
