@@ -31,6 +31,8 @@ rust_job=$(sed -n '/^  rust:/,/^  shell:/p' "$workflow")
 shell_job=$(sed -n '/^  shell:/,/^  shdeps-lock:/p' "$workflow")
 grep -Fq 'bash tests/run' <<<"$rust_job" ||
   fail 'Rust platform CI must run the native-backed shell acceptance suite'
+grep -Fq 'termux-profiles: base' <<<"$rust_job" ||
+  fail 'Rust Termux lifecycle smoke must install the Git-backed base profile'
 if grep -Fq 'bash tests/run' <<<"$shell_job"; then
   fail 'shell-only CI cannot run the native-backed acceptance suite without a build'
 fi

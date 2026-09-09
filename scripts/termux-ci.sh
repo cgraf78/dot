@@ -55,6 +55,7 @@ signal_home=$signal_root/home
 signal_state=$signal_root/state
 signal_suites=$signal_root/suites
 signal_pid_file=$signal_root/suite.pid
+signal_output=$signal_root/runner.out
 runner_pid=''
 suite_pid=''
 watchdog_pid=''
@@ -99,14 +100,24 @@ EOF
 chmod 0755 "$signal_suites/quit-test"
 HOME=$signal_home XDG_STATE_HOME=$signal_state DOT_BASH=$PREFIX/bin/bash \
   DOT_TEST_TESTS_DIR=$signal_suites DOT_TEST_SIGNAL_PID_FILE=$signal_pid_file \
-  DOT_TEST_NO_COLOR=1 "$absolute_binary" test -s >/dev/null 2>&1 &
+  DOT_TEST_NO_COLOR=1 "$absolute_binary" test -s >"$signal_output" 2>&1 &
 runner_pid=$!
 deadline=$((SECONDS + 15))
 while [[ ! -s $signal_pid_file && $SECONDS -lt $deadline ]]; do
+  if ! jobs -pr | grep -Fxq "$runner_pid"; then
+    signal_status=0
+    wait "$runner_pid" || signal_status=$?
+    runner_pid=''
+    printf 'termux-ci: signal fixture exited before start (status %s)\n' \
+      "$signal_status" >&2
+    cat "$signal_output" >&2
+    exit 1
+  fi
   sleep 0.05
 done
 if [[ ! -s $signal_pid_file ]]; then
   printf 'termux-ci: signal fixture did not start\n' >&2
+  cat "$signal_output" >&2
   exit 1
 fi
 suite_pid=$(<"$signal_pid_file")
