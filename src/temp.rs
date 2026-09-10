@@ -53,14 +53,25 @@ fn has_control_char(path: &Path) -> bool {
 /// (`create_new`) with a retry loop, so a guessed name can neither be
 /// squatted nor followed — the same guarantee `mktemp` gives the shell.
 pub fn sibling_tmp_for(dst: &Path) -> Result<PathBuf> {
+    sibling_tmp_for_impl(dst, true)
+}
+
+/// Create a sibling temporary file without creating its parent directory.
+pub(crate) fn sibling_tmp_for_existing_parent(dst: &Path) -> Result<PathBuf> {
+    sibling_tmp_for_impl(dst, false)
+}
+
+fn sibling_tmp_for_impl(dst: &Path, create_parent: bool) -> Result<PathBuf> {
     let dir = dst.parent().unwrap_or_else(|| Path::new("/"));
     let base = dst.file_name().ok_or(Error::Usage {
         message: "destination has no file name",
     })?;
-    std::fs::create_dir_all(dir).map_err(|source| Error::Io {
-        context: "create sibling temp parent",
-        source,
-    })?;
+    if create_parent {
+        std::fs::create_dir_all(dir).map_err(|source| Error::Io {
+            context: "create sibling temp parent",
+            source,
+        })?;
+    }
     let mut prefix = base.to_os_string();
     prefix.push(".tmp.");
     for _ in 0..TMP_RETRIES {

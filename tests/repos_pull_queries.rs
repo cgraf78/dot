@@ -444,6 +444,29 @@ fn candidate_adapter_allowed_matches_shell() {
         );
         assert!(warnings.is_empty(), "adapter warnings: {warnings:?}");
     }
+
+    // `git show` is deliberately quiet in the shell adapter gate. A missing
+    // object must reject without leaking Git's fatal diagnostic ahead of the
+    // caller's policy warning.
+    let snippet = format!(
+        "if _repo_candidate_adapter_allowed no-such-ref .local/bin/dot 100755 git -C {repo_text}; then echo yes; else echo no; fi\n"
+    );
+    let (status, out, shell_warnings) = shell_validate(&fixture.home, &snippet);
+    assert_eq!(status, 0, "harness exit for missing adapter object");
+    assert_eq!(out, b"no\n", "shell rejects missing adapter object");
+    let mut warnings = Vec::new();
+    assert!(
+        !candidate_adapter_allowed(
+            &prefix,
+            "no-such-ref",
+            ".local/bin/dot",
+            "100755",
+            &fixture.env,
+            &mut warnings,
+        ),
+        "rust rejects missing adapter object"
+    );
+    assert_eq!(warnings, shell_warnings, "missing-object warning parity");
 }
 
 #[test]
