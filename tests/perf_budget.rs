@@ -1,102 +1,214 @@
-//! Performance budgets for the `dot` Rust port.
+//! Deterministic tests for the release performance-gate policy.
 //!
-//! CLI-level wall-clock budgets including process startup, following the
-//! `hive-memory` `tests/perf_budget.rs` pattern: the user pays startup on
-//! every invocation, so an in-process microbenchmark would miss the
-//! latency that matters. p95 over repeated runs; heavy update-level
-//! budgets (slice 2+) are `#[ignore]`-gated and run explicitly in CI.
-//!
-//! Gate jobs run these with `DOT_PERF_BUDGET_MULTIPLIER=1`. The
-//! multiplier exists for slow developer hosts only.
+//! Wall-clock measurement is intentionally absent from the ordinary debug test
+//! matrix. The ignored end-to-end gate in `perf_update.rs` runs through
+//! `scripts/benchmark-port.sh`, which forces Cargo's release profile.
 
-use std::process::Command;
-use std::time::{Duration, Instant};
+#[path = "support/perf_policy.rs"]
+mod perf_policy;
 
-/// Slice-1 startup budgets (reference host p95, ms).
-const HELP_WARM_BUDGET_MS: u128 = if cfg!(target_os = "macos") { 30 } else { 25 };
-const VERSION_WARM_BUDGET_MS: u128 = 30;
-const RUNS: usize = 30;
-const PERF_BUDGET_MULTIPLIER_ENV: &str = "DOT_PERF_BUDGET_MULTIPLIER";
+use perf_policy::{
+    BASE_UPDATE_P95_NS, CLEAN_UPDATE_P95_NS, DIRTY_UPDATE_P95_NS, EngineKind, FAILURE_P95_NS,
+    FEATURE_UPDATE_P95_NS, FIRST_SPAWN_NS, HELP_P95_NS, HISTORICAL_CLEAN_UPDATE_P95_NS,
+    HISTORICAL_DIRTY_UPDATE_P95_NS, HISTORICAL_HELP_MEAN_NS, HISTORICAL_VERSION_MEAN_NS,
+    MAX_RUST_PERCENT, REQUIRED_WORKLOADS, RUNS, STARTUP_CI_HEADROOM_PERCENT,
+    STARTUP_PREFLIGHT_PAIRS, STARTUP_WARMUPS, UPDATE_CI_HEADROOM_PERCENT, UPDATE_WARMUPS,
+    VERSION_P95_NS, WORKLOAD_POLICIES, Workload, budget_headroom_percent, meets_relative_gate,
+    pair_order, ratio_percent_ceil, shell_baseline_sha, startup_warmup_schedule, summarize,
+};
 
-fn budget_ms(base: u128) -> u128 {
-    // An unset or malformed multiplier means "no scaling" (1.0), not an
-    // error: failing loudly here would turn an unrelated env typo into a
-    // perf failure, hiding the real signal. Gate jobs pin the value to 1.
-    let multiplier: f64 = std::env::var(PERF_BUDGET_MULTIPLIER_ENV)
-        .ok()
-        .and_then(|raw| raw.parse().ok())
-        .filter(|parsed: &f64| parsed.is_finite() && *parsed > 0.0)
-        .unwrap_or(1.0);
-    ((base as f64) * multiplier) as u128
+#[test]
+fn performance_policy_pins_reachable_shell_baseline() {
+    assert_eq!(
+        shell_baseline_sha(),
+        "c3477fac9474d4b5f8ca038a3fc83cd1be5b2571"
+    );
+    assert_eq!(shell_baseline_sha().len(), 40);
+    assert!(
+        shell_baseline_sha()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
 }
 
-fn repeat(n: usize, mut op: impl FnMut() -> Duration) -> Vec<u128> {
-    let mut samples = Vec::with_capacity(n);
-    for _ in 0..n {
-        samples.push(op().as_millis());
+#[test]
+fn performance_policy_uses_meaningful_samples_after_warmup() {
+    assert!(std::hint::black_box(RUNS) >= 30);
+    assert!(std::hint::black_box(STARTUP_WARMUPS) > 0);
+    assert!(std::hint::black_box(UPDATE_WARMUPS) > 0);
+}
+
+#[test]
+fn paired_order_is_exactly_balanced() {
+    let shell_first = (0..RUNS)
+        .filter(|iteration| pair_order(*iteration)[0] == EngineKind::Shell)
+        .count();
+    let rust_first = RUNS - shell_first;
+
+    assert_eq!(shell_first, RUNS / 2);
+    assert_eq!(rust_first, RUNS / 2);
+    assert_eq!(EngineKind::Shell.label(), "shell");
+    assert_eq!(EngineKind::Rust.label(), "rust");
+}
+
+#[test]
+fn startup_preflight_and_remaining_warmups_match_the_declared_schedule() {
+    assert_eq!(STARTUP_PREFLIGHT_PAIRS, 1);
+    for workload in [Workload::Help, Workload::Version] {
+        let schedule = startup_warmup_schedule(workload);
+        assert_eq!(schedule.len(), STARTUP_WARMUPS);
+        assert_eq!(schedule.len(), workload.policy().warmups_per_engine);
+        assert_eq!(schedule[0], [EngineKind::Shell, EngineKind::Rust]);
+        assert_eq!(
+            schedule.iter().skip(STARTUP_PREFLIGHT_PAIRS).count(),
+            STARTUP_WARMUPS - STARTUP_PREFLIGHT_PAIRS
+        );
+        assert!(
+            schedule
+                .iter()
+                .all(|order| *order == [EngineKind::Shell, EngineKind::Rust])
+        );
+        for kind in [EngineKind::Shell, EngineKind::Rust] {
+            assert_eq!(
+                schedule
+                    .iter()
+                    .flatten()
+                    .filter(|entry| **entry == kind)
+                    .count(),
+                STARTUP_WARMUPS
+            );
+        }
     }
-    samples
-}
-
-fn p95_ms(mut samples: Vec<u128>) -> u128 {
-    samples.sort_unstable();
-    let index = ((samples.len() as f64) * 0.95).ceil() as usize;
-    samples[index.saturating_sub(1).min(samples.len() - 1)]
-}
-
-fn run_dot(args: &[&str]) -> Duration {
-    // Null stdio: the child prints version/help text we do not assert on
-    // here (parity owns that), and 30 inheriting children would flood
-    // the test log and perturb timing with terminal writes.
-    let start = Instant::now();
-    let status = Command::new(env!("CARGO_BIN_EXE_dot"))
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("run dot binary");
-    assert!(status.success());
-    start.elapsed()
 }
 
 #[test]
-fn startup_stays_within_warm_budget() {
-    // One warm-up run so the binary pages are hot, matching how the
-    // budgets were calibrated.
-    run_dot(&["help"]);
-    let help_p95 = p95_ms(repeat(RUNS, || run_dot(&["help"])));
-    let version_p95 = p95_ms(repeat(RUNS, || run_dot(&["version"])));
-    eprintln!("dot help warm p95: {help_p95}ms");
-    eprintln!("dot version warm p95: {version_p95}ms");
-    assert!(
-        help_p95 <= budget_ms(HELP_WARM_BUDGET_MS),
-        "help p95 {help_p95}ms exceeds budget"
-    );
-    assert!(
-        version_p95 <= budget_ms(VERSION_WARM_BUDGET_MS),
-        "version p95 {version_p95}ms exceeds budget"
+fn summary_uses_conventional_median_and_nearest_rank_p95() {
+    let values = [40, 10, 30, 20];
+    let stats = summarize(&values).expect("non-empty samples");
+    assert_eq!(stats.median_ns, 25);
+    assert_eq!(stats.p95_ns, 40);
+
+    let values = (1..=30).collect::<Vec<_>>();
+    let stats = summarize(&values).expect("non-empty samples");
+    assert_eq!(stats.median_ns, 15);
+    assert_eq!(stats.p95_ns, 29);
+    assert_eq!(values, (1..=30).collect::<Vec<_>>());
+    assert_eq!(summarize(&[]), None);
+    assert_eq!(
+        summarize(&[u128::MAX, u128::MAX])
+            .expect("maximum samples")
+            .median_ns,
+        u128::MAX
     );
 }
 
 #[test]
-fn first_run_stays_within_loose_ceiling() {
-    // No cache eviction is performed (no vmtouch-style control here), so
-    // "first run" means first spawn in this test, not a cold page cache:
-    // the name says exactly that. The ceiling is loose (4x warm) because
-    // first-run latency is host-state dependent; this catches linked-in
-    // bloat (debug symbols, huge static constructors), not scheduling.
-    let start = Instant::now();
-    let status = Command::new(env!("CARGO_BIN_EXE_dot"))
-        .arg("help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("run dot binary");
-    assert!(status.success());
-    let elapsed = start.elapsed().as_millis();
-    eprintln!("dot help first run: {elapsed}ms");
-    assert!(
-        elapsed <= budget_ms(HELP_WARM_BUDGET_MS * 4),
-        "first-run help {elapsed}ms exceeds ceiling"
+fn relative_gate_requires_at_least_twenty_five_percent_improvement() {
+    assert_eq!(MAX_RUST_PERCENT, 75);
+    assert!(meets_relative_gate(75, 100, MAX_RUST_PERCENT));
+    assert!(!meets_relative_gate(76, 100, MAX_RUST_PERCENT));
+    assert!(!meets_relative_gate(51, 100, 50));
+    assert!(!meets_relative_gate(u128::MAX, u128::MAX, 75));
+}
+
+#[test]
+fn absolute_release_budgets_remain_explicit() {
+    assert_eq!(STARTUP_CI_HEADROOM_PERCENT, 125);
+    assert_eq!(UPDATE_CI_HEADROOM_PERCENT, 150);
+    assert_eq!(HISTORICAL_HELP_MEAN_NS, 10_700_000);
+    assert_eq!(HISTORICAL_VERSION_MEAN_NS, 10_600_000);
+    assert_eq!(HISTORICAL_CLEAN_UPDATE_P95_NS, 641_000_000);
+    assert_eq!(HISTORICAL_DIRTY_UPDATE_P95_NS, 804_000_000);
+    assert_eq!(HELP_P95_NS, 24_075_000);
+    assert_eq!(VERSION_P95_NS, 23_850_000);
+    assert_eq!(FIRST_SPAWN_NS, 100_000_000);
+    assert_eq!(BASE_UPDATE_P95_NS, 4_000_000_000);
+    assert_eq!(CLEAN_UPDATE_P95_NS, 1_602_500_000);
+    assert_eq!(DIRTY_UPDATE_P95_NS, 2_010_000_000);
+    assert_eq!(FEATURE_UPDATE_P95_NS, 12_000_000_000);
+    assert_eq!(FAILURE_P95_NS, 4_000_000_000);
+}
+
+#[test]
+fn normative_spec_matches_the_enforced_performance_policy() {
+    let spec = include_str!("../docs/rust-port-spec.md");
+    for requirement in [
+        "median no more than 75% of Bash; p95 no more than 24.075ms",
+        "median no more than 75% of Bash; p95 no more than 23.85ms",
+        "median no more than 75% of Bash; p95 no more than 4s",
+        "median no more than 75% of Bash; p95 no more than 1.6025s",
+        "median no more than 75% of Bash; p95 no more than 2.01s",
+        "median no more than 75% of Bash; p95 no more than 12s",
+    ] {
+        assert!(spec.contains(requirement), "missing policy: {requirement}");
+    }
+    assert_eq!(
+        spec.matches("median no more than 75% of Bash").count(),
+        WORKLOAD_POLICIES
+            .iter()
+            .filter(|policy| policy.max_rust_percent == Some(MAX_RUST_PERCENT))
+            .count()
     );
+}
+
+#[test]
+fn completion_spec_workloads_remain_in_the_gate() {
+    assert_eq!(
+        REQUIRED_WORKLOADS,
+        [
+            "first-spawn",
+            "help",
+            "version",
+            "base-clean",
+            "disjoint-clean",
+            "disjoint-dirty",
+            "profile-provider-hooks-collision",
+            "pre-sync-failure",
+        ]
+    );
+}
+
+#[test]
+fn workload_policy_is_the_single_budget_and_sampling_authority() {
+    assert_eq!(WORKLOAD_POLICIES.len(), 8);
+    for policy in WORKLOAD_POLICIES {
+        assert_eq!(policy.workload.policy(), policy);
+        assert!(policy.samples_per_engine > 0);
+        assert!(policy.rust_p95_budget_ns > 0);
+    }
+    for policy in WORKLOAD_POLICIES
+        .iter()
+        .filter(|policy| policy.workload != Workload::FirstSpawn)
+    {
+        assert_eq!(
+            policy.max_rust_percent,
+            Some(MAX_RUST_PERCENT),
+            "{} must reject a materially slower-than-shell native result",
+            policy.workload.label()
+        );
+        assert!(meets_relative_gate(75, 100, MAX_RUST_PERCENT));
+        assert!(!meets_relative_gate(100, 100, MAX_RUST_PERCENT));
+    }
+    assert_eq!(
+        Workload::FeatureCollision.policy().max_rust_percent,
+        Some(MAX_RUST_PERCENT),
+        "the expensive composed workload must preserve measured relative speedup"
+    );
+}
+
+#[test]
+fn calibration_ratios_and_headroom_are_recomputed_from_raw_values() {
+    for (shell, rust, rust_p95, budget, expected_ratio, expected_headroom) in [
+        (None, 25, 25, 100, None, 75),
+        (Some(400), 100, 120, 1_000, Some(25), 88),
+        (Some(3), 2, 5, 10, Some(67), 50),
+    ] {
+        assert_eq!(
+            shell.and_then(|value| ratio_percent_ceil(rust, value)),
+            expected_ratio
+        );
+        assert_eq!(budget_headroom_percent(rust_p95, budget), expected_headroom);
+    }
+    assert_eq!(ratio_percent_ceil(1, 0), None);
+    assert_eq!(budget_headroom_percent(101, 100), 0);
 }

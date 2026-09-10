@@ -329,10 +329,10 @@ fn completion_reload_shell_clock_and_json_contracts() {
 
 #[test]
 fn elapsed_normalization_changes_only_progress_stamps() {
-    let input = b"row 3/4                         12s\nDone in 9s. reload\nin 5star\n";
+    let input = b"row 3/4                         12s\nDone in 9s. reload\nDone with errors in 4s. reload\nin 5star\n";
     assert_eq!(
         normalize_elapsed(input),
-        b"row 3/4                         12s\nDone in Ns. reload\nin 5star\n"
+        b"row 3/4                         12s\nDone in Ns. reload\nDone with errors in Ns. reload\nin 5star\n"
     );
 }
 

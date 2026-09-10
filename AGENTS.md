@@ -19,13 +19,17 @@ packaging, and test-harness boundaries.
 
 ## Testing
 
-- Rust: `cargo test --locked` (unit + integration + perf budgets).
-- Perf-heavy: `cargo test --locked -- --ignored`; gate jobs pin
-  `DOT_PERF_BUDGET_MULTIPLIER=1`.
+- Rust: `cargo test --locked` (unit, integration, and deterministic performance
+  policy tests; no wall-clock gates).
+- Performance: `scripts/benchmark-port.sh` (Linux-only ignored release-mode
+  paired gate over clean committed source trees).
 - Public-boundary shell acceptance: `bash tests/run`.
 - Lints: `cargo clippy --locked --all-targets --all-features -- -D warnings`
   (`[lints.rust] warnings = "deny"` covers rustc lints locally; Clippy
   itself is enforced by the CI flag).
+- Standalone Rust: `rustfmt --check support/performance-command-supervisor.rs
+  tests/support/performance-supervisor-fixture.rs` (these files are compiled
+  directly and are outside Cargo's module graph).
 - ShellCheck inventory: `.github/shellcheck-files.txt` (do not regress).
 
 ## Rules for native changes
