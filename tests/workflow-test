@@ -25,12 +25,18 @@ grep -Fq "BASE_SHA: \${{ github.event.pull_request.base.sha || github.event.befo
 # shellcheck disable=SC2016 # The workflow must retain these literal shell variables.
 grep -Fq 'run: scripts/verify-shdeps-lock --if-changed "$EVENT_NAME" "$BASE_SHA"' \
   "$workflow" || fail 'CI must delegate lock change detection to the verifier'
-grep -Fq 'needs: [shell, shdeps-lock, rust]' "$workflow" ||
-  fail 'Required must wait for the Shdeps lock check and the Rust port'
+grep -Fq 'needs: [performance, shell, shdeps-lock, rust]' "$workflow" ||
+  fail 'Required must wait for performance, Shdeps, shell, and Rust checks'
 rust_job=$(sed -n '/^  rust:/,/^  shell:/p' "$workflow")
 shell_job=$(sed -n '/^  shell:/,/^  shdeps-lock:/p' "$workflow")
+performance_job=$(sed -n '/^  performance:/,/^  required:/p' "$workflow")
 grep -Fq 'bash tests/run' <<<"$rust_job" ||
   fail 'Rust platform CI must run the native-backed shell acceptance suite'
+grep -Fq 'rustfmt --check support/performance-command-supervisor.rs tests/support/performance-supervisor-fixture.rs' \
+  <<<"$rust_job" || fail 'Rust CI must format-check standalone supervisor sources'
+if grep -Fq -- '--ignored' <<<"$rust_job"; then
+  fail 'shared debug/platform CI must not run wall-clock performance gates'
+fi
 grep -Fq 'termux-profiles: base' <<<"$rust_job" ||
   fail 'Rust Termux lifecycle smoke must install the Git-backed base profile'
 if grep -Fq 'bash tests/run' <<<"$shell_job"; then
@@ -38,6 +44,51 @@ if grep -Fq 'bash tests/run' <<<"$shell_job"; then
 fi
 grep -Fq 'bash tests/library-test' <<<"$shell_job" ||
   fail 'shell CI must retain public library boundary coverage'
+grep -Fq 'name: Performance / Ubuntu' <<<"$performance_job" ||
+  fail 'CI must expose one dedicated Ubuntu performance gate'
+grep -Fq 'runs-on: ubuntu-24.04' <<<"$performance_job" ||
+  fail 'performance timing must use the pinned Ubuntu runner'
+grep -Fq 'fetch-depth: 0' <<<"$performance_job" ||
+  fail 'performance CI must fetch the reachable shell baseline ancestry'
+grep -Fq 'run: bash tests/provenance-test' <<<"$performance_job" ||
+  fail 'performance CI must verify its tracked source inventory before publication'
+assert_contains $'run: bash tests/provenance-test\n\n      - name: Compare release performance' \
+  "$performance_job" 'provenance inventory must be verified before the performance run'
+grep -Fq 'run: scripts/benchmark-port.sh' <<<"$performance_job" ||
+  fail 'performance CI must use the reviewed release benchmark driver'
+grep -Fq 'id: benchmark' <<<"$performance_job" ||
+  fail 'performance CI must expose the exact unique publication path'
+grep -Fq 'name: Confirm sealed performance publication' <<<"$performance_job" ||
+  fail 'performance CI must recheck the exact sealed publication before upload'
+# shellcheck disable=SC2016 # Workflow expressions must remain literal.
+grep -Fq 'DOT_PERF_PUBLICATION_DIR: ${{ steps.benchmark.outputs.publication_dir }}' \
+  <<<"$performance_job" || fail 'performance CI must consume the exact driver publication'
+# shellcheck disable=SC2016 # Workflow variables must remain literal.
+grep -Fq 'run: scripts/benchmark-port.sh --validate-publication "$DOT_PERF_PUBLICATION_DIR"' \
+  <<<"$performance_job" || fail 'performance CI must fully revalidate immediately pre-upload'
+assert_contains $'run: scripts/benchmark-port.sh --validate-publication "$DOT_PERF_PUBLICATION_DIR"\n\n      - name: Upload performance evidence' \
+  "$performance_job" 'full evidence validation must be the step immediately before upload'
+# shellcheck disable=SC2016 # The workflow must retain this literal expression.
+grep -Fq 'if: ${{ success() }}' <<<"$performance_job" ||
+  fail 'performance artifacts must be uploaded only after validation succeeds'
+# shellcheck disable=SC2016 # Rejected partial metadata must never be uploaded.
+if grep -Fq 'if: ${{ always() }}' <<<"$performance_job"; then
+  fail 'performance artifacts must not be uploaded after a failed gate'
+fi
+grep -Fq 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
+  <<<"$performance_job" || fail 'performance artifact upload must use the pinned action'
+for artifact in driver metadata samples summary calibration completion; do
+  # shellcheck disable=SC2016 # Workflow expression must remain literal.
+  grep -Fq "          \${{ steps.benchmark.outputs.publication_dir }}/$artifact.tsv" \
+    <<<"$performance_job" || fail "performance upload omits validated $artifact evidence"
+done
+# shellcheck disable=SC2016 # Workflow expression must remain literal.
+assert_eq 6 "$(grep -Fc '            ${{ steps.benchmark.outputs.publication_dir }}/' \
+  <<<"$performance_job")" 'performance upload contains exactly the validated artifact set'
+# shellcheck disable=SC2016 # Reject uploading an unvalidated directory tree.
+if grep -Fxq '          path: ${{ steps.benchmark.outputs.publication_dir }}' <<<"$performance_job"; then
+  fail 'performance upload must not include an unvalidated artifact directory'
+fi
 # shellcheck disable=SC2016 # Workflow variables must remain literal.
 grep -Fq 'HOME="$install_root/home" ./install.sh' "$workflow" ||
   fail 'Linux package smoke must activate the musl artifact through install.sh'
@@ -56,5 +107,11 @@ grep -Fq 'RUST_RESULT: ${{ needs.rust.result }}' "$workflow" ||
 # shellcheck disable=SC2016 # The workflow must retain this literal shell variable.
 grep -Fq 'test "$RUST_RESULT" = success' "$workflow" ||
   fail 'Required must reject a failed Rust port'
+# shellcheck disable=SC2016 # The workflow must retain this literal expression.
+grep -Fq 'PERFORMANCE_RESULT: ${{ needs.performance.result }}' "$workflow" ||
+  fail 'Required must receive the dedicated performance result'
+# shellcheck disable=SC2016 # The workflow must retain this literal shell variable.
+grep -Fq 'test "$PERFORMANCE_RESULT" = success' "$workflow" ||
+  fail 'Required must reject a failed performance gate'
 
 printf 'workflow-test: ok\n'

@@ -45,32 +45,42 @@ section 5 and cut the installed entry point over to the Rust binary.
   pattern). (`Result` is reserved for fallible engine operations in
   later migration work; slice-1 dispatch was infallible by construction.)
 
-## 3. Performance budgets (historical slice-1 baseline)
+## 3. Performance budgets
 
-Measured on the reference host; enforced by `tests/perf_budget.rs`
-(p95 over runs, CLI-level including process startup, following
-`hive-memory` `tests/perf_budget.rs`):
+`tests/perf_budget.rs` owns deterministic policy tests. The ignored
+`tests/perf_update.rs` harness is run only in Cargo's release profile by the
+dedicated Ubuntu performance job; ordinary debug and portability jobs do not
+make wall-clock assertions.
 
-| Operation | Shell baseline (warm) | Rust budget (p95) | Rust expected |
-|---|---|---|---|
-| `help` | ~18ms (parse+probes) | 25ms (30ms on macOS) | ~2-5ms |
-| `version` | ~26ms (incl. one `git rev-parse` fork; Rust bakes the revision, no fork) | 30ms | ~2-5ms |
+| Operation | Samples | Rust requirement |
+|---|---:|---|
+| first `help` spawn | 1 before warm-up | no more than 100ms |
+| warm `help` | median and p95 of 30 paired runs after 10 warm-ups | median no more than 75% of Bash; p95 no more than 24.075ms |
+| warm `version` | median and p95 of 30 paired runs after 10 warm-ups | median no more than 75% of Bash; p95 no more than 23.85ms |
+| clean base-only update | median and p95 of 30 paired runs | median no more than 75% of Bash; p95 no more than 4s |
+| clean disjoint three-overlay update | median and p95 of 30 paired runs | median no more than 75% of Bash; p95 no more than 1.6025s |
+| dirty disjoint three-overlay update | median and p95 of 30 independently dirtied paired runs | median no more than 75% of Bash; p95 no more than 2.01s |
+| profile/provider/hooks/collision update | median and p95 of 30 paired runs | median no more than 75% of Bash; p95 no more than 12s |
+| failing pre-sync update | median and p95 of 30 paired runs | median no more than 75% of Bash; p95 no more than 4s |
 
-Budgets are CI-variance ceilings, not targets: the port must beat them
-by an order of magnitude on the reference host; a change that merely
-squeaks under budget without improving on the shell has failed the
-point of the port even if the gate is green.
+The historical commit is centralized in
+`support/performance-baseline-v1.tsv`; one shared policy table supplies the
+harness and deterministic tests with workload order, sample counts, warm-ups,
+and acceptance limits. Each gate run emits anonymized calibration ratios and
+headroom bound to its candidate, baseline, provider, toolchain, and evidence
+hashes. The gate covers every workload required by the completion design, and
+every accepted update sample has already passed output, expected-payload, and
+normalized filesystem-state checks. Raw nanosecond samples, path-sanitized
+environment metadata, calibration, and the atomic completion manifest are
+uploaded as an exact six-file set only after independent validation succeeds;
+rejected partial evidence is not published.
+The exact methodology and its remaining coverage boundary are recorded in
+`docs/rust-port-performance.md`.
 
-- Multiplier env `DOT_PERF_BUDGET_MULTIPLIER` (float, default 1.0) exists
-  for slow developer hosts only. Gate CI jobs run perf tests explicitly
-  (including `#[ignore]`-gated ones) with the multiplier pinned to 1.
-- Budgets cover warm and cold startup paths. The completed update-level
-  benchmark and measured comparison are recorded in
-  `docs/rust-port-performance.md`.
-- Heavy/loop-heavy budgets (e.g. full `update` on fixtures) are
-  `#[ignore]`-gated and run explicitly in CI, same as hive-memory.
-- Budgets are regression gates, not goals: the port must beat them by a
-  wide margin on the reference host; a budget failure blocks the slice.
+The measured provider is always the revision pinned by the current candidate.
+Its ABI must match the historical shell lock, but the old and current lock
+revisions are intentionally allowed to differ so later compatible provider
+fixes do not invalidate the immutable shell baseline.
 
 ## 4. Initial crate layout (historical)
 

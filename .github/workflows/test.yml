@@ -21,15 +21,13 @@ jobs:
       # missing-doc lint, fmt, audit, and the default `cargo test --locked`
       # invocation; local copies would drift.
       msrv-toolchain: "1.85"
-      # Perf budgets are calibrated on a fast host and must run at
-      # multiplier 1 in CI, including the #[ignore]-gated heavy tests. The
-      # multiplier exists for slow developer hosts only; gate jobs must not
-      # raise it.
+      # Wall-clock tests run once, in release mode, in the dedicated Ubuntu
+      # performance job below. Keep the portable matrix deterministic.
       test-command: |
         cargo test --locked
+        rustfmt --check support/performance-command-supervisor.rs tests/support/performance-supervisor-fixture.rs
         bash tests/run
         bash tests/release-scripts-test
-        DOT_PERF_BUDGET_MULTIPLIER=1 cargo test --locked -- --ignored
       # Native integration tests retain the public Python timeout helper as an
       # external-suite compatibility boundary. Minimal Rust images do not
       # otherwise install its interpreter.
@@ -76,10 +74,9 @@ jobs:
           --archive "$archive" --checksum "$archive.sha256" \
           --data-home "$install_root/data" --bin-dir "$install_root/bin"
         "$install_root/bin/dot" version
-      # Termux hardware is too slow and variable for wall-clock perf
-      # budgets (p95-over-30 at 25/30ms), so the emulator runs the
-      # transported release-mode binary's CLI contract only (no cargo in
-      # the sandbox); perf budgets are a fast-host gate.
+      # Termux hardware is too slow and variable for wall-clock performance
+      # gates, so the emulator runs the transported release-mode binary's CLI
+      # contract only (no cargo in the sandbox).
       termux-command: scripts/termux-ci.sh
       # The lifecycle smoke invokes `dot test`, whose parity contract requires
       # a trusted system Git before it launches any suite.
@@ -126,12 +123,59 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
         run: scripts/verify-shdeps-lock --if-changed "$EVENT_NAME" "$BASE_SHA"
 
+  performance:
+    name: Performance / Ubuntu
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The shell baseline is a reachable ancestor of the port stack. A
+          # shallow checkout cannot construct its independent source clone.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Verify performance source provenance
+        run: bash tests/provenance-test
+
+      - name: Compare release performance with the shell baseline
+        id: benchmark
+        shell: bash
+        env:
+          DOT_PERF_ARTIFACT_DIR: ${{ runner.temp }}/dot-performance
+        run: scripts/benchmark-port.sh
+
+      - name: Confirm sealed performance publication
+        shell: bash
+        env:
+          DOT_PERF_PUBLICATION_DIR: ${{ steps.benchmark.outputs.publication_dir }}
+        run: scripts/benchmark-port.sh --validate-publication "$DOT_PERF_PUBLICATION_DIR"
+
+      - name: Upload performance evidence
+        if: ${{ success() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4.6.2
+        with:
+          name: dot-performance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.benchmark.outputs.publication_dir }}/driver.tsv
+            ${{ steps.benchmark.outputs.publication_dir }}/metadata.tsv
+            ${{ steps.benchmark.outputs.publication_dir }}/samples.tsv
+            ${{ steps.benchmark.outputs.publication_dir }}/summary.tsv
+            ${{ steps.benchmark.outputs.publication_dir }}/calibration.tsv
+            ${{ steps.benchmark.outputs.publication_dir }}/completion.tsv
+          if-no-files-found: error
+          retention-days: 14
+
   required:
     name: Required
     if: ${{ always() }}
-    needs: [shell, shdeps-lock, rust]
+    needs: [performance, shell, shdeps-lock, rust]
     runs-on: ubuntu-24.04
     env:
+      PERFORMANCE_RESULT: ${{ needs.performance.result }}
       SHELL_RESULT: ${{ needs.shell.result }}
       SHDEPS_LOCK_RESULT: ${{ needs.shdeps-lock.result }}
       RUST_RESULT: ${{ needs.rust.result }}
@@ -139,9 +183,11 @@ jobs:
       - name: Require all compatibility checks
         shell: bash
         run: |-
+          printf 'Performance: %s\n' "$PERFORMANCE_RESULT"
           printf 'Shared shell CI: %s\n' "$SHELL_RESULT"
           printf 'Shdeps lock: %s\n' "$SHDEPS_LOCK_RESULT"
           printf 'Rust port: %s\n' "$RUST_RESULT"
+          test "$PERFORMANCE_RESULT" = success
           test "$SHELL_RESULT" = success
           test "$SHDEPS_LOCK_RESULT" = success
           test "$RUST_RESULT" = success

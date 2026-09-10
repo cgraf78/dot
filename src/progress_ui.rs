@@ -257,7 +257,8 @@ pub fn elapsed(seconds_now: i64, started_secs: i64) -> Vec<u8> {
 
 /// Normalize only elapsed stamps in captured progress output for
 /// shell/Rust differential tests.  Progress rows end with `Ns`; the
-/// completion summary spells the same value as `Done in Ns.`.  Other
+/// completion summaries spell the same value as `Done in Ns.` or
+/// `Done with errors in Ns.`. Other
 /// numbers — including counts, diagnostics, labels, and ordering —
 /// remain byte-significant.
 pub fn normalize_elapsed(bytes: &[u8]) -> Vec<u8> {
@@ -330,20 +331,22 @@ fn normalize_stage_elapsed(line: &[u8], normalized: &mut Vec<u8>) {
     }
 }
 
-/// Copy a completion row, replacing only its `Done in Ns.` value.
+/// Copy a completion row, replacing only its success/failure elapsed value.
 fn normalize_done_elapsed(line: &[u8], normalized: &mut Vec<u8>) {
-    const PREFIX: &[u8] = b"Done in ";
-    if !line.starts_with(PREFIX) {
+    let Some(prefix) = [b"Done in ".as_slice(), b"Done with errors in ".as_slice()]
+        .into_iter()
+        .find(|prefix| line.starts_with(prefix))
+    else {
         normalized.extend_from_slice(line);
         return;
-    }
-    let stamp = &line[PREFIX.len()..];
+    };
+    let stamp = &line[prefix.len()..];
     let digits = stamp
         .iter()
         .take_while(|byte| byte.is_ascii_digit())
         .count();
     if digits > 0 && stamp[digits..].starts_with(b"s.") {
-        normalized.extend_from_slice(PREFIX);
+        normalized.extend_from_slice(prefix);
         normalized.extend_from_slice(b"Ns.");
         normalized.extend_from_slice(&stamp[digits + 2..]);
     } else {
