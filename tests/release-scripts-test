@@ -4366,7 +4366,10 @@ printf 'fn main() {}\n' >"$snapshot_fixture/caller/src/main.rs"
 snapshot_tree=$("$system_git" -C "$snapshot_fixture/caller" rev-parse 'HEAD^{tree}')
 snapshot_source_object=$snapshot_fixture/caller/.git/objects/${snapshot_tree:0:2}/${snapshot_tree:2}
 chmod u+w "$snapshot_source_object"
-snapshot_source_mode=$(stat -c %a "$snapshot_source_object")
+# BSD stat has no -c flag, so compare the portable `ls -l` mode field. Any
+# SELinux/xattr suffix is stable within one machine and harmless to compare.
+snapshot_source_mode=$(ls -l "$snapshot_source_object")
+snapshot_source_mode=${snapshot_source_mode%% *}
 cat >"$snapshot_fixture/cargo-wrapper" <<EOF
 #!/bin/sh
 chmod u+w '$snapshot_fixture/scratch/candidate/tracked'
@@ -4395,7 +4398,12 @@ if ! bash -c '
   tree=$REPLY_TREE
   status=$REPLY_STATUS_BLOB
   perf_require_dissociated_repository "$2/scratch/candidate"
-  test ! -w "$2/scratch/candidate/tracked"
+  # `test -w` always succeeds for root (container CI runs as root), so
+  # inspect the permission bits instead of the access check.
+  sealed_mode=$(ls -l "$2/scratch/candidate/tracked")
+  case ${sealed_mode%% *} in
+    *w*) exit 1 ;;
+  esac
   PERF_CARGO=$2/cargo-wrapper
   DOT_BUILD_COMMIT=$commit
   DOT_PERF_ARTIFACT_DIR=$2/scratch/evidence
@@ -4421,7 +4429,8 @@ if ! bash -c '
 fi
 [[ -f $snapshot_fixture/candidate-mutation-attempted ]] ||
   fail 'controlled Cargo wrapper did not target the candidate snapshot'
-assert_eq "$snapshot_source_mode" "$(stat -c %a "$snapshot_source_object")" \
+snapshot_sealed_mode=$(ls -l "$snapshot_source_object")
+assert_eq "$snapshot_source_mode" "${snapshot_sealed_mode%% *}" \
   'sealing a source snapshot must not change caller Git object modes'
 [[ ! -e $snapshot_fixture/scratch/candidate/.git/objects/info/alternates ]] ||
   fail 'candidate snapshot retained a Git object alternate'
