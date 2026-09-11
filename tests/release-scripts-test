@@ -4425,7 +4425,7 @@ if ! bash -c '
   test -z "$(perf_git -C "$2/caller" status --porcelain=v1)"
   grep -Fxq "$2/scratch/candidate/Cargo.toml" "$2/invocation"
   ! grep -Fxq "$2/caller/Cargo.toml" "$2/invocation"
-  "$PERF_CHMOD" -R u+w -- "$2/scratch/candidate"
+  "$PERF_CHMOD" -R u+w "$2/scratch/candidate"
 ' _ "$DOT_TEST_ROOT/scripts/benchmark-port.sh" "$snapshot_fixture"; then
   fail 'performance build was not isolated from a mutating caller checkout'
 fi
