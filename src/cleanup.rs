@@ -1098,6 +1098,16 @@ fn signal_group_result(pid: u32, signal: i32) -> std::io::Result<bool> {
         if error.raw_os_error() == Some(libc::ESRCH) {
             return Ok(false);
         }
+        // EPERM means no group member accepted the signal. Any live owned
+        // member is same-uid signalable (stopped members queue the signal,
+        // zombies accept it), so a fully unsignalable group holds nothing
+        // owned: the pgid is stale or reused by a foreign group. Report
+        // undelivered without failing teardown; the shell reference ignores
+        // group-kill errors the same way (`|| true`) and verifies absence
+        // through snapshots instead of signal delivery.
+        if error.raw_os_error() == Some(libc::EPERM) {
+            return Ok(false);
+        }
         return Err(error);
     }
     Ok(false)
@@ -2666,7 +2676,18 @@ fn process_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
     let mut command = Command::new("/bin/ps");
     command.args(["-A", "-o", "pid=,ppid=,pgid=,sid=,stat="]);
     let bytes = snapshot(command, deadline)?;
-    let processes = parse_ps_snapshot(&bytes)?;
+    let processes = match parse_ps_snapshot(&bytes) {
+        Some(processes) => processes,
+        None => {
+            #[cfg(test)]
+            eprintln!(
+                "SNAPSHOT_PROBE stage=parse-none bytes={} sample={:?}",
+                bytes.len(),
+                String::from_utf8_lossy(&bytes[..bytes.len().min(300)])
+            );
+            return None;
+        }
+    };
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // `ps` supplies an atomic topology row but no start generation. Read
@@ -3040,11 +3061,26 @@ impl OwnedMember {
 
 /// Capture a portable process snapshot without a blocking pipe reader thread.
 fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
+    // TEMPORARY macOS CI probe (removed once the snapshot-None root cause
+    // is identified): stage tracing for each snapshot failure mode.
     if Instant::now() >= deadline {
+        #[cfg(test)]
+        eprintln!("SNAPSHOT_PROBE stage=expired");
         return None;
     }
-    let (reader, writer) = internal_stream_pair().ok()?;
-    reader.set_nonblocking(true).ok()?;
+    let (reader, writer) = match internal_stream_pair() {
+        Ok(pair) => pair,
+        Err(_error) => {
+            #[cfg(test)]
+            eprintln!("SNAPSHOT_PROBE stage=pair-err error={_error:?}");
+            return None;
+        }
+    };
+    if let Err(_error) = reader.set_nonblocking(true) {
+        #[cfg(test)]
+        eprintln!("SNAPSHOT_PROBE stage=nonblock-err error={_error:?}");
+        return None;
+    }
     // The fallback helper participates in the same launch generation as
     // every other status-owning child.  A concurrent adopted-zombie reaper
     // must never mistake the just-forked `ps` process for an unregistered
@@ -3053,12 +3089,19 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     let fork_registration = STATUS_CHILD_FORK_REGISTRATION
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let mut child = command
+    let mut child = match command
         .stdin(Stdio::null())
         .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
+    {
+        Ok(child) => child,
+        Err(_error) => {
+            #[cfg(test)]
+            eprintln!("SNAPSHOT_PROBE stage=spawn-err error={_error:?}");
+            return None;
+        }
+    };
     let _registration = StatusChildRegistration::new(child.id());
     drop(fork_registration);
     drop(launch);
@@ -3070,6 +3113,8 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     use std::io::Read as _;
     loop {
         if Instant::now() >= deadline {
+            #[cfg(test)]
+            eprintln!("SNAPSHOT_PROBE stage=read-timeout bytes={}", bytes.len());
             let _ = child.kill();
             let _ = wait_child_until(&mut child, cleanup_deadline());
             return None;
@@ -3081,7 +3126,9 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(_) => {
+            Err(_error) => {
+                #[cfg(test)]
+                eprintln!("SNAPSHOT_PROBE stage=read-err error={_error:?}");
                 let _ = child.kill();
                 let _ = wait_child_until(&mut child, cleanup_deadline());
                 return None;
@@ -3091,9 +3138,20 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     // EOF is independent of process exit: a helper may close stdout early.
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success().then_some(bytes),
+            Ok(Some(status)) => {
+                #[cfg(test)]
+                eprintln!(
+                    "SNAPSHOT_PROBE stage=exit success={} bytes={} sample={:?}",
+                    status.success(),
+                    bytes.len(),
+                    String::from_utf8_lossy(&bytes[..bytes.len().min(120)])
+                );
+                return status.success().then_some(bytes);
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             _ => {
+                #[cfg(test)]
+                eprintln!("SNAPSHOT_PROBE stage=wait-timeout bytes={}", bytes.len());
                 let _ = child.kill();
                 let _ = wait_child_until(&mut child, cleanup_deadline());
                 return None;
