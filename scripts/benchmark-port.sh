@@ -590,6 +590,8 @@ perf_resolve_tools() {
   PERF_ENV=$REPLY
   perf_first_tool /usr/bin/cp /bin/cp || return 1
   PERF_CP=$REPLY
+  perf_first_tool /usr/bin/ln /bin/ln || return 1
+  PERF_LN=$REPLY
   perf_first_tool /usr/bin/chmod /bin/chmod || return 1
   PERF_CHMOD=$REPLY
   perf_first_tool /usr/bin/mkdir /bin/mkdir || return 1
@@ -923,19 +925,23 @@ perf_prepare_provider_run_root() {
   # binary is built into a separate target dir), so samples would trigger a
   # from-source rebuild with network fetches and exceed the sample timeout.
   # Give samples a verified copy of the sealed root with the release binary
-  # pre-placed where bootstrap expects it. Identity evidence still comes
-  # from the sealed root plus the hashed provider binary blob.
+  # linked where bootstrap expects it. The staged entries must be symlinks
+  # to the harness-built binary, not copies: feature-payload validation
+  # requires the installed provider to canonicalize to the pinned
+  # executable path. Identity evidence still comes from the sealed root
+  # plus the hashed provider binary blob.
   local sealed=$1 binary=$2 run_root=$3 commit=$4 head short version
-  [[ -x $binary ]] || {
-    printf 'error: Shdeps provider binary is not executable: %s\n' "$binary" >&2
+  perf_canonical_executable "$binary" || {
+    printf 'error: Shdeps provider binary is not usable: %s\n' "$binary" >&2
     return 1
   }
+  binary=$REPLY
   "$PERF_MKDIR" -p -- "$run_root" || return 1
   "$PERF_CP" -r -- "$sealed/." "$run_root/" || return 1
   "$PERF_CHMOD" -R u+w -- "$run_root" || return 1
   "$PERF_MKDIR" -p -- "$run_root/target/release" || return 1
-  "$PERF_CP" -- "$binary" "$run_root/target/release/shdeps" || return 1
-  "$PERF_CP" -- "$binary" "$run_root/shdeps" || return 1
+  "$PERF_LN" -s -- "$binary" "$run_root/target/release/shdeps" || return 1
+  "$PERF_LN" -s -- "$binary" "$run_root/shdeps" || return 1
   [[ -x $run_root/target/release/shdeps && -x $run_root/shdeps ]] || {
     printf 'error: staged Shdeps binaries lost the executable bit\n' >&2
     return 1
