@@ -2956,6 +2956,46 @@ fn should_skip(root: ClientRoot, relative: &Path) -> bool {
     matches!(root, ClientRoot::Data) && relative.starts_with(Path::new("shdeps/.git"))
 }
 
+/// Whether `full` holds no recorded content: every on-disk child is excluded
+/// (recursively), or the directory is empty. Directory entries are
+/// structural (same as `tests/cli.rs` `semantic_tree`, which never records
+/// them); convergence is judged on files and symlinks. For example `dot/`
+/// holding only the shell's `bash-v1` interpreter hint compares equal to a
+/// missing or empty `dot/` on the native side, while any non-excluded file
+/// under `dot/` keeps the directory and its content compared.
+fn dir_holds_only_excluded(root: ClientRoot, full: &Path, home: &Path) -> bool {
+    let children = match fs::read_dir(full) {
+        Ok(children) => children,
+        Err(_) => return false,
+    };
+    for child in children {
+        let path = match child {
+            Ok(child) => child.path(),
+            Err(_) => return false,
+        };
+        let relative = match path.strip_prefix(home) {
+            Ok(relative) => relative,
+            Err(_) => return false,
+        };
+        if should_skip(root, relative) {
+            continue;
+        }
+        let file_type = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata.file_type(),
+            Err(_) => return false,
+        };
+        if file_type.is_dir() {
+            if !dir_holds_only_excluded(root, &path, home) {
+                return false;
+            }
+        } else {
+            // A recorded file, symlink, or special entry keeps the directory.
+            return false;
+        }
+    }
+    true
+}
+
 fn normalize_state_value(root: Option<ClientRoot>, relative: &Path, value: Vec<u8>) -> Vec<u8> {
     if !matches!(root, Some(ClientRoot::State)) {
         return value;
@@ -3032,6 +3072,9 @@ fn snapshot_tree_with_filter(home: &Path, root: Option<ClientRoot>) -> Vec<TreeE
             let metadata = fs::symlink_metadata(&path).expect("snapshot metadata");
             let file_type = metadata.file_type();
             let (kind, value) = if file_type.is_dir() {
+                if root.is_some_and(|root| dir_holds_only_excluded(root, &path, home)) {
+                    continue;
+                }
                 stack.push(path.clone());
                 (b'd', Vec::new())
             } else if file_type.is_file() {
@@ -4233,6 +4276,48 @@ fn state_snapshot_normalizes_only_documented_engine_private_receipt_fields() {
     )
     .expect("significant provider state");
     assert_ne!(snapshot_client(&shell), snapshot_client(&rust));
+}
+
+#[test]
+fn state_snapshot_ignores_directories_holding_only_excluded_markers() {
+    let scratch = Scratch::new("perf-excluded-only-dirs").expect("scratch");
+    let shell = empty_client(&scratch, "shell");
+    let rust = empty_client(&scratch, "rust");
+    // The shell trampoline records its interpreter hint under `dot/` on every
+    // invocation (including `help`); the native engine has no resolver and
+    // writes nothing. Parity must ignore a directory whose entire on-disk
+    // content is already excluded.
+    fs::create_dir_all(shell.state.join("dot")).expect("shell state directory");
+    fs::write(shell.state.join("dot/bash-v1"), b"shell runtime marker\n").expect("shell marker");
+    fs::create_dir_all(shell.state.join("shdeps")).expect("shell provider directory");
+    fs::write(
+        shell.state.join("shdeps/shdeps.self-update.stamp"),
+        b"1700000000\n",
+    )
+    .expect("shell update stamp");
+    assert_eq!(
+        snapshot_client(&shell),
+        snapshot_client(&rust),
+        "directories holding only excluded markers must not break parity"
+    );
+
+    // Non-excluded content under the same directories is still converged.
+    fs::write(shell.state.join("dot/unexpected"), b"significant\n").expect("significant state");
+    assert_ne!(
+        snapshot_client(&shell),
+        snapshot_client(&rust),
+        "non-excluded state under dot/ must break parity"
+    );
+    fs::remove_file(shell.state.join("dot/unexpected")).expect("remove significant state");
+
+    // Directory entries are structural, so an asymmetric empty directory is
+    // also ignored: excluded-only content compares equal to missing or empty.
+    fs::create_dir_all(rust.state.join("dot")).expect("rust state directory");
+    assert_eq!(
+        snapshot_client(&shell),
+        snapshot_client(&rust),
+        "an asymmetric empty directory must not break parity"
+    );
 }
 
 #[test]
