@@ -916,6 +916,46 @@ perf_clone_source_snapshot() {
   perf_seal_source_snapshot "$destination" "$commit" "$label"
 }
 
+perf_prepare_provider_run_root() {
+  # Shell samples bootstrap install.sh against SHDEPS_LIB's checkout, which
+  # rebuilds the Rust CLI from source when the checkout has no matching
+  # binary. The sealed provider root deliberately has none (the release
+  # binary is built into a separate target dir), so samples would trigger a
+  # from-source rebuild with network fetches and exceed the sample timeout.
+  # Give samples a verified copy of the sealed root with the release binary
+  # pre-placed where bootstrap expects it. Identity evidence still comes
+  # from the sealed root plus the hashed provider binary blob.
+  local sealed=$1 binary=$2 run_root=$3 commit=$4 head short version
+  [[ -x $binary ]] || {
+    printf 'error: Shdeps provider binary is not executable: %s\n' "$binary" >&2
+    return 1
+  }
+  "$PERF_MKDIR" -p -- "$run_root" || return 1
+  "$PERF_CP" -r -- "$sealed/." "$run_root/" || return 1
+  "$PERF_CHMOD" -R u+w -- "$run_root" || return 1
+  "$PERF_MKDIR" -p -- "$run_root/target/release" || return 1
+  "$PERF_CP" -- "$binary" "$run_root/target/release/shdeps" || return 1
+  "$PERF_CP" -- "$binary" "$run_root/shdeps" || return 1
+  [[ -x $run_root/target/release/shdeps && -x $run_root/shdeps ]] || {
+    printf 'error: staged Shdeps binaries lost the executable bit\n' >&2
+    return 1
+  }
+  head=$("$PERF_GIT" -C "$run_root" rev-parse HEAD) || return 1
+  [[ $head == "$commit" ]] || {
+    printf 'error: Shdeps run-root identity mismatch\n' >&2
+    return 1
+  }
+  short=$("$PERF_GIT" -C "$run_root" rev-parse --short=8 HEAD) || return 1
+  version=$("$run_root/target/release/shdeps" version 2>/dev/null) || {
+    printf 'error: staged Shdeps binary does not report a version\n' >&2
+    return 1
+  }
+  [[ $version == *"$short"* ]] || {
+    printf 'error: staged Shdeps binary does not match run-root HEAD\n' >&2
+    return 1
+  }
+}
+
 perf_require_dissociated_repository() {
   local root=$1 git_dir objects alternates
 
@@ -2120,7 +2160,7 @@ perf_main() {
   local artifact_config artifact_dir scratch staging completion_path candidate_root shell_root
   local publication
   local cargo_target_root shdeps_target dot_target command_supervisor
-  local shdeps_source shdeps_origin shdeps_parent shdeps_root
+  local shdeps_source shdeps_origin shdeps_parent shdeps_root shdeps_run_root
   local cargo_status
 
   case $script in
@@ -2308,6 +2348,10 @@ perf_main() {
   fi
   [[ $cargo_status -eq 0 ]] || exit "$cargo_status"
   perf_require_all_source_identities post-provider-build || exit 1
+  shdeps_run_root=$scratch/provider-run/shdeps
+  perf_prepare_provider_run_root "$shdeps_root" "$shdeps_target/release/shdeps" \
+    "$shdeps_run_root" "$shdeps_commit" || exit 1
+  DOT_PERF_SHDEPS_ROOT=$shdeps_run_root
   PERF_CARGO_TARGET_DIR=$dot_target
   perf_require_all_source_identities pre-measurement || exit 1
   perf_release_cargo_test_contract "$candidate_root" || exit 1

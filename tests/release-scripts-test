@@ -4620,4 +4620,43 @@ mv "$extract/lib/dot" "$extract/public-assets-away"
   scripts/smoke-release.sh "$asset_platform"
 )
 
+# A sealed provider root carries no prebuilt binary; shell samples bootstrap
+# install.sh against it, which rebuilds from source (network fetch) and
+# exceeds the sample timeout. The run-root setup must pre-place a matching
+# release binary so bootstrap never builds.
+. "$DOT_TEST_ROOT/scripts/benchmark-port.sh"
+provider_sealed=$DOT_TEST_TMP/provider-sealed
+provider_run=$DOT_TEST_TMP/provider-run
+provider_bin=$DOT_TEST_TMP/provider-bin
+mkdir -p "$provider_sealed" "$provider_bin"
+(
+  cd "$provider_sealed" &&
+    GIT_CONFIG_GLOBAL=/dev/null git init -q -b main . &&
+    GIT_CONFIG_GLOBAL=/dev/null git -c user.name=t -c user.email=t@t \
+      -c commit.gpgsign=false commit -q --allow-empty -m seed
+) || fail 'provider run-root fixture cannot init git'
+printf '[package]\nname = "shdeps"\n' >"$provider_sealed/Cargo.toml"
+provider_head=$(git -C "$provider_sealed" rev-parse HEAD) ||
+  fail 'provider run-root fixture has no HEAD'
+provider_short=$(git -C "$provider_sealed" rev-parse --short=8 HEAD) ||
+  fail 'provider run-root fixture has no short HEAD'
+cat >"$provider_bin/shdeps" <<EOF
+#!/bin/bash
+printf 'shdeps %s (test stub)\n' "$provider_short"
+EOF
+chmod +x "$provider_bin/shdeps"
+PERF_MKDIR=$(command -v mkdir) PERF_CP=$(command -v cp)
+PERF_CHMOD=$(command -v chmod) PERF_GIT=$(command -v git)
+export PERF_MKDIR PERF_CP PERF_CHMOD PERF_GIT
+perf_prepare_provider_run_root "$provider_sealed" "$provider_bin/shdeps" \
+  "$provider_run" "$provider_head" ||
+  fail 'provider run-root setup fails on a sealed-like root'
+[[ -x $provider_run/target/release/shdeps ]] ||
+  fail 'run-root lacks executable release binary'
+[[ -x $provider_run/shdeps ]] || fail 'run-root lacks shdeps entry point'
+[[ $(git -C "$provider_run" rev-parse HEAD) == "$provider_head" ]] ||
+  fail 'run-root identity mismatch'
+"$provider_run/target/release/shdeps" version | grep -q "$provider_short" ||
+  fail 'staged binary does not match run-root HEAD'
+
 printf 'release-scripts-test: ok\n'
