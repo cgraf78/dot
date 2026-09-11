@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2030,SC2031 # Background PIDs are captured in the
+# parent shell after each backgrounded group, and the evidence-validation
+# overrides are intentionally subshell-scoped for driver isolation (this suite
+# passes at runtime); `-x` follow-sources analysis misattributes subshell
+# scope across the sourced driver boundary.
 
 set -euo pipefail
 
