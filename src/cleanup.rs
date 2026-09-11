@@ -837,11 +837,20 @@ fn receive_nested_registration(
     let received = unsafe { libc::recvmsg(control.as_raw_fd(), &mut message, flags) };
     if received < 0 {
         let error = std::io::Error::last_os_error();
+        // macOS reports ECONNRESET (not EAGAIN) when the datagram queue is
+        // empty: the child closes the CLOEXEC control writer at exec, so a
+        // session with no nested supervisor deterministically resets while
+        // Linux reports EAGAIN for the same state. Tolerate the reset as
+        // "no data this tick": queued frames are still returned normally,
+        // the worker keeps polling, and a reset carries no bytes that
+        // could forge a delegation, so fail-closed behavior is unchanged.
         // TEMP-DIAG-180: remove once macOS control-channel failures are
         // root-caused. Logs the raw errno behind a channel invalidation.
         if !matches!(
             error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::ConnectionReset
         ) {
             eprintln!(
                 "TEMP-DIAG-180: nested-control recvmsg failed: {error:?} \
@@ -851,7 +860,9 @@ fn receive_nested_registration(
         }
         return if matches!(
             error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::ConnectionReset
         ) {
             Ok(None)
         } else {
