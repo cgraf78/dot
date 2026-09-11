@@ -6142,6 +6142,24 @@ impl Session {
             }
         }
         let leader_observed = self.current.contains_key(&self.leader);
+        // TEMP-DIAG-180: remove with the recvmsg diag. Shows what the
+        // empty-proof sees per observation on macOS.
+        #[cfg(target_os = "macos")]
+        {
+            let live_members: Vec<u32> = self
+                .current
+                .values()
+                .filter(|process| process.live)
+                .map(|process| process.pid)
+                .collect();
+            eprintln!(
+                "TEMP-DIAG-180: observe: leader={} observed={} current={} live={:?}",
+                self.leader,
+                leader_observed,
+                self.current.len(),
+                live_members,
+            );
+        }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         for member in self.members.values_mut() {
             if !self.current.contains_key(&member.process.pid) {
