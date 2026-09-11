@@ -2766,6 +2766,9 @@ fn parse_macos_ps_snapshot(bytes: &[u8]) -> Option<Vec<ProcessInfo>> {
     Some(processes)
 }
 
+// The macOS snapshot path uses `parse_macos_ps_snapshot`; keep this parser
+// for unit tests on every platform so malformed-row coverage still builds.
+#[cfg(any(test, not(target_os = "macos")))]
 fn parse_ps_snapshot(bytes: &[u8]) -> Option<Vec<ProcessInfo>> {
     let mut processes = Vec::new();
     for bytes in bytes.split(|byte| *byte == b'\n') {
