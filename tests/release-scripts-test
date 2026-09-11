@@ -333,6 +333,33 @@ artifact_path=$(bash -c '
 assert_eq /checkout/evidence/performance "$artifact_path" \
   'relative performance artifact paths resolve from the source root'
 
+# The artifact lifecycle needs Linux-only tools (flock, GNU realpath/stat,
+# sha256sum); the measurement gate itself only runs on Linux. Skip these
+# unit tests elsewhere instead of failing tool resolution.
+# The Darwin-reporting uname and supervisor passthrough fixtures are shared
+# with portable tests below, so they live outside the gate.
+fake_uname=$DOT_TEST_TMP/fake-uname
+cat >"$fake_uname" <<'EOF'
+#!/bin/sh
+printf 'Darwin\n'
+EOF
+chmod 0700 "$fake_uname"
+performance_supervisor_passthrough=$DOT_TEST_TMP/performance-supervisor-passthrough
+cat >"$performance_supervisor_passthrough" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+[[ ${1-} == --parent-pid && ${2-} =~ ^[0-9]+$ ]]
+shift 2
+[[ ${1-} == --cwd && -d ${2-} ]]
+cwd=$2
+shift 2
+[[ ${1-} == -- ]]
+shift
+cd -P -- "$cwd"
+exec "$@"
+EOF
+chmod 0700 "$performance_supervisor_passthrough"
+if [[ $(uname -s) == Linux ]]; then
 preflight_artifacts=$DOT_TEST_TMP/preflight-artifacts
 mkdir -p "$preflight_artifacts"
 reset_preflight_artifacts() {
@@ -934,12 +961,6 @@ if DOT_PERF_ARTIFACT_DIR=$preflight_artifacts \
 fi
 assert_fresh_preflight_failure 'tool-preflight failure'
 
-fake_uname=$DOT_TEST_TMP/fake-uname
-cat >"$fake_uname" <<'EOF'
-#!/bin/sh
-printf 'Darwin\n'
-EOF
-chmod 0700 "$fake_uname"
 reset_preflight_artifacts
 non_linux_output=
 if non_linux_output=$(DOT_PERF_ARTIFACT_DIR=$preflight_artifacts \
@@ -1601,6 +1622,9 @@ EOF
 ); then
   fail 'performance evidence validator did not enforce the completion contract'
 fi
+else
+  printf 'release-scripts-test: skipped Linux-only artifact lifecycle tests on %s\n' "$(uname -s)"
+fi
 
 noexec_probe=$DOT_TEST_TMP/noexec-probe
 mkdir -p "$noexec_probe/scratch"
@@ -1677,6 +1701,8 @@ if bash -c '
 ' _ "$DOT_TEST_ROOT/scripts/benchmark-port.sh" "$unsupported_arch_uname" 2>/dev/null; then
   fail 'performance driver accepted an unsupported Linux supervisor architecture'
 fi
+# Cargo-driver tests build on the Linux-only artifact lifecycle above.
+if [[ $(uname -s) == Linux ]]; then
 unsupported_rustc=$DOT_TEST_TMP/unsupported-supervisor-rustc
 cat >"$unsupported_rustc" <<EOF
 #!/bin/sh
@@ -1775,22 +1801,6 @@ fi
 assert_eq 20 "$(wc -l <"$public_driver/driver.tsv" | tr -d ' ')" \
   'performance driver has one header and exactly nineteen unique fields'
 
-performance_supervisor_passthrough=$DOT_TEST_TMP/performance-supervisor-passthrough
-cat >"$performance_supervisor_passthrough" <<'EOF'
-#!/bin/bash
-set -euo pipefail
-[[ ${1-} == --parent-pid && ${2-} =~ ^[0-9]+$ ]]
-shift 2
-[[ ${1-} == --cwd && -d ${2-} ]]
-cwd=$2
-shift 2
-[[ ${1-} == -- ]]
-shift
-cd -P -- "$cwd"
-exec "$@"
-EOF
-chmod 0700 "$performance_supervisor_passthrough"
-
 cargo_argv=$DOT_TEST_TMP/performance-cargo-argv
 mkdir -p "$cargo_argv/scratch/driver-home" "$cargo_argv/candidate"
 cat >"$cargo_argv/capture-cargo" <<EOF
@@ -1829,7 +1839,10 @@ fi
 printf '%s\0' test --release --locked --manifest-path \
   "$cargo_argv/candidate/Cargo.toml" --test perf_update release_performance_gate -- \
   --exact --ignored --nocapture --test-threads=1 >"$cargo_argv/expected-argv"
-cmp "$cargo_argv/expected-argv" "$cargo_argv/actual-argv" ||
+# cmp(1) is absent from minimal container images; compare content hashes
+# instead. NUL bytes survive hashing but not command substitution.
+test "$(git hash-object --no-filters -- "$cargo_argv/expected-argv")" = \
+  "$(git hash-object --no-filters -- "$cargo_argv/actual-argv")" ||
   fail 'actual Cargo argv diverged from the authoritative array'
 assert_eq 'cargo test --release --locked --manifest-path candidate/Cargo.toml --test perf_update release_performance_gate -- --exact --ignored --nocapture --test-threads=1' \
   "$(cat "$cargo_argv/recorded-invocation")" \
@@ -1896,6 +1909,9 @@ EOF
   [[ ! -e $late_fixture/continued ]] ||
     fail "post-wait $late_signal cancellation allowed later build or publication work"
 done
+else
+  printf 'release-scripts-test: skipped Linux-only Cargo driver tests on %s\n' "$(uname -s)"
+fi
 
 case $(uname -s):$(uname -m) in
 Linux:x86_64|Linux:aarch64)

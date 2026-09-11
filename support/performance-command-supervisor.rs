@@ -92,6 +92,8 @@ const ECHILD: i32 = 10;
 const EINTR: i32 = 4;
 const EBADF: i32 = 9;
 const EAGAIN: i32 = 11;
+const EPERM: i32 = 1;
+const ENOSYS: i32 = 38;
 const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
 const FD_CLOEXEC: c_int = 1;
@@ -752,13 +754,33 @@ fn same_open_file(left: c_int, right: c_int) -> Result<bool, String> {
     // without modifying either open-file description.
     let result = unsafe { syscall(SYS_KCMP, process, process, KCMP_FILE, left, right) };
     if result >= 0 {
-        Ok(result == 0)
-    } else {
-        Err(format!(
-            "compare command-supervisor output identities: {}",
-            std::io::Error::last_os_error()
-        ))
+        return Ok(result == 0);
     }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        // kcmp needs CAP_SYS_PTRACE, which container runtimes withhold, and
+        // kernels older than 3.5 lack the call entirely. Fall back to the
+        // portable procfs comparison there; any other failure (a closed
+        // descriptor, a bad call) still fails closed below.
+        Some(EPERM) | Some(ENOSYS) => same_open_file_by_procfs(left, right),
+        _ => Err(format!(
+            "compare command-supervisor output identities: {error}"
+        )),
+    }
+}
+
+// Compares open-file identity through /proc/self/fd links when kcmp is
+// unavailable. Anonymous objects (pipes, sockets) compare by kernel inode,
+// so duplicates match and distinct objects do not. Path-backed links can
+// over-match separately opened descriptions of one path (notably /dev/null
+// and same-path deleted files); merging those captures is benign because
+// the relay still delivers identical bytes to both inherited sinks.
+fn same_open_file_by_procfs(left: c_int, right: c_int) -> Result<bool, String> {
+    let left_target = fs::read_link(format!("/proc/self/fd/{left}"))
+        .map_err(|error| format!("read command-supervisor output identity {left}: {error}"))?;
+    let right_target = fs::read_link(format!("/proc/self/fd/{right}"))
+        .map_err(|error| format!("read command-supervisor output identity {right}: {error}"))?;
+    Ok(left_target == right_target)
 }
 
 fn outputs_aliased(stdio_mask: u8) -> Result<bool, String> {
@@ -4480,6 +4502,25 @@ mod tests {
             internal_pipe("other read", "other write").expect("create distinct fixture pipe");
         assert!(!same_open_file(write.as_raw_fd(), other_write.as_raw_fd())
             .expect("compare distinct descriptors"));
+    }
+
+    #[test]
+    fn procfs_identity_comparison_distinguishes_pipe_aliases() {
+        // Containers without CAP_SYS_PTRACE deny kcmp; the procfs fallback
+        // must still tell a duplicated pipe from a distinct one.
+        let (_read, write) =
+            internal_pipe("fixture read", "fixture write").expect("create aliased fixture pipe");
+        let alias = duplicate_internal_fd(&write, "fixture alias").expect("duplicate fixture pipe");
+        assert!(
+            same_open_file_by_procfs(write.as_raw_fd(), alias.as_raw_fd())
+                .expect("compare aliased descriptors without kcmp")
+        );
+        let (_other_read, other_write) =
+            internal_pipe("other read", "other write").expect("create distinct fixture pipe");
+        assert!(
+            !same_open_file_by_procfs(write.as_raw_fd(), other_write.as_raw_fd())
+                .expect("compare distinct descriptors without kcmp")
+        );
     }
 
     #[test]
