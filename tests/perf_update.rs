@@ -19,7 +19,9 @@ mod perf_policy;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{BufWriter, Read as _, Write as _};
+#[cfg(target_os = "linux")]
+use std::io::Read as _;
+use std::io::{BufWriter, Write as _};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
@@ -145,8 +147,19 @@ fn canonical_executable(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!("tool path is not absolute: {}", path.display()));
     }
-    let canonical = fs::canonicalize(path)
-        .map_err(|error| format!("canonicalize {}: {error}", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("tool path has no file name: {}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("tool path has no parent directory: {}", path.display()))?;
+    // Normalize the containing directory but keep the final component
+    // unresolved: argv[0]-dispatched proxies (rustup shims) must keep their
+    // selected name, so resolving `cargo` to the `rustup` manager binary
+    // would execute the tool under the wrong identity.
+    let canonical = fs::canonicalize(parent)
+        .map_err(|error| format!("canonicalize {}: {error}", parent.display()))?
+        .join(name);
     let metadata = fs::metadata(&canonical)
         .map_err(|error| format!("inspect {}: {error}", canonical.display()))?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
@@ -836,10 +849,20 @@ fn public_version_token(name: &str, version: &str) -> bool {
 }
 
 fn tool_version(name: &str, program: &Path, args: &[&str]) -> String {
-    let output = Command::new(program)
-        .args(args)
-        .env_clear()
-        .env("LC_ALL", "C")
+    let mut command = Command::new(program);
+    command.args(args).env_clear().env("LC_ALL", "C");
+    // Rustup shims resolve the active toolchain from these variables; without
+    // them the probe fails even though `cargo test` itself runs through the
+    // same shim. Only the parsed version line is recorded, so passing the
+    // resolution environment cannot leak private paths into the metadata.
+    if matches!(name, "cargo" | "rustc") {
+        for key in ["RUSTUP_TOOLCHAIN", "RUSTUP_HOME", "CARGO_HOME", "HOME"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+    }
+    let output = command
         .output()
         .unwrap_or_else(|error| panic!("run {name} metadata command: {error}"));
     assert!(output.status.success(), "{name} metadata command failed");
@@ -5343,6 +5366,40 @@ fn rustup_style_build_tool_directory_is_a_supported_fallback() {
     assert_eq!(
         discover_build_tool("rustc-fixture", &path).expect("rustup-style tool"),
         fs::canonicalize(rustc).expect("canonical tool")
+    );
+}
+
+#[test]
+fn symlinked_proxy_tool_keeps_its_selected_name() {
+    // Rustup proxies dispatch on argv[0]: resolving the `cargo` symlink to the
+    // manager binary would report `manager --version` instead of `cargo --version`.
+    // The manager also needs its resolution environment (like rustup needs HOME
+    // to locate the toolchain), which the version probe must pass through.
+    if std::env::var_os("HOME").is_none() {
+        panic!("proxy tool test requires HOME in the test environment");
+    }
+    let scratch = Scratch::new_exec("perf-proxy-tools").expect("scratch");
+    let bin = scratch.path().join("bin");
+    fs::create_dir_all(&bin).expect("tool directory");
+    let manager = bin.join("manager");
+    fs::write(
+        &manager,
+        "#!/bin/sh\n[ -n \"$HOME\" ] || exit 1\ncase \"${0##*/}\" in\ncargo) printf 'cargo 1.2.3 (fixture)\\n';;\n*) printf 'manager 9.9.9 (fixture)\\n';;\nesac\n",
+    )
+    .expect("manager fixture");
+    fs::set_permissions(&manager, fs::Permissions::from_mode(0o700)).expect("chmod manager");
+    let proxy = bin.join("cargo");
+    std::os::unix::fs::symlink(&manager, &proxy).expect("proxy symlink");
+    let path = std::env::join_paths([bin]).expect("fixture PATH");
+
+    let resolved = discover_build_tool("cargo", &path).expect("proxy tool");
+    assert_eq!(
+        resolved.file_name().expect("proxy file name"),
+        OsStr::new("cargo")
+    );
+    assert_eq!(
+        tool_version("cargo", &resolved, &["--version"]),
+        "cargo 1.2.3"
     );
 }
 
