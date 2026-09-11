@@ -593,10 +593,20 @@ with tempfile.TemporaryDirectory() as temporary:
         pass_fds=session_fds(),
     )
     deadline = time.monotonic() + 5
-    while (not ready.exists() or not descendant.exists()) and time.monotonic() < deadline:
+    pid_text = ""
+    while time.monotonic() < deadline:
+        # Existence races the writer's flush: the file appears at open()
+        # time but may still be empty, so wait for content, not the path.
+        if ready.exists() and descendant.exists():
+            try:
+                pid_text = descendant.read_text(encoding="ascii").strip()
+            except OSError:
+                pid_text = ""
+            if pid_text:
+                break
         time.sleep(0.01)
-    assert ready.exists() and descendant.exists(), child.poll()
-    pid = int(descendant.read_text(encoding="ascii"))
+    assert ready.exists() and pid_text, child.poll()
+    pid = int(pid_text)
     pidfd = os.pidfd_open(pid)
     os.kill(child.pid, signal.SIGTERM)
     _stdout, stderr = child.communicate(timeout=7)
