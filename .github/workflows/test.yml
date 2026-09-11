@@ -25,9 +25,16 @@ jobs:
       # performance job below. Keep the portable matrix deterministic.
       test-command: |
         cargo test --locked
-        rustfmt --check support/performance-command-supervisor.rs tests/support/performance-supervisor-fixture.rs
         bash tests/run
         bash tests/release-scripts-test
+      # Formatting is platform-independent, so check it once on the
+      # Ubuntu quality gate (which installs the rustfmt component)
+      # instead of on every platform container. The two supervisor
+      # sources compile outside Cargo targets, so `cargo fmt` skips
+      # them and they need the explicit `rustfmt` line.
+      fmt-command: |
+        cargo fmt --check
+        rustfmt --check support/performance-command-supervisor.rs tests/support/performance-supervisor-fixture.rs
       # Native integration tests retain the public Python timeout helper as an
       # external-suite compatibility boundary. Minimal Rust images do not
       # otherwise install its interpreter.
