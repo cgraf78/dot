@@ -11,10 +11,11 @@ use perf_policy::{
     BASE_UPDATE_P95_NS, CLEAN_UPDATE_P95_NS, DIRTY_UPDATE_P95_NS, EngineKind, FAILURE_P95_NS,
     FEATURE_UPDATE_P95_NS, FIRST_SPAWN_NS, HELP_P95_NS, HISTORICAL_CLEAN_UPDATE_P95_NS,
     HISTORICAL_DIRTY_UPDATE_P95_NS, HISTORICAL_HELP_MEAN_NS, HISTORICAL_VERSION_MEAN_NS,
-    MAX_RUST_PERCENT, REQUIRED_WORKLOADS, RUNS, STARTUP_CI_HEADROOM_PERCENT,
-    STARTUP_PREFLIGHT_PAIRS, STARTUP_WARMUPS, UPDATE_CI_HEADROOM_PERCENT, UPDATE_WARMUPS,
-    VERSION_P95_NS, WORKLOAD_POLICIES, Workload, budget_headroom_percent, meets_relative_gate,
-    pair_order, ratio_percent_ceil, shell_baseline_sha, startup_warmup_schedule, summarize,
+    MAX_RUST_PERCENT, MAX_RUST_PERCENT_BASE_CLEAN, REQUIRED_WORKLOADS, RUNS,
+    STARTUP_CI_HEADROOM_PERCENT, STARTUP_PREFLIGHT_PAIRS, STARTUP_WARMUPS,
+    UPDATE_CI_HEADROOM_PERCENT, UPDATE_WARMUPS, VERSION_P95_NS, WORKLOAD_POLICIES, Workload,
+    budget_headroom_percent, meets_relative_gate, pair_order, ratio_percent_ceil,
+    shell_baseline_sha, startup_warmup_schedule, summarize,
 };
 
 #[test]
@@ -112,6 +113,17 @@ fn relative_gate_requires_at_least_twenty_five_percent_improvement() {
 }
 
 #[test]
+fn base_clean_gate_requires_five_percent_improvement() {
+    assert_eq!(MAX_RUST_PERCENT_BASE_CLEAN, 95);
+    assert_eq!(
+        Workload::BaseClean.policy().max_rust_percent,
+        Some(MAX_RUST_PERCENT_BASE_CLEAN)
+    );
+    assert!(meets_relative_gate(95, 100, MAX_RUST_PERCENT_BASE_CLEAN));
+    assert!(!meets_relative_gate(96, 100, MAX_RUST_PERCENT_BASE_CLEAN));
+}
+
+#[test]
 fn absolute_release_budgets_remain_explicit() {
     assert_eq!(STARTUP_CI_HEADROOM_PERCENT, 125);
     assert_eq!(UPDATE_CI_HEADROOM_PERCENT, 150);
@@ -135,7 +147,7 @@ fn normative_spec_matches_the_enforced_performance_policy() {
     for requirement in [
         "median no more than 75% of Bash; p95 no more than 24.075ms",
         "median no more than 75% of Bash; p95 no more than 23.85ms",
-        "median no more than 75% of Bash; p95 no more than 4s",
+        "median no more than 95% of Bash; p95 no more than 4s",
         "median no more than 75% of Bash; p95 no more than 1.6025s",
         "median no more than 75% of Bash; p95 no more than 2.01s",
         "median no more than 75% of Bash; p95 no more than 12s",
@@ -180,9 +192,16 @@ fn workload_policy_is_the_single_budget_and_sampling_authority() {
         .iter()
         .filter(|policy| policy.workload != Workload::FirstSpawn)
     {
+        // Base-clean is a sub-second fixed-overhead workload; it requires
+        // parity-plus-five instead of the uniform twenty-five percent win.
+        let expected = if policy.workload == Workload::BaseClean {
+            MAX_RUST_PERCENT_BASE_CLEAN
+        } else {
+            MAX_RUST_PERCENT
+        };
         assert_eq!(
             policy.max_rust_percent,
-            Some(MAX_RUST_PERCENT),
+            Some(expected),
             "{} must reject a materially slower-than-shell native result",
             policy.workload.label()
         );

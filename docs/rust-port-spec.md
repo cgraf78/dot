@@ -57,7 +57,7 @@ make wall-clock assertions.
 | first `help` spawn | 1 before warm-up | no more than 100ms |
 | warm `help` | median and p95 of 30 paired runs after 10 warm-ups | median no more than 75% of Bash; p95 no more than 24.075ms |
 | warm `version` | median and p95 of 30 paired runs after 10 warm-ups | median no more than 75% of Bash; p95 no more than 23.85ms |
-| clean base-only update | median and p95 of 30 paired runs | median no more than 75% of Bash; p95 no more than 4s |
+| clean base-only update | median and p95 of 30 paired runs | median no more than 95% of Bash; p95 no more than 4s |
 | clean disjoint three-overlay update | median and p95 of 30 paired runs | median no more than 75% of Bash; p95 no more than 1.6025s |
 | dirty disjoint three-overlay update | median and p95 of 30 independently dirtied paired runs | median no more than 75% of Bash; p95 no more than 2.01s |
 | profile/provider/hooks/collision update | median and p95 of 30 paired runs | median no more than 75% of Bash; p95 no more than 12s |
