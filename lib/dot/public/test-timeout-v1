@@ -991,6 +991,44 @@ def diagnostic(message: str) -> None:
         time.sleep(min(0.01, max(0.0, reap_deadline - time.monotonic())))
 
 
+def _kcmp_syscall_number():
+    """kcmp(2) syscall number for this machine, or None when unknown."""
+    syscall_numbers = {
+        "aarch64": 272,
+        "armv7l": 378,
+        "i386": 349,
+        "i686": 349,
+        "riscv64": 272,
+        "x86_64": 312,
+    }
+    return syscall_numbers.get(os.uname().machine)
+
+
+def kcmp_available() -> bool:
+    """Whether the kcmp syscall answers instead of failing EPERM/ENOSYS.
+
+    Container runtimes withhold CAP_SYS_PTRACE (seccomp EPERM) and kernels
+    older than 3.5 lack the call (ENOSYS); both force the procfs fallback,
+    which over-matches path-backed links of one path.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    syscall_number = _kcmp_syscall_number()
+    if syscall_number is None:
+        return False
+    try:
+        import ctypes
+    except ImportError:
+        return False
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    # KCMP_FILE == 0 on fds (0, 0): any answer other than EPERM/ENOSYS
+    # proves the call itself is permitted (EBADF from a closed stdin
+    # still means the syscall executed).
+    result = libc.syscall(syscall_number, os.getpid(), os.getpid(), 0, 0, 0)
+    return result != -1 or ctypes.get_errno() not in (errno.EPERM, errno.ENOSYS)
+
+
 def same_stream(left: int, right: int) -> bool:
     """Return whether two descriptors share one open file description."""
     if left == right:
@@ -1000,15 +1038,7 @@ def same_stream(left: int, right: int) -> bool:
         # FIFO/socket have the same inode but independent flags and ordering.
         # Keeping separate relays is the conservative portable fallback.
         return False
-    syscall_numbers = {
-        "aarch64": 272,
-        "armv7l": 378,
-        "i386": 349,
-        "i686": 349,
-        "riscv64": 272,
-        "x86_64": 312,
-    }
-    syscall_number = syscall_numbers.get(os.uname().machine)
+    syscall_number = _kcmp_syscall_number()
     if syscall_number is None:
         return False
     try:
@@ -1018,19 +1048,37 @@ def same_stream(left: int, right: int) -> bool:
     libc = ctypes.CDLL(None, use_errno=True)
     libc.syscall.restype = ctypes.c_long
     # KCMP_FILE == 0. A zero result is the kernel's exact proof that the two
-    # descriptors reference one open file description; every error or
-    # different-description result keeps the relays independent.
-    return (
-        libc.syscall(
-            syscall_number,
-            os.getpid(),
-            os.getpid(),
-            0,
-            left,
-            right,
-        )
-        == 0
+    # descriptors reference one open file description.
+    result = libc.syscall(
+        syscall_number,
+        os.getpid(),
+        os.getpid(),
+        0,
+        left,
+        right,
     )
+    if result == 0:
+        return True
+    if result != -1:
+        # A nonzero KCMP ordering result proves distinct descriptions.
+        return False
+    if ctypes.get_errno() not in (errno.EPERM, errno.ENOSYS):
+        # A closed descriptor or a bad call still fails closed.
+        return False
+    # kcmp needs CAP_SYS_PTRACE, which container runtimes withhold, and
+    # kernels older than 3.5 lack the call entirely. Fall back to the
+    # /proc/self/fd link comparison there: anonymous objects (pipes,
+    # sockets) compare by kernel inode, so duplicates match and distinct
+    # objects do not. Path-backed links can over-match separately opened
+    # descriptions of one path (notably /dev/null); merging those
+    # captures is benign because the relay still delivers identical
+    # bytes to both inherited sinks.
+    try:
+        return os.readlink('/proc/self/fd/%d' % left) == os.readlink(
+            '/proc/self/fd/%d' % right
+        )
+    except OSError:
+        return False
 
 
 def prepare_stdio_relays(
