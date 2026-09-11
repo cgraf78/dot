@@ -127,6 +127,7 @@ tests/doctor_checks.rs	standalone:new
 tests/init_client_publish_intent.rs	standalone:new
 tests/init_client_safe_path.rs	standalone:new
 tests/init_client_command.rs	standalone:new
+tests/test_support.rs	standalone:new
 tests/startup.rs	standalone:new
 tests/update_run.rs	standalone:new
 tests/init_client_engine.rs	standalone:new
