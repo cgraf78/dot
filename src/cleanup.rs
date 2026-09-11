@@ -828,11 +828,27 @@ fn receive_nested_registration(
     message.msg_controllen = control_bytes as _;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let flags = libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC;
+    // The control socket is already nonblocking, so per-call flags are
+    // redundant here. macOS CI invalidates the nested-supervisor channel on
+    // every session while Linux never does; pass no flags so a platform
+    // quirk in flag handling cannot fail the receive.
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let flags = libc::MSG_DONTWAIT;
+    let flags = 0;
     let received = unsafe { libc::recvmsg(control.as_raw_fd(), &mut message, flags) };
     if received < 0 {
         let error = std::io::Error::last_os_error();
+        // TEMP-DIAG-180: remove once macOS control-channel failures are
+        // root-caused. Logs the raw errno behind a channel invalidation.
+        if !matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) {
+            eprintln!(
+                "TEMP-DIAG-180: nested-control recvmsg failed: {error:?} \
+                 (raw_os_error={:?})",
+                error.raw_os_error()
+            );
+        }
         return if matches!(
             error.kind(),
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
@@ -3560,6 +3576,8 @@ impl NestedControlWorker {
                             ) && !links.contains_key(&registration.boundary)
                                 && links.len() < MAX_ACTIVE_NESTED_SESSIONS;
                             if !valid || registration.link.write_all(&[1]).is_err() {
+                                // TEMP-DIAG-180: remove with the recvmsg diag.
+                                eprintln!("TEMP-DIAG-180: nested-control cleared: invalid frame");
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -3578,7 +3596,11 @@ impl NestedControlWorker {
                             );
                         }
                         Ok(None) => break,
-                        Err(_) => {
+                        Err(error) => {
+                            // TEMP-DIAG-180: remove with the recvmsg diag.
+                            eprintln!(
+                                "TEMP-DIAG-180: nested-control cleared: receive error {error:?}"
+                            );
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.complete = false;
                             state.supervisors.clear();
@@ -3593,6 +3615,10 @@ impl NestedControlWorker {
                     match link.read(&mut byte) {
                         Ok(0) => closed.push(boundary.clone()),
                         Ok(_) => {
+                            // TEMP-DIAG-180: remove with the recvmsg diag.
+                            eprintln!(
+                                "TEMP-DIAG-180: nested-control cleared: unexpected link byte"
+                            );
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.complete = false;
                             state.supervisors.clear();
@@ -5864,6 +5890,8 @@ impl Session {
             return self.control_complete;
         };
         if Instant::now() >= deadline {
+            // TEMP-DIAG-180: remove with the recvmsg diag.
+            eprintln!("TEMP-DIAG-180: nested-control cleared: drain past deadline");
             self.invalidate_nested_control();
             return false;
         }
@@ -6458,6 +6486,27 @@ mod tests {
 
         let (receiver, writer) = internal_datagram_pair().unwrap();
         receiver.set_nonblocking(true).unwrap();
+        // The burst below queues 128 datagrams before the worker starts.
+        // Linux buffers absorb that; macOS defaults return ENOBUFS once
+        // the small socket buffer fills. Size both ends for the burst so
+        // the test exercises the tick budget, not buffer exhaustion.
+        // (Kernels silently clamp; the burst needs well under a megabyte.)
+        for socket in [&receiver, &writer] {
+            let size: libc::c_int = 512 * 1024;
+            let size_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            for option in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+                let result = unsafe {
+                    libc::setsockopt(
+                        socket.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        option,
+                        (&size as *const libc::c_int).cast(),
+                        size_len,
+                    )
+                };
+                assert_eq!(result, 0, "test socket buffer sizing");
+            }
+        }
         let mut registrations = Vec::new();
         for index in 0..128 {
             let (local, parent) = internal_stream_pair().unwrap();
