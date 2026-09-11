@@ -13,8 +13,6 @@ release_slug='dot'
 release_asset_name='dot'
 release_binary='dot'
 release_binary_dest='dot'
-release_binary_version_style='commit'
-release_install_init_subcommand='init'
 release_manpage_path=''
 owner_marker='cgraf78/actions release-installer v1'
 
@@ -32,34 +30,6 @@ man_target=
 published_stable=0
 published_command=0
 published_man=0
-probe_pid=
-probe_group_owned=0
-probe_pending_status=0
-
-stop_probe() {
-  local grace_deadline
-
-  if [[ "$probe_group_owned" -eq 1 && "$probe_pid" =~ ^[1-9][0-9]*$ ]]; then
-    kill -TERM -- "-$probe_pid" 2>/dev/null || true
-    grace_deadline=$((SECONDS + 1))
-    while kill -0 -- "-$probe_pid" 2>/dev/null &&
-      [[ "$SECONDS" -lt "$grace_deadline" ]]; do
-      sleep 0.1
-    done
-    if kill -0 -- "-$probe_pid" 2>/dev/null; then
-      kill -KILL -- "-$probe_pid" 2>/dev/null || true
-    fi
-  elif [[ "$probe_pid" =~ ^[1-9][0-9]*$ ]]; then
-    # A signal may arrive after spawn but before negative-PGID ownership is
-    # proven. At that point only the exact direct child is safe to address.
-    kill -KILL "$probe_pid" 2>/dev/null || true
-  fi
-  if [[ "$probe_pid" =~ ^[1-9][0-9]*$ ]]; then
-    wait "$probe_pid" 2>/dev/null || true
-  fi
-  probe_group_owned=0
-  probe_pid=
-}
 
 rollback_published_link() {
   local path=$1 target=$2 published=$3
@@ -75,9 +45,7 @@ rollback_published_link() {
 
 cleanup() {
   status=$?
-  # Cleanup owns the verified probe group once it starts. Ignore repeated
-  # termination signals so they cannot interrupt the bounded TERM/KILL reap.
-  trap - EXIT HUP INT TERM
+  trap - EXIT
   # Public links are all-or-nothing. Destination preflight catches ordinary
   # collisions, but a late filesystem or ln failure can still occur after an
   # earlier link was created. Roll back only links first published by this
@@ -86,7 +54,6 @@ cleanup() {
   rollback_published_link "$man_link" "$man_target" "$published_man"
   rollback_published_link "$command_link" "$command_target" "$published_command"
   rollback_published_link "$stable_root" "$stable_target" "$published_stable"
-  stop_probe
   if [[ -n "$incoming" && -d "$incoming" && ! -L "$incoming" ]]; then
     rm -rf "$incoming"
   fi
@@ -102,9 +69,6 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 die() {
   printf 'install.sh: %s\n' "$*" >&2
@@ -143,10 +107,6 @@ Options:
   --man-dir PATH     manual-page directory (default: DATA_HOME/man/man1)
   -h, --help         show this help
 EOF
-  if [[ -n "$release_install_init_subcommand" ]]; then
-    printf '%s\n' \
-      '  --init [ARGS...]  run initialization after install (must be last option)'
-  fi
 }
 
 require_value() {
@@ -166,8 +126,6 @@ data_home=
 bin_dir=
 man_dir=
 archive_is_private=0
-init_requested=0
-init_args=()
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -204,17 +162,6 @@ while [[ $# -gt 0 ]]; do
       require_value "$1" "${2:-}"
       man_dir=$2
       shift 2
-      ;;
-    --init)
-      if [[ -z "$release_install_init_subcommand" ]]; then
-        printf 'install.sh: unknown option: %s\n' "$1" >&2
-        usage >&2
-        exit 2
-      fi
-      init_requested=1
-      shift
-      init_args=("$@")
-      set --
       ;;
     *)
       printf 'install.sh: unknown option: %s\n' "$1" >&2
@@ -355,13 +302,12 @@ fi
 
 if [[ -z "$archive" ]]; then
   command -v curl >/dev/null 2>&1 || die 'curl is required for online installation'
-  command -v gh >/dev/null 2>&1 ||
-    die 'gh is required for online attestation verification'
   [[ -z "$checksum" ]] || die '--checksum is valid only with --archive'
 
   # Bound connection setup, silent bodies, trickling transfers, and transient
-  # failures for all three release-download requests. At their worst-case retry
-  # windows they consume 546 seconds, below a ten-minute download budget.
+  # failures for every GitHub request. Three calls at their worst-case retry
+  # windows consume 546 seconds, below the online installer's ten-minute
+  # network budget.
   curl_net_opts=(
     --connect-timeout 10
     --max-time 60
@@ -461,11 +407,6 @@ fi
 actual_sha=$(sha256_file "$archive")
 [[ "$actual_sha" == "$expected_sha" ]] ||
   die "checksum mismatch for $archive_name"
-if [[ "$archive_is_private" -eq 1 ]]; then
-  gh attestation verify "$archive" --repo "$release_repo" \
-    --signer-repo cgraf78/actions >/dev/null ||
-    die "artifact attestation verification failed for $archive_name"
-fi
 
 archive_list=$scratch/archive.list
 archive_normalized=$scratch/archive.normalized
@@ -556,115 +497,6 @@ validate_metadata_identity() {
 }
 
 validate_metadata_identity "$metadata"
-
-version_output=$scratch/binary.version
-mkdir -m 0700 "$scratch/home" "$scratch/config" "$scratch/cache" \
-  "$scratch/data" "$scratch/tmp" ||
-  die 'cannot create isolated directories for release binary validation'
-if [[ "$release_platform" == android-* ]]; then
-  safe_path=$PREFIX/bin
-  env_command=$PREFIX/bin/env
-else
-  safe_path=/usr/bin:/bin
-  env_command=/usr/bin/env
-fi
-[[ -x "$env_command" ]] ||
-  die "cannot isolate release binary environment: $env_command"
-
-run_binary_version() {
-  local pid deadline status monitor_was_set=0 group_owned=0
-  local probe_start=$scratch/probe.start
-
-  probe_pending_status=0
-  trap 'probe_pending_status=129' HUP
-  trap 'probe_pending_status=130' INT
-  trap 'probe_pending_status=143' TERM
-  case $- in *m*) monitor_was_set=1 ;; esac
-  set -m
-  (
-    trap - HUP INT TERM
-    while [[ ! -f "$probe_start" ]]; do :; done
-    cd "$scratch" || exit 1
-    # Bash defines this limit in 1024-byte blocks. The kernel stops a noisy or
-    # hostile probe even between the supervisor's portable polling intervals.
-    ulimit -f 1
-    exec "$env_command" -i HOME="$scratch/home" \
-      XDG_CONFIG_HOME="$scratch/config" XDG_CACHE_HOME="$scratch/cache" \
-      XDG_DATA_HOME="$scratch/data" TMPDIR="$scratch/tmp" LC_ALL=C \
-      PATH="$safe_path" "$binary" --version
-  ) >"$version_output" 2>&1 &
-  pid=$!
-  probe_pid=$pid
-  # Test fixtures instrument this exact marker to exercise the otherwise tiny
-  # deferred-signal window without adding a runtime test hook.
-  : 'probe direct child ownership published'
-  if [[ "$monitor_was_set" -eq 0 ]]; then
-    set +m
-  fi
-
-  # Monitor mode gives each asynchronous job its own process group led by $!.
-  # Prove that exact negative group exists before ever using a group signal;
-  # this prevents a failed setup from signaling the installer's own group.
-  if kill -0 -- "-$pid" 2>/dev/null; then
-    group_owned=1
-  fi
-  if [[ "$group_owned" -eq 0 ]]; then
-    stop_probe
-    trap 'exit 129' HUP
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    die 'cannot create an owned process group for release binary validation'
-  fi
-  probe_group_owned=1
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  if [[ "$probe_pending_status" -ne 0 ]]; then
-    exit "$probe_pending_status"
-  fi
-  : >"$probe_start"
-
-  # `$SECONDS` is a Bash 3.2 wall-clock counter. Do not approximate a deadline
-  # by counting subprocess-heavy polls: process startup is much slower on the
-  # stock macOS shell and can turn a nominal five seconds into tens of seconds.
-  deadline=$((SECONDS + 5))
-  while [[ "$group_owned" -eq 1 ]] && kill -0 -- "-$pid" 2>/dev/null &&
-    [[ "$SECONDS" -lt "$deadline" ]]; do
-    sleep 0.2
-  done
-
-  if [[ "$group_owned" -eq 1 ]] && kill -0 -- "-$pid" 2>/dev/null; then
-    stop_probe
-    die "release binary --version exceeded its deadline or output limit"
-  fi
-
-  if wait "$pid"; then
-    status=0
-  else
-    status=$?
-  fi
-  probe_group_owned=0
-  probe_pid=
-  [[ "$status" -eq 0 ]] ||
-    die "release binary --version failed: $release_binary_dest"
-}
-
-run_binary_version
-version_bytes=$(wc -c <"$version_output" | tr -d ' ')
-[[ "$version_bytes" -gt 0 && "$version_bytes" -le 1024 ]] ||
-  die "release binary --version output must contain 1-1024 bytes"
-IFS= read -r version_line <"$version_output" ||
-  die 'release binary --version output must be one newline-terminated line'
-expected_version_bytes=$((${#version_line} + 1))
-[[ "$version_bytes" -eq "$expected_version_bytes" ]] ||
-  die 'release binary --version output must be one line without NUL bytes'
-case "$release_binary_version_style" in
-  version) expected_binary_identity=$metadata_version ;;
-  commit) expected_binary_identity=${metadata_commit:0:12} ;;
-esac
-grep -Eq "(^|[[:space:]])${expected_binary_identity}([[:space:]]|$)" \
-  "$version_output" ||
-  die "release binary --version does not identify $expected_binary_identity"
 
 owner_file=$control_root/owner
 current_link=$control_root/current
@@ -835,21 +667,3 @@ published_man=0
 
 printf 'Installed %s %s for %s\n' \
   "$release_slug" "$release_version" "$release_platform"
-
-if [[ "$init_requested" -eq 1 ]]; then
-  # Initialization is a consumer command, not part of installation's atomic
-  # publication transaction. Release ownership and scratch state before it so
-  # failure cannot roll back a complete install or retain the installer lock.
-  rmdir "$lock_dir" || die "cannot release installer lock: $lock_dir"
-  lock_held=0
-  rm -rf "$scratch"
-  scratch=
-  trap - EXIT
-  if "$release_dir/$release_binary_dest" "$release_install_init_subcommand" \
-    ${init_args[@]+"${init_args[@]}"}; then
-    exit 0
-  else
-    init_status=$?
-    exit "$init_status"
-  fi
-fi
