@@ -3411,6 +3411,11 @@ fn decide_after_cleanup(
         Ok(status) => status,
         Err(error) => {
             eprintln!("DOT_TEARDOWN_FAIL: {error:?}");
+            // TEMP-DIAG-180: remove with the recvmsg diag.
+            eprintln!(
+                "TEMP-DIAG-180: decide: cleanup err preempts (deferred={})",
+                deferred_error.is_some()
+            );
             CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
             return Ok(SessionEnd::CleanupIncomplete);
         }
@@ -3720,7 +3725,11 @@ impl NestedControlWorker {
                 for (boundary, (_pid, link)) in &mut links {
                     let mut byte = [0u8; 1];
                     match link.read(&mut byte) {
-                        Ok(0) => closed.push(boundary.clone()),
+                        Ok(0) => {
+                            // TEMP-DIAG-180: remove with the recvmsg diag.
+                            eprintln!("TEMP-DIAG-180: nested-control link EOF: {boundary}");
+                            closed.push(boundary.clone())
+                        }
                         Ok(_) => {
                             // TEMP-DIAG-180: remove with the recvmsg diag.
                             eprintln!(
@@ -3734,7 +3743,13 @@ impl NestedControlWorker {
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(_) => closed.push(boundary.clone()),
+                        Err(error) => {
+                            // TEMP-DIAG-180: remove with the recvmsg diag.
+                            eprintln!(
+                                "TEMP-DIAG-180: nested-control link read error: {boundary} {error:?}"
+                            );
+                            closed.push(boundary.clone())
+                        }
                     }
                 }
                 if !closed.is_empty() {
@@ -5796,6 +5811,8 @@ fn merge_authority_errors(
     tick_result?;
     for session in sessions {
         if let Some(error) = session.authority_error.take() {
+            // TEMP-DIAG-180: remove with the recvmsg diag.
+            eprintln!("TEMP-DIAG-180: authority refusal merged");
             return Err(error);
         }
     }
@@ -6398,6 +6415,8 @@ impl Session {
             // outcome): an unpinned member must never be delivered unsafely,
             // and the caller must handle the refusal explicitly.
             CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
+            // TEMP-DIAG-180: remove with the recvmsg diag.
+            eprintln!("TEMP-DIAG-180: authority refusal set");
             self.authority_error = Some(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "safe descendant delivery has no stable process authority",
@@ -6611,8 +6630,18 @@ mod tests {
                     .expect("private registration"),
             );
         }
+        let mut iterations = 0u32;
         poll_until(Instant::now() + Duration::from_secs(1), || {
             let state = state.lock().unwrap_or_else(|error| error.into_inner());
+            iterations += 1;
+            // TEMP-DIAG-180: remove with the recvmsg diag.
+            if iterations % 10 == 1 {
+                eprintln!(
+                    "TEMP-DIAG-180: nested-control poll: len={} complete={}",
+                    state.supervisors.len(),
+                    state.complete,
+                );
+            }
             Ok((state.supervisors.len() == tokens.len()).then_some(()))
         })
         .unwrap();
