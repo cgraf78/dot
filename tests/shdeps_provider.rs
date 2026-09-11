@@ -9,7 +9,11 @@ use std::fs::File;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io::{Read as _, Write as _};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::fd::AsRawFd as _;
+// FromRawFd transfers only happen on the PTY-capable platforms; Android's
+// pidfd path brings its own scoped import.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::fd::FromRawFd as _;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -1365,6 +1369,7 @@ impl TestSessionChild {
         )
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn observe_foreground(&mut self, identity: TestProcessIdentity) {
         self.foreground =
             Some(PinnedTestProcess::claim(identity).expect("pin foreground fixture identity"));
@@ -1543,8 +1548,10 @@ fn spawn_on_pty(mut command: Command) -> (TestSessionChild, File) {
                 &mut master_fd,
                 &mut slave_fd,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                // macOS takes *mut termios/*mut winsize while Linux takes
+                // *const; null_mut() satisfies both through coercion.
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0,
@@ -1618,7 +1625,7 @@ fn wait_for_foreground(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wait_for_identity_exit(identity: &TestProcessIdentity, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while same_process(identity) && std::time::Instant::now() < deadline {
@@ -2166,12 +2173,14 @@ fn provider_int_cancellation_reaps_session() {
         // SAFETY: PR_SET_CHILD_SUBREAPER accepts the integer enable flag.
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
     }
-    let (provider, descendant) = assert_provider_signal(libc::SIGINT, 130);
+    // Underscored: only the Linux/Android identity comparison below reads
+    // the pair; every platform still runs the cancellation helper itself.
+    let (_provider, _descendant) = assert_provider_signal(libc::SIGINT, 130);
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let provider_exists = same_process(&provider);
-        let descendant_exists = same_process(&descendant);
-        for identity in [&provider, &descendant] {
+        let provider_exists = same_process(&_provider);
+        let descendant_exists = same_process(&_descendant);
+        for identity in [&_provider, &_descendant] {
             if same_process(identity) {
                 // SAFETY: a matching generation is still an unreaped child of
                 // this subreaper, so its positive PID cannot be recycled.

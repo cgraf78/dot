@@ -446,8 +446,10 @@ mod tests {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    // macOS takes *mut termios/*mut winsize while Linux takes
+                    // *const; null_mut() satisfies both through coercion.
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
@@ -475,7 +477,9 @@ mod tests {
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() < 0
-                    || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) < 0
+                    // ioctl request is c_ulong on Linux/macOS but c_int on Android;
+                    // the inferred cast matches each platform's declaration.
+                    || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0
                     || libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) < 0
                 {
                     Err(std::io::Error::last_os_error())

@@ -438,6 +438,7 @@ impl GuardedDoctorChild {
         Ok(status)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn reap_with_output(&mut self) -> std::io::Result<Output> {
         let output = self
             .child

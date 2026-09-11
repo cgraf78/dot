@@ -12,10 +12,12 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 use dot_test_support::TempDir;
 

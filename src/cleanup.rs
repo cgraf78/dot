@@ -253,6 +253,7 @@ fn session_control(pid: u32) -> Option<std::sync::Arc<std::sync::Mutex<NestedCon
         .map(|(_registration, active)| active.control.clone())
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn is_registered_session_leader(pid: u32) -> bool {
     active_session_boundaries()
         .lock()
@@ -364,6 +365,9 @@ impl Drop for StatusChildRegistration {
     }
 }
 
+// Needed on macOS test builds (registry bookkeeping assertions) in addition
+// to the Linux/Android reconciliation passes that use it in production.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
 fn is_registered_status_child(pid: u32) -> bool {
     active_status_children()
         .lock()
@@ -656,7 +660,8 @@ fn send_nested_registration_with_pid(
     message.msg_iov = &mut iovec;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = control_bytes;
+    // msg_controllen is size_t on Linux but socklen_t (u32) on macOS.
+    message.msg_controllen = control_bytes as _;
     unsafe {
         let header = libc::CMSG_FIRSTHDR(&message);
         if header.is_null() {
@@ -666,7 +671,8 @@ fn send_nested_registration_with_pid(
         }
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as usize;
+        // cmsg_len is size_t on Linux but socklen_t (u32) on macOS.
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as _;
         std::ptr::write(
             libc::CMSG_DATA(header).cast::<libc::c_int>(),
             registration_fd,
@@ -818,7 +824,8 @@ fn receive_nested_registration(
     message.msg_iov = &mut iovec;
     message.msg_iovlen = 1;
     message.msg_control = ancillary.as_mut_ptr().cast();
-    message.msg_controllen = control_bytes;
+    // msg_controllen is size_t on Linux but socklen_t (u32) on macOS.
+    message.msg_controllen = control_bytes as _;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let flags = libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -841,7 +848,8 @@ fn receive_nested_registration(
         while !header.is_null() {
             if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
                 let header_bytes = libc::CMSG_LEN(0) as usize;
-                let payload_bytes = (*header).cmsg_len.saturating_sub(header_bytes);
+                // cmsg_len is size_t on Linux but socklen_t (u32) on macOS.
+                let payload_bytes = ((*header).cmsg_len as usize).saturating_sub(header_bytes);
                 let count = payload_bytes / std::mem::size_of::<libc::c_int>();
                 let values = libc::CMSG_DATA(header).cast::<libc::c_int>();
                 for index in 0..count {
@@ -1127,13 +1135,13 @@ thread_local! {
     static GLOBAL_PROCESS_SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 static FORCE_PIDFD_UNAVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 static FORCE_PROC_SNAPSHOT_UNAVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 static FORCE_FALLBACK_PROCESS_INFO_UNAVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1341,6 +1349,7 @@ fn record_pending_signal() {
     // sigtimedwait consumes all currently pending instances so restoring a
     // caller's disposition cannot deliver a signal that this owner already
     // incorporated into its result.
+    #[cfg(target_os = "linux")]
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
@@ -1367,6 +1376,55 @@ fn record_pending_signal() {
                 Some(libc::EINTR) => continue,
                 _ => break,
             }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    drain_pending_signals_without_sigtimedwait();
+}
+
+/// Pending-signal drain for platforms without `sigtimedwait` (macOS, and
+/// Android below the API level that provides it): `sigpending` observes the
+/// blocked set, the first pending handled signal is latched, and a brief
+/// SIG_IGN round-trip consumes every pending instance before the saved
+/// dispositions are restored. A signal arriving inside the round-trip window
+/// is discarded instead of staying pending; teardown still converges because
+/// the owner either already latched an instance or re-observes on its next
+/// drain. Compiled on Linux for direct test coverage only.
+#[cfg(any(test, not(target_os = "linux")))]
+fn drain_pending_signals_without_sigtimedwait() {
+    // SAFETY: all sets and actions name initialized local storage; the
+    // caller blocks every handled signal, so observation here cannot race
+    // delivery to this thread.
+    unsafe {
+        let mut pending: libc::sigset_t = std::mem::zeroed();
+        if libc::sigpending(&mut pending) != 0 {
+            return;
+        }
+        for signal in HANDLED_SIGNALS {
+            if libc::sigismember(&pending, signal) > 0 {
+                let _ = INTERRUPTED.compare_exchange(
+                    0,
+                    signal,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                break;
+            }
+        }
+        for signal in HANDLED_SIGNALS {
+            let mut saved: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(signal, std::ptr::null(), &mut saved) != 0 {
+                continue;
+            }
+            let mut ignore: libc::sigaction = std::mem::zeroed();
+            ignore.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&mut ignore.sa_mask);
+            if libc::sigaction(signal, &ignore, std::ptr::null_mut()) != 0 {
+                continue;
+            }
+            // Discarding is complete once SIG_IGN is installed; restore the
+            // exact disposition saved above (normally the owner's latch).
+            libc::sigaction(signal, &saved, std::ptr::null_mut());
         }
     }
 }
@@ -1791,7 +1849,7 @@ fn snapshot_process_output(
 
 fn output_relay_child(
     receiver: std::os::unix::net::UnixDatagram,
-    expected_parent: libc::pid_t,
+    _expected_parent: libc::pid_t,
     stdout: Option<std::os::fd::OwnedFd>,
     stderr: Option<std::os::fd::OwnedFd>,
     relay_ready_writer: std::os::unix::net::UnixStream,
@@ -1801,7 +1859,7 @@ fn output_relay_child(
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
-            || libc::getppid() != expected_parent
+            || libc::getppid() != _expected_parent
         {
             libc::_exit(125);
         }
@@ -2675,7 +2733,7 @@ fn proc_process_vanished(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 static FORCE_FAKE_PROC_STAT_ESRCH_ROOT: std::sync::Mutex<Option<std::path::PathBuf>> =
     std::sync::Mutex::new(None);
 
@@ -4653,7 +4711,11 @@ impl OwnedSession {
             // descendant (double-fork + setsid + close-all +
             // env-scrubbed exec) survives this path by design — see the
             // known-limit note on `normal_completion_needs_discovery`.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let leader = child.id();
+            // The reassignment below is Linux/Android-only; macOS only moves
+            // the initial value into the outcome.
+            #[allow(unused_mut)]
             let mut status = child.wait();
             // A group kill leaves known-dead members whose status the
             // registry-validated sweep below cannot consume once the
@@ -5147,7 +5209,7 @@ fn reap_group_stragglers(pgid: u32, deadline: Instant) -> std::io::Result<()> {
 /// teardown reaches adoptees behind a protected child through
 /// [`reap_recorded_descendants`] plus [`reap_session_group_stragglers`]
 /// instead, so no production pass pays a host-wide snapshot.
-#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+#[cfg(all(test, target_os = "linux"))]
 fn scan_and_reap_unregistered_zombies(deadline: Instant) -> std::io::Result<()> {
     // Single pass with no launch quiescence: each candidate is revalidated
     // against live registrations inside reap_observed_zombie, and a zombie
@@ -5473,6 +5535,7 @@ struct Session {
 
 #[derive(Clone, Copy)]
 enum InitialDelivery {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     ExactLeader,
     Group(bool),
 }
@@ -5684,7 +5747,10 @@ impl Session {
                 .find(|process| process.pid == leader)
                 .and_then(|process| process.identity.start),
         });
-        let boundary = session_boundary(leader);
+        // Underscored (not cfg-gated): the lookup keeps the session
+        // registry helpers live on every platform; only the Linux/Android
+        // reconciliation pass below consumes the result.
+        let _boundary = session_boundary(leader);
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let session_lease = session_lease_inode(leader);
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -5701,6 +5767,7 @@ impl Session {
                     .find(|candidate| candidate.pid == process.parent);
                 let inherited =
                     parent_process.is_some_and(|candidate| owned.contains(&candidate.identity));
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 let inherited_delegation = parent_process
                     .is_some_and(|candidate| self.delegated.contains(&candidate.identity));
                 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -5732,7 +5799,7 @@ impl Session {
                     // environment marker lazily keeps a full-table environ
                     // scan per fixpoint pass from burning the verification
                     // budget on a busy host.
-                    let boundary_match = boundary
+                    let boundary_match = _boundary
                         .as_deref()
                         .map(|boundary| process_boundary(process.pid, boundary));
                     match boundary_match.as_ref() {
@@ -5868,6 +5935,7 @@ impl Session {
 
     fn finish_initial_delivery(&mut self, signal: i32, delivery: InitialDelivery) {
         match delivery {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             InitialDelivery::ExactLeader => self.signal_new(signal),
             InitialDelivery::Group(true) => {
                 self.note_group_delivery();
@@ -5890,7 +5958,7 @@ impl Session {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
     fn signal_initial(&mut self, signal: i32) {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
@@ -5929,7 +5997,7 @@ impl Session {
         self.signal_new(signal);
     }
 
-    fn signal_new(&mut self, signal: i32) {
+    fn signal_new(&mut self, _signal: i32) {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let pending = self
@@ -5947,7 +6015,7 @@ impl Session {
             for pid in pending {
                 let member = self.members.get_mut(&pid).expect("retained member");
                 if !member.signaled {
-                    match member.signal(signal) {
+                    match member.signal(_signal) {
                         Ok(true) => member.signaled = true,
                         Ok(false) => {}
                         Err(error) => {
@@ -6551,6 +6619,36 @@ os._exit(0)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command
+    }
+
+    #[test]
+    fn pending_signal_fallback_records_and_consumes_without_sigtimedwait() {
+        // Platforms without sigtimedwait (macOS, Android) drain through
+        // sigpending plus a SIG_IGN round-trip. Block every handled signal
+        // on this thread and target it directly so no other thread can
+        // consume or observe the pending instance.
+        let _signals = Signals::install().unwrap();
+        let _blocked = BlockedLaunchSignals::install().unwrap();
+        // SAFETY: the mask above blocks SIGTERM on this thread, so the
+        // thread-directed signal stays pending for the drain below.
+        assert_eq!(
+            unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTERM) },
+            0
+        );
+        drain_pending_signals_without_sigtimedwait();
+        assert_eq!(
+            INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst),
+            libc::SIGTERM
+        );
+        // SAFETY: sigpending inspects this thread's mask without blocking.
+        unsafe {
+            let mut pending: libc::sigset_t = std::mem::zeroed();
+            assert_eq!(libc::sigpending(&mut pending), 0);
+            assert!(
+                libc::sigismember(&pending, libc::SIGTERM) <= 0,
+                "fallback drain left SIGTERM pending"
+            );
+        }
     }
 
     #[test]
