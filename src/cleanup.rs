@@ -2751,6 +2751,49 @@ fn process_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
     Some(processes)
 }
 
+/// Resolve the group/session pair for one macOS `ps` row.
+///
+/// The supervisor deliberately keeps the leader unreaped until the empty
+/// proof completes, so every macOS observation races a zombie leader:
+/// Darwin answers ESRCH for getpgid/getsid once the process has exited
+/// even though `ps` still lists it. A zombie (`Z...` state) therefore
+/// keeps its row with a self-referential pair: the row is definitively
+/// dead, so the pair preserves the leader-observed proof without
+/// authorizing delivery to any live group (delivery, survivor checks,
+/// and direct-authority escalation only consult live rows). A
+/// non-zombie row that vanished between the listing and the query is
+/// unrelated churn (`Ok(None)`); any other query failure fails the
+/// whole snapshot closed (`Err`).
+#[cfg(any(test, target_os = "macos"))]
+fn macos_row_membership(pid: u32, zombie: bool) -> std::io::Result<Option<(u32, u32)>> {
+    // SAFETY: getpgid/getsid take a PID and no pointers.
+    let group = unsafe { libc::getpgid(pid as libc::pid_t) };
+    let group_errno = if group < 0 {
+        std::io::Error::last_os_error().raw_os_error()
+    } else {
+        None
+    };
+    let session = unsafe { libc::getsid(pid as libc::pid_t) };
+    let session_errno = if session < 0 {
+        std::io::Error::last_os_error().raw_os_error()
+    } else {
+        None
+    };
+    match (group_errno, session_errno) {
+        (None, None) => Ok(Some((group as u32, session as u32))),
+        _ if group_errno.is_none_or(|errno| errno == libc::ESRCH)
+            && session_errno.is_none_or(|errno| errno == libc::ESRCH) =>
+        {
+            if zombie {
+                Ok(Some((pid, pid)))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Err(std::io::Error::other("macOS session query failed")),
+    }
+}
+
 /// Parse the macOS `ps` columns and resolve group/session per PID.
 ///
 /// macOS `ps` has no numeric session/group keywords, so the snapshot
@@ -2776,26 +2819,16 @@ fn parse_macos_ps_snapshot(bytes: &[u8]) -> Option<Vec<ProcessInfo>> {
         if pid == 0 {
             continue;
         }
-        // SAFETY: getpgid/getsid take a PID and no pointers.
-        let group = unsafe { libc::getpgid(pid as libc::pid_t) };
-        if group < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                continue;
-            }
-            return None;
-        }
-        let session = unsafe { libc::getsid(pid as libc::pid_t) };
-        if session < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                continue;
-            }
-            return None;
-        }
+        let (group, session) = match macos_row_membership(pid, state.starts_with('Z')) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => continue,
+            Err(_) => return None,
+        };
         processes.push(ProcessInfo {
             pid,
             parent,
-            group: group as u32,
-            session: session as u32,
+            group,
+            session,
             live: !state.starts_with('Z'),
             identity: ProcessIdentity { pid, start: None },
         });
@@ -9694,6 +9727,38 @@ os._exit(0)
         assert_eq!(parse_ps_snapshot(b"123 S\n"), None);
         assert_eq!(parse_ps_snapshot(b"123 1 123 123 Z\nmalformed\n"), None);
         assert_eq!(parse_ps_snapshot(b"123 1 123 123 S extra\n"), None);
+    }
+
+    #[test]
+    fn macos_membership_reads_live_session_identity() {
+        let pid = std::process::id();
+        let (group, session) = macos_row_membership(pid, false)
+            .expect("live lookup")
+            .expect("live present");
+        assert!(group > 0, "live group must be resolved, got {group}");
+        assert!(session > 0, "live session must be resolved, got {session}");
+    }
+
+    #[test]
+    fn macos_membership_keeps_zombie_rows_without_session_identity() {
+        // A reaped child is the portable stand-in for ESRCH lookups:
+        // Darwin answers ESRCH for getpgid/getsid on zombies too, and
+        // dropping those rows starves the leader-observed proof on macOS.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap true");
+        assert_eq!(
+            macos_row_membership(pid, true).expect("zombie lookup"),
+            Some((pid, pid)),
+            "zombie rows keep a self-referential pair"
+        );
+        assert_eq!(
+            macos_row_membership(pid, false).expect("gone lookup"),
+            None,
+            "vanished non-zombie rows stay unrelated churn"
+        );
     }
 
     #[test]

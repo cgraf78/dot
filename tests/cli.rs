@@ -3381,8 +3381,16 @@ fn assert_native_silent(output: &std::process::Output, label: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.is_empty(), "{label} stdout");
-    assert!(output.stderr.is_empty(), "{label} stderr");
+    assert!(
+        output.stdout.is_empty(),
+        "{label} stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{label} stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Assert the last cron outcome line under a fixture home names
