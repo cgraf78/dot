@@ -2949,7 +2949,8 @@ fn should_skip(root: ClientRoot, relative: &Path) -> bool {
     }
     if matches!(root, ClientRoot::State)
         && (relative == Path::new("dot/bash-v1")
-            || relative == Path::new("shdeps/shdeps.self-update.stamp"))
+            || relative == Path::new("shdeps/shdeps.self-update.stamp")
+            || relative == Path::new("shdeps/.lock"))
     {
         return true;
     }
@@ -4255,6 +4256,24 @@ fn state_snapshot_normalizes_only_documented_engine_private_receipt_fields() {
         b"1700000000\n",
     )
     .expect("shell update stamp");
+    // The provider state lock embeds the holder pid and acquisition time on
+    // both sides; it is runtime metadata, not converged content.
+    fs::write(
+        shell.state.join("shdeps/.lock"),
+        format!(
+            "pid=111\nstate_dir={}/shdeps\nacquired_unix=1700000000\n",
+            shell.state.display()
+        ),
+    )
+    .expect("shell provider lock");
+    fs::write(
+        rust.state.join("shdeps/.lock"),
+        format!(
+            "pid=222\nstate_dir={}/shdeps\nacquired_unix=1700000999\n",
+            rust.state.display()
+        ),
+    )
+    .expect("rust provider lock");
 
     assert_eq!(snapshot_client(&shell), snapshot_client(&rust));
     fs::write(
