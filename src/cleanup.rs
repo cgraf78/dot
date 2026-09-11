@@ -2710,7 +2710,17 @@ fn process_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
     command.args(["-A", "-o", "pid=,ppid=,pgid=,sid=,stat="]);
     let bytes = snapshot(command, deadline)?;
     #[cfg(target_os = "macos")]
-    let processes = parse_macos_ps_snapshot(&bytes)?;
+    let processes = match parse_macos_ps_snapshot(&bytes) {
+        Some(processes) => processes,
+        // TEMP-DIAG-180: remove with the recvmsg diag.
+        None => {
+            eprintln!(
+                "TEMP-DIAG-180: snapshot: macOS ps parse failed ({} bytes)",
+                bytes.len()
+            );
+            return None;
+        }
+    };
     #[cfg(not(target_os = "macos"))]
     let processes = parse_ps_snapshot(&bytes)?;
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -3176,14 +3186,22 @@ impl OwnedMember {
 
 /// Capture a portable process snapshot without a blocking pipe reader thread.
 fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
+    // TEMP-DIAG-180: remove with the recvmsg diag. Identifies which
+    // snapshot stage fails on macOS (every probe session currently burns
+    // its full teardown budget and reports "could not verify").
     if Instant::now() >= deadline {
+        eprintln!("TEMP-DIAG-180: snapshot: deadline already passed at entry");
         return None;
     }
     let (reader, writer) = match internal_stream_pair() {
         Ok(pair) => pair,
-        Err(_) => return None,
+        Err(error) => {
+            eprintln!("TEMP-DIAG-180: snapshot: stream pair failed: {error:?}");
+            return None;
+        }
     };
     if reader.set_nonblocking(true).is_err() {
+        eprintln!("TEMP-DIAG-180: snapshot: nonblocking failed");
         return None;
     }
     // The fallback helper participates in the same launch generation as
@@ -3201,7 +3219,10 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
         .spawn()
     {
         Ok(child) => child,
-        Err(_) => return None,
+        Err(error) => {
+            eprintln!("TEMP-DIAG-180: snapshot: spawn failed: {error:?}");
+            return None;
+        }
     };
     let _registration = StatusChildRegistration::new(child.id());
     drop(fork_registration);
@@ -3214,6 +3235,10 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     use std::io::Read as _;
     loop {
         if Instant::now() >= deadline {
+            eprintln!(
+                "TEMP-DIAG-180: snapshot: read deadline passed with {} bytes",
+                bytes.len()
+            );
             let _ = child.kill();
             let _ = wait_child_until(&mut child, cleanup_deadline());
             return None;
@@ -3225,7 +3250,8 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(_) => {
+            Err(error) => {
+                eprintln!("TEMP-DIAG-180: snapshot: read failed: {error:?}");
                 let _ = child.kill();
                 let _ = wait_child_until(&mut child, cleanup_deadline());
                 return None;
@@ -3235,9 +3261,15 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     // EOF is independent of process exit: a helper may close stdout early.
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success().then_some(bytes),
+            Ok(Some(status)) => {
+                if !status.success() {
+                    eprintln!("TEMP-DIAG-180: snapshot: helper status {status:?}");
+                }
+                return status.success().then_some(bytes);
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             _ => {
+                eprintln!("TEMP-DIAG-180: snapshot: helper did not exit in time");
                 let _ = child.kill();
                 let _ = wait_child_until(&mut child, cleanup_deadline());
                 return None;
