@@ -386,15 +386,21 @@ fn automatic_jobs(runtime: &Runtime) -> Option<String> {
 
 fn probe(runtime: &Runtime, name: &str, args: &[&str]) -> Option<String> {
     let program = runtime.find_on_path(name)?;
-    let output = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .env_clear()
         .envs(runtime.env())
         .current_dir(runtime.cwd())
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
     output.status.success().then(|| {
         let mut value = output.stdout.as_slice();
         while value.last() == Some(&b'\n') {
@@ -494,7 +500,13 @@ fn git(runtime: &Runtime, prefix: &[OsString], args: &[&str]) -> Option<Vec<u8>>
         .stdin(Stdio::null())
         .stderr(Stdio::null());
     crate::temp::sanitize_git_env(&mut command);
-    let output = command.output().ok()?;
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
     output.status.success().then(|| {
         let mut bytes = output.stdout;
         while bytes.last() == Some(&b'\n') {

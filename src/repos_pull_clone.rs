@@ -8,6 +8,7 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -19,8 +20,8 @@ use crate::repos_pull_queries::{
     CandidateEnv, repo_head, terminated_records, validate_candidate_tree,
 };
 use crate::temp::{
-    MoveCache, apply_git_metadata_modes, apply_tracked_file_mode, apply_umask_ceiling, file_digest,
-    file_text_digest, move_noreplace_cached,
+    MoveCache, TMP_RETRIES, apply_git_metadata_modes, apply_tracked_file_mode, apply_umask_ceiling,
+    file_digest, file_text_digest, move_noreplace_cached, random_suffix,
 };
 
 /// `git -C root` prefix for the staged helpers.
@@ -188,6 +189,23 @@ fn remove_stage(stage_root: &Path) {
     let _ = cleanup.remove_path(stage_root);
 }
 
+/// Create the private sibling clone directory without a PATH-resolved
+/// `mktemp` subprocess. `create` is atomic and retries random collisions.
+fn create_stage_root(parent: &Path, name: &str) -> Option<PathBuf> {
+    for _ in 0..TMP_RETRIES {
+        crate::cancellation::check().ok()?;
+        let candidate = parent.join(format!(".{name}.clone.{}", random_suffix()));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&candidate) {
+            Ok(()) => return Some(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// Inputs for [`clone_overlay_staged`]: the clone source and
 /// destination plus the validation context.
 pub struct CloneOverlayInputs<'a> {
@@ -213,27 +231,23 @@ pub fn clone_overlay_staged(
     moves: &mut MoveCache,
     warnings: &mut dyn Write,
 ) -> bool {
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
     let Some((parent, name)) = inputs.path.rsplit_once('/') else {
         return false;
     };
     if parent.is_empty() || parent == inputs.path {
         return false;
     }
-    if !crate::temp::mkdir_forwarded(Path::new(parent), warnings) {
+    if crate::cancellation::check().is_err()
+        || !crate::temp::mkdir_forwarded(Path::new(parent), warnings)
+    {
         return false;
     }
-    let template = format!("{parent}/.{name}.clone.XXXXXX");
-    let stage_root = match std::process::Command::new("mktemp")
-        .arg("-d")
-        .arg(&template)
-        .output()
-    {
-        Ok(output) if output.status.success() => PathBuf::from(
-            String::from_utf8_lossy(&output.stdout)
-                .trim_end()
-                .to_string(),
-        ),
-        _ => return false,
+    let stage_root = match create_stage_root(Path::new(parent), name) {
+        Some(stage_root) => stage_root,
+        None => return false,
     };
     let stage = stage_root.join("checkout");
     let stage_text = stage.to_string_lossy().into_owned();
@@ -241,7 +255,8 @@ pub fn clone_overlay_staged(
     // redirects, so clone diagnostics reach the caller's stderr
     // (`warnings` here). A `--quiet` clone writes no stdout in
     // either outcome, so only stderr forwards.
-    let clone = crate::init_client_identity::host_git_command()
+    let mut clone = crate::init_client_identity::host_git_command();
+    clone
         .args([
             "-c",
             "core.sharedRepository=0700",
@@ -254,8 +269,13 @@ pub fn clone_overlay_staged(
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+        .stderr(Stdio::piped());
+    let clone = crate::cleanup::run_session_output_typed(
+        clone,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    );
     match clone {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
@@ -267,6 +287,10 @@ pub fn clone_overlay_staged(
             remove_stage(&stage_root);
             return false;
         }
+    }
+    if crate::cancellation::check().is_err() {
+        remove_stage(&stage_root);
+        return false;
     }
     let stage_prefix = stage_prefix(&stage_text);
     let commit = repo_head(&stage_prefix);
@@ -291,7 +315,9 @@ pub fn clone_overlay_staged(
         remove_stage(&stage_root);
         return false;
     }
-    if move_noreplace_cached(&stage, Path::new(inputs.path), moves).is_err() {
+    if crate::cancellation::check().is_err()
+        || move_noreplace_cached(&stage, Path::new(inputs.path), moves).is_err()
+    {
         remove_stage(&stage_root);
         return false;
     }

@@ -164,19 +164,27 @@ fn lsof_report(fd: i32) -> Option<(u64, u64, u64, u32)> {
         if !executable {
             continue;
         }
-        output = std::process::Command::new(bin)
-            .args([
-                "-a",
-                "-p",
-                &pid.to_string(),
-                "-d",
-                &fd.to_string(),
-                "-FDiku",
-            ])
-            .output()
-            .ok()
-            .filter(|result| result.status.success())
-            .map(|result| result.stdout);
+        if crate::cancellation::check().is_err() {
+            return None;
+        }
+        let mut command = std::process::Command::new(bin);
+        command.args([
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-d",
+            &fd.to_string(),
+            "-FDiku",
+        ]);
+        output = crate::cleanup::run_session_output(
+            command,
+            None,
+            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+            crate::cleanup::LingerPolicy::Strict,
+        )
+        .ok()
+        .filter(|result| result.status.success())
+        .map(|result| result.stdout);
         // The shell returns after the first usable binary whether or
         // not the query itself succeeded.
         break;

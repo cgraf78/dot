@@ -87,6 +87,9 @@ jobs:
         # copy with permission errors (sibling convention uses
         # $RUNNER_TEMP target dirs for the same reason).
         export CARGO_TARGET_DIR="$RUNNER_TEMP/dot-termux-target"
+        # Compile every test target under Android cfg even though the emulator
+        # runs only the transported release CLI contract.
+        cargo check --locked --tests --target "$RUST_TARGET"
         archive=$(scripts/package-release.sh "$RUST_TARGET" android-x86_64)
         scripts/smoke-release.sh android-x86_64
         mkdir -p .termux-ci

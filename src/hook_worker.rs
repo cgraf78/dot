@@ -5,7 +5,6 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use crate::app::Runtime;
 use crate::profile_lifecycle::{WorkerOutcome, WorkerRun};
@@ -90,7 +89,7 @@ impl Worker {
     /// Run the native pre-sync coordinator's one-use call through the same
     /// sanitized launcher used for lifecycle retirement.
     pub(crate) fn pre_sync(&mut self, call: &crate::pre_sync::Call) -> PreSyncOutcome {
-        let mut command = match self.command(
+        let command = match self.command(
             "pre-sync",
             &call.script,
             &call.temporary,
@@ -104,7 +103,7 @@ impl Worker {
                 return failed_pre_sync(self.runtime.bash_error_line_once(&error));
             }
         };
-        separate(&mut command, &call.temporary)
+        separate(command, &call.temporary)
     }
 
     /// Run one merge hook through the same authenticated worker boundary. Merge
@@ -292,8 +291,7 @@ impl Worker {
         context: &Path,
         token: &str,
     ) -> WorkerOutcome {
-        let mut command = match self.command(mode, script, result_dir, result_file, context, token)
-        {
+        let command = match self.command(mode, script, result_dir, result_file, context, token) {
             Ok(command) => command,
             Err(CommandFailure::Invalid) => {
                 return WorkerOutcome {
@@ -308,7 +306,7 @@ impl Worker {
                 };
             }
         };
-        combined(&mut command, result_dir)
+        combined(command, result_dir)
     }
 }
 
@@ -336,7 +334,7 @@ fn xdg_home(runtime: &Runtime, key: &str, fallback: &str) -> Option<PathBuf> {
 /// Bash's `2>&1` gives both streams one open file description, so writes keep
 /// their observable order. A private scratch file gives `Command` the same
 /// property without racing independent stdout/stderr readers.
-fn combined(command: &mut Command, result_dir: &Path) -> WorkerOutcome {
+fn combined(mut command: Command, result_dir: &Path) -> WorkerOutcome {
     let path = result_dir.join("worker-output");
     let file = match OpenOptions::new()
         .read(true)
@@ -390,7 +388,7 @@ fn stream_file(result_dir: &Path, name: &str) -> std::io::Result<(PathBuf, std::
 /// inherited streams. Files avoid pipe backpressure deadlock; the surrounding
 /// update engine already buffers its command streams, so this adds no output
 /// limit beyond that established update boundary.
-fn separate(command: &mut Command, result_dir: &Path) -> PreSyncOutcome {
+fn separate(mut command: Command, result_dir: &Path) -> PreSyncOutcome {
     let (stdout_path, stdout) = match stream_file(result_dir, "worker-stdout") {
         Ok(capture) => capture,
         Err(_) => return failed_pre_sync(Vec::new()),
@@ -420,41 +418,18 @@ fn separate(command: &mut Command, result_dir: &Path) -> PreSyncOutcome {
 /// Run one user hook in its own session and retain the leader until every
 /// descendant is gone. The CLI owns the signal handler; parallel hook threads
 /// only observe its atomic result and perform teardown for their own session.
-fn wait(command: &mut Command) -> Option<i32> {
+fn wait(command: Command) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt as _;
 
-    if let Some(signal) = crate::cleanup::received_signal() {
-        return Some(128 + signal);
-    }
-    crate::cleanup::isolate(command);
-    let mut child = command.spawn().ok()?;
-    loop {
-        if let Some(signal) = crate::cleanup::received_signal() {
-            // The shell cleanup contract always gives owned work TERM before
-            // bounded KILL escalation. The CLI retains the original signal
-            // separately for its conventional 128+signal exit status.
-            let _ = crate::cleanup::stop_session(&mut child, libc::SIGTERM).ok()?;
-            return Some(128 + signal);
-        }
-        match crate::cleanup::exited(&child) {
-            Ok(true) => {
-                // Retain the exited leader as the session authority until
-                // descendants complete the normal TERM/KILL teardown.
-                let status = crate::cleanup::stop_session(&mut child, libc::SIGTERM).ok()?;
-                if let Some(signal) = crate::cleanup::received_signal() {
-                    return Some(128 + signal);
-                }
-                return Some(
-                    status
-                        .code()
-                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
-                );
-            }
-            Ok(false) => std::thread::sleep(Duration::from_millis(10)),
-            Err(_) => {
-                let _ = crate::cleanup::stop_session(&mut child, libc::SIGKILL);
-                return None;
-            }
+    match crate::cleanup::supervise_session(command, None, |_| Ok(())).ok()? {
+        crate::cleanup::SessionEnd::Exited(status) => Some(
+            status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
+        ),
+        crate::cleanup::SessionEnd::Interrupted(signal) => Some(128 + signal),
+        crate::cleanup::SessionEnd::TimedOut | crate::cleanup::SessionEnd::CleanupIncomplete => {
+            None
         }
     }
 }
@@ -646,7 +621,7 @@ mod tests {
             // SAFETY: getpid returns this live helper and SIGHUP is handled.
             assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGHUP) }, 0);
         });
-        let status = wait(&mut command);
+        let status = wait(command);
         sender.join().unwrap();
         assert_eq!(status, Some(128 + libc::SIGHUP));
         let later = scope.path().join("later");
@@ -657,12 +632,13 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        assert_eq!(wait(&mut later_command), Some(128 + libc::SIGHUP));
+        assert_eq!(wait(later_command), Some(128 + libc::SIGHUP));
         assert!(!later.exists(), "a hook started after cancellation");
         assert_eq!(signals.finish(0), 128 + libc::SIGHUP);
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn signal_during_completed_worker_teardown_owns_status() {
         const HELPER: &str = "DOT_HOOK_TEARDOWN_SIGNAL_HELPER";
         if std::env::var_os(HELPER).is_none() {
@@ -699,11 +675,12 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let signals = crate::cleanup::Signals::install().unwrap();
-        assert_eq!(wait(&mut command), Some(128 + libc::SIGHUP));
+        assert_eq!(wait(command), Some(128 + libc::SIGHUP));
         assert_eq!(signals.finish(0), 128 + libc::SIGHUP);
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn completed_worker_stops_escaped_session_descendants() {
         const HELPER: &str = "DOT_HOOK_DESCENDANT_HELPER";
         if std::env::var_os(HELPER).is_none() {
@@ -731,14 +708,14 @@ mod tests {
         command
             .args([
                 "-c",
-                "set -m; (trap '' TERM; echo $BASHPID >\"$1\"; while :; do sleep 1; done) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
+                "set -m; (trap '' TERM; echo $BASHPID >\"$1\"; sleep 4) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
                 "hook-descendant",
             ])
             .arg(&marker)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let status = wait(&mut command);
+        let status = wait(command);
         let pid = std::fs::read_to_string(&marker)
             .expect("descendant marker")
             .trim()
@@ -749,12 +726,44 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let survived = process_live(pid);
-        if survived {
-            // SAFETY: set -m made this fixture descendant its group leader.
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
-        }
         assert_eq!(status, Some(0));
         assert!(!survived, "completed hook left its descendant running");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn completed_worker_with_unpinned_descendant_fails_closed() {
+        let scope = TempDir::new("hook-worker-unpinned-descendant").expect("scope");
+        let marker = scope.path().join("descendant");
+        let mut command = Command::new(dot_test_support::bash());
+        command
+            .args([
+                "-c",
+                "set -m; (trap '' TERM; echo $BASHPID >\"$1\"; sleep 3) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
+                "hook-descendant",
+            ])
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let started = std::time::Instant::now();
+        let status = wait(command);
+        let pid = std::fs::read_to_string(&marker)
+            .expect("descendant marker")
+            .trim()
+            .parse::<i32>()
+            .expect("descendant pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_live(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert_eq!(status, None, "unsafe cleanup was reported as success");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(6),
+            "incomplete cleanup was not bounded"
+        );
+        assert!(!process_live(pid), "self-bounded descendant survived");
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

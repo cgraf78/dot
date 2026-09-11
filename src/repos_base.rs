@@ -9,6 +9,16 @@ use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+/// Failures that must not be mistaken for an empty Git query result before a
+/// caller performs durable repository mutations.
+#[derive(Debug)]
+pub(crate) enum GitOutputError {
+    Interrupted(i32),
+    CaptureLimit,
+    CleanupIncomplete,
+    Other,
+}
+
 /// `_base_repo_exists` shape: which `git` command form addresses
 /// the base client repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,13 +98,38 @@ pub fn overlay_path_sync(entry: &str) -> (String, String) {
 /// nulled, stdin null. `None` on spawn failure (callers treat that
 /// like any other git failure).
 pub fn run_git(prefix: &[OsString], args: &[&str]) -> Option<Output> {
+    run_git_typed(prefix, args).ok()
+}
+
+pub(crate) fn run_git_typed(prefix: &[OsString], args: &[&str]) -> Result<Output, GitOutputError> {
     let mut cmd = crate::init_client_identity::host_git_command();
     cmd.args(prefix)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    cmd.output().ok()
+    crate::cleanup::run_session_output_typed(
+        cmd,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .map(|mut output| {
+        // `run_git` has always nulled inspection stderr. The bounded
+        // supervisor captures it only so a writer cannot hold teardown
+        // open; do not change the returned public contract.
+        output.stderr.clear();
+        output
+    })
+    .map_err(|error| match error {
+        crate::cleanup::SessionOutputError::Interrupted(signal) => {
+            GitOutputError::Interrupted(signal)
+        }
+        crate::cleanup::SessionOutputError::CaptureLimit => GitOutputError::CaptureLimit,
+        crate::cleanup::SessionOutputError::CleanupIncomplete => GitOutputError::CleanupIncomplete,
+        crate::cleanup::SessionOutputError::Io(_)
+        | crate::cleanup::SessionOutputError::TimedOut => GitOutputError::Other,
+    })
 }
 
 pub(crate) fn select(
@@ -305,7 +340,8 @@ fn client_matches(record: &crate::init_client_record::TransactionRecord, home: &
 
 fn git_dir_output(runtime: &crate::app::Runtime, git_dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let program = runtime.find_on_path("git")?;
-    let output = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .env_clear()
         .envs(runtime.env())
         .current_dir(runtime.cwd())
@@ -313,8 +349,13 @@ fn git_dir_output(runtime: &crate::app::Runtime, git_dir: &Path, args: &[&str]) 
         .arg("--git-dir")
         .arg(git_dir)
         .args(args)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .ok()?;
     output.status.success().then_some(output.stdout)
 }

@@ -259,7 +259,9 @@ fn commit_valid(commit: &[u8]) -> bool {
 /// for the bare substitution in the `case`, like its empty expansion.
 /// Git's own stderr is silenced (the candidate lane precedent).
 fn git_dir_output(git_dir: &Path, home: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = crate::init_client_identity::host_git_command()
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("--git-dir")
         .arg(git_dir)
         .args(args)
@@ -267,9 +269,15 @@ fn git_dir_output(git_dir: &Path, home: &Path, args: &[&str]) -> Option<Vec<u8>>
         .env("HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -280,7 +288,9 @@ fn git_dir_output(git_dir: &Path, home: &Path, args: &[&str]) -> Option<Vec<u8>>
 /// worktree context the `--git-dir` form cannot provide. Same
 /// pinning and silencing as [`git_dir_output`].
 fn git_home_output(home: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = crate::init_client_identity::host_git_command()
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("-C")
         .arg(home)
         .args(args)
@@ -288,9 +298,15 @@ fn git_home_output(home: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .env("HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }

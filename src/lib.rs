@@ -10,6 +10,7 @@
 
 pub mod app;
 pub(crate) mod bash;
+mod cancellation;
 pub mod cleanup;
 pub mod cli;
 pub mod config;
@@ -92,6 +93,7 @@ pub mod update;
 pub mod update_engine;
 pub mod update_lock;
 pub mod update_run;
+pub mod update_status;
 pub mod version;
 pub mod xdg;
 

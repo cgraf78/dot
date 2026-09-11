@@ -57,6 +57,9 @@ pub fn completed_file(home: &str, xdg_state_home: &str) -> std::result::Result<S
 /// rejected.
 pub fn private_directory(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
     if std::fs::create_dir_all(path).is_err() {
         return false;
     }
@@ -102,6 +105,7 @@ pub fn prepare_transaction(transaction: &Path) -> Result<PathBuf> {
         });
     }
     for _ in 0..temp::TMP_RETRIES {
+        crate::cancellation::check_mutation()?;
         // The shell template is `"${transaction}.prepare.XXXXXX"`;
         // the six random characters come from the shared mktemp
         // alphabet so both engines draw the same name shape.
@@ -122,6 +126,7 @@ pub fn prepare_transaction(transaction: &Path) -> Result<PathBuf> {
                     });
                 }
                 let marker = stage.join(PREPARATION_MARKER_NAME);
+                crate::cancellation::check_mutation()?;
                 if std::fs::write(&marker, PREPARATION_MARKER).is_err()
                     || std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600))
                         .is_err()

@@ -39,6 +39,1130 @@ assert_eq 2 "$nan_timeout_status" 'timeout command rejects NaN'
 assert_eq 2 "$zero_timeout_status" 'timeout command rejects zero'
 assert_eq 2 "$negative_timeout_status" 'timeout command rejects negative values'
 
+# A nested wrapper is the nearer owner for its target. The outer wrapper must
+# signal that owner once, leave its target dormant while the owner is alive,
+# and still close every relayed pipe before returning.
+"$timeout_python" - "$timeout_command" "$timeout_python" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+def session_fds():
+    """Owned-session descriptors a nested timeout wrapper must keep holding.
+
+    The suite coordinator advertises its lease/control sockets through the
+    environment. A child that closes those descriptors while keeping the
+    advertisement fails closed, so preserve exactly the ones still open.
+    """
+    fds = []
+    for key in (
+        "DOT_OWNED_SESSION_LEASE_FDS_V1",
+        "DOT_OWNED_SESSION_CONTROL_FDS_V1",
+    ):
+        for field in os.environ.get(key, "").split(":"):
+            if not field.isdecimal():
+                continue
+            try:
+                os.fstat(int(field))
+            except OSError:
+                continue
+            fds.append(int(field))
+    return fds
+
+wrapper = sys.argv[1]
+python = sys.argv[2]
+with tempfile.TemporaryDirectory() as temporary:
+    root = Path(temporary)
+    ready = root / "ready"
+    target_pid = root / "target.pid"
+    terms = root / "terms"
+    program = """
+import os, signal, sys, time
+from pathlib import Path
+def stop(signum, _frame):
+    with open(sys.argv[3], "a", encoding="utf-8") as output:
+        output.write(f"{signum}\\n")
+signal.signal(signal.SIGTERM, stop)
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+Path(sys.argv[2]).write_text("ready", encoding="utf-8")
+while True:
+    time.sleep(0.05)
+"""
+    child = subprocess.Popen(
+        [
+            python,
+            wrapper,
+            "30",
+            python,
+            wrapper,
+            "30",
+            python,
+            "-c",
+            program,
+            str(target_pid),
+            str(ready),
+            str(terms),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        pass_fds=session_fds(),
+    )
+    deadline = time.monotonic() + 5
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists(), "nested timeout target did not become ready"
+    os.kill(child.pid, signal.SIGTERM)
+    stdout, stderr = child.communicate(timeout=7)
+    assert child.returncode == 143, (child.returncode, stdout, stderr)
+    delivered = terms.read_text(encoding="utf-8").splitlines()
+    assert delivered == [str(int(signal.SIGTERM))], (delivered, stdout, stderr)
+    pid = int(target_pid.read_text(encoding="utf-8"))
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        # A zombie is already dead: only its reaper (the suite coordinator,
+        # which reaps adopted orphans when the worker stops) can make the
+        # PID itself vanish, so an unreaped zombie must not read as alive.
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as stat:
+                fields = stat.read().rsplit(b") ", 1)[-1].split()
+        except OSError:
+            return False
+        return not fields or fields[0] != b"Z"
+    deadline = time.monotonic() + 2
+    while alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if alive(pid):
+        os.kill(pid, signal.SIGKILL)
+        raise AssertionError("nested target survived wrapper completion")
+
+    # A nested deadline can already be in its TERM phase when the outer owner
+    # is cancelled. The outer signals only the registered nearer wrapper; its
+    # one latched cleanup pass must not redeliver TERM to the target.
+    concurrent_ready = root / "concurrent.ready"
+    concurrent_pid = root / "concurrent.pid"
+    concurrent_terms = root / "concurrent.terms"
+    concurrent = subprocess.Popen(
+        [
+            python,
+            wrapper,
+            "30",
+            python,
+            wrapper,
+            "1",
+            python,
+            "-c",
+            program,
+            str(concurrent_pid),
+            str(concurrent_ready),
+            str(concurrent_terms),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        pass_fds=session_fds(),
+    )
+    deadline = time.monotonic() + 5
+    while not concurrent_terms.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert concurrent_terms.exists(), "inner timeout never entered its TERM phase"
+    os.kill(concurrent.pid, signal.SIGTERM)
+    stdout, stderr = concurrent.communicate(timeout=7)
+    assert concurrent.returncode == 143, (concurrent.returncode, stdout, stderr)
+    assert concurrent_terms.read_text(encoding="utf-8").splitlines() == [
+        str(int(signal.SIGTERM))
+    ]
+    pid = int(concurrent_pid.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 2
+    while alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if alive(pid):
+        os.kill(pid, signal.SIGKILL)
+        raise AssertionError("concurrent nested cleanup left its target alive")
+
+    crash_ready = root / "crash.ready"
+    crash_pid = root / "crash.pid"
+    crash_program = """
+import os, sys, time
+from pathlib import Path
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+Path(sys.argv[2]).write_text("ready", encoding="utf-8")
+while True:
+    os.write(1, b"x" * 65536)
+"""
+    crashed = subprocess.Popen(
+        [python, wrapper, "30", python, "-c", crash_program, str(crash_pid), str(crash_ready)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        pass_fds=session_fds(),
+    )
+    deadline = time.monotonic() + 5
+    while not crash_ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert crash_ready.exists(), "relay parent-death target did not become ready"
+    relay_identities = []
+    if sys.platform.startswith("linux") and hasattr(os, "pidfd_open"):
+        deadline = time.monotonic() + 5
+        seen_descendants = {}
+        while time.monotonic() < deadline:
+            rows = {}
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdecimal():
+                    continue
+                try:
+                    stat = (entry / "stat").read_text(encoding="ascii")
+                    tail = stat[stat.rfind(") ") + 2:].split()
+                    parent = int(tail[1])
+                    command = (entry / "cmdline").read_bytes()
+                except (OSError, ValueError):
+                    continue
+                rows[int(entry.name)] = (parent, command)
+            descendants = {crashed.pid}
+            changed = True
+            while changed:
+                changed = False
+                for pid, (parent, _command) in rows.items():
+                    if parent in descendants and pid not in descendants:
+                        descendants.add(pid)
+                        changed = True
+            seen_descendants = {
+                pid: rows[pid][1] for pid in descendants if pid != crashed.pid
+            }
+            relay_pids = [
+                pid for pid in descendants
+                if pid != crashed.pid and b"--dot-relay-helper-v1" in rows[pid][1]
+            ]
+            # A relay may exit between the /proc scan above and this open;
+            # skip vanished PIDs and let the rescan below re-observe.
+            relay_identities = []
+            for pid in relay_pids:
+                try:
+                    relay_identities.append((pid, os.pidfd_open(pid)))
+                except ProcessLookupError:
+                    continue
+            if relay_identities:
+                break
+            for _pid, pidfd in relay_identities:
+                os.close(pidfd)
+            relay_identities = []
+            time.sleep(0.01)
+        assert relay_identities, (
+            "wrapper did not publish relay processes",
+            seen_descendants,
+            crashed.poll(),
+        )
+    os.kill(crashed.pid, signal.SIGKILL)
+    # Target stdout/stderr are internal relay pipes, not the caller's pipes.
+    # Killing the wrapper must close the relay liveness writers and make both
+    # outer pipes reach EOF even while the deliberately orphaned target lives.
+    relay_survived = False
+    if relay_identities:
+        import select
+        deadline = time.monotonic() + 2
+        for pid, pidfd in relay_identities:
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
+            poller = select.poll()
+            poller.register(pidfd, select.POLLIN)
+            if not poller.poll(remaining):
+                relay_survived = True
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            os.close(pidfd)
+    crashed.communicate(timeout=3)
+    assert crashed.returncode == -signal.SIGKILL
+    assert not relay_survived, "blocked output relay survived its supervisor"
+    orphan = int(crash_pid.read_text(encoding="utf-8"))
+    if alive(orphan):
+        try:
+            os.killpg(orphan, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 2
+    while alive(orphan) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not alive(orphan), "relay crash fixture cleanup left its target"
+
+    ignored_launcher = """
+import os, signal, sys
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+os.execv(sys.argv[1], [sys.argv[1], sys.argv[2], "2", "sh", "-c", "exit 42"])
+"""
+    ignored = subprocess.run(
+        [python, "-c", ignored_launcher, python, wrapper],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5,
+        check=False,
+        pass_fds=session_fds(),
+    )
+    assert ignored.returncode == 42, (ignored.returncode, ignored.stderr)
+
+    disposition_probe = (
+        "import signal,sys;"
+        "sys.exit(0 if signal.getsignal(signal.SIGCHLD)==signal.SIG_IGN else 9)"
+    )
+    ignored_target_launcher = """
+import os, signal, sys
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+os.execv(sys.argv[1], [sys.argv[1], sys.argv[2], "2", sys.argv[1], "-c", sys.argv[3]])
+"""
+    ignored_target = subprocess.run(
+        [python, "-c", ignored_target_launcher, python, wrapper, disposition_probe],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5,
+        check=False,
+        pass_fds=session_fds(),
+    )
+    assert ignored_target.returncode == 0, (
+        ignored_target.returncode,
+        ignored_target.stderr,
+    )
+PY
+
+# A cooperative shell may wait for a nested wrapper instead of replacing
+# itself. Authenticate the nested supervisor by its private peer identity and
+# retained session membership so one or more such launch layers do not turn a
+# valid cancellation into incomplete cleanup.
+"$timeout_python" - "$timeout_command" "$timeout_python" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+def session_fds():
+    """Owned-session descriptors a nested timeout wrapper must keep holding.
+
+    The suite coordinator advertises its lease/control sockets through the
+    environment. A child that closes those descriptors while keeping the
+    advertisement fails closed, so preserve exactly the ones still open.
+    """
+    fds = []
+    for key in (
+        "DOT_OWNED_SESSION_LEASE_FDS_V1",
+        "DOT_OWNED_SESSION_CONTROL_FDS_V1",
+    ):
+        for field in os.environ.get(key, "").split(":"):
+            if not field.isdecimal():
+                continue
+            try:
+                os.fstat(int(field))
+            except OSError:
+                continue
+            fds.append(int(field))
+    return fds
+
+wrapper = sys.argv[1]
+python = sys.argv[2]
+shell_wait = '"$@"; status=$?; exit "$status"'
+program = r'''
+import os, signal, sys, time
+from pathlib import Path
+def term(signum, _frame):
+    with open(sys.argv[2], "a", encoding="utf-8") as output:
+        output.write(f"{signum}\n")
+signal.signal(signal.SIGTERM, term)
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+Path(sys.argv[3]).write_text("ready", encoding="utf-8")
+while True:
+    time.sleep(0.02)
+'''
+for depth in (1, 2):
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        pid_file = root / "target.pid"
+        terms = root / "terms"
+        ready = root / "ready"
+        command = [
+            wrapper,
+            "30",
+            python,
+            "-c",
+            program,
+            str(pid_file),
+            str(terms),
+            str(ready),
+        ]
+        for layer in range(depth):
+            command = ["/bin/sh", "-c", shell_wait, f"nested-shell-{layer}", *command]
+        child = subprocess.Popen(
+            [wrapper, "30", *command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=session_fds(),
+        )
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), f"depth {depth} target did not become ready"
+        os.kill(child.pid, signal.SIGTERM)
+        stdout, stderr = child.communicate(timeout=8)
+        assert child.returncode == 143, (depth, child.returncode, stdout, stderr)
+        assert terms.read_text(encoding="utf-8").splitlines() == [
+            str(int(signal.SIGTERM))
+        ], (depth, terms.read_text(encoding="utf-8"), stdout, stderr)
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            os.kill(pid, signal.SIGKILL)
+            raise AssertionError(f"depth {depth} nested target survived cancellation")
+PY
+
+# Nested ownership registrations are per session, authenticated by the
+# private stream peer, and withdrawn independently.  More than the historical
+# ancestry-depth limit may coexist for one parallel supervisor.
+"$timeout_python" - "$timeout_command" <<'PY'
+import importlib.util
+import array
+import os
+import socket
+import struct
+import threading
+import time
+import types
+from importlib.machinery import SourceFileLoader
+
+loader = SourceFileLoader("dot_timeout_nested_registration", __import__("sys").argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+reader, writer = module.protocol_socketpair(module.socket.SOCK_DGRAM)
+module.control_reader = reader
+module.process = types.SimpleNamespace(pid=os.getpid())
+tokens = [f"{index:064x}" for index in range(64)]
+registrations = []
+failure = []
+
+def publish_all():
+    try:
+        for token in tokens:
+            registrations.append(module.publish_nested_supervisor([writer], token))
+    except BaseException as error:
+        failure.append(error)
+
+publisher = threading.Thread(target=publish_all)
+publisher.start()
+deadline = time.monotonic() + 3
+while publisher.is_alive() and time.monotonic() < deadline:
+    assert module.drain_nested_supervisors(deadline)
+    publisher.join(0.01)
+publisher.join(0)
+assert not publisher.is_alive(), "nested registration publisher did not finish"
+assert not failure, failure
+assert len(module.nested_supervisors) == len(tokens)
+
+registrations.pop(0).close()
+deadline = time.monotonic() + 1
+while tokens[0] in module.nested_supervisors and time.monotonic() < deadline:
+    assert module.drain_nested_supervisors(deadline)
+    time.sleep(0.01)
+assert tokens[0] not in module.nested_supervisors
+assert tokens[1] in module.nested_supervisors
+for registration in registrations:
+    registration.close()
+deadline = time.monotonic() + 1
+while module.nested_supervisors and time.monotonic() < deadline:
+    assert module.drain_nested_supervisors(deadline)
+    time.sleep(0.01)
+assert not module.nested_supervisors
+os.close(writer)
+os.close(reader)
+
+# A full per-tick registration budget is a yield point, not corruption. The
+# 129th publisher remains authorization-gated until the next drain.
+reader, writer = module.protocol_socketpair(module.socket.SOCK_DGRAM)
+module.control_reader = reader
+module.nested_control_complete = True
+queued = []
+writer_socket = socket.socket(fileno=writer)
+try:
+    writer_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+    for index in range(129):
+        local_fd, parent_fd = module.protocol_socketpair()
+        local = socket.socket(fileno=local_fd)
+        parent = socket.socket(fileno=parent_fd)
+        frame = b"DTS2" + struct.pack("!I", os.getpid()) + f"{index:064x}".encode()
+        rights = array.array("i", [parent.fileno()])
+        assert writer_socket.sendmsg(
+            [frame], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)]
+        ) == len(frame)
+        parent.close()
+        queued.append(local)
+    deadline = time.monotonic() + 2
+    assert module.drain_nested_supervisors(deadline)
+    assert module.nested_control_complete
+    assert len(module.nested_supervisors) == 128
+    assert module.drain_nested_supervisors(deadline)
+    assert module.nested_control_complete
+    assert len(module.nested_supervisors) == 129
+finally:
+    for registration in queued:
+        registration.close()
+    for _pid, registration in module.nested_supervisors.values():
+        registration.close()
+    module.nested_supervisors.clear()
+    writer_socket.close()
+    os.close(reader)
+PY
+
+# Registration is a delegation hint, not a secret or an exemption from hard
+# cleanup. Even a target that speaks the framing protocol and keeps the private
+# link open cannot hide a surviving descendant once its claimed supervisor is
+# dead.
+"$timeout_python" - "$timeout_command" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+if not sys.platform.startswith("linux"):
+    raise SystemExit(0)
+def session_fds():
+    """Owned-session descriptors a nested timeout wrapper must keep holding.
+
+    The suite coordinator advertises its lease/control sockets through the
+    environment. A child that closes those descriptors while keeping the
+    advertisement fails closed, so preserve exactly the ones still open.
+    """
+    fds = []
+    for key in (
+        "DOT_OWNED_SESSION_LEASE_FDS_V1",
+        "DOT_OWNED_SESSION_CONTROL_FDS_V1",
+    ):
+        for field in os.environ.get(key, "").split(":"):
+            if not field.isdecimal():
+                continue
+            try:
+                os.fstat(int(field))
+            except OSError:
+                continue
+            fds.append(int(field))
+    return fds
+
+wrapper = sys.argv[1]
+program = r'''
+import array, os, signal, socket, struct, sys, time
+control_fd = int(os.environ["DOT_OWNED_SESSION_CONTROL_FDS_V1"])
+local, parent = socket.socketpair()
+frame = b"DTS2" + struct.pack("!I", os.getpid()) + b"f" * 64
+control = socket.socket(fileno=control_fd)
+control.sendmsg([frame], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [parent.fileno()]))])
+control.detach()
+parent.close()
+assert local.recv(1) == b"\1"
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = os.fork()
+if child == 0:
+    os.setsid()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    open(sys.argv[1], "w", encoding="ascii").write(str(os.getpid()))
+    keep = local.fileno()
+    maximum = os.sysconf("SC_OPEN_MAX")
+    if not isinstance(maximum, int) or maximum < 3:
+        maximum = 65536
+    os.closerange(3, keep)
+    os.closerange(keep + 1, maximum)
+    while True: time.sleep(1)
+open(sys.argv[2], "w", encoding="ascii").write("ready")
+while True: time.sleep(1)
+'''
+with tempfile.TemporaryDirectory() as temporary:
+    root = Path(temporary)
+    descendant = root / "descendant"
+    ready = root / "ready"
+    child = subprocess.Popen(
+        [wrapper, "30", sys.executable, "-c", program, str(descendant), str(ready)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        pass_fds=session_fds(),
+    )
+    deadline = time.monotonic() + 5
+    while (not ready.exists() or not descendant.exists()) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists() and descendant.exists(), child.poll()
+    pid = int(descendant.read_text(encoding="ascii"))
+    pidfd = os.pidfd_open(pid)
+    os.kill(child.pid, signal.SIGTERM)
+    _stdout, stderr = child.communicate(timeout=7)
+    assert child.returncode == 143, (child.returncode, stderr)
+    import select
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    gone = bool(poller.poll(2000))
+    if not gone:
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+    os.close(pidfd)
+    assert gone, "spoofed nested registration hid a live descendant"
+PY
+
+# The standalone wrapper preserves the caller's exec-boundary closed stdio
+# state. Internal protocol pipes are always moved above fd 2, so later opens
+# cannot accidentally become target stdin/stdout/stderr. An explicit
+# /dev/null redirection remains present rather than being guessed absent.
+"$timeout_python" - "$timeout_command" <<'PY'
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+def session_fds():
+    """Owned-session descriptors a nested timeout wrapper must keep holding.
+
+    The suite coordinator advertises its lease/control sockets through the
+    environment. A child that closes those descriptors while keeping the
+    advertisement fails closed, so preserve exactly the ones still open.
+    """
+    fds = []
+    for key in (
+        "DOT_OWNED_SESSION_LEASE_FDS_V1",
+        "DOT_OWNED_SESSION_CONTROL_FDS_V1",
+    ):
+        for field in os.environ.get(key, "").split(":"):
+            if not field.isdecimal():
+                continue
+            try:
+                os.fstat(int(field))
+            except OSError:
+                continue
+            fds.append(int(field))
+    return fds
+
+wrapper = sys.argv[1]
+probe = r'''
+import os, sys
+mask = 0
+for descriptor in range(3):
+    try:
+        os.fstat(descriptor)
+    except OSError:
+        continue
+    mask |= 1 << descriptor
+open(sys.argv[1], "w", encoding="ascii").write(str(mask))
+'''
+with tempfile.TemporaryDirectory() as temporary:
+    root = Path(temporary)
+    for closed_mask in range(8):
+        result = root / f"mask-{closed_mask}"
+        def close_selected(mask=closed_mask):
+            for descriptor in range(3):
+                if mask & (1 << descriptor):
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+        child = subprocess.Popen(
+            [wrapper, "3", sys.executable, "-c", probe, str(result)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=close_selected,
+            pass_fds=session_fds(),
+        )
+        status = child.wait(timeout=5)
+        assert status == 0, (closed_mask, status)
+        observed = int(result.read_text(encoding="ascii"))
+        assert observed == 0b111 & ~closed_mask, (closed_mask, observed)
+
+    explicit = root / "explicit-null"
+    with open(os.devnull, "rb") as stdin, open(os.devnull, "wb") as output:
+        status = subprocess.run(
+            [wrapper, "3", sys.executable, "-c", probe, str(explicit)],
+            stdin=stdin,
+            stdout=output,
+            stderr=output,
+            timeout=5,
+            check=False,
+            pass_fds=session_fds(),
+        ).returncode
+    assert status == 0
+    assert int(explicit.read_text(encoding="ascii")) == 0b111
+PY
+
+# Stdout/stderr sharing is an open-file-description property, not an inode
+# property. Independent opens of one FIFO must remain independent relay sinks,
+# while an actual dup may share one ordered relay when the platform can prove
+# the relationship.
+"$timeout_python" - "$timeout_command" <<'PY'
+import importlib.util
+import os
+import subprocess
+import sys
+import tempfile
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+def session_fds():
+    """Owned-session descriptors a nested timeout wrapper must keep holding.
+
+    The suite coordinator advertises its lease/control sockets through the
+    environment. A child that closes those descriptors while keeping the
+    advertisement fails closed, so preserve exactly the ones still open.
+    """
+    fds = []
+    for key in (
+        "DOT_OWNED_SESSION_LEASE_FDS_V1",
+        "DOT_OWNED_SESSION_CONTROL_FDS_V1",
+    ):
+        for field in os.environ.get(key, "").split(":"):
+            if not field.isdecimal():
+                continue
+            try:
+                os.fstat(int(field))
+            except OSError:
+                continue
+            fds.append(int(field))
+    return fds
+
+loader = SourceFileLoader("dot_timeout_stream_identity", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+with tempfile.TemporaryDirectory() as temporary:
+    fifo = Path(temporary) / "stream"
+    os.mkfifo(fifo)
+    anchor = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+    first = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    second = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    duplicate = os.dup(first)
+    try:
+        assert not module.same_stream(first, second), "independent FIFO opens aliased"
+        if sys.platform.startswith("linux"):
+            assert module.same_stream(first, duplicate), "dup was not recognized"
+    finally:
+        for descriptor in (duplicate, second, first, anchor):
+            os.close(descriptor)
+
+if sys.platform.startswith("linux"):
+    ordered = subprocess.run(
+        [
+            sys.executable,
+            sys.argv[1],
+            "5",
+            sys.executable,
+            "-c",
+            "import os;[(os.write(1,b'o'),os.write(2,b'e')) for _ in range(128)]",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=5,
+        check=False,
+        pass_fds=session_fds(),
+    )
+    assert ordered.returncode == 0, ordered.returncode
+    assert ordered.stdout == b"oe" * 128, ordered.stdout
+PY
+
+# A blocked destination is an ordinary output failure only after the relay can
+# prove that its private source reached HUP.  An unrelated process retaining a
+# transferred source writer makes descendant cleanup unprovable and must win
+# with status 125 instead of being mislabeled as a sink-only failure.
+"$timeout_python" - "$timeout_command" <<'PY'
+import array
+import fcntl
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+def session_fds():
+    """Owned-session descriptors a nested timeout wrapper must keep holding.
+
+    The suite coordinator advertises its lease/control sockets through the
+    environment. A child that closes those descriptors while keeping the
+    advertisement fails closed, so preserve exactly the ones still open.
+    """
+    fds = []
+    for key in (
+        "DOT_OWNED_SESSION_LEASE_FDS_V1",
+        "DOT_OWNED_SESSION_CONTROL_FDS_V1",
+    ):
+        for field in os.environ.get(key, "").split(":"):
+            if not field.isdecimal():
+                continue
+            try:
+                os.fstat(int(field))
+            except OSError:
+                continue
+            fds.append(int(field))
+    return fds
+
+wrapper = sys.argv[1]
+
+def full_pipe():
+    source, sink = os.pipe()
+    flags = fcntl.fcntl(sink, fcntl.F_GETFL)
+    fcntl.fcntl(sink, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    try:
+        while True:
+            os.write(sink, b"x" * 4096)
+    except BlockingIOError:
+        pass
+    fcntl.fcntl(sink, fcntl.F_SETFL, flags)
+    return source, sink
+
+source, sink = full_pipe()
+plain = subprocess.Popen(
+    [sys.executable, wrapper, "5", sys.executable, "-c", "import os; os.write(1,b'x')"],
+    stdout=sink,
+    stderr=subprocess.DEVNULL,
+    pass_fds=session_fds(),
+)
+os.close(sink)
+assert plain.wait(timeout=5) == 1, "closed relay source was not a sink-only failure"
+os.close(source)
+
+with tempfile.TemporaryDirectory() as temporary:
+    endpoint = str(Path(temporary) / "fd.sock")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(endpoint)
+    listener.listen(1)
+    retained = []
+    received = threading.Event()
+    release = threading.Event()
+
+    def hold_writer():
+        connection, _ = listener.accept()
+        _payload, ancillary, _flags, _address = connection.recvmsg(
+            1, socket.CMSG_SPACE(array.array("i").itemsize)
+        )
+        for level, kind, payload in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                values = array.array("i")
+                values.frombytes(payload[: len(payload) - len(payload) % values.itemsize])
+                retained.extend(values)
+        received.set()
+        release.wait(7)
+        for descriptor in retained:
+            os.close(descriptor)
+        connection.close()
+
+    holder = threading.Thread(target=hold_writer)
+    holder.start()
+    program = r'''
+import array, os, socket, sys
+connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+connection.connect(sys.argv[1])
+os.write(1, b"x")
+connection.sendmsg([b"x"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [1]))])
+connection.close()
+'''
+    source, sink = full_pipe()
+    hidden = subprocess.Popen(
+        [sys.executable, wrapper, "5", sys.executable, "-c", program, endpoint],
+        stdout=sink,
+        stderr=subprocess.DEVNULL,
+        pass_fds=session_fds(),
+    )
+    os.close(sink)
+    assert received.wait(3), "target did not transfer its private stdout writer"
+    try:
+        assert hidden.wait(timeout=5) == 125, "open relay source did not fail closed"
+    finally:
+        release.set()
+        holder.join(2)
+        listener.close()
+        os.close(source)
+    assert not holder.is_alive(), "source-holder fixture did not stop"
+PY
+
+# Cleanup diagnostics must not write through the caller's original full pipe
+# after its relay has been stopped. Exercise both a distinct stderr pipe and a
+# true stdout/stderr alias; malformed target control makes cleanup deliberately
+# fail closed so the diagnostic path is guaranteed to run.
+"$timeout_python" - "$timeout_command" <<'PY'
+import fcntl
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+def session_fds():
+    """Owned-session descriptors a nested timeout wrapper must keep holding.
+
+    The suite coordinator advertises its lease/control sockets through the
+    environment. A child that closes those descriptors while keeping the
+    advertisement fails closed, so preserve exactly the ones still open.
+    """
+    fds = []
+    for key in (
+        "DOT_OWNED_SESSION_LEASE_FDS_V1",
+        "DOT_OWNED_SESSION_CONTROL_FDS_V1",
+    ):
+        for field in os.environ.get(key, "").split(":"):
+            if not field.isdecimal():
+                continue
+            try:
+                os.fstat(int(field))
+            except OSError:
+                continue
+            fds.append(int(field))
+    return fds
+
+wrapper = sys.argv[1]
+program = r'''
+import os, sys, time
+from pathlib import Path
+control = int(os.environ["DOT_OWNED_SESSION_CONTROL_FDS_V1"].split(":")[-1])
+os.write(control, b"invalid")
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+while True:
+    time.sleep(0.05)
+'''
+
+with tempfile.TemporaryDirectory() as temporary:
+    ready = Path(temporary) / "ready"
+    healthy = subprocess.Popen(
+        [sys.executable, wrapper, "30", sys.executable, "-c", program, str(ready)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        pass_fds=session_fds(),
+    )
+    deadline = time.monotonic() + 5
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists(), healthy.poll()
+    os.kill(healthy.pid, signal.SIGTERM)
+    _stdout, healthy_stderr = healthy.communicate(timeout=5)
+    assert healthy.returncode == 125, healthy.returncode
+    assert b"could not verify child cleanup" in healthy_stderr, healthy_stderr
+    target = int(ready.read_text(encoding="utf-8"))
+    try:
+        os.kill(target, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        raise AssertionError("invalid control left a delegated target alive")
+
+for aliased in (False, True):
+    with tempfile.TemporaryDirectory() as temporary:
+        ready = Path(temporary) / "ready"
+        source, sink = os.pipe()
+        flags = fcntl.fcntl(sink, fcntl.F_GETFL)
+        fcntl.fcntl(sink, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        try:
+            while True:
+                os.write(sink, b"x" * 4096)
+        except BlockingIOError:
+            pass
+        fcntl.fcntl(sink, fcntl.F_SETFL, flags)
+        child = subprocess.Popen(
+            [sys.executable, wrapper, "30", sys.executable, "-c", program, str(ready)],
+            stdout=sink if aliased else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if aliased else sink,
+            pass_fds=session_fds(),
+        )
+        os.close(sink)
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), (aliased, child.poll())
+        os.kill(child.pid, signal.SIGTERM)
+        blocked = False
+        try:
+            status = child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            blocked = True
+            os.set_blocking(source, False)
+            while True:
+                try:
+                    if not os.read(source, 65536):
+                        break
+                except BlockingIOError:
+                    break
+            os.set_blocking(source, True)
+            try:
+                status = child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.kill(child.pid, signal.SIGKILL)
+                status = child.wait(timeout=2)
+        os.close(source)
+        assert not blocked, ("wrapper diagnostic blocked", aliased, status)
+        assert status == 125, (aliased, status)
+        target = int(ready.read_text(encoding="utf-8"))
+        try:
+            os.kill(target, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError(("invalid control left a target alive", aliased, target))
+PY
+
+# A Linux relay can be blocked inside a write after a readiness notification;
+# its liveness pipe cannot be polled in that state. Parent-death SIGKILL must
+# still close the lifetime if the wrapper itself is killed uncatchably.
+"$timeout_python" - "$timeout_command" <<'PY'
+import fcntl
+import importlib.util
+import os
+import select
+import signal
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+if not sys.platform.startswith("linux") or not hasattr(os, "pidfd_open"):
+    raise SystemExit(0)
+loader = SourceFileLoader("dot_timeout_parent_death", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+source, sink = os.pipe()
+ready_read, ready_write = os.pipe()
+flags = fcntl.fcntl(sink, fcntl.F_GETFL)
+fcntl.fcntl(sink, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+try:
+    while True:
+        os.write(sink, b"x" * 4096)
+except BlockingIOError:
+    pass
+fcntl.fcntl(sink, fcntl.F_SETFL, flags)
+
+owner = os.fork()
+if owner == 0:
+    os.close(source)
+    os.close(ready_read)
+    expected_parent = os.getpid()
+    relay = os.fork()
+    if relay == 0:
+        module.bind_linux_parent_death(expected_parent)
+        os.write(ready_write, f"{os.getpid()}\n".encode("ascii"))
+        os.close(ready_write)
+        os.write(sink, b"blocked")
+        os._exit(9)
+    os.close(ready_write)
+    os.close(sink)
+    while True:
+        time.sleep(1)
+
+os.close(ready_write)
+os.close(sink)
+relay_pid = int(os.read(ready_read, 64).strip())
+os.close(ready_read)
+relay_pidfd = os.pidfd_open(relay_pid)
+deadline = time.monotonic() + 2
+while time.monotonic() < deadline:
+    try:
+        wait = Path(f"/proc/{relay_pid}/wchan").read_text(encoding="ascii").strip()
+    except OSError:
+        wait = ""
+    if "pipe" in wait:
+        break
+    time.sleep(0.01)
+assert "pipe" in wait, (relay_pid, wait)
+os.kill(owner, signal.SIGKILL)
+os.waitpid(owner, 0)
+poller = select.poll()
+poller.register(relay_pidfd, select.POLLIN)
+terminated = bool(poller.poll(2000))
+if not terminated:
+    signal.pidfd_send_signal(relay_pidfd, signal.SIGKILL)
+os.close(relay_pidfd)
+os.close(source)
+assert terminated, "blocked relay survived an uncatchable wrapper exit"
+PY
+
+# Old Linux/Android kernels without pidfd support still reap same-group
+# adopted zombies before reporting a completed timeout. The test removes the
+# Python pidfd entry points in-process instead of exposing a production test
+# environment switch.
+"$timeout_python" - "$timeout_command" <<'PY'
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+def session_fds():
+    """Owned-session descriptors a nested timeout wrapper must keep holding.
+
+    The suite coordinator advertises its lease/control sockets through the
+    environment. A child that closes those descriptors while keeping the
+    advertisement fails closed, so preserve exactly the ones still open.
+    """
+    fds = []
+    for key in (
+        "DOT_OWNED_SESSION_LEASE_FDS_V1",
+        "DOT_OWNED_SESSION_CONTROL_FDS_V1",
+    ):
+        for field in os.environ.get(key, "").split(":"):
+            if not field.isdecimal():
+                continue
+            try:
+                os.fstat(int(field))
+            except OSError:
+                continue
+            fds.append(int(field))
+    return fds
+
+if not sys.platform.startswith("linux"):
+    raise SystemExit(0)
+wrapper = sys.argv[1]
+helper = r'''
+import importlib.util, os, signal, sys
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+loader = SourceFileLoader("dot_timeout_no_pidfd", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+module.os.pidfd_open = None
+module.signal.pidfd_send_signal = None
+script = """
+trap 'exit 0' TERM
+(trap '' TERM; printf '%s\\n' "$BASHPID" >"$1"; while :; do sleep 1; done) &
+while [[ ! -s $1 ]]; do sleep 0.01; done
+while :; do sleep 1; done
+"""
+status = module.main(["test-timeout-v1", "0.5", "/bin/bash", "-c", script, "fixture", sys.argv[2]])
+pid = int(Path(sys.argv[2]).read_text(encoding="ascii"))
+if status != 124 or Path(f"/proc/{pid}").exists():
+    try: os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError: pass
+    raise SystemExit(1)
+'''
+with tempfile.TemporaryDirectory() as temporary:
+    pid_file = str(Path(temporary) / "member.pid")
+    result = subprocess.run(
+        [sys.executable, "-c", helper, wrapper, pid_file],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=7,
+        check=False,
+        pass_fds=session_fds(),
+    )
+    assert result.returncode == 0, (result.returncode, result.stderr)
+PY
+
 timeout_fixture=$DOT_TEST_TMP/timeout-helper
 timeout_expired=$timeout_fixture/expired
 timeout_descendant_pid=$timeout_fixture/descendant.pid
@@ -56,7 +1180,7 @@ signal.signal(signal.SIGHUP, signal.SIG_IGN)
 signal.signal(signal.SIGINT, signal.SIG_IGN)
 signal.signal(signal.SIGQUIT, signal.SIG_IGN)
 Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
-time.sleep(30)
+time.sleep(4)
 PY
 cat >"$timeout_fixture/parent.sh" <<'SUITE'
 #!/usr/bin/env bash
@@ -83,6 +1207,150 @@ while process_is_live "$timeout_descendant" && ((SECONDS < deadline)); do
 done
 process_is_live "$timeout_descendant" &&
   fail 'timeout command left a TERM-ignoring descendant running'
+
+normal_descendant_pid=$timeout_fixture/normal-descendant.pid
+cat >"$timeout_fixture/parent-exits.sh" <<'SUITE'
+#!/usr/bin/env bash
+python3 "$DOT_TEST_TIMEOUT_CHILD" "$DOT_TEST_TIMEOUT_DESCENDANT_PID" &
+deadline=$((SECONDS + 5))
+while [[ ! -s $DOT_TEST_TIMEOUT_DESCENDANT_PID && $SECONDS -lt $deadline ]]; do
+  sleep 0.05
+done
+[[ -s $DOT_TEST_TIMEOUT_DESCENDANT_PID ]]
+SUITE
+chmod 0755 "$timeout_fixture/parent-exits.sh"
+DOT_TEST_TIMEOUT_CHILD=$timeout_fixture/child.py \
+  DOT_TEST_TIMEOUT_DESCENDANT_PID=$normal_descendant_pid \
+  "$timeout_command" 5 "$timeout_fixture/parent-exits.sh"
+normal_descendant=$(<"$normal_descendant_pid")
+deadline=$((SECONDS + 5))
+while process_is_live "$normal_descendant" && ((SECONDS < deadline)); do
+  sleep 0.05
+done
+process_is_live "$normal_descendant" &&
+  fail 'timeout command accepted leader exit with a live descendant'
+
+escaped_descendant_pid=$timeout_fixture/escaped-descendant.pid
+cat >"$timeout_fixture/parent-escaped.sh" <<'SUITE'
+#!/usr/bin/env bash
+set -m
+(trap '' HUP TERM; printf '%s\n' "$BASHPID" >"$DOT_TEST_TIMEOUT_DESCENDANT_PID"; sleep 4) &
+deadline=$((SECONDS + 5))
+while [[ ! -s $DOT_TEST_TIMEOUT_DESCENDANT_PID && $SECONDS -lt $deadline ]]; do
+  sleep 0.05
+done
+[[ -s $DOT_TEST_TIMEOUT_DESCENDANT_PID ]]
+SUITE
+chmod 0755 "$timeout_fixture/parent-escaped.sh"
+set +e
+DOT_TEST_TIMEOUT_DESCENDANT_PID=$escaped_descendant_pid \
+  "$timeout_command" 5 "$timeout_fixture/parent-escaped.sh"
+escaped_status=$?
+set -e
+if [[ $(uname -s) == Darwin ]]; then
+  assert_eq 125 "$escaped_status" \
+    'timeout fails closed when an escaped member cannot be pinned'
+else
+  assert_eq 0 "$escaped_status" \
+    'timeout cleans an escaped member through exact Linux authority'
+fi
+escaped_descendant=$(<"$escaped_descendant_pid")
+deadline=$((SECONDS + 5))
+while process_is_live "$escaped_descendant" && ((SECONDS < deadline)); do
+  sleep 0.05
+done
+process_is_live "$escaped_descendant" &&
+  fail 'escaped timeout fixture outlived its bounded self-cleanup'
+
+closed_fd_descendant_pid=$timeout_fixture/closed-fd-descendant.pid
+cat >"$timeout_fixture/closed-fd-parent.py" <<'PY'
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+child = subprocess.Popen(
+    ["/bin/sleep", "30"],
+    env={},
+    start_new_session=True,
+    close_fds=True,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+Path(sys.argv[1]).write_text(str(child.pid), encoding="utf-8")
+if len(sys.argv) > 2:
+    time.sleep(30)
+PY
+chmod 0755 "$timeout_fixture/closed-fd-parent.py"
+set +e
+"$timeout_command" 10 "$timeout_fixture/closed-fd-parent.py" \
+  "$closed_fd_descendant_pid"
+closed_fd_normal_status=$?
+set -e
+closed_fd_descendant=$(<"$closed_fd_descendant_pid")
+closed_fd_identity=
+process_identity "$closed_fd_descendant" closed_fd_identity || true
+if [[ $(uname -s) == Darwin ]]; then
+  [[ $closed_fd_normal_status == 0 || $closed_fd_normal_status == 125 ]] ||
+    fail "portable unobservable escape returned unexpected status $closed_fd_normal_status"
+else
+  assert_eq 0 "$closed_fd_normal_status" \
+    'Linux timeout attributes an escaped close-fds descendant'
+fi
+deadline=$((SECONDS + 3))
+while process_is_live "$closed_fd_descendant" "$closed_fd_identity" &&
+  ((SECONDS < deadline)); do
+  sleep 0.05
+done
+if process_is_live "$closed_fd_descendant" "$closed_fd_identity"; then
+  if [[ $(uname -s) != Darwin ]]; then
+    kill -KILL "$closed_fd_descendant" 2>/dev/null || true
+    fail 'normal timeout completion lost an escaped close-fds descendant'
+  fi
+  # A pre-observation env/fd/session escape is outside portable process-only
+  # authority. The fixture owns this captured generation and removes it only
+  # after the behavioral assertion above.
+  kill -KILL "$closed_fd_descendant" 2>/dev/null || true
+fi
+
+rm -f "$closed_fd_descendant_pid"
+"$timeout_command" 30 "$timeout_fixture/closed-fd-parent.py" \
+  "$closed_fd_descendant_pid" wait &
+closed_fd_timeout_pid=$!
+deadline=$((SECONDS + 3))
+while [[ ! -s $closed_fd_descendant_pid && $SECONDS -lt $deadline ]]; do
+  sleep 0.05
+done
+[[ -s $closed_fd_descendant_pid ]] ||
+  fail 'cancelled close-fds timeout fixture did not start'
+closed_fd_descendant=$(<"$closed_fd_descendant_pid")
+closed_fd_identity=
+process_identity "$closed_fd_descendant" closed_fd_identity || true
+kill -TERM "$closed_fd_timeout_pid"
+closed_fd_status=0
+wait "$closed_fd_timeout_pid" || closed_fd_status=$?
+if [[ $(uname -s) == Darwin ]]; then
+  assert_eq 125 "$closed_fd_status" \
+    'portable cancellation reports incomplete escaped close-fds cleanup'
+else
+  assert_eq 143 "$closed_fd_status" \
+    'timeout preserves TERM after proving close-fds descendant cleanup'
+fi
+deadline=$((SECONDS + 3))
+while process_is_live "$closed_fd_descendant" "$closed_fd_identity" &&
+  ((SECONDS < deadline)); do
+  sleep 0.05
+done
+if process_is_live "$closed_fd_descendant" "$closed_fd_identity"; then
+  if [[ $(uname -s) != Darwin ]]; then
+    kill -KILL "$closed_fd_descendant" 2>/dev/null || true
+    fail 'cancelled timeout lost an escaped close-fds descendant'
+  fi
+  kill -KILL "$closed_fd_descendant" 2>/dev/null || true
+fi
 
 printf 'stale\n' >"$timeout_expired"
 set +e
@@ -147,16 +1415,6 @@ assert_timeout_cancellation() {
     done
     kill -KILL "$timeout_call_pid" 2>/dev/null || true
     wait "$timeout_call_pid" 2>/dev/null || true
-    if [[ -s $parent_pid_file ]]; then
-      timeout_parent=$(<"$parent_pid_file")
-      [[ $timeout_parent =~ ^[1-9][0-9]*$ ]] &&
-        kill -KILL -- "-$timeout_parent" 2>/dev/null || true
-    fi
-    if [[ -s $timeout_descendant_pid ]]; then
-      timeout_descendant=$(<"$timeout_descendant_pid")
-      [[ $timeout_descendant =~ ^[1-9][0-9]*$ ]] &&
-        kill -KILL "$timeout_descendant" 2>/dev/null || true
-    fi
     fail "timeout $signal_name cancellation fixture did not start"
   fi
   timeout_parent=$(<"$parent_pid_file")
@@ -176,8 +1434,6 @@ assert_timeout_cancellation() {
   kill "$watchdog_pid" 2>/dev/null || true
   wait "$watchdog_pid" 2>/dev/null || true
   if [[ -e $watchdog_marker ]]; then
-    kill -KILL -- "-$timeout_parent" 2>/dev/null || true
-    kill -KILL "$timeout_descendant" 2>/dev/null || true
     fail "timeout $signal_name cancellation did not finish before deadline"
   fi
   deadline=$((SECONDS + 5))
@@ -189,10 +1445,6 @@ assert_timeout_cancellation() {
   done
   process_is_live "$timeout_parent" && parent_survived=1
   process_is_live "$timeout_descendant" && descendant_survived=1
-  if ((parent_survived || descendant_survived)); then
-    kill -KILL -- "-$timeout_parent" 2>/dev/null || true
-    kill -KILL "$timeout_descendant" 2>/dev/null || true
-  fi
   assert_eq "$expected" "$status" \
     "timeout cancellation preserves $signal_name status"
   ((parent_survived == 0)) ||
@@ -206,8 +1458,56 @@ assert_timeout_cancellation INT 130
 assert_timeout_cancellation QUIT 131
 assert_timeout_cancellation TERM 143
 
-python3 - "$timeout_command" <<'PY'
+# A retained leader can become waitable while its observation crosses the
+# absolute deadline. Historical timeout semantics give that exact tie to the
+# timeout, not the otherwise-successful child status.
+"$timeout_python" - "$timeout_command" <<'PY'
 import importlib.util
+import signal
+import sys
+from importlib.machinery import SourceFileLoader
+
+loader = SourceFileLoader("dot_timeout_deadline", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+class Clock:
+    now = 0.0
+
+    @classmethod
+    def monotonic(cls):
+        return cls.now
+
+module.time.monotonic = Clock.monotonic
+module.time.sleep = lambda seconds: setattr(Clock, "now", Clock.now + seconds)
+module.install_signal_handlers = lambda: None
+module.clear_timeout_marker = lambda: True
+module.mark_timeout_expired = lambda: None
+module.adopt_descendants = lambda: True
+module.launch_process = lambda _argv, _env: object()
+module.poll_stdio_relay_states = lambda: None
+
+def exit_at_deadline():
+    Clock.now = 1.0
+    return True
+
+delivered = []
+module.leader_exited = exit_at_deadline
+module.stop_process_group = lambda signum: (
+    delivered.append(signum),
+    module.CleanupResult(0, True),
+)[1]
+module.finish = lambda status, cleanup_complete=True: status if cleanup_complete else 125
+
+assert module.main(["test-timeout-v1", "1", "true"]) == 124
+assert delivered == [signal.SIGTERM]
+PY
+
+"$timeout_python" - "$timeout_command" <<'PY'
+import importlib.util
+import io
 import signal
 import subprocess
 import sys
@@ -220,6 +1520,20 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 assert spec is not None
 module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
+real_launch_process = module.launch_process
+real_authorize_launch = module.authorize_launch
+real_os_close = module.os.close
+real_os_getsid = module.os.getsid
+real_os_kill = module.os.kill
+real_os_killpg = module.os.killpg
+real_pidfd_open = getattr(module.os, "pidfd_open", None)
+real_pidfd_send_signal = getattr(module.signal, "pidfd_send_signal", None)
+real_subprocess_popen = module.subprocess.Popen
+
+
+def proc_stat(pid, name, group, session, start=77):
+    fields = ["S", "1", str(group), str(session)] + ["0"] * 15 + [str(start)]
+    return f"{pid} ({name}) ".encode() + " ".join(fields).encode() + b"\n"
 
 
 with tempfile.TemporaryDirectory() as temporary:
@@ -230,12 +1544,13 @@ with tempfile.TemporaryDirectory() as temporary:
     ):
         proc_dir = proc_root / str(pid)
         proc_dir.mkdir()
-        (proc_dir / "stat").write_bytes(
-            f"{pid} ({name}) S 1 2 {session} 0 0 0\n".encode()
-        )
+        (proc_dir / "stat").write_bytes(proc_stat(pid, name, 2, session))
     proc_dir = proc_root / "124"
     proc_dir.mkdir()
-    (proc_dir / "stat").write_bytes(b"124 (worker \xff (nested)) S 1 2 123 0\n")
+    nested = proc_stat(124, "worker (nested)", 2, 123).replace(
+        b"worker", b"worker \xff"
+    )
+    (proc_dir / "stat").write_bytes(nested)
     (proc_root / "not-a-pid").mkdir()
     (proc_root / "126").mkdir()
     assert module.list_proc_session_pids(123, proc_root) == [123, 124]
@@ -251,191 +1566,405 @@ with tempfile.TemporaryDirectory() as temporary:
     proc_root = Path(temporary)
     proc_dir = proc_root / "123"
     proc_dir.mkdir()
-    (proc_dir / "stat").write_bytes(b"123 (leader) S 1 2 123 0\n")
+    (proc_dir / "stat").write_bytes(proc_stat(123, "leader", 2, 123))
     proc_dir = proc_root / "124"
     proc_dir.mkdir()
     (proc_dir / "stat").mkdir()
     assert module.list_proc_session_pids(123, proc_root) is None
 
+portable = module.parse_ps_snapshot(
+    "\n123 1 122 121 S\n124 1 122 121 Z\n",
+    121,
+)
+assert [item.pid for item in portable] == [123, 124]
+assert module.parse_ps_snapshot("123 S\n", 123) is None
+assert module.parse_ps_snapshot("123 1 123 123 Z\nmalformed\n", 123) is None
+
+
+class PermissionEntry:
+    name = "123"
+
+    def __truediv__(self, _name):
+        return self
+
+    def read_bytes(self):
+        raise PermissionError
+
+
+class PermissionRoot:
+    def iterdir(self):
+        return iter([PermissionEntry()])
+
+
+assert module.list_proc_session_processes(123, PermissionRoot()) is None
+
+
+class FailingIterator:
+    def __iter__(self):
+        yield PermissionEntry()
+        raise OSError("injected iterator failure")
+
+
+class FailingRoot:
+    def iterdir(self):
+        return FailingIterator()
+
+
+assert module.list_proc_session_processes(123, FailingRoot()) is None
+
 assert module.list_proc_session_pids(123, Path("/missing/proc/root")) is None
-module.list_proc_session_pids = lambda _session_id: [123, 124]
-module.subprocess.run = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+identity = module.SessionProcess(123, 123, 123, True, 77)
+assert module.same_process_identity(identity, identity._replace(group=124, live=False))
+assert not module.same_process_identity(identity, identity._replace(start=78))
+
+member = module.MemberHandle(identity, 9)
+module.proc_process = lambda _pid: None
+module.signal.pidfd_send_signal = lambda _fd, _signum, _info, _flags: None
+assert member.refresh(), "an unreadable pinned identity was treated as gone"
+
+
+def missing_pidfd_target(_fd, _signum, _info, _flags):
+    raise ProcessLookupError
+
+
+module.signal.pidfd_send_signal = missing_pidfd_target
+assert not member.refresh(), "a gone pinned identity remained live"
+
+module.list_proc_session_processes = lambda _session_id, **_kwargs: [
+    module.SessionProcess(123, 123, 123, True, 10),
+    module.SessionProcess(124, 123, 123, True, 11),
+]
+module.subprocess.Popen = lambda *_args, **_kwargs: (_ for _ in ()).throw(
     AssertionError("ps should not run when procfs is available")
 )
 assert module.list_session_pids(123) == [123, 124]
-module.list_proc_session_pids = lambda _session_id: None
+module.list_proc_session_processes = lambda _session_id, **_kwargs: None
 
 
-class PsResult:
-    stdout = "123\n124\n125\n"
+class PsProcess:
+    pid = 999
+    returncode = 0
+
+    def communicate(self, **_kwargs):
+        return "123 1 123 123 S\n124 123 123 123 S\n125 1 125 125 S\n", None
 
 
 def run_ps(argv, **_kwargs):
-    assert argv == ["ps", "-A", "-o", "pid="]
-    return PsResult()
+    assert argv == ["/bin/ps", "-A", "-o", "pid=,ppid=,pgid=,sid=,stat="]
+    return PsProcess()
 
 
-module.subprocess.run = run_ps
-module.os.getsid = lambda pid: 123 if pid in (123, 124) else 125
+module.subprocess.Popen = run_ps
 assert module.list_session_pids(123) == [123, 124]
 
 
-def timeout_ps(argv, **kwargs):
-    assert argv == ["ps", "-A", "-o", "pid="]
-    raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+class TimeoutPs(PsProcess):
+    def communicate(self, **kwargs):
+        raise subprocess.TimeoutExpired(["/bin/ps"], kwargs["timeout"])
+
+    def kill(self):
+        pass
+
+    def wait(self, **_kwargs):
+        return -signal.SIGKILL
 
 
-module.subprocess.run = timeout_ps
+def timeout_ps(argv, **_kwargs):
+    assert argv == ["/bin/ps", "-A", "-o", "pid=,ppid=,pgid=,sid=,stat="]
+    return TimeoutPs()
+
+
+module.subprocess.Popen = timeout_ps
 assert module.list_session_pids(123) is None
+
+fixed_ps = []
+
+
+def record_fixed_ps(argv, **_kwargs):
+    fixed_ps.append(argv[0])
+    return PsProcess()
+
+
+module.subprocess.Popen = record_fixed_ps
+assert module.list_session_pids(123) == [123, 124]
+assert fixed_ps == ["/bin/ps"]
 
 
 class Process:
     pid = 123
     waited = False
 
-    def poll(self):
-        return None
-
-    def wait(self):
+    def wait(self, timeout=None):
+        assert timeout == module.PROCESS_SNAPSHOT_TIMEOUT_SECONDS
         self.waited = True
+        return 0
+
+    def kill(self):
+        raise AssertionError("bounded group cleanup should stop the leader")
+
+
+class Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(seconds, module.PROCESS_POLL_SECONDS)
+
+
+class StuckWaitProcess:
+    pid = 123
+
+    def __init__(self):
+        self.wait_timeouts = []
+        self.killed = False
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        raise subprocess.TimeoutExpired(["fixture"], timeout)
+
+    def kill(self):
+        self.killed = True
+
+
+process = StuckWaitProcess()
+module.process = process
+module.list_session_processes = lambda _session_id, _timeout=1: [
+    module.SessionProcess(123, 123, 123, False, 10)
+]
+module.os.getsid = lambda _pid: 123
+module.os.killpg = lambda _pid, _signum: None
+clock = Clock()
+module.time.monotonic = clock.monotonic
+module.time.sleep = clock.sleep
+cleanup = module.stop_process_group(signal.SIGTERM)
+assert cleanup == module.CleanupResult(125, False)
+assert process.killed
+assert process.wait_timeouts == [
+    module.PROCESS_SNAPSHOT_TIMEOUT_SECONDS,
+    module.PROCESS_SNAPSHOT_TIMEOUT_SECONDS,
+]
 
 
 process = Process()
 module.process = process
-module.time.sleep = lambda _: None
-module.list_session_pids = lambda _session_id: []
-signals = []
+module.list_session_processes = lambda _session_id, _timeout=1: []
+module.os.getsid = lambda _pid: 123
+module.os.pidfd_open = None
+module.signal.pidfd_send_signal = None
+module.os.killpg = lambda _pid, _signum: None
+clock = Clock()
+module.time.monotonic = clock.monotonic
+module.time.sleep = clock.sleep
+cleanup = module.stop_process_group(signal.SIGTERM)
+assert not cleanup.complete, "a missing retained leader certified an empty snapshot"
 
 
-def killpg(_pid, signum):
-    signals.append(signum)
+process = Process()
+module.process = process
+module.interrupted_signal = None
+module.list_session_processes = lambda _session_id, _timeout=1: [
+    module.SessionProcess(123, 123, 123, True, 10),
+    module.SessionProcess(124, 124, 123, True, 11),
+]
+module.os.getsid = lambda _pid: 123
+module.os.pidfd_open = None
+module.signal.pidfd_send_signal = None
+raw_delivery = []
+group_delivery = []
+module.os.kill = lambda pid, signum: raw_delivery.append((pid, signum))
+module.os.killpg = lambda pid, signum: group_delivery.append((pid, signum))
+clock = Clock()
+module.time.monotonic = clock.monotonic
+module.time.sleep = clock.sleep
+cleanup = module.stop_process_group(signal.SIGTERM)
+assert cleanup.status == 0
+assert not cleanup.complete
+assert process.waited
+assert all(signum == 0 for _pid, signum in raw_delivery), (
+    "session members require stable authority for nonzero signal delivery",
+    raw_delivery,
+)
+assert group_delivery[0] == (123, signal.SIGTERM)
+assert (123, signal.SIGKILL) in group_delivery
+
+
+process = Process()
+module.process = process
+member = module.SessionProcess(124, 123, 123, True, 11)
+snapshot_calls = 0
+
+
+def member_snapshots(_session_id, _timeout=1):
+    global snapshot_calls
+    snapshot_calls += 1
+    if snapshot_calls == 1:
+        return [module.SessionProcess(123, 123, 123, True, 10), member]
+    return [module.SessionProcess(123, 123, 123, False, 10)]
+
+
+module.list_session_processes = member_snapshots
+module.os.getsid = lambda _pid: 123
+module.os.pidfd_open = lambda pid, flags: 9 if (pid, flags) == (124, 0) else None
+member_live = True
+
+
+def current_member(pid):
+    if pid != 124:
+        return None
+    group = 123 if snapshot_calls == 1 else 124
+    return member._replace(group=group, live=member_live)
+
+
+module.proc_process = current_member
+pidfd_delivery = []
+
+
+def pidfd_signal(fd, signum, info, flags):
+    global member_live
+    pidfd_delivery.append((fd, signum, info, flags))
     if signum == signal.SIGKILL:
-        raise PermissionError
+        member_live = False
 
 
-module.os.killpg = killpg
-module.stop_process_group(signal.SIGTERM)
-assert process.waited
-assert signals == [signal.SIGTERM, signal.SIGKILL]
-
-
-class LeaderExitsBeforeFallbackProcess:
-    pid = 123
-    exited = False
-    waited = False
-
-    def poll(self):
-        return 0 if self.exited else None
-
-    def wait(self):
-        self.waited = True
-
-
-process = LeaderExitsBeforeFallbackProcess()
-module.process = process
-snapshots = iter(([123, 124], None))
-module.list_session_pids = lambda _session_id: next(snapshots)
-retained_delivery = []
-
-
-def retained_session(pid):
-    if pid == 123 and process.exited:
-        raise ProcessLookupError
-    return 123 if pid in (123, 124) else pid
-
-
-def retain_kill(pid, signum):
-    retained_delivery.append((pid, signum))
-
-
-def leader_exits_after_term(_seconds):
-    process.exited = True
-
-
-module.os.getsid = retained_session
-module.os.kill = retain_kill
-module.time.sleep = leader_exits_after_term
-module.stop_process_group(signal.SIGTERM)
-assert process.waited
-assert retained_delivery == [
-    (123, signal.SIGTERM),
-    (124, signal.SIGTERM),
-    (124, signal.SIGKILL),
-]
+module.signal.pidfd_send_signal = pidfd_signal
+closed = []
+module.os.close = closed.append
+module.os.killpg = lambda _pid, _signum: None
+clock = Clock()
+module.time.monotonic = clock.monotonic
+module.time.sleep = clock.sleep
+cleanup = module.stop_process_group(signal.SIGTERM)
+assert cleanup == module.CleanupResult(0, True), (
+    cleanup,
+    group_delivery,
+    pidfd_delivery,
+    closed,
+)
+assert pidfd_delivery[0] == (9, signal.SIGTERM, None, 0)
+assert (9, signal.SIGKILL, None, 0) in pidfd_delivery
+assert closed == [9]
 
 
 process = Process()
 module.process = process
-snapshots = iter(([123], None))
-module.list_session_pids = lambda _session_id: next(snapshots)
+member = module.SessionProcess(124, 124, 123, True, 11)
+member_live = True
+
+
+def retained_member_snapshots(_session_id, _timeout=1):
+    return [
+        module.SessionProcess(123, 123, 123, False, 10),
+        member._replace(live=member_live),
+    ]
+
+
+module.list_session_processes = retained_member_snapshots
 module.os.getsid = lambda _pid: 123
-module.time.sleep = lambda _seconds: None
-late_group_delivery = []
-module.os.kill = lambda pid, signum: late_group_delivery.append(
-    ("pid", pid, signum)
-)
-module.os.killpg = lambda pid, signum: late_group_delivery.append(
-    ("group", pid, signum)
-)
-module.stop_process_group(signal.SIGTERM)
-assert process.waited
-assert late_group_delivery == [
-    ("pid", 123, signal.SIGTERM),
-    ("group", 123, signal.SIGKILL),
-    ("pid", 123, signal.SIGKILL),
-]
+module.os.pidfd_open = lambda pid, flags: 9 if (pid, flags) == (124, 0) else None
+module.proc_process = lambda pid: member if pid == 124 else None
+pidfd_delivery = []
+
+
+def stop_retained_member(fd, signum, info, flags):
+    global member_live
+    pidfd_delivery.append((fd, signum, info, flags))
+    member_live = False
+
+
+module.signal.pidfd_send_signal = stop_retained_member
+closed = []
+module.os.close = closed.append
+module.os.killpg = lambda _pid, _signum: None
+clock = Clock()
+module.time.monotonic = clock.monotonic
+module.time.sleep = clock.sleep
+cleanup = module.stop_process_group(signal.SIGTERM)
+assert cleanup == module.CleanupResult(0, True)
+assert pidfd_delivery == [(9, signal.SIGTERM, None, 0)]
+assert closed == [9]
 
 
 process = Process()
 module.process = process
-snapshots = iter(([123], [123, 125]))
-module.list_session_pids = lambda _session_id: next(snapshots)
+leader_live = True
+late_available = False
+late_live = True
+late_member = module.SessionProcess(124, 123, 123, True, 11)
+
+
+def late_member_snapshots(_session_id, _timeout=1):
+    snapshot = [module.SessionProcess(123, 123, 123, leader_live, 10)]
+    if late_available:
+        snapshot.append(late_member._replace(live=late_live))
+    return snapshot
+
+
+group_delivery = []
+
+
+def spawn_late_member(pid, signum):
+    global leader_live, late_available
+    group_delivery.append((pid, signum))
+    if signum == signal.SIGTERM:
+        late_available = True
+        leader_live = False
+
+
+module.list_session_processes = late_member_snapshots
 module.os.getsid = lambda _pid: 123
-module.time.sleep = lambda _seconds: None
-complete_snapshot_delivery = []
-module.os.kill = lambda pid, signum: complete_snapshot_delivery.append(
-    ("pid", pid, signum)
+module.os.pidfd_open = lambda pid, flags: 9 if (pid, flags) == (124, 0) else None
+module.proc_process = lambda pid: (
+    late_member._replace(live=late_live) if pid == 124 else None
 )
-module.os.killpg = lambda pid, signum: complete_snapshot_delivery.append(
-    ("group", pid, signum)
+pidfd_delivery = []
+
+
+def stop_late_member(fd, signum, info, flags):
+    global late_live
+    pidfd_delivery.append((fd, signum, info, flags))
+    late_live = False
+
+
+module.signal.pidfd_send_signal = stop_late_member
+closed = []
+module.os.close = closed.append
+module.os.kill = spawn_late_member
+module.os.killpg = lambda *_args: (_ for _ in ()).throw(
+    AssertionError("fully pinned initial cohort must not use killpg")
 )
-module.stop_process_group(signal.SIGTERM)
-assert process.waited
-assert complete_snapshot_delivery == [
-    ("pid", 123, signal.SIGTERM),
-    ("group", 123, signal.SIGKILL),
-    ("pid", 123, signal.SIGKILL),
-    ("pid", 125, signal.SIGKILL),
-]
-
-process.poll = lambda: 0
-signals.clear()
-module.os.killpg = killpg
-module.list_session_pids = lambda _session_id: None
-module.stop_process_group(signal.SIGTERM)
-assert signals == []
-
-
-class SignalDuringCleanupProcess:
-    pid = 123
-    waited = False
-
-    def poll(self):
-        return None
-
-    def wait(self):
-        self.waited = True
+clock = Clock()
+module.time.monotonic = clock.monotonic
+module.time.sleep = clock.sleep
+cleanup = module.stop_process_group(signal.SIGTERM)
+assert cleanup == module.CleanupResult(0, True), (
+    cleanup,
+    group_delivery,
+    pidfd_delivery,
+    closed,
+)
+assert group_delivery == [
+    (123, signal.SIGTERM)
+], f"unchanged public-helper leader received TERM more than once: {group_delivery!r}"
+assert pidfd_delivery == [
+    (9, signal.SIGTERM, None, 0)
+], f"late same-group member did not receive one exact TERM: {pidfd_delivery!r}"
+assert closed == [9]
 
 
-process = SignalDuringCleanupProcess()
+process = Process()
 module.process = process
 module.interrupted_signal = None
 for handled_signal in module.handled_signals:
     signal.signal(handled_signal, module.capture_signal)
-module.list_session_pids = lambda _session_id: [123]
+module.list_session_processes = lambda _session_id, _timeout=1: [
+    module.SessionProcess(123, 123, 123, False, 10)
+]
+module.os.pidfd_open = None
+module.signal.pidfd_send_signal = None
 module.os.getsid = lambda _pid: 123
-cleanup_delivery = []
-module.os.kill = lambda pid, signum: cleanup_delivery.append((pid, signum))
 
 
 def signal_while_stopping(_seconds):
@@ -444,14 +1973,48 @@ def signal_while_stopping(_seconds):
     handler(signal.SIGQUIT, None)
 
 
-module.time.sleep = signal_while_stopping
-module.stop_process_group(signal.SIGTERM)
+clock = Clock()
+module.time.monotonic = clock.monotonic
+module.time.sleep = lambda seconds: (
+    signal_while_stopping(seconds),
+    setattr(clock, "now", clock.now + module.PROCESS_POLL_SECONDS),
+)
+cleanup = module.stop_process_group(signal.SIGTERM)
+assert cleanup == module.CleanupResult(0, True)
 assert process.waited
 assert module.interrupted_signal == signal.SIGQUIT
-assert cleanup_delivery == [(123, signal.SIGTERM), (123, signal.SIGKILL)]
+
+
+class IncompleteCleanupProcess:
+    pid = 123
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+
+module.process = None
+module.interrupted_signal = None
+module.launch_process = lambda _argv, _env: IncompleteCleanupProcess()
+module.leader_exited = lambda: True
+module.stop_process_group = lambda _signum: module.CleanupResult(0, False)
+stderr = io.StringIO()
+saved_stderr = module.sys.stderr
+module.sys.stderr = stderr
+try:
+    assert module.main(["test-timeout-v1", "5", "fixture"]) == 125
+finally:
+    module.sys.stderr = saved_stderr
+assert stderr.getvalue() == "test-timeout-v1: could not verify child cleanup\n"
 
 cleanup_signals = []
-module.stop_process_group = lambda signum: cleanup_signals.append(signum)
+
+
+def complete_cleanup(signum):
+    cleanup_signals.append(signum)
+    return module.CleanupResult(0, True)
+
+
+module.stop_process_group = complete_cleanup
 module.time.sleep = lambda _: None
 
 
@@ -467,7 +2030,8 @@ class SignalDuringSpawn:
 
 module.process = None
 module.interrupted_signal = None
-module.subprocess.Popen = SignalDuringSpawn
+module.leader_exited = lambda: False
+module.launch_process = lambda _argv, _env: SignalDuringSpawn()
 assert module.main(["test-timeout-v1", "5", "fixture"]) == 131
 assert cleanup_signals == [signal.SIGQUIT]
 
@@ -482,7 +2046,7 @@ class SignalThenMissing:
 
 module.process = None
 module.interrupted_signal = None
-module.subprocess.Popen = SignalThenMissing
+module.launch_process = lambda _argv, _env: SignalThenMissing()
 assert module.main(["test-timeout-v1", "5", "fixture"]) == 129
 
 
@@ -494,7 +2058,7 @@ class SignalThenExecError:
 
 module.process = None
 module.interrupted_signal = None
-module.subprocess.Popen = SignalThenExecError
+module.launch_process = lambda _argv, _env: SignalThenExecError()
 assert module.main(["test-timeout-v1", "5", "fixture"]) == 131
 
 
@@ -511,7 +2075,15 @@ class SignalDuringWait:
 
 module.process = None
 module.interrupted_signal = None
-module.subprocess.Popen = SignalDuringWait
+module.launch_process = lambda _argv, _env: SignalDuringWait()
+
+
+def signal_during_observe():
+    module.capture_signal(signal.SIGINT, None)
+    return True
+
+
+module.leader_exited = signal_during_observe
 assert module.main(["test-timeout-v1", "5", "fixture"]) == 130
 assert cleanup_signals == [signal.SIGINT]
 
@@ -522,38 +2094,77 @@ class SignalDuringNormalCleanup:
     pid = 123
 
     def __init__(self, *_args, **_kwargs):
-        pass
+        self.waited = False
+
+    def wait(self, **_kwargs):
+        self.waited = True
+        return 0
+
+
+def interrupt_normal_cleanup(signum):
+    assert module.process is not None
+    assert not module.process.waited, "leader was reaped before session cleanup"
+    cleanup_signals.append(signum)
+    module.capture_signal(signal.SIGQUIT, None)
+    return module.CleanupResult(0, True)
+
+
+module.process = None
+module.interrupted_signal = None
+module.leader_exited = lambda: True
+module.stop_process_group = interrupt_normal_cleanup
+module.launch_process = lambda _argv, _env: SignalDuringNormalCleanup()
+assert module.main(["test-timeout-v1", "5", "fixture"]) == 131
+assert cleanup_signals == [signal.SIGTERM]
+
+with tempfile.TemporaryDirectory() as temporary:
+    marker = Path(temporary) / "launched"
+
+    def deny_after_fork(_pid):
+        module.capture_signal(signal.SIGTERM, None)
+        return False
+
+    module.process = None
+    module.interrupted_signal = None
+    module.os.close = real_os_close
+    module.os.getsid = real_os_getsid
+    module.os.kill = real_os_kill
+    module.os.killpg = real_os_killpg
+    module.os.pidfd_open = real_pidfd_open
+    module.signal.pidfd_send_signal = real_pidfd_send_signal
+    module.subprocess.Popen = real_subprocess_popen
+    module.launch_process = real_launch_process
+    module.authorize_launch = deny_after_fork
+    assert module.main(
+        ["test-timeout-v1", "5", "/bin/sh", "-c", f": >'{marker}'"]
+    ) == 143
+    assert not marker.exists(), "denied post-fork child reached exec"
+    module.authorize_launch = real_authorize_launch
+
+
+class InterruptedIncompleteProcess:
+    pid = 123
 
     def wait(self, **_kwargs):
         return 0
 
 
-def interrupt_normal_cleanup(signum):
-    cleanup_signals.append(signum)
-    module.capture_signal(signal.SIGQUIT, None)
-
-
 module.process = None
 module.interrupted_signal = None
-module.stop_process_group = interrupt_normal_cleanup
-module.subprocess.Popen = SignalDuringNormalCleanup
-assert module.main(["test-timeout-v1", "5", "fixture"]) == 131
-assert cleanup_signals == [signal.SIGTERM]
+module.launch_process = lambda _argv, _env: InterruptedIncompleteProcess()
+module.leader_exited = lambda: (
+    module.capture_signal(signal.SIGTERM, None),
+    False,
+)[1]
+module.stop_process_group = lambda _signum: module.CleanupResult(0, False)
+stderr = io.StringIO()
+module.sys.stderr = stderr
+try:
+    assert module.main(["test-timeout-v1", "5", "fixture"]) == 125
+finally:
+    module.sys.stderr = saved_stderr
+assert stderr.getvalue() == "test-timeout-v1: could not verify child cleanup\n"
 
-closed_signals = []
-
-
-def signal_at_finish_boundary(signum, disposition):
-    if not closed_signals:
-        module.capture_signal(signal.SIGHUP, None)
-    closed_signals.append((signum, disposition))
-
-
-module.interrupted_signal = None
-module.signal.signal = signal_at_finish_boundary
-assert module.finish(0) == 129
-assert [signum for signum, _ in closed_signals] == list(module.handled_signals)
-assert all(disposition == signal.SIG_IGN for _, disposition in closed_signals)
 PY
 
 suites=$DOT_TEST_TMP/suites
@@ -727,7 +2338,8 @@ assert_cancellation() {
 # The harness must retain the observed process identity before inducing that.
 trap 'rm -f "$DOT_TEST_CANCEL_PID_FILE"; exit 143' TERM
 printf '%s\n' "$$" >"$DOT_TEST_CANCEL_PID_FILE"
-while :; do sleep 1; done
+deadline=$((SECONDS + 6))
+while ((SECONDS < deadline)); do sleep 0.1; done
 SUITE
   chmod 0755 "$cancel_suites/cancel-test"
   (
@@ -751,7 +2363,6 @@ SUITE
   while process_is_live "$suite_pid" "$suite_identity" &&
     ((SECONDS < deadline)); do sleep 0.05; done
   if process_is_live "$suite_pid" "$suite_identity"; then
-    kill -KILL "$suite_pid" 2>/dev/null || true
     fail "$mode cancellation left the active suite running"
   fi
 }
@@ -772,7 +2383,7 @@ from pathlib import Path
 
 os.setpgid(0, 0)
 Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
-time.sleep(300)
+time.sleep(4)
 PY
 deadline=$((SECONDS + 5))
 while [[ ! -s $DOT_TEST_DESCENDANT_PID_FILE && $SECONDS -lt $deadline ]]; do
@@ -790,7 +2401,6 @@ while process_is_live "$descendant_pid" && ((SECONDS < deadline)); do
   sleep 0.05
 done
 if process_is_live "$descendant_pid"; then
-  kill -KILL "$descendant_pid" 2>/dev/null || true
   fail 'successful suite left its descendant running'
 fi
 
@@ -840,7 +2450,7 @@ import sys
 from pathlib import Path
 
 process = subprocess.Popen(
-    [sys.executable, "-c", "import time; time.sleep(12)"],
+    [sys.executable, "-c", "import time; time.sleep(4)"],
     start_new_session=True,
 )
 Path(sys.argv[1]).write_text(str(process.pid), encoding="utf-8")
@@ -849,25 +2459,37 @@ while :; do sleep 1; done
 SUITE
 chmod 0755 "$escaped/escaped-test"
 SECONDS=0
+escaped_output_file=$escaped/output
 set +e
-escaped_output=$(PATH=$no_setsid_bin \
+PATH=$no_setsid_bin \
   DOT_TEST_ESCAPED_PID_FILE=$escaped_pid_file \
-  DOT_TEST_SUITE_TIMEOUT_SECONDS=1 run_tests "$escaped" -s escaped 2>&1)
+  DOT_TEST_SUITE_TIMEOUT_SECONDS=1 run_tests "$escaped" -s escaped \
+  >"$escaped_output_file" 2>&1 &
+escaped_runner=$!
+set -e
+deadline=$((SECONDS + 5))
+while [[ ! -s $escaped_pid_file && $SECONDS -lt $deadline ]]; do
+  sleep 0.05
+done
+[[ -s $escaped_pid_file ]] || fail 'escaped writer did not publish its identity'
+escaped_pid=$(<"$escaped_pid_file")
+process_identity "$escaped_pid" escaped_identity || escaped_identity=''
+set +e
+wait "$escaped_runner"
 escaped_status=$?
 set -e
 escaped_elapsed=$SECONDS
-if [[ -s $escaped_pid_file ]]; then
-  # The fixture deliberately creates a new session outside the suite's owned
-  # session. Its inherited writer must not hold the runner's display pipe open;
-  # remove it explicitly after measuring that bounded-output contract.
-  escaped_pid=$(<"$escaped_pid_file")
-  kill -KILL "$escaped_pid" 2>/dev/null || true
-fi
+escaped_output=$(<"$escaped_output_file")
 assert_eq 1 "$escaped_status" 'escaped writer suite still times out'
 assert_contains 'Failed: escaped-test' "$escaped_output" \
   'escaped writer timeout is reported'
 [[ $escaped_elapsed -le 8 ]] ||
   fail "escaped writer delayed timeout reporting for ${escaped_elapsed}s"
+deadline=$((SECONDS + 5))
+while process_is_live "$escaped_pid" "$escaped_identity" &&
+  ((SECONDS < deadline)); do sleep 0.05; done
+process_is_live "$escaped_pid" "$escaped_identity" &&
+  fail 'escaped writer outlived its bounded fixture lifetime'
 
 stale_parent=$DOT_TEST_TMP/stale-parent
 stale_root=$stale_parent/dot-suite-runs.$EUID

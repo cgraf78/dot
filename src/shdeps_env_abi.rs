@@ -14,9 +14,9 @@
 //! Engine boundaries: every shell `_warn` diagnostic folds into the
 //! status or `None` refusal, like parts 1 and 2 folded theirs —
 //! warnings are caller UI, the refusal is the contract. The bounded
-//! runner supervises one direct child with standard pipes rather
-//! than the shell's cleanup job table and process-group kill, so
-//! rows pin leaf commands (no surviving descendants); the timeout
+//! runner supervises one isolated, owned process session and bounds its
+//! aggregate capture, so cancellation, timeout, and output failure all stop
+//! and reap descendants before returning. The timeout
 //! warning text stays unsaid and `124` is the contract. A spawn
 //! failure reads `127`, like the shell's missing-command `$?`
 //! (probing a directory would read `126` on the shell; rows pin
@@ -31,9 +31,8 @@
 //! fixtures both sides stage.
 
 use std::ffi::OsString;
-use std::io::Read as _;
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 
 /// Restored caller policy from [`restore_caller_env`]: `Some` means
@@ -199,19 +198,6 @@ fn parse_timeout(raw: &str) -> Option<u64> {
     }
 }
 
-/// Map a reaped exit status to the shell `$?` the recorder subshell
-/// would have stored: the code itself, or `128` plus the fatal
-/// signal when signaled.
-fn status_code(status: std::process::ExitStatus) -> i32 {
-    match status.code() {
-        Some(code) => code,
-        None => match status.signal() {
-            Some(signal) => 128 + signal,
-            None => 1,
-        },
-    }
-}
-
 /// `_dot_shdeps_run_bounded`: run `argv` with stdout captured,
 /// stdin closed, and stderr inherited or discarded per
 /// `stderr_mode` (`"inherit-stderr"` / `"discard-stderr"`), killing
@@ -248,74 +234,56 @@ pub fn run_bounded(
     }
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
-    if discard_stderr {
-        command.stderr(std::process::Stdio::null());
+    command.stderr(if discard_stderr {
+        std::process::Stdio::null()
     } else {
-        command.stderr(std::process::Stdio::inherit());
-    }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => {
-            // The shell's recorder stores `127` for a missing
-            // command; see the module docs for the directory caveat.
-            return BoundedOutcome {
+        std::process::Stdio::piped()
+    });
+    let now = std::time::Instant::now();
+    let deadline = now.checked_add(std::time::Duration::from_secs(seconds));
+    match crate::cleanup::run_session_output_typed(
+        command,
+        deadline,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    ) {
+        Ok(output) => {
+            if !discard_stderr {
+                let _ = std::io::stderr().write_all(&output.stderr);
+            }
+            let status = output.status.code().unwrap_or_else(|| {
+                use std::os::unix::process::ExitStatusExt as _;
+                output.status.signal().map_or(1, |signal| 128 + signal)
+            });
+            BoundedOutcome {
+                status,
+                stdout: output.stdout,
+            }
+        }
+        Err(crate::cleanup::SessionOutputError::Interrupted(signal)) => BoundedOutcome {
+            status: 128 + signal,
+            stdout: Vec::new(),
+        },
+        Err(crate::cleanup::SessionOutputError::TimedOut) => BoundedOutcome {
+            status: 124,
+            stdout: Vec::new(),
+        },
+        Err(crate::cleanup::SessionOutputError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            BoundedOutcome {
                 status: 127,
                 stdout: Vec::new(),
-            };
-        }
-    };
-    let taken = match child.stdout.take() {
-        Some(taken) => taken,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return BoundedOutcome {
-                status: 1,
-                stdout: Vec::new(),
-            };
-        }
-    };
-    let reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        let mut pipe = taken;
-        let _ = pipe.read_to_end(&mut output);
-        output
-    });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let code = status_code(status);
-                let stdout = reader.join().unwrap_or_default();
-                return BoundedOutcome {
-                    status: code,
-                    stdout,
-                };
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // The shell drops the partial capture on timeout;
-                    // the join only reaps the drain thread.
-                    let _ = reader.join();
-                    return BoundedOutcome {
-                        status: 124,
-                        stdout: Vec::new(),
-                    };
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return BoundedOutcome {
-                    status: 1,
-                    stdout: Vec::new(),
-                };
             }
         }
+        Err(
+            crate::cleanup::SessionOutputError::Io(_)
+            | crate::cleanup::SessionOutputError::CaptureLimit
+            | crate::cleanup::SessionOutputError::CleanupIncomplete,
+        ) => BoundedOutcome {
+            status: 1,
+            stdout: Vec::new(),
+        },
     }
 }
 

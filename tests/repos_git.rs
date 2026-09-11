@@ -2,8 +2,11 @@
 use dot::repos_base::{Base, RepoKind, Topology};
 use dot_test_support::TempDir;
 use std::ffi::OsString;
+use std::os::fd::FromRawFd as _;
 use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 mod repos_git {
     pub use dot::repos_git::each_existing;
@@ -113,6 +116,91 @@ fn repos_git_stream_child() {
         _ => dot::repos_git::repo_git(&base, kind, &path, &args),
     };
     println!("DOT_RC={rc}");
+}
+
+#[test]
+fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
+    const HELPER: &str = "DOT_REPOS_GIT_PTY_HELPER";
+    if std::env::var_os(HELPER).is_some() {
+        assert_eq!(dot::repos_git::run_git_streaming(&[], &["push"]), 0);
+        return;
+    }
+
+    let scope = TempDir::new("repos-git-pty").unwrap();
+    let bin = scope.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let observed = scope.path().join("foreground-tty");
+    let git = bin.join("git");
+    std::fs::write(
+        &git,
+        "#!/bin/sh\n/usr/bin/python3 -c 'import os,sys; sys.exit(0 if all(os.isatty(fd) and os.tcgetpgrp(fd) == os.getpgrp() for fd in (0,1,2)) else 9)' || exit $?\n: >\"$DOT_TEST_GIT_PTY_OBSERVED\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: openpty initializes both descriptors and null optional pointers
+    // request the platform defaults.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    // SAFETY: successful openpty returned uniquely owned descriptors.
+    let _master = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
+    let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "streaming_git_keeps_the_callers_foreground_controlling_tty",
+            "--nocapture",
+        ])
+        .env(HELPER, "1")
+        .env("PATH", &bin)
+        .env("DOT_TEST_GIT_PTY_OBSERVED", &observed)
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave));
+    // SAFETY: the post-fork child is single threaded and the calls establish
+    // fd 0's PTY as its controlling, foreground terminal before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0
+                || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) < 0
+                || libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) < 0
+            {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PTY Git helper did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(status.success(), "PTY Git helper failed with {status:?}");
+    assert!(
+        observed.exists(),
+        "streaming Git did not retain foreground TTY access"
+    );
 }
 fn git(path: &Path, args: &[&str]) {
     assert!(

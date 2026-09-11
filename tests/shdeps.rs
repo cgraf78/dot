@@ -44,6 +44,14 @@ fn lock_value_requires_the_literal_three_field_contract() {
         ("abi", Some(valid.clone()), "abi", Some(ABI)),
         ("bogus-key", Some(valid.clone()), "bogus", None),
         ("missing", None, "revision", None),
+        // Fresh-review-B F5: an oversized lock refuses rather than reading
+        // unbounded bytes (valid locks are ~150 bytes; cap is 4 KiB).
+        (
+            "oversized",
+            Some(format!("revision={}\n", "a".repeat(5000)).into_bytes()),
+            "revision",
+            None,
+        ),
         (
             "two-lines",
             Some(format!("revision={REVISION}\ninstall_sha256={INSTALL_SHA256}\n").into_bytes()),
@@ -221,6 +229,45 @@ fn sha256_uses_known_literal_vectors_and_refuses_missing_files() {
     ] {
         let path = home.path().join(name);
         std::fs::write(&path, bytes).expect("digest fixture");
+        assert_eq!(dot::shdeps::sha256_file(&path).as_deref(), Some(digest));
+    }
+}
+
+#[test]
+fn sha256_pins_padding_boundary_lengths() {
+    // Fresh-review-A nit-3 / review-B P2-2: pin the `used > 56` padding
+    // branch and multi-block `update` on this security-critical digest.
+    // Inputs are `0..n`; digests are independent `hashlib.sha256` values.
+    let home = TempDir::new("shdeps-digest-boundary").expect("fixture directory");
+    for (len, digest) in [
+        (
+            55,
+            "463eb28e72f82e0a96c0a4cc53690c571281131f672aa229e0d45ae59b598b59",
+        ),
+        (
+            56,
+            "da2ae4d6b36748f2a318f23e7ab1dfdf45acdc9d049bd80e59de82a60895f562",
+        ),
+        (
+            57,
+            "2fe741af801cc238602ac0ec6a7b0c3a8a87c7fc7d7f02a3fe03d1c12eac4d8f",
+        ),
+        (
+            63,
+            "29af2686fd53374a36b0846694cc342177e428d1647515f078784d69cdb9e488",
+        ),
+        (
+            64,
+            "fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108",
+        ),
+        (
+            65,
+            "4bfd2c8b6f1eec7a2afeb48b934ee4b2694182027e6d0fc075074f2fabb31781",
+        ),
+    ] {
+        let path = home.path().join(format!("bytes-{len}"));
+        let bytes: Vec<u8> = (0..len).map(|index| index as u8).collect();
+        std::fs::write(&path, &bytes).expect("digest fixture");
         assert_eq!(dot::shdeps::sha256_file(&path).as_deref(), Some(digest));
     }
 }

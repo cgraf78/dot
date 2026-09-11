@@ -160,6 +160,17 @@ returns nonzero. `dot_write_text_if_changed` preserves an unchanged destination
 inode. Family helpers print one deterministic path per line, with filtering
 applied before `.replace` winner selection.
 
+A merge hook may declare the live files it maintains in a `.outputs` sidecar
+next to its script: `10-example.sh` (or `10-example.serial.sh`) reads
+`10-example.outputs`. The sidecar lists one path per line; blank lines and
+`#` comments are ignored, and each entry supports the same leading `~`,
+`$HOME`, and `${HOME}` expansion as `dot_expand_home`. Entries must expand
+to absolute paths. `dot doctor` fails unless every declared output exists and
+is strictly newer than the hook script, the sidecar, and the hook's
+identity-named family directory. Hooks without a sidecar (or with an empty
+one) skip verification instead of failing. Sidecars pass the same ownership
+and writability validation as hook scripts.
+
 Doctor extensions report structured records only; ordinary stdout/stderr is
 diagnosed as out-of-band output. Each result helper accepts `LABEL [DETAIL]`
 except the one-argument section helper:

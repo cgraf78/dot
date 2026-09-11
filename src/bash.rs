@@ -147,6 +147,7 @@ fn resolve_with_fixed(
 }
 
 fn probe(candidate: &Path, env: &BTreeMap<OsString, OsString>, cwd: &Path) -> Option<Resolved> {
+    crate::cancellation::check().ok()?;
     if !normalized_absolute(candidate) || !executable(candidate) {
         return None;
     }
@@ -166,7 +167,14 @@ fn probe(candidate: &Path, env: &BTreeMap<OsString, OsString>, cwd: &Path) -> Op
     // Match the former resolver's explicit empty values as an additional
     // defense if a future Bash startup path distinguishes unset from empty.
     command.env("BASH_ENV", "").env("ENV", "");
-    let output = command.output().ok()?;
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }

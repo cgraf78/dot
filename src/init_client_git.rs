@@ -271,7 +271,13 @@ fn git(home: &Path, args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    command.output().map_err(|source| Error::Io {
+    crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .map_err(|source| Error::Io {
         context: "spawn git",
         source,
     })
@@ -311,11 +317,13 @@ pub fn stage_git(inputs: &GitStageInputs<'_>, deps: &GitStageDeps<'_>) -> Result
 
     (deps.ensure_private_dir)(inputs.backup)?;
     if !exists_lexical(&container) {
+        crate::cancellation::check_mutation()?;
         (deps.ensure_private_dir)(&container)?;
         let mut body = STAGE_HEADER.to_vec();
         body.extend_from_slice(format!("nonce={}\n", inputs.nonce).as_bytes());
         body.extend_from_slice(format!("commit={}\n", inputs.commit).as_bytes());
         body.extend_from_slice(format!("identity={}\n", inputs.identity).as_bytes());
+        crate::cancellation::check_mutation()?;
         std::fs::write(&marker, &body).map_err(|source| Error::Io {
             context: "write stage identity marker",
             source,

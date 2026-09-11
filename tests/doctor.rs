@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 use dot_test_support::TempDir;
 
@@ -207,6 +207,177 @@ fn portable_process_live(status: &[u8]) -> bool {
     )
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DoctorProcessIdentity {
+    pid: i32,
+    group: i32,
+    session: i32,
+    generation: Vec<u8>,
+}
+
+struct PinnedDoctorProcess {
+    identity: DoctorProcessIdentity,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pidfd: std::os::fd::OwnedFd,
+}
+
+impl PinnedDoctorProcess {
+    fn claim(identity: DoctorProcessIdentity) -> Option<Self> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::FromRawFd as _;
+
+            // SAFETY: pidfd_open only observes the positive fixture PID.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) };
+            if fd < 0 {
+                return None;
+            }
+            // SAFETY: a successful pidfd_open returns one newly owned fd.
+            let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+            if !same_doctor_process(&identity) {
+                return None;
+            }
+            Some(Self { identity, pidfd })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            same_doctor_process(&identity).then_some(Self { identity })
+        }
+    }
+
+    fn signal_for_cleanup(&self, signal: i32) -> bool {
+        if !same_doctor_process(&self.identity) {
+            return false;
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::AsRawFd as _;
+
+            if self.identity.pid == self.identity.group
+                && self.identity.pid == self.identity.session
+                && self.identity.group != unsafe { libc::getpgrp() }
+            {
+                // The retained pidfd anchors this private process-group number
+                // across validation and delivery.
+                // SAFETY: this group is owned by the pinned fixture leader.
+                if unsafe { libc::kill(-self.identity.group, signal) } == 0 {
+                    return true;
+                }
+            }
+            // SAFETY: pidfd_send_signal targets the retained kernel identity.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                ) == 0
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = signal;
+            false
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn doctor_process_generation(pid: i32) -> Option<Vec<u8>> {
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.windows(2).rposition(|part| part == b") ")?;
+    stat[end + 2..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .nth(19)
+        .map(<[u8]>::to_vec)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn doctor_process_generation(pid: i32) -> Option<Vec<u8>> {
+    let output = Command::new("/bin/ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let generation = output.status.success().then_some(output.stdout)?;
+    (!generation.iter().all(u8::is_ascii_whitespace)).then_some(generation)
+}
+
+fn doctor_process_identity(pid: i32) -> Option<DoctorProcessIdentity> {
+    let generation = doctor_process_generation(pid)?;
+    // SAFETY: `pid` is positive and these calls only inspect process topology.
+    let (group, session) = unsafe { (libc::getpgid(pid), libc::getsid(pid)) };
+    let identity = DoctorProcessIdentity {
+        pid,
+        group,
+        session,
+        generation,
+    };
+    (group > 0 && session > 0 && doctor_process_generation(pid)? == identity.generation)
+        .then_some(identity)
+}
+
+fn same_doctor_process_identity(
+    expected: &DoctorProcessIdentity,
+    observed: &DoctorProcessIdentity,
+) -> bool {
+    expected == observed
+}
+
+fn same_doctor_process(identity: &DoctorProcessIdentity) -> bool {
+    doctor_process_identity(identity.pid)
+        .as_ref()
+        .is_some_and(|observed| same_doctor_process_identity(identity, observed))
+}
+
+#[test]
+fn doctor_fixture_rejects_a_stale_process_generation() {
+    let current = DoctorProcessIdentity {
+        pid: 101,
+        group: 202,
+        session: 303,
+        generation: b"current".to_vec(),
+    };
+    let stale = DoctorProcessIdentity {
+        generation: b"stale".to_vec(),
+        ..current.clone()
+    };
+
+    assert!(!same_doctor_process_identity(&stale, &current));
+    assert!(same_doctor_process_identity(&current, &current));
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn doctor_cleanup_handle_suppresses_reused_generation_delivery() {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut command = Command::new("sleep");
+    command.arg("30").stdin(Stdio::null());
+    // SAFETY: setsid creates a private fixture session before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn().expect("spawn cleanup fixture");
+    let identity = doctor_process_identity(child.id() as i32).expect("fixture identity");
+    let mut process = PinnedDoctorProcess::claim(identity).expect("pin fixture identity");
+    process.identity.generation.push(b'x');
+
+    assert!(!process.signal_for_cleanup(libc::SIGKILL));
+    assert_eq!(child.try_wait().expect("observe fixture"), None);
+    child.kill().expect("stop retained fixture child");
+    child.wait().expect("reap retained fixture child");
+}
+
 #[test]
 fn empty_portable_process_status_is_not_live() {
     assert!(!portable_process_live(b""));
@@ -215,17 +386,143 @@ fn empty_portable_process_status_is_not_live() {
     assert!(portable_process_live(b"S+\n"));
 }
 
-fn poll_until(mut condition: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !condition() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "observable condition timed out"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
+struct GuardedDoctorChild {
+    child: Option<Child>,
+    identity: DoctorProcessIdentity,
+    reaped: bool,
+}
+
+impl GuardedDoctorChild {
+    fn new(child: Child) -> Self {
+        let identity = doctor_process_identity(child.id() as i32)
+            .expect("observe retained doctor process identity");
+        Self {
+            child: Some(child),
+            identity,
+            reaped: false,
+        }
+    }
+
+    fn exited_wnowait(&self) -> std::io::Result<bool> {
+        let child = self.child.as_ref().expect("retained doctor child");
+        // SAFETY: waitid writes only the initialized local siginfo and WNOWAIT
+        // preserves this owned child's identity while descendants are checked.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            if libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(info.si_pid() != 0)
+        }
+    }
+
+    fn signal(&self, signal: i32) -> std::io::Result<()> {
+        // The unreaped `Child` retains authority over this exact process even
+        // after it exits, so its positive PID cannot be recycled underneath us.
+        if unsafe { libc::kill(self.identity.pid, signal) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.as_mut().expect("retained doctor child").wait()?;
+        self.reaped = true;
+        Ok(status)
+    }
+
+    fn reap_with_output(&mut self) -> std::io::Result<Output> {
+        let output = self
+            .child
+            .take()
+            .expect("retained doctor child")
+            .wait_with_output()?;
+        self.reaped = true;
+        Ok(output)
     }
 }
 
+impl Drop for GuardedDoctorChild {
+    fn drop(&mut self) {
+        if self.reaped || self.child.is_none() {
+            return;
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !self.exited_wnowait().unwrap_or(false) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if self.exited_wnowait().unwrap_or(false) {
+            let _ = self.child.as_mut().expect("retained doctor child").wait();
+            self.reaped = true;
+        }
+    }
+}
+
+struct GuardedProbeSession {
+    process: PinnedDoctorProcess,
+    active: bool,
+}
+
+impl GuardedProbeSession {
+    fn new(leader: i32) -> Self {
+        Self::from_identity(
+            doctor_process_identity(leader).expect("observe fixture process identity"),
+        )
+    }
+
+    fn from_identity(identity: DoctorProcessIdentity) -> Self {
+        Self {
+            process: PinnedDoctorProcess::claim(identity).expect("pin fixture process identity"),
+            active: true,
+        }
+    }
+
+    fn observe_stopped(&mut self) -> bool {
+        let stopped = !same_doctor_process(&self.process.identity)
+            || !process_live(self.process.identity.pid);
+        if stopped {
+            self.active = false;
+        }
+        stopped
+    }
+
+    fn force_stop(&mut self) {
+        if !self.active || !same_doctor_process(&self.process.identity) {
+            self.active = false;
+            return;
+        }
+        let _ = self.process.signal_for_cleanup(libc::SIGKILL);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while same_doctor_process(&self.process.identity)
+            && process_live(self.process.identity.pid)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !same_doctor_process(&self.process.identity) || !process_live(self.process.identity.pid)
+        {
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for GuardedProbeSession {
+    fn drop(&mut self) {
+        self.force_stop();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn assert_doctor_signal(signal: i32, expected: i32) {
     let home = TempDir::new("doctor-native-signal-home").expect("home");
     let state = TempDir::new("doctor-native-signal-state").expect("state");
@@ -260,7 +557,7 @@ fn assert_doctor_signal(signal: i32, expected: i32) {
     seal(&directory.join("10-hang.sh"), 0o644);
     seal(&directory.join("20-later.sh"), 0o644);
 
-    let mut child = command(
+    let child = command(
         false,
         &home,
         &state,
@@ -268,70 +565,72 @@ fn assert_doctor_signal(signal: i32, expected: i32) {
     )
     .spawn()
     .expect("doctor");
+    let mut child = GuardedDoctorChild::new(child);
     let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut worker_identity = None;
+    let mut descendant_identity = None;
     let (worker, descendant) = loop {
-        let worker = std::fs::read_to_string(&marker)
-            .ok()
-            .and_then(|value| value.trim().parse::<i32>().ok());
-        let descendant = std::fs::read_to_string(&descendant_marker)
-            .ok()
-            .and_then(|value| value.trim().parse::<i32>().ok());
-        if let (Some(worker), Some(descendant)) = (worker, descendant) {
-            break (worker, descendant);
+        if worker_identity.is_none() {
+            worker_identity = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok())
+                .and_then(doctor_process_identity);
         }
+        if descendant_identity.is_none() {
+            descendant_identity = std::fs::read_to_string(&descendant_marker)
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok())
+                .and_then(doctor_process_identity);
+        }
+        if let (Some(worker), Some(descendant)) =
+            (worker_identity.clone(), descendant_identity.clone())
+        {
+            break (
+                GuardedProbeSession::from_identity(worker),
+                GuardedProbeSession::from_identity(descendant),
+            );
+        }
+        assert!(
+            !child.exited_wnowait().expect("doctor status"),
+            "doctor exited before starting its cancellation fixture"
+        );
         if std::time::Instant::now() >= ready_deadline {
-            for path in [&marker, &descendant_marker] {
-                if let Ok(pid) = std::fs::read_to_string(path) {
-                    if let Ok(pid) = pid.trim().parse::<i32>() {
-                        // SAFETY: fixture markers contain only process-group
-                        // leaders created by this doctor invocation.
-                        unsafe { libc::kill(-pid, libc::SIGKILL) };
-                    }
-                }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+            let _worker = worker_identity
+                .take()
+                .map(GuardedProbeSession::from_identity);
+            let _descendant = descendant_identity
+                .take()
+                .map(GuardedProbeSession::from_identity);
             panic!("doctor cancellation fixture did not start");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    // SAFETY: the fixture owns this positive Dot child and uses a valid signal.
-    assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+    child.signal(signal).expect("signal retained doctor child");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while child.try_wait().expect("doctor status").is_none() {
+    while !child.exited_wnowait().expect("doctor status") {
         if std::time::Instant::now() >= deadline {
-            // SAFETY: these are the two fixture-owned process identities.
-            unsafe {
-                libc::kill(-worker, libc::SIGKILL);
-                libc::kill(-descendant, libc::SIGKILL);
-                libc::kill(child.id() as i32, libc::SIGKILL);
-            }
-            let _ = child.wait();
             panic!("doctor did not finish after signal {signal}");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let output = child.wait_with_output().expect("doctor output");
-    let observed = output.status.code();
+    let mut worker = worker;
+    let mut descendant = descendant;
     let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while (process_live(worker) || process_live(descendant))
+    while (!worker.observe_stopped() || !descendant.observe_stopped())
         && std::time::Instant::now() < cleanup_deadline
     {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let worker_survived = process_live(worker);
-    let descendant_survived = process_live(descendant);
+    let worker_survived = !worker.observe_stopped();
+    let descendant_survived = !descendant.observe_stopped();
     if worker_survived {
-        // Keep the intentionally failing RED run from leaking the worker.
-        // SAFETY: the hook worker is the leader of its owned session.
-        unsafe { libc::kill(-worker, libc::SIGKILL) };
-        poll_until(|| !process_live(worker));
+        worker.force_stop();
     }
     if descendant_survived {
-        // SAFETY: set -m made this fixture descendant its process-group leader.
-        unsafe { libc::kill(-descendant, libc::SIGKILL) };
-        poll_until(|| !process_live(descendant));
+        descendant.force_stop();
     }
+    let output = child.reap_with_output().expect("doctor output");
+    let observed = output.status.code();
     assert_eq!(
         observed,
         Some(expected),
@@ -341,16 +640,18 @@ fn assert_doctor_signal(signal: i32, expected: i32) {
     );
     assert!(!worker_survived, "doctor extension worker survived");
     assert!(!descendant_survived, "doctor extension descendant survived");
-    assert_eq!(
-        std::fs::read(&delivered).expect("delivered signal marker"),
-        b"TERM\n",
-        "worker received the parent signal instead of cleanup TERM"
-    );
-    assert_eq!(
-        std::fs::read(&descendant_delivered).expect("descendant signal marker"),
-        b"TERM\n",
-        "escaped-group descendant did not receive exactly one cleanup TERM"
-    );
+    for (path, label) in [
+        (&delivered, "worker"),
+        (&descendant_delivered, "escaped-group descendant"),
+    ] {
+        let delivered = std::fs::read_to_string(path).expect("delivered signal marker");
+        let signals = delivered.lines().collect::<Vec<_>>();
+        assert_eq!(
+            signals,
+            ["TERM"],
+            "{label} did not receive exactly one cleanup TERM"
+        );
+    }
     assert!(
         !later.exists(),
         "doctor started an extension after cancellation"
@@ -365,23 +666,73 @@ fn assert_doctor_signal(signal: i32, expected: i32) {
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn native_doctor_hup_reaps_extension() {
     assert_doctor_signal(libc::SIGHUP, 129);
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn native_doctor_int_reaps_extension() {
     assert_doctor_signal(libc::SIGINT, 130);
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn native_doctor_quit_reaps_extension() {
     assert_doctor_signal(libc::SIGQUIT, 131);
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn native_doctor_term_reaps_extension() {
     assert_doctor_signal(libc::SIGTERM, 143);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn native_doctor_unpinned_descendant_fails_closed_boundedly() {
+    let home = TempDir::new("doctor-unpinned-home").expect("home");
+    let state = TempDir::new("doctor-unpinned-state").expect("state");
+    let root = home.path().join("extensions");
+    let directory = root.join("doctor.d");
+    let marker = home.path().join("doctor-unpinned-descendant");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
+    std::fs::create_dir_all(&directory).expect("doctor directory");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=none\n",
+    )
+    .expect("config");
+    std::fs::write(
+        directory.join("10-escape.sh"),
+        b"doctor() {\n  set -m\n  (trap '' TERM; printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-unpinned-descendant\"; sleep 3) </dev/null >/dev/null 2>&1 &\n  until [[ -s $HOME/doctor-unpinned-descendant ]]; do sleep 0.02; done\n}\n",
+    )
+    .expect("extension");
+    seal(&root, 0o700);
+    seal(&directory, 0o700);
+    seal(&directory.join("10-escape.sh"), 0o644);
+
+    let started = std::time::Instant::now();
+    let output = command(false, &home, &state, &[])
+        .output()
+        .expect("doctor output");
+    let pid = std::fs::read_to_string(&marker)
+        .expect("descendant marker")
+        .trim()
+        .parse::<i32>()
+        .expect("descendant pid");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while process_live(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(6),
+        "doctor incomplete cleanup was not bounded"
+    );
+    assert!(!process_live(pid), "self-bounded descendant survived");
 }
 
 #[test]
@@ -407,11 +758,12 @@ fn signal_interrupts_backpressured_doctor_rendering() {
     seal(&directory.join("10-output.sh"), 0o644);
 
     let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("stdout pair");
-    let mut child = command(false, &home, &state, &[])
+    let child = command(false, &home, &state, &[])
         .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
         .stderr(Stdio::null())
         .spawn()
         .expect("doctor");
+    let mut child = GuardedDoctorChild::new(child);
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -435,33 +787,45 @@ fn signal_interrupts_backpressured_doctor_rendering() {
         .is_err()
     {
         // Let the command's own handler clean any extension session before
-        // the bounded emergency fallback terminates the coordinator.
-        // SAFETY: the fixture owns this positive Dot child and SIGTERM is valid.
-        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        // the bounded guard terminates the retained coordinator.
+        let _ = child.signal(libc::SIGTERM);
         let _ = release_tx.send(());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while child.try_wait().ok().flatten().is_none() && std::time::Instant::now() < deadline {
+        while !child.exited_wnowait().unwrap_or(false) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        if child.try_wait().ok().flatten().is_none() {
-            let _ = child.kill();
+        if child.exited_wnowait().unwrap_or(false) {
+            let _ = child.reap();
         }
-        let _ = child.wait();
         panic!("doctor rendering did not start");
     }
-    // SAFETY: the fixture owns this positive Dot child and SIGINT is valid.
-    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    child
+        .signal(libc::SIGINT)
+        .expect("signal retained doctor child");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut observed = None;
-    while observed.is_none() && std::time::Instant::now() < deadline {
-        observed = child.try_wait().expect("doctor status");
-        if observed.is_none() {
+    let mut completed = false;
+    while !completed && std::time::Instant::now() < deadline {
+        completed = child.exited_wnowait().expect("doctor status");
+        if !completed {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
-    let blocked = observed.is_none();
+    let blocked = !completed;
     release_tx.send(()).unwrap();
-    let status = observed.unwrap_or_else(|| child.wait().expect("doctor exit"));
+    if !completed {
+        let release_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !completed && std::time::Instant::now() < release_deadline {
+            completed = child.exited_wnowait().expect("doctor status after release");
+            if !completed {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+    assert!(
+        completed,
+        "doctor did not exit after releasing its output sink"
+    );
+    let status = child.reap().expect("doctor exit");
     reader.join().unwrap();
     assert!(!blocked, "signal left doctor blocked on an unread stdout");
     assert_eq!(status.code(), Some(130));
@@ -1083,6 +1447,192 @@ fn trusted_merge_inventory_matches_without_the_old_engine() {
     assert_pair(&shell, &native);
 }
 
+fn merge_fixture(tag: &str) -> (TempDir, TempDir, std::path::PathBuf) {
+    let home = TempDir::new(&format!("doctor-native-{tag}-home")).expect("home");
+    let state = TempDir::new(&format!("doctor-native-{tag}-state")).expect("state");
+    let root = home.path().join("extensions");
+    let directory = root.join("merge-hooks.d");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
+    std::fs::create_dir_all(&directory).expect("merge directory");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=none\n",
+    )
+    .expect("config");
+    std::fs::write(directory.join("10-fixture.sh"), b"merge() { :; }\n").expect("hook");
+    seal(&root, 0o700);
+    seal(&directory, 0o700);
+    seal(&directory.join("10-fixture.sh"), 0o644);
+    (home, state, directory)
+}
+
+fn backdate_mtime(path: &Path, secs_ago: u64) {
+    let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for backdating")
+        .set_modified(mtime)
+        .expect("backdate mtime");
+}
+
+#[test]
+fn declared_merge_outputs_verify_end_to_end() {
+    // Handoff finding #8: the `.outputs` sidecar declares live
+    // outputs; doctor verifies each exists and is newer than its
+    // inputs. Hooks without a sidecar skip verification.
+    let (home, state, directory) = merge_fixture("merge-outputs");
+    let output = home.path().join("live.conf");
+    std::fs::write(
+        directory.join("10-fixture.outputs"),
+        format!("{}\n# comment line\n\n", output.display()),
+    )
+    .expect("sidecar");
+    seal(&directory.join("10-fixture.outputs"), 0o644);
+    backdate_mtime(&directory.join("10-fixture.sh"), 100);
+    backdate_mtime(&directory.join("10-fixture.outputs"), 100);
+    std::fs::write(&output, b"live\n").expect("output");
+
+    let (_, native) = pair(&home, &state);
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("1 hook(s)"),
+        "discovery aggregate kept: {stdout}"
+    );
+    assert!(
+        stdout.contains("merge-hook outputs are current"),
+        "fresh output passes: {stdout}"
+    );
+
+    // A missing output fails the merge section.
+    std::fs::remove_file(&output).expect("remove output");
+    let (_, native) = pair(&home, &state);
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("merge-hook output is missing"),
+        "missing output fails: {stdout}"
+    );
+
+    // An output older than the hook script fails as stale.
+    std::fs::write(&output, b"stale\n").expect("stale output");
+    backdate_mtime(&output, 200);
+    let (_, native) = pair(&home, &state);
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("merge-hook output is stale"),
+        "stale output fails: {stdout}"
+    );
+}
+
+#[test]
+fn bad_sidecars_degrade_per_spec_end_to_end() {
+    // Fresh-review-B B2: one unreadable/oversized/untrusted sidecar
+    // fails its own hook, never the whole inventory; the 1 MiB read
+    // cap bounds a corrupt sidecar. Native-only (sidecars are new
+    // observability the shell never read).
+    let (home, state, directory) = merge_fixture("merge-sidecar-degrade");
+    std::fs::write(directory.join("20-second.sh"), b"merge() { :; }\n").expect("hook");
+    seal(&directory.join("20-second.sh"), 0o644);
+    // Healthy hook: fresh declared output still verifies.
+    let output = home.path().join("live.conf");
+    std::fs::write(
+        directory.join("10-fixture.outputs"),
+        format!("{}\n", output.display()),
+    )
+    .expect("good sidecar");
+    seal(&directory.join("10-fixture.outputs"), 0o644);
+    backdate_mtime(&directory.join("10-fixture.sh"), 100);
+    backdate_mtime(&directory.join("10-fixture.outputs"), 100);
+    std::fs::write(&output, b"live\n").expect("output");
+    // Sick hook: an oversized sidecar (1 MiB + 1 byte).
+    std::fs::write(
+        directory.join("20-second.outputs"),
+        vec![b'x'; 1024 * 1024 + 1],
+    )
+    .expect("big sidecar");
+    seal(&directory.join("20-second.outputs"), 0o644);
+
+    let (_, native) = pair(&home, &state);
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("merge-hook outputs are current"),
+        "healthy hook still verifies: {stdout}"
+    );
+    assert!(
+        stdout.contains("merge-hook output declaration is invalid"),
+        "sick hook fails its spec: {stdout}"
+    );
+    assert!(
+        !stdout.contains("inventory is invalid"),
+        "one bad sidecar must not blind the inventory: {stdout}"
+    );
+
+    // An untrusted (group-writable) sidecar degrades the same way.
+    std::fs::write(directory.join("20-second.outputs"), b"/tmp/x\n").expect("sidecar");
+    seal(&directory.join("20-second.outputs"), 0o666);
+    let (_, native) = pair(&home, &state);
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("merge-hook outputs are current"),
+        "healthy hook still verifies: {stdout}"
+    );
+    assert!(
+        stdout.contains("merge-hook output declaration is invalid"),
+        "untrusted sidecar fails its spec: {stdout}"
+    );
+    assert!(
+        !stdout.contains("inventory is invalid"),
+        "one bad sidecar must not blind the inventory: {stdout}"
+    );
+}
+
+#[test]
+fn undeclared_merge_outputs_skip_verification_end_to_end() {
+    let (home, state, _) = merge_fixture("merge-undeclared");
+    let (shell, native) = pair(&home, &state);
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(stdout.contains("1 hook(s)"));
+    assert!(
+        stdout.contains("merge-hook outputs are unverified"),
+        "no sidecar skips, not fails: {stdout}"
+    );
+    assert_pair(&shell, &native);
+}
+
+#[test]
+fn cron_freshness_reports_stamp_age_end_to_end() {
+    // Handoff finding #1: doctor reads the cron last-success stamp
+    // a successful `update --cron` writes.
+    let (home, state, _) = merge_fixture("cron-freshness");
+    let (_, native) = pair(&home, &state);
+    assert!(
+        String::from_utf8_lossy(&native.stdout).contains("cron update success is unknown"),
+        "missing stamp skips"
+    );
+
+    let stamp = state.path().join("dot/update.last-success");
+    std::fs::create_dir_all(stamp.parent().expect("stamp parent")).expect("stamp dir");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    std::fs::write(&stamp, format!("{now}\n")).expect("fresh stamp");
+    let (_, native) = pair(&home, &state);
+    assert!(
+        String::from_utf8_lossy(&native.stdout).contains("cron update succeeded recently"),
+        "fresh stamp passes"
+    );
+
+    std::fs::write(&stamp, b"1\n").expect("aged stamp");
+    let (shell, native) = pair(&home, &state);
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("cron update has not succeeded recently"),
+        "stale stamp warns: {stdout}"
+    );
+    assert_pair(&shell, &native);
+}
+
 #[test]
 fn unsafe_merge_inventory_matches_without_the_old_engine() {
     let home = TempDir::new("doctor-native-unsafe-merge-home").expect("home");
@@ -1228,7 +1778,35 @@ fn latest_provider(home: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
     std::fs::write(provider.join("shdeps.sh"), b"# fixture library\n").expect("library");
     std::fs::write(
         provider.join("shdeps"),
-        b"#!/usr/bin/env bash\nif [[ ${1:-} == __api && ${2:-} == version ]]; then printf 'abi:1\\n'; exit 0; fi\nexit 2\n",
+        br#"#!/usr/bin/env bash
+doctor_hang() {
+  [[ ${DOT_TEST_PROVIDER_DOCTOR_HANG_API:-} == "$1" ]] || return 0
+  printf '%s\n' "$BASHPID" >"$DOT_TEST_PROVIDER_DOCTOR_PID"
+  trap 'printf TERM >"$DOT_TEST_PROVIDER_DOCTOR_SIGNAL"; exit 0' TERM
+  while :; do sleep 1; done
+}
+if [[ ${1:-} == __api && ${2:-} == version ]]; then
+  [[ -z ${DOT_TEST_PROVIDER_API_RECORD:-} ]] || printf 'version\n' >>"$DOT_TEST_PROVIDER_API_RECORD"
+  doctor_hang version
+  printf '%s\n' "${DOT_TEST_PROVIDER_ABI_OUTPUT:-abi:1}"
+  exit 0
+fi
+if [[ ${1:-} == __api && ${2:-} == capability ]]; then
+  [[ -z ${DOT_TEST_PROVIDER_API_RECORD:-} ]] || printf 'capability:%s\n' "${3:-}" >>"$DOT_TEST_PROVIDER_API_RECORD"
+  doctor_hang capability
+  case ${3:-} in
+    owned-subprocess-cancellation-v1)
+      [[ ${DOT_TEST_PROVIDER_REJECT_CAPABILITY:-0} != 1 ]]
+      ;;
+    prompt-fifo-reader-before-event-v1)
+      [[ ${DOT_TEST_PROVIDER_REJECT_PROMPT_CAPABILITY:-0} != 1 ]]
+      ;;
+    *) exit 2 ;;
+  esac
+  exit
+fi
+exit 2
+"#,
     )
     .expect("binary");
     seal(&provider.join("shdeps"), 0o755);
@@ -1285,6 +1863,248 @@ fn healthy_latest_provider_matches_without_the_old_engine() {
     assert!(output.contains("Shdeps provider source (trusted development checkout:"));
     assert!(output.contains("Shdeps provider ABI (abi:1)"));
     assert_pair(&shell, &native);
+}
+
+#[test]
+fn provider_without_owned_subprocess_cancellation_is_unhealthy_natively() {
+    let home = TempDir::new("doctor-native-provider-capability-home").expect("home");
+    let state = TempDir::new("doctor-native-provider-capability-state").expect("state");
+    let (root, managed) = latest_provider(&home);
+    let native = command(
+        false,
+        &home,
+        &state,
+        &[
+            ("SHDEPS_LIB", ""),
+            ("SHDEPS_GIT_DEV_DIR", root.to_str().expect("provider root")),
+            ("SHDEPS_DIR", managed.to_str().expect("managed root")),
+            ("DOT_TEST_PROVIDER_REJECT_CAPABILITY", "1"),
+        ],
+    )
+    .output()
+    .expect("native doctor");
+
+    assert_eq!(native.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&native.stdout)
+            .contains("Shdeps provider cancellation capability is unavailable"),
+        "doctor stdout: {}",
+        String::from_utf8_lossy(&native.stdout)
+    );
+}
+
+#[test]
+fn provider_without_prompt_reader_handshake_is_unhealthy_natively() {
+    let home = TempDir::new("doctor-native-provider-prompt-home").expect("home");
+    let state = TempDir::new("doctor-native-provider-prompt-state").expect("state");
+    let (root, managed) = latest_provider(&home);
+    let native = command(
+        false,
+        &home,
+        &state,
+        &[
+            ("SHDEPS_LIB", ""),
+            ("SHDEPS_GIT_DEV_DIR", root.to_str().expect("provider root")),
+            ("SHDEPS_DIR", managed.to_str().expect("managed root")),
+            ("DOT_TEST_PROVIDER_REJECT_PROMPT_CAPABILITY", "1"),
+        ],
+    )
+    .output()
+    .expect("native doctor");
+
+    assert_eq!(native.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&native.stdout)
+            .contains("Shdeps provider prompt handshake capability is unavailable"),
+        "doctor stdout: {}",
+        String::from_utf8_lossy(&native.stdout)
+    );
+}
+
+#[test]
+fn disabled_provider_does_not_execute_provider_api_natively() {
+    let home = TempDir::new("doctor-native-provider-disabled-home").expect("home");
+    let state = TempDir::new("doctor-native-provider-disabled-state").expect("state");
+    let (root, managed) = latest_provider(&home);
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\ndependency_provider=none\nshdeps_update_policy=latest\n",
+    )
+    .expect("disabled provider config");
+    let api_record = home.path().join("provider-api-record");
+    let native = command(
+        false,
+        &home,
+        &state,
+        &[
+            ("SHDEPS_LIB", ""),
+            ("SHDEPS_GIT_DEV_DIR", root.to_str().expect("provider root")),
+            ("SHDEPS_DIR", managed.to_str().expect("managed root")),
+            (
+                "DOT_TEST_PROVIDER_API_RECORD",
+                api_record.to_str().expect("API record path"),
+            ),
+        ],
+    )
+    .output()
+    .expect("native doctor");
+
+    assert!(String::from_utf8_lossy(&native.stdout).contains("no dependency provider configured"));
+    assert!(
+        !api_record.exists(),
+        "disabled provider unexpectedly received an API probe"
+    );
+}
+
+#[test]
+fn provider_capability_is_not_probed_after_abi_mismatch() {
+    let home = TempDir::new("doctor-native-provider-abi-mismatch-home").expect("home");
+    let state = TempDir::new("doctor-native-provider-abi-mismatch-state").expect("state");
+    let (root, managed) = latest_provider(&home);
+    let api_record = home.path().join("provider-api-record");
+    let native = command(
+        false,
+        &home,
+        &state,
+        &[
+            ("SHDEPS_LIB", ""),
+            ("SHDEPS_GIT_DEV_DIR", root.to_str().expect("provider root")),
+            ("SHDEPS_DIR", managed.to_str().expect("managed root")),
+            ("DOT_TEST_PROVIDER_ABI_OUTPUT", "abi:999"),
+            (
+                "DOT_TEST_PROVIDER_API_RECORD",
+                api_record.to_str().expect("API record path"),
+            ),
+        ],
+    )
+    .output()
+    .expect("native doctor");
+
+    assert_eq!(native.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read(&api_record).expect("API probe record"),
+        b"version\n"
+    );
+}
+
+#[test]
+fn provider_capability_is_not_probed_after_abi_timeout() {
+    let home = TempDir::new("doctor-native-provider-abi-timeout-home").expect("home");
+    let state = TempDir::new("doctor-native-provider-abi-timeout-state").expect("state");
+    let (root, managed) = latest_provider(&home);
+    let api_record = home.path().join("provider-api-record");
+    let native = command(
+        false,
+        &home,
+        &state,
+        &[
+            ("SHDEPS_LIB", ""),
+            ("SHDEPS_GIT_DEV_DIR", root.to_str().expect("provider root")),
+            ("SHDEPS_DIR", managed.to_str().expect("managed root")),
+            ("DOT_TEST_PROVIDER_DOCTOR_HANG_API", "version"),
+            ("_DOT_SHDEPS_ABI_TIMEOUT_SECONDS", "1"),
+            (
+                "DOT_TEST_PROVIDER_API_RECORD",
+                api_record.to_str().expect("API record path"),
+            ),
+        ],
+    )
+    .output()
+    .expect("native doctor");
+
+    assert_eq!(native.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read(&api_record).expect("API probe record"),
+        b"version\n"
+    );
+}
+
+fn assert_doctor_provider_probe_signal(api: &str) {
+    let home = TempDir::new("doctor-native-provider-probe-signal-home").expect("home");
+    let state = TempDir::new("doctor-native-provider-probe-signal-state").expect("state");
+    let (root, managed) = latest_provider(&home);
+    let pid_file = home.path().join("doctor-provider-pid");
+    let signal_file = home.path().join("doctor-provider-signal");
+    let child = command(
+        false,
+        &home,
+        &state,
+        &[
+            ("SHDEPS_LIB", ""),
+            ("SHDEPS_GIT_DEV_DIR", root.to_str().expect("provider root")),
+            ("SHDEPS_DIR", managed.to_str().expect("managed root")),
+            ("DOT_TEST_PROVIDER_DOCTOR_HANG_API", api),
+            (
+                "DOT_TEST_PROVIDER_DOCTOR_PID",
+                pid_file.to_str().expect("provider pid path"),
+            ),
+            (
+                "DOT_TEST_PROVIDER_DOCTOR_SIGNAL",
+                signal_file.to_str().expect("provider signal path"),
+            ),
+        ],
+    )
+    .spawn()
+    .expect("native doctor");
+    let mut child = GuardedDoctorChild::new(child);
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !pid_file.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        assert!(
+            !child.exited_wnowait().expect("doctor status"),
+            "doctor exited before starting its {api} probe"
+        );
+        assert!(
+            std::time::Instant::now() < ready_deadline,
+            "doctor did not start its {api} probe"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let provider_pid = std::fs::read_to_string(&pid_file)
+        .expect("provider pid")
+        .trim()
+        .parse::<i32>()
+        .expect("numeric provider pid");
+    let mut provider = GuardedProbeSession::new(provider_pid);
+
+    let delivered = child.signal(libc::SIGINT).is_ok();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.exited_wnowait().expect("doctor status") {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("doctor did not finish after interrupting {api} probe");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !provider.observe_stopped() && std::time::Instant::now() < cleanup_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let provider_survived = !provider.observe_stopped();
+    if provider_survived {
+        provider.force_stop();
+    }
+    let observed = child.reap().expect("doctor exit status").code();
+
+    assert!(delivered, "SIGINT was not delivered to doctor");
+    assert_eq!(observed, Some(130), "doctor did not preserve SIGINT status");
+    assert!(!provider_survived, "doctor left the {api} probe alive");
+    assert_eq!(
+        std::fs::read(&signal_file).expect("provider cleanup signal"),
+        b"TERM",
+        "doctor did not cooperatively terminate the {api} probe"
+    );
+}
+
+#[test]
+fn signal_interrupts_and_reaps_doctor_provider_abi_probe() {
+    assert_doctor_provider_probe_signal("version");
+}
+
+#[test]
+fn signal_interrupts_and_reaps_doctor_provider_capability_probe() {
+    assert_doctor_provider_probe_signal("capability");
 }
 
 #[test]

@@ -295,7 +295,9 @@ fn safe_relative_bytes(path: &[u8]) -> bool {
 /// failure, like the shell's `|| return 1` on the substitution —
 /// git's own stderr is silenced (the candidate lane precedent).
 fn git_in(home: &Path, candidate: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = crate::init_client_identity::host_git_command()
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("-C")
         .arg(candidate)
         .args(args)
@@ -303,9 +305,15 @@ fn git_in(home: &Path, candidate: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .env("HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -363,6 +371,7 @@ fn mktemp_suffix() -> [u8; 6] {
 /// tests can recognize the file by name on both engines.
 fn mktemp_in(dir: &Path, prefix: &str) -> Result<PathBuf> {
     for _ in 0..100 {
+        crate::cancellation::check_mutation()?;
         let suffix = mktemp_suffix();
         let mut name = OsString::from(prefix);
         name.push(OsString::from_vec(suffix.to_vec()));
@@ -534,6 +543,7 @@ pub fn plan_summary(inputs: &PlanInputs<'_>) -> Result<Vec<u8>> {
             status: Some("non-zero exit".to_string()),
         })?;
         let preview = join2(candidate, PREVIEW_NAME);
+        crate::cancellation::check_mutation()?;
         std::fs::write(&preview, &shown).map_err(|source| Error::Io {
             context: "write config preview",
             source,
@@ -612,6 +622,7 @@ pub fn move_conflicts(
     ensure_private_dir(backup)?;
     let stored = join2(backup, "manifest");
     if !exists_lexical(&stored) {
+        crate::cancellation::check_mutation()?;
         std::fs::copy(manifest, &stored).map_err(|source| Error::Io {
             context: "stage conflicts manifest",
             source,
@@ -757,6 +768,7 @@ pub fn publish_completed(
     let root = Path::new(std::ffi::OsStr::from_bytes(root));
     ensure_private_dir(root)?;
     let temporary = mktemp_in(root, ".completed.")?;
+    crate::cancellation::check_mutation()?;
     std::fs::copy(record, &temporary).map_err(|source| Error::Io {
         context: "copy completion record",
         source,

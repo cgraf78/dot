@@ -111,14 +111,22 @@ fn run_validation_git(
     args: &[&str],
     warnings: &mut dyn std::io::Write,
 ) -> Option<(bool, Vec<u8>)> {
-    let output = crate::init_client_identity::host_git_command()
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .args(prefix)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
+        .stderr(Stdio::piped());
+    let output = crate::cleanup::run_session_output_typed(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     let _ = warnings.write_all(&output.stderr);
     Some((output.status.success(), output.stdout))
 }

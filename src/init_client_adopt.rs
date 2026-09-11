@@ -286,7 +286,15 @@ fn base_git(home: &Path, prefix: &[OsString], args: &[&str]) -> Option<Vec<u8>> 
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let output = cmd.output().ok()?;
+    crate::cancellation::check().ok()?;
+    let output = crate::cleanup::run_session_output(
+        cmd,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }

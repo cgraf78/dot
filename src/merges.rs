@@ -114,10 +114,17 @@ pub fn cpu_count_select(getconf: &str, uname_s: &str, sysctl: &str) -> String {
 /// Run one helper binary, returning trimmed stdout (empty on any
 /// failure, like `$(... || true)`).
 fn probe(program: &str, args: &[&str]) -> String {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output();
+    if crate::cancellation::check().is_err() {
+        return String::new();
+    }
+    let mut command = std::process::Command::new(program);
+    command.args(args).stdin(std::process::Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    );
     match output {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_string()

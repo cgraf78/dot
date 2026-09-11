@@ -67,6 +67,7 @@ pub fn write_generation_marker(
     let temporary = temp::sibling_tmp_for(&marker)?;
     let body =
         format!("{GENERATION_HEADER}\nnonce={nonce}\ncommit={commit}\nidentity={identity}\n");
+    crate::cancellation::check_mutation()?;
     std::fs::write(&temporary, body.as_bytes()).map_err(|source| Error::Io {
         context: "write generation marker",
         source,
@@ -188,22 +189,33 @@ pub fn generation_matches(
     commit: &str,
     identity: &str,
 ) -> bool {
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
     if !generation_marker_matches(git_dir, nonce, commit, identity) {
         return false;
     }
-    let output = match crate::init_client_identity::host_git_command()
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg(OsString::from(format!("--git-dir={}", git_dir.display())))
         .arg("rev-parse")
         .arg(format!("refs/heads/{branch}"))
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    {
+        .stderr(Stdio::null());
+    let output = match crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    ) {
         Ok(output) => output,
         Err(_) => return false,
     };
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
     if !output.status.success() {
         return false;
     }
@@ -230,24 +242,27 @@ pub fn set_git_identity(git_dir: &Path) -> Result<(u64, u64)> {
 /// the live `umask` at each entry; the umask cannot change mid-run,
 /// so one read is equivalent.
 pub fn configure_git_metadata_modes(git_dir: &Path) -> Result<()> {
-    let status = crate::init_client_identity::host_git_command()
+    crate::cancellation::check().map_err(|_| Error::Usage {
+        message: "git metadata configuration interrupted",
+    })?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg(OsString::from(format!("--git-dir={}", git_dir.display())))
         .args(["config", "core.sharedRepository", "0700"])
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|source| Error::Io {
-            context: "run git config sharedRepository",
-            source,
-        })?;
-    if !status.success() {
+        .stderr(Stdio::null());
+    let status = crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Strict);
+    if status != 0 {
         return Err(Error::Command {
             command: "git config core.sharedRepository".to_string(),
             status: Some(status.to_string()),
         });
     }
+    crate::cancellation::check().map_err(|_| Error::Usage {
+        message: "git metadata configuration interrupted",
+    })?;
     let mask = crate::startup::ensure_umask_ceiling(temp::read_umask()?);
     temp::apply_git_metadata_modes(git_dir, mask)
 }

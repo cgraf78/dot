@@ -96,14 +96,14 @@ Full command table (`lib/dot/commands.sh`, `lib/dot/main.sh`):
 
 | Command | Behavior | Exit codes |
 |---|---|---|
-| `update`, `pull` (alias) | update lock + `_dot_update`; flags `--cron --quiet -f/--force -v/--verbose`, rest to `git pull` | 0, 2 (config load fail), 75 (lock busy) |
-| `fetch` | overlay-resolve `fetch` + per-repo `git fetch` passthrough | 0/1 |
-| `push` | resolve `inspect` + per-repo `git push`; base failure hard-fails, overlay warns+continues | 0/1 |
-| `status`, `diff` | resolve `inspect` + per-repo passthrough | 0/1 |
-| `cron` | `crontab -l` or `  no crontab installed` | 0 |
-| `doctor` | resolve tolerated + `_dot_doctor` | 0/1 |
-| `test` | resolve + `dot_test_command` (`-s -v -j N --list [names]`) | runner codes |
-| `init` | lock (except `--status/--help/-h`) + `dot_init_command` | 0/1/2 (unknown `--*`), 75 |
+| `update`, `pull` (alias) | update lock + `_dot_update`; flags `--cron --quiet -f/--force -v/--verbose`, rest to `git pull` | 0, 1, 2 (config load fail), 75 (lock busy), or 129/130/131/143 after HUP/INT/QUIT/TERM |
+| `fetch` | overlay-resolve `fetch` + per-repo `git fetch` passthrough | 0/1, or 129/130/131/143 after HUP/INT/QUIT/TERM |
+| `push` | resolve `inspect` + per-repo `git push`; base failure hard-fails, overlay warns+continues | 0/1, or 129/130/131/143 after HUP/INT/QUIT/TERM |
+| `status`, `diff` | resolve `inspect` + per-repo passthrough | 0/1, or 129/130/131/143 after HUP/INT/QUIT/TERM |
+| `cron` | `crontab -l` or `  no crontab installed` | 0, or 129/130/131/143 after HUP/INT/QUIT/TERM |
+| `doctor` | resolve tolerated + `_dot_doctor` | 0/1, or 129/130/131/143 after HUP/INT/QUIT/TERM |
+| `test` | resolve + `dot_test_command` (`-s -v -j N --list [names]`) | runner codes, or 129/130/131/143 after HUP/INT/QUIT/TERM |
+| `init` | lock (except `--status/--help/-h`) + `dot_init_command` | 0/1/2 (unknown `--*`), 75, or 129/130/131/143 after HUP/INT/QUIT/TERM |
 | unknown | `dot: unknown command: %s` on stderr | 1 (2 if config unloadable — config load precedes dispatch) |
 
 Environment (precedence: process env wins; captured at load): `DOT_BASH`,
@@ -141,6 +141,27 @@ before native cutover):
 | `overlays` | `overlays.sh` (+ `repos/config.sh` checkout match) | descriptor parse; strict/legacy discovery with selection echo; name derivation mirroring bash `=~` `$` newline anchoring; glob-exact `*.conf` filter (dotfiles skipped); `mapfile`-empty origin semantics; warning-text discovery errors (never announced) |
 | `version::LIBRARY_API` | `public/api-version.sh` | `DOT_LIBRARY_API=1` pinned on both sides |
 
+The native Shdeps relay preserves byte order within provider stdout and within
+provider stderr. As in the shell implementation's JSONL FIFO plus inherited
+stderr, it does not define a total order between writes to the two independent
+descriptors. After cancellation, bytes already relayed remain exactly once;
+queued, unrelayed bytes are best-effort and may be discarded so a provider
+cannot defeat the bounded shutdown contract through output backpressure. No
+post-cancellation JSONL event is interpreted or acknowledged.
+
+Provider selection requires the locked wrapper ABI and both independent
+behavioral capabilities: `owned-subprocess-cancellation-v1` and
+`prompt-fifo-reader-before-event-v1`. The former makes provider statuses 129,
+130, 131, and 143 trusted reports that owned descendants stopped after HUP,
+INT, QUIT, or TERM. The latter proves the provider opens and retains the FIFO
+reader before publishing a prompt, so Dot can acknowledge through a fresh
+nonblocking writer without a post-exit race. Missing either capability forces
+one reviewed bootstrap refresh; a second mismatch is rejected. Dot propagates
+a trusted cancellation status and skips all later update stages. Other nonzero
+provider statuses remain ordinary failures. `dot doctor` checks both
+capabilities, and every doctor probe runs under Dot's signal owner so
+cancellation reaps its isolated session.
+
 ## 6. Native test supervisor
 
 The Rust `test` command owns arguments, inspect-mode resolution, source-home
@@ -162,6 +183,20 @@ owned descendants have received TERM and, if necessary, KILL. Cancelling a
 worker wave uses one shared grace deadline. Independent CLI/embedded
 invocations run in separate processes and cannot share signal guards or roots.
 `app::run_direct` remains a single-process entry, not a concurrent embedding API.
+
+On Linux and Android, subreaper adoption, retained start identities, and
+pidfds extend cancellation/timeout ownership across ordinary `setsid`, closed
+descriptor, and cleared-environment descendants. Other Unix platforms can
+prove ownership through the retained session leader, observed process
+topology, and cooperative lifetime/control descriptors; a descendant that
+deliberately discards all three before its parent exits is outside portable
+process-only authority. Such an observed escape reports cleanup-incomplete
+(125) instead of signaling an unpinned PID. The native scheduler preserves the
+historical successful-command behavior for a deliberately detached process
+that closes every ownership channel, while still cleaning every same-group
+descendant before releasing the retained leader. The standalone public timeout
+helper has the stronger Linux subreaper contract and cleans an attributable
+detached descendant even after an otherwise successful leader exit.
 
 Coordinator-created result/output file handles remain authoritative throughout
 execution. Replacing their directory entries cannot redirect readers to FIFOs

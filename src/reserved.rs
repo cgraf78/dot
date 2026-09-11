@@ -237,10 +237,15 @@ pub fn physical_leaf_candidate(path: &str, pwd: &str) -> Result<LeafCandidate, E
 /// failing `realpath` falls through to the ancestor walk, which is
 /// the shell's `||` fallback verbatim.
 fn realpath_leaf(path: &str) -> Option<String> {
-    let output = std::process::Command::new("realpath")
-        .arg(path)
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("realpath");
+    command.arg(path);
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }

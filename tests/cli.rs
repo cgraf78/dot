@@ -13,7 +13,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 
 use dot_test_support::TempDir;
 
@@ -44,6 +46,18 @@ fn process_env_guard() -> MutexGuard<'static, ()> {
     PROCESS_ENV
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Put standard system tools ahead of developer-local wrappers while retaining
+/// the ambient tail for platform-specific utilities used by individual tests.
+fn fixture_path() -> OsString {
+    let mut path = OsString::from("/usr/bin:/bin");
+    let ambient = std::env::var_os("PATH").unwrap_or_default();
+    if !ambient.is_empty() {
+        path.push(":");
+        path.push(ambient);
+    }
+    path
 }
 
 fn bin() -> Command {
@@ -279,6 +293,379 @@ fn binary_help_has_the_public_byte_contract() {
 }
 
 #[test]
+#[cfg(unix)]
+fn informational_entry_stays_responsive_across_every_closed_stdio_mask() {
+    let python = if Path::new("/usr/bin/python3").is_file() {
+        PathBuf::from("/usr/bin/python3")
+    } else {
+        PathBuf::from("python3")
+    };
+    for mask in 1u8..8 {
+        let descriptors = (0..=2)
+            .filter(|descriptor| mask & (1 << descriptor) != 0)
+            .map(|descriptor| descriptor.to_string())
+            .collect::<Vec<_>>()
+            .join(":");
+        let mut command = Command::new(&python);
+        command
+            .args([
+                "-c",
+                "import os,sys;[os.close(int(fd)) for fd in sys.argv[1].split(':')];os.execv(sys.argv[2],[sys.argv[2],'help'])",
+                &descriptors,
+            ])
+            .arg(env!("CARGO_BIN_EXE_dot"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let started = Instant::now();
+        let status = command.status().expect("run Dot with closed stdio");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "closed stdio mask {mask:#05b} stranded the informational entry path"
+        );
+        let expected = if mask & (1 << libc::STDOUT_FILENO) != 0 {
+            Some(1)
+        } else {
+            Some(0)
+        };
+        assert_eq!(status.code(), expected, "closed stdio mask {mask:#05b}");
+    }
+
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .expect("open read-write null sink");
+    let status = bin()
+        .arg("help")
+        .stdout(Stdio::from(null))
+        .stderr(Stdio::null())
+        .status()
+        .expect("run Dot with an explicit read-write null sink");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "an explicit /dev/null stream was mistaken for a runtime placeholder"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn process_output_relay_drains_an_open_stream_when_the_other_was_closed() {
+    const MODE: &str = "DOT_OUTPUT_RELAY_PARTIAL_STDIO_HELPER";
+    const PAYLOAD: &[u8] = b"retained stderr payload\n";
+    if std::env::var_os(MODE).is_some() {
+        use std::io::Write as _;
+
+        let relay = dot::cleanup::ProcessOutputRelay::start().expect("start output relay");
+        let mut stdout = relay.stdout();
+        let mut stderr = relay.stderr();
+        stderr.write_all(PAYLOAD).expect("queue stderr payload");
+        assert!(
+            stdout.write_all(b"closed stdout").is_err(),
+            "stdout was open despite the exec-boundary close"
+        );
+        drop(stdout);
+        drop(stderr);
+        assert_eq!(
+            relay.finish(true),
+            dot::cleanup::ProcessOutputFinish::Complete,
+            "healthy stderr relay did not drain"
+        );
+        std::process::exit(1);
+    }
+
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            "exec 1>&-; exec \"$1\" --exact process_output_relay_drains_an_open_stream_when_the_other_was_closed --nocapture",
+            "closed-stdout",
+        ])
+        .arg(std::env::current_exe().expect("test binary"))
+        .env(MODE, "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run partial-stdio helper");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output
+            .stderr
+            .windows(PAYLOAD.len())
+            .any(|bytes| bytes == PAYLOAD),
+        "queued stderr was discarded after a closed-stdout write: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn process_output_relay_serializes_exactly_aliased_stdout_and_stderr() {
+    const MODE: &str = "DOT_OUTPUT_RELAY_ALIAS_HELPER";
+    if std::env::var_os(MODE).is_some() {
+        use std::io::Write as _;
+
+        let relay = dot::cleanup::ProcessOutputRelay::start().expect("start output relay");
+        let mut stdout = relay.stdout();
+        let mut stderr = relay.stderr();
+        for _ in 0..256 {
+            stdout.write_all(b"o").expect("write stdout record");
+            stderr.write_all(b"e").expect("write stderr record");
+        }
+        drop(stdout);
+        drop(stderr);
+        assert_eq!(
+            relay.finish(true),
+            dot::cleanup::ProcessOutputFinish::Complete,
+            "output relay did not drain"
+        );
+        return;
+    }
+
+    use std::io::Read as _;
+
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("output socket");
+    let stderr = writer.try_clone().expect("duplicate exact output stream");
+    let writer: std::os::fd::OwnedFd = writer.into();
+    let stderr: std::os::fd::OwnedFd = stderr.into();
+    let mut command = Command::new(std::env::current_exe().expect("test binary"));
+    command
+        .args([
+            "--exact",
+            "process_output_relay_serializes_exactly_aliased_stdout_and_stderr",
+            "--nocapture",
+        ])
+        .env(MODE, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::from(stderr));
+    let mut child = command.spawn().expect("run exact-alias helper");
+    drop(command);
+    let reader = std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).expect("read merged output");
+        output
+    });
+    let status = child.wait().expect("wait exact-alias helper");
+    assert!(status.success(), "exact-alias helper failed: {status}");
+    let output = reader.join().expect("join merged-output reader");
+    assert!(
+        output.windows(512).any(|bytes| bytes == b"oe".repeat(256)),
+        "exactly aliased output lost or reordered payload: {} bytes",
+        output.len()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn process_output_relay_does_not_inherit_unrelated_descriptors() {
+    const MODE: &str = "DOT_OUTPUT_RELAY_FD_HELPER";
+    const READY: &str = "DOT_OUTPUT_RELAY_FD_READY";
+    if std::env::var_os(MODE).is_some() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("sentinel pair");
+        let relay = dot::cleanup::ProcessOutputRelay::start().expect("start output relay");
+        drop(writer);
+        reader
+            .set_nonblocking(true)
+            .expect("nonblocking sentinel reader");
+        let eof_deadline = Instant::now() + Duration::from_millis(500);
+        let mut byte = [0u8; 1];
+        let mut eof = false;
+        while Instant::now() < eof_deadline {
+            match std::io::Read::read(&mut reader, &mut byte) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(_) => panic!("unexpected sentinel payload"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("sentinel read failed: {error}"),
+            }
+        }
+        assert!(
+            eof,
+            "an output relay descendant retained an unrelated descriptor"
+        );
+        std::fs::write(std::env::var_os(READY).expect("ready path"), b"ready")
+            .expect("publish relay readiness");
+        assert_eq!(
+            relay.finish(true),
+            dot::cleanup::ProcessOutputFinish::Complete
+        );
+        return;
+    }
+
+    let scope = TempDir::new("cli-output-relay-fd-scope").expect("fixture");
+    let ready = scope.path().join("ready");
+    let mut child = Command::new(std::env::current_exe().expect("test binary"));
+    child
+        .args([
+            "--exact",
+            "process_output_relay_does_not_inherit_unrelated_descriptors",
+            "--nocapture",
+        ])
+        .env(MODE, "1")
+        .env(READY, &ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = child.spawn().expect("spawn relay fd helper");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !ready.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "output relay helper did not start");
+    assert!(child.wait().expect("wait relay fd helper").success());
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_output_relay_dies_with_a_killed_parent_while_sink_is_full() {
+    const MODE: &str = "DOT_OUTPUT_RELAY_PARENT_DEATH_HELPER";
+    const READY: &str = "DOT_OUTPUT_RELAY_PARENT_DEATH_READY";
+    if std::env::var_os(MODE).is_some() {
+        use std::io::Write as _;
+
+        let relay = dot::cleanup::ProcessOutputRelay::start().expect("start output relay");
+        let mut output = relay.stdout();
+        std::fs::write(std::env::var_os(READY).expect("ready path"), b"ready")
+            .expect("publish relay readiness");
+        let bytes = [b'x'; 512];
+        loop {
+            output.write_all(&bytes).expect("fill relay input");
+        }
+    }
+
+    fn descendants(root: i32) -> Vec<i32> {
+        let mut rows = Vec::new();
+        for entry in std::fs::read_dir("/proc").expect("read proc") {
+            let Ok(entry) = entry else { continue };
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some(tail) = stat.rsplit_once(") ").map(|(_, tail)| tail) else {
+                continue;
+            };
+            let Some(parent) = tail
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            rows.push((pid, parent));
+        }
+        let mut owned = vec![root];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (pid, parent) in &rows {
+                if owned.contains(parent) && !owned.contains(pid) {
+                    owned.push(*pid);
+                    changed = true;
+                }
+            }
+        }
+        owned.into_iter().filter(|pid| *pid != root).collect()
+    }
+
+    let scope = TempDir::new("cli-output-relay-parent-death").expect("fixture");
+    let ready = scope.path().join("ready");
+    let mut pipe = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    // SAFETY: pipe2 returned two uniquely owned descriptors.
+    let reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+    // SAFETY: pipe2 returned two uniquely owned descriptors.
+    let writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(pipe[1]) };
+    let mut competing_writer = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(format!("/proc/self/fd/{}", writer.as_raw_fd()))
+        .expect("independent competing pipe writer");
+    let mut child = Command::new(std::env::current_exe().expect("test binary"));
+    child
+        .args([
+            "--exact",
+            "process_output_relay_dies_with_a_killed_parent_while_sink_is_full",
+        ])
+        .env(MODE, "1")
+        .env(READY, &ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::null());
+    let mut child = child.spawn().expect("spawn blocked output relay helper");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !ready.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "blocked output relay helper did not start");
+    let bytes = [b'x'; 4096];
+    loop {
+        match std::io::Write::write(&mut competing_writer, &bytes) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("fill competing sink writer: {error}"),
+        }
+    }
+    drop(competing_writer);
+    let descendant_deadline = Instant::now() + Duration::from_secs(2);
+    let relay_pids = loop {
+        let observed = descendants(child.id() as i32);
+        if observed.len() >= 2 || Instant::now() >= descendant_deadline {
+            break observed;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        relay_pids.len() >= 2,
+        "watchdog/relay children were not visible"
+    );
+    let pidfds = relay_pids
+        .iter()
+        .map(|pid| {
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, *pid, 0) } as i32;
+            assert!(fd >= 0, "pin relay identity {pid}");
+            (*pid, fd)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    let _ = child.wait();
+    drop(reader);
+    for (pid, pidfd) in pidfds {
+        let mut pollfd = libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 3000) } > 0;
+        if !ready {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd,
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        }
+        unsafe { libc::close(pidfd) };
+        assert!(
+            ready,
+            "output relay descendant {pid} survived parent SIGKILL"
+        );
+    }
+}
+
+#[test]
 fn binary_default_command_is_help() {
     let output = bin().output().expect("run dot");
     assert!(output.status.success());
@@ -316,8 +703,20 @@ fn binary_version_is_stable_across_aliases() {
 
 #[test]
 fn binary_unknown_command_has_the_public_error_contract() {
+    let scope = TempDir::new("unknown-command").expect("fixture");
+    let home = scope.path().join("home");
+    let state = scope.path().join("state");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&state).expect("state");
     let output = bin()
         .arg("frobnicate")
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", fixture_path())
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
+        .current_dir(&home)
         .output()
         .expect("run dot frobnicate");
     assert_eq!(output.status.code(), Some(1));
@@ -811,7 +1210,7 @@ fn binary_doctor_test_wired_past_interim() {
 /// checkout, provider state, or ambient variables.
 fn init_env(cmd: &mut Command, home: &TempDir, state: &TempDir) {
     let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = fixture_path();
     let tmpdir = std::env::var_os("TMPDIR")
         .filter(|dir| !dir.is_empty())
         .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
@@ -824,7 +1223,7 @@ fn init_env(cmd: &mut Command, home: &TempDir, state: &TempDir) {
         .env("XDG_STATE_HOME", state.path())
         .env("DOT_SOURCE_ROOT", repo)
         .current_dir(home.path());
-    isolate_git(cmd);
+    isolate_git_config(cmd);
 }
 
 /// The Rust binary's `init` with a controlled client.
@@ -951,7 +1350,7 @@ fn poison_curl(scope: &Path) -> (OsString, PathBuf) {
         .expect("poison curl mode");
     let mut path = poison_dir.into_os_string();
     path.push(":");
-    path.push(std::env::var_os("PATH").unwrap_or_default());
+    path.push(fixture_path());
     (path, record)
 }
 
@@ -1316,7 +1715,7 @@ struct ReposClient {
 /// inputs. In particular, it points the topology publication and the XDG
 /// state/config roots at this fixture rather than at the test process.
 fn native_update_env(client: &ReposClient, state: &Path) -> BTreeMap<OsString, OsString> {
-    let path = std::env::var_os("PATH").expect("test PATH");
+    let path = fixture_path();
     let tmp = std::env::var_os("TMPDIR").unwrap_or_else(|| OsString::from("/tmp"));
     BTreeMap::from([
         (OsString::from("HOME"), client.home.as_os_str().to_owned()),
@@ -1495,8 +1894,8 @@ fn real_tool(tool: &str) -> PathBuf {
         .expect("real native tool")
 }
 
-/// Keep fixtures independent of developer Git hooks and signing policy.
-fn isolate_git(command: &mut Command) {
+/// Keep Git configuration independent of developer hooks and signing policy.
+fn isolate_git_config(command: &mut Command) {
     command
         .env("GIT_CONFIG_COUNT", "3")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
@@ -1507,14 +1906,57 @@ fn isolate_git(command: &mut Command) {
         .env("GIT_CONFIG_VALUE_2", "false");
 }
 
+/// Give test-owned Git commands a writable HOME outside the user's state.
+fn isolate_git(command: &mut Command) {
+    isolate_git_config(command);
+    let home =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("cli-git-home-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("create fixture Git home");
+    command.env("HOME", home).env("PATH", fixture_path());
+}
+
+#[test]
+fn fixture_git_commands_do_not_inherit_the_user_home() {
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    let home = command
+        .get_envs()
+        .find(|(key, _)| *key == "HOME")
+        .and_then(|(_, value)| value)
+        .expect("fixture Git HOME");
+
+    assert!(Path::new(home).starts_with(env!("CARGO_TARGET_TMPDIR")));
+    assert_ne!(Some(home), std::env::var_os("HOME").as_deref());
+}
+
 fn wait_for_runtime_workers(barrier: &Path, markers: &[&str]) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         if markers
             .iter()
             .all(|marker| barrier.join(format!("{marker}-ready")).exists())
         {
             return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// Wait until a producer has both created and populated its readiness file.
+/// Existence alone races with the producer's open/truncate/write sequence.
+fn wait_for_child_marker(child: &mut TestChildGuard, path: &Path) -> bool {
+    // Full-suite contention can make a complete update traverse many owned
+    // process sessions before reaching the injected worker. Poll the actual
+    // readiness condition with a generous bound, while stopping immediately
+    // if the child has already failed.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
+            return true;
+        }
+        if child.exited_wnowait().unwrap_or(false) {
+            return false;
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -1628,6 +2070,27 @@ fn repos_git_prefix(git_dir: &Path, work: &Path, args: &[&str]) {
         "prefix git {args:?} in {}",
         git_dir.display()
     );
+}
+
+/// Capture output from a separate-topology base worktree without refreshing
+/// its index through porcelain status. Cancellation tests use this to retain
+/// an mtime-only dirty sentinel until the engine either normalizes it or exits.
+fn repos_git_prefix_output(
+    git_dir: &Path,
+    work: &Path,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    command
+        .arg(format!("--git-dir={}", git_dir.display()))
+        .arg(format!("--work-tree={}", work.display()))
+        .args(args)
+        .env("DOT_GIT_REAL", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
 }
 
 /// Capture one `git -C dir args` stdout line, trimmed.
@@ -1793,7 +2256,7 @@ fn stage_repos_client() -> ReposClient {
 /// one `.env` entry per variable make every input explicit.
 fn repos_env(cmd: &mut Command, client: &ReposClient) {
     let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = fixture_path();
     let tmpdir = std::env::var_os("TMPDIR")
         .filter(|dir| !dir.is_empty())
         .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
@@ -1815,7 +2278,7 @@ fn repos_env(cmd: &mut Command, client: &ReposClient) {
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("DOT_SOURCE_ROOT", repo)
         .current_dir(&client.home);
-    isolate_git(cmd);
+    isolate_git_config(cmd);
 }
 
 #[cfg(target_os = "macos")]
@@ -1884,7 +2347,7 @@ fn ambient_topology_cannot_authorize_an_uninitialized_checkout() {
             .arg(command)
             .env_clear()
             .env("LC_ALL", "C")
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("PATH", fixture_path())
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &xdg)
             .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
@@ -1912,7 +2375,7 @@ fn ambient_topology_cannot_authorize_an_uninitialized_checkout() {
             .arg(command)
             .env_clear()
             .env("LC_ALL", "C")
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("PATH", fixture_path())
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &xdg)
             .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
@@ -1939,7 +2402,7 @@ fn init_help_validates_an_existing_identity_record() {
         .args(["init", "--help"])
         .env_clear()
         .env("LC_ALL", "C")
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PATH", fixture_path())
         .env("HOME", &home)
         .env("XDG_STATE_HOME", &state)
         .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
@@ -2448,7 +2911,7 @@ fn repos_status_without_topology_is_silent() {
     let xdg = scope.path().join("xdg");
     std::fs::create_dir_all(&home).expect("fixture home");
     let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = fixture_path();
     let tmpdir = std::env::var_os("TMPDIR")
         .filter(|dir| !dir.is_empty())
         .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
@@ -2467,7 +2930,7 @@ fn repos_status_without_topology_is_silent() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    isolate_git(&mut command);
+    isolate_git_config(&mut command);
     let output = command.output().expect("run dot status");
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"");
@@ -2871,6 +3334,41 @@ impl NativeUpdateFixture {
             .stderr(Stdio::piped());
         cmd.output().expect("run native update")
     }
+
+    #[cfg(unix)]
+    fn spawn_rust_dot_with_bash(&self, argv: &[&str]) -> std::process::Child {
+        self.spawn_rust_dot_with_bash_and(argv, |_| {})
+    }
+
+    #[cfg(unix)]
+    fn spawn_rust_dot_with_bash_and(
+        &self,
+        argv: &[&str],
+        configure: impl FnOnce(&mut Command),
+    ) -> std::process::Child {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut cmd = bin();
+        cmd.args(argv);
+        repos_env(&mut cmd, &self.client);
+        cmd.env("DOT_BASH", dot_test_support::bash());
+        configure(&mut cmd);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: setsid has no memory arguments and gives failure cleanup an
+        // outer session containing Dot plus any child that fails to isolate.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        cmd.spawn().expect("spawn native update")
+    }
 }
 
 fn assert_native_silent(output: &std::process::Output, label: &str) {
@@ -2883,6 +3381,408 @@ fn assert_native_silent(output: &std::process::Output, label: &str) {
     );
     assert!(output.stdout.is_empty(), "{label} stdout");
     assert!(output.stderr.is_empty(), "{label} stderr");
+}
+
+/// Assert the last cron outcome line under a fixture home names
+/// `outcome`/`stage` with a sane epoch stamp; returns every field
+/// for detail assertions.
+fn assert_cron_outcome(home: &Path, outcome: &str, stage: &str) -> Vec<String> {
+    let log = std::fs::read_to_string(home.join(".local/state/dot/update.log"))
+        .expect("cron outcome log");
+    let line = log.lines().last().expect("outcome line").to_string();
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    assert!(fields.len() >= 3, "outcome fields: {line}");
+    let epoch: i64 = fields[0].parse().expect("outcome epoch");
+    assert!(epoch > 1_700_000_000, "outcome epoch sane: {line}");
+    assert_eq!(fields[1], outcome, "outcome kind: {line}");
+    assert_eq!(fields[2], stage, "outcome stage: {line}");
+    fields.into_iter().map(str::to_string).collect()
+}
+
+#[cfg(unix)]
+fn arm_base_stat_sentinel(client: &ReposClient) -> std::io::Result<std::process::Output> {
+    let tracked = client.home.join("tracked.txt");
+    let modified = std::fs::metadata(&tracked)?.modified()?;
+    std::fs::File::options()
+        .write(true)
+        .open(&tracked)?
+        .set_modified(modified + Duration::from_secs(2))?;
+    repos_git_prefix_output(
+        &client.base_git_dir,
+        &client.home,
+        &["diff-files", "--name-only", "--", "tracked.txt"],
+    )
+}
+
+/// Observe a real update at a hook boundary, interrupt it, and reap it before
+/// making assertions. Keeping assertions after the reap prevents a failed
+/// readiness or stat-cache precondition from leaking the blocked fixture.
+#[cfg(unix)]
+struct CancelledUpdate<T> {
+    ready: bool,
+    observed: Option<T>,
+    worker_identity_valid: bool,
+    worker_in_dot_foreground_group: bool,
+    signal_result: i32,
+    exited: bool,
+    worker_gone: bool,
+    output: std::process::Output,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TestProcessIdentity {
+    pid: i32,
+    pgid: i32,
+    sid: i32,
+    generation: Vec<u8>,
+}
+
+#[cfg(unix)]
+struct PinnedTestProcess {
+    identity: TestProcessIdentity,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pidfd: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl PinnedTestProcess {
+    fn claim(identity: TestProcessIdentity) -> Option<Self> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::FromRawFd as _;
+
+            // SAFETY: pidfd_open only observes the positive fixture PID.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) };
+            if fd < 0 {
+                return None;
+            }
+            // SAFETY: a successful pidfd_open returns one newly owned fd.
+            let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+            if !same_test_process(&identity) {
+                return None;
+            }
+            Some(Self { identity, pidfd })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            same_test_process(&identity).then_some(Self { identity })
+        }
+    }
+
+    fn signal_for_cleanup(&self, signal: i32) -> bool {
+        if !same_test_process(&self.identity) {
+            return false;
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::AsRawFd as _;
+
+            if self.identity.pid == self.identity.pgid
+                && self.identity.pid == self.identity.sid
+                && self.identity.pgid != unsafe { libc::getpgrp() }
+            {
+                // The retained pidfd keeps this process-group number from
+                // being recycled between the generation check and delivery.
+                // SAFETY: the pinned fixture leader anchors this private group.
+                let group_result = unsafe { libc::kill(-self.identity.pgid, signal) };
+                if group_result == 0 {
+                    return true;
+                }
+            }
+            // SAFETY: pidfd_send_signal addresses the retained kernel process
+            // identity, never a subsequently reused numeric PID.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                ) == 0
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            // No portable stable handle exists for a non-child fixture. Its
+            // scripts are self-bounded on these platforms; fail closed rather
+            // than signaling a cached numeric PID.
+            let _ = signal;
+            false
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn test_process_generation(pid: i32) -> Option<Vec<u8>> {
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.windows(2).rposition(|part| part == b") ")?;
+    stat[end + 2..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .nth(19)
+        .map(<[u8]>::to_vec)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn test_process_generation(pid: i32) -> Option<Vec<u8>> {
+    let output = Command::new("/bin/ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let generation = output.status.success().then_some(output.stdout)?;
+    (!generation.iter().all(u8::is_ascii_whitespace)).then_some(generation)
+}
+
+#[cfg(unix)]
+fn test_process_identity(pid: i32) -> Option<TestProcessIdentity> {
+    let generation = test_process_generation(pid)?;
+    // SAFETY: pid is positive and these calls only query process topology.
+    let (pgid, sid) = unsafe { (libc::getpgid(pid), libc::getsid(pid)) };
+    let identity = TestProcessIdentity {
+        pid,
+        pgid,
+        sid,
+        generation,
+    };
+    (pgid > 0 && sid > 0 && test_process_generation(pid)? == identity.generation)
+        .then_some(identity)
+}
+
+#[cfg(unix)]
+fn same_test_process(identity: &TestProcessIdentity) -> bool {
+    test_process_identity(identity.pid).as_ref() == Some(identity)
+}
+
+#[cfg(unix)]
+struct TestChildGuard {
+    child: Option<std::process::Child>,
+    marker: PathBuf,
+    worker: Option<PinnedTestProcess>,
+}
+
+#[cfg(unix)]
+impl TestChildGuard {
+    fn new(child: std::process::Child, marker: &Path) -> Self {
+        Self {
+            child: Some(child),
+            marker: marker.to_path_buf(),
+            worker: None,
+        }
+    }
+
+    fn child(&mut self) -> &mut std::process::Child {
+        self.child.as_mut().expect("owned test child")
+    }
+
+    fn read_worker(&self) -> Option<PinnedTestProcess> {
+        let pid = std::fs::read_to_string(&self.marker)
+            .ok()?
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .filter(|pid| *pid > 0)?;
+        PinnedTestProcess::claim(test_process_identity(pid)?)
+    }
+
+    fn observe_worker(&mut self) -> Option<TestProcessIdentity> {
+        let worker = self.read_worker()?;
+        let identity = worker.identity.clone();
+        self.worker = Some(worker);
+        Some(identity)
+    }
+
+    fn force_stop_dot(&mut self) {
+        // `Child::kill` addresses the retained child identity. Any marked
+        // subprocess is separately pinned before cleanup; never infer group
+        // authority from Dot's numeric PID on a failing assertion path.
+        let _ = self.child().kill();
+    }
+
+    fn exited_wnowait(&self) -> std::io::Result<bool> {
+        let child = self.child.as_ref().expect("owned test child");
+        // SAFETY: waitid writes only the initialized local siginfo and WNOWAIT
+        // retains the leader until fixture descendants have been checked.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            if libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(info.si_pid() != 0)
+        }
+    }
+
+    fn wait_with_output(&mut self) -> std::io::Result<std::process::Output> {
+        self.child
+            .take()
+            .expect("owned test child")
+            .wait_with_output()
+    }
+
+    fn cleanup_worker(&mut self) {
+        if self.worker.is_none() {
+            self.worker = self.read_worker();
+        }
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        let _ = worker.signal_for_cleanup(libc::SIGKILL);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TestChildGuard {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            self.force_stop_dot();
+        }
+        self.cleanup_worker();
+        if self.child.is_some() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !self.exited_wnowait().unwrap_or(false) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            if self.exited_wnowait().unwrap_or(false) {
+                let _ = self.child().wait();
+            }
+            self.child.take();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn cancel_after_marker<T>(
+    child: std::process::Child,
+    marker: &Path,
+    observe: impl FnOnce() -> T,
+) -> CancelledUpdate<T> {
+    cancel_after_marker_with_signal(child, marker, libc::SIGTERM, observe)
+}
+
+#[cfg(unix)]
+const HANDLED_SIGNAL_CASES: [(i32, i32, &str); 4] = [
+    (libc::SIGHUP, 129, "hup"),
+    (libc::SIGINT, 130, "int"),
+    (libc::SIGQUIT, 131, "quit"),
+    (libc::SIGTERM, 143, "term"),
+];
+
+#[cfg(unix)]
+fn cancel_after_marker_with_signal<T>(
+    child: std::process::Child,
+    marker: &Path,
+    signal: i32,
+    observe: impl FnOnce() -> T,
+) -> CancelledUpdate<T> {
+    let mut child = TestChildGuard::new(child, marker);
+    let ready = wait_for_child_marker(&mut child, marker);
+    let worker = ready.then(|| child.observe_worker()).flatten();
+    let worker_identity_valid = worker
+        .as_ref()
+        .is_some_and(|identity| identity.sid == identity.pid && identity.pgid == identity.pid);
+    let dot_pid = child.child().id() as i32;
+    // SAFETY: both positive PIDs are retained by the fixture at this point;
+    // getpgid/getsid only observe their current terminal topology.
+    let dot_group = unsafe { libc::getpgid(dot_pid) };
+    let dot_session = unsafe { libc::getsid(dot_pid) };
+    let worker_in_dot_foreground_group = worker
+        .as_ref()
+        .is_some_and(|worker| worker.pgid == dot_group && worker.sid == dot_session);
+    let observed = ready.then(observe);
+    // SAFETY: this fixture owns the positive Dot child and the caller supplies
+    // one of the four signals handled by the CLI owner.
+    let signal_result = unsafe { libc::kill(child.child().id() as i32, signal) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if child.exited_wnowait().unwrap_or(false) {
+            exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    if !exited {
+        child.force_stop_dot();
+    }
+    let worker_gone = worker.as_ref().is_some_and(wait_for_process_exit);
+    if !worker_gone {
+        child.cleanup_worker();
+        if let Some(identity) = &worker {
+            let _ = wait_for_process_exit(identity);
+        }
+    }
+    let output = child.wait_with_output().expect("reap interrupted update");
+    CancelledUpdate {
+        ready,
+        observed,
+        worker_identity_valid,
+        worker_in_dot_foreground_group,
+        signal_result,
+        exited,
+        worker_gone,
+        output,
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_process_exit(identity: &TestProcessIdentity) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !same_test_process(identity) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    !same_test_process(identity)
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_fixture_rejects_a_stale_process_generation() {
+    let current =
+        test_process_identity(std::process::id() as i32).expect("current process identity");
+    let mut stale = current.clone();
+    stale.generation.push(b'x');
+
+    assert!(same_test_process(&current));
+    assert!(!same_test_process(&stale));
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn cli_cleanup_guard_suppresses_delivery_after_generation_change() {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut command = Command::new("sleep");
+    command.arg("30").stdin(Stdio::null());
+    // SAFETY: setsid has no memory arguments and creates a private fixture
+    // process group before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn().expect("spawn cleanup guard fixture");
+    let identity = test_process_identity(child.id() as i32).expect("fixture identity");
+    let mut pinned = PinnedTestProcess::claim(identity).expect("pin fixture identity");
+    pinned.identity.generation.push(b'x');
+
+    assert!(!pinned.signal_for_cleanup(libc::SIGKILL));
+    assert_eq!(child.try_wait().expect("observe fixture"), None);
+    child.kill().expect("stop retained fixture child");
+    child.wait().expect("reap retained fixture child");
 }
 
 #[test]
@@ -2907,14 +3807,52 @@ fn update_native_entry_edges_reject_fallback() {
         .expect("bump tracked mtime");
     mtime.reject_fallback();
     assert_native_silent(&mtime.rust_dot(&["update", "--cron"]), "mtime cron");
+    #[cfg(unix)]
+    {
+        let normalized = repos_git_prefix_output(
+            &mtime.client.base_git_dir,
+            &mtime.client.home,
+            &["diff-files", "--name-only", "--", "tracked.txt"],
+        )
+        .expect("inspect normalized mtime");
+        assert!(
+            normalized.status.success(),
+            "inspect normalized mtime: {}",
+            String::from_utf8_lossy(&normalized.stderr)
+        );
+        assert_eq!(
+            normalized.stdout, b"",
+            "successful cleanup refreshes the base index stat cache"
+        );
+    }
 
     let unresolved = NativeUpdateFixture::stage();
     std::fs::write(unresolved.client.home.join("tracked.txt"), b"local edit\n")
         .expect("make unresolved edit");
     unresolved.reject_fallback();
-    assert_native_silent(
-        &unresolved.rust_dot(&["update", "--cron"]),
-        "unresolved cron",
+    // Handoff finding #1 deliberately ends cron dirty-skip silence
+    // (verified against `src/update_engine.rs::run_gathered`): the
+    // exit stays 0 and the edit is untouched, but the run now warns
+    // on stderr and records the skip in the outcome log.
+    let skipped = unresolved.rust_dot(&["update", "--cron"]);
+    assert_eq!(
+        skipped.status.code(),
+        Some(0),
+        "unresolved cron status; stdout={} stderr={}",
+        String::from_utf8_lossy(&skipped.stdout),
+        String::from_utf8_lossy(&skipped.stderr)
+    );
+    assert!(skipped.stdout.is_empty(), "unresolved cron stdout");
+    assert!(
+        String::from_utf8_lossy(&skipped.stderr)
+            .contains("cron update skipped with unresolved local edits (tracked.txt)"),
+        "unresolved cron warns: {}",
+        String::from_utf8_lossy(&skipped.stderr)
+    );
+    let skip = assert_cron_outcome(&unresolved.client.home, "skip", "dirty");
+    assert!(
+        skip.iter().any(|field| field == "tracked.txt"),
+        "skip names the dirty file: {skip:?}"
     );
     assert_eq!(
         std::fs::read(unresolved.client.home.join("tracked.txt")).expect("read unresolved edit"),
@@ -2936,6 +3874,66 @@ fn update_native_entry_edges_reject_fallback() {
             cmd.env("DOT_OVERLAY_LINKS_FROZEN", "1");
         }),
         "stale frozen marker",
+    );
+}
+
+#[test]
+fn cron_outcome_log_records_ok_and_fail_with_success_stamp() {
+    // Handoff finding #6: every cron run appends one outcome record,
+    // and finding #1's doctor check reads the success stamp below.
+    let clean = NativeUpdateFixture::stage();
+    clean.reject_fallback();
+    assert_native_silent(
+        &clean.rust_dot(&["update", "--cron"]),
+        "clean cron records ok",
+    );
+    assert_cron_outcome(&clean.client.home, "ok", "update");
+    let stamp = std::fs::read_to_string(
+        clean
+            .client
+            .home
+            .join(".local/state/dot/update.last-success"),
+    )
+    .expect("success stamp");
+    let stamped: i64 = stamp.trim().parse().expect("stamp epoch");
+    assert!(stamped > 1_700_000_000, "stamp epoch sane: {stamp}");
+
+    // A failing merge hook fails the run, records `fail`, and leaves
+    // no success stamp behind.
+    let failing = NativeUpdateFixture::stage().with_merge(b"merge() { return 3; }\n");
+    let output = failing.rust_dot_with_bash(&["update", "--cron"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "failing cron status; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_cron_outcome(&failing.client.home, "fail", "update");
+    assert!(
+        !failing
+            .client
+            .home
+            .join(".local/state/dot/update.last-success")
+            .exists(),
+        "failed cron run writes no success stamp"
+    );
+
+    // Plain updates stay out of the cron log: the history-tree tests
+    // pin the state directory across non-cron runs.
+    let plain = NativeUpdateFixture::stage();
+    plain.reject_fallback();
+    assert_native_silent(
+        &plain.rust_dot(&["update", "--quiet"]),
+        "plain update stays silent",
+    );
+    assert!(
+        !plain
+            .client
+            .home
+            .join(".local/state/dot/update.log")
+            .exists(),
+        "non-cron runs write no outcome record"
     );
 }
 
@@ -3360,6 +4358,839 @@ fn update_native_merge_hook_receives_update_lock_token() {
     assert_native_silent(&output, "merge update lock token");
 }
 
+#[cfg(unix)]
+#[test]
+fn direct_signal_during_git_sync_stops_the_owned_command_and_later_stages() {
+    let fixture = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { : >\"$HOME/merge-after-git-cancel\"; }\n");
+    seed_advance(&fixture.client.base_seed, "tracked.txt", b"v2\n");
+    let shim_dir = fixture.client.scope.path().join("blocking-git-bin");
+    std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
+    let marker = fixture.client.home.join("git-sync-ready");
+    let git_shim = shim_dir.join("git");
+    std::fs::write(
+        &git_shim,
+        br#"#!/bin/sh
+case " $* " in
+  *" rebase --autostash "*)
+    trap '' TERM
+    printf '%s\n' "$$" >"$DOT_TEST_GIT_SYNC_READY"
+    while :; do sleep 1; done
+    ;;
+esac
+exec "$DOT_TEST_REAL_GIT" "$@"
+"#,
+    )
+    .expect("write Git shim");
+    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
+        .expect("make Git shim executable");
+    let mut paths = vec![shim_dir];
+    paths.extend(std::env::split_paths(&fixture_path()));
+    let path = std::env::join_paths(paths).expect("Git shim PATH");
+    let real_git = real_tool("git");
+    let child = fixture.spawn_rust_dot_with_bash_and(&["update", "--quiet"], |command| {
+        command
+            .env("PATH", &path)
+            .env("DOT_TEST_REAL_GIT", &real_git)
+            .env("DOT_TEST_GIT_SYNC_READY", &marker);
+    });
+
+    let cancelled = cancel_after_marker(child, &marker, || ());
+
+    assert!(
+        cancelled.ready,
+        "Git sync did not reach its blocking command"
+    );
+    assert!(
+        cancelled.worker_identity_valid,
+        "Git sync was not isolated into an owned session"
+    );
+    assert_eq!(cancelled.signal_result, 0, "send SIGTERM to Dot");
+    assert!(
+        cancelled.exited,
+        "Dot did not stop boundedly during Git sync"
+    );
+    assert!(cancelled.worker_gone, "TERM-ignoring Git child survived");
+    assert_eq!(cancelled.output.status.code(), Some(143));
+    assert!(
+        !fixture.client.home.join("merge-after-git-cancel").exists(),
+        "update advanced to a later stage after Git cancellation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_signal_during_fetch_does_not_start_git_cleanup_queries() {
+    let fixture = NativeUpdateFixture::stage();
+    let shim_dir = fixture.client.scope.path().join("blocking-fetch-git-bin");
+    std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
+    let marker = fixture.client.home.join("git-fetch-ready");
+    let later = fixture.client.home.join("git-after-fetch-cancel");
+    let git_shim = shim_dir.join("git");
+    std::fs::write(
+        &git_shim,
+        br#"#!/bin/sh
+case " $* " in
+  *" fetch "*)
+    trap '' TERM
+    printf '%s\n' "$$" >"$DOT_TEST_GIT_FETCH_READY"
+    while :; do sleep 1; done
+    ;;
+  *" rev-parse --absolute-git-dir "*)
+    if [ -s "$DOT_TEST_GIT_FETCH_READY" ]; then
+      : >"$DOT_TEST_GIT_AFTER_FETCH_CANCEL"
+    fi
+    ;;
+esac
+exec "$DOT_TEST_REAL_GIT" "$@"
+"#,
+    )
+    .expect("write Git shim");
+    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
+        .expect("make Git shim executable");
+    let mut paths = vec![shim_dir];
+    paths.extend(std::env::split_paths(&fixture_path()));
+    let path = std::env::join_paths(paths).expect("Git shim PATH");
+    let real_git = real_tool("git");
+    let child = fixture.spawn_rust_dot_with_bash_and(&["fetch"], |command| {
+        command
+            .env("PATH", &path)
+            .env("DOT_TEST_REAL_GIT", &real_git)
+            .env("DOT_TEST_GIT_FETCH_READY", &marker)
+            .env("DOT_TEST_GIT_AFTER_FETCH_CANCEL", &later);
+    });
+
+    let cancelled = cancel_after_marker(child, &marker, || ());
+
+    assert!(
+        cancelled.ready,
+        "Git fetch did not reach its blocking command"
+    );
+    assert!(
+        cancelled.worker_in_dot_foreground_group,
+        "streaming Git fetch did not retain Dot's foreground process group"
+    );
+    assert_eq!(cancelled.signal_result, 0, "send SIGTERM to Dot");
+    assert!(cancelled.exited, "Dot did not stop boundedly during fetch");
+    assert!(cancelled.worker_gone, "TERM-ignoring Git fetch survived");
+    assert_eq!(cancelled.output.status.code(), Some(143));
+    assert!(
+        !later.exists(),
+        "fetch started a Git cleanup query after cancellation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_signals_during_startup_git_stop_the_owned_query() {
+    for (signal, expected, name) in HANDLED_SIGNAL_CASES {
+        let fixture = NativeUpdateFixture::stage()
+            .with_merge(b"merge() { : >\"$HOME/merge-after-startup-cancel\"; }\n");
+        let shim_dir = fixture
+            .client
+            .scope
+            .path()
+            .join(format!("blocking-startup-git-{name}"));
+        std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
+        let marker = fixture
+            .client
+            .scope
+            .path()
+            .join(format!("startup-git-{name}-ready"));
+        let git_shim = shim_dir.join("git");
+        std::fs::write(
+            &git_shim,
+            br#"#!/bin/sh
+case " $* " in
+  *" rev-parse HEAD "*)
+    trap '' TERM
+    printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
+    while :; do sleep 1; done
+    ;;
+esac
+exec "$DOT_TEST_REAL_GIT" "$@"
+"#,
+        )
+        .expect("write Git shim");
+        std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
+            .expect("make Git shim executable");
+        let mut paths = vec![shim_dir];
+        paths.extend(std::env::split_paths(&fixture_path()));
+        let path = std::env::join_paths(paths).expect("Git shim PATH");
+        let real_git = real_tool("git");
+        let child = fixture.spawn_rust_dot_with_bash_and(&["update", "--quiet"], |command| {
+            command
+                .env("PATH", &path)
+                .env("DOT_TEST_REAL_GIT", &real_git)
+                .env("DOT_TEST_GIT_QUERY_READY", &marker);
+        });
+
+        let cancelled = cancel_after_marker_with_signal(child, &marker, signal, || ());
+
+        assert!(cancelled.ready, "startup Git did not start for {name}");
+        assert!(
+            cancelled.worker_identity_valid,
+            "startup Git was not isolated for {name}"
+        );
+        assert_eq!(cancelled.signal_result, 0, "send {name} to Dot");
+        assert!(cancelled.exited, "Dot did not stop boundedly for {name}");
+        assert!(cancelled.worker_gone, "startup Git survived {name}");
+        assert_eq!(cancelled.output.status.code(), Some(expected));
+        assert!(
+            !fixture
+                .client
+                .home
+                .join("merge-after-startup-cancel")
+                .exists(),
+            "update advanced after startup cancellation for {name}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn informational_commands_own_their_blocking_startup_git_probe() {
+    for command_name in ["help", "version"] {
+        let fixture = NativeUpdateFixture::stage();
+        let shim_dir = fixture
+            .client
+            .scope
+            .path()
+            .join(format!("blocking-info-git-{command_name}"));
+        std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
+        let marker = fixture
+            .client
+            .scope
+            .path()
+            .join(format!("info-git-{command_name}-ready"));
+        let git_shim = shim_dir.join("git");
+        std::fs::write(
+            &git_shim,
+            br#"#!/bin/sh
+case " $* " in
+  *" rev-parse HEAD "*)
+    trap '' TERM
+    printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
+    while :; do sleep 1; done
+    ;;
+esac
+exec "$DOT_TEST_REAL_GIT" "$@"
+"#,
+        )
+        .expect("write Git shim");
+        std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
+            .expect("make Git shim executable");
+        let mut paths = vec![shim_dir];
+        paths.extend(std::env::split_paths(&fixture_path()));
+        let path = std::env::join_paths(paths).expect("Git shim PATH");
+        let real_git = real_tool("git");
+        let child = fixture.spawn_rust_dot_with_bash_and(&[command_name], |command| {
+            command
+                .env("PATH", &path)
+                .env("DOT_TEST_REAL_GIT", &real_git)
+                .env("DOT_TEST_GIT_QUERY_READY", &marker);
+        });
+
+        let cancelled = cancel_after_marker(child, &marker, || ());
+
+        assert!(cancelled.ready, "{command_name} Git probe did not start");
+        assert!(
+            cancelled.worker_identity_valid,
+            "{command_name} Git probe was not isolated"
+        );
+        assert_eq!(cancelled.output.status.code(), Some(143));
+        assert!(cancelled.worker_gone, "{command_name} Git probe survived");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_signals_during_crontab_stop_the_owned_query() {
+    for (signal, expected, name) in HANDLED_SIGNAL_CASES {
+        let fixture = NativeUpdateFixture::stage();
+        let shim_dir = fixture
+            .client
+            .scope
+            .path()
+            .join(format!("blocking-crontab-{name}"));
+        std::fs::create_dir_all(&shim_dir).expect("crontab shim directory");
+        let marker = fixture
+            .client
+            .scope
+            .path()
+            .join(format!("crontab-{name}-ready"));
+        let crontab = shim_dir.join("crontab");
+        std::fs::write(
+            &crontab,
+            b"#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' \"$$\" >\"$DOT_TEST_CRONTAB_READY\"\nwhile :; do sleep 1; done\n",
+        )
+        .expect("write crontab shim");
+        std::fs::set_permissions(&crontab, std::fs::Permissions::from_mode(0o755))
+            .expect("make crontab shim executable");
+        let mut paths = vec![shim_dir];
+        paths.extend(std::env::split_paths(&fixture_path()));
+        let path = std::env::join_paths(paths).expect("crontab shim PATH");
+        let child = fixture.spawn_rust_dot_with_bash_and(&["cron"], |command| {
+            command
+                .env("PATH", &path)
+                .env("DOT_TEST_CRONTAB_READY", &marker);
+        });
+
+        let cancelled = cancel_after_marker_with_signal(child, &marker, signal, || ());
+
+        assert!(cancelled.ready, "crontab did not start for {name}");
+        assert!(
+            cancelled.worker_identity_valid,
+            "crontab was not isolated for {name}"
+        );
+        assert_eq!(cancelled.signal_result, 0, "send {name} to Dot");
+        assert!(cancelled.exited, "Dot did not stop boundedly for {name}");
+        assert!(cancelled.worker_gone, "crontab survived {name}");
+        assert_eq!(cancelled.output.status.code(), Some(expected));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_signal_during_legacy_identity_selection_stops_the_owned_query() {
+    let fixture = NativeUpdateFixture::stage();
+    let shim_dir = fixture
+        .client
+        .scope
+        .path()
+        .join("blocking-legacy-select-bin");
+    std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
+    let marker = fixture.client.scope.path().join("legacy-select-ready");
+    let git_shim = shim_dir.join("git");
+    std::fs::write(
+        &git_shim,
+        br#"#!/bin/sh
+case " $* " in
+  *" rev-parse --absolute-git-dir "*)
+    trap '' TERM
+    printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
+    while :; do sleep 1; done
+    ;;
+esac
+exec "$DOT_TEST_REAL_GIT" "$@"
+"#,
+    )
+    .expect("write Git shim");
+    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
+        .expect("make Git shim executable");
+    let mut paths = vec![shim_dir];
+    paths.extend(std::env::split_paths(&fixture_path()));
+    let path = std::env::join_paths(paths).expect("Git shim PATH");
+    let real_git = real_tool("git");
+    let mut command = bin();
+    repos_env(&mut command, &fixture.client);
+    let child = command
+        .arg("status")
+        .env("PATH", &path)
+        .env("DOT_TEST_REAL_GIT", &real_git)
+        .env("DOT_TEST_GIT_QUERY_READY", &marker)
+        .spawn()
+        .expect("spawn status during legacy identity selection");
+
+    let cancelled = cancel_after_marker(child, &marker, || ());
+
+    assert!(cancelled.ready, "legacy identity query did not start");
+    assert!(
+        cancelled.worker_identity_valid,
+        "legacy identity query was not isolated into an owned session"
+    );
+    assert_eq!(cancelled.signal_result, 0, "send SIGTERM to Dot");
+    assert!(
+        cancelled.exited,
+        "Dot did not stop boundedly during legacy identity selection"
+    );
+    assert!(
+        cancelled.worker_gone,
+        "TERM-ignoring legacy identity query survived"
+    );
+    assert_eq!(cancelled.output.status.code(), Some(143));
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_signals_during_init_git_clone_stop_the_owned_query() {
+    for (signal, expected, name) in HANDLED_SIGNAL_CASES {
+        let home = TempDir::new(&format!("cli-init-signal-{name}-home")).expect("home");
+        let state = TempDir::new(&format!("cli-init-signal-{name}-state")).expect("state");
+        let shim_dir = state.path().join("blocking-init-git-bin");
+        std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
+        let marker = state.path().join("init-git-ready");
+        let git_shim = shim_dir.join("git");
+        std::fs::write(
+            &git_shim,
+            br#"#!/bin/sh
+case " $* " in
+  *" clone "*)
+    trap '' TERM
+    printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
+    while :; do sleep 1; done
+    ;;
+esac
+exec "$DOT_TEST_REAL_GIT" "$@"
+"#,
+        )
+        .expect("write Git shim");
+        std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
+            .expect("make Git shim executable");
+        let mut paths = vec![shim_dir];
+        paths.extend(std::env::split_paths(&fixture_path()));
+        let path = std::env::join_paths(paths).expect("Git shim PATH");
+        let real_git = real_tool("git");
+        let mut command = init_bin(&home, &state);
+        let child = command
+            .args([
+                "init",
+                "--yes",
+                "--branch",
+                "main",
+                "file:///nonexistent-origin.git",
+            ])
+            .env("PATH", &path)
+            .env("DOT_TEST_REAL_GIT", &real_git)
+            .env("DOT_TEST_GIT_QUERY_READY", &marker)
+            .env("DOT_INIT_SKIP_PROVIDER", "1")
+            .spawn()
+            .expect("spawn init during Git clone");
+
+        let cancelled = cancel_after_marker_with_signal(child, &marker, signal, || ());
+
+        assert!(cancelled.ready, "init Git clone did not start for {name}");
+        assert!(
+            cancelled.worker_identity_valid,
+            "init Git clone was not isolated for {name}"
+        );
+        assert_eq!(cancelled.signal_result, 0, "send {name} to Dot");
+        assert!(cancelled.exited, "Dot did not stop boundedly for {name}");
+        assert!(cancelled.worker_gone, "init Git clone survived {name}");
+        assert_eq!(cancelled.output.status.code(), Some(expected));
+        assert!(
+            !home.path().join(".dotfiles").exists(),
+            "init published the live Git directory after {name}"
+        );
+        assert!(
+            !state.path().join("dot/init/completed").exists(),
+            "init published its completed record after {name}"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn assert_signal_during_missing_overlay_clone(signal: i32, expected: i32, name: &str) {
+    let fixture = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { : >\"$HOME/merge-after-clone-cancel\"; }\n");
+    std::fs::remove_dir_all(&fixture.client.overlay).expect("remove overlay checkout");
+    let shim_dir = fixture
+        .client
+        .scope
+        .path()
+        .join(format!("blocking-overlay-clone-{name}"));
+    std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
+    let marker = fixture
+        .client
+        .scope
+        .path()
+        .join(format!("overlay-clone-{name}-ready"));
+    let git_shim = shim_dir.join("git");
+    std::fs::write(
+        &git_shim,
+        br#"#!/bin/sh
+case " $* " in
+  *" clone --quiet --no-hardlinks "*)
+    trap '' TERM
+    printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
+    while :; do sleep 1; done
+    ;;
+esac
+exec "$DOT_TEST_REAL_GIT" "$@"
+"#,
+    )
+    .expect("write Git shim");
+    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
+        .expect("make Git shim executable");
+    let mut paths = vec![shim_dir];
+    paths.extend(std::env::split_paths(&fixture_path()));
+    let path = std::env::join_paths(paths).expect("Git shim PATH");
+    let real_git = real_tool("git");
+    let child = fixture.spawn_rust_dot_with_bash_and(&["update", "--quiet"], |command| {
+        command
+            .env("PATH", &path)
+            .env("DOT_TEST_REAL_GIT", &real_git)
+            .env("DOT_TEST_GIT_QUERY_READY", &marker);
+    });
+
+    let cancelled = cancel_after_marker_with_signal(child, &marker, signal, || ());
+
+    assert!(
+        cancelled.ready,
+        "overlay clone did not start for {name}; status={:?}; stdout={}; stderr={}",
+        cancelled.output.status,
+        String::from_utf8_lossy(&cancelled.output.stdout),
+        String::from_utf8_lossy(&cancelled.output.stderr),
+    );
+    assert!(
+        cancelled.worker_identity_valid,
+        "overlay clone was not isolated for {name}"
+    );
+    assert_eq!(cancelled.signal_result, 0, "send {name} to Dot");
+    assert!(cancelled.exited, "Dot did not stop boundedly for {name}");
+    assert!(cancelled.worker_gone, "overlay clone survived {name}");
+    assert_eq!(cancelled.output.status.code(), Some(expected));
+    assert!(
+        !fixture.client.overlay.exists(),
+        "missing overlay was published after {name}"
+    );
+    assert!(
+        !fixture
+            .client
+            .home
+            .join("merge-after-clone-cancel")
+            .exists(),
+        "update advanced after overlay-clone cancellation for {name}"
+    );
+    let staged = std::fs::read_dir(&fixture.client.home)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy().contains(".clone."));
+    assert!(!staged, "overlay clone stage survived {name}");
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_hup_during_missing_overlay_clone_stops_before_publication() {
+    assert_signal_during_missing_overlay_clone(libc::SIGHUP, 129, "hup");
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_int_during_missing_overlay_clone_stops_before_publication() {
+    assert_signal_during_missing_overlay_clone(libc::SIGINT, 130, "int");
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_quit_during_missing_overlay_clone_stops_before_publication() {
+    assert_signal_during_missing_overlay_clone(libc::SIGQUIT, 131, "quit");
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_term_during_missing_overlay_clone_stops_before_publication() {
+    assert_signal_during_missing_overlay_clone(libc::SIGTERM, 143, "term");
+}
+
+#[cfg(unix)]
+fn stage_sync_none_overlay_link(client: &ReposClient) -> (PathBuf, PathBuf, PathBuf) {
+    let source = client.overlay.join("home/linked-from-overlay");
+    std::fs::create_dir_all(source.parent().expect("overlay home"))
+        .expect("overlay home directory");
+    std::fs::write(&source, b"overlay\n").expect("overlay source");
+    std::fs::write(
+        client.xdg.join("dot/overlays.d/10-alpha.conf"),
+        format!("path={}\nsync=none\n", client.overlay.display()),
+    )
+    .expect("local overlay descriptor");
+    let destination = client.home.join("linked-from-overlay");
+    let manifest = client.home.join(".local/state/dot/overlay-links");
+    let pending = client.home.join(".local/state/dot/overlay-links.pending");
+    (destination, manifest, pending)
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_signal_during_base_tracked_query_prevents_overlay_mutation() {
+    let fixture = NativeUpdateFixture::stage();
+    let (destination, manifest, pending) = stage_sync_none_overlay_link(&fixture.client);
+    let shim_dir = fixture
+        .client
+        .scope
+        .path()
+        .join("blocking-base-tracked-bin");
+    std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
+    let marker = fixture.client.scope.path().join("base-tracked-ready");
+    let git_shim = shim_dir.join("git");
+    std::fs::write(
+        &git_shim,
+        br#"#!/bin/sh
+last=
+for arg do last=$arg; done
+if [ "$last" = ls-files ]; then
+  trap '' TERM
+  printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
+  while :; do sleep 1; done
+fi
+exec "$DOT_TEST_REAL_GIT" "$@"
+"#,
+    )
+    .expect("write Git shim");
+    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
+        .expect("make Git shim executable");
+    let mut paths = vec![shim_dir];
+    paths.extend(std::env::split_paths(&fixture_path()));
+    let path = std::env::join_paths(paths).expect("Git shim PATH");
+    let real_git = real_tool("git");
+    let child = fixture.spawn_rust_dot_with_bash_and(&["update"], |command| {
+        command
+            .env("PATH", &path)
+            .env("DOT_TEST_REAL_GIT", &real_git)
+            .env("DOT_TEST_GIT_QUERY_READY", &marker);
+    });
+
+    let cancelled = cancel_after_marker(child, &marker, || ());
+
+    assert!(cancelled.ready, "base tracked query did not start");
+    assert!(cancelled.worker_identity_valid, "query was not isolated");
+    assert_eq!(cancelled.output.status.code(), Some(143));
+    assert!(cancelled.worker_gone, "base tracked query survived");
+    assert!(!destination.exists(), "overlay destination changed");
+    assert!(!manifest.exists(), "overlay manifest was published");
+    assert!(!pending.exists(), "overlay pending authority was published");
+}
+
+#[cfg(unix)]
+#[test]
+fn base_tracked_output_overflow_fails_before_overlay_mutation() {
+    let fixture = NativeUpdateFixture::stage();
+    let (destination, manifest, pending) = stage_sync_none_overlay_link(&fixture.client);
+    let shim_dir = fixture
+        .client
+        .scope
+        .path()
+        .join("overflow-base-tracked-bin");
+    std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
+    let marker = fixture
+        .client
+        .scope
+        .path()
+        .join("base-tracked-overflow-ready");
+    let git_shim = shim_dir.join("git");
+    std::fs::write(
+        &git_shim,
+        br#"#!/bin/sh
+last=
+for arg do last=$arg; done
+if [ "$last" = ls-files ]; then
+  trap '' TERM
+  : >"$DOT_TEST_GIT_QUERY_READY"
+  head -c 16785408 /dev/zero
+  exit 0
+fi
+exec "$DOT_TEST_REAL_GIT" "$@"
+"#,
+    )
+    .expect("write Git shim");
+    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
+        .expect("make Git shim executable");
+    let mut paths = vec![shim_dir];
+    paths.extend(std::env::split_paths(&fixture_path()));
+    let path = std::env::join_paths(paths).expect("Git shim PATH");
+    let real_git = real_tool("git");
+    let started = Instant::now();
+    let output = fixture.rust_dot_with_bash_and(&["update"], |command| {
+        command
+            .env("PATH", &path)
+            .env("DOT_TEST_REAL_GIT", &real_git)
+            .env("DOT_TEST_GIT_QUERY_READY", &marker);
+    });
+
+    assert!(marker.exists(), "base tracked overflow query did not start");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "base tracked overflow was not bounded"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("repository inspection output exceeded its safety limit"),
+        "missing stable overflow diagnostic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!destination.exists(), "overlay destination changed");
+    assert!(!manifest.exists(), "overlay manifest was published");
+    assert!(!pending.exists(), "overlay pending authority was published");
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_signal_during_post_fetch_query_stops_the_owned_command() {
+    let fixture = NativeUpdateFixture::stage();
+    let shim_dir = fixture
+        .client
+        .scope
+        .path()
+        .join("blocking-post-fetch-git-bin");
+    std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
+    let fetched = fixture.client.home.join("git-fetch-finished");
+    let marker = fixture.client.home.join("git-post-fetch-query-ready");
+    let git_shim = shim_dir.join("git");
+    std::fs::write(
+        &git_shim,
+        br#"#!/bin/sh
+case " $* " in
+  *" fetch "*)
+    "$DOT_TEST_REAL_GIT" "$@"
+    rc=$?
+    : >"$DOT_TEST_GIT_FETCH_FINISHED"
+    exit "$rc"
+    ;;
+  *" rev-parse --absolute-git-dir "*)
+    if [ -e "$DOT_TEST_GIT_FETCH_FINISHED" ]; then
+      trap '' TERM
+      printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
+      while :; do sleep 1; done
+    fi
+    ;;
+esac
+exec "$DOT_TEST_REAL_GIT" "$@"
+"#,
+    )
+    .expect("write Git shim");
+    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
+        .expect("make Git shim executable");
+    let mut paths = vec![shim_dir];
+    paths.extend(std::env::split_paths(&fixture_path()));
+    let path = std::env::join_paths(paths).expect("Git shim PATH");
+    let real_git = real_tool("git");
+    let child = fixture.spawn_rust_dot_with_bash_and(&["fetch"], |command| {
+        command
+            .env("PATH", &path)
+            .env("DOT_TEST_REAL_GIT", &real_git)
+            .env("DOT_TEST_GIT_FETCH_FINISHED", &fetched)
+            .env("DOT_TEST_GIT_QUERY_READY", &marker);
+    });
+
+    let cancelled = cancel_after_marker(child, &marker, || fetched.exists());
+
+    assert!(cancelled.ready, "post-fetch Git query did not start");
+    assert_eq!(cancelled.observed, Some(true), "fetch did not finish first");
+    assert!(
+        cancelled.worker_identity_valid,
+        "post-fetch Git query was not isolated into an owned session"
+    );
+    assert_eq!(cancelled.signal_result, 0, "send SIGTERM to Dot");
+    assert!(
+        cancelled.exited,
+        "Dot did not stop boundedly during the post-fetch query"
+    );
+    assert!(
+        cancelled.worker_gone,
+        "TERM-ignoring post-fetch Git query survived"
+    );
+    assert_eq!(cancelled.output.status.code(), Some(143));
+}
+
+#[cfg(unix)]
+#[test]
+fn update_native_signal_during_merge_retains_lifecycle_state_and_skips_normalization() {
+    let fixture = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { :; }\n")
+        .with_profile_retirement();
+    assert_native_silent(
+        &fixture.rust_dot_with_bash(&["update", "--quiet"]),
+        "merge cancellation setup",
+    );
+    let ledger = fixture
+        .client
+        .home
+        .join(".local/state/dot/profile-overlay-lifecycle-v1");
+    let ledger_before = std::fs::read(&ledger).expect("setup lifecycle ledger");
+    assert!(
+        ledger_before
+            .windows(b"alpha|".len())
+            .any(|row| row == b"alpha|"),
+        "setup grants alpha lifecycle authority"
+    );
+
+    std::fs::write(
+        fixture
+            .client
+            .home
+            .join("extensions/merge-hooks.d/10-config.sh"),
+        b"merge() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/merge-cancel-ready\"\n  while :; do sleep 1; done\n}\n",
+    )
+    .expect("blocking merge hook");
+    std::fs::write(
+        fixture.client.xdg.join("dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
+    )
+    .expect("switch profile");
+
+    let marker = fixture.client.home.join("merge-cancel-ready");
+    let child = fixture.spawn_rust_dot_with_bash(&["update", "--quiet"]);
+    let cancelled = cancel_after_marker(child, &marker, || {
+        (
+            std::fs::read(fixture.client.home.join("alpha-retired")),
+            arm_base_stat_sentinel(&fixture.client),
+        )
+    });
+
+    assert!(
+        cancelled.ready,
+        "merge hook did not publish its readiness marker; status={:?}; stdout={}; stderr={}",
+        cancelled.output.status,
+        String::from_utf8_lossy(&cancelled.output.stdout),
+        String::from_utf8_lossy(&cancelled.output.stderr),
+    );
+    assert!(
+        cancelled.worker_identity_valid,
+        "merge marker did not identify its private session leader"
+    );
+    let (retired, dirty) = cancelled.observed.expect("pre-signal merge observations");
+    assert_eq!(retired.expect("retirement marker"), b"alpha|0");
+    let dirty = dirty.expect("arm base stat sentinel");
+    assert!(
+        dirty.status.success(),
+        "inspect armed stat sentinel: {}",
+        String::from_utf8_lossy(&dirty.stderr)
+    );
+    assert_eq!(dirty.stdout, b"tracked.txt\n", "stat sentinel precondition");
+    assert_eq!(cancelled.signal_result, 0, "send SIGTERM to Dot");
+    assert!(
+        cancelled.exited,
+        "Dot did not exit within the cancellation deadline"
+    );
+    assert!(
+        cancelled.worker_gone,
+        "Dot returned while the merge worker was still alive"
+    );
+    assert_eq!(
+        cancelled.output.status.code(),
+        Some(143),
+        "cancelled merge status; stdout={} stderr={}",
+        String::from_utf8_lossy(&cancelled.output.stdout),
+        String::from_utf8_lossy(&cancelled.output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&ledger).expect("retained lifecycle ledger"),
+        ledger_before,
+        "cancellation must not commit the staged retirement"
+    );
+    let dirty = repos_git_prefix_output(
+        &fixture.client.base_git_dir,
+        &fixture.client.home,
+        &["diff-files", "--name-only", "--", "tracked.txt"],
+    )
+    .expect("inspect retained stat sentinel");
+    assert!(dirty.status.success());
+    assert_eq!(
+        dirty.stdout, b"tracked.txt\n",
+        "cancellation must skip cleanup normalization"
+    );
+    assert!(
+        !fixture
+            .client
+            .home
+            .join(".local/state/dot/update.lock")
+            .exists(),
+        "cancellation releases the update lock"
+    );
+}
+
 #[test]
 fn update_native_profile_base_selection_rejects_fallback() {
     let fixture = NativeUpdateFixture::stage().with_base_profile();
@@ -3529,6 +5360,107 @@ fn update_native_profile_failed_retirement_preserves_lifecycle_authority() {
     assert_eq!(base_snapshot(&fixture.client), clean_checkout());
     assert_clean_checkout(&fixture.client, "alpha");
     assert_clean_checkout(&fixture.client, "beta");
+}
+
+#[cfg(unix)]
+#[test]
+fn update_native_signal_during_retirement_retains_lifecycle_state_and_skips_normalization() {
+    let fixture = NativeUpdateFixture::stage().with_profile_retirement();
+    seed_advance(
+        &fixture.client.overlay_seed,
+        "dot/profile-deactivate",
+        b"deactivate() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/retire-cancel-ready\"\n  while :; do sleep 1; done\n}\n",
+    );
+    assert_native_silent(
+        &fixture.rust_dot_with_bash(&["update", "--quiet"]),
+        "retirement cancellation setup",
+    );
+    let ledger = fixture
+        .client
+        .home
+        .join(".local/state/dot/profile-overlay-lifecycle-v1");
+    let ledger_before = std::fs::read(&ledger).expect("setup lifecycle ledger");
+    assert!(
+        ledger_before
+            .windows(b"alpha|".len())
+            .any(|row| row == b"alpha|"),
+        "setup grants alpha lifecycle authority"
+    );
+    std::fs::write(
+        fixture.client.xdg.join("dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
+    )
+    .expect("switch profile");
+
+    let marker = fixture.client.home.join("retire-cancel-ready");
+    let child = fixture.spawn_rust_dot_with_bash(&["update", "--quiet"]);
+    let cancelled = cancel_after_marker(child, &marker, || arm_base_stat_sentinel(&fixture.client));
+
+    assert!(
+        cancelled.ready,
+        "retirement hook did not publish its readiness marker; status={:?}; stdout={}; stderr={}",
+        cancelled.output.status,
+        String::from_utf8_lossy(&cancelled.output.stdout),
+        String::from_utf8_lossy(&cancelled.output.stderr),
+    );
+    assert!(
+        cancelled.worker_identity_valid,
+        "retirement marker did not identify its private session leader"
+    );
+    let dirty = cancelled
+        .observed
+        .expect("pre-signal retirement observation")
+        .expect("arm base stat sentinel");
+    assert!(
+        dirty.status.success(),
+        "inspect armed stat sentinel: {}",
+        String::from_utf8_lossy(&dirty.stderr)
+    );
+    assert_eq!(dirty.stdout, b"tracked.txt\n", "stat sentinel precondition");
+    assert_eq!(cancelled.signal_result, 0, "send SIGTERM to Dot");
+    assert!(
+        cancelled.exited,
+        "Dot did not exit within the cancellation deadline"
+    );
+    assert!(
+        cancelled.worker_gone,
+        "Dot returned while the retirement worker was still alive"
+    );
+    assert_eq!(
+        cancelled.output.status.code(),
+        Some(143),
+        "cancelled retirement status; stdout={} stderr={}",
+        String::from_utf8_lossy(&cancelled.output.stdout),
+        String::from_utf8_lossy(&cancelled.output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&ledger).expect("retained lifecycle ledger"),
+        ledger_before,
+        "cancellation must retain alpha's lifecycle authority"
+    );
+    assert!(
+        !fixture.client.home.join("alpha-retired").exists(),
+        "the blocked retirement hook must not report completion"
+    );
+    let dirty = repos_git_prefix_output(
+        &fixture.client.base_git_dir,
+        &fixture.client.home,
+        &["diff-files", "--name-only", "--", "tracked.txt"],
+    )
+    .expect("inspect retained stat sentinel");
+    assert!(dirty.status.success());
+    assert_eq!(
+        dirty.stdout, b"tracked.txt\n",
+        "cancellation must skip cleanup normalization"
+    );
+    assert!(
+        !fixture
+            .client
+            .home
+            .join(".local/state/dot/update.lock")
+            .exists(),
+        "cancellation releases the update lock"
+    );
 }
 
 #[test]

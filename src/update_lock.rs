@@ -241,16 +241,32 @@ pub fn mint_token() -> String {
 /// `ps` answer wins (preserving locks from older generations); procfs
 /// is the fallback only when no expectation constrains the backend.
 pub fn process_start(pid: u32, expected: Option<&str>) -> Option<String> {
+    process_start_typed(pid, expected).ok().flatten()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeFailure {
+    Interrupted,
+    Unknown,
+}
+
+fn process_start_typed(
+    pid: u32,
+    expected: Option<&str>,
+) -> std::result::Result<Option<String>, ProbeFailure> {
     if expected.is_some_and(|text| text.starts_with("proc:")) {
-        return process_start_proc(pid);
+        return Ok(process_start_proc(pid));
     }
-    if let Some(start) = process_start_ps(pid) {
-        return Some(start);
+    match process_start_ps_typed(pid) {
+        Ok(Some(start)) => Ok(Some(start)),
+        Ok(None) if expected.is_none() => Ok(process_start_proc(pid)),
+        Ok(None) => Ok(None),
+        Err(ProbeFailure::Interrupted) => Err(ProbeFailure::Interrupted),
+        Err(ProbeFailure::Unknown) if expected.is_none() => process_start_proc(pid)
+            .map(Some)
+            .ok_or(ProbeFailure::Unknown),
+        Err(error) => Err(error),
     }
-    if expected.is_none() {
-        return process_start_proc(pid);
-    }
-    None
 }
 
 /// Procfs backend: kernel start tick (field 22) of `/proc/<pid>/stat`.
@@ -271,7 +287,12 @@ pub fn process_start_proc(pid: u32) -> Option<String> {
 /// if any, are preserved — both sides compare opaque strings).
 /// Empty output means no such process (or a broken `ps`).
 pub fn process_start_ps(pid: u32) -> Option<String> {
-    let output = Command::new("ps")
+    process_start_ps_typed(pid).ok().flatten()
+}
+
+fn process_start_ps_typed(pid: u32) -> std::result::Result<Option<String>, ProbeFailure> {
+    let mut command = Command::new("ps");
+    command
         .arg("-o")
         .arg("lstart=")
         .arg("-p")
@@ -279,18 +300,29 @@ pub fn process_start_ps(pid: u32) -> Option<String> {
         .env("LC_ALL", "C")
         .env("TZ", "UTC0")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output_typed(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .map_err(|error| match error {
+        crate::cleanup::SessionOutputError::Interrupted(_) => ProbeFailure::Interrupted,
+        crate::cleanup::SessionOutputError::Io(_)
+        | crate::cleanup::SessionOutputError::TimedOut
+        | crate::cleanup::SessionOutputError::CaptureLimit
+        | crate::cleanup::SessionOutputError::CleanupIncomplete => ProbeFailure::Unknown,
+    })?;
     if !output.status.success() {
-        return None;
+        return Err(ProbeFailure::Unknown);
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let trimmed = text.trim_end_matches('\n');
     if trimmed.is_empty() {
-        return None;
+        return Err(ProbeFailure::Unknown);
     }
-    Some(trimmed.to_string())
+    Ok(Some(trimmed.to_string()))
 }
 
 /// Foreign-pid liveness through the native Unix signal-zero probe.
@@ -311,10 +343,39 @@ fn pid_alive(pid: u32) -> bool {
 /// Whether a recorded owner still holds the lock: process alive AND
 /// start identity unchanged (PID-reuse protection).
 pub fn owner_is_active(owner: &Owner) -> bool {
-    if !pid_alive(owner.pid) {
-        return false;
+    matches!(owner_activity(owner), OwnerActivity::Active)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerActivity {
+    Active,
+    Stale,
+    Unknown,
+    Interrupted,
+}
+
+pub(crate) fn owner_activity(owner: &Owner) -> OwnerActivity {
+    classify_owner_activity(
+        owner,
+        pid_alive(owner.pid),
+        process_start_typed(owner.pid, Some(&owner.start)),
+    )
+}
+
+fn classify_owner_activity(
+    owner: &Owner,
+    alive: bool,
+    observed: std::result::Result<Option<String>, ProbeFailure>,
+) -> OwnerActivity {
+    if !alive {
+        return OwnerActivity::Stale;
     }
-    process_start(owner.pid, Some(&owner.start)).as_deref() == Some(owner.start.as_str())
+    match observed {
+        Ok(Some(start)) if start == owner.start => OwnerActivity::Active,
+        Ok(Some(_)) | Ok(None) => OwnerActivity::Stale,
+        Err(ProbeFailure::Interrupted) => OwnerActivity::Interrupted,
+        Err(ProbeFailure::Unknown) => OwnerActivity::Unknown,
+    }
 }
 
 /// File mtime as whole seconds since the epoch.
@@ -660,12 +721,28 @@ pub fn acquire(
         }
 
         if let Some(owner) = read_owner(&lock_dir) {
-            if owner_is_active(&owner) {
-                let message = format!("  warning: dot update already running (pid {})", owner.pid);
-                if !cron {
-                    log.warn(warn_sink, &message);
+            match owner_activity(&owner) {
+                OwnerActivity::Active => {
+                    let message =
+                        format!("  warning: dot update already running (pid {})", owner.pid);
+                    if !cron {
+                        log.warn(warn_sink, &message);
+                    }
+                    return Err(Error::LockBusy { message });
                 }
-                return Err(Error::LockBusy { message });
+                OwnerActivity::Stale => {}
+                OwnerActivity::Interrupted => {
+                    return Err(Error::Io {
+                        context: "update lock owner probe interrupted",
+                        source: std::io::ErrorKind::Interrupted.into(),
+                    });
+                }
+                OwnerActivity::Unknown => {
+                    return Err(Error::Io {
+                        context: "update lock owner identity is unavailable",
+                        source: std::io::Error::other("could not verify the live lock owner"),
+                    });
+                }
             }
         } else if is_initializing(&lock_dir) {
             let message = "  warning: dot update lock is initializing".to_string();
@@ -689,6 +766,7 @@ pub fn acquire(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn test_log() -> Log {
         Log::new(false, false)
@@ -719,6 +797,93 @@ mod tests {
             "pid\t123\nstart\tproc:456\ntoken\t123.456.0\n"
         );
         assert_eq!(parse_owner(&format_owner(&owner)), Some(owner));
+    }
+
+    #[test]
+    fn uncertain_or_interrupted_live_owner_probe_never_authorizes_reclaim() {
+        let owner = Owner {
+            pid: 123,
+            start: "legacy ps identity".to_string(),
+            token: "token".to_string(),
+        };
+
+        assert_eq!(
+            classify_owner_activity(&owner, true, Err(ProbeFailure::Interrupted)),
+            OwnerActivity::Interrupted
+        );
+        assert_eq!(
+            classify_owner_activity(&owner, true, Err(ProbeFailure::Unknown)),
+            OwnerActivity::Unknown
+        );
+        assert_eq!(
+            classify_owner_activity(&owner, false, Err(ProbeFailure::Unknown)),
+            OwnerActivity::Stale
+        );
+    }
+
+    #[test]
+    fn interrupted_legacy_owner_probe_preserves_the_live_lock() {
+        const HELPER: &str = "DOT_UPDATE_LOCK_INTERRUPTED_PS_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update_lock::tests::interrupted_legacy_owner_probe_preserves_the_live_lock",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "interrupted owner-probe helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let scratch = dot_test_support::TempDir::new("lock-interrupted-ps").unwrap();
+        let bin = scratch.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let ready = scratch.path().join("ps.ready");
+        let ps = bin.join("ps");
+        std::fs::write(
+            &ps,
+            format!(
+                "#!/bin/sh\n: >'{}'\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: this recursive helper is the only test in its process.
+        unsafe { std::env::set_var("PATH", &bin) };
+        let lock = lock_path(scratch.path());
+        std::fs::create_dir_all(&lock).unwrap();
+        let owner = Owner {
+            pid: std::process::id(),
+            start: "legacy ps identity".to_string(),
+            token: "retained".to_string(),
+        };
+        std::fs::write(owner_file(&lock), format_owner(&owner)).unwrap();
+        let signals = crate::cleanup::Signals::install().unwrap();
+        let ready_for_signal = ready.clone();
+        let sender = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !ready_for_signal.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(ready_for_signal.exists());
+            // SAFETY: the helper owns an installed SIGTERM handler.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+        });
+        let result = acquire(scratch.path(), false, &test_log(), None, &mut Vec::new());
+        sender.join().unwrap();
+        let status = signals.finish(if result.is_ok() { 0 } else { 1 });
+
+        assert_eq!(status, 128 + libc::SIGTERM);
+        assert_eq!(read_owner(&lock), Some(owner));
     }
 
     #[test]
@@ -847,6 +1012,43 @@ mod tests {
                 & 0o777,
             0o755,
             "refusal must not chmod the symlink target"
+        );
+    }
+
+    #[test]
+    fn owner_activity_classifies_every_probe_outcome() {
+        let owner = Owner {
+            pid: 4242,
+            start: "proc:99".to_string(),
+            token: "4242.0.0".to_string(),
+        };
+        // A dead pid is stale whatever the probe observed.
+        assert_eq!(
+            classify_owner_activity(&owner, false, Err(ProbeFailure::Unknown)),
+            OwnerActivity::Stale
+        );
+        assert_eq!(
+            classify_owner_activity(&owner, true, Ok(Some("proc:99".to_string()))),
+            OwnerActivity::Active
+        );
+        assert_eq!(
+            classify_owner_activity(&owner, true, Ok(Some("proc:100".to_string()))),
+            OwnerActivity::Stale
+        );
+        assert_eq!(
+            classify_owner_activity(&owner, true, Ok(None)),
+            OwnerActivity::Stale
+        );
+        // Probe failures are their own outcomes (never stale, never
+        // active): `acquire` refuses on `Unknown`, and doctor renders
+        // its own row for both.
+        assert_eq!(
+            classify_owner_activity(&owner, true, Err(ProbeFailure::Unknown)),
+            OwnerActivity::Unknown
+        );
+        assert_eq!(
+            classify_owner_activity(&owner, true, Err(ProbeFailure::Interrupted)),
+            OwnerActivity::Interrupted
         );
     }
 }

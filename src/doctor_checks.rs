@@ -7,7 +7,8 @@
 //! [`check_profile_lifecycle`], [`check_overlays`],
 //! [`shdeps_binary`], [`check_provider`],
 //! [`completed_identity_matches_home`], [`is_client_checkout`],
-//! and [`check_base_repo`]. [`crate::doctor`] owns orchestration.
+//! [`check_base_repo`], and [`check_cron_freshness`].
+//! [`crate::doctor`] owns orchestration.
 //!
 //! Everything here is a pure function of explicit inputs, the
 //! established boundary: shell-era globals (`DOT_*`,
@@ -46,6 +47,10 @@
 //!   fires when the `wc -l` pipeline itself fails (a bad inventory
 //!   still prints zero lines through `sort`, whose exit status
 //!   decides); the port keeps the branch with `spec_count: None`.
+//! - [`check_cron_freshness`] and per-hook output verification are
+//!   new observability (handoff findings #1 and #8), not shell
+//!   ports: the shell counted merge specs only and kept no
+//!   success stamp.
 //! - `read` field splitting (`IFS='|'`, `-r`, last variable keeps
 //!   the remainder, missing fields read empty) is mirrored by the
 //!   private `read_fields` helper.
@@ -206,6 +211,33 @@ fn is_executable_bits(mode: u32) -> bool {
     mode & 0o111 != 0
 }
 
+/// One owner row for [`check_update_lock`]: the row must agree with
+/// what `acquire` will do. `acquire` reclaims stale owners but
+/// *refuses* when the owner probe cannot verify liveness, so
+/// `Unknown`/`Interrupted` get their own row instead of sharing the
+/// stale "will reclaim" promise.
+fn lock_owner_record(
+    owner: &crate::update_lock::Owner,
+    activity: crate::update_lock::OwnerActivity,
+) -> Record {
+    use crate::update_lock::OwnerActivity as Activity;
+
+    match activity {
+        Activity::Active => Record::warn(
+            "update is currently running",
+            Some(format!("pid {}", owner.pid)),
+        ),
+        Activity::Stale => Record::warn(
+            "update lock owner is stale",
+            Some("the next mutating command will reclaim it".to_string()),
+        ),
+        Activity::Unknown | Activity::Interrupted => Record::warn(
+            "update lock owner cannot be verified",
+            Some("mutating commands refuse until the owner probe succeeds".to_string()),
+        ),
+    }
+}
+
 /// `_dr_check_update_lock` (`doctor/lock.sh`): the process-wide
 /// mutation lock is either clear, held live, stale, initializing,
 /// or incomplete.
@@ -213,11 +245,12 @@ fn is_executable_bits(mode: u32) -> bool {
 /// `lock_dir` is the `_dot_update_lock_path` result (`None` when
 /// path resolution fails). Owner liveness reuses
 /// [`crate::update_lock`]: `read_owner` for
-/// `_dot_update_lock_read_owner`, `owner_is_active` for
-/// `_dot_update_lock_owner_is_active`, and `is_initializing` for
-/// `_dot_update_lock_is_initializing`. The `-e`/`-L`/`-d` probes
-/// read through `symlink_metadata` exactly like the shell
-/// conditionals (a symlink to a directory is unsafe, not clear).
+/// `_dot_update_lock_read_owner`, `owner_activity` for owner
+/// classification (active, stale, or unverifiable), and
+/// `is_initializing` for `_dot_update_lock_is_initializing`. The
+/// `-e`/`-L`/`-d` probes read through `symlink_metadata` exactly
+/// like the shell conditionals (a symlink to a directory is unsafe,
+/// not clear).
 pub fn check_update_lock(lock_dir: Option<&Path>) -> Vec<Record> {
     let mut out = vec![Record::section("Update lock")];
     let Some(dir) = lock_dir else {
@@ -242,17 +275,10 @@ pub fn check_update_lock(lock_dir: Option<&Path>) -> Vec<Record> {
         return out;
     }
     if let Some(owner) = crate::update_lock::read_owner(dir) {
-        if crate::update_lock::owner_is_active(&owner) {
-            out.push(Record::warn(
-                "update is currently running",
-                Some(format!("pid {}", owner.pid)),
-            ));
-        } else {
-            out.push(Record::warn(
-                "update lock owner is stale",
-                Some("the next mutating command will reclaim it".to_string()),
-            ));
-        }
+        out.push(lock_owner_record(
+            &owner,
+            crate::update_lock::owner_activity(&owner),
+        ));
     } else if crate::update_lock::is_initializing(dir) {
         out.push(Record::warn("update lock is being initialized", None));
     } else {
@@ -262,6 +288,30 @@ pub fn check_update_lock(lock_dir: Option<&Path>) -> Vec<Record> {
         ));
     }
     out
+}
+
+/// One merge-hook output declaration for freshness
+/// verification (handoff finding #8): the script and its
+/// `.outputs` sidecar arrive trust-validated from
+/// [`crate::doctor`]; the outputs arrive expanded to absolute
+/// paths. Freshness inputs are the script, the sidecar, and the
+/// identity-named family directory when one exists.
+pub struct MergeSpec {
+    /// Hook identity (the spec label doctor reports).
+    pub identity: String,
+    /// Hook script path (a freshness input).
+    pub script: String,
+    /// Outputs-declaration sidecar path, when one exists (a
+    /// freshness input).
+    pub sidecar: Option<String>,
+    /// Identity-named family directory, when one exists
+    /// (freshness inputs root).
+    pub family_dir: Option<String>,
+    /// Expanded absolute declared live outputs.
+    pub outputs: Vec<String>,
+    /// Declared outputs that are not absolute paths after
+    /// expansion (raw lines).
+    pub invalid: Vec<String>,
 }
 
 /// Inputs for [`check_merges`]: the extension boundary plus the
@@ -280,11 +330,147 @@ pub struct MergeInputs {
     /// spec listing stays shell-side (`merges` slice); only its
     /// count crosses here.
     pub spec_count: Option<usize>,
+    /// Per-hook output declarations for freshness verification.
+    /// Empty skips verification (the historical count-only
+    /// behavior); production always passes one entry per
+    /// inventoried hook.
+    pub specs: Vec<MergeSpec>,
+}
+
+/// Bounds for the family-directory walk below: a merge family is
+/// a handful of hook sources, so thousands of files or deep
+/// nesting means a pathological tree, not freshness inputs.
+const FAMILY_WALK_MAX_FILES: usize = 4096;
+/// Maximum descent below the family directory itself.
+const FAMILY_WALK_MAX_DEPTH: usize = 32;
+
+/// Newest mtime across a merge spec's freshness inputs: the
+/// hook script, its `.outputs` sidecar, and every regular file
+/// under the identity-named family directory (bounded by
+/// [`FAMILY_WALK_MAX_FILES`] files and [`FAMILY_WALK_MAX_DEPTH`]
+/// levels). Missing inputs are ignored; `None` means nothing was
+/// comparable.
+fn newest_input_mtime(spec: &MergeSpec) -> Option<std::time::SystemTime> {
+    newest_input_mtime_bounded(spec, FAMILY_WALK_MAX_FILES, FAMILY_WALK_MAX_DEPTH)
+}
+
+fn newest_input_mtime_bounded(
+    spec: &MergeSpec,
+    max_files: usize,
+    max_depth: usize,
+) -> Option<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut consider = |path: &Path| {
+        let mtime = std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok();
+        if let Some(mtime) = mtime {
+            if newest.is_none_or(|best| mtime > best) {
+                newest = Some(mtime);
+            }
+        }
+    };
+    consider(Path::new(&spec.script));
+    if let Some(sidecar) = spec.sidecar.as_deref() {
+        consider(Path::new(sidecar));
+    }
+    if let Some(dir) = spec.family_dir.as_deref() {
+        // Symlinks never descend (dirent types only), so no cycle
+        // risk; the file/depth budgets bound hostile breadth.
+        let mut stack = vec![(PathBuf::from(dir), 0usize)];
+        let mut files = 0usize;
+        while let Some((dir, depth)) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                if files >= max_files {
+                    break;
+                }
+                let path = entry.path();
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => {
+                        if depth < max_depth {
+                            stack.push((path, depth + 1));
+                        }
+                    }
+                    Ok(kind) if kind.is_file() => {
+                        files += 1;
+                        consider(&path);
+                    }
+                    _ => {}
+                }
+            }
+            if files >= max_files {
+                break;
+            }
+        }
+    }
+    newest
+}
+
+/// Verify one merge spec's declared live outputs: each must exist
+/// and be strictly newer than its newest input. Hooks without
+/// declarations skip (documented, not a failure); invalid
+/// declarations fail outright.
+fn verify_merge_outputs(spec: &MergeSpec) -> Vec<Record> {
+    let mut out = Vec::new();
+    for raw in &spec.invalid {
+        out.push(Record::fail(
+            "merge-hook output declaration is invalid",
+            Some(format!("{}: {raw}", spec.identity)),
+        ));
+    }
+    if !spec.invalid.is_empty() {
+        return out;
+    }
+    if spec.outputs.is_empty() {
+        out.push(Record::skip(
+            "merge-hook outputs are unverified",
+            Some(format!("{}: no declared outputs", spec.identity)),
+        ));
+        return out;
+    }
+    let Some(newest) = newest_input_mtime(spec) else {
+        out.push(Record::skip(
+            "merge-hook outputs are unverified",
+            Some(format!("{}: no inputs to compare", spec.identity)),
+        ));
+        return out;
+    };
+    let mut fresh = 0;
+    for output in &spec.outputs {
+        let mtime = std::fs::metadata(Path::new(output))
+            .and_then(|meta| meta.modified())
+            .ok();
+        match mtime {
+            None => out.push(Record::fail(
+                "merge-hook output is missing",
+                Some(format!("{}: {output}", spec.identity)),
+            )),
+            Some(mtime) if mtime <= newest => out.push(Record::fail(
+                "merge-hook output is stale",
+                Some(format!("{}: {output}", spec.identity)),
+            )),
+            Some(_) => fresh += 1,
+        }
+    }
+    if fresh == spec.outputs.len() {
+        out.push(Record::ok(
+            "merge-hook outputs are current",
+            Some(format!("{}: {fresh} output(s)", spec.identity)),
+        ));
+    }
+    out
 }
 
 /// `_dr_check_merges` (`doctor/merges.sh`): merge-hook extension
 /// discovery health. The `-e`/`-d`/`-L` root probes run in-process;
 /// the inventory count arrives via [`MergeInputs::spec_count`].
+/// Past discovery, each [`MergeInputs::specs`] entry verifies its
+/// declared live outputs (handoff finding #8 goes beyond the shell
+/// port, which counted specs only).
 pub fn check_merges(inputs: &MergeInputs) -> Vec<Record> {
     let mut out = vec![Record::section("Extensions")];
     if !inputs.enabled {
@@ -323,10 +509,53 @@ pub fn check_merges(inputs: &MergeInputs) -> Vec<Record> {
             "merge-hook extensions",
             Some(format!("{count} hook(s)")),
         ));
+        for spec in &inputs.specs {
+            out.extend(verify_merge_outputs(spec));
+        }
     } else {
         out.push(Record::skip(
             "merge-hook extensions",
             Some("none configured".to_string()),
+        ));
+    }
+    out
+}
+
+/// Inputs for [`check_cron_freshness`]: the cron last-success stamp
+/// plus the current clock, both epoch seconds.
+pub struct CronInputs {
+    /// Epoch of the last successful cron run, or `None` when no
+    /// successful run was ever recorded.
+    pub last_success: Option<i64>,
+    /// Current epoch seconds.
+    pub now: i64,
+}
+
+/// Cron convergence freshness (handoff finding #1): warns when the
+/// last successful cron run is older than
+/// [`crate::update_status::CRON_STALE_AFTER_SECS`]. Warn, not fail:
+/// a stale stamp usually self-heals on the next slot, and sleeping
+/// machines go stale with nothing broken. A missing stamp skips:
+/// fresh installs have never converged.
+pub fn check_cron_freshness(inputs: &CronInputs) -> Vec<Record> {
+    let mut out = vec![Record::section("Update")];
+    let Some(last) = inputs.last_success else {
+        out.push(Record::skip(
+            "cron update success is unknown",
+            Some("no successful cron update recorded".to_string()),
+        ));
+        return out;
+    };
+    let age = crate::update_status::format_age(inputs.now.saturating_sub(last));
+    if crate::update_status::is_stale(last, inputs.now) {
+        out.push(Record::warn(
+            "cron update has not succeeded recently",
+            Some(format!("last success {age} ago")),
+        ));
+    } else {
+        out.push(Record::ok(
+            "cron update succeeded recently",
+            Some(format!("{age} ago")),
         ));
     }
     out
@@ -903,6 +1132,11 @@ pub struct ProviderInputs<'a> {
     /// `_dot_shdeps_binary_abi_version` `REPLY` (`None` when the
     /// probe fails, which reports `<unavailable>`).
     pub actual_abi: Option<&'a str>,
+    /// Whether the provider accepts the behavioral cancellation capability
+    /// required by the native update coordinator.
+    pub cancellation_capability: bool,
+    /// Whether prompt FIFO readers are installed before prompt events.
+    pub prompt_handshake_capability: bool,
 }
 
 /// `_dr_check_provider` (`doctor/provider.sh`): the dependency
@@ -1063,7 +1297,8 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
     }
     let expected = inputs.expected_abi.unwrap_or("");
     let actual = inputs.actual_abi.unwrap_or("");
-    if !expected.is_empty() && actual == format!("abi:{expected}") {
+    let abi_matches = !expected.is_empty() && actual == format!("abi:{expected}");
+    if abi_matches {
         out.push(Record::ok("Shdeps provider ABI", Some(actual.to_string())));
     } else {
         let want = if expected.is_empty() {
@@ -1079,6 +1314,22 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
         out.push(Record::fail(
             "Shdeps provider ABI mismatch",
             Some(format!("expected abi:{want}, found {found}")),
+        ));
+    }
+    // Preserve the healthy shell-era report shape: the capability is a
+    // required predicate rather than another informational success row. A
+    // missing predicate must nevertheless prevent doctor from blessing a
+    // provider that `dot update` will reject.
+    if abi_matches && !inputs.cancellation_capability {
+        out.push(Record::fail(
+            "Shdeps provider cancellation capability is unavailable",
+            Some("run dot update to install the reviewed provider release".to_string()),
+        ));
+    }
+    if abi_matches && !inputs.prompt_handshake_capability {
+        out.push(Record::fail(
+            "Shdeps provider prompt handshake capability is unavailable",
+            Some("run dot update to install the reviewed provider release".to_string()),
         ));
     }
     out
@@ -1378,4 +1629,90 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::update_lock::OwnerActivity as Activity;
+
+    #[test]
+    fn lock_owner_rows_match_acquire_behavior() {
+        // Fresh-review-B B6: only the stale row may promise
+        // reclamation; `acquire` refuses on `Unknown`/`Interrupted`,
+        // so those rows must say refuse, never reclaim.
+        let owner = crate::update_lock::Owner {
+            pid: 4242,
+            start: "proc:99".to_string(),
+            token: "4242.0.0".to_string(),
+        };
+        let rendered = |activity| render(&[lock_owner_record(&owner, activity)]);
+        assert!(rendered(Activity::Active).contains("currently running"));
+        assert!(rendered(Activity::Active).contains("pid 4242"));
+        let stale = rendered(Activity::Stale);
+        assert!(stale.contains("owner is stale"));
+        assert!(stale.contains("will reclaim it"));
+        for activity in [Activity::Unknown, Activity::Interrupted] {
+            let row = rendered(activity);
+            assert!(row.contains("cannot be verified"));
+            assert!(row.contains("refuse"));
+            assert!(!row.contains("reclaim"));
+        }
+    }
+
+    #[test]
+    fn family_walk_honors_file_and_depth_budgets() {
+        // Fresh-review-A nit-11: the freshness walk must terminate on
+        // pathological trees. Tiny budgets pin both cutoffs without
+        // building a 4096-file fixture.
+        let scratch = dot_test_support::TempDir::new("doctor-family-bounds").expect("scratch");
+        let family = scratch.path().join("family");
+        std::fs::create_dir_all(family.join("sub/deep")).expect("family tree");
+        let old = family.join("old.txt");
+        let deep = family.join("sub/deep/new.txt");
+        std::fs::write(&old, b"old").expect("old input");
+        std::fs::write(&deep, b"new").expect("deep input");
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .expect("open old")
+            .set_modified(past)
+            .expect("age old");
+        let spec = MergeSpec {
+            identity: "bound".to_string(),
+            script: scratch
+                .path()
+                .join("missing.sh")
+                .to_string_lossy()
+                .into_owned(),
+            sidecar: None,
+            family_dir: Some(family.to_string_lossy().into_owned()),
+            outputs: Vec::new(),
+            invalid: Vec::new(),
+        };
+        // Unbounded: the deep file is newest.
+        let newest = newest_input_mtime_bounded(&spec, usize::MAX, usize::MAX).expect("newest");
+        assert_eq!(
+            newest,
+            std::fs::metadata(&deep)
+                .expect("deep meta")
+                .modified()
+                .expect("deep mtime")
+        );
+        // Depth 0 never descends: only the top-level old file counts
+        // (compared through a metadata read-back so timestamp
+        // truncation cannot perturb the pin).
+        let shallow = newest_input_mtime_bounded(&spec, usize::MAX, 0).expect("shallow");
+        assert_eq!(
+            shallow,
+            std::fs::metadata(&old)
+                .expect("old meta")
+                .modified()
+                .expect("old mtime")
+        );
+        // Zero file budget: nothing under the family counts (the
+        // script is missing, so no input is comparable at all).
+        assert_eq!(newest_input_mtime_bounded(&spec, 0, usize::MAX), None);
+    }
 }

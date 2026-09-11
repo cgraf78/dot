@@ -285,6 +285,7 @@ cat >"$host_git_home/.local/bin/git" <<'GIT'
 set -euo pipefail
 if [[ ! -f $HOME/.local/lib/dotfiles/launcher-real.sh ]]; then
   printf 'called without helper\n' >>"${DOT_TEST_GIT_WRAPPER_MARKER:?}"
+  printf '%s\n' "$*" >>"${DOT_TEST_GIT_WRAPPER_MARKER:?}.args"
 fi
 . "$HOME/.local/lib/dotfiles/launcher-real.sh"
 exec "${DOT_TEST_HOST_GIT:?}" "$@"
@@ -311,18 +312,20 @@ assert_contains 'phase=backing-up' \
   'failure fixture retained a resumable transaction'
 
 set +e
+host_git_resume_output=$(
 PATH="$host_git_home/.local/bin:$host_git_regular_bin:$PATH" \
   DOT_TEST_REAL_GIT=$system_git \
   DOT_TEST_HOST_GIT=$host_git_regular_bin/git \
   DOT_TEST_GIT_WRAPPER_MARKER=$host_git_marker \
   run_dot "$host_git_home" "$host_git_state" init --yes \
-  "file://$host_git_origin" >/dev/null 2>&1
+  "file://$host_git_origin" 2>&1
+)
 host_git_status=$?
 set -e
 assert_eq 0 "$host_git_status" \
-  'initialization resumes independently of a client Git wrapper'
+  "initialization resumes independently of a client Git wrapper: $host_git_resume_output"
 [[ ! -e $host_git_marker ]] ||
-  fail 'initialization executed the client Git wrapper after moving its helper'
+  fail "initialization executed the client Git wrapper after moving its helper: $(<"$host_git_marker.args")"
 assert_contains 'phase=complete' \
   "$(<"$host_git_state/dot/init/completed")" \
   'host Git initialization completed its durable transaction'

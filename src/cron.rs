@@ -33,16 +33,24 @@ pub const NO_CRONTAB_MESSAGE: &str = "  no crontab installed\n";
 /// dispatcher, an absolute fixture path in tests). Stdin is
 /// inherited and stderr nulled, matching the shell; stdout streams
 /// through even on failure, followed by [`NO_CRONTAB_MESSAGE`].
-/// Returns 0 on every path, like the dispatcher: listing failures
-/// are informational, never errors.
+/// A finished listing returns 0 (listing failures are
+/// informational, never errors), as do timeout and spawn failures
+/// (with the message); interruption reports `128 + signal`, an
+/// unverifiable cleanup reports `125`, and a capture-limit breach
+/// reports `1`.
 pub fn cron(program: &str, out: &mut dyn Write) -> i32 {
-    match Command::new(program)
+    let mut command = Command::new(program);
+    command
         .arg("-l")
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    {
+        .stderr(Stdio::null());
+    match crate::cleanup::run_session_output_typed(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    ) {
         Ok(output) => {
             let _ = out.write_all(&output.stdout);
             if !output.status.success() {
@@ -50,6 +58,11 @@ pub fn cron(program: &str, out: &mut dyn Write) -> i32 {
             }
             0
         }
+        Err(crate::cleanup::SessionOutputError::Interrupted(signal)) => 128 + signal,
+        Err(crate::cleanup::SessionOutputError::CleanupIncomplete) => {
+            crate::cleanup::CLEANUP_INCOMPLETE_STATUS
+        }
+        Err(crate::cleanup::SessionOutputError::CaptureLimit) => 1,
         Err(_) => {
             let _ = out.write_all(NO_CRONTAB_MESSAGE.as_bytes());
             0

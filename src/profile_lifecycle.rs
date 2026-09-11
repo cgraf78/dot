@@ -259,6 +259,9 @@ fn mkdir_private_all(path: &Path) -> bool {
         }
     }
     for dir in missing.iter().rev() {
+        if crate::cancellation::check().is_err() {
+            return false;
+        }
         if std::fs::create_dir(dir).is_err() {
             return false;
         }
@@ -275,6 +278,9 @@ fn mkdir_private_all(path: &Path) -> bool {
 fn mktemp_file(directory: &Path, prefix: &str) -> Option<PathBuf> {
     use std::io::Read as _;
     for _ in 0..16 {
+        if crate::cancellation::check().is_err() {
+            return None;
+        }
         let mut suffix = [0u8; 8];
         std::fs::File::open("/dev/urandom")
             .ok()
@@ -294,6 +300,13 @@ fn mktemp_file(directory: &Path, prefix: &str) -> Option<PathBuf> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteOutcome {
+    Committed,
+    Cancelled,
+    Failed,
+}
+
 /// `_dot_profile_lifecycle_write`: atomically replace the ledger
 /// with `version=1` plus `records`. A missing parent chain is
 /// created private (mode `0o700` per level), the body lands in a
@@ -303,39 +316,63 @@ fn mktemp_file(directory: &Path, prefix: &str) -> Option<PathBuf> {
 /// part; a bare filename fails closed where the shell would
 /// mistake the name for a directory.
 pub fn write(ledger: &Path, records: &[String], euid: u32) -> bool {
+    write_guarded(ledger, records, euid, || true) == WriteOutcome::Committed
+}
+
+/// Stage a ledger rewrite, then ask the caller whether the atomic rename is
+/// still allowed. Update cancellation is asynchronous, so sampling only before
+/// validation and file I/O leaves a large window in which interrupted state can
+/// become authoritative. The guard narrows that window to the same final
+/// rename boundary as the shell implementation.
+fn write_guarded(
+    ledger: &Path,
+    records: &[String],
+    euid: u32,
+    allow_publish: impl FnOnce() -> bool,
+) -> WriteOutcome {
     if ledger.as_os_str().is_empty() {
-        return false;
+        return WriteOutcome::Failed;
     }
     let directory = match ledger.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => return false,
+        _ => return WriteOutcome::Failed,
     };
     if std::fs::symlink_metadata(directory).is_err() && !mkdir_private_all(directory) {
-        return false;
+        return WriteOutcome::Failed;
     }
     if !crate::overlay_context::directory_safe(directory, euid) {
-        return false;
+        return WriteOutcome::Failed;
     }
     let Some(temporary) = mktemp_file(directory, ".profile-overlay-lifecycle") else {
-        return false;
+        return WriteOutcome::Failed;
     };
-    let failed = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
-        .is_err()
-        || {
+    if crate::cancellation::check().is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return WriteOutcome::Cancelled;
+    }
+    let staged =
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).is_ok() && {
             let mut body = Vec::from(b"version=1\n".as_slice());
             for record in records {
                 body.extend_from_slice(record.as_bytes());
                 body.push(b'\n');
             }
-            std::fs::write(&temporary, &body).is_err()
-        }
-        || std::fs::rename(&temporary, ledger).is_err();
-    if failed {
+            std::fs::write(&temporary, &body).is_ok()
+        };
+    if !staged {
         let _ = std::fs::remove_file(&temporary);
-        return false;
+        return WriteOutcome::Failed;
+    }
+    if crate::cancellation::check().is_err() || !allow_publish() {
+        let _ = std::fs::remove_file(&temporary);
+        return WriteOutcome::Cancelled;
+    }
+    if std::fs::rename(&temporary, ledger).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return WriteOutcome::Failed;
     }
     let _ = std::fs::remove_file(&temporary);
-    true
+    WriteOutcome::Committed
 }
 
 /// `_dot_profile_deactivation_script`: resolve the fixed
@@ -600,8 +637,19 @@ pub struct CommitInputs<'a> {
 /// warning (the shell bare `return 1`). The result is written
 /// back; `true` is shell exit 0.
 pub fn commit(inputs: &CommitInputs<'_>) -> bool {
+    commit_guarded(inputs, || true) == WriteOutcome::Committed
+}
+
+/// Commit lifecycle state only if the caller still permits publication at the
+/// final atomic rename boundary. This keeps ordinary lifecycle users on the
+/// shell-compatible boolean API while update cancellation can distinguish an
+/// interrupted publication from an I/O or trust failure.
+pub(crate) fn commit_guarded(
+    inputs: &CommitInputs<'_>,
+    allow_publish: impl FnOnce() -> bool,
+) -> WriteOutcome {
     if !inputs.present || !inputs.extensions_enabled {
-        return true;
+        return WriteOutcome::Committed;
     }
     let eligible: HashSet<&str> = inputs.eligible.iter().map(String::as_str).collect();
     let mut active: HashMap<&str, &str> = HashMap::new();
@@ -625,14 +673,14 @@ pub fn commit(inputs: &CommitInputs<'_>) -> bool {
         match deactivation_script(active[name], inputs.home, inputs.euid) {
             Ok(_) => committed.push(active[name].to_string()),
             Err(ScriptError::Missing) => (),
-            Err(ScriptError::Refused) => return false,
+            Err(ScriptError::Refused) => return WriteOutcome::Failed,
         }
     }
     let ledger = match inputs.ledger {
         Some(path) if !path.as_os_str().is_empty() => path,
-        _ => return false,
+        _ => return WriteOutcome::Failed,
     };
-    write(ledger, &committed, inputs.euid)
+    write_guarded(ledger, &committed, inputs.euid, allow_publish)
 }
 
 /// Inputs for [`run_one`]: the record to deactivate plus the
@@ -670,6 +718,9 @@ fn command_output(output: &[u8]) -> &[u8] {
 fn mktemp_dir(tmpdir: &Path) -> Option<PathBuf> {
     use std::io::Read as _;
     for _ in 0..16 {
+        if crate::cancellation::check().is_err() {
+            return None;
+        }
         let mut suffix = [0u8; 8];
         std::fs::File::open("/dev/urandom")
             .ok()
@@ -820,4 +871,73 @@ pub fn retire(
         }
     }
     failed
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::write_guarded;
+    use std::cell::Cell;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn cancellation_at_publish_boundary_preserves_prior_ledger() {
+        let fixture =
+            dot_test_support::TempDir::new("ledger-publish-cancel").expect("fixture directory");
+        let ledger = fixture.path().join("state/ledger");
+        std::fs::create_dir_all(ledger.parent().expect("ledger parent")).expect("state directory");
+        std::fs::set_permissions(
+            ledger.parent().expect("ledger parent"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private state directory");
+        std::fs::write(&ledger, b"version=1\nprior\n").expect("prior ledger");
+        let guard_called = Cell::new(false);
+        // SAFETY: geteuid has no preconditions or memory effects.
+        let euid = unsafe { libc::geteuid() };
+
+        assert_eq!(
+            write_guarded(&ledger, &[String::from("replacement")], euid, || {
+                guard_called.set(true);
+                assert_eq!(
+                    std::fs::read(&ledger).expect("unpublished prior ledger"),
+                    b"version=1\nprior\n"
+                );
+                let entries = std::fs::read_dir(ledger.parent().expect("ledger parent"))
+                    .expect("staged entries")
+                    .map(|entry| entry.expect("state entry").path())
+                    .collect::<Vec<_>>();
+                assert_eq!(entries.len(), 2, "publish guard did not run after staging");
+                let staged = entries
+                    .iter()
+                    .find(|path| *path != &ledger)
+                    .expect("staged ledger");
+                assert_eq!(
+                    std::fs::read(staged).expect("staged ledger body"),
+                    b"version=1\nreplacement\n"
+                );
+                assert_eq!(
+                    std::fs::metadata(staged)
+                        .expect("staged ledger metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+                false
+            },),
+            super::WriteOutcome::Cancelled
+        );
+        assert!(guard_called.get(), "publish guard was not called");
+        assert_eq!(
+            std::fs::read(&ledger).expect("retained ledger"),
+            b"version=1\nprior\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(ledger.parent().expect("ledger parent"))
+                .expect("state entries")
+                .count(),
+            1,
+            "cancelled staging file was not removed"
+        );
+    }
 }

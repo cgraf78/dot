@@ -195,7 +195,7 @@ chmod 0644 "$extensions/merge-hooks.d/10-cancellable.sh"
 HOME="$home" XDG_STATE_HOME="$state" XDG_CONFIG_HOME='' \
   "$root/bin/dot" update >"$home/cancellable.out" 2>"$home/cancellable.err" &
 cancellable_dot_pid=$!
-cancellable_deadline=$((SECONDS + 5))
+cancellable_deadline=$((SECONDS + 60))
 while ((SECONDS < cancellable_deadline)); do
   [[ -s $home/cancellable-hook.pid && -s $home/cancellable-child.pid ]] && break
   kill -0 "$cancellable_dot_pid" 2>/dev/null || break

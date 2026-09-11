@@ -2939,8 +2939,12 @@ fn should_skip(root: ClientRoot, relative: &Path) -> bool {
     let first = components.next();
     if matches!(root, ClientRoot::Home) {
         if let Some(Component::Normal(name)) = first {
+            // `.scm.sqlite` is SCM's async telemetry database: a lingering
+            // SCM helper may create it after Dot returns, so it is never
+            // converged content (same exclusion as `tests/update_run.rs`).
             if name == OsStr::new(".dotfiles")
                 || name == OsStr::new(".dot-backup")
+                || name == OsStr::new(".scm.sqlite")
                 || name.as_bytes().starts_with(b".dotfiles-overlay-")
             {
                 return true;

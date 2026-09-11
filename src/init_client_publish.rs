@@ -401,8 +401,8 @@ fn stage_claim_file(stage: &Path) -> PathBuf {
 /// broken pipe) is a publication refusal, exactly like the shell's
 /// `|| return 1` on the substitution.
 fn git_hash_stdin(input: &[u8], home: &Path, work_dir: &Path) -> Result<String> {
-    use std::io::Write as _;
-    let mut child = crate::init_client_identity::host_git_command()
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("hash-object")
         .arg("--stdin")
         .env("LC_ALL", "C")
@@ -410,20 +410,18 @@ fn git_hash_stdin(input: &[u8], home: &Path, work_dir: &Path) -> Result<String> 
         .current_dir(work_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| Error::Usage {
-            message: "cannot hash publish path",
-        })?;
-    let status_ok = child
-        .stdin
-        .take()
-        .map(|mut stdin| stdin.write_all(input).is_ok())
-        .unwrap_or(false);
-    let output = child.wait_with_output().map_err(|_| Error::Usage {
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output_with_input(
+        command,
+        input,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .map_err(|_| Error::Usage {
         message: "cannot hash publish path",
     })?;
-    if !status_ok || !output.status.success() {
+    if !output.status.success() {
         return Err(Error::Usage {
             message: "cannot hash publish path",
         });
@@ -445,7 +443,8 @@ fn git_hash_stdin(input: &[u8], home: &Path, work_dir: &Path) -> Result<String> 
 /// commands print nothing on success, and their diagnostics stay
 /// owned by the surrounding init orchestration.
 fn git_dir_run(git: &PublishGit<'_>, home: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = crate::init_client_identity::host_git_command()
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("--git-dir")
         .arg(git.git_dir)
         .args(args)
@@ -454,11 +453,16 @@ fn git_dir_run(git: &PublishGit<'_>, home: &Path, args: &[&str]) -> Result<Vec<u
         .current_dir(git.work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|_| Error::Usage {
-            message: "publish git sequence failed",
-        })?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .map_err(|_| Error::Usage {
+        message: "publish git sequence failed",
+    })?;
     if !output.status.success() {
         return Err(Error::Usage {
             message: "publish git sequence failed",
@@ -761,7 +765,7 @@ pub fn single_origin(scope: &OriginScope<'_>, home: &Path) -> Result<Vec<u8>> {
             command.arg("-C").arg(home);
         }
     }
-    let output = command
+    command
         .arg("config")
         .arg("--local")
         .arg("--get-all")
@@ -770,11 +774,16 @@ pub fn single_origin(scope: &OriginScope<'_>, home: &Path) -> Result<Vec<u8>> {
         .env("HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|_| Error::Usage {
-            message: "cannot read origin url",
-        })?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .map_err(|_| Error::Usage {
+        message: "cannot read origin url",
+    })?;
     if !output.status.success() {
         return Err(Error::Usage {
             message: "cannot read origin url",

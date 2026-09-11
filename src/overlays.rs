@@ -481,13 +481,21 @@ pub fn is_worktree(path: &Path) -> bool {
         Ok(canonical) => canonical,
         Err(_) => return false,
     };
-    let top = match crate::init_client_identity::host_git_command()
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("-C")
         .arg(path)
         .arg("rev-parse")
-        .arg("--show-toplevel")
-        .output()
-    {
+        .arg("--show-toplevel");
+    let top = match crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    ) {
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
             .trim_end()
             .to_string(),
@@ -526,13 +534,22 @@ pub fn effective_url(url: &str, home: &str) -> String {
 /// match, or the `<missing>` / `<multiple origin URLs>`
 /// diagnostic the shell stores in `REPLY`.
 pub fn origin_matches(path: &Path, expected: &str) -> Result<String, String> {
-    let output = crate::init_client_identity::host_git_command()
+    if crate::cancellation::check().is_err() {
+        return Err("<interrupted>".to_string());
+    }
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("-C")
         .arg(path)
         .arg("config")
         .arg("--get-all")
-        .arg("remote.origin.url")
-        .output();
+        .arg("remote.origin.url");
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    );
     let mut urls: Vec<String> = Vec::new();
     if let Ok(output) = output {
         let text = String::from_utf8_lossy(&output.stdout);

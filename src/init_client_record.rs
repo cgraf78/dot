@@ -251,16 +251,16 @@ fn branch_valid(branch: &[u8]) -> bool {
     if branch.is_empty() {
         return false;
     }
-    crate::init_client_identity::host_git_command()
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("check-ref-format")
         .arg("--branch")
         .arg(std::ffi::OsStr::from_bytes(branch))
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .stderr(Stdio::null());
+    crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Strict) == 0
 }
 
 /// The source revision from the shared checkout-or-release identity resolver.
@@ -332,6 +332,7 @@ pub fn write_record(
         body.extend_from_slice(value);
         body.push(b'\n');
     }
+    crate::cancellation::check_mutation()?;
     if let Err(source) = std::fs::write(&temporary, &body) {
         let _ = std::fs::remove_file(&temporary);
         return Err(Error::Io {
