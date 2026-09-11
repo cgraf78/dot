@@ -141,8 +141,10 @@ assert_contains 'attestations: write' "$release_workflow" \
 test_workflow=$(cat "$DOT_TEST_ROOT/.github/workflows/test.yml")
 rust_job=$(sed -n '/^  rust:/,/^  shell:/p' "$DOT_TEST_ROOT/.github/workflows/test.yml")
 shell_job=$(sed -n '/^  shell:/,/^  shdeps-lock:/p' "$DOT_TEST_ROOT/.github/workflows/test.yml")
-assert_contains $'test-command: |\n        cargo test --locked\n        rustfmt --check support/performance-command-supervisor.rs tests/support/performance-supervisor-fixture.rs\n        bash tests/run\n        bash tests/release-scripts-test' \
+assert_contains $'test-command: |\n        cargo test --locked\n        bash tests/run\n        bash tests/release-scripts-test' \
   "$rust_job" 'Rust CI runs build-dependent release coverage without wall-clock tests'
+assert_contains $'fmt-command: |\n        cargo fmt --check\n        rustfmt --check support/performance-command-supervisor.rs tests/support/performance-supervisor-fixture.rs' \
+  "$rust_job" 'Rust quality gate formats the supervisor sources outside Cargo targets'
 assert_contains 'test-command: bash tests/library-test' "$shell_job" \
   'shell CI runs sourceable public-library acceptance without a Rust toolchain'
 if [[ $shell_job == *'tests/run'* || $shell_job == *'tests/release-scripts-test'* ]]; then
