@@ -455,7 +455,7 @@ mod tests {
             0
         );
         // SAFETY: successful openpty returned uniquely owned descriptors.
-        let _master = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
+        let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
         let slave = unsafe { std::fs::File::from_raw_fd(slave) };
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
@@ -492,6 +492,33 @@ mod tests {
         let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while !ready.exists() && std::time::Instant::now() < ready_deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            // TEMP-DIAG-180: remove with the recvmsg diag. Drain the
+            // helper's PTY output so macOS CI shows whether the helper
+            // panicked or sudo rejected the foreground check.
+            use std::os::fd::AsRawFd as _;
+            let master_fd = master.as_raw_fd();
+            let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+            if flags >= 0 {
+                unsafe {
+                    libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+            let mut output = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let count =
+                    unsafe { libc::read(master_fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+                if count <= 0 || output.len() > 65536 {
+                    break;
+                }
+                output.extend_from_slice(&chunk[..count as usize]);
+            }
+            eprintln!(
+                "TEMP-DIAG-180: sudo-pty helper output: {:?}",
+                String::from_utf8_lossy(&output)
+            );
         }
         assert!(
             ready.exists(),

@@ -3702,6 +3702,12 @@ impl NestedControlWorker {
                                 links.clear();
                                 break;
                             }
+                            // TEMP-DIAG-180: remove with the recvmsg diag.
+                            eprintln!(
+                                "TEMP-DIAG-180: nested-control link insert: {} fd={}",
+                                registration.boundary,
+                                std::os::fd::AsRawFd::as_raw_fd(&registration.link),
+                            );
                             links.insert(
                                 registration.boundary,
                                 (registration.pid, registration.link),
@@ -3727,7 +3733,14 @@ impl NestedControlWorker {
                     match link.read(&mut byte) {
                         Ok(0) => {
                             // TEMP-DIAG-180: remove with the recvmsg diag.
-                            eprintln!("TEMP-DIAG-180: nested-control link EOF: {boundary}");
+                            // A confirmatory read distinguishes a real peer
+                            // close from a spurious first read.
+                            let mut confirm_byte = [0u8; 1];
+                            let confirm = link.read(&mut confirm_byte);
+                            eprintln!(
+                                "TEMP-DIAG-180: nested-control link EOF: {boundary} fd={} confirm={confirm:?}",
+                                std::os::fd::AsRawFd::as_raw_fd(link),
+                            );
                             closed.push(boundary.clone())
                         }
                         Ok(_) => {
@@ -6448,6 +6461,13 @@ impl Session {
     }
 
     fn note_survivors(&mut self) {
+        if self.authority_error.is_some() {
+            // The refusal already explains the outcome: delivery was never
+            // attempted, so no bounded SIGKILL ran and claiming survivors
+            // would both misdescribe the run and suppress the refusal into
+            // CleanupIncomplete instead of surfacing it as the call's error.
+            return;
+        }
         let current_live = self.current.values().any(|process| process.live);
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let retained_live = self.members.values().any(|member| member.process.live);
@@ -10566,6 +10586,53 @@ int kill(pid_t pid, int sig) {
         let tick_error = std::io::Error::other("drain failed");
         let error = merge_authority_errors(&mut sessions, Err(tick_error)).unwrap_err();
         assert_eq!(error.to_string(), "drain failed");
+    }
+
+    #[test]
+    fn authority_refusal_suppresses_survivor_error() {
+        // A refusal means delivery was never attempted, so survivor
+        // accounting must not record a second error that would suppress
+        // the refusal into CleanupIncomplete.
+        let mut session = Session::new(11);
+        session.current.insert(
+            12,
+            ProcessInfo {
+                pid: 12,
+                parent: 11,
+                group: 99,
+                session: 11,
+                live: true,
+                identity: ProcessIdentity {
+                    pid: 12,
+                    start: None,
+                },
+            },
+        );
+        session.authority_error = Some(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "safe descendant delivery has no stable process authority",
+        ));
+        session.note_survivors();
+        assert!(session.error.is_none());
+        assert!(session.authority_error.is_some());
+        // Without a refusal, live survivors still record.
+        let mut plain = Session::new(11);
+        plain.current.insert(
+            12,
+            ProcessInfo {
+                pid: 12,
+                parent: 11,
+                group: 99,
+                session: 11,
+                live: true,
+                identity: ProcessIdentity {
+                    pid: 12,
+                    start: None,
+                },
+            },
+        );
+        plain.note_survivors();
+        assert!(plain.error.is_some());
     }
 
     #[test]
