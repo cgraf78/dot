@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@850305d507a2def2ec27fc1fc11e0705695bf2b4
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@b750c292f00e079c2270df0d8f4c8bdaf43e0356
     with:
       # rust-version is a compatibility promise, so exercise it inside the
       # shared required gate instead of leaving it aspirational. The shared
