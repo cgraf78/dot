@@ -684,14 +684,25 @@ perf_require_config_free_cwd() {
 perf_process_start_tick() {
   local pid=$1 line rest
 
-  [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/stat ]] || return 1
-  IFS= read -r line <"/proc/$pid/stat" || return 1
-  rest=${line##*) }
-  [[ $rest != "$line" ]] || return 1
-  # shellcheck disable=SC2086  # Kernel stat fields are intentionally tokenized.
-  set -- $rest
-  [[ $# -ge 20 && ${20} =~ ^[0-9]+$ ]] || return 1
-  printf '%s\n' "${20}"
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  if [[ -r /proc/$pid/stat ]]; then
+    IFS= read -r line <"/proc/$pid/stat" || return 1
+    rest=${line##*) }
+    [[ $rest != "$line" ]] || return 1
+    # shellcheck disable=SC2086  # Kernel stat fields are intentionally tokenized.
+    set -- $rest
+    [[ $# -ge 20 && ${20} =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${20}"
+    return 0
+  fi
+  # No procfs (macOS): fall back to the `ps` start timestamp. `ps`
+  # prints one `lstart` line per live PID; an unknown or reaped PID
+  # prints nothing, which fails closed like the procfs path.
+  command -v ps >/dev/null 2>&1 || return 1
+  line=$(ps -o lstart= -p "$pid" 2>/dev/null) || return 1
+  line=${line#"${line%%[![:space:]]*}"}
+  [[ -n $line ]] || return 1
+  printf '%s\n' "$line"
 }
 
 perf_process_identity_matches() {
