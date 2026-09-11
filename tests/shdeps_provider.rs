@@ -81,13 +81,19 @@ fn isolated_tool_path() -> std::ffi::OsString {
 
 #[test]
 fn isolated_tool_path_resolves_engine_os_tools() {
-    // The engine shells out to PATH-resolved `ps` (update-lock identity)
-    // and `mv` (atomic moves). If the closed PATH stops resolving them,
+    // The engine shells out to PATH-resolved `mv` (atomic moves) and,
+    // where the kernel offers no procfs fallback, `ps` (update-lock
+    // identity). If the closed PATH stops resolving them, the
     // provider-boundary tests fail with a bare exit status instead of a
     // clear message — pin the resolution directly. (On macOS both live
-    // in /bin, outside every bash/git home.)
+    // in /bin, outside every bash/git home; minimal Linux images omit
+    // procps and the engine reads /proc instead.)
     let path = isolated_tool_path();
-    for name in ["bash", "git", "ps", "mv"] {
+    let mut names = vec!["bash", "git", "mv"];
+    if !Path::new("/proc").is_dir() {
+        names.push("ps");
+    }
+    for name in names {
         let found = std::env::split_paths(&path).any(|directory| {
             let candidate = directory.join(name);
             candidate.is_file()
