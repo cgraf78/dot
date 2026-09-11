@@ -17,6 +17,9 @@ program	lib/dot/public/hook-runtime-v1/repos/overlays.sh
 program	lib/dot/public/hook-runtime-v1/temp.sh
 program	lib/dot/public/hook-runtime-v1/worker.sh
 program	lib/dot/public/test-reporter-v1
+# sh/python polyglot (`":"""` entry): ShellCheck cannot parse the Python
+# body, so the file is inventoried but excluded from linting.
+fixture	lib/dot/public/test-timeout-v1
 program	lib/dot/public/ui.sh
 program	lib/dot/public/xdg.sh
 program	scripts/benchmark-port.sh

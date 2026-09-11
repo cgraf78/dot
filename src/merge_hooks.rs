@@ -223,6 +223,15 @@ fn jq_valid(dst: &Path) -> Result<bool, Error> {
             context: "jq validation cleanup incomplete",
             source: std::io::Error::other("could not verify jq subprocess cleanup"),
         }),
+        Err(crate::cleanup::SessionOutputError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            // Shell parity: a missing `jq` binary fails the `jq empty`
+            // probe like corrupt JSON, so the caller takes the
+            // warn-and-rebuild path (which then degrades to warn-and-skip
+            // in run_jq) instead of failing the whole layer.
+            Ok(false)
+        }
         Err(crate::cleanup::SessionOutputError::Io(error)) => Err(Error::Io {
             context: "run jq validation",
             source: error,

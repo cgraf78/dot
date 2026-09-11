@@ -30,8 +30,11 @@ jobs:
         bash tests/release-scripts-test
       # Native integration tests retain the public Python timeout helper as an
       # external-suite compatibility boundary. Minimal Rust images do not
-      # otherwise install its interpreter.
-      profiles: python
+      # otherwise install its interpreter. The process-supervision tests
+      # shell out to `ps` (portable snapshot fallback, start-identity
+      # probe) and the hook-merge tests validate through `jq`; install
+      # both so every platform exercises the strict path.
+      profiles: python,procps,jq
       # User-authored hooks retain a versioned Bash 4+ API. A brewed Bash lands
       # on the default macOS PATH; the native engine itself has no shell
       # interpreter dependency.
