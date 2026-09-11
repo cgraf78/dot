@@ -10,7 +10,10 @@ if [[ -n $(find "$root/lib/dot" -mindepth 1 -maxdepth 1 \
   exit 1
 fi
 
-if rg -n '"lib/dot/(main|runtime|commands|update|extension-worker)\.sh"|env\("DOT_BASH"|var(_os)?\("DOT_BASH"' \
+# CI runners do not provide ripgrep; plain grep is equivalent here because the
+# match only gates on the exit status and the scanned trees hold no hidden or
+# git-ignored source that grep would additionally cover.
+if grep -rnE '"lib/dot/(main|runtime|commands|update|extension-worker)\.sh"|env\("DOT_BASH"|var(_os)?\("DOT_BASH"' \
   "$root/src" "$root/bin"; then
   printf 'no-private-engine-test: native production path retains a shell fallback\n' >&2
   exit 1
@@ -19,7 +22,7 @@ fi
 # Core engine helpers must not recover simple Unix process state by spawning a
 # shell. Shell remains an intentional boundary for user hooks and the shdeps
 # bootstrap, but umask and lock-owner liveness are native OS operations.
-if rg -n 'Command::new\("sh"\)|std::process::Command::new\("sh"\)' \
+if grep -rnE 'Command::new\("sh"\)|std::process::Command::new\("sh"\)' \
   "$root/src/temp.rs" "$root/src/update_lock.rs"; then
   printf 'no-private-engine-test: core engine still spawns a shell\n' >&2
   exit 1
