@@ -2674,20 +2674,18 @@ fn process_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
     let mut command = Command::new("/system/bin/ps");
     #[cfg(not(target_os = "android"))]
     let mut command = Command::new("/bin/ps");
+    // macOS ps rejects the Linux group/session keywords: it prints the
+    // columns it knows and exits nonzero, so request only the portable
+    // columns there and resolve group/session per PID below.
+    #[cfg(target_os = "macos")]
+    command.args(["-A", "-o", "pid=,ppid=,stat="]);
+    #[cfg(not(target_os = "macos"))]
     command.args(["-A", "-o", "pid=,ppid=,pgid=,sid=,stat="]);
     let bytes = snapshot(command, deadline)?;
-    let processes = match parse_ps_snapshot(&bytes) {
-        Some(processes) => processes,
-        None => {
-            #[cfg(test)]
-            eprintln!(
-                "SNAPSHOT_PROBE stage=parse-none bytes={} sample={:?}",
-                bytes.len(),
-                String::from_utf8_lossy(&bytes[..bytes.len().min(300)])
-            );
-            return None;
-        }
-    };
+    #[cfg(target_os = "macos")]
+    let processes = parse_macos_ps_snapshot(&bytes)?;
+    #[cfg(not(target_os = "macos"))]
+    let processes = parse_ps_snapshot(&bytes)?;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // `ps` supplies an atomic topology row but no start generation. Read
@@ -2713,6 +2711,58 @@ fn process_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
         Some(validated)
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    Some(processes)
+}
+
+/// Parse the macOS `ps` columns and resolve group/session per PID.
+///
+/// macOS `ps` has no numeric session/group keywords, so the snapshot
+/// requests only PID/PPID/state and reads the rest through getpgid/getsid.
+/// A PID that exits between the listing and the query is unrelated churn;
+/// any other query failure fails the whole snapshot closed. PID 0 (the
+/// kernel scheduler) is skipped: querying it would alias the caller.
+#[cfg(target_os = "macos")]
+fn parse_macos_ps_snapshot(bytes: &[u8]) -> Option<Vec<ProcessInfo>> {
+    let mut processes = Vec::new();
+    for bytes in bytes.split(|byte| *byte == b'\n') {
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let line = std::str::from_utf8(bytes).ok()?;
+        let mut fields = line.split_whitespace();
+        let pid = fields.next()?.parse::<u32>().ok()?;
+        let parent = fields.next()?.parse::<u32>().ok()?;
+        let state = fields.next()?;
+        if fields.next().is_some() {
+            return None;
+        }
+        if pid == 0 {
+            continue;
+        }
+        // SAFETY: getpgid/getsid take a PID and no pointers.
+        let group = unsafe { libc::getpgid(pid as libc::pid_t) };
+        if group < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return None;
+        }
+        let session = unsafe { libc::getsid(pid as libc::pid_t) };
+        if session < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return None;
+        }
+        processes.push(ProcessInfo {
+            pid,
+            parent,
+            group: group as u32,
+            session: session as u32,
+            live: !state.starts_with('Z'),
+            identity: ProcessIdentity { pid, start: None },
+        });
+    }
     Some(processes)
 }
 
@@ -3061,24 +3111,14 @@ impl OwnedMember {
 
 /// Capture a portable process snapshot without a blocking pipe reader thread.
 fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
-    // TEMPORARY macOS CI probe (removed once the snapshot-None root cause
-    // is identified): stage tracing for each snapshot failure mode.
     if Instant::now() >= deadline {
-        #[cfg(test)]
-        eprintln!("SNAPSHOT_PROBE stage=expired");
         return None;
     }
     let (reader, writer) = match internal_stream_pair() {
         Ok(pair) => pair,
-        Err(_error) => {
-            #[cfg(test)]
-            eprintln!("SNAPSHOT_PROBE stage=pair-err error={_error:?}");
-            return None;
-        }
+        Err(_) => return None,
     };
-    if let Err(_error) = reader.set_nonblocking(true) {
-        #[cfg(test)]
-        eprintln!("SNAPSHOT_PROBE stage=nonblock-err error={_error:?}");
+    if reader.set_nonblocking(true).is_err() {
         return None;
     }
     // The fallback helper participates in the same launch generation as
@@ -3096,11 +3136,7 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
         .spawn()
     {
         Ok(child) => child,
-        Err(_error) => {
-            #[cfg(test)]
-            eprintln!("SNAPSHOT_PROBE stage=spawn-err error={_error:?}");
-            return None;
-        }
+        Err(_) => return None,
     };
     let _registration = StatusChildRegistration::new(child.id());
     drop(fork_registration);
@@ -3113,8 +3149,6 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     use std::io::Read as _;
     loop {
         if Instant::now() >= deadline {
-            #[cfg(test)]
-            eprintln!("SNAPSHOT_PROBE stage=read-timeout bytes={}", bytes.len());
             let _ = child.kill();
             let _ = wait_child_until(&mut child, cleanup_deadline());
             return None;
@@ -3126,9 +3160,7 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(_error) => {
-                #[cfg(test)]
-                eprintln!("SNAPSHOT_PROBE stage=read-err error={_error:?}");
+            Err(_) => {
                 let _ = child.kill();
                 let _ = wait_child_until(&mut child, cleanup_deadline());
                 return None;
@@ -3138,20 +3170,9 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     // EOF is independent of process exit: a helper may close stdout early.
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                #[cfg(test)]
-                eprintln!(
-                    "SNAPSHOT_PROBE stage=exit success={} bytes={} sample={:?}",
-                    status.success(),
-                    bytes.len(),
-                    String::from_utf8_lossy(&bytes[..bytes.len().min(120)])
-                );
-                return status.success().then_some(bytes);
-            }
+            Ok(Some(status)) => return status.success().then_some(bytes),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             _ => {
-                #[cfg(test)]
-                eprintln!("SNAPSHOT_PROBE stage=wait-timeout bytes={}", bytes.len());
                 let _ = child.kill();
                 let _ = wait_child_until(&mut child, cleanup_deadline());
                 return None;
@@ -6666,6 +6687,14 @@ if child == 0:
         os._exit(0)
     os._exit(0)
 os.waitpid(child, 0)
+while True:
+    try:
+        pid = open(sys.argv[1], encoding="ascii").read().strip()
+        stat = open(f"/proc/{pid}/stat", encoding="ascii").read()
+    except (FileNotFoundError, ValueError):
+        continue
+    if ") Z " in stat:
+        break
 os._exit(0)
 "#;
         let mut command = Command::new("/usr/bin/python3");
@@ -8484,6 +8513,25 @@ os._exit(0)
         );
     }
 
+    /// Snapshot one process's fd table for lease-proof failure messages.
+    /// CI-only mismatches without a local reproduction need the observed
+    /// link targets, not just the boolean verdict.
+    #[cfg(target_os = "linux")]
+    fn lease_debug_fd_targets(pid: u32) -> Vec<String> {
+        let mut targets = Vec::new();
+        if let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+            for entry in dir.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let target = std::fs::read_link(entry.path())
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+                targets.push(format!("{name}->{target}"));
+            }
+        }
+        targets.sort();
+        targets
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn session_lease_proof_distinguishes_an_inheriting_child() {
@@ -8546,7 +8594,11 @@ os._exit(0)
         .unwrap();
         assert!(
             !process_holds_session_lease(plain.child.id(), inode),
-            "a child without the lease descriptor matched the lease proof"
+            "a child without the lease descriptor matched the lease proof: pid {} fds {:?} lease socket:[{}] writer fd {}",
+            plain.child.id(),
+            lease_debug_fd_targets(plain.child.id()),
+            inode,
+            writer_fd,
         );
         assert!(
             !process_holds_session_lease(u32::MAX - 7, inode),
