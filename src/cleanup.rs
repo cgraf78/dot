@@ -1138,12 +1138,12 @@ static FORCE_FALLBACK_PROCESS_INFO_UNAVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
-fn reset_global_process_snapshot_calls() {
+pub(crate) fn reset_global_process_snapshot_calls() {
     GLOBAL_PROCESS_SNAPSHOT_CALLS.with(|calls| calls.set(0));
 }
 
 #[cfg(test)]
-fn global_process_snapshot_calls() -> usize {
+pub(crate) fn global_process_snapshot_calls() -> usize {
     GLOBAL_PROCESS_SNAPSHOT_CALLS.with(std::cell::Cell::get)
 }
 

@@ -1288,7 +1288,9 @@ fn run_mv(mv_bin: &Path, flags: &[&str], source: &Path, target: &Path) -> bool {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Strict) == 0
+    // Plain file move, no descendants: Detach skips the host-wide completion
+    // scan; cancellation still takes the strict path.
+    crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Detach) == 0
 }
 
 /// Identity of a path for move verification: plain `stat` (never
@@ -1383,11 +1385,13 @@ pub fn mkdir_forwarded(path: &Path, warnings: &mut dyn std::io::Write) -> bool {
     }
     let mut command = std::process::Command::new("mkdir");
     command.arg("-p").arg(path);
+    // Plain mkdir leaf, no descendants: Detach skips the host-wide completion
+    // scan; cancellation still takes the strict path.
     match crate::cleanup::run_session_output(
         command,
         None,
         crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
-        crate::cleanup::LingerPolicy::Strict,
+        crate::cleanup::LingerPolicy::Detach,
     ) {
         Ok(output) => {
             if !output.status.success() {
@@ -2068,4 +2072,42 @@ pub fn apply_git_metadata_modes(root: &Path, mask: u32) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dot_test_support::TempDir;
+
+    #[test]
+    fn leaf_mkdir_runs_without_host_process_snapshot() {
+        let dir = TempDir::new("leaf-mkdir-no-scan").expect("scratch");
+        let target = dir.path().join("nested/dir");
+        let mut warnings = Vec::new();
+        crate::cleanup::reset_global_process_snapshot_calls();
+        assert!(mkdir_forwarded(&target, &mut warnings));
+        assert!(target.is_dir());
+        assert_eq!(
+            crate::cleanup::global_process_snapshot_calls(),
+            0,
+            "deterministic mkdir leaf must not pay a host-wide /proc walk"
+        );
+    }
+
+    #[test]
+    fn leaf_move_runs_without_host_process_snapshot() {
+        let mv = resolve_mv().expect("test requires mv on PATH");
+        let dir = TempDir::new("leaf-move-no-scan").expect("scratch");
+        let source = dir.path().join("source.txt");
+        let target = dir.path().join("target.txt");
+        std::fs::write(&source, b"leaf").expect("fixture");
+        crate::cleanup::reset_global_process_snapshot_calls();
+        assert!(run_mv(&mv, &[], &source, &target));
+        assert!(target.is_file());
+        assert_eq!(
+            crate::cleanup::global_process_snapshot_calls(),
+            0,
+            "deterministic leaf move must not pay a host-wide /proc walk"
+        );
+    }
 }

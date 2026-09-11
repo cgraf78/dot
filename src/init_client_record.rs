@@ -260,7 +260,9 @@ fn branch_valid(branch: &[u8]) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Strict) == 0
+    // Pure ref-format validation, no repo access: Detach skips the host-wide
+    // completion scan; cancellation still takes the strict path.
+    crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Detach) == 0
 }
 
 /// The source revision from the shared checkout-or-release identity resolver.
@@ -768,4 +770,20 @@ pub fn prior_record(prior: &Path, wanted: &str) -> Result<PriorEntry> {
     Err(Error::Usage {
         message: "prior snapshot has no such path",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_check_runs_without_host_process_snapshot() {
+        crate::cleanup::reset_global_process_snapshot_calls();
+        assert!(branch_valid(b"main"));
+        assert_eq!(
+            crate::cleanup::global_process_snapshot_calls(),
+            0,
+            "pure ref-format check must not pay a host-wide /proc walk"
+        );
+    }
 }

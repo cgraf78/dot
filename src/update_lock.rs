@@ -305,7 +305,9 @@ fn process_start_ps_typed(pid: u32) -> std::result::Result<Option<String>, Probe
         command,
         None,
         crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
-        crate::cleanup::LingerPolicy::Strict,
+        // Single-pid ps probe, no descendants: Detach skips the host-wide
+        // completion scan; cancellation still takes the strict path.
+        crate::cleanup::LingerPolicy::Detach,
     )
     .map_err(|error| match error {
         crate::cleanup::SessionOutputError::Interrupted(_) => ProbeFailure::Interrupted,
@@ -767,6 +769,18 @@ pub fn acquire(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn start_probe_runs_without_host_process_snapshot() {
+        crate::cleanup::reset_global_process_snapshot_calls();
+        let probe = process_start_ps_typed(std::process::id());
+        assert!(probe.ok().flatten().is_some());
+        assert_eq!(
+            crate::cleanup::global_process_snapshot_calls(),
+            0,
+            "single-pid ps probe must not pay a host-wide /proc walk"
+        );
+    }
 
     fn test_log() -> Log {
         Log::new(false, false)
