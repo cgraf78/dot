@@ -4647,13 +4647,18 @@ EOF
 chmod +x "$provider_bin/shdeps"
 PERF_MKDIR=$(command -v mkdir) PERF_CP=$(command -v cp)
 PERF_CHMOD=$(command -v chmod) PERF_GIT=$(command -v git)
-export PERF_MKDIR PERF_CP PERF_CHMOD PERF_GIT
+PERF_LN=$(command -v ln)
+export PERF_MKDIR PERF_CP PERF_CHMOD PERF_GIT PERF_LN
 perf_prepare_provider_run_root "$provider_sealed" "$provider_bin/shdeps" \
   "$provider_run" "$provider_head" ||
   fail 'provider run-root setup fails on a sealed-like root'
 [[ -x $provider_run/target/release/shdeps ]] ||
   fail 'run-root lacks executable release binary'
 [[ -x $provider_run/shdeps ]] || fail 'run-root lacks shdeps entry point'
+[[ $provider_run/target/release/shdeps -ef $provider_bin/shdeps ]] ||
+  fail 'staged binary is not the pinned executable'
+[[ $provider_run/shdeps -ef $provider_bin/shdeps ]] ||
+  fail 'staged entry point is not the pinned executable'
 [[ $(git -C "$provider_run" rev-parse HEAD) == "$provider_head" ]] ||
   fail 'run-root identity mismatch'
 "$provider_run/target/release/shdeps" version | grep -q "$provider_short" ||
