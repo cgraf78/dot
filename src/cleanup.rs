@@ -3189,10 +3189,15 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     // TEMP-DIAG-180: remove with the recvmsg diag. Identifies which
     // snapshot stage fails on macOS (every probe session currently burns
     // its full teardown budget and reports "could not verify").
-    if Instant::now() >= deadline {
+    let entered = Instant::now();
+    if entered >= deadline {
         eprintln!("TEMP-DIAG-180: snapshot: deadline already passed at entry");
         return None;
     }
+    eprintln!(
+        "TEMP-DIAG-180: snapshot: entry with {}ms remaining",
+        deadline.saturating_duration_since(entered).as_millis()
+    );
     let (reader, writer) = match internal_stream_pair() {
         Ok(pair) => pair,
         Err(error) => {
@@ -3227,6 +3232,8 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     let _registration = StatusChildRegistration::new(child.id());
     drop(fork_registration);
     drop(launch);
+    // TEMP-DIAG-180: remove with the recvmsg diag.
+    let spawned = Instant::now();
     // Command retains configured descriptors after spawn; release our writer
     // so child EOF is observable instead of timing out every valid snapshot.
     drop(command);
@@ -3236,8 +3243,9 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     loop {
         if Instant::now() >= deadline {
             eprintln!(
-                "TEMP-DIAG-180: snapshot: read deadline passed with {} bytes",
-                bytes.len()
+                "TEMP-DIAG-180: snapshot: read deadline passed with {} bytes after {}ms",
+                bytes.len(),
+                entered.elapsed().as_millis()
             );
             let _ = child.kill();
             let _ = wait_child_until(&mut child, cleanup_deadline());
@@ -3246,7 +3254,15 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
         let mut chunk = [0; 8192];
         match reader.read(&mut chunk) {
             Ok(0) => break,
-            Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+            Ok(count) => {
+                if bytes.is_empty() {
+                    eprintln!(
+                        "TEMP-DIAG-180: snapshot: first byte after {}ms",
+                        spawned.elapsed().as_millis()
+                    );
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
