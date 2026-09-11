@@ -498,7 +498,7 @@ perf_cleanup() {
   [[ -n ${PERF_RUN_SCRATCH:-} ]] || return 0
   case ${PERF_RUN_SCRATCH:-} in
     "${PERF_SCRATCH_PARENT:-}"/dot-performance.*)
-      "$PERF_CHMOD" -R u+w -- "$PERF_RUN_SCRATCH" 2>/dev/null || :
+      "$PERF_CHMOD" -R u+w "$PERF_RUN_SCRATCH" 2>/dev/null || :
       "$PERF_RM" -rf -- "$PERF_RUN_SCRATCH"
       ;;
     *)
@@ -899,7 +899,10 @@ perf_seal_source_snapshot() {
   }
   tree=$REPLY_TREE
   status_blob=$REPLY_STATUS_BLOB
-  "$PERF_CHMOD" -R a-w -- "$root" || return 1
+  # No `--`: BSD chmod parses the mode first, so a `--` after it is treated
+  # as a filename and fails the seal on macOS. Sealed roots are absolute
+  # scratch paths, never dash-leading, so the guard is unnecessary.
+  "$PERF_CHMOD" -R a-w "$root" || return 1
   perf_source_state "$root" || return 1
   [[ $REPLY_SHA == "$expected_commit" && $REPLY_TREE == "$tree" \
     && $REPLY_STATUS_BLOB == "$status_blob" && $REPLY_DIRTY == false ]] || {
@@ -938,7 +941,7 @@ perf_prepare_provider_run_root() {
   binary=$REPLY
   "$PERF_MKDIR" -p -- "$run_root" || return 1
   "$PERF_CP" -r -- "$sealed/." "$run_root/" || return 1
-  "$PERF_CHMOD" -R u+w -- "$run_root" || return 1
+  "$PERF_CHMOD" -R u+w "$run_root" || return 1
   "$PERF_MKDIR" -p -- "$run_root/target/release" || return 1
   "$PERF_LN" -s -- "$binary" "$run_root/target/release/shdeps" || return 1
   "$PERF_LN" -s -- "$binary" "$run_root/shdeps" || return 1
