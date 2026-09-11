@@ -739,7 +739,7 @@ perf_cargo() {
   )
   local name supervisor_pid='' supervisor_start='' requested_signal=0 status=0 driver_pid=$BASHPID
   local old_hup old_int old_quit old_term
-  for name in HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY SSL_CERT_FILE SSL_CERT_DIR; do
+  for name in HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY SSL_CERT_FILE SSL_CERT_DIR RUST_BACKTRACE; do
     if [[ -n ${!name+x} ]]; then
       environment+=("$name=${!name}")
     fi
