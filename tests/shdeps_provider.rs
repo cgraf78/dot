@@ -65,7 +65,41 @@ fn isolated_tool_path() -> std::ffi::OsString {
             directories.push(directory);
         }
     }
+    // The closed PATH must still resolve the OS tools the engine shells
+    // out to (notably PATH-resolved `ps` for update-lock identity and
+    // `mv` for atomic moves): on macOS those live in /bin, which the
+    // bash/git homes do not cover. Developer wrappers stay excluded by
+    // construction; only genuine system directories are appended.
+    for directory in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        let directory = PathBuf::from(directory);
+        if directory.is_dir() && !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
     std::env::join_paths(directories).expect("isolated tool PATH")
+}
+
+#[test]
+fn isolated_tool_path_resolves_engine_os_tools() {
+    // The engine shells out to PATH-resolved `ps` (update-lock identity)
+    // and `mv` (atomic moves). If the closed PATH stops resolving them,
+    // provider-boundary tests fail with a bare exit status instead of a
+    // clear message — pin the resolution directly. (On macOS both live
+    // in /bin, outside every bash/git home.)
+    let path = isolated_tool_path();
+    for name in ["bash", "git", "ps", "mv"] {
+        let found = std::env::split_paths(&path).any(|directory| {
+            let candidate = directory.join(name);
+            candidate.is_file()
+                && candidate
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        });
+        assert!(
+            found,
+            "{name} must resolve under the isolated tool PATH ({path:?})"
+        );
+    }
 }
 
 struct Fixture {
