@@ -2807,15 +2807,45 @@ fn proc_process_vanished(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
+/// Whether an unreadable procfs entry belongs to another app.
+///
+/// Android denies an app's reads of other apps' stat files, and app
+/// processes cannot change UID (no setuid), so a permission-denied entry
+/// is provably foreign to every owned session. Linux keeps denials
+/// fail-closed instead: a setuid descendant's stat stays world-readable
+/// there, so an unreadable stat indicates a genuinely partial view.
+#[cfg(any(test, target_os = "android"))]
+fn proc_process_foreign(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 static FORCE_FAKE_PROC_STAT_ESRCH_ROOT: std::sync::Mutex<Option<std::path::PathBuf>> =
     std::sync::Mutex::new(None);
 
-/// Read one procfs stat file. The test seam injects an exit race (ESRCH)
-/// only under the registered fake root, so parallel tests using their own
-/// roots or the live process table never observe it.
+/// Exact stat path that must fail with permission denied. Mode-bit tricks
+/// cannot simulate EACCES for root, so the seam injects the errno directly;
+/// registration is path-exact so parallel tests never observe it.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+static FORCE_FAKE_PROC_STAT_DENIED: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Read one procfs stat file. The test seams inject an exit race (ESRCH)
+/// or a foreign-app denial (EACCES) only for registered fake paths, so
+/// parallel tests using their own roots or the live process table never
+/// observe them.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn read_proc_stat(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    if !path.starts_with("/proc")
+        && FORCE_FAKE_PROC_STAT_DENIED
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|denied| path == denied)
+    {
+        return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+    }
     #[cfg(test)]
     if !path.starts_with("/proc")
         && FORCE_FAKE_PROC_STAT_ESRCH_ROOT
@@ -2851,6 +2881,11 @@ fn proc_process_snapshot(root: &Path, deadline: Instant) -> Option<Vec<ProcessIn
         let stat = match read_proc_stat(&entry.path().join("stat")) {
             Ok(stat) => stat,
             Err(error) if proc_process_vanished(&error) => continue,
+            // Android hides other apps' stat files behind permission errors;
+            // those entries cannot be owned descendants, so skip them rather
+            // than failing a snapshot that is complete for everything owned.
+            #[cfg(target_os = "android")]
+            Err(error) if proc_process_foreign(&error) => continue,
             Err(_) => return None,
         };
         processes.push(parse_proc_process(pid, &stat)?);
@@ -4659,6 +4694,59 @@ fn drain_retained_group_zombies(pgid: u32) {
 /// analysis). Impact stays bounded: a same-uid stray holding no
 /// fds, locks, or pipes, from an attacker that already had code
 /// execution.
+/// Error-path-only probe explaining why a process snapshot is unavailable.
+///
+/// Samples a bounded slice of the process table plus the fallback helper's
+/// presence so a failed verification names its cause instead of reporting a
+/// bare failure. No spawns, no sleeps, no retries: the diagnostic itself
+/// must never stall teardown.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn snapshot_failure_hint() -> String {
+    let mut readable = 0u32;
+    let mut denied = 0u32;
+    let mut missing = 0u32;
+    let mut unparsable = 0u32;
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(error) => return format!("cannot list /proc: {error}"),
+    };
+    for entry in entries.flatten().take(128) {
+        let name = entry.file_name();
+        let Some(text) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = text.parse::<u32>() else {
+            continue;
+        };
+        match std::fs::read(entry.path().join("stat")) {
+            Ok(stat) => {
+                if parse_proc_process(pid, &stat).is_some() {
+                    readable += 1;
+                } else {
+                    unparsable += 1;
+                }
+            }
+            Err(error) if proc_process_vanished(&error) => missing += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                denied += 1;
+            }
+            Err(_) => missing += 1,
+        }
+    }
+    #[cfg(target_os = "android")]
+    let ps = "/system/bin/ps";
+    #[cfg(not(target_os = "android"))]
+    let ps = "/bin/ps";
+    format!(
+        "procfs sample: {readable} readable, {denied} denied, {missing} vanished, {unparsable} unparsable; {ps}: {}",
+        if Path::new(ps).exists() {
+            "present"
+        } else {
+            "missing"
+        }
+    )
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn normal_completion_needs_discovery(leader: u32, deadline: Instant) -> std::io::Result<bool> {
     let raw = libc::pid_t::try_from(leader)
@@ -4670,8 +4758,12 @@ fn normal_completion_needs_discovery(leader: u32, deadline: Instant) -> std::io:
         return Err(std::io::Error::last_os_error());
     }
     let session = session as u32;
-    let processes = process_snapshot(deadline)
-        .ok_or_else(|| std::io::Error::other("could not verify the completed session"))?;
+    let processes = process_snapshot(deadline).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "could not verify the completed session ({})",
+            snapshot_failure_hint()
+        ))
+    })?;
     Ok(processes
         .iter()
         .any(|process| process.live && process.session == session))
@@ -10323,6 +10415,76 @@ int kill(pid_t pid, int sig) {
         let snapshot = proc_process_snapshot(root.path(), Instant::now() + Duration::from_secs(5));
         assert!(snapshot.is_some(), "an exit race failed the whole snapshot");
         assert!(snapshot.unwrap().is_empty(), "an exit race was not skipped");
+    }
+
+    #[test]
+    fn proc_foreign_classifies_permission_denied() {
+        assert!(proc_process_foreign(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(proc_process_foreign(&std::io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        assert!(!proc_process_foreign(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn proc_snapshot_denied_entry_is_platform_scoped() {
+        struct ResetDenied;
+        impl Drop for ResetDenied {
+            fn drop(&mut self) {
+                *FORCE_FAKE_PROC_STAT_DENIED
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = None;
+            }
+        }
+        let root = dot_test_support::TempDir::new("denied-proc-snapshot").unwrap();
+        let readable = root.path().join("123");
+        std::fs::create_dir(&readable).unwrap();
+        std::fs::write(
+            readable.join("stat"),
+            b"123 (stat) R 1 123 123 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 100 0 0",
+        )
+        .unwrap();
+        let denied = root.path().join("456");
+        std::fs::create_dir(&denied).unwrap();
+        let denied_stat = denied.join("stat");
+        std::fs::write(
+            &denied_stat,
+            b"456 (stat) R 1 456 456 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 200 0 0",
+        )
+        .unwrap();
+        *FORCE_FAKE_PROC_STAT_DENIED
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(denied_stat);
+        let _reset = ResetDenied;
+        let snapshot = proc_process_snapshot(root.path(), Instant::now() + Duration::from_secs(5));
+        #[cfg(target_os = "android")]
+        assert_eq!(
+            snapshot,
+            Some(vec![ProcessInfo {
+                pid: 123,
+                parent: 1,
+                group: 123,
+                session: 123,
+                live: true,
+                identity: ProcessIdentity {
+                    pid: 123,
+                    start: Some(100),
+                },
+            }]),
+            "a foreign-app denial must skip one row, not fail the snapshot"
+        );
+        // Linux has setuid transitions, so an unreadable stat stays a
+        // fail-closed partial view there.
+        #[cfg(not(target_os = "android"))]
+        assert!(
+            snapshot.is_none(),
+            "a denied stat must fail the snapshot closed on Linux"
+        );
     }
 
     #[test]
