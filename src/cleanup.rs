@@ -3667,7 +3667,7 @@ impl NestedControlWorker {
                                 expected_leader,
                             ) && !links.contains_key(&registration.boundary)
                                 && links.len() < MAX_ACTIVE_NESTED_SESSIONS;
-                            if !valid || registration.link.write_all(&[1]).is_err() {
+                            if !valid {
                                 // TEMP-DIAG-180: remove with the recvmsg diag.
                                 eprintln!("TEMP-DIAG-180: nested-control cleared: invalid frame");
                                 let mut state =
@@ -3677,11 +3677,26 @@ impl NestedControlWorker {
                                 links.clear();
                                 break;
                             }
+                            // Record before acknowledging: the ACK tells the
+                            // publisher its registration is already visible,
+                            // so the shared insert must land first. ACK-first
+                            // let a burst's final insert land after every ACK
+                            // and flaked convergence polls on loaded runners.
                             state
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner())
                                 .supervisors
                                 .insert(registration.boundary.clone(), registration.pid);
+                            if registration.link.write_all(&[1]).is_err() {
+                                // TEMP-DIAG-180: remove with the recvmsg diag.
+                                eprintln!("TEMP-DIAG-180: nested-control cleared: ack failed");
+                                let mut state =
+                                    state.lock().unwrap_or_else(|error| error.into_inner());
+                                state.complete = false;
+                                state.supervisors.clear();
+                                links.clear();
+                                break;
+                            }
                             links.insert(
                                 registration.boundary,
                                 (registration.pid, registration.link),
@@ -5764,7 +5779,27 @@ fn stop_sessions_with_tick(
             None => status,
         })
         .collect();
-    (results, tick_result)
+    (results, merge_authority_errors(&mut sessions, tick_result))
+}
+
+/// Surface portable fail-closed refusals as the supervision call's error.
+///
+/// An authority refusal is not a cleanup verification failure: the reap
+/// outcome stays intact and the refusal travels the deferred-error channel
+/// so `decide_after_cleanup` returns it instead of suppressing the outcome
+/// into `CleanupIncomplete`. First refusal wins; an existing tick error
+/// takes precedence.
+fn merge_authority_errors(
+    sessions: &mut [Session],
+    tick_result: std::io::Result<()>,
+) -> std::io::Result<()> {
+    tick_result?;
+    for session in sessions {
+        if let Some(error) = session.authority_error.take() {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// Require two complete snapshots without a live session member. Process-table
@@ -5823,6 +5858,11 @@ struct Session {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     members: std::collections::BTreeMap<u32, OwnedMember>,
     error: Option<std::io::Error>,
+    // Portable fail-closed: an unpinned live member refuses unsafe delivery.
+    // Unlike `error` (which suppresses the outcome into CleanupIncomplete),
+    // this surfaces as the supervision call's error so callers must handle
+    // the refusal explicitly.
+    authority_error: Option<std::io::Error>,
 }
 
 #[derive(Clone, Copy)]
@@ -5974,6 +6014,7 @@ impl Session {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             members: std::collections::BTreeMap::new(),
             error: None,
+            authority_error: None,
         }
     }
 
@@ -6347,12 +6388,17 @@ impl Session {
         // leaves an unpinned late member for the anchored group KILL phase.
 
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        if self
-            .current
-            .values()
-            .any(|process| requires_direct_signal_authority(process, self.leader))
+        if self.authority_error.is_none()
+            && self
+                .current
+                .values()
+                .any(|process| requires_direct_signal_authority(process, self.leader))
         {
-            self.record_error(std::io::Error::new(
+            // Fail closed as the call's error (not a suppressed incomplete
+            // outcome): an unpinned member must never be delivered unsafely,
+            // and the caller must handle the refusal explicitly.
+            CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.authority_error = Some(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "safe descendant delivery has no stable process authority",
             ));
@@ -10466,6 +10512,31 @@ int kill(pid_t pid, int sig) {
     fn unsupported_pidfd_fails_closed() {
         let error = stable_pidfd(PidFd::Unsupported).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn authority_refusal_travels_the_deferred_error_channel() {
+        let refusal = || {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "safe descendant delivery has no stable process authority",
+            )
+        };
+        // A refusal with a clean tick surfaces as the call's error.
+        let mut sessions = vec![Session::new(11), Session::new(12)];
+        sessions[1].authority_error = Some(refusal());
+        let error = merge_authority_errors(&mut sessions, Ok(())).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("no stable process authority"));
+        // No refusal leaves the tick result untouched.
+        let mut sessions = vec![Session::new(11)];
+        assert!(merge_authority_errors(&mut sessions, Ok(())).is_ok());
+        // An existing tick error takes precedence over a later refusal.
+        let mut sessions = vec![Session::new(11)];
+        sessions[0].authority_error = Some(refusal());
+        let tick_error = std::io::Error::other("drain failed");
+        let error = merge_authority_errors(&mut sessions, Err(tick_error)).unwrap_err();
+        assert_eq!(error.to_string(), "drain failed");
     }
 
     #[test]
