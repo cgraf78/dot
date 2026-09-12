@@ -2953,7 +2953,7 @@ fn macos_native_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
 /// into one row. Zombies keep the self-referential pair the `ps`
 /// fallback uses since they are definitively dead.
 #[cfg(target_os = "macos")]
-fn macos_native_process_info(pid: u32) -> Result<Option<ProcessInfo>, ()> {
+fn macos_native_process_info(pid: u32) -> std::result::Result<Option<ProcessInfo>, ()> {
     let before = match macos_bsd_info(pid) {
         Ok(Some(info)) => info,
         Ok(None) => return Ok(None),
@@ -3010,7 +3010,7 @@ fn macos_native_process_info(pid: u32) -> Result<Option<ProcessInfo>, ()> {
 /// (unrelated churn) and `Err` for any other query failure, matching
 /// the `ps` fallback's fail-closed rule.
 #[cfg(target_os = "macos")]
-fn macos_bsd_info(pid: u32) -> Result<Option<libc::proc_bsdinfo>, ()> {
+fn macos_bsd_info(pid: u32) -> std::result::Result<Option<libc::proc_bsdinfo>, ()> {
     let Ok(pid_i32) = i32::try_from(pid) else {
         return Err(());
     };
