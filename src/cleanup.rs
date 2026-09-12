@@ -6643,15 +6643,26 @@ mod tests {
             .map(|index| format!("{index:064x}"))
             .collect::<Vec<_>>();
         let mut registrations = Vec::new();
+        // TEMP-DIAG-180: remove with the recvmsg diag. Prove whether the
+        // test still holds every peer when convergence fails.
+        let mut fd_proof = Vec::new();
         for token in &tokens {
-            registrations.push(
+            let local =
                 publish_nested_supervisor(&[std::os::fd::AsRawFd::as_raw_fd(&writer)], token)
                     .unwrap()
-                    .expect("private registration"),
-            );
+                    .expect("private registration");
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&local);
+            let ino = if unsafe { libc::fstat(fd, &mut stat) } == 0 {
+                stat.st_ino as u64
+            } else {
+                u64::MAX
+            };
+            fd_proof.push((fd, ino));
+            registrations.push(local);
         }
         let mut iterations = 0u32;
-        poll_until(Instant::now() + Duration::from_secs(1), || {
+        let converged = poll_until(Instant::now() + Duration::from_secs(1), || {
             let state = state.lock().unwrap_or_else(|error| error.into_inner());
             iterations += 1;
             // TEMP-DIAG-180: remove with the recvmsg diag.
@@ -6663,8 +6674,25 @@ mod tests {
                 );
             }
             Ok((state.supervisors.len() == tokens.len()).then_some(()))
-        })
-        .unwrap();
+        });
+        // TEMP-DIAG-180: remove with the recvmsg diag.
+        if let Err(error) = &converged {
+            for (index, registration) in registrations.iter().enumerate() {
+                let fd = std::os::fd::AsRawFd::as_raw_fd(registration);
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                let (open, ino) = if unsafe { libc::fstat(fd, &mut stat) } == 0 {
+                    (true, stat.st_ino as u64)
+                } else {
+                    (false, u64::MAX)
+                };
+                let (_, first_ino) = fd_proof[index];
+                eprintln!(
+                    "TEMP-DIAG-180: test local {index} fd={fd} open={open} same_ino={}",
+                    ino == first_ino,
+                );
+            }
+            panic!("nested-control convergence failed: {error:?}");
+        }
 
         let first_token = tokens[0].clone();
         let second_token = tokens[1].clone();
