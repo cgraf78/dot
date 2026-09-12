@@ -699,7 +699,11 @@ fn native_doctor_unpinned_descendant_fails_closed_boundedly() {
     // outlive the stop sequence deterministically: a self-exiting sleeper
     // races the authority check (exit 1 when already dead, 125 when live).
     // The test therefore owns cleanup of the surviving descendant, like
-    // the provider escaped-stderr fixtures do.
+    // the provider escaped-stderr fixtures do. The refusal does not
+    // short-circuit the TERM/KILL grace phases, and each host snapshot
+    // spawns ps plus per-PID getsid queries, so the bound stays generous
+    // enough for a loaded runner while remaining well under the
+    // descendant lifetime (which proves no awaiting happened).
     let home = TempDir::new("doctor-unpinned-home").expect("home");
     let state = TempDir::new("doctor-unpinned-state").expect("state");
     let root = home.path().join("extensions");
@@ -714,7 +718,7 @@ fn native_doctor_unpinned_descendant_fails_closed_boundedly() {
     .expect("config");
     std::fs::write(
         directory.join("10-escape.sh"),
-        b"doctor() {\n  set -m\n  (trap '' TERM; printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-unpinned-descendant\"; sleep 30) </dev/null >/dev/null 2>&1 &\n  until [[ -s $HOME/doctor-unpinned-descendant ]]; do sleep 0.02; done\n}\n",
+        b"doctor() {\n  set -m\n  (trap '' TERM; printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-unpinned-descendant\"; sleep 60) </dev/null >/dev/null 2>&1 &\n  until [[ -s $HOME/doctor-unpinned-descendant ]]; do sleep 0.02; done\n}\n",
     )
     .expect("extension");
     seal(&root, 0o700);
@@ -738,7 +742,7 @@ fn native_doctor_unpinned_descendant_fails_closed_boundedly() {
     }
 
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(6),
+        started.elapsed() < std::time::Duration::from_secs(30),
         "doctor incomplete cleanup was not bounded"
     );
     assert!(
