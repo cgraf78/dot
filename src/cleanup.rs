@@ -3652,8 +3652,12 @@ impl NestedControlWorker {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_stop = stop.clone();
         let thread = std::thread::spawn(move || {
-            let mut links =
-                std::collections::BTreeMap::<String, (u32, std::os::unix::net::UnixStream)>::new();
+            // Third tuple element is the insert instant: links younger
+            // than the settle window skip liveness reads (see below).
+            let mut links = std::collections::BTreeMap::<
+                String,
+                (u32, std::os::unix::net::UnixStream, Instant),
+            >::new();
             while !worker_stop.load(std::sync::atomic::Ordering::Acquire) {
                 let mut received = 0usize;
                 loop {
@@ -3710,7 +3714,7 @@ impl NestedControlWorker {
                             );
                             links.insert(
                                 registration.boundary,
-                                (registration.pid, registration.link),
+                                (registration.pid, registration.link, Instant::now()),
                             );
                         }
                         Ok(None) => break,
@@ -3728,7 +3732,17 @@ impl NestedControlWorker {
                     }
                 }
                 let mut closed = Vec::new();
-                for (boundary, (_pid, link)) in &mut links {
+                let scan = Instant::now();
+                for (boundary, (_pid, link, born)) in &mut links {
+                    // Settle window: on macOS a freshly received link can
+                    // read a stable-but-spurious 0 on its first liveness
+                    // check (every observed spurious EOF fired within ~1
+                    // datagram of its insert, with the peer held open).
+                    // Real peer closes persist, so skipping fresh links
+                    // only delays withdrawal detection by the window.
+                    if scan.saturating_duration_since(*born) < Duration::from_millis(5) {
+                        continue;
+                    }
                     let mut byte = [0u8; 1];
                     match link.read(&mut byte) {
                         Ok(0) => {
@@ -3738,8 +3752,9 @@ impl NestedControlWorker {
                             let mut confirm_byte = [0u8; 1];
                             let confirm = link.read(&mut confirm_byte);
                             eprintln!(
-                                "TEMP-DIAG-180: nested-control link EOF: {boundary} fd={} confirm={confirm:?}",
+                                "TEMP-DIAG-180: nested-control link EOF: {boundary} fd={} age_ms={} confirm={confirm:?}",
                                 std::os::fd::AsRawFd::as_raw_fd(link),
+                                born.elapsed().as_millis(),
                             );
                             closed.push(boundary.clone())
                         }
