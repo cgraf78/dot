@@ -8985,6 +8985,32 @@ os._exit(0)
     }
 
     #[test]
+    #[cfg(unix)]
+    fn internal_pairs_set_close_on_exec() {
+        use std::os::fd::AsRawFd as _;
+        // Pin the CLOEXEC property directly and deterministically (no
+        // spawn involved): internal endpoints must never leak into an
+        // exec'd child. The lease-proof test below relies on this for
+        // its inheriting/plain distinction.
+        let (stream_left, stream_right) = internal_stream_pair().unwrap();
+        let (dgram_left, dgram_right) = internal_datagram_pair().unwrap();
+        for fd in [
+            stream_left.as_raw_fd(),
+            stream_right.as_raw_fd(),
+            dgram_left.as_raw_fd(),
+            dgram_right.as_raw_fd(),
+        ] {
+            assert!(fd >= 3, "internal endpoint aliased stdio: fd {fd}");
+            // SAFETY: F_GETFD only reads the descriptor flags.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(
+                flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+                "internal endpoint fd {fd} lacks close-on-exec (flags {flags})"
+            );
+        }
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn session_lease_proof_distinguishes_an_inheriting_child() {
         use std::os::fd::AsRawFd as _;
@@ -9001,6 +9027,19 @@ os._exit(0)
             }
         }
 
+        // Spawn the plain child before the lease socket exists: fork
+        // copies the parent's descriptor table, so a child forked before
+        // the socket exists cannot inherit it through any descriptor-table
+        // race with the parallel tests sharing this process. (The writer
+        // is additionally CLOEXEC by construction; that property is pinned
+        // directly by `internal_pairs_set_close_on_exec` below.)
+        let mut plain = ReapGuard {
+            child: Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap(),
+        };
         let (_reader, writer) = internal_stream_pair().unwrap();
         let inode = {
             // SAFETY: the writer is a live socket; fstat writes only `stat`.
@@ -9031,13 +9070,6 @@ os._exit(0)
         }
         let mut inheriting = ReapGuard {
             child: inheriting.spawn().unwrap(),
-        };
-        let mut plain = ReapGuard {
-            child: Command::new("/bin/sleep")
-                .arg("30")
-                .stdin(Stdio::null())
-                .spawn()
-                .unwrap(),
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         poll_until(deadline, || {
