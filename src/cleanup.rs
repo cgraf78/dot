@@ -3413,6 +3413,14 @@ fn end_after_cleanup(
     if cleanup.is_ok() {
         completed
     } else {
+        // TEMP-DIAG-180: end_after_cleanup drops the stop error silently while
+        // decide_after_cleanup prints DOT_TEARDOWN_FAIL. The macOS 125-vs-143
+        // failures take this path with no other diagnostic; print the error
+        // so CI names which stop failure macOS hits. Remove with the fix.
+        eprintln!(
+            "TEMP-DIAG-180: end_after_cleanup err: {:?}",
+            cleanup.as_ref().err()
+        );
         CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
         SessionEnd::CleanupIncomplete
     }
