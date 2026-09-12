@@ -187,7 +187,10 @@ fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
         });
     }
     let mut child = command.spawn().unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    // The helper exits in milliseconds when the runner is quiet, but it
+    // spawns a Python check plus supervised PTY teardown, so a saturated
+    // macOS runner needs headroom. The bound still catches true hangs.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
