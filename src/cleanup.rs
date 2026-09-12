@@ -3010,10 +3010,15 @@ fn macos_native_process_info(pid: u32) -> std::result::Result<Option<ProcessInfo
     };
     // A generation change between the two records means the PID was
     // reused mid-query; skip the row rather than splicing generations.
-    // The scheduling status is deliberately not compared: a busy writer
-    // flaps between running and sleeping across two back-to-back reads,
-    // which would drop live rows (notably the provider during teardown).
+    // Liveness (live versus zombie) is compared but the scheduling
+    // status is not: a busy writer flaps between running and sleeping
+    // across two back-to-back reads, which would drop live rows
+    // (notably the provider during teardown), while a row that died
+    // mid-query must never report as live.
+    let before_live = before.pbi_status != libc::SZOMB;
+    let after_live = after.pbi_status != libc::SZOMB;
     if before.pbi_pid != after.pbi_pid
+        || before_live != after_live
         || before.pbi_ppid != after.pbi_ppid
         || before.pbi_pgid != after.pbi_pgid
         || before.pbi_start_tvsec != after.pbi_start_tvsec
