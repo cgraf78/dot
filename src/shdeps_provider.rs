@@ -1075,6 +1075,16 @@ fn download_installer(
                 if remaining_bytes == 0 {
                     let _ = preparation_stderr.write_all(PROVIDER_OUTPUT_LIMIT_ERROR.as_bytes());
                     let _ = preparation_stderr.write_all(b"\n");
+                } else {
+                    // Name the failure instead of failing silently: the
+                    // remaining capture budget distinguishes an
+                    // underflowing flood from a broken capture pipe.
+                    let _ = preparation_stderr.write_all(
+                        format!(
+                            "Shdeps provider download cleanup incomplete with {remaining_bytes} capture bytes remaining\n"
+                        )
+                        .as_bytes(),
+                    );
                 }
                 let _ = std::fs::remove_file(&temporary);
                 return Err(EnsureFailure::Output);
@@ -1083,6 +1093,14 @@ fn download_installer(
             Err(error) => {
                 if is_provider_output_limit(&error) {
                     let _ = preparation_stderr.write_all(PROVIDER_OUTPUT_LIMIT_ERROR.as_bytes());
+                    let _ = preparation_stderr.write_all(b"\n");
+                } else {
+                    // Name the failure instead of failing silently: a bare
+                    // transport error leaves only the exit code, which
+                    // cannot distinguish a broken capture pipe from a
+                    // refused endpoint.
+                    let _ = preparation_stderr.write_all(b"Shdeps provider download failed: ");
+                    let _ = preparation_stderr.write_all(error.to_string().as_bytes());
                     let _ = preparation_stderr.write_all(b"\n");
                 }
                 let _ = std::fs::remove_file(&temporary);
@@ -1198,7 +1216,15 @@ fn bootstrap(
             &mut relay_failed,
         )
     })
-    .map_err(|_| EnsureFailure::Output)?;
+    .map_err(|error| {
+        // Name the failure instead of failing silently: a bare output
+        // error leaves only the exit code, which cannot distinguish a
+        // tripped output limit from a broken capture pipe.
+        let _ = preparation_stderr.write_all(b"Shdeps provider bootstrap failed: ");
+        let _ = preparation_stderr.write_all(error.to_string().as_bytes());
+        let _ = preparation_stderr.write_all(b"\n");
+        EnsureFailure::Output
+    })?;
     let status = match result {
         crate::cleanup::SessionEnd::Exited(status) => status,
         crate::cleanup::SessionEnd::Interrupted(signal) => {

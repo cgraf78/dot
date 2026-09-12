@@ -3008,11 +3008,12 @@ fn macos_native_process_info(pid: u32) -> std::result::Result<Option<ProcessInfo
         }
         Err(()) => return Err(()),
     };
-    // A generation or liveness change between the two records means the
-    // PID was reused or exited mid-query; skip the row rather than
-    // splicing generations or reporting a dead process as live.
+    // A generation change between the two records means the PID was
+    // reused mid-query; skip the row rather than splicing generations.
+    // The scheduling status is deliberately not compared: a busy writer
+    // flaps between running and sleeping across two back-to-back reads,
+    // which would drop live rows (notably the provider during teardown).
     if before.pbi_pid != after.pbi_pid
-        || before.pbi_status != after.pbi_status
         || before.pbi_ppid != after.pbi_ppid
         || before.pbi_pgid != after.pbi_pgid
         || before.pbi_start_tvsec != after.pbi_start_tvsec
@@ -5106,6 +5107,14 @@ impl OwnedChild {
             };
         }
         let pid = self.child().id();
+        // Drain before signaling: a provider blocked writing to a full
+        // capture socket cannot run its TERM handler until the socket
+        // moves, so the signal would pend behind output backpressure
+        // (notably on macOS, where small socket buffers fill fast).
+        // Best-effort unblock; errors are observed on the grace ticks.
+        for _ in 0..4 {
+            let _ = tick();
+        }
         signal_pid(pid, signal);
         if signal != libc::SIGKILL {
             // A stopped cooperative provider cannot run its TERM handler until
