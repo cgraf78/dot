@@ -443,6 +443,37 @@ mod tests {
         assert!(!decide_sudo(false, false, false, &no));
     }
 
+    // TEMP-DIAG-180: remove with the recvmsg diag. Best-effort
+    // process snapshot for stop-timeout triage; never fails the test
+    // itself. `ps` keywords below exist on both macOS and Linux.
+    fn ps_snapshot(pid: u32) -> String {
+        fn run_ps(args: &[&str]) -> String {
+            match std::process::Command::new("ps").args(args).output() {
+                Ok(output) => {
+                    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+                    if text.len() > 4096 {
+                        text.truncate(4096);
+                    }
+                    text
+                }
+                Err(error) => format!("ps unavailable: {error}\n"),
+            }
+        }
+        let target = pid.to_string();
+        let mut snapshot = run_ps(&["-o", "pid,ppid,state,etime,cputime,command", "-p", &target]);
+        // Children of the helper: a stray supervised descendant would
+        // show here even though try_wait only watches the helper pid.
+        let table = run_ps(&["-A", "-o", "pid,ppid,state,etime,cputime,command"]);
+        for line in table.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 2 && fields[1] == target {
+                snapshot.push_str(line);
+                snapshot.push('\n');
+            }
+        }
+        snapshot
+    }
+
     // TEMP-DIAG-180: remove with the recvmsg diag. Nonblocking drain
     // of the sudo helper's PTY master for failure triage.
     fn drain_pty_master(master: &std::os::fd::OwnedFd) -> Vec<u8> {
@@ -585,6 +616,15 @@ mod tests {
                 eprintln!(
                     "TEMP-DIAG-180: sudo-pty helper output at stop timeout: {:?}",
                     String::from_utf8_lossy(&drain_pty_master(&master))
+                );
+                // TEMP-DIAG-180: remove with the recvmsg diag. The helper
+                // printed its complete inner summary yet is still alive:
+                // capture state/CPU/children to distinguish a job-control
+                // stop (T) from a shutdown hang (R/S with CPU or a stray
+                // child holding the suite up).
+                eprintln!(
+                    "TEMP-DIAG-180: helper ps at stop timeout:\n{}",
+                    ps_snapshot(child.id())
                 );
                 panic!("PTY helper did not stop");
             }
