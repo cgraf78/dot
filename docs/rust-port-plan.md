@@ -67,15 +67,21 @@ final filesystem tree remain significant.
 
 Performance evidence has two layers:
 
-- `hyperfine` compares explicit pre-cutover and native release executables for
-  startup-oriented commands;
-- `tests/perf_update.rs` measures complete native update fixtures and enforces a
-  regression budget, while the archived pre-cutover harness supplies the same
-  fixture's Bash baseline.
+- `tests/perf_budget.rs` deterministically pins sample count, percentile,
+  relative-improvement, and absolute-budget policy in the ordinary test suite;
+- `scripts/benchmark-port.sh` runs the ignored `tests/perf_update.rs` gate in
+  release mode against the pinned pre-cutover shell checkout, recording paired
+  startup, base-only, disjoint and colliding overlay, profile, provider, hook,
+  merge, and failure samples plus machine-readable evidence.
 
-Measurements use local Git remotes so network variance is not mistaken for
-engine cost. See [`rust-port-performance.md`](rust-port-performance.md) for
-commands, sample counts, p95 values, and limitations.
+Measurements alternate engine order and use shared local Git remotes so load,
+cache order, and network variance are not mistaken for engine cost. Every
+paired workload requires a 25% native median improvement as well as an absolute
+p95 ceiling. Ceilings derived from historical measurements state their CI
+headroom explicitly; new workload shapes require calibration by the final
+integrated run rather than an invented historical value.
+See [`rust-port-performance.md`](rust-port-performance.md) for exact workloads,
+sample counts, validation, budgets, artifacts, and limitations.
 
 ## Completion gates
 

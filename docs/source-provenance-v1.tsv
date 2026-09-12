@@ -23,6 +23,8 @@ lib/dot/public/ui.sh	dotfiles:core/ui.sh@dotfiles-v1
 lib/dot/public/variables-v1.tsv	standalone:new
 lib/dot/public/xdg.sh	dotfiles:core/xdg.sh@dotfiles-v1
 support/client-launcher.sh	standalone:new
+support/performance-baseline-v1.tsv	standalone:new
+support/performance-command-supervisor.rs	standalone:new
 support/shdeps.lock	shdeps:installer-lock
 tests/batch-verification-test	standalone:new
 tests/cleanup.rs	standalone:new
@@ -56,6 +58,8 @@ tests/overlays.rs	standalone:new
 tests/ownership-transfer-test	standalone:new
 tests/perf_budget.rs	standalone:new
 tests/perf_update.rs	standalone:new
+tests/support/perf_policy.rs	standalone:new
+tests/support/performance-supervisor-fixture.rs	standalone:new
 tests/platform.rs	standalone:new
 tests/profile_lifecycle.rs	standalone:new
 tests/profiles.rs	standalone:new
