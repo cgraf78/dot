@@ -1912,9 +1912,7 @@ def list_session_processes(
     try:
         ps = "/system/bin/ps" if Path("/system/bin/ps").is_file() else "/bin/ps"
         ps_process = subprocess.Popen(
-            # `sess` (not procps-only `sid`) so BSD `ps` on macOS
-            # accepts the same session-ID column.
-            [ps, "-A", "-o", "pid=,ppid=,pgid=,sess=,stat="],
+            [ps, "-A", "-o", "pid=,ppid=,pgid=,sid=,stat="],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
