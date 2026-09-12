@@ -117,6 +117,17 @@ fn sq(word: &str) -> String {
 /// runs by construction.
 fn normalize(text: &str, home: &str, origin: &str) -> String {
     let text = text.replace(home, "@HOME@").replace(origin, "@ORIGIN@");
+    // Bash enables monitor mode transiently for coprocess and cleanup
+    // launches (`resources.sh`); when its delayed `setpgid` races a
+    // fast-exiting child on macOS, jobs.c reports `child setpgid (X
+    // to Y): Operation not permitted` on stderr. That is shell
+    // process-management noise, not pull semantics, and the Rust side
+    // can never emit it, so drop those lines on both sides before
+    // comparing.
+    let text: String = text
+        .split_inclusive('\n')
+        .filter(|line| !line.contains("child setpgid ("))
+        .collect();
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut index = 0;
@@ -134,6 +145,21 @@ fn normalize(text: &str, home: &str, origin: &str) -> String {
         }
     }
     out
+}
+
+#[test]
+fn normalize_drops_bash_setpgid_job_control_noise() {
+    let err = "/h/lib/dot/repos/pull.sh: child setpgid (64304 to 64304): Operation not permitted\nreal warning\n";
+    assert_eq!(normalize(err, "/h", "/o"), "real warning\n");
+    assert_eq!(normalize("real warning\n", "/h", "/o"), "real warning\n");
+    assert_eq!(
+        normalize(
+            "/h/lib/dot/repos/pull.sh: child setpgid (1 to 1): Operation not permitted\n",
+            "/h",
+            "/o"
+        ),
+        ""
+    );
 }
 
 /// Replace the trailing elapsed stamp (` 0s`, ` 12s`) on stage
