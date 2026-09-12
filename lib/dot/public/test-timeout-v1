@@ -1912,7 +1912,8 @@ def list_session_processes(
     try:
         ps = "/system/bin/ps" if Path("/system/bin/ps").is_file() else "/bin/ps"
         ps_process = subprocess.Popen(
-            [ps, "-A", "-o", "pid=,ppid=,pgid=,sid=,stat="],
+            # TEMP-DEBUG-180: sess round. Debug branch only; never merge.
+            [ps, "-A", "-o", "pid=,ppid=,pgid=,sess=,stat="],
             stdout=subprocess.PIPE,
             # TEMP-DEBUG-180: capture ps stderr so macOS CI reports the
             # exact keyword rejection. Debug branch only; never merge.
@@ -2389,6 +2390,13 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             else:
                 consecutive_empty = 0
             time.sleep(min(PROCESS_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+        # TEMP-DEBUG-180: report the blocking observation. Debug branch only.
+        diagnostic(
+            "TEMP-DEBUG-180 phase failed: "
+            f"signum={signum} obs={None if processes is None else [(p.pid, p.live, p.group, p.session, p.ambiguous, p.delegated) for p in processes]} "
+            f"unsafe={unsafe_direct_member} "
+            f"members={[(pid, m.process.live) for pid, m in known_members.items()]}"
+        )
         return False
 
     try:
