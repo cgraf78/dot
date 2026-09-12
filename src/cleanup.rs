@@ -1173,6 +1173,30 @@ const SIGNAL_CLOSED: i32 = -1;
 static INTERRUPTED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static CLEANUP_INCOMPLETE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+// TEMP-DIAG-180: first-wins attribution for the sticky atomic. Remove with
+// the 125 fix.
+static CLEANUP_INCOMPLETE_SOURCE: std::sync::Mutex<Option<&'static str>> =
+    std::sync::Mutex::new(None);
+
+/// TEMP-DIAG-180: record which production path set the sticky atomic.
+/// First setter wins: it names the original poison when a later
+/// supervision succeeds but the process still exits 125.
+fn set_cleanup_incomplete(source: &'static str) {
+    CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut guard = CLEANUP_INCOMPLETE_SOURCE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if guard.is_none() {
+        *guard = Some(source);
+    }
+}
+
+/// TEMP-DIAG-180: read the first-wins setter attribution.
+fn cleanup_incomplete_source() -> Option<&'static str> {
+    *CLEANUP_INCOMPLETE_SOURCE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
 static ACTIVE_HANDLERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static SIGNAL_OWNER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1257,6 +1281,10 @@ impl Signals {
             .unwrap_or_else(|error| error.into_inner());
         INTERRUPTED.store(0, std::sync::atomic::Ordering::SeqCst);
         CLEANUP_INCOMPLETE.store(false, std::sync::atomic::Ordering::SeqCst);
+        // TEMP-DIAG-180: fresh signal ownership clears the attribution too.
+        *CLEANUP_INCOMPLETE_SOURCE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
         OUTWARD_WRITE_ABORTED.store(false, std::sync::atomic::Ordering::SeqCst);
         let mut guard = Self {
             previous: Vec::new(),
@@ -1327,7 +1355,8 @@ impl Signals {
         if owns_process_signals && CLEANUP_INCOMPLETE.load(std::sync::atomic::Ordering::SeqCst) {
             // TEMP-DIAG-180: remove with the 125 fix.
             eprintln!(
-                "TEMP-DIAG-180: finish: CLEANUP_INCOMPLETE atomic overrode code={code} signal={signal:?}"
+                "TEMP-DIAG-180: finish: CLEANUP_INCOMPLETE atomic overrode code={code} signal={signal:?} source={:?}",
+                cleanup_incomplete_source()
             );
             CLEANUP_INCOMPLETE_STATUS
         } else {
@@ -1526,7 +1555,10 @@ fn exit_process_with_hook(code: i32, mut after_install: impl FnMut(i32)) -> ! {
     record_pending_signal();
     let final_code = if CLEANUP_INCOMPLETE.load(std::sync::atomic::Ordering::SeqCst) {
         // TEMP-DIAG-180: remove with the 125 fix.
-        eprintln!("TEMP-DIAG-180: exit_process: CLEANUP_INCOMPLETE atomic overrode code={code}");
+        eprintln!(
+            "TEMP-DIAG-180: exit_process: CLEANUP_INCOMPLETE atomic overrode code={code} source={:?}",
+            cleanup_incomplete_source()
+        );
         CLEANUP_INCOMPLETE_STATUS
     } else {
         match INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -3441,7 +3473,7 @@ fn end_after_cleanup(
             "TEMP-DIAG-180: end_after_cleanup err: {:?}",
             cleanup.as_ref().err()
         );
-        CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
+        set_cleanup_incomplete("end_after_cleanup");
         SessionEnd::CleanupIncomplete
     }
 }
@@ -3461,7 +3493,7 @@ fn decide_after_cleanup(
                 "TEMP-DIAG-180: decide: cleanup err preempts (deferred={})",
                 deferred_error.is_some()
             );
-            CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
+            set_cleanup_incomplete("decide_after_cleanup");
             return Ok(SessionEnd::CleanupIncomplete);
         }
     };
@@ -5076,7 +5108,7 @@ impl OwnedSession {
     pub(crate) fn stop(&mut self, signal: i32) -> std::io::Result<std::process::ExitStatus> {
         let outcome = self.stop_with_tick_outcome(signal, true, &mut || Ok(()));
         if outcome.status.is_err() {
-            CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
+            set_cleanup_incomplete("OwnedSession::stop");
         }
         outcome.into_result()
     }
@@ -5776,7 +5808,7 @@ pub(crate) fn stop_owned_sessions(
     first_signal: i32,
 ) -> Vec<std::io::Result<std::process::ExitStatus>> {
     if sessions.iter().any(|session| session.child.is_none()) {
-        CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
+        set_cleanup_incomplete("stop_owned_sessions:child-lost");
         return (0..sessions.len())
             .map(|_| Err(std::io::Error::other("owned session lost its child handle")))
             .collect();
@@ -5800,7 +5832,7 @@ pub(crate) fn stop_owned_sessions(
         }
     }
     if results.iter().any(std::result::Result::is_err) {
-        CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
+        set_cleanup_incomplete("stop_owned_sessions:results-err");
     }
     results
 }
@@ -6538,7 +6570,7 @@ impl Session {
             // Fail closed as the call's error (not a suppressed incomplete
             // outcome): an unpinned member must never be delivered unsafely,
             // and the caller must handle the refusal explicitly.
-            CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
+            set_cleanup_incomplete("signal_new:authority-refusal");
             // TEMP-DIAG-180: remove with the recvmsg diag.
             eprintln!("TEMP-DIAG-180: authority refusal set");
             self.authority_error = Some(std::io::Error::new(
