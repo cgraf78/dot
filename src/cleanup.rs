@@ -873,12 +873,16 @@ fn receive_nested_registration(
                 error.raw_os_error()
             );
         }
+        // Darwin reports a momentarily exhausted socket buffer as ENOBUFS
+        // (raw 55, surfaced as `Uncategorized`), not `WouldBlock`; treat
+        // it as transient like the other retryable reads.
         return if matches!(
             error.kind(),
             std::io::ErrorKind::WouldBlock
                 | std::io::ErrorKind::Interrupted
                 | std::io::ErrorKind::ConnectionReset
-        ) {
+        ) || error.raw_os_error() == Some(libc::ENOBUFS)
+        {
             Ok(None)
         } else {
             Err(error)
@@ -4331,6 +4335,10 @@ impl SessionLease {
                 Ok(_) => return Ok(false),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                // Darwin reports a momentarily exhausted socket buffer as
+                // ENOBUFS (raw 55, surfaced as `Uncategorized`), not
+                // `WouldBlock`; retry it like an interrupt.
+                Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -5127,13 +5135,21 @@ impl OwnedChild {
                 }
                 Ok(None) if signal == libc::SIGKILL || Instant::now() >= deadline => break,
                 Ok(None) => {
-                    if let Err(error) = tick() {
-                        // Retain the first delivery failure but continue
-                        // teardown. Later ticks may still drain bytes from the
-                        // child-facing socket even when its external sink is
-                        // permanently closed.
-                        if tick_error.is_none() {
-                            tick_error = Some(error);
+                    // Drain several bounded chunks per grace quantum, like
+                    // the session-stop loop: one small drain per sleep can
+                    // make a cooperative TERM handler hit the grace
+                    // deadline merely because it is flushing output
+                    // (notably on macOS, where small socket buffers and
+                    // loaded-timer oversleep compound).
+                    for _ in 0..4 {
+                        if let Err(error) = tick() {
+                            // Retain the first delivery failure but continue
+                            // teardown. Later ticks may still drain bytes from the
+                            // child-facing socket even when its external sink is
+                            // permanently closed.
+                            if tick_error.is_none() {
+                                tick_error = Some(error);
+                            }
                         }
                     }
                     std::thread::sleep(Duration::from_millis(GRACE_INTERVAL_MS));

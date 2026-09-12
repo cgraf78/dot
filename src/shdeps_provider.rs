@@ -527,6 +527,12 @@ impl CaptureStream {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                // Darwin reports a momentarily exhausted socket buffer as
+                // ENOBUFS (raw 55, surfaced as `Uncategorized`), not
+                // `WouldBlock`. Treat it like `WouldBlock` (end this pass,
+                // retry on the next supervisor tick) instead of aborting
+                // the drain; the send side already retries it the same way.
+                Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => break,
                 Err(error) => return Err(error),
             }
         }
@@ -1061,6 +1067,15 @@ fn download_installer(
             }
             Ok(crate::cleanup::SessionEnd::TimedOut) => unreachable!("classified above"),
             Ok(crate::cleanup::SessionEnd::CleanupIncomplete) => {
+                // A flood that exhausted the cumulative budget before
+                // teardown failed still reports the output limit: the
+                // budget state, not the teardown outcome, decides the
+                // diagnostic, keeping it stable when teardown races the
+                // limit on loaded hosts.
+                if remaining_bytes == 0 {
+                    let _ = preparation_stderr.write_all(PROVIDER_OUTPUT_LIMIT_ERROR.as_bytes());
+                    let _ = preparation_stderr.write_all(b"\n");
+                }
                 let _ = std::fs::remove_file(&temporary);
                 return Err(EnsureFailure::Output);
             }
