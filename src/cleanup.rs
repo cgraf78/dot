@@ -1325,6 +1325,10 @@ impl Signals {
         let owns_process_signals = self.active;
         let signal = self.finish_signal();
         if owns_process_signals && CLEANUP_INCOMPLETE.load(std::sync::atomic::Ordering::SeqCst) {
+            // TEMP-DIAG-180: remove with the 125 fix.
+            eprintln!(
+                "TEMP-DIAG-180: finish: CLEANUP_INCOMPLETE atomic overrode code={code} signal={signal:?}"
+            );
             CLEANUP_INCOMPLETE_STATUS
         } else {
             signal.map_or(code, |signal| 128 + signal)
@@ -1521,6 +1525,8 @@ fn exit_process_with_hook(code: i32, mut after_install: impl FnMut(i32)) -> ! {
     }
     record_pending_signal();
     let final_code = if CLEANUP_INCOMPLETE.load(std::sync::atomic::Ordering::SeqCst) {
+        // TEMP-DIAG-180: remove with the 125 fix.
+        eprintln!("TEMP-DIAG-180: exit_process: CLEANUP_INCOMPLETE atomic overrode code={code}");
         CLEANUP_INCOMPLETE_STATUS
     } else {
         match INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1837,7 +1843,11 @@ pub enum ProcessOutputFinish {
 /// failure or cancellation code to hide incomplete relay teardown.
 pub fn process_output_status(code: i32, finish: ProcessOutputFinish) -> i32 {
     match finish {
-        ProcessOutputFinish::CleanupIncomplete => CLEANUP_INCOMPLETE_STATUS,
+        ProcessOutputFinish::CleanupIncomplete => {
+            // TEMP-DIAG-180: remove with the 125 fix.
+            eprintln!("TEMP-DIAG-180: process_output_status: relay finish overrode code={code}");
+            CLEANUP_INCOMPLETE_STATUS
+        }
         ProcessOutputFinish::OutputFailed if code == 0 => 1,
         ProcessOutputFinish::Complete | ProcessOutputFinish::OutputFailed => code,
     }
@@ -2359,6 +2369,10 @@ impl ProcessOutputEndpoint {
             if waited == pid {
                 self.registration.take();
                 return if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) == 125 {
+                    // TEMP-DIAG-180: remove with the 125 fix.
+                    eprintln!(
+                        "TEMP-DIAG-180: relay finish: child status={status} drain={drain} channel_failed={channel_failed} finish_sent={finish_sent}"
+                    );
                     ProcessOutputFinish::CleanupIncomplete
                 } else if drain
                     && (!channel_failed && finish_sent && libc::WEXITSTATUS(status) == 0)
@@ -2375,6 +2389,8 @@ impl ProcessOutputEndpoint {
             }
             if waited < 0 {
                 self.registration.take();
+                // TEMP-DIAG-180: remove with the 125 fix.
+                eprintln!("TEMP-DIAG-180: relay finish: waitpid error, drain={drain}");
                 return ProcessOutputFinish::CleanupIncomplete;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -2382,6 +2398,10 @@ impl ProcessOutputEndpoint {
         self.lifetime_writer.take();
         let _ = stop_output_relay_watchdog(pid, true);
         self.registration.take();
+        // TEMP-DIAG-180: remove with the 125 fix.
+        eprintln!(
+            "TEMP-DIAG-180: relay finish: deadline expired with relay child unreaped, drain={drain}"
+        );
         ProcessOutputFinish::CleanupIncomplete
     }
 }
