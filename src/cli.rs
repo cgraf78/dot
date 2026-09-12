@@ -268,10 +268,7 @@ pub(crate) fn run_with_runtime(
     // The re-exec guard precedes every command. Informational commands then
     // return without reading user configuration, matching the shell entry
     // point; operational commands load configuration before dispatch.
-    if matches!(
-        command,
-        b"" | b"help" | b"-h" | b"--help" | b"version" | b"--version"
-    ) {
+    if crate::startup::informational_command(command) {
         if let Err(failure) = crate::startup::check_reexec(runtime) {
             let _ = stderr.write_all(failure.line().as_bytes());
             let _ = stderr.write_all(b"\n");

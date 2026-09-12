@@ -44,34 +44,99 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Snapshot `env` and `cwd` for an independent Dot invocation.
+    /// Snapshot trusted `env` and `cwd` for an embedded Dot invocation.
     ///
     /// The working directory must be absolute so every derived path remains
-    /// stable if another caller later changes its own process context.
+    /// stable if another caller later changes its own process context. An
+    /// explicit `DOT_SOURCE_ROOT` is an embedding capability here; the shipped
+    /// binary uses [`Self::from_process_args`] so ambient input cannot select
+    /// executable hook code.
     pub fn from_env(env: &BTreeMap<OsString, OsString>, cwd: &Path) -> std::io::Result<Self> {
-        if !cwd.is_absolute() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "dot runtime working directory must be absolute",
-            ));
-        }
-        let home = value(env, "HOME").map(PathBuf::from).unwrap_or_default();
-        let state_home = xdg_home(env, "XDG_STATE_HOME", &home, ".local/state");
-        let config_home = xdg_home(env, "XDG_CONFIG_HOME", &home, ".config");
+        validate_cwd(cwd)?;
         let source_root = crate::startup::resolve_source_root(
             &std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/nonexistent-dot-exe")),
             value(env, "DOT_SOURCE_ROOT"),
             cwd,
         );
-        Ok(Self {
+        Ok(Self::snapshot(env.clone(), cwd, source_root))
+    }
+
+    /// Snapshot the process environment while binding executable code to this
+    /// binary's own checkout or release.
+    ///
+    /// Unlike [`Self::from_env`], this production entry point ignores ambient
+    /// `DOT_SOURCE_ROOT` and republishes the derived root to descendants.
+    #[doc(hidden)]
+    pub fn from_process_env(
+        env: &BTreeMap<OsString, OsString>,
+        cwd: &Path,
+    ) -> std::io::Result<Self> {
+        validate_cwd(cwd)?;
+        let argv0 = std::env::args_os().next();
+        let executable = crate::startup::process_executable(
+            argv0.as_deref(),
+            value(env, crate::startup::TERMUX_EXECUTABLE_ENV),
+        )?;
+        let source_root = crate::startup::process_source_root(&executable)?;
+        Ok(Self::process_snapshot(env, cwd, source_root))
+    }
+
+    /// Snapshot a process entry, using application `argv[0]` to corroborate
+    /// executable identity under Termux and retaining standalone `help` and
+    /// `version` support when a packaged release's hook assets have been
+    /// removed.
+    #[doc(hidden)]
+    pub fn from_process_args(
+        env: &BTreeMap<OsString, OsString>,
+        cwd: &Path,
+        argv0: Option<&OsStr>,
+        args: &[OsString],
+    ) -> std::io::Result<Self> {
+        validate_cwd(cwd)?;
+        let executable = crate::startup::process_executable(
+            argv0,
+            value(env, crate::startup::TERMUX_EXECUTABLE_ENV),
+        )?;
+        let command = args
+            .first()
+            .map(|arg| arg.as_os_str().as_encoded_bytes())
+            .unwrap_or_default();
+        let source_root = match crate::startup::process_source_root(&executable) {
+            Ok(root) => root,
+            Err(error) if crate::startup::informational_command(command) => {
+                crate::startup::process_owner_root(&executable).map_err(|_| error)?
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Self::process_snapshot(env, cwd, source_root))
+    }
+
+    fn process_snapshot(
+        env: &BTreeMap<OsString, OsString>,
+        cwd: &Path,
+        source_root: PathBuf,
+    ) -> Self {
+        let mut env = env.clone();
+        env.insert(
+            OsString::from("DOT_SOURCE_ROOT"),
+            source_root.as_os_str().to_os_string(),
+        );
+        Self::snapshot(env, cwd, source_root)
+    }
+
+    fn snapshot(env: BTreeMap<OsString, OsString>, cwd: &Path, source_root: PathBuf) -> Self {
+        let home = value(&env, "HOME").map(PathBuf::from).unwrap_or_default();
+        let state_home = xdg_home(&env, "XDG_STATE_HOME", &home, ".local/state");
+        let config_home = xdg_home(&env, "XDG_CONFIG_HOME", &home, ".config");
+        Self {
             home,
             state_home,
             config_home,
             cwd: cwd.to_path_buf(),
             source_root,
-            env: env.clone(),
+            env,
             executable: None,
-        })
+        }
     }
 
     /// Attach the explicit executable capability required by [`run`].
@@ -141,6 +206,17 @@ impl Runtime {
 
     pub(crate) fn value(&self, key: &str) -> Option<&OsStr> {
         value(&self.env, key)
+    }
+}
+
+fn validate_cwd(cwd: &Path) -> std::io::Result<()> {
+    if cwd.is_absolute() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "dot runtime working directory must be absolute",
+        ))
     }
 }
 
@@ -280,4 +356,27 @@ fn xdg_home(env: &BTreeMap<OsString, OsString>, key: &str, home: &Path, fallback
         .filter(|path| path.is_absolute())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home.join(fallback))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_runtime_republishes_derived_source_root() {
+        let cwd = std::env::current_dir().expect("absolute test cwd");
+        let mut env = BTreeMap::new();
+        env.insert(
+            OsString::from("DOT_SOURCE_ROOT"),
+            OsString::from("/untrusted"),
+        );
+
+        let runtime = Runtime::from_process_env(&env, &cwd).expect("owned test executable");
+
+        assert_ne!(runtime.source_root(), Path::new("/untrusted"));
+        assert_eq!(
+            runtime.value("DOT_SOURCE_ROOT"),
+            Some(runtime.source_root().as_os_str())
+        );
+    }
 }

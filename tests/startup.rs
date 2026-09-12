@@ -272,6 +272,101 @@ fn reexec_guard_precedes_dispatch_in_the_binary() {
 }
 
 #[test]
+fn binary_ignores_caller_supplied_source_root() {
+    let home = clean_home("untrusted-source-root");
+    let untrusted = clean_home("untrusted-checkout");
+    let observed = dot::startup::observed_revision(Path::new(repo())).expect("checkout revision");
+    let untrusted_text = untrusted.path().to_str().expect("ASCII fixture path");
+    let env = [
+        ("DOT_SOURCE_ROOT", Some(untrusted_text)),
+        ("TERMUX_EXEC__PROC_SELF_EXE", Some(untrusted_text)),
+        ("DOT_REEXEC_EXPECTED_REVISION", Some(observed.as_str())),
+    ];
+
+    assert_eq!(
+        run(home.path(), &[OsStr::new("version")], &env),
+        (0, version_bytes(), Vec::new())
+    );
+}
+
+#[test]
+fn binary_fails_closed_outside_an_owned_source_root() {
+    let fixture = TempDir::new_exec("unowned-binary").expect("executable fixture");
+    let binary = fixture.path().join("dot");
+    dot_test_support::copy_dot_binary(Path::new(env!("CARGO_BIN_EXE_dot")), &binary)
+        .expect("copy binary");
+
+    let output = Command::new(&binary)
+        .arg("version")
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", parent_path())
+        .env("HOME", fixture.path())
+        .env("DOT_SOURCE_ROOT", repo())
+        .current_dir(repo())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run unowned binary");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"dot: startup: cannot resolve source root from executable\n"
+    );
+}
+
+#[test]
+fn packaged_help_and_version_survive_removed_hook_assets() {
+    let release = TempDir::new_exec("standalone-release").expect("executable fixture");
+    let binary = release.path().join("dot");
+    dot_test_support::copy_dot_binary(Path::new(env!("CARGO_BIN_EXE_dot")), &binary)
+        .expect("copy binary");
+    std::fs::write(release.path().join(".dot-install.json"), b"{}\n").expect("release metadata");
+
+    for (command, expected) in [
+        ("help", EXPECTED_HELP.as_bytes().to_vec()),
+        ("version", version_bytes()),
+    ] {
+        let output = Command::new(&binary)
+            .arg(command)
+            .env_clear()
+            .env("LC_ALL", "C")
+            .env("PATH", parent_path())
+            .env("HOME", release.path())
+            .env("DOT_SOURCE_ROOT", "/untrusted")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run standalone command");
+        assert_eq!(output.status.code(), Some(0), "command: {command}");
+        assert_eq!(output.stdout, expected, "command: {command}");
+        assert!(output.stderr.is_empty(), "command: {command}");
+    }
+
+    let output = Command::new(&binary)
+        .arg("doctor")
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", parent_path())
+        .env("HOME", release.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run operational command");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"dot: startup: cannot resolve source root from executable\n"
+    );
+}
+
+#[test]
 fn umask_ceiling_matches_shell_g_w_o_w() {
     for (start, expected) in [
         (0o022, 0o022),
@@ -292,6 +387,8 @@ fn umask_ceiling_matches_shell_g_w_o_w() {
 
 #[test]
 fn source_root_resolution_matches_shell_derivation() {
+    use std::os::unix::fs::symlink;
+
     let root = clean_home("checkout-root");
     let public = root.path().join("lib/dot/public");
     std::fs::create_dir_all(&public).expect("public API");
@@ -309,7 +406,18 @@ fn source_root_resolution_matches_shell_derivation() {
             dot::startup::resolve_source_root(&executable, None, Path::new("/wrong-cwd")),
             root.path().canonicalize().expect("canonical root")
         );
+        assert_eq!(
+            dot::startup::executable_source_root(&executable).expect("owned executable"),
+            root.path().canonicalize().expect("canonical root")
+        );
     }
+    let link_home = clean_home("checkout-link");
+    let link = link_home.path().join("dot");
+    symlink(root.path().join("target/debug/dot"), &link).expect("binary symlink");
+    assert_eq!(
+        dot::startup::executable_source_root(&link).expect("linked executable"),
+        root.path().canonicalize().expect("canonical root")
+    );
     assert_eq!(
         dot::startup::resolve_source_root(
             Path::new("/missing"),
@@ -360,6 +468,13 @@ fn installed_binary_resolves_release_root_without_private_engine() {
         assert_eq!(
             dot::startup::resolve_source_root(&binary, None, Path::new("/fallback")),
             PathBuf::from("/fallback"),
+            "incomplete installed metadata: {missing}"
+        );
+        assert_eq!(
+            dot::startup::executable_source_root(&binary)
+                .expect_err("incomplete roots must fail closed")
+                .to_string(),
+            "cannot resolve source root from executable",
             "incomplete installed metadata: {missing}"
         );
     }
