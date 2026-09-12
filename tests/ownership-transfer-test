@@ -319,8 +319,17 @@ base_fallback_origin=$REPLY
 fixture_home base-fallback
 base_fallback_home=$REPLY
 base_fallback_state=$DOT_TEST_TMP/base-fallback-state
-run_dot "$base_fallback_home" "$base_fallback_state" init --yes \
-  "file://$base_fallback_origin" >/dev/null
+# TEMP-DIAG-180: remove after the macOS ownership diagnosis (init hang watch).
+base_fallback_init_status=0
+base_fallback_init_output=$("$root/lib/dot/public/test-timeout-v1" 90s \
+  env HOME="$base_fallback_home" XDG_STATE_HOME="$base_fallback_state" XDG_CONFIG_HOME='' \
+  "$DOT_TEST_ROOT/bin/dot" init --yes "file://$base_fallback_origin" 2>&1) || base_fallback_init_status=$?
+if [[ $base_fallback_init_status -eq 125 ]]; then
+  printf '%s\n' "HANG-DUMP init hit 90s timeout; output: $base_fallback_init_output"
+  ps -ef | head -60 || true
+  fail 'base-fallback init hung (TEMP-DIAG-180)'
+fi
+[[ $base_fallback_init_status -eq 0 ]] || fail "base-fallback init failed: $base_fallback_init_output"
 
 base_fallback_seed=$DOT_TEST_TMP/base-fallback-base-seed
 mkdir -p "$base_fallback_seed/.config/base-fallback"

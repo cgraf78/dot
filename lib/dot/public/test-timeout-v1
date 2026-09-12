@@ -949,8 +949,8 @@ def stream_requires_relay(fd: int) -> bool:
 
 # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis. diagnostic()
 # forks a writer child when stderr is piped, so high-frequency TEMP prints
-# would strand teardown; cap TEMP volume to the first few handshake events.
-_temp_diag_remaining = 12
+# would strand teardown; cap TEMP volume to handshake plus stop-phase events.
+_temp_diag_remaining = 48
 
 
 def _temp_diag(message: str) -> None:
@@ -2434,6 +2434,11 @@ def stop_process_group(first_signal: int) -> CleanupResult:
 
     def phase(signum: int, deadline: float, only_new: bool) -> bool:
         """Signal and require two complete empty session observations."""
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(
+            f"TEMP-DIAG-180 STOP-PHASE enter pid={os.getpid()} signum={signum} "
+            f"budget={deadline - time.monotonic():.2f}"
+        )
         group_delivered.clear()
         processes = observe(deadline)
         complete_exact_cohort = processes is not None and all(
@@ -2470,10 +2475,26 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             ):
                 consecutive_empty += 1
                 if consecutive_empty >= 2:
+                    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+                    _temp_diag(
+                        f"TEMP-DIAG-180 STOP-PHASE exit pid={os.getpid()} "
+                        f"signum={signum} result=True"
+                    )
                     return True
             else:
                 consecutive_empty = 0
             time.sleep(min(PROCESS_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        if processes is None:
+            live_summary = "observe-None"
+        else:
+            live_summary = ",".join(
+                str(item.pid) for item in processes if item.live
+            ) or "none-live"
+        _temp_diag(
+            f"TEMP-DIAG-180 STOP-PHASE exit pid={os.getpid()} signum={signum} "
+            f"result=False unsafe={unsafe_direct_member} live={live_summary}"
+        )
         return False
 
     try:
@@ -2524,12 +2545,21 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
         )
         lease_complete = lease_closed()
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        phase_complete = complete
         complete = (
             complete
             and known_adoptees_complete
             and relays_complete
             and unregistered_complete
             and lease_complete
+        )
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(
+            f"TEMP-DIAG-180 STOP-LEGS pid={os.getpid()} phases={phase_complete} "
+            f"adoptees={known_adoptees_complete} relays={relays_complete} "
+            f"unreg={unregistered_complete} lease={lease_complete} "
+            f"status={status} complete={complete}"
         )
         return CleanupResult(status, complete)
     finally:
