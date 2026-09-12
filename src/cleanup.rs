@@ -1793,6 +1793,12 @@ fn send_process_output_record(
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            // Darwin reports a momentarily full datagram buffer as ENOBUFS
+            // (raw 55, surfaced as `Uncategorized`), not `WouldBlock`.
+            // Retry it like any other transient backpressure signal instead
+            // of poisoning the channel; cancellation still wins at the top
+            // of the loop.
+            Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => {}
             Err(error) => {
                 channel
                     .failed
