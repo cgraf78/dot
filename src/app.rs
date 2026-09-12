@@ -9,6 +9,8 @@ use std::io::{IsTerminal as _, Write};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// An absolute `dot` executable explicitly authorized for an embedded runtime.
 ///
@@ -41,6 +43,8 @@ pub struct Runtime {
     source_root: PathBuf,
     env: BTreeMap<OsString, OsString>,
     executable: Option<RuntimeExecutable>,
+    bash: Arc<OnceLock<Result<crate::bash::Resolved, crate::bash::Error>>>,
+    bash_error_reported: Arc<AtomicBool>,
 }
 
 impl Runtime {
@@ -136,6 +140,8 @@ impl Runtime {
             source_root,
             env,
             executable: None,
+            bash: Arc::new(OnceLock::new()),
+            bash_error_reported: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -181,18 +187,19 @@ impl Runtime {
             })
     }
 
-    /// Resolve the Bash interpreter authorized by this invocation.
-    ///
-    /// An explicit `BASH` must already be absolute and executable. When it is
-    /// absent, direct native invocations select the first executable `bash` on
-    /// the snapshotted `PATH`; relative entries are anchored to [`Self::cwd`].
-    pub(crate) fn bash(&self) -> Option<PathBuf> {
-        match self.value("BASH") {
-            Some(value) => {
-                let path = PathBuf::from(value);
-                (path.is_absolute() && executable(&path)).then_some(path)
-            }
-            None => self.find_on_path("bash"),
+    /// Resolve and cache the Bash 4+ capability for retained shell boundaries.
+    pub(crate) fn bash(&self) -> Result<crate::bash::Resolved, crate::bash::Error> {
+        self.bash
+            .get_or_init(|| crate::bash::resolve(&self.env, &self.cwd))
+            .clone()
+    }
+
+    /// Return the cached Bash failure diagnostic at most once per invocation.
+    pub(crate) fn bash_error_line_once(&self, error: &crate::bash::Error) -> Vec<u8> {
+        if self.bash_error_reported.swap(true, Ordering::AcqRel) {
+            Vec::new()
+        } else {
+            error.line()
         }
     }
 
@@ -218,11 +225,6 @@ fn validate_cwd(cwd: &Path) -> std::io::Result<()> {
             "dot runtime working directory must be absolute",
         ))
     }
-}
-
-fn executable(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 /// Borrowed stdout and stderr for one Dot invocation.
@@ -361,6 +363,252 @@ fn xdg_home(env: &BTreeMap<OsString, OsString>, key: &str, home: &Path, fallback
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+
+    use dot_test_support::TempDir;
+
+    fn test_runtime(cwd: &Path, entries: &[(&str, &OsStr)]) -> Runtime {
+        let mut env = BTreeMap::from([
+            (OsString::from("HOME"), cwd.as_os_str().to_owned()),
+            (
+                OsString::from("DOT_SOURCE_ROOT"),
+                OsString::from(env!("CARGO_MANIFEST_DIR")),
+            ),
+        ]);
+        for (key, value) in entries {
+            env.insert(OsString::from(key), (*value).to_os_string());
+        }
+        Runtime::from_env(&env, cwd).expect("runtime")
+    }
+
+    fn bash_link(root: &Path, relative: &str) -> PathBuf {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("bash parent")).expect("bash parent");
+        symlink(dot_test_support::bash(), &path).expect("bash link");
+        path
+    }
+
+    fn fake_bash(root: &Path, relative: &str, body: &str) -> PathBuf {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("bash parent")).expect("bash parent");
+        std::fs::write(&path, body).expect("fake Bash");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("fake Bash mode");
+        path
+    }
+
+    #[test]
+    fn bash_prefers_strict_dot_bash_override() {
+        let scope = TempDir::new_exec("bash-dot-override").expect("scope");
+        let explicit = bash_link(scope.path(), "explicit/bash");
+        let ambient = bash_link(scope.path(), "ambient/bash");
+        let runtime = test_runtime(
+            scope.path(),
+            &[
+                ("DOT_BASH", explicit.as_os_str()),
+                ("BASH", ambient.as_os_str()),
+                ("PATH", OsStr::new("")),
+            ],
+        );
+
+        assert_eq!(runtime.bash().expect("selected Bash").path(), explicit);
+    }
+
+    #[test]
+    fn bash_rejects_invalid_dot_bash_without_fallback() {
+        let scope = TempDir::new_exec("bash-invalid-dot-override").expect("scope");
+        let ambient = bash_link(scope.path(), "ambient/bash");
+        let missing = scope.path().join("missing/bash");
+        let runtime = test_runtime(
+            scope.path(),
+            &[
+                ("DOT_BASH", missing.as_os_str()),
+                ("BASH", ambient.as_os_str()),
+                ("PATH", OsStr::new("")),
+            ],
+        );
+
+        assert!(runtime.bash().is_err());
+    }
+
+    #[test]
+    fn bash_treats_invalid_ambient_bash_as_a_soft_hint() {
+        let scope = TempDir::new_exec("bash-soft-ambient").expect("scope");
+        let path_bash = bash_link(scope.path(), "path/bash");
+        let missing = scope.path().join("missing/bash");
+        let path = path_bash.parent().expect("PATH directory");
+        let runtime = test_runtime(
+            scope.path(),
+            &[("BASH", missing.as_os_str()), ("PATH", path.as_os_str())],
+        );
+
+        assert_eq!(runtime.bash().expect("PATH Bash").path(), path_bash);
+    }
+
+    #[test]
+    fn bash_rejects_pre_v4_ambient_hint_and_uses_path() {
+        let scope = TempDir::new_exec("bash-old-ambient").expect("scope");
+        let old = fake_bash(
+            scope.path(),
+            "old/bash",
+            "#!/bin/sh\nprintf 'cgraf78-dot-bash-v1:3:3.2.57(1)-release\\n'\n",
+        );
+        let path_bash = bash_link(scope.path(), "path/bash");
+        let runtime = test_runtime(
+            scope.path(),
+            &[
+                ("BASH", old.as_os_str()),
+                (
+                    "PATH",
+                    path_bash.parent().expect("PATH directory").as_os_str(),
+                ),
+            ],
+        );
+
+        assert_eq!(runtime.bash().expect("PATH Bash").path(), path_bash);
+    }
+
+    #[test]
+    fn bash_ignores_relative_path_entries() {
+        let scope = TempDir::new_exec("bash-relative-path").expect("scope");
+        let relative = bash_link(scope.path(), "relative/bin/bash");
+        let absolute = bash_link(scope.path(), "absolute/bin/bash");
+        let path = std::env::join_paths([
+            Path::new("relative/bin"),
+            absolute.parent().expect("absolute PATH directory"),
+        ])
+        .expect("PATH");
+        let runtime = test_runtime(scope.path(), &[("PATH", path.as_os_str())]);
+
+        assert_eq!(runtime.bash().expect("absolute PATH Bash").path(), absolute);
+        assert_ne!(runtime.bash().expect("cached Bash").path(), relative);
+    }
+
+    #[test]
+    fn bash_uses_prefix_after_path_candidates() {
+        let scope = TempDir::new_exec("bash-prefix").expect("scope");
+        let prefix = scope.path().join("prefix");
+        let prefix_bash = bash_link(&prefix, "bin/bash");
+        let runtime = test_runtime(
+            scope.path(),
+            &[
+                ("PATH", OsStr::new("/definitely/missing")),
+                ("PREFIX", prefix.as_os_str()),
+            ],
+        );
+
+        assert_eq!(runtime.bash().expect("PREFIX Bash").path(), prefix_bash);
+    }
+
+    #[test]
+    fn bash_selection_is_lazy_and_shared_by_runtime_clones() {
+        let scope = TempDir::new_exec("bash-selection-cache").expect("scope");
+        let marker = scope.path().join("probe-count");
+        let real = dot_test_support::bash();
+        let wrapper = fake_bash(
+            scope.path(),
+            "wrapper/bash",
+            &format!(
+                "#!/bin/sh\nprintf x >>'{}'\nexec '{}' \"$@\"\n",
+                marker.display(),
+                real.display()
+            ),
+        );
+        let poison = scope.path().join("bash-env");
+        let poison_marker = scope.path().join("bash-env-ran");
+        std::fs::write(
+            &poison,
+            format!("printf poison >'{}'\n", poison_marker.display()),
+        )
+        .expect("BASH_ENV");
+        let runtime = test_runtime(
+            scope.path(),
+            &[
+                ("DOT_BASH", wrapper.as_os_str()),
+                ("BASH_ENV", poison.as_os_str()),
+            ],
+        );
+        let clone = runtime.clone();
+
+        assert!(!marker.exists(), "Runtime construction must not probe Bash");
+        assert_eq!(runtime.bash().expect("selected Bash").path(), wrapper);
+        assert_eq!(clone.bash().expect("shared selected Bash").path(), wrapper);
+        assert_eq!(std::fs::read(&marker).expect("probe marker"), b"x");
+        assert!(
+            !poison_marker.exists(),
+            "BASH_ENV must not run during probe"
+        );
+    }
+
+    #[test]
+    fn failed_bash_selection_is_cached_across_runtime_clones() {
+        let scope = TempDir::new_exec("bash-negative-cache").expect("scope");
+        let marker = scope.path().join("probe-count");
+        let old = fake_bash(
+            scope.path(),
+            "old/bash",
+            &format!(
+                "#!/bin/sh\nprintf x >>'{}'\nprintf 'cgraf78-dot-bash-v1:3:3.2.57(1)-release\\n'\n",
+                marker.display()
+            ),
+        );
+        let runtime = test_runtime(scope.path(), &[("DOT_BASH", old.as_os_str())]);
+        let clone = runtime.clone();
+
+        assert!(runtime.bash().is_err());
+        assert!(clone.bash().is_err());
+        assert_eq!(std::fs::read(&marker).expect("probe marker"), b"x");
+    }
+
+    #[test]
+    fn bash_failure_diagnostic_is_shared_once_across_runtime_clones() {
+        let scope = TempDir::new_exec("bash-error-once").expect("scope");
+        let missing = scope.path().join("missing/bash");
+        let runtime = test_runtime(scope.path(), &[("DOT_BASH", missing.as_os_str())]);
+        let clone = runtime.clone();
+        let error = runtime.bash().expect_err("invalid Bash");
+
+        assert_eq!(runtime.bash_error_line_once(&error), error.line());
+        assert!(clone.bash_error_line_once(&error).is_empty());
+    }
+
+    #[test]
+    fn concurrent_runtime_clones_share_one_bash_probe() {
+        let scope = TempDir::new_exec("bash-concurrent-cache").expect("scope");
+        let marker = scope.path().join("probe-count");
+        let real = dot_test_support::bash();
+        let wrapper = fake_bash(
+            scope.path(),
+            "wrapper/bash",
+            &format!(
+                "#!/bin/sh\nprintf x >>'{}'\nexec '{}' \"$@\"\n",
+                marker.display(),
+                real.display()
+            ),
+        );
+        let runtime = test_runtime(scope.path(), &[("DOT_BASH", wrapper.as_os_str())]);
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let runtime = runtime.clone();
+                let expected = wrapper.clone();
+                scope.spawn(move || assert_eq!(runtime.bash().expect("Bash").path(), expected));
+            }
+        });
+        assert_eq!(std::fs::read(&marker).expect("probe marker"), b"x");
+    }
+
+    #[test]
+    fn independent_runtimes_keep_independent_bash_caches() {
+        let scope = TempDir::new_exec("bash-independent-cache").expect("scope");
+        let first = bash_link(scope.path(), "first/bash");
+        let second = bash_link(scope.path(), "second/bash");
+        let first_runtime = test_runtime(scope.path(), &[("DOT_BASH", first.as_os_str())]);
+        let second_runtime = test_runtime(scope.path(), &[("DOT_BASH", second.as_os_str())]);
+
+        assert_eq!(first_runtime.bash().expect("first Bash").path(), first);
+        assert_eq!(second_runtime.bash().expect("second Bash").path(), second);
+    }
 
     #[test]
     fn process_runtime_republishes_derived_source_root() {

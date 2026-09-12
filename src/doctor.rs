@@ -62,8 +62,16 @@ fn run_configured(
         return 1;
     }
     let mut recorder = Recorder::new();
-    let runtime_snapshot =
-        runtime_snapshot(runtime, &source, crate::config::extensions_enabled(config));
+    let bash_required = crate::config::extensions_enabled(config)
+        || config.provider == crate::config::Provider::Shdeps;
+    if bash_required {
+        if let Err(error) = runtime.bash() {
+            let _ = streams
+                .stderr
+                .write_all(&runtime.bash_error_line_once(&error));
+        }
+    }
+    let runtime_snapshot = runtime_snapshot(runtime, &source, bash_required);
     let engine = engine_snapshot(runtime, &source, &home);
     crate::doctor_orchestrator::check_runtime(
         &mut recorder,
@@ -255,7 +263,11 @@ fn runtime_snapshot(
     source: &str,
     bash_required: bool,
 ) -> RuntimeSnapshot {
-    let (bash_version, bash_major) = bash_version(runtime);
+    let (bash_version, bash_major) = if bash_required {
+        bash_version(runtime)
+    } else {
+        (Vec::new(), 0)
+    };
     let checkout_root = git_output(
         runtime,
         Path::new(source),
@@ -289,39 +301,10 @@ fn release_root(root: &Path) -> bool {
 }
 
 fn bash_version(runtime: &crate::app::Runtime) -> (Vec<u8>, u64) {
-    let Some(bash) = runtime.bash() else {
+    let Ok(bash) = runtime.bash() else {
         return (Vec::new(), 0);
     };
-    // `bash -c` would evaluate caller-controlled startup state such as
-    // BASH_ENV merely to render a health row. The version flag is a
-    // non-script capability probe, and an empty environment keeps the
-    // observation outside the extension execution boundary.
-    let output = Command::new(bash)
-        .arg("--version")
-        .env_clear()
-        .current_dir(runtime.cwd())
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-    let version = output
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| bash_version_field(&output.stdout))
-        .unwrap_or_default();
-    let major = String::from_utf8_lossy(&version)
-        .split('.')
-        .next()
-        .and_then(|part| part.parse().ok())
-        .unwrap_or(0);
-    (version, major)
-}
-
-fn bash_version_field(output: &[u8]) -> Option<Vec<u8>> {
-    let line = output.split(|byte| *byte == b'\n').next()?;
-    let marker = b"version ";
-    let start = line.windows(marker.len()).position(|part| part == marker)? + marker.len();
-    let field = line[start..].split(|byte| *byte == b' ').next()?;
-    (!field.is_empty()).then(|| field.to_vec())
+    (bash.version().to_vec(), bash.major())
 }
 
 fn engine_snapshot(runtime: &crate::app::Runtime, source: &str, home: &str) -> EngineSnapshot {
@@ -407,15 +390,9 @@ fn provider_records(
             Path::new(path),
         )
     });
-    let actual = binary.as_ref().and_then(|binary| {
-        crate::shdeps_env_abi::abi_version(
-            binary,
-            runtime
-                .value("_DOT_SHDEPS_ABI_TIMEOUT_SECONDS")
-                .and_then(OsStr::to_str)
-                .unwrap_or("10"),
-        )
-    });
+    let actual = binary
+        .as_ref()
+        .and_then(|binary| crate::shdeps_provider::doctor_abi_version(runtime, binary));
     crate::doctor_checks::check_provider(&ProviderInputs {
         home,
         dependency_provider: provider,
@@ -600,10 +577,11 @@ fn extensions(
         .map(|entry| entry.as_bytes().to_vec())
         .collect();
     let mut status = 0;
-    let Some(bash) = doctor_bash(runtime) else {
+    let Ok(bash) = doctor_bash(runtime) else {
         return 1;
     };
-    let mut worker = crate::hook_worker::Worker::with_doctor(runtime, root, bash);
+    let mut worker =
+        crate::hook_worker::Worker::with_doctor(runtime, root, bash.path().to_path_buf());
     for spec in discovery.specs {
         let mut launch = |call: &crate::doctor_orchestrator::WorkerInvocation<'_>| {
             let outcome = worker.doctor(
@@ -677,7 +655,7 @@ fn value_or(runtime: &crate::app::Runtime, key: &str, fallback: &str) -> String 
         .to_string()
 }
 
-fn doctor_bash(runtime: &crate::app::Runtime) -> Option<PathBuf> {
+fn doctor_bash(runtime: &crate::app::Runtime) -> Result<crate::bash::Resolved, crate::bash::Error> {
     runtime.bash()
 }
 

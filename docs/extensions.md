@@ -15,10 +15,16 @@ helper libraries—are ignored by the standalone engine.
 
 Hook names use an optional numeric ordering prefix plus a lowercase identity.
 `NAME.serial.sh` adds a barrier without changing the identity or lexical sort
-key. Duplicate identities are fatal before any extension runs. Each extension
-runs in a fresh invocation of the absolute Bash selected by the `dot` launcher;
-`PATH` cannot substitute another interpreter. Workers use `--noprofile` and
-`--norc`, start in `$HOME`, close stdin, set `umask 077`, enable
+key. Duplicate identities are fatal before any extension runs. Each shell hook
+runs in a fresh invocation of one validated Bash 4+ interpreter. A non-empty
+`DOT_BASH` is a strict override. Otherwise Dot tries the inherited `BASH`, only
+absolute `PATH` entries, `$PREFIX/bin/bash`, and fixed platform locations in
+that order. Relative and empty `PATH` entries cannot substitute an interpreter
+from the working directory. Selection is lazy and shared by every worker in an
+invocation; obsolete `bash-v1` bootstrap hints are not consulted. `dot doctor`
+uses the same cached probe when checking configured shell-hook or Shdeps
+capabilities. Workers use `--noprofile` and `--norc`, start in `$HOME`, close
+stdin, set `umask 077`, enable
 `errexit`/`nounset`/`pipefail`, clear every resettable trap, and start with
 `extglob`, `nocasematch`, and `nullglob` disabled. POSIX shell semantics do not
 let a shell reset signals it inherited as ignored, so those exact host

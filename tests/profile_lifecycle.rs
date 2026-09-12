@@ -310,6 +310,45 @@ fn run_one_mints_one_use_context_relays_status_output_and_cleans_scratch() {
 }
 
 #[test]
+fn run_one_preserves_non_utf8_worker_diagnostics() {
+    let scope = TempDir::new("ledger-run-bytes").unwrap();
+    let home = scope.path().to_string_lossy();
+    let record = checkout(scope.path(), "web", true);
+    let logger = log();
+    let expected = b"resolver path: /tmp/bash-\xff";
+    let mut worker = Fake {
+        outcomes: vec![WorkerOutcome {
+            rc: 1,
+            output: expected.to_vec(),
+        }],
+        calls: 0,
+        contexts: vec![],
+    };
+    let mut out = vec![];
+    let mut warnings = vec![];
+
+    let rc = lifecycle::run_one(
+        &lifecycle::RunInputs {
+            record: &record,
+            home: &home,
+            euid: euid(),
+            tmpdir: scope.path(),
+            verbose: false,
+            log: &logger,
+        },
+        &mut worker,
+        &mut out,
+        &mut warnings,
+    );
+
+    assert_eq!(rc, 1);
+    assert!(out.is_empty());
+    let mut expected_line = expected.to_vec();
+    expected_line.push(b'\n');
+    assert_eq!(warnings, expected_line);
+}
+
+#[test]
 fn retire_skips_eligible_runs_all_retiring_and_latches_failures() {
     let d = TempDir::new("ledger-retire").unwrap();
     let home = d.path().to_string_lossy();
