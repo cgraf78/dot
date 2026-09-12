@@ -118,6 +118,35 @@ fn repos_git_stream_child() {
     println!("DOT_RC={rc}");
 }
 
+/// `pid:ppid:stat:comm` for `pid` plus every process parented to it, as a
+/// single-line wedge snapshot. Best-effort: `ps` failure yields a marker.
+fn ps_snapshot(pid: u32) -> String {
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,stat=,comm="])
+        .output();
+    let Ok(output) = output else {
+        return "ps-failed".to_owned();
+    };
+    let wanted = pid.to_string();
+    let rows: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let row_pid = fields.next()?;
+            let row_ppid = fields.next()?;
+            let stat = fields.next()?;
+            let comm = fields.next()?;
+            (row_pid == wanted || row_ppid == wanted)
+                .then(|| format!("{row_pid}:{row_ppid}:{stat}:{comm}"))
+        })
+        .collect();
+    if rows.is_empty() {
+        "no-rows".to_owned()
+    } else {
+        rows.join(" ")
+    }
+}
+
 #[test]
 fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
     const HELPER: &str = "DOT_REPOS_GIT_PTY_HELPER";
@@ -200,7 +229,13 @@ fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
             // helper is even killable, so a timeout names the wedge
             // instead of just the bound. Never block here: poll the
             // reap briefly, then fail; master close HUPs strays.
+            // Snapshot the helper's kernel state plus its live children
+            // BEFORE signaling: a SIGKILL-proof wedge is a kernel wait
+            // (uninterruptible/exiting), and the state plus whom it waits
+            // on distinguishes driver, exit-teardown, and userspace spins.
             let marker_exists = observed.exists();
+            let helper_pid = child.id();
+            let ps_before = ps_snapshot(helper_pid);
             let _ = child.kill();
             let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             let mut reaped = None;
@@ -211,8 +246,9 @@ fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
+            let ps_after = ps_snapshot(helper_pid);
             panic!(
-                "PTY Git helper did not stop (marker_exists={marker_exists}, reaped={reaped:?})"
+                "PTY Git helper did not stop (marker_exists={marker_exists}, reaped={reaped:?}, before=[{ps_before}], after=[{ps_after}])"
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
