@@ -2232,11 +2232,53 @@ def signal_member(member: MemberHandle, signum: int) -> bool:
     return True
 
 
+_libc_waitid = None
+
+
+def _waitid_exited_ctypes(pid: int) -> bool:
+    """waitid(P_PID, WEXITED|WNOHANG|WNOWAIT) for Pythons without os.waitid.
+
+    macOS libc provides waitid(2) but CPython does not expose os.waitid
+    there. Constants are the Apple ABI values (matching the Rust libc
+    crate's unix/bsd/apple definitions): P_PID=1, WEXITED=0x04,
+    WNOHANG=0x01, WNOWAIT=0x20; si_pid sits at byte 12 of siginfo_t
+    (three int32 fields precede the pid_t). Like os.waitid, EINTR
+    reports not-exited while any other errno propagates.
+    """
+    global _libc_waitid
+    import ctypes
+
+    if _libc_waitid is None:
+        _libc_waitid = ctypes.CDLL(None, use_errno=True).waitid
+        _libc_waitid.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        _libc_waitid.restype = ctypes.c_int
+    info = ctypes.create_string_buffer(128)
+    if _libc_waitid(1, pid, info, 0x04 | 0x01 | 0x20) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EINTR:
+            return False
+        raise OSError(error, os.strerror(error))
+    return struct.unpack_from("i", info, 12)[0] != 0
+
+
 def leader_exited() -> bool:
     """Observe leader exit without reaping its PID or group identity."""
     assert process is not None
+    waitid = getattr(os, "waitid", None)
+    if waitid is None:
+        # Only Darwin is known to provide waitid(2) without os.waitid;
+        # other waitid-less platforms fail closed instead of guessing
+        # unfamiliar wait options.
+        if sys.platform != "darwin":
+            raise AttributeError("os.waitid is required outside macOS")
+        return _waitid_exited_ctypes(process.pid)
     try:
-        result = os.waitid(
+        result = waitid(
             os.P_PID,
             process.pid,
             os.WEXITED | os.WNOHANG | os.WNOWAIT,
