@@ -1635,6 +1635,41 @@ fn wait_for_identity_exit(identity: &TestProcessIdentity, timeout: std::time::Du
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Wait for a PTY-backed child while draining its master, returning the
+/// collected output with whether the child exited in time.
+///
+/// BSD line disciplines block exit teardown until pending slave output
+/// drains, so waiting on the child before first reading wedges the exit
+/// on macOS (Linux discards instead). Drain concurrently instead.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_bounded_draining(
+    child: &TestSessionChild,
+    terminal: &mut File,
+    timeout: std::time::Duration,
+) -> (bool, Vec<u8>) {
+    use std::io::Read as _;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut output = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        match terminal.read(&mut chunk) {
+            Ok(0) => {}
+            Ok(count) => output.extend_from_slice(&chunk[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(libc::EIO) => {}
+            Err(error) => panic!("read PTY master while waiting: {error}"),
+        }
+        if child.wait_bounded(std::time::Duration::from_millis(50)) {
+            return (true, output);
+        }
+        if std::time::Instant::now() >= deadline {
+            return (false, output);
+        }
+    }
+}
+
 fn read_nonblocking_to_end(file: &mut File, timeout: std::time::Duration) -> Vec<u8> {
     let deadline = std::time::Instant::now() + timeout;
     let mut output = Vec::new();
@@ -2107,11 +2142,16 @@ fn provider_foreground_interrupt_propagates_without_signaling_dot() {
     terminal
         .write_all(b"\x03")
         .expect("send the terminal VINTR character");
+    let (exited, mut output) =
+        wait_bounded_draining(&dot, &mut terminal, std::time::Duration::from_secs(10));
     assert!(
-        dot.wait_bounded(std::time::Duration::from_secs(10)),
+        exited,
         "Dot did not exit after the provider foreground interrupt"
     );
-    let output = read_nonblocking_to_end(&mut terminal, std::time::Duration::from_secs(5));
+    output.extend_from_slice(&read_nonblocking_to_end(
+        &mut terminal,
+        std::time::Duration::from_secs(5),
+    ));
     let foreground_gone = wait_for_identity_exit(&foreground, std::time::Duration::from_secs(5));
     let status = dot.reap().expect("reap PTY-backed Dot");
 
