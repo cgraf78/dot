@@ -474,6 +474,36 @@ mod tests {
         snapshot
     }
 
+    // TEMP-DIAG-180: remove with the recvmsg diag. Bytes waiting on
+    // the PTY master without consuming them ( ioctl FIONREAD ).
+    fn pty_pending_bytes(master: &std::os::fd::OwnedFd) -> String {
+        use std::os::fd::AsRawFd as _;
+        let mut pending: libc::c_int = 0;
+        // SAFETY: FIONREAD only writes the pending count through the
+        // live master descriptor; request cast matches each platform.
+        let result = unsafe { libc::ioctl(master.as_raw_fd(), libc::FIONREAD as _, &mut pending) };
+        if result == 0 && pending >= 0 {
+            pending.to_string()
+        } else {
+            format!("ioctl-err({})", std::io::Error::last_os_error())
+        }
+    }
+
+    // TEMP-DIAG-180: remove with the recvmsg diag. Single-letter state
+    // for one pid; never fails the test itself.
+    fn helper_state(pid: u32) -> String {
+        match std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            Ok(_) => "ps-exited-nonzero".to_string(),
+            Err(error) => format!("ps-unavailable({error})"),
+        }
+    }
+
     // TEMP-DIAG-180: remove with the recvmsg diag. Nonblocking drain
     // of the sudo helper's PTY master for failure triage.
     fn drain_pty_master(master: &std::os::fd::OwnedFd) -> Vec<u8> {
@@ -610,6 +640,13 @@ mod tests {
         // below keeps the budget honest.
         let stop_started = std::time::Instant::now();
         let deadline = stop_started + std::time::Duration::from_secs(15);
+        // TEMP-DIAG-180: remove with the recvmsg diag. The helper exits
+        // just after every deadline tried (4s, 15s): sample output
+        // progress (FIONREAD, non-consuming) and process state every 500ms
+        // to learn whether the inner test itself is slow (steady output
+        // growth to the deadline) or done-but-unreaped (output complete,
+        // zombie visible while try_wait still misses it).
+        let mut last_probe = stop_started;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 // TEMP-DIAG-180: remove with the recvmsg diag.
@@ -618,6 +655,16 @@ mod tests {
                     stop_started.elapsed().as_millis()
                 );
                 break status;
+            }
+            if last_probe.elapsed() >= std::time::Duration::from_millis(500) {
+                last_probe = std::time::Instant::now();
+                // TEMP-DIAG-180: remove with the recvmsg diag.
+                eprintln!(
+                    "TEMP-DIAG-180: stop t+{}ms master_pending={} helper_state={}",
+                    stop_started.elapsed().as_millis(),
+                    pty_pending_bytes(&master),
+                    helper_state(child.id()),
+                );
             }
             if std::time::Instant::now() >= deadline {
                 // TEMP-DIAG-180: remove with the recvmsg diag. The
