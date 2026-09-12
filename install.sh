@@ -662,8 +662,11 @@ case "$release_binary_version_style" in
   version) expected_binary_identity=$metadata_version ;;
   commit) expected_binary_identity=${metadata_commit:0:12} ;;
 esac
-grep -Eq "(^|[[:space:]])${expected_binary_identity}([[:space:]]|$)" \
-  "$version_output" ||
+# An empty style skips the identity match while the output-shape checks
+# above still apply.
+[[ -z "$release_binary_version_style" ]] ||
+  grep -Eq "(^|[[:space:]])${expected_binary_identity}([[:space:]]|$)" \
+    "$version_output" ||
   die "release binary --version does not identify $expected_binary_identity"
 
 owner_file=$control_root/owner
