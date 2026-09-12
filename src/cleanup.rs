@@ -722,7 +722,16 @@ fn publish_nested_supervisor(
     let (mut local, parent) = internal_stream_pair()?;
     local.set_nonblocking(true)?;
     send_nested_registration(control_fd, boundary, parent.as_raw_fd())?;
-    drop(parent);
+    // Hold our copy of the registered end until the ACK below, not just
+    // until the send. The datagram (with its in-flight descriptor) can
+    // sit unread while the worker ticks, and closing our copy during
+    // that window corrupts the pending macOS install: the worker has
+    // received the same fd number twice (two map entries, one socket)
+    // and links with phantom queued bytes plus HUP despite open peers.
+    // Keeping the sender copy open until acknowledged removes the
+    // close-during-queue race; the binding drops at scope end on every
+    // return path.
+    let _hold_parent_until_ack = parent;
     let deadline = cleanup_deadline();
     let mut reply = [0u8; 1];
     loop {
@@ -3675,6 +3684,26 @@ impl NestedControlWorker {
                             if !valid {
                                 // TEMP-DIAG-180: remove with the recvmsg diag.
                                 eprintln!("TEMP-DIAG-180: nested-control cleared: invalid frame");
+                                let mut state =
+                                    state.lock().unwrap_or_else(|error| error.into_inner());
+                                state.complete = false;
+                                state.supervisors.clear();
+                                links.clear();
+                                suspect.clear();
+                                break;
+                            }
+                            // Fail closed on a duplicate install: macOS has
+                            // handed the same fd number out twice while the
+                            // first entry still mapped it, so both entries
+                            // would read one socket. Never acknowledge it.
+                            let incoming_fd = std::os::fd::AsRawFd::as_raw_fd(&registration.link);
+                            if links.values().any(|(_, link, _)| {
+                                std::os::fd::AsRawFd::as_raw_fd(link) == incoming_fd
+                            }) {
+                                // TEMP-DIAG-180: remove with the recvmsg diag.
+                                eprintln!(
+                                    "TEMP-DIAG-180: nested-control cleared: duplicate install fd={incoming_fd}"
+                                );
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -6780,6 +6809,11 @@ mod tests {
             }
         }
         let mut registrations = Vec::new();
+        // Hold every sent end until the burst below converges (like
+        // publish_nested_supervisor holds until ACK): closing a copy
+        // while its datagram still queues corrupts the pending macOS
+        // install (duplicate fd numbers, phantom bytes plus HUP).
+        let mut sent_ends = Vec::new();
         for index in 0..128 {
             let (local, parent) = internal_stream_pair().unwrap();
             send_nested_registration_with_pid(
@@ -6789,7 +6823,7 @@ mod tests {
                 std::process::id(),
             )
             .unwrap();
-            drop(parent);
+            sent_ends.push(parent);
             registrations.push(local);
         }
 
@@ -6841,7 +6875,9 @@ mod tests {
             std::process::id().saturating_add(1),
         )
         .unwrap();
-        drop(parent);
+        // Hold the sent end past the receive below: closing it while its
+        // datagram still queues corrupts the pending macOS install.
+        let _hold_parent_until_received = parent;
 
         poll_until(Instant::now() + Duration::from_secs(1), || {
             let state = state.lock().unwrap_or_else(|error| error.into_inner());
