@@ -1954,6 +1954,18 @@ const CHECKED: &[u8] =
 [4/5] Cleanup    ok       no base repo                                   Ns\n\
 Done in Ns. Reload your shell: source ~/.bashrc\n";
 
+/// TEMP-DIAG-180: strip temp diagnostic lines so exact-stderr assertions stay
+/// green while the macOS ensure-failure variant is being identified.
+fn strip_temp_diag(stderr: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(stderr.len());
+    for line in stderr.split_inclusive(|b| *b == b'\n') {
+        if !line.starts_with(b"TEMP-DIAG-180") {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}
+
 fn assert_cli(output: &Output, status: i32, stdout: &[u8], stderr: &[u8]) {
     assert_eq!(
         output.status.code(),
@@ -1963,7 +1975,7 @@ fn assert_cli(output: &Output, status: i32, stdout: &[u8], stderr: &[u8]) {
         output.stderr
     );
     assert_eq!(normalize_elapsed(&output.stdout), stdout);
-    assert_eq!(output.stderr, stderr);
+    assert_eq!(strip_temp_diag(&output.stderr), stderr);
 }
 
 #[test]
