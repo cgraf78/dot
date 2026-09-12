@@ -3652,12 +3652,11 @@ impl NestedControlWorker {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_stop = stop.clone();
         let thread = std::thread::spawn(move || {
-            // Third tuple element is the insert instant: links younger
-            // than the settle window skip liveness reads (see below).
-            let mut links = std::collections::BTreeMap::<
-                String,
-                (u32, std::os::unix::net::UnixStream, Instant),
-            >::new();
+            let mut links =
+                std::collections::BTreeMap::<String, (u32, std::os::unix::net::UnixStream)>::new();
+            // Boundaries that read EOF on the previous tick but have not
+            // confirmed it yet (see the liveness scan below).
+            let mut suspect = std::collections::HashSet::<String>::new();
             while !worker_stop.load(std::sync::atomic::Ordering::Acquire) {
                 let mut received = 0usize;
                 loop {
@@ -3684,6 +3683,7 @@ impl NestedControlWorker {
                                 state.complete = false;
                                 state.supervisors.clear();
                                 links.clear();
+                                suspect.clear();
                                 break;
                             }
                             // Record before acknowledging: the ACK tells the
@@ -3704,6 +3704,7 @@ impl NestedControlWorker {
                                 state.complete = false;
                                 state.supervisors.clear();
                                 links.clear();
+                                suspect.clear();
                                 break;
                             }
                             // TEMP-DIAG-180: remove with the recvmsg diag.
@@ -3714,7 +3715,7 @@ impl NestedControlWorker {
                             );
                             links.insert(
                                 registration.boundary,
-                                (registration.pid, registration.link, Instant::now()),
+                                (registration.pid, registration.link),
                             );
                         }
                         Ok(None) => break,
@@ -3727,36 +3728,40 @@ impl NestedControlWorker {
                             state.complete = false;
                             state.supervisors.clear();
                             links.clear();
+                            suspect.clear();
                             break;
                         }
                     }
                 }
                 let mut closed = Vec::new();
-                let scan = Instant::now();
-                for (boundary, (_pid, link, born)) in &mut links {
-                    // Settle window: on macOS a freshly received link can
-                    // read a stable-but-spurious 0 on its first liveness
-                    // check (every observed spurious EOF fired within ~1
-                    // datagram of its insert, with the peer held open).
-                    // Real peer closes persist, so skipping fresh links
-                    // only delays withdrawal detection by the window.
-                    if scan.saturating_duration_since(*born) < Duration::from_millis(5) {
-                        continue;
-                    }
+                for (boundary, (_pid, link)) in &mut links {
                     let mut byte = [0u8; 1];
                     match link.read(&mut byte) {
                         Ok(0) => {
-                            // TEMP-DIAG-180: remove with the recvmsg diag.
-                            // A confirmatory read distinguishes a real peer
-                            // close from a spurious first read.
-                            let mut confirm_byte = [0u8; 1];
-                            let confirm = link.read(&mut confirm_byte);
-                            eprintln!(
-                                "TEMP-DIAG-180: nested-control link EOF: {boundary} fd={} age_ms={} confirm={confirm:?}",
-                                std::os::fd::AsRawFd::as_raw_fd(link),
-                                born.elapsed().as_millis(),
-                            );
-                            closed.push(boundary.clone())
+                            // Tick-confirmed EOF: on macOS a link's first
+                            // liveness read can return a spurious 0 with
+                            // the peer held open (never observed twice,
+                            // never on a later tick). A real peer close
+                            // reads 0 on every tick (EOF is sticky), so
+                            // only the second consecutive EOF removes the
+                            // link; a single EOF merely flags it. This
+                            // costs one tick (1ms) of withdrawal latency.
+                            if suspect.contains(boundary.as_str()) {
+                                // TEMP-DIAG-180: remove with the recvmsg diag.
+                                eprintln!(
+                                    "TEMP-DIAG-180: nested-control link EOF confirmed: {boundary} fd={}",
+                                    std::os::fd::AsRawFd::as_raw_fd(link),
+                                );
+                                suspect.remove(boundary.as_str());
+                                closed.push(boundary.clone())
+                            } else {
+                                // TEMP-DIAG-180: remove with the recvmsg diag.
+                                eprintln!(
+                                    "TEMP-DIAG-180: nested-control link EOF suspect: {boundary} fd={}",
+                                    std::os::fd::AsRawFd::as_raw_fd(link),
+                                );
+                                suspect.insert(boundary.clone());
+                            }
                         }
                         Ok(_) => {
                             // TEMP-DIAG-180: remove with the recvmsg diag.
@@ -3766,16 +3771,22 @@ impl NestedControlWorker {
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.complete = false;
                             state.supervisors.clear();
+                            suspect.clear();
                             closed.extend(links.keys().cloned());
                             break;
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            suspect.remove(boundary.as_str());
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                            suspect.remove(boundary.as_str());
+                        }
                         Err(error) => {
                             // TEMP-DIAG-180: remove with the recvmsg diag.
                             eprintln!(
                                 "TEMP-DIAG-180: nested-control link read error: {boundary} {error:?}"
                             );
+                            suspect.remove(boundary.as_str());
                             closed.push(boundary.clone())
                         }
                     }
@@ -3784,6 +3795,7 @@ impl NestedControlWorker {
                     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                     for boundary in closed {
                         links.remove(&boundary);
+                        suspect.remove(&boundary);
                         state.supervisors.remove(&boundary);
                     }
                 }
