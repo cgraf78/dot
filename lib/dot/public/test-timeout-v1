@@ -744,6 +744,8 @@ def publish_nested_supervisor(
         parent.close()
         parent = None
         local.setblocking(False)
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH sent pid={os.getpid()} token={token}")
         deadline = time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
         with selectors.DefaultSelector() as selector:
             selector.register(local, selectors.EVENT_READ)
@@ -752,12 +754,18 @@ def publish_nested_supervisor(
                     raise InterruptedError("nested-supervisor registration interrupted")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+                    _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH ack timeout pid={os.getpid()}")
                     raise TimeoutError("nested-supervisor registration timed out")
                 if not selector.select(min(remaining, PROCESS_POLL_SECONDS)):
                     continue
                 reply = local.recv(2)
                 if reply == b"\1":
+                    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+                    _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH acked pid={os.getpid()}")
                     return local
+                # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+                _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH rejected pid={os.getpid()} reply={reply!r}")
                 raise OSError(errno.EPROTO, "nested-supervisor registration was rejected")
     finally:
         if rendezvous is not None:
@@ -888,6 +896,11 @@ def drain_nested_supervisors(deadline: float | None = None) -> bool:
             invalidate_nested_control()
             return False
         expected = process.pid if process is not None else 0
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(
+            f"TEMP-DIAG-180 NESTED-DRAIN frame supervisor={supervisor} peer={peer} "
+            f"expected={expected} token={token} dup={token in nested_supervisors}"
+        )
         if (
             supervisor <= 0
             or not nested_supervisor_belongs_to_session(supervisor, expected)
@@ -896,15 +909,25 @@ def drain_nested_supervisors(deadline: float | None = None) -> bool:
             or token in nested_supervisors
             or len(nested_supervisors) >= 1024
         ):
+            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+            _temp_diag(
+                f"TEMP-DIAG-180 NESTED-DRAIN rejected supervisor={supervisor}"
+            )
             link.close()
             invalidate_nested_control()
             return False
         try:
             link.sendall(b"\1")
         except OSError:
+            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+            _temp_diag(
+                f"TEMP-DIAG-180 NESTED-DRAIN ack failed supervisor={supervisor}"
+            )
             link.close()
             invalidate_nested_control()
             return False
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(f"TEMP-DIAG-180 NESTED-DRAIN acked supervisor={supervisor}")
         nested_supervisors[token] = (supervisor, link)
     # The fixed loop count is a per-call work budget, not a protocol error.
     # Every accepted supervisor is recorded before its ACK; any registration
@@ -922,6 +945,20 @@ def stream_requires_relay(fd: int) -> bool:
     except OSError:
         return False
     return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
+
+
+# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis. diagnostic()
+# forks a writer child when stderr is piped, so high-frequency TEMP prints
+# would strand teardown; cap TEMP volume to the first few handshake events.
+_temp_diag_remaining = 12
+
+
+def _temp_diag(message: str) -> None:
+    global _temp_diag_remaining
+    if _temp_diag_remaining <= 0:
+        return
+    _temp_diag_remaining -= 1
+    diagnostic(message)
 
 
 def diagnostic(message: str) -> None:
