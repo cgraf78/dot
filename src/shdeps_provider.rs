@@ -656,35 +656,51 @@ pub(crate) fn prepare(
             summary: b"dependency update interrupted".to_vec(),
             stderr: Vec::new(),
         }),
-        Err(failure) => Err(PrepareFailure {
-            interrupted: None,
-            abort: matches!(
-                failure,
-                EnsureFailure::Output | EnsureFailure::DownloadTimeout(_)
-            ),
-            summary: b"shdeps unavailable; dependency install skipped".to_vec(),
-            stderr: match failure {
-                EnsureFailure::Unavailable => Vec::new(),
-                EnsureFailure::Bash(error) => inputs.runtime.bash_error_line_once(&error),
-                EnsureFailure::AbiTimeout(seconds) => crate::progress_ui::warn_line(
-                    inputs.palette,
-                    format!("  warning: Shdeps provider ABI probe timed out after {seconds}s")
+        Err(failure) => {
+            let name = match &failure {
+                EnsureFailure::Unavailable => "Unavailable",
+                EnsureFailure::Bash(error) => {
+                    eprintln!("TEMP-DIAG-180 ENSURE-FAIL Bash: {error}");
+                    "Bash"
+                }
+                EnsureFailure::AbiTimeout(_) => "AbiTimeout",
+                EnsureFailure::CapabilityTimeout(_) => "CapabilityTimeout",
+                EnsureFailure::DownloadTimeout(_) => "DownloadTimeout",
+                EnsureFailure::Download(DownloadFailure::Transport) => "Download(Transport)",
+                EnsureFailure::Download(DownloadFailure::Digest) => "Download(Digest)",
+                EnsureFailure::Output => "Output",
+                EnsureFailure::Interrupted(_) => "Interrupted",
+            };
+            eprintln!("TEMP-DIAG-180 ENSURE-FAIL {name}");
+            Err(PrepareFailure {
+                interrupted: None,
+                abort: matches!(
+                    failure,
+                    EnsureFailure::Output | EnsureFailure::DownloadTimeout(_)
+                ),
+                summary: b"shdeps unavailable; dependency install skipped".to_vec(),
+                stderr: match failure {
+                    EnsureFailure::Unavailable => Vec::new(),
+                    EnsureFailure::Bash(error) => inputs.runtime.bash_error_line_once(&error),
+                    EnsureFailure::AbiTimeout(seconds) => crate::progress_ui::warn_line(
+                        inputs.palette,
+                        format!("  warning: Shdeps provider ABI probe timed out after {seconds}s")
+                            .as_bytes(),
+                    ),
+                    EnsureFailure::CapabilityTimeout(seconds) => crate::progress_ui::warn_line(
+                        inputs.palette,
+                        format!(
+                            "  warning: Shdeps provider capability probe timed out after {seconds}s"
+                        )
                         .as_bytes(),
-                ),
-                EnsureFailure::CapabilityTimeout(seconds) => crate::progress_ui::warn_line(
-                    inputs.palette,
-                    format!(
-                        "  warning: Shdeps provider capability probe timed out after {seconds}s"
-                    )
-                    .as_bytes(),
-                ),
-                EnsureFailure::DownloadTimeout(seconds) => crate::progress_ui::warn_line(
-                    inputs.palette,
-                    format!("  warning: Shdeps provider download timed out after {seconds}s")
-                        .as_bytes(),
-                ),
-                EnsureFailure::Download(kind) => {
-                    let mut out = crate::progress_ui::warn_line(
+                    ),
+                    EnsureFailure::DownloadTimeout(seconds) => crate::progress_ui::warn_line(
+                        inputs.palette,
+                        format!("  warning: Shdeps provider download timed out after {seconds}s")
+                            .as_bytes(),
+                    ),
+                    EnsureFailure::Download(kind) => {
+                        let mut out = crate::progress_ui::warn_line(
                         inputs.palette,
                         match kind {
                             DownloadFailure::Transport => {
@@ -693,16 +709,17 @@ pub(crate) fn prepare(
                             DownloadFailure::Digest => b"  warning: downloaded Shdeps bootstrap did not match the release digest".as_slice(),
                         },
                     );
-                    out.extend_from_slice(&crate::progress_ui::warn_line(
-                        inputs.palette,
-                        b"  warning: failed to fetch the reviewed Shdeps bootstrap",
-                    ));
-                    out
-                }
-                EnsureFailure::Output => Vec::new(),
-                EnsureFailure::Interrupted(_) => unreachable!("handled above"),
-            },
-        }),
+                        out.extend_from_slice(&crate::progress_ui::warn_line(
+                            inputs.palette,
+                            b"  warning: failed to fetch the reviewed Shdeps bootstrap",
+                        ));
+                        out
+                    }
+                    EnsureFailure::Output => Vec::new(),
+                    EnsureFailure::Interrupted(_) => unreachable!("handled above"),
+                },
+            })
+        }
     }
 }
 
