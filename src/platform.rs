@@ -254,6 +254,14 @@ pub fn decide_sudo(
 /// `DOT_QUIET` value; only exactly `1` suppresses the prompt, like the
 /// shell's `-eq 1`.
 pub fn require_sudo(quiet: &str) -> bool {
+    // TEMP-DIAG-180: remove with the recvmsg diag.
+    #[cfg(test)]
+    let sudo_started = std::time::Instant::now();
+    #[cfg(test)]
+    eprintln!(
+        "TEMP-DIAG-180: sudo-probe id-start at {}ms",
+        sudo_started.elapsed().as_millis()
+    );
     let mut id = std::process::Command::new("id");
     id.arg("-u");
     let euid_output = crate::cleanup::run_session_output(
@@ -271,10 +279,27 @@ pub fn require_sudo(quiet: &str) -> bool {
     let euid_is_root = euid_output
         .as_deref()
         .is_none_or(|text| !matches!(text.parse::<i64>(), Ok(uid) if uid != 0));
+    // TEMP-DIAG-180: remove with the recvmsg diag.
+    #[cfg(test)]
+    eprintln!(
+        "TEMP-DIAG-180: sudo-probe id-end at {}ms",
+        sudo_started.elapsed().as_millis()
+    );
     let probe = |extra: &[&str], interactive: bool| {
+        // TEMP-DIAG-180: remove with the recvmsg diag.
+        #[cfg(test)]
+        eprintln!(
+            "TEMP-DIAG-180: sudo-probe {}-start at {}ms",
+            if interactive {
+                "interactive"
+            } else {
+                "noninteractive"
+            },
+            sudo_started.elapsed().as_millis()
+        );
         let mut command = std::process::Command::new("sudo");
         command.args(extra).arg("true");
-        if interactive {
+        let accepted = if interactive {
             command
                 .stdin(std::process::Stdio::inherit())
                 .stdout(std::process::Stdio::inherit())
@@ -286,7 +311,20 @@ pub fn require_sudo(quiet: &str) -> bool {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
             crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Strict) == 0
-        }
+        };
+        // TEMP-DIAG-180: remove with the recvmsg diag.
+        #[cfg(test)]
+        eprintln!(
+            "TEMP-DIAG-180: sudo-probe {}-end accepted={} at {}ms",
+            if interactive {
+                "interactive"
+            } else {
+                "noninteractive"
+            },
+            accepted,
+            sudo_started.elapsed().as_millis()
+        );
+        accepted
     };
     decide_sudo(euid_is_root, probe(&["-n"], false), quiet == "1", &|| {
         probe(&[], true)
@@ -489,7 +527,10 @@ mod tests {
             });
         }
         let mut child = command.spawn().unwrap();
-        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // TEMP-DIAG-180: widen from 3s while diagnosing whether macOS CI
+        // is slow (python startup under load) or stuck (probe never
+        // returns). Revert or justify with the sudo-probe timestamps.
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while !ready.exists() && std::time::Instant::now() < ready_deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
