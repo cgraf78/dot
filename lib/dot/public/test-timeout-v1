@@ -957,6 +957,9 @@ def _temp_diag(message: str) -> None:
     global _temp_diag_remaining
     if _temp_diag_remaining <= 0:
         return
+    # Env-gated: exact-stderr assertions stay green where unset.
+    if not os.environ.get("DOT_TEST_DIAG_NESTED"):
+        return
     _temp_diag_remaining -= 1
     diagnostic(message)
 
