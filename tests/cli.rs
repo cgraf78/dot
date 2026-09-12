@@ -449,8 +449,15 @@ fn process_output_relay_serializes_exactly_aliased_stdout_and_stderr() {
         output
     });
     let status = child.wait().expect("wait exact-alias helper");
-    assert!(status.success(), "exact-alias helper failed: {status}");
+    // The helper has exited, so the merged stream is at EOF and the
+    // join cannot block; capture the output before asserting so a
+    // helper panic is visible instead of swallowed.
     let output = reader.join().expect("join merged-output reader");
+    assert!(
+        status.success(),
+        "exact-alias helper failed: {status}; merged output:\n{}",
+        String::from_utf8_lossy(&output)
+    );
     assert!(
         output.windows(512).any(|bytes| bytes == b"oe".repeat(256)),
         "exactly aliased output lost or reordered payload: {} bytes",
@@ -4730,6 +4737,13 @@ fn direct_signals_during_init_git_clone_stop_the_owned_query() {
         let shim_dir = state.path().join("blocking-init-git-bin");
         std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
         let marker = state.path().join("init-git-ready");
+        // macOS refuses nonexistent `file://` origins at identity time
+        // (BSD `realpath` parity), so the origin must exist for the
+        // clone step to start there; the shim intercepts before any
+        // real Git reads it.
+        let origin = state.path().join("hup-origin");
+        std::fs::create_dir_all(&origin).expect("origin dir");
+        let origin_url = format!("file://{}", origin.display());
         let git_shim = shim_dir.join("git");
         std::fs::write(
             &git_shim,
@@ -4753,13 +4767,8 @@ exec "$DOT_TEST_REAL_GIT" "$@"
         let real_git = real_tool("git");
         let mut command = init_bin(&home, &state);
         let child = command
-            .args([
-                "init",
-                "--yes",
-                "--branch",
-                "main",
-                "file:///nonexistent-origin.git",
-            ])
+            .args(["init", "--yes", "--branch", "main"])
+            .arg(&origin_url)
             .env("PATH", &path)
             .env("DOT_TEST_REAL_GIT", &real_git)
             .env("DOT_TEST_GIT_QUERY_READY", &marker)

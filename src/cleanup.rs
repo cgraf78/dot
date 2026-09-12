@@ -64,6 +64,9 @@ extern "C" fn capture_entry_stdio() {
 // `main`. ELF pre-initialization captures the kernel exec-boundary state before
 // that normalization; Darwin does not synthesize the descriptors and its
 // earliest image initializer provides the same stable snapshot.
+// Plain `used` lets the macOS linker drop this initializer from test
+// binaries (stable has no `used(linker)`); the functions below that
+// consume the mask also take its address so the object is retained.
 #[used]
 #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
 #[cfg_attr(
@@ -76,6 +79,9 @@ static CAPTURE_ENTRY_STDIO: extern "C" fn() = capture_entry_stdio;
 /// uses this for informational commands that bypass the output relay, so a
 /// descriptor closed at exec fails identically on both paths.
 pub fn entry_stdio_open(descriptor: i32) -> bool {
+    // Take the initializer's address so the linker keeps its object
+    // (see above).
+    std::hint::black_box(&CAPTURE_ENTRY_STDIO);
     let mask = ENTRY_STDIO_MASK.load(std::sync::atomic::Ordering::Relaxed);
     if mask & ENTRY_STDIO_INITIALIZED == 0 {
         // No exec-boundary capture ran (in-process embedding): probe live.
@@ -2393,6 +2399,9 @@ impl ProcessOutputRelay {
     pub fn start() -> std::io::Result<Self> {
         use std::os::fd::AsRawFd as _;
 
+        // Take the initializer's address so the linker keeps its object
+        // in every binary that starts a relay (see above).
+        std::hint::black_box(&CAPTURE_ENTRY_STDIO);
         let entry_mask = ENTRY_STDIO_MASK.load(std::sync::atomic::Ordering::Relaxed);
         if entry_mask & ENTRY_STDIO_INITIALIZED == 0 {
             return Err(std::io::Error::other(
