@@ -1,23 +1,8 @@
-//! CLI parity tests: the Rust binary must behave like the shell dispatcher.
+//! Native end-to-end contracts for the `dot` CLI.
 //!
-//! `HELP` is pinned against the shell `dot_help` heredoc at compile time
-//! via `include_str!`, so any drift in `lib/dot/main.sh` fails this suite
-//! until the Rust constant is updated in the same commit.
-//!
-//! Slice 77 adds differential dispatch tests: the live
-//! `dot_command_dispatch` (`lib/dot/commands.sh`) runs with stubbed
-//! kernels as the oracle, and the Rust [`dispatch`](dot::cli::dispatch)
-//! decision plus the binary's observable behavior must agree with it.
-//! Kernel execution itself stays in shell until each kernel slice
-//! lands, so for kernel-backed arms the tests pin the oracle's trace
-//! and exit code (the contract the kernel slice inherits) alongside
-//! the Rust interim "not yet implemented" behavior — never conflated.
-//!
-//! Slice 83 wires the last two arms (`doctor`, `test`) end to end:
-//! the engine rows below compare the Rust binary against the live
-//! `bin/dot` on fixtures — exit code plus both streams, byte for
-//! byte — so the interim set is empty and no known command reports
-//! "not yet implemented" anymore.
+//! Every scenario invokes the shipped Rust binary once and checks a
+//! hand-written process contract plus independently observable state. Bash is
+//! exercised only at the supported public user-hook boundary.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -30,25 +15,35 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use dot::cli::{Command as Decision, dispatch, init_acquires_lock};
-use dot::test_support::TempDir;
+use dot_test_support::TempDir;
 
 static PROCESS_ENV: Mutex<()> = Mutex::new(());
+
+const EXPECTED_HELP: &str = concat!(
+    "usage: dot <command> [<args>]\n",
+    "\n",
+    "Commands:\n",
+    "  update           Converge the base repository, overlays, hooks, and provider\n",
+    "  pull             Alias for update\n",
+    "  fetch            Fetch the base repository and active Git overlays\n",
+    "  push             Push the base repository and active Git overlays\n",
+    "  status           Show base and overlay status\n",
+    "  diff             Show base and overlay differences\n",
+    "  cron             Show the installed user crontab\n",
+    "  doctor           Run core and configured extension health checks\n",
+    "  test             Run configured tests; provider suite is opt-in\n",
+    "  init             Initialize or resume a client dotfiles repository\n",
+    "  help             Show this command summary\n",
+    "\n",
+    "Run `dot init --help` for initialization and recovery syntax.\n",
+);
+
+const EXPECTED_INIT_USAGE: &[u8] = b"usage: dot init [--branch BRANCH] [--yes] REPOSITORY_URL\n       dot init --status\n       dot init --rollback\n";
 
 fn process_env_guard() -> MutexGuard<'static, ()> {
     PROCESS_ENV
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-}
-
-/// Extract the `dot_help` heredoc body from the shell source.
-fn shell_help() -> String {
-    let source = include_str!("../lib/dot/main.sh");
-    let marker = "cat <<'EOF'\n";
-    let start = source.find(marker).expect("dot_help heredoc marker") + marker.len();
-    let rest = &source[start..];
-    let end = rest.find("\nEOF\n").expect("dot_help heredoc terminator");
-    format!("{}\n", &rest[..end])
 }
 
 fn bin() -> Command {
@@ -58,19 +53,17 @@ fn bin() -> Command {
 #[test]
 fn native_update_flag_capture_does_not_mutate_parent_environment() {
     let _env = process_env_guard();
-    // Provider `none` now keeps `--force` on the native path. The explicit
-    // embedded runtime must still retain semantic stream, user-tree, and
-    // state parity when it re-execs the real binary.
+    // Provider `none` keeps `--force` on the native path. The explicit
+    // embedded runtime must retain its process and repository contracts when
+    // it re-execs the real binary.
     let parent = native_parent_snapshot();
-    let shell_client = stage_repos_client();
-    let native_client = stage_repos_client();
-    let runtime = runtime_for_force_fallback(&native_client);
+    let client = stage_repos_client();
+    let runtime = runtime_for_force_update(&client);
     let args = [
         OsString::from("update"),
         OsString::from("--quiet"),
         OsString::from("--force"),
     ];
-    let shell = repos_shell(&shell_client, &["update", "--quiet", "--force"]);
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let code = dot::app::run(
@@ -79,27 +72,20 @@ fn native_update_flag_capture_does_not_mutate_parent_environment() {
         &mut dot::app::Streams::new(&mut stdout, &mut stderr),
     );
 
-    assert_eq!(code, shell.status.code().expect("shell exit"));
+    assert_eq!(code, 0);
+    assert_eq!(stdout, b"");
+    assert_eq!(stderr, b"");
     assert_eq!(
-        scrub_twin(&stdout, native_client.scope.path()),
-        scrub_twin(&shell.stdout, shell_client.scope.path()),
-        "force fallback stdout",
+        std::fs::read(client.home.join("tracked.txt")).unwrap(),
+        b"v1\n"
     );
     assert_eq!(
-        scrub_twin(&stderr, native_client.scope.path()),
-        scrub_twin(&shell.stderr, shell_client.scope.path()),
-        "force fallback stderr",
+        std::fs::read(client.overlay.join("tracked.txt")).unwrap(),
+        b"v1\n"
     );
-    assert_eq!(
-        semantic_tree(&native_client.home, true),
-        semantic_tree(&shell_client.home, true),
-        "force fallback user tree",
-    );
-    assert_eq!(
-        semantic_tree(runtime.state_home(), false),
-        semantic_tree(&shell_client.home.join(".local/state"), false),
-        "force fallback state",
-    );
+    assert_clean_checkout(&client, "alpha");
+    assert_eq!(base_snapshot(&client), clean_checkout());
+    assert!(!runtime.state_home().join("dot/update.lock").exists());
     assert_eq!(native_parent_snapshot(), parent);
 }
 
@@ -277,17 +263,17 @@ fn embedded_executable_rejects_relative_path() {
 }
 
 #[test]
-fn help_constant_matches_shell_heredoc_byte_for_byte() {
-    assert_eq!(dot::cli::HELP, shell_help());
+fn help_constant_has_the_public_byte_contract() {
+    assert_eq!(dot::cli::HELP, EXPECTED_HELP);
 }
 
 #[test]
-fn binary_help_matches_shell_help() {
+fn binary_help_has_the_public_byte_contract() {
     let output = bin().arg("help").output().expect("run dot help");
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout UTF-8"),
-        shell_help()
+        EXPECTED_HELP
     );
     assert!(output.stderr.is_empty());
 }
@@ -298,7 +284,7 @@ fn binary_default_command_is_help() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout UTF-8"),
-        shell_help()
+        EXPECTED_HELP
     );
 }
 
@@ -318,48 +304,18 @@ fn binary_version_shape() {
 }
 
 #[test]
-fn binary_version_agrees_with_shell_in_same_checkout() {
-    // Both implementations resolve the revision from the same checkout,
-    // so their outputs must be identical here. Skips are LOUD (stderr):
-    // a silent pass would hide a broken shell path or a stale baked
-    // revision. Shell parity itself is owned by `bash tests/run`.
-    // Known race: a commit landing between compile time (baked SHA) and
-    // this run fails despite both sides being correct; likewise an
-    // explicit DOT_BUILD_COMMIT/GITHUB_SHA stamping intentionally
-    // disagrees with run-time `git rev-parse HEAD`.
-    let shell = Command::new("bash")
-        .arg("bin/dot")
-        .arg("version")
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output();
-    let Ok(shell) = shell else {
-        eprintln!("SKIP: cannot spawn bash for shell agreement check");
-        return;
-    };
-    if !shell.status.success() {
-        eprintln!("SKIP: shell `dot version` failed; shell parity is owned by tests/run");
-        return;
-    }
-    let rust = bin().arg("version").output().expect("run dot version");
-    assert!(rust.status.success());
-    assert_eq!(rust.stdout, shell.stdout);
-}
-
-/// The exact `printf` format in the shell dispatcher. Unlike HELP (a
-/// heredoc with stable boundaries), this is one line inside a function,
-/// so the pin asserts the shell still contains the literal rather than
-/// re-extracting it: a wording drift in `commands.sh` must fail here.
-fn shell_unknown_command_format() -> &'static str {
-    let source = include_str!("../lib/dot/commands.sh");
-    assert!(
-        source.contains("printf 'dot: unknown command: %s\\n'"),
-        "shell dispatcher changed its unknown-command wording"
-    );
-    "dot: unknown command: frobnicate\n"
+fn binary_version_is_stable_across_aliases() {
+    let version = bin().arg("version").output().expect("run dot version");
+    let flag = bin().arg("--version").output().expect("run dot --version");
+    assert_eq!(version.status.code(), Some(0));
+    assert_eq!(flag.status.code(), Some(0));
+    assert_eq!(version.stdout, flag.stdout);
+    assert!(version.stderr.is_empty());
+    assert!(flag.stderr.is_empty());
 }
 
 #[test]
-fn binary_unknown_command_fails_like_shell() {
+fn binary_unknown_command_has_the_public_error_contract() {
     let output = bin()
         .arg("frobnicate")
         .output()
@@ -368,387 +324,28 @@ fn binary_unknown_command_fails_like_shell() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr UTF-8"),
-        shell_unknown_command_format()
+        "dot: unknown command: frobnicate\n"
     );
 }
 
 #[test]
-fn binary_help_flags_match_shell() {
-    let expected = shell_help();
+fn binary_help_flags_have_the_public_byte_contract() {
     for flag in ["-h", "--help"] {
         let output = bin().arg(flag).output().expect("run dot flag");
         assert!(output.status.success(), "flag: {flag}");
         assert_eq!(
             String::from_utf8(output.stdout).expect("stdout UTF-8"),
-            expected,
+            EXPECTED_HELP,
             "flag: {flag}"
         );
         assert!(output.stderr.is_empty(), "flag: {flag}");
     }
 }
 
-/// Stubbed kernels for the dispatch oracle: each prints a trace token
-/// with its arguments (`"$*"` joins like the shell passes them on)
-/// and exits with an overridable code, so every dispatch decision —
-/// routing, argument forwarding, resolve/lock gating, and the
-/// ignore-vs-propagate exit-code quirks — is observable without side
-/// effects. `crontab` is overridden as a function (functions win over
-/// PATH lookup), so `cron` needs no fixture binary on this side.
-const ORACLE_STUBS: &str = concat!(
-    "_dot_cleanup_install_owner_traps() { printf 'TRAPS\\n'; }\n",
-    "_dot_update_lock_acquire() { printf 'LOCK-ACQUIRE:%s\\n' \"$*\"; ",
-    "return \"${STUB_LOCK_RC:-0}\"; }\n",
-    "_dot_update() { printf 'UPDATE:%s\\n' \"$*\"; ",
-    "return \"${STUB_UPDATE_RC:-0}\"; }\n",
-    "_dot_resolve_overlays() { printf 'RESOLVE:%s SILENT:%s\\n' \"$*\" ",
-    "\"${DOT_OVERLAY_DISCOVERY_SILENT:-unset}\"; ",
-    "return \"${STUB_RESOLVE_RC:-0}\"; }\n",
-    "_repo_fetch_all() { printf 'FETCH-ALL:%s\\n' \"$*\"; ",
-    "return \"${STUB_ALL_RC:-0}\"; }\n",
-    "_repo_push_all() { printf 'PUSH-ALL:%s\\n' \"$*\"; ",
-    "return \"${STUB_ALL_RC:-0}\"; }\n",
-    "_repo_status_all() { printf 'STATUS-ALL:%s\\n' \"$*\"; ",
-    "return \"${STUB_ALL_RC:-0}\"; }\n",
-    "_repo_diff_all() { printf 'DIFF-ALL:%s\\n' \"$*\"; ",
-    "return \"${STUB_ALL_RC:-0}\"; }\n",
-    "_dot_doctor() { printf 'DOCTOR:%s\\n' \"$*\"; ",
-    "return \"${STUB_DOCTOR_RC:-0}\"; }\n",
-    "dot_test_command() { printf 'TEST-CMD:%s\\n' \"$*\"; ",
-    "return \"${STUB_TEST_RC:-0}\"; }\n",
-    "dot_init_command() { printf 'INIT-CMD:%s\\n' \"$*\"; ",
-    "return \"${STUB_INIT_RC:-0}\"; }\n",
-    "crontab() { if [ \"${STUB_CRONTAB_RC:-0}\" = 0 ]; then ",
-    "printf '%s' \"${STUB_CRONTAB_OUT:-}\"; else return 1; fi; }\n",
-);
-
-/// Run the live `dot_command_dispatch` with stubbed kernels.
-/// Returns (exit code, stdout trace, stderr). The trace's last line is
-/// always the `ORACLE-RC=` trailer, split off so assertions read only
-/// the kernels' tokens.
-fn oracle(argv: &[&OsStr], extra_env: &[(&str, &str)]) -> (i32, Vec<u8>, Vec<u8>) {
-    // Built with `push_str`, not `format!`: the shell `${...}`
-    // expansions would read as format placeholders.
-    let mut script = String::from(ORACLE_STUBS);
-    script.push_str(". \"$1/lib/dot/commands.sh\"\n");
-    script.push_str("shift\n");
-    script.push_str("dot_command_dispatch \"$@\"\n");
-    script.push_str("rc=$?\n");
-    script.push_str("printf 'ORACLE-RC=%d\\n' \"$rc\"\n");
-    let home = TempDir::new("cli-oracle").expect("oracle home");
-    let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let tmpdir = std::env::var_os("TMPDIR")
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg("--noprofile").arg("--norc").arg("-c").arg(script);
-    cmd.arg("dot-test-sh").arg(repo);
-    for arg in argv {
-        cmd.arg(arg);
-    }
-    // One `.env` per variable (never `.envs`): each entry stays
-    // auditable, matching the repos differential-test convention.
-    cmd.env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", &path)
-        .env("TMPDIR", &tmpdir)
-        .env("HOME", home.path())
-        .env("DOT_TEST", "1")
-        .current_dir(home.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in extra_env {
-        cmd.env(key, value);
-    }
-    let output = cmd.output().expect("spawn dispatch oracle");
-    // Byte-level trailer split (never `str` slicing): the trace stays
-    // raw bytes end to end, and only the `ORACLE-RC=` line is decoded.
-    let mut trace = output.stdout;
-    assert_eq!(
-        trace.pop(),
-        Some(b'\n'),
-        "oracle output ends with newline: {trace:?}"
-    );
-    let split = trace
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map(|pos| pos + 1)
-        .unwrap_or(0);
-    let trailer = trace.split_off(split);
-    let code: i32 = std::str::from_utf8(&trailer)
-        .ok()
-        .and_then(|line| line.strip_prefix("ORACLE-RC="))
-        .unwrap_or_else(|| panic!("oracle lost its RC trailer: {trailer:?}"))
-        .parse()
-        .expect("oracle RC is numeric");
-    (code, trace, output.stderr)
-}
-
-/// The shell arm structure the Rust table mirrors: every `case` label,
-/// the `pull` recursion, the resolve modes, the `test` rc handoff, the
-/// `init` lock-skip flags, and the exact `cron`/unknown spellings. A
-/// wording or routing drift in `commands.sh` fails here before any
-/// behavioral assertion can silently pass against the wrong shape.
-#[test]
-fn shell_source_still_has_every_dispatch_arm() {
-    let source = include_str!("../lib/dot/commands.sh");
-    for arm in [
-        "update)", "pull)", "fetch)", "push)", "status)", "diff)", "cron)", "doctor)", "test)",
-        "init)",
-    ] {
-        assert!(source.contains(arm), "shell lost its {arm} arm");
-    }
-    for line in [
-        "dot_command_dispatch update \"$@\"",
-        "_dot_resolve_overlays fetch",
-        "_dot_resolve_overlays inspect",
-        "dot_test_command \"$@\" || rc=$?",
-        "--status | --help | -h",
-        "crontab -l 2>/dev/null || printf '  no crontab installed\\n'",
-        "printf 'dot: unknown command: %s\\n'",
-        "DOT_OVERLAY_DISCOVERY_SILENT=1",
-        "return \"$rc\"",
-    ] {
-        assert!(source.contains(line), "shell lost: {line}");
-    }
-}
-
-#[test]
-fn oracle_update_runs_traps_lock_then_update() {
-    assert_eq!(dispatch(b"update"), Decision::Update);
-    let (code, trace, err) = oracle(
-        &[OsStr::new("update"), OsStr::new("a"), OsStr::new("b")],
-        &[],
-    );
-    assert_eq!(code, 0);
-    assert_eq!(trace, b"TRAPS\nLOCK-ACQUIRE:a b\nUPDATE:a b\n");
-    assert!(err.is_empty());
-    // A failing kernel is ignored: the dispatcher returns `rc` (0),
-    // not the kernel's status. Kernel slices must preserve this.
-    let (code, _, _) = oracle(&[OsStr::new("update")], &[("STUB_UPDATE_RC", "3")]);
-    assert_eq!(code, 0);
-    // A failing lock short-circuits with its own status (e.g. 75 busy).
-    let (code, trace, _) = oracle(&[OsStr::new("update")], &[("STUB_LOCK_RC", "75")]);
-    assert_eq!(code, 75);
-    assert_eq!(trace, b"TRAPS\nLOCK-ACQUIRE:\n");
-}
-
-#[test]
-fn oracle_pull_aliases_update_exactly() {
-    assert_eq!(dispatch(b"pull"), Decision::Update);
-    assert_eq!(dispatch(b"pull"), dispatch(b"update"));
-    let pull = oracle(&[OsStr::new("pull"), OsStr::new("x")], &[]);
-    let update = oracle(&[OsStr::new("update"), OsStr::new("x")], &[]);
-    assert_eq!(pull, update);
-    assert_eq!(pull.0, 0);
-    assert_eq!(pull.1, b"TRAPS\nLOCK-ACQUIRE:x\nUPDATE:x\n");
-}
-
-#[test]
-fn oracle_fetch_resolves_fetch_mode_then_fetches() {
-    assert_eq!(dispatch(b"fetch"), Decision::Fetch);
-    let (code, trace, err) = oracle(&[OsStr::new("fetch")], &[]);
-    assert_eq!(code, 0);
-    assert_eq!(trace, b"RESOLVE:fetch SILENT:unset\nFETCH-ALL:\n");
-    assert!(err.is_empty());
-    let (code, trace, _) = oracle(&[OsStr::new("fetch")], &[("STUB_RESOLVE_RC", "1")]);
-    assert_eq!(code, 1);
-    assert_eq!(trace, b"RESOLVE:fetch SILENT:unset\n");
-}
-
-#[test]
-fn oracle_push_status_diff_resolve_inspect_mode() {
-    let cases: &[(&str, Decision, &[u8])] = &[
-        ("push", Decision::Push, b"PUSH-ALL:\n"),
-        ("status", Decision::Status, b"STATUS-ALL:\n"),
-        ("diff", Decision::Diff, b"DIFF-ALL:\n"),
-    ];
-    for (name, expected, token) in cases {
-        assert_eq!(dispatch(name.as_bytes()), *expected, "command: {name}");
-        let arg = OsStr::new(name);
-        let (code, trace, err) = oracle(&[arg], &[]);
-        assert_eq!(code, 0, "command: {name}");
-        let mut full = b"RESOLVE:inspect SILENT:unset\n".to_vec();
-        full.extend_from_slice(token);
-        assert_eq!(trace, full, "command: {name}");
-        assert!(err.is_empty(), "command: {name}");
-        let (code, _, _) = oracle(&[arg], &[("STUB_RESOLVE_RC", "1")]);
-        assert_eq!(code, 1, "command: {name}");
-    }
-}
-
-#[test]
-fn oracle_doctor_succeeds_despite_any_failure() {
-    assert_eq!(dispatch(b"doctor"), Decision::Doctor);
-    // Resolve failure AND doctor failure: `|| true` plus the ignored
-    // kernel status keep the dispatcher at 0, with discovery silenced.
-    let (code, trace, err) = oracle(
-        &[OsStr::new("doctor")],
-        &[("STUB_RESOLVE_RC", "1"), ("STUB_DOCTOR_RC", "5")],
-    );
-    assert_eq!(code, 0);
-    assert_eq!(trace, b"TRAPS\nRESOLVE:inspect SILENT:1\nDOCTOR:\n");
-    assert!(err.is_empty());
-}
-
-#[test]
-fn oracle_test_propagates_test_status() {
-    assert_eq!(dispatch(b"test"), Decision::Test);
-    let (code, trace, err) = oracle(
-        &[OsStr::new("test"), OsStr::new("t1")],
-        &[("STUB_TEST_RC", "3")],
-    );
-    assert_eq!(code, 3);
-    assert_eq!(trace, b"TRAPS\nRESOLVE:inspect SILENT:unset\nTEST-CMD:t1\n");
-    assert!(err.is_empty());
-    let (code, _, _) = oracle(&[OsStr::new("test")], &[("STUB_RESOLVE_RC", "1")]);
-    assert_eq!(code, 1);
-}
-
-#[test]
-fn oracle_init_lock_branches_on_first_arg() {
-    assert_eq!(dispatch(b"init"), Decision::Init);
-    // No argument acquires the lock (`${1:-}` is empty → `*`).
-    assert!(init_acquires_lock(None));
-    let (code, trace, _) = oracle(&[OsStr::new("init")], &[]);
-    assert_eq!(code, 0);
-    assert_eq!(trace, b"TRAPS\nLOCK-ACQUIRE:\nINIT-CMD:\n");
-    // Read-only probes skip the lock but still run init.
-    for flag in ["--status", "--help", "-h"] {
-        assert!(!init_acquires_lock(Some(flag.as_bytes())), "flag: {flag}");
-        let (code, trace, _) = oracle(&[OsStr::new("init"), OsStr::new(flag)], &[]);
-        assert_eq!(code, 0, "flag: {flag}");
-        assert_eq!(
-            trace,
-            format!("TRAPS\nINIT-CMD:{flag}\n").into_bytes(),
-            "flag: {flag}"
-        );
-    }
-    // Anything else acquires, and init's own failure is ignored.
-    assert!(init_acquires_lock(Some(b"--other")));
-    let (code, trace, _) = oracle(
-        &[OsStr::new("init"), OsStr::new("--other")],
-        &[("STUB_INIT_RC", "4")],
-    );
-    assert_eq!(code, 0);
-    assert_eq!(trace, b"TRAPS\nLOCK-ACQUIRE:\nINIT-CMD:--other\n");
-    let (code, _, _) = oracle(&[OsStr::new("init")], &[("STUB_LOCK_RC", "75")]);
-    assert_eq!(code, 75);
-}
-
-#[test]
-fn oracle_bare_dispatch_reports_help_as_unknown() {
-    // `dot_command_dispatch` with no argument defaults to `help`,
-    // which has no arm there (`main.sh` handles it first): unknown.
-    let (code, trace, err) = oracle(&[], &[]);
-    assert_eq!(code, 1);
-    assert!(trace.is_empty());
-    assert_eq!(err, b"dot: unknown command: help\n");
-    assert_eq!(dispatch(b"help"), Decision::Unknown);
-}
-
-/// A `crontab` fixture printing `$FAKE_CRONTAB_BODY` for `crontab
-/// -l` (the body travels by environment, never embedded in the
-/// script, so quoting cannot mangle it). Lives in an exec-capable dir
-/// (the system temp dir may be `noexec`); resolution runs through
-/// PATH, never a hardcoded path.
-fn fake_crontab() -> TempDir {
-    let dir = TempDir::new_exec("fake-crontab").expect("exec dir");
-    let script = dir.write(
-        "crontab",
-        b"#!/bin/sh\nprintf '%s' \"$FAKE_CRONTAB_BODY\"\n",
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod fake crontab");
-    }
-    dir
-}
-
-fn prepend_path(dir: &Path) -> std::ffi::OsString {
-    let orig = std::env::var_os("PATH").unwrap_or_default();
-    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&orig)))
-        .expect("join PATH")
-}
-
-#[test]
-fn cron_matches_oracle_on_both_branches() {
-    assert_eq!(dispatch(b"cron"), Decision::Cron);
-    // Success branch: the listing passes through byte for byte.
-    let listing = "CRON-LINE-1\nCRON-LINE-2\n";
-    let fixture = fake_crontab();
-    let (ocode, otrace, oerr) = oracle(
-        &[OsStr::new("cron")],
-        &[("STUB_CRONTAB_OUT", listing), ("STUB_CRONTAB_RC", "0")],
-    );
-    assert_eq!(ocode, 0);
-    assert_eq!(otrace, listing.as_bytes());
-    assert!(oerr.is_empty());
-    let rust = bin()
-        .arg("cron")
-        .env("PATH", prepend_path(fixture.path()))
-        .env("FAKE_CRONTAB_BODY", listing)
-        .output()
-        .expect("run dot cron");
-    assert_eq!(rust.status.code(), Some(ocode));
-    assert_eq!(rust.stdout, otrace);
-    assert_eq!(rust.stderr, oerr);
-    // Failure branch (no crontab at all): the fallback line, code 0.
-    let (ocode, otrace, oerr) = oracle(&[OsStr::new("cron")], &[("STUB_CRONTAB_RC", "1")]);
-    assert_eq!(ocode, 0);
-    assert_eq!(otrace, b"  no crontab installed\n");
-    assert!(oerr.is_empty());
-    let empty = TempDir::new("cli-cron-empty").expect("empty PATH dir");
-    let rust = bin()
-        .arg("cron")
-        .env("PATH", empty.path())
-        .output()
-        .expect("run dot cron without crontab");
-    assert_eq!(rust.status.code(), Some(ocode));
-    assert_eq!(rust.stdout, otrace);
-    assert_eq!(rust.stderr, oerr);
-}
-
-#[test]
-fn binary_unknown_matches_oracle_byte_for_byte() {
-    let (ocode, otrace, oerr) = oracle(&[OsStr::new("frobnicate")], &[]);
-    assert_eq!(ocode, 1);
-    assert!(otrace.is_empty());
-    assert_eq!(oerr, b"dot: unknown command: frobnicate\n");
-    let rust = bin()
-        .arg("frobnicate")
-        .output()
-        .expect("run dot frobnicate");
-    assert_eq!(rust.status.code(), Some(ocode));
-    assert_eq!(rust.stdout, otrace);
-    assert_eq!(rust.stderr, oerr);
-}
-
-#[cfg(unix)]
-#[test]
-fn binary_unknown_non_utf8_matches_oracle() {
-    use std::os::unix::ffi::OsStringExt as _;
-    let raw = vec![0x66u8, 0x6F, 0xFF, 0x62]; // "fo\xFFb"
-    let arg = std::ffi::OsString::from_vec(raw.clone());
-    let (ocode, otrace, oerr) = oracle(&[arg.as_os_str()], &[]);
-    let rust = bin().arg(&arg).output().expect("run dot non-UTF8");
-    assert_eq!(rust.status.code(), Some(ocode));
-    assert_eq!(rust.stdout, otrace);
-    assert_eq!(rust.stderr, oerr);
-    let mut expected = b"dot: unknown command: ".to_vec();
-    expected.extend_from_slice(&raw);
-    expected.push(b'\n');
-    assert_eq!(oerr, expected);
-}
-
 #[test]
 fn update_passes_flag_exports_to_child_without_mutating_parent() {
     let _env = process_env_guard();
-    // Slice 80 runs `Command::Update` end to end: the shell loop's
-    // values reach the native engine, which then runs for real
+    // The parsed flag values reach the native engine, which then runs for real
     // — exit `0` on the empty-HOME fixture, never the interim
     // diagnostic. The same exports must not leak back into this test
     // process, which may construct another runtime immediately.
@@ -816,10 +413,8 @@ fn update_passes_flag_exports_to_child_without_mutating_parent() {
             .map(|key| (*key, std::env::var_os(key)))
             .collect();
         restore();
-        // An empty HOME has no base repo and nothing to converge:
-        // the shell succeeds with its no-base rows (pinned against
-        // `bin/dot`), so the wired arm reports `0` — never the
-        // interim diagnostic.
+        // An empty HOME has no base repo and nothing to converge, so the
+        // command reports success without an interim diagnostic.
         assert_eq!(code, 0, "argv: {argv:?}");
         assert!(err.is_empty(), "argv: {argv:?}");
         assert!(
@@ -839,22 +434,15 @@ fn update_passes_flag_exports_to_child_without_mutating_parent() {
     restore();
 }
 
-/// The production shell over the twin home (unlike [`shell_dot`],
-/// whose checkout cwd would change test source selection): the
-/// strongest oracle for the wired doctor/test arms, comparing
-/// process observables end to end on the same env and cwd.
-fn engine_shell(
+/// Run the binary with an isolated home, state directory, environment, and
+/// working directory.
+fn isolated_run(
     home: &TempDir,
     state: &TempDir,
     argv: &[&str],
     extra: &[(&str, &str)],
 ) -> std::process::Output {
-    // Absolute launcher path: `cwd` is the twin home below (not
-    // the checkout like `shell_dot`), so a relative script would
-    // not resolve.
-    let launcher = Path::new(env!("CARGO_MANIFEST_DIR")).join("bin/dot");
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg(&launcher);
+    let mut cmd = bin();
     for arg in argv {
         cmd.arg(arg);
     }
@@ -869,59 +457,7 @@ fn engine_shell(
     cmd.output().expect("run bin/dot")
 }
 
-/// The Rust binary over the same fixture.
-fn engine_rust(
-    home: &TempDir,
-    state: &TempDir,
-    argv: &[&str],
-    extra: &[(&str, &str)],
-) -> std::process::Output {
-    let mut cmd = bin();
-    for arg in argv {
-        cmd.arg(arg);
-    }
-    init_env(&mut cmd, home, state);
-    for (key, value) in extra {
-        cmd.env(key, value);
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd.output().expect("run dot binary")
-}
-
-/// One engine-arm row: the shell runs first (the oracle), then the
-/// Rust binary on the same home/state — the rows below are read-only
-/// (doctor) or hermetic to their own suite dirs (test), so the
-/// second run observes the same client — and exit code plus both
-/// streams must agree byte for byte.
-fn run_engine_pair(
-    home: &TempDir,
-    state: &TempDir,
-    argv: &[&str],
-    extra: &[(&str, &str)],
-) -> (std::process::Output, std::process::Output) {
-    let shell = engine_shell(home, state, argv, extra);
-    let rust = engine_rust(home, state, argv, extra);
-    (shell, rust)
-}
-
-/// Assert one engine-arm row: exit code and both streams, byte for byte.
-fn check_engine_pair(shell: &std::process::Output, rust: &std::process::Output, argv: &[&str]) {
-    assert_eq!(
-        rust.status.code(),
-        shell.status.code(),
-        "argv: {argv:?}\n shell stdout: {}\n shell stderr: {}",
-        String::from_utf8_lossy(&shell.stdout),
-        String::from_utf8_lossy(&shell.stderr),
-    );
-    assert_eq!(rust.stdout, shell.stdout, "argv: {argv:?} stdout");
-    assert_eq!(rust.stderr, shell.stderr, "argv: {argv:?} stderr");
-}
-
-/// Trust one fixture path exactly like the shell suites do (`umask
-/// 077` there): the ambient test umask may be permissive, so modes
-/// are set explicitly rather than inherited.
+/// Set fixture trust modes explicitly instead of depending on ambient umask.
 #[cfg(unix)]
 fn seal(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -929,79 +465,74 @@ fn seal(path: &Path, mode: u32) {
 }
 
 #[test]
-fn doctor_empty_home_matches_shell() {
+fn doctor_empty_home_reports_the_missing_client() {
     // No client checkout: the base-repo check fails, so doctor
     // reports the failure rows and exits 1 — nothing to stage.
-    let home = TempDir::new("cli-doctor-empty").expect("twin home");
-    let state = TempDir::new("cli-doctor-empty-state").expect("twin state");
-    let (shell, rust) = run_engine_pair(&home, &state, &["doctor"], &[]);
+    let home = TempDir::new("cli-doctor-empty").expect("fixture home");
+    let state = TempDir::new("cli-doctor-empty-state").expect("fixture state");
+    let output = isolated_run(&home, &state, &["doctor"], &[]);
     assert_eq!(
-        shell.status.code(),
+        output.status.code(),
         Some(1),
-        "oracle fails without a client: {}",
-        String::from_utf8_lossy(&shell.stdout),
+        "doctor must fail without a client: {}",
+        String::from_utf8_lossy(&output.stdout),
     );
     assert!(
-        String::from_utf8_lossy(&shell.stdout).contains("client repository is missing"),
-        "oracle names the missing client: {}",
-        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&output.stdout).contains("client repository is missing"),
+        "doctor names the missing client: {}",
+        String::from_utf8_lossy(&output.stdout),
     );
-    assert!(shell.stderr.is_empty(), "clean doctor is silent on stderr");
-    check_engine_pair(&shell, &rust, &["doctor"]);
+    assert!(output.stderr.is_empty(), "doctor is silent on stderr");
 }
 
-/// Initialized file:// client for the doctor pass/extension rows: a
-/// one-commit bare origin plus a shell `init --yes` (the oracle
-/// stages the client, like the shell suites do — the arm under test
-/// below is doctor, compared row by row).
+/// Initialized file:// client for the doctor pass/extension rows.
 fn stage_doctor_client() -> (TempDir, TempDir, TempDir) {
     let scope = TempDir::new("cli-doctor-origin").expect("origin scope");
     let (origin, _seed, _branch) = seed_bare_origin(scope.path(), "dotfiles");
-    let home = TempDir::new("cli-doctor-client").expect("twin home");
-    let state = TempDir::new("cli-doctor-client-state").expect("twin state");
+    let home = TempDir::new("cli-doctor-client").expect("fixture home");
+    let state = TempDir::new("cli-doctor-client-state").expect("fixture state");
     let url = format!("file://{}", origin.display());
-    let staged = engine_shell(&home, &state, &["init", "--yes", &url], &[]);
+    let staged = isolated_run(&home, &state, &["init", "--yes", &url], &[]);
     assert_eq!(
         staged.status.code(),
         Some(0),
-        "oracle stages the client: {}",
+        "init stages the client: {}",
         String::from_utf8_lossy(&staged.stderr),
     );
     (scope, home, state)
 }
 
 #[test]
-fn doctor_init_client_matches_shell() {
+fn doctor_initialized_client_reports_no_failures() {
     // Healthy client, no extensions: warnings stay (the worktree
     // checkout is outside the managed locations), failures clear,
     // exit 0.
     let (_scope, home, state) = stage_doctor_client();
-    let (shell, rust) = run_engine_pair(&home, &state, &["doctor"], &[]);
+    let output = isolated_run(&home, &state, &["doctor"], &[]);
     assert_eq!(
-        shell.status.code(),
+        output.status.code(),
         Some(0),
-        "oracle passes on a healthy client: {} {}",
-        String::from_utf8_lossy(&shell.stdout),
-        String::from_utf8_lossy(&shell.stderr),
+        "doctor passes on a healthy client: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
     assert!(
-        String::from_utf8_lossy(&shell.stdout).contains("0 failed"),
-        "oracle reports zero failures: {}",
-        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&output.stdout).contains("0 failed"),
+        "doctor reports zero failures: {}",
+        String::from_utf8_lossy(&output.stdout),
     );
     assert!(
-        shell.stderr.is_empty(),
+        output.stderr.is_empty(),
         "passing doctor is silent on stderr"
     );
-    check_engine_pair(&shell, &rust, &["doctor"]);
 }
 
 /// Home whose overlay resolution fails: the dispatcher prints the
 /// resolve warning on stderr, then doctor still runs (`|| true`)
 /// while test refuses (`|| return 1`).
 fn stage_bad_descriptor() -> (TempDir, TempDir) {
-    let home = TempDir::new("cli-bad-desc").expect("twin home");
-    let state = TempDir::new("cli-bad-desc-state").expect("twin state");
+    let home = TempDir::new("cli-bad-desc").expect("fixture home");
+    let state = TempDir::new("cli-bad-desc-state").expect("fixture state");
     let confd = home.path().join(".config/dot/overlays.d");
     std::fs::create_dir_all(&confd).expect("overlay conf dir");
     std::fs::write(home.path().join(".config/dot/config"), b"version=1\n").expect("config");
@@ -1010,53 +541,50 @@ fn stage_bad_descriptor() -> (TempDir, TempDir) {
 }
 
 #[test]
-fn doctor_resolve_failure_matches_shell() {
+fn doctor_resolve_failure_reports_the_warning_and_continues() {
     let (home, state) = stage_bad_descriptor();
-    let (shell, rust) = run_engine_pair(&home, &state, &["doctor"], &[]);
+    let output = isolated_run(&home, &state, &["doctor"], &[]);
     assert_eq!(
-        shell.status.code(),
+        output.status.code(),
         Some(1),
-        "oracle doctor still reports its checks: {}",
-        String::from_utf8_lossy(&shell.stdout),
+        "doctor still reports its checks: {}",
+        String::from_utf8_lossy(&output.stdout),
     );
     assert!(
-        String::from_utf8_lossy(&shell.stderr).contains("unknown sync value: hg"),
-        "oracle prints the resolve warning: {}",
-        String::from_utf8_lossy(&shell.stderr),
+        String::from_utf8_lossy(&output.stderr).contains("unknown sync value: hg"),
+        "doctor prints the resolve warning: {}",
+        String::from_utf8_lossy(&output.stderr),
     );
     assert!(
-        String::from_utf8_lossy(&shell.stdout).contains("dot runtime"),
-        "oracle doctor still ran: {}",
-        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&output.stdout).contains("dot runtime"),
+        "doctor still ran: {}",
+        String::from_utf8_lossy(&output.stdout),
     );
-    check_engine_pair(&shell, &rust, &["doctor"]);
 }
 
 #[test]
-fn test_resolve_failure_matches_shell() {
+fn test_resolve_failure_stops_before_running_suites() {
     let (home, state) = stage_bad_descriptor();
-    let (shell, rust) = run_engine_pair(&home, &state, &["test"], &[]);
+    let output = isolated_run(&home, &state, &["test"], &[]);
     assert_eq!(
-        shell.status.code(),
+        output.status.code(),
         Some(1),
-        "oracle test refuses without resolution: {}",
-        String::from_utf8_lossy(&shell.stderr),
+        "test refuses without resolution: {}",
+        String::from_utf8_lossy(&output.stderr),
     );
     assert!(
-        shell.stdout.is_empty(),
+        output.stdout.is_empty(),
         "refused test prints nothing on stdout"
     );
     assert!(
-        String::from_utf8_lossy(&shell.stderr).contains("unknown sync value: hg"),
-        "oracle prints the resolve warning: {}",
-        String::from_utf8_lossy(&shell.stderr),
+        String::from_utf8_lossy(&output.stderr).contains("unknown sync value: hg"),
+        "test prints the resolve warning: {}",
+        String::from_utf8_lossy(&output.stderr),
     );
-    check_engine_pair(&shell, &rust, &["test"]);
 }
 
-/// One failing doctor extension on an initialized client, mirroring
-/// the shell-suite trust recipe (0700 extension dirs, sealed
-/// scripts, explicit extension config): the worker failure marks
+/// One failing doctor extension on an initialized client (0700 extension
+/// directories, sealed scripts, explicit extension config). The worker failure marks
 /// `status=1`, so doctor exits 1 after the core rows.
 fn stage_doctor_extension(home: &TempDir) {
     let extd = home.path().join("extensions/doctor.d");
@@ -1081,72 +609,65 @@ fn stage_doctor_extension(home: &TempDir) {
 }
 
 #[test]
-fn doctor_extension_failure_matches_shell() {
+fn doctor_extension_failure_is_aggregated() {
     let (_scope, home, state) = stage_doctor_client();
     stage_doctor_extension(&home);
-    let (shell, rust) = run_engine_pair(&home, &state, &["doctor"], &[]);
+    let output = isolated_run(&home, &state, &["doctor"], &[]);
     assert_eq!(
-        shell.status.code(),
+        output.status.code(),
         Some(1),
-        "oracle aggregates the extension failure: {}",
-        String::from_utf8_lossy(&shell.stdout),
+        "doctor aggregates the extension failure: {}",
+        String::from_utf8_lossy(&output.stdout),
     );
     assert!(
-        String::from_utf8_lossy(&shell.stdout).contains("expected extension failure"),
-        "oracle carries the extension record: {}",
-        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&output.stdout).contains("expected extension failure"),
+        "doctor carries the extension record: {}",
+        String::from_utf8_lossy(&output.stdout),
     );
-    check_engine_pair(&shell, &rust, &["doctor"]);
 }
 
 #[test]
-fn test_help_matches_shell() {
-    // Static pin beside the oracle comparison, so a future wording
-    // drift reads as an explicit contract change.
-    let home = TempDir::new("cli-test-help").expect("twin home");
-    let state = TempDir::new("cli-test-help-state").expect("twin state");
-    let (shell, rust) = run_engine_pair(&home, &state, &["test", "--help"], &[]);
-    assert_eq!(shell.status.code(), Some(0));
+fn test_help_has_the_public_byte_contract() {
+    let home = TempDir::new("cli-test-help").expect("fixture home");
+    let state = TempDir::new("cli-test-help-state").expect("fixture state");
+    let output = isolated_run(&home, &state, &["test", "--help"], &[]);
+    assert_eq!(output.status.code(), Some(0));
     assert_eq!(
-        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&output.stdout),
         "usage: dot test [-s|--sequential] [-v|--verbose] [-j N|--jobs N] [--list] [name ...]\n\
          \n\
          Set DOT_TEST_INCLUDE_PROVIDER=1 to include the provider suite in an\n\
          unfiltered run. Select `dot` by name to run only the provider suite.\n",
     );
-    assert!(shell.stderr.is_empty());
-    check_engine_pair(&shell, &rust, &["test", "--help"]);
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
-fn test_unknown_option_matches_shell() {
-    let home = TempDir::new("cli-test-opt").expect("twin home");
-    let state = TempDir::new("cli-test-opt-state").expect("twin state");
-    let (shell, rust) = run_engine_pair(&home, &state, &["test", "--bogus"], &[]);
-    assert_eq!(shell.status.code(), Some(2));
-    assert!(shell.stdout.is_empty());
-    assert_eq!(shell.stderr, b"unknown option: --bogus\n");
-    check_engine_pair(&shell, &rust, &["test", "--bogus"]);
+fn test_unknown_option_has_the_public_error_contract() {
+    let home = TempDir::new("cli-test-opt").expect("fixture home");
+    let state = TempDir::new("cli-test-opt-state").expect("fixture state");
+    let output = isolated_run(&home, &state, &["test", "--bogus"], &[]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"unknown option: --bogus\n");
 }
 
 #[test]
-fn test_list_matches_shell() {
+fn test_list_prints_discovered_suites() {
     // No suites configured: only the provider identity lists.
-    let home = TempDir::new("cli-test-list").expect("twin home");
-    let state = TempDir::new("cli-test-list-state").expect("twin state");
-    let (shell, rust) = run_engine_pair(&home, &state, &["test", "-l"], &[]);
-    assert_eq!(shell.status.code(), Some(0));
-    assert_eq!(shell.stdout, b"dot\n");
-    assert!(shell.stderr.is_empty());
-    check_engine_pair(&shell, &rust, &["test", "-l"]);
+    let home = TempDir::new("cli-test-list").expect("fixture home");
+    let state = TempDir::new("cli-test-list-state").expect("fixture state");
+    let output = isolated_run(&home, &state, &["test", "-l"], &[]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"dot\n");
+    assert!(output.stderr.is_empty());
 }
 
 /// Local `*-test` suites for the propagation rows: one passing
 /// (`complete` record, exit 0), one failing (exit 3, no record).
 /// Discovery runs through `DOT_TEST_TESTS_DIR`, so no client
 /// checkout is needed; the scope lives in an exec-capable dir (the
-/// system temp dir may be `noexec`) with sealed modes, mirroring
-/// the shell-suite trust recipe.
+/// system temp dir may be `noexec`) with sealed modes.
 struct SuiteFixture {
     /// Temp scope owning every path below (held for the test).
     #[allow(dead_code)]
@@ -1174,11 +695,7 @@ fn stage_suites() -> SuiteFixture {
 }
 
 /// Scrub suite elapsed marks (` (0s)`, ` (12s)`) from one stream
-/// before comparing: the runner stamps `$SECONDS` (integer
-/// precision), so a loaded machine can tip a mark across a second
-/// boundary on one side only. Codes, glyphs, labels, ordering, and
-/// summaries still compare exactly — only wall-clock is excluded
-/// from byte parity. The digit run keeps `(1 total)`-style clauses
+/// before asserting a literal stream contract. The digit run keeps `(1 total)`-style clauses
 /// (digits followed by a space, never `s)`) intact.
 fn scrub_elapsed(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
@@ -1217,106 +734,51 @@ fn scrub_elapsed_keeps_counts_but_not_wall_clock() {
     assert_eq!(scrub_elapsed(b"no marks here\n"), b"no marks here\n");
 }
 
-/// One suite-propagation row: exit code plus stderr compare exactly;
-/// stdout compares with elapsed marks scrubbed (see
-/// [`scrub_elapsed`]).
-fn check_suite_pair(shell: &std::process::Output, rust: &std::process::Output, argv: &[&str]) {
-    assert_eq!(
-        rust.status.code(),
-        shell.status.code(),
-        "argv: {argv:?}\n shell stdout: {}\n shell stderr: {}",
-        String::from_utf8_lossy(&shell.stdout),
-        String::from_utf8_lossy(&shell.stderr),
-    );
-    assert_eq!(
-        scrub_elapsed(&rust.stdout),
-        scrub_elapsed(&shell.stdout),
-        "argv: {argv:?} stdout",
-    );
-    assert_eq!(rust.stderr, shell.stderr, "argv: {argv:?} stderr");
-}
-
 #[test]
-fn test_suite_pass_matches_shell() {
-    // `DOT_TEST_NO_COLOR=1` selects the plain rendering both sides
-    // share regardless of gum.
+fn test_suite_pass_reports_success() {
+    // `DOT_TEST_NO_COLOR=1` selects deterministic plain rendering.
     let fixture = stage_suites();
-    let home = TempDir::new("cli-test-pass").expect("twin home");
-    let state = TempDir::new("cli-test-pass-state").expect("twin state");
+    let home = TempDir::new("cli-test-pass").expect("fixture home");
+    let state = TempDir::new("cli-test-pass-state").expect("fixture state");
     let dir = fixture.dir.to_string_lossy().into_owned();
     let extra = [
         ("DOT_TEST_NO_COLOR", "1"),
         ("DOT_TEST_TESTS_DIR", dir.as_str()),
     ];
-    let (shell, rust) = run_engine_pair(&home, &state, &["test", "-s", "pass"], &extra);
-    // Skips are LOUD (stderr): suite execution needs the timeout
-    // supervisor (`python3` plus `test-timeout-v1`), which some
-    // platforms (e.g. the Debian CI image, whose test prerequisites
-    // the rust jobs skip) do not provide. The oracle reports the
-    // missing prerequisite itself — via the suite fifo on stdout,
-    // or stderr — so a silent pass can never hide behind it (the
-    // `binary_version_agrees_with_shell_in_same_checkout` precedent
-    // for environment-dependent oracles).
-    if String::from_utf8_lossy(&shell.stdout).contains("suite timeout requires python3")
-        || String::from_utf8_lossy(&shell.stderr).contains("suite timeout requires python3")
-    {
-        eprintln!(
-            "SKIP: no python3 suite supervisor here; suite parity is owned by platforms with the test prerequisites"
-        );
-        return;
-    }
+    let output = isolated_run(&home, &state, &["test", "-s", "pass"], &extra);
     assert_eq!(
-        shell.status.code(),
+        output.status.code(),
         Some(0),
-        "oracle passes the passing suite: {} {}",
-        String::from_utf8_lossy(&shell.stdout),
-        String::from_utf8_lossy(&shell.stderr),
+        "passing suite: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
-    assert!(
-        String::from_utf8_lossy(&shell.stdout).contains("Suites: 1 passed (1 total)"),
-        "oracle prints the pass summary: {}",
-        String::from_utf8_lossy(&shell.stdout),
-    );
-    check_suite_pair(&shell, &rust, &["test", "-s", "pass"]);
+    let expected = "\ndot test\n\n\nRunning 1 test suites...\n\n── pass-test ──\n  ✓ pass-test (Ns)\n════════════════════════════════\n✓ Suites: 1 passed (1 total)\n════════════════════════════════\n";
+    assert_eq!(scrub_elapsed(&output.stdout), expected.as_bytes());
+    assert_eq!(output.stderr, b"");
 }
 
 #[test]
-fn test_suite_fail_matches_shell() {
+fn test_suite_failure_reports_failure() {
     let fixture = stage_suites();
-    let home = TempDir::new("cli-test-fail").expect("twin home");
-    let state = TempDir::new("cli-test-fail-state").expect("twin state");
+    let home = TempDir::new("cli-test-fail").expect("fixture home");
+    let state = TempDir::new("cli-test-fail-state").expect("fixture state");
     let dir = fixture.dir.to_string_lossy().into_owned();
     let extra = [
         ("DOT_TEST_NO_COLOR", "1"),
         ("DOT_TEST_TESTS_DIR", dir.as_str()),
     ];
-    let (shell, rust) = run_engine_pair(&home, &state, &["test", "-s", "fail"], &extra);
-    // Same loud skip as the pass row above: without the timeout
-    // supervisor neither side can execute a suite, so there is no
-    // propagation to compare (a coincidental code match would hide
-    // the missing coverage). Either stream carries the oracle's
-    // report (see above).
-    if String::from_utf8_lossy(&shell.stdout).contains("suite timeout requires python3")
-        || String::from_utf8_lossy(&shell.stderr).contains("suite timeout requires python3")
-    {
-        eprintln!(
-            "SKIP: no python3 suite supervisor here; suite parity is owned by platforms with the test prerequisites"
-        );
-        return;
-    }
+    let output = isolated_run(&home, &state, &["test", "-s", "fail"], &extra);
     assert_eq!(
-        shell.status.code(),
+        output.status.code(),
         Some(1),
-        "oracle fails the failing suite: {} {}",
-        String::from_utf8_lossy(&shell.stdout),
-        String::from_utf8_lossy(&shell.stderr),
+        "failing suite: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
-    assert!(
-        String::from_utf8_lossy(&shell.stdout).contains("1 failed"),
-        "oracle prints the fail summary: {}",
-        String::from_utf8_lossy(&shell.stdout),
-    );
-    check_suite_pair(&shell, &rust, &["test", "-s", "fail"]);
+    let expected = "\ndot test\n\n\nRunning 1 test suites...\n\n── fail-test ──\n  ✗ fail-test (Ns)\n════════════════════════════════\n✗ Suites: 0 passed, 1 failed (1 total)\n════════════════════════════════\nFailed: fail-test\n";
+    assert_eq!(scrub_elapsed(&output.stdout), expected.as_bytes());
+    assert_eq!(output.stderr, b"");
 }
 
 #[test]
@@ -1324,40 +786,28 @@ fn binary_doctor_test_wired_past_interim() {
     // Slice 83: the interim set is empty — every `Command` variant
     // has a dedicated arm in `run`, so no known command may report
     // "not yet implemented" (routing finality is pinned by
-    // `dispatch_names_every_shell_arm`, execution parity by the
-    // engine rows above). This smoke asserts the diagnostic is gone
+    // the dispatch tests and the end-to-end rows above). This smoke asserts the diagnostic is gone
     // on the cheapest deterministic rows.
-    let home = TempDir::new("cli-wired").expect("twin home");
-    let state = TempDir::new("cli-wired-state").expect("twin state");
+    let home = TempDir::new("cli-wired").expect("fixture home");
+    let state = TempDir::new("cli-wired-state").expect("fixture state");
     for argv in [&["test", "--help"][..], &["test", "--bogus"][..]] {
-        let rust = engine_rust(&home, &state, argv, &[]);
-        let combined = [rust.stdout.as_slice(), rust.stderr.as_slice()].concat();
+        let output = isolated_run(&home, &state, argv, &[]);
+        let combined = [output.stdout.as_slice(), output.stderr.as_slice()].concat();
         assert!(
             !combined.windows(19).any(|w| w == b"not yet implemented"),
             "argv: {argv:?}",
         );
     }
-    let rust = engine_rust(&home, &state, &["doctor"], &[]);
-    let combined = [rust.stdout.as_slice(), rust.stderr.as_slice()].concat();
+    let output = isolated_run(&home, &state, &["doctor"], &[]);
+    let combined = [output.stdout.as_slice(), output.stderr.as_slice()].concat();
     assert!(
         !combined.windows(19).any(|w| w == b"not yet implemented"),
         "doctor is wired",
     );
 }
 
-/// Extract the `_dot_init_usage` heredoc body from the shell source,
-/// like [`shell_help`] does for the dispatcher help.
-fn shell_init_usage() -> String {
-    let source = include_str!("../lib/dot/init-client.sh");
-    let marker = "_dot_init_usage() {\n  cat <<'EOF'\n";
-    let start = source.find(marker).expect("init usage marker") + marker.len();
-    let rest = &source[start..];
-    let end = rest.find("\nEOF\n").expect("init usage terminator");
-    format!("{}\n", &rest[..end])
-}
-
 /// `dot init` under a controlled client: a cleared environment plus a
-/// twin home/state pair, so rows never touch the developer's own
+/// temporary home/state pair, so rows never touch the developer's own
 /// checkout, provider state, or ambient variables.
 fn init_env(cmd: &mut Command, home: &TempDir, state: &TempDir) {
     let repo = env!("CARGO_MANIFEST_DIR");
@@ -1365,8 +815,7 @@ fn init_env(cmd: &mut Command, home: &TempDir, state: &TempDir) {
     let tmpdir = std::env::var_os("TMPDIR")
         .filter(|dir| !dir.is_empty())
         .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    // One `.env` per variable (never `.envs`), matching the oracle
-    // convention above.
+    // One `.env` per variable (never `.envs`).
     cmd.env_clear()
         .env("LC_ALL", "C")
         .env("PATH", &path)
@@ -1375,6 +824,7 @@ fn init_env(cmd: &mut Command, home: &TempDir, state: &TempDir) {
         .env("XDG_STATE_HOME", state.path())
         .env("DOT_SOURCE_ROOT", repo)
         .current_dir(home.path());
+    isolate_git(cmd);
 }
 
 /// The Rust binary's `init` with a controlled client.
@@ -1384,53 +834,20 @@ fn init_bin(home: &TempDir, state: &TempDir) -> Command {
     cmd
 }
 
-/// The production shell binary (`bin/dot`, under its own
-/// `set -euo pipefail`) with the same controlled client: the
-/// strongest oracle for the wired arm, comparing process observables
-/// end to end rather than function text.
-fn shell_dot(argv: &[&str], home: &TempDir, state: &TempDir) -> std::process::Output {
-    let mut cmd = Command::new("bash");
-    cmd.arg("bin/dot");
-    for arg in argv {
-        cmd.arg(arg);
-    }
-    init_env(&mut cmd, home, state);
-    cmd.current_dir(env!("CARGO_MANIFEST_DIR"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd.output().expect("run bin/dot")
-}
-
-/// One wired-arm row: the Rust binary and the production shell agree
-/// on exit code and both streams byte for byte.
-fn check_init(argv: &[&str]) {
-    let home = TempDir::new("cli-init-rust").expect("twin home");
-    let state = TempDir::new("cli-init-state").expect("twin state");
-    let rust = init_bin(&home, &state)
-        .args(argv)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("run dot init");
-    let shell = shell_dot(argv, &home, &state);
-    assert_eq!(rust.status.code(), shell.status.code(), "argv: {argv:?}");
-    assert_eq!(rust.stdout, shell.stdout, "argv: {argv:?}");
-    assert_eq!(rust.stderr, shell.stderr, "argv: {argv:?}");
-}
-
 #[test]
-fn binary_init_help_matches_shell_usage() {
-    assert_eq!(
-        dot::init_client_adopt::usage(),
-        shell_init_usage().into_bytes()
-    );
+fn binary_init_help_has_the_public_byte_contract() {
+    let home = TempDir::new("cli-init-help").expect("test home");
+    let state = TempDir::new("cli-init-help-state").expect("test state");
+    assert_eq!(dot::init_client_adopt::usage(), EXPECTED_INIT_USAGE);
     for argv in [vec!["init", "--help"], vec!["init", "-h"]] {
-        check_init(&argv);
+        let output = init_bin(&home, &state)
+            .args(argv)
+            .output()
+            .expect("init help");
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stdout, EXPECTED_INIT_USAGE);
+        assert!(output.stderr.is_empty());
     }
-    let home = TempDir::new("cli-init-help").expect("twin home");
-    let state = TempDir::new("cli-init-help-state").expect("twin state");
     let rust = init_bin(&home, &state)
         .args(["init", "--help"])
         .output()
@@ -1438,37 +855,39 @@ fn binary_init_help_matches_shell_usage() {
     assert_eq!(rust.status.code(), Some(0));
     assert_eq!(
         String::from_utf8(rust.stdout).expect("stdout UTF-8"),
-        shell_init_usage()
+        std::str::from_utf8(EXPECTED_INIT_USAGE).expect("literal init usage UTF-8")
     );
     assert!(rust.stderr.is_empty());
 }
 
 #[test]
-fn binary_init_matches_production_on_early_paths() {
+fn binary_init_early_paths_have_expected_statuses() {
     // Parsing, mode gates, the provider gate, and the resolvable
-    // failures: none reach the interim closures, so the production
-    // shell is the exact oracle — including the errexit-shaped codes
-    // (`--bogus` exits `1`, never the dead `return 2`).
-    for argv in [
-        vec!["init", "--bogus"],
-        vec!["init"],
-        vec!["init", "--branch"],
-        vec!["init", "--status", "some-origin"],
-        vec!["init", "--status"],
-        vec!["init", "--branch", "main", "notaurl"],
-        vec!["init", "--branch", "bad..name", "notaurl"],
+    // failures: none reach convergence (`--bogus` exits `1`, while
+    // incomplete usage exits `2`).
+    let home = TempDir::new("cli-init-early").expect("test home");
+    let state = TempDir::new("cli-init-early-state").expect("test state");
+    for (argv, code) in [
+        (vec!["init", "--bogus"], 1),
+        (vec!["init"], 2),
+        (vec!["init", "--branch"], 2),
+        (vec!["init", "--status", "some-origin"], 2),
+        (vec!["init", "--status"], 0),
+        (vec!["init", "--branch", "main", "notaurl"], 1),
+        (vec!["init", "--branch", "bad..name", "notaurl"], 1),
     ] {
-        check_init(&argv);
+        let output = init_bin(&home, &state)
+            .args(&argv)
+            .output()
+            .expect("init row");
+        assert_eq!(output.status.code(), Some(code), "argv: {argv:?}");
     }
 }
 
 #[test]
-fn binary_init_early_codes_match_production_shape() {
-    // Static pins beside the oracle comparison above, so a future
-    // drift reads as an explicit contract change, not a silent
-    // byte shift.
-    let home = TempDir::new("cli-init-codes").expect("twin home");
-    let state = TempDir::new("cli-init-codes-state").expect("twin state");
+fn binary_init_early_codes_have_expected_streams() {
+    let home = TempDir::new("cli-init-codes").expect("fixture home");
+    let state = TempDir::new("cli-init-codes-state").expect("fixture state");
     let cases: &[(&[&str], i32, &[u8])] = &[
         (
             &["init", "--bogus"],
@@ -1497,34 +916,8 @@ fn binary_init_early_codes_match_production_shape() {
     );
 }
 
-/// One stateful wired-arm row: the Rust binary and the production
-/// shell agree on exit code and both streams byte for byte, each on
-/// its own twin home/state pair (unlike [`check_init`], whose
-/// shared pair only suits stateless rows).
-fn check_init_twins(argv: &[&str]) {
-    let rust_home = TempDir::new("cli-init-rust").expect("rust home");
-    let rust_state = TempDir::new("cli-init-rust-state").expect("rust state");
-    let shell_home = TempDir::new("cli-init-shell").expect("shell home");
-    let shell_state = TempDir::new("cli-init-shell-state").expect("shell state");
-    let rust = init_bin(&rust_home, &rust_state)
-        .args(argv)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("run dot init");
-    let shell = shell_dot(argv, &shell_home, &shell_state);
-    assert_eq!(rust.status.code(), shell.status.code(), "argv: {argv:?}");
-    assert_eq!(rust.stdout, shell.stdout, "argv: {argv:?}");
-    assert_eq!(rust.stderr, shell.stderr, "argv: {argv:?}");
-}
-
 #[test]
-fn binary_init_rollback_matches_production() {
-    // The rollback tree runs the real ports now: refusal rows and
-    // the journal-free success row agree with `bin/dot` end to
-    // end (rollback never converges, so streams compare exactly).
-    check_init_twins(&["init", "--rollback"]);
+fn binary_init_rollback_without_a_transaction_is_rejected() {
     let rust_home = TempDir::new("cli-init-rb").expect("rust home");
     let rust_state = TempDir::new("cli-init-rb-state").expect("rust state");
     let rust = init_bin(&rust_home, &rust_state)
@@ -1581,7 +974,7 @@ fn binary_init_fresh_converges_natively() {
     let output = init_bin(&home, &state)
         .args(["init", "--yes", "--branch", &branch, &url])
         .env("DOT_INIT_SKIP_PROVIDER", "1")
-        .env("DOT_BASH", "/definitely/missing/bash-engine")
+        .env("DOT_BASH", "/definitely/missing/fallback")
         .env("PATH", &path)
         .output()
         .expect("run native init");
@@ -1610,7 +1003,7 @@ fn binary_init_fresh_converges_natively() {
         let repeated = init_bin(&home, &state)
             .args(&argv)
             .env("DOT_INIT_SKIP_PROVIDER", "1")
-            .env("DOT_BASH", "/definitely/missing/bash-engine")
+            .env("DOT_BASH", "/definitely/missing/fallback")
             .env("PATH", &path)
             .output()
             .expect("repeat native convergence");
@@ -1624,6 +1017,74 @@ fn binary_init_fresh_converges_natively() {
     assert_eq!(semantic_tree(home.path(), true), first_home);
     assert_eq!(semantic_tree(state.path(), false), first_state);
     assert!(!poison_record.exists(), "repeat invoked Shdeps provider");
+}
+
+#[cfg(unix)]
+#[test]
+fn repo_fetch_discovers_the_base_from_native_init_identity() {
+    let scope = TempDir::new("cli-fetch-after-init-origin").expect("origin scope");
+    let (origin, seed, branch) = seed_bare_origin(scope.path(), "dotfiles");
+    let home = TempDir::new("cli-fetch-after-init-home").expect("home");
+    let state = TempDir::new("cli-fetch-after-init-state").expect("state");
+    let url = format!("file://{}", origin.display());
+
+    let initialized = init_bin(&home, &state)
+        .args(["init", "--yes", "--branch", &branch, &url])
+        .env("DOT_INIT_SKIP_PROVIDER", "1")
+        .env("DOT_BASH", "/definitely/missing/fallback")
+        .output()
+        .expect("native init");
+    assert_eq!(
+        initialized.status.code(),
+        Some(0),
+        "native init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    assert!(state.path().join("dot/init/completed").is_file());
+
+    seed_advance(&seed, "tracked.txt", b"origin-two\n");
+    let expected = repos_git_line(&seed, &["rev-parse", "HEAD"]);
+    let before = repos_prefix_line(
+        &home.path().join(".dotfiles"),
+        home.path(),
+        &["rev-parse", &format!("refs/remotes/origin/{branch}")],
+    );
+    assert_ne!(before, expected, "fixture remote advanced");
+
+    let fetched = init_bin(&home, &state)
+        .arg("fetch")
+        .output()
+        .expect("native repository fetch");
+    assert_eq!(
+        fetched.status.code(),
+        Some(0),
+        "fetch failed: {}",
+        String::from_utf8_lossy(&fetched.stderr)
+    );
+    assert_eq!(fetched.stdout, b"==> Fetching dotfiles...\n");
+    assert_eq!(
+        repos_prefix_line(
+            &home.path().join(".dotfiles"),
+            home.path(),
+            &["rev-parse", &format!("refs/remotes/origin/{branch}")],
+        ),
+        expected
+    );
+    let fetch_head = home.path().join(".dotfiles/FETCH_HEAD");
+    assert_eq!(
+        std::fs::metadata(&fetch_head)
+            .expect("FETCH_HEAD metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(
+        std::fs::read(&fetch_head)
+            .expect("FETCH_HEAD bytes")
+            .starts_with(expected.as_bytes()),
+        "FETCH_HEAD records the fetched generation"
+    );
 }
 
 #[cfg(unix)]
@@ -1644,7 +1105,7 @@ fn binary_init_reloads_the_configuration_it_just_cloned() {
 
     let output = init_bin(&home, &state)
         .args(["init", "--yes", "--branch", &branch, &url])
-        .env("DOT_BASH", "/definitely/missing/bash-engine")
+        .env("DOT_BASH", "/definitely/missing/fallback")
         .env("PATH", path)
         .output()
         .expect("run native init with cloned config");
@@ -1692,13 +1153,15 @@ fn binary_init_holds_the_operation_lock_and_read_only_modes_skip_it() {
 }
 
 #[test]
-fn binary_init_adopts_and_converges_without_the_bash_engine() {
+fn binary_init_adopts_and_converges_natively() {
     let scope = TempDir::new("cli-init-adopt-origin").expect("origin scope");
     let (origin, _seed, branch) = seed_bare_origin(scope.path(), "dotfiles");
     let home = TempDir::new("cli-init-adopt-home").expect("home");
     let state = TempDir::new("cli-init-adopt-state").expect("state");
     let url = format!("file://{}", origin.display());
-    let clone = Command::new("git")
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    let clone = command
         .args(["clone", "-q", "--branch", &branch, &url])
         .arg(home.path())
         .status()
@@ -1709,7 +1172,7 @@ fn binary_init_adopts_and_converges_without_the_bash_engine() {
     let output = init_bin(&home, &state)
         .args(["init", "--yes", "--branch", &branch, &url])
         .env("DOT_INIT_SKIP_PROVIDER", "1")
-        .env("DOT_BASH", "/definitely/missing/bash-engine")
+        .env("DOT_BASH", "/definitely/missing/fallback")
         .output()
         .expect("run native adopt");
     assert_eq!(
@@ -1728,7 +1191,41 @@ fn binary_init_adopts_and_converges_without_the_bash_engine() {
 }
 
 #[test]
-fn binary_init_resumes_live_transaction_and_converges_without_bash() {
+fn binary_init_adopts_legacy_separate_git_dir_natively() {
+    let scope = TempDir::new("cli-init-adopt-separate-origin").expect("origin scope");
+    let (origin, _seed, branch) = seed_bare_origin(scope.path(), "dotfiles");
+    let home = TempDir::new("cli-init-adopt-separate-home").expect("home");
+    let state = TempDir::new("cli-init-adopt-separate-state").expect("state");
+    let url = format!("file://{}", origin.display());
+    let git_dir = home.path().join(".dotfiles");
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    let clone = command
+        .args(["clone", "-q", "--bare", &url])
+        .arg(&git_dir)
+        .status()
+        .expect("clone separate fixture");
+    assert!(clone.success());
+    std::fs::write(home.path().join("tracked.txt"), b"v1\n").expect("materialize worktree");
+
+    let output = init_bin(&home, &state)
+        .args(["init", "--yes", "--branch", &branch, &url])
+        .env("DOT_INIT_SKIP_PROVIDER", "1")
+        .output()
+        .expect("run native separate adoption");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "native separate adoption failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(state.path().join("dot/init/completed").is_file());
+    assert!(!state.path().join("dot/init/transaction").exists());
+    assert!(git_dir.is_dir());
+}
+
+#[test]
+fn binary_init_resumes_live_transaction_and_converges_natively() {
     let scope = TempDir::new("cli-init-resume-origin").expect("origin scope");
     let (origin, _seed, branch) = seed_bare_origin(scope.path(), "dotfiles");
     let home = TempDir::new("cli-init-resume-home").expect("home");
@@ -1739,7 +1236,7 @@ fn binary_init_resumes_live_transaction_and_converges_without_bash() {
     let initial = init_bin(&home, &state)
         .args(argv)
         .env("DOT_INIT_SKIP_PROVIDER", "1")
-        .env("DOT_BASH", "/definitely/missing/bash-engine")
+        .env("DOT_BASH", "/definitely/missing/fallback")
         .output()
         .expect("initial native init");
     assert_eq!(initial.status.code(), Some(0));
@@ -1771,7 +1268,7 @@ fn binary_init_resumes_live_transaction_and_converges_without_bash() {
     let resumed = init_bin(&home, &state)
         .args(argv)
         .env("DOT_INIT_SKIP_PROVIDER", "1")
-        .env("DOT_BASH", "/definitely/missing/bash-engine")
+        .env("DOT_BASH", "/definitely/missing/fallback")
         .output()
         .expect("resume native init");
     assert_eq!(
@@ -1791,12 +1288,12 @@ fn binary_init_resumes_live_transaction_and_converges_without_bash() {
     );
 }
 
-/// Synthetic file:// client for the fetch/push/status/diff wiring
-/// rows (slice 82): a legacy-separate base (`$HOME/.dotfiles`, bare,
+/// Synthetic file:// client for fetch/push/status/diff scenarios: a separate
+/// base (`$HOME/.dotfiles`, bare,
 /// one file:// origin, worktree materialized at `$HOME`) plus one
 /// git overlay with a matching descriptor, all under one TempDir
 /// scope. Origins and seed clones live beside — never inside — the
-/// twin home, so `status` sees only worktree files.
+/// temporary home, so `status` sees only worktree files.
 struct ReposClient {
     /// Temp scope owning every path below (held for the test).
     #[allow(dead_code)]
@@ -1834,23 +1331,40 @@ fn native_update_env(client: &ReposClient, state: &Path) -> BTreeMap<OsString, O
         (OsString::from("PATH"), path),
         (
             OsString::from("BASH"),
-            dot::test_support::bash().as_os_str().to_owned(),
+            dot_test_support::bash().as_os_str().to_owned(),
         ),
         (OsString::from("TMPDIR"), tmp),
         (OsString::from("LC_ALL"), OsString::from("C")),
         (OsString::from("SHELL"), OsString::from("/bin/sh")),
         (OsString::from("DOT_GIT_REAL"), OsString::from("1")),
+        (OsString::from("GIT_CONFIG_COUNT"), OsString::from("3")),
+        (
+            OsString::from("GIT_CONFIG_KEY_0"),
+            OsString::from("core.hooksPath"),
+        ),
+        (
+            OsString::from("GIT_CONFIG_VALUE_0"),
+            OsString::from("/dev/null"),
+        ),
+        (
+            OsString::from("GIT_CONFIG_KEY_1"),
+            OsString::from("commit.gpgSign"),
+        ),
+        (
+            OsString::from("GIT_CONFIG_VALUE_1"),
+            OsString::from("false"),
+        ),
+        (
+            OsString::from("GIT_CONFIG_KEY_2"),
+            OsString::from("tag.gpgSign"),
+        ),
+        (
+            OsString::from("GIT_CONFIG_VALUE_2"),
+            OsString::from("false"),
+        ),
         (
             OsString::from("DOT_SOURCE_ROOT"),
             OsString::from(env!("CARGO_MANIFEST_DIR")),
-        ),
-        (
-            OsString::from("DOT_BASE_TOPOLOGY"),
-            OsString::from("separate"),
-        ),
-        (
-            OsString::from("DOT_CLIENT_GIT_DIR"),
-            client.base_git_dir.as_os_str().to_owned(),
         ),
         (
             OsString::from("DOT_DEPENDENCY_PROVIDER"),
@@ -1878,9 +1392,9 @@ fn embedded_runtime(
         )
 }
 
-/// The shell harness defaults state beneath HOME and keeps Git's launcher
-/// cache outside it. Mirror that for the force-fallback oracle.
-fn runtime_for_force_fallback(client: &ReposClient) -> dot::app::Runtime {
+/// Use the default state location while keeping Git's launcher cache outside
+/// the isolated home.
+fn runtime_for_force_update(client: &ReposClient) -> dot::app::Runtime {
     let state = client.home.join(".local/state");
     let mut env = native_update_env(client, &state);
     env.remove(OsStr::new("XDG_STATE_HOME"));
@@ -1981,6 +1495,18 @@ fn real_tool(tool: &str) -> PathBuf {
         .expect("real native tool")
 }
 
+/// Keep fixtures independent of developer Git hooks and signing policy.
+fn isolate_git(command: &mut Command) {
+    command
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_KEY_1", "commit.gpgSign")
+        .env("GIT_CONFIG_VALUE_1", "false")
+        .env("GIT_CONFIG_KEY_2", "tag.gpgSign")
+        .env("GIT_CONFIG_VALUE_2", "false");
+}
+
 fn wait_for_runtime_workers(barrier: &Path, markers: &[&str]) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -1995,10 +1521,8 @@ fn wait_for_runtime_workers(barrier: &Path, markers: &[&str]) -> bool {
     false
 }
 
-/// Snapshot semantic user/state files. The production shell launcher writes
-/// only `dot/bash-v1` bootstrap metadata before dispatch; the Rust binary
-/// intentionally does not own that obsolete launcher cache, so this exact
-/// one path is classified rather than recreated or broadly normalized.
+/// Snapshot semantic user/state files while excluding repository internals and
+/// obsolete bootstrap metadata that are outside the tested operation.
 fn semantic_tree(root: &Path, home_tree: bool) -> Vec<(String, Vec<u8>)> {
     if !root.is_dir() {
         return Vec::new();
@@ -2037,8 +1561,8 @@ fn semantic_tree(root: &Path, home_tree: bool) -> Vec<(String, Vec<u8>)> {
     entries
 }
 
-/// Ambient values the old engine accidentally captured or changed. The test
-/// never writes them: preserving this snapshot proves two explicit runtimes
+/// Ambient values that an embedded invocation must not capture or change. The
+/// test never writes them: preserving this snapshot proves explicit runtimes
 /// are isolated even while they run concurrently.
 fn native_parent_snapshot() -> BTreeMap<OsString, Option<OsString>> {
     [
@@ -2065,11 +1589,13 @@ fn native_parent_snapshot() -> BTreeMap<OsString, Option<OsString>> {
 /// Run `git -C dir args` silenced, asserting success. Fixed
 /// author/committer dates keep fixture SHAs deterministic;
 /// `DOT_GIT_REAL` bypasses any machine-local git launcher shim
-/// (the `shell_run` convention in tests/repos_commands.rs).
 fn repos_git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    let status = command
         .arg("-C")
         .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .env("DOT_GIT_REAL", "1")
         .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00+00:00")
@@ -2084,7 +1610,9 @@ fn repos_git(dir: &Path, args: &[&str]) {
 /// Run `git --git-dir=<git_dir> --work-tree=<work> args` silenced
 /// (separate-topology base fixtures), asserting success.
 fn repos_git_prefix(git_dir: &Path, work: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    let status = command
         .arg(format!("--git-dir={}", git_dir.display()))
         .arg(format!("--work-tree={}", work.display()))
         .args(args)
@@ -2104,7 +1632,9 @@ fn repos_git_prefix(git_dir: &Path, work: &Path, args: &[&str]) {
 
 /// Capture one `git -C dir args` stdout line, trimmed.
 fn repos_git_line(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    let output = command
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -2129,7 +1659,9 @@ fn seed_bare_origin(scope: &Path, name: &str) -> (PathBuf, PathBuf, String) {
     std::fs::create_dir_all(&origin).expect("origin dir");
     repos_git(&origin, &["init", "--bare", "-q"]);
     let seed = scope.join(format!("{name}-seed"));
-    let status = Command::new("git")
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    let status = command
         .arg("clone")
         .arg("-q")
         .arg(&origin)
@@ -2185,17 +1717,17 @@ fn seed_advance(seed: &Path, file: &str, body: &[u8]) {
     repos_git(seed, &["push", "-q", "origin", "HEAD"]);
 }
 
-/// Stage the full client: bare file:// origins, a legacy-separate
+/// Stage the full client: bare file:// origins, a separate
 /// base cloned bare into `$HOME/.dotfiles` (single origin, valid
 /// branch, worktree checked out at `$HOME` tracking its origin),
-/// and one overlay clone with a matching descriptor under a twin
+/// and one overlay clone with a matching descriptor under a temporary
 /// XDG config home (kept outside `$HOME` so status stays clean).
 fn stage_repos_client() -> ReposClient {
     let scope = TempDir::new("cli-repos").expect("repos scope");
     let home = scope.path().join("home");
     let xdg = scope.path().join("xdg");
     let origins = scope.path().join("origins");
-    std::fs::create_dir_all(&home).expect("twin home");
+    std::fs::create_dir_all(&home).expect("fixture home");
     let (base_origin, base_seed, base_branch) = seed_bare_origin(&origins, "dotfiles");
     let base_url = format!("file://{}", base_origin.display());
     let base_git_dir = home.join(".dotfiles");
@@ -2229,7 +1761,9 @@ fn stage_repos_client() -> ReposClient {
     std::fs::write(confd.join("10-alpha.conf"), format!("url={overlay_url}\n"))
         .expect("overlay descriptor");
     let overlay = home.join(".dotfiles-alpha");
-    let status = Command::new("git")
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    let status = command
         .arg("clone")
         .arg("-q")
         .arg(&overlay_url)
@@ -2255,14 +1789,9 @@ fn stage_repos_client() -> ReposClient {
     }
 }
 
-/// Controlled environment for the repo wiring rows: a cleared
-/// environment plus the twin home/XDG pair, so rows never touch the
-/// developer's own checkout or ambient variables. The Rust side
-/// additionally receives the shell-computed topology publication
-/// (`_dot_client_select` stays shell-owned; see `base_from_env`);
-/// the shell side computes it from the fixture itself. One `.env`
-/// per variable (never `.envs`), matching the oracle convention.
-fn repos_env(cmd: &mut Command, client: &ReposClient, topology: bool) {
+/// Controlled environment for repo scenarios. The topology publication and
+/// one `.env` entry per variable make every input explicit.
+fn repos_env(cmd: &mut Command, client: &ReposClient) {
     let repo = env!("CARGO_MANIFEST_DIR");
     let path = std::env::var_os("PATH").unwrap_or_default();
     let tmpdir = std::env::var_os("TMPDIR")
@@ -2272,14 +1801,9 @@ fn repos_env(cmd: &mut Command, client: &ReposClient, topology: bool) {
     cmd.env_clear()
         .env("LC_ALL", "C")
         .env("PATH", &path)
-        .env("BASH", dot::test_support::bash())
+        .env("BASH", dot_test_support::bash())
         .env("TMPDIR", &tmpdir)
-        // Pin an unknown shell: production always exports `SHELL`
-        // (and bash backfills it from the login shell when it does
-        // not), but this cleared harness env has none — without the
-        // pin the reload hint would read each machine's login shell
-        // on the shell side and nothing on the Rust side. `/bin/sh`
-        // keeps both twins on the rc-files fallback deterministically.
+        // Pin the reload hint independently of the machine's login shell.
         .env("SHELL", "/bin/sh")
         .env("HOME", &client.home)
         .env("XDG_CONFIG_HOME", &client.xdg)
@@ -2291,16 +1815,11 @@ fn repos_env(cmd: &mut Command, client: &ReposClient, topology: bool) {
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("DOT_SOURCE_ROOT", repo)
         .current_dir(&client.home);
-    if topology {
-        cmd.env("DOT_BASE_TOPOLOGY", "separate").env(
-            "DOT_CLIENT_GIT_DIR",
-            client.base_git_dir.to_string_lossy().into_owned(),
-        );
-    }
+    isolate_git(cmd);
 }
 
 #[cfg(target_os = "macos")]
-fn shell_oracle_command() -> Command {
+fn public_hook_command() -> Command {
     let mut cmd = Command::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/lib/dot/public/test-timeout-v1"
@@ -2309,15 +1828,15 @@ fn shell_oracle_command() -> Command {
     // complete child session. Nested shell workers can therefore inherit that
     // group instead of asking macOS Bash to create another group after a
     // short-lived worker has crossed exec and racing with `setpgid`.
-    cmd.arg("120s").arg(dot::test_support::bash());
+    cmd.arg("120s").arg(dot_test_support::bash());
     cmd
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn shell_oracle_uses_no_extra_runtime_dependency() {
-    let cmd = shell_oracle_command();
-    assert_eq!(cmd.get_program(), dot::test_support::bash());
+fn public_hook_command_uses_no_extra_runtime_dependency() {
+    let cmd = public_hook_command();
+    assert_eq!(cmd.get_program(), dot_test_support::bash());
     assert!(
         cmd.get_envs()
             .all(|(key, _)| key != "DOT_CLEANUP_INHERIT_GROUP")
@@ -2325,8 +1844,8 @@ fn shell_oracle_uses_no_extra_runtime_dependency() {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn shell_oracle_command() -> Command {
-    Command::new(dot::test_support::bash())
+fn public_hook_command() -> Command {
+    Command::new(dot_test_support::bash())
 }
 
 #[cfg(target_os = "macos")]
@@ -2335,34 +1854,116 @@ fn inherit_supervised_group(cmd: &mut Command) {
 }
 
 #[test]
-fn repos_twins_disable_optional_git_locks() {
+fn repo_commands_disable_optional_git_locks() {
     let client = stage_repos_client();
-    let mut shell = Command::new(dot::test_support::bash());
-    let mut rust = bin();
-    repos_env(&mut shell, &client, false);
-    repos_env(&mut rust, &client, true);
-    let shell_value = shell
+    let mut command = bin();
+    repos_env(&mut command, &client);
+    let value = command
         .get_envs()
         .find(|(key, _)| *key == "GIT_OPTIONAL_LOCKS")
         .and_then(|(_, value)| value);
-    let rust_value = rust
-        .get_envs()
-        .find(|(key, _)| *key == "GIT_OPTIONAL_LOCKS")
-        .and_then(|(_, value)| value);
-    assert_eq!(shell_value, Some(OsStr::new("0")));
-    assert_eq!(rust_value, shell_value);
+    assert_eq!(value, Some(OsStr::new("0")));
+}
+
+#[test]
+fn ambient_topology_cannot_authorize_an_uninitialized_checkout() {
+    let scope = TempDir::new("repo-topology-injection").expect("fixture");
+    let home = scope.path().join("home");
+    let xdg = scope.path().join("xdg");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(xdg.join("dot/overlays.d")).expect("overlay config");
+    std::fs::write(xdg.join("dot/overlays.d/bad.conf"), b"url=x\nsync=hg\n")
+        .expect("invalid descriptor");
+    repos_git(&home, &["init", "-q"]);
+    std::fs::write(home.join("tracked"), b"content\n").expect("tracked file");
+    repos_git(&home, &["add", "tracked"]);
+    repos_git(&home, &["commit", "-qm", "seed"]);
+
+    for command in ["fetch", "push", "status", "diff"] {
+        let output = bin()
+            .arg(command)
+            .env_clear()
+            .env("LC_ALL", "C")
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
+            .env("DOT_BASE_TOPOLOGY", "ordinary")
+            .env("DOT_CLIENT_GIT_DIR", home.join(".git"))
+            .current_dir(&home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run repo command");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{command} accepted injection"
+        );
+        assert_eq!(
+            output.stderr, b"dot: ordinary HOME checkout requires a completed dot init identity\n",
+            "{command} diagnostic"
+        );
+    }
+
+    for command in ["cron", "frobnicate"] {
+        let output = bin()
+            .arg(command)
+            .env_clear()
+            .env("LC_ALL", "C")
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
+            .current_dir(&home)
+            .output()
+            .expect("run pre-dispatch command");
+        assert_eq!(output.status.code(), Some(1), "{command} code");
+        assert_eq!(
+            output.stderr, b"dot: ordinary HOME checkout requires a completed dot init identity\n",
+            "{command} identity precedence"
+        );
+    }
+}
+
+#[test]
+fn init_help_validates_an_existing_identity_record() {
+    let scope = TempDir::new("init-help-identity").expect("fixture");
+    let home = scope.path().join("home");
+    let state = scope.path().join("state");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(state.join("dot/init")).expect("init state");
+    std::fs::write(state.join("dot/init/completed"), b"malformed\n").expect("record");
+    let output = bin()
+        .args(["init", "--help"])
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
+        .current_dir(&home)
+        .output()
+        .expect("run init help");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"dot: malformed initialization identity record\n"
+    );
 }
 
 #[cfg(target_os = "macos")]
 #[test]
-fn shell_oracle_owns_one_inherited_process_group() {
-    let mut cmd = shell_oracle_command();
+fn public_hook_command_owns_one_inherited_process_group() {
+    let mut cmd = public_hook_command();
     cmd.args([
         "-c",
         "parent=$(ps -o pgid= -p $$ | tr -d ' '); child=$(bash -c 'ps -o pgid= -p $$ | tr -d \" \"'); printf '%s|%s|%s|%s' \"$DOT_CLEANUP_INHERIT_GROUP\" \"$$\" \"$parent\" \"$child\"",
     ]);
     inherit_supervised_group(&mut cmd);
-    let output = cmd.output().expect("run isolated shell oracle probe");
+    let output = cmd.output().expect("run isolated hook process probe");
     assert!(
         output.status.success(),
         "probe status: {:?}; stderr={}",
@@ -2382,90 +1983,106 @@ fn shell_oracle_owns_one_inherited_process_group() {
         "valid numeric process identities: {text}; stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(parent, pid, "oracle shell must lead its group: {text}");
+    assert_eq!(parent, pid, "hook shell must lead its group: {text}");
     assert_eq!(child, parent, "child process group: {text}");
     assert!(fields.next().is_none(), "unexpected probe fields: {text}");
 }
 
-/// The production shell (`bin/dot` under `set -euo pipefail`) over
-/// the fixture: the strongest oracle for the wired arms, comparing
-/// process observables end to end.
-fn repos_shell(client: &ReposClient, argv: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg("bin/dot");
-    for arg in argv {
-        cmd.arg(arg);
-    }
-    repos_env(&mut cmd, client, false);
-    cmd.current_dir(env!("CARGO_MANIFEST_DIR"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd.output().expect("run bin/dot")
-}
-
-/// The Rust binary over the same fixture.
-fn repos_rust(client: &ReposClient, argv: &[&str]) -> std::process::Output {
+/// Run one repository command in its isolated fixture.
+fn repos_run(client: &ReposClient, argv: &[&str]) -> std::process::Output {
     let mut cmd = bin();
     for arg in argv {
         cmd.arg(arg);
     }
-    repos_env(&mut cmd, client, true);
-    cmd.stdin(Stdio::null())
+    repos_env(&mut cmd, client);
+    cmd.current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd.output().expect("run dot binary")
-}
-
-/// One wired-arm row: the Rust binary and the production shell agree
-/// on exit code and both streams byte for byte.
-fn check_repos(client: &ReposClient, argv: &[&str]) {
-    let shell = repos_shell(client, argv);
-    let rust = repos_rust(client, argv);
-    assert_eq!(
-        rust.status.code(),
-        shell.status.code(),
-        "argv: {argv:?}\n shell stdout: {}\n shell stderr: {}",
-        String::from_utf8_lossy(&shell.stdout),
-        String::from_utf8_lossy(&shell.stderr),
-    );
-    assert_eq!(rust.stdout, shell.stdout, "argv: {argv:?} stdout");
-    assert_eq!(rust.stderr, shell.stderr, "argv: {argv:?} stderr");
+    cmd.output().expect("run repository command")
 }
 
 #[test]
-fn repos_status_clean_matches_shell() {
+fn repos_status_clean_reports_both_repositories() {
     let client = stage_repos_client();
-    let shell = repos_shell(&client, &["status"]);
-    assert_eq!(shell.status.code(), Some(0), "oracle status code");
-    assert!(
-        String::from_utf8_lossy(&shell.stdout).contains("==> dotfiles"),
-        "oracle sees the base: {}",
-        String::from_utf8_lossy(&shell.stdout),
+    let output = repos_run(&client, &["status"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&shell.stdout).contains("==> alpha dotfiles"),
-        "oracle sees the overlay: {}",
-        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&output.stdout).contains("==> dotfiles"),
+        "status sees the base: {}",
+        String::from_utf8_lossy(&output.stdout),
     );
-    check_repos(&client, &["status"]);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("==> alpha dotfiles"),
+        "status sees the overlay: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
-fn repos_status_dirty_matches_shell() {
+fn repos_status_uses_default_profile_from_loaded_config() {
+    let client = stage_repos_client();
+    let dot = client.xdg.join("dot");
+    let profiles = dot.join("profiles.d");
+    std::fs::create_dir_all(&profiles).expect("profile directory");
+    std::fs::write(dot.join("config"), b"version=1\ndefault_profile=dev\n").expect("dot config");
+    std::fs::write(profiles.join("base.conf"), b"version=1\noverlays=beta\n")
+        .expect("base profile");
+    std::fs::write(profiles.join("dev.conf"), b"version=1\noverlays=alpha\n").expect("dev profile");
+    std::fs::write(
+        dot.join("overlays.d/20-beta.conf"),
+        format!("url=file://{}\n", client.overlay_origin.display()),
+    )
+    .expect("beta descriptor");
+
+    let output = repos_run(&client, &["status"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("==> alpha dotfiles"),
+        "configured dev profile must select alpha: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn repos_status_dirty_reports_base_and_overlay_changes() {
     let client = stage_repos_client();
     // Base: modified tracked file plus one untracked file.
     std::fs::write(client.home.join("tracked.txt"), b"v1-dirty\n").expect("dirty base");
     std::fs::write(client.home.join("new.txt"), b"untracked\n").expect("untracked base");
     // Overlay: modified tracked file.
     std::fs::write(client.overlay.join("tracked.txt"), b"v1-dirty\n").expect("dirty overlay");
-    let shell = repos_shell(&client, &["status"]);
-    assert_eq!(shell.status.code(), Some(0), "oracle status code");
-    check_repos(&client, &["status"]);
+    let output = repos_run(&client, &["status", "--short"]);
+    assert_eq!(output.status.code(), Some(0), "status code");
+    assert_eq!(
+        output.stdout,
+        b"==> dotfiles\n M tracked.txt\n?? .dotfiles-alpha/\n?? .dotfiles/\n?? new.txt\n\n==> alpha dotfiles\n M tracked.txt\n"
+    );
+    assert_eq!(
+        output
+            .stdout
+            .windows(b" M tracked.txt\n".len())
+            .filter(|row| *row == b" M tracked.txt\n")
+            .count(),
+        2
+    );
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
-fn repos_status_ahead_behind_matches_shell() {
+fn repos_status_reports_ahead_and_behind_branches() {
     let client = stage_repos_client();
     // Base moves ahead of its origin.
     std::fs::write(client.home.join("tracked.txt"), b"v1-ahead\n").expect("ahead file");
@@ -2498,56 +2115,69 @@ fn repos_status_ahead_behind_matches_shell() {
     // remote-tracking ref so plain `status` reports behind).
     seed_advance(&client.overlay_seed, "tracked.txt", b"v1-origin\n");
     repos_git(&client.overlay, &["fetch", "-q", "origin"]);
-    let shell = repos_shell(&client, &["status"]);
-    assert_eq!(shell.status.code(), Some(0), "oracle status code");
-    let text = String::from_utf8_lossy(&shell.stdout).into_owned();
-    assert!(text.contains("ahead"), "oracle reports ahead: {text}");
-    assert!(text.contains("behind"), "oracle reports behind: {text}");
+    let output = repos_run(&client, &["status"]);
+    assert_eq!(output.status.code(), Some(0), "status code");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(text.contains("ahead"), "reports ahead: {text}");
+    assert!(text.contains("behind"), "reports behind: {text}");
     assert!(
         !text.contains(".dotfiles/index"),
         "fixture must not track its own Git metadata: {text}",
     );
-    check_repos(&client, &["status"]);
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
-fn repos_status_extra_args_forwarded_like_shell() {
+fn repos_status_forwards_extra_arguments() {
     let client = stage_repos_client();
     std::fs::write(client.home.join("tracked.txt"), b"v1-dirty\n").expect("dirty base");
-    check_repos(&client, &["status", "--short", "--branch"]);
+    let output = repos_run(&client, &["status", "--short", "--branch"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(has_bytes(&output.stdout, b"## "));
+    assert!(has_bytes(&output.stdout, b" M tracked.txt\n"));
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
-fn repos_diff_dirty_matches_shell() {
+fn repos_diff_dirty_reports_base_and_overlay_hunks() {
     let client = stage_repos_client();
     // Base dirty (shows a hunks), overlay clean (header only).
     std::fs::write(client.home.join("tracked.txt"), b"v1\nv2\n").expect("dirty base");
-    let shell = repos_shell(&client, &["diff"]);
-    assert_eq!(shell.status.code(), Some(0), "oracle diff code");
-    assert!(
-        String::from_utf8_lossy(&shell.stdout).contains("==> dotfiles"),
-        "oracle sees the base",
-    );
-    check_repos(&client, &["diff"]);
-    // Both dirty: the overlay section carries its own hunk.
     std::fs::write(client.overlay.join("tracked.txt"), b"v1\nv2\n").expect("dirty overlay");
-    check_repos(&client, &["diff"]);
+    let output = repos_run(&client, &["diff"]);
+    assert_eq!(output.status.code(), Some(0), "diff code");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("==> dotfiles"),
+        "diff sees the base",
+    );
+    assert!(has_bytes(&output.stdout, b"==> alpha dotfiles\n"));
+    assert_eq!(
+        output
+            .stdout
+            .windows(b"+v2\n".len())
+            .filter(|row| *row == b"+v2\n")
+            .count(),
+        2
+    );
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
-fn repos_diff_clean_matches_shell() {
+fn repos_diff_clean_prints_headers_without_hunks() {
     let client = stage_repos_client();
-    let shell = repos_shell(&client, &["diff"]);
-    assert_eq!(shell.status.code(), Some(0), "oracle diff code");
+    let output = repos_run(&client, &["diff"]);
+    assert_eq!(output.status.code(), Some(0), "diff code");
     // No hunks anywhere: headers only, no git output.
-    assert!(shell.stderr.is_empty(), "clean diff is silent on stderr");
-    check_repos(&client, &["diff"]);
+    assert_eq!(output.stdout, b"==> dotfiles\n\n==> alpha dotfiles\n");
+    assert!(output.stderr.is_empty(), "clean diff is silent on stderr");
 }
 
 /// Capture one separate-topology `git --git-dir/--work-tree` stdout
 /// line, trimmed.
 fn repos_prefix_line(git_dir: &Path, work: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    let output = command
         .arg(format!("--git-dir={}", git_dir.display()))
         .arg(format!("--work-tree={}", work.display()))
         .args(args)
@@ -2569,7 +2199,7 @@ fn repos_prefix_line(git_dir: &Path, work: &Path, args: &[&str]) -> String {
 }
 
 #[test]
-fn repos_fetch_matches_shell() {
+fn repos_fetch_updates_both_remote_tracking_refs() {
     let client = stage_repos_client();
     // Both origins advance while the client stays stale, so `fetch`
     // prints its update lines on both repos.
@@ -2590,39 +2220,42 @@ fn repos_fetch_matches_shell() {
             &format!("refs/remotes/origin/{}", client.overlay_branch),
         ],
     );
-    let shell = repos_shell(&client, &["fetch"]);
-    assert_eq!(shell.status.code(), Some(0), "oracle fetch code");
+    let output = repos_run(&client, &["fetch"]);
+    assert_eq!(output.status.code(), Some(0), "fetch code");
     assert!(
-        String::from_utf8_lossy(&shell.stderr).contains("From file://"),
-        "oracle fetch reports its remotes: {}",
-        String::from_utf8_lossy(&shell.stderr),
+        String::from_utf8_lossy(&output.stderr).contains("From file://"),
+        "fetch reports its remotes: {}",
+        String::from_utf8_lossy(&output.stderr),
     );
-    // Rewind the oracle's fetch so the Rust run sees the same update.
-    repos_git_prefix(
-        &client.base_git_dir,
-        &client.home,
-        &[
-            "update-ref",
-            &format!("refs/remotes/origin/{}", client.base_branch),
-            &base_before,
-        ],
+    assert_eq!(
+        output.stdout,
+        b"==> Fetching dotfiles...\n==> Fetching alpha dotfiles...\n"
     );
-    repos_git(
-        &client.overlay,
-        &[
-            "update-ref",
-            &format!("refs/remotes/origin/{}", client.overlay_branch),
-            &overlay_before,
-        ],
+    assert_ne!(
+        repos_prefix_line(
+            &client.base_git_dir,
+            &client.home,
+            &[
+                "rev-parse",
+                &format!("refs/remotes/origin/{}", client.base_branch)
+            ]
+        ),
+        base_before
     );
-    let rust = repos_rust(&client, &["fetch"]);
-    assert_eq!(rust.status.code(), shell.status.code(), "fetch code");
-    assert_eq!(rust.stdout, shell.stdout, "fetch stdout");
-    assert_eq!(rust.stderr, shell.stderr, "fetch stderr");
+    assert_ne!(
+        repos_git_line(
+            &client.overlay,
+            &[
+                "rev-parse",
+                &format!("refs/remotes/origin/{}", client.overlay_branch)
+            ]
+        ),
+        overlay_before
+    );
 }
 
 #[test]
-fn repos_push_matches_shell() {
+fn repos_push_updates_both_origins_and_tracking_refs() {
     let client = stage_repos_client();
     // Both repos move ahead of their origins.
     std::fs::write(client.home.join("tracked.txt"), b"v1-ahead\n").expect("ahead base");
@@ -2688,55 +2321,59 @@ fn repos_push_matches_shell() {
             &format!("refs/remotes/origin/{}", client.overlay_branch),
         ],
     );
-    let shell = repos_shell(&client, &["push"]);
-    assert_eq!(shell.status.code(), Some(0), "oracle push code");
+    let output = repos_run(&client, &["push"]);
+    assert_eq!(output.status.code(), Some(0), "push code");
     assert!(
-        String::from_utf8_lossy(&shell.stderr).contains("To file://"),
-        "oracle push reports its remotes: {}",
-        String::from_utf8_lossy(&shell.stderr),
+        String::from_utf8_lossy(&output.stderr).contains("To file://"),
+        "push reports its remotes: {}",
+        String::from_utf8_lossy(&output.stderr),
     );
-    // Rewind the oracle's push so the Rust run publishes the same update.
-    repos_git(
-        &client.base_origin,
-        &[
-            "update-ref",
-            &format!("refs/heads/{}", client.base_branch),
-            &base_origin_before,
-        ],
+    assert_eq!(
+        output.stdout,
+        b"==> Pushing dotfiles...\n==> Pushing alpha dotfiles...\n"
     );
-    repos_git_prefix(
-        &client.base_git_dir,
-        &client.home,
-        &[
-            "update-ref",
-            &format!("refs/remotes/origin/{}", client.base_branch),
-            &base_tracking_before,
-        ],
+    assert_ne!(
+        repos_git_line(
+            &client.base_origin,
+            &["rev-parse", &format!("refs/heads/{}", client.base_branch)]
+        ),
+        base_origin_before
     );
-    repos_git(
-        &client.overlay_origin,
-        &[
-            "update-ref",
-            &format!("refs/heads/{}", client.overlay_branch),
-            &overlay_origin_before,
-        ],
+    assert_ne!(
+        repos_prefix_line(
+            &client.base_git_dir,
+            &client.home,
+            &[
+                "rev-parse",
+                &format!("refs/remotes/origin/{}", client.base_branch)
+            ]
+        ),
+        base_tracking_before
     );
-    repos_git(
-        &client.overlay,
-        &[
-            "update-ref",
-            &format!("refs/remotes/origin/{}", client.overlay_branch),
-            &overlay_tracking_before,
-        ],
+    assert_ne!(
+        repos_git_line(
+            &client.overlay_origin,
+            &[
+                "rev-parse",
+                &format!("refs/heads/{}", client.overlay_branch)
+            ]
+        ),
+        overlay_origin_before
     );
-    let rust = repos_rust(&client, &["push"]);
-    assert_eq!(rust.status.code(), shell.status.code(), "push code");
-    assert_eq!(rust.stdout, shell.stdout, "push stdout");
-    assert_eq!(rust.stderr, shell.stderr, "push stderr");
+    assert_ne!(
+        repos_git_line(
+            &client.overlay,
+            &[
+                "rev-parse",
+                &format!("refs/remotes/origin/{}", client.overlay_branch)
+            ]
+        ),
+        overlay_tracking_before
+    );
 }
 
 #[test]
-fn repos_push_rejected_matches_shell() {
+fn repos_push_rejects_non_fast_forward_base() {
     let client = stage_repos_client();
     // Diverge the base: a local commit plus an origin advance the
     // client never fetches, so the base push is rejected. The
@@ -2763,66 +2400,61 @@ fn repos_push_rejected_matches_shell() {
         ],
     );
     seed_advance(&client.base_seed, "tracked.txt", b"v1-origin\n");
-    let shell = repos_shell(&client, &["push"]);
+    let output = repos_run(&client, &["push"]);
     assert_eq!(
-        shell.status.code(),
+        output.status.code(),
         Some(1),
-        "rejected base push exits 1 under errexit: {}",
-        String::from_utf8_lossy(&shell.stderr),
+        "rejected base push exits 1: {}",
+        String::from_utf8_lossy(&output.stderr),
     );
     assert!(
-        String::from_utf8_lossy(&shell.stderr).contains("rejected"),
-        "oracle reports the rejection: {}",
-        String::from_utf8_lossy(&shell.stderr),
+        String::from_utf8_lossy(&output.stderr).contains("rejected"),
+        "reports the rejection: {}",
+        String::from_utf8_lossy(&output.stderr),
     );
-    // Rejected pushes mutate nothing, so the oracle output compares directly.
-    let rust = repos_rust(&client, &["push"]);
-    assert_eq!(rust.status.code(), shell.status.code(), "push code");
-    assert_eq!(rust.stdout, shell.stdout, "push stdout");
-    assert_eq!(rust.stderr, shell.stderr, "push stderr");
+    assert_eq!(output.stdout, b"==> Pushing dotfiles...\n");
 }
 
 #[test]
-fn repos_resolve_failure_matches_shell() {
+fn repos_resolve_failure_reports_invalid_sync_value() {
     let client = stage_repos_client();
     // An invalid descriptor fails overlay resolution before any
-    // kernel runs: both sides exit 1 with the same diagnostics.
+    // repository command runs.
     std::fs::write(
         client.xdg.join("dot/overlays.d/90-bad.conf"),
         b"url=x\nsync=hg\n",
     )
     .expect("bad descriptor");
-    let shell = repos_shell(&client, &["status"]);
+    let output = repos_run(&client, &["status"]);
     assert_eq!(
-        shell.status.code(),
+        output.status.code(),
         Some(1),
-        "oracle resolve-failure code: {}",
-        String::from_utf8_lossy(&shell.stderr),
+        "resolve-failure code: {}",
+        String::from_utf8_lossy(&output.stderr),
     );
-    let rust = repos_rust(&client, &["status"]);
-    assert_eq!(rust.status.code(), shell.status.code(), "status code");
-    assert_eq!(rust.stdout, shell.stdout, "status stdout");
-    assert_eq!(rust.stderr, shell.stderr, "status stderr");
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        scrub_scope(&output.stderr, client.scope.path()),
+        b"  warning: invalid overlay descriptor @SCOPE@/xdg/dot/overlays.d/90-bad.conf: unknown sync value: hg\n"
+    );
 }
 
 #[test]
-fn repos_status_missing_topology_matches_shell() {
+fn repos_status_without_topology_is_silent() {
     // No base repo and no descriptors: resolution succeeds empty
-    // and every kernel no-ops, so both sides exit 0 silently. The
-    // Rust side exports no topology at all here, pinning the
-    // missing default end to end.
+    // and every repository operation no-ops. No topology is exported.
     let scope = TempDir::new("cli-repos-empty").expect("empty scope");
     let home = scope.path().join("home");
     let xdg = scope.path().join("xdg");
-    std::fs::create_dir_all(&home).expect("twin home");
+    std::fs::create_dir_all(&home).expect("fixture home");
     let repo = env!("CARGO_MANIFEST_DIR");
     let path = std::env::var_os("PATH").unwrap_or_default();
     let tmpdir = std::env::var_os("TMPDIR")
         .filter(|dir| !dir.is_empty())
         .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    let mut shell_cmd = Command::new(dot::test_support::bash());
-    shell_cmd.arg("bin/dot").arg("status");
-    shell_cmd
+    let mut command = bin();
+    command.arg("status");
+    command
         .env_clear()
         .env("LC_ALL", "C")
         .env("PATH", &path)
@@ -2835,36 +2467,28 @@ fn repos_status_missing_topology_matches_shell() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let shell = shell_cmd.output().expect("run bin/dot");
-    assert_eq!(shell.status.code(), Some(0), "oracle empty status code");
-    assert!(shell.stdout.is_empty(), "oracle empty status is silent");
-    let mut rust_cmd = bin();
-    rust_cmd.arg("status");
-    rust_cmd
-        .env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", &path)
-        .env("TMPDIR", &tmpdir)
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", &xdg)
-        .env("DOT_GIT_REAL", "1")
-        .env("DOT_SOURCE_ROOT", repo)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let rust = rust_cmd.output().expect("run dot binary");
-    assert_eq!(rust.status.code(), shell.status.code(), "status code");
-    assert_eq!(rust.stdout, shell.stdout, "status stdout");
-    assert_eq!(rust.stderr, shell.stderr, "status stderr");
+    isolate_git(&mut command);
+    let output = command.output().expect("run dot status");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(output.stderr, b"");
 }
 
 #[test]
-fn binary_init_fresh_failures_match_production() {
-    // Fresh-tail failures before convergence agree with `bin/dot`
-    // byte for byte: the missing-repository clone fails silently,
-    // and the unknown option keeps its errexit-shaped code.
-    check_init_twins(&["init", "--branch", "main", "file:///nonexistent-origin.git"]);
-    check_init_twins(&["init", "--bogus"]);
+fn binary_init_fresh_failures_do_not_publish_state() {
+    let home = TempDir::new("cli-init-failures").expect("test home");
+    let state = TempDir::new("cli-init-failures-state").expect("test state");
+    for argv in [
+        &["init", "--branch", "main", "file:///nonexistent-origin.git"][..],
+        &["init", "--bogus"][..],
+    ] {
+        let output = init_bin(&home, &state)
+            .args(argv)
+            .output()
+            .expect("init failure");
+        assert!(!output.status.success(), "argv: {argv:?}");
+        assert!(output.stdout.is_empty(), "argv: {argv:?}");
+    }
 }
 
 /// The Rust binary over the same fixture with the native update driver.
@@ -2873,42 +2497,36 @@ fn repos_rust_native(client: &ReposClient, argv: &[&str]) -> std::process::Outpu
     for arg in argv {
         cmd.arg(arg);
     }
-    repos_env(&mut cmd, client, true);
-    cmd.env(
-        "DOT_BASH",
-        client.scope.path().join("absent-old-update-engine"),
-    );
+    repos_env(&mut cmd, client);
+    cmd.env("DOT_BASH", client.scope.path().join("absent-fallback"));
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.output().expect("run dot binary")
 }
 
-/// A native-update client whose former shell engine is poisoned.
-///
-/// The sentinel is deliberately an executable rather than a missing command:
-/// a fallback then leaves an unambiguous byte in stderr instead of looking
-/// like an unrelated launcher failure. Native rows must never execute it.
+/// A native-update client with an executable sentinel for any unsupported
+/// fallback. Native scenarios must never execute it.
 struct NativeUpdateFixture {
     client: ReposClient,
-    shell_poison: PathBuf,
+    fallback_sentinel: PathBuf,
 }
 
 impl NativeUpdateFixture {
     fn stage() -> Self {
         let client = stage_repos_client();
-        let shell_poison = client.scope.path().join("old-update-engine");
+        let fallback_sentinel = client.scope.path().join("unexpected-fallback");
         let fixture = Self {
             client,
-            shell_poison,
+            fallback_sentinel,
         };
-        fixture.break_shell_engine();
+        fixture.reject_fallback();
         fixture
     }
 
     /// Install one trusted pre-sync entry point in the fixture's configured
-    /// extension root. The shell and native update lanes must relay the hook's
-    /// stdout and stderr to their respective update streams.
+    /// extension root. The native update must relay the hook's stdout and
+    /// stderr to its process streams.
     fn with_pre_sync(self, script: &[u8]) -> Self {
         let extensions = self.client.home.join("extensions");
         let hooks = extensions.join("pre-sync.d");
@@ -2972,19 +2590,26 @@ impl NativeUpdateFixture {
 
     /// Add the smallest profile-aware policy to the otherwise clean native
     /// repository fixture. The existing `alpha` descriptor stays selected in
-    /// phase one, so an old-engine failure identifies an accidental legacy
-    /// branch rather than a missing descriptor or repository error.
+    /// phase one, so the fallback sentinel distinguishes an unsupported branch
+    /// from a missing descriptor or repository error.
     fn with_base_profile(self) -> Self {
         let profiles = self.client.xdg.join("dot/profiles.d");
         std::fs::create_dir_all(&profiles).expect("profile directory");
         std::fs::write(profiles.join("base.conf"), b"version=1\noverlays=alpha\n")
             .expect("base profile");
+        std::fs::create_dir_all(self.client.overlay_seed.join("home/.config/profile"))
+            .expect("alpha profile tree");
+        seed_advance(
+            &self.client.overlay_seed,
+            "home/.config/profile/value",
+            b"alpha\n",
+        );
         self
     }
 
     /// Create two matching selectors that disagree after the base-only pass.
     /// The update must fail natively and preserve the existing generation;
-    /// reaching the poison instead would mean profiles still escaped to Bash.
+    /// reaching the sentinel instead would mean profiles escaped native execution.
     fn with_conflicting_profile_selectors(self) -> Self {
         let profiles = self.client.xdg.join("dot/profiles.d");
         let root = self.client.xdg.join("dot/profile-selectors.d");
@@ -3031,6 +2656,8 @@ impl NativeUpdateFixture {
         let extensions = self.client.home.join("extensions");
         std::fs::create_dir_all(&profiles).expect("profile directory");
         std::fs::create_dir_all(&extensions).expect("extensions directory");
+        let support = extensions.join("retirement-support");
+        std::fs::write(&support, b"support\n").expect("retirement support file");
         std::fs::write(profiles.join("base.conf"), b"version=1\noverlays=alpha\n")
             .expect("base profile");
         std::fs::write(profiles.join("dev.conf"), b"version=1\noverlays=beta\n")
@@ -3044,7 +2671,7 @@ impl NativeUpdateFixture {
         seed_advance(
             &self.client.overlay_seed,
             "dot/profile-deactivate",
-            b"deactivate() { printf retired >\"$HOME/alpha-retired\"; }\n",
+            b"deactivate() { dot_hook_file retirement-support || return; [[ -f $REPLY ]] || return; printf '%s|%s' \"$DOT_RETIRING_OVERLAY\" \"${#OVERLAYS[@]}\" >\"$HOME/alpha-retired\"; }\n",
         );
         let origins = self.client.scope.path().join("origins");
         let (beta_origin, _beta_seed, _branch) = seed_bare_origin(&origins, "beta");
@@ -3054,8 +2681,12 @@ impl NativeUpdateFixture {
         )
         .expect("beta descriptor");
         #[cfg(unix)]
-        std::fs::set_permissions(&extensions, std::fs::Permissions::from_mode(0o700))
-            .expect("private extension directory");
+        {
+            std::fs::set_permissions(&extensions, std::fs::Permissions::from_mode(0o700))
+                .expect("private extension directory");
+            std::fs::set_permissions(&support, std::fs::Permissions::from_mode(0o600))
+                .expect("private support file");
+        }
         self
     }
 
@@ -3186,15 +2817,18 @@ impl NativeUpdateFixture {
         self
     }
 
-    fn break_shell_engine(&self) {
+    fn reject_fallback(&self) {
         std::fs::write(
-            &self.shell_poison,
-            b"#!/bin/sh\nprintf 'OLD-UPDATE-ENGINE\n' >&2\nexit 97\n",
+            &self.fallback_sentinel,
+            b"#!/bin/sh\nprintf 'UNEXPECTED-FALLBACK\n' >&2\nexit 97\n",
         )
-        .expect("write shell poison");
+        .expect("write fallback sentinel");
         #[cfg(unix)]
-        std::fs::set_permissions(&self.shell_poison, std::fs::Permissions::from_mode(0o755))
-            .expect("mark shell poison executable");
+        std::fs::set_permissions(
+            &self.fallback_sentinel,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("mark fallback sentinel executable");
     }
 
     fn rust_dot(&self, argv: &[&str]) -> std::process::Output {
@@ -3210,36 +2844,15 @@ impl NativeUpdateFixture {
         for arg in argv {
             cmd.arg(arg);
         }
-        repos_env(&mut cmd, &self.client, true);
-        if self.shell_poison.exists() {
-            cmd.env("DOT_BASH", &self.shell_poison);
+        repos_env(&mut cmd, &self.client);
+        if self.fallback_sentinel.exists() {
+            cmd.env("DOT_BASH", &self.fallback_sentinel);
         }
         configure(&mut cmd);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd.output().expect("run native update")
-    }
-
-    fn shell_dot_with(
-        &self,
-        argv: &[&str],
-        configure: impl FnOnce(&mut Command),
-    ) -> std::process::Output {
-        let mut cmd = shell_oracle_command();
-        cmd.arg("bin/dot");
-        for arg in argv {
-            cmd.arg(arg);
-        }
-        repos_env(&mut cmd, &self.client, false);
-        #[cfg(target_os = "macos")]
-        inherit_supervised_group(&mut cmd);
-        configure(&mut cmd);
-        cmd.current_dir(env!("CARGO_MANIFEST_DIR"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        cmd.output().expect("run shell update")
     }
 }
 
@@ -3256,11 +2869,11 @@ fn assert_native_silent(output: &std::process::Output, label: &str) {
 }
 
 #[test]
-fn update_native_entry_edges_do_not_invoke_shell_engine() {
-    // Each row poisons only update's former shell engine. A passing assertion is
-    // therefore native evidence, not an accidentally-green shell oracle.
+fn update_native_entry_edges_reject_fallback() {
+    // Each row installs the unsupported-fallback sentinel, so success proves
+    // the native entry handled the edge.
     let clean = NativeUpdateFixture::stage();
-    clean.break_shell_engine();
+    clean.reject_fallback();
     assert_native_silent(&clean.rust_dot(&["update", "--cron"]), "clean cron");
 
     let mtime = NativeUpdateFixture::stage();
@@ -3275,13 +2888,13 @@ fn update_native_entry_edges_do_not_invoke_shell_engine() {
         .expect("open tracked file")
         .set_modified(modified + Duration::from_secs(2))
         .expect("bump tracked mtime");
-    mtime.break_shell_engine();
+    mtime.reject_fallback();
     assert_native_silent(&mtime.rust_dot(&["update", "--cron"]), "mtime cron");
 
     let unresolved = NativeUpdateFixture::stage();
     std::fs::write(unresolved.client.home.join("tracked.txt"), b"local edit\n")
         .expect("make unresolved edit");
-    unresolved.break_shell_engine();
+    unresolved.reject_fallback();
     assert_native_silent(
         &unresolved.rust_dot(&["update", "--cron"]),
         "unresolved cron",
@@ -3293,14 +2906,14 @@ fn update_native_entry_edges_do_not_invoke_shell_engine() {
     );
 
     let force = NativeUpdateFixture::stage();
-    force.break_shell_engine();
+    force.reject_fallback();
     assert_native_silent(
         &force.rust_dot(&["update", "--quiet", "--force"]),
         "force with provider none",
     );
 
     let frozen = NativeUpdateFixture::stage();
-    frozen.break_shell_engine();
+    frozen.reject_fallback();
     assert_native_silent(
         &frozen.rust_dot_with(&["update", "--quiet"], |cmd| {
             cmd.env("DOT_OVERLAY_LINKS_FROZEN", "1");
@@ -3310,7 +2923,7 @@ fn update_native_entry_edges_do_not_invoke_shell_engine() {
 }
 
 #[test]
-fn update_native_invalid_home_never_runs_shell_engine() {
+fn update_native_invalid_home_rejects_fallback() {
     for (label, home, state) in [
         ("missing absolute state", None, Some("state")),
         (
@@ -3323,7 +2936,7 @@ fn update_native_invalid_home_never_runs_shell_engine() {
     ] {
         let fixture = NativeUpdateFixture::stage();
         let state_path = fixture.client.scope.path().join("invalid-home-state");
-        fixture.break_shell_engine();
+        fixture.reject_fallback();
         let output = fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
             match home {
                 Some(home) => {
@@ -3354,8 +2967,8 @@ fn update_native_invalid_home_never_runs_shell_engine() {
 #[test]
 fn update_native_configured_pre_sync_hook_uses_the_hardened_worker() {
     // A configured hook must remain native and run only after the worker has
-    // validated its one-use context. Poisoning the old update engine makes a
-    // fallback unmistakable while the marker proves the hook actually ran.
+    // validated its one-use context. The sentinel makes a fallback
+    // unmistakable while the marker proves the hook actually ran.
     let fixture = NativeUpdateFixture::stage();
     let extensions = fixture.client.home.join("extensions/pre-sync.d");
     std::fs::create_dir_all(&extensions).expect("pre-sync directory");
@@ -3383,7 +2996,7 @@ fn update_native_configured_pre_sync_hook_uses_the_hardened_worker() {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700))
             .expect("executable pre-sync hook");
     }
-    fixture.break_shell_engine();
+    fixture.reject_fallback();
     let output = fixture.rust_dot(&["update", "--quiet"]);
     assert_native_silent(&output, "configured pre-sync hook");
     assert_eq!(
@@ -3393,81 +3006,75 @@ fn update_native_configured_pre_sync_hook_uses_the_hardened_worker() {
 }
 
 #[test]
-fn update_native_pre_sync_success_streams_match_shell() {
-    let shell = NativeUpdateFixture::stage().with_pre_sync(
-        b"prepare() { printf 'pre-sync stdout\\n'; printf 'pre-sync stderr\\n' >&2; }\n",
-    );
-    let native = NativeUpdateFixture::stage().with_pre_sync(
-        b"prepare() { printf 'pre-sync stdout\\n'; printf 'pre-sync stderr\\n' >&2; }\n",
-    );
+fn update_hook_runs_with_only_public_hook_assets() {
+    fn copy_tree(source: &Path, destination: &Path) {
+        std::fs::create_dir_all(destination).expect("copy destination");
+        for entry in std::fs::read_dir(source).expect("copy source") {
+            let entry = entry.expect("source entry");
+            let target = destination.join(entry.file_name());
+            if entry.file_type().expect("source type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copy public asset");
+            }
+        }
+    }
 
-    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
-    assert_eq!(shell_run.status.code(), Some(0), "shell pre-sync success");
-    assert!(has_bytes(&shell_run.stdout, b"pre-sync stdout\n"));
-    assert!(has_bytes(&shell_run.stderr, b"pre-sync stderr\n"));
-    let native_run = native.rust_dot(&["update", "--quiet"]);
+    let fixture = NativeUpdateFixture::stage().with_pre_sync(
+        b"prepare() { [[ $# -eq 0 ]] || return 91; if command -v ps >/dev/null; then command_line=$(ps -o command= -p $$) || return; [[ $command_line != *file://* ]] || return 92; fi; ! declare -F _ensure_repo_config >/dev/null || return 93; ! declare -F _overlay_record_link_target >/dev/null || return 94; printf prepared >\"$HOME/pre-sync-ran\"; }\n",
+    );
+    let release_root = fixture.client.home.join("native-release");
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("lib/dot/public"),
+        &release_root.join("lib/dot/public"),
+    );
+    std::fs::write(release_root.join(".dot-install.json"), b"{}\n").expect("release metadata");
 
-    assert_update_pair(
-        &shell_run,
-        &native_run,
-        &shell,
-        &native,
-        "successful pre-sync",
+    fixture.reject_fallback();
+    let output = fixture.rust_dot_with(&["update", "--quiet"], |command| {
+        command.env("DOT_SOURCE_ROOT", &release_root);
+    });
+    assert_native_silent(&output, "release-only pre-sync hook");
+    assert_eq!(
+        std::fs::read(fixture.client.home.join("pre-sync-ran")).expect("pre-sync marker"),
+        b"prepared"
     );
 }
 
 #[test]
-fn update_native_pre_sync_failure_streams_match_shell() {
-    let shell = NativeUpdateFixture::stage().with_pre_sync(
-        b"prepare() { printf 'pre-sync stdout\\n'; printf 'pre-sync stderr\\n' >&2; return 7; }\n",
+fn update_native_pre_sync_success_relays_both_streams() {
+    let fixture = NativeUpdateFixture::stage().with_pre_sync(
+        b"prepare() { printf 'pre-sync stdout\\n'; printf 'pre-sync stderr\\n' >&2; }\n",
     );
-    let native = NativeUpdateFixture::stage().with_pre_sync(
-        b"prepare() { printf 'pre-sync stdout\\n'; printf 'pre-sync stderr\\n' >&2; return 7; }\n",
-    );
-
-    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
-    assert_eq!(shell_run.status.code(), Some(1), "shell pre-sync failure");
-    assert!(has_bytes(&shell_run.stdout, b"pre-sync stdout\n"));
-    assert!(has_bytes(&shell_run.stderr, b"pre-sync stderr\n"));
-    let native_run = native.rust_dot(&["update", "--quiet"]);
-
-    assert_update_pair(&shell_run, &native_run, &shell, &native, "failed pre-sync");
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(has_bytes(&output.stdout, b"pre-sync stdout\n"));
+    assert!(has_bytes(&output.stderr, b"pre-sync stderr\n"));
 }
 
 #[test]
-fn update_native_merge_hook_matches_shell_without_the_legacy_adapter() {
-    // This catches reinstating a legacy merge-hook branch: the shell oracle must
-    // run one actual hook, while the native half has no usable old engine.
-    let shell = NativeUpdateFixture::stage()
-        .with_merge(b"merge() { printf merged >\"$HOME/merge-hook-ran\"; }\n");
-    let native = NativeUpdateFixture::stage()
-        .with_merge(b"merge() { printf merged >\"$HOME/merge-hook-ran\"; }\n");
+fn update_native_pre_sync_failure_relays_both_streams() {
+    let fixture = NativeUpdateFixture::stage().with_pre_sync(
+        b"prepare() { printf 'pre-sync stdout\\n'; printf 'pre-sync stderr\\n' >&2; return 7; }\n",
+    );
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(has_bytes(&output.stdout, b"pre-sync stdout\n"));
+    assert!(has_bytes(&output.stderr, b"pre-sync stderr\n"));
+}
 
-    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |cmd| {
+#[test]
+fn update_native_merge_hook_runs_with_a_large_job_limit() {
+    let fixture = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { printf merged >\"$HOME/merge-hook-ran\"; }\n");
+    let output = fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
         cmd.env("DOT_MERGE_JOBS", "1000000000");
     });
-    assert_eq!(shell_run.status.code(), Some(0), "shell merge-hook status");
+    assert_native_silent(&output, "merge-hook success");
     assert_eq!(
-        std::fs::read(shell.client.home.join("merge-hook-ran")).expect("shell merge marker"),
+        std::fs::read(fixture.client.home.join("merge-hook-ran")).expect("merge marker"),
         b"merged",
-        "shell merge hook ran"
-    );
-    native.break_shell_engine();
-    let native_run = native.rust_dot_with(&["update", "--quiet"], |cmd| {
-        cmd.env("DOT_MERGE_JOBS", "1000000000");
-    });
-
-    assert_update_pair(
-        &shell_run,
-        &native_run,
-        &shell,
-        &native,
-        "merge-hook success",
-    );
-    assert_eq!(
-        std::fs::read(native.client.home.join("merge-hook-ran")).expect("native merge marker"),
-        b"merged",
-        "native merge hook ran"
+        "merge hook ran"
     );
 }
 
@@ -3497,70 +3104,52 @@ fn update_native_verbose_merge_replays_hook_output_in_declaration_order() {
             b"merge() { [[ $(<\"$HOME/barrier-done\") == barrier ]] || return 9; printf 'Delta result\\n'; printf delta >\"$HOME/delta-done\"; }\n",
         ),
     ];
-    let shell = NativeUpdateFixture::stage().with_merge_files(hooks);
-    let native = NativeUpdateFixture::stage().with_merge_files(hooks);
-
-    let shell_run = shell.shell_dot_with(&["update", "--verbose"], |cmd| {
+    let fixture = NativeUpdateFixture::stage().with_merge_files(hooks);
+    let output = fixture.rust_dot_with(&["update", "--verbose"], |cmd| {
         // Force a two-worker batch even on a one-core runner. The serial hook
         // proves the whole batch joined before its barrier starts.
         cmd.env("DOT_UPDATE_JOBS", "1");
         cmd.env("DOT_MERGE_JOBS", "2");
     });
-    assert_eq!(
-        shell_run.status.code(),
-        Some(0),
-        "shell verbose merge status"
-    );
-    assert!(has_bytes(&shell_run.stdout, b"Alpha result"));
-    assert!(has_bytes(&shell_run.stdout, b"Beta result"));
-    assert!(has_bytes(&shell_run.stdout, b"Gamma result"));
-    assert!(has_bytes(&shell_run.stdout, b"Barrier result"));
-    assert!(has_bytes(&shell_run.stdout, b"Delta result"));
-    native.break_shell_engine();
-    let native_run = native.rust_dot_with(&["update", "--verbose"], |cmd| {
-        cmd.env("DOT_UPDATE_JOBS", "1");
-        cmd.env("DOT_MERGE_JOBS", "2");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stderr, b"");
+    let positions = [
+        b"Alpha result".as_slice(),
+        b"Beta result".as_slice(),
+        b"Gamma result".as_slice(),
+        b"Barrier result".as_slice(),
+        b"Delta result".as_slice(),
+    ]
+    .map(|expected| {
+        output
+            .stdout
+            .windows(expected.len())
+            .position(|window| window == expected)
+            .expect("literal merge output")
     });
-
-    assert_eq!(native_run.status.code(), shell_run.status.code());
-    let shell_stdout = scrub_twin(
-        &scrub_merge_durations(&shell_run.stdout),
-        shell.client.scope.path(),
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "parallel captures replay in declaration order before and after the serial barrier: {:?}",
+        output.stdout
     );
-    let native_stdout = scrub_twin(
-        &scrub_merge_durations(&native_run.stdout),
-        native.client.scope.path(),
-    );
-    assert_eq!(native_stdout, shell_stdout, "verbose ordered merge stdout");
-    for output in [&shell_stdout, &native_stdout] {
-        let positions = [
-            "Alpha result",
-            "Beta result",
-            "Gamma result",
-            "Barrier result",
-            "Delta result",
-        ]
-        .map(|label| {
-            output
-                .windows(label.len())
-                .position(|window| window == label.as_bytes())
-                .expect("merge result label")
-        });
-        assert!(
-            positions.windows(2).all(|pair| pair[0] < pair[1]),
-            "parallel captures replay in declaration order before and after the serial barrier: {output:?}"
-        );
+    for detail in [
+        b"\n    alpha detail\n".as_slice(),
+        b"\n    beta detail\n".as_slice(),
+        b"\n    gamma detail\n".as_slice(),
+    ] {
+        assert!(has_bytes(&output.stdout, detail));
     }
-    assert_eq!(
-        scrub_twin(&native_run.stderr, native.client.scope.path()),
-        scrub_twin(&shell_run.stderr, shell.client.scope.path()),
-        "verbose ordered merge stderr",
-    );
-    for fixture in [&shell, &native] {
+    for (name, expected) in [
+        ("alpha-done", b"alpha".as_slice()),
+        ("beta-done", b"beta".as_slice()),
+        ("gamma-done", b"gamma".as_slice()),
+        ("barrier-done", b"barrier".as_slice()),
+        ("delta-done", b"delta".as_slice()),
+    ] {
         assert_eq!(
-            std::fs::read(fixture.client.home.join("delta-done")).expect("post-barrier marker"),
-            b"delta",
-            "post-barrier hook ran after the serial hook"
+            std::fs::read(fixture.client.home.join(name)).expect("merge marker"),
+            expected,
+            "{name}"
         );
     }
 }
@@ -3568,174 +3157,132 @@ fn update_native_verbose_merge_replays_hook_output_in_declaration_order() {
 #[test]
 fn update_native_verbose_merge_preserves_non_utf8_output() {
     let script = b"merge() { printf 'Binary '; printf '\\377'; printf 'A\\0B\\n'; }\n";
-    let shell = NativeUpdateFixture::stage().with_merge(script);
-    let native = NativeUpdateFixture::stage().with_merge(script);
-
-    let shell_run = shell.shell_dot_with(&["update", "--verbose"], |_| {});
-    assert_eq!(
-        shell_run.status.code(),
-        Some(0),
-        "shell binary-output status"
-    );
+    let fixture = NativeUpdateFixture::stage().with_merge(script);
+    let output = fixture.rust_dot(&["update", "--verbose"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stderr, b"");
     assert!(
-        shell_run.stdout.contains(&0xff),
-        "shell oracle preserves the non-UTF-8 byte"
-    );
-    assert!(
-        !shell_run.stdout.contains(&0),
-        "shell variables discard NUL bytes while parsing hook output"
-    );
-    assert!(has_bytes(&shell_run.stdout, b"AB"));
-    native.break_shell_engine();
-    let native_run = native.rust_dot(&["update", "--verbose"]);
-
-    assert_eq!(native_run.status.code(), shell_run.status.code());
-    assert_eq!(
-        scrub_twin(
-            &scrub_merge_durations(&native_run.stdout),
-            native.client.scope.path(),
-        ),
-        scrub_twin(
-            &scrub_merge_durations(&shell_run.stdout),
-            shell.client.scope.path(),
-        ),
-        "verbose binary merge stdout",
-    );
-    assert_eq!(
-        scrub_twin(&native_run.stderr, native.client.scope.path()),
-        scrub_twin(&shell_run.stderr, shell.client.scope.path()),
-        "verbose binary merge stderr",
-    );
-    assert!(
-        native_run.stdout.contains(&0xff),
+        output.stdout.contains(&0xff),
         "native replay preserves the non-UTF-8 byte"
     );
     assert!(
-        !native_run.stdout.contains(&0),
-        "native replay matches Bash variable NUL handling"
+        !output.stdout.contains(&0),
+        "the public hook boundary discards NUL bytes while parsing output"
     );
+    assert!(has_bytes(&output.stdout, b"Binary \xffAB"));
 }
 
 #[test]
-fn update_native_merge_without_an_entry_point_matches_shell_failure() {
+fn update_native_merge_without_an_entry_point_fails() {
     // A helper-looking `*.sh` is discovered, but the worker writes a zero
     // merge record and exits nonzero. It must still fail the aggregate stage.
-    let shell = NativeUpdateFixture::stage().with_merge(b"helper() { :; }\n");
-    let native = NativeUpdateFixture::stage().with_merge(b"helper() { :; }\n");
-
-    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
-    assert_eq!(
-        shell_run.status.code(),
-        Some(1),
-        "shell missing-entry status"
-    );
-    native.break_shell_engine();
-    let native_run = native.rust_dot(&["update", "--quiet"]);
-
-    assert_update_pair(
-        &shell_run,
-        &native_run,
-        &shell,
-        &native,
-        "missing merge entry point",
-    );
+    let fixture = NativeUpdateFixture::stage().with_merge(b"helper() { :; }\n");
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(output.stderr, b"");
 }
 
 #[test]
-fn update_native_unsafe_merge_hook_refusal_matches_shell() {
-    // Discovery must reject an unsafe entry point before either engine runs it;
-    // poisoning the old engine still proves native handling of that refusal.
-    let shell = NativeUpdateFixture::stage().with_merge(b"merge() { :; }\n");
-    let native = NativeUpdateFixture::stage().with_merge(b"merge() { :; }\n");
-    for fixture in [&shell, &native] {
-        std::fs::set_permissions(
-            fixture
-                .client
-                .home
-                .join("extensions/merge-hooks.d/10-config.sh"),
-            std::fs::Permissions::from_mode(0o666),
-        )
-        .expect("make merge hook unsafe");
-    }
-
-    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
-    assert_eq!(shell_run.status.code(), Some(1), "shell unsafe-hook status");
-    assert!(has_bytes(&shell_run.stderr, b"unsafe merge hook"));
-    native.break_shell_engine();
-    let native_run = native.rust_dot(&["update", "--quiet"]);
-
-    assert_update_pair(
-        &shell_run,
-        &native_run,
-        &shell,
-        &native,
-        "unsafe merge hook",
-    );
+fn update_native_unsafe_merge_hook_is_rejected() {
+    // Discovery rejects an unsafe entry point before invoking it.
+    let fixture = NativeUpdateFixture::stage().with_merge(b"merge() { :; }\n");
+    std::fs::set_permissions(
+        fixture
+            .client
+            .home
+            .join("extensions/merge-hooks.d/10-config.sh"),
+        std::fs::Permissions::from_mode(0o666),
+    )
+    .unwrap();
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert!(has_bytes(&output.stderr, b"unsafe merge hook"));
 }
 
 #[test]
-fn update_native_failed_merge_hook_matches_shell() {
+fn update_native_failed_merge_hook_reports_its_capture() {
     // Failed hooks retain their ordered capture for a non-verbose update and
     // still make the aggregate Configs stage fail.
     let script = b"merge() { printf 'merge stdout\\n'; printf 'merge stderr\\n' >&2; return 7; }\n";
-    let shell = NativeUpdateFixture::stage().with_merge(script);
-    let native = NativeUpdateFixture::stage().with_merge(script);
-
-    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
-    assert_eq!(
-        shell_run.status.code(),
-        Some(1),
-        "shell merge failure status"
-    );
-    assert!(has_bytes(&shell_run.stderr, b"10-config output:"));
-    assert!(has_bytes(&shell_run.stderr, b"merge stdout\n"));
-    assert!(has_bytes(&shell_run.stderr, b"merge stderr\n"));
-    native.break_shell_engine();
-    let native_run = native.rust_dot(&["update", "--quiet"]);
-
-    assert_update_pair(
-        &shell_run,
-        &native_run,
-        &shell,
-        &native,
-        "failed merge hook",
-    );
+    let fixture = NativeUpdateFixture::stage().with_merge(script);
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert!(has_bytes(&output.stderr, b"10-config output:"));
+    assert!(has_bytes(&output.stderr, b"merge stdout\n"));
+    assert!(has_bytes(&output.stderr, b"merge stderr\n"));
 }
 
 #[test]
-fn update_native_merge_context_matches_shell() {
-    // Merge hooks receive the one-use active-overlay context used by Bash;
-    // this oracle observes the values from inside the actual worker.
+fn update_native_merge_hook_receives_active_overlay_context() {
+    // The hook observes the one-use active-overlay context inside the public
+    // worker boundary.
     let script = b"merge() {\n  [[ $REPLY_SET_KIND == active && $REPLY_STAGE == none && ${#OVERLAYS[@]} -eq 1 && ${OVERLAYS[0]} == alpha\\|* ]] || return 8\n  printf '%s:%s:%s' \"$REPLY_SET_KIND\" \"$REPLY_STAGE\" \"${OVERLAYS[0]%%|*}\" >\"$HOME/merge-context\"\n}\n";
-    let shell = NativeUpdateFixture::stage().with_merge(script);
-    let native = NativeUpdateFixture::stage().with_merge(script);
-
-    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
+    let fixture = NativeUpdateFixture::stage().with_merge(script);
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_native_silent(&output, "merge context");
     assert_eq!(
-        shell_run.status.code(),
-        Some(0),
-        "shell merge context status"
-    );
-    assert_eq!(
-        std::fs::read(shell.client.home.join("merge-context")).expect("shell merge context"),
-        b"active:none:alpha"
-    );
-    native.break_shell_engine();
-    let native_run = native.rust_dot(&["update", "--quiet"]);
-
-    assert_update_pair(&shell_run, &native_run, &shell, &native, "merge context");
-    assert_eq!(
-        std::fs::read(native.client.home.join("merge-context")).expect("native merge context"),
+        std::fs::read(fixture.client.home.join("merge-context")).expect("merge context"),
         b"active:none:alpha"
     );
 }
 
 #[test]
-fn update_native_profile_base_selection_does_not_invoke_shell_engine() {
-    // A native profile run must complete with the former shell engine
-    // impossible to invoke; the poison makes any regression unmistakable.
+fn update_native_merge_hook_receives_overlay_manifest() {
+    let script = b"merge() { [[ -n ${DOT_OVERLAY_MANIFEST:-} ]] || return 8; printf '%s' \"$DOT_OVERLAY_MANIFEST\" >\"$HOME/merge-manifest\"; }\n";
+    let fixture = NativeUpdateFixture::stage().with_merge(script);
+    let manifest = fixture.client.home.join("selected-overlay-links");
+    let output = fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
+        cmd.env("DOT_OVERLAY_MANIFEST", &manifest);
+    });
+    assert_native_silent(&output, "merge manifest");
+    assert_eq!(
+        std::fs::read_to_string(fixture.client.home.join("merge-manifest")).unwrap(),
+        manifest.to_string_lossy()
+    );
+}
+
+#[test]
+fn update_native_merge_hook_logging_defaults_to_not_quiet() {
+    let fixture = NativeUpdateFixture::stage().with_merge(
+        b"merge() { [[ ${DOT_VERBOSE:-} == 1 && ${SHDEPS_LOG_LEVEL:-} == 2 ]] || return 8; _log hook-log; }\n",
+    );
+    let output = fixture.rust_dot(&["update", "--verbose"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(has_bytes(&output.stdout, b"hook-log"));
+    assert_eq!(output.stderr, b"");
+}
+
+#[test]
+fn update_native_merge_hook_receives_quiet_flag() {
+    let fixture = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { [[ ${DOT_QUIET:-} == 1 && ${SHDEPS_QUIET:-} == 1 ]]; }\n");
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_native_silent(&output, "merge quiet flag");
+}
+
+#[test]
+fn update_native_merge_hook_receives_force_flags() {
+    let fixture = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { [[ ${DOT_FORCE:-} == 1 && ${SHDEPS_FORCE:-} == 1 ]]; }\n");
+    let output = fixture.rust_dot(&["update", "--force", "--quiet"]);
+    assert_native_silent(&output, "merge force flags");
+}
+
+#[test]
+fn update_native_merge_hook_receives_update_lock_token() {
+    let fixture = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { [[ -n ${DOT_UPDATE_LOCK_TOKEN:-} ]]; }\n");
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_native_silent(&output, "merge update lock token");
+}
+
+#[test]
+fn update_native_profile_base_selection_rejects_fallback() {
     let fixture = NativeUpdateFixture::stage().with_base_profile();
-    fixture.break_shell_engine();
+    fixture.reject_fallback();
     assert_native_silent(
         &fixture.rust_dot(&["update", "--quiet"]),
         "profile base selection",
@@ -3745,7 +3292,7 @@ fn update_native_profile_base_selection_does_not_invoke_shell_engine() {
 #[test]
 fn update_native_profile_addition_discovered_after_base_pull_stays_native() {
     let fixture = NativeUpdateFixture::stage().with_base_discovered_profile_addition();
-    fixture.break_shell_engine();
+    fixture.reject_fallback();
     assert_native_silent(
         &fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
             cmd.env("XDG_CONFIG_HOME", fixture.client.home.join(".config"));
@@ -3778,12 +3325,12 @@ fn update_native_profile_addition_discovered_after_base_pull_stays_native() {
 }
 
 #[test]
-fn update_native_profile_selector_conflict_does_not_invoke_shell_engine() {
+fn update_native_profile_selector_conflict_rejects_fallback() {
     // This is the post-base selector phase: both selectors are valid and
     // trusted, but their different profiles must freeze the generation with a
-    // profile error rather than fall back to the legacy update engine.
+    // profile error rather than leave native execution.
     let fixture = NativeUpdateFixture::stage().with_conflicting_profile_selectors();
-    fixture.break_shell_engine();
+    fixture.reject_fallback();
     let output = fixture.rust_dot(&["update", "--quiet"]);
     assert_eq!(output.status.code(), Some(1), "selector conflict status");
     assert!(
@@ -3796,19 +3343,23 @@ fn update_native_profile_selector_conflict_does_not_invoke_shell_engine() {
     assert!(
         !output
             .stderr
-            .windows(b"OLD-UPDATE-ENGINE".len())
-            .any(|window| { window == b"OLD-UPDATE-ENGINE" })
+            .windows(b"UNEXPECTED-FALLBACK".len())
+            .any(|window| window == b"UNEXPECTED-FALLBACK")
     );
 }
 
 #[test]
-fn update_native_profile_downgrade_retires_lifecycle_state_without_shell_engine() {
+fn update_native_profile_downgrade_retires_lifecycle_state() {
     // First establish alpha's lifecycle authority. Then switch the persisted
     // default profile to beta: the native two-phase driver must link beta,
     // execute alpha's trusted deactivation hook, and commit the emptied ledger.
     let fixture = NativeUpdateFixture::stage().with_profile_retirement();
-    fixture.break_shell_engine();
+    fixture.reject_fallback();
     assert_native_silent(&fixture.rust_dot(&["update", "--quiet"]), "profile setup");
+    assert!(
+        !fixture.client.home.join("alpha-retired").exists(),
+        "an eligible active overlay must not be deactivated during setup"
+    );
     let ledger = fixture
         .client
         .home
@@ -3818,9 +3369,22 @@ fn update_native_profile_downgrade_retires_lifecycle_state_without_shell_engine(
             .expect("setup ledger")
             .contains("alpha|")
     );
+    let refreshed_extensions = fixture.client.home.join("extensions-next");
+    std::fs::create_dir(&refreshed_extensions).expect("refreshed extensions directory");
+    std::fs::rename(
+        fixture.client.home.join("extensions/retirement-support"),
+        refreshed_extensions.join("retirement-support"),
+    )
+    .expect("move retirement support to refreshed root");
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &refreshed_extensions,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("private refreshed extensions directory");
     std::fs::write(
         fixture.client.xdg.join("dot/config"),
-        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions-next\ndefault_profile=dev\n",
     )
     .expect("switch profile");
 
@@ -3830,7 +3394,8 @@ fn update_native_profile_downgrade_retires_lifecycle_state_without_shell_engine(
     );
     assert_eq!(
         std::fs::read(fixture.client.home.join("alpha-retired")).expect("retirement marker"),
-        b"retired"
+        b"alpha|0",
+        "retirement publishes saved identity without active overlays"
     );
     assert!(
         !std::fs::read_to_string(&ledger)
@@ -3844,76 +3409,47 @@ fn update_native_profile_downgrade_retires_lifecycle_state_without_shell_engine(
 }
 
 #[test]
-fn update_native_profile_failed_retirement_matches_shell_twin() {
-    let shell = NativeUpdateFixture::stage().with_profile_retirement();
-    let native = NativeUpdateFixture::stage().with_profile_retirement();
-    // The twin stays an end-to-end oracle while making a native fallback
-    // unmistakable. The versioned lifecycle worker uses Runtime's absolute
-    // BASH, not a legacy update-engine selector.
-    native.break_shell_engine();
-    assert_profile_twin(&shell, &native, "failed retirement setup");
+fn update_native_profile_failed_retirement_preserves_lifecycle_authority() {
+    let fixture = NativeUpdateFixture::stage().with_profile_retirement();
+    assert_native_silent(&fixture.rust_dot(&["update", "--quiet"]), "profile setup");
+    seed_advance(
+        &fixture.client.overlay_seed,
+        "dot/profile-deactivate",
+        b"deactivate() { printf failed >&2; return 7; }\n",
+    );
+    std::fs::write(
+        fixture.client.xdg.join("dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
+    )
+    .expect("switch profile");
 
-    for fixture in [&shell, &native] {
-        seed_advance(
-            &fixture.client.overlay_seed,
-            "dot/profile-deactivate",
-            b"deactivate() { printf failed >&2; return 7; }\n",
-        );
-        std::fs::write(
-            fixture.client.xdg.join("dot/config"),
-            b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
-        )
-        .expect("switch profile");
-    }
-    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
-    assert_eq!(
-        shell_run.status.code(),
-        Some(1),
-        "shell failed-retirement status"
-    );
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert!(has_bytes(
+        &output.stderr,
+        b"profile deactivation failed: alpha"
+    ));
+    assert!(has_bytes(&output.stderr, b"failed"));
+    let ledger = fixture
+        .client
+        .home
+        .join(".local/state/dot/profile-overlay-lifecycle-v1");
     assert!(
-        String::from_utf8_lossy(&shell_run.stderr).contains("profile deactivation failed: alpha"),
-        "shell failed-retirement stderr: {}",
-        String::from_utf8_lossy(&shell_run.stderr)
+        std::fs::read_to_string(ledger)
+            .expect("retained ledger")
+            .contains("alpha|"),
+        "failed retirement keeps alpha in the lifecycle ledger"
     );
-    assert!(
-        shell.client.home.join(".dotfiles-beta/.git").is_dir(),
-        "shell finalization reaches the selected beta generation before retirement fails"
-    );
-    let native_run = native.rust_dot(&["update", "--quiet"]);
-
-    assert_profile_pair(
-        &shell_run,
-        &native_run,
-        &shell,
-        &native,
-        "failed retirement",
-    );
-    for fixture in [&shell, &native] {
-        let ledger = fixture
-            .client
-            .home
-            .join(".local/state/dot/profile-overlay-lifecycle-v1");
-        assert!(
-            std::fs::read_to_string(ledger)
-                .expect("retained ledger")
-                .contains("alpha|"),
-            "failed retirement keeps alpha in the lifecycle ledger"
-        );
-    }
-    assert_profile_tree_twin(
-        &shell,
-        &native,
-        ".config/profile",
-        &["alpha", "beta"],
-        "failed retirement",
-    );
+    assert_eq!(base_snapshot(&fixture.client), clean_checkout());
+    assert_clean_checkout(&fixture.client, "alpha");
+    assert_clean_checkout(&fixture.client, "beta");
 }
 
 #[test]
 fn update_native_profile_conflict_after_base_pull_restores_prior_generation() {
     let fixture = NativeUpdateFixture::stage().with_base_profile_rollback();
-    fixture.break_shell_engine();
+    fixture.reject_fallback();
     let run = || {
         fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
             cmd.env("XDG_CONFIG_HOME", fixture.client.home.join(".config"));
@@ -3956,9 +3492,9 @@ fn update_native_profile_conflict_after_base_pull_restores_prior_generation() {
     assert!(
         !output
             .stderr
-            .windows(b"OLD-UPDATE-ENGINE".len())
-            .any(|row| row == b"OLD-UPDATE-ENGINE"),
-        "profile conflict must not escape to the former shell engine"
+            .windows(b"UNEXPECTED-FALLBACK".len())
+            .any(|row| row == b"UNEXPECTED-FALLBACK"),
+        "profile conflict must not leave native execution"
     );
     assert!(target.is_symlink(), "rollback restores the managed link");
     assert_eq!(
@@ -3972,92 +3508,31 @@ fn update_native_profile_conflict_after_base_pull_restores_prior_generation() {
     );
 }
 
-/// Compare the process contract of independently staged shell and native
-/// updates. Scope-specific paths and elapsed stamps normalize only after each
-/// lane's exit status is established.
-fn assert_update_pair(
-    shell: &std::process::Output,
-    native: &std::process::Output,
-    shell_fixture: &NativeUpdateFixture,
-    native_fixture: &NativeUpdateFixture,
-    label: &str,
-) {
-    assert_eq!(
-        native.status.code(),
-        shell.status.code(),
-        "{label} status\nshell stdout: {}\nshell stderr: {}\nnative stdout: {}\nnative stderr: {}",
-        String::from_utf8_lossy(&shell.stdout),
-        String::from_utf8_lossy(&shell.stderr),
-        String::from_utf8_lossy(&native.stdout),
-        String::from_utf8_lossy(&native.stderr),
-    );
-    assert_eq!(
-        scrub_twin(&native.stdout, native_fixture.client.scope.path()),
-        scrub_twin(&shell.stdout, shell_fixture.client.scope.path()),
-        "{label} stdout",
-    );
-    assert_eq!(
-        scrub_twin(&native.stderr, native_fixture.client.scope.path()),
-        scrub_twin(&shell.stderr, shell_fixture.client.scope.path()),
-        "{label} stderr",
-    );
-}
-
-/// A profile update also owns mutable manifest and lifecycle records, so its
-/// oracle extends the process contract with those persisted generations.
-fn assert_profile_pair(
-    shell: &std::process::Output,
-    native: &std::process::Output,
-    shell_fixture: &NativeUpdateFixture,
-    native_fixture: &NativeUpdateFixture,
-    label: &str,
-) {
-    assert_update_pair(shell, native, shell_fixture, native_fixture, label);
-    for relative in [
-        ".local/state/dot/overlay-links",
-        ".local/state/dot/profile-overlay-lifecycle-v1",
-    ] {
-        let shell_path = shell_fixture.client.home.join(relative);
-        let native_path = native_fixture.client.home.join(relative);
-        assert_eq!(
-            native_path.exists(),
-            shell_path.exists(),
-            "{label} {relative} presence",
-        );
-        if shell_path.exists() {
-            assert_eq!(
-                scrub_scope(
-                    &std::fs::read(&native_path).expect("native state"),
-                    native_fixture.client.scope.path()
-                ),
-                scrub_scope(
-                    &std::fs::read(&shell_path).expect("shell state"),
-                    shell_fixture.client.scope.path()
-                ),
-                "{label} {relative}",
-            );
-        }
-    }
-}
-
-fn assert_profile_twin(
-    shell_fixture: &NativeUpdateFixture,
-    native_fixture: &NativeUpdateFixture,
-    label: &str,
-) {
-    let shell = repos_shell(&shell_fixture.client, &["update", "--quiet"]);
-    let native = native_fixture.rust_dot(&["update", "--quiet"]);
-    assert_profile_pair(&shell, &native, shell_fixture, native_fixture, label);
-}
-
 #[derive(Debug, PartialEq, Eq)]
 struct CheckoutSnapshot {
     head_at_upstream: bool,
     porcelain: Vec<u8>,
 }
 
+fn clean_checkout() -> CheckoutSnapshot {
+    CheckoutSnapshot {
+        head_at_upstream: true,
+        porcelain: Vec::new(),
+    }
+}
+
+fn assert_clean_checkout(client: &ReposClient, name: &str) {
+    assert_eq!(
+        checkout_snapshot(&profile_checkout(client, name)),
+        Some(clean_checkout()),
+        "{name} checkout"
+    );
+}
+
 fn git_base_output(client: &ReposClient, args: &[&str]) -> Vec<u8> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    let output = command
         .arg(format!("--git-dir={}", client.base_git_dir.display()))
         .arg(format!("--work-tree={}", client.home.display()))
         .args(args)
@@ -4075,7 +3550,9 @@ fn git_base_output(client: &ReposClient, args: &[&str]) -> Vec<u8> {
 }
 
 fn git_checkout_output(checkout: &Path, args: &[&str]) -> Vec<u8> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    isolate_git(&mut command);
+    let output = command
         .arg("-C")
         .arg(checkout)
         .args(args)
@@ -4094,9 +3571,7 @@ fn git_checkout_output(checkout: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn base_snapshot(client: &ReposClient) -> CheckoutSnapshot {
-    // The separate bare Git directory, checkouts, and shell-only runtime
-    // stamps all live under this synthetic worktree. Compare tracked changes
-    // only: that is the Git state profile convergence owns.
+    // Compare tracked changes only: that is the Git state profile convergence owns.
     let head = git_base_output(client, &["rev-parse", "HEAD"]);
     let upstream = git_base_output(client, &["rev-parse", "@{upstream}"]);
     CheckoutSnapshot {
@@ -4173,197 +3648,172 @@ fn normalized_managed_tree(root: &Path, scope: &Path) -> Vec<(String, bool, Vec<
         .collect()
 }
 
-fn assert_profile_tree_twin(
-    shell_fixture: &NativeUpdateFixture,
-    native_fixture: &NativeUpdateFixture,
-    relative: &str,
-    checkouts: &[&str],
-    label: &str,
-) {
-    let shell = shell_fixture.client.home.join(relative);
-    let native = native_fixture.client.home.join(relative);
+#[test]
+fn update_native_profile_selection_publishes_the_base_generation() {
+    let fixture = NativeUpdateFixture::stage().with_base_profile();
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_native_silent(&output, "base profile selection");
+    assert_eq!(base_snapshot(&fixture.client), clean_checkout());
+    assert_clean_checkout(&fixture.client, "alpha");
     assert_eq!(
-        normalized_managed_tree(&native, native_fixture.client.scope.path()),
-        normalized_managed_tree(&shell, shell_fixture.client.scope.path()),
-        "{label} managed tree"
+        checkout_snapshot(&profile_checkout(&fixture.client, "beta")),
+        None
     );
     assert_eq!(
-        base_snapshot(&native_fixture.client),
-        base_snapshot(&shell_fixture.client),
-        "{label} base checkout"
+        normalized_managed_tree(
+            &fixture.client.home.join(".config/profile"),
+            fixture.client.scope.path(),
+        ),
+        vec![(
+            "value".to_string(),
+            true,
+            b"../../.dotfiles-alpha/home/.config/profile/value".to_vec(),
+        )]
     );
-    for name in checkouts {
-        assert_eq!(
-            checkout_snapshot(&profile_checkout(&native_fixture.client, name)),
-            checkout_snapshot(&profile_checkout(&shell_fixture.client, name)),
-            "{label} {name} checkout"
-        );
-    }
-}
-
-#[test]
-fn update_native_profile_selection_matches_shell_twin() {
-    // This is deliberately not an old-engine poison test: each implementation
-    // gets an independently staged client, then we compare process behavior
-    // and the profile generation it published.
-    let shell = NativeUpdateFixture::stage().with_base_profile();
-    let native = NativeUpdateFixture::stage().with_base_profile();
-
-    assert_profile_twin(&shell, &native, "base profile selection");
-    assert_profile_tree_twin(
-        &shell,
-        &native,
-        ".config/profile",
-        &["alpha"],
-        "base profile selection",
+    assert_eq!(
+        std::fs::read(fixture.client.home.join(".config/profile/value")).unwrap(),
+        b"alpha\n"
+    );
+    let manifest =
+        std::fs::read_to_string(fixture.client.home.join(".local/state/dot/overlay-links"))
+            .expect("overlay manifest");
+    assert!(manifest.contains("alpha"));
+    assert!(
+        !fixture
+            .client
+            .home
+            .join(".local/state/dot/profile-overlay-lifecycle-v1")
+            .exists()
     );
 }
 
 #[test]
-fn update_native_profile_selector_conflict_matches_shell_twin() {
-    // An equally-specific conflict is a semantic profile error.  The native
-    // lane must preserve the shell's failure code and diagnostic rather than
-    // merely reporting any native failure.
-    let shell = NativeUpdateFixture::stage().with_conflicting_profile_selectors();
-    let native = NativeUpdateFixture::stage().with_conflicting_profile_selectors();
-
-    assert_profile_twin(&shell, &native, "selector conflict");
-    assert_profile_tree_twin(
-        &shell,
-        &native,
-        ".config/profile",
-        &["alpha"],
-        "selector conflict",
+fn update_native_profile_selector_conflict_preserves_unpublished_state() {
+    let fixture = NativeUpdateFixture::stage().with_conflicting_profile_selectors();
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert!(
+        output
+            .stderr
+            .starts_with(b"dot: profile: equally specific selectors choose base and dev")
+    );
+    assert_eq!(base_snapshot(&fixture.client), clean_checkout());
+    assert_clean_checkout(&fixture.client, "alpha");
+    assert!(
+        !fixture
+            .client
+            .home
+            .join(".local/state/dot/overlay-links")
+            .exists()
     );
 }
 
 #[test]
-fn update_native_profile_descriptor_refresh_matches_shell_twin() {
+fn update_native_profile_descriptor_refresh_selects_the_new_overlay() {
     // The base refresh changes alpha's descriptor before it selects beta.  A
-    // full-record difference must not make alpha an additions-only pull; the
-    // shell and native outputs plus generated state remain the oracle.
-    let shell = NativeUpdateFixture::stage().with_base_discovered_profile_addition();
-    let native = NativeUpdateFixture::stage().with_base_discovered_profile_addition();
-    let shell_run = shell.shell_dot_with(&["update"], |cmd| {
-        cmd.env("XDG_CONFIG_HOME", shell.client.home.join(".config"));
+    // full-record difference must not make alpha an additions-only pull.
+    let fixture = NativeUpdateFixture::stage().with_base_discovered_profile_addition();
+    let output = fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
+        cmd.env("XDG_CONFIG_HOME", fixture.client.home.join(".config"));
     });
-    let native_run = native.rust_dot_with(&["update"], |cmd| {
-        cmd.env("XDG_CONFIG_HOME", native.client.home.join(".config"));
-    });
-
-    assert_profile_pair(
-        &shell_run,
-        &native_run,
-        &shell,
-        &native,
-        "descriptor refresh",
+    assert_native_silent(&output, "descriptor refresh");
+    assert_eq!(
+        normalized_managed_tree(
+            &fixture.client.home.join(".config/profile"),
+            fixture.client.scope.path(),
+        ),
+        vec![(
+            "value".to_string(),
+            true,
+            b"../../.dotfiles-beta/home/.config/profile/value".to_vec(),
+        )]
     );
-    assert_profile_tree_twin(
-        &shell,
-        &native,
-        ".config/profile",
-        &["alpha", "beta"],
-        "descriptor refresh",
+    assert_eq!(
+        std::fs::read(fixture.client.home.join(".config/profile/value")).unwrap(),
+        b"beta\n"
+    );
+    assert_eq!(base_snapshot(&fixture.client), clean_checkout());
+    assert_clean_checkout(&fixture.client, "alpha");
+    assert_clean_checkout(&fixture.client, "beta");
+    assert_eq!(
+        std::fs::read(fixture.client.home.join("post-base-pre-sync")).unwrap(),
+        b"reconcile"
     );
 }
 
 #[test]
-fn update_native_profile_retirement_matches_shell_twin() {
-    let shell = NativeUpdateFixture::stage().with_profile_retirement();
-    let native = NativeUpdateFixture::stage().with_profile_retirement();
-    assert_profile_twin(&shell, &native, "retirement setup");
-
-    for fixture in [&shell, &native] {
-        std::fs::write(
-            fixture.client.xdg.join("dot/config"),
-            b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
-        )
-        .expect("switch profile");
-    }
-    let shell_run = shell.shell_dot_with(&["update", "--quiet"], |_| {});
-    let native_run = native.rust_dot(&["update", "--quiet"]);
-
-    assert_profile_pair(&shell_run, &native_run, &shell, &native, "retirement");
+fn update_native_profile_retirement_commits_the_selected_generation() {
+    let fixture = NativeUpdateFixture::stage().with_profile_retirement();
+    assert_native_silent(
+        &fixture.rust_dot(&["update", "--quiet"]),
+        "retirement setup",
+    );
+    std::fs::write(
+        fixture.client.xdg.join("dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndefault_profile=dev\n",
+    )
+    .expect("switch profile");
+    let output = fixture.rust_dot(&["update", "--quiet"]);
+    assert_native_silent(&output, "retirement");
     assert_eq!(
-        std::fs::read(native.client.home.join("alpha-retired")).expect("native retirement marker"),
-        std::fs::read(shell.client.home.join("alpha-retired")).expect("shell retirement marker"),
-        "retirement hook result"
+        std::fs::read(fixture.client.home.join("alpha-retired")).unwrap(),
+        b"alpha|0",
+        "retirement publishes saved identity without active overlays"
     );
-    assert_eq!(
-        native.client.home.join(".dotfiles-beta/.git").is_dir(),
-        shell.client.home.join(".dotfiles-beta/.git").is_dir(),
-        "retirement beta checkout"
-    );
-    assert_profile_tree_twin(
-        &shell,
-        &native,
-        ".config/profile",
-        &["alpha", "beta"],
-        "retirement",
-    );
+    let ledger = std::fs::read_to_string(
+        fixture
+            .client
+            .home
+            .join(".local/state/dot/profile-overlay-lifecycle-v1"),
+    )
+    .unwrap();
+    assert!(!ledger.contains("alpha|"));
+    assert_eq!(base_snapshot(&fixture.client), clean_checkout());
+    assert_clean_checkout(&fixture.client, "alpha");
+    assert_clean_checkout(&fixture.client, "beta");
 }
 
 #[test]
-fn update_native_profile_rollback_matches_shell_twin() {
-    let shell = NativeUpdateFixture::stage().with_base_profile_rollback();
-    let native = NativeUpdateFixture::stage().with_base_profile_rollback();
-    let run_shell = || {
-        shell.shell_dot_with(&["update", "--quiet"], |cmd| {
-            cmd.env("XDG_CONFIG_HOME", shell.client.home.join(".config"));
+fn update_native_profile_rollback_keeps_the_prior_generation() {
+    let fixture = NativeUpdateFixture::stage().with_base_profile_rollback();
+    let run = || {
+        fixture.rust_dot_with(&["update", "--quiet"], |cmd| {
+            cmd.env("XDG_CONFIG_HOME", fixture.client.home.join(".config"));
         })
     };
-    let run_native = || {
-        native.rust_dot_with(&["update", "--quiet"], |cmd| {
-            cmd.env("XDG_CONFIG_HOME", native.client.home.join(".config"));
-        })
-    };
-    let shell_setup = run_shell();
-    let native_setup = run_native();
-    assert_profile_pair(
-        &shell_setup,
-        &native_setup,
-        &shell,
-        &native,
-        "rollback setup",
-    );
+    assert_native_silent(&run(), "rollback setup");
+    let target = fixture.client.home.join(".config/profile/value");
+    let manifest = fixture.client.home.join(".local/state/dot/overlay-links");
+    let manifest_before = std::fs::read(&manifest).unwrap();
 
     let user = dot::profiles::current_user().expect("current user");
-    for fixture in [&shell, &native] {
-        std::fs::create_dir_all(
-            fixture
-                .client
-                .base_seed
-                .join(".config/dot/profile-selectors.d"),
-        )
-        .expect("base selector directory");
-        seed_advance(
-            &fixture.client.base_seed,
-            ".config/dot/profile-selectors.d/conflict.conf",
-            format!("version=1\nuser={user}\nprofile=dev\n").as_bytes(),
-        );
-    }
-    let shell_conflict = run_shell();
-    let native_conflict = run_native();
-
-    assert_profile_pair(
-        &shell_conflict,
-        &native_conflict,
-        &shell,
-        &native,
-        "rollback conflict",
+    std::fs::create_dir_all(
+        fixture
+            .client
+            .base_seed
+            .join(".config/dot/profile-selectors.d"),
+    )
+    .expect("base selector directory");
+    seed_advance(
+        &fixture.client.base_seed,
+        ".config/dot/profile-selectors.d/conflict.conf",
+        format!("version=1\nuser={user}\nprofile=dev\n").as_bytes(),
     );
-    assert_profile_tree_twin(
-        &shell,
-        &native,
-        ".config/profile",
-        &["alpha"],
-        "rollback conflict",
-    );
+    let output = run();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert!(has_bytes(
+        &output.stderr,
+        b"equally specific selectors choose dev and base"
+    ));
+    assert_eq!(std::fs::read(&target).unwrap(), b"overlay\n");
+    assert_eq!(std::fs::read(&manifest).unwrap(), manifest_before);
+    assert_eq!(base_snapshot(&fixture.client), clean_checkout());
+    assert_clean_checkout(&fixture.client, "alpha");
 }
 
-/// Scrub one twin's temp scope (every home, XDG, origin, and state
-/// path lives under it) so twin outputs compare on behavior, not
-/// machine paths.
+/// Normalize the fixture's temporary scope in a process or state contract.
 fn scrub_scope(bytes: &[u8], scope: &std::path::Path) -> Vec<u8> {
     String::from_utf8_lossy(bytes)
         .replace(&scope.to_string_lossy().into_owned(), "@SCOPE@")
@@ -4375,8 +3825,7 @@ fn has_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Scrub update elapsed stamps (trailing `0s`, `1s`) after
-/// asserting each is sane: wall-clock jitter between twins is
-/// expected, but a garbage stamp (an unstarted stage clock) must
+/// asserting each is sane. A garbage stamp from an unstarted stage clock must
 /// still fail loudly. (The suite `(Ns)` marks use the existing
 /// [`scrub_elapsed`] instead.)
 fn scrub_update_elapsed(bytes: &[u8]) -> Vec<u8> {
@@ -4453,8 +3902,7 @@ fn scrub_update_elapsed(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Worker durations are per-process timing fields, so verbose merge twins
-/// compare their rendered shape after preserving the rest of each row exactly.
+/// Normalize per-process worker durations while preserving each result row.
 fn scrub_merge_durations(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
@@ -4492,14 +3940,8 @@ fn scrub_merge_durations(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Twin outputs compared on behavior: scope paths, then elapsed
-/// stamps, scrubbed identically on both sides.
-fn scrub_twin(bytes: &[u8], scope: &std::path::Path) -> Vec<u8> {
-    scrub_update_elapsed(&scrub_scope(bytes, scope))
-}
-
 #[test]
-fn update_twin_duration_normalizers_cover_slow_ci_formats() {
+fn update_duration_normalizers_cover_slow_ci_formats() {
     assert_eq!(
         scrub_update_elapsed(
             b"Done in 10s\nDone with errors in 10s\nDone in 10s. Reload your shell: source ~/.zshrc\n"
@@ -4524,51 +3966,33 @@ fn update_twin_duration_normalizers_cover_slow_ci_formats() {
 }
 
 #[test]
-fn update_native_matches_shell_byte_for_byte() {
-    // Twin staged clients (base plus one overlay, both current):
-    // the shell side runs the oracle engine and the Rust side the native
-    // driver. Pulls are no-ops, so the run exercises the
+fn update_native_success_reports_completion_and_commits_state() {
+    // The base plus one overlay are current. Pulls are no-ops, so the run exercises the
     // deferred close with real counts, discovery, the link phase,
     // retire, the empty merges close, commit, and normalize.
-    let shell_client = stage_repos_client();
-    let shell = repos_shell(&shell_client, &["update"]);
+    let client = stage_repos_client();
+    let output = repos_rust_native(&client, &["update"]);
     assert_eq!(
-        shell.status.code(),
+        output.status.code(),
         Some(0),
-        "oracle update code\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&shell.stdout),
-        String::from_utf8_lossy(&shell.stderr),
+        "update code\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
-    let native_client = stage_repos_client();
-    let native = repos_rust_native(&native_client, &["update"]);
-    assert_eq!(
-        native.status.code(),
-        shell.status.code(),
-        "update code\nshell stdout: {}\nshell stderr: {}\nnative stdout: {}\nnative stderr: {}",
-        String::from_utf8_lossy(&shell.stdout),
-        String::from_utf8_lossy(&shell.stderr),
-        String::from_utf8_lossy(&native.stdout),
-        String::from_utf8_lossy(&native.stderr),
+    assert!(
+        has_bytes(&output.stdout, b"Reload your shell"),
+        "successful update completion: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
-    assert_eq!(
-        scrub_twin(&native.stdout, native_client.scope.path()),
-        scrub_twin(&shell.stdout, shell_client.scope.path()),
-        "update stdout\ncodes: native={} shell={}\nshell stderr: {}\nnative stderr: {}",
-        native.status.code().unwrap_or(-1),
-        shell.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&shell.stderr),
-        String::from_utf8_lossy(&native.stderr),
-    );
-    assert_eq!(
-        scrub_twin(&native.stderr, native_client.scope.path()),
-        scrub_twin(&shell.stderr, shell_client.scope.path()),
-        "update stderr",
-    );
+    assert_eq!(output.stderr, b"");
+    assert_eq!(base_snapshot(&client), clean_checkout());
+    assert_clean_checkout(&client, "alpha");
+    assert!(!client.home.join(".local/state/dot/overlay-links").exists());
 }
 
 #[test]
-fn update_native_failure_matches_shell_byte_for_byte() {
-    // Twin staged clients with a broken base origin: the base
+fn update_native_failure_reports_errors_and_restores_state() {
+    // A staged client has a broken base origin: the base
     // pull fails, so the run exercises the failed deferred close
     // with real counts, the generation restore, the frozen
     // preservation rows, and the skipped-inputs close. The dead
@@ -4588,40 +4012,32 @@ fn update_native_failure_matches_shell_byte_for_byte() {
             ],
         );
     };
-    let shell_client = stage_repos_client();
-    break_origin(&shell_client);
-    let shell = repos_shell(&shell_client, &["update"]);
-    assert_ne!(
-        shell.status.code(),
-        Some(0),
-        "oracle update must fail\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&shell.stdout),
-        String::from_utf8_lossy(&shell.stderr),
-    );
-    let native_client = stage_repos_client();
-    break_origin(&native_client);
-    let native = repos_rust_native(&native_client, &["update"]);
+    let fixture = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { printf 'ran\n' >\"$HOME/.failed-sync-hook\"; }\n");
+    let client = &fixture.client;
+    break_origin(client);
+    let output = repos_rust_native(client, &["update"]);
     assert_eq!(
-        native.status.code(),
-        shell.status.code(),
-        "failed update code\nshell stdout: {}\nshell stderr: {}\nnative stdout: {}\nnative stderr: {}",
-        String::from_utf8_lossy(&shell.stdout),
-        String::from_utf8_lossy(&shell.stderr),
-        String::from_utf8_lossy(&native.stdout),
-        String::from_utf8_lossy(&native.stderr),
+        output.status.code(),
+        Some(1),
+        "update must fail\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
-    assert_eq!(
-        scrub_twin(&native.stdout, native_client.scope.path()),
-        scrub_twin(&shell.stdout, shell_client.scope.path()),
-        "failed update stdout\ncodes: native={} shell={}\nshell stderr: {}\nnative stderr: {}",
-        native.status.code().unwrap_or(-1),
-        shell.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&shell.stderr),
-        String::from_utf8_lossy(&native.stderr),
+    assert!(
+        has_bytes(&output.stdout, b"Done with errors"),
+        "failed completion: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
+    assert!(has_bytes(&output.stderr, b"fatal:"));
     assert_eq!(
-        scrub_twin(&native.stderr, native_client.scope.path()),
-        scrub_twin(&shell.stderr, shell_client.scope.path()),
-        "failed update stderr",
+        std::fs::read(client.home.join("tracked.txt")).unwrap(),
+        b"v1\n"
+    );
+    assert_eq!(base_snapshot(client), clean_checkout());
+    assert_clean_checkout(client, "alpha");
+    assert!(
+        !client.home.join(".failed-sync-hook").exists(),
+        "repository failure must stop before newly eligible merge hooks"
     );
 }

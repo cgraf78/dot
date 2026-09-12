@@ -1,11 +1,10 @@
 //! `dot`: fast declarative dotfiles manager.
 //!
-//! The Rust crate owns the implementation. The shell tree under `lib/`
-//! remains the behavior owner until each slice cuts over; `tests/*-test`
-//! (run via `bash tests/run`) is the parity oracle and must stay green.
-//! Public shell API boundaries (`lib/dot/public/*`, `hook-api-v1.tsv`,
-//! `doctor-api-v1.tsv`, `test-api-v1.tsv`) are compatibility constraints,
-//! not implementation details to mirror.
+//! The Rust crate owns the CLI and engine implementation. Shell retained under
+//! `lib/dot/public/` is a versioned compatibility boundary for user hooks and
+//! executable test suites, not an alternate engine or fallback. Native unit
+//! and integration tests own engine regression coverage; retained shell suites
+//! validate only actual shell-facing interfaces, packaging, and bootstrap.
 
 #![deny(missing_docs)]
 
@@ -43,7 +42,6 @@ pub mod init_client_plan;
 pub mod init_client_publish;
 pub mod init_client_publish_intent;
 pub mod init_client_record;
-pub mod init_client_records;
 pub mod init_client_resume;
 pub mod init_client_rollback;
 pub mod init_client_safe_path;
@@ -88,7 +86,6 @@ pub mod temp;
 pub(crate) mod test_command;
 pub(crate) mod test_runner;
 pub mod test_suites;
-pub mod test_support;
 pub mod ui;
 pub mod update;
 pub mod update_engine;

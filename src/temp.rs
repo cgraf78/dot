@@ -9,10 +9,9 @@
 //! shell uses (Git is already a required engine dependency), moves go
 //! through the same `mv` binary with the same `-nT`/`-nh` capability
 //! probe (GNU and BSD `mv` differ on late directories, and the probe
-//! matrix is exactly what the shell suite pins), and `umask` is read
-//! from the engine process the way the shell reads its own —
-//! `std` offers no `umask(2)` binding, and the shell pays a fork per
-//! read too. Callers thread [`LockCtx`] (the `DOT_TEST` /
+//! matrix is exactly what the shell suite pins), and the process umask
+//! is read without mutating process state. Callers thread
+//! [`LockCtx`] (the `DOT_TEST` /
 //! `DOT_UPDATE_LOCK_TOKEN` gate), `source_root` (the
 //! `DOT_SOURCE_ROOT` binding, see [`source_root`]), the umask, and a
 //! [`MoveCache`] explicitly so differential tests can pin every knob
@@ -183,15 +182,10 @@ pub fn path_nlink(path: &Path) -> Result<u64> {
     Ok(meta.nlink())
 }
 
-/// Current effective uid, forked from `id -u` exactly like the shell
-/// (see `platform::require_sudo`): no libc binding for parity.
+/// Current effective uid from the Unix process credentials.
 pub fn current_uid() -> Option<u32> {
-    std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+    // SAFETY: `geteuid` has no preconditions and does not dereference memory.
+    Some(unsafe { libc::geteuid() })
 }
 
 /// `_dot_private_dir_validate`: a real directory (never a symlink)
@@ -245,13 +239,36 @@ pub fn private_control_file_validate(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read the engine process umask by asking `sh` (whose builtin reports
-/// the inherited mask): `std` has no `umask(2)` binding, and the shell
-/// pays the same fork with `mask=$(umask)`.
+/// Parse the numeric form emitted by `/proc/self/status` and `sh -c umask`.
+fn parse_umask(value: &str) -> Option<u32> {
+    let value = value.trim_matches(|ch: char| ch.is_ascii_whitespace());
+    if value.is_empty() || value.len() > 4 || !value.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
+    {
+        return None;
+    }
+    let mask = u32::from_str_radix(value, 8).ok()?;
+    (mask <= 0o777).then_some(mask)
+}
+
+/// Read the engine process umask without mutating process-global state.
 pub fn read_umask() -> Result<u32> {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("umask")
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        if let Some(mask) = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Umask:").and_then(parse_umask))
+        {
+            return Ok(mask);
+        }
+    }
+
+    let shell = if Path::new("/bin/sh").is_file() {
+        "/bin/sh"
+    } else {
+        "sh"
+    };
+    let output = std::process::Command::new(shell)
+        .args(["-c", "umask"])
         .output()
         .map_err(|source| Error::Io {
             context: "read umask",
@@ -259,19 +276,38 @@ pub fn read_umask() -> Result<u32> {
         })?;
     if !output.status.success() {
         return Err(Error::Usage {
-            message: "umask query failed",
+            message: "cannot read umask",
         });
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let digits = text.trim();
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(Error::Usage {
-            message: "umask query returned non-octal output",
-        });
-    }
-    u32::from_str_radix(digits, 8).map_err(|_| Error::Usage {
-        message: "umask query returned non-octal output",
+    let value = String::from_utf8(output.stdout).map_err(|_| Error::Usage {
+        message: "invalid umask output",
+    })?;
+    parse_umask(&value).ok_or(Error::Usage {
+        message: "invalid umask output",
     })
+}
+
+#[cfg(test)]
+mod umask_tests {
+    use super::parse_umask;
+
+    #[test]
+    fn numeric_umask_parser_is_strict() {
+        for (value, expected) in [
+            ("0022", Some(0o022)),
+            (" 0077\n", Some(0o077)),
+            ("0", Some(0)),
+            ("0777", Some(0o777)),
+            ("", None),
+            ("Umask:\t0022", None),
+            ("00022", None),
+            ("0788", None),
+            ("1000", None),
+            ("u=rwx,g=rx,o=rx", None),
+        ] {
+            assert_eq!(parse_umask(value), expected, "{value:?}");
+        }
+    }
 }
 
 /// `_dot_apply_tracked_file_mode`: force a git-tracked mode (`100644`
@@ -381,7 +417,7 @@ pub fn sanitized_git<S: AsRef<std::ffi::OsStr>>(
     source_root: &Path,
     args: &[S],
 ) -> std::process::Command {
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = crate::init_client_identity::host_git_command();
     sanitize_git_env(&mut cmd);
     bind_source_git(&mut cmd, source_root);
     cmd.args(args);

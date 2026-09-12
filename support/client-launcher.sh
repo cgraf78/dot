@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Permanent client-owned front door. Shdeps owns the checkout and public-link
-# topology; this file only binds those two authorities before entering Dot.
+# Legacy client-owned front door. New installs publish the native binary
+# directly; existing client repositories may keep this exact file while init
+# transitions them to the standalone release layout.
 
 set -euo pipefail
 CDPATH=
@@ -16,7 +17,7 @@ dot_client_unavailable() {
 
 checkout=${CGRAF78_CHECKOUT_INSTALL_DIR:-}
 if [[ -z $checkout ]]; then
-  install_home=${SHDEPS_INSTALL_DIR:-$HOME/.local/share}
+  install_home=${XDG_DATA_HOME:-$HOME/.local/share}
   while [[ $install_home != / && $install_home == */ ]]; do
     install_home=${install_home%/}
   done
@@ -42,12 +43,10 @@ case ${HOME:-} in
   *) dot_client_unavailable ;;
 esac
 
-runtime=$checkout/bin/dot
+runtime=$checkout/dot
 public=$checkout/lib/dot/public
-public_link=$HOME/.local/lib/dot
 
 [[ -f $runtime && ! -L $runtime && -x $runtime ]] || dot_client_unavailable
 [[ -d $public && ! -L $public ]] || dot_client_unavailable
-[[ -L $public_link && $public_link -ef $public ]] || dot_client_unavailable
 
 exec "$runtime" "$@"

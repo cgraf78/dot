@@ -3,19 +3,12 @@
 //! marker validation, the branch-tip check, git identity capture,
 //! and git metadata mode setup.
 //!
-//! The shell file holds 79 functions — too big for one lane — so
-//! this module owns only the six functions from
-//! `_dot_init_generation_marker` through
-//! `_dot_init_configure_git_metadata_modes`. The file-generic
-//! `_dot_init_error` diagnostic stays unported (a bare
-//! `printf ... >&2; return 1` with no family state, absorbed into
-//! [`Result`] the way earlier slices absorb engine diagnostics).
-//! The transaction-directory lifecycle lives in the sibling
-//! transaction module, the host-git identity family is in flight on
-//! `rust-port-slice-41`, and the record, claim, publish, and
-//! rollback families stay for later slices.
+//! This module owns generation markers, branch-tip validation, Git identity,
+//! and metadata-mode configuration. The transaction-directory lifecycle lives
+//! in the sibling transaction module, while record, claim, publish, and
+//! rollback families live in their adjacent native modules.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the run identity from the
@@ -28,7 +21,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::errors::{Error, Result};
 use crate::temp;
@@ -198,7 +191,7 @@ pub fn generation_matches(
     if !generation_marker_matches(git_dir, nonce, commit, identity) {
         return false;
     }
-    let output = match Command::new("git")
+    let output = match crate::init_client_identity::host_git_command()
         .arg(OsString::from(format!("--git-dir={}", git_dir.display())))
         .arg("rev-parse")
         .arg(format!("refs/heads/{branch}"))
@@ -237,7 +230,7 @@ pub fn set_git_identity(git_dir: &Path) -> Result<(u64, u64)> {
 /// the live `umask` at each entry; the umask cannot change mid-run,
 /// so one read is equivalent.
 pub fn configure_git_metadata_modes(git_dir: &Path) -> Result<()> {
-    let status = Command::new("git")
+    let status = crate::init_client_identity::host_git_command()
         .arg(OsString::from(format!("--git-dir={}", git_dir.display())))
         .args(["config", "core.sharedRepository", "0700"])
         .env("LC_ALL", "C")
@@ -255,6 +248,6 @@ pub fn configure_git_metadata_modes(git_dir: &Path) -> Result<()> {
             status: Some(status.to_string()),
         });
     }
-    let mask = temp::read_umask()?;
+    let mask = crate::startup::ensure_umask_ceiling(temp::read_umask()?);
     temp::apply_git_metadata_modes(git_dir, mask)
 }

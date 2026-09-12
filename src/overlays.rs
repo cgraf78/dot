@@ -1,13 +1,13 @@
-//! Overlay discovery and local-source validation (slice 9).
+//! Overlay discovery and local-source validation.
 //!
-//! Ports `lib/dot/overlays.sh`: filename-derived identities,
+//! Owns filename-derived identities,
 //! descriptor safety gates, single-descriptor parsing with the
 //! strict/permissive split, physical-directory resolution, local
 //! (`sync=none`) destination and inventory validation, the
 //! configured/eligible/active lifecycle sets, and top-level
 //! resolution across legacy and profile-aware discovery.
 //!
-//! Conventions follow the earlier ports: the shell's globals become
+//! Shell globals become
 //! [`State`], environment-derived inputs arrive explicitly via
 //! [`Inputs`], and stderr text (warnings, discovery errors) is
 //! collected for engine callers to reproduce — the library never
@@ -481,7 +481,7 @@ pub fn is_worktree(path: &Path) -> bool {
         Ok(canonical) => canonical,
         Err(_) => return false,
     };
-    let top = match std::process::Command::new("git")
+    let top = match crate::init_client_identity::host_git_command()
         .arg("-C")
         .arg(path)
         .arg("rev-parse")
@@ -526,7 +526,7 @@ pub fn effective_url(url: &str, home: &str) -> String {
 /// match, or the `<missing>` / `<multiple origin URLs>`
 /// diagnostic the shell stores in `REPLY`.
 pub fn origin_matches(path: &Path, expected: &str) -> Result<String, String> {
-    let output = std::process::Command::new("git")
+    let output = crate::init_client_identity::host_git_command()
         .arg("-C")
         .arg(path)
         .arg("config")

@@ -54,15 +54,16 @@ assert_eq dot "$RELEASE_ASSET_NAME" 'release archives retain the dot name'
 assert_eq dot "$RELEASE_BINARY" 'release config builds the native dot binary'
 
 declared_files=$(printf '%s\n' "${RELEASE_PAYLOAD_FILES[@]}")
-assert_eq $'README.md\nLICENSE' "$declared_files" \
-  'release package includes only required top-level documentation'
+assert_eq $'README.md\nLICENSE\nsupport/client-launcher.sh' "$declared_files" \
+  'release package includes documentation and the client adapter'
 declared_dirs=$(printf '%s\n' "${RELEASE_PAYLOAD_DIRS[@]}")
 assert_eq 'lib/dot/public' "$declared_dirs" \
   'release package retains only the public shell API directory'
 
 release_workflow=$(cat "$DOT_TEST_ROOT/.github/workflows/release.yml")
+actions_lock=$(tr -d '\n' <"$DOT_TEST_ROOT/.github/cgraf78-actions.lock")
 assert_contains \
-  'cgraf78/actions/.github/workflows/rust-release.yml@b97bd729afec784785bd01ebd43321225ef47bb7' \
+  "cgraf78/actions/.github/workflows/rust-release.yml@$actions_lock" \
   "$release_workflow" 'release workflow uses the pinned shared workflow'
 assert_contains 'android-aarch64: true' "$release_workflow" \
   'release workflow publishes the supported Android artifact'
@@ -81,12 +82,12 @@ assert_contains 'attestations: write' "$release_workflow" \
 
 test_workflow=$(cat "$DOT_TEST_ROOT/.github/workflows/test.yml")
 rust_job=$(sed -n '/^  rust:/,/^  shell:/p' "$DOT_TEST_ROOT/.github/workflows/test.yml")
-shell_job=$(sed -n '/^  shell:/,/^  macos-bash32:/p' "$DOT_TEST_ROOT/.github/workflows/test.yml")
-assert_contains $'test-command: |\n        cargo test --locked\n        bash tests/release-scripts-test\n        DOT_PERF_BUDGET_MULTIPLIER=1 cargo test --locked -- --ignored' \
+shell_job=$(sed -n '/^  shell:/,/^  shdeps-lock:/p' "$DOT_TEST_ROOT/.github/workflows/test.yml")
+assert_contains $'test-command: |\n        cargo test --locked\n        bash tests/run\n        bash tests/release-scripts-test\n        DOT_PERF_BUDGET_MULTIPLIER=1 cargo test --locked -- --ignored' \
   "$rust_job" 'Rust CI runs build-dependent release coverage before ignored performance tests'
-assert_contains 'test-command: bash tests/run' "$shell_job" \
-  'shell CI runs only the shell oracle without assuming a Rust toolchain'
-if [[ $shell_job == *'tests/release-scripts-test'* ]]; then
+assert_contains 'test-command: bash tests/library-test' "$shell_job" \
+  'shell CI runs sourceable public-library acceptance without a Rust toolchain'
+if [[ $shell_job == *'tests/run'* || $shell_job == *'tests/release-scripts-test'* ]]; then
   fail 'shell CI must not run the Cargo-dependent release contract'
 fi
 assert_contains 'android-package-smoke-command: |' "$test_workflow" \
@@ -99,13 +100,35 @@ assert_contains 'scripts/smoke-release.sh "$ASSET_PLATFORM"' "$test_workflow" \
   'Android CI validates the release archive'
 assert_contains 'package-smoke-musl-target: x86_64-unknown-linux-musl' "$test_workflow" \
   'CI exercises the supported musl package'
+# shellcheck disable=SC2016 # Workflow variables must remain literal.
+assert_contains 'HOME="$install_root/home" ./install.sh' "$test_workflow" \
+  'Linux package smoke activates the musl archive through the generated installer'
+# shellcheck disable=SC2016 # Workflow variables must remain literal.
+assert_contains '"$install_root/bin/dot" version' "$test_workflow" \
+  'Linux package smoke executes the installed native command'
 assert_contains 'bash tests/release-scripts-test' "$test_workflow" \
   'Rust CI runs the release contract'
+
+for obsolete in support/install-checkout.sh support/post-install.sh; do
+  [[ ! -e $DOT_TEST_ROOT/$obsolete && ! -L $DOT_TEST_ROOT/$obsolete ]] ||
+    fail "checkout-era release helper remains: $obsolete"
+done
+assert_contains "release_install_init_subcommand='init'" "$(<"$DOT_TEST_ROOT/install.sh")" \
+  'generated release installer dispatches initialization through the native binary'
 
 target=$(rustc -vV | sed -n 's/^host: //p')
 [[ -n $target ]] || fail 'could not determine the host Rust target'
 case $(uname -s) in
-  Darwin) asset_platform=macos-$(uname -m) ;;
+  Darwin)
+    case $(uname -m) in
+      arm64 | aarch64) asset_platform=macos-aarch64 ;;
+      x86_64 | amd64) asset_platform=macos-x86_64 ;;
+      *) fail "unsupported local macOS architecture: $(uname -m)" ;;
+    esac
+    ;;
+  # The ordinary Linux host target is glibc, so its local package must not be
+  # mislabeled as the published musl artifact. The dedicated package-smoke job
+  # below builds and validates the canonical musl target.
   Linux) asset_platform=linux-$(uname -m) ;;
   *) fail "unsupported local release-test host: $(uname -s)" ;;
 esac
@@ -121,13 +144,29 @@ archive=$(
 [[ -f $DOT_TEST_ROOT/$archive ]] || fail "packager did not create $archive"
 [[ -f $DOT_TEST_ROOT/$archive.sha256 ]] || fail "packager did not create $archive.sha256"
 
+if [[ $asset_platform == macos-* ]]; then
+  install_home=$DOT_TEST_TMP/install-home
+  install_data=$DOT_TEST_TMP/install-data
+  install_bin=$DOT_TEST_TMP/install-bin
+  mkdir -p "$install_home"
+  HOME=$install_home "$DOT_TEST_ROOT/install.sh" \
+    --archive "$DOT_TEST_ROOT/$archive" \
+    --checksum "$DOT_TEST_ROOT/$archive.sha256" \
+    --data-home "$install_data" --bin-dir "$install_bin" >/dev/null ||
+    fail 'generated installer cannot activate the locally built archive'
+  [[ -L $install_bin/dot ]] || fail 'generated installer did not publish the command link'
+  [[ -L $install_data/cgraf78/dot ]] || fail 'generated installer did not publish the stable release link'
+  "$install_bin/dot" version >/dev/null || fail 'installed native command cannot execute'
+fi
+
 extract=$DOT_TEST_TMP/release
 mkdir -p "$extract"
 tar -C "$extract" -xzf "$DOT_TEST_ROOT/$archive"
 
 for entry in \
-  dot README.md LICENSE .dot-install.json \
+  dot README.md LICENSE .dot-install.json support/client-launcher.sh \
   lib/dot/public/api-v1.tsv lib/dot/public/api-version.sh \
+  lib/dot/public/hook-runtime-v1/worker.sh \
   lib/dot/public/test-reporter-v1 lib/dot/public/test-timeout-v1 \
   lib/dot/public/ui.sh lib/dot/public/variables-v1.tsv lib/dot/public/xdg.sh; do
   [[ -e $extract/$entry ]] || fail "release archive is missing $entry"
@@ -147,6 +186,43 @@ assert_eq "dot commit ${build_commit:0:12} (config 1; extensions 1; library 1)" 
   "$version" 'extracted binary identity agrees with release metadata'
 assert_contains '"version": "' "$metadata" 'release metadata records the computed version'
 "$extract/dot" help >/dev/null || fail 'extracted native binary cannot print help'
+
+# Initialization must work from the artifact users actually install, where
+# source identity comes from trusted release metadata instead of a Git checkout.
+release_origin_work=$DOT_TEST_TMP/release-origin-work
+release_origin=$DOT_TEST_TMP/release-origin.git
+release_home=$DOT_TEST_TMP/release-home
+release_state=$DOT_TEST_TMP/release-state
+mkdir -p "$release_origin_work/.local/bin" "$release_home" "$release_state"
+cp "$extract/support/client-launcher.sh" "$release_origin_work/.local/bin/dot"
+git -C "$release_origin_work" init -q -b main
+git -C "$release_origin_work" config user.name 'Dot Release Test'
+git -C "$release_origin_work" config user.email 'dot-release@example.invalid'
+git -C "$release_origin_work" add .local/bin/dot
+git -C "$release_origin_work" -c core.hooksPath=/dev/null commit -q -m seed
+git clone -q --bare "$release_origin_work" "$release_origin"
+HOME=$release_home XDG_CONFIG_HOME=$release_home/.config \
+  XDG_STATE_HOME=$release_state DOT_INIT_SKIP_PROVIDER=1 DOT_GIT_REAL=1 \
+  GIT_CONFIG_GLOBAL=/dev/null \
+  "$extract/dot" init --yes --branch main "file://$release_origin" >/dev/null ||
+  fail 'extracted native release cannot initialize a client'
+[[ -f $release_state/dot/init/completed ]] ||
+  fail 'extracted native release did not complete initialization'
+assert_contains "dot_revision=$build_commit" \
+  "$(<"$release_state/dot/init/completed")" \
+  'release initialization records the trusted build commit'
+assert_contains "dot=$extract/dot" \
+  "$(<"$release_state/dot/init/completed")" \
+  'release initialization records the packaged native binary'
+HOME=$release_home XDG_CONFIG_HOME=$release_home/.config \
+  XDG_STATE_HOME=$release_state DOT_GIT_REAL=1 GIT_CONFIG_GLOBAL=/dev/null \
+  "$extract/dot" doctor >/dev/null ||
+  fail 'initialized native release does not pass doctor'
+HOME=$release_home XDG_CONFIG_HOME=$release_home/.config \
+  XDG_STATE_HOME=$release_state DOT_GIT_REAL=1 GIT_CONFIG_GLOBAL=/dev/null \
+  "$extract/dot" update >/dev/null ||
+  fail 'initialized native release cannot complete an update'
+
 mv "$extract/lib/dot" "$extract/public-assets-away"
 "$extract/dot" version >/dev/null || fail 'native binary resolves the removed lib/dot engine at runtime'
 "$extract/dot" help >/dev/null || fail 'native help resolves the removed lib/dot engine at runtime'

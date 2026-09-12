@@ -2,14 +2,14 @@
 //! pull fan-out with parent-owned scratch files and the top-level
 //! synchronized-set pull.
 //!
-//! Ports `_pull_overlay_capture`, `_pull_overlay_drain_workers`,
+//! Owns `_pull_overlay_capture`, `_pull_overlay_drain_workers`,
 //! `_pull_overlays_serial`, `_pull_overlays`, and `_repo_pull_all`.
 //! The single-overlay orchestrator ([`crate::repos_pull_overlay`])
 //! and the accounting leaves ([`crate::repos_pull_support`]) already
 //! own their behavior; this layer only fans out, replays, and
 //! aggregates on top of them.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`. Process-group orchestration has no Rust
 //! equivalent: the shell's job-launch isolation, stdin-fd plumbing,
 //! PID registration, and subshell trap reset are owned by scoped
@@ -471,12 +471,17 @@ fn run_chunk(
     result_dir: &Path,
     inputs: &PullOverlaysInputs<'_>,
 ) {
+    let host_git = crate::init_client_identity::current_host_git();
     std::thread::scope(|scope| {
         for (offset, entry) in chunk.iter().enumerate() {
             let idx = base_idx + offset as i64 + 1;
             let dir = result_dir;
             let item = *entry;
+            let host_git = host_git.clone();
             scope.spawn(move || {
+                let _host_git = host_git
+                    .as_deref()
+                    .map(crate::init_client_identity::bind_host_git_for_scope);
                 let mut moves = MoveCache::default();
                 // Each thread builds its own borrowed overlay inputs
                 // from the shared fleet inputs; the scope guarantees

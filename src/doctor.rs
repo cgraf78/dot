@@ -62,7 +62,8 @@ fn run_configured(
         return 1;
     }
     let mut recorder = Recorder::new();
-    let runtime_snapshot = runtime_snapshot(runtime, &source);
+    let runtime_snapshot =
+        runtime_snapshot(runtime, &source, crate::config::extensions_enabled(config));
     let engine = engine_snapshot(runtime, &source, &home);
     crate::doctor_orchestrator::check_runtime(
         &mut recorder,
@@ -249,7 +250,11 @@ fn resolve(
     (overlays, profiles)
 }
 
-fn runtime_snapshot(runtime: &crate::app::Runtime, source: &str) -> RuntimeSnapshot {
+fn runtime_snapshot(
+    runtime: &crate::app::Runtime,
+    source: &str,
+    bash_required: bool,
+) -> RuntimeSnapshot {
     let (bash_version, bash_major) = bash_version(runtime);
     let checkout_root = git_output(
         runtime,
@@ -265,7 +270,9 @@ fn runtime_snapshot(runtime: &crate::app::Runtime, source: &str) -> RuntimeSnaps
     RuntimeSnapshot {
         bash_version,
         bash_major,
+        bash_required,
         checkout_root,
+        release_root: release_root(Path::new(source)),
         source_raw: source.as_bytes().to_vec(),
         source_root,
         git_version,
@@ -273,13 +280,16 @@ fn runtime_snapshot(runtime: &crate::app::Runtime, source: &str) -> RuntimeSnaps
     }
 }
 
+fn release_root(root: &Path) -> bool {
+    let metadata = root.join(".dot-install.json");
+    let public = root.join("lib/dot/public");
+    !root.join("Cargo.toml").is_file()
+        && std::fs::symlink_metadata(metadata).is_ok_and(|entry| entry.file_type().is_file())
+        && std::fs::symlink_metadata(public).is_ok_and(|entry| entry.file_type().is_dir())
+}
+
 fn bash_version(runtime: &crate::app::Runtime) -> (Vec<u8>, u64) {
-    let bash = runtime
-        .value("BASH")
-        .filter(|path| Path::new(path).is_absolute())
-        .map(PathBuf::from)
-        .or_else(|| runtime.find_on_path("bash"));
-    let Some(bash) = bash else {
+    let Some(bash) = runtime.bash() else {
         return (Vec::new(), 0);
     };
     // `bash -c` would evaluate caller-controlled startup state such as
@@ -668,11 +678,7 @@ fn value_or(runtime: &crate::app::Runtime, key: &str, fallback: &str) -> String 
 }
 
 fn doctor_bash(runtime: &crate::app::Runtime) -> Option<PathBuf> {
-    runtime
-        .value("BASH")
-        .filter(|path| Path::new(path).is_absolute())
-        .map(PathBuf::from)
-        .or_else(|| runtime.find_on_path("bash"))
+    runtime.bash()
 }
 
 fn command(runtime: &crate::app::Runtime, program: &Path) -> Command {
@@ -758,15 +764,13 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
-    use std::process::{Command, Stdio};
 
     use super::run_configured;
 
     #[test]
     fn disabled_extensions_do_not_inspect_configured_merge_root() {
-        let home = crate::test_support::TempDir::new("doctor-disabled-merge-home").expect("home");
-        let state =
-            crate::test_support::TempDir::new("doctor-disabled-merge-state").expect("state");
+        let home = dot_test_support::TempDir::new("doctor-disabled-merge-home").expect("home");
+        let state = dot_test_support::TempDir::new("doctor-disabled-merge-state").expect("state");
         let extension_root = home.path().join("extensions");
         let hooks = extension_root.join("merge-hooks.d");
         std::fs::create_dir_all(&hooks).expect("hook directory");
@@ -781,28 +785,6 @@ mod tests {
         }
 
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let snippet = concat!(
-            ". \"$1/lib/dot/config.sh\"\n",
-            ". \"$1/lib/dot/doctor/runtime.sh\"\n",
-            ". \"$1/lib/dot/doctor/merges.sh\"\n",
-            "DOT_EXTENSION_API= DOT_EXTENSIONS_DIR=$2 _dr_check_merges\n",
-        );
-        let shell = Command::new(crate::test_support::bash())
-            .args(["--noprofile", "--norc", "-c", snippet, "dot-test-sh"])
-            .arg(repo)
-            .arg(&extension_root)
-            .env_clear()
-            .env("HOME", home.path())
-            .env("PATH", "/usr/bin:/bin")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("shell merge check");
-        assert!(shell.status.success(), "shell status");
-        assert!(shell.stderr.is_empty(), "shell stderr: {:?}", shell.stderr);
-        assert!(String::from_utf8_lossy(&shell.stdout).contains("no extension root configured"));
-
         let mut config = crate::config::load(&crate::config::Request {
             config_path: None,
             home: home.path().to_str().expect("home text"),
@@ -821,7 +803,7 @@ mod tests {
             ("PATH".into(), OsString::from("/usr/bin:/bin")),
             (
                 "BASH".into(),
-                OsStr::new(crate::test_support::bash()).to_os_string(),
+                OsStr::new(dot_test_support::bash()).to_os_string(),
             ),
             ("LC_ALL".into(), OsString::from("C")),
         ]);
@@ -830,6 +812,9 @@ mod tests {
         let mut stderr = Vec::new();
         let mut streams = crate::app::Streams::with_terminal(&mut stdout, &mut stderr, false);
         let _ = run_configured(&runtime, &config, &mut streams);
-        assert_eq!(stderr, shell.stderr, "disabled inventory diagnostics");
+        assert!(
+            stderr.is_empty(),
+            "disabled inventory diagnostics: {stderr:?}"
+        );
     }
 }

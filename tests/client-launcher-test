@@ -5,56 +5,67 @@ set -euo pipefail
 # shellcheck disable=SC1091 # Test helper path is resolved from this file.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
+# The checkout launcher is development-only and enters a compiled binary.
+native_checkout=$DOT_TEST_TMP/native-checkout
+mkdir -p "$native_checkout/bin" "$native_checkout/target/debug"
+cp "$DOT_TEST_ROOT/bin/dot" "$native_checkout/bin/dot"
+cp "$DOT_TEST_ROOT/target/debug/dot" "$native_checkout/target/debug/dot"
+native_version=$(HOME=$DOT_TEST_TMP/native-home "$native_checkout/bin/dot" version)
+assert_eq "$("$DOT_TEST_ROOT/target/debug/dot" version)" "$native_version" \
+  'development launcher enters the native binary'
+
+missing_checkout=$DOT_TEST_TMP/missing-native-checkout
+mkdir -p "$missing_checkout/bin"
+cp "$DOT_TEST_ROOT/bin/dot" "$missing_checkout/bin/dot"
+if HOME=$DOT_TEST_TMP/native-home "$missing_checkout/bin/dot" version \
+  >"$DOT_TEST_TMP/missing-native.out" 2>"$DOT_TEST_TMP/missing-native.err"; then
+  fail 'development launcher succeeded without a compiled binary'
+fi
+assert_eq '' "$(<"$DOT_TEST_TMP/missing-native.out")" \
+  'missing native binary leaves stdout empty'
+# shellcheck disable=SC2016 # Backticks are literal expected syntax.
+assert_contains 'run `cargo build --locked`' \
+  "$(<"$DOT_TEST_TMP/missing-native.err")" \
+  'missing native binary gives the build command'
+
+# The retained client-owned launcher follows the standalone release root. It
+# adds no output and preserves argv and the native process status exactly.
 launcher=$DOT_TEST_ROOT/support/client-launcher.sh
 client_home=$DOT_TEST_TMP/home
-install_home=$DOT_TEST_TMP/install
-checkout=$install_home/cgraf78/dot
-public_link=$client_home/.local/lib/dot
+data_home=$DOT_TEST_TMP/data
+release=$data_home/cgraf78/dot
 runtime_log=$DOT_TEST_TMP/runtime.log
 
-write_runtime() {
+write_release() {
   local root=$1
 
-  mkdir -p "$root/bin" "$root/lib/dot/public"
-  cat >"$root/bin/dot" <<'RUNTIME'
+  mkdir -p "$root/lib/dot/public"
+  cat >"$root/dot" <<'RUNTIME'
 #!/usr/bin/env bash
 printf '<%s>\n' "$@" >"${DOT_CLIENT_TEST_RUNTIME_LOG:?}"
 exit "${DOT_CLIENT_TEST_RUNTIME_STATUS:-0}"
 RUNTIME
-  chmod 0755 "$root/bin/dot"
+  chmod 0755 "$root/dot"
 }
 
-publish_public_link() {
-  local root=$1
-
-  mkdir -p "${public_link%/*}"
-  rm -rf -- "$public_link"
-  ln -s "$root/lib/dot/public" "$public_link"
-}
-
-assert_launcher_rejected() {
-  local label=$1 output=$DOT_TEST_TMP/rejected.out error=$DOT_TEST_TMP/rejected.err
+assert_rejected() {
+  local label=$1
   shift
-
-  rm -f -- "$runtime_log" "$output" "$error"
+  rm -f -- "$runtime_log" "$DOT_TEST_TMP/rejected.out" "$DOT_TEST_TMP/rejected.err"
   if HOME=$client_home DOT_CLIENT_TEST_RUNTIME_LOG=$runtime_log \
-    "$@" "$launcher" rejected >"$output" 2>"$error"; then
+    "$@" "$launcher" rejected >"$DOT_TEST_TMP/rejected.out" \
+    2>"$DOT_TEST_TMP/rejected.err"; then
     fail "$label: launcher unexpectedly succeeded"
   fi
-  assert_eq '' "$(<"$output")" "$label: stdout remains silent"
-  assert_contains 'dot: standalone runtime is unavailable' "$(<"$error")" \
-    "$label: error identifies the unavailable runtime"
-  assert_contains 'https://raw.githubusercontent.com/cgraf78/dot/main/install.sh' \
-    "$(<"$error")" "$label: error gives an actionable reinstall command"
-  [[ ! -e $runtime_log ]] || fail "$label: launcher executed a rejected runtime"
+  assert_eq '' "$(<"$DOT_TEST_TMP/rejected.out")" "$label: stdout"
+  assert_contains 'dot: standalone runtime is unavailable' \
+    "$(<"$DOT_TEST_TMP/rejected.err")" "$label: diagnostic"
+  [[ ! -e $runtime_log ]] || fail "$label: rejected runtime executed"
 }
 
-write_runtime "$checkout"
-publish_public_link "$checkout"
-rm -f -- "$runtime_log"
+write_release "$release"
 set +e
-HOME=$client_home SHDEPS_INSTALL_DIR="$install_home/" \
-  CGRAF78_CHECKOUT_INSTALL_DIR='' \
+HOME=$client_home XDG_DATA_HOME=$data_home CGRAF78_CHECKOUT_INSTALL_DIR='' \
   DOT_CLIENT_TEST_RUNTIME_LOG=$runtime_log DOT_CLIENT_TEST_RUNTIME_STATUS=37 \
   "$launcher" first 'two words' >"$DOT_TEST_TMP/forward.out" \
   2>"$DOT_TEST_TMP/forward.err"
@@ -62,78 +73,39 @@ status=$?
 set -e
 assert_eq 37 "$status" 'client launcher preserves runtime status'
 assert_eq $'<first>\n<two words>' "$(<"$runtime_log")" \
-  'client launcher preserves runtime arguments'
-assert_eq '' "$(<"$DOT_TEST_TMP/forward.out")" \
-  'client launcher adds no stdout'
-assert_eq '' "$(<"$DOT_TEST_TMP/forward.err")" \
-  'client launcher adds no stderr'
+  'client launcher preserves arguments'
+assert_eq '' "$(<"$DOT_TEST_TMP/forward.out")" 'client launcher adds no stdout'
+assert_eq '' "$(<"$DOT_TEST_TMP/forward.err")" 'client launcher adds no stderr'
 
-custom_install_home=$DOT_TEST_TMP/custom-install
-custom_checkout=$custom_install_home/cgraf78/dot
-write_runtime "$custom_checkout"
-publish_public_link "$custom_checkout"
+default_release=$client_home/.local/share/cgraf78/dot
+write_release "$default_release"
 rm -f -- "$runtime_log"
-HOME=$client_home SHDEPS_INSTALL_DIR="$custom_install_home" \
-  CGRAF78_CHECKOUT_INSTALL_DIR='' DOT_CLIENT_TEST_RUNTIME_LOG=$runtime_log \
-  "$launcher" shdeps-root
-assert_eq '<shdeps-root>' "$(<"$runtime_log")" \
-  'client launcher honors a custom Shdeps install root'
+HOME=$client_home XDG_DATA_HOME='' CGRAF78_CHECKOUT_INSTALL_DIR='' \
+  DOT_CLIENT_TEST_RUNTIME_LOG=$runtime_log "$launcher" default-root
+assert_eq '<default-root>' "$(<"$runtime_log")" \
+  'client launcher uses the installer default data root'
 
-explicit_checkout=$DOT_TEST_TMP/explicit/dot
-write_runtime "$explicit_checkout"
-publish_public_link "$explicit_checkout"
+explicit_release=$DOT_TEST_TMP/explicit/dot
+write_release "$explicit_release"
 rm -f -- "$runtime_log"
-HOME=$client_home SHDEPS_INSTALL_DIR=relative \
-  CGRAF78_CHECKOUT_INSTALL_DIR=$explicit_checkout \
+HOME=$client_home XDG_DATA_HOME=relative \
+  CGRAF78_CHECKOUT_INSTALL_DIR=$explicit_release \
   DOT_CLIENT_TEST_RUNTIME_LOG=$runtime_log "$launcher" explicit-root
 assert_eq '<explicit-root>' "$(<"$runtime_log")" \
-  'client launcher honors the explicit checkout install root'
+  'explicit release root takes precedence'
 
-# Shdeps development mode keeps the manager-owned root stable while making it
-# a symlink to the selected clone. The front door binds to that official root,
-# not to an arbitrary public-library target.
-manager_home=$DOT_TEST_TMP/manager
-manager_checkout=$manager_home/cgraf78/dot
-development_checkout=$DOT_TEST_TMP/development/dot
-write_runtime "$development_checkout"
-mkdir -p "${manager_checkout%/*}"
-ln -s "$development_checkout" "$manager_checkout"
-publish_public_link "$manager_checkout"
-rm -f -- "$runtime_log"
-HOME=$client_home SHDEPS_INSTALL_DIR=$manager_home \
-  CGRAF78_CHECKOUT_INSTALL_DIR='' DOT_CLIENT_TEST_RUNTIME_LOG=$runtime_log \
-  "$launcher" development-root
-assert_eq '<development-root>' "$(<"$runtime_log")" \
-  'client launcher follows the official manager-owned development root'
-
-foreign_checkout=$DOT_TEST_TMP/foreign/dot
-write_runtime "$foreign_checkout"
-publish_public_link "$foreign_checkout"
-assert_launcher_rejected 'foreign public-library target' \
-  env SHDEPS_INSTALL_DIR="$install_home" CGRAF78_CHECKOUT_INSTALL_DIR=
-
-rm -rf -- "$public_link"
-mkdir -p "$public_link"
-assert_launcher_rejected 'non-symlink public library' \
-  env SHDEPS_INSTALL_DIR="$install_home" CGRAF78_CHECKOUT_INSTALL_DIR=
-
-rm -rf -- "$public_link"
-assert_launcher_rejected 'missing public library' \
-  env SHDEPS_INSTALL_DIR="$install_home" CGRAF78_CHECKOUT_INSTALL_DIR=
-
-publish_public_link "$checkout"
-chmod 0644 "$checkout/bin/dot"
-assert_launcher_rejected 'non-executable runtime' \
-  env SHDEPS_INSTALL_DIR="$install_home" CGRAF78_CHECKOUT_INSTALL_DIR=
-chmod 0755 "$checkout/bin/dot"
-
-assert_launcher_rejected 'relative Shdeps install root' \
-  env SHDEPS_INSTALL_DIR=relative CGRAF78_CHECKOUT_INSTALL_DIR=
-assert_launcher_rejected 'relative explicit checkout root' \
-  env SHDEPS_INSTALL_DIR="$install_home" \
-  CGRAF78_CHECKOUT_INSTALL_DIR=relative/dot
-assert_launcher_rejected 'root client home' \
-  env HOME=/ SHDEPS_INSTALL_DIR="$install_home" \
-  CGRAF78_CHECKOUT_INSTALL_DIR=''
+chmod 0644 "$release/dot"
+assert_rejected 'non-executable runtime' \
+  env XDG_DATA_HOME="$data_home" CGRAF78_CHECKOUT_INSTALL_DIR=
+chmod 0755 "$release/dot"
+mv "$release/lib/dot/public" "$release/public-away"
+assert_rejected 'missing public API' \
+  env XDG_DATA_HOME="$data_home" CGRAF78_CHECKOUT_INSTALL_DIR=
+assert_rejected 'relative data root' \
+  env XDG_DATA_HOME=relative CGRAF78_CHECKOUT_INSTALL_DIR=
+assert_rejected 'relative explicit root' \
+  env XDG_DATA_HOME="$data_home" CGRAF78_CHECKOUT_INSTALL_DIR=relative/dot
+assert_rejected 'root client home' \
+  env HOME=/ XDG_DATA_HOME="$data_home" CGRAF78_CHECKOUT_INSTALL_DIR=
 
 printf 'client-launcher-test: ok\n'

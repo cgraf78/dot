@@ -10,16 +10,17 @@
 //! transaction-directory lifecycle) lives on its own lane, the
 //! `_dot_init_safe_value` / `_dot_init_safe_relative_path` predicates
 //! already live behind [`crate::repos_overlays`], and the file-generic
-//! `_dot_init_error` diagnostic stays unported: a bare
+//! `_dot_init_error` diagnostic is represented as a typed error: a bare
 //! `printf 'dot init: %s\n' ... >&2; return 1` with no family state,
 //! absorbed here into the `Result` payloads [`NO_HOST_GIT`] /
 //! [`GIT_SHADOWED`], which the caller renders with the same
 //! `dot init: ` prefix. Record, candidate, generation, claim, and
-//! rollback families stay for later slices.
+//! rollback families live in their adjacent native modules.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,6 +36,56 @@ pub const NO_HOST_GIT: &str = "host Git is unavailable outside HOME and the Dot 
 /// shadows the executable. Rendered as `dot init: {GIT_SHADOWED}`
 /// on stderr, exactly like the shell.
 pub const GIT_SHADOWED: &str = "a shell function named git cannot be used during initialization";
+
+thread_local! {
+    /// Per-invocation executable capability. Init is callable in-process, so
+    /// the binding must not mutate process-global `PATH`.
+    static HOST_GIT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Run one init operation with every Git child pinned to `git`.
+pub fn with_host_git<T>(git: &Path, run: impl FnOnce() -> T) -> T {
+    let _restore = bind_host_git_for_scope(git);
+    run()
+}
+
+/// Scoped host-Git binding used when an init worker crosses a thread boundary.
+pub struct HostGitGuard(Option<PathBuf>);
+
+impl Drop for HostGitGuard {
+    fn drop(&mut self) {
+        HOST_GIT.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+/// Bind `git` on the current thread until the returned guard is dropped.
+pub fn bind_host_git_for_scope(git: &Path) -> HostGitGuard {
+    let previous = HOST_GIT.with(|slot| slot.borrow_mut().replace(git.to_path_buf()));
+    HostGitGuard(previous)
+}
+
+/// Return the executable currently bound to this init invocation.
+pub fn current_host_git() -> Option<PathBuf> {
+    HOST_GIT.with(|slot| slot.borrow().clone())
+}
+
+/// Construct a Git child pinned by [`with_host_git`].
+///
+/// Isolated helper tests outside the production init boundary retain ordinary
+/// `PATH` lookup.
+pub fn host_git_command() -> Command {
+    HOST_GIT.with(|slot| match slot.borrow().as_deref() {
+        Some(git) => Command::new(git),
+        None => Command::new("git"),
+    })
+}
+
+/// Return the bound Git program for argv vectors that spawn later.
+pub fn host_git_program() -> std::ffi::OsString {
+    current_host_git()
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| std::ffi::OsString::from("git"))
+}
 
 /// `_dot_init_safe_value`: nonempty with no tab, newline, or
 /// carriage-return bytes. The same rule already guards
@@ -339,7 +390,7 @@ pub fn branch_valid(branch: &str) -> bool {
 /// here) and report success. `false` covers spawn failure and
 /// non-zero exit alike, like the shell's `||` chains.
 fn git_status(args: &[&str]) -> bool {
-    Command::new("git")
+    host_git_command()
         .args(args)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
@@ -354,7 +405,7 @@ fn git_status(args: &[&str]) -> bool {
 /// `None` on spawn failure; callers check the exit status, like the
 /// shell's `$(... || true)` captures.
 fn git_output<S: AsRef<OsStr>>(args: &[S]) -> Option<std::process::Output> {
-    Command::new("git")
+    host_git_command()
         .args(args)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())

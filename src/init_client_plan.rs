@@ -2,8 +2,7 @@
 //! the plan summary, the confirmation gate, the conflict backup and
 //! restore pair, and the completion publication.
 //!
-//! The shell file holds 79 functions — too big for one lane — so this
-//! module owns only the five contiguous functions from
+//! This module owns the plan and safekeeping operations from
 //! `_dot_init_confirm` through `_dot_init_publish_completed` in file
 //! order: the operator sees the plan ([`plan_summary`]), approves it
 //! ([`confirm`]), conflicting worktree state is stashed aside
@@ -11,32 +10,18 @@
 //! ([`restore_backups`]), and a successful run stamps its record
 //! ([`publish_completed`]).
 //!
-//! Lane map, so the integrator can stack without overlap: the
-//! transaction-directory lifecycle lives on `rust-port-slice-35`
-//! (`init_client_transaction`), the host-git identity family on
-//! `rust-port-slice-41` (`init_client_identity`), the git-generation
-//! binding on `rust-port-slice-43` (`init_client_generation`), the
-//! per-entry staging family on `rust-port-slice-46`
-//! (`init_client_entry`), the candidate planning family on
-//! `rust-port-slice-48` (`init_client_candidate`), the transaction
-//! record journal on `rust-port-slice-51` (`init_client_records`) and
-//! `rust-port-slice-54` (`init_client_record`), and the
-//! deletion-parking family on `rust-port-slice-55`
-//! (`init_client_delete`). The file-generic `_dot_init_error`
-//! diagnostic stays unported (a bare `printf ... >&2; return 1` with
-//! no family state, absorbed into [`Result`] the way earlier slices
-//! absorb engine diagnostics). The publish (`publish_intent`,
+//! Transaction, identity, generation, entry, candidate, record, and deletion
+//! responsibilities live in their corresponding modules. The publish (`publish_intent`,
 //! `publish_one`, `publish_worktree`, `published_stage_matches`,
 //! `published_intent_matches`, `cleanup_published_stage`), git-stage
 //! (`stage_git`, `publish_git`), rollback, resume, status, and
-//! command-dispatch families stay for later slices, as do the small
+//! command-dispatch families are composed by the engine, as are the small
 //! shared guards (`safe_value`, `safe_relative_path` — the latter
 //! already lives in the base tree as
 //! [`crate::repos_overlays::init_safe_relative_path`], which this
-//! module mirrors with a byte-local twin the way the record lane
-//! does).
+//! module mirrors with a byte-local twin).
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the run identity from the
@@ -86,23 +71,18 @@ use std::io::Write as _;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::errors::{Error, Result};
 use crate::temp;
 
-/// Worktree-state matcher: the candidate lane's
-/// `_dot_init_path_state_matches` by position
-/// (`target kind dev ino mode size value`), injected because that
-/// lane is unmerged. Tests feed either a stub or a closure that runs
-/// the live shell predicate, so the orchestration below stays
-/// differentially covered either way.
+/// Worktree-state matcher by position
+/// (`target kind dev ino mode size value`), injected for focused tests.
 pub type StateMatches<'a> = dyn Fn(&Path, &str, &str, &str, &str, &str, &str) -> bool + 'a;
 
-/// Private-directory provision: the transaction lane's
-/// `_dot_init_private_directory` (`mkdir -p` plus the real-directory
-/// gate plus `chmod 0700`), injected because that lane is unmerged.
+/// Private-directory provision (`mkdir -p`, real-directory validation,
+/// and `chmod 0700`), injected for focused tests.
 pub type EnsurePrivateDir<'a> = dyn Fn(&Path) -> Result<()> + 'a;
 
 /// Header of the confirmation listing, printed when the conflicts
@@ -125,16 +105,6 @@ const PREVIEW_NAME: &str = "dot-config.preview";
 /// Config blob the plan summary inspects inside the candidate:
 /// the shell's `$branch:.config/dot/config`.
 const CONFIG_BLOB: &str = ".config/dot/config";
-
-/// Child script that loads the preview through the real config
-/// engine and prints the three plan fields: the shell's
-/// `--noprofile --norc -c '...'` body verbatim, so provider, policy,
-/// and extension defaults stay owned by `config.sh` on both engines.
-const CONFIG_PROBE: &str = "set -euo pipefail
-. \"$DOT_SOURCE_ROOT/lib/dot/config.sh\"
-dot_config_load \"$1\"
-printf \"%s\\t%s\\t%s\\n\" \"$DOT_DEPENDENCY_PROVIDER\" \"$DOT_SHDEPS_UPDATE_POLICY\" \"${DOT_EXTENSION_API:+enabled}\"
-";
 
 /// A path that exists as anything but a missing name: the shell's
 /// `[[ -e $path || -L $path ]]`, which also sees dangling symlinks.
@@ -164,8 +134,7 @@ fn is_file_following(path: &Path) -> bool {
 
 /// Effective-uid ownership (`test -O`): the shell gate requires the
 /// path to be ours. An unreadable identity fails closed, like the
-/// shell's failed `stat`. (Twin of the delete lane's gate; kept
-/// local because that lane is unmerged.)
+/// shell's failed `stat`.
 fn owned_by_us(path: &Path) -> bool {
     match (temp::current_uid(), temp::path_uid(path)) {
         (Some(uid), Ok(owner)) => uid == owner,
@@ -326,7 +295,7 @@ fn safe_relative_bytes(path: &[u8]) -> bool {
 /// failure, like the shell's `|| return 1` on the substitution —
 /// git's own stderr is silenced (the candidate lane precedent).
 fn git_in(home: &Path, candidate: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new("git")
+    let output = crate::init_client_identity::host_git_command()
         .arg("-C")
         .arg(candidate)
         .args(args)
@@ -517,11 +486,10 @@ pub struct PlanInputs<'a> {
     pub identity: &'a str,
     /// Client root (`HOME`): steers the config-probe child.
     pub home: &'a Path,
-    /// Source checkout (`DOT_SOURCE_ROOT`): the probe sources
-    /// `config.sh` from here.
-    pub source_root: &'a Path,
     /// `DOT_INIT_SKIP_PROVIDER` is `1`: annotate a real provider.
     pub skip_provider: bool,
+    /// Process-local policy override, which wins over candidate config.
+    pub env_policy: Option<&'a str>,
 }
 
 /// `_dot_init_plan_summary`: render what this run is about to do.
@@ -533,11 +501,8 @@ pub struct PlanInputs<'a> {
 /// The provider triple comes from the live config engine: when the
 /// candidate holds `$branch:.config/dot/config`, its bytes land in
 /// `$candidate/dot-config.preview` (left behind on later failure,
-/// like the shell's) and a child `bash` sources `config.sh` against
-/// it with `HOME` and `DOT_SOURCE_ROOT` steered at `home` and
-/// `source_root`. Only the child's first output line is read, the
-/// shell's `read` on the herestring, and an empty extension word
-/// reports `disabled`. When `skip_provider` is set (the shell's
+/// like the shell's) and the native parser loads it against `home`.
+/// When `skip_provider` is set (the shell's
 /// `DOT_INIT_SKIP_PROVIDER=1`) a non-`none` provider is annotated.
 /// A missing config blob keeps the compiled-in defaults, and a
 /// failed `git show` or failed child refuses. An unreadable tree
@@ -553,7 +518,6 @@ pub fn plan_summary(inputs: &PlanInputs<'_>) -> Result<Vec<u8>> {
     let backup = inputs.backup;
     let identity = inputs.identity;
     let home = inputs.home;
-    let source_root = inputs.source_root;
     let skip_provider = inputs.skip_provider;
     let content = std::fs::read(tree).map_err(|source| Error::Io {
         context: "read candidate tree",
@@ -574,40 +538,29 @@ pub fn plan_summary(inputs: &PlanInputs<'_>) -> Result<Vec<u8>> {
             context: "write config preview",
             source,
         })?;
-        let probed = Command::new("bash")
-            .arg("--noprofile")
-            .arg("--norc")
-            .arg("-c")
-            .arg(CONFIG_PROBE)
-            .arg("dot-plan-sh")
-            .arg(&preview)
-            .env("LC_ALL", "C")
-            .env("HOME", home)
-            .env("DOT_SOURCE_ROOT", source_root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|source| Error::Io {
-                context: "probe candidate config",
-                source,
-            })?;
-        if !probed.status.success() {
-            return Err(Error::Command {
-                command: "load candidate config".to_string(),
-                status: Some("non-zero exit".to_string()),
-            });
-        }
-        // Command substitution strips every trailing newline; the
-        // herestring adds one back and `read` takes the first line.
-        let text = String::from_utf8_lossy(&probed.stdout);
-        let first = text.split('\n').next().unwrap_or("");
-        let mut fields = ["", "", ""];
-        read_row(first, &mut fields);
-        provider = fields[0].as_bytes().to_vec();
-        policy = fields[1].as_bytes().to_vec();
-        if !fields[2].is_empty() {
-            extensions = fields[2].as_bytes().to_vec();
+        let home = home.to_str().ok_or(Error::Command {
+            command: "load candidate config".to_string(),
+            status: Some("non-zero exit".to_string()),
+        })?;
+        let config = crate::config::load(&crate::config::Request {
+            config_path: Some(&preview),
+            home,
+            env_policy: inputs.env_policy,
+        })
+        .map_err(|_| Error::Command {
+            command: "load candidate config".to_string(),
+            status: Some("non-zero exit".to_string()),
+        })?;
+        provider = match config.provider {
+            crate::config::Provider::None => b"none".to_vec(),
+            crate::config::Provider::Shdeps => b"shdeps".to_vec(),
+        };
+        policy = match config.shdeps_update_policy {
+            crate::config::UpdatePolicy::Pinned => b"pinned".to_vec(),
+            crate::config::UpdatePolicy::Latest => b"latest".to_vec(),
+        };
+        if config.extension_api {
+            extensions = b"enabled".to_vec();
         }
     }
     if skip_provider && provider != b"none" {

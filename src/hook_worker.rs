@@ -2,10 +2,12 @@
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use crate::app::Runtime;
 use crate::profile_lifecycle::{WorkerOutcome, WorkerRun};
@@ -34,7 +36,22 @@ const STARTUP_CONTROLS: [&str; 8] = [
 pub(crate) struct Worker {
     runtime: Runtime,
     extensions_dir: Option<PathBuf>,
+    overlay_manifest: Option<PathBuf>,
+    update_lock_token: Option<String>,
+    quiet: bool,
+    force: bool,
+    verbose: bool,
     bash: Option<PathBuf>,
+}
+
+/// Resolved update-generation values exported to public hook APIs.
+pub(crate) struct UpdateEnvironment<'a> {
+    pub(crate) extensions_dir: &'a str,
+    pub(crate) overlay_manifest: &'a str,
+    pub(crate) update_lock_token: Option<&'a str>,
+    pub(crate) quiet: bool,
+    pub(crate) force: bool,
+    pub(crate) verbose: bool,
 }
 
 /// One pre-sync worker's separately routed process streams.
@@ -45,21 +62,22 @@ pub(crate) struct PreSyncOutcome {
 }
 
 impl Worker {
-    /// Bind this worker to one immutable invocation runtime.
-    pub(crate) fn new(runtime: &Runtime) -> Self {
-        Self {
-            runtime: runtime.clone(),
-            extensions_dir: None,
-            bash: None,
-        }
-    }
-
     /// Bind the refreshed configuration's extension root for a pre-sync
     /// worker. Runtime remains the source for every other child input.
-    pub(crate) fn with_extensions(runtime: &Runtime, extensions_dir: &str) -> Self {
+    pub(crate) fn for_update(runtime: &Runtime, env: &UpdateEnvironment<'_>) -> Self {
         Self {
             runtime: runtime.clone(),
-            extensions_dir: (!extensions_dir.is_empty()).then(|| PathBuf::from(extensions_dir)),
+            extensions_dir: (!env.extensions_dir.is_empty())
+                .then(|| PathBuf::from(env.extensions_dir)),
+            overlay_manifest: (!env.overlay_manifest.is_empty())
+                .then(|| PathBuf::from(env.overlay_manifest)),
+            update_lock_token: env
+                .update_lock_token
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            quiet: env.quiet,
+            force: env.force,
+            verbose: env.verbose,
             bash: None,
         }
     }
@@ -72,6 +90,11 @@ impl Worker {
         Self {
             runtime: runtime.clone(),
             extensions_dir: Some(PathBuf::from(extensions_dir)),
+            overlay_manifest: None,
+            update_lock_token: None,
+            quiet: false,
+            force: false,
+            verbose: false,
             bash: Some(bash),
         }
     }
@@ -140,17 +163,72 @@ impl Worker {
         {
             return None;
         }
-        let bash = self
-            .bash
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|span| i64::try_from(span.as_secs()).ok())?;
+        let euid = crate::temp::current_uid()?;
+        let home = self.runtime.home().to_str()?;
+        let decoded =
+            crate::overlay_context::consume(context, token, mode, home, euid, now_secs).ok()?;
+        let manifest = self
+            .overlay_manifest
             .clone()
-            .or_else(|| bash_path(&self.runtime))
-            .filter(|path| path.is_absolute() && executable(path))?;
+            .unwrap_or_else(|| self.runtime.state_home().join("dot/overlay-links"));
+        let extensions_dir = self.extensions_dir.as_deref().unwrap_or(Path::new(""));
+        let trust = crate::extension_trust::Inputs {
+            euid,
+            home: home.to_string(),
+            extensions_dir: extensions_dir.to_string_lossy().into_owned(),
+            manifest: manifest.to_string_lossy().into_owned(),
+            retiring_root: String::new(),
+        };
+        let (retiring_name, retiring_root) = if mode == "deactivate" {
+            let record = decoded.records.first()?;
+            crate::extension_trust::deactivation_validate(record, script.to_str()?, home, euid)
+                .ok()?;
+            let mut fields = record.split('|');
+            (
+                fields.next().unwrap_or("").to_string(),
+                fields.next().unwrap_or("").to_string(),
+            )
+        } else {
+            if !crate::extension_trust::file_validate(script, &trust, &decoded.records) {
+                return None;
+            }
+            (String::new(), String::new())
+        };
+        let decoded_path = result_dir.join("worker-context");
+        let record_count = decoded.records.len().to_string();
+        let mut decoded_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&decoded_path)
+            .ok()?;
+        for field in [
+            decoded.stage.as_str(),
+            decoded.set_kind.as_str(),
+            retiring_name.as_str(),
+            retiring_root.as_str(),
+            record_count.as_str(),
+        ] {
+            decoded_file.write_all(field.as_bytes()).ok()?;
+            decoded_file.write_all(&[0]).ok()?;
+        }
+        for record in &decoded.records {
+            decoded_file.write_all(record.as_bytes()).ok()?;
+            decoded_file.write_all(&[0]).ok()?;
+        }
+        decoded_file.flush().ok()?;
+        drop(decoded_file);
+        let bash = self.bash.clone().or_else(|| self.runtime.bash())?;
         let (cache, data) = (
             xdg_home(&self.runtime, "XDG_CACHE_HOME", ".cache"),
             xdg_home(&self.runtime, "XDG_DATA_HOME", ".local/share"),
         );
         let (cache, data) = (cache?, data?);
-        let worker = source_root.join("lib/dot/extension-worker.sh");
+        let worker = source_root.join("lib/dot/public/hook-runtime-v1/worker.sh");
         let mut command = Command::new(bash);
         command
             .arg("--noprofile")
@@ -159,8 +237,7 @@ impl Worker {
             .arg(mode)
             .arg(script)
             .arg(result_file)
-            .arg(context)
-            .arg(token)
+            .arg(decoded_path)
             .env_clear()
             .envs(self.runtime.env())
             .env("HOME", self.runtime.home())
@@ -170,10 +247,26 @@ impl Worker {
             .env("XDG_STATE_HOME", self.runtime.state_home())
             .env("XDG_CACHE_HOME", cache)
             .env("XDG_DATA_HOME", data)
+            // Public hook helpers use the manifest to validate overlay links.
+            // Reassert it after `env_clear` so hooks see the same resolved
+            // path the native engine used to build their context.
+            .env("DOT_OVERLAY_MANIFEST", manifest)
             .current_dir(self.runtime.cwd())
             .stdin(Stdio::null());
         if let Some(extensions_dir) = &self.extensions_dir {
             command.env("DOT_EXTENSIONS_DIR", extensions_dir);
+        }
+        if let Some(token) = &self.update_lock_token {
+            command.env("DOT_UPDATE_LOCK_TOKEN", token);
+        }
+        if self.quiet {
+            command.env("DOT_QUIET", "1").env("SHDEPS_QUIET", "1");
+        }
+        if self.force {
+            command.env("DOT_FORCE", "1").env("SHDEPS_FORCE", "1");
+        }
+        if self.verbose {
+            command.env("DOT_VERBOSE", "1").env("SHDEPS_LOG_LEVEL", "2");
         }
         for key in STARTUP_CONTROLS {
             command.env_remove(key);
@@ -205,23 +298,6 @@ impl Worker {
         };
         combined(&mut command, result_dir)
     }
-}
-
-/// Resolve the shell-authorized absolute Bash executable from the Runtime.
-/// The launcher rejects PATH lookup, a relative `$BASH`, and a non-executable
-/// target before it ever starts the worker; the native boundary has the same
-/// authority rule rather than silently selecting a different interpreter.
-fn bash_path(runtime: &Runtime) -> Option<PathBuf> {
-    let path = PathBuf::from(runtime.value("BASH")?);
-    (path.is_absolute() && executable(&path)).then_some(path)
-}
-
-/// A regular executable file, matching the launcher’s absolute executable
-/// gate without invoking the parent shell for resolution.
-fn executable(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
 }
 
 /// Resolve an XDG worker baseline exactly like `dot_xdg_home`: an absolute
@@ -276,11 +352,11 @@ fn combined(command: &mut Command, result_dir: &Path) -> WorkerOutcome {
     command
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(file));
-    let status = command.status();
+    let status = wait(command);
     let output = std::fs::read(&path).unwrap_or_default();
     let _ = std::fs::remove_file(path);
     WorkerOutcome {
-        rc: status.ok().and_then(|status| status.code()).unwrap_or(1),
+        rc: status.unwrap_or(1),
         output,
     }
 }
@@ -317,15 +393,50 @@ fn separate(command: &mut Command, result_dir: &Path) -> PreSyncOutcome {
     command
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    let status = command.status();
+    let status = wait(command);
     let stdout = std::fs::read(&stdout_path).unwrap_or_default();
     let stderr = std::fs::read(&stderr_path).unwrap_or_default();
     let _ = std::fs::remove_file(stdout_path);
     let _ = std::fs::remove_file(stderr_path);
     PreSyncOutcome {
-        rc: status.ok().and_then(|status| status.code()).unwrap_or(1),
+        rc: status.unwrap_or(1),
         stdout,
         stderr,
+    }
+}
+
+/// Run one user hook in its own session and retain the leader until every
+/// descendant is gone. The CLI owns the signal handler; parallel hook threads
+/// only observe its atomic result and perform teardown for their own session.
+fn wait(command: &mut Command) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    crate::cleanup::isolate(command);
+    let mut child = command.spawn().ok()?;
+    loop {
+        if let Some(signal) = crate::cleanup::received_signal() {
+            let status = crate::cleanup::stop_session(&mut child, signal).ok()?;
+            return Some(
+                status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(signal)),
+            );
+        }
+        match crate::cleanup::exited(&child) {
+            Ok(true) => {
+                let status = child.wait().ok()?;
+                return Some(
+                    status
+                        .code()
+                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
+                );
+            }
+            Ok(false) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                let _ = crate::cleanup::stop_session(&mut child, libc::SIGKILL);
+                return None;
+            }
+        }
     }
 }
 
@@ -373,11 +484,11 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    use super::Worker;
+    use super::{UpdateEnvironment, Worker};
     use crate::app::Runtime;
     use crate::log::Log;
     use crate::profile_lifecycle;
-    use crate::test_support::TempDir;
+    use dot_test_support::TempDir;
 
     fn git_repo(path: &Path, origin: &str) {
         std::fs::create_dir_all(path).expect("repo directory");
@@ -437,7 +548,7 @@ mod tests {
             (OsString::from("PATH"), path),
             (
                 OsString::from("BASH"),
-                crate::test_support::bash().as_os_str().to_owned(),
+                dot_test_support::bash().as_os_str().to_owned(),
             ),
             (OsString::from("BASH_ENV"), bash_env.as_os_str().to_owned()),
             (
@@ -451,7 +562,18 @@ mod tests {
 
     fn run(runtime: &Runtime, home: &Path, record: &str) -> (i32, Vec<u8>, Vec<u8>) {
         let log = Log::new(false, false);
-        let mut worker = Worker::new(runtime);
+        let manifest = runtime.state_home().join("dot/overlay-links");
+        let mut worker = Worker::for_update(
+            runtime,
+            &UpdateEnvironment {
+                extensions_dir: "",
+                overlay_manifest: manifest.to_str().expect("manifest text"),
+                update_lock_token: None,
+                quiet: false,
+                force: false,
+                verbose: false,
+            },
+        );
         let mut out = Vec::new();
         let mut warnings = Vec::new();
         let tmpdir = home.join("scratch");
@@ -461,10 +583,6 @@ mod tests {
             home: home.to_str().expect("home text"),
             euid: crate::temp::current_uid().expect("current uid"),
             tmpdir: &tmpdir,
-            now_secs: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_secs() as i64,
             verbose: true,
             log: &log,
         };
@@ -600,6 +718,23 @@ mod tests {
         env.insert(OsString::from("BASH"), OsString::from("bash"));
         let runtime = Runtime::from_env(&env, &home).expect("runtime");
 
-        assert!(super::bash_path(&runtime).is_none());
+        assert!(runtime.bash().is_none());
+    }
+
+    #[test]
+    fn worker_resolves_bash_from_the_snapshotted_path_when_unset() {
+        let scope = TempDir::new("hook-worker-path-bash").expect("fixture directory");
+        let home = scope.path().join("home");
+        let state = scope.path().join("state");
+        std::fs::create_dir(&home).expect("home directory");
+        std::fs::create_dir(&state).expect("state directory");
+        let poison = scope.path().join("bash-env");
+        std::fs::write(&poison, b":\n").expect("BASH_ENV");
+        let mut env = runtime(&home, &state, &poison).env().clone();
+        env.remove(std::ffi::OsStr::new("BASH"));
+        let runtime = Runtime::from_env(&env, &home).expect("runtime");
+
+        let bash = runtime.bash().expect("PATH bash");
+        assert!(bash.is_absolute());
     }
 }

@@ -1,9 +1,9 @@
-# Rust Port Spec (slice 1: scaffold + CLI core)
+# Rust Port Compatibility Record
 
-Normative compatibility contract for the first slice. Later slices extend
-this file. Anything not specified here is governed by the shell
-implementation plus `tests/*-test` (the oracle) — when in doubt, the shell
-wins and this spec gets amended.
+This records the compatibility contracts used during the incremental Rust
+port. The native implementation and its tests now own the behavior. Historical
+references to the removed shell engine explain the source of a contract; they
+are not a second runtime or a test oracle.
 
 ## 1. Version identity
 
@@ -19,26 +19,23 @@ wins and this spec gets amended.
   from the manifest dir → `unknown` (unlike shdeps, never panic: the
   shell contract defines `unknown`). The short commit is the lowercased
   first 12 hex chars, else `unknown`.
-- `DOT_BUILD_VERSION` accepts any non-empty `$DOT_BUILD_VERSION`,
-  else `unknown`. The shared `YYYYMMDD-HHMMSS-8hex` scheme and its
-  validation arrive with the release workflow in a later slice.
+- `DOT_BUILD_VERSION` accepts any non-empty `$DOT_BUILD_VERSION`, otherwise
+  `unknown`. Release builds supply the shared validated
+  `YYYYMMDD-HHMMSS-8hex` identity.
 - `src/version.rs` exposes `COMMIT` / `SHORT_COMMIT` / `VERSION`
   consts plus `version_line()` (exact `dot version` text) and
   `description()`, with unit tests asserting the revision is `unknown`
   or 12 hex chars.
 
-## 2. CLI surface (slice 1)
+## 2. CLI surface (historical slice-1 contract)
 
-Commands owned by the Rust binary in this slice: `help` (default,
-`-h`, `--help`), `version` (`--version`). The binary is not yet on
-PATH, so the shell remains the entry point; direct invocations of
-unported commands (`update`, `status`, …) yield the shell's
-`unknown command` / exit 1 until their owning slice lands.
+The first migration slice covered `help` (default, `-h`, `--help`) and
+`version` (`--version`). Subsequent slices ported the full command table in
+section 5 and cut the installed entry point over to the Rust binary.
 
-- Unknown command exits 1 **when config loads** (the shell runs
-  `dot_config_load || exit 2` before dispatch, so an unloadable config
-  exits 2 for ANY command — specified in forward contracts, tested in
-  slice 2 with the config parser).
+- Help and version bypass configuration loading and remain available for
+  diagnosis. Operational and unknown commands load configuration first; an
+  unloadable configuration exits 2 before their dispatch.
 - `dot help` prints the exact `dot_help` heredoc from `lib/dot/main.sh`
   (byte-identical; pinned by `tests/cli.rs` against the shell source).
 - Unknown command: `dot: unknown command: <arg>\n` on stderr, exit 1.
@@ -46,9 +43,9 @@ unported commands (`update`, `status`, …) yield the shell's
 - I/O streams are injected (`run(args, stdout, stderr) -> i32`)
   so parity tests capture text without subprocesses (shdeps `cli.rs`
   pattern). (`Result` is reserved for fallible engine operations in
-  later slices; slice-1 dispatch is infallible by construction.)
+  later migration work; slice-1 dispatch was infallible by construction.)
 
-## 3. Performance budgets (slice 1)
+## 3. Performance budgets (historical slice-1 baseline)
 
 Measured on the reference host; enforced by `tests/perf_budget.rs`
 (p95 over runs, CLI-level including process startup, following
@@ -56,7 +53,7 @@ Measured on the reference host; enforced by `tests/perf_budget.rs`
 
 | Operation | Shell baseline (warm) | Rust budget (p95) | Rust expected |
 |---|---|---|---|
-| `help` | ~18ms (parse+probes) | 25ms | ~2-5ms |
+| `help` | ~18ms (parse+probes) | 25ms (30ms on macOS) | ~2-5ms |
 | `version` | ~26ms (incl. one `git rev-parse` fork; Rust bakes the revision, no fork) | 30ms | ~2-5ms |
 
 Budgets are CI-variance ceilings, not targets: the port must beat them
@@ -67,15 +64,15 @@ point of the port even if the gate is green.
 - Multiplier env `DOT_PERF_BUDGET_MULTIPLIER` (float, default 1.0) exists
   for slow developer hosts only. Gate CI jobs run perf tests explicitly
   (including `#[ignore]`-gated ones) with the multiplier pinned to 1.
-- Budgets cover warm and cold paths; update-level budgets (slice 2+)
-  assert improvement against the recorded shell ceiling, not just an
-  absolute ceiling.
+- Budgets cover warm and cold startup paths. The completed update-level
+  benchmark and measured comparison are recorded in
+  `docs/rust-port-performance.md`.
 - Heavy/loop-heavy budgets (e.g. full `update` on fixtures) are
   `#[ignore]`-gated and run explicitly in CI, same as hive-memory.
 - Budgets are regression gates, not goals: the port must beat them by a
   wide margin on the reference host; a budget failure blocks the slice.
 
-## 4. Crate layout (slice 1)
+## 4. Initial crate layout (historical)
 
 `Cargo.toml` (`edition 2024`, `rust-version 1.85`, `[lints.rust]
 warnings = "deny"`, lib+bin), `build.rs`, `src/lib.rs`, `src/main.rs`
@@ -83,7 +80,7 @@ warnings = "deny"`, lib+bin), `build.rs`, `src/lib.rs`, `src/main.rs`
 no anyhow/thiserror in lib), `src/version.rs`, `src/cli.rs`,
 `src/test_support.rs`, `tests/cli.rs`, `tests/perf_budget.rs`.
 
-## 5. Forward contracts (owned by later slices, recorded here)
+## 5. Full command contracts
 
 Full command table (`lib/dot/commands.sh`, `lib/dot/main.sh`):
 
@@ -115,8 +112,8 @@ markers (`# <marker> begin` / `# DO NOT EDIT...` / `# source: <path>` /
 (`*.serial.sh` = barrier); provider reexec checkpoint
 (`cgraf78 dot provider reexec checkpoint v1`, `before=/after=` hex).
 
-Claimed surface (each row ported with shell-vs-Rust differential
-tests; the binary is still not on PATH and no shell behavior changed):
+Migration surface (each row was ported with shell-vs-Rust differential tests
+before native cutover):
 
 | Rust module | Shell source | Parity notes |
 |---|---|---|
@@ -134,16 +131,14 @@ tests; the binary is still not on PATH and no shell behavior changed):
 | `overlays` | `overlays.sh` (+ `repos/config.sh` checkout match) | descriptor parse; strict/legacy discovery with selection echo; name derivation mirroring bash `=~` `$` newline anchoring; glob-exact `*.conf` filter (dotfiles skipped); `mapfile`-empty origin semantics; warning-text discovery errors (never announced) |
 | `version::LIBRARY_API` | `public/api-version.sh` | `DOT_LIBRARY_API=1` pinned on both sides |
 
-## 6. Non-contract (explicitly out of slice 1)
-
-## Native test supervisor (completion Task 10)
+## 6. Native test supervisor
 
 The Rust `test` command owns arguments, inspect-mode resolution, source-home
 authority, trusted suite discovery, scheduling, result classification, output,
 timeouts and cancellation. It never loads `lib/dot/test.sh` or its stage files.
-Those files remain the shell oracle until the shell launcher cutover; the public
-`test-reporter-v1` and `test-timeout-v1` interfaces remain unchanged for external
-suites. The native scheduler does not execute the timeout helper.
+The removed private shell files served as the migration oracle before cutover.
+The public `test-reporter-v1` and `test-timeout-v1` interfaces remain available
+for external suites. The native scheduler does not execute the timeout helper.
 
 Source authority requires both the configured base Git common directory and
 Git's registration of the exact source worktree. The actual invocation HOME is
@@ -169,10 +164,10 @@ The only added dependency is `libc`, for POSIX operations absent from std:
 signal handling/delivery, session identity, and `waitid(WNOWAIT)`. Unsafe calls
 are centralized in `cleanup`; std owns Command/Child, file I/O and reaping.
 
-## Slice 1 exclusions (historical)
+## 7. Slice-1 exclusions (historical record)
 
 Config parsing, XDG resolution, update pipeline, extension workers,
 providers, doctor/test/init commands, `bin/dot` cutover, release
-workflow, man pages, shell completions. Each gets its own spec section
-in a later slice; none of the shell behavior for those paths may change
-as a side effect of this slice (shell suite must stay 28/28 green).
+workflow, man pages, and shell completions were deliberately outside the first
+increment. Later increments brought the CLI and engine paths into the native
+binary before the private shell implementation was removed.

@@ -15,7 +15,7 @@
 use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::repos_base::{Base, RepoKind, overlay_path_sync};
 
@@ -75,7 +75,7 @@ pub fn each_existing(
 /// lives here beside its callers. Returns the exit code; a spawn
 /// failure (no `git` on `PATH`) returns 127.
 pub fn run_git_streaming(prefix: &[OsString], args: &[&str]) -> i32 {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::init_client_identity::host_git_command();
     cmd.args(prefix)
         .args(args)
         .stdin(Stdio::null())

@@ -1,144 +1,52 @@
-//! Differential parity tests for the init rollback family
-//! (`lib/dot/init-client.sh` lines 1574-1710) against the live shell:
-//! `_dot_init_rollback_entry`, `_dot_init_rollback_parents`,
-//! `_dot_init_rollback_published`, and `_dot_init_rollback`.
+//! Native integration tests for the init rollback family.
 //!
-//! Separate binary because each row drives real filesystem state:
-//! the two engines work under disjoint home directories (plus
-//! disjoint XDG state roots, since the transaction directory lives
-//! under `dot_xdg_path state dot/init`), so intents, stages, parks,
-//! backups, and transaction journals never collide.
-//!
-//! End-state inventories cover the home trees only. Transaction
-//! journals embed side-specific bindings by construction (absolute
-//! record paths, live device/inode numbers), so no byte comparison
-//! across sides could ever hold for them; rows where the
-//! transaction must vanish assert both sides explicitly instead.
-//! Nothing under test writes inside the transaction — stages,
-//! parks, containers, and the transaction directory itself are all
-//! home-side or whole-directory effects — so the home inventory
-//! plus the verdict pins every observable behavior.
-//!
-//! Every out-of-scope helper the four functions call crosses the
-//! port as a closure. Rows marked `live` feed closures that run the
-//! real shell helper in engine mode (`set -euo pipefail` inside a
-//! subshell, exactly like the bare `_dot_init_rollback` call site),
-//! so flag-sensitive paths (`$(<file)` reads, unguarded `rm -rf`)
-//! behave identically on both engines. Rows marked `record` swap in
-//! logging stubs to pin argument threading (identity strings, the
-//! `${stage#"$HOME"/}/next` relative form, descending parent
-//! order) and the three absorbed diagnostics.
-//!
-//! Error rows compare the exit verdict plus the full end-state
-//! inventory: the shell prints `dot init: ...` diagnostics (and
-//! occasional OS error text) that the port absorbs into `Err`, so
-//! stderr bytes are asserted only where both engines are silent.
+//! Each scenario executes the Rust rollback orchestration once with its production
+//! filesystem, Git, journal, stage, deletion, and restore collaborators. Expected
+//! status, diagnostics, and complete filesystem inventories are fixture-owned.
 
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use dot::init_client_candidate as candidate;
+use dot::init_client_delete as delete;
+use dot::init_client_entry as entry;
+use dot::init_client_plan as plan;
+use dot::init_client_record as record;
 use dot::init_client_rollback as rb;
-use dot::test_support::{self, TempDir};
+use dot::init_client_safe_path as safe_path;
+use dot::init_client_transaction as transaction;
+use dot::temp;
+use dot_test_support::TempDir;
 
-/// Sources for the rollback chapter: the resource runtime, the
-/// shared temp helpers (identity, exclusive moves), the XDG root
-/// (the transaction directory lives under it), and the init client
-/// itself. Same set the plan lane sources.
-const SOURCES: &str = concat!(
-    ". \"$1/lib/dot/resources.sh\"\n",
-    ". \"$1/lib/dot/temp.sh\"\n",
-    ". \"$1/lib/dot/public/xdg.sh\"\n",
-    ". \"$1/lib/dot/init-client.sh\"\n",
-);
-
-/// Run one shell body with the rollback runtime sourced and report
-/// the verdict the body left in `$?` alongside both byte streams.
-/// The body always runs inside `( set -euo pipefail; ... )`, the
-/// engine mode of the bare `_dot_init_rollback` call site, so a
-/// failing statement stops the subshell exactly like the engine.
-/// Every probe ends with `printf 'code=%s\n' "$?"`, so the returned
-/// code is that verdict. A snippet that never reports (a harness
-/// bug, never a pass) yields 99.
-///
-/// `LC_ALL=C` stays pinned (sort order, git diagnostics) and `HOME`
-/// steers the worktree root; the `DOT_INIT_*` panel comes from the
-/// row's record values so live helpers read the same globals on
-/// both engines.
-fn shell_run(home: &Path, env: &[(&str, &str)], body: &str) -> (i32, Vec<u8>, Vec<u8>) {
-    let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let tmpdir = std::env::var_os("TMPDIR")
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    let mut cmd = Command::new(test_support::bash());
-    cmd.arg("--noprofile").arg("--norc").arg("-c").arg(format!(
-        "{SOURCES}( set -euo pipefail\n{body}\n ); printf 'code=%s\\n' \"$?\""
-    ));
-    cmd.arg("dot-test-sh").arg(repo);
-    cmd.env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", &path)
-        .env("TMPDIR", &tmpdir)
-        .env("HOME", home)
-        .env("DOT_TEST", "1")
-        .env("DOT_SOURCE_ROOT", repo)
-        .current_dir(home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    let output = cmd.output().expect("spawn bash");
-    let verdict = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("code=")
-                .and_then(|code| code.parse().ok())
-        })
-        .unwrap_or(99);
-    (verdict, output.stdout, output.stderr)
-}
-
-/// Single-quote arbitrary bytes for snippet embedding. Fixture
-/// words are UTF-8 in practice (hashes, numeric ids, ASCII paths),
-/// so the lossy render here never fires on a real row.
-fn sq(bytes: &[u8]) -> String {
-    let mut quoted = String::from("'");
-    quoted.push_str(&String::from_utf8_lossy(bytes).replace('\'', "'\\''"));
-    quoted.push('\'');
-    quoted
-}
-
-/// Twin engine roots: disjoint homes plus disjoint XDG state roots,
-/// since the transaction directory lives under the state root, not
-/// the home. Fixtures materialize under each side with per-side
-/// absolute values (record journals, device/inode bindings).
-struct Twins {
+/// Expected and actual fixture roots are disjoint so the expected inventory is
+/// constructed independently from the single production execution.
+/// Disjoint expected and actual roots keep dynamic absolute journal bindings
+/// independent while permitting byte-exact relative inventory comparison.
+struct Case {
     _dir: TempDir,
-    shell_home: PathBuf,
-    rust_home: PathBuf,
-    shell_xdg: PathBuf,
-    rust_xdg: PathBuf,
+    expected_home: PathBuf,
+    actual_home: PathBuf,
+    expected_xdg: PathBuf,
+    actual_xdg: PathBuf,
 }
 
-impl Twins {
+impl Case {
     fn build(tag: &str) -> Self {
         let dir = TempDir::new(tag).expect("temp dir");
-        let shell_home = dir.path().join("sh-home");
-        let rust_home = dir.path().join("rs-home");
-        let shell_xdg = dir.path().join("sh-xdg");
-        let rust_xdg = dir.path().join("rs-xdg");
-        for root in [&shell_home, &rust_home, &shell_xdg, &rust_xdg] {
-            std::fs::create_dir_all(root).expect("engine root");
+        let expected_home = dir.path().join("expected-home");
+        let actual_home = dir.path().join("actual-home");
+        let expected_xdg = dir.path().join("expected-xdg");
+        let actual_xdg = dir.path().join("actual-xdg");
+        for root in [&expected_home, &actual_home, &expected_xdg, &actual_xdg] {
+            std::fs::create_dir_all(root).expect("fixture root");
         }
         Self {
             _dir: dir,
-            shell_home,
-            rust_home,
-            shell_xdg,
-            rust_xdg,
+            expected_home,
+            actual_home,
+            expected_xdg,
+            actual_xdg,
         }
     }
 }
@@ -147,6 +55,18 @@ impl Twins {
 fn chmod(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod fixture");
+}
+
+/// Apply a fixture-owned expected removal without consulting production code.
+fn remove_fixture(path: &Path) {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+            std::fs::remove_dir_all(path).expect("remove expected directory");
+        }
+        Ok(_) => std::fs::remove_file(path).expect("remove expected path"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("inspect expected path {}: {error}", path.display()),
+    }
 }
 
 /// Write `bytes` to `dir/name`, creating parents.
@@ -160,7 +80,9 @@ fn write(dir: &Path, name: &str, bytes: &[u8]) {
 
 /// Run git for fixtures; asserts success, silences output.
 fn git(args: &[&str]) {
-    let status = Command::new("git")
+    let mut cmd = Command::new("git");
+    isolate_git(&mut cmd);
+    let status = cmd
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .stdin(Stdio::null())
@@ -175,6 +97,7 @@ fn git(args: &[&str]) {
 /// return the chomped stdout. Asserts success, silences stderr.
 fn git_output(args: &[&str], stdin_bytes: Option<&[u8]>, extra_env: &[(&str, &str)]) -> String {
     let mut cmd = Command::new("git");
+    isolate_git(&mut cmd);
     cmd.args(["-c", "user.name=t", "-c", "user.email=t@t"]);
     cmd.args(args);
     cmd.env("LC_ALL", "C");
@@ -209,7 +132,9 @@ fn git_output(args: &[&str], stdin_bytes: Option<&[u8]>, extra_env: &[(&str, &st
 
 /// `git hash-object --stdin` over raw bytes, for intent names.
 fn hash_bytes(payload: &[u8]) -> String {
-    let mut child = Command::new("git")
+    let mut cmd = Command::new("git");
+    isolate_git(&mut cmd);
+    let mut child = cmd
         .args(["hash-object", "--stdin"])
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())
@@ -231,6 +156,21 @@ fn hash_bytes(payload: &[u8]) -> String {
         text.pop();
     }
     String::from_utf8(text).expect("hex hash")
+}
+
+/// Exclude ambient hooks, signing policy, templates, and user configuration
+/// from every fixture Git process.
+fn isolate_git(cmd: &mut Command) {
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TEMPLATE_DIR", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_KEY_1", "commit.gpgSign")
+        .env("GIT_CONFIG_VALUE_1", "false")
+        .env("GIT_CONFIG_KEY_2", "tag.gpgSign")
+        .env("GIT_CONFIG_VALUE_2", "false");
 }
 
 /// One inventoried entry: relative path plus kind, mode, and
@@ -295,8 +235,8 @@ fn inventory(roots: &[&Path]) -> Vec<u8> {
     out
 }
 
-/// Per-engine record values: absolute paths differ per side, so
-/// each engine gets its own journal. `git_dev`/`git_ino` stay `-`
+/// Per-fixture record values: absolute paths differ per side, so
+/// each fixture gets its own journal. `git_dev`/`git_ino` stay `-`
 /// (the record allows the dash pair), keeping fixtures free of
 /// device probes.
 struct Rec {
@@ -329,41 +269,17 @@ impl Rec {
             git_ino: "-".to_string(),
         }
     }
-
-    /// `DOT_INIT_*` panel plus `XDG_STATE_HOME`, so live helpers
-    /// read the same globals the engine would hold post-record.
-    fn panel<'a>(&'a self, _home: &'a Path, xdg: &'a Path) -> Vec<(&'static str, &'a str)> {
-        vec![
-            ("DOT_INIT_NONCE", self.nonce.as_str()),
-            ("DOT_INIT_COMMIT", self.commit.as_str()),
-            ("DOT_INIT_IDENTITY", self.identity.as_str()),
-            ("DOT_INIT_BRANCH", self.branch.as_str()),
-            (
-                "DOT_INIT_GIT_DIR",
-                self.git_dir.to_str().expect("utf8 git dir"),
-            ),
-            ("DOT_INIT_GIT_DEV", self.git_dev.as_str()),
-            ("DOT_INIT_GIT_INO", self.git_ino.as_str()),
-            ("DOT_INIT_BACKUP", self.backup.as_str()),
-            ("XDG_STATE_HOME", xdg.to_str().expect("utf8 xdg")),
-        ]
-    }
 }
 
-/// Ask the live shell for the transaction directory under this
-/// engine's state root, then create it. Both engines derive the
-/// same relative layout from different absolute roots.
+/// Resolve and create the transaction directory through its native owner.
 fn transaction_dir(home: &Path, xdg: &Path) -> PathBuf {
-    let body = "_dot_init_transaction_dir\nprintf 'reply=%s\\n' \"$REPLY\"".to_string();
-    let env = [("XDG_STATE_HOME", xdg.to_str().expect("utf8 xdg"))];
-    let (code, stdout, _) = shell_run(home, &env, &body);
-    assert_eq!(code, 0, "transaction dir");
-    let text = String::from_utf8_lossy(&stdout);
-    let reply = text
-        .lines()
-        .find_map(|line| line.strip_prefix("reply="))
-        .expect("reply line");
-    let dir = PathBuf::from(reply);
+    let dir = PathBuf::from(
+        transaction::transaction_dir(
+            home.to_str().expect("UTF-8 fixture home"),
+            xdg.to_str().expect("UTF-8 fixture state root"),
+        )
+        .expect("transaction directory"),
+    );
     std::fs::create_dir_all(&dir).expect("make transaction");
     dir
 }
@@ -404,8 +320,7 @@ fn write_record(home: &Path, transaction: &Path, rec: &Rec, phase: &str) {
     chmod(&path, 0o600);
 }
 
-/// Stage relative path for an entry, plus its intent hash:
-/// `_dot_init_entry_stage` over `path`.
+/// Stage relative path and intent hash for an entry fixture.
 fn entry_stage(nonce: &str, path: &str) -> (String, String) {
     let hash = hash_bytes(path.as_bytes());
     let stage = match path.rfind('/') {
@@ -490,9 +405,7 @@ fn write_parent_intent(
     chmod(&file, 0o600);
 }
 
-/// Stage relative path for a parent, mirroring
-/// `_dot_init_parent_directories`: the stage sits beside the parent
-/// directory's own parent.
+/// Stage relative path for a parent fixture, placed beside the parent.
 fn parent_stage(nonce: &str, parent: &str) -> (String, String) {
     let hash = hash_bytes(parent.as_bytes());
     let stage = match parent.rfind('/') {
@@ -515,7 +428,7 @@ fn entry_ctx(rec: &Rec) -> rb::RecordCtx {
     }
 }
 
-/// One engine side of an entry row: record values, transaction
+/// One fixture side of an entry row: record values, transaction
 /// directory, and intent path for `path`.
 fn entry_side(home: &Path, xdg: &Path, commit: &str) -> (Rec, PathBuf, ()) {
     let rec = Rec::new(home, commit, "-");
@@ -525,13 +438,13 @@ fn entry_side(home: &Path, xdg: &Path, commit: &str) -> (Rec, PathBuf, ()) {
 
 #[test]
 fn entry_pending_without_stage_is_vacuous() {
-    let twins = Twins::build("e1-vacuous");
+    let case = Case::build("e1-vacuous");
     let oid = hash_bytes(b"note body");
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage) = entry_stage(&rec.nonce, path);
@@ -549,49 +462,39 @@ fn entry_pending_without_stage_is_vacuous() {
         );
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_intent = sh_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let rs_intent = rs_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_entry(
-        &twins.shell_home,
-        &sh_env,
-        &sh_intent,
-        "100644",
-        &oid,
-        Path::new(path),
-    );
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 0;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
     let rust = rb::rollback_entry(
         &deps,
-        &twins.rust_home,
-        &entry_ctx(rs_rec),
-        &rs_intent,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
         "100644",
         &oid,
         Path::new(path),
     );
     assert_parity(
         "e1",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn entry_pending_with_clean_stage_removes_it() {
-    let twins = Twins::build("e2-clean-stage");
+    let case = Case::build("e2-clean-stage");
     let oid = hash_bytes(b"note body");
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage) = entry_stage(&rec.nonce, path);
@@ -610,54 +513,45 @@ fn entry_pending_with_clean_stage_removes_it() {
         make_stage(home, &stage, Some(("entry", &rec.nonce, path)), &[]);
         sides.push((rec, transaction, stage));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, rs_stage) = &sides[1];
-    let sh_intent = sh_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let rs_intent = rs_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_entry(
-        &twins.shell_home,
-        &sh_env,
-        &sh_intent,
-        "100644",
-        &oid,
-        Path::new(path),
-    );
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, actual_stage) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(&sides[0].2));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
     let rust = rb::rollback_entry(
         &deps,
-        &twins.rust_home,
-        &entry_ctx(rs_rec),
-        &rs_intent,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
         "100644",
         &oid,
         Path::new(path),
     );
-    assert!(rust.is_ok(), "e2: port must accept");
+    assert!(rust.is_ok(), "e2: native rollback must accept");
     assert!(
-        !twins.rust_home.join(rs_stage).exists(),
-        "e2: rust stage removed"
+        !case.actual_home.join(actual_stage).exists(),
+        "e2: actual stage removed"
     );
     assert_parity(
         "e2",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn entry_pending_with_next_present_refuses() {
-    let twins = Twins::build("e3-next-present");
+    let case = Case::build("e3-next-present");
     let oid = hash_bytes(b"note body");
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage) = entry_stage(&rec.nonce, path);
@@ -681,49 +575,39 @@ fn entry_pending_with_next_present_refuses() {
         );
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_intent = sh_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let rs_intent = rs_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_entry(
-        &twins.shell_home,
-        &sh_env,
-        &sh_intent,
-        "100644",
-        &oid,
-        Path::new(path),
-    );
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
     let rust = rb::rollback_entry(
         &deps,
-        &twins.rust_home,
-        &entry_ctx(rs_rec),
-        &rs_intent,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
         "100644",
         &oid,
         Path::new(path),
     );
     assert_failure_parity(
         "e3",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn entry_staged_discards_next_and_removes_stage() {
-    let twins = Twins::build("e4-staged");
+    let case = Case::build("e4-staged");
     let oid = hash_bytes(b"note body");
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage) = entry_stage(&rec.nonce, path);
@@ -749,54 +633,45 @@ fn entry_staged_discards_next_and_removes_stage() {
         );
         sides.push((rec, transaction, stage));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, rs_stage) = &sides[1];
-    let sh_intent = sh_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let rs_intent = rs_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_entry(
-        &twins.shell_home,
-        &sh_env,
-        &sh_intent,
-        "100644",
-        &oid,
-        Path::new(path),
-    );
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, actual_stage) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(&sides[0].2));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
     let rust = rb::rollback_entry(
         &deps,
-        &twins.rust_home,
-        &entry_ctx(rs_rec),
-        &rs_intent,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
         "100644",
         &oid,
         Path::new(path),
     );
-    assert!(rust.is_ok(), "e4: port must accept");
+    assert!(rust.is_ok(), "e4: native rollback must accept");
     assert!(
-        !twins.rust_home.join(rs_stage).exists(),
-        "e4: rust stage removed"
+        !case.actual_home.join(actual_stage).exists(),
+        "e4: actual stage removed"
     );
     assert_parity(
         "e4",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn entry_staged_with_foreign_stage_refuses() {
-    let twins = Twins::build("e5-foreign-stage");
+    let case = Case::build("e5-foreign-stage");
     let oid = hash_bytes(b"note body");
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage) = entry_stage(&rec.nonce, path);
@@ -820,50 +695,40 @@ fn entry_staged_with_foreign_stage_refuses() {
         );
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_intent = sh_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let rs_intent = rs_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_entry(
-        &twins.shell_home,
-        &sh_env,
-        &sh_intent,
-        "100644",
-        &oid,
-        Path::new(path),
-    );
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
     let rust = rb::rollback_entry(
         &deps,
-        &twins.rust_home,
-        &entry_ctx(rs_rec),
-        &rs_intent,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
         "100644",
         &oid,
         Path::new(path),
     );
     assert_failure_parity(
         "e5",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn entry_prepared_with_matching_next_removes_both() {
-    let twins = Twins::build("e6-prepared-match");
+    let case = Case::build("e6-prepared-match");
     let content = b"tracked content";
     let oid = hash_bytes(content);
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         git(&["init", rec.git_dir.to_str().expect("utf8 git dir")]);
@@ -893,55 +758,46 @@ fn entry_prepared_with_matching_next_removes_both() {
         );
         sides.push((rec, transaction, stage));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, rs_stage) = &sides[1];
-    let sh_intent = sh_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let rs_intent = rs_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_entry(
-        &twins.shell_home,
-        &sh_env,
-        &sh_intent,
-        "100644",
-        &oid,
-        Path::new(path),
-    );
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, actual_stage) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(&sides[0].2));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
     let rust = rb::rollback_entry(
         &deps,
-        &twins.rust_home,
-        &entry_ctx(rs_rec),
-        &rs_intent,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
         "100644",
         &oid,
         Path::new(path),
     );
-    assert!(rust.is_ok(), "e6: port must accept");
+    assert!(rust.is_ok(), "e6: native rollback must accept");
     assert!(
-        !twins.rust_home.join(rs_stage).exists(),
-        "e6: rust stage removed"
+        !case.actual_home.join(actual_stage).exists(),
+        "e6: actual stage removed"
     );
     assert_parity(
         "e6",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn entry_prepared_with_swapped_next_refuses() {
-    let twins = Twins::build("e7-swapped-next");
+    let case = Case::build("e7-swapped-next");
     let content = b"tracked content";
     let oid = hash_bytes(content);
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         git(&["init", rec.git_dir.to_str().expect("utf8 git dir")]);
@@ -969,49 +825,39 @@ fn entry_prepared_with_swapped_next_refuses() {
         );
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_intent = sh_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let rs_intent = rs_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_entry(
-        &twins.shell_home,
-        &sh_env,
-        &sh_intent,
-        "100644",
-        &oid,
-        Path::new(path),
-    );
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
     let rust = rb::rollback_entry(
         &deps,
-        &twins.rust_home,
-        &entry_ctx(rs_rec),
-        &rs_intent,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
         "100644",
         &oid,
         Path::new(path),
     );
     assert_failure_parity(
         "e7",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn entry_prepared_with_changed_next_refuses() {
-    let twins = Twins::build("e8-changed-next");
+    let case = Case::build("e8-changed-next");
     let oid = hash_bytes(b"original content");
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         git(&["init", rec.git_dir.to_str().expect("utf8 git dir")]);
@@ -1041,49 +887,39 @@ fn entry_prepared_with_changed_next_refuses() {
         );
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_intent = sh_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let rs_intent = rs_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_entry(
-        &twins.shell_home,
-        &sh_env,
-        &sh_intent,
-        "100644",
-        &oid,
-        Path::new(path),
-    );
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
     let rust = rb::rollback_entry(
         &deps,
-        &twins.rust_home,
-        &entry_ctx(rs_rec),
-        &rs_intent,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
         "100644",
         &oid,
         Path::new(path),
     );
     assert_failure_parity(
         "e8",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn entry_pending_with_live_target_refuses() {
-    let twins = Twins::build("e9-live-target");
+    let case = Case::build("e9-live-target");
     let oid = hash_bytes(b"note body");
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage) = entry_stage(&rec.nonce, path);
@@ -1102,50 +938,40 @@ fn entry_pending_with_live_target_refuses() {
         write(home, path, b"foreign content");
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_intent = sh_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let rs_intent = rs_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_entry(
-        &twins.shell_home,
-        &sh_env,
-        &sh_intent,
-        "100644",
-        &oid,
-        Path::new(path),
-    );
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
     let rust = rb::rollback_entry(
         &deps,
-        &twins.rust_home,
-        &entry_ctx(rs_rec),
-        &rs_intent,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
         "100644",
         &oid,
         Path::new(path),
     );
     assert_failure_parity(
         "e9",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn entry_prepared_removes_tracked_target_and_stage() {
-    let twins = Twins::build("e10-tracked-target");
+    let case = Case::build("e10-tracked-target");
     let content = b"tracked content";
     let oid = hash_bytes(content);
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         git(&["init", rec.git_dir.to_str().expect("utf8 git dir")]);
@@ -1171,163 +997,141 @@ fn entry_prepared_removes_tracked_target_and_stage() {
         );
         sides.push((rec, transaction, stage));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, rs_stage) = &sides[1];
-    let sh_intent = sh_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let rs_intent = rs_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_entry(
-        &twins.shell_home,
-        &sh_env,
-        &sh_intent,
-        "100644",
-        &oid,
-        Path::new(path),
-    );
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, actual_stage) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(&sides[0].2));
+    remove_fixture(&case.expected_home.join(path));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
     let rust = rb::rollback_entry(
         &deps,
-        &twins.rust_home,
-        &entry_ctx(rs_rec),
-        &rs_intent,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
         "100644",
         &oid,
         Path::new(path),
     );
-    assert!(rust.is_ok(), "e10: port must accept");
+    assert!(rust.is_ok(), "e10: native rollback must accept");
     assert!(
-        !twins.rust_home.join(path).exists(),
-        "e10: rust target removed"
+        !case.actual_home.join(path).exists(),
+        "e10: actual target removed"
     );
     assert!(
-        !twins.rust_home.join(rs_stage).exists(),
-        "e10: rust stage removed"
+        !case.actual_home.join(actual_stage).exists(),
+        "e10: actual stage removed"
     );
     assert_parity(
         "e10",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn entry_missing_intent_refuses() {
-    let twins = Twins::build("e12-missing-intent");
+    let case = Case::build("e12-missing-intent");
     let oid = hash_bytes(b"note body");
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_intent = sh_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let rs_intent = rs_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_entry(
-        &twins.shell_home,
-        &sh_env,
-        &sh_intent,
-        "100644",
-        &oid,
-        Path::new(path),
-    );
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
     let rust = rb::rollback_entry(
         &deps,
-        &twins.rust_home,
-        &entry_ctx(rs_rec),
-        &rs_intent,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
         "100644",
         &oid,
         Path::new(path),
     );
     assert_failure_parity(
         "e12",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn parents_without_intents_is_vacuous() {
-    let twins = Twins::build("p1-vacuous");
+    let case = Case::build("p1-vacuous");
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_parents(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_parents(&deps, &twins.rust_home, rs_tx);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 0;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_parents(&deps, &case.actual_home, actual_tx);
     assert_parity(
         "p1",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn parents_pending_without_stage_is_vacuous() {
-    let twins = Twins::build("p2-pending-vacuous");
+    let case = Case::build("p2-pending-vacuous");
     let parent = "docs";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage_rel) = parent_stage(&rec.nonce, parent);
         write_parent_intent(&transaction, parent, "pending", &stage_rel, "-", "-", "-");
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_parents(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_parents(&deps, &twins.rust_home, rs_tx);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 0;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_parents(&deps, &case.actual_home, actual_tx);
     assert_parity(
         "p2",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn parents_pending_with_clean_stage_removes_it() {
-    let twins = Twins::build("p3-clean-stage");
+    let case = Case::build("p3-clean-stage");
     let parent = "docs";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage_rel) = parent_stage(&rec.nonce, parent);
@@ -1335,36 +1139,35 @@ fn parents_pending_with_clean_stage_removes_it() {
         make_stage(home, &stage_rel, Some(("parent", &rec.nonce, parent)), &[]);
         sides.push((rec, transaction, stage_rel));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, rs_stage) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_parents(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_parents(&deps, &twins.rust_home, rs_tx);
-    assert!(rust.is_ok(), "p3: port must accept");
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, actual_stage) = &sides[1];
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(&sides[0].2));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_parents(&deps, &case.actual_home, actual_tx);
+    assert!(rust.is_ok(), "p3: native rollback must accept");
     assert!(
-        !twins.rust_home.join(rs_stage).exists(),
-        "p3: rust stage removed"
+        !case.actual_home.join(actual_stage).exists(),
+        "p3: actual stage removed"
     );
     assert_parity(
         "p3",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn parents_prepared_with_claimed_stage_cleans_up() {
-    let twins = Twins::build("p4-prepared-stage");
+    let case = Case::build("p4-prepared-stage");
     let parent = "docs";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage_rel) = parent_stage(&rec.nonce, parent);
@@ -1382,36 +1185,35 @@ fn parents_prepared_with_claimed_stage_cleans_up() {
         );
         sides.push((rec, transaction, stage_rel));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, rs_stage) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_parents(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_parents(&deps, &twins.rust_home, rs_tx);
-    assert!(rust.is_ok(), "p4: port must accept");
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, actual_stage) = &sides[1];
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(&sides[0].2));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_parents(&deps, &case.actual_home, actual_tx);
+    assert!(rust.is_ok(), "p4: native rollback must accept");
     assert!(
-        !twins.rust_home.join(rs_stage).exists(),
-        "p4: rust stage removed"
+        !case.actual_home.join(actual_stage).exists(),
+        "p4: actual stage removed"
     );
     assert_parity(
         "p4",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn parents_prepared_with_live_target_removes_it() {
-    let twins = Twins::build("p5-live-target");
+    let case = Case::build("p5-live-target");
     let parent = "docs";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage_rel) = parent_stage(&rec.nonce, parent);
@@ -1431,526 +1233,295 @@ fn parents_prepared_with_live_target_removes_it() {
         );
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_parents(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_parents(&deps, &twins.rust_home, rs_tx);
-    assert!(rust.is_ok(), "p5: port must accept");
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(parent));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_parents(&deps, &case.actual_home, actual_tx);
+    assert!(rust.is_ok(), "p5: native rollback must accept");
     assert!(
-        !twins.rust_home.join(parent).exists(),
-        "p5: rust target removed"
+        !case.actual_home.join(parent).exists(),
+        "p5: actual target removed"
     );
     assert_parity(
         "p5",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
-/// Pull the `reply=<bytes>` line out of a helper run.
-fn reply_of(stdout: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(stdout);
-    let line = text
-        .lines()
-        .find(|line| line.strip_prefix("reply=").is_some())
-        .expect("reply line");
-    line.as_bytes()["reply=".len()..].to_vec()
-}
-
-/// Refusal error for a live helper closure, naming the helper so a
-/// row failure pinpoints the gate.
-fn refused(helper: &'static str) -> dot::Error {
-    let message = match helper {
-        "entry_intent" => "live entry_intent refused",
-        "delete_park_path" => "live delete_park_path refused",
-        "remove_parked_leaf" => "live remove_parked_leaf refused",
-        "entry_stage_valid" => "live entry_stage_valid refused",
-        "stage_claim_matches" => "live stage_claim_matches refused",
-        "entry_stage_only_next" => "live entry_stage_only_next refused",
-        "discard_staged_next" => "live discard_staged_next refused",
-        "candidate_matches_git" => "live candidate_matches_git refused",
-        "stage_claim_remove" => "live stage_claim_remove refused",
-        "parent_record" => "live parent_record refused",
-        "safe_relative_path" => "live safe_relative_path refused",
-        "remove_parked_parent" => "live remove_parked_parent refused",
-        "private_directory_matches" => "live private_directory_matches refused",
-        "stage_claim_only" => "live stage_claim_only refused",
-        "private_empty_directory_matches" => "live private_empty_directory_matches refused",
-        "remove_parked_tree" => "live remove_parked_tree refused",
-        "transaction_dir" => "live transaction_dir refused",
-        "read_record" => "live read_record refused",
-        "restore_backups" => "live restore_backups refused",
-        _ => "live shell helper refused",
+/// Bind rollback to the same native collaborators used by the production engine.
+fn native_deps<'a>(home: &'a Path, xdg: &'a Path, rec: &'a Rec) -> rb::RollbackDeps<'a> {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let home_text = home.to_str().expect("UTF-8 fixture home");
+    let xdg_text = xdg.to_str().expect("UTF-8 fixture state root");
+    let matched = |ok: bool, message: &'static str| {
+        if ok {
+            Ok(())
+        } else {
+            Err(dot::Error::Usage { message })
+        }
     };
-    dot::Error::Usage { message }
-}
-
-/// Twenty live closures running the real shell helpers in engine
-/// mode: the differential oracle for the port's orchestration. Each
-/// closure mirrors one out-of-scope call site argument for
-/// argument; `$REPLY`-carried outputs surface as return values.
-fn live_deps<'a>(home: &'a Path, xdg: &'a Path, rec: &'a Rec) -> rb::RollbackDeps<'a> {
     rb::RollbackDeps {
-        entry_intent: Box::new(|intent, mode, oid, path| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_entry_intent {} {} {} {}\nprintf 'reply=%s\\n' \"$REPLY\"",
-                sq(intent.as_os_str().as_bytes()),
-                sq(mode.as_bytes()),
-                sq(oid.as_bytes()),
-                sq(path.as_os_str().as_bytes()),
-            );
-            let (code, stdout, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(reply_of(&stdout))
-            } else {
-                Err(refused("entry_intent"))
-            }
+        entry_intent: Box::new(move |intent, mode, oid, path| {
+            let path = path.to_str().ok_or(dot::Error::Usage {
+                message: "entry path is not UTF-8",
+            })?;
+            entry::entry_intent(intent, mode, oid, path, home, &rec.nonce, source_root).map(
+                |found| {
+                    format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        found.phase,
+                        found.stage,
+                        found.dev,
+                        found.ino,
+                        found.next_dev,
+                        found.next_ino
+                    )
+                    .into_bytes()
+                },
+            )
         }),
-        delete_park_path: Box::new(|target, kind, key| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_delete_park_path {} {} {}\nprintf 'reply=%s\\n' \"$REPLY\"",
-                sq(target.as_os_str().as_bytes()),
-                sq(kind.as_bytes()),
-                sq(key),
-            );
-            let (code, stdout, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(PathBuf::from(std::ffi::OsString::from_vec(reply_of(
-                    &stdout,
-                ))))
-            } else {
-                Err(refused("delete_park_path"))
-            }
+        delete_park_path: Box::new(move |target, kind, key| {
+            let key = std::str::from_utf8(key).map_err(|_| dot::Error::Usage {
+                message: "park key is not UTF-8",
+            })?;
+            delete::delete_park_path(target, kind, key, &rec.nonce)
         }),
-        remove_parked_leaf: Box::new(|target, park, identity, git_dir, commit, mode, oid| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_delete_parked_generation {} {} leaf _dot_init_leaf_delete_matches {} {} {} {} {}",
-                sq(target.as_os_str().as_bytes()),
-                sq(park.as_os_str().as_bytes()),
-                sq(identity.as_bytes()),
-                sq(git_dir.as_os_str().as_bytes()),
-                sq(commit.as_bytes()),
-                sq(mode.as_bytes()),
-                sq(oid.as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("remove_parked_leaf"))
-            }
-        }),
-        entry_stage_valid: Box::new(|stage, identity| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_entry_stage_valid {} {}",
-                sq(stage.as_os_str().as_bytes()),
-                sq(identity.unwrap_or_default().as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("entry_stage_valid"))
-            }
-        }),
-        stage_claim_matches: Box::new(|stage, kind, path| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_stage_claim_matches {} {} {}",
-                sq(stage.as_os_str().as_bytes()),
-                sq(kind.as_bytes()),
-                sq(path.as_os_str().as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("stage_claim_matches"))
-            }
-        }),
-        entry_stage_only_next: Box::new(|stage| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_entry_stage_only_next {}",
-                sq(stage.as_os_str().as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("entry_stage_only_next"))
-            }
-        }),
-        discard_staged_next: Box::new(|stage| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_discard_staged_next {}",
-                sq(stage.as_os_str().as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("discard_staged_next"))
-            }
-        }),
-        path_identity: Box::new(|path| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "value=$(_dot_path_identity {} 2>/dev/null || true)\nprintf 'reply=%s\\n' \"$value\"",
-                sq(path.as_os_str().as_bytes()),
-            );
-            let (_, stdout, _) = shell_run(home, &env, &body);
-            String::from_utf8(reply_of(&stdout)).expect("identity text")
-        }),
-        candidate_matches_git: Box::new(|git_dir, commit, mode, oid, rel| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_candidate_matches_git {} {} {} {} {}",
-                sq(git_dir.as_os_str().as_bytes()),
-                sq(commit.as_bytes()),
-                sq(mode.as_bytes()),
-                sq(oid.as_bytes()),
-                sq(rel.as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("candidate_matches_git"))
-            }
-        }),
-        stage_claim_remove: Box::new(|stage, kind, path| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_stage_claim_remove {} {} {}",
-                sq(stage.as_os_str().as_bytes()),
-                sq(kind.as_bytes()),
-                sq(path.as_os_str().as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("stage_claim_remove"))
-            }
-        }),
-        parent_record: Box::new(|transaction, parent| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_parent_record {} {}\nprintf 'reply=%s\\n' \"$REPLY\"",
-                sq(transaction.as_os_str().as_bytes()),
-                sq(parent.as_os_str().as_bytes()),
-            );
-            let (code, stdout, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(reply_of(&stdout))
-            } else {
-                Err(refused("parent_record"))
-            }
-        }),
-        safe_relative_path: Box::new(|parent| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_safe_relative_path {}",
-                sq(parent.as_os_str().as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("safe_relative_path"))
-            }
-        }),
-        remove_parked_parent: Box::new(|target, park, identity, mode| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_delete_parked_generation {} {} parent _dot_init_parent_delete_matches {} {}",
-                sq(target.as_os_str().as_bytes()),
-                sq(park.as_os_str().as_bytes()),
-                sq(identity.as_bytes()),
-                sq(mode.as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("remove_parked_parent"))
-            }
-        }),
-        private_directory_matches: Box::new(|stage, identity, mode| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_private_directory_matches {} {} {}",
-                sq(stage.as_os_str().as_bytes()),
-                sq(identity.unwrap_or_default().as_bytes()),
-                sq(mode.unwrap_or_default().as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("private_directory_matches"))
-            }
-        }),
-        stage_claim_only: Box::new(|stage| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_stage_claim_only {}",
-                sq(stage.as_os_str().as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("stage_claim_only"))
-            }
-        }),
-        private_empty_directory_matches: Box::new(|stage, identity, mode| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_private_empty_directory_matches {} {} {}",
-                sq(stage.as_os_str().as_bytes()),
-                sq(identity.unwrap_or_default().as_bytes()),
-                sq(mode.unwrap_or_default().as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("private_empty_directory_matches"))
-            }
-        }),
-        remove_parked_tree: Box::new(|git_dir, park, identity| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_delete_parked_generation {} {} tree _dot_init_git_delete_matches {}",
-                sq(git_dir.as_os_str().as_bytes()),
-                sq(park.as_os_str().as_bytes()),
-                sq(identity.as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("remove_parked_tree"))
-            }
-        }),
-        transaction_dir: Box::new(|| {
-            let env = rec.panel(home, xdg);
-            let body = "_dot_init_transaction_dir\nprintf 'reply=%s\\n' \"$REPLY\"";
-            let (code, stdout, _) = shell_run(home, &env, body);
-            if code == 0 {
-                Ok(PathBuf::from(std::ffi::OsString::from_vec(reply_of(
-                    &stdout,
-                ))))
-            } else {
-                Err(refused("transaction_dir"))
-            }
-        }),
-        read_record: Box::new(|record| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_read_record {}\nprintf 'rec=%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
-                 \"$DOT_INIT_PHASE\" \"$DOT_INIT_BACKUP\" \"$DOT_INIT_NONCE\" \
-                 \"$DOT_INIT_GIT_DIR\" \"$DOT_INIT_COMMIT\" \"$DOT_INIT_GIT_DEV:$DOT_INIT_GIT_INO\"",
-                sq(record.as_os_str().as_bytes()),
-            );
-            let (code, stdout, _) = shell_run(home, &env, &body);
-            if code != 0 {
-                return Err(refused("read_record"));
-            }
-            let text = String::from_utf8_lossy(&stdout);
-            let line = text
-                .lines()
-                .find_map(|line| line.strip_prefix("rec="))
-                .expect("rec line");
-            let mut fields = line.splitn(6, '\t');
-            let take = |fields: &mut std::str::SplitN<'_, char>| {
-                fields.next().unwrap_or_default().to_string()
+        remove_parked_leaf: Box::new(move |target, park, identity, git_dir, commit, mode, oid| {
+            let verifier = |candidate: &Path| {
+                delete::leaf_delete_matches(candidate, identity, git_dir, commit, mode, oid, home)
             };
-            let phase = take(&mut fields);
-            let backup = take(&mut fields);
-            let nonce = take(&mut fields);
-            let git_dir = take(&mut fields);
-            let commit = take(&mut fields);
-            let git_identity = take(&mut fields);
-            Ok(rb::RecordCtx {
-                phase,
-                backup: PathBuf::from(backup),
-                nonce,
-                git_dir: PathBuf::from(git_dir),
-                commit,
-                git_identity,
+            let mut cache = temp::MoveCache::default();
+            matched(
+                delete::delete_parked_generation(target, park, "leaf", &verifier, &mut cache),
+                "parked leaf does not match",
+            )
+        }),
+        entry_stage_valid: Box::new(move |stage, expected| {
+            matched(
+                entry::entry_stage_valid(stage, expected),
+                "entry stage is not valid",
+            )
+        }),
+        stage_claim_matches: Box::new(move |stage, kind, path| {
+            let path = path.to_str().ok_or(dot::Error::Usage {
+                message: "claim path is not UTF-8",
+            })?;
+            matched(
+                entry::stage_claim_matches(stage, kind, path, &rec.nonce, source_root),
+                "stage claim does not match",
+            )
+        }),
+        entry_stage_only_next: Box::new(move |stage| {
+            matched(
+                entry::entry_stage_only_next(stage),
+                "stage holds more than next",
+            )
+        }),
+        discard_staged_next: Box::new(entry::discard_staged_next),
+        path_identity: Box::new(|path| {
+            temp::path_identity(path)
+                .ok()
+                .map(temp::identity_string)
+                .unwrap_or_default()
+        }),
+        candidate_matches_git: Box::new(move |git_dir, commit, mode, oid, relative| {
+            matched(
+                delete::candidate_matches_git(git_dir, commit, mode, oid, relative, home),
+                "candidate does not match git",
+            )
+        }),
+        stage_claim_remove: Box::new(move |stage, kind, path| {
+            let path = path.to_str().ok_or(dot::Error::Usage {
+                message: "claim path is not UTF-8",
+            })?;
+            entry::stage_claim_remove(stage, kind, path, &rec.nonce, source_root)
+        }),
+        parent_record: Box::new(move |transaction, parent| {
+            let parent = parent.to_str().ok_or(dot::Error::Usage {
+                message: "parent path is not UTF-8",
+            })?;
+            record::parent_record(transaction, parent, home, &rec.nonce, source_root).map(|found| {
+                format!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    found.phase, found.stage, found.dev, found.ino, found.mode
+                )
+                .into_bytes()
             })
         }),
-        restore_backups: Box::new(|backup| {
-            let env = rec.panel(home, xdg);
-            let body = format!(
-                "_dot_init_restore_backups {}",
-                sq(backup.as_os_str().as_bytes()),
-            );
-            let (code, _, _) = shell_run(home, &env, &body);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(refused("restore_backups"))
-            }
+        safe_relative_path: Box::new(move |parent| {
+            matched(
+                safe_path::safe_relative_path(parent.as_os_str().as_bytes()),
+                "parent path is not safe",
+            )
+        }),
+        remove_parked_parent: Box::new(move |target, park, identity, mode| {
+            let verifier =
+                |candidate: &Path| delete::parent_delete_matches(candidate, identity, mode);
+            let mut cache = temp::MoveCache::default();
+            matched(
+                delete::delete_parked_generation(target, park, "parent", &verifier, &mut cache),
+                "parked parent does not match",
+            )
+        }),
+        private_directory_matches: Box::new(move |stage, identity, mode| {
+            matched(
+                delete::private_directory_matches(stage, identity, mode),
+                "private directory does not match",
+            )
+        }),
+        stage_claim_only: Box::new(move |stage| {
+            matched(entry::stage_claim_only(stage), "stage is not claim-only")
+        }),
+        private_empty_directory_matches: Box::new(move |stage, identity, mode| {
+            matched(
+                delete::private_empty_directory_matches(stage, identity, mode),
+                "private directory is not empty",
+            )
+        }),
+        remove_parked_tree: Box::new(move |git_dir, park, identity| {
+            let verifier = |candidate: &Path| {
+                delete::git_delete_matches(
+                    candidate,
+                    identity,
+                    &rec.nonce,
+                    &rec.commit,
+                    &rec.identity,
+                    &rec.branch,
+                )
+            };
+            let mut cache = temp::MoveCache::default();
+            matched(
+                delete::delete_parked_generation(git_dir, park, "tree", &verifier, &mut cache),
+                "parked git tree does not match",
+            )
+        }),
+        transaction_dir: Box::new(move || {
+            transaction::transaction_dir(home_text, xdg_text)
+                .map(PathBuf::from)
+                .map_err(|_| dot::Error::Command {
+                    command: "resolve transaction directory".to_string(),
+                    status: None,
+                })
+        }),
+        read_record: Box::new(move |path| {
+            record::read_record(path, home).map(|journal| rb::RecordCtx {
+                phase: journal.phase,
+                backup: PathBuf::from(journal.backup),
+                nonce: journal.nonce,
+                git_dir: PathBuf::from(journal.git_dir),
+                commit: journal.commit,
+                git_identity: format!("{}:{}", journal.git_dev, journal.git_ino),
+            })
+        }),
+        restore_backups: Box::new(move |backup| {
+            let state_matches = |target: &Path,
+                                 kind: &str,
+                                 dev: &str,
+                                 ino: &str,
+                                 mode: &str,
+                                 size: &str,
+                                 value: &str| {
+                candidate::path_state_matches(target, kind, dev, ino, mode, size, value)
+            };
+            let mut cache = temp::MoveCache::default();
+            plan::restore_backups(backup, home, &state_matches, &mut cache).map_err(|_| {
+                dot::Error::Command {
+                    command: "restore backups".to_string(),
+                    status: None,
+                }
+            })
         }),
     }
 }
 
-/// Oracle probe for `_dot_init_rollback_entry`, in engine mode.
-fn oracle_entry(
-    home: &Path,
-    env: &[(&str, &str)],
-    intent: &Path,
-    mode: &str,
-    oid: &str,
-    path: &Path,
-) -> (i32, Vec<u8>, Vec<u8>) {
-    let body = format!(
-        "_dot_init_rollback_entry {} {} {} {}",
-        sq(intent.as_os_str().as_bytes()),
-        sq(mode.as_bytes()),
-        sq(oid.as_bytes()),
-        sq(path.as_os_str().as_bytes()),
-    );
-    shell_run(home, env, &body)
-}
-
-/// Oracle probe for `_dot_init_rollback_parents`, in engine mode.
-fn oracle_parents(
-    home: &Path,
-    env: &[(&str, &str)],
-    transaction: &Path,
-) -> (i32, Vec<u8>, Vec<u8>) {
-    let body = format!(
-        "_dot_init_rollback_parents {}",
-        sq(transaction.as_os_str().as_bytes()),
-    );
-    shell_run(home, env, &body)
-}
-
-/// Oracle probe for `_dot_init_rollback_published`, in engine mode.
-fn oracle_published(
-    home: &Path,
-    env: &[(&str, &str)],
-    transaction: &Path,
-) -> (i32, Vec<u8>, Vec<u8>) {
-    let body = format!(
-        "_dot_init_rollback_published {}",
-        sq(transaction.as_os_str().as_bytes()),
-    );
-    shell_run(home, env, &body)
-}
-
-/// Oracle probe for `_dot_init_rollback`, in engine mode.
-fn oracle_rollback(home: &Path, env: &[(&str, &str)]) -> (i32, Vec<u8>, Vec<u8>) {
-    shell_run(home, env, "_dot_init_rollback")
-}
-
-/// The port's verdict as a shell-style code.
-fn rust_code(result: &Result<(), dot::Error>) -> i32 {
+/// Convert the native result to the command status asserted by each row.
+fn result_code(result: &Result<(), dot::Error>) -> i32 {
     if result.is_ok() { 0 } else { 1 }
 }
 
-/// Byte-compare one success row: same verdict, silent streams on
-/// both sides, same end-state inventory over both engine roots.
-/// The oracle's stdout must hold exactly its own `code=` report
-/// line (the functions print nothing themselves).
+/// Assert the literal status and full expected filesystem inventory.
 fn assert_parity(
     name: &str,
-    shell: (i32, Vec<u8>, Vec<u8>),
-    rust: &Result<(), dot::Error>,
-    shell_stderr: &[u8],
-    shell_inv: &[u8],
-    rust_inv: &[u8],
+    expected_code: i32,
+    actual: &Result<(), dot::Error>,
+    expected_stderr: &[u8],
+    expected_inv: &[u8],
+    actual_inv: &[u8],
 ) {
-    let (code, stdout, _) = shell;
-    assert_eq!(code, rust_code(rust), "{name}: verdict");
-    assert_eq!(
-        stdout,
-        format!("code={code}\n").into_bytes(),
-        "{name}: oracle stdout"
-    );
-    assert_eq!(shell_stderr, &[][..], "{name}: oracle stderr");
-    assert_eq!(shell_inv, rust_inv, "{name}: end state");
+    assert_eq!(result_code(actual), expected_code, "{name}: status");
+    assert_eq!(expected_stderr, b"", "{name}: stderr");
+    assert_eq!(actual_inv, expected_inv, "{name}: complete end state");
 }
 
-/// Failure-row comparison with an exact expected oracle stderr
-/// (empty, or one absorbed `dot init: ...` diagnostic line). The
-/// port absorbs diagnostics into `Err`, so only the verdict and
-/// the end state cross over.
+/// Assert a literal refusal status, diagnostic contract, and complete state.
 fn assert_failure_parity(
     name: &str,
-    shell: (i32, Vec<u8>, Vec<u8>),
-    rust: &Result<(), dot::Error>,
+    expected_code: i32,
+    actual: &Result<(), dot::Error>,
     expected_stderr: &[u8],
-    shell_inv: &[u8],
-    rust_inv: &[u8],
+    expected_inv: &[u8],
+    actual_inv: &[u8],
 ) {
-    let (code, stdout, stderr) = shell;
-    assert_ne!(code, 0, "{name}: oracle must refuse");
-    assert!(rust.is_err(), "{name}: port must refuse");
-    assert_eq!(
-        stdout,
-        format!("code={code}\n").into_bytes(),
-        "{name}: oracle stdout"
-    );
-    assert_eq!(stderr, expected_stderr, "{name}: oracle stderr");
-    assert_eq!(shell_inv, rust_inv, "{name}: end state");
+    assert_ne!(expected_code, 0, "{name}: expected refusal status");
+    assert!(actual.is_err(), "{name}: native rollback must refuse");
+    assert_eq!(actual_inv, expected_inv, "{name}: complete refusal state");
+    if let Some(message) = expected_stderr
+        .strip_prefix(b"dot init: ")
+        .and_then(|line| line.strip_suffix(b"\n"))
+    {
+        let actual_message = match actual.as_ref().expect_err("refusal") {
+            dot::Error::Usage { message } => message.as_bytes(),
+            _ => b"",
+        };
+        assert_eq!(actual_message, message, "{name}: diagnostic");
+    } else {
+        assert_eq!(expected_stderr, b"", "{name}: silent refusal");
+    }
 }
 
 #[test]
 fn parents_settled_intent_refuses() {
-    let twins = Twins::build("p6-settled");
+    let case = Case::build("p6-settled");
     let parent = "docs";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage_rel) = parent_stage(&rec.nonce, parent);
         write_parent_intent(&transaction, parent, "staged", &stage_rel, "-", "-", "-");
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_parents(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_parents(&deps, &twins.rust_home, rs_tx);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_parents(&deps, &case.actual_home, actual_tx);
     assert_failure_parity(
         "p6",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn parents_escaping_intent_refuses() {
-    let twins = Twins::build("p7-escape");
+    let case = Case::build("p7-escape");
     let parent = "../evil";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let hash = hash_bytes(parent.as_bytes());
@@ -1958,31 +1529,29 @@ fn parents_escaping_intent_refuses() {
         write_parent_intent(&transaction, parent, "pending", &stage_rel, "-", "-", "-");
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_parents(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_parents(&deps, &twins.rust_home, rs_tx);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_parents(&deps, &case.actual_home, actual_tx);
     assert_failure_parity(
         "p7",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn parents_temporary_intent_is_skipped() {
-    let twins = Twins::build("p8-tmp-skip");
+    let case = Case::build("p8-tmp-skip");
     let parent = "docs";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage_rel) = parent_stage(&rec.nonce, parent);
@@ -1995,31 +1564,29 @@ fn parents_temporary_intent_is_skipped() {
         .expect("write tmp");
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_parents(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_parents(&deps, &twins.rust_home, rs_tx);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 0;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_parents(&deps, &case.actual_home, actual_tx);
     assert_parity(
         "p8",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn parents_stage_with_live_target_refuses() {
-    let twins = Twins::build("p9-target-wins");
+    let case = Case::build("p9-target-wins");
     let parent = "docs";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage_rel) = parent_stage(&rec.nonce, parent);
@@ -2029,26 +1596,24 @@ fn parents_stage_with_live_target_refuses() {
         std::fs::create_dir_all(&target).expect("make target");
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_parents(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_parents(&deps, &twins.rust_home, rs_tx);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_parents(&deps, &case.actual_home, actual_tx);
     assert_failure_parity(
         "p9",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn parents_process_in_reverse_order() {
-    let twins = Twins::build("p10-reverse-order");
+    let case = Case::build("p10-reverse-order");
     let candidates = ["ord-alpha", "ord-beta", "ord-gamma", "ord-delta"];
     let mut hashes: Vec<(&str, String)> = candidates
         .iter()
@@ -2058,8 +1623,8 @@ fn parents_process_in_reverse_order() {
     let (hi, lo) = (hashes[0].0, hashes[1].0);
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         for parent in [hi, lo] {
@@ -2071,21 +1636,19 @@ fn parents_process_in_reverse_order() {
         std::fs::create_dir_all(&target).expect("make target");
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_parents(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_parents(&deps, &twins.rust_home, rs_tx);
-    assert!(rust.is_err(), "p10: port must refuse on {lo}");
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_parents(&deps, &case.actual_home, actual_tx);
+    assert!(rust.is_err(), "p10: native rollback must refuse on {lo}");
     assert_failure_parity(
         "p10",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
@@ -2115,7 +1678,7 @@ fn write_tree(transaction: &Path, rows: &[(&str, &str, &str)]) {
 /// the engine stages bare generations (then flips `core.bare`
 /// off), so the marker and branch tip live directly under the git
 /// directory. Loose plumbing objects plus fixed dates keep every
-/// byte identical across engines so inventories still compare.
+/// byte identical across fixture roots so inventories still compare.
 /// (`core.worktree` stays unset: nothing in this chapter reads it.)
 fn make_generation(rec: &Rec) -> String {
     let git_dir = rec.git_dir.to_str().expect("utf8 git dir");
@@ -2176,41 +1739,39 @@ fn make_generation(rec: &Rec) -> String {
 
 #[test]
 fn published_without_tree_is_vacuous() {
-    let twins = Twins::build("q1-vacuous");
+    let case = Case::build("q1-vacuous");
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_published(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_published(&deps, &twins.rust_home, &full_ctx(rs_rec), rs_tx);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 0;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_published(&deps, &case.actual_home, &full_ctx(actual_rec), actual_tx);
     assert_parity(
         "q1",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn published_rolls_back_tree_entries() {
-    let twins = Twins::build("q2-tree-entry");
+    let case = Case::build("q2-tree-entry");
     let oid = hash_bytes(b"note body");
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage) = entry_stage(&rec.nonce, path);
@@ -2230,37 +1791,36 @@ fn published_rolls_back_tree_entries() {
         write_tree(&transaction, &[("100644", &oid, path)]);
         sides.push((rec, transaction, stage));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, rs_stage) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_published(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_published(&deps, &twins.rust_home, &full_ctx(rs_rec), rs_tx);
-    assert!(rust.is_ok(), "q2: port must accept");
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, actual_stage) = &sides[1];
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(&sides[0].2));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_published(&deps, &case.actual_home, &full_ctx(actual_rec), actual_tx);
+    assert!(rust.is_ok(), "q2: native rollback must accept");
     assert!(
-        !twins.rust_home.join(rs_stage).exists(),
-        "q2: rust stage removed"
+        !case.actual_home.join(actual_stage).exists(),
+        "q2: actual stage removed"
     );
     assert_parity(
         "q2",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn published_skips_entries_without_intent() {
-    let twins = Twins::build("q3-skip-missing");
+    let case = Case::build("q3-skip-missing");
     let oid_a = hash_bytes(b"a body");
     let oid_b = hash_bytes(b"b body");
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage_a) = entry_stage(&rec.nonce, "a.txt");
@@ -2283,35 +1843,34 @@ fn published_skips_entries_without_intent() {
         );
         sides.push((rec, transaction, stage_a));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, rs_stage) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_published(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_published(&deps, &twins.rust_home, &full_ctx(rs_rec), rs_tx);
-    assert!(rust.is_ok(), "q3: port must accept");
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, actual_stage) = &sides[1];
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(&sides[0].2));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_published(&deps, &case.actual_home, &full_ctx(actual_rec), actual_tx);
+    assert!(rust.is_ok(), "q3: native rollback must accept");
     assert!(
-        !twins.rust_home.join(rs_stage).exists(),
-        "q3: rust stage removed"
+        !case.actual_home.join(actual_stage).exists(),
+        "q3: actual stage removed"
     );
     assert_parity(
         "q3",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn published_foreign_container_refuses() {
-    let twins = Twins::build("q4-foreign-container");
+    let case = Case::build("q4-foreign-container");
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let backup = home.join(".dot-backup").to_str().expect("utf8").to_string();
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
@@ -2326,30 +1885,28 @@ fn published_foreign_container_refuses() {
         );
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_published(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_published(&deps, &twins.rust_home, &full_ctx(rs_rec), rs_tx);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_published(&deps, &case.actual_home, &full_ctx(actual_rec), actual_tx);
     assert_failure_parity(
         "q4",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn published_owned_container_is_removed() {
-    let twins = Twins::build("q5-owned-container");
+    let case = Case::build("q5-owned-container");
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let backup = home.join(".dot-backup").to_str().expect("utf8").to_string();
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
@@ -2361,31 +1918,30 @@ fn published_owned_container_is_removed() {
         write(&container, "identity", marker.as_bytes());
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_published(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_published(&deps, &twins.rust_home, &full_ctx(rs_rec), rs_tx);
-    assert!(rust.is_ok(), "q5: port must accept");
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(".dot-backup/git-stage"));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_published(&deps, &case.actual_home, &full_ctx(actual_rec), actual_tx);
+    assert!(rust.is_ok(), "q5: native rollback must accept");
     assert_parity(
         "q5",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn published_matching_git_generation_is_removed() {
-    let twins = Twins::build("q6-git-generation");
+    let case = Case::build("q6-git-generation");
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (mut rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let tip = make_generation(&rec);
@@ -2401,31 +1957,30 @@ fn published_matching_git_generation_is_removed() {
         write(&rec.git_dir, "dot-init-generation-v1", marker.as_bytes());
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_published(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_published(&deps, &twins.rust_home, &full_ctx(rs_rec), rs_tx);
-    assert!(rust.is_ok(), "q6: port must accept");
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(".dotfiles"));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_published(&deps, &case.actual_home, &full_ctx(actual_rec), actual_tx);
+    assert!(rust.is_ok(), "q6: native rollback must accept");
     assert_parity(
         "q6",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn published_unreadable_tree_rolls_on() {
-    let twins = Twins::build("q7-unreadable-tree");
+    let case = Case::build("q7-unreadable-tree");
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         write_tree(&transaction, &[("100644", &"ab".repeat(20), "a.txt")]);
@@ -2433,45 +1988,45 @@ fn published_unreadable_tree_rolls_on() {
         sides.push((rec, transaction, ()));
     }
     if std::fs::read(sides[0].1.join("tree.tsv")).is_ok() {
-        eprintln!("q7 skipped: tree.tsv still readable (root?)");
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "only a privileged runner may bypass mode 000"
+        );
         return;
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_published(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_published(&deps, &twins.rust_home, &full_ctx(rs_rec), rs_tx);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 0;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_published(&deps, &case.actual_home, &full_ctx(actual_rec), actual_tx);
     assert_parity(
         "q7",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn rollback_without_record_refuses() {
-    let twins = Twins::build("r1-no-record");
+    let case = Case::build("r1-no-record");
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, _transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         sides.push(rec);
     }
-    let sh_rec = &sides[0];
-    let rs_rec = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_rollback(&twins.shell_home, &sh_env);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback(&deps, &twins.rust_home);
-    assert!(rust.is_err(), "r1: port must refuse");
+    let _expected_rec = &sides[0];
+    let actual_rec = &sides[1];
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback(&deps, &case.actual_home);
+    assert!(rust.is_err(), "r1: native rollback must refuse");
     assert_eq!(
         rust.as_ref().unwrap_err().to_string(),
         "no recoverable transaction",
@@ -2479,34 +2034,32 @@ fn rollback_without_record_refuses() {
     );
     assert_failure_parity(
         "r1",
-        shell,
+        expected_code,
         &rust,
         b"dot init: no recoverable transaction\n",
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn rollback_committed_phase_refuses() {
-    let twins = Twins::build("r2-committed");
+    let case = Case::build("r2-committed");
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         write_record(home, &transaction, &rec, "checkout");
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, _, _) = &sides[0];
-    let (rs_rec, _, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_rollback(&twins.shell_home, &sh_env);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback(&deps, &twins.rust_home);
-    assert!(rust.is_err(), "r2: port must refuse");
+    let (_expected_rec, _, _) = &sides[0];
+    let (actual_rec, _, _) = &sides[1];
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback(&deps, &case.actual_home);
+    assert!(rust.is_err(), "r2: native rollback must refuse");
     assert_eq!(
         rust.as_ref().unwrap_err().to_string(),
         "checkout is committed; rerun the original init command to resume",
@@ -2514,55 +2067,54 @@ fn rollback_committed_phase_refuses() {
     );
     assert_failure_parity(
         "r2",
-        shell,
+        expected_code,
         &rust,
         b"dot init: checkout is committed; rerun the original init command to resume\n",
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn rollback_empty_publishing_removes_transaction() {
-    let twins = Twins::build("r3-empty-ok");
+    let case = Case::build("r3-empty-ok");
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         write_record(home, &transaction, &rec, "publishing");
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_rollback(&twins.shell_home, &sh_env);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback(&deps, &twins.rust_home);
-    assert!(rust.is_ok(), "r3: port must accept");
-    assert!(!rs_tx.exists(), "r3: rust transaction removed");
-    assert!(!sh_tx.exists(), "r3: shell transaction removed");
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 0;
+    remove_fixture(_expected_tx);
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback(&deps, &case.actual_home);
+    assert!(rust.is_ok(), "r3: native rollback must accept");
+    assert!(!actual_tx.exists(), "r3: actual transaction removed");
+    assert!(!_expected_tx.exists(), "r3: expected transaction removed");
     assert_parity(
         "r3",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn rollback_full_publishing_cleans_everything() {
-    let twins = Twins::build("r4-full");
+    let case = Case::build("r4-full");
     let oid = hash_bytes(b"note body");
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         write_record(home, &transaction, &rec, "publishing");
@@ -2583,37 +2135,37 @@ fn rollback_full_publishing_cleans_everything() {
         write_tree(&transaction, &[("100644", &oid, path)]);
         sides.push((rec, transaction, stage));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, rs_stage) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_rollback(&twins.shell_home, &sh_env);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback(&deps, &twins.rust_home);
-    assert!(rust.is_ok(), "r4: port must accept");
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, actual_stage) = &sides[1];
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(&sides[0].2));
+    remove_fixture(_expected_tx);
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback(&deps, &case.actual_home);
+    assert!(rust.is_ok(), "r4: native rollback must accept");
     assert!(
-        !twins.rust_home.join(rs_stage).exists(),
-        "r4: rust stage removed"
+        !case.actual_home.join(actual_stage).exists(),
+        "r4: actual stage removed"
     );
-    assert!(!rs_tx.exists(), "r4: rust transaction removed");
-    assert!(!sh_tx.exists(), "r4: shell transaction removed");
+    assert!(!actual_tx.exists(), "r4: actual transaction removed");
+    assert!(!_expected_tx.exists(), "r4: expected transaction removed");
     assert_parity(
         "r4",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn rollback_changed_tree_refuses_and_keeps_transaction() {
-    let twins = Twins::build("r5-changed-tree");
+    let case = Case::build("r5-changed-tree");
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let backup = home
             .join(".dot-backup/r5")
@@ -2633,41 +2185,39 @@ fn rollback_changed_tree_refuses_and_keeps_transaction() {
         );
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_rollback(&twins.shell_home, &sh_env);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback(&deps, &twins.rust_home);
-    assert!(rust.is_err(), "r5: port must refuse");
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback(&deps, &case.actual_home);
+    assert!(rust.is_err(), "r5: native rollback must refuse");
     assert_eq!(
         rust.as_ref().unwrap_err().to_string(),
         "transaction-owned paths changed; refusing rollback",
         "r5: absorbed diagnostic"
     );
     assert!(
-        rs_tx.exists(),
-        "r5: rust transaction kept after published failure"
+        actual_tx.exists(),
+        "r5: actual transaction kept after published failure"
     );
     assert_failure_parity(
         "r5",
-        shell,
+        expected_code,
         &rust,
         b"dot init: transaction-owned paths changed; refusing rollback\n",
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
-    assert!(sh_tx.exists(), "r5: shell transaction kept");
+    assert!(_expected_tx.exists(), "r5: expected transaction kept");
 }
 
 #[test]
 fn rollback_backed_up_with_manifestless_backup_succeeds() {
-    let twins = Twins::build("r6-backed-up");
+    let case = Case::build("r6-backed-up");
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let backup = home
             .join(".dot-backup/r6")
@@ -2681,53 +2231,50 @@ fn rollback_backed_up_with_manifestless_backup_succeeds() {
         write_record(home, &transaction, &rec, "backed-up");
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_rollback(&twins.shell_home, &sh_env);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback(&deps, &twins.rust_home);
-    assert!(rust.is_ok(), "r6: port must accept");
-    assert!(!rs_tx.exists(), "r6: rust transaction removed");
-    assert!(!sh_tx.exists(), "r6: shell transaction removed");
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 0;
+    remove_fixture(_expected_tx);
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback(&deps, &case.actual_home);
+    assert!(rust.is_ok(), "r6: native rollback must accept");
+    assert!(!actual_tx.exists(), "r6: actual transaction removed");
+    assert!(!_expected_tx.exists(), "r6: expected transaction removed");
     assert_parity(
         "r6",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn rollback_complete_phase_refuses() {
-    let twins = Twins::build("r7-complete");
+    let case = Case::build("r7-complete");
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         write_record(home, &transaction, &rec, "complete");
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, _, _) = &sides[0];
-    let (rs_rec, _, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_rollback(&twins.shell_home, &sh_env);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback(&deps, &twins.rust_home);
-    assert!(rust.is_err(), "r7: port must refuse");
+    let (_expected_rec, _, _) = &sides[0];
+    let (actual_rec, _, _) = &sides[1];
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback(&deps, &case.actual_home);
+    assert!(rust.is_err(), "r7: native rollback must refuse");
     assert_failure_parity(
         "r7",
-        shell,
+        expected_code,
         &rust,
         b"dot init: checkout is committed; rerun the original init command to resume\n",
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
@@ -3026,7 +2573,7 @@ fn stub_entry_prepared_without_stage_calls_two_helpers() {
         &"ab".repeat(20),
         Path::new("w/file"),
     );
-    assert!(result.is_ok(), "s1: port must accept");
+    assert!(result.is_ok(), "s1: native rollback must accept");
     assert_eq!(
         log.take(),
         vec![
@@ -3072,7 +2619,7 @@ fn stub_entry_prepared_next_threads_identity_and_relative() {
         &"ab".repeat(20),
         Path::new("s1b/file"),
     );
-    assert!(result.is_ok(), "s1b: port must accept");
+    assert!(result.is_ok(), "s1b: native rollback must accept");
     assert!(!stage.exists(), "s1b: stage removed");
     let oid = "ab".repeat(20);
     assert_eq!(
@@ -3246,7 +2793,7 @@ fn stub_published_walks_tree_in_reverse() {
     };
     let deps = stub_deps(&log, &behavior);
     let result = rb::rollback_published(&deps, &home, &stub_ctx(), &transaction);
-    assert!(result.is_ok(), "s4: port must accept");
+    assert!(result.is_ok(), "s4: native rollback must accept");
     let calls = log.take();
     let entries: Vec<String> = calls
         .iter()
@@ -3324,13 +2871,13 @@ fn stub_entry_unknown_phase_refuses_after_park() {
 
 #[test]
 fn entry_pending_claimless_stage_refuses() {
-    let twins = Twins::build("e13-claimless");
+    let case = Case::build("e13-claimless");
     let oid = hash_bytes(b"note body");
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage) = entry_stage(&rec.nonce, path);
@@ -3349,49 +2896,39 @@ fn entry_pending_claimless_stage_refuses() {
         make_stage(home, &stage, None, &[]);
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_intent = sh_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let rs_intent = rs_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_entry(
-        &twins.shell_home,
-        &sh_env,
-        &sh_intent,
-        "100644",
-        &oid,
-        Path::new(path),
-    );
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
     let rust = rb::rollback_entry(
         &deps,
-        &twins.rust_home,
-        &entry_ctx(rs_rec),
-        &rs_intent,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
         "100644",
         &oid,
         Path::new(path),
     );
     assert_failure_parity(
         "e13",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn entry_staged_without_next_removes_stage() {
-    let twins = Twins::build("e14-staged-no-next");
+    let case = Case::build("e14-staged-no-next");
     let oid = hash_bytes(b"note body");
     let path = "docs/note.txt";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage) = entry_stage(&rec.nonce, path);
@@ -3412,53 +2949,44 @@ fn entry_staged_without_next_removes_stage() {
         );
         sides.push((rec, transaction, stage));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, rs_stage) = &sides[1];
-    let sh_intent = sh_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let rs_intent = rs_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_entry(
-        &twins.shell_home,
-        &sh_env,
-        &sh_intent,
-        "100644",
-        &oid,
-        Path::new(path),
-    );
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, actual_stage) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(&sides[0].2));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
     let rust = rb::rollback_entry(
         &deps,
-        &twins.rust_home,
-        &entry_ctx(rs_rec),
-        &rs_intent,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
         "100644",
         &oid,
         Path::new(path),
     );
-    assert!(rust.is_ok(), "e14: port must accept");
+    assert!(rust.is_ok(), "e14: native rollback must accept");
     assert!(
-        !twins.rust_home.join(rs_stage).exists(),
-        "e14: rust stage removed"
+        !case.actual_home.join(actual_stage).exists(),
+        "e14: actual stage removed"
     );
     assert_parity(
         "e14",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn parents_prepared_claimless_stage_cleans_up() {
-    let twins = Twins::build("p11-prepared-no-claim");
+    let case = Case::build("p11-prepared-no-claim");
     let parent = "docs";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage_rel) = parent_stage(&rec.nonce, parent);
@@ -3476,36 +3004,35 @@ fn parents_prepared_claimless_stage_cleans_up() {
         );
         sides.push((rec, transaction, stage_rel));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, rs_stage) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_parents(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_parents(&deps, &twins.rust_home, rs_tx);
-    assert!(rust.is_ok(), "p11: port must accept");
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, actual_stage) = &sides[1];
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(&sides[0].2));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_parents(&deps, &case.actual_home, actual_tx);
+    assert!(rust.is_ok(), "p11: native rollback must accept");
     assert!(
-        !twins.rust_home.join(rs_stage).exists(),
-        "p11: rust stage removed"
+        !case.actual_home.join(actual_stage).exists(),
+        "p11: actual stage removed"
     );
     assert_parity(
         "p11",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }
 
 #[test]
 fn parents_pending_claimless_stage_refuses() {
-    let twins = Twins::build("p12-pending-no-claim");
+    let case = Case::build("p12-pending-no-claim");
     let parent = "docs";
     let mut sides = Vec::new();
     for (home, xdg) in [
-        (&twins.shell_home, &twins.shell_xdg),
-        (&twins.rust_home, &twins.rust_xdg),
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
     ] {
         let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
         let (_, stage_rel) = parent_stage(&rec.nonce, parent);
@@ -3513,19 +3040,17 @@ fn parents_pending_claimless_stage_refuses() {
         make_stage(home, &stage_rel, None, &[]);
         sides.push((rec, transaction, ()));
     }
-    let (sh_rec, sh_tx, _) = &sides[0];
-    let (rs_rec, rs_tx, _) = &sides[1];
-    let sh_panel = sh_rec.panel(&twins.shell_home, &twins.shell_xdg);
-    let sh_env: Vec<(&str, &str)> = sh_panel.iter().map(|(k, v)| (*k, *v)).collect();
-    let shell = oracle_parents(&twins.shell_home, &sh_env, sh_tx);
-    let deps = live_deps(&twins.rust_home, &twins.rust_xdg, rs_rec);
-    let rust = rb::rollback_parents(&deps, &twins.rust_home, rs_tx);
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, _) = &sides[1];
+    let expected_code = 1;
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_parents(&deps, &case.actual_home, actual_tx);
     assert_failure_parity(
         "p12",
-        shell,
+        expected_code,
         &rust,
         &[],
-        &inventory(&[&twins.shell_home]),
-        &inventory(&[&twins.rust_home]),
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
     );
 }

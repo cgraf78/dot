@@ -1,47 +1,13 @@
-//! Differential parity tests for marked-block merging against
-//! `lib/dot/merge-block.sh`: block assembly, stripping (single and
+//! Native tests for marked-block merging: block assembly, stripping (single and
 //! family), atomic finalize, and both merge flavors — including
 //! modeline corners, unterminated blocks, and idempotent re-merges.
 
-use std::collections::BTreeMap;
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use dot::merge_block;
 use dot::temp;
-use dot::test_support::TempDir;
-
-/// Run one shell snippet with `merge-block.sh` sourced. `argv`
-/// arrives as `$2..` (`$1` is the repo root, byte-exact).
-fn shell_run(fixture: &Path, argv: &[&std::ffi::OsStr], snippet: &str) -> (i32, Vec<u8>) {
-    let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let tmpdir = std::env::var_os("TMPDIR")
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg("--noprofile").arg("--norc").arg("-c").arg(format!(
-        ". \"$1/lib/dot/temp.sh\"\n. \"$1/lib/dot/merge-block.sh\"\n{snippet}"
-    ));
-    cmd.arg("dot-test-sh").arg(repo);
-    for arg in argv {
-        cmd.arg(arg);
-    }
-    cmd.env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", &path)
-        .env("TMPDIR", &tmpdir)
-        .env("DOT_TEST", "1")
-        .env("DOT_SOURCE_ROOT", fixture)
-        .current_dir(fixture)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let output = cmd.output().expect("spawn bash");
-    (output.status.code().unwrap_or(99), output.stdout)
-}
+use dot_test_support::TempDir;
 
 /// Fresh publishing context over `root` (git digests run under it).
 fn ctx<'a>(root: &'a Path, cache: &'a mut temp::MoveCache) -> merge_block::Ctx<'a> {
@@ -49,72 +15,6 @@ fn ctx<'a>(root: &'a Path, cache: &'a mut temp::MoveCache) -> merge_block::Ctx<'
         source_root: root,
         cache,
     }
-}
-
-/// Snapshot a fixture tree: relative path to kind, mode, and payload.
-#[derive(Debug, PartialEq)]
-struct Snap {
-    kind: char,
-    mode: u32,
-    payload: Vec<u8>,
-}
-
-fn snapshot(root: &Path) -> BTreeMap<String, Snap> {
-    let mut map = BTreeMap::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut names: Vec<_> = std::fs::read_dir(&dir)
-            .expect("list fixture")
-            .map(|entry| entry.expect("fixture entry").file_name())
-            .collect();
-        names.sort();
-        for name in names {
-            let path = dir.join(&name);
-            let rel = path
-                .strip_prefix(root)
-                .expect("fixture prefix")
-                .as_os_str()
-                .as_bytes()
-                .to_vec();
-            let key = String::from_utf8_lossy(&rel).into_owned();
-            let meta = std::fs::symlink_metadata(&path).expect("stat fixture");
-            let mode = meta.permissions().mode() & 0o7777;
-            if meta.file_type().is_symlink() {
-                map.insert(
-                    key,
-                    Snap {
-                        kind: 'l',
-                        mode,
-                        payload: std::fs::read_link(&path)
-                            .expect("read link")
-                            .as_os_str()
-                            .as_bytes()
-                            .to_vec(),
-                    },
-                );
-            } else if meta.is_dir() {
-                map.insert(
-                    key,
-                    Snap {
-                        kind: 'd',
-                        mode,
-                        payload: Vec::new(),
-                    },
-                );
-                stack.push(path);
-            } else if meta.is_file() {
-                map.insert(
-                    key,
-                    Snap {
-                        kind: 'f',
-                        mode,
-                        payload: std::fs::read(&path).expect("read fixture"),
-                    },
-                );
-            }
-        }
-    }
-    map
 }
 
 /// Write `bytes` to `dir/name`, creating parents.
@@ -128,9 +28,7 @@ fn stage(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
 }
 
 #[test]
-fn build_shapes_agree() {
-    let dir = TempDir::new("mb-build").expect("fixture dir");
-    let root = dir.path();
+fn build_shapes_have_stable_boundaries() {
     let bodies = [
         ("plain", "Host example\n  ForwardAgent yes"),
         ("padded", "\n\nHost example\n\n"),
@@ -146,27 +44,23 @@ fn build_shapes_agree() {
     ];
     for (label, body) in bodies {
         let marker = format!("# dot-{label}");
-        let (code, out) = shell_run(
-            root,
-            &[
-                marker.as_str().as_ref(),
-                "/src/frag".as_ref(),
-                body.as_ref(),
-            ],
-            "_mb_build \"$2\" \"$3\" \"$4\"",
-        );
-        assert_eq!(code, 0, "shell build {label}");
-        let shell = String::from_utf8(out).expect("build text");
         let rust = merge_block::build(&marker, "/src/frag", body);
-        assert_eq!(rust, shell, "build parity for {label}");
+        assert!(rust.starts_with(&format!("{marker} begin\n")));
+        assert!(rust.ends_with(&format!("{marker} end")));
         assert!(!rust.ends_with('\n'), "no trailing newline for {label}");
     }
+    assert_eq!(
+        merge_block::build(
+            "# dot-managed:example",
+            "/source/example",
+            "  generated\n# vim: set ft=conf\n# -*- mode: conf -*-\n",
+        ),
+        "# dot-managed:example begin\n# DO NOT EDIT: changes will be overwritten by dot update\n# source: /source/example\ngenerated\n# dot-managed:example end"
+    );
 }
 
 #[test]
-fn strip_cases_agree() {
-    let dir = TempDir::new("mb-strip").expect("fixture dir");
-    let root = dir.path();
+fn strip_removes_only_the_selected_marker_range() {
     let block_a = merge_block::build("# dot-a", "/s/a", "Host a");
     let block_b = merge_block::build("# dot-b", "/s/b", "Host b");
     let cases = [
@@ -188,15 +82,8 @@ fn strip_cases_agree() {
         for marker in ["# dot-a", "# dot-b", "# dot-missing"] {
             // Callers consume the capture, which strips the output
             // newline the function itself prints.
-            let (code, out) = shell_run(
-                root,
-                &[marker.as_ref(), input.as_ref()],
-                "stripped=$(_mb_strip \"$2\" \"$3\"); printf '%s' \"$stripped\"",
-            );
-            assert_eq!(code, 0, "shell strip {label}");
-            let shell = String::from_utf8(out).expect("strip text");
             let rust = merge_block::strip(marker, input);
-            assert_eq!(rust, shell, "strip parity for {label} with {marker}");
+            assert!(!rust.contains(&format!("{marker} begin")), "strip {label}");
         }
     }
     // Stripping with the wrong marker leaves content alone.
@@ -208,9 +95,7 @@ fn strip_cases_agree() {
 }
 
 #[test]
-fn strip_family_cases_agree() {
-    let dir = TempDir::new("mb-family").expect("fixture dir");
-    let root = dir.path();
+fn strip_family_removes_every_matching_marker_range() {
     let cases = [
         ("empty", ""),
         ("no-family", "Host hand\n# other begin\nx\n# other end\n"),
@@ -232,20 +117,18 @@ fn strip_family_cases_agree() {
     for (label, input) in cases {
         // Callers consume the capture, which strips the output
         // newline the function itself prints.
-        let (code, out) = shell_run(
-            root,
-            &[input.as_ref()],
-            "stripped=$(_mb_strip_family \"# ssh\" \"$2\"); printf '%s' \"$stripped\"",
-        );
-        assert_eq!(code, 0, "shell strip family {label}");
-        let shell = String::from_utf8(out).expect("family text");
         let rust = merge_block::strip_family("# ssh", input);
-        assert_eq!(rust, shell, "family parity for {label}");
+        assert!(
+            !rust
+                .lines()
+                .any(|line| line.starts_with("# ssh ") && line.ends_with(" begin")),
+            "family {label}"
+        );
     }
 }
 
 #[test]
-fn merge_twins_agree() {
+fn merge_contracts_preserve_manual_content_and_replace_managed_blocks() {
     let setups: &[(&str, &str)] = &[
         ("fresh", ""),
         ("hand", "Host hand-managed\n  Opt yes\n\n\n"),
@@ -257,27 +140,13 @@ fn merge_twins_agree() {
     ];
     for (label, current) in setups {
         for family in [false, true] {
-            let sdir = TempDir::new(&format!("merge-{label}-shell")).expect("shell dir");
             let rdir = TempDir::new(&format!("merge-{label}-rust")).expect("rust dir");
-            let block_s = merge_block::build("# dot-app", "/src/app", "Host managed\n  Opt no");
-            let block_r = block_s.clone();
-            let dst_s = sdir.path().join("sub/ssh_config");
+            let block_r = merge_block::build("# dot-app", "/src/app", "Host managed\n  Opt no");
             let dst_r = rdir.path().join("sub/ssh_config");
             if !current.is_empty() {
-                stage(sdir.path(), "sub/ssh_config", current.as_bytes());
                 stage(rdir.path(), "sub/ssh_config", current.as_bytes());
             }
             let verb = if family { "family" } else { "exact" };
-            let snippet = if family {
-                "_mb_merge_family \"$2\" \"# dot\" \"$3\""
-            } else {
-                "_mb_merge \"$2\" \"$3\""
-            };
-            let (scode, _) = shell_run(
-                sdir.path(),
-                &[dst_s.as_os_str(), block_s.as_str().as_ref()],
-                snippet,
-            );
             let mut cache = temp::MoveCache::default();
             let rcode = if family {
                 merge_block::merge_family(
@@ -293,22 +162,12 @@ fn merge_twins_agree() {
                     &mut ctx(rdir.path(), &mut cache),
                 )
             };
-            assert_eq!(rcode.is_ok(), scode == 0, "merge {verb} code for {label}");
-            assert_eq!(
-                snapshot(rdir.path()),
-                snapshot(sdir.path()),
-                "merge {verb} tree for {label}"
-            );
+            assert!(rcode.is_ok(), "merge {verb} code for {label}");
             // Re-merging is a no-op on both sides (same bytes and mtime).
             let before = std::fs::metadata(&dst_r)
                 .expect("merged file")
                 .modified()
                 .expect("mtime");
-            let (scode2, _) = shell_run(
-                sdir.path(),
-                &[dst_s.as_os_str(), block_s.as_str().as_ref()],
-                snippet,
-            );
             let mut cache2 = temp::MoveCache::default();
             let rcode2 = if family {
                 merge_block::merge_family(
@@ -324,20 +183,74 @@ fn merge_twins_agree() {
                     &mut ctx(rdir.path(), &mut cache2),
                 )
             };
-            assert_eq!(scode2, 0, "shell re-merge {label}");
             assert!(rcode2.is_ok(), "rust re-merge {label}");
             let after = std::fs::metadata(&dst_r)
                 .expect("merged file")
                 .modified()
                 .expect("mtime");
             assert_eq!(before, after, "re-merge skips the write for {label}");
-            assert_eq!(
-                snapshot(rdir.path()),
-                snapshot(sdir.path()),
-                "re-merge tree for {label}"
+            assert!(
+                std::fs::read_to_string(&dst_r)
+                    .expect("merged")
+                    .contains("Host managed")
             );
         }
     }
+}
+
+#[test]
+fn family_merge_has_exact_order_and_keeps_inode_when_unchanged() {
+    let dir = TempDir::new("merge-family-exact").expect("fixture");
+    let destination = stage(
+        dir.path(),
+        "config/output",
+        b"manual first\n\n# dot-managed:family:old begin\n# DO NOT EDIT: changes will be overwritten by dot update\n# source: /source/old\nold generated\n# dot-managed:family:old end\n\nmanual last\n",
+    );
+    let first = merge_block::build("# dot-managed:family:new", "/source/new", "new generated");
+    let second = merge_block::build(
+        "# dot-managed:family:second",
+        "/source/second",
+        "second generated",
+    );
+    let mut cache = temp::MoveCache::default();
+    merge_block::merge_family(
+        &destination,
+        "# dot-managed:family:",
+        &[first.as_str(), second.as_str()],
+        &mut ctx(dir.path(), &mut cache),
+    )
+    .expect("family merge");
+    let expected = format!("manual first\n\nmanual last\n\n{first}\n\n{second}\n");
+    assert_eq!(std::fs::read_to_string(&destination).unwrap(), expected);
+    let inode = std::fs::metadata(&destination).unwrap().ino();
+    let mut cache = temp::MoveCache::default();
+    merge_block::merge_family(
+        &destination,
+        "# dot-managed:family:",
+        &[first.as_str(), second.as_str()],
+        &mut ctx(dir.path(), &mut cache),
+    )
+    .expect("idempotent family merge");
+    assert_eq!(std::fs::metadata(&destination).unwrap().ino(), inode);
+    assert_eq!(std::fs::read_to_string(&destination).unwrap(), expected);
+}
+
+#[test]
+fn merge_refuses_directory_destination_without_nesting_stage() {
+    let dir = TempDir::new("merge-directory-refusal").expect("fixture");
+    let destination = dir.path().join("foreign-directory");
+    std::fs::create_dir(&destination).unwrap();
+    let block = merge_block::build("# dot-app", "/source", "managed");
+    let mut cache = temp::MoveCache::default();
+    assert!(
+        merge_block::merge(
+            &destination,
+            &[block.as_str()],
+            &mut ctx(dir.path(), &mut cache),
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
 }
 
 #[test]

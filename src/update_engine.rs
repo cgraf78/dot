@@ -46,6 +46,8 @@ pub struct UpdateFlags {
 pub struct EngineInputs<'a> {
     /// Immutable process boundary for leaf workers launched during this update.
     pub runtime: &'a crate::app::Runtime,
+    /// Native update lock claim exposed only to transactional hook workers.
+    pub update_lock_token: Option<&'a str>,
     /// Parsed client configuration for this update generation.
     pub config: &'a crate::config::Config,
     /// Parsed flags.
@@ -250,8 +252,8 @@ struct UpdateState {
     profiles: crate::profiles::State,
     /// Names selected by the final profile expansion.
     selected: Vec<String>,
-    /// Final eligible overlay records.
-    eligible: Vec<String>,
+    /// Final eligible overlay names used by lifecycle retention policy.
+    eligible_names: Vec<String>,
     /// Final active overlay records, used for links and cleanup.
     active: Vec<String>,
     /// Ledger records loaded before lifecycle preparation.
@@ -279,7 +281,7 @@ impl UpdateState {
             config,
             profiles: crate::profiles::State::default(),
             selected: Vec::new(),
-            eligible: Vec::new(),
+            eligible_names: Vec::new(),
             active: Vec::new(),
             prior: Vec::new(),
             retained: Vec::new(),
@@ -293,7 +295,7 @@ impl UpdateState {
     /// final discovery, matching the shell's resettable global arrays.
     fn capture(&mut self, overlays: &crate::overlays::State) {
         self.selected = overlays.selected.clone();
-        self.eligible = overlays.eligible.clone();
+        self.eligible_names = overlays.eligible_names.clone();
         self.active = overlays.active.clone();
     }
 
@@ -660,7 +662,7 @@ fn sync_tail(
         &crate::profile_lifecycle::PrepareInputs {
             present: conv.state.profiles.present,
             extensions_enabled: conv.state.extensions_enabled(),
-            eligible: &conv.state.eligible,
+            eligible: &conv.state.eligible_names,
             phase_one: &conv.state.phase_one,
             active: &conv.state.active,
             prior: &conv.state.prior,
@@ -820,7 +822,6 @@ fn converge_overlays(
         update.config.extensions_dir.as_deref(),
         &entries,
         "reconcile",
-        now_secs,
         io.out,
         io.err,
     )
@@ -931,7 +932,6 @@ fn converge_profiles(
         update.config.extensions_dir.as_deref(),
         &entries,
         "prepare",
-        now_secs,
         io.out,
         io.err,
     )
@@ -1040,7 +1040,6 @@ fn converge_profiles(
         update.config.extensions_dir.as_deref(),
         &entries,
         "reconcile",
-        now_secs,
         io.out,
         io.err,
     )
@@ -1191,7 +1190,6 @@ fn pre_sync(
     configured_root: Option<&str>,
     eligible: &[String],
     stage: &str,
-    now_secs: i64,
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
 ) -> Result<(), ()> {
@@ -1207,22 +1205,24 @@ fn pre_sync(
         .iter()
         .map(|record| record.as_bytes().to_vec())
         .collect();
-    let mut worker = crate::hook_worker::Worker::with_extensions(inputs.runtime, extensions_dir);
+    let mut worker = crate::hook_worker::Worker::for_update(
+        inputs.runtime,
+        &crate::hook_worker::UpdateEnvironment {
+            extensions_dir,
+            overlay_manifest: inputs.manifest,
+            update_lock_token: inputs.update_lock_token,
+            quiet: quiet(inputs),
+            force: inputs.flags.force,
+            verbose: inputs.flags.verbose || crate::log::is_quiet(inputs.dot_verbose),
+        },
+    );
     let mut runner = |call: &crate::pre_sync::Call| {
         let outcome = worker.pre_sync(call);
         out.extend_from_slice(&outcome.stdout);
         err.extend_from_slice(&outcome.stderr);
         outcome.rc == 0
     };
-    match crate::pre_sync::run(
-        stage,
-        &records,
-        &trust,
-        eligible,
-        now_secs,
-        inputs.tmp,
-        &mut runner,
-    ) {
+    match crate::pre_sync::run(stage, &records, &trust, eligible, inputs.tmp, &mut runner) {
         Ok(outcome) if outcome.status == 0 => Ok(()),
         Ok(outcome) => {
             for warning in outcome.warnings {
@@ -1355,17 +1355,31 @@ fn finalize(
     if !inputs_ready {
         skip_inputs_rows(stage, io.out, "repository synchronization failed", now_secs);
     } else {
-        let mut worker = crate::hook_worker::Worker::new(inputs.runtime);
+        let extensions_dir = state
+            .config
+            .extensions_dir
+            .as_deref()
+            .unwrap_or(inputs.extensions_dir);
+        let mut worker = crate::hook_worker::Worker::for_update(
+            inputs.runtime,
+            &crate::hook_worker::UpdateEnvironment {
+                extensions_dir,
+                overlay_manifest: inputs.manifest,
+                update_lock_token: inputs.update_lock_token,
+                quiet: quiet(inputs),
+                force: inputs.flags.force,
+                verbose: inputs.flags.verbose || crate::log::is_quiet(inputs.dot_verbose),
+            },
+        );
         let retired = crate::profile_lifecycle::retire(
             &crate::profile_lifecycle::RetireInputs {
                 present: state.profiles.present,
                 extensions_enabled: state.extensions_enabled(),
                 retained: &state.retained,
-                eligible: &state.eligible,
+                eligible: &state.eligible_names,
                 home: inputs.home,
                 euid: inputs.euid,
                 tmpdir: inputs.tmp,
-                now_secs,
                 verbose: inputs.flags.verbose,
                 log: inputs.log,
             },
@@ -1433,6 +1447,7 @@ fn finalize(
             let merged = crate::merges::run(
                 &crate::merges::RunInputs {
                     runtime: inputs.runtime,
+                    update_lock_token: inputs.update_lock_token,
                     extension_inputs: crate::extension_trust::Inputs {
                         euid: inputs.euid,
                         home: inputs.home.to_string(),
@@ -1447,6 +1462,7 @@ fn finalize(
                     merge_jobs: inputs.merge_jobs,
                     verbose: inputs.flags.verbose || crate::log::is_quiet(inputs.dot_verbose),
                     quiet: quiet(inputs),
+                    force: inputs.flags.force,
                     palette: inputs.palette,
                     multibyte: inputs.multibyte,
                     log: inputs.log,
@@ -1467,7 +1483,7 @@ fn finalize(
             present: state.profiles.present,
             extensions_enabled: state.extensions_enabled(),
             retained: &state.retained,
-            eligible: &state.eligible,
+            eligible: &state.eligible_names,
             active: &state.active,
             ledger: Some(&ledger),
             home: inputs.home,
@@ -1674,6 +1690,7 @@ fn startup_inputs<'a>(inputs: &EngineInputs<'a>) -> crate::startup::Inputs<'a> {
 /// from here, so one value lives through the whole run.
 pub struct Gathered {
     runtime: crate::app::Runtime,
+    update_lock_token: Option<String>,
     config: crate::config::Config,
     flags: UpdateFlags,
     args: Vec<std::ffi::OsString>,
@@ -1714,6 +1731,7 @@ impl Gathered {
     pub fn inputs(&self) -> EngineInputs<'_> {
         EngineInputs {
             runtime: &self.runtime,
+            update_lock_token: self.update_lock_token.as_deref(),
             config: &self.config,
             flags: self.flags,
             original_args: &self.args,
@@ -1820,53 +1838,13 @@ fn locale_name(env: &BTreeMap<OsString, OsString>) -> String {
 /// place in globals before dispatch. A completed init record is authoritative;
 /// the legacy separate checkout remains the record-free compatibility shape.
 fn base_client(
+    runtime: &crate::app::Runtime,
     home: &str,
     state_home: &str,
-    env: &BTreeMap<OsString, OsString>,
 ) -> Result<Base, GatherError> {
-    let published = env_value(env, "DOT_BASE_TOPOLOGY");
-    if published.is_some() {
-        return Ok(crate::cli::base_from_values(
-            home,
-            published.as_deref(),
-            env_value(env, "DOT_CLIENT_GIT_DIR").as_deref(),
-        ));
-    }
-    let completed = Path::new(state_home).join("dot/init/completed");
-    if std::fs::symlink_metadata(&completed).is_ok() {
-        let record =
-            crate::init_client_record::read_record(&completed, Path::new(home)).map_err(|_| {
-                GatherError::Diagnostic(b"dot: malformed initialization identity record\n")
-            })?;
-        if record.phase != "complete" {
-            return Err(GatherError::Diagnostic(
-                b"dot: malformed initialization identity record\n",
-            ));
-        }
-        let topology = if record.git_dir == format!("{home}/.dotfiles") {
-            Some("separate")
-        } else if record.git_dir == format!("{home}/.git") {
-            Some("ordinary")
-        } else {
-            None
-        };
-        if topology.is_some() {
-            return Ok(crate::cli::base_from_values(
-                home,
-                topology,
-                Some(&record.git_dir),
-            ));
-        }
-        return Err(GatherError::Diagnostic(
-            b"dot: initialization identity names an unsupported Git directory\n",
-        ));
-    }
-    let legacy = Path::new(home).join(".dotfiles");
-    Ok(crate::cli::base_from_values(
-        home,
-        legacy.is_dir().then_some("separate"),
-        legacy.to_str(),
-    ))
+    let mut diagnostic = Vec::new();
+    crate::repos_base::select(runtime, home, state_home, &mut diagnostic)
+        .map_err(|()| GatherError::Diagnostic(diagnostic))
 }
 
 /// A complete request for one native update invocation.
@@ -1881,15 +1859,15 @@ pub struct UpdateRequest<'a> {
     pub state_home: &'a Path,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum GatherError {
     Xdg(crate::xdg::Error),
-    Diagnostic(&'static [u8]),
+    Diagnostic(Vec<u8>),
     Unavailable,
 }
 
 impl GatherError {
-    fn code(self) -> i32 {
+    fn code(&self) -> i32 {
         match self {
             Self::Xdg(error) => error.code(),
             Self::Diagnostic(_) => 1,
@@ -1897,7 +1875,7 @@ impl GatherError {
         }
     }
 
-    fn write(self, stderr: &mut dyn std::io::Write) {
+    fn write(&self, stderr: &mut dyn std::io::Write) {
         if let Self::Diagnostic(line) = self {
             let _ = stderr.write_all(line);
         }
@@ -1997,6 +1975,7 @@ fn gather(
     };
     Ok(Gathered {
         runtime: runtime.clone(),
+        update_lock_token: env_value(env, "DOT_UPDATE_LOCK_TOKEN"),
         config: config.clone(),
         flags,
         args: args.to_vec(),
@@ -2010,7 +1989,7 @@ fn gather(
         tool,
         log,
         palette,
-        base: Some(base_client(&home, state_home, env)?),
+        base: Some(base_client(runtime, &home, state_home)?),
         bar_width: env_value(env, "DOT_UI_PROGRESS_WIDTH").unwrap_or_else(|| "8".to_string()),
         dot_verbose,
         dot_quiet,
@@ -2331,7 +2310,7 @@ mod tests {
 
     #[test]
     fn malformed_completed_identity_fails_instead_of_becoming_legacy() {
-        let scratch = crate::test_support::TempDir::new("update-base-malformed")
+        let scratch = dot_test_support::TempDir::new("update-base-malformed")
             .expect("create temporary directory");
         let home = scratch.path().join("home");
         let state = scratch.path().join("state");
@@ -2339,10 +2318,18 @@ mod tests {
         std::fs::create_dir_all(state.join("dot/init")).expect("init state");
         std::fs::write(state.join("dot/init/completed"), b"not-a-record\n")
             .expect("malformed completed record");
+        let env = BTreeMap::from([
+            (OsString::from("HOME"), home.as_os_str().to_owned()),
+            (
+                OsString::from("XDG_STATE_HOME"),
+                state.as_os_str().to_owned(),
+            ),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, scratch.path()).expect("runtime");
         let error = base_client(
+            &runtime,
             home.to_str().expect("UTF-8 home"),
             state.to_str().expect("UTF-8 state"),
-            &BTreeMap::new(),
         )
         .expect_err("completed identity stays authoritative");
         assert!(matches!(error, GatherError::Diagnostic(_)));
@@ -2350,7 +2337,7 @@ mod tests {
 
     #[test]
     fn stderr_is_delivered_even_when_stdout_delivery_fails() {
-        let scratch = crate::test_support::TempDir::new("update-stream-failure")
+        let scratch = dot_test_support::TempDir::new("update-stream-failure")
             .expect("create temporary directory");
         let home = scratch.path().join("home");
         let state = scratch.path().join("state");

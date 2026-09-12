@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+if [[ -n $(find "$root/lib/dot" -mindepth 1 -maxdepth 1 \
+  ! -name public -print -quit) ]]; then
+  printf 'no-private-engine-test: private lib/dot runtime remains\n' >&2
+  exit 1
+fi
+
+# CI runners do not provide ripgrep; plain grep is equivalent here because the
+# match only gates on the exit status and the scanned trees hold no hidden or
+# git-ignored source that grep would additionally cover.
+if grep -rnE '"lib/dot/(main|runtime|commands|update|extension-worker)\.sh"|env\("DOT_BASH"|var(_os)?\("DOT_BASH"' \
+  "$root/src" "$root/bin"; then
+  printf 'no-private-engine-test: native production path retains a shell fallback\n' >&2
+  exit 1
+fi
+
+# Core engine helpers must not recover simple Unix process state by spawning a
+# shell. Shell remains an intentional boundary for user hooks and the shdeps
+# bootstrap, but umask and lock-owner liveness are native OS operations.
+if grep -rnE 'Command::new\("sh"\)|std::process::Command::new\("sh"\)' \
+  "$root/src/temp.rs" "$root/src/update_lock.rs"; then
+  printf 'no-private-engine-test: core engine still spawns a shell\n' >&2
+  exit 1
+fi
+
+binary=$root/target/debug/dot
+[[ -x $binary ]] || {
+  printf 'no-private-engine-test: build target/debug/dot first\n' >&2
+  exit 1
+}
+home=$(mktemp -d)
+trap 'rm -rf -- "$home"' EXIT
+commands=(
+  'help'
+  'version'
+  'update --quiet'
+  'pull --quiet'
+  'fetch'
+  'push'
+  'status'
+  'diff'
+  'cron'
+  'doctor'
+  'test --list'
+  'init --help'
+)
+for words in "${commands[@]}"; do
+  read -r -a argv <<<"$words"
+  output=$(HOME=$home XDG_CONFIG_HOME=$home/.config \
+    XDG_STATE_HOME=$home/.local/state DOT_SOURCE_ROOT=$root \
+    "$binary" "${argv[@]}" 2>&1) || true
+  if [[ $output == *'lib/dot/main.sh'* || $output == *'OLD-UPDATE-ENGINE'* ||
+    $output == *'not yet implemented'* ]]; then
+    printf 'no-private-engine-test: command used removed engine: %s\n%s\n' \
+      "$words" "$output" >&2
+    exit 1
+  fi
+done
+
+printf 'no-private-engine-test: ok\n'

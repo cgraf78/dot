@@ -1,37 +1,15 @@
-//! Binary startup prelude for `dot` (slice 84).
+//! Binary startup prelude for `dot`.
 //!
-//! Ports the `lib/dot/main.sh` prelude plus the `bin/dot` entry
-//! contract into the Rust binary startup path (`app::run` calls
+//! Owns source-root discovery and the process preflight before
+//! command dispatch (`app::run` calls
 //! [`check`] with its snapshotted runtime).
-//! Reuses the already-ported [`crate::config`], [`crate::xdg`], and
+//! Reuses the [`crate::config`], [`crate::xdg`], and
 //! [`crate::version`] modules plus the existing `cli::HELP` text —
 //! nothing here re-ports their internals.
 //!
-//! Shell line map (`bin/dot` is 59 lines, `lib/dot/main.sh` 94):
-//!
-//! | Shell | Rust |
-//! |---|---|
-//! | `CDPATH=` | No equivalent needed: the engine builds absolute paths only (`source_root` / `xdg` joins); no `cd`-relative lookup exists to perturb. |
-//! | `set -euo pipefail` | No equivalent needed: fallibility is typed (`Result`, explicit `Option`) instead of dynamic. |
-//! | `umask g-w,o-w` | [`ensure_umask_ceiling`]: the same `mask \| 0o022` as a pure function. The process mask itself is never mutated (no `std` binding exists — see `temp::read_umask` — and a global mutation would race every thread); creation sites already carry explicit modes (`temp::sibling_tmp_for` uses `0o600`, plus `temp::apply_umask_ceiling`). |
-//! | `shopt -u nocasematch` | No equivalent needed: Rust `match` on argv bytes is always byte-exact and case-sensitive (pinned by test against both entry files). |
-//! | Bash-4+ gate (`dot: Bash 4 or newer is required`, exit 1) | No equivalent needed: the compiled binary has no interpreter to version-gate. `test_support::bash` still requires Bash 4+ for the differential oracles only. |
-//! | `DOT_SOURCE_ROOT=$(cd -P …/lib/dot/main.sh …/../..)` + export | [`resolve_source_root`] / [`ambient_source_root`]: an explicit `DOT_SOURCE_ROOT` wins verbatim (the hermetic-test and embedding hook the shell's unconditional bind cannot offer); otherwise the current executable's canonical path is walked up to the first ancestor holding `lib/dot/main.sh` (canonicalization resolves symlink chains the way `cd -P` plus the `bin/dot` 40-hop loop does — an unresolvable chain simply misses the probe instead of printing `launcher symlink chain is too deep`); otherwise the cwd applies (mirroring `${DOT_SOURCE_ROOT:-$PWD}` in `_dot_source_git`). |
-//! | `. lib/dot/temp.sh` | No sourcing step: `temp` is linked statically and called directly ([`observed_revision`] uses `temp::sanitized_git`). |
-//! | `DOT_ORIGINAL_ARGV=("$@")` | No global: argv is threaded explicitly (`cli::run` takes `args`). |
-//! | `DOT_REEXEC_EXPECTED_REVISION` guard (exit 1) | [`check_reexec_revision`] + [`observed_revision`], same order (before config), same bytes including the `${var:-<missing>}` spelling. |
-//! | `. public/api-version.sh` | [`crate::version::LIBRARY_API`] (already pinned to `DOT_LIBRARY_API=1` by `tests/constants.rs`). |
-//! | `. public/xdg.sh` | [`crate::xdg`] (relative XDG values already fall back, exactly like the shell). |
-//! | `. public/ui.sh` | [`crate::ui`] (already ported; startup performs no presentation). |
-//! | `. lib/dot/config.sh` + `dot_config_load \|\| exit 2` | [`load_default_config`]: the XDG-default `dot/config` through `config::load`; any rejection becomes exit 2 with byte-identical diagnostics. Runs BEFORE dispatch for EVERY command per the forward contracts in `docs/rust-port-spec.md` ("an unloadable config exits 2 for ANY command") — the shell `case` currently exempts `help`/`version`, and that divergence is deliberate and pinned in `tests/startup.rs`. |
-//! | `REPLY` global | No equivalent: every helper returns values (the `xdg` precedent). |
-//! | `dot_version` / `dot_help` | `version::version_line` / `cli::HELP` (byte parity already pinned by `tests/cli.rs`; the startup suite re-pins `version` end to end so the prelude cannot perturb it). |
-//!
-//! A loaded config is otherwise invisible: [`preflight`] validates
-//! and returns the [`Config`] for future slices, while
-//! [`check`] (the application entry) discards it
-//! — no process environment is published yet, so already-wired
-//! commands behave exactly as before whenever config loads.
+//! [`preflight`] validates and returns the loaded [`Config`] to native command
+//! dispatch. No process environment is published; consumers receive the
+//! immutable configuration explicitly.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -54,9 +32,8 @@ pub fn ensure_umask_ceiling(mask: u32) -> u32 {
 ///
 /// `env_root` (explicit `DOT_SOURCE_ROOT`) wins verbatim when
 /// non-empty; otherwise the canonicalized `exe` path is walked up to
-/// the first ancestor holding `lib/dot/main.sh` (a binary installed
-/// as `<root>/bin/dot` answers exactly like the shell's
-/// `dirname …/../..` derivation); otherwise `cwd` applies.
+/// the first ancestor holding either native checkout metadata or native
+/// release metadata plus its public API directory; otherwise `cwd` applies.
 pub fn resolve_source_root(exe: &Path, env_root: Option<&OsStr>, cwd: &Path) -> PathBuf {
     if let Some(root) = env_root {
         if !root.is_empty() {
@@ -65,7 +42,10 @@ pub fn resolve_source_root(exe: &Path, env_root: Option<&OsStr>, cwd: &Path) -> 
     }
     if let Ok(canonical) = std::fs::canonicalize(exe) {
         for ancestor in canonical.ancestors() {
-            if ancestor.join("lib/dot/main.sh").is_file() {
+            if (ancestor.join("Cargo.toml").is_file() && ancestor.join("lib/dot/public").is_dir())
+                || (ancestor.join(".dot-install.json").is_file()
+                    && ancestor.join("lib/dot/public").is_dir())
+            {
                 return ancestor.to_path_buf();
             }
         }
@@ -107,6 +87,54 @@ pub fn observed_revision(source_root: &Path) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Resolve the immutable revision associated with a checkout or packaged
+/// release. Development checkouts retain Git as their authority. A packaged
+/// runtime has no `.git`, so its signed archive metadata must agree with the
+/// commit compiled into the executable before that identity is accepted.
+pub(crate) fn source_revision(source_root: &Path) -> Option<String> {
+    observed_revision(source_root).or_else(|| release_revision(source_root))
+}
+
+fn release_revision(source_root: &Path) -> Option<String> {
+    let commit = crate::version::COMMIT;
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let metadata = source_root.join(".dot-install.json");
+    let kind = std::fs::symlink_metadata(&metadata).ok()?.file_type();
+    if !kind.is_file() || kind.is_symlink() {
+        return None;
+    }
+    let body = std::fs::read_to_string(metadata).ok()?;
+    let mut found = None;
+    for line in body.lines() {
+        let Some(rest) = line.trim().strip_prefix("\"commit\"") else {
+            continue;
+        };
+        let value = rest.trim_start().strip_prefix(':')?.trim();
+        let value = value.strip_suffix(',').unwrap_or(value).trim();
+        let value = value.strip_prefix('"')?.strip_suffix('"')?;
+        if found.replace(value).is_some() {
+            return None;
+        }
+    }
+    (found == Some(commit)).then(|| commit.to_string())
+}
+
+/// Return the packaged native entry only when the release metadata matches this
+/// build and the payload is a real executable file.
+pub(crate) fn release_binary(source_root: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    release_revision(source_root)?;
+    let binary = source_root.join("dot");
+    let metadata = std::fs::symlink_metadata(&binary).ok()?;
+    (metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.permissions().mode() & 0o111 != 0)
+        .then_some(binary)
 }
 
 /// Decide the re-exec guard over explicit revisions.
@@ -217,10 +245,8 @@ impl Failure {
     }
 }
 
-/// Run the startup prelude in shell order: re-exec guard first (exit
-/// 1), then default config load (exit 2). The returned config is for
-/// future slices; `cli::run` discards it so wired commands cannot
-/// observe a difference whenever config loads.
+/// Run the startup prelude in shell order: re-exec guard first (exit 1), then
+/// default config load (exit 2). Native dispatch consumes the returned config.
 pub fn preflight(inputs: &Inputs<'_>) -> Result<Config, Failure> {
     let observed = observed_revision(inputs.source_root);
     if let Err(line) = check_reexec_revision(inputs.reexec_expected, observed.as_deref()) {
@@ -234,6 +260,7 @@ pub fn preflight(inputs: &Inputs<'_>) -> Result<Config, Failure> {
 
 /// Run [`preflight`] against an immutable invocation runtime.
 pub fn check(runtime: &crate::app::Runtime) -> Result<Config, Failure> {
+    check_reexec(runtime)?;
     let home = runtime
         .value("HOME")
         .and_then(OsStr::to_str)
@@ -245,23 +272,24 @@ pub fn check(runtime: &crate::app::Runtime) -> Result<Config, Failure> {
     let env_policy = runtime
         .value("DOT_SHDEPS_UPDATE_POLICY")
         .and_then(OsStr::to_str);
-    let reexec_expected = runtime
+    load_default_config(home, xdg_config_home, env_policy).map_err(|line| Failure::Config { line })
+}
+
+/// Validate the provider re-exec generation before any command dispatch.
+/// Help and version deliberately stop after this guard, matching the shell
+/// entry point which does not load user configuration for informational output.
+pub(crate) fn check_reexec(runtime: &crate::app::Runtime) -> Result<(), Failure> {
+    let expected = runtime
         .value("DOT_REEXEC_EXPECTED_REVISION")
         .and_then(OsStr::to_str);
-    let inputs = Inputs {
-        home,
-        xdg_config_home,
-        env_policy,
-        reexec_expected,
-        source_root: runtime.source_root(),
-    };
-    preflight(&inputs)
+    let observed = observed_revision(runtime.source_root());
+    check_reexec_revision(expected, observed.as_deref()).map_err(|line| Failure::Reexec { line })
 }
 
 /// Run [`check`] against a one-time snapshot of the ambient process state.
 ///
-/// Compatibility-only native callers that have not yet received an explicit
-/// runtime use this adapter; command dispatch enters through [`crate::app`].
+/// Compatibility-only native callers use this adapter; command dispatch enters
+/// through [`crate::app`] with an explicit snapshot.
 pub fn check_ambient() -> Result<Config, Failure> {
     let env = std::env::vars_os().collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));

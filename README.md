@@ -8,11 +8,15 @@ repository supplies the files and extensions it wants.
 
 ## Installation
 
-Install the checkout-backed release with:
+Install the native release with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cgraf78/dot/main/install.sh | bash
 ```
+
+Online installation requires both `curl` and the GitHub CLI (`gh`). The latter
+verifies the downloaded archive's GitHub artifact attestation before it is
+activated.
 
 To initialize a client in the same operation:
 
@@ -21,22 +25,24 @@ curl -fsSL https://raw.githubusercontent.com/cgraf78/dot/main/install.sh |
   bash -s -- --init https://github.com/example/dotfiles.git
 ```
 
-The installer and public launcher run on stock macOS Bash 3.2, locate a
-validated Bash 4+ runtime, and use the same canonical checkout as Shdeps:
-`${SHDEPS_INSTALL_DIR:-$HOME/.local/share}/cgraf78/dot`. The installer never
-creates a second XDG-specific checkout.
+The installer runs on stock macOS Bash 3.2, downloads the platform archive,
+verifies its published checksum and signer-aware attestation from
+`cgraf78/actions`, and atomically selects a versioned release under
+`${XDG_DATA_HOME:-$HOME/.local/share}/cgraf78`. The `dot` engine is a native
+executable and does not require Bash. Bash 4 or newer is needed only when a
+configured user hook uses the versioned shell extension API.
 
-It publishes:
+It publishes the stable links:
 
-- `~/.local/bin/dot` -> `<checkout>/bin/dot`
-- `~/.local/lib/dot` -> `<checkout>/lib/dot/public`
+- `~/.local/bin/dot` -> `<data-home>/cgraf78/dot/dot`
+- `<data-home>/cgraf78/dot` -> the current immutable release directory
 
-Both destinations are no-clobber. A client repository may retain a regular
-`~/.local/bin/dot` only when it is byte-identical to the generated permanent
-front door in `support/client-launcher.sh`. That front door derives the same
-official install root, requires `~/.local/lib/dot` to resolve to that checkout's
-public library, and then executes its standalone runtime without sourcing
-client or checkout code itself. Missing topology reports the reinstall command.
+Both destinations are fail-closed around foreign content. Existing client
+repositories may retain a regular `~/.local/bin/dot` only when it is
+byte-identical to the compatibility adapter in `support/client-launcher.sh`.
+That adapter resolves the same standalone release root and executes its native
+binary without sourcing client code. Missing topology reports the reinstall
+command.
 
 Other regular files and directories are rejected throughout.
 
@@ -78,9 +84,9 @@ refreshes the managed release through Dot's pinned bootstrap trust anchor.
 This freshness check does not force every configured dependency to be checked;
 use `dot update --force` when dependency-wide forced convergence is intended.
 
-Only the versioned modules under `lib/dot/public` are sourceable APIs. All
-other shell files are private runtime implementation. See
-[library.md](docs/library.md).
+Only the versioned modules under `lib/dot/public` are sourceable APIs. They are
+the shell boundary for user-authored hooks, not an alternate implementation of
+the engine. See [library.md](docs/library.md).
 
 `dot doctor` runs built-in health checks plus configured `doctor.d` extensions.
 `dot test` runs trusted executable test extensions from the configured `tests`
@@ -98,7 +104,7 @@ tests/run
 The provider entry point runs its independent test files concurrently through
 the same bounded coordinator used by `dot test`.
 
-The project uses the full shared Linux, macOS, and Termux shell matrix plus a
-stock macOS Bash 3.2 bootstrap job.
+The project uses the shared Rust Linux, macOS, musl, Android, and Termux matrix,
+plus a shell matrix for the installer and public hook APIs.
 
 Licensed under the [MIT License](LICENSE).

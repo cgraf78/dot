@@ -167,8 +167,7 @@ fi
 # Restore for other tests
 printf 'one\n' >"$dirty_home/.a"
 git -C "$dirty_home/.dotfiles" checkout -q -- .a 2>/dev/null || true
-# Overlay batching is covered by existing repos-test; base batching above is sufficient
-# for the performance-structure assertion. Overlay verification uses the same
-# _repo_normalize_updated_paths path, so base coverage implies overlay.
+# Overlay ordering and worker bounds are covered by repos_pull_fleet; base
+# batching above is sufficient for this performance-structure assertion.
 
 printf 'batch-verification-test: ok\n'

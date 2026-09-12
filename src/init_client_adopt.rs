@@ -2,33 +2,13 @@
 //! legacy-client adoption, the init usage text, and the init status
 //! report.
 //!
-//! The shell file holds 79 functions — too big for one lane — so
-//! this module owns only the three contiguous functions from
-//! `_dot_init_adopt_existing` through `_dot_init_status` in file
-//! order (lines 1418-1501): the existing-client adoption
+//! This module owns existing-client adoption
 //! ([`adopt_existing`]), the command usage ([`usage`]), and the
 //! transaction status report ([`status`]).
+//! Transaction, identity, record, publication, convergence, and deletion
+//! responsibilities live in their corresponding `init_client_*` modules.
 //!
-//! Lane map, so the integrator can stack without overlap: the
-//! transaction-directory lifecycle lives on `rust-port-slice-35`
-//! (`init_client_transaction`), the host-git identity family
-//! (including `_dot_init_repo_identity`) on `rust-port-slice-41`
-//! (`init_client_identity`), the transaction record journal on
-//! `rust-port-slice-51` (`init_client_records`) and
-//! `rust-port-slice-54` (`init_client_record`), the confirmation and
-//! completion publication (including `_dot_init_publish_completed`)
-//! on `rust-port-slice-62` (`init_client_plan`), and the
-//! published-state recovery plus update convergence (including
-//! `_dot_init_forward_converge` and `_dot_init_single_origin`) on
-//! `rust-port-slice-65` (`init_client_publish`). The neighbor
-//! `_dot_init_delete_park_path` below this chapter lives on
-//! `rust-port-slice-55` (`init_client_delete`). The file-generic
-//! `_dot_init_error` diagnostic stays unported (a bare
-//! `printf ... >&2; return 1` with no family state, absorbed into
-//! [`StatusReport`] the way earlier slices absorb engine
-//! diagnostics).
-//!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the run identity from the
@@ -42,7 +22,7 @@
 //! rendered reports ([`usage`], [`status`]) return their bytes for
 //! the caller to emit, keeping this module free of ambient file
 //! descriptors. The `git` invocations below are engine mechanics,
-//! not ported functions: they run the exact `_base_git` argv
+//! direct engine mechanics: they run the exact `_base_git` argv
 //! (`--git-dir=<dir> --work-tree=<home>` for a separate client,
 //! `-C <home>` for an ordinary one) with `LC_ALL=C` pinned and the
 //! home steered at the fixture, like the shell inherits from its
@@ -50,12 +30,11 @@
 //!
 //! Byte-fidelity boundary: every `$HOME/...` join concatenates bytes
 //! like the shell, preserving a doubled separator on trailing-slash
-//! inputs instead of normalizing it away (the delete lane
-//! precedent). Command substitution chomps every trailing newline
+//! inputs instead of normalizing it away. Command substitution chomps every trailing newline
 //! before the shell compares, so git output is chomped the same way
 //! here. Journal and identity text crosses the UTF-8 boundary as
-//! `&str`, the candidate lane precedent, so non-UTF8 run values can
-//! diverge from the shell exactly the way they do on sibling lanes.
+//! `&str`, so non-UTF8 run values retain the established compatibility
+//! boundary.
 
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
@@ -65,30 +44,19 @@ use std::process::{Command, Stdio};
 use crate::repos_base::Topology;
 use crate::temp;
 
-/// Single-origin reader: the `rust-port-slice-65` lane's
-/// `_dot_init_single_origin` by detected topology, injected because
-/// that lane is unmerged. `None` is any failure, the shell's
-/// `|| return 2`.
+/// Single-origin reader by detected topology. `None` is any failure.
 pub type SingleOrigin<'a> = dyn Fn(Topology) -> Option<String> + 'a;
 
-/// Repository-identity canonicalizer: the `rust-port-slice-41`
-/// lane's `_dot_init_repo_identity`, injected because that lane is
-/// unmerged. `None` is any failure, the shell's `|| return 2`.
+/// Repository-identity canonicalizer. `None` is any failure.
 pub type RepoIdentity<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
-/// Transaction-directory derivation: the `rust-port-slice-35`
-/// lane's `_dot_init_transaction_dir`, injected because that lane is
-/// unmerged. `None` is any failure.
+/// Transaction-directory derivation. `None` is any failure.
 pub type TransactionDir<'a> = dyn Fn() -> Option<PathBuf> + 'a;
 
-/// Completion-record derivation: the `rust-port-slice-35` lane's
-/// `_dot_init_completed_file`, injected because that lane is
-/// unmerged. `None` is any failure.
+/// Completion-record derivation. `None` is any failure.
 pub type CompletedFile<'a> = dyn Fn() -> Option<PathBuf> + 'a;
 
-/// Transaction stager: the `rust-port-slice-35` lane's
-/// `_dot_init_prepare_transaction`, injected because that lane is
-/// unmerged. `None` is any failure, the shell's `|| return 3`.
+/// Transaction stager. `None` is any failure.
 pub type PrepareTransaction<'a> = dyn Fn(&Path) -> Option<PathBuf> + 'a;
 
 /// Record fields for one `_dot_init_write_record` call: the
@@ -122,68 +90,50 @@ pub struct RecordFields<'a> {
     pub git_ino: &'a str,
 }
 
-/// Record journal writer: the `rust-port-slice-51` /
-/// `rust-port-slice-54` lanes' `_dot_init_write_record`, injected
-/// because those lanes are unmerged. `false` is any failure, the
-/// shell's `|| return 3`.
+/// Record journal writer. `false` is any failure.
 pub type WriteRecord<'a> = dyn Fn(&RecordFields<'_>) -> bool + 'a;
 
-/// Transaction publisher: the `rust-port-slice-35` lane's
-/// `_dot_init_publish_transaction`, injected because that lane is
-/// unmerged. `false` is any failure, the shell's `|| return 3`.
+/// Transaction publisher. `false` is any failure.
 pub type PublishTransaction<'a> = dyn Fn(&Path, &Path) -> bool + 'a;
 
-/// Update convergence entry: the `rust-port-slice-65` lane's
-/// `_dot_init_forward_converge`, injected because that lane is
-/// unmerged (and because this chapter must not touch it). The shell
-/// passes the detected topology and git directory through the
-/// `DOT_BASE_TOPOLOGY` / `DOT_CLIENT_GIT_DIR` globals; here they
-/// cross as arguments. `false` is any failure, the shell's
-/// `|| return 3`.
+/// Update convergence entry. Topology and git directory cross this
+/// boundary as arguments; `false` is any failure.
 pub type ForwardConverge<'a> = dyn Fn(Topology, &Path) -> bool + 'a;
 
-/// Completion publisher: the `rust-port-slice-62` lane's
-/// `_dot_init_publish_completed`, injected because that lane is
-/// unmerged. `false` is any failure, the shell's `|| return 3`.
+/// Completion publisher. `false` is any failure.
 pub type PublishCompleted<'a> = dyn Fn(&Path) -> bool + 'a;
 
-/// Record reader for the status report: the
-/// `rust-port-slice-51` / `rust-port-slice-54` lanes'
-/// `_dot_init_read_record`, projected onto the four fields the
-/// status report prints, injected because those lanes are unmerged.
-/// `None` is any failure (including a malformed record).
+/// Record reader projected onto the fields printed by status.
+/// `None` is any failure, including a malformed record.
 pub type ReadRecord<'a> = dyn Fn(&Path) -> Option<StatusRecord> + 'a;
 
-/// Cross-lane engine for [`adopt_existing`]: one closure per shell
-/// call by name, so tests feed either stubs or closures running the
-/// live shell functions.
+/// Dependencies for [`adopt_existing`], injected for focused tests.
 pub struct AdoptEngine<'a> {
-    /// Lane-65 single-origin reader.
+    /// Single-origin reader.
     pub single_origin: &'a SingleOrigin<'a>,
-    /// Lane-41 repository-identity canonicalizer.
+    /// Repository-identity canonicalizer.
     pub repo_identity: &'a RepoIdentity<'a>,
-    /// Lane-35 transaction-directory derivation.
+    /// Transaction-directory derivation.
     pub transaction_dir: &'a TransactionDir<'a>,
-    /// Lane-35 transaction stager.
+    /// Transaction stager.
     pub prepare_transaction: &'a PrepareTransaction<'a>,
-    /// Lanes-51/54 record journal writer.
+    /// Record journal writer.
     pub write_record: &'a WriteRecord<'a>,
-    /// Lane-35 transaction publisher.
+    /// Transaction publisher.
     pub publish_transaction: &'a PublishTransaction<'a>,
-    /// Lane-65 update convergence entry.
+    /// Update convergence entry.
     pub forward_converge: &'a ForwardConverge<'a>,
-    /// Lane-62 completion publisher.
+    /// Completion publisher.
     pub publish_completed: &'a PublishCompleted<'a>,
 }
 
-/// Cross-lane engine for [`status`]: one closure per shell call by
-/// name.
+/// Dependencies for [`status`], injected for focused tests.
 pub struct StatusEngine<'a> {
-    /// Lane-35 transaction-directory derivation.
+    /// Transaction-directory derivation.
     pub transaction_dir: &'a TransactionDir<'a>,
-    /// Lane-35 completion-record derivation.
+    /// Completion-record derivation.
     pub completed_file: &'a CompletedFile<'a>,
-    /// Lanes-51/54 record reader (status projection).
+    /// Record reader projected for status.
     pub read_record: &'a ReadRecord<'a>,
 }
 
@@ -295,7 +245,7 @@ fn valid_commit(commit: &[u8]) -> bool {
     (commit.len() == 40 || commit.len() == 64) && commit.iter().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Scrub the ambient `GIT_*` overrides the shell oracle never sees
+/// Scrub ambient `GIT_*` overrides the isolated repository must not see
 /// (it runs under `env_clear`), so a developer's exported `GIT_DIR`
 /// cannot steer one engine and not the other. Twin of the
 /// `temp::sanitized_git` unset list, without its `-c`/`-C` source
@@ -327,7 +277,7 @@ fn unset_git_env(cmd: &mut Command) {
 /// cannot start or reports failure, like the shell's `|| return` on
 /// the substitution — git's own stderr is silenced.
 fn base_git(home: &Path, prefix: &[OsString], args: &[&str]) -> Option<Vec<u8>> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::init_client_identity::host_git_command();
     unset_git_env(&mut cmd);
     cmd.env("LC_ALL", "C")
         .env("HOME", home)

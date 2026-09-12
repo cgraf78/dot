@@ -12,10 +12,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Infrastructure failure kinds.
 ///
-/// Scaffolding for slice 2+: no slice-1 path constructs these yet (only
-/// the self-tests below touch them). The shape is settled now so the
-/// lock/config/git-callers arriving in slices 2-3 share one error type
-/// instead of each inventing their own.
+/// Shared by lock, configuration, filesystem, and process boundaries so each
+/// caller does not invent its own status vocabulary.
 #[derive(Debug)]
 pub enum Error {
     /// Caller usage error (shell exit 2): malformed registration input,

@@ -9,14 +9,9 @@ workflow=$DOT_TEST_ROOT/.github/workflows/test.yml
 grep -Fxq 'name: Tests' "$workflow" ||
   fail 'primary workflow must use the standard Tests display name'
 # shellcheck disable=SC2016 # The workflow must retain this literal shell expression.
-if ! grep -Fq '[[ -z "$modern_bash" || ! -x "$modern_bash" ]]' "$workflow"; then
+if ! grep -Fq 'if [ -z "$brew_prefix" ] || [ ! -x "$brew_prefix/bin/bash" ]; then' "$workflow"; then
   fail 'modern Bash provisioning must validate the executable, not only its Homebrew prefix'
 fi
-# shellcheck disable=SC2016 # The workflow must retain this literal shell expression.
-if ! grep -Fq 'git -C "$origin" config receive.shallowUpdate true' "$workflow"; then
-  fail 'the disposable installer origin must accept a depth-1 CI checkout'
-fi
-
 assert_eq 1 "$(grep -Fc 'name: Verify Shdeps lock' "$workflow")" \
   'CI exposes exactly one stable singleton Shdeps lock check'
 grep -Fq 'fetch-depth: 0' "$workflow" ||
@@ -30,8 +25,20 @@ grep -Fq "BASE_SHA: \${{ github.event.pull_request.base.sha || github.event.befo
 # shellcheck disable=SC2016 # The workflow must retain these literal shell variables.
 grep -Fq 'run: scripts/verify-shdeps-lock --if-changed "$EVENT_NAME" "$BASE_SHA"' \
   "$workflow" || fail 'CI must delegate lock change detection to the verifier'
-grep -Fq 'needs: [shell, macos-bash32, shdeps-lock, rust]' "$workflow" ||
+grep -Fq 'needs: [shell, shdeps-lock, rust]' "$workflow" ||
   fail 'Required must wait for the Shdeps lock check and the Rust port'
+rust_job=$(sed -n '/^  rust:/,/^  shell:/p' "$workflow")
+shell_job=$(sed -n '/^  shell:/,/^  shdeps-lock:/p' "$workflow")
+grep -Fq 'bash tests/run' <<<"$rust_job" ||
+  fail 'Rust platform CI must run the native-backed shell acceptance suite'
+if grep -Fq 'bash tests/run' <<<"$shell_job"; then
+  fail 'shell-only CI cannot run the native-backed acceptance suite without a build'
+fi
+grep -Fq 'bash tests/library-test' <<<"$shell_job" ||
+  fail 'shell CI must retain public library boundary coverage'
+# shellcheck disable=SC2016 # Workflow variables must remain literal.
+grep -Fq 'HOME="$install_root/home" ./install.sh' "$workflow" ||
+  fail 'Linux package smoke must activate the musl artifact through install.sh'
 # shellcheck disable=SC2016 # The workflow must retain this literal expression.
 grep -Fq 'SHDEPS_LOCK_RESULT: ${{ needs.shdeps-lock.result }}' "$workflow" ||
   fail 'Required must receive the Shdeps lock result'
