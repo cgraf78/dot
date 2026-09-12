@@ -2772,6 +2772,12 @@ fn process_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(processes) = macos_native_snapshot(deadline) {
+            return Some(processes);
+        }
+    }
     // This is an OS process-table interface, not a caller-selected tool.
     #[cfg(target_os = "android")]
     let mut command = Command::new("/system/bin/ps");
@@ -2868,6 +2874,151 @@ fn macos_row_membership(pid: u32, zombie: bool) -> std::io::Result<Option<(u32, 
         }
         _ => Err(std::io::Error::other("macOS session query failed")),
     }
+}
+
+/// Snapshot the macOS process table without spawning `ps`.
+///
+/// A fork+exec costs ~200ms on loaded macOS runners and teardown takes
+/// several snapshots per stop, so spawn latency burns the verification
+/// budget and reports "could not verify". `proc_listpids` enumerates the
+/// table in one syscall and each row resolves through `proc_pidinfo` plus
+/// `getsid`, matching the `ps` fallback row-for-row. Any failure returns
+/// None and the caller falls back to `ps`.
+#[cfg(target_os = "macos")]
+fn macos_native_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
+    // `PROC_ALL_PIDS` is stable libproc ABI (1) but absent from libc 0.2.
+    const PROC_ALL_PIDS: u32 = 1;
+    let mut capacity: usize = 4096;
+    let mut pids: Vec<i32> = Vec::new();
+    let mut complete = false;
+    // A full buffer may mean truncation (processes fork concurrently), so
+    // grow boundedly until a fetch leaves room, then fall back to `ps`.
+    for _ in 0..4 {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        pids.resize(capacity, 0);
+        // SAFETY: pids owns capacity pid_t slots; PROC_ALL_PIDS lists all.
+        let written = unsafe {
+            libc::proc_listpids(
+                PROC_ALL_PIDS,
+                0,
+                pids.as_mut_ptr().cast(),
+                (capacity * std::mem::size_of::<i32>()) as libc::c_int,
+            )
+        };
+        if written < 0 {
+            return None;
+        }
+        let count = (written as usize) / std::mem::size_of::<i32>();
+        if count < capacity {
+            pids.truncate(count);
+            complete = true;
+            break;
+        }
+        capacity = capacity.saturating_mul(2);
+    }
+    if !complete {
+        return None;
+    }
+    let mut processes = Vec::with_capacity(pids.len());
+    for pid in pids {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let Ok(pid) = u32::try_from(pid) else {
+            continue;
+        };
+        // PID 0 (the kernel scheduler) is skipped: querying it would
+        // alias the caller.
+        if pid == 0 {
+            continue;
+        }
+        match macos_native_process_info(pid) {
+            Ok(Some(process)) => processes.push(process),
+            Ok(None) => {}
+            Err(()) => return None,
+        }
+    }
+    Some(processes)
+}
+
+/// Resolve one macOS snapshot row through `proc_pidinfo`.
+///
+/// Returns `Ok(None)` for a row that exited mid-query (unrelated churn),
+/// `Err` for any other query failure (fails the whole snapshot closed,
+/// matching the `ps` fallback), and the row otherwise. The `getsid`
+/// lookup is bracketed with two matching kernel records so PID reuse or
+/// a concurrent setsid cannot splice topology from different generations
+/// into one row. Zombies keep the self-referential pair the `ps`
+/// fallback uses since they are definitively dead.
+#[cfg(target_os = "macos")]
+fn macos_native_process_info(pid: u32) -> Result<Option<ProcessInfo>, ()> {
+    let Some(before) = macos_bsd_info(pid) else {
+        return Ok(None);
+    };
+    if before.pbi_status == libc::SZOMB {
+        return Ok(Some(ProcessInfo {
+            pid,
+            parent: before.pbi_ppid,
+            group: pid,
+            session: pid,
+            live: false,
+            identity: ProcessIdentity { pid, start: None },
+        }));
+    }
+    // SAFETY: getsid takes a PID and no pointers.
+    let session = unsafe { libc::getsid(pid as libc::pid_t) };
+    if session < 0 {
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(());
+    }
+    let Some(after) = macos_bsd_info(pid) else {
+        return Ok(None);
+    };
+    // A generation change between the two records means the PID was
+    // reused mid-query; skip the row rather than splicing generations.
+    if before.pbi_pid != after.pbi_pid
+        || before.pbi_ppid != after.pbi_ppid
+        || before.pbi_pgid != after.pbi_pgid
+        || before.pbi_start_tvsec != after.pbi_start_tvsec
+        || before.pbi_start_tvusec != after.pbi_start_tvusec
+    {
+        return Ok(None);
+    }
+    Ok(Some(ProcessInfo {
+        pid,
+        parent: before.pbi_ppid,
+        group: before.pbi_pgid,
+        session: session as u32,
+        live: true,
+        identity: ProcessIdentity { pid, start: None },
+    }))
+}
+
+/// Read one macOS process record through `proc_pidinfo`.
+#[cfg(target_os = "macos")]
+fn macos_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    let pid_i32 = i32::try_from(pid).ok()?;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: info owns size writable bytes and this flavor has no
+    // auxiliary argument.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid_i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    if written != size || info.pbi_pid != pid {
+        return None;
+    }
+    Some(info)
 }
 
 /// Parse the macOS `ps` columns and resolve group/session per PID.
@@ -10641,6 +10792,27 @@ int kill(pid_t pid, int sig) {
         );
         assert!(started.elapsed() < Duration::from_secs(6));
         assert!(!alive(pid), "self-bounded descendant survived");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_native_snapshot_lists_current_process() {
+        let snapshot = macos_native_snapshot(Instant::now() + Duration::from_secs(5))
+            .expect("native snapshot succeeds");
+        let me = std::process::id();
+        let row = snapshot
+            .iter()
+            .find(|process| process.pid == me)
+            .expect("current process row present");
+        assert!(row.live, "current process must be live: {row:?}");
+        // The native row must match the per-PID resolver the snapshot is
+        // built from, so rows stay consistent across the walk.
+        let resolved = macos_native_process_info(me)
+            .expect("resolver succeeds")
+            .expect("current process row resolves");
+        assert_eq!(row.parent, resolved.parent);
+        assert_eq!(row.group, resolved.group);
+        assert_eq!(row.session, resolved.session);
     }
 
     #[test]
