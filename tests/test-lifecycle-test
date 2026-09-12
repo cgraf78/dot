@@ -114,6 +114,17 @@ while True:
     deadline = time.monotonic() + 5
     while not ready.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
+    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+    if not ready.exists():
+        child.kill()
+        try:
+            o, e = child.communicate(timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            print(f"NESTED-DUMP communicate failed: {exc!r}")
+        else:
+            print(f"NESTED-DUMP returncode={child.returncode}")
+            print(f"NESTED-DUMP stdout={o!r}")
+            print(f"NESTED-DUMP stderr={e!r}")
     assert ready.exists(), "nested timeout target did not become ready"
     os.kill(child.pid, signal.SIGTERM)
     stdout, stderr = child.communicate(timeout=7)

@@ -294,12 +294,20 @@ impl Worker {
         let command = match self.command(mode, script, result_dir, result_file, context, token) {
             Ok(command) => command,
             Err(CommandFailure::Invalid) => {
+                // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
+                if std::env::var_os("DOT_TEST_DIAG_HOOKS").is_some() {
+                    eprintln!("TEMP-DIAG-180 HOOKS-INVALID-COMMAND {mode} {script:?}");
+                }
                 return WorkerOutcome {
                     rc: 1,
                     output: Vec::new(),
                 };
             }
             Err(CommandFailure::Bash(error)) => {
+                // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
+                if std::env::var_os("DOT_TEST_DIAG_HOOKS").is_some() {
+                    eprintln!("TEMP-DIAG-180 HOOKS-BASH-FAIL {mode} {script:?}: {error}");
+                }
                 return WorkerOutcome {
                     rc: 1,
                     output: self.runtime.bash_error_line_once(&error),

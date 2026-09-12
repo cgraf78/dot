@@ -688,6 +688,10 @@ fn run_one(
         .is_ok()
         && crate::temp::private_dir_validate(&temporary).is_ok();
     if !ready {
+        // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
+        if std::env::var_os("DOT_TEST_DIAG_HOOKS").is_some() {
+            eprintln!("TEMP-DIAG-180 HOOKS-NO-TMPDIR key={:?}", hook.key);
+        }
         return ResultRecord {
             hook,
             rc: 1,
@@ -710,6 +714,10 @@ fn run_one(
         inputs.extension_inputs.euid,
     );
     let started = Instant::now();
+    // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
+    if created.is_err() && std::env::var_os("DOT_TEST_DIAG_HOOKS").is_some() {
+        eprintln!("TEMP-DIAG-180 HOOKS-NO-CONTEXT key={:?}", hook.key);
+    }
     let (rc, output) = match created {
         Ok((context, token)) => {
             let mut worker = crate::hook_worker::Worker::for_update(
@@ -777,6 +785,19 @@ fn run_batch(
     let root = state.root;
     let overlays = state.overlays;
     let first_index = state.merge_index - hooks.len();
+    // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
+    // Env-gated so exact-output CLI assertions stay green.
+    let diag = std::env::var_os("DOT_TEST_DIAG_HOOKS").is_some();
+    if diag && !hooks.is_empty() {
+        eprintln!(
+            "TEMP-DIAG-180 HOOKS-BATCH hooks={} jobs={}",
+            hooks.len(),
+            jobs.max(1)
+        );
+        for hook in hooks {
+            eprintln!("TEMP-DIAG-180 HOOKS-DISCOVERED {:?}", hook.key);
+        }
+    }
     std::thread::scope(|scope| {
         // The shell never retains more PIDs than there are hooks. Do not let a
         // user-controlled but valid numeric job limit reserve unrelated memory.
@@ -813,6 +834,19 @@ fn run_batch(
             }))
         }
     });
+    // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
+    if diag {
+        for record in &records {
+            eprintln!(
+                "TEMP-DIAG-180 HOOKS-RECORD key={:?} rc={} has_merge={} elapsed_ms={} output={:?}",
+                record.hook.key,
+                record.rc,
+                record.has_merge,
+                record.elapsed_ms,
+                String::from_utf8_lossy(&record.output),
+            );
+        }
+    }
     records
 }
 

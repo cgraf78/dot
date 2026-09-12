@@ -341,7 +341,17 @@ assert_eq 'base destination' \
   "$(<"$base_fallback_home/.config/base-fallback/value")" \
   'failed handoff keeps base destination content available'
 mv "$base_fallback_blocker_origin.offline" "$base_fallback_blocker_origin"
-run_dot "$base_fallback_home" "$base_fallback_state" update -f >/dev/null
+# TEMP-DIAG-180: remove after the macOS ownership diagnosis (hang watch).
+base_fallback_retry_status=0
+base_fallback_retry_output=$("$root/lib/dot/public/test-timeout-v1" 90s \
+  env HOME="$base_fallback_home" XDG_STATE_HOME="$base_fallback_state" XDG_CONFIG_HOME='' \
+  "$DOT_TEST_ROOT/bin/dot" update -f 2>&1) || base_fallback_retry_status=$?
+if [[ $base_fallback_retry_status -eq 125 ]]; then
+  printf '%s\n' "HANG-DUMP retry hit 90s timeout; output: $base_fallback_retry_output"
+  ps -ef | head -60 || true
+fi
+assert_eq 0 "$base_fallback_retry_status" \
+  'base handoff retry finished before the hang watch'
 assert_eq 'base destination' \
   "$(<"$base_fallback_home/.config/base-fallback/value")" \
   'base handoff retry converges'
