@@ -4385,7 +4385,7 @@ case " $* " in
   *" rebase --autostash "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_SYNC_READY"
-    while :; do sleep 1; done
+    while :; do sleep 0.05; done
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
@@ -4444,7 +4444,7 @@ case " $* " in
   *" fetch "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_FETCH_READY"
-    while :; do sleep 1; done
+    while :; do sleep 0.05; done
     ;;
   *" rev-parse --absolute-git-dir "*)
     if [ -s "$DOT_TEST_GIT_FETCH_READY" ]; then
@@ -4515,7 +4515,7 @@ case " $* " in
   *" rev-parse HEAD "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 1; done
+    while :; do sleep 0.05; done
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
@@ -4581,7 +4581,7 @@ case " $* " in
   *" rev-parse HEAD "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 1; done
+    while :; do sleep 0.05; done
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
@@ -4632,7 +4632,7 @@ fn direct_signals_during_crontab_stop_the_owned_query() {
         let crontab = shim_dir.join("crontab");
         std::fs::write(
             &crontab,
-            b"#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' \"$$\" >\"$DOT_TEST_CRONTAB_READY\"\nwhile :; do sleep 1; done\n",
+            b"#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' \"$$\" >\"$DOT_TEST_CRONTAB_READY\"\nwhile :; do sleep 0.05; done\n",
         )
         .expect("write crontab shim");
         std::fs::set_permissions(&crontab, std::fs::Permissions::from_mode(0o755))
@@ -4679,7 +4679,7 @@ case " $* " in
   *" rev-parse --absolute-git-dir "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 1; done
+    while :; do sleep 0.05; done
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
@@ -4738,7 +4738,7 @@ case " $* " in
   *" clone "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 1; done
+    while :; do sleep 0.05; done
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
@@ -4813,7 +4813,7 @@ case " $* " in
   *" clone --quiet --no-hardlinks "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 1; done
+    while :; do sleep 0.05; done
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
@@ -4932,7 +4932,7 @@ for arg do last=$arg; done
 if [ "$last" = ls-files ]; then
   trap '' TERM
   printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-  while :; do sleep 1; done
+  while :; do sleep 0.05; done
 fi
 exec "$DOT_TEST_REAL_GIT" "$@"
 "#,
@@ -5052,7 +5052,7 @@ case " $* " in
     if [ -e "$DOT_TEST_GIT_FETCH_FINISHED" ]; then
       trap '' TERM
       printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-      while :; do sleep 1; done
+      while :; do sleep 0.05; done
     fi
     ;;
 esac
@@ -5121,7 +5121,7 @@ fn update_native_signal_during_merge_retains_lifecycle_state_and_skips_normaliza
             .client
             .home
             .join("extensions/merge-hooks.d/10-config.sh"),
-        b"merge() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/merge-cancel-ready\"\n  while :; do sleep 1; done\n}\n",
+        b"merge() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/merge-cancel-ready\"\n  while :; do sleep 0.05; done\n}\n",
     )
     .expect("blocking merge hook");
     std::fs::write(
@@ -5379,7 +5379,7 @@ fn update_native_signal_during_retirement_retains_lifecycle_state_and_skips_norm
     seed_advance(
         &fixture.client.overlay_seed,
         "dot/profile-deactivate",
-        b"deactivate() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/retire-cancel-ready\"\n  while :; do sleep 1; done\n}\n",
+        b"deactivate() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/retire-cancel-ready\"\n  while :; do sleep 0.05; done\n}\n",
     );
     assert_native_silent(
         &fixture.rust_dot_with_bash(&["update", "--quiet"]),

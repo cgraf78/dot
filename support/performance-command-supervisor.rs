@@ -4,7 +4,8 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::ffi::{c_int, c_long, c_ulong, OsString};
+use std::ffi::OsString;
+use std::ffi::{c_int, c_long, c_ulong};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -1671,11 +1672,37 @@ fn spawn_relay(
     let identity = match process_identity(child.id()) {
         Ok(Some(identity)) if identity.live => identity,
         Ok(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "supervised command {stream} relay vanished during identity binding"
-            ));
+            // Non-live immediately after spawn: an empty stream drains
+            // to EOF before the bind, so a clean exit is completion,
+            // not disappearance. The child is unreaped, so its PID
+            // cannot be recycled yet and try_wait strikes nothing else.
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => {
+                    return Ok(RelayChild {
+                        key: ProcessKey {
+                            pid: child.id(),
+                            start: 0,
+                        },
+                        child,
+                        destination_mask,
+                        destination_detached: false,
+                        stream,
+                        status: Some(status),
+                    });
+                }
+                Ok(Some(status)) => {
+                    return Err(format!(
+                        "supervised command {stream} relay exited {status:?} before identity binding"
+                    ));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "supervised command {stream} relay vanished during identity binding"
+                    ));
+                }
+            }
         }
         Err(error) => {
             let _ = child.kill();
@@ -1822,9 +1849,17 @@ impl OutputRelay {
     }
 
     fn keys(&self) -> Vec<ProcessKey> {
-        let mut keys = vec![self.stdout.key];
+        // Relays that drained before the identity bind carry a
+        // zero start time and are already reaped: they need no
+        // baseline exclusion and must not match recycled PIDs.
+        let mut keys = Vec::new();
+        if self.stdout.status.is_none() {
+            keys.push(self.stdout.key);
+        }
         if let Some(stderr) = &self.stderr {
-            keys.push(stderr.key);
+            if stderr.status.is_none() {
+                keys.push(stderr.key);
+            }
         }
         keys
     }
@@ -4496,12 +4531,14 @@ mod tests {
         let (_read, write) =
             internal_pipe("fixture read", "fixture write").expect("create aliased fixture pipe");
         let alias = duplicate_internal_fd(&write, "fixture alias").expect("duplicate fixture pipe");
-        assert!(same_open_file(write.as_raw_fd(), alias.as_raw_fd())
-            .expect("compare aliased descriptors"));
+        let aliased = same_open_file(write.as_raw_fd(), alias.as_raw_fd())
+            .expect("compare aliased descriptors");
+        assert!(aliased);
         let (_other_read, other_write) =
             internal_pipe("other read", "other write").expect("create distinct fixture pipe");
-        assert!(!same_open_file(write.as_raw_fd(), other_write.as_raw_fd())
-            .expect("compare distinct descriptors"));
+        let distinct = same_open_file(write.as_raw_fd(), other_write.as_raw_fd())
+            .expect("compare distinct descriptors");
+        assert!(!distinct);
     }
 
     #[test]

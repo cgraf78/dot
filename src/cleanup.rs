@@ -7830,8 +7830,14 @@ while True:
             .stderr(Stdio::null());
         let marker_for_signal = marker.clone();
         let sender = std::thread::spawn(move || {
+            // The fixture creates the marker before writing the child PID,
+            // so existence alone races the write: signal only once the
+            // marker carries a parseable PID.
             poll_until(Instant::now() + Duration::from_secs(2), || {
-                Ok(marker_for_signal.exists().then_some(()))
+                let ready = std::fs::read_to_string(&marker_for_signal)
+                    .ok()
+                    .is_some_and(|text| valid_pid(text.trim()));
+                Ok(ready.then_some(()))
             })
             .unwrap();
             // SAFETY: this helper process owns an installed SIGTERM handler.
@@ -9589,7 +9595,7 @@ os._exit(0)
         grouped
             .args([
                 "-c",
-                "(trap '' TERM; printf '%s\\n' \"$BASHPID\" >\"$1\"; while :; do sleep 1; done) & while [[ ! -s $1 ]]; do sleep 0.01; done; exit 0",
+                "(trap '' TERM; printf '%s\\n' \"$BASHPID\" >\"$1\"; while :; do sleep 0.05; done) & while [[ ! -s $1 ]]; do sleep 0.01; done; exit 0",
                 "no-pidfd-grouped",
             ])
             .arg(&grouped_pid)
@@ -9999,7 +10005,7 @@ os._exit(0)
         command
             .args([
                 "-c",
-                "trap '' TERM; printf '%s\\n' \"$$\" >\"$1\"; while :; do sleep 1; done",
+                "trap '' TERM; printf '%s\\n' \"$$\" >\"$1\"; while :; do sleep 0.05; done",
                 "supervisor-tick-error",
             ])
             .arg(&ready)
@@ -10486,7 +10492,7 @@ int kill(pid_t pid, int sig) {
                 // supervisor drains mid-stop) but needs a single drain round
                 // trip; 512KB needs two, which a loaded host cannot always
                 // fit inside the one-second TERM grace.
-                "set -m; (trap 'printf \"%327680s\" x; : >\"$2\"; exit 0' TERM; printf ready >\"$1\"; while :; do sleep 1; done) & until [[ -s $1 ]]; do sleep 0.01; done; exit 0",
+                "set -m; (trap 'printf \"%327680s\" x; : >\"$2\"; exit 0' TERM; printf ready >\"$1\"; while :; do sleep 0.05; done) & until [[ -s $1 ]]; do sleep 0.01; done; exit 0",
                 "supervisor-term-output",
             ])
             .arg(&ready)

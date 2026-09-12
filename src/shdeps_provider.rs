@@ -2869,7 +2869,9 @@ mod tests {
                 .stderr(std::process::Stdio::inherit())
                 .spawn()
                 .expect("blocking-writer helper");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            // Sender budget is 10s to enter plus 6s to clean; keep the
+            // parent watchdog above their sum.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
             let status = loop {
                 if let Some(status) = child.try_wait().expect("observe helper") {
                     break status;
@@ -2902,7 +2904,7 @@ mod tests {
         let provider = scratch.path().join("provider");
         std::fs::write(
             &provider,
-            b"#!/bin/sh\ntrap ': >\"$DOT_TEST_PROVIDER_STOPPED\"; exit 143' TERM\nprintf '%s\\n' '{\"event\":\"warning\",\"status\":\"warning\",\"detail\":\"blocking sink\"}'\nwhile :; do sleep 1; done\n",
+            b"#!/bin/sh\ntrap ': >\"$DOT_TEST_PROVIDER_STOPPED\"; exit 143' TERM\nprintf '%s\\n' '{\"event\":\"warning\",\"status\":\"warning\",\"detail\":\"blocking sink\"}'\nwhile :; do sleep 0.05; done\n",
         )
         .expect("provider fixture");
         std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755))
@@ -2964,7 +2966,10 @@ mod tests {
         let signals = crate::cleanup::Signals::install().expect("signal owner");
         let sender = std::thread::spawn(move || {
             let (lock, condition) = &*sender_state;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            // Provider spawn plus first-event delivery runs under the full
+            // parallel suite on hosted runners; macOS needs more than the
+            // original 4s tail budget.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             let mut state = lock.lock().expect("sender lock");
             while !state.entered && std::time::Instant::now() < deadline {
                 let (next, _) = condition
@@ -2978,7 +2983,7 @@ mod tests {
                 // SAFETY: this helper installed a synchronous SIGINT owner.
                 assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGINT) }, 0);
             }
-            let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
             while !stopped_for_sender.exists() && std::time::Instant::now() < cleanup_deadline {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -2986,15 +2991,24 @@ mod tests {
             let mut state = lock.lock().expect("release lock");
             state.release = true;
             condition.notify_all();
-            cleaned_while_blocked
+            (entered, stopped_for_sender.exists(), cleaned_while_blocked)
         });
         let mut output = BlockingWriter { state: shared };
         let mut errors = Vec::new();
 
         let outcome = run_update(&inputs, &ready, &mut stage, 0, &mut output, &mut errors);
 
+        let (entered, stopped, cleaned_while_blocked) = sender.join().expect("signal sender");
         assert!(
-            sender.join().expect("signal sender"),
+            entered,
+            "provider never delivered its first event to the outward sink"
+        );
+        assert!(
+            stopped,
+            "provider trap did not run while the outward sink was blocked"
+        );
+        assert!(
+            cleaned_while_blocked,
             "provider cleanup waited for the outward sink to unblock"
         );
         assert!(outcome.abort, "interrupted provider update did not abort");
