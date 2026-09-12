@@ -693,6 +693,13 @@ fn native_doctor_term_reaps_extension() {
 #[test]
 #[cfg(target_os = "macos")]
 fn native_doctor_unpinned_descendant_fails_closed_boundedly() {
+    // Portable supervision has no stable signal authority for an unpinned
+    // live member (no pidfds), so it refuses delivery and fails closed
+    // with 125 instead of Linux's exact-delivery 1. The descendant must
+    // outlive the stop sequence deterministically: a self-exiting sleeper
+    // races the authority check (exit 1 when already dead, 125 when live).
+    // The test therefore owns cleanup of the surviving descendant, like
+    // the provider escaped-stderr fixtures do.
     let home = TempDir::new("doctor-unpinned-home").expect("home");
     let state = TempDir::new("doctor-unpinned-state").expect("state");
     let root = home.path().join("extensions");
@@ -707,7 +714,7 @@ fn native_doctor_unpinned_descendant_fails_closed_boundedly() {
     .expect("config");
     std::fs::write(
         directory.join("10-escape.sh"),
-        b"doctor() {\n  set -m\n  (trap '' TERM; printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-unpinned-descendant\"; sleep 3) </dev/null >/dev/null 2>&1 &\n  until [[ -s $HOME/doctor-unpinned-descendant ]]; do sleep 0.02; done\n}\n",
+        b"doctor() {\n  set -m\n  (trap '' TERM; printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-unpinned-descendant\"; sleep 30) </dev/null >/dev/null 2>&1 &\n  until [[ -s $HOME/doctor-unpinned-descendant ]]; do sleep 0.02; done\n}\n",
     )
     .expect("extension");
     seal(&root, 0o700);
@@ -723,17 +730,29 @@ fn native_doctor_unpinned_descendant_fails_closed_boundedly() {
         .trim()
         .parse::<i32>()
         .expect("descendant pid");
+    assert_eq!(output.status.code(), Some(125));
+    kill_process(pid);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while process_live(pid) && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
-    assert_eq!(output.status.code(), Some(1));
     assert!(
         started.elapsed() < std::time::Duration::from_secs(6),
         "doctor incomplete cleanup was not bounded"
     );
-    assert!(!process_live(pid), "self-bounded descendant survived");
+    assert!(
+        !process_live(pid),
+        "refused descendant survived test cleanup"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn kill_process(pid: i32) {
+    // SAFETY: positive test-owned PID read from the descendant marker.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
 }
 
 #[test]
