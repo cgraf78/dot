@@ -173,7 +173,7 @@ fn pull_cmd_keeps_the_callers_foreground_controlling_tty() {
         0
     );
     // SAFETY: successful openpty returned uniquely owned descriptors.
-    let _master = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
+    let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
     let slave = unsafe { std::fs::File::from_raw_fd(slave) };
     let mut command = Command::new(std::env::current_exe().expect("test executable"));
     command
@@ -203,6 +203,26 @@ fn pull_cmd_keeps_the_callers_foreground_controlling_tty() {
         });
     }
     let mut child = command.spawn().expect("PTY pull helper");
+    // Drain the master for the helper's whole lifetime: a never-read
+    // master wedges the helper in SIGKILL-proof `E` state on macOS,
+    // where the line discipline drains pending slave output during
+    // exit teardown. The detached drainer exits at EOF or error.
+    let _drainer = std::thread::Builder::new()
+        .name("pty-master-drain".to_owned())
+        .spawn(move || {
+            use std::io::Read as _;
+            let mut master = std::fs::File::from(master);
+            let mut chunk = [0u8; 8192];
+            loop {
+                match master.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .expect("PTY master drainer");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
     let status = loop {
         if let Some(status) = child.try_wait().expect("observe PTY pull helper") {

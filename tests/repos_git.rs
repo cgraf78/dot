@@ -186,7 +186,7 @@ fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
         0
     );
     // SAFETY: successful openpty returned uniquely owned descriptors.
-    let _master = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
+    let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
     let slave = unsafe { std::fs::File::from_raw_fd(slave) };
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
@@ -216,6 +216,31 @@ fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
         });
     }
     let mut child = command.spawn().unwrap();
+    // Drain the master for the helper's whole lifetime. BSD line
+    // disciplines block the last slave close in exit teardown until
+    // pending output drains to the master; a never-read master wedges
+    // the helper in SIGKILL-proof `E` state on macOS (Linux discards
+    // instead). The drainer owns the only master fd and exits at EOF
+    // or the first read error; it stays detached so a wedged helper
+    // can never hang the harness join itself.
+    let _drainer = std::thread::Builder::new()
+        .name("pty-master-drain".to_owned())
+        .spawn(move || {
+            use std::io::Read as _;
+            let mut master = std::fs::File::from(master);
+            let mut chunk = [0u8; 8192];
+            loop {
+                match master.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    // EIO once the final slave closes (Linux) plus HUP
+                    // and teardown races: nothing left to drain.
+                    Err(_) => break,
+                }
+            }
+        })
+        .expect("PTY master drainer");
     // The helper exits in milliseconds when the runner is quiet, but it
     // spawns a Python check plus supervised PTY teardown, so a saturated
     // macOS runner needs headroom. The bound still catches true hangs.
@@ -228,7 +253,8 @@ fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
             // Report whether the fake git ran (marker) and whether the
             // helper is even killable, so a timeout names the wedge
             // instead of just the bound. Never block here: poll the
-            // reap briefly, then fail; master close HUPs strays.
+            // reap briefly, then fail; the detached drainer keeps the
+            // master open so slave output can never wedge the reap.
             // Snapshot the helper's kernel state plus its live children
             // BEFORE signaling: a SIGKILL-proof wedge is a kernel wait
             // (uninterruptible/exiting), and the state plus whom it waits
