@@ -2954,8 +2954,10 @@ fn macos_native_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
 /// fallback uses since they are definitively dead.
 #[cfg(target_os = "macos")]
 fn macos_native_process_info(pid: u32) -> Result<Option<ProcessInfo>, ()> {
-    let Some(before) = macos_bsd_info(pid) else {
-        return Ok(None);
+    let before = match macos_bsd_info(pid) {
+        Ok(Some(info)) => info,
+        Ok(None) => return Ok(None),
+        Err(()) => return Err(()),
     };
     if before.pbi_status == libc::SZOMB {
         return Ok(Some(ProcessInfo {
@@ -2975,12 +2977,16 @@ fn macos_native_process_info(pid: u32) -> Result<Option<ProcessInfo>, ()> {
         }
         return Err(());
     }
-    let Some(after) = macos_bsd_info(pid) else {
-        return Ok(None);
+    let after = match macos_bsd_info(pid) {
+        Ok(Some(info)) => info,
+        Ok(None) => return Ok(None),
+        Err(()) => return Err(()),
     };
-    // A generation change between the two records means the PID was
-    // reused mid-query; skip the row rather than splicing generations.
+    // A generation or liveness change between the two records means the
+    // PID was reused or exited mid-query; skip the row rather than
+    // splicing generations or reporting a dead process as live.
     if before.pbi_pid != after.pbi_pid
+        || before.pbi_status != after.pbi_status
         || before.pbi_ppid != after.pbi_ppid
         || before.pbi_pgid != after.pbi_pgid
         || before.pbi_start_tvsec != after.pbi_start_tvsec
@@ -2999,11 +3005,19 @@ fn macos_native_process_info(pid: u32) -> Result<Option<ProcessInfo>, ()> {
 }
 
 /// Read one macOS process record through `proc_pidinfo`.
+///
+/// Returns `Ok(None)` when the row exited or was reused mid-query
+/// (unrelated churn) and `Err` for any other query failure, matching
+/// the `ps` fallback's fail-closed rule.
 #[cfg(target_os = "macos")]
-fn macos_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
-    let pid_i32 = i32::try_from(pid).ok()?;
+fn macos_bsd_info(pid: u32) -> Result<Option<libc::proc_bsdinfo>, ()> {
+    let Ok(pid_i32) = i32::try_from(pid) else {
+        return Err(());
+    };
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    let Ok(size) = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()) else {
+        return Err(());
+    };
     // SAFETY: info owns size writable bytes and this flavor has no
     // auxiliary argument.
     let written = unsafe {
@@ -3015,10 +3029,19 @@ fn macos_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
             size,
         )
     };
-    if written != size || info.pbi_pid != pid {
-        return None;
+    if written == size {
+        // A complete record for another PID means the slot was reused
+        // mid-query; skip the row rather than splicing generations.
+        return if info.pbi_pid == pid {
+            Ok(Some(info))
+        } else {
+            Ok(None)
+        };
     }
-    Some(info)
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return Ok(None);
+    }
+    Err(())
 }
 
 /// Parse the macOS `ps` columns and resolve group/session per PID.
@@ -10813,6 +10836,15 @@ int kill(pid_t pid, int sig) {
         assert_eq!(row.parent, resolved.parent);
         assert_eq!(row.group, resolved.group);
         assert_eq!(row.session, resolved.session);
+        // The native row must also match the `ps` fallback's membership
+        // query for the same PID, pinning cross-source interchangeability.
+        let (group, session) = macos_row_membership(me, false)
+            .expect("fallback membership succeeds")
+            .expect("current process membership present");
+        assert_eq!(row.group, group);
+        assert_eq!(row.session, session);
+        // SAFETY: getppid takes no arguments and always succeeds.
+        assert_eq!(row.parent, unsafe { libc::getppid() } as u32);
     }
 
     #[test]
