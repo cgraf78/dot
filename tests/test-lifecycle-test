@@ -480,6 +480,34 @@ assert not module.nested_supervisors
 os.close(writer)
 os.close(reader)
 
+# Darwin reports ECONNRESET (not EAGAIN) for an empty datagram queue once
+# the child closes the CLOEXEC control writer at exec. The drain must
+# treat the reset as "no data this tick", not invalidate the channel:
+# without this, every macOS session fails closed with 125.
+reader, writer = module.protocol_socketpair(module.socket.SOCK_DGRAM)
+module.control_reader = reader
+module.nested_control_complete = True
+module.nested_supervisors.clear()
+os.close(writer)
+
+
+class ResetEndpoint:
+    def recvmsg(self, *args):
+        raise ConnectionResetError("simulated Darwin empty-queue reset")
+
+    def detach(self):
+        pass
+
+
+real_socket = module.socket.socket
+module.socket.socket = lambda **kwargs: ResetEndpoint()
+try:
+    assert module.drain_nested_supervisors() is True
+    assert module.nested_control_complete
+finally:
+    module.socket.socket = real_socket
+    os.close(reader)
+
 # A full per-tick registration budget is a yield point, not corruption. The
 # 129th publisher remains authorization-gated until the next drain.
 reader, writer = module.protocol_socketpair(module.socket.SOCK_DGRAM)
@@ -1664,7 +1692,12 @@ class PsProcess:
 
 
 def run_ps(argv, **_kwargs):
-    assert argv == ["/bin/ps", "-A", "-o", "pid=,ppid=,pgid=,sid=,stat="]
+    columns = (
+        "pid=,ppid=,pgid=,sess=,stat="
+        if sys.platform == "darwin"
+        else "pid=,ppid=,pgid=,sid=,stat="
+    )
+    assert argv == ["/bin/ps", "-A", "-o", columns]
     return PsProcess()
 
 
@@ -1684,7 +1717,12 @@ class TimeoutPs(PsProcess):
 
 
 def timeout_ps(argv, **_kwargs):
-    assert argv == ["/bin/ps", "-A", "-o", "pid=,ppid=,pgid=,sid=,stat="]
+    columns = (
+        "pid=,ppid=,pgid=,sess=,stat="
+        if sys.platform == "darwin"
+        else "pid=,ppid=,pgid=,sid=,stat="
+    )
+    assert argv == ["/bin/ps", "-A", "-o", columns]
     return TimeoutPs()
 
 

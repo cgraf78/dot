@@ -830,6 +830,15 @@ def drain_nested_supervisors(deadline: float | None = None) -> bool:
             return nested_control_complete
         except InterruptedError:
             continue
+        except ConnectionResetError:
+            # Darwin reports ECONNRESET (not EAGAIN) when the datagram
+            # queue is empty: the child closes the CLOEXEC control
+            # writer at exec, so a session with no nested supervisor
+            # deterministically resets while Linux reports EAGAIN for
+            # the same state. A reset carries no bytes and cannot
+            # forge a delegation, so treat it as "no data this tick"
+            # exactly like the native supervisor does.
+            return nested_control_complete
         except OSError:
             invalidate_nested_control()
             return False
@@ -1911,8 +1920,16 @@ def list_session_processes(
     ps_process = None
     try:
         ps = "/system/bin/ps" if Path("/system/bin/ps").is_file() else "/bin/ps"
+        # Darwin `ps` rejects the procps-only `sid` keyword
+        # (`ps: sid: keyword not found`, exit 1); its `sess` column
+        # carries the same session ID. Verified on macOS CI.
+        columns = (
+            "pid=,ppid=,pgid=,sess=,stat="
+            if sys.platform == "darwin"
+            else "pid=,ppid=,pgid=,sid=,stat="
+        )
         ps_process = subprocess.Popen(
-            [ps, "-A", "-o", "pid=,ppid=,pgid=,sid=,stat="],
+            [ps, "-A", "-o", columns],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
