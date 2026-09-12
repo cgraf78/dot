@@ -3227,10 +3227,9 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
         eprintln!("TEMP-DIAG-180: snapshot: deadline already passed at entry");
         return None;
     }
-    eprintln!(
-        "TEMP-DIAG-180: snapshot: entry with {}ms remaining",
-        deadline.saturating_duration_since(entered).as_millis()
-    );
+    // No per-iteration "entry with..." print: the sudo-PTY test's helper
+    // writes to a small macOS PTY buffer nobody drains, so hot-path
+    // diagnostics flow-control the helper into a 15s timeout (Heisenbug).
     let (reader, writer) = match internal_stream_pair() {
         Ok(pair) => pair,
         Err(error) => {
@@ -3265,8 +3264,6 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     let _registration = StatusChildRegistration::new(child.id());
     drop(fork_registration);
     drop(launch);
-    // TEMP-DIAG-180: remove with the recvmsg diag.
-    let spawned = Instant::now();
     // Command retains configured descriptors after spawn; release our writer
     // so child EOF is observable instead of timing out every valid snapshot.
     drop(command);
@@ -3288,12 +3285,8 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
         match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => {
-                if bytes.is_empty() {
-                    eprintln!(
-                        "TEMP-DIAG-180: snapshot: first byte after {}ms",
-                        spawned.elapsed().as_millis()
-                    );
-                }
+                // No per-iteration "first byte" print: see the PTY
+                // flow-control note at this function's entry.
                 bytes.extend_from_slice(&chunk[..count]);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -6293,25 +6286,10 @@ impl Session {
                 }
             }
         }
+        // No per-observation print: the sudo-PTY test's helper writes to
+        // a small macOS PTY buffer nobody drains, so hot-path diagnostics
+        // flow-control the helper into a 15s timeout (Heisenbug).
         let leader_observed = self.current.contains_key(&self.leader);
-        // TEMP-DIAG-180: remove with the recvmsg diag. Shows what the
-        // empty-proof sees per observation on macOS.
-        #[cfg(target_os = "macos")]
-        {
-            let live_members: Vec<u32> = self
-                .current
-                .values()
-                .filter(|process| process.live)
-                .map(|process| process.pid)
-                .collect();
-            eprintln!(
-                "TEMP-DIAG-180: observe: leader={} observed={} current={} live={:?}",
-                self.leader,
-                leader_observed,
-                self.current.len(),
-                live_members,
-            );
-        }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         for member in self.members.values_mut() {
             if !self.current.contains_key(&member.process.pid) {
