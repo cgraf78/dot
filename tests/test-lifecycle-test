@@ -24,6 +24,10 @@ run_tests() {
 timeout_command=$root/lib/dot/public/test-timeout-v1
 timeout_python=$(command -v python3)
 [[ ! -x /usr/bin/python3 ]] || timeout_python=/usr/bin/python3
+# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+if [[ $(uname -s) == Darwin ]]; then
+  export DOT_TEST_DIAG_NESTED=1
+fi
 set +e
 "$timeout_command" >/dev/null 2>&1
 missing_timeout_status=$?
