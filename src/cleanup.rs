@@ -118,6 +118,10 @@ fn internal_datagram_pair() -> std::io::Result<(
 )> {
     use std::os::fd::{FromRawFd as _, IntoRawFd as _};
     let (left, right) = std::os::unix::net::UnixDatagram::pair()?;
+    // Keep default buffer sizes: a large buffer queues bulk stdout flood
+    // ahead of stderr diagnostics and the finish record, starving them
+    // behind a blocked sink (head-of-line blocking). Small buffers keep
+    // backpressure at the writer, where the retry quantum below paces it.
     let left = normalize_internal_fd(left.into_raw_fd())?;
     let right = normalize_internal_fd(right.into_raw_fd())?;
     // SAFETY: each descriptor is uniquely owned and has been normalized.
@@ -1841,7 +1845,18 @@ fn send_process_output_record(
             // of poisoning the channel; cancellation still wins at the top
             // of the loop.
             Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => {}
+            // A sustained provider flood can briefly exhaust Darwin mbuf
+            // clusters, surfacing as ENOMEM on an otherwise healthy socket.
+            // Treat it as transient backpressure like ENOBUFS: the sleeping
+            // retry lets the relay child drain while cancellation still
+            // wins at the top of the loop.
+            Err(error) if error.raw_os_error() == Some(libc::ENOMEM) => {}
             Err(error) => {
+                eprintln!(
+                    "TEMP-DIAG-180 RELAY-POISON errno={:?} kind={:?}",
+                    error.raw_os_error(),
+                    error.kind()
+                );
                 channel
                     .failed
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -1849,7 +1864,11 @@ fn send_process_output_record(
             }
         }
         drop(channel);
-        std::thread::sleep(Duration::from_millis(10));
+        // One-millisecond backpressure quantum, matching the supervisor
+        // tick: macOS default datagram buffers hold only a couple of
+        // payloads, so a coarser sleep throttles floods to tens of KB/s
+        // and megabyte capture limits never trip before timeouts.
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -2432,13 +2451,21 @@ impl ProcessOutputEndpoint {
             std::thread::sleep(Duration::from_millis(10));
         }
         self.lifetime_writer.take();
-        let _ = stop_output_relay_watchdog(pid, true);
+        let reaped = stop_output_relay_watchdog(pid, true);
         self.registration.take();
         // TEMP-DIAG-180: remove with the 125 fix.
         eprintln!(
-            "TEMP-DIAG-180: relay finish: deadline expired with relay child unreaped, drain={drain}"
+            "TEMP-DIAG-180: relay finish: deadline expired with relay child unreaped, drain={drain} reaped={reaped}"
         );
-        ProcessOutputFinish::CleanupIncomplete
+        // A relay child that never drains is usually blocked on an
+        // undrained sink, not a leaked descendant: the watchdog kill above
+        // reaps it, so only genuinely unreaped helpers fail closed. Lost
+        // output preserves the command's own status instead of raising 125.
+        if reaped {
+            ProcessOutputFinish::OutputFailed
+        } else {
+            ProcessOutputFinish::CleanupIncomplete
+        }
     }
 }
 

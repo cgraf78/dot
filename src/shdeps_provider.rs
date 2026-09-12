@@ -1069,10 +1069,20 @@ fn download_installer(
             let _ = std::fs::remove_file(&temporary);
             return Err(failure);
         }
-        if sink_error.is_some() {
+        if sink_error
+            .as_ref()
+            .is_some_and(|failure| !failure.intentional_abort)
+        {
             let _ = std::fs::remove_file(&temporary);
             return Err(EnsureFailure::Output);
         }
+        // An intentionally aborted relay is a consequence of the supervised
+        // outcome (the supervisor stops outward delivery once the download
+        // is decided), never the outcome itself: slow hosts can still be
+        // flushing flood bytes when the limit trips, and that race must not
+        // shadow the limit diagnostic with a silent output failure. Fall
+        // through to the supervised outcome below, mirroring the update
+        // path's intentional-abort excuse.
         match supervised {
             Ok(crate::cleanup::SessionEnd::Exited(status)) if status.success() => {
                 succeeded = true;
