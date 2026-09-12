@@ -3007,8 +3007,9 @@ fn macos_native_process_info(pid: u32) -> std::result::Result<Option<ProcessInfo
 /// Read one macOS process record through `proc_pidinfo`.
 ///
 /// Returns `Ok(None)` when the row exited or was reused mid-query
-/// (unrelated churn) and `Err` for any other query failure, matching
-/// the `ps` fallback's fail-closed rule.
+/// (unrelated churn) or belongs to another user and is therefore
+/// unobservable, and `Err` for any other query failure, matching the
+/// `ps` fallback's fail-closed rule.
 #[cfg(target_os = "macos")]
 fn macos_bsd_info(pid: u32) -> std::result::Result<Option<libc::proc_bsdinfo>, ()> {
     let Ok(pid_i32) = i32::try_from(pid) else {
@@ -3038,10 +3039,16 @@ fn macos_bsd_info(pid: u32) -> std::result::Result<Option<libc::proc_bsdinfo>, (
             Ok(None)
         };
     }
-    if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-        return Ok(None);
+    match std::io::Error::last_os_error().raw_os_error() {
+        // Exited mid-query, or owned by another user/SIP-protected and
+        // therefore unobservable: unrelated to this snapshot. Teardown
+        // verification only consults same-user session members, which
+        // are always observable, so skipping cannot hide a member.
+        Some(errno) if errno == libc::ESRCH || errno == libc::EPERM || errno == libc::EACCES => {
+            Ok(None)
+        }
+        _ => Err(()),
     }
-    Err(())
 }
 
 /// Parse the macOS `ps` columns and resolve group/session per PID.
