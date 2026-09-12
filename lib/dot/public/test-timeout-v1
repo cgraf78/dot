@@ -1914,15 +1914,22 @@ def list_session_processes(
         ps_process = subprocess.Popen(
             [ps, "-A", "-o", "pid=,ppid=,pgid=,sid=,stat="],
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            # TEMP-DEBUG-180: capture ps stderr so macOS CI reports the
+            # exact keyword rejection. Debug branch only; never merge.
+            stderr=subprocess.PIPE,
             text=True,
         )
-        output, _ = ps_process.communicate(
+        output, ps_stderr = ps_process.communicate(
             timeout=max(0.001, deadline - time.monotonic())
         )
         if ps_process.returncode != 0:
+            diagnostic(
+                "TEMP-DEBUG-180 ps failed: "
+                f"rc={ps_process.returncode} stderr={ps_stderr!r}"
+            )
             return None
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as snapshot_error:
+        diagnostic(f"TEMP-DEBUG-180 ps exception: {snapshot_error!r}")
         if ps_process is not None:
             try:
                 ps_process.kill()
@@ -1931,7 +1938,14 @@ def list_session_processes(
                 pass
         return None
 
-    return parse_ps_snapshot(output, session_id, {ps_process.pid}, deadline)
+    parsed = parse_ps_snapshot(output, session_id, {ps_process.pid}, deadline)
+    # TEMP-DEBUG-180: report parse outcomes on macOS CI.
+    if parsed is None:
+        diagnostic(
+            "TEMP-DEBUG-180 ps parse failed: "
+            f"{len(output)} bytes head={output[:200]!r}"
+        )
+    return parsed
 
 
 def parse_ps_snapshot(

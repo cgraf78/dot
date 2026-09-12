@@ -6077,3 +6077,55 @@ fn update_native_failure_reports_errors_and_restores_state() {
         "repository failure must stop before newly eligible merge hooks"
     );
 }
+
+// TEMP-DEBUG-180: macOS `ps` keyword probe. Panics with a full report so the
+// verdicts land in the CI log. Debug branch only; never merge.
+#[cfg(target_os = "macos")]
+#[test]
+fn temp_debug_macos_ps_keywords() {
+    fn run(argv: &[&str]) -> String {
+        let output = std::process::Command::new(argv[0])
+            .args(&argv[1..])
+            .output()
+            .expect("spawn ps probe");
+        format!(
+            "argv={argv:?} status={} stdout={:?} stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )
+    }
+    let mut report = String::new();
+    for keyword in ["sid", "sess", "pgid", "stat", "state"] {
+        report.push_str(&run(&["/bin/ps", "-o", &format!("{keyword}="), "-p", "1"]));
+        report.push('\n');
+    }
+    report.push_str(&run(&[
+        "/bin/ps",
+        "-A",
+        "-o",
+        "pid=,ppid=,pgid=,sid=,stat=",
+    ]));
+    report.push('\n');
+    report.push_str(&run(&["/bin/ps", "-A", "-o", "pid=,ppid=,stat="]));
+    report.push('\n');
+    // Exercise the real harness snapshot entry point on this host.
+    let harness = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import importlib.util, os; spec = importlib.util.spec_from_file_location('tto', os.environ['TTO']); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); print('snapshot:', m.list_session_pids(os.getpid()))",
+        ])
+        .env(
+            "TTO",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/lib/dot/public/test-timeout-v1"),
+        )
+        .output()
+        .expect("spawn harness probe");
+    report.push_str(&format!(
+        "harness status={} stdout={:?} stderr={:?}",
+        harness.status,
+        String::from_utf8_lossy(&harness.stdout),
+        String::from_utf8_lossy(&harness.stderr),
+    ));
+    panic!("TEMP-DEBUG-180 PS REPORT:\n{report}");
+}

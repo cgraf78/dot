@@ -1783,7 +1783,12 @@ fn send_process_output_record(
                     .store(true, std::sync::atomic::Ordering::Release);
                 return Ok(());
             }
-            Ok(_) => {
+            Ok(written) => {
+                // TEMP-DEBUG-180: partial datagram sends should be impossible.
+                eprintln!(
+                    "TEMP-DEBUG-180 relay partial send: {written} of {} bytes",
+                    packet.len()
+                );
                 channel
                     .failed
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -1794,6 +1799,11 @@ fn send_process_output_record(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => {
+                // TEMP-DEBUG-180: surface the raw send errno on macOS CI.
+                eprintln!(
+                    "TEMP-DEBUG-180 relay send failed: {error:?} raw={:?}",
+                    error.raw_os_error()
+                );
                 channel
                     .failed
                     .store(true, std::sync::atomic::Ordering::Release);
