@@ -443,6 +443,29 @@ mod tests {
         assert!(!decide_sudo(false, false, false, &no));
     }
 
+    // TEMP-DIAG-180: remove with the recvmsg diag. Nonblocking drain
+    // of the sudo helper's PTY master for failure triage.
+    fn drain_pty_master(master: &std::os::fd::OwnedFd) -> Vec<u8> {
+        use std::os::fd::AsRawFd as _;
+        let master_fd = master.as_raw_fd();
+        let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+        if flags >= 0 {
+            unsafe {
+                libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        let mut output = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let count = unsafe { libc::read(master_fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            if count <= 0 || output.len() > 65536 {
+                break;
+            }
+            output.extend_from_slice(&chunk[..count as usize]);
+        }
+        output
+    }
+
     #[test]
     fn interactive_sudo_keeps_the_foreground_tty_and_resumes_for_cleanup() {
         const HELPER: &str = "DOT_SUDO_PTY_HELPER";
@@ -538,27 +561,9 @@ mod tests {
             // TEMP-DIAG-180: remove with the recvmsg diag. Drain the
             // helper's PTY output so macOS CI shows whether the helper
             // panicked or sudo rejected the foreground check.
-            use std::os::fd::AsRawFd as _;
-            let master_fd = master.as_raw_fd();
-            let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
-            if flags >= 0 {
-                unsafe {
-                    libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                }
-            }
-            let mut output = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                let count =
-                    unsafe { libc::read(master_fd, chunk.as_mut_ptr().cast(), chunk.len()) };
-                if count <= 0 || output.len() > 65536 {
-                    break;
-                }
-                output.extend_from_slice(&chunk[..count as usize]);
-            }
             eprintln!(
                 "TEMP-DIAG-180: sudo-pty helper output: {:?}",
-                String::from_utf8_lossy(&output)
+                String::from_utf8_lossy(&drain_pty_master(&master))
             );
         }
         assert!(
@@ -572,10 +577,17 @@ mod tests {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "PTY helper did not stop"
-            );
+            if std::time::Instant::now() >= deadline {
+                // TEMP-DIAG-180: remove with the recvmsg diag. The
+                // interactive-end marker below shows whether require_sudo
+                // returned (stuck after teardown) or never did (stuck in
+                // teardown of the stopped sudo).
+                eprintln!(
+                    "TEMP-DIAG-180: sudo-pty helper output at stop timeout: {:?}",
+                    String::from_utf8_lossy(&drain_pty_master(&master))
+                );
+                panic!("PTY helper did not stop");
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         assert!(status.success(), "PTY helper failed with {status:?}");

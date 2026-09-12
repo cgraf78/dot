@@ -3762,9 +3762,22 @@ impl NestedControlWorker {
                             // live link.
                             if suspect.contains(boundary.as_str()) {
                                 // TEMP-DIAG-180: remove with the recvmsg diag.
+                                // Root-cause the sticky macOS EOF: is the
+                                // socket identity intact (peerpid still the
+                                // publisher?) and does poll agree it is
+                                // at EOF (HUP/ERR) or readable-empty?
+                                let peer = nested_peer_pid(std::os::fd::AsRawFd::as_raw_fd(link));
+                                let mut pollfd = libc::pollfd {
+                                    fd: std::os::fd::AsRawFd::as_raw_fd(link),
+                                    events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+                                    revents: 0,
+                                };
+                                let poll_result = unsafe { libc::poll(&mut pollfd, 1, 0) };
                                 eprintln!(
-                                    "TEMP-DIAG-180: nested-control link EOF confirmed: {boundary} fd={}",
+                                    "TEMP-DIAG-180: nested-control link EOF confirmed: {boundary} fd={} peer={peer:?} poll={poll_result} revents={} claimed={}",
                                     std::os::fd::AsRawFd::as_raw_fd(link),
+                                    pollfd.revents,
+                                    _pid,
                                 );
                                 suspect.remove(boundary.as_str());
                                 closed.push(boundary.clone())
