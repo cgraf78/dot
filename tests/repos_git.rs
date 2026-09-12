@@ -195,10 +195,26 @@ fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "PTY Git helper did not stop"
-        );
+        if std::time::Instant::now() >= deadline {
+            // Report whether the fake git ran (marker) and whether the
+            // helper is even killable, so a timeout names the wedge
+            // instead of just the bound. Never block here: poll the
+            // reap briefly, then fail; master close HUPs strays.
+            let marker_exists = observed.exists();
+            let _ = child.kill();
+            let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut reaped = None;
+            while std::time::Instant::now() < reap_deadline {
+                if let Some(status) = child.try_wait().unwrap() {
+                    reaped = Some(status);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            panic!(
+                "PTY Git helper did not stop (marker_exists={marker_exists}, reaped={reaped:?})"
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     assert!(status.success(), "PTY Git helper failed with {status:?}");
