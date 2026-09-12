@@ -603,9 +603,20 @@ mod tests {
         );
         // SAFETY: the fixture owns the test subprocess and its signal handler.
         assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        // macOS teardown is slow (process queries spawn `ps` per poll
+        // versus free /proc reads on Linux): the helper deterministically
+        // needs ~5s to exit after SIGTERM, so a 4s deadline fails a
+        // healthy shutdown. 15s keeps 3x headroom; the latency report
+        // below keeps the budget honest.
+        let stop_started = std::time::Instant::now();
+        let deadline = stop_started + std::time::Duration::from_secs(15);
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
+                // TEMP-DIAG-180: remove with the recvmsg diag.
+                eprintln!(
+                    "TEMP-DIAG-180: sudo-pty helper stopped in {}ms",
+                    stop_started.elapsed().as_millis()
+                );
                 break status;
             }
             if std::time::Instant::now() >= deadline {

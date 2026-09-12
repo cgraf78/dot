@@ -9032,7 +9032,7 @@ os._exit(0)
         // the socket exists cannot inherit it through any descriptor-table
         // race with the parallel tests sharing this process. (The writer
         // is additionally CLOEXEC by construction; that property is pinned
-        // directly by `internal_pairs_set_close_on_exec` below.)
+        // directly by `internal_pairs_set_close_on_exec` above.)
         let mut plain = ReapGuard {
             child: Command::new("/bin/sleep")
                 .arg("30")
