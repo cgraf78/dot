@@ -325,6 +325,27 @@ fn bind_pins_selected_git() {
     assert_eq!(err, "");
 }
 
+/// Spawn a freshly-written fixture with a bounded retry on ETXTBSY.
+/// The write handle is closed before the first exec, but some CI
+/// filesystems (overlayfs copy-up window) can still report the file
+/// as open-for-writing when the exec lands microseconds later. Any
+/// other spawn error fails immediately.
+fn spawn_fresh_fixture(command: &mut Command) -> std::process::Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match command.output() {
+            Ok(output) => return output,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => panic!("run bound host git: {error:?}"),
+        }
+    }
+}
+
 #[test]
 fn bound_host_git_drives_children_without_path_lookup() {
     let twins = Twins::build("init-ident-bound-command");
@@ -336,10 +357,7 @@ fn bound_host_git_drives_children_without_path_lookup() {
     chmod(&shadow_dir.join("git"), 0o755);
 
     let output = init::with_host_git(&selected, || {
-        init::host_git_command()
-            .env("PATH", &shadow_dir)
-            .output()
-            .expect("run bound host git")
+        spawn_fresh_fixture(init::host_git_command().env("PATH", &shadow_dir))
     });
 
     assert!(output.status.success());
