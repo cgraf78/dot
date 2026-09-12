@@ -3652,8 +3652,12 @@ impl NestedControlWorker {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_stop = stop.clone();
         let thread = std::thread::spawn(move || {
-            let mut links =
-                std::collections::BTreeMap::<String, (u32, std::os::unix::net::UnixStream)>::new();
+            // Third tuple element is the insert instant: links younger
+            // than the settle window skip liveness reads (see below).
+            let mut links = std::collections::BTreeMap::<
+                String,
+                (u32, std::os::unix::net::UnixStream, Instant),
+            >::new();
             // Boundaries that read EOF on the previous tick but have not
             // confirmed it yet (see the liveness scan below).
             let mut suspect = std::collections::HashSet::<String>::new();
@@ -3715,7 +3719,7 @@ impl NestedControlWorker {
                             );
                             links.insert(
                                 registration.boundary,
-                                (registration.pid, registration.link),
+                                (registration.pid, registration.link, Instant::now()),
                             );
                         }
                         Ok(None) => break,
@@ -3734,18 +3738,35 @@ impl NestedControlWorker {
                     }
                 }
                 let mut closed = Vec::new();
-                for (boundary, (_pid, link)) in &mut links {
+                let scan = Instant::now();
+                for (boundary, (_pid, link, born)) in &mut links {
+                    // Settle window: on macOS a freshly received link can
+                    // read a sticky-but-spurious 0 for its first several
+                    // milliseconds (16/64 died at insert age with no
+                    // window; 4/64 still died at 5-7ms under a 5ms window,
+                    // with back-to-back confirmatory reads also 0, peer
+                    // held open throughout). 50ms is far past the observed
+                    // window under any monotone-decay fit, and the
+                    // tick-confirmation below absorbs any tail. Real peer
+                    // closes persist, so the window only delays withdrawal
+                    // detection for closes that land inside it.
+                    if scan.saturating_duration_since(*born) < Duration::from_millis(50) {
+                        continue;
+                    }
                     let mut byte = [0u8; 1];
                     match link.read(&mut byte) {
                         Ok(0) => {
-                            // Tick-confirmed EOF: on macOS a link's first
-                            // liveness read can return a spurious 0 with
-                            // the peer held open (never observed twice,
-                            // never on a later tick). A real peer close
-                            // reads 0 on every tick (EOF is sticky), so
-                            // only the second consecutive EOF removes the
-                            // link; a single EOF merely flags it. This
-                            // costs one tick (1ms) of withdrawal latency.
+                            // Tick-confirmed EOF: a single 0 with no
+                            // history merely flags the link suspect; only
+                            // the second consecutive EOF removes it. A
+                            // real peer close reads 0 on every tick (EOF
+                            // is sticky), so confirmation costs one tick
+                            // (1ms) of withdrawal latency. Inside the
+                            // settle window above, spurious macOS 0s can
+                            // repeat back-to-back, which is why fresh
+                            // links skip reads entirely; out here any
+                            // lone 0 is absorbed instead of removing a
+                            // live link.
                             if suspect.contains(boundary.as_str()) {
                                 // TEMP-DIAG-180: remove with the recvmsg diag.
                                 eprintln!(
