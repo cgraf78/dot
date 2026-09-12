@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@b750c292f00e079c2270df0d8f4c8bdaf43e0356
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@c05c06f1c0fc443b15255b823e0b11d7b190bda3
     with:
       # rust-version is a compatibility promise, so exercise it inside the
       # shared required gate instead of leaving it aspirational. The shared
@@ -106,7 +106,7 @@ jobs:
         tar -C .termux-ci -xzf "$archive"
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@b750c292f00e079c2270df0d8f4c8bdaf43e0356
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@c05c06f1c0fc443b15255b823e0b11d7b190bda3
     with:
       matrix-set: full
       profiles: base,python
@@ -214,4 +214,4 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@b750c292f00e079c2270df0d8f4c8bdaf43e0356
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@c05c06f1c0fc443b15255b823e0b11d7b190bda3
