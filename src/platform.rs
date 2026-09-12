@@ -474,26 +474,80 @@ mod tests {
         snapshot
     }
 
-    // TEMP-DIAG-180: remove with the recvmsg diag. Bytes waiting on
-    // the PTY master without consuming them ( ioctl FIONREAD ).
-    fn pty_pending_bytes(master: &std::os::fd::OwnedFd) -> String {
-        use std::os::fd::AsRawFd as _;
-        let mut pending: libc::c_int = 0;
-        // SAFETY: FIONREAD only writes the pending count through the
-        // live master descriptor; request cast matches each platform.
-        let result = unsafe { libc::ioctl(master.as_raw_fd(), libc::FIONREAD as _, &mut pending) };
-        if result == 0 && pending >= 0 {
-            pending.to_string()
-        } else {
-            format!("ioctl-err({})", std::io::Error::last_os_error())
+    /// Output pumped from the sudo helper's PTY master, with the
+    /// instant of the most recent arrival for progress tracking.
+    struct PumpedOutput {
+        bytes: Vec<u8>,
+        last_append: std::time::Instant,
+    }
+
+    impl PumpedOutput {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                last_append: std::time::Instant::now(),
+            }
         }
     }
 
+    /// Pump `master` into `pumped` until `stop` is set or the slave side
+    /// goes away (read returning 0 on Linux, EIO on macOS/BSD). Runs on
+    /// its own thread so the helper can never block writing while the
+    /// driver waits for exit; the driver joins this thread before
+    /// touching the master itself.
+    fn pump_pty_master(
+        master: std::os::fd::OwnedFd,
+        pumped: std::sync::Arc<std::sync::Mutex<PumpedOutput>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::os::fd::AsRawFd as _;
+        let fd = master.as_raw_fd();
+        // SAFETY: F_GETFL/F_SETFL on our own dup; nonblocking reads keep
+        // the pump responsive to `stop`.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        let mut chunk = [0u8; 4096];
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            // SAFETY: `chunk` is a live writable buffer.
+            let read =
+                unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+            if read > 0 {
+                let mut pumped = pumped.lock().unwrap();
+                pumped.bytes.extend_from_slice(&chunk[..read as usize]);
+                pumped.last_append = std::time::Instant::now();
+            } else if read == 0 {
+                break;
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EIO) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// Signal the pump thread to stop and join it. The pump's reads are
+    /// nonblocking, so the join is prompt; the driver owns the master
+    /// again afterward.
+    fn stop_pty_pump(
+        stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: std::thread::JoinHandle<()>,
+    ) {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = thread.join();
+    }
+
     // TEMP-DIAG-180: remove with the recvmsg diag. Single-letter state
-    // for one pid; never fails the test itself.
+    // for one pid; never fails the test itself. (`state`, not `stat`:
+    // the latter is not an output keyword on macOS `ps`.)
     fn helper_state(pid: u32) -> String {
         match std::process::Command::new("ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .args(["-o", "state=", "-p", &pid.to_string()])
             .output()
         {
             Ok(output) if output.status.success() => {
@@ -611,6 +665,23 @@ mod tests {
             });
         }
         let mut child = command.spawn().unwrap();
+        // Pump the PTY master continuously from spawn: the helper must
+        // never block writing while the driver waits for exit without
+        // reading (classic PTY producer/consumer deadlock, and the prime
+        // suspect for the macOS stop-phase stall). The pump owns a dup of
+        // the master; the driver only touches the master again after the
+        // pump has stopped and joined.
+        let pumped = std::sync::Arc::new(std::sync::Mutex::new(PumpedOutput::new()));
+        let pump_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut pump_thread = Some({
+            let pumped = std::sync::Arc::clone(&pumped);
+            let pump_stop = std::sync::Arc::clone(&pump_stop);
+            // SAFETY: openpty gave us a uniquely owned master; the dup
+            // shares its description, which is exactly what a second
+            // reader needs.
+            let pump_master = master.try_clone().unwrap();
+            std::thread::spawn(move || pump_pty_master(pump_master, pumped, pump_stop))
+        });
         // TEMP-DIAG-180: widen from 3s while diagnosing whether macOS CI
         // is slow (python startup under load) or stuck (probe never
         // returns). Revert or justify with the sudo-probe timestamps.
@@ -622,9 +693,12 @@ mod tests {
             // TEMP-DIAG-180: remove with the recvmsg diag. Drain the
             // helper's PTY output so macOS CI shows whether the helper
             // panicked or sudo rejected the foreground check.
+            stop_pty_pump(&pump_stop, pump_thread.take().unwrap());
+            let mut output = pumped.lock().unwrap().bytes.clone();
+            output.extend_from_slice(&drain_pty_master(&master));
             eprintln!(
                 "TEMP-DIAG-180: sudo-pty helper output: {:?}",
-                String::from_utf8_lossy(&drain_pty_master(&master))
+                String::from_utf8_lossy(&output)
             );
         }
         assert!(
@@ -641,28 +715,32 @@ mod tests {
         let stop_started = std::time::Instant::now();
         let deadline = stop_started + std::time::Duration::from_secs(15);
         // TEMP-DIAG-180: remove with the recvmsg diag. The helper exits
-        // just after every deadline tried (4s, 15s): sample output
-        // progress (FIONREAD, non-consuming) and process state every 500ms
-        // to learn whether the inner test itself is slow (steady output
-        // growth to the deadline) or done-but-unreaped (output complete,
-        // zombie visible while try_wait still misses it).
+        // just after every deadline tried (4s, 15s): log pumped output
+        // progress and process state every 500ms to learn whether the
+        // inner test itself is slow (steady byte growth to the deadline)
+        // or done-but-unreaped (bytes plateau early, zombie visible while
+        // try_wait still misses it).
         let mut last_probe = stop_started;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
+                stop_pty_pump(&pump_stop, pump_thread.take().unwrap());
                 // TEMP-DIAG-180: remove with the recvmsg diag.
                 eprintln!(
-                    "TEMP-DIAG-180: sudo-pty helper stopped in {}ms",
-                    stop_started.elapsed().as_millis()
+                    "TEMP-DIAG-180: sudo-pty helper stopped in {}ms ({} pumped bytes)",
+                    stop_started.elapsed().as_millis(),
+                    pumped.lock().unwrap().bytes.len(),
                 );
                 break status;
             }
             if last_probe.elapsed() >= std::time::Duration::from_millis(500) {
                 last_probe = std::time::Instant::now();
                 // TEMP-DIAG-180: remove with the recvmsg diag.
+                let pumped_state = pumped.lock().unwrap();
                 eprintln!(
-                    "TEMP-DIAG-180: stop t+{}ms master_pending={} helper_state={}",
+                    "TEMP-DIAG-180: stop t+{}ms pumped_bytes={} last_append_ms_ago={} helper_state={}",
                     stop_started.elapsed().as_millis(),
-                    pty_pending_bytes(&master),
+                    pumped_state.bytes.len(),
+                    pumped_state.last_append.elapsed().as_millis(),
                     helper_state(child.id()),
                 );
             }
@@ -671,9 +749,12 @@ mod tests {
                 // interactive-end marker below shows whether require_sudo
                 // returned (stuck after teardown) or never did (stuck in
                 // teardown of the stopped sudo).
+                stop_pty_pump(&pump_stop, pump_thread.take().unwrap());
+                let mut output = pumped.lock().unwrap().bytes.clone();
+                output.extend_from_slice(&drain_pty_master(&master));
                 eprintln!(
                     "TEMP-DIAG-180: sudo-pty helper output at stop timeout: {:?}",
-                    String::from_utf8_lossy(&drain_pty_master(&master))
+                    String::from_utf8_lossy(&output)
                 );
                 // TEMP-DIAG-180: remove with the recvmsg diag. The helper
                 // printed its complete inner summary yet is still alive:
