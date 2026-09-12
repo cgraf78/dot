@@ -17,6 +17,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 static BASH: OnceLock<PathBuf> = OnceLock::new();
 const EXEC_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const EXEC_READY_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+const TEMP_DIR_ATTEMPTS: usize = 1_024;
 
 /// Absolute path to the engine-runtime `bash` for differential harnesses.
 ///
@@ -188,6 +189,18 @@ impl TempDir {
     }
 
     fn new_in(root: &std::path::Path, name: &str) -> std::io::Result<Self> {
+        Self::new_in_with_identity(root, name, &COUNTER, std::process::id())
+    }
+
+    /// Construct with an injected identity so integration tests can prove that
+    /// stale directories are skipped instead of adopted.
+    #[doc(hidden)]
+    pub fn new_in_with_identity(
+        root: &std::path::Path,
+        name: &str,
+        counter: &AtomicU64,
+        pid: u32,
+    ) -> std::io::Result<Self> {
         if name.is_empty()
             || name.contains(['/', '\\', '\0'])
             || name.split(std::path::MAIN_SEPARATOR).count() != 1
@@ -199,11 +212,23 @@ impl TempDir {
                 format!("unsafe temp dir label: {name:?}"),
             ));
         }
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = root.join(format!("dot-{name}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&path)?;
-        let path = path.canonicalize().unwrap_or_else(|_| path.clone());
-        Ok(Self { path })
+        std::fs::create_dir_all(root)?;
+        for _ in 0..TEMP_DIR_ATTEMPTS {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let path = root.join(format!("dot-{name}-{pid}-{n}"));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    let path = path.canonicalize().unwrap_or(path);
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("could not allocate a unique dot-{name} temp directory"),
+        ))
     }
 
     /// Isolated directory path.

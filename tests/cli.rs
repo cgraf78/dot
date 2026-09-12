@@ -6,9 +6,10 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,115 @@ fn process_env_guard() -> MutexGuard<'static, ()> {
     PROCESS_ENV
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Select a regular executable Git outside roots controlled by the test user.
+fn select_fixture_git(
+    directories: impl IntoIterator<Item = PathBuf>,
+    excluded_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    let excluded: Vec<_> = excluded_roots
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .collect();
+    for directory in directories {
+        if !directory.is_absolute() {
+            continue;
+        }
+        let Ok(directory) = directory.canonicalize() else {
+            continue;
+        };
+        let candidate = directory.join("git");
+        if excluded.iter().any(|root| candidate.starts_with(root)) {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if metadata.file_type().is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.permissions().mode() & 0o111 != 0
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Candidate directories for Linux, macOS, and Termux fixture Git.
+fn fixture_git_directories(prefix: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut directories = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
+    if let Some(prefix) = prefix.map(PathBuf::from) {
+        if prefix.is_absolute() {
+            directories.push(prefix.join("bin"));
+        }
+    }
+    directories.extend([
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/opt/local/bin"),
+    ]);
+    directories
+}
+
+fn resolve_fixture_git(
+    explicit: Option<&OsStr>,
+    prefix: Option<&OsStr>,
+    home: Option<&OsStr>,
+    source: &Path,
+) -> PathBuf {
+    let mut excluded = vec![source.to_path_buf()];
+    excluded.extend(home.map(PathBuf::from));
+    if let Some(explicit) = explicit.map(PathBuf::from) {
+        assert!(
+            explicit.is_absolute(),
+            "DOT_TEST_SYSTEM_GIT must be absolute"
+        );
+        let parent = explicit.parent().expect("DOT_TEST_SYSTEM_GIT parent");
+        let selected = select_fixture_git([parent.to_path_buf()], &excluded)
+            .expect("valid DOT_TEST_SYSTEM_GIT");
+        let expected = parent
+            .canonicalize()
+            .expect("DOT_TEST_SYSTEM_GIT parent")
+            .join(explicit.file_name().expect("DOT_TEST_SYSTEM_GIT name"));
+        assert_eq!(selected, expected, "DOT_TEST_SYSTEM_GIT must name git");
+        return selected;
+    }
+    select_fixture_git(fixture_git_directories(prefix), &excluded).expect("trusted fixture Git")
+}
+
+/// Resolve the fixture Git once from public system and platform prefixes.
+fn fixture_git_program() -> &'static Path {
+    static GIT: OnceLock<PathBuf> = OnceLock::new();
+    GIT.get_or_init(|| {
+        let explicit = std::env::var_os("DOT_TEST_SYSTEM_GIT");
+        let prefix = std::env::var_os("PREFIX");
+        let home = std::env::var_os("HOME");
+        resolve_fixture_git(
+            explicit.as_deref(),
+            prefix.as_deref(),
+            home.as_deref(),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+    })
+}
+
+/// Put the selected Git directory ahead of the ambient tool path.
+fn fixture_path_with(git: &Path, ambient: &OsStr) -> OsString {
+    let git_dir = git.parent().expect("fixture Git parent");
+    let mut directories = vec![git_dir.to_path_buf()];
+    directories.extend(
+        std::env::split_paths(ambient)
+            .filter(|directory| !directory.as_os_str().is_empty() && directory != git_dir),
+    );
+    std::env::join_paths(directories).expect("fixture PATH")
+}
+
+fn fixture_path() -> OsString {
+    fixture_path_with(
+        fixture_git_program(),
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )
 }
 
 fn bin() -> Command {
@@ -811,7 +921,7 @@ fn binary_doctor_test_wired_past_interim() {
 /// checkout, provider state, or ambient variables.
 fn init_env(cmd: &mut Command, home: &TempDir, state: &TempDir) {
     let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = fixture_path();
     let tmpdir = std::env::var_os("TMPDIR")
         .filter(|dir| !dir.is_empty())
         .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
@@ -824,7 +934,7 @@ fn init_env(cmd: &mut Command, home: &TempDir, state: &TempDir) {
         .env("XDG_STATE_HOME", state.path())
         .env("DOT_SOURCE_ROOT", repo)
         .current_dir(home.path());
-    isolate_git(cmd);
+    isolate_git_config(cmd);
 }
 
 /// The Rust binary's `init` with a controlled client.
@@ -951,7 +1061,7 @@ fn poison_curl(scope: &Path) -> (OsString, PathBuf) {
         .expect("poison curl mode");
     let mut path = poison_dir.into_os_string();
     path.push(":");
-    path.push(std::env::var_os("PATH").unwrap_or_default());
+    path.push(fixture_path());
     (path, record)
 }
 
@@ -1159,8 +1269,7 @@ fn binary_init_adopts_and_converges_natively() {
     let home = TempDir::new("cli-init-adopt-home").expect("home");
     let state = TempDir::new("cli-init-adopt-state").expect("state");
     let url = format!("file://{}", origin.display());
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
+    let mut command = fixture_git();
     let clone = command
         .args(["clone", "-q", "--branch", &branch, &url])
         .arg(home.path())
@@ -1198,8 +1307,7 @@ fn binary_init_adopts_legacy_separate_git_dir_natively() {
     let state = TempDir::new("cli-init-adopt-separate-state").expect("state");
     let url = format!("file://{}", origin.display());
     let git_dir = home.path().join(".dotfiles");
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
+    let mut command = fixture_git();
     let clone = command
         .args(["clone", "-q", "--bare", &url])
         .arg(&git_dir)
@@ -1316,7 +1424,7 @@ struct ReposClient {
 /// inputs. In particular, it points the topology publication and the XDG
 /// state/config roots at this fixture rather than at the test process.
 fn native_update_env(client: &ReposClient, state: &Path) -> BTreeMap<OsString, OsString> {
-    let path = std::env::var_os("PATH").expect("test PATH");
+    let path = fixture_path();
     let tmp = std::env::var_os("TMPDIR").unwrap_or_else(|| OsString::from("/tmp"));
     BTreeMap::from([
         (OsString::from("HOME"), client.home.as_os_str().to_owned()),
@@ -1486,17 +1594,20 @@ exec "${{DOT_RUNTIME_REAL_{variable}}}" "$@"
 }
 
 fn real_tool(tool: &str) -> PathBuf {
+    if tool == "git" {
+        return fixture_git_program().to_path_buf();
+    }
     let launcher = std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".local/bin").join(tool));
-    std::env::split_paths(&std::env::var_os("PATH").expect("test PATH"))
+    std::env::split_paths(&fixture_path())
         .map(|dir| dir.join(tool))
         .find(|candidate| candidate.is_file() && Some(candidate) != launcher.as_ref())
         .expect("real native tool")
 }
 
-/// Keep fixtures independent of developer Git hooks and signing policy.
-fn isolate_git(command: &mut Command) {
+/// Keep Git configuration independent of developer hooks and signing policy.
+fn isolate_git_config(command: &mut Command) {
     command
         .env("GIT_CONFIG_COUNT", "3")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
@@ -1505,6 +1616,315 @@ fn isolate_git(command: &mut Command) {
         .env("GIT_CONFIG_VALUE_1", "false")
         .env("GIT_CONFIG_KEY_2", "tag.gpgSign")
         .env("GIT_CONFIG_VALUE_2", "false");
+}
+
+/// Remove every ambient Git control before installing the fixture policy.
+fn scrub_fixture_git_env(command: &mut Command) {
+    let mut keys: Vec<OsString> = std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| key.as_encoded_bytes().starts_with(b"GIT_"))
+        .collect();
+    keys.extend(
+        command
+            .get_envs()
+            .map(|(key, _)| key.to_owned())
+            .filter(|key| key.as_encoded_bytes().starts_with(b"GIT_")),
+    );
+    for key in keys {
+        command.env_remove(key);
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+}
+
+/// A fixture Git command that owns its isolated HOME through child exit.
+struct FixtureGit {
+    command: Command,
+    _home: TempDir,
+}
+
+impl Deref for FixtureGit {
+    type Target = Command;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl DerefMut for FixtureGit {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
+
+fn configure_fixture_git(command: &mut Command, home: &Path) {
+    scrub_fixture_git_env(command);
+    command
+        .env("LC_ALL", "C")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("PATH", fixture_path());
+    isolate_git_config(command);
+}
+
+fn fixture_git() -> FixtureGit {
+    let home = TempDir::new("cli-git-home").expect("create fixture Git home");
+    let mut command = Command::new(fixture_git_program());
+    configure_fixture_git(&mut command, home.path());
+    FixtureGit {
+        command,
+        _home: home,
+    }
+}
+
+#[test]
+fn fixture_git_commands_do_not_inherit_the_user_home() {
+    let command = fixture_git();
+    let home = command
+        .get_envs()
+        .find(|(key, _)| *key == "HOME")
+        .and_then(|(_, value)| value)
+        .expect("fixture Git HOME");
+
+    assert_ne!(Some(home), std::env::var_os("HOME").as_deref());
+}
+
+#[test]
+fn fixture_git_sanitizer_matches_the_internal_git_boundary() {
+    const REMOVED: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_CONFIG",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_DEFAULT_HASH",
+        "GIT_TEMPLATE_DIR",
+        "GIT_ALLOW_PROTOCOL",
+    ];
+    let home = TempDir::new("cli-git-policy-home").expect("fixture Git home");
+    let mut command = Command::new(fixture_git_program());
+    for key in REMOVED {
+        command.env(key, "poison");
+    }
+    command
+        .env("GIT_CONFIG_GLOBAL", "poison")
+        .env("GIT_CONFIG_COUNT", "99")
+        .env("GIT_CONFIG_NOSYSTEM", "0");
+
+    configure_fixture_git(&mut command, home.path());
+    let configured: BTreeMap<_, _> = command
+        .get_envs()
+        .map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+        .collect();
+
+    for key in REMOVED {
+        assert_eq!(configured.get(OsStr::new(key)), Some(&None), "{key}");
+    }
+    assert_eq!(
+        configured.get(OsStr::new("GIT_CONFIG_GLOBAL")),
+        Some(&Some(OsString::from("/dev/null")))
+    );
+    assert_eq!(
+        configured.get(OsStr::new("GIT_CONFIG_NOSYSTEM")),
+        Some(&Some(OsString::from("1")))
+    );
+    assert_eq!(
+        configured.get(OsStr::new("GIT_CONFIG_COUNT")),
+        Some(&Some(OsString::from("3")))
+    );
+}
+
+#[test]
+fn fixture_path_places_the_selected_git_first() {
+    assert_eq!(
+        std::env::split_paths(&fixture_path()).next().as_deref(),
+        fixture_git_program().parent()
+    );
+}
+
+#[test]
+fn fixture_git_candidates_include_the_platform_prefix() {
+    let prefix = Path::new("/platform-prefix");
+    assert!(
+        fixture_git_directories(Some(prefix.as_os_str())).contains(&prefix.join("bin")),
+        "platform prefix must participate in Git resolution"
+    );
+}
+
+#[test]
+fn fixture_git_resolution_does_not_require_a_user_home() {
+    let selected = resolve_fixture_git(
+        None,
+        std::env::var_os("PREFIX").as_deref(),
+        None,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    );
+    assert!(selected.is_absolute());
+    assert!(selected.is_file());
+}
+
+#[test]
+fn fixture_git_commands_scrub_repository_selection() {
+    let scope = TempDir::new("cli-git-env").expect("fixture scope");
+    let repo = scope.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("fixture repository");
+    let mut init = fixture_git();
+    assert!(
+        init.args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .expect("init fixture")
+            .success()
+    );
+
+    let command_home = TempDir::new("cli-git-poison-home").expect("fixture Git home");
+    let mut command = Command::new(fixture_git_program());
+    command
+        .env("GIT_DIR", scope.path().join("poison.git"))
+        .env("GIT_WORK_TREE", scope.path().join("poison-worktree"))
+        .env("GIT_OBJECT_DIRECTORY", scope.path().join("poison-objects"))
+        .env("GIT_INDEX_FILE", scope.path().join("poison-index"))
+        .env("GIT_CONFIG_PARAMETERS", "broken")
+        .env("GIT_CONFIG_GLOBAL", scope.path().join("poison-config"))
+        .env("XDG_CONFIG_HOME", scope.path().join("poison-xdg"));
+    configure_fixture_git(&mut command, command_home.path());
+    let output = command
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .expect("inspect fixture repository");
+
+    assert!(
+        output.status.success(),
+        "fixture Git inherited repository selection: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let top = String::from_utf8(output.stdout).expect("fixture repository path");
+    assert_eq!(Path::new(top.trim_end_matches('\n')), repo);
+}
+
+#[test]
+fn fixture_git_commands_scrub_template_and_transport_policy() {
+    let scope = TempDir::new("cli-git-policy").expect("fixture scope");
+    let (origin, _seed, _branch) = seed_bare_origin(scope.path(), "origin");
+    let template = scope.path().join("bad-template");
+    std::fs::create_dir_all(&template).expect("template directory");
+    std::fs::write(template.join("config"), b"not valid Git configuration\n")
+        .expect("poison template");
+
+    let cases = [
+        ("GIT_ALLOW_PROTOCOL", OsString::from("https:ssh")),
+        ("GIT_TEMPLATE_DIR", template.as_os_str().to_owned()),
+    ];
+    for (index, (key, value)) in cases.into_iter().enumerate() {
+        let home = TempDir::new("cli-git-policy-home").expect("fixture Git home");
+        let destination = scope.path().join(format!("clone-{index}"));
+        let mut command = Command::new(fixture_git_program());
+        command.env(key, value);
+        configure_fixture_git(&mut command, home.path());
+        let output = command
+            .args(["clone", "-q"])
+            .arg(format!("file://{}", origin.display()))
+            .arg(&destination)
+            .output()
+            .expect("clone with scrubbed policy");
+
+        assert!(
+            output.status.success(),
+            "fixture Git inherited {key}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn fixture_git_commands_have_disjoint_homes() {
+    let first = fixture_git();
+    let first_home = first
+        .get_envs()
+        .find(|(key, _)| *key == "HOME")
+        .and_then(|(_, value)| value)
+        .expect("first fixture Git HOME")
+        .to_owned();
+
+    let second = fixture_git();
+    let second_home = second
+        .get_envs()
+        .find(|(key, _)| *key == "HOME")
+        .and_then(|(_, value)| value)
+        .expect("second fixture Git HOME")
+        .to_owned();
+
+    assert_ne!(first_home, second_home);
+    assert!(Path::new(&first_home).is_dir());
+    assert!(Path::new(&second_home).is_dir());
+    drop(first);
+    assert!(!Path::new(&first_home).exists());
+    assert!(Path::new(&second_home).is_dir());
+    drop(second);
+    assert!(!Path::new(&second_home).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_git_ignores_a_home_wrapper_and_uses_the_platform_prefix() {
+    let scope = TempDir::new_exec("cli-git-path").expect("fixture scope");
+    let home = scope.path().join("home");
+    let source = scope.path().join("source");
+    let wrapper_dir = home.join("bin");
+    let prefix_bin = scope.path().join("prefix/bin");
+    std::fs::create_dir_all(&wrapper_dir).expect("wrapper directory");
+    std::fs::create_dir_all(&source).expect("source directory");
+    std::fs::create_dir_all(&prefix_bin).expect("platform prefix");
+
+    let marker = scope.path().join("wrapper-ran");
+    let wrapper = wrapper_dir.join("git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!{}\nprintf wrapper >'{}'\nexit 97\n",
+            dot_test_support::bash().display(),
+            marker.display()
+        ),
+    )
+    .expect("poison Git wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("make wrapper executable");
+
+    let trusted = prefix_bin.join("git");
+    std::fs::write(
+        &trusted,
+        format!(
+            "#!{}\nprintf 'fixture git\\n'\n",
+            dot_test_support::bash().display()
+        ),
+    )
+    .expect("trusted fixture Git");
+    std::fs::set_permissions(&trusted, std::fs::Permissions::from_mode(0o755))
+        .expect("make fixture Git executable");
+
+    let selected = select_fixture_git([wrapper_dir.clone(), prefix_bin], &[home, source])
+        .expect("select trusted fixture Git");
+    let output = Command::new("git")
+        .arg("--version")
+        .env_clear()
+        .env(
+            "PATH",
+            fixture_path_with(&selected, wrapper_dir.as_os_str()),
+        )
+        .output()
+        .expect("run selected fixture Git");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"fixture git\n");
+    assert!(output.stderr.is_empty());
+    assert!(!marker.exists(), "home wrapper ran");
 }
 
 fn wait_for_runtime_workers(barrier: &Path, markers: &[&str]) -> bool {
@@ -1590,8 +2010,7 @@ fn native_parent_snapshot() -> BTreeMap<OsString, Option<OsString>> {
 /// author/committer dates keep fixture SHAs deterministic;
 /// `DOT_GIT_REAL` bypasses any machine-local git launcher shim
 fn repos_git(dir: &Path, args: &[&str]) {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
+    let mut command = fixture_git();
     let status = command
         .arg("-C")
         .arg(dir)
@@ -1610,8 +2029,7 @@ fn repos_git(dir: &Path, args: &[&str]) {
 /// Run `git --git-dir=<git_dir> --work-tree=<work> args` silenced
 /// (separate-topology base fixtures), asserting success.
 fn repos_git_prefix(git_dir: &Path, work: &Path, args: &[&str]) {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
+    let mut command = fixture_git();
     let status = command
         .arg(format!("--git-dir={}", git_dir.display()))
         .arg(format!("--work-tree={}", work.display()))
@@ -1632,8 +2050,7 @@ fn repos_git_prefix(git_dir: &Path, work: &Path, args: &[&str]) {
 
 /// Capture one `git -C dir args` stdout line, trimmed.
 fn repos_git_line(dir: &Path, args: &[&str]) -> String {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
+    let mut command = fixture_git();
     let output = command
         .arg("-C")
         .arg(dir)
@@ -1659,8 +2076,7 @@ fn seed_bare_origin(scope: &Path, name: &str) -> (PathBuf, PathBuf, String) {
     std::fs::create_dir_all(&origin).expect("origin dir");
     repos_git(&origin, &["init", "--bare", "-q"]);
     let seed = scope.join(format!("{name}-seed"));
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
+    let mut command = fixture_git();
     let status = command
         .arg("clone")
         .arg("-q")
@@ -1761,8 +2177,7 @@ fn stage_repos_client() -> ReposClient {
     std::fs::write(confd.join("10-alpha.conf"), format!("url={overlay_url}\n"))
         .expect("overlay descriptor");
     let overlay = home.join(".dotfiles-alpha");
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
+    let mut command = fixture_git();
     let status = command
         .arg("clone")
         .arg("-q")
@@ -1793,7 +2208,7 @@ fn stage_repos_client() -> ReposClient {
 /// one `.env` entry per variable make every input explicit.
 fn repos_env(cmd: &mut Command, client: &ReposClient) {
     let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = fixture_path();
     let tmpdir = std::env::var_os("TMPDIR")
         .filter(|dir| !dir.is_empty())
         .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
@@ -1815,7 +2230,7 @@ fn repos_env(cmd: &mut Command, client: &ReposClient) {
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("DOT_SOURCE_ROOT", repo)
         .current_dir(&client.home);
-    isolate_git(cmd);
+    isolate_git_config(cmd);
 }
 
 #[cfg(target_os = "macos")]
@@ -1884,7 +2299,7 @@ fn ambient_topology_cannot_authorize_an_uninitialized_checkout() {
             .arg(command)
             .env_clear()
             .env("LC_ALL", "C")
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("PATH", fixture_path())
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &xdg)
             .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
@@ -1912,7 +2327,7 @@ fn ambient_topology_cannot_authorize_an_uninitialized_checkout() {
             .arg(command)
             .env_clear()
             .env("LC_ALL", "C")
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("PATH", fixture_path())
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &xdg)
             .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
@@ -1939,7 +2354,7 @@ fn init_help_validates_an_existing_identity_record() {
         .args(["init", "--help"])
         .env_clear()
         .env("LC_ALL", "C")
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PATH", fixture_path())
         .env("HOME", &home)
         .env("XDG_STATE_HOME", &state)
         .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
@@ -2175,8 +2590,7 @@ fn repos_diff_clean_prints_headers_without_hunks() {
 /// Capture one separate-topology `git --git-dir/--work-tree` stdout
 /// line, trimmed.
 fn repos_prefix_line(git_dir: &Path, work: &Path, args: &[&str]) -> String {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
+    let mut command = fixture_git();
     let output = command
         .arg(format!("--git-dir={}", git_dir.display()))
         .arg(format!("--work-tree={}", work.display()))
@@ -2448,7 +2862,7 @@ fn repos_status_without_topology_is_silent() {
     let xdg = scope.path().join("xdg");
     std::fs::create_dir_all(&home).expect("fixture home");
     let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = fixture_path();
     let tmpdir = std::env::var_os("TMPDIR")
         .filter(|dir| !dir.is_empty())
         .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
@@ -2467,7 +2881,7 @@ fn repos_status_without_topology_is_silent() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    isolate_git(&mut command);
+    isolate_git_config(&mut command);
     let output = command.output().expect("run dot status");
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"");
@@ -3615,8 +4029,7 @@ fn assert_clean_checkout(client: &ReposClient, name: &str) {
 }
 
 fn git_base_output(client: &ReposClient, args: &[&str]) -> Vec<u8> {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
+    let mut command = fixture_git();
     let output = command
         .arg(format!("--git-dir={}", client.base_git_dir.display()))
         .arg(format!("--work-tree={}", client.home.display()))
@@ -3635,8 +4048,7 @@ fn git_base_output(client: &ReposClient, args: &[&str]) -> Vec<u8> {
 }
 
 fn git_checkout_output(checkout: &Path, args: &[&str]) -> Vec<u8> {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
+    let mut command = fixture_git();
     let output = command
         .arg("-C")
         .arg(checkout)
