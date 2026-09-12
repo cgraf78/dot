@@ -2951,12 +2951,23 @@ fn macos_native_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
 /// lookup is bracketed with two matching kernel records so PID reuse or
 /// a concurrent setsid cannot splice topology from different generations
 /// into one row. Zombies keep the self-referential pair the `ps`
-/// fallback uses since they are definitively dead.
+/// fallback uses since they are definitively dead; an unreadable zombie
+/// reports parent zero (unknown) since only its presence is observable.
 #[cfg(target_os = "macos")]
 fn macos_native_process_info(pid: u32) -> std::result::Result<Option<ProcessInfo>, ()> {
     let before = match macos_bsd_info(pid) {
-        Ok(Some(info)) => info,
-        Ok(None) => return Ok(None),
+        Ok(BsdOutcome::Record(info)) => info,
+        Ok(BsdOutcome::Gone) => return Ok(None),
+        Ok(BsdOutcome::Zombie) => {
+            return Ok(Some(ProcessInfo {
+                pid,
+                parent: 0,
+                group: pid,
+                session: pid,
+                live: false,
+                identity: ProcessIdentity { pid, start: None },
+            }));
+        }
         Err(()) => return Err(()),
     };
     if before.pbi_status == libc::SZOMB {
@@ -2978,8 +2989,19 @@ fn macos_native_process_info(pid: u32) -> std::result::Result<Option<ProcessInfo
         return Err(());
     }
     let after = match macos_bsd_info(pid) {
-        Ok(Some(info)) => info,
-        Ok(None) => return Ok(None),
+        Ok(BsdOutcome::Record(info)) => info,
+        // The row died between the two records: report the zombie with
+        // the parent observed while it was still readable.
+        Ok(BsdOutcome::Gone) | Ok(BsdOutcome::Zombie) => {
+            return Ok(Some(ProcessInfo {
+                pid,
+                parent: before.pbi_ppid,
+                group: pid,
+                session: pid,
+                live: false,
+                identity: ProcessIdentity { pid, start: None },
+            }));
+        }
         Err(()) => return Err(()),
     };
     // A generation or liveness change between the two records means the
@@ -3004,21 +3026,66 @@ fn macos_native_process_info(pid: u32) -> std::result::Result<Option<ProcessInfo
     }))
 }
 
+/// Outcome of one macOS process-record query.
+#[cfg(target_os = "macos")]
+enum BsdOutcome {
+    /// A complete record for the requested PID.
+    Record(libc::proc_bsdinfo),
+    /// The PID is gone, reused, or unobservable: unrelated churn.
+    Gone,
+    /// The PID exists but `proc_pidinfo` cannot read it: an unreaped
+    /// zombie, which the teardown proof must observe as present-but-dead.
+    Zombie,
+}
+
 /// Read one macOS process record through `proc_pidinfo`.
 ///
-/// Returns `Ok(None)` when the row exited or was reused mid-query
-/// (unrelated churn) or belongs to another user and is therefore
-/// unobservable, and `Err` for any other query failure, matching the
-/// `ps` fallback's fail-closed rule.
+/// `proc_pidinfo` cannot read zombies, so an `ESRCH` row is probed with
+/// `kill(pid, 0)`: a present-but-unreadable PID is reported as a zombie
+/// (matching the `ps` fallback, which lists zombies) while a fully gone
+/// PID is churn. The probe re-reads once so an exit/refork race resolves
+/// to the fresh live record instead of a zombie row for a live process.
+/// Permission-denied rows stay skipped without probing: session members
+/// are always same-user observable, so skipping cannot hide a member.
+/// Any other query failure fails closed like the `ps` fallback.
 #[cfg(target_os = "macos")]
-fn macos_bsd_info(pid: u32) -> std::result::Result<Option<libc::proc_bsdinfo>, ()> {
+fn macos_bsd_info(pid: u32) -> std::result::Result<BsdOutcome, ()> {
     let Ok(pid_i32) = i32::try_from(pid) else {
         return Err(());
     };
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let Ok(size) = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()) else {
         return Err(());
     };
+    match macos_bsd_read(pid, pid_i32, size) {
+        Ok(info) => Ok(BsdOutcome::Record(info)),
+        Err(error) if error == libc::ESRCH => {
+            // SAFETY: positive PID and signal zero only probe existence.
+            if unsafe { libc::kill(pid_i32, 0) } != 0 {
+                return Ok(BsdOutcome::Gone);
+            }
+            match macos_bsd_read(pid, pid_i32, size) {
+                Ok(info) => Ok(BsdOutcome::Record(info)),
+                Err(error) if error == libc::ESRCH => Ok(BsdOutcome::Zombie),
+                Err(error) if error == libc::EPERM || error == libc::EACCES => Ok(BsdOutcome::Gone),
+                Err(_) => Err(()),
+            }
+        }
+        Err(error) if error == libc::EPERM || error == libc::EACCES => Ok(BsdOutcome::Gone),
+        Err(_) => Err(()),
+    }
+}
+
+/// One `proc_pidinfo` attempt: a complete matching record, or the errno.
+///
+/// A complete record for another PID reports `ESRCH`: the slot was
+/// reused mid-query, which the caller treats like an exited row.
+#[cfg(target_os = "macos")]
+fn macos_bsd_read(
+    pid: u32,
+    pid_i32: i32,
+    size: i32,
+) -> std::result::Result<libc::proc_bsdinfo, i32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     // SAFETY: info owns size writable bytes and this flavor has no
     // auxiliary argument.
     let written = unsafe {
@@ -3030,25 +3097,15 @@ fn macos_bsd_info(pid: u32) -> std::result::Result<Option<libc::proc_bsdinfo>, (
             size,
         )
     };
+    if written == size && info.pbi_pid == pid {
+        return Ok(info);
+    }
     if written == size {
-        // A complete record for another PID means the slot was reused
-        // mid-query; skip the row rather than splicing generations.
-        return if info.pbi_pid == pid {
-            Ok(Some(info))
-        } else {
-            Ok(None)
-        };
+        return Err(libc::ESRCH);
     }
-    match std::io::Error::last_os_error().raw_os_error() {
-        // Exited mid-query, or owned by another user/SIP-protected and
-        // therefore unobservable: unrelated to this snapshot. Teardown
-        // verification only consults same-user session members, which
-        // are always observable, so skipping cannot hide a member.
-        Some(errno) if errno == libc::ESRCH || errno == libc::EPERM || errno == libc::EACCES => {
-            Ok(None)
-        }
-        _ => Err(()),
-    }
+    Err(std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EINVAL))
 }
 
 /// Parse the macOS `ps` columns and resolve group/session per PID.
@@ -10852,6 +10909,36 @@ int kill(pid_t pid, int sig) {
         assert_eq!(row.session, session);
         // SAFETY: getppid takes no arguments and always succeeds.
         assert_eq!(row.parent, unsafe { libc::getppid() } as u32);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_native_snapshot_lists_an_unreaped_zombie() {
+        // SAFETY: fork in a threaded test is safe when the child calls
+        // only async-signal-safe functions before exiting immediately.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork the zombie fixture");
+        if child == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        let zombie = child as u32;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = macos_native_snapshot(deadline).expect("snapshot succeeds");
+            match snapshot.iter().find(|process| process.pid == zombie) {
+                // The teardown proof requires the unreaped leader to be
+                // listed as present-but-dead, like the `ps` fallback.
+                Some(row) if !row.live => break,
+                _ if Instant::now() >= deadline => {
+                    panic!("unreaped zombie was never listed as not-live")
+                }
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        // SAFETY: the fixture child is our direct child; reap it.
+        unsafe {
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+        }
     }
 
     #[test]
