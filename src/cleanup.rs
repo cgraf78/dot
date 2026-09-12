@@ -6864,8 +6864,12 @@ impl Session {
         {
             // Fail closed as the call's error (not a suppressed incomplete
             // outcome): an unpinned member must never be delivered unsafely,
-            // and the caller must handle the refusal explicitly.
-            set_cleanup_incomplete("signal_new:authority-refusal");
+            // and the caller must handle the refusal explicitly. The refusal
+            // travels the deferred-error channel via merge_authority_errors;
+            // it must not set the incomplete atomic, which would rewrite
+            // the caller's explicit failure into a global 125. Genuine
+            // teardown failures still fail closed through decide_after_cleanup
+            // and the stop-owned-sessions verifiers.
             // TEMP-DIAG-180: remove with the recvmsg diag.
             eprintln!("TEMP-DIAG-180: authority refusal set");
             self.authority_error = Some(std::io::Error::new(
