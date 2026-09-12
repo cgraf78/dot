@@ -4,7 +4,8 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::ffi::{c_int, c_long, c_ulong, OsString};
+use std::ffi::OsString;
+use std::ffi::{c_int, c_long, c_ulong};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -3553,6 +3554,14 @@ fn coordinate_for_parent(
     drop(command);
     drop(ready_write);
     drop(start_read);
+    // Publish the test-only guardian identity before binding: a guardian that
+    // exits during arming may already be gone when binding runs, and the
+    // post-mortem assertions still need its exact PID.
+    #[cfg(performance_supervisor_test)]
+    if let Some(path) = env::var_os(TEST_GUARDIAN_PID_FILE_ENV) {
+        fs::write(path, format!("{}\n", child.id()))
+            .map_err(|error| format!("publish cleanup-guardian identity: {error}"))?;
+    }
     let guardian_identity = match process_identity(child.id()) {
         Ok(Some(identity)) if identity.live => identity,
         result => {
@@ -3596,12 +3605,6 @@ fn coordinate_for_parent(
         guardian_reaped: false,
         target_cleanup_done: false,
     };
-    #[cfg(performance_supervisor_test)]
-    if let Some(path) = env::var_os(TEST_GUARDIAN_PID_FILE_ENV) {
-        fs::write(path, format!("{}\n", guardian.child.id()))
-            .map_err(|error| format!("publish cleanup-guardian identity: {error}"))?;
-    }
-
     let mut armed = [0_u8; 1];
     let arming_deadline = Instant::now() + setup_grace();
     match guardian.read_frame(&parent, &mut armed, true, Some(arming_deadline))? {
@@ -4496,12 +4499,14 @@ mod tests {
         let (_read, write) =
             internal_pipe("fixture read", "fixture write").expect("create aliased fixture pipe");
         let alias = duplicate_internal_fd(&write, "fixture alias").expect("duplicate fixture pipe");
-        assert!(same_open_file(write.as_raw_fd(), alias.as_raw_fd())
-            .expect("compare aliased descriptors"));
+        let aliased = same_open_file(write.as_raw_fd(), alias.as_raw_fd())
+            .expect("compare aliased descriptors");
+        assert!(aliased);
         let (_other_read, other_write) =
             internal_pipe("other read", "other write").expect("create distinct fixture pipe");
-        assert!(!same_open_file(write.as_raw_fd(), other_write.as_raw_fd())
-            .expect("compare distinct descriptors"));
+        let distinct = same_open_file(write.as_raw_fd(), other_write.as_raw_fd())
+            .expect("compare distinct descriptors");
+        assert!(!distinct);
     }
 
     #[test]
