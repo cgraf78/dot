@@ -109,6 +109,64 @@ assert_contains '"$install_root/bin/dot" version' "$test_workflow" \
 assert_contains 'bash tests/release-scripts-test' "$test_workflow" \
   'Rust CI runs the release contract'
 
+# The Termux runtime smoke runs a background native command and waits for its
+# suite readiness marker. A preflight failure must surface immediately with the
+# owned runner's diagnostic instead of looking like a fifteen-second fixture
+# timeout. The fake preserves every earlier CLI contract check, then fails only
+# at the `dot test` boundary this assertion owns.
+termux_failure=$DOT_TEST_TMP/termux-runner-failure
+mkdir -p "$termux_failure/.termux-ci" "$termux_failure/tmp"
+cat >"$termux_failure/.termux-ci/dot" <<'SH'
+#!/usr/bin/env bash
+case ${1:-} in
+  help)
+    printf '%s\n' 'usage: dot <command> [<args>]'
+    ;;
+  version)
+    printf '%s\n' \
+      'dot commit 0123456789abcdef0123456789abcdef01234567 (config 1; extensions 1; library 1)'
+    ;;
+  frobnicate)
+    printf '%s\n' 'dot: unknown command: frobnicate' >&2
+    exit 1
+    ;;
+  test)
+    mode=$(LC_ALL=C ls -ld "$DOT_TEST_TESTS_DIR")
+    [[ ${mode:0:10} == drwx------ ]] || {
+      printf '%s\n' 'synthetic runner rejected unsafe suite permissions' >&2
+      exit 24
+    }
+    printf '%s\n' 'synthetic runner preflight failure' >&2
+    exit 23
+    ;;
+  *)
+    exit 99
+    ;;
+esac
+SH
+chmod 0755 "$termux_failure/.termux-ci/dot"
+: >"$termux_failure/.termux-ci/.dot-install.json"
+termux_started=$SECONDS
+termux_status=0
+set +e
+termux_output=$(
+  cd "$termux_failure"
+  umask 002
+  PREFIX=/usr TMPDIR=$termux_failure/tmp \
+    "$BASH" "$DOT_TEST_ROOT/scripts/termux-ci.sh" 2>&1
+)
+termux_status=$?
+set -e
+termux_elapsed=$((SECONDS - termux_started))
+assert_eq 1 "$termux_status" \
+  'Termux smoke rejects a runner that exits before suite readiness'
+((termux_elapsed < 5)) ||
+  fail "Termux smoke waited ${termux_elapsed}s after its runner exited"
+assert_contains 'termux-ci: signal fixture exited before start (status 23)' \
+  "$termux_output" 'Termux smoke reports the early runner status'
+assert_contains 'synthetic runner preflight failure' "$termux_output" \
+  'Termux smoke preserves the early runner diagnostic'
+
 for obsolete in support/install-checkout.sh support/post-install.sh; do
   [[ ! -e $DOT_TEST_ROOT/$obsolete && ! -L $DOT_TEST_ROOT/$obsolete ]] ||
     fail "checkout-era release helper remains: $obsolete"

@@ -376,7 +376,7 @@ fn run_update(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
-    let signals = match crate::cleanup::Signals::install() {
+    let signals = match crate::cleanup::Signals::for_runtime(runtime) {
         Ok(signals) => signals,
         Err(_) => return EXIT_ERROR,
     };
@@ -402,15 +402,19 @@ fn run_update(
     }
     // Preserve the kernel's codes (`0` success, `1` failure, `2` config
     // rejection, `75` lock busy) across the typed stream boundary.
-    let code = crate::update_run::run(
-        runtime,
-        config,
-        &env,
-        crate::update_run::Request { args },
-        stdout,
-        stderr,
-    );
-    signals.received().map_or(code, |signal| 128 + signal)
+    let code = {
+        let mut stdout = signals.writer(stdout);
+        let mut stderr = signals.writer(stderr);
+        crate::update_run::run(
+            runtime,
+            config,
+            &env,
+            crate::update_run::Request { args },
+            &mut stdout,
+            &mut stderr,
+        )
+    };
+    signals.finish(code)
 }
 
 /// The [`Command::Cron`] arm: `crontab -l`, falling back to the

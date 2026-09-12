@@ -175,38 +175,62 @@ fn run_configured(
         }),
     );
 
-    let extension_status = extensions(
-        runtime,
-        config,
-        euid,
-        &overlays.active,
-        &constants.overlay_manifest,
-        streams.stderr,
-        &mut recorder,
-    );
-    let palette = crate::doctor_runtime::resolve_palette(
-        stdout_terminal,
-        runtime.value("NO_COLOR").and_then(OsStr::to_str),
-    );
-    if streams
-        .stdout
-        .write_all(&recorder.render_with(&palette))
-        .is_err()
-    {
-        return 1;
-    }
-    let counts = recorder.counts();
-    let summary = crate::doctor_coordinator::summary_line(counts.pass, counts.warn, counts.fail);
-    let color = crate::doctor_coordinator::summary_color(counts.fail, counts.warn);
-    if streams.stdout.write_all(b"\n").is_err()
-        || crate::ui::summary_box(streams.stdout, &renderer, color.name(), &summary).is_err()
-    {
-        return 1;
-    }
-    i32::from(!crate::doctor_coordinator::overall_ok(
-        counts.fail,
-        extension_status,
-    ))
+    // Core probes are synchronous and precede all owned background work. Arm
+    // the process-level handler only for the extension phase, whose worker
+    // sessions poll the shared cancellation state and reap before return.
+    let signals = match crate::cleanup::Signals::for_runtime(runtime) {
+        Ok(signals) => signals,
+        Err(_) => return 1,
+    };
+    let code = {
+        let mut stdout = signals.writer(streams.stdout);
+        let mut stderr = signals.writer(streams.stderr);
+        let mut guarded_streams =
+            crate::app::Streams::with_terminal(&mut stdout, &mut stderr, stdout_terminal);
+        let streams = &mut guarded_streams;
+        (|| -> i32 {
+            let extension_status = extensions(
+                runtime,
+                config,
+                euid,
+                &overlays.active,
+                &constants.overlay_manifest,
+                streams.stderr,
+                &mut recorder,
+            );
+            // Cancellation owns the final status at the CLI boundary. Do not
+            // render a normal report after an interrupted extension is reaped.
+            if crate::cleanup::received_signal().is_some() {
+                return 1;
+            }
+            let palette = crate::doctor_runtime::resolve_palette(
+                stdout_terminal,
+                runtime.value("NO_COLOR").and_then(OsStr::to_str),
+            );
+            if streams
+                .stdout
+                .write_all(&recorder.render_with(&palette))
+                .is_err()
+            {
+                return 1;
+            }
+            let counts = recorder.counts();
+            let summary =
+                crate::doctor_coordinator::summary_line(counts.pass, counts.warn, counts.fail);
+            let color = crate::doctor_coordinator::summary_color(counts.fail, counts.warn);
+            if streams.stdout.write_all(b"\n").is_err()
+                || crate::ui::summary_box(streams.stdout, &renderer, color.name(), &summary)
+                    .is_err()
+            {
+                return 1;
+            }
+            i32::from(!crate::doctor_coordinator::overall_ok(
+                counts.fail,
+                extension_status,
+            ))
+        })()
+    };
+    signals.finish(code)
 }
 
 fn text(value: Option<&OsStr>) -> String {
@@ -583,6 +607,9 @@ fn extensions(
     let mut worker =
         crate::hook_worker::Worker::with_doctor(runtime, root, bash.path().to_path_buf());
     for spec in discovery.specs {
+        if crate::cleanup::received_signal().is_some() {
+            return 1;
+        }
         let mut launch = |call: &crate::doctor_orchestrator::WorkerInvocation<'_>| {
             let outcome = worker.doctor(
                 call.script,
@@ -609,6 +636,9 @@ fn extensions(
         ) != 0
         {
             status = 1;
+        }
+        if crate::cleanup::received_signal().is_some() {
+            return 1;
         }
     }
     status

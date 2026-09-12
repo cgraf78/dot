@@ -81,6 +81,9 @@ jobs:
       # transported release-mode binary's CLI contract only (no cargo in
       # the sandbox); perf budgets are a fast-host gate.
       termux-command: scripts/termux-ci.sh
+      # The lifecycle smoke invokes `dot test`, whose parity contract requires
+      # a trusted system Git before it launches any suite.
+      termux-profiles: base
       termux-host-command: |
         # Build outside the checkout: the emulator copy step tars the
         # whole caller tree, and in-tree target/ hardlinks break that
@@ -90,7 +93,7 @@ jobs:
         archive=$(scripts/package-release.sh "$RUST_TARGET" android-x86_64)
         scripts/smoke-release.sh android-x86_64
         mkdir -p .termux-ci
-        tar -C .termux-ci -xzf "$archive" ./dot ./.dot-install.json
+        tar -C .termux-ci -xzf "$archive"
 
   shell:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@c05c06f1c0fc443b15255b823e0b11d7b190bda3

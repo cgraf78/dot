@@ -161,19 +161,19 @@ struct Outcome {
 struct Workers(Vec<Worker>);
 
 impl Workers {
-    fn stop(&mut self, signal: i32) {
+    fn stop(&mut self) {
         let mut children: Vec<_> = self
             .0
             .iter_mut()
             .filter_map(|worker| worker.child.take())
             .collect();
-        let _ = crate::cleanup::stop_sessions(&mut children, signal);
+        let _ = crate::cleanup::stop_sessions(&mut children, libc::SIGTERM);
     }
 }
 
 impl Drop for Workers {
     fn drop(&mut self) {
-        self.stop(libc::SIGTERM);
+        self.stop();
     }
 }
 
@@ -284,12 +284,50 @@ fn start(
 fn drain(worker: &mut Worker, out: &mut dyn std::io::Write) -> std::io::Result<()> {
     let length = worker.reader.metadata()?.len();
     worker.reader.seek(SeekFrom::Start(worker.offset))?;
-    let count = std::io::copy(
+    let count = copy_interruptible(
         &mut (&mut worker.reader).take(length.saturating_sub(worker.offset)),
         out,
     )?;
     worker.offset += count;
     out.flush()
+}
+
+/// Copy file-backed suite output while retaining cancellation as an escape
+/// from a blocked stdout. The installed handlers omit `SA_RESTART`, so a
+/// signal interrupts the underlying write and lets this loop observe the
+/// process-wide latch instead of retrying forever like `write_all`/`copy`.
+fn copy_interruptible(
+    input: &mut dyn std::io::Read,
+    output: &mut dyn std::io::Write,
+) -> std::io::Result<u64> {
+    let mut copied = 0;
+    let mut buffer = [0; 8192];
+    loop {
+        if crate::cleanup::received_signal().is_some() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        let count = match input.read(&mut buffer) {
+            Ok(0) => return Ok(copied),
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let mut remaining = &buffer[..count];
+        while !remaining.is_empty() {
+            if crate::cleanup::received_signal().is_some() {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            match output.write(remaining) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(written) => {
+                    copied += written as u64;
+                    remaining = &remaining[written..];
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 
 fn finish(worker: &mut Worker, options: &Options) -> std::io::Result<Outcome> {
@@ -346,169 +384,177 @@ fn execute(
     streams: &mut Streams<'_>,
 ) -> std::io::Result<i32> {
     crate::cleanup::adopt_descendants()?;
-    let signals = crate::cleanup::Signals::install()?;
-    let mut invocation = Invocation::new(context)?;
-    let renderer = if options.color {
-        crate::ui::Renderer::select(
-            crate::ui::find_gum(
-                &context
-                    .runtime
-                    .value("PATH")
-                    .unwrap_or_default()
-                    .to_string_lossy(),
-            ),
-            streams.stdout_is_terminal(),
-            None,
-        )
-    } else {
-        crate::ui::Renderer::Plain
-    };
-    crate::ui::title(streams.stdout, &renderer, "dot test").map_err(render_error)?;
-    writeln!(streams.stdout)?;
-    styled(
-        streams.stdout,
-        options,
-        "dim",
-        &if options.parallel {
-            format!(
-                "Running {} test suites with up to {} jobs...",
-                suites.len(),
-                options.jobs
+    let signals = crate::cleanup::Signals::for_runtime(context.runtime)?;
+    let stdout_terminal = streams.stdout_is_terminal();
+    let mut stdout = signals.writer(streams.stdout);
+    let mut stderr = signals.writer(streams.stderr);
+    let mut guarded_streams = Streams::with_terminal(&mut stdout, &mut stderr, stdout_terminal);
+    let streams = &mut guarded_streams;
+    let result = (|| -> std::io::Result<i32> {
+        let mut invocation = Invocation::new(context)?;
+        let renderer = if options.color {
+            crate::ui::Renderer::select(
+                crate::ui::find_gum(
+                    &context
+                        .runtime
+                        .value("PATH")
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                ),
+                streams.stdout_is_terminal(),
+                None,
             )
         } else {
-            format!("Running {} test suites...", suites.len())
-        },
-    )?;
-    if options.parallel {
+            crate::ui::Renderer::Plain
+        };
+        crate::ui::title(streams.stdout, &renderer, "dot test").map_err(render_error)?;
         writeln!(streams.stdout)?;
-    }
-    let mut workers = Workers(Vec::new());
-    let mut outcomes: Vec<Option<Outcome>> = (0..suites.len()).map(|_| None).collect();
-    let mut next = 0;
-    let mut completed = 0;
-    let limit = if options.parallel { options.jobs } else { 1 };
-    while completed < suites.len() {
-        if let Some(signal) = signals.received() {
-            workers.stop(signal);
-            return Ok(128 + signal);
-        }
-        while workers.0.len() < limit && next < suites.len() && signals.received().is_none() {
-            if !options.parallel {
-                writeln!(streams.stdout)?;
-                header(streams.stdout, options, &label(&suites[next]), false)?;
-            }
-            workers.0.push(start(
-                context,
-                options,
-                &suites[next],
-                next,
-                &invocation.root,
-            )?);
-            next += 1;
-        }
-        let mut index = 0;
-        while index < workers.0.len() {
-            let worker = &mut workers.0[index];
-            if !options.parallel {
-                drain(worker, streams.stdout)?;
-            }
-            if let Some(child) = worker.child.as_ref() {
-                let exited = crate::cleanup::exited(child)?;
-                let expired = worker.started.elapsed() >= worker.timeout;
-                if exited || expired {
-                    let mut child = worker.child.take().expect("observed owned child");
-                    let status = crate::cleanup::stop_session(&mut child, libc::SIGTERM)?;
-                    worker.status = Some(if !exited && expired {
-                        124
-                    } else {
-                        status
-                            .code()
-                            .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
-                    });
-                }
-            }
-            if worker.status.is_none() {
-                index += 1;
-                continue;
-            }
-            if !options.parallel {
-                drain(worker, streams.stdout)?;
-            }
-            let outcome = finish(worker, options)?;
-            mark(streams, options, &label(&suites[worker.index]), &outcome)?;
-            if !options.parallel && options.ci {
-                writeln!(streams.stdout, "::endgroup::")?;
-            }
-            outcomes[worker.index] = Some(outcome);
-            workers.0.remove(index);
-            completed += 1;
-        }
-        if completed < suites.len() {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-    let mut passed = 0;
-    let mut skipped = 0;
-    let mut failed = Vec::new();
-    for (suite, outcome) in suites.iter().zip(outcomes.iter().flatten()) {
-        match outcome.classification {
-            SuiteClassification::Pass => passed += 1,
-            SuiteClassification::Skip => skipped += 1,
-            _ => failed.push(label(suite)),
-        }
-        if options.parallel
-            && (options.verbose
-                || !matches!(
-                    outcome.classification,
-                    SuiteClassification::Pass | SuiteClassification::Skip
-                ))
-        {
-            writeln!(streams.stdout)?;
-            header(streams.stdout, options, &label(suite), true)?;
-            let mut reader = &outcome.output;
-            reader.seek(SeekFrom::Start(0))?;
-            let length = reader.metadata()?.len();
-            std::io::copy(&mut reader.take(length), streams.stdout)?;
-            if options.ci {
-                writeln!(streams.stdout, "::endgroup::")?;
-            }
-        }
-    }
-    if !invocation.remove() {
-        writeln!(
-            streams.stderr,
-            "dot test: could not remove temporary directory: {}",
-            invocation.root.display()
-        )?;
-        failed.push("cleanup".into());
-    }
-    let summary = format_summary(passed, skipped, failed.len() as u64, suites.len());
-    let (color, glyph) = if failed.is_empty() {
-        ("green", "✓")
-    } else {
-        ("red", "✗")
-    };
-    if options.color {
-        writeln!(streams.stdout)?;
-        crate::ui::summary_box(
-            streams.stdout,
-            &renderer,
-            color,
-            &format!("{glyph} {summary}"),
-        )
-        .map_err(render_error)?;
-    } else {
-        writeln!(streams.stdout, "{RULE}\n{glyph} {summary}\n{RULE}")?;
-    }
-    if !failed.is_empty() {
         styled(
             streams.stdout,
             options,
-            "red",
-            &format!("Failed: {}", failed.join(" ")),
+            "dim",
+            &if options.parallel {
+                format!(
+                    "Running {} test suites with up to {} jobs...",
+                    suites.len(),
+                    options.jobs
+                )
+            } else {
+                format!("Running {} test suites...", suites.len())
+            },
         )?;
-    }
-    Ok(i32::from(!failed.is_empty()))
+        if options.parallel {
+            writeln!(streams.stdout)?;
+        }
+        let mut workers = Workers(Vec::new());
+        let mut outcomes: Vec<Option<Outcome>> = (0..suites.len()).map(|_| None).collect();
+        let mut next = 0;
+        let mut completed = 0;
+        let limit = if options.parallel { options.jobs } else { 1 };
+        while completed < suites.len() {
+            if signals.received().is_some() {
+                workers.stop();
+                return Ok(1);
+            }
+            while workers.0.len() < limit && next < suites.len() && signals.received().is_none() {
+                if !options.parallel {
+                    writeln!(streams.stdout)?;
+                    header(streams.stdout, options, &label(&suites[next]), false)?;
+                }
+                workers.0.push(start(
+                    context,
+                    options,
+                    &suites[next],
+                    next,
+                    &invocation.root,
+                )?);
+                next += 1;
+            }
+            let mut index = 0;
+            while index < workers.0.len() {
+                let worker = &mut workers.0[index];
+                if !options.parallel {
+                    drain(worker, streams.stdout)?;
+                }
+                if let Some(child) = worker.child.as_ref() {
+                    let exited = crate::cleanup::exited(child)?;
+                    let expired = worker.started.elapsed() >= worker.timeout;
+                    if exited || expired {
+                        let mut child = worker.child.take().expect("observed owned child");
+                        let status = crate::cleanup::stop_session(&mut child, libc::SIGTERM)?;
+                        worker.status = Some(if !exited && expired {
+                            124
+                        } else {
+                            status
+                                .code()
+                                .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
+                        });
+                    }
+                }
+                if worker.status.is_none() {
+                    index += 1;
+                    continue;
+                }
+                if !options.parallel {
+                    drain(worker, streams.stdout)?;
+                }
+                let outcome = finish(worker, options)?;
+                mark(streams, options, &label(&suites[worker.index]), &outcome)?;
+                if !options.parallel && options.ci {
+                    writeln!(streams.stdout, "::endgroup::")?;
+                }
+                outcomes[worker.index] = Some(outcome);
+                workers.0.remove(index);
+                completed += 1;
+            }
+            if completed < suites.len() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let mut passed = 0;
+        let mut skipped = 0;
+        let mut failed = Vec::new();
+        for (suite, outcome) in suites.iter().zip(outcomes.iter().flatten()) {
+            match outcome.classification {
+                SuiteClassification::Pass => passed += 1,
+                SuiteClassification::Skip => skipped += 1,
+                _ => failed.push(label(suite)),
+            }
+            if options.parallel
+                && (options.verbose
+                    || !matches!(
+                        outcome.classification,
+                        SuiteClassification::Pass | SuiteClassification::Skip
+                    ))
+            {
+                writeln!(streams.stdout)?;
+                header(streams.stdout, options, &label(suite), true)?;
+                let mut reader = &outcome.output;
+                reader.seek(SeekFrom::Start(0))?;
+                let length = reader.metadata()?.len();
+                copy_interruptible(&mut reader.take(length), streams.stdout)?;
+                if options.ci {
+                    writeln!(streams.stdout, "::endgroup::")?;
+                }
+            }
+        }
+        if !invocation.remove() {
+            writeln!(
+                streams.stderr,
+                "dot test: could not remove temporary directory: {}",
+                invocation.root.display()
+            )?;
+            failed.push("cleanup".into());
+        }
+        let summary = format_summary(passed, skipped, failed.len() as u64, suites.len());
+        let (color, glyph) = if failed.is_empty() {
+            ("green", "✓")
+        } else {
+            ("red", "✗")
+        };
+        if options.color {
+            writeln!(streams.stdout)?;
+            crate::ui::summary_box(
+                streams.stdout,
+                &renderer,
+                color,
+                &format!("{glyph} {summary}"),
+            )
+            .map_err(render_error)?;
+        } else {
+            writeln!(streams.stdout, "{RULE}\n{glyph} {summary}\n{RULE}")?;
+        }
+        if !failed.is_empty() {
+            styled(
+                streams.stdout,
+                options,
+                "red",
+                &format!("Failed: {}", failed.join(" ")),
+            )?;
+        }
+        Ok(i32::from(!failed.is_empty()))
+    })();
+    signals.finish_result(result)
 }
 
 fn styled(

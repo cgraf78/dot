@@ -159,6 +159,314 @@ fn seal(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("fixture mode");
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_live(pid: i32) -> bool {
+    match std::fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            let end = stat
+                .windows(2)
+                .rposition(|part| part == b") ")
+                .expect("well-formed proc stat");
+            stat.get(end + 2) != Some(&b'Z')
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("could not inspect process {pid}: {error}"),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn process_live(pid: i32) -> bool {
+    let output = Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|error| panic!("could not inspect process {pid}: {error}"));
+    if output.status.success() {
+        portable_process_live(&output.stdout)
+    // SAFETY: a positive PID and signal zero only test existence.
+    } else if unsafe { libc::kill(pid, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        false
+    } else {
+        panic!(
+            "ps could not inspect live process {pid}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+}
+
+fn portable_process_live(status: &[u8]) -> bool {
+    !matches!(
+        status
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace()),
+        None | Some(b'Z')
+    )
+}
+
+#[test]
+fn empty_portable_process_status_is_not_live() {
+    assert!(!portable_process_live(b""));
+    assert!(!portable_process_live(b" \n"));
+    assert!(!portable_process_live(b"Z+\n"));
+    assert!(portable_process_live(b"S+\n"));
+}
+
+fn poll_until(mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "observable condition timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn assert_doctor_signal(signal: i32, expected: i32) {
+    let home = TempDir::new("doctor-native-signal-home").expect("home");
+    let state = TempDir::new("doctor-native-signal-state").expect("state");
+    let root = home.path().join("extensions");
+    let directory = root.join("doctor.d");
+    let marker = home.path().join("doctor-worker");
+    let descendant_marker = home.path().join("doctor-worker-descendant");
+    let delivered = home.path().join("doctor-worker-signal");
+    let descendant_delivered = home.path().join("doctor-worker-descendant-signal");
+    let later = home.path().join("later-extension");
+    let temporary = home.path().join("tmp");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
+    std::fs::create_dir_all(&directory).expect("doctor directory");
+    std::fs::create_dir(&temporary).expect("temporary directory");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=none\n",
+    )
+    .expect("config");
+    std::fs::write(
+        directory.join("10-hang.sh"),
+        b"doctor() {\n  trap 'printf \"%s\\n\" HUP >>\"$HOME/doctor-worker-signal\"' HUP\n  trap 'printf \"%s\\n\" INT >>\"$HOME/doctor-worker-signal\"' INT\n  trap 'printf \"%s\\n\" QUIT >>\"$HOME/doctor-worker-signal\"' QUIT\n  trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker-signal\"' TERM\n  set -m\n  (\n    trap '' HUP INT QUIT\n    trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker-descendant-signal\"' TERM\n    printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker-descendant\"\n    while :; do sleep 1; done\n  ) </dev/null >/dev/null 2>&1 &\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker\"\n  while :; do wait || true; done\n}\n",
+    )
+    .expect("extension");
+    std::fs::write(
+        directory.join("20-later.sh"),
+        b"doctor() { printf ran >\"$HOME/later-extension\"; }\n",
+    )
+    .expect("later extension");
+    seal(&root, 0o700);
+    seal(&directory, 0o700);
+    seal(&directory.join("10-hang.sh"), 0o644);
+    seal(&directory.join("20-later.sh"), 0o644);
+
+    let mut child = command(
+        false,
+        &home,
+        &state,
+        &[("TMPDIR", temporary.to_str().expect("temporary path"))],
+    )
+    .spawn()
+    .expect("doctor");
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let (worker, descendant) = loop {
+        let worker = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok());
+        let descendant = std::fs::read_to_string(&descendant_marker)
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok());
+        if let (Some(worker), Some(descendant)) = (worker, descendant) {
+            break (worker, descendant);
+        }
+        if std::time::Instant::now() >= ready_deadline {
+            for path in [&marker, &descendant_marker] {
+                if let Ok(pid) = std::fs::read_to_string(path) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() {
+                        // SAFETY: fixture markers contain only process-group
+                        // leaders created by this doctor invocation.
+                        unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    }
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("doctor cancellation fixture did not start");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // SAFETY: the fixture owns this positive Dot child and uses a valid signal.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while child.try_wait().expect("doctor status").is_none() {
+        if std::time::Instant::now() >= deadline {
+            // SAFETY: these are the two fixture-owned process identities.
+            unsafe {
+                libc::kill(-worker, libc::SIGKILL);
+                libc::kill(-descendant, libc::SIGKILL);
+                libc::kill(child.id() as i32, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            panic!("doctor did not finish after signal {signal}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().expect("doctor output");
+    let observed = output.status.code();
+    let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while (process_live(worker) || process_live(descendant))
+        && std::time::Instant::now() < cleanup_deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let worker_survived = process_live(worker);
+    let descendant_survived = process_live(descendant);
+    if worker_survived {
+        // Keep the intentionally failing RED run from leaking the worker.
+        // SAFETY: the hook worker is the leader of its owned session.
+        unsafe { libc::kill(-worker, libc::SIGKILL) };
+        poll_until(|| !process_live(worker));
+    }
+    if descendant_survived {
+        // SAFETY: set -m made this fixture descendant its process-group leader.
+        unsafe { libc::kill(-descendant, libc::SIGKILL) };
+        poll_until(|| !process_live(descendant));
+    }
+    assert_eq!(
+        observed,
+        Some(expected),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!worker_survived, "doctor extension worker survived");
+    assert!(!descendant_survived, "doctor extension descendant survived");
+    assert_eq!(
+        std::fs::read(&delivered).expect("delivered signal marker"),
+        b"TERM\n",
+        "worker received the parent signal instead of cleanup TERM"
+    );
+    assert_eq!(
+        std::fs::read(&descendant_delivered).expect("descendant signal marker"),
+        b"TERM\n",
+        "escaped-group descendant did not receive exactly one cleanup TERM"
+    );
+    assert!(
+        !later.exists(),
+        "doctor started an extension after cancellation"
+    );
+    assert_eq!(
+        std::fs::read_dir(&temporary)
+            .expect("temporary directory")
+            .count(),
+        0,
+        "doctor left extension scratch state"
+    );
+}
+
+#[test]
+fn native_doctor_hup_reaps_extension() {
+    assert_doctor_signal(libc::SIGHUP, 129);
+}
+
+#[test]
+fn native_doctor_int_reaps_extension() {
+    assert_doctor_signal(libc::SIGINT, 130);
+}
+
+#[test]
+fn native_doctor_quit_reaps_extension() {
+    assert_doctor_signal(libc::SIGQUIT, 131);
+}
+
+#[test]
+fn native_doctor_term_reaps_extension() {
+    assert_doctor_signal(libc::SIGTERM, 143);
+}
+
+#[test]
+fn signal_interrupts_backpressured_doctor_rendering() {
+    let home = TempDir::new("doctor-backpressure-home").expect("home");
+    let state = TempDir::new("doctor-backpressure-state").expect("state");
+    let root = home.path().join("extensions");
+    let directory = root.join("doctor.d");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
+    std::fs::create_dir_all(&directory).expect("doctor directory");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=none\n",
+    )
+    .expect("config");
+    std::fs::write(
+        directory.join("10-output.sh"),
+        b"doctor() {\n  python3 - \"$DOT_DOCTOR_RESULT_FILE\" <<'PY'\nimport sys\nwith open(sys.argv[1], 'ab') as result:\n    result.write(b'warn\\tDOCTOR-BLOCKED\\t' + b'x' * (8 * 1024 * 1024) + b'\\n')\nPY\n}\n",
+    )
+    .expect("extension");
+    seal(&root, 0o700);
+    seal(&directory, 0o700);
+    seal(&directory.join("10-output.sh"), 0o644);
+
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("stdout pair");
+    let mut child = command(false, &home, &state, &[])
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("doctor");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut reader = std::io::BufReader::new(reader);
+        let mut observed = Vec::new();
+        loop {
+            let mut byte = [0];
+            assert_ne!(reader.read(&mut byte).unwrap(), 0, "missing doctor marker");
+            observed.push(byte[0]);
+            if observed.ends_with(b"DOCTOR-BLOCKED") {
+                break;
+            }
+        }
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        reader.read_to_end(&mut observed).unwrap();
+    });
+    if started_rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .is_err()
+    {
+        // Let the command's own handler clean any extension session before
+        // the bounded emergency fallback terminates the coordinator.
+        // SAFETY: the fixture owns this positive Dot child and SIGTERM is valid.
+        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        let _ = release_tx.send(());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while child.try_wait().ok().flatten().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        panic!("doctor rendering did not start");
+    }
+    // SAFETY: the fixture owns this positive Dot child and SIGINT is valid.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut observed = None;
+    while observed.is_none() && std::time::Instant::now() < deadline {
+        observed = child.try_wait().expect("doctor status");
+        if observed.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let blocked = observed.is_none();
+    release_tx.send(()).unwrap();
+    let status = observed.unwrap_or_else(|| child.wait().expect("doctor exit"));
+    reader.join().unwrap();
+    assert!(!blocked, "signal left doctor blocked on an unread stdout");
+    assert_eq!(status.code(), Some(130));
+}
+
 fn git(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")

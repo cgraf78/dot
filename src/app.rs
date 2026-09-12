@@ -43,6 +43,7 @@ pub struct Runtime {
     source_root: PathBuf,
     env: BTreeMap<OsString, OsString>,
     executable: Option<RuntimeExecutable>,
+    process_entry: bool,
     bash: Arc<OnceLock<Result<crate::bash::Resolved, crate::bash::Error>>>,
     bash_error_reported: Arc<AtomicBool>,
 }
@@ -125,7 +126,9 @@ impl Runtime {
             OsString::from("DOT_SOURCE_ROOT"),
             source_root.as_os_str().to_os_string(),
         );
-        Self::snapshot(env, cwd, source_root)
+        let mut runtime = Self::snapshot(env, cwd, source_root);
+        runtime.process_entry = true;
+        runtime
     }
 
     fn snapshot(env: BTreeMap<OsString, OsString>, cwd: &Path, source_root: PathBuf) -> Self {
@@ -140,6 +143,7 @@ impl Runtime {
             source_root,
             env,
             executable: None,
+            process_entry: false,
             bash: Arc::new(OnceLock::new()),
             bash_error_reported: Arc::new(AtomicBool::new(false)),
         }
@@ -209,6 +213,10 @@ impl Runtime {
 
     pub(crate) fn env(&self) -> &BTreeMap<OsString, OsString> {
         &self.env
+    }
+
+    pub(crate) fn is_process_entry(&self) -> bool {
+        self.process_entry
     }
 
     pub(crate) fn value(&self, key: &str) -> Option<&OsStr> {
@@ -391,9 +399,15 @@ mod tests {
     fn fake_bash(root: &Path, relative: &str, body: &str) -> PathBuf {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().expect("bash parent")).expect("bash parent");
+        let body = body
+            .strip_prefix("#!/bin/sh\n")
+            .expect("fake Bash uses the fixture shell");
+        let body = format!("#!/bin/sh\n[ \"${{1-}}\" != --dot-fixture-ready ] || exit 0\n{body}");
         std::fs::write(&path, body).expect("fake Bash");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("fake Bash mode");
+        dot_test_support::wait_until_executable(&path, &["--dot-fixture-ready"])
+            .expect("fake Bash executable");
         path
     }
 

@@ -52,62 +52,6 @@ fn fixture_command(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Keep provider-boundary tests independent of developer command wrappers.
-fn isolated_tool_path() -> std::ffi::OsString {
-    let mut directories = Vec::new();
-    for name in ["bash", "git"] {
-        let command = fixture_command(name).unwrap_or_else(|| panic!("fixture requires {name}"));
-        let directory = command
-            .parent()
-            .expect("fixture command parent")
-            .to_path_buf();
-        if !directories.contains(&directory) {
-            directories.push(directory);
-        }
-    }
-    // The closed PATH must still resolve the OS tools the engine shells
-    // out to (notably PATH-resolved `ps` for update-lock identity and
-    // `mv` for atomic moves): on macOS those live in /bin, which the
-    // bash/git homes do not cover. Developer wrappers stay excluded by
-    // construction; only genuine system directories are appended.
-    for directory in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
-        let directory = PathBuf::from(directory);
-        if directory.is_dir() && !directories.contains(&directory) {
-            directories.push(directory);
-        }
-    }
-    std::env::join_paths(directories).expect("isolated tool PATH")
-}
-
-#[test]
-fn isolated_tool_path_resolves_engine_os_tools() {
-    // The engine shells out to PATH-resolved `mv` (atomic moves) and,
-    // where the kernel offers no procfs fallback, `ps` (update-lock
-    // identity). If the closed PATH stops resolving them, the
-    // provider-boundary tests fail with a bare exit status instead of a
-    // clear message — pin the resolution directly. (On macOS both live
-    // in /bin, outside every bash/git home; minimal Linux images omit
-    // procps and the engine reads /proc instead.)
-    let path = isolated_tool_path();
-    let mut names = vec!["bash", "git", "mv"];
-    if !Path::new("/proc").is_dir() {
-        names.push("ps");
-    }
-    for name in names {
-        let found = std::env::split_paths(&path).any(|directory| {
-            let candidate = directory.join(name);
-            candidate.is_file()
-                && candidate
-                    .metadata()
-                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
-        });
-        assert!(
-            found,
-            "{name} must resolve under the isolated tool PATH ({path:?})"
-        );
-    }
-}
-
 struct Fixture {
     _scratch: TempDir,
     root: PathBuf,
@@ -350,13 +294,15 @@ cp "$DOT_TEST_PROVIDER_DIR/install.sh" "$out"
     /// Rebuild the inherited command path without `jq`. The provider intentionally
     /// falls back to its bootstrap JSON parser in this mode, so this must not
     /// depend on whether a host image happens to install jq.
-    fn without_jq_path(&self) -> std::ffi::OsString {
+    fn closed_tool_path(&self) -> std::ffi::OsString {
         let bin = self.home.join("without-jq-bin");
         std::fs::create_dir_all(&bin).expect("without-jq bin");
-        // Bash is the fixture's only execution prerequisite. Every other
-        // candidate is copied only when available: keeping PATH closed still
-        // proves jq is absent, while an optional platform helper such as ps
-        // remains absent so the native fallback owns the result.
+        // Build a fixture-owned allowlist instead of borrowing whole host
+        // directories. Homebrew macOS splits Bash/Git from system tools such
+        // as mv, id, and shasum, while Linux commonly co-locates them. Listing
+        // each dependency keeps this path portable and excludes developer
+        // wrappers and jq; unavailable optional helpers remain absent so the
+        // native fallback owns the result.
         let bash = fixture_command("bash").expect("no-jq fixture requires `bash` in the host PATH");
         write_exec(
             &bin.join("bash"),
@@ -648,7 +594,13 @@ const CHECKED: &[u8] =
 Done in Ns. Reload your shell: source ~/.bashrc\n";
 
 fn assert_cli(output: &Output, status: i32, stdout: &[u8], stderr: &[u8]) {
-    assert_eq!(output.status.code(), Some(status));
+    assert_eq!(
+        output.status.code(),
+        Some(status),
+        "stdout={:?}\nstderr={:?}",
+        output.stdout,
+        output.stderr
+    );
     assert_eq!(normalize_elapsed(&output.stdout), stdout);
     assert_eq!(output.stderr, stderr);
 }
@@ -766,6 +718,24 @@ fn invalid_explicit_bash_does_not_download_an_installer() {
 }
 
 #[test]
+fn closed_provider_path_contains_native_prerequisites_without_jq() {
+    let rust = Fixture::new("shdeps-provider-closed-path");
+    let path = PathBuf::from(rust.closed_tool_path());
+
+    for name in ["bash", "git", "id", "mv"] {
+        assert!(
+            path.join(name).is_file(),
+            "closed provider PATH omitted required {name}"
+        );
+    }
+    assert!(
+        path.join("sha256sum").is_file() || path.join("shasum").is_file(),
+        "closed provider PATH omitted a supported hash command"
+    );
+    assert!(!path.join("jq").exists(), "closed provider PATH leaked jq");
+}
+
+#[test]
 fn provider_processes_do_not_evaluate_bash_env() {
     let rust = Fixture::new("shdeps-provider-bash-env");
     let poison = rust.home.join("bash-env");
@@ -776,7 +746,7 @@ fn provider_processes_do_not_evaluate_bash_env() {
     let output = rust
         .command()
         .env("BASH_ENV", &poison)
-        .env("PATH", isolated_tool_path())
+        .env("PATH", rust.closed_tool_path())
         .output()
         .expect("run provider with BASH_ENV");
 
@@ -789,14 +759,14 @@ fn provider_processes_do_not_import_exported_functions() {
     let rust = Fixture::new("shdeps-provider-exported-function");
     let marker = rust.home.join("exported-function-ran");
     let function = format!(
-        "() {{ command touch '{}'; builtin printf \"$@\"; }}",
+        "() {{ builtin printf poison >>'{}'; builtin printf \"$@\"; }}",
         marker.display()
     );
 
     let output = rust
         .command()
         .env("BASH_FUNC_printf%%", function)
-        .env("PATH", isolated_tool_path())
+        .env("PATH", rust.closed_tool_path())
         .output()
         .expect("run provider with exported function");
 
@@ -1139,7 +1109,7 @@ fn escaped_unicode_provider_event_is_literal_with_and_without_jq() {
             let path = if jq {
                 fixture.jq_path()
             } else {
-                fixture.without_jq_path()
+                fixture.closed_tool_path()
             };
             fixture
                 .command()
@@ -1166,7 +1136,7 @@ fn escaped_quote_provider_detail_pins_fallback_parser_limit() {
     let run = |fixture: &Fixture| {
         fixture
             .command()
-            .env("PATH", fixture.without_jq_path())
+            .env("PATH", fixture.closed_tool_path())
             .env("DOT_TEST_PROVIDER_ESCAPED_QUOTE_DETAIL", "1")
             .output()
             .expect("escaped quote provider event")

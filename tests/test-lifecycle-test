@@ -52,12 +52,17 @@ import time
 from pathlib import Path
 
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+signal.signal(signal.SIGQUIT, signal.SIG_IGN)
 Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
 time.sleep(30)
 PY
 cat >"$timeout_fixture/parent.sh" <<'SUITE'
 #!/usr/bin/env bash
-trap 'exit 0' TERM
+trap 'exit 0' HUP INT QUIT TERM
+[[ -z ${DOT_TEST_TIMEOUT_PARENT_PID:-} ]] ||
+  printf '%s\n' "$$" >"$DOT_TEST_TIMEOUT_PARENT_PID"
 python3 "$DOT_TEST_TIMEOUT_CHILD" "$DOT_TEST_TIMEOUT_DESCENDANT_PID" &
 wait
 SUITE
@@ -115,29 +120,91 @@ assert_eq 126 "$non_executable_status" \
 assert_eq '' "$(<"$timeout_fixture/exec-error")" \
   'non-executable command does not emit a traceback'
 
-rm -f "$timeout_descendant_pid"
-DOT_TEST_TIMEOUT_CHILD=$timeout_fixture/child.py \
-  DOT_TEST_TIMEOUT_DESCENDANT_PID=$timeout_descendant_pid \
-  "$timeout_command" 30 "$timeout_fixture/parent.sh" &
-timeout_call_pid=$!
-deadline=$((SECONDS + 5))
-while [[ ! -s $timeout_descendant_pid && $SECONDS -lt $deadline ]]; do
-  sleep 0.05
-done
-[[ -s $timeout_descendant_pid ]] ||
-  fail 'timeout cancellation fixture did not start'
-kill -TERM "$timeout_call_pid"
-timeout_cancel_status=0
-wait "$timeout_call_pid" || timeout_cancel_status=$?
-assert_eq 143 "$timeout_cancel_status" \
-  'timeout cancellation preserves signal status'
-timeout_descendant=$(<"$timeout_descendant_pid")
-deadline=$((SECONDS + 5))
-while process_is_live "$timeout_descendant" && ((SECONDS < deadline)); do
-  sleep 0.05
-done
-process_is_live "$timeout_descendant" &&
-  fail 'timeout cancellation left a descendant running'
+assert_timeout_cancellation() {
+  local signal_name=$1 expected=$2
+  local parent_pid_file=$timeout_fixture/parent.pid
+  local timeout_call_pid timeout_parent timeout_descendant status=0 deadline
+  local watchdog_pid watchdog_marker
+  local parent_survived=0 descendant_survived=0
+  rm -f "$parent_pid_file" "$timeout_descendant_pid"
+  DOT_TEST_TIMEOUT_CHILD=$timeout_fixture/child.py \
+    DOT_TEST_TIMEOUT_PARENT_PID=$parent_pid_file \
+    DOT_TEST_TIMEOUT_DESCENDANT_PID=$timeout_descendant_pid \
+    "$timeout_command" 30 "$timeout_fixture/parent.sh" &
+  timeout_call_pid=$!
+  deadline=$((SECONDS + 5))
+  while {
+    [[ ! -s $parent_pid_file || ! -s $timeout_descendant_pid ]] &&
+      ((SECONDS < deadline))
+  }; do
+    sleep 0.05
+  done
+  if [[ ! -s $parent_pid_file || ! -s $timeout_descendant_pid ]]; then
+    kill -TERM "$timeout_call_pid" 2>/dev/null || true
+    deadline=$((SECONDS + 2))
+    while process_is_live "$timeout_call_pid" && ((SECONDS < deadline)); do
+      sleep 0.05
+    done
+    kill -KILL "$timeout_call_pid" 2>/dev/null || true
+    wait "$timeout_call_pid" 2>/dev/null || true
+    if [[ -s $parent_pid_file ]]; then
+      timeout_parent=$(<"$parent_pid_file")
+      [[ $timeout_parent =~ ^[1-9][0-9]*$ ]] &&
+        kill -KILL -- "-$timeout_parent" 2>/dev/null || true
+    fi
+    if [[ -s $timeout_descendant_pid ]]; then
+      timeout_descendant=$(<"$timeout_descendant_pid")
+      [[ $timeout_descendant =~ ^[1-9][0-9]*$ ]] &&
+        kill -KILL "$timeout_descendant" 2>/dev/null || true
+    fi
+    fail "timeout $signal_name cancellation fixture did not start"
+  fi
+  timeout_parent=$(<"$parent_pid_file")
+  timeout_descendant=$(<"$timeout_descendant_pid")
+  kill -"$signal_name" "$timeout_call_pid"
+  watchdog_marker=$timeout_fixture/watchdog-$signal_name
+  rm -f "$watchdog_marker"
+  (
+    sleep 5
+    if kill -0 "$timeout_call_pid" 2>/dev/null; then
+      : >"$watchdog_marker"
+      kill -KILL "$timeout_call_pid" 2>/dev/null || true
+    fi
+  ) &
+  watchdog_pid=$!
+  wait "$timeout_call_pid" || status=$?
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  if [[ -e $watchdog_marker ]]; then
+    kill -KILL -- "-$timeout_parent" 2>/dev/null || true
+    kill -KILL "$timeout_descendant" 2>/dev/null || true
+    fail "timeout $signal_name cancellation did not finish before deadline"
+  fi
+  deadline=$((SECONDS + 5))
+  while {
+    process_is_live "$timeout_parent" ||
+      process_is_live "$timeout_descendant"
+  } && ((SECONDS < deadline)); do
+    sleep 0.05
+  done
+  process_is_live "$timeout_parent" && parent_survived=1
+  process_is_live "$timeout_descendant" && descendant_survived=1
+  if ((parent_survived || descendant_survived)); then
+    kill -KILL -- "-$timeout_parent" 2>/dev/null || true
+    kill -KILL "$timeout_descendant" 2>/dev/null || true
+  fi
+  assert_eq "$expected" "$status" \
+    "timeout cancellation preserves $signal_name status"
+  ((parent_survived == 0)) ||
+    fail "timeout $signal_name cancellation left its child running"
+  ((descendant_survived == 0)) ||
+    fail "timeout $signal_name cancellation left a descendant running"
+}
+
+assert_timeout_cancellation HUP 129
+assert_timeout_cancellation INT 130
+assert_timeout_cancellation QUIT 131
+assert_timeout_cancellation TERM 143
 
 python3 - "$timeout_command" <<'PY'
 import importlib.util
@@ -251,11 +318,242 @@ module.stop_process_group(signal.SIGTERM)
 assert process.waited
 assert signals == [signal.SIGTERM, signal.SIGKILL]
 
+
+class LeaderExitsBeforeFallbackProcess:
+    pid = 123
+    exited = False
+    waited = False
+
+    def poll(self):
+        return 0 if self.exited else None
+
+    def wait(self):
+        self.waited = True
+
+
+process = LeaderExitsBeforeFallbackProcess()
+module.process = process
+snapshots = iter(([123, 124], None))
+module.list_session_pids = lambda _session_id: next(snapshots)
+retained_delivery = []
+
+
+def retained_session(pid):
+    if pid == 123 and process.exited:
+        raise ProcessLookupError
+    return 123 if pid in (123, 124) else pid
+
+
+def retain_kill(pid, signum):
+    retained_delivery.append((pid, signum))
+
+
+def leader_exits_after_term(_seconds):
+    process.exited = True
+
+
+module.os.getsid = retained_session
+module.os.kill = retain_kill
+module.time.sleep = leader_exits_after_term
+module.stop_process_group(signal.SIGTERM)
+assert process.waited
+assert retained_delivery == [
+    (123, signal.SIGTERM),
+    (124, signal.SIGTERM),
+    (124, signal.SIGKILL),
+]
+
+
+process = Process()
+module.process = process
+snapshots = iter(([123], None))
+module.list_session_pids = lambda _session_id: next(snapshots)
+module.os.getsid = lambda _pid: 123
+module.time.sleep = lambda _seconds: None
+late_group_delivery = []
+module.os.kill = lambda pid, signum: late_group_delivery.append(
+    ("pid", pid, signum)
+)
+module.os.killpg = lambda pid, signum: late_group_delivery.append(
+    ("group", pid, signum)
+)
+module.stop_process_group(signal.SIGTERM)
+assert process.waited
+assert late_group_delivery == [
+    ("pid", 123, signal.SIGTERM),
+    ("group", 123, signal.SIGKILL),
+    ("pid", 123, signal.SIGKILL),
+]
+
+
+process = Process()
+module.process = process
+snapshots = iter(([123], [123, 125]))
+module.list_session_pids = lambda _session_id: next(snapshots)
+module.os.getsid = lambda _pid: 123
+module.time.sleep = lambda _seconds: None
+complete_snapshot_delivery = []
+module.os.kill = lambda pid, signum: complete_snapshot_delivery.append(
+    ("pid", pid, signum)
+)
+module.os.killpg = lambda pid, signum: complete_snapshot_delivery.append(
+    ("group", pid, signum)
+)
+module.stop_process_group(signal.SIGTERM)
+assert process.waited
+assert complete_snapshot_delivery == [
+    ("pid", 123, signal.SIGTERM),
+    ("group", 123, signal.SIGKILL),
+    ("pid", 123, signal.SIGKILL),
+    ("pid", 125, signal.SIGKILL),
+]
+
 process.poll = lambda: 0
 signals.clear()
+module.os.killpg = killpg
 module.list_session_pids = lambda _session_id: None
 module.stop_process_group(signal.SIGTERM)
 assert signals == []
+
+
+class SignalDuringCleanupProcess:
+    pid = 123
+    waited = False
+
+    def poll(self):
+        return None
+
+    def wait(self):
+        self.waited = True
+
+
+process = SignalDuringCleanupProcess()
+module.process = process
+module.interrupted_signal = None
+for handled_signal in module.handled_signals:
+    signal.signal(handled_signal, module.capture_signal)
+module.list_session_pids = lambda _session_id: [123]
+module.os.getsid = lambda _pid: 123
+cleanup_delivery = []
+module.os.kill = lambda pid, signum: cleanup_delivery.append((pid, signum))
+
+
+def signal_while_stopping(_seconds):
+    handler = signal.getsignal(signal.SIGQUIT)
+    assert callable(handler), "cleanup replaced the cancellation handler"
+    handler(signal.SIGQUIT, None)
+
+
+module.time.sleep = signal_while_stopping
+module.stop_process_group(signal.SIGTERM)
+assert process.waited
+assert module.interrupted_signal == signal.SIGQUIT
+assert cleanup_delivery == [(123, signal.SIGTERM), (123, signal.SIGKILL)]
+
+cleanup_signals = []
+module.stop_process_group = lambda signum: cleanup_signals.append(signum)
+module.time.sleep = lambda _: None
+
+
+class SignalDuringSpawn:
+    pid = 123
+
+    def __init__(self, *_args, **_kwargs):
+        module.capture_signal(signal.SIGQUIT, None)
+
+    def wait(self, **_kwargs):
+        return 0
+
+
+module.process = None
+module.interrupted_signal = None
+module.subprocess.Popen = SignalDuringSpawn
+assert module.main(["test-timeout-v1", "5", "fixture"]) == 131
+assert cleanup_signals == [signal.SIGQUIT]
+
+cleanup_signals.clear()
+
+
+class SignalThenMissing:
+    def __init__(self, *_args, **_kwargs):
+        module.capture_signal(signal.SIGHUP, None)
+        raise FileNotFoundError
+
+
+module.process = None
+module.interrupted_signal = None
+module.subprocess.Popen = SignalThenMissing
+assert module.main(["test-timeout-v1", "5", "fixture"]) == 129
+
+
+class SignalThenExecError:
+    def __init__(self, *_args, **_kwargs):
+        module.capture_signal(signal.SIGQUIT, None)
+        raise OSError
+
+
+module.process = None
+module.interrupted_signal = None
+module.subprocess.Popen = SignalThenExecError
+assert module.main(["test-timeout-v1", "5", "fixture"]) == 131
+
+
+class SignalDuringWait:
+    pid = 123
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def wait(self, **_kwargs):
+        module.capture_signal(signal.SIGINT, None)
+        return 0
+
+
+module.process = None
+module.interrupted_signal = None
+module.subprocess.Popen = SignalDuringWait
+assert module.main(["test-timeout-v1", "5", "fixture"]) == 130
+assert cleanup_signals == [signal.SIGINT]
+
+cleanup_signals.clear()
+
+
+class SignalDuringNormalCleanup:
+    pid = 123
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def wait(self, **_kwargs):
+        return 0
+
+
+def interrupt_normal_cleanup(signum):
+    cleanup_signals.append(signum)
+    module.capture_signal(signal.SIGQUIT, None)
+
+
+module.process = None
+module.interrupted_signal = None
+module.stop_process_group = interrupt_normal_cleanup
+module.subprocess.Popen = SignalDuringNormalCleanup
+assert module.main(["test-timeout-v1", "5", "fixture"]) == 131
+assert cleanup_signals == [signal.SIGTERM]
+
+closed_signals = []
+
+
+def signal_at_finish_boundary(signum, disposition):
+    if not closed_signals:
+        module.capture_signal(signal.SIGHUP, None)
+    closed_signals.append((signum, disposition))
+
+
+module.interrupted_signal = None
+module.signal.signal = signal_at_finish_boundary
+assert module.finish(0) == 129
+assert [signum for signum, _ in closed_signals] == list(module.handled_signals)
+assert all(disposition == signal.SIG_IGN for _, disposition in closed_signals)
 PY
 
 suites=$DOT_TEST_TMP/suites
