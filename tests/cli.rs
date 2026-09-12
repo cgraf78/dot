@@ -5019,8 +5019,12 @@ exec "$DOT_TEST_REAL_GIT" "$@"
 
     assert!(marker.exists(), "base tracked overflow query did not start");
     assert_eq!(output.status.code(), Some(1));
+    // The bound guards against hangs, not performance: a full `update`
+    // run supervises dozens of queries, and every macOS stop takes
+    // ps-spawn host snapshots, so a saturated parallel runner inflates
+    // the total far beyond the overflow capture itself.
     assert!(
-        started.elapsed() < Duration::from_secs(20),
+        started.elapsed() < Duration::from_secs(60),
         "base tracked overflow was not bounded"
     );
     assert!(
