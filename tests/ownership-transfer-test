@@ -300,6 +300,10 @@ assert_no_pull_backup "$overlay_rollback_home" \
   'repaired overlay-to-base transfer avoids managed-link backups'
 
 printf '%s\n' '=== two-release overlay to base failure fallback ==='
+# TEMP-DIAG-180: remove after the macOS ownership diagnosis (hang trace).
+if [[ $(uname -s) == Darwin ]]; then
+  set -x
+fi
 fixture_repo base-fallback-source main \
   home/.config/base-fallback/value $'source\n' 100644
 base_fallback_source_origin=$REPLY
@@ -356,6 +360,10 @@ assert_eq 'base destination' \
   "$(<"$base_fallback_home/.config/base-fallback/value")" \
   'base handoff retry converges'
 
+# TEMP-DIAG-180: remove after the macOS ownership diagnosis (hang trace).
+if [[ $(uname -s) == Darwin ]]; then
+  set +x
+fi
 printf '%s\n' '=== two-release overlay to overlay failure fallback ==='
 fixture_repo overlay-fallback-target main \
   home/.config/overlay-fallback/target $'target-existing\n' 100644
