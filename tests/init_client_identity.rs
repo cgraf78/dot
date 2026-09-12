@@ -336,10 +336,22 @@ fn bound_host_git_drives_children_without_path_lookup() {
     chmod(&shadow_dir.join("git"), 0o755);
 
     let output = init::with_host_git(&selected, || {
-        init::host_git_command()
-            .env("PATH", &shadow_dir)
-            .output()
-            .expect("run bound host git")
+        // Under parallel load the kernel can report the just-written
+        // fixture busy (ETXTBSY) on first exec; retry that transient
+        // only, with a bounded deadline (same pattern as
+        // `dot_test_support::copy_dot_binary`).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match init::host_git_command().env("PATH", &shadow_dir).output() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => break result.expect("run bound host git"),
+            }
+        }
     });
 
     assert!(output.status.success());

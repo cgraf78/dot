@@ -2,6 +2,8 @@
 //! re-exec protection, command bytes, permissions, and provenance.
 
 use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -382,6 +384,65 @@ fn umask_ceiling_matches_shell_g_w_o_w() {
             expected,
             "mask {start:03o}"
         );
+    }
+}
+
+#[test]
+fn binary_applies_umask_ceiling_and_preserves_stricter_masks() {
+    let fixture = TempDir::new_exec("startup-umask").expect("executable fixture");
+    let suites = fixture.path().join("suites");
+    std::fs::create_dir_all(&suites).expect("suites");
+    let suite = suites.join("mode-test");
+    std::fs::write(
+        &suite,
+        format!(
+            "#!{}\numask >\"$HOME/observed-umask\"\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"\n",
+            dot_test_support::bash().display()
+        ),
+    )
+    .expect("suite");
+    std::fs::set_permissions(&suite, std::fs::Permissions::from_mode(0o755))
+        .expect("suite permissions");
+
+    for (inherited, expected) in [(0o000, 0o022), (0o077, 0o077)] {
+        let home = fixture.path().join(format!("home-{inherited:03o}"));
+        let observed = home.join("observed-umask");
+        std::fs::create_dir_all(&home).expect("home");
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dot"));
+        command
+            .args(["test", "--sequential"])
+            .env_clear()
+            .env("LC_ALL", "C")
+            .env("PATH", parent_path())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env("DOT_TEST_TESTS_DIR", &suites)
+            .env("DOT_TEST_NO_COLOR", "1")
+            .current_dir(&home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: this runs after fork and before exec, and only invokes the
+        // async-signal-safe `umask(2)` syscall.
+        unsafe {
+            command.pre_exec(move || {
+                libc::umask(inherited);
+                Ok(())
+            });
+        }
+        let output = command.output().expect("run dot test");
+
+        assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+        let actual = u32::from_str_radix(
+            std::fs::read_to_string(&observed)
+                .expect("observed umask")
+                .trim(),
+            8,
+        )
+        .expect("octal umask");
+        assert_eq!(actual, expected, "inherited mask {inherited:03o}");
     }
 }
 
