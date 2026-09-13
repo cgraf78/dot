@@ -2649,12 +2649,20 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             # when available. Without exact authority, never re-enter every
             # unchanged catchable-signal handler; the anchored KILL phase will
             # still stop that late member.
+            # A registered nested supervisor vetoes completion even when
+            # the snapshot looks empty: on platforms without pidfds the
+            # snapshot can miss a live owner, and completing early would
+            # skip its shutdown (and the KILL-phase wait) while it still
+            # holds relays and the lease. Dead supervisors unregister
+            # within a few stop-drain observations, so the veto always
+            # lifts; the phase deadline still bounds a wedged owner.
             if (
                 processes is not None
                 and any(item.pid == process.pid for item in processes)
                 and all(not item.live for item in processes)
                 and all(not member.process.live for member in known_members.values())
                 and not unsafe_direct_member
+                and not nested_supervisors
             ):
                 consecutive_empty += 1
                 if consecutive_empty >= 2:
