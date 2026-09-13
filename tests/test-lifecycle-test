@@ -480,16 +480,18 @@ publisher = threading.Thread(target=publish_all)
 publisher.start()
 deadline = time.monotonic() + 3
 drains = 0
+# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+loop_started = time.monotonic()
 while publisher.is_alive() and time.monotonic() < deadline:
     assert module.drain_nested_supervisors(deadline)
     drains += 1
     # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-    if drains % 100 == 0:
+    if drains % 10 == 0:
         print(f"TEMP-DIAG-180 DRAIN-PROGRESS drains={drains} registered={len(module.nested_supervisors)} done={len(registrations)}", flush=True)
     publisher.join(0.01)
 publisher.join(0)
 # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-print(f"TEMP-DIAG-180 PUB-FINAL alive={publisher.is_alive()} done={len(registrations)}/{len(tokens)} drains={drains} registered={len(module.nested_supervisors)}", flush=True)
+print(f"TEMP-DIAG-180 PUB-FINAL alive={publisher.is_alive()} done={len(registrations)}/{len(tokens)} drains={drains} registered={len(module.nested_supervisors)} elapsed={time.monotonic() - loop_started:.2f}s", flush=True)
 assert not publisher.is_alive(), "nested registration publisher did not finish"
 assert not failure, failure
 assert len(module.nested_supervisors) == len(tokens)

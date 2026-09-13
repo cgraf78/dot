@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC1073,SC1065,SC1064,SC1072,SC1009  # sh/python polyglot: the python body is not shell
 """:"
 # Capture the caller's actual descriptor state before a language runtime can
 # reserve a closed standard descriptor, then restart without site hooks.
@@ -771,8 +772,14 @@ def publish_nested_supervisor(
             raise OSError(errno.EAGAIN, "supervisor registration would block") from error
         if written != len(frame):
             raise OSError(errno.EIO, "short supervisor registration")
-        parent.close()
-        parent = None
+        # Hold our copy of the registered end until the ACK below, not just
+        # until the send. The datagram (with its in-flight descriptor) can
+        # sit unread while the supervisor drains, and closing our copy during
+        # that window corrupts the pending macOS install: links observe
+        # phantom EOF plus HUP despite open peers, and stale-registration
+        # strikes unregister live supervisors. The native publisher holds
+        # its copy the same way; the finally below still closes every copy
+        # on the error paths.
         local.setblocking(False)
         # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
         _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH sent pid={os.getpid()} token={token}")
@@ -793,6 +800,8 @@ def publish_nested_supervisor(
                 if reply == b"\1":
                     # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
                     _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH acked pid={os.getpid()}")
+                    parent.close()
+                    parent = None
                     return local
                 # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
                 _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH rejected pid={os.getpid()} reply={reply!r}")
