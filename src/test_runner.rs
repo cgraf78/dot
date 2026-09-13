@@ -494,7 +494,9 @@ fn execute(
                                     "TEMP-DIAG-180 WORKER-STOP-ERR suite={} err={error:?}",
                                     label(&suites[worker.index])
                                 );
-                                let _ = child.stop(libc::SIGKILL);
+                                // The failed stop consumed the child
+                                // handle; OwnedSession::stop is
+                                // single-shot and a second call panics.
                                 worker.status = Some(125);
                             }
                         }
