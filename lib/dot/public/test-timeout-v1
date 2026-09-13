@@ -104,11 +104,17 @@ stdio_relay_states: dict[int, bytes] = {}
 stdio_relay_parent_fds: dict[int, int] = {}
 stdio_relay_status: int | None = None
 nested_supervisors: dict[str, tuple[int, socket.socket]] = {}
-# Consecutive peek-EOF observations per registration. A single EOF can
-# race the supervisor's own first supervision tick on heavily loaded
-# hosts, so unregistration requires repeated confirmation; a truly
-# exited supervisor EOFs forever and still unregisters promptly.
-nested_eof_strikes: dict[str, int] = {}
+# Consecutive unhealthy observations per registration: an anomalous
+# link peek (EOF or error) while the confirming snapshot does not show
+# the supervisor live. A healthy peek or a live snapshot resets the
+# count, so neither a peek glitch nor a missed snapshot alone can
+# orphan a live nested session; a truly exited supervisor is
+# persistently EOF and persistently absent, and still unregisters
+# after three observations.
+nested_unhealthy_strikes: dict[str, int] = {}
+# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis. Tokens
+# with an already-reported open anomaly bout (bounds LINK-PEEK spam).
+nested_peek_logged: set[str] = set()
 nested_control_complete = True
 ancestor_registration: socket.socket | None = None
 PROCESS_SNAPSHOT_TIMEOUT_SECONDS = 1
@@ -301,7 +307,8 @@ def finish(status: int, cleanup_complete: bool = True) -> int:
     for _pid, link in nested_supervisors.values():
         link.close()
     nested_supervisors.clear()
-    nested_eof_strikes.clear()
+    nested_unhealthy_strikes.clear()
+    nested_peek_logged.clear()
     terminal_cleanup_incomplete = not cleanup_complete
     if terminal_handoff_required:
         # The single-threaded process-entry path keeps handled signals blocked
@@ -802,7 +809,8 @@ def invalidate_nested_control() -> None:
     for _pid, link in nested_supervisors.values():
         link.close()
     nested_supervisors.clear()
-    nested_eof_strikes.clear()
+    nested_unhealthy_strikes.clear()
+    nested_peek_logged.clear()
 
 
 def nested_supervisor_belongs_to_session(supervisor: int, leader: int) -> bool:
@@ -840,10 +848,12 @@ def drain_nested_supervisors(
         try:
             payload = link.recv(1, getattr(socket, "MSG_PEEK", 0))
         except BlockingIOError:
-            nested_eof_strikes[token] = 0
+            nested_unhealthy_strikes[token] = 0
+            nested_peek_logged.discard(token)
             continue
         except InterruptedError:
-            nested_eof_strikes[token] = 0
+            nested_unhealthy_strikes[token] = 0
+            nested_peek_logged.discard(token)
             continue
         except OSError as error:
             anomaly = f"os-error:{error.errno}"
@@ -853,12 +863,28 @@ def drain_nested_supervisors(
         if payload:
             invalidate_nested_control()
             return False
-        strikes = nested_eof_strikes.get(token, 0) + 1
-        nested_eof_strikes[token] = strikes
+        if supervisor in snapshot_live:
+            # A live snapshot overrules any peek anomaly: the owner
+            # is demonstrably alive, so keep it and reset.
+            nested_unhealthy_strikes[token] = 0
+        else:
+            strikes = nested_unhealthy_strikes.get(token, 0) + 1
+            nested_unhealthy_strikes[token] = strikes
+            if unregister and strikes >= 3:
+                # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+                _temp_diag(
+                    f"TEMP-DIAG-180 LINK-UNREG pid={os.getpid()} "
+                    f"supervisor={supervisor} anomaly={anomaly} "
+                    f"strikes={strikes}"
+                )
+                closed.append(token)
+                nested_peek_logged.discard(token)
+                continue
         # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-        # Log once per anomaly bout plus on unregister; a persistent
-        # anomaly would otherwise exhaust the diagnostic budget.
-        if strikes == 1:
+        # Log once per open anomaly bout; a persistent anomaly would
+        # otherwise exhaust the diagnostic budget.
+        if token not in nested_peek_logged:
+            nested_peek_logged.add(token)
             in_snapshot = (
                 "live"
                 if supervisor in snapshot_live
@@ -867,22 +893,12 @@ def drain_nested_supervisors(
             _temp_diag(
                 f"TEMP-DIAG-180 LINK-PEEK pid={os.getpid()} "
                 f"supervisor={supervisor} anomaly={anomaly} "
-                f"strikes={strikes} snapshot={in_snapshot} "
-                f"unregister={unregister}"
+                f"strikes={nested_unhealthy_strikes.get(token, 0)} "
+                f"snapshot={in_snapshot} unregister={unregister}"
             )
-        if supervisor in snapshot_live:
-            continue
-        if unregister and strikes >= 3:
-            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-            _temp_diag(
-                f"TEMP-DIAG-180 LINK-UNREG pid={os.getpid()} "
-                f"supervisor={supervisor} anomaly={anomaly} "
-                f"strikes={strikes}"
-            )
-            closed.append(token)
     for token in closed:
         _pid, link = nested_supervisors.pop(token)
-        nested_eof_strikes.pop(token, None)
+        nested_unhealthy_strikes.pop(token, None)
         link.close()
     for _ in range(128):
         if deadline is not None and time.monotonic() >= deadline:
@@ -2472,7 +2488,12 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             process.pid,
             max(0.001, deadline - time.monotonic()),
         )
-        if not drain_nested_supervisors(deadline, processes, True):
+        # Drain with no deadline: the snapshot above already consumed
+        # part of the phase budget, and an expired phase deadline must
+        # end the phase, never invalidate the control plane. The drain
+        # loop is bounded by its fixed iteration cap plus non-blocking
+        # I/O either way.
+        if not drain_nested_supervisors(None, processes, True):
             unsafe_direct_member = True
             # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
             if not unsafe_direct_member_reason:
@@ -2766,7 +2787,8 @@ def main(argv: Sequence[str], terminal: bool = False) -> int:
     for _pid, link in nested_supervisors.values():
         link.close()
     nested_supervisors.clear()
-    nested_eof_strikes.clear()
+    nested_unhealthy_strikes.clear()
+    nested_peek_logged.clear()
     nested_control_complete = True
     if ancestor_registration is not None:
         ancestor_registration.close()
