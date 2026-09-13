@@ -2745,24 +2745,52 @@ pub(crate) fn adopt_descendants() -> std::io::Result<()> {
 
 /// Observe a child's exit without releasing its PID/session identity. A
 /// retained zombie leader prevents reuse throughout descendant teardown.
+/// Transient `waitid` pressure on Darwin (proc-table contention under
+/// fork storms surfaces `EAGAIN`); bounded so a persistently broken
+/// query still fails instead of spinning the supervisor forever.
+const WAITID_EAGAIN_RETRIES: u32 = 100;
+
+/// Whether a `waitid` failure is transient pressure worth polling again.
+/// A missed tick only delays exit detection by a millisecond; every
+/// caller treats `Ok(false)` as "not observed exited yet" and repolls.
+fn waitid_retryable(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EAGAIN)
+}
+
 pub(crate) fn exited(child: &Child) -> std::io::Result<bool> {
     // SAFETY: siginfo is initialized; waitid writes only this local value.
-    unsafe {
-        let mut info: libc::siginfo_t = std::mem::zeroed();
-        if libc::waitid(
-            libc::P_PID,
-            child.id(),
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        ) != 0
-        {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(false);
+    let mut eagain_retries = 0;
+    loop {
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            if libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) != 0
+            {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    return Ok(false);
+                }
+                if waitid_retryable(&error) && eagain_retries < WAITID_EAGAIN_RETRIES {
+                    eagain_retries += 1;
+                    // TEMP-DIAG-180: remove the gated logging after the macOS
+                    // ownership diagnosis; keep the retry itself.
+                    if std::env::var_os("DOT_TEST_DIAG_CLONE").is_some() {
+                        eprintln!(
+                            "TEMP-DIAG-180 WAITID-RETRY attempt={eagain_retries} pid={}",
+                            child.id()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                return Err(error);
             }
-            return Err(error);
+            return Ok(info.si_pid() != 0);
         }
-        Ok(info.si_pid() != 0)
     }
 }
 
@@ -7053,6 +7081,22 @@ mod tests {
         )));
         assert!(!spawn_retryable(&std::io::Error::from(
             std::io::ErrorKind::PermissionDenied
+        )));
+    }
+
+    #[test]
+    fn waitid_retryable_covers_only_transient_pressure() {
+        assert!(waitid_retryable(&std::io::Error::from_raw_os_error(
+            libc::EAGAIN
+        )));
+        assert!(!waitid_retryable(&std::io::Error::from_raw_os_error(
+            libc::ECHILD
+        )));
+        assert!(!waitid_retryable(&std::io::Error::from_raw_os_error(
+            libc::EINVAL
+        )));
+        assert!(!waitid_retryable(&std::io::Error::from(
+            std::io::ErrorKind::Interrupted
         )));
     }
 
