@@ -108,6 +108,13 @@ nested_control_complete = True
 ancestor_registration: socket.socket | None = None
 PROCESS_SNAPSHOT_TIMEOUT_SECONDS = 1
 PROCESS_POLL_SECONDS = 0.05
+# Extra KILL-phase budget while a live delegated nested supervisor shuts
+# itself down. Without pidfds the owner cannot adopt or signal the
+# supervisor's subtree after murdering it (orphans keep the session
+# lease open and fail cleanup), so the KILL phase waits instead of
+# group-signaling. Two seconds covers the supervisor's own kill round
+# plus its relay/lease legs even with per-observe `ps` snapshots.
+DELEGATED_OWNER_GRACE_SECONDS = 2.0
 SESSION_BOUNDARY_ENV = "DOT_OWNED_SESSION_BOUNDARY_V1"
 SESSION_LEASE_FDS_ENV = "DOT_OWNED_SESSION_LEASE_FDS_V1"
 SESSION_CONTROL_FDS_ENV = "DOT_OWNED_SESSION_CONTROL_FDS_V1"
@@ -2487,9 +2494,49 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             )
             for process_info in processes
         )
-        if complete_exact_cohort and send_leader_signal(signum):
+        # Without pidfds there is no way to adopt or exactly signal a
+        # murdered nested supervisor's subtree (no subreaper, no
+        # start-identity snapshots): its target and relays orphan with
+        # the session lease held open and fail cleanup. The TERM phase
+        # still triggers the supervisor, but the KILL phase waits for a
+        # live registered owner to finish its own shutdown instead of
+        # group-signaling it. Platforms with exact authority keep the
+        # previous behavior: the murdered subtree is adopted and
+        # exactly stopped.
+        exact_signals_unavailable = (
+            getattr(signal, "pidfd_send_signal", None) is None
+        )
+        supervisor_pids = {pid for pid, _link in nested_supervisors.values()}
+        wait_for_owner = (
+            signum == signal.SIGKILL
+            and exact_signals_unavailable
+            and processes is not None
+            and any(
+                process_info.live and process_info.pid in supervisor_pids
+                for process_info in processes
+            )
+        )
+        if wait_for_owner:
+            deadline += DELEGATED_OWNER_GRACE_SECONDS
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(
+            f"TEMP-DIAG-180 STOP-DECIDE pid={os.getpid()} signum={signum} "
+            f"wait={wait_for_owner} none={processes is None} "
+            f"cohort={complete_exact_cohort}"
+        )
+        # `wait_for_owner` is KILL-only, so TERM delivery (which the
+        # nested supervisor needs as its shutdown trigger) is unchanged.
+        # For KILL, neither the exact leader signal nor the group signal
+        # may murder a live registered owner: it owns a subtree (own
+        # sessions) this owner cannot adopt or signal without pidfds,
+        # so the phase waits out its shutdown instead.
+        if (
+            not wait_for_owner
+            and complete_exact_cohort
+            and send_leader_signal(signum)
+        ):
             pass
-        elif send_process_group_signal(signum):
+        elif not wait_for_owner and send_process_group_signal(signum):
             note_group_delivery(processes)
         signal_known(signum, only_new)
         consecutive_empty = 0
