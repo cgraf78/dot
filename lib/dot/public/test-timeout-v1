@@ -2466,17 +2466,30 @@ def stop_process_group(first_signal: int) -> CleanupResult:
     # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
     unsafe_direct_member_reason = ""
 
-    def send_process_group_signal(signum: int) -> bool:
+    def send_process_group_signal(
+        signum: int, processes: list[SessionProcess] | None
+    ) -> bool:
         """Signal the group whose retained leader reserves its numeric ID."""
+        via_zombie = False
         try:
             if os.getsid(process.pid) != process.pid:
                 return False
         except (PermissionError, ProcessLookupError):
-            return False
+            # macOS rejects getsid on zombies, but an unreaped zombie
+            # leader still reserves its group ID: only this wrapper
+            # reaps it (after the stop legs), so the numeric ID cannot
+            # have been recycled. Fall back to the fresh snapshot,
+            # where a dead observed leader is exactly that zombie.
+            if processes is None or not any(
+                item.pid == process.pid and not item.live for item in processes
+            ):
+                return False
+            via_zombie = True
         # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
         _temp_diag(
             f"TEMP-DIAG-180 SIGNAL-GROUP pid={os.getpid()} "
             f"group={process.pid} signum={signum}"
+            f"{' zombie' if via_zombie else ''}"
         )
         try:
             os.killpg(process.pid, signum)
@@ -2666,7 +2679,7 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             and send_leader_signal(signum)
         ):
             pass
-        elif not wait_for_owner and send_process_group_signal(signum):
+        elif not wait_for_owner and send_process_group_signal(signum, processes):
             note_group_delivery(processes)
         signal_known(signum, only_new)
         consecutive_empty = 0
