@@ -2553,8 +2553,21 @@ done
 "$DOT_TEST_REPORTER" complete 1 0
 SUITE
 chmod 0755 "$descendants/descendant-test"
+set +e
 DOT_TEST_DESCENDANT_PID_FILE=$descendant_pid_file \
   run_tests "$descendants" -s descendant >/dev/null
+descendant_status=$?
+set -e
+if [[ $(uname -s) == Darwin ]]; then
+  # Without pidfds there is no safe delivery to a cross-group
+  # descendant, so the worker fails closed with 125; the liveness
+  # wait below still verifies no leak either way.
+  [[ $descendant_status == 0 || $descendant_status == 125 ]] ||
+    fail "descendant suite returned unexpected status $descendant_status"
+else
+  assert_eq 0 "$descendant_status" \
+    'descendant suite cleans its cross-group member'
+fi
 descendant_pid=$(<"$descendant_pid_file")
 deadline=$((SECONDS + 5))
 while process_is_live "$descendant_pid" && ((SECONDS < deadline)); do
