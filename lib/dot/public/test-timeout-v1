@@ -2243,13 +2243,21 @@ def owned_processes(
                 is_ambiguous=parent_pid in ambiguous,
             )
 
-    # A same-session identity whose parent vanished during an otherwise
-    # complete snapshot remains visible. Attribute only that narrow cohort and
-    # inspect its marker lazily rather than scanning every host process.
+    # A same-session or same-group identity whose parent vanished during
+    # an otherwise complete snapshot remains visible. Attribute only that
+    # narrow cohort and inspect its marker lazily rather than scanning
+    # every host process. Group membership is immutable across reparenting
+    # and cannot be joined from another session, so a same-group orphan is
+    # unambiguously this session's member even where the session fallback
+    # cannot see it; without this, a reparented TERM-ignoring descendant
+    # vanishes from TERM-phase snapshots, the phase completes without
+    # escalating to KILL, and cleanup fails closed on the open lease.
     for item in processes:
         if deadline is not None and time.monotonic() >= deadline:
             return None
-        if item.pid in owned or item.pid in stdio_relay_pids or item.session != session_id:
+        if item.pid in owned or item.pid in stdio_relay_pids:
+            continue
+        if item.session != session_id and item.group != session_id:
             continue
         marker = (
             process_boundary(item.pid, boundary_token)
