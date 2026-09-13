@@ -1510,6 +1510,9 @@ DOT_TEST_TIMEOUT_EXPIRED_FILE=$timeout_expired \
   "$timeout_command" 5 bash -c \
   '[[ -z ${DOT_TEST_TIMEOUT_EXPIRED_FILE+x} ]]'
 
+# TEMP-DIAG-180: the nested diagnostics below would pollute these
+# exact-stderr assertions; restore the gate afterwards.
+unset DOT_TEST_DIAG_NESTED
 set +e
 "$timeout_python" "$timeout_command" 1 "$timeout_fixture/missing" \
   2>"$timeout_fixture/exec-error"
@@ -1530,6 +1533,10 @@ assert_eq 126 "$non_executable_status" \
   'timeout command preserves non-executable status'
 assert_eq '' "$(<"$timeout_fixture/exec-error")" \
   'non-executable command does not emit a traceback'
+# TEMP-DIAG-180: restore the nested-diagnostics gate.
+if [[ $(uname -s) == Darwin ]]; then
+  export DOT_TEST_DIAG_NESTED=1
+fi
 
 assert_timeout_cancellation() {
   local signal_name=$1 expected=$2
