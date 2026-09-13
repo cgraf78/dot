@@ -438,10 +438,12 @@ fn normalize_timing(bytes: &[u8]) -> Vec<u8> {
 
 /// Snapshot the converged HOME tree (regular files only, sorted) for
 /// stable comparisons across independent native clients. `.git` carries
-/// checkout identity, `.dotfiles` carries the base checkout, and
-/// `.dot-backup` carries timestamped init-time safekeeping: none of
-/// them is converged content, so all three stay out of the
-/// comparison, exactly like the `tests/perf_update.rs` technique.
+/// checkout identity, `.dotfiles` carries the base checkout,
+/// `.dot-backup` carries timestamped init-time safekeeping, and
+/// `.scm.sqlite` is SCM's async telemetry database (a lingering SCM
+/// helper may create it after Dot returns): none of them is converged
+/// content, so all four stay out of the comparison, exactly like the
+/// `tests/perf_update.rs` technique.
 fn snapshot_tree(home: &Path) -> Vec<(String, Vec<u8>)> {
     let mut entries = Vec::new();
     let mut stack = vec![home.to_path_buf()];
@@ -451,12 +453,13 @@ fn snapshot_tree(home: &Path) -> Vec<(String, Vec<u8>)> {
             let entry = entry.expect("dir entry");
             let path = entry.path();
             let kind = entry.file_type().expect("file type");
-            // Checkout identity and timestamped safekeeping are never
-            // converged content, whatever filesystem kind they take
-            // (a worktree `.git` may be a file, not a directory).
-            let skip = path
-                .file_name()
-                .is_some_and(|n| n == ".git" || n == ".dotfiles" || n == ".dot-backup");
+            // Checkout identity, timestamped safekeeping, and SCM's async
+            // telemetry database are never converged content, whatever
+            // filesystem kind they take (a worktree `.git` may be a file,
+            // not a directory).
+            let skip = path.file_name().is_some_and(|n| {
+                n == ".git" || n == ".dotfiles" || n == ".dot-backup" || n == ".scm.sqlite"
+            });
             if kind.is_dir() {
                 if !skip {
                     stack.push(path);

@@ -81,6 +81,10 @@ fn client_env(
     cmd.env("XDG_STATE_HOME", state);
     cmd.env("XDG_CONFIG_HOME", "");
     cmd.env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"));
+    // Bypass any machine-local Git launcher while retaining the caller's
+    // public PATH. The fixture must exercise Git itself, not mutate host-only
+    // launcher caches inside its synthetic HOME.
+    cmd.env("DOT_GIT_REAL", "1");
     cmd.env("GIT_AUTHOR_NAME", "fixture");
     cmd.env("GIT_AUTHOR_EMAIL", "fixture@example.invalid");
     cmd.env("GIT_COMMITTER_NAME", "fixture");
@@ -106,6 +110,11 @@ fn command_pins_the_reload_shell() {
         .find(|(key, _)| *key == "SHELL")
         .and_then(|(_, value)| value);
     assert_eq!(value, Some(OsStr::new("/bin/bash")));
+    let git_real = command
+        .get_envs()
+        .find(|(key, _)| *key == "DOT_GIT_REAL")
+        .and_then(|(_, value)| value);
+    assert_eq!(git_real, Some(OsStr::new("1")));
 }
 
 /// The native Rust CLI with the same controlled client.
@@ -133,6 +142,7 @@ fn git(dir: &Path, args: &[&str]) {
         .arg(dir)
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("DOT_GIT_REAL", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -164,6 +174,7 @@ fn seed_overlay(scratch: &Scratch, index: usize, files: usize) -> PathBuf {
         .arg("--bare")
         .arg(&seed)
         .arg(&origin)
+        .env("DOT_GIT_REAL", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
@@ -213,6 +224,7 @@ fn shared_remotes(scratch: &Scratch) -> (Vec<PathBuf>, PathBuf) {
         .arg("--bare")
         .arg(&base_seed)
         .arg(&base_origin)
+        .env("DOT_GIT_REAL", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
@@ -267,10 +279,12 @@ fn twin_client(
 
 /// Snapshot the converged HOME tree (regular files only, sorted) for
 /// stability comparisons between native runs. `.git` carries
-/// checkout identity, `.dotfiles` carries the base checkout, and
-/// `.dot-backup` carries timestamped init-time safekeeping: none of
-/// them is converged content, so all three stay out of the
-/// comparison, exactly like the `tests/perf_update.rs` technique.
+/// checkout identity, `.dotfiles` carries the base checkout,
+/// `.dot-backup` carries timestamped init-time safekeeping, and
+/// `.scm.sqlite` is SCM's async telemetry database (a lingering SCM
+/// helper may create it after Dot returns): none of them is converged
+/// content, so all four stay out of the comparison, exactly like the
+/// `tests/perf_update.rs` technique.
 fn snapshot_tree(home: &Path) -> Vec<(String, Vec<u8>)> {
     let mut entries = Vec::new();
     let mut stack = vec![home.to_path_buf()];
@@ -280,12 +294,13 @@ fn snapshot_tree(home: &Path) -> Vec<(String, Vec<u8>)> {
             let entry = entry.expect("dir entry");
             let path = entry.path();
             let kind = entry.file_type().expect("file type");
-            // Checkout identity and timestamped safekeeping are never
-            // converged content, whatever filesystem kind they take
-            // (a worktree `.git` may be a file, not a directory).
-            let skip = path
-                .file_name()
-                .is_some_and(|n| n == ".git" || n == ".dotfiles" || n == ".dot-backup");
+            // Checkout identity, timestamped safekeeping, and SCM's async
+            // telemetry database are never converged content, whatever
+            // filesystem kind they take (a worktree `.git` may be a file,
+            // not a directory).
+            let skip = path.file_name().is_some_and(|n| {
+                n == ".git" || n == ".dotfiles" || n == ".dot-backup" || n == ".scm.sqlite"
+            });
             if kind.is_dir() {
                 if !skip {
                     stack.push(path);

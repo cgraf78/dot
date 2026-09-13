@@ -142,16 +142,24 @@ fn home_join(home: &str, relative: &str) -> PathBuf {
 /// silenced (the `candidate_matches` precedent; the tree scan's
 /// unredirected fd 2 is an unobservable sink in tests).
 fn run_repo_git(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = crate::init_client_identity::host_git_command()
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("-C")
         .arg(repo)
         .args(args)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -163,22 +171,23 @@ fn run_repo_git(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
 /// link targets (which live only in memory here) hash with the exact
 /// flags the shell's combined call uses. `None` when git fails.
 fn hash_stdin_bytes(payload: &[u8]) -> Option<String> {
-    use std::io::Write as _;
-    let mut child = crate::init_client_identity::host_git_command()
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .args(["hash-object", "--no-filters", "--stdin"])
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    child
-        .stdin
-        .as_mut()?
-        .write_all(payload)
-        .map_err(|_| ())
-        .ok()?;
-    let output = child.wait_with_output().ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output_with_input(
+        command,
+        payload,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -190,15 +199,23 @@ fn hash_stdin_bytes(payload: &[u8]) -> Option<String> {
 /// shell), so non-UTF8 names hash exactly like the shell's.
 /// `None` when git fails.
 fn hash_live_file(path: &Path) -> Option<String> {
-    let output = crate::init_client_identity::host_git_command()
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .args(["hash-object", "--no-filters", "--"])
         .arg(path.as_os_str())
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -279,6 +296,7 @@ pub fn candidate_tree(
 ) -> Result<()> {
     use std::io::Write as _;
     // Truncate first, like the shell's opening `: >"$output"`.
+    crate::cancellation::check_mutation()?;
     std::fs::write(output, b"").map_err(|source| Error::Io {
         context: "truncate candidate tree",
         source,
@@ -286,7 +304,9 @@ pub fn candidate_tree(
     let fail = |message: &'static str| -> Result<()> {
         // Mirror the trailing truncation: no partial inventory
         // survives a rejection.
-        let _ = std::fs::write(output, b"");
+        if crate::cancellation::check().is_ok() {
+            let _ = std::fs::write(output, b"");
+        }
         Err(Error::Usage { message })
     };
     let raw = match run_repo_git(repo, &["ls-tree", "-rz", "--full-tree", branch]) {
@@ -362,6 +382,7 @@ pub fn candidate_tree(
         context: "rewrite candidate tree",
         source,
     })?;
+    crate::cancellation::check_mutation()?;
     file.write_all(&out).map_err(|source| Error::Io {
         context: "write candidate tree",
         source,
@@ -657,10 +678,12 @@ pub fn build_prior_and_conflicts(
     use std::io::Write as _;
     // Truncate first: the shell's opening `: >` pair runs before the
     // tree is even opened, so a missing tree still empties both.
+    crate::cancellation::check_mutation()?;
     std::fs::write(prior, b"").map_err(|source| Error::Io {
         context: "truncate prior journal",
         source,
     })?;
+    crate::cancellation::check_mutation()?;
     std::fs::write(conflicts, b"").map_err(|source| Error::Io {
         context: "truncate conflicts journal",
         source,
@@ -701,6 +724,7 @@ pub fn build_prior_and_conflicts(
         );
         let live = home_join(&scope.home, path);
         let state = snapshot_path(&live)?;
+        crate::cancellation::check_mutation()?;
         writeln!(prior_file, "{path}\t{state}").map_err(|source| Error::Io {
             context: "append prior journal",
             source,
@@ -728,6 +752,7 @@ pub fn build_prior_and_conflicts(
                 message: "conflict root is absent",
             });
         }
+        crate::cancellation::check_mutation()?;
         writeln!(conflicts_file, "{root}\t{root_state}").map_err(|source| Error::Io {
             context: "append conflicts journal",
             source,

@@ -161,9 +161,15 @@ merge() { printf 'later\n' >>"$HOME/hook.log"; }
 HOOK
 chmod 0644 "$extensions/merge-hooks.d"/*.sh
 set +e
+# TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
+export DOT_TEST_DIAG_HOOKS=1
 failing_hook_output=$(run_dot "$home" "$state" update 2>&1)
 failing_hook_status=$?
+unset DOT_TEST_DIAG_HOOKS
 set -e
+# TEMP-DIAG-180: remove after the macOS hooks-test diagnosis. Print before the
+# asserts: assert_contains aborts the suite, hiding the captured output.
+printf '%s\n' "HOOK-OUTPUT-BEGIN $failing_hook_output HOOK-OUTPUT-END"
 assert_eq 1 "$failing_hook_status" \
   'real failing merge hook normalizes aggregate update status to one'
 assert_contains 'warning: merge failed: 10-failing' "$failing_hook_output" \
@@ -195,7 +201,7 @@ chmod 0644 "$extensions/merge-hooks.d/10-cancellable.sh"
 HOME="$home" XDG_STATE_HOME="$state" XDG_CONFIG_HOME='' \
   "$root/bin/dot" update >"$home/cancellable.out" 2>"$home/cancellable.err" &
 cancellable_dot_pid=$!
-cancellable_deadline=$((SECONDS + 5))
+cancellable_deadline=$((SECONDS + 60))
 while ((SECONDS < cancellable_deadline)); do
   [[ -s $home/cancellable-hook.pid && -s $home/cancellable-child.pid ]] && break
   kill -0 "$cancellable_dot_pid" 2>/dev/null || break

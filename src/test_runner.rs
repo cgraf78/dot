@@ -9,7 +9,7 @@ use std::os::unix::fs::{
 };
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::app::Streams;
@@ -131,9 +131,10 @@ fn prune(parent: &Path, uid: u32, now: u64) {
 }
 
 struct Worker {
-    child: Option<Child>,
+    child: Option<crate::cleanup::OwnedSession>,
     index: usize,
     started: Instant,
+    execution_started: Option<Instant>,
     timeout: Duration,
     result_path: PathBuf,
     result: File,
@@ -146,7 +147,7 @@ struct Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = crate::cleanup::stop_session(&mut child, libc::SIGTERM);
+            let _ = child.stop(libc::SIGTERM);
         }
     }
 }
@@ -167,7 +168,7 @@ impl Workers {
             .iter_mut()
             .filter_map(|worker| worker.child.take())
             .collect();
-        let _ = crate::cleanup::stop_sessions(&mut children, libc::SIGTERM);
+        let _ = crate::cleanup::stop_owned_sessions(&mut children, libc::SIGTERM);
     }
 }
 
@@ -220,6 +221,7 @@ fn start(
         child: None,
         index,
         started: Instant::now(),
+        execution_started: None,
         timeout: Duration::ZERO,
         result_path: result,
         result: result_file,
@@ -265,9 +267,12 @@ fn start(
         .stdin(Stdio::null())
         .stdout(Stdio::from(writer.try_clone()?))
         .stderr(Stdio::from(writer));
-    crate::cleanup::isolate(&mut command);
-    match command.spawn() {
-        Ok(child) => worker.child = Some(child),
+    match crate::cleanup::spawn_owned_session(command) {
+        Ok(Some(child)) => {
+            worker.execution_started = Some(Instant::now());
+            worker.child = Some(child);
+        }
+        Ok(None) => worker.status = Some(1),
         Err(error) => {
             worker.status = Some(if error.kind() == std::io::ErrorKind::NotFound {
                 127
@@ -368,12 +373,17 @@ pub(crate) fn run(
     suites: &[Suite],
     streams: &mut Streams<'_>,
 ) -> i32 {
-    match execute(context, options, suites, streams) {
+    let code = match execute(context, options, suites, streams) {
         Ok(code) => code,
         Err(error) => {
             let _ = writeln!(streams.stderr, "dot test: {error}");
             1
         }
+    };
+    if crate::cleanup::cleanup_incomplete() {
+        crate::cleanup::CLEANUP_INCOMPLETE_STATUS
+    } else {
+        code
     }
 }
 
@@ -384,13 +394,7 @@ fn execute(
     streams: &mut Streams<'_>,
 ) -> std::io::Result<i32> {
     crate::cleanup::adopt_descendants()?;
-    let signals = crate::cleanup::Signals::for_runtime(context.runtime)?;
-    let stdout_terminal = streams.stdout_is_terminal();
-    let mut stdout = signals.writer(streams.stdout);
-    let mut stderr = signals.writer(streams.stderr);
-    let mut guarded_streams = Streams::with_terminal(&mut stdout, &mut stderr, stdout_terminal);
-    let streams = &mut guarded_streams;
-    let result = (|| -> std::io::Result<i32> {
+    (|| -> std::io::Result<i32> {
         let mut invocation = Invocation::new(context)?;
         let renderer = if options.color {
             crate::ui::Renderer::select(
@@ -432,11 +436,14 @@ fn execute(
         let mut completed = 0;
         let limit = if options.parallel { options.jobs } else { 1 };
         while completed < suites.len() {
-            if signals.received().is_some() {
+            if crate::cleanup::received_signal().is_some() {
                 workers.stop();
                 return Ok(1);
             }
-            while workers.0.len() < limit && next < suites.len() && signals.received().is_none() {
+            while workers.0.len() < limit
+                && next < suites.len()
+                && crate::cleanup::received_signal().is_none()
+            {
                 if !options.parallel {
                     writeln!(streams.stdout)?;
                     header(streams.stdout, options, &label(&suites[next]), false)?;
@@ -457,18 +464,42 @@ fn execute(
                     drain(worker, streams.stdout)?;
                 }
                 if let Some(child) = worker.child.as_ref() {
-                    let exited = crate::cleanup::exited(child)?;
-                    let expired = worker.started.elapsed() >= worker.timeout;
-                    if exited || expired {
+                    let exited = child.exited()?;
+                    let expired = worker
+                        .execution_started
+                        .is_some_and(|started| started.elapsed() >= worker.timeout);
+                    // The shell checks its timeout before observing child
+                    // status, so an exact-deadline tie is status 124.
+                    if expired || exited {
                         let mut child = worker.child.take().expect("observed owned child");
-                        let status = crate::cleanup::stop_session(&mut child, libc::SIGTERM)?;
-                        worker.status = Some(if !exited && expired {
-                            124
-                        } else {
-                            status
-                                .code()
-                                .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
-                        });
+                        // TEMP-DIAG-180: remove after the macOS lifecycle
+                        // diagnosis. A stuck suite session currently kills
+                        // the coordinator here, discarding every buffered
+                        // suite output. Record the stop failure as the
+                        // suite's status and continue so one stuck suite
+                        // cannot hide the rest; the latched cleanup
+                        // atomic still fails the run with 125.
+                        match child.stop(libc::SIGTERM) {
+                            Ok(status) => {
+                                worker.status = Some(if expired {
+                                    124
+                                } else {
+                                    status
+                                        .code()
+                                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
+                                });
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "TEMP-DIAG-180 WORKER-STOP-ERR suite={} err={error:?}",
+                                    label(&suites[worker.index])
+                                );
+                                // The failed stop consumed the child
+                                // handle; OwnedSession::stop is
+                                // single-shot and a second call panics.
+                                worker.status = Some(125);
+                            }
+                        }
                     }
                 }
                 if worker.status.is_none() {
@@ -553,8 +584,7 @@ fn execute(
             )?;
         }
         Ok(i32::from(!failed.is_empty()))
-    })();
-    signals.finish_result(result)
+    })()
 }
 
 fn styled(

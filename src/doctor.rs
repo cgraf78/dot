@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::doctor_checks::{
-    BaseRepoInputs, LifecycleInputs, MergeInputs, OverlayInputs, ProviderInputs, ProviderInstaller,
+    BaseRepoInputs, CronInputs, LifecycleInputs, MergeInputs, MergeSpec, OverlayInputs,
+    ProviderInputs, ProviderInstaller,
 };
 use crate::doctor_orchestrator::{EngineSnapshot, Recorder, RuntimeSnapshot};
 
@@ -103,8 +104,18 @@ fn run_configured(
     );
     append(
         &mut recorder,
+        crate::doctor_checks::check_cron_freshness(&CronInputs {
+            last_success: crate::update_status::read_last_success(runtime.state_home()),
+            now: crate::update_engine::now_secs(),
+        }),
+    );
+    append(
+        &mut recorder,
         provider_records(runtime, config, &home, &source),
     );
+    if crate::cleanup::received_signal().is_some() {
+        return 1;
+    }
 
     let mut lifecycle_records = Vec::new();
     let log = crate::log::Log::from_env(
@@ -156,81 +167,65 @@ fn run_configured(
             local_validate: &local_validate,
         }),
     );
-    let merge_specs = extensions_enabled.then(|| {
-        merge_count(
-            config,
-            &home,
-            &overlays.active,
-            &constants.overlay_manifest,
-            euid,
-            streams.stderr,
-        )
-    });
+    let merge_specs = extensions_enabled
+        .then(|| {
+            merge_inventory(
+                config,
+                &home,
+                &overlays.active,
+                &constants.overlay_manifest,
+                euid,
+                streams.stderr,
+            )
+        })
+        .flatten();
     append(
         &mut recorder,
         crate::doctor_checks::check_merges(&MergeInputs {
             enabled: extensions_enabled,
             extensions_dir: config.extensions_dir.clone().unwrap_or_default(),
-            spec_count: merge_specs.flatten(),
+            spec_count: merge_specs.as_ref().map(Vec::len),
+            specs: merge_specs.unwrap_or_default(),
         }),
     );
 
-    // Core probes are synchronous and precede all owned background work. Arm
-    // the process-level handler only for the extension phase, whose worker
-    // sessions poll the shared cancellation state and reap before return.
-    let signals = match crate::cleanup::Signals::for_runtime(runtime) {
-        Ok(signals) => signals,
-        Err(_) => return 1,
-    };
-    let code = {
-        let mut stdout = signals.writer(streams.stdout);
-        let mut stderr = signals.writer(streams.stderr);
-        let mut guarded_streams =
-            crate::app::Streams::with_terminal(&mut stdout, &mut stderr, stdout_terminal);
-        let streams = &mut guarded_streams;
-        (|| -> i32 {
-            let extension_status = extensions(
-                runtime,
-                config,
-                euid,
-                &overlays.active,
-                &constants.overlay_manifest,
-                streams.stderr,
-                &mut recorder,
-            );
-            // Cancellation owns the final status at the CLI boundary. Do not
-            // render a normal report after an interrupted extension is reaped.
-            if crate::cleanup::received_signal().is_some() {
-                return 1;
-            }
-            let palette = crate::doctor_runtime::resolve_palette(
-                stdout_terminal,
-                runtime.value("NO_COLOR").and_then(OsStr::to_str),
-            );
-            if streams
-                .stdout
-                .write_all(&recorder.render_with(&palette))
-                .is_err()
-            {
-                return 1;
-            }
-            let counts = recorder.counts();
-            let summary =
-                crate::doctor_coordinator::summary_line(counts.pass, counts.warn, counts.fail);
-            let color = crate::doctor_coordinator::summary_color(counts.fail, counts.warn);
-            if streams.stdout.write_all(b"\n").is_err()
-                || crate::ui::summary_box(streams.stdout, &renderer, color.name(), &summary)
-                    .is_err()
-            {
-                return 1;
-            }
-            i32::from(!crate::doctor_coordinator::overall_ok(
-                counts.fail,
-                extension_status,
-            ))
-        })()
-    };
-    signals.finish(code)
+    let extension_status = extensions(
+        runtime,
+        config,
+        euid,
+        &overlays.active,
+        &constants.overlay_manifest,
+        streams.stderr,
+        &mut recorder,
+    );
+    // Cancellation owns the final status at the CLI boundary. Do not render a
+    // normal report after an interrupted extension is reaped.
+    if crate::cleanup::received_signal().is_some() {
+        return 1;
+    }
+    let palette = crate::doctor_runtime::resolve_palette(
+        stdout_terminal,
+        runtime.value("NO_COLOR").and_then(OsStr::to_str),
+    );
+    if streams
+        .stdout
+        .write_all(&recorder.render_with(&palette))
+        .is_err()
+    {
+        return 1;
+    }
+    let counts = recorder.counts();
+    let summary = crate::doctor_coordinator::summary_line(counts.pass, counts.warn, counts.fail);
+    let color = crate::doctor_coordinator::summary_color(counts.fail, counts.warn);
+    if streams.stdout.write_all(b"\n").is_err()
+        || crate::ui::summary_box(streams.stdout, &renderer, color.name(), &summary).is_err()
+    {
+        return 1;
+    }
+    i32::from(!crate::doctor_coordinator::overall_ok(
+        counts.fail,
+        extension_status,
+    ))
 }
 
 fn text(value: Option<&OsStr>) -> String {
@@ -375,7 +370,25 @@ fn provider_records(
     source: &str,
 ) -> Vec<crate::doctor_checks::Record> {
     let provider = match config.provider {
-        crate::config::Provider::None => None,
+        crate::config::Provider::None => {
+            return crate::doctor_checks::check_provider(&ProviderInputs {
+                home,
+                dependency_provider: None,
+                policy: "",
+                configure_ok: true,
+                dev_dir: "",
+                development_exists: false,
+                development_valid: false,
+                installer: None,
+                locked_revision: None,
+                development_revision: None,
+                binary: None,
+                expected_abi: None,
+                actual_abi: None,
+                cancellation_capability: false,
+                prompt_handshake_capability: false,
+            });
+        }
         crate::config::Provider::Shdeps => Some("shdeps"),
     };
     let policy = match config.shdeps_update_policy {
@@ -414,9 +427,23 @@ fn provider_records(
             Path::new(path),
         )
     });
+    let expected_abi = crate::shdeps::lock_value(Path::new(source), "abi");
     let actual = binary
         .as_ref()
         .and_then(|binary| crate::shdeps_provider::doctor_abi_version(runtime, binary));
+    let abi_matches = expected_abi.as_ref().is_some_and(|expected| {
+        actual
+            .as_deref()
+            .is_some_and(|actual| actual == format!("abi:{expected}"))
+    });
+    let cancellation_capability = abi_matches
+        && binary.as_ref().is_some_and(|binary| {
+            crate::shdeps_provider::doctor_has_cancellation_capability(runtime, binary)
+        });
+    let prompt_handshake_capability = abi_matches
+        && binary.as_ref().is_some_and(|binary| {
+            crate::shdeps_provider::doctor_has_prompt_capability(runtime, binary)
+        });
     crate::doctor_checks::check_provider(&ProviderInputs {
         home,
         dependency_provider: provider,
@@ -429,8 +456,10 @@ fn provider_records(
         locked_revision: crate::shdeps::lock_value(Path::new(source), "revision").as_deref(),
         development_revision: Some(&crate::shdeps::active_revision(&development)),
         binary: binary.as_ref().and_then(|path| path.to_str()),
-        expected_abi: crate::shdeps::lock_value(Path::new(source), "abi").as_deref(),
+        expected_abi: expected_abi.as_deref(),
         actual_abi: actual.as_deref(),
+        cancellation_capability,
+        prompt_handshake_capability,
     })
 }
 
@@ -474,22 +503,61 @@ fn installer(
     None
 }
 
-fn merge_count(
+/// Largest `.outputs` sidecar accepted: declarations are short
+/// path lines, so 1 MiB bounds a corrupt sidecar without
+/// constraining legitimate inventories.
+const SIDECAR_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Read one `.outputs` sidecar: blank lines and `#` comments
+/// skipped, the rest expanded through
+/// [`crate::merge_hooks::expand_home`]. Absolute results are live
+/// outputs; anything else is invalid (raw line kept for the
+/// diagnostic). `None` means the sidecar exists but cannot be read
+/// (oversized, unreadable, or non-UTF-8).
+fn read_outputs_sidecar(sidecar: &Path, home: &str) -> Option<(Vec<String>, Vec<String>)> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(sidecar).ok()?;
+    let mut content = String::new();
+    file.take(SIDECAR_MAX_BYTES + 1)
+        .read_to_string(&mut content)
+        .ok()?;
+    if content.len() as u64 > SIDECAR_MAX_BYTES {
+        return None;
+    }
+    let mut outputs = Vec::new();
+    let mut invalid = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let expanded = crate::merge_hooks::expand_home(line, home);
+        if Path::new(&expanded).is_absolute() {
+            outputs.push(expanded);
+        } else {
+            invalid.push(line.to_string());
+        }
+    }
+    Some((outputs, invalid))
+}
+
+fn merge_inventory(
     config: &crate::config::Config,
     home: &str,
     overlays: &[String],
     manifest: &str,
     euid: u32,
     stderr: &mut dyn std::io::Write,
-) -> Option<usize> {
+) -> Option<Vec<MergeSpec>> {
     let root = config.extensions_dir.as_deref()?;
     let directory = Path::new(root).join("merge-hooks.d");
     if !directory.exists() {
-        return Some(0);
+        return Some(Vec::new());
     }
     let meta = std::fs::symlink_metadata(&directory).ok()?;
     if !meta.is_dir() || meta.file_type().is_symlink() {
-        return Some(0);
+        return Some(Vec::new());
     }
     let trust = crate::extension_trust::Inputs {
         euid,
@@ -524,7 +592,7 @@ fn merge_count(
             .as_bytes()
             .cmp(right.as_os_str().as_bytes())
     });
-    let mut spec_count = 0;
+    let mut rows: Vec<(OsString, OsString)> = Vec::new();
     for index in 0..scripts.len() {
         let path = &scripts[index];
         if !crate::extension_trust::file_validate(path, &trust, overlays) {
@@ -540,14 +608,69 @@ fn merge_count(
             .map(|script| script.as_os_str())
             .collect();
         match crate::merges::collect_specs(&refs) {
-            Ok(specs) => spec_count = specs.len(),
+            Ok(specs) => rows = specs,
             Err(error) => {
                 let _ = writeln!(stderr, "{error}");
                 return None;
             }
         }
     }
-    Some(spec_count)
+    // Script validation precedes sidecar discovery, so script
+    // diagnostics keep their historical precedence.
+    let mut inventory = Vec::new();
+    for (key, script) in &rows {
+        let identity = crate::merges::spec_identity(key)?;
+        let mut sidecar_name = key.as_bytes().to_vec();
+        sidecar_name.extend_from_slice(b".outputs");
+        let sidecar = directory.join(OsStr::from_bytes(&sidecar_name));
+        let mut spec = MergeSpec {
+            identity: identity.to_string_lossy().into_owned(),
+            script: script.to_string_lossy().into_owned(),
+            sidecar: None,
+            family_dir: None,
+            outputs: Vec::new(),
+            invalid: Vec::new(),
+        };
+        if std::fs::symlink_metadata(&sidecar).is_ok() {
+            // One bad sidecar degrades its own spec, never the whole
+            // inventory: the hook fails verification (fail-closed for
+            // that hook) while healthy siblings still verify.
+            if !crate::extension_trust::file_validate(&sidecar, &trust, overlays) {
+                let _ = writeln!(
+                    stderr,
+                    "dot: unsafe merge-hook outputs: {}",
+                    sidecar.display()
+                );
+                spec.invalid.push(format!(
+                    "{}: untrusted outputs declaration",
+                    sidecar.display()
+                ));
+            } else if let Some((outputs, invalid)) = read_outputs_sidecar(&sidecar, home) {
+                spec.sidecar = Some(sidecar.to_string_lossy().into_owned());
+                spec.outputs = outputs;
+                spec.invalid = invalid;
+            } else {
+                let _ = writeln!(
+                    stderr,
+                    "dot: cannot read merge-hook outputs: {}",
+                    sidecar.display()
+                );
+                spec.invalid.push(format!(
+                    "{}: unreadable outputs declaration",
+                    sidecar.display()
+                ));
+            }
+        }
+        let family = directory.join(&identity);
+        let family_real = std::fs::symlink_metadata(&family)
+            .ok()
+            .is_some_and(|meta| meta.is_dir() && !meta.file_type().is_symlink());
+        if family_real {
+            spec.family_dir = Some(family.to_string_lossy().into_owned());
+        }
+        inventory.push(spec);
+    }
+    Some(inventory)
 }
 
 fn extensions(
@@ -701,7 +824,15 @@ fn command(runtime: &crate::app::Runtime, program: &Path) -> Command {
 
 fn command_output(runtime: &crate::app::Runtime, program: &str, args: &[&str]) -> Option<Vec<u8>> {
     let program = runtime.find_on_path(program)?;
-    let output = command(runtime, &program).args(args).output().ok()?;
+    let mut command = command(runtime, &program);
+    command.args(args);
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
     output.status.success().then(|| {
         output
             .stdout
@@ -754,7 +885,14 @@ fn git_output(runtime: &crate::app::Runtime, cwd: &Path, args: &[&str]) -> Optio
     let mut command = command(runtime, &program);
     crate::temp::sanitize_git_env(&mut command);
     crate::temp::bind_source_git(&mut command, cwd);
-    let output = command.args(args).stderr(Stdio::null()).output().ok()?;
+    command.args(args).stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
     output.status.success().then(|| {
         PathBuf::from(OsString::from_vec(
             output

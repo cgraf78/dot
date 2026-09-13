@@ -300,6 +300,11 @@ assert_no_pull_backup "$overlay_rollback_home" \
   'repaired overlay-to-base transfer avoids managed-link backups'
 
 printf '%s\n' '=== two-release overlay to base failure fallback ==='
+# TEMP-DIAG-180: remove after the macOS ownership diagnosis (hang trace).
+if [[ $(uname -s) == Darwin ]]; then
+  set -x
+  export DOT_TEST_DIAG_CLONE=1
+fi
 fixture_repo base-fallback-source main \
   home/.config/base-fallback/value $'source\n' 100644
 base_fallback_source_origin=$REPLY
@@ -315,14 +320,45 @@ base_fallback_origin=$REPLY
 fixture_home base-fallback
 base_fallback_home=$REPLY
 base_fallback_state=$DOT_TEST_TMP/base-fallback-state
-run_dot "$base_fallback_home" "$base_fallback_state" init --yes \
-  "file://$base_fallback_origin" >/dev/null
+# TEMP-DIAG-180: remove after the macOS ownership diagnosis (init hang watch).
+# GIT_TRACE=file bypasses dot's suppressed clone capture (clone_suppressed
+# swallows git stderr), so the trace survives even a silent clone failure;
+# the file is discarded on success.
+base_fallback_init_status=0
+base_fallback_init_trace=$DOT_TEST_TMP/base-fallback-init.trace
+rm -f "$base_fallback_init_trace"
+base_fallback_init_output=$("$root/lib/dot/public/test-timeout-v1" 90s \
+  env HOME="$base_fallback_home" XDG_STATE_HOME="$base_fallback_state" XDG_CONFIG_HOME='' \
+  GIT_TRACE="$base_fallback_init_trace" DOT_TEST_DIAG_CLONE=1 \
+  "$DOT_TEST_ROOT/bin/dot" init --yes "file://$base_fallback_origin" 2>&1) || base_fallback_init_status=$?
+if [[ $base_fallback_init_status -eq 125 ]]; then
+  printf '%s\n' "HANG-DUMP init hit 90s timeout; output: $base_fallback_init_output"
+  ps -ef | head -60 || true
+  fail 'base-fallback init hung (TEMP-DIAG-180)'
+fi
+if [[ $base_fallback_init_status -ne 0 ]]; then
+  printf '%s\n' 'GIT-TRACE-180 clone lines:'
+  grep -a 'built-in: git clone' "$base_fallback_init_trace" 2>/dev/null |
+    cut -c1-250 || printf '%s\n' '<no clone in trace>'
+  printf '%s\n' 'GIT-TRACE-180 command inventory:'
+  grep -a -o 'built-in: git [a-z-]*' "$base_fallback_init_trace" 2>/dev/null |
+    sort | uniq -c || printf '%s\n' '<no trace file>'
+  fail "base-fallback init failed: $base_fallback_init_output"
+fi
+rm -f "$base_fallback_init_trace"
 
 base_fallback_seed=$DOT_TEST_TMP/base-fallback-base-seed
 mkdir -p "$base_fallback_seed/.config/base-fallback"
 printf 'base destination\n' >"$base_fallback_seed/.config/base-fallback/value"
 commit_seed base-fallback-base publish-destination
-run_dot "$base_fallback_home" "$base_fallback_state" update -f >/dev/null
+# TEMP-DIAG-180: remove after the macOS ownership diagnosis (silent update
+# death: capture the exit status and full output the plain invocation hides).
+base_fallback_update_status=0
+base_fallback_update_output=$(run_dot "$base_fallback_home" "$base_fallback_state" update -f 2>&1) || base_fallback_update_status=$?
+if [[ $base_fallback_update_status -ne 0 ]]; then
+  printf '%s\n' "UPDATE-DUMP status=$base_fallback_update_status output: $base_fallback_update_output"
+  fail 'base-fallback update died silently (TEMP-DIAG-180)'
+fi
 assert_link_owner "$base_fallback_home" .config/base-fallback/value source \
   'source overlay keeps precedence during base handoff overlap'
 
@@ -341,11 +377,26 @@ assert_eq 'base destination' \
   "$(<"$base_fallback_home/.config/base-fallback/value")" \
   'failed handoff keeps base destination content available'
 mv "$base_fallback_blocker_origin.offline" "$base_fallback_blocker_origin"
-run_dot "$base_fallback_home" "$base_fallback_state" update -f >/dev/null
+# TEMP-DIAG-180: remove after the macOS ownership diagnosis (hang watch).
+base_fallback_retry_status=0
+base_fallback_retry_output=$("$root/lib/dot/public/test-timeout-v1" 90s \
+  env HOME="$base_fallback_home" XDG_STATE_HOME="$base_fallback_state" XDG_CONFIG_HOME='' \
+  "$DOT_TEST_ROOT/bin/dot" update -f 2>&1) || base_fallback_retry_status=$?
+if [[ $base_fallback_retry_status -eq 125 ]]; then
+  printf '%s\n' "HANG-DUMP retry hit 90s timeout; output: $base_fallback_retry_output"
+  ps -ef | head -60 || true
+fi
+assert_eq 0 "$base_fallback_retry_status" \
+  'base handoff retry finished before the hang watch'
 assert_eq 'base destination' \
   "$(<"$base_fallback_home/.config/base-fallback/value")" \
   'base handoff retry converges'
 
+# TEMP-DIAG-180: remove after the macOS ownership diagnosis (hang trace).
+if [[ $(uname -s) == Darwin ]]; then
+  set +x
+  unset DOT_TEST_DIAG_CLONE
+fi
 printf '%s\n' '=== two-release overlay to overlay failure fallback ==='
 fixture_repo overlay-fallback-target main \
   home/.config/overlay-fallback/target $'target-existing\n' 100644

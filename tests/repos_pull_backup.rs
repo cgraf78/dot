@@ -5,7 +5,9 @@ use dot::repos_base::{Base, Topology};
 use dot::repos_overlays::{DestinationInputs, QuarantineInputs, RollbackSnapshot};
 use dot::repos_pull_backup::{BackupConflictsInputs, BackupOutcome, backup_pull_conflicts};
 use dot_test_support::TempDir;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn stage(root: &Path, relative: &str, bytes: &[u8]) -> PathBuf {
     let path = root.join(relative);
@@ -141,6 +143,11 @@ fn files_and_dangling_links_are_moved_to_a_private_backup() {
     );
     assert!(outcome.succeeded);
     let backup = outcome.backup.unwrap();
+    assert_eq!(
+        std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "backup leaf must be private at creation time even under umask 022"
+    );
     assert!(!fixture.root.join("nested/note.txt").exists());
     assert!(fixture.root.join("dangling").symlink_metadata().is_err());
     assert_eq!(
@@ -156,6 +163,55 @@ fn files_and_dangling_links_are_moved_to_a_private_backup() {
             .unwrap()
             .contains("backed up 2 conflicting untracked files")
     );
+}
+
+#[test]
+fn colliding_backup_fallback_is_private_at_creation_under_public_umask() {
+    const HELPER: &str = "DOT_BACKUP_COLLISION_PERMISSION_HELPER";
+    if std::env::var_os(HELPER).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "colliding_backup_fallback_is_private_at_creation_under_public_umask",
+                "--nocapture",
+            ])
+            .env(HELPER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "backup collision helper failed with {:?}:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    // SAFETY: the recursive helper is the only test in this process.
+    unsafe { libc::umask(0o022) };
+    let scope = TempDir::new("backup-collision-mode").unwrap();
+    let home = scope.path().to_string_lossy();
+    let mut warnings = Vec::new();
+    let mut previous = dot::repos_pull_support::backup_dir(&home, &mut warnings).unwrap();
+    for _ in 0..100 {
+        let previous_name = previous.file_name().unwrap().to_string_lossy();
+        let stamp = previous_name
+            .get(..14)
+            .unwrap_or(&previous_name)
+            .to_string();
+        let candidate = dot::repos_pull_support::backup_dir(&home, &mut warnings).unwrap();
+        let candidate_name = candidate.file_name().unwrap().to_string_lossy();
+        if candidate_name.starts_with(&format!("{stamp}.")) {
+            assert_eq!(
+                std::fs::metadata(&candidate).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "randomized collision fallback was exposed before a later chmod"
+            );
+            return;
+        }
+        previous = candidate;
+    }
+    panic!("could not exercise the same-second collision fallback");
 }
 
 #[test]

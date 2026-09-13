@@ -161,8 +161,15 @@ fn clone_suppressed(
     effective: &str,
     moves: &mut MoveCache,
 ) -> bool {
-    let Ok(mask) = read_umask().map(crate::startup::ensure_umask_ceiling) else {
-        return false;
+    let mask = match read_umask().map(crate::startup::ensure_umask_ceiling) {
+        Ok(mask) => mask,
+        Err(error) => {
+            // TEMP-DIAG-180: remove after the macOS ownership diagnosis.
+            if std::env::var_os("DOT_TEST_DIAG_CLONE").is_some() {
+                eprintln!("TEMP-DIAG-180 CLONE-SITE umask-err:{error:?}");
+            }
+            return false;
+        }
     };
     let clone_inputs = CloneOverlayInputs {
         url: effective,

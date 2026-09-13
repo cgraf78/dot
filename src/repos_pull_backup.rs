@@ -11,6 +11,7 @@
 //! restored on failure exactly like the shell's recovery walk.
 
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::log::Log;
@@ -33,12 +34,15 @@ use crate::temp::{MoveCache, MoveTool, move_noreplace_cached};
 /// never meet dangling links.
 fn live_identity(path: &Path) -> Option<String> {
     for format in ["-c", "-f"] {
-        let output = std::process::Command::new("stat")
-            .arg(format)
-            .arg("%d:%i")
-            .arg(path)
-            .output()
-            .ok()?;
+        let mut command = std::process::Command::new("stat");
+        command.arg(format).arg("%d:%i").arg(path);
+        let output = crate::cleanup::run_session_output(
+            command,
+            None,
+            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+            crate::cleanup::LingerPolicy::Strict,
+        )
+        .ok()?;
         if output.status.success() {
             return Some(
                 String::from_utf8_lossy(&output.stdout)
@@ -48,6 +52,54 @@ fn live_identity(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Restore one already-recorded backup without consulting the cancellation
+/// latch. Recovery is not a new publication: once the source has moved, an
+/// interrupt must not strand it merely because the ordinary move helper quite
+/// correctly refuses to start more operational subprocesses. The kernel
+/// no-replace operation also prevents a concurrent replacement at `target`
+/// from being overwritten during rollback.
+fn restore_noreplace(source: &Path, target: &Path) -> std::io::Result<()> {
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let target = std::ffi::CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: both C strings remain alive for the syscall, AT_FDCWD selects
+    // their absolute/relative path interpretation, and RENAME_NOREPLACE has no
+    // pointer output.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            1u32,
+        ) as i32
+    };
+    #[cfg(target_os = "macos")]
+    // SAFETY: both C strings remain alive for the call and RENAME_EXCL asks
+    // the kernel to reject an existing destination atomically.
+    let result = unsafe { libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    let result = {
+        if std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(target.as_bytes())).is_ok() {
+            -1
+        } else {
+            return std::fs::rename(
+                std::ffi::OsStr::from_bytes(source.as_bytes()),
+                std::ffi::OsStr::from_bytes(target.as_bytes()),
+            );
+        }
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Inputs for [`backup_pull_conflicts`], replacing the shell's
@@ -178,10 +230,15 @@ pub fn backup_pull_conflicts(
             }
         };
         let target = backup.join(file);
-        let moved = move_noreplace_cached(&live, &target, moves).is_ok();
-        if live_identity(&target) == Some(source.clone()) {
+        if move_noreplace_cached(&live, &target, moves).is_ok() {
+            // The move helper verified this exact source inode at `target`.
+            // Record rollback ownership before any further cancellable probe.
             backed.push(file.clone());
             backed_up += 1;
+            if crate::cancellation::check().is_err() {
+                failed = true;
+                break;
+            }
             continue;
         }
         if live_identity(&live) != Some(source.clone()) {
@@ -203,9 +260,6 @@ pub fn backup_pull_conflicts(
                     &format!("  warning: user conflict move became ambiguous: {file}"),
                 );
             }
-            recovery_failed = true;
-        }
-        if moved {
             recovery_failed = true;
         }
         failed = true;
@@ -285,7 +339,7 @@ pub fn backup_pull_conflicts(
             for file in backed.iter().rev() {
                 let live = root.join(file);
                 if std::fs::symlink_metadata(&live).is_err() {
-                    if move_noreplace_cached(&backup.join(file), &live, moves).is_err() {
+                    if restore_noreplace(&backup.join(file), &live).is_err() {
                         recovery_failed = true;
                     }
                 } else {
@@ -376,4 +430,128 @@ fn retained(log: &Log, warnings: &mut dyn Write, stage: &Path) {
             stage.display()
         ),
     );
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use crate::repos_base::Topology;
+    use crate::repos_overlays::DestinationInputs;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Command;
+
+    #[test]
+    fn cancellation_after_the_move_restores_the_exact_conflict_bytes() {
+        const HELPER: &str = "DOT_BACKUP_POST_MOVE_CANCEL_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "repos_pull_backup::cancellation_tests::cancellation_after_the_move_restores_the_exact_conflict_bytes",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "post-move cancellation helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let scope = dot_test_support::TempDir::new("backup-post-move-cancel").unwrap();
+        let home = scope.path().join("home");
+        let root = scope.path().join("root");
+        let bin = scope.path().join("bin");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let original = b"byte-identical user data\n\0tail";
+        std::fs::write(root.join("note"), original).unwrap();
+        let pull_log = scope.path().join("pull.log");
+        std::fs::write(
+            &pull_log,
+            b"untracked working tree files would be overwritten by\n\tnote\n",
+        )
+        .unwrap();
+
+        let ready = scope.path().join("move.ready");
+        let fake_mv = bin.join("mv");
+        std::fs::write(
+            &fake_mv,
+            "#!/bin/sh\n\"$DOT_TEST_REAL_MV\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *'.dot-backup/pull/'*)\n    : >\"$DOT_TEST_MOVE_READY\"\n    trap '' TERM\n    while :; do /bin/sleep 1; done\n    ;;\nesac\nexit \"$status\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_mv, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/stat", bin.join("stat")).unwrap();
+        std::os::unix::fs::symlink("/bin/mkdir", bin.join("mkdir")).unwrap();
+        // SAFETY: this recursive helper is the only test in its process.
+        unsafe {
+            std::env::set_var("PATH", &bin);
+            std::env::set_var("DOT_TEST_REAL_MV", "/bin/mv");
+            std::env::set_var("DOT_TEST_MOVE_READY", &ready);
+        }
+
+        let home_text = home.to_string_lossy().into_owned();
+        let root_text = root.to_string_lossy().into_owned();
+        let base = Base {
+            topology: Topology::Ordinary,
+            client_git_dir: String::new(),
+            home: home_text.clone(),
+        };
+        let destination = DestinationInputs {
+            pwd: home_text.clone(),
+            home: home_text.clone(),
+            xdg_state_home: None,
+            install_dir: None,
+            state_dir: None,
+            overlay_paths: vec![],
+            init_backup: None,
+        };
+        let mut moves = MoveCache::default();
+        let tool = moves.tool().unwrap();
+        let log = Log::new(false, false);
+        let signals = crate::cleanup::Signals::install().unwrap();
+        let signal_ready = ready.clone();
+        let sender = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !signal_ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                signal_ready.exists(),
+                "the move never reached its post-publication hold"
+            );
+            // SAFETY: the recursive helper owns an installed SIGTERM handler.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+        });
+        let outcome = backup_pull_conflicts(
+            &BackupConflictsInputs {
+                home: &home_text,
+                root: &root_text,
+                pull_log: &pull_log,
+                base: &base,
+                quarantine: None,
+                overlays: &[],
+                dest: &destination,
+                manifest: "",
+                legacy_manifest: "",
+                euid: crate::temp::current_uid().unwrap(),
+                source_root: scope.path(),
+                tmp: scope.path(),
+                log: &log,
+                tool: &tool,
+            },
+            &mut moves,
+            &mut Vec::new(),
+        );
+        sender.join().unwrap();
+        let status = signals.finish(i32::from(!outcome.succeeded));
+
+        assert_eq!(status, 128 + libc::SIGTERM);
+        assert_eq!(std::fs::read(root.join("note")).unwrap(), original);
+    }
 }

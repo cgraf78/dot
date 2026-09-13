@@ -46,7 +46,6 @@
 //! hash child so diagnostics read English on both engines.
 
 use std::ffi::OsString;
-use std::io::Write as _;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -226,29 +225,21 @@ fn chomp_newlines(bytes: &[u8]) -> &[u8] {
 /// `printf '%s' ... | git hash-object --stdin`, run natively like
 /// the rollback lane's twin. `LC_ALL=C` is pinned, never `envs`.
 fn hash_stdin_bytes(payload: &[u8]) -> Result<String> {
-    let mut child = crate::init_client_identity::host_git_command()
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .args(["hash-object", "--stdin"])
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|source| Error::Io {
-            context: "spawn git hash-object",
-            source,
-        })?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or(Error::Usage {
-            message: "git hash-object has no stdin",
-        })?
-        .write_all(payload)
-        .map_err(|source| Error::Io {
-            context: "feed git hash-object",
-            source,
-        })?;
-    let output = child.wait_with_output().map_err(|source| Error::Io {
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output_with_input(
+        command,
+        payload,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .map_err(|source| Error::Io {
         context: "reap git hash-object",
         source,
     })?;
@@ -378,6 +369,7 @@ pub fn parent_directories(
                 });
             }
             if !exists_lexical(&stage) {
+                crate::cancellation::check_mutation()?;
                 std::fs::create_dir(&stage).map_err(|source| Error::Io {
                     context: "create parent stage",
                     source,

@@ -114,10 +114,17 @@ pub fn cpu_count_select(getconf: &str, uname_s: &str, sysctl: &str) -> String {
 /// Run one helper binary, returning trimmed stdout (empty on any
 /// failure, like `$(... || true)`).
 fn probe(program: &str, args: &[&str]) -> String {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output();
+    if crate::cancellation::check().is_err() {
+        return String::new();
+    }
+    let mut command = std::process::Command::new(program);
+    command.args(args).stdin(std::process::Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    );
     match output {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -681,6 +688,10 @@ fn run_one(
         .is_ok()
         && crate::temp::private_dir_validate(&temporary).is_ok();
     if !ready {
+        // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
+        if std::env::var_os("DOT_TEST_DIAG_HOOKS").is_some() {
+            eprintln!("TEMP-DIAG-180 HOOKS-NO-TMPDIR key={:?}", hook.key);
+        }
         return ResultRecord {
             hook,
             rc: 1,
@@ -703,6 +714,10 @@ fn run_one(
         inputs.extension_inputs.euid,
     );
     let started = Instant::now();
+    // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
+    if created.is_err() && std::env::var_os("DOT_TEST_DIAG_HOOKS").is_some() {
+        eprintln!("TEMP-DIAG-180 HOOKS-NO-CONTEXT key={:?}", hook.key);
+    }
     let (rc, output) = match created {
         Ok((context, token)) => {
             let mut worker = crate::hook_worker::Worker::for_update(
@@ -770,6 +785,19 @@ fn run_batch(
     let root = state.root;
     let overlays = state.overlays;
     let first_index = state.merge_index - hooks.len();
+    // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
+    // Env-gated so exact-output CLI assertions stay green.
+    let diag = std::env::var_os("DOT_TEST_DIAG_HOOKS").is_some();
+    if diag && !hooks.is_empty() {
+        eprintln!(
+            "TEMP-DIAG-180 HOOKS-BATCH hooks={} jobs={}",
+            hooks.len(),
+            jobs.max(1)
+        );
+        for hook in hooks {
+            eprintln!("TEMP-DIAG-180 HOOKS-DISCOVERED {:?}", hook.key);
+        }
+    }
     std::thread::scope(|scope| {
         // The shell never retains more PIDs than there are hooks. Do not let a
         // user-controlled but valid numeric job limit reserve unrelated memory.
@@ -806,6 +834,19 @@ fn run_batch(
             }))
         }
     });
+    // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
+    if diag {
+        for record in &records {
+            eprintln!(
+                "TEMP-DIAG-180 HOOKS-RECORD key={:?} rc={} has_merge={} elapsed_ms={} output={:?}",
+                record.hook.key,
+                record.rc,
+                record.has_merge,
+                record.elapsed_ms,
+                String::from_utf8_lossy(&record.output),
+            );
+        }
+    }
     records
 }
 

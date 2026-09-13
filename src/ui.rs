@@ -85,13 +85,14 @@ pub fn find_gum(path_dirs: &str) -> Option<PathBuf> {
         if !is_executable_file(&candidate) {
             continue;
         }
-        let ok = std::process::Command::new(&candidate)
+        let mut command = std::process::Command::new(&candidate);
+        command
             .arg("style")
             .arg("--help")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
+            .stderr(std::process::Stdio::null());
+        let ok =
+            crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Strict) == 0;
         if ok {
             return Some(candidate);
         }
@@ -153,7 +154,8 @@ pub fn title(out: &mut dyn Write, renderer: &Renderer, text: &str) -> Result<(),
             // Argument order mirrors the shell invocation exactly.
             // Gum's stdout is piped through `out` (the shell inherits
             // its stdout the same way) so every renderer has one sink.
-            let output = std::process::Command::new(binary)
+            let mut command = std::process::Command::new(binary);
+            command
                 .arg("style")
                 .arg("--bold")
                 .arg("--foreground")
@@ -162,9 +164,14 @@ pub fn title(out: &mut dyn Write, renderer: &Renderer, text: &str) -> Result<(),
                 .arg("normal")
                 .arg("--padding")
                 .arg("0 2")
-                .arg(text)
-                .output()
-                .map_err(|_| Error::Unavailable)?;
+                .arg(text);
+            let output = crate::cleanup::run_session_output(
+                command,
+                None,
+                crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+                crate::cleanup::LingerPolicy::Strict,
+            )
+            .map_err(|_| Error::Unavailable)?;
             if !output.status.success() {
                 return Err(Error::Unavailable);
             }
@@ -190,7 +197,8 @@ pub fn summary_box(
     const RULE: &str = "════════════════════════════════";
     match renderer {
         Renderer::Gum { binary } => {
-            let output = std::process::Command::new(binary)
+            let mut command = std::process::Command::new(binary);
+            command
                 .arg("style")
                 .arg("--bold")
                 .arg("--foreground")
@@ -199,9 +207,14 @@ pub fn summary_box(
                 .arg("rounded")
                 .arg("--padding")
                 .arg("0 2")
-                .arg(text)
-                .output()
-                .map_err(|_| Error::Unavailable)?;
+                .arg(text);
+            let output = crate::cleanup::run_session_output(
+                command,
+                None,
+                crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+                crate::cleanup::LingerPolicy::Strict,
+            )
+            .map_err(|_| Error::Unavailable)?;
             if !output.status.success() {
                 return Err(Error::Unavailable);
             }

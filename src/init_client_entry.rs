@@ -140,6 +140,7 @@ pub fn write_private_line(
     let temporary = temp::sibling_tmp_for(file)?;
     let mut body = line.as_bytes().to_vec();
     body.push(b'\n');
+    crate::cancellation::check_mutation()?;
     std::fs::write(&temporary, &body).map_err(|source| Error::Io {
         context: "write private line",
         source,
@@ -381,6 +382,7 @@ pub fn stage_claim_write(
         });
     }
     let temporary = temp::sibling_tmp_for(&marker)?;
+    crate::cancellation::check_mutation()?;
     std::fs::write(&temporary, stage_claim_body(kind, nonce, path)).map_err(|source| {
         Error::Io {
             context: "write stage claim",
@@ -700,6 +702,7 @@ pub fn publish_one(inputs: &PublishOneInputs<'_>, moves: &mut MoveCache) -> Resu
                 });
             }
         } else {
+            crate::cancellation::check_mutation()?;
             std::fs::create_dir(&stage).map_err(|source| Error::Io {
                 context: "create entry stage",
                 source,
@@ -747,6 +750,7 @@ pub fn publish_one(inputs: &PublishOneInputs<'_>, moves: &mut MoveCache) -> Resu
                 // runs, so a failed show still leaves the (partial)
                 // bytes behind for rollback to sweep.
                 let (body, ok) = git_show(inputs.git_dir, inputs.commit, inputs.path);
+                crate::cancellation::check_mutation()?;
                 std::fs::write(&next, &body).map_err(|source| Error::Io {
                     context: "write entry next",
                     source,
@@ -773,6 +777,7 @@ pub fn publish_one(inputs: &PublishOneInputs<'_>, moves: &mut MoveCache) -> Resu
                         message: "entry link target is not a safe value",
                     });
                 }
+                crate::cancellation::check_mutation()?;
                 std::os::unix::fs::symlink(OsString::from_vec(link_target), &next).map_err(
                     |source| Error::Io {
                         context: "link entry next",

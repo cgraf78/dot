@@ -4,9 +4,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use dot::doctor_checks::{
-    BaseRepoInputs, LifecycleInputs, MergeInputs, OverlayInputs, ProviderInputs, ProviderInstaller,
-    Record, check_base_repo, check_merges, check_overlays, check_profile_lifecycle, check_provider,
-    check_update_lock, completed_identity_matches_home, is_client_checkout, render, shdeps_binary,
+    BaseRepoInputs, CronInputs, LifecycleInputs, MergeInputs, MergeSpec, OverlayInputs,
+    ProviderInputs, ProviderInstaller, Record, check_base_repo, check_cron_freshness, check_merges,
+    check_overlays, check_profile_lifecycle, check_provider, check_update_lock,
+    completed_identity_matches_home, is_client_checkout, render, shdeps_binary,
 };
 use dot_test_support::TempDir;
 
@@ -108,11 +109,14 @@ fn update_lock_initializing_incomplete_live_and_stale() {
 fn merge_inventory_branch_matrix() {
     let scratch = TempDir::new("doctor-merges-native").expect("scratch");
     let ext = scratch.path().join("extensions");
+    // Handoff finding #8 added `specs` for output verification;
+    // empty keeps this matrix on the historical count-only branches.
     let check = |enabled, count| {
         render(&check_merges(&MergeInputs {
             enabled,
             extensions_dir: ext.to_string_lossy().into_owned(),
             spec_count: count,
+            specs: vec![],
         }))
     };
     assert!(check(false, None).contains("no extension root configured"));
@@ -120,6 +124,167 @@ fn merge_inventory_branch_matrix() {
     std::fs::create_dir_all(ext.join("merge-hooks.d")).expect("hooks");
     assert!(check(true, None).contains("inventory is invalid"));
     assert!(check(true, Some(2)).contains("2 hook(s)"));
+}
+
+#[test]
+fn cron_freshness_trips_on_stale_and_passes_on_fresh() {
+    let check = |last: Option<i64>| {
+        render(&check_cron_freshness(&CronInputs {
+            last_success: last,
+            now: 1_800_000_000,
+        }))
+    };
+    let missing = check(None);
+    assert!(missing.contains("· cron update success is unknown"));
+    assert!(missing.contains("no successful cron update recorded"));
+    assert!(!missing.contains('✗'));
+
+    let fresh = check(Some(1_800_000_000 - 60));
+    assert!(fresh.contains("✓ cron update succeeded recently"));
+    assert!(!fresh.contains('✗'));
+
+    // Exactly at the threshold reads fresh (staleness is strict).
+    let boundary = check(Some(1_800_000_000 - 7200));
+    assert!(boundary.contains("✓ cron update succeeded recently"));
+
+    // Clock skew (a future stamp) never trips.
+    let future = check(Some(1_800_000_000 + 60));
+    assert!(future.contains("✓ cron update succeeded recently"));
+
+    let stale = check(Some(1_800_000_000 - 7201));
+    assert!(stale.contains("⚠ cron update has not succeeded recently"));
+    assert!(stale.contains("last success 2h0m ago"));
+    assert!(!stale.contains('✗'));
+
+    // Fresh-review-B B3: a hostile `i64::MIN` stamp saturates to
+    // stale instead of overflowing the age subtraction (and an
+    // `i64::MAX` stamp reads fresh, never panics).
+    let hostile = check(Some(i64::MIN));
+    assert!(hostile.contains("⚠ cron update has not succeeded recently"));
+    assert!(!hostile.contains('✗'));
+    let far_future = check(Some(i64::MAX));
+    assert!(far_future.contains("✓ cron update succeeded recently"));
+}
+
+fn backdate(path: &Path, secs_ago: u64) {
+    let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for backdating")
+        .set_modified(mtime)
+        .expect("backdate mtime");
+}
+
+fn merge_spec(identity: &str, script: &Path, outputs: Vec<String>) -> MergeSpec {
+    MergeSpec {
+        identity: identity.to_string(),
+        script: script.to_string_lossy().into_owned(),
+        sidecar: None,
+        family_dir: None,
+        outputs,
+        invalid: vec![],
+    }
+}
+
+#[test]
+fn merge_outputs_verify_fresh_missing_and_stale() {
+    let scratch = TempDir::new("doctor-merge-outputs").expect("scratch");
+    let ext = scratch.path().join("extensions");
+    std::fs::create_dir_all(ext.join("merge-hooks.d")).expect("hooks");
+    let script = ext.join("merge-hooks.d/10-fixture.sh");
+    std::fs::write(&script, b"merge() { :; }\n").expect("hook");
+    let check = |specs: Vec<MergeSpec>| {
+        render(&check_merges(&MergeInputs {
+            enabled: true,
+            extensions_dir: ext.to_string_lossy().into_owned(),
+            spec_count: Some(1),
+            specs,
+        }))
+    };
+
+    // Fresh output (newer than the script) passes.
+    let fresh_out = scratch.path().join("fresh.conf");
+    backdate(&script, 100);
+    std::fs::write(&fresh_out, b"live\n").expect("fresh output");
+    let fresh = check(vec![merge_spec(
+        "fixture",
+        &script,
+        vec![fresh_out.to_string_lossy().into_owned()],
+    )]);
+    assert!(fresh.contains("1 hook(s)"));
+    assert!(fresh.contains("✓ merge-hook outputs are current"));
+    assert!(!fresh.contains('✗'));
+
+    // Missing output fails.
+    let missing = check(vec![merge_spec(
+        "fixture",
+        &script,
+        vec![
+            scratch
+                .path()
+                .join("absent.conf")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+    )]);
+    assert!(missing.contains("✗ merge-hook output is missing"));
+
+    // Stale output (older than the script) fails.
+    let stale_out = scratch.path().join("stale.conf");
+    std::fs::write(&stale_out, b"stale\n").expect("stale output");
+    backdate(&stale_out, 200);
+    let stale = check(vec![merge_spec(
+        "fixture",
+        &script,
+        vec![stale_out.to_string_lossy().into_owned()],
+    )]);
+    assert!(stale.contains("✗ merge-hook output is stale"));
+
+    // Equal mtimes fail: outputs must be strictly newer than inputs.
+    let tied_out = scratch.path().join("tied.conf");
+    std::fs::write(&tied_out, b"tied\n").expect("tied output");
+    let script_mtime = std::fs::metadata(&script)
+        .expect("script meta")
+        .modified()
+        .expect("mtime");
+    std::fs::File::options()
+        .write(true)
+        .open(&tied_out)
+        .expect("open tied output")
+        .set_modified(script_mtime)
+        .expect("tie mtime");
+    let tied = check(vec![merge_spec(
+        "fixture",
+        &script,
+        vec![tied_out.to_string_lossy().into_owned()],
+    )]);
+    assert!(tied.contains("✗ merge-hook output is stale"));
+
+    // A newer family input also makes the output stale.
+    let family = ext.join("merge-hooks.d/fixture");
+    std::fs::create_dir_all(&family).expect("family");
+    std::fs::write(family.join("input.conf"), b"input\n").expect("family input");
+    let mut family_spec = merge_spec(
+        "fixture",
+        &script,
+        vec![fresh_out.to_string_lossy().into_owned()],
+    );
+    family_spec.family_dir = Some(family.to_string_lossy().into_owned());
+    let family_stale = check(vec![family_spec]);
+    assert!(family_stale.contains("✗ merge-hook output is stale"));
+
+    // No declared outputs skips (documented behavior, not a failure).
+    let undeclared = check(vec![merge_spec("fixture", &script, vec![])]);
+    assert!(undeclared.contains("· merge-hook outputs are unverified"));
+    assert!(undeclared.contains("no declared outputs"));
+    assert!(!undeclared.contains('✗'));
+
+    // A relative declaration fails outright.
+    let mut bad = merge_spec("fixture", &script, vec![]);
+    bad.invalid = vec!["relative/path.conf".to_string()];
+    let invalid = check(vec![bad]);
+    assert!(invalid.contains("✗ merge-hook output declaration is invalid"));
 }
 
 #[test]
@@ -381,6 +546,8 @@ fn provider<'a>(
         binary,
         expected_abi: expected,
         actual_abi: actual,
+        cancellation_capability: true,
+        prompt_handshake_capability: true,
     }
 }
 
@@ -411,6 +578,22 @@ fn provider_disabled_unsupported_and_healthy() {
         Some("abi:1"),
     )));
     assert!(output.contains("Shdeps provider ABI (abi:1)"));
+
+    let mut missing_prompt = provider(
+        Some("shdeps"),
+        Some(ProviderInstaller {
+            path: "/managed/install.sh",
+            source: "managed",
+        }),
+        Some("/bin/shdeps"),
+        Some("1"),
+        Some("abi:1"),
+    );
+    missing_prompt.prompt_handshake_capability = false;
+    assert!(
+        render(&check_provider(&missing_prompt))
+            .contains("Shdeps provider prompt handshake capability is unavailable")
+    );
 }
 
 #[test]
@@ -484,6 +667,22 @@ fn provider_failure_source_development_and_abi_matrix() {
     };
     let missing_binary = provider(Some("shdeps"), Some(managed), None, Some("1"), None);
     assert!(render(&check_provider(&missing_binary)).contains("binary is unavailable"));
+
+    let mut missing_capability = provider(
+        Some("shdeps"),
+        Some(ProviderInstaller {
+            path: "/managed/install.sh",
+            source: "managed",
+        }),
+        Some("/bin/shdeps"),
+        Some("1"),
+        Some("abi:1"),
+    );
+    missing_capability.cancellation_capability = false;
+    assert!(
+        render(&check_provider(&missing_capability))
+            .contains("provider cancellation capability is unavailable")
+    );
 }
 
 #[test]

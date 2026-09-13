@@ -3,6 +3,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(unix)]
+use std::os::fd::FromRawFd as _;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+
 use dot::progress_ui::Palette;
 use dot::repos_base::{Base, Topology};
 use dot::repos_pull_support::{
@@ -123,6 +128,116 @@ fn pull_cmd_pins_locale_and_appends_quiet() {
     assert_eq!(
         std::fs::read_to_string(format!("{}.unused", record.display())).expect("argv"),
         "args=--quiet\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pull_cmd_keeps_the_callers_foreground_controlling_tty() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const HELPER: &str = "DOT_PULL_CMD_PTY_HELPER";
+    if std::env::var_os(HELPER).is_some() {
+        let program = std::env::var("DOT_TEST_PULL_PROGRAM").expect("pull fixture program");
+        assert_eq!(pull_cmd(false, &program, &["pull"]), 0);
+        return;
+    }
+
+    let scope = TempDir::new("pull-command-pty").expect("fixture dir");
+    let observed = scope.path().join("foreground-tty");
+    let program = scope.path().join("pull-program");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\n/usr/bin/python3 -c 'import os,sys; sys.exit(0 if all(os.isatty(fd) and os.tcgetpgrp(fd) == os.getpgrp() for fd in (0,1,2)) else 9)' || exit $?\n: >\"$DOT_TEST_PULL_PTY_OBSERVED\"\n",
+    )
+    .expect("pull fixture");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("pull fixture mode");
+
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: openpty initializes both descriptors and null optional pointers
+    // request the platform defaults.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                // macOS takes *mut termios/*mut winsize while Linux takes
+                // *const; null_mut() satisfies both through coercion.
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    // SAFETY: successful openpty returned uniquely owned descriptors.
+    let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
+    let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+    let mut command = Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .args([
+            "--exact",
+            "pull_cmd_keeps_the_callers_foreground_controlling_tty",
+            "--nocapture",
+        ])
+        .env(HELPER, "1")
+        .env("DOT_TEST_PULL_PROGRAM", &program)
+        .env("DOT_TEST_PULL_PTY_OBSERVED", &observed)
+        .stdin(Stdio::from(slave.try_clone().expect("PTY stdin")))
+        .stdout(Stdio::from(slave.try_clone().expect("PTY stdout")))
+        .stderr(Stdio::from(slave));
+    // SAFETY: the post-fork child is single threaded and the calls establish
+    // fd 0's PTY as its controlling, foreground terminal before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0
+                || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0
+                || libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) < 0
+            {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn().expect("PTY pull helper");
+    // Drain the master for the helper's whole lifetime: a never-read
+    // master wedges the helper in SIGKILL-proof `E` state on macOS,
+    // where the line discipline drains pending slave output during
+    // exit teardown. The detached drainer exits at EOF or error.
+    let _drainer = std::thread::Builder::new()
+        .name("pty-master-drain".to_owned())
+        .spawn(move || {
+            use std::io::Read as _;
+            let mut master = std::fs::File::from(master);
+            let mut chunk = [0u8; 8192];
+            loop {
+                match master.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .expect("PTY master drainer");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("observe PTY pull helper") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PTY pull helper did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(status.success(), "PTY pull helper failed with {status:?}");
+    assert!(
+        observed.exists(),
+        "streaming pull did not retain foreground TTY access"
     );
 }
 

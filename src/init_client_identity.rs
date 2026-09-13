@@ -390,14 +390,14 @@ pub fn branch_valid(branch: &str) -> bool {
 /// here) and report success. `false` covers spawn failure and
 /// non-zero exit alike, like the shell's `||` chains.
 fn git_status(args: &[&str]) -> bool {
-    host_git_command()
+    let mut command = host_git_command();
+    command
         .args(args)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .stderr(Stdio::null());
+    crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Detach) == 0
 }
 
 /// Run `git` with `args` (borrowed `OsStr` for caller-owned paths)
@@ -405,14 +405,20 @@ fn git_status(args: &[&str]) -> bool {
 /// `None` on spawn failure; callers check the exit status, like the
 /// shell's `$(... || true)` captures.
 fn git_output<S: AsRef<OsStr>>(args: &[S]) -> Option<std::process::Output> {
-    host_git_command()
+    let mut command = host_git_command();
+    command
         .args(args)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
+        .stderr(Stdio::null());
+    crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .ok()
 }
 
 /// Command-substitution trimming: every trailing newline strips,

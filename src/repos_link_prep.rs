@@ -179,6 +179,7 @@ fn run_task(task: &Task<'_>, home: &str, root: &Path) -> Option<TaskOutcome> {
     };
     let bytes = walk_inventory(&home_dir).ok()?;
     let staging = root.join(format!(".build-{}", task.pos));
+    crate::cancellation::check().ok()?;
     std::fs::write(&staging, &bytes).ok()?;
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -250,6 +251,9 @@ pub fn prepare_inventories(inputs: &Inputs<'_>, root: &Path) -> Option<Prepared>
                 index += 1;
                 let staged = root.join(format!(".build-{pos}"));
                 let placed = root.join(index.to_string());
+                if crate::cancellation::check().is_err() {
+                    return None;
+                }
                 if std::fs::rename(&staged, &placed).is_err() {
                     return None;
                 }

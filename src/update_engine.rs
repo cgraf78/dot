@@ -1281,6 +1281,7 @@ fn skip_inputs_rows(stage: &mut Stage, out: &mut Vec<u8>, reason: &str, now_secs
 /// frozen preservation rows), lifecycle retire, the provider-none
 /// tools stage, the empty merges close, lifecycle commit, worktree
 /// normalize, and `_ui_done`. Returns the update status.
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     inputs: &EngineInputs<'_>,
     state: &mut UpdateState,
@@ -1289,8 +1290,13 @@ fn finalize(
     now_secs: i64,
     update_status: i32,
     frozen: bool,
+    live_out: &mut dyn std::io::Write,
+    live_err: &mut dyn std::io::Write,
 ) -> i32 {
     use std::io::Write as _;
+    if cancelled() {
+        return 1;
+    }
     let mut status = update_status;
     let mut inputs_ready = status == 0;
     let checkpoint = format!("{}/dot/provider-reexec-failed", inputs.state_home);
@@ -1352,6 +1358,9 @@ fn finalize(
             inputs_ready = false;
         }
     }
+    if cancelled() {
+        return 1;
+    }
     if !inputs_ready {
         skip_inputs_rows(stage, io.out, "repository synchronization failed", now_secs);
     } else {
@@ -1391,53 +1400,115 @@ fn finalize(
             status = 1;
             skip_inputs_rows(stage, io.out, "profile deactivation failed", now_secs);
         } else {
-            let open = stage.start(
-                b"Tools",
-                Some(b"checking configured dependencies"),
-                now_secs,
-                inputs.dot_verbose,
-            );
-            let _ = io.out.write_all(&open);
+            if cancelled() {
+                return 1;
+            }
             let provider_enabled =
                 !inputs.skip_provider && state.config.provider == crate::config::Provider::Shdeps;
             if !provider_enabled {
+                let open = stage.start(
+                    b"Tools",
+                    Some(b"checking configured dependencies"),
+                    now_secs,
+                    inputs.dot_verbose,
+                );
+                let _ = io.out.write_all(&open);
                 let close = stage.finish(b"ok", b"no dependency provider", now_secs);
                 let _ = io.out.write_all(&close);
             } else {
+                // The shell prepares Shdeps before opening the Tools stage.
+                // Flush completed earlier stages first so bootstrap/download
+                // diagnostics retain their stream and execution-point order.
+                if !flush_pending(io, live_out, live_err) {
+                    return 1;
+                }
                 let policy = match state.config.shdeps_update_policy {
                     crate::config::UpdatePolicy::Pinned => "pinned",
                     crate::config::UpdatePolicy::Latest => "latest",
                 };
-                let provider = crate::shdeps_provider::update(
-                    &crate::shdeps_provider::Inputs {
-                        runtime: inputs.runtime,
-                        source_root: inputs.source_root_git,
-                        home: inputs.home,
-                        config_home: inputs.config_home,
-                        state_home: inputs.state_home,
-                        policy,
-                        force: inputs.flags.force,
-                        quiet: quiet(inputs),
-                        verbose: inputs.flags.verbose || crate::log::is_quiet(inputs.dot_verbose),
-                        update_jobs: inputs.update_jobs,
-                        palette: inputs.palette,
-                        multibyte: inputs.multibyte,
-                        ascii: inputs.ascii,
-                        bar_width: inputs.bar_width,
-                    },
-                    stage,
-                    now_secs,
-                );
-                io.err.extend_from_slice(&provider.stderr);
-                io.out.extend_from_slice(&provider.during);
-                let close = stage.finish(&provider.stage_status, &provider.summary, now_secs);
-                let _ = io.out.write_all(&close);
-                io.out.extend_from_slice(&provider.details);
-                if provider.status != 0 {
-                    status = 1;
-                } else if let Some((before, after)) = provider.revision_change {
-                    return provider_reexec(inputs, io, &before, &after, now_secs);
+                let provider_inputs = crate::shdeps_provider::Inputs {
+                    runtime: inputs.runtime,
+                    source_root: inputs.source_root_git,
+                    home: inputs.home,
+                    config_home: inputs.config_home,
+                    state_home: inputs.state_home,
+                    policy,
+                    force: inputs.flags.force,
+                    quiet: quiet(inputs),
+                    verbose: inputs.flags.verbose || crate::log::is_quiet(inputs.dot_verbose),
+                    update_jobs: inputs.update_jobs,
+                    palette: inputs.palette,
+                    multibyte: inputs.multibyte,
+                    ascii: inputs.ascii,
+                    bar_width: inputs.bar_width,
+                };
+                match crate::shdeps_provider::prepare(&provider_inputs, live_out, live_err) {
+                    Err(provider) if provider.interrupted.is_some() || cancelled() => {
+                        return interruption_status(provider.interrupted);
+                    }
+                    Err(provider) if provider.abort => {
+                        let _ = live_err.write_all(&provider.stderr);
+                        return 1;
+                    }
+                    Err(provider) => {
+                        if live_err.write_all(&provider.stderr).is_err() {
+                            return 1;
+                        }
+                        let open = stage.start(
+                            b"Tools",
+                            Some(b"checking configured dependencies"),
+                            now_secs,
+                            inputs.dot_verbose,
+                        );
+                        let _ = io.out.write_all(&open);
+                        let close = stage.finish(b"failed", &provider.summary, now_secs);
+                        let _ = io.out.write_all(&close);
+                        status = 1;
+                    }
+                    Ok(prepared) => {
+                        let open = stage.start(
+                            b"Tools",
+                            Some(b"checking configured dependencies"),
+                            now_secs,
+                            inputs.dot_verbose,
+                        );
+                        let _ = io.out.write_all(&open);
+                        if !flush_pending(io, live_out, live_err) {
+                            return 1;
+                        }
+                        let provider = crate::shdeps_provider::update(
+                            &provider_inputs,
+                            prepared,
+                            stage,
+                            now_secs,
+                            live_out,
+                            live_err,
+                        );
+                        if provider.interrupted.is_some() {
+                            return interruption_status(provider.interrupted);
+                        }
+                        if provider.abort || cancelled() {
+                            return interruption_status(None);
+                        }
+                        let close =
+                            stage.finish(&provider.stage_status, &provider.summary, now_secs);
+                        let _ = io.out.write_all(&close);
+                        io.out.extend_from_slice(&provider.details);
+                        if provider.status != 0 {
+                            status = 1;
+                        } else if let Some((before, after)) = provider.revision_change {
+                            if cancelled() {
+                                return 1;
+                            }
+                            return provider_reexec(
+                                inputs, io, &before, &after, now_secs, live_out, live_err,
+                            );
+                        }
+                    }
                 }
+            }
+            if cancelled() {
+                return 1;
             }
             let extensions_dir = state
                 .config
@@ -1475,28 +1546,45 @@ fn finalize(
             if merged.status != 0 {
                 status = 1;
             }
+            if cancelled() {
+                return 1;
+            }
         }
     }
-    if inputs_ready && status == 0 {
-        let ledger = state.ledger(inputs);
-        let committed = crate::profile_lifecycle::commit(&crate::profile_lifecycle::CommitInputs {
-            present: state.profiles.present,
-            extensions_enabled: state.extensions_enabled(),
-            retained: &state.retained,
-            eligible: &state.eligible_names,
-            active: &state.active,
-            ledger: Some(&ledger),
-            home: inputs.home,
-            euid: inputs.euid,
-        });
-        if !committed {
-            warn_row(
-                io.err,
-                inputs.palette,
-                "  warning: could not commit profile lifecycle state",
+    match lifecycle_publish_decision(inputs_ready, status, cancelled()) {
+        LifecyclePublish::Interrupted => return 1,
+        LifecyclePublish::Skip => {}
+        LifecyclePublish::Commit => {
+            let ledger = state.ledger(inputs);
+            let committed = crate::profile_lifecycle::commit_guarded(
+                &crate::profile_lifecycle::CommitInputs {
+                    present: state.profiles.present,
+                    extensions_enabled: state.extensions_enabled(),
+                    retained: &state.retained,
+                    eligible: &state.eligible_names,
+                    active: &state.active,
+                    ledger: Some(&ledger),
+                    home: inputs.home,
+                    euid: inputs.euid,
+                },
+                || !cancelled(),
             );
-            status = 1;
+            match committed {
+                crate::profile_lifecycle::WriteOutcome::Committed => {}
+                crate::profile_lifecycle::WriteOutcome::Cancelled => return 1,
+                crate::profile_lifecycle::WriteOutcome::Failed => {
+                    warn_row(
+                        io.err,
+                        inputs.palette,
+                        "  warning: could not commit profile lifecycle state",
+                    );
+                    status = 1;
+                }
+            }
         }
+    }
+    if cancelled() {
+        return 1;
     }
     let based = inputs.base.is_some_and(|base| base.exists());
     if based {
@@ -1521,6 +1609,9 @@ fn finalize(
         let close = stage.finish(b"ok", b"no base repo", now_secs);
         let _ = io.out.write_all(&close);
     }
+    if cancelled() {
+        return 1;
+    }
     let close = crate::progress_ui::done(
         inputs.palette,
         quiet(inputs),
@@ -1541,8 +1632,13 @@ fn provider_reexec(
     before: &str,
     after: &str,
     now_secs: i64,
+    live_out: &mut dyn std::io::Write,
+    live_err: &mut dyn std::io::Write,
 ) -> i32 {
     use std::io::Write as _;
+    if cancelled() {
+        return 1;
+    }
     if !crate::shdeps::revision_valid(before) {
         warn_row(
             io.err,
@@ -1635,6 +1731,9 @@ fn provider_reexec(
             return 1;
         }
     };
+    if cancelled() {
+        return 1;
+    }
     let gathered = match gather(
         inputs.original_args,
         &runtime,
@@ -1648,7 +1747,57 @@ fn provider_reexec(
         _ => return 1,
     };
     let nested = gathered.inputs();
-    run_gathered(&nested, io.out, io.err, now_secs)
+    if cancelled() {
+        return 1;
+    }
+    run_gathered(&nested, io.out, io.err, now_secs, live_out, live_err)
+}
+
+fn flush_pending(
+    io: &mut UpdateIo<'_>,
+    live_out: &mut dyn std::io::Write,
+    live_err: &mut dyn std::io::Write,
+) -> bool {
+    let stdout_ok = live_out.write_all(io.out).is_ok();
+    let stderr_ok = live_err.write_all(io.err).is_ok();
+    io.out.clear();
+    io.err.clear();
+    stdout_ok && stderr_ok
+}
+
+fn cancelled() -> bool {
+    crate::cleanup::received_signal().is_some()
+}
+
+fn interruption_status(signal: Option<i32>) -> i32 {
+    signal
+        .or_else(crate::cleanup::received_signal)
+        .map_or(1, |signal| 128 + signal)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecyclePublish {
+    Interrupted,
+    Commit,
+    Skip,
+}
+
+/// Decide whether staged lifecycle authority may become durable. Keeping the
+/// post-hook cancellation sample in this decision makes the narrow race where
+/// every hook succeeded but a signal arrived before commit explicit and
+/// independently testable.
+fn lifecycle_publish_decision(
+    inputs_ready: bool,
+    status: i32,
+    interrupted: bool,
+) -> LifecyclePublish {
+    if interrupted {
+        LifecyclePublish::Interrupted
+    } else if inputs_ready && status == 0 {
+        LifecyclePublish::Commit
+    } else {
+        LifecyclePublish::Skip
+    }
 }
 
 /// Effective quiet for rows the shell gates on `DOT_QUIET` (the
@@ -1814,15 +1963,7 @@ fn resolve_euid(env: &BTreeMap<OsString, OsString>) -> Option<u32> {
     if let Some(euid) = env_value(env, "EUID").and_then(|value| value.parse::<u32>().ok()) {
         return Some(euid);
     }
-    let mut command = std::process::Command::new("id");
-    command.arg("-u");
-    command.env_clear();
-    command.envs(env);
-    command
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|text| text.trim().parse::<u32>().ok())
+    Some(unsafe { libc::geteuid() })
 }
 
 /// Locale for the ASCII probe: `${LC_ALL:-${LC_CTYPE:-${LANG:-}}}`,
@@ -2059,7 +2200,14 @@ pub fn run_update(
     };
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let code = run_gathered(&gathered.inputs(), &mut out, &mut err, now_secs());
+    let code = run_gathered(
+        &gathered.inputs(),
+        &mut out,
+        &mut err,
+        now_secs(),
+        streams.stdout,
+        streams.stderr,
+    );
     let stdout_failed = streams.stdout.write_all(&out).is_err();
     let stderr_failed = streams.stderr.write_all(&err).is_err();
     if stdout_failed || stderr_failed {
@@ -2068,19 +2216,31 @@ pub fn run_update(
     code
 }
 
-/// `_dot_update` natively: flag-driven stages around [`sync_repos`]
-/// and finalization with the defensive policy reload between them.
+/// `_dot_update` natively: the cron dirty gate plus one outcome
+/// record per cron run around [`run_gathered_inner`].
+///
+/// The shell resolves cron dirt before `_ui_begin`: unresolved edits
+/// return 0 with no rows, while matching-upstream files are repaired
+/// before sync. Handoff finding #1 keeps that contract (exit 0,
+/// never fight active edits) but ends the silence: a skip appends a
+/// `skip` line to the cron outcome log and warns on stderr even in
+/// cron mode, so a frozen slot is visible without re-running.
+/// Finding #6 records `ok`/`fail` the same way on the way out and
+/// refreshes the last-success stamp on success. Interrupted runs
+/// record nothing (cancellation is not an outcome), and non-cron
+/// runs write nothing (the history-tree tests pin the state
+/// directory across plain updates).
 fn run_gathered(
     inputs: &EngineInputs<'_>,
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
     now_secs: i64,
+    live_out: &mut dyn std::io::Write,
+    live_err: &mut dyn std::io::Write,
 ) -> i32 {
-    use std::io::Write as _;
-    // The shell resolves cron dirt before `_ui_begin`: unresolved edits return
-    // 0 with no rows, while matching-upstream files are repaired before sync.
-    // These probes are intentionally silent, so the early return preserves
-    // the historical cron contract byte for byte.
+    if cancelled() {
+        return 1;
+    }
     let base = inputs
         .base
         .filter(|base| base.exists())
@@ -2089,7 +2249,50 @@ fn run_gathered(
         && crate::repos_dirty::is_worktree_dirty(base.as_deref(), inputs.entries)
         && !crate::repos_dirty::try_resolve_dirty(inputs.home, base.as_deref(), inputs.entries)
     {
+        let files = crate::repos_dirty::dirty_file_list(base.as_deref(), inputs.entries);
+        let detail = crate::update_status::format_skip_detail(&files);
+        crate::update_status::append_outcome(
+            Path::new(inputs.state_home),
+            now_secs,
+            "skip",
+            "dirty",
+            &detail,
+        );
+        warn_row(
+            err,
+            inputs.palette,
+            &format!(
+                "  warning: cron update skipped with unresolved local edits ({detail}); commit, stash, or resolve them to resume convergence"
+            ),
+        );
         return 0;
+    }
+    let rc = run_gathered_inner(inputs, out, err, now_secs, live_out, live_err);
+    if inputs.flags.cron && !cancelled() {
+        let state_home = Path::new(inputs.state_home);
+        if rc == 0 {
+            crate::update_status::append_outcome(state_home, now_secs, "ok", "update", "");
+            crate::update_status::record_success(state_home, now_secs);
+        } else {
+            crate::update_status::append_outcome(state_home, now_secs, "fail", "update", "");
+        }
+    }
+    rc
+}
+
+/// `_dot_update` natively: flag-driven stages around [`sync_repos`]
+/// and finalization with the defensive policy reload between them.
+fn run_gathered_inner(
+    inputs: &EngineInputs<'_>,
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+    now_secs: i64,
+    live_out: &mut dyn std::io::Write,
+    live_err: &mut dyn std::io::Write,
+) -> i32 {
+    use std::io::Write as _;
+    if cancelled() {
+        return 1;
     }
     // `_ui_begin 5`: the update always runs counted (the assignment
     // overwrites any ambient total, like the shell).
@@ -2103,6 +2306,9 @@ fn run_gathered(
     );
     let mut moves = crate::temp::MoveCache::default();
     let mut sync = sync_repos(inputs, &mut stage, &mut moves, out, err, now_secs);
+    if cancelled() {
+        return 1;
+    }
     if sync.rc != 0 {
         let mut io = UpdateIo { out, err };
         let rc = finalize(
@@ -2113,6 +2319,8 @@ fn run_gathered(
             now_secs,
             1,
             sync.frozen,
+            live_out,
+            live_err,
         );
         return rc;
     }
@@ -2137,6 +2345,9 @@ fn run_gathered(
             return 1;
         }
     }
+    if cancelled() {
+        return 1;
+    }
     let mut io = UpdateIo { out, err };
     finalize(
         inputs,
@@ -2146,6 +2357,8 @@ fn run_gathered(
         now_secs,
         0,
         sync.frozen,
+        live_out,
+        live_err,
     )
 }
 
@@ -2243,6 +2456,14 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn signal_after_successful_hooks_prevents_lifecycle_publish() {
+        assert_eq!(
+            lifecycle_publish_decision(true, 0, true),
+            LifecyclePublish::Interrupted
+        );
     }
 
     #[test]

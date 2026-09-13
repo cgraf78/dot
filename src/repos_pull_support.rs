@@ -37,60 +37,56 @@ pub fn conflicts_from_log(log: &str) -> Vec<String> {
     files
 }
 
-/// Current `%Y%m%d%H%M%S` stamp from `date`, exactly like the shell:
-/// `std` has no timezone-aware calendar, and forking `date` costs
-/// the same fork the shell pays. `None` when `date` fails (callers
-/// degrade exactly like the shell's empty substitution).
+/// Current local `%Y%m%d%H%M%S` stamp without launching a helper.
 fn date_stamp() -> Option<String> {
-    std::process::Command::new("date")
-        .arg("+%Y%m%d%H%M%S")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .trim_end()
-                .to_string()
-        })
+    crate::temp::local_timestamp()
 }
 
 /// `_backup_dir`: create `$HOME/.dot-backup/pull/<stamp>` and report
-/// it (`Some`), falling back to `mktemp -d` when the stamped name
+/// it (`Some`), falling back to an exclusive randomized sibling when the stamped name
 /// collides and to `None` when nothing is creatable — the shell's
 /// `REPLY=""` plus exit 1. A failed `date` degrades exactly like the
 /// shell's empty command substitution (the join keeps the root, whose
 /// `mkdir` then succeeds on the existing directory).
 ///
 /// The shell's first `mkdir -p` is unguarded, so its diagnostics leak
-/// to stderr while creation continues below; the port forks the same
-/// tool and forwards those bytes to `warnings` verbatim (the
-/// `date_stamp` precedent: forking costs what the shell pays and keeps
-/// the bytes identical). The stamped `mkdir` and the `mktemp`
-/// fallback stay suppressed on both sides.
+/// to stderr while creation continues below; the owned helper forwards those
+/// bytes to `warnings`. The stamped and randomized leaf attempts stay
+/// suppressed on both sides.
 pub fn backup_dir(home: &str, warnings: &mut dyn std::io::Write) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
     use std::path::Path;
+    crate::cancellation::check().ok()?;
     let root = Path::new(home).join(".dot-backup/pull");
     // Unguarded like the shell: diagnostics leak while creation
     // continues below.
     crate::temp::mkdir_forwarded(&root, warnings);
     let stamp = date_stamp().unwrap_or_default();
     let backup = root.join(stamp);
-    if std::fs::create_dir(&backup).is_ok() {
+    crate::cancellation::check().ok()?;
+    if std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&backup)
+        .is_ok()
+    {
         return Some(backup);
     }
-    let template = format!("{}.XXXXXX", backup.display());
-    std::process::Command::new("mktemp")
-        .args(["-d", &template])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            std::path::PathBuf::from(
-                String::from_utf8_lossy(&output.stdout)
-                    .trim_end()
-                    .to_string(),
-            )
-        })
+    for _ in 0..crate::temp::TMP_RETRIES {
+        if crate::cancellation::check().is_err() {
+            return None;
+        }
+        let candidate = root.join(format!(
+            "{}.{}",
+            backup.file_name()?.to_string_lossy(),
+            crate::temp::random_suffix()
+        ));
+        match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
+            Ok(()) => return Some(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// `_pull_cmd`: run `program` with `args` under `LC_ALL=C`, appending
@@ -106,17 +102,14 @@ pub fn pull_cmd(quiet: bool, program: &str, args: &[&str]) -> i32 {
     if quiet {
         argv.push("--quiet");
     }
-    match std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(&argv)
         .env("LC_ALL", "C")
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-    {
-        Ok(status) => status.code().unwrap_or(127),
-        Err(_) => 127,
-    }
+        .stderr(std::process::Stdio::inherit());
+    crate::cleanup::run_foreground_status(command)
 }
 
 /// `_pull_overlay_result_prefix`: `<dir>/<idx>` with the worker

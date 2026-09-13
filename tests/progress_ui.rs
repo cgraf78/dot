@@ -211,7 +211,10 @@ fn progress_bars_and_details_cover_numeric_edges() {
         (1, 4, "4", true, "[#---] 1/4"),
         (4, 4, "4", true, "[####] 4/4"),
         (5, 4, "4", true, "[####] 5/4"),
-        (-1, 4, "4", true, "[-----] -1/4"),
+        // Negative progress renders an empty bar at exactly `width` cells
+        // (moved from the over-wide `[-----]` by the P2-1 clamp: the bar
+        // must never exceed its width, whatever `done` arrives).
+        (-1, 4, "4", true, "[----] -1/4"),
         (1, 4, "0", true, "[] 1/4"),
         (1, 4, "+4", true, "[#---] 1/4"),
         (1, 4, "bad", true, ""),
@@ -234,6 +237,32 @@ fn progress_bars_and_details_cover_numeric_edges() {
         b"pull               [##--] 2/4"
     );
     assert!(progress_detail(b"pull", 0, 0, "4", true, false).is_empty());
+}
+
+#[test]
+fn progress_bar_bounds_hostile_done_values() {
+    // Fresh-review-B P2-1 RED pin: `done` arrives from untrusted provider
+    // JSONL with the full i64 range. The bar must stay within `width`
+    // cells: no overflow panic, no hang, no terabyte allocation.
+    assert_eq!(
+        progress_bar(i64::MIN, 1, "10", true),
+        b"[----------] -9223372036854775808/1"
+    );
+    assert_eq!(progress_bar(-1, 1, "10", true), b"[----------] -1/1");
+    assert_eq!(progress_bar(-1, 4, "4", true), b"[----] -1/4");
+    for done in [i64::MIN, i64::MIN + 1, -9_000_000_000_000, -1, 0] {
+        let bar = progress_bar(done, 1, "18", true);
+        assert!(
+            bar.len() < 100,
+            "negative done {done} escaped the width bound ({} bytes)",
+            bar.len()
+        );
+    }
+    // Overfull progress still saturates at a full bar (existing contract).
+    assert_eq!(
+        progress_bar(i64::MAX, 1, "4", true),
+        b"[####] 9223372036854775807/1"
+    );
 }
 
 #[test]

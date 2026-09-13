@@ -31,7 +31,6 @@
 //! plain string. `REPLY` outputs surface as return values.
 
 use std::ffi::OsString;
-use std::io::Write as _;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -141,9 +140,11 @@ fn chomp_newlines(bytes: &[u8]) -> &[u8] {
 /// nothing usable — the shell's `|| return 1` / empty-substitution
 /// failure modes.
 fn run_git_dir(git_dir: &Path, args: &[&str], stdin_bytes: Option<&[u8]>) -> Option<Vec<u8>> {
+    crate::cancellation::check().ok()?;
     let mut dir_arg = OsString::from("--git-dir=");
     dir_arg.push(git_dir);
-    let mut child = crate::init_client_identity::host_git_command()
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg(dir_arg)
         .args(args)
         .env("LC_ALL", "C")
@@ -153,13 +154,24 @@ fn run_git_dir(git_dir: &Path, args: &[&str], stdin_bytes: Option<&[u8]>) -> Opt
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    if let Some(payload) = stdin_bytes {
-        child.stdin.as_mut()?.write_all(payload).ok()?;
+        .stderr(Stdio::null());
+    let output = match stdin_bytes {
+        Some(payload) => crate::cleanup::run_session_output_with_input(
+            command,
+            payload,
+            None,
+            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+            crate::cleanup::LingerPolicy::Strict,
+        ),
+        None => crate::cleanup::run_session_output(
+            command,
+            None,
+            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+            crate::cleanup::LingerPolicy::Strict,
+        ),
     }
-    let output = child.wait_with_output().ok()?;
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -170,31 +182,26 @@ fn run_git_dir(git_dir: &Path, args: &[&str], stdin_bytes: Option<&[u8]>) -> Opt
 /// store-independent, so no `--git-dir`): the shell's
 /// `printf ... | git hash-object --stdin`.
 fn hash_stdin_bytes(payload: &[u8]) -> Result<String> {
-    let mut child = crate::init_client_identity::host_git_command()
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .args(["hash-object", "--stdin"])
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|source| Error::Io {
-            context: "spawn git hash-object",
-            source,
-        })?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or(Error::Usage {
-            message: "git hash-object has no stdin",
-        })?
-        .write_all(payload)
-        .map_err(|source| Error::Io {
-            context: "feed git hash-object",
-            source,
-        })?;
-    let output = child.wait_with_output().map_err(|source| Error::Io {
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output_with_input(
+        command,
+        payload,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .map_err(|source| Error::Io {
         context: "reap git hash-object",
         source,
+    })?;
+    crate::cancellation::check().map_err(|_| Error::Usage {
+        message: "git hash-object interrupted",
     })?;
     if !output.status.success() {
         return Err(Error::Command {
@@ -330,19 +337,27 @@ pub fn candidate_matches_git(
 /// `git --git-dir=<git_dir> hash-object --no-filters -- <target>`,
 /// chomped like the shell's `actual_oid=$(...)`.
 fn hash_live_file(git_dir: &Path, target: &Path) -> Option<String> {
+    crate::cancellation::check().ok()?;
     let target = target.as_os_str().to_os_string();
     let mut dir_arg = OsString::from("--git-dir=");
     dir_arg.push(git_dir);
-    let output = crate::init_client_identity::host_git_command()
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg(dir_arg)
         .args(["hash-object", "--no-filters", "--"])
         .arg(target)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }

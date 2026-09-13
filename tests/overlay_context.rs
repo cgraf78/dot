@@ -20,7 +20,7 @@ fn private_dir(tag: &str) -> TempDir {
     dir
 }
 fn records(home: &str) -> Vec<Vec<u8>> {
-    vec![format!("work|{home}/.dotfiles-work|https://example.test/work.git|{home}/.config/dot/overlays.d/10-work.conf|false|git").into_bytes()]
+    vec![format!("overlay|{home}/.dotfiles-overlay|https://example.test/overlay.git|{home}/.config/dot/overlays.d/10-overlay.conf|false|git").into_bytes()]
 }
 fn frame(
     token: &str,

@@ -243,7 +243,10 @@ pub(crate) fn process_owner_root(executable: &Path) -> std::io::Result<PathBuf> 
     executable_owner_root(executable)
 }
 
-pub(crate) fn informational_command(command: &[u8]) -> bool {
+/// Whether a command form is informational (`help`, `version`, and aliases).
+/// The binary entry point uses this to bypass the output relay for
+/// informational commands; dispatch applies the same predicate.
+pub fn informational_command(command: &[u8]) -> bool {
     matches!(
         command,
         b"" | b"help" | b"-h" | b"--help" | b"version" | b"--version"
@@ -278,7 +281,13 @@ pub fn observed_revision(source_root: &Path) -> Option<String> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let output = cmd.output().ok()?;
+    let output = crate::cleanup::run_session_output(
+        cmd,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -836,5 +845,44 @@ mod tests {
             err,
             "dot: config: HOME does not provide an absolute config root"
         );
+    }
+
+    #[test]
+    fn reexec_guard_still_probes_with_expected_revision() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = TempDir::new("reexec-probe").expect("scratch");
+        let marker = scratch.path().join("git-called");
+        let fake = scratch.path().join("git");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\n: >\"{}\"\nexit 1\n", marker.display()),
+        )
+        .expect("fake git");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .expect("fake git mode");
+        let env = std::collections::BTreeMap::from([
+            (
+                std::ffi::OsString::from("DOT_SOURCE_ROOT"),
+                scratch.path().as_os_str().to_owned(),
+            ),
+            (
+                std::ffi::OsString::from("DOT_REEXEC_EXPECTED_REVISION"),
+                std::ffi::OsString::from("deadbeef"),
+            ),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, scratch.path()).expect("runtime");
+        let _git = crate::init_client_identity::bind_host_git_for_scope(&fake);
+        let result = check_reexec(&runtime);
+        assert!(
+            marker.exists(),
+            "expected revision did not probe the checkout"
+        );
+        match result {
+            Err(Failure::Reexec { line }) => assert!(
+                line.contains("<missing>"),
+                "failing probe must report <missing>: {line}"
+            ),
+            other => panic!("expected reexec mismatch, got {other:?}"),
+        }
     }
 }

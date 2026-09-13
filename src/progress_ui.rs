@@ -381,27 +381,23 @@ pub fn live_enabled(quiet: bool, stdout_is_tty: bool, force_live: Option<&str>) 
 /// success — empty when `jq` cannot spawn or the filter fails (the
 /// shell's `2>/dev/null` plus empty-on-error contract).
 fn json_via_jq(key: &str, line: &[u8], filter: &str) -> Vec<u8> {
-    use std::io::Write as _;
-    let mut child = match std::process::Command::new("jq")
+    let mut command = std::process::Command::new("jq");
+    command
         .arg("-r")
         .arg("--arg")
         .arg("k")
         .arg(key)
         .arg(filter)
-        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return Vec::new(),
-    };
-    let fed = child
-        .stdin
-        .as_mut()
-        .is_some_and(|stdin| stdin.write_all(line).is_ok());
-    match child.wait_with_output() {
-        Ok(output) if fed && output.status.success() => output.stdout,
+        .stderr(std::process::Stdio::null());
+    match crate::cleanup::run_session_output_with_input(
+        command,
+        line,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    ) {
+        Ok(output) if output.status.success() => output.stdout,
         _ => Vec::new(),
     }
 }
@@ -735,9 +731,31 @@ fn parse_width(text: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
+/// Replace ASCII control bytes and DEL with spaces so untrusted text
+/// (provider event strings, dirty filenames) cannot break line
+/// protocols or inject terminal escapes at the render boundary.
+/// Non-ASCII bytes pass through untouched, preserving UTF-8 labels.
+pub fn sanitize_untrusted_text(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_control() || *byte == 0x7f {
+                b' '
+            } else {
+                *byte
+            }
+        })
+        .collect()
+}
+
 /// `_ui_progress_bar`: `[###---] done/total` with ASCII or block
 /// glyphs. A non-positive total prints nothing; a malformed width
 /// reads empty the way the shell arithmetic error does.
+///
+/// `done` arrives from untrusted provider JSONL with the full `i64`
+/// range, so the fill math saturates and clamps to `[0, width]`:
+/// a hostile or underflowed negative can never hang, OOM, or panic
+/// this renderer (the bar stays within its width cells).
 pub fn progress_bar(done: i64, total: i64, width: &str, ascii: bool) -> Vec<u8> {
     if total <= 0 {
         return Vec::new();
@@ -746,17 +764,18 @@ pub fn progress_bar(done: i64, total: i64, width: &str, ascii: bool) -> Vec<u8> 
         Some(width) => width,
         None => return Vec::new(),
     };
-    let mut filled = done * width as i64 / total;
-    if filled > width as i64 {
-        filled = width as i64;
-    }
-    let empty = width as i64 - filled;
+    let width_cells = width as i64;
+    let filled = done
+        .saturating_mul(width_cells)
+        .saturating_div(total)
+        .clamp(0, width_cells);
+    let empty = width_cells - filled;
     let (fill_char, empty_char) = if ascii { ("#", "-") } else { ("━", "·") };
     let mut bar = String::new();
-    for _ in 0..filled.max(0) {
+    for _ in 0..filled {
         bar.push_str(fill_char);
     }
-    for _ in 0..empty.max(0) {
+    for _ in 0..empty {
         bar.push_str(empty_char);
     }
     let done_text = done.to_string();

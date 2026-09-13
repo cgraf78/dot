@@ -57,14 +57,16 @@ fn summary_text_has_exact_order_plural_quirks_and_fallbacks() {
 #[test]
 fn state_records_deduplicate_append_overwrite_and_preserve_raw_keys() {
     let mut state = State::new();
-    state.remember_group(b"cargo");
-    state.remember_group(b"cargo");
-    state.remember_group(b"go");
+    state.remember_group(b"cargo").unwrap();
+    state.remember_group(b"cargo").unwrap();
+    state.remember_group(b"go").unwrap();
     assert_eq!(state.order(), [b"cargo".to_vec(), b"go".to_vec()]);
 
     let mut state = State::new();
-    state.record_item(b"cargo", b"changed", b"ripgrep", b"fast search");
-    state.record_item(b"cargo", b"failed", b"", b"");
+    state
+        .record_item(b"cargo", b"changed", b"ripgrep", b"fast search")
+        .unwrap();
+    state.record_item(b"cargo", b"failed", b"", b"").unwrap();
     assert_eq!(state.order(), [b"cargo".to_vec()]);
     assert_eq!(
         state.items_blob(b"cargo"),
@@ -74,16 +76,22 @@ fn state_records_deduplicate_append_overwrite_and_preserve_raw_keys() {
     assert_eq!(state.display_label(b"cargo"), b"Cargo");
 
     let mut state = State::new();
-    state.remember_group(b"");
-    state.record_item(b"", b"ok", b"mystery", b"no group");
-    state.record_group_summary(b"", b"", b"ok", 0, 3, 0, 0, b"10", 0);
+    state.remember_group(b"").unwrap();
+    state
+        .record_item(b"", b"ok", b"mystery", b"no group")
+        .unwrap();
+    state
+        .record_group_summary(b"", b"", b"ok", 0, 3, 0, 0, b"10", 0)
+        .unwrap();
     assert!(state.order().is_empty());
     assert_eq!(state.items_blob(b""), None);
     assert_eq!(state.summary_blob(b""), None);
     assert_eq!(state.display_label(b""), b"Other");
 
     let mut state = State::new();
-    state.record_group_summary(b"cargo", b"", b"changed", 1, 2, 0, 0, b"1500", 0);
+    state
+        .record_group_summary(b"cargo", b"", b"changed", 1, 2, 0, 0, b"1500", 0)
+        .unwrap();
     assert_eq!(state.display_label(b"cargo"), b"Cargo");
     assert_eq!(
         state.summary_blob(b"cargo"),
@@ -91,8 +99,12 @@ fn state_records_deduplicate_append_overwrite_and_preserve_raw_keys() {
     );
 
     let mut state = State::new();
-    state.record_group_summary(b"pip", b"Pip Extra", b"ok", 0, 9, 0, 0, b"", 0);
-    state.record_group_summary(b"brew", b"", b"ok", 0, 3, 0, 0, b"200", 0);
+    state
+        .record_group_summary(b"pip", b"Pip Extra", b"ok", 0, 9, 0, 0, b"", 0)
+        .unwrap();
+    state
+        .record_group_summary(b"brew", b"", b"ok", 0, 3, 0, 0, b"200", 0)
+        .unwrap();
     assert_eq!(state.order(), [b"pip".to_vec(), b"brew".to_vec()]);
     assert_eq!(state.display_label(b"pip"), b"Pip Extra");
     assert_eq!(
@@ -106,17 +118,27 @@ fn state_records_deduplicate_append_overwrite_and_preserve_raw_keys() {
     );
 
     let mut state = State::new();
-    state.record_group_summary(b"uv", b"", b"warning", 0, 1, 0, 0, b"42", 0);
+    state
+        .record_group_summary(b"uv", b"", b"warning", 0, 1, 0, 0, b"42", 0)
+        .unwrap();
     assert_eq!(
         state.summary_blob(b"uv"),
         Some(b"warning\tUV: 1 current\t42".as_slice())
     );
 
     let mut state = State::new();
-    state.record_item(b"npm", b"changed", b"left-pad", b"new api");
-    state.record_group_summary(b"npm", b"", b"changed", 1, 4, 0, 0, b"900", 0);
-    state.record_item(b"npm", b"failed", b"right-pad", b"rate limited");
-    state.record_group_summary(b"npm", b"NPM", b"failed", 1, 4, 0, 1, b"950", 0);
+    state
+        .record_item(b"npm", b"changed", b"left-pad", b"new api")
+        .unwrap();
+    state
+        .record_group_summary(b"npm", b"", b"changed", 1, 4, 0, 0, b"900", 0)
+        .unwrap();
+    state
+        .record_item(b"npm", b"failed", b"right-pad", b"rate limited")
+        .unwrap();
+    state
+        .record_group_summary(b"npm", b"NPM", b"failed", 1, 4, 0, 1, b"950", 0)
+        .unwrap();
     assert_eq!(state.order(), [b"npm".to_vec()]);
     assert_eq!(
         state.items_blob(b"npm"),
@@ -129,8 +151,8 @@ fn state_records_deduplicate_append_overwrite_and_preserve_raw_keys() {
     assert_eq!(state.display_label(b"other"), b"Other");
 
     let mut state = State::new();
-    state.remember_group(b"\xff-group");
-    state.record_item(b"\xff-group", b"ok", b"n", b"d");
+    state.remember_group(b"\xff-group").unwrap();
+    state.record_item(b"\xff-group", b"ok", b"n", b"d").unwrap();
     assert_eq!(state.order(), [b"\xff-group".to_vec()]);
     assert_eq!(
         state.items_blob(b"\xff-group"),

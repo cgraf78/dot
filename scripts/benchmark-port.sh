@@ -1387,7 +1387,7 @@ perf_validate_summary() {
   local -a workloads=(first-spawn help version base-clean disjoint-clean \
     disjoint-dirty profile-provider-hooks-collision pre-sync-failure)
   local -a sample_counts=(1 30 30 30 30 30 30 30)
-  local -a percentages=('' 75 75 75 75 75 75 75)
+  local -a percentages=('' 75 75 95 75 75 75 75)
   local -a budgets=(100000000 24075000 23850000 4000000000 1602500000 \
     2010000000 12000000000 4000000000)
 

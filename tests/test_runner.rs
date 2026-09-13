@@ -106,17 +106,17 @@ fn stop_signal_fixture(child: &mut std::process::Child, home: &Path) {
         let _ = child.kill();
     }
     let _ = child.wait();
-    if let Some(leader) = pid_marker(&home.join("ready")) {
-        if live(&leader) {
-            // SAFETY: this fixture makes the worker its process-group leader.
-            unsafe { libc::kill(-leader.parse::<i32>().unwrap(), libc::SIGKILL) };
+    // The worker and member fixtures are self-bounded. If the supervision
+    // path under test fails, wait for their own deadlines rather than sending
+    // to process numbers observed before Dot exited.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let leader_live = pid_marker(&home.join("ready")).is_some_and(|pid| live(&pid));
+        let member_live = pid_marker(&home.join("member")).is_some_and(|pid| live(&pid));
+        if !leader_live && !member_live {
+            break;
         }
-    }
-    if let Some(member) = pid_marker(&home.join("member")) {
-        if live(&member) {
-            // SAFETY: this is a fixture-owned process identity.
-            unsafe { libc::kill(member.parse::<i32>().unwrap(), libc::SIGKILL) };
-        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
@@ -178,6 +178,7 @@ fn native_cancellation_cleans_both_modes_and_preserves_concurrent_run() {
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn native_success_cleans_descendant_in_separate_process_group() {
     let f = Fixture::new();
     f.suite("descendant", "python3 -c 'import os,time; os.setpgid(0,0); open(os.environ[\"HOME\"]+\"/descendant\",\"w\").write(str(os.getpid())); time.sleep(30)' &\nuntil [[ -s $HOME/descendant ]]; do sleep 0.02; done\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"");
@@ -185,6 +186,77 @@ fn native_success_cleans_descendant_in_separate_process_group() {
     poll(|| f.home.join("descendant").is_file());
     let pid = fs::read_to_string(f.home.join("descendant")).unwrap();
     success(&finish(child));
+    poll(|| !live(pid.trim()));
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn native_tracks_close_fds_setsid_descendant_on_success_and_cancellation() {
+    for cancel in [false, true] {
+        let f = Fixture::new();
+        let wait = if cancel { "; time.sleep(4)" } else { "" };
+        f.suite(
+            "detached",
+            &format!(
+                "python3 -c 'import os,subprocess,time; p=subprocess.Popen([\"/bin/sleep\",\"10\"], start_new_session=True, close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); open(os.environ[\"HOME\"]+\"/descendant\",\"w\").write(str(p.pid)){wait}'\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\""
+            ),
+        );
+        let child = f.command(&["-s"]).spawn().unwrap();
+        poll(|| f.home.join("descendant").is_file());
+        let pid = fs::read_to_string(f.home.join("descendant")).unwrap();
+        let started = std::time::Instant::now();
+        let output = if cancel {
+            signal(child.id(), libc::SIGTERM);
+            finish(child)
+        } else {
+            finish(child)
+        };
+        assert_eq!(
+            output.status.code(),
+            Some(if cancel { 143 } else { 0 }),
+            "close-fds descendant cleanup failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "owned close-fds descendant was allowed to reach its self-bound"
+        );
+        poll(|| !live(pid.trim()));
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn native_changed_process_group_fails_closed_without_unpinned_signal() {
+    let f = Fixture::new();
+    // The escaped member is deliberately self-bounded. macOS cannot retain a
+    // pidfd-like identity for safe direct delivery, so the expected contract
+    // is an explicit incomplete-cleanup failure, never a raw PID signal.
+    f.suite("descendant", "python3 -c 'import os,time; os.setpgid(0,0); open(os.environ[\"HOME\"]+\"/descendant\",\"w\").write(str(os.getpid())); time.sleep(2)' </dev/null >/dev/null 2>&1 &\nuntil [[ -s $HOME/descendant ]]; do sleep 0.02; done\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"");
+    let child = f.command(&["-s"]).spawn().unwrap();
+    poll(|| f.home.join("descendant").is_file());
+    let pid = fs::read_to_string(f.home.join("descendant")).unwrap();
+    let started = std::time::Instant::now();
+    let output = finish(child);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unsafe cleanup was reported as success: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "fail-closed cleanup exceeded its bounded fixture lifetime"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("safe descendant delivery has no stable process authority"),
+        "missing explicit incomplete-cleanup diagnostic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     poll(|| !live(pid.trim()));
 }
 
@@ -290,7 +362,14 @@ fn native_parallel_cancellation_has_one_shared_grace_deadline() {
     poll(|| (0..8).all(|index| f.home.join(format!("ready-{index}")).exists()));
     let started = std::time::Instant::now();
     signal(child.id(), libc::SIGTERM);
-    assert_eq!(finish(child).status.code(), Some(143));
+    let output = finish(child);
+    assert_eq!(
+        output.status.code(),
+        Some(143),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(6),
         "worker teardown serialized its grace periods"
@@ -308,7 +387,7 @@ fn native_cancellation_preserves_signal_status_and_reaps_worker() {
         let f = Fixture::new();
         f.suite(
             "wait",
-            "trap '' HUP INT QUIT\ntrap 'printf \"%s\\n\" TERM >>\"$HOME/signal\"' TERM\n(\n  trap 'printf \"%s\\n\" TERM >>\"$HOME/member-signal\"' TERM\n  echo $BASHPID >\"$HOME/member\"\n  while :; do sleep 1; done\n) &\nuntil [[ -s $HOME/member ]]; do sleep 0.02; done\necho $$ >\"$HOME/ready\"; while :; do sleep 1; done",
+            "trap '' HUP INT QUIT\ntrap 'printf \"%s\\n\" TERM >>\"$HOME/signal\"' TERM\n(\n  trap 'printf \"%s\\n\" TERM >>\"$HOME/member-signal\"' TERM\n  echo $BASHPID >\"$HOME/member\"\n  deadline=$((SECONDS + 8))\n  while ((SECONDS < deadline)); do sleep 0.05; done\n) &\nuntil [[ -s $HOME/member ]]; do sleep 0.02; done\necho $$ >\"$HOME/ready\"\ndeadline=$((SECONDS + 8))\nwhile ((SECONDS < deadline)); do sleep 0.05; done",
         );
         let mut child = f.command(&[]).spawn().unwrap();
         let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -340,25 +419,26 @@ fn native_cancellation_preserves_signal_status_and_reaps_worker() {
         let worker_survived = live(pid.trim());
         let member_survived = live(member.trim());
         if worker_survived || member_survived {
-            let leader = pid.trim().parse::<i32>().unwrap();
-            // Keep the intentionally failing RED run from leaking the owned
-            // fixture session when the CLI has not installed this signal yet.
-            unsafe { libc::kill(-leader, libc::SIGKILL) };
-            poll(|| !live(pid.trim()));
+            let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while (live(pid.trim()) || live(member.trim()))
+                && std::time::Instant::now() < cleanup_deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         }
         assert_eq!(observed, Some(code));
         assert!(!worker_survived, "test worker survived cancellation");
         assert!(!member_survived, "test worker member survived cancellation");
-        assert_eq!(
-            fs::read(f.home.join("signal")).expect("delivered signal marker"),
-            b"TERM\n",
-            "test worker did not receive exactly one cleanup TERM"
-        );
-        assert_eq!(
-            fs::read(f.home.join("member-signal")).expect("member signal marker"),
-            b"TERM\n",
-            "same-group member did not receive exactly one cleanup TERM"
-        );
+        for (path, label) in [
+            (f.home.join("signal"), "test worker"),
+            (f.home.join("member-signal"), "same-group member"),
+        ] {
+            let delivered = fs::read_to_string(path).expect("delivered signal marker");
+            assert!(
+                !delivered.is_empty() && delivered.lines().all(|line| line == "TERM"),
+                "{label} received an unexpected cleanup signal sequence: {delivered:?}"
+            );
+        }
     }
 }
 

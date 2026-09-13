@@ -190,6 +190,9 @@ fn log_row(out: &mut Vec<u8>, inputs: &Inputs<'_>, text: &str) {
 /// repository (the caller never asks then, like the empty shell
 /// map); failure is the shell `|| return 1`.
 fn skip_worktree(base: Option<&Base>, rel: &str) -> bool {
+    if crate::cleanup::received_signal().is_some() {
+        return false;
+    }
     let Some(base) = base else {
         return false;
     };
@@ -240,6 +243,9 @@ fn link_one(
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
 ) -> Option<FileStep> {
+    if crate::cleanup::received_signal().is_some() {
+        return None;
+    }
     let verbose = is_verbose(inputs.dot_verbose);
     let prefix = format!("{}/", inputs.overlay_home);
     let rel_bytes = src.strip_prefix(prefix.as_bytes()).unwrap_or(src);
@@ -309,7 +315,9 @@ fn link_one(
         .map(|parent| parent.to_string_lossy().into_owned())
         .unwrap_or_default();
     let parent_is_dir = std::fs::metadata(&dst_parent).is_ok_and(|meta| meta.is_dir());
-    if !parent_is_dir && !crate::repos_overlays::ensure_destination_parent(inputs.home, &dst_parent)
+    if !parent_is_dir
+        && (crate::cleanup::received_signal().is_some()
+            || !crate::repos_overlays::ensure_destination_parent(inputs.home, &dst_parent))
     {
         return None;
     }
@@ -345,7 +353,12 @@ fn link_one(
                 );
                 return None;
             }
-            if tracked && !skip_worktree(inputs.base, rel) {
+            if crate::cleanup::received_signal().is_some()
+                || (tracked && !skip_worktree(inputs.base, rel))
+            {
+                return None;
+            }
+            if crate::cleanup::received_signal().is_some() {
                 return None;
             }
             if !crate::repos_overlays::record_final(
@@ -479,10 +492,12 @@ fn link_one(
         tmp: inputs.tmp,
         tool: inputs.tool,
     };
-    if !crate::repos_overlays::publish_link(&publish) {
+    if crate::cleanup::received_signal().is_some() || !crate::repos_overlays::publish_link(&publish)
+    {
         return None;
     }
-    if tracked && !skip_worktree(inputs.base, rel) {
+    if crate::cleanup::received_signal().is_some() || (tracked && !skip_worktree(inputs.base, rel))
+    {
         return None;
     }
     if link_rows_visible(inputs.ui_total, verbose) {
@@ -492,13 +507,15 @@ fn link_one(
             log_row(out, inputs, &format!("  linked: {rel}"));
         }
     }
-    if !crate::repos_overlays::record_final(
-        rel,
-        inputs.name,
-        &target,
-        inputs.manifest_new,
-        &mut state.current,
-    ) {
+    if crate::cleanup::received_signal().is_some()
+        || !crate::repos_overlays::record_final(
+            rel,
+            inputs.name,
+            &target,
+            inputs.manifest_new,
+            &mut state.current,
+        )
+    {
         return None;
     }
     Some(FileStep::Linked)
@@ -528,6 +545,9 @@ pub fn link_overlay(
     let mut cache = AuthorityCache::disabled();
     let mut linked: u64 = 0;
     for src in inventory_records(inventory) {
+        if crate::cleanup::received_signal().is_some() {
+            return Outcome::Failed;
+        }
         let step = match link_one(inputs, state, &mut cache, src, out, err) {
             // The shell `|| return 1` after `_link_overlay` fails
             // the whole overlay on the first failing entry.

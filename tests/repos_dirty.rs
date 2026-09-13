@@ -374,3 +374,34 @@ fn normalize_filtered_visits_base_and_git_overlays_only() {
         .unwrap();
     assert_eq!(local_noise.stdout, b"tracked\n");
 }
+#[test]
+fn dirty_file_list_names_base_files_and_prefixes_overlays() {
+    let b = repo("dirty-list-base");
+    let o = repo("dirty-list-overlay");
+    assert!(repos_dirty::dirty_file_list(Some(&prefix(b.path())), &[]).is_empty());
+    assert!(repos_dirty::dirty_file_list(None, &[]).is_empty());
+    std::fs::write(b.path().join("tracked"), b"base edit").unwrap();
+    assert_eq!(
+        repos_dirty::dirty_file_list(Some(&prefix(b.path())), &[]),
+        vec!["tracked".to_string()]
+    );
+    std::fs::write(o.path().join("tracked"), b"overlay edit").unwrap();
+    let records = vec![format!("o|{}||||git", o.path().display())];
+    assert_eq!(
+        repos_dirty::dirty_file_list(Some(&prefix(b.path())), &records),
+        vec![
+            "tracked".to_string(),
+            format!("{}/tracked", o.path().display()),
+        ]
+    );
+    // Non-git overlays and missing worktrees contribute nothing.
+    for records in [
+        vec![format!("local|{}||||none", o.path().display())],
+        vec!["missing|/missing||||git".to_string()],
+    ] {
+        assert_eq!(
+            repos_dirty::dirty_file_list(None, &records),
+            Vec::<String>::new(),
+        );
+    }
+}

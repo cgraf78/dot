@@ -70,7 +70,7 @@ pub fn each_existing(
 }
 
 /// Run `git` with `prefix` plus `args`, streaming to the terminal:
-/// stdin null, stdout/stderr inherited. No `run_git`-style capture
+/// stdin/stdout/stderr inherited. No `run_git`-style capture
 /// exists with inherited stdio anywhere in `src/`, so this runner
 /// lives here beside its callers. Returns the exit code; a spawn
 /// failure (no `git` on `PATH`) returns 127.
@@ -78,13 +78,10 @@ pub fn run_git_streaming(prefix: &[OsString], args: &[&str]) -> i32 {
     let mut cmd = crate::init_client_identity::host_git_command();
     cmd.args(prefix)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    match cmd.status() {
-        Ok(status) => status.code().unwrap_or(127),
-        Err(_) => 127,
-    }
+    crate::cleanup::run_foreground_status(cmd)
 }
 
 /// `_repo_git`: execute `git` for one repo record. A base record
@@ -129,6 +126,9 @@ pub fn repo_git_fetch(base: &Base, kind: RepoKind, path: &str, extra: &[&str], m
     fetch.push("fetch");
     fetch.extend_from_slice(extra);
     let rc = repo_git(base, kind, path, &fetch);
+    if crate::cleanup::received_signal().is_some() {
+        return rc;
+    }
     let prefix: Vec<OsString> = match kind {
         RepoKind::Base => match base.git_prefix() {
             Some(prefix) => prefix,

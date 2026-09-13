@@ -259,7 +259,9 @@ fn commit_valid(commit: &[u8]) -> bool {
 /// for the bare substitution in the `case`, like its empty expansion.
 /// Git's own stderr is silenced (the candidate lane precedent).
 fn git_dir_output(git_dir: &Path, home: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = crate::init_client_identity::host_git_command()
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("--git-dir")
         .arg(git_dir)
         .args(args)
@@ -267,9 +269,17 @@ fn git_dir_output(git_dir: &Path, home: &Path, args: &[&str]) -> Option<Vec<u8>>
         .env("HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        // Pinned deterministic leaf: Detach skips the host-wide completion scan;
+        // cancellation still takes the strict path.
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -280,7 +290,9 @@ fn git_dir_output(git_dir: &Path, home: &Path, args: &[&str]) -> Option<Vec<u8>>
 /// worktree context the `--git-dir` form cannot provide. Same
 /// pinning and silencing as [`git_dir_output`].
 fn git_home_output(home: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = crate::init_client_identity::host_git_command()
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("-C")
         .arg(home)
         .args(args)
@@ -288,9 +300,17 @@ fn git_home_output(home: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .env("HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        // Pinned deterministic leaf: Detach skips the host-wide completion scan;
+        // cancellation still takes the strict path.
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -559,6 +579,28 @@ pub fn resume_transaction(inputs: &ResumeInputs<'_>, deps: &ResumeDeps<'_>) -> R
 mod tests {
     use super::*;
     use dot_test_support::TempDir;
+
+    #[test]
+    fn git_probe_runs_without_host_process_snapshot() {
+        let dir = TempDir::new("leaf-git-no-scan").expect("scratch");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(dir.path())
+            .status()
+            .expect("git init fixture");
+        assert!(status.success());
+        crate::cleanup::reset_global_process_snapshot_calls();
+        let version = git_dir_output(&dir.path().join(".git"), dir.path(), &["--version"]);
+        assert!(version.is_some_and(|out| !out.is_empty()));
+        let home_version = git_home_output(dir.path(), &["--version"]);
+        assert!(home_version.is_some_and(|out| !out.is_empty()));
+        assert_eq!(
+            crate::cleanup::global_process_snapshot_calls(),
+            0,
+            "read-only git probes must not pay a host-wide /proc walk"
+        );
+    }
 
     #[test]
     fn commit_ids_cover_both_generations() {

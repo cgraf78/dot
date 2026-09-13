@@ -1086,11 +1086,15 @@ pub fn user_valid(user: &[u8]) -> bool {
 
 /// Current login name (`id -un`), like `_dot_profile_resolve`.
 pub fn current_user() -> Option<String> {
-    let output = std::process::Command::new("id")
-        .arg("-un")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("id");
+    command.arg("-un").stdin(std::process::Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }

@@ -86,20 +86,14 @@ fn run_pull_to_log(log: &Path, argv: &[OsString]) -> i32 {
     let Some((program, args)) = argv.split_first() else {
         return 127;
     };
-    let child = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .env("LC_ALL", "C")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(file))
-        .stderr(std::process::Stdio::from(stream))
-        .spawn();
-    match child {
-        Ok(mut child) => match child.wait() {
-            Ok(status) => status.code().unwrap_or(127),
-            Err(_) => 127,
-        },
-        Err(_) => 127,
-    }
+        .stderr(std::process::Stdio::from(stream));
+    crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Detach)
 }
 
 /// Streaming pull without a log, like the `_logfile_create`
@@ -109,17 +103,14 @@ fn run_streaming(argv: &[OsString]) -> i32 {
     let Some((program, args)) = argv.split_first() else {
         return 127;
     };
-    match std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .env("LC_ALL", "C")
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-    {
-        Ok(status) => status.code().unwrap_or(127),
-        Err(_) => 127,
-    }
+        .stderr(std::process::Stdio::inherit());
+    crate::cleanup::run_foreground_status(command)
 }
 
 /// Whether a pull-log line is filtered from the visible dump, like
@@ -149,6 +140,11 @@ pub fn pull_repo(
         return run_streaming(&argv);
     };
     let mut rc = run_pull_to_log(&log, &argv);
+    if crate::cleanup::received_signal().is_some() {
+        let mut cleanup = Registry::new();
+        let _ = cleanup.remove_path(&log);
+        return rc;
+    }
     if rc != 0 {
         let backup = BackupConflictsInputs {
             home: inputs.home,

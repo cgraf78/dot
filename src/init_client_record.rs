@@ -251,16 +251,18 @@ fn branch_valid(branch: &[u8]) -> bool {
     if branch.is_empty() {
         return false;
     }
-    crate::init_client_identity::host_git_command()
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("check-ref-format")
         .arg("--branch")
         .arg(std::ffi::OsStr::from_bytes(branch))
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .stderr(Stdio::null());
+    // Pure ref-format validation, no repo access: Detach skips the host-wide
+    // completion scan; cancellation still takes the strict path.
+    crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Detach) == 0
 }
 
 /// The source revision from the shared checkout-or-release identity resolver.
@@ -332,6 +334,7 @@ pub fn write_record(
         body.extend_from_slice(value);
         body.push(b'\n');
     }
+    crate::cancellation::check_mutation()?;
     if let Err(source) = std::fs::write(&temporary, &body) {
         let _ = std::fs::remove_file(&temporary);
         return Err(Error::Io {
@@ -767,4 +770,20 @@ pub fn prior_record(prior: &Path, wanted: &str) -> Result<PriorEntry> {
     Err(Error::Usage {
         message: "prior snapshot has no such path",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_check_runs_without_host_process_snapshot() {
+        crate::cleanup::reset_global_process_snapshot_calls();
+        assert!(branch_valid(b"main"));
+        assert_eq!(
+            crate::cleanup::global_process_snapshot_calls(),
+            0,
+            "pure ref-format check must not pay a host-wide /proc walk"
+        );
+    }
 }

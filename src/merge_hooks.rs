@@ -93,7 +93,8 @@ pub fn family_marker_name(relpath: &OsStr) -> OsString {
 
 /// `_merge_hook_expand_home`: replace `${HOME}` then `$HOME`
 /// (single pass, no rescan — like bash `//`), then a leading `~`
-/// (`~` alone or `~/...`; `~user` is untouched).
+/// (`~` alone or `~/...`; `~otheruser/...` is untouched, never
+/// resolved to another user's home).
 pub fn expand_home(value: &str, home: &str) -> String {
     let replaced = value.replace("${HOME}", home).replace("$HOME", home);
     if replaced == "~" {
@@ -172,10 +173,17 @@ pub fn write_text_if_changed(dst: &Path, text: &str, ctx: &mut Ctx<'_>) -> Resul
 /// branches on `$?`). `jq` diagnostics flow to the `warn` sink line
 /// by line, exactly where the shell leaves them on stderr.
 fn run_jq(args: &[&OsStr], tmp: &Path, warn: &mut dyn FnMut(&str)) -> bool {
-    let output = std::process::Command::new("jq")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output();
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
+    let mut command = std::process::Command::new("jq");
+    command.args(args).stdin(std::process::Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    );
     let Ok(output) = output else {
         return false;
     };
@@ -185,19 +193,57 @@ fn run_jq(args: &[&OsStr], tmp: &Path, warn: &mut dyn FnMut(&str)) -> bool {
     if !output.status.success() {
         return false;
     }
-    std::fs::write(tmp, &output.stdout).is_ok()
+    crate::cancellation::check().is_ok() && std::fs::write(tmp, &output.stdout).is_ok()
 }
 
-/// The `jq empty` corruption probe: true when `dst` parses.
-fn jq_valid(dst: &Path) -> bool {
-    std::process::Command::new("jq")
+/// The `jq empty` corruption probe. Ordinary nonzero exit means invalid JSON;
+/// cancellation or an unverified teardown remains a typed error so callers
+/// never delete a valid destination merely because validation was interrupted.
+fn jq_valid(dst: &Path) -> Result<bool, Error> {
+    crate::cancellation::check_mutation()?;
+    let mut command = std::process::Command::new("jq");
+    command
         .arg("empty")
         .arg(dst)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .stderr(std::process::Stdio::null());
+    match crate::cleanup::run_session_output_typed(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    ) {
+        Ok(output) => Ok(output.status.success()),
+        Err(crate::cleanup::SessionOutputError::Interrupted(_)) => Err(Error::Io {
+            context: "jq validation interrupted",
+            source: std::io::ErrorKind::Interrupted.into(),
+        }),
+        Err(crate::cleanup::SessionOutputError::CleanupIncomplete) => Err(Error::Io {
+            context: "jq validation cleanup incomplete",
+            source: std::io::Error::other("could not verify jq subprocess cleanup"),
+        }),
+        Err(crate::cleanup::SessionOutputError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            // Shell parity: a missing `jq` binary fails the `jq empty`
+            // probe like corrupt JSON, so the caller takes the
+            // warn-and-rebuild path (which then degrades to warn-and-skip
+            // in run_jq) instead of failing the whole layer.
+            Ok(false)
+        }
+        Err(crate::cleanup::SessionOutputError::Io(error)) => Err(Error::Io {
+            context: "run jq validation",
+            source: error,
+        }),
+        Err(
+            crate::cleanup::SessionOutputError::TimedOut
+            | crate::cleanup::SessionOutputError::CaptureLimit,
+        ) => Err(Error::Io {
+            context: "run jq validation",
+            source: std::io::Error::other("jq validation did not complete"),
+        }),
+    }
 }
 
 /// `_merge_hook_jq_layer`: install (`! -f dst`) or merge JSON through
@@ -241,11 +287,13 @@ pub fn jq_layer(
         return Ok(());
     }
     let empty = std::fs::metadata(dst).is_ok_and(|meta| meta.len() == 0);
-    if empty || !jq_valid(dst) {
+    let valid = if empty { false } else { jq_valid(dst)? };
+    if !valid {
         ctx.warnings.push(format!(
             "    warning: corrupt {} \u{2014} rebuilding",
             dst.display()
         ));
+        crate::cancellation::check_mutation()?;
         let _ = std::fs::remove_file(dst);
         remove_tmp(&tmp);
         return jq_layer(label, src, dst, filter, ctx);
@@ -283,4 +331,86 @@ pub fn jq_layer(
         return Err(error);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn interrupted_jq_validation_never_removes_the_existing_destination() {
+        const HELPER: &str = "DOT_MERGE_JQ_CANCEL_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "merge_hooks::cancellation_tests::interrupted_jq_validation_never_removes_the_existing_destination",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "interrupted jq helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let scratch = dot_test_support::TempDir::new("merge-jq-cancel").unwrap();
+        let bin = scratch.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let ready = scratch.path().join("jq.ready");
+        let jq = bin.join("jq");
+        std::fs::write(
+            &jq,
+            format!(
+                "#!/bin/sh\n: >'{}'\ntrap '' TERM\nwhile :; do /bin/sleep 1; done\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&jq, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: this recursive helper is the only test in its process.
+        unsafe { std::env::set_var("PATH", &bin) };
+        let source = scratch.path().join("source.json");
+        let destination = scratch.path().join("destination.json");
+        std::fs::write(&source, b"{\"new\":true}\n").unwrap();
+        std::fs::write(&destination, b"{\"preserve\":true}\n").unwrap();
+        let signals = crate::cleanup::Signals::install().unwrap();
+        let ready_for_signal = ready.clone();
+        let sender = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !ready_for_signal.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(ready_for_signal.exists());
+            // SAFETY: the helper owns an installed SIGTERM handler.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+        });
+        let mut cache = MoveCache::default();
+        let mut warnings = Vec::new();
+        let result = jq_layer(
+            "fixture",
+            &source,
+            &destination,
+            "$s[0] * $d[0]",
+            &mut Ctx {
+                source_root: scratch.path(),
+                cache: &mut cache,
+                warnings: &mut warnings,
+            },
+        );
+        sender.join().unwrap();
+        let status = signals.finish(if result.is_ok() { 0 } else { 1 });
+
+        assert_eq!(status, 128 + libc::SIGTERM);
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"{\"preserve\":true}\n"
+        );
+    }
 }

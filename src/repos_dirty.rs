@@ -68,13 +68,53 @@ pub fn is_worktree_dirty(base: Option<&[OsString]>, overlays: &[String]) -> bool
     false
 }
 
+/// Dirty display lines across the base repository and
+/// git-synchronized overlay worktrees (`diff-index --name-only
+/// HEAD`): base files bare, overlay files prefixed with their
+/// worktree path. Failed listings read empty, so unresolvable
+/// repositories contribute nothing. Feeds the cron `skip` outcome
+/// detail (capped at the writer).
+pub fn dirty_file_list(base: Option<&[OsString]>, overlays: &[String]) -> Vec<String> {
+    let mut files = Vec::new();
+    if let Some(prefix) = base {
+        files.extend(
+            git_lines(prefix, &["diff-index", "--name-only", "HEAD"])
+                .into_iter()
+                .filter(|file| !file.is_empty()),
+        );
+    }
+    for entry in overlays {
+        let (path, sync) = overlay_path_sync(entry);
+        if sync != "git" {
+            continue;
+        }
+        if !is_worktree(Path::new(&path)) {
+            continue;
+        }
+        let prefix = [OsString::from("-C"), OsString::from(&path)];
+        for file in git_lines(&prefix, &["diff-index", "--name-only", "HEAD"]) {
+            if file.is_empty() {
+                continue;
+            }
+            files.push(format!("{path}/{file}"));
+        }
+    }
+    files
+}
+
 /// `_checkout_dirty_files`: revert exactly the currently-dirty
 /// tracked files, one at a time, ignoring per-file errors. A failed
-/// listing reads empty, so nothing happens.
+/// listing reads empty, so nothing happens. Cancellation breaks the
+/// loop (a partially reverted tree still reads dirty downstream,
+/// and `pull` re-verifies before proceeding, so stopping early is
+/// fail-safe).
 pub fn checkout_dirty_files(prefix: &[OsString]) {
     for file in git_lines(prefix, &["diff-index", "--name-only", "HEAD"]) {
         if file.is_empty() {
             continue;
+        }
+        if crate::cancellation::check().is_err() {
+            break;
         }
         let _ = run_git(prefix, &["checkout", "--", file.as_str()]);
     }

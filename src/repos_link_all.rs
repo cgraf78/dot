@@ -186,19 +186,24 @@ fn snapshot_string(roots: &[String]) -> String {
 /// The `_base_tracked` capture: one `git ls-files` whose newline
 /// split mirrors `while IFS= read -r` (only the terminator's empty
 /// tail is dropped). Empty without a base repository.
-fn base_tracked(inputs: &Inputs<'_>) -> HashSet<String> {
+fn base_tracked(inputs: &Inputs<'_>) -> Result<HashSet<String>, crate::repos_base::GitOutputError> {
     let mut tracked = HashSet::new();
     let Some(base) = inputs.base else {
-        return tracked;
+        return Ok(tracked);
     };
     let Some(prefix) = base.git_prefix() else {
-        return tracked;
+        return Ok(tracked);
     };
-    let Some(output) = crate::repos_base::run_git(&prefix, &["ls-files"]) else {
-        return tracked;
+    let output = match crate::repos_base::run_git_typed(&prefix, &["ls-files"]) {
+        Ok(output) => output,
+        Err(crate::repos_base::GitOutputError::Other) => return Ok(tracked),
+        Err(crate::repos_base::GitOutputError::CleanupIncomplete) => {
+            return Err(crate::repos_base::GitOutputError::CleanupIncomplete);
+        }
+        Err(error) => return Err(error),
     };
     if !output.status.success() {
-        return tracked;
+        return Ok(tracked);
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut lines: Vec<&str> = text.split('\n').collect();
@@ -206,7 +211,11 @@ fn base_tracked(inputs: &Inputs<'_>) -> HashSet<String> {
         lines.pop();
     }
     tracked.extend(lines.into_iter().map(str::to_string));
-    tracked
+    Ok(tracked)
+}
+
+fn cancelled() -> bool {
+    crate::cleanup::received_signal().is_some()
 }
 
 /// Next temporary suffix (see module docs).
@@ -221,6 +230,9 @@ fn temp_suffix() -> String {
 fn create_manifest_new(manifest: &str) -> Option<PathBuf> {
     use std::os::unix::fs::OpenOptionsExt as _;
     for _ in 0..16 {
+        if cancelled() {
+            return None;
+        }
         let path = PathBuf::from(format!("{manifest}.tmp.{}", temp_suffix()));
         match std::fs::OpenOptions::new()
             .write(true)
@@ -239,6 +251,9 @@ fn create_manifest_new(manifest: &str) -> Option<PathBuf> {
 fn create_inventory_root(manifest: &str) -> Option<PathBuf> {
     use std::os::unix::fs::DirBuilderExt as _;
     for _ in 0..16 {
+        if cancelled() {
+            return None;
+        }
         let root = PathBuf::from(format!("{manifest}.inventory.{}", temp_suffix()));
         match std::fs::DirBuilder::new().mode(0o700).create(&root) {
             Ok(()) => return Some(root),
@@ -332,8 +347,14 @@ pub fn link_overlays(
         current: 0,
         changed_items: Vec::new(),
     };
+    if cancelled() {
+        return outcome;
+    }
     // `mkdir -p "${manifest%/*}"`.
     let dir = manifest_dir(inputs.manifest);
+    if cancelled() {
+        return outcome;
+    }
     if std::fs::create_dir_all(&dir).is_err() {
         warn_row(
             err,
@@ -344,6 +365,9 @@ pub fn link_overlays(
     }
     // Recovery first: a stranded generation must converge before
     // anything else reads the filesystem.
+    if cancelled() {
+        return outcome;
+    }
     if let Err(record) = recover_replacements(inputs) {
         warn_row(
             err,
@@ -457,9 +481,34 @@ pub fn link_overlays(
             return outcome;
         }
     }
-    let tracked = base_tracked(inputs);
+    let tracked = match base_tracked(inputs) {
+        Ok(tracked) => tracked,
+        Err(crate::repos_base::GitOutputError::Interrupted(signal)) => {
+            outcome.rc = 128 + signal;
+            return outcome;
+        }
+        Err(crate::repos_base::GitOutputError::CaptureLimit) => {
+            warn_row(
+                err,
+                inputs.palette,
+                "  warning: repository inspection output exceeded its safety limit",
+            );
+            return outcome;
+        }
+        Err(crate::repos_base::GitOutputError::CleanupIncomplete) => {
+            outcome.rc = crate::cleanup::CLEANUP_INCOMPLETE_STATUS;
+            return outcome;
+        }
+        Err(crate::repos_base::GitOutputError::Other) => unreachable!("handled by base_tracked"),
+    };
+    if cancelled() {
+        return outcome;
+    }
     // Manifest draft plus inventory root, then the pending
     // publication that makes every later link recoverable.
+    if cancelled() {
+        return outcome;
+    }
     let Some(manifest_new) = create_manifest_new(inputs.manifest) else {
         warn_row(
             err,
@@ -468,6 +517,10 @@ pub fn link_overlays(
         );
         return outcome;
     };
+    if cancelled() {
+        cleanup(Some(&manifest_new), None);
+        return outcome;
+    }
     let Some(inventory_root) = create_inventory_root(inputs.manifest) else {
         warn_row(
             err,
@@ -477,6 +530,10 @@ pub fn link_overlays(
         cleanup(Some(&manifest_new), None);
         return outcome;
     };
+    if cancelled() {
+        cleanup(Some(&manifest_new), Some(&inventory_root));
+        return outcome;
+    }
     let prep_inputs = repos_link_prep::Inputs {
         entries: inputs.entries,
         home: inputs.home,
@@ -491,6 +548,10 @@ pub fn link_overlays(
         cleanup(Some(&manifest_new), Some(&inventory_root));
         return outcome;
     };
+    if cancelled() {
+        cleanup(Some(&manifest_new), Some(&inventory_root));
+        return outcome;
+    }
     let pending = match repos_overlays::publish_pending(
         &mut ctx,
         inputs.euid,
@@ -530,6 +591,10 @@ pub fn link_overlays(
     let mut done: i64 = 0;
     let verbose = is_verbose(inputs.dot_verbose);
     for entry in inputs.entries {
+        if cancelled() {
+            cleanup(Some(&manifest_new), Some(&inventory_root));
+            return outcome;
+        }
         let (name, path, url, sync) = split_entry(entry);
         let sync = if sync.is_empty() {
             "git".to_string()
@@ -681,6 +746,10 @@ pub fn link_overlays(
     // rows; the counted path stays quiet unless verbose.
     let verbose_rows = !gt_zero(inputs.ui_total) || verbose;
     for rel in stale_rels {
+        if cancelled() {
+            cleanup(Some(&manifest_new), Some(&inventory_root));
+            return outcome;
+        }
         if overlay_state.current.contains(rel) {
             continue;
         }
@@ -731,6 +800,10 @@ pub fn link_overlays(
                         .header(out, "==> Cleaning stale overlay symlinks...");
                     stale_header = true;
                 }
+                if cancelled() {
+                    cleanup(Some(&manifest_new), Some(&inventory_root));
+                    return outcome;
+                }
                 if std::fs::remove_file(&dst).is_err() {
                     warn_row(
                         err,
@@ -763,6 +836,10 @@ pub fn link_overlays(
             Err(_) => {}
         }
         if tracked.contains(rel) {
+            if cancelled() {
+                cleanup(Some(&manifest_new), Some(&inventory_root));
+                return outcome;
+            }
             let (restored, warnings) = match inputs.base {
                 Some(base) => repos_overlays::restore_tracked_path(
                     inputs.palette,
@@ -813,6 +890,10 @@ pub fn link_overlays(
         cleanup(Some(&manifest_new), Some(&inventory_root));
         return outcome;
     };
+    if cancelled() {
+        cleanup(Some(&manifest_new), Some(&inventory_root));
+        return outcome;
+    }
     let manifest_exists = std::fs::symlink_metadata(manifest_path).is_ok();
     let moved = if manifest_exists {
         temp::move_replace_nodir_with(&manifest_new, manifest_path, inputs.tool).is_ok()
@@ -846,6 +927,9 @@ pub fn link_overlays(
         return outcome;
     }
     let _ = std::fs::remove_dir_all(&inventory_root);
+    if cancelled() {
+        return outcome;
+    }
     if std::fs::remove_file(&pending).is_err() {
         warn_row(
             err,
@@ -859,6 +943,9 @@ pub fn link_overlays(
             std::fs::symlink_metadata(legacy_path).is_ok_and(|meta| meta.file_type().is_symlink());
         let legacy_regular = std::fs::metadata(legacy_path).is_ok_and(|meta| meta.is_file());
         if !legacy_link && legacy_regular {
+            if cancelled() {
+                return outcome;
+            }
             if std::fs::remove_file(legacy_path).is_err() {
                 warn_row(
                     err,

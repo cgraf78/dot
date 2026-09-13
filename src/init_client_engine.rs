@@ -52,7 +52,7 @@ use std::cell::RefCell;
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::errors::{Error, Result};
 use crate::init_client_adopt::{self as adopt, AdoptError};
@@ -1204,6 +1204,9 @@ impl<'a> Production<'a> {
     fn make_candidate(&self, state_root: &Path) -> Option<PathBuf> {
         use std::os::unix::fs::PermissionsExt as _;
         for _ in 0..temp::TMP_RETRIES {
+            if crate::cancellation::check().is_err() {
+                return None;
+            }
             let mut name = state_root.as_os_str().to_os_string();
             name.push(".candidate.");
             name.push(temp::random_suffix());
@@ -1486,6 +1489,9 @@ impl<'a> Production<'a> {
             (&prior, "prior.tsv"),
             (&conflicts, "conflicts.tsv"),
         ] {
+            if crate::cancellation::check().is_err() {
+                return carried(out_stderr);
+            }
             if std::fs::copy(source, stage.join(name)).is_err() {
                 return carried(out_stderr);
             }
@@ -1562,7 +1568,8 @@ impl<'a> Production<'a> {
 /// shell, so they are captured here and merged into the report
 /// streams by the caller (never dropped, never bypassed).
 fn git_clone(origin: &str, branch: &str, candidate: &Path) -> CloneReport {
-    match identity::host_git_command()
+    let mut command = identity::host_git_command();
+    command
         .arg("clone")
         .arg("--quiet")
         .arg("--no-checkout")
@@ -1574,9 +1581,13 @@ fn git_clone(origin: &str, branch: &str, candidate: &Path) -> CloneReport {
         .arg(candidate)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-    {
+        .stderr(Stdio::piped());
+    match crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    ) {
         Ok(output) if output.status.success() => CloneReport {
             stdout: output.stdout,
             stderr: output.stderr,
@@ -1609,16 +1620,24 @@ struct CloneReport {
 /// substitution chomping: the locked commit, or `None` when git
 /// cannot report it.
 fn git_rev_parse(candidate: &Path, branch: &str) -> Option<String> {
-    let output = identity::host_git_command()
+    crate::cancellation::check().ok()?;
+    let mut command = identity::host_git_command();
+    command
         .arg("-C")
         .arg(candidate)
         .arg("rev-parse")
         .arg(format!("{branch}^{{commit}}"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1637,24 +1656,9 @@ fn commit_valid(commit: &str) -> bool {
         && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// `date +%Y%m%d%H%M%S` for the backup stamp: the same binary the
-/// shell calls, so timezone and shape agree by construction.
+/// Local `%Y%m%d%H%M%S` backup stamp without launching a helper.
 fn backup_stamp() -> Option<String> {
-    let output = Command::new("date")
-        .arg("+%Y%m%d%H%M%S")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let mut text = output.stdout;
-    while text.last() == Some(&b'\n') {
-        text.pop();
-    }
-    String::from_utf8(text).ok()
+    crate::temp::local_timestamp()
 }
 
 /// The run nonce `"$(date +%s).$$.$RANDOM"`: epoch seconds from the
@@ -1662,21 +1666,7 @@ fn backup_stamp() -> Option<String> {
 /// 0-32767 draw from `/dev/urandom` (wall-clock nanos when
 /// urandom is unreadable, so the shape never fails).
 fn fresh_nonce() -> Option<String> {
-    let output = Command::new("date")
-        .arg("+%s")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let mut secs = output.stdout;
-    while secs.last() == Some(&b'\n') {
-        secs.pop();
-    }
-    let secs = String::from_utf8(secs).ok()?;
+    let secs = crate::temp::epoch_seconds()?;
     // Bounded two-byte read: `/dev/urandom` is endless, so a
     // whole-file read would block forever filling memory.
     let draw = std::fs::File::open("/dev/urandom")

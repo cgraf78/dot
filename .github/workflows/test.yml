@@ -37,8 +37,11 @@ jobs:
         rustfmt --check support/performance-command-supervisor.rs tests/support/performance-supervisor-fixture.rs
       # Native integration tests retain the public Python timeout helper as an
       # external-suite compatibility boundary. Minimal Rust images do not
-      # otherwise install its interpreter.
-      profiles: python
+      # otherwise install its interpreter. The process-supervision tests
+      # shell out to `ps` (portable snapshot fallback, start-identity
+      # probe) and the hook-merge tests validate through `jq`; install
+      # both so every platform exercises the strict path.
+      profiles: python,procps,jq
       # User-authored hooks retain a versioned Bash 4+ API. A brewed Bash lands
       # on the default macOS PATH; the native engine itself has no shell
       # interpreter dependency.
@@ -94,6 +97,9 @@ jobs:
         # copy with permission errors (sibling convention uses
         # $RUNNER_TEMP target dirs for the same reason).
         export CARGO_TARGET_DIR="$RUNNER_TEMP/dot-termux-target"
+        # Compile every test target under Android cfg even though the emulator
+        # runs only the transported release CLI contract.
+        cargo check --locked --tests --target "$RUST_TARGET"
         archive=$(scripts/package-release.sh "$RUST_TARGET" android-x86_64)
         scripts/smoke-release.sh android-x86_64
         mkdir -p .termux-ci

@@ -1,22 +1,229 @@
-#!/usr/bin/env python3
-"""Run one command under a portable process-group timeout."""
+#!/bin/sh
+# shellcheck disable=SC1073,SC1065,SC1064,SC1072,SC1009  # sh/python polyglot: the python body is not shell
+""":"
+# Capture the caller's actual descriptor state before a language runtime can
+# reserve a closed standard descriptor, then restart without site hooks.
+exec 9>/dev/null || exit 126
+dot_stdio_mask=0
+if (: <&0 2>&9); then dot_stdio_mask=$((dot_stdio_mask + 1)); fi
+if (: >&1 2>&9); then dot_stdio_mask=$((dot_stdio_mask + 2)); fi
+if (: 3>&2 2>&9); then dot_stdio_mask=$((dot_stdio_mask + 4)); fi
+exec 9>&-
+exec python3 -I -S "$0" --dot-python-entry-v1 "$dot_stdio_mask" "$@"
+exit 126
+":"""
 
 from __future__ import annotations
 
+import os as _entry_os
+import sys as _entry_sys
+import fcntl as _entry_fcntl
+
+# Capture stdio before this module opens any descriptors. A numeric fd that
+# was closed at the wrapper boundary stays absent even if a later internal open
+# reuses 0, 1, or 2.
+if len(_entry_sys.argv) >= 3 and _entry_sys.argv[1] == "--dot-python-entry-v1":
+    try:
+        ENTRY_STDIO_MASK = int(_entry_sys.argv[2])
+    except ValueError:
+        _entry_os._exit(126)
+    if ENTRY_STDIO_MASK < 0 or ENTRY_STDIO_MASK > 7:
+        _entry_os._exit(126)
+    del _entry_sys.argv[1:3]
+    # Some /bin/sh implementations open the shebang script on the lowest
+    # available descriptor.  If stderr was closed, that can be fd 2.  An
+    # O_RDONLY descriptor for this exact script cannot be a usable caller
+    # stderr, so remove the interpreter artifact without guessing about valid
+    # writable redirects such as /dev/null.
+    if ENTRY_STDIO_MASK & (1 << 2):
+        try:
+            _entry_stderr = _entry_os.fstat(2)
+            _entry_script = _entry_os.stat(__file__)
+            _entry_flags = _entry_fcntl.fcntl(2, _entry_fcntl.F_GETFL)
+            if (
+                (_entry_stderr.st_dev, _entry_stderr.st_ino)
+                == (_entry_script.st_dev, _entry_script.st_ino)
+                and _entry_flags & _entry_os.O_ACCMODE == _entry_os.O_RDONLY
+            ):
+                ENTRY_STDIO_MASK &= ~(1 << 2)
+        except OSError:
+            pass
+    for _entry_fd in range(3):
+        if ENTRY_STDIO_MASK & (1 << _entry_fd) == 0:
+            try:
+                _entry_os.close(_entry_fd)
+            except OSError:
+                pass
+else:
+    ENTRY_STDIO_MASK = 0
+    for _entry_fd in range(3):
+        try:
+            _entry_os.fstat(_entry_fd)
+        except OSError:
+            continue
+        ENTRY_STDIO_MASK |= 1 << _entry_fd
+
 import math
+import errno
+import array
+import fcntl
 import os
+import secrets
+import select
+import selectors
 import signal
+import socket
+import stat
+import struct
 import subprocess
 import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
 from types import FrameType
+from typing import NamedTuple
 
 process: subprocess.Popen | None = None
 interrupted_signal: int | None = None
+boundary_token: str | None = None
+lease_reader: int | None = None
+control_reader: int | None = None
+subreaper_enabled = False
 handled_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+subprocess_restored_signals = tuple(
+    candidate
+    for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ")
+    if (candidate := getattr(signal, name, None)) is not None
+)
+previous_signal_handlers: dict[int, object] = {}
+previous_sigchld_handler: object = signal.SIG_DFL
+terminal_handoff_required = False
+terminal_cleanup_incomplete = False
+stdio_relay_pids: dict[int, str] = {}
+stdio_relay_state_fds: dict[int, int] = {}
+stdio_relay_states: dict[int, bytes] = {}
+stdio_relay_parent_fds: dict[int, int] = {}
+stdio_relay_status: int | None = None
+nested_supervisors: dict[str, tuple[int, socket.socket]] = {}
+# Consecutive unhealthy observations per registration: an anomalous
+# link peek (EOF or error) while the confirming snapshot does not show
+# the supervisor live. A healthy peek or a live snapshot resets the
+# count, so neither a peek glitch nor a missed snapshot alone can
+# orphan a live nested session; a truly exited supervisor is
+# persistently EOF and persistently absent, and still unregisters
+# after three observations.
+nested_unhealthy_strikes: dict[str, int] = {}
+# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis. Tokens
+# with an already-reported open anomaly bout (bounds LINK-PEEK spam).
+nested_peek_logged: set[str] = set()
+# Whether any nested supervisor ever registered. Registrations arrive
+# during supervision, long before the stop; once set, phase completion
+# additionally requires a drained lease, so a snapshot that misses a
+# live owner cannot end the stop early. Never reset: a drained lease
+# lifts the gate as soon as the owners are really gone.
+nested_ever_registered = False
+nested_control_complete = True
+ancestor_registration: socket.socket | None = None
 PROCESS_SNAPSHOT_TIMEOUT_SECONDS = 1
+PROCESS_POLL_SECONDS = 0.05
+# Extra KILL-phase budget while a live delegated nested supervisor shuts
+# itself down. Without pidfds the owner cannot adopt or signal the
+# supervisor's subtree after murdering it (orphans keep the session
+# lease open and fail cleanup), so the KILL phase waits instead of
+# group-signaling. Two seconds covers the supervisor's own kill round
+# plus its relay/lease legs even with per-observe `ps` snapshots.
+DELEGATED_OWNER_GRACE_SECONDS = 2.0
+SESSION_BOUNDARY_ENV = "DOT_OWNED_SESSION_BOUNDARY_V1"
+SESSION_LEASE_FDS_ENV = "DOT_OWNED_SESSION_LEASE_FDS_V1"
+SESSION_CONTROL_FDS_ENV = "DOT_OWNED_SESSION_CONTROL_FDS_V1"
+MAX_ENVIRON_BYTES = 1024 * 1024
+MAX_ANCESTOR_BOUNDARIES = 16
+LAUNCH_HELPER_MODE = "--dot-launch-helper-v1"
+RELAY_HELPER_MODE = "--dot-relay-helper-v1"
+LAUNCH_PROTOCOL_BYTES = 4
+LAUNCH_CONFIG_MAGIC = b"DTC1"
+MAX_LAUNCH_CONFIG_BYTES = 4 * 1024 * 1024
+MAX_LAUNCH_CONFIG_ITEMS = 65536
+LAUNCH_PROTOCOL_TIMEOUT_SECONDS = 5
+CONTROL_FRAME_MAGIC = b"DTS2"
+CONTROL_FRAME_BYTES = len(CONTROL_FRAME_MAGIC) + 4 + 64
+
+
+class SessionProcess(NamedTuple):
+    """One observed process-table identity inside the owned session."""
+
+    pid: int
+    group: int
+    session: int
+    live: bool
+    start: int | None
+    parent: int = 0
+    delegated: bool = False
+    ambiguous: bool = False
+
+
+class MemberHandle:
+    """A Linux pidfd that pins one exact observed process identity."""
+
+    def __init__(self, process: SessionProcess, fd: int):
+        self.process = process
+        self.fd = fd
+        self.signaled = False
+
+    def close(self) -> None:
+        """Release the retained kernel identity."""
+        os.close(self.fd)
+
+    def refresh(self) -> bool:
+        """Refresh liveness without changing which identity the pidfd owns."""
+        current = proc_process(self.process.pid)
+        if current is None:
+            sender = getattr(signal, "pidfd_send_signal", None)
+            if sender is None:
+                # An observation failure is never proof that the retained
+                # identity exited. Keep it live so cleanup fails closed.
+                self.process = self.process._replace(live=True)
+                return True
+            try:
+                sender(self.fd, 0, None, 0)
+            except ProcessLookupError:
+                self.process = self.process._replace(live=False)
+            except (PermissionError, OSError, TypeError):
+                self.process = self.process._replace(live=True)
+            else:
+                self.process = self.process._replace(live=True)
+        elif not same_process_identity(current, self.process):
+            self.process = self.process._replace(live=False)
+        else:
+            self.process = current._replace(
+                delegated=self.process.delegated,
+                ambiguous=self.process.ambiguous,
+            )
+        return self.process.live
+
+    def reap_if_adopted(self) -> bool:
+        """Reap a direct subreaper adoptee without releasing PID authority first."""
+        if self.process.parent != os.getpid() or self.process.live:
+            return True
+        try:
+            waited, _status = os.waitpid(self.process.pid, os.WNOHANG)
+        except ChildProcessError:
+            current = proc_process(self.process.pid)
+            return current is None or not same_process_identity(current, self.process)
+        except (InterruptedError, OSError):
+            return False
+        return waited == self.process.pid
+
+
+class CleanupResult(NamedTuple):
+    """Leader status plus proof that no live session member remained."""
+
+    status: int
+    complete: bool
+
+
+class CleanupIncompleteError(RuntimeError):
+    """A launch failed and its owned child could not be proven reaped."""
 
 
 def parse_timeout(value: str) -> float:
@@ -38,11 +245,124 @@ def capture_signal(signum: int, _frame: FrameType | None) -> None:
         interrupted_signal = signum
 
 
-def finish(status: int) -> int:
-    """Close signal ownership and return the first signal or fallback status."""
+def drain_pending_signals() -> None:
+    """Synchronously latch handled signals blocked on the current thread."""
+    waiter = getattr(signal, "sigtimedwait", None)
+    if waiter is not None:
+        while True:
+            pending = waiter(handled_signals, 0)
+            if pending is None:
+                return
+            capture_signal(pending.si_signo, None)
+    pending_reader = getattr(signal, "sigpending", None)
+    pending_waiter = getattr(signal, "sigwait", None)
+    if pending_reader is None or pending_waiter is None:
+        return
+    while True:
+        pending = set(pending_reader()).intersection(handled_signals)
+        if not pending:
+            return
+        capture_signal(pending_waiter(pending), None)
+
+
+def install_signal_handlers() -> None:
+    """Install one process-entry signal owner and remember caller state."""
+    global previous_sigchld_handler
+    previous_signal_handlers.clear()
+    previous_sigchld_handler = signal.getsignal(signal.SIGCHLD)
+    # The supervisor must retain wait status even when its caller ignored
+    # SIGCHLD. The target disposition is restored in the authorized helper
+    # immediately before exec.
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     for handled_signal in handled_signals:
-        signal.signal(handled_signal, signal.SIG_IGN)
-    return 128 + interrupted_signal if interrupted_signal is not None else status
+        previous_signal_handlers[handled_signal] = signal.getsignal(handled_signal)
+        signal.signal(handled_signal, capture_signal)
+
+
+def finish(status: int, cleanup_complete: bool = True) -> int:
+    """Close signal ownership without losing a signal in the handoff window."""
+    global ancestor_registration, control_reader, lease_reader
+    global terminal_cleanup_incomplete
+    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+    _temp_diag(f"TEMP-DIAG-180 FINISH-ENTER pid={os.getpid()} status={status}")
+    old_mask = None
+    if hasattr(signal, "pthread_sigmask"):
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+    drain_pending_signals()
+    if lease_reader is not None:
+        try:
+            os.close(lease_reader)
+        except OSError:
+            pass
+        lease_reader = None
+    if control_reader is not None:
+        close_fd(control_reader)
+        control_reader = None
+    relays_complete = stop_stdio_relays(
+        time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
+    )
+    if status == 0 and stdio_relay_status is not None:
+        status = stdio_relay_status
+    cleanup_complete = cleanup_complete and relays_complete
+    # Keep the immediate parent's delegation registration live until this
+    # wrapper has reaped both its target and its private relays.  Closing it
+    # earlier would invite the ancestor to promote and signal relay identities
+    # whose statuses are still owned here.
+    if ancestor_registration is not None:
+        ancestor_registration.close()
+        ancestor_registration = None
+    for _pid, link in nested_supervisors.values():
+        link.close()
+    nested_supervisors.clear()
+    nested_unhealthy_strikes.clear()
+    nested_peek_logged.clear()
+    terminal_cleanup_incomplete = not cleanup_complete
+    if terminal_handoff_required:
+        # The single-threaded process-entry path keeps handled signals blocked
+        # and captured until terminal_exit installs final _exit handlers.
+        return resolved_status(status)
+    signal.signal(signal.SIGCHLD, previous_sigchld_handler)
+    for handled_signal, previous in previous_signal_handlers.items():
+        signal.signal(handled_signal, previous)
+    drain_pending_signals()
+    result = resolved_status(status)
+    if old_mask is not None:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+    previous_signal_handlers.clear()
+    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+    _temp_diag(f"TEMP-DIAG-180 FINISH-EXIT pid={os.getpid()} result={result}")
+    return result
+
+
+def resolved_status(status: int, current_signal: int | None = None) -> int:
+    """Apply cleanup, first-signal, then fallback-status precedence."""
+    if terminal_cleanup_incomplete:
+        return 125
+    if interrupted_signal is not None:
+        return 128 + interrupted_signal
+    if current_signal is not None:
+        return 128 + current_signal
+    return status
+
+
+def terminal_exit(status: int) -> None:
+    """Atomically hand blocked cancellation signals to default disposition."""
+    if hasattr(signal, "pthread_sigmask"):
+        signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+    drain_pending_signals()
+    for handled_signal in handled_signals:
+        signal.signal(handled_signal, signal.SIG_DFL)
+    drain_pending_signals()
+    if terminal_cleanup_incomplete:
+        os._exit(125)
+    if interrupted_signal is not None:
+        os._exit(128 + interrupted_signal)
+    if hasattr(signal, "pthread_sigmask"):
+        # Default dispositions are kernel actions, unlike Python callbacks.
+        # A pending signal terminates synchronously during unmask; a new one in
+        # the final instruction window likewise observes SIG_DFL.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, handled_signals)
+    os._exit(status)
 
 
 def mark_timeout_expired() -> None:
@@ -70,101 +390,2107 @@ def clear_timeout_marker() -> bool:
     return True
 
 
-def list_proc_session_pids(
-    session_id: int, proc_root: Path = Path("/proc")
-) -> list[int] | None:
-    """Return one Linux session's PIDs, or None when procfs is unavailable."""
+def adopt_descendants() -> bool:
+    """Enable required Linux orphan ownership; report portable capability."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        import ctypes
+    except ImportError as error:
+        raise OSError(errno.ENOSYS, "Linux subreaper support is unavailable") from error
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_CHILD_SUBREAPER) failed")
+    return True
+
+
+def bind_linux_parent_death(expected_parent: int) -> None:
+    """Make a relay die even while blocked if its owning wrapper disappears."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+    except ImportError:
+        os._exit(125)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        os._exit(125)
+    # Close the fork-to-prctl race: parent death before prctl does not enqueue
+    # the requested signal retroactively.
+    if os.getppid() != expected_parent:
+        os._exit(0)
+
+
+def lease_closed() -> bool:
+    """Return whether every ordinary descendant closed its inherited lease."""
+    if lease_reader is None:
+        return True
+    try:
+        return os.read(lease_reader, 1) == b""
+    except BlockingIOError:
+        return False
+    except InterruptedError:
+        return False
+    except OSError:
+        return False
+
+
+def authorize_launch(_pid: int) -> bool:
+    """Consume a signal pending in the fork-to-exec window before authorization."""
+    if interrupted_signal is not None:
+        return False
+    drain_pending_signals()
+    return interrupted_signal is None
+
+
+def write_all_fd(fd: int, payload: bytes) -> None:
+    """Write one small launch-protocol frame."""
+    offset = 0
+    while offset < len(payload):
+        try:
+            written = os.write(fd, payload[offset:])
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise OSError(errno.EPIPE, "launch protocol pipe closed")
+        offset += written
+
+
+def read_exact_fd(fd: int, size: int, deadline: float) -> bytes:
+    """Read one fixed-size launch frame under an absolute deadline."""
+    os.set_blocking(fd, False)
+    payload = bytearray()
+    with selectors.DefaultSelector() as selector:
+        selector.register(fd, selectors.EVENT_READ)
+        while len(payload) < size:
+            if interrupted_signal is not None:
+                raise InterruptedError("launch interrupted while reading protocol state")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("launch protocol exceeded its deadline")
+            if not selector.select(min(remaining, PROCESS_POLL_SECONDS)):
+                continue
+            try:
+                chunk = os.read(fd, size - len(payload))
+            except (BlockingIOError, InterruptedError):
+                continue
+            if not chunk:
+                raise OSError(errno.EPIPE, "launch protocol closed early")
+            payload.extend(chunk)
+    return bytes(payload)
+
+
+def write_all_fd_until(fd: int, payload: bytes, deadline: float) -> None:
+    """Write a bounded launch payload without defeating its deadline."""
+    os.set_blocking(fd, False)
+    offset = 0
+    with selectors.DefaultSelector() as selector:
+        selector.register(fd, selectors.EVENT_WRITE)
+        while offset < len(payload):
+            if interrupted_signal is not None:
+                raise InterruptedError("launch interrupted while transferring target state")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("launch protocol exceeded its deadline")
+            if not selector.select(min(remaining, PROCESS_POLL_SECONDS)):
+                continue
+            try:
+                written = os.write(fd, payload[offset:])
+            except (BlockingIOError, InterruptedError):
+                continue
+            if written <= 0:
+                raise OSError(errno.EPIPE, "launch protocol pipe closed")
+            offset += written
+
+
+def encode_launch_config(
+    argv: Sequence[str], child_env: dict[str, str]
+) -> bytes:
+    """Encode target argv/env without exposing them to helper startup."""
+    arguments = [os.fsencode(value) for value in argv]
+    environment = [(os.fsencode(key), os.fsencode(value)) for key, value in child_env.items()]
+    if not arguments or len(arguments) + len(environment) > MAX_LAUNCH_CONFIG_ITEMS:
+        raise OSError(errno.E2BIG, "target launch configuration is too large")
+    body = bytearray()
+
+    def append(value: bytes) -> None:
+        if b"\0" in value or len(value) > MAX_LAUNCH_CONFIG_BYTES:
+            raise OSError(errno.EINVAL, "invalid target launch value")
+        body.extend(struct.pack("!I", len(value)))
+        body.extend(value)
+        if len(body) > MAX_LAUNCH_CONFIG_BYTES:
+            raise OSError(errno.E2BIG, "target launch configuration is too large")
+
+    for argument in arguments:
+        append(argument)
+    for key, value in environment:
+        if not key or b"=" in key:
+            raise OSError(errno.EINVAL, "invalid target environment key")
+        append(key)
+        append(value)
+    return struct.pack(
+        "!4sIII", LAUNCH_CONFIG_MAGIC, len(arguments), len(environment), len(body)
+    ) + body
+
+
+def decode_launch_config(fd: int) -> tuple[list[bytes], dict[bytes, bytes]]:
+    """Decode one bounded target configuration inside the fresh helper."""
+    deadline = time.monotonic() + LAUNCH_PROTOCOL_TIMEOUT_SECONDS
+    header = read_exact_fd(fd, struct.calcsize("!4sIII"), deadline)
+    magic, argument_count, environment_count, body_size = struct.unpack("!4sIII", header)
+    if (
+        magic != LAUNCH_CONFIG_MAGIC
+        or argument_count == 0
+        or argument_count + environment_count > MAX_LAUNCH_CONFIG_ITEMS
+        or body_size > MAX_LAUNCH_CONFIG_BYTES
+    ):
+        raise OSError(errno.EINVAL, "invalid target launch configuration")
+    body = read_exact_fd(fd, body_size, deadline)
+    offset = 0
+
+    def take() -> bytes:
+        nonlocal offset
+        if offset + 4 > len(body):
+            raise OSError(errno.EINVAL, "truncated target launch configuration")
+        size = struct.unpack("!I", body[offset : offset + 4])[0]
+        offset += 4
+        if offset + size > len(body):
+            raise OSError(errno.EINVAL, "truncated target launch configuration")
+        value = body[offset : offset + size]
+        offset += size
+        if b"\0" in value:
+            raise OSError(errno.EINVAL, "invalid target launch value")
+        return value
+
+    arguments = [take() for _ in range(argument_count)]
+    environment: dict[bytes, bytes] = {}
+    for _ in range(environment_count):
+        key = take()
+        value = take()
+        if not key or b"=" in key or key in environment:
+            raise OSError(errno.EINVAL, "invalid target environment")
+        environment[key] = value
+    if offset != len(body):
+        raise OSError(errno.EINVAL, "oversized target launch configuration")
+    return arguments, environment
+
+
+def read_exec_result(fd: int, deadline: float) -> tuple[bool, int | None]:
+    """Read explicit exec-attempt state and an optional structured errno."""
+    os.set_blocking(fd, False)
+    payload = bytearray()
+    with selectors.DefaultSelector() as selector:
+        selector.register(fd, selectors.EVENT_READ)
+        while True:
+            if interrupted_signal is not None:
+                raise InterruptedError("launch interrupted before target exec completed")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("target exec did not finish before launch deadline")
+            if not selector.select(min(remaining, PROCESS_POLL_SECONDS)):
+                continue
+            try:
+                chunk = os.read(fd, 2 + LAUNCH_PROTOCOL_BYTES - len(payload))
+            except (BlockingIOError, InterruptedError):
+                continue
+            if not chunk:
+                if payload == b"A":
+                    return True, None
+                failure = payload[1:] if payload.startswith(b"A") else payload
+                if len(failure) != 1 + LAUNCH_PROTOCOL_BYTES or failure[:1] != b"E":
+                    raise OSError(errno.EPROTO, "invalid target exec result frame")
+                return payload.startswith(b"A"), struct.unpack("!i", failure[1:])[0]
+            payload.extend(chunk)
+            if len(payload) > 2 + LAUNCH_PROTOCOL_BYTES:
+                raise OSError(errno.EPROTO, "oversized target exec error frame")
+
+
+def close_fd(fd: int | None) -> None:
+    """Close one optional launch-protocol endpoint."""
+    if fd is None or fd < 0:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def normalize_internal_fd(descriptor: int) -> int:
+    """Move one owned internal descriptor above stdio or close it on failure."""
+    replacement: int | None = None
+    try:
+        if descriptor < 3:
+            duplicate_command = getattr(fcntl, "F_DUPFD_CLOEXEC", fcntl.F_DUPFD)
+            replacement = fcntl.fcntl(descriptor, duplicate_command, 3)
+            os.set_inheritable(replacement, False)
+            os.close(descriptor)
+            descriptor = replacement
+            replacement = None
+        else:
+            os.set_inheritable(descriptor, False)
+        return descriptor
+    except BaseException:
+        close_fd(replacement)
+        close_fd(descriptor)
+        raise
+
+
+def normalize_internal_pair(left: int, right: int) -> tuple[int, int]:
+    """Normalize an owned descriptor pair with all-or-nothing cleanup."""
+    normalized_left: int | None = None
+    try:
+        owned_left = left
+        left = -1
+        normalized_left = normalize_internal_fd(owned_left)
+        owned_right = right
+        right = -1
+        normalized_right = normalize_internal_fd(owned_right)
+        return normalized_left, normalized_right
+    except BaseException:
+        close_fd(normalized_left)
+        close_fd(left)
+        close_fd(right)
+        raise
+
+
+def protocol_pipe() -> tuple[int, int]:
+    """Create a CLOEXEC pipe whose endpoints cannot alias standard streams."""
+    left, right = os.pipe()
+    return normalize_internal_pair(left, right)
+
+
+def protocol_socketpair(kind: int = socket.SOCK_STREAM) -> tuple[int, int]:
+    """Create a CLOEXEC socket pair whose endpoints cannot alias stdio."""
+    left_socket = right_socket = None
+    left = right = -1
+    try:
+        left_socket, right_socket = socket.socketpair(type=kind)
+        left = left_socket.detach()
+        right = right_socket.detach()
+        owned_left, owned_right = left, right
+        left = right = -1
+        return normalize_internal_pair(owned_left, owned_right)
+    except BaseException:
+        close_fd(left)
+        close_fd(right)
+        if left_socket is not None:
+            left_socket.close()
+        if right_socket is not None:
+            right_socket.close()
+        raise
+
+
+def valid_boundary_token(token: str) -> bool:
+    """Validate one unforgeable boundary component."""
+    return len(token) == 64 and all(character in "0123456789abcdefABCDEF" for character in token)
+
+
+def extend_boundary_chain(existing: str | None, current: str) -> str:
+    """Append one boundary without truncating or accepting invalid ancestry."""
+    if not valid_boundary_token(current):
+        raise OSError(errno.EINVAL, "invalid owned-session boundary")
+    ancestors = [] if not existing else existing.split(":")
+    if any(not valid_boundary_token(token) for token in ancestors):
+        raise OSError(errno.EINVAL, "invalid inherited owned-session boundary")
+    if len(ancestors) >= MAX_ANCESTOR_BOUNDARIES:
+        raise OSError(errno.E2BIG, "too many inherited owned-session boundaries")
+    return ":".join([*ancestors, current])
+
+
+def validate_socket_fds(value: str | None, description: str) -> list[int]:
+    """Validate a bounded inherited socket descriptor list."""
+    if not value:
+        return []
+    fields = value.split(":")
+    if len(fields) > MAX_ANCESTOR_BOUNDARIES:
+        raise OSError(errno.EINVAL, f"too many inherited {description} descriptors")
+    descriptors: list[int] = []
+    for field in fields:
+        if not field.isdecimal() or str(int(field)) != field:
+            raise OSError(errno.EINVAL, f"invalid inherited {description} descriptor")
+        descriptor = int(field)
+        if descriptor < 3 or descriptor in descriptors:
+            raise OSError(errno.EINVAL, f"invalid inherited {description} descriptor")
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError as error:
+            raise OSError(
+                errno.EINVAL, f"invalid inherited {description} descriptor"
+            ) from error
+        if not stat.S_ISSOCK(metadata.st_mode):
+            raise OSError(errno.EINVAL, f"inherited {description} descriptor is not a socket")
+        descriptors.append(descriptor)
+    return descriptors
+
+
+def validate_lease_fds(value: str | None) -> list[int]:
+    """Validate a bounded ancestor-lease descriptor list without widening it."""
+    return validate_socket_fds(value, "session lease")
+
+
+def validate_control_fds(value: str | None) -> list[int]:
+    """Validate the immediate-parent supervisor rendezvous."""
+    descriptors = validate_socket_fds(value, "supervisor control")
+    if len(descriptors) > 1:
+        raise OSError(errno.EINVAL, "nested supervision requires one parent control")
+    return descriptors
+
+
+def publish_nested_supervisor(
+    control_fds: list[int], chain: str
+) -> socket.socket | None:
+    """Register one private session link with the immediate parent."""
+    if not control_fds:
+        return None
+    if len(control_fds) != 1:
+        raise OSError(errno.EINVAL, "nested supervision requires one parent control")
+    token = chain.rsplit(":", 1)[-1]
+    if not valid_boundary_token(token):
+        raise OSError(errno.EINVAL, "invalid nested-supervisor boundary")
+    frame = CONTROL_FRAME_MAGIC + struct.pack("!I", os.getpid()) + token.encode("ascii")
+    if len(frame) != CONTROL_FRAME_BYTES:
+        raise OSError(errno.EINVAL, "invalid nested-supervisor registration")
+    local_fd = parent_fd = None
+    local = parent = rendezvous = None
+    try:
+        os.set_inheritable(control_fds[0], False)
+        local_fd, parent_fd = protocol_socketpair()
+        local = socket.socket(fileno=local_fd)
+        local_fd = None
+        parent = socket.socket(fileno=parent_fd)
+        parent_fd = None
+        rendezvous = socket.socket(fileno=control_fds[0])
+        rights = array.array("i", [parent.fileno()])
+        try:
+            written = rendezvous.sendmsg(
+                [frame],
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+                getattr(socket, "MSG_DONTWAIT", 0) | getattr(socket, "MSG_NOSIGNAL", 0),
+            )
+        except BlockingIOError as error:
+            raise OSError(errno.EAGAIN, "supervisor registration would block") from error
+        if written != len(frame):
+            raise OSError(errno.EIO, "short supervisor registration")
+        # Hold our copy of the registered end until the ACK below, not just
+        # until the send. The datagram (with its in-flight descriptor) can
+        # sit unread while the supervisor drains, and closing our copy during
+        # that window corrupts the pending macOS install: links observe
+        # phantom EOF plus HUP despite open peers, and stale-registration
+        # strikes unregister live supervisors. The native publisher holds
+        # its copy the same way; the finally below still closes every copy
+        # on the error paths.
+        local.setblocking(False)
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH sent pid={os.getpid()} token={token}")
+        deadline = time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
+        with selectors.DefaultSelector() as selector:
+            selector.register(local, selectors.EVENT_READ)
+            while True:
+                if interrupted_signal is not None:
+                    raise InterruptedError("nested-supervisor registration interrupted")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+                    _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH ack timeout pid={os.getpid()}")
+                    raise TimeoutError("nested-supervisor registration timed out")
+                if not selector.select(min(remaining, PROCESS_POLL_SECONDS)):
+                    continue
+                reply = local.recv(2)
+                if reply == b"\1":
+                    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+                    _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH acked pid={os.getpid()}")
+                    parent.close()
+                    parent = None
+                    return local
+                # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+                _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH rejected pid={os.getpid()} reply={reply!r}")
+                raise OSError(errno.EPROTO, "nested-supervisor registration was rejected")
+    finally:
+        if rendezvous is not None:
+            rendezvous.detach()
+        if parent is not None:
+            parent.close()
+        close_fd(parent_fd)
+        close_fd(local_fd)
+        if sys.exc_info()[0] is not None and local is not None:
+            local.close()
+
+
+def invalidate_nested_control() -> None:
+    """Revoke every delegation hint after incomplete or invalid control input."""
+    global nested_control_complete
+    nested_control_complete = False
+    for _pid, link in nested_supervisors.values():
+        link.close()
+    nested_supervisors.clear()
+    nested_unhealthy_strikes.clear()
+    nested_peek_logged.clear()
+
+
+def nested_supervisor_belongs_to_session(supervisor: int, leader: int) -> bool:
+    """Validate one authenticated peer inside the retained target session."""
+    if supervisor == leader:
+        return True
+    try:
+        return os.getsid(supervisor) == leader
+    except (PermissionError, ProcessLookupError, OSError):
+        return False
+
+
+def drain_nested_supervisors(
+    deadline: float | None = None,
+    snapshot: list[SessionProcess] | None = None,
+    unregister: bool = True,
+) -> bool:
+    """Incorporate every published nested owner before attributing processes.
+
+    `snapshot` is a fresh process-table observation the caller takes
+    before draining: a supervisor it shows live is never unregistered,
+    no matter what the link peek reports, so a transient peek anomaly
+    cannot orphan a live nested session. Peeks still fail closed for
+    dead or absent supervisors (three consecutive anomalies), and
+    unexpected link data still invalidates unconditionally.
+    """
+    global nested_control_complete, nested_ever_registered
+    if control_reader is None:
+        return nested_control_complete
+    snapshot_live = {
+        item.pid for item in snapshot or () if item.live
+    }
+    closed = []
+    for token, (supervisor, link) in nested_supervisors.items():
+        try:
+            payload = link.recv(1, getattr(socket, "MSG_PEEK", 0))
+        except BlockingIOError:
+            nested_unhealthy_strikes[token] = 0
+            nested_peek_logged.discard(token)
+            continue
+        except InterruptedError:
+            nested_unhealthy_strikes[token] = 0
+            nested_peek_logged.discard(token)
+            continue
+        except OSError as error:
+            anomaly = f"os-error:{error.errno}"
+            payload = None
+        else:
+            anomaly = "ok" if payload else "eof"
+        if payload:
+            invalidate_nested_control()
+            return False
+        if supervisor in snapshot_live:
+            # A live snapshot overrules any peek anomaly: the owner
+            # is demonstrably alive, so keep it and reset.
+            nested_unhealthy_strikes[token] = 0
+        else:
+            strikes = nested_unhealthy_strikes.get(token, 0) + 1
+            nested_unhealthy_strikes[token] = strikes
+            if unregister and strikes >= 3:
+                # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+                _temp_diag(
+                    f"TEMP-DIAG-180 LINK-UNREG pid={os.getpid()} "
+                    f"supervisor={supervisor} anomaly={anomaly} "
+                    f"strikes={strikes}"
+                )
+                closed.append(token)
+                nested_peek_logged.discard(token)
+                continue
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        # Log once per open anomaly bout; a persistent anomaly would
+        # otherwise exhaust the diagnostic budget.
+        if token not in nested_peek_logged:
+            nested_peek_logged.add(token)
+            in_snapshot = (
+                "live"
+                if supervisor in snapshot_live
+                else ("dead" if snapshot is not None else "none")
+            )
+            _temp_diag(
+                f"TEMP-DIAG-180 LINK-PEEK pid={os.getpid()} "
+                f"supervisor={supervisor} anomaly={anomaly} "
+                f"strikes={nested_unhealthy_strikes.get(token, 0)} "
+                f"snapshot={in_snapshot} unregister={unregister}"
+            )
+    for token in closed:
+        _pid, link = nested_supervisors.pop(token)
+        nested_unhealthy_strikes.pop(token, None)
+        link.close()
+    for _ in range(128):
+        if deadline is not None and time.monotonic() >= deadline:
+            invalidate_nested_control()
+            return False
+        try:
+            endpoint = socket.socket(fileno=control_reader)
+            try:
+                frame, ancillary, flags, _address = endpoint.recvmsg(
+                    CONTROL_FRAME_BYTES + 1,
+                    socket.CMSG_SPACE(array.array("i").itemsize),
+                    getattr(socket, "MSG_DONTWAIT", 0),
+                )
+            finally:
+                endpoint.detach()
+        except BlockingIOError:
+            return nested_control_complete
+        except InterruptedError:
+            continue
+        except ConnectionResetError:
+            # Darwin reports ECONNRESET (not EAGAIN) when the datagram
+            # queue is empty: the child closes the CLOEXEC control
+            # writer at exec, so a session with no nested supervisor
+            # deterministically resets while Linux reports EAGAIN for
+            # the same state. A reset carries no bytes and cannot
+            # forge a delegation, so treat it as "no data this tick"
+            # exactly like the native supervisor does.
+            return nested_control_complete
+        except OSError:
+            invalidate_nested_control()
+            return False
+        received_fds: list[int] = []
+        for level, kind, payload in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                values = array.array("i")
+                values.frombytes(payload[: len(payload) - len(payload) % values.itemsize])
+                received_fds.extend(values)
+        if (
+            not frame
+            or len(frame) != CONTROL_FRAME_BYTES
+            or not frame.startswith(CONTROL_FRAME_MAGIC)
+            or flags & getattr(socket, "MSG_CTRUNC", 0)
+            or len(received_fds) != 1
+        ):
+            for descriptor in received_fds:
+                close_fd(descriptor)
+            invalidate_nested_control()
+            return False
+        supervisor = struct.unpack("!I", frame[len(CONTROL_FRAME_MAGIC):8])[0]
+        token = frame[8:].decode("ascii", errors="ignore")
+        link_fd = received_fds.pop()
+        try:
+            link_fd = normalize_internal_fd(link_fd)
+            link = socket.socket(fileno=link_fd)
+            link_fd = -1
+            link.setblocking(False)
+            if sys.platform.startswith("linux"):
+                peer = struct.unpack(
+                    "3i",
+                    link.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12),
+                )[0]
+            elif sys.platform == "darwin":
+                peer = struct.unpack(
+                    "i",
+                    link.getsockopt(
+                        getattr(socket, "SOL_LOCAL", 0),
+                        getattr(socket, "LOCAL_PEERPID", 2),
+                        4,
+                    ),
+                )[0]
+            else:
+                raise OSError(errno.ENOTSUP, "supervisor peer identity unavailable")
+        except BaseException:
+            close_fd(link_fd)
+            invalidate_nested_control()
+            return False
+        expected = process.pid if process is not None else 0
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(
+            f"TEMP-DIAG-180 NESTED-DRAIN frame supervisor={supervisor} peer={peer} "
+            f"expected={expected} token={token} dup={token in nested_supervisors}"
+        )
+        if (
+            supervisor <= 0
+            or not nested_supervisor_belongs_to_session(supervisor, expected)
+            or peer != supervisor
+            or not valid_boundary_token(token)
+            or token in nested_supervisors
+            or len(nested_supervisors) >= 1024
+        ):
+            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+            _temp_diag(
+                f"TEMP-DIAG-180 NESTED-DRAIN rejected supervisor={supervisor}"
+            )
+            link.close()
+            invalidate_nested_control()
+            return False
+        try:
+            link.sendall(b"\1")
+        except OSError:
+            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+            _temp_diag(
+                f"TEMP-DIAG-180 NESTED-DRAIN ack failed supervisor={supervisor}"
+            )
+            link.close()
+            invalidate_nested_control()
+            return False
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(f"TEMP-DIAG-180 NESTED-DRAIN acked supervisor={supervisor}")
+        nested_supervisors[token] = (supervisor, link)
+        nested_ever_registered = True
+    # The fixed loop count is a per-call work budget, not a protocol error.
+    # Every accepted supervisor is recorded before its ACK; any registration
+    # still queued remains authorization-gated and cannot have launched target
+    # code. The next supervision tick resumes draining.
+    return nested_control_complete
+
+
+def stream_requires_relay(fd: int) -> bool:
+    """Return whether inheriting this caller stream can prolong pipe lifetime."""
+    if 0 <= fd <= 2 and ENTRY_STDIO_MASK & (1 << fd) == 0:
+        return False
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError:
+        return False
+    return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
+
+
+# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis. Best-effort
+# direct write: diagnostic() forks a writer child, and fork latency inside
+# stop perturbs the nested-teardown race under diagnosis. Temporarily flip
+# fd 2 non-blocking, drop on backpressure, and always restore flags.
+_temp_diag_remaining = 48
+
+
+def _temp_diag(message: str) -> None:
+    global _temp_diag_remaining
+    if _temp_diag_remaining <= 0:
+        return
+    # Env-gated: exact-stderr assertions stay green where unset.
+    if not os.environ.get("DOT_TEST_DIAG_NESTED"):
+        return
+    if ENTRY_STDIO_MASK & (1 << 2) == 0:
+        return
+    try:
+        stream_fd = sys.stderr.fileno()
+    except (AttributeError, OSError):
+        return
+    if stream_fd != 2:
+        return
+    _temp_diag_remaining -= 1
+    payload = (message + "\n").encode("utf-8", errors="replace")[:4096]
+    try:
+        flags = fcntl.fcntl(2, fcntl.F_GETFL)
+    except (AttributeError, OSError):
+        return
+    try:
+        fcntl.fcntl(2, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    except (AttributeError, OSError):
+        return
+    try:
+        os.write(2, payload)
+    except (BlockingIOError, InterruptedError, OSError):
+        pass
+    finally:
+        try:
+            fcntl.fcntl(2, fcntl.F_SETFL, flags)
+        except (AttributeError, OSError):
+            pass
+
+
+def diagnostic(message: str) -> None:
+    """Best-effort diagnostics that cannot strand teardown on a full pipe."""
+    if ENTRY_STDIO_MASK & (1 << 2) == 0:
+        return
+    try:
+        stream_fd = sys.stderr.fileno()
+    except (AttributeError, OSError):
+        # Embedded callers and the deterministic unit harness can provide an
+        # in-memory stream. The executable boundary always has fd 2 and uses
+        # the bounded process writer below.
+        try:
+            sys.stderr.write(message + "\n")
+            sys.stderr.flush()
+        except (AttributeError, OSError):
+            pass
+        return
+    if stream_fd != 2:
+        try:
+            sys.stderr.write(message + "\n")
+            sys.stderr.flush()
+        except (AttributeError, OSError):
+            pass
+        return
+    payload = (message + "\n").encode("utf-8", errors="replace")[:4096]
+    if not stream_requires_relay(2):
+        try:
+            write_all_fd(2, payload)
+        except OSError:
+            pass
+        return
+    expected_parent = os.getpid()
+    try:
+        writer = os.fork()
+    except OSError:
+        return
+    if writer == 0:
+        bind_linux_parent_death(expected_parent)
+        for handled_signal in handled_signals + subprocess_restored_signals:
+            signal.signal(handled_signal, signal.SIG_DFL)
+        try:
+            write_all_fd(2, payload)
+        except OSError:
+            os._exit(1)
+        os._exit(0)
+    deadline = time.monotonic() + 0.25
+    while time.monotonic() < deadline:
+        try:
+            waited, _status = os.waitpid(writer, os.WNOHANG)
+        except ChildProcessError:
+            return
+        except InterruptedError:
+            continue
+        except OSError:
+            break
+        if waited == writer:
+            return
+        time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+    try:
+        os.kill(writer, signal.SIGKILL)
+    except (PermissionError, ProcessLookupError):
+        pass
+    reap_deadline = time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
+    while time.monotonic() < reap_deadline:
+        try:
+            waited, _status = os.waitpid(writer, os.WNOHANG)
+        except ChildProcessError:
+            return
+        except InterruptedError:
+            continue
+        except OSError:
+            return
+        if waited == writer:
+            return
+        time.sleep(min(0.01, max(0.0, reap_deadline - time.monotonic())))
+
+
+def _kcmp_syscall_number():
+    """kcmp(2) syscall number for this machine, or None when unknown."""
+    syscall_numbers = {
+        "aarch64": 272,
+        "armv7l": 378,
+        "i386": 349,
+        "i686": 349,
+        "riscv64": 272,
+        "x86_64": 312,
+    }
+    return syscall_numbers.get(os.uname().machine)
+
+
+def kcmp_available() -> bool:
+    """Whether the kcmp syscall answers instead of failing EPERM/ENOSYS.
+
+    Container runtimes withhold CAP_SYS_PTRACE (seccomp EPERM) and kernels
+    older than 3.5 lack the call (ENOSYS); both force the procfs fallback,
+    which over-matches path-backed links of one path.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    syscall_number = _kcmp_syscall_number()
+    if syscall_number is None:
+        return False
+    try:
+        import ctypes
+    except ImportError:
+        return False
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    # KCMP_FILE == 0 on fds (0, 0): any answer other than EPERM/ENOSYS
+    # proves the call itself is permitted (EBADF from a closed stdin
+    # still means the syscall executed).
+    result = libc.syscall(syscall_number, os.getpid(), os.getpid(), 0, 0, 0)
+    return result != -1 or ctypes.get_errno() not in (errno.EPERM, errno.ENOSYS)
+
+
+def same_stream(left: int, right: int) -> bool:
+    """Return whether two descriptors share one open file description."""
+    if left == right:
+        return True
+    if not sys.platform.startswith("linux"):
+        # POSIX fstat identity is not enough: two independent opens of one
+        # FIFO/socket have the same inode but independent flags and ordering.
+        # Keeping separate relays is the conservative portable fallback.
+        return False
+    syscall_number = _kcmp_syscall_number()
+    if syscall_number is None:
+        return False
+    try:
+        import ctypes
+    except ImportError:
+        return False
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    # KCMP_FILE == 0. A zero result is the kernel's exact proof that the two
+    # descriptors reference one open file description.
+    result = libc.syscall(
+        syscall_number,
+        os.getpid(),
+        os.getpid(),
+        0,
+        left,
+        right,
+    )
+    if result == 0:
+        return True
+    if result != -1:
+        # A nonzero KCMP ordering result proves distinct descriptions.
+        return False
+    if ctypes.get_errno() not in (errno.EPERM, errno.ENOSYS):
+        # A closed descriptor or a bad call still fails closed.
+        return False
+    # kcmp needs CAP_SYS_PTRACE, which container runtimes withhold, and
+    # kernels older than 3.5 lack the call entirely. Fall back to the
+    # /proc/self/fd link comparison there: anonymous objects (pipes,
+    # sockets) compare by kernel inode, so duplicates match and distinct
+    # objects do not. Path-backed links can over-match separately opened
+    # descriptions of one path (notably /dev/null); merging those
+    # captures is benign because the relay still delivers identical
+    # bytes to both inherited sinks.
+    try:
+        return os.readlink('/proc/self/fd/%d' % left) == os.readlink(
+            '/proc/self/fd/%d' % right
+        )
+    except OSError:
+        return False
+
+
+def prepare_stdio_relays(
+) -> tuple[dict[str, int], list[tuple[str, int, int]], list[int]]:
+    """Interpose internal pipes for caller-owned FIFO/socket standard streams."""
+    popen_stdio: dict[str, int] = {}
+    relay_specs: list[tuple[str, int, int]] = []
+    child_endpoints: list[int] = []
+    try:
+        if stream_requires_relay(0):
+            child_read, relay_write = protocol_pipe()
+            popen_stdio["stdin"] = child_read
+            child_endpoints.append(child_read)
+            relay_specs.append(("input", 0, relay_write))
+        relay_stdout = stream_requires_relay(1)
+        relay_stderr = stream_requires_relay(2)
+        aliased_output = relay_stdout and relay_stderr and same_stream(1, 2)
+        if aliased_output:
+            relay_read, child_write = protocol_pipe()
+            popen_stdio["stdout"] = child_write
+            popen_stdio["stderr"] = child_write
+            child_endpoints.append(child_write)
+            relay_specs.append(("output", relay_read, 1))
+        elif relay_stdout:
+            relay_read, child_write = protocol_pipe()
+            popen_stdio["stdout"] = child_write
+            child_endpoints.append(child_write)
+            relay_specs.append(("output", relay_read, 1))
+        if relay_stderr and not aliased_output:
+            relay_read, child_write = protocol_pipe()
+            popen_stdio["stderr"] = child_write
+            child_endpoints.append(child_write)
+            relay_specs.append(("output", relay_read, 2))
+        return popen_stdio, relay_specs, child_endpoints
+    except BaseException:
+        close_relay_specs(relay_specs)
+        for descriptor in child_endpoints:
+            close_fd(descriptor)
+        raise
+
+
+def publish_relay_state(descriptor: int, state: bytes) -> None:
+    """Publish one nonblocking relay state transition."""
+    endpoint = socket.socket(fileno=descriptor)
+    try:
+        endpoint.send(state, getattr(socket, "MSG_DONTWAIT", 0))
+    except (BlockingIOError, BrokenPipeError, OSError):
+        pass
+    finally:
+        endpoint.detach()
+
+
+def relay_stream(direction: str, state_fd: int, parent_fd: int) -> None:
+    """Copy fd0 to fd1 in a fresh independently killable helper process."""
+    try:
+        for restored_signal in handled_signals + subprocess_restored_signals:
+            signal.signal(restored_signal, signal.SIG_DFL)
+        last_state = b""
+
+        def state(value: bytes) -> None:
+            nonlocal last_state
+            if value != last_state:
+                publish_relay_state(state_fd, value)
+                last_state = value
+
+        while True:
+            state(b"R")
+            with selectors.DefaultSelector() as reader:
+                reader.register(0, selectors.EVENT_READ)
+                reader.register(parent_fd, selectors.EVENT_READ)
+                while True:
+                    events = reader.select(PROCESS_POLL_SECONDS)
+                    if any(key.fd == parent_fd for key, _event in events):
+                        if os.read(parent_fd, 1) == b"":
+                            os._exit(0)
+                    if any(key.fd == 0 for key, _event in events):
+                        try:
+                            chunk = os.read(0, 65536)
+                        except (BlockingIOError, InterruptedError):
+                            continue
+                        break
+            if not chunk:
+                state(b"E")
+                os._exit(0)
+            offset = 0
+            state(b"W")
+            with selectors.DefaultSelector() as writer:
+                writer.register(1, selectors.EVENT_WRITE)
+                writer.register(parent_fd, selectors.EVENT_READ)
+                source_state = select.poll()
+                source_state.register(0, select.POLLIN | select.POLLHUP | select.POLLERR)
+                while offset < len(chunk):
+                    if any(
+                        events & (select.POLLHUP | select.POLLERR)
+                        for _fd, events in source_state.poll(0)
+                    ):
+                        # No writer can add more bytes to the internal source.
+                        # If the caller sink remains blocked, teardown is an
+                        # ordinary output-delivery failure rather than an
+                        # unattributed descendant retaining the source open.
+                        state(b"C")
+                    events = writer.select(PROCESS_POLL_SECONDS)
+                    if any(key.fd == parent_fd for key, _event in events):
+                        if os.read(parent_fd, 1) == b"":
+                            os._exit(0)
+                    if not any(key.fd == 1 for key, _event in events):
+                        continue
+                    try:
+                        written = os.write(1, chunk[offset:])
+                    except (BlockingIOError, InterruptedError):
+                        continue
+                    except BrokenPipeError:
+                        os._exit(0 if direction == "input" else 128 + signal.SIGPIPE)
+                    if written <= 0:
+                        os._exit(1)
+                    offset += written
+    except BrokenPipeError:
+        os._exit(0 if direction == "input" else 128 + signal.SIGPIPE)
+    except BaseException:
+        os._exit(1)
+
+
+def stdio_relay_watchdog(
+    direction: str,
+    source: int,
+    destination: int,
+    state_write: int,
+    parent_read: int,
+    boundary_chain: str,
+) -> None:
+    """Own a potentially blocked relay and kill it when its wrapper dies."""
+    for handled_signal in handled_signals + subprocess_restored_signals:
+        signal.signal(handled_signal, signal.SIG_IGN)
+    os.setsid()
+    expected_parent = os.getpid()
+    relay = os.fork()
+    if relay == 0:
+        try:
+            bind_linux_parent_death(expected_parent)
+            os.dup2(source, 0)
+            os.dup2(destination, 1)
+            close_fd(2)
+            for retained in (state_write, parent_read):
+                flags = fcntl.fcntl(retained, fcntl.F_GETFD)
+                fcntl.fcntl(retained, fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
+            maximum = os.sysconf("SC_OPEN_MAX")
+            if not isinstance(maximum, int) or maximum < 3:
+                maximum = 65536
+            retained = sorted((state_write, parent_read))
+            start = 3
+            for descriptor in retained:
+                os.closerange(start, descriptor)
+                start = descriptor + 1
+            os.closerange(start, maximum)
+            os.execve(
+                sys.executable,
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    str(Path(__file__).resolve()),
+                    RELAY_HELPER_MODE,
+                    direction,
+                    str(state_write),
+                    str(parent_read),
+                ],
+                {SESSION_BOUNDARY_ENV: boundary_chain},
+            )
+        except BaseException:
+            os._exit(1)
+    if relay < 0:
+        os._exit(125)
+
+    close_fd(state_write)
+    if source >= 3:
+        close_fd(source)
+    if destination >= 3:
+        close_fd(destination)
+    close_fd(0)
+    close_fd(1)
+    close_fd(2)
+    maximum = os.sysconf("SC_OPEN_MAX")
+    if not isinstance(maximum, int) or maximum < 3:
+        maximum = 65536
+    os.closerange(3, parent_read)
+    os.closerange(parent_read + 1, maximum)
+    os.set_blocking(parent_read, False)
+    stopping_at = None
+    while True:
+        try:
+            waited, status = os.waitpid(relay, os.WNOHANG)
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            os._exit(125)
+        if waited == relay:
+            if stopping_at is not None:
+                os._exit(0)
+            if os.WIFEXITED(status):
+                os._exit(os.WEXITSTATUS(status))
+            if os.WIFSIGNALED(status):
+                os._exit(min(255, 128 + os.WTERMSIG(status)))
+            os._exit(1)
+        try:
+            parent_state = os.read(parent_read, 1)
+        except BlockingIOError:
+            parent_state = None
+        except InterruptedError:
+            continue
+        except OSError:
+            parent_state = b""
+        if parent_state is not None:
+            if stopping_at is None:
+                stopping_at = time.monotonic()
+            try:
+                os.kill(relay, signal.SIGKILL)
+            except (PermissionError, ProcessLookupError):
+                pass
+        if (
+            stopping_at is not None
+            and time.monotonic() - stopping_at >= PROCESS_SNAPSHOT_TIMEOUT_SECONDS
+        ):
+            # Both processes are in this watchdog's private session. If the
+            # exact child cannot be reaped, terminate the whole helper group;
+            # the caller reports incomplete cleanup after its own deadline.
+            try:
+                os.killpg(os.getpid(), signal.SIGKILL)
+            except (PermissionError, ProcessLookupError):
+                pass
+            os._exit(125)
+        time.sleep(PROCESS_POLL_SECONDS)
+
+
+def start_stdio_relays(
+    relay_specs: list[tuple[str, int, int]], boundary_chain: str
+) -> None:
+    """Start every prepared relay only after target exec authorization."""
+    while relay_specs:
+        direction, source, destination = relay_specs.pop(0)
+        state_read = state_write = None
+        parent_read = parent_write = None
+        try:
+            state_read, state_write = protocol_socketpair(socket.SOCK_DGRAM)
+            os.set_blocking(state_read, False)
+            parent_read, parent_write = protocol_pipe()
+            os.set_blocking(parent_read, False)
+            pid = os.fork()
+        except BaseException:
+            close_fd(state_read)
+            close_fd(state_write)
+            close_fd(parent_read)
+            close_fd(parent_write)
+            close_fd(source if source >= 3 else None)
+            close_fd(destination if destination >= 3 else None)
+            close_relay_specs(relay_specs)
+            relay_specs.clear()
+            raise
+        if pid == 0:
+            try:
+                close_fd(state_read)
+                close_fd(parent_write)
+                stdio_relay_watchdog(
+                    direction,
+                    source,
+                    destination,
+                    state_write,
+                    parent_read,
+                    boundary_chain,
+                )
+            except BaseException:
+                os._exit(1)
+        stdio_relay_pids[pid] = direction
+        stdio_relay_state_fds[pid] = state_read
+        stdio_relay_states[pid] = b""
+        stdio_relay_parent_fds[pid] = parent_write
+        close_fd(state_write)
+        close_fd(parent_read)
+        if source >= 3:
+            close_fd(source)
+        if destination >= 3:
+            close_fd(destination)
+
+
+def close_relay_specs(relay_specs: list[tuple[str, int, int]]) -> None:
+    """Close prepared internal endpoints when target launch never completes."""
+    for _direction, source, destination in relay_specs:
+        if source >= 3:
+            close_fd(source)
+        if destination >= 3:
+            close_fd(destination)
+
+
+def poll_stdio_relay_states() -> None:
+    """Drain bounded relay-state datagrams without delaying supervision."""
+    for pid, descriptor in list(stdio_relay_state_fds.items()):
+        endpoint = socket.socket(fileno=descriptor)
+        try:
+            for _ in range(128):
+                try:
+                    state = endpoint.recv(2)
+                except BlockingIOError:
+                    break
+                except InterruptedError:
+                    continue
+                except OSError:
+                    stdio_relay_states[pid] = b"X"
+                    break
+                if state not in (b"R", b"W", b"C", b"E"):
+                    stdio_relay_states[pid] = b"X"
+                    break
+                stdio_relay_states[pid] = state
+        finally:
+            endpoint.detach()
+
+
+def stop_stdio_relays(deadline: float) -> bool:
+    """Boundedly drain, then kill and reap all wrapper-owned relay processes."""
+    global stdio_relay_status
+    pending = dict(stdio_relay_pids)
+    intentionally_killed: set[int] = set()
+    complete = True
+
+    def forget_relay(pid: int) -> None:
+        stdio_relay_pids.pop(pid, None)
+        close_fd(stdio_relay_state_fds.pop(pid, None))
+        stdio_relay_states.pop(pid, None)
+        close_fd(stdio_relay_parent_fds.pop(pid, None))
+
+    def record_status(pid: int, status: int) -> None:
+        global stdio_relay_status
+        if (
+            pid in intentionally_killed
+            and os.WIFSIGNALED(status)
+            and os.WTERMSIG(status) == signal.SIGKILL
+        ):
+            return
+        if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+            return
+        if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 128 + signal.SIGPIPE:
+            failure = 128 + signal.SIGPIPE
+        elif os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGPIPE:
+            failure = 128 + signal.SIGPIPE
+        else:
+            failure = 1
+        if stdio_relay_status is None:
+            stdio_relay_status = failure
+
+    # Observe already-terminal input relays before issuing our own SIGKILL so
+    # an independent exec/I/O failure cannot be mislabeled intentional.
+    poll_stdio_relay_states()
+    for pid in list(pending):
+        try:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            waited, status = pid, 0
+        except (InterruptedError, OSError):
+            continue
+        if waited == pid:
+            record_status(pid, status)
+            pending.pop(pid)
+            forget_relay(pid)
+    for pid, direction in pending.items():
+        if direction != "input":
+            continue
+        # Closing the private liveness writer asks the isolated watchdog to
+        # kill and reap its possibly blocked relay.  The wrapper never has to
+        # wait on the process that performs external I/O.
+        close_fd(stdio_relay_parent_fds.pop(pid, None))
+        intentionally_killed.add(pid)
+    while pending and time.monotonic() < deadline:
+        poll_stdio_relay_states()
+        for pid in list(pending):
+            try:
+                waited, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                waited = pid
+                status = 0
+            except (InterruptedError, OSError):
+                continue
+            if waited == pid:
+                record_status(pid, status)
+                pending.pop(pid)
+                forget_relay(pid)
+        if pending:
+            time.sleep(min(PROCESS_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+    for pid, direction in pending.items():
+        if direction == "output":
+            relay_state = stdio_relay_states.get(pid, b"")
+            if relay_state == b"C" and stdio_relay_status is None:
+                stdio_relay_status = 1
+            elif relay_state != b"C":
+                complete = False
+        close_fd(stdio_relay_parent_fds.pop(pid, None))
+    kill_deadline = time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
+    while pending and time.monotonic() < kill_deadline:
+        poll_stdio_relay_states()
+        for pid in list(pending):
+            try:
+                waited, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                waited = pid
+                status = 0
+            except (InterruptedError, OSError):
+                continue
+            if waited == pid:
+                record_status(pid, status)
+                pending.pop(pid)
+                forget_relay(pid)
+        if pending:
+            time.sleep(
+                min(PROCESS_POLL_SECONDS, max(0.0, kill_deadline - time.monotonic()))
+            )
+    for pid in pending:
+        # The watchdog is a retained session leader.  A final group KILL is
+        # safe even on platforms without pidfds and cannot target the caller's
+        # foreground process group.
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (PermissionError, ProcessLookupError):
+            pass
+    return complete and not pending
+
+
+def stop_launch_helper(child: subprocess.Popen) -> None:
+    """Kill and reap a helper that never completed safe target exec."""
+    try:
+        child.kill()
+    except (PermissionError, ProcessLookupError):
+        pass
+    try:
+        child.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise CleanupIncompleteError(
+            "launch helper did not reap before its deadline"
+        ) from error
+
+
+def launch_helper(argv: Sequence[str]) -> None:
+    """Fresh single-threaded process that establishes an authorized session."""
+    if not sys.flags.isolated or not sys.flags.no_site:
+        os._exit(126)
+    if len(argv) != 11:
+        os._exit(126)
+    try:
+        ready_write = int(argv[2])
+        authorize_read = int(argv[3])
+        lease_write = int(argv[4])
+        error_write = int(argv[5])
+        config_read = int(argv[6])
+        encoded_mask = argv[7]
+        lease_fds = validate_lease_fds(argv[8])
+        target_sigchld = argv[9]
+        control_fds = validate_control_fds(argv[10])
+    except ValueError:
+        os._exit(126)
+    exec_attempted = False
+    try:
+        # Popen passed only these five descriptors. Protocol/error endpoints
+        # close on target exec; the lifetime lease alone intentionally remains.
+        os.set_inheritable(ready_write, False)
+        os.set_inheritable(authorize_read, False)
+        os.set_inheritable(error_write, False)
+        os.set_inheritable(config_read, False)
+        if lease_write not in lease_fds:
+            raise OSError(errno.EINVAL, "own session lease is missing")
+        for descriptor in lease_fds:
+            os.set_inheritable(descriptor, True)
+        for descriptor in control_fds:
+            os.set_inheritable(descriptor, True)
+        if os.getsid(0) != os.getpid():
+            raise OSError(errno.EPERM, "launch helper did not become session leader")
+        target, target_env = decode_launch_config(config_read)
+        close_fd(config_read)
+        config_read = -1
+        write_all_fd(ready_write, struct.pack("!I", os.getpid()))
+        close_fd(ready_write)
+        ready_write = -1
+        decision = read_exact_fd(
+            authorize_read,
+            1,
+            time.monotonic() + LAUNCH_PROTOCOL_TIMEOUT_SECONDS,
+        )
+        close_fd(authorize_read)
+        authorize_read = -1
+        if decision != b"\1":
+            os._exit(125)
+        old_mask = (
+            set()
+            if encoded_mask == "-"
+            else {int(value) for value in encoded_mask.split(",") if value}
+        )
+        write_all_fd(error_write, b"A")
+        exec_attempted = True
+        for restored_signal in handled_signals + subprocess_restored_signals:
+            signal.signal(restored_signal, signal.SIG_DFL)
+        signal.signal(
+            signal.SIGCHLD,
+            signal.SIG_IGN if target_sigchld == "I" else signal.SIG_DFL,
+        )
+        if hasattr(signal, "pthread_sigmask"):
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        os.execvpe(target[0], target, target_env)
+    except BaseException as error:
+        error_number = (
+            error.errno if isinstance(error, OSError) and error.errno else errno.EIO
+        )
+        try:
+            write_all_fd(error_write, b"E" + struct.pack("!i", error_number))
+        except BaseException:
+            pass
+        os._exit(127 if error_number == errno.ENOENT else 126)
+
+
+def launch_process(argv: Sequence[str], child_env: dict[str, str]) -> subprocess.Popen | None:
+    """Launch through a freshly execed, single-threaded authorization helper."""
+    global ancestor_registration, control_reader, lease_reader, process
+    if interrupted_signal is not None:
+        return None
+    old_mask = None
+    if hasattr(signal, "pthread_sigmask"):
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+    ready_read = ready_write = None
+    authorize_read = authorize_write = None
+    read_fd = lease_write = None
+    control_read = control_write = None
+    error_read = error_write = None
+    config_read = config_write = None
+    child: subprocess.Popen | None = None
+    authorized = False
+    lease_fds: list[int] = []
+    popen_stdio: dict[str, int] = {}
+    relay_specs: list[tuple[str, int, int]] = []
+    child_endpoints: list[int] = []
+    try:
+        popen_stdio, relay_specs, child_endpoints = prepare_stdio_relays()
+        ready_read, ready_write = protocol_pipe()
+        authorize_read, authorize_write = protocol_pipe()
+        inherited_lease_fds = validate_lease_fds(child_env.get(SESSION_LEASE_FDS_ENV))
+        inherited_control_fds = validate_control_fds(
+            child_env.get(SESSION_CONTROL_FDS_ENV)
+        )
+        ancestor_registration = publish_nested_supervisor(
+            inherited_control_fds, child_env[SESSION_BOUNDARY_ENV]
+        )
+        read_fd, lease_write = protocol_socketpair()
+        control_read, control_write = protocol_socketpair(socket.SOCK_DGRAM)
+        os.set_blocking(control_read, False)
+        control_reader = control_read
+        control_read = None
+        lease_fds = [*inherited_lease_fds, lease_write]
+        # The target receives only this wrapper's immediate-parent
+        # rendezvous.  Ancestor controls and the private registration link
+        # remain supervisor-owned and close on wrapper failure.
+        control_fds = [control_write]
+        child_env = child_env.copy()
+        child_env[SESSION_LEASE_FDS_ENV] = ":".join(str(fd) for fd in lease_fds)
+        child_env[SESSION_CONTROL_FDS_ENV] = ":".join(str(fd) for fd in control_fds)
+        boundary_count = len(child_env[SESSION_BOUNDARY_ENV].split(":"))
+        if (
+            boundary_count != len(lease_fds)
+            or len(inherited_control_fds) != int(boundary_count > 1)
+            or len(control_fds) != 1
+        ):
+            raise OSError(errno.EINVAL, "owned-session boundary and lease chains differ")
+        launch_config = encode_launch_config(argv, child_env)
+        error_read, error_write = protocol_pipe()
+        config_read, config_write = protocol_pipe()
+        os.set_blocking(read_fd, False)
+        lease_reader = read_fd
+        read_fd = None
+        encoded_mask = (
+            "-"
+            if old_mask is None
+            else ",".join(str(int(signum)) for signum in sorted(old_mask))
+        )
+        helper = [
+            sys.executable,
+            "-I",
+            "-S",
+            str(Path(__file__).resolve()),
+            LAUNCH_HELPER_MODE,
+            str(ready_write),
+            str(authorize_read),
+            str(lease_write),
+            str(error_write),
+            str(config_read),
+            encoded_mask,
+            child_env[SESSION_LEASE_FDS_ENV],
+            "I" if previous_sigchld_handler == signal.SIG_IGN else "D",
+            child_env[SESSION_CONTROL_FDS_ENV],
+        ]
+        child = subprocess.Popen(
+            helper,
+            env={},
+            close_fds=True,
+            pass_fds=tuple(
+                sorted(
+                    {
+                        ready_write,
+                        authorize_read,
+                        error_write,
+                        config_read,
+                        *lease_fds,
+                        *control_fds,
+                    }
+                )
+            ),
+            start_new_session=True,
+            **popen_stdio,
+        )
+        # Retain the exact child status before the spawning thread can accept
+        # cancellation again. The helper is still blocked on its private
+        # config/authorization protocol and cannot execute the target.
+        process = child
+        for descriptor in child_endpoints:
+            close_fd(descriptor)
+        child_endpoints.clear()
+        if old_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+            old_mask = None
+        close_fd(ready_write)
+        ready_write = None
+        close_fd(authorize_read)
+        authorize_read = None
+        close_fd(lease_write)
+        lease_write = None
+        close_fd(control_write)
+        control_write = None
+        close_fd(error_write)
+        error_write = None
+        close_fd(config_read)
+        config_read = None
+
+        protocol_deadline = time.monotonic() + LAUNCH_PROTOCOL_TIMEOUT_SECONDS
+        write_all_fd_until(config_write, launch_config, protocol_deadline)
+        close_fd(config_write)
+        config_write = None
+        helper_pid = struct.unpack(
+            "!I", read_exact_fd(ready_read, LAUNCH_PROTOCOL_BYTES, protocol_deadline)
+        )[0]
+        close_fd(ready_read)
+        ready_read = None
+        if helper_pid != child.pid or os.getsid(child.pid) != child.pid:
+            raise OSError(errno.EPROTO, "launch authorization did not match child session")
+        authorization_mask = None
+        if hasattr(signal, "pthread_sigmask"):
+            authorization_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, handled_signals
+            )
+        try:
+            allowed = authorize_launch(child.pid)
+            allowed = allowed and interrupted_signal is None
+            if allowed:
+                # From this point onward any ambiguity is cleaned as a fully
+                # owned target session. A failed allow write is a safe false
+                # positive; treating a successful write as helper-only would
+                # permit an exec/fork survivor on later parent errors.
+                authorized = True
+            write_all_fd(authorize_write, b"\1" if allowed else b"\0")
+        finally:
+            if authorization_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, authorization_mask)
+        close_fd(authorize_write)
+        authorize_write = None
+        if not allowed:
+            stop_launch_helper(child)
+            process = None
+            close_fd(lease_reader)
+            lease_reader = None
+            close_fd(control_reader)
+            control_reader = None
+            return None
+        exec_attempted, exec_error = read_exec_result(error_read, protocol_deadline)
+        close_fd(error_read)
+        error_read = None
+        if exec_error is not None:
+            child.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
+            process = None
+            close_fd(lease_reader)
+            lease_reader = None
+            close_fd(control_reader)
+            control_reader = None
+            if exec_error == errno.ENOENT:
+                raise FileNotFoundError(exec_error, os.strerror(exec_error), argv[0])
+            raise OSError(exec_error, os.strerror(exec_error), argv[0])
+        if not exec_attempted:
+            raise OSError(errno.EPROTO, "target exec was never attempted")
+        start_stdio_relays(relay_specs, child_env[SESSION_BOUNDARY_ENV])
+        relay_specs.clear()
+        return child
+    except BaseException:
+        if child is not None and process is child and authorized:
+            cleanup = stop_process_group(signal.SIGKILL)
+            process = None
+            if not cleanup.complete:
+                close_fd(lease_reader)
+                lease_reader = None
+                close_fd(control_reader)
+                control_reader = None
+                if ancestor_registration is not None:
+                    ancestor_registration.close()
+                    ancestor_registration = None
+                raise CleanupIncompleteError(
+                    "authorized launch cleanup could not be verified"
+                )
+        else:
+            if child is not None and process is child:
+                process = None
+            if child is not None and child.poll() is None:
+                stop_launch_helper(child)
+        close_fd(lease_reader)
+        lease_reader = None
+        close_fd(control_reader)
+        control_reader = None
+        if ancestor_registration is not None:
+            ancestor_registration.close()
+            ancestor_registration = None
+        close_relay_specs(relay_specs)
+        raise
+    finally:
+        for descriptor in (
+            ready_read,
+            ready_write,
+            authorize_read,
+            authorize_write,
+            read_fd,
+            lease_write,
+            control_read,
+            control_write,
+            error_read,
+            error_write,
+            config_read,
+            config_write,
+            *child_endpoints,
+        ):
+            close_fd(descriptor)
+        if old_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+
+def parse_proc_process(pid: int, stat: bytes) -> SessionProcess | None:
+    """Parse one Linux procfs stat row without trusting the command name."""
+    delimiter = stat.rfind(b") ")
+    if delimiter < 0:
+        return None
+    fields = stat[delimiter + 2 :].split()
+    if len(fields) < 20:
+        return None
+    try:
+        return SessionProcess(
+            pid=pid,
+            group=int(fields[2]),
+            session=int(fields[3]),
+            live=fields[0] != b"Z",
+            start=int(fields[19]),
+            parent=int(fields[1]),
+        )
+    except ValueError:
+        return None
+
+
+def list_proc_session_processes(
+    session_id: int,
+    proc_root: Path = Path("/proc"),
+    deadline: float | None = None,
+) -> list[SessionProcess] | None:
+    """Return one Linux session's identities, or None when unavailable."""
     try:
         entries = list(proc_root.iterdir())
     except OSError:
         return None
 
-    pids: list[int] = []
+    processes: list[SessionProcess] = []
     for entry in entries:
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
         if not entry.name.isdecimal():
             continue
         try:
             stat = (entry / "stat").read_bytes()
         except FileNotFoundError:
-            # Processes can disappear while the snapshot is being collected.
+            # Processes can disappear during collection.
             continue
+        except PermissionError:
+            return None
         except OSError:
             # A partial snapshot is not authoritative. Let the caller use its
             # platform fallback instead of silently omitting a live member.
             return None
 
-        # The command name is parenthesized arbitrary bytes and may itself
-        # contain spaces or parentheses. Split after its final closing
-        # delimiter; the remaining fields begin with state, parent PID,
-        # process group, and session ID.
-        delimiter = stat.rfind(b") ")
-        if delimiter < 0:
-            return None
-        fields = stat[delimiter + 2 :].split()
-        if len(fields) < 4:
-            return None
         try:
             pid = int(entry.name)
-            member_session = int(fields[3])
         except ValueError:
             return None
-        if member_session == session_id:
-            pids.append(pid)
-    return sorted(pids)
+        process = parse_proc_process(pid, stat)
+        if process is None:
+            return None
+        processes.append(process)
+    return owned_processes(processes, session_id, deadline)
+
+
+def list_proc_session_pids(
+    session_id: int, proc_root: Path = Path("/proc")
+) -> list[int] | None:
+    """Return one Linux session's PIDs, or None when procfs is unavailable."""
+    processes = list_proc_session_processes(session_id, proc_root)
+    if processes is None:
+        return None
+    return [process.pid for process in processes]
 
 
 def list_session_pids(session_id: int) -> list[int] | None:
     """Return a portable PID snapshot for one session, or None when unavailable."""
-    pids = list_proc_session_pids(session_id)
-    if pids is not None:
-        return pids
+    processes = list_session_processes(session_id)
+    if processes is None:
+        return None
+    return [process.pid for process in processes]
 
+
+def list_session_processes(
+    session_id: int,
+    timeout: float = PROCESS_SNAPSHOT_TIMEOUT_SECONDS,
+) -> list[SessionProcess] | None:
+    """Return a portable process snapshot for one retained session."""
+    deadline = time.monotonic() + timeout
+    processes = list_proc_session_processes(session_id, deadline=deadline)
+    if processes is not None:
+        return processes
+
+    ps_process = None
     try:
-        result = subprocess.run(
-            ["ps", "-A", "-o", "pid="],
-            check=True,
+        ps = "/system/bin/ps" if Path("/system/bin/ps").is_file() else "/bin/ps"
+        # Darwin `ps` rejects the procps-only `sid` keyword
+        # (`ps: sid: keyword not found`, exit 1); its `sess` column
+        # carries the same session ID. Verified on macOS CI.
+        columns = (
+            "pid=,ppid=,pgid=,sess=,stat="
+            if sys.platform == "darwin"
+            else "pid=,ppid=,pgid=,sid=,stat="
+        )
+        ps_process = subprocess.Popen(
+            [ps, "-A", "-o", columns],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        output, _ = ps_process.communicate(
+            timeout=max(0.001, deadline - time.monotonic())
+        )
+        if ps_process.returncode != 0:
+            return None
+    except (OSError, subprocess.SubprocessError):
+        if ps_process is not None:
+            try:
+                ps_process.kill()
+                ps_process.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
+            except (OSError, subprocess.SubprocessError):
+                pass
         return None
 
-    pids = []
-    for line in result.stdout.splitlines():
+    return parse_ps_snapshot(output, session_id, {ps_process.pid}, deadline)
+
+
+def parse_ps_snapshot(
+    output: str,
+    session_id: int,
+    excluded_pids: set[int] | None = None,
+    deadline: float | None = None,
+) -> list[SessionProcess] | None:
+    """Parse complete atomic ps rows; any malformed nonblank row invalidates."""
+    processes: list[SessionProcess] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
         fields = line.split()
-        if len(fields) != 1:
+        if len(fields) != 5:
             return None
         try:
             pid = int(fields[0])
+            parent = int(fields[1])
+            group = int(fields[2])
+            session = int(fields[3])
         except ValueError:
             return None
+        if excluded_pids is not None and pid in excluded_pids:
+            continue
+        processes.append(
+            SessionProcess(
+                pid=pid,
+                group=group,
+                session=session,
+                live=not fields[4].startswith("Z"),
+                start=None,
+                parent=parent,
+            )
+        )
+    return owned_processes(processes, session_id, deadline)
+
+
+def process_boundary_tokens(pid: int) -> list[bytes] | None:
+    """Read one bounded marker chain; None means the identity was unqueryable."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as environ:
+            data = environ.read(MAX_ENVIRON_BYTES + 1)
+    except OSError:
+        return None
+    if len(data) > MAX_ENVIRON_BYTES:
+        return None
+    prefix = f"{SESSION_BOUNDARY_ENV}=".encode()
+    for entry in data.split(b"\0"):
+        if entry.startswith(prefix):
+            return entry[len(prefix) :].split(b":")
+    return []
+
+
+def process_boundary(pid: int, expected: str) -> str:
+    """Classify one inherited Linux ownership marker."""
+    tokens = process_boundary_tokens(pid)
+    if tokens is None:
+        return "unknown"
+    matching = [index for index, token in enumerate(tokens) if token == expected.encode()]
+    if matching:
+        return "matches" if matching[-1] + 1 == len(tokens) else "delegated"
+    if tokens:
+        return "foreign"
+    return "absent"
+
+
+def owned_processes(
+    processes: list[SessionProcess],
+    session_id: int,
+    deadline: float | None = None,
+) -> list[SessionProcess] | None:
+    """Resolve ownership with indexed ancestry and lazy marker inspection."""
+    by_pid = {item.pid: item for item in processes}
+    children: dict[int, list[int]] = {}
+    for item in processes:
+        children.setdefault(item.parent, []).append(item.pid)
+
+    owned: set[int] = set()
+    delegated: set[int] = set()
+    ambiguous: set[int] = set()
+    queue: list[int] = []
+
+    def add(pid: int, *, is_delegated: bool = False, is_ambiguous: bool = False) -> None:
+        if pid in stdio_relay_pids:
+            return
+        if pid not in owned:
+            owned.add(pid)
+            queue.append(pid)
+        if is_delegated:
+            delegated.add(pid)
+        if is_ambiguous:
+            ambiguous.add(pid)
+
+    if session_id in by_pid:
+        add(session_id)
+
+    # Linux subreaper adoption is a stable kernel relationship. Missing or
+    # absent markers are attributable while this is the sole wrapper; an
+    # explicit foreign marker is retained only as ambiguous liveness so it can
+    # never be signaled or used to certify successful cleanup.
+    if subreaper_enabled and boundary_token is not None:
+        for item in processes:
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            if item.pid == session_id or item.parent != os.getpid():
+                continue
+            # Reparenting to this subreaper after the registered nearer owner
+            # exits is the promotion event. This single-threaded wrapper has
+            # no other unregistered child source, so even a stale foreign
+            # marker cannot veto direct-parent kernel authority.
+            add(item.pid)
+
+    live_supervisors = {
+        pid
+        for pid, _link in nested_supervisors.values()
+        if (item := by_pid.get(pid)) is not None and item.live
+    }
+    index = 0
+    while index < len(queue):
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
+        parent_pid = queue[index]
+        index += 1
+        inherited_delegation = parent_pid in delegated or parent_pid in live_supervisors
+        for child_pid in children.get(parent_pid, ()):
+            add(
+                child_pid,
+                is_delegated=inherited_delegation,
+                is_ambiguous=parent_pid in ambiguous,
+            )
+
+    # A same-session or same-group identity whose parent vanished during
+    # an otherwise complete snapshot remains visible. Attribute only that
+    # narrow cohort and inspect its marker lazily rather than scanning
+    # every host process. Group membership is immutable across reparenting
+    # and cannot be joined from another session, so a same-group orphan is
+    # unambiguously this session's member even where the session fallback
+    # cannot see it; without this, a reparented TERM-ignoring descendant
+    # vanishes from TERM-phase snapshots, the phase completes without
+    # escalating to KILL, and cleanup fails closed on the open lease.
+    for item in processes:
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
+        if item.pid in owned or item.pid in stdio_relay_pids:
+            continue
+        if item.session != session_id and item.group != session_id:
+            continue
+        marker = (
+            process_boundary(item.pid, boundary_token)
+            if boundary_token is not None
+            else "unknown"
+        )
+        add(
+            item.pid,
+            # Only a live registered owner establishes delegation. Marker
+            # chains remain redundant attribution, not raw-PID authority.
+            is_delegated=False,
+            is_ambiguous=marker == "foreign",
+        )
+
+    return sorted(
+        (
+            item._replace(
+                delegated=item.pid in delegated,
+                ambiguous=item.pid in ambiguous,
+            )
+            for item in processes
+            if item.pid in owned
+        ),
+        key=lambda item: item.pid,
+    )
+
+
+def proc_process(pid: int, proc_root: Path = Path("/proc")) -> SessionProcess | None:
+    """Read one Linux identity for post-pidfd validation."""
+    try:
+        stat = (proc_root / str(pid) / "stat").read_bytes()
+    except OSError:
+        return None
+    return parse_proc_process(pid, stat)
+
+
+def same_process_identity(left: SessionProcess, right: SessionProcess) -> bool:
+    """Compare the kernel identity fields that cannot change during a lifetime."""
+    return (
+        left.pid == right.pid and left.start is not None and left.start == right.start
+    )
+
+
+def claim_member(
+    process_info: SessionProcess, _session_id: int
+) -> tuple[MemberHandle | None, str]:
+    """Pin one identity and distinguish disappearance from unavailable proof."""
+    opener = getattr(os, "pidfd_open", None)
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if opener is None or sender is None or process_info.start is None:
+        if process_info.start is not None:
+            current = proc_process(process_info.pid)
+            if current is not None and not same_process_identity(current, process_info):
+                return None, "gone"
+            if current is None:
+                try:
+                    os.kill(process_info.pid, 0)
+                except ProcessLookupError:
+                    return None, "gone"
+                except (PermissionError, OSError):
+                    pass
+        return None, "unavailable"
+    try:
+        fd = opener(process_info.pid, 0)
+    except ProcessLookupError:
+        return None, "gone"
+    except (OSError, TypeError):
+        return None, "unavailable"
+    current = proc_process(process_info.pid)
+    if current is None:
         try:
-            if os.getsid(pid) == session_id:
-                pids.append(pid)
-        except (PermissionError, ProcessLookupError):
-            pass
-    return pids
+            sender(fd, 0, None, 0)
+        except ProcessLookupError:
+            os.close(fd)
+            return None, "gone"
+        except (PermissionError, OSError, TypeError):
+            os.close(fd)
+            return None, "unavailable"
+        os.close(fd)
+        return None, "unavailable"
+    if not same_process_identity(current, process_info):
+        os.close(fd)
+        return None, "gone"
+    return MemberHandle(
+        current._replace(
+            delegated=process_info.delegated,
+            ambiguous=process_info.ambiguous,
+        ),
+        fd,
+    ), "claimed"
 
 
-def stop_process_group(first_signal: int) -> None:
-    """Stop the entire child session, then reap its leader."""
-    assert process is not None
-    known_session_pids: set[int] = set()
+def signal_member(member: MemberHandle, signum: int) -> bool:
+    """Signal only the process identity pinned by a retained pidfd."""
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if sender is None:
+        return False
+    try:
+        sender(member.fd, signum, None, 0)
+    except (PermissionError, ProcessLookupError, OSError):
+        return False
+    return True
 
-    def send_process_group_signal(signum: int) -> bool:
-        """Signal the original process group when session enumeration is unavailable."""
-        # Once the leader has been reaped, its numeric process-group identity
-        # is no longer owned and may be reused. Fail closed instead of risking
-        # a signal to an unrelated same-user group.
-        if process.poll() is not None:
+
+_libc_waitid = None
+
+
+def _waitid_exited_ctypes(pid: int) -> bool:
+    """waitid(P_PID, WEXITED|WNOHANG|WNOWAIT) for Pythons without os.waitid.
+
+    macOS libc provides waitid(2) but CPython does not expose os.waitid
+    there. Constants are the Apple ABI values (matching the Rust libc
+    crate's unix/bsd/apple definitions): P_PID=1, WEXITED=0x04,
+    WNOHANG=0x01, WNOWAIT=0x20; si_pid sits at byte 12 of siginfo_t
+    (three int32 fields precede the pid_t). Like os.waitid, EINTR
+    reports not-exited while any other errno propagates.
+    """
+    global _libc_waitid
+    import ctypes
+
+    if _libc_waitid is None:
+        _libc_waitid = ctypes.CDLL(None, use_errno=True).waitid
+        _libc_waitid.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        _libc_waitid.restype = ctypes.c_int
+    info = ctypes.create_string_buffer(128)
+    if _libc_waitid(1, pid, info, 0x04 | 0x01 | 0x20) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EINTR:
             return False
+        raise OSError(error, os.strerror(error))
+    return struct.unpack_from("i", info, 12)[0] != 0
+
+
+def leader_exited() -> bool:
+    """Observe leader exit without reaping its PID or group identity."""
+    assert process is not None
+    waitid = getattr(os, "waitid", None)
+    if waitid is None:
+        # Only Darwin is known to provide waitid(2) without os.waitid;
+        # other waitid-less platforms fail closed instead of guessing
+        # unfamiliar wait options.
+        if sys.platform != "darwin":
+            raise AttributeError("os.waitid is required outside macOS")
+        return _waitid_exited_ctypes(process.pid)
+    try:
+        result = waitid(
+            os.P_PID,
+            process.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except InterruptedError:
+        return False
+    return result is not None
+
+
+def reap_unregistered_adopted_zombies(deadline: float) -> bool:
+    """Reap direct Linux zombie adoptees with start-generation revalidation."""
+    if not subreaper_enabled:
+        return True
+    while time.monotonic() < deadline:
+        try:
+            pending = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            return True
+        except InterruptedError:
+            continue
+        except OSError:
+            return False
+        if pending is None or pending.si_pid == 0:
+            return True
+        observed = proc_process(pending.si_pid)
+        if (
+            observed is None
+            or observed.live
+            or observed.parent != os.getpid()
+            or (process is not None and observed.pid == process.pid)
+        ):
+            return False
+        current = proc_process(observed.pid)
+        if current is None or not same_process_identity(current, observed):
+            continue
+        try:
+            waited, _status = os.waitpid(observed.pid, os.WNOHANG)
+        except ChildProcessError:
+            continue
+        except (InterruptedError, OSError):
+            return False
+        if waited != observed.pid:
+            time.sleep(
+                min(PROCESS_POLL_SECONDS, max(0.0, deadline - time.monotonic()))
+            )
+    return False
+
+
+def stop_process_group(first_signal: int) -> CleanupResult:
+    """Stop the entire child session, then reap its retained leader."""
+    assert process is not None
+    known_members: dict[int, MemberHandle] = {}
+    group_delivered: set[tuple[int, int | None]] = set()
+    unsafe_direct_member = False
+    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+    unsafe_direct_member_reason = ""
+
+    def send_process_group_signal(
+        signum: int, processes: list[SessionProcess] | None
+    ) -> bool:
+        """Signal the group whose retained leader reserves its numeric ID."""
+        via_zombie = False
         try:
             if os.getsid(process.pid) != process.pid:
                 return False
         except (PermissionError, ProcessLookupError):
-            return False
+            # macOS rejects getsid on zombies, but an unreaped zombie
+            # leader still reserves its group ID: only this wrapper
+            # reaps it (after the stop legs), so the numeric ID cannot
+            # have been recycled. Fall back to the fresh snapshot,
+            # where a dead observed leader is exactly that zombie.
+            if processes is None or not any(
+                item.pid == process.pid and not item.live for item in processes
+            ):
+                return False
+            via_zombie = True
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(
+            f"TEMP-DIAG-180 SIGNAL-GROUP pid={os.getpid()} "
+            f"group={process.pid} signum={signum}"
+            f"{' zombie' if via_zombie else ''}"
+        )
         try:
             os.killpg(process.pid, signum)
         except AttributeError:
@@ -176,107 +2502,433 @@ def stop_process_group(first_signal: int) -> None:
             return False
         return True
 
-    def send_signal(signum: int) -> bool:
-        """Signal revalidated members of the child session."""
-        pids = list_session_pids(process.pid)
-        if pids is not None:
-            # Preserve every observed member across the grace interval. The
-            # leader can exit before the final snapshot, and a transient
-            # enumeration failure must not strand an escaped descendant that
-            # was already known to belong to this session.
-            known_session_pids.update(pids)
+    def send_leader_signal(signum: int) -> bool:
+        """Signal the exact unreaped Popen leader without polling its status."""
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(
+            f"TEMP-DIAG-180 SIGNAL-LEADER pid={os.getpid()} "
+            f"target={process.pid} signum={signum}"
+        )
+        try:
+            os.kill(process.pid, signum)
+        except (PermissionError, ProcessLookupError):
+            return False
+        return True
 
-        # Final KILL always covers the still-owned original group after the
-        # snapshot. That closes the interval in which a TERM trap can create a
-        # same-group child too late to appear in the PID list. An unavailable
-        # snapshot needs the same fallback for every signal. Do this before
-        # direct delivery: killing a cached leader first would make the safe
-        # group-ownership check fail. Revalidated session members below still
-        # cover descendants that escaped the original process group.
-        group_attempted = signum == signal.SIGKILL or pids is None
-        group_signaled = False
-        if group_attempted:
-            group_signaled = send_process_group_signal(signum)
+    def observe(deadline: float, unregister: bool) -> list[SessionProcess] | None:
+        """Refresh member handles while preserving previously pinned identities."""
+        nonlocal unsafe_direct_member, unsafe_direct_member_reason
+        # Snapshot before draining so the drain can confirm liveness:
+        # a supervisor this snapshot shows live is never unregistered.
+        # Queued registrations wait in the datagram queue meanwhile.
+        processes = list_session_processes(
+            process.pid,
+            max(0.001, deadline - time.monotonic()),
+        )
+        # Drain with no deadline: the snapshot above already consumed
+        # part of the phase budget, and an expired phase deadline must
+        # end the phase, never invalidate the control plane. The drain
+        # loop is bounded by its fixed iteration cap plus non-blocking
+        # I/O either way.
+        if not drain_nested_supervisors(None, processes, unregister):
+            unsafe_direct_member = True
+            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+            if not unsafe_direct_member_reason:
+                unsafe_direct_member_reason = "nested-drain"
+        if processes is None:
+            return None
+        for process_info in processes:
+            if process_info.pid == process.pid:
+                continue
+            previous = known_members.get(process_info.pid)
+            if previous is not None and not same_process_identity(
+                previous.process, process_info
+            ):
+                previous.close()
+                del known_members[process_info.pid]
+                previous = None
+            elif previous is not None:
+                previous.process = process_info
+            if process_info.ambiguous:
+                unsafe_direct_member = True
+                # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+                if not unsafe_direct_member_reason:
+                    unsafe_direct_member_reason = (
+                        f"ambiguous:{process_info.pid}"
+                    )
+                continue
+            if previous is None:
+                member, _claim = claim_member(process_info, process.pid)
+                if member is not None:
+                    known_members[process_info.pid] = member
+                # NOTE: plain unclaimability is deliberately NOT sticky. A
+                # live unclaimed member already fails the phase through the
+                # liveness check; once it vanishes it has exited, which is
+                # success, and a pid reused inside the session shows live
+                # and keeps failing. Only ambiguity (possibly-foreign
+                # identity) and nested-control failure stay fail-closed.
+                # Without this, macOS (no pidfds) can never pass a phase
+                # whose cohort held a cross-group member, even after the
+                # session is provably empty.
+            # Pinned delegated handles stay dormant until a later snapshot
+            # proves the nearer supervisor dead and reparents/promotes them.
+        current_pids = {process_info.pid for process_info in processes}
+        for pid, member in known_members.items():
+            if pid not in current_pids:
+                member.refresh()
+        return processes
 
-        found_member = False
-        for pid in sorted(known_session_pids):
-            try:
-                # The snapshot is only a candidate. Re-check the SID
-                # immediately before signaling to reduce the PID-reuse window.
-                if os.getsid(pid) != process.pid:
-                    continue
-                found_member = True
-                os.kill(pid, signum)
-            except (PermissionError, ProcessLookupError):
-                pass
-        if found_member or group_signaled:
-            return True
+    def signal_known(signum: int, only_new: bool) -> None:
+        """Deliver through pinned identities, never through cached PIDs."""
+        for member in known_members.values():
+            if not member.process.live:
+                continue
+            if member.process.delegated:
+                continue
+            identity = (member.process.pid, member.process.start)
+            if member.process.group == process.pid and identity in group_delivered:
+                continue
+            if only_new and member.signaled:
+                continue
+            if signal_member(member, signum):
+                member.signaled = True
 
-        # A portable PID snapshot can race with a still-running leader. The
-        # original process group remains a safe fallback because this wrapper
-        # created that leader and session itself.
-        if not group_attempted and process.poll() is None:
-            return send_process_group_signal(signum)
+    def note_group_delivery(processes: list[SessionProcess] | None) -> None:
+        """Remember the cohort reached by one anchored group delivery."""
+        if processes is None:
+            return
+        for process_info in processes:
+            if process_info.live and process_info.group == process.pid:
+                group_delivered.add((process_info.pid, process_info.start))
+
+    def phase(signum: int, deadline: float, only_new: bool) -> bool:
+        """Signal and require two complete empty session observations."""
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(
+            f"TEMP-DIAG-180 STOP-PHASE enter pid={os.getpid()} signum={signum} "
+            f"budget={deadline - time.monotonic():.2f}"
+        )
+        group_delivered.clear()
+        # Only the KILL phase unregisters: a live owner must survive
+        # TERM (it needs that time to shut its own session down), and a
+        # dead one unregisters within a few KILL observations anyway.
+        kill_phase = signum == signal.SIGKILL
+        processes = observe(deadline, kill_phase)
+        complete_exact_cohort = processes is not None and all(
+            process_info.pid == process.pid
+            or not process_info.live
+            or process_info.delegated
+            or (
+                process_info.pid in known_members
+                and same_process_identity(
+                    known_members[process_info.pid].process, process_info
+                )
+            )
+            for process_info in processes
+        )
+        # Without pidfds there is no way to adopt or exactly signal a
+        # murdered nested supervisor's subtree (no subreaper, no
+        # start-identity snapshots): its target and relays orphan with
+        # the session lease held open and fail cleanup. The TERM phase
+        # still triggers the supervisor, but the KILL phase waits for a
+        # live registered owner to finish its own shutdown instead of
+        # group-signaling it. Platforms with exact authority keep the
+        # previous behavior: the murdered subtree is adopted and
+        # exactly stopped.
+        exact_signals_unavailable = (
+            getattr(signal, "pidfd_send_signal", None) is None
+        )
+        supervisor_pids = {pid for pid, _link in nested_supervisors.values()}
+        # An open registration link is itself the liveness proof: the
+        # drain above peeks every link each observe, and process death
+        # closes file descriptors, so a registered supervisor is alive
+        # even when a transient process-table snapshot misses it. Never
+        # cross-check liveness against that racy snapshot here: missing
+        # a live owner murders it and orphans its session (and lease).
+        wait_for_owner = (
+            signum == signal.SIGKILL
+            and exact_signals_unavailable
+            and bool(supervisor_pids)
+        )
+        if wait_for_owner:
+            deadline += DELEGATED_OWNER_GRACE_SECONDS
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        live_sup = sorted(
+            pid
+            for pid in supervisor_pids
+            if processes is not None
+            and any(
+                item.live and item.pid == pid for item in processes
+            )
+        )
+        _temp_diag(
+            f"TEMP-DIAG-180 STOP-DECIDE pid={os.getpid()} signum={signum} "
+            f"wait={wait_for_owner} none={processes is None} "
+            f"cohort={complete_exact_cohort} sup={len(supervisor_pids)} "
+            f"live_sup={live_sup}"
+        )
+        # `wait_for_owner` is KILL-only, so TERM delivery (which the
+        # nested supervisor needs as its shutdown trigger) is unchanged.
+        # For KILL, neither the exact leader signal nor the group signal
+        # may murder a live registered owner: it owns a subtree (own
+        # sessions) this owner cannot adopt or signal without pidfds,
+        # so the phase waits out its shutdown instead.
+        if (
+            not wait_for_owner
+            and complete_exact_cohort
+            and send_leader_signal(signum)
+        ):
+            pass
+        elif not wait_for_owner and send_process_group_signal(signum, processes):
+            note_group_delivery(processes)
+        signal_known(signum, only_new)
+        consecutive_empty = 0
+        while time.monotonic() < deadline:
+            processes = observe(deadline, kill_phase)
+            signal_known(signum, only_new)
+            # A newly forked same-group member receives one exact pidfd signal
+            # when available. Without exact authority, never re-enter every
+            # unchanged catchable-signal handler; the anchored KILL phase will
+            # still stop that late member.
+            # A registered nested supervisor vetoes completion even when
+            # the snapshot looks empty: on platforms without pidfds the
+            # snapshot can miss a live owner, and completing early would
+            # skip its shutdown (and the KILL-phase wait) while it still
+            # holds relays and the lease. Dead supervisors unregister
+            # within a few stop-drain observations, so the veto always
+            # lifts; the phase deadline still bounds a wedged owner.
+            # And once this stop ever involved nested owners, completion
+            # additionally requires a drained lease: the kernel closes
+            # file descriptors on death, so a drained lease is proof the
+            # subtree is really gone no matter what the snapshot shows.
+            if (
+                processes is not None
+                and any(item.pid == process.pid for item in processes)
+                and all(not item.live for item in processes)
+                and all(not member.process.live for member in known_members.values())
+                and not unsafe_direct_member
+                and not nested_supervisors
+                and (not nested_ever_registered or lease_closed())
+            ):
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+                    _temp_diag(
+                        f"TEMP-DIAG-180 STOP-PHASE exit pid={os.getpid()} "
+                        f"signum={signum} result=True"
+                    )
+                    return True
+            else:
+                consecutive_empty = 0
+            time.sleep(min(PROCESS_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        if processes is None:
+            live_summary = "observe-None"
+        else:
+            live_summary = ",".join(
+                str(item.pid) for item in processes if item.live
+            ) or "none-live"
+        _temp_diag(
+            f"TEMP-DIAG-180 STOP-PHASE exit pid={os.getpid()} signum={signum} "
+            f"result=False unsafe={unsafe_direct_member} "
+            f"reason={unsafe_direct_member_reason or 'none'} live={live_summary}"
+        )
         return False
 
-    if not send_signal(first_signal):
-        process.wait()
-        return
-    time.sleep(1)
-    send_signal(signal.SIGKILL)
-    process.wait()
+    try:
+        complete = phase(
+            first_signal,
+            time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS,
+            True,
+        )
+        if not complete:
+            complete = phase(
+                signal.SIGKILL,
+                time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS,
+                False,
+            )
+        try:
+            status = process.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # The retained Popen handle is stable authority for its own leader.
+            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+            _temp_diag(
+                f"TEMP-DIAG-180 LEGS-KILL pid={os.getpid()} target={process.pid}"
+            )
+            process.kill()
+            try:
+                status = process.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                # A broken platform wait implementation must not turn bounded
+                # cleanup into an indefinite hang or a false success.
+                return CleanupResult(125, False)
+        reap_deadline = time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
+        adopted = [
+            member
+            for member in known_members.values()
+            if member.process.parent == os.getpid()
+        ]
+        while adopted and time.monotonic() < reap_deadline:
+            adopted = [member for member in adopted if not member.reap_if_adopted()]
+            if adopted:
+                time.sleep(
+                    min(
+                        PROCESS_POLL_SECONDS,
+                        max(0.0, reap_deadline - time.monotonic()),
+                    )
+                )
+        known_adoptees_complete = not adopted
+        relays_complete = stop_stdio_relays(
+            time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
+        )
+        if status == 0 and stdio_relay_status is not None:
+            status = stdio_relay_status
+        unregistered_complete = reap_unregistered_adopted_zombies(
+            time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
+        )
+        lease_complete = lease_closed()
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        phase_complete = complete
+        complete = (
+            complete
+            and known_adoptees_complete
+            and relays_complete
+            and unregistered_complete
+            and lease_complete
+        )
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(
+            f"TEMP-DIAG-180 STOP-LEGS pid={os.getpid()} phases={phase_complete} "
+            f"adoptees={known_adoptees_complete} relays={relays_complete} "
+            f"unreg={unregistered_complete} lease={lease_complete} "
+            f"status={status} complete={complete}"
+        )
+        return CleanupResult(status, complete)
+    finally:
+        for member in known_members.values():
+            member.close()
 
 
-def main(argv: Sequence[str]) -> int:
+def main(argv: Sequence[str], terminal: bool = False) -> int:
     """Run the requested command and return a shell-compatible status."""
-    global process
+    global ancestor_registration, boundary_token, control_reader, lease_reader
+    global process, subreaper_enabled
+    global nested_control_complete
+    global stdio_relay_status, terminal_cleanup_incomplete, terminal_handoff_required
 
     if len(argv) < 3:
-        print("usage: test-timeout-v1 TIMEOUT COMMAND [ARG ...]", file=sys.stderr)
+        diagnostic("usage: test-timeout-v1 TIMEOUT COMMAND [ARG ...]")
         return 2
     try:
         timeout = parse_timeout(argv[1])
     except (ValueError, OverflowError):
-        print(f"test-timeout-v1: invalid timeout: {argv[1]}", file=sys.stderr)
+        diagnostic(f"test-timeout-v1: invalid timeout: {argv[1]}")
         return 2
     if not clear_timeout_marker():
-        print("test-timeout-v1: could not clear timeout marker", file=sys.stderr)
+        diagnostic("test-timeout-v1: could not clear timeout marker")
         return 2
-    for handled_signal in handled_signals:
-        signal.signal(handled_signal, capture_signal)
+    terminal_handoff_required = terminal
+    terminal_cleanup_incomplete = False
+    stdio_relay_status = None
+    stdio_relay_pids.clear()
+    for descriptor in stdio_relay_state_fds.values():
+        close_fd(descriptor)
+    stdio_relay_state_fds.clear()
+    stdio_relay_states.clear()
+    for descriptor in stdio_relay_parent_fds.values():
+        close_fd(descriptor)
+    stdio_relay_parent_fds.clear()
+    for _pid, link in nested_supervisors.values():
+        link.close()
+    nested_supervisors.clear()
+    nested_unhealthy_strikes.clear()
+    nested_peek_logged.clear()
+    nested_control_complete = True
+    if ancestor_registration is not None:
+        ancestor_registration.close()
+        ancestor_registration = None
+    control_reader = None
+    install_signal_handlers()
 
-    child_env = os.environ.copy()
-    child_env.pop("DOT_TEST_TIMEOUT_EXPIRED_FILE", None)
     try:
-        process = subprocess.Popen(argv[2:], start_new_session=True, env=child_env)
+        child_env = os.environ.copy()
+        child_env.pop("DOT_TEST_TIMEOUT_EXPIRED_FILE", None)
+        boundary_token = secrets.token_hex(32)
+        child_env[SESSION_BOUNDARY_ENV] = extend_boundary_chain(
+            child_env.get(SESSION_BOUNDARY_ENV), boundary_token
+        )
+        subreaper_enabled = adopt_descendants()
+    except OSError:
+        diagnostic("test-timeout-v1: could not establish descendant supervision")
+        return finish(125, False)
+    try:
+        process = launch_process(argv[2:], child_env)
+    except CleanupIncompleteError:
+        diagnostic("test-timeout-v1: could not verify child cleanup")
+        return finish(125, False)
     except FileNotFoundError:
         return finish(127)
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
+        if interrupted_signal is not None:
+            return finish(128 + interrupted_signal)
         return finish(126)
+    if process is None:
+        return finish(128 + interrupted_signal) if interrupted_signal is not None else finish(126)
 
     deadline = time.monotonic() + timeout
     while True:
+        poll_stdio_relay_states()
+        # Nested wrappers cannot authorize their own target until this exact
+        # retained wrapper identity acknowledges a private registration.  Do
+        # this during ordinary supervision, not only after teardown begins.
+        # Supervision only registers: unregistering needs a confirming
+        # snapshot, which only stop-time observes take.
+        if not drain_nested_supervisors(unregister=False):
+            stop_process_group(signal.SIGKILL)
+            diagnostic("test-timeout-v1: could not verify child cleanup")
+            return finish(125, False)
         if interrupted_signal is not None:
-            stop_process_group(interrupted_signal)
-            return finish(128 + interrupted_signal)
+            cleanup = stop_process_group(interrupted_signal)
+            if not cleanup.complete:
+                diagnostic("test-timeout-v1: could not verify child cleanup")
+            return finish(128 + interrupted_signal, cleanup.complete)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             mark_timeout_expired()
-            stop_process_group(signal.SIGTERM)
-            return finish(124)
-        try:
-            status = process.wait(timeout=min(remaining, 0.05))
+            cleanup = stop_process_group(signal.SIGTERM)
+            if not cleanup.complete:
+                diagnostic("test-timeout-v1: could not verify child cleanup")
+            return finish(124, cleanup.complete)
+        if leader_exited():
+            # Observation may cross the absolute deadline. Re-enter the
+            # precedence checks while the leader remains retained so timeout
+            # (or a concurrently latched signal) wins the exact boundary.
+            if time.monotonic() >= deadline:
+                continue
             break
-        except subprocess.TimeoutExpired:
-            pass
+        time.sleep(min(remaining, PROCESS_POLL_SECONDS))
 
     if interrupted_signal is not None:
-        stop_process_group(interrupted_signal)
-        return finish(128 + interrupted_signal)
+        cleanup = stop_process_group(interrupted_signal)
+        if not cleanup.complete:
+            diagnostic("test-timeout-v1: could not verify child cleanup")
+        return finish(128 + interrupted_signal, cleanup.complete)
 
-    stop_process_group(signal.SIGTERM)
+    cleanup = stop_process_group(signal.SIGTERM)
+    if not cleanup.complete:
+        diagnostic("test-timeout-v1: could not verify child cleanup")
+        return finish(125, False)
+    status = cleanup.status
     return finish(status if status >= 0 else 128 - status)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    if len(sys.argv) > 1 and sys.argv[1] == LAUNCH_HELPER_MODE:
+        launch_helper(sys.argv)
+        os._exit(126)
+    if len(sys.argv) == 5 and sys.argv[1] == RELAY_HELPER_MODE:
+        if not sys.flags.isolated or not sys.flags.no_site:
+            os._exit(1)
+        relay_stream(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+        os._exit(1)
+    terminal_exit(main(sys.argv, terminal=True))

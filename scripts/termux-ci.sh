@@ -47,6 +47,37 @@ fi
   exit 1
 }
 
+# TEMP-DIAG-180: pre-flight probes for the Android snapshot failure.
+# Remove once the Termux signal test is green.
+{
+  echo '--- TEMP-DIAG-180 pre-flight ---'
+  echo "diag self stat: $(cat /proc/self/stat 2>&1 || true)"
+  echo 'diag unreadable proc stats (up to 5):'
+  unreadable=0
+  for dir in /proc/[0-9]*; do
+    if [[ ! -r $dir/stat ]]; then
+      echo "UNREADABLE: $dir"
+      unreadable=$((unreadable + 1))
+      if ((unreadable >= 5)); then
+        break
+      fi
+    fi
+  done 2>/dev/null || true
+  echo "diag unreadable count sample done"
+  ps_status=0
+  ps_output=$(/system/bin/ps -A -o pid=,ppid=,pgid=,sid=,stat= 2>&1) || ps_status=$?
+  echo "diag ps status: $ps_status"
+  printf '%s\n' "$ps_output" | head -5 || true
+  echo 'diag tool availability:'
+  for tool in hostname uname id getconf git; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      echo "HAVE: $tool"
+    else
+      echo "MISSING: $tool"
+    fi
+  done
+} >&2
+
 # Operational commands require an absolute argv[0] under Termux's linker
 # interposition contract. Exercise native SIGQUIT handling inside the real app
 # sandbox with the complete transported release tree.
@@ -118,6 +149,14 @@ while [[ ! -s $signal_pid_file && $SECONDS -lt $deadline ]]; do
 done
 if [[ ! -s $signal_pid_file ]]; then
   printf 'termux-ci: signal fixture did not start\n' >&2
+  # TEMP-DIAG-180: show runner liveness plus its subtree at the deadline.
+  if [[ -n ${runner_pid:-} ]] && kill -0 "$runner_pid" 2>/dev/null; then
+    echo "diag runner $runner_pid alive at deadline; subtree:" >&2
+    ps_all=$(/system/bin/ps -o pid=,ppid=,stat=,args= 2>/dev/null || /system/bin/ps 2>/dev/null || true)
+    printf '%s\n' "$ps_all" | grep -E "$runner_pid|PID" >&2 || true
+  else
+    echo 'diag runner already exited at deadline' >&2
+  fi
   cat "$signal_output" >&2
   exit 1
 fi

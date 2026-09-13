@@ -75,9 +75,14 @@ pub const HELP: &str = concat!(
 
 /// Public process exit-code contract:
 /// `0` success, `1` error/unknown command, `2` usage/config failure,
-/// `75` lock busy. Numeric codes cross the process boundary into
-/// scripts and CI gates, so they are named constants — never inline
-/// literals.
+/// `75` lock busy, `125` for an unverifiable owned-subprocess cleanup,
+/// and `128 + signal` for handled HUP, INT, QUIT, or TERM. Passthrough
+/// foreground children (git fetch/push, interactive sudo) report the
+/// reaped leader status instead of `125` on normal completion, like
+/// the shell; the strict `125` applies to owned sessions and the
+/// dependency-provider path. Numeric codes cross the process boundary
+/// into scripts and CI gates, so non-signal codes are named constants
+/// rather than duplicated inline.
 pub const EXIT_SUCCESS: i32 = 0;
 /// Generic failure (unknown command today; repo-failure paths reuse it
 /// per the historical shell `return 1` sites).
@@ -262,6 +267,13 @@ pub(crate) fn run_with_runtime(
     let command = args.next().unwrap_or_default();
     let command = argv_bytes(&command);
     let command = command.as_slice();
+    // One owner covers every subprocess-capable phase, including the revision
+    // probe shared by help/version. Otherwise an informational command can be
+    // terminated while its isolated Git child survives without an owner.
+    let signals = match crate::cleanup::Signals::for_runtime(runtime) {
+        Ok(signals) => signals,
+        Err(_) => return EXIT_ERROR,
+    };
     // Shell matches `${1:-help}`: empty or missing command shows help.
     // The empty-string arm matters because `run([])` (no argv at all,
     // as in tests) must behave like bare `dot`, not like an error.
@@ -269,93 +281,146 @@ pub(crate) fn run_with_runtime(
     // return without reading user configuration, matching the shell entry
     // point; operational commands load configuration before dispatch.
     if crate::startup::informational_command(command) {
-        if let Err(failure) = crate::startup::check_reexec(runtime) {
-            let _ = stderr.write_all(failure.line().as_bytes());
-            let _ = stderr.write_all(b"\n");
-            return failure.code();
-        }
-        return match command {
-            b"" | b"help" | b"-h" | b"--help" => {
-                if stdout.write_all(HELP.as_bytes()).is_err() {
-                    EXIT_ERROR
-                } else {
-                    EXIT_SUCCESS
-                }
-            }
-            _ => {
-                if writeln!(stdout, "{}", version::version_line()).is_err() {
-                    EXIT_ERROR
-                } else {
-                    EXIT_SUCCESS
+        let code = {
+            let mut stdout = signals.writer(stdout);
+            let mut stderr = signals.writer(stderr);
+            if let Err(failure) = crate::startup::check_reexec(runtime) {
+                let _ = stderr.write_all(failure.line().as_bytes());
+                let _ = stderr.write_all(b"\n");
+                failure.code()
+            } else {
+                match command {
+                    b"" | b"help" | b"-h" | b"--help" => {
+                        if stdout.write_all(HELP.as_bytes()).is_err() {
+                            EXIT_ERROR
+                        } else {
+                            EXIT_SUCCESS
+                        }
+                    }
+                    _ => {
+                        if writeln!(stdout, "{}", version::version_line()).is_err() {
+                            EXIT_ERROR
+                        } else {
+                            EXIT_SUCCESS
+                        }
+                    }
                 }
             }
         };
+        return signals.finish(code);
     }
-    let config = match crate::startup::check(runtime) {
-        Ok(config) => config,
-        Err(failure) => {
-            let _ = stderr.write_all(failure.line().as_bytes());
-            let _ = stderr.write_all(b"\n");
-            return failure.code();
-        }
-    };
-    let selected = dispatch(command);
-    let home = runtime.home().to_string_lossy();
-    let state = runtime.state_home().to_string_lossy();
-    let identity = if selected == Command::Init {
-        crate::repos_base::select_for_init(runtime, &home, &state, stderr)
-    } else {
-        crate::repos_base::select(runtime, &home, &state, stderr)
-    };
-    if identity.is_err() {
-        return EXIT_ERROR;
-    }
+    // Operational commands share one process-wide signal owner from before
+    // configuration and repository identity inspection until their final
+    // status is selected. Nested guards would either deadlock on the owner
+    // mutex or reset the first-signal latch between adjacent subprocesses.
+    let rest: Vec<OsString> = args.collect();
+    let code = {
+        let mut stdout = signals.writer(stdout);
+        let mut stderr = signals.writer(stderr);
+        (|| -> i32 {
+            let selected = dispatch(command);
+            let home = runtime.home().to_string_lossy();
+            let state = runtime.state_home().to_string_lossy();
+            // Init's host-Git capability must cover startup revision checks,
+            // client-identity selection, and the engine itself. A resumable
+            // transaction can already have moved a client-owned wrapper's
+            // helper, so any PATH fallback during those phases can reject an
+            // otherwise valid journal. The process-wide signal owner is
+            // already active here, before any Git child is launched.
+            let host_git = if selected == Command::Init {
+                runtime
+                    .value("PATH")
+                    .and_then(OsStr::to_str)
+                    .and_then(|path| {
+                        crate::init_client_identity::select_host_git(
+                            &home,
+                            &runtime.source_root().to_string_lossy(),
+                            path,
+                        )
+                    })
+            } else {
+                None
+            };
+            if selected == Command::Init && host_git.is_none() {
+                let _ = writeln!(
+                    stderr,
+                    "dot init: {}",
+                    crate::init_client_identity::NO_HOST_GIT
+                );
+                return EXIT_ERROR;
+            }
+            let _host_git = host_git
+                .as_deref()
+                .map(|git| crate::init_client_identity::bind_host_git_for_scope(Path::new(git)));
+            let config = match crate::startup::check(runtime) {
+                Ok(config) => config,
+                Err(failure) => {
+                    let _ = stderr.write_all(failure.line().as_bytes());
+                    let _ = stderr.write_all(b"\n");
+                    return failure.code();
+                }
+            };
+            if let Err(interrupted) = crate::cancellation::check() {
+                return interrupted.status();
+            }
+            let identity = if selected == Command::Init {
+                crate::repos_base::select_for_init(runtime, &home, &state, &mut stderr)
+            } else {
+                crate::repos_base::select(runtime, &home, &state, &mut stderr)
+            };
+            if identity.is_err() {
+                return EXIT_ERROR;
+            }
+            if let Err(interrupted) = crate::cancellation::check() {
+                return interrupted.status();
+            }
 
-    let mut failed = false;
-    let code = match command {
-        b"" | b"help" | b"-h" | b"--help" | b"version" | b"--version" => unreachable!(),
-        // `main.sh` loads config and the runtime before dispatch, so
-        // everything else is `dot_command_dispatch` (`commands.sh`).
-        other => match selected {
-            Command::Cron => run_cron(stdout, &mut failed),
-            Command::Update => {
-                let rest: Vec<OsString> = args.collect();
-                run_update(runtime, &config, &rest, stdout, stderr)
-            }
-            Command::Init => {
-                let rest: Vec<Vec<u8>> = args.map(|arg| argv_bytes(&arg)).collect();
-                run_init(runtime, &rest, stdout, stderr, &mut failed)
-            }
-            command @ (Command::Fetch | Command::Push | Command::Status | Command::Diff) => {
-                let rest: Vec<OsString> = args.collect();
-                run_repos(runtime, &config, command, &rest, stdout, stderr)
-            }
-            Command::Doctor => {
-                let mut streams = crate::app::Streams::new(stdout, stderr);
-                crate::doctor::run(runtime, &mut streams)
-            }
-            Command::Test => {
-                let rest: Vec<OsString> = args.collect();
-                crate::test_command::run(
-                    runtime,
-                    &rest,
-                    &mut crate::app::Streams::new(stdout, stderr),
-                )
-            }
-            Command::Unknown => {
-                // A closed stderr here leaves nothing to report to; the
-                // exit code still carries the failure.
-                let _ = stderr.write_all(b"dot: unknown command: ");
-                let _ = stderr.write_all(other);
-                let _ = stderr.write_all(b"\n");
-                EXIT_ERROR
-            }
-        },
+            let mut failed = false;
+            let code = match command {
+                b"" | b"help" | b"-h" | b"--help" | b"version" | b"--version" => {
+                    unreachable!()
+                }
+                // `main.sh` loads config and the runtime before dispatch, so
+                // everything else is `dot_command_dispatch` (`commands.sh`).
+                other => match selected {
+                    Command::Cron => run_cron(&mut stdout, &mut failed),
+                    Command::Update => {
+                        run_update(runtime, &config, &rest, &mut stdout, &mut stderr)
+                    }
+                    Command::Init => {
+                        let raw: Vec<Vec<u8>> = rest.iter().map(argv_bytes).collect();
+                        run_init(runtime, &raw, &mut stdout, &mut stderr, &mut failed)
+                    }
+                    command
+                    @ (Command::Fetch | Command::Push | Command::Status | Command::Diff) => {
+                        run_repos(runtime, &config, command, &rest, &mut stdout, &mut stderr)
+                    }
+                    Command::Doctor => {
+                        let mut streams = crate::app::Streams::new(&mut stdout, &mut stderr);
+                        crate::doctor::run(runtime, &mut streams)
+                    }
+                    Command::Test => crate::test_command::run(
+                        runtime,
+                        &rest,
+                        &mut crate::app::Streams::new(&mut stdout, &mut stderr),
+                    ),
+                    Command::Unknown => {
+                        // A closed stderr here leaves nothing to report to; the
+                        // exit code still carries the failure.
+                        let _ = stderr.write_all(b"dot: unknown command: ");
+                        let _ = stderr.write_all(other);
+                        let _ = stderr.write_all(b"\n");
+                        EXIT_ERROR
+                    }
+                },
+            };
+            // A closed pipe must not report success for undelivered output.
+            // (The shell dies on SIGPIPE; Rust reports failure via exit code —
+            // same signal to the caller, different mechanism, pinned by test.)
+            if failed { EXIT_ERROR } else { code }
+        })()
     };
-    // A closed pipe must not report success for undelivered output.
-    // (The shell dies on SIGPIPE; Rust reports failure via exit code —
-    // same signal to the caller, different mechanism, pinned by test.)
-    if failed { EXIT_ERROR } else { code }
+    signals.finish(code)
 }
 
 /// The [`Command::Update`] arm: parse the leading flags
@@ -376,10 +441,6 @@ fn run_update(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
-    let signals = match crate::cleanup::Signals::for_runtime(runtime) {
-        Ok(signals) => signals,
-        Err(_) => return EXIT_ERROR,
-    };
     let raw: Vec<Vec<u8>> = args.iter().map(argv_bytes).collect();
     let refs: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
     let parsed = crate::update::parse_update_flags(&refs);
@@ -400,21 +461,19 @@ fn run_update(
         env.insert(OsString::from("DOT_VERBOSE"), OsString::from("1"));
         env.insert(OsString::from("SHDEPS_LOG_LEVEL"), OsString::from("2"));
     }
-    // Preserve the kernel's codes (`0` success, `1` failure, `2` config
-    // rejection, `75` lock busy) across the typed stream boundary.
-    let code = {
-        let mut stdout = signals.writer(stdout);
-        let mut stderr = signals.writer(stderr);
-        crate::update_run::run(
-            runtime,
-            config,
-            &env,
-            crate::update_run::Request { args },
-            &mut stdout,
-            &mut stderr,
-        )
-    };
-    signals.finish(code)
+    // Preserve the kernel's ordinary codes (`0`, `1`, `2`, `75`, and the
+    // strict-path `125`) and its trusted provider cancellation codes
+    // (`129`, `130`, `131`, and `143`) across the typed stream boundary.
+    // A locally handled signal still wins in `finish` with the
+    // corresponding `128 + signal` status.
+    crate::update_run::run(
+        runtime,
+        config,
+        &env,
+        crate::update_run::Request { args },
+        stdout,
+        stderr,
+    )
 }
 
 /// The [`Command::Cron`] arm: `crontab -l`, falling back to the
@@ -426,13 +485,28 @@ fn run_update(
 /// A missing `crontab` binary fails the spawn exactly like the
 /// shell's `127` feeds the `||`, and crontab diagnostics are dropped
 /// on both sides (the shell's `2>/dev/null`; here by capturing and
-/// ignoring stderr). The arm always succeeds — the shell's `rc` stays
-/// `0` either way — and only undelivered output flips `failed`, which
-/// [`run`] turns into [`EXIT_ERROR`] like the other arms.
+/// ignoring stderr). A clean listing, a missing crontab, and even a
+/// timed-out or unspawnable probe report [`EXIT_SUCCESS`] — only
+/// undelivered output flips `failed`, which [`run`] turns into
+/// [`EXIT_ERROR`] like the other arms — but an interrupted listing
+/// reports `128 + signal`, an unverifiable cleanup reports `125`,
+/// and a capture-limit breach reports [`EXIT_ERROR`].
 fn run_cron(stdout: &mut dyn Write, failed: &mut bool) -> i32 {
-    let listed = std::process::Command::new("crontab").arg("-l").output();
+    let mut command = std::process::Command::new("crontab");
+    command.arg("-l");
+    let listed = crate::cleanup::run_session_output_typed(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    );
     let show: Vec<u8> = match listed {
         Ok(output) if output.status.success() => output.stdout,
+        Err(crate::cleanup::SessionOutputError::Interrupted(signal)) => return 128 + signal,
+        Err(crate::cleanup::SessionOutputError::CleanupIncomplete) => {
+            return crate::cleanup::CLEANUP_INCOMPLETE_STATUS;
+        }
+        Err(crate::cleanup::SessionOutputError::CaptureLimit) => return EXIT_ERROR,
         _ => b"  no crontab installed\n".to_vec(),
     };
     if stdout.write_all(&show).is_err() {
@@ -482,16 +556,6 @@ fn run_init(
         .unwrap_or("0")
         == "1";
     let source_root = runtime.source_root();
-    let Some(host_git) = runtime
-        .value("PATH")
-        .and_then(OsStr::to_str)
-        .and_then(|path| identity::select_host_git(home, &source_root.to_string_lossy(), path))
-    else {
-        if writeln!(stderr, "dot init: {}", identity::NO_HOST_GIT).is_err() {
-            *failed = true;
-        }
-        return EXIT_ERROR;
-    };
     let scratch = runtime
         .value("TMPDIR")
         .filter(|dir| !dir.is_empty())
@@ -586,9 +650,7 @@ fn run_init(
         rollback: &rollback,
         fresh: &fresh,
     };
-    let report = identity::with_host_git(Path::new(&host_git), || {
-        init_client_command::run(&env, &engine, args)
-    });
+    let report = init_client_command::run(&env, &engine, args);
     if write_init_output(
         stdout,
         stderr,
@@ -695,6 +757,17 @@ fn run_repos(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
+    run_repos_inner(runtime, config, command, args, stdout, stderr)
+}
+
+fn run_repos_inner(
+    runtime: &crate::app::Runtime,
+    config: &crate::config::Config,
+    command: Command,
+    args: &[OsString],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
     if !matches!(
         command,
         Command::Fetch | Command::Push | Command::Status | Command::Diff
@@ -790,19 +863,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    fn run_text(args: &[&str]) -> (i32, String, String) {
-        let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let code = run(owned, &mut out, &mut err);
-        (
-            code,
-            String::from_utf8(out).expect("stdout is UTF-8"),
-            String::from_utf8(err).expect("stderr is UTF-8"),
-        )
-    }
-
-    fn run_init_text(args: &[&str]) -> (i32, String, String) {
+    fn run_owned(owned: Vec<OsString>) -> (i32, Vec<u8>, Vec<u8>) {
         let home = dot_test_support::TempDir::new("cli-unit-init-home").expect("home");
         let state = dot_test_support::TempDir::new("cli-unit-init-state").expect("state");
         let env = BTreeMap::from([
@@ -824,15 +885,24 @@ mod tests {
             ),
         ]);
         let runtime = crate::app::Runtime::from_env(&env, home.path()).expect("runtime");
-        let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run_with_runtime(&runtime, &owned, &mut out, &mut err);
+        (code, out, err)
+    }
+
+    fn run_text(args: &[&str]) -> (i32, String, String) {
+        let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let (code, out, err) = run_owned(owned);
         (
             code,
             String::from_utf8(out).expect("stdout is UTF-8"),
             String::from_utf8(err).expect("stderr is UTF-8"),
         )
+    }
+
+    fn run_init_text(args: &[&str]) -> (i32, String, String) {
+        run_text(args)
     }
 
     #[test]
@@ -1138,9 +1208,7 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let raw = vec![0x66, 0x6F, 0xFF, 0x62]; // "fo\xFFb"
         let owned = vec![OsString::from_vec(raw.clone())];
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let code = run(owned, &mut out, &mut err);
+        let (code, out, err) = run_owned(owned);
         assert_eq!(code, EXIT_ERROR);
         assert!(out.is_empty());
         let mut expected = b"dot: unknown command: ".to_vec();

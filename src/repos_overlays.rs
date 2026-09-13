@@ -282,14 +282,14 @@ fn gnu_stat_flavor() -> Result<bool> {
 /// One branch of the `stat` probe against `/`, quietly: success
 /// decides, exactly like the shell's `2>/dev/null ||` chain.
 fn stat_probe(args: &[&str]) -> bool {
-    std::process::Command::new("stat")
+    let mut command = std::process::Command::new("stat");
+    command
         .args(args)
         .arg("/")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .stderr(std::process::Stdio::null());
+    crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Strict) == 0
 }
 
 /// Leaf identity plus `mode:size` for one path: the two halves
@@ -771,6 +771,9 @@ fn create_stage(parent: &Path, base: &std::ffi::OsStr) -> Option<PathBuf> {
     use std::io::Read as _;
     use std::os::unix::fs::PermissionsExt as _;
     for _ in 0..16 {
+        if crate::cancellation::check().is_err() {
+            return None;
+        }
         let mut suffix = [0u8; 8];
         let random = std::fs::File::open("/dev/urandom")
             .ok()
@@ -1161,6 +1164,9 @@ fn stage_sibling(destination: &Path, contents: &[u8]) -> Option<PathBuf> {
     let mut prefix = destination.file_name().unwrap_or_default().to_os_string();
     prefix.push(".tmp.");
     for _ in 0..16 {
+        if crate::cancellation::check().is_err() {
+            return None;
+        }
         let mut suffix = [0u8; 8];
         std::fs::File::open("/dev/urandom")
             .ok()
@@ -1336,6 +1342,9 @@ pub fn load_authority(ctx: &mut AuthorityCtx<'_>) -> std::result::Result<Authori
 fn append_line(state: &mut Option<std::fs::File>, path: &Path, line: &str) -> bool {
     use std::io::Write as _;
     if state.is_none() {
+        if crate::cancellation::check().is_err() {
+            return false;
+        }
         *state = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1665,6 +1674,9 @@ fn stage_private_dir(tmp: &Path, prefix: &str) -> Option<PathBuf> {
     use std::io::Read as _;
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     for _ in 0..16 {
+        if crate::cancellation::check().is_err() {
+            return None;
+        }
         let mut suffix = [0u8; 8];
         std::fs::File::open("/dev/urandom")
             .ok()
@@ -1714,7 +1726,7 @@ pub fn replacement_hash_object_format(
     // throwaway and reports failure, like `status=1` does.
     let outcome = (|| {
         let format = format!("--object-format={object_format}");
-        let initialized = temp::sanitized_git(
+        let mut command = temp::sanitized_git(
             tmp,
             &[
                 "init",
@@ -1724,12 +1736,13 @@ pub fn replacement_hash_object_format(
                 format.as_str(),
                 temporary.to_string_lossy().as_ref(),
             ],
-        )
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
+        );
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let initialized =
+            crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Detach) == 0;
         if !initialized {
             return None;
         }
@@ -2043,6 +2056,9 @@ pub fn ensure_destination_parent(home: &str, parent: &str) -> bool {
         if current.symlink_metadata().is_ok() {
             return false;
         }
+        if crate::cancellation::check().is_err() {
+            return false;
+        }
         if std::fs::DirBuilder::new()
             .mode(0o777)
             .create(&current)
@@ -2068,6 +2084,9 @@ pub fn record_final(
     current: &mut HashSet<String>,
 ) -> bool {
     use std::io::Write as _;
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
     let mut file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -2333,6 +2352,9 @@ pub struct PublishLinkInputs<'a> {
 /// the stage, while record/transaction failures after the write
 /// keep the recovery trail.
 pub fn publish_link(link: &PublishLinkInputs<'_>) -> bool {
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
     let target = link.target;
     let destination = link.destination;
     let inputs = link.inputs;
@@ -2355,6 +2377,10 @@ pub fn publish_link(link: &PublishLinkInputs<'_>) -> bool {
         None => return false,
     };
     let staged = stage.join("link");
+    if crate::cancellation::check().is_err() {
+        let _ = std::fs::remove_dir(&stage);
+        return false;
+    }
     if std::os::unix::fs::symlink(target, &staged).is_err() {
         let _ = std::fs::remove_file(&staged);
         let _ = std::fs::remove_dir(&stage);
@@ -2452,6 +2478,9 @@ fn publish_link_replace(
     // creation succeeds: no cleanup past this point except through
     // recovery itself.
     use std::os::unix::fs::PermissionsExt as _;
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
     if std::fs::create_dir(&transaction).is_err()
         || std::fs::set_permissions(&transaction, std::fs::Permissions::from_mode(0o700)).is_err()
     {

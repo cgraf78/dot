@@ -13,10 +13,9 @@
 //!
 //! Engine boundaries: the lock parses as bytes (the shell's
 //! `IFS= read -r` keeps carriage returns, so CRLF stays malformed
-//! here too); digests come from the same `sha256sum` / `shasum -a
-//! 256` baseline the shell shells out to (adding a hash crate for
-//! one predicate would trade exact compatibility for an unnecessary
-//! dependency); ownership reads `symlink_metadata`,
+//! here too); digests use a small streaming SHA-256 implementation so
+//! verification has neither an ambient-PATH dependency nor an unowned helper
+//! process; ownership reads `symlink_metadata`,
 //! which refuses a final symlink exactly like the shell's `stat`
 //! without `-L` (the shared gate shape with
 //! [`crate::extension_trust`], whose link counts this predicate
@@ -76,8 +75,22 @@ fn is_abi(bytes: &[u8]) -> bool {
 /// trailing newline still counts its line, exactly like the shell
 /// `read ... || [[ -n $line ]]` fallback), unordered or wrongly
 /// prefixed lines, or a malformed value.
+/// Maximum `support/shdeps.lock` size read: a valid lock is three short
+/// lines (~150 bytes), so anything past 4 KiB is corrupt, not pinned.
+const LOCK_MAX_BYTES: u64 = 4096;
+
 fn lock_fields(source_root: &Path) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let content = std::fs::read(source_root.join("support/shdeps.lock")).ok()?;
+    use std::io::Read as _;
+
+    let path = source_root.join("support/shdeps.lock");
+    let file = std::fs::File::open(path).ok()?;
+    let mut content = Vec::new();
+    file.take(LOCK_MAX_BYTES + 1)
+        .read_to_end(&mut content)
+        .ok()?;
+    if content.len() as u64 > LOCK_MAX_BYTES {
+        return None;
+    }
     let mut lines: Vec<&[u8]> = content.split(|byte| *byte == b'\n').collect();
     // `read` consumes one trailing newline as its delimiter without
     // producing a field; without it the tail counts as a line.
@@ -141,35 +154,154 @@ pub fn path_owned(path: &Path, euid: u32) -> bool {
     }
 }
 
-/// `_dot_shdeps_sha256`: the hex digest of `path` via `sha256sum`,
-/// falling back to `shasum -a 256`, like the shell. `None` mirrors
-/// every failure the installer-hash predicate can observe (missing
-/// tool, unreadable file, unparsable output). One intentional
-/// hardening: the shell pipeline prints an empty digest with a
-/// success status when the file is missing (`awk` masks the
-/// failure); this reports `None` instead, which still refuses
-/// through [`installer_hash_matches`] exactly like the shell.
+struct Sha256 {
+    state: [u32; 8],
+    block: [u8; 64],
+    used: usize,
+    bytes: u64,
+}
+
+impl Sha256 {
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            block: [0; 64],
+            used: 0,
+            bytes: 0,
+        }
+    }
+
+    fn update(&mut self, mut input: &[u8]) {
+        self.bytes = self.bytes.wrapping_add(input.len() as u64);
+        if self.used != 0 {
+            let count = (64 - self.used).min(input.len());
+            self.block[self.used..self.used + count].copy_from_slice(&input[..count]);
+            self.used += count;
+            input = &input[count..];
+            if self.used == 64 {
+                let block = self.block;
+                Self::compress(&mut self.state, &block);
+                self.used = 0;
+            }
+        }
+        while input.len() >= 64 {
+            let block: &[u8; 64] = input[..64].try_into().expect("fixed SHA-256 block");
+            Self::compress(&mut self.state, block);
+            input = &input[64..];
+        }
+        // Invariant: the partial-fill branch above compressed whenever `used`
+        // reached 64, and the loop consumed every full block, so `used + len`
+        // is strictly below 64 here — the tail appends at the buffered
+        // offset, preserving bytes from earlier `update` calls.
+        let used = self.used;
+        self.block[used..used + input.len()].copy_from_slice(input);
+        self.used = used + input.len();
+    }
+
+    fn finish(mut self) -> [u8; 32] {
+        let bits = self.bytes.wrapping_mul(8);
+        self.block[self.used] = 0x80;
+        self.used += 1;
+        if self.used > 56 {
+            self.block[self.used..].fill(0);
+            let block = self.block;
+            Self::compress(&mut self.state, &block);
+            self.block = [0; 64];
+            self.used = 0;
+        }
+        self.block[self.used..56].fill(0);
+        self.block[56..].copy_from_slice(&bits.to_be_bytes());
+        let block = self.block;
+        Self::compress(&mut self.state, &block);
+        let mut digest = [0; 32];
+        for (chunk, word) in digest.chunks_exact_mut(4).zip(self.state) {
+            chunk.copy_from_slice(&word.to_be_bytes());
+        }
+        digest
+    }
+
+    fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let mut words = [0u32; 64];
+        for (index, chunk) in block.chunks_exact(4).enumerate() {
+            words[index] = u32::from_be_bytes(chunk.try_into().expect("four-byte SHA-256 word"));
+        }
+        for index in 16..64 {
+            let s0 = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let s1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+        for index in 0..64 {
+            let sum1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choice = (e & f) ^ (!e & g);
+            let first = h
+                .wrapping_add(sum1)
+                .wrapping_add(choice)
+                .wrapping_add(K[index])
+                .wrapping_add(words[index]);
+            let sum0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let second = sum0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(first);
+            d = c;
+            c = b;
+            b = a;
+            a = first.wrapping_add(second);
+        }
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+}
+
+/// `_dot_shdeps_sha256`: the lowercase SHA-256 digest of `path`.
+/// `None` mirrors every unreadable-file failure the installer-hash predicate
+/// can observe. Hashing streams fixed-size blocks and launches no helper.
 pub fn sha256_file(path: &Path) -> Option<String> {
-    let output = std::process::Command::new("sha256sum")
-        .arg(path)
-        .output()
-        .or_else(|_| {
-            std::process::Command::new("shasum")
-                .args(["-a", "256"])
-                .arg(path)
-                .output()
-        })
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let digest = text.split_whitespace().next()?;
-    if is_install_sha256(digest.as_bytes()) {
-        Some(digest.to_string())
-    } else {
-        None
-    }
+    Some(
+        hasher
+            .finish()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 /// `_dot_shdeps_installer_hash_matches`: whether `path` digests to
@@ -229,10 +361,14 @@ pub fn checkpoint_path(xdg_state_home: &str, home: &str) -> Option<PathBuf> {
 /// config ignored). Always succeeds: an unresolvable checkout
 /// yields the empty string, like the shell's trailing `|| true`.
 pub fn active_revision(source_root: &Path) -> String {
-    let output = crate::temp::sanitized_git(source_root, &["rev-parse", "HEAD"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+    let mut command = crate::temp::sanitized_git(source_root, &["rev-parse", "HEAD"]);
+    command.stdin(Stdio::null()).stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    );
     match output {
         Ok(produced) if produced.status.success() => String::from_utf8_lossy(&produced.stdout)
             .trim_end_matches('\n')
@@ -318,6 +454,9 @@ pub fn read_checkpoint(path: &Path) -> Option<String> {
 /// and the publish goes through the shared no-replace move, so a
 /// late path still refuses without replacing it.
 pub fn write_checkpoint(before: &str, after: &str, path: &Path, moves: &mut MoveCache) -> bool {
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
     if !revision_valid(before) || !revision_valid(after) {
         return false;
     }
@@ -348,7 +487,8 @@ pub fn write_checkpoint(before: &str, after: &str, path: &Path, moves: &mut Move
         "{}\nbefore={before}\nafter={after}\n",
         String::from_utf8_lossy(CHECKPOINT_MAGIC)
     );
-    if std::fs::write(&temporary, body.as_bytes()).is_err() {
+    if crate::cancellation::check().is_err() || std::fs::write(&temporary, body.as_bytes()).is_err()
+    {
         let _ = std::fs::remove_file(&temporary);
         return false;
     }
@@ -405,4 +545,49 @@ pub fn consume_checkpoint(path: &Path, source_root: &Path) -> bool {
         return false;
     }
     std::fs::remove_file(path).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest_hex(digest: [u8; 32]) -> String {
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn sha256_update_accumulates_across_split_feeds() {
+        // Fresh-review-B P2-2 RED pin: the streaming contract must hold for
+        // multi-call feeds, not just single-shot ones. The buggy tail
+        // overwrote the buffered prefix and produced `02db4ca4…` here.
+        let mut split = Sha256::new();
+        split.update(b"hello sh");
+        split.update(b"deps\n");
+        let mut single = Sha256::new();
+        single.update(b"hello shdeps\n");
+        assert_eq!(split.finish(), single.finish());
+        assert_eq!(
+            digest_hex({
+                let mut hasher = Sha256::new();
+                hasher.update(b"hello sh");
+                hasher.update(b"deps\n");
+                hasher.finish()
+            }),
+            "f990fdf034b96b1ce03e80928a7a7bd50889fe3a22c3c8da6011b61396e7ea80"
+        );
+    }
+
+    #[test]
+    fn sha256_matches_a_byte_at_a_time_mib_vector() {
+        // 1 MiB of `i % 251` fed one byte per `update` call, digest from
+        // `hashlib.sha256` (independent oracle, not this implementation).
+        let mut hasher = Sha256::new();
+        for index in 0..1024 * 1024 {
+            hasher.update(&[(index % 251) as u8]);
+        }
+        assert_eq!(
+            digest_hex(hasher.finish()),
+            "631b84027d6b9e52b539c4e8373622d23032dfadc64d60af87339c9037e4f769"
+        );
+    }
 }
