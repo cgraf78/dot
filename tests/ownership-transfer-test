@@ -336,8 +336,12 @@ if [[ $base_fallback_init_status -eq 125 ]]; then
   fail 'base-fallback init hung (TEMP-DIAG-180)'
 fi
 if [[ $base_fallback_init_status -ne 0 ]]; then
-  printf '%s\n' 'GIT-TRACE-180 tail:'
-  tail -c 4000 "$base_fallback_init_trace" 2>/dev/null || printf '%s\n' '<no trace file>'
+  printf '%s\n' 'GIT-TRACE-180 clone lines:'
+  grep -a 'built-in: git clone' "$base_fallback_init_trace" 2>/dev/null |
+    cut -c1-250 || printf '%s\n' '<no clone in trace>'
+  printf '%s\n' 'GIT-TRACE-180 command inventory:'
+  grep -a -o 'built-in: git [a-z-]*' "$base_fallback_init_trace" 2>/dev/null |
+    sort | uniq -c || printf '%s\n' '<no trace file>'
   fail "base-fallback init failed: $base_fallback_init_output"
 fi
 rm -f "$base_fallback_init_trace"
