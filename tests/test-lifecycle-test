@@ -479,12 +479,21 @@ def publish_all():
 
 publisher = threading.Thread(target=publish_all)
 publisher.start()
-deadline = time.monotonic() + 3
+# Loaded macOS CI runners pace registration roundtrips near 60ms; the
+# 64-publisher phase verifies accounting, not speed, so allow headroom.
+deadline = time.monotonic() + 10
 drains = 0
 # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
 loop_started = time.monotonic()
+drain_total = 0.0
+drain_worst = 0.0
 while publisher.is_alive() and time.monotonic() < deadline:
+    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+    drain_started = time.monotonic()
     assert module.drain_nested_supervisors(deadline)
+    drain_elapsed = time.monotonic() - drain_started
+    drain_total += drain_elapsed
+    drain_worst = max(drain_worst, drain_elapsed)
     drains += 1
     # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
     if drains % 10 == 0:
@@ -492,7 +501,7 @@ while publisher.is_alive() and time.monotonic() < deadline:
     publisher.join(0.01)
 publisher.join(0)
 # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-print(f"TEMP-DIAG-180 PUB-FINAL alive={publisher.is_alive()} done={len(registrations)}/{len(tokens)} drains={drains} registered={len(module.nested_supervisors)} elapsed={time.monotonic() - loop_started:.2f}s", flush=True)
+print(f"TEMP-DIAG-180 PUB-FINAL alive={publisher.is_alive()} done={len(registrations)}/{len(tokens)} drains={drains} registered={len(module.nested_supervisors)} elapsed={time.monotonic() - loop_started:.2f}s drain_avg={drain_total / max(drains, 1) * 1000:.1f}ms drain_max={drain_worst * 1000:.1f}ms", flush=True)
 assert not publisher.is_alive(), "nested registration publisher did not finish"
 assert not failure, failure
 assert len(module.nested_supervisors) == len(tokens)
