@@ -557,45 +557,69 @@ reader, writer = module.protocol_socketpair(module.socket.SOCK_DGRAM)
 module.control_reader = reader
 module.nested_control_complete = True
 queued = []
+held = []
 writer_socket = socket.socket(fileno=writer)
 try:
     writer_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+    deadline = time.monotonic() + 10
+    resumed = False
+    resumes = 0
     for index in range(129):
         local_fd, parent_fd = module.protocol_socketpair()
         local = socket.socket(fileno=local_fd)
         parent = socket.socket(fileno=parent_fd)
         frame = b"DTS2" + struct.pack("!I", os.getpid()) + f"{index:064x}".encode()
         rights = array.array("i", [parent.fileno()])
-        # Darwin reports ENOBUFS (not EAGAIN) when a burst of
-        # descriptor-carrying datagrams momentarily exhausts mbuf
-        # space. The backlog is still queued ahead of the drain, so
-        # retry briefly; persistent exhaustion still fails loudly.
-        for attempt in range(100):
+        # Darwin reports ENOBUFS (not EAGAIN) when descriptor-carrying
+        # datagrams exhaust mbuf space; loaded CI runners vary from 22
+        # to 129 queued, so retry briefly, then drain the backlog to
+        # free queue space and resume the burst.
+        for attempt in range(40):
             try:
                 written = writer_socket.sendmsg(
                     [frame], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)]
                 )
             except OSError as error:
-                if error.errno != errno.ENOBUFS or attempt >= 99:
+                if error.errno != errno.ENOBUFS:
                     raise
                 # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
                 print(f"TEMP-DIAG-180 BURST-RETRY index={index} attempt={attempt + 1}", flush=True)
-                time.sleep(0.005)
+                time.sleep(0.025)
             else:
                 break
+        else:
+            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+            print(f"TEMP-DIAG-180 BURST-RESUME index={index} queued={len(queued)}", flush=True)
+            assert module.drain_nested_supervisors(deadline)
+            resumed = True
+            resumes += 1
+            assert resumes <= 10, "macOS mbuf pressure never cleared"
+            written = writer_socket.sendmsg(
+                [frame], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)]
+            )
         assert written == len(frame)
-        parent.close()
+        # Hold the sent copy until the burst drains: closing before the
+        # ack corrupts the pending macOS install (phantom EOF/HUP),
+        # the same hazard the publisher avoids by holding until ack.
+        held.append(parent)
         queued.append(local)
-    deadline = time.monotonic() + 2
-    assert module.drain_nested_supervisors(deadline)
-    assert module.nested_control_complete
-    assert len(module.nested_supervisors) == 128
-    assert module.drain_nested_supervisors(deadline)
-    assert module.nested_control_complete
-    assert len(module.nested_supervisors) == 129
+    if not resumed:
+        assert module.drain_nested_supervisors(deadline)
+        assert module.nested_control_complete
+        assert len(module.nested_supervisors) == 128
+        assert module.drain_nested_supervisors(deadline)
+        assert module.nested_control_complete
+        assert len(module.nested_supervisors) == 129
+    else:
+        while len(module.nested_supervisors) != 129 and time.monotonic() < deadline:
+            assert module.drain_nested_supervisors(deadline)
+        assert module.nested_control_complete
+        assert len(module.nested_supervisors) == 129
 finally:
     for registration in queued:
         registration.close()
+    for sender in held:
+        sender.close()
     for _pid, registration in module.nested_supervisors.values():
         registration.close()
     module.nested_supervisors.clear()
