@@ -4817,7 +4817,7 @@ fn spawn_owned_child(mut command: Command) -> std::io::Result<Option<OwnedChild>
             Ok((pid, authorized, registration))
         },
     );
-    let spawned = command.spawn();
+    let spawned = spawn_with_eagain_retry(&mut command);
     drop(command);
     drop(ready_child);
     drop(authorize_child);
@@ -5551,6 +5551,35 @@ impl OwnedSession {
     }
 }
 
+/// Fork attempts under transient resource pressure (Darwin reports
+/// `EAGAIN` when parallel suites and per-observe `ps` snapshots
+/// contend). Bounded like the capture backpressure retries so a
+/// launch stall always returns to the supervisor for signal checks.
+const SPAWN_EAGAIN_RETRIES: u32 = 100;
+
+/// Spawn with transient-pressure retries. A failed fork never
+/// reaches the pre-exec barrier, so the registrar still awaits its
+/// single handshake and each attempt is independent. Only
+/// resource-pressure (`EAGAIN`) retries; every other spawn error
+/// (missing binary, denied exec) fails immediately like before.
+fn spawn_with_eagain_retry(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    let mut eagain_retries = 0;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && eagain_retries < SPAWN_EAGAIN_RETRIES =>
+            {
+                eagain_retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 /// Atomically authorize, launch, and register an isolated child session.
 /// A pre-latched signal returns `None`; a signal pending on the spawning thread
 /// is released only after the child and its transitive ownership marker are
@@ -5674,7 +5703,7 @@ pub(crate) fn spawn_owned_session(mut command: Command) -> std::io::Result<Optio
         }
         result
     });
-    let spawned = command.spawn();
+    let spawned = spawn_with_eagain_retry(&mut command);
     drop(command);
     drop(ready_child);
     drop(authorize_child);
