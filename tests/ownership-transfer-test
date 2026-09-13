@@ -351,7 +351,14 @@ base_fallback_seed=$DOT_TEST_TMP/base-fallback-base-seed
 mkdir -p "$base_fallback_seed/.config/base-fallback"
 printf 'base destination\n' >"$base_fallback_seed/.config/base-fallback/value"
 commit_seed base-fallback-base publish-destination
-run_dot "$base_fallback_home" "$base_fallback_state" update -f >/dev/null
+# TEMP-DIAG-180: remove after the macOS ownership diagnosis (silent update
+# death: capture the exit status and full output the plain invocation hides).
+base_fallback_update_status=0
+base_fallback_update_output=$(run_dot "$base_fallback_home" "$base_fallback_state" update -f 2>&1) || base_fallback_update_status=$?
+if [[ $base_fallback_update_status -ne 0 ]]; then
+  printf '%s\n' "UPDATE-DUMP status=$base_fallback_update_status output: $base_fallback_update_output"
+  fail 'base-fallback update died silently (TEMP-DIAG-180)'
+fi
 assert_link_owner "$base_fallback_home" .config/base-fallback/value source \
   'source overlay keeps precedence during base handoff overlap'
 
