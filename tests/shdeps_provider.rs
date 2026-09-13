@@ -271,7 +271,9 @@ case ${1:-} in
         '{"event":"warning","status":"warning","detail":"provider live stdout"}'
       printf '%s\n' 'provider live stderr' >&2
       printf '%s\n' "$BASHPID" >"$DOT_TEST_PROVIDER_LIVE_PID"
-      while :; do sleep 1; done
+      # An orphaned sleep holds the lifetime lease until it exits; keep the
+      # idle granularity an order of magnitude under the lease-proof deadline.
+      while :; do sleep 0.1; done
     fi
     if [[ -n ${DOT_TEST_PROVIDER_OVERFLOW_STREAM:-} ]]; then
       trap ': >"$DOT_TEST_PROVIDER_OVERFLOW_STOPPED"; exit 143' TERM
@@ -312,7 +314,10 @@ case ${1:-} in
         printf '%s' "$flood"
       done
       printf '%s\n' '"}'
-      while :; do sleep 1; done
+      # Bash defers a TERM trap across a foreground sleep while teardown
+      # grace is one second; keep the idle granularity an order of
+      # magnitude under it so the trap always wins.
+      while :; do sleep 0.1; done
     fi
     if [[ ${DOT_TEST_PROVIDER_BACKPRESSURE_EXIT130:-0} == 1 ]]; then
       printf '%s\n' "$BASHPID" >"$DOT_TEST_PROVIDER_BACKPRESSURE_PID"
