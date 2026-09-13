@@ -169,17 +169,43 @@ fn cached_matches(stage: &[OsString], commit: &str) -> bool {
 /// exactly the commit — clean index, clean worktree, no untracked
 /// files.
 pub fn cloned_overlay_matches_commit(root: &str, commit: &str) -> bool {
+    // TEMP-DIAG-180: remove after the macOS ownership diagnosis.
+    let diag = std::env::var_os("DOT_TEST_DIAG_CLONE").is_some();
     let stage = stage_prefix(root);
     if !cached_matches(&stage, commit) {
+        if diag {
+            eprintln!("TEMP-DIAG-180 CLONE-SITE matches-cached");
+        }
         return false;
     }
-    if !run_git(&stage, &["diff", "--quiet", commit, "--"])
-        .is_some_and(|output| output.status.success())
-    {
-        return false;
+    match run_git(&stage, &["diff", "--quiet", commit, "--"]) {
+        Some(output) if output.status.success() => {}
+        output => {
+            if diag {
+                eprintln!(
+                    "TEMP-DIAG-180 CLONE-SITE matches-worktree ran={} code={:?} out={:?}",
+                    output.is_some(),
+                    output.as_ref().and_then(|o| o.status.code()),
+                    output.as_ref().map(|o| String::from_utf8_lossy(&o.stdout)),
+                );
+            }
+            return false;
+        }
     }
-    run_git(&stage, &["ls-files", "--others", "-z"])
-        .is_some_and(|output| output.status.success() && output.stdout.is_empty())
+    match run_git(&stage, &["ls-files", "--others", "-z"]) {
+        Some(output) if output.status.success() && output.stdout.is_empty() => true,
+        output => {
+            if diag {
+                eprintln!(
+                    "TEMP-DIAG-180 CLONE-SITE matches-untracked ran={} code={:?} out={:?}",
+                    output.is_some(),
+                    output.as_ref().and_then(|o| o.status.code()),
+                    output.as_ref().map(|o| String::from_utf8_lossy(&o.stdout)),
+                );
+            }
+            false
+        }
+    }
 }
 
 /// Remove a staging directory, best effort like the shell's

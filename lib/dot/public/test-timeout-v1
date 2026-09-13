@@ -265,6 +265,8 @@ def finish(status: int, cleanup_complete: bool = True) -> int:
     """Close signal ownership without losing a signal in the handoff window."""
     global ancestor_registration, control_reader, lease_reader
     global terminal_cleanup_incomplete
+    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+    _temp_diag(f"TEMP-DIAG-180 FINISH-ENTER pid={os.getpid()} status={status}")
     old_mask = None
     if hasattr(signal, "pthread_sigmask"):
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
@@ -307,6 +309,8 @@ def finish(status: int, cleanup_complete: bool = True) -> int:
     if old_mask is not None:
         signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
     previous_signal_handlers.clear()
+    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+    _temp_diag(f"TEMP-DIAG-180 FINISH-EXIT pid={os.getpid()} result={result}")
     return result
 
 
@@ -2376,6 +2380,11 @@ def stop_process_group(first_signal: int) -> CleanupResult:
                 return False
         except (PermissionError, ProcessLookupError):
             return False
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(
+            f"TEMP-DIAG-180 SIGNAL-GROUP pid={os.getpid()} "
+            f"group={process.pid} signum={signum}"
+        )
         try:
             os.killpg(process.pid, signum)
         except AttributeError:
@@ -2389,6 +2398,11 @@ def stop_process_group(first_signal: int) -> CleanupResult:
 
     def send_leader_signal(signum: int) -> bool:
         """Signal the exact unreaped Popen leader without polling its status."""
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        _temp_diag(
+            f"TEMP-DIAG-180 SIGNAL-LEADER pid={os.getpid()} "
+            f"target={process.pid} signum={signum}"
+        )
         try:
             os.kill(process.pid, signum)
         except (PermissionError, ProcessLookupError):
@@ -2595,6 +2609,10 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             status = process.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             # The retained Popen handle is stable authority for its own leader.
+            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+            _temp_diag(
+                f"TEMP-DIAG-180 LEGS-KILL pid={os.getpid()} target={process.pid}"
+            )
             process.kill()
             try:
                 status = process.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
