@@ -113,9 +113,6 @@ nested_supervisors: dict[str, tuple[int, socket.socket]] = {}
 # persistently EOF and persistently absent, and still unregisters
 # after three observations.
 nested_unhealthy_strikes: dict[str, int] = {}
-# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis. Tokens
-# with an already-reported open anomaly bout (bounds LINK-PEEK spam).
-nested_peek_logged: set[str] = set()
 # Whether any nested supervisor ever registered. Registrations arrive
 # during supervision, long before the stop; once set, phase completion
 # additionally requires a drained lease, so a snapshot that misses a
@@ -283,8 +280,6 @@ def finish(status: int, cleanup_complete: bool = True) -> int:
     """Close signal ownership without losing a signal in the handoff window."""
     global ancestor_registration, control_reader, lease_reader
     global terminal_cleanup_incomplete
-    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-    _temp_diag(f"TEMP-DIAG-180 FINISH-ENTER pid={os.getpid()} status={status}")
     old_mask = None
     if hasattr(signal, "pthread_sigmask"):
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
@@ -315,7 +310,6 @@ def finish(status: int, cleanup_complete: bool = True) -> int:
         link.close()
     nested_supervisors.clear()
     nested_unhealthy_strikes.clear()
-    nested_peek_logged.clear()
     terminal_cleanup_incomplete = not cleanup_complete
     if terminal_handoff_required:
         # The single-threaded process-entry path keeps handled signals blocked
@@ -329,8 +323,6 @@ def finish(status: int, cleanup_complete: bool = True) -> int:
     if old_mask is not None:
         signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
     previous_signal_handlers.clear()
-    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-    _temp_diag(f"TEMP-DIAG-180 FINISH-EXIT pid={os.getpid()} result={result}")
     return result
 
 
@@ -781,8 +773,6 @@ def publish_nested_supervisor(
         # its copy the same way; the finally below still closes every copy
         # on the error paths.
         local.setblocking(False)
-        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-        _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH sent pid={os.getpid()} token={token}")
         deadline = time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
         with selectors.DefaultSelector() as selector:
             selector.register(local, selectors.EVENT_READ)
@@ -791,20 +781,14 @@ def publish_nested_supervisor(
                     raise InterruptedError("nested-supervisor registration interrupted")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-                    _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH ack timeout pid={os.getpid()}")
                     raise TimeoutError("nested-supervisor registration timed out")
                 if not selector.select(min(remaining, PROCESS_POLL_SECONDS)):
                     continue
                 reply = local.recv(2)
                 if reply == b"\1":
-                    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-                    _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH acked pid={os.getpid()}")
                     parent.close()
                     parent = None
                     return local
-                # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-                _temp_diag(f"TEMP-DIAG-180 NESTED-PUBLISH rejected pid={os.getpid()} reply={reply!r}")
                 raise OSError(errno.EPROTO, "nested-supervisor registration was rejected")
     finally:
         if rendezvous is not None:
@@ -825,7 +809,6 @@ def invalidate_nested_control() -> None:
         link.close()
     nested_supervisors.clear()
     nested_unhealthy_strikes.clear()
-    nested_peek_logged.clear()
 
 
 def nested_supervisor_belongs_to_session(supervisor: int, leader: int) -> bool:
@@ -864,11 +847,9 @@ def drain_nested_supervisors(
             payload = link.recv(1, getattr(socket, "MSG_PEEK", 0))
         except BlockingIOError:
             nested_unhealthy_strikes[token] = 0
-            nested_peek_logged.discard(token)
             continue
         except InterruptedError:
             nested_unhealthy_strikes[token] = 0
-            nested_peek_logged.discard(token)
             continue
         except OSError as error:
             anomaly = f"os-error:{error.errno}"
@@ -886,31 +867,7 @@ def drain_nested_supervisors(
             strikes = nested_unhealthy_strikes.get(token, 0) + 1
             nested_unhealthy_strikes[token] = strikes
             if unregister and strikes >= 3:
-                # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-                _temp_diag(
-                    f"TEMP-DIAG-180 LINK-UNREG pid={os.getpid()} "
-                    f"supervisor={supervisor} anomaly={anomaly} "
-                    f"strikes={strikes}"
-                )
                 closed.append(token)
-                nested_peek_logged.discard(token)
-                continue
-        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-        # Log once per open anomaly bout; a persistent anomaly would
-        # otherwise exhaust the diagnostic budget.
-        if token not in nested_peek_logged:
-            nested_peek_logged.add(token)
-            in_snapshot = (
-                "live"
-                if supervisor in snapshot_live
-                else ("dead" if snapshot is not None else "none")
-            )
-            _temp_diag(
-                f"TEMP-DIAG-180 LINK-PEEK pid={os.getpid()} "
-                f"supervisor={supervisor} anomaly={anomaly} "
-                f"strikes={nested_unhealthy_strikes.get(token, 0)} "
-                f"snapshot={in_snapshot} unregister={unregister}"
-            )
     for token in closed:
         _pid, link = nested_supervisors.pop(token)
         nested_unhealthy_strikes.pop(token, None)
@@ -991,11 +948,6 @@ def drain_nested_supervisors(
             invalidate_nested_control()
             return False
         expected = process.pid if process is not None else 0
-        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-        _temp_diag(
-            f"TEMP-DIAG-180 NESTED-DRAIN frame supervisor={supervisor} peer={peer} "
-            f"expected={expected} token={token} dup={token in nested_supervisors}"
-        )
         if (
             supervisor <= 0
             or not nested_supervisor_belongs_to_session(supervisor, expected)
@@ -1004,25 +956,15 @@ def drain_nested_supervisors(
             or token in nested_supervisors
             or len(nested_supervisors) >= 1024
         ):
-            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-            _temp_diag(
-                f"TEMP-DIAG-180 NESTED-DRAIN rejected supervisor={supervisor}"
-            )
             link.close()
             invalidate_nested_control()
             return False
         try:
             link.sendall(b"\1")
         except OSError:
-            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-            _temp_diag(
-                f"TEMP-DIAG-180 NESTED-DRAIN ack failed supervisor={supervisor}"
-            )
             link.close()
             invalidate_nested_control()
             return False
-        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-        _temp_diag(f"TEMP-DIAG-180 NESTED-DRAIN acked supervisor={supervisor}")
         nested_supervisors[token] = (supervisor, link)
         nested_ever_registered = True
     # The fixed loop count is a per-call work budget, not a protocol error.
@@ -1041,49 +983,6 @@ def stream_requires_relay(fd: int) -> bool:
     except OSError:
         return False
     return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
-
-
-# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis. Best-effort
-# direct write: diagnostic() forks a writer child, and fork latency inside
-# stop perturbs the nested-teardown race under diagnosis. Temporarily flip
-# fd 2 non-blocking, drop on backpressure, and always restore flags.
-_temp_diag_remaining = 48
-
-
-def _temp_diag(message: str) -> None:
-    global _temp_diag_remaining
-    if _temp_diag_remaining <= 0:
-        return
-    # Env-gated: exact-stderr assertions stay green where unset.
-    if not os.environ.get("DOT_TEST_DIAG_NESTED"):
-        return
-    if ENTRY_STDIO_MASK & (1 << 2) == 0:
-        return
-    try:
-        stream_fd = sys.stderr.fileno()
-    except (AttributeError, OSError):
-        return
-    if stream_fd != 2:
-        return
-    _temp_diag_remaining -= 1
-    payload = (message + "\n").encode("utf-8", errors="replace")[:4096]
-    try:
-        flags = fcntl.fcntl(2, fcntl.F_GETFL)
-    except (AttributeError, OSError):
-        return
-    try:
-        fcntl.fcntl(2, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-    except (AttributeError, OSError):
-        return
-    try:
-        os.write(2, payload)
-    except (BlockingIOError, InterruptedError, OSError):
-        pass
-    finally:
-        try:
-            fcntl.fcntl(2, fcntl.F_SETFL, flags)
-        except (AttributeError, OSError):
-            pass
 
 
 def diagnostic(message: str) -> None:
@@ -2463,14 +2362,11 @@ def stop_process_group(first_signal: int) -> CleanupResult:
     known_members: dict[int, MemberHandle] = {}
     group_delivered: set[tuple[int, int | None]] = set()
     unsafe_direct_member = False
-    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-    unsafe_direct_member_reason = ""
 
     def send_process_group_signal(
         signum: int, processes: list[SessionProcess] | None
     ) -> bool:
         """Signal the group whose retained leader reserves its numeric ID."""
-        via_zombie = False
         try:
             if os.getsid(process.pid) != process.pid:
                 return False
@@ -2484,13 +2380,6 @@ def stop_process_group(first_signal: int) -> CleanupResult:
                 item.pid == process.pid and not item.live for item in processes
             ):
                 return False
-            via_zombie = True
-        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-        _temp_diag(
-            f"TEMP-DIAG-180 SIGNAL-GROUP pid={os.getpid()} "
-            f"group={process.pid} signum={signum}"
-            f"{' zombie' if via_zombie else ''}"
-        )
         try:
             os.killpg(process.pid, signum)
         except AttributeError:
@@ -2504,11 +2393,6 @@ def stop_process_group(first_signal: int) -> CleanupResult:
 
     def send_leader_signal(signum: int) -> bool:
         """Signal the exact unreaped Popen leader without polling its status."""
-        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-        _temp_diag(
-            f"TEMP-DIAG-180 SIGNAL-LEADER pid={os.getpid()} "
-            f"target={process.pid} signum={signum}"
-        )
         try:
             os.kill(process.pid, signum)
         except (PermissionError, ProcessLookupError):
@@ -2517,7 +2401,7 @@ def stop_process_group(first_signal: int) -> CleanupResult:
 
     def observe(deadline: float, unregister: bool) -> list[SessionProcess] | None:
         """Refresh member handles while preserving previously pinned identities."""
-        nonlocal unsafe_direct_member, unsafe_direct_member_reason
+        nonlocal unsafe_direct_member
         # Snapshot before draining so the drain can confirm liveness:
         # a supervisor this snapshot shows live is never unregistered.
         # Queued registrations wait in the datagram queue meanwhile.
@@ -2532,9 +2416,6 @@ def stop_process_group(first_signal: int) -> CleanupResult:
         # I/O either way.
         if not drain_nested_supervisors(None, processes, unregister):
             unsafe_direct_member = True
-            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-            if not unsafe_direct_member_reason:
-                unsafe_direct_member_reason = "nested-drain"
         if processes is None:
             return None
         for process_info in processes:
@@ -2551,11 +2432,6 @@ def stop_process_group(first_signal: int) -> CleanupResult:
                 previous.process = process_info
             if process_info.ambiguous:
                 unsafe_direct_member = True
-                # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-                if not unsafe_direct_member_reason:
-                    unsafe_direct_member_reason = (
-                        f"ambiguous:{process_info.pid}"
-                    )
                 continue
             if previous is None:
                 member, _claim = claim_member(process_info, process.pid)
@@ -2603,11 +2479,6 @@ def stop_process_group(first_signal: int) -> CleanupResult:
 
     def phase(signum: int, deadline: float, only_new: bool) -> bool:
         """Signal and require two complete empty session observations."""
-        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-        _temp_diag(
-            f"TEMP-DIAG-180 STOP-PHASE enter pid={os.getpid()} signum={signum} "
-            f"budget={deadline - time.monotonic():.2f}"
-        )
         group_delivered.clear()
         # Only the KILL phase unregisters: a live owner must survive
         # TERM (it needs that time to shut its own session down), and a
@@ -2652,21 +2523,6 @@ def stop_process_group(first_signal: int) -> CleanupResult:
         )
         if wait_for_owner:
             deadline += DELEGATED_OWNER_GRACE_SECONDS
-        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-        live_sup = sorted(
-            pid
-            for pid in supervisor_pids
-            if processes is not None
-            and any(
-                item.live and item.pid == pid for item in processes
-            )
-        )
-        _temp_diag(
-            f"TEMP-DIAG-180 STOP-DECIDE pid={os.getpid()} signum={signum} "
-            f"wait={wait_for_owner} none={processes is None} "
-            f"cohort={complete_exact_cohort} sup={len(supervisor_pids)} "
-            f"live_sup={live_sup}"
-        )
         # `wait_for_owner` is KILL-only, so TERM delivery (which the
         # nested supervisor needs as its shutdown trigger) is unchanged.
         # For KILL, neither the exact leader signal nor the group signal
@@ -2712,27 +2568,10 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             ):
                 consecutive_empty += 1
                 if consecutive_empty >= 2:
-                    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-                    _temp_diag(
-                        f"TEMP-DIAG-180 STOP-PHASE exit pid={os.getpid()} "
-                        f"signum={signum} result=True"
-                    )
                     return True
             else:
                 consecutive_empty = 0
             time.sleep(min(PROCESS_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
-        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-        if processes is None:
-            live_summary = "observe-None"
-        else:
-            live_summary = ",".join(
-                str(item.pid) for item in processes if item.live
-            ) or "none-live"
-        _temp_diag(
-            f"TEMP-DIAG-180 STOP-PHASE exit pid={os.getpid()} signum={signum} "
-            f"result=False unsafe={unsafe_direct_member} "
-            f"reason={unsafe_direct_member_reason or 'none'} live={live_summary}"
-        )
         return False
 
     try:
@@ -2751,10 +2590,6 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             status = process.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             # The retained Popen handle is stable authority for its own leader.
-            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-            _temp_diag(
-                f"TEMP-DIAG-180 LEGS-KILL pid={os.getpid()} target={process.pid}"
-            )
             process.kill()
             try:
                 status = process.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
@@ -2787,21 +2622,12 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
         )
         lease_complete = lease_closed()
-        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-        phase_complete = complete
         complete = (
             complete
             and known_adoptees_complete
             and relays_complete
             and unregistered_complete
             and lease_complete
-        )
-        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-        _temp_diag(
-            f"TEMP-DIAG-180 STOP-LEGS pid={os.getpid()} phases={phase_complete} "
-            f"adoptees={known_adoptees_complete} relays={relays_complete} "
-            f"unreg={unregistered_complete} lease={lease_complete} "
-            f"status={status} complete={complete}"
         )
         return CleanupResult(status, complete)
     finally:
@@ -2842,7 +2668,6 @@ def main(argv: Sequence[str], terminal: bool = False) -> int:
         link.close()
     nested_supervisors.clear()
     nested_unhealthy_strikes.clear()
-    nested_peek_logged.clear()
     nested_control_complete = True
     if ancestor_registration is not None:
         ancestor_registration.close()

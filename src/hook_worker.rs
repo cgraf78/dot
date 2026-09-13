@@ -294,20 +294,12 @@ impl Worker {
         let command = match self.command(mode, script, result_dir, result_file, context, token) {
             Ok(command) => command,
             Err(CommandFailure::Invalid) => {
-                // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
-                if std::env::var_os("DOT_TEST_DIAG_HOOKS").is_some() {
-                    eprintln!("TEMP-DIAG-180 HOOKS-INVALID-COMMAND {mode} {script:?}");
-                }
                 return WorkerOutcome {
                     rc: 1,
                     output: Vec::new(),
                 };
             }
             Err(CommandFailure::Bash(error)) => {
-                // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
-                if std::env::var_os("DOT_TEST_DIAG_HOOKS").is_some() {
-                    eprintln!("TEMP-DIAG-180 HOOKS-BASH-FAIL {mode} {script:?}: {error}");
-                }
                 return WorkerOutcome {
                     rc: 1,
                     output: self.runtime.bash_error_line_once(&error),
@@ -429,23 +421,7 @@ fn separate(mut command: Command, result_dir: &Path) -> PreSyncOutcome {
 fn wait(command: Command) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt as _;
 
-    // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
-    let diag = std::env::var_os("DOT_TEST_DIAG_HOOKS").is_some();
-    if diag {
-        eprintln!("TEMP-DIAG-180 HOOKS-WAIT enter");
-    }
-    let supervised = crate::cleanup::supervise_session(command, None, |_| Ok(()));
-    if diag {
-        match &supervised {
-            Ok(end) => eprintln!("TEMP-DIAG-180 HOOKS-WAIT end={end:?}"),
-            Err(error) => eprintln!(
-                "TEMP-DIAG-180 HOOKS-WAIT err kind={:?} code={:?}",
-                error.kind(),
-                error.raw_os_error()
-            ),
-        }
-    }
-    match supervised.ok()? {
+    match crate::cleanup::supervise_session(command, None, |_| Ok(())).ok()? {
         crate::cleanup::SessionEnd::Exited(status) => Some(
             status
                 .code()

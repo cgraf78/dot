@@ -24,10 +24,6 @@ run_tests() {
 timeout_command=$root/lib/dot/public/test-timeout-v1
 timeout_python=$(command -v python3)
 [[ ! -x /usr/bin/python3 ]] || timeout_python=/usr/bin/python3
-# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-if [[ $(uname -s) == Darwin ]]; then
-  export DOT_TEST_DIAG_NESTED=1
-fi
 set +e
 "$timeout_command" >/dev/null 2>&1
 missing_timeout_status=$?
@@ -118,17 +114,6 @@ while True:
     deadline = time.monotonic() + 5
     while not ready.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
-    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-    if not ready.exists():
-        child.kill()
-        try:
-            o, e = child.communicate(timeout=5)
-        except Exception as exc:  # noqa: BLE001
-            print(f"NESTED-DUMP communicate failed: {exc!r}")
-        else:
-            print(f"NESTED-DUMP returncode={child.returncode}")
-            print(f"NESTED-DUMP stdout={o!r}")
-            print(f"NESTED-DUMP stderr={e!r}")
     assert ready.exists(), "nested timeout target did not become ready"
     os.kill(child.pid, signal.SIGTERM)
     stdout, stderr = child.communicate(timeout=7)
@@ -464,18 +449,9 @@ failure = []
 
 def publish_all():
     try:
-        for index, token in enumerate(tokens):
-            started = time.monotonic()
+        for token in tokens:
             registrations.append(module.publish_nested_supervisor([writer], token))
-            elapsed = time.monotonic() - started
-            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-            if (index + 1) % 8 == 0:
-                print(f"TEMP-DIAG-180 PUB-PROGRESS done={index + 1}/{len(tokens)}", flush=True)
-            if elapsed > 0.25:
-                print(f"TEMP-DIAG-180 PUB-STALL token=...{token[-8:]} elapsed={elapsed:.2f}s", flush=True)
     except BaseException as error:
-        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-        print(f"TEMP-DIAG-180 PUB-FAIL done={len(registrations)}/{len(tokens)} error={error!r}", flush=True)
         failure.append(error)
 
 publisher = threading.Thread(target=publish_all)
@@ -483,26 +459,10 @@ publisher.start()
 # Loaded macOS CI runners pace registration roundtrips near 60ms; the
 # 64-publisher phase verifies accounting, not speed, so allow headroom.
 deadline = time.monotonic() + 10
-drains = 0
-# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-loop_started = time.monotonic()
-drain_total = 0.0
-drain_worst = 0.0
 while publisher.is_alive() and time.monotonic() < deadline:
-    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-    drain_started = time.monotonic()
     assert module.drain_nested_supervisors(deadline)
-    drain_elapsed = time.monotonic() - drain_started
-    drain_total += drain_elapsed
-    drain_worst = max(drain_worst, drain_elapsed)
-    drains += 1
-    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-    if drains % 10 == 0:
-        print(f"TEMP-DIAG-180 DRAIN-PROGRESS drains={drains} registered={len(module.nested_supervisors)} done={len(registrations)}", flush=True)
     publisher.join(0.01)
 publisher.join(0)
-# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-print(f"TEMP-DIAG-180 PUB-FINAL alive={publisher.is_alive()} done={len(registrations)}/{len(tokens)} drains={drains} registered={len(module.nested_supervisors)} elapsed={time.monotonic() - loop_started:.2f}s drain_avg={drain_total / max(drains, 1) * 1000:.1f}ms drain_max={drain_worst * 1000:.1f}ms", flush=True)
 assert not publisher.is_alive(), "nested registration publisher did not finish"
 assert not failure, failure
 assert len(module.nested_supervisors) == len(tokens)
@@ -590,14 +550,10 @@ try:
             except OSError as error:
                 if error.errno != errno.ENOBUFS:
                     raise
-                # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-                print(f"TEMP-DIAG-180 BURST-RETRY index={index} attempt={attempt + 1}", flush=True)
                 time.sleep(0.025)
             else:
                 break
         else:
-            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-            print(f"TEMP-DIAG-180 BURST-RESUME index={index} queued={len(queued)}", flush=True)
             assert module.drain_nested_supervisors(deadline)
             resumed = True
             resumes += 1
@@ -1510,9 +1466,6 @@ DOT_TEST_TIMEOUT_EXPIRED_FILE=$timeout_expired \
   "$timeout_command" 5 bash -c \
   '[[ -z ${DOT_TEST_TIMEOUT_EXPIRED_FILE+x} ]]'
 
-# TEMP-DIAG-180: the nested diagnostics below would pollute these
-# exact-stderr assertions; restore the gate afterwards.
-unset DOT_TEST_DIAG_NESTED
 set +e
 "$timeout_python" "$timeout_command" 1 "$timeout_fixture/missing" \
   2>"$timeout_fixture/exec-error"
@@ -1533,10 +1486,6 @@ assert_eq 126 "$non_executable_status" \
   'timeout command preserves non-executable status'
 assert_eq '' "$(<"$timeout_fixture/exec-error")" \
   'non-executable command does not emit a traceback'
-# TEMP-DIAG-180: restore the nested-diagnostics gate.
-if [[ $(uname -s) == Darwin ]]; then
-  export DOT_TEST_DIAG_NESTED=1
-fi
 
 assert_timeout_cancellation() {
   local signal_name=$1 expected=$2

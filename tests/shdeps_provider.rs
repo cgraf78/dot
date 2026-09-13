@@ -1960,18 +1960,6 @@ const CHECKED: &[u8] =
 [4/5] Cleanup    ok       no base repo                                   Ns\n\
 Done in Ns. Reload your shell: source ~/.bashrc\n";
 
-/// TEMP-DIAG-180: strip temp diagnostic lines so exact-stderr assertions stay
-/// green while the macOS ensure-failure variant is being identified.
-fn strip_temp_diag(stderr: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(stderr.len());
-    for line in stderr.split_inclusive(|b| *b == b'\n') {
-        if !line.starts_with(b"TEMP-DIAG-180") {
-            out.extend_from_slice(line);
-        }
-    }
-    out
-}
-
 fn assert_cli(output: &Output, status: i32, stdout: &[u8], stderr: &[u8]) {
     assert_eq!(
         output.status.code(),
@@ -1981,7 +1969,7 @@ fn assert_cli(output: &Output, status: i32, stdout: &[u8], stderr: &[u8]) {
         output.stderr
     );
     assert_eq!(normalize_elapsed(&output.stdout), stdout);
-    assert_eq!(strip_temp_diag(&output.stderr), stderr);
+    assert_eq!(output.stderr, stderr);
 }
 
 #[test]
@@ -4015,11 +4003,6 @@ fn signal_interrupts_backpressured_provider_relay() {
     let rust = Fixture::new("shdeps-provider-backpressure");
     let provider_pid_file = rust.home.join("provider-backpressure-pid");
     let signal_file = rust.home.join("provider-backpressure-signal");
-    // TEMP-DIAG-180: remove after the macOS backpressure diagnosis. Capture
-    // Dot stderr to a file (a regular file never backpressures) so a marker
-    // miss can dump teardown diagnostics.
-    let dot_stderr_file = rust.home.join("dot-backpressure-stderr");
-    let dot_stderr_capture = std::fs::File::create(&dot_stderr_file).expect("dot stderr capture");
     let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("stdout pair");
     let mut command = rust.command();
     command
@@ -4028,7 +4011,7 @@ fn signal_interrupts_backpressured_provider_relay() {
         .env("DOT_TEST_PROVIDER_BACKPRESSURE_PID", &provider_pid_file)
         .env("DOT_TEST_PROVIDER_BACKPRESSURE_SIGNAL", &signal_file)
         .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
-        .stderr(Stdio::from(dot_stderr_capture));
+        .stderr(Stdio::null());
     let mut child = spawn_test_session(command);
     let dot_pid = child.id();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -4058,8 +4041,6 @@ fn signal_interrupts_backpressured_provider_relay() {
         && started_rx
             .recv_timeout(std::time::Duration::from_secs(15))
             .is_ok();
-    // TEMP-DIAG-180: remove after the macOS backpressure diagnosis.
-    let signal_instant = std::time::Instant::now();
     let delivered = if rendering_started {
         // SAFETY: the fixture owns this positive Dot child and SIGINT is valid.
         (unsafe { libc::kill(dot_pid, libc::SIGINT) }) == 0
@@ -4087,8 +4068,6 @@ fn signal_interrupts_backpressured_provider_relay() {
         panic!("provider did not exit after releasing its output sink");
     }
     let status = child.reap().expect("provider exit");
-    // TEMP-DIAG-180: remove after the macOS backpressure diagnosis.
-    let reaped_elapsed_ms = signal_instant.elapsed().as_millis();
     let marker_observed = reader.join().expect("provider output reader");
 
     assert!(
@@ -4099,38 +4078,10 @@ fn signal_interrupts_backpressured_provider_relay() {
     assert!(delivered, "SIGINT was not delivered to Dot");
     assert!(!blocked, "signal left Dot blocked on provider output");
     assert_eq!(status.code(), Some(130));
-    // TEMP-DIAG-180: remove after the macOS backpressure diagnosis. A bare
-    // NotFound names nothing; dump provider liveness, Dot stderr, and the
-    // SIGINT-to-exit latency so CI shows whether the trap never ran because
-    // the provider was KILLed, orphaned, or never signaled.
-    match std::fs::read(&signal_file) {
-        Ok(content) if content == b"TERM\n" => {}
-        other => {
-            let provider_pid_text = std::fs::read_to_string(&provider_pid_file).unwrap_or_default();
-            let provider_pid = provider_pid_text.trim().parse::<i32>().unwrap_or(-1);
-            // SAFETY: signal zero only probes; the PID came from our fixture.
-            let alive = provider_pid > 0 && unsafe { libc::kill(provider_pid, 0) } == 0;
-            let ps = std::process::Command::new("ps")
-                .args([
-                    "-o",
-                    "pid,stat,etime,command",
-                    "-p",
-                    &provider_pid.to_string(),
-                ])
-                .output()
-                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-                .unwrap_or_default();
-            let dot_stderr = std::fs::read(&dot_stderr_file)
-                .map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned())
-                .unwrap_or_default();
-            panic!(
-                "BACKPRESSURE-DUMP marker={other:?} provider_pid={provider_pid} \
-                 alive={alive} sigint_to_reap_ms={reaped_elapsed_ms} blocked={blocked} \
-                 status={status:?} provider_stopped={provider_stopped} \
-                 ps=[{ps}] dot_stderr=[{dot_stderr}]",
-            );
-        }
-    }
+    assert_eq!(
+        std::fs::read(&signal_file).expect("provider signal marker"),
+        b"TERM\n"
+    );
     assert!(
         provider_stopped,
         "provider survived backpressure cancellation"

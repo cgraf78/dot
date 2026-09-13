@@ -169,43 +169,17 @@ fn cached_matches(stage: &[OsString], commit: &str) -> bool {
 /// exactly the commit — clean index, clean worktree, no untracked
 /// files.
 pub fn cloned_overlay_matches_commit(root: &str, commit: &str) -> bool {
-    // TEMP-DIAG-180: remove after the macOS ownership diagnosis.
-    let diag = std::env::var_os("DOT_TEST_DIAG_CLONE").is_some();
     let stage = stage_prefix(root);
     if !cached_matches(&stage, commit) {
-        if diag {
-            eprintln!("TEMP-DIAG-180 CLONE-SITE matches-cached");
-        }
         return false;
     }
-    match run_git(&stage, &["diff", "--quiet", commit, "--"]) {
-        Some(output) if output.status.success() => {}
-        output => {
-            if diag {
-                eprintln!(
-                    "TEMP-DIAG-180 CLONE-SITE matches-worktree ran={} code={:?} out={:?}",
-                    output.is_some(),
-                    output.as_ref().and_then(|o| o.status.code()),
-                    output.as_ref().map(|o| String::from_utf8_lossy(&o.stdout)),
-                );
-            }
-            return false;
-        }
+    if !run_git(&stage, &["diff", "--quiet", commit, "--"])
+        .is_some_and(|output| output.status.success())
+    {
+        return false;
     }
-    match run_git(&stage, &["ls-files", "--others", "-z"]) {
-        Some(output) if output.status.success() && output.stdout.is_empty() => true,
-        output => {
-            if diag {
-                eprintln!(
-                    "TEMP-DIAG-180 CLONE-SITE matches-untracked ran={} code={:?} out={:?}",
-                    output.is_some(),
-                    output.as_ref().and_then(|o| o.status.code()),
-                    output.as_ref().map(|o| String::from_utf8_lossy(&o.stdout)),
-                );
-            }
-            false
-        }
-    }
+    run_git(&stage, &["ls-files", "--others", "-z"])
+        .is_some_and(|output| output.status.success() && output.stdout.is_empty())
 }
 
 /// Remove a staging directory, best effort like the shell's
@@ -248,18 +222,6 @@ pub struct CloneOverlayInputs<'a> {
     pub log: &'a Log,
 }
 
-/// TEMP-DIAG-180: remove after the macOS ownership diagnosis.
-/// Report which staged-clone step failed; returns whether diagnosis
-/// is enabled so callers can attach payloads.
-fn diag_clone_site(site: &str) -> bool {
-    if std::env::var_os("DOT_TEST_DIAG_CLONE").is_some() {
-        eprintln!("TEMP-DIAG-180 CLONE-SITE {site}");
-        true
-    } else {
-        false
-    }
-}
-
 /// `_repo_clone_overlay_staged`: clone into a quarantine sibling,
 /// validate and normalize the checkout, then move it into place.
 /// Failures remove the staging directory and report false; only the
@@ -270,29 +232,22 @@ pub fn clone_overlay_staged(
     warnings: &mut dyn Write,
 ) -> bool {
     if crate::cancellation::check().is_err() {
-        diag_clone_site("cancel-early");
         return false;
     }
     let Some((parent, name)) = inputs.path.rsplit_once('/') else {
-        diag_clone_site("no-parent");
         return false;
     };
     if parent.is_empty() || parent == inputs.path {
-        diag_clone_site("empty-parent");
         return false;
     }
     if crate::cancellation::check().is_err()
         || !crate::temp::mkdir_forwarded(Path::new(parent), warnings)
     {
-        diag_clone_site("mkdir-parent");
         return false;
     }
     let stage_root = match create_stage_root(Path::new(parent), name) {
         Some(stage_root) => stage_root,
-        None => {
-            diag_clone_site("stage-root");
-            return false;
-        }
+        None => return false,
     };
     let stage = stage_root.join("checkout");
     let stage_text = stage.to_string_lossy().into_owned();
@@ -324,73 +279,45 @@ pub fn clone_overlay_staged(
     match clone {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
-            if diag_clone_site("git-failed") {
-                eprintln!(
-                    "TEMP-DIAG-180 CLONE-STDERR {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
             let _ = warnings.write_all(&output.stderr);
             remove_stage(&stage_root);
             return false;
         }
         Err(_) => {
-            diag_clone_site("spawn-err");
             remove_stage(&stage_root);
             return false;
         }
     }
     if crate::cancellation::check().is_err() {
-        diag_clone_site("cancel-post-clone");
         remove_stage(&stage_root);
         return false;
     }
     let stage_prefix = stage_prefix(&stage_text);
     let commit = repo_head(&stage_prefix);
-    if commit.is_empty() {
-        diag_clone_site("empty-head");
+    if commit.is_empty()
+        || !validate_candidate_tree(
+            &stage_prefix,
+            "overlay",
+            &commit,
+            inputs.candidate,
+            inputs.log,
+            warnings,
+        )
+        || !cloned_overlay_matches_commit(&stage_text, &commit)
+    {
         remove_stage(&stage_root);
         return false;
     }
-    if !validate_candidate_tree(
-        &stage_prefix,
-        "overlay",
-        &commit,
-        inputs.candidate,
-        inputs.log,
-        warnings,
-    ) {
-        diag_clone_site("validate");
+    if !normalize_cloned_overlay_modes(&stage_text, &commit, inputs.mask)
+        || repo_head(&stage_prefix) != commit
+        || !cloned_overlay_matches_commit(&stage_text, &commit)
+    {
         remove_stage(&stage_root);
         return false;
     }
-    if !cloned_overlay_matches_commit(&stage_text, &commit) {
-        diag_clone_site("matches-pre");
-        remove_stage(&stage_root);
-        return false;
-    }
-    if !normalize_cloned_overlay_modes(&stage_text, &commit, inputs.mask) {
-        diag_clone_site("normalize");
-        remove_stage(&stage_root);
-        return false;
-    }
-    if repo_head(&stage_prefix) != commit {
-        diag_clone_site("head-changed");
-        remove_stage(&stage_root);
-        return false;
-    }
-    if !cloned_overlay_matches_commit(&stage_text, &commit) {
-        diag_clone_site("matches-post");
-        remove_stage(&stage_root);
-        return false;
-    }
-    if crate::cancellation::check().is_err() {
-        diag_clone_site("cancel-pre-move");
-        remove_stage(&stage_root);
-        return false;
-    }
-    if move_noreplace_cached(&stage, Path::new(inputs.path), moves).is_err() {
-        diag_clone_site("move");
+    if crate::cancellation::check().is_err()
+        || move_noreplace_cached(&stage, Path::new(inputs.path), moves).is_err()
+    {
         remove_stage(&stage_root);
         return false;
     }

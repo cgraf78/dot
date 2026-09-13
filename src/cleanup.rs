@@ -712,15 +712,6 @@ fn send_nested_registration_with_pid(
             let error = std::io::Error::last_os_error();
             if nested_send_retryable(&error) && send_retries < NESTED_SEND_EAGAIN_RETRIES {
                 send_retries += 1;
-                // TEMP-DIAG-180: remove the gated logging after the macOS
-                // ownership diagnosis; keep the retry itself.
-                if std::env::var_os("DOT_TEST_DIAG_CLONE").is_some() {
-                    eprintln!(
-                        "TEMP-DIAG-180 NESTED-SEND-RETRY attempt={send_retries} kind={:?} code={:?}",
-                        error.kind(),
-                        error.raw_os_error()
-                    );
-                }
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
@@ -898,20 +889,6 @@ fn receive_nested_registration(
         // "no data this tick": queued frames are still returned normally,
         // the worker keeps polling, and a reset carries no bytes that
         // could forge a delegation, so fail-closed behavior is unchanged.
-        // TEMP-DIAG-180: remove once macOS control-channel failures are
-        // root-caused. Logs the raw errno behind a channel invalidation.
-        if !matches!(
-            error.kind(),
-            std::io::ErrorKind::WouldBlock
-                | std::io::ErrorKind::Interrupted
-                | std::io::ErrorKind::ConnectionReset
-        ) {
-            eprintln!(
-                "TEMP-DIAG-180: nested-control recvmsg failed: {error:?} \
-                 (raw_os_error={:?})",
-                error.raw_os_error()
-            );
-        }
         // Darwin reports a momentarily exhausted socket buffer as ENOBUFS
         // (raw 55, surfaced as `Uncategorized`), not `WouldBlock`; treat
         // it as transient like the other retryable reads.
@@ -1216,30 +1193,6 @@ const SIGNAL_CLOSED: i32 = -1;
 static INTERRUPTED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static CLEANUP_INCOMPLETE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-// TEMP-DIAG-180: first-wins attribution for the sticky atomic. Remove with
-// the 125 fix.
-static CLEANUP_INCOMPLETE_SOURCE: std::sync::Mutex<Option<&'static str>> =
-    std::sync::Mutex::new(None);
-
-/// TEMP-DIAG-180: record which production path set the sticky atomic.
-/// First setter wins: it names the original poison when a later
-/// supervision succeeds but the process still exits 125.
-fn set_cleanup_incomplete(source: &'static str) {
-    CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
-    let mut guard = CLEANUP_INCOMPLETE_SOURCE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    if guard.is_none() {
-        *guard = Some(source);
-    }
-}
-
-/// TEMP-DIAG-180: read the first-wins setter attribution.
-fn cleanup_incomplete_source() -> Option<&'static str> {
-    *CLEANUP_INCOMPLETE_SOURCE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-}
 static ACTIVE_HANDLERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static SIGNAL_OWNER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1324,10 +1277,6 @@ impl Signals {
             .unwrap_or_else(|error| error.into_inner());
         INTERRUPTED.store(0, std::sync::atomic::Ordering::SeqCst);
         CLEANUP_INCOMPLETE.store(false, std::sync::atomic::Ordering::SeqCst);
-        // TEMP-DIAG-180: fresh signal ownership clears the attribution too.
-        *CLEANUP_INCOMPLETE_SOURCE
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
         OUTWARD_WRITE_ABORTED.store(false, std::sync::atomic::Ordering::SeqCst);
         let mut guard = Self {
             previous: Vec::new(),
@@ -1396,11 +1345,6 @@ impl Signals {
         let owns_process_signals = self.active;
         let signal = self.finish_signal();
         if owns_process_signals && CLEANUP_INCOMPLETE.load(std::sync::atomic::Ordering::SeqCst) {
-            // TEMP-DIAG-180: remove with the 125 fix.
-            eprintln!(
-                "TEMP-DIAG-180: finish: CLEANUP_INCOMPLETE atomic overrode code={code} signal={signal:?} source={:?}",
-                cleanup_incomplete_source()
-            );
             CLEANUP_INCOMPLETE_STATUS
         } else {
             signal.map_or(code, |signal| 128 + signal)
@@ -1597,11 +1541,6 @@ fn exit_process_with_hook(code: i32, mut after_install: impl FnMut(i32)) -> ! {
     }
     record_pending_signal();
     let final_code = if CLEANUP_INCOMPLETE.load(std::sync::atomic::Ordering::SeqCst) {
-        // TEMP-DIAG-180: remove with the 125 fix.
-        eprintln!(
-            "TEMP-DIAG-180: exit_process: CLEANUP_INCOMPLETE atomic overrode code={code} source={:?}",
-            cleanup_incomplete_source()
-        );
         CLEANUP_INCOMPLETE_STATUS
     } else {
         match INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1887,11 +1826,6 @@ fn send_process_output_record(
             // wins at the top of the loop.
             Err(error) if error.raw_os_error() == Some(libc::ENOMEM) => {}
             Err(error) => {
-                eprintln!(
-                    "TEMP-DIAG-180 RELAY-POISON errno={:?} kind={:?}",
-                    error.raw_os_error(),
-                    error.kind()
-                );
                 channel
                     .failed
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -1933,11 +1867,7 @@ pub enum ProcessOutputFinish {
 /// failure or cancellation code to hide incomplete relay teardown.
 pub fn process_output_status(code: i32, finish: ProcessOutputFinish) -> i32 {
     match finish {
-        ProcessOutputFinish::CleanupIncomplete => {
-            // TEMP-DIAG-180: remove with the 125 fix.
-            eprintln!("TEMP-DIAG-180: process_output_status: relay finish overrode code={code}");
-            CLEANUP_INCOMPLETE_STATUS
-        }
+        ProcessOutputFinish::CleanupIncomplete => CLEANUP_INCOMPLETE_STATUS,
         ProcessOutputFinish::OutputFailed if code == 0 => 1,
         ProcessOutputFinish::Complete | ProcessOutputFinish::OutputFailed => code,
     }
@@ -2459,10 +2389,6 @@ impl ProcessOutputEndpoint {
             if waited == pid {
                 self.registration.take();
                 return if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) == 125 {
-                    // TEMP-DIAG-180: remove with the 125 fix.
-                    eprintln!(
-                        "TEMP-DIAG-180: relay finish: child status={status} drain={drain} channel_failed={channel_failed} finish_sent={finish_sent}"
-                    );
                     ProcessOutputFinish::CleanupIncomplete
                 } else if drain
                     && (!channel_failed && finish_sent && libc::WEXITSTATUS(status) == 0)
@@ -2479,8 +2405,6 @@ impl ProcessOutputEndpoint {
             }
             if waited < 0 {
                 self.registration.take();
-                // TEMP-DIAG-180: remove with the 125 fix.
-                eprintln!("TEMP-DIAG-180: relay finish: waitpid error, drain={drain}");
                 return ProcessOutputFinish::CleanupIncomplete;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -2488,10 +2412,6 @@ impl ProcessOutputEndpoint {
         self.lifetime_writer.take();
         let reaped = stop_output_relay_watchdog(pid, true);
         self.registration.take();
-        // TEMP-DIAG-180: remove with the 125 fix.
-        eprintln!(
-            "TEMP-DIAG-180: relay finish: deadline expired with relay child unreaped, drain={drain} reaped={reaped}"
-        );
         // A relay child that never drains is usually blocked on an
         // undrained sink, not a leaked descendant: the watchdog kill above
         // reaps it, so only genuinely unreaped helpers fail closed. Lost
@@ -2811,14 +2731,6 @@ pub(crate) fn exited(child: &Child) -> std::io::Result<bool> {
                 }
                 if waitid_retryable(&error) && eagain_retries < WAITID_EAGAIN_RETRIES {
                     eagain_retries += 1;
-                    // TEMP-DIAG-180: remove the gated logging after the macOS
-                    // ownership diagnosis; keep the retry itself.
-                    if std::env::var_os("DOT_TEST_DIAG_CLONE").is_some() {
-                        eprintln!(
-                            "TEMP-DIAG-180 WAITID-RETRY attempt={eagain_retries} pid={}",
-                            child.id()
-                        );
-                    }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
@@ -2886,17 +2798,7 @@ fn process_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
     command.args(["-A", "-o", "pid=,ppid=,pgid=,sid=,stat="]);
     let bytes = snapshot(command, deadline)?;
     #[cfg(target_os = "macos")]
-    let processes = match parse_macos_ps_snapshot(&bytes) {
-        Some(processes) => processes,
-        // TEMP-DIAG-180: remove with the recvmsg diag.
-        None => {
-            eprintln!(
-                "TEMP-DIAG-180: snapshot: macOS ps parse failed ({} bytes)",
-                bytes.len()
-            );
-            return None;
-        }
-    };
+    let processes = parse_macos_ps_snapshot(&bytes)?;
     #[cfg(not(target_os = "macos"))]
     let processes = parse_ps_snapshot(&bytes)?;
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -3633,12 +3535,7 @@ impl OwnedMember {
 
 /// Capture a portable process snapshot without a blocking pipe reader thread.
 fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
-    // TEMP-DIAG-180: remove with the recvmsg diag. Identifies which
-    // snapshot stage fails on macOS (every probe session currently burns
-    // its full teardown budget and reports "could not verify").
-    let entered = Instant::now();
-    if entered >= deadline {
-        eprintln!("TEMP-DIAG-180: snapshot: deadline already passed at entry");
+    if Instant::now() >= deadline {
         return None;
     }
     // No per-iteration "entry with..." print: the sudo-PTY test's helper
@@ -3646,13 +3543,9 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     // diagnostics flow-control the helper into a 15s timeout (Heisenbug).
     let (reader, writer) = match internal_stream_pair() {
         Ok(pair) => pair,
-        Err(error) => {
-            eprintln!("TEMP-DIAG-180: snapshot: stream pair failed: {error:?}");
-            return None;
-        }
+        Err(_) => return None,
     };
     if reader.set_nonblocking(true).is_err() {
-        eprintln!("TEMP-DIAG-180: snapshot: nonblocking failed");
         return None;
     }
     // The fallback helper participates in the same launch generation as
@@ -3670,10 +3563,7 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
         .spawn()
     {
         Ok(child) => child,
-        Err(error) => {
-            eprintln!("TEMP-DIAG-180: snapshot: spawn failed: {error:?}");
-            return None;
-        }
+        Err(_) => return None,
     };
     let _registration = StatusChildRegistration::new(child.id());
     drop(fork_registration);
@@ -3686,11 +3576,6 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     use std::io::Read as _;
     loop {
         if Instant::now() >= deadline {
-            eprintln!(
-                "TEMP-DIAG-180: snapshot: read deadline passed with {} bytes after {}ms",
-                bytes.len(),
-                entered.elapsed().as_millis()
-            );
             let _ = child.kill();
             let _ = wait_child_until(&mut child, cleanup_deadline());
             return None;
@@ -3706,8 +3591,7 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(error) => {
-                eprintln!("TEMP-DIAG-180: snapshot: read failed: {error:?}");
+            Err(_) => {
                 let _ = child.kill();
                 let _ = wait_child_until(&mut child, cleanup_deadline());
                 return None;
@@ -3717,15 +3601,9 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     // EOF is independent of process exit: a helper may close stdout early.
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    eprintln!("TEMP-DIAG-180: snapshot: helper status {status:?}");
-                }
-                return status.success().then_some(bytes);
-            }
+            Ok(Some(status)) => return status.success().then_some(bytes),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             _ => {
-                eprintln!("TEMP-DIAG-180: snapshot: helper did not exit in time");
                 let _ = child.kill();
                 let _ = wait_child_until(&mut child, cleanup_deadline());
                 return None;
@@ -3803,15 +3681,7 @@ fn end_after_cleanup(
     if cleanup.is_ok() {
         completed
     } else {
-        // TEMP-DIAG-180: end_after_cleanup drops the stop error silently while
-        // decide_after_cleanup prints DOT_TEARDOWN_FAIL. The macOS 125-vs-143
-        // failures take this path with no other diagnostic; print the error
-        // so CI names which stop failure macOS hits. Remove with the fix.
-        eprintln!(
-            "TEMP-DIAG-180: end_after_cleanup err: {:?}",
-            cleanup.as_ref().err()
-        );
-        set_cleanup_incomplete("end_after_cleanup");
+        CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
         SessionEnd::CleanupIncomplete
     }
 }
@@ -3826,12 +3696,7 @@ fn decide_after_cleanup(
         Ok(status) => status,
         Err(error) => {
             eprintln!("DOT_TEARDOWN_FAIL: {error:?}");
-            // TEMP-DIAG-180: remove with the recvmsg diag.
-            eprintln!(
-                "TEMP-DIAG-180: decide: cleanup err preempts (deferred={})",
-                deferred_error.is_some()
-            );
-            set_cleanup_incomplete("decide_after_cleanup");
+            CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
             return Ok(SessionEnd::CleanupIncomplete);
         }
     };
@@ -4095,8 +3960,6 @@ impl NestedControlWorker {
                             ) && !links.contains_key(&registration.boundary)
                                 && links.len() < MAX_ACTIVE_NESTED_SESSIONS;
                             if !valid {
-                                // TEMP-DIAG-180: remove with the recvmsg diag.
-                                eprintln!("TEMP-DIAG-180: nested-control cleared: invalid frame");
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4113,10 +3976,6 @@ impl NestedControlWorker {
                             if links.values().any(|(_, link, _)| {
                                 std::os::fd::AsRawFd::as_raw_fd(link) == incoming_fd
                             }) {
-                                // TEMP-DIAG-180: remove with the recvmsg diag.
-                                eprintln!(
-                                    "TEMP-DIAG-180: nested-control cleared: duplicate install fd={incoming_fd}"
-                                );
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4136,8 +3995,6 @@ impl NestedControlWorker {
                                 .supervisors
                                 .insert(registration.boundary.clone(), registration.pid);
                             if registration.link.write_all(&[1]).is_err() {
-                                // TEMP-DIAG-180: remove with the recvmsg diag.
-                                eprintln!("TEMP-DIAG-180: nested-control cleared: ack failed");
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4146,23 +4003,13 @@ impl NestedControlWorker {
                                 suspect.clear();
                                 break;
                             }
-                            // TEMP-DIAG-180: remove with the recvmsg diag.
-                            eprintln!(
-                                "TEMP-DIAG-180: nested-control link insert: {} fd={}",
-                                registration.boundary,
-                                std::os::fd::AsRawFd::as_raw_fd(&registration.link),
-                            );
                             links.insert(
                                 registration.boundary,
                                 (registration.pid, registration.link, Instant::now()),
                             );
                         }
                         Ok(None) => break,
-                        Err(error) => {
-                            // TEMP-DIAG-180: remove with the recvmsg diag.
-                            eprintln!(
-                                "TEMP-DIAG-180: nested-control cleared: receive error {error:?}"
-                            );
+                        Err(_) => {
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.complete = false;
                             state.supervisors.clear();
@@ -4203,40 +4050,13 @@ impl NestedControlWorker {
                             // lone 0 is absorbed instead of removing a
                             // live link.
                             if suspect.contains(boundary.as_str()) {
-                                // TEMP-DIAG-180: remove with the recvmsg diag.
-                                // Root-cause the sticky macOS EOF: is the
-                                // socket identity intact (peerpid still the
-                                // publisher?) and does poll agree it is
-                                // at EOF (HUP/ERR) or readable-empty?
-                                let peer = nested_peer_pid(std::os::fd::AsRawFd::as_raw_fd(link));
-                                let mut pollfd = libc::pollfd {
-                                    fd: std::os::fd::AsRawFd::as_raw_fd(link),
-                                    events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
-                                    revents: 0,
-                                };
-                                let poll_result = unsafe { libc::poll(&mut pollfd, 1, 0) };
-                                eprintln!(
-                                    "TEMP-DIAG-180: nested-control link EOF confirmed: {boundary} fd={} peer={peer:?} poll={poll_result} revents={} claimed={}",
-                                    std::os::fd::AsRawFd::as_raw_fd(link),
-                                    pollfd.revents,
-                                    _pid,
-                                );
                                 suspect.remove(boundary.as_str());
                                 closed.push(boundary.clone())
                             } else {
-                                // TEMP-DIAG-180: remove with the recvmsg diag.
-                                eprintln!(
-                                    "TEMP-DIAG-180: nested-control link EOF suspect: {boundary} fd={}",
-                                    std::os::fd::AsRawFd::as_raw_fd(link),
-                                );
                                 suspect.insert(boundary.clone());
                             }
                         }
                         Ok(_) => {
-                            // TEMP-DIAG-180: remove with the recvmsg diag.
-                            eprintln!(
-                                "TEMP-DIAG-180: nested-control cleared: unexpected link byte"
-                            );
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.complete = false;
                             state.supervisors.clear();
@@ -4250,11 +4070,7 @@ impl NestedControlWorker {
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                             suspect.remove(boundary.as_str());
                         }
-                        Err(error) => {
-                            // TEMP-DIAG-180: remove with the recvmsg diag.
-                            eprintln!(
-                                "TEMP-DIAG-180: nested-control link read error: {boundary} {error:?}"
-                            );
+                        Err(_) => {
                             suspect.remove(boundary.as_str());
                             closed.push(boundary.clone())
                         }
@@ -5466,7 +5282,7 @@ impl OwnedSession {
     pub(crate) fn stop(&mut self, signal: i32) -> std::io::Result<std::process::ExitStatus> {
         let outcome = self.stop_with_tick_outcome(signal, true, &mut || Ok(()));
         if outcome.status.is_err() {
-            set_cleanup_incomplete("OwnedSession::stop");
+            CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         outcome.into_result()
     }
@@ -5642,33 +5458,14 @@ fn spawn_retryable(error: &std::io::Error) -> bool {
 fn spawn_with_eagain_retry(
     command: &mut std::process::Command,
 ) -> std::io::Result<std::process::Child> {
-    // TEMP-DIAG-180: remove the gated logging after the macOS ownership
-    // diagnosis; keep the retry itself.
-    let diag = std::env::var_os("DOT_TEST_DIAG_CLONE").is_some();
     let mut eagain_retries = 0;
     loop {
         match command.spawn() {
             Err(error) if spawn_retryable(&error) && eagain_retries < SPAWN_EAGAIN_RETRIES => {
                 eagain_retries += 1;
-                if diag {
-                    eprintln!(
-                        "TEMP-DIAG-180 SPAWN-RETRY attempt={eagain_retries} kind={:?} code={:?}",
-                        error.kind(),
-                        error.raw_os_error()
-                    );
-                }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             outcome => {
-                if diag {
-                    if let Err(error) = &outcome {
-                        eprintln!(
-                            "TEMP-DIAG-180 SPAWN-GIVEUP kind={:?} code={:?} after={eagain_retries}",
-                            error.kind(),
-                            error.raw_os_error()
-                        );
-                    }
-                }
                 return outcome;
             }
         }
@@ -6227,7 +6024,7 @@ pub(crate) fn stop_owned_sessions(
     first_signal: i32,
 ) -> Vec<std::io::Result<std::process::ExitStatus>> {
     if sessions.iter().any(|session| session.child.is_none()) {
-        set_cleanup_incomplete("stop_owned_sessions:child-lost");
+        CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
         return (0..sessions.len())
             .map(|_| Err(std::io::Error::other("owned session lost its child handle")))
             .collect();
@@ -6251,7 +6048,7 @@ pub(crate) fn stop_owned_sessions(
         }
     }
     if results.iter().any(std::result::Result::is_err) {
-        set_cleanup_incomplete("stop_owned_sessions:results-err");
+        CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     results
 }
@@ -6401,8 +6198,6 @@ fn merge_authority_errors(
     tick_result?;
     for session in sessions {
         if let Some(error) = session.authority_error.take() {
-            // TEMP-DIAG-180: remove with the recvmsg diag.
-            eprintln!("TEMP-DIAG-180: authority refusal merged");
             return Err(error);
         }
     }
@@ -6630,8 +6425,6 @@ impl Session {
             return self.control_complete;
         };
         if Instant::now() >= deadline {
-            // TEMP-DIAG-180: remove with the recvmsg diag.
-            eprintln!("TEMP-DIAG-180: nested-control cleared: drain past deadline");
             self.invalidate_nested_control();
             return false;
         }
@@ -6994,8 +6787,6 @@ impl Session {
             // the caller's explicit failure into a global 125. Genuine
             // teardown failures still fail closed through decide_after_cleanup
             // and the stop-owned-sessions verifiers.
-            // TEMP-DIAG-180: remove with the recvmsg diag.
-            eprintln!("TEMP-DIAG-180: authority refusal set");
             self.authority_error = Some(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "safe descendant delivery has no stable process authority",
@@ -7260,56 +7051,18 @@ mod tests {
             .map(|index| format!("{index:064x}"))
             .collect::<Vec<_>>();
         let mut registrations = Vec::new();
-        // TEMP-DIAG-180: remove with the recvmsg diag. Prove whether the
-        // test still holds every peer when convergence fails.
-        let mut fd_proof = Vec::new();
         for token in &tokens {
-            let local =
+            registrations.push(
                 publish_nested_supervisor(&[std::os::fd::AsRawFd::as_raw_fd(&writer)], token)
                     .unwrap()
-                    .expect("private registration");
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            let fd = std::os::fd::AsRawFd::as_raw_fd(&local);
-            let ino = if unsafe { libc::fstat(fd, &mut stat) } == 0 {
-                stat.st_ino as u64
-            } else {
-                u64::MAX
-            };
-            fd_proof.push((fd, ino));
-            registrations.push(local);
+                    .expect("private registration"),
+            );
         }
-        let mut iterations = 0u32;
-        let converged = poll_until(Instant::now() + Duration::from_secs(1), || {
+        poll_until(Instant::now() + Duration::from_secs(1), || {
             let state = state.lock().unwrap_or_else(|error| error.into_inner());
-            iterations += 1;
-            // TEMP-DIAG-180: remove with the recvmsg diag.
-            if iterations % 10 == 1 {
-                eprintln!(
-                    "TEMP-DIAG-180: nested-control poll: len={} complete={}",
-                    state.supervisors.len(),
-                    state.complete,
-                );
-            }
             Ok((state.supervisors.len() == tokens.len()).then_some(()))
-        });
-        // TEMP-DIAG-180: remove with the recvmsg diag.
-        if let Err(error) = &converged {
-            for (index, registration) in registrations.iter().enumerate() {
-                let fd = std::os::fd::AsRawFd::as_raw_fd(registration);
-                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-                let (open, ino) = if unsafe { libc::fstat(fd, &mut stat) } == 0 {
-                    (true, stat.st_ino as u64)
-                } else {
-                    (false, u64::MAX)
-                };
-                let (_, first_ino) = fd_proof[index];
-                eprintln!(
-                    "TEMP-DIAG-180: test local {index} fd={fd} open={open} same_ino={}",
-                    ino == first_ino,
-                );
-            }
-            panic!("nested-control convergence failed: {error:?}");
-        }
+        })
+        .unwrap();
 
         let first_token = tokens[0].clone();
         let second_token = tokens[1].clone();

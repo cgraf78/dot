@@ -472,34 +472,14 @@ fn execute(
                     // status, so an exact-deadline tie is status 124.
                     if expired || exited {
                         let mut child = worker.child.take().expect("observed owned child");
-                        // TEMP-DIAG-180: remove after the macOS lifecycle
-                        // diagnosis. A stuck suite session currently kills
-                        // the coordinator here, discarding every buffered
-                        // suite output. Record the stop failure as the
-                        // suite's status and continue so one stuck suite
-                        // cannot hide the rest; the latched cleanup
-                        // atomic still fails the run with 125.
-                        match child.stop(libc::SIGTERM) {
-                            Ok(status) => {
-                                worker.status = Some(if expired {
-                                    124
-                                } else {
-                                    status
-                                        .code()
-                                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
-                                });
-                            }
-                            Err(error) => {
-                                eprintln!(
-                                    "TEMP-DIAG-180 WORKER-STOP-ERR suite={} err={error:?}",
-                                    label(&suites[worker.index])
-                                );
-                                // The failed stop consumed the child
-                                // handle; OwnedSession::stop is
-                                // single-shot and a second call panics.
-                                worker.status = Some(125);
-                            }
-                        }
+                        let status = child.stop(libc::SIGTERM)?;
+                        worker.status = Some(if expired {
+                            124
+                        } else {
+                            status
+                                .code()
+                                .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
+                        });
                     }
                 }
                 if worker.status.is_none() {

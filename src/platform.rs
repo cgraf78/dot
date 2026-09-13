@@ -254,14 +254,6 @@ pub fn decide_sudo(
 /// `DOT_QUIET` value; only exactly `1` suppresses the prompt, like the
 /// shell's `-eq 1`.
 pub fn require_sudo(quiet: &str) -> bool {
-    // TEMP-DIAG-180: remove with the recvmsg diag.
-    #[cfg(test)]
-    let sudo_started = std::time::Instant::now();
-    #[cfg(test)]
-    eprintln!(
-        "TEMP-DIAG-180: sudo-probe id-start at {}ms",
-        sudo_started.elapsed().as_millis()
-    );
     let mut id = std::process::Command::new("id");
     id.arg("-u");
     let euid_output = crate::cleanup::run_session_output(
@@ -279,27 +271,10 @@ pub fn require_sudo(quiet: &str) -> bool {
     let euid_is_root = euid_output
         .as_deref()
         .is_none_or(|text| !matches!(text.parse::<i64>(), Ok(uid) if uid != 0));
-    // TEMP-DIAG-180: remove with the recvmsg diag.
-    #[cfg(test)]
-    eprintln!(
-        "TEMP-DIAG-180: sudo-probe id-end at {}ms",
-        sudo_started.elapsed().as_millis()
-    );
     let probe = |extra: &[&str], interactive: bool| {
-        // TEMP-DIAG-180: remove with the recvmsg diag.
-        #[cfg(test)]
-        eprintln!(
-            "TEMP-DIAG-180: sudo-probe {}-start at {}ms",
-            if interactive {
-                "interactive"
-            } else {
-                "noninteractive"
-            },
-            sudo_started.elapsed().as_millis()
-        );
         let mut command = std::process::Command::new("sudo");
         command.args(extra).arg("true");
-        let accepted = if interactive {
+        if interactive {
             command
                 .stdin(std::process::Stdio::inherit())
                 .stdout(std::process::Stdio::inherit())
@@ -311,20 +286,7 @@ pub fn require_sudo(quiet: &str) -> bool {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
             crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Strict) == 0
-        };
-        // TEMP-DIAG-180: remove with the recvmsg diag.
-        #[cfg(test)]
-        eprintln!(
-            "TEMP-DIAG-180: sudo-probe {}-end accepted={} at {}ms",
-            if interactive {
-                "interactive"
-            } else {
-                "noninteractive"
-            },
-            accepted,
-            sudo_started.elapsed().as_millis()
-        );
-        accepted
+        }
     };
     decide_sudo(euid_is_root, probe(&["-n"], false), quiet == "1", &|| {
         probe(&[], true)
@@ -443,61 +405,13 @@ mod tests {
         assert!(!decide_sudo(false, false, false, &no));
     }
 
-    // TEMP-DIAG-180: remove with the recvmsg diag. Best-effort
-    // process snapshot for stop-timeout triage; never fails the test
-    // itself. `ps` keywords below exist on both macOS and Linux.
-    fn ps_snapshot(pid: u32) -> String {
-        fn run_ps(args: &[&str]) -> String {
-            match std::process::Command::new("ps").args(args).output() {
-                Ok(output) => {
-                    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-                    if text.len() > 4096 {
-                        text.truncate(4096);
-                    }
-                    text
-                }
-                Err(error) => format!("ps unavailable: {error}\n"),
-            }
-        }
-        let target = pid.to_string();
-        let mut snapshot = run_ps(&["-o", "pid,ppid,state,etime,cputime,command", "-p", &target]);
-        // Children of the helper: a stray supervised descendant would
-        // show here even though try_wait only watches the helper pid.
-        let table = run_ps(&["-A", "-o", "pid,ppid,state,etime,cputime,command"]);
-        for line in table.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() >= 2 && fields[1] == target {
-                snapshot.push_str(line);
-                snapshot.push('\n');
-            }
-        }
-        snapshot
-    }
-
-    /// Output pumped from the sudo helper's PTY master, with the
-    /// instant of the most recent arrival for progress tracking.
-    struct PumpedOutput {
-        bytes: Vec<u8>,
-        last_append: std::time::Instant,
-    }
-
-    impl PumpedOutput {
-        fn new() -> Self {
-            Self {
-                bytes: Vec::new(),
-                last_append: std::time::Instant::now(),
-            }
-        }
-    }
-
-    /// Pump `master` into `pumped` until `stop` is set or the slave side
-    /// goes away (read returning 0 on Linux, EIO on macOS/BSD). Runs on
-    /// its own thread so the helper can never block writing while the
-    /// driver waits for exit; the driver joins this thread before
-    /// touching the master itself.
+    /// Drain `master` until `stop` is set or the slave side goes away
+    /// (read returning 0 on Linux, EIO on macOS/BSD). Runs on its own
+    /// thread so the helper can never block writing while the driver
+    /// waits for exit; the driver joins this thread before touching
+    /// the master itself.
     fn pump_pty_master(
         master: std::os::fd::OwnedFd,
-        pumped: std::sync::Arc<std::sync::Mutex<PumpedOutput>>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
         use std::os::fd::AsRawFd as _;
@@ -516,9 +430,7 @@ mod tests {
             let read =
                 unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
             if read > 0 {
-                let mut pumped = pumped.lock().unwrap();
-                pumped.bytes.extend_from_slice(&chunk[..read as usize]);
-                pumped.last_append = std::time::Instant::now();
+                continue;
             } else if read == 0 {
                 break;
             } else {
@@ -540,45 +452,6 @@ mod tests {
     ) {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = thread.join();
-    }
-
-    // TEMP-DIAG-180: remove with the recvmsg diag. Single-letter state
-    // for one pid; never fails the test itself. (`state`, not `stat`:
-    // the latter is not an output keyword on macOS `ps`.)
-    fn helper_state(pid: u32) -> String {
-        match std::process::Command::new("ps")
-            .args(["-o", "state=", "-p", &pid.to_string()])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                String::from_utf8_lossy(&output.stdout).trim().to_string()
-            }
-            Ok(_) => "ps-exited-nonzero".to_string(),
-            Err(error) => format!("ps-unavailable({error})"),
-        }
-    }
-
-    // TEMP-DIAG-180: remove with the recvmsg diag. Nonblocking drain
-    // of the sudo helper's PTY master for failure triage.
-    fn drain_pty_master(master: &std::os::fd::OwnedFd) -> Vec<u8> {
-        use std::os::fd::AsRawFd as _;
-        let master_fd = master.as_raw_fd();
-        let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
-        if flags >= 0 {
-            unsafe {
-                libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-        }
-        let mut output = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            let count = unsafe { libc::read(master_fd, chunk.as_mut_ptr().cast(), chunk.len()) };
-            if count <= 0 || output.len() > 65536 {
-                break;
-            }
-            output.extend_from_slice(&chunk[..count as usize]);
-        }
-        output
     }
 
     #[test]
@@ -671,35 +544,21 @@ mod tests {
         // suspect for the macOS stop-phase stall). The pump owns a dup of
         // the master; the driver only touches the master again after the
         // pump has stopped and joined.
-        let pumped = std::sync::Arc::new(std::sync::Mutex::new(PumpedOutput::new()));
         let pump_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut pump_thread = Some({
-            let pumped = std::sync::Arc::clone(&pumped);
             let pump_stop = std::sync::Arc::clone(&pump_stop);
             // SAFETY: openpty gave us a uniquely owned master; the dup
             // shares its description, which is exactly what a second
             // reader needs.
             let pump_master = master.try_clone().unwrap();
-            std::thread::spawn(move || pump_pty_master(pump_master, pumped, pump_stop))
+            std::thread::spawn(move || pump_pty_master(pump_master, pump_stop))
         });
-        // TEMP-DIAG-180: widen from 3s while diagnosing whether macOS CI
-        // is slow (python startup under load) or stuck (probe never
-        // returns). Revert or justify with the sudo-probe timestamps.
-        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while !ready.exists() && std::time::Instant::now() < ready_deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         if !ready.exists() {
-            // TEMP-DIAG-180: remove with the recvmsg diag. Drain the
-            // helper's PTY output so macOS CI shows whether the helper
-            // panicked or sudo rejected the foreground check.
             stop_pty_pump(&pump_stop, pump_thread.take().unwrap());
-            let mut output = pumped.lock().unwrap().bytes.clone();
-            output.extend_from_slice(&drain_pty_master(&master));
-            eprintln!(
-                "TEMP-DIAG-180: sudo-pty helper output: {:?}",
-                String::from_utf8_lossy(&output)
-            );
         }
         assert!(
             ready.exists(),
@@ -710,61 +569,15 @@ mod tests {
         // macOS teardown is slow (process queries spawn `ps` per poll
         // versus free /proc reads on Linux): the helper deterministically
         // needs ~5s to exit after SIGTERM, so a 4s deadline fails a
-        // healthy shutdown. 15s keeps 3x headroom; the latency report
-        // below keeps the budget honest.
-        let stop_started = std::time::Instant::now();
-        let deadline = stop_started + std::time::Duration::from_secs(15);
-        // TEMP-DIAG-180: remove with the recvmsg diag. The helper exits
-        // just after every deadline tried (4s, 15s): log pumped output
-        // progress and process state every 500ms to learn whether the
-        // inner test itself is slow (steady byte growth to the deadline)
-        // or done-but-unreaped (bytes plateau early, zombie visible while
-        // try_wait still misses it).
-        let mut last_probe = stop_started;
+        // healthy shutdown. 15s keeps 3x headroom.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 stop_pty_pump(&pump_stop, pump_thread.take().unwrap());
-                // TEMP-DIAG-180: remove with the recvmsg diag.
-                eprintln!(
-                    "TEMP-DIAG-180: sudo-pty helper stopped in {}ms ({} pumped bytes)",
-                    stop_started.elapsed().as_millis(),
-                    pumped.lock().unwrap().bytes.len(),
-                );
                 break status;
             }
-            if last_probe.elapsed() >= std::time::Duration::from_millis(500) {
-                last_probe = std::time::Instant::now();
-                // TEMP-DIAG-180: remove with the recvmsg diag.
-                let pumped_state = pumped.lock().unwrap();
-                eprintln!(
-                    "TEMP-DIAG-180: stop t+{}ms pumped_bytes={} last_append_ms_ago={} helper_state={}",
-                    stop_started.elapsed().as_millis(),
-                    pumped_state.bytes.len(),
-                    pumped_state.last_append.elapsed().as_millis(),
-                    helper_state(child.id()),
-                );
-            }
             if std::time::Instant::now() >= deadline {
-                // TEMP-DIAG-180: remove with the recvmsg diag. The
-                // interactive-end marker below shows whether require_sudo
-                // returned (stuck after teardown) or never did (stuck in
-                // teardown of the stopped sudo).
                 stop_pty_pump(&pump_stop, pump_thread.take().unwrap());
-                let mut output = pumped.lock().unwrap().bytes.clone();
-                output.extend_from_slice(&drain_pty_master(&master));
-                eprintln!(
-                    "TEMP-DIAG-180: sudo-pty helper output at stop timeout: {:?}",
-                    String::from_utf8_lossy(&output)
-                );
-                // TEMP-DIAG-180: remove with the recvmsg diag. The helper
-                // printed its complete inner summary yet is still alive:
-                // capture state/CPU/children to distinguish a job-control
-                // stop (T) from a shutdown hang (R/S with CPU or a stray
-                // child holding the suite up).
-                eprintln!(
-                    "TEMP-DIAG-180: helper ps at stop timeout:\n{}",
-                    ps_snapshot(child.id())
-                );
                 panic!("PTY helper did not stop");
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
