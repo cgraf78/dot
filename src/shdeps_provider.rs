@@ -100,6 +100,11 @@ struct PromptPipe {
 
 const CAPTURE_TICK_BYTES: usize = 64 * 1024;
 const CAPTURE_FINAL_BYTES: usize = 1024 * 1024;
+// Darwin receive-side backpressure retries per drain pass. The send side
+// already retries ENOBUFS/ENOMEM on this quantum; without the symmetric
+// receive retry a flooding provider stalls behind a full pipe while
+// teardown burns its grace, and the provider's TERM trap never runs.
+const CAPTURE_BACKPRESSURE_RETRIES: u32 = 50;
 const PROVIDER_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
 const PROVIDER_FRAME_LIMIT_BYTES: usize = 1024 * 1024;
 const PROVIDER_RUN_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
@@ -508,12 +513,14 @@ impl CaptureStream {
     ) -> std::io::Result<()> {
         let mut drained = 0;
         let mut output_error = None;
+        let mut backpressure_retries = 0;
         while drained < budget {
             let mut chunk = [0u8; 8192];
             let available = (budget - drained).min(chunk.len());
             match self.reader.read(&mut chunk[..available]) {
                 Ok(0) => break,
                 Ok(count) => {
+                    backpressure_retries = 0;
                     if output_error.is_none() {
                         if let Err(error) = output.write_all(&chunk[..count]) {
                             // Never replay a partially delivered chunk. Keep
@@ -529,10 +536,23 @@ impl CaptureStream {
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 // Darwin reports a momentarily exhausted socket buffer as
                 // ENOBUFS (raw 55, surfaced as `Uncategorized`), not
-                // `WouldBlock`. Treat it like `WouldBlock` (end this pass,
-                // retry on the next supervisor tick) instead of aborting
-                // the drain; the send side already retries it the same way.
-                Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => break,
+                // `WouldBlock`, and sustained floods can briefly exhaust
+                // mbuf clusters as ENOMEM. Retry both on the send side's
+                // 1ms quantum instead of abandoning this pass: ending the
+                // pass here strands a flooding provider behind a full pipe
+                // while teardown burns its grace, so the provider's TERM
+                // trap never runs. The retry count stays bounded so a tick
+                // always returns to the supervisor for signal checks.
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ENOBUFS)
+                        || error.raw_os_error() == Some(libc::ENOMEM) =>
+                {
+                    if backpressure_retries >= CAPTURE_BACKPRESSURE_RETRIES {
+                        break;
+                    }
+                    backpressure_retries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 Err(error) => return Err(error),
             }
         }
