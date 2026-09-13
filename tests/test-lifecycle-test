@@ -439,6 +439,7 @@ PY
 "$timeout_python" - "$timeout_command" <<'PY'
 import importlib.util
 import array
+import errno
 import os
 import socket
 import struct
@@ -556,9 +557,24 @@ try:
         parent = socket.socket(fileno=parent_fd)
         frame = b"DTS2" + struct.pack("!I", os.getpid()) + f"{index:064x}".encode()
         rights = array.array("i", [parent.fileno()])
-        assert writer_socket.sendmsg(
-            [frame], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)]
-        ) == len(frame)
+        # Darwin reports ENOBUFS (not EAGAIN) when a burst of
+        # descriptor-carrying datagrams momentarily exhausts mbuf
+        # space. The backlog is still queued ahead of the drain, so
+        # retry briefly; persistent exhaustion still fails loudly.
+        for attempt in range(100):
+            try:
+                written = writer_socket.sendmsg(
+                    [frame], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)]
+                )
+            except OSError as error:
+                if error.errno != errno.ENOBUFS or attempt >= 99:
+                    raise
+                # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+                print(f"TEMP-DIAG-180 BURST-RETRY index={index} attempt={attempt + 1}", flush=True)
+                time.sleep(0.005)
+            else:
+                break
+        assert written == len(frame)
         parent.close()
         queued.append(local)
     deadline = time.monotonic() + 2
