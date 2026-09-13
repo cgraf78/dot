@@ -121,6 +121,12 @@ pub(crate) fn run_git_typed(prefix: &[OsString], args: &[&str]) -> Result<Output
         output.stderr.clear();
         output
     })
+    .inspect_err(|error| {
+        // TEMP-DIAG-180: remove after the macOS ownership diagnosis.
+        if std::env::var_os("DOT_TEST_DIAG_CLONE").is_some() {
+            eprintln!("TEMP-DIAG-180 GIT-ERR {error:?}");
+        }
+    })
     .map_err(|error| match error {
         crate::cleanup::SessionOutputError::Interrupted(signal) => {
             GitOutputError::Interrupted(signal)

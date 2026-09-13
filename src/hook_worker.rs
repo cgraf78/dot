@@ -429,7 +429,20 @@ fn separate(mut command: Command, result_dir: &Path) -> PreSyncOutcome {
 fn wait(command: Command) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt as _;
 
-    match crate::cleanup::supervise_session(command, None, |_| Ok(())).ok()? {
+    // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
+    let diag = std::env::var_os("DOT_TEST_DIAG_HOOKS").is_some();
+    let supervised = crate::cleanup::supervise_session(command, None, |_| Ok(()));
+    if diag {
+        match &supervised {
+            Ok(end) => eprintln!("TEMP-DIAG-180 HOOKS-WAIT end={end:?}"),
+            Err(error) => eprintln!(
+                "TEMP-DIAG-180 HOOKS-WAIT err kind={:?} code={:?}",
+                error.kind(),
+                error.raw_os_error()
+            ),
+        }
+    }
+    match supervised.ok()? {
         crate::cleanup::SessionEnd::Exited(status) => Some(
             status
                 .code()
