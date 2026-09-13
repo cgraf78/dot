@@ -115,6 +115,12 @@ nested_unhealthy_strikes: dict[str, int] = {}
 # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis. Tokens
 # with an already-reported open anomaly bout (bounds LINK-PEEK spam).
 nested_peek_logged: set[str] = set()
+# Whether any nested supervisor ever registered. Registrations arrive
+# during supervision, long before the stop; once set, phase completion
+# additionally requires a drained lease, so a snapshot that misses a
+# live owner cannot end the stop early. Never reset: a drained lease
+# lifts the gate as soon as the owners are really gone.
+nested_ever_registered = False
 nested_control_complete = True
 ancestor_registration: socket.socket | None = None
 PROCESS_SNAPSHOT_TIMEOUT_SECONDS = 1
@@ -837,7 +843,7 @@ def drain_nested_supervisors(
     dead or absent supervisors (three consecutive anomalies), and
     unexpected link data still invalidates unconditionally.
     """
-    global nested_control_complete
+    global nested_control_complete, nested_ever_registered
     if control_reader is None:
         return nested_control_complete
     snapshot_live = {
@@ -1009,6 +1015,7 @@ def drain_nested_supervisors(
         # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
         _temp_diag(f"TEMP-DIAG-180 NESTED-DRAIN acked supervisor={supervisor}")
         nested_supervisors[token] = (supervisor, link)
+        nested_ever_registered = True
     # The fixed loop count is a per-call work budget, not a protocol error.
     # Every accepted supervisor is recorded before its ACK; any registration
     # still queued remains authorization-gated and cannot have launched target
@@ -2478,7 +2485,7 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             return False
         return True
 
-    def observe(deadline: float) -> list[SessionProcess] | None:
+    def observe(deadline: float, unregister: bool) -> list[SessionProcess] | None:
         """Refresh member handles while preserving previously pinned identities."""
         nonlocal unsafe_direct_member, unsafe_direct_member_reason
         # Snapshot before draining so the drain can confirm liveness:
@@ -2493,7 +2500,7 @@ def stop_process_group(first_signal: int) -> CleanupResult:
         # end the phase, never invalidate the control plane. The drain
         # loop is bounded by its fixed iteration cap plus non-blocking
         # I/O either way.
-        if not drain_nested_supervisors(None, processes, True):
+        if not drain_nested_supervisors(None, processes, unregister):
             unsafe_direct_member = True
             # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
             if not unsafe_direct_member_reason:
@@ -2572,7 +2579,11 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             f"budget={deadline - time.monotonic():.2f}"
         )
         group_delivered.clear()
-        processes = observe(deadline)
+        # Only the KILL phase unregisters: a live owner must survive
+        # TERM (it needs that time to shut its own session down), and a
+        # dead one unregisters within a few KILL observations anyway.
+        kill_phase = signum == signal.SIGKILL
+        processes = observe(deadline, kill_phase)
         complete_exact_cohort = processes is not None and all(
             process_info.pid == process.pid
             or not process_info.live
@@ -2643,7 +2654,7 @@ def stop_process_group(first_signal: int) -> CleanupResult:
         signal_known(signum, only_new)
         consecutive_empty = 0
         while time.monotonic() < deadline:
-            processes = observe(deadline)
+            processes = observe(deadline, kill_phase)
             signal_known(signum, only_new)
             # A newly forked same-group member receives one exact pidfd signal
             # when available. Without exact authority, never re-enter every
@@ -2656,6 +2667,10 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             # holds relays and the lease. Dead supervisors unregister
             # within a few stop-drain observations, so the veto always
             # lifts; the phase deadline still bounds a wedged owner.
+            # And once this stop ever involved nested owners, completion
+            # additionally requires a drained lease: the kernel closes
+            # file descriptors on death, so a drained lease is proof the
+            # subtree is really gone no matter what the snapshot shows.
             if (
                 processes is not None
                 and any(item.pid == process.pid for item in processes)
@@ -2663,6 +2678,7 @@ def stop_process_group(first_signal: int) -> CleanupResult:
                 and all(not member.process.live for member in known_members.values())
                 and not unsafe_direct_member
                 and not nested_supervisors
+                and (not nested_ever_registered or lease_closed())
             ):
                 consecutive_empty += 1
                 if consecutive_empty >= 2:
