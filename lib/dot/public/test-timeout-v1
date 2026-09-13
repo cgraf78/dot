@@ -947,9 +947,10 @@ def stream_requires_relay(fd: int) -> bool:
     return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
 
 
-# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis. diagnostic()
-# forks a writer child when stderr is piped, so high-frequency TEMP prints
-# would strand teardown; cap TEMP volume to handshake plus stop-phase events.
+# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis. Best-effort
+# direct write: diagnostic() forks a writer child, and fork latency inside
+# stop perturbs the nested-teardown race under diagnosis. Temporarily flip
+# fd 2 non-blocking, drop on backpressure, and always restore flags.
 _temp_diag_remaining = 48
 
 
@@ -960,8 +961,33 @@ def _temp_diag(message: str) -> None:
     # Env-gated: exact-stderr assertions stay green where unset.
     if not os.environ.get("DOT_TEST_DIAG_NESTED"):
         return
+    if ENTRY_STDIO_MASK & (1 << 2) == 0:
+        return
+    try:
+        stream_fd = sys.stderr.fileno()
+    except (AttributeError, OSError):
+        return
+    if stream_fd != 2:
+        return
     _temp_diag_remaining -= 1
-    diagnostic(message)
+    payload = (message + "\n").encode("utf-8", errors="replace")[:4096]
+    try:
+        flags = fcntl.fcntl(2, fcntl.F_GETFL)
+    except (AttributeError, OSError):
+        return
+    try:
+        fcntl.fcntl(2, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    except (AttributeError, OSError):
+        return
+    try:
+        os.write(2, payload)
+    except (BlockingIOError, InterruptedError, OSError):
+        pass
+    finally:
+        try:
+            fcntl.fcntl(2, fcntl.F_SETFL, flags)
+        except (AttributeError, OSError):
+            pass
 
 
 def diagnostic(message: str) -> None:
