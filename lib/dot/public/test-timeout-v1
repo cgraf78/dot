@@ -815,13 +815,28 @@ def nested_supervisor_belongs_to_session(supervisor: int, leader: int) -> bool:
         return False
 
 
-def drain_nested_supervisors(deadline: float | None = None) -> bool:
-    """Incorporate every published nested owner before attributing processes."""
+def drain_nested_supervisors(
+    deadline: float | None = None,
+    snapshot: list[SessionProcess] | None = None,
+    unregister: bool = True,
+) -> bool:
+    """Incorporate every published nested owner before attributing processes.
+
+    `snapshot` is a fresh process-table observation the caller takes
+    before draining: a supervisor it shows live is never unregistered,
+    no matter what the link peek reports, so a transient peek anomaly
+    cannot orphan a live nested session. Peeks still fail closed for
+    dead or absent supervisors (three consecutive anomalies), and
+    unexpected link data still invalidates unconditionally.
+    """
     global nested_control_complete
     if control_reader is None:
         return nested_control_complete
+    snapshot_live = {
+        item.pid for item in snapshot or () if item.live
+    }
     closed = []
-    for token, (_pid, link) in nested_supervisors.items():
+    for token, (supervisor, link) in nested_supervisors.items():
         try:
             payload = link.recv(1, getattr(socket, "MSG_PEEK", 0))
         except BlockingIOError:
@@ -830,17 +845,41 @@ def drain_nested_supervisors(deadline: float | None = None) -> bool:
         except InterruptedError:
             nested_eof_strikes[token] = 0
             continue
-        except OSError:
-            closed.append(token)
-            continue
+        except OSError as error:
+            anomaly = f"os-error:{error.errno}"
+            payload = None
+        else:
+            anomaly = "ok" if payload else "eof"
         if payload:
             invalidate_nested_control()
             return False
         strikes = nested_eof_strikes.get(token, 0) + 1
-        if strikes >= 3:
+        nested_eof_strikes[token] = strikes
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        # Log once per anomaly bout plus on unregister; a persistent
+        # anomaly would otherwise exhaust the diagnostic budget.
+        if strikes == 1:
+            in_snapshot = (
+                "live"
+                if supervisor in snapshot_live
+                else ("dead" if snapshot is not None else "none")
+            )
+            _temp_diag(
+                f"TEMP-DIAG-180 LINK-PEEK pid={os.getpid()} "
+                f"supervisor={supervisor} anomaly={anomaly} "
+                f"strikes={strikes} snapshot={in_snapshot} "
+                f"unregister={unregister}"
+            )
+        if supervisor in snapshot_live:
+            continue
+        if unregister and strikes >= 3:
+            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+            _temp_diag(
+                f"TEMP-DIAG-180 LINK-UNREG pid={os.getpid()} "
+                f"supervisor={supervisor} anomaly={anomaly} "
+                f"strikes={strikes}"
+            )
             closed.append(token)
-        else:
-            nested_eof_strikes[token] = strikes
     for token in closed:
         _pid, link = nested_supervisors.pop(token)
         nested_eof_strikes.pop(token, None)
@@ -2426,15 +2465,18 @@ def stop_process_group(first_signal: int) -> CleanupResult:
     def observe(deadline: float) -> list[SessionProcess] | None:
         """Refresh member handles while preserving previously pinned identities."""
         nonlocal unsafe_direct_member, unsafe_direct_member_reason
-        if not drain_nested_supervisors(deadline):
-            unsafe_direct_member = True
-            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
-            if not unsafe_direct_member_reason:
-                unsafe_direct_member_reason = "nested-drain"
+        # Snapshot before draining so the drain can confirm liveness:
+        # a supervisor this snapshot shows live is never unregistered.
+        # Queued registrations wait in the datagram queue meanwhile.
         processes = list_session_processes(
             process.pid,
             max(0.001, deadline - time.monotonic()),
         )
+        if not drain_nested_supervisors(deadline, processes, True):
+            unsafe_direct_member = True
+            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+            if not unsafe_direct_member_reason:
+                unsafe_direct_member_reason = "nested-drain"
         if processes is None:
             return None
         for process_info in processes:
@@ -2763,7 +2805,9 @@ def main(argv: Sequence[str], terminal: bool = False) -> int:
         # Nested wrappers cannot authorize their own target until this exact
         # retained wrapper identity acknowledges a private registration.  Do
         # this during ordinary supervision, not only after teardown begins.
-        if not drain_nested_supervisors():
+        # Supervision only registers: unregistering needs a confirming
+        # snapshot, which only stop-time observes take.
+        if not drain_nested_supervisors(unregister=False):
             stop_process_group(signal.SIGKILL)
             diagnostic("test-timeout-v1: could not verify child cleanup")
             return finish(125, False)
