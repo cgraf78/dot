@@ -104,6 +104,11 @@ stdio_relay_states: dict[int, bytes] = {}
 stdio_relay_parent_fds: dict[int, int] = {}
 stdio_relay_status: int | None = None
 nested_supervisors: dict[str, tuple[int, socket.socket]] = {}
+# Consecutive peek-EOF observations per registration. A single EOF can
+# race the supervisor's own first supervision tick on heavily loaded
+# hosts, so unregistration requires repeated confirmation; a truly
+# exited supervisor EOFs forever and still unregisters promptly.
+nested_eof_strikes: dict[str, int] = {}
 nested_control_complete = True
 ancestor_registration: socket.socket | None = None
 PROCESS_SNAPSHOT_TIMEOUT_SECONDS = 1
@@ -296,6 +301,7 @@ def finish(status: int, cleanup_complete: bool = True) -> int:
     for _pid, link in nested_supervisors.values():
         link.close()
     nested_supervisors.clear()
+    nested_eof_strikes.clear()
     terminal_cleanup_incomplete = not cleanup_complete
     if terminal_handoff_required:
         # The single-threaded process-entry path keeps handled signals blocked
@@ -796,6 +802,7 @@ def invalidate_nested_control() -> None:
     for _pid, link in nested_supervisors.values():
         link.close()
     nested_supervisors.clear()
+    nested_eof_strikes.clear()
 
 
 def nested_supervisor_belongs_to_session(supervisor: int, leader: int) -> bool:
@@ -818,8 +825,10 @@ def drain_nested_supervisors(deadline: float | None = None) -> bool:
         try:
             payload = link.recv(1, getattr(socket, "MSG_PEEK", 0))
         except BlockingIOError:
+            nested_eof_strikes[token] = 0
             continue
         except InterruptedError:
+            nested_eof_strikes[token] = 0
             continue
         except OSError:
             closed.append(token)
@@ -827,9 +836,14 @@ def drain_nested_supervisors(deadline: float | None = None) -> bool:
         if payload:
             invalidate_nested_control()
             return False
-        closed.append(token)
+        strikes = nested_eof_strikes.get(token, 0) + 1
+        if strikes >= 3:
+            closed.append(token)
+        else:
+            nested_eof_strikes[token] = strikes
     for token in closed:
         _pid, link = nested_supervisors.pop(token)
+        nested_eof_strikes.pop(token, None)
         link.close()
     for _ in range(128):
         if deadline is not None and time.monotonic() >= deadline:
@@ -2521,22 +2535,33 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             getattr(signal, "pidfd_send_signal", None) is None
         )
         supervisor_pids = {pid for pid, _link in nested_supervisors.values()}
+        # An open registration link is itself the liveness proof: the
+        # drain above peeks every link each observe, and process death
+        # closes file descriptors, so a registered supervisor is alive
+        # even when a transient process-table snapshot misses it. Never
+        # cross-check liveness against that racy snapshot here: missing
+        # a live owner murders it and orphans its session (and lease).
         wait_for_owner = (
             signum == signal.SIGKILL
             and exact_signals_unavailable
-            and processes is not None
-            and any(
-                process_info.live and process_info.pid in supervisor_pids
-                for process_info in processes
-            )
+            and bool(supervisor_pids)
         )
         if wait_for_owner:
             deadline += DELEGATED_OWNER_GRACE_SECONDS
         # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        live_sup = sorted(
+            pid
+            for pid in supervisor_pids
+            if processes is not None
+            and any(
+                item.live and item.pid == pid for item in processes
+            )
+        )
         _temp_diag(
             f"TEMP-DIAG-180 STOP-DECIDE pid={os.getpid()} signum={signum} "
             f"wait={wait_for_owner} none={processes is None} "
-            f"cohort={complete_exact_cohort}"
+            f"cohort={complete_exact_cohort} sup={len(supervisor_pids)} "
+            f"live_sup={live_sup}"
         )
         # `wait_for_owner` is KILL-only, so TERM delivery (which the
         # nested supervisor needs as its shutdown trigger) is unchanged.
@@ -2699,6 +2724,7 @@ def main(argv: Sequence[str], terminal: bool = False) -> int:
     for _pid, link in nested_supervisors.values():
         link.close()
     nested_supervisors.clear()
+    nested_eof_strikes.clear()
     nested_control_complete = True
     if ancestor_registration is not None:
         ancestor_registration.close()
