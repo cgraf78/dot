@@ -5553,29 +5553,61 @@ impl OwnedSession {
 
 /// Fork attempts under transient resource pressure (Darwin reports
 /// `EAGAIN` when parallel suites and per-observe `ps` snapshots
-/// contend). Bounded like the capture backpressure retries so a
-/// launch stall always returns to the supervisor for signal checks.
+/// contend; descriptor exhaustion reports `EMFILE`/`ENFILE` the same
+/// way). Bounded like the capture backpressure retries so a launch
+/// stall always returns to the supervisor for signal checks.
 const SPAWN_EAGAIN_RETRIES: u32 = 100;
+
+/// Whether a spawn failure is transient resource pressure worth one
+/// more attempt. A failed spawn never runs the command, so retrying
+/// is safe for every caller, idempotent or not.
+fn spawn_retryable(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EMFILE || code == libc::ENFILE
+    )
+}
 
 /// Spawn with transient-pressure retries. A failed fork never
 /// reaches the pre-exec barrier, so the registrar still awaits its
 /// single handshake and each attempt is independent. Only
-/// resource-pressure (`EAGAIN`) retries; every other spawn error
-/// (missing binary, denied exec) fails immediately like before.
+/// resource-pressure retries; every other spawn error (missing
+/// binary, denied exec) fails immediately like before.
 fn spawn_with_eagain_retry(
     command: &mut std::process::Command,
 ) -> std::io::Result<std::process::Child> {
+    // TEMP-DIAG-180: remove the gated logging after the macOS ownership
+    // diagnosis; keep the retry itself.
+    let diag = std::env::var_os("DOT_TEST_DIAG_CLONE").is_some();
     let mut eagain_retries = 0;
     loop {
         match command.spawn() {
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    && eagain_retries < SPAWN_EAGAIN_RETRIES =>
-            {
+            Err(error) if spawn_retryable(&error) && eagain_retries < SPAWN_EAGAIN_RETRIES => {
                 eagain_retries += 1;
+                if diag {
+                    eprintln!(
+                        "TEMP-DIAG-180 SPAWN-RETRY attempt={eagain_retries} kind={:?} code={:?}",
+                        error.kind(),
+                        error.raw_os_error()
+                    );
+                }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            outcome => return outcome,
+            outcome => {
+                if diag {
+                    if let Err(error) = &outcome {
+                        eprintln!(
+                            "TEMP-DIAG-180 SPAWN-GIVEUP kind={:?} code={:?} after={eagain_retries}",
+                            error.kind(),
+                            error.raw_os_error()
+                        );
+                    }
+                }
+                return outcome;
+            }
         }
     }
 }
@@ -7004,6 +7036,25 @@ fn terminate_children(children: &mut Vec<Child>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_retryable_covers_pressure_but_not_permanent_errors() {
+        assert!(spawn_retryable(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(spawn_retryable(&std::io::Error::from_raw_os_error(
+            libc::EMFILE
+        )));
+        assert!(spawn_retryable(&std::io::Error::from_raw_os_error(
+            libc::ENFILE
+        )));
+        assert!(!spawn_retryable(&std::io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
+        assert!(!spawn_retryable(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+    }
 
     #[test]
     fn stderr_writer_falls_back_when_its_first_primary_send_discovers_failure() {
