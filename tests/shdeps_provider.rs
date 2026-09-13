@@ -1670,6 +1670,7 @@ fn wait_bounded_draining(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_nonblocking_to_end(file: &mut File, timeout: std::time::Duration) -> Vec<u8> {
     let deadline = std::time::Instant::now() + timeout;
     let mut output = Vec::new();
