@@ -431,6 +431,9 @@ fn wait(command: Command) -> Option<i32> {
 
     // TEMP-DIAG-180: remove after the macOS hooks-test diagnosis.
     let diag = std::env::var_os("DOT_TEST_DIAG_HOOKS").is_some();
+    if diag {
+        eprintln!("TEMP-DIAG-180 HOOKS-WAIT enter");
+    }
     let supervised = crate::cleanup::supervise_session(command, None, |_| Ok(()));
     if diag {
         match &supervised {

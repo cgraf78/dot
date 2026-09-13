@@ -649,6 +649,9 @@ fn send_nested_registration(
     send_nested_registration_with_pid(control_fd, boundary, registration_fd, std::process::id())
 }
 
+/// Bounded registration-send retries under control-queue pressure.
+const NESTED_SEND_EAGAIN_RETRIES: u32 = 100;
+
 fn send_nested_registration_with_pid(
     control_fd: i32,
     boundary: &str,
@@ -690,20 +693,52 @@ fn send_nested_registration_with_pid(
     }
     // One datagram carries one fixed frame and one private per-session stream.
     // The immediate parent validates the stream peer before acknowledging it.
-    let written = unsafe {
-        libc::sendmsg(
-            control_fd,
-            &message,
-            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-        )
-    };
-    if written == frame.len() as isize {
-        Ok(())
-    } else if written < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Err(std::io::Error::other("short supervisor registration"))
+    // A busy parent (mid-snapshot, mid-phase) momentarily backpressures its
+    // datagram queue; a failed nonblocking send transmits nothing, so
+    // retrying the same frame is safe. Bounded like the other pressure
+    // retries so a wedged parent still fails instead of stalling spawn.
+    let mut send_retries = 0;
+    loop {
+        let written = unsafe {
+            libc::sendmsg(
+                control_fd,
+                &message,
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if written == frame.len() as isize {
+            return Ok(());
+        } else if written < 0 {
+            let error = std::io::Error::last_os_error();
+            if nested_send_retryable(&error) && send_retries < NESTED_SEND_EAGAIN_RETRIES {
+                send_retries += 1;
+                // TEMP-DIAG-180: remove the gated logging after the macOS
+                // ownership diagnosis; keep the retry itself.
+                if std::env::var_os("DOT_TEST_DIAG_CLONE").is_some() {
+                    eprintln!(
+                        "TEMP-DIAG-180 NESTED-SEND-RETRY attempt={send_retries} kind={:?} code={:?}",
+                        error.kind(),
+                        error.raw_os_error()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            return Err(error);
+        } else {
+            return Err(std::io::Error::other("short supervisor registration"));
+        }
     }
+}
+
+/// Transient control-queue pressure worth one more registration send.
+/// `EAGAIN` means the parent's datagram buffer was momentarily full;
+/// `EINTR` is a signal blip. Anything else fails immediately.
+fn nested_send_retryable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    )
 }
 
 fn publish_nested_supervisor(
@@ -7097,6 +7132,22 @@ mod tests {
         )));
         assert!(!waitid_retryable(&std::io::Error::from(
             std::io::ErrorKind::Interrupted
+        )));
+    }
+
+    #[test]
+    fn nested_send_retryable_covers_backpressure_and_blips() {
+        assert!(nested_send_retryable(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(nested_send_retryable(&std::io::Error::from(
+            std::io::ErrorKind::Interrupted
+        )));
+        assert!(!nested_send_retryable(&std::io::Error::from_raw_os_error(
+            libc::EBADF
+        )));
+        assert!(!nested_send_retryable(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
         )));
     }
 

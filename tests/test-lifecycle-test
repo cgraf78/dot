@@ -462,18 +462,34 @@ failure = []
 
 def publish_all():
     try:
-        for token in tokens:
+        for index, token in enumerate(tokens):
+            started = time.monotonic()
             registrations.append(module.publish_nested_supervisor([writer], token))
+            elapsed = time.monotonic() - started
+            # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+            if (index + 1) % 8 == 0:
+                print(f"TEMP-DIAG-180 PUB-PROGRESS done={index + 1}/{len(tokens)}", flush=True)
+            if elapsed > 0.25:
+                print(f"TEMP-DIAG-180 PUB-STALL token=...{token[-8:]} elapsed={elapsed:.2f}s", flush=True)
     except BaseException as error:
+        # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+        print(f"TEMP-DIAG-180 PUB-FAIL done={len(registrations)}/{len(tokens)} error={error!r}", flush=True)
         failure.append(error)
 
 publisher = threading.Thread(target=publish_all)
 publisher.start()
 deadline = time.monotonic() + 3
+drains = 0
 while publisher.is_alive() and time.monotonic() < deadline:
     assert module.drain_nested_supervisors(deadline)
+    drains += 1
+    # TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+    if drains % 100 == 0:
+        print(f"TEMP-DIAG-180 DRAIN-PROGRESS drains={drains} registered={len(module.nested_supervisors)} done={len(registrations)}", flush=True)
     publisher.join(0.01)
 publisher.join(0)
+# TEMP-DIAG-180: remove after the macOS lifecycle diagnosis.
+print(f"TEMP-DIAG-180 PUB-FINAL alive={publisher.is_alive()} done={len(registrations)}/{len(tokens)} drains={drains} registered={len(module.nested_supervisors)}", flush=True)
 assert not publisher.is_alive(), "nested registration publisher did not finish"
 assert not failure, failure
 assert len(module.nested_supervisors) == len(tokens)
