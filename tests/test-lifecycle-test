@@ -969,7 +969,11 @@ os.close(sink)
 assert plain.wait(timeout=5) == 1, "closed relay source was not a sink-only failure"
 os.close(source)
 
-with tempfile.TemporaryDirectory() as temporary:
+# AF_UNIX paths are capped near 104 bytes on macOS, and TMPDIR on CI
+# runners nests deep enough to breach it. Bind under /tmp where it
+# exists so the endpoint stays short; otherwise keep the default.
+socket_parent = "/tmp" if os.path.isdir("/tmp") else None
+with tempfile.TemporaryDirectory(dir=socket_parent) as temporary:
     endpoint = str(Path(temporary) / "fd.sock")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(endpoint)
