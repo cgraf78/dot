@@ -10,14 +10,18 @@
 //! that replays a transaction forward from any recorded phase
 //! ([`resume_transaction`]).
 //!
-//! Rollback and command dispatch remain separate from the record
-//! journal (`init_client_record`), the
+//! Lane map, so the integrator can stack without overlap: the
+//! rollback neighbor below (`_dot_init_rollback`) lives on
+//! `rust-port-slice-66` and the command dispatcher above
+//! (`dot_init_command`) stays for a later lane, as do the record
+//! journal (`init_client_records` / `init_client_record`), the
 //! plan-review family (`init_client_plan`), the git-stage pair and
 //! converge tail (`init_client_git`, `init_client_publish`), and the
 //! identity, generation, candidate, entry, and delete families owned
-//! by their corresponding modules.
+//! by their own lanes. Nothing outside lines 1711-1788 is ported
+//! here.
 //!
-//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the run identity from the
@@ -29,8 +33,8 @@
 //! `clippy::too_many_arguments`). All cross-lane helpers the shell
 //! calls by name — the path identity, generation-marker, and repo
 //! identity predicates plus the record, move, stage, publish,
-//! converge, and completion steps — cross as closures to preserve those
-//! ownership boundaries. `REPLY`-carried outputs
+//! converge, and completion steps — cross as closures, the plan and
+//! git lane precedent for unmerged neighbors. `REPLY`-carried outputs
 //! surface as return values; the resume wrapper itself is silent like
 //! the shell (sub-step bytes belong to the step closures, which own
 //! their file descriptors the way the engine does).
@@ -62,7 +66,7 @@
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 use crate::errors::{Error, Result};
 
@@ -259,7 +263,7 @@ fn commit_valid(commit: &[u8]) -> bool {
 /// for the bare substitution in the `case`, like its empty expansion.
 /// Git's own stderr is silenced (the candidate lane precedent).
 fn git_dir_output(git_dir: &Path, home: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = crate::init_client_identity::host_git_command()
+    let output = Command::new("git")
         .arg("--git-dir")
         .arg(git_dir)
         .args(args)
@@ -280,7 +284,7 @@ fn git_dir_output(git_dir: &Path, home: &Path, args: &[&str]) -> Option<Vec<u8>>
 /// worktree context the `--git-dir` form cannot provide. Same
 /// pinning and silencing as [`git_dir_output`].
 fn git_home_output(home: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = crate::init_client_identity::host_git_command()
+    let output = Command::new("git")
         .arg("-C")
         .arg(home)
         .args(args)
@@ -558,7 +562,7 @@ pub fn resume_transaction(inputs: &ResumeInputs<'_>, deps: &ResumeDeps<'_>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dot_test_support::TempDir;
+    use crate::test_support::TempDir;
 
     #[test]
     fn commit_ids_cover_both_generations() {

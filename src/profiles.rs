@@ -1,6 +1,7 @@
-//! Profile definitions and user/host selector resolution.
+//! Profile definitions and user/host selector resolution (slice 8).
 //!
-//! Owns definition parsing, include expansion,
+//! Ports `lib/dot/profile-format.sh` and the loading/selection half
+//! of `lib/dot/profiles.sh`: definition parsing, include expansion
 //! with cycle detection, selector parsing and matching, and default
 //! resolution. The profile lifecycle ledger
 //! (`profile-lifecycle.sh`) lives in [`crate::profile_lifecycle`].

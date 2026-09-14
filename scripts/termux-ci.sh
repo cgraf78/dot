@@ -3,8 +3,8 @@ set -euo pipefail
 
 # The standard matrix owns the full test suite. This job executes the
 # NDK-built Android binary inside the real Termux app sandbox and
-# verifies the transported binary's startup contract: help, version, and
-# unknown-command handling.
+# verifies the slice-1 CLI contract (help text, version shape, unknown
+# command) on-device. Deeper suites arrive with their owning slices.
 binary=.termux-ci/dot
 
 [[ -x $binary ]] || {
