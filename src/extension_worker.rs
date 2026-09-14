@@ -1,6 +1,6 @@
 //! Worker decision kernels from `lib/dot/extension-worker.sh`.
 //!
-//! Ports the pure validation logic behind the four worker entry
+//! Owns the pure validation logic behind the four worker entry
 //! points: the overlay-protocol whitelist from
 //! `_dot_extension_worker_load_overlay_protocol`, the ordered API
 //! file lists from `_dot_extension_worker_load_merge_api` and
@@ -16,7 +16,7 @@
 //! under traps and readonly guards. Only the decisions that can be
 //! tested without side effects live here.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 
 use std::path::{Path, PathBuf};
@@ -135,37 +135,6 @@ pub fn protocol_survivors(before: &[String], after: &[String]) -> Vec<String> {
         }
     }
     survivors
-}
-
-/// Ordered files sourced by `_dot_extension_worker_load_merge_api`,
-/// relative to `$DOT_SOURCE_ROOT`.
-pub const MERGE_API_RELPATHS: [&str; 6] = [
-    "lib/dot/log.sh",
-    "lib/dot/temp.sh",
-    "lib/dot/merge-block.sh",
-    "lib/dot/families.sh",
-    "lib/dot/merge-hooks.sh",
-    "lib/dot/hook-api.sh",
-];
-
-/// File sourced by `_dot_extension_worker_load_doctor_api`,
-/// relative to `$DOT_SOURCE_ROOT`.
-pub const DOCTOR_API_RELPATH: &str = "lib/dot/doctor-api.sh";
-
-/// Join the merge-API list onto `source_root`, like the six `.`
-/// lines in the loader (`"$DOT_SOURCE_ROOT/<rel>"` string
-/// concatenation, so an empty root yields `/lib/...` like the
-/// shell).
-pub fn merge_api_paths(source_root: &str) -> Vec<PathBuf> {
-    MERGE_API_RELPATHS
-        .iter()
-        .map(|rel| PathBuf::from(format!("{source_root}/{rel}")))
-        .collect()
-}
-
-/// Join the doctor-API file onto `source_root`, like the loader.
-pub fn doctor_api_path(source_root: &str) -> PathBuf {
-    PathBuf::from(format!("{source_root}/{DOCTOR_API_RELPATH}"))
 }
 
 /// Whether `source_root` has the `/*` shape from

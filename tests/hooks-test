@@ -149,21 +149,6 @@ assert_eq 0 "$catchup_status" \
   "pre-sync recovery update succeeds: $catchup_output"
 rm -f "$extensions/pre-sync.d/10-prepare.sh"
 
-allocator_probe=$(DOT_TEST_ROOT=$root HOME=$home bash --noprofile --norc -c '
-  set -euo pipefail
-  . "$DOT_TEST_ROOT/lib/dot/public/xdg.sh"
-  . "$DOT_TEST_ROOT/lib/dot/resources.sh"
-  . "$DOT_TEST_ROOT/lib/dot/merges.sh"
-  _warn() { :; }
-  _dot_cleanup_mktemp() { return 1; }
-  DOT_MERGE_FAILED_COUNT=0
-  REPLY=unset
-  _run_merge_hook_batch $'"'"'10-alpha\t/unused'"'"'
-  printf "reply=%s\nfailures=%s\n" "$REPLY" "$DOT_MERGE_FAILED_COUNT"
-')
-assert_eq $'reply=0\nfailures=1' "$allocator_probe" \
-  'merge scratch allocation failure counts as an operational failure'
-
 rm -f "$extensions/merge-hooks.d"/*.sh "$home/hook.log"
 cat >"$extensions/merge-hooks.d/10-failing.sh" <<'HOOK'
 merge() {

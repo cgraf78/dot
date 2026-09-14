@@ -10,50 +10,39 @@ an older file.
 
 | Standalone path | Public source or origin | Notes |
 | --- | --- | --- |
-| `install.sh` | `cgraf78/actions` checkout-installer at the revision in `.github/cgraf78-actions.lock` | Generated, never hand-edited |
-| `support/checkout-bash-v1.sh` | `actions:checkout-installer/bash-resolver-v1.sh.in` at the same locked revision | Generated from the resolver embedded in `install.sh` |
+| `install.sh` | `cgraf78/actions` release installer at the revision in `.github/cgraf78-actions.lock` | Generated, never hand-edited |
 | `support/shdeps.lock` | Its recorded immutable `cgraf78/shdeps` revision | Pins revision, installer digest, and ABI without duplicating that revision in this inventory |
 | `docs/source-revisions-v1.tsv` | Reviewed immutable public extraction inputs | Gives each source revision one stable name so per-path provenance does not duplicate commit hashes |
 
-## Public runtime implementation
+## Native runtime implementation
+
+The CLI and engine are implemented by `src/*.rs`. Their behavior was ported
+from the public `cgraf78/dotfiles` inputs named in
+[`source-revisions-v1.tsv`](source-revisions-v1.tsv), then split into native
+modules by responsibility. The removed private `lib/dot/*.sh` tree is not a
+runtime or test dependency.
+
+## Retained public shell boundary
 
 | Standalone path | Public source or origin | Extraction notes |
 | --- | --- | --- |
 | `lib/dot/public/xdg.sh` | `dotfiles:.local/lib/dot/core/xdg.sh` | Public names, strict argument validation, and API inventory added |
 | `lib/dot/public/ui.sh` | `dotfiles:.local/lib/dot/core/ui.sh` | Public names, deterministic caller-state behavior, and API inventory added |
 | `lib/dot/public/{api-version.sh,api-v1.tsv,variables-v1.tsv}` | New standalone interface | Machine-readable public ABI and drift checks |
-| `lib/dot/{log.sh,progress-ui.sh,resources.sh,run.sh,temp.sh,update-lock.sh}` | Same-named files under `dotfiles:.local/lib/dot/core/` | Generic runtime and cleanup behavior extracted; client policy removed |
-| `lib/dot/constants.sh` | `dotfiles:.local/lib/dot/core/constants.sh` | Reduced to standalone runtime state using the public XDG API |
-| `lib/dot/platform.sh` | `dotfiles:.local/lib/dot/core/platform.sh` | Only generic platform and host filtering retained |
-| `lib/dot/pre-sync.sh` | New standalone extension lifecycle | Runs trusted client prerequisites before repository network or checkout mutation |
-| `lib/dot/overlays.sh` | `dotfiles:.local/lib/dot/core/overlays.sh` | Generic descriptor and local-source validation retained; SSH application policy removed |
-| `lib/dot/repos/{api.sh,commands.sh,config.sh,dirty.sh,git.sh,overlays.sh,pull.sh}` | Same-named files under `dotfiles:.local/lib/dot/core/repos/` | URL rewriting, personal branch assumptions, and application policy removed |
-| `lib/dot/repos/model.sh` | New standalone seam, adapted from `core/constants.sh`, `core/init.sh`, and repo helpers | Typed ordinary/separate-Git-dir topology and repository identity |
-| `lib/dot/{families.sh,merge-block.sh,merge-hooks.sh,merges.sh}` | Same-named files under `dotfiles:.local/lib/dot/core/` | Concrete application hooks removed; generic ordering, publication, and scheduling retained |
-| `lib/dot/{extension-trust.sh,extension-worker-launch.sh,extension-worker.sh}` | New standalone split from `core/merges.sh` and `core/merge-hooks.sh` | Shared trust validation and fresh-Bash worker boundary |
-| `lib/dot/{hook-api.sh,hook-api-v1.tsv}` | New standalone interface, using generic helpers formerly in `core/merge-hooks.sh` | Versioned extension API and drift inventory |
-| `lib/dot/providers/shdeps-ui.sh` | `dotfiles:.local/lib/dot/core/shdeps-ui.sh` | Generic JSONL rendering and cancellation retained |
-| `lib/dot/providers/shdeps.sh` | Adapted from `core/init.sh`, `core/update.sh`, and `core/shdeps-assets.sh` | Immutable pin, optional provider, and one-shot standalone re-exec |
-| `lib/dot/doctor.sh` | `dotfiles:.local/lib/dot/core/doctor.sh` | Core-first coordinator plus isolated client extension stage |
-| `lib/dot/doctor/{runtime.sh,paths.sh,repos.sh,overlays.sh,merges.sh}` | Same-named files under `dotfiles:.local/lib/dot/core/doctor/` | Only generic runtime/repository/overlay/hook checks retained |
-| `lib/dot/doctor/{lock.sh,provider.sh}` | New standalone checks derived from update-lock and provider contracts | No application-specific diagnostics |
-| `lib/dot/{doctor-api.sh,doctor-api-v1.tsv}` | New standalone interface | Isolated result transport and machine-readable ABI |
-| `lib/dot/init-client.sh` | New standalone transaction, adapted from topology and bootstrap behavior in `core/init.sh` | Candidate quarantine, durable identity, rollback, and forward convergence |
-| `lib/dot/reserved.sh` | New standalone security seam | Dynamic Actions/Shdeps/provider/client control-plane inventory |
-| `lib/dot/update.sh` | `dotfiles:.local/lib/dot/core/update.sh` | Provider-neutral orchestration; client integrations removed |
-| `lib/dot/{commands.sh,init.sh,main.sh,runtime.sh,config.sh}` | New standalone composition around the extracted public engine | CLI, strict config, loading order, and product/version boundary |
-| `lib/dot/test.sh` and `lib/dot/test/{source,discovery,runner}.sh` | `dotfiles:.local/lib/dotfiles/tests/run` at `dotfiles-v2`, plus standalone composition | Generic scheduling, cancellation, source-worktree selection, and result coordination moved into focused provider modules; client policy removed |
+| `lib/dot/public/hook-runtime-v1/**` | Reviewed extraction of the former hook API helpers | Self-contained compatibility surface sourced only by user-provided hooks; it cannot dispatch the CLI or engine |
+| `lib/dot/public/{doctor-api-v1.tsv,hook-api-v1.tsv,test-api-v1.tsv}` | New standalone interfaces | Machine-readable public boundary inventories |
 | `lib/dot/public/test-timeout-v1` | `dotfiles:.local/lib/dotfiles/tests/timeout.py` at `dotfiles-v2` | Versioned portable timeout command for suites and provider-owned descendant cleanup |
-| `lib/dot/{test-api-v1.tsv,public/test-reporter-v1}` | New standalone interface | Language-neutral, single-terminal-record result transport for executable suites |
+| `lib/dot/public/test-reporter-v1` | New standalone interface | Language-neutral, single-terminal-record result transport for executable suites |
+| `support/client-launcher.sh` | New standalone release boundary | Installs or invokes a verified native release artifact; it is not an engine fallback |
 
 ## Test provenance
 
 | Standalone tests | Public source or origin | Notes |
 | --- | --- | --- |
-| `tests/{repos-test,resources-test,update-lock-test}` | Generic cases extracted from `dotfiles:.local/lib/dot/tests/{core-pull-test,core-overlays-test,core-update-test,core-resource-cleanup-test,xdg-test}` and `tests/core/commands.sh` | Expanded with standalone topology, reserved-path, cancellation, and crash-phase fixtures |
-| `tests/{families-test,merge-block-test,hooks-test,hook-api-test,extensions-api-test}` | Generic cases extracted from `core-merges-test`, `core-resource-cleanup-test`, and `tests/core/merges.sh` | Concrete application hook cases deliberately excluded |
-| `tests/{doctor-test,shdeps-provider-test}` | Generic cases extracted from `core-doctor-test`, `core-test`, `core-reexec-test`, and provider/UI portions of the public suite | Application and environment checks remain client-owned |
-| `tests/{init-test,cli-test,config-test,install-test,client-launcher-test,library-test,examples-test,test-command-test,workflow-test}` | New standalone acceptance suites, informed by public bootstrap/launcher/XDG/workflow characterization | Use only synthetic users, repositories, hosts, and paths |
+| `tests/repos_*.rs`, `tests/reserved.rs`, and `tests/update_lock.rs` | Generic cases extracted from `dotfiles:.local/lib/dot/tests/{core-pull-test,core-overlays-test,core-update-test,core-resource-cleanup-test,xdg-test}` and `tests/core/commands.sh` | Expanded with standalone topology, reserved-path, cancellation, and crash-phase fixtures; repository and update-lock contracts run directly against native owners |
+| `tests/{families.rs,hook_api.rs,extension_worker.rs,extension_trust.rs,overlay_context.rs}` and `tests/hooks-test` | Generic cases extracted from `core-merges-test`, `core-resource-cleanup-test`, and `tests/core/merges.sh` | Concrete application hook cases deliberately excluded; family selection, API inventories, trust/context matrices, and hook contracts run directly against native owners, with hermetic public-runtime and user-hook Bash boundary tests |
+| `tests/{shdeps.rs,shdeps_checkpoint.rs,shdeps_env_abi.rs,shdeps_provider.rs,shdeps_ui.rs,shdeps_ui_render.rs}` | Generic cases extracted from `core-doctor-test`, `core-test`, `core-reexec-test`, and provider/UI portions of the public suite | Lock, checkpoint, environment ABI, provider coordination, progress records, rendering, lifecycle, and failure contracts run directly against native owners with fake external Shdeps binaries only at the public provider boundary |
+| `tests/{cli.rs,config.rs,profiles.rs}` and `tests/{init-test,client-launcher-test,library-test,workflow-test}` | New standalone acceptance suites, informed by public bootstrap/launcher/XDG/workflow characterization | Use only synthetic users, repositories, hosts, and paths; CLI, configuration, profile, and checked-in example contracts now run directly against the native engine |
 | `tests/test-lifecycle-test` | Generic cases extracted from `dotfiles:.local/lib/dotfiles/tests/core/runner.sh` at `dotfiles-v2` | Covers filtering, priority, stdin closure, timeout, descendant cleanup, concurrent temp ownership, and CLI failures |
 | `tests/lib/{test.sh,repo.sh}`, `tests/run`, and `tests/provider-suite-wrapper` | New standalone harness, adapted from public dotfiles test conventions | Checkout-local only; delegates provider files to the shared parallel coordinator and does not invoke client-owned tests |
 
