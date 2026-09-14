@@ -1,30 +1,24 @@
 //! The parent-directory publisher of `lib/dot/init-client.sh`:
 //! ensuring every ancestor of an entry exists before publication.
 //!
-//! The shell file holds 79 functions — too big for one lane — so
-//! this module owns only `_dot_init_parent_directories` (lines
-//! 1062-1130): walk the entry's ancestors top-down, reserve each
+//! This module owns parent-directory publication: walk an entry's ancestors
+//! top-down, reserve each
 //! missing level with a pending intent, prepare a claimed stage
 //! directory bound to its device, inode, and mode, then rename the
 //! stage into place. Levels that already hold real directories are
 //! kept; anything else refuses.
 //!
-//! Lane map, so the integrator can stack without overlap: the
-//! parent record reader lives on `rust-port-slice-54`
-//! (`init_client_record`), the private-line publisher and the four
-//! stage-claim helpers on `rust-port-slice-46` (`init_client_entry`),
-//! and the two private-directory gates on `rust-port-slice-55`
-//! (`init_client_delete`) — all unmerged here, so those eight call
-//! sites cross as closures in [`ParentHooks`], one per shell call
+//! Record reading, private-line publication, stage claims, and private-directory
+//! gates live in their focused modules. Those call sites cross as closures in
+//! [`ParentHooks`], one per shell call
 //! site with the verifier arguments bound positionally, the way the
 //! rollback lane binds its verifiers. The `git hash-object --stdin`
 //! digest, the `mkdir`/`chmod` provisioning, the identity and mode
 //! reads, and the exclusive rename are engine mechanics, not ported
 //! functions: they run natively here through [`crate::temp`], like
-//! the sibling lanes' twins. Nothing above line 1062 and nothing
-//! below line 1130 is ported here.
+//! the neighboring native modules.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the run identity from the
@@ -56,7 +50,7 @@ use std::io::Write as _;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::errors::{Error, Result};
 use crate::temp;
@@ -232,7 +226,7 @@ fn chomp_newlines(bytes: &[u8]) -> &[u8] {
 /// `printf '%s' ... | git hash-object --stdin`, run natively like
 /// the rollback lane's twin. `LC_ALL=C` is pinned, never `envs`.
 fn hash_stdin_bytes(payload: &[u8]) -> Result<String> {
-    let mut child = Command::new("git")
+    let mut child = crate::init_client_identity::host_git_command()
         .args(["hash-object", "--stdin"])
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())

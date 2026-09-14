@@ -1,37 +1,15 @@
-//! Binary startup prelude for `dot` (slice 84).
+//! Binary startup prelude for `dot`.
 //!
-//! Ports the `lib/dot/main.sh` prelude plus the `bin/dot` entry
-//! contract into the Rust binary startup path (`cli::run` calls
-//! [`check_ambient`]; `main.rs` binds [`ambient_source_root`]).
-//! Reuses the already-ported [`crate::config`], [`crate::xdg`], and
+//! Owns source-root discovery and the process preflight before
+//! command dispatch (`app::run` calls
+//! [`check`] with its snapshotted runtime).
+//! Reuses the [`crate::config`], [`crate::xdg`], and
 //! [`crate::version`] modules plus the existing `cli::HELP` text —
 //! nothing here re-ports their internals.
 //!
-//! Shell line map (`bin/dot` is 59 lines, `lib/dot/main.sh` 94):
-//!
-//! | Shell | Rust |
-//! |---|---|
-//! | `CDPATH=` | No equivalent needed: the engine builds absolute paths only (`source_root` / `xdg` joins); no `cd`-relative lookup exists to perturb. |
-//! | `set -euo pipefail` | No equivalent needed: fallibility is typed (`Result`, explicit `Option`) instead of dynamic. |
-//! | `umask g-w,o-w` | [`ensure_umask_ceiling`]: the same `mask \| 0o022` as a pure function. The process mask itself is never mutated (no `std` binding exists — see `temp::read_umask` — and a global mutation would race every thread); creation sites already carry explicit modes (`temp::sibling_tmp_for` uses `0o600`, plus `temp::apply_umask_ceiling`). |
-//! | `shopt -u nocasematch` | No equivalent needed: Rust `match` on argv bytes is always byte-exact and case-sensitive (pinned by test against both entry files). |
-//! | Bash-4+ gate (`dot: Bash 4 or newer is required`, exit 1) | No equivalent needed: the compiled binary has no interpreter to version-gate. `test_support::bash` still requires Bash 4+ for the differential oracles only. |
-//! | `DOT_SOURCE_ROOT=$(cd -P …/lib/dot/main.sh …/../..)` + export | [`resolve_source_root`] / [`ambient_source_root`]: an explicit `DOT_SOURCE_ROOT` wins verbatim (the hermetic-test and embedding hook the shell's unconditional bind cannot offer); otherwise the current executable's canonical path is walked up to the first ancestor holding `lib/dot/main.sh` (canonicalization resolves symlink chains the way `cd -P` plus the `bin/dot` 40-hop loop does — an unresolvable chain simply misses the probe instead of printing `launcher symlink chain is too deep`); otherwise the cwd applies (mirroring `${DOT_SOURCE_ROOT:-$PWD}` in `_dot_source_git`). |
-//! | `. lib/dot/temp.sh` | No sourcing step: `temp` is linked statically and called directly ([`observed_revision`] uses `temp::sanitized_git`). |
-//! | `DOT_ORIGINAL_ARGV=("$@")` | No global: argv is threaded explicitly (`cli::run` takes `args`). |
-//! | `DOT_REEXEC_EXPECTED_REVISION` guard (exit 1) | [`check_reexec_revision`] + [`observed_revision`], same order (before config), same bytes including the `${var:-<missing>}` spelling. |
-//! | `. public/api-version.sh` | [`crate::version::LIBRARY_API`] (already pinned to `DOT_LIBRARY_API=1` by `tests/constants.rs`). |
-//! | `. public/xdg.sh` | [`crate::xdg`] (relative XDG values already fall back, exactly like the shell). |
-//! | `. public/ui.sh` | [`crate::ui`] (already ported; startup performs no presentation). |
-//! | `. lib/dot/config.sh` + `dot_config_load \|\| exit 2` | [`load_default_config`]: the XDG-default `dot/config` through `config::load`; any rejection becomes exit 2 with byte-identical diagnostics. Runs BEFORE dispatch for EVERY command per the forward contracts in `docs/rust-port-spec.md` ("an unloadable config exits 2 for ANY command") — the shell `case` currently exempts `help`/`version`, and that divergence is deliberate and pinned in `tests/startup.rs`. |
-//! | `REPLY` global | No equivalent: every helper returns values (the `xdg` precedent). |
-//! | `dot_version` / `dot_help` | `version::version_line` / `cli::HELP` (byte parity already pinned by `tests/cli.rs`; the startup suite re-pins `version` end to end so the prelude cannot perturb it). |
-//!
-//! A loaded config is otherwise invisible: [`preflight`] validates
-//! and returns the [`Config`] for future slices, while
-//! [`check_ambient`] (the `cli::run` entry) discards it
-//! — no process environment is published yet, so already-wired
-//! commands behave exactly as before whenever config loads.
+//! [`preflight`] validates and returns the loaded [`Config`] to native command
+//! dispatch. No process environment is published; consumers receive the
+//! immutable configuration explicitly.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -43,6 +21,10 @@ use crate::config::Config;
 /// other-write denied, every stricter caller bit retained.
 pub const UMASK_CEILING_BITS: u32 = 0o022;
 
+/// Termux's published replacement for `/proc/self/exe` while its exec shim
+/// launches an application through Android's system linker.
+pub(crate) const TERMUX_EXECUTABLE_ENV: &str = "TERMUX_EXEC__PROC_SELF_EXE";
+
 /// Apply the startup umask ceiling to a mask without touching the
 /// process: `umask g-w,o-w` is `mask | 0o022` (a stricter caller
 /// policy such as `0077` passes through unchanged).
@@ -50,40 +32,240 @@ pub fn ensure_umask_ceiling(mask: u32) -> u32 {
     mask | UMASK_CEILING_BITS
 }
 
-/// Resolve the selected Dot checkout.
+/// Apply the shell-compatible write-permission ceiling to this process.
+///
+/// The binary calls this before starting worker threads or creating files, so
+/// the process-wide two-syscall read/update cannot race another Dot operation.
+pub fn apply_umask_ceiling() {
+    // SAFETY: `umask(2)` has no memory-safety preconditions. This function is
+    // called once at process entry before any threads are started.
+    unsafe {
+        let inherited = libc::umask(0) as u32;
+        libc::umask(ensure_umask_ceiling(inherited) as libc::mode_t);
+    }
+}
+
+/// Resolve the Dot checkout or release that owns `exe`.
+///
+/// The executable is canonicalized before its recognized development or
+/// release layout is inspected, so an installed launcher symlink still binds
+/// the runtime to the payload it actually executes. A missing or incomplete
+/// root is an error: the binary must never fall back to caller-controlled
+/// process state when selecting code that hooks and providers may execute.
+pub fn executable_source_root(exe: &Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(exe).map_err(|_| source_root_error())?;
+    source_root_from_canonical(
+        &canonical,
+        Path::new(env!("OUT_DIR")),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        true,
+    )
+    .ok_or_else(source_root_error)
+}
+
+fn executable_owner_root(exe: &Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(exe).map_err(|_| source_root_error())?;
+    source_root_from_canonical(
+        &canonical,
+        Path::new(env!("OUT_DIR")),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        false,
+    )
+    .ok_or_else(source_root_error)
+}
+
+fn source_root_shape(root: &Path, require_public: bool) -> bool {
+    (root.join("Cargo.toml").is_file() || root.join(".dot-install.json").is_file())
+        && (!require_public || root.join("lib/dot/public").is_dir())
+}
+
+fn source_root_from_canonical(
+    executable: &Path,
+    out_dir: &Path,
+    manifest_dir: &Path,
+    require_public: bool,
+) -> Option<PathBuf> {
+    cargo_source_root_from(executable, out_dir, manifest_dir, require_public)
+        .or_else(|| physical_source_root(executable, require_public))
+}
+
+fn physical_source_root(executable: &Path, require_public: bool) -> Option<PathBuf> {
+    let parent = executable.parent()?;
+    if source_root_shape(parent, require_public) {
+        return Some(parent.to_path_buf());
+    }
+    if parent.file_name() == Some(OsStr::new("bin")) {
+        let root = parent.parent()?;
+        if source_root_shape(root, require_public) {
+            return Some(root.to_path_buf());
+        }
+    }
+    let target = if parent.file_name() == Some(OsStr::new("deps")) {
+        parent.parent()?.parent()?
+    } else {
+        parent.parent()?
+    };
+    if target.file_name() == Some(OsStr::new("target")) {
+        let root = target.parent()?;
+        if source_root_shape(root, require_public) {
+            return Some(root.to_path_buf());
+        }
+    }
+    None
+}
+
+fn cargo_source_root_from(
+    executable: &Path,
+    out_dir: &Path,
+    manifest_dir: &Path,
+    require_public: bool,
+) -> Option<PathBuf> {
+    // Cargo may place target artifacts outside the checkout. `OUT_DIR` and
+    // `CARGO_MANIFEST_DIR` are compile-time values, so unlike process
+    // environment they cannot redirect a built binary. Restrict the fallback
+    // to a direct binary or `deps/` artifact in the exact Cargo profile that
+    // produced this crate; a copied or installed binary must carry release
+    // metadata beside itself.
+    let profile = out_dir.ancestors().nth(3)?;
+    let profile = std::fs::canonicalize(profile).ok()?;
+    let relative = executable.strip_prefix(&profile).ok()?;
+    let mut components = relative.components();
+    let cargo_artifact = match (components.next(), components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None, None) => true,
+        (
+            Some(std::path::Component::Normal(directory)),
+            Some(std::path::Component::Normal(_)),
+            None,
+        ) => directory == OsStr::new("deps"),
+        _ => false,
+    };
+    if !cargo_artifact {
+        return None;
+    }
+    let manifest = std::fs::canonicalize(manifest_dir).ok()?;
+    source_root_shape(&manifest, require_public).then_some(manifest)
+}
+
+fn source_root_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "cannot resolve source root from executable",
+    )
+}
+
+#[cfg(any(target_os = "android", test))]
+fn process_executable_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "cannot resolve process executable",
+    )
+}
+
+#[cfg(any(target_os = "android", test))]
+fn process_executable_from(
+    current_exe: &Path,
+    argv0: Option<&OsStr>,
+    termux_executable: Option<&OsStr>,
+    system_linkers: &[&Path],
+) -> std::io::Result<PathBuf> {
+    let current_identity = match std::fs::canonicalize(current_exe) {
+        Ok(path) => path,
+        Err(_) => return Ok(current_exe.to_path_buf()),
+    };
+    let uses_system_linker = system_linkers.iter().any(|linker| {
+        std::fs::canonicalize(linker).is_ok_and(|identity| identity == current_identity)
+    });
+    if !uses_system_linker {
+        return Ok(current_exe.to_path_buf());
+    }
+
+    // In Termux's system-linker mode `/proc/self/exe` identifies Bionic's
+    // linker. The preload shim records the actual ELF in this variable, while
+    // Bionic independently presents that same loaded path as application
+    // `argv[0]`. Require both signals to agree so arbitrary ambient state can
+    // never select the checkout whose hook code Dot will execute.
+    let candidate = termux_executable
+        .filter(|path| !path.is_empty())
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(process_executable_error)?;
+    let argv0 = argv0
+        .filter(|path| !path.is_empty())
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(process_executable_error)?;
+    let candidate = std::fs::canonicalize(candidate).map_err(|_| process_executable_error())?;
+    let argv0 = std::fs::canonicalize(argv0).map_err(|_| process_executable_error())?;
+    if candidate != argv0 {
+        return Err(process_executable_error());
+    }
+    Ok(candidate)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_system_linkers() -> [&'static Path; 4] {
+    [
+        Path::new("/system/bin/linker"),
+        Path::new("/system/bin/linker64"),
+        Path::new("/apex/com.android.runtime/bin/linker"),
+        Path::new("/apex/com.android.runtime/bin/linker64"),
+    ]
+}
+
+pub(crate) fn process_executable(
+    argv0: Option<&OsStr>,
+    termux_executable: Option<&OsStr>,
+) -> std::io::Result<PathBuf> {
+    let executable = std::env::current_exe().map_err(|_| source_root_error())?;
+
+    #[cfg(target_os = "android")]
+    {
+        process_executable_from(
+            &executable,
+            argv0,
+            termux_executable,
+            &android_system_linkers(),
+        )
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (argv0, termux_executable);
+        Ok(executable)
+    }
+}
+
+pub(crate) fn process_source_root(executable: &Path) -> std::io::Result<PathBuf> {
+    executable_source_root(executable)
+}
+
+pub(crate) fn process_owner_root(executable: &Path) -> std::io::Result<PathBuf> {
+    executable_owner_root(executable)
+}
+
+pub(crate) fn informational_command(command: &[u8]) -> bool {
+    matches!(
+        command,
+        b"" | b"help" | b"-h" | b"--help" | b"version" | b"--version"
+    )
+}
+
+/// Resolve the selected Dot checkout for a trusted embedded runtime.
 ///
 /// `env_root` (explicit `DOT_SOURCE_ROOT`) wins verbatim when
 /// non-empty; otherwise the canonicalized `exe` path is walked up to
-/// the first ancestor holding `lib/dot/main.sh` (a binary installed
-/// as `<root>/bin/dot` answers exactly like the shell's
-/// `dirname …/../..` derivation); otherwise `cwd` applies.
+/// the first ancestor holding either native checkout metadata or native
+/// release metadata plus its public API directory; otherwise `cwd` applies.
 pub fn resolve_source_root(exe: &Path, env_root: Option<&OsStr>, cwd: &Path) -> PathBuf {
     if let Some(root) = env_root {
         if !root.is_empty() {
             return PathBuf::from(root);
         }
     }
-    if let Ok(canonical) = std::fs::canonicalize(exe) {
-        for ancestor in canonical.ancestors() {
-            if ancestor.join("lib/dot/main.sh").is_file() {
-                return ancestor.to_path_buf();
-            }
-        }
+    if let Ok(root) = executable_source_root(exe) {
+        return root;
     }
     cwd.to_path_buf()
-}
-
-/// Resolve the checkout from ambient process state: `DOT_SOURCE_ROOT`
-///, the current executable, and the working directory, in the
-/// [`resolve_source_root`] precedence. Unresolvable pieces degrade to
-/// inert placeholders (never an error: the re-exec probe then reports
-/// `<missing>` and config resolution falls back exactly like the
-/// shell's `${DOT_SOURCE_ROOT:-$PWD}`).
-pub fn ambient_source_root() -> PathBuf {
-    let env_root = std::env::var_os("DOT_SOURCE_ROOT");
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/nonexistent-dot-exe"));
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    resolve_source_root(&exe, env_root.as_deref(), &cwd)
 }
 
 /// Read the observed checkout revision: `git rev-parse HEAD` bound to
@@ -107,6 +289,54 @@ pub fn observed_revision(source_root: &Path) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Resolve the immutable revision associated with a checkout or packaged
+/// release. Development checkouts retain Git as their authority. A packaged
+/// runtime has no `.git`, so its signed archive metadata must agree with the
+/// commit compiled into the executable before that identity is accepted.
+pub(crate) fn source_revision(source_root: &Path) -> Option<String> {
+    observed_revision(source_root).or_else(|| release_revision(source_root))
+}
+
+fn release_revision(source_root: &Path) -> Option<String> {
+    let commit = crate::version::COMMIT;
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let metadata = source_root.join(".dot-install.json");
+    let kind = std::fs::symlink_metadata(&metadata).ok()?.file_type();
+    if !kind.is_file() || kind.is_symlink() {
+        return None;
+    }
+    let body = std::fs::read_to_string(metadata).ok()?;
+    let mut found = None;
+    for line in body.lines() {
+        let Some(rest) = line.trim().strip_prefix("\"commit\"") else {
+            continue;
+        };
+        let value = rest.trim_start().strip_prefix(':')?.trim();
+        let value = value.strip_suffix(',').unwrap_or(value).trim();
+        let value = value.strip_prefix('"')?.strip_suffix('"')?;
+        if found.replace(value).is_some() {
+            return None;
+        }
+    }
+    (found == Some(commit)).then(|| commit.to_string())
+}
+
+/// Return the packaged native entry only when the release metadata matches this
+/// build and the payload is a real executable file.
+pub(crate) fn release_binary(source_root: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    release_revision(source_root)?;
+    let binary = source_root.join("dot");
+    let metadata = std::fs::symlink_metadata(&binary).ok()?;
+    (metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.permissions().mode() & 0o111 != 0)
+        .then_some(binary)
 }
 
 /// Decide the re-exec guard over explicit revisions.
@@ -217,10 +447,8 @@ impl Failure {
     }
 }
 
-/// Run the startup prelude in shell order: re-exec guard first (exit
-/// 1), then default config load (exit 2). The returned config is for
-/// future slices; `cli::run` discards it so wired commands cannot
-/// observe a difference whenever config loads.
+/// Run the startup prelude in shell order: re-exec guard first (exit 1), then
+/// default config load (exit 2). Native dispatch consumes the returned config.
 pub fn preflight(inputs: &Inputs<'_>) -> Result<Config, Failure> {
     let observed = observed_revision(inputs.source_root);
     if let Err(line) = check_reexec_revision(inputs.reexec_expected, observed.as_deref()) {
@@ -232,30 +460,263 @@ pub fn preflight(inputs: &Inputs<'_>) -> Result<Config, Failure> {
     }
 }
 
-/// Run [`preflight`] against ambient process state (`HOME`,
-/// `XDG_CONFIG_HOME`, `DOT_SHDEPS_UPDATE_POLICY`,
-/// `DOT_REEXEC_EXPECTED_REVISION`, and the [`ambient_source_root`]
-/// checkout). The single-flight command entry path, like the shell's
-/// own exports.
+/// Run [`preflight`] against an immutable invocation runtime.
+pub fn check(runtime: &crate::app::Runtime) -> Result<Config, Failure> {
+    check_reexec(runtime)?;
+    let home = runtime
+        .value("HOME")
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    let xdg_config_home = runtime
+        .value("XDG_CONFIG_HOME")
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    let env_policy = runtime
+        .value("DOT_SHDEPS_UPDATE_POLICY")
+        .and_then(OsStr::to_str);
+    load_default_config(home, xdg_config_home, env_policy).map_err(|line| Failure::Config { line })
+}
+
+/// Validate the provider re-exec generation before any command dispatch.
+/// Help and version deliberately stop after this guard, matching the shell
+/// entry point which does not load user configuration for informational output.
+pub(crate) fn check_reexec(runtime: &crate::app::Runtime) -> Result<(), Failure> {
+    let expected = runtime
+        .value("DOT_REEXEC_EXPECTED_REVISION")
+        .and_then(OsStr::to_str);
+    let observed = observed_revision(runtime.source_root());
+    check_reexec_revision(expected, observed.as_deref()).map_err(|line| Failure::Reexec { line })
+}
+
+/// Run [`check`] against a one-time snapshot of the ambient process state.
+///
+/// Compatibility-only native callers use this adapter; command dispatch enters
+/// through [`crate::app`] with an explicit snapshot.
 pub fn check_ambient() -> Result<Config, Failure> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let xdg_config_home = std::env::var("XDG_CONFIG_HOME").unwrap_or_default();
-    let env_policy = std::env::var("DOT_SHDEPS_UPDATE_POLICY").ok();
-    let reexec_expected = std::env::var("DOT_REEXEC_EXPECTED_REVISION").ok();
-    let root = ambient_source_root();
-    let inputs = Inputs {
-        home: &home,
-        xdg_config_home: &xdg_config_home,
-        env_policy: env_policy.as_deref(),
-        reexec_expected: reexec_expected.as_deref(),
-        source_root: &root,
-    };
-    preflight(&inputs)
+    let env = std::env::vars_os().collect();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let runtime = crate::app::Runtime::from_env(&env, &cwd)
+        .expect("the current directory fallback is absolute");
+    check(&runtime)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dot_test_support::TempDir;
+
+    fn executable_fixture(root: &Path, relative: &str) -> PathBuf {
+        let executable = root.join(relative);
+        std::fs::create_dir_all(executable.parent().expect("executable parent"))
+            .expect("executable parent");
+        std::fs::write(&executable, b"fixture executable").expect("executable fixture");
+        executable
+    }
+
+    #[test]
+    fn ordinary_process_ignores_termux_executable_override() {
+        let scratch = TempDir::new("ordinary-process-executable").expect("scratch");
+        let current = executable_fixture(scratch.path(), "bin/dot");
+        let hostile = executable_fixture(scratch.path(), "hostile/dot");
+
+        assert_eq!(
+            process_executable_from(
+                &current,
+                Some(hostile.as_os_str()),
+                Some(hostile.as_os_str()),
+                &[],
+            )
+            .expect("ordinary executable"),
+            current
+        );
+    }
+
+    #[test]
+    fn android_system_linker_inventory_covers_legacy_and_apex_paths() {
+        assert_eq!(
+            android_system_linkers(),
+            [
+                Path::new("/system/bin/linker"),
+                Path::new("/system/bin/linker64"),
+                Path::new("/apex/com.android.runtime/bin/linker"),
+                Path::new("/apex/com.android.runtime/bin/linker64"),
+            ]
+        );
+    }
+
+    #[test]
+    fn linker_name_outside_android_system_paths_is_not_trusted() {
+        let scratch = TempDir::new("untrusted-linker-name").expect("scratch");
+        let current = executable_fixture(scratch.path(), "attacker/linker64");
+        let candidate = executable_fixture(scratch.path(), "release/dot");
+        let trusted_linker = executable_fixture(scratch.path(), "system/bin/linker64");
+
+        assert_eq!(
+            process_executable_from(
+                &current,
+                Some(candidate.as_os_str()),
+                Some(candidate.as_os_str()),
+                &[trusted_linker.as_path()],
+            )
+            .expect("ordinary executable"),
+            current
+        );
+    }
+
+    #[test]
+    fn android_linker_accepts_matching_absolute_termux_executable() {
+        let scratch = TempDir::new("termux-process-executable").expect("scratch");
+        let linker = executable_fixture(scratch.path(), "system/bin/linker64");
+        let candidate = executable_fixture(scratch.path(), "release/dot");
+
+        assert_eq!(
+            process_executable_from(
+                &linker,
+                Some(candidate.as_os_str()),
+                Some(candidate.as_os_str()),
+                &[linker.as_path()],
+            )
+            .expect("Termux executable"),
+            candidate.canonicalize().expect("canonical candidate")
+        );
+    }
+
+    #[test]
+    fn android_linker_rejects_missing_termux_executable() {
+        let scratch = TempDir::new("termux-missing-executable").expect("scratch");
+        let linker = executable_fixture(scratch.path(), "system/bin/linker64");
+
+        let error = process_executable_from(
+            &linker,
+            Some(OsStr::new("/actual/dot")),
+            None,
+            &[linker.as_path()],
+        )
+        .expect_err("missing Termux identity must fail closed");
+        assert_eq!(error.to_string(), "cannot resolve process executable");
+    }
+
+    #[test]
+    fn android_linker_rejects_missing_argv0_identity() {
+        let scratch = TempDir::new("termux-missing-argv0").expect("scratch");
+        let linker = executable_fixture(scratch.path(), "system/bin/linker64");
+        let candidate = executable_fixture(scratch.path(), "release/dot");
+
+        let error = process_executable_from(
+            &linker,
+            None,
+            Some(candidate.as_os_str()),
+            &[linker.as_path()],
+        )
+        .expect_err("missing argv0 identity must fail closed");
+        assert_eq!(error.to_string(), "cannot resolve process executable");
+    }
+
+    #[test]
+    fn android_linker_rejects_empty_termux_executable() {
+        let scratch = TempDir::new("termux-empty-executable").expect("scratch");
+        let linker = executable_fixture(scratch.path(), "system/bin/linker64");
+
+        let error = process_executable_from(
+            &linker,
+            Some(OsStr::new("/actual/dot")),
+            Some(OsStr::new("")),
+            &[linker.as_path()],
+        )
+        .expect_err("empty Termux identity must fail closed");
+        assert_eq!(error.to_string(), "cannot resolve process executable");
+    }
+
+    #[test]
+    fn android_linker_rejects_relative_termux_executable() {
+        let scratch = TempDir::new("termux-relative-executable").expect("scratch");
+        let linker = executable_fixture(scratch.path(), "system/bin/linker64");
+        let candidate = executable_fixture(scratch.path(), "release/dot");
+
+        let error = process_executable_from(
+            &linker,
+            Some(candidate.as_os_str()),
+            Some(OsStr::new("relative/dot")),
+            &[linker.as_path()],
+        )
+        .expect_err("relative Termux identity must fail closed");
+        assert_eq!(error.to_string(), "cannot resolve process executable");
+    }
+
+    #[test]
+    fn android_linker_rejects_relative_argv0_identity() {
+        let scratch = TempDir::new("termux-relative-argv0").expect("scratch");
+        let linker = executable_fixture(scratch.path(), "system/bin/linker64");
+        let candidate = executable_fixture(scratch.path(), "release/dot");
+
+        let error = process_executable_from(
+            &linker,
+            Some(OsStr::new("relative/dot")),
+            Some(candidate.as_os_str()),
+            &[linker.as_path()],
+        )
+        .expect_err("relative argv0 identity must fail closed");
+        assert_eq!(error.to_string(), "cannot resolve process executable");
+    }
+
+    #[test]
+    fn android_linker_rejects_nonexistent_termux_executable() {
+        let scratch = TempDir::new("termux-nonexistent-executable").expect("scratch");
+        let linker = executable_fixture(scratch.path(), "system/bin/linker64");
+        let missing = scratch.path().join("missing/dot");
+
+        let error = process_executable_from(
+            &linker,
+            Some(missing.as_os_str()),
+            Some(missing.as_os_str()),
+            &[linker.as_path()],
+        )
+        .expect_err("nonexistent Termux identity must fail closed");
+        assert_eq!(error.to_string(), "cannot resolve process executable");
+    }
+
+    #[test]
+    fn android_linker_rejects_mismatched_argv0() {
+        let scratch = TempDir::new("termux-mismatched-executable").expect("scratch");
+        let linker = executable_fixture(scratch.path(), "system/bin/linker64");
+        let candidate = executable_fixture(scratch.path(), "release/dot");
+        let other = executable_fixture(scratch.path(), "other/dot");
+
+        let error = process_executable_from(
+            &linker,
+            Some(other.as_os_str()),
+            Some(candidate.as_os_str()),
+            &[linker.as_path()],
+        )
+        .expect_err("mismatched executable identities must fail closed");
+        assert_eq!(error.to_string(), "cannot resolve process executable");
+    }
+
+    #[test]
+    fn android_linker_accepts_canonically_matching_symlink_spellings() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = TempDir::new("termux-symlink-executable").expect("scratch");
+        let linker = executable_fixture(scratch.path(), "apex/linker64");
+        let linker_alias = scratch.path().join("system/bin/linker64");
+        std::fs::create_dir_all(linker_alias.parent().expect("linker alias parent"))
+            .expect("linker alias parent");
+        symlink(&linker, &linker_alias).expect("linker alias");
+        let candidate = executable_fixture(scratch.path(), "release/dot");
+        let candidate_alias = scratch.path().join("release/dot-link");
+        symlink(&candidate, &candidate_alias).expect("candidate alias");
+
+        assert_eq!(
+            process_executable_from(
+                &linker_alias,
+                Some(candidate_alias.as_os_str()),
+                Some(candidate.as_os_str()),
+                &[linker.as_path()],
+            )
+            .expect("matching canonical identities"),
+            candidate.canonicalize().expect("canonical candidate")
+        );
+    }
 
     #[test]
     fn umask_ceiling_ors_group_and_other_write() {
@@ -330,6 +791,41 @@ mod tests {
         assert_eq!(
             resolve_source_root(Path::new("/nonexistent/exe"), None, Path::new("/fallback")),
             PathBuf::from("/fallback")
+        );
+    }
+
+    #[test]
+    fn cargo_source_root_is_limited_to_its_compiled_profile() {
+        let scratch = TempDir::new("cargo-source-root").expect("scratch");
+        let manifest = scratch.path().join("checkout");
+        let decoy = scratch.path().join("decoy-checkout");
+        let profile = decoy.join("external-target/debug");
+        let out_dir = profile.join("build/dot-fixture/out");
+        let executable = profile.join("deps/dot-fixture");
+        let copied = scratch.path().join("copied-dot");
+        std::fs::create_dir_all(manifest.join("lib/dot/public")).expect("public API");
+        std::fs::write(manifest.join("Cargo.toml"), b"[package]\n").expect("manifest");
+        std::fs::create_dir_all(decoy.join("lib/dot/public")).expect("decoy public API");
+        std::fs::write(decoy.join("Cargo.toml"), b"[package]\n").expect("decoy manifest");
+        std::fs::create_dir_all(&out_dir).expect("Cargo OUT_DIR");
+        std::fs::create_dir_all(executable.parent().expect("executable parent"))
+            .expect("profile deps");
+        std::fs::write(&executable, b"binary").expect("profile executable");
+        std::fs::write(&copied, b"binary").expect("copied executable");
+
+        let executable = executable.canonicalize().expect("canonical executable");
+        assert_eq!(
+            cargo_source_root_from(&executable, &out_dir, &manifest, true),
+            Some(manifest.canonicalize().expect("canonical manifest"))
+        );
+        assert_eq!(
+            source_root_from_canonical(&executable, &out_dir, &manifest, true),
+            Some(manifest.canonicalize().expect("canonical manifest")),
+            "compiled ownership must win over a surrounding checkout"
+        );
+        assert_eq!(
+            cargo_source_root_from(&copied, &out_dir, &manifest, true),
+            None
         );
     }
 

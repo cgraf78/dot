@@ -7,13 +7,9 @@
 //! before a sync, [`retire`] runs the entry points the new profile
 //! drops, and [`commit`] records the survivors for next time.
 //!
-//! The worker spawn itself (`_dot_extension_worker_run`) belongs to
-//! a later slice, so [`run_one`] takes execution as a [`WorkerRun`]
-//! seam: the ported plumbing (script resolution, scratch directory,
-//! authorization context, exit-code/output relay, warning routing,
-//! cleanup) is exact, and only the leaf process spawn is injected.
-//! Differential tests inject the live shell worker there, so the
-//! comparison still covers everything this module owns.
+//! [`run_one`] accepts a [`WorkerRun`] so process execution remains separate
+//! from lifecycle policy. Production supplies the hardened worker; tests supply
+//! deterministic fixtures.
 //!
 //! Like the earlier ports the library never prints: `_warn` lines go
 //! to the caller's `warnings` buffer through [`Log::warn`] (which
@@ -88,7 +84,7 @@ pub struct WorkerOutcome {
 
 /// Executes one validated deactivation script under the worker
 /// protocol: the `_dot_extension_worker_run` leaf that belongs to a
-/// later slice. Arguments mirror its call in [`run_one`]: the fixed
+/// native worker. Arguments mirror its call in [`run_one`]: the fixed
 /// entry-point script, the scratch directory, the `has-deactivate`
 /// result file inside it, and the minted context path plus token.
 pub trait WorkerRun {
@@ -409,6 +405,13 @@ pub struct PrepareInputs<'a> {
 /// on the success path), so even failing outcomes carry state the
 /// tests compare.
 pub struct Prepared {
+    /// Records loaded from the ledger before this prepare attempt.
+    ///
+    /// The shell keeps these as its prior lifecycle state until a successful
+    /// rewrite publishes the refreshed records. The update coordinator carries
+    /// both vectors explicitly so a later retire or rollback cannot observe a
+    /// partially refreshed ledger.
+    pub prior: Vec<String>,
     /// Records the shell global would hold.
     pub records: Vec<String>,
     /// Whether the shell returned exit 0.
@@ -432,6 +435,7 @@ pub struct Prepared {
 pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) -> Prepared {
     if !inputs.present {
         return Prepared {
+            prior: inputs.prior.to_vec(),
             records: inputs.prior.to_vec(),
             succeeded: true,
         };
@@ -446,6 +450,7 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
         &mut loaded,
     ) {
         return Prepared {
+            prior: loaded.clone(),
             records: loaded,
             succeeded: false,
         };
@@ -470,12 +475,14 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
                     ),
                 );
                 return Prepared {
+                    prior: loaded.clone(),
                     records: loaded,
                     succeeded: false,
                 };
             }
         }
         return Prepared {
+            prior: loaded.clone(),
             records: loaded,
             succeeded: true,
         };
@@ -491,6 +498,7 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
                 &format!("  warning: unsafe retiring overlay entrypoint: {name}"),
             );
             return Prepared {
+                prior: loaded.clone(),
                 records: loaded,
                 succeeded: false,
             };
@@ -511,6 +519,7 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
                         ),
                     );
                     return Prepared {
+                        prior: loaded.clone(),
                         records: loaded,
                         succeeded: false,
                     };
@@ -522,6 +531,7 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
                     &format!("  warning: unsafe profile deactivation entrypoint: {name}"),
                 );
                 return Prepared {
+                    prior: loaded.clone(),
                     records: loaded,
                     succeeded: false,
                 };
@@ -538,6 +548,7 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
         Some(path) if !path.as_os_str().is_empty() => path,
         _ => {
             return Prepared {
+                prior: loaded.clone(),
                 records: loaded,
                 succeeded: false,
             };
@@ -545,11 +556,13 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
     };
     if !write(ledger, &prepared, inputs.euid) {
         return Prepared {
+            prior: loaded.clone(),
             records: loaded,
             succeeded: false,
         };
     }
     Prepared {
+        prior: loaded,
         records: prepared,
         succeeded: true,
     }
@@ -623,9 +636,8 @@ pub fn commit(inputs: &CommitInputs<'_>) -> bool {
 }
 
 /// Inputs for [`run_one`]: the record to deactivate plus the
-/// runtime the worker needs. `tmpdir` is `${TMPDIR:-/tmp}`,
-/// `now_secs` the `date +%s` instant for context freshness, and
-/// `verbose` whether `DOT_VERBOSE` equals `1` (the `_log` quiet
+/// runtime the worker needs. `tmpdir` is `${TMPDIR:-/tmp}`, and `verbose`
+/// indicates whether `DOT_VERBOSE` equals `1` (the `_log` quiet
 /// gate itself lives in `log`, like the shell's `_log`).
 pub struct RunInputs<'a> {
     /// Ledger record to deactivate.
@@ -636,8 +648,6 @@ pub struct RunInputs<'a> {
     pub euid: u32,
     /// Scratch parent (`${TMPDIR:-/tmp}`).
     pub tmpdir: &'a Path,
-    /// Current time in epoch seconds.
-    pub now_secs: i64,
     /// `DOT_VERBOSE -eq 1`.
     pub verbose: bool,
     /// Logger for `_warn` lines and the verbose `_log` relay.
@@ -708,7 +718,7 @@ pub fn run_one(
         return 1;
     };
     let result_file = result_dir.join("has-deactivate");
-    let context = match crate::overlay_context::create(
+    let context = match crate::overlay_context::create_current(
         &result_dir,
         CONTEXT_MODE,
         CONTEXT_SET_KIND,
@@ -716,7 +726,6 @@ pub fn run_one(
         &[inputs.record.as_bytes().to_vec()],
         inputs.home,
         inputs.euid,
-        inputs.now_secs,
     ) {
         Ok((context, token)) => Some((context, token)),
         Err(_) => None,
@@ -769,8 +778,6 @@ pub struct RetireInputs<'a> {
     pub euid: u32,
     /// Scratch parent (`${TMPDIR:-/tmp}`).
     pub tmpdir: &'a Path,
-    /// Current time in epoch seconds.
-    pub now_secs: i64,
     /// `DOT_VERBOSE -eq 1`.
     pub verbose: bool,
     /// Logger for `_warn` lines and the verbose `_log` relay.
@@ -803,7 +810,6 @@ pub fn retire(
             home: inputs.home,
             euid: inputs.euid,
             tmpdir: inputs.tmpdir,
-            now_secs: inputs.now_secs,
             verbose: inputs.verbose,
             log: inputs.log,
         };
