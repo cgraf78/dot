@@ -30,7 +30,6 @@ pub mod init_client_adopt;
 pub mod init_client_candidate;
 pub mod init_client_command;
 pub mod init_client_delete;
-pub mod init_client_engine;
 pub mod init_client_entry;
 pub mod init_client_generation;
 pub mod init_client_git;
@@ -83,7 +82,6 @@ pub mod test_support;
 pub mod ui;
 pub mod update;
 pub mod update_lock;
-pub mod update_run;
 pub mod version;
 pub mod xdg;
 
