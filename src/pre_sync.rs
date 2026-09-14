@@ -1,13 +1,15 @@
 //! Client pre-sync extensions from `lib/dot/pre-sync.sh`.
 //!
-//! Owns pre-sync specification discovery (enumerate and validate the
+//! Ports `_dot_pre_sync_specs` (enumerate and validate the
 //! `pre-sync.d` entry points) and `_run_pre_sync_extensions` (run
 //! each entry point with a fresh one-use overlay context). The
-//! [`run`] takes process execution as a caller-supplied [`Runner`]
+//! shell's worker spawn (`_dot_extension_worker_run` from
+//! `extension-worker-launch.sh`) belongs to a later slice, so
+//! [`run`] takes the spawn as a caller-supplied [`Runner`]
 //! closure; everything around it — stage gate, spec enumeration,
 //! per-extension scratch directory plus `result` channel, context
 //! creation, the failure warning, and break-on-first-failure — is
-//! is owned here. Production supplies the hardened worker implementation.
+//! the port.
 //!
 //! Like the earlier ports the library never prints: spec identity
 //! failures carry the exact `dot: ...` line the shell emits, and
@@ -305,7 +307,8 @@ fn basename(path: &Path) -> String {
 /// `pre-sync`/`eligible` context. `records` are the
 /// `name|path|url|descriptor|optional|sync` rows sealed into
 /// each context; `scratch_root` is the `$TMPDIR` equivalent the
-/// shell's `mktemp -d` allocates under.
+/// shell's `mktemp -d` allocates under; `now_secs` is the
+/// `date +%s` instant.
 ///
 /// A failing worker records its warning, removes its scratch
 /// directory, and stops the run with status 1; a scratch
@@ -320,6 +323,7 @@ pub fn run(
     records: &[Vec<u8>],
     inputs: &Inputs,
     overlays: &[String],
+    now_secs: i64,
     scratch_root: &Path,
     runner: &mut Runner<'_>,
 ) -> Result<Outcome, Error> {
@@ -348,7 +352,7 @@ pub fn run(
         {
             return Err(Error::Refused);
         }
-        let (context, token) = match crate::overlay_context::create_current(
+        let (context, token) = match crate::overlay_context::create(
             &temporary,
             "pre-sync",
             "eligible",
@@ -356,6 +360,7 @@ pub fn run(
             records,
             &inputs.home,
             inputs.euid,
+            now_secs,
         ) {
             Ok(created) => created,
             Err(crate::overlay_context::Error::Invalid(message)) => {
