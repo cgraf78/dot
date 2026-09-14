@@ -18,6 +18,87 @@
 //! pure; production resolves it with [`resolve_palette`], tests with
 //! marker strings.
 
+/// One doctor result row, mirroring a single `_dr_*` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    /// Which `_dr_*` helper filed this row.
+    pub kind: Kind,
+    /// The message verbatim (`$1`), as bytes.
+    pub message: Vec<u8>,
+    /// The detail verbatim (`$2`), or `None` for one-argument calls.
+    pub detail: Option<Vec<u8>>,
+}
+
+impl Record {
+    /// Build a section record from the text-oriented check modules.
+    pub fn section(message: impl Into<String>) -> Self {
+        Self::text(Kind::Section, message, None)
+    }
+
+    /// Build a passing record from the text-oriented check modules.
+    pub fn ok(message: impl Into<String>, detail: Option<String>) -> Self {
+        Self::text(Kind::Ok, message, detail)
+    }
+
+    /// Build a warning record from the text-oriented check modules.
+    pub fn warn(message: impl Into<String>, detail: Option<String>) -> Self {
+        Self::text(Kind::Warn, message, detail)
+    }
+
+    /// Build a failing record from the text-oriented check modules.
+    pub fn fail(message: impl Into<String>, detail: Option<String>) -> Self {
+        Self::text(Kind::Fail, message, detail)
+    }
+
+    /// Build a skipped record from the text-oriented check modules.
+    pub fn skip(message: impl Into<String>, detail: Option<String>) -> Self {
+        Self::text(Kind::Skip, message, detail)
+    }
+
+    fn text(kind: Kind, message: impl Into<String>, detail: Option<String>) -> Self {
+        Self {
+            kind,
+            message: message.into().into_bytes(),
+            detail: detail.map(String::into_bytes),
+        }
+    }
+}
+
+/// The `_dr_*` helper family a [`Record`] was filed through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// `_dr_section`: a section title, never counted.
+    Section,
+    /// `_dr_ok`: a passing check, bumps the pass count.
+    Ok,
+    /// `_dr_warn`: a warning, bumps the warn count.
+    Warn,
+    /// `_dr_fail`: a failure, bumps the fail count.
+    Fail,
+    /// `_dr_skip`: a skipped check, never counted.
+    Skip,
+    /// An extension result kind that the public API does not define.
+    Unknown,
+}
+
+/// The `_DR_*_COUNT` aggregate counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Counts {
+    /// `_DR_PASS_COUNT`, incremented by [`ok`].
+    pub pass: u64,
+    /// `_DR_WARN_COUNT`, incremented by [`warn`].
+    pub warn: u64,
+    /// `_DR_FAIL_COUNT`, incremented by [`fail`].
+    pub fail: u64,
+}
+
+impl Counts {
+    /// Zeroed counters, like a freshly sourced `runtime.sh`.
+    pub fn new() -> Self {
+        Counts::default()
+    }
+}
+
 /// The six `_DR_*` color slots from `lib/dot/doctor/runtime.sh`,
 /// resolved by the caller (empty under pipes, ANSI escapes on a
 /// color terminal).
@@ -77,28 +158,36 @@ pub fn resolve_palette(stdout_is_tty: bool, no_color: Option<&str>) -> Palette {
     }
 }
 
-/// The `_DR_*_COUNT` aggregate counters. Section modules report
-/// through [`ok`], [`warn`], and [`fail`]; [`skip`] and [`section`]
-/// leave the counts alone, exactly like the shell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Counts {
-    /// `_DR_PASS_COUNT`, incremented by [`ok`].
-    pub pass: u64,
-    /// `_DR_WARN_COUNT`, incremented by [`warn`].
-    pub warn: u64,
-    /// `_DR_FAIL_COUNT`, incremented by [`fail`].
-    pub fail: u64,
-}
-
-impl Counts {
-    /// Zeroed counters, like a freshly sourced `runtime.sh`.
-    pub fn new() -> Self {
-        Counts {
-            pass: 0,
-            warn: 0,
-            fail: 0,
-        }
+/// Render canonical records with one palette and one counts model.
+pub fn render(records: &[Record], palette: &Palette) -> Vec<u8> {
+    let mut counts = Counts::new();
+    let mut out = Vec::new();
+    for record in records {
+        let row = match record.kind {
+            Kind::Section => section(palette, &record.message),
+            Kind::Ok => ok(
+                &mut counts,
+                palette,
+                &record.message,
+                record.detail.as_deref(),
+            ),
+            Kind::Warn => warn(
+                &mut counts,
+                palette,
+                &record.message,
+                record.detail.as_deref(),
+            ),
+            Kind::Fail | Kind::Unknown => fail(
+                &mut counts,
+                palette,
+                &record.message,
+                record.detail.as_deref(),
+            ),
+            Kind::Skip => skip(palette, &record.message, record.detail.as_deref()),
+        };
+        out.extend_from_slice(&row);
     }
+    out
 }
 
 /// `_dr_ok`: `  ✓ message [ (detail)]`, then the pass count goes up

@@ -136,6 +136,41 @@ tests; the binary is still not on PATH and no shell behavior changed):
 
 ## 6. Non-contract (explicitly out of slice 1)
 
+## Native test supervisor (completion Task 10)
+
+The Rust `test` command owns arguments, inspect-mode resolution, source-home
+authority, trusted suite discovery, scheduling, result classification, output,
+timeouts and cancellation. It never loads `lib/dot/test.sh` or its stage files.
+Those files remain the shell oracle until the shell launcher cutover; the public
+`test-reporter-v1` and `test-timeout-v1` interfaces remain unchanged for external
+suites. The native scheduler does not execute the timeout helper.
+
+Source authority requires both the configured base Git common directory and
+Git's registration of the exact source worktree. The actual invocation HOME is
+the trust anchor; caller-supplied host metadata cannot replace it. Source-path
+comparisons retain Unix bytes. Shared client identity selection belongs to
+`repos_base`, and executable lookup belongs to the immutable `Runtime`.
+
+Each suite receives closed stdin, private cache/state/temp paths, and its own
+session. The supervisor observes child exit without reaping the leader until
+owned descendants have received TERM and, if necessary, KILL. Cancelling a
+worker wave uses one shared grace deadline. Independent CLI/embedded
+invocations run in separate processes and cannot share signal guards or roots.
+`app::run_direct` remains a single-process entry, not a concurrent embedding API.
+
+Coordinator-created result/output file handles remain authoritative throughout
+execution. Replacing their directory entries cannot redirect readers to FIFOs
+or foreign files. Suites write the supplied result file in place, as the public
+reporter does. Sequential output is streamed in bounded snapshots; parallel
+replay follows selected-suite order. Wall-clock marks and already-parallel
+completion order retain the existing parity exclusions.
+
+The only added dependency is `libc`, for POSIX operations absent from std:
+signal handling/delivery, session identity, and `waitid(WNOWAIT)`. Unsafe calls
+are centralized in `cleanup`; std owns Command/Child, file I/O and reaping.
+
+## Slice 1 exclusions (historical)
+
 Config parsing, XDG resolution, update pipeline, extension workers,
 providers, doctor/test/init commands, `bin/dot` cutover, release
 workflow, man pages, shell completions. Each gets its own spec section
