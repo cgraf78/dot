@@ -20,9 +20,9 @@
 //! lane, and the exclusive move (`_dot_move_noreplace`) in
 //! [`crate::temp`]. None of those are merged here, so every one
 //! crosses as a closure on [`GitStageDeps`]. The candidate-match
-//! neighbor at line 872 stays for its own later slice.
+//! candidate matching remains owned by `init_client_candidate`.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the run identity from the
@@ -63,34 +63,34 @@ use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::errors::{Error, Result};
 
 /// Private-directory provision: the transaction lane's
 /// `_dot_init_private_directory` (`mkdir -p` plus the real-directory
-/// gate plus `chmod 0700`), injected because that lane is unmerged.
+/// gate plus `chmod 0700`), injected to keep transaction policy separate.
 pub type EnsurePrivateDir<'a> = dyn Fn(&Path) -> Result<()> + 'a;
 
 /// Generation check: the generation lane's
 /// `_dot_init_generation_matches` (generation marker plus branch-tip
-/// comparison), injected because that lane is unmerged. Answers
+/// comparison), injected to keep generation policy separate. Answers
 /// false for every refusal, like the shell's `return 1`.
 pub type GenerationMatches<'a> = dyn Fn(&Path) -> bool + 'a;
 
 /// Metadata-modes walk: `_dot_init_configure_git_metadata_modes`
 /// (`core.sharedRepository` plus the owner-only metadata walk),
-/// injected because its lane is unmerged.
+/// injected to keep record persistence separate.
 pub type ConfigureMetadataModes<'a> = dyn Fn(&Path) -> Result<()> + 'a;
 
 /// Git identity capture: the identity lane's
 /// `_dot_init_set_git_identity` (resolves the git directory's device
-/// and inode into the run), injected because that lane is unmerged.
+/// and inode into the run), injected to keep identity capture separate.
 pub type SetGitIdentity<'a> = dyn Fn(&Path) -> Result<()> + 'a;
 
 /// Generation-marker writer: the generation lane's
 /// `_dot_init_write_generation_marker`, injected because that lane
-/// is unmerged.
+/// stays behind the dependency boundary.
 pub type WriteGenerationMarker<'a> = dyn Fn(&Path) -> Result<()> + 'a;
 
 /// Exclusive move: `_dot_move_noreplace` (the [`crate::temp`] move
@@ -263,7 +263,7 @@ fn command_output(body: Vec<u8>) -> Vec<u8> {
 /// controlling terminal, output captured and discarded (every call
 /// site here is quiet on success; failures surface as the status).
 fn git(home: &Path, args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
-    let mut command = Command::new("git");
+    let mut command = crate::init_client_identity::host_git_command();
     command
         .args(args)
         .env("LC_ALL", "C")

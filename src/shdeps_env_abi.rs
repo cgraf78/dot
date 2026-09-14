@@ -1,5 +1,4 @@
-//! Shdeps provider environment and bounded ABI probe, part 3 of
-//! `lib/dot/providers/shdeps.sh`.
+//! Shdeps provider environment and bounded ABI probe.
 //!
 //! This family prepares the process the Shdeps bootstrap runs in and
 //! probes the provider binary it selects: the caller-policy restore
@@ -7,18 +6,10 @@
 //! (`_dot_shdeps_configure_env`), the synchronous bounded runner
 //! (`_dot_shdeps_run_bounded`), and the ABI probe plus its comparison
 //! (`_dot_shdeps_binary_abi_version`, `_dot_shdeps_binary_abi`).
-//! Part 1 (the lock reader and installer trust predicates) lives on
-//! the unmerged `rust-port-slice-37` lane and part 2 (the re-exec
-//! checkpoint record) on `rust-port-slice-40`; this module stacks
-//! beside them once all land, which is why the ABI comparison takes
-//! its expected value as a parameter instead of re-reading the lock.
-//!
-//! Later lanes own the remainder: installer selection
-//! (`_dot_shdeps_development_checkout_valid`, `_dot_shdeps_installer`),
-//! the bootstrap download (`_dot_shdeps_download_installer`), the
-//! provider orchestration (`_ensure_shdeps`), and the re-exec itself
-//! (`_dot_provider_maybe_reexec`, which ends in `exec` and needs an
-//! interpreter decision this layer never makes).
+//! The ABI comparison accepts the expected value explicitly so this module does
+//! not duplicate the lock reader owned by [`crate::shdeps`]. Provider selection,
+//! bootstrap, and re-exec orchestration live in the private
+//! `shdeps_provider` coordinator.
 //!
 //! Engine boundaries: every shell `_warn` diagnostic folds into the
 //! status or `None` refusal, like parts 1 and 2 folded theirs —

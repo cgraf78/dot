@@ -17,12 +17,12 @@ use dot::ui::{Renderer, color_hex, hex_to_rgb, summary_box, title};
 static SPAWN_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Oracle interpreter, shared with the other differential harnesses (see
-/// `dot::test_support::bash`): the child environment overrides PATH (to
+/// `dot_test_support::bash`): the child environment overrides PATH (to
 /// neutralize `gum`), so the interpreter is resolved from the parent
 /// PATH before spawning — fixed `/usr/bin`/`/bin` candidates would pin
 /// the macOS 3.2 trampoline instead of the engine runtime.
 fn bash_bin() -> &'static std::path::Path {
-    dot::test_support::bash()
+    dot_test_support::bash()
 }
 
 /// Run one shell UI function with piped stdout (never a tty) and empty
@@ -135,11 +135,11 @@ fn rust_matches_shell_on_ui_matrix() {
 fn gum_branch_invokes_identical_argv() {
     use std::os::unix::fs::PermissionsExt;
 
-    // Exec-capable scratch (see `dot::test_support::TempDir::new_exec`):
+    // Exec-capable scratch (see `dot_test_support::TempDir::new_exec`):
     // the fixture must RUN (the shell's `style --help` gate), and the
     // system temp dir is `noexec` on some CI images. The guard removes
     // it on drop.
-    let scratch = dot::test_support::TempDir::new_exec("ui-gum").expect("fixture dir");
+    let scratch = dot_test_support::TempDir::new_exec("ui-gum").expect("fixture dir");
     let dir = scratch.path();
     let log = dir.join("argv.log");
     let fixture = dir.join("gum");

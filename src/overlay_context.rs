@@ -1,11 +1,11 @@
-//! One-use authorization contexts for isolated workers (slice 9).
+//! One-use authorization contexts for isolated workers.
 //!
-//! Ports `lib/dot/overlay-context.sh`: the shared field gate, path
+//! Owns the shared field gate, path
 //! and record validators, the mode/set/stage matrix, random tokens,
 //! and NUL-framed context file creation and single-use consumption
 //! with open-descriptor TOCTOU checks.
 //!
-//! Like the earlier ports the library never prints: failures carry
+//! The library never prints: failures carry
 //! the message the shell emits after `dot: overlay context: `, and
 //! message-less shell `return 1` paths surface as
 //! [`Error::Refused`]. `stat`-based identity uses
@@ -448,6 +448,32 @@ pub fn create(
         return Err(Error::Refused);
     }
     Ok((path, token))
+}
+
+/// Create a context using the clock at the authorization boundary.
+///
+/// Update stages may begin minutes before a hook runs. Production callers use
+/// this entry point so display timestamps cannot accidentally become security
+/// timestamps; [`create`] retains its explicit clock for deterministic protocol
+/// tests.
+pub fn create_current(
+    directory: &Path,
+    mode: &str,
+    set_kind: &str,
+    stage: &str,
+    records: &[Vec<u8>],
+    home: &str,
+    euid: u32,
+) -> Result<(PathBuf, String), Error> {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Error::Refused)?
+        .as_secs()
+        .try_into()
+        .map_err(|_| Error::Refused)?;
+    create(
+        directory, mode, set_kind, stage, records, home, euid, now_secs,
+    )
 }
 
 /// Whether `token` matches the `^[0-9a-f]{64}$` gate the shell

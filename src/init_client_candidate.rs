@@ -1,25 +1,16 @@
 //! Candidate enumeration, live snapshots, and conflict planning for
 //! `lib/dot/init-client.sh`.
 //!
-//! The shell file holds 79 functions — too big for one lane — so this
-//! module owns only the seven planning primitives from
+//! This module owns the planning primitives from
 //! `_dot_init_symlink_blob_safe` through
 //! `_dot_init_build_prior_and_conflicts`: the symlink-blob byte gate,
 //! the candidate-tree writer, the per-path candidate matcher, the
 //! live-filesystem snapshot probe and its recheck, the conflict-root
-//! walk, and the prior/conflicts publisher. The file-generic
-//! `_dot_init_error` diagnostic stays unported (a bare
-//! `printf ... >&2; return 1` with no family state, absorbed into
-//! [`Result`] the way earlier slices absorb engine diagnostics). The
-//! transaction-directory lifecycle lives on `rust-port-slice-35`
-//! (`init_client_transaction`), the host-git identity family on
-//! `rust-port-slice-41` (`init_client_identity`), the git-generation
-//! binding on `rust-port-slice-43` (`init_client_generation`), the
-//! per-entry staging family on `rust-port-slice-46`
-//! (`init_client_entry`), and the record, git-staging, publish,
-//! delete, and rollback families stay for later slices.
+//! walk, and the prior/conflicts publisher. Transaction, identity,
+//! generation, entry staging, record, git-staging, publish,
+//! delete, and rollback families live in adjacent native modules.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the client root from `HOME`, the
@@ -41,7 +32,7 @@
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::errors::{Error, Result};
 use crate::repos_overlays::init_safe_relative_path;
@@ -151,7 +142,7 @@ fn home_join(home: &str, relative: &str) -> PathBuf {
 /// silenced (the `candidate_matches` precedent; the tree scan's
 /// unredirected fd 2 is an unobservable sink in tests).
 fn run_repo_git(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new("git")
+    let output = crate::init_client_identity::host_git_command()
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -173,7 +164,7 @@ fn run_repo_git(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
 /// flags the shell's combined call uses. `None` when git fails.
 fn hash_stdin_bytes(payload: &[u8]) -> Option<String> {
     use std::io::Write as _;
-    let mut child = Command::new("git")
+    let mut child = crate::init_client_identity::host_git_command()
         .args(["hash-object", "--no-filters", "--stdin"])
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())
@@ -199,7 +190,7 @@ fn hash_stdin_bytes(payload: &[u8]) -> Option<String> {
 /// shell), so non-UTF8 names hash exactly like the shell's.
 /// `None` when git fails.
 fn hash_live_file(path: &Path) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::init_client_identity::host_git_command()
         .args(["hash-object", "--no-filters", "--"])
         .arg(path.as_os_str())
         .env("LC_ALL", "C")

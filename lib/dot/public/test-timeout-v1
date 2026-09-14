@@ -15,12 +15,8 @@ from types import FrameType
 
 process: subprocess.Popen | None = None
 interrupted_signal: int | None = None
-handled_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+handled_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 PROCESS_SNAPSHOT_TIMEOUT_SECONDS = 1
-
-
-class ForwardedSignal(Exception):
-    """Indicate that the supervisor received a cancellation signal."""
 
 
 def parse_timeout(value: str) -> float:
@@ -36,11 +32,17 @@ def parse_timeout(value: str) -> float:
 
 
 def capture_signal(signum: int, _frame: FrameType | None) -> None:
-    """Record cancellation and interrupt a blocking wait once a child exists."""
+    """Record the first cancellation signal for the polling owner."""
     global interrupted_signal
-    interrupted_signal = signum
-    if process is not None:
-        raise ForwardedSignal
+    if interrupted_signal is None:
+        interrupted_signal = signum
+
+
+def finish(status: int) -> int:
+    """Close signal ownership and return the first signal or fallback status."""
+    for handled_signal in handled_signals:
+        signal.signal(handled_signal, signal.SIG_IGN)
+    return 128 + interrupted_signal if interrupted_signal is not None else status
 
 
 def mark_timeout_expired() -> None:
@@ -149,8 +151,7 @@ def list_session_pids(session_id: int) -> list[int] | None:
 def stop_process_group(first_signal: int) -> None:
     """Stop the entire child session, then reap its leader."""
     assert process is not None
-    for handled_signal in handled_signals:
-        signal.signal(handled_signal, signal.SIG_IGN)
+    known_session_pids: set[int] = set()
 
     def send_process_group_signal(signum: int) -> bool:
         """Signal the original process group when session enumeration is unavailable."""
@@ -178,11 +179,27 @@ def stop_process_group(first_signal: int) -> None:
     def send_signal(signum: int) -> bool:
         """Signal revalidated members of the child session."""
         pids = list_session_pids(process.pid)
-        if pids is None:
-            return send_process_group_signal(signum)
+        if pids is not None:
+            # Preserve every observed member across the grace interval. The
+            # leader can exit before the final snapshot, and a transient
+            # enumeration failure must not strand an escaped descendant that
+            # was already known to belong to this session.
+            known_session_pids.update(pids)
+
+        # Final KILL always covers the still-owned original group after the
+        # snapshot. That closes the interval in which a TERM trap can create a
+        # same-group child too late to appear in the PID list. An unavailable
+        # snapshot needs the same fallback for every signal. Do this before
+        # direct delivery: killing a cached leader first would make the safe
+        # group-ownership check fail. Revalidated session members below still
+        # cover descendants that escaped the original process group.
+        group_attempted = signum == signal.SIGKILL or pids is None
+        group_signaled = False
+        if group_attempted:
+            group_signaled = send_process_group_signal(signum)
 
         found_member = False
-        for pid in pids:
+        for pid in sorted(known_session_pids):
             try:
                 # The snapshot is only a candidate. Re-check the SID
                 # immediately before signaling to reduce the PID-reuse window.
@@ -192,13 +209,13 @@ def stop_process_group(first_signal: int) -> None:
                 os.kill(pid, signum)
             except (PermissionError, ProcessLookupError):
                 pass
-        if found_member:
+        if found_member or group_signaled:
             return True
 
         # A portable PID snapshot can race with a still-running leader. The
         # original process group remains a safe fallback because this wrapper
         # created that leader and session itself.
-        if process.poll() is None:
+        if not group_attempted and process.poll() is None:
             return send_process_group_signal(signum)
         return False
 
@@ -233,25 +250,32 @@ def main(argv: Sequence[str]) -> int:
     try:
         process = subprocess.Popen(argv[2:], start_new_session=True, env=child_env)
     except FileNotFoundError:
-        return 127
+        return finish(127)
     except OSError:
-        return 126
+        return finish(126)
 
-    try:
+    deadline = time.monotonic() + timeout
+    while True:
         if interrupted_signal is not None:
-            raise ForwardedSignal
-        status = process.wait(timeout=timeout)
-    except ForwardedSignal:
-        assert interrupted_signal is not None
+            stop_process_group(interrupted_signal)
+            return finish(128 + interrupted_signal)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            mark_timeout_expired()
+            stop_process_group(signal.SIGTERM)
+            return finish(124)
+        try:
+            status = process.wait(timeout=min(remaining, 0.05))
+            break
+        except subprocess.TimeoutExpired:
+            pass
+
+    if interrupted_signal is not None:
         stop_process_group(interrupted_signal)
-        return 128 + interrupted_signal
-    except subprocess.TimeoutExpired:
-        mark_timeout_expired()
-        stop_process_group(signal.SIGTERM)
-        return 124
+        return finish(128 + interrupted_signal)
 
     stop_process_group(signal.SIGTERM)
-    return status if status >= 0 else 128 - status
+    return finish(status if status >= 0 else 128 - status)
 
 
 if __name__ == "__main__":
