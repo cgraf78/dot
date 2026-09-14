@@ -4,33 +4,22 @@
 //! gate, identity/branch resolution, and the transaction
 //! recover/resume sequencing.
 //!
-//! The shell file holds 79 functions — too big for one lane — so
-//! this module owns only the command entry point through the
-//! live-transaction resume (`return 0` at line 1870). Everything
-//! from the completed-file branch on (lines 1872+) arrives through
-//! the [`CommandEngine::fresh`] continuation, owned by a later
-//! slice: the shell has no stopping point there, so the engine
-//! carries the resolved inputs forward instead of re-deciding them.
-//!
-//! Lane map, so the integrator can stack without overlap: the usage
-//! text and status report live on `rust-port-slice-73`
+//! This module owns argument parsing and dispatch. The completed-state path
+//! continues through [`CommandEngine::fresh`] so resolved inputs remain
+//! single-sourced. Usage text and status reports live in
 //! ([`crate::init_client_adopt`]), the repository identity and
-//! branch validation on `rust-port-slice-41`
+//! branch validation in
 //! ([`crate::init_client_identity`]), the transaction-directory
-//! lifecycle on `rust-port-slice-35`
+//! lifecycle in
 //! ([`crate::init_client_transaction`]), and the transaction record
-//! journal on `rust-port-slice-54`
+//! journal in
 //! ([`crate::init_client_record`]). The resume and rollback
 //! orchestrators ([`crate::init_client_resume`],
 //! [`crate::init_client_rollback`]) and the remote default-branch
 //! probe stay behind the engine closures — the former need dep
-//! trees the integrator builds, the latter needs the network — and
-//! the file-generic `_dot_init_error` diagnostic stays unported (a
-//! bare `printf ... >&2; return 1` with no family state, absorbed
-//! into [`InitReport`] the way earlier slices absorb engine
-//! diagnostics).
+//! trees the engine builds, while the latter needs the network.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the run identity from the
@@ -145,7 +134,7 @@ pub struct CommandEnv<'a> {
 }
 
 /// Fresh-init continuation inputs (the line-1872+ tail): everything
-/// the later slice needs without re-deriving it — the requested
+/// the fresh-run path needs without re-deriving it — the requested
 /// origin, its canonical identity, the resolved branch, and the
 /// confirmation bypass.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,10 +149,9 @@ pub struct FreshInputs {
     pub yes: bool,
 }
 
-/// Cross-lane engine for [`run`]: one closure per out-of-scope call
-/// the ported range makes. Tests feed either stubs or closures
-/// running the live shell functions; production binds the ported
-/// modules (deep dep trees arrive with the integrator).
+/// Engine dependencies for [`run`]: one closure per neighboring
+/// native contract. Tests feed focused stubs; production binds the
+/// owning modules.
 pub struct CommandEngine<'a> {
     /// `_dot_init_remote_default_branch`: resolve the remote's
     /// default branch. `None` is any failure, the shell's silent

@@ -19,7 +19,7 @@
 //! candidate, records, delete, plan, publish, rollback, git, adopt,
 //! resume — stay for their own lanes.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Byte-fidelity boundary: `case` arms with `*` match across `/`,

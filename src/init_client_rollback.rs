@@ -1,35 +1,13 @@
-//! The init rollback family of `lib/dot/init-client.sh`: undoing a
-//! published transaction before it commits.
+//! Roll back a published init transaction before it commits.
 //!
-//! The shell file holds 79 functions — too big for one lane — so
-//! this module owns only the four contiguous functions from
-//! `_dot_init_rollback_entry` through `_dot_init_rollback` in file
-//! order (lines 1574-1710): one published entry rolls back
-//! ([`rollback_entry`]), every reserved parent directory rolls back
-//! in reverse order ([`rollback_parents`]), the whole published
-//! generation plus the staged git directory and its container roll
-//! back ([`rollback_published`]), and the top-level command
-//! validates the journal, rolls back, restores backups, and drops
-//! the transaction ([`rollback`]).
-//!
-//! Lane map, so the integrator can stack without overlap: the
-//! transaction-directory lifecycle lives on `rust-port-slice-35`
-//! (`init_client_transaction`), the host-git identity family on
-//! `rust-port-slice-41` (`init_client_identity`), the git-generation
-//! binding on `rust-port-slice-43` (`init_client_generation`), the
-//! per-entry staging family on `rust-port-slice-46`
-//! (`init_client_entry`), the candidate planning family on
-//! `rust-port-slice-48` (`init_client_candidate`), the transaction
-//! record journal on `rust-port-slice-51` (`init_client_records`)
-//! and `rust-port-slice-54` (`init_client_record`), the
-//! deletion-parking family on `rust-port-slice-55`
-//! (`init_client_delete`), and the plan review plus conflict
-//! safekeeping on `rust-port-slice-62` (`init_client_plan`). The
-//! file-generic `_dot_init_error` diagnostic stays unported (a bare
-//! `printf ... >&2; return 1` with no family state): its three
-//! messages surface as [`Error::Usage`] text, the way earlier slices
-//! absorb engine diagnostics. The publish, resume, status, and
-//! command-dispatch families stay for later slices.
+//! One entry rolls back through [`rollback_entry`], reserved parent
+//! directories roll back in reverse order through
+//! [`rollback_parents`], and [`rollback_published`] removes the
+//! published generation and staged git directory. [`rollback`]
+//! validates the journal, restores backups, and removes the
+//! transaction. Adjacent init-client modules provide transaction,
+//! identity, journal, generation, deletion, and plan operations.
+//! User-facing failures are represented by [`Error::Usage`].
 //!
 //! The port stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
@@ -71,7 +49,7 @@ use std::ffi::OsString;
 use std::io::Write as _;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::errors::{Error, Result};
 
@@ -402,7 +380,7 @@ fn chomp_newlines(bytes: &[u8]) -> &[u8] {
 /// `_dot_init_rollback_published`, run natively like the delete
 /// lane's twin. `LC_ALL=C` is pinned, never `envs`.
 fn hash_stdin_bytes(payload: &[u8]) -> Result<String> {
-    let mut child = Command::new("git")
+    let mut child = crate::init_client_identity::host_git_command()
         .args(["hash-object", "--stdin"])
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())
