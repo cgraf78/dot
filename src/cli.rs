@@ -1,31 +1,37 @@
-//! Command dispatch for the native `dot` CLI.
+//! Command dispatch for the `dot` CLI (slices 1 + 77).
 //!
 //! Hand-rolled parsing over `std::env::args_os`, no CLI framework: the
-//! command set, and startup latency is a first-class budget (see
-//! `tests/perf_budget.rs`). Streams are injected so tests capture output
-//! without subprocesses. [`dispatch`] is the single routing table and its
-//! exhaustive match keeps every public command wired.
+//! shell dispatcher matches on `${1:-help}` with a small fixed command
+//! set, and startup latency is a first-class budget (see
+//! `tests/perf_budget.rs`). Streams are injected so parity tests capture
+//! output without subprocesses.
 //!
-//! [`Command::Update`] uses the sequencer's flag parser
-//! ([`crate::update::parse_update_flags`]) and runs end to end through
-//! [`update_run::run`](crate::update_run::run), with a native lock and
-//! native engine. `init` runs through [`init_client_command::run`];
-//! `fetch`/`push`/`status`/`diff` through overlay resolution
-//! ([`crate::overlays::resolve`]) plus the matching
-//! [`crate::repos_commands`] kernel. Native [`Command::Test`] owns discovery,
-//! scheduling, result collection, timeout and cancellation directly.
-//! The startup prelude ([`crate::startup`]) runs at the top of [`run`]: the re-exec
-//! guard (exit 1) then `dot_config_load || exit 2` before dispatch
-//! for every command.
+//! Slice 1 owned `help` and `version` only. Slice 77 adds the full
+//! [`dispatch`] table for `dot_command_dispatch`
+//! (`lib/dot/commands.sh`): every command name decides a [`Command`]
+//! exactly like the shell `case`. `help`/`version`/`cron`/`unknown`
+//! execute here with byte-exact shell parity; the remaining commands
+//! report "not yet implemented" until their kernel slices land (their
+//! dispatch decision is final — a later slice only fills in the call,
+//! never re-decides the routing). Slice 78 drives [`Command::Update`]
+//! through the sequencer's flag parser
+//! ([`crate::update::parse_update_flags`]): the shell loop's exports
+//! land in the process environment while the engine (sync/finalize)
+//! stays shell-owned, so the interim diagnostic remains; slice 79
+//! drives `init` through [`init_client_command::run`]. The shell
+//! `bin/dot` remains the entry point and never routes here yet.
+//! Slice 84 runs the startup prelude ([`crate::startup`]) at the top
+//! of [`run`]: the re-exec guard (exit 1) then `dot_config_load ||
+//! exit 2` before dispatch for every command, per the forward
+//! contracts (see [`crate::startup`] for the deliberate help/version
+//! divergence from the shell `case` order).
 
-use std::ffi::{OsStr, OsString};
-use std::io::IsTerminal as _;
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::errors::Error;
 use crate::init_client_command;
-use crate::init_client_engine;
 use crate::init_client_identity as identity;
 use crate::init_client_record::TransactionRecord;
 use crate::version;
@@ -51,9 +57,11 @@ fn argv_bytes(arg: &OsString) -> Vec<u8> {
     arg.to_string_lossy().into_owned().into_bytes()
 }
 
-/// Exact help bytes, including the trailing newline. One literal per line:
+/// Exact bytes of the shell `dot_help` heredoc, including trailing newline.
+///
+/// Exact bytes of the shell `dot_help` heredoc. One literal per line:
 /// a `\`-continued literal would strip the two-space command indent.
-/// Pinned directly by `tests/cli.rs`.
+/// Pinned by `tests/cli.rs` against `lib/dot/main.sh`.
 pub const HELP: &str = concat!(
     "usage: dot <command> [<args>]\n",
     "\n",
@@ -73,94 +81,69 @@ pub const HELP: &str = concat!(
     "Run `dot init --help` for initialization and recovery syntax.\n",
 );
 
-/// Public process exit-code contract:
+/// Shell exit-code contract (`lib/dot/commands.sh`, `lib/dot/main.sh`):
 /// `0` success, `1` error/unknown command, `2` usage/config failure,
 /// `75` lock busy. Numeric codes cross the process boundary into
 /// scripts and CI gates, so they are named constants — never inline
-/// literals.
+/// literals — and new codes arrive only with their owning slice (the
+/// lock's `75` is not defined until the lock module lands).
 pub const EXIT_SUCCESS: i32 = 0;
 /// Generic failure (unknown command today; repo-failure paths reuse it
-/// per the historical shell `return 1` sites).
+/// per the shell `return 1` sites). Named so later slices share one value.
 pub const EXIT_ERROR: i32 = 1;
 /// Config/usage failure (`dot_config_load || exit 2` in
 /// `lib/dot/main.sh`, owned by the [`crate::startup`] prelude).
 /// Named so the startup gate shares one value with later usage errors.
 pub const EXIT_USAGE: i32 = 2;
 
-/// Command dispatch decision.
+/// `dot_command_dispatch` decision (`lib/dot/commands.sh`).
 ///
 /// One variant per shell `case` arm. Each variant names the kernel that
-/// executes it plus the shell's exit-code contract. The headline
+/// executes it plus the shell's exit-code contract, so the owning slice
+/// wires the call without re-deriving the plumbing. The headline
 /// contract: the dispatcher returns `0` unless an arm says otherwise —
 /// `update`/`fetch`/`push`/`status`/`diff`/`doctor`/`init`/`cron` ignore
 /// their kernels' statuses and succeed whenever setup does; only the
 /// early `return` sites (lock/resolve failures) and `test` (which
-/// records its runner status) propagate nonzero codes. Pinned directly in
-/// `tests/cli.rs` with stubbed kernels.
+/// records `rc=$?`) propagate nonzero codes. Pinned differentially in
+/// `tests/cli.rs` against the live shell with stubbed kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     /// `update`, plus `pull` (the shell recurses into the `update`
-    /// arm): native update-lock acquisition (failure returns its status,
-    /// e.g. lock-busy `75`), then the native update engine, wired to
-    /// [`update_run::run`](crate::update_run::run).
-    ///
-    /// Exit-code note: the dispatcher text ignores the kernel status
-    /// (`0` regardless), but production runs under `set -euo pipefail`
-    /// (`bin/dot`, `lib/dot/main.sh`), so a failing kernel exits the
-    /// process with its own code before the dispatcher resumes —
-    /// `dot update` reports a failure as `1`, pinned against
-    /// `bin/dot`; see the [`Command::Init`] contract. Lock
-    /// acquisition is native here and for `init`.
+    /// arm): owner traps, `_dot_update_lock_acquire "$@"` (failure
+    /// returns its status, e.g. lock-busy), then `_dot_update "$@"`
+    /// whose status is ignored — success is `0` regardless.
+    /// Kernels live in other lanes (`update`, `update_lock`,
+    /// `cleanup`).
     Update,
     /// `fetch`: `_dot_resolve_overlays fetch` (failure returns `1`),
-    /// then `_repo_fetch_all "$@"`. Wired through `run_repos` using
-    /// [`crate::overlays::resolve`] plus
-    /// [`crate::repos_commands::fetch_all`].
-    ///
-    /// Exit-code note: the dispatcher text ignores the kernel status
-    /// (`0` regardless), but production runs under `set -euo
-    /// pipefail` (`bin/dot`, `lib/dot/main.sh`), so a failing kernel
-    /// exits the process with its own code before the dispatcher
-    /// resumes — a rejected base push exits `1`, pinned against
-    /// `bin/dot`. `run_repos` therefore reports the kernel's code
-    /// directly (the [`Command::Init`] precedent).
+    /// then `_repo_fetch_all "$@"` (status ignored → `0`).
+    /// Kernel [`crate::repos_commands::fetch_all`] is ported; overlay
+    /// resolution lives in another lane.
     Fetch,
     /// `push`: `_dot_resolve_overlays inspect` (failure returns `1`),
-    /// then `_repo_push_all "$@"`. Wired through `run_repos` using
-    /// [`crate::overlays::resolve`] plus
-    /// [`crate::repos_commands::push_all`]. Kernel codes cross the
-    /// process boundary under `set -euo pipefail` (see
-    /// [`Command::Fetch`]).
+    /// then `_repo_push_all "$@"` (status ignored → `0`).
+    /// Kernel [`crate::repos_commands::push_all`] is ported.
     Push,
     /// `status`: `_dot_resolve_overlays inspect` (failure returns
-    /// `1`), then `_repo_status_all "$@"`. Wired through `run_repos` using
-    /// [`crate::overlays::resolve`] plus
-    /// [`crate::repos_commands::status_all`]. Kernel codes cross the
-    /// process boundary under `set -euo pipefail` (see
-    /// [`Command::Fetch`]).
+    /// `1`), then `_repo_status_all "$@"` (status ignored → `0`).
+    /// Kernel [`crate::repos_commands::status_all`] is ported.
     Status,
     /// `diff`: `_dot_resolve_overlays inspect` (failure returns `1`),
-    /// then `_repo_diff_all "$@"`. Wired through `run_repos` using
-    /// [`crate::overlays::resolve`] plus
-    /// [`crate::repos_commands::diff_all`]. Kernel codes cross the
-    /// process boundary under `set -euo pipefail` (see
-    /// [`Command::Fetch`]).
+    /// then `_repo_diff_all "$@"` (status ignored → `0`).
+    /// Kernel [`crate::repos_commands::diff_all`] is ported.
     Diff,
     /// `cron`: `crontab -l`, falling back to `no crontab installed`
     /// (always `0`). Executed in [`run`] — no kernel, owned here.
     Cron,
     /// `doctor`: owner traps, `DOT_OVERLAY_DISCOVERY_SILENT=1`,
     /// `_dot_resolve_overlays inspect` (`|| true` — failure ignored),
-    /// then `_dot_doctor` (the dispatcher text ignores the status
-    /// with `return "$rc"`, but production runs under `set -euo
-    /// pipefail`, so a failing kernel exits the process with its own
-    /// code before the dispatcher resumes — the [`Command::Init`]
-    /// precedent, pinned against `bin/dot`). The native coordinator owns the
-    /// complete check, extension, and rendering path.
+    /// then `_dot_doctor` (status ignored → always `0`). Kernel lives
+    /// in another lane.
     Doctor,
-    /// Native suite supervisor: inspect resolution gates discovery; argument
-    /// validation, trusted launch, bounded scheduling and owned cancellation
-    /// report their aggregate status directly.
+    /// `test`: owner traps, `_dot_resolve_overlays inspect` (failure
+    /// returns `1`), then `dot_test_command "$@"` whose status becomes
+    /// the dispatcher's code (`rc=$?`). Kernel lives in another lane.
     Test,
     /// `init`: owner traps, then [`init_acquires_lock`] decides the
     /// nested `case ${1:-}` — `_dot_update_lock_acquire` unless the
@@ -173,8 +156,9 @@ pub enum Command {
     /// (`bin/dot`, `lib/dot/main.sh`), so a failing kernel exits the
     /// process with its own code before the dispatcher resumes —
     /// `dot init --bogus` exits `1`, pinned against `bin/dot`.
-    /// [`run`] therefore reports the kernel's code directly. Native
-    /// initialization holds one operation lock through convergence.
+    /// [`run`] therefore reports the kernel's code directly. Lock
+    /// acquisition still arrives with its slice: until then every
+    /// `init` proceeds without locking, like every other arm here.
     Init,
     /// Anything else: `dot: unknown command: %s` on stderr, `1`.
     Unknown,
@@ -213,7 +197,7 @@ pub fn dispatch(command: &[u8]) -> Command {
 /// `$1`); `None` is no argument at all, which the shell's `${1:-}`
 /// spells as empty and routes to `*` (acquire). Only the read-only
 /// probes `--status`, `--help`, and `-h` skip the lock. The owning
-/// `init` uses this to decide whether the operation lock is required.
+/// `init` slice consumes this when it wires [`Command::Init`].
 pub fn init_acquires_lock(first_arg: Option<&[u8]>) -> bool {
     match first_arg {
         Some(arg) => {
@@ -232,115 +216,61 @@ pub fn init_acquires_lock(first_arg: Option<&[u8]>) -> bool {
 /// The first argument is the command (`${1:-help}` in shell terms);
 /// remaining arguments are accepted and ignored by `help`/`version`,
 /// matching the shell dispatcher, which shifts once and never inspects
-/// `$@` for these commands. Each command owns its own
+/// `$@` for these commands. Later slices give each command its own
 /// parser; nothing here may grow flags implicitly.
 pub fn run(
     args: impl IntoIterator<Item = OsString>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
-    let env = std::env::vars_os().collect();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let runtime = crate::app::Runtime::from_env(&env, &cwd)
-        .expect("the current directory fallback is absolute");
-    let args = args.into_iter().collect::<Vec<_>>();
-    crate::app::run_direct(
-        &runtime,
-        &args,
-        &mut crate::app::Streams::new(stdout, stderr),
-    )
-}
-
-/// Run the CLI with a preconstructed immutable runtime.
-pub(crate) fn run_with_runtime(
-    runtime: &crate::app::Runtime,
-    args: &[OsString],
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> i32 {
-    let mut args = args.iter().cloned();
+    let mut args = args.into_iter();
     let command = args.next().unwrap_or_default();
     let command = argv_bytes(&command);
     let command = command.as_slice();
     // Shell matches `${1:-help}`: empty or missing command shows help.
     // The empty-string arm matters because `run([])` (no argv at all,
     // as in tests) must behave like bare `dot`, not like an error.
-    // The re-exec guard precedes every command. Informational commands then
-    // return without reading user configuration, matching the shell entry
-    // point; operational commands load configuration before dispatch.
-    if crate::startup::informational_command(command) {
-        if let Err(failure) = crate::startup::check_reexec(runtime) {
-            let _ = stderr.write_all(failure.line().as_bytes());
-            let _ = stderr.write_all(b"\n");
-            return failure.code();
-        }
-        return match command {
-            b"" | b"help" | b"-h" | b"--help" => {
-                if stdout.write_all(HELP.as_bytes()).is_err() {
-                    EXIT_ERROR
-                } else {
-                    EXIT_SUCCESS
-                }
-            }
-            _ => {
-                if writeln!(stdout, "{}", version::version_line()).is_err() {
-                    EXIT_ERROR
-                } else {
-                    EXIT_SUCCESS
-                }
-            }
-        };
-    }
-    let config = match crate::startup::check(runtime) {
-        Ok(config) => config,
+    // Slice 84 startup prelude: `dot_config_load || exit 2` runs
+    // before dispatch for every command (forward-contract order from
+    // `docs/rust-port-spec.md` — the shell `case` exempts
+    // help/version, but the spec requires ANY command to exit 2
+    // here), preceded by the re-exec guard (exit 1). A loaded config
+    // is otherwise invisible (validated, then discarded until the
+    // slices consuming each field land), so wired commands behave
+    // exactly as before whenever config loads.
+    match crate::startup::check_ambient() {
+        Ok(_) => {}
         Err(failure) => {
             let _ = stderr.write_all(failure.line().as_bytes());
             let _ = stderr.write_all(b"\n");
             return failure.code();
         }
-    };
-    let selected = dispatch(command);
-    let home = runtime.home().to_string_lossy();
-    let state = runtime.state_home().to_string_lossy();
-    let identity = if selected == Command::Init {
-        crate::repos_base::select_for_init(runtime, &home, &state, stderr)
-    } else {
-        crate::repos_base::select(runtime, &home, &state, stderr)
-    };
-    if identity.is_err() {
-        return EXIT_ERROR;
     }
-
     let mut failed = false;
     let code = match command {
-        b"" | b"help" | b"-h" | b"--help" | b"version" | b"--version" => unreachable!(),
+        b"" | b"help" | b"-h" | b"--help" => {
+            if stdout.write_all(HELP.as_bytes()).is_err() {
+                failed = true;
+            }
+            EXIT_SUCCESS
+        }
+        b"version" | b"--version" => {
+            if writeln!(stdout, "{}", version::version_line()).is_err() {
+                failed = true;
+            }
+            EXIT_SUCCESS
+        }
         // `main.sh` loads config and the runtime before dispatch, so
         // everything else is `dot_command_dispatch` (`commands.sh`).
-        other => match selected {
+        other => match dispatch(other) {
             Command::Cron => run_cron(stdout, &mut failed),
             Command::Update => {
                 let rest: Vec<OsString> = args.collect();
-                run_update(runtime, &config, &rest, stdout, stderr)
+                run_update(other, &rest, stderr)
             }
             Command::Init => {
                 let rest: Vec<Vec<u8>> = args.map(|arg| argv_bytes(&arg)).collect();
-                run_init(runtime, &rest, stdout, stderr, &mut failed)
-            }
-            command @ (Command::Fetch | Command::Push | Command::Status | Command::Diff) => {
-                let rest: Vec<OsString> = args.collect();
-                run_repos(runtime, &config, command, &rest, stdout, stderr)
-            }
-            Command::Doctor => {
-                let mut streams = crate::app::Streams::new(stdout, stderr);
-                crate::doctor::run(runtime, &mut streams)
-            }
-            Command::Test => {
-                let rest: Vec<OsString> = args.collect();
-                crate::test_command::run(
-                    runtime,
-                    &rest,
-                    &mut crate::app::Streams::new(stdout, stderr),
-                )
+                run_init(&rest, stdout, stderr, &mut failed)
             }
             Command::Unknown => {
                 // A closed stderr here leaves nothing to report to; the
@@ -348,6 +278,16 @@ pub(crate) fn run_with_runtime(
                 let _ = stderr.write_all(b"dot: unknown command: ");
                 let _ = stderr.write_all(other);
                 let _ = stderr.write_all(b"\n");
+                EXIT_ERROR
+            }
+            // Known command whose kernel lives in another lane: the
+            // dispatch decision above is final (a later slice only
+            // fills in the call), so this names the typed command
+            // instead of falling through to "unknown command".
+            _ => {
+                let _ = stderr.write_all(b"dot: command '");
+                let _ = stderr.write_all(other);
+                let _ = stderr.write_all(b"' is not yet implemented\n");
                 EXIT_ERROR
             }
         },
@@ -358,59 +298,49 @@ pub(crate) fn run_with_runtime(
     if failed { EXIT_ERROR } else { code }
 }
 
-/// The [`Command::Update`] arm: parse the leading flags
-/// through the sequencer kernel, apply the shell loop's exports,
-/// then run the update end to end and report its exit code (`0` on
-/// success).
+/// The [`Command::Update`] arm (slice 78): parse the leading flags
+/// through the sequencer kernel and apply the shell loop's exports,
+/// then report the pending engine.
 ///
 /// `_dot_update` (`lib/dot/update.sh`) consumes `--cron --quiet
 /// -f`/`--force -v`/`--verbose` up front — exporting the
 /// quiet/force/verbose pairs and unsetting `DOT_OVERLAY_LINKS_FROZEN`
-/// — before the repo sync and finalize steps run. This arm hands the
-/// residue to [`update_run::run`](crate::update_run::run): native lock plus
-/// the native engine.
-fn run_update(
-    runtime: &crate::app::Runtime,
-    config: &crate::config::Config,
-    args: &[OsString],
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> i32 {
-    let signals = match crate::cleanup::Signals::install() {
-        Ok(signals) => signals,
-        Err(_) => return EXIT_ERROR,
-    };
+/// — before the repo sync and finalize steps run. Those steps stay
+/// shell-owned until their slices land, so this arm stops after the
+/// flag side effects with the interim not-yet-implemented diagnostic
+/// ([`EXIT_ERROR`]) — never success, since no engine ran.
+/// `command` names the invoked spelling (`update` or its `pull`
+/// alias) for the diagnostic.
+fn run_update(command: &[u8], args: &[OsString], stderr: &mut dyn Write) -> i32 {
     let raw: Vec<Vec<u8>> = args.iter().map(argv_bytes).collect();
     let refs: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
     let parsed = crate::update::parse_update_flags(&refs);
-    // The shell exports these values before the engine runs. Keep that
-    // behavior inside this invocation's child environment instead of
-    // publishing transient command state to other callers in this process.
-    let mut env = runtime.env().clone();
-    env.remove(OsStr::new("DOT_OVERLAY_LINKS_FROZEN"));
-    if parsed.quiet {
-        env.insert(OsString::from("DOT_QUIET"), OsString::from("1"));
-        env.insert(OsString::from("SHDEPS_QUIET"), OsString::from("1"));
+    // Entry side effects, in shell order: rollback authority first,
+    // then the flag exports. One `set_var` per variable (never a
+    // batch): each entry stays auditable, matching the repo
+    // differential-test convention. Process env mutation is
+    // `unsafe` in edition 2024; `run` is the single-flight command
+    // entry path (like the shell's own exports), so no other thread
+    // observes a half-applied flag set.
+    unsafe {
+        std::env::remove_var("DOT_OVERLAY_LINKS_FROZEN");
+        if parsed.quiet {
+            std::env::set_var("DOT_QUIET", "1");
+            std::env::set_var("SHDEPS_QUIET", "1");
+        }
+        if parsed.force {
+            std::env::set_var("DOT_FORCE", "1");
+            std::env::set_var("SHDEPS_FORCE", "1");
+        }
+        if parsed.verbose {
+            std::env::set_var("DOT_VERBOSE", "1");
+            std::env::set_var("SHDEPS_LOG_LEVEL", "2");
+        }
     }
-    if parsed.force {
-        env.insert(OsString::from("DOT_FORCE"), OsString::from("1"));
-        env.insert(OsString::from("SHDEPS_FORCE"), OsString::from("1"));
-    }
-    if parsed.verbose {
-        env.insert(OsString::from("DOT_VERBOSE"), OsString::from("1"));
-        env.insert(OsString::from("SHDEPS_LOG_LEVEL"), OsString::from("2"));
-    }
-    // Preserve the kernel's codes (`0` success, `1` failure, `2` config
-    // rejection, `75` lock busy) across the typed stream boundary.
-    let code = crate::update_run::run(
-        runtime,
-        config,
-        &env,
-        crate::update_run::Request { args },
-        stdout,
-        stderr,
-    );
-    signals.received().map_or(code, |signal| 128 + signal)
+    let _ = stderr.write_all(b"dot: command '");
+    let _ = stderr.write_all(command);
+    let _ = stderr.write_all(b"' is not yet implemented\n");
+    EXIT_ERROR
 }
 
 /// The [`Command::Cron`] arm: `crontab -l`, falling back to the
@@ -440,140 +370,59 @@ fn run_cron(stdout: &mut dyn Write, failed: &mut bool) -> i32 {
 /// The [`Command::Init`] arm: `dot_init_command "$@"` through
 /// [`init_client_command::run`].
 ///
-/// Runtime inputs are read here — the dispatcher is the engine
-/// boundary, so command modules receive explicit parameters (its
-/// [`CommandEnv`][init_client_command::CommandEnv]).
+/// Process environment is read here — the dispatcher is the engine
+/// boundary, so ambient reads live in this arm while the command
+/// module itself takes explicit parameters (its [`CommandEnv`][init_client_command::CommandEnv]).
 /// Effect-free helpers run as the real ports inside the module; the
 /// network default-branch probe binds its ported helper with a
-/// `TMPDIR` scratch, and the resume, rollback, and fresh-tail steps
-/// bind the production wiring
-/// ([`init_client_engine::Production`]). Convergence calls the native
-/// update application service directly while the init operation lock
-/// remains held; it never recursively invokes the CLI.
-/// The arm reports the kernel's own code, matching the production
-/// process under `set -euo pipefail` (pinned against `bin/dot`;
-/// see the [`Command::Init`] contract).
+/// `TMPDIR` scratch, while the deep resume and rollback trees plus
+/// the line-1872+ fresh tail stay interim "not yet implemented"
+/// closures until their slices fill them in. The arm reports the
+/// kernel's own code, matching the production process under
+/// `set -euo pipefail` (pinned against `bin/dot`; see the
+/// [`Command::Init`] contract).
 fn run_init(
-    runtime: &crate::app::Runtime,
     args: &[Vec<u8>],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     failed: &mut bool,
 ) -> i32 {
-    let home = runtime
-        .value("HOME")
-        .and_then(OsStr::to_str)
-        .unwrap_or_default();
-    let xdg_state_home = runtime
-        .value("XDG_STATE_HOME")
-        .and_then(OsStr::to_str)
-        .unwrap_or_default();
-    let skip_provider = runtime
-        .value("DOT_INIT_SKIP_PROVIDER")
-        .and_then(OsStr::to_str);
-    // The command gate already rejected every spelling but `0` and
-    // `1` before the engine runs; anything else never reaches it.
-    let skip_provider_flag = skip_provider
-        .filter(|value| !value.is_empty())
-        .unwrap_or("0")
-        == "1";
-    let source_root = runtime.source_root();
-    let Some(host_git) = runtime
-        .value("PATH")
-        .and_then(OsStr::to_str)
-        .and_then(|path| identity::select_host_git(home, &source_root.to_string_lossy(), path))
-    else {
-        if writeln!(stderr, "dot init: {}", identity::NO_HOST_GIT).is_err() {
-            *failed = true;
-        }
-        return EXIT_ERROR;
-    };
-    let scratch = runtime
-        .value("TMPDIR")
+    let home = std::env::var("HOME").unwrap_or_default();
+    let xdg_state_home = std::env::var("XDG_STATE_HOME").unwrap_or_default();
+    let skip_provider = std::env::var("DOT_INIT_SKIP_PROVIDER").ok();
+    let source_root = std::env::var_os("DOT_SOURCE_ROOT").map(PathBuf::from);
+    // Degraded-env ownership root: without a source checkout the
+    // stage-ownership hash cannot verify, so recovery preserves
+    // every stage (fail closed), like the shell's failed probe.
+    let fallback = PathBuf::from("/nonexistent-dot-source-root");
+    let source_root = source_root.as_deref().unwrap_or(&fallback);
+    let scratch = std::env::var_os("TMPDIR")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    // The shell inherits its working directory; a deleted one can
-    // never serve the reserved probe, so fall back to the client
-    // root there (fail closed on the lookup, never on the run).
-    let cwd = runtime.cwd();
     let remote_default_branch =
         |url: &str| -> Option<String> { identity::remote_default_branch(url, &scratch) };
-    let log = crate::log::Log::new(false, false);
-    let guard = if init_acquires_lock(args.first().map(Vec::as_slice)) {
-        match crate::update_lock::acquire(runtime.state_home(), false, &log, None, stderr) {
-            Ok(guard) => Some(guard),
-            Err(Error::LockBusy { .. }) => return crate::update_lock::EXIT_LOCK_BUSY,
-            Err(_) => return EXIT_ERROR,
-        }
-    } else {
-        None
+    let resume = |_: &Path, _: &Path, _: &TransactionRecord| -> Result<(), Error> {
+        Err(Error::Usage {
+            message: "initialization resume is not yet implemented",
+        })
     };
-    let mut update_env = runtime.env().clone();
-    if let Some(guard) = &guard {
-        update_env.insert(
-            OsString::from("DOT_UPDATE_LOCK_TOKEN"),
-            OsString::from(guard.token()),
-        );
-    }
-    let converge_stdout = std::cell::RefCell::new(Vec::new());
-    let converge_stderr = std::cell::RefCell::new(Vec::new());
-    let converge_called = std::cell::Cell::new(false);
-    let resume_converge_failed = std::cell::Cell::new(false);
-    let converge = || -> Result<(), Error> {
-        converge_called.set(true);
-        let mut out = converge_stdout.borrow_mut();
-        let mut err = converge_stderr.borrow_mut();
-        let config = init_config(runtime, &mut *err)?;
-        let mut streams = crate::app::Streams::new(&mut *out, &mut *err);
-        let code = crate::update_engine::run_update(
-            runtime,
-            &crate::update_engine::UpdateRequest {
-                config: &config,
-                env: &update_env,
-                args: &[],
-                state_home: runtime.state_home(),
-            },
-            &mut streams,
-        );
-        if code == EXIT_SUCCESS {
-            Ok(())
-        } else {
-            Err(Error::Command {
-                command: "native init convergence".to_string(),
-                status: Some(format!("exit status: {code}")),
-            })
-        }
+    let rollback = |_: &Path| -> Result<(), Error> {
+        Err(Error::Usage {
+            message: "initialization rollback is not yet implemented",
+        })
     };
-    let production = init_client_engine::Production::new(
-        init_client_engine::EngineCtx {
-            home,
-            xdg_state_home,
-            source_root,
-            skip_provider: skip_provider_flag,
-            shdeps_update_policy: runtime
-                .value("DOT_SHDEPS_UPDATE_POLICY")
-                .and_then(OsStr::to_str),
-            cwd,
-        },
-        &converge,
-    );
-    let resume =
-        |transaction: &Path, record: &Path, journal: &TransactionRecord| -> Result<(), Error> {
-            let result = production.resume(transaction, record, journal);
-            if result.is_err() && converge_called.get() {
-                resume_converge_failed.set(true);
-            }
-            result
-        };
-    let rollback = |at: &Path| -> Result<(), Error> { production.rollback(at) };
-    let fresh = |inputs: &init_client_command::FreshInputs| -> init_client_command::InitReport {
-        production.run_fresh(inputs)
+    let fresh = |_: &init_client_command::FreshInputs| -> init_client_command::InitReport {
+        init_client_command::InitReport {
+            stdout: Vec::new(),
+            stderr: b"dot: command 'init' is not yet implemented\n".to_vec(),
+            code: EXIT_ERROR,
+        }
     };
     let env = init_client_command::CommandEnv {
-        home,
-        xdg_state_home,
-        skip_provider,
+        home: &home,
+        xdg_state_home: &xdg_state_home,
+        skip_provider: skip_provider.as_deref(),
         source_root,
     };
     let engine = init_client_command::CommandEngine {
@@ -582,248 +431,25 @@ fn run_init(
         rollback: &rollback,
         fresh: &fresh,
     };
-    let report = identity::with_host_git(Path::new(&host_git), || {
-        init_client_command::run(&env, &engine, args)
-    });
-    if write_init_output(
-        stdout,
-        stderr,
-        &report,
-        &converge_stdout.into_inner(),
-        &converge_stderr.into_inner(),
-        resume_converge_failed.get(),
-    )
-    .is_err()
-    {
+    let report = init_client_command::run(&env, &engine, args);
+    if stdout.write_all(&report.stdout).is_err() {
         *failed = true;
     }
-    if let Some(guard) = guard {
-        guard.release(&log, stderr);
+    if stderr.write_all(&report.stderr).is_err() {
+        *failed = true;
     }
     report.code
-}
-
-/// Reload configuration after init publishes the candidate worktree. The
-/// Runtime freezes environment, not files, so this sees configuration cloned
-/// after process startup just like `dot_config_load` in the shell path.
-fn init_config(
-    runtime: &crate::app::Runtime,
-    stderr: &mut dyn Write,
-) -> Result<crate::config::Config, Error> {
-    crate::startup::check(runtime).map_err(|failure| {
-        let _ = stderr.write_all(failure.line().as_bytes());
-        let _ = stderr.write_all(b"\n");
-        Error::Command {
-            command: "native init configuration reload".to_string(),
-            status: Some(format!("exit status: {}", failure.code())),
-        }
-    })
-}
-
-/// Emit init and convergence streams in execution order. A resumed
-/// transaction prints the update failure before its wrapper diagnostic;
-/// fresh and completed paths contain only pre-convergence init output.
-fn write_init_output(
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-    report: &init_client_command::InitReport,
-    converge_stdout: &[u8],
-    converge_stderr: &[u8],
-    resume_converge_failed: bool,
-) -> std::io::Result<()> {
-    stdout.write_all(&report.stdout)?;
-    stdout.write_all(converge_stdout)?;
-    if resume_converge_failed {
-        stderr.write_all(converge_stderr)?;
-        stderr.write_all(&report.stderr)
-    } else {
-        stderr.write_all(&report.stderr)?;
-        stderr.write_all(converge_stderr)
-    }
-}
-
-pub(crate) fn base_from_values(
-    home: &str,
-    topology_value: Option<&str>,
-    git_dir_value: Option<&str>,
-) -> crate::repos_base::Base {
-    let topology = match topology_value {
-        Some("separate") => crate::repos_base::Topology::Separate,
-        Some("ordinary") => crate::repos_base::Topology::Ordinary,
-        _ => crate::repos_base::Topology::Missing,
-    };
-    let git_dir = git_dir_value
-        .filter(|dir| !dir.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{home}/.dotfiles"));
-    crate::repos_base::Base {
-        topology,
-        client_git_dir: git_dir,
-        home: home.to_string(),
-    }
-}
-
-/// The [`Command::Fetch`], [`Command::Push`], [`Command::Status`],
-/// and [`Command::Diff`] arms: `_dot_resolve_overlays fetch` for
-/// fetch, `inspect` for the rest (`|| return 1`), then the matching
-/// [`crate::repos_commands`] kernel over `"$@"`.
-///
-/// The dispatcher text ignores the kernel status (`return "$rc"`
-/// with `rc=0`), but production runs under `set -euo pipefail`, so
-/// a failing kernel exits the process with its own code before the
-/// dispatcher resumes — the arm reports the kernel's code directly
-/// (the [`Command::Init`] precedent, pinned against `bin/dot`).
-///
-/// Runtime inputs are read here — the dispatcher is the engine
-/// boundary, so kernel modules receive explicit parameters. Resolution diagnostics replay
-/// the shell's stderr (collected warnings plus the failure line,
-/// when the shell prints one); kernel headers go to `stdout`,
-/// overlay push warnings to `stderr`, and git's own output streams
-/// to the terminal through the kernel, exactly like the shell's
-/// inherited stdio. Color follows fd 1 (`[[ -t 1 ]]`), not the
-/// injected stream, so piped runs stay byte-identical on both
-/// sides. Extra arguments pass through to `git` verbatim.
-fn run_repos(
-    runtime: &crate::app::Runtime,
-    config: &crate::config::Config,
-    command: Command,
-    args: &[OsString],
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> i32 {
-    if !matches!(
-        command,
-        Command::Fetch | Command::Push | Command::Status | Command::Diff
-    ) {
-        return EXIT_ERROR;
-    }
-    let mode = if command == Command::Fetch {
-        "fetch"
-    } else {
-        "inspect"
-    };
-    let home = runtime
-        .value("HOME")
-        .and_then(OsStr::to_str)
-        .unwrap_or_default();
-    let prefix = runtime.value("PREFIX").unwrap_or_default();
-    let prefix = prefix.to_string_lossy();
-    let state_home = runtime.state_home().to_string_lossy();
-    let base = match crate::repos_base::select(runtime, home, &state_home, stderr) {
-        Ok(base) => base,
-        Err(()) => return EXIT_ERROR,
-    };
-    let inputs = crate::overlays::ResolveInputs {
-        home: home.to_string(),
-        xdg_config: runtime
-            .value("XDG_CONFIG_HOME")
-            .and_then(OsStr::to_str)
-            .unwrap_or_default()
-            .to_string(),
-        discovery_silent: runtime.value("DOT_OVERLAY_DISCOVERY_SILENT") == Some(OsStr::new("1")),
-        default_profile: Some(config.default_profile.clone()),
-        user: crate::profiles::current_user(),
-        host: crate::platform::detect_host().ok(),
-        platform: crate::platform::detect_platform().ok(),
-        termux: !prefix.is_empty() && prefix.contains("/com.termux/"),
-        euid: match crate::temp::current_uid() {
-            Some(uid) => uid,
-            None => return EXIT_ERROR,
-        },
-    };
-    let mut state = crate::overlays::State::default();
-    let mut profiles = crate::profiles::State::default();
-    if let Err(error) = crate::overlays::resolve(&mut state, &mut profiles, mode, &inputs) {
-        for warning in &state.warnings {
-            let _ = writeln!(stderr, "{warning}");
-        }
-        let rendered = error.to_string();
-        if !rendered.is_empty() {
-            let _ = writeln!(stderr, "{rendered}");
-        }
-        return EXIT_ERROR;
-    }
-    // The shell checks `[[ -t 1 && -z ${NO_COLOR:-} ]]` on the real
-    // fd 1; the injected stream may be a capture buffer, so color
-    // follows the process stdout instead.
-    let log = crate::log::Log::from_env(
-        std::io::stdout().is_terminal(),
-        runtime.value("NO_COLOR").and_then(OsStr::to_str),
-        runtime.value("DOT_QUIET").and_then(OsStr::to_str),
-    );
-    match command {
-        Command::Fetch => {
-            // The shell pays the same fork (`mask=$(umask)`); the
-            // fallback is unreachable without a working `sh`, where
-            // git is gone too.
-            let mask =
-                crate::startup::ensure_umask_ceiling(crate::temp::read_umask().unwrap_or(0o022));
-            crate::repos_commands::fetch_all(&log, stdout, &base, &state.overlays, home, args, mask)
-        }
-        Command::Push => crate::repos_commands::push_all(
-            &log,
-            stdout,
-            stderr,
-            &base,
-            &state.overlays,
-            home,
-            args,
-        ),
-        Command::Status => {
-            crate::repos_commands::status_all(&log, stdout, &base, &state.overlays, home, args)
-        }
-        Command::Diff => {
-            crate::repos_commands::diff_all(&log, stdout, &base, &state.overlays, home, args)
-        }
-        // Decided above; kept as generic failure, never a panic
-        // (panics would break the stderr byte contract).
-        _ => EXIT_ERROR,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn run_text(args: &[&str]) -> (i32, String, String) {
         let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run(owned, &mut out, &mut err);
-        (
-            code,
-            String::from_utf8(out).expect("stdout is UTF-8"),
-            String::from_utf8(err).expect("stderr is UTF-8"),
-        )
-    }
-
-    fn run_init_text(args: &[&str]) -> (i32, String, String) {
-        let home = dot_test_support::TempDir::new("cli-unit-init-home").expect("home");
-        let state = dot_test_support::TempDir::new("cli-unit-init-state").expect("state");
-        let env = BTreeMap::from([
-            (
-                OsString::from("HOME"),
-                home.path().as_os_str().to_os_string(),
-            ),
-            (
-                OsString::from("XDG_STATE_HOME"),
-                state.path().as_os_str().to_os_string(),
-            ),
-            (
-                OsString::from("DOT_SOURCE_ROOT"),
-                OsString::from(env!("CARGO_MANIFEST_DIR")),
-            ),
-            (
-                OsString::from("PATH"),
-                std::env::var_os("PATH").expect("test PATH"),
-            ),
-        ]);
-        let runtime = crate::app::Runtime::from_env(&env, home.path()).expect("runtime");
-        let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let code = run_with_runtime(&runtime, &owned, &mut out, &mut err);
         (
             code,
             String::from_utf8(out).expect("stdout is UTF-8"),
@@ -965,70 +591,24 @@ mod tests {
     }
 
     #[test]
-    fn base_from_values_honors_model_publication() {
-        // The `model.sh` publication read at the dispatcher boundary:
-        // known topologies pass through, anything else (unset,
-        // `missing`, foreign) reads as missing, and an empty git dir
-        // falls back to `$HOME/.dotfiles` like `${VAR:-...}`.
-        let cases: &[(
-            Option<&str>,
-            Option<&str>,
-            crate::repos_base::Topology,
-            &str,
-        )] = &[
-            (
-                Some("separate"),
-                Some("/h/.dotfiles"),
-                crate::repos_base::Topology::Separate,
-                "/h/.dotfiles",
-            ),
-            (
-                Some("ordinary"),
-                Some("/h/.git"),
-                crate::repos_base::Topology::Ordinary,
-                "/h/.git",
-            ),
-            (
-                None,
-                None,
-                crate::repos_base::Topology::Missing,
-                "/h/.dotfiles",
-            ),
-            (
-                Some("missing"),
-                None,
-                crate::repos_base::Topology::Missing,
-                "/h/.dotfiles",
-            ),
-            (
-                Some("bogus"),
-                Some("/h/.git"),
-                crate::repos_base::Topology::Missing,
-                "/h/.git",
-            ),
-            (
-                Some("separate"),
-                Some(""),
-                crate::repos_base::Topology::Separate,
-                "/h/.dotfiles",
-            ),
-            (
-                Some("separate"),
-                None,
-                crate::repos_base::Topology::Separate,
-                "/h/.dotfiles",
-            ),
-        ];
-        let mut observed = Vec::new();
-        for (topology, git_dir, _, _) in cases {
-            let base = base_from_values("/h", *topology, *git_dir);
-            observed.push((base.topology, base.client_git_dir, base.home));
-        }
-        for (index, (_, _, want_topology, want_git_dir)) in cases.iter().enumerate() {
-            let (got_topology, got_git_dir, got_home) = &observed[index];
-            assert_eq!(got_topology, want_topology, "case: {index}");
-            assert_eq!(got_git_dir, want_git_dir, "case: {index}");
-            assert_eq!(got_home, "/h", "case: {index}");
+    fn kernel_commands_report_not_implemented_not_unknown() {
+        // Known commands whose kernels live in other lanes: the
+        // dispatch decision is final, so they must never fall through
+        // to the unknown-command diagnostic. Interim exit is the
+        // generic failure until the owning slice wires the kernel.
+        // (`init` left this set when slice 79 wired it; see the
+        // `init_*` tests below.)
+        for command in [
+            "update", "pull", "fetch", "push", "status", "diff", "doctor", "test",
+        ] {
+            let (code, out, err) = run_text(&[command]);
+            assert_eq!(code, EXIT_ERROR, "command: {command}");
+            assert!(out.is_empty(), "command: {command}");
+            assert_eq!(
+                err,
+                format!("dot: command '{command}' is not yet implemented\n"),
+                "command: {command}"
+            );
         }
     }
 
@@ -1057,7 +637,7 @@ mod tests {
         // inside `_dot_init_error` (pinned against `bin/dot`), and
         // so does this arm — never the dispatcher's ignore-status
         // default, never the interim text.
-        let (code, out, err) = run_init_text(&["init", "--bogus"]);
+        let (code, out, err) = run_text(&["init", "--bogus"]);
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert_eq!(err, "dot init: unknown option: --bogus\n");
@@ -1068,64 +648,10 @@ mod tests {
         // Past parsing, the first resolvable failure also crosses
         // with its code (identity here; the fresh tail stays
         // interim).
-        let (code, out, err) = run_init_text(&["init", "--branch", "main", "notaurl"]);
+        let (code, out, err) = run_text(&["init", "--branch", "main", "notaurl"]);
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert_eq!(err, "dot init: unsupported repository URL: notaurl\n");
-    }
-
-    #[test]
-    fn resume_convergence_failure_preserves_stderr_execution_order() {
-        let report = init_client_command::InitReport {
-            stdout: Vec::new(),
-            stderr: b"dot init: initialization transaction could not be resumed safely\n".to_vec(),
-            code: 1,
-        };
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        write_init_output(
-            &mut out,
-            &mut err,
-            &report,
-            b"update stdout\n",
-            b"update failed\n",
-            true,
-        )
-        .expect("write ordered streams");
-        assert_eq!(out, b"update stdout\n");
-        assert_eq!(
-            err,
-            b"update failed\ndot init: initialization transaction could not be resumed safely\n"
-        );
-    }
-
-    #[test]
-    fn init_convergence_reloads_config_created_after_runtime_capture() {
-        let home = dot_test_support::TempDir::new("cli-init-config-home").expect("home");
-        let state = dot_test_support::TempDir::new("cli-init-config-state").expect("state");
-        let env = BTreeMap::from([
-            (
-                OsString::from("HOME"),
-                home.path().as_os_str().to_os_string(),
-            ),
-            (
-                OsString::from("XDG_STATE_HOME"),
-                state.path().as_os_str().to_os_string(),
-            ),
-        ]);
-        let runtime = crate::app::Runtime::from_env(&env, home.path()).expect("runtime");
-        let config_dir = home.path().join(".config/dot");
-        std::fs::create_dir_all(&config_dir).expect("config dir");
-        std::fs::write(
-            config_dir.join("config"),
-            b"version=1\ndependency_provider=shdeps\n",
-        )
-        .expect("post-capture config");
-
-        let mut err = Vec::new();
-        let config = init_config(&runtime, &mut err).expect("reload cloned config");
-        assert_eq!(config.provider, crate::config::Provider::Shdeps);
-        assert!(err.is_empty());
     }
 
     #[cfg(unix)]

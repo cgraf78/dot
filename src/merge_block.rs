@@ -1,6 +1,6 @@
-//! Marked-block config merging.
+//! Marked-block config merging (slice 6: merge layer start).
 //!
-//! Owns block assembly with
+//! Ports `lib/dot/merge-block.sh` exactly: block assembly with
 //! modeline stripping, prefix-matched stripping (single marker and
 //! whole family), and atomic publish of hand-managed content plus
 //! managed blocks. File effects (sibling temps, digest-skipped

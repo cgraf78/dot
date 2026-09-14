@@ -1,26 +1,36 @@
 //! Transaction record journal for `lib/dot/init-client.sh`: the
 //! write/read/advance cycle plus the parent and prior lookups.
 //!
-//! This module owns the record primitives from
+//! The shell file holds 78 functions — too big for one lane — so
+//! this module owns only the five record primitives from
 //! `_dot_init_safe_value` through `_dot_init_prior_record` in file
 //! order, skipping what other lanes already own: the transaction
 //! record lifecycle (`_dot_init_write_record`,
 //! `_dot_init_read_record`, `_dot_init_record_phase`) with the
 //! parent-intent and prior-snapshot readers (`_dot_init_parent_record`,
-//! `_dot_init_prior_record`). Diagnostics use the shared typed [`Result`]. The sanitizers stay where
+//! `_dot_init_prior_record`). The file-generic `_dot_init_error`
+//! diagnostic stays unported (a bare `printf ... >&2; return 1`
+//! with no family state, absorbed into [`Result`] the way earlier
+//! slices absorb engine diagnostics). The sanitizers stay where
 //! they are: `_dot_init_safe_relative_path` already lives in the
 //! base tree as [`crate::repos_overlays::init_safe_relative_path`]
 //! and this module reuses it through byte-local twins, the way the
-//! identity and candidate modules keep their focused copies.
+//! identity and candidate lanes vendor their own copies.
 //!
-//! Transaction, identity, generation, entry, and candidate responsibilities
-//! live in their corresponding modules. The publish
+//! Lane map, so the integrator can stack without overlap: the
+//! transaction-directory lifecycle lives on `rust-port-slice-35`
+//! (`init_client_transaction`), the host-git identity family on
+//! `rust-port-slice-41` (`init_client_identity`), the git-generation
+//! binding on `rust-port-slice-43` (`init_client_generation`), the
+//! per-entry staging family on `rust-port-slice-46`
+//! (`init_client_entry`), and the candidate planning family on
+//! `rust-port-slice-48` (`init_client_candidate`). The publish
 //! (`publish_intent`, `publish_one`, `publish_worktree`,
 //! `published_stage_matches`, `published_intent_matches`,
 //! `cleanup_published_stage`), delete, rollback, resume, and status
-//! families live in their adjacent native modules.
+//! families stay for later slices.
 //!
-//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the run identity from the
@@ -251,7 +261,7 @@ fn branch_valid(branch: &[u8]) -> bool {
     if branch.is_empty() {
         return false;
     }
-    crate::init_client_identity::host_git_command()
+    std::process::Command::new("git")
         .arg("check-ref-format")
         .arg("--branch")
         .arg(std::ffi::OsStr::from_bytes(branch))
@@ -263,16 +273,34 @@ fn branch_valid(branch: &[u8]) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// The source revision from the shared checkout-or-release identity resolver.
-/// Development keeps the sanitized Git authority; packaged releases use the
-/// matching compiled and archive-metadata commit.
+/// The source checkout revision: `_dot_source_git rev-parse HEAD`
+/// under the sanitized binding. Trailing newlines chomp like the
+/// shell's command substitution; the bytes otherwise cross
+/// untouched, so no UTF-8 assumption sneaks in before the body
+/// is assembled.
 fn source_revision(source_root: &Path) -> Result<Vec<u8>> {
-    crate::startup::source_revision(source_root)
-        .map(String::into_bytes)
-        .ok_or_else(|| Error::Command {
-            command: "resolve source revision".to_string(),
-            status: None,
-        })
+    use std::process::Stdio;
+    let output = temp::sanitized_git(source_root, &["rev-parse", "HEAD"])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|source| Error::Io {
+            context: "read source revision",
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(Error::Command {
+            command: "git rev-parse HEAD".to_string(),
+            status: Some(output.status.to_string()),
+        });
+    }
+    let mut revision = output.stdout;
+    while revision.last() == Some(&b'\n') {
+        revision.pop();
+    }
+    Ok(revision)
 }
 
 /// `_dot_init_write_record`: publish the fourteen-line journal at
