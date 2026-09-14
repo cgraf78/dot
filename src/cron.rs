@@ -11,11 +11,9 @@
 //! stdout before the `||` fallback runs).
 //!
 //! The binary travels as a parameter, like
-//! [`crate::repos_pull_support::pull_cmd`]'s `program`, so
-//! differential tests can point at fixture scripts; the dispatcher
-//! passes `"crontab"`, resolved through `PATH` exactly like the
-//! shell. Dispatch wiring (`cli`) is a later slice: this module owns
-//! only the branch behavior.
+//! [`crate::repos_pull_support::pull_cmd`]'s `program`, so tests can point at
+//! fixture scripts; the dispatcher passes `"crontab"`, resolved through
+//! `PATH`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};

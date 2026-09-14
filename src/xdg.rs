@@ -1,6 +1,6 @@
-//! Public XDG base-directory resolver (slice 2 foundations).
+//! Public XDG base-directory resolver.
 //!
-//! Ports `lib/dot/public/xdg.sh` exactly: empty and relative XDG values
+//! Owns empty and relative XDG handling: these values
 //! fall back to HOME (accepting them would make runtime ownership depend
 //! on cwd), and unknown kinds are usage errors. The shell reports via
 //! `$REPLY` plus exit codes (0 ok, 2 usage, 1 unresolvable HOME); Rust

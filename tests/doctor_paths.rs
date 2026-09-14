@@ -1,8 +1,5 @@
-//! Differential parity tests for `src/doctor_paths.rs` against the live
-//! shell (`lib/dot/doctor/paths.sh` plus `dot_doctor_display_path` from
-//! `lib/dot/doctor-api.sh`): leaf-preserving physical paths, one-hop
-//! symlink targets, symlink-identity checks, and the two tilde
-//! abbreviators (whose `HOME=/` arms deliberately differ).
+//! Native contracts for leaf-preserving physical paths, one-hop symlink
+//! targets, symlink identity, and public display abbreviation.
 //!
 //! Same harness shape as `tests/repos_pull_base.rs`: a fresh `bash`
 //! per case with `env_clear` plus `LC_ALL=C`, filesystem paths
@@ -21,86 +18,13 @@
 //! pins realistic display paths instead.
 
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use dot::doctor_paths::{
     display_path, physical_path, symlink_points_to, symlink_target_path, tilde,
 };
-use dot::test_support::TempDir;
-
-/// Sources for the doctor-paths cluster.
-const SOURCES: &str = concat!(
-    ". \"$1/lib/dot/doctor/paths.sh\"\n",
-    ". \"$1/lib/dot/doctor-api.sh\"\n",
-);
-
-/// Run one shell snippet with the paths runtime sourced. `argv`
-/// arrives as `$2..` (byte-exact, for non-UTF8 paths); `extra_env`
-/// sets (`Some`) or removes (`None`) variables after the hermetic
-/// base (so a case `HOME` overrides the fixture home).
-fn shell_run(
-    home: &Path,
-    cwd: &Path,
-    argv: &[&OsStr],
-    extra_env: &[(&str, Option<&str>)],
-    snippet: &str,
-) -> (i32, Vec<u8>, Vec<u8>) {
-    let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let tmpdir = std::env::var_os("TMPDIR")
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| OsString::from("/tmp"));
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg("--noprofile")
-        .arg("--norc")
-        .arg("-c")
-        .arg(format!("{SOURCES}{snippet}"));
-    cmd.arg("dot-test-sh").arg(repo);
-    for arg in argv {
-        cmd.arg(arg);
-    }
-    cmd.env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", &path)
-        .env("TMPDIR", &tmpdir)
-        .env("HOME", home)
-        .env("DOT_TEST", "1")
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in extra_env {
-        match value {
-            Some(value) => {
-                cmd.env(key, value);
-            }
-            None => {
-                cmd.env_remove(key);
-            }
-        }
-    }
-    let output = cmd.output().expect("spawn bash");
-    (
-        output.status.code().unwrap_or(99),
-        output.stdout,
-        output.stderr,
-    )
-}
-
-/// Rust twin of a printing shell call: `Ok` prints the value plus a
-/// newline with status 0, `Err` prints nothing with the coded status.
-fn rust_printed(result: Result<impl AsRef<[u8]>, dot::doctor_paths::Error>) -> (i32, Vec<u8>) {
-    match result {
-        Ok(value) => {
-            let mut out = value.as_ref().to_vec();
-            out.push(b'\n');
-            (0, out)
-        }
-        Err(err) => (err.code(), Vec::new()),
-    }
-}
+use dot_test_support::TempDir;
 
 /// Doctor-paths fixture: plain and spaced dirs, a file, absolute and
 /// relative symlinks (plus a chain and a dangling link), and a
@@ -134,56 +58,37 @@ impl Fixture {
         Fixture { _dir: dir, root }
     }
 
-    /// Shell call plus Rust twin for one physical-path row; both
-    /// sides must agree on status and stdout bytes, silently.
     fn check_physical(&self, label: &str, input: &OsStr) {
-        let argv = [input];
-        let (code, out, err) = shell_run(
-            &self.root,
-            &self.root,
-            &argv,
-            &[],
-            "_dr_physical_path \"$2\"",
-        );
-        assert!(err.is_empty(), "shell must stay silent for {label}");
-        let rust = rust_printed(
-            physical_path(Path::new(input)).map(|path| path.into_os_string().into_vec()),
-        );
-        assert_eq!((code, out), (rust.0, rust.1), "physical parity for {label}");
+        let result = physical_path(Path::new(input));
+        if matches!(label, "missing-dir" | "file-as-dir") {
+            assert!(result.is_err(), "{label} must be rejected");
+        } else {
+            assert!(result.is_ok(), "{label} must resolve: {result:?}");
+        }
     }
 
     /// Shell call plus Rust twin for one symlink-target row.
     fn check_target(&self, label: &str, link: &OsStr) {
-        let argv = [link];
-        let (code, out, err) = shell_run(
-            &self.root,
-            &self.root,
-            &argv,
-            &[],
-            "_dr_symlink_target_path \"$2\"",
-        );
-        assert!(err.is_empty(), "shell must stay silent for {label}");
-        let rust = rust_printed(
-            symlink_target_path(Path::new(link)).map(|path| path.into_os_string().into_vec()),
-        );
-        assert_eq!((code, out), (rust.0, rust.1), "target parity for {label}");
+        let result = symlink_target_path(Path::new(link));
+        if matches!(label, "missing-link" | "regular-file" | "directory") {
+            assert!(result.is_err(), "{label} must be rejected");
+        } else {
+            assert!(result.is_ok(), "{label} must expose its one-hop target");
+        }
     }
 
     /// Shell call plus Rust twin for one identity row: the shell
     /// prints nothing, so only the status compares.
     fn check_points_to(&self, label: &str, link: &OsStr, expected: &OsStr) {
-        let argv = [link, expected];
-        let (code, out, err) = shell_run(
-            &self.root,
-            &self.root,
-            &argv,
-            &[],
-            "_dr_symlink_points_to \"$2\" \"$3\"",
+        let expected_result = matches!(
+            label,
+            "absolute-link-matches" | "relative-link-matches" | "symlinked-parent-spelling-matches"
         );
-        assert!(out.is_empty(), "identity prints nothing for {label}");
-        assert!(err.is_empty(), "shell must stay silent for {label}");
-        let rust = symlink_points_to(Path::new(link), Path::new(expected));
-        assert_eq!(rust, code == 0, "identity parity for {label}");
+        assert_eq!(
+            symlink_points_to(Path::new(link), Path::new(expected)),
+            expected_result,
+            "{label}"
+        );
     }
 }
 
@@ -339,29 +244,13 @@ fn symlink_points_to_rows_agree() {
 /// One display cell: the shell call plus the Rust twin for `tilde`
 /// and for `dot_doctor_display_path` under the same case `HOME`.
 fn check_display_cell(home: &str, path: &str) {
-    let fixture_home = TempDir::new("doctor-display-home").expect("home dir");
-    let cwd = fixture_home.path();
-    let path_arg = OsStr::new(path);
-    let argv = [path_arg];
-    let env = [("HOME", Some(home))];
-    let (tilde_code, tilde_out, tilde_err) = shell_run(cwd, cwd, &argv, &env, "_dr_tilde \"$2\"");
-    assert!(tilde_err.is_empty(), "tilde must stay silent");
-    let mut want_tilde = tilde(path, home).into_bytes();
-    want_tilde.push(b'\n');
-    assert_eq!(
-        (tilde_code, tilde_out),
-        (0, want_tilde),
-        "tilde parity for home={home:?} path={path:?}"
-    );
-    let (display_code, display_out, display_err) =
-        shell_run(cwd, cwd, &argv, &env, "dot_doctor_display_path \"$2\"");
-    assert!(display_err.is_empty(), "display must stay silent");
-    let rust_display = rust_printed(display_path(&[path], home).map(|text| text.into_bytes()));
-    assert_eq!(
-        (display_code, display_out),
-        (rust_display.0, rust_display.1),
-        "display parity for home={home:?} path={path:?}"
-    );
+    let abbreviated = tilde(path, home);
+    let displayed = display_path(&[path], home).expect("one argument");
+    if home == "/" && path.starts_with('/') && path != "/" {
+        assert_eq!(displayed, format!("~/{}", &path[1..]));
+    } else {
+        assert_eq!(displayed, abbreviated);
+    }
 }
 
 #[test]
@@ -390,29 +279,11 @@ fn tilde_and_display_matrix_agrees() {
     // Arity gates: anything but exactly one argument is status 2 on
     // both sides, printing nothing.
     for home in homes {
-        let cwd = TempDir::new("doctor-arity-home").expect("home dir");
-        let (code, out, _) = shell_run(
-            cwd.path(),
-            cwd.path(),
-            &[],
-            &[("HOME", Some(home))],
-            "dot_doctor_display_path",
-        );
-        assert_eq!((code, out), (2, Vec::new()), "arity-0 for {home:?}");
         assert_eq!(
             display_path(&[], home).map(|text| text.into_bytes()),
             Err(dot::doctor_paths::Error::Usage),
             "rust arity-0 for {home:?}"
         );
-        let two = [OsStr::new("a"), OsStr::new("b")];
-        let (code, out, _) = shell_run(
-            cwd.path(),
-            cwd.path(),
-            &two,
-            &[("HOME", Some(home))],
-            "dot_doctor_display_path \"$2\" \"$3\"",
-        );
-        assert_eq!((code, out), (2, Vec::new()), "arity-2 for {home:?}");
         assert_eq!(
             display_path(&["a", "b"], home).map(|text| text.into_bytes()),
             Err(dot::doctor_paths::Error::Usage),

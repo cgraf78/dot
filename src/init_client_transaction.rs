@@ -4,16 +4,11 @@
 //! with an ownership marker, the ownership gate, orphan recovery,
 //! and publication.
 //!
-//! The shell file holds 79 functions — too big for one lane — so
-//! this module owns only the directory lifecycle: the eight
-//! functions from `_dot_init_state_root` through
-//! `_dot_init_publish_transaction`, minus the file-generic
-//! `_dot_init_error` diagnostic (a bare `printf ... >&2; return 1`
-//! with no family state; the port absorbs it into [`Result`], the
-//! way earlier slices absorb engine diagnostics). Record, claim,
-//! generation, and rollback families stay for later slices.
+//! This module owns the directory lifecycle from state-root resolution through
+//! transaction publication. Record, claim,
+//! generation, and rollback families live in their adjacent native modules.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 
 use std::os::unix::ffi::OsStrExt as _;
