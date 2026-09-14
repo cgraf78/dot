@@ -1,8 +1,9 @@
-//! Published-state recovery and worktree publication for the native init client.
+//! Published-state recovery and worktree publication for `lib/dot/init-client.sh`.
 //!
-//! This module owns the six related functions from
+//! The shell file holds 79 functions — too big for one lane — so this
+//! module owns only the six contiguous functions from
 //! `_dot_init_published_stage_matches` through `_dot_init_single_origin`
-//! in the compatibility contract: the leaf-stage validator
+//! in file order (lines 1279-1417): the leaf-stage validator
 //! ([`published_stage_matches`]), the prepared-intent validator
 //! ([`published_intent_matches`]), the published-stage reaper
 //! ([`cleanup_published_stage`]), the per-entry worktree publisher
@@ -10,12 +11,30 @@
 //! ([`forward_converge`]), and the single-origin reader
 //! ([`single_origin`]).
 //!
-//! Neighboring transaction, identity, generation, entry, candidate,
-//! record, deletion, planning, rollback, resume, and dispatch
-//! contracts live in their corresponding `init_client_*` modules
-//! and are composed by the engine. Diagnostics use the shared typed [`Result`].
+//! Lane map, so the integrator can stack without overlap: the
+//! transaction-directory lifecycle lives on `rust-port-slice-35`
+//! (`init_client_transaction`), the host-git identity family on
+//! `rust-port-slice-41` (`init_client_identity`), the git-generation
+//! binding on `rust-port-slice-43` (`init_client_generation`), the
+//! per-entry staging family on `rust-port-slice-46`
+//! (`init_client_entry`: `entry_intent`, `entry_stage_only_next`,
+//! the stage-claim readers, and the private-directory matchers this
+//! module takes as closures), the candidate planning family on
+//! `rust-port-slice-48` (`init_client_candidate`:
+//! `candidate_matches_git`, `path_state_matches`, `prior_record`),
+//! the transaction record journal on `rust-port-slice-51`
+//! (`init_client_records`) and `rust-port-slice-54`
+//! (`init_client_record`), the deletion-parking family on
+//! `rust-port-slice-55` (`init_client_delete`), and the plan review
+//! and conflict safekeeping on `rust-port-slice-62`
+//! (`init_client_plan`). The publishing siblings `publish_intent`
+//! and `publish_one` stay for later slices, as do the rollback,
+//! resume, status, and command-dispatch families. The file-generic
+//! `_dot_init_error` diagnostic stays unported (a bare
+//! `printf ... >&2; return 1` with no family state, absorbed into
+//! [`Result`] the way earlier slices absorb engine diagnostics).
 //!
-//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the run identity from the
@@ -63,7 +82,7 @@
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 use crate::errors::{Error, Result};
 use crate::temp;
@@ -84,10 +103,11 @@ const STAGE_CLAIM_KIND: &str = "entry";
 /// shell's `_ui_begin 5` literal.
 const CONVERGE_TOTAL: u32 = 5;
 
-/// A published entry intent split into its six returned fields.
-/// This byte-local twin of the entry module's `EntryIntent` keeps
-/// the neighboring contract explicit, including the `-` spellings
-/// carried by the `pending` phase.
+/// A published entry intent: the shell's `REPLY` from
+/// `_dot_init_entry_intent` split into its six tab fields. This is a
+/// byte-local twin of the entry lane's `EntryIntent`, kept local
+/// because that lane is unmerged; the fields mirror it case for
+/// case, including the `-` spellings the `pending` phase carries.
 pub struct IntentRecord {
     /// `pending`, `staged`, or `prepared`: how far publication got.
     pub phase: String,
@@ -103,8 +123,10 @@ pub struct IntentRecord {
     pub next_ino: String,
 }
 
-/// A prior-worktree record split into its six persisted fields.
-/// Kept local to make the neighboring native contract explicit.
+/// A prior-worktree record: the shell's `REPLY` from
+/// `_dot_init_prior_record` split into its six tab fields. This is a
+/// byte-local twin of the candidate lane's record, kept local
+/// because that lane is unmerged.
 pub struct PriorRecord {
     /// `absent`, `regular`, `symlink`, or `directory`.
     pub kind: String,
@@ -137,58 +159,62 @@ pub struct PublishGit<'a> {
 
 /// Private-directory gate: the entry lane's
 /// `_dot_init_private_directory_matches` by position
-/// (`path identity mode`), injected to keep the neighboring native
-/// contract behind an explicit boundary.
+/// (`path identity mode`), injected because that lane is unmerged.
 pub type PrivateDirectoryMatches<'a> = dyn Fn(&Path, &str, &str) -> bool + 'a;
 
-/// Stage-content gate for the neighboring native entry contract.
+/// Stage-content gate: the entry lane's
+/// `_dot_init_entry_stage_only_next`, injected because that lane is
+/// unmerged.
 pub type StageOnlyNext<'a> = dyn Fn(&Path) -> bool + 'a;
 
 /// Claim-content gate: the entry lane's
 /// `_dot_init_stage_claim_matches` by position
-/// (`stage kind path`), injected to keep the neighboring native
-/// contract behind an explicit boundary.
+/// (`stage kind path`), injected because that lane is unmerged.
 pub type StageClaimMatches<'a> = dyn Fn(&Path, &str, &str) -> bool + 'a;
 
 /// Empty-directory gate: the entry lane's
 /// `_dot_init_private_empty_directory_matches` by position
-/// (`path identity mode`), injected to keep the neighboring native
-/// contract behind an explicit boundary.
+/// (`path identity mode`), injected because that lane is unmerged.
 pub type PrivateEmptyDirectoryMatches<'a> = dyn Fn(&Path, &str, &str) -> bool + 'a;
 
-/// Claim reaper for the neighboring native entry contract, by
-/// position (`stage kind path`).
+/// Claim reaper: the entry lane's `_dot_init_stage_claim_remove` by
+/// position (`stage kind path`), injected because that lane is
+/// unmerged.
 pub type StageClaimRemove<'a> = dyn Fn(&Path, &str, &str) -> Result<()> + 'a;
 
-/// Intent-record reader for the neighboring native entry contract,
-/// by position (`file mode oid path`).
+/// Intent-record reader: the entry lane's `_dot_init_entry_intent`
+/// by position (`file mode oid path`), injected because that lane
+/// is unmerged. Tests feed either a stub or a closure that runs the
+/// live shell predicate, so the orchestration below stays
+/// differentially covered either way.
 pub type EntryIntentFn<'a> = dyn Fn(&Path, &str, &str, &str) -> Result<IntentRecord> + 'a;
 
-/// Prior-record reader for the neighboring native candidate
-/// contract, by position (`prior path`).
+/// Prior-record reader: the candidate lane's `_dot_init_prior_record`
+/// by position (`prior path`), injected because that lane is
+/// unmerged.
 pub type PriorRecordFn<'a> = dyn Fn(&Path, &str) -> Result<PriorRecord> + 'a;
 
 /// Worktree-blob matcher: the candidate lane's
 /// `_dot_init_candidate_matches_git` by position
 /// (`mode oid path`, git binding curried by the engine), injected
-/// to keep the neighboring native contract explicit.
+/// because that lane is unmerged.
 pub type CandidateMatchesGit<'a> = dyn Fn(&str, &str, &str) -> bool + 'a;
 
 /// Worktree-state matcher: the candidate lane's
 /// `_dot_init_path_state_matches` by position
-/// (`target kind dev ino mode size value`), injected to keep the
-/// neighboring native contract explicit.
+/// (`target kind dev ino mode size value`), injected because that
+/// lane is unmerged. Same shape as the plan lane's twin.
 pub type StateMatches<'a> = dyn Fn(&Path, &str, &str, &str, &str, &str, &str) -> bool + 'a;
 
-/// Intent publisher for the neighboring native publication
-/// contract, by position (`file mode oid path`).
+/// Intent publisher: the later publish lane's `_dot_init_publish_intent`
+/// by position (`file mode oid path`), injected because that lane is
+/// unmerged.
 pub type PublishIntentFn<'a> = dyn Fn(&Path, &str, &str, &str) -> Result<()> + 'a;
 
 /// Single-entry publisher: the later publish lane's
 /// `_dot_init_publish_one` by position
 /// (`transaction intent mode oid path`, git binding curried by the
-/// engine), injected to keep the neighboring native contract
-/// explicit.
+/// engine), injected because that lane is unmerged.
 pub type PublishOneFn<'a> = dyn Fn(&Path, &Path, &str, &str, &str) -> Result<()> + 'a;
 
 /// The entry-family gates [`published_stage_matches`] and
@@ -402,7 +428,7 @@ fn stage_claim_file(stage: &Path) -> PathBuf {
 /// `|| return 1` on the substitution.
 fn git_hash_stdin(input: &[u8], home: &Path, work_dir: &Path) -> Result<String> {
     use std::io::Write as _;
-    let mut child = crate::init_client_identity::host_git_command()
+    let mut child = Command::new("git")
         .arg("hash-object")
         .arg("--stdin")
         .env("LC_ALL", "C")
@@ -443,9 +469,9 @@ fn git_hash_stdin(input: &[u8], home: &Path, work_dir: &Path) -> Result<String> 
 /// like the shell's `|| return 1` after each closing command. Git's
 /// own stderr is silenced (the candidate lane precedent): these
 /// commands print nothing on success, and their diagnostics stay
-/// owned by the surrounding init orchestration.
+/// owned by later lanes.
 fn git_dir_run(git: &PublishGit<'_>, home: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = crate::init_client_identity::host_git_command()
+    let output = Command::new("git")
         .arg("--git-dir")
         .arg(git.git_dir)
         .args(args)
@@ -472,7 +498,7 @@ fn git_dir_run(git: &PublishGit<'_>, home: &Path, args: &[&str]) -> Result<Vec<u
 /// marker and never the in-progress `next` file. With a claim, the
 /// claim must verify for this path; without one, the directory must
 /// be empty. A pure predicate: every gate answers through the
-/// entry-family hooks so the engine can compose native contracts.
+/// entry-family hooks, so tests can feed the live shell functions.
 pub fn published_stage_matches(
     stage: &Path,
     expected_identity: &str,
@@ -501,8 +527,9 @@ pub fn published_stage_matches(
 /// proves this path already published. A present stage must still
 /// verify; a consumed stage (removed after publication) skips that
 /// gate, exactly like the shell's existence check. Returns the
-/// stage and identity bytes (`stage\tidentity`, no trailing newline)
-/// for the caller to split.
+/// `REPLY` bytes (`stage\tidentity`, no trailing newline) for the
+/// caller to split, so the parity tests can compare them byte for
+/// byte against the live shell.
 ///
 /// A failed identity read refuses rather than errors: the shell's
 /// `$(... || true)` compares empty against the recorded identity.
@@ -748,7 +775,7 @@ pub fn forward_converge(skip_provider: bool, hooks: &ConvergeHooks<'_>) -> Resul
 /// return) all refuse with no output, like the shell's bare
 /// `return 1`s — git's own stderr is silenced.
 pub fn single_origin(scope: &OriginScope<'_>, home: &Path) -> Result<Vec<u8>> {
-    let mut command = crate::init_client_identity::host_git_command();
+    let mut command = Command::new("git");
     match scope {
         OriginScope::Separate { git_dir } => {
             command
