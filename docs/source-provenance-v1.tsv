@@ -97,7 +97,6 @@ tests/lib/repo.sh	standalone:new
 tests/lib/test.sh	standalone:new
 tests/library-test	standalone:new
 tests/license-test	standalone:new
-tests/link_prep.rs	standalone:new
 tests/log.rs	standalone:new
 tests/merge-block-test	dotfiles:tests/core-merges-test@dotfiles-v1
 tests/merge_block.rs	standalone:new
@@ -183,6 +182,3 @@ tests/init_client_publish_intent.rs	standalone:new
 tests/init_client_safe_path.rs	standalone:new
 tests/init_client_command.rs	standalone:new
 tests/startup.rs	standalone:new
-tests/update_run.rs	standalone:new
-tests/init_client_engine.rs	standalone:new
-tests/update_parpull.rs	standalone:new
