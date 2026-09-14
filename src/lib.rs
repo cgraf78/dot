@@ -9,6 +9,7 @@
 
 #![deny(missing_docs)]
 
+pub mod app;
 pub mod cleanup;
 pub mod cli;
 pub mod config;
@@ -30,6 +31,7 @@ pub mod init_client_adopt;
 pub mod init_client_candidate;
 pub mod init_client_command;
 pub mod init_client_delete;
+pub mod init_client_engine;
 pub mod init_client_entry;
 pub mod init_client_generation;
 pub mod init_client_git;
@@ -60,6 +62,9 @@ pub mod repos_commands;
 pub mod repos_config;
 pub mod repos_dirty;
 pub mod repos_git;
+pub mod repos_link_all;
+pub mod repos_link_exec;
+pub mod repos_link_prep;
 pub mod repos_overlays;
 pub mod repos_pull;
 pub mod repos_pull_backup;
@@ -81,7 +86,9 @@ pub mod test_suites;
 pub mod test_support;
 pub mod ui;
 pub mod update;
+pub mod update_engine;
 pub mod update_lock;
+pub mod update_run;
 pub mod version;
 pub mod xdg;
 
