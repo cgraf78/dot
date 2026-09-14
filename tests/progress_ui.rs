@@ -843,9 +843,12 @@ fn progress_detail_total_gate_agrees() {
 }
 
 /// Replace rendered elapsed stamps (`in 12s.`, `    3s` before
-/// end-of-line or a carriage return) with placeholders. Stage
-/// outputs embed `$SECONDS` deltas no harness can pin, so both
-/// engines normalize before comparing structure.
+/// end-of-line or a carriage return) with placeholders. This is a
+/// shell-renderer harness normalizer, deliberately distinct from
+/// [`dot::progress_ui::normalize_elapsed`]: it must compare ANSI
+///-wrapped and live carriage-return frames, including negative
+/// `$SECONDS` deltas, which are outside the plain captured-progress
+/// row contract.
 fn normalize_elapsed(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -908,6 +911,13 @@ fn normalize_elapsed_exact_done_bytes() {
         normalize_elapsed(negative),
         b"<B><W>Done in Ns<R>\n".as_slice()
     );
+}
+
+#[test]
+fn harness_elapsed_normalizer_handles_frames_outside_the_shared_contract() {
+    let frame = b"<B><W>Done in -90s<R>\r";
+    assert_eq!(normalize_elapsed(frame), b"<B><W>Done in Ns<R>\r");
+    assert_eq!(dot::progress_ui::normalize_elapsed(frame), frame);
 }
 
 #[test]

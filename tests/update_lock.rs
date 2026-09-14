@@ -168,6 +168,31 @@ fn acquire_release_round_trip() {
     assert!(!dir.exists());
 }
 
+/// The lock and profile lifecycle ledger share `<state>/dot`; acquiring a
+/// lock must leave that common trusted-state directory private so the later
+/// ledger publication does not reject an ancestor the lock just created.
+#[cfg(unix)]
+#[test]
+fn acquire_makes_shared_dot_state_directory_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let scratch = dot::test_support::TempDir::new("lock-private-dot").expect("scratch");
+    let state = scratch.path().join("state");
+    let log = test_log();
+    let mut warnings = Vec::new();
+    let guard =
+        dot::update_lock::acquire(&state, false, &log, None, &mut warnings).expect("acquire");
+    assert!(warnings.is_empty(), "fresh acquire warned: {warnings:?}");
+    let dot_dir = state.join(dot::update_lock::DOT_DIR_NAME);
+    let mode = std::fs::metadata(&dot_dir)
+        .expect("shared dot directory")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700, "shared dot directory mode");
+    drop(guard);
+}
+
 /// Live contention: a holder sleeps with the lock; a contender must
 /// see exit 75 with the pid warning (both engines, both directions).
 /// Cron mode keeps the same busy OUTCOME but stays silent on the warn
