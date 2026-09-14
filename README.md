@@ -1,5 +1,7 @@
 # dot
 
+![Tests](https://github.com/cgraf78/dot/actions/workflows/test.yml/badge.svg?branch=main)
+
 `dot` is a reusable dotfiles convergence engine. It manages a client Git
 repository whose work tree is your home directory, optional overlay
 repositories, versioned extension hooks, and an optional dependency provider.
