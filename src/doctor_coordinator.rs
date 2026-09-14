@@ -20,11 +20,10 @@
 //!   failure travels as [`Discovery::error`] alongside the partial
 //!   listing, never as an `Err` — instead of "fixing" the swallowed
 //!   status the shell suite pins.
-//! - Per-file trust validation (`_dot_extension_file_validate`) runs
-//!   before key derivation in the shell but belongs to the
-//!   extension-trust lane; [`collect_specs`] assumes a trusted
-//!   listing the way the differential rows stub that check to
-//!   success, and documents the seam.
+//! - Per-file trust validation (`_dot_extension_file_validate`) belongs to the
+//!   extension-trust lane. [`collect_specs_with`] accepts that predicate so
+//!   trust and identity failures retain the shell loop's first-failure order;
+//!   [`collect_specs`] supplies the trusted test seam used by focused rows.
 //! - Names travel as `&[u8]` throughout (byte sort is `LC_ALL=C`
 //!   sort; the identity character classes are ASCII ranges), so
 //!   non-UTF8 entry names behave like the shell's.
@@ -54,6 +53,12 @@ pub struct Spec {
 /// [`Discovery::error`] with [`SpecError::code`] pinned at 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecError {
+    /// `dot: unsafe doctor extension: <path>` — the trust gate failed before
+    /// the script's identity was interpreted.
+    Unsafe {
+        /// Offending extension path.
+        script: PathBuf,
+    },
     /// `dot: invalid doctor extension identity: <basename>` — the
     /// key matches neither the bare nor the numerically prefixed
     /// identity shape.
@@ -74,6 +79,7 @@ impl SpecError {
     /// pipe swallows it before callers can see it).
     pub fn code(self) -> i32 {
         match self {
+            SpecError::Unsafe { .. } => 1,
             SpecError::InvalidIdentity { .. } => 1,
             SpecError::DuplicateIdentity { .. } => 1,
         }
@@ -83,6 +89,12 @@ impl SpecError {
     /// trailing newline included.
     pub fn message(&self) -> Vec<u8> {
         match self {
+            SpecError::Unsafe { script } => {
+                let mut line = b"dot: unsafe doctor extension: ".to_vec();
+                line.extend_from_slice(script.as_os_str().as_encoded_bytes());
+                line.push(b'\n');
+                line
+            }
             SpecError::InvalidIdentity { file_name } => {
                 let mut line = b"dot: invalid doctor extension identity: ".to_vec();
                 line.extend_from_slice(file_name);
@@ -202,6 +214,16 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// shell's missing-root early return runs before this logic, so
 /// callers pass a directory they already know exists.
 pub fn collect_specs(dir: &Path) -> std::io::Result<Discovery> {
+    collect_specs_with(dir, |_| true)
+}
+
+/// Discover doctor extensions with the caller's trust predicate in the same
+/// ordered loop as identity validation. This preserves the first failing
+/// condition when an unsafe script precedes a malformed or duplicate name.
+pub fn collect_specs_with(
+    dir: &Path,
+    mut trusted: impl FnMut(&Path) -> bool,
+) -> std::io::Result<Discovery> {
     let mut names: Vec<Vec<u8>> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -219,6 +241,16 @@ pub fn collect_specs(dir: &Path) -> std::io::Result<Discovery> {
     let mut specs: Vec<Spec> = Vec::new();
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     for name in &names {
+        let mut script = dir_bytes.to_vec();
+        script.push(b'/');
+        script.extend_from_slice(name);
+        let script = PathBuf::from(std::ffi::OsStr::from_bytes(&script));
+        if !trusted(&script) {
+            return Ok(Discovery {
+                specs,
+                error: Some(SpecError::Unsafe { script }),
+            });
+        }
         let key = extension_key(name).to_vec();
         let identity = match extension_identity(&key) {
             Some(identity) => identity.to_vec(),
@@ -237,13 +269,7 @@ pub fn collect_specs(dir: &Path) -> std::io::Result<Discovery> {
                 error: Some(SpecError::DuplicateIdentity { identity }),
             });
         }
-        let mut script = dir_bytes.to_vec();
-        script.push(b'/');
-        script.extend_from_slice(name);
-        specs.push(Spec {
-            key,
-            script: PathBuf::from(std::ffi::OsStr::from_bytes(&script)),
-        });
+        specs.push(Spec { key, script });
     }
     // The shell re-sorts the full rendered lines; sorting the
     // rendered bytes (not just keys) keeps `key`-prefix corners
@@ -252,26 +278,9 @@ pub fn collect_specs(dir: &Path) -> std::io::Result<Discovery> {
     Ok(Discovery { specs, error: None })
 }
 
-/// Which `_dr_*` renderer `_dot_doctor_render_records` dispatches a
-/// result-file row to, by its `kind` column. Known kinds render;
-/// anything else (empty kinds included) fails as
-/// `doctor extension emitted an invalid result`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordKind {
-    /// `section`: `_dr_section "$message"`.
-    Section,
-    /// `ok`: `_dr_ok "$message" "$detail"`.
-    Ok,
-    /// `warn`: `_dr_warn "$message" "$detail"`.
-    Warn,
-    /// `fail`: `_dr_fail "$message" "$detail"`.
-    Fail,
-    /// `skip`: `_dr_skip "$message" "$detail"`.
-    Skip,
-    /// Any other kind: `_dr_fail 'doctor extension emitted an
-    /// invalid result' "$kind"`.
-    Unknown,
-}
+/// The canonical record kind, retained under the coordinator's historical
+/// name for callers that only perform extension dispatch.
+pub use crate::doctor_runtime::Kind as RecordKind;
 
 /// The `case $kind in ...` dispatch of
 /// `_dot_doctor_render_records`: the five known kinds map to their

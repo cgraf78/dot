@@ -16,7 +16,8 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use dot::doctor_records::{fail, ok, record, section, skip, warn};
+use dot::doctor_records::{fail, ok, read, record, section, skip, warn};
+use dot::doctor_runtime::{Palette, render};
 use dot::test_support::TempDir;
 
 /// Sources for the doctor-records cluster: the extension API only.
@@ -218,6 +219,58 @@ fn check_row(name: &str, call: &Call, setup: Setup, select: Select) {
 /// Short byte-string helper for the row table.
 fn b(text: &str) -> Vec<u8> {
     text.as_bytes().to_vec()
+}
+
+fn check_render(name: &str, rows: &[u8]) {
+    let dir = TempDir::new("doctor-record-render").expect("fixture dir");
+    let results = dir.path().join("results");
+    std::fs::write(&results, rows).expect("result rows");
+    let argv = [results.as_os_str()];
+    let snippet = concat!(
+        ". \"$1/lib/dot/doctor/runtime.sh\"\n",
+        ". \"$1/lib/dot/doctor.sh\"\n",
+        "_dot_doctor_render_records \"$2\"\n",
+    );
+    let (code, shell, err) = shell_run(dir.path(), &argv, snippet);
+    assert_eq!(code, 0, "shell render status for {name}");
+    assert!(err.is_empty(), "shell render stderr for {name}: {err:?}");
+    let records = read(&results).expect("read result rows");
+    assert_eq!(
+        render(&records, &Palette::empty()),
+        shell,
+        "render for {name}"
+    );
+}
+
+#[test]
+fn render_empty_message_agrees() {
+    check_render("empty message", b"ok\t\tdetail\n");
+}
+
+#[test]
+fn render_repeated_and_leading_tabs_agrees() {
+    check_render(
+        "repeated and leading tabs",
+        b"\t\tok\t\tmessage\t\tdetail\n",
+    );
+    check_render(
+        "repeated tabs in final field",
+        b"ok\tmessage\tone\t\ttwo\t\n",
+    );
+}
+
+#[test]
+fn render_unterminated_rows_agree() {
+    check_render("unterminated verdict", b"warn\tmessage\tdetail");
+    check_render("unterminated tabs", b"\t\t");
+}
+
+#[test]
+fn render_whitespace_only_rows_agree() {
+    check_render("newline row", b"\n");
+    check_render("tab row", b"\t\t\n");
+    check_render("space row", b"  \n");
+    check_render("unterminated space row", b"  ");
 }
 
 #[test]
