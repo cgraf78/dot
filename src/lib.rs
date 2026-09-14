@@ -1,20 +1,19 @@
 //! `dot`: fast declarative dotfiles manager.
 //!
-//! The Rust crate owns the CLI and engine implementation. Shell retained under
-//! `lib/dot/public/` is a versioned compatibility boundary for user hooks and
-//! executable test suites, not an alternate engine or fallback. Native unit
-//! and integration tests own engine regression coverage; retained shell suites
-//! validate only actual shell-facing interfaces, packaging, and bootstrap.
+//! The Rust crate owns the implementation. The shell tree under `lib/`
+//! remains the behavior owner until each slice cuts over; `tests/*-test`
+//! (run via `bash tests/run`) is the parity oracle and must stay green.
+//! Public shell API boundaries (`lib/dot/public/*`, `hook-api-v1.tsv`,
+//! `doctor-api-v1.tsv`, `test-api-v1.tsv`) are compatibility constraints,
+//! not implementation details to mirror.
 
 #![deny(missing_docs)]
 
-pub mod app;
 pub mod cleanup;
 pub mod cli;
 pub mod config;
 pub mod constants;
 pub mod cron;
-pub mod doctor;
 pub mod doctor_checks;
 pub mod doctor_coordinator;
 pub mod doctor_orchestrator;
@@ -27,12 +26,10 @@ pub mod extension_worker;
 pub mod families;
 pub mod glob;
 pub mod hook_api;
-pub(crate) mod hook_worker;
 pub mod init_client_adopt;
 pub mod init_client_candidate;
 pub mod init_client_command;
 pub mod init_client_delete;
-pub mod init_client_engine;
 pub mod init_client_entry;
 pub mod init_client_generation;
 pub mod init_client_git;
@@ -42,6 +39,7 @@ pub mod init_client_plan;
 pub mod init_client_publish;
 pub mod init_client_publish_intent;
 pub mod init_client_record;
+pub mod init_client_records;
 pub mod init_client_resume;
 pub mod init_client_rollback;
 pub mod init_client_safe_path;
@@ -62,9 +60,6 @@ pub mod repos_commands;
 pub mod repos_config;
 pub mod repos_dirty;
 pub mod repos_git;
-pub mod repos_link_all;
-pub mod repos_link_exec;
-pub mod repos_link_prep;
 pub mod repos_overlays;
 pub mod repos_pull;
 pub mod repos_pull_backup;
@@ -78,19 +73,15 @@ pub mod reserved;
 pub mod run;
 pub mod shdeps;
 pub mod shdeps_env_abi;
-pub(crate) mod shdeps_provider;
 pub mod shdeps_ui;
 pub mod shdeps_ui_render;
 pub mod startup;
 pub mod temp;
-pub(crate) mod test_command;
-pub(crate) mod test_runner;
 pub mod test_suites;
+pub mod test_support;
 pub mod ui;
 pub mod update;
-pub mod update_engine;
 pub mod update_lock;
-pub mod update_run;
 pub mod version;
 pub mod xdg;
 

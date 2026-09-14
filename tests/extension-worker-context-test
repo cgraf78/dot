@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+
+HOME=$DOT_TEST_TMP/home
+DOT_SOURCE_ROOT=$DOT_TEST_ROOT
+DOT_EXTENSIONS_DIR=$HOME/extensions
+export HOME DOT_SOURCE_ROOT DOT_EXTENSIONS_DIR
+mkdir -p "$DOT_EXTENSIONS_DIR/pre-sync.d" "$DOT_EXTENSIONS_DIR/merge-hooks.d" \
+  "$DOT_EXTENSIONS_DIR/doctor.d"
+chmod 0700 "$DOT_EXTENSIONS_DIR" "$DOT_EXTENSIONS_DIR"/*
+
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/public/xdg.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/temp.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/overlay-context.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/extension-worker-launch.sh"
+
+descriptor=$HOME/.config/dot/overlays.d/10-example.conf
+overlay=$HOME/.dotfiles-example
+origin=https://example.invalid/example.git
+mkdir -p "${descriptor%/*}" "$overlay"
+printf 'url=%s\n' "$origin" >"$descriptor"
+records=("example|$overlay|$origin|$descriptor|true|git")
+
+pre_sync=$DOT_EXTENSIONS_DIR/pre-sync.d/10-context.sh
+cat >"$pre_sync" <<'HOOK'
+prepare() {
+  [[ $DOT_PRE_SYNC_STAGE == prepare ]]
+  [[ ${#OVERLAYS[@]} -eq 1 ]]
+  [[ ${OVERLAYS[0]} == "example|$HOME/.dotfiles-example|https://example.invalid/example.git|$HOME/.config/dot/overlays.d/10-example.conf|true|git" ]]
+}
+HOOK
+chmod 0600 "$pre_sync"
+
+temporary=$HOME/worker
+mkdir "$temporary"
+chmod 0700 "$temporary"
+result=$temporary/result
+: >"$result"
+chmod 0600 "$result"
+_dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+_dot_extension_worker_run pre-sync "$pre_sync" "$temporary" "$result" \
+  "$context" "$token"
+assert_eq 1 "$(<"$result")" 'pre-sync worker ran with decoded context'
+[[ ! -e $context && ! -L $context ]] || fail 'worker did not consume context'
+
+# Profile deactivation receives one saved Git authority record, but old
+# overlays are intentionally hidden from the ordinary active-family API.
+retiring=$HOME/.dotfiles-retiring
+retiring_descriptor=$HOME/.config/dot/overlays.d/20-retiring.conf
+retiring_origin=https://example.invalid/retiring.git
+mkdir -p "$retiring/dot" "$retiring/support"
+cat >"$retiring/support/helper.sh" <<'HELPER'
+retiring_support_run() {
+  printf '%s|%s\n' "$DOT_RETIRING_OVERLAY" "${#OVERLAYS[@]}" \
+    >"$HOME/deactivation-observed"
+}
+HELPER
+cat >"$retiring/dot/profile-deactivate" <<'HOOK'
+deactivate() {
+  dot_retiring_overlay_file support/helper.sh || return
+  # shellcheck source=/dev/null
+  . "$REPLY" || return
+  retiring_support_run
+}
+HOOK
+chmod 0600 "$retiring/dot/profile-deactivate" "$retiring/support/helper.sh"
+git -C "$retiring" init -q
+git -C "$retiring" config user.name 'Dot Test'
+git -C "$retiring" config user.email dot-test@example.invalid
+git -C "$retiring" add dot/profile-deactivate support/helper.sh
+git -C "$retiring" commit -qm 'Add profile deactivation fixture'
+git -C "$retiring" remote add origin "$retiring_origin"
+printf 'url=%s\n' "$retiring_origin" >"$retiring_descriptor"
+retiring_record="retiring|$retiring|$retiring_origin|$retiring_descriptor|true|git"
+hardlinks_supported=false
+if ln "$retiring/support/helper.sh" "$temporary/hardlink-probe" 2>/dev/null; then
+  hardlinks_supported=true
+  rm "$temporary/hardlink-probe"
+fi
+: >"$result"
+_dot_overlay_context_create "$temporary" deactivate retiring none \
+  "$retiring_record"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+_dot_extension_worker_run deactivate "$retiring/dot/profile-deactivate" \
+  "$temporary" "$result" "$context" "$token"
+assert_eq 1 "$(<"$result")" 'deactivation worker ran with saved authority'
+assert_eq 'retiring|0' "$(<"$HOME/deactivation-observed")" \
+  'deactivation worker exposes identity without active overlays'
+
+# The repository-only entry point is a fixed, single-link, non-writable file
+# below the exact recorded Git checkout. Exercise each trust boundary directly.
+# shellcheck source=../lib/dot/repos/config.sh
+. "$DOT_TEST_ROOT/lib/dot/repos/config.sh"
+# shellcheck source=../lib/dot/repos/overlays.sh
+. "$DOT_TEST_ROOT/lib/dot/repos/overlays.sh"
+# shellcheck source=../lib/dot/extension-trust.sh
+. "$DOT_TEST_ROOT/lib/dot/extension-trust.sh"
+# shellcheck disable=SC2034 # Read dynamically by the retiring-overlay lookup.
+DOT_RETIRING_OVERLAY_ROOT=$retiring
+dot_retiring_overlay_file support/helper.sh ||
+  fail 'rejected a trusted retiring-overlay support file'
+assert_eq "$retiring/support/helper.sh" "$REPLY" \
+  'retiring-overlay support lookup returns the validated path'
+mv "$retiring/support/helper.sh" "$retiring/support/helper.sh.real"
+ln -s helper.sh.real "$retiring/support/helper.sh"
+if dot_retiring_overlay_file support/helper.sh; then
+  fail 'accepted a symlinked retiring-overlay support file'
+fi
+rm "$retiring/support/helper.sh"
+mv "$retiring/support/helper.sh.real" "$retiring/support/helper.sh"
+if $hardlinks_supported; then
+  ln "$retiring/support/helper.sh" "$retiring/support/helper.sh.hardlink"
+  if dot_retiring_overlay_file support/helper.sh; then
+    fail 'accepted a hard-linked retiring-overlay support file'
+  fi
+  rm "$retiring/support/helper.sh.hardlink"
+fi
+deactivate_script=$retiring/dot/profile-deactivate
+mv "$deactivate_script" "$deactivate_script.real"
+ln -s profile-deactivate.real "$deactivate_script"
+if _dot_profile_deactivation_validate "$retiring_record" "$deactivate_script"; then
+  fail 'accepted a symlinked profile deactivation entry point'
+fi
+rm "$deactivate_script"
+mv "$deactivate_script.real" "$deactivate_script"
+if $hardlinks_supported; then
+  ln "$deactivate_script" "$retiring/dot/profile-deactivate.hardlink"
+  if _dot_profile_deactivation_validate "$retiring_record" "$deactivate_script"; then
+    fail 'accepted a hard-linked profile deactivation entry point'
+  fi
+  rm "$retiring/dot/profile-deactivate.hardlink"
+fi
+chmod 0666 "$deactivate_script"
+if _dot_profile_deactivation_validate "$retiring_record" "$deactivate_script"; then
+  fail 'accepted a writable profile deactivation entry point'
+fi
+chmod 0600 "$deactivate_script"
+chmod 0777 "$retiring/dot"
+if _dot_profile_deactivation_validate "$retiring_record" "$deactivate_script"; then
+  fail 'accepted a profile deactivation entry point below a writable parent'
+fi
+chmod 0700 "$retiring/dot"
+printf 'safe but misplaced\n' >"$retiring/other"
+chmod 0600 "$retiring/other"
+if _dot_profile_deactivation_validate "$retiring_record" "$retiring/other"; then
+  fail 'accepted a profile deactivation entry point at the wrong path'
+fi
+local_descriptor=$HOME/.config/dot/overlays.d/30-local.conf
+printf 'sync=none\npath=%s\n' "$HOME/local-overlay" >"$local_descriptor"
+local_record="local|$HOME/local-overlay||$local_descriptor|false|none"
+if _dot_profile_deactivation_validate "$local_record" \
+  "$HOME/local-overlay/dot/profile-deactivate"; then
+  fail 'accepted executable deactivation authority from sync=none'
+fi
+
+# Lifecycle authority is private durable state. Reject alternate names,
+# aliases, permissive files, malformed framing, duplicates, and oversized data.
+# shellcheck source=../lib/dot/profile-lifecycle.sh
+. "$DOT_TEST_ROOT/lib/dot/profile-lifecycle.sh"
+_warn() { :; }
+lifecycle_dir=$HOME/lifecycle
+mkdir "$lifecycle_dir"
+chmod 0700 "$lifecycle_dir"
+DOT_PROFILE_LIFECYCLE_LEDGER=$lifecycle_dir/ledger
+printf 'version=1\n%s\n' "$retiring_record" >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+chmod 0600 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+_dot_profile_lifecycle_load || fail 'rejected a valid lifecycle ledger'
+ledger_cases=(symlink mode malformed duplicate control oversize)
+if $hardlinks_supported; then ledger_cases+=(hardlink); fi
+for ledger_case in "${ledger_cases[@]}"; do
+  rm -f "$DOT_PROFILE_LIFECYCLE_LEDGER" "$lifecycle_dir/alias"
+  case $ledger_case in
+    symlink)
+      printf 'version=1\n' >"$lifecycle_dir/alias"
+      chmod 0600 "$lifecycle_dir/alias"
+      ln -s alias "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ;;
+    hardlink)
+      printf 'version=1\n' >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+      chmod 0600 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ln "$DOT_PROFILE_LIFECYCLE_LEDGER" "$lifecycle_dir/alias"
+      ;;
+    mode)
+      printf 'version=1\n' >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+      chmod 0644 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ;;
+    malformed)
+      printf 'version=2\n' >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+      chmod 0600 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ;;
+    duplicate)
+      printf 'version=1\n%s\n%s\n' "$retiring_record" "$retiring_record" >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+      chmod 0600 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ;;
+    control)
+      printf 'version=1\n%s\n' "${retiring_record/example/example$'\033'}" >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+      chmod 0600 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ;;
+    oversize)
+      {
+        printf 'version=1\n'
+        head -c 1048576 /dev/zero | tr '\0' x
+      } >"$DOT_PROFILE_LIFECYCLE_LEDGER"
+      chmod 0600 "$DOT_PROFILE_LIFECYCLE_LEDGER"
+      ;;
+  esac
+  if _dot_profile_lifecycle_load >/dev/null 2>&1; then
+    fail "accepted unsafe lifecycle ledger: $ledger_case"
+  fi
+done
+rm -f "$DOT_PROFILE_LIFECYCLE_LEDGER" "$lifecycle_dir/alias"
+
+for case_name in token tamper unsafe-mode expired symlink wrong-mode wrong-kind wrong-stage reuse; do
+  : >"$result"
+  _dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
+  context=$REPLY_PATH
+  token=$REPLY_TOKEN
+  case $case_name in
+    token) token=wrong-token ;;
+    tamper) printf 'trailing' >>"$context" ;;
+    unsafe-mode) chmod 0644 "$context" ;;
+    expired) touch -t 200001010000 "$context" ;;
+    symlink)
+      saved_context=$temporary/saved-context
+      mv "$context" "$saved_context"
+      ln -s "$saved_context" "$context"
+      ;;
+    wrong-mode) ;;
+    wrong-kind)
+      rm "$context"
+      if _dot_overlay_context_create "$temporary" pre-sync active prepare \
+        "${records[@]}" >/dev/null 2>&1; then
+        fail 'context encoder accepted wrong set kind'
+      fi
+      continue
+      context=$REPLY_PATH
+      token=$REPLY_TOKEN
+      ;;
+    wrong-stage)
+      rm "$context"
+      if _dot_overlay_context_create "$temporary" pre-sync eligible none \
+        "${records[@]}" >/dev/null 2>&1; then
+        fail 'context encoder accepted wrong stage'
+      fi
+      continue
+      context=$REPLY_PATH
+      token=$REPLY_TOKEN
+      ;;
+    reuse) ;;
+  esac
+  worker_mode=pre-sync
+  [[ $case_name != wrong-mode ]] || worker_mode=merge
+  if [[ $case_name == reuse ]]; then
+    _dot_extension_worker_run pre-sync "$pre_sync" "$temporary" "$result" \
+      "$context" "$token"
+    if _dot_extension_worker_run pre-sync "$pre_sync" "$temporary" "$result" \
+      "$context" "$token" >/dev/null 2>&1; then
+      fail 'worker reused consumed context'
+    fi
+    continue
+  fi
+  if _dot_extension_worker_run "$worker_mode" "$pre_sync" "$temporary" "$result" \
+    "$context" "$token" >/dev/null 2>&1; then
+    fail "worker accepted invalid context case: $case_name"
+  fi
+  rm -f "$context"
+done
+
+if _dot_overlay_context_create "$temporary" pre-sync eligible prepare \
+  "${records[0]}" "${records[0]}" >/dev/null 2>&1; then
+  fail 'context encoder accepted duplicate overlay records'
+fi
+invalid_records=("example|relative|$origin|$descriptor|true|git")
+if _dot_overlay_context_create "$temporary" pre-sync eligible prepare \
+  "${invalid_records[@]}" >/dev/null 2>&1; then
+  fail 'context encoder accepted an invalid overlay record'
+fi
+for control_name in escape delete; do
+  case $control_name in
+    escape) control_byte=$'\033' ;;
+    delete) control_byte=$'\177' ;;
+  esac
+  invalid_records=("example|$overlay|https://example.invalid/${control_byte}example.git|$descriptor|true|git")
+  if _dot_overlay_context_create "$temporary" pre-sync eligible prepare \
+    "${invalid_records[@]}" >/dev/null 2>&1; then
+    fail "context encoder accepted a $control_name control byte"
+  fi
+done
+
+# Reproduce a hard-link race after the pathname check but before the open-file
+# identity check where the filesystem supports hard links. Some Android
+# application filesystems reject link(2), which removes this attack primitive;
+# the regular Linux and macOS lanes retain the adversarial coverage.
+if $hardlinks_supported; then
+  _dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
+  context=$REPLY_PATH
+  token=$REPLY_TOKEN
+  hardlink=$temporary/context-hardlink
+  eval "$(declare -f _dot_overlay_context_file_safe |
+    sed '1s/_dot_overlay_context_file_safe/_dot_overlay_context_file_safe_original/')"
+  _dot_overlay_context_file_safe() {
+    _dot_overlay_context_file_safe_original "$@" || return
+    ln "$1" "$hardlink"
+  }
+  if _dot_overlay_context_consume "$context" "$token" pre-sync >/dev/null 2>&1; then
+    fail 'context decoder accepted a post-check hardlink'
+  fi
+  rm -f "$context" "$hardlink"
+  eval "$(declare -f _dot_overlay_context_file_safe_original |
+    sed '1s/_dot_overlay_context_file_safe_original/_dot_overlay_context_file_safe/')"
+  unset -f _dot_overlay_context_file_safe_original
+fi
+
+# Context capabilities are passed across an exec boundary and must never be
+# interpreted relative to a worker-controlled current directory.
+(
+  cd "$HOME"
+  if _dot_overlay_context_create worker pre-sync eligible prepare \
+    "${records[@]}" >/dev/null 2>&1; then
+    fail 'context encoder accepted a relative directory'
+  fi
+)
+_dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+(
+  cd "$HOME"
+  if _dot_overlay_context_consume "${context#"$HOME/"}" "$token" pre-sync \
+    >/dev/null 2>&1; then
+    fail 'context decoder accepted a relative pathname'
+  fi
+)
+rm -f "$context"
+
+# Darwin's /dev/fd entries can expose devfs metadata instead of the opened
+# file's identity. Force the BSD stat branch and that mismatch, then require
+# the portable open-descriptor fallback to preserve one-use consumption.
+bsd_bin=$HOME/bsd-tools
+mkdir "$bsd_bin"
+cat >"$bsd_bin/stat" <<'STAT'
+#!/usr/bin/env bash
+case ${1:-} in
+  -c | -Lc) exit 1 ;;
+  -f)
+    case ${2:-} in
+      '%m') date +%s ;;
+      *)
+        if [[ $3 == "$DOT_TEST_CONTEXT_PATH" ]]; then
+          printf '%s 600 1 %s %s\n' \
+            "$EUID" "$DOT_TEST_CONTEXT_DEV" "$DOT_TEST_CONTEXT_INO"
+        else
+          printf '%s 700 1 1 1\n' "$EUID"
+        fi
+        ;;
+    esac
+    exit 0
+    ;;
+  -Lf)
+    printf '%s 666 1 999 999\n' "$EUID"
+    ;;
+esac
+exit 2
+STAT
+chmod 0755 "$bsd_bin/stat"
+_dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+_dot_overlay_context_stat "$context"
+DOT_TEST_CONTEXT_DEV=$REPLY_DEV
+DOT_TEST_CONTEXT_INO=$REPLY_INO
+DOT_TEST_CONTEXT_PATH=$context
+export DOT_TEST_CONTEXT_DEV DOT_TEST_CONTEXT_INO DOT_TEST_CONTEXT_PATH
+eval "$(declare -f _dot_overlay_context_lsof |
+  sed '1s/_dot_overlay_context_lsof/_dot_overlay_context_lsof_original/')"
+_dot_overlay_context_lsof() {
+  local fd=$1 links=0
+  [[ -e $DOT_TEST_CONTEXT_PATH ]] && links=1
+  printf 'p%s\n' "$$"
+  printf 'f%s\n' "$fd"
+  printf 'D0x%x\n' "$DOT_TEST_CONTEXT_DEV"
+  printf 'i%s\n' "$DOT_TEST_CONTEXT_INO"
+  printf 'k%s\n' "$links"
+  printf 'u%s\n' "$EUID"
+}
+if ! PATH="$bsd_bin:$PATH" _dot_overlay_context_consume \
+  "$context" "$token" pre-sync; then
+  fail 'context decoder rejected the BSD open-descriptor fallback'
+fi
+assert_eq "${records[0]}" "${OVERLAYS[0]}" \
+  'BSD open-descriptor fallback preserves context records'
+eval "$(declare -f _dot_overlay_context_lsof_original |
+  sed '1s/_dot_overlay_context_lsof_original/_dot_overlay_context_lsof/')"
+unset -f _dot_overlay_context_lsof_original
+
+# Exercise decoder-side framing checks independently of the stricter encoder.
+_write_manual_context() {
+  local path=$1 token_value=$2 variant=$3 count=1
+  case $variant in
+    duplicate | count-mismatch) count=2 ;;
+  esac
+  {
+    printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0' \
+      DOT_OVERLAY_CONTEXT 1 "$token_value" pre-sync eligible prepare "$count"
+    case $variant in
+      duplicate)
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+          example "$overlay" "$origin" "$descriptor" true git
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+          example "$overlay" "$origin" "$descriptor" true git
+        ;;
+      truncated)
+        printf '%s\0%s\0%s\0%s\0%s\0%s' \
+          example "$overlay" "$origin" "$descriptor" true git
+        ;;
+      trailing-nul)
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0\0' \
+          example "$overlay" "$origin" "$descriptor" true git
+        ;;
+      count-mismatch)
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+          example "$overlay" "$origin" "$descriptor" true git
+        ;;
+    esac
+  } >"$path"
+  chmod 0600 "$path"
+}
+
+for malformed_case in duplicate count-mismatch truncated trailing-nul; do
+  token=$(_dot_overlay_context_token)
+  context=$temporary/manual-$malformed_case
+  _write_manual_context "$context" "$token" "$malformed_case"
+  if _dot_overlay_context_consume "$context" "$token" pre-sync \
+    >/dev/null 2>&1; then
+    fail "context decoder accepted malformed framing: $malformed_case"
+  fi
+  rm -f "$context"
+done
+
+unsafe_parent=$HOME/unsafe-context-parent
+mkdir "$unsafe_parent"
+chmod 0700 "$unsafe_parent"
+_dot_overlay_context_create "$unsafe_parent" pre-sync eligible prepare \
+  "${records[@]}"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+chmod 0755 "$unsafe_parent"
+if _dot_overlay_context_consume "$context" "$token" pre-sync \
+  >/dev/null 2>&1; then
+  fail 'context decoder accepted an unsafe parent directory mode'
+fi
+chmod 0700 "$unsafe_parent"
+rm -f "$context"
+
+_dot_overlay_context_create "$temporary" pre-sync eligible prepare "${records[@]}"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+wrong_owner_context=$context
+eval "$(declare -f _dot_overlay_context_stat |
+  sed '1s/_dot_overlay_context_stat/_dot_overlay_context_stat_original/')"
+_dot_overlay_context_stat() {
+  _dot_overlay_context_stat_original "$@" || return
+  if [[ $1 == "$wrong_owner_context" ]]; then
+    # shellcheck disable=SC2034 # Simulates the stat helper's dynamic output.
+    REPLY_UID=$((EUID + 1))
+    return 1
+  fi
+}
+if _dot_overlay_context_consume "$context" "$token" pre-sync \
+  >/dev/null 2>&1; then
+  fail 'context decoder accepted a wrong-owner context file'
+fi
+rm -f "$context"
+eval "$(declare -f _dot_overlay_context_stat_original |
+  sed '1s/_dot_overlay_context_stat_original/_dot_overlay_context_stat/')"
+unset -f _dot_overlay_context_stat_original
+
+# A descriptor record must survive the real encoder/decoder byte-for-byte.
+roundtrip=$HOME/roundtrip
+mkdir "$roundtrip"
+chmod 0700 "$roundtrip"
+_dot_overlay_context_create "$roundtrip" pre-sync eligible reconcile "${records[@]}"
+context=$REPLY_PATH
+token=$REPLY_TOKEN
+OVERLAYS=()
+_dot_overlay_context_consume "$context" "$token" pre-sync
+assert_eq "${records[0]}" "${OVERLAYS[0]}" 'six-field context roundtrip'
+assert_eq reconcile "$REPLY_STAGE" 'context stage roundtrip'
+
+printf 'extension-worker-context-test: ok\n'

@@ -1,0 +1,675 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$DOT_TEST_ROOT/tests/lib/repo.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/public/xdg.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/log.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/temp.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/platform.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/profiles.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/overlays.sh"
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/repos/config.sh"
+
+HOME=$DOT_TEST_TMP/home
+XDG_CONFIG_HOME=$HOME/.config
+mkdir -p "$XDG_CONFIG_HOME/dot/profiles.d" \
+  "$XDG_CONFIG_HOME/dot/overlays.d" \
+  "$XDG_CONFIG_HOME/dot/profile-selectors.d" \
+  "$XDG_CONFIG_HOME/dot/profile-selectors.local.d"
+chmod 0700 "$XDG_CONFIG_HOME/dot/profile-selectors.local.d"
+
+printf 'version=1\noverlays=personal\n' \
+  >"$XDG_CONFIG_HOME/dot/profiles.d/base.conf"
+printf 'version=1\nprofiles=base\noverlays=nvim\n' \
+  >"$XDG_CONFIG_HOME/dot/profiles.d/editor.conf"
+printf 'version=1\nprofiles=editor\noverlays=dev,work\n' \
+  >"$XDG_CONFIG_HOME/dot/profiles.d/dev.conf"
+printf 'url=https://example.invalid/personal.git\noptional=true\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/80-personal.conf"
+printf 'url=https://example.invalid/nvim.git\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/20-nvim.conf"
+printf 'this selected descriptor is malformed\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/30-dev.conf"
+printf 'url=https://example.invalid/work.git\noptional=true\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/90-work.conf"
+
+fake_bin=$DOT_TEST_TMP/bin
+mkdir "$fake_bin"
+cat >"$fake_bin/id" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' example-user
+SH
+cat >"$fake_bin/hostname" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' example-host
+SH
+chmod +x "$fake_bin/id" "$fake_bin/hostname"
+PATH=$fake_bin:$PATH
+
+_dot_resolve_overlays inspect
+assert_eq base "$SELECTED_PROFILE" 'inspect defaults to base'
+assert_eq personal "${SELECTED_OVERLAY_NAMES[*]}" 'base selection ignores other descriptors'
+assert_eq personal "${ELIGIBLE_OVERLAY_NAMES[*]}" 'base eligible overlay'
+assert_eq '' "${ACTIVE_OVERLAY_NAMES[*]}" 'missing optional overlay is unavailable'
+assert_eq '' "${OVERLAYS[*]}" 'inspect publishes active overlays only'
+assert_contains 'dev|not-selected|' "${DOT_OVERLAY_LIFECYCLE[*]}" \
+  'unselected malformed descriptor is classified without parsing'
+
+printf 'version=1\nuser=example-user\nprofile=editor\n' \
+  >"$XDG_CONFIG_HOME/dot/profile-selectors.local.d/editor.conf"
+chmod 0600 "$XDG_CONFIG_HOME/dot/profile-selectors.local.d/editor.conf"
+_dot_resolve_overlays inspect
+assert_eq editor "$SELECTED_PROFILE" 'inspect resolves machine-local selector'
+assert_eq 'personal nvim' "${SELECTED_OVERLAY_NAMES[*]}" 'editor selected overlays'
+assert_eq 'nvim personal' "${ELIGIBLE_OVERLAY_NAMES[*]}" \
+  'descriptor order remains authoritative'
+
+printf 'version=1\nuser=example-user\nprofile=dev\n' \
+  >"$XDG_CONFIG_HOME/dot/profile-selectors.local.d/editor.conf"
+if _dot_resolve_overlays inspect >/dev/null 2>&1; then
+  fail 'selected malformed dev descriptor did not fail'
+fi
+printf 'url=https://example.invalid/dev.git\nhosts=another-host\noptional=invalid\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/30-dev.conf"
+if _dot_resolve_overlays inspect >/dev/null 2>&1; then
+  fail 'selected ineligible descriptor bypassed invalid optional validation'
+fi
+printf 'this selected descriptor is malformed\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/30-dev.conf"
+
+printf 'version=1\nuser=example-user\nprofile=editor\n' \
+  >"$XDG_CONFIG_HOME/dot/profile-selectors.local.d/editor.conf"
+mv "$XDG_CONFIG_HOME/dot/overlays.d/20-nvim.conf" \
+  "$XDG_CONFIG_HOME/dot/overlays.d/20-editor.conf"
+if _dot_resolve_overlays inspect >/dev/null 2>&1; then
+  fail 'missing selected descriptor did not fail'
+fi
+mv "$XDG_CONFIG_HOME/dot/overlays.d/20-editor.conf" \
+  "$XDG_CONFIG_HOME/dot/overlays.d/20-nvim.conf"
+
+printf 'url=https://example.invalid/duplicate.git\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/21-nvim.local.conf"
+if _dot_resolve_overlays inspect >/dev/null 2>&1; then
+  fail 'ambiguous descriptor filenames did not fail'
+fi
+rm "$XDG_CONFIG_HOME/dot/overlays.d/21-nvim.local.conf"
+
+# Legacy clients without profiles continue to discover every valid descriptor.
+rm -rf "$XDG_CONFIG_HOME/dot/profiles.d"
+rm "$XDG_CONFIG_HOME/dot/overlays.d/30-dev.conf"
+printf 'url=https://example.invalid/team.git\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/05-Team_One.conf"
+printf 'url=https://example.invalid/alpha.git\n' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/06-alpha.local.conf"
+_dot_resolve_overlays inspect
+assert_eq 0 "$DOT_PROFILES_PRESENT" 'legacy resolver mode'
+assert_eq 'Team_One alpha.local nvim personal work' \
+  "${ELIGIBLE_OVERLAY_NAMES[*]}" \
+  'legacy resolver keeps all-descriptor behavior'
+rm "$XDG_CONFIG_HOME/dot/overlays.d/05-Team_One.conf" \
+  "$XDG_CONFIG_HOME/dot/overlays.d/06-alpha.local.conf"
+printf 'url=https://example.invalid/%slegacy.git\n' $'\033' \
+  >"$XDG_CONFIG_HOME/dot/overlays.d/40-control.conf"
+if _dot_resolve_overlays inspect >/dev/null 2>&1; then
+  fail 'legacy resolver accepted a descriptor control byte'
+fi
+rm "$XDG_CONFIG_HOME/dot/overlays.d/40-control.conf"
+
+# Converge resolves profile selection only after the phase-one optional source
+# has had a chance to become active and provide repository-only selectors.
+converge_home=$DOT_TEST_TMP/converge-home
+HOME=$converge_home
+XDG_CONFIG_HOME=$HOME/.config
+mkdir -p "$XDG_CONFIG_HOME/dot/profiles.d" "$XDG_CONFIG_HOME/dot/overlays.d"
+printf 'version=1\noverlays=personal\n' >"$XDG_CONFIG_HOME/dot/profiles.d/base.conf"
+printf 'version=1\nprofiles=base\noverlays=nvim\n' >"$XDG_CONFIG_HOME/dot/profiles.d/editor.conf"
+printf 'version=1\nprofiles=editor\noverlays=dev,work\n' \
+  >"$XDG_CONFIG_HOME/dot/profiles.d/dev.conf"
+for spec in \
+  '20-nvim:https://example.invalid/nvim.git:false' \
+  '30-dev:https://example.invalid/dev.git:false' \
+  '80-personal:https://example.invalid/personal.git:true' \
+  '90-work:https://example.invalid/work.git:true'; do
+  prefix=${spec%%:*}
+  rest=${spec#*:}
+  optional=${rest##*:}
+  url=${rest%:*}
+  printf 'url=%s\noptional=%s\n' "$url" "$optional" \
+    >"$XDG_CONFIG_HOME/dot/overlays.d/$prefix.conf"
+done
+events=$DOT_TEST_TMP/converge-events
+: >"$events"
+# shellcheck disable=SC2034 # Read dynamically by progress helpers.
+DOT_UI_TOTAL=4
+# shellcheck disable=SC2034 # Read dynamically by update orchestration.
+DOT_REPO_STAGE_DEFERRED_ACTIVE=1
+DOT_REPO_PROGRESS_DONE=1
+DOT_REPO_PROGRESS_TOTAL=1
+# shellcheck disable=SC2034 # Read dynamically by update orchestration.
+DOT_REPO_AGG_CURRENT=1
+# shellcheck disable=SC2034 # Read dynamically by update orchestration.
+DOT_REPO_AGG_CHANGED=0
+# shellcheck disable=SC2034 # Read dynamically by update orchestration.
+DOT_REPO_AGG_FAILED=0
+# shellcheck disable=SC2034 # Read dynamically by update orchestration.
+DOT_REPO_AGG_SKIPPED=0
+# shellcheck disable=SC2034 # Read dynamically by update orchestration.
+DOT_REPO_AGG_CHANGED_ITEMS=''
+_ui_stage_update() {
+  printf 'ui-update:%s\n' "$1" >>"$events"
+}
+_run_pre_sync_extensions() {
+  local stage=$1
+  shift
+  printf 'pre-sync:%s:%s\n' "$stage" "$*" >>"$events"
+}
+_pull_overlay_count() {
+  local record count=0 sync
+  for record in "${OVERLAYS[@]+"${OVERLAYS[@]}"}"; do
+    IFS='|' read -r _ _ _ _ _ sync <<<"$record"
+    [[ ${sync:-git} == git ]] && count=$((count + 1))
+  done
+  printf '%s' "$count"
+}
+_dot_progress_detail() {
+  printf '%s %s/%s' "$1" "$2" "$3"
+}
+# shellcheck disable=SC2329 # Invoked dynamically by _dot_converge_overlays.
+_pull_overlays() {
+  local entry name path
+  printf 'progress:%s/%s\n' \
+    "${DOT_REPO_PROGRESS_DONE:-unset}" "${DOT_REPO_PROGRESS_TOTAL:-unset}" \
+    >>"$events"
+  printf 'pull:%s\n' "${OVERLAYS[*]}" >>"$events"
+  for entry in "${OVERLAYS[@]+"${OVERLAYS[@]}"}"; do
+    IFS='|' read -r name path _ <<<"$entry"
+    mkdir -p "$path/.git" "$path/dot/profile-selectors.d"
+    if [[ $name == personal ]]; then
+      printf 'version=1\nuser=example-user\nprofile=dev\n' \
+        >"$path/dot/profile-selectors.d/dev.conf"
+    fi
+  done
+  # shellcheck disable=SC2034 # Consumed dynamically by the convergence helper.
+  DOT_PULL_OVERLAY_FAILED=0
+  # shellcheck disable=SC2034 # Read dynamically by update orchestration.
+  DOT_PULL_OVERLAY_CURRENT=${#OVERLAYS[@]}
+  # shellcheck disable=SC2034 # Read dynamically by update orchestration.
+  DOT_PULL_OVERLAY_CHANGED=0
+  # shellcheck disable=SC2034 # Read dynamically by update orchestration.
+  DOT_PULL_OVERLAY_CHANGED_ITEMS=''
+  # shellcheck disable=SC2034 # Read dynamically by update orchestration.
+  DOT_PULL_OVERLAY_SKIPPED=0
+  DOT_REPO_PROGRESS_DONE=$((DOT_REPO_PROGRESS_DONE + ${#OVERLAYS[@]}))
+}
+_overlay_record_active_existing() {
+  local record=$1 path
+  IFS='|' read -r _ path _ <<<"$record"
+  [[ -d $path/.git ]]
+}
+# shellcheck disable=SC1091 # Repository root comes from the test helper.
+. "$DOT_TEST_ROOT/lib/dot/update.sh"
+_dot_converge_overlays
+assert_eq dev "$SELECTED_PROFILE" 'phase-one personal selector chooses final profile'
+assert_eq 'nvim dev personal work' "${ACTIVE_OVERLAY_NAMES[*]}" \
+  'final active set retains descriptor precedence'
+converge_log=$(<"$events")
+assert_contains 'pre-sync:prepare:personal|' "$converge_log" \
+  'phase-one prepare sees only base-selected eligible records'
+assert_contains 'pre-sync:reconcile:nvim|' "$converge_log" \
+  'final reconcile sees the final eligible records'
+pull_count=$(grep -c '^pull:' "$events")
+assert_eq 2 "$pull_count" 'converge has phase-one and additions sync passes'
+second_pull=$(grep '^pull:' "$events" | tail -1)
+[[ $second_pull != *'personal|'* ]] ||
+  fail 'phase-one overlay was synchronized twice'
+assert_contains 'progress:1/2' "$converge_log" \
+  'phase-one progress total is recomputed after base selection'
+assert_contains 'progress:2/5' "$converge_log" \
+  'final progress total is recomputed after selector resolution'
+assert_contains 'ui-update:' "$converge_log" \
+  'post-rediscovery overlay synchronization remains visible'
+
+failure_home=$DOT_TEST_TMP/converge-failure-home
+HOME=$failure_home
+XDG_CONFIG_HOME=$HOME/.config
+mkdir -p "$XDG_CONFIG_HOME/dot"
+cp -R "$converge_home/.config/dot/profiles.d" \
+  "$XDG_CONFIG_HOME/dot/profiles.d"
+cp -R "$converge_home/.config/dot/overlays.d" \
+  "$XDG_CONFIG_HOME/dot/overlays.d"
+: >"$events"
+# shellcheck disable=SC2329 # Invoked dynamically by _dot_converge_overlays.
+_pull_overlays() {
+  printf 'pull:%s\n' "${OVERLAYS[*]}" >>"$events"
+  # shellcheck disable=SC2034 # Consumed dynamically by the convergence helper.
+  DOT_PULL_OVERLAY_FAILED=1
+}
+if _dot_converge_overlays >/dev/null 2>&1; then
+  fail 'required phase-one synchronization failure did not fail convergence'
+fi
+assert_contains 'pre-sync:prepare:' "$(<"$events")" \
+  'phase-one failure still runs prepare'
+[[ $(<"$events") != *'pre-sync:reconcile:'* ]] ||
+  fail 'phase-one failure reached final reconcile'
+
+# Real command dispatch keeps inspection offline and fetch/push scoped to an
+# existing selected checkout. The unselected malformed descriptor is never
+# opened by any of these commands.
+command_home=$DOT_TEST_TMP/command-home
+command_state=$DOT_TEST_TMP/command-state
+command_bin=$DOT_TEST_TMP/command-bin
+command_log=$DOT_TEST_TMP/command-git.log
+mkdir -p "$command_home/.config/dot/profiles.d" \
+  "$command_home/.config/dot/overlays.d" \
+  "$command_home/.config/dot/profile-selectors.local.d" "$command_bin"
+chmod 0700 "$command_home/.config/dot/profile-selectors.local.d"
+printf 'version=1\noverlays=personal\n' \
+  >"$command_home/.config/dot/profiles.d/base.conf"
+printf 'version=1\nprofiles=base\noverlays=nvim\n' \
+  >"$command_home/.config/dot/profiles.d/editor.conf"
+printf 'version=1\nprofiles=editor\noverlays=dev\n' \
+  >"$command_home/.config/dot/profiles.d/dev.conf"
+printf 'url=https://example.invalid/nvim.git\n' \
+  >"$command_home/.config/dot/overlays.d/20-nvim.conf"
+printf 'malformed and unselected\n' \
+  >"$command_home/.config/dot/overlays.d/30-dev.conf"
+printf 'url=https://example.invalid/personal.git\noptional=true\n' \
+  >"$command_home/.config/dot/overlays.d/80-personal.conf"
+printf 'version=1\nuser=example-user\nprofile=editor\n' \
+  >"$command_home/.config/dot/profile-selectors.local.d/editor.conf"
+chmod 0600 "$command_home/.config/dot/profile-selectors.local.d/editor.conf"
+git init -q "$command_home/.dotfiles-nvim"
+git -C "$command_home/.dotfiles-nvim" remote add origin \
+  https://example.invalid/nvim.git
+real_git=$(type -P git)
+cat >"$command_bin/git" <<'GIT'
+#!/usr/bin/env bash
+set -e
+for arg in "$@"; do
+  case $arg in
+    clone | pull)
+      printf 'forbidden:%s\n' "$*" >>"$DOT_TEST_GIT_LOG"
+      exit 99
+      ;;
+    fetch | push)
+      printf '%s:%s\n' "$arg" "$*" >>"$DOT_TEST_GIT_LOG"
+      exit 0
+      ;;
+  esac
+done
+exec "$DOT_TEST_REAL_GIT" "$@"
+GIT
+chmod +x "$command_bin/git"
+for command in status diff doctor 'test --list'; do
+  : >"$command_log"
+  # shellcheck disable=SC2086 # Exercise the documented command words.
+  PATH="$fake_bin:$command_bin:$PATH" HOME=$command_home \
+    XDG_STATE_HOME=$command_state DOT_TEST_REAL_GIT=$real_git \
+    DOT_TEST_GIT_LOG=$command_log "$DOT_TEST_ROOT/bin/dot" $command \
+    >/dev/null 2>&1 || [[ $command == doctor ]]
+  assert_eq '' "$(<"$command_log")" "$command performs no network operation"
+done
+for command in fetch push; do
+  : >"$command_log"
+  PATH="$fake_bin:$command_bin:$PATH" HOME=$command_home \
+    XDG_STATE_HOME=$command_state DOT_TEST_REAL_GIT=$real_git \
+    DOT_TEST_GIT_LOG=$command_log "$DOT_TEST_ROOT/bin/dot" "$command" \
+    >/dev/null 2>&1
+  assert_contains "$command:-C $command_home/.dotfiles-nvim $command" \
+    "$(<"$command_log")" "$command includes selected existing overlay"
+  [[ $(<"$command_log") != *'.dotfiles-dev'* ]] ||
+    fail "$command included an unselected overlay"
+done
+
+mv "$command_home/.config/dot/overlays.d/20-nvim.conf" \
+  "$command_home/.config/dot/overlays.d/20-editor.conf"
+set +e
+missing_descriptor_output=$(PATH="$fake_bin:$command_bin:$PATH" HOME=$command_home \
+  XDG_STATE_HOME=$command_state DOT_TEST_REAL_GIT=$real_git \
+  DOT_TEST_GIT_LOG=$command_log "$DOT_TEST_ROOT/bin/dot" status 2>&1)
+missing_descriptor_status=$?
+set -e
+assert_eq 1 "$missing_descriptor_status" \
+  'status rejects a selected overlay with no descriptor'
+assert_contains 'selected overlay has no descriptor: nvim' \
+  "$missing_descriptor_output" 'status explains the missing selected descriptor'
+mv "$command_home/.config/dot/overlays.d/20-editor.conf" \
+  "$command_home/.config/dot/overlays.d/20-nvim.conf"
+
+# Both legacy and profile-aware convergence must reject selected sync=none
+# sources before pre-sync reconciliation or repository synchronization.
+for local_mode in legacy profile; do
+  local_home=$DOT_TEST_TMP/local-preflight-$local_mode
+  mkdir -p "$local_home/.config/dot/overlays.d"
+  printf 'sync=none\npath=%s\n' "$local_home/missing-local" \
+    >"$local_home/.config/dot/overlays.d/40-local.conf"
+  if [[ $local_mode == profile ]]; then
+    mkdir -p "$local_home/.config/dot/profiles.d" \
+      "$local_home/.config/dot/profile-selectors.local.d"
+    chmod 0700 "$local_home/.config/dot/profile-selectors.local.d"
+    printf 'version=1\noverlays=personal\n' \
+      >"$local_home/.config/dot/profiles.d/base.conf"
+    printf 'version=1\nprofiles=base\noverlays=local\n' \
+      >"$local_home/.config/dot/profiles.d/dev.conf"
+    printf 'url=https://example.invalid/personal.git\noptional=true\n' \
+      >"$local_home/.config/dot/overlays.d/80-personal.conf"
+    printf 'version=1\nuser=example-user\nprofile=dev\n' \
+      >"$local_home/.config/dot/profile-selectors.local.d/dev.conf"
+    chmod 0600 "$local_home/.config/dot/profile-selectors.local.d/dev.conf"
+  fi
+  if (
+    HOME=$local_home
+    XDG_CONFIG_HOME=$HOME/.config
+    # shellcheck disable=SC2329 # Invoked dynamically by convergence.
+    _run_pre_sync_extensions() { :; }
+    # shellcheck disable=SC2034,SC2329 # Invoked/read dynamically by convergence.
+    _pull_overlays() { DOT_PULL_OVERLAY_FAILED=0; }
+    _dot_converge_overlays
+  ) >/dev/null 2>&1; then
+    fail "$local_mode convergence accepted an unavailable sync=none source"
+  fi
+done
+
+# Changing the configured no-selector fallback is a stateful profile
+# transition, not just a parser choice. Preserve cached repositories and
+# unmanaged files while exact managed links move down and back up the stack.
+fixture_repo default-personal main \
+  home/.config/profile/personal-only $'personal\n' 100644 \
+  home/.local/lib/dotfiles/merge-hooks.d/20-personal-state.sh \
+  $'merge() { printf "personal\\n" >>"$HOME/personal-merges"; }\n' 100644
+default_personal_origin=$REPLY
+fixture_repo default-nvim main \
+  home/.config/profile/editor-only $'editor\n' 100644
+default_nvim_origin=$REPLY
+default_deactivate_content=$'deactivate() {\n  [[ ${DOT_RETIRING_OVERLAY:-} == dev && ${#OVERLAYS[@]} -eq 0 ]] || return 1\n  [[ ! -e $HOME/block-dev-retirement ]] || return 1\n  rm -f -- "$HOME/generated-dev-state"\n  printf "retired\\n" >>"$HOME/dev-retirements"\n}\n'
+fixture_repo default-dev main \
+  home/.config/profile/value $'dev\n' 100644 \
+  home/.local/lib/dotfiles/merge-hooks.d/30-dev-state.sh \
+  $'merge() { printf "managed-dev\\n" >"$HOME/generated-dev-state"; }\n' \
+  100644 \
+  dot/profile-deactivate \
+  "$default_deactivate_content" \
+  100644
+default_dev_origin=$REPLY
+fixture_repo default-base main \
+  .config/profile/value $'base\n' 100644 \
+  .config/dot/config $'version=1\ndefault_profile=dev\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644 \
+  .config/dot/profiles.d/base.conf $'version=1\noverlays=personal\n' 100644 \
+  .config/dot/profiles.d/editor.conf $'version=1\nprofiles=base\noverlays=nvim\n' 100644 \
+  .config/dot/profiles.d/dev.conf $'version=1\nprofiles=editor\noverlays=dev\n' 100644 \
+  .config/dot/overlays.d/20-nvim.conf \
+  "url=file://$default_nvim_origin"$'\n' 100644 \
+  .config/dot/overlays.d/30-dev.conf \
+  "url=file://$default_dev_origin"$'\n' 100644 \
+  .config/dot/overlays.d/80-personal.conf \
+  "url=file://$default_personal_origin"$'\n' 100644
+default_base_origin=$REPLY
+fixture_home default-transition
+default_home=$REPLY
+default_state=$DOT_TEST_TMP/default-transition-state
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" init --yes \
+  "file://$default_base_origin" >/dev/null
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+[[ -L $default_home/.config/profile/value ]] ||
+  fail 'configured dev default did not shadow the base path'
+assert_eq dev "$(<"$default_home/.config/profile/value")" \
+  'configured dev default installs the dev overlay'
+[[ -L $default_home/.config/profile/editor-only ]] ||
+  fail 'configured dev default did not install the editor overlay'
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'configured dev default runs the dev merge hook'
+printf '%s\n' unmanaged >"$default_home/unmanaged-profile-file"
+
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=base\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+[[ ! -e $default_home/.config/profile/editor-only ]] ||
+  fail 'dev to base default transition retained an editor link'
+[[ ! -L $default_home/.config/profile/value ]] ||
+  fail 'dev to base default transition retained the dev link'
+assert_eq base "$(<"$default_home/.config/profile/value")" \
+  'dev to base default transition restores the root file'
+assert_eq unmanaged "$(<"$default_home/unmanaged-profile-file")" \
+  'dev to base default transition preserves unmanaged files'
+[[ ! -e $default_home/generated-dev-state ]] ||
+  fail 'dev to base default transition retained generated dev state'
+assert_eq retired "$(<"$default_home/dev-retirements")" \
+  'dev to base default transition invokes the retiring overlay once'
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+assert_eq retired "$(<"$default_home/dev-retirements")" \
+  'repeated base convergence does not repeat a completed retirement'
+if grep -Fq 'dev|' "$default_state/dot/profile-overlay-lifecycle-v1"; then
+  fail 'completed retirement remained in the lifecycle ledger'
+fi
+[[ -d $default_home/.dotfiles-nvim/.git ]] ||
+  fail 'dev to base default transition removed the cached editor checkout'
+[[ -d $default_home/.dotfiles-dev/.git ]] ||
+  fail 'dev to base default transition removed the cached dev checkout'
+
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=dev\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+[[ -L $default_home/.config/profile/value ]] ||
+  fail 'base to dev default transition did not restore the dev link'
+assert_eq dev "$(<"$default_home/.config/profile/value")" \
+  'base to dev default transition reactivates the dev overlay'
+[[ -L $default_home/.config/profile/editor-only ]] ||
+  fail 'base to dev default transition did not restore the editor overlay'
+assert_eq unmanaged "$(<"$default_home/unmanaged-profile-file")" \
+  'base to dev default transition preserves unmanaged files'
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'base to dev default transition recreates generated dev state'
+assert_eq retired "$(<"$default_home/dev-retirements")" \
+  'reactivation does not repeat a completed retirement'
+
+# Once link convergence has selected the smaller profile, a failed cleanup is
+# retained in the lifecycle ledger and retried on the next update.
+touch "$default_home/block-dev-retirement"
+personal_merges_before=$(wc -l <"$default_home/personal-merges" | tr -d ' ')
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=base\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644
+if PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update \
+  >/dev/null 2>&1; then
+  fail 'profile downgrade ignored a failed deactivation hook'
+fi
+[[ ! -L $default_home/.config/profile/value ]] ||
+  fail 'failed deactivation prevented the selected base link generation'
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'failed deactivation retains generated state for retry'
+grep -Fq 'dev|' "$default_state/dot/profile-overlay-lifecycle-v1" ||
+  fail 'failed deactivation was dropped from the lifecycle ledger'
+set +e
+pending_output=$(PATH="$fake_bin:$PATH" run_dot "$default_home" \
+  "$default_state" doctor 2>&1)
+pending_status=$?
+set -e
+assert_eq 1 "$pending_status" 'doctor fails while profile cleanup is pending'
+assert_contains 'profile deactivation pending' "$pending_output" \
+  'doctor reports the retiring overlay that needs a retry'
+assert_eq "$personal_merges_before" \
+  "$(wc -l <"$default_home/personal-merges" | tr -d ' ')" \
+  'failed deactivation suppresses new-profile merge hooks'
+rm "$default_home/block-dev-retirement"
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+[[ ! -e $default_home/generated-dev-state ]] ||
+  fail 'retried deactivation retained generated dev state'
+assert_eq $'retired\nretired' "$(<"$default_home/dev-retirements")" \
+  'retried deactivation runs once after the failure clears'
+
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=dev\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'second reactivation recreates generated dev state'
+
+# Selection alone is not activation: a host-ineligible overlay must retire its
+# persistent state even though the flattened profile still names it.
+fixture_push default-base main .config/dot/overlays.d/30-dev.conf \
+  "url=file://$default_dev_origin"$'\nhosts=never-matches.invalid\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+[[ ! -e $default_home/generated-dev-state ]] ||
+  fail 'selected host-ineligible overlay retained generated state'
+assert_eq $'retired\nretired\nretired' \
+  "$(<"$default_home/dev-retirements")" \
+  'selected host-ineligible overlay is retired once'
+fixture_push default-base main .config/dot/overlays.d/30-dev.conf \
+  "url=file://$default_dev_origin"$'\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'host-eligible overlay reactivation recreates generated state'
+
+# API selection without an extension root does not authorize executable
+# lifecycle hooks. A downgrade fails before link mutation and keeps the ledger
+# for a later update after extensions are re-enabled.
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=base\nextension_api=1\ndependency_provider=none\n' 100644
+if PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update \
+  >/dev/null 2>&1; then
+  fail 'profile deactivation ran without a configured extension root'
+fi
+[[ -L $default_home/.config/profile/value ]] ||
+  fail 'disabled lifecycle extensions changed the installed dev links'
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'disabled lifecycle extensions preserve generated state'
+assert_eq $'retired\nretired\nretired' \
+  "$(<"$default_home/dev-retirements")" \
+  'disabled lifecycle extensions do not invoke deactivation'
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=dev\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+
+# An active overlay may not silently drop cleanup authority while its generated
+# state remains. Fail closed until a later overlay revision restores the hook.
+git -C "$DOT_TEST_TMP/default-dev-seed" rm -q dot/profile-deactivate
+git -C "$DOT_TEST_TMP/default-dev-seed" -c core.hooksPath=/dev/null \
+  commit -qm 'Remove deactivation hook'
+git -C "$DOT_TEST_TMP/default-dev-seed" push -q \
+  "$DOT_TEST_TMP/default-dev.git" HEAD:main
+if PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update \
+  >/dev/null 2>&1; then
+  fail 'active overlay silently removed its deactivation authority'
+fi
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'missing deactivation authority preserves generated state'
+set +e
+missing_authority_output=$(PATH="$fake_bin:$PATH" run_dot "$default_home" \
+  "$default_state" doctor 2>&1)
+missing_authority_status=$?
+set -e
+assert_eq 1 "$missing_authority_status" \
+  'doctor fails for missing active deactivation authority'
+assert_contains 'active profile deactivation authority unsafe' \
+  "$missing_authority_output" \
+  'doctor reports missing active deactivation authority'
+fixture_push default-dev main dot/profile-deactivate \
+  "$default_deactivate_content" 100644
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+
+# A saved retirement record is executable authority. If the cached checkout no
+# longer has the recorded origin, reject the transition before changing links
+# or generated state, then retry cleanly once identity is restored.
+git -C "$default_home/.dotfiles-dev" config remote.origin.url \
+  "file://$DOT_TEST_TMP/wrong-dev-origin.git"
+fixture_push default-base main .config/dot/config \
+  $'version=1\ndefault_profile=base\nextension_api=1\nextensions_dir=$HOME/.local/lib/dotfiles\ndependency_provider=none\n' 100644
+if PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update \
+  >/dev/null 2>&1; then
+  fail 'profile downgrade accepted a retiring checkout with the wrong origin'
+fi
+[[ -L $default_home/.config/profile/value ]] ||
+  fail 'unsafe retirement changed the active dev link generation'
+assert_eq dev "$(<"$default_home/.config/profile/value")" \
+  'unsafe retirement preserves the active dev profile'
+assert_eq managed-dev "$(<"$default_home/generated-dev-state")" \
+  'unsafe retirement preserves generated dev state'
+
+git -C "$default_home/.dotfiles-dev" config remote.origin.url \
+  "file://$default_dev_origin"
+PATH="$fake_bin:$PATH" run_dot "$default_home" "$default_state" update >/dev/null
+[[ ! -e $default_home/generated-dev-state ]] ||
+  fail 'retried safe downgrade retained generated dev state'
+assert_eq $'retired\nretired\nretired\nretired' \
+  "$(<"$default_home/dev-retirements")" \
+  'retried safe downgrade invokes one additional retirement'
+
+# A base update temporarily restores shadowed paths before pulling. If the new
+# selector generation conflicts, the previously active link generation must be
+# restored instead of being left as an unlinked base file.
+fixture_repo rollback-overlay main home/.config/profile/value $'overlay\n' 100644
+rollback_overlay_origin=$REPLY
+fixture_repo rollback-base main \
+  .config/profile/value $'base\n' 100644 \
+  .config/dot/profiles.d/base.conf $'version=1\noverlays=nvim\n' 100644 \
+  .config/dot/profiles.d/editor.conf $'version=1\nprofiles=base\n' 100644 \
+  .config/dot/profiles.d/dev.conf $'version=1\noverlays=dev\n' 100644 \
+  .config/dot/overlays.d/20-nvim.conf \
+  "url=file://$rollback_overlay_origin"$'\n' 100644 \
+  .config/dot/overlays.d/30-dev.conf $'malformed selected descriptor\n' 100644
+rollback_base_origin=$REPLY
+fixture_home rollback-profile
+rollback_home=$REPLY
+rollback_state=$DOT_TEST_TMP/rollback-profile-state
+mkdir -p "$rollback_home/.config/dot/profile-selectors.local.d"
+chmod 0700 "$rollback_home/.config/dot/profile-selectors.local.d"
+printf 'version=1\nuser=example-user\nprofile=editor\n' \
+  >"$rollback_home/.config/dot/profile-selectors.local.d/editor.conf"
+chmod 0600 "$rollback_home/.config/dot/profile-selectors.local.d/editor.conf"
+PATH="$fake_bin:$PATH" run_dot "$rollback_home" "$rollback_state" init --yes \
+  "file://$rollback_base_origin" >/dev/null
+[[ -L $rollback_home/.config/profile/value ]] ||
+  fail 'rollback fixture did not install its overlay link'
+assert_eq overlay "$(<"$rollback_home/.config/profile/value")" \
+  'rollback fixture starts with overlay content'
+fixture_push rollback-base main .config/dot/profile-selectors.d/conflict.conf \
+  $'version=1\nuser=example-user\nprofile=dev\n' 100644
+set +e
+PATH="$fake_bin:$PATH" run_dot "$rollback_home" "$rollback_state" update \
+  >/dev/null 2>&1
+rollback_status=$?
+set -e
+assert_eq 1 "$rollback_status" 'selector conflict fails update'
+[[ -L $rollback_home/.config/profile/value ]] ||
+  fail 'selector conflict left the previous overlay generation unstashed'
+assert_eq overlay "$(<"$rollback_home/.config/profile/value")" \
+  'selector conflict restores previous overlay content'
+
+# The next update must be able to pull a repaired policy even though the
+# currently checked-out generation is malformed. Pre-pull rollback authority
+# comes from the installed manifest and exact live link, not current profiles.
+fixture_push rollback-base main .config/dot/profile-selectors.d/conflict.conf \
+  $'version=1\nuser=another-example-user\nprofile=dev\n' 100644
+PATH="$fake_bin:$PATH" run_dot "$rollback_home" "$rollback_state" update \
+  >/dev/null
+[[ -L $rollback_home/.config/profile/value ]] ||
+  fail 'repaired upstream policy did not converge the prior overlay link'
+assert_eq overlay "$(<"$rollback_home/.config/profile/value")" \
+  'repaired upstream policy converges without pre-pull profile parsing'
+
+# A malformed newly pulled Dot config fails even earlier than profile
+# resolution. That post-pull failure must restore the same installed link
+# generation and freeze final link reconciliation.
+fixture_push rollback-base main .config/dot/config \
+  $'version=999\ndependency_provider=none\n' 100644
+set +e
+PATH="$fake_bin:$PATH" run_dot "$rollback_home" "$rollback_state" update \
+  >/dev/null 2>&1
+rollback_config_status=$?
+set -e
+assert_eq 1 "$rollback_config_status" 'malformed pulled Dot config fails update'
+[[ -L $rollback_home/.config/profile/value ]] ||
+  fail 'malformed pulled Dot config left the previous overlay generation unstashed'
+assert_eq overlay "$(<"$rollback_home/.config/profile/value")" \
+  'malformed pulled Dot config restores previous overlay content'
+
+printf 'overlay-profile-resolution-test: ok\n'
