@@ -9,21 +9,10 @@
 
 #![deny(missing_docs)]
 
-pub mod cleanup;
 pub mod cli;
-pub mod config;
-pub mod constants;
 pub mod errors;
-pub mod families;
-pub mod glob;
-pub mod log;
-pub mod platform;
-pub mod reserved;
-pub mod temp;
-pub mod test_support;
-pub mod ui;
-pub mod update_lock;
+#[cfg(test)]
+mod test_support;
 pub mod version;
-pub mod xdg;
 
 pub use errors::{Error, Result};

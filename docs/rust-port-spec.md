@@ -115,19 +115,6 @@ markers (`# <marker> begin` / `# DO NOT EDIT...` / `# source: <path>` /
 (`*.serial.sh` = barrier); provider reexec checkpoint
 (`cgraf78 dot provider reexec checkpoint v1`, `before=/after=` hex).
 
-Claimed surface (each row ported with shell-vs-Rust differential
-tests; the binary is still not on PATH and no shell behavior changed):
-
-| Rust module | Shell source | Parity notes |
-|---|---|---|
-| `glob` | `case`-pattern semantics (shared) | byte-oriented C-locale matcher; `\|` from variables is literal; descending ranges void; post-void dash stages shadowed; pinned to bash 5.x (`DOT_BASH`); macOS system bash 3.2 trailing-`\` corner differs, not a supported engine runtime |
-| `platform` | `platform.sh` | `command -v` needs no exec bit; `[[ "" -eq 0 ]]` id coercion replicated in `require_sudo`; spec sides both literal (quoted RHS), first line only (`read -a`) |
-| `reserved` | `reserved.sh` | roots inventory compared line-for-line; ancestor-swallowing candidate rule; leaf symlinks resolve `realpath`-style (dangling included) |
-| `families` | `families.sh` | byte-ordered stream incl. non-UTF8 names; patterns filter before `.replace` selection |
-| `constants` | `constants.sh` | `${VAR:-0}` substitutes on empty too |
-| `temp` | `temp.sh` | generation tokens (verbatim string compares, trailing-delimiter quirk); prepare/quarantine/commit/remove with shell-identical unwinds; `mv` via the same probed binary (BSD nesting recovery); git-sha digests under the sanitized binding; umask read from the process; sorted tree walk (deterministic; success end-state order-free) |
-| `version::LIBRARY_API` | `public/api-version.sh` | `DOT_LIBRARY_API=1` pinned on both sides |
-
 ## 6. Non-contract (explicitly out of slice 1)
 
 Config parsing, XDG resolution, update pipeline, extension workers,
