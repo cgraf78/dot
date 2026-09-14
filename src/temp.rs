@@ -9,9 +9,10 @@
 //! shell uses (Git is already a required engine dependency), moves go
 //! through the same `mv` binary with the same `-nT`/`-nh` capability
 //! probe (GNU and BSD `mv` differ on late directories, and the probe
-//! matrix is exactly what the shell suite pins), and the process umask
-//! is read without mutating process state. Callers thread
-//! [`LockCtx`] (the `DOT_TEST` /
+//! matrix is exactly what the shell suite pins), and `umask` is read
+//! from the engine process the way the shell reads its own —
+//! `std` offers no `umask(2)` binding, and the shell pays a fork per
+//! read too. Callers thread [`LockCtx`] (the `DOT_TEST` /
 //! `DOT_UPDATE_LOCK_TOKEN` gate), `source_root` (the
 //! `DOT_SOURCE_ROOT` binding, see [`source_root`]), the umask, and a
 //! [`MoveCache`] explicitly so differential tests can pin every knob
@@ -182,10 +183,15 @@ pub fn path_nlink(path: &Path) -> Result<u64> {
     Ok(meta.nlink())
 }
 
-/// Current effective uid from the Unix process credentials.
+/// Current effective uid, forked from `id -u` exactly like the shell
+/// (see `platform::require_sudo`): no libc binding for parity.
 pub fn current_uid() -> Option<u32> {
-    // SAFETY: `geteuid` has no preconditions and does not dereference memory.
-    Some(unsafe { libc::geteuid() })
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
 }
 
 /// `_dot_private_dir_validate`: a real directory (never a symlink)
@@ -239,36 +245,13 @@ pub fn private_control_file_validate(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Parse the numeric form emitted by `/proc/self/status` and `sh -c umask`.
-fn parse_umask(value: &str) -> Option<u32> {
-    let value = value.trim_matches(|ch: char| ch.is_ascii_whitespace());
-    if value.is_empty() || value.len() > 4 || !value.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
-    {
-        return None;
-    }
-    let mask = u32::from_str_radix(value, 8).ok()?;
-    (mask <= 0o777).then_some(mask)
-}
-
-/// Read the engine process umask without mutating process-global state.
+/// Read the engine process umask by asking `sh` (whose builtin reports
+/// the inherited mask): `std` has no `umask(2)` binding, and the shell
+/// pays the same fork with `mask=$(umask)`.
 pub fn read_umask() -> Result<u32> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        if let Some(mask) = status
-            .lines()
-            .find_map(|line| line.strip_prefix("Umask:").and_then(parse_umask))
-        {
-            return Ok(mask);
-        }
-    }
-
-    let shell = if Path::new("/bin/sh").is_file() {
-        "/bin/sh"
-    } else {
-        "sh"
-    };
-    let output = std::process::Command::new(shell)
-        .args(["-c", "umask"])
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("umask")
         .output()
         .map_err(|source| Error::Io {
             context: "read umask",
@@ -276,38 +259,19 @@ pub fn read_umask() -> Result<u32> {
         })?;
     if !output.status.success() {
         return Err(Error::Usage {
-            message: "cannot read umask",
+            message: "umask query failed",
         });
     }
-    let value = String::from_utf8(output.stdout).map_err(|_| Error::Usage {
-        message: "invalid umask output",
-    })?;
-    parse_umask(&value).ok_or(Error::Usage {
-        message: "invalid umask output",
-    })
-}
-
-#[cfg(test)]
-mod umask_tests {
-    use super::parse_umask;
-
-    #[test]
-    fn numeric_umask_parser_is_strict() {
-        for (value, expected) in [
-            ("0022", Some(0o022)),
-            (" 0077\n", Some(0o077)),
-            ("0", Some(0)),
-            ("0777", Some(0o777)),
-            ("", None),
-            ("Umask:\t0022", None),
-            ("00022", None),
-            ("0788", None),
-            ("1000", None),
-            ("u=rwx,g=rx,o=rx", None),
-        ] {
-            assert_eq!(parse_umask(value), expected, "{value:?}");
-        }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let digits = text.trim();
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Error::Usage {
+            message: "umask query returned non-octal output",
+        });
     }
+    u32::from_str_radix(digits, 8).map_err(|_| Error::Usage {
+        message: "umask query returned non-octal output",
+    })
 }
 
 /// `_dot_apply_tracked_file_mode`: force a git-tracked mode (`100644`
@@ -417,17 +381,6 @@ pub fn sanitized_git<S: AsRef<std::ffi::OsStr>>(
     source_root: &Path,
     args: &[S],
 ) -> std::process::Command {
-    let mut cmd = crate::init_client_identity::host_git_command();
-    sanitize_git_env(&mut cmd);
-    bind_source_git(&mut cmd, source_root);
-    cmd.args(args);
-    cmd
-}
-
-/// Apply `_dot_sanitized_git` environment isolation to an already-selected
-/// Git executable. Runtime-bound callers use this form so executable lookup
-/// remains tied to their immutable PATH without duplicating Git policy.
-pub(crate) fn sanitize_git_env(cmd: &mut std::process::Command) {
     const UNSET: &[&str] = &[
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -443,16 +396,12 @@ pub(crate) fn sanitize_git_env(cmd: &mut std::process::Command) {
         "GIT_CONFIG_NOSYSTEM",
         "GIT_DEFAULT_HASH",
     ];
+    let mut cmd = std::process::Command::new("git");
     for var in UNSET {
         cmd.env_remove(var);
     }
     cmd.env("GIT_CONFIG_NOSYSTEM", "1");
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
-}
-
-/// Bind one sanitized Git command to the selected source checkout, including
-/// the explicit trust required when a container mount is host-owned.
-pub(crate) fn bind_source_git(cmd: &mut std::process::Command, source_root: &Path) {
     let directory = source_root.as_os_str().as_bytes();
     let mut safe = b"safe.directory=".to_vec();
     safe.extend_from_slice(directory);
@@ -462,6 +411,8 @@ pub(crate) fn bind_source_git(cmd: &mut std::process::Command, source_root: &Pat
     cmd.arg(std::ffi::OsStr::from_bytes(&safe));
     cmd.arg("-C");
     cmd.arg(source_root);
+    cmd.args(args);
+    cmd
 }
 
 /// `_dot_source_git`: Git bound to the already-selected physical

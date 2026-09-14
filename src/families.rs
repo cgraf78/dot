@@ -1,6 +1,6 @@
-//! Ordered fragment-family discovery.
+//! Ordered fragment-family discovery (slice 2 foundations).
 //!
-//! Owns the fragment-candidate filter
+//! Ports `lib/dot/families.sh` exactly: the fragment-candidate filter
 //! (regular files only, editor artifacts and dotfiles excluded),
 //! caller-pattern filtering applied BEFORE `.replace` winner selection,
 //! last-lexical-wins mutual exclusion inside immediate `<name>.replace/`
