@@ -409,13 +409,6 @@ pub struct PrepareInputs<'a> {
 /// on the success path), so even failing outcomes carry state the
 /// tests compare.
 pub struct Prepared {
-    /// Records loaded from the ledger before this prepare attempt.
-    ///
-    /// The shell keeps these as its prior lifecycle state until a successful
-    /// rewrite publishes the refreshed records. The update coordinator carries
-    /// both vectors explicitly so a later retire or rollback cannot observe a
-    /// partially refreshed ledger.
-    pub prior: Vec<String>,
     /// Records the shell global would hold.
     pub records: Vec<String>,
     /// Whether the shell returned exit 0.
@@ -439,7 +432,6 @@ pub struct Prepared {
 pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) -> Prepared {
     if !inputs.present {
         return Prepared {
-            prior: inputs.prior.to_vec(),
             records: inputs.prior.to_vec(),
             succeeded: true,
         };
@@ -454,7 +446,6 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
         &mut loaded,
     ) {
         return Prepared {
-            prior: loaded.clone(),
             records: loaded,
             succeeded: false,
         };
@@ -479,14 +470,12 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
                     ),
                 );
                 return Prepared {
-                    prior: loaded.clone(),
                     records: loaded,
                     succeeded: false,
                 };
             }
         }
         return Prepared {
-            prior: loaded.clone(),
             records: loaded,
             succeeded: true,
         };
@@ -502,7 +491,6 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
                 &format!("  warning: unsafe retiring overlay entrypoint: {name}"),
             );
             return Prepared {
-                prior: loaded.clone(),
                 records: loaded,
                 succeeded: false,
             };
@@ -523,7 +511,6 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
                         ),
                     );
                     return Prepared {
-                        prior: loaded.clone(),
                         records: loaded,
                         succeeded: false,
                     };
@@ -535,7 +522,6 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
                     &format!("  warning: unsafe profile deactivation entrypoint: {name}"),
                 );
                 return Prepared {
-                    prior: loaded.clone(),
                     records: loaded,
                     succeeded: false,
                 };
@@ -552,7 +538,6 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
         Some(path) if !path.as_os_str().is_empty() => path,
         _ => {
             return Prepared {
-                prior: loaded.clone(),
                 records: loaded,
                 succeeded: false,
             };
@@ -560,13 +545,11 @@ pub fn prepare(inputs: &PrepareInputs<'_>, warnings: &mut dyn std::io::Write) ->
     };
     if !write(ledger, &prepared, inputs.euid) {
         return Prepared {
-            prior: loaded.clone(),
             records: loaded,
             succeeded: false,
         };
     }
     Prepared {
-        prior: loaded,
         records: prepared,
         succeeded: true,
     }
