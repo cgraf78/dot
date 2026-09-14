@@ -3,12 +3,18 @@ set -euo pipefail
 
 # The standard matrix owns the full test suite. This job executes the
 # NDK-built Android binary inside the real Termux app sandbox and
-# verifies the slice-1 CLI contract (help text, version shape, unknown
-# command) on-device. Deeper suites arrive with their owning slices.
+# verifies the transported release's startup contract plus one native
+# signal-cancellation lifecycle path.
 binary=.termux-ci/dot
+metadata=.termux-ci/.dot-install.json
+absolute_binary=$PWD/$binary
 
 [[ -x $binary ]] || {
   printf 'termux-ci: transported binary missing: %s\n' "$binary" >&2
+  exit 1
+}
+[[ -f $metadata ]] || {
+  printf 'termux-ci: transported release metadata missing: %s\n' "$metadata" >&2
   exit 1
 }
 
@@ -28,9 +34,170 @@ case $version_actual in
     ;;
 esac
 
-if "$binary" frobnicate 2>/dev/null; then
+set +e
+unknown_output=$("$binary" frobnicate 2>&1)
+unknown_status=$?
+set -e
+if [[ $unknown_status -ne 1 ]]; then
   printf 'termux-ci: unknown command unexpectedly succeeded\n' >&2
   exit 1
 fi
+[[ $unknown_output == 'dot: unknown command: frobnicate' ]] || {
+  printf 'termux-ci: unexpected unknown-command output: %s\n' "$unknown_output" >&2
+  exit 1
+}
+
+# TEMP-DIAG-180: pre-flight probes for the Android snapshot failure.
+# Remove once the Termux signal test is green.
+{
+  echo '--- TEMP-DIAG-180 pre-flight ---'
+  echo "diag self stat: $(cat /proc/self/stat 2>&1 || true)"
+  echo 'diag unreadable proc stats (up to 5):'
+  unreadable=0
+  for dir in /proc/[0-9]*; do
+    if [[ ! -r $dir/stat ]]; then
+      echo "UNREADABLE: $dir"
+      unreadable=$((unreadable + 1))
+      if ((unreadable >= 5)); then
+        break
+      fi
+    fi
+  done 2>/dev/null || true
+  echo "diag unreadable count sample done"
+  ps_status=0
+  ps_output=$(/system/bin/ps -A -o pid=,ppid=,pgid=,sid=,stat= 2>&1) || ps_status=$?
+  echo "diag ps status: $ps_status"
+  printf '%s\n' "$ps_output" | head -5 || true
+  echo 'diag tool availability:'
+  for tool in hostname uname id getconf git; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      echo "HAVE: $tool"
+    else
+      echo "MISSING: $tool"
+    fi
+  done
+} >&2
+
+# Operational commands require an absolute argv[0] under Termux's linker
+# interposition contract. Exercise native SIGQUIT handling inside the real app
+# sandbox with the complete transported release tree.
+signal_root=$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/dot-termux-signal.XXXXXX")
+signal_home=$signal_root/home
+signal_state=$signal_root/state
+signal_suites=$signal_root/suites
+signal_pid_file=$signal_root/suite.pid
+signal_output=$signal_root/runner.out
+runner_pid=''
+suite_pid=''
+watchdog_pid=''
+cleanup_signal_test() {
+  local owned_runner=$runner_pid owned_suite=$suite_pid
+  local owned_watchdog=$watchdog_pid cleanup_deadline
+  runner_pid=''
+  suite_pid=''
+  watchdog_pid=''
+  if [[ -n $owned_watchdog ]]; then
+    kill "$owned_watchdog" 2>/dev/null || true
+    wait "$owned_watchdog" 2>/dev/null || true
+  fi
+  if [[ -n $owned_runner ]] && kill -0 "$owned_runner" 2>/dev/null; then
+    kill -QUIT "$owned_runner" 2>/dev/null || true
+    cleanup_deadline=$((SECONDS + 2))
+    while kill -0 "$owned_runner" 2>/dev/null &&
+      ((SECONDS < cleanup_deadline)); do
+      sleep 0.05
+    done
+    kill -KILL "$owned_runner" 2>/dev/null || true
+    wait "$owned_runner" 2>/dev/null || true
+  fi
+  if [[ -z $owned_suite && -s $signal_pid_file ]]; then
+    owned_suite=$(<"$signal_pid_file")
+  fi
+  if [[ $owned_suite =~ ^[1-9][0-9]*$ ]] &&
+    kill -0 "$owned_suite" 2>/dev/null; then
+    kill -KILL -- "-$owned_suite" 2>/dev/null || true
+    kill -KILL "$owned_suite" 2>/dev/null || true
+  fi
+  rm -rf -- "$signal_root"
+}
+trap cleanup_signal_test EXIT
+mkdir -p "$signal_home" "$signal_state" "$signal_suites"
+chmod 0700 "$signal_home" "$signal_state" "$signal_suites"
+cat >"$signal_suites/quit-test" <<EOF
+#!$PREFIX/bin/bash
+trap '' HUP INT QUIT TERM
+printf '%s\n' "\$BASHPID" >"\$DOT_TEST_SIGNAL_PID_FILE"
+while :; do sleep 1; done
+EOF
+chmod 0755 "$signal_suites/quit-test"
+HOME=$signal_home XDG_STATE_HOME=$signal_state DOT_BASH=$PREFIX/bin/bash \
+  DOT_TEST_TESTS_DIR=$signal_suites DOT_TEST_SIGNAL_PID_FILE=$signal_pid_file \
+  DOT_TEST_NO_COLOR=1 "$absolute_binary" test -s >"$signal_output" 2>&1 &
+runner_pid=$!
+deadline=$((SECONDS + 15))
+while [[ ! -s $signal_pid_file && $SECONDS -lt $deadline ]]; do
+  if ! jobs -pr | grep -Fxq "$runner_pid"; then
+    signal_status=0
+    wait "$runner_pid" || signal_status=$?
+    runner_pid=''
+    printf 'termux-ci: signal fixture exited before start (status %s)\n' \
+      "$signal_status" >&2
+    cat "$signal_output" >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+if [[ ! -s $signal_pid_file ]]; then
+  printf 'termux-ci: signal fixture did not start\n' >&2
+  # TEMP-DIAG-180: show runner liveness plus its subtree at the deadline.
+  if [[ -n ${runner_pid:-} ]] && kill -0 "$runner_pid" 2>/dev/null; then
+    echo "diag runner $runner_pid alive at deadline; subtree:" >&2
+    ps_all=$(/system/bin/ps -o pid=,ppid=,stat=,args= 2>/dev/null || /system/bin/ps 2>/dev/null || true)
+    printf '%s\n' "$ps_all" | grep -E "$runner_pid|PID" >&2 || true
+  else
+    echo 'diag runner already exited at deadline' >&2
+  fi
+  cat "$signal_output" >&2
+  exit 1
+fi
+suite_pid=$(<"$signal_pid_file")
+kill -QUIT "$runner_pid"
+signal_status=0
+watchdog_marker=$signal_root/watchdog-fired
+(
+  sleep 15
+  if kill -0 "$runner_pid" 2>/dev/null; then
+    : >"$watchdog_marker"
+    kill -KILL "$runner_pid" 2>/dev/null || true
+  fi
+) &
+watchdog_pid=$!
+wait "$runner_pid" || signal_status=$?
+runner_pid=''
+kill "$watchdog_pid" 2>/dev/null || true
+wait "$watchdog_pid" 2>/dev/null || true
+watchdog_pid=''
+[[ ! -e $watchdog_marker ]] || {
+  printf 'termux-ci: SIGQUIT cancellation did not finish before deadline\n' >&2
+  exit 1
+}
+suite_survived=0
+kill -0 "$suite_pid" 2>/dev/null && suite_survived=1
+if ((suite_survived)); then
+  kill -KILL -- "-$suite_pid" 2>/dev/null || true
+  kill -KILL "$suite_pid" 2>/dev/null || true
+fi
+rm -rf -- "$signal_root"
+[[ $signal_status -eq 131 ]] || {
+  printf 'termux-ci: SIGQUIT status was %s, expected 131\n' "$signal_status" >&2
+  exit 1
+}
+((suite_survived == 0)) || {
+  printf 'termux-ci: SIGQUIT left the suite process running\n' >&2
+  exit 1
+}
+signal_root=''
+suite_pid=''
+trap - EXIT
 
 printf 'termux-ci: ok\n'
