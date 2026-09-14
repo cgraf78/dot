@@ -4,8 +4,8 @@
 //! same code path as the installed binary — a bug fixed in the library
 //! is fixed for every caller, and a behavior tested in-process holds on
 //! the command line. The adapter owns only four things: skipping
-//! `argv[0]`, binding `DOT_SOURCE_ROOT` when the caller left it unset
-//! (slice 84; the shell `main.sh` derives it from its own path — see
+//! `argv[0]`, snapshotting the ambient runtime (including the resolved source
+//! root; the shell `main.sh` derives it from its own path — see
 //! `dot::startup` for the full entry-contract map), locking
 //! stdout/stderr once (one lock acquisition instead of per-write
 //! locking on every output call), and translating the returned code
@@ -16,28 +16,19 @@
 //! This adapter itself performs no fallible setup, so it cannot fail
 //! before `run` takes over.
 
+use std::collections::BTreeMap;
 use std::io::{Write, stderr, stdout};
 
 fn main() {
-    // Slice 84: the shell always exports `DOT_SOURCE_ROOT` from its
-    // own path; the binary reproduces the export only when the caller
-    // left it unset or empty, so an explicit hook (tests, embeddings)
-    // survives. Process environment mutation is `unsafe` in edition
-    // 2024; `main` is the single-flight process entry (like the
-    // shell's own export), so no other thread observes the change.
-    let missing = match std::env::var_os("DOT_SOURCE_ROOT") {
-        None => true,
-        Some(value) => value.is_empty(),
-    };
-    if missing {
-        let root = dot::startup::ambient_source_root();
-        unsafe {
-            std::env::set_var("DOT_SOURCE_ROOT", &root);
-        }
-    }
+    let env = std::env::vars_os().collect::<BTreeMap<_, _>>();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+    let runtime = dot::app::Runtime::from_env(&env, &cwd)
+        .expect("the current directory fallback is absolute");
     let mut out = stdout().lock();
     let mut err = stderr().lock();
-    let code = dot::cli::run(std::env::args_os().skip(1), &mut out, &mut err);
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let mut streams = dot::app::Streams::new(&mut out, &mut err);
+    let code = dot::app::run_direct(&runtime, &args, &mut streams);
     // `process::exit` runs no destructors and flushes nothing; `StdoutLock`
     // is line-buffered, so a future write without a trailing newline would
     // be silently truncated without this. A flush failure here means the
