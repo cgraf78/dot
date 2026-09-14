@@ -1,6 +1,6 @@
-//! Live-progress formatting helpers.
+//! Live-progress formatting leaves (slice 20).
 //!
-//! Owns
+//! Ports the pure helpers from `lib/dot/progress-ui.sh` exactly:
 //! status colors, ASCII detection, cell fitting, and the summary
 //! phrases the update stages report through. Text flows as bytes:
 //! bash counts string length in characters under a working UTF-8
@@ -253,105 +253,6 @@ pub fn duration_ms(ms: i64) -> Vec<u8> {
 /// production passes its own now/started pair).
 pub fn elapsed(seconds_now: i64, started_secs: i64) -> Vec<u8> {
     format!("{}s", seconds_now - started_secs).into_bytes()
-}
-
-/// Normalize only elapsed stamps in captured progress output for
-/// shell/Rust differential tests.  Progress rows end with `Ns`; the
-/// completion summaries spell the same value as `Done in Ns.` or
-/// `Done with errors in Ns.`. Other
-/// numbers — including counts, diagnostics, labels, and ordering —
-/// remain byte-significant.
-pub fn normalize_elapsed(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut line_start = 0;
-    while line_start < bytes.len() {
-        let line_end = bytes[line_start..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(bytes.len(), |offset| line_start + offset);
-        let line = &bytes[line_start..line_end];
-        if is_progress_row(line) {
-            normalize_stage_elapsed(line, &mut normalized);
-        } else {
-            normalize_done_elapsed(line, &mut normalized);
-        }
-        if line_end < bytes.len() {
-            normalized.push(b'\n');
-        }
-        line_start = line_end.saturating_add(1);
-    }
-    normalized
-}
-
-/// True only for the progress-line prefix `[<digits>/<digits>] `.
-fn is_progress_row(line: &[u8]) -> bool {
-    let Some(after_open) = line.strip_prefix(b"[") else {
-        return false;
-    };
-    let index_digits = after_open
-        .iter()
-        .take_while(|byte| byte.is_ascii_digit())
-        .count();
-    if index_digits == 0 || after_open.get(index_digits) != Some(&b'/') {
-        return false;
-    }
-    let after_slash = &after_open[index_digits + 1..];
-    let total_digits = after_slash
-        .iter()
-        .take_while(|byte| byte.is_ascii_digit())
-        .count();
-    total_digits > 0
-        && after_slash.get(total_digits) == Some(&b']')
-        && after_slash.get(total_digits + 1) == Some(&b' ')
-}
-
-/// Copy one bracketed stage row, replacing its trailing fixed-width elapsed field.
-fn normalize_stage_elapsed(line: &[u8], normalized: &mut Vec<u8>) {
-    let Some(space) = line.iter().rposition(|byte| *byte == b' ') else {
-        normalized.extend_from_slice(line);
-        return;
-    };
-    let stamp = &line[space + 1..];
-    if stamp.len() > 1
-        && stamp[..stamp.len() - 1]
-            .iter()
-            .all(|byte| byte.is_ascii_digit())
-        && stamp.last() == Some(&b's')
-    {
-        // The renderer right-aligns this field. Crossing `9s` to `11s`
-        // therefore changes both the token and one padding byte.
-        let field_start = line[..space]
-            .iter()
-            .rposition(|byte| *byte != b' ')
-            .map_or(0, |index| index + 1);
-        normalized.extend_from_slice(&line[..field_start]);
-        normalized.extend_from_slice(b" @ELAPSED@");
-    } else {
-        normalized.extend_from_slice(line);
-    }
-}
-
-/// Copy a completion row, replacing only its success/failure elapsed value.
-fn normalize_done_elapsed(line: &[u8], normalized: &mut Vec<u8>) {
-    let Some(prefix) = [b"Done in ".as_slice(), b"Done with errors in ".as_slice()]
-        .into_iter()
-        .find(|prefix| line.starts_with(prefix))
-    else {
-        normalized.extend_from_slice(line);
-        return;
-    };
-    let stamp = &line[prefix.len()..];
-    let digits = stamp
-        .iter()
-        .take_while(|byte| byte.is_ascii_digit())
-        .count();
-    if digits > 0 && stamp[digits..].starts_with(b"s.") {
-        normalized.extend_from_slice(prefix);
-        normalized.extend_from_slice(b"Ns.");
-        normalized.extend_from_slice(&stamp[digits + 2..]);
-    } else {
-        normalized.extend_from_slice(line);
-    }
 }
 
 /// `_ui_now_ms`: millisecond clock for durations. `date_output` is the

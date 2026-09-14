@@ -1,28 +1,30 @@
-//! Doctor orchestration: the load boundary,
+//! Doctor orchestration (`lib/dot/doctor.sh`): the load boundary,
 //! the runtime and engine-source checks, one extension run, and the
 //! `_dot_doctor` coordinator.
 //!
-//! Owns `_dot_doctor_load`
+//! Ports exactly five functions and nothing else: `_dot_doctor_load`
 //! (~line 17), `_dr_check_runtime` (~line 36),
 //! `_dr_check_engine_source` (~line 62),
 //! `_dot_doctor_run_extension` (~line 135), and `_dot_doctor`
-//! (~line 179). Neighboring pieces stay with their focused modules:
+//! (~line 179). The neighboring pieces stay with their own lanes:
 //! `_dot_doctor_extension_specs` and `_dot_doctor_render_records`
 //! (discovery and result dispatch), the `_dr_*` color/tty rendering
-//! (`doctor_runtime`), `_dr_tilde` (`doctor_paths`), the
+//! (`doctor_runtime` lane), `_dr_tilde` (`doctor_paths` lane), the
 //! kernel checks (`repos`, `lock`, `provider`, `overlays`, `merges`
-//! modules), and the worker spawn (`extension_worker`).
+//! lanes), and the worker spawn (`extension-worker` lane).
 //!
 //! Parity decisions:
-//! - Results flow as re-exported canonical [`Record`] rows (kind, message, detail) with
+//! - Results flow as [`Record`] rows (kind, message, detail) with
 //!   shell `$#` arity: `detail` is `None` for one-argument calls and
 //!   `Some` (possibly empty) for two-argument calls. [`Recorder`]
 //!   mirrors the `_DR_*_COUNT` effects (`ok`/`warn`/`fail` count,
 //!   `skip`/`section` do not).
-//! - [`Recorder::render`] reproduces the deterministic pipe projection used
-//!   by differential tests. Production passes the invocation palette through
-//!   the crate-private colored renderer; palette policy remains owned by
-//!   `doctor_runtime`, while title/summary styling remains in `ui`.
+//! - [`Recorder::render`] reproduces only the deterministic pipe
+//!   projection (empty palette, non-tty): the differential tests run
+//!   the live shell under pipes with a gum-free `PATH`, so colors
+//!   are empty and `dot_ui_title` / `dot_ui_summary_box` take their
+//!   plain branches. Color/tty/gum styling stays with the
+//!   `doctor_runtime` and `ui` lanes.
 //! - Text travels as bytes (`&[u8]` / `Vec<u8]`): messages carry
 //!   paths that may be non-UTF8, and `tr` / `printf` copy bytes
 //!   verbatim.
@@ -32,21 +34,71 @@
 //! - Worker execution and result-file dispatch arrive as injected
 //!   seams (the `worker` hook taking [`WorkerInvocation`] and the
 //!   `render` hook): the worker spawn and the record-file parser
-//!   belong to other modules, but
+//!   belong to other lanes, but
 //!   the temp lifecycle, context step, tail records, and cleanup
 //!   sequencing here are real.
 //!
-//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 
 use std::path::{Path, PathBuf};
-
-pub use crate::doctor_runtime::{Counts, Kind, Record};
 
 /// Summary helpers owned by the coordinator lane
 /// ([`crate::doctor_coordinator`]), re-exported here so orchestrator
 /// callers keep one import path.
 pub use crate::doctor_coordinator::{SummaryColor, overall_ok, summary_color, summary_line};
+
+/// One doctor result row, mirroring a single `_dr_*` call.
+///
+/// `detail` mirrors the shell `$#` arity: `None` renders no
+/// trailer (one-argument call), while `Some` — even empty —
+/// renders the trailer (two-argument call), exactly like
+/// `[[ $# -gt 1 ]]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    /// Which `_dr_*` helper filed this row.
+    pub kind: Kind,
+    /// The message verbatim (`$1`), as bytes.
+    pub message: Vec<u8>,
+    /// The detail verbatim (`$2`), or `None` for one-argument calls.
+    pub detail: Option<Vec<u8>>,
+}
+
+/// The `_dr_*` helper family a [`Record`] was filed through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// `_dr_section`: a section title, never counted.
+    Section,
+    /// `_dr_ok`: a passing check, bumps the pass count.
+    Ok,
+    /// `_dr_warn`: a warning, bumps the warn count.
+    Warn,
+    /// `_dr_fail`: a failure, bumps the fail count.
+    Fail,
+    /// `_dr_skip`: a skipped check, never counted.
+    Skip,
+}
+
+/// The `_DR_*_COUNT` aggregates: section modules report through
+/// [`Recorder::ok`], [`Recorder::warn`], and [`Recorder::fail`];
+/// [`Recorder::skip`] and [`Recorder::section`] leave the counts
+/// alone, exactly like the shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Counts {
+    /// `_DR_PASS_COUNT`, incremented by `ok`.
+    pub pass: u64,
+    /// `_DR_WARN_COUNT`, incremented by `warn`.
+    pub warn: u64,
+    /// `_DR_FAIL_COUNT`, incremented by `fail`.
+    pub fail: u64,
+}
+
+impl Counts {
+    /// Zeroed counters, like a freshly sourced `runtime.sh`.
+    pub fn new() -> Self {
+        Counts::default()
+    }
+}
 
 /// Collects [`Record`] rows and counts, mirroring the `_dr_*`
 /// helpers' print-plus-count effects without touching stdout.
@@ -106,17 +158,6 @@ impl Recorder {
         self.push(Kind::Skip, message, detail);
     }
 
-    /// File one already-built canonical record and update its aggregate.
-    pub fn record(&mut self, record: Record) {
-        match record.kind {
-            Kind::Ok => self.counts.pass += 1,
-            Kind::Warn => self.counts.warn += 1,
-            Kind::Fail | Kind::Unknown => self.counts.fail += 1,
-            Kind::Section | Kind::Skip => {}
-        }
-        self.records.push(record);
-    }
-
     /// Push one row without touching the counts.
     fn push(&mut self, kind: Kind, message: &[u8], detail: Option<&[u8]>) {
         self.records.push(Record {
@@ -132,12 +173,11 @@ impl Recorder {
     /// exactly what the live `_dr_*` helpers print when stdout is
     /// not a terminal.
     pub fn render(&self) -> Vec<u8> {
-        crate::doctor_runtime::render(&self.records, &crate::doctor_runtime::Palette::empty())
-    }
-
-    /// Render every filed row with the invocation's canonical doctor palette.
-    pub(crate) fn render_with(&self, palette: &crate::doctor_runtime::Palette) -> Vec<u8> {
-        crate::doctor_runtime::render(&self.records, palette)
+        let mut out = Vec::new();
+        for record in &self.records {
+            render_record(&mut out, record);
+        }
+        out
     }
 }
 
@@ -254,6 +294,46 @@ fn tilde(path: &[u8], home: &[u8]) -> Vec<u8> {
     path.to_vec()
 }
 
+/// Render one row under the pipe projection (see
+/// [`Recorder::render`]).
+fn render_record(out: &mut Vec<u8>, record: &Record) {
+    match record.kind {
+        Kind::Section => {
+            out.push(b'\n');
+            out.extend_from_slice(&record.message);
+            out.push(b'\n');
+        }
+        Kind::Ok | Kind::Skip => {
+            out.extend_from_slice(if record.kind == Kind::Ok {
+                "  ✓ ".as_bytes()
+            } else {
+                "  · ".as_bytes()
+            });
+            out.extend_from_slice(&record.message);
+            if let Some(detail) = &record.detail {
+                out.extend_from_slice(b" (");
+                out.extend_from_slice(detail);
+                out.push(b')');
+            }
+            out.push(b'\n');
+        }
+        Kind::Warn | Kind::Fail => {
+            out.extend_from_slice(if record.kind == Kind::Warn {
+                "  ⚠ ".as_bytes()
+            } else {
+                "  ✗ ".as_bytes()
+            });
+            out.extend_from_slice(&record.message);
+            out.push(b'\n');
+            if let Some(detail) = &record.detail {
+                out.extend_from_slice(b"    ");
+                out.extend_from_slice(detail);
+                out.push(b'\n');
+            }
+        }
+    }
+}
+
 /// Resolved inputs for [`check_runtime`], mirroring the shell locals
 /// of `_dr_check_runtime`: the Bash probe, the canonicalized
 /// checkout/source roots, the `git --version` line, and the
@@ -264,15 +344,9 @@ pub struct RuntimeSnapshot {
     pub bash_version: Vec<u8>,
     /// `${BASH_VERSINFO[0]}` for the Bash 4 gate.
     pub bash_major: u64,
-    /// Whether configured user hooks or the Shdeps provider make Bash part of
-    /// this invocation's runtime. The native engine itself has no Bash
-    /// dependency.
-    pub bash_required: bool,
     /// Canonicalized `rev-parse --show-toplevel`, `None` when the
     /// shell would leave `checkout_root` empty.
     pub checkout_root: Option<Vec<u8>>,
-    /// Whether the selected source is a packaged native release root.
-    pub release_root: bool,
     /// `$DOT_SOURCE_ROOT` verbatim (the fail detail uses this raw).
     pub source_raw: Vec<u8>,
     /// Canonicalized `$DOT_SOURCE_ROOT` (possibly empty on failure,
@@ -297,9 +371,7 @@ pub fn check_runtime(
     home: &[u8],
 ) {
     rec.section(b"dot runtime");
-    if !snapshot.bash_required {
-        rec.skip(b"Bash runtime is not required", None);
-    } else if snapshot.bash_major >= 4 {
+    if snapshot.bash_major >= 4 {
         rec.ok(b"Bash runtime", Some(&snapshot.bash_version));
     } else {
         rec.fail(
@@ -311,10 +383,7 @@ pub fn check_runtime(
         Some(root) => !root.is_empty() && *root == snapshot.source_root,
         None => false,
     };
-    if snapshot.release_root {
-        let display = tilde(&snapshot.source_raw, home);
-        rec.ok(b"dot release exists", Some(&display));
-    } else if checkout_ok {
+    if checkout_ok {
         let display = tilde(&snapshot.source_raw, home);
         rec.ok(b"dot checkout exists", Some(&display));
     } else {
@@ -462,19 +531,12 @@ fn random_suffix() -> u32 {
 /// mktemp template root and directory mode. Creation races retry;
 /// other failures surface like the shell's allocator failure.
 pub fn make_temp_dir() -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    use std::sync::atomic::Ordering;
     let root = std::env::var_os("TMPDIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    make_temp_dir_in(&root)
-}
-
-/// Allocate one doctor scratch directory under a caller-captured temp root.
-/// Native application code uses this form so embedded Runtime invocations do
-/// not fall through to the parent process environment.
-pub(crate) fn make_temp_dir_in(root: &Path) -> std::io::Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    use std::sync::atomic::Ordering;
     let pid = std::process::id();
     for _ in 0..100 {
         let n = TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -570,21 +632,6 @@ pub fn create_context(temporary: &Path, overlays: &[Vec<u8>]) -> Option<(PathBuf
     .ok()
 }
 
-/// Create a doctor worker context from one invocation's immutable Runtime
-/// values instead of process-global environment.
-pub fn create_context_for(
-    temporary: &Path,
-    overlays: &[Vec<u8>],
-    home: &str,
-    euid: u32,
-    now_secs: i64,
-) -> Option<(PathBuf, String)> {
-    crate::overlay_context::create(
-        temporary, "doctor", "active", "none", overlays, home, euid, now_secs,
-    )
-    .ok()
-}
-
 /// `_dot_doctor_run_extension`: allocate scratch, create the result
 /// file, build the overlay context, run the worker through
 /// `worker`, dispatch the filed rows through `render` (the
@@ -600,48 +647,7 @@ pub fn run_extension(
     worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> i32,
     render: &mut dyn FnMut(&Path, &mut Recorder),
 ) -> i32 {
-    let mut context = |temporary: &Path| create_context(temporary, overlays);
-    run_extension_with_context(rec, key, script, None, worker, render, &mut context)
-}
-
-/// Run one extension with context identity captured by the native
-/// invocation rather than read from process-global state.
-#[allow(clippy::too_many_arguments)]
-pub fn run_extension_for(
-    rec: &mut Recorder,
-    key: &[u8],
-    script: &Path,
-    overlays: &[Vec<u8>],
-    home: &str,
-    euid: u32,
-    now_secs: i64,
-    temporary_root: &Path,
-    worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> i32,
-    render: &mut dyn FnMut(&Path, &mut Recorder),
-) -> i32 {
-    let mut context =
-        |temporary: &Path| create_context_for(temporary, overlays, home, euid, now_secs);
-    run_extension_with_context(
-        rec,
-        key,
-        script,
-        Some(temporary_root),
-        worker,
-        render,
-        &mut context,
-    )
-}
-
-fn run_extension_with_context(
-    rec: &mut Recorder,
-    key: &[u8],
-    script: &Path,
-    temporary_root: Option<&Path>,
-    worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> i32,
-    render: &mut dyn FnMut(&Path, &mut Recorder),
-    context: &mut dyn FnMut(&Path) -> Option<(PathBuf, String)>,
-) -> i32 {
-    let temporary = match temporary_root.map_or_else(make_temp_dir, make_temp_dir_in) {
+    let temporary = match make_temp_dir() {
         Ok(dir) => dir,
         Err(_) => {
             let mut message = key.to_vec();
@@ -652,7 +658,7 @@ fn run_extension_with_context(
     };
     let (result, log) = result_paths(&temporary);
     let _ = create_result_file(&result);
-    let (context, token) = match context(&temporary) {
+    let (context, token) = match create_context(&temporary, overlays) {
         Some(pair) => pair,
         None => {
             let mut message = key.to_vec();

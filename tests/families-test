@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/test.sh
+. "$root/tests/lib/test.sh"
+# shellcheck source=../lib/dot/families.sh
+. "$root/lib/dot/families.sh"
+
+family=$DOT_TEST_TMP/example.d
+mkdir -p "$family/50-env.replace" "$family/70-mode.replace" \
+  "$family/65-subdir" "$family/75-nested.replace/90-dir"
+printf 'core\n' >"$family/10-core.json"
+printf 'extra\n' >"$family/90-extra.json"
+printf 'tab\n' >"$family/"$'85-tab\tname.json'
+printf 'alpha\n' >"$family/50-env.replace/50-alpha.json"
+printf 'beta\n' >"$family/50-env.replace/80-beta.json"
+printf 'dark\n' >"$family/70-mode.replace/10-dark.json"
+printf 'light\n' >"$family/70-mode.replace/20-light.json"
+printf 'ignored\n' >"$family/65-subdir/10-nested.json"
+printf 'ignored\n' >"$family/75-nested.replace/90-dir/99-nested.json"
+printf 'ignored\n' >"$family/70-mode.replace/.hidden.json"
+printf 'ignored\n' >"$family/.hidden.json"
+printf 'ignored\n' >"$family/99-temp.json~"
+
+files=$(
+  while IFS= read -r file; do
+    printf '%s\n' "${file#"$family/"}"
+  done < <(dot_family_files "$family")
+)
+assert_eq $'10-core.json\n50-env.replace/80-beta.json\n70-mode.replace/20-light.json\n85-tab\tname.json\n90-extra.json' \
+  "$files" 'family stream orders aggregates and replace winners'
+
+printf 'ignored\n' >"$family/50-env.replace/90-not-json.txt"
+matching=$(
+  while IFS= read -r file; do
+    printf '%s\n' "${file#"$family/"}"
+  done < <(dot_family_files_matching "$family" '*.json' '*.replace/*.json')
+)
+assert_eq $'10-core.json\n50-env.replace/80-beta.json\n70-mode.replace/20-light.json\n85-tab\tname.json\n90-extra.json' \
+  "$matching" 'family filtering happens before replace winner selection'
+
+empty=$DOT_TEST_TMP/empty.d
+mkdir -p "$empty/50-empty.replace"
+printf 'ignored\n' >"$empty/50-empty.replace/.hidden.json"
+assert_eq '' "$(dot_family_files "$DOT_TEST_TMP/missing.d")" \
+  'missing family is empty'
+assert_eq '' "$(dot_family_files "$empty")" \
+  'ignored-only replace family is empty'
+
+set +e
+dot_family_files >/dev/null 2>&1
+missing_status=$?
+dot_family_files "$family" extra >/dev/null 2>&1
+extra_status=$?
+dot_family_files_matching >/dev/null 2>&1
+matching_status=$?
+set -e
+assert_eq 2 "$missing_status" 'family API rejects missing argument'
+assert_eq 2 "$extra_status" 'family API rejects extra argument'
+assert_eq 2 "$matching_status" 'matching family API rejects missing argument'
+
+printf 'families-test: ok\n'
