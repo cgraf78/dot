@@ -10,12 +10,9 @@
 #![deny(missing_docs)]
 
 pub mod cli;
-pub mod config;
 pub mod errors;
-pub mod log;
-pub mod test_support;
-pub mod ui;
+#[cfg(test)]
+mod test_support;
 pub mod version;
-pub mod xdg;
 
 pub use errors::{Error, Result};
