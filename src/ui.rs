@@ -1,6 +1,6 @@
-//! Public presentation helpers.
+//! Public presentation helpers (slice 2 foundations).
 //!
-//! Owns the named color map, `#rrggbb`
+//! Ports `lib/dot/public/ui.sh` exactly: the named color map, `#rrggbb`
 //! validation, gum/tty/plain renderer selection, and the title and
 //! summary-box layouts. Output CONTENT stays caller-owned here as in
 //! the shell; these helpers only prevent styling from drifting.

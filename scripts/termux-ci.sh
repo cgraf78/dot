@@ -3,17 +3,12 @@ set -euo pipefail
 
 # The standard matrix owns the full test suite. This job executes the
 # NDK-built Android binary inside the real Termux app sandbox and
-# verifies the transported release's startup contract: help, version, and
-# fail-closed operational-command handling.
+# verifies the slice-1 CLI contract (help text, version shape, unknown
+# command) on-device. Deeper suites arrive with their owning slices.
 binary=.termux-ci/dot
-metadata=.termux-ci/.dot-install.json
 
 [[ -x $binary ]] || {
   printf 'termux-ci: transported binary missing: %s\n' "$binary" >&2
-  exit 1
-}
-[[ -f $metadata ]] || {
-  printf 'termux-ci: transported release metadata missing: %s\n' "$metadata" >&2
   exit 1
 }
 
@@ -33,17 +28,9 @@ case $version_actual in
     ;;
 esac
 
-set +e
-unknown_output=$("$binary" frobnicate 2>&1)
-unknown_status=$?
-set -e
-if [[ $unknown_status -ne 1 ]]; then
+if "$binary" frobnicate 2>/dev/null; then
   printf 'termux-ci: unknown command unexpectedly succeeded\n' >&2
   exit 1
 fi
-[[ $unknown_output == 'dot: startup: cannot resolve source root from executable' ]] || {
-  printf 'termux-ci: unexpected operational failure: %s\n' "$unknown_output" >&2
-  exit 1
-}
 
 printf 'termux-ci: ok\n'

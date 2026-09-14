@@ -12,8 +12,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Infrastructure failure kinds.
 ///
-/// Shared by lock, configuration, filesystem, and process boundaries so each
-/// caller does not invent its own status vocabulary.
+/// Scaffolding for slice 2+: no slice-1 path constructs these yet (only
+/// the self-tests below touch them). The shape is settled now so the
+/// lock/config/git-callers arriving in slices 2-3 share one error type
+/// instead of each inventing their own.
 #[derive(Debug)]
 pub enum Error {
     /// Caller usage error (shell exit 2): malformed registration input,
@@ -29,8 +31,8 @@ pub enum Error {
     /// again. Display renders the warning text for contexts that did not
     /// go through `update_lock::acquire`.
     LockBusy {
-        /// The already-emitted warning, e.g. `  warning: dot update
-        /// already running (pid 123)` (two-space `_warn` indent).
+        /// The already-emitted warning, e.g. `dot update already
+        /// running (pid 123)`.
         message: String,
     },
     /// Config rejection with the exact shell diagnostic text (without

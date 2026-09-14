@@ -1,6 +1,6 @@
-//! Quiet-gated logging helpers.
+//! Quiet-gated logging helpers (slice 2 foundations).
 //!
-//! Owns color enablement (tty stdout plus
+//! Ports `lib/dot/log.sh` exactly: color enablement (tty stdout plus
 //! unset-or-empty `NO_COLOR`), the quiet gate on `DOT_QUIET`, and the
 //! six helpers with their stdout/stderr routing. Message CONTENT stays
 //! caller-owned; callers pass pre-joined text (`echo "$@"` joins with

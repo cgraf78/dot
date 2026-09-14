@@ -1,5 +1,6 @@
-//! Native contract tests for host Git selection and repository
-//! identity: the pinned host `git` search with its client-root
+//! Differential parity tests for host Git selection and repository
+//! identity (`lib/dot/init-client.sh`, part 2) against the live
+//! shell: the pinned host `git` search with its client-root
 //! exclusions, the shell-function guard, repository URL
 //! normalization, branch-name validation, and remote
 //! default-branch resolution.
@@ -14,7 +15,57 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use dot::init_client_identity as init;
-use dot_test_support::TempDir;
+use dot::test_support::TempDir;
+
+/// Sources for the identity chapter: the cleanup allocator (probe
+/// stages for default-branch resolution) and the init client
+/// itself. Selection, binding, identity, and branch validation
+/// need nothing else; `temp.sh` / `public/xdg.sh` stay out so the
+/// harness spells exactly what the family consumes.
+const SOURCES: &str = concat!(
+    ". \"$1/lib/dot/resources.sh\"\n",
+    ". \"$1/lib/dot/init-client.sh\"\n",
+);
+
+/// Run one shell snippet with the identity runtime sourced. The
+/// locale stays pinned: `git` diagnostics must read English on both
+/// engines, and the port pins `LC_ALL=C` around every git run like
+/// the shell helpers do.
+fn shell_run(home: &Path, snippet: &str) -> (i32, Vec<u8>, Vec<u8>) {
+    let repo = env!("CARGO_MANIFEST_DIR");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let tmpdir = std::env::var_os("TMPDIR")
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
+    let mut cmd = Command::new(dot::test_support::bash());
+    cmd.arg("--noprofile")
+        .arg("--norc")
+        .arg("-c")
+        .arg(format!("{SOURCES}{snippet}"));
+    cmd.arg("dot-test-sh").arg(repo);
+    cmd.env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", &path)
+        .env("TMPDIR", &tmpdir)
+        .env("HOME", home)
+        .env("DOT_TEST", "1")
+        .env("DOT_SOURCE_ROOT", repo)
+        .current_dir(home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = cmd.output().expect("spawn bash");
+    (
+        output.status.code().unwrap_or(99),
+        output.stdout,
+        output.stderr,
+    )
+}
+
+/// Single-quote a word for snippet embedding.
+fn sq(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
 
 /// Twin homes: disjoint directories so probe stages never collide
 /// across engines. Selection fixtures live under the shared root
@@ -119,8 +170,14 @@ fn chmod(path: &Path, mode: u32) {
 
 /// Shell verdict for one selection probe: (exit code, stdout).
 fn shell_select(home: &Path, fake_home: &str, source: &str, path: &str) -> (i32, String) {
-    let _ = home;
-    (0, rust_select(fake_home, source, path))
+    let snippet = format!(
+        "export HOME={} DOT_SOURCE_ROOT={} PATH={}\nREPLY=; _dot_init_select_host_git; code=$?; printf 'code=%s\\nreply=%s\\n' \"$code\" \"$REPLY\"\n",
+        sq(fake_home),
+        sq(source),
+        sq(path),
+    );
+    let (code, out, _) = shell_run(home, &snippet);
+    (code, String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Rust verdict in the same shape.
@@ -290,9 +347,21 @@ fn shell_bind(
     path: &str,
     shadow: bool,
 ) -> (i32, String, String) {
-    let _ = home;
-    let (out, err) = rust_bind(fake_home, source, path, shadow);
-    (0, out, err)
+    let shadow_setup = if shadow { "git() { :; }\n" } else { "" };
+    // The trailing `if` (never `&&`) keeps the oracle exit at 0 on
+    // failure rows: the verdict travels in the captured streams.
+    let snippet = format!(
+        "export HOME={} DOT_SOURCE_ROOT={} PATH={}\n{shadow_setup}_dot_init_bind_host_git; code=$?; printf 'code=%s\\n' \"$code\"; if [[ $code -eq 0 ]]; then command -v git; fi\n",
+        sq(fake_home),
+        sq(source),
+        sq(path),
+    );
+    let (code, out, err) = shell_run(home, &snippet);
+    (
+        code,
+        String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned(),
+    )
 }
 
 /// Rust verdict in the same shape: the `Err` payload renders with
@@ -323,39 +392,6 @@ fn bind_pins_selected_git() {
     assert_eq!((&out, &err), (&rust_out, &rust_err));
     assert_eq!(out, format!("code=0\n{}/git\n", tools.display()));
     assert_eq!(err, "");
-}
-
-#[test]
-fn bound_host_git_drives_children_without_path_lookup() {
-    let twins = Twins::build("init-ident-bound-command");
-    let selected_dir = twins.shared().join("selected");
-    let shadow_dir = twins.shared().join("shadow");
-    let selected = fake_git(&selected_dir);
-    std::fs::create_dir_all(&shadow_dir).expect("shadow dir");
-    std::fs::write(shadow_dir.join("git"), b"#!/bin/sh\necho shadow\n").expect("shadow git");
-    chmod(&shadow_dir.join("git"), 0o755);
-
-    let output = init::with_host_git(&selected, || {
-        // Under parallel load the kernel can report the just-written
-        // fixture busy (ETXTBSY) on first exec; retry that transient
-        // only, with a bounded deadline (same pattern as
-        // `dot_test_support::copy_dot_binary`).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match init::host_git_command().env("PATH", &shadow_dir).output() {
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                result => break result.expect("run bound host git"),
-            }
-        }
-    });
-
-    assert!(output.status.success());
-    assert_eq!(output.stdout, b"fake\n");
 }
 
 #[test]
@@ -404,8 +440,12 @@ fn bind_rejects_shadowed_git() {
 /// printed identity (command substitution already stripped the
 /// single trailing newline, like the port's return value).
 fn shell_identity(home: &Path, url: &str) -> (i32, String) {
-    let _ = home;
-    (0, rust_identity(url))
+    let snippet = format!(
+        "out=$(_dot_init_repo_identity {} 2>/dev/null); code=$?; printf 'code=%s\\nout=%s\\n' \"$code\" \"$out\"\n",
+        sq(url),
+    );
+    let (code, out, _) = shell_run(home, &snippet);
+    (code, String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Rust verdict in the same shape.
@@ -555,11 +595,12 @@ fn identity_normalizes_network_shapes() {
 /// port reports the boolean verdict, and every caller only branches
 /// on zero versus nonzero.
 fn shell_branch(home: &Path, branch: &str) -> (i32, String) {
-    let _ = home;
-    (
-        0,
-        format!("code={}\n", i32::from(!init::branch_valid(branch))),
-    )
+    let snippet = format!(
+        "if _dot_init_branch_valid {} 2>/dev/null; then printf 'code=0\\n'; else printf 'code=1\\n'; fi\n",
+        sq(branch),
+    );
+    let (code, out, _) = shell_run(home, &snippet);
+    (code, String::from_utf8_lossy(&out).into_owned())
 }
 
 #[test]
@@ -597,8 +638,13 @@ fn branch_validation_matrix() {
 /// engines; only the branch name crosses the boundary, so random
 /// stage names need no normalization.
 fn shell_default(home: &Path, scratch: &Path, url: &str) -> (i32, String) {
-    let _ = home;
-    (0, rust_default(scratch, url))
+    let snippet = format!(
+        "export TMPDIR={}\nout=$(_dot_init_remote_default_branch {} 2>/dev/null); code=$?; printf 'code=%s\\nout=%s\\n' \"$code\" \"$out\"\n",
+        sq(&scratch.to_string_lossy()),
+        sq(url),
+    );
+    let (code, out, _) = shell_run(home, &snippet);
+    (code, String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Rust verdict in the same shape.

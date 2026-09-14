@@ -1,6 +1,6 @@
-//! Process-wide `dot update` serialization.
+//! Process-wide `dot update` serialization (slice 3).
 //!
-//! Uses `mkdir` atomicity, an owner record,
+//! Ports `lib/dot/update-lock.sh`. `mkdir` atomicity, the owner record
 //! (`pid\t…/start\t…/token\t…`), lock/owner path resolution,
 //! stale-claim-by-rename, the empty-guard protocol, and the 3-attempt
 //! acquire loop are transliterated. Two deliberate replacements (same
@@ -8,8 +8,8 @@
 //!
 //! - Process identity uses the same two backends (procfs field 22,
 //!   `ps -o lstart=`), read through std/`Command` — no change needed.
-//! - Liveness probing uses native `kill(pid, 0)` through the existing Unix
-//!   ABI dependency, avoiding a shell process on lock inspection.
+//! - Liveness probing (`kill -0`) goes through the `kill` CLI (std has
+//!   no `kill(pid, 0)`); rare path only, no new dependency.
 //! - The lock TOKEN format differs (`pid.nanos.counter` instead of
 //!   `$$.${SECONDS}.${RANDOM}`): tokens are opaque, and wall-clock
 //!   seconds plus `$RANDOM` are weaker uniqueness than a monotonic
@@ -17,7 +17,7 @@
 //! - Signal-trap installation (`_dot_update_lock_install_traps`) is
 //!   EXCLUDED: [`LockGuard`] releases on drop (RAII), which is strictly
 //!   stronger than EXIT-trap release (it also covers early returns and
-//!   panics). Process-level signal handling stays at the CLI boundary.
+//!   panics). A signal-handler story is a later slice.
 //! - `DOT_UPDATE_LOCK_TOKEN`/`DOT_UPDATE_LOCK_CRON_MODE` globals become
 //!   explicit parameters and return values.
 
@@ -67,99 +67,6 @@ pub fn lock_path(state_dir: &Path) -> PathBuf {
 /// Ports `_dot_update_lock_owner_file` (`printf '%s/owner\n' "$1"`).
 pub fn owner_file(lock_dir: &Path) -> PathBuf {
     lock_dir.join(OWNER_FILE_NAME)
-}
-
-/// Validate the state-owned parent before treating it as the lock namespace.
-/// In particular, never chmod through a `dot` symlink: it could change an
-/// unrelated target before the lock operation has even begun.
-#[cfg(unix)]
-fn secure_parent(state_dir: &Path) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-    let parent = state_dir.join(DOT_DIR_NAME);
-    match std::fs::symlink_metadata(&parent) {
-        Ok(meta) => {
-            if !meta.is_dir()
-                || meta.file_type().is_symlink()
-                || meta.uid() != crate::temp::current_uid().unwrap_or(u32::MAX)
-            {
-                return Err(Error::Io {
-                    context: "lock state directory is unsafe",
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        parent.display().to_string(),
-                    ),
-                });
-            }
-            // The shell has always repaired a pre-existing, user-owned
-            // state directory.  Keep that compatibility, but only after the
-            // lstat above has ruled out a link or foreign owner.
-            if meta.permissions().mode() & 0o077 != 0 {
-                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).map_err(
-                    |source| Error::Io {
-                        context: "lock could not secure its state directory",
-                        source,
-                    },
-                )?;
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(state_dir).map_err(|source| Error::Io {
-                context: "lock could not create its state directory",
-                source,
-            })?;
-            match std::fs::create_dir(&parent) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return secure_parent(state_dir);
-                }
-                Err(source) => {
-                    return Err(Error::Io {
-                        context: "lock could not create its state directory",
-                        source,
-                    });
-                }
-            }
-            // We created it, but still lstat before chmod so a concurrent
-            // replacement cannot redirect permission changes through a link.
-            let meta = std::fs::symlink_metadata(&parent).map_err(|source| Error::Io {
-                context: "lock could not inspect its state directory",
-                source,
-            })?;
-            if !meta.is_dir() || meta.file_type().is_symlink() {
-                return Err(Error::Io {
-                    context: "lock state directory is unsafe",
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        parent.display().to_string(),
-                    ),
-                });
-            }
-            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).map_err(
-                |source| Error::Io {
-                    context: "lock could not secure its state directory",
-                    source,
-                },
-            )?;
-        }
-        Err(source) => {
-            return Err(Error::Io {
-                context: "lock could not inspect its state directory",
-                source,
-            });
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn secure_parent(state_dir: &Path) -> Result<()> {
-    let parent = state_dir.join(DOT_DIR_NAME);
-    std::fs::create_dir_all(&parent).map_err(|source| Error::Io {
-        context: "lock could not create its state directory",
-        source,
-    })?;
-    Ok(())
 }
 
 /// Parsed owner record.
@@ -293,19 +200,21 @@ pub fn process_start_ps(pid: u32) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-/// Foreign-pid liveness through the native Unix signal-zero probe.
+/// Foreign-pid liveness via the shell's `kill -0` builtin (std cannot
+/// send signal 0, and the external `kill` binary is absent from
+/// minimal images that the shell still supports: there `kill` is a
+/// builtin, so invoke it through `sh`, exactly like the shell's own
+/// `kill -0 "$pid" 2>/dev/null`. The pid is a u32, so no quoting is
+/// needed. A missing `sh` degrades to inactive, like every other
+/// unreadable-identity path.
 fn pid_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: signal zero performs permission/existence validation only and
-    // does not deliver a signal. `pid` is a checked positive process id.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    // EPERM still proves that the process exists; we merely lack permission
-    // to signal it.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -0 {pid}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Whether a recorded owner still holds the lock: process alive AND
@@ -522,7 +431,7 @@ impl LockGuard {
             log.warn(
                 warn_sink,
                 &format!(
-                    "  warning: unable to remove dot update lock state: {}",
+                    "warning: unable to remove dot update lock state: {}",
                     self.lock_dir.display()
                 ),
             );
@@ -604,7 +513,12 @@ pub fn acquire(
     warn_sink: &mut dyn std::io::Write,
 ) -> Result<LockGuard> {
     let lock_dir = lock_path(state_dir);
-    secure_parent(state_dir)?;
+    std::fs::create_dir_all(lock_dir.parent().unwrap_or(state_dir)).map_err(|source| {
+        Error::Io {
+            context: "lock could not create its state directory",
+            source,
+        }
+    })?;
     if let Some(token) = prior_token {
         if let Some(guard) = try_reenter(&lock_dir, token) {
             return Ok(guard);
@@ -646,7 +560,7 @@ pub fn acquire(
             log.warn(
                 warn_sink,
                 &format!(
-                    "  warning: dot update lock path is not a directory: {}",
+                    "warning: dot update lock path is not a directory: {}",
                     lock_dir.display()
                 ),
             );
@@ -661,14 +575,14 @@ pub fn acquire(
 
         if let Some(owner) = read_owner(&lock_dir) {
             if owner_is_active(&owner) {
-                let message = format!("  warning: dot update already running (pid {})", owner.pid);
+                let message = format!("warning: dot update already running (pid {})", owner.pid);
                 if !cron {
                     log.warn(warn_sink, &message);
                 }
                 return Err(Error::LockBusy { message });
             }
         } else if is_initializing(&lock_dir) {
-            let message = "  warning: dot update lock is initializing".to_string();
+            let message = "warning: dot update lock is initializing".to_string();
             if !cron {
                 log.warn(warn_sink, &message);
             }
@@ -677,12 +591,12 @@ pub fn acquire(
 
         if !reclaim_stale(&lock_dir) {
             return Err(Error::LockBusy {
-                message: "  warning: dot update already running".to_string(),
+                message: "warning: dot update already running".to_string(),
             });
         }
     }
     Err(Error::LockBusy {
-        message: "  warning: dot update already running".to_string(),
+        message: "warning: dot update already running".to_string(),
     })
 }
 
@@ -769,7 +683,7 @@ mod tests {
 
     #[test]
     fn acquire_release_cycle() {
-        let scratch = dot_test_support::TempDir::new("lock-cycle").expect("scratch");
+        let scratch = crate::test_support::TempDir::new("lock-cycle").expect("scratch");
         let log = test_log();
         let mut warnings = Vec::new();
         let guard = acquire(scratch.path(), false, &log, None, &mut warnings).expect("acquire");
@@ -792,7 +706,7 @@ mod tests {
 
     #[test]
     fn drop_releases_unreleased_guard() {
-        let scratch = dot_test_support::TempDir::new("lock-drop").expect("scratch");
+        let scratch = crate::test_support::TempDir::new("lock-drop").expect("scratch");
         let log = test_log();
         let dir = scratch.path().join(DOT_DIR_NAME).join(LOCK_DIR_NAME);
         {
@@ -804,7 +718,7 @@ mod tests {
 
     #[test]
     fn initializing_empty_lock_reports_busy() {
-        let scratch = dot_test_support::TempDir::new("lock-init").expect("scratch");
+        let scratch = crate::test_support::TempDir::new("lock-init").expect("scratch");
         let dir = scratch.path().join(DOT_DIR_NAME).join(LOCK_DIR_NAME);
         std::fs::create_dir_all(&dir).expect("empty lock");
         assert!(is_initializing(&dir));
@@ -816,37 +730,5 @@ mod tests {
             }
             other => panic!("expected busy, got {other:?}"),
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn acquire_refuses_a_symlinked_state_parent_without_touching_target() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
-
-        let scratch = dot_test_support::TempDir::new("lock-parent-link").expect("scratch");
-        let target = scratch.path().join("unrelated-target");
-        std::fs::create_dir(&target).expect("target directory");
-        let sentinel = target.join("sentinel");
-        std::fs::write(&sentinel, b"must survive").expect("target content");
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
-            .expect("target mode");
-        symlink(&target, scratch.path().join(DOT_DIR_NAME)).expect("state symlink");
-
-        let result = acquire(scratch.path(), false, &test_log(), None, &mut Vec::new());
-
-        assert!(result.is_err(), "symlinked state parent must be refused");
-        assert_eq!(
-            std::fs::read(&sentinel).expect("target content"),
-            b"must survive"
-        );
-        assert_eq!(
-            std::fs::metadata(&target)
-                .expect("target metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755,
-            "refusal must not chmod the symlink target"
-        );
     }
 }

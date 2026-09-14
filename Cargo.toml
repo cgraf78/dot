@@ -8,7 +8,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-description = "Fast declarative dotfiles manager"
+description = "Fast declarative dotfiles manager (Rust port of the dot engine)"
 build = "build.rs"
 
 [lib]
@@ -17,14 +17,6 @@ name = "dot"
 [[bin]]
 name = "dot"
 path = "src/main.rs"
-
-[dependencies]
-# std has no sigaction, setsid, waitid(WNOWAIT), or group signal delivery.
-# Keep Unix ABI definitions in libc rather than duplicating platform layouts.
-libc = "0.2"
-
-[dev-dependencies]
-dot-test-support = { path = "test-support" }
 
 # Treat compiler warnings as build errors. CI runs `cargo clippy --locked
 # --all-targets --all-features -- -D warnings`, but ordinary local builds
