@@ -32,6 +32,23 @@ root=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 _warn() { printf '%s\n' "$*" >&2; }
 
+wait_for_provider_exit() {
+  local deadline=$((SECONDS + 2)) pid live
+
+  while :; do
+    live=0
+    for pid in "$@"; do
+      process_is_live "$pid" && {
+        live=1
+        break
+      }
+    done
+    [[ $live -eq 0 ]] && return 0
+    ((SECONDS < deadline)) || return 1
+    sleep 0.01
+  done
+}
+
 provider_home=$DOT_TEST_TMP/provider-home
 provider_state=$DOT_TEST_TMP/provider-state
 revision_file=$DOT_TEST_TMP/provider-revision
@@ -580,6 +597,7 @@ assert_contains 'Shdeps provider ABI probe timed out after 1s' "$bounded_output"
   fail 'bounded provider fixture did not start its process tree'
 bounded_parent_pid=$(<"$bounded_parent")
 bounded_child_pid=$(<"$bounded_child")
+wait_for_provider_exit "$bounded_parent_pid" "$bounded_child_pid" || true
 process_is_live "$bounded_parent_pid" &&
   fail 'bounded provider command retained its process leader'
 process_is_live "$bounded_child_pid" &&
@@ -615,6 +633,7 @@ assert_eq abi:1 "$REPLY" \
 [[ -s $pipeholder_child ]] ||
   fail 'provider ABI pipe-holder fixture did not start its descendant'
 pipeholder_child_pid=$(<"$pipeholder_child")
+wait_for_provider_exit "$pipeholder_child_pid" || true
 process_is_live "$pipeholder_child_pid" &&
   fail 'successful provider ABI probe retained its stdout-holding descendant'
 
@@ -660,6 +679,7 @@ assert_contains 'Shdeps provider ABI probe timed out after 1s' \
   'provider ABI probe reports its bounded phase'
 abi_parent_pid=$(<"$abi_parent")
 abi_child_pid=$(<"$abi_child")
+wait_for_provider_exit "$abi_parent_pid" "$abi_child_pid" || true
 process_is_live "$abi_parent_pid" &&
   fail 'provider ABI timeout retained its process leader'
 process_is_live "$abi_child_pid" &&
