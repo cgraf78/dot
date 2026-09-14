@@ -18,6 +18,30 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// instead of each inventing their own.
 #[derive(Debug)]
 pub enum Error {
+    /// Caller usage error (shell exit 2): malformed registration input,
+    /// bad arity, invalid values. The message is the diagnostic payload;
+    /// the CLI maps this variant to exit code 2.
+    Usage {
+        /// What was wrong, e.g. `pid must be a positive integer`.
+        message: &'static str,
+    },
+    /// Update lock held by another live owner (shell exit 75). The
+    /// acquiring side already emitted the warning (cron mode suppresses
+    /// it); the CLI maps this variant to exit code 75 WITHOUT printing
+    /// again. Display renders the warning text for contexts that did not
+    /// go through `update_lock::acquire`.
+    LockBusy {
+        /// The already-emitted warning, e.g. `dot update already
+        /// running (pid 123)`.
+        message: String,
+    },
+    /// Config rejection with the exact shell diagnostic text (without
+    /// the `dot: config: ` prefix, which the Display impl adds so every
+    /// call site emits byte-identical diagnostics).
+    Config {
+        /// The shell's `%s` payload, e.g. `duplicate version`.
+        message: String,
+    },
     /// Filesystem or process I/O failure with context.
     Io {
         /// What the engine was trying to do.
@@ -37,6 +61,9 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::Usage { message } => write!(f, "{message}"),
+            Error::LockBusy { message } => write!(f, "{message}"),
+            Error::Config { message } => write!(f, "dot: config: {message}"),
             Error::Io { context, source } => write!(f, "{context}: {source}"),
             Error::Command { command, status } => match status {
                 Some(status) => write!(f, "command failed ({status}): {command}"),
@@ -49,6 +76,11 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            // Usage, lock-busy, and config rejections are complete
+            // diagnostics already; there is no deeper cause to chain.
+            Error::Usage { .. } => None,
+            Error::LockBusy { .. } => None,
+            Error::Config { .. } => None,
             Error::Io { source, .. } => Some(source),
             Error::Command { .. } => None,
         }
@@ -67,6 +99,14 @@ impl From<io::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_error_carries_shell_prefix() {
+        let err = Error::Config {
+            message: "duplicate version".to_string(),
+        };
+        assert_eq!(format!("{err}"), "dot: config: duplicate version");
+    }
 
     #[test]
     fn io_error_displays_context_and_source() {
