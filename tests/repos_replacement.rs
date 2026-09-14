@@ -1,601 +1,434 @@
-//! Differential parity tests for the replacement record layer of
-//! `lib/dot/repos/overlays.sh`: the record path derivation, the
-//! legacy-format hash, legacy record matching, generation
-//! matching, transaction safety, record reading, and cleanup.
-//!
-//! Every case runs the live shell function and its Rust twin on
-//! identical fixtures and compares exit status and selection.
+//! Native contracts for durable overlay replacement records.
 
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use dot::repos_overlays;
-use dot::test_support::TempDir;
+use dot::repos_overlays::{self, ReplaceIdentityKind};
+use dot_test_support::TempDir;
 
-/// Run one shell snippet with the replacement runtime sourced
-/// (overlays.sh pulls in temp.sh for the Git boundary itself).
-fn shell_run(home: &Path, argv: &[&std::ffi::OsStr], snippet: &str) -> (i32, Vec<u8>, Vec<u8>) {
-    let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let tmpdir = std::env::var_os("TMPDIR")
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg("--noprofile")
-        .arg("--norc")
-        .arg("-c")
-        .arg(format!(
-            ". \"$1/lib/dot/repos/overlays.sh\"\n. \"$1/lib/dot/reserved.sh\"\n. \"$1/lib/dot/public/xdg.sh\"\n{snippet}"
-        ));
-    cmd.arg("dot-test-sh").arg(repo);
-    for arg in argv {
-        cmd.arg(arg);
-    }
-    cmd.env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", &path)
-        .env("TMPDIR", &tmpdir)
-        .env("HOME", home)
-        .env("DOT_TEST", "1")
-        .current_dir(home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = cmd.output().expect("spawn bash");
-    (
-        output.status.code().unwrap_or(99),
-        output.stdout,
-        output.stderr,
-    )
-}
-
-/// Write `bytes` to `dir/name`, creating parents.
-fn stage(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
-    let path = dir.join(name);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("fixture parents");
-    }
-    std::fs::write(&path, bytes).expect("write fixture");
+fn stage(root: &Path, relative: &str, bytes: &[u8], mode: u32) -> PathBuf {
+    let path = root.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
     path
 }
 
-/// chmod a fixture to an exact mode.
-fn chmod(path: &Path, mode: u32) {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod fixture");
-}
-
-/// Single-quote a word for snippet embedding.
-fn sq(word: &str) -> String {
-    format!("'{}'", word.replace('\'', "'\\''"))
-}
-
-/// `git hash-object --stdin` for setup only (an independent oracle
-/// for the record-name fixtures, not the implementation).
-fn hash_stdin(value: &str) -> String {
+fn hash(value: &str) -> String {
+    use std::io::Write as _;
     let mut child = Command::new("git")
-        .args(["hash-object", "--stdin"])
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "tag.gpgSign=false",
+            "hash-object",
+            "--stdin",
+        ])
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", "/tmp")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
         .spawn()
-        .expect("spawn git");
-    use std::io::Write as _;
+        .unwrap();
     child
         .stdin
         .as_mut()
-        .expect("stdin")
+        .unwrap()
         .write_all(value.as_bytes())
-        .expect("feed git");
-    let output = child.wait_with_output().expect("wait git");
-    assert!(output.status.success(), "setup hash");
-    String::from_utf8(output.stdout)
-        .expect("hash")
-        .trim()
-        .to_string()
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().into()
 }
 
 #[test]
-fn replacement_record_path_agrees() {
-    let dir = TempDir::new("ovrepl-path").expect("fixture dir");
-    let home = dir.path();
-    for destination in [
-        home.join("app.conf").to_string_lossy().into_owned(),
-        home.join("deep/nested.conf").to_string_lossy().into_owned(),
-    ] {
-        let manifest = home.join("manifest.tsv").to_string_lossy().into_owned();
-        let snippet = format!(
-            "DOT_OVERLAY_MANIFEST={} _overlay_replacement_record_path {}; code=$?; printf 'rc=%s\\nreply=%s\\n' \"$code\" \"$REPLY\"\n",
-            sq(&manifest),
-            sq(&destination),
+fn replacement_record_path_binds_the_absolute_destination() {
+    let scope = TempDir::new("replacement-path").unwrap();
+    let manifest = scope.path().join("manifest.tsv");
+    for relative in ["app.conf", "deep/nested.conf"] {
+        let destination = scope.path().join(relative).to_string_lossy().into_owned();
+        assert_eq!(
+            repos_overlays::replacement_record_path(
+                &destination,
+                &manifest.to_string_lossy(),
+                scope.path()
+            ),
+            Some(format!(
+                "{}.replace.{}",
+                manifest.display(),
+                hash(&destination)
+            ))
         );
-        let (code, out, serr) = shell_run(home, &[], &snippet);
-        assert_eq!(code, 0, "harness exit for {destination:?}");
-        assert!(serr.is_empty(), "record path stderr: {serr:?}");
-        let shell = String::from_utf8(out).expect("record path dump");
-        let rust = match repos_overlays::replacement_record_path(&destination, &manifest, home) {
-            Some(path) => format!("rc=0\nreply={path}\n"),
-            None => String::from("rc=1\nreply=\n"),
-        };
-        assert_eq!(rust, shell, "record path for {destination:?}");
     }
 }
 
 #[test]
-fn replacement_hash_object_format_agrees() {
-    let dir = TempDir::new("ovrepl-format").expect("fixture dir");
-    let home = dir.path();
-    for (format, value) in [
-        ("sha1", "alpha"),
-        ("sha256", "alpha"),
-        ("sha1", ""),
-        ("bogus", "alpha"),
-        ("", "alpha"),
+fn replacement_hash_object_format_has_literal_git_blob_values() {
+    let scope = TempDir::new("replacement-format").unwrap();
+    for (format, value, expected) in [
+        (
+            "sha1",
+            "alpha",
+            Some("7e74e68b2a782a3aead46d987a63ca1c91091c13"),
+        ),
+        (
+            "sha256",
+            "alpha",
+            Some("a127e6ce46f35284822de1324a3ed0d3430cb75e4417061c719749a26d59a364"),
+        ),
+        ("sha1", "", Some("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")),
+        (
+            "sha256",
+            "",
+            Some("473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813"),
+        ),
+        ("bogus", "alpha", None),
+        ("", "alpha", None),
     ] {
-        let snippet = format!(
-            "out=$(_overlay_replacement_hash_object_format {} {} 2>/dev/null); code=$?; printf 'rc=%s\\nhash=%s\\n' \"$code\" \"$out\"\n",
-            sq(format),
-            sq(value),
+        assert_eq!(
+            repos_overlays::replacement_hash_object_format(format, value, scope.path()).as_deref(),
+            expected,
+            "{format:?} {value:?}"
         );
-        let (code, out, _serr) = shell_run(home, &[], &snippet);
-        assert_eq!(code, 0, "harness exit for {format:?}");
-        let shell = String::from_utf8(out).expect("format dump");
-        let rust = match repos_overlays::replacement_hash_object_format(format, value, home) {
-            Some(hash) => format!("rc=0\nhash={hash}\n"),
-            None => String::from("rc=1\nhash=\n"),
-        };
-        assert_eq!(rust, shell, "hash format for {format:?}");
-        // The sha1 spelling must equal the plain hash oracle.
-        if format == "sha1" {
-            assert_eq!(
-                repos_overlays::replacement_hash_object_format(format, value, home),
-                Some(hash_stdin(value)),
-                "sha1 equals oracle"
-            );
-        }
     }
 }
 
-/// Legacy record fixture: the record name carries the alternate
-/// (sha256) hash of the destination while the current hash is
-/// sha1, which is exactly the length-mismatch legacy shape.
-fn legacy_record(manifest: &str, destination: &str, home: &Path) -> (String, String) {
-    let current = hash_stdin(destination);
-    assert_eq!(current.len(), 40, "current format is sha1");
-    let alternate = repos_overlays::replacement_hash_object_format("sha256", destination, home)
-        .expect("alternate hash");
-    (format!("{manifest}.replace.{alternate}"), current)
-}
-
 #[test]
-fn replacement_legacy_record_path_matches_agrees() {
-    let dir = TempDir::new("ovrepl-legacy").expect("fixture dir");
-    let home = dir.path();
-    let manifest = home.join("manifest.tsv").to_string_lossy().into_owned();
-    let destination = home.join("app.conf").to_string_lossy().into_owned();
-    let (legacy, current) = legacy_record(&manifest, &destination, home);
-    let current_named = format!("{manifest}.replace.{current}");
-    let cases: &[(&str, String, String)] = &[
-        ("legacy-sha256", legacy.clone(), destination.clone()),
-        ("current-name", current_named, destination.clone()),
+fn legacy_record_path_accepts_only_the_alternate_object_format_for_the_destination() {
+    let scope = TempDir::new("replacement-legacy").unwrap();
+    let root = scope.path();
+    let manifest = root.join("manifest.tsv").to_string_lossy().into_owned();
+    let destination = root.join("app.conf").to_string_lossy().into_owned();
+    let current = hash(&destination);
+    let alternate =
+        repos_overlays::replacement_hash_object_format("sha256", &destination, root).unwrap();
+    let legacy = format!("{manifest}.replace.{alternate}");
+    for (name, record, candidate, expected) in [
+        ("legacy-sha256", legacy.clone(), destination.clone(), true),
+        (
+            "current-name",
+            format!("{manifest}.replace.{current}"),
+            destination.clone(),
+            false,
+        ),
         (
             "bad-prefix",
-            format!("{manifest}.other.{current}"),
+            format!("{manifest}.other.{alternate}"),
             destination.clone(),
+            false,
         ),
         (
             "bad-suffix",
             format!("{manifest}.replace.{}", "g".repeat(64)),
             destination.clone(),
+            false,
         ),
         (
             "wrong-target",
-            legacy.clone(),
-            home.join("other.conf").to_string_lossy().into_owned(),
+            legacy,
+            root.join("other.conf").to_string_lossy().into_owned(),
+            false,
         ),
-    ];
-    for (name, record, destination) in cases {
-        let snippet = format!(
-            "DOT_OVERLAY_MANIFEST={} _overlay_replacement_legacy_record_path_matches {} {} {}; printf 'rc=%s\\n' \"$?\"\n",
-            sq(&manifest),
-            sq(record),
-            sq(destination),
-            sq(&current),
-        );
-        let (code, out, serr) = shell_run(home, &[], &snippet);
-        assert_eq!(code, 0, "harness exit for {name:?}");
-        assert!(serr.is_empty(), "legacy stderr for {name:?}: {serr:?}");
-        let shell = String::from_utf8(out).expect("legacy dump");
-        let rust_code = if repos_overlays::replacement_legacy_record_path_matches(
-            record,
-            destination,
-            &current,
-            &manifest,
-            home,
-        ) {
-            0
-        } else {
-            1
-        };
+    ] {
         assert_eq!(
-            format!("rc={rust_code}\n"),
-            shell,
-            "legacy match for {name:?}"
+            repos_overlays::replacement_legacy_record_path_matches(
+                &record, &candidate, &current, &manifest, root
+            ),
+            expected,
+            "{name}"
         );
     }
 }
 
 #[test]
-fn replacement_generation_matches_agrees() {
-    let dir = TempDir::new("ovrepl-generation").expect("fixture dir");
-    let home = dir.path();
-    let file = stage(home, "app.conf", b"body\n");
-    let link = home.join("link.conf");
-    std::os::unix::fs::symlink("app.conf", &link).expect("link");
-    let content_file = repos_overlays::replacement_identity(home, &file).expect("file identity");
-    let content_link = repos_overlays::replacement_identity(home, &link).expect("link identity");
-    let legacy_id =
-        dot::temp::identity_string(dot::temp::path_identity(&file).expect("path identity"));
-    // No-follow leaf identity: the link answers its own dev:ino.
-    use std::os::unix::fs::MetadataExt as _;
-    let link_meta = std::fs::symlink_metadata(&link).expect("link meta");
-    let link_legacy_id = format!("{}:{}", link_meta.dev(), link_meta.ino());
-    for (name, path, expected, kind) in [
+fn replacement_generation_matches_content_and_nofollow_legacy_identity() {
+    let scope = TempDir::new("replacement-generation").unwrap();
+    let root = scope.path();
+    let file = stage(root, "app.conf", b"body\n", 0o600);
+    let link = root.join("link.conf");
+    std::os::unix::fs::symlink("app.conf", &link).unwrap();
+    let file_content = repos_overlays::replacement_identity(root, &file).unwrap();
+    let link_content = repos_overlays::replacement_identity(root, &link).unwrap();
+    let file_meta = std::fs::symlink_metadata(&file).unwrap();
+    let link_meta = std::fs::symlink_metadata(&link).unwrap();
+    let file_legacy = format!("{}:{}", file_meta.dev(), file_meta.ino());
+    let link_legacy = format!("{}:{}", link_meta.dev(), link_meta.ino());
+    for (name, path, expected, kind, answer) in [
         (
             "file-content",
             file.clone(),
-            content_file.clone(),
+            file_content.clone(),
             "content",
+            true,
         ),
         (
             "link-content",
             link.clone(),
-            content_link.clone(),
+            link_content.clone(),
             "content",
+            true,
         ),
-        ("file-legacy", file.clone(), legacy_id.clone(), "legacy"),
-        // Plain `stat` takes no `-L` here: the link answers its
-        // own pair, not its target's.
+        ("file-legacy", file.clone(), file_legacy, "legacy", true),
+        ("link-legacy", link.clone(), link_legacy, "legacy", true),
+        ("mismatch", file.clone(), link_content, "content", false),
         (
-            "link-legacy",
-            link.clone(),
-            link_legacy_id.clone(),
-            "legacy",
+            "bogus-kind",
+            file.clone(),
+            file_content.clone(),
+            "bogus",
+            false,
         ),
-        ("mismatch", file.clone(), content_link.clone(), "content"),
-        ("bogus-kind", file.clone(), content_file.clone(), "bogus"),
-        ("empty-kind", file.clone(), content_file.clone(), ""),
+        ("empty-kind", file.clone(), file_content.clone(), "", false),
         (
             "missing",
-            home.join("absent.conf"),
-            content_file.clone(),
+            root.join("absent.conf"),
+            file_content,
             "content",
+            false,
         ),
     ] {
-        let snippet = format!(
-            "if _overlay_replacement_generation_matches {} {} {}; then code=0; else code=1; fi; printf 'rc=%s\\n' \"$code\"\n",
-            sq(&path.to_string_lossy()),
-            sq(&expected),
-            sq(kind),
-        );
-        let (code, out, serr) = shell_run(home, &[], &snippet);
-        assert_eq!(code, 0, "harness exit for {name:?}");
-        assert!(serr.is_empty(), "generation stderr for {name:?}: {serr:?}");
-        let shell = String::from_utf8(out).expect("generation dump");
-        let rust_code =
-            if repos_overlays::replacement_generation_matches(&path, &expected, kind, home) {
-                0
-            } else {
-                1
-            };
         assert_eq!(
-            format!("rc={rust_code}\n"),
-            shell,
-            "generation for {name:?}"
+            repos_overlays::replacement_generation_matches(&path, &expected, kind, root),
+            answer,
+            "{name}"
         );
     }
 }
 
 #[test]
-fn replacement_transaction_safe_agrees() {
-    let dir = TempDir::new("ovrepl-transaction").expect("fixture dir");
-    let home = dir.path();
-    let euid = dot::temp::current_uid().expect("current uid");
-    // (name, setup): each case stages one transaction directory.
-    let cases = [
-        "empty",
-        "next-only",
-        "previous-only",
-        "both",
-        "extra-file",
-        "extra-hidden",
-        "open-mode",
-        "as-file",
-        "as-link",
-        "missing",
-    ];
-    for name in cases {
-        let root = home.join(name);
-        std::fs::create_dir_all(&root).expect("case dir");
+fn replacement_transaction_requires_a_private_directory_with_only_staging_names() {
+    let scope = TempDir::new("replacement-transaction").unwrap();
+    for (name, expected) in [
+        ("empty", true),
+        ("next-only", true),
+        ("previous-only", true),
+        ("both", true),
+        ("extra-file", false),
+        ("extra-hidden", false),
+        ("open-mode", false),
+        ("as-file", false),
+        ("as-link", false),
+        ("missing", false),
+    ] {
+        let root = scope.path().join(name);
+        std::fs::create_dir_all(&root).unwrap();
         let transaction = root.join("txn");
         match name {
             "empty" | "next-only" | "previous-only" | "both" | "extra-file" | "extra-hidden" => {
-                std::fs::create_dir_all(&transaction).expect("txn dir");
-                chmod(&transaction, 0o700);
-                if name == "next-only" || name == "both" {
-                    std::os::unix::fs::symlink("target", transaction.join("next")).expect("next");
+                std::fs::create_dir(&transaction).unwrap();
+                std::fs::set_permissions(&transaction, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                if matches!(name, "next-only" | "both") {
+                    std::os::unix::fs::symlink("target", transaction.join("next")).unwrap();
                 }
-                if name == "previous-only" || name == "both" {
-                    std::os::unix::fs::symlink("target", transaction.join("previous"))
-                        .expect("previous");
+                if matches!(name, "previous-only" | "both") {
+                    std::os::unix::fs::symlink("target", transaction.join("previous")).unwrap();
                 }
                 if name == "extra-file" {
-                    stage(&transaction, "stray", b"x\n");
+                    stage(&transaction, "stray", b"x", 0o600);
                 }
                 if name == "extra-hidden" {
-                    stage(&transaction, ".hidden", b"x\n");
+                    stage(&transaction, ".hidden", b"x", 0o600);
                 }
             }
             "open-mode" => {
-                std::fs::create_dir_all(&transaction).expect("txn dir");
-                chmod(&transaction, 0o755);
+                std::fs::create_dir(&transaction).unwrap();
+                std::fs::set_permissions(&transaction, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
             }
             "as-file" => {
-                stage(&root, "txn", b"x\n");
+                stage(&root, "txn", b"x", 0o600);
             }
             "as-link" => {
-                std::os::unix::fs::symlink("elsewhere", &transaction).expect("link");
+                std::os::unix::fs::symlink("elsewhere", &transaction).unwrap();
             }
             _ => {}
         }
-        let snippet = format!(
-            "if _overlay_replacement_transaction_safe {}; then code=0; else code=1; fi; printf 'rc=%s\\n' \"$code\"\n",
-            sq(&transaction.to_string_lossy()),
-        );
-        let (code, out, serr) = shell_run(&root, &[], &snippet);
-        assert_eq!(code, 0, "harness exit for {name:?}");
-        assert!(serr.is_empty(), "transaction stderr for {name:?}: {serr:?}");
-        let shell = String::from_utf8(out).expect("transaction dump");
-        let rust_code = if repos_overlays::replacement_transaction_safe(&transaction, euid) {
-            0
-        } else {
-            1
-        };
         assert_eq!(
-            format!("rc={rust_code}\n"),
-            shell,
-            "transaction for {name:?}"
+            repos_overlays::replacement_transaction_safe(
+                &transaction,
+                dot::temp::current_uid().unwrap()
+            ),
+            expected,
+            "{name}"
         );
     }
 }
 
-/// One replacement fixture: a physical file plus its transaction
-/// directory, with content-kind and legacy-kind identities.
 struct RecordFixture {
     destination: String,
     physical: PathBuf,
     transaction: PathBuf,
-    content_expected: String,
-    legacy_expected: String,
+    expected: String,
+    legacy: String,
     parent_identity: String,
 }
 
-fn record_fixture(root: &Path, rel: &str) -> RecordFixture {
-    let destination = root.join(rel).to_string_lossy().into_owned();
-    let physical = stage(root, "physical/app.conf", b"body\n");
-    let parent = physical.parent().expect("parent").to_path_buf();
+fn record_fixture(root: &Path) -> RecordFixture {
+    let destination = root.join("app.conf").to_string_lossy().into_owned();
+    let physical = stage(root, "physical/app.conf", b"body\n", 0o600);
+    let parent = physical.parent().unwrap();
     let transaction = parent.join(".app.conf.dot-overlay-replace-v1");
-    std::fs::create_dir_all(&transaction).expect("txn dir");
-    let content_expected =
-        repos_overlays::replacement_identity(root, &physical).expect("content identity");
-    let legacy_expected =
-        dot::temp::identity_string(dot::temp::path_identity(&physical).expect("identity"));
-    let parent_identity =
-        dot::temp::identity_string(dot::temp::path_identity(&parent).expect("parent identity"));
+    std::fs::create_dir(&transaction).unwrap();
+    let expected = repos_overlays::replacement_identity(root, &physical).unwrap();
+    let meta = std::fs::symlink_metadata(&physical).unwrap();
+    let legacy = format!("{}:{}", meta.dev(), meta.ino());
+    let parent_meta = std::fs::symlink_metadata(parent).unwrap();
+    let parent_identity = format!("{}:{}", parent_meta.dev(), parent_meta.ino());
     RecordFixture {
         destination,
         physical,
         transaction,
-        content_expected,
-        legacy_expected,
+        expected,
+        legacy,
         parent_identity,
     }
 }
 
-/// The six-field record line.
-fn record_line(fixture: &RecordFixture, target: &str, expected: &str) -> Vec<u8> {
+fn line(f: &RecordFixture, expected: &str) -> Vec<u8> {
     format!(
-        "{}\t{}\t{target}\t{expected}\t{}\t{}\n",
-        fixture.destination,
-        fixture.physical.to_string_lossy(),
-        fixture.transaction.to_string_lossy(),
-        fixture.parent_identity,
+        "{}\t{}\t.dotfiles-web/home/app.conf\t{}\t{}\t{}\n",
+        f.destination,
+        f.physical.display(),
+        expected,
+        f.transaction.display(),
+        f.parent_identity
     )
     .into_bytes()
 }
 
-/// Dump a read: rc plus the seven record fields (empty on failure).
-fn dump_read(record: Option<repos_overlays::ReplaceRecord>) -> String {
-    match record {
-        Some(fields) => format!(
-            "rc=0\ndestination={}\nphysical={}\ntarget={}\nexpected={}\nkind={}\ntransaction={}\nparent={}\n",
-            fields.destination,
-            fields.physical,
-            fields.target,
-            fields.expected,
-            fields.identity_kind.as_str(),
-            fields.transaction,
-            fields.parent_identity,
-        ),
-        None => String::from("rc=1\n"),
-    }
-}
-
 #[test]
-fn replacement_read_agrees() {
-    let dir = TempDir::new("ovrepl-read").expect("fixture dir");
-    let home = dir.path();
-    let euid = dot::temp::current_uid().expect("current uid");
-    for (name, body, rename) in [
-        ("content", "content", ""),
-        ("legacy", "legacy", ""),
-        ("wrong-name", "content", "renamed"),
-        ("two-line", "two-line", ""),
-        ("relative-dest", "relative-dest", ""),
-        ("open-record", "content", ""),
-        ("transaction-mismatch", "transaction-mismatch", ""),
-        ("garbage-expected", "garbage-expected", ""),
-        ("extra-field", "extra-field", ""),
+fn replacement_read_validates_privacy_shape_name_identity_and_transaction_binding() {
+    for case in [
+        "content",
+        "legacy",
+        "wrong-name",
+        "two-line",
+        "relative-dest",
+        "open-record",
+        "transaction-mismatch",
+        "garbage-expected",
+        "extra-field",
     ] {
-        let root = home.join(name);
-        std::fs::create_dir_all(&root).expect("case dir");
+        let scope = TempDir::new("replacement-read").unwrap();
+        let root = scope.path();
         let manifest = root.join("manifest.tsv").to_string_lossy().into_owned();
-        let fixture = record_fixture(&root, "app.conf");
-        let target = ".dotfiles-web/home/app.conf";
-        let record_name = if rename.is_empty() {
-            match body {
-                "legacy" => legacy_record(&manifest, &fixture.destination, &root).0,
-                _ => format!("{manifest}.replace.{}", hash_stdin(&fixture.destination)),
-            }
+        let mut fixture = record_fixture(root);
+        let expected = if case == "legacy" {
+            fixture.legacy.clone()
         } else {
-            root.join(rename).to_string_lossy().into_owned()
+            fixture.expected.clone()
         };
-        let expected = match body {
-            "legacy" => fixture.legacy_expected.clone(),
-            "garbage-expected" => "zzz".to_string(),
-            _ => fixture.content_expected.clone(),
+        let record_name = if case == "legacy" {
+            let alternate = repos_overlays::replacement_hash_object_format(
+                "sha256",
+                &fixture.destination,
+                root,
+            )
+            .unwrap();
+            format!("{manifest}.replace.{alternate}")
+        } else if case == "wrong-name" {
+            root.join("renamed").to_string_lossy().into_owned()
+        } else {
+            format!("{manifest}.replace.{}", hash(&fixture.destination))
         };
-        let mut line = record_line(&fixture, target, &expected);
-        match body {
-            "two-line" => {
-                line.extend_from_slice(b"second\tline\there\n");
-            }
-            "relative-dest" => {
-                line = record_line(
-                    &RecordFixture {
-                        destination: "relative/app.conf".to_string(),
-                        ..fixture
-                    },
-                    target,
-                    &expected,
-                );
-            }
-            "transaction-mismatch" => {
-                line = format!(
-                    "{}\t{}\t{target}\t{expected}\t{}\t{}\n",
-                    fixture.destination,
-                    fixture.physical.to_string_lossy(),
-                    root.join("elsewhere").to_string_lossy(),
-                    fixture.parent_identity,
-                )
-                .into_bytes();
-            }
-            "extra-field" => {
-                line.pop();
-                line.extend_from_slice(b"\textra\n");
-            }
-            _ => {}
+        if case == "relative-dest" {
+            fixture.destination = "relative/app.conf".into();
         }
-        let record = PathBuf::from(&record_name);
-        if let Some(parent) = record.parent() {
-            std::fs::create_dir_all(parent).expect("record parent");
+        if case == "transaction-mismatch" {
+            fixture.transaction = root.join("elsewhere");
         }
-        std::fs::write(&record, &line).expect("record");
-        chmod(&record, if name == "open-record" { 0o644 } else { 0o600 });
-        let snippet = format!(
-            "DOT_OVERLAY_MANIFEST={} _overlay_replacement_read {}; code=$?; printf 'rc=%s\\n' \"$code\"; if [[ $code -eq 0 ]]; then printf 'destination=%s\\nphysical=%s\\ntarget=%s\\nexpected=%s\\nkind=%s\\ntransaction=%s\\nparent=%s\\n' \"$OVERLAY_REPLACE_DESTINATION\" \"$OVERLAY_REPLACE_PHYSICAL\" \"$OVERLAY_REPLACE_TARGET\" \"$OVERLAY_REPLACE_EXPECTED\" \"$OVERLAY_REPLACE_IDENTITY_KIND\" \"$OVERLAY_REPLACE_TRANSACTION\" \"$OVERLAY_REPLACE_PARENT_IDENTITY\"; fi\n",
-            sq(&manifest),
-            sq(&record_name),
+        let mut body = line(
+            &fixture,
+            if case == "garbage-expected" {
+                "zzz"
+            } else {
+                &expected
+            },
         );
-        let (code, out, serr) = shell_run(&root, &[], &snippet);
-        assert_eq!(code, 0, "harness exit for {name:?}");
-        assert!(serr.is_empty(), "read stderr for {name:?}: {serr:?}");
-        let shell = String::from_utf8(out).expect("read dump");
-        let rust = dump_read(repos_overlays::replacement_read(
-            &record, &manifest, euid, &root, &root,
-        ));
-        assert_eq!(rust, shell, "replacement read for {name:?}");
+        if case == "two-line" {
+            body.extend_from_slice(b"second\tline\there\n");
+        }
+        if case == "extra-field" {
+            body.pop();
+            body.extend_from_slice(b"\textra\n");
+        }
+        let record = PathBuf::from(record_name);
+        std::fs::write(&record, body).unwrap();
+        std::fs::set_permissions(
+            &record,
+            std::fs::Permissions::from_mode(if case == "open-record" { 0o644 } else { 0o600 }),
+        )
+        .unwrap();
+        let read = repos_overlays::replacement_read(
+            &record,
+            &manifest,
+            dot::temp::current_uid().unwrap(),
+            root,
+            root,
+        );
+        let accepted = matches!(case, "content" | "legacy");
+        assert_eq!(read.is_some(), accepted, "{case}");
+        if let Some(record) = read {
+            assert_eq!(record.destination, fixture.destination);
+            assert_eq!(record.physical, fixture.physical.to_string_lossy());
+            assert_eq!(record.target, ".dotfiles-web/home/app.conf");
+            assert_eq!(record.expected, expected);
+            assert_eq!(
+                record.identity_kind,
+                if case == "legacy" {
+                    ReplaceIdentityKind::Legacy
+                } else {
+                    ReplaceIdentityKind::Content
+                }
+            );
+            assert_eq!(record.transaction, fixture.transaction.to_string_lossy());
+            assert_eq!(record.parent_identity, fixture.parent_identity);
+        }
     }
 }
 
 #[test]
-fn replacement_cleanup_agrees() {
-    let dir = TempDir::new("ovrepl-cleanup").expect("fixture dir");
-    let home = dir.path();
-    // (name, stage next, stage previous, next target): `next` is a
-    // symlink except in the file case; `previous` is a file.
-    for (name, next, previous, next_target) in [
-        ("empty", false, false, "wanted"),
-        ("next-match", true, false, "wanted"),
-        ("next-mismatch", true, false, "other"),
-        ("previous-present", false, true, "wanted"),
-        ("next-file", false, false, "wanted"),
+fn replacement_cleanup_removes_only_the_expected_next_link_and_empty_transaction() {
+    for (case, next, previous, target, expected) in [
+        ("empty", None, false, "wanted", true),
+        ("next-match", Some("wanted"), false, "wanted", true),
+        ("next-mismatch", Some("other"), false, "wanted", false),
+        ("previous-present", None, true, "wanted", false),
+        ("next-file", Some("FILE"), false, "wanted", false),
     ] {
-        let root = home.join(name);
-        std::fs::create_dir_all(&root).expect("case dir");
+        let scope = TempDir::new("replacement-cleanup").unwrap();
+        let root = scope.path();
         let transaction = root.join("txn");
-        std::fs::create_dir_all(&transaction).expect("txn dir");
-        if next {
-            std::os::unix::fs::symlink(next_target, transaction.join("next")).expect("next");
-        }
-        if name == "next-file" {
-            stage(&transaction, "next", b"x\n");
-        }
-        if previous {
-            stage(&transaction, "previous", b"x\n");
-        }
-        let record = stage(&root, "record", b"line\n");
-        let snippet = format!(
-            "_overlay_replacement_cleanup {} {} wanted; code=$?; printf 'rc=%s\\n' \"$code\"; printf 'record='; cat {} 2>/dev/null || true; printf 'txn='; ls -A {} 2>/dev/null || echo MISSING\n",
-            sq(&record.to_string_lossy()),
-            sq(&transaction.to_string_lossy()),
-            sq(&record.to_string_lossy()),
-            sq(&transaction.to_string_lossy()),
-        );
-        let (code, out, serr) = shell_run(&root, &[], &snippet);
-        assert_eq!(code, 0, "harness exit for {name:?}");
-        assert!(serr.is_empty(), "cleanup stderr for {name:?}: {serr:?}");
-        let shell = String::from_utf8(out).expect("cleanup dump");
-        std::fs::write(home.join(format!("{name}.shell.out")), shell).expect("stash");
-        // The Rust twin runs on a mirrored layout (same names, fresh
-        // root) so mutations never collide with the shell side.
-        // (Shell and Rust roots differ, but cleanup dumps carry no
-        // paths, so no scrubbing is needed.)
-        let rust_root = home.join(format!("{name}-rust"));
-        std::fs::create_dir_all(&rust_root).expect("rust dir");
-        let rust_transaction = rust_root.join("txn");
-        std::fs::create_dir_all(&rust_transaction).expect("rust txn");
-        if next {
-            std::os::unix::fs::symlink(next_target, rust_transaction.join("next")).expect("next");
-        }
-        if name == "next-file" {
-            stage(&rust_transaction, "next", b"x\n");
-        }
-        if previous {
-            stage(&rust_transaction, "previous", b"x\n");
-        }
-        let rust_record = stage(&rust_root, "record", b"line\n");
-        let ok = repos_overlays::replacement_cleanup(&rust_record, &rust_transaction, "wanted");
-        let mut rust = format!("rc={}\n", if ok { 0 } else { 1 });
-        rust.push_str("record=");
-        rust.push_str(&std::fs::read_to_string(&rust_record).unwrap_or_default());
-        // `ls -A` lists byte-sorted; mirror it for the twin.
-        rust.push_str("txn=");
-        if rust_transaction.symlink_metadata().is_err() {
-            rust.push_str("MISSING\n");
-        } else {
-            let mut entries: Vec<String> = std::fs::read_dir(&rust_transaction)
-                .expect("scan txn")
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect();
-            entries.sort();
-            for entry in entries {
-                rust.push_str(&entry);
-                rust.push('\n');
+        std::fs::create_dir(&transaction).unwrap();
+        if let Some(next) = next {
+            if next == "FILE" {
+                stage(&transaction, "next", b"x", 0o600);
+            } else {
+                std::os::unix::fs::symlink(next, transaction.join("next")).unwrap();
             }
         }
-        let shell = std::fs::read_to_string(home.join(format!("{name}.shell.out"))).expect("stash");
-        assert_eq!(rust, shell, "replacement cleanup for {name:?}");
+        if previous {
+            stage(&transaction, "previous", b"x", 0o600);
+        }
+        let record = stage(root, "record", b"line\n", 0o600);
+        assert_eq!(
+            repos_overlays::replacement_cleanup(&record, &transaction, target),
+            expected,
+            "{case}"
+        );
+        assert_eq!(record.exists(), !expected, "record {case}");
+        assert_eq!(transaction.exists(), !expected, "transaction {case}");
+        if !expected {
+            assert_eq!(std::fs::read(&record).unwrap(), b"line\n");
+        }
     }
 }

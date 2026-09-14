@@ -77,9 +77,9 @@ positional arguments; use ordinary assignments or functions at top level, not
 The supported helper inventories are the normative signature/status/result
 reference:
 
-- [`hook-api-v1.tsv`](../lib/dot/hook-api-v1.tsv)
-- [`doctor-api-v1.tsv`](../lib/dot/doctor-api-v1.tsv)
-- [`test-api-v1.tsv`](../lib/dot/test-api-v1.tsv)
+- [`hook-api-v1.tsv`](../lib/dot/public/hook-api-v1.tsv)
+- [`doctor-api-v1.tsv`](../lib/dot/public/doctor-api-v1.tsv)
+- [`test-api-v1.tsv`](../lib/dot/public/test-api-v1.tsv)
 
 Arguments are positional and must match the inventory exactly; fixed-arity
 helpers return 2 for misuse. Values printed by a helper go to stdout. Allocation

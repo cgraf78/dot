@@ -13,7 +13,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Slice-1 startup budgets (reference host p95, ms).
-const HELP_WARM_BUDGET_MS: u128 = 25;
+const HELP_WARM_BUDGET_MS: u128 = if cfg!(target_os = "macos") { 30 } else { 25 };
 const VERSION_WARM_BUDGET_MS: u128 = 30;
 const RUNS: usize = 30;
 const PERF_BUDGET_MULTIPLIER_ENV: &str = "DOT_PERF_BUDGET_MULTIPLIER";

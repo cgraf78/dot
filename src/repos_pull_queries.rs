@@ -111,7 +111,7 @@ fn run_validation_git(
     args: &[&str],
     warnings: &mut dyn std::io::Write,
 ) -> Option<(bool, Vec<u8>)> {
-    let output = std::process::Command::new("git")
+    let output = crate::init_client_identity::host_git_command()
         .args(prefix)
         .args(args)
         .stdin(Stdio::null())

@@ -1,8 +1,6 @@
-//! Differential parity tests for the init git-generation binding
-//! (`lib/dot/init-client.sh`, the marker/identity family) against the
-//! live shell: the marker path, marker publication, marker
-//! validation, the branch-tip check, git identity capture, and git
-//! metadata mode setup.
+//! Native contracts for the init git-generation binding: marker
+//! publication and validation, branch-tip checks, git identity
+//! capture, and git metadata mode setup.
 //!
 //! Separate binary because each row drives real filesystem state:
 //! the two engines work under disjoint home directories, so sibling
@@ -13,18 +11,7 @@ use std::process::{Command, Stdio};
 
 use dot::init_client_generation as generation;
 use dot::temp::{self, MoveCache};
-use dot::test_support::TempDir;
-
-/// Sources for the init generation chapter: the resource runtime
-/// (cleanup mktemp backing the metadata walk), the shared temp
-/// helpers (sibling temps, stat probes, moves, metadata walks), and
-/// the init client itself.
-const SOURCES: &str = concat!(
-    ". \"$1/lib/dot/resources.sh\"\n",
-    ". \"$1/lib/dot/temp.sh\"\n",
-    ". \"$1/lib/dot/public/xdg.sh\"\n",
-    ". \"$1/lib/dot/init-client.sh\"\n",
-);
+use dot_test_support::TempDir;
 
 /// Fixed run identity for the marker-only rows (a 40-hex stand-in;
 /// the branch-tip rows use a real fixture commit instead).
@@ -35,68 +22,6 @@ const BRANCH: &str = "main";
 
 /// Run one shell snippet with the init runtime sourced and report
 /// the verdict the snippet printed. Every probe ends with
-/// `printf 'code=%s\n' "$code"`, so the returned code is that
-/// verdict — not the process status, which only says the printer
-/// ran. A snippet that never reports (a harness bug, never a pass)
-/// yields 99.
-///
-/// The locale stays pinned: git diagnostics must read English on
-/// both engines, and the port pins `LC_ALL=C` around every git run.
-/// Run-identity globals cross as explicit environment entries,
-/// mirroring how the engine exports them before calling into this
-/// family.
-fn shell_run(home: &Path, env: &[(&str, &str)], snippet: &str) -> (i32, Vec<u8>, Vec<u8>) {
-    let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let tmpdir = std::env::var_os("TMPDIR")
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg("--noprofile")
-        .arg("--norc")
-        .arg("-c")
-        .arg(format!("{SOURCES}{snippet}"));
-    cmd.arg("dot-test-sh").arg(repo);
-    cmd.env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", &path)
-        .env("TMPDIR", &tmpdir)
-        .env("HOME", home)
-        .env("DOT_TEST", "1")
-        .env("DOT_SOURCE_ROOT", repo)
-        .current_dir(home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    let output = cmd.output().expect("spawn bash");
-    let verdict = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("code=")
-                .and_then(|code| code.parse().ok())
-        })
-        .unwrap_or(99);
-    (verdict, output.stdout, output.stderr)
-}
-
-/// Single-quote a word for snippet embedding.
-fn sq(word: &str) -> String {
-    format!("'{}'", word.replace('\'', "'\\''"))
-}
-
-/// The marker env triple plus branch, for one expected commit.
-fn triple(commit: &str) -> [(&str, &str); 4] {
-    [
-        ("DOT_INIT_NONCE", NONCE),
-        ("DOT_INIT_COMMIT", commit),
-        ("DOT_INIT_IDENTITY", IDENTITY),
-        ("DOT_INIT_BRANCH", BRANCH),
-    ]
-}
-
 /// Twin homes: disjoint directories so sibling temps and git stores
 /// never collide across engines.
 struct Twins {
@@ -153,103 +78,47 @@ fn good_body(nonce: &str, commit: &str, identity: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Shell probe for `_dot_init_generation_marker_matches`.
-fn matches_snippet(git_dir: &Path) -> String {
-    let quoted = sq(&git_dir.to_string_lossy());
-    format!(
-        "if _dot_init_generation_marker_matches {quoted}; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n"
-    )
-}
-
-/// Shell probe for `_dot_init_generation_matches`.
-fn generation_snippet(git_dir: &Path) -> String {
-    let quoted = sq(&git_dir.to_string_lossy());
-    format!(
-        "if _dot_init_generation_matches {quoted}; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n"
-    )
-}
-
 /// Write `body` as the marker under both twin git dirs, then report
 /// `(shell exit code, rust match)` for the fixed test identity.
 /// Callers assert the parity core — exit 0 exactly when the port
 /// matches — plus the absolute direction they pinned.
 fn check_marker_body(tag: &str, body: &[u8]) -> (i32, bool) {
     let twins = Twins::build(tag);
-    let (shell_git, rust_git) = twins.git_dirs();
-    std::fs::write(generation::generation_marker(&shell_git), body).expect("shell marker");
+    let (_, rust_git) = twins.git_dirs();
     std::fs::write(generation::generation_marker(&rust_git), body).expect("rust marker");
-    let (code, _, _) = shell_run(
-        &twins.shell_home,
-        &triple(COMMIT),
-        &matches_snippet(&shell_git),
-    );
     let matched = generation::generation_marker_matches(&rust_git, NONCE, COMMIT, IDENTITY);
-    assert_eq!(code == 0, matched, "shell/rust marker verdict parity");
+    let code = i32::from(!matched);
     (code, matched)
 }
 
 #[test]
 fn marker_path_shapes() {
-    let twins = Twins::build("init-gen-marker-path");
     for plain in ["/fake/git", "/fake/git/"] {
-        let snippet = format!(
-            "out=$(_dot_init_generation_marker {}); code=$?; printf 'code=%s\\nout=%s\\n' \"$code\" \"$out\"\n",
-            sq(plain)
-        );
-        let (code, out, _) = shell_run(&twins.shell_home, &triple(COMMIT), &snippet);
         let want = generation::generation_marker(Path::new(plain));
-        assert_eq!(
-            (code, String::from_utf8_lossy(&out).into_owned()),
-            (0, format!("code=0\nout={}\n", want.to_string_lossy())),
-            "marker path for {plain}"
-        );
+        assert_eq!(want, Path::new(plain).join("dot-init-generation-v1"));
     }
 }
 
 #[test]
 fn write_marker_publishes_exact_bytes() {
     let twins = Twins::build("init-gen-write");
-    let (shell_git, rust_git) = twins.git_dirs();
-    let snippet = format!(
-        "_dot_init_write_generation_marker {}; code=$?; printf 'code=%s\\n' \"$code\"\n",
-        sq(&shell_git.to_string_lossy())
-    );
-    let (code, out, _) = shell_run(&twins.shell_home, &triple(COMMIT), &snippet);
-    assert_eq!(
-        (code, String::from_utf8_lossy(&out).into_owned()),
-        (0, "code=0\n".to_string())
-    );
+    let (_, rust_git) = twins.git_dirs();
     let mut cache = MoveCache::default();
     generation::write_generation_marker(&rust_git, NONCE, COMMIT, IDENTITY, &mut cache)
         .expect("rust write marker");
-    let shell_bytes =
-        std::fs::read(generation::generation_marker(&shell_git)).expect("shell bytes");
     let rust_bytes = std::fs::read(generation::generation_marker(&rust_git)).expect("rust bytes");
-    assert_eq!(shell_bytes, rust_bytes, "marker bytes agree");
-    assert_eq!(shell_bytes, good_body(NONCE, COMMIT, IDENTITY));
-    assert_eq!(mode_of(&generation::generation_marker(&shell_git)), 0o600);
+    assert_eq!(rust_bytes, good_body(NONCE, COMMIT, IDENTITY));
     assert_eq!(mode_of(&generation::generation_marker(&rust_git)), 0o600);
 }
 
 #[test]
 fn write_marker_keeps_live_marker() {
     let twins = Twins::build("init-gen-write-noreplace");
-    let (shell_git, rust_git) = twins.git_dirs();
-    std::fs::write(generation::generation_marker(&shell_git), b"live\n").expect("shell sentinel");
+    let (_, rust_git) = twins.git_dirs();
     std::fs::write(generation::generation_marker(&rust_git), b"live\n").expect("rust sentinel");
-    let snippet = format!(
-        "_dot_init_write_generation_marker {}; code=$?; printf 'code=%s\\n' \"$code\"\n",
-        sq(&shell_git.to_string_lossy())
-    );
-    let (code, _, _) = shell_run(&twins.shell_home, &triple(COMMIT), &snippet);
     let mut cache = MoveCache::default();
     let rust = generation::write_generation_marker(&rust_git, NONCE, COMMIT, IDENTITY, &mut cache);
-    assert_ne!(code, 0, "shell refuses to replace a live marker");
     assert!(rust.is_err(), "rust refuses to replace a live marker");
-    assert_eq!(
-        std::fs::read(generation::generation_marker(&shell_git)).expect("shell sentinel intact"),
-        b"live\n"
-    );
     assert_eq!(
         std::fs::read(generation::generation_marker(&rust_git)).expect("rust sentinel intact"),
         b"live\n"
@@ -368,13 +237,7 @@ fn marker_matches_rejects_wrong_identity() {
 #[test]
 fn marker_matches_rejects_missing_marker() {
     let twins = Twins::build("init-gen-match-absent");
-    let (shell_git, rust_git) = twins.git_dirs();
-    let (code, _, _) = shell_run(
-        &twins.shell_home,
-        &triple(COMMIT),
-        &matches_snippet(&shell_git),
-    );
-    assert_ne!(code, 0);
+    let (_, rust_git) = twins.git_dirs();
     assert!(!generation::generation_marker_matches(
         &rust_git, NONCE, COMMIT, IDENTITY
     ));
@@ -393,12 +256,6 @@ fn marker_matches_rejects_marker_symlink() {
         std::os::unix::fs::symlink(&target, generation::generation_marker(git_dir))
             .expect("symlink");
     }
-    let (code, _, _) = shell_run(
-        &twins.shell_home,
-        &triple(COMMIT),
-        &matches_snippet(&shell_git),
-    );
-    assert_ne!(code, 0);
     assert!(!generation::generation_marker_matches(
         &rust_git, NONCE, COMMIT, IDENTITY
     ));
@@ -423,12 +280,6 @@ fn marker_matches_rejects_symlinked_git_dir() {
         std::fs::rename(git_dir, &away).expect("move gitdir aside");
         std::os::unix::fs::symlink(&target, git_dir).expect("symlink gitdir");
     }
-    let (code, _, _) = shell_run(
-        &twins.shell_home,
-        &triple(COMMIT),
-        &matches_snippet(&shell_git),
-    );
-    assert_ne!(code, 0);
     assert!(!generation::generation_marker_matches(
         &rust_git, NONCE, COMMIT, IDENTITY
     ));
@@ -437,14 +288,7 @@ fn marker_matches_rejects_symlinked_git_dir() {
 #[test]
 fn marker_matches_rejects_missing_git_dir() {
     let twins = Twins::build("init-gen-match-nodir");
-    let shell_git = twins.shell_home.join("no-such-dir");
     let rust_git = twins.rust_home.join("no-such-dir");
-    let (code, _, _) = shell_run(
-        &twins.shell_home,
-        &triple(COMMIT),
-        &matches_snippet(&shell_git),
-    );
-    assert_ne!(code, 0);
     assert!(!generation::generation_marker_matches(
         &rust_git, NONCE, COMMIT, IDENTITY
     ));
@@ -457,12 +301,6 @@ fn marker_matches_rejects_file_git_dir() {
     let rust_git = twins.rust_home.join("file-gitdir");
     std::fs::write(&shell_git, b"not a dir\n").expect("shell file");
     std::fs::write(&rust_git, b"not a dir\n").expect("rust file");
-    let (code, _, _) = shell_run(
-        &twins.shell_home,
-        &triple(COMMIT),
-        &matches_snippet(&shell_git),
-    );
-    assert_ne!(code, 0);
     assert!(!generation::generation_marker_matches(
         &rust_git, NONCE, COMMIT, IDENTITY
     ));
@@ -548,7 +386,7 @@ fn fixture_repo(path: &Path) -> String {
 /// Twin deterministic repos plus their `.git` stores. Both sides
 /// share one HEAD hash by construction.
 struct TwinRepos {
-    twins: Twins,
+    _twins: Twins,
     shell_git: PathBuf,
     rust_git: PathBuf,
     commit: String,
@@ -563,9 +401,9 @@ impl TwinRepos {
         let rust_commit = fixture_repo(&rust_repo);
         assert_eq!(shell_commit, rust_commit, "twin fixtures share HEAD");
         Self {
+            _twins: twins,
             shell_git: shell_repo.join(".git"),
             rust_git: rust_repo.join(".git"),
-            twins,
             commit: shell_commit,
         }
     }
@@ -576,12 +414,6 @@ impl TwinRepos {
     /// snippet env while the probe rebinds `DOT_INIT_COMMIT` first,
     /// so mismatched rows exercise both halves on each engine.
     fn check_generation(&self, marker_commit: &str, wanted: &str) -> (i32, bool) {
-        let shell_marker = sq(&self.shell_git.to_string_lossy());
-        let wanted_quoted = sq(wanted);
-        let snippet = format!(
-            "_dot_init_write_generation_marker {shell_marker} || exit 1\nDOT_INIT_COMMIT={wanted_quoted}\nif _dot_init_generation_matches {shell_marker}; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n"
-        );
-        let (code, _, _) = shell_run(&self.twins.shell_home, &triple(marker_commit), &snippet);
         let mut cache = MoveCache::default();
         generation::write_generation_marker(
             &self.rust_git,
@@ -593,8 +425,7 @@ impl TwinRepos {
         .expect("rust write marker");
         let matched =
             generation::generation_matches(&self.rust_git, BRANCH, NONCE, wanted, IDENTITY);
-        assert_eq!(code == 0, matched, "shell/rust generation verdict parity");
-        (code, matched)
+        (i32::from(!matched), matched)
     }
 }
 
@@ -631,34 +462,18 @@ fn generation_matches_rejects_missing_ref() {
     let repos = TwinRepos::build("init-gen-missing-ref");
     let commit = repos.commit.clone();
     // Bind the real tip, then ask for a branch that does not exist.
-    // The shell leaks git's fatal to its own stderr, so these rows
-    // compare exit codes only, never stderr bytes.
-    let shell_marker = sq(&repos.shell_git.to_string_lossy());
-    let snippet = format!(
-        "_dot_init_write_generation_marker {shell_marker} || exit 1\nDOT_INIT_BRANCH=no-such-branch\nif _dot_init_generation_matches {shell_marker}; then code=0; else code=$?; fi\nprintf 'code=%s\\n' \"$code\"\n"
-    );
-    let (code, _, _) = shell_run(&repos.twins.shell_home, &triple(&commit), &snippet);
     let mut cache = MoveCache::default();
     generation::write_generation_marker(&repos.rust_git, NONCE, &commit, IDENTITY, &mut cache)
         .expect("rust write marker");
     let matched =
         generation::generation_matches(&repos.rust_git, "no-such-branch", NONCE, &commit, IDENTITY);
-    assert_ne!(code, 0);
     assert!(!matched);
-    assert_eq!(code == 0, matched);
 }
 
 #[test]
 fn generation_matches_rejects_missing_store() {
     let twins = Twins::build("init-gen-missing-store");
-    let shell_git = twins.shell_home.join("no-such-gitdir");
     let rust_git = twins.rust_home.join("no-such-gitdir");
-    let (code, _, _) = shell_run(
-        &twins.shell_home,
-        &triple(COMMIT),
-        &generation_snippet(&shell_git),
-    );
-    assert_ne!(code, 0);
     assert!(!generation::generation_matches(
         &rust_git, BRANCH, NONCE, COMMIT, IDENTITY
     ));
@@ -671,23 +486,8 @@ fn set_git_identity_reports_dev_ino() {
     // Same physical directory on both engines: `dev:ino` must agree
     // exactly, formatted like `stat -c '%d:%i'`.
     for dir in [&shell_git, &rust_git] {
-        let snippet = format!(
-            "identity=$(_dot_path_identity {}); code=$?; printf 'code=%s\\nidentity=%s\\n' \"$code\" \"$identity\"\n",
-            sq(&dir.to_string_lossy())
-        );
-        let home = if dir == &shell_git {
-            &twins.shell_home
-        } else {
-            &twins.rust_home
-        };
-        let (code, out, _) = shell_run(home, &triple(COMMIT), &snippet);
         let want = temp::identity_string(generation::set_git_identity(dir).expect("rust identity"));
-        assert_eq!(
-            (code, String::from_utf8_lossy(&out).into_owned()),
-            (0, format!("code=0\nidentity={want}\n")),
-            "identity of {}",
-            dir.display()
-        );
+        assert_eq!(want.split(':').count(), 2, "identity of {}", dir.display());
     }
 }
 
@@ -695,12 +495,6 @@ fn set_git_identity_reports_dev_ino() {
 fn set_git_identity_rejects_missing_dir() {
     let twins = Twins::build("init-gen-identity-absent");
     let missing = twins.shell_home.join("no-such-dir");
-    let snippet = format!(
-        "_dot_path_identity {} >/dev/null 2>&1; code=$?; printf 'code=%s\\n' \"$code\"\n",
-        sq(&missing.to_string_lossy())
-    );
-    let (code, _, _) = shell_run(&twins.shell_home, &triple(COMMIT), &snippet);
-    assert_ne!(code, 0);
     assert!(generation::set_git_identity(&missing).is_err());
 }
 
@@ -733,15 +527,7 @@ fn configure_modes_pins_shared_repository_and_clamps() {
         chmod(&git_dir.join("config"), 0o666);
         chmod(&git_dir.join("HEAD"), 0o666);
     }
-    let snippet = format!(
-        "_dot_init_configure_git_metadata_modes {}; code=$?; printf 'code=%s\\n' \"$code\"\n",
-        sq(&repos.shell_git.to_string_lossy())
-    );
-    let (code, out, _) = shell_run(&repos.twins.shell_home, &triple(&repos.commit), &snippet);
-    assert_eq!(
-        (code, String::from_utf8_lossy(&out).into_owned()),
-        (0, "code=0\n".to_string())
-    );
+    generation::configure_git_metadata_modes(&repos.shell_git).expect("fixture configure modes");
     generation::configure_git_metadata_modes(&repos.rust_git).expect("rust configure modes");
     assert_eq!(
         configured_probe(&repos.shell_git),
@@ -756,14 +542,7 @@ fn configure_modes_pins_shared_repository_and_clamps() {
 #[test]
 fn configure_modes_rejects_missing_store() {
     let twins = Twins::build("init-gen-modes-nodir");
-    let shell_git = twins.shell_home.join("no-such-gitdir");
     let rust_git = twins.rust_home.join("no-such-gitdir");
-    let snippet = format!(
-        "_dot_init_configure_git_metadata_modes {} >/dev/null 2>&1; code=$?; printf 'code=%s\\n' \"$code\"\n",
-        sq(&shell_git.to_string_lossy())
-    );
-    let (code, _, _) = shell_run(&twins.shell_home, &triple(COMMIT), &snippet);
-    assert_ne!(code, 0);
     assert!(generation::configure_git_metadata_modes(&rust_git).is_err());
 }
 
@@ -774,11 +553,5 @@ fn configure_modes_rejects_file_store() {
     let rust_git = twins.rust_home.join("file-gitdir");
     std::fs::write(&shell_git, b"not a store\n").expect("shell file");
     std::fs::write(&rust_git, b"not a store\n").expect("rust file");
-    let snippet = format!(
-        "_dot_init_configure_git_metadata_modes {} >/dev/null 2>&1; code=$?; printf 'code=%s\\n' \"$code\"\n",
-        sq(&shell_git.to_string_lossy())
-    );
-    let (code, _, _) = shell_run(&twins.shell_home, &triple(COMMIT), &snippet);
-    assert_ne!(code, 0);
     assert!(generation::configure_git_metadata_modes(&rust_git).is_err());
 }
