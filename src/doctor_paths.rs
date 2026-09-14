@@ -1,6 +1,6 @@
-//! Doctor path resolution and display (slice 42: doctor layer, part 2).
+//! Doctor path resolution and display.
 //!
-//! Ports the second doctor family exactly: the four path helpers from
+//! Owns the four path helpers formerly defined in
 //! `lib/dot/doctor/paths.sh` — `_dr_physical_path`,
 //! `_dr_symlink_target_path`, `_dr_symlink_points_to`, `_dr_tilde` —
 //! plus the public display twin `dot_doctor_display_path` from

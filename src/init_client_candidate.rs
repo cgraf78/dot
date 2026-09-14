@@ -1,25 +1,16 @@
 //! Candidate enumeration, live snapshots, and conflict planning for
 //! `lib/dot/init-client.sh`.
 //!
-//! The shell file holds 79 functions — too big for one lane — so this
-//! module owns only the seven planning primitives from
+//! This module owns the planning primitives from
 //! `_dot_init_symlink_blob_safe` through
 //! `_dot_init_build_prior_and_conflicts`: the symlink-blob byte gate,
 //! the candidate-tree writer, the per-path candidate matcher, the
 //! live-filesystem snapshot probe and its recheck, the conflict-root
-//! walk, and the prior/conflicts publisher. The file-generic
-//! `_dot_init_error` diagnostic stays unported (a bare
-//! `printf ... >&2; return 1` with no family state, absorbed into
-//! [`Result`] the way earlier slices absorb engine diagnostics). The
-//! transaction-directory lifecycle lives on `rust-port-slice-35`
-//! (`init_client_transaction`), the host-git identity family on
-//! `rust-port-slice-41` (`init_client_identity`), the git-generation
-//! binding on `rust-port-slice-43` (`init_client_generation`), the
-//! per-entry staging family on `rust-port-slice-46`
-//! (`init_client_entry`), and the record, git-staging, publish,
-//! delete, and rollback families stay for later slices.
+//! walk, and the prior/conflicts publisher. Transaction, identity,
+//! generation, entry staging, record, git-staging, publish,
+//! delete, and rollback families live in adjacent native modules.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the client root from `HOME`, the
@@ -41,7 +32,7 @@
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::errors::{Error, Result};
 use crate::repos_overlays::init_safe_relative_path;
@@ -151,16 +142,24 @@ fn home_join(home: &str, relative: &str) -> PathBuf {
 /// silenced (the `candidate_matches` precedent; the tree scan's
 /// unredirected fd 2 is an unobservable sink in tests).
 fn run_repo_git(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new("git")
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("-C")
         .arg(repo)
         .args(args)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -172,22 +171,23 @@ fn run_repo_git(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
 /// link targets (which live only in memory here) hash with the exact
 /// flags the shell's combined call uses. `None` when git fails.
 fn hash_stdin_bytes(payload: &[u8]) -> Option<String> {
-    use std::io::Write as _;
-    let mut child = Command::new("git")
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .args(["hash-object", "--no-filters", "--stdin"])
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    child
-        .stdin
-        .as_mut()?
-        .write_all(payload)
-        .map_err(|_| ())
-        .ok()?;
-    let output = child.wait_with_output().ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output_with_input(
+        command,
+        payload,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -199,15 +199,23 @@ fn hash_stdin_bytes(payload: &[u8]) -> Option<String> {
 /// shell), so non-UTF8 names hash exactly like the shell's.
 /// `None` when git fails.
 fn hash_live_file(path: &Path) -> Option<String> {
-    let output = Command::new("git")
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .args(["hash-object", "--no-filters", "--"])
         .arg(path.as_os_str())
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -288,6 +296,7 @@ pub fn candidate_tree(
 ) -> Result<()> {
     use std::io::Write as _;
     // Truncate first, like the shell's opening `: >"$output"`.
+    crate::cancellation::check_mutation()?;
     std::fs::write(output, b"").map_err(|source| Error::Io {
         context: "truncate candidate tree",
         source,
@@ -295,7 +304,9 @@ pub fn candidate_tree(
     let fail = |message: &'static str| -> Result<()> {
         // Mirror the trailing truncation: no partial inventory
         // survives a rejection.
-        let _ = std::fs::write(output, b"");
+        if crate::cancellation::check().is_ok() {
+            let _ = std::fs::write(output, b"");
+        }
         Err(Error::Usage { message })
     };
     let raw = match run_repo_git(repo, &["ls-tree", "-rz", "--full-tree", branch]) {
@@ -371,6 +382,7 @@ pub fn candidate_tree(
         context: "rewrite candidate tree",
         source,
     })?;
+    crate::cancellation::check_mutation()?;
     file.write_all(&out).map_err(|source| Error::Io {
         context: "write candidate tree",
         source,
@@ -666,10 +678,12 @@ pub fn build_prior_and_conflicts(
     use std::io::Write as _;
     // Truncate first: the shell's opening `: >` pair runs before the
     // tree is even opened, so a missing tree still empties both.
+    crate::cancellation::check_mutation()?;
     std::fs::write(prior, b"").map_err(|source| Error::Io {
         context: "truncate prior journal",
         source,
     })?;
+    crate::cancellation::check_mutation()?;
     std::fs::write(conflicts, b"").map_err(|source| Error::Io {
         context: "truncate conflicts journal",
         source,
@@ -710,6 +724,7 @@ pub fn build_prior_and_conflicts(
         );
         let live = home_join(&scope.home, path);
         let state = snapshot_path(&live)?;
+        crate::cancellation::check_mutation()?;
         writeln!(prior_file, "{path}\t{state}").map_err(|source| Error::Io {
             context: "append prior journal",
             source,
@@ -737,6 +752,7 @@ pub fn build_prior_and_conflicts(
                 message: "conflict root is absent",
             });
         }
+        crate::cancellation::check_mutation()?;
         writeln!(conflicts_file, "{root}\t{root_state}").map_err(|source| Error::Io {
             context: "append conflicts journal",
             source,

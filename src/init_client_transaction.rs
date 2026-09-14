@@ -4,16 +4,11 @@
 //! with an ownership marker, the ownership gate, orphan recovery,
 //! and publication.
 //!
-//! The shell file holds 79 functions — too big for one lane — so
-//! this module owns only the directory lifecycle: the eight
-//! functions from `_dot_init_state_root` through
-//! `_dot_init_publish_transaction`, minus the file-generic
-//! `_dot_init_error` diagnostic (a bare `printf ... >&2; return 1`
-//! with no family state; the port absorbs it into [`Result`], the
-//! way earlier slices absorb engine diagnostics). Record, claim,
-//! generation, and rollback families stay for later slices.
+//! This module owns the directory lifecycle from state-root resolution through
+//! transaction publication. Record, claim,
+//! generation, and rollback families live in their adjacent native modules.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 
 use std::os::unix::ffi::OsStrExt as _;
@@ -62,6 +57,9 @@ pub fn completed_file(home: &str, xdg_state_home: &str) -> std::result::Result<S
 /// rejected.
 pub fn private_directory(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
     if std::fs::create_dir_all(path).is_err() {
         return false;
     }
@@ -107,6 +105,7 @@ pub fn prepare_transaction(transaction: &Path) -> Result<PathBuf> {
         });
     }
     for _ in 0..temp::TMP_RETRIES {
+        crate::cancellation::check_mutation()?;
         // The shell template is `"${transaction}.prepare.XXXXXX"`;
         // the six random characters come from the shared mktemp
         // alphabet so both engines draw the same name shape.
@@ -127,6 +126,7 @@ pub fn prepare_transaction(transaction: &Path) -> Result<PathBuf> {
                     });
                 }
                 let marker = stage.join(PREPARATION_MARKER_NAME);
+                crate::cancellation::check_mutation()?;
                 if std::fs::write(&marker, PREPARATION_MARKER).is_err()
                     || std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600))
                         .is_err()

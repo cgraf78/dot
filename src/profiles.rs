@@ -1,7 +1,6 @@
-//! Profile definitions and user/host selector resolution (slice 8).
+//! Profile definitions and user/host selector resolution.
 //!
-//! Ports `lib/dot/profile-format.sh` and the loading/selection half
-//! of `lib/dot/profiles.sh`: definition parsing, include expansion
+//! Owns definition parsing, include expansion,
 //! with cycle detection, selector parsing and matching, and default
 //! resolution. The profile lifecycle ledger
 //! (`profile-lifecycle.sh`) lives in [`crate::profile_lifecycle`].
@@ -1087,11 +1086,15 @@ pub fn user_valid(user: &[u8]) -> bool {
 
 /// Current login name (`id -un`), like `_dot_profile_resolve`.
 pub fn current_user() -> Option<String> {
-    let output = std::process::Command::new("id")
-        .arg("-un")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("id");
+    command.arg("-un").stdin(std::process::Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }

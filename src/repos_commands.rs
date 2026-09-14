@@ -113,6 +113,9 @@ pub fn push_one(
     argv.push("push");
     argv.extend(extra.iter().copied());
     let rc = repo_git(base, kind, path, &argv);
+    if crate::cleanup::received_signal().is_some() {
+        return rc;
+    }
     if rc == 0 {
         return 0;
     }

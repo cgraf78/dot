@@ -1,13 +1,12 @@
-//! Shdeps update group labels, summary text, and group record (slice 44).
+//! Shdeps update group labels, summary text, and group records.
 //!
-//! Ports the first coherent family from
-//! `lib/dot/providers/shdeps-ui.sh`: the group display vocabulary
+//! Owns the group display vocabulary
 //! (`_shdeps_group_label`, `_shdeps_summary_text`) and the in-memory
 //! group record the event adapter accumulates
 //! (`_shdeps_remember_group`, `_shdeps_record_item`,
 //! `_shdeps_record_group_summary`, `_shdeps_display_label`).
 //!
-//! Later lanes own the remainder of that file: the prompt
+//! [`crate::shdeps_ui_render`] owns prompt
 //! pause/resume pair and the UI reset (`_shdeps_prompt_pause`,
 //! `_shdeps_prompt_resume`, `_shdeps_ui_reset`), the verbose and
 //! summary renderers (`_shdeps_print_verbose_group_rows`,
@@ -17,10 +16,8 @@
 //! (`_shdeps_parse_event`, `_handle_shdeps_event`), the child
 //! liveness probes (`_shdeps_proc_state`, `_shdeps_update_finished`),
 //! and the FIFO update orchestration (`_run_shdeps_update_ui`,
-//! `_run_shdeps_update_command`). A different lane family
-//! (`src/shdeps.rs` on the unmerged `rust-port-slice-37`/`40`
-//! lanes) owns the sibling `lib/dot/providers/shdeps.sh`
-//! provider; nothing here duplicates it.
+//! `_run_shdeps_update_command`). [`crate::shdeps`] owns provider policy;
+//! nothing here duplicates it.
 //!
 //! Engine boundaries: text flows as bytes, like the sibling
 //! [`crate::progress_ui`] helpers, so group keys outside the known
@@ -34,6 +31,20 @@
 //! [`crate::progress_ui::join_comma`] rather than re-typed here.
 
 use std::collections::{HashMap, HashSet};
+
+const RETAINED_STATE_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// A provider attempted to retain more UI state than one update run permits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateLimit;
+
+impl std::fmt::Display for StateLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Shdeps provider state exceeded its safety limit")
+    }
+}
+
+impl std::error::Error for StateLimit {}
 
 /// `_shdeps_group_label`: the display name for a shdeps dependency
 /// group. Known groups map to their fixed titles (`github-releases`
@@ -108,7 +119,7 @@ pub fn summary_text(
 /// Bundled so the record stays single-sourced while the later
 /// render and event lanes are still shell: those lanes read the
 /// same associative state through the accessors below.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     /// `DOT_UI_SHDEPS_GROUP_ORDER`, in first-seen order.
     order: Vec<Vec<u8>>,
@@ -122,6 +133,25 @@ pub struct State {
     /// `DOT_UI_SHDEPS_GROUP_SUMMARIES` one tab-separated record per
     /// group, `${status}\t${detail}\t${elapsed_ms}`.
     summaries: HashMap<Vec<u8>, Vec<u8>>,
+    /// Total retained payload bytes across the vectors and map entries above.
+    /// Container allocator overhead is bounded separately by the event limit
+    /// at the provider boundary.
+    retained_bytes: usize,
+    retained_limit: usize,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            order: Vec::new(),
+            seen: HashSet::new(),
+            labels: HashMap::new(),
+            items: HashMap::new(),
+            summaries: HashMap::new(),
+            retained_bytes: 0,
+            retained_limit: RETAINED_STATE_LIMIT_BYTES,
+        }
+    }
 }
 
 impl State {
@@ -141,13 +171,17 @@ impl State {
     /// this returns without touching the order either. The stderr
     /// diagnostic and nonzero status are caller UI; the stored state
     /// is the contract.
-    pub fn remember_group(&mut self, group: &[u8]) {
+    pub fn remember_group(&mut self, group: &[u8]) -> Result<(), StateLimit> {
         if group.is_empty() {
-            return;
+            return Ok(());
         }
-        if self.seen.insert(group.to_vec()) {
-            self.order.push(group.to_vec());
+        if self.seen.contains(group) {
+            return Ok(());
         }
+        self.retain(group.len().checked_mul(2).ok_or(StateLimit)?)?;
+        self.seen.insert(group.to_vec());
+        self.order.push(group.to_vec());
+        Ok(())
     }
 
     /// Discovery order of the groups recorded so far, like
@@ -165,11 +199,29 @@ impl State {
     /// nothing: the shell's failed remember unwinds the whole call
     /// before the append, so this returns early like
     /// [`State::remember_group`].
-    pub fn record_item(&mut self, group: &[u8], status: &[u8], name: &[u8], detail: &[u8]) {
+    pub fn record_item(
+        &mut self,
+        group: &[u8],
+        status: &[u8],
+        name: &[u8],
+        detail: &[u8],
+    ) -> Result<(), StateLimit> {
         if group.is_empty() {
-            return;
+            return Ok(());
         }
-        self.remember_group(group);
+        self.remember_group(group)?;
+        let row_bytes = status
+            .len()
+            .checked_add(name.len())
+            .and_then(|bytes| bytes.checked_add(detail.len()))
+            .and_then(|bytes| bytes.checked_add(3))
+            .ok_or(StateLimit)?;
+        let key_bytes = if self.items.contains_key(group) {
+            0
+        } else {
+            group.len()
+        };
+        self.retain(key_bytes.checked_add(row_bytes).ok_or(StateLimit)?)?;
         let blob = self.items.entry(group.to_vec()).or_default();
         blob.extend_from_slice(status);
         blob.push(b'\t');
@@ -177,6 +229,7 @@ impl State {
         blob.push(b'\t');
         blob.extend_from_slice(detail);
         blob.push(b'\n');
+        Ok(())
     }
 
     /// Raw item blob for `group`, or `None` before its first item,
@@ -208,18 +261,17 @@ impl State {
         failed: i64,
         elapsed_ms: &[u8],
         warnings: i64,
-    ) {
+    ) -> Result<(), StateLimit> {
         if group.is_empty() {
-            return;
+            return Ok(());
         }
-        self.remember_group(group);
+        self.remember_group(group)?;
         let resolved = if label.is_empty() {
             group_label(group)
         } else {
             label.to_vec()
         };
-        self.labels.insert(group.to_vec(), resolved.clone());
-        let mut detail = resolved;
+        let mut detail = resolved.clone();
         detail.extend_from_slice(b": ");
         detail.extend_from_slice(&summary_text(changed, current, skipped, failed, warnings));
         let mut record = status.to_vec();
@@ -231,7 +283,37 @@ impl State {
         } else {
             record.extend_from_slice(elapsed_ms);
         }
+
+        let old_label = self.labels.get(group).map_or(0, Vec::len);
+        let old_summary = self.summaries.get(group).map_or(0, Vec::len);
+        let label_key = if self.labels.contains_key(group) {
+            0
+        } else {
+            group.len()
+        };
+        let summary_key = if self.summaries.contains_key(group) {
+            0
+        } else {
+            group.len()
+        };
+        let new_keys = label_key.checked_add(summary_key).ok_or(StateLimit)?;
+        let replaced = self
+            .retained_bytes
+            .checked_sub(old_label)
+            .and_then(|bytes| bytes.checked_sub(old_summary))
+            .ok_or(StateLimit)?;
+        let retained_bytes = replaced
+            .checked_add(new_keys)
+            .and_then(|bytes| bytes.checked_add(resolved.len()))
+            .and_then(|bytes| bytes.checked_add(record.len()))
+            .ok_or(StateLimit)?;
+        if retained_bytes > self.retained_limit {
+            return Err(StateLimit);
+        }
+        self.retained_bytes = retained_bytes;
+        self.labels.insert(group.to_vec(), resolved);
         self.summaries.insert(group.to_vec(), record);
+        Ok(())
     }
 
     /// Raw summary record for `group`, or `None` before its first
@@ -255,5 +337,67 @@ impl State {
             Some(label) if !label.is_empty() => label.clone(),
             _ => group_label(group),
         }
+    }
+
+    /// Borrow the recorded item map for the native provider renderer.
+    pub(crate) fn items(&self) -> &HashMap<Vec<u8>, Vec<u8>> {
+        &self.items
+    }
+
+    /// Borrow the recorded label map for the native provider renderer.
+    pub(crate) fn labels(&self) -> &HashMap<Vec<u8>, Vec<u8>> {
+        &self.labels
+    }
+
+    /// Borrow the recorded summary map for the native provider renderer.
+    pub(crate) fn summaries(&self) -> &HashMap<Vec<u8>, Vec<u8>> {
+        &self.summaries
+    }
+
+    fn retain(&mut self, bytes: usize) -> Result<(), StateLimit> {
+        let retained = self.retained_bytes.checked_add(bytes).ok_or(StateLimit)?;
+        if retained > self.retained_limit {
+            return Err(StateLimit);
+        }
+        self.retained_bytes = retained;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{State, StateLimit};
+
+    #[test]
+    fn retained_state_limit_rejects_growth_without_exceeding_the_bound() {
+        let mut state = State {
+            retained_limit: 32,
+            ..State::default()
+        };
+        state.record_item(b"g", b"ok", b"one", b"two").unwrap();
+        let retained_before = state.retained_bytes;
+
+        assert_eq!(
+            state.record_item(b"g", b"changed", b"three", b"four"),
+            Err(StateLimit)
+        );
+        assert_eq!(state.retained_bytes, retained_before);
+        assert_eq!(state.items_blob(b"g"), Some(b"ok\tone\ttwo\n".as_slice()));
+    }
+
+    #[test]
+    fn replacing_summaries_accounts_for_only_current_retained_payload() {
+        let mut state = State {
+            retained_limit: 80,
+            ..State::default()
+        };
+        state
+            .record_group_summary(b"g", b"label", b"ok", 0, 1, 0, 0, b"1", 0)
+            .unwrap();
+        state
+            .record_group_summary(b"g", b"x", b"ok", 0, 1, 0, 0, b"2", 0)
+            .unwrap();
+        assert!(state.retained_bytes <= state.retained_limit);
+        assert_eq!(state.display_label(b"g"), b"x");
     }
 }

@@ -1,11 +1,11 @@
-//! One-use authorization contexts for isolated workers (slice 9).
+//! One-use authorization contexts for isolated workers.
 //!
-//! Ports `lib/dot/overlay-context.sh`: the shared field gate, path
+//! Owns the shared field gate, path
 //! and record validators, the mode/set/stage matrix, random tokens,
 //! and NUL-framed context file creation and single-use consumption
 //! with open-descriptor TOCTOU checks.
 //!
-//! Like the earlier ports the library never prints: failures carry
+//! The library never prints: failures carry
 //! the message the shell emits after `dot: overlay context: `, and
 //! message-less shell `return 1` paths surface as
 //! [`Error::Refused`]. `stat`-based identity uses
@@ -164,19 +164,27 @@ fn lsof_report(fd: i32) -> Option<(u64, u64, u64, u32)> {
         if !executable {
             continue;
         }
-        output = std::process::Command::new(bin)
-            .args([
-                "-a",
-                "-p",
-                &pid.to_string(),
-                "-d",
-                &fd.to_string(),
-                "-FDiku",
-            ])
-            .output()
-            .ok()
-            .filter(|result| result.status.success())
-            .map(|result| result.stdout);
+        if crate::cancellation::check().is_err() {
+            return None;
+        }
+        let mut command = std::process::Command::new(bin);
+        command.args([
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-d",
+            &fd.to_string(),
+            "-FDiku",
+        ]);
+        output = crate::cleanup::run_session_output(
+            command,
+            None,
+            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+            crate::cleanup::LingerPolicy::Strict,
+        )
+        .ok()
+        .filter(|result| result.status.success())
+        .map(|result| result.stdout);
         // The shell returns after the first usable binary whether or
         // not the query itself succeeded.
         break;
@@ -448,6 +456,32 @@ pub fn create(
         return Err(Error::Refused);
     }
     Ok((path, token))
+}
+
+/// Create a context using the clock at the authorization boundary.
+///
+/// Update stages may begin minutes before a hook runs. Production callers use
+/// this entry point so display timestamps cannot accidentally become security
+/// timestamps; [`create`] retains its explicit clock for deterministic protocol
+/// tests.
+pub fn create_current(
+    directory: &Path,
+    mode: &str,
+    set_kind: &str,
+    stage: &str,
+    records: &[Vec<u8>],
+    home: &str,
+    euid: u32,
+) -> Result<(PathBuf, String), Error> {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Error::Refused)?
+        .as_secs()
+        .try_into()
+        .map_err(|_| Error::Refused)?;
+    create(
+        directory, mode, set_kind, stage, records, home, euid, now_secs,
+    )
 }
 
 /// Whether `token` matches the `^[0-9a-f]{64}$` gate the shell

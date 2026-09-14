@@ -10,18 +10,14 @@
 //! that replays a transaction forward from any recorded phase
 //! ([`resume_transaction`]).
 //!
-//! Lane map, so the integrator can stack without overlap: the
-//! rollback neighbor below (`_dot_init_rollback`) lives on
-//! `rust-port-slice-66` and the command dispatcher above
-//! (`dot_init_command`) stays for a later lane, as do the record
-//! journal (`init_client_records` / `init_client_record`), the
+//! Rollback and command dispatch remain separate from the record
+//! journal (`init_client_record`), the
 //! plan-review family (`init_client_plan`), the git-stage pair and
 //! converge tail (`init_client_git`, `init_client_publish`), and the
 //! identity, generation, candidate, entry, and delete families owned
-//! by their own lanes. Nothing outside lines 1711-1788 is ported
-//! here.
+//! by their corresponding modules.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the run identity from the
@@ -33,8 +29,8 @@
 //! `clippy::too_many_arguments`). All cross-lane helpers the shell
 //! calls by name — the path identity, generation-marker, and repo
 //! identity predicates plus the record, move, stage, publish,
-//! converge, and completion steps — cross as closures, the plan and
-//! git lane precedent for unmerged neighbors. `REPLY`-carried outputs
+//! converge, and completion steps — cross as closures to preserve those
+//! ownership boundaries. `REPLY`-carried outputs
 //! surface as return values; the resume wrapper itself is silent like
 //! the shell (sub-step bytes belong to the step closures, which own
 //! their file descriptors the way the engine does).
@@ -66,7 +62,7 @@
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::errors::{Error, Result};
 
@@ -263,7 +259,9 @@ fn commit_valid(commit: &[u8]) -> bool {
 /// for the bare substitution in the `case`, like its empty expansion.
 /// Git's own stderr is silenced (the candidate lane precedent).
 fn git_dir_output(git_dir: &Path, home: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new("git")
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("--git-dir")
         .arg(git_dir)
         .args(args)
@@ -271,9 +269,17 @@ fn git_dir_output(git_dir: &Path, home: &Path, args: &[&str]) -> Option<Vec<u8>>
         .env("HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        // Pinned deterministic leaf: Detach skips the host-wide completion scan;
+        // cancellation still takes the strict path.
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -284,7 +290,9 @@ fn git_dir_output(git_dir: &Path, home: &Path, args: &[&str]) -> Option<Vec<u8>>
 /// worktree context the `--git-dir` form cannot provide. Same
 /// pinning and silencing as [`git_dir_output`].
 fn git_home_output(home: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new("git")
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg("-C")
         .arg(home)
         .args(args)
@@ -292,9 +300,17 @@ fn git_home_output(home: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .env("HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        // Pinned deterministic leaf: Detach skips the host-wide completion scan;
+        // cancellation still takes the strict path.
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -562,7 +578,29 @@ pub fn resume_transaction(inputs: &ResumeInputs<'_>, deps: &ResumeDeps<'_>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
+    use dot_test_support::TempDir;
+
+    #[test]
+    fn git_probe_runs_without_host_process_snapshot() {
+        let dir = TempDir::new("leaf-git-no-scan").expect("scratch");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(dir.path())
+            .status()
+            .expect("git init fixture");
+        assert!(status.success());
+        crate::cleanup::reset_global_process_snapshot_calls();
+        let version = git_dir_output(&dir.path().join(".git"), dir.path(), &["--version"]);
+        assert!(version.is_some_and(|out| !out.is_empty()));
+        let home_version = git_home_output(dir.path(), &["--version"]);
+        assert!(home_version.is_some_and(|out| !out.is_empty()));
+        assert_eq!(
+            crate::cleanup::global_process_snapshot_calls(),
+            0,
+            "read-only git probes must not pay a host-wide /proc walk"
+        );
+    }
 
     #[test]
     fn commit_ids_cover_both_generations() {

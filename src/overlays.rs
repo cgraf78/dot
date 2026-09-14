@@ -1,13 +1,13 @@
-//! Overlay discovery and local-source validation (slice 9).
+//! Overlay discovery and local-source validation.
 //!
-//! Ports `lib/dot/overlays.sh`: filename-derived identities,
+//! Owns filename-derived identities,
 //! descriptor safety gates, single-descriptor parsing with the
 //! strict/permissive split, physical-directory resolution, local
 //! (`sync=none`) destination and inventory validation, the
 //! configured/eligible/active lifecycle sets, and top-level
 //! resolution across legacy and profile-aware discovery.
 //!
-//! Conventions follow the earlier ports: the shell's globals become
+//! Shell globals become
 //! [`State`], environment-derived inputs arrive explicitly via
 //! [`Inputs`], and stderr text (warnings, discovery errors) is
 //! collected for engine callers to reproduce — the library never
@@ -481,13 +481,24 @@ pub fn is_worktree(path: &Path) -> bool {
         Ok(canonical) => canonical,
         Err(_) => return false,
     };
-    let top = match std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .arg("rev-parse")
-        .arg("--show-toplevel")
-        .output()
-    {
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
+    let output = retry_once(|| {
+        let mut command = crate::init_client_identity::host_git_command();
+        command
+            .arg("-C")
+            .arg(path)
+            .arg("rev-parse")
+            .arg("--show-toplevel");
+        crate::cleanup::run_session_output(
+            command,
+            None,
+            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+            crate::cleanup::LingerPolicy::Detach,
+        )
+    });
+    let top = match output {
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
             .trim_end()
             .to_string(),
@@ -521,18 +532,43 @@ pub fn effective_url(url: &str, home: &str) -> String {
     format!("{home}/{url}")
 }
 
+/// Run one read-only git gate twice. A single retry absorbs transient
+/// spawn pressure (fork bursts under parallel suites) without changing
+/// any definitive answer: both attempts run the same read-only command,
+/// and two failures return the second error.
+fn retry_once<T, E>(mut attempt: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+    match attempt() {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            attempt()
+        }
+    }
+}
+
 /// `_overlay_origin_matches`: the single authoritative origin URL
 /// against the configured spelling. Returns the recorded URL on a
 /// match, or the `<missing>` / `<multiple origin URLs>`
 /// diagnostic the shell stores in `REPLY`.
 pub fn origin_matches(path: &Path, expected: &str) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .arg("config")
-        .arg("--get-all")
-        .arg("remote.origin.url")
-        .output();
+    if crate::cancellation::check().is_err() {
+        return Err("<interrupted>".to_string());
+    }
+    let output = retry_once(|| {
+        let mut command = crate::init_client_identity::host_git_command();
+        command
+            .arg("-C")
+            .arg(path)
+            .arg("config")
+            .arg("--get-all")
+            .arg("remote.origin.url");
+        crate::cleanup::run_session_output(
+            command,
+            None,
+            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+            crate::cleanup::LingerPolicy::Detach,
+        )
+    });
     let mut urls: Vec<String> = Vec::new();
     if let Ok(output) = output {
         let text = String::from_utf8_lossy(&output.stdout);
@@ -1298,4 +1334,46 @@ pub fn resolve(
         use_set(state, "active")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_once_passes_first_success_through() {
+        let mut calls = 0;
+        let result: Result<&str, &str> = retry_once(|| {
+            calls += 1;
+            Ok("ok")
+        });
+        assert_eq!(result, Ok("ok"));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn retry_once_recovers_transient_failure() {
+        let mut calls = 0;
+        let result: Result<&str, &str> = retry_once(|| {
+            calls += 1;
+            if calls == 1 {
+                Err("transient")
+            } else {
+                Ok("recovered")
+            }
+        });
+        assert_eq!(result, Ok("recovered"));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn retry_once_returns_second_error_after_two_failures() {
+        let mut calls = 0;
+        let result: Result<&str, &str> = retry_once(|| {
+            calls += 1;
+            Err("down")
+        });
+        assert_eq!(result, Err("down"));
+        assert_eq!(calls, 2);
+    }
 }

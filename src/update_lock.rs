@@ -1,6 +1,6 @@
-//! Process-wide `dot update` serialization (slice 3).
+//! Process-wide `dot update` serialization.
 //!
-//! Ports `lib/dot/update-lock.sh`. `mkdir` atomicity, the owner record
+//! Uses `mkdir` atomicity, an owner record,
 //! (`pid\t…/start\t…/token\t…`), lock/owner path resolution,
 //! stale-claim-by-rename, the empty-guard protocol, and the 3-attempt
 //! acquire loop are transliterated. Two deliberate replacements (same
@@ -8,8 +8,8 @@
 //!
 //! - Process identity uses the same two backends (procfs field 22,
 //!   `ps -o lstart=`), read through std/`Command` — no change needed.
-//! - Liveness probing (`kill -0`) goes through the `kill` CLI (std has
-//!   no `kill(pid, 0)`); rare path only, no new dependency.
+//! - Liveness probing uses native `kill(pid, 0)` through the existing Unix
+//!   ABI dependency, avoiding a shell process on lock inspection.
 //! - The lock TOKEN format differs (`pid.nanos.counter` instead of
 //!   `$$.${SECONDS}.${RANDOM}`): tokens are opaque, and wall-clock
 //!   seconds plus `$RANDOM` are weaker uniqueness than a monotonic
@@ -17,7 +17,7 @@
 //! - Signal-trap installation (`_dot_update_lock_install_traps`) is
 //!   EXCLUDED: [`LockGuard`] releases on drop (RAII), which is strictly
 //!   stronger than EXIT-trap release (it also covers early returns and
-//!   panics). A signal-handler story is a later slice.
+//!   panics). Process-level signal handling stays at the CLI boundary.
 //! - `DOT_UPDATE_LOCK_TOKEN`/`DOT_UPDATE_LOCK_CRON_MODE` globals become
 //!   explicit parameters and return values.
 
@@ -67,6 +67,99 @@ pub fn lock_path(state_dir: &Path) -> PathBuf {
 /// Ports `_dot_update_lock_owner_file` (`printf '%s/owner\n' "$1"`).
 pub fn owner_file(lock_dir: &Path) -> PathBuf {
     lock_dir.join(OWNER_FILE_NAME)
+}
+
+/// Validate the state-owned parent before treating it as the lock namespace.
+/// In particular, never chmod through a `dot` symlink: it could change an
+/// unrelated target before the lock operation has even begun.
+#[cfg(unix)]
+fn secure_parent(state_dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let parent = state_dir.join(DOT_DIR_NAME);
+    match std::fs::symlink_metadata(&parent) {
+        Ok(meta) => {
+            if !meta.is_dir()
+                || meta.file_type().is_symlink()
+                || meta.uid() != crate::temp::current_uid().unwrap_or(u32::MAX)
+            {
+                return Err(Error::Io {
+                    context: "lock state directory is unsafe",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        parent.display().to_string(),
+                    ),
+                });
+            }
+            // The shell has always repaired a pre-existing, user-owned
+            // state directory.  Keep that compatibility, but only after the
+            // lstat above has ruled out a link or foreign owner.
+            if meta.permissions().mode() & 0o077 != 0 {
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |source| Error::Io {
+                        context: "lock could not secure its state directory",
+                        source,
+                    },
+                )?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(state_dir).map_err(|source| Error::Io {
+                context: "lock could not create its state directory",
+                source,
+            })?;
+            match std::fs::create_dir(&parent) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return secure_parent(state_dir);
+                }
+                Err(source) => {
+                    return Err(Error::Io {
+                        context: "lock could not create its state directory",
+                        source,
+                    });
+                }
+            }
+            // We created it, but still lstat before chmod so a concurrent
+            // replacement cannot redirect permission changes through a link.
+            let meta = std::fs::symlink_metadata(&parent).map_err(|source| Error::Io {
+                context: "lock could not inspect its state directory",
+                source,
+            })?;
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                return Err(Error::Io {
+                    context: "lock state directory is unsafe",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        parent.display().to_string(),
+                    ),
+                });
+            }
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |source| Error::Io {
+                    context: "lock could not secure its state directory",
+                    source,
+                },
+            )?;
+        }
+        Err(source) => {
+            return Err(Error::Io {
+                context: "lock could not inspect its state directory",
+                source,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_parent(state_dir: &Path) -> Result<()> {
+    let parent = state_dir.join(DOT_DIR_NAME);
+    std::fs::create_dir_all(&parent).map_err(|source| Error::Io {
+        context: "lock could not create its state directory",
+        source,
+    })?;
+    Ok(())
 }
 
 /// Parsed owner record.
@@ -148,16 +241,32 @@ pub fn mint_token() -> String {
 /// `ps` answer wins (preserving locks from older generations); procfs
 /// is the fallback only when no expectation constrains the backend.
 pub fn process_start(pid: u32, expected: Option<&str>) -> Option<String> {
+    process_start_typed(pid, expected).ok().flatten()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeFailure {
+    Interrupted,
+    Unknown,
+}
+
+fn process_start_typed(
+    pid: u32,
+    expected: Option<&str>,
+) -> std::result::Result<Option<String>, ProbeFailure> {
     if expected.is_some_and(|text| text.starts_with("proc:")) {
-        return process_start_proc(pid);
+        return Ok(process_start_proc(pid));
     }
-    if let Some(start) = process_start_ps(pid) {
-        return Some(start);
+    match process_start_ps_typed(pid) {
+        Ok(Some(start)) => Ok(Some(start)),
+        Ok(None) if expected.is_none() => Ok(process_start_proc(pid)),
+        Ok(None) => Ok(None),
+        Err(ProbeFailure::Interrupted) => Err(ProbeFailure::Interrupted),
+        Err(ProbeFailure::Unknown) if expected.is_none() => process_start_proc(pid)
+            .map(Some)
+            .ok_or(ProbeFailure::Unknown),
+        Err(error) => Err(error),
     }
-    if expected.is_none() {
-        return process_start_proc(pid);
-    }
-    None
 }
 
 /// Procfs backend: kernel start tick (field 22) of `/proc/<pid>/stat`.
@@ -178,7 +287,12 @@ pub fn process_start_proc(pid: u32) -> Option<String> {
 /// if any, are preserved — both sides compare opaque strings).
 /// Empty output means no such process (or a broken `ps`).
 pub fn process_start_ps(pid: u32) -> Option<String> {
-    let output = Command::new("ps")
+    process_start_ps_typed(pid).ok().flatten()
+}
+
+fn process_start_ps_typed(pid: u32) -> std::result::Result<Option<String>, ProbeFailure> {
+    let mut command = Command::new("ps");
+    command
         .arg("-o")
         .arg("lstart=")
         .arg("-p")
@@ -186,44 +300,84 @@ pub fn process_start_ps(pid: u32) -> Option<String> {
         .env("LC_ALL", "C")
         .env("TZ", "UTC0")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output_typed(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        // Single-pid ps probe, no descendants: Detach skips the host-wide
+        // completion scan; cancellation still takes the strict path.
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .map_err(|error| match error {
+        crate::cleanup::SessionOutputError::Interrupted(_) => ProbeFailure::Interrupted,
+        crate::cleanup::SessionOutputError::Io(_)
+        | crate::cleanup::SessionOutputError::TimedOut
+        | crate::cleanup::SessionOutputError::CaptureLimit
+        | crate::cleanup::SessionOutputError::CleanupIncomplete => ProbeFailure::Unknown,
+    })?;
     if !output.status.success() {
-        return None;
+        return Err(ProbeFailure::Unknown);
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let trimmed = text.trim_end_matches('\n');
     if trimmed.is_empty() {
-        return None;
+        return Err(ProbeFailure::Unknown);
     }
-    Some(trimmed.to_string())
+    Ok(Some(trimmed.to_string()))
 }
 
-/// Foreign-pid liveness via the shell's `kill -0` builtin (std cannot
-/// send signal 0, and the external `kill` binary is absent from
-/// minimal images that the shell still supports: there `kill` is a
-/// builtin, so invoke it through `sh`, exactly like the shell's own
-/// `kill -0 "$pid" 2>/dev/null`. The pid is a u32, so no quoting is
-/// needed. A missing `sh` degrades to inactive, like every other
-/// unreadable-identity path.
+/// Foreign-pid liveness through the native Unix signal-zero probe.
 fn pid_alive(pid: u32) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("kill -0 {pid}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal zero performs permission/existence validation only and
+    // does not deliver a signal. `pid` is a checked positive process id.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    // EPERM still proves that the process exists; we merely lack permission
+    // to signal it.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Whether a recorded owner still holds the lock: process alive AND
 /// start identity unchanged (PID-reuse protection).
 pub fn owner_is_active(owner: &Owner) -> bool {
-    if !pid_alive(owner.pid) {
-        return false;
+    matches!(owner_activity(owner), OwnerActivity::Active)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerActivity {
+    Active,
+    Stale,
+    Unknown,
+    Interrupted,
+}
+
+pub(crate) fn owner_activity(owner: &Owner) -> OwnerActivity {
+    classify_owner_activity(
+        owner,
+        pid_alive(owner.pid),
+        process_start_typed(owner.pid, Some(&owner.start)),
+    )
+}
+
+fn classify_owner_activity(
+    owner: &Owner,
+    alive: bool,
+    observed: std::result::Result<Option<String>, ProbeFailure>,
+) -> OwnerActivity {
+    if !alive {
+        return OwnerActivity::Stale;
     }
-    process_start(owner.pid, Some(&owner.start)).as_deref() == Some(owner.start.as_str())
+    match observed {
+        Ok(Some(start)) if start == owner.start => OwnerActivity::Active,
+        Ok(Some(_)) | Ok(None) => OwnerActivity::Stale,
+        Err(ProbeFailure::Interrupted) => OwnerActivity::Interrupted,
+        Err(ProbeFailure::Unknown) => OwnerActivity::Unknown,
+    }
 }
 
 /// File mtime as whole seconds since the epoch.
@@ -431,7 +585,7 @@ impl LockGuard {
             log.warn(
                 warn_sink,
                 &format!(
-                    "warning: unable to remove dot update lock state: {}",
+                    "  warning: unable to remove dot update lock state: {}",
                     self.lock_dir.display()
                 ),
             );
@@ -513,12 +667,7 @@ pub fn acquire(
     warn_sink: &mut dyn std::io::Write,
 ) -> Result<LockGuard> {
     let lock_dir = lock_path(state_dir);
-    std::fs::create_dir_all(lock_dir.parent().unwrap_or(state_dir)).map_err(|source| {
-        Error::Io {
-            context: "lock could not create its state directory",
-            source,
-        }
-    })?;
+    secure_parent(state_dir)?;
     if let Some(token) = prior_token {
         if let Some(guard) = try_reenter(&lock_dir, token) {
             return Ok(guard);
@@ -560,7 +709,7 @@ pub fn acquire(
             log.warn(
                 warn_sink,
                 &format!(
-                    "warning: dot update lock path is not a directory: {}",
+                    "  warning: dot update lock path is not a directory: {}",
                     lock_dir.display()
                 ),
             );
@@ -574,15 +723,31 @@ pub fn acquire(
         }
 
         if let Some(owner) = read_owner(&lock_dir) {
-            if owner_is_active(&owner) {
-                let message = format!("warning: dot update already running (pid {})", owner.pid);
-                if !cron {
-                    log.warn(warn_sink, &message);
+            match owner_activity(&owner) {
+                OwnerActivity::Active => {
+                    let message =
+                        format!("  warning: dot update already running (pid {})", owner.pid);
+                    if !cron {
+                        log.warn(warn_sink, &message);
+                    }
+                    return Err(Error::LockBusy { message });
                 }
-                return Err(Error::LockBusy { message });
+                OwnerActivity::Stale => {}
+                OwnerActivity::Interrupted => {
+                    return Err(Error::Io {
+                        context: "update lock owner probe interrupted",
+                        source: std::io::ErrorKind::Interrupted.into(),
+                    });
+                }
+                OwnerActivity::Unknown => {
+                    return Err(Error::Io {
+                        context: "update lock owner identity is unavailable",
+                        source: std::io::Error::other("could not verify the live lock owner"),
+                    });
+                }
             }
         } else if is_initializing(&lock_dir) {
-            let message = "warning: dot update lock is initializing".to_string();
+            let message = "  warning: dot update lock is initializing".to_string();
             if !cron {
                 log.warn(warn_sink, &message);
             }
@@ -591,18 +756,31 @@ pub fn acquire(
 
         if !reclaim_stale(&lock_dir) {
             return Err(Error::LockBusy {
-                message: "warning: dot update already running".to_string(),
+                message: "  warning: dot update already running".to_string(),
             });
         }
     }
     Err(Error::LockBusy {
-        message: "warning: dot update already running".to_string(),
+        message: "  warning: dot update already running".to_string(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn start_probe_runs_without_host_process_snapshot() {
+        crate::cleanup::reset_global_process_snapshot_calls();
+        let probe = process_start_ps_typed(std::process::id());
+        assert!(probe.ok().flatten().is_some());
+        assert_eq!(
+            crate::cleanup::global_process_snapshot_calls(),
+            0,
+            "single-pid ps probe must not pay a host-wide /proc walk"
+        );
+    }
 
     fn test_log() -> Log {
         Log::new(false, false)
@@ -633,6 +811,93 @@ mod tests {
             "pid\t123\nstart\tproc:456\ntoken\t123.456.0\n"
         );
         assert_eq!(parse_owner(&format_owner(&owner)), Some(owner));
+    }
+
+    #[test]
+    fn uncertain_or_interrupted_live_owner_probe_never_authorizes_reclaim() {
+        let owner = Owner {
+            pid: 123,
+            start: "legacy ps identity".to_string(),
+            token: "token".to_string(),
+        };
+
+        assert_eq!(
+            classify_owner_activity(&owner, true, Err(ProbeFailure::Interrupted)),
+            OwnerActivity::Interrupted
+        );
+        assert_eq!(
+            classify_owner_activity(&owner, true, Err(ProbeFailure::Unknown)),
+            OwnerActivity::Unknown
+        );
+        assert_eq!(
+            classify_owner_activity(&owner, false, Err(ProbeFailure::Unknown)),
+            OwnerActivity::Stale
+        );
+    }
+
+    #[test]
+    fn interrupted_legacy_owner_probe_preserves_the_live_lock() {
+        const HELPER: &str = "DOT_UPDATE_LOCK_INTERRUPTED_PS_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update_lock::tests::interrupted_legacy_owner_probe_preserves_the_live_lock",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "interrupted owner-probe helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let scratch = dot_test_support::TempDir::new("lock-interrupted-ps").unwrap();
+        let bin = scratch.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let ready = scratch.path().join("ps.ready");
+        let ps = bin.join("ps");
+        std::fs::write(
+            &ps,
+            format!(
+                "#!/bin/sh\n: >'{}'\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: this recursive helper is the only test in its process.
+        unsafe { std::env::set_var("PATH", &bin) };
+        let lock = lock_path(scratch.path());
+        std::fs::create_dir_all(&lock).unwrap();
+        let owner = Owner {
+            pid: std::process::id(),
+            start: "legacy ps identity".to_string(),
+            token: "retained".to_string(),
+        };
+        std::fs::write(owner_file(&lock), format_owner(&owner)).unwrap();
+        let signals = crate::cleanup::Signals::install().unwrap();
+        let ready_for_signal = ready.clone();
+        let sender = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !ready_for_signal.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(ready_for_signal.exists());
+            // SAFETY: the helper owns an installed SIGTERM handler.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+        });
+        let result = acquire(scratch.path(), false, &test_log(), None, &mut Vec::new());
+        sender.join().unwrap();
+        let status = signals.finish(if result.is_ok() { 0 } else { 1 });
+
+        assert_eq!(status, 128 + libc::SIGTERM);
+        assert_eq!(read_owner(&lock), Some(owner));
     }
 
     #[test]
@@ -683,7 +948,7 @@ mod tests {
 
     #[test]
     fn acquire_release_cycle() {
-        let scratch = crate::test_support::TempDir::new("lock-cycle").expect("scratch");
+        let scratch = dot_test_support::TempDir::new("lock-cycle").expect("scratch");
         let log = test_log();
         let mut warnings = Vec::new();
         let guard = acquire(scratch.path(), false, &log, None, &mut warnings).expect("acquire");
@@ -706,7 +971,7 @@ mod tests {
 
     #[test]
     fn drop_releases_unreleased_guard() {
-        let scratch = crate::test_support::TempDir::new("lock-drop").expect("scratch");
+        let scratch = dot_test_support::TempDir::new("lock-drop").expect("scratch");
         let log = test_log();
         let dir = scratch.path().join(DOT_DIR_NAME).join(LOCK_DIR_NAME);
         {
@@ -718,7 +983,7 @@ mod tests {
 
     #[test]
     fn initializing_empty_lock_reports_busy() {
-        let scratch = crate::test_support::TempDir::new("lock-init").expect("scratch");
+        let scratch = dot_test_support::TempDir::new("lock-init").expect("scratch");
         let dir = scratch.path().join(DOT_DIR_NAME).join(LOCK_DIR_NAME);
         std::fs::create_dir_all(&dir).expect("empty lock");
         assert!(is_initializing(&dir));
@@ -730,5 +995,74 @@ mod tests {
             }
             other => panic!("expected busy, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_refuses_a_symlinked_state_parent_without_touching_target() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let scratch = dot_test_support::TempDir::new("lock-parent-link").expect("scratch");
+        let target = scratch.path().join("unrelated-target");
+        std::fs::create_dir(&target).expect("target directory");
+        let sentinel = target.join("sentinel");
+        std::fs::write(&sentinel, b"must survive").expect("target content");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("target mode");
+        symlink(&target, scratch.path().join(DOT_DIR_NAME)).expect("state symlink");
+
+        let result = acquire(scratch.path(), false, &test_log(), None, &mut Vec::new());
+
+        assert!(result.is_err(), "symlinked state parent must be refused");
+        assert_eq!(
+            std::fs::read(&sentinel).expect("target content"),
+            b"must survive"
+        );
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "refusal must not chmod the symlink target"
+        );
+    }
+
+    #[test]
+    fn owner_activity_classifies_every_probe_outcome() {
+        let owner = Owner {
+            pid: 4242,
+            start: "proc:99".to_string(),
+            token: "4242.0.0".to_string(),
+        };
+        // A dead pid is stale whatever the probe observed.
+        assert_eq!(
+            classify_owner_activity(&owner, false, Err(ProbeFailure::Unknown)),
+            OwnerActivity::Stale
+        );
+        assert_eq!(
+            classify_owner_activity(&owner, true, Ok(Some("proc:99".to_string()))),
+            OwnerActivity::Active
+        );
+        assert_eq!(
+            classify_owner_activity(&owner, true, Ok(Some("proc:100".to_string()))),
+            OwnerActivity::Stale
+        );
+        assert_eq!(
+            classify_owner_activity(&owner, true, Ok(None)),
+            OwnerActivity::Stale
+        );
+        // Probe failures are their own outcomes (never stale, never
+        // active): `acquire` refuses on `Unknown`, and doctor renders
+        // its own row for both.
+        assert_eq!(
+            classify_owner_activity(&owner, true, Err(ProbeFailure::Unknown)),
+            OwnerActivity::Unknown
+        );
+        assert_eq!(
+            classify_owner_activity(&owner, true, Err(ProbeFailure::Interrupted)),
+            OwnerActivity::Interrupted
+        );
     }
 }

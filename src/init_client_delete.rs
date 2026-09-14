@@ -3,8 +3,7 @@
 //! per-kind delete validators, the two private-directory gates, and
 //! the parked-generation remover.
 //!
-//! The shell file holds 79 functions — too big for one lane — so
-//! this module owns only the eight functions from
+//! This module owns the functions from
 //! `_dot_init_delete_park_path` through
 //! `_dot_init_delete_parked_generation`, plus the two small match
 //! gates they call that no lane has claimed: the worktree-content
@@ -12,16 +11,12 @@
 //! validator) and the private-directory pair
 //! `_dot_init_private_directory_matches` /
 //! `_dot_init_private_empty_directory_matches` (used by the parent
-//! validator). The file-generic `_dot_init_error` diagnostic stays
-//! unported (a bare `printf ... >&2; return 1` with no family state,
-//! absorbed into [`Result`] the way earlier slices absorb engine
-//! diagnostics). The transaction lifecycle, host-git identity,
+//! validator). Transaction lifecycle, host-git identity,
 //! git-generation binding, per-entry staging, candidate planning,
-//! and record journal families live on sibling
-//! `rust-port-slice-{35,41,43,46,48,51,54}`; the rollback, publish,
-//! status, and command-dispatch families stay for later slices.
+//! and record journal families live in sibling modules; rollback, publish,
+//! status and command-dispatch families live in adjacent native modules.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the run identity from the
@@ -36,22 +31,18 @@
 //! plain string. `REPLY` outputs surface as return values.
 
 use std::ffi::OsString;
-use std::io::Write as _;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::errors::{Error, Result};
 use crate::temp;
 
-/// File name of the staged-generation marker inside a git directory
-/// (twin of the sibling generation lane's constant, kept local
-/// because that lane is unmerged).
+/// File name of the staged-generation marker inside a git directory.
 const GENERATION_MARKER_NAME: &str = "dot-init-generation-v1";
 
-/// First line of a generation marker: proves the file is ours before
-/// any field is trusted (twin of the sibling generation lane's
-/// constant, kept local because that lane is unmerged).
+/// First line of a generation marker, proving its format before any
+/// field is trusted.
 const GENERATION_HEADER: &str = "cgraf78 dot client generation v1";
 
 /// A path that exists as anything but a missing name: the shell's
@@ -81,8 +72,7 @@ fn is_real_file(path: &Path) -> bool {
 
 /// Effective-uid ownership (`test -O`): the shell gate requires the
 /// path to be ours. An unreadable identity fails closed, like the
-/// shell's failed `stat`. (Twin of the sibling generation lane's
-/// gate; kept local because that lane is unmerged.)
+/// shell's failed `stat`.
 fn owned_by_us(path: &Path) -> bool {
     match (temp::current_uid(), temp::path_uid(path)) {
         (Some(uid), Ok(owner)) => uid == owner,
@@ -150,9 +140,11 @@ fn chomp_newlines(bytes: &[u8]) -> &[u8] {
 /// nothing usable — the shell's `|| return 1` / empty-substitution
 /// failure modes.
 fn run_git_dir(git_dir: &Path, args: &[&str], stdin_bytes: Option<&[u8]>) -> Option<Vec<u8>> {
+    crate::cancellation::check().ok()?;
     let mut dir_arg = OsString::from("--git-dir=");
     dir_arg.push(git_dir);
-    let mut child = Command::new("git")
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg(dir_arg)
         .args(args)
         .env("LC_ALL", "C")
@@ -162,13 +154,24 @@ fn run_git_dir(git_dir: &Path, args: &[&str], stdin_bytes: Option<&[u8]>) -> Opt
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    if let Some(payload) = stdin_bytes {
-        child.stdin.as_mut()?.write_all(payload).ok()?;
+        .stderr(Stdio::null());
+    let output = match stdin_bytes {
+        Some(payload) => crate::cleanup::run_session_output_with_input(
+            command,
+            payload,
+            None,
+            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+            crate::cleanup::LingerPolicy::Strict,
+        ),
+        None => crate::cleanup::run_session_output(
+            command,
+            None,
+            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+            crate::cleanup::LingerPolicy::Strict,
+        ),
     }
-    let output = child.wait_with_output().ok()?;
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -179,31 +182,26 @@ fn run_git_dir(git_dir: &Path, args: &[&str], stdin_bytes: Option<&[u8]>) -> Opt
 /// store-independent, so no `--git-dir`): the shell's
 /// `printf ... | git hash-object --stdin`.
 fn hash_stdin_bytes(payload: &[u8]) -> Result<String> {
-    let mut child = Command::new("git")
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .args(["hash-object", "--stdin"])
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|source| Error::Io {
-            context: "spawn git hash-object",
-            source,
-        })?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or(Error::Usage {
-            message: "git hash-object has no stdin",
-        })?
-        .write_all(payload)
-        .map_err(|source| Error::Io {
-            context: "feed git hash-object",
-            source,
-        })?;
-    let output = child.wait_with_output().map_err(|source| Error::Io {
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output_with_input(
+        command,
+        payload,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .map_err(|source| Error::Io {
         context: "reap git hash-object",
         source,
+    })?;
+    crate::cancellation::check().map_err(|_| Error::Usage {
+        message: "git hash-object interrupted",
     })?;
     if !output.status.success() {
         return Err(Error::Command {
@@ -339,19 +337,27 @@ pub fn candidate_matches_git(
 /// `git --git-dir=<git_dir> hash-object --no-filters -- <target>`,
 /// chomped like the shell's `actual_oid=$(...)`.
 fn hash_live_file(git_dir: &Path, target: &Path) -> Option<String> {
+    crate::cancellation::check().ok()?;
     let target = target.as_os_str().to_os_string();
     let mut dir_arg = OsString::from("--git-dir=");
     dir_arg.push(git_dir);
-    let output = Command::new("git")
+    let mut command = crate::init_client_identity::host_git_command();
+    command
         .arg(dir_arg)
         .args(["hash-object", "--no-filters", "--"])
         .arg(target)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -449,8 +455,8 @@ pub fn parent_delete_matches(
 
 /// `_dot_init_git_delete_matches`: the parked candidate still has
 /// the recorded git-directory identity and still carries this run's
-/// generation marker and branch tip. The generation check twins the
-/// sibling generation lane (unmerged): marker header plus one
+/// generation marker and branch tip. The generation check requires
+/// the marker header plus one
 /// `nonce=`/`commit=`/`identity=` line each, then
 /// `refs/heads/<branch>` resolving to `commit`. Like the shell, the
 /// generation gate runs against the candidate itself (the parked
@@ -473,8 +479,7 @@ pub fn git_delete_matches(
 }
 
 /// `<git_dir>/dot-init-generation-v1` by byte concatenation, like the
-/// shell's `printf '%s/...'` (twin of the sibling generation lane's
-/// helper, kept local because that lane is unmerged).
+/// shell's `printf '%s/...'`.
 fn generation_marker(git_dir: &Path) -> PathBuf {
     let mut marker = git_dir.as_os_str().to_os_string();
     marker.push("/");
@@ -482,8 +487,7 @@ fn generation_marker(git_dir: &Path) -> PathBuf {
     PathBuf::from(marker)
 }
 
-/// Twin of the sibling generation lane's marker validator (that lane
-/// is unmerged, so the check lives here too): the marker sits under
+/// Validate that the marker sits under
 /// a real `git_dir`, is a real file owned by us, and holds exactly
 /// the header plus one `nonce=`, one `commit=`, and one `identity=`
 /// line equal to this run. Duplicate or unknown keys, lines without
@@ -545,8 +549,7 @@ fn generation_marker_matches(git_dir: &Path, nonce: &str, commit: &str, identity
     lines.len() == 4 && seen_nonce && seen_commit && seen_identity
 }
 
-/// Twin of the sibling generation lane's branch-tip check (that lane
-/// is unmerged): the marker matches AND `refs/heads/<branch>`
+/// Require that the marker matches and `refs/heads/<branch>`
 /// resolves to `commit`. The rev-parse comparison chomps trailing
 /// newlines exactly like the shell's `$(...)`; a failed git run
 /// fails the match, also like the shell.

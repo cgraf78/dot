@@ -9,10 +9,9 @@
 //! shell uses (Git is already a required engine dependency), moves go
 //! through the same `mv` binary with the same `-nT`/`-nh` capability
 //! probe (GNU and BSD `mv` differ on late directories, and the probe
-//! matrix is exactly what the shell suite pins), and `umask` is read
-//! from the engine process the way the shell reads its own —
-//! `std` offers no `umask(2)` binding, and the shell pays a fork per
-//! read too. Callers thread [`LockCtx`] (the `DOT_TEST` /
+//! matrix is exactly what the shell suite pins), and the process umask
+//! is read without mutating process state. Callers thread
+//! [`LockCtx`] (the `DOT_TEST` /
 //! `DOT_UPDATE_LOCK_TOKEN` gate), `source_root` (the
 //! `DOT_SOURCE_ROOT` binding, see [`source_root`]), the umask, and a
 //! [`MoveCache`] explicitly so differential tests can pin every knob
@@ -28,6 +27,12 @@ use std::path::{Path, PathBuf};
 
 use crate::errors::{Error, Result};
 
+fn cancellation_checkpoint() -> Result<()> {
+    crate::cancellation::check().map_err(|_| Error::Usage {
+        message: "operation interrupted",
+    })
+}
+
 /// `REPLY` capacity the shell never exceeds: sibling temps carry the
 /// destination basename plus `.tmp.` plus six random characters.
 const TMP_SUFFIX_LEN: usize = 6;
@@ -36,6 +41,43 @@ const TMP_SUFFIX_LEN: usize = 6;
 /// Crate-visible so the init transaction stage allocator shares the
 /// exact retry budget instead of inventing a second one.
 pub(crate) const TMP_RETRIES: usize = 100;
+
+/// Current epoch seconds without launching `date`.
+pub(crate) fn epoch_seconds() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
+
+/// Current local time in the shell's `%Y%m%d%H%M%S` shape.
+///
+/// `localtime_r` uses the process timezone database just like `date`, while
+/// avoiding an unsupervised helper between cancellation checkpoints and a
+/// durable publication.
+pub(crate) fn local_timestamp() -> Option<String> {
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    if now == -1 {
+        return None;
+    }
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: both pointers refer to live, correctly aligned objects for the
+    // duration of the call. `localtime_r` initializes `local` on success.
+    if unsafe { libc::localtime_r(&now, local.as_mut_ptr()) }.is_null() {
+        return None;
+    }
+    // SAFETY: successful `localtime_r` initialized the value above.
+    let local = unsafe { local.assume_init() };
+    Some(format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}",
+        local.tm_year + 1900,
+        local.tm_mon + 1,
+        local.tm_mday,
+        local.tm_hour,
+        local.tm_min,
+        local.tm_sec
+    ))
+}
 
 /// True when `path` carries a byte the transaction layer rejects
 /// outright: newline, carriage return, or tab. The shell tests
@@ -59,6 +101,7 @@ pub fn sibling_tmp_for(dst: &Path) -> Result<PathBuf> {
     let base = dst.file_name().ok_or(Error::Usage {
         message: "destination has no file name",
     })?;
+    cancellation_checkpoint()?;
     std::fs::create_dir_all(dir).map_err(|source| Error::Io {
         context: "create sibling temp parent",
         source,
@@ -66,6 +109,7 @@ pub fn sibling_tmp_for(dst: &Path) -> Result<PathBuf> {
     let mut prefix = base.to_os_string();
     prefix.push(".tmp.");
     for _ in 0..TMP_RETRIES {
+        cancellation_checkpoint()?;
         // `OsString::truncate` is still unstable: rebuild the name per
         // attempt instead of truncating back to the prefix.
         let mut name = prefix.clone();
@@ -183,15 +227,10 @@ pub fn path_nlink(path: &Path) -> Result<u64> {
     Ok(meta.nlink())
 }
 
-/// Current effective uid, forked from `id -u` exactly like the shell
-/// (see `platform::require_sudo`): no libc binding for parity.
+/// Current effective uid from the Unix process credentials.
 pub fn current_uid() -> Option<u32> {
-    std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+    // SAFETY: `geteuid` has no preconditions and does not dereference memory.
+    Some(unsafe { libc::geteuid() })
 }
 
 /// `_dot_private_dir_validate`: a real directory (never a symlink)
@@ -245,33 +284,80 @@ pub fn private_control_file_validate(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read the engine process umask by asking `sh` (whose builtin reports
-/// the inherited mask): `std` has no `umask(2)` binding, and the shell
-/// pays the same fork with `mask=$(umask)`.
+/// Parse the numeric form emitted by `/proc/self/status` and `sh -c umask`.
+fn parse_umask(value: &str) -> Option<u32> {
+    let value = value.trim_matches(|ch: char| ch.is_ascii_whitespace());
+    if value.is_empty() || value.len() > 4 || !value.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
+    {
+        return None;
+    }
+    let mask = u32::from_str_radix(value, 8).ok()?;
+    (mask <= 0o777).then_some(mask)
+}
+
+/// Read the engine process umask without mutating process-global state.
 pub fn read_umask() -> Result<u32> {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("umask")
-        .output()
-        .map_err(|source| Error::Io {
-            context: "read umask",
-            source,
-        })?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        if let Some(mask) = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Umask:").and_then(parse_umask))
+        {
+            return Ok(mask);
+        }
+    }
+
+    let shell = if Path::new("/bin/sh").is_file() {
+        "/bin/sh"
+    } else {
+        "sh"
+    };
+    let mut command = std::process::Command::new(shell);
+    command.args(["-c", "umask"]);
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .map_err(|source| Error::Io {
+        context: "read umask",
+        source,
+    })?;
     if !output.status.success() {
         return Err(Error::Usage {
-            message: "umask query failed",
+            message: "cannot read umask",
         });
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let digits = text.trim();
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(Error::Usage {
-            message: "umask query returned non-octal output",
-        });
-    }
-    u32::from_str_radix(digits, 8).map_err(|_| Error::Usage {
-        message: "umask query returned non-octal output",
+    let value = String::from_utf8(output.stdout).map_err(|_| Error::Usage {
+        message: "invalid umask output",
+    })?;
+    parse_umask(&value).ok_or(Error::Usage {
+        message: "invalid umask output",
     })
+}
+
+#[cfg(test)]
+mod umask_tests {
+    use super::parse_umask;
+
+    #[test]
+    fn numeric_umask_parser_is_strict() {
+        for (value, expected) in [
+            ("0022", Some(0o022)),
+            (" 0077\n", Some(0o077)),
+            ("0", Some(0)),
+            ("0777", Some(0o777)),
+            ("", None),
+            ("Umask:\t0022", None),
+            ("00022", None),
+            ("0788", None),
+            ("1000", None),
+            ("u=rwx,g=rx,o=rx", None),
+        ] {
+            assert_eq!(parse_umask(value), expected, "{value:?}");
+        }
+    }
 }
 
 /// `_dot_apply_tracked_file_mode`: force a git-tracked mode (`100644`
@@ -381,6 +467,17 @@ pub fn sanitized_git<S: AsRef<std::ffi::OsStr>>(
     source_root: &Path,
     args: &[S],
 ) -> std::process::Command {
+    let mut cmd = crate::init_client_identity::host_git_command();
+    sanitize_git_env(&mut cmd);
+    bind_source_git(&mut cmd, source_root);
+    cmd.args(args);
+    cmd
+}
+
+/// Apply `_dot_sanitized_git` environment isolation to an already-selected
+/// Git executable. Runtime-bound callers use this form so executable lookup
+/// remains tied to their immutable PATH without duplicating Git policy.
+pub(crate) fn sanitize_git_env(cmd: &mut std::process::Command) {
     const UNSET: &[&str] = &[
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -396,12 +493,16 @@ pub fn sanitized_git<S: AsRef<std::ffi::OsStr>>(
         "GIT_CONFIG_NOSYSTEM",
         "GIT_DEFAULT_HASH",
     ];
-    let mut cmd = std::process::Command::new("git");
     for var in UNSET {
         cmd.env_remove(var);
     }
     cmd.env("GIT_CONFIG_NOSYSTEM", "1");
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+}
+
+/// Bind one sanitized Git command to the selected source checkout, including
+/// the explicit trust required when a container mount is host-owned.
+pub(crate) fn bind_source_git(cmd: &mut std::process::Command, source_root: &Path) {
     let directory = source_root.as_os_str().as_bytes();
     let mut safe = b"safe.directory=".to_vec();
     safe.extend_from_slice(directory);
@@ -411,8 +512,6 @@ pub fn sanitized_git<S: AsRef<std::ffi::OsStr>>(
     cmd.arg(std::ffi::OsStr::from_bytes(&safe));
     cmd.arg("-C");
     cmd.arg(source_root);
-    cmd.args(args);
-    cmd
 }
 
 /// `_dot_source_git`: Git bound to the already-selected physical
@@ -435,7 +534,6 @@ pub(crate) fn hash_object<S: AsRef<std::ffi::OsStr>>(
     args: &[S],
     stdin: Option<&[u8]>,
 ) -> Result<String> {
-    use std::io::Write as _;
     use std::process::Stdio;
     // The subcommand lives here, not at the call sites: `sanitized_git`
     // only builds the isolated `git -c/-C` prefix (like `_dot_sanitized_git`,
@@ -450,24 +548,22 @@ pub(crate) fn hash_object<S: AsRef<std::ffi::OsStr>>(
     }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::null());
-    let mut child = cmd.spawn().map_err(|source| Error::Io {
-        context: "spawn git hash-object",
-        source,
-    })?;
-    if let Some(input) = stdin {
-        child
-            .stdin
-            .as_mut()
-            .ok_or(Error::Usage {
-                message: "hash-object stdin unavailable",
-            })?
-            .write_all(input)
-            .map_err(|source| Error::Io {
-                context: "feed git hash-object",
-                source,
-            })?;
+    let output = match stdin {
+        Some(input) => crate::cleanup::run_session_output_with_input(
+            cmd,
+            input,
+            None,
+            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+            crate::cleanup::LingerPolicy::Detach,
+        ),
+        None => crate::cleanup::run_session_output(
+            cmd,
+            None,
+            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+            crate::cleanup::LingerPolicy::Detach,
+        ),
     }
-    let output = child.wait_with_output().map_err(|source| Error::Io {
+    .map_err(|source| Error::Io {
         context: "wait git hash-object",
         source,
     })?;
@@ -998,6 +1094,7 @@ pub fn record_write(
         "v1\t{operation}\t{phase}\t{expected_token}\t{}\n",
         render_candidate(candidate)
     );
+    cancellation_checkpoint()?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
     let mut file = options.open(&next).map_err(|source| Error::Io {
@@ -1027,6 +1124,7 @@ pub fn record_write(
     // NOTE: from here on `record.next` is intentionally left behind on
     // failure, mirroring the shell.
     let record = transaction.join("record");
+    cancellation_checkpoint()?;
     match record.symlink_metadata() {
         Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => {
             move_replace_nodir_cached(&next, &record, cache)
@@ -1178,16 +1276,21 @@ fn detect_move_tool(mv_bin: &Path) -> Result<MoveTool> {
 /// Run `mv` with flags, swallowing output: success is decided by the
 /// aftermath checks, exactly like the shell's `|| true` plus tests.
 fn run_mv(mv_bin: &Path, flags: &[&str], source: &Path, target: &Path) -> bool {
-    std::process::Command::new(mv_bin)
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
+    let mut command = std::process::Command::new(mv_bin);
+    command
         .args(flags)
         .arg("--")
         .arg(source)
         .arg(target)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .stderr(std::process::Stdio::null());
+    // Plain file move, no descendants: Detach skips the host-wide completion
+    // scan; cancellation still takes the strict path.
+    crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Detach) == 0
 }
 
 /// Identity of a path for move verification: plain `stat` (never
@@ -1208,6 +1311,7 @@ fn move_identity(path: &Path) -> Option<String> {
 /// directory; exact inode recovery moves only that source back out,
 /// and every shape still reports failure.
 pub fn move_noreplace_with(source: &Path, target: &Path, tool: &MoveTool) -> Result<()> {
+    cancellation_checkpoint()?;
     let identity = move_identity(source).ok_or(Error::Usage {
         message: "move source has no identity",
     })?;
@@ -1226,13 +1330,10 @@ pub fn move_noreplace_with(source: &Path, target: &Path, tool: &MoveTool) -> Res
         && move_identity(&nested) == Some(identity)
     {
         // Best-effort un-nesting; the move still failed.
-        let _ = std::process::Command::new(&tool.bin)
-            .arg(&nested)
-            .arg(source)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // Restoring the exact staged inode is cleanup, not new publication;
+        // use a direct rename so a just-latched cancellation cannot prevent
+        // un-nesting the failed move.
+        let _ = std::fs::rename(&nested, source);
     }
     Err(Error::Usage {
         message: "move would replace an existing target",
@@ -1243,6 +1344,7 @@ pub fn move_noreplace_with(source: &Path, target: &Path, tool: &MoveTool) -> Res
 /// engine-owned non-directory destination, with the same nesting
 /// recovery as [`move_noreplace_with`].
 pub fn move_replace_nodir_with(source: &Path, target: &Path, tool: &MoveTool) -> Result<()> {
+    cancellation_checkpoint()?;
     let identity = move_identity(source).ok_or(Error::Usage {
         message: "move source has no identity",
     })?;
@@ -1260,13 +1362,7 @@ pub fn move_replace_nodir_with(source: &Path, target: &Path, tool: &MoveTool) ->
         .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
         && move_identity(&nested) == Some(identity)
     {
-        let _ = std::process::Command::new(&tool.bin)
-            .arg(&nested)
-            .arg(source)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let _ = std::fs::rename(&nested, source);
     }
     Err(Error::Usage {
         message: "replace move failed",
@@ -1284,11 +1380,19 @@ pub fn move_noreplace_cached(source: &Path, target: &Path, cache: &mut MoveCache
 /// to `warnings` while reporting success. Callers keep going after
 /// a failure exactly like the shell does past a failed `mkdir`.
 pub fn mkdir_forwarded(path: &Path, warnings: &mut dyn std::io::Write) -> bool {
-    match std::process::Command::new("mkdir")
-        .arg("-p")
-        .arg(path)
-        .output()
-    {
+    if crate::cancellation::check().is_err() {
+        return false;
+    }
+    let mut command = std::process::Command::new("mkdir");
+    command.arg("-p").arg(path);
+    // Plain mkdir leaf, no descendants: Detach skips the host-wide completion
+    // scan; cancellation still takes the strict path.
+    match crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    ) {
         Ok(output) => {
             if !output.status.success() {
                 let _ = warnings.write_all(&output.stderr);
@@ -1316,6 +1420,7 @@ pub fn move_replace_nodir_cached(
 /// existing regular target is replaced only while its no-follow
 /// identity still matches; an absent target uses exclusive creation.
 pub fn publish_prepared_regular(source: &Path, target: &Path, cache: &mut MoveCache) -> Result<()> {
+    cancellation_checkpoint()?;
     let source_meta = std::fs::symlink_metadata(source).map_err(|source| Error::Io {
         context: "stat publish source",
         source,
@@ -1357,6 +1462,7 @@ pub fn publish_prepared_regular(source: &Path, target: &Path, cache: &mut MoveCa
 /// names may be non-UTF8, and the suffix is ASCII.
 fn private_scratch_dir(parent: &Path, prefix: &std::ffi::OsStr) -> Result<PathBuf> {
     for _ in 0..TMP_RETRIES {
+        cancellation_checkpoint()?;
         let mut name = prefix.to_os_string();
         name.push(random_suffix());
         let dir = parent.join(&name);
@@ -1966,4 +2072,42 @@ pub fn apply_git_metadata_modes(root: &Path, mask: u32) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dot_test_support::TempDir;
+
+    #[test]
+    fn leaf_mkdir_runs_without_host_process_snapshot() {
+        let dir = TempDir::new("leaf-mkdir-no-scan").expect("scratch");
+        let target = dir.path().join("nested/dir");
+        let mut warnings = Vec::new();
+        crate::cleanup::reset_global_process_snapshot_calls();
+        assert!(mkdir_forwarded(&target, &mut warnings));
+        assert!(target.is_dir());
+        assert_eq!(
+            crate::cleanup::global_process_snapshot_calls(),
+            0,
+            "deterministic mkdir leaf must not pay a host-wide /proc walk"
+        );
+    }
+
+    #[test]
+    fn leaf_move_runs_without_host_process_snapshot() {
+        let mv = resolve_mv().expect("test requires mv on PATH");
+        let dir = TempDir::new("leaf-move-no-scan").expect("scratch");
+        let source = dir.path().join("source.txt");
+        let target = dir.path().join("target.txt");
+        std::fs::write(&source, b"leaf").expect("fixture");
+        crate::cleanup::reset_global_process_snapshot_calls();
+        assert!(run_mv(&mv, &[], &source, &target));
+        assert!(target.is_file());
+        assert_eq!(
+            crate::cleanup::global_process_snapshot_calls(),
+            0,
+            "deterministic leaf move must not pay a host-wide /proc walk"
+        );
+    }
 }

@@ -69,6 +69,11 @@ pub fn logfile_print(log: &Log, warnings: &mut dyn std::io::Write, label: &str, 
     }
 }
 
+/// Minimum live-tick quantum in seconds: a zero or negative
+/// `$DOT_UI_TICK_SECONDS` must render heartbeats at this rate, never
+/// busy-spin `recv_timeout(ZERO)` at 100% CPU.
+const MIN_TICK_QUANTUM_SECS: f64 = 0.1;
+
 /// Live ticking for [`run_to_log_with_ticks`]: the stage renders on
 /// `out` every `tick_seconds` while the command runs.
 pub struct Live<'a> {
@@ -78,18 +83,6 @@ pub struct Live<'a> {
     pub out: &'a mut dyn std::io::Write,
     /// Poll interval (`$DOT_UI_TICK_SECONDS`).
     pub tick_seconds: f64,
-}
-
-/// Exit code with the shell's signal mapping (128 plus signal).
-fn status_code(status: std::process::ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        return code;
-    }
-    #[cfg(unix)]
-    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
-        return 128 + signal;
-    }
-    1
 }
 
 /// Spawn `argv` with both streams sharing one log handle pair.
@@ -118,19 +111,13 @@ fn run_to_file(log: &Path, argv: &[OsString]) -> i32 {
         Ok(stream) => stream,
         Err(_) => return 127,
     };
-    let child = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
-        .stderr(Stdio::from(stream))
-        .spawn();
-    match child {
-        Ok(mut child) => match child.wait() {
-            Ok(status) => status_code(status),
-            Err(_) => 127,
-        },
-        Err(_) => 127,
-    }
+        .stderr(Stdio::from(stream));
+    crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Strict)
 }
 
 /// Current epoch seconds for heartbeat stamps.
@@ -154,7 +141,7 @@ pub fn run_to_log_with_ticks(log: &Path, argv: &[OsString], live: Option<Live<'_
         out,
         tick_seconds,
     } = live;
-    let tick = Duration::from_secs_f64(tick_seconds.max(0.0));
+    let tick = Duration::from_secs_f64(tick_seconds.max(MIN_TICK_QUANTUM_SECS));
     let (done_tx, done_rx) = mpsc::channel();
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -180,40 +167,55 @@ fn run_to_null(argv: &[OsString]) -> i32 {
     let Some((program, args)) = argv.split_first() else {
         return 0;
     };
-    match std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        Ok(status) => status_code(status),
-        Err(_) => 127,
-    }
+        .stderr(Stdio::null());
+    crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Strict)
 }
 
 /// `_run_quiet_logged`: run `argv`, warning with the labeled log on
-/// failure. Always reports success itself, like the shell's fixed
-/// `return 0`; without a scratch log the command runs silently and
-/// only a nonzero exit warns.
+/// failure. Reports the real command status (handoff finding #6
+/// retired the shell's fixed `return 0`; the caller audit in
+/// `tests/run.rs` pins the zero-production-caller precondition).
+/// Without a scratch log the command runs silently and only a
+/// nonzero exit warns. A failing run retains its log under
+/// `retain_dir` (the [`crate::update_status::logs_dir`] layout)
+/// with bounded rotation; `None` keeps the historical
+/// delete-always behavior. Successful runs always clean up.
 pub fn run_quiet_logged(
     log: &Log,
     warnings: &mut dyn std::io::Write,
     label: &str,
     warning: &str,
     argv: &[OsString],
-) {
+    retain_dir: Option<&Path>,
+) -> i32 {
     let Some(path) = logfile_create() else {
-        if run_to_null(argv) != 0 {
+        let rc = run_to_null(argv);
+        if rc != 0 {
             log.warn(warnings, &format!("  warning: {warning}"));
         }
-        return;
+        return rc;
     };
-    if run_to_log_with_ticks(&path, argv, None) == 0 {
+    let rc = run_to_log_with_ticks(&path, argv, None);
+    if rc == 0 {
         std::fs::remove_file(&path).ok();
-        return;
+        return 0;
     }
     logfile_print(log, warnings, label, &path);
-    std::fs::remove_file(&path).ok();
+    match retain_dir {
+        Some(dir) => {
+            if crate::update_status::retain_failed_log(dir, label, epoch_secs(), &path).is_none() {
+                std::fs::remove_file(&path).ok();
+            }
+        }
+        None => {
+            std::fs::remove_file(&path).ok();
+        }
+    }
     log.warn(warnings, &format!("  warning: {warning}"));
+    rc
 }

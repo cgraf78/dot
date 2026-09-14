@@ -1,6 +1,6 @@
-//! Live-progress formatting leaves (slice 20).
+//! Live-progress formatting helpers.
 //!
-//! Ports the pure helpers from `lib/dot/progress-ui.sh` exactly:
+//! Owns
 //! status colors, ASCII detection, cell fitting, and the summary
 //! phrases the update stages report through. Text flows as bytes:
 //! bash counts string length in characters under a working UTF-8
@@ -255,6 +255,105 @@ pub fn elapsed(seconds_now: i64, started_secs: i64) -> Vec<u8> {
     format!("{}s", seconds_now - started_secs).into_bytes()
 }
 
+/// Normalize only elapsed stamps in captured progress output for
+/// shell/Rust differential tests.  Progress rows end with `Ns`; the
+/// completion summaries spell the same value as `Done in Ns.` or
+/// `Done with errors in Ns.`. Other
+/// numbers — including counts, diagnostics, labels, and ordering —
+/// remain byte-significant.
+pub fn normalize_elapsed(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut line_start = 0;
+    while line_start < bytes.len() {
+        let line_end = bytes[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |offset| line_start + offset);
+        let line = &bytes[line_start..line_end];
+        if is_progress_row(line) {
+            normalize_stage_elapsed(line, &mut normalized);
+        } else {
+            normalize_done_elapsed(line, &mut normalized);
+        }
+        if line_end < bytes.len() {
+            normalized.push(b'\n');
+        }
+        line_start = line_end.saturating_add(1);
+    }
+    normalized
+}
+
+/// True only for the progress-line prefix `[<digits>/<digits>] `.
+fn is_progress_row(line: &[u8]) -> bool {
+    let Some(after_open) = line.strip_prefix(b"[") else {
+        return false;
+    };
+    let index_digits = after_open
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if index_digits == 0 || after_open.get(index_digits) != Some(&b'/') {
+        return false;
+    }
+    let after_slash = &after_open[index_digits + 1..];
+    let total_digits = after_slash
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    total_digits > 0
+        && after_slash.get(total_digits) == Some(&b']')
+        && after_slash.get(total_digits + 1) == Some(&b' ')
+}
+
+/// Copy one bracketed stage row, replacing its trailing fixed-width elapsed field.
+fn normalize_stage_elapsed(line: &[u8], normalized: &mut Vec<u8>) {
+    let Some(space) = line.iter().rposition(|byte| *byte == b' ') else {
+        normalized.extend_from_slice(line);
+        return;
+    };
+    let stamp = &line[space + 1..];
+    if stamp.len() > 1
+        && stamp[..stamp.len() - 1]
+            .iter()
+            .all(|byte| byte.is_ascii_digit())
+        && stamp.last() == Some(&b's')
+    {
+        // The renderer right-aligns this field. Crossing `9s` to `11s`
+        // therefore changes both the token and one padding byte.
+        let field_start = line[..space]
+            .iter()
+            .rposition(|byte| *byte != b' ')
+            .map_or(0, |index| index + 1);
+        normalized.extend_from_slice(&line[..field_start]);
+        normalized.extend_from_slice(b" @ELAPSED@");
+    } else {
+        normalized.extend_from_slice(line);
+    }
+}
+
+/// Copy a completion row, replacing only its success/failure elapsed value.
+fn normalize_done_elapsed(line: &[u8], normalized: &mut Vec<u8>) {
+    let Some(prefix) = [b"Done in ".as_slice(), b"Done with errors in ".as_slice()]
+        .into_iter()
+        .find(|prefix| line.starts_with(prefix))
+    else {
+        normalized.extend_from_slice(line);
+        return;
+    };
+    let stamp = &line[prefix.len()..];
+    let digits = stamp
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits > 0 && stamp[digits..].starts_with(b"s.") {
+        normalized.extend_from_slice(prefix);
+        normalized.extend_from_slice(b"Ns.");
+        normalized.extend_from_slice(&stamp[digits + 2..]);
+    } else {
+        normalized.extend_from_slice(line);
+    }
+}
+
 /// `_ui_now_ms`: millisecond clock for durations. `date_output` is the
 /// command-substitution-stripped `date +%s%3N` read (empty when `date`
 /// is missing or its `%3N` is unsupported, like BSD `date`); pure
@@ -282,27 +381,23 @@ pub fn live_enabled(quiet: bool, stdout_is_tty: bool, force_live: Option<&str>) 
 /// success — empty when `jq` cannot spawn or the filter fails (the
 /// shell's `2>/dev/null` plus empty-on-error contract).
 fn json_via_jq(key: &str, line: &[u8], filter: &str) -> Vec<u8> {
-    use std::io::Write as _;
-    let mut child = match std::process::Command::new("jq")
+    let mut command = std::process::Command::new("jq");
+    command
         .arg("-r")
         .arg("--arg")
         .arg("k")
         .arg(key)
         .arg(filter)
-        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return Vec::new(),
-    };
-    let fed = child
-        .stdin
-        .as_mut()
-        .is_some_and(|stdin| stdin.write_all(line).is_ok());
-    match child.wait_with_output() {
-        Ok(output) if fed && output.status.success() => output.stdout,
+        .stderr(std::process::Stdio::null());
+    match crate::cleanup::run_session_output_with_input(
+        command,
+        line,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    ) {
+        Ok(output) if output.status.success() => output.stdout,
         _ => Vec::new(),
     }
 }
@@ -636,9 +731,31 @@ fn parse_width(text: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
+/// Replace ASCII control bytes and DEL with spaces so untrusted text
+/// (provider event strings, dirty filenames) cannot break line
+/// protocols or inject terminal escapes at the render boundary.
+/// Non-ASCII bytes pass through untouched, preserving UTF-8 labels.
+pub fn sanitize_untrusted_text(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_control() || *byte == 0x7f {
+                b' '
+            } else {
+                *byte
+            }
+        })
+        .collect()
+}
+
 /// `_ui_progress_bar`: `[###---] done/total` with ASCII or block
 /// glyphs. A non-positive total prints nothing; a malformed width
 /// reads empty the way the shell arithmetic error does.
+///
+/// `done` arrives from untrusted provider JSONL with the full `i64`
+/// range, so the fill math saturates and clamps to `[0, width]`:
+/// a hostile or underflowed negative can never hang, OOM, or panic
+/// this renderer (the bar stays within its width cells).
 pub fn progress_bar(done: i64, total: i64, width: &str, ascii: bool) -> Vec<u8> {
     if total <= 0 {
         return Vec::new();
@@ -647,17 +764,18 @@ pub fn progress_bar(done: i64, total: i64, width: &str, ascii: bool) -> Vec<u8> 
         Some(width) => width,
         None => return Vec::new(),
     };
-    let mut filled = done * width as i64 / total;
-    if filled > width as i64 {
-        filled = width as i64;
-    }
-    let empty = width as i64 - filled;
+    let width_cells = width as i64;
+    let filled = done
+        .saturating_mul(width_cells)
+        .saturating_div(total)
+        .clamp(0, width_cells);
+    let empty = width_cells - filled;
     let (fill_char, empty_char) = if ascii { ("#", "-") } else { ("━", "·") };
     let mut bar = String::new();
-    for _ in 0..filled.max(0) {
+    for _ in 0..filled {
         bar.push_str(fill_char);
     }
-    for _ in 0..empty.max(0) {
+    for _ in 0..empty {
         bar.push_str(empty_char);
     }
     let done_text = done.to_string();

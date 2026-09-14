@@ -1,6 +1,6 @@
-//! Reserved control-plane path predicates (slice 2 foundations).
+//! Reserved control-plane path predicates.
 //!
-//! Ports `lib/dot/reserved.sh` exactly: the lexical `_dot_path_within`
+//! Owns lexical containment,
 //! test, overlay control-path rules, init-recovery sentinels,
 //! absolute-path normalization, physical (symlink-resolved) directory
 //! and leaf candidates, per-root canonicalization, the reserved-roots
@@ -134,9 +134,7 @@ pub fn normalize_absolute_path(input: &str, pwd: &str) -> Result<String, Error> 
     Ok(out)
 }
 
-/// `dev:ino` identity for TOCTOU re-validation. `temp.sh` owns
-/// `_dot_path_identity`; this private copy keeps the foundations PR
-/// self-contained until the transactions module lands and re-homes it.
+/// `dev:ino` identity for TOCTOU re-validation.
 #[cfg(unix)]
 fn dev_ino(path: &Path) -> std::io::Result<String> {
     use std::os::unix::fs::MetadataExt;
@@ -239,10 +237,15 @@ pub fn physical_leaf_candidate(path: &str, pwd: &str) -> Result<LeafCandidate, E
 /// failing `realpath` falls through to the ancestor walk, which is
 /// the shell's `||` fallback verbatim.
 fn realpath_leaf(path: &str) -> Option<String> {
-    let output = std::process::Command::new("realpath")
-        .arg(path)
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("realpath");
+    command.arg(path);
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Strict,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -260,12 +263,13 @@ fn realpath_leaf(path: &str) -> Option<String> {
 pub fn reserved_root(requested: &str, pwd: &str) -> Result<Vec<String>, Error> {
     let normalized = normalize_absolute_path(requested, pwd)?;
     let mut roots = vec![normalized.clone()];
-    let physical =
-        if std::fs::symlink_metadata(&normalized).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            realpath_leaf(&normalized)
-        } else {
-            physical_directory_candidate(&normalized, pwd).ok()
-        };
+    let physical = if std::fs::symlink_metadata(&normalized)
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        realpath_leaf(&normalized).or_else(|| physical_directory_candidate(&normalized, pwd).ok())
+    } else {
+        physical_directory_candidate(&normalized, pwd).ok()
+    };
     // No let-chains (MSRV 1.85): nested `if`s instead.
     if let Some(physical) = physical {
         if physical != normalized {
@@ -495,7 +499,7 @@ mod tests {
 
     #[test]
     fn reserved_root_resolves_leaf_symlinks_like_realpath() {
-        let dir = crate::test_support::TempDir::new("reserved-root").expect("temp");
+        let dir = dot_test_support::TempDir::new("reserved-root").expect("temp");
         let pwd = dir.path().to_string_lossy().into_owned();
         let link_name = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
         let real = dir.path().join("real");
