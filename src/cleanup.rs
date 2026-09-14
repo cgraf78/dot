@@ -1,31 +1,14 @@
-//! Owned-resource cleanup registry (slice 3).
+//! Owned resources and POSIX process lifecycle.
 //!
-//! Ports the GUARANTEES of `lib/dot/resources.sh`, not its Bash
-//! machinery. The shell tracks PIDs (with procfs start-tick identities
-//! against reuse), temp paths, and fds in parallel arrays, then tears
-//! down TERM-first with bounded KILL escalation exactly once. None of
-//! that machinery exists in Rust — no job tables, no `BASHPID`, no
-//! coprocs — and none of it is needed:
+//! Registry owns explicitly registered children, files and temporary paths.
+//! Callers invoke its idempotent cleanup; scoped owners provide Drop where
+//! required. Native suite supervision additionally reserves each session
+//! leader until descendant teardown completes, then reaps through Child.
 //!
-//! - Owned children are tracked as [`std::process::Child`] HANDLES, not
-//!   PIDs. Handle ownership makes PID reuse impossible by construction,
-//!   so procfs observation, `pgrep` descendant discovery, and start-tick
-//!   identities are out of scope (they only exist to approximate what a
-//!   handle states outright).
-//! - Liveness polling uses [`std::process::Child::try_wait`] (free,
-//!   race-free reaping). Only signal DELIVERY needs help: std exposes
-//!   SIGKILL via [`std::process::Child::kill`] but not SIGTERM, so the
-//!   TERM grace step shells out to the `kill` CLI — one spawn per child
-//!   on the rare cleanup path, no new dependency (the engine already
-//!   requires `kill`, `sleep`, and friends).
-//! - Temp paths are removed with symlink-aware semantics matching
-//!   `rm -rf` (a symlink removes the LINK, never the target).
-//!
-//! Explicitly EXCLUDED (later slices, each documented at its call site):
-//! trap installation (needs a signal-handler story), process-group
-//! isolation (needs a `setpgid` story), the mktemp coproc allocator
-//! (temp slice: direct atomic creation needs no coproc), and
-//! FOREIGN-pid liveness probing (update-lock slice).
+//! std owns spawn, file I/O and reaping. This module centralizes the small
+//! libc boundary for signal handlers, session identity, non-reaping waitid,
+//! descendant adoption, and TERM/group delivery, which std does not expose. Handler callbacks
+//! only publish an atomic cancellation flag; resource cleanup runs normally.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -175,19 +158,681 @@ fn remove_one(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Send SIGTERM via the shell's `kill` builtin (std cannot address
-/// SIGTERM, and the external `kill` binary is absent from minimal
-/// images where the shell still works). Failures are best-effort
-/// (`|| true` in the shell): the grace loop and KILL escalation below
-/// handle uncooperative children. The pid is a u32, so no quoting is
-/// needed.
+/// Send TERM to a registered child before bounded grace and KILL escalation.
 fn terminate(pid: u32) {
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(format!("kill -TERM {pid}"))
-        .stdout(Stdio::null())
+    signal_pid(pid, libc::SIGTERM);
+}
+
+/// Deliver a signal to a positive process identity held by the caller.
+pub(crate) fn signal_pid(pid: u32, signal: i32) {
+    if let Some(pid) = i32::try_from(pid).ok().filter(|pid| *pid > 0) {
+        // SAFETY: positive PID, no pointer arguments. Callers retain ownership.
+        unsafe { libc::kill(pid, signal) };
+    }
+}
+
+/// Deliver a signal to the group of an unreaped owned leader.
+pub(crate) fn signal_group(pid: u32, signal: i32) {
+    if let Some(pid) = i32::try_from(pid).ok().filter(|pid| *pid > 0) {
+        // SAFETY: only the explicitly owned group is addressed.
+        unsafe { libc::kill(-pid, signal) };
+    }
+}
+
+/// Effective process identity, never an environment-provided value.
+pub(crate) fn euid() -> u32 {
+    // SAFETY: get effective uid has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+/// Conservative foreign-process liveness for stale-directory pruning.
+pub(crate) fn alive(pid: i32) -> bool {
+    // SAFETY: positive PID and signal zero only probe existence.
+    pid > 0
+        && (unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+const SIGNAL_CLOSED: i32 = -1;
+static INTERRUPTED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static ACTIVE_HANDLERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SIGNAL_OWNER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const HANDLED_SIGNALS: [i32; 4] = [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
+
+extern "C" fn interrupted(signal: i32) {
+    // A signal handler must neither allocate nor lock nor touch owned resources.
+    ACTIVE_HANDLERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let _ = INTERRUPTED.compare_exchange(
+        0,
+        signal,
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    ACTIVE_HANDLERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Process-local handler guard. Process-wide dispositions admit only one owner
+/// even when public command entry points are invoked by concurrent threads.
+pub(crate) struct Signals {
+    previous: Vec<(i32, libc::sigaction)>,
+    _owner: Option<std::sync::MutexGuard<'static, ()>>,
+    restore: bool,
+    active: bool,
+}
+
+impl Signals {
+    #[cfg(test)]
+    pub(crate) fn install() -> std::io::Result<Self> {
+        Self::install_with_restore(true)
+    }
+
+    /// Own signals only for a real process entry. Embedded invocations are
+    /// signal-neutral and isolate through [`crate::app::run`] instead.
+    pub(crate) fn for_runtime(runtime: &crate::app::Runtime) -> std::io::Result<Self> {
+        if runtime.is_process_entry() {
+            Self::install_with_restore(false)
+        } else {
+            Ok(Self {
+                previous: Vec::new(),
+                _owner: None,
+                restore: false,
+                active: false,
+            })
+        }
+    }
+
+    fn install_with_restore(restore: bool) -> std::io::Result<Self> {
+        let owner = SIGNAL_OWNER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        INTERRUPTED.store(0, std::sync::atomic::Ordering::SeqCst);
+        let mut guard = Self {
+            previous: Vec::new(),
+            _owner: Some(owner),
+            // A partial install must restore what it changed on error. Switch
+            // to process-lifetime ownership only after all actions succeed.
+            restore: true,
+            active: true,
+        };
+        for signal in HANDLED_SIGNALS {
+            // SAFETY: zero initialization is valid for sigaction, the mask is
+            // initialized explicitly, and saved actions outlive each call.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                let mut previous: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = interrupted as *const () as usize;
+                libc::sigemptyset(&mut action.sa_mask);
+                if libc::sigaction(signal, &action, &mut previous) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                guard.previous.push((signal, previous));
+            }
+        }
+        guard.restore = restore;
+        Ok(guard)
+    }
+
+    pub(crate) fn received(&self) -> Option<i32> {
+        self.active.then(received_signal).flatten()
+    }
+
+    /// Wrap an output sink so a handled signal can break a blocked write.
+    pub(crate) fn writer<'a>(&'a self, inner: &'a mut dyn std::io::Write) -> SignalWriter<'a> {
+        SignalWriter {
+            inner,
+            signals: self,
+        }
+    }
+
+    /// Restore the caller's dispositions and return the final command status
+    /// without losing a signal in the load-versus-restore window.
+    pub(crate) fn finish(self, code: i32) -> i32 {
+        self.finish_signal().map_or(code, |signal| 128 + signal)
+    }
+
+    /// Preserve an operational error unless cancellation owns the result.
+    /// This keeps fallible rendering and cleanup paths from dropping a signal.
+    pub(crate) fn finish_result<E>(
+        self,
+        result: std::result::Result<i32, E>,
+    ) -> std::result::Result<i32, E> {
+        match self.finish_signal() {
+            Some(signal) => Ok(128 + signal),
+            None => result,
+        }
+    }
+
+    fn finish_signal(mut self) -> Option<i32> {
+        self.close()
+    }
+
+    fn close(&mut self) -> Option<i32> {
+        if !self.active {
+            return None;
+        }
+        // Stop new callbacks before closing the latch. A callback already in
+        // flight remains allowed to publish the first signal, so a delivery
+        // immediately before the disposition change cannot disappear.
+        self.ignore();
+        // `sigaction(SIG_IGN)` prevents new callbacks and discards pending
+        // instances. Wait for callbacks that were already executing before a
+        // subsequent guard can reset the process-global latch.
+        while ACTIVE_HANDLERS.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
+        }
+        let received = match INTERRUPTED.swap(SIGNAL_CLOSED, std::sync::atomic::Ordering::SeqCst) {
+            signal if signal > 0 => Some(signal),
+            _ => None,
+        };
+        if self.restore {
+            self.restore();
+        } else {
+            // The binary exits immediately after returning the final status.
+            // Keep later handled signals ignored instead of reopening a race
+            // between restored dispositions and `process::exit`.
+            self.previous.clear();
+        }
+        self.active = false;
+        received
+    }
+
+    fn ignore(&self) {
+        for &(signal, _) in &self.previous {
+            // SAFETY: zero initialization is valid for sigaction; SIG_IGN is
+            // the standard disposition and every signal is handled above.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = libc::SIG_IGN;
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(signal, &action, std::ptr::null_mut());
+            }
+        }
+    }
+
+    fn restore(&mut self) {
+        for (signal, action) in self.previous.drain(..) {
+            // SAFETY: restore the exact initialized action saved at install.
+            unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };
+        }
+    }
+}
+
+/// A writer that turns a latched signal into a non-retriable I/O error.
+///
+/// `write_all` retries `Interrupted`, so returning that error kind would leave
+/// a command stuck when its consumer stops reading. `Other` escapes the retry
+/// loop; the owning [`Signals`] guard then converts the command result to the
+/// conventional signal status.
+pub(crate) struct SignalWriter<'a> {
+    inner: &'a mut dyn std::io::Write,
+    signals: &'a Signals,
+}
+
+impl std::io::Write for SignalWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.signals.received().is_some() {
+            return Err(signal_io_error());
+        }
+        match self.inner.write(bytes) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted
+                    && self.signals.received().is_some() =>
+            {
+                Err(signal_io_error())
+            }
+            result => result,
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.signals.received().is_some() {
+            return Err(signal_io_error());
+        }
+        match self.inner.flush() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted
+                    && self.signals.received().is_some() =>
+            {
+                Err(signal_io_error())
+            }
+            result => result,
+        }
+    }
+}
+
+fn signal_io_error() -> std::io::Error {
+    std::io::Error::other("interrupted by signal")
+}
+
+/// Return the signal captured by the invocation owner, if any.
+///
+/// Worker threads cannot borrow the guard that owns the process handler, but
+/// they must still stop their isolated child sessions before the top-level
+/// command returns the conventional `128 + signal` status.
+pub(crate) fn received_signal() -> Option<i32> {
+    match INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+        signal if signal > 0 => Some(signal),
+        _ => None,
+    }
+}
+
+impl Drop for Signals {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+/// Start a child session before exec; all work in this post-fork closure is
+/// async-signal-safe. No allocation or Rust runtime operation runs there.
+pub(crate) fn isolate(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: setsid has no memory arguments and is safe between fork/exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+/// Adopt orphaned suite descendants so their lifecycle never depends on an
+/// outer init process reaping promptly. Other Unix platforms reap through
+/// their init process because Linux's subreaper facility is not available.
+pub(crate) fn adopt_descendants() -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // SAFETY: prctl has no pointer arguments for PR_SET_CHILD_SUBREAPER.
+        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Observe a child's exit without releasing its PID/session identity. A
+/// retained zombie leader prevents reuse throughout descendant teardown.
+pub(crate) fn exited(child: &Child) -> std::io::Result<bool> {
+    // SAFETY: siginfo is initialized; waitid writes only this local value.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        if libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        ) != 0
+        {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        Ok(info.si_pid() != 0)
+    }
+}
+
+/// Snapshot all live processes once per polling pass, so a busy first session
+/// cannot consume the discovery budget allocated to later workers.
+fn process_snapshot(deadline: Instant) -> Option<Vec<(u32, u32, bool)>> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        let mut members = Vec::new();
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read(entry.path().join("stat")) else {
+                continue;
+            };
+            let end = stat.windows(2).rposition(|part| part == b") ")?;
+            let fields: Vec<_> = stat[end + 2..]
+                .split(|byte| byte.is_ascii_whitespace())
+                .filter(|field| !field.is_empty())
+                .collect();
+            let sid = fields
+                .get(3)
+                .and_then(|field| std::str::from_utf8(field).ok())
+                .and_then(|field| field.parse::<u32>().ok());
+            if let Some(sid) = sid {
+                members.push((pid, sid, fields.first() != Some(&b"Z".as_slice())));
+            }
+        }
+        return Some(members);
+    }
+    // This is an OS process-table interface, not a caller-selected tool.
+    #[cfg(target_os = "android")]
+    let mut command = Command::new("/system/bin/ps");
+    #[cfg(not(target_os = "android"))]
+    let mut command = Command::new("/bin/ps");
+    command.args(["-A", "-o", "pid=,stat="]);
+    let bytes = snapshot(command, deadline)?;
+    Some(
+        String::from_utf8(bytes)
+            .ok()?
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next()?.parse::<u32>().ok()?;
+                let live = !fields.next()?.starts_with('Z');
+                session_id(pid).map(|sid| (pid, sid, live))
+            })
+            .collect(),
+    )
+}
+
+fn same_session(pid: u32, sid: u32) -> bool {
+    session_id(pid) == Some(sid)
+}
+
+fn session_id(pid: u32) -> Option<u32> {
+    // SAFETY: getsid is an observation with no pointer arguments.
+    let sid = unsafe { libc::getsid(pid as i32) };
+    u32::try_from(sid).ok()
+}
+
+fn process_group(pid: u32) -> Option<u32> {
+    // SAFETY: getpgid is an observation with no pointer arguments.
+    let group = unsafe { libc::getpgid(pid as i32) };
+    u32::try_from(group).ok()
+}
+
+/// Capture a portable process snapshot without a blocking pipe reader thread.
+fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().ok()?;
+    reader.set_nonblocking(true).ok()?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
         .stderr(Stdio::null())
-        .status();
+        .spawn()
+        .ok()?;
+    // Command retains configured descriptors after spawn; release our writer
+    // so child EOF is observable instead of timing out every valid snapshot.
+    drop(command);
+    let mut bytes = Vec::new();
+    let mut reader = reader;
+    use std::io::Read as _;
+    loop {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        let mut chunk = [0; 8192];
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    // EOF is independent of process exit: a helper may close stdout early.
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success().then_some(bytes),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Stop all still-owned session members, including descendants that created
+/// another process group. Keep the leader unreaped until the final signal.
+pub(crate) fn stop_session(
+    child: &mut Child,
+    first_signal: i32,
+) -> std::io::Result<std::process::ExitStatus> {
+    stop_sessions(std::slice::from_mut(child), first_signal)
+        .pop()
+        .expect("one owned child")
+}
+
+/// Stop a worker wave under one shared grace deadline. Each retained child
+/// reserves its own SID until every final signal has been delivered.
+pub(crate) fn stop_sessions(
+    children: &mut [Child],
+    first_signal: i32,
+) -> Vec<std::io::Result<std::process::ExitStatus>> {
+    // The budget starts before discovery: degraded BSD ps probes must not
+    // allocate a fresh second for every worker or every polling pass.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut sessions: Vec<_> = children
+        .iter()
+        .map(|child| Session {
+            leader: child.id(),
+            members: std::collections::BTreeSet::new(),
+            signaled: std::collections::BTreeSet::new(),
+            group_signaled: false,
+        })
+        .collect();
+    // Start graceful shutdown immediately. Session discovery must not consume
+    // the grace budget before the owned leader and its original group see the
+    // first signal.
+    for session in &mut sessions {
+        session.signal_group_once(first_signal);
+    }
+    let mut consecutive_empty = 0;
+    loop {
+        let observed = observe_sessions(&mut sessions, deadline);
+        if sessions_stably_empty(observed, &mut consecutive_empty) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            for session in &sessions {
+                session.signal_all(libc::SIGKILL);
+            }
+            break;
+        }
+        if observed.is_some() {
+            for session in &mut sessions {
+                session.signal_new(first_signal);
+            }
+        } else {
+            for session in &mut sessions {
+                session.signal_group_once(first_signal);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let results = children.iter_mut().map(Child::wait).collect();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let pending = sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.leader,
+                    session
+                        .members
+                        .iter()
+                        .copied()
+                        .filter(|&pid| pid != session.leader)
+                        .collect(),
+                )
+            })
+            .collect();
+        let reap_deadline =
+            Instant::now() + Duration::from_millis(GRACE_ATTEMPTS as u64 * GRACE_INTERVAL_MS);
+        reap_sessions(
+            pending,
+            reap_deadline,
+            |leader, pid| same_session(pid, leader),
+            wait_member,
+        );
+    }
+    results
+}
+
+/// Require two complete snapshots without a live session member. Process-table
+/// enumeration is not atomic: a member can fork a replacement and exit between
+/// entries, making one pass appear empty even though the owned session remains
+/// active. An unavailable snapshot is likewise not evidence of quiescence.
+fn sessions_stably_empty(observed: Option<bool>, consecutive_empty: &mut u8) -> bool {
+    if observed == Some(true) {
+        *consecutive_empty = consecutive_empty.saturating_add(1);
+    } else {
+        *consecutive_empty = 0;
+    }
+    *consecutive_empty >= 2
+}
+
+fn observe_sessions(sessions: &mut [Session], deadline: Instant) -> Option<bool> {
+    let processes = process_snapshot(deadline)?;
+    let mut finished = true;
+    for session in sessions {
+        for &(pid, sid, live) in &processes {
+            if sid == session.leader {
+                session.members.insert(pid);
+                finished &= !live;
+            }
+        }
+    }
+    Some(finished)
+}
+
+/// A retained leader reserves the SID; remembered members keep KILL delivery
+/// independent of a degraded or exhausted portable snapshot helper budget.
+struct Session {
+    leader: u32,
+    members: std::collections::BTreeSet<u32>,
+    signaled: std::collections::BTreeSet<u32>,
+    group_signaled: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+enum WaitState {
+    Reaped,
+    Running,
+    Interrupted,
+    NotChild,
+    Terminal,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn wait_member(pid: u32) -> WaitState {
+    // SAFETY: waitpid receives no status pointer, never blocks, and targets
+    // only an exact cached session member.
+    let waited = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
+    if waited > 0 {
+        WaitState::Reaped
+    } else if waited == 0 {
+        WaitState::Running
+    } else {
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => WaitState::Interrupted,
+            Some(libc::ECHILD) => WaitState::NotChild,
+            _ => WaitState::Terminal,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn reap_sessions(
+    mut sessions: Vec<(u32, Vec<u32>)>,
+    deadline: Instant,
+    mut belongs: impl FnMut(u32, u32) -> bool,
+    mut wait: impl FnMut(u32) -> WaitState,
+) {
+    while !sessions.is_empty() && Instant::now() < deadline {
+        for (leader, pending) in &mut sessions {
+            let mut next = Vec::new();
+            let mut not_children = Vec::new();
+            let mut progress = false;
+            let mut child_pending = false;
+            let mut interrupted = false;
+            for pid in pending.drain(..) {
+                if !belongs(*leader, pid) {
+                    continue;
+                }
+                match wait(pid) {
+                    WaitState::Reaped => progress = true,
+                    WaitState::Running => {
+                        child_pending = true;
+                        next.push(pid);
+                    }
+                    WaitState::Interrupted => {
+                        interrupted = true;
+                        next.push(pid);
+                    }
+                    // A grandchild can become ours only after its intermediate
+                    // parent is reaped later in this pass.
+                    WaitState::NotChild => not_children.push(pid),
+                    WaitState::Terminal => {}
+                }
+            }
+            if progress || child_pending || interrupted {
+                next.extend(not_children);
+            }
+            *pending = next;
+        }
+        sessions.retain(|(_, pending)| !pending.is_empty());
+        if !sessions.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Session {
+    fn signal_group_once(&mut self, signal: i32) {
+        if !self.group_signaled {
+            signal_group(self.leader, signal);
+            self.group_signaled = true;
+            self.signaled.insert(self.leader);
+        }
+    }
+
+    fn signal_new(&mut self, signal: i32) {
+        let pending: Vec<_> = self.members.difference(&self.signaled).copied().collect();
+        for pid in pending {
+            if same_session(pid, self.leader) {
+                // The initial group delivery already reached every member of
+                // the leader's original process group. Signal only members
+                // that escaped into another group, exactly once.
+                match process_group(pid) {
+                    Some(group) if group == self.leader => {
+                        self.signaled.insert(pid);
+                    }
+                    Some(_) => {
+                        signal_pid(pid, signal);
+                        self.signaled.insert(pid);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    fn signal_all(&self, signal: i32) {
+        signal_group(self.leader, signal);
+        for &pid in &self.members {
+            // Duplicate KILL is harmless; revalidate only the session so a
+            // member that changed process groups during grace cannot escape.
+            if same_session(pid, self.leader) {
+                signal_pid(pid, signal);
+            }
+        }
+    }
 }
 
 /// TERM grace, then KILL escalation, then reap — mirroring
@@ -228,6 +873,322 @@ fn terminate_children(children: &mut Vec<Child>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_finish_keeps_first_signal_during_a_late_burst() {
+        const HELPER: &str = "DOT_SIGNAL_FINISH_BURST_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cleanup::tests::signal_finish_keeps_first_signal_during_a_late_burst",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "signal-finalization helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // A sender can observe the old latch immediately before close and
+        // issue one final TERM after restoration. Make that post-boundary
+        // delivery harmless; the test is about signals owned by the guard.
+        // SAFETY: SIG_IGN is a valid process disposition in this helper.
+        unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+        let signals = Signals::install().unwrap();
+        // SAFETY: this process installed a handler for this valid signal.
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        assert_eq!(signals.received(), Some(libc::SIGHUP));
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let sender_barrier = barrier.clone();
+        let sender = std::thread::spawn(move || {
+            sender_barrier.wait();
+            while INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) != SIGNAL_CLOSED {
+                // SAFETY: getpid returns this live process and SIGTERM is valid.
+                unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+            }
+        });
+        barrier.wait();
+        let code = signals.finish(0);
+        sender.join().unwrap();
+        assert_eq!(code, 128 + libc::SIGHUP);
+    }
+
+    #[test]
+    fn signal_guards_serialize_process_wide_ownership() {
+        const HELPER: &str = "DOT_SIGNAL_OWNER_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cleanup::tests::signal_guards_serialize_process_wide_ownership",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "signal-owner helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let first = Signals::install().unwrap();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (installed_tx, installed_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let guard = Signals::install().unwrap();
+            installed_tx.send(()).unwrap();
+            drop(guard);
+        });
+        attempted_rx.recv().unwrap();
+        let installed_while_owned = installed_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_ok();
+        drop(first);
+        if !installed_while_owned {
+            installed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        second.join().unwrap();
+        assert!(
+            !installed_while_owned,
+            "overlapping guards replaced the process-global signal owner"
+        );
+    }
+
+    #[test]
+    fn process_signal_guard_keeps_handlers_closed_until_exit() {
+        const HELPER: &str = "DOT_PROCESS_SIGNAL_OWNER_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cleanup::tests::process_signal_guard_keeps_handlers_closed_until_exit",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "process-signal helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let signals = Signals::install_with_restore(false).unwrap();
+        // SAFETY: the guard owns both valid handled signals.
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        assert_eq!(signals.finish(0), 128 + libc::SIGHUP);
+        // A second signal in the small return-to-process::exit window must not
+        // replace the first status or invoke a restored default disposition.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+    }
+
+    #[test]
+    fn snapshot_observes_every_session_when_first_remains_active() {
+        let mut children = Vec::new();
+        for _ in 0..2 {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            isolate(&mut command);
+            children.push(command.spawn().unwrap());
+        }
+        let mut sessions: Vec<_> = children
+            .iter()
+            .map(|child| Session {
+                leader: child.id(),
+                members: std::collections::BTreeSet::new(),
+                signaled: std::collections::BTreeSet::new(),
+                group_signaled: false,
+            })
+            .collect();
+        assert_eq!(
+            observe_sessions(&mut sessions, Instant::now() + Duration::from_secs(1)),
+            Some(false)
+        );
+        let observed: Vec<_> = sessions
+            .iter()
+            .map(|session| session.members.contains(&session.leader))
+            .collect();
+        for child in &mut children {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert_eq!(observed, [true, true]);
+    }
+
+    #[test]
+    fn session_shutdown_requires_stable_empty_snapshots() {
+        let mut consecutive_empty = 0;
+
+        assert!(!sessions_stably_empty(Some(true), &mut consecutive_empty));
+        assert_eq!(consecutive_empty, 1);
+        assert!(!sessions_stably_empty(Some(false), &mut consecutive_empty));
+        assert_eq!(consecutive_empty, 0);
+        assert!(!sessions_stably_empty(Some(true), &mut consecutive_empty));
+        assert!(!sessions_stably_empty(None, &mut consecutive_empty));
+        assert_eq!(consecutive_empty, 0);
+        assert!(!sessions_stably_empty(Some(true), &mut consecutive_empty));
+        assert!(sessions_stably_empty(Some(true), &mut consecutive_empty));
+    }
+
+    #[test]
+    fn snapshot_wave_consumes_one_absolute_deadline() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(250);
+        for _ in 0..3 {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            assert!(snapshot(command, deadline).is_none());
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "each snapshot renewed the cancellation budget"
+        );
+    }
+
+    #[test]
+    fn snapshot_collects_successful_process_output() {
+        let mut command = Command::new(dot_test_support::bash());
+        command.args(["-c", "printf 'snapshot\\n'"]);
+        assert_eq!(
+            snapshot(command, Instant::now() + Duration::from_secs(1)),
+            Some(b"snapshot\n".to_vec())
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn reap_deadline_does_not_wait_for_a_still_running_member() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let leader = session_id(pid).unwrap();
+        let started = Instant::now();
+        reap_sessions(
+            vec![(leader, vec![pid])],
+            started + Duration::from_millis(50),
+            |leader, pid| same_session(pid, leader),
+            wait_member,
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn reap_retries_not_child_after_adoption_progress() {
+        let mut calls = Vec::new();
+        let mut grandchild_calls = 0;
+        reap_sessions(
+            vec![(1, vec![10, 20])],
+            Instant::now() + Duration::from_secs(1),
+            |_, _| true,
+            |pid| {
+                calls.push(pid);
+                if pid == 10 {
+                    grandchild_calls += 1;
+                    if grandchild_calls == 1 {
+                        WaitState::NotChild
+                    } else {
+                        WaitState::Reaped
+                    }
+                } else {
+                    WaitState::Reaped
+                }
+            },
+        );
+        assert_eq!(calls, [10, 20, 10]);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn reap_retries_interrupted_wait() {
+        let mut calls = 0;
+        reap_sessions(
+            vec![(1, vec![10])],
+            Instant::now() + Duration::from_secs(1),
+            |_, _| true,
+            |_| {
+                calls += 1;
+                if calls == 1 {
+                    WaitState::Interrupted
+                } else {
+                    WaitState::Reaped
+                }
+            },
+        );
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn reap_pass_visits_later_sessions_when_an_earlier_member_runs() {
+        let mut calls = Vec::new();
+        reap_sessions(
+            vec![(1, vec![10]), (2, vec![20])],
+            Instant::now() + Duration::from_millis(30),
+            |_, _| true,
+            |pid| {
+                calls.push(pid);
+                if pid == 10 {
+                    WaitState::Running
+                } else {
+                    WaitState::Reaped
+                }
+            },
+        );
+        assert!(calls.starts_with(&[10, 20]));
+    }
+
+    #[test]
+    fn snapshot_deadline_covers_child_that_closes_stdout_early() {
+        let root = dot_test_support::TempDir::new("snapshot-deadline").unwrap();
+        let marker = root.path().join("pid");
+        let mut command = Command::new(dot_test_support::bash());
+        command
+            .args([
+                "-c",
+                "echo $$ >\"$1\"; exec >/dev/null; exec sleep 30",
+                "snapshot",
+            ])
+            .arg(&marker);
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send.send(snapshot(command, Instant::now() + Duration::from_secs(1)))
+                .unwrap();
+        });
+        let observed = receive.recv_timeout(Duration::from_secs(3));
+        if observed.is_err() {
+            // The regression must clean the exact helper even on RED.
+            let pid = std::fs::read_to_string(&marker)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            signal_pid(pid, libc::SIGKILL);
+        }
+        worker.join().unwrap();
+        assert!(
+            observed.is_ok(),
+            "snapshot EOF bypassed the bounded child wait"
+        );
+        assert!(observed.unwrap().is_none());
+    }
 
     #[test]
     fn pid_and_group_rules_match_shell() {

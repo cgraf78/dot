@@ -1,21 +1,9 @@
-//! Test-coordinator scheduling decisions from `lib/dot/test.sh`,
-//! `lib/dot/test/runner.sh`, and `lib/dot/test/discovery.sh`.
+//! Pure scheduling and result decisions for native `dot test`.
 //!
-//! Pure decision helpers behind `dot test`: per-source suite
-//! timeouts, result-record classification (a zero exit alone never
-//! proves success), worker-count selection and validation, the
-//! early-wave scheduling marker, suite labels, the summary line,
-//! suite-identity validation, and name-filter matching. Everything
-//! is a pure function of explicit inputs — shell globals (`$HOME`,
-//! option state, the discovered script arrays) stay with the caller
-//! so tests inject fixtures deterministically.
-//!
-//! Process orchestration (parallel/sequential scheduling, suite
-//! sandboxing, output multiplexing, rendering), temporary-root
-//! lifecycle and cancellation, source-home and Git-backend
-//! selection, and directory inventory stay in shell: they depend on
-//! job control, process groups, and worktree trust checks with no
-//! faithful pure model.
+//! Timeout defaults, structured-result classification, job selection, early
+//! priority, identity/filter rules and summary vocabulary mirror the shell
+//! oracle. `test_command` owns authority and discovery; `test_runner` owns
+//! scheduling, presentation and temporary state; `cleanup` owns POSIX calls.
 
 /// Terminal classification of one finished suite, mirroring the
 /// words `_classify_suite` prints.
@@ -173,10 +161,26 @@ pub fn default_jobs(nproc_text: Option<&str>) -> u32 {
 /// independent of suite size and fixture text never reads as
 /// scheduling metadata.
 pub fn runs_early(script_bytes: &[u8]) -> bool {
-    script_bytes
-        .split(|byte| *byte == b'\n')
-        .take(20)
-        .any(|line| line == b"# dot-suite-priority: early")
+    runs_early_reader(std::io::Cursor::new(script_bytes)).unwrap_or(false)
+}
+
+/// Inspect at most twenty complete header lines without reading the suite body.
+/// An unterminated final line is ignored, matching Bash `while read` semantics.
+pub(crate) fn runs_early_reader(mut reader: impl std::io::BufRead) -> std::io::Result<bool> {
+    let mut line = Vec::new();
+    for _ in 0..20 {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if line.pop() != Some(b'\n') {
+            break;
+        }
+        if line == b"# dot-suite-priority: early" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `_dot_test_suite_label`: display label for a discovered suite
@@ -255,6 +259,28 @@ pub fn filter_matches(identity: &str, filter: &str) -> bool {
 mod tests {
     use super::*;
 
+    struct TwentyLines {
+        line: usize,
+    }
+
+    impl std::io::Read for TwentyLines {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            unreachable!("BufRead supplies the bounded header directly")
+        }
+    }
+
+    impl std::io::BufRead for TwentyLines {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            assert!(self.line < 20, "read beyond the twenty-line header");
+            Ok(b"ordinary header line\n")
+        }
+
+        fn consume(&mut self, amount: usize) {
+            assert_eq!(amount, b"ordinary header line\n".len());
+            self.line += 1;
+        }
+    }
+
     #[test]
     fn timeout_override_wins_verbatim() {
         assert_eq!(suite_timeout("provider", Some("45")), "45");
@@ -305,5 +331,11 @@ mod tests {
             format_summary(1, 2, 3, 6),
             "Suites: 1 passed, 2 skipped, 3 failed (6 total)"
         );
+    }
+
+    #[test]
+    fn priority_reader_stops_after_twenty_complete_lines() {
+        assert!(!runs_early_reader(TwentyLines { line: 0 }).unwrap());
+        assert!(!runs_early(b"# dot-suite-priority: early"));
     }
 }

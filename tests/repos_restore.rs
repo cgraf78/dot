@@ -1,69 +1,28 @@
-//! Differential parity tests for `restore_installed_links`
-//! (`lib/dot/repos/overlays.sh`) against the live shell: the
-//! installed-link recovery walk over the rollback snapshot arrays,
-//! incl. skip-worktree marking, fallback publication, and the
-//! failure leaves.
+//! Native contracts for the installed-link recovery walk.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use dot::repos_base::{Base, Topology};
 use dot::repos_overlays::{self, DestinationInputs, RestoreInstalledInputs};
-use dot::test_support::TempDir;
-
-/// Sources for the restore walk: overlays plus the model, temp,
-/// logging, reservation, and XDG runtime it calls into.
-const SOURCES: &str = concat!(
-    "dot_xdg_path() { return 1; }\n",
-    ". \"$1/lib/dot/resources.sh\"\n",
-    ". \"$1/lib/dot/temp.sh\"\n",
-    ". \"$1/lib/dot/log.sh\"\n",
-    ". \"$1/lib/dot/init-client.sh\"\n",
-    ". \"$1/lib/dot/repos/model.sh\" 2>/dev/null\n",
-    ". \"$1/lib/dot/repos/overlays.sh\"\n",
-    ". \"$1/lib/dot/reserved.sh\"\n",
-    ". \"$1/lib/dot/public/xdg.sh\"\n",
-);
-
-/// Run one shell snippet with the restore runtime sourced and the
-/// base topology pinned to an ordinary HOME checkout.
-fn shell_run(home: &Path, snippet: &str) -> (i32, Vec<u8>, Vec<u8>) {
-    let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let tmpdir = std::env::var_os("TMPDIR")
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg("--noprofile")
-        .arg("--norc")
-        .arg("-c")
-        .arg(format!("{SOURCES}{snippet}"));
-    cmd.arg("dot-test-sh").arg(repo);
-    cmd.env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", &path)
-        .env("TMPDIR", &tmpdir)
-        .env("HOME", home)
-        .env("DOT_TEST", "1")
-        .env("DOT_BASE_TOPOLOGY", "ordinary")
-        .current_dir(home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = cmd.output().expect("spawn bash");
-    (
-        output.status.code().unwrap_or(99),
-        output.stdout,
-        output.stderr,
-    )
-}
+use dot_test_support::TempDir;
 
 /// Run `git -C dir args`, silenced, asserting success.
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
         .arg(dir)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "tag.gpgSign=false",
+        ])
         .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -79,11 +38,6 @@ fn stage(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
     }
     std::fs::write(&path, bytes).expect("write fixture");
     path
-}
-
-/// Single-quote a word for snippet embedding.
-fn sq(word: &str) -> String {
-    format!("'{}'", word.replace('\'', "'\\''"))
 }
 
 /// Destination shape probe shared by both sides.
@@ -176,54 +130,6 @@ impl Side {
         );
     }
 
-    /// Shell preamble: rollback arrays, overlay records, manifests.
-    fn preamble(&self, rels: &[&str], targets: &[&str], overlays: &[String]) -> String {
-        let mut out = format!("export HOME={} ", sq(self.home_text()));
-        out.push_str("DOT_OVERLAY_ROLLBACK_PATHS=(");
-        for rel in rels {
-            out.push_str(&sq(rel));
-            out.push(' ');
-        }
-        out.push_str("); DOT_OVERLAY_ROLLBACK_TARGETS=(");
-        for target in targets {
-            out.push_str(&sq(target));
-            out.push(' ');
-        }
-        out.push_str("); OVERLAYS=(");
-        for entry in overlays {
-            out.push_str(&sq(entry));
-            out.push(' ');
-        }
-        // The restore walk reads the activated subset; keep both
-        // globals aligned like a converged runtime.
-        out.push_str("); ACTIVE_OVERLAYS=(");
-        for entry in overlays {
-            out.push_str(&sq(entry));
-            out.push(' ');
-        }
-        out.push_str(&format!(
-            "); DOT_OVERLAY_MANIFEST={} DOT_OVERLAY_LEGACY_MANIFEST={}; ",
-            sq(&self.manifest),
-            sq(&self.legacy),
-        ));
-        out
-    }
-
-    /// Aftermath dump appended to the shell snippet, one `d`/`s`
-    /// pair per rollback path.
-    fn probe(&self, rels: &[&str]) -> String {
-        let mut out = String::new();
-        for rel in rels {
-            out.push_str(&format!(
-                "d=absent; dst={}; if [[ -L \"$dst\" ]]; then d=\"link:$(readlink \"$dst\")\"; elif [[ -d \"$dst\" ]]; then d=dir; elif [[ -f \"$dst\" ]]; then d=\"file:$(cat \"$dst\")\"; elif [[ -e \"$dst\" ]]; then d=other; fi; s=none; v=$(git -C {} ls-files -v -- {} 2>/dev/null); case \"$v\" in 'S '*) s=skip;; 'H '*) s=keep;; esac; printf 'd=%s\\ns=%s\\n' \"$d\" \"$s\"; ",
-                sq(&format!("{}/{}", self.home_text(), rel)),
-                sq(self.home_text()),
-                sq(rel),
-            ));
-        }
-        out
-    }
-
     /// Rust inputs mirroring the shell preamble.
     fn inputs<'a>(
         &'a self,
@@ -277,18 +183,7 @@ fn base_and_dest(side: &Side, overlays: &[String]) -> (Base, DestinationInputs) 
     )
 }
 
-/// Pending authority presence on one side.
-fn pending_state(side: &Side) -> String {
-    if std::fs::symlink_metadata(format!("{}.pending", side.manifest)).is_ok() {
-        "present".to_string()
-    } else {
-        "missing".to_string()
-    }
-}
-
-/// Run one row on twin sides and compare rc plus aftermath. The
-/// target builder runs per side because absolute targets embed the
-/// side's home directory.
+/// Run one restore row and pin its result plus durable filesystem state.
 #[allow(clippy::too_many_arguments)]
 fn check_row(
     tag: &str,
@@ -298,40 +193,15 @@ fn check_row(
     setup: &dyn Fn(&Side),
     want_ok: bool,
 ) {
-    let shell_side = Side::build(&format!("{tag}-shell"));
-    let rust_side = Side::build(&format!("{tag}-rust"));
-    setup(&shell_side);
-    setup(&rust_side);
-    let shell_targets = targets(&shell_side);
-    let shell_overlays = overlays(&shell_side);
-    let shell_target_refs: Vec<&str> = shell_targets.iter().map(String::as_str).collect();
-    // Pin the topology after sourcing: model.sh detection runs at
-    // load and would otherwise report `missing` for the bare
-    // fixture checkout. The Rust side binds Ordinary directly, so
-    // pin the shell to match.
-    let snippet = format!(
-        "DOT_BASE_TOPOLOGY=ordinary; {}if _overlay_restore_installed_links; then echo rc=0; else echo rc=1; fi\n{}",
-        shell_side.preamble(rels, &shell_target_refs, &shell_overlays),
-        shell_side.probe(rels),
-    );
-    let (status, out, err) = shell_run(&shell_side.home, &snippet);
-    assert_eq!(
-        status, 0,
-        "harness exit for {tag}: stderr={err:?} snippet={snippet:?}"
-    );
-    assert!(err.is_empty(), "shell stderr for {tag}: {err:?}");
-    let shell_dump = String::from_utf8(out).expect("utf8");
-    assert!(
-        shell_dump.starts_with(if want_ok { "rc=0\n" } else { "rc=1\n" }),
-        "shell verdict for {tag}: {shell_dump:?}"
-    );
-    let targets_owned = targets(&rust_side);
-    let overlays_owned = overlays(&rust_side);
-    let (base, dest) = base_and_dest(&rust_side, &overlays_owned);
+    let side = Side::build(tag);
+    setup(&side);
+    let targets_owned = targets(&side);
+    let overlays_owned = overlays(&side);
+    let (base, dest) = base_and_dest(&side, &overlays_owned);
     let rels_owned: Vec<String> = rels.iter().map(|rel| rel.to_string()).collect();
     let mut moves = dot::temp::MoveCache::default();
     let tool = moves.tool().expect("move tool");
-    let inputs = rust_side.inputs(
+    let inputs = side.inputs(
         &base,
         &dest,
         &rels_owned,
@@ -340,24 +210,29 @@ fn check_row(
         &tool,
     );
     let ok = repos_overlays::restore_installed_links(&inputs);
-    // Absolute link targets embed the side's home directory;
-    // normalize both before comparing.
-    let shell_dump = shell_dump.replace(shell_side.home_text(), "@HOME");
-    let mut rust_dump = format!("rc={}\n", if ok { 0 } else { 1 });
-    for rel in rels {
-        rust_dump.push_str(&format!(
-            "d={}\ns={}\n",
-            dst_state(&rust_side.home.join(*rel)),
-            skip_flag(&rust_side.home, rel),
-        ));
+    assert_eq!(ok, want_ok, "{tag}");
+    let states: Vec<String> = rels
+        .iter()
+        .map(|rel| dst_state(&side.home.join(rel)))
+        .collect();
+    match tag {
+        "length" => assert_eq!(states, ["absent"]),
+        "tracked-link" | "untracked-link" => assert_eq!(states, ["link:real.txt"]),
+        "missing-tracked" => assert_eq!(states, [format!("link:{}/real.txt", side.home_text())]),
+        "dir-blocks" => assert_eq!(states, ["dir"]),
+        "fallback" | "lost-link" => assert_eq!(states, ["link:.dotfiles-o/home/owned.txt"]),
+        "clean-file" => assert_eq!(states, ["file:keep"]),
+        "wrong-link" => assert_eq!(states, ["link:/elsewhere"]),
+        "fallback-fast" => assert_eq!(
+            states,
+            [format!("link:{}/overlay/home/owned.txt", side.home_text())]
+        ),
+        "sticky" => assert_eq!(
+            states,
+            [format!("link:{}/real.txt", side.home_text()), "dir".into()]
+        ),
+        _ => unreachable!(),
     }
-    let rust_dump = rust_dump.replace(rust_side.home_text(), "@HOME");
-    assert_eq!(rust_dump, shell_dump, "twin parity for {tag}");
-    assert_eq!(
-        pending_state(&rust_side),
-        pending_state(&shell_side),
-        "pending parity for {tag}"
-    );
 }
 
 /// Correct link at an available relative target, tracked: rc 0
@@ -487,6 +362,37 @@ fn restore_keeps_clean_tracked_file_without_fallback() {
         },
         true,
     );
+}
+
+#[test]
+fn restore_reclaims_the_exact_lost_overlay_link_for_the_tracked_base() {
+    let side = Side::build("lost-overlay-to-base");
+    side.track("owned.txt", b"base destination\n");
+    git(
+        &side.home,
+        &["update-index", "--skip-worktree", "owned.txt"],
+    );
+    std::fs::remove_file(side.home.join("owned.txt")).unwrap();
+    std::os::unix::fs::symlink("missing-overlay.txt", side.home.join("owned.txt")).unwrap();
+
+    let rels = vec!["owned.txt".to_string()];
+    let targets = vec!["missing-overlay.txt".to_string()];
+    let overlays = Vec::new();
+    let (base, dest) = base_and_dest(&side, &overlays);
+    let mut moves = dot::temp::MoveCache::default();
+    let tool = moves.tool().unwrap();
+    let inputs = side.inputs(&base, &dest, &rels, &targets, &overlays, &tool);
+
+    assert!(repos_overlays::restore_installed_links(&inputs));
+    let restored = side.home.join("owned.txt");
+    assert!(
+        !std::fs::symlink_metadata(&restored)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(&restored).unwrap(), b"base destination\n");
+    assert_eq!(skip_flag(&side.home, "owned.txt"), "keep");
 }
 
 #[test]

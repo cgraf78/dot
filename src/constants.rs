@@ -1,6 +1,6 @@
-//! Private runtime constants (slice 2 foundations).
+//! Private runtime constants.
 //!
-//! Ports `lib/dot/constants.sh` exactly: the XDG-derived overlay
+//! Owns the XDG-derived overlay
 //! manifest and profile lifecycle ledger, the legacy manifest pinned
 //! to `$HOME/.local/state` (it deliberately ignores XDG), the engine
 //! binary resolved through the checked-out source root (never PATH,

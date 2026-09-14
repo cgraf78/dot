@@ -1,4 +1,4 @@
-//! BSD-`stat` simulator differential for replacement identities.
+//! BSD-`stat` simulator contract for native replacement identities.
 //!
 //! Linux-only: the fake `stat` below normalizes the GNU coreutils
 //! tool into BSD shape (`-c` fails, `-f '%d:%i'` / `'%p:%z'` render
@@ -15,47 +15,10 @@
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use dot::repos_overlays;
-use dot::test_support::TempDir;
-
-/// Run one shell snippet with the manifest library sourced, like
-/// `repos_overlays.rs` — but the caller prepends the fixture dir to
-/// the process PATH first, so the child inherits the fake `stat`
-/// through the preserved PATH below.
-fn shell_run(home: &Path, argv: &[&std::ffi::OsStr], snippet: &str) -> (i32, Vec<u8>, Vec<u8>) {
-    let repo = env!("CARGO_MANIFEST_DIR");
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let tmpdir = std::env::var_os("TMPDIR")
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| std::ffi::OsString::from("/tmp"));
-    let mut cmd = Command::new(dot::test_support::bash());
-    cmd.arg("--noprofile")
-        .arg("--norc")
-        .arg("-c")
-        .arg(format!(". \"$1/lib/dot/repos/overlays.sh\"\n{snippet}"));
-    cmd.arg("dot-test-sh").arg(repo);
-    for arg in argv {
-        cmd.arg(arg);
-    }
-    cmd.env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", &path)
-        .env("TMPDIR", &tmpdir)
-        .env("HOME", home)
-        .env("DOT_TEST", "1")
-        .current_dir(home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = cmd.output().expect("spawn bash");
-    (
-        output.status.code().unwrap_or(99),
-        output.stdout,
-        output.stderr,
-    )
-}
+use dot_test_support::TempDir;
 
 /// Write `bytes` to `dir/name`, creating parents.
 fn stage(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
@@ -162,25 +125,11 @@ fn bsd_stat_octal_mode_agrees() {
     // branch would render `81a4` / `a1ff` here.
     for (name, mode_pin) in [("doc.txt", ":100644:8:"), ("link", ":120777:7:")] {
         let target = home.join(name);
-        let (code, out, serr) = shell_run(
-            home,
-            &[target.as_os_str()],
-            "out=$(_overlay_replacement_identity \"$2\"); code=$?; printf 'rc=%s\\nreply=%s\\n' \"$code\" \"$out\"\n",
-        );
-        assert_eq!(code, 0, "harness exit for {name:?}");
+        let identity = repos_overlays::replacement_identity(home, &target)
+            .unwrap_or_else(|error| panic!("BSD replacement identity for {name:?}: {error:?}"));
         assert!(
-            serr.is_empty(),
-            "BSD identity stderr for {name:?}: {serr:?}"
-        );
-        let shell = String::from_utf8(out).expect("identity dump");
-        let rust = match repos_overlays::replacement_identity(home, &target) {
-            Ok(identity) => format!("rc=0\nreply={identity}\n"),
-            Err(_) => "rc=1\nreply=\n".to_string(),
-        };
-        assert_eq!(rust, shell, "BSD replacement identity for {name:?}");
-        assert!(
-            rust.contains(mode_pin),
-            "BSD octal mode pin for {name:?}: {rust:?}"
+            identity.contains(mode_pin),
+            "BSD octal mode pin for {name:?}: {identity:?}"
         );
     }
 }
