@@ -381,6 +381,17 @@ pub fn sanitized_git<S: AsRef<std::ffi::OsStr>>(
     source_root: &Path,
     args: &[S],
 ) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    sanitize_git_env(&mut cmd);
+    bind_source_git(&mut cmd, source_root);
+    cmd.args(args);
+    cmd
+}
+
+/// Apply `_dot_sanitized_git` environment isolation to an already-selected
+/// Git executable. Runtime-bound callers use this form so executable lookup
+/// remains tied to their immutable PATH without duplicating Git policy.
+pub(crate) fn sanitize_git_env(cmd: &mut std::process::Command) {
     const UNSET: &[&str] = &[
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -396,12 +407,16 @@ pub fn sanitized_git<S: AsRef<std::ffi::OsStr>>(
         "GIT_CONFIG_NOSYSTEM",
         "GIT_DEFAULT_HASH",
     ];
-    let mut cmd = std::process::Command::new("git");
     for var in UNSET {
         cmd.env_remove(var);
     }
     cmd.env("GIT_CONFIG_NOSYSTEM", "1");
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+}
+
+/// Bind one sanitized Git command to the selected source checkout, including
+/// the explicit trust required when a container mount is host-owned.
+pub(crate) fn bind_source_git(cmd: &mut std::process::Command, source_root: &Path) {
     let directory = source_root.as_os_str().as_bytes();
     let mut safe = b"safe.directory=".to_vec();
     safe.extend_from_slice(directory);
@@ -411,8 +426,6 @@ pub fn sanitized_git<S: AsRef<std::ffi::OsStr>>(
     cmd.arg(std::ffi::OsStr::from_bytes(&safe));
     cmd.arg("-C");
     cmd.arg(source_root);
-    cmd.args(args);
-    cmd
 }
 
 /// `_dot_source_git`: Git bound to the already-selected physical

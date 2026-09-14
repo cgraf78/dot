@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC1091 # Test helper path is resolved from this file.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
+
+previous_dist=
+cleanup() {
+  rm -rf "$DOT_TEST_ROOT/dist"
+  if [[ -n $previous_dist ]]; then
+    mv "$previous_dist" "$DOT_TEST_ROOT/dist"
+  fi
+  rm -rf "$DOT_TEST_TMP"
+}
+trap cleanup EXIT HUP INT TERM
+
+release_files=(
+  package-release.sh
+  release-lib.sh
+  release-tag.sh
+  release-version.sh
+  release.sh
+  smoke-release.sh
+)
+release_blobs=(
+  66e7176c89ba28894c8ca78de728630e1ab82fac
+  b4ebea3600351c8ad3fbef2401a5ef7ac8e03f45
+  2da694543a02b13da1384edd05044cd564d1d188
+  a6b37eb6fa59161f8116fd3226c35220b31d6b14
+  3e1db43b6fdb90ccffc84c120bb600a55eea0136
+  6718ff66461feb91dd92e642c6430d8ec5250b77
+)
+
+for index in "${!release_files[@]}"; do
+  file=${release_files[$index]}
+  path=$DOT_TEST_ROOT/scripts/$file
+  [[ -f $path && ! -L $path ]] || fail "missing vendored release script: scripts/$file"
+  assert_eq "${release_blobs[$index]}" "$(git hash-object --no-filters -- "$path")" \
+    "scripts/$file matches the pinned cgraf78/actions blob"
+done
+
+expected_manifest=$(printf '%s\n' "${release_files[@]}")
+assert_eq "$expected_manifest" "$(cat "$DOT_TEST_ROOT/scripts/.release-scripts.manifest")" \
+  'managed release-script manifest is complete and sorted'
+
+# shellcheck source=../scripts/release.conf
+# shellcheck disable=SC1091 # Resolved from the repository root at runtime.
+. "$DOT_TEST_ROOT/scripts/release.conf"
+assert_eq DOT "$RELEASE_ENV_PREFIX" 'release config owns the DOT namespace'
+assert_eq dot "$RELEASE_SLUG" 'release config identifies the dot repository'
+assert_eq cgraf78/dot "$RELEASE_REPO" 'release config records the publishing repository'
+assert_eq dot "$RELEASE_ASSET_NAME" 'release archives retain the dot name'
+assert_eq dot "$RELEASE_BINARY" 'release config builds the native dot binary'
+
+declared_files=$(printf '%s\n' "${RELEASE_PAYLOAD_FILES[@]}")
+assert_eq $'README.md\nLICENSE' "$declared_files" \
+  'release package includes only required top-level documentation'
+declared_dirs=$(printf '%s\n' "${RELEASE_PAYLOAD_DIRS[@]}")
+assert_eq 'lib/dot/public' "$declared_dirs" \
+  'release package retains only the public shell API directory'
+
+release_workflow=$(cat "$DOT_TEST_ROOT/.github/workflows/release.yml")
+assert_contains \
+  'cgraf78/actions/.github/workflows/rust-release.yml@b97bd729afec784785bd01ebd43321225ef47bb7' \
+  "$release_workflow" 'release workflow uses the pinned shared workflow'
+assert_contains 'android-aarch64: true' "$release_workflow" \
+  'release workflow publishes the supported Android artifact'
+assert_contains 'tag-command: scripts/release-tag.sh' "$release_workflow" \
+  'release workflow uses the shared release identity'
+# shellcheck disable=SC2016 # Workflow variables must remain literal.
+assert_contains 'package-command: scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"' \
+  "$release_workflow" 'release workflow uses the vendored packager'
+# shellcheck disable=SC2016 # Workflow variables must remain literal.
+assert_contains 'smoke-command: scripts/smoke-release.sh "$ASSET_PLATFORM"' \
+  "$release_workflow" 'release workflow smokes every runnable package'
+assert_contains 'id-token: write' "$release_workflow" \
+  'release workflow permits artifact attestation identity'
+assert_contains 'attestations: write' "$release_workflow" \
+  'release workflow permits artifact attestations'
+
+test_workflow=$(cat "$DOT_TEST_ROOT/.github/workflows/test.yml")
+rust_job=$(sed -n '/^  rust:/,/^  shell:/p' "$DOT_TEST_ROOT/.github/workflows/test.yml")
+shell_job=$(sed -n '/^  shell:/,/^  macos-bash32:/p' "$DOT_TEST_ROOT/.github/workflows/test.yml")
+assert_contains $'test-command: |\n        cargo test --locked\n        bash tests/release-scripts-test\n        DOT_PERF_BUDGET_MULTIPLIER=1 cargo test --locked -- --ignored' \
+  "$rust_job" 'Rust CI runs build-dependent release coverage before ignored performance tests'
+assert_contains 'test-command: bash tests/run' "$shell_job" \
+  'shell CI runs only the shell oracle without assuming a Rust toolchain'
+if [[ $shell_job == *'tests/release-scripts-test'* ]]; then
+  fail 'shell CI must not run the Cargo-dependent release contract'
+fi
+assert_contains 'android-package-smoke-command: |' "$test_workflow" \
+  'CI packages and smokes Android artifacts'
+# shellcheck disable=SC2016 # Workflow variables must remain literal.
+assert_contains 'scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"' "$test_workflow" \
+  'Android CI uses the release packager'
+# shellcheck disable=SC2016 # Workflow variables must remain literal.
+assert_contains 'scripts/smoke-release.sh "$ASSET_PLATFORM"' "$test_workflow" \
+  'Android CI validates the release archive'
+assert_contains 'package-smoke-musl-target: x86_64-unknown-linux-musl' "$test_workflow" \
+  'CI exercises the supported musl package'
+assert_contains 'bash tests/release-scripts-test' "$test_workflow" \
+  'Rust CI runs the release contract'
+
+target=$(rustc -vV | sed -n 's/^host: //p')
+[[ -n $target ]] || fail 'could not determine the host Rust target'
+case $(uname -s) in
+  Darwin) asset_platform=macos-$(uname -m) ;;
+  Linux) asset_platform=linux-$(uname -m) ;;
+  *) fail "unsupported local release-test host: $(uname -s)" ;;
+esac
+
+if [[ -e $DOT_TEST_ROOT/dist || -L $DOT_TEST_ROOT/dist ]]; then
+  previous_dist=$DOT_TEST_TMP/dist.before
+  mv "$DOT_TEST_ROOT/dist" "$previous_dist"
+fi
+archive=$(
+  cd "$DOT_TEST_ROOT"
+  scripts/package-release.sh "$target" "$asset_platform"
+)
+[[ -f $DOT_TEST_ROOT/$archive ]] || fail "packager did not create $archive"
+[[ -f $DOT_TEST_ROOT/$archive.sha256 ]] || fail "packager did not create $archive.sha256"
+
+extract=$DOT_TEST_TMP/release
+mkdir -p "$extract"
+tar -C "$extract" -xzf "$DOT_TEST_ROOT/$archive"
+
+for entry in \
+  dot README.md LICENSE .dot-install.json \
+  lib/dot/public/api-v1.tsv lib/dot/public/api-version.sh \
+  lib/dot/public/test-reporter-v1 lib/dot/public/test-timeout-v1 \
+  lib/dot/public/ui.sh lib/dot/public/variables-v1.tsv lib/dot/public/xdg.sh; do
+  [[ -e $extract/$entry ]] || fail "release archive is missing $entry"
+done
+
+[[ -x $extract/dot ]] || fail 'release binary is not executable'
+[[ ! -e $extract/lib/dot/main.sh ]] || fail 'release archive contains the production Bash engine'
+unexpected=$(find "$extract/lib/dot" -mindepth 1 -maxdepth 1 ! -name public -print)
+assert_eq '' "$unexpected" 'release archive contains no private Bash engine paths'
+
+metadata=$(cat "$extract/.dot-install.json")
+build_commit=$(sed -n 's/^[[:space:]]*"commit": "\([0-9a-f]*\)",*$/\1/p' \
+  "$extract/.dot-install.json")
+[[ ${#build_commit} -ge 12 ]] || fail 'release metadata contains no usable build commit'
+version=$("$extract/dot" version)
+assert_eq "dot commit ${build_commit:0:12} (config 1; extensions 1; library 1)" \
+  "$version" 'extracted binary identity agrees with release metadata'
+assert_contains '"version": "' "$metadata" 'release metadata records the computed version'
+"$extract/dot" help >/dev/null || fail 'extracted native binary cannot print help'
+mv "$extract/lib/dot" "$extract/public-assets-away"
+"$extract/dot" version >/dev/null || fail 'native binary resolves the removed lib/dot engine at runtime'
+"$extract/dot" help >/dev/null || fail 'native help resolves the removed lib/dot engine at runtime'
+
+(
+  cd "$DOT_TEST_ROOT"
+  scripts/smoke-release.sh "$asset_platform"
+)
+
+printf 'release-scripts-test: ok\n'
