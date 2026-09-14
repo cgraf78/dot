@@ -10,11 +10,13 @@
 //! revalidation pair (source snapshot, inventory entry) and the
 //! replacement hash boundary. `_overlay_replacement_git` stays a
 //! shell alias for the shared sanitized boundary already ported as
-//! `temp::sanitized_git`; `_overlay_prepare_inventories`,
-//! `_overlay_snapshot_installed_links`, `_overlay_restore_tracked_path`,
-//! `_unstash_overlay_overrides`, `_link_overlay`, and `_link_overlays`
-//! stay in shell until their reserved-roots and link-execution
-//! layers land.
+//! `temp::sanitized_git`; `_overlay_snapshot_installed_links`,
+//! `_overlay_restore_tracked_path`, `_unstash_overlay_overrides`,
+//! `_link_overlay`, and `_link_overlays` stay in shell until their
+//! reserved-roots and link-execution layers land.
+//! `_overlay_prepare_inventories` lives in
+//! [`crate::repos_link_prep`] (parallel fan-out, unwired: the
+//! engine still drives the shell `_link_overlays`).
 
 //!
 //! Two engine boundaries apply. Values cross from bytes to `String`
