@@ -163,6 +163,32 @@ fn commands() -> Vec<Vec<&'static OsStr>> {
 }
 
 #[test]
+fn runtime_snapshots_xdg_homes_from_explicit_environment() {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+
+    let home = TempDir::new("runtime-home").expect("home");
+    let state = TempDir::new("runtime-state").expect("state");
+    let config = TempDir::new("runtime-config").expect("config");
+    let mut env = BTreeMap::new();
+    env.insert(OsString::from("HOME"), home.path().as_os_str().to_owned());
+    env.insert(
+        OsString::from("XDG_STATE_HOME"),
+        state.path().as_os_str().to_owned(),
+    );
+    env.insert(
+        OsString::from("XDG_CONFIG_HOME"),
+        config.path().as_os_str().to_owned(),
+    );
+
+    let runtime = dot::app::Runtime::from_env(&env, home.path()).expect("runtime");
+    assert_eq!(runtime.home(), home.path());
+    assert_eq!(runtime.state_home(), state.path());
+    assert_eq!(runtime.config_home(), config.path());
+    assert_eq!(runtime.cwd(), home.path());
+}
+
+#[test]
 fn unloadable_config_exits_2_for_every_command() {
     // Forward-contract order: config loads before dispatch, so even
     // `help`/`version` exit 2 here. The shell `case` in `main.sh`
