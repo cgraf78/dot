@@ -29,6 +29,21 @@ jobs:
       test-command: >-
         cargo test --locked &&
         DOT_PERF_BUDGET_MULTIPLIER=1 cargo test --locked -- --ignored
+      # The slice-2 update harness shells out to the shell `dot` oracle
+      # for baseline timing and byte comparison, and the engine requires
+      # Bash 4+ (stock macOS Bash is 3.2). A brewed Bash lands on the
+      # default PATH, where the checkout resolver's walk finds it; other
+      # platforms ship a new enough Bash natively.
+      setup-command: |
+        # `brew --prefix` alone is not a reliable installed-check, so
+        # require the executable itself (same pattern as the macos-bash32
+        # job below).
+        if [ "$(uname -s)" = Darwin ]; then
+          brew_prefix=$(brew --prefix bash 2>/dev/null || true)
+          if [ -z "$brew_prefix" ] || [ ! -x "$brew_prefix/bin/bash" ]; then
+            brew install bash
+          fi
+        fi
       # Slice 1 has no release/packaging scripts yet, so the Android and
       # Termux gates validate what exists: cross-compilation and the
       # native test suite. Packaging smoke arrives with the release
