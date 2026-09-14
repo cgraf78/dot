@@ -97,9 +97,6 @@ tests/lib/repo.sh	standalone:new
 tests/lib/test.sh	standalone:new
 tests/library-test	standalone:new
 tests/license-test	standalone:new
-tests/link_all.rs	standalone:new
-tests/link_exec.rs	standalone:new
-tests/link_prep.rs	standalone:new
 tests/log.rs	standalone:new
 tests/merge-block-test	dotfiles:tests/core-merges-test@dotfiles-v1
 tests/merge_block.rs	standalone:new
@@ -151,10 +148,6 @@ tests/temp.rs	standalone:new
 tests/test-command-test	standalone:new
 tests/test-lifecycle-test	dotfiles:.local/lib/dotfiles/tests/core/runner.sh@dotfiles-v2+standalone
 tests/test_suites.rs	standalone:new
-tests/support/test_fixture.rs	standalone:new
-tests/test_command.rs	standalone:new
-tests/test_runner.rs	standalone:new
-tests/test_runner_reaping.rs	standalone:new
 tests/ui.rs	standalone:new
 tests/update-lock-test	dotfiles:tests/core-update-test@dotfiles-v1+standalone
 tests/update.rs	standalone:new
@@ -163,7 +156,6 @@ tests/workflow-test	standalone:new
 tests/xdg.rs	standalone:new
 tests/repos_pull_overlay.rs	standalone:new
 tests/shdeps_checkpoint.rs	standalone:new
-tests/shdeps_provider.rs	standalone:new
 tests/init_client_identity.rs	standalone:new
 tests/init_client_generation.rs	standalone:new
 tests/shdeps_ui.rs	standalone:new
@@ -190,7 +182,3 @@ tests/init_client_publish_intent.rs	standalone:new
 tests/init_client_safe_path.rs	standalone:new
 tests/init_client_command.rs	standalone:new
 tests/startup.rs	standalone:new
-tests/update_run.rs	standalone:new
-tests/init_client_engine.rs	standalone:new
-tests/update_parpull.rs	standalone:new
-tests/doctor.rs	standalone:new
