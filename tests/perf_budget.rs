@@ -22,7 +22,7 @@ use perf_policy::{
 fn performance_policy_pins_reachable_shell_baseline() {
     assert_eq!(
         shell_baseline_sha(),
-        "b502904d9b848288799318826e507e0827fd97bf"
+        "762fb7eed72a8c429b12a5dca320ef32ebd3c777"
     );
     assert_eq!(shell_baseline_sha().len(), 40);
     assert!(
