@@ -1,9 +1,9 @@
-# Rust Port Spec (slice 1: scaffold + CLI core)
+# Rust Port Compatibility Record
 
-Normative compatibility contract for the first slice. Later slices extend
-this file. Anything not specified here is governed by the shell
-implementation plus `tests/*-test` (the oracle) — when in doubt, the shell
-wins and this spec gets amended.
+This records the compatibility contracts used during the incremental Rust
+port. The native implementation and its tests now own the behavior. Historical
+references to the removed shell engine explain the source of a contract; they
+are not a second runtime or a test oracle.
 
 ## 1. Version identity
 
@@ -19,26 +19,23 @@ wins and this spec gets amended.
   from the manifest dir → `unknown` (unlike shdeps, never panic: the
   shell contract defines `unknown`). The short commit is the lowercased
   first 12 hex chars, else `unknown`.
-- `DOT_BUILD_VERSION` accepts any non-empty `$DOT_BUILD_VERSION`,
-  else `unknown`. The shared `YYYYMMDD-HHMMSS-8hex` scheme and its
-  validation arrive with the release workflow in a later slice.
+- `DOT_BUILD_VERSION` accepts any non-empty `$DOT_BUILD_VERSION`, otherwise
+  `unknown`. Release builds supply the shared validated
+  `YYYYMMDD-HHMMSS-8hex` identity.
 - `src/version.rs` exposes `COMMIT` / `SHORT_COMMIT` / `VERSION`
   consts plus `version_line()` (exact `dot version` text) and
   `description()`, with unit tests asserting the revision is `unknown`
   or 12 hex chars.
 
-## 2. CLI surface (slice 1)
+## 2. CLI surface (historical slice-1 contract)
 
-Commands owned by the Rust binary in this slice: `help` (default,
-`-h`, `--help`), `version` (`--version`). The binary is not yet on
-PATH, so the shell remains the entry point; direct invocations of
-unported commands (`update`, `status`, …) yield the shell's
-`unknown command` / exit 1 until their owning slice lands.
+The first migration slice covered `help` (default, `-h`, `--help`) and
+`version` (`--version`). Subsequent slices ported the full command table in
+section 5 and cut the installed entry point over to the Rust binary.
 
-- Unknown command exits 1 **when config loads** (the shell runs
-  `dot_config_load || exit 2` before dispatch, so an unloadable config
-  exits 2 for ANY command — specified in forward contracts, tested in
-  slice 2 with the config parser).
+- Help and version bypass configuration loading and remain available for
+  diagnosis. Operational and unknown commands load configuration first; an
+  unloadable configuration exits 2 before their dispatch.
 - `dot help` prints the exact `dot_help` heredoc from `lib/dot/main.sh`
   (byte-identical; pinned by `tests/cli.rs` against the shell source).
 - Unknown command: `dot: unknown command: <arg>\n` on stderr, exit 1.
@@ -46,36 +43,46 @@ unported commands (`update`, `status`, …) yield the shell's
 - I/O streams are injected (`run(args, stdout, stderr) -> i32`)
   so parity tests capture text without subprocesses (shdeps `cli.rs`
   pattern). (`Result` is reserved for fallible engine operations in
-  later slices; slice-1 dispatch is infallible by construction.)
+  later migration work; slice-1 dispatch was infallible by construction.)
 
-## 3. Performance budgets (slice 1)
+## 3. Performance budgets
 
-Measured on the reference host; enforced by `tests/perf_budget.rs`
-(p95 over runs, CLI-level including process startup, following
-`hive-memory` `tests/perf_budget.rs`):
+`tests/perf_budget.rs` owns deterministic policy tests. The ignored
+`tests/perf_update.rs` harness is run only in Cargo's release profile by the
+dedicated Ubuntu performance job; ordinary debug and portability jobs do not
+make wall-clock assertions.
 
-| Operation | Shell baseline (warm) | Rust budget (p95) | Rust expected |
-|---|---|---|---|
-| `help` | ~18ms (parse+probes) | 25ms | ~2-5ms |
-| `version` | ~26ms (incl. one `git rev-parse` fork; Rust bakes the revision, no fork) | 30ms | ~2-5ms |
+| Operation | Samples | Rust requirement |
+|---|---:|---|
+| first `help` spawn | 1 before warm-up | no more than 100ms |
+| warm `help` | median and p95 of 30 paired runs after 10 warm-ups | median no more than 75% of Bash; p95 no more than 24.075ms |
+| warm `version` | median and p95 of 30 paired runs after 10 warm-ups | median no more than 75% of Bash; p95 no more than 23.85ms |
+| clean base-only update | median and p95 of 30 paired runs | median no more than 75% of Bash; p95 no more than 4s |
+| clean disjoint three-overlay update | median and p95 of 30 paired runs | median no more than 75% of Bash; p95 no more than 1.6025s |
+| dirty disjoint three-overlay update | median and p95 of 30 independently dirtied paired runs | median no more than 75% of Bash; p95 no more than 2.01s |
+| profile/provider/hooks/collision update | median and p95 of 30 paired runs | median no more than 75% of Bash; p95 no more than 12s |
+| failing pre-sync update | median and p95 of 30 paired runs | median no more than 75% of Bash; p95 no more than 4s |
 
-Budgets are CI-variance ceilings, not targets: the port must beat them
-by an order of magnitude on the reference host; a change that merely
-squeaks under budget without improving on the shell has failed the
-point of the port even if the gate is green.
+The historical commit is centralized in
+`support/performance-baseline-v1.tsv`; one shared policy table supplies the
+harness and deterministic tests with workload order, sample counts, warm-ups,
+and acceptance limits. Each gate run emits anonymized calibration ratios and
+headroom bound to its candidate, baseline, provider, toolchain, and evidence
+hashes. The gate covers every workload required by the completion design, and
+every accepted update sample has already passed output, expected-payload, and
+normalized filesystem-state checks. Raw nanosecond samples, path-sanitized
+environment metadata, calibration, and the atomic completion manifest are
+uploaded as an exact six-file set only after independent validation succeeds;
+rejected partial evidence is not published.
+The exact methodology and its remaining coverage boundary are recorded in
+`docs/rust-port-performance.md`.
 
-- Multiplier env `DOT_PERF_BUDGET_MULTIPLIER` (float, default 1.0) exists
-  for slow developer hosts only. Gate CI jobs run perf tests explicitly
-  (including `#[ignore]`-gated ones) with the multiplier pinned to 1.
-- Budgets cover warm and cold paths; update-level budgets (slice 2+)
-  assert improvement against the recorded shell ceiling, not just an
-  absolute ceiling.
-- Heavy/loop-heavy budgets (e.g. full `update` on fixtures) are
-  `#[ignore]`-gated and run explicitly in CI, same as hive-memory.
-- Budgets are regression gates, not goals: the port must beat them by a
-  wide margin on the reference host; a budget failure blocks the slice.
+The measured provider is always the revision pinned by the current candidate.
+Its ABI must match the historical shell lock, but the old and current lock
+revisions are intentionally allowed to differ so later compatible provider
+fixes do not invalidate the immutable shell baseline.
 
-## 4. Crate layout (slice 1)
+## 4. Initial crate layout (historical)
 
 `Cargo.toml` (`edition 2024`, `rust-version 1.85`, `[lints.rust]
 warnings = "deny"`, lib+bin), `build.rs`, `src/lib.rs`, `src/main.rs`
@@ -83,7 +90,7 @@ warnings = "deny"`, lib+bin), `build.rs`, `src/lib.rs`, `src/main.rs`
 no anyhow/thiserror in lib), `src/version.rs`, `src/cli.rs`,
 `src/test_support.rs`, `tests/cli.rs`, `tests/perf_budget.rs`.
 
-## 5. Forward contracts (owned by later slices, recorded here)
+## 5. Full command contracts
 
 Full command table (`lib/dot/commands.sh`, `lib/dot/main.sh`):
 
@@ -115,8 +122,8 @@ markers (`# <marker> begin` / `# DO NOT EDIT...` / `# source: <path>` /
 (`*.serial.sh` = barrier); provider reexec checkpoint
 (`cgraf78 dot provider reexec checkpoint v1`, `before=/after=` hex).
 
-Claimed surface (each row ported with shell-vs-Rust differential
-tests; the binary is still not on PATH and no shell behavior changed):
+Migration surface (each row was ported with shell-vs-Rust differential tests
+before native cutover):
 
 | Rust module | Shell source | Parity notes |
 |---|---|---|
@@ -134,10 +141,43 @@ tests; the binary is still not on PATH and no shell behavior changed):
 | `overlays` | `overlays.sh` (+ `repos/config.sh` checkout match) | descriptor parse; strict/legacy discovery with selection echo; name derivation mirroring bash `=~` `$` newline anchoring; glob-exact `*.conf` filter (dotfiles skipped); `mapfile`-empty origin semantics; warning-text discovery errors (never announced) |
 | `version::LIBRARY_API` | `public/api-version.sh` | `DOT_LIBRARY_API=1` pinned on both sides |
 
-## 6. Non-contract (explicitly out of slice 1)
+## 6. Native test supervisor
+
+The Rust `test` command owns arguments, inspect-mode resolution, source-home
+authority, trusted suite discovery, scheduling, result classification, output,
+timeouts and cancellation. It never loads `lib/dot/test.sh` or its stage files.
+The removed private shell files served as the migration oracle before cutover.
+The public `test-reporter-v1` and `test-timeout-v1` interfaces remain available
+for external suites. The native scheduler does not execute the timeout helper.
+
+Source authority requires both the configured base Git common directory and
+Git's registration of the exact source worktree. The actual invocation HOME is
+the trust anchor; caller-supplied host metadata cannot replace it. Source-path
+comparisons retain Unix bytes. Shared client identity selection belongs to
+`repos_base`, and executable lookup belongs to the immutable `Runtime`.
+
+Each suite receives closed stdin, private cache/state/temp paths, and its own
+session. The supervisor observes child exit without reaping the leader until
+owned descendants have received TERM and, if necessary, KILL. Cancelling a
+worker wave uses one shared grace deadline. Independent CLI/embedded
+invocations run in separate processes and cannot share signal guards or roots.
+`app::run_direct` remains a single-process entry, not a concurrent embedding API.
+
+Coordinator-created result/output file handles remain authoritative throughout
+execution. Replacing their directory entries cannot redirect readers to FIFOs
+or foreign files. Suites write the supplied result file in place, as the public
+reporter does. Sequential output is streamed in bounded snapshots; parallel
+replay follows selected-suite order. Wall-clock marks and already-parallel
+completion order retain the existing parity exclusions.
+
+The only added dependency is `libc`, for POSIX operations absent from std:
+signal handling/delivery, session identity, and `waitid(WNOWAIT)`. Unsafe calls
+are centralized in `cleanup`; std owns Command/Child, file I/O and reaping.
+
+## 7. Slice-1 exclusions (historical record)
 
 Config parsing, XDG resolution, update pipeline, extension workers,
 providers, doctor/test/init commands, `bin/dot` cutover, release
-workflow, man pages, shell completions. Each gets its own spec section
-in a later slice; none of the shell behavior for those paths may change
-as a side effect of this slice (shell suite must stay 28/28 green).
+workflow, man pages, and shell completions were deliberately outside the first
+increment. Later increments brought the CLI and engine paths into the native
+binary before the private shell implementation was removed.

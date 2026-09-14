@@ -1,25 +1,21 @@
 //! The intent publisher of `lib/dot/init-client.sh`: recording one
 //! entry's pending intent before its stage is prepared.
 //!
-//! The shell file holds 79 functions — too big for one lane — so
-//! this module owns only `_dot_init_publish_intent` (lines 927-938):
+//! This module owns `_dot_init_publish_intent`:
 //! derive the transaction stage for the entry ([`publish_intent`]),
 //! validate the existing record when one is already present, or
 //! publish the pending line at mode `0600` when the path is still
 //! free.
 //!
-//! Lane map, so the integrator can stack without overlap: the
-//! per-entry staging family (`_dot_init_entry_stage`,
+//! The per-entry staging family (`_dot_init_entry_stage`,
 //! `_dot_init_entry_intent`, `_dot_init_write_private_line`) lives
-//! on `rust-port-slice-46` (`init_client_entry`) and is unmerged
-//! here, so those three call sites cross as closures in
+//! lives in `init_client_entry`, so those three call sites cross as closures in
 //! [`PublishIntentHooks`] — one per shell call site, the way the
 //! rollback lane binds its verifiers. The sibling `publish_one`,
 //! the worktree publisher, and the published-state recovery family
-//! stay for their own lanes. Nothing above line 927 and nothing
-//! below line 938 is ported here.
+//! live in their corresponding modules.
 //!
-//! The port stays MSRV-clean (Rust 1.85): no let-chains, no
+//! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 //!
 //! Engine boundary: the shell reads the run identity from the
@@ -31,7 +27,7 @@
 //! surface as return values. Every shell refusal in this function
 //! is a bare `return 1` with no diagnostic of its own, so every
 //! refusal here surfaces as [`Error::Usage`](crate::errors::Error::Usage);
-//! diagnostics printed by callees stay owned by their lanes.
+//! diagnostics printed by callees stay owned by their modules.
 //!
 //! Byte-fidelity boundary: the `${REPLY#"$HOME"/}` strip keeps the
 //! whole stage path on a miss, like the shell's expansion, and the

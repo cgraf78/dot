@@ -1,327 +1,350 @@
-//! Differential parity tests for fragment-family discovery against
-//! `lib/dot/families.sh`: aggregate files, `.replace` winner
-//! selection, artifact filtering, pattern pre-filtering, and the
-//! byte-ordered stream (including a non-UTF8 filename probe).
+//! Native contracts for ordered fragment-family discovery and byte globbing.
 
 use std::ffi::OsStr;
-use std::process::{Command, Stdio};
+use std::path::Path;
 
-use dot::families::family_files;
+use dot::families::{self, family_files};
+use dot_test_support::TempDir;
 
-/// Raw bytes of an `OsStr` for byte-exact comparisons. Unix: lossless.
-/// Elsewhere: lossy (the byte-level probes are `#[cfg(unix)]`-gated;
-/// only UTF-8 fixtures reach this helper there).
+type FilterCase<'a> = (&'a [&'a [u8]], &'a [&'a [u8]]);
+
 #[cfg(unix)]
 fn raw_bytes(value: &OsStr) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::OsStrExt as _;
     value.as_bytes().to_vec()
 }
 
-/// Non-Unix fallback for [`raw_bytes`].
 #[cfg(not(unix))]
 fn raw_bytes(value: &OsStr) -> Vec<u8> {
     value.to_string_lossy().into_owned().into_bytes()
 }
 
-/// Oracle interpreter: absolute path resolved once from the parent PATH
-/// (see `dot::test_support::bash`), so hermetic children spawn the
-/// engine runtime even under `env_clear` — a bare `bash` would follow
-/// the child's env and fall back to the macOS 3.2 trampoline.
-fn bash_cmd() -> Command {
-    Command::new(dot::test_support::bash())
-}
-
-/// Run `dot_family_files` / `dot_family_files_matching` on `dir` with
-/// `patterns`. Returns (exit code, raw stdout bytes).
-fn shell_family(dir: &OsStr, matching: bool, patterns: &[&OsStr]) -> (i32, Vec<u8>) {
-    // $0 dummy, $1 family dir, $2 tree root, $3 mode, $4+ patterns.
-    // No `shift` juggling (`shift` never moves `$0`); `"${@:4}"`
-    // keeps the callee argv exact in both modes.
-    let mut cmd = bash_cmd();
-    cmd.arg("--noprofile").arg("--norc").arg("-c").arg(
-        ". \"$2/lib/dot/families.sh\"\n\
-         if [ \"$3\" = matching ]; then dot_family_files_matching \"$1\" \"${@:4}\";\n\
-         else dot_family_files \"$1\"; fi\n",
-    );
-    cmd.arg("dot-test-sh");
-    cmd.arg(dir);
-    cmd.arg(env!("CARGO_MANIFEST_DIR"));
-    cmd.arg(if matching { "matching" } else { "plain" });
-    for pattern in patterns {
-        cmd.arg(pattern);
+fn write(root: &Path, name: &str) {
+    let path = root.join(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("fixture parents");
     }
-    let output = cmd
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .expect("spawn bash");
-    (output.status.code().unwrap_or(99), output.stdout)
+    std::fs::write(path, format!("{name}\n")).expect("fixture file");
 }
 
-/// Fixture family: aggregates, two populated groups, empty and
-/// ignored-only groups, a non-directory `*.replace` file, editor
-/// artifacts, a symlink pair, and a non-UTF8 name.
+/// One family containing ordinary aggregates, replacement groups, artifacts,
+/// nested non-candidates, links, a tabbed name, and a non-UTF-8 name.
 struct Fixture {
-    dir: dot::test_support::TempDir,
+    dir: TempDir,
 }
 
 impl Fixture {
     fn build() -> Self {
-        let dir = dot::test_support::TempDir::new("families").expect("temp dir");
+        let dir = TempDir::new("families-native").expect("temp dir");
         let root = dir.path();
         for name in [
-            "10-a.sh",
+            "10-core.json",
+            "15-a.sh",
             "20-b.sh",
-            "notes.txt",
-            ".hidden",
-            "bak~",
+            "25-notes.txt",
+            "80-strange.replace",
+            "85-tab\tname.json",
+            "90-extra.json",
+            ".hidden.json",
+            "99-temp.json~",
             "x.tmp",
             "x.tmp.1",
             "y.bak",
             "z.swp",
             "w.swo",
             ".DS_Store",
-            "strange.replace",
+            "65-subdir/10-nested.json",
+            "05-group.replace/01-low.sh",
+            "05-group.replace/02-high.sh",
+            "30-second.replace/a.sh",
+            "30-second.replace/b.sh",
+            "50-env.replace/50-alpha.json",
+            "50-env.replace/80-beta.json",
+            "60-ignored.replace/.hidden.json",
+            "60-ignored.replace/x.tmp",
+            "70-mode.replace/10-dark.json",
+            "70-mode.replace/20-light.json",
+            "75-nested.replace/90-dir/99-nested.json",
         ] {
-            std::fs::write(root.join(name), b"payload").expect("write");
+            write(root, name);
         }
-        // Non-UTF8 filename: byte-level candidacy and ordering.
-        // Unix-only and never macOS: non-UTF8 names have no portable
-        // spelling, and APFS rejects them at creation outright (the
-        // byte-exactness probe runs on Linux CI instead).
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            std::fs::write(root.join(OsStr::from_bytes(b"bad\xffname.sh")), b"payload")
-                .expect("write");
-        }
-        let group = root.join("05-group.replace");
-        std::fs::create_dir(&group).expect("mkdir");
-        for name in ["01-low.sh", "02-high.sh", "skip~", ".hidden-in-group"] {
-            std::fs::write(group.join(name), b"payload").expect("write");
-        }
-        let second = root.join("30-second.replace");
-        std::fs::create_dir(&second).expect("mkdir");
-        for name in ["a.sh", "b.sh"] {
-            std::fs::write(second.join(name), b"payload").expect("write");
-        }
-        std::fs::create_dir(root.join("empty.replace")).expect("mkdir");
-        let ignored = root.join("ignored-only.replace");
-        std::fs::create_dir(&ignored).expect("mkdir");
-        std::fs::write(ignored.join("x.tmp"), b"payload").expect("write");
-        std::fs::create_dir(root.join("plain")).expect("mkdir");
+        std::fs::create_dir(root.join("55-empty.replace")).expect("empty replacement group");
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink("10-a.sh", root.join("link-ok.sh")).expect("symlink");
-            std::os::unix::fs::symlink("no-such-target", root.join("dangling.sh"))
-                .expect("symlink");
+            std::os::unix::fs::symlink("10-core.json", root.join("40-link.json"))
+                .expect("live fragment link");
+            std::os::unix::fs::symlink("missing", root.join("45-dangling.json"))
+                .expect("dangling fragment link");
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            std::fs::write(
+                root.join(OsStr::from_bytes(b"87-bad\xff.json")),
+                b"non-utf8\n",
+            )
+            .expect("non-UTF-8 fixture");
         }
         Self { dir }
     }
 
-    fn check(&self, matching: bool, patterns: &[&OsStr]) {
-        let dir = self.dir.path().as_os_str();
-        let (shell_code, shell_out) = shell_family(dir, matching, patterns);
-        let owned: Vec<Vec<u8>> = patterns.iter().map(|p| raw_bytes(p)).collect();
-        let borrowed: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-        let rust = family_files(Some(self.dir.path()), &borrowed).expect("arity ok");
-        let mut rust_out = Vec::new();
-        for path in &rust {
-            rust_out.extend_from_slice(&raw_bytes(path.as_os_str()));
-            rust_out.push(b'\n');
-        }
+    fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn add_filtered_out_winner(&self) {
+        write(self.root(), "50-env.replace/90-not-json.txt");
+    }
+
+    fn keys(&self, patterns: &[&[u8]]) -> Vec<Vec<u8>> {
+        family_files(Some(self.root()), patterns)
+            .expect("family directory argument")
+            .into_iter()
+            .map(|path| relative_bytes(self.root(), &path))
+            .collect()
+    }
+}
+
+fn relative_bytes(root: &Path, path: &Path) -> Vec<u8> {
+    raw_bytes(
+        path.strip_prefix(root)
+            .expect("family result stays under its root")
+            .as_os_str(),
+    )
+}
+
+fn expected(mut keys: Vec<&[u8]>) -> Vec<Vec<u8>> {
+    keys.sort();
+    keys.into_iter().map(<[u8]>::to_vec).collect()
+}
+
+fn all_expected(filtered_out_winner: bool) -> Vec<Vec<u8>> {
+    let mut keys = vec![
+        b"05-group.replace/02-high.sh".as_slice(),
+        b"10-core.json",
+        b"15-a.sh",
+        b"20-b.sh",
+        b"25-notes.txt",
+        b"30-second.replace/b.sh",
+        if filtered_out_winner {
+            b"50-env.replace/90-not-json.txt"
+        } else {
+            b"50-env.replace/80-beta.json"
+        },
+        b"70-mode.replace/20-light.json",
+        b"80-strange.replace",
+        b"85-tab\tname.json",
+        b"90-extra.json",
+    ];
+    #[cfg(unix)]
+    keys.push(b"40-link.json");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    keys.push(b"87-bad\xff.json");
+    expected(keys)
+}
+
+#[test]
+fn family_stream_orders_aggregates_and_replacement_winners() {
+    let fixture = Fixture::build();
+    assert_eq!(fixture.keys(&[]), all_expected(false));
+}
+
+#[test]
+fn filtering_precedes_replacement_selection_and_has_literal_results() {
+    let fixture = Fixture::build();
+    fixture.add_filtered_out_winner();
+
+    let mut json = vec![
+        b"10-core.json".as_slice(),
+        b"50-env.replace/80-beta.json",
+        b"70-mode.replace/20-light.json",
+        b"85-tab\tname.json",
+        b"90-extra.json",
+    ];
+    #[cfg(unix)]
+    json.push(b"40-link.json");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    json.push(b"87-bad\xff.json");
+    assert_eq!(
+        fixture.keys(&[b"*.json", b"*.replace/*.json"]),
+        expected(json),
+        "the later non-JSON member must not displace a matching JSON winner"
+    );
+
+    let cases: &[FilterCase<'_>] = &[
+        (
+            &[b"*.sh"],
+            &[
+                b"05-group.replace/02-high.sh",
+                b"15-a.sh",
+                b"20-b.sh",
+                b"30-second.replace/b.sh",
+            ],
+        ),
+        (
+            &[b"*.txt"],
+            &[b"25-notes.txt", b"50-env.replace/90-not-json.txt"],
+        ),
+        (&[b"05-group.replace/*"], &[b"05-group.replace/02-high.sh"]),
+        (&[b"nomatch*"], &[]),
+        (&[b"10-*", b"*-b.sh"], &[b"10-core.json", b"20-b.sh"]),
+        (&[b"02-high.sh"], &[]),
+        (&[b"*.replace"], &[b"80-strange.replace"]),
+        (&[b"a|b"], &[]),
+        (&[b"[12]0-*"], &[b"10-core.json", b"20-b.sh"]),
+    ];
+    for (patterns, want) in cases {
         assert_eq!(
-            (0, rust_out),
-            (shell_code, shell_out),
-            "family divergence matching={matching} patterns={patterns:?}"
+            fixture.keys(patterns),
+            expected(want.to_vec()),
+            "patterns {patterns:?}"
         );
     }
+    assert_eq!(fixture.keys(&[b"*"]), all_expected(true));
 }
 
 #[test]
-fn rust_matches_shell_on_family_stream() {
+fn artifact_names_nested_entries_and_dangling_links_are_excluded() {
+    let cases: &[(&[u8], bool)] = &[
+        (b"hook.sh", true),
+        (b"a.b", true),
+        (b"DS_Store-x", true),
+        (b"~lead", true),
+        (b"", false),
+        (b".hidden", false),
+        (b".replace", false),
+        (b"notes~", false),
+        (b"frag.tmp", false),
+        (b"frag.tmp.1", false),
+        (b"old.bak", false),
+        (b"x.swp", false),
+        (b"y.swo", false),
+        (b".DS_Store", false),
+    ];
+    for (name, want) in cases {
+        assert_eq!(families::is_candidate_name(name), *want, "name {name:?}");
+    }
+
     let fixture = Fixture::build();
-    // Plain stream, no patterns.
-    fixture.check(false, &[]);
-    // Pattern pre-filtering (applied before winner selection).
-    for patterns in [
-        vec![],
-        vec![OsStr::new("*.sh")],
-        vec![OsStr::new("*.txt")],
-        vec![OsStr::new("05-group.replace/*")],
-        vec![OsStr::new("*")],
-        vec![OsStr::new("nomatch*")],
-        vec![OsStr::new("10-*"), OsStr::new("*-b.sh")],
-        vec![OsStr::new("02-high.sh")],
-        vec![OsStr::new("*.replace")],
-        vec![OsStr::new("a|b")],
-        vec![OsStr::new("[12]0-*")],
+    let keys = fixture.keys(&[]);
+    for rejected in [
+        b"65-subdir/10-nested.json".as_slice(),
+        b"75-nested.replace/90-dir/99-nested.json",
+        b"45-dangling.json",
+        b".hidden.json",
+        b"99-temp.json~",
     ] {
-        fixture.check(true, &patterns);
+        assert!(!keys.iter().any(|key| key == rejected), "key {rejected:?}");
     }
 }
 
 #[test]
-fn missing_and_file_directories_are_empty() {
-    let missing = std::ffi::OsStr::new("/nonexistent-family-dir-xyz");
-    assert_eq!(shell_family(missing, false, &[]), (0, Vec::new()));
+fn missing_and_non_directory_inputs_are_empty_and_missing_argument_is_usage() {
     assert_eq!(
-        family_files(Some(std::path::Path::new(missing)), &[]),
+        family_files(Some(Path::new("/nonexistent-family-dir-xyz")), &[]),
         Ok(Vec::new())
     );
-    let file = std::env::temp_dir().join("dot-family-file-probe");
-    std::fs::write(&file, b"x").expect("write");
-    let (code, out) = shell_family(file.as_os_str(), false, &[]);
-    assert_eq!((code, out), (0, Vec::new()));
+    let scratch = TempDir::new("family-file-input").expect("temp dir");
+    let file = scratch.write("not-a-directory", b"payload");
     assert_eq!(family_files(Some(&file), &[]), Ok(Vec::new()));
-    std::fs::remove_file(&file).expect("cleanup");
+    assert_eq!(family_files(None, &[]), Err(families::Error::Usage));
+    assert_eq!(families::Error::Usage.code(), 2);
+    std::fs::remove_file(file).expect("remove non-directory fixture");
+
+    let ignored = scratch.path().join("ignored-only.replace");
+    std::fs::create_dir(&ignored).expect("ignored-only group");
+    write(&ignored, ".hidden.json");
+    assert_eq!(family_files(Some(scratch.path()), &[]), Ok(Vec::new()));
 }
 
-/// Pin [`dot::glob::matches`] against the true oracle — bash `case`
-/// with the pattern arriving via a variable, exactly like
-/// `_dot_family_key_matches`. Whatever bash says here rules; the
-/// unit tests in `src/glob.rs` must agree with this matrix.
-/// Unix-only: byte-exact argv have no portable spelling.
 #[test]
 #[cfg(unix)]
-fn glob_exotics_match_shell_case() {
+fn glob_byte_contract_has_literal_expected_verdicts() {
     use dot::glob::matches;
-    // (pattern, key) pairs; the verdict comes from bash at runtime.
-    // Rust byte literals are exact here (no shell quoting layer), so
-    // `\\` below is one real backslash and `\\\\` is two.
-    let pairs: &[(&[u8], &[u8])] = &[
-        // Descending ranges are void, endpoints included.
-        (b"[c-a]", b"a"),
-        (b"[c-a]", b"c"),
-        (b"[c-a]", b"b"),
-        // Leading dashes stage: `[--0]` spans.
-        (b"[--0]", b"-"),
-        (b"[--0]", b"."),
-        (b"[--0]", b"0"),
-        (b"[--0]", b"1"),
-        // Escapes contribute the escaped char as a member.
-        (b"[\\]]", b"]"),
-        (b"[\\]]", b"\\"),
-        (b"[a\\]c]", b"]"),
-        (b"[a\\]c]", b"a]c"),
-        (b"[a\\bc]", b"b"),
-        (b"[\\\\]", b"\\"),
-        (b"[a\\\\c]", b"\\"),
-        (b"[a\\\\c]", b"a"),
-        (b"[a\\\\-c]", b"a"),
-        (b"[a\\\\-c]", b"\\"),
-        (b"[a\\\\-c]", b"b"),
-        (b"[a\\\\-c]", b"-"),
-        (b"[a\\\\-c]", b"c"),
-        (b"[\\--0]", b"-"),
-        (b"[\\--0]", b"."),
-        (b"[\\--0]", b"0"),
-        (b"[\\--0]", b"\\"),
-        // Post-range dashes: literal after good ranges ...
-        (b"[a-c-e-g]", b"b"),
-        (b"[a-c-e-g]", b"-"),
-        (b"[a-c-e-g]", b"f"),
-        (b"[a-c-e-g]", b"d"),
-        (b"[a-c-]", b"-"),
-        (b"[a-c--d]", b"-"),
-        (b"[a-c--d]", b"."),
-        (b"[a-c--d]", b"d"),
-        // ... shadowed after void ones ...
-        (b"[\\\\--0]", b"-"),
-        (b"[\\\\--0]", b"."),
-        (b"[\\\\--0]", b"0"),
-        (b"[c-A--b]", b"-"),
-        (b"[c-A--b]", b"."),
-        (b"[c-A--b]", b"b"),
-        (b"[c-A---b]", b"-"),
-        (b"[c-A---b]", b"."),
-        (b"[c-A---b]", b"b"),
-        // Byte semantics under LC_ALL=C: `?` and class members are
-        // single bytes, so a two-byte UTF-8 char needs two of them.
-        (b"?", "é".as_bytes()),
-        (b"??", "é".as_bytes()),
-        ("[é]".as_bytes(), "é".as_bytes()),
-        ("*é*".as_bytes(), "café".as_bytes()),
-        // Empty pattern matches only the empty text.
-        (b"", b""),
-        (b"", b"a"),
-        // Backtracking across classes and stars.
-        (b"*a*b", b"aab"),
-        (b"a*b*c", b"abc"),
-        (b"a*b*c", b"axbyc"),
-        (b"a*b*c", b"ac"),
-        (b"[ab]*[cd]", b"axd"),
-        (b"[ab]*[cd]", b"axe"),
-        (b"*[*]*", b"a[b"),
-        (b"*[*]*", b"ab"),
-        // Everyday shapes.
-        (b"a\\", b"a\\"),
-        (b"a\\", b"ab"),
-        (b"[ab", b"[ab"),
-        (b"[ab", b"a"),
-        (b"*.*", b"x.tmp.1"),
-        (b"*.tmp.*", b"x.tmp"),
-        (b"?", b""),
-        (b"[!a]", b"b"),
-        (b"[^a]", b"a"),
-        (b"[]a]", b"]"),
-        (b"[a-]", b"-"),
-        (b"[-a]", b"."),
-        (b"a|b", b"a"),
-        (b"**", b"anything"),
-        (b"\\*\\?\\[", b"*?["),
+    let pairs: &[(&[u8], &[u8], bool)] = &[
+        (b"[c-a]", b"a", false),
+        (b"[c-a]", b"c", false),
+        (b"[c-a]", b"b", false),
+        (b"[--0]", b"-", true),
+        (b"[--0]", b".", true),
+        (b"[--0]", b"0", true),
+        (b"[--0]", b"1", false),
+        (b"[\\]]", b"]", true),
+        (b"[\\]]", b"\\", false),
+        (b"[a\\]c]", b"]", true),
+        (b"[a\\]c]", b"a]c", false),
+        (b"[a\\bc]", b"b", true),
+        (b"[\\\\]", b"\\", true),
+        (b"[a\\\\c]", b"\\", true),
+        (b"[a\\\\c]", b"a", true),
+        (b"[a\\\\-c]", b"a", true),
+        (b"[a\\\\-c]", b"\\", true),
+        (b"[a\\\\-c]", b"b", true),
+        (b"[a\\\\-c]", b"-", false),
+        (b"[a\\\\-c]", b"c", true),
+        (b"[\\--0]", b"-", true),
+        (b"[\\--0]", b".", true),
+        (b"[\\--0]", b"0", true),
+        (b"[\\--0]", b"\\", false),
+        (b"[a-c-e-g]", b"b", true),
+        (b"[a-c-e-g]", b"-", true),
+        (b"[a-c-e-g]", b"f", true),
+        (b"[a-c-e-g]", b"d", false),
+        (b"[a-c-]", b"-", true),
+        (b"[a-c--d]", b"-", true),
+        (b"[a-c--d]", b".", true),
+        (b"[a-c--d]", b"d", true),
+        (b"[\\\\--0]", b"-", false),
+        (b"[\\\\--0]", b".", false),
+        (b"[\\\\--0]", b"0", true),
+        (b"[c-A--b]", b"-", true),
+        (b"[c-A--b]", b".", true),
+        (b"[c-A--b]", b"b", true),
+        (b"[c-A---b]", b"-", true),
+        (b"[c-A---b]", b".", false),
+        (b"[c-A---b]", b"b", true),
+        (b"?", "é".as_bytes(), false),
+        (b"??", "é".as_bytes(), true),
+        ("[é]".as_bytes(), "é".as_bytes(), false),
+        ("*é*".as_bytes(), "café".as_bytes(), true),
+        (b"", b"", true),
+        (b"", b"a", false),
+        (b"*a*b", b"aab", true),
+        (b"a*b*c", b"abc", true),
+        (b"a*b*c", b"axbyc", true),
+        (b"a*b*c", b"ac", false),
+        (b"[ab]*[cd]", b"axd", true),
+        (b"[ab]*[cd]", b"axe", false),
+        (b"*[*]*", b"a[b", false),
+        (b"*[*]*", b"ab", false),
+        (b"a\\", b"a\\", true),
+        (b"a\\", b"ab", false),
+        (b"[ab", b"[ab", true),
+        (b"[ab", b"a", false),
+        (b"*.*", b"x.tmp.1", true),
+        (b"*.tmp.*", b"x.tmp", false),
+        (b"?", b"", false),
+        (b"[!a]", b"b", true),
+        (b"[^a]", b"a", false),
+        (b"[]a]", b"]", true),
+        (b"[a-]", b"-", true),
+        (b"[-a]", b".", false),
+        (b"a|b", b"a", false),
+        (b"**", b"anything", true),
+        (b"\\*\\?\\[", b"*?[", true),
     ];
-    for (pattern, key) in pairs {
-        let output = bash_cmd()
-            .arg("--noprofile")
-            .arg("--norc")
-            .arg("-c")
-            .arg("key=$1; pat=$2; case $key in $pat) exit 0;; *) exit 1;; esac")
-            .arg("dot-test-sh")
-            .arg(os_arg(key))
-            .arg(os_arg(pattern))
-            .env_clear()
-            .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .expect("spawn bash");
-        let shell = output.status.code() == Some(0);
+    for (pattern, key, want) in pairs {
         assert_eq!(
             matches(pattern, key),
-            shell,
-            "glob divergence pattern={pattern:?} key={key:?}",
+            *want,
+            "pattern={pattern:?} key={key:?}"
         );
     }
-}
-
-/// Build an argv element from raw bytes (Unix-only: byte-exact argv
-/// have no portable spelling).
-#[cfg(unix)]
-fn os_arg(bytes: &[u8]) -> &OsStr {
-    use std::os::unix::ffi::OsStrExt;
-    OsStr::from_bytes(bytes)
 }
 
 #[test]
 #[cfg(all(unix, not(target_os = "macos")))]
-fn non_utf8_name_is_byte_exact() {
+fn non_utf8_name_and_filter_are_byte_exact() {
     let fixture = Fixture::build();
-    let dir = fixture.dir.path().as_os_str();
-    let (_, shell_out) = shell_family(dir, true, &[OsStr::new("bad*")]);
-    let mut expected = raw_bytes(dir);
-    expected.extend_from_slice(b"/bad\xffname.sh\n");
-    assert_eq!(shell_out, expected, "shell fixture sanity");
-    let patterns: Vec<&[u8]> = vec![b"bad*"];
-    let rust = family_files(Some(fixture.dir.path()), &patterns).expect("ok");
-    assert_eq!(rust.len(), 1);
-    assert_eq!(
-        raw_bytes(rust[0].as_os_str()),
-        expected[..expected.len() - 1]
-    );
+    assert_eq!(fixture.keys(&[b"87-*"]), vec![b"87-bad\xff.json".to_vec()]);
 }
