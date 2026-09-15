@@ -75,6 +75,29 @@ extern "C" fn capture_entry_stdio() {
 )]
 static CAPTURE_ENTRY_STDIO: extern "C" fn() = capture_entry_stdio;
 
+/// Resolve the exec-boundary descriptor bitmap, probing live descriptors
+/// when no static capture ran. musl's static startup does not execute
+/// `.preinit_array`, so release binaries built for musl arrive with a zero
+/// mask; probing then observes the inherited descriptors exactly as the
+/// capture would have, except for descriptors the Rust runtime already
+/// reserved (its pre-`main` normalization reopens closed standard
+/// descriptors on `/dev/null`). A relay started from the probe therefore
+/// behaves identically whenever stdio was open at exec; only the exotic
+/// closed-at-exec edge reports the reserved sink instead of absence.
+fn resolve_entry_stdio_mask(stored: u8) -> u8 {
+    if stored & ENTRY_STDIO_INITIALIZED != 0 {
+        return stored;
+    }
+    let mut mask = ENTRY_STDIO_INITIALIZED;
+    for descriptor in 0..=2 {
+        // SAFETY: fcntl with F_GETFD only observes descriptor validity.
+        if unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0 {
+            mask |= 1 << descriptor;
+        }
+    }
+    mask
+}
+
 /// Whether a standard descriptor was open at exec. The binary entry point
 /// uses this for informational commands that bypass the output relay, so a
 /// descriptor closed at exec fails identically on both paths.
@@ -2439,19 +2462,17 @@ impl ProcessOutputRelay {
     /// Capture the exec-boundary descriptor bitmap and start a serialized
     /// primary stdout/stderr relay. Stderr also has an independent dormant
     /// fallback so a blocked stdout cannot suppress the bounded timeout or
-    /// cancellation diagnostic that explains the terminal status.
+    /// cancellation diagnostic that explains the terminal status. When no
+    /// static capture ran (musl static binaries never execute
+    /// `.preinit_array`), live descriptors are probed instead of failing.
     pub fn start() -> std::io::Result<Self> {
         use std::os::fd::AsRawFd as _;
 
         // Take the initializer's address so the linker keeps its object
         // in every binary that starts a relay (see above).
         std::hint::black_box(&CAPTURE_ENTRY_STDIO);
-        let entry_mask = ENTRY_STDIO_MASK.load(std::sync::atomic::Ordering::Relaxed);
-        if entry_mask & ENTRY_STDIO_INITIALIZED == 0 {
-            return Err(std::io::Error::other(
-                "process stdio was not captured before runtime initialization",
-            ));
-        }
+        let stored_mask = ENTRY_STDIO_MASK.load(std::sync::atomic::Ordering::Relaxed);
+        let entry_mask = resolve_entry_stdio_mask(stored_mask);
         let stdout = snapshot_process_output(
             libc::STDOUT_FILENO,
             entry_mask & (1 << libc::STDOUT_FILENO) != 0,
@@ -11523,5 +11544,28 @@ int kill(pid_t pid, int sig) {
     #[cfg(not(unix))]
     fn process_gone(_pid: u32) -> bool {
         true
+    }
+
+    #[test]
+    fn resolve_entry_stdio_mask_prefers_the_captured_bitmap() {
+        let captured = ENTRY_STDIO_INITIALIZED | 0b011;
+        assert_eq!(resolve_entry_stdio_mask(captured), captured);
+        let closed = ENTRY_STDIO_INITIALIZED;
+        assert_eq!(resolve_entry_stdio_mask(closed), closed);
+    }
+
+    #[test]
+    fn resolve_entry_stdio_mask_probes_live_without_capture() {
+        let mask = resolve_entry_stdio_mask(0);
+        assert_ne!(mask & ENTRY_STDIO_INITIALIZED, 0);
+        for descriptor in 0..=2 {
+            // SAFETY: fcntl with F_GETFD only observes descriptor validity.
+            let open = unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0;
+            assert_eq!(
+                mask & (1 << descriptor) != 0,
+                open,
+                "descriptor {descriptor} must match the live probe"
+            );
+        }
     }
 }
