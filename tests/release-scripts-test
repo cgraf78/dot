@@ -112,8 +112,14 @@ assert_eq dot "$RELEASE_ASSET_NAME" 'release archives retain the dot name'
 assert_eq dot "$RELEASE_BINARY" 'release config builds the native dot binary'
 
 declared_files=$(printf '%s\n' "${RELEASE_PAYLOAD_FILES[@]}")
-assert_eq $'README.md\nLICENSE\nsupport/client-launcher.sh' "$declared_files" \
-  'release package includes documentation and the client adapter'
+assert_eq $'README.md\nLICENSE\nsupport/client-launcher.sh\nsupport/shdeps.lock' "$declared_files" \
+  'release package includes documentation, the client adapter, and the Shdeps trust anchor'
+# The native Tools provider reads its pinned Shdeps revision, installer
+# digest, and ABI exclusively from $source_root/support/shdeps.lock. A
+# release root without the lock fails every provider path, so installs
+# from the archive could never run dependency updates.
+[[ -f $DOT_TEST_ROOT/support/shdeps.lock && ! -L $DOT_TEST_ROOT/support/shdeps.lock ]] ||
+  fail 'release payload references a missing Shdeps trust anchor'
 declared_dirs=$(printf '%s\n' "${RELEASE_PAYLOAD_DIRS[@]}")
 assert_eq 'lib/dot/public' "$declared_dirs" \
   'release package retains only the public shell API directory'
