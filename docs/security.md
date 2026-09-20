@@ -1,18 +1,20 @@
 # Security and trust model
 
-The convenience `curl | bash` installation trusts TLS, GitHub delivery, the
-protected `cgraf78/dot` main branch, and the cgraf78 account. A checksum fetched
-from that same mutable channel would not add independent trust, so dot does not
-present one as verification.
+The convenience `curl | bash` installation trusts TLS and GitHub delivery for
+the installer itself. It requires the GitHub CLI (`gh`), verifies the platform
+archive's published checksum, and then requires a GitHub artifact attestation
+for `cgraf78/dot` whose signer repository is `cgraf78/actions`. The checksum
+detects corruption and binds the requested asset name; the independently
+verified build provenance is the executable-release trust decision.
 
-The installer validates and publishes one ordinary checkout, uses a shared
-owner-recorded mutation lock with Shdeps, and refuses foreign destinations. A
-selected Shdeps development checkout is explicit source trust. Dot validates
-its user-owned root, bootstrap entrypoints, Git metadata, and official origin
-to prevent accidental foreign selection, then treats the whole checkout as
-executable developer input, including existing binaries and Cargo inputs.
-Those identity checks are not a recursive content sandbox. `install.sh
---managed` bypasses and never executes that development target.
+The installer publishes one immutable versioned release behind an atomic
+stable link and refuses foreign destinations. Caller-supplied local archives
+use their explicitly supplied checksum but are not treated as online attested
+downloads. A selected Shdeps development checkout remains explicit source
+trust for dependency-provider behavior; Dot validates its user-owned root,
+bootstrap entrypoints, Git metadata, and official origin before treating that
+checkout as executable developer input. Those identity checks are not a
+recursive content sandbox.
 
 Client configuration is parsed as data. Extension discovery is versioned and
 rejects unsafe roots, path components, file types, ownership, modes, duplicate
@@ -33,9 +35,9 @@ inspects the complete candidate inventory against its dynamic control-plane
 paths. The check covers lexical and physical containment, including a
 symlinked parent into dot or provider state. Publication revalidates the
 physical parent generation. The only public-command exception is the exact
-tracked `support/client-launcher.sh` from this release. The permanent launcher
-derives the official Shdeps checkout root and requires the public library link
-to resolve into that same checkout before dispatch.
+tracked `support/client-launcher.sh` from this release. This legacy adapter
+derives the standalone release root and validates its native binary and public
+hook API directory before dispatch.
 
 Client materialization reapplies the effective process umask after filesystem
 creation, including on filesystems whose inherited default ACL would otherwise
