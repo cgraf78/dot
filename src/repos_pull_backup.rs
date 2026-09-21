@@ -517,7 +517,11 @@ mod cancellation_tests {
         let signals = crate::cleanup::Signals::install().unwrap();
         let signal_ready = ready.clone();
         let sender = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            // Loaded CI hosts (396 parallel lib tests on small Alpine
+            // runners) can stall the helper past a tight bound even when
+            // the fixture engages correctly, so wait patiently: a genuine
+            // hang still fails well inside the suite timeout.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !signal_ready.exists() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
