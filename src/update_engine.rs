@@ -134,7 +134,7 @@ struct InstalledSnapshot {
 /// (the manifest-unsafe warning travels in `err`).
 fn snapshot_installed_links(
     inputs: &EngineInputs<'_>,
-    err: &mut Vec<u8>,
+    err: &mut dyn std::io::Write,
 ) -> Option<InstalledSnapshot> {
     if let Err(record) = repos_overlays::recover_replacements(
         inputs.manifest,
@@ -223,8 +223,8 @@ fn snapshot_installed_links(
 }
 
 /// Append one `_warn` row to the stderr stream.
-fn warn_row(err: &mut Vec<u8>, palette: &Palette, message: &str) {
-    err.extend_from_slice(&crate::progress_ui::warn_line(palette, message.as_bytes()));
+fn warn_row(err: &mut dyn std::io::Write, palette: &Palette, message: &str) {
+    let _ = err.write_all(&crate::progress_ui::warn_line(palette, message.as_bytes()));
 }
 
 /// Result of the native repo-sync phase.
@@ -271,8 +271,46 @@ struct UpdateState {
 /// Keeping the paired streams together prevents orchestration signatures from
 /// growing a positional stdout/stderr tail.
 struct UpdateIo<'a> {
-    out: &'a mut Vec<u8>,
-    err: &'a mut Vec<u8>,
+    out: &'a mut dyn std::io::Write,
+    err: &'a mut dyn std::io::Write,
+}
+
+/// A live update stream that forwards every row immediately while remembering
+/// delivery failure. Results pass through untouched, so explicit delivery
+/// checks behave exactly as with the raw stream; the engine converts a
+/// remembered failure into its exit-1 delivery contract at the end, exactly
+/// like the old end-of-run flush.
+struct LiveSink<'a> {
+    inner: &'a mut dyn std::io::Write,
+    failed: bool,
+}
+
+impl LiveSink<'_> {
+    fn failed(&self) -> bool {
+        self.failed
+    }
+}
+
+impl std::io::Write for LiveSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self.inner.write_all(bytes) {
+            Ok(()) => Ok(bytes.len()),
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.inner.flush() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
 }
 
 impl UpdateState {
@@ -457,7 +495,7 @@ fn restore_generation(
     base: &Base,
     snapshot: &InstalledSnapshot,
     entries: &[String],
-    err: &mut Vec<u8>,
+    err: &mut dyn std::io::Write,
 ) -> bool {
     let ok = crate::repos_overlays::restore_installed_links(
         &crate::repos_overlays::RestoreInstalledInputs {
@@ -494,10 +532,9 @@ pub fn sync_repos(
     inputs: &EngineInputs<'_>,
     stage: &mut Stage,
     moves: &mut crate::temp::MoveCache,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> SyncDone {
-    use std::io::Write as _;
     let base = inputs.base.filter(|found| found.exists());
     let Some(base) = base else {
         // No base checkout: config only, then the shared tail
@@ -576,8 +613,8 @@ pub fn sync_repos(
     let config = match crate::startup::preflight(&startup) {
         Ok(config) => config,
         Err(failure) => {
-            err.extend_from_slice(failure.line().as_bytes());
-            err.push(b'\n');
+            let _ = err.write_all(failure.line().as_bytes());
+            let _ = err.write_all(b"\n");
             let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose);
             let _ = out.write_all(&close);
             restore_generation(inputs, base, &snapshot, &[], err);
@@ -616,14 +653,13 @@ fn sync_tail(
     state: UpdateState,
     stage: &mut Stage,
     moves: &mut crate::temp::MoveCache,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
     mut agg: Agg,
     base: Option<&Base>,
     snapshot: Option<InstalledSnapshot>,
     close_active: bool,
 ) -> SyncDone {
-    use std::io::Write as _;
     let mut io = UpdateIo { out, err };
     let mut conv = converge_overlays(inputs, state, stage, moves, &mut io);
     agg.fold_agg(&conv.overlay);
@@ -698,8 +734,8 @@ fn pull_overlays_only(
     candidate: &crate::repos_pull_queries::CandidateEnv,
     base: Option<&Base>,
     entries: &[String],
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
     progress_done: &str,
     progress_total: &str,
 ) -> crate::repos_pull_fleet::PullOverlaysOutcome {
@@ -768,7 +804,6 @@ fn converge_overlays(
     moves: &mut crate::temp::MoveCache,
     io: &mut UpdateIo<'_>,
 ) -> ConvergeOut {
-    use std::io::Write as _;
     let fail = |state: UpdateState, overlay: Agg| ConvergeOut {
         rc: 1,
         state,
@@ -780,8 +815,9 @@ fn converge_overlays(
         inputs.home,
         Some(&update.config.default_profile),
     ) {
-        io.err
-            .extend_from_slice(format!("dot: profile: {}\n", error.message).as_bytes());
+        let _ = io
+            .err
+            .write_all(format!("dot: profile: {}\n", error.message).as_bytes());
         return fail(update, overlay);
     }
     if update.profiles.present {
@@ -798,8 +834,8 @@ fn converge_overlays(
         ..Default::default()
     };
     if let Err(warning) = crate::overlays::preflight(&mut preflight_state, inputs.home) {
-        io.err.extend_from_slice(warning.as_bytes());
-        io.err.push(b'\n');
+        let _ = io.err.write_all(warning.as_bytes());
+        let _ = io.err.write_all(b"\n");
         update.active = entries;
         return fail(update, overlay);
     }
@@ -881,15 +917,15 @@ fn converge_profiles(
     mut update: UpdateState,
     mut overlay: Agg,
 ) -> ConvergeOut {
-    use std::io::Write as _;
     let fail = |state: UpdateState, overlay: Agg| ConvergeOut {
         rc: 1,
         state,
         overlay,
     };
     if let Err(error) = update.profiles.select_base() {
-        io.err
-            .extend_from_slice(format!("dot: profile: {}\n", error.message).as_bytes());
+        let _ = io
+            .err
+            .write_all(format!("dot: profile: {}\n", error.message).as_bytes());
         return fail(update, overlay);
     }
     let mut state = crate::overlays::State::default();
@@ -909,8 +945,8 @@ fn converge_profiles(
         ..Default::default()
     };
     if let Err(warning) = crate::overlays::preflight(&mut preflight_state, inputs.home) {
-        io.err.extend_from_slice(warning.as_bytes());
-        io.err.push(b'\n');
+        let _ = io.err.write_all(warning.as_bytes());
+        let _ = io.err.write_all(b"\n");
         update.active = entries;
         return fail(update, overlay);
     }
@@ -979,8 +1015,9 @@ fn converge_profiles(
     let user = match crate::profiles::current_user() {
         Some(user) => user,
         None => {
-            io.err
-                .extend_from_slice(b"dot: profile: cannot determine current user\n");
+            let _ = io
+                .err
+                .write_all(b"dot: profile: cannot determine current user\n");
             update.active = entries;
             return fail(update, overlay);
         }
@@ -988,8 +1025,9 @@ fn converge_profiles(
     let host = match crate::platform::detect_host() {
         Ok(host) => host,
         Err(_) => {
-            io.err
-                .extend_from_slice(b"dot: profile: cannot determine current short hostname\n");
+            let _ = io
+                .err
+                .write_all(b"dot: profile: cannot determine current short hostname\n");
             update.active = entries;
             return fail(update, overlay);
         }
@@ -1003,8 +1041,9 @@ fn converge_profiles(
         &host,
         inputs.euid,
     ) {
-        io.err
-            .extend_from_slice(format!("dot: profile: {}\n", error.message).as_bytes());
+        let _ = io
+            .err
+            .write_all(format!("dot: profile: {}\n", error.message).as_bytes());
         update.active = entries;
         return fail(update, overlay);
     }
@@ -1019,8 +1058,8 @@ fn converge_profiles(
         ..Default::default()
     };
     if let Err(warning) = crate::overlays::preflight(&mut preflight_state, inputs.home) {
-        io.err.extend_from_slice(warning.as_bytes());
-        io.err.push(b'\n');
+        let _ = io.err.write_all(warning.as_bytes());
+        let _ = io.err.write_all(b"\n");
         update.active = entries;
         return fail(update, overlay);
     }
@@ -1092,7 +1131,7 @@ fn use_set(state: &mut crate::overlays::State, kind: &str) -> Vec<String> {
 fn discover_active(
     inputs: &EngineInputs<'_>,
     state: &mut crate::overlays::State,
-    err: &mut Vec<u8>,
+    err: &mut dyn std::io::Write,
 ) -> Result<(), ()> {
     let xdg_config = if inputs.config_home.is_empty() {
         String::new()
@@ -1123,7 +1162,7 @@ fn discover_active(
     match crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches) {
         Ok(()) => Ok(()),
         Err(error) => {
-            err.extend_from_slice(format!("{error:?}\n").as_bytes());
+            let _ = err.write_all(format!("{error:?}\n").as_bytes());
             Err(())
         }
     }
@@ -1136,7 +1175,7 @@ fn discover_selected(
     inputs: &EngineInputs<'_>,
     state: &mut crate::overlays::State,
     selected: &[String],
-    err: &mut Vec<u8>,
+    err: &mut dyn std::io::Write,
 ) -> Result<(), ()> {
     let xdg_config = inputs.config_home.to_string();
     let conf_dir = crate::overlays::conf_dir(&xdg_config, inputs.home);
@@ -1165,7 +1204,7 @@ fn discover_selected(
     match crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches) {
         Ok(()) => Ok(()),
         Err(error) => {
-            err.extend_from_slice(format!("{error}\n").as_bytes());
+            let _ = err.write_all(format!("{error}\n").as_bytes());
             Err(())
         }
     }
@@ -1179,8 +1218,8 @@ fn pre_sync(
     configured_root: Option<&str>,
     eligible: &[String],
     stage: &str,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> Result<(), ()> {
     let extensions_dir = configured_root.unwrap_or(inputs.extensions_dir);
     let trust = crate::extension_trust::Inputs {
@@ -1207,8 +1246,8 @@ fn pre_sync(
     );
     let mut runner = |call: &crate::pre_sync::Call| {
         let outcome = worker.pre_sync(call);
-        out.extend_from_slice(&outcome.stdout);
-        err.extend_from_slice(&outcome.stderr);
+        let _ = out.write_all(&outcome.stdout);
+        let _ = err.write_all(&outcome.stderr);
         outcome.rc == 0
     };
     match crate::pre_sync::run(stage, &records, &trust, eligible, inputs.tmp, &mut runner) {
@@ -1220,8 +1259,8 @@ fn pre_sync(
             Err(())
         }
         Err(crate::pre_sync::Error::Invalid(message)) => {
-            err.extend_from_slice(message.as_bytes());
-            err.push(b'\n');
+            let _ = err.write_all(message.as_bytes());
+            let _ = err.write_all(b"\n");
             Err(())
         }
         Err(crate::pre_sync::Error::Usage | crate::pre_sync::Error::Refused) => Err(()),
@@ -1241,8 +1280,7 @@ fn record_name(record: &str) -> Option<&str> {
 
 /// `_dot_update_skip_inputs`: the Tools/Configs warning close for
 /// a failed input side.
-fn skip_inputs_rows(stage: &mut Stage, out: &mut Vec<u8>, reason: &str) {
-    use std::io::Write as _;
+fn skip_inputs_rows(stage: &mut Stage, out: &mut dyn std::io::Write, reason: &str) {
     let open = stage.start(
         b"Tools",
         Some(b"skipping configured dependencies"),
@@ -1284,10 +1322,7 @@ fn finalize(
     now_secs: i64,
     update_status: i32,
     frozen: bool,
-    live_out: &mut dyn std::io::Write,
-    live_err: &mut dyn std::io::Write,
 ) -> i32 {
-    use std::io::Write as _;
     if cancelled() {
         return 1;
     }
@@ -1415,11 +1450,9 @@ fn finalize(
                 let _ = io.out.write_all(&close);
             } else {
                 // The shell prepares Shdeps before opening the Tools stage.
-                // Flush completed earlier stages first so bootstrap/download
-                // diagnostics retain their stream and execution-point order.
-                if !flush_pending(io, live_out, live_err) {
-                    return 1;
-                }
+                // Engine rows already stream live, so bootstrap/download
+                // diagnostics keep their stream and execution-point order
+                // without a handoff flush.
                 let policy = match state.config.shdeps_update_policy {
                     crate::config::UpdatePolicy::Pinned => "pinned",
                     crate::config::UpdatePolicy::Latest => "latest",
@@ -1440,16 +1473,17 @@ fn finalize(
                     ascii: inputs.ascii,
                     bar_width: inputs.bar_width,
                 };
-                match crate::shdeps_provider::prepare(&provider_inputs, live_out, live_err) {
+                match crate::shdeps_provider::prepare(&provider_inputs, &mut *io.out, &mut *io.err)
+                {
                     Err(provider) if provider.interrupted.is_some() || cancelled() => {
                         return interruption_status(provider.interrupted);
                     }
                     Err(provider) if provider.abort => {
-                        let _ = live_err.write_all(&provider.stderr);
+                        let _ = io.err.write_all(&provider.stderr);
                         return 1;
                     }
                     Err(provider) => {
-                        if live_err.write_all(&provider.stderr).is_err() {
+                        if io.err.write_all(&provider.stderr).is_err() {
                             return 1;
                         }
                         let open = stage.start(
@@ -1475,15 +1509,12 @@ fn finalize(
                             inputs.dot_verbose,
                         );
                         let _ = io.out.write_all(&open);
-                        if !flush_pending(io, live_out, live_err) {
-                            return 1;
-                        }
                         let provider = crate::shdeps_provider::update(
                             &provider_inputs,
                             prepared,
                             stage,
-                            live_out,
-                            live_err,
+                            &mut *io.out,
+                            &mut *io.err,
                         );
                         if provider.interrupted.is_some() {
                             return interruption_status(provider.interrupted);
@@ -1497,16 +1528,14 @@ fn finalize(
                             crate::update_engine::now_secs(),
                         );
                         let _ = io.out.write_all(&close);
-                        io.out.extend_from_slice(&provider.details);
+                        let _ = io.out.write_all(&provider.details);
                         if provider.status != 0 {
                             status = 1;
                         } else if let Some((before, after)) = provider.revision_change {
                             if cancelled() {
                                 return 1;
                             }
-                            return provider_reexec(
-                                inputs, io, &before, &after, now_secs, live_out, live_err,
-                            );
+                            return provider_reexec(inputs, io, &before, &after, now_secs);
                         }
                     }
                 }
@@ -1639,10 +1668,7 @@ fn provider_reexec(
     before: &str,
     after: &str,
     now_secs: i64,
-    live_out: &mut dyn std::io::Write,
-    live_err: &mut dyn std::io::Write,
 ) -> i32 {
-    use std::io::Write as _;
     if cancelled() {
         return 1;
     }
@@ -1733,8 +1759,8 @@ fn provider_reexec(
     let config = match crate::startup::preflight(&startup) {
         Ok(config) => config,
         Err(failure) => {
-            io.err.extend_from_slice(failure.line().as_bytes());
-            io.err.push(b'\n');
+            let _ = io.err.write_all(failure.line().as_bytes());
+            let _ = io.err.write_all(b"\n");
             return 1;
         }
     };
@@ -1757,19 +1783,7 @@ fn provider_reexec(
     if cancelled() {
         return 1;
     }
-    run_gathered(&nested, io.out, io.err, now_secs, live_out, live_err)
-}
-
-fn flush_pending(
-    io: &mut UpdateIo<'_>,
-    live_out: &mut dyn std::io::Write,
-    live_err: &mut dyn std::io::Write,
-) -> bool {
-    let stdout_ok = live_out.write_all(io.out).is_ok();
-    let stderr_ok = live_err.write_all(io.err).is_ok();
-    io.out.clear();
-    io.err.clear();
-    stdout_ok && stderr_ok
+    run_gathered(&nested, &mut *io.out, &mut *io.err, now_secs)
 }
 
 fn cancelled() -> bool {
@@ -2205,19 +2219,19 @@ pub fn run_update(
             return error.code();
         }
     };
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let code = run_gathered(
-        &gathered.inputs(),
-        &mut out,
-        &mut err,
-        now_secs(),
-        streams.stdout,
-        streams.stderr,
-    );
-    let stdout_failed = streams.stdout.write_all(&out).is_err();
-    let stderr_failed = streams.stderr.write_all(&err).is_err();
-    if stdout_failed || stderr_failed {
+    // Every engine row streams through these sinks as its phase files it;
+    // either sink remembers a delivery failure so the exit status still
+    // reports undelivered output exactly like the old end-of-run flush.
+    let mut out = LiveSink {
+        inner: &mut *streams.stdout,
+        failed: false,
+    };
+    let mut err = LiveSink {
+        inner: &mut *streams.stderr,
+        failed: false,
+    };
+    let code = run_gathered(&gathered.inputs(), &mut out, &mut err, now_secs());
+    if out.failed() || err.failed() {
         return 1;
     }
     code
@@ -2239,11 +2253,9 @@ pub fn run_update(
 /// directory across plain updates).
 fn run_gathered(
     inputs: &EngineInputs<'_>,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
     now_secs: i64,
-    live_out: &mut dyn std::io::Write,
-    live_err: &mut dyn std::io::Write,
 ) -> i32 {
     if cancelled() {
         return 1;
@@ -2274,7 +2286,7 @@ fn run_gathered(
         );
         return 0;
     }
-    let rc = run_gathered_inner(inputs, out, err, now_secs, live_out, live_err);
+    let rc = run_gathered_inner(inputs, out, err, now_secs);
     if inputs.flags.cron && !cancelled() {
         let state_home = Path::new(inputs.state_home);
         if rc == 0 {
@@ -2291,13 +2303,10 @@ fn run_gathered(
 /// and finalization with the defensive policy reload between them.
 fn run_gathered_inner(
     inputs: &EngineInputs<'_>,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
     now_secs: i64,
-    live_out: &mut dyn std::io::Write,
-    live_err: &mut dyn std::io::Write,
 ) -> i32 {
-    use std::io::Write as _;
     if cancelled() {
         return 1;
     }
@@ -2326,8 +2335,6 @@ fn run_gathered_inner(
             now_secs,
             1,
             sync.frozen,
-            live_out,
-            live_err,
         );
         return rc;
     }
@@ -2338,8 +2345,8 @@ fn run_gathered_inner(
     match crate::startup::preflight(&startup) {
         Ok(config) => sync.state.config = config,
         Err(failure) => {
-            err.extend_from_slice(failure.line().as_bytes());
-            err.push(b'\n');
+            let _ = err.write_all(failure.line().as_bytes());
+            let _ = err.write_all(b"\n");
             let close = crate::progress_ui::done(
                 inputs.palette,
                 quiet(inputs),
@@ -2364,8 +2371,6 @@ fn run_gathered_inner(
         now_secs,
         0,
         sync.frozen,
-        live_out,
-        live_err,
     )
 }
 
@@ -2463,6 +2468,26 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn live_sink_forwards_rows_and_remembers_delivery_failure() {
+        use std::io::Write as _;
+        let mut inner = Vec::new();
+        let mut sink = LiveSink {
+            inner: &mut inner,
+            failed: false,
+        };
+        sink.write_all(b"row\n").expect("forward rows");
+        assert!(!sink.failed());
+        assert_eq!(inner, b"row\n");
+        let mut failing = FailingWriter;
+        let mut sink = LiveSink {
+            inner: &mut failing,
+            failed: false,
+        };
+        assert!(sink.write_all(b"row\n").is_err());
+        assert!(sink.failed());
     }
 
     #[test]

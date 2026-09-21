@@ -151,8 +151,8 @@ fn link_rows_visible(ui_total: Option<&str>, verbose: bool) -> bool {
 }
 
 /// Append one `_warn` row to the stderr stream.
-fn warn_row(err: &mut Vec<u8>, palette: &Palette, message: String) {
-    err.extend_from_slice(&crate::progress_ui::warn_line(palette, message.as_bytes()));
+fn warn_row(err: &mut dyn std::io::Write, palette: &Palette, message: String) {
+    let _ = err.write_all(&crate::progress_ui::warn_line(palette, message.as_bytes()));
 }
 
 /// Append one `_ui_status` row to the stdout stream, threading the
@@ -162,7 +162,7 @@ fn status_row(
     inputs: &Inputs<'_>,
     status: &[u8],
     detail: &str,
-    out: &mut Vec<u8>,
+    out: &mut dyn std::io::Write,
 ) {
     let (bytes, live) = crate::progress_ui::status(
         inputs.palette,
@@ -172,17 +172,17 @@ fn status_row(
         detail.as_bytes(),
         inputs.multibyte,
     );
-    out.extend_from_slice(&bytes);
+    let _ = out.write_all(&bytes);
     state.live_active = live;
 }
 
 /// Append one `_log` row unless quiet hides it.
-fn log_row(out: &mut Vec<u8>, inputs: &Inputs<'_>, text: &str) {
+fn log_row(out: &mut dyn std::io::Write, inputs: &Inputs<'_>, text: &str) {
     if is_quiet(inputs.dot_quiet) {
         return;
     }
-    out.extend_from_slice(text.as_bytes());
-    out.push(b'\n');
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.write_all(b"\n");
 }
 
 /// `_base_git update-index --skip-worktree`: mark one shadowed path
@@ -240,8 +240,8 @@ fn link_one(
     state: &mut OverlayState,
     cache: &mut AuthorityCache,
     src: &[u8],
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> Option<FileStep> {
     if crate::cleanup::received_signal().is_some() {
         return None;
@@ -529,8 +529,8 @@ pub fn link_overlay(
     inputs: &Inputs<'_>,
     state: &mut OverlayState,
     inventory: &[u8],
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> Outcome {
     let verbose = is_verbose(inputs.dot_verbose);
     if verbose {
