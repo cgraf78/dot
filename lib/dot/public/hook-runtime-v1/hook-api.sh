@@ -148,6 +148,13 @@ dot_tool_present() {
   esac
 }
 
+# ASCII lowercase via `tr`: case-modification expansion needs Bash 4, and
+# this payload still runs under 3.2. Callers pass platform names,
+# hostnames, and match specs, all ASCII by contract.
+_dot_hook_lower() {
+  printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'
+}
+
 _dot_hook_platform() {
   local value
 
@@ -158,7 +165,7 @@ _dot_hook_platform() {
     return
   fi
   value=$(uname -s 2>/dev/null) || return 1
-  value=${value,,}
+  value=$(_dot_hook_lower "$value")
   [[ $value == darwin ]] && value=macos
   printf '%s\n' "$value"
 }
@@ -167,7 +174,7 @@ _dot_hook_host() {
   local value
 
   value=$(hostname -s 2>/dev/null || hostname 2>/dev/null) || return 1
-  printf '%s\n' "${value,,}"
+  printf '%s\n' "$(_dot_hook_lower "$value")"
 }
 
 _dot_hook_match_specs() {
@@ -183,7 +190,7 @@ _dot_hook_match_specs() {
   for item in "${items[@]}"; do
     [[ -n $item ]] || continue
     if [[ $case_mode == lowercase ]]; then
-      normalized=${item,,}
+      normalized=$(_dot_hook_lower "$item")
     else
       normalized=$item
     fi
@@ -195,7 +202,7 @@ _dot_hook_match_specs() {
   [[ $has_include == false ]] && return 0
   for item in "${items[@]}"; do
     [[ -n $item ]] || continue
-    [[ $case_mode == lowercase ]] && item=${item,,}
+    [[ $case_mode == lowercase ]] && item=$(_dot_hook_lower "$item")
     for current in "${current_values[@]}"; do
       [[ $item == "$current" ]] && return 0
     done

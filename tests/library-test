@@ -140,4 +140,27 @@ if [[ -n $utf8_locale ]]; then
   assert_eq '' "$unicode_output" 'invalid Unicode color output'
 fi
 
+# The shipped shell payload runs under each platform's default Bash,
+# including 3.2 on macOS, which the Linux-only Rust suite never
+# exercises. Ban post-3.2 constructs statically so they fail here
+# instead of on a Mac. The patterns stay clear of full-line comments
+# and use portable ERE (no GNU-only `\|` or `\b`) for BSD grep.
+bash32_violations=$DOT_TEST_TMP/payload-bash32
+: >"$bash32_violations"
+while IFS= read -r -d '' payload_file; do
+  grep -nE \
+    -e '(^|[;|&])[[:space:]]*(declare|local|typeset)[[:space:]]+-[a-zA-Z]*A([^A-Za-z0-9_]|$)' \
+    -e '(^|[;|&])[[:space:]]*(mapfile|readarray|coproc)([^A-Za-z0-9_]|$)' \
+    -e '&>>' -e ';;&' -e ';&' -e '[,^][,^]}' -e '[A-Za-z0-9_][,^]}' \
+    -e '[|]&' -e 'exec[[:space:]]*[{][A-Za-z_]' -e 'globstar' \
+    "$payload_file" | grep -v '^[0-9]*:[[:space:]]*#' |
+    sed "s|^|$payload_file:|" >>"$bash32_violations" || true
+done < <(find "$DOT_TEST_ROOT/lib" "$DOT_TEST_ROOT/bin" "$DOT_TEST_ROOT/support" \
+  -type f \( -name '*.sh' -o -path "$DOT_TEST_ROOT/bin/*" \) -print0)
+if [[ -s $bash32_violations ]]; then
+  bash32_count=$(grep -c . "$bash32_violations")
+  bash32_sample=$(head -n 5 "$bash32_violations" | tr '\n' ';')
+  fail "payload needs Bash 3.2 ($bash32_count: $bash32_sample)"
+fi
+
 printf 'library-test: ok\n'
