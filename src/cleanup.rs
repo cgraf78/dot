@@ -3290,6 +3290,7 @@ fn read_proc_stat(path: &Path) -> std::io::Result<Vec<u8>> {
     std::fs::read(path)
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn proc_process_snapshot(root: &Path, deadline: Instant) -> Option<Vec<ProcessInfo>> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -3356,12 +3357,14 @@ fn proc_stat_fields(stat: &[u8]) -> Option<Vec<&[u8]>> {
 /// `X`, ...), or `None` for a short/corrupt read. Shares the comm scan
 /// with [`parse_proc_process`] so the two can never disagree about where
 /// comm ends (comm may itself contain `") X "`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn proc_stat_state(stat: &[u8]) -> Option<u8> {
     proc_stat_fields(stat)?
         .first()
         .and_then(|state| state.first().copied())
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn parse_proc_process(pid: u32, stat: &[u8]) -> Option<ProcessInfo> {
     let fields = proc_stat_fields(stat)?;
     let parse = |index: usize| {
