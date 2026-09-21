@@ -1187,6 +1187,72 @@ impl Stage {
     }
 }
 
+/// Seconds between live heartbeat redraws: whole-second stamps mean
+/// one render per elapsed second keeps the live counter visibly
+/// advancing without redraw spam.
+pub const HEARTBEAT_INTERVAL_SECS: i64 = 1;
+
+/// Wait-loop poll quantum behind heartbeat waiters: completions
+/// surface within a tenth of a second while renders stay gated to
+/// whole seconds by [`Heartbeat`].
+pub const HEARTBEAT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Shared live-render heartbeat: one render trigger fed by real
+/// progress events and periodic wait-loop polls alike. Live-line
+/// renders latch through [`Heartbeat::noted`]; polls render through
+/// [`Heartbeat::poll`] only once the latched second is stale, so a
+/// quiet phase still redraws its elapsed stamp every second while a
+/// busy phase never double-renders the live line. (Newline status
+/// rows are separate lines and never latch.) Seconds only (never
+/// instants):
+/// callers already thread whole-second stamps, and tests pin every
+/// transition with explicit values instead of wall-clock gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Heartbeat {
+    last_secs: i64,
+    interval_secs: i64,
+}
+
+impl Heartbeat {
+    /// Latch a heartbeat at the render second `now_secs`, redrawing
+    /// at most every `interval_secs`. Production passes
+    /// [`HEARTBEAT_INTERVAL_SECS`]; tests pass `0` to force every
+    /// poll without sleeping out a production interval. Negative
+    /// intervals clamp to the same always-due behavior.
+    pub fn new(now_secs: i64, interval_secs: i64) -> Self {
+        Heartbeat {
+            last_secs: now_secs,
+            interval_secs: interval_secs.max(0),
+        }
+    }
+
+    /// Record a real progress render at `now_secs`: the next
+    /// heartbeat waits a fresh interval instead of duplicating the
+    /// event render within its second.
+    pub fn noted(&mut self, now_secs: i64) {
+        self.last_secs = now_secs;
+    }
+
+    /// Heartbeat poll: true exactly when `now_secs` advanced at
+    /// least the interval past the latched render second, latching
+    /// the new second (a multi-second jump renders once, never a
+    /// catch-up burst). A backward clock jump relatches silently
+    /// instead of rendering, so a stepping clock can never spin the
+    /// renderer.
+    pub fn poll(&mut self, now_secs: i64) -> bool {
+        if now_secs < self.last_secs {
+            self.last_secs = now_secs;
+            return false;
+        }
+        if now_secs.saturating_sub(self.last_secs) >= self.interval_secs {
+            self.last_secs = now_secs;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// `_ui_done`: `Done in Ns.` (or `Done with errors`), plus the
 /// reload hint when one applies. `status` defaults to `0` when
 /// absent, like `${1:-0}`; `hint` is the precomputed

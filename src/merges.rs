@@ -29,10 +29,11 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Instant;
 
 use crate::merge_block::trim_shell_space;
-use crate::progress_ui::{self, Palette, arith_value};
+use crate::progress_ui::{self, Heartbeat, Palette, arith_value};
 
 /// `_merge_trim`: strip shell whitespace from both ends.
 pub fn trim(line: &str) -> &str {
@@ -772,6 +773,47 @@ fn run_one(
     }
 }
 
+/// Wait for one FIFO-window worker's record, redrawing the live
+/// line on whole seconds while stalled. A dropped sender means its
+/// worker panicked: synthesize the same rc=1 record an explicitly
+/// joined panic maps to. The join is always consumed (after a
+/// receive the worker already finished, so it blocks only for
+/// thread exit), which keeps panics reading as records rather than
+/// propagating out of the scope exactly like today.
+fn wait_for_worker(
+    rx: &Receiver<ResultRecord>,
+    worker: std::thread::ScopedJoinHandle<'_, ()>,
+    hook: Hook,
+    beat: &mut Heartbeat,
+    stage: &mut crate::progress_ui::Stage,
+    out: &mut dyn std::io::Write,
+) -> ResultRecord {
+    loop {
+        match rx.recv_timeout(crate::progress_ui::HEARTBEAT_POLL_INTERVAL) {
+            Ok(record) => {
+                drop(worker.join());
+                return record;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let now = crate::update_engine::now_secs();
+                if beat.poll(now) {
+                    let _ = out.write_all(&stage.tick(now));
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                drop(worker.join());
+                return ResultRecord {
+                    hook,
+                    rc: 1,
+                    output: Vec::new(),
+                    has_merge: false,
+                    elapsed_ms: 0,
+                };
+            }
+        }
+    }
+}
+
 /// Run one parallel batch with a fixed ceiling, then return records in the
 /// declaration order they were launched. The batch always joins before its
 /// caller can pass a `.serial.sh` barrier.
@@ -782,6 +824,10 @@ fn run_batch(
     stage: &mut crate::progress_ui::Stage,
     out: &mut dyn std::io::Write,
 ) -> Vec<ResultRecord> {
+    let mut beat = Heartbeat::new(
+        crate::update_engine::now_secs(),
+        crate::progress_ui::HEARTBEAT_INTERVAL_SECS,
+    );
     for hook in hooks {
         state.merge_index += 1;
         let label = label_from_script(&hook.key);
@@ -795,11 +841,12 @@ fn run_batch(
                 inputs.ascii,
                 inputs.multibyte,
             );
-            let _ = out.write_all(&stage.update(
-                &detail,
-                crate::update_engine::now_secs(),
-                inputs.verbose.then_some("1"),
-            ));
+            let now = crate::update_engine::now_secs();
+            let rendered = stage.update(&detail, now, inputs.verbose.then_some("1"));
+            let _ = out.write_all(&rendered);
+            if !rendered.is_empty() {
+                beat.noted(now);
+            }
         }
     }
     let jobs = parallel_jobs(
@@ -819,33 +866,26 @@ fn run_batch(
         for (index, hook) in hooks.iter().cloned().enumerate() {
             let index = first_index + index + 1;
             let panic_hook = hook.clone();
+            let (completion_tx, completion_rx) = std::sync::mpsc::channel::<ResultRecord>();
             workers.push_back((
                 panic_hook,
-                scope.spawn(move || run_one(inputs, hook, index, root, overlays)),
+                completion_rx,
+                scope.spawn(move || {
+                    let record = run_one(inputs, hook, index, root, overlays);
+                    let _ = completion_tx.send(record);
+                }),
             ));
             // Bash waits for the oldest in-flight worker once the ceiling is
             // reached, then immediately launches the next hook. This is a FIFO
             // window rather than fixed chunks, so a fast oldest worker frees
             // capacity even while a later worker is still running.
             if workers.len() >= jobs.max(1) {
-                let (hook, worker) = workers.pop_front().expect("nonempty worker queue");
-                records.push(worker.join().unwrap_or_else(|_| ResultRecord {
-                    hook,
-                    rc: 1,
-                    output: Vec::new(),
-                    has_merge: false,
-                    elapsed_ms: 0,
-                }));
+                let (hook, rx, worker) = workers.pop_front().expect("nonempty worker queue");
+                records.push(wait_for_worker(&rx, worker, hook, &mut beat, stage, out));
             }
         }
-        for (hook, worker) in workers {
-            records.push(worker.join().unwrap_or_else(|_| ResultRecord {
-                hook,
-                rc: 1,
-                output: Vec::new(),
-                has_merge: false,
-                elapsed_ms: 0,
-            }))
+        for (hook, rx, worker) in workers {
+            records.push(wait_for_worker(&rx, worker, hook, &mut beat, stage, out))
         }
     });
     records
@@ -1047,7 +1087,9 @@ fn is_serial_os(script: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunInputs, counted_ui, run, scratch};
+    use super::{
+        Heartbeat, Hook, ResultRecord, RunInputs, counted_ui, run, scratch, wait_for_worker,
+    };
     use dot_test_support::TempDir;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -1170,5 +1212,75 @@ mod tests {
             !err.windows(23)
                 .any(|window| window == b"checkout Bash resolver:")
         );
+    }
+
+    #[test]
+    fn batch_waiter_redraws_while_stalled() {
+        // A worker that outlasts the poll quantum must still redraw
+        // the live line: interval 0 forces every poll to render, so
+        // one 150ms stall (past the 100ms quantum) proves the wiring
+        // without sleeping out a production second. The received
+        // record proves the waiter stayed until completion.
+        let palette = crate::progress_ui::Palette::empty();
+        let mut stage = crate::progress_ui::Stage::begin(palette, "5", false, true, false, true);
+        let mut out = Vec::new();
+        let mut beat = Heartbeat::new(crate::update_engine::now_secs(), 0);
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel::<ResultRecord>();
+            let hook = Hook {
+                key: std::ffi::OsString::from("k"),
+                script: std::path::PathBuf::from("s.sh"),
+            };
+            let worker = scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let _ = tx.send(ResultRecord {
+                    hook: Hook {
+                        key: std::ffi::OsString::from("k"),
+                        script: std::path::PathBuf::from("s.sh"),
+                    },
+                    rc: 0,
+                    output: b"done".to_vec(),
+                    has_merge: true,
+                    elapsed_ms: 7,
+                });
+            });
+            let record = wait_for_worker(&rx, worker, hook, &mut beat, &mut stage, &mut out);
+            assert_eq!(record.rc, 0);
+            assert_eq!(record.output, b"done");
+            assert!(record.has_merge);
+            assert_eq!(record.elapsed_ms, 7);
+        });
+        assert!(out.contains(&0x1b), "150ms stall drew no heartbeat");
+    }
+
+    #[test]
+    fn batch_waiter_turns_worker_panic_into_rc1() {
+        // Intentional panic: a worker that dies without reporting
+        // must read as the same rc=1 record an explicitly joined
+        // panic maps to, and the consumed join must keep the panic
+        // from propagating out of the scope (propagation would fail
+        // this test by panicking it).
+        let palette = crate::progress_ui::Palette::empty();
+        let mut stage = crate::progress_ui::Stage::begin(palette, "5", false, false, false, true);
+        let mut out = Vec::new();
+        let mut beat = Heartbeat::new(crate::update_engine::now_secs(), 0);
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel::<ResultRecord>();
+            let hook = Hook {
+                key: std::ffi::OsString::from("k"),
+                script: std::path::PathBuf::from("s.sh"),
+            };
+            let worker = scope.spawn(move || {
+                drop(tx);
+                panic!("intentional worker panic");
+            });
+            let record = wait_for_worker(&rx, worker, hook, &mut beat, &mut stage, &mut out);
+            assert_eq!(record.rc, 1);
+            assert!(record.output.is_empty());
+            assert!(!record.has_merge);
+            assert_eq!(record.elapsed_ms, 0);
+            assert_eq!(record.hook.key, std::ffi::OsString::from("k"));
+        });
+        assert!(out.is_empty());
     }
 }

@@ -33,11 +33,12 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 
 use crate::cleanup::Registry;
 use crate::log::Log;
 use crate::merges::update_jobs;
-use crate::progress_ui::{Palette, Stage, count_phrase, join_comma, progress_detail};
+use crate::progress_ui::{Heartbeat, Palette, Stage, count_phrase, join_comma, progress_detail};
 use crate::repos_base::Base;
 use crate::repos_config::ensure_repo_config;
 use crate::repos_dirty::normalize_filtered;
@@ -465,20 +466,65 @@ pub fn pull_overlays_serial(
 /// borrow, each with its own [`MoveCache`] and its own indexed
 /// result files. A panicking worker leaves its status file missing,
 /// which the ordered replay reads as a plumbing failure.
+/// Reap `count` worker completions, redrawing the live line on
+/// whole seconds while stalled (the `run_to_log_with_ticks`
+/// pattern: the waiting thread polls instead of blocking in a
+/// join). A dropped sender means its worker panicked without
+/// completing: stop waiting (its status file is missing, which the
+/// ordered replay reads as a plumbing failure) and let the
+/// enclosing scope propagate the panic as a bare join would.
+fn wait_for_chunk(
+    rx: &std::sync::mpsc::Receiver<()>,
+    count: usize,
+    beat: &mut Heartbeat,
+    stage: &mut Stage,
+    out: &mut dyn Write,
+) {
+    // Timeouts never consume the budget: only completions do, so a
+    // slow worker delays the replay instead of truncating it.
+    let mut remaining = count;
+    while remaining > 0 {
+        match rx.recv_timeout(crate::progress_ui::HEARTBEAT_POLL_INTERVAL) {
+            Ok(()) => {
+                remaining -= 1;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let now = crate::update_engine::now_secs();
+                if beat.poll(now) {
+                    let _ = out.write_all(&stage.tick(now));
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 fn run_chunk(
     chunk: &[ActiveOverlay<'_>],
     base_idx: i64,
     result_dir: &Path,
     inputs: &PullOverlaysInputs<'_>,
+    stage: &mut Stage,
+    out: &mut dyn Write,
+    beat: &mut Heartbeat,
 ) {
     let host_git = crate::init_client_identity::current_host_git();
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel::<()>();
     std::thread::scope(|scope| {
         for (offset, entry) in chunk.iter().enumerate() {
             let idx = base_idx + offset as i64 + 1;
             let dir = result_dir;
             let item = *entry;
             let host_git = host_git.clone();
+            let completion_tx = completion_tx.clone();
             scope.spawn(move || {
+                // Every exit reports: the waiter counts completions
+                // instead of joining, so a missing send would stall
+                // it until disconnect. Only a panic skips the send
+                // (its sender drops), which reads as disconnect.
+                let done = || {
+                    let _ = completion_tx.send(());
+                };
                 let _host_git = host_git
                     .as_deref()
                     .map(crate::init_client_identity::bind_host_git_for_scope);
@@ -524,11 +570,13 @@ fn run_chunk(
                 let Ok(file) = opened else {
                     let _ = std::fs::write(&rc_path, "1");
                     let _ = std::fs::write(&status_path, "");
+                    done();
                     return;
                 };
                 let Ok(clone) = file.try_clone() else {
                     let _ = std::fs::write(&rc_path, "1");
                     let _ = std::fs::write(&status_path, "");
+                    done();
                     return;
                 };
                 let mut out_file = file;
@@ -538,8 +586,13 @@ fn run_chunk(
                 drop(err_file);
                 let _ = std::fs::write(&rc_path, outcome.rc.to_string());
                 let _ = std::fs::write(&status_path, outcome.status.as_str());
+                done();
             });
         }
+        // The parent-side sender must drop so a panicking worker
+        // reads as disconnect; worker clones report the rest.
+        drop(completion_tx);
+        wait_for_chunk(&completion_rx, chunk.len(), beat, stage, out);
     });
 }
 
@@ -575,19 +628,27 @@ pub fn pull_overlays(
         return pull_overlays_serial(inputs, stage, moves, out, warnings);
     };
     let bound = jobs_bound(inputs.update_jobs).max(1);
+    let mut beat = Heartbeat::new(
+        crate::update_engine::now_secs(),
+        crate::progress_ui::HEARTBEAT_INTERVAL_SECS,
+    );
     // Launch pass: bump progress per entry in declaration order,
     // exactly like the shell's pre-fork `_done`/`_dot_maybe_stage_progress`.
     for entry in &active {
         done += 1;
+        let now = crate::update_engine::now_secs();
         let rendered = stage.maybe_progress(
             entry.name.as_bytes(),
             done,
             total,
-            crate::update_engine::now_secs(),
+            now,
             inputs.dot_verbose,
             inputs.bar_width,
         );
         let _ = out.write_all(&rendered);
+        if !rendered.is_empty() {
+            beat.noted(now);
+        }
     }
     let final_done = done;
     // Parallel pass in bound-sized chunks (the shell slides one
@@ -595,7 +656,7 @@ pub fn pull_overlays(
     // the same ordered replay and the same cap).
     let mut base_idx: i64 = 0;
     for chunk in active.chunks(bound) {
-        run_chunk(chunk, base_idx, &result_dir, inputs);
+        run_chunk(chunk, base_idx, &result_dir, inputs, stage, out, &mut beat);
         base_idx += chunk.len() as i64;
     }
     // Ordered replay: collect non-empty logs plus structured
@@ -1028,5 +1089,53 @@ pub fn pull_all(
         failed,
         skipped,
         deferred: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_waiter_redraws_while_stalled() {
+        // A worker that outlasts the poll quantum must still redraw
+        // the live line: interval 0 forces every poll to render, so
+        // one 150ms stall (past the 100ms quantum) proves the wiring
+        // without sleeping out a production second.
+        let palette = crate::progress_ui::Palette::empty();
+        let mut stage = Stage::begin(palette, "5", false, true, false, true);
+        let mut out = Vec::new();
+        let mut beat = Heartbeat::new(crate::update_engine::now_secs(), 0);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_sender = completed.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            completed_sender.store(true, std::sync::atomic::Ordering::Release);
+            let _ = tx.send(());
+        });
+        wait_for_chunk(&rx, 1, &mut beat, &mut stage, &mut out);
+        assert!(out.contains(&0x1b), "150ms stall drew no heartbeat");
+        // Timeouts must never consume the completion budget: the
+        // waiter returns only after the worker reports.
+        assert!(
+            completed.load(std::sync::atomic::Ordering::Acquire),
+            "waiter returned before the completion arrived"
+        );
+    }
+
+    #[test]
+    fn chunk_waiter_stops_on_disconnect() {
+        // A dropped sender (a worker that panicked without
+        // completing) ends the wait instead of hanging: no
+        // completions expected, none rendered, no crash.
+        let palette = crate::progress_ui::Palette::empty();
+        let mut stage = Stage::begin(palette, "5", false, false, false, true);
+        let mut out = Vec::new();
+        let mut beat = Heartbeat::new(crate::update_engine::now_secs(), 0);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        drop(tx);
+        wait_for_chunk(&rx, 3, &mut beat, &mut stage, &mut out);
+        assert!(out.is_empty());
     }
 }

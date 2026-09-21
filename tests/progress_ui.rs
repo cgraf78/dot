@@ -483,3 +483,57 @@ fn clock_and_json_edge_matrices_are_explicit() {
         }
     }
 }
+
+#[test]
+fn heartbeat_production_cadence_is_one_second() {
+    // Whole-second stamps mean a render per elapsed second is exactly
+    // "at least every second" for the live seconds counter.
+    assert_eq!(HEARTBEAT_INTERVAL_SECS, 1);
+}
+
+#[test]
+fn heartbeat_renders_at_most_once_per_interval() {
+    let mut beat = Heartbeat::new(100, 1);
+    assert!(!beat.poll(100));
+    assert!(!beat.poll(100));
+    assert!(beat.poll(101));
+    assert!(!beat.poll(101));
+    // A multi-second jump renders once, never a catch-up burst.
+    assert!(beat.poll(104));
+    assert!(!beat.poll(104));
+}
+
+#[test]
+fn heartbeat_noted_event_restarts_the_interval() {
+    let mut beat = Heartbeat::new(100, 1);
+    beat.noted(100);
+    assert!(!beat.poll(100));
+    assert!(beat.poll(101));
+    // A later event render pushes the next heartbeat out, so the
+    // heartbeat never duplicates an event render within its second.
+    beat.noted(101);
+    assert!(!beat.poll(101));
+    assert!(beat.poll(102));
+}
+
+#[test]
+fn heartbeat_backward_clock_relatches_without_rendering() {
+    let mut beat = Heartbeat::new(100, 1);
+    assert!(!beat.poll(99));
+    // Relatched at 99: no render storm while the clock sits behind.
+    assert!(!beat.poll(99));
+    assert!(!beat.poll(98));
+    assert!(beat.poll(100));
+}
+
+#[test]
+fn heartbeat_zero_interval_renders_every_poll() {
+    // Tests force every wait-loop poll to render without sleeping out
+    // a production interval.
+    let mut beat = Heartbeat::new(50, 0);
+    assert!(beat.poll(50));
+    assert!(beat.poll(50));
+    // Negative intervals clamp to the same always-due behavior.
+    let mut beat = Heartbeat::new(50, -3);
+    assert!(beat.poll(50));
+}
