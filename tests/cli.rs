@@ -690,10 +690,13 @@ fn binary_version_shape() {
         let output = bin().arg(flag).output().expect("run dot version");
         assert!(output.status.success(), "flag: {flag}");
         let stdout = String::from_utf8(output.stdout).expect("stdout UTF-8");
-        assert!(stdout.starts_with("dot commit "), "flag {flag}: {stdout}");
-        assert!(
-            stdout.ends_with(" (config 1; extensions 1; library 1)\n"),
-            "flag {flag}: {stdout}"
+        assert_eq!(
+            stdout,
+            format!(
+                "dot {} (config 1; extensions 1; library 1)\n",
+                env!("DOT_BUILD_VERSION")
+            ),
+            "flag {flag}"
         );
         assert!(output.stderr.is_empty(), "flag: {flag}");
     }

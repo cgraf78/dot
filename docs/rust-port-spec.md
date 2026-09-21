@@ -8,24 +8,22 @@ are not a second runtime or a test oracle.
 ## 1. Version identity
 
 - `dot version` prints exactly:
-  `dot commit <rev> (config 1; extensions 1; library 1)\n`
-  where `<rev>` is the 12-hex-char source revision, or the literal
-  `unknown` when no revision is available (no git, thin checkout, or
-  `DOT_BUILD_COMMIT` unset and unresolvable). This matches `dot_version()`
-  in `lib/dot/main.sh`, including the `unknown` fallback.
-- `build.rs` provides `DOT_BUILD_COMMIT` / `DOT_BUILD_SHORT_COMMIT` /
-  `DOT_BUILD_VERSION` via `cargo:rustc-env`, resolved as:
-  `$DOT_BUILD_COMMIT` → `$GITHUB_SHA` → `git rev-parse HEAD` walking up
-  from the manifest dir → `unknown` (unlike shdeps, never panic: the
-  shell contract defines `unknown`). The short commit is the lowercased
-  first 12 hex chars, else `unknown`.
-- `DOT_BUILD_VERSION` accepts any non-empty `$DOT_BUILD_VERSION`, otherwise
-  `unknown`. Release builds supply the shared validated
-  `YYYYMMDD-HHMMSS-8hex` identity.
-- `src/version.rs` exposes `COMMIT` / `SHORT_COMMIT` / `VERSION`
-  consts plus `version_line()` (exact `dot version` text) and
-  `description()`, with unit tests asserting the revision is `unknown`
-  or 12 hex chars.
+  `dot <version> (config 1; extensions 1; library 1)\n`
+  where `<version>` is the public `YYYYMMDD-HHMMSS-<8hex>` identity,
+  the same string release tags, archive names, and installer metadata
+  use (shared Rust-repo policy). The historical shell `dot_version()`
+  printed `dot commit <short12|unknown> ...` instead.
+- `build.rs` provides `DOT_BUILD_COMMIT` / `DOT_BUILD_VERSION` via
+  `cargo:rustc-env`. The commit resolves as `$DOT_BUILD_COMMIT` →
+  `$GITHUB_SHA` → `git rev-parse HEAD` from the manifest dir, and the
+  build fails without a concrete hash. The version comes from
+  `scripts/release-version.sh` (honoring an explicit validated
+  `$DOT_BUILD_VERSION`, else the commit timestamp plus short hash),
+  and the build fails unless it matches `YYYYMMDD-HHMMSS-8hex`.
+- `src/version.rs` exposes `COMMIT` / `VERSION` consts plus
+  `version_line()` (exact `dot version` text) and `description()`,
+  with unit tests asserting a concrete commit, a well-formed version
+  whose suffix matches the commit, and the exact line shape.
 
 ## 2. CLI surface (historical slice-1 contract)
 

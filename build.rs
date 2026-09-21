@@ -1,9 +1,10 @@
-//! Build script: resolve the source revision and release version.
+//! Build script: resolve the source revision and public version.
 //!
-//! Unlike the sibling `shdeps` port, a missing revision is NOT fatal here:
-//! the shell contract defines `dot version` as printing `unknown` when git
-//! is unavailable, so the build falls back to `unknown` instead of
-//! panicking. New code must preserve that fallback.
+//! This follows the shared Rust-repo policy: the build stamps the exact
+//! commit plus the generated `YYYYMMDD-HHMMSS-8hex` version used by release
+//! tags, archive names, and installer metadata. Resolution is strict — a
+//! missing commit or an invalid version fails the build with an actionable
+//! message instead of baking in an ambiguous `unknown`.
 
 use std::env;
 use std::path::PathBuf;
@@ -12,43 +13,75 @@ use std::process::Command;
 /// Environment prefix for build overrides, mirroring the sibling repos.
 const PREFIX: &str = "DOT_BUILD";
 
-/// Resolve the full commit SHA: explicit env, then GitHub, then git.
-///
-/// Ordering is precedence, highest first: a release build stamps an exact
-/// commit via `DOT_BUILD_COMMIT` (reproducible even from an exported
-/// tarball with no `.git`), CI falls back to `GITHUB_SHA`, and only local
-/// developer builds shell out to git. git itself resolves the owning repo
-/// from the manifest dir (worktrees, submodules, ceilings included) —
-///
-/// the script must NOT walk up manually: climbing past the owning repo
-/// would silently bake an unrelated parent checkout's SHA into the
-/// binary (e.g. a crate copy nested inside another repo).
-fn resolve_commit(manifest_dir: &std::path::Path) -> String {
-    if let Ok(commit) = env::var(format!("{PREFIX}_COMMIT")) {
-        if !commit.trim().is_empty() {
-            return commit.trim().to_string();
+fn main() {
+    println!("cargo:rerun-if-env-changed={PREFIX}_COMMIT");
+    println!("cargo:rerun-if-env-changed={PREFIX}_VERSION");
+    println!("cargo:rerun-if-env-changed={PREFIX}_TIMESTAMP");
+    println!("cargo:rerun-if-env-changed=GITHUB_SHA");
+    println!("cargo:rerun-if-env-changed=GITHUB_REF");
+    println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
+    println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
+    println!("cargo:rerun-if-changed=scripts/release-version.sh");
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()));
+    // In a linked worktree `.git` is a file, not a dir, so watching the
+    // literal `.git/HEAD` would never fire and the binary would report a
+    // stale version. Watch the resolved git dir instead.
+    match resolve_git_dir(&manifest_dir) {
+        Some(git_dir) => {
+            println!("cargo:rerun-if-changed={}/HEAD", git_dir.display());
+            println!("cargo:rerun-if-changed={}/packed-refs", git_dir.display());
+        }
+        None => {
+            println!("cargo:rerun-if-changed=.git/HEAD");
+            println!("cargo:rerun-if-changed=.git/packed-refs");
         }
     }
-    if let Ok(sha) = env::var("GITHUB_SHA") {
-        if !sha.trim().is_empty() {
-            return sha.trim().to_string();
-        }
+
+    let commit = env_commit(&format!("{PREFIX}_COMMIT"))
+        .or_else(|| env_commit("GITHUB_SHA"))
+        .or_else(|| git_commit(&manifest_dir))
+        .unwrap_or_else(|| {
+            panic!(
+                "failed to resolve dot build commit; set {PREFIX}_COMMIT \
+                 to a concrete git hash when building outside a git checkout"
+            );
+        });
+    let version = build_version(&commit);
+
+    println!("cargo:rustc-env={PREFIX}_COMMIT={commit}");
+    println!("cargo:rustc-env={PREFIX}_VERSION={version}");
+}
+
+fn env_commit(name: &str) -> Option<String> {
+    let value = env::var(name).ok()?;
+    let trimmed = value.trim();
+    if valid_commit(trimmed) {
+        Some(trimmed.to_owned())
+    } else if trimmed.is_empty() {
+        None
+    } else {
+        panic!("{name} must be a concrete git hash, got {trimmed:?}");
     }
+}
+
+fn git_commit(manifest_dir: &std::path::Path) -> Option<String> {
     let output = Command::new("git")
         .arg("rev-parse")
         .arg("HEAD")
         .current_dir(manifest_dir)
-        .output();
-    if let Ok(output) = output {
-        if output.status.success() {
-            let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !sha.is_empty() {
-                return sha;
-            }
-        }
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    // Shell contract: `dot version` prints `unknown`, never fails here.
-    "unknown".to_string()
+    let commit = String::from_utf8(output.stdout).ok()?;
+    let commit = commit.trim();
+    valid_commit(commit).then(|| commit.to_owned())
+}
+
+fn valid_commit(value: &str) -> bool {
+    value.len() >= 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Resolve the git dir owning the manifest (worktree gitfiles included)
@@ -75,54 +108,44 @@ fn resolve_git_dir(manifest_dir: &std::path::Path) -> Option<PathBuf> {
     })
 }
 
-/// A usable revision is the lowercased first 12 hex chars of the SHA.
-fn short_revision(commit: &str) -> String {
-    let short: String = commit.chars().take(12).collect();
-    if short.len() == 12 && short.chars().all(|c| c.is_ascii_hexdigit()) {
-        short.to_ascii_lowercase()
-    } else {
-        "unknown".to_string()
+fn build_version(commit: &str) -> String {
+    // Keep the public version formatter in one shell helper because release
+    // tags, archive names, and installer smoke tests need the exact same logic
+    // without reimplementing Rust build-script details. Passing the already
+    // resolved commit also lets containerized builds avoid extra Git metadata
+    // reads when a safe.directory mismatch would otherwise block them.
+    let output = Command::new("bash")
+        .arg("scripts/release-version.sh")
+        .env(format!("{PREFIX}_COMMIT"), commit)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run scripts/release-version.sh: {error}"));
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("failed to compute dot build version: {stderr}");
     }
+
+    let version = String::from_utf8(output.stdout)
+        .expect("release-version.sh output should be utf-8")
+        .trim()
+        .to_owned();
+    if !valid_version(&version) {
+        panic!("release-version.sh produced invalid version {version:?}");
+    }
+    version
 }
 
-/// Resolve the release version supplied by the shared release pipeline,
-/// falling back to `unknown` for ordinary development builds.
-fn resolve_version() -> String {
-    if let Ok(version) = env::var(format!("{PREFIX}_VERSION")) {
-        let version = version.trim().to_string();
-        if !version.is_empty() {
-            return version;
-        }
-    }
-    "unknown".to_string()
-}
+fn valid_version(value: &str) -> bool {
+    let mut parts = value.split('-');
+    let date = parts.next().unwrap_or_default();
+    let time = parts.next().unwrap_or_default();
+    let commit = parts.next().unwrap_or_default();
 
-fn main() {
-    println!("cargo:rerun-if-env-changed={PREFIX}_COMMIT");
-    println!("cargo:rerun-if-env-changed={PREFIX}_VERSION");
-    println!("cargo:rerun-if-env-changed=GITHUB_SHA");
-    let manifest_dir =
-        PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()));
-    // In a linked worktree `.git` is a file, not a dir, so watching the
-    // literal `.git/HEAD` would never fire and the binary would report a
-    // stale SHA. Watch the resolved git dir instead. (Thin checkouts whose
-    // HEAD moves without touching these paths still need an explicit
-    // `DOT_BUILD_COMMIT`; that limitation is inherent to mtime tracking.)
-    match resolve_git_dir(&manifest_dir) {
-        Some(git_dir) => {
-            println!("cargo:rerun-if-changed={}/HEAD", git_dir.display());
-            println!("cargo:rerun-if-changed={}/packed-refs", git_dir.display());
-        }
-        None => {
-            println!("cargo:rerun-if-changed=.git/HEAD");
-            println!("cargo:rerun-if-changed=.git/packed-refs");
-        }
-    }
-
-    let commit = resolve_commit(&manifest_dir);
-    let short = short_revision(&commit);
-    let version = resolve_version();
-    println!("cargo:rustc-env={PREFIX}_COMMIT={commit}");
-    println!("cargo:rustc-env={PREFIX}_SHORT_COMMIT={short}");
-    println!("cargo:rustc-env={PREFIX}_VERSION={version}");
+    parts.next().is_none()
+        && date.len() == 8
+        && time.len() == 6
+        && date.bytes().all(|byte| byte.is_ascii_digit())
+        && time.bytes().all(|byte| byte.is_ascii_digit())
+        && commit.len() == 8
+        && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

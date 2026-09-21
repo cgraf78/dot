@@ -216,8 +216,8 @@ impl Engine {
 
     fn version_line(&self) -> Vec<u8> {
         format!(
-            "dot commit {} (config 1; extensions 1; library 1)\n",
-            self.short_commit()
+            "dot {} (config 1; extensions 1; library 1)\n",
+            env!("DOT_BUILD_VERSION")
         )
         .into_bytes()
     }

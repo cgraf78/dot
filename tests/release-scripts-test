@@ -4497,7 +4497,7 @@ case ${1:-} in
     ;;
   version)
     printf '%s\n' \
-      'dot commit 0123456789abcdef0123456789abcdef01234567 (config 1; extensions 1; library 1)'
+      'dot 20250101-000000-01234567 (config 1; extensions 1; library 1)'
     ;;
   frobnicate)
     printf '%s\n' 'dot: unknown command: frobnicate' >&2
@@ -4612,8 +4612,11 @@ metadata=$(cat "$extract/.dot-install.json")
 build_commit=$(sed -n 's/^[[:space:]]*"commit": "\([0-9a-f]*\)",*$/\1/p' \
   "$extract/.dot-install.json")
 [[ ${#build_commit} -ge 12 ]] || fail 'release metadata contains no usable build commit'
+build_version=$(sed -n 's/^[[:space:]]*"version": "\([^"]*\)",*$/\1/p' \
+  "$extract/.dot-install.json")
+[[ -n $build_version ]] || fail 'release metadata records no version'
 version=$("$extract/dot" version)
-assert_eq "dot commit ${build_commit:0:12} (config 1; extensions 1; library 1)" \
+assert_eq "dot $build_version (config 1; extensions 1; library 1)" \
   "$version" 'extracted binary identity agrees with release metadata'
 assert_contains '"version": "' "$metadata" 'release metadata records the computed version'
 "$extract/dot" help >/dev/null || fail 'extracted native binary cannot print help'
