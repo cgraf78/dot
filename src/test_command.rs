@@ -516,6 +516,18 @@ fn git(runtime: &Runtime, prefix: &[OsString], args: &[&str]) -> Option<Vec<u8>>
     })
 }
 
+/// System temporary directory suites run under before the runner overrides it.
+///
+/// The per-suite `temporary` root nests deep enough to exceed the ~107-byte
+/// Unix socket limit, so suites that mint sockets (tmux) build them below
+/// this directory instead of below the overridden `TMPDIR`.
+pub(crate) fn system_tmpdir(runtime: &Runtime) -> PathBuf {
+    runtime
+        .value("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
 /// Prepare the deterministic host Git backend and each suite's environment.
 pub(crate) fn environment(
     context: &Context<'_>,
@@ -587,6 +599,10 @@ pub(crate) fn environment(
         ("PATH", path),
         ("TMPDIR", temporary.as_os_str().to_owned()),
         (
+            "DOT_TEST_SYSTEM_TMPDIR",
+            system_tmpdir(runtime).into_os_string(),
+        ),
+        (
             "XDG_CACHE_HOME",
             temporary.join("xdg-cache").into_os_string(),
         ),
@@ -654,7 +670,10 @@ pub(crate) fn label(suite: &Suite) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::child_style;
+    use super::{child_style, system_tmpdir};
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
 
     #[test]
     fn terminal_enables_child_style_without_gum() {
@@ -662,5 +681,33 @@ mod tests {
         assert!(child_style(true, true, false));
         assert!(!child_style(false, true, true));
         assert!(!child_style(true, false, false));
+    }
+
+    fn runtime_with(env: BTreeMap<OsString, OsString>) -> crate::app::Runtime {
+        let cwd = std::env::temp_dir();
+        crate::app::Runtime::from_env(&env, &cwd).expect("runtime")
+    }
+
+    #[test]
+    fn system_tmpdir_prefers_runtime_tmpdir() {
+        let env = BTreeMap::from([("TMPDIR".into(), OsString::from("/var/folders/x/T"))]);
+        assert_eq!(
+            system_tmpdir(&runtime_with(env)),
+            PathBuf::from("/var/folders/x/T")
+        );
+    }
+
+    #[test]
+    fn system_tmpdir_defaults_to_tmp() {
+        assert_eq!(
+            system_tmpdir(&runtime_with(BTreeMap::new())),
+            PathBuf::from("/tmp")
+        );
+    }
+
+    #[test]
+    fn system_tmpdir_treats_empty_tmpdir_as_unset() {
+        let env = BTreeMap::from([("TMPDIR".into(), OsString::new())]);
+        assert_eq!(system_tmpdir(&runtime_with(env)), PathBuf::from("/tmp"));
     }
 }
