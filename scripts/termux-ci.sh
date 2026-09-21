@@ -27,7 +27,7 @@ help_actual=$("$binary" help)
 
 version_actual=$("$binary" version)
 case $version_actual in
-  'dot commit '*'(config 1; extensions 1; library 1)') ;;
+  'dot '*'(config 1; extensions 1; library 1)') ;;
   *)
     printf 'termux-ci: unexpected version output: %s\n' "$version_actual" >&2
     exit 1

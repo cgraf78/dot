@@ -86,8 +86,8 @@ fn run(
 
 fn version_bytes() -> Vec<u8> {
     format!(
-        "dot commit {} (config 1; extensions 1; library 1)\n",
-        env!("DOT_BUILD_SHORT_COMMIT")
+        "dot {} (config 1; extensions 1; library 1)\n",
+        env!("DOT_BUILD_VERSION")
     )
     .into_bytes()
 }
