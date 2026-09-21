@@ -35,7 +35,6 @@
 //!   broader.
 
 use std::collections::HashSet;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -137,8 +136,8 @@ fn split_entry(entry: &str) -> (String, String, String, String) {
 }
 
 /// Append one `_warn` row to the stderr stream.
-fn warn_row(err: &mut Vec<u8>, palette: &Palette, message: &str) {
-    err.extend_from_slice(&crate::progress_ui::warn_line(palette, message.as_bytes()));
+fn warn_row(err: &mut dyn std::io::Write, palette: &Palette, message: &str) {
+    let _ = err.write_all(&crate::progress_ui::warn_line(palette, message.as_bytes()));
 }
 
 /// The shell `${manifest%/*}`: everything before the last slash,
@@ -337,8 +336,8 @@ fn adopt_command(path: &str, expected: &str, actual: &str) -> String {
 pub fn link_overlays(
     inputs: &Inputs<'_>,
     stage: &mut Stage,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
     now_secs: i64,
 ) -> LinkOutcome {
     let mut outcome = LinkOutcome {
@@ -388,8 +387,8 @@ pub fn link_overlays(
         ..Default::default()
     };
     if let Err(warning) = overlays::preflight(&mut preflight_state, inputs.home) {
-        err.extend_from_slice(warning.as_bytes());
-        err.push(b'\n');
+        let _ = err.write_all(warning.as_bytes());
+        let _ = err.write_all(b"\n");
         return outcome;
     }
     // The manifest may be absent, but never a directory or link.
@@ -854,7 +853,7 @@ pub fn link_overlays(
                 ),
                 None => (false, Vec::new()),
             };
-            err.extend_from_slice(&warnings);
+            let _ = err.write_all(&warnings);
             if !restored {
                 warn_row(
                     err,

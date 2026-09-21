@@ -748,9 +748,8 @@ fn run_batch(
     hooks: &[Hook],
     state: &mut BatchState<'_>,
     stage: &mut crate::progress_ui::Stage,
-    out: &mut Vec<u8>,
+    out: &mut dyn std::io::Write,
 ) -> Vec<ResultRecord> {
-    use std::io::Write as _;
     for hook in hooks {
         state.merge_index += 1;
         let label = label_from_script(&hook.key);
@@ -818,10 +817,9 @@ fn run_batch(
 fn replay(
     records: Vec<ResultRecord>,
     inputs: &RunInputs<'_>,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> (i64, i64) {
-    use std::io::Write as _;
     let mut merged = 0;
     let mut failed = 0;
     for record in records {
@@ -880,10 +878,9 @@ fn replay(
 pub(crate) fn run(
     inputs: &RunInputs<'_>,
     stage: &mut crate::progress_ui::Stage,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> Outcome {
-    use std::io::Write as _;
     let hooks = match discover(inputs) {
         Ok(hooks) => hooks,
         Err(error) => {

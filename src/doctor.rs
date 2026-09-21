@@ -62,7 +62,11 @@ fn run_configured(
     if crate::ui::title(streams.stdout, &renderer, "dot doctor").is_err() {
         return 1;
     }
-    let mut recorder = Recorder::new();
+    let palette = crate::doctor_runtime::resolve_palette(
+        stdout_terminal,
+        runtime.value("NO_COLOR").and_then(OsStr::to_str),
+    );
+    let mut emit = Emitter::new(Recorder::new(), &palette, &mut *streams.stdout);
     let bash_required = crate::config::extensions_enabled(config)
         || config.provider == crate::config::Provider::Shdeps;
     if bash_required {
@@ -75,17 +79,18 @@ fn run_configured(
     let runtime_snapshot = runtime_snapshot(runtime, &source, bash_required);
     let engine = engine_snapshot(runtime, &source, &home);
     crate::doctor_orchestrator::check_runtime(
-        &mut recorder,
+        emit.recorder(),
         &runtime_snapshot,
         &engine,
         home.as_bytes(),
     );
+    emit.emit();
 
     let topology = topology_name(base.topology);
     let git_dir = base.client_git_dir.as_str();
     let marker = Path::new(&state).join("dot/init/completed");
     append(
-        &mut recorder,
+        emit.recorder(),
         crate::doctor_checks::check_base_repo(&BaseRepoInputs {
             topology,
             client_git_dir: git_dir,
@@ -96,23 +101,27 @@ fn run_configured(
             ),
         }),
     );
+    emit.emit();
     append(
-        &mut recorder,
+        emit.recorder(),
         crate::doctor_checks::check_update_lock(Some(&crate::update_lock::lock_path(
             runtime.state_home(),
         ))),
     );
+    emit.emit();
     append(
-        &mut recorder,
+        emit.recorder(),
         crate::doctor_checks::check_cron_freshness(&CronInputs {
             last_success: crate::update_status::read_last_success(runtime.state_home()),
             now: crate::update_engine::now_secs(),
         }),
     );
+    emit.emit();
     append(
-        &mut recorder,
+        emit.recorder(),
         provider_records(runtime, config, &home, &source),
     );
+    emit.emit();
     if crate::cleanup::received_signal().is_some() {
         return 1;
     }
@@ -138,7 +147,7 @@ fn run_configured(
     let deactivation =
         |record: &str| crate::profile_lifecycle::deactivation_script(record, &home, euid).is_ok();
     append(
-        &mut recorder,
+        emit.recorder(),
         crate::doctor_checks::check_overlays(&OverlayInputs {
             home: &home,
             profile_config_error: profiles.config_error.as_deref(),
@@ -167,6 +176,7 @@ fn run_configured(
             local_validate: &local_validate,
         }),
     );
+    emit.emit();
     let merge_specs = extensions_enabled
         .then(|| {
             merge_inventory(
@@ -180,7 +190,7 @@ fn run_configured(
         })
         .flatten();
     append(
-        &mut recorder,
+        emit.recorder(),
         crate::doctor_checks::check_merges(&MergeInputs {
             enabled: extensions_enabled,
             extensions_dir: config.extensions_dir.clone().unwrap_or_default(),
@@ -188,6 +198,7 @@ fn run_configured(
             specs: merge_specs.unwrap_or_default(),
         }),
     );
+    emit.emit();
 
     let extension_status = extensions(
         runtime,
@@ -196,24 +207,19 @@ fn run_configured(
         &overlays.active,
         &constants.overlay_manifest,
         streams.stderr,
-        &mut recorder,
+        &mut emit,
     );
     // Cancellation owns the final status at the CLI boundary. Do not render a
-    // normal report after an interrupted extension is reaped.
+    // normal report after an interrupted extension is reaped; rows already
+    // streamed stay visible so the interruption point is diagnosable.
     if crate::cleanup::received_signal().is_some() {
         return 1;
     }
-    let palette = crate::doctor_runtime::resolve_palette(
-        stdout_terminal,
-        runtime.value("NO_COLOR").and_then(OsStr::to_str),
-    );
-    if streams
-        .stdout
-        .write_all(&recorder.render_with(&palette))
-        .is_err()
-    {
+    emit.emit();
+    if emit.failed() {
         return 1;
     }
+    let recorder = emit.finish();
     let counts = recorder.counts();
     let summary = crate::doctor_coordinator::summary_line(counts.pass, counts.warn, counts.fail);
     let color = crate::doctor_coordinator::summary_color(counts.fail, counts.warn);
@@ -226,6 +232,65 @@ fn run_configured(
         counts.fail,
         extension_status,
     ))
+}
+
+/// Streams filed doctor records to stdout as checks complete, so a slow
+/// extension never holds already-known rows hostage. Rendering stays
+/// byte-identical to the end-of-run report: the row renderer is linear over
+/// concatenation, so emitting filed prefixes in order reproduces it exactly.
+struct Emitter<'a> {
+    recorder: Recorder,
+    emitted: usize,
+    failed: bool,
+    palette: &'a crate::doctor_runtime::Palette,
+    stdout: &'a mut dyn std::io::Write,
+}
+
+impl<'a> Emitter<'a> {
+    fn new(
+        recorder: Recorder,
+        palette: &'a crate::doctor_runtime::Palette,
+        stdout: &'a mut dyn std::io::Write,
+    ) -> Self {
+        Emitter {
+            recorder,
+            emitted: 0,
+            failed: false,
+            palette,
+            stdout,
+        }
+    }
+
+    fn recorder(&mut self) -> &mut Recorder {
+        &mut self.recorder
+    }
+
+    /// Write every record filed since the last emission. A delivery failure
+    /// is remembered, not fatal: the run continues so extensions still
+    /// execute and stderr diagnostics are still delivered, and the caller
+    /// converts [`Emitter::failed`] into the exit status at the end, exactly
+    /// like the old end-of-run render. The cursor advances only on success,
+    /// so a transient failure retries the same rows next time.
+    fn emit(&mut self) {
+        let pending = &self.recorder.records()[self.emitted..];
+        if pending.is_empty() {
+            return;
+        }
+        let bytes = crate::doctor_runtime::render(pending, self.palette);
+        if self.stdout.write_all(&bytes).is_ok() {
+            self.emitted = self.recorder.records().len();
+        } else {
+            self.failed = true;
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.failed
+    }
+
+    fn finish(self) -> Recorder {
+        self.recorder
+    }
 }
 
 fn text(value: Option<&OsStr>) -> String {
@@ -680,14 +745,15 @@ fn extensions(
     overlays: &[String],
     manifest: &str,
     stderr: &mut dyn std::io::Write,
-    recorder: &mut Recorder,
+    emit: &mut Emitter<'_>,
 ) -> i32 {
     if !crate::config::extensions_enabled(config) {
         return 0;
     }
     let root = config.extensions_dir.as_deref().unwrap_or_default();
     if !crate::extension_trust::root_validate(root, euid) {
-        recorder.fail(b"doctor extension discovery failed", None);
+        emit.recorder()
+            .fail(b"doctor extension discovery failed", None);
         return 1;
     }
     let directory = Path::new(root).join("doctor.d");
@@ -695,7 +761,8 @@ fn extensions(
         return 0;
     }
     if !crate::extension_trust::directory_validate(&directory, root, euid) {
-        recorder.fail(b"doctor extension discovery failed", None);
+        emit.recorder()
+            .fail(b"doctor extension discovery failed", None);
         return 1;
     }
     let trust = crate::extension_trust::Inputs {
@@ -710,13 +777,15 @@ fn extensions(
     }) {
         Ok(discovery) => discovery,
         Err(_) => {
-            recorder.fail(b"doctor extension discovery failed", None);
+            emit.recorder()
+                .fail(b"doctor extension discovery failed", None);
             return 1;
         }
     };
     if let Some(error) = discovery.error {
         let _ = stderr.write_all(&error.message());
-        recorder.fail(b"doctor extension discovery failed", None);
+        emit.recorder()
+            .fail(b"doctor extension discovery failed", None);
         return 1;
     }
     let context_overlays: Vec<Vec<u8>> = overlays
@@ -746,7 +815,7 @@ fn extensions(
         };
         let mut render = |path: &Path, recorder: &mut Recorder| render_records(path, recorder);
         if crate::doctor_orchestrator::run_extension_for(
-            recorder,
+            emit.recorder(),
             &spec.key,
             &spec.script,
             &context_overlays,
@@ -760,6 +829,7 @@ fn extensions(
         {
             status = 1;
         }
+        emit.emit();
         if crate::cleanup::received_signal().is_some() {
             return 1;
         }

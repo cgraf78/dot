@@ -20,9 +20,10 @@
 //!   mirrors the `_DR_*_COUNT` effects (`ok`/`warn`/`fail` count,
 //!   `skip`/`section` do not).
 //! - [`Recorder::render`] reproduces the deterministic pipe projection used
-//!   by differential tests. Production passes the invocation palette through
-//!   the crate-private colored renderer; palette policy remains owned by
-//!   `doctor_runtime`, while title/summary styling remains in `ui`.
+//!   by differential tests. Production renders filed prefixes through
+//!   `doctor_runtime::render` with the invocation palette as checks stream;
+//!   palette policy remains owned by `doctor_runtime`, while title/summary
+//!   styling remains in `ui`.
 //! - Text travels as bytes (`&[u8]` / `Vec<u8]`): messages carry
 //!   paths that may be non-UTF8, and `tr` / `printf` copy bytes
 //!   verbatim.
@@ -130,14 +131,11 @@ impl Recorder {
     /// projection: empty palette (no ANSI spans) on one line per
     /// row, warn/fail details on the following indented line —
     /// exactly what the live `_dr_*` helpers print when stdout is
-    /// not a terminal.
+    /// not a terminal. Production renders filed prefixes the same way
+    /// through [`crate::doctor_runtime::render`] with the invocation
+    /// palette as checks stream.
     pub fn render(&self) -> Vec<u8> {
         crate::doctor_runtime::render(&self.records, &crate::doctor_runtime::Palette::empty())
-    }
-
-    /// Render every filed row with the invocation's canonical doctor palette.
-    pub(crate) fn render_with(&self, palette: &crate::doctor_runtime::Palette) -> Vec<u8> {
-        crate::doctor_runtime::render(&self.records, palette)
     }
 }
 

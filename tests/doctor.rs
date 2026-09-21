@@ -2262,3 +2262,209 @@ fn wrong_origin_latest_provider_matches_without_the_old_engine() {
     assert!(String::from_utf8_lossy(&shell.stdout).contains("Shdeps development checkout ignored"));
     assert_pair(&shell, &native);
 }
+
+/// A `Write` sink that keeps every `write` call's bytes as its own chunk, so
+/// tests can observe emission granularity without changing what is emitted.
+struct ChunkWriter {
+    chunks: Vec<Vec<u8>>,
+}
+
+impl ChunkWriter {
+    fn new() -> Self {
+        ChunkWriter { chunks: Vec::new() }
+    }
+
+    fn concatenated(&self) -> Vec<u8> {
+        self.chunks.concat()
+    }
+
+    /// Index of the first chunk holding `needle`, if any.
+    fn chunk_holding(&self, needle: &[u8]) -> Option<usize> {
+        self.chunks.iter().position(|chunk| {
+            chunk
+                .windows(needle.len().max(1))
+                .any(|window| window == needle)
+        })
+    }
+}
+
+impl std::io::Write for ChunkWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.chunks.push(bytes.to_vec());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn doctor_streams_result_records_before_extensions_complete() {
+    // `dot doctor` must emit each result record as its check files it: the
+    // core runtime rows reach stdout before any extension runs, instead of
+    // the whole report rendering once at the end.
+    let home = TempDir::new("doctor-streaming-home").expect("home");
+    let state = TempDir::new("doctor-streaming-state").expect("state");
+    let root = home.path().join("extensions");
+    let directory = root.join("doctor.d");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
+    std::fs::create_dir_all(&directory).expect("doctor directory");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=none\n",
+    )
+    .expect("config");
+    std::fs::write(
+        directory.join("10-marker.sh"),
+        b"doctor() {\n  printf 'ok\\tSTREAM-MARKER\\t\\n' >>\"$DOT_DOCTOR_RESULT_FILE\"\n}\n",
+    )
+    .expect("extension");
+    seal(&root, 0o700);
+    seal(&directory, 0o700);
+    seal(&directory.join("10-marker.sh"), 0o644);
+
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let env = BTreeMap::<OsString, OsString>::from([
+        ("HOME".into(), home.path().as_os_str().to_os_string()),
+        (
+            "XDG_STATE_HOME".into(),
+            state.path().as_os_str().to_os_string(),
+        ),
+        ("DOT_SOURCE_ROOT".into(), repo.as_os_str().to_os_string()),
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("BASH".into(), dot_test_support::bash().into()),
+        ("DOT_BASH".into(), dot_test_support::bash().into()),
+        ("LC_ALL".into(), "C".into()),
+    ]);
+    let runtime = dot::app::Runtime::from_env(&env, home.path()).expect("runtime");
+    let mut stdout = ChunkWriter::new();
+    let mut stderr = Vec::new();
+    let code = {
+        let mut streams = dot::app::Streams::with_terminal(&mut stdout, &mut stderr, false);
+        dot::doctor::run(&runtime, &mut streams)
+    };
+    // The fixture home has no client checkout, so the completed run reports
+    // its missing base repository and exits 1.
+    assert_eq!(code, 1, "streamed doctor run did not complete");
+    let output = stdout.concatenated();
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("dot runtime"),
+        "streamed doctor omitted the runtime section: {text}"
+    );
+    assert!(
+        text.contains("STREAM-MARKER"),
+        "streamed doctor omitted the extension marker: {text}"
+    );
+    assert!(
+        text.contains("passed \u{b7}"),
+        "streamed doctor omitted the summary: {text}"
+    );
+    let runtime_chunk = stdout
+        .chunk_holding(b"dot runtime")
+        .expect("runtime section chunk");
+    let marker_chunk = stdout
+        .chunk_holding(b"STREAM-MARKER")
+        .expect("marker chunk");
+    assert_ne!(
+        runtime_chunk, marker_chunk,
+        "doctor buffered the report into one emission instead of streaming records"
+    );
+}
+
+/// A `Write` sink that forwards the first `limit` bytes, then fails every
+/// further write: the title fits, but record emission fails partway, proving
+/// the run continues through a stdout delivery failure.
+struct FailAfterBytes {
+    forwarded: Vec<u8>,
+    limit: usize,
+}
+
+impl FailAfterBytes {
+    fn new(limit: usize) -> Self {
+        FailAfterBytes {
+            forwarded: Vec::new(),
+            limit,
+        }
+    }
+}
+
+impl std::io::Write for FailAfterBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.forwarded.len() + bytes.len() > self.limit {
+            return Err(std::io::Error::other("closed stdout"));
+        }
+        self.forwarded.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn doctor_runs_extensions_through_stdout_delivery_failure() {
+    // A broken stdout must not abort the run: extensions still execute, later
+    // stderr diagnostics are still delivered, and the exit status still
+    // reports the delivery failure.
+    let home = TempDir::new("doctor-failing-stdout-home").expect("home");
+    let state = TempDir::new("doctor-failing-stdout-state").expect("state");
+    let root = home.path().join("extensions");
+    let directory = root.join("doctor.d");
+    let hooks = root.join("merge-hooks.d");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
+    std::fs::create_dir_all(&directory).expect("doctor directory");
+    std::fs::create_dir_all(&hooks).expect("hook directory");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=none\n",
+    )
+    .expect("config");
+    std::fs::write(
+        directory.join("10-marker.sh"),
+        b"doctor() {\n  printf ran >\"$HOME/extension-ran\"\n  printf 'ok\\tSTREAM-MARKER\\t\\n' >>\"$DOT_DOCTOR_RESULT_FILE\"\n}\n",
+    )
+    .expect("extension");
+    let unsafe_hook = hooks.join("10-unsafe.sh");
+    std::fs::write(&unsafe_hook, b"merge() { :; }\n").expect("hook");
+    seal(&root, 0o700);
+    seal(&directory, 0o700);
+    seal(&directory.join("10-marker.sh"), 0o644);
+    seal(&hooks, 0o700);
+    seal(&unsafe_hook, 0o666);
+
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let env = BTreeMap::<OsString, OsString>::from([
+        ("HOME".into(), home.path().as_os_str().to_os_string()),
+        (
+            "XDG_STATE_HOME".into(),
+            state.path().as_os_str().to_os_string(),
+        ),
+        ("DOT_SOURCE_ROOT".into(), repo.as_os_str().to_os_string()),
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("BASH".into(), dot_test_support::bash().into()),
+        ("DOT_BASH".into(), dot_test_support::bash().into()),
+        ("LC_ALL".into(), "C".into()),
+    ]);
+    let runtime = dot::app::Runtime::from_env(&env, home.path()).expect("runtime");
+    // The piped title is 12 bytes; the first record emission is hundreds, so
+    // 64 delivers the title, then fails every record write.
+    let mut stdout = FailAfterBytes::new(64);
+    let mut stderr = Vec::new();
+    let code = {
+        let mut streams = dot::app::Streams::with_terminal(&mut stdout, &mut stderr, false);
+        dot::doctor::run(&runtime, &mut streams)
+    };
+    assert_eq!(code, 1, "delivery failure must exit 1");
+    assert!(
+        home.path().join("extension-ran").is_file(),
+        "doctor skipped extensions after a stdout failure"
+    );
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("dot: unsafe merge hook"),
+        "doctor dropped later stderr diagnostics after a stdout failure: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+}

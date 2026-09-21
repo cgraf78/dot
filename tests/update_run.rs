@@ -565,3 +565,173 @@ fn lock_busy_reports_75() {
     assert!(output.stdout.is_empty());
     let _ = guard;
 }
+
+/// A `Write` sink that keeps every `write` call's bytes as its own chunk, so
+/// tests can observe emission granularity without changing what is emitted.
+struct ChunkWriter {
+    chunks: Vec<Vec<u8>>,
+}
+
+impl ChunkWriter {
+    fn new() -> Self {
+        ChunkWriter { chunks: Vec::new() }
+    }
+
+    fn concatenated(&self) -> Vec<u8> {
+        self.chunks.concat()
+    }
+
+    /// Index of the first chunk holding `needle`, if any.
+    fn chunk_holding(&self, needle: &[u8]) -> Option<usize> {
+        self.chunks.iter().position(|chunk| {
+            chunk
+                .windows(needle.len().max(1))
+                .any(|window| window == needle)
+        })
+    }
+}
+
+/// A `Write` sink that fails every write, proving delivery failure still
+/// exits 1 after the engine runs to completion.
+struct FailingWriter;
+
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("closed stdout"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Write for ChunkWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.chunks.push(bytes.to_vec());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn update_streams_stage_rows_before_completion() {
+    // `dot update` must emit each stage row as its phase files it: completed
+    // stages reach stdout while later phases still run, instead of the whole
+    // run rendering once at the end.
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+
+    let scratch = Scratch::new("update-run-streaming").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home_ref, state_ref) = twin_client(&scratch, "reference", &overlay_origin, &base_origin);
+    let (home_live, state_live) = twin_client(&scratch, "live", &overlay_origin, &base_origin);
+    let reference = check_update(&["update"], &home_ref, &state_ref);
+
+    let home_text = home_live.to_str().expect("UTF-8 home").to_string();
+    let env = BTreeMap::<OsString, OsString>::from([
+        ("HOME".into(), home_live.as_os_str().to_os_string()),
+        (
+            "XDG_STATE_HOME".into(),
+            state_live.as_os_str().to_os_string(),
+        ),
+        ("XDG_CONFIG_HOME".into(), OsString::from("")),
+        (
+            "DOT_SOURCE_ROOT".into(),
+            OsString::from(env!("CARGO_MANIFEST_DIR")),
+        ),
+        ("LC_ALL".into(), OsString::from("C")),
+        ("PATH".into(), std::env::var_os("PATH").unwrap_or_default()),
+        (
+            "TMPDIR".into(),
+            std::env::var_os("TMPDIR")
+                .filter(|dir| !dir.is_empty())
+                .unwrap_or_else(|| OsString::from("/tmp")),
+        ),
+        ("SHELL".into(), OsString::from("/bin/bash")),
+        ("GIT_AUTHOR_NAME".into(), OsString::from("fixture")),
+        (
+            "GIT_AUTHOR_EMAIL".into(),
+            OsString::from("fixture@example.invalid"),
+        ),
+        ("GIT_COMMITTER_NAME".into(), OsString::from("fixture")),
+        (
+            "GIT_COMMITTER_EMAIL".into(),
+            OsString::from("fixture@example.invalid"),
+        ),
+        (
+            "DOT_BASH".into(),
+            home_live
+                .join("absent-old-update-engine")
+                .as_os_str()
+                .to_os_string(),
+        ),
+    ]);
+    let runtime = dot::app::Runtime::from_env(&env, &home_live).expect("runtime");
+    let config = dot::config::load(&dot::config::Request {
+        config_path: None,
+        home: &home_text,
+        env_policy: None,
+    })
+    .expect("client config");
+    let args: Vec<OsString> = Vec::new();
+    let mut stdout = ChunkWriter::new();
+    let mut stderr = Vec::new();
+    let code = {
+        let mut streams = dot::app::Streams::with_terminal(&mut stdout, &mut stderr, false);
+        dot::update_engine::run_update(
+            &runtime,
+            &dot::update_engine::UpdateRequest {
+                config: &config,
+                env: &env,
+                args: &args,
+                state_home: &state_live,
+            },
+            &mut streams,
+        )
+    };
+    assert_eq!(
+        code,
+        0,
+        "in-process update failed: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // The first stage opens long before the run closes: its row must reach
+    // stdout in an earlier emission than the completion row.
+    let first_stage = stdout.chunk_holding(b"[1/5]").expect("first stage row");
+    let completion = stdout.chunk_holding(b"Done in").expect("completion row");
+    assert!(
+        first_stage < completion,
+        "update buffered stage rows instead of streaming them"
+    );
+    assert_eq!(
+        normalize_timing(&stdout.concatenated()),
+        normalize_timing(&reference.stdout),
+        "streamed update bytes differ from the process run"
+    );
+    assert_eq!(
+        stderr, reference.stderr,
+        "streamed update stderr differs from the process run"
+    );
+    // A delivery failure still exits 1 after the engine runs to completion:
+    // this clean re-update would exit 0 with a working stdout.
+    let mut failed_stdout = FailingWriter;
+    let mut failed_stderr = Vec::new();
+    let failed_code = {
+        let mut streams =
+            dot::app::Streams::with_terminal(&mut failed_stdout, &mut failed_stderr, false);
+        dot::update_engine::run_update(
+            &runtime,
+            &dot::update_engine::UpdateRequest {
+                config: &config,
+                env: &env,
+                args: &args,
+                state_home: &state_live,
+            },
+            &mut streams,
+        )
+    };
+    assert_eq!(failed_code, 1, "delivery failure must exit 1");
+}
