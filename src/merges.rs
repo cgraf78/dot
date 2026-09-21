@@ -222,6 +222,33 @@ pub fn progress_detail(
     )
 }
 
+/// The `run_merges` per-hook progress branch: verbose keeps the
+/// plain `label done/total` row, while normal mode renders the bar
+/// detail through [`progress_detail`] like the other stages.
+#[allow(clippy::too_many_arguments)] // one rendering context, like `progress_detail`
+pub fn hook_progress_detail(
+    label: &[u8],
+    done: i64,
+    total: i64,
+    verbose: bool,
+    bar_width: &str,
+    ascii: bool,
+    multibyte: bool,
+) -> Vec<u8> {
+    if verbose {
+        format!("{} {done}/{total}", String::from_utf8_lossy(label)).into_bytes()
+    } else {
+        progress_detail(label, done, total, "18", bar_width, ascii, multibyte)
+    }
+}
+
+/// `[[ "${DOT_UI_TOTAL:-0}" -gt 0 ]]`: hook progress renders only
+/// for counted UI, like the shell gate around both branches.
+fn counted_ui(raw: Option<&str>) -> bool {
+    raw.and_then(progress_ui::arith_value)
+        .is_some_and(|value| value > 0)
+}
+
 /// Split a captured hook log the way `_print_merge_result` reads
 /// it: shell-whitespace-trimmed lines with empties dropped; the
 /// first surviving line is the display label and the rest are
@@ -551,6 +578,11 @@ pub(crate) struct RunInputs<'a> {
     pub(crate) force: bool,
     pub(crate) palette: &'a Palette,
     pub(crate) multibyte: bool,
+    pub(crate) ascii: bool,
+    /// `DOT_UI_TOTAL`: counted UI renders hook progress.
+    pub(crate) ui_total: Option<&'a str>,
+    /// Progress bar width for the non-verbose hook detail.
+    pub(crate) bar_width: &'a str,
     pub(crate) log: &'a crate::log::Log,
 }
 
@@ -753,17 +785,22 @@ fn run_batch(
     for hook in hooks {
         state.merge_index += 1;
         let label = label_from_script(&hook.key);
-        let detail = format!(
-            "{} {}/{}",
-            label.to_string_lossy(),
-            state.merge_index,
-            state.total
-        );
-        let _ = out.write_all(&stage.update(
-            detail.as_bytes(),
-            crate::update_engine::now_secs(),
-            inputs.verbose.then_some("1"),
-        ));
+        if counted_ui(inputs.ui_total) {
+            let detail = hook_progress_detail(
+                label.as_bytes(),
+                i64::try_from(state.merge_index).unwrap_or(i64::MAX),
+                i64::try_from(state.total).unwrap_or(i64::MAX),
+                inputs.verbose,
+                inputs.bar_width,
+                inputs.ascii,
+                inputs.multibyte,
+            );
+            let _ = out.write_all(&stage.update(
+                &detail,
+                crate::update_engine::now_secs(),
+                inputs.verbose.then_some("1"),
+            ));
+        }
     }
     let jobs = parallel_jobs(
         inputs.merge_jobs.unwrap_or_default(),
@@ -1010,7 +1047,7 @@ fn is_serial_os(script: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunInputs, run, scratch};
+    use super::{RunInputs, counted_ui, run, scratch};
     use dot_test_support::TempDir;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -1033,6 +1070,21 @@ mod tests {
         std::fs::write(&blocked, b"not a directory\n").expect("blocked root");
         assert!(scratch(&blocked).is_none());
         assert_eq!(std::fs::read(&blocked).unwrap(), b"not a directory\n");
+    }
+
+    #[test]
+    fn hook_progress_renders_only_for_counted_ui() {
+        for (raw, expected) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("-1"), false),
+            (Some("nope"), false),
+            (Some("1"), true),
+            (Some("5"), true),
+        ] {
+            assert_eq!(counted_ui(raw), expected, "counted_ui({raw:?})");
+        }
     }
 
     #[test]
@@ -1101,6 +1153,9 @@ mod tests {
             force: false,
             palette: &palette,
             multibyte: true,
+            ascii: true,
+            ui_total: Some("1"),
+            bar_width: "8",
             log: &log,
         };
 
