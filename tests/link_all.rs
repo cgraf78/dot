@@ -85,6 +85,15 @@ impl Fixture {
         ui_total: Option<&str>,
         verbose: bool,
     ) -> (repos_link_all::LinkOutcome, Vec<u8>, Vec<u8>) {
+        self.run_with_live(ui_total, verbose, false)
+    }
+
+    fn run_with_live(
+        &self,
+        ui_total: Option<&str>,
+        verbose: bool,
+        live: bool,
+    ) -> (repos_link_all::LinkOutcome, Vec<u8>, Vec<u8>) {
         let home = self.home.to_string_lossy().into_owned();
         let overlay = self.overlay.to_string_lossy().into_owned();
         let source = self.source.to_string_lossy().into_owned();
@@ -108,7 +117,7 @@ impl Fixture {
             palette.clone(),
             ui_total.unwrap_or("0"),
             false,
-            false,
+            live,
             false,
             true,
         );
@@ -134,7 +143,7 @@ impl Fixture {
         };
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let result = repos_link_all::link_overlays(&inputs, &mut stage, &mut out, &mut err, 10);
+        let result = repos_link_all::link_overlays(&inputs, &mut stage, &mut out, &mut err);
         (result, out, err)
     }
 }
@@ -225,4 +234,46 @@ fn empty_counted_phase_succeeds_without_a_manifest() {
             .contains("0 overlays current")
     );
     assert!(!f.manifest.exists());
+}
+
+/// Live-rendered rows start with the `\r\x1b[K[` redraw prefix (split off
+/// the `\r` here); a `-` immediately followed by a digit inside one can
+/// only come from the elapsed field, since labels, counters, bars, and
+/// spinner frames never pair them.
+fn live_rows(out: &[u8]) -> Vec<&[u8]> {
+    out.split(|byte| *byte == b'\r')
+        .filter(|row| row.starts_with(b"\x1b[K["))
+        .collect()
+}
+
+fn live_rows_have_negative_elapsed(out: &[u8]) -> bool {
+    live_rows(out).iter().any(|row| {
+        row.windows(2)
+            .any(|pair| pair[0] == b'-' && pair[1].is_ascii_digit())
+    })
+}
+
+/// Progress rows are the only live rows carrying the `[#` progress bar.
+fn live_progress_was_rendered(out: &[u8]) -> bool {
+    live_rows(out)
+        .iter()
+        .any(|row| row.windows(2).any(|window| window == b"[#"))
+}
+
+#[test]
+fn live_link_progress_reports_non_negative_elapsed() {
+    let f = Fixture::new(&[("app.conf", "app\n")]);
+    let (result, out, err) = f.run_with_live(Some("4"), false, true);
+    assert_eq!(result.rc, 0);
+    assert!(err.is_empty());
+    assert!(
+        live_progress_was_rendered(&out),
+        "expected live progress rows: {}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        !live_rows_have_negative_elapsed(&out),
+        "live progress carried a negative elapsed stamp: {}",
+        String::from_utf8_lossy(&out)
+    );
 }
