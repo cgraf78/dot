@@ -3446,6 +3446,20 @@ struct CancelledUpdate<T> {
     output: std::process::Output,
 }
 
+/// Render a reaped child's streams for exit-code assertions. A
+/// signal-death mismatch without the child's output (notably a
+/// `DOT_TEARDOWN_FAIL` line) is unactionable under load. Takes the
+/// output by reference because several callers already moved the
+/// observation out of the [`CancelledUpdate`].
+#[cfg(unix)]
+fn cancelled_output_detail(output: &std::process::Output) -> String {
+    format!(
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
 #[cfg(unix)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TestProcessIdentity {
@@ -4428,7 +4442,12 @@ exec "$DOT_TEST_REAL_GIT" "$@"
         "Dot did not stop boundedly during Git sync"
     );
     assert!(cancelled.worker_gone, "TERM-ignoring Git child survived");
-    assert_eq!(cancelled.output.status.code(), Some(143));
+    assert_eq!(
+        cancelled.output.status.code(),
+        Some(143),
+        "cancelled Git status; {}",
+        cancelled_output_detail(&cancelled.output)
+    );
     assert!(
         !fixture.client.home.join("merge-after-git-cancel").exists(),
         "update advanced to a later stage after Git cancellation"
@@ -4490,7 +4509,12 @@ exec "$DOT_TEST_REAL_GIT" "$@"
     assert_eq!(cancelled.signal_result, 0, "send SIGTERM to Dot");
     assert!(cancelled.exited, "Dot did not stop boundedly during fetch");
     assert!(cancelled.worker_gone, "TERM-ignoring Git fetch survived");
-    assert_eq!(cancelled.output.status.code(), Some(143));
+    assert_eq!(
+        cancelled.output.status.code(),
+        Some(143),
+        "cancelled fetch status; {}",
+        cancelled_output_detail(&cancelled.output)
+    );
     assert!(
         !later.exists(),
         "fetch started a Git cleanup query after cancellation"
@@ -4552,7 +4576,12 @@ exec "$DOT_TEST_REAL_GIT" "$@"
         assert_eq!(cancelled.signal_result, 0, "send {name} to Dot");
         assert!(cancelled.exited, "Dot did not stop boundedly for {name}");
         assert!(cancelled.worker_gone, "startup Git survived {name}");
-        assert_eq!(cancelled.output.status.code(), Some(expected));
+        assert_eq!(
+            cancelled.output.status.code(),
+            Some(expected),
+            "startup Git status for {name}; {}",
+            cancelled_output_detail(&cancelled.output)
+        );
         assert!(
             !fixture
                 .client
@@ -4615,7 +4644,12 @@ exec "$DOT_TEST_REAL_GIT" "$@"
             cancelled.worker_identity_valid,
             "{command_name} Git probe was not isolated"
         );
-        assert_eq!(cancelled.output.status.code(), Some(143));
+        assert_eq!(
+            cancelled.output.status.code(),
+            Some(143),
+            "{command_name} Git probe status; {}",
+            cancelled_output_detail(&cancelled.output)
+        );
         assert!(cancelled.worker_gone, "{command_name} Git probe survived");
     }
 }
@@ -4663,7 +4697,12 @@ fn direct_signals_during_crontab_stop_the_owned_query() {
         assert_eq!(cancelled.signal_result, 0, "send {name} to Dot");
         assert!(cancelled.exited, "Dot did not stop boundedly for {name}");
         assert!(cancelled.worker_gone, "crontab survived {name}");
-        assert_eq!(cancelled.output.status.code(), Some(expected));
+        assert_eq!(
+            cancelled.output.status.code(),
+            Some(expected),
+            "crontab status for {name}; {}",
+            cancelled_output_detail(&cancelled.output)
+        );
     }
 }
 
@@ -4725,7 +4764,12 @@ exec "$DOT_TEST_REAL_GIT" "$@"
         cancelled.worker_gone,
         "TERM-ignoring legacy identity query survived"
     );
-    assert_eq!(cancelled.output.status.code(), Some(143));
+    assert_eq!(
+        cancelled.output.status.code(),
+        Some(143),
+        "cancelled legacy identity status; {}",
+        cancelled_output_detail(&cancelled.output)
+    );
 }
 
 #[cfg(unix)]
@@ -4786,7 +4830,12 @@ exec "$DOT_TEST_REAL_GIT" "$@"
         assert_eq!(cancelled.signal_result, 0, "send {name} to Dot");
         assert!(cancelled.exited, "Dot did not stop boundedly for {name}");
         assert!(cancelled.worker_gone, "init Git clone survived {name}");
-        assert_eq!(cancelled.output.status.code(), Some(expected));
+        assert_eq!(
+            cancelled.output.status.code(),
+            Some(expected),
+            "init Git clone status for {name}; {}",
+            cancelled_output_detail(&cancelled.output)
+        );
         assert!(
             !home.path().join(".dotfiles").exists(),
             "init published the live Git directory after {name}"
@@ -4858,7 +4907,12 @@ exec "$DOT_TEST_REAL_GIT" "$@"
     assert_eq!(cancelled.signal_result, 0, "send {name} to Dot");
     assert!(cancelled.exited, "Dot did not stop boundedly for {name}");
     assert!(cancelled.worker_gone, "overlay clone survived {name}");
-    assert_eq!(cancelled.output.status.code(), Some(expected));
+    assert_eq!(
+        cancelled.output.status.code(),
+        Some(expected),
+        "overlay clone status for {name}; {}",
+        cancelled_output_detail(&cancelled.output)
+    );
     assert!(
         !fixture.client.overlay.exists(),
         "missing overlay was published after {name}"
@@ -4964,7 +5018,12 @@ exec "$DOT_TEST_REAL_GIT" "$@"
 
     assert!(cancelled.ready, "base tracked query did not start");
     assert!(cancelled.worker_identity_valid, "query was not isolated");
-    assert_eq!(cancelled.output.status.code(), Some(143));
+    assert_eq!(
+        cancelled.output.status.code(),
+        Some(143),
+        "base tracked query status; {}",
+        cancelled_output_detail(&cancelled.output)
+    );
     assert!(cancelled.worker_gone, "base tracked query survived");
     assert!(!destination.exists(), "overlay destination changed");
     assert!(!manifest.exists(), "overlay manifest was published");
@@ -5104,7 +5163,12 @@ exec "$DOT_TEST_REAL_GIT" "$@"
         cancelled.worker_gone,
         "TERM-ignoring post-fetch Git query survived"
     );
-    assert_eq!(cancelled.output.status.code(), Some(143));
+    assert_eq!(
+        cancelled.output.status.code(),
+        Some(143),
+        "cancelled post-fetch status; {}",
+        cancelled_output_detail(&cancelled.output)
+    );
 }
 
 #[cfg(unix)]
@@ -5184,9 +5248,8 @@ fn update_native_signal_during_merge_retains_lifecycle_state_and_skips_normaliza
     assert_eq!(
         cancelled.output.status.code(),
         Some(143),
-        "cancelled merge status; stdout={} stderr={}",
-        String::from_utf8_lossy(&cancelled.output.stdout),
-        String::from_utf8_lossy(&cancelled.output.stderr)
+        "cancelled merge status; {}",
+        cancelled_output_detail(&cancelled.output)
     );
     assert_eq!(
         std::fs::read(&ledger).expect("retained lifecycle ledger"),
@@ -5452,9 +5515,8 @@ fn update_native_signal_during_retirement_retains_lifecycle_state_and_skips_norm
     assert_eq!(
         cancelled.output.status.code(),
         Some(143),
-        "cancelled retirement status; stdout={} stderr={}",
-        String::from_utf8_lossy(&cancelled.output.stdout),
-        String::from_utf8_lossy(&cancelled.output.stderr)
+        "cancelled retirement status; {}",
+        cancelled_output_detail(&cancelled.output)
     );
     assert_eq!(
         std::fs::read(&ledger).expect("retained lifecycle ledger"),
