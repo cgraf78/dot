@@ -469,3 +469,157 @@ fn pull_all_aggregates_base_and_overlay_outcomes() {
     assert_eq!(outcome.changed_items, ["ovl0 dotfiles updated"]);
     assert!(warnings.is_empty());
 }
+
+fn live_stage() -> Stage {
+    Stage::begin(palette(), "5", false, true, false, true)
+}
+
+/// Live-rendered rows start with the `\r\x1b[K[` redraw prefix (split off
+/// the `\r` here); a `-` immediately followed by a digit inside one can
+/// only come from the elapsed field, since labels, counters, bars, and
+/// spinner frames never pair them.
+fn live_rows(out: &[u8]) -> Vec<&[u8]> {
+    out.split(|byte| *byte == b'\r')
+        .filter(|row| row.starts_with(b"\x1b[K["))
+        .collect()
+}
+
+fn live_rows_have_negative_elapsed(out: &[u8]) -> bool {
+    live_rows(out).iter().any(|row| {
+        row.windows(2)
+            .any(|pair| pair[0] == b'-' && pair[1].is_ascii_digit())
+    })
+}
+
+/// Progress rows are the only live rows carrying the `[#` progress bar.
+fn live_progress_was_rendered(out: &[u8]) -> bool {
+    live_rows(out)
+        .iter()
+        .any(|row| row.windows(2).any(|window| window == b"[#"))
+}
+
+fn run_overlays_live(
+    fleet: &Fleet,
+    parallel: bool,
+    jobs: Option<&str>,
+) -> (dot::repos_pull_fleet::PullOverlaysOutcome, Vec<u8>) {
+    let home = fleet.home.to_string_lossy().into_owned();
+    let entries = fleet.entries();
+    let dest = DestinationInputs {
+        pwd: home.clone(),
+        home: home.clone(),
+        xdg_state_home: None,
+        install_dir: None,
+        state_dir: None,
+        overlay_paths: vec![],
+        init_backup: None,
+    };
+    let candidate = candidate(&home);
+    let base = Base {
+        topology: Topology::Ordinary,
+        client_git_dir: String::new(),
+        home: home.clone(),
+    };
+    let palette = palette();
+    let log = Log::new(false, false);
+    let manifest = fleet
+        ._dir
+        .path()
+        .join("manifest.tsv")
+        .to_string_lossy()
+        .into_owned();
+    let legacy = fleet
+        ._dir
+        .path()
+        .join("legacy.tsv")
+        .to_string_lossy()
+        .into_owned();
+    let mut moves = dot::temp::MoveCache::default();
+    let tool = moves.tool().expect("move tool");
+    let empty: &[OsString] = &[];
+    let total = entries.len().to_string();
+    let inputs = PullOverlaysInputs {
+        entries: &entries,
+        extra_args: empty,
+        home: &home,
+        ui_total: None,
+        dot_quiet: Some("0"),
+        dot_verbose: Some("0"),
+        update_jobs: jobs,
+        progress_done: Some("0"),
+        progress_total: Some(&total),
+        bar_width: "8",
+        palette: &palette,
+        multibyte: false,
+        ascii: true,
+        candidate: &candidate,
+        base: &base,
+        quarantine: None,
+        overlays: &[],
+        dest: &dest,
+        manifest: &manifest,
+        legacy_manifest: &legacy,
+        euid: dot::temp::current_uid().expect("uid"),
+        source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
+        tmp: fleet._dir.path(),
+        tool: &tool,
+        log: &log,
+    };
+    let mut stage = live_stage();
+    let mut out = Vec::new();
+    let mut warnings = Vec::new();
+    // Mirror production: `pull_all` opens the stage on the wall clock before
+    // the fleet reports progress against it.
+    let open = stage.start(
+        b"Repos",
+        Some(b"pulling repositories"),
+        dot::update_engine::now_secs(),
+        Some("0"),
+    );
+    out.extend_from_slice(&open);
+    let outcome = if parallel {
+        pull_overlays(&inputs, &mut stage, &mut moves, &mut out, &mut warnings)
+    } else {
+        pull_overlays_serial(&inputs, &mut stage, &mut moves, &mut out, &mut warnings)
+    };
+    assert!(warnings.is_empty());
+    (outcome, out)
+}
+
+#[test]
+fn serial_pull_progress_reports_non_negative_elapsed() {
+    let fleet = Fleet::new("fleet-live-serial", 1);
+    commit(&fleet.origins[0], "changed.txt", "changed\n");
+    let (outcome, out) = run_overlays_live(&fleet, false, None);
+    assert_eq!(outcome.rc, 0);
+    assert!(
+        live_progress_was_rendered(&out),
+        "expected live progress rows: {}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        !live_rows_have_negative_elapsed(&out),
+        "live progress carried a negative elapsed stamp: {}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+#[test]
+fn parallel_pull_progress_reports_non_negative_elapsed() {
+    let fleet = Fleet::new("fleet-live-parallel", 2);
+    for origin in &fleet.origins {
+        commit(origin, "changed.txt", "changed\n");
+    }
+    let (outcome, out) = run_overlays_live(&fleet, true, Some("2"));
+    assert_eq!(outcome.rc, 0);
+    assert!(
+        live_progress_was_rendered(&out),
+        "expected live progress rows: {}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        !live_rows_have_negative_elapsed(&out),
+        "live progress carried a negative elapsed stamp: {}",
+        String::from_utf8_lossy(&out)
+    );
+}

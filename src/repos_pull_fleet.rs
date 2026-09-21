@@ -439,7 +439,7 @@ pub fn pull_overlays_serial(
             entry.name.as_bytes(),
             done,
             total,
-            0,
+            crate::update_engine::now_secs(),
             inputs.dot_verbose,
             inputs.bar_width,
         );
@@ -583,7 +583,7 @@ pub fn pull_overlays(
             entry.name.as_bytes(),
             done,
             total,
-            0,
+            crate::update_engine::now_secs(),
             inputs.dot_verbose,
             inputs.bar_width,
         );

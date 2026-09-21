@@ -332,13 +332,13 @@ fn adopt_command(path: &str, expected: &str, actual: &str) -> String {
 /// `_link_overlays`: run the whole link phase natively. Rows land
 /// in `out`/`err` exactly like the shell streams; `stage` renders
 /// the counted-UI open/close the pull lane threads the same way.
-/// `now_secs` stamps the stage rows (tests pin matching clocks).
+/// Every row reads the wall clock at render time, so progress
+/// stamps can never run behind the stage they update.
 pub fn link_overlays(
     inputs: &Inputs<'_>,
     stage: &mut Stage,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
-    now_secs: i64,
 ) -> LinkOutcome {
     let mut outcome = LinkOutcome {
         rc: 1,
@@ -659,7 +659,7 @@ pub fn link_overlays(
             name.as_bytes(),
             done,
             overlay_total,
-            now_secs,
+            crate::update_engine::now_secs(),
             inputs.dot_verbose,
             inputs.bar_width,
         );

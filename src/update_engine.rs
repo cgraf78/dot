@@ -1380,8 +1380,7 @@ fn finalize(
             bar_width: inputs.bar_width,
             log: inputs.log,
         };
-        let outcome =
-            crate::repos_link_all::link_overlays(&link_inputs, stage, io.out, io.err, now_secs);
+        let outcome = crate::repos_link_all::link_overlays(&link_inputs, stage, io.out, io.err);
         if outcome.rc != 0 {
             status = 1;
             inputs_ready = false;
