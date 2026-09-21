@@ -466,7 +466,7 @@ pub fn link_overlays(
             let open = stage.start(
                 b"Overlays",
                 Some(b"checking overlay links"),
-                now_secs,
+                crate::update_engine::now_secs(),
                 inputs.dot_verbose,
             );
             let _ = out.write_all(&open);
@@ -475,7 +475,11 @@ pub fn link_overlays(
             let _ = out.write_all(&open);
         }
         if !has_overlay_home && manifests.is_empty() {
-            let close = stage.finish(b"ok", b"0 overlays current", now_secs);
+            let close = stage.finish(
+                b"ok",
+                b"0 overlays current",
+                crate::update_engine::now_secs(),
+            );
             let _ = out.write_all(&close);
             outcome.rc = 0;
             return outcome;
@@ -987,7 +991,11 @@ pub fn link_overlays(
         let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
         let summary = crate::progress_ui::join_comma(&refs);
         let status = if outcome.changed > 0 { "changed" } else { "ok" };
-        let close = stage.finish(status.as_bytes(), &summary, now_secs);
+        let close = stage.finish(
+            status.as_bytes(),
+            &summary,
+            crate::update_engine::now_secs(),
+        );
         let _ = out.write_all(&close);
         if !verbose {
             for item in &outcome.changed_items {

@@ -985,6 +985,21 @@ fn cleanup_deadline() -> Instant {
     Instant::now() + Duration::from_millis(GRACE_ATTEMPTS as u64 * GRACE_INTERVAL_MS)
 }
 
+/// Budget for one post-completion verification snapshot. Completion
+/// verification is not latency-sensitive (the leader already exited and
+/// reported), but a full process-table walk costs hundreds of
+/// milliseconds under load — observed to 800ms for ~2150 rows on a
+/// loaded host, plus the `ps` fallback. The 1s teardown grace starves
+/// it and fails teardown (loaded-host DOT_TEARDOWN_FAIL); 5s covers
+/// loaded hosts and slow CI with headroom while staying bounded. This
+/// budget covers verification snapshots only — interruption paths keep
+/// the 1s grace so Ctrl-C stays responsive.
+const COMPLETION_SNAPSHOT_BUDGET: Duration = Duration::from_secs(5);
+
+fn completion_snapshot_deadline() -> Instant {
+    Instant::now() + COMPLETION_SNAPSHOT_BUDGET
+}
+
 fn poll_until<T>(
     deadline: Instant,
     mut poll: impl FnMut() -> std::io::Result<Option<T>>,
@@ -3185,13 +3200,22 @@ fn parse_ps_snapshot(bytes: &[u8]) -> Option<Vec<ProcessInfo>> {
         let line = std::str::from_utf8(bytes).ok()?;
         let mut fields = line.split_whitespace();
         let pid = fields.next()?.parse::<u32>().ok()?;
-        let parent = fields.next()?.parse::<u32>().ok()?;
-        let group = fields.next()?.parse::<u32>().ok()?;
-        let session = fields.next()?.parse::<u32>().ok()?;
+        let parent = fields.next()?;
+        let group = fields.next()?;
+        let session = fields.next()?;
         let state = fields.next()?;
         if fields.next().is_some() {
             return None;
         }
+        // A fully-dead (`X`) row is exited churn: `ps` reports its
+        // ppid/pgrp/session as -1, which never parses as live topology.
+        // Skip it like a vanished entry instead of failing the snapshot.
+        if state.starts_with('X') {
+            continue;
+        }
+        let parent = parent.parse::<u32>().ok()?;
+        let group = group.parse::<u32>().ok()?;
+        let session = session.parse::<u32>().ok()?;
         processes.push(ProcessInfo {
             pid,
             parent,
@@ -3268,16 +3292,23 @@ fn read_proc_stat(path: &Path) -> std::io::Result<Vec<u8>> {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn proc_process_snapshot(root: &Path, deadline: Instant) -> Option<Vec<ProcessInfo>> {
-    let entries = std::fs::read_dir(root).ok()?;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return None,
+    };
     let mut processes = Vec::new();
     for entry in entries {
+        // A partial walk certifies nothing: refuse rather than report.
         if Instant::now() >= deadline {
             return None;
         }
         // An iterator error means the directory walk was incomplete. Falling
         // back to the fixed OS process-table command is safer than certifying
         // an empty session from a partial view.
-        let entry = entry.ok()?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return None,
+        };
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -3295,18 +3326,47 @@ fn proc_process_snapshot(root: &Path, deadline: Instant) -> Option<Vec<ProcessIn
             Err(error) if proc_process_foreign(&error) => continue,
             Err(_) => return None,
         };
-        processes.push(parse_proc_process(pid, &stat)?);
+        // A fully-dead (`X`) entry is exited churn, not a partial view: the
+        // kernel reports its ppid/pgrp/session as -1/0, which never parses
+        // as live topology. Skip it like a vanished entry — a dead process
+        // is definitively not a live survivor the snapshot must report.
+        if proc_stat_state(&stat) == Some(b'X') {
+            continue;
+        }
+        let info = parse_proc_process(pid, &stat)?;
+        processes.push(info);
     }
     Some(processes)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn parse_proc_process(pid: u32, stat: &[u8]) -> Option<ProcessInfo> {
+/// Post-comm fields of a procfs stat row: everything after the last `") "`
+/// (comm itself may contain parens and spaces). `None` when the row has no
+/// comm terminator — a short or corrupt read.
+fn proc_stat_fields(stat: &[u8]) -> Option<Vec<&[u8]>> {
     let end = stat.windows(2).rposition(|part| part == b") ")?;
-    let fields: Vec<_> = stat[end + 2..]
-        .split(|byte| byte.is_ascii_whitespace())
-        .filter(|field| !field.is_empty())
-        .collect();
+    Some(
+        stat[end + 2..]
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect(),
+    )
+}
+
+/// The single-letter process state of a procfs stat row (`R`, `S`, `Z`,
+/// `X`, ...), or `None` for a short/corrupt read. Shares the comm scan
+/// with [`parse_proc_process`] so the two can never disagree about where
+/// comm ends (comm may itself contain `") X "`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn proc_stat_state(stat: &[u8]) -> Option<u8> {
+    proc_stat_fields(stat)?
+        .first()
+        .and_then(|state| state.first().copied())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn parse_proc_process(pid: u32, stat: &[u8]) -> Option<ProcessInfo> {
+    let fields = proc_stat_fields(stat)?;
     let parse = |index: usize| {
         fields
             .get(index)
@@ -3394,6 +3454,11 @@ fn linux_process_info_result(pid: u32) -> std::io::Result<Option<ProcessInfo>> {
         Err(error) if proc_process_vanished(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
+    // A fully-dead (`X`) row exited between listing and re-read: exited
+    // churn, like a vanished entry — never a live survivor to report.
+    if proc_stat_state(&stat) == Some(b'X') {
+        return Ok(None);
+    }
     parse_proc_process(pid, &stat)
         .map(Some)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc stat"))
@@ -3622,7 +3687,8 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     // EOF is independent of process exit: a helper may close stdout early.
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success().then_some(bytes),
+            Ok(Some(status)) if status.success() => return Some(bytes),
+            Ok(Some(_)) => return None,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             _ => {
                 let _ = child.kill();
@@ -3792,10 +3858,9 @@ fn supervise_session_with_completion(
     mut completion_proven: impl FnMut() -> bool,
     linger: LingerPolicy,
 ) -> std::io::Result<SessionEnd> {
-    let Some(mut child) = spawn_owned_session(command)? else {
-        return Ok(SessionEnd::Interrupted(
-            received_signal().expect("cancelled launch has a signal"),
-        ));
+    let mut child = match spawn_owned_session(command)? {
+        OwnedLaunch::Live(child) => child,
+        OwnedLaunch::Cancelled(signal) => return Ok(SessionEnd::Interrupted(signal)),
     };
     child.linger = linger;
     loop {
@@ -4614,15 +4679,45 @@ pub(crate) fn run_session_output_typed(
 /// Launch a cooperative foreground child behind the same signal/registration
 /// authorization barrier as an isolated session, without changing its process
 /// group or controlling terminal.
-fn spawn_owned_child(mut command: Command) -> std::io::Result<Option<OwnedChild>> {
+/// Outcome of an owned launch: either the live child or the signal that
+/// cancelled it. The cancelling signal travels with the decision, captured
+/// where it was observed: re-reading the global latch afterwards races a
+/// concurrent owner resetting it (parallel test installs), which strands a
+/// cancellation without its cause.
+pub(crate) enum OwnedLaunch<T> {
+    Live(T),
+    Cancelled(i32),
+}
+
+#[cfg(test)]
+impl<T> OwnedLaunch<T> {
+    pub(crate) fn into_live(self) -> Option<T> {
+        match self {
+            OwnedLaunch::Live(child) => Some(child),
+            OwnedLaunch::Cancelled(_) => None,
+        }
+    }
+}
+
+/// One registrar verdict for an owned launch: the pre-exec child's PID, the
+/// retained registration, and the cancelling signal captured where observed.
+/// `signal` is the single source of truth — `None` authorizes the launch —
+/// so the spawning thread never re-reads the global latch after the verdict.
+struct LaunchDecision<R> {
+    pid: u32,
+    registration: Option<R>,
+    signal: Option<i32>,
+}
+
+fn spawn_owned_child(mut command: Command) -> std::io::Result<OwnedLaunch<OwnedChild>> {
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
 
     let mut blocked = BlockedLaunchSignals::install()?;
     let launch = StatusChildLaunch::begin();
-    if received_signal().is_some() {
-        return Ok(None);
+    if let Some(signal) = received_signal() {
+        return Ok(OwnedLaunch::Cancelled(signal));
     }
     let (mut ready_parent, ready_child) = internal_stream_pair()?;
     let (mut authorize_parent, authorize_child) = internal_stream_pair()?;
@@ -4690,7 +4785,7 @@ fn spawn_owned_child(mut command: Command) -> std::io::Result<Option<OwnedChild>
     }
     let registrar_mask = blocked.previous();
     let registrar = std::thread::spawn(
-        move || -> std::io::Result<(u32, bool, Option<StatusChildRegistration>)> {
+        move || -> std::io::Result<LaunchDecision<StatusChildRegistration>> {
             let error = unsafe {
                 libc::pthread_sigmask(libc::SIG_SETMASK, &registrar_mask, std::ptr::null_mut())
             };
@@ -4705,16 +4800,20 @@ fn spawn_owned_child(mut command: Command) -> std::io::Result<Option<OwnedChild>
             }
             let pid = u32::from_ne_bytes(bytes);
             let mut registration = None;
-            let mut authorized = received_signal().is_none();
-            if authorized {
+            let mut signal = received_signal();
+            if signal.is_none() {
                 registration = Some(StatusChildRegistration::new(pid));
-                if received_signal().is_some() {
+                if let Some(observed) = received_signal() {
                     registration.take();
-                    authorized = false;
+                    signal = Some(observed);
                 }
             }
-            authorize_parent.write_all(&[u8::from(authorized)])?;
-            Ok((pid, authorized, registration))
+            authorize_parent.write_all(&[u8::from(signal.is_none())])?;
+            Ok(LaunchDecision {
+                pid,
+                registration,
+                signal,
+            })
         },
     );
     let spawned = spawn_with_eagain_retry(&mut command);
@@ -4741,30 +4840,30 @@ fn spawn_owned_child(mut command: Command) -> std::io::Result<Option<OwnedChild>
         }
     };
     let child = match spawned {
-        Ok(child) if decision.1 && child.id() == decision.0 => child,
+        Ok(child) if decision.signal.is_none() && child.id() == decision.pid => child,
         Ok(mut child) => {
-            drop(decision.2);
+            drop(decision.registration);
             let _ = child.kill();
             let _ = wait_child_until(&mut child, cleanup_deadline());
             blocked.restore()?;
-            if !decision.1 && received_signal().is_some() {
-                return Ok(None);
+            if let Some(signal) = decision.signal {
+                return Ok(OwnedLaunch::Cancelled(signal));
             }
             return Err(std::io::Error::other(
                 "child launch authorization did not match its retained identity",
             ));
         }
         Err(error) => {
-            drop(decision.2);
+            drop(decision.registration);
             blocked.restore()?;
-            if !decision.1 && received_signal().is_some() {
-                return Ok(None);
+            if let Some(signal) = decision.signal {
+                return Ok(OwnedLaunch::Cancelled(signal));
             }
             return Err(error);
         }
     };
     let registration = decision
-        .2
+        .registration
         .expect("authorized foreground child has status registration");
     lease.parent_spawned_foreground(child.id());
     let owned = OwnedChild::from_registered_with_lease(child, registration, lease);
@@ -4773,7 +4872,7 @@ fn spawn_owned_child(mut command: Command) -> std::io::Result<Option<OwnedChild>
         return Err(error);
     }
     drop(launch);
-    Ok(Some(owned))
+    Ok(OwnedLaunch::Live(owned))
 }
 
 /// How `supervise_child` treats a session lease left open past the
@@ -4818,10 +4917,9 @@ pub(crate) fn supervise_child_with_policy(
     mut tick: impl FnMut(bool) -> std::io::Result<()>,
     policy: ForegroundLeasePolicy,
 ) -> std::io::Result<SessionEnd> {
-    let Some(mut child) = spawn_owned_child(command)? else {
-        return Ok(SessionEnd::Interrupted(
-            received_signal().expect("cancelled launch has a signal"),
-        ));
+    let mut child = match spawn_owned_child(command)? {
+        OwnedLaunch::Live(child) => child,
+        OwnedLaunch::Cancelled(signal) => return Ok(SessionEnd::Interrupted(signal)),
     };
     loop {
         if let Some(signal) = received_signal() {
@@ -5375,7 +5473,8 @@ impl OwnedSession {
         // path.
         let same_group_member =
             if completion_proven && leader_exited && lease_closed && !detach_completion {
-                match normal_completion_needs_discovery(child.id(), cleanup_deadline()) {
+                match normal_completion_needs_discovery(child.id(), completion_snapshot_deadline())
+                {
                     Ok(present) => present,
                     Err(error) => {
                         return StopOutcome {
@@ -5497,15 +5596,17 @@ fn spawn_with_eagain_retry(
 /// A pre-latched signal returns `None`; a signal pending on the spawning thread
 /// is released only after the child and its transitive ownership marker are
 /// retained. The barrier is thread-local and never serializes parallel spawns.
-pub(crate) fn spawn_owned_session(mut command: Command) -> std::io::Result<Option<OwnedSession>> {
+pub(crate) fn spawn_owned_session(
+    mut command: Command,
+) -> std::io::Result<OwnedLaunch<OwnedSession>> {
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
 
     let mut blocked = BlockedLaunchSignals::install()?;
     let launch = StatusChildLaunch::begin();
-    if received_signal().is_some() {
-        return Ok(None);
+    if let Some(signal) = received_signal() {
+        return Ok(OwnedLaunch::Cancelled(signal));
     }
     isolate(&mut command);
     let mut lease = SessionLease::install(&mut command)?;
@@ -5574,7 +5675,7 @@ pub(crate) fn spawn_owned_session(mut command: Command) -> std::io::Result<Optio
     let boundary = lease.boundary.clone();
     let boundary_control = lease.control_state.clone();
     let registrar_mask = blocked.previous();
-    let registrar = std::thread::spawn(move || -> std::io::Result<(u32, bool, Option<u64>)> {
+    let registrar = std::thread::spawn(move || -> std::io::Result<LaunchDecision<u64>> {
         let mut registered = None;
         let result = (|| {
             // The registrar must be eligible to run the installed handler
@@ -5589,24 +5690,24 @@ pub(crate) fn spawn_owned_session(mut command: Command) -> std::io::Result<Optio
             let mut bytes = [0u8; std::mem::size_of::<u32>()];
             ready_parent.read_exact(&mut bytes)?;
             let pid = u32::from_ne_bytes(bytes);
-            let mut authorized = received_signal().is_none();
-            if authorized {
+            let mut signal = received_signal();
+            if signal.is_none() {
                 registered = Some((
                     pid,
                     register_session_boundary(pid, &boundary, boundary_control.clone()),
                 ));
-                if received_signal().is_some() {
+                if let Some(observed) = received_signal() {
                     unregister_session_boundary(pid, registered.expect("registration").1);
                     registered = None;
-                    authorized = false;
+                    signal = Some(observed);
                 }
             }
-            authorize_parent.write_all(&[u8::from(authorized)])?;
-            Ok((
+            authorize_parent.write_all(&[u8::from(signal.is_none())])?;
+            Ok(LaunchDecision {
                 pid,
-                authorized,
-                registered.map(|(_pid, registration)| registration),
-            ))
+                registration: registered.map(|(_pid, registration)| registration),
+                signal,
+            })
         })();
         if result.is_err() {
             if let Some((pid, registration)) = registered {
@@ -5640,28 +5741,28 @@ pub(crate) fn spawn_owned_session(mut command: Command) -> std::io::Result<Optio
         }
     };
     let child = match spawned {
-        Ok(child) if decision.1 && child.id() == decision.0 => child,
+        Ok(child) if decision.signal.is_none() && child.id() == decision.pid => child,
         Ok(mut child) => {
-            if let Some(registration) = decision.2 {
-                unregister_session_boundary(decision.0, registration);
+            if let Some(registration) = decision.registration {
+                unregister_session_boundary(decision.pid, registration);
             }
             let _ = child.kill();
             let _ = wait_child_until(&mut child, cleanup_deadline());
             blocked.restore()?;
-            if !decision.1 && received_signal().is_some() {
-                return Ok(None);
+            if let Some(signal) = decision.signal {
+                return Ok(OwnedLaunch::Cancelled(signal));
             }
             return Err(std::io::Error::other(
                 "session launch authorization did not match its child",
             ));
         }
         Err(error) => {
-            if let Some(registration) = decision.2 {
-                unregister_session_boundary(decision.0, registration);
+            if let Some(registration) = decision.registration {
+                unregister_session_boundary(decision.pid, registration);
             }
             blocked.restore()?;
-            if !decision.1 && received_signal().is_some() {
-                return Ok(None);
+            if let Some(signal) = decision.signal {
+                return Ok(OwnedLaunch::Cancelled(signal));
             }
             return Err(error);
         }
@@ -5669,7 +5770,7 @@ pub(crate) fn spawn_owned_session(mut command: Command) -> std::io::Result<Optio
     lease.parent_spawned(
         child.id(),
         decision
-            .2
+            .registration
             .expect("authorized session has a boundary registration"),
     );
     // Command retains configured descriptors after spawn. Release them before
@@ -5684,7 +5785,7 @@ pub(crate) fn spawn_owned_session(mut command: Command) -> std::io::Result<Optio
         return Err(error);
     }
     drop(launch);
-    Ok(Some(owned))
+    Ok(OwnedLaunch::Live(owned))
 }
 
 /// What a `waitid` drain does next after handling one WNOWAIT candidate.
@@ -6965,8 +7066,31 @@ mod tests {
 
     #[test]
     fn stderr_writer_falls_back_when_its_first_primary_send_discovers_failure() {
+        const HELPER: &str = "DOT_STDERR_FALLBACK_SEND_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cleanup::tests::stderr_writer_falls_back_when_its_first_primary_send_discovers_failure",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stderr fallback-send helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         use std::io::Write as _;
 
+        // The helper owns the process-wide outward-write-abort latch
+        // exclusively: a parallel relay abort would flip this failure-path
+        // test onto the cancelled path mid-run (loaded-host flake).
         resume_outward_writes();
         // An unbound sender fails deterministically. A dropped peer's send
         // can still succeed while another thread's forked-not-yet-exec'd
@@ -7018,8 +7142,32 @@ mod tests {
 
     #[test]
     fn cancelled_primary_send_does_not_poison_the_stderr_fallback() {
+        const HELPER: &str = "DOT_CANCELLED_SEND_FALLBACK_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cleanup::tests::cancelled_primary_send_does_not_poison_the_stderr_fallback",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "cancelled-send fallback helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         use std::io::Write as _;
 
+        // The helper owns the process-wide outward-write-abort latch
+        // exclusively: a parallel relay resume (clear) would erase this
+        // test's abort mid-run, and a parallel abort would poison its
+        // resumed writes (loaded-host flake).
         resume_outward_writes();
         let (primary_sender, _primary_receiver) = internal_datagram_pair().unwrap();
         primary_sender.set_nonblocking(true).unwrap();
@@ -7270,7 +7418,7 @@ while :; do sleep 0.02; done
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut outer = spawn_owned_session(command).unwrap().unwrap();
+        let mut outer = spawn_owned_session(command).unwrap().into_live().unwrap();
         poll_until(Instant::now() + Duration::from_secs(3), || {
             Ok(ready.exists().then_some(()))
         })
@@ -7305,7 +7453,7 @@ while :; do sleep 0.02; done
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut outer = spawn_owned_session(command).unwrap().unwrap();
+        let mut outer = spawn_owned_session(command).unwrap().into_live().unwrap();
         poll_until(Instant::now() + Duration::from_secs(3), || {
             Ok(shell_ready.exists().then_some(()))
         })
@@ -7485,10 +7633,33 @@ os._exit(0)
 
     #[test]
     fn pending_signal_fallback_records_and_consumes_without_sigtimedwait() {
+        const HELPER: &str = "DOT_PENDING_FALLBACK_DRAIN_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cleanup::tests::pending_signal_fallback_records_and_consumes_without_sigtimedwait",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "pending-fallback drain helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         // Platforms without sigtimedwait (macOS, Android) drain through
         // sigpending plus a SIG_IGN round-trip. Block every handled signal
         // on this thread and target it directly so no other thread can
-        // consume or observe the pending instance.
+        // consume or observe the pending instance. The helper process owns
+        // the process-wide interrupt latch exclusively: latching a real
+        // signal in the shared test binary poisons parallel tests polling
+        // `received_signal` (loaded-host flake).
         let _signals = Signals::install().unwrap();
         let _blocked = BlockedLaunchSignals::install().unwrap();
         // SAFETY: the mask above blocks SIGTERM on this thread, so the
@@ -8644,7 +8815,10 @@ os._exit(0)
             return;
         }
 
-        let mut earlier = spawn_owned_session(Command::new("true")).unwrap().unwrap();
+        let mut earlier = spawn_owned_session(Command::new("true"))
+            .unwrap()
+            .into_live()
+            .unwrap();
         poll_until(Instant::now() + Duration::from_secs(2), || {
             earlier.exited().map(|done| done.then_some(()))
         })
@@ -8683,7 +8857,7 @@ os._exit(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut later = spawn_owned_session(command).unwrap().unwrap();
+        let mut later = spawn_owned_session(command).unwrap().into_live().unwrap();
         poll_until(Instant::now() + Duration::from_secs(2), || {
             later.exited().map(|done| done.then_some(()))
         })
@@ -8762,7 +8936,7 @@ os._exit(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let session = spawn_owned_session(command).unwrap().unwrap();
+        let session = spawn_owned_session(command).unwrap().into_live().unwrap();
         poll_until(Instant::now() + Duration::from_secs(2), || {
             session.exited().map(|done| done.then_some(()))
         })
@@ -8821,7 +8995,7 @@ os._exit(0)
 
         let mut command = Command::new("sleep");
         command.arg("30");
-        let mut session = spawn_owned_session(command).unwrap().unwrap();
+        let mut session = spawn_owned_session(command).unwrap().into_live().unwrap();
         let stopped = session.stop(libc::SIGTERM).unwrap();
 
         assert_eq!(stopped.signal(), Some(libc::SIGTERM));
@@ -8863,7 +9037,7 @@ os._exit(0)
         .unwrap();
         let mut command = Command::new("sleep");
         command.arg("30");
-        let mut owned = spawn_owned_session(command).unwrap().unwrap();
+        let mut owned = spawn_owned_session(command).unwrap().into_live().unwrap();
 
         let launch = StatusChildLaunch::begin();
         let processes = process_snapshot(Instant::now() + Duration::from_secs(2)).unwrap();
@@ -8993,14 +9167,18 @@ os._exit(0)
 
         let _ = stop_session(&mut child, libc::SIGTERM);
 
-        assert!(
-            child_ready.exists(),
-            "TERM handler did not spawn its late child"
-        );
-        assert!(
-            child_term.exists(),
-            "late same-group child did not receive TERM"
-        );
+        // The late child is spawned by the leader's TERM trap and is
+        // signaled by the same stop: both the spawn and the delivery
+        // land after `stop_session` returns, so poll for the markers
+        // instead of asserting them on arrival (loaded hosts flake).
+        poll_until(Instant::now() + Duration::from_secs(10), || {
+            Ok(child_ready.exists().then_some(()))
+        })
+        .expect("TERM handler did not spawn its late child");
+        poll_until(Instant::now() + Duration::from_secs(10), || {
+            Ok(child_term.exists().then_some(()))
+        })
+        .expect("late same-group child did not receive TERM");
         assert_eq!(
             std::fs::read_to_string(&leader_term)
                 .unwrap()
@@ -9076,14 +9254,23 @@ os._exit(0)
 
         let _ = stop_session(&mut child, libc::SIGTERM);
 
-        assert!(
-            child_ready.exists(),
-            "TERM handler did not spawn its late child"
-        );
-        assert!(
-            !child_term.exists(),
-            "portable fallback redelivered TERM to the whole unchanged group"
-        );
+        // The late child is spawned by the leader's TERM trap after the
+        // stop returns, so wait for the spawn (loaded hosts flake on an
+        // immediate check). Absence of a wrongful redelivery is then
+        // proven by a quiet period: any signal sent during the stop is
+        // delivered and trapped long before it ends.
+        poll_until(Instant::now() + Duration::from_secs(10), || {
+            Ok(child_ready.exists().then_some(()))
+        })
+        .expect("TERM handler did not spawn its late child");
+        let quiet_until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < quiet_until {
+            assert!(
+                !child_term.exists(),
+                "portable fallback redelivered TERM to the whole unchanged group"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(
             std::fs::read_to_string(&leader_term)
                 .unwrap()
@@ -9279,7 +9466,7 @@ os._exit(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut owned = spawn_owned_session(command).unwrap().unwrap();
+        let mut owned = spawn_owned_session(command).unwrap().into_live().unwrap();
         let status = owned.stop(libc::SIGTERM).unwrap();
         use std::os::unix::process::ExitStatusExt as _;
         assert_eq!(status.signal(), Some(libc::SIGTERM));
@@ -9497,7 +9684,7 @@ os._exit(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut session = spawn_owned_session(command).unwrap().unwrap();
+        let mut session = spawn_owned_session(command).unwrap().into_live().unwrap();
         poll_until(Instant::now() + Duration::from_secs(5), || {
             session.exited().map(|done| done.then_some(()))
         })
@@ -9695,7 +9882,7 @@ os._exit(0)
             .arg(&side_effect);
         let session = spawn_owned_session(command).unwrap();
 
-        assert!(session.is_none());
+        assert!(matches!(session, OwnedLaunch::Cancelled(libc::SIGTERM)));
         assert!(
             !side_effect.exists(),
             "cancelled suite crossed the launch barrier"
@@ -9750,7 +9937,7 @@ os._exit(0)
 
         let session = spawn_owned_session(command).unwrap();
 
-        assert!(session.is_none());
+        assert!(matches!(session, OwnedLaunch::Cancelled(libc::SIGTERM)));
         assert!(
             !side_effect.exists(),
             "child exec crossed denied authorization"
@@ -9983,11 +10170,13 @@ os._exit(0)
         // session-probe snapshot, no discovery).
         let scope = dot_test_support::TempDir::new("four-step-escape").unwrap();
         let pid_path = scope.path().join("escapee.pid");
+        let escaped_path = scope.path().join("escaped");
         let program = r#"
 import os
 import sys
+import time
 
-pid_path = sys.argv[1]
+pid_path, escaped_path = sys.argv[1:]
 first = os.fork()
 if first == 0:
     second = os.fork()
@@ -9997,9 +10186,18 @@ if first == 0:
         if not isinstance(maximum, int) or maximum < 3:
             maximum = 65536
         os.closerange(3, maximum)
+        with open(escaped_path, "w", encoding="utf-8") as output:
+            output.write("escaped")
         with open(pid_path, "w", encoding="utf-8") as output:
             output.write(str(os.getpid()))
         os.execvpe("sleep", ["sleep", "30"], {})
+    # The leader must not exit (starting teardown) until the escapee has
+    # left the session and closed every fd: otherwise teardown can SIGKILL
+    # the still-in-session grandchild before it writes its pidfile, and the
+    # pidfile poll below times out (loaded-host flake).
+    deadline = time.monotonic() + 10
+    while not os.path.exists(escaped_path) and time.monotonic() < deadline:
+        time.sleep(0.005)
     os._exit(0)
 os.waitpid(first, 0)
 os._exit(0)
@@ -10008,6 +10206,7 @@ os._exit(0)
         command
             .args(["-I", "-S", "-c", program])
             .arg(&pid_path)
+            .arg(&escaped_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -10058,12 +10257,16 @@ if child == 0:
             output.write("TERM\n")
         os._exit(0)
     signal.signal(signal.SIGTERM, stop)
-    with open(pid_path, "w", encoding="utf-8") as output:
-        output.write(str(os.getpid()))
     maximum = os.sysconf("SC_OPEN_MAX")
     if not isinstance(maximum, int) or maximum < 3:
         maximum = 65536
     os.closerange(3, maximum)
+    # The pidfile is the leader's exit gate, and the exit starts teardown:
+    # it must land only once the descendant is fully started (handler
+    # installed, lease closed). A pidfile before closerange lets teardown
+    # observe an open lease and SIGKILL the group without TERM (flake).
+    with open(pid_path, "w", encoding="utf-8") as output:
+        output.write(str(os.getpid()))
     time.sleep(4)
     os._exit(0)
 while not os.path.exists(pid_path):
@@ -10133,12 +10336,17 @@ if branch == 0:
                 output.write("TERM\n")
             os._exit(0)
         signal.signal(signal.SIGTERM, stop_member)
-        with open(child_pid, "w", encoding="utf-8") as output:
-            output.write(str(os.getpid()))
         maximum = os.sysconf("SC_OPEN_MAX")
         if not isinstance(maximum, int) or maximum < 3:
             maximum = 65536
         os.closerange(3, maximum)
+        # Pidfiles gate the leader's exit, and the exit starts teardown:
+        # they must land only once each descendant is fully started
+        # (handler installed, group moved, lease closed). A pidfile before
+        # closerange lets teardown observe an open lease and SIGKILL the
+        # group without TERM (loaded-host flake).
+        with open(child_pid, "w", encoding="utf-8") as output:
+            output.write(str(os.getpid()))
         time.sleep(4)
         os._exit(0)
     os.setpgid(0, 0)
@@ -10147,12 +10355,12 @@ if branch == 0:
             output.write("TERM\n")
         os._exit(0)
     signal.signal(signal.SIGTERM, stop_parent)
-    with open(parent_pid, "w", encoding="utf-8") as output:
-        output.write(str(os.getpid()))
     maximum = os.sysconf("SC_OPEN_MAX")
     if not isinstance(maximum, int) or maximum < 3:
         maximum = 65536
     os.closerange(3, maximum)
+    with open(parent_pid, "w", encoding="utf-8") as output:
+        output.write(str(os.getpid()))
     time.sleep(4)
     os._exit(0)
 while not (os.path.exists(parent_pid) and os.path.exists(child_pid)):
@@ -10286,6 +10494,27 @@ os._exit(0)
         assert_eq!(parse_ps_snapshot(b"123 S\n"), None);
         assert_eq!(parse_ps_snapshot(b"123 1 123 123 Z\nmalformed\n"), None);
         assert_eq!(parse_ps_snapshot(b"123 1 123 123 S extra\n"), None);
+    }
+
+    #[test]
+    fn portable_snapshot_skips_fully_dead_rows() {
+        // A fully-dead (`X`) row is exited churn: its ppid/pgrp/session
+        // read back as -1, which never parses as live topology. It must
+        // skip like a blank line instead of failing the snapshot.
+        assert_eq!(
+            parse_ps_snapshot(b"123 1 122 121 S\n456 -1 -1 -1 X\n"),
+            Some(vec![ProcessInfo {
+                pid: 123,
+                parent: 1,
+                group: 122,
+                session: 121,
+                live: true,
+                identity: ProcessIdentity {
+                    pid: 123,
+                    start: None,
+                },
+            }])
+        );
     }
 
     #[test]
@@ -11248,6 +11477,98 @@ int kill(pid_t pid, int sig) {
         assert!(
             proc_process_snapshot(root.path(), Instant::now() + Duration::from_secs(1)).is_none()
         );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn proc_snapshot_skips_fully_dead_rows() {
+        // A fully-dead (`X`) row is exited churn: the kernel reports its
+        // ppid/pgrp/session as -1/0, which never parses as live topology.
+        // Observed under fork storms (`2871753 (dot) X 0 -1 -1 ...`); it
+        // must skip like a vanished entry instead of failing the snapshot
+        // (loaded-host DOT_TEARDOWN_FAIL).
+        let root = dot_test_support::TempDir::new("dead-proc-snapshot").unwrap();
+        let live = root.path().join("123");
+        std::fs::create_dir(&live).unwrap();
+        std::fs::write(
+            live.join("stat"),
+            b"123 (stat) R 1 123 123 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 100 0 0",
+        )
+        .unwrap();
+        let dead = root.path().join("456");
+        std::fs::create_dir(&dead).unwrap();
+        std::fs::write(
+            dead.join("stat"),
+            b"456 (dot) X 0 -1 -1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+        )
+        .unwrap();
+        let snapshot = proc_process_snapshot(root.path(), Instant::now() + Duration::from_secs(5));
+        let snapshot = snapshot.expect("a dead row failed the whole snapshot");
+        assert_eq!(
+            snapshot,
+            vec![ProcessInfo {
+                pid: 123,
+                parent: 1,
+                group: 123,
+                session: 123,
+                live: true,
+                identity: ProcessIdentity {
+                    pid: 123,
+                    start: Some(100),
+                },
+            }],
+            "a dead row was not skipped"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn proc_snapshot_honors_an_expired_deadline() {
+        // The snapshot stays fail-closed under a spent budget: an expired
+        // deadline must refuse the walk rather than return a partial table.
+        let root = dot_test_support::TempDir::new("expired-proc-snapshot").unwrap();
+        let live = root.path().join("123");
+        std::fs::create_dir(&live).unwrap();
+        std::fs::write(
+            live.join("stat"),
+            b"123 (stat) R 1 123 123 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 100 0 0",
+        )
+        .unwrap();
+        assert!(
+            proc_process_snapshot(root.path(), Instant::now() - Duration::from_secs(1)).is_none(),
+            "an expired deadline still produced a snapshot"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn completion_snapshot_budget_covers_the_live_table() {
+        // The completion budget exists because a full table walk costs
+        // hundreds of milliseconds on a loaded host (observed to 800ms);
+        // it must suffice for the real table on the test host. A loaded
+        // host could still exceed it — but then the snapshot fails closed
+        // (verified above) and teardown retries instead of misreading.
+        assert!(
+            process_snapshot(completion_snapshot_deadline()).is_some(),
+            "the completion snapshot budget cannot cover the live table"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn proc_stat_state_reads_past_tricky_comm() {
+        // Comm may contain parens, spaces, and even `") X "`: the state
+        // must come from after the LAST comm terminator, exactly like the
+        // topology parser (a comm-content match would skip a live row).
+        assert_eq!(
+            proc_stat_state(b"123 (nested ) X ) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 77"),
+            Some(b'R')
+        );
+        assert_eq!(
+            proc_stat_state(b"456 (dot) X 0 -1 -1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"),
+            Some(b'X')
+        );
+        assert_eq!(proc_stat_state(b"123 (truncated"), None);
     }
 
     #[test]

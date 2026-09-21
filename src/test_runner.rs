@@ -268,11 +268,11 @@ fn start(
         .stdout(Stdio::from(writer.try_clone()?))
         .stderr(Stdio::from(writer));
     match crate::cleanup::spawn_owned_session(command) {
-        Ok(Some(child)) => {
+        Ok(crate::cleanup::OwnedLaunch::Live(child)) => {
             worker.execution_started = Some(Instant::now());
             worker.child = Some(child);
         }
-        Ok(None) => worker.status = Some(1),
+        Ok(crate::cleanup::OwnedLaunch::Cancelled(_)) => worker.status = Some(1),
         Err(error) => {
             worker.status = Some(if error.kind() == std::io::ErrorKind::NotFound {
                 127

@@ -458,7 +458,7 @@ fn pull_all_aggregates_base_and_overlay_outcomes() {
     let mut stage = stage();
     let mut out = Vec::new();
     let mut warnings = Vec::new();
-    let outcome = pull_all(&inputs, &mut stage, &mut moves, &mut out, &mut warnings, 0);
+    let outcome = pull_all(&inputs, &mut stage, &mut moves, &mut out, &mut warnings);
     assert_eq!(outcome.status, RepoPullStatus::Changed);
     assert_eq!(outcome.rc, 0);
     assert_eq!(

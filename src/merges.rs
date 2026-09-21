@@ -669,7 +669,6 @@ struct ResultRecord {
 /// argument list.
 struct BatchState<'a> {
     root: &'a Path,
-    now_secs: i64,
     merge_index: usize,
     total: usize,
     overlays: &'a [Vec<u8>],
@@ -763,7 +762,7 @@ fn run_batch(
         );
         let _ = out.write_all(&stage.update(
             detail.as_bytes(),
-            state.now_secs,
+            crate::update_engine::now_secs(),
             inputs.verbose.then_some("1"),
         ));
     }
@@ -883,7 +882,6 @@ pub(crate) fn run(
     stage: &mut crate::progress_ui::Stage,
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
-    now_secs: i64,
 ) -> Outcome {
     use std::io::Write as _;
     let hooks = match discover(inputs) {
@@ -897,12 +895,25 @@ pub(crate) fn run(
         }
     };
     if hooks.is_empty() {
-        let _ =
-            out.write_all(&stage.start(b"Configs", Some(b"checking config hooks"), now_secs, None));
-        let _ = out.write_all(&stage.finish(b"ok", b"no config hooks", now_secs));
+        let _ = out.write_all(&stage.start(
+            b"Configs",
+            Some(b"checking config hooks"),
+            crate::update_engine::now_secs(),
+            None,
+        ));
+        let _ = out.write_all(&stage.finish(
+            b"ok",
+            b"no config hooks",
+            crate::update_engine::now_secs(),
+        ));
         return Outcome { status: 0 };
     }
-    let _ = out.write_all(&stage.start(b"Configs", Some(b"running config hooks"), now_secs, None));
+    let _ = out.write_all(&stage.start(
+        b"Configs",
+        Some(b"running config hooks"),
+        crate::update_engine::now_secs(),
+        None,
+    ));
     let Some(root) = scratch(inputs.tmp) else {
         inputs.log.warn(
             err,
@@ -911,7 +922,7 @@ pub(crate) fn run(
         let _ = out.write_all(&stage.finish(
             b"warning",
             warning_summary(0, i64::try_from(hooks.len()).unwrap_or(i64::MAX)).as_bytes(),
-            now_secs,
+            crate::update_engine::now_secs(),
         ));
         return Outcome { status: 1 };
     };
@@ -925,7 +936,7 @@ pub(crate) fn run(
         let _ = out.write_all(&stage.finish(
             b"warning",
             warning_summary(0, i64::try_from(hooks.len()).unwrap_or(i64::MAX)).as_bytes(),
-            now_secs,
+            crate::update_engine::now_secs(),
         ));
         return Outcome { status: 1 };
     }
@@ -940,7 +951,6 @@ pub(crate) fn run(
         .collect();
     let mut state = BatchState {
         root: &root,
-        now_secs,
         merge_index: 0,
         total: hooks.len(),
         overlays: &overlays,
@@ -988,7 +998,7 @@ pub(crate) fn run(
     let _ = out.write_all(&stage.finish(
         if failed > 0 { b"warning" } else { b"ok" },
         detail.as_bytes(),
-        now_secs,
+        crate::update_engine::now_secs(),
     ));
     Outcome {
         status: if failed == 0 { 0 } else { 1 },
@@ -1097,7 +1107,7 @@ mod tests {
             log: &log,
         };
 
-        let outcome = run(&inputs, &mut stage, &mut out, &mut err, 0);
+        let outcome = run(&inputs, &mut stage, &mut out, &mut err);
 
         assert_eq!(outcome.status, 1);
         assert_eq!(

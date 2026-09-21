@@ -381,13 +381,7 @@ impl Agg {
 
     /// The single deferred close
     /// (`_dot_update_repo_stage_finish`).
-    fn close(
-        &self,
-        stage: &mut Stage,
-        forced: &str,
-        verbose: Option<&str>,
-        now_secs: i64,
-    ) -> Vec<u8> {
+    fn close(&self, stage: &mut Stage, forced: &str, verbose: Option<&str>) -> Vec<u8> {
         repo_finish(
             stage,
             forced,
@@ -397,7 +391,6 @@ impl Agg {
             &self.skipped.to_string(),
             &self.changed_items,
             verbose,
-            now_secs,
         )
     }
 }
@@ -440,7 +433,6 @@ fn repo_finish(
     skipped: &str,
     changed_items: &[u8],
     verbose: Option<&str>,
-    now_secs: i64,
 ) -> Vec<u8> {
     crate::update::repo_stage_finish(
         stage,
@@ -454,7 +446,6 @@ fn repo_finish(
             changed_items,
             verbose,
         },
-        now_secs,
     )
 }
 
@@ -505,7 +496,6 @@ pub fn sync_repos(
     moves: &mut crate::temp::MoveCache,
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
-    now_secs: i64,
 ) -> SyncDone {
     use std::io::Write as _;
     let base = inputs.base.filter(|found| found.exists());
@@ -521,7 +511,6 @@ pub fn sync_repos(
             moves,
             out,
             err,
-            now_secs,
             Agg::zero(),
             None,
             None,
@@ -569,9 +558,9 @@ pub fn sync_repos(
         tool: inputs.tool,
         log: inputs.log,
     };
-    let outcome = crate::repos_pull_fleet::pull_all(&pull_inputs, stage, moves, out, err, now_secs);
+    let outcome = crate::repos_pull_fleet::pull_all(&pull_inputs, stage, moves, out, err);
     if outcome.rc != 0 || outcome.failed > 0 {
-        let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose, now_secs);
+        let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose);
         let _ = out.write_all(&close);
         restore_generation(inputs, base, &snapshot, &[], err);
         return SyncDone {
@@ -589,7 +578,7 @@ pub fn sync_repos(
         Err(failure) => {
             err.extend_from_slice(failure.line().as_bytes());
             err.push(b'\n');
-            let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose, now_secs);
+            let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose);
             let _ = out.write_all(&close);
             restore_generation(inputs, base, &snapshot, &[], err);
             return SyncDone {
@@ -606,7 +595,6 @@ pub fn sync_repos(
         moves,
         out,
         err,
-        now_secs,
         Agg::base(&outcome),
         Some(base),
         Some(snapshot),
@@ -630,7 +618,6 @@ fn sync_tail(
     moves: &mut crate::temp::MoveCache,
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
-    now_secs: i64,
     mut agg: Agg,
     base: Option<&Base>,
     snapshot: Option<InstalledSnapshot>,
@@ -638,11 +625,11 @@ fn sync_tail(
 ) -> SyncDone {
     use std::io::Write as _;
     let mut io = UpdateIo { out, err };
-    let mut conv = converge_overlays(inputs, state, stage, moves, &mut io, now_secs);
+    let mut conv = converge_overlays(inputs, state, stage, moves, &mut io);
     agg.fold_agg(&conv.overlay);
     if conv.rc != 0 {
         if close_active {
-            let close = agg.close(stage, "1", inputs.dot_verbose, now_secs);
+            let close = agg.close(stage, "1", inputs.dot_verbose);
             let _ = io.out.write_all(&close);
         }
         if let (Some(base), Some(snapshot)) = (base, snapshot.as_ref()) {
@@ -678,7 +665,7 @@ fn sync_tail(
     conv.state.retained = prepared.records;
     if !prepared_ok {
         if close_active {
-            let close = agg.close(stage, "1", inputs.dot_verbose, now_secs);
+            let close = agg.close(stage, "1", inputs.dot_verbose);
             let _ = io.out.write_all(&close);
         }
         if let (Some(base), Some(snapshot)) = (base, snapshot.as_ref()) {
@@ -691,7 +678,7 @@ fn sync_tail(
         };
     }
     if close_active {
-        let close = agg.close(stage, "0", inputs.dot_verbose, now_secs);
+        let close = agg.close(stage, "0", inputs.dot_verbose);
         let _ = io.out.write_all(&close);
     }
     SyncDone {
@@ -780,7 +767,6 @@ fn converge_overlays(
     stage: &mut Stage,
     moves: &mut crate::temp::MoveCache,
     io: &mut UpdateIo<'_>,
-    now_secs: i64,
 ) -> ConvergeOut {
     use std::io::Write as _;
     let fail = |state: UpdateState, overlay: Agg| ConvergeOut {
@@ -799,7 +785,7 @@ fn converge_overlays(
         return fail(update, overlay);
     }
     if update.profiles.present {
-        return converge_profiles(inputs, stage, moves, io, now_secs, update, overlay);
+        return converge_profiles(inputs, stage, moves, io, update, overlay);
     }
     let mut dstate = crate::overlays::State::default();
     if discover_active(inputs, &mut dstate, io.err).is_err() {
@@ -844,9 +830,11 @@ fn converge_overlays(
             inputs.ascii,
             inputs.multibyte,
         );
-        let _ = io
-            .out
-            .write_all(&stage.update(&detail, now_secs, inputs.dot_verbose));
+        let _ = io.out.write_all(&stage.update(
+            &detail,
+            crate::update_engine::now_secs(),
+            inputs.dot_verbose,
+        ));
     }
     let candidate = pull_candidate(inputs, &entries);
     let outcome = pull_overlays_only(
@@ -890,7 +878,6 @@ fn converge_profiles(
     stage: &mut Stage,
     moves: &mut crate::temp::MoveCache,
     io: &mut UpdateIo<'_>,
-    now_secs: i64,
     mut update: UpdateState,
     mut overlay: Agg,
 ) -> ConvergeOut {
@@ -950,9 +937,11 @@ fn converge_profiles(
             inputs.ascii,
             inputs.multibyte,
         );
-        let _ = io
-            .out
-            .write_all(&stage.update(&detail, now_secs, inputs.dot_verbose));
+        let _ = io.out.write_all(&stage.update(
+            &detail,
+            crate::update_engine::now_secs(),
+            inputs.dot_verbose,
+        ));
     }
     let candidate = pull_candidate(inputs, &entries);
     let outcome = pull_overlays_only(
@@ -1252,27 +1241,32 @@ fn record_name(record: &str) -> Option<&str> {
 
 /// `_dot_update_skip_inputs`: the Tools/Configs warning close for
 /// a failed input side.
-fn skip_inputs_rows(stage: &mut Stage, out: &mut Vec<u8>, reason: &str, now_secs: i64) {
+fn skip_inputs_rows(stage: &mut Stage, out: &mut Vec<u8>, reason: &str) {
     use std::io::Write as _;
     let open = stage.start(
         b"Tools",
         Some(b"skipping configured dependencies"),
-        now_secs,
+        crate::update_engine::now_secs(),
         None,
     );
     let _ = out.write_all(&open);
     let close = stage.finish(
         b"warning",
         format!("{reason}; dependencies skipped").as_bytes(),
-        now_secs,
+        crate::update_engine::now_secs(),
     );
     let _ = out.write_all(&close);
-    let open = stage.start(b"Configs", Some(b"skipping config hooks"), now_secs, None);
+    let open = stage.start(
+        b"Configs",
+        Some(b"skipping config hooks"),
+        crate::update_engine::now_secs(),
+        None,
+    );
     let _ = out.write_all(&open);
     let close = stage.finish(
         b"warning",
         format!("{reason}; config hooks skipped").as_bytes(),
-        now_secs,
+        crate::update_engine::now_secs(),
     );
     let _ = out.write_all(&close);
 }
@@ -1306,7 +1300,7 @@ fn finalize(
             quiet(inputs),
             Some("1"),
             now_secs,
-            now_secs,
+            crate::update_engine::now_secs(),
             &reload_hint(inputs),
         );
         let _ = io.out.write_all(&close);
@@ -1318,14 +1312,14 @@ fn finalize(
         let open = stage.start(
             b"Overlays",
             Some(b"preserving installed overlay links"),
-            now_secs,
+            crate::update_engine::now_secs(),
             inputs.dot_verbose,
         );
         let _ = io.out.write_all(&open);
         let close = stage.finish(
             b"warning",
             b"profile resolution or repository sync failed",
-            now_secs,
+            crate::update_engine::now_secs(),
         );
         let _ = io.out.write_all(&close);
         status = 1;
@@ -1362,7 +1356,7 @@ fn finalize(
         return 1;
     }
     if !inputs_ready {
-        skip_inputs_rows(stage, io.out, "repository synchronization failed", now_secs);
+        skip_inputs_rows(stage, io.out, "repository synchronization failed");
     } else {
         let extensions_dir = state
             .config
@@ -1398,7 +1392,7 @@ fn finalize(
         );
         if retired != 0 {
             status = 1;
-            skip_inputs_rows(stage, io.out, "profile deactivation failed", now_secs);
+            skip_inputs_rows(stage, io.out, "profile deactivation failed");
         } else {
             if cancelled() {
                 return 1;
@@ -1409,11 +1403,15 @@ fn finalize(
                 let open = stage.start(
                     b"Tools",
                     Some(b"checking configured dependencies"),
-                    now_secs,
+                    crate::update_engine::now_secs(),
                     inputs.dot_verbose,
                 );
                 let _ = io.out.write_all(&open);
-                let close = stage.finish(b"ok", b"no dependency provider", now_secs);
+                let close = stage.finish(
+                    b"ok",
+                    b"no dependency provider",
+                    crate::update_engine::now_secs(),
+                );
                 let _ = io.out.write_all(&close);
             } else {
                 // The shell prepares Shdeps before opening the Tools stage.
@@ -1457,11 +1455,15 @@ fn finalize(
                         let open = stage.start(
                             b"Tools",
                             Some(b"checking configured dependencies"),
-                            now_secs,
+                            crate::update_engine::now_secs(),
                             inputs.dot_verbose,
                         );
                         let _ = io.out.write_all(&open);
-                        let close = stage.finish(b"failed", &provider.summary, now_secs);
+                        let close = stage.finish(
+                            b"failed",
+                            &provider.summary,
+                            crate::update_engine::now_secs(),
+                        );
                         let _ = io.out.write_all(&close);
                         status = 1;
                     }
@@ -1469,7 +1471,7 @@ fn finalize(
                         let open = stage.start(
                             b"Tools",
                             Some(b"checking configured dependencies"),
-                            now_secs,
+                            crate::update_engine::now_secs(),
                             inputs.dot_verbose,
                         );
                         let _ = io.out.write_all(&open);
@@ -1480,7 +1482,6 @@ fn finalize(
                             &provider_inputs,
                             prepared,
                             stage,
-                            now_secs,
                             live_out,
                             live_err,
                         );
@@ -1490,8 +1491,11 @@ fn finalize(
                         if provider.abort || cancelled() {
                             return interruption_status(None);
                         }
-                        let close =
-                            stage.finish(&provider.stage_status, &provider.summary, now_secs);
+                        let close = stage.finish(
+                            &provider.stage_status,
+                            &provider.summary,
+                            crate::update_engine::now_secs(),
+                        );
                         let _ = io.out.write_all(&close);
                         io.out.extend_from_slice(&provider.details);
                         if provider.status != 0 {
@@ -1541,7 +1545,6 @@ fn finalize(
                 stage,
                 io.out,
                 io.err,
-                now_secs,
             );
             if merged.status != 0 {
                 status = 1;
@@ -1591,22 +1594,26 @@ fn finalize(
         let open = stage.start(
             b"Cleanup",
             Some(b"normalizing worktree"),
-            now_secs,
+            crate::update_engine::now_secs(),
             inputs.dot_verbose,
         );
         let _ = io.out.write_all(&open);
         crate::repos_dirty::normalize_filtered(base_prefix.as_deref(), &state.active);
-        let close = stage.finish(b"ok", b"worktree normalized", now_secs);
+        let close = stage.finish(
+            b"ok",
+            b"worktree normalized",
+            crate::update_engine::now_secs(),
+        );
         let _ = io.out.write_all(&close);
     } else {
         let open = stage.start(
             b"Cleanup",
             Some(b"normalizing worktree"),
-            now_secs,
+            crate::update_engine::now_secs(),
             inputs.dot_verbose,
         );
         let _ = io.out.write_all(&open);
-        let close = stage.finish(b"ok", b"no base repo", now_secs);
+        let close = stage.finish(b"ok", b"no base repo", crate::update_engine::now_secs());
         let _ = io.out.write_all(&close);
     }
     if cancelled() {
@@ -1617,7 +1624,7 @@ fn finalize(
         quiet(inputs),
         Some(&status.to_string()),
         now_secs,
-        now_secs,
+        crate::update_engine::now_secs(),
         &reload_hint(inputs),
     );
     let _ = io.out.write_all(&close);
@@ -1650,7 +1657,7 @@ fn provider_reexec(
             quiet(inputs),
             Some("1"),
             now_secs,
-            now_secs,
+            crate::update_engine::now_secs(),
             &reload_hint(inputs),
         );
         let _ = io.out.write_all(&close);
@@ -1667,7 +1674,7 @@ fn provider_reexec(
             quiet(inputs),
             Some("1"),
             now_secs,
-            now_secs,
+            crate::update_engine::now_secs(),
             &reload_hint(inputs),
         );
         let _ = io.out.write_all(&close);
@@ -1699,7 +1706,7 @@ fn provider_reexec(
             quiet(inputs),
             Some("1"),
             now_secs,
-            now_secs,
+            crate::update_engine::now_secs(),
             &reload_hint(inputs),
         );
         let _ = io.out.write_all(&close);
@@ -2305,7 +2312,7 @@ fn run_gathered_inner(
         inputs.ascii,
     );
     let mut moves = crate::temp::MoveCache::default();
-    let mut sync = sync_repos(inputs, &mut stage, &mut moves, out, err, now_secs);
+    let mut sync = sync_repos(inputs, &mut stage, &mut moves, out, err);
     if cancelled() {
         return 1;
     }
@@ -2338,7 +2345,7 @@ fn run_gathered_inner(
                 quiet(inputs),
                 Some("1"),
                 now_secs,
-                now_secs,
+                crate::update_engine::now_secs(),
                 &reload_hint(inputs),
             );
             let _ = out.write_all(&close);

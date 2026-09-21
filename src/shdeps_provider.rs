@@ -731,11 +731,10 @@ pub(crate) fn update(
     inputs: &Inputs<'_>,
     prepared: Prepared,
     stage: &mut crate::progress_ui::Stage,
-    now_secs: i64,
     live_out: &mut dyn std::io::Write,
     live_err: &mut dyn std::io::Write,
 ) -> Outcome {
-    run_update(inputs, &prepared.0, stage, now_secs, live_out, live_err)
+    run_update(inputs, &prepared.0, stage, live_out, live_err)
 }
 
 enum EnsureFailure {
@@ -1450,7 +1449,6 @@ fn run_update(
     inputs: &Inputs<'_>,
     ready: &Ready,
     stage: &mut crate::progress_ui::Stage,
-    now_secs: i64,
     live_out: &mut dyn std::io::Write,
     live_err: &mut dyn std::io::Write,
 ) -> Outcome {
@@ -1612,7 +1610,6 @@ fn run_update(
                                     session,
                                     stage,
                                     inputs,
-                                    now_secs,
                                     &mut bounded_live_out,
                                     live,
                                     prompt.as_ref().map(|pipe| pipe.path.as_path()),
@@ -1723,7 +1720,6 @@ fn run_update(
                     &mut session,
                     stage,
                     inputs,
-                    now_secs,
                     &mut bounded_live_out,
                     &mut live,
                     prompt.as_ref().map(|pipe| pipe.path.as_path()),
@@ -1744,7 +1740,6 @@ fn run_update(
                         &mut session,
                         stage,
                         inputs,
-                        now_secs,
                         &mut bounded_live_out,
                         &mut live,
                         prompt.as_ref().map(|pipe| pipe.path.as_path()),
@@ -1975,7 +1970,6 @@ fn provider_line(
     session: &mut crate::shdeps_ui_render::Session,
     stage: &mut crate::progress_ui::Stage,
     inputs: &Inputs<'_>,
-    now_secs: i64,
     output: &mut dyn std::io::Write,
     live: &mut bool,
     prompt: Option<&Path>,
@@ -1988,9 +1982,7 @@ fn provider_line(
     if line.last() == Some(&b'\n') {
         line.pop();
     }
-    handle_event(
-        &line, state, session, stage, inputs, now_secs, output, live, prompt,
-    )
+    handle_event(&line, state, session, stage, inputs, output, live, prompt)
 }
 
 fn report_provider_output_limit(output: &mut LimitedWriter<'_>, error: &std::io::Error) {
@@ -2058,7 +2050,6 @@ fn handle_event(
     session: &mut crate::shdeps_ui_render::Session,
     stage: &mut crate::progress_ui::Stage,
     inputs: &Inputs<'_>,
-    now_secs: i64,
     output: &mut dyn std::io::Write,
     live: &mut bool,
     prompt: Option<&Path>,
@@ -2138,7 +2129,11 @@ fn handle_event(
                 text(&fields, "label").to_vec()
             };
             let detail = crate::progress_ui::sanitize_untrusted_text(&detail);
-            output.write_all(&stage.update(&detail, now_secs, inputs.verbose.then_some("1")))?;
+            output.write_all(&stage.update(
+                &detail,
+                crate::update_engine::now_secs(),
+                inputs.verbose.then_some("1"),
+            ))?;
         }
         b"warning" | b"detail" | b"hint" => {
             crate::shdeps_ui_render::prompt_resume(session);
@@ -2567,7 +2562,6 @@ mod tests {
             &mut session,
             &mut stage,
             &inputs,
-            0,
             &mut output,
             &mut live,
             None,
@@ -2731,6 +2725,30 @@ mod tests {
 
     #[test]
     fn trusted_provider_cancellation_wins_over_intentional_queued_relay_abort() {
+        const HELPER: &str = "DOT_PROVIDER_CANCEL_RELAY_ABORT_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "shdeps_provider::tests::trusted_provider_cancellation_wins_over_intentional_queued_relay_abort",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "provider cancel relay-abort helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // The helper owns the process-wide outward-write-abort latch
+        // exclusively: parallel relay tests resume (clear) the latch when
+        // their own relay ends, which can erase this relay's abort before
+        // its blocked writer observes it (loaded-host flake).
         let scratch = dot_test_support::TempDir::new_exec("provider-cancel-relay-abort")
             .expect("fixture directory");
         let root = scratch.path().join("source");
@@ -2864,7 +2882,7 @@ mod tests {
             crate::cleanup::abort_outward_writes();
         });
 
-        let outcome = run_update(&inputs, &ready, &mut stage, 0, &mut output, &mut errors);
+        let outcome = run_update(&inputs, &ready, &mut stage, &mut output, &mut errors);
 
         assert!(release_after_block.join().expect("provider release thread"));
         watchdog.join().expect("provider abort watchdog");
@@ -3067,7 +3085,7 @@ mod tests {
         let mut output = BlockingWriter { state: shared };
         let mut errors = Vec::new();
 
-        let outcome = run_update(&inputs, &ready, &mut stage, 0, &mut output, &mut errors);
+        let outcome = run_update(&inputs, &ready, &mut stage, &mut output, &mut errors);
 
         let (entered, stopped, cleaned_while_blocked) = sender.join().expect("signal sender");
         assert!(
