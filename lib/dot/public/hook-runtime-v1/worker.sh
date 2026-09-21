@@ -40,21 +40,21 @@ cd "$HOME"
 # shellcheck source=../xdg.sh
 . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
 # Snapshot the pre-existing functions so only the overlay allowlist below
-# survives the library sources. A plain array with a linear scan keeps this
-# compatible with Bash 3.2 (macOS ships no associative arrays); names are
-# compared literally, never as patterns.
-existing_functions=()
-while IFS= read -r function_name; do
-  existing_functions+=("$function_name")
-done < <(compgen -A function)
+# survives the library sources. Membership against the newline-joined
+# snapshot needs one process listing and no per-item forks, and stays
+# compatible with Bash 3.2, which ships no associative arrays. The name
+# stays quoted inside the pattern so glob characters in it match
+# literally; function names cannot contain newlines.
+existing_functions=$(compgen -A function)
+existing_functions=$'\n'"$existing_functions"$'\n'
 # shellcheck source=repos/config.sh
 . "$DOT_SOURCE_ROOT/lib/dot/public/hook-runtime-v1/repos/config.sh"
 # shellcheck source=repos/overlays.sh
 . "$DOT_SOURCE_ROOT/lib/dot/public/hook-runtime-v1/repos/overlays.sh"
 while IFS= read -r function_name; do
-  for existing_function in ${existing_functions[@]+"${existing_functions[@]}"}; do
-    [[ $existing_function == "$function_name" ]] && continue 2
-  done
+  case $existing_functions in
+    *$'\n'"$function_name"$'\n'*) continue ;;
+  esac
   case $function_name in
     _overlay_link_target | _overlay_private_regular_file | \
       _overlay_parse_manifest_record | _overlay_manifest_safe | \
@@ -63,7 +63,7 @@ while IFS= read -r function_name; do
     *) unset -f "$function_name" ;;
   esac
 done < <(compgen -A function)
-unset existing_functions existing_function function_name
+unset existing_functions function_name
 # shellcheck source=extension-trust.sh
 . "$DOT_SOURCE_ROOT/lib/dot/public/hook-runtime-v1/extension-trust.sh"
 
