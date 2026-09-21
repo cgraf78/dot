@@ -1181,11 +1181,11 @@ EOF
       done >>"$directory/summary.tsv" <<'EOF'
 help 24075000 75
 version 23850000 75
-base-clean 4000000000 95
+base-clean 535000000 -
 disjoint-clean 1602500000 75
 disjoint-dirty 2010000000 75
 profile-provider-hooks-collision 12000000000 75
-pre-sync-failure 4000000000 75
+pre-sync-failure 735000000 -
 EOF
       bind_calibration "$directory"
       perf_write_final_driver "$directory" "$run_id" "$shell_commit" "$shell_tree" \
