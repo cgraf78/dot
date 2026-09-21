@@ -734,7 +734,11 @@ pub(crate) fn update(
     live_out: &mut dyn std::io::Write,
     live_err: &mut dyn std::io::Write,
 ) -> Outcome {
-    run_update(inputs, &prepared.0, stage, live_out, live_err)
+    let mut beat = crate::progress_ui::Heartbeat::new(
+        crate::update_engine::now_secs(),
+        crate::progress_ui::HEARTBEAT_INTERVAL_SECS,
+    );
+    run_update(inputs, &prepared.0, stage, live_out, live_err, &mut beat)
 }
 
 enum EnsureFailure {
@@ -1451,6 +1455,7 @@ fn run_update(
     stage: &mut crate::progress_ui::Stage,
     live_out: &mut dyn std::io::Write,
     live_err: &mut dyn std::io::Write,
+    beat: &mut crate::progress_ui::Heartbeat,
 ) -> Outcome {
     let before = crate::shdeps::active_revision(inputs.source_root);
     let mut env = ready.env.clone();
@@ -1539,6 +1544,7 @@ fn run_update(
             let state = &mut state;
             let session = &mut session;
             let stage = &mut *stage;
+            let beat = &mut *beat;
             let live = &mut live;
             let prompt = &mut prompt;
             let remaining_events = &mut remaining_events;
@@ -1556,6 +1562,16 @@ fn run_update(
                     target: RelayTarget::Stderr,
                     sender: relay_sender,
                     sink_failed: relay_failure,
+                };
+                // Heartbeats ride the same relay (FIFO order against
+                // event renders from this thread) but bypass the
+                // provider capture budget: they are our bytes, not
+                // provider output, so a quiet provider must never
+                // spend its flood allowance on our redraws.
+                let mut heartbeat_out = RelayWriter {
+                    target: RelayTarget::Stdout,
+                    sender: relay_out.sender.clone(),
+                    sink_failed: relay_out.sink_failed.clone(),
                 };
                 let mut bounded_live_out =
                     LimitedWriter::new(&mut relay_out, PROVIDER_CAPTURE_LIMIT_BYTES);
@@ -1592,7 +1608,7 @@ fn run_update(
                         }
                         return result;
                     }
-                    drain_provider_streams(
+                    let result = drain_provider_streams(
                         stdout,
                         pending,
                         stderr_reader,
@@ -1614,11 +1630,25 @@ fn run_update(
                                     live,
                                     prompt.as_ref().map(|pipe| pipe.path.as_path()),
                                     remaining_events,
+                                    beat,
                                 );
                             }
                             Ok(())
                         },
-                    )
+                    );
+                    // Heartbeat: the supervisor ticks every millisecond,
+                    // so a quiet provider redraws its elapsed stamp on
+                    // whole seconds instead of freezing between events.
+                    // Final passes skip it (the finish row follows
+                    // immediately) and failures propagate like event
+                    // renders.
+                    if result.is_ok() && !final_pass {
+                        let now = crate::update_engine::now_secs();
+                        if beat.poll(now) {
+                            heartbeat_out.write_all(&stage.tick(now))?;
+                        }
+                    }
+                    result
                 });
                 let abort_output = match &finished {
                     Ok(crate::cleanup::SessionEnd::Exited(status)) => {
@@ -1724,6 +1754,7 @@ fn run_update(
                     &mut live,
                     prompt.as_ref().map(|pipe| pipe.path.as_path()),
                     &mut remaining_events,
+                    beat,
                 )
             },
         );
@@ -1744,6 +1775,7 @@ fn run_update(
                         &mut live,
                         prompt.as_ref().map(|pipe| pipe.path.as_path()),
                         &mut remaining_events,
+                        beat,
                     )
                 },
             )
@@ -1974,6 +2006,7 @@ fn provider_line(
     live: &mut bool,
     prompt: Option<&Path>,
     remaining_events: &mut usize,
+    beat: &mut crate::progress_ui::Heartbeat,
 ) -> std::io::Result<()> {
     if *remaining_events == 0 {
         return Err(provider_output_limit());
@@ -1982,7 +2015,9 @@ fn provider_line(
     if line.last() == Some(&b'\n') {
         line.pop();
     }
-    handle_event(&line, state, session, stage, inputs, output, live, prompt)
+    handle_event(
+        &line, state, session, stage, inputs, output, live, prompt, beat,
+    )
 }
 
 fn report_provider_output_limit(output: &mut LimitedWriter<'_>, error: &std::io::Error) {
@@ -2053,6 +2088,7 @@ fn handle_event(
     output: &mut dyn std::io::Write,
     live: &mut bool,
     prompt: Option<&Path>,
+    beat: &mut crate::progress_ui::Heartbeat,
 ) -> std::io::Result<()> {
     let Some(fields) = parse_event(inputs.runtime, line) else {
         return Ok(());
@@ -2129,11 +2165,15 @@ fn handle_event(
                 text(&fields, "label").to_vec()
             };
             let detail = crate::progress_ui::sanitize_untrusted_text(&detail);
-            output.write_all(&stage.update(
-                &detail,
-                crate::update_engine::now_secs(),
-                inputs.verbose.then_some("1"),
-            ))?;
+            let now = crate::update_engine::now_secs();
+            let rendered = stage.update(&detail, now, inputs.verbose.then_some("1"));
+            output.write_all(&rendered)?;
+            // The event just rendered: latch the heartbeat so the
+            // next poll waits a fresh interval instead of duplicating
+            // this line within its second.
+            if !rendered.is_empty() {
+                beat.noted(now);
+            }
         }
         b"warning" | b"detail" | b"hint" => {
             crate::shdeps_ui_render::prompt_resume(session);
@@ -2556,6 +2596,10 @@ mod tests {
             crate::progress_ui::Stage::begin(palette.clone(), "5", false, true, false, true);
         let mut output = Vec::new();
         let mut live = true;
+        let mut beat = crate::progress_ui::Heartbeat::new(
+            crate::update_engine::now_secs(),
+            crate::progress_ui::HEARTBEAT_INTERVAL_SECS,
+        );
         handle_event(
             line.as_bytes(),
             &mut state,
@@ -2565,6 +2609,7 @@ mod tests {
             &mut output,
             &mut live,
             None,
+            &mut beat,
         )
         .expect("phase event renders");
         output
@@ -2632,6 +2677,88 @@ mod tests {
             error.to_string(),
             "provider capture supervisor thread panicked"
         );
+    }
+
+    #[test]
+    fn quiet_provider_stall_still_redraws_the_live_line() {
+        // A provider that emits nothing for hundreds of milliseconds
+        // must still redraw the live elapsed stamp: interval 0 forces
+        // every supervisor poll to render, so even one poll proves the
+        // wiring (a 0.3s stall spans hundreds of 1ms supervisor
+        // ticks). The stage stays live with no events, so every ESC
+        // in the output is a heartbeat redraw.
+        let scratch =
+            dot_test_support::TempDir::new_exec("provider-heartbeat").expect("fixture directory");
+        let root = scratch.path().join("source");
+        let home = scratch.path().join("home");
+        let config = scratch.path().join("config");
+        let state_home = scratch.path().join("state");
+        let tmp = scratch.path().join("tmp");
+        for directory in [&root, &home, &config, &state_home, &tmp] {
+            std::fs::create_dir_all(directory).expect("fixture directory");
+        }
+        let provider = scratch.path().join("provider");
+        std::fs::write(&provider, b"#!/bin/sh\nsleep 0.3\nexit 0\n").expect("provider fixture");
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755))
+            .expect("provider fixture mode");
+        let env = std::collections::BTreeMap::from([
+            (
+                std::ffi::OsString::from("HOME"),
+                home.as_os_str().to_owned(),
+            ),
+            (
+                std::ffi::OsString::from("PATH"),
+                std::ffi::OsString::from("/usr/bin:/bin"),
+            ),
+            (
+                std::ffi::OsString::from("TMPDIR"),
+                tmp.as_os_str().to_owned(),
+            ),
+            (
+                std::ffi::OsString::from("DOT_SOURCE_ROOT"),
+                root.as_os_str().to_owned(),
+            ),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, scratch.path()).expect("runtime");
+        let palette = crate::progress_ui::Palette::empty();
+        let inputs = Inputs {
+            runtime: &runtime,
+            source_root: &root,
+            home: home.to_str().expect("UTF-8 home"),
+            config_home: config.to_str().expect("UTF-8 config"),
+            state_home: state_home.to_str().expect("UTF-8 state"),
+            policy: "pinned",
+            force: false,
+            quiet: false,
+            verbose: false,
+            update_jobs: None,
+            palette: &palette,
+            multibyte: false,
+            ascii: true,
+            bar_width: "8",
+        };
+        let ready = Ready {
+            binary: provider,
+            directory: scratch.path().to_path_buf(),
+            env,
+            _snapshot: None,
+        };
+        let mut stage =
+            crate::progress_ui::Stage::begin(palette.clone(), "5", false, true, false, true);
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        let mut beat = crate::progress_ui::Heartbeat::new(crate::update_engine::now_secs(), 0);
+        let outcome = run_update(
+            &inputs,
+            &ready,
+            &mut stage,
+            &mut output,
+            &mut errors,
+            &mut beat,
+        );
+        assert_eq!(outcome.status, 0);
+        let heartbeats = output.iter().filter(|byte| **byte == 0x1b).count();
+        assert!(heartbeats >= 1, "quiet 0.3s provider drew no heartbeat");
     }
 
     #[test]
@@ -2882,7 +3009,18 @@ mod tests {
             crate::cleanup::abort_outward_writes();
         });
 
-        let outcome = run_update(&inputs, &ready, &mut stage, &mut output, &mut errors);
+        let mut beat = crate::progress_ui::Heartbeat::new(
+            crate::update_engine::now_secs(),
+            crate::progress_ui::HEARTBEAT_INTERVAL_SECS,
+        );
+        let outcome = run_update(
+            &inputs,
+            &ready,
+            &mut stage,
+            &mut output,
+            &mut errors,
+            &mut beat,
+        );
 
         assert!(release_after_block.join().expect("provider release thread"));
         watchdog.join().expect("provider abort watchdog");
@@ -3085,7 +3223,18 @@ mod tests {
         let mut output = BlockingWriter { state: shared };
         let mut errors = Vec::new();
 
-        let outcome = run_update(&inputs, &ready, &mut stage, &mut output, &mut errors);
+        let mut beat = crate::progress_ui::Heartbeat::new(
+            crate::update_engine::now_secs(),
+            crate::progress_ui::HEARTBEAT_INTERVAL_SECS,
+        );
+        let outcome = run_update(
+            &inputs,
+            &ready,
+            &mut stage,
+            &mut output,
+            &mut errors,
+            &mut beat,
+        );
 
         let (entered, stopped, cleaned_while_blocked) = sender.join().expect("signal sender");
         assert!(
