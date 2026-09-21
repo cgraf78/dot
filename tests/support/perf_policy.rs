@@ -18,17 +18,16 @@ pub const STARTUP_WARMUPS: usize = 10;
 pub const STARTUP_PREFLIGHT_PAIRS: usize = 1;
 /// Update warm-ups per client before clean samples begin.
 pub const UPDATE_WARMUPS: usize = 2;
-/// Maximum native share of the shell median for every paired workload.
-pub const MAX_RUST_PERCENT: u128 = 75;
-/// Maximum native share of the shell median for the base-clean workload.
+/// Maximum native share of the shell median for every ratio-gated workload.
 ///
-/// Base-clean is a sub-second near-zero-workload update, so the ratio
-/// measures fixed-overhead parity rather than scaling: both engines sit
-/// near their startup floors (observed 89.9-92.3% across gate runs while
-/// every larger workload lands at 24-65%). The uniform 75% improvement
-/// target does not fit that floor; base-clean instead requires the
-/// native engine to beat the shell by at least five percent.
-pub const MAX_RUST_PERCENT_BASE_CLEAN: u128 = 95;
+/// Base-clean and pre-sync-failure are sub-second fixed-overhead workloads
+/// where the shell denominator swings with the host (170-237ms observed
+/// for identical base-clean code), so a fixed ratio fails correct native
+/// results on fast hosts and passes uniform slowdowns on slow ones. Those
+/// two workloads are absolute-only like first-spawn: the ceilings below
+/// bound native fixed overhead deterministically, while paired shell
+/// samples are still measured and published as evidence.
+pub const MAX_RUST_PERCENT: u128 = 75;
 /// CI headroom above the historical native startup means.
 pub const STARTUP_CI_HEADROOM_PERCENT: u128 = 125;
 /// CI headroom above the historical native full-update p95 values.
@@ -41,6 +40,12 @@ pub const HISTORICAL_VERSION_MEAN_NS: u128 = 10_600_000;
 pub const HISTORICAL_CLEAN_UPDATE_P95_NS: u128 = 641_000_000;
 /// Historical native p95 for a dirty full update.
 pub const HISTORICAL_DIRTY_UPDATE_P95_NS: u128 = 804_000_000;
+/// Historical native p95 for a clean base-only update: the maximum CI
+/// observation (213.9ms) across the passing and ratio-failing runs.
+pub const HISTORICAL_BASE_CLEAN_P95_NS: u128 = 214_000_000;
+/// Historical native p95 for a representative pre-sync failure: the maximum
+/// CI observation (293.2ms) across the passing and ratio-failing runs.
+pub const HISTORICAL_PRE_SYNC_P95_NS: u128 = 294_000_000;
 
 /// Add an explicit percentage of CI headroom to a measured reference.
 pub const fn with_ci_headroom(reference_ns: u128, headroom_percent: u128) -> u128 {
@@ -56,7 +61,8 @@ pub const VERSION_P95_NS: u128 =
 /// Loose ceiling for the first native process spawn before benchmark warm-up.
 pub const FIRST_SPAWN_NS: u128 = 100_000_000;
 /// Release-mode p95 ceiling for a clean base-only update.
-pub const BASE_UPDATE_P95_NS: u128 = 4_000_000_000;
+pub const BASE_UPDATE_P95_NS: u128 =
+    with_ci_headroom(HISTORICAL_BASE_CLEAN_P95_NS, UPDATE_CI_HEADROOM_PERCENT);
 /// Release-mode p95 ceiling for a clean representative update.
 pub const CLEAN_UPDATE_P95_NS: u128 =
     with_ci_headroom(HISTORICAL_CLEAN_UPDATE_P95_NS, UPDATE_CI_HEADROOM_PERCENT);
@@ -66,7 +72,8 @@ pub const DIRTY_UPDATE_P95_NS: u128 =
 /// Release-mode p95 ceiling for the composed profile/provider/hook workload.
 pub const FEATURE_UPDATE_P95_NS: u128 = 12_000_000_000;
 /// Release-mode p95 ceiling for a representative pre-sync failure.
-pub const FAILURE_P95_NS: u128 = 4_000_000_000;
+pub const FAILURE_P95_NS: u128 =
+    with_ci_headroom(HISTORICAL_PRE_SYNC_P95_NS, UPDATE_CI_HEADROOM_PERCENT);
 
 /// Stable identity of a blocking performance workload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,7 +160,7 @@ pub const WORKLOAD_POLICIES: [WorkloadPolicy; 8] = [
         samples_per_engine: RUNS,
         warmups_per_engine: UPDATE_WARMUPS,
         rust_p95_budget_ns: BASE_UPDATE_P95_NS,
-        max_rust_percent: Some(MAX_RUST_PERCENT_BASE_CLEAN),
+        max_rust_percent: None,
     },
     WorkloadPolicy {
         workload: Workload::DisjointClean,
@@ -181,7 +188,7 @@ pub const WORKLOAD_POLICIES: [WorkloadPolicy; 8] = [
         samples_per_engine: RUNS,
         warmups_per_engine: UPDATE_WARMUPS,
         rust_p95_budget_ns: FAILURE_P95_NS,
-        max_rust_percent: Some(MAX_RUST_PERCENT),
+        max_rust_percent: None,
     },
 ];
 

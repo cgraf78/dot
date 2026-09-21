@@ -21,9 +21,12 @@ _overlay_effective_url() {
 }
 
 _overlay_origin_matches() {
-  local path=$1 expected=$2
+  local path=$1 expected=$2 url_line
   local -a urls=()
-  mapfile -t urls < <(git -C "$path" config --get-all remote.origin.url 2>/dev/null)
+  # A read loop instead of `mapfile` keeps this compatible with Bash 3.2.
+  while IFS= read -r url_line; do
+    urls+=("$url_line")
+  done < <(git -C "$path" config --get-all remote.origin.url 2>/dev/null)
   case ${#urls[@]} in
     0)
       REPLY='<missing>'

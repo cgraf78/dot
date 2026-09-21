@@ -191,6 +191,12 @@ assert_contains 'perf_require_command_supervisor_platform' "$benchmark_driver" \
 # shellcheck disable=SC2016 # The benchmark must check the generated run identity.
 assert_contains 'perf_preflight_artifact_destination "$root" "$artifact_config" "$run_id"' \
   "$benchmark_driver" 'performance gate checks the exact hidden and final run paths'
+assert_contains "local -a percentages=('' 75 75 '' 75 75 75 '')" \
+  "$benchmark_driver" 'evidence validator matches the enforced ratio policy'
+assert_contains "local -a budgets=(100000000 24075000 23850000 535000000 1602500000 \\" \
+  "$benchmark_driver" 'evidence validator matches the enforced budget policy'
+assert_contains '2010000000 12000000000 735000000)' \
+  "$benchmark_driver" 'evidence validator matches the enforced budget policy'
 benchmark_main=$(sed -n '/^perf_main()/,/^}/p' \
   "$DOT_TEST_ROOT/scripts/benchmark-port.sh")
 benchmark_finish=$(sed -n '/^perf_finish()/,/^}/p' \
@@ -1175,11 +1181,11 @@ EOF
       done >>"$directory/summary.tsv" <<'EOF'
 help 24075000 75
 version 23850000 75
-base-clean 4000000000 95
+base-clean 535000000 -
 disjoint-clean 1602500000 75
 disjoint-dirty 2010000000 75
 profile-provider-hooks-collision 12000000000 75
-pre-sync-failure 4000000000 75
+pre-sync-failure 735000000 -
 EOF
       bind_calibration "$directory"
       perf_write_final_driver "$directory" "$run_id" "$shell_commit" "$shell_tree" \

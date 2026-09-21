@@ -36,11 +36,7 @@ impl Drop for Invocation {
 
 impl Invocation {
     fn new(context: &Context<'_>) -> std::io::Result<Self> {
-        let base = context
-            .runtime
-            .value("TMPDIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let base = crate::test_command::system_tmpdir(context.runtime);
         let parent = base.join(format!("dot-suite-runs.{}", context.euid));
         match fs::DirBuilder::new().mode(0o700).create(&parent) {
             Ok(()) => {}

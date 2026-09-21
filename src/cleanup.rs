@@ -3765,11 +3765,13 @@ fn end_after_cleanup(
     cleanup: std::io::Result<std::process::ExitStatus>,
     completed: SessionEnd,
 ) -> SessionEnd {
-    if cleanup.is_ok() {
-        completed
-    } else {
-        CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
-        SessionEnd::CleanupIncomplete
+    match cleanup {
+        Ok(_) => completed,
+        Err(error) => {
+            eprintln!("DOT_TEARDOWN_FAIL: {error:?}");
+            CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
+            SessionEnd::CleanupIncomplete
+        }
     }
 }
 

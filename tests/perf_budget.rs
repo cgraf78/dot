@@ -9,10 +9,10 @@ mod perf_policy;
 
 use perf_policy::{
     BASE_UPDATE_P95_NS, CLEAN_UPDATE_P95_NS, DIRTY_UPDATE_P95_NS, EngineKind, FAILURE_P95_NS,
-    FEATURE_UPDATE_P95_NS, FIRST_SPAWN_NS, HELP_P95_NS, HISTORICAL_CLEAN_UPDATE_P95_NS,
-    HISTORICAL_DIRTY_UPDATE_P95_NS, HISTORICAL_HELP_MEAN_NS, HISTORICAL_VERSION_MEAN_NS,
-    MAX_RUST_PERCENT, MAX_RUST_PERCENT_BASE_CLEAN, REQUIRED_WORKLOADS, RUNS,
-    STARTUP_CI_HEADROOM_PERCENT, STARTUP_PREFLIGHT_PAIRS, STARTUP_WARMUPS,
+    FEATURE_UPDATE_P95_NS, FIRST_SPAWN_NS, HELP_P95_NS, HISTORICAL_BASE_CLEAN_P95_NS,
+    HISTORICAL_CLEAN_UPDATE_P95_NS, HISTORICAL_DIRTY_UPDATE_P95_NS, HISTORICAL_HELP_MEAN_NS,
+    HISTORICAL_PRE_SYNC_P95_NS, HISTORICAL_VERSION_MEAN_NS, MAX_RUST_PERCENT, REQUIRED_WORKLOADS,
+    RUNS, STARTUP_CI_HEADROOM_PERCENT, STARTUP_PREFLIGHT_PAIRS, STARTUP_WARMUPS,
     UPDATE_CI_HEADROOM_PERCENT, UPDATE_WARMUPS, VERSION_P95_NS, WORKLOAD_POLICIES, Workload,
     budget_headroom_percent, meets_relative_gate, pair_order, ratio_percent_ceil,
     shell_baseline_sha, startup_warmup_schedule, summarize,
@@ -113,14 +113,25 @@ fn relative_gate_requires_at_least_twenty_five_percent_improvement() {
 }
 
 #[test]
-fn base_clean_gate_requires_five_percent_improvement() {
-    assert_eq!(MAX_RUST_PERCENT_BASE_CLEAN, 95);
+fn floor_workloads_gate_absolute_native_overhead_without_a_shell_ratio() {
+    for workload in [Workload::BaseClean, Workload::PreSyncFailure] {
+        assert_eq!(
+            workload.policy().max_rust_percent,
+            None,
+            "{} must not gate on the host-fragile shell denominator",
+            workload.label()
+        );
+        assert!(
+            workload.policy().rust_p95_budget_ns < 1_000_000_000,
+            "{} keeps a tight absolute ceiling on native fixed overhead",
+            workload.label()
+        );
+    }
+    assert_eq!(Workload::BaseClean.policy().rust_p95_budget_ns, 535_000_000);
     assert_eq!(
-        Workload::BaseClean.policy().max_rust_percent,
-        Some(MAX_RUST_PERCENT_BASE_CLEAN)
+        Workload::PreSyncFailure.policy().rust_p95_budget_ns,
+        735_000_000
     );
-    assert!(meets_relative_gate(95, 100, MAX_RUST_PERCENT_BASE_CLEAN));
-    assert!(!meets_relative_gate(96, 100, MAX_RUST_PERCENT_BASE_CLEAN));
 }
 
 #[test]
@@ -131,14 +142,16 @@ fn absolute_release_budgets_remain_explicit() {
     assert_eq!(HISTORICAL_VERSION_MEAN_NS, 10_600_000);
     assert_eq!(HISTORICAL_CLEAN_UPDATE_P95_NS, 641_000_000);
     assert_eq!(HISTORICAL_DIRTY_UPDATE_P95_NS, 804_000_000);
+    assert_eq!(HISTORICAL_BASE_CLEAN_P95_NS, 214_000_000);
+    assert_eq!(HISTORICAL_PRE_SYNC_P95_NS, 294_000_000);
     assert_eq!(HELP_P95_NS, 24_075_000);
     assert_eq!(VERSION_P95_NS, 23_850_000);
     assert_eq!(FIRST_SPAWN_NS, 100_000_000);
-    assert_eq!(BASE_UPDATE_P95_NS, 4_000_000_000);
+    assert_eq!(BASE_UPDATE_P95_NS, 535_000_000);
     assert_eq!(CLEAN_UPDATE_P95_NS, 1_602_500_000);
     assert_eq!(DIRTY_UPDATE_P95_NS, 2_010_000_000);
     assert_eq!(FEATURE_UPDATE_P95_NS, 12_000_000_000);
-    assert_eq!(FAILURE_P95_NS, 4_000_000_000);
+    assert_eq!(FAILURE_P95_NS, 735_000_000);
 }
 
 #[test]
@@ -147,10 +160,11 @@ fn normative_spec_matches_the_enforced_performance_policy() {
     for requirement in [
         "median no more than 75% of Bash; p95 no more than 24.075ms",
         "median no more than 75% of Bash; p95 no more than 23.85ms",
-        "median no more than 95% of Bash; p95 no more than 4s",
+        "p95 no more than 535ms",
         "median no more than 75% of Bash; p95 no more than 1.6025s",
         "median no more than 75% of Bash; p95 no more than 2.01s",
         "median no more than 75% of Bash; p95 no more than 12s",
+        "p95 no more than 735ms",
     ] {
         assert!(spec.contains(requirement), "missing policy: {requirement}");
     }
@@ -192,16 +206,24 @@ fn workload_policy_is_the_single_budget_and_sampling_authority() {
         .iter()
         .filter(|policy| policy.workload != Workload::FirstSpawn)
     {
-        // Base-clean is a sub-second fixed-overhead workload; it requires
-        // parity-plus-five instead of the uniform twenty-five percent win.
-        let expected = if policy.workload == Workload::BaseClean {
-            MAX_RUST_PERCENT_BASE_CLEAN
-        } else {
-            MAX_RUST_PERCENT
-        };
+        // Base-clean and pre-sync-failure are sub-second fixed-overhead
+        // workloads whose shell denominator swings with the host, so they
+        // gate a tight absolute ceiling instead of a shell ratio.
+        if matches!(
+            policy.workload,
+            Workload::BaseClean | Workload::PreSyncFailure
+        ) {
+            assert_eq!(
+                policy.max_rust_percent,
+                None,
+                "{} must not gate on the host-fragile shell denominator",
+                policy.workload.label()
+            );
+            continue;
+        }
         assert_eq!(
             policy.max_rust_percent,
-            Some(expected),
+            Some(MAX_RUST_PERCENT),
             "{} must reject a materially slower-than-shell native result",
             policy.workload.label()
         );

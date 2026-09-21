@@ -148,6 +148,24 @@ dot_tool_present() {
   esac
 }
 
+# ASCII lowercase without case-modification expansion, which needs Bash 4
+# while this payload still runs under 3.2. Callers pass platform names,
+# hostnames, and match specs, all ASCII by contract. The result lands in
+# REPLY so the common all-lowercase input costs no fork at all; values
+# with uppercase take one `tr`. The letter list is explicit (not a
+# range) so no locale can misread the guard.
+_dot_hook_lower() {
+  local value=${1:-}
+  case $value in
+    *A* | *B* | *C* | *D* | *E* | *F* | *G* | *H* | *I* | *J* | *K* | \
+      *L* | *M* | *N* | *O* | *P* | *Q* | *R* | *S* | *T* | *U* | *V* | \
+      *W* | *X* | *Y* | *Z*)
+      REPLY=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+      ;;
+    *) REPLY=$value ;;
+  esac
+}
+
 _dot_hook_platform() {
   local value
 
@@ -158,7 +176,8 @@ _dot_hook_platform() {
     return
   fi
   value=$(uname -s 2>/dev/null) || return 1
-  value=${value,,}
+  _dot_hook_lower "$value"
+  value=$REPLY
   [[ $value == darwin ]] && value=macos
   printf '%s\n' "$value"
 }
@@ -167,7 +186,8 @@ _dot_hook_host() {
   local value
 
   value=$(hostname -s 2>/dev/null || hostname 2>/dev/null) || return 1
-  printf '%s\n' "${value,,}"
+  _dot_hook_lower "$value"
+  printf '%s\n' "$REPLY"
 }
 
 _dot_hook_match_specs() {
@@ -183,7 +203,8 @@ _dot_hook_match_specs() {
   for item in "${items[@]}"; do
     [[ -n $item ]] || continue
     if [[ $case_mode == lowercase ]]; then
-      normalized=${item,,}
+      _dot_hook_lower "$item"
+      normalized=$REPLY
     else
       normalized=$item
     fi
@@ -195,7 +216,10 @@ _dot_hook_match_specs() {
   [[ $has_include == false ]] && return 0
   for item in "${items[@]}"; do
     [[ -n $item ]] || continue
-    [[ $case_mode == lowercase ]] && item=${item,,}
+    if [[ $case_mode == lowercase ]]; then
+      _dot_hook_lower "$item"
+      item=$REPLY
+    fi
     for current in "${current_values[@]}"; do
       [[ $item == "$current" ]] && return 0
     done

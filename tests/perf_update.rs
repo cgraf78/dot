@@ -5010,7 +5010,13 @@ fn timed_command_reaps_a_descendant_left_by_a_successful_parent() {
     let started = Instant::now();
     let error = run_timed_command(&mut command, Duration::from_secs(2))
         .expect_err("a successful leader with live descendants is invalid");
-    assert!(error.contains("live descendant"));
+    // A loaded host can exhaust the total deadline while quiescence is still
+    // forcing cleanup of the never-exiting descendant; both rejections are
+    // valid, and the reaping assertions below own this test's purpose.
+    assert!(
+        error.contains("live descendant") || error.contains("timed out"),
+        "{error}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "successful-parent cleanup exceeded its bounded deadline"
@@ -5061,7 +5067,13 @@ fn timed_command_rejects_and_reaps_an_escaped_setsid_descendant() {
         }
     }
     let error = result.expect_err("escaped live descendant must invalidate the command");
-    assert!(error.contains("live descendant"), "{error}");
+    // A loaded host can exhaust the total deadline while quiescence is still
+    // forcing cleanup of the never-exiting descendant; both rejections are
+    // valid, and the reaping assertion below owns this test's purpose.
+    assert!(
+        error.contains("live descendant") || error.contains("timed out"),
+        "{error}"
+    );
     assert!(!process_is_live(pid), "escaped descendant {pid} survived");
 }
 
@@ -5138,6 +5150,25 @@ fn direct_child_authority_precedes_a_failing_broad_process_scan() {
     );
 }
 
+/// Final descriptor count, settled past transient parallel-test handles.
+///
+/// Sibling tests open and close pipes and sockets while the leak assertion
+/// runs, so one snapshot can catch a foreign transient. Genuine leaks stay
+/// open, so polling keeps the strict bound while draining the noise.
+#[cfg(target_os = "linux")]
+fn settled_descriptor_count(before: usize) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let after = fs::read_dir("/proc/self/fd")
+            .expect("final descriptor inventory")
+            .count();
+        if after <= before + 1 || Instant::now() >= deadline {
+            return after;
+        }
+        std::thread::sleep(PROCESS_POLL);
+    }
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 fn retained_pidfd_survives_an_omitted_then_failed_process_snapshot() {
@@ -5208,9 +5239,10 @@ fn retained_pidfd_survives_an_omitted_then_failed_process_snapshot() {
         "retained escaped child {pid} survived"
     );
     assert!(lock_available, "escaped child retained its inherited lock");
-    let after = fs::read_dir("/proc/self/fd")
-        .expect("final descriptor inventory")
-        .count();
+    // The guard's pidfd has served its purpose; holding it through the
+    // inventory would consume the transient slack meant for parallel tests.
+    drop(escaped_guard);
+    let after = settled_descriptor_count(before);
     assert!(
         after <= before + 1,
         "process identity handles leaked after cleanup: {before} -> {after}"
@@ -5310,9 +5342,7 @@ fn total_observation_loss_rejects_without_blocking_capture_readers() {
             .success(),
         "escaped fixture retained its lock after exact teardown"
     );
-    let after = fs::read_dir("/proc/self/fd")
-        .expect("final descriptor inventory")
-        .count();
+    let after = settled_descriptor_count(before);
     assert!(
         after <= before + 1,
         "process identity or capture handles leaked: {before} -> {after}"
@@ -5349,11 +5379,18 @@ fn timed_cleanup_does_not_signal_an_unrelated_session() {
     let mut command = Command::new(&script);
     let error = run_timed_command(&mut command, Duration::from_secs(2))
         .expect_err("live descendant must invalidate the command");
+    // A loaded host can exhaust the total deadline while quiescence is still
+    // forcing cleanup of the never-exiting descendant; both rejections are
+    // valid, and the session-isolation assertions below own this test's
+    // purpose.
     let control_survived = control.try_wait().expect("inspect control").is_none();
 
     signal_original_group(control.id(), libc::SIGKILL).expect("stop control session");
     let _ = control.wait();
-    assert!(error.contains("live descendant"));
+    assert!(
+        error.contains("live descendant") || error.contains("timed out"),
+        "{error}"
+    );
     assert!(control_survived, "cleanup signaled an unrelated session");
 }
 

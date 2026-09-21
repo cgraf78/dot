@@ -39,16 +39,22 @@ cd "$HOME"
 
 # shellcheck source=../xdg.sh
 . "$DOT_SOURCE_ROOT/lib/dot/public/xdg.sh"
-declare -A existing_functions=()
-while IFS= read -r function_name; do
-  existing_functions["$function_name"]=1
-done < <(compgen -A function)
+# Snapshot the pre-existing functions so only the overlay allowlist below
+# survives the library sources. Membership against the newline-joined
+# snapshot needs one process listing and no per-item forks, and stays
+# compatible with Bash 3.2, which ships no associative arrays. The name
+# stays quoted inside the pattern so glob characters in it match
+# literally; function names cannot contain newlines.
+existing_functions=$(compgen -A function)
+existing_functions=$'\n'"$existing_functions"$'\n'
 # shellcheck source=repos/config.sh
 . "$DOT_SOURCE_ROOT/lib/dot/public/hook-runtime-v1/repos/config.sh"
 # shellcheck source=repos/overlays.sh
 . "$DOT_SOURCE_ROOT/lib/dot/public/hook-runtime-v1/repos/overlays.sh"
 while IFS= read -r function_name; do
-  [[ -n ${existing_functions[$function_name]+x} ]] && continue
+  case $existing_functions in
+    *$'\n'"$function_name"$'\n'*) continue ;;
+  esac
   case $function_name in
     _overlay_link_target | _overlay_private_regular_file | \
       _overlay_parse_manifest_record | _overlay_manifest_safe | \

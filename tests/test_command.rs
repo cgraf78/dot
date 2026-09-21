@@ -482,3 +482,21 @@ fn native_registered_source_keeps_non_utf8_path_identity() {
             .any(|part| part == source_bin)
     );
 }
+
+#[test]
+fn native_suite_observes_pre_override_system_tmpdir() {
+    let f = Fixture::new();
+    f.suite(
+        "core",
+        "printf '%s\\n%s\\n' \"$DOT_TEST_SYSTEM_TMPDIR\" \"$TMPDIR\" >\"$HOME/observed\"; printf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
+    );
+    let output = f.run(&[]);
+    success(&output);
+    let observed = std::fs::read_to_string(f.home.join("observed")).unwrap();
+    let mut lines = observed.lines();
+    let system = lines.next().unwrap();
+    let tmpdir = lines.next().unwrap();
+    assert_eq!(system, f.scope.path().join("tmp").to_str().unwrap());
+    assert_ne!(system, tmpdir);
+    assert!(tmpdir.starts_with(system));
+}
