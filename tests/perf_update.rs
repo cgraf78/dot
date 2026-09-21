@@ -3286,6 +3286,12 @@ fn normalize_output(bytes: &[u8], engine: &Engine, client: &Client) -> Vec<u8> {
     ] {
         normalized = replace_bytes(&normalized, path.as_os_str().as_bytes(), token);
     }
+    // The engines report different identities (the pinned shell baseline
+    // prints its commit, native prints its release version). Exact identity
+    // is validated by the version preflight; parity compares the shape only,
+    // so canonicalize the whole version line before the commit replacement
+    // below rewrites the revision it contains.
+    normalized = replace_bytes(&normalized, &engine.version_line(), b"$VERSION");
     normalized = replace_bytes(&normalized, engine.short_commit().as_bytes(), b"$COMMIT");
     normalize_timing(&normalized)
 }
@@ -4198,6 +4204,29 @@ fn performance_path_normalization_handles_repeated_roots() {
     assert_eq!(
         replace_bytes(b"/tmp/home/a -> /tmp/home/b", b"/tmp/home", b"$HOME"),
         b"$HOME/a -> $HOME/b"
+    );
+}
+
+#[test]
+fn performance_version_parity_canonicalizes_engine_identities() {
+    let scratch = Scratch::new("perf-version-parity").expect("scratch");
+    let shell_client = empty_client(&scratch, "shell");
+    let rust_client = empty_client(&scratch, "rust");
+    let shell = Engine {
+        kind: EngineKind::Shell,
+        executable: PathBuf::from("shell-dot"),
+        source_root: scratch.path().join("shell-src"),
+        commit: "762fb7eed72a8c429b12a5dca320ef32ebd3c777".to_string(),
+    };
+    let rust = Engine {
+        kind: EngineKind::Rust,
+        executable: PathBuf::from("rust-dot"),
+        source_root: scratch.path().join("rust-src"),
+        commit: "0936deec9fe6bfbab33cc34484d4dc701a683a0d".to_string(),
+    };
+    assert_eq!(
+        normalize_output(&shell.version_line(), &shell, &shell_client),
+        normalize_output(&rust.version_line(), &rust, &rust_client),
     );
 }
 
