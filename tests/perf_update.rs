@@ -5150,6 +5150,25 @@ fn direct_child_authority_precedes_a_failing_broad_process_scan() {
     );
 }
 
+/// Final descriptor count, settled past transient parallel-test handles.
+///
+/// Sibling tests open and close pipes and sockets while the leak assertion
+/// runs, so one snapshot can catch a foreign transient. Genuine leaks stay
+/// open, so polling keeps the strict bound while draining the noise.
+#[cfg(target_os = "linux")]
+fn settled_descriptor_count(before: usize) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let after = fs::read_dir("/proc/self/fd")
+            .expect("final descriptor inventory")
+            .count();
+        if after <= before + 1 || Instant::now() >= deadline {
+            return after;
+        }
+        std::thread::sleep(PROCESS_POLL);
+    }
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 fn retained_pidfd_survives_an_omitted_then_failed_process_snapshot() {
@@ -5220,9 +5239,10 @@ fn retained_pidfd_survives_an_omitted_then_failed_process_snapshot() {
         "retained escaped child {pid} survived"
     );
     assert!(lock_available, "escaped child retained its inherited lock");
-    let after = fs::read_dir("/proc/self/fd")
-        .expect("final descriptor inventory")
-        .count();
+    // The guard's pidfd has served its purpose; holding it through the
+    // inventory would consume the transient slack meant for parallel tests.
+    drop(escaped_guard);
+    let after = settled_descriptor_count(before);
     assert!(
         after <= before + 1,
         "process identity handles leaked after cleanup: {before} -> {after}"
@@ -5322,9 +5342,7 @@ fn total_observation_loss_rejects_without_blocking_capture_readers() {
             .success(),
         "escaped fixture retained its lock after exact teardown"
     );
-    let after = fs::read_dir("/proc/self/fd")
-        .expect("final descriptor inventory")
-        .count();
+    let after = settled_descriptor_count(before);
     assert!(
         after <= before + 1,
         "process identity or capture handles leaked: {before} -> {after}"
