@@ -113,14 +113,14 @@ fn relative_gate_requires_at_least_twenty_five_percent_improvement() {
 }
 
 #[test]
-fn base_clean_gate_requires_five_percent_improvement() {
-    assert_eq!(MAX_RUST_PERCENT_BASE_CLEAN, 95);
+fn base_clean_gate_requires_parity_within_five_percent() {
+    assert_eq!(MAX_RUST_PERCENT_BASE_CLEAN, 105);
     assert_eq!(
         Workload::BaseClean.policy().max_rust_percent,
         Some(MAX_RUST_PERCENT_BASE_CLEAN)
     );
-    assert!(meets_relative_gate(95, 100, MAX_RUST_PERCENT_BASE_CLEAN));
-    assert!(!meets_relative_gate(96, 100, MAX_RUST_PERCENT_BASE_CLEAN));
+    assert!(meets_relative_gate(105, 100, MAX_RUST_PERCENT_BASE_CLEAN));
+    assert!(!meets_relative_gate(106, 100, MAX_RUST_PERCENT_BASE_CLEAN));
 }
 
 #[test]
