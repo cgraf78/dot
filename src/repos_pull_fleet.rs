@@ -781,7 +781,6 @@ pub fn pull_all(
     moves: &mut MoveCache,
     out: &mut dyn Write,
     warnings: &mut dyn Write,
-    now_secs: i64,
 ) -> PullAllOutcome {
     let quiet = is_quiet_flag(inputs.dot_quiet);
     let verbose = is_verbose(inputs.dot_verbose);
@@ -810,7 +809,12 @@ pub fn pull_all(
     } else {
         b"pulling repositories".to_vec()
     };
-    let start_bytes = stage.start(b"Repos", Some(&detail), now_secs, inputs.dot_verbose);
+    let start_bytes = stage.start(
+        b"Repos",
+        Some(&detail),
+        crate::update_engine::now_secs(),
+        inputs.dot_verbose,
+    );
     let _ = out.write_all(&start_bytes);
     let mut current: i64 = 0;
     let mut changed: i64 = 0;
@@ -1001,7 +1005,11 @@ pub fn pull_all(
     }
     let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
     let summary = String::from_utf8_lossy(&join_comma(&refs)).into_owned();
-    let finish_bytes = stage.finish(status.as_str().as_bytes(), summary.as_bytes(), now_secs);
+    let finish_bytes = stage.finish(
+        status.as_str().as_bytes(),
+        summary.as_bytes(),
+        crate::update_engine::now_secs(),
+    );
     let _ = out.write_all(&finish_bytes);
     if !verbose {
         for item in &changed_items {

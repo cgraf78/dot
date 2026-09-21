@@ -142,6 +142,39 @@ fn in_process_no_color_disables_terminal_result_colors() {
     );
 }
 
+/// Blank the cron stamp-age rendering (`last success 497206h5m ago`):
+/// shell and native run sequentially, so a minute (or hour) boundary
+/// between the two renders a different age for the same stamp. Only the
+/// age span is blanked — every other byte still compares exactly — and
+/// the cron test below pins the age value itself with a ±1-minute
+/// tolerance instead of exact bytes.
+fn normalize_stamp_age(bytes: &[u8]) -> Vec<u8> {
+    const PREFIX: &[u8] = b"last success ";
+    const SUFFIX: &[u8] = b" ago";
+    const BLANK: &[u8] = b"last success AGE ago";
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(start) = rest
+        .windows(PREFIX.len())
+        .position(|window| window == PREFIX)
+    {
+        out.extend_from_slice(&rest[..start]);
+        let after = &rest[start + PREFIX.len()..];
+        if let Some(end) = after
+            .windows(SUFFIX.len())
+            .position(|window| window == SUFFIX)
+        {
+            out.extend_from_slice(BLANK);
+            rest = &after[end + SUFFIX.len()..];
+        } else {
+            out.extend_from_slice(PREFIX);
+            rest = after;
+        }
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
 fn assert_pair(shell: &Output, native: &Output) {
     assert_eq!(
         native.status.code(),
@@ -149,7 +182,11 @@ fn assert_pair(shell: &Output, native: &Output) {
         "native stderr: {}",
         String::from_utf8_lossy(&native.stderr)
     );
-    assert_eq!(native.stdout, shell.stdout, "doctor stdout");
+    assert_eq!(
+        normalize_stamp_age(&native.stdout),
+        normalize_stamp_age(&shell.stdout),
+        "doctor stdout"
+    );
     assert_eq!(native.stderr, shell.stderr, "doctor stderr");
 }
 
@@ -1655,6 +1692,33 @@ fn cron_freshness_reports_stamp_age_end_to_end() {
         "stale stamp warns: {stdout}"
     );
     assert_pair(&shell, &native);
+    // The age value itself must agree up to the minute boundary that may
+    // fall between the two runs — never by exact bytes (loaded-host flake).
+    let shell_age = stamp_age_minutes(&String::from_utf8_lossy(&shell.stdout));
+    let native_age = stamp_age_minutes(&stdout);
+    assert!(
+        shell_age.abs_diff(native_age) <= 1,
+        "stamp age diverged: shell {shell_age}m vs native {native_age}m"
+    );
+}
+
+/// Total minutes rendered in `last success 497206h5m ago`. Small ages
+/// without an hour part (`90m`, `45s`) parse to their minute count.
+fn stamp_age_minutes(stdout: &str) -> u64 {
+    const PREFIX: &str = "last success ";
+    const SUFFIX: &str = " ago";
+    let start = stdout.find(PREFIX).expect("rendered stamp age") + PREFIX.len();
+    let end = stdout[start..].find(SUFFIX).expect("age suffix") + start;
+    let age = &stdout[start..end];
+    let (hours, rest) = match age.find('h') {
+        Some(at) => (age[..at].parse::<u64>().expect("age hours"), &age[at + 1..]),
+        None => (0, age),
+    };
+    let minutes = match rest.find('m') {
+        Some(at) => rest[..at].parse::<u64>().expect("age minutes"),
+        None => 0,
+    };
+    hours * 60 + minutes
 }
 
 #[test]

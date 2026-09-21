@@ -95,7 +95,6 @@ fn repository_stage_is_silent_until_deferred() {
             changed_items: b"must-not-render",
             verbose: None,
         },
-        100,
     );
     assert!(output.is_empty());
 }
@@ -202,7 +201,6 @@ fn repository_stage_renders_all_statuses_counts_and_notes() {
                 changed_items: case.items,
                 verbose: case.verbose,
             },
-            100,
         );
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains(case.status), "status in {text:?}");

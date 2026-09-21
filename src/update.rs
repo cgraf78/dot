@@ -27,11 +27,7 @@ pub struct RepoStageFinish<'a> {
 }
 
 /// Close a deferred repository stage with its aggregate status and summary.
-pub fn repo_stage_finish(
-    stage: &mut Stage,
-    inputs: &RepoStageFinish<'_>,
-    now_secs: i64,
-) -> Vec<u8> {
+pub fn repo_stage_finish(stage: &mut Stage, inputs: &RepoStageFinish<'_>) -> Vec<u8> {
     if !inputs.deferred_active {
         return Vec::new();
     }
@@ -68,7 +64,11 @@ pub fn repo_stage_finish(
         parts.push(part(skipped, b"skipped"));
     }
     let fields: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-    let mut output = stage.finish(status, &join_comma(&fields), now_secs);
+    let mut output = stage.finish(
+        status,
+        &join_comma(&fields),
+        crate::update_engine::now_secs(),
+    );
     if arith_value(inputs.verbose.unwrap_or("0")) == Some(0) {
         for item in inputs.changed_items.split(|byte| *byte == b'\n') {
             if !item.is_empty() {
