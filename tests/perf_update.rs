@@ -215,11 +215,21 @@ impl Engine {
     }
 
     fn version_line(&self) -> Vec<u8> {
-        format!(
-            "dot {} (config 1; extensions 1; library 1)\n",
-            env!("DOT_BUILD_VERSION")
-        )
-        .into_bytes()
+        // The pinned shell baseline predates the shared version policy and
+        // still reports its commit; the native engine reports its public
+        // release version.
+        match self.kind {
+            EngineKind::Shell => format!(
+                "dot commit {} (config 1; extensions 1; library 1)\n",
+                self.short_commit()
+            )
+            .into_bytes(),
+            EngineKind::Rust => format!(
+                "dot {} (config 1; extensions 1; library 1)\n",
+                env!("DOT_BUILD_VERSION")
+            )
+            .into_bytes(),
+        }
     }
 }
 
