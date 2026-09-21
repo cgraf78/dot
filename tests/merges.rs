@@ -4,6 +4,7 @@
 use dot::{merges, progress_ui::Palette};
 
 type ProgressCase<'a> = (&'a str, i64, i64, &'a str, &'a str, &'a [u8]);
+type HookProgressCase<'a> = (&'a str, i64, i64, bool, &'a str, &'a [u8]);
 type LabelCase<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], i64, &'a [u8]);
 type RenderCase<'a> = (&'a [u8], &'a [u8], i64, &'a [&'a [u8]], &'a [u8]);
 use std::ffi::{OsStr, OsString};
@@ -230,6 +231,54 @@ fn progress_detail_cases_agree() {
             ),
             expected,
             "progress {label:?}"
+        );
+    }
+}
+
+#[test]
+fn hook_progress_matches_the_other_stages_outside_verbose() {
+    let cases: &[HookProgressCase<'_>] = &[
+        (
+            "codex",
+            3,
+            33,
+            false,
+            "8",
+            b"codex              [--------]  3/33",
+        ),
+        ("codex", 3, 33, true, "8", b"codex 3/33"),
+        (
+            "ssh",
+            1,
+            4,
+            false,
+            "8",
+            b"ssh                [##------] 1/4",
+        ),
+        ("ssh", 1, 4, true, "8", b"ssh 1/4"),
+        (
+            "uni-hööks",
+            1,
+            2,
+            false,
+            "8",
+            b"uni-h\xc3\xb6\xc3\xb6ks        [####----] 1/2",
+        ),
+        ("uni-hööks", 1, 2, true, "8", "uni-hööks 1/2".as_bytes()),
+    ];
+    for &(label, done, total, verbose, bar_width, expected) in cases {
+        assert_eq!(
+            merges::hook_progress_detail(
+                label.as_bytes(),
+                done,
+                total,
+                verbose,
+                bar_width,
+                true,
+                false
+            ),
+            expected,
+            "hook progress {label:?} verbose={verbose}"
         );
     }
 }
