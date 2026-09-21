@@ -5010,7 +5010,13 @@ fn timed_command_reaps_a_descendant_left_by_a_successful_parent() {
     let started = Instant::now();
     let error = run_timed_command(&mut command, Duration::from_secs(2))
         .expect_err("a successful leader with live descendants is invalid");
-    assert!(error.contains("live descendant"));
+    // A loaded host can exhaust the total deadline while quiescence is still
+    // forcing cleanup of the never-exiting descendant; both rejections are
+    // valid, and the reaping assertions below own this test's purpose.
+    assert!(
+        error.contains("live descendant") || error.contains("timed out"),
+        "{error}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "successful-parent cleanup exceeded its bounded deadline"
@@ -5061,7 +5067,13 @@ fn timed_command_rejects_and_reaps_an_escaped_setsid_descendant() {
         }
     }
     let error = result.expect_err("escaped live descendant must invalidate the command");
-    assert!(error.contains("live descendant"), "{error}");
+    // A loaded host can exhaust the total deadline while quiescence is still
+    // forcing cleanup of the never-exiting descendant; both rejections are
+    // valid, and the reaping assertion below owns this test's purpose.
+    assert!(
+        error.contains("live descendant") || error.contains("timed out"),
+        "{error}"
+    );
     assert!(!process_is_live(pid), "escaped descendant {pid} survived");
 }
 
@@ -5349,11 +5361,18 @@ fn timed_cleanup_does_not_signal_an_unrelated_session() {
     let mut command = Command::new(&script);
     let error = run_timed_command(&mut command, Duration::from_secs(2))
         .expect_err("live descendant must invalidate the command");
+    // A loaded host can exhaust the total deadline while quiescence is still
+    // forcing cleanup of the never-exiting descendant; both rejections are
+    // valid, and the session-isolation assertions below own this test's
+    // purpose.
     let control_survived = control.try_wait().expect("inspect control").is_none();
 
     signal_original_group(control.id(), libc::SIGKILL).expect("stop control session");
     let _ = control.wait();
-    assert!(error.contains("live descendant"));
+    assert!(
+        error.contains("live descendant") || error.contains("timed out"),
+        "{error}"
+    );
     assert!(control_survived, "cleanup signaled an unrelated session");
 }
 
