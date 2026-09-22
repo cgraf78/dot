@@ -49,6 +49,7 @@ pub mod init_client_rollback;
 pub mod init_client_safe_path;
 pub mod init_client_transaction;
 pub mod log;
+pub(crate) mod memo;
 pub mod merge_block;
 pub mod merge_hooks;
 pub mod merges;

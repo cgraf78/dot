@@ -113,6 +113,23 @@ fn repos_git_stream_child() {
                 .unwrap(),
         ),
         "stream" => dot::repos_git::run_git_streaming(&["-C".into(), path.into()], &args),
+        "clear-probe" => {
+            // Invalidation probe: the parent's counting shim answers
+            // `rev-parse --show-toplevel` and silently accepts the
+            // streaming call. Two worktree probes around one
+            // `repo_git` must spawn twice (memoized middle probe,
+            // re-probe after the clear), plus the streaming call
+            // itself: three shim invocations total.
+            let repo = std::path::PathBuf::from(std::env::var("DOT_REPOS_GIT_PROBE_REPO").unwrap());
+            assert!(dot::overlays::is_worktree(&repo));
+            assert!(dot::overlays::is_worktree(&repo));
+            let rc = dot::repos_git::repo_git(&base, kind, &path, &args);
+            assert!(dot::overlays::is_worktree(&repo));
+            let log = std::fs::read_to_string(std::env::var("DOT_REPOS_GIT_PROBE_LOG").unwrap())
+                .expect("probe log");
+            println!("DOT_PROBES={}", log.lines().count());
+            rc
+        }
         _ => dot::repos_git::repo_git(&base, kind, &path, &args),
     };
     println!("DOT_RC={rc}");
@@ -145,6 +162,57 @@ fn ps_snapshot(pid: u32) -> String {
     } else {
         rows.join(" ")
     }
+}
+
+#[test]
+fn repos_git_command_clears_memoized_worktree_probes() {
+    let scope = TempDir::new("repos-git-clear-probe").unwrap();
+    let repo = scope.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let bin = scope.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let log = scope.path().join("git.log");
+    // Counting shim: answers `rev-parse --show-toplevel` by
+    // echoing the directory, silently accepts anything else.
+    std::fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$3\" = rev-parse ]; then printf '%s\\n' \"$2\"; fi\nexit 0\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin.clone())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "repos_git_stream_child", "--nocapture"])
+        .env("DOT_REPOS_GIT_CHILD", "clear-probe")
+        .env("DOT_REPOS_GIT_TOPOLOGY", "ordinary")
+        .env("DOT_REPOS_GIT_DIR", scope.path())
+        .env("DOT_REPOS_GIT_HOME", scope.path())
+        .env("DOT_REPOS_GIT_KIND", "overlay")
+        .env("DOT_REPOS_GIT_PATH", &repo)
+        .env("DOT_REPOS_GIT_ARGS", "--version")
+        .env("DOT_REPOS_GIT_MASK", "0")
+        .env("DOT_REPOS_GIT_PROBE_REPO", &repo)
+        .env("DOT_REPOS_GIT_PROBE_LOG", &log)
+        .env("PATH", &path)
+        .output()
+        .expect("run clear-probe child");
+    assert!(
+        output.status.success(),
+        "child stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let probes = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("DOT_PROBES=")?.parse::<usize>().ok())
+        .expect("child probe marker");
+    assert_eq!(probes, 3);
 }
 
 #[test]

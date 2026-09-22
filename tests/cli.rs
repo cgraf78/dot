@@ -4139,6 +4139,17 @@ fn update_native_pre_sync_failure_relays_both_streams() {
 }
 
 #[test]
+fn update_observes_overlay_checkout_removed_by_pre_sync_hook() {
+    // Discovery memoizes the overlay as a live worktree before hooks
+    // run; a pre-sync hook that deletes `.git` must be observed by
+    // the pull phase, not masked by the stale memoized answer.
+    let fixture = NativeUpdateFixture::stage()
+        .with_pre_sync(b"prepare() { rm -rf \"$HOME/.dotfiles-alpha/.git\"; }\n");
+    let output = fixture.rust_dot_with_bash(&["update"]);
+    assert!(has_bytes(&output.stdout, b"not a Git worktree"));
+}
+
+#[test]
 fn update_native_merge_hook_runs_with_a_large_job_limit() {
     let fixture = NativeUpdateFixture::stage()
         .with_merge(b"merge() { printf merged >\"$HOME/merge-hook-ran\"; }\n");

@@ -103,7 +103,11 @@ impl Worker {
                 return failed_pre_sync(self.runtime.bash_error_line_once(&error));
             }
         };
-        separate(command, &call.temporary)
+        let outcome = separate(command, &call.temporary);
+        // Like `launch`: the hook ran arbitrary user code that may
+        // have replaced repository directories.
+        crate::overlays::invalidate_worktree_cache();
+        outcome
     }
 
     /// Run one merge hook through the same authenticated worker boundary. Merge
@@ -306,7 +310,12 @@ impl Worker {
                 };
             }
         };
-        combined(command, result_dir)
+        let outcome = combined(command, result_dir);
+        // The hook ran arbitrary user code: it may have replaced
+        // repository directories, so memoized probe answers are
+        // no longer trustworthy.
+        crate::overlays::invalidate_worktree_cache();
+        outcome
     }
 }
 

@@ -112,11 +112,12 @@ pub fn cpu_count_select(getconf: &str, uname_s: &str, sysctl: &str) -> String {
     normalize_jobs(probed, "4")
 }
 
-/// Run one helper binary, returning trimmed stdout (empty on any
-/// failure, like `$(... || true)`).
-fn probe(program: &str, args: &[&str]) -> String {
+/// Run one helper binary, returning trimmed stdout (`None` when
+/// the probe itself could not run, so callers can tell a failed
+/// spawn from empty output).
+fn probe(program: &str, args: &[&str]) -> Option<String> {
     if crate::cancellation::check().is_err() {
-        return String::new();
+        return None;
     }
     let mut command = std::process::Command::new(program);
     command.args(args).stdin(std::process::Stdio::null());
@@ -128,27 +129,50 @@ fn probe(program: &str, args: &[&str]) -> String {
     );
     match output {
         Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
         }
-        _ => String::new(),
+        _ => None,
     }
 }
+
+/// Memoized CPU count. The merge phase resolves worker counts more
+/// than once per update, and the online-processor answer cannot
+/// change mid-process. Only a successful `getconf` memoizes: a
+/// failed spawn keeps today's uncached fallback instead of pinning
+/// the default worker count.
+static CPU_COUNT_MEMO: crate::memo::Memo<String> = crate::memo::Memo::new();
 
 /// `_dot_update_cpu_count`: `getconf`, Darwin `sysctl` fallback,
 /// default four.
 pub fn cpu_count() -> String {
+    cpu_count_inner(&CPU_COUNT_MEMO, probe)
+}
+
+fn cpu_count_inner(
+    memo: &crate::memo::Memo<String>,
+    probe: impl Fn(&str, &[&str]) -> Option<String>,
+) -> String {
+    if let Some(cached) = memo.get() {
+        return cached;
+    }
     let getconf = probe("getconf", &["_NPROCESSORS_ONLN"]);
-    let uname = if getconf.is_empty() {
+    let raw = getconf.as_deref().unwrap_or("");
+    let uname = if raw.is_empty() {
         probe("uname", &["-s"])
     } else {
-        String::new()
+        Some(String::new())
     };
-    let sysctl = if getconf.is_empty() && uname == "Darwin" {
+    let uname = uname.as_deref().unwrap_or("");
+    let sysctl = if raw.is_empty() && uname == "Darwin" {
         probe("sysctl", &["-n", "hw.ncpu"])
     } else {
-        String::new()
+        Some(String::new())
     };
-    cpu_count_select(&getconf, &uname, &sysctl)
+    let result = cpu_count_select(raw, uname, sysctl.as_deref().unwrap_or(""));
+    if let Some(value) = getconf.map(|_| result.clone()) {
+        memo.set(value);
+    }
+    result
 }
 
 /// `_dot_update_jobs`: `DOT_UPDATE_JOBS` when numeric, else the CPU
@@ -1282,5 +1306,64 @@ mod tests {
             assert_eq!(record.hook.key, std::ffi::OsString::from("k"));
         });
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cpu_count_memoizes_successful_getconf() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let probe = |program: &str, _args: &[&str]| {
+            calls.set(calls.get() + 1);
+            assert_eq!(program, "getconf");
+            Some("8".to_string())
+        };
+        let memo = crate::memo::Memo::new();
+        assert_eq!(super::cpu_count_inner(&memo, probe), "8");
+        let probe = |program: &str, _args: &[&str]| {
+            calls.set(calls.get() + 1);
+            assert_eq!(program, "getconf");
+            Some("changed".to_string())
+        };
+        assert_eq!(super::cpu_count_inner(&memo, probe), "8");
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn cpu_count_reprobes_after_failed_getconf() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let memo = crate::memo::Memo::new();
+        for _ in 0..2 {
+            let result = super::cpu_count_inner(&memo, |program: &str, _args: &[&str]| {
+                calls.set(calls.get() + 1);
+                match program {
+                    "getconf" => None,
+                    "uname" => Some("Linux".to_string()),
+                    other => panic!("unexpected probe: {other}"),
+                }
+            });
+            assert_eq!(result, "4");
+        }
+        assert_eq!(calls.get(), 4);
+    }
+
+    #[test]
+    fn cpu_count_caches_the_darwin_fallback_chain() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let memo = crate::memo::Memo::new();
+        for _ in 0..2 {
+            let result = super::cpu_count_inner(&memo, |program: &str, _args: &[&str]| {
+                calls.set(calls.get() + 1);
+                match program {
+                    "getconf" => Some(String::new()),
+                    "uname" => Some("Darwin".to_string()),
+                    "sysctl" => Some("10".to_string()),
+                    other => panic!("unexpected probe: {other}"),
+                }
+            });
+            assert_eq!(result, "10");
+        }
+        assert_eq!(calls.get(), 3);
     }
 }
