@@ -173,14 +173,7 @@ pub fn try_resolve_dirty(home: &str, base: Option<&[OsString]>, overlays: &[Stri
 /// before the first `/` (`${upstream%%/*}`), which must differ from
 /// the whole.
 pub fn configured_upstream(prefix: &[OsString]) -> Option<String> {
-    let output = run_git(
-        prefix,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-    )?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = crate::overlays::cached_upstream_raw(prefix)?;
     let upstream = text.trim_end_matches('\n');
     let remote = upstream.split('/').next().unwrap_or("");
     if remote.is_empty() || remote == upstream {

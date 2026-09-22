@@ -11,9 +11,12 @@
 //! dispatch. No process environment is published; consumers receive the
 //! immutable configuration explicitly.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 
 use crate::config::Config;
 
@@ -271,12 +274,48 @@ pub fn resolve_source_root(exe: &Path, env_root: Option<&OsStr>, cwd: &Path) -> 
     cwd.to_path_buf()
 }
 
+/// Memoized checkout revisions by source root. `dot update` reads the
+/// revision up to four times per run (dispatch guard plus three
+/// post-pull preflights), and each read is a supervised `git`
+/// subprocess. The answer only changes when the engine itself moves
+/// the source checkout's HEAD (base pull) or runs arbitrary code
+/// (extension hooks, `repos git`), so those boundaries invalidate
+/// explicitly and every other caller shares the run's first answer.
+/// `None` (missing repo, failed spawn) never pins: the next read
+/// re-probes, so a transient failure cannot stick.
+static REVISION_CACHE: OnceLock<Mutex<HashMap<Vec<u8>, String>>> = OnceLock::new();
+
+fn revision_cache() -> &'static Mutex<HashMap<Vec<u8>, String>> {
+    REVISION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop every memoized revision answer. Call after any engine phase
+/// that may have moved a source checkout's HEAD (pull, clone into a
+/// cached root) and after arbitrary user code (hooks) or git
+/// passthrough. Over-invalidation only costs a re-probe; a missed
+/// invalidation would serve a stale generation to the re-exec guard.
+pub(crate) fn invalidate_revision_cache() {
+    if let Ok(mut cache) = revision_cache().lock() {
+        cache.clear();
+    }
+}
+
 /// Read the observed checkout revision: `git rev-parse HEAD` bound to
 /// `source_root` through the same sanitized `-c`/`-C` isolation the
 /// shell's `_dot_source_git` applies (`2>/dev/null || true` there is
 /// `None` here — spawn failure, non-zero exit, and empty output all
 /// mean "missing", which the guard spells `<missing>`).
 pub fn observed_revision(source_root: &Path) -> Option<String> {
+    let cancelled = crate::cancellation::check().is_err();
+    crate::memo::cached_probe(
+        revision_cache(),
+        source_root.as_os_str().as_bytes(),
+        cancelled,
+        || observed_revision_uncached(source_root),
+    )
+}
+
+fn observed_revision_uncached(source_root: &Path) -> Option<String> {
     let mut cmd = crate::temp::sanitized_git(source_root, &["rev-parse", "HEAD"]);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -657,6 +657,19 @@ pub(crate) fn prepare(
     preparation_stdout: &mut dyn std::io::Write,
     preparation_stderr: &mut dyn std::io::Write,
 ) -> Result<Prepared, PrepareFailure> {
+    let outcome = prepare_inner(inputs, preparation_stdout, preparation_stderr);
+    // Preparation executes provider code (ABI/capability probes),
+    // which may commit to the source checkout like any provider
+    // run; later revision reads must re-probe.
+    crate::startup::invalidate_revision_cache();
+    outcome
+}
+
+fn prepare_inner(
+    inputs: &Inputs<'_>,
+    preparation_stdout: &mut dyn std::io::Write,
+    preparation_stderr: &mut dyn std::io::Write,
+) -> Result<Prepared, PrepareFailure> {
     if inputs.runtime.is_process_entry() {
         if let Err(error) = crate::cleanup::adopt_descendants() {
             return Err(PrepareFailure {
@@ -738,7 +751,14 @@ pub(crate) fn update(
         crate::update_engine::now_secs(),
         crate::progress_ui::HEARTBEAT_INTERVAL_SECS,
     );
-    run_update(inputs, &prepared.0, stage, live_out, live_err, &mut beat)
+    let outcome = run_update(inputs, &prepared.0, stage, live_out, live_err, &mut beat);
+    // The provider is external code that may commit to the source
+    // checkout (the reexec fixtures advance it deliberately), so
+    // memoized revisions from before the provider ran are no longer
+    // trustworthy. Later guards (reexec verification, defensive
+    // reload) must re-probe.
+    crate::startup::invalidate_revision_cache();
+    outcome
 }
 
 enum EnsureFailure {

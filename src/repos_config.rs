@@ -15,13 +15,11 @@ pub use crate::overlays::{effective_url, is_worktree};
 
 /// `_repo_has_upstream`: `"$@" rev-parse --abbrev-ref
 /// --symbolic-full-name '@{u}'`, true iff git exits 0 (stdout
-/// ignored; both engines silence it).
+/// ignored; both engines silence it). Shares the memoized raw
+/// probe with fetch preparation: `Some` (even empty) is exactly
+/// the exit-0 case.
 pub fn has_upstream(prefix: &[OsString]) -> bool {
-    crate::repos_base::run_git(
-        prefix,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-    )
-    .is_some_and(|output| output.status.success())
+    crate::overlays::cached_upstream_raw(prefix).is_some()
 }
 
 /// `_overlay_origin_matches` adapter: `Ok(url)` reads `(true, url)`

@@ -596,6 +596,14 @@ pub fn sync_repos(
         log: inputs.log,
     };
     let outcome = crate::repos_pull_fleet::pull_all(&pull_inputs, stage, moves, out, err);
+    // Pulls move HEAD (rebase, fast-forward, fresh clone) and the
+    // failure path restores generations, so memoized revisions are
+    // no longer trustworthy. Unconditional: quiet failures and empty
+    // optional statuses tally nothing, so the outcome cannot prove
+    // a clean tree. Tracking names survive clean pulls, but a failed
+    // pull can detach HEAD, so upstream answers go too.
+    crate::startup::invalidate_revision_cache();
+    crate::overlays::invalidate_upstream_cache();
     if outcome.rc != 0 || outcome.failed > 0 {
         let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose);
         let _ = out.write_all(&close);

@@ -102,6 +102,7 @@ pub fn repo_git(base: &Base, kind: RepoKind, path: &str, args: &[&str]) -> i32 {
     // trustworthy. Engine-internal streaming fetch/pull cannot
     // change worktree or origin answers and bypasses this boundary.
     crate::overlays::invalidate_worktree_cache();
+    crate::startup::invalidate_revision_cache();
     rc
 }
 

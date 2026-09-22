@@ -8,7 +8,15 @@
 //! transient failure never pins). Unlike the overlay repository
 //! cache ([`crate::overlays`] invalidation on clone/hooks), these
 //! answers have no engine mutation point and need no invalidation.
+//!
+//! [`cached_probe`] is the keyed variant for probes whose answers
+//! the engine can mutate (checkout revisions, upstream names):
+//! same Some-only caching plus a cancellation gate, with explicit
+//! invalidation at the mutation boundaries. Callers pass the
+//! cancellation verdict they already read so unit tests can drive
+//! both branches without touching the process signal latch.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// A single memoized probe answer. Thread-safe: concurrent first
@@ -50,6 +58,34 @@ impl<T: Clone> Memo<T> {
         self.set(probed.clone());
         Some(probed)
     }
+}
+
+/// Memoized keyed probe with a cancellation gate. When `cancelled`,
+/// return missing without consulting or filling the cache: every
+/// caller routes through supervised spawns that observe the latched
+/// signal and fail, so serving a stale hit would let teardown
+/// proceed as if uninterrupted. Only `Some` answers pin; `None`
+/// re-probes so transient failures never stick. A poisoned lock
+/// degrades to probing (miss plus skipped store).
+pub(crate) fn cached_probe(
+    cache: &Mutex<HashMap<Vec<u8>, String>>,
+    key: &[u8],
+    cancelled: bool,
+    probe: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if cancelled {
+        return None;
+    }
+    if let Ok(cache) = cache.lock() {
+        if let Some(hit) = cache.get(key) {
+            return Some(hit.clone());
+        }
+    }
+    let answer = probe()?;
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(key.to_vec(), answer.clone());
+    }
+    Some(answer)
 }
 
 #[cfg(test)]
@@ -117,5 +153,96 @@ mod tests {
         });
         assert_eq!(memo.get(), Some("linux".to_string()));
         assert!(probes.load(Ordering::SeqCst) >= 1);
+    }
+
+    fn keyed_probes(
+        cache: &Mutex<HashMap<Vec<u8>, String>>,
+        key: &[u8],
+        cancelled: bool,
+        calls: &std::cell::Cell<usize>,
+        answer: Option<&str>,
+    ) -> Option<String> {
+        cached_probe(cache, key, cancelled, || {
+            calls.set(calls.get() + 1);
+            answer.map(str::to_string)
+        })
+    }
+
+    #[test]
+    fn keyed_probe_memoizes_one_key_across_reads() {
+        let cache = Mutex::new(HashMap::new());
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..3 {
+            assert_eq!(
+                keyed_probes(&cache, b"/repo/root", false, &calls, Some("abc123")),
+                Some("abc123".to_string())
+            );
+        }
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn keyed_probe_keys_answers_separately() {
+        let cache = Mutex::new(HashMap::new());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            keyed_probes(&cache, b"/repo/a", false, &calls, Some("aaa")),
+            Some("aaa".to_string())
+        );
+        assert_eq!(
+            keyed_probes(&cache, b"/repo/b", false, &calls, Some("bbb")),
+            Some("bbb".to_string())
+        );
+        assert_eq!(
+            keyed_probes(&cache, b"/repo/a", false, &calls, Some("aaa")),
+            Some("aaa".to_string())
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn keyed_probe_reprobes_after_invalidate() {
+        let cache = Mutex::new(HashMap::new());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            keyed_probes(&cache, b"/repo/root", false, &calls, Some("before")),
+            Some("before".to_string())
+        );
+        cache.lock().unwrap().clear();
+        assert_eq!(
+            keyed_probes(&cache, b"/repo/root", false, &calls, Some("after")),
+            Some("after".to_string())
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn keyed_probe_failures_stay_uncached() {
+        let cache = Mutex::new(HashMap::new());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            keyed_probes(&cache, b"/repo/root", false, &calls, None),
+            None
+        );
+        assert_eq!(
+            keyed_probes(&cache, b"/repo/root", false, &calls, Some("recovered")),
+            Some("recovered".to_string())
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn keyed_probe_returns_missing_when_cancelled_without_probing() {
+        let cache = Mutex::new(HashMap::new());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            keyed_probes(&cache, b"/repo/root", false, &calls, Some("abc123")),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            keyed_probes(&cache, b"/repo/root", true, &calls, Some("abc123")),
+            None
+        );
+        assert_eq!(calls.get(), 1);
     }
 }

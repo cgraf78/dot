@@ -107,6 +107,7 @@ impl Worker {
         // Like `launch`: the hook ran arbitrary user code that may
         // have replaced repository directories.
         crate::overlays::invalidate_worktree_cache();
+        crate::startup::invalidate_revision_cache();
         outcome
     }
 
@@ -315,6 +316,7 @@ impl Worker {
         // repository directories, so memoized probe answers are
         // no longer trustworthy.
         crate::overlays::invalidate_worktree_cache();
+        crate::startup::invalidate_revision_cache();
         outcome
     }
 }
