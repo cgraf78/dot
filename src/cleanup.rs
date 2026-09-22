@@ -9142,14 +9142,19 @@ os._exit(0)
         let child_ready = scope.path().join("child-ready");
         let child_term = scope.path().join("child-term");
         let leader_term = scope.path().join("leader-term");
-        // Subsecond sleeps bound trap deferral: Bash runs a TERM trap only
-        // after its foreground sleep finishes, and a loaded host can deliver
-        // TERM deep into a one-second sleep.
+        // A single background sleep plus `wait` bounds trap latency to
+        // scheduling: Bash runs a TERM trap only after its foreground
+        // command finishes, and a `sleep 0.1` fork-exec loop defers the
+        // trap by a whole loaded fork-exec chain, which can push the
+        // spawn-observe-signal-trap chain past the grace window into KILL
+        // (loaded hosts flake). `wait` returns immediately on a trapped
+        // signal, and the sleeps self-bound the fixture if teardown ever
+        // misses them.
         let mut command = Command::new(dot_test_support::bash());
         command
             .args([
                 "-c",
-                "trap 'printf \"TERM\\n\" >>\"$5\"; if [[ ! -e $2 ]]; then : >\"$2\"; (trap '\"'\"': >\"$4\"; exit 0'\"'\"' TERM; : >\"$3\"; while :; do sleep 0.1; done) & fi' TERM; : >\"$1\"; while :; do sleep 0.1; done",
+                "trap 'printf \"TERM\\n\" >>\"$5\"; if [[ ! -e $2 ]]; then : >\"$2\"; (trap '\"'\"': >\"$4\"; exit 0'\"'\"' TERM; : >\"$3\"; sleep 30 & wait $!) & fi' TERM; : >\"$1\"; sleep 30 & wait $!",
                 "late-term-child",
             ])
             .arg(&ready)
@@ -9170,9 +9175,9 @@ os._exit(0)
         let _ = stop_session(&mut child, libc::SIGTERM);
 
         // The late child is spawned by the leader's TERM trap and is
-        // signaled by the same stop: both the spawn and the delivery
-        // land after `stop_session` returns, so poll for the markers
-        // instead of asserting them on arrival (loaded hosts flake).
+        // signaled by the same stop; trap execution (the marker writes)
+        // completes asynchronously, so poll for the markers instead of
+        // asserting them on arrival.
         poll_until(Instant::now() + Duration::from_secs(10), || {
             Ok(child_ready.exists().then_some(()))
         })
@@ -9229,14 +9234,16 @@ os._exit(0)
         let child_ready = scope.path().join("child-ready");
         let child_term = scope.path().join("child-term");
         let leader_term = scope.path().join("leader-term");
-        // Subsecond sleeps bound trap deferral: Bash runs a TERM trap only
-        // after its foreground sleep finishes, and a loaded host can deliver
-        // TERM deep into a one-second sleep.
+        // A single background sleep plus `wait` bounds trap latency to
+        // scheduling (see the late-term-child fixture): a `sleep 0.1`
+        // fork-exec loop defers the trap by a whole loaded fork-exec
+        // chain. `wait` returns immediately on a trapped signal, and the
+        // sleeps self-bound the fixture if teardown ever misses them.
         let mut command = Command::new(dot_test_support::bash());
         command
             .args([
                 "-c",
-                "trap 'printf \"TERM\\n\" >>\"$5\"; if [[ ! -e $2 ]]; then : >\"$2\"; (trap '\"'\"': >\"$4\"; exit 0'\"'\"' TERM; : >\"$3\"; while :; do sleep 0.1; done) & fi' TERM; : >\"$1\"; while :; do sleep 0.1; done",
+                "trap 'printf \"TERM\\n\" >>\"$5\"; if [[ ! -e $2 ]]; then : >\"$2\"; (trap '\"'\"': >\"$4\"; exit 0'\"'\"' TERM; : >\"$3\"; sleep 30 & wait $!) & fi' TERM; : >\"$1\"; sleep 30 & wait $!",
                 "no-pidfd-late-term",
             ])
             .arg(&ready)
@@ -9256,11 +9263,11 @@ os._exit(0)
 
         let _ = stop_session(&mut child, libc::SIGTERM);
 
-        // The late child is spawned by the leader's TERM trap after the
-        // stop returns, so wait for the spawn (loaded hosts flake on an
-        // immediate check). Absence of a wrongful redelivery is then
-        // proven by a quiet period: any signal sent during the stop is
-        // delivered and trapped long before it ends.
+        // The late child is spawned by the leader's TERM trap during the
+        // stop, so wait for the spawn (loaded hosts flake on an immediate
+        // check). Absence of a wrongful redelivery is then proven by a
+        // quiet period: any signal sent during the stop is delivered and
+        // trapped long before it ends.
         poll_until(Instant::now() + Duration::from_secs(10), || {
             Ok(child_ready.exists().then_some(()))
         })
@@ -9951,32 +9958,89 @@ os._exit(0)
     fn foreground_signal_after_fork_denies_every_target_exec() {
         const HELPER: &str = "DOT_FOREGROUND_POST_FORK_HELPER";
         if let Some(signal) = std::env::var_os(HELPER) {
+            use std::io::Write as _;
+            use std::os::fd::AsRawFd as _;
             use std::os::unix::process::CommandExt as _;
 
             let signal = signal.to_string_lossy().parse::<i32>().unwrap();
             let scope = dot_test_support::TempDir::new("foreground-post-fork").unwrap();
             let marker = scope.path().join("launched");
             let signals = Signals::install().unwrap();
+            // kill(2) only queues the signal: delivery to a parent thread is
+            // asynchronous, so the registrar can authorize before the latch
+            // lands and the child would exec past a barrier the test then
+            // asserts denied it (loaded hosts flake). The pre-exec child
+            // therefore waits for an explicit observed-ack before it may
+            // request authorization. The latch is sticky, so once the
+            // watcher observes the signal the registrar must see it too and
+            // observed-before-ready is deterministic.
+            let (ack_read, mut ack_write) = internal_stream_pair().unwrap();
+            ack_read.set_nonblocking(true).unwrap();
+            let watcher = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while received_signal().is_none() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let _ = ack_write.write_all(&[u8::from(received_signal().is_some())]);
+            });
+            let ack_fd = ack_read.as_raw_fd();
             let mut command = Command::new(dot_test_support::bash());
             command
                 .arg("-c")
                 .arg(": >\"$1\"")
                 .arg("foreground-launch")
                 .arg(&marker);
-            // SAFETY: kill/getppid are async-signal-safe. This callback runs
-            // before the supervisor's authorization callback and places the
-            // signal in the exact fork-to-exec window under test.
+            // SAFETY: kill/getppid/read/close/nanosleep are
+            // async-signal-safe and touch only stack memory plus the
+            // inherited ack descriptor. This callback is registered before
+            // the supervisor installs its own, and std runs pre_exec
+            // callbacks in registration order, so the authorization
+            // handshake cannot proceed until the ack lands.
             unsafe {
                 command.pre_exec(move || {
-                    if libc::kill(libc::getppid(), signal) == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
+                    if libc::kill(libc::getppid(), signal) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let mut byte = [0u8; 1];
+                    let mut waited_ms = 0u32;
+                    loop {
+                        let count = libc::read(ack_fd, byte.as_mut_ptr().cast(), 1);
+                        if count == 1 {
+                            libc::close(ack_fd);
+                            if byte[0] == 1 {
+                                return Ok(());
+                            }
+                            return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
+                        }
+                        if count == 0 {
+                            libc::close(ack_fd);
+                            return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
+                        }
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        if error.raw_os_error() != Some(libc::EAGAIN) {
+                            libc::close(ack_fd);
+                            return Err(error);
+                        }
+                        if waited_ms >= 30_000 {
+                            libc::close(ack_fd);
+                            return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                        }
+                        let nap = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 1_000_000,
+                        };
+                        libc::nanosleep(&nap, std::ptr::null_mut());
+                        waited_ms += 1;
                     }
                 });
             }
 
             let result = supervise_child(command, None, |_| Ok(())).unwrap();
+            watcher.join().unwrap();
+            drop(ack_read);
 
             assert!(matches!(result, SessionEnd::Interrupted(observed) if observed == signal));
             assert!(
