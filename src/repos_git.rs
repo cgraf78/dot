@@ -151,6 +151,7 @@ pub fn repo_git(base: &Base, kind: RepoKind, path: &str, args: &[&str]) -> i32 {
     crate::overlays::invalidate_worktree_cache();
     crate::startup::invalidate_revision_cache();
     crate::repos_base::invalidate_client_match_cache();
+    crate::repos_config::invalidate_config_cache();
     rc
 }
 
