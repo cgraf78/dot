@@ -209,6 +209,19 @@ fn upstream_remote(upstream: &str) -> Option<&str> {
     Some(remote)
 }
 
+/// Trimmed `@{u}` tracking name under `prefix`, shared with the
+/// upstream gate and dirty checks through the memoized raw probe.
+/// Trims and rejects empty exactly like the direct `rev_parse`
+/// probe it replaces.
+fn upstream_name(prefix: &[std::ffi::OsString]) -> Option<String> {
+    let raw = crate::overlays::cached_upstream_raw(prefix)?;
+    let text = raw.trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
 /// Run `git rev-parse` under `prefix`, returning trimmed stdout on
 /// success (empty on any failure, like `$(... || true)` downstream
 /// of an `|| return`).
@@ -232,8 +245,7 @@ fn rev_parse(prefix: &[std::ffi::OsString], args: &[&str]) -> Option<String> {
 /// fetch, 3 for an unresolvable tip.
 pub fn prepare_base_upstream(base: &crate::repos_base::Base) -> Result<String, u8> {
     let prefix = base.git_prefix().ok_or(1u8)?;
-    let upstream =
-        rev_parse(&prefix, &["--abbrev-ref", "--symbolic-full-name", "@{u}"]).ok_or(1u8)?;
+    let upstream = upstream_name(&prefix).ok_or(1u8)?;
     let remote = upstream_remote(&upstream).ok_or(1u8)?;
     if crate::repos_git::run_git_streaming(
         &prefix,
@@ -252,8 +264,7 @@ pub fn prepare_base_upstream(base: &crate::repos_base::Base) -> Result<String, u
 /// and fetch diagnostics stay quiet when `quiet_errors` holds.
 pub fn prepare_overlay_upstream(path: &std::path::Path, quiet_errors: bool) -> Result<String, u8> {
     let prefix = vec![std::ffi::OsString::from("-C"), path.as_os_str().to_owned()];
-    let upstream =
-        rev_parse(&prefix, &["--abbrev-ref", "--symbolic-full-name", "@{u}"]).ok_or(1u8)?;
+    let upstream = upstream_name(&prefix).ok_or(1u8)?;
     let remote = upstream_remote(&upstream).ok_or(1u8)?;
     let fetch = ["fetch", "--quiet", "--no-write-fetch-head", remote];
     let fetched = if quiet_errors {

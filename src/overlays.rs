@@ -480,10 +480,18 @@ pub fn parse_conf(
 /// invalidate explicitly and every other caller shares the run's
 /// first answer. Shared across the pull-fleet scope threads via
 /// the mutex; contention is negligible (tens of lookups per run).
+///
+/// `upstream` memoizes the raw stdout of `rev-parse --abbrev-ref
+/// --symbolic-full-name @{u}` by command-prefix bytes: every pull
+/// resolves it twice per repo (the upstream gate, then the fetch
+/// preparation). Tracking names survive pulls (rebase and
+/// fast-forward stay on the branch); only a fresh clone at the same
+/// path, arbitrary hook code, or git passthrough can change them.
 #[derive(Default)]
 struct WorktreeProbeCache {
     worktree: HashMap<Vec<u8>, bool>,
     origin: HashMap<(Vec<u8>, Vec<u8>), Result<String, String>>,
+    upstream: HashMap<Vec<u8>, String>,
 }
 
 static WORKTREE_PROBE_CACHE: OnceLock<Mutex<WorktreeProbeCache>> = OnceLock::new();
@@ -502,6 +510,7 @@ pub(crate) fn invalidate_worktree_cache() {
     if let Some(mut cache) = probe_cache() {
         cache.worktree.clear();
         cache.origin.clear();
+        cache.upstream.clear();
     }
 }
 
@@ -513,7 +522,67 @@ pub(crate) fn invalidate_worktree_path(path: &Path) {
     if let Some(mut cache) = probe_cache() {
         cache.worktree.remove(&key);
         cache.origin.retain(|entry, _| entry.0 != key);
+        // Upstream entries key by full command prefix, so evict any
+        // entry addressing the replaced path. Over-eviction (one
+        // path a prefix of another, or an empty key) only costs a
+        // re-probe; `windows` would panic on a zero length.
+        if key.is_empty() {
+            cache.upstream.clear();
+        } else {
+            cache
+                .upstream
+                .retain(|entry, _| !entry.windows(key.len()).any(|w| w == key));
+        }
     }
+}
+
+/// Drop every memoized upstream answer. Pulls keep tracking names
+/// but a failed pull can leave a detached HEAD behind, so the pull
+/// boundary clears unconditionally rather than trusting the tally.
+pub(crate) fn invalidate_upstream_cache() {
+    if let Some(mut cache) = probe_cache() {
+        cache.upstream.clear();
+    }
+}
+
+/// Raw stdout of `rev-parse --abbrev-ref --symbolic-full-name @{u}`
+/// under `prefix`, or `None` when git fails or exits nonzero.
+/// Shared by the upstream gate, the fetch preparation, and the
+/// dirty checks so each repo resolves its tracking name once per
+/// run; the raw bytes (trailing newline included) let every
+/// consumer trim exactly like its uncached probe did.
+pub(crate) fn cached_upstream_raw(prefix: &[std::ffi::OsString]) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut key = Vec::new();
+    for arg in prefix {
+        key.extend_from_slice(arg.as_os_str().as_bytes());
+        key.push(0);
+    }
+    // Match the uncached path under cancellation: the supervised
+    // spawn observes the latched signal and fails, which reads as
+    // missing. Serving a stale hit here would let teardown proceed
+    // as if uninterrupted.
+    let cancelled = crate::cancellation::check().is_err();
+    if cancelled {
+        return None;
+    }
+    if let Some(cache) = probe_cache() {
+        if let Some(hit) = cache.upstream.get(&key) {
+            return Some(hit.clone());
+        }
+    }
+    let output = crate::repos_base::run_git(
+        prefix,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )?;
+    if !output.status.success() {
+        return None;
+    }
+    let answer = String::from_utf8_lossy(&output.stdout).into_owned();
+    if let Some(mut cache) = probe_cache() {
+        cache.upstream.insert(key, answer.clone());
+    }
+    Some(answer)
 }
 
 /// `_overlay_is_worktree`: a directory whose `.git` entry exists
