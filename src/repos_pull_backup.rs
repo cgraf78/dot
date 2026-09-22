@@ -486,7 +486,22 @@ mod cancellation_tests {
         )
         .unwrap();
         std::fs::set_permissions(&fake_mv, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/stat", bin.join("stat")).unwrap();
+        // Resolve `stat` off the ambient PATH instead of hardcoding
+        // `/usr/bin/stat`: busybox-based images (Alpine) install the
+        // applet elsewhere, and a dangling fixture symlink makes every
+        // identity probe fail so the move hold never engages.
+        let real_stat = std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths).find_map(|dir| {
+                    if dir.as_os_str().is_empty() {
+                        return None;
+                    }
+                    let candidate = dir.join("stat");
+                    candidate.is_file().then_some(candidate)
+                })
+            })
+            .expect("no `stat` on PATH for the identity fixture");
+        std::os::unix::fs::symlink(&real_stat, bin.join("stat")).unwrap();
         std::os::unix::fs::symlink("/bin/mkdir", bin.join("mkdir")).unwrap();
         // SAFETY: this recursive helper is the only test in its process.
         unsafe {
