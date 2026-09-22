@@ -358,18 +358,17 @@ pub fn pull_overlay(
             return done(PullOverlayStatus::Failed, live);
         }
     };
-    let head_before = repo_head(&prefix);
     // Match the base fast path, including local-delta policy and a
     // final HEAD generation check before accepting the checkout.
-    match accept_current_generation(
+    let (accept_status, head_before) = accept_current_generation(
         &prefix,
         "overlay",
-        &head_before,
         &upstream,
         inputs.candidate,
         inputs.log,
         warnings,
-    ) {
+    );
+    match accept_status {
         0 => return done(PullOverlayStatus::Current, live),
         1 => {}
         _ => {

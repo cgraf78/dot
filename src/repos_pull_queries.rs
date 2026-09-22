@@ -413,27 +413,40 @@ pub fn validate_ahead_delta(
 /// safely current (equal, or a contained generation with a valid
 /// local-ahead delta and a stable final HEAD read), 1 when the
 /// fetched upstream is not contained and needs the ordinary pull
-/// path, and 2 when inputs are empty or a contained generation is
-/// invalid or moved during inspection.
+/// path, and 2 when the checkout is missing or a contained
+/// generation is invalid or moved during inspection. Returns the
+/// status with the HEAD observed at entry: callers pass no
+/// generation in, so the preflight keeps one authoritative read
+/// instead of the caller probing and this re-check probing again.
+/// The equal path skips the final re-check (only pure comparisons
+/// run between the entry read and the verdict, so no inspection
+/// subprocess could have raced it); the ahead path keeps the
+/// re-check after merge-base and the delta scan, exactly the race
+/// the shell guarded.
 pub fn accept_current_generation(
     prefix: &[OsString],
     kind: &str,
-    head: &str,
     upstream: &str,
     env: &CandidateEnv,
     log: &Log,
     warnings: &mut dyn std::io::Write,
-) -> i32 {
+) -> (i32, String) {
+    let head = repo_head(prefix);
     if head.is_empty() || upstream.is_empty() {
-        return 2;
+        return (2, head);
     }
-    if head != upstream {
-        if !repo_head_contains_upstream(prefix, head, upstream) {
-            return 1;
-        }
-        if !validate_ahead_delta(prefix, kind, upstream, head, env, log, warnings) {
-            return 2;
-        }
+    if head == upstream {
+        return (0, head);
     }
-    if repo_head_is(prefix, head) { 0 } else { 2 }
+    if !repo_head_contains_upstream(prefix, &head, upstream) {
+        return (1, head);
+    }
+    if !validate_ahead_delta(prefix, kind, upstream, &head, env, log, warnings) {
+        return (2, head);
+    }
+    if repo_head_is(prefix, &head) {
+        (0, head)
+    } else {
+        (2, head)
+    }
 }

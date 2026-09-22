@@ -587,26 +587,33 @@ fn generation_acceptance_pins_equal_ahead_unrelated_empty_and_head_race() {
     let unrelated = head(&repo);
     git(&repo, &["checkout", "-q", &ahead]);
     let p = prefix(&repo);
-    for (have, upstream, expected) in [
-        (ahead.as_str(), ahead.as_str(), 0),
-        (&ahead, &base, 0),
-        (&ahead, &unrelated, 1),
-        ("", &base, 2),
-        (&ahead, "", 2),
+    for (upstream, expected, expected_head) in [
+        (ahead.as_str(), 0, ahead.as_str()),
+        (base.as_str(), 0, ahead.as_str()),
+        (unrelated.as_str(), 1, ahead.as_str()),
+        ("", 2, ahead.as_str()),
     ] {
         assert_eq!(
-            accept_current_generation(
-                &p,
-                "base",
-                have,
-                upstream,
-                &fixture.env,
-                &log(),
-                &mut Vec::new()
-            ),
-            expected
+            accept_current_generation(&p, "base", upstream, &fixture.env, &log(), &mut Vec::new()),
+            (expected, expected_head.to_string())
         );
     }
+
+    // An unborn checkout probes empty, which refuses like empty input did.
+    let unborn = fixture.dir.path().join("unborn");
+    std::fs::create_dir_all(&unborn).expect("unborn dir");
+    git(&unborn, &["init", "-q"]);
+    assert_eq!(
+        accept_current_generation(
+            &prefix(&unborn),
+            "base",
+            &base,
+            &fixture.env,
+            &log(),
+            &mut Vec::new()
+        ),
+        (2, String::new())
+    );
 
     let tree = String::from_utf8(git(&repo, &["rev-parse", "HEAD^{tree}"]).stdout)
         .unwrap()
@@ -648,17 +655,44 @@ fn generation_acceptance_pins_equal_ahead_unrelated_empty_and_head_race() {
             shell_word(&repo),
         ),
     );
-    let outcome = dot::init_client_identity::with_host_git(&wrapper, || {
+    let (status, observed) = dot::init_client_identity::with_host_git(&wrapper, || {
+        accept_current_generation(&p, "base", &base, &fixture.env, &log(), &mut Vec::new())
+    });
+    assert_eq!(status, 2, "moved HEAD invalidates fast path");
+    assert_eq!(observed, ahead, "entry probe predates the race");
+    assert_eq!(head(&repo), moved);
+}
+
+#[test]
+fn accept_current_generation_probes_head_once_on_the_equal_path() {
+    let fixture = Fixture::new("repo-accept-once");
+    let scope = fixture.dir.path().join("counting");
+    std::fs::create_dir_all(&scope).expect("counting scope");
+    let invocations_log = scope.join("invocations.log");
+    let shim = scope.join("git");
+    let canned = "0123456789abcdef0123456789abcdef01234567";
+    write_program(
+        &shim,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nprintf '%s\\n' \"{canned}\"\n",
+            shell_word(&invocations_log),
+        ),
+    );
+    let repo = scope.join("repo");
+    let (status, observed) = dot::init_client_identity::with_host_git(&shim, || {
         accept_current_generation(
-            &p,
+            &prefix(&repo),
             "base",
-            &ahead,
-            &base,
+            canned,
             &fixture.env,
             &log(),
             &mut Vec::new(),
         )
     });
-    assert_eq!(outcome, 2, "moved HEAD invalidates fast path");
-    assert_eq!(head(&repo), moved);
+    assert_eq!((status, observed.as_str()), (0, canned));
+    let invocations = std::fs::read_to_string(&invocations_log)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert_eq!(invocations, 1);
 }
