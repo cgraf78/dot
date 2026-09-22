@@ -603,6 +603,7 @@ pub fn sync_repos(
     // a clean tree. Tracking names survive clean pulls, but a failed
     // pull can detach HEAD, so upstream answers go too.
     crate::startup::invalidate_revision_cache();
+    crate::repos_base::invalidate_client_match_cache();
     crate::overlays::invalidate_upstream_cache();
     if outcome.rc != 0 || outcome.failed > 0 {
         let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose);

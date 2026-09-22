@@ -150,6 +150,7 @@ pub fn repo_git(base: &Base, kind: RepoKind, path: &str, args: &[&str]) -> i32 {
     // change worktree or origin answers and bypasses this boundary.
     crate::overlays::invalidate_worktree_cache();
     crate::startup::invalidate_revision_cache();
+    crate::repos_base::invalidate_client_match_cache();
     rc
 }
 

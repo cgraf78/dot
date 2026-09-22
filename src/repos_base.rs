@@ -4,10 +4,12 @@
 //! Git directories before publishing a Base. Native doctor and test use this
 //! same authority boundary; repository commands consume its topology model.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
-use std::os::unix::ffi::OsStringExt as _;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 /// Failures that must not be mistaken for an empty Git query result before a
 /// caller performs durable repository mutations.
@@ -304,7 +306,75 @@ fn chomp_newlines(mut output: Vec<u8>) -> Vec<u8> {
     output
 }
 
+/// Memoized `client_matches` TRUE verdicts by record identity plus
+/// home. Dispatch validates the base client before running the
+/// command, and `update` gather validates it again before the pull
+/// phase; each validation is five supervised `git` probes against
+/// unchanging state, so the second call shares the first answer.
+/// Only TRUE pins: a mismatch re-probes, so a checkout converging
+/// mid-run (staged clone landing between phases) is observed.
+static CLIENT_MATCH_CACHE: OnceLock<Mutex<HashMap<Vec<u8>, ()>>> = OnceLock::new();
+
+fn client_match_cache() -> &'static Mutex<HashMap<Vec<u8>, ()>> {
+    CLIENT_MATCH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn client_match_key(record: &crate::init_client_record::TransactionRecord, home: &Path) -> Vec<u8> {
+    let mut key = Vec::new();
+    for part in [
+        record.git_dir.as_bytes(),
+        record.git_dev.as_bytes(),
+        record.git_ino.as_bytes(),
+        record.nonce.as_bytes(),
+        record.identity.as_bytes(),
+        record.branch.as_bytes(),
+        home.as_os_str().as_bytes(),
+    ] {
+        key.extend_from_slice(part);
+        key.push(0);
+    }
+    key
+}
+
+/// Drop every memoized client-match verdict. Call after any engine
+/// phase that may have moved the base checkout's branch or HEAD
+/// (pull, staged clone into place, generation restore) and after
+/// arbitrary user code (hooks) or git passthrough. Over-invalidation
+/// only costs a re-probe; a missed invalidation would trust a
+/// replaced checkout.
+pub(crate) fn invalidate_client_match_cache() {
+    if let Ok(mut cache) = client_match_cache().lock() {
+        cache.clear();
+    }
+}
+
 fn client_matches(record: &crate::init_client_record::TransactionRecord, home: &Path) -> bool {
+    // Match the uncached path under cancellation: the supervised
+    // probes observe the latched signal and fail, which reads as a
+    // mismatch. Serving a stale TRUE here would let teardown
+    // proceed as if uninterrupted.
+    if crate::cancellation::check().is_err() {
+        return client_matches_uncached(record, home);
+    }
+    let key = client_match_key(record, home);
+    if let Ok(cache) = client_match_cache().lock() {
+        if cache.contains_key(&key) {
+            return true;
+        }
+    }
+    let matched = client_matches_uncached(record, home);
+    if matched {
+        if let Ok(mut cache) = client_match_cache().lock() {
+            cache.insert(key, ());
+        }
+    }
+    matched
+}
+
+fn client_matches_uncached(
+    record: &crate::init_client_record::TransactionRecord,
+    home: &Path,
+) -> bool {
     let git_dir = Path::new(&record.git_dir);
     let path_identity =
         |path: &Path| crate::temp::path_identity(path).map(crate::temp::identity_string);
@@ -358,4 +428,143 @@ fn git_dir_output(runtime: &crate::app::Runtime, git_dir: &Path, args: &[&str]) 
     )
     .ok()?;
     output.status.success().then_some(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt as _};
+
+    const CANNED_URL: &str = "https://example.invalid/dotfiles.git";
+    const CANNED_HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    struct IdentityGit {
+        _scope: dot_test_support::TempDir,
+        home: PathBuf,
+        log: PathBuf,
+        shim: PathBuf,
+    }
+
+    impl IdentityGit {
+        fn answering(tag: &str, branch: &str, worktree: &str) -> Self {
+            let scope = dot_test_support::TempDir::new_exec(&format!("identity-git-{tag}"))
+                .expect("identity git scope");
+            let home = scope.path().join("home");
+            let git_dir = home.join(".dotfiles");
+            std::fs::create_dir_all(&git_dir).expect("fixture git dir");
+            let log = scope.path().join("invocations.log");
+            let shim = scope.path().join("git");
+            std::fs::write(
+                &shim,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\ncase \"$3\" in\n  config)\n    case \"$4\" in\n      --get-all) printf '%s\\n' \"{CANNED_URL}\";;\n      --bool) printf 'false\\n';;\n      *) printf '%s\\n' \"{worktree}\";;\n    esac;;\n  symbolic-ref) printf '%s\\n' \"{branch}\";;\n  rev-parse) printf '%s\\n' \"{CANNED_HEAD}\";;\nesac\n",
+                    log = log.display(),
+                ),
+            )
+            .expect("identity git shim");
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("identity git mode");
+            Self {
+                _scope: scope,
+                home,
+                log,
+                shim,
+            }
+        }
+
+        fn matching(tag: &str) -> Self {
+            // The identity probes export the fixture home as `HOME`,
+            // so the shim answers the worktree query from the runtime
+            // environment instead of a baked-in path.
+            Self::answering(tag, "main", "$HOME")
+        }
+
+        fn invocations(&self) -> usize {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        }
+
+        fn record(&self, branch: &str) -> crate::init_client_record::TransactionRecord {
+            let git_dir = self.home.join(".dotfiles");
+            let meta = std::fs::metadata(&git_dir).expect("git dir stat");
+            let identity = crate::init_client_identity::repo_identity(CANNED_URL)
+                .expect("canned URL identity");
+            crate::init_client_record::TransactionRecord {
+                phase: "complete".to_string(),
+                origin: CANNED_URL.to_string(),
+                identity,
+                branch: branch.to_string(),
+                commit: CANNED_HEAD.to_string(),
+                git_dir: git_dir.to_string_lossy().into_owned(),
+                worktree: self.home.to_string_lossy().into_owned(),
+                backup: "-".to_string(),
+                dot: "/nonexistent".to_string(),
+                dot_revision: CANNED_HEAD.to_string(),
+                nonce: "adopted".to_string(),
+                git_dev: meta.dev().to_string(),
+                git_ino: meta.ino().to_string(),
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_client_matches_probes_git_once() {
+        let _serial = TEST_SERIAL.lock();
+        let git = IdentityGit::matching("dedup");
+        let record = git.record("main");
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            assert!(client_matches(&record, &git.home));
+            assert!(client_matches(&record, &git.home));
+        });
+        assert_eq!(git.invocations(), 5);
+    }
+
+    #[test]
+    fn client_matches_keys_homes_separately() {
+        let _serial = TEST_SERIAL.lock();
+        let first = IdentityGit::matching("first");
+        let second = IdentityGit::matching("second");
+        let first_record = first.record("main");
+        let second_record = second.record("main");
+        crate::init_client_identity::with_host_git(first.shim.as_path(), || {
+            assert!(client_matches(&first_record, &first.home));
+            assert!(client_matches(&first_record, &first.home));
+        });
+        crate::init_client_identity::with_host_git(second.shim.as_path(), || {
+            assert!(client_matches(&second_record, &second.home));
+            assert!(client_matches(&second_record, &second.home));
+        });
+        assert_eq!(first.invocations(), 5);
+        assert_eq!(second.invocations(), 5);
+    }
+
+    #[test]
+    fn client_match_invalidation_reprobes() {
+        let _serial = TEST_SERIAL.lock();
+        let git = IdentityGit::matching("invalidate");
+        let record = git.record("main");
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            assert!(client_matches(&record, &git.home));
+            assert_eq!(git.invocations(), 5);
+            invalidate_client_match_cache();
+            assert!(client_matches(&record, &git.home));
+        });
+        assert_eq!(git.invocations(), 10);
+    }
+
+    #[test]
+    fn client_matches_mismatches_stay_uncached() {
+        let _serial = TEST_SERIAL.lock();
+        let git = IdentityGit::answering("mismatch", "other", "/elsewhere");
+        let record = git.record("main");
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            assert!(!client_matches(&record, &git.home));
+            assert!(!client_matches(&record, &git.home));
+        });
+        assert_eq!(git.invocations(), 4);
+    }
 }

@@ -108,6 +108,7 @@ impl Worker {
         // have replaced repository directories.
         crate::overlays::invalidate_worktree_cache();
         crate::startup::invalidate_revision_cache();
+        crate::repos_base::invalidate_client_match_cache();
         outcome
     }
 
@@ -317,6 +318,7 @@ impl Worker {
         // no longer trustworthy.
         crate::overlays::invalidate_worktree_cache();
         crate::startup::invalidate_revision_cache();
+        crate::repos_base::invalidate_client_match_cache();
         outcome
     }
 }
