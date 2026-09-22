@@ -75,15 +75,33 @@ extern "C" fn capture_entry_stdio() {
 )]
 static CAPTURE_ENTRY_STDIO: extern "C" fn() = capture_entry_stdio;
 
+// musl's static startup never executes `.preinit_array`, so without a
+// second capture a musl binary arrives with a zero mask and the live
+// probe below observes descriptors after Rust's pre-`main` stdio
+// sanitization reopened closed ones on `/dev/null`. `.init_array`
+// runs before `main` on musl too, so capture there as well; on glibc
+// and bionic the preinit entry already ran first and this is a no-op.
+#[used]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg_attr(
+    any(target_os = "linux", target_os = "android"),
+    unsafe(link_section = ".init_array")
+)]
+static CAPTURE_ENTRY_STDIO_LATE: extern "C" fn() = capture_entry_stdio_unless_captured;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+extern "C" fn capture_entry_stdio_unless_captured() {
+    if ENTRY_STDIO_MASK.load(std::sync::atomic::Ordering::Relaxed) & ENTRY_STDIO_INITIALIZED == 0 {
+        capture_entry_stdio();
+    }
+}
+
 /// Resolve the exec-boundary descriptor bitmap, probing live descriptors
-/// when no static capture ran. musl's static startup does not execute
-/// `.preinit_array`, so release binaries built for musl arrive with a zero
-/// mask; probing then observes the inherited descriptors exactly as the
-/// capture would have, except for descriptors the Rust runtime already
-/// reserved (its pre-`main` normalization reopens closed standard
-/// descriptors on `/dev/null`). A relay started from the probe therefore
-/// behaves identically whenever stdio was open at exec; only the exotic
-/// closed-at-exec edge reports the reserved sink instead of absence.
+/// when no static capture ran. Every native binary captures before
+/// `main` (`.preinit_array`, plus an `.init_array` fallback for musl's
+/// static startup, which never executes preinit), so the probe only
+/// serves in-process embedding, where neither initializer runs and the
+/// live descriptors are exactly what the embedder intends to share.
 fn resolve_entry_stdio_mask(stored: u8) -> u8 {
     if stored & ENTRY_STDIO_INITIALIZED != 0 {
         return stored;
@@ -102,9 +120,11 @@ fn resolve_entry_stdio_mask(stored: u8) -> u8 {
 /// uses this for informational commands that bypass the output relay, so a
 /// descriptor closed at exec fails identically on both paths.
 pub fn entry_stdio_open(descriptor: i32) -> bool {
-    // Take the initializer's address so the linker keeps its object
+    // Take the initializers' addresses so the linker keeps their objects
     // (see above).
     std::hint::black_box(&CAPTURE_ENTRY_STDIO);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    std::hint::black_box(&CAPTURE_ENTRY_STDIO_LATE);
     let mask = ENTRY_STDIO_MASK.load(std::sync::atomic::Ordering::Relaxed);
     if mask & ENTRY_STDIO_INITIALIZED == 0 {
         // No exec-boundary capture ran (in-process embedding): probe live.
@@ -2478,14 +2498,17 @@ impl ProcessOutputRelay {
     /// primary stdout/stderr relay. Stderr also has an independent dormant
     /// fallback so a blocked stdout cannot suppress the bounded timeout or
     /// cancellation diagnostic that explains the terminal status. When no
-    /// static capture ran (musl static binaries never execute
-    /// `.preinit_array`), live descriptors are probed instead of failing.
+    /// static capture ran (in-process embedding only; musl binaries capture
+    /// through the `.init_array` fallback), live descriptors are probed
+    /// instead of failing.
     pub fn start() -> std::io::Result<Self> {
         use std::os::fd::AsRawFd as _;
 
-        // Take the initializer's address so the linker keeps its object
+        // Take the initializers' addresses so the linker keeps their objects
         // in every binary that starts a relay (see above).
         std::hint::black_box(&CAPTURE_ENTRY_STDIO);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        std::hint::black_box(&CAPTURE_ENTRY_STDIO_LATE);
         let stored_mask = ENTRY_STDIO_MASK.load(std::sync::atomic::Ordering::Relaxed);
         let entry_mask = resolve_entry_stdio_mask(stored_mask);
         let stdout = snapshot_process_output(
@@ -12011,5 +12034,24 @@ int kill(pid_t pid, int sig) {
                 "descriptor {descriptor} must match the live probe"
             );
         }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
+    fn entry_stdio_capture_runs_before_test_main() {
+        // The test binary is a native binary, so one of the section
+        // initializers must have captured the exec-boundary bitmap before
+        // `main` (and before Rust's stdio sanitization). If the linker
+        // drops the initializers, musl falls back to a post-sanitization
+        // live probe that mistakes closed descriptors for open ones.
+        std::hint::black_box(&CAPTURE_ENTRY_STDIO);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        std::hint::black_box(&CAPTURE_ENTRY_STDIO_LATE);
+        let mask = ENTRY_STDIO_MASK.load(std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(
+            mask & ENTRY_STDIO_INITIALIZED,
+            0,
+            "exec-boundary stdio capture must run before main"
+        );
     }
 }
