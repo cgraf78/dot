@@ -325,6 +325,7 @@ pub fn clone_overlay_staged(
     // probes memoized it as missing, so drop those answers before
     // later phases re-probe.
     crate::overlays::invalidate_worktree_path(Path::new(inputs.path));
+    crate::startup::invalidate_revision_cache();
     let mut cleanup = Registry::new();
     cleanup.remove_path(&stage_root).is_ok()
 }
