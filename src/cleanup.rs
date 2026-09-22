@@ -80,12 +80,15 @@ static CAPTURE_ENTRY_STDIO: extern "C" fn() = capture_entry_stdio;
 // probe below observes descriptors after Rust's pre-`main` stdio
 // sanitization reopened closed ones on `/dev/null`. `.init_array`
 // runs before `main` on musl too, so capture there as well; on glibc
-// and bionic the preinit entry already ran first and this is a no-op.
+// the preinit entry already ran first and this is a no-op. Priority
+// `00000` sorts the entry ahead of every plain `.init_array`
+// constructor, so no current or future initializer can reuse a closed
+// descriptor before the capture observes it.
 #[used]
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[cfg_attr(
     any(target_os = "linux", target_os = "android"),
-    unsafe(link_section = ".init_array")
+    unsafe(link_section = ".init_array.00000")
 )]
 static CAPTURE_ENTRY_STDIO_LATE: extern "C" fn() = capture_entry_stdio_unless_captured;
 
@@ -97,11 +100,13 @@ extern "C" fn capture_entry_stdio_unless_captured() {
 }
 
 /// Resolve the exec-boundary descriptor bitmap, probing live descriptors
-/// when no static capture ran. Every native binary captures before
-/// `main` (`.preinit_array`, plus an `.init_array` fallback for musl's
-/// static startup, which never executes preinit), so the probe only
-/// serves in-process embedding, where neither initializer runs and the
-/// live descriptors are exactly what the embedder intends to share.
+/// when no static capture ran. Native Linux, Android, and macOS binaries
+/// capture before `main` (`.preinit_array`, plus an `.init_array.00000`
+/// fallback for libc startups like musl's that never execute preinit),
+/// so the probe remains only for hosts with no initializer: Windows,
+/// which has none, and embedding links whose garbage collection drops
+/// the init sections. The probe then observes the descriptors the host
+/// shares, which is the closest available answer outside a binary.
 fn resolve_entry_stdio_mask(stored: u8) -> u8 {
     if stored & ENTRY_STDIO_INITIALIZED != 0 {
         return stored;
@@ -127,7 +132,8 @@ pub fn entry_stdio_open(descriptor: i32) -> bool {
     std::hint::black_box(&CAPTURE_ENTRY_STDIO_LATE);
     let mask = ENTRY_STDIO_MASK.load(std::sync::atomic::Ordering::Relaxed);
     if mask & ENTRY_STDIO_INITIALIZED == 0 {
-        // No exec-boundary capture ran (in-process embedding): probe live.
+        // No exec-boundary capture ran (Windows has no initializer;
+        // embedding links may drop the init sections): probe live.
         return descriptor >= 0 && unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0;
     }
     (0..=2).contains(&descriptor) && mask & (1 << descriptor) != 0
@@ -2498,9 +2504,9 @@ impl ProcessOutputRelay {
     /// primary stdout/stderr relay. Stderr also has an independent dormant
     /// fallback so a blocked stdout cannot suppress the bounded timeout or
     /// cancellation diagnostic that explains the terminal status. When no
-    /// static capture ran (in-process embedding only; musl binaries capture
-    /// through the `.init_array` fallback), live descriptors are probed
-    /// instead of failing.
+    /// static capture ran (Windows and embedding links without the init
+    /// sections; musl binaries capture through the `.init_array.00000`
+    /// fallback), live descriptors are probed instead of failing.
     pub fn start() -> std::io::Result<Self> {
         use std::os::fd::AsRawFd as _;
 
@@ -12041,9 +12047,14 @@ int kill(pid_t pid, int sig) {
     fn entry_stdio_capture_runs_before_test_main() {
         // The test binary is a native binary, so one of the section
         // initializers must have captured the exec-boundary bitmap before
-        // `main` (and before Rust's stdio sanitization). If the linker
-        // drops the initializers, musl falls back to a post-sanitization
-        // live probe that mistakes closed descriptors for open ones.
+        // `main` (and before Rust's stdio sanitization). This guards the
+        // linkage: it proves the capture objects survive into the binary
+        // and run. It cannot prove which section each entry landed in
+        // from in-process (on glibc the preinit entry sets the flag
+        // first); musl placement is proven by the closed-stdio CLI tests
+        // on the Alpine leg instead. If the linker drops the
+        // initializers, musl falls back to a post-sanitization live
+        // probe that mistakes closed descriptors for open ones.
         std::hint::black_box(&CAPTURE_ENTRY_STDIO);
         #[cfg(any(target_os = "linux", target_os = "android"))]
         std::hint::black_box(&CAPTURE_ENTRY_STDIO_LATE);
