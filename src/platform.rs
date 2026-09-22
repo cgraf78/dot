@@ -57,9 +57,30 @@ pub fn platform_name(uname_s: &str, wsl: bool) -> String {
     }
 }
 
+/// Memoized platform/hostname detection. `dot update` detects
+/// each ~4x (CLI dispatch plus engine phases), and neither answer
+/// can change mid-process: the kernel, hostname, and WSL markers
+/// are immutable for the run's lifetime (production code never
+/// mutates the environment). Only successful detections memoize;
+/// a failed `uname`/`hostname` re-probes so a transient spawn
+/// failure cannot pin `Unavailable`.
+static PLATFORM_MEMO: crate::memo::Memo<String> = crate::memo::Memo::new();
+static HOST_MEMO: crate::memo::Memo<String> = crate::memo::Memo::new();
+
 /// Detect the live platform: WSL markers from the environment plus
 /// `/proc/sys/kernel/osrelease` when readable, then `uname -s`.
 pub fn detect_platform() -> Result<String, Error> {
+    detect_inner(&PLATFORM_MEMO, detect_platform_uncached).ok_or(Error::Unavailable)
+}
+
+fn detect_inner(
+    memo: &crate::memo::Memo<String>,
+    probe: impl FnOnce() -> Result<String, Error>,
+) -> Option<String> {
+    memo.get_or_probe(|| probe().ok())
+}
+
+fn detect_platform_uncached() -> Result<String, Error> {
     let distro = std::env::var("WSL_DISTRO_NAME").unwrap_or_default();
     let interop = std::env::var("WSL_INTEROP").unwrap_or_default();
     let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok();
@@ -91,6 +112,10 @@ pub fn host_name(raw: &str) -> String {
 /// Detect the live short hostname: `hostname -s`, falling back to
 /// plain `hostname` exactly like the shell's `||` chain.
 pub fn detect_host() -> Result<String, Error> {
+    detect_inner(&HOST_MEMO, detect_host_uncached).ok_or(Error::Unavailable)
+}
+
+fn detect_host_uncached() -> Result<String, Error> {
     for args in [&["-s"][..], &[][..]] {
         // No let-chains: the crate MSRV is 1.85 and let-chains need
         // 1.88. Same for the other two sites like this one.
@@ -587,5 +612,27 @@ mod tests {
             cleaned.exists(),
             "interactive sudo cleanup marker is absent"
         );
+    }
+
+    #[test]
+    fn detection_memoizes_successes_and_reprobes_failures() {
+        use std::cell::Cell;
+        let probes = Cell::new(0);
+        let memo = crate::memo::Memo::new();
+        let probe = || {
+            probes.set(probes.get() + 1);
+            Ok("linux".to_string())
+        };
+        assert_eq!(detect_inner(&memo, probe), Some("linux".to_string()));
+        let probe = || {
+            probes.set(probes.get() + 1);
+            Ok("changed".to_string())
+        };
+        assert_eq!(detect_inner(&memo, probe), Some("linux".to_string()));
+        assert_eq!(probes.get(), 1);
+        let failing = crate::memo::Memo::new();
+        for _ in 0..2 {
+            assert_eq!(detect_inner(&failing, || Err(Error::Unavailable)), None);
+        }
     }
 }

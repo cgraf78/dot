@@ -90,13 +90,19 @@ pub fn run_git_streaming(prefix: &[OsString], args: &[&str]) -> i32 {
 /// `git -C path`. The shell's `*) -> return 2` arm is unreachable
 /// through the [`RepoKind`] enum, so it has no representation here.
 pub fn repo_git(base: &Base, kind: RepoKind, path: &str, args: &[&str]) -> i32 {
-    match kind {
+    let rc = match kind {
         RepoKind::Base => match base.git_prefix() {
             Some(prefix) => run_git_streaming(&prefix, args),
             None => 128,
         },
         RepoKind::Overlay => run_git_streaming(&[OsString::from("-C"), OsString::from(path)], args),
-    }
+    };
+    // `dot repos git` runs caller-chosen (possibly mutating) git
+    // across repositories, so memoized probe answers are no longer
+    // trustworthy. Engine-internal streaming fetch/pull cannot
+    // change worktree or origin answers and bypasses this boundary.
+    crate::overlays::invalidate_worktree_cache();
+    rc
 }
 
 /// `_repo_git_fetch`: run `fetch` plus `extra` for one repo record,

@@ -321,6 +321,10 @@ pub fn clone_overlay_staged(
         remove_stage(&stage_root);
         return false;
     }
+    // The move placed a fresh checkout at the destination: earlier
+    // probes memoized it as missing, so drop those answers before
+    // later phases re-probe.
+    crate::overlays::invalidate_worktree_path(Path::new(inputs.path));
     let mut cleanup = Registry::new();
     cleanup.remove_path(&stage_root).is_ok()
 }

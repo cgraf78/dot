@@ -323,6 +323,28 @@ fn staged_clone_installs_only_a_valid_clean_candidate() {
 }
 
 #[test]
+fn staged_clone_invalidates_memoized_worktree_probes() {
+    let fixture = CloneFixture::new("clone-invalidate", false);
+    let url = fixture.origin.to_string_lossy().into_owned();
+    // Pre-clone probes memoize the missing destination as "not a
+    // worktree" with a `<missing>` origin; the clone must drop both
+    // answers so later update phases observe the fresh checkout.
+    assert!(!dot::overlays::is_worktree(&fixture.dest));
+    assert_eq!(
+        dot::overlays::origin_matches(&fixture.dest, &url),
+        Err("<missing>".to_string())
+    );
+    let (ok, warnings) = fixture.clone(&url, mask());
+    assert!(ok);
+    assert!(warnings.is_empty());
+    assert!(dot::overlays::is_worktree(&fixture.dest));
+    assert_eq!(
+        dot::overlays::origin_matches(&fixture.dest, &url),
+        Ok(url.clone())
+    );
+}
+
+#[test]
 fn staged_clone_does_not_replace_an_existing_destination() {
     let fixture = CloneFixture::new("clone-existing", false);
     stage(&fixture.parent, "checkout", b"user data\n");

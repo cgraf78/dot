@@ -31,6 +31,7 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Overlay failure, mirroring the shell exit codes and stderr
 /// shapes. `Display` renders the exact stderr line the shell
@@ -467,23 +468,90 @@ pub fn parse_conf(
     )))
 }
 
+/// Memoized answers for the two read-only overlay repository
+/// probes below. A clean `dot update` re-probes each overlay ~8x
+/// (progress totals, pull, link prep, link, normalize, discovery),
+/// and each probe is a `git` subprocess plus supervisor round-trip;
+/// strace on the 3-overlay fixture counts 26 `rev-parse
+/// --show-toplevel` and 16 `config --get-all remote.origin.url`
+/// spawns per update. The answers only change when the engine
+/// itself mutates repository topology (overlay clone) or runs
+/// arbitrary user code (extension hooks), so both call sites
+/// invalidate explicitly and every other caller shares the run's
+/// first answer. Shared across the pull-fleet scope threads via
+/// the mutex; contention is negligible (tens of lookups per run).
+#[derive(Default)]
+struct WorktreeProbeCache {
+    worktree: HashMap<Vec<u8>, bool>,
+    origin: HashMap<(Vec<u8>, Vec<u8>), Result<String, String>>,
+}
+
+static WORKTREE_PROBE_CACHE: OnceLock<Mutex<WorktreeProbeCache>> = OnceLock::new();
+
+fn probe_cache() -> Option<std::sync::MutexGuard<'static, WorktreeProbeCache>> {
+    WORKTREE_PROBE_CACHE
+        .get_or_init(|| Mutex::new(WorktreeProbeCache::default()))
+        .lock()
+        .ok()
+}
+
+/// Drop every memoized probe answer. Extension hooks run arbitrary
+/// user code that may replace repository directories, so the hook
+/// boundary clears the cache after each execution.
+pub(crate) fn invalidate_worktree_cache() {
+    if let Some(mut cache) = probe_cache() {
+        cache.worktree.clear();
+        cache.origin.clear();
+    }
+}
+
+/// Drop memoized probe answers for one overlay path. The staged
+/// clone moves a fresh checkout into place, flipping both answers
+/// for its destination from negative to positive.
+pub(crate) fn invalidate_worktree_path(path: &Path) {
+    let key = path.as_os_str().as_bytes().to_vec();
+    if let Some(mut cache) = probe_cache() {
+        cache.worktree.remove(&key);
+        cache.origin.retain(|entry, _| entry.0 != key);
+    }
+}
+
 /// `_overlay_is_worktree`: a directory whose `.git` entry exists
 /// and whose physical directory is the `git` top level.
 pub fn is_worktree(path: &Path) -> bool {
-    if !path.is_dir() {
-        return false;
-    }
-    let dot_git = path.join(".git");
-    if !(dot_git.is_dir() || dot_git.is_file()) {
-        return false;
-    }
-    let checkout = match std::fs::canonicalize(path) {
-        Ok(canonical) => canonical,
-        Err(_) => return false,
-    };
     if crate::cancellation::check().is_err() {
         return false;
     }
+    let key = path.as_os_str().as_bytes().to_vec();
+    if let Some(answer) = probe_cache().and_then(|cache| cache.worktree.get(&key).copied()) {
+        return answer;
+    }
+    let answer = is_worktree_uncached(path);
+    // A failed spawn (missing `git`, fork pressure past the retry)
+    // reports false but must not pin it: the next probe may run
+    // with a working `git`. Only definitive subprocess answers
+    // enter the cache.
+    if let Some(determined) = answer {
+        if let Some(mut cache) = probe_cache() {
+            cache.worktree.insert(key, determined);
+        }
+        return determined;
+    }
+    false
+}
+
+fn is_worktree_uncached(path: &Path) -> Option<bool> {
+    if !path.is_dir() {
+        return Some(false);
+    }
+    let dot_git = path.join(".git");
+    if !(dot_git.is_dir() || dot_git.is_file()) {
+        return Some(false);
+    }
+    let checkout = match std::fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(_) => return Some(false),
+    };
     let output = retry_once(|| {
         let mut command = crate::init_client_identity::host_git_command();
         command
@@ -498,15 +566,19 @@ pub fn is_worktree(path: &Path) -> bool {
             crate::cleanup::LingerPolicy::Detach,
         )
     });
-    let top = match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-            .trim_end()
-            .to_string(),
-        _ => return false,
+    let output = match output {
+        Ok(output) => output,
+        Err(_) => return None,
     };
+    if !output.status.success() {
+        return Some(false);
+    }
+    let top = String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string();
     match std::fs::canonicalize(&top) {
-        Ok(canonical) => canonical == checkout,
-        Err(_) => false,
+        Ok(canonical) => Some(canonical == checkout),
+        Err(_) => Some(false),
     }
 }
 
@@ -554,6 +626,13 @@ pub fn origin_matches(path: &Path, expected: &str) -> Result<String, String> {
     if crate::cancellation::check().is_err() {
         return Err("<interrupted>".to_string());
     }
+    let key = (
+        path.as_os_str().as_bytes().to_vec(),
+        expected.as_bytes().to_vec(),
+    );
+    if let Some(answer) = probe_cache().and_then(|cache| cache.origin.get(&key).cloned()) {
+        return answer;
+    }
     let output = retry_once(|| {
         let mut command = crate::init_client_identity::host_git_command();
         command
@@ -569,20 +648,24 @@ pub fn origin_matches(path: &Path, expected: &str) -> Result<String, String> {
             crate::cleanup::LingerPolicy::Detach,
         )
     });
+    // A failed spawn reports `<missing>` (empty URL list) but must
+    // not pin it; see `is_worktree`.
+    let output = match output {
+        Ok(output) => output,
+        Err(_) => return Err("<missing>".to_string()),
+    };
     let mut urls: Vec<String> = Vec::new();
-    if let Ok(output) = output {
-        let text = String::from_utf8_lossy(&output.stdout);
-        // Like `mapfile -t`: empty input reads zero lines, while a
-        // blank line still reads one empty entry.
-        if !text.is_empty() {
-            let mut lines: Vec<&str> = text.split('\n').collect();
-            if text.ends_with('\n') {
-                lines.pop();
-            }
-            urls = lines.iter().map(|line| line.to_string()).collect();
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Like `mapfile -t`: empty input reads zero lines, while a
+    // blank line still reads one empty entry.
+    if !text.is_empty() {
+        let mut lines: Vec<&str> = text.split('\n').collect();
+        if text.ends_with('\n') {
+            lines.pop();
         }
+        urls = lines.iter().map(|line| line.to_string()).collect();
     }
-    match urls.len() {
+    let answer = match urls.len() {
         0 => Err("<missing>".to_string()),
         1 => {
             if urls[0] == expected {
@@ -592,7 +675,11 @@ pub fn origin_matches(path: &Path, expected: &str) -> Result<String, String> {
             }
         }
         _ => Err("<multiple origin URLs>".to_string()),
+    };
+    if let Some(mut cache) = probe_cache() {
+        cache.origin.insert(key, answer.clone());
     }
+    answer
 }
 
 /// `_overlay_checkout_matches` (from `repos/config.sh`, the small
@@ -1339,6 +1426,7 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn retry_once_passes_first_success_through() {
@@ -1375,5 +1463,143 @@ mod tests {
         });
         assert_eq!(result, Err("down"));
         assert_eq!(calls, 2);
+    }
+
+    /// A fake `git` that logs every invocation and emulates the two
+    /// read-only probes, so repeated probes assert exact spawn counts
+    /// without wall-clock gates.
+    struct CountingGit {
+        _scope: dot_test_support::TempDir,
+        log: std::path::PathBuf,
+        shim: std::path::PathBuf,
+    }
+
+    impl CountingGit {
+        fn new(tag: &str, url: &str) -> Self {
+            Self::with_body(
+                tag,
+                &format!(
+                    "if [ \"$3\" = rev-parse ]; then printf '%s\\n' \"$2\"; else printf '%s\\n' \"{url}\"; fi\n",
+                ),
+            )
+        }
+
+        fn failing(tag: &str) -> Self {
+            Self::with_body(tag, "exit 1\n")
+        }
+
+        fn with_body(tag: &str, body: &str) -> Self {
+            let scope = dot_test_support::TempDir::new_exec(&format!("overlay-counting-git-{tag}"))
+                .expect("counting git scope");
+            let log = scope.path().join("invocations.log");
+            let shim = scope.path().join("git");
+            // `$1` is `-C`, `$2` the directory, `$3` the subcommand.
+            // `--show-toplevel` echoes the directory back (the caller
+            // canonicalizes both sides, so any spelling round-trips);
+            // `config --get-all` reports one canned URL line. The
+            // failing variant exits nonzero with empty output, like
+            // git refusing a broken repository.
+            std::fs::write(
+                &shim,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n{body}",
+                    log = log.display(),
+                ),
+            )
+            .expect("counting git shim");
+            #[cfg(unix)]
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("counting git mode");
+            Self {
+                _scope: scope,
+                log,
+                shim,
+            }
+        }
+
+        fn invocations(&self) -> usize {
+            let text = std::fs::read_to_string(&self.log).unwrap_or_default();
+            if text.is_empty() {
+                0
+            } else {
+                text.lines().count()
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_worktree_probes_spawn_git_once_per_distinct_query() {
+        let git = CountingGit::new("dedup", "https://example/repo.git");
+        let repo = git._scope.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("fixture git dir");
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            assert!(is_worktree(&repo));
+            assert!(is_worktree(&repo));
+            assert!(origin_matches(&repo, "https://example/repo.git").is_ok());
+            assert!(origin_matches(&repo, "https://example/repo.git").is_ok());
+            assert!(origin_matches(&repo, "https://example/other.git").is_err());
+        });
+        assert_eq!(git.invocations(), 3);
+    }
+
+    #[test]
+    fn worktree_probe_cache_clears_per_path_and_globally() {
+        let git = CountingGit::new("invalidate", "https://example/repo.git");
+        let repo = git._scope.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("fixture git dir");
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            assert!(is_worktree(&repo));
+            assert!(is_worktree(&repo));
+            assert_eq!(git.invocations(), 1);
+            invalidate_worktree_path(&repo);
+            assert!(is_worktree(&repo));
+            assert_eq!(git.invocations(), 2);
+            assert!(origin_matches(&repo, "https://example/repo.git").is_ok());
+            assert!(origin_matches(&repo, "https://example/repo.git").is_ok());
+            assert_eq!(git.invocations(), 3);
+            invalidate_worktree_cache();
+            assert!(is_worktree(&repo));
+            assert!(origin_matches(&repo, "https://example/repo.git").is_ok());
+            assert_eq!(git.invocations(), 5);
+        });
+    }
+
+    #[test]
+    fn failed_git_spawns_do_not_poison_the_probe_cache() {
+        let git = CountingGit::new("no-poison", "https://example/repo.git");
+        let repo = git._scope.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("fixture git dir");
+        let missing = git._scope.path().join("no-such-git");
+        crate::init_client_identity::with_host_git(missing.as_path(), || {
+            assert!(!is_worktree(&repo));
+            assert!(origin_matches(&repo, "https://example/repo.git").is_err());
+        });
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            assert!(is_worktree(&repo));
+            assert!(origin_matches(&repo, "https://example/repo.git").is_ok());
+        });
+    }
+
+    #[test]
+    fn nonzero_git_exit_pins_the_negative_answer() {
+        // Git's exit status is the semantic authority: a nonzero
+        // refusal (broken repository) is definitive and memoizes,
+        // unlike a spawn failure, which re-probes.
+        let git = CountingGit::failing("nonzero");
+        let repo = git._scope.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("fixture git dir");
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            assert!(!is_worktree(&repo));
+            assert!(!is_worktree(&repo));
+            assert_eq!(
+                origin_matches(&repo, "https://example/repo.git"),
+                Err("<missing>".to_string())
+            );
+            assert_eq!(
+                origin_matches(&repo, "https://example/repo.git"),
+                Err("<missing>".to_string())
+            );
+        });
+        assert_eq!(git.invocations(), 2);
     }
 }
