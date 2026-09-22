@@ -62,6 +62,29 @@ fn live(pid: &str) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn proc_start_time(pid: &str) -> Option<String> {
+    let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.windows(2).rposition(|part| part == b") ")?;
+    let after = std::str::from_utf8(&stat[end + 2..]).ok()?;
+    // state, ppid, pgrp, session, tty_nr, tpgid, flags, minflt, cminflt,
+    // majflt, cmajflt, utime, stime, cutime, cstime, priority, nice,
+    // num_threads, itrealvalue, then starttime.
+    after.split_whitespace().nth(19).map(str::to_string)
+}
+
+/// Whether `/proc/<pid>` still refers to the captured process. A zombie
+/// counts as present (unreaped is the failure under test), while a changed
+/// start token proves PID reuse, which is disappearance of our descendant.
+#[cfg(target_os = "linux")]
+fn same_proc_entry(pid: &str, start: &Option<String>) -> bool {
+    match (proc_start_time(pid), start) {
+        (Some(now), Some(was)) => now == *was,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 fn signal(pid: u32, signal: i32) {
     // SAFETY: the fixture owns this positive child PID and uses valid signals.
     assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0);
@@ -286,11 +309,22 @@ fn native_teardown_reaps_orphaned_descendants() {
     let child = f.command(&[]).spawn().unwrap();
     poll(|| f.home.join("descendant").is_file());
     let pid = fs::read_to_string(f.home.join("descendant")).unwrap();
+    let start = proc_start_time(pid.trim());
     success(&finish(child));
-    assert!(
-        !std::path::Path::new("/proc").join(pid.trim()).exists(),
-        "descendant survived as a process or zombie"
-    );
+    // The orphan is init's child by the time teardown KILLs it, so only
+    // init can reap the zombie; teardown certifies death, not init's reap
+    // latency. Poll for /proc disappearance instead of asserting it
+    // immediately (loaded hosts flake). A missing entry or a reused PID
+    // both prove our descendant is gone; a lingering live process or a
+    // zombie still fails after the deadline.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while same_proc_entry(pid.trim(), &start) {
+        assert!(
+            std::time::Instant::now() < end,
+            "descendant survived as a process or zombie"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 #[test]
