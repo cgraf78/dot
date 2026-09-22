@@ -9921,30 +9921,87 @@ os._exit(0)
             return;
         }
 
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
         use std::os::unix::process::CommandExt as _;
         let scope = dot_test_support::TempDir::new("post-fork-session-launch").unwrap();
         let side_effect = scope.path().join("launched");
         let signals = Signals::install().unwrap();
+        // kill(2) only queues the signal: delivery to a parent thread is
+        // asynchronous, so the registrar can authorize before the latch
+        // lands and the child would exec past a barrier the test then
+        // asserts denied it (loaded hosts flake). The pre-exec child
+        // therefore waits for an explicit observed-ack before it may
+        // request authorization. The latch is sticky, so once the
+        // watcher observes the signal the registrar must see it too and
+        // observed-before-ready is deterministic.
+        let (ack_read, mut ack_write) = internal_stream_pair().unwrap();
+        ack_read.set_nonblocking(true).unwrap();
+        let watcher = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while received_signal().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = ack_write.write_all(&[u8::from(received_signal().is_some())]);
+        });
+        let ack_fd = ack_read.as_raw_fd();
         let mut command = Command::new(dot_test_support::bash());
         command
             .arg("-c")
             .arg(": >\"$1\"")
             .arg("launch")
             .arg(&side_effect);
-        // SAFETY: kill/getppid are async-signal-safe. The callback runs before
-        // the ownership callback, deterministically placing cancellation in
-        // the fork-to-authorization window under test.
+        // SAFETY: kill/getppid/read/close/nanosleep are
+        // async-signal-safe and touch only stack memory plus the
+        // inherited ack descriptor. This callback is registered before
+        // the supervisor installs its own, and std runs pre_exec
+        // callbacks in registration order, so the authorization
+        // handshake cannot proceed until the ack lands.
         unsafe {
-            command.pre_exec(|| {
-                if libc::kill(libc::getppid(), libc::SIGTERM) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
+            command.pre_exec(move || {
+                if libc::kill(libc::getppid(), libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut byte = [0u8; 1];
+                let mut waited_ms = 0u32;
+                loop {
+                    let count = libc::read(ack_fd, byte.as_mut_ptr().cast(), 1);
+                    if count == 1 {
+                        libc::close(ack_fd);
+                        if byte[0] == 1 {
+                            return Ok(());
+                        }
+                        return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
+                    }
+                    if count == 0 {
+                        libc::close(ack_fd);
+                        return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    if error.raw_os_error() != Some(libc::EAGAIN) {
+                        libc::close(ack_fd);
+                        return Err(error);
+                    }
+                    if waited_ms >= 30_000 {
+                        libc::close(ack_fd);
+                        return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                    }
+                    let nap = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 1_000_000,
+                    };
+                    libc::nanosleep(&nap, std::ptr::null_mut());
+                    waited_ms += 1;
                 }
             });
         }
 
         let session = spawn_owned_session(command).unwrap();
+        watcher.join().unwrap();
+        drop(ack_read);
 
         assert!(matches!(session, OwnedLaunch::Cancelled(libc::SIGTERM)));
         assert!(
