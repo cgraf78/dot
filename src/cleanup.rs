@@ -4558,6 +4558,47 @@ pub(crate) fn run_foreground_status(command: Command) -> i32 {
     ))
 }
 
+/// Run a cooperative foreground child like [`run_foreground_status`],
+/// but pipe its stdout and forward every drained chunk to `out`
+/// instead of inheriting the descriptor.
+///
+/// A header written through the output relay races an inheriting
+/// child's direct descriptor writes: the relay child process may
+/// forward the header only after git already wrote its first line,
+/// printing body-before-header under load. Forwarding keeps a
+/// single writer (the relay) so relayed output stays ordered.
+/// Stderr stays inherited so progress keeps streaming; stdin is the
+/// caller's. Forwarding is unbounded by design (the relay owns
+/// backpressure), so a whole-repo diff never trips a capture limit.
+pub(crate) fn run_foreground_forward_stdout(
+    mut command: Command,
+    out: &mut dyn std::io::Write,
+) -> i32 {
+    let (mut reader, writer) = match SessionCapture::new() {
+        Ok(pair) => pair,
+        Err(_) => return 127,
+    };
+    command.stdout(writer);
+    let mut scratch = Vec::new();
+    session_end_status(supervise_child_with_policy(
+        command,
+        None,
+        |final_pass| {
+            let budget = if final_pass {
+                COMMAND_CAPTURE_FINAL_BYTES
+            } else {
+                COMMAND_CAPTURE_TICK_BYTES
+            };
+            let mut remaining = usize::MAX;
+            let _overflow = reader.drain(&mut scratch, &mut remaining, budget, false)?;
+            out.write_all(&scratch)?;
+            scratch.clear();
+            Ok(())
+        },
+        ForegroundLeasePolicy::TrustLeader,
+    ))
+}
+
 fn session_end_status(end: std::io::Result<SessionEnd>) -> i32 {
     match end {
         Ok(SessionEnd::Exited(status)) => status.code().unwrap_or_else(|| {

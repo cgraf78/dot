@@ -111,6 +111,7 @@ fn repos_git_stream_child() {
                 .unwrap()
                 .parse()
                 .unwrap(),
+            &mut Vec::new(),
         ),
         "stream" => dot::repos_git::run_git_streaming(&["-C".into(), path.into()], &args),
         "clear-probe" => {
@@ -479,6 +480,36 @@ fn repo_git_dispatches_base_and_overlay_with_status_codes() {
         ),
         128
     );
+}
+#[test]
+fn repo_git_forwarded_delivers_stdout_through_the_writer() {
+    let o = repo("git-forwarded-overlay");
+    std::fs::write(o.path().join("new.txt"), b"untracked\n").unwrap();
+    let mut out = Vec::new();
+    assert_eq!(
+        dot::repos_git::repo_git_forwarded(
+            &base(Topology::Ordinary, o.path()),
+            RepoKind::Overlay,
+            &o.path().to_string_lossy(),
+            &["status", "--short"],
+            &mut out,
+        ),
+        0
+    );
+    assert_eq!(out, b"?? new.txt\n");
+    // A failing command forwards nothing: diagnostics stay on inherited stderr.
+    out.clear();
+    assert_eq!(
+        dot::repos_git::repo_git_forwarded(
+            &base(Topology::Ordinary, o.path()),
+            RepoKind::Overlay,
+            &o.path().to_string_lossy(),
+            &["rev-parse", "--verify", "missing"],
+            &mut out,
+        ),
+        128
+    );
+    assert!(out.is_empty());
 }
 #[test]
 fn each_existing_short_circuits_exact_status() {
