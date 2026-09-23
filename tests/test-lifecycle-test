@@ -1042,6 +1042,11 @@ with tempfile.TemporaryDirectory() as temporary:
     while not ready.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert ready.exists(), healthy.poll()
+    # `write_text` creates the file before its content lands, so an
+    # existence poll can observe an empty pid file; wait for content.
+    deadline = time.monotonic() + 5
+    while not ready.read_text(encoding="utf-8").strip() and time.monotonic() < deadline:
+        time.sleep(0.01)
     os.kill(healthy.pid, signal.SIGTERM)
     _stdout, healthy_stderr = healthy.communicate(timeout=5)
     assert healthy.returncode == 125, healthy.returncode
@@ -1077,6 +1082,11 @@ for aliased in (False, True):
         while not ready.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert ready.exists(), (aliased, child.poll())
+        # `write_text` creates the file before its content lands, so an
+        # existence poll can observe an empty pid file; wait for content.
+        deadline = time.monotonic() + 5
+        while not ready.read_text(encoding="utf-8").strip() and time.monotonic() < deadline:
+            time.sleep(0.01)
         os.kill(child.pid, signal.SIGTERM)
         blocked = False
         try:

@@ -15,6 +15,9 @@ jobs:
   rust:
     uses: cgraf78/actions/.github/workflows/rust-ci.yml@c05c06f1c0fc443b15255b823e0b11d7b190bda3
     with:
+      # Full matrix on every PR: scheduled-only legs let main break
+      # silently between daily runs and cannot validate their fixes.
+      matrix-set: full
       # rust-version is a compatibility promise, so exercise it inside the
       # shared required gate instead of leaving it aspirational. The shared
       # defaults own Clippy's locked all-target/all-feature scope, rustdoc

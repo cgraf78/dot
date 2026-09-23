@@ -7,12 +7,15 @@
 //! of reimplementing those command shapes.
 //!
 //! Engine boundaries: iteration records cross from shell globals as
-//! explicit parameters; streaming commands inherit stdout/stderr so
-//! push/diff/status/fetch output reaches the terminal (unlike
+//! explicit parameters; header-prefixed commands forward piped git
+//! stdout through the caller's writer so relayed headers stay
+//! ordered ahead of it, while stderr stays inherited so progress
+//! reaches the terminal (unlike
 //! [`repos_base::run_git`](crate::repos_base::run_git), which pipes
 //! stdout and nulls stderr for inspection commands).
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::process::Stdio;
@@ -84,6 +87,50 @@ pub fn run_git_streaming(prefix: &[OsString], args: &[&str]) -> i32 {
     crate::cleanup::run_foreground_status(cmd)
 }
 
+/// Run `git` with `prefix` plus `args`, forwarding piped stdout to
+/// `out` while stdin/stderr stay inherited.
+///
+/// Like [`run_git_streaming`], except stdout travels through the
+/// caller's writer instead of the inherited descriptor: a header
+/// printed through the output relay would otherwise race git's
+/// direct descriptor writes (body-before-header under load).
+/// Progress keeps streaming on inherited stderr. Returns the exit
+/// code; a spawn failure returns 127.
+pub fn run_git_forwarded(prefix: &[OsString], args: &[&str], out: &mut dyn Write) -> i32 {
+    let mut cmd = crate::init_client_identity::host_git_command();
+    cmd.args(prefix)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    crate::cleanup::run_foreground_forward_stdout(cmd, out)
+}
+
+/// [`repo_git`] with stdout forwarded through `out` (see
+/// [`run_git_forwarded`]) so a relayed header can never lose its
+/// race with git's first output line. Invalidates the same
+/// worktree/revision caches: caller-visible forwarded git can
+/// mutate just like the inherited form.
+pub fn repo_git_forwarded(
+    base: &Base,
+    kind: RepoKind,
+    path: &str,
+    args: &[&str],
+    out: &mut dyn Write,
+) -> i32 {
+    let rc = match kind {
+        RepoKind::Base => match base.git_prefix() {
+            Some(prefix) => run_git_forwarded(&prefix, args, out),
+            None => 128,
+        },
+        RepoKind::Overlay => {
+            run_git_forwarded(&[OsString::from("-C"), OsString::from(path)], args, out)
+        }
+    };
+    crate::overlays::invalidate_worktree_cache();
+    crate::startup::invalidate_revision_cache();
+    rc
+}
+
 /// `_repo_git`: execute `git` for one repo record. A base record
 /// dispatches through [`Base::git_prefix`] (a missing topology has
 /// no prefix, like the shell's exit 128); an overlay record runs
@@ -109,6 +156,8 @@ pub fn repo_git(base: &Base, kind: RepoKind, path: &str, args: &[&str]) -> i32 {
 /// `_repo_git_fetch`: run `fetch` plus `extra` for one repo record,
 /// then close the `FETCH_HEAD` side effect Git leaves behind (Git
 /// does not apply `core.sharedRepository` to that scratch file).
+/// Fetch stdout forwards through `out` (see [`repo_git_forwarded`])
+/// so a relayed header stays ordered ahead of it.
 ///
 /// The fetch exit code is recorded and returned last: every later
 /// failure (unresolvable git dir, a rejected `FETCH_HEAD`, a failed
@@ -128,11 +177,18 @@ pub fn repo_git(base: &Base, kind: RepoKind, path: &str, args: &[&str]) -> i32 {
 /// `0600` under the caller's `mask` (the shell reads its own umask;
 /// callers pass [`read_umask`](crate::temp::read_umask)); a clamp
 /// failure returns 1.
-pub fn repo_git_fetch(base: &Base, kind: RepoKind, path: &str, extra: &[&str], mask: u32) -> i32 {
+pub fn repo_git_fetch(
+    base: &Base,
+    kind: RepoKind,
+    path: &str,
+    extra: &[&str],
+    mask: u32,
+    out: &mut dyn Write,
+) -> i32 {
     let mut fetch: Vec<&str> = Vec::with_capacity(extra.len() + 1);
     fetch.push("fetch");
     fetch.extend_from_slice(extra);
-    let rc = repo_git(base, kind, path, &fetch);
+    let rc = repo_git_forwarded(base, kind, path, &fetch, out);
     if crate::cleanup::received_signal().is_some() {
         return rc;
     }

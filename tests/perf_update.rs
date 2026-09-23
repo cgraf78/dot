@@ -1369,6 +1369,18 @@ fn parse_linux_process_identity(pid: u32, stat: &[u8]) -> Result<LinuxProcessIde
 }
 
 #[cfg(target_os = "linux")]
+impl LinuxProcessIdentity {
+    /// Whether two records describe the same process instance. Parent,
+    /// session, and start time never change for an instance, while `live`
+    /// flips the moment it exits: a zombie is still the same pidfd-bound
+    /// instance, so identity comparisons must exclude `live` or a leader
+    /// that exits between two reads misreports as vanished.
+    fn same_instance(&self, other: &LinuxProcessIdentity) -> bool {
+        self.parent == other.parent && self.session == other.session && self.start == other.start
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn open_process_member(
     pid: u32,
     expected: &LinuxProcessIdentity,
@@ -1386,8 +1398,9 @@ fn open_process_member(
     }
     // SAFETY: pidfd_open returned a new owned descriptor.
     let pidfd = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
-    if linux_process_identity(pid)?.as_ref() != Some(expected) {
-        return Ok(None);
+    match linux_process_identity(pid)? {
+        Some(identity) if identity.same_instance(expected) => {}
+        _ => return Ok(None),
     }
     Ok(Some(SessionMember {
         key: ProcessKey {
@@ -4988,6 +5001,29 @@ fn linux_process_identity_parser_is_strict_and_records_start_time() {
     assert!(!process_vanished(&std::io::Error::from_raw_os_error(
         libc::EACCES
     )));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn process_identity_ignores_liveness_when_matching_instances() {
+    let live = LinuxProcessIdentity {
+        parent: 1,
+        session: 44,
+        start: 777,
+        live: true,
+    };
+    let zombie = LinuxProcessIdentity {
+        live: false,
+        ..live
+    };
+    // A leader that exits between two identity reads is still the same
+    // pidfd-bound instance; only a reused PID (new start time) differs.
+    assert!(live.same_instance(&zombie));
+    assert!(zombie.same_instance(&live));
+    let reused = LinuxProcessIdentity { start: 778, ..live };
+    assert!(!live.same_instance(&reused));
+    let reparented = LinuxProcessIdentity { parent: 2, ..live };
+    assert!(!live.same_instance(&reparented));
 }
 
 #[test]

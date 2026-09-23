@@ -73,6 +73,53 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+# Start COMMAND with SIGNAL at its default disposition, then exec so the
+# backgrounded caller's $! stays the driver PID. Without job control a
+# backgrounded child forces SIGINT/SIGQUIT to ignored, which the driver
+# could neither trap nor reset, so call sites enable monitor mode
+# around the spawn: the child then inherits the trap (reset to default
+# across exec) instead of ignored. GNU env additionally resets through
+# --default-signal, which busybox env lacks, so probe once and exec
+# directly there; the inherited default is what the driver needs.
+# Call only backgrounded, with monitor mode set: a foreground call
+# would replace this shell.
+with_default_signal() {
+  local signal=$1
+  shift
+  if [[ ${DOT_ENV_HAS_DEFAULT_SIGNAL:-auto} == auto ]]; then
+    if /usr/bin/env --default-signal="$signal" true 2>/dev/null; then
+      DOT_ENV_HAS_DEFAULT_SIGNAL=true
+    else
+      DOT_ENV_HAS_DEFAULT_SIGNAL=false
+    fi
+  fi
+  if $DOT_ENV_HAS_DEFAULT_SIGNAL; then
+    exec /usr/bin/env --default-signal="$signal" "$@"
+  else
+    exec "$@"
+  fi
+}
+
+# Canonicalize PATH, allowing missing trailing components like GNU
+# `realpath -m`. busybox realpath rejects `-m`/`--` (it treats flags
+# as paths), so probe once and use python3 (present on every CI leg),
+# whose `os.path.realpath` matches `-m` semantics exactly, where GNU
+# flags are unavailable. For existing paths this equals `realpath -e`.
+canonicalize_relaxed() {
+  if [[ ${DOT_REALPATH_HAS_MISSING_OK:-auto} == auto ]]; then
+    if /usr/bin/realpath -m -- / >/dev/null 2>&1; then
+      DOT_REALPATH_HAS_MISSING_OK=true
+    else
+      DOT_REALPATH_HAS_MISSING_OK=false
+    fi
+  fi
+  if $DOT_REALPATH_HAS_MISSING_OK; then
+    /usr/bin/realpath -m -- "$1"
+  else
+    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+  fi
+}
+
 release_files=(
   package-release.sh
   release-lib.sh
@@ -534,8 +581,11 @@ while [[ ! -e $2 ]]; do
 done
 HOLDER
     chmod +x "$close_holder"
+    # Monitor mode keeps SIGINT/SIGQUIT trappable in the backgrounded
+    # driver (without it the child forces both to ignored).
+    set -m
     # shellcheck disable=SC2016 # Positional parameters expand in the child Bash.
-    /usr/bin/env --default-signal="$close_signal" /bin/bash -c '
+    with_default_signal "$close_signal" /bin/bash -c '
     set -euo pipefail
     . "$1"
     perf_resolve_artifact_tools
@@ -548,6 +598,7 @@ HOLDER
     while :; do /bin/sleep 0.05; done
   ' _ "$DOT_TEST_ROOT/scripts/benchmark-port.sh" "$close_fixture" \
       "$close_fixture/ready" "$close_signal" "$close_status" &
+    set +m
     close_driver_pid=$!
     for _ in {1..500}; do
       [[ -e $close_fixture/ready ]] && break
@@ -740,8 +791,8 @@ HOLDER
     printf 'parent-completion\n' >"$artifact_boundary/completion.tsv"
     printf 'parent-driver\n' >"$artifact_boundary/driver.tsv"
     case $unsafe_artifact_config in
-      /*) unsafe_artifact=$(/usr/bin/realpath -m -- "$unsafe_artifact_config") ;;
-      *) unsafe_artifact=$(/usr/bin/realpath -m -- \
+      /*) unsafe_artifact=$(canonicalize_relaxed "$unsafe_artifact_config") ;;
+      *) unsafe_artifact=$(canonicalize_relaxed \
         "$artifact_source/$unsafe_artifact_config") ;;
     esac
     unsafe_lock_key=$(printf '%s\0' "$unsafe_artifact" | /usr/bin/sha256sum)
@@ -849,7 +900,7 @@ HOLDER
       printf '%s\t%s\n' "$file" "$(git hash-object --no-filters -- "$file")"
     done
   )
-  preflight_artifact_canonical=$(realpath -e -- "$preflight_driver_artifacts")
+  preflight_artifact_canonical=$(canonicalize_relaxed "$preflight_driver_artifacts")
   preflight_lock_key=$(printf '%s\0' "$preflight_artifact_canonical" | sha256sum)
   preflight_lock_key=${preflight_lock_key%%[[:space:]]*}
   preflight_lock=/tmp/.dot-performance-locks-$EUID/$preflight_lock_key.lock
@@ -1269,7 +1320,10 @@ EOF
 
     truncated=$evidence_validation_root/truncated
     cp -R "$valid" "$truncated"
-    truncate -s -1 "$truncated/samples.tsv"
+    # Drop the trailing byte with an absolute size: GNU accepts relative
+    # `-s -1`, but busybox truncate rejects negative sizes.
+    truncated_bytes=$(wc -c <"$truncated/samples.tsv")
+    truncate -s $((truncated_bytes - 1)) "$truncated/samples.tsv"
     if validate_fixture "$truncated"; then
       printf 'validator accepted a truncated sample file\n' >&2
       exit 1
@@ -1639,16 +1693,18 @@ fi
 
 noexec_probe=$DOT_TEST_TMP/noexec-probe
 mkdir -p "$noexec_probe/scratch"
-cat >"$noexec_probe/copy-without-execute" <<'EOF'
+# The probe must fail to run for every user: mode 0600 refuses
+# execution uniformly (the kernel requires at least one execute bit
+# even for root), which simulates a noexec mount on all platforms.
+cat >"$noexec_probe/chmod-without-execute" <<'EOF'
 #!/bin/sh
-/bin/cp "$@" || exit
 destination=
 for argument do
   destination=$argument
 done
 /bin/chmod 0600 "$destination"
 EOF
-chmod 0700 "$noexec_probe/copy-without-execute"
+chmod 0700 "$noexec_probe/chmod-without-execute"
 noexec_output=
 if noexec_output=$(bash -c '
   set -euo pipefail
@@ -1656,7 +1712,7 @@ if noexec_output=$(bash -c '
   declare -F perf_require_executable_scratch >/dev/null
   perf_resolve_tools
   perf_require_executable_scratch "$2/scratch"
-  PERF_CP=$2/copy-without-execute
+  PERF_CHMOD=$2/chmod-without-execute
   ! perf_require_executable_scratch "$2/scratch"
 ' _ "$DOT_TEST_ROOT/scripts/benchmark-port.sh" "$noexec_probe" 2>&1); then
   :
@@ -2616,7 +2672,7 @@ EOF
       ) &
       guarded_output_holder_pid=$!
       exec 9>"$directory/inherited-lock"
-      /usr/bin/flock --exclusive --nonblock 9 ||
+      /usr/bin/flock -x -n 9 ||
         fail "$label could not hold its inherited lock"
       # shellcheck disable=SC2016 # Positional parameters belong to the fixture shell.
       env DOT_PERF_TEST_STALL_GUARDIAN_PHASE="$stall_phase" \
@@ -2720,7 +2776,7 @@ EOF
       [[ -e $directory/downstream-eof ]] ||
         fail "$label did not close its downstream relay"
       exec 9>&-
-      /usr/bin/flock --exclusive --nonblock \
+      /usr/bin/flock -x -n \
         "$directory/inherited-lock" /bin/true ||
         fail "$label retained its inherited lock"
     }
@@ -2738,7 +2794,7 @@ EOF
 
       mkdir -p "$directory/relay-pids"
       exec 9>"$directory/inherited-lock"
-      /usr/bin/flock --exclusive --nonblock 9 ||
+      /usr/bin/flock -x -n 9 ||
         fail "$label could not hold its inherited lock"
       # shellcheck disable=SC2016 # Positional parameters belong to the fixture shell.
       env DOT_PERF_TEST_STALL_COORDINATOR_PHASE="$stall_phase" \
@@ -2832,7 +2888,7 @@ EOF
       guarded_stderr_relay_identity=
       assert_eq 70 "$supervisor_status" "$label released coordinator fails closed"
       exec 9>&-
-      /usr/bin/flock --exclusive --nonblock \
+      /usr/bin/flock -x -n \
         "$directory/inherited-lock" /bin/true ||
         fail "$label retained its inherited lock"
     }
@@ -2872,7 +2928,7 @@ EOF
       done
       [[ $filler_blocked == true ]] || fail 'arming failure did not fill its stderr sink'
       exec 9>"$directory/inherited-lock"
-      /usr/bin/flock --exclusive --nonblock 9 ||
+      /usr/bin/flock -x -n 9 ||
         fail 'arming failure could not hold its inherited lock'
       env DOT_PERF_TEST_GUARDIAN_EXIT_PHASE=arming \
         DOT_PERF_TEST_GUARDIAN_PID_FILE="$directory/guardian-pid" \
@@ -2912,7 +2968,7 @@ EOF
       [[ -e $directory/downstream-eof ]] ||
         fail 'arming failure did not close its downstream relay'
       exec 9>&-
-      /usr/bin/flock --exclusive --nonblock \
+      /usr/bin/flock -x -n \
         "$directory/inherited-lock" /bin/true ||
         fail 'arming failure retained its inherited lock'
     }
@@ -2952,7 +3008,7 @@ EOF
       done
       [[ $filler_blocked == true ]] || fail 'coordinator failure did not fill its stderr sink'
       exec 9>"$directory/inherited-lock"
-      /usr/bin/flock --exclusive --nonblock 9 ||
+      /usr/bin/flock -x -n 9 ||
         fail 'coordinator failure could not hold its inherited lock'
       # shellcheck disable=SC2016 # Positional parameters belong to the fixture shell.
       env DOT_PERF_TEST_STALL_GUARDIAN_PHASE=pre-arm \
@@ -3009,7 +3065,7 @@ EOF
       [[ -e $directory/downstream-eof ]] ||
         fail 'coordinator failure did not close its downstream relay'
       exec 9>&-
-      /usr/bin/flock --exclusive --nonblock \
+      /usr/bin/flock -x -n \
         "$directory/inherited-lock" /bin/true ||
         fail 'coordinator failure retained its inherited lock'
     }
@@ -3050,7 +3106,7 @@ EOF
       done
       [[ $filler_blocked == true ]] || fail 'coordinator death did not fill its stderr sink'
       exec 9>"$directory/inherited-lock"
-      /usr/bin/flock --exclusive --nonblock 9 ||
+      /usr/bin/flock -x -n 9 ||
         fail 'coordinator death could not hold its inherited lock'
       env DOT_PERF_TEST_GUARDIAN_PID_FILE="$directory/guardian-pid" \
         DOT_PERF_TEST_COORDINATOR_TARGET_PID_FILE="$directory/target-pid" \
@@ -3133,7 +3189,7 @@ EOF
       [[ -e $directory/downstream-eof ]] ||
         fail 'coordinator death did not close its downstream relay'
       exec 9>&-
-      /usr/bin/flock --exclusive --nonblock \
+      /usr/bin/flock -x -n \
         "$directory/inherited-lock" /bin/true ||
         fail 'coordinator death retained its inherited lock'
     }
@@ -3176,7 +3232,7 @@ EOF
       cat >"$directory/driver" <<EOF
 #!/bin/bash
 exec 9>"$directory/lifecycle-lock"
-/usr/bin/flock --exclusive --nonblock 9 || exit 91
+/usr/bin/flock -x -n 9 || exit 91
 "$cargo_tree/scratch/performance-command-supervisor-barrier-test" --parent-pid "\$\$" -- /bin/true & printf '%s\n' "\$!" >"$directory/supervisor-pid"
 wait
 EOF
@@ -3229,7 +3285,7 @@ EOF
       guarded_output_holder_pid=
       [[ -e $directory/downstream-eof ]] ||
         fail 'driver death did not close its downstream relay'
-      /usr/bin/flock --exclusive --nonblock \
+      /usr/bin/flock -x -n \
         "$directory/lifecycle-lock" /bin/true ||
         fail 'driver death retained its inherited lifecycle lock'
     }
@@ -3271,7 +3327,7 @@ EOF
       /bin/bash --noprofile --norc -c '
     trap "" HUP INT QUIT TERM
     exec 9>"$3"
-    /usr/bin/flock --exclusive --nonblock 9 || exit 91
+    /usr/bin/flock -x -n 9 || exit 91
     printf "%s\n" "$$" >"$1"
     /usr/bin/setsid /bin/bash --noprofile --norc -c '\''
       trap "" HUP INT QUIT TERM
@@ -3365,7 +3421,7 @@ EOF
       fail 'forced supervisor death left its quiet escaped descendant alive'
     process_is_live "$guarded_guardian_pid" "$guarded_guardian_identity" &&
       fail 'forced supervisor death left its cleanup guardian alive'
-    if ! /usr/bin/flock --exclusive --nonblock \
+    if ! /usr/bin/flock -x -n \
       "$cargo_relay_parent_death/lifecycle-lock" /bin/true; then
       fail 'forced supervisor death retained the target lifecycle lock'
     fi
@@ -3402,7 +3458,7 @@ EOF
       /bin/bash --noprofile --norc -c '
     trap "" HUP INT QUIT TERM
     exec 9>"$3"
-    /usr/bin/flock --exclusive --nonblock 9 || exit 91
+    /usr/bin/flock -x -n 9 || exit 91
     printf "%s\n" "$$" >"$1"
     /usr/bin/setsid /bin/bash --noprofile --norc -c '\''
       trap "" HUP INT QUIT TERM
@@ -3496,7 +3552,7 @@ EOF
       fail 'guardian crash left its stdout relay alive'
     process_is_live "$guarded_stderr_relay_pid" "$guarded_stderr_relay_identity" &&
       fail 'guardian crash left its stderr relay alive'
-    if ! /usr/bin/flock --exclusive --nonblock \
+    if ! /usr/bin/flock -x -n \
       "$cargo_guardian_crash/lifecycle-lock" /bin/true; then
       fail 'guardian crash retained the target lifecycle lock'
     fi
@@ -4009,8 +4065,11 @@ while [[ ! -s '$cargo_graceful/escaped-pid' ]]; do /bin/sleep 0.01; done
 while :; do /bin/sleep 1; done
 EOF
       chmod 0700 "$cargo_graceful/stuck-cargo"
+      # Monitor mode keeps SIGINT/SIGQUIT trappable in the backgrounded
+      # driver (without it the child forces both to ignored).
+      set -m
       # shellcheck disable=SC2016 # Positional parameters expand in the child Bash.
-      /usr/bin/env --default-signal="$graceful_signal" /bin/bash -c '
+      with_default_signal "$graceful_signal" /bin/bash -c '
     set -euo pipefail
     . "$1"
     perf_resolve_artifact_tools
@@ -4039,6 +4098,7 @@ EOF
   ' _ "$DOT_TEST_ROOT/scripts/benchmark-port.sh" "$cargo_graceful" \
         "$cargo_tree/scratch/performance-command-supervisor" "$graceful_signal" \
         "$graceful_status" &
+      set +m
       graceful_driver_pid=$!
       for _ in {1..500}; do
         [[ -s $cargo_graceful/leader-pid &&
