@@ -4126,6 +4126,13 @@ impl NestedControlWorker {
                             ) && !links.contains_key(&registration.boundary)
                                 && links.len() < MAX_ACTIVE_NESTED_SESSIONS;
                             if !valid {
+                                eprintln!(
+                                    "DIAG control-nuke: arm=invalid-registration pid={} boundary={} duplicate={} links={}",
+                                    registration.pid,
+                                    registration.boundary,
+                                    links.contains_key(&registration.boundary),
+                                    links.len()
+                                );
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4142,6 +4149,10 @@ impl NestedControlWorker {
                             if links.values().any(|(_, link, _)| {
                                 std::os::fd::AsRawFd::as_raw_fd(link) == incoming_fd
                             }) {
+                                eprintln!(
+                                    "DIAG control-nuke: arm=duplicate-fd pid={} fd={incoming_fd}",
+                                    registration.pid
+                                );
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -6645,7 +6656,11 @@ impl Session {
             return self.control_complete;
         };
         if Instant::now() >= deadline {
-            self.invalidate_nested_control();
+            // Late, not corrupt: a slow snapshot can straddle the phase
+            // deadline, but the phase loop exits on that deadline and the
+            // hard phase re-drains with a fresh deadline. Invalidating
+            // here would permanently poison the session for one slow
+            // observation even when later verification fully succeeds.
             return false;
         }
         let control = control.lock().unwrap_or_else(|error| error.into_inner());
@@ -7441,6 +7456,33 @@ mod tests {
         assert!(!session.control_complete);
         assert!(session.nested_supervisors.is_empty());
         assert!(session.delegated.is_empty());
+    }
+
+    #[test]
+    fn expired_drain_deadline_skips_without_invalidating_nested_control() {
+        // A slow snapshot can straddle the phase deadline. The drain
+        // must skip that refresh, not permanently poison the session:
+        // the hard phase re-drains with a fresh deadline, so skipping
+        // only delays genuine-corruption detection by one phase
+        // transition instead of failing fully verified cleanup.
+        let mut session = Session::new(u32::MAX - 41);
+        let boundary = "d".repeat(64);
+        let state = std::sync::Arc::new(std::sync::Mutex::new(NestedControlState::new()));
+        state
+            .lock()
+            .unwrap()
+            .supervisors
+            .insert(boundary.clone(), u32::MAX - 42);
+        session.control = Some(state);
+        assert!(!session.drain_nested_supervisors(Instant::now() - Duration::from_secs(1)));
+        assert!(session.control_complete);
+        assert!(session.nested_supervisors.is_empty());
+        assert!(session.drain_nested_supervisors(Instant::now() + Duration::from_secs(1)));
+        assert!(session.control_complete);
+        assert_eq!(
+            session.nested_supervisors.get(&(u32::MAX - 42)),
+            Some(&boundary)
+        );
     }
 
     #[test]
