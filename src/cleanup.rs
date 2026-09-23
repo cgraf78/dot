@@ -2060,6 +2060,19 @@ fn output_relay_child(
             if error.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
+            // Momentary socket-buffer exhaustion (Darwin mbufs, Linux
+            // skbuff pressure) surfaces as ENOBUFS/ENOMEM on an
+            // otherwise healthy socket. Retry like the parent send
+            // side instead of failing the relay: a fatal exit here
+            // reads as an outward-sink failure mid-run and rewrites a
+            // clean provider 128+signal exit into ordinary status 1.
+            if matches!(
+                error.raw_os_error(),
+                Some(code) if code == libc::ENOBUFS || code == libc::ENOMEM
+            ) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
             unsafe { libc::_exit(1) };
         }
         if received == 1 && packet[0] == OUTPUT_RELAY_FINISH {
@@ -2086,10 +2099,21 @@ fn output_relay_child(
                 offset += written as usize;
                 continue;
             }
-            if written < 0
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-            {
-                continue;
+            if written < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // Same transient backpressure as the receive path
+                // above: a loaded host can briefly refuse the sink
+                // write without the sink being broken.
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::ENOBUFS || code == libc::ENOMEM
+                ) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
             }
             unsafe { libc::_exit(1) };
         }
