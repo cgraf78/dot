@@ -440,6 +440,33 @@ mod cancellation_tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
 
+    /// Backup warnings shared with the watchdog thread so a staging
+    /// failure reports what the backup said instead of timing out
+    /// silently. Each write locks briefly; the backup never holds the
+    /// lock across calls, so the watchdog cannot deadlock against it.
+    #[derive(Clone, Default)]
+    struct SharedWarnings(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedWarnings {
+        fn snapshot(&self) -> Vec<u8> {
+            self.0.lock().expect("backup warnings lock").clone()
+        }
+    }
+
+    impl std::io::Write for SharedWarnings {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("backup warnings lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn cancellation_after_the_move_restores_the_exact_conflict_bytes() {
         const HELPER: &str = "DOT_BACKUP_POST_MOVE_CANCEL_HELPER";
@@ -531,21 +558,49 @@ mod cancellation_tests {
         let log = Log::new(false, false);
         let signals = crate::cleanup::Signals::install().unwrap();
         let signal_ready = ready.clone();
+        // The watchdog waits on the backup's condition instead of racing
+        // a tight bound: a slow-but-healthy backup keeps its full window
+        // while it runs, while a backup that returns early without
+        // engaging the hold fails fast with its own outcome and warnings
+        // instead of idling out a timeout. Only a backup that neither
+        // returns nor engages trips the hang bound, still far inside the
+        // suite timeout.
+        let backup_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backup_outcome = std::sync::Arc::new(std::sync::Mutex::new(None::<BackupOutcome>));
+        let backup_warnings = SharedWarnings::default();
+        let sender_done = backup_done.clone();
+        let sender_outcome = backup_outcome.clone();
+        let sender_warnings = backup_warnings.clone();
+        let mut warnings_sink = backup_warnings.clone();
         let sender = std::thread::spawn(move || {
-            // Loaded CI hosts (396 parallel lib tests on small Alpine
-            // runners) can stall the helper past a tight bound even when
-            // the fixture engages correctly, so wait patiently: a genuine
-            // hang still fails well inside the suite timeout.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while !signal_ready.exists() && std::time::Instant::now() < deadline {
+            let start = std::time::Instant::now();
+            let hang_deadline = start + std::time::Duration::from_secs(60);
+            loop {
+                if signal_ready.exists() {
+                    // SAFETY: the recursive helper owns an installed SIGTERM handler.
+                    assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+                    return;
+                }
+                if sender_done.load(std::sync::atomic::Ordering::Acquire) {
+                    let outcome = sender_outcome
+                        .lock()
+                        .expect("backup outcome lock")
+                        .take()
+                        .expect("backup outcome recorded");
+                    let warnings = sender_warnings.snapshot();
+                    panic!(
+                        "backup returned before the hold engaged after {:?} (succeeded={}, backup={:?}): warnings={:?}",
+                        start.elapsed(),
+                        outcome.succeeded,
+                        outcome.backup,
+                        String::from_utf8_lossy(&warnings),
+                    );
+                }
+                if std::time::Instant::now() >= hang_deadline {
+                    panic!("backup stalled: no hold engaged after 60s while backup still running");
+                }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            assert!(
-                signal_ready.exists(),
-                "the move never reached its post-publication hold"
-            );
-            // SAFETY: the recursive helper owns an installed SIGTERM handler.
-            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
         });
         let outcome = backup_pull_conflicts(
             &BackupConflictsInputs {
@@ -565,8 +620,16 @@ mod cancellation_tests {
                 tool: &tool,
             },
             &mut moves,
-            &mut Vec::new(),
+            &mut warnings_sink,
         );
+        backup_outcome
+            .lock()
+            .expect("backup outcome lock")
+            .replace(BackupOutcome {
+                succeeded: outcome.succeeded,
+                backup: outcome.backup.clone(),
+            });
+        backup_done.store(true, std::sync::atomic::Ordering::Release);
         sender.join().unwrap();
         let status = signals.finish(i32::from(!outcome.succeeded));
 
