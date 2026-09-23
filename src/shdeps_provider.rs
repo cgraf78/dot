@@ -361,10 +361,6 @@ fn pump_relay(
         if let Err(error) = delivered {
             if sink_error.is_none() {
                 intentional_abort = crate::cleanup::outward_write_aborted();
-                eprintln!(
-                    "DIAG pump-relay-failure: error={error:?} intentional_abort={intentional_abort} interrupted={}",
-                    crate::cleanup::outward_write_interrupted()
-                );
                 sink_error = Some(error);
                 sink_failed.store(true, std::sync::atomic::Ordering::Release);
             }

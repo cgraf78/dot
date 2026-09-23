@@ -460,9 +460,6 @@ fn native_cancellation_preserves_signal_status_and_reaps_worker() {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
-        if observed != Some(code) {
-            eprintln!("DIAG runner-output: signal={signal_number} code={observed:?}");
-        }
         assert_eq!(observed, Some(code));
         assert!(!worker_survived, "test worker survived cancellation");
         assert!(!member_survived, "test worker member survived cancellation");

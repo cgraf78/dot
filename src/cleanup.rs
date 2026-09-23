@@ -2460,17 +2460,11 @@ impl ProcessOutputEndpoint {
         self.channel.take();
         let Some(pid) = self.child.take() else {
             self.registration.take();
-            let result = if channel_failed {
+            return if channel_failed {
                 ProcessOutputFinish::OutputFailed
             } else {
                 ProcessOutputFinish::Complete
             };
-            if result != ProcessOutputFinish::Complete {
-                eprintln!(
-                    "DIAG relay-finish: no-child drain={drain} channel_failed={channel_failed}"
-                );
-            }
-            return result;
         };
         let mut status = 0;
         if !drain || channel_failed || !finish_sent {
@@ -2482,7 +2476,7 @@ impl ProcessOutputEndpoint {
             let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
             if waited == pid {
                 self.registration.take();
-                let result = if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) == 125 {
+                return if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) == 125 {
                     ProcessOutputFinish::CleanupIncomplete
                 } else if drain
                     && (!channel_failed && finish_sent && libc::WEXITSTATUS(status) == 0)
@@ -2496,25 +2490,9 @@ impl ProcessOutputEndpoint {
                 } else {
                     ProcessOutputFinish::OutputFailed
                 };
-                if result != ProcessOutputFinish::Complete {
-                    eprintln!(
-                        "DIAG relay-finish: pid={pid} drain={drain} channel_failed={channel_failed} finish_sent={finish_sent} status={status} exited={} code={}",
-                        libc::WIFEXITED(status),
-                        if libc::WIFEXITED(status) {
-                            libc::WEXITSTATUS(status)
-                        } else {
-                            -1
-                        }
-                    );
-                }
-                return result;
             }
             if waited < 0 {
                 self.registration.take();
-                eprintln!(
-                    "DIAG relay-finish: pid={pid} drain={drain} waitpid-error={:?}",
-                    std::io::Error::last_os_error()
-                );
                 return ProcessOutputFinish::CleanupIncomplete;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -2526,9 +2504,6 @@ impl ProcessOutputEndpoint {
         // undrained sink, not a leaked descendant: the watchdog kill above
         // reaps it, so only genuinely unreaped helpers fail closed. Lost
         // output preserves the command's own status instead of raising 125.
-        eprintln!(
-            "DIAG relay-finish: pid={pid} drain={drain} channel_failed={channel_failed} finish_sent={finish_sent} timeout reaped={reaped}"
-        );
         if reaped {
             ProcessOutputFinish::OutputFailed
         } else {
@@ -4126,13 +4101,6 @@ impl NestedControlWorker {
                             ) && !links.contains_key(&registration.boundary)
                                 && links.len() < MAX_ACTIVE_NESTED_SESSIONS;
                             if !valid {
-                                eprintln!(
-                                    "DIAG control-nuke: arm=invalid-registration pid={} boundary={} duplicate={} links={}",
-                                    registration.pid,
-                                    registration.boundary,
-                                    links.contains_key(&registration.boundary),
-                                    links.len()
-                                );
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4149,10 +4117,6 @@ impl NestedControlWorker {
                             if links.values().any(|(_, link, _)| {
                                 std::os::fd::AsRawFd::as_raw_fd(link) == incoming_fd
                             }) {
-                                eprintln!(
-                                    "DIAG control-nuke: arm=duplicate-fd pid={} fd={incoming_fd}",
-                                    registration.pid
-                                );
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4171,11 +4135,7 @@ impl NestedControlWorker {
                                 .unwrap_or_else(|error| error.into_inner())
                                 .supervisors
                                 .insert(registration.boundary.clone(), registration.pid);
-                            if let Err(error) = registration.link.write_all(&[1]) {
-                                eprintln!(
-                                    "DIAG control-nuke: arm=ack-fail pid={} error={error:?}",
-                                    registration.pid
-                                );
+                            if registration.link.write_all(&[1]).is_err() {
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4190,12 +4150,7 @@ impl NestedControlWorker {
                             );
                         }
                         Ok(None) => break,
-                        Err(error) => {
-                            eprintln!(
-                                "DIAG control-nuke: arm=recv-error error={error:?} kind={:?} raw={:?}",
-                                error.kind(),
-                                error.raw_os_error()
-                            );
+                        Err(_) => {
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.complete = false;
                             state.supervisors.clear();
@@ -4243,7 +4198,6 @@ impl NestedControlWorker {
                             }
                         }
                         Ok(_) => {
-                            eprintln!("DIAG control-nuke: arm=unexpected-byte boundary={boundary}");
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.complete = false;
                             state.supervisors.clear();
@@ -5509,10 +5463,6 @@ impl OwnedSession {
     pub(crate) fn stop(&mut self, signal: i32) -> std::io::Result<std::process::ExitStatus> {
         let outcome = self.stop_with_tick_outcome(signal, true, &mut || Ok(()));
         if outcome.status.is_err() {
-            eprintln!(
-                "DIAG stop-owned-session-error: signal={signal} error={:?}",
-                outcome.status.as_ref().err()
-            );
             CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         outcome.into_result()
@@ -6282,10 +6232,6 @@ pub(crate) fn stop_owned_sessions(
         }
     }
     if results.iter().any(std::result::Result::is_err) {
-        eprintln!(
-            "DIAG stop-owned-sessions-error: {:?}",
-            results.iter().find_map(|result| result.as_ref().err())
-        );
         CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     results
