@@ -349,7 +349,7 @@ fn test_scan_fixture() -> Option<(&'static str, u32)> {
     Some((mode, pid))
 }
 
-fn parse_process_identity(pid: u32, stat: &[u8]) -> Result<ProcessIdentity, String> {
+fn parse_process_identity(pid: u32, stat: &[u8]) -> Result<Option<ProcessIdentity>, String> {
     let delimiter = stat
         .windows(2)
         .rposition(|window| window == b") ")
@@ -360,6 +360,12 @@ fn parse_process_identity(pid: u32, stat: &[u8]) -> Result<ProcessIdentity, Stri
         .collect::<Vec<_>>();
     if fields.len() <= 19 {
         return Err(format!("short process record for {pid}"));
+    }
+    // A fully-dead row exited between listing and re-read: exited churn,
+    // like a vanished entry — never a live survivor to report. Its -1
+    // generations would otherwise fail numeric parsing and doom the scan.
+    if matches!(fields[0], b"X" | b"x") {
+        return Ok(None);
     }
     let parse = |field: &[u8], label: &str| {
         std::str::from_utf8(field)
@@ -373,21 +379,40 @@ fn parse_process_identity(pid: u32, stat: &[u8]) -> Result<ProcessIdentity, Stri
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| format!("invalid start time for {pid}"))?;
-    Ok(ProcessIdentity {
+    Ok(Some(ProcessIdentity {
         parent,
         session,
         start,
         live: !matches!(fields[0], b"Z" | b"X" | b"x"),
-    })
+    }))
+}
+
+fn read_process_stat(pid: u32) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(error) if process_vanished(&error) => Ok(None),
+        Err(error) => Err(format!("read process identity for {pid}: {error}")),
+    }
 }
 
 fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>, String> {
-    let stat = match fs::read(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(error) if process_vanished(&error) => return Ok(None),
-        Err(error) => return Err(format!("read process identity for {pid}: {error}")),
+    let Some(stat) = read_process_stat(pid)? else {
+        return Ok(None);
     };
-    parse_process_identity(pid, &stat).map(Some)
+    match parse_process_identity(pid, &stat) {
+        Ok(identity) => Ok(identity),
+        Err(_) => {
+            // Exit churn can tear a stat row between listing and read (a
+            // zombie mid-teardown shows -1 generations). Re-read once: a
+            // transient tear resolves to a valid row or a vanished/dead
+            // entry, while persistent garbage stays fatal so the scan
+            // never silently drops a listed identity.
+            let Some(stat) = read_process_stat(pid)? else {
+                return Ok(None);
+            };
+            parse_process_identity(pid, &stat)
+        }
+    }
 }
 
 fn process_table() -> Result<HashMap<u32, ProcessIdentity>, String> {
@@ -4472,15 +4497,41 @@ mod tests {
 
     #[test]
     fn terminal_proc_states_are_not_live() {
-        for state in ["Z", "X", "x"] {
-            let fields = [
-                state, "1", "2", "42", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
-                "0", "1", "0", "777",
-            ];
-            let stat = format!("9 (fixture) {}\n", fields.join(" "));
-            let identity = parse_process_identity(9, stat.as_bytes()).expect("valid proc record");
-            assert!(!identity.live, "state {state} must be terminal");
+        let fields = [
+            "Z", "1", "2", "42", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
+            "1", "0", "777",
+        ];
+        let stat = format!("9 (fixture) {}\n", fields.join(" "));
+        let identity = parse_process_identity(9, stat.as_bytes())
+            .expect("valid proc record")
+            .expect("zombie row is reported");
+        assert!(!identity.live, "zombie state must be terminal");
+    }
+
+    #[test]
+    fn dead_proc_rows_are_exited_churn() {
+        // Fully-dead rows exited between listing and re-read; their -1
+        // generations are churn, like a vanished entry — never a live
+        // survivor to report. Bytes captured from a flaked scan.
+        for state in ["X", "x"] {
+            let stat = format!(
+                "2238178 (sleep) {state} 0 -1 -1 0 -1 4227084 108 0 0 0 0 0 0 0 30 10 0 0 229662513 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 17 38 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+            );
+            assert!(
+                parse_process_identity(2238178, stat.as_bytes())
+                    .expect("dead row must not be fatal")
+                    .is_none(),
+                "state {state} must be skipped as churn"
+            );
         }
+    }
+
+    #[test]
+    fn persistent_proc_garbage_stays_fatal() {
+        // A live row with a corrupt generation is not churn: the scan must
+        // fail closed rather than silently drop a listed identity.
+        let stat = "9 (fixture) R 1 2 nope 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 777\n";
+        assert!(parse_process_identity(9, stat.as_bytes()).is_err());
     }
 
     #[test]
