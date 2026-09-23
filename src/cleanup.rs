@@ -8416,9 +8416,10 @@ os._exit(0)
         // on the fast path; under load the bounded verify may legitimately
         // fall back to one discovery snapshot. The pin is that the holder
         // dies (ESRCH below), not the snapshot count.
+        let snapshots = global_process_snapshot_calls();
         assert!(
-            global_process_snapshot_calls() <= 1,
-            "the retained-group kill plus bounded verify must absorb an in-group holder without repeated host-wide discovery"
+            snapshots <= 1,
+            "the retained-group kill plus bounded verify must absorb an in-group holder without repeated host-wide discovery (took {snapshots} snapshots)"
         );
         // SAFETY: the fixture wrote its positive PID; signal zero only probes.
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
@@ -8612,9 +8613,21 @@ while True:
         }
 
         assert!(matches!(result, SessionEnd::Interrupted(libc::SIGTERM)));
+        // On failure, dump the survivor's state: a live `sleep`
+        // proves a genuine discovery miss, while any other command
+        // proves PID reuse between the kill and the sample.
+        let survivor_detail = || {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+                .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            format!("stat={stat} cmdline={cmdline}")
+        };
         assert!(
             !survived,
-            "closed-FD escaped descendant survived cancellation"
+            "closed-FD escaped descendant survived cancellation: {}",
+            survivor_detail()
         );
         drop(signals);
     }
@@ -9430,20 +9443,51 @@ os._exit(0)
         })
         .unwrap();
 
-        let _ = stop_session(&mut child, libc::SIGTERM);
+        // Graceful path pins the leader at exit 143: its trap runs,
+        // `wait` returns 143, and the script ends with that status. A
+        // KILLed leader (grace lost) dies signaled instead, failing fast
+        // here rather than timing out the marker polls below.
+        let status = stop_session(&mut child, libc::SIGTERM).expect("graceful stop failed");
+        assert_eq!(
+            status.code(),
+            Some(143),
+            "leader was not gracefully TERMed (KILL won the grace?)"
+        );
 
         // The late child is spawned by the leader's TERM trap and is
         // signaled by the same stop; trap execution (the marker writes)
         // completes asynchronously, so poll for the markers instead of
-        // asserting them on arrival.
-        poll_until(Instant::now() + Duration::from_secs(10), || {
+        // asserting them on arrival. On timeout, dump every marker to
+        // show how far the trap chain progressed.
+        let marker_states = || {
+            format!(
+                "leader_term={:?} spawned={} child_ready={} child_term={}",
+                std::fs::read_to_string(&leader_term).unwrap_or_default(),
+                spawned.exists(),
+                child_ready.exists(),
+                child_term.exists(),
+            )
+        };
+        if poll_until(Instant::now() + Duration::from_secs(10), || {
             Ok(child_ready.exists().then_some(()))
         })
-        .expect("TERM handler did not spawn its late child");
-        poll_until(Instant::now() + Duration::from_secs(10), || {
+        .is_err()
+        {
+            panic!(
+                "TERM handler did not spawn its late child: {}",
+                marker_states()
+            );
+        }
+        if poll_until(Instant::now() + Duration::from_secs(10), || {
             Ok(child_term.exists().then_some(()))
         })
-        .expect("late same-group child did not receive TERM");
+        .is_err()
+        {
+            panic!(
+                "late same-group child did not receive TERM: {}",
+                marker_states()
+            );
+        }
         assert_eq!(
             std::fs::read_to_string(&leader_term)
                 .unwrap()
