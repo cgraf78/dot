@@ -1320,7 +1320,10 @@ EOF
 
     truncated=$evidence_validation_root/truncated
     cp -R "$valid" "$truncated"
-    truncate -s -1 "$truncated/samples.tsv"
+    # Drop the trailing byte with an absolute size: GNU accepts relative
+    # `-s -1`, but busybox truncate rejects negative sizes.
+    truncated_bytes=$(wc -c <"$truncated/samples.tsv")
+    truncate -s $((truncated_bytes - 1)) "$truncated/samples.tsv"
     if validate_fixture "$truncated"; then
       printf 'validator accepted a truncated sample file\n' >&2
       exit 1
