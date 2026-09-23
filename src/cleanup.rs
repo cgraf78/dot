@@ -7737,6 +7737,11 @@ while :; do sleep 0.02; done
         let ready = scope.path().join("ready");
         let terms = scope.path().join("terms");
         let target = scope.path().join("target");
+        // Own the freshness precondition explicitly: a reused scope would
+        // append a second trap marker (the trap uses `>>`) and a stale
+        // ready marker would short-circuit the start poll.
+        let _ = std::fs::remove_file(&ready);
+        std::fs::write(&terms, b"").unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -7770,6 +7775,9 @@ while :; do sleep 0.02; done
         let shell_ready = shell_scope.path().join("ready");
         let shell_terms = shell_scope.path().join("terms");
         let shell_target = shell_scope.path().join("target");
+        // Same freshness precondition as the first scenario above.
+        let _ = std::fs::remove_file(&shell_ready);
+        std::fs::write(&shell_terms, b"").unwrap();
         let executable = std::env::current_exe().unwrap();
         let mut command = Command::new("sh");
         command

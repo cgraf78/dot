@@ -162,6 +162,24 @@ pub struct TempDir {
     path: PathBuf,
 }
 
+/// Remove a stale directory left by a killed prior run, if any.
+///
+/// `TempDir` paths are `(name, pid, counter)`. A run killed before drop
+/// (timeout, SIGKILL) never cleans up, and PID recycling hands a later
+/// run the same path — `create_dir_all` would then silently reuse it, so
+/// the earlier run's files poison exact-content assertions (an appended
+/// trap marker double-counts; a ready marker short-circuits a start poll).
+/// No live process can own this path — PIDs are unique while live and the
+/// counter is unique per process — so anything already here is stale.
+fn clear_stale_dir(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
 impl TempDir {
     /// Create `dot-<name>-<pid>-<n>` under the system temp directory.
     ///
@@ -201,6 +219,7 @@ impl TempDir {
         }
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let path = root.join(format!("dot-{name}-{}-{n}", std::process::id()));
+        clear_stale_dir(&path)?;
         std::fs::create_dir_all(&path)?;
         let path = path.canonicalize().unwrap_or_else(|_| path.clone());
         Ok(Self { path })
@@ -239,6 +258,20 @@ impl Drop for TempDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_dir_cleanup_is_idempotent_and_removes_planted_files() {
+        let stale = TempDir::new("stale-cleanup-probe").expect("create temp dir");
+        let stale_path = stale.path().to_path_buf();
+        std::fs::write(stale_path.join("terms"), b"15\n").expect("plant stale file");
+        // Forgetting the guard simulates a run killed before drop: the
+        // directory survives, and the next creation at this path must
+        // clear it instead of reusing its content.
+        std::mem::forget(stale);
+        clear_stale_dir(&stale_path).expect("clear stale dir");
+        assert!(!stale_path.exists());
+        clear_stale_dir(&stale_path).expect("second clear is a no-op");
+    }
 
     #[test]
     fn temp_dirs_are_unique_and_cleaned_up() {
