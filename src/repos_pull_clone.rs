@@ -327,6 +327,7 @@ pub fn clone_overlay_staged(
     crate::overlays::invalidate_worktree_path(Path::new(inputs.path));
     crate::startup::invalidate_revision_cache();
     crate::repos_base::invalidate_client_match_cache();
+    crate::repos_config::invalidate_config_cache();
     let mut cleanup = Registry::new();
     cleanup.remove_path(&stage_root).is_ok()
 }

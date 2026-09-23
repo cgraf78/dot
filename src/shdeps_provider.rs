@@ -663,6 +663,7 @@ pub(crate) fn prepare(
     // run; later revision reads must re-probe.
     crate::startup::invalidate_revision_cache();
     crate::repos_base::invalidate_client_match_cache();
+    crate::repos_config::invalidate_config_cache();
     outcome
 }
 
@@ -760,6 +761,7 @@ pub(crate) fn update(
     // reload) must re-probe.
     crate::startup::invalidate_revision_cache();
     crate::repos_base::invalidate_client_match_cache();
+    crate::repos_config::invalidate_config_cache();
     outcome
 }
 

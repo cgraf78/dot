@@ -420,9 +420,10 @@ pub fn validate_ahead_delta(
 /// instead of the caller probing and this re-check probing again.
 /// The equal path skips the final re-check (only pure comparisons
 /// run between the entry read and the verdict, so no inspection
-/// subprocess could have raced it); the ahead path keeps the
-/// re-check after merge-base and the delta scan, exactly the race
-/// the shell guarded.
+/// subprocess could have raced it; the residual window against an
+/// external mover is unchanged from the shell, which read no
+/// later); the ahead path keeps the re-check after merge-base and
+/// the delta scan, exactly the race the shell guarded.
 pub fn accept_current_generation(
     prefix: &[OsString],
     kind: &str,

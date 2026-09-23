@@ -4972,6 +4972,80 @@ fn direct_term_during_missing_overlay_clone_stops_before_publication() {
 }
 
 #[cfg(unix)]
+#[test]
+fn update_native_config_reads_survive_the_pull_phase() {
+    // `ensure_repo_config` runs before the pull phase and again in
+    // the link phase; fetch and rebase never write config, so the
+    // pull phase deliberately does not invalidate the config cache
+    // and the link-phase ensure shares the pre-pull reads. A
+    // counting shim proxies every invocation to real git: a
+    // successful run (both ensures execute) must read each key
+    // exactly once.
+    let fixture = NativeUpdateFixture::stage();
+    // Start compliant: a mismatched key would repair (write) in the
+    // pre-pull ensure, which correctly invalidates and re-reads.
+    // The memo case under test is read-only sharing.
+    let seed_git = real_tool("git");
+    let base_git_dir = fixture.client.home.join(".dotfiles");
+    for (key, value) in [
+        ("core.fsmonitor", "false"),
+        ("status.showUntrackedFiles", "no"),
+    ] {
+        let status = std::process::Command::new(&seed_git)
+            .arg(format!("--git-dir={}", base_git_dir.display()))
+            .arg(format!("--work-tree={}", fixture.client.home.display()))
+            .args(["config", key, value])
+            .status()
+            .expect("seed compliant base config");
+        assert!(status.success(), "seed {key}={value}");
+    }
+    let shim_dir = fixture.client.scope.path().join("counting-config-bin");
+    std::fs::create_dir_all(&shim_dir).expect("config shim directory");
+    let log = fixture.client.scope.path().join("config-invocations.log");
+    let git_shim = shim_dir.join("git");
+    std::fs::write(
+        &git_shim,
+        b"#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$DOT_TEST_CONFIG_LOG\"\nexec \"$DOT_TEST_REAL_GIT\" \"$@\"\n",
+    )
+    .expect("write config shim");
+    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
+        .expect("make config shim executable");
+    let mut paths = vec![shim_dir];
+    paths.extend(std::env::split_paths(&fixture_path()));
+    let path = std::env::join_paths(paths).expect("config shim PATH");
+    let real_git = real_tool("git");
+    let output = fixture.rust_dot_with_bash_and(&["update"], |command| {
+        command
+            .env("PATH", &path)
+            .env("DOT_TEST_REAL_GIT", &real_git)
+            .env("DOT_TEST_CONFIG_LOG", &log);
+    });
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "update code\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        has_bytes(&output.stdout, b"Reload your shell"),
+        "successful update completion: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let invocations = std::fs::read_to_string(&log).expect("config invocation log");
+    for key in [
+        "config --bool core.fsmonitor",
+        "config status.showUntrackedFiles",
+    ] {
+        assert_eq!(
+            invocations.matches(key).count(),
+            1,
+            "config read count for {key}; log:\n{invocations}"
+        );
+    }
+}
+
+#[cfg(unix)]
 fn stage_sync_none_overlay_link(client: &ReposClient) -> (PathBuf, PathBuf, PathBuf) {
     let source = client.overlay.join("home/linked-from-overlay");
     std::fs::create_dir_all(source.parent().expect("overlay home"))

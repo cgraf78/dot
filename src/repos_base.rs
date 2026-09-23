@@ -309,10 +309,11 @@ fn chomp_newlines(mut output: Vec<u8>) -> Vec<u8> {
 /// Memoized `client_matches` TRUE verdicts by record identity plus
 /// home. Dispatch validates the base client before running the
 /// command, and `update` gather validates it again before the pull
-/// phase; each validation is five supervised `git` probes against
-/// unchanging state, so the second call shares the first answer.
-/// Only TRUE pins: a mismatch re-probes, so a checkout converging
-/// mid-run (staged clone landing between phases) is observed.
+/// phase; each validation is up to five supervised `git` probes
+/// against unchanging state, so the second call shares the first
+/// answer. Only TRUE pins: a mismatch re-probes, so a checkout
+/// converging mid-run (staged clone landing between phases) is
+/// observed.
 static CLIENT_MATCH_CACHE: OnceLock<Mutex<HashMap<Vec<u8>, ()>>> = OnceLock::new();
 
 fn client_match_cache() -> &'static Mutex<HashMap<Vec<u8>, ()>> {
@@ -338,10 +339,10 @@ fn client_match_key(record: &crate::init_client_record::TransactionRecord, home:
 
 /// Drop every memoized client-match verdict. Call after any engine
 /// phase that may have moved the base checkout's branch or HEAD
-/// (pull, staged clone into place, generation restore) and after
-/// arbitrary user code (hooks) or git passthrough. Over-invalidation
-/// only costs a re-probe; a missed invalidation would trust a
-/// replaced checkout.
+/// (pull, staged clone into place) and after arbitrary user code
+/// (hooks) or git passthrough. Link-only generation restores need
+/// no call. Over-invalidation only costs a re-probe; a missed
+/// invalidation would trust a replaced checkout.
 pub(crate) fn invalidate_client_match_cache() {
     if let Ok(mut cache) = client_match_cache().lock() {
         cache.clear();

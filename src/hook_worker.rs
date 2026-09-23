@@ -109,6 +109,7 @@ impl Worker {
         crate::overlays::invalidate_worktree_cache();
         crate::startup::invalidate_revision_cache();
         crate::repos_base::invalidate_client_match_cache();
+        crate::repos_config::invalidate_config_cache();
         outcome
     }
 
@@ -319,6 +320,7 @@ impl Worker {
         crate::overlays::invalidate_worktree_cache();
         crate::startup::invalidate_revision_cache();
         crate::repos_base::invalidate_client_match_cache();
+        crate::repos_config::invalidate_config_cache();
         outcome
     }
 }
