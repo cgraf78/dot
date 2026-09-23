@@ -1100,8 +1100,11 @@ mod tests {
     fn chunk_waiter_redraws_while_stalled() {
         // A worker that outlasts the poll quantum must still redraw
         // the live line: interval 0 forces every poll to render, so
-        // one 150ms stall (past the 100ms quantum) proves the wiring
-        // without sleeping out a production second.
+        // one 350ms stall (past the 100ms quantum with margin for
+        // main-thread scheduling slop between spawn and the first
+        // recv, which otherwise collapses the stall below one
+        // quantum on loaded runners) proves the wiring without
+        // sleeping out a production second.
         let palette = crate::progress_ui::Palette::empty();
         let mut stage = Stage::begin(palette, "5", false, true, false, true);
         let mut out = Vec::new();
@@ -1110,12 +1113,12 @@ mod tests {
         let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let completed_sender = completed.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            std::thread::sleep(std::time::Duration::from_millis(350));
             completed_sender.store(true, std::sync::atomic::Ordering::Release);
             let _ = tx.send(());
         });
         wait_for_chunk(&rx, 1, &mut beat, &mut stage, &mut out);
-        assert!(out.contains(&0x1b), "150ms stall drew no heartbeat");
+        assert!(out.contains(&0x1b), "350ms stall drew no heartbeat");
         // Timeouts must never consume the completion budget: the
         // waiter returns only after the worker reports.
         assert!(
