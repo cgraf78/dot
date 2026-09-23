@@ -516,7 +516,9 @@ perf_require_executable_scratch() {
     printf 'error: cannot create native executable scratch probe\n' >&2
     return 1
   }
-  "$PERF_CHMOD" 0755 -- "$probe" || {
+  # No `--` after the mode: BSD chmod parses the mode first, so a
+  # `--` there becomes a filename operand and fails the call.
+  "$PERF_CHMOD" 0755 "$probe" || {
     printf 'error: cannot create native executable scratch probe\n' >&2
     return 1
   }
