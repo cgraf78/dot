@@ -74,9 +74,9 @@ perf_canonical_artifact_destination() {
   local root=$1 configured=$2 root_canonical artifact_dir
 
   [[ -n $configured && $configured != *$'\n'* && $configured != *$'\r'* ]] || return 1
-  root_canonical=$("$PERF_REALPATH" -e -- "$root") || return 1
+  root_canonical=$(perf_realpath -e "$root") || return 1
   perf_artifact_directory "$root" "$configured"
-  artifact_dir=$("$PERF_REALPATH" -m -- "$REPLY") || return 1
+  artifact_dir=$(perf_realpath -m "$REPLY") || return 1
   [[ $artifact_dir == /*/* && $artifact_dir != / ]] || return 1
   case "$root_canonical"/ in
     "$artifact_dir"/|"$artifact_dir"/*)
@@ -90,7 +90,7 @@ perf_canonical_artifact_destination() {
 perf_lifecycle_lock_root_path() {
   local lock_root=/tmp/.dot-performance-locks-$EUID
 
-  REPLY=$("$PERF_REALPATH" -m -- "$lock_root") || return 1
+  REPLY=$(perf_realpath -m "$lock_root") || return 1
   [[ $REPLY == /*/* && $REPLY != / ]]
 }
 
@@ -109,7 +109,7 @@ perf_lifecycle_lock_root() {
   IFS=: read -r owner mode < <("$PERF_STAT" -Lc '%u:%a' -- "$lock_root") || return 1
   [[ $owner == "$EUID" && $mode =~ ^[0-7]{3,4}$ ]] || return 1
   (( (8#$mode & 077) == 0 )) || return 1
-  REPLY=$("$PERF_REALPATH" -e -- "$lock_root") || return 1
+  REPLY=$(perf_realpath -e "$lock_root") || return 1
 }
 
 perf_artifact_lifecycle_lock_path() {
@@ -135,7 +135,7 @@ perf_preflight_artifact_destination() {
   local -a directories files run_ids
 
   [[ -n $configured && $configured != *$'\n'* && $configured != *$'\r'* ]] || return 1
-  root_canonical=$("$PERF_REALPATH" -e -- "$root") || return 1
+  root_canonical=$(perf_realpath -e "$root") || return 1
   perf_canonical_artifact_destination "$root_canonical" "$configured" || return 1
   artifact_dir=$REPLY
   perf_lifecycle_lock_root_path || return 1
@@ -308,8 +308,32 @@ perf_resolve_artifact_tools() {
   PERF_STAT=$REPLY
   perf_first_tool /usr/bin/realpath /bin/realpath || return 1
   PERF_REALPATH=$REPLY
+  # busybox realpath looks like GNU realpath but rejects `-e`, `-m`,
+  # and `--`. Probe once; where GNU flags are unavailable, python3
+  # (present on every CI leg) canonicalizes portably instead.
+  if "$PERF_REALPATH" -e -- / >/dev/null 2>&1; then
+    PERF_REALPATH_GNU=true
+  else
+    PERF_REALPATH_GNU=false
+    perf_first_tool /usr/bin/python3 /bin/python3 || return 1
+    PERF_PYTHON3=$REPLY
+  fi
   perf_first_tool /usr/bin/sha256sum /bin/sha256sum || return 1
   PERF_SHA256SUM=$REPLY
+}
+
+# Canonicalize PATH like GNU `realpath -e` (must exist) or `realpath
+# -m` (missing components allowed). `os.path.realpath` matches `-m`
+# semantics exactly; the `-e` leg adds the existence check first.
+perf_realpath() {
+  local mode=$1 path=$2
+  if $PERF_REALPATH_GNU; then
+    "$PERF_REALPATH" "$mode" -- "$path"
+  elif [[ $mode == -e && ! -e $path ]]; then
+    return 1
+  else
+    "$PERF_PYTHON3" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$path"
+  fi
 }
 
 perf_invalidate_prior_completion() {
@@ -482,7 +506,19 @@ perf_require_executable_scratch() {
 
   probe=$scratch/native-execution-probe
 
-  "$PERF_CP" -- "$PERF_UNAME" "$probe" || {
+  # The probe is a shebang-less script: copying a system binary fails
+  # where that binary is a multi-call applet (busybox uname on Alpine
+  # exits 127 for an unrecognized argv[0]), while a shebang would fail
+  # where /bin/sh is absent (Termux). The invoking shell's ENOEXEC
+  # fallback runs `exit 0` everywhere, and a noexec mount still
+  # refuses with EACCES.
+  printf 'exit 0\n' >"$probe" || {
+    printf 'error: cannot create native executable scratch probe\n' >&2
+    return 1
+  }
+  # No `--` after the mode: BSD chmod parses the mode first, so a
+  # `--` there becomes a filename operand and fails the call.
+  "$PERF_CHMOD" 0755 "$probe" || {
     printf 'error: cannot create native executable scratch probe\n' >&2
     return 1
   }

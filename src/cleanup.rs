@@ -75,15 +75,38 @@ extern "C" fn capture_entry_stdio() {
 )]
 static CAPTURE_ENTRY_STDIO: extern "C" fn() = capture_entry_stdio;
 
+// musl's static startup never executes `.preinit_array`, so without a
+// second capture a musl binary arrives with a zero mask and the live
+// probe below observes descriptors after Rust's pre-`main` stdio
+// sanitization reopened closed ones on `/dev/null`. `.init_array`
+// runs before `main` on musl too, so capture there as well; on glibc
+// the preinit entry already ran first and this is a no-op. Priority
+// `00000` sorts the entry ahead of every plain `.init_array`
+// constructor, so no current or future initializer can reuse a closed
+// descriptor before the capture observes it.
+#[used]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg_attr(
+    any(target_os = "linux", target_os = "android"),
+    unsafe(link_section = ".init_array.00000")
+)]
+static CAPTURE_ENTRY_STDIO_LATE: extern "C" fn() = capture_entry_stdio_unless_captured;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+extern "C" fn capture_entry_stdio_unless_captured() {
+    if ENTRY_STDIO_MASK.load(std::sync::atomic::Ordering::Relaxed) & ENTRY_STDIO_INITIALIZED == 0 {
+        capture_entry_stdio();
+    }
+}
+
 /// Resolve the exec-boundary descriptor bitmap, probing live descriptors
-/// when no static capture ran. musl's static startup does not execute
-/// `.preinit_array`, so release binaries built for musl arrive with a zero
-/// mask; probing then observes the inherited descriptors exactly as the
-/// capture would have, except for descriptors the Rust runtime already
-/// reserved (its pre-`main` normalization reopens closed standard
-/// descriptors on `/dev/null`). A relay started from the probe therefore
-/// behaves identically whenever stdio was open at exec; only the exotic
-/// closed-at-exec edge reports the reserved sink instead of absence.
+/// when no static capture ran. Native Linux, Android, and macOS binaries
+/// capture before `main` (`.preinit_array`, plus an `.init_array.00000`
+/// fallback for libc startups like musl's that never execute preinit),
+/// so the probe remains only for hosts with no initializer: Windows,
+/// which has none, and embedding links whose garbage collection drops
+/// the init sections. The probe then observes the descriptors the host
+/// shares, which is the closest available answer outside a binary.
 fn resolve_entry_stdio_mask(stored: u8) -> u8 {
     if stored & ENTRY_STDIO_INITIALIZED != 0 {
         return stored;
@@ -102,12 +125,15 @@ fn resolve_entry_stdio_mask(stored: u8) -> u8 {
 /// uses this for informational commands that bypass the output relay, so a
 /// descriptor closed at exec fails identically on both paths.
 pub fn entry_stdio_open(descriptor: i32) -> bool {
-    // Take the initializer's address so the linker keeps its object
+    // Take the initializers' addresses so the linker keeps their objects
     // (see above).
     std::hint::black_box(&CAPTURE_ENTRY_STDIO);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    std::hint::black_box(&CAPTURE_ENTRY_STDIO_LATE);
     let mask = ENTRY_STDIO_MASK.load(std::sync::atomic::Ordering::Relaxed);
     if mask & ENTRY_STDIO_INITIALIZED == 0 {
-        // No exec-boundary capture ran (in-process embedding): probe live.
+        // No exec-boundary capture ran (Windows has no initializer;
+        // embedding links may drop the init sections): probe live.
         return descriptor >= 0 && unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0;
     }
     (0..=2).contains(&descriptor) && mask & (1 << descriptor) != 0
@@ -2034,6 +2060,19 @@ fn output_relay_child(
             if error.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
+            // Momentary socket-buffer exhaustion (Darwin mbufs, Linux
+            // skbuff pressure) surfaces as ENOBUFS/ENOMEM on an
+            // otherwise healthy socket. Retry like the parent send
+            // side instead of failing the relay: a fatal exit here
+            // reads as an outward-sink failure mid-run and rewrites a
+            // clean provider 128+signal exit into ordinary status 1.
+            if matches!(
+                error.raw_os_error(),
+                Some(code) if code == libc::ENOBUFS || code == libc::ENOMEM
+            ) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
             unsafe { libc::_exit(1) };
         }
         if received == 1 && packet[0] == OUTPUT_RELAY_FINISH {
@@ -2060,10 +2099,21 @@ fn output_relay_child(
                 offset += written as usize;
                 continue;
             }
-            if written < 0
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-            {
-                continue;
+            if written < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // Same transient backpressure as the receive path
+                // above: a loaded host can briefly refuse the sink
+                // write without the sink being broken.
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::ENOBUFS || code == libc::ENOMEM
+                ) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
             }
             unsafe { libc::_exit(1) };
         }
@@ -2410,11 +2460,17 @@ impl ProcessOutputEndpoint {
         self.channel.take();
         let Some(pid) = self.child.take() else {
             self.registration.take();
-            return if channel_failed {
+            let result = if channel_failed {
                 ProcessOutputFinish::OutputFailed
             } else {
                 ProcessOutputFinish::Complete
             };
+            if result != ProcessOutputFinish::Complete {
+                eprintln!(
+                    "DIAG relay-finish: no-child drain={drain} channel_failed={channel_failed}"
+                );
+            }
+            return result;
         };
         let mut status = 0;
         if !drain || channel_failed || !finish_sent {
@@ -2426,7 +2482,7 @@ impl ProcessOutputEndpoint {
             let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
             if waited == pid {
                 self.registration.take();
-                return if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) == 125 {
+                let result = if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) == 125 {
                     ProcessOutputFinish::CleanupIncomplete
                 } else if drain
                     && (!channel_failed && finish_sent && libc::WEXITSTATUS(status) == 0)
@@ -2440,9 +2496,25 @@ impl ProcessOutputEndpoint {
                 } else {
                     ProcessOutputFinish::OutputFailed
                 };
+                if result != ProcessOutputFinish::Complete {
+                    eprintln!(
+                        "DIAG relay-finish: pid={pid} drain={drain} channel_failed={channel_failed} finish_sent={finish_sent} status={status} exited={} code={}",
+                        libc::WIFEXITED(status),
+                        if libc::WIFEXITED(status) {
+                            libc::WEXITSTATUS(status)
+                        } else {
+                            -1
+                        }
+                    );
+                }
+                return result;
             }
             if waited < 0 {
                 self.registration.take();
+                eprintln!(
+                    "DIAG relay-finish: pid={pid} drain={drain} waitpid-error={:?}",
+                    std::io::Error::last_os_error()
+                );
                 return ProcessOutputFinish::CleanupIncomplete;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -2454,6 +2526,9 @@ impl ProcessOutputEndpoint {
         // undrained sink, not a leaked descendant: the watchdog kill above
         // reaps it, so only genuinely unreaped helpers fail closed. Lost
         // output preserves the command's own status instead of raising 125.
+        eprintln!(
+            "DIAG relay-finish: pid={pid} drain={drain} channel_failed={channel_failed} finish_sent={finish_sent} timeout reaped={reaped}"
+        );
         if reaped {
             ProcessOutputFinish::OutputFailed
         } else {
@@ -2478,14 +2553,17 @@ impl ProcessOutputRelay {
     /// primary stdout/stderr relay. Stderr also has an independent dormant
     /// fallback so a blocked stdout cannot suppress the bounded timeout or
     /// cancellation diagnostic that explains the terminal status. When no
-    /// static capture ran (musl static binaries never execute
-    /// `.preinit_array`), live descriptors are probed instead of failing.
+    /// static capture ran (Windows and embedding links without the init
+    /// sections; musl binaries capture through the `.init_array.00000`
+    /// fallback), live descriptors are probed instead of failing.
     pub fn start() -> std::io::Result<Self> {
         use std::os::fd::AsRawFd as _;
 
-        // Take the initializer's address so the linker keeps its object
+        // Take the initializers' addresses so the linker keeps their objects
         // in every binary that starts a relay (see above).
         std::hint::black_box(&CAPTURE_ENTRY_STDIO);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        std::hint::black_box(&CAPTURE_ENTRY_STDIO_LATE);
         let stored_mask = ENTRY_STDIO_MASK.load(std::sync::atomic::Ordering::Relaxed);
         let entry_mask = resolve_entry_stdio_mask(stored_mask);
         let stdout = snapshot_process_output(
@@ -4048,6 +4126,13 @@ impl NestedControlWorker {
                             ) && !links.contains_key(&registration.boundary)
                                 && links.len() < MAX_ACTIVE_NESTED_SESSIONS;
                             if !valid {
+                                eprintln!(
+                                    "DIAG control-nuke: arm=invalid-registration pid={} boundary={} duplicate={} links={}",
+                                    registration.pid,
+                                    registration.boundary,
+                                    links.contains_key(&registration.boundary),
+                                    links.len()
+                                );
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4064,6 +4149,10 @@ impl NestedControlWorker {
                             if links.values().any(|(_, link, _)| {
                                 std::os::fd::AsRawFd::as_raw_fd(link) == incoming_fd
                             }) {
+                                eprintln!(
+                                    "DIAG control-nuke: arm=duplicate-fd pid={} fd={incoming_fd}",
+                                    registration.pid
+                                );
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4082,7 +4171,11 @@ impl NestedControlWorker {
                                 .unwrap_or_else(|error| error.into_inner())
                                 .supervisors
                                 .insert(registration.boundary.clone(), registration.pid);
-                            if registration.link.write_all(&[1]).is_err() {
+                            if let Err(error) = registration.link.write_all(&[1]) {
+                                eprintln!(
+                                    "DIAG control-nuke: arm=ack-fail pid={} error={error:?}",
+                                    registration.pid
+                                );
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4097,7 +4190,12 @@ impl NestedControlWorker {
                             );
                         }
                         Ok(None) => break,
-                        Err(_) => {
+                        Err(error) => {
+                            eprintln!(
+                                "DIAG control-nuke: arm=recv-error error={error:?} kind={:?} raw={:?}",
+                                error.kind(),
+                                error.raw_os_error()
+                            );
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.complete = false;
                             state.supervisors.clear();
@@ -4145,6 +4243,7 @@ impl NestedControlWorker {
                             }
                         }
                         Ok(_) => {
+                            eprintln!("DIAG control-nuke: arm=unexpected-byte boundary={boundary}");
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.complete = false;
                             state.supervisors.clear();
@@ -4365,7 +4464,11 @@ impl SessionLease {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return false;
+                // The budget bounds waiting, not the condition: a
+                // starved thread can arrive here with EOF long ready.
+                // Re-check once instead of reporting a satisfied
+                // condition as still open.
+                return self.closed().unwrap_or(false);
             }
             let mut observed = libc::pollfd {
                 fd: self.reader.as_raw_fd(),
@@ -4391,7 +4494,10 @@ impl SessionLease {
                     Err(_) => return false,
                 }
             } else if ready == 0 {
-                return false;
+                // poll(0) after millisecond truncation returns
+                // without watching; EOF may have landed in the gap.
+                // One nonblocking re-check keeps the timeout honest.
+                return self.closed().unwrap_or(false);
             } else {
                 let error = std::io::Error::last_os_error();
                 if error.kind() == std::io::ErrorKind::Interrupted {
@@ -5403,6 +5509,10 @@ impl OwnedSession {
     pub(crate) fn stop(&mut self, signal: i32) -> std::io::Result<std::process::ExitStatus> {
         let outcome = self.stop_with_tick_outcome(signal, true, &mut || Ok(()));
         if outcome.status.is_err() {
+            eprintln!(
+                "DIAG stop-owned-session-error: signal={signal} error={:?}",
+                outcome.status.as_ref().err()
+            );
             CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         outcome.into_result()
@@ -6172,6 +6282,10 @@ pub(crate) fn stop_owned_sessions(
         }
     }
     if results.iter().any(std::result::Result::is_err) {
+        eprintln!(
+            "DIAG stop-owned-sessions-error: {:?}",
+            results.iter().find_map(|result| result.as_ref().err())
+        );
         CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     results
@@ -6549,7 +6663,11 @@ impl Session {
             return self.control_complete;
         };
         if Instant::now() >= deadline {
-            self.invalidate_nested_control();
+            // Late, not corrupt: a slow snapshot can straddle the phase
+            // deadline, but the phase loop exits on that deadline and the
+            // hard phase re-drains with a fresh deadline. Invalidating
+            // here would permanently poison the session for one slow
+            // observation even when later verification fully succeeds.
             return false;
         }
         let control = control.lock().unwrap_or_else(|error| error.into_inner());
@@ -6618,9 +6736,6 @@ impl Session {
         while changed {
             changed = false;
             for process in processes {
-                if owned.contains(&process.identity) {
-                    continue;
-                }
                 let parent_process = processes
                     .iter()
                     .find(|candidate| candidate.pid == process.parent);
@@ -6631,12 +6746,38 @@ impl Session {
                     .is_some_and(|candidate| self.delegated.contains(&candidate.identity));
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 let direct_adoptee = process.parent == parent;
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let delegated = !direct_adoptee
+                    && (inherited_delegation
+                        || parent_process.is_some_and(|parent| {
+                            parent.live && self.nested_supervisors.contains_key(&parent.pid)
+                        }));
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let delegated = false;
+                if owned.contains(&process.identity) {
+                    // Ownership is sticky, but delegation is recomputed every
+                    // observation: the set is cleared above, so without this
+                    // a delegated child that outlives one grace quantum loses
+                    // its delegation and the next delivery round re-signals a
+                    // child its nested supervisor already owns (a slow TERM
+                    // trap can then run twice). The recompute is pure snapshot
+                    // and map lookups, preserving the syscall avoidance below.
+                    // The leader itself always evaluates to undelegated here
+                    // (its parent is outside the session and can never be a
+                    // registered nested supervisor), so delivery to the leader
+                    // is unchanged.
+                    if delegated && self.delegated.insert(process.identity.clone()) {
+                        changed = true;
+                    }
+                    continue;
+                }
                 // Skip every syscall below (status registry, environ read,
                 // fd-table walk) for processes no ownership rule can match.
                 // Adoption requires a direct child of this process; the other
-                // rules use only snapshot fields. Delegation marking lives
-                // inside the ownership insert, so a skipped process cannot
-                // gain delegation state either.
+                // rules use only snapshot fields. These pre-filtered processes
+                // can never be owned, so they gain no delegation state either
+                // (unlike already-owned members, whose delegation is refreshed
+                // above).
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 if process.session != leader && !inherited && !direct_adoptee {
                     continue;
@@ -6688,14 +6829,6 @@ impl Session {
                 };
                 #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 let adopted = false;
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                let delegated = !direct_adoptee
-                    && (inherited_delegation
-                        || parent_process.is_some_and(|parent| {
-                            parent.live && self.nested_supervisors.contains_key(&parent.pid)
-                        }));
-                #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                let delegated = false;
                 if process.session == leader || inherited || adopted {
                     owned.insert(process.identity.clone());
                     if delegated {
@@ -7333,6 +7466,33 @@ mod tests {
     }
 
     #[test]
+    fn expired_drain_deadline_skips_without_invalidating_nested_control() {
+        // A slow snapshot can straddle the phase deadline. The drain
+        // must skip that refresh, not permanently poison the session:
+        // the hard phase re-drains with a fresh deadline, so skipping
+        // only delays genuine-corruption detection by one phase
+        // transition instead of failing fully verified cleanup.
+        let mut session = Session::new(u32::MAX - 41);
+        let boundary = "d".repeat(64);
+        let state = std::sync::Arc::new(std::sync::Mutex::new(NestedControlState::new()));
+        state
+            .lock()
+            .unwrap()
+            .supervisors
+            .insert(boundary.clone(), u32::MAX - 42);
+        session.control = Some(state);
+        assert!(!session.drain_nested_supervisors(Instant::now() - Duration::from_secs(1)));
+        assert!(session.control_complete);
+        assert!(session.nested_supervisors.is_empty());
+        assert!(session.drain_nested_supervisors(Instant::now() + Duration::from_secs(1)));
+        assert!(session.control_complete);
+        assert_eq!(
+            session.nested_supervisors.get(&(u32::MAX - 42)),
+            Some(&boundary)
+        );
+    }
+
+    #[test]
     fn nested_registration_rejects_a_spoofed_supervisor_pid() {
         use std::os::fd::AsRawFd as _;
 
@@ -7366,6 +7526,89 @@ mod tests {
         );
         drop(local);
         drop(worker);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn repeated_observation_keeps_delegation_for_a_live_nested_child() {
+        // A delegated child that outlives one grace quantum must keep its
+        // delegation: the set is cleared every observation, so if sticky
+        // ownership skips the recompute, the next delivery round re-signals
+        // a child its nested supervisor already owns (and a slow TERM trap
+        // runs twice). The child is a real process so member claiming pins
+        // it exactly like production; only its ancestry rows are doctored.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let child_identity = linux_process_info(child_pid)
+            .expect("live child snapshot")
+            .identity;
+        let leader = 1_000_000u32;
+        let supervisor = 1_000_001u32;
+        let row = |pid: u32, parent: u32, identity: ProcessIdentity| ProcessInfo {
+            pid,
+            parent,
+            group: leader,
+            session: leader,
+            live: true,
+            identity,
+        };
+        let snapshot = vec![
+            row(
+                leader,
+                1,
+                ProcessIdentity {
+                    pid: leader,
+                    start: Some(u64::from(leader)),
+                },
+            ),
+            row(
+                supervisor,
+                leader,
+                ProcessIdentity {
+                    pid: supervisor,
+                    start: Some(u64::from(supervisor)),
+                },
+            ),
+            row(child_pid, supervisor, child_identity.clone()),
+        ];
+        let mut session = Session::new(leader);
+        session
+            .nested_supervisors
+            .insert(supervisor, "d".repeat(64));
+        assert!(!session.observe(&snapshot));
+        assert!(
+            session.delegated.contains(&child_identity),
+            "first observation must delegate the nested child"
+        );
+        assert!(
+            session.members.contains_key(&child_pid),
+            "child must be a claimed member so sticky ownership is exercised"
+        );
+        // Second observation with an identical snapshot (the child is still
+        // alive in its TERM trap): delegation must persist so delivery
+        // still skips it.
+        assert!(!session.observe(&snapshot));
+        assert!(
+            session.delegated.contains(&child_identity),
+            "second observation dropped delegation for a live nested child"
+        );
+        session.signal_new(libc::SIGTERM);
+        assert!(
+            !session
+                .members
+                .get(&child_pid)
+                .map(|member| member.signaled)
+                .unwrap_or(true),
+            "delivery must skip the still-delegated child"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -8173,9 +8416,10 @@ os._exit(0)
         // on the fast path; under load the bounded verify may legitimately
         // fall back to one discovery snapshot. The pin is that the holder
         // dies (ESRCH below), not the snapshot count.
+        let snapshots = global_process_snapshot_calls();
         assert!(
-            global_process_snapshot_calls() <= 1,
-            "the retained-group kill plus bounded verify must absorb an in-group holder without repeated host-wide discovery"
+            snapshots <= 1,
+            "the retained-group kill plus bounded verify must absorb an in-group holder without repeated host-wide discovery (took {snapshots} snapshots)"
         );
         // SAFETY: the fixture wrote its positive PID; signal zero only probes.
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
@@ -8347,16 +8591,43 @@ while True:
             .trim()
             .parse::<i32>()
             .unwrap();
-        let survived = alive(pid);
+        // A zombie is already dead: signal-zero still succeeds until
+        // the (possibly loaded) reaper collects it, so only a live
+        // process counts as a cancellation survivor.
+        fn live_descendant(pid: i32) -> bool {
+            let Ok(pid) = u32::try_from(pid) else {
+                return false;
+            };
+            std::fs::read(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let delimiter = stat.windows(2).rposition(|window| window == b") ")?;
+                    stat.get(delimiter + 2).copied()
+                })
+                .is_some_and(|state| !matches!(state, b'Z' | b'X' | b'x'))
+        }
+        let survived = live_descendant(pid);
         let deadline = Instant::now() + Duration::from_secs(6);
-        while alive(pid) && Instant::now() < deadline {
+        while live_descendant(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
 
         assert!(matches!(result, SessionEnd::Interrupted(libc::SIGTERM)));
+        // On failure, dump the survivor's state: a live `sleep`
+        // proves a genuine discovery miss, while any other command
+        // proves PID reuse between the kill and the sample.
+        let survivor_detail = || {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+                .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            format!("stat={stat} cmdline={cmdline}")
+        };
         assert!(
             !survived,
-            "closed-FD escaped descendant survived cancellation"
+            "closed-FD escaped descendant survived cancellation: {}",
+            survivor_detail()
         );
         drop(signals);
     }
@@ -9172,20 +9443,51 @@ os._exit(0)
         })
         .unwrap();
 
-        let _ = stop_session(&mut child, libc::SIGTERM);
+        // Graceful path pins the leader at exit 143: its trap runs,
+        // `wait` returns 143, and the script ends with that status. A
+        // KILLed leader (grace lost) dies signaled instead, failing fast
+        // here rather than timing out the marker polls below.
+        let status = stop_session(&mut child, libc::SIGTERM).expect("graceful stop failed");
+        assert_eq!(
+            status.code(),
+            Some(143),
+            "leader was not gracefully TERMed (KILL won the grace?)"
+        );
 
         // The late child is spawned by the leader's TERM trap and is
         // signaled by the same stop; trap execution (the marker writes)
         // completes asynchronously, so poll for the markers instead of
-        // asserting them on arrival.
-        poll_until(Instant::now() + Duration::from_secs(10), || {
+        // asserting them on arrival. On timeout, dump every marker to
+        // show how far the trap chain progressed.
+        let marker_states = || {
+            format!(
+                "leader_term={:?} spawned={} child_ready={} child_term={}",
+                std::fs::read_to_string(&leader_term).unwrap_or_default(),
+                spawned.exists(),
+                child_ready.exists(),
+                child_term.exists(),
+            )
+        };
+        if poll_until(Instant::now() + Duration::from_secs(10), || {
             Ok(child_ready.exists().then_some(()))
         })
-        .expect("TERM handler did not spawn its late child");
-        poll_until(Instant::now() + Duration::from_secs(10), || {
+        .is_err()
+        {
+            panic!(
+                "TERM handler did not spawn its late child: {}",
+                marker_states()
+            );
+        }
+        if poll_until(Instant::now() + Duration::from_secs(10), || {
             Ok(child_term.exists().then_some(()))
         })
-        .expect("late same-group child did not receive TERM");
+        .is_err()
+        {
+            panic!(
+                "late same-group child did not receive TERM: {}",
+                marker_states()
+            );
+        }
         assert_eq!(
             std::fs::read_to_string(&leader_term)
                 .unwrap()
@@ -10780,11 +11082,44 @@ os._exit(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = OwnedChild::new(command.spawn().unwrap());
+        let spawned = command.spawn().unwrap();
+        let pid = spawned.id();
+        let mut child = OwnedChild::new(spawned);
         poll_until(Instant::now() + Duration::from_secs(2), || {
             Ok(ready.exists().then_some(()))
         })
         .expect("stopped provider fixture became ready");
+        // READY precedes the fixture's self-STOP: stopping here would race
+        // it, and a CONT consumed before the STOP lands leaves the child
+        // stopped with TERM pending until escalation KILLs it. Wait for the
+        // stopped state itself so the stop below always resumes a child
+        // that is provably stopped.
+        poll_until(Instant::now() + Duration::from_secs(2), || {
+            let mut status = 0;
+            // SAFETY: direct child pid; WUNTRACED|WNOHANG reports a stop
+            // without reaping. The fixture is not expected to exit before
+            // the stop below, but if it does the poll fails fast here
+            // instead of hanging, before any other wait can observe it.
+            let waited =
+                unsafe { libc::waitpid(pid as i32, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+            if waited < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+            if waited == 0 {
+                return Ok(None);
+            }
+            if libc::WIFSTOPPED(status) {
+                return Ok(Some(()));
+            }
+            Err(std::io::Error::other(
+                "stopped provider fixture exited before stopping itself",
+            ))
+        })
+        .expect("stopped provider fixture stopped itself");
 
         let status = child.stop_with_tick(libc::SIGTERM, &mut || Ok(())).unwrap();
 
@@ -12011,5 +12346,29 @@ int kill(pid_t pid, int sig) {
                 "descriptor {descriptor} must match the live probe"
             );
         }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
+    fn entry_stdio_capture_runs_before_test_main() {
+        // The test binary is a native binary, so one of the section
+        // initializers must have captured the exec-boundary bitmap before
+        // `main` (and before Rust's stdio sanitization). This guards the
+        // linkage: it proves the capture objects survive into the binary
+        // and run. It cannot prove which section each entry landed in
+        // from in-process (on glibc the preinit entry sets the flag
+        // first); musl placement is proven by the closed-stdio CLI tests
+        // on the Alpine leg instead. If the linker drops the
+        // initializers, musl falls back to a post-sanitization live
+        // probe that mistakes closed descriptors for open ones.
+        std::hint::black_box(&CAPTURE_ENTRY_STDIO);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        std::hint::black_box(&CAPTURE_ENTRY_STDIO_LATE);
+        let mask = ENTRY_STDIO_MASK.load(std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(
+            mask & ENTRY_STDIO_INITIALIZED,
+            0,
+            "exec-boundary stdio capture must run before main"
+        );
     }
 }

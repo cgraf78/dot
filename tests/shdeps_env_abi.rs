@@ -294,7 +294,17 @@ fn bounded_run_passthrough() {
         0,
         b"a\nb\n",
     );
-    assert_bounded("5", "true", "discard-stderr", &["/usr/bin/true"], 0, b"");
+    // `true` lives in `/usr/bin` on usr-merged systems but in `/bin` on
+    // Alpine; fall back to a PATH lookup where neither absolute path
+    // exists so the passthrough case runs on every platform layout.
+    let true_bin = if Path::new("/usr/bin/true").is_file() {
+        "/usr/bin/true"
+    } else if Path::new("/bin/true").is_file() {
+        "/bin/true"
+    } else {
+        "true"
+    };
+    assert_bounded("5", "true", "discard-stderr", &[true_bin], 0, b"");
     assert_bounded(
         "5",
         "exit three",

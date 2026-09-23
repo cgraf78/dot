@@ -4092,6 +4092,10 @@ fn signal_interrupts_backpressured_provider_relay() {
 fn trusted_provider_exit_interrupts_an_undrained_cli_pipe_without_a_signal() {
     let rust = Fixture::new("shdeps-provider-exit-backpressure");
     let provider_pid_file = rust.home.join("provider-exit-backpressure-pid");
+    // A regular file, never a pipe: it cannot apply backpressure to the
+    // child, and its bytes survive to explain a status mismatch (the
+    // undrained stdout socket intentionally stays unread).
+    let stderr_file = rust.home.join("provider-exit-backpressure-stderr.log");
     let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("stdout pair");
     let mut command = rust.command();
     command
@@ -4099,7 +4103,9 @@ fn trusted_provider_exit_interrupts_an_undrained_cli_pipe_without_a_signal() {
         .env("DOT_TEST_PROVIDER_BACKPRESSURE_EXIT130", "1")
         .env("DOT_TEST_PROVIDER_BACKPRESSURE_PID", &provider_pid_file)
         .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(
+            std::fs::File::create(&stderr_file).expect("stderr capture"),
+        ));
     let mut child = spawn_test_session(command);
     let provider_pid = wait_for_pid(&provider_pid_file, 10).expect("provider pid");
     // A fast provider can exit between its pidfile write and our identity
@@ -4122,7 +4128,8 @@ fn trusted_provider_exit_interrupts_an_undrained_cli_pipe_without_a_signal() {
         completed,
         "trusted provider exit 130 remained blocked on an unread output pipe"
     );
-    assert_eq!(status.code(), Some(130));
+    let stderr_text = std::fs::read_to_string(&stderr_file).unwrap_or_default();
+    assert_eq!(status.code(), Some(130), "dot stderr:\n{stderr_text}");
     assert!(
         exited_before_identity
             || provider
