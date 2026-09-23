@@ -4464,7 +4464,11 @@ impl SessionLease {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return false;
+                // The budget bounds waiting, not the condition: a
+                // starved thread can arrive here with EOF long ready.
+                // Re-check once instead of reporting a satisfied
+                // condition as still open.
+                return self.closed().unwrap_or(false);
             }
             let mut observed = libc::pollfd {
                 fd: self.reader.as_raw_fd(),
@@ -4490,7 +4494,10 @@ impl SessionLease {
                     Err(_) => return false,
                 }
             } else if ready == 0 {
-                return false;
+                // poll(0) after millisecond truncation returns
+                // without watching; EOF may have landed in the gap.
+                // One nonblocking re-check keeps the timeout honest.
+                return self.closed().unwrap_or(false);
             } else {
                 let error = std::io::Error::last_os_error();
                 if error.kind() == std::io::ErrorKind::Interrupted {
