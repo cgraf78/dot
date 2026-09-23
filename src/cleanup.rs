@@ -6341,6 +6341,9 @@ fn stop_sessions_with_tick(
     // final reaping share one additional bounded window rather than renewing
     // a full deadline at each stage; retain half a grace of scan margin for a
     // busy host without allowing teardown latency to accumulate unboundedly.
+    // The reassignment below is Linux/Android-only; portable platforms
+    // never run the settle round and keep the initial deadline.
+    #[allow(unused_mut)]
     let mut hard_deadline = graceful_deadline
         + Duration::from_millis(GRACE_ATTEMPTS as u64 * GRACE_INTERVAL_MS * 3 / 2);
     // Deliver to the retained leader before a potentially expensive global
@@ -6409,6 +6412,13 @@ fn stop_sessions_with_tick(
         // (elimination would need per-member delivery tracking). Skipped
         // when the first signal is uncatchable (KILL, STOP): no handler can
         // run, so there is no trap to protect (the drop-path caller).
+        // Pidfd-capable platforms only: the round exists to DELIVER the
+        // catchable signal to never-signaled members, which needs exact
+        // process authority. Portable cleanup deliberately leaves an
+        // unpinned late member for the anchored group KILL phase; running
+        // the round there would add no delivery and could only trip the
+        // fail-closed authority refusal on a path that previously KILLed.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if first_signal != libc::SIGKILL && first_signal != libc::SIGSTOP {
             let settle_start = Instant::now();
             let observed = observe_sessions(&mut sessions, hard_deadline);
