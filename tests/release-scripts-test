@@ -73,6 +73,31 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+# Start COMMAND with SIGNAL at its default disposition, then exec so the
+# backgrounded caller's $! stays the driver PID. GNU env resets through
+# --default-signal; busybox env lacks the flag, so probe once and exec
+# directly there instead. The reset is defensive only: drivers inherit
+# default dispositions in practice (parents trap, never ignore, and CI
+# runners do not ignore these signals), and a shell cannot reset a
+# signal ignored on entry anyway. Call only backgrounded: a foreground
+# call would replace this shell.
+with_default_signal() {
+  local signal=$1
+  shift
+  if [[ ${DOT_ENV_HAS_DEFAULT_SIGNAL:-auto} == auto ]]; then
+    if /usr/bin/env --default-signal="$signal" true 2>/dev/null; then
+      DOT_ENV_HAS_DEFAULT_SIGNAL=true
+    else
+      DOT_ENV_HAS_DEFAULT_SIGNAL=false
+    fi
+  fi
+  if $DOT_ENV_HAS_DEFAULT_SIGNAL; then
+    exec /usr/bin/env --default-signal="$signal" "$@"
+  else
+    exec "$@"
+  fi
+}
+
 release_files=(
   package-release.sh
   release-lib.sh
@@ -535,7 +560,7 @@ done
 HOLDER
     chmod +x "$close_holder"
     # shellcheck disable=SC2016 # Positional parameters expand in the child Bash.
-    /usr/bin/env --default-signal="$close_signal" /bin/bash -c '
+    with_default_signal "$close_signal" /bin/bash -c '
     set -euo pipefail
     . "$1"
     perf_resolve_artifact_tools
@@ -4010,7 +4035,7 @@ while :; do /bin/sleep 1; done
 EOF
       chmod 0700 "$cargo_graceful/stuck-cargo"
       # shellcheck disable=SC2016 # Positional parameters expand in the child Bash.
-      /usr/bin/env --default-signal="$graceful_signal" /bin/bash -c '
+      with_default_signal "$graceful_signal" /bin/bash -c '
     set -euo pipefail
     . "$1"
     perf_resolve_artifact_tools
