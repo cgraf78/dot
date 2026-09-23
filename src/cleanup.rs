@@ -4111,7 +4111,11 @@ impl NestedControlWorker {
                                 .unwrap_or_else(|error| error.into_inner())
                                 .supervisors
                                 .insert(registration.boundary.clone(), registration.pid);
-                            if registration.link.write_all(&[1]).is_err() {
+                            if let Err(error) = registration.link.write_all(&[1]) {
+                                eprintln!(
+                                    "DIAG control-nuke: arm=ack-fail pid={} error={error:?}",
+                                    registration.pid
+                                );
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4126,7 +4130,12 @@ impl NestedControlWorker {
                             );
                         }
                         Ok(None) => break,
-                        Err(_) => {
+                        Err(error) => {
+                            eprintln!(
+                                "DIAG control-nuke: arm=recv-error error={error:?} kind={:?} raw={:?}",
+                                error.kind(),
+                                error.raw_os_error()
+                            );
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.complete = false;
                             state.supervisors.clear();
@@ -4174,6 +4183,7 @@ impl NestedControlWorker {
                             }
                         }
                         Ok(_) => {
+                            eprintln!("DIAG control-nuke: arm=unexpected-byte boundary={boundary}");
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.complete = false;
                             state.supervisors.clear();
