@@ -10907,11 +10907,44 @@ os._exit(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = OwnedChild::new(command.spawn().unwrap());
+        let spawned = command.spawn().unwrap();
+        let pid = spawned.id();
+        let mut child = OwnedChild::new(spawned);
         poll_until(Instant::now() + Duration::from_secs(2), || {
             Ok(ready.exists().then_some(()))
         })
         .expect("stopped provider fixture became ready");
+        // READY precedes the fixture's self-STOP: stopping here would race
+        // it, and a CONT consumed before the STOP lands leaves the child
+        // stopped with TERM pending until escalation KILLs it. Wait for the
+        // stopped state itself so the stop below always resumes a child
+        // that is provably stopped.
+        poll_until(Instant::now() + Duration::from_secs(2), || {
+            let mut status = 0;
+            // SAFETY: direct child pid; WUNTRACED|WNOHANG reports a stop
+            // without reaping. The fixture is not expected to exit before
+            // the stop below, but if it does the poll fails fast here
+            // instead of hanging, before any other wait can observe it.
+            let waited =
+                unsafe { libc::waitpid(pid as i32, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+            if waited < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+            if waited == 0 {
+                return Ok(None);
+            }
+            if libc::WIFSTOPPED(status) {
+                return Ok(Some(()));
+            }
+            Err(std::io::Error::other(
+                "stopped provider fixture exited before stopping itself",
+            ))
+        })
+        .expect("stopped provider fixture stopped itself");
 
         let status = child.stop_with_tick(libc::SIGTERM, &mut || Ok(())).unwrap();
 
