@@ -90,7 +90,7 @@ pub fn fetch_one(
 }
 
 /// `_repo_push_one`: print the push header, then `push` through
-/// [`repo_git`].
+/// [`repo_git_forwarded`].
 ///
 /// A failed base push keeps the shell's hard-fail (exactly exit 1); a
 /// failed overlay push warns on `err` and returns success so one stale
@@ -127,7 +127,7 @@ pub fn push_one(
 }
 
 /// `_repo_diff_one`: print the diff header, then `diff` through
-/// [`repo_git`], propagating git's exit code like the shell.
+/// [`repo_git_forwarded`], propagating git's exit code like the shell.
 pub fn diff_one(
     log: &Log,
     out: &mut dyn Write,
@@ -145,7 +145,7 @@ pub fn diff_one(
 }
 
 /// `_repo_status_one`: print the status header, then `status` through
-/// [`repo_git`], propagating git's exit code like the shell.
+/// [`repo_git_forwarded`], propagating git's exit code like the shell.
 pub fn status_one(
     log: &Log,
     out: &mut dyn Write,
