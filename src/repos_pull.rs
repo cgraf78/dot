@@ -285,16 +285,15 @@ pub fn pull_base(
         Ok(upstream) => upstream,
         Err(_) => return failed(),
     };
-    let head_before = repo_head(&prefix);
-    match accept_current_generation(
+    let (accept_status, head_before) = accept_current_generation(
         &prefix,
         "base",
-        &head_before,
         &upstream,
         inputs.candidate,
         inputs.log,
         warnings,
-    ) {
+    );
+    match accept_status {
         0 => return done(PullStatus::Current),
         1 => {}
         _ => return failed(),
