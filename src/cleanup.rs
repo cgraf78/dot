@@ -6647,9 +6647,6 @@ impl Session {
         while changed {
             changed = false;
             for process in processes {
-                if owned.contains(&process.identity) {
-                    continue;
-                }
                 let parent_process = processes
                     .iter()
                     .find(|candidate| candidate.pid == process.parent);
@@ -6660,12 +6657,38 @@ impl Session {
                     .is_some_and(|candidate| self.delegated.contains(&candidate.identity));
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 let direct_adoptee = process.parent == parent;
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let delegated = !direct_adoptee
+                    && (inherited_delegation
+                        || parent_process.is_some_and(|parent| {
+                            parent.live && self.nested_supervisors.contains_key(&parent.pid)
+                        }));
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let delegated = false;
+                if owned.contains(&process.identity) {
+                    // Ownership is sticky, but delegation is recomputed every
+                    // observation: the set is cleared above, so without this
+                    // a delegated child that outlives one grace quantum loses
+                    // its delegation and the next delivery round re-signals a
+                    // child its nested supervisor already owns (a slow TERM
+                    // trap can then run twice). The recompute is pure snapshot
+                    // and map lookups, preserving the syscall avoidance below.
+                    // The leader itself always evaluates to undelegated here
+                    // (its parent is outside the session and can never be a
+                    // registered nested supervisor), so delivery to the leader
+                    // is unchanged.
+                    if delegated && self.delegated.insert(process.identity.clone()) {
+                        changed = true;
+                    }
+                    continue;
+                }
                 // Skip every syscall below (status registry, environ read,
                 // fd-table walk) for processes no ownership rule can match.
                 // Adoption requires a direct child of this process; the other
-                // rules use only snapshot fields. Delegation marking lives
-                // inside the ownership insert, so a skipped process cannot
-                // gain delegation state either.
+                // rules use only snapshot fields. These pre-filtered processes
+                // can never be owned, so they gain no delegation state either
+                // (unlike already-owned members, whose delegation is refreshed
+                // above).
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 if process.session != leader && !inherited && !direct_adoptee {
                     continue;
@@ -6717,14 +6740,6 @@ impl Session {
                 };
                 #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 let adopted = false;
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                let delegated = !direct_adoptee
-                    && (inherited_delegation
-                        || parent_process.is_some_and(|parent| {
-                            parent.live && self.nested_supervisors.contains_key(&parent.pid)
-                        }));
-                #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                let delegated = false;
                 if process.session == leader || inherited || adopted {
                     owned.insert(process.identity.clone());
                     if delegated {
@@ -7395,6 +7410,89 @@ mod tests {
         );
         drop(local);
         drop(worker);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn repeated_observation_keeps_delegation_for_a_live_nested_child() {
+        // A delegated child that outlives one grace quantum must keep its
+        // delegation: the set is cleared every observation, so if sticky
+        // ownership skips the recompute, the next delivery round re-signals
+        // a child its nested supervisor already owns (and a slow TERM trap
+        // runs twice). The child is a real process so member claiming pins
+        // it exactly like production; only its ancestry rows are doctored.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let child_identity = linux_process_info(child_pid)
+            .expect("live child snapshot")
+            .identity;
+        let leader = 1_000_000u32;
+        let supervisor = 1_000_001u32;
+        let row = |pid: u32, parent: u32, identity: ProcessIdentity| ProcessInfo {
+            pid,
+            parent,
+            group: leader,
+            session: leader,
+            live: true,
+            identity,
+        };
+        let snapshot = vec![
+            row(
+                leader,
+                1,
+                ProcessIdentity {
+                    pid: leader,
+                    start: Some(u64::from(leader)),
+                },
+            ),
+            row(
+                supervisor,
+                leader,
+                ProcessIdentity {
+                    pid: supervisor,
+                    start: Some(u64::from(supervisor)),
+                },
+            ),
+            row(child_pid, supervisor, child_identity.clone()),
+        ];
+        let mut session = Session::new(leader);
+        session
+            .nested_supervisors
+            .insert(supervisor, "d".repeat(64));
+        assert!(!session.observe(&snapshot));
+        assert!(
+            session.delegated.contains(&child_identity),
+            "first observation must delegate the nested child"
+        );
+        assert!(
+            session.members.contains_key(&child_pid),
+            "child must be a claimed member so sticky ownership is exercised"
+        );
+        // Second observation with an identical snapshot (the child is still
+        // alive in its TERM trap): delegation must persist so delivery
+        // still skips it.
+        assert!(!session.observe(&snapshot));
+        assert!(
+            session.delegated.contains(&child_identity),
+            "second observation dropped delegation for a live nested child"
+        );
+        session.signal_new(libc::SIGTERM);
+        assert!(
+            !session
+                .members
+                .get(&child_pid)
+                .map(|member| member.signaled)
+                .unwrap_or(true),
+            "delivery must skip the still-delegated child"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
