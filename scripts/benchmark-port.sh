@@ -506,7 +506,17 @@ perf_require_executable_scratch() {
 
   probe=$scratch/native-execution-probe
 
-  "$PERF_CP" -- "$PERF_UNAME" "$probe" || {
+  # The probe is a shebang-less script: copying a system binary fails
+  # where that binary is a multi-call applet (busybox uname on Alpine
+  # exits 127 for an unrecognized argv[0]), while a shebang would fail
+  # where /bin/sh is absent (Termux). The invoking shell's ENOEXEC
+  # fallback runs `exit 0` everywhere, and a noexec mount still
+  # refuses with EACCES.
+  printf 'exit 0\n' >"$probe" || {
+    printf 'error: cannot create native executable scratch probe\n' >&2
+    return 1
+  }
+  "$PERF_CHMOD" 0755 -- "$probe" || {
     printf 'error: cannot create native executable scratch probe\n' >&2
     return 1
   }

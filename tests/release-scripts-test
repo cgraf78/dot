@@ -1693,16 +1693,18 @@ fi
 
 noexec_probe=$DOT_TEST_TMP/noexec-probe
 mkdir -p "$noexec_probe/scratch"
-cat >"$noexec_probe/copy-without-execute" <<'EOF'
+# The probe must fail to run for every user: mode 0600 refuses
+# execution uniformly (the kernel requires at least one execute bit
+# even for root), which simulates a noexec mount on all platforms.
+cat >"$noexec_probe/chmod-without-execute" <<'EOF'
 #!/bin/sh
-/bin/cp "$@" || exit
 destination=
 for argument do
   destination=$argument
 done
 /bin/chmod 0600 "$destination"
 EOF
-chmod 0700 "$noexec_probe/copy-without-execute"
+chmod 0700 "$noexec_probe/chmod-without-execute"
 noexec_output=
 if noexec_output=$(bash -c '
   set -euo pipefail
@@ -1710,7 +1712,7 @@ if noexec_output=$(bash -c '
   declare -F perf_require_executable_scratch >/dev/null
   perf_resolve_tools
   perf_require_executable_scratch "$2/scratch"
-  PERF_CP=$2/copy-without-execute
+  PERF_CHMOD=$2/chmod-without-execute
   ! perf_require_executable_scratch "$2/scratch"
 ' _ "$DOT_TEST_ROOT/scripts/benchmark-port.sh" "$noexec_probe" 2>&1); then
   :
