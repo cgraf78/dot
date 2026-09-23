@@ -1159,6 +1159,41 @@ fn wait_for_nonempty(path: &Path, seconds: u64) -> bool {
     }
 }
 
+/// Wait until a fixture child reports a job-control stop. `SIGSTOP` is
+/// asynchronous: `kill` returning does not mean the target stopped, and
+/// releasing a fixture the moment `kill` returns lets Dot run a live
+/// tick in the provider's write-then-exit window — acknowledging a
+/// prompt the staged exit should have suppressed. `WUNTRACED` reports
+/// the stop without consuming the eventual exit status, so the later
+/// reap still observes the real outcome.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_for_stopped(pid: i32, seconds: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    loop {
+        let mut status = 0;
+        // SAFETY: pid is the fixture-owned Dot child.
+        let observed = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+        if observed == pid {
+            if libc::WIFSTOPPED(status) {
+                return true;
+            }
+            // The child exited instead of stopping: it will never stage
+            // the freeze, so report that rather than timing out.
+            return false;
+        }
+        if observed < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn process_running_pid(pid: i32) -> bool {
     match std::fs::read(format!("/proc/{pid}/stat")) {
@@ -3854,8 +3889,15 @@ fn provider_complete_final_prompt_is_not_acknowledged_after_conventional_interru
     let provider_pid = wait_for_pid(&provider_pid_file, 10).expect("final prompt provider pid");
     // Freeze Dot before releasing the provider so the complete JSONL record
     // and exit status are both published before the supervisor can drain.
+    // The freeze must be observed, not merely requested: SIGSTOP is
+    // asynchronous, and releasing on kill alone lets a live tick win the
+    // provider's write-then-exit race and acknowledge the staged prompt.
     // SAFETY: the fixture owns this positive Dot child.
     assert_eq!(unsafe { libc::kill(dot.id(), libc::SIGSTOP) }, 0);
+    assert!(
+        wait_for_stopped(dot.id(), 10),
+        "Dot did not stop before the provider release"
+    );
     std::fs::write(&prompt_release, b"ready\n").expect("release final prompt provider");
     let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while process_running_pid(provider_pid) && std::time::Instant::now() < exit_deadline {
