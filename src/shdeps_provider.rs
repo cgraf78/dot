@@ -662,6 +662,7 @@ pub(crate) fn prepare(
     // which may commit to the source checkout like any provider
     // run; later revision reads must re-probe.
     crate::startup::invalidate_revision_cache();
+    crate::repos_base::invalidate_client_match_cache();
     outcome
 }
 
@@ -758,6 +759,7 @@ pub(crate) fn update(
     // trustworthy. Later guards (reexec verification, defensive
     // reload) must re-probe.
     crate::startup::invalidate_revision_cache();
+    crate::repos_base::invalidate_client_match_cache();
     outcome
 }
 
