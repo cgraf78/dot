@@ -74,13 +74,15 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 # Start COMMAND with SIGNAL at its default disposition, then exec so the
-# backgrounded caller's $! stays the driver PID. GNU env resets through
-# --default-signal; busybox env lacks the flag, so probe once and exec
-# directly there instead. The reset is defensive only: drivers inherit
-# default dispositions in practice (parents trap, never ignore, and CI
-# runners do not ignore these signals), and a shell cannot reset a
-# signal ignored on entry anyway. Call only backgrounded: a foreground
-# call would replace this shell.
+# backgrounded caller's $! stays the driver PID. Without job control a
+# backgrounded child forces SIGINT/SIGQUIT to ignored, which the driver
+# could neither trap nor reset, so call sites enable monitor mode
+# around the spawn: the child then inherits the trap (reset to default
+# across exec) instead of ignored. GNU env additionally resets through
+# --default-signal, which busybox env lacks, so probe once and exec
+# directly there; the inherited default is what the driver needs.
+# Call only backgrounded, with monitor mode set: a foreground call
+# would replace this shell.
 with_default_signal() {
   local signal=$1
   shift
@@ -559,6 +561,9 @@ while [[ ! -e $2 ]]; do
 done
 HOLDER
     chmod +x "$close_holder"
+    # Monitor mode keeps SIGINT/SIGQUIT trappable in the backgrounded
+    # driver (without it the child forces both to ignored).
+    set -m
     # shellcheck disable=SC2016 # Positional parameters expand in the child Bash.
     with_default_signal "$close_signal" /bin/bash -c '
     set -euo pipefail
@@ -573,6 +578,7 @@ HOLDER
     while :; do /bin/sleep 0.05; done
   ' _ "$DOT_TEST_ROOT/scripts/benchmark-port.sh" "$close_fixture" \
       "$close_fixture/ready" "$close_signal" "$close_status" &
+    set +m
     close_driver_pid=$!
     for _ in {1..500}; do
       [[ -e $close_fixture/ready ]] && break
@@ -4034,6 +4040,9 @@ while [[ ! -s '$cargo_graceful/escaped-pid' ]]; do /bin/sleep 0.01; done
 while :; do /bin/sleep 1; done
 EOF
       chmod 0700 "$cargo_graceful/stuck-cargo"
+      # Monitor mode keeps SIGINT/SIGQUIT trappable in the backgrounded
+      # driver (without it the child forces both to ignored).
+      set -m
       # shellcheck disable=SC2016 # Positional parameters expand in the child Bash.
       with_default_signal "$graceful_signal" /bin/bash -c '
     set -euo pipefail
@@ -4064,6 +4073,7 @@ EOF
   ' _ "$DOT_TEST_ROOT/scripts/benchmark-port.sh" "$cargo_graceful" \
         "$cargo_tree/scratch/performance-command-supervisor" "$graceful_signal" \
         "$graceful_status" &
+      set +m
       graceful_driver_pid=$!
       for _ in {1..500}; do
         [[ -s $cargo_graceful/leader-pid &&
