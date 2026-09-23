@@ -6341,7 +6341,7 @@ fn stop_sessions_with_tick(
     // final reaping share one additional bounded window rather than renewing
     // a full deadline at each stage; retain half a grace of scan margin for a
     // busy host without allowing teardown latency to accumulate unboundedly.
-    let hard_deadline = graceful_deadline
+    let mut hard_deadline = graceful_deadline
         + Duration::from_millis(GRACE_ATTEMPTS as u64 * GRACE_INTERVAL_MS * 3 / 2);
     // Deliver to the retained leader before a potentially expensive global
     // snapshot. On pidfd-capable systems every other member is then delivered
@@ -6395,11 +6395,46 @@ fn stop_sessions_with_tick(
         // Keep the leader unreaped so its original process-group ID remains
         // reserved until two complete snapshots prove the session empty.
         consecutive_empty = 0;
+        // Settle round: a member forked during the final grace observation
+        // was never observed, so it never received the catchable signal and
+        // may never have been scheduled. KILLing it immediately would deny
+        // the trap the graceful protocol promises: a newborn whose first
+        // schedule lands after the KILL dies silently instead of trapping.
+        // Observe once more, deliver the catchable signal to anything never
+        // signaled, and yield one scheduling quantum before the first group
+        // KILL. The trap's execution is not observable from the supervisor,
+        // so this is a deliberate bounded settle rather than a condition
+        // wait; a member forked during the sleep itself still dies
+        // KILL-first, so this narrows the race rather than eliminating it
+        // (elimination would need per-member delivery tracking). Skipped
+        // when the first signal is uncatchable (KILL, STOP): no handler can
+        // run, so there is no trap to protect (the drop-path caller).
+        if first_signal != libc::SIGKILL && first_signal != libc::SIGSTOP {
+            let settle_start = Instant::now();
+            let observed = observe_sessions(&mut sessions, hard_deadline);
+            sessions_stably_empty(observed, &mut consecutive_empty);
+            for session in &mut sessions {
+                session.signal_new(first_signal);
+            }
+            for _ in 0..4 {
+                let next_tick = tick();
+                if tick_result.is_ok() {
+                    tick_result = next_tick;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(GRACE_INTERVAL_MS));
+            // The settle round is delivery, not verification: refund its
+            // cost to the hard deadline so the later KILL keeps its full
+            // certification budget instead of starving it on a host whose
+            // scans are already slow.
+            hard_deadline += settle_start.elapsed();
+        }
         for session in &mut sessions {
-            // Do not spend the hard-phase budget on a pre-KILL host snapshot.
-            // The last graceful observation already established the owned
-            // cohort; KILL first, then use complete snapshots to discover and
+            // KILL first, then use complete snapshots to discover and
             // deliver to any late members before certifying stable absence.
+            // The settle round above already gave never-signaled members
+            // their catchable delivery; no further pre-KILL snapshot is
+            // needed here.
             session.signal_all(libc::SIGKILL);
         }
         while Instant::now() < hard_deadline {
