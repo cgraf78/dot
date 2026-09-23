@@ -1242,9 +1242,12 @@ mod tests {
     fn batch_waiter_redraws_while_stalled() {
         // A worker that outlasts the poll quantum must still redraw
         // the live line: interval 0 forces every poll to render, so
-        // one 150ms stall (past the 100ms quantum) proves the wiring
-        // without sleeping out a production second. The received
-        // record proves the waiter stayed until completion.
+        // one 350ms stall (past the 100ms quantum with margin for
+        // main-thread scheduling slop between spawn and the first
+        // recv, which otherwise collapses the stall below one
+        // quantum on loaded runners) proves the wiring without
+        // sleeping out a production second. The received record
+        // proves the waiter stayed until completion.
         let palette = crate::progress_ui::Palette::empty();
         let mut stage = crate::progress_ui::Stage::begin(palette, "5", false, true, false, true);
         let mut out = Vec::new();
@@ -1256,7 +1259,7 @@ mod tests {
                 script: std::path::PathBuf::from("s.sh"),
             };
             let worker = scope.spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(150));
+                std::thread::sleep(std::time::Duration::from_millis(350));
                 let _ = tx.send(ResultRecord {
                     hook: Hook {
                         key: std::ffi::OsString::from("k"),
@@ -1274,7 +1277,7 @@ mod tests {
             assert!(record.has_merge);
             assert_eq!(record.elapsed_ms, 7);
         });
-        assert!(out.contains(&0x1b), "150ms stall drew no heartbeat");
+        assert!(out.contains(&0x1b), "350ms stall drew no heartbeat");
     }
 
     #[test]
