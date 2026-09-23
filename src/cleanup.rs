@@ -2436,11 +2436,17 @@ impl ProcessOutputEndpoint {
         self.channel.take();
         let Some(pid) = self.child.take() else {
             self.registration.take();
-            return if channel_failed {
+            let result = if channel_failed {
                 ProcessOutputFinish::OutputFailed
             } else {
                 ProcessOutputFinish::Complete
             };
+            if result != ProcessOutputFinish::Complete {
+                eprintln!(
+                    "DIAG relay-finish: no-child drain={drain} channel_failed={channel_failed}"
+                );
+            }
+            return result;
         };
         let mut status = 0;
         if !drain || channel_failed || !finish_sent {
@@ -2452,7 +2458,7 @@ impl ProcessOutputEndpoint {
             let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
             if waited == pid {
                 self.registration.take();
-                return if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) == 125 {
+                let result = if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) == 125 {
                     ProcessOutputFinish::CleanupIncomplete
                 } else if drain
                     && (!channel_failed && finish_sent && libc::WEXITSTATUS(status) == 0)
@@ -2466,9 +2472,25 @@ impl ProcessOutputEndpoint {
                 } else {
                     ProcessOutputFinish::OutputFailed
                 };
+                if result != ProcessOutputFinish::Complete {
+                    eprintln!(
+                        "DIAG relay-finish: pid={pid} drain={drain} channel_failed={channel_failed} finish_sent={finish_sent} status={status} exited={} code={}",
+                        libc::WIFEXITED(status),
+                        if libc::WIFEXITED(status) {
+                            libc::WEXITSTATUS(status)
+                        } else {
+                            -1
+                        }
+                    );
+                }
+                return result;
             }
             if waited < 0 {
                 self.registration.take();
+                eprintln!(
+                    "DIAG relay-finish: pid={pid} drain={drain} waitpid-error={:?}",
+                    std::io::Error::last_os_error()
+                );
                 return ProcessOutputFinish::CleanupIncomplete;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -2480,6 +2502,9 @@ impl ProcessOutputEndpoint {
         // undrained sink, not a leaked descendant: the watchdog kill above
         // reaps it, so only genuinely unreaped helpers fail closed. Lost
         // output preserves the command's own status instead of raising 125.
+        eprintln!(
+            "DIAG relay-finish: pid={pid} drain={drain} channel_failed={channel_failed} finish_sent={finish_sent} timeout reaped={reaped}"
+        );
         if reaped {
             ProcessOutputFinish::OutputFailed
         } else {
@@ -5442,6 +5467,10 @@ impl OwnedSession {
     pub(crate) fn stop(&mut self, signal: i32) -> std::io::Result<std::process::ExitStatus> {
         let outcome = self.stop_with_tick_outcome(signal, true, &mut || Ok(()));
         if outcome.status.is_err() {
+            eprintln!(
+                "DIAG stop-owned-session-error: signal={signal} error={:?}",
+                outcome.status.as_ref().err()
+            );
             CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         outcome.into_result()
@@ -6211,6 +6240,10 @@ pub(crate) fn stop_owned_sessions(
         }
     }
     if results.iter().any(std::result::Result::is_err) {
+        eprintln!(
+            "DIAG stop-owned-sessions-error: {:?}",
+            results.iter().find_map(|result| result.as_ref().err())
+        );
         CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     results
