@@ -320,12 +320,29 @@ fn is_registered_session_leader(pid: u32) -> bool {
         .contains_key(&pid)
 }
 
-fn active_status_children()
--> &'static Mutex<std::collections::BTreeMap<u32, std::collections::BTreeSet<u64>>> {
-    static CHILDREN: OnceLock<
-        Mutex<std::collections::BTreeMap<u32, std::collections::BTreeSet<u64>>>,
-    > = OnceLock::new();
+/// Live wait-status owners by PID, each holding the owner's start-tick
+/// identity so a recycled PID never inherits the retained-status skip.
+type StatusChildRegistrations =
+    std::collections::BTreeMap<u32, std::collections::BTreeMap<u64, Option<ProcessIdentity>>>;
+
+fn active_status_children() -> &'static Mutex<StatusChildRegistrations> {
+    static CHILDREN: OnceLock<Mutex<StatusChildRegistrations>> = OnceLock::new();
     CHILDREN.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Snapshot the wait-status owner's identity at registration time, so a
+/// later process that recycled the PID is never mistaken for the retained
+/// child. Registration always targets a live (possibly zombie) process, so
+/// procfs exposes its start tick; a vanished PID records `None` and keeps
+/// the legacy conservative skip.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn snapshot_registration_identity(pid: u32) -> Option<ProcessIdentity> {
+    linux_process_info(pid).map(|process| process.identity)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn snapshot_registration_identity(_pid: u32) -> Option<ProcessIdentity> {
+    None
 }
 
 static STATUS_CHILD_LAUNCHES: std::sync::atomic::AtomicUsize =
@@ -384,12 +401,13 @@ impl StatusChildRegistration {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let registration = next_process_registration();
+        let identity = snapshot_registration_identity(pid);
         active_status_children()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .entry(pid)
             .or_default()
-            .insert(registration);
+            .insert(registration, identity);
         if track_generation {
             PROCESS_OWNERSHIP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -411,7 +429,7 @@ impl Drop for StatusChildRegistration {
             .unwrap_or_else(|error| error.into_inner());
         let removed = children
             .get_mut(&self.pid)
-            .is_some_and(|registrations| registrations.remove(&self.registration));
+            .is_some_and(|registrations| registrations.remove(&self.registration).is_some());
         if children
             .get(&self.pid)
             .is_some_and(|entries| entries.is_empty())
@@ -432,6 +450,30 @@ fn is_registered_status_child(pid: u32) -> bool {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .contains_key(&pid)
+}
+
+/// Whether this snapshot row is the retained wait-status owner rather than
+/// a later process that recycled its PID. Registrations outlive the child's
+/// death (the owner holds them through teardown), so a bare PID match would
+/// skip a live session member that reused the number. The skip applies only
+/// when a registration's start tick matches this row; unknown identity on
+/// either side (portable snapshots, a PID that vanished before registration
+/// could snapshot it) keeps the legacy conservative skip.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn is_retained_status_child(process: &ProcessInfo) -> bool {
+    let children = active_status_children()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(registrations) = children.get(&process.pid) else {
+        return false;
+    };
+    let Some(current) = process.identity.start else {
+        return !registrations.is_empty();
+    };
+    registrations.values().any(|stored| match stored {
+        None => true,
+        Some(known) => known.start == Some(current),
+    })
 }
 
 /// Live owned-session lease writers by session leader. A direct child that
@@ -2460,17 +2502,11 @@ impl ProcessOutputEndpoint {
         self.channel.take();
         let Some(pid) = self.child.take() else {
             self.registration.take();
-            let result = if channel_failed {
+            return if channel_failed {
                 ProcessOutputFinish::OutputFailed
             } else {
                 ProcessOutputFinish::Complete
             };
-            if result != ProcessOutputFinish::Complete {
-                eprintln!(
-                    "DIAG relay-finish: no-child drain={drain} channel_failed={channel_failed}"
-                );
-            }
-            return result;
         };
         let mut status = 0;
         if !drain || channel_failed || !finish_sent {
@@ -2482,7 +2518,7 @@ impl ProcessOutputEndpoint {
             let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
             if waited == pid {
                 self.registration.take();
-                let result = if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) == 125 {
+                return if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) == 125 {
                     ProcessOutputFinish::CleanupIncomplete
                 } else if drain
                     && (!channel_failed && finish_sent && libc::WEXITSTATUS(status) == 0)
@@ -2496,25 +2532,9 @@ impl ProcessOutputEndpoint {
                 } else {
                     ProcessOutputFinish::OutputFailed
                 };
-                if result != ProcessOutputFinish::Complete {
-                    eprintln!(
-                        "DIAG relay-finish: pid={pid} drain={drain} channel_failed={channel_failed} finish_sent={finish_sent} status={status} exited={} code={}",
-                        libc::WIFEXITED(status),
-                        if libc::WIFEXITED(status) {
-                            libc::WEXITSTATUS(status)
-                        } else {
-                            -1
-                        }
-                    );
-                }
-                return result;
             }
             if waited < 0 {
                 self.registration.take();
-                eprintln!(
-                    "DIAG relay-finish: pid={pid} drain={drain} waitpid-error={:?}",
-                    std::io::Error::last_os_error()
-                );
                 return ProcessOutputFinish::CleanupIncomplete;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -2526,9 +2546,6 @@ impl ProcessOutputEndpoint {
         // undrained sink, not a leaked descendant: the watchdog kill above
         // reaps it, so only genuinely unreaped helpers fail closed. Lost
         // output preserves the command's own status instead of raising 125.
-        eprintln!(
-            "DIAG relay-finish: pid={pid} drain={drain} channel_failed={channel_failed} finish_sent={finish_sent} timeout reaped={reaped}"
-        );
         if reaped {
             ProcessOutputFinish::OutputFailed
         } else {
@@ -3001,12 +3018,14 @@ fn macos_native_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
     let mut capacity: usize = 4096;
     let mut pids: Vec<i32> = Vec::new();
     let mut complete = false;
+    // Check the deadline once (see proc_process_snapshot): never start
+    // past-due work, but never abandon the fetch loop in flight.
+    if Instant::now() >= deadline {
+        return None;
+    }
     // A full buffer may mean truncation (processes fork concurrently), so
     // grow boundedly until a fetch leaves room, then fall back to `ps`.
     for _ in 0..4 {
-        if Instant::now() >= deadline {
-            return None;
-        }
         pids.resize(capacity, 0);
         // SAFETY: pids owns capacity pid_t slots; PROC_ALL_PIDS lists all.
         let written = unsafe {
@@ -3033,9 +3052,6 @@ fn macos_native_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
     }
     let mut processes = Vec::with_capacity(pids.len());
     for pid in pids {
-        if Instant::now() >= deadline {
-            return None;
-        }
         let Ok(pid) = u32::try_from(pid) else {
             continue;
         };
@@ -3370,16 +3386,21 @@ fn read_proc_stat(path: &Path) -> std::io::Result<Vec<u8>> {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn proc_process_snapshot(root: &Path, deadline: Instant) -> Option<Vec<ProcessInfo>> {
+    // Check the deadline once: never start past-due work, but never
+    // abandon a walk in flight. A thread starved mid-walk would
+    // otherwise discard a completable snapshot and report None,
+    // blinding every observer until the next round; callers' loops
+    // are already deadline-gated, so a complete late snapshot is
+    // strictly more useful than a refusal.
+    if Instant::now() >= deadline {
+        return None;
+    }
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(_) => return None,
     };
     let mut processes = Vec::new();
     for entry in entries {
-        // A partial walk certifies nothing: refuse rather than report.
-        if Instant::now() >= deadline {
-            return None;
-        }
         // An iterator error means the directory walk was incomplete. Falling
         // back to the fixed OS process-table command is safer than certifying
         // an empty session from a partial view.
@@ -4126,13 +4147,6 @@ impl NestedControlWorker {
                             ) && !links.contains_key(&registration.boundary)
                                 && links.len() < MAX_ACTIVE_NESTED_SESSIONS;
                             if !valid {
-                                eprintln!(
-                                    "DIAG control-nuke: arm=invalid-registration pid={} boundary={} duplicate={} links={}",
-                                    registration.pid,
-                                    registration.boundary,
-                                    links.contains_key(&registration.boundary),
-                                    links.len()
-                                );
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4149,10 +4163,6 @@ impl NestedControlWorker {
                             if links.values().any(|(_, link, _)| {
                                 std::os::fd::AsRawFd::as_raw_fd(link) == incoming_fd
                             }) {
-                                eprintln!(
-                                    "DIAG control-nuke: arm=duplicate-fd pid={} fd={incoming_fd}",
-                                    registration.pid
-                                );
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4171,11 +4181,7 @@ impl NestedControlWorker {
                                 .unwrap_or_else(|error| error.into_inner())
                                 .supervisors
                                 .insert(registration.boundary.clone(), registration.pid);
-                            if let Err(error) = registration.link.write_all(&[1]) {
-                                eprintln!(
-                                    "DIAG control-nuke: arm=ack-fail pid={} error={error:?}",
-                                    registration.pid
-                                );
+                            if registration.link.write_all(&[1]).is_err() {
                                 let mut state =
                                     state.lock().unwrap_or_else(|error| error.into_inner());
                                 state.complete = false;
@@ -4190,12 +4196,7 @@ impl NestedControlWorker {
                             );
                         }
                         Ok(None) => break,
-                        Err(error) => {
-                            eprintln!(
-                                "DIAG control-nuke: arm=recv-error error={error:?} kind={:?} raw={:?}",
-                                error.kind(),
-                                error.raw_os_error()
-                            );
+                        Err(_) => {
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.complete = false;
                             state.supervisors.clear();
@@ -4243,7 +4244,6 @@ impl NestedControlWorker {
                             }
                         }
                         Ok(_) => {
-                            eprintln!("DIAG control-nuke: arm=unexpected-byte boundary={boundary}");
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.complete = false;
                             state.supervisors.clear();
@@ -4554,6 +4554,47 @@ pub(crate) fn run_foreground_status(command: Command) -> i32 {
         command,
         None,
         |_| Ok(()),
+        ForegroundLeasePolicy::TrustLeader,
+    ))
+}
+
+/// Run a cooperative foreground child like [`run_foreground_status`],
+/// but pipe its stdout and forward every drained chunk to `out`
+/// instead of inheriting the descriptor.
+///
+/// A header written through the output relay races an inheriting
+/// child's direct descriptor writes: the relay child process may
+/// forward the header only after git already wrote its first line,
+/// printing body-before-header under load. Forwarding keeps a
+/// single writer (the relay) so relayed output stays ordered.
+/// Stderr stays inherited so progress keeps streaming; stdin is the
+/// caller's. Forwarding is unbounded by design (the relay owns
+/// backpressure), so a whole-repo diff never trips a capture limit.
+pub(crate) fn run_foreground_forward_stdout(
+    mut command: Command,
+    out: &mut dyn std::io::Write,
+) -> i32 {
+    let (mut reader, writer) = match SessionCapture::new() {
+        Ok(pair) => pair,
+        Err(_) => return 127,
+    };
+    command.stdout(writer);
+    let mut scratch = Vec::new();
+    session_end_status(supervise_child_with_policy(
+        command,
+        None,
+        |final_pass| {
+            let budget = if final_pass {
+                COMMAND_CAPTURE_FINAL_BYTES
+            } else {
+                COMMAND_CAPTURE_TICK_BYTES
+            };
+            let mut remaining = usize::MAX;
+            let _overflow = reader.drain(&mut scratch, &mut remaining, budget, false)?;
+            out.write_all(&scratch)?;
+            scratch.clear();
+            Ok(())
+        },
         ForegroundLeasePolicy::TrustLeader,
     ))
 }
@@ -5509,10 +5550,6 @@ impl OwnedSession {
     pub(crate) fn stop(&mut self, signal: i32) -> std::io::Result<std::process::ExitStatus> {
         let outcome = self.stop_with_tick_outcome(signal, true, &mut || Ok(()));
         if outcome.status.is_err() {
-            eprintln!(
-                "DIAG stop-owned-session-error: signal={signal} error={:?}",
-                outcome.status.as_ref().err()
-            );
             CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         outcome.into_result()
@@ -6282,10 +6319,6 @@ pub(crate) fn stop_owned_sessions(
         }
     }
     if results.iter().any(std::result::Result::is_err) {
-        eprintln!(
-            "DIAG stop-owned-sessions-error: {:?}",
-            results.iter().find_map(|result| result.as_ref().err())
-        );
         CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     results
@@ -6325,7 +6358,16 @@ fn stop_sessions_with_tick(
     }
     let mut tick_result = tick();
     let mut consecutive_empty = 0;
-    while Instant::now() < graceful_deadline {
+    // Guarantee one observe-and-signal round even if the pre-loop
+    // snapshot starved past the grace deadline. Giving up with zero
+    // graceful rounds would KILL a session that was never signaled
+    // (a late child observed only in the hard phase dies uncatchably
+    // instead of trapping). The hard phase still requires its own
+    // two empties below, so a late round only ever adds delivery,
+    // never weakens verification.
+    let mut first_round = true;
+    while first_round || Instant::now() < graceful_deadline {
+        first_round = false;
         let observed = observe_sessions(&mut sessions, graceful_deadline);
         if sessions_stably_empty(observed, &mut consecutive_empty) {
             break;
@@ -6783,16 +6825,17 @@ impl Session {
                     continue;
                 }
                 #[cfg(any(target_os = "linux", target_os = "android"))]
-                if is_registered_status_child(process.pid) {
+                if is_retained_status_child(process) {
                     // Another caller retains this exact wait status. It must
                     // never become a member merely because a dead process no
-                    // longer exposes its environment marker.
+                    // longer exposes its environment marker. The identity
+                    // check keeps a recycled PID from inheriting the skip.
                     continue;
                 }
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 let adopted = if direct_adoptee
                     && !is_registered_session_leader(process.pid)
-                    && !is_registered_status_child(process.pid)
+                    && !is_retained_status_child(process)
                 {
                     // The pre-filter above already excluded every process
                     // this rule cannot adopt; probing this candidate's
@@ -7739,6 +7782,73 @@ while :; do sleep 0.02; done
         drop(first);
         assert!(is_registered_status_child(pid));
         drop(second);
+        assert!(!is_registered_status_child(pid));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn retained_status_child_ignores_a_recycled_pid() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let live = linux_process_info(pid).unwrap();
+        let Some(tick) = live.identity.start else {
+            panic!("procfs row lacks a start tick");
+        };
+        let registration = StatusChildRegistration::new(pid);
+        // Same process, same start tick: still the retained owner.
+        assert!(is_retained_status_child(&live));
+        // Same PID, different start tick: a recycled impostor that must
+        // never inherit the skip.
+        let recycled = ProcessInfo {
+            pid,
+            parent: live.parent,
+            group: live.group,
+            session: live.session,
+            live: true,
+            identity: ProcessIdentity {
+                pid,
+                start: Some(tick.wrapping_add(1)),
+            },
+        };
+        assert!(!is_retained_status_child(&recycled));
+        // Portable snapshots carry no start tick: keep the legacy skip.
+        let unknown = ProcessInfo {
+            identity: ProcessIdentity { pid, start: None },
+            ..live.clone()
+        };
+        assert!(is_retained_status_child(&unknown));
+        drop(registration);
+        assert!(!is_retained_status_child(&live));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn retained_status_child_skips_when_registration_identity_is_unknown() {
+        // Nothing lives at this PID, so registration snapshots no identity.
+        let pid = u32::MAX - 23;
+        let registration = StatusChildRegistration::new(pid);
+        let row = ProcessInfo {
+            pid,
+            parent: 1,
+            group: 1,
+            session: 1,
+            live: true,
+            identity: ProcessIdentity {
+                pid,
+                start: Some(12345),
+            },
+        };
+        // Unknown stored identity keeps the legacy conservative skip, and
+        // the PID-only view is unchanged for the waitid-derived reaper.
+        assert!(is_retained_status_child(&row));
+        assert!(is_registered_status_child(pid));
+        drop(registration);
+        assert!(!is_retained_status_child(&row));
         assert!(!is_registered_status_child(pid));
     }
 
@@ -9420,12 +9530,17 @@ os._exit(0)
         // spawn-observe-signal-trap chain past the grace window into KILL
         // (loaded hosts flake). `wait` returns immediately on a trapped
         // signal, and the sleeps self-bound the fixture if teardown ever
-        // misses them.
+        // misses them. The late child instead loops over a long sleep:
+        // a `wait`-chained child would exit on its own when the stop
+        // TERM kills its sleep job, winning the race against the
+        // child's own TERM delivery and skipping its trap whenever
+        // the child is first observed late. The loop can only exit
+        // via its TERM trap (or KILL), so the pin is deterministic.
         let mut command = Command::new(dot_test_support::bash());
         command
             .args([
                 "-c",
-                "trap 'printf \"TERM\\n\" >>\"$5\"; if [[ ! -e $2 ]]; then : >\"$2\"; (trap '\"'\"': >\"$4\"; exit 0'\"'\"' TERM; : >\"$3\"; sleep 30 & wait $!) & fi' TERM; : >\"$1\"; sleep 30 & wait $!",
+                "trap 'printf \"TERM\\n\" >>\"$5\"; if [[ ! -e $2 ]]; then : >\"$2\"; (trap '\"'\"': >\"$4\"; exit 0'\"'\"' TERM; : >\"$3\"; while :; do sleep 86400; done) & fi' TERM; : >\"$1\"; sleep 30 & wait $!",
                 "late-term-child",
             ])
             .arg(&ready)

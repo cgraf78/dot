@@ -361,10 +361,6 @@ fn pump_relay(
         if let Err(error) = delivered {
             if sink_error.is_none() {
                 intentional_abort = crate::cleanup::outward_write_aborted();
-                eprintln!(
-                    "DIAG pump-relay-failure: error={error:?} intentional_abort={intentional_abort} interrupted={}",
-                    crate::cleanup::outward_write_interrupted()
-                );
                 sink_error = Some(error);
                 sink_failed.store(true, std::sync::atomic::Ordering::Release);
             }
@@ -2651,11 +2647,28 @@ mod tests {
         // untrusted provider JSONL must render exactly like the
         // `total <= 0` label-only fallback — no bar math on hostile
         // values. Each render uses a fresh stage so the live spinner
-        // state cannot perturb the differential comparison.
-        let fallback = render_phase_event(1, 0);
+        // state cannot perturb the differential comparison. Renders
+        // embed a wall-clock elapsed stamp, so strip the trailing
+        // `Ns` before comparing: a second boundary between two
+        // renders must not fail the differential.
+        fn without_elapsed_stamp(mut bytes: Vec<u8>) -> Vec<u8> {
+            let len = bytes.len();
+            if bytes.last() == Some(&b's') {
+                bytes.pop();
+                while bytes.last().is_some_and(|byte| byte.is_ascii_digit()) {
+                    bytes.pop();
+                }
+            }
+            assert!(
+                bytes.len() < len,
+                "render lost its elapsed stamp; update the normalization"
+            );
+            bytes
+        }
+        let fallback = without_elapsed_stamp(render_phase_event(1, 0));
         assert!(fallback.windows(9).any(|window| window == b"Resolving"));
         for done in [i64::MIN, -1] {
-            assert_eq!(render_phase_event(done, 1), fallback);
+            assert_eq!(without_elapsed_stamp(render_phase_event(done, 1)), fallback);
         }
     }
 

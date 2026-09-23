@@ -314,6 +314,9 @@ fn diff_one_propagates_exit_code_and_status_one_prints_even_when_quiet() {
         assert_eq!(out, b"==> dotfiles\n");
         std::fs::write(repo.join("tracked"), b"two\n").unwrap();
         out.clear();
+        // `--quiet` keeps this an exit-code probe: without it git
+        // prints the diff body, which now forwards through `out`
+        // instead of bypassing it via the inherited descriptor.
         assert_eq!(
             diff_one(
                 &Log::new(false, false),
@@ -322,7 +325,7 @@ fn diff_one_propagates_exit_code_and_status_one_prints_even_when_quiet() {
                 RepoKind::Base,
                 "dotfiles",
                 repo.to_str().unwrap(),
-                &["--exit-code"]
+                &["--exit-code", "--quiet"]
             ),
             1
         );
@@ -340,7 +343,36 @@ fn diff_one_propagates_exit_code_and_status_one_prints_even_when_quiet() {
             ),
             0
         );
-        assert_eq!(out, b"\n==> web dotfiles\n");
+        // The repo was dirtied above, so git's forwarded body follows
+        // the header (it used to bypass `out` via the inherited
+        // descriptor and race the header under load).
+        assert_eq!(out, b"\n==> web dotfiles\n M tracked\n");
+    });
+}
+
+#[test]
+fn status_one_prints_header_before_forwarded_body() {
+    let scope = TempDir::new_exec("commands-status-forwarded").unwrap();
+    let (repo, _) = clone_repo(scope.path(), "base");
+    std::fs::write(repo.join("new.txt"), b"untracked\n").unwrap();
+    let model = base(&repo);
+    bound(scope.path(), || {
+        let mut out = Vec::new();
+        assert_eq!(
+            status_one(
+                &Log::new(false, false),
+                &mut out,
+                &model,
+                RepoKind::Overlay,
+                "web",
+                repo.to_str().unwrap(),
+                &["--short"]
+            ),
+            0
+        );
+        // Header and body share one writer, so a relayed header can
+        // never lose its race with git's first output line.
+        assert_eq!(out, b"\n==> web dotfiles\n?? new.txt\n");
     });
 }
 

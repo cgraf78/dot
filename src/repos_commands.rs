@@ -2,7 +2,7 @@
 //! `lib/dot/repos/commands.sh`.
 //!
 //! The iteration ([`crate::repos_git::each_existing`]), git
-//! invocation ([`crate::repos_git::repo_git`],
+//! invocation ([`crate::repos_git::repo_git_forwarded`],
 //! [`crate::repos_git::repo_git_fetch`]), and mtime-noise
 //! normalization ([`crate::repos_dirty::normalize_filtered`]) live in
 //! sibling modules; this
@@ -16,7 +16,7 @@ use std::io::Write;
 use crate::log::Log;
 use crate::repos_base::{Base, RepoKind};
 use crate::repos_dirty::normalize_filtered;
-use crate::repos_git::{each_existing, repo_git, repo_git_fetch};
+use crate::repos_git::{each_existing, repo_git_fetch, repo_git_forwarded};
 
 /// Header bytes `_repo_simple_header` prints for one repo, including the
 /// shell `echo` trailing newline, or `None` when the shell prints nothing
@@ -86,11 +86,11 @@ pub fn fetch_one(
     mask: u32,
 ) -> i32 {
     print_header(log, out, "fetch", kind, name);
-    repo_git_fetch(base, kind, path, extra, mask)
+    repo_git_fetch(base, kind, path, extra, mask, out)
 }
 
 /// `_repo_push_one`: print the push header, then `push` through
-/// [`repo_git`].
+/// [`repo_git_forwarded`].
 ///
 /// A failed base push keeps the shell's hard-fail (exactly exit 1); a
 /// failed overlay push warns on `err` and returns success so one stale
@@ -112,7 +112,7 @@ pub fn push_one(
     let mut argv: Vec<&str> = Vec::with_capacity(extra.len() + 1);
     argv.push("push");
     argv.extend(extra.iter().copied());
-    let rc = repo_git(base, kind, path, &argv);
+    let rc = repo_git_forwarded(base, kind, path, &argv, out);
     if crate::cleanup::received_signal().is_some() {
         return rc;
     }
@@ -127,7 +127,7 @@ pub fn push_one(
 }
 
 /// `_repo_diff_one`: print the diff header, then `diff` through
-/// [`repo_git`], propagating git's exit code like the shell.
+/// [`repo_git_forwarded`], propagating git's exit code like the shell.
 pub fn diff_one(
     log: &Log,
     out: &mut dyn Write,
@@ -141,11 +141,11 @@ pub fn diff_one(
     let mut argv: Vec<&str> = Vec::with_capacity(extra.len() + 1);
     argv.push("diff");
     argv.extend(extra.iter().copied());
-    repo_git(base, kind, path, &argv)
+    repo_git_forwarded(base, kind, path, &argv, out)
 }
 
 /// `_repo_status_one`: print the status header, then `status` through
-/// [`repo_git`], propagating git's exit code like the shell.
+/// [`repo_git_forwarded`], propagating git's exit code like the shell.
 pub fn status_one(
     log: &Log,
     out: &mut dyn Write,
@@ -159,7 +159,7 @@ pub fn status_one(
     let mut argv: Vec<&str> = Vec::with_capacity(extra.len() + 1);
     argv.push("status");
     argv.extend(extra.iter().copied());
-    repo_git(base, kind, path, &argv)
+    repo_git_forwarded(base, kind, path, &argv, out)
 }
 
 /// `_repo_fetch_all`: fetch every existing repo via [`each_existing`]
