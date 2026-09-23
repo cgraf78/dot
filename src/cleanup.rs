@@ -8590,9 +8590,24 @@ while True:
             .trim()
             .parse::<i32>()
             .unwrap();
-        let survived = alive(pid);
+        // A zombie is already dead: signal-zero still succeeds until
+        // the (possibly loaded) reaper collects it, so only a live
+        // process counts as a cancellation survivor.
+        fn live_descendant(pid: i32) -> bool {
+            let Ok(pid) = u32::try_from(pid) else {
+                return false;
+            };
+            std::fs::read(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let delimiter = stat.windows(2).rposition(|window| window == b") ")?;
+                    stat.get(delimiter + 2).copied()
+                })
+                .is_some_and(|state| !matches!(state, b'Z' | b'X' | b'x'))
+        }
+        let survived = live_descendant(pid);
         let deadline = Instant::now() + Duration::from_secs(6);
-        while alive(pid) && Instant::now() < deadline {
+        while live_descendant(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
 
