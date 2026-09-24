@@ -9598,11 +9598,17 @@ os._exit(0)
         // child's own TERM delivery and skipping its trap whenever
         // the child is first observed late. The loop can only exit
         // via its TERM trap (or KILL), so the pin is deterministic.
+        // The sleep PID is captured into a named variable instead of
+        // `wait $!`: if the stop lands before `wait` starts, the trap
+        // runs first and its background subshell rebinds `$!` to the
+        // late child, so `wait $!` would wait for the late child (which
+        // exits 0) instead of the sleep and the leader would exit 0
+        // instead of 143.
         let mut command = Command::new(dot_test_support::bash());
         command
             .args([
                 "-c",
-                "trap 'printf \"TERM\\n\" >>\"$5\"; if [[ ! -e $2 ]]; then : >\"$2\"; (trap '\"'\"': >\"$4\"; exit 0'\"'\"' TERM; : >\"$3\"; while :; do sleep 86400; done) & fi' TERM; : >\"$1\"; sleep 30 & wait $!",
+                "trap 'printf \"TERM\\n\" >>\"$5\"; if [[ ! -e $2 ]]; then : >\"$2\"; (trap '\"'\"': >\"$4\"; exit 0'\"'\"' TERM; : >\"$3\"; while :; do sleep 86400; done) & fi' TERM; : >\"$1\"; sleep 30 & sleep_pid=$!; wait $sleep_pid",
                 "late-term-child",
             ])
             .arg(&ready)
