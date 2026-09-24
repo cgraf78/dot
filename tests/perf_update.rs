@@ -1291,6 +1291,76 @@ struct LinuxProcessIdentity {
     live: bool,
 }
 
+/// PIDs of timed leaders and supervisor subprocesses currently owned by
+/// a parallel test in this process. Direct-child adoption cannot tell a
+/// foreign leader (reparented to nobody, still owned through its own
+/// Child handle) from a genuinely orphaned descendant: both are direct
+/// children newer than the baseline. Adopting one retains a pidfd
+/// against it (a descriptor-inventory leak for the owner's leak check),
+/// signals it out from under its owner, and reaps it ("vanished before
+/// pidfd validation", ECHILD on its wait). Registration closes that:
+/// every owned async child registers at spawn and releases after its
+/// final reap; adoption skips registered PIDs, and each scan purges
+/// registered PIDs (a spawn-to-register gap adoption) plus their
+/// observed subtrees from membership, retained pidfds, and signaling —
+/// only the boundary's own leader is exempt, since it is registered by
+/// its own owner. Counts, not a set:
+/// a stale release racing a PID-reusing registration must not delete
+/// the new owner's entry.
+#[cfg(target_os = "linux")]
+static TIMED_COMMAND_LEADERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, u32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(target_os = "linux")]
+fn timed_leader_registered(pid: u32) -> bool {
+    TIMED_COMMAND_LEADERS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .contains_key(&pid)
+}
+
+#[cfg(target_os = "linux")]
+struct TimedLeaderGuard {
+    pid: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+impl TimedLeaderGuard {
+    fn register(pid: u32) -> Self {
+        TIMED_COMMAND_LEADERS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .entry(pid)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        Self { pid: Some(pid) }
+    }
+
+    fn release(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            let mut leaders = TIMED_COMMAND_LEADERS
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            match leaders.get(&pid) {
+                Some(1) | None => {
+                    leaders.remove(&pid);
+                }
+                Some(_) => {
+                    leaders.entry(pid).and_modify(|count| *count -= 1);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TimedLeaderGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct ProcessBoundary {
@@ -1663,7 +1733,11 @@ fn prune_retained_members(boundary: &ProcessBoundary) -> Result<Vec<ProcessKey>,
         .map_err(|_| "retained process-boundary map was poisoned".to_string())?;
     let mut exited = Vec::new();
     for (&key, pidfd) in retained.iter() {
-        if pidfd_is_ready(pidfd)? {
+        // A spawn-to-register gap adoption is purged once the foreign
+        // owner registers: the pidfd is dropped (no descriptor leak) and
+        // the PID leaves membership and signaling below. The boundary's
+        // own leader stays: it is registered by its own owner.
+        if (key != boundary.leader && timed_leader_registered(key.pid)) || pidfd_is_ready(pidfd)? {
             exited.push(key);
         }
     }
@@ -1720,6 +1794,7 @@ fn retain_adopted_children(boundary: &ProcessBoundary) -> Result<bool, String> {
             || identity.start < boundary.leader.start
             || boundary.baseline_direct.contains(&key)
             || retained.contains_key(&key)
+            || timed_leader_registered(pid)
         {
             continue;
         }
@@ -1855,7 +1930,8 @@ fn live_boundary_members(boundary: &ProcessBoundary) -> Result<Vec<ProcessKey>, 
             });
             let adopted_after_spawn = identity.parent == boundary.supervisor
                 && identity.start >= boundary.leader.start
-                && !boundary.baseline_direct.contains(&key);
+                && !boundary.baseline_direct.contains(&key)
+                && !timed_leader_registered(pid);
             if identity.session == boundary.leader.pid || parent_owned || adopted_after_spawn {
                 owned.insert(key);
             }
@@ -1864,6 +1940,36 @@ fn live_boundary_members(boundary: &ProcessBoundary) -> Result<Vec<ProcessKey>, 
             break;
         }
     }
+    // Purge gap adoptions transitively: a foreign leader adopted
+    // before its owner registered would otherwise linger in membership,
+    // and its unregistered children would keep entering through parent
+    // linkage (and stay signaled) even after the leader itself is
+    // purged. Purged PIDs cascade to children observed under them in
+    // this scan; the cascade is start-matched so PID reuse cannot drag
+    // an unrelated process in. The boundary's own leader is exempt
+    // throughout: it is registered by its own owner.
+    let mut purged: HashSet<u32> = owned
+        .iter()
+        .filter(|key| *key != &boundary.leader && timed_leader_registered(key.pid))
+        .map(|key| key.pid)
+        .collect();
+    loop {
+        let before = purged.len();
+        for key in owned.iter() {
+            if *key == boundary.leader || purged.contains(&key.pid) {
+                continue;
+            }
+            if let Some(identity) = processes.get(&key.pid) {
+                if identity.start == key.start && purged.contains(&identity.parent) {
+                    purged.insert(key.pid);
+                }
+            }
+        }
+        if purged.len() == before {
+            break;
+        }
+    }
+    owned.retain(|key| *key == boundary.leader || !purged.contains(&key.pid));
     *boundary
         .observed
         .lock()
@@ -1873,6 +1979,9 @@ fn live_boundary_members(boundary: &ProcessBoundary) -> Result<Vec<ProcessKey>, 
         .retained
         .lock()
         .map_err(|_| "retained process-boundary map was poisoned".to_string())?;
+    // Membership shrank above; drop retained pidfds that left it so a
+    // purged subtree leaves signaling and the member list together.
+    retained.retain(|key, _| owned.contains(key));
     for key in owned {
         if retained.contains_key(&key) {
             continue;
@@ -1915,6 +2024,12 @@ fn signal_members(boundary: &ProcessBoundary, signal: i32) -> Result<(), String>
         .lock()
         .map_err(|_| "retained process-boundary map was poisoned".to_string())?;
     for (&key, pidfd) in retained.iter() {
+        // Never signal a PID another test owns: a spawn-to-register gap
+        // adoption retains a pidfd against a foreign leader, and the
+        // prune above runs per scan while signals land between scans.
+        if key != boundary.leader && timed_leader_registered(key.pid) {
+            continue;
+        }
         // SAFETY: pidfd_send_signal targets the exact process instance held by
         // the descriptor, even if its numeric PID has since been recycled.
         let result = unsafe {
@@ -1968,6 +2083,31 @@ fn drain_boundary(
             }
         }
         if Instant::now() >= deadline {
+            // Expiry with an empty boundary must not escalate to the next
+            // signal: confirm once more (a scan can miss a fork in flight)
+            // and clear when the boundary stays empty. Blind escalation
+            // burns the full forced grace, and its signals, on a boundary
+            // that is already drained, which breaks bounded cleanup budgets
+            // whenever process-table scans are slow.
+            if members.is_empty() {
+                let confirmed = match live_boundary_members(boundary) {
+                    Ok(members) => members,
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        prune_retained_members(boundary)?
+                    }
+                };
+                if confirmed.is_empty() {
+                    return first_error.map_or(Ok(true), Err);
+                }
+                if let Err(error) = signal_members(boundary, signal) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
             return first_error.map_or(Ok(false), Err);
         }
         std::thread::sleep(PROCESS_POLL);
@@ -2056,6 +2196,13 @@ fn reap_observed_children(boundary: &ProcessBoundary) -> Result<(), String> {
         .clone();
     for key in observed {
         if key == boundary.leader {
+            continue;
+        }
+        // Reap-time ownership check: a foreign leader adopted in the
+        // spawn-to-register gap must never be reaped while its owner
+        // still holds it (release always follows the owner's final
+        // wait, so a registered PID is still owned).
+        if timed_leader_registered(key.pid) {
             continue;
         }
         let mut status = 0;
@@ -2250,6 +2397,7 @@ fn supervise_timed_command(
     let mut child = command
         .spawn()
         .map_err(|error| format!("spawn command: {error}"))?;
+    let mut leader_guard = TimedLeaderGuard::register(child.id());
     let stdout = child
         .stdout
         .take()
@@ -2277,6 +2425,7 @@ fn supervise_timed_command(
         Err(error) => {
             let _ = signal_original_group(session, libc::SIGKILL);
             let _ = child.wait();
+            leader_guard.release();
             capture_stop.store(true, Ordering::Release);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
@@ -2339,6 +2488,10 @@ fn supervise_timed_command(
         .join()
         .map_err(|_| "command waiter panicked".to_string());
     let reap = reap_observed_children(&boundary);
+    // Release only after the final reap: between the leader's wait and
+    // this point the PID is still ours, and an early release would let a
+    // parallel test adopt a PID-reusing new process under our name.
+    leader_guard.release();
     if cleanup.is_err()
         || quiescence.is_err()
         || wait_error.is_some()
@@ -2584,9 +2737,14 @@ fn run_timed_command_with_scan_fault_marker(
     if let Some(path) = direct_pid_file {
         supervisor.env(SUPERVISOR_DIRECT_PID_FILE_ENV, path);
     }
-    let status = supervisor
-        .status()
+    let mut supervisor_child = supervisor
+        .spawn()
         .map_err(|error| format!("spawn performance supervisor: {error}"))?;
+    let mut supervisor_guard = TimedLeaderGuard::register(supervisor_child.id());
+    let status = supervisor_child
+        .wait()
+        .map_err(|error| format!("wait for performance supervisor: {error}"))?;
+    supervisor_guard.release();
     if !status.success() {
         let error = fs::read_to_string(exchange.path().join("error"))
             .unwrap_or_else(|_| "performance supervisor failed without a diagnostic".to_string());
@@ -2985,12 +3143,14 @@ fn should_skip(root: ClientRoot, relative: &Path) -> bool {
     let first = components.next();
     if matches!(root, ClientRoot::Home) {
         if let Some(Component::Normal(name)) = first {
-            // `.scm.sqlite` is SCM's async telemetry database: a lingering
-            // SCM helper may create it after Dot returns, so it is never
-            // converged content (same exclusion as `tests/update_run.rs`).
+            // `.scm.sqlite*` is SCM's async telemetry database with its
+            // SQLite sidecars: a lingering SCM helper may create them after
+            // Dot returns, so none is ever converged content (same exclusion
+            // as `tests/update_run.rs`).
             if name == OsStr::new(".dotfiles")
                 || name == OsStr::new(".dot-backup")
                 || name == OsStr::new(".scm.sqlite")
+                || name.as_bytes().starts_with(b".scm.sqlite-")
                 || name.as_bytes().starts_with(b".dotfiles-overlay-")
             {
                 return true;
@@ -4886,8 +5046,13 @@ fn timed_command_accepts_only_a_quiescent_success() {
 fn timed_command_allows_a_short_lived_descendant_to_quiesce() {
     let scratch = Scratch::new_exec("perf-quiescence").expect("scratch");
     let marker = scratch.path().join("required-marker");
+    // Margin math: quiescence must observe the descendant's whole life
+    // (spawn chain + timer + exit) plus two confirming scans inside the
+    // 500ms grace. Each full process-table scan costs 100ms+ on a loaded
+    // host, so the timer stays small; the marker below (not a wall-clock
+    // lower bound) proves the supervisor waited for the descendant.
     let script = format!(
-        "( sleep 0.15; printf complete >'{}' ) </dev/null >/dev/null 2>&1 & exit 0",
+        "( sleep 0.05; printf complete >'{}' ) </dev/null >/dev/null 2>&1 & exit 0",
         marker.display()
     );
     let mut command = Command::new("/bin/sh");
@@ -4899,11 +5064,6 @@ fn timed_command_allows_a_short_lived_descendant_to_quiesce() {
     assert_eq!(
         fs::read(marker).expect("delayed required marker"),
         b"complete"
-    );
-    assert!(
-        output.elapsed_ns >= Duration::from_millis(100).as_nanos(),
-        "elapsed time excluded required descendant work: {}ns",
-        output.elapsed_ns
     );
 }
 
@@ -4923,10 +5083,194 @@ fn timed_command_rejects_quiescence_after_the_total_deadline() {
         error.contains("live descendant") || error.contains("timed out"),
         "{error}"
     );
+    // Total elapsed covers supervisor spawn plus cleanup scans (each full
+    // process-table scan costs 100ms+ on a loaded host), so it cannot pin
+    // quiescence behavior precisely; the clamp itself is pinned by
+    // descendant_quiescence_stops_at_the_total_deadline. This bound only
+    // guards against unbounded cleanup, consistent with sibling tests.
     assert!(
-        started.elapsed() < Duration::from_millis(800),
-        "total deadline was extended by the quiescence grace"
+        started.elapsed() < Duration::from_secs(5),
+        "bounded cleanup exceeded its deadline"
     );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn drain_empty_boundary_at_expiry_clears_without_escalation() {
+    // Fake leader: no live process can match u32::MAX, and the maximal start
+    // time excludes every direct-child adoption, so the boundary is
+    // deterministically empty regardless of host load. A 1ms grace forces
+    // the expiry path; with no members the drain must report cleared
+    // instead of escalating to the next signal.
+    let boundary = ProcessBoundary {
+        leader: ProcessKey {
+            pid: u32::MAX,
+            start: u64::MAX,
+        },
+        supervisor: std::process::id(),
+        baseline_direct: HashSet::new(),
+        observed: Mutex::new(HashSet::new()),
+        retained: Mutex::new(HashMap::new()),
+        scan_fault: Mutex::new(ScanFault::default()),
+    };
+    let cleared = drain_boundary(
+        &boundary,
+        libc::SIGTERM,
+        Instant::now() + Duration::from_millis(1),
+    )
+    .expect("empty drain succeeds");
+    assert!(cleared, "expiry with an empty boundary escalated");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn descendant_quiescence_stops_at_the_total_deadline() {
+    // The "live descendant" is this test process itself, pre-seeded into
+    // the boundary: trivially live for the whole test with no
+    // spawn/kill/reap, and invisible to parallel tests (its parent and
+    // session are the harness's, never another test's boundary), so no
+    // fixture child can be adopted or signaled out from under this
+    // boundary. Quiescence can only end at the deadline. The 100ms
+    // deadline sits well inside the 500ms quiescence grace, so a broken
+    // clamp (waiting out the grace) overshoots the 450ms bound even on a
+    // quiet host, while a correct clamp lands near the deadline even
+    // when scans are slow.
+    let supervisor = std::process::id();
+    let identity = linux_process_identity(supervisor)
+        .expect("read test-process identity")
+        .expect("test process is alive");
+    let boundary = ProcessBoundary {
+        leader: ProcessKey {
+            pid: u32::MAX,
+            start: 0,
+        },
+        supervisor,
+        baseline_direct: HashSet::new(),
+        observed: Mutex::new(HashSet::from([ProcessKey {
+            pid: supervisor,
+            start: identity.start,
+        }])),
+        retained: Mutex::new(HashMap::new()),
+        scan_fault: Mutex::new(ScanFault::default()),
+    };
+    let started = Instant::now();
+    let result = descendant_quiescence(&boundary, started + Duration::from_millis(100));
+    let elapsed = started.elapsed();
+    let quiesced = result.expect("quiescence scan succeeds");
+    assert!(quiesced.is_none(), "live descendant quiesced");
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "quiescence returned before the total deadline with a live descendant: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(450),
+        "quiescence waited past the total deadline into the grace period: {elapsed:?}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn gap_purge_drops_registered_leaders_and_their_subtrees() {
+    // Reproduce the spawn-to-register gap deterministically in two
+    // scans: scan 1 adopts a foreign tree (leader plus child) while it
+    // is still unregistered; the foreign owner then registers the
+    // leader; scan 2 must purge the leader AND its subtree from
+    // membership. Purging only the leader would leave the child
+    // signaled out from under its owner and permanently poison the
+    // boundary through the persisted observed set.
+    let mut foreign = Command::new("/bin/sh")
+        .args(["-c", "trap '' TERM; sleep 30 & wait"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn foreign tree");
+    // The TERM trap is self-defense, not test logic: while the leader
+    // is unregistered a parallel test could adopt and SIGTERM it; the
+    // trap makes that harmless (their SIGKILL grace cannot land inside
+    // this millisecond-scale test), and our own cleanup uses SIGKILL.
+    let child = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let table = linux_process_table().expect("process table");
+            if let Some((&pid, identity)) = table
+                .iter()
+                .find(|(_, identity)| identity.parent == foreign.id())
+            {
+                break ProcessKey {
+                    pid,
+                    start: identity.start,
+                };
+            }
+            assert!(Instant::now() < deadline, "foreign child did not appear");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let boundary = ProcessBoundary {
+        leader: ProcessKey {
+            pid: u32::MAX,
+            start: 0,
+        },
+        supervisor: std::process::id(),
+        baseline_direct: HashSet::new(),
+        observed: Mutex::new(HashSet::new()),
+        retained: Mutex::new(HashMap::new()),
+        scan_fault: Mutex::new(ScanFault::default()),
+    };
+    // Scan 1 (gap): both the leader and its child are adopted while
+    // unregistered — the precondition the purge below must undo.
+    let first = live_boundary_members(&boundary).expect("gap scan succeeds");
+    let leader_key = ProcessKey {
+        pid: foreign.id(),
+        start: linux_process_identity(foreign.id())
+            .expect("read foreign leader")
+            .expect("foreign leader is alive")
+            .start,
+    };
+    assert!(
+        first.contains(&leader_key),
+        "gap scan did not adopt the foreign leader: {first:?}"
+    );
+    assert!(
+        first.contains(&child),
+        "gap scan did not adopt the foreign child: {first:?}"
+    );
+    // The foreign owner registers late; scan 2 must purge the whole
+    // subtree from membership (and drop its pidfds).
+    let mut foreign_guard = TimedLeaderGuard::register(foreign.id());
+    let second = live_boundary_members(&boundary).expect("purge scan succeeds");
+    assert!(
+        !second.contains(&leader_key),
+        "purge kept the registered leader: {second:?}"
+    );
+    assert!(
+        !second.contains(&child),
+        "purge kept the registered leader's subtree: {second:?}"
+    );
+    foreign.kill().ok();
+    let _ = foreign.wait();
+    // Revalidate identity before signaling: the numeric PID must still
+    // be our fixture child, never a reused slot.
+    let current = linux_process_identity(child.pid).expect("read foreign child");
+    if current
+        .as_ref()
+        .is_some_and(|identity| identity.live && identity.start == child.start)
+    {
+        // SAFETY: the start tick above pins this PID to our fixture
+        // child; SIGKILL only hastens its exit.
+        unsafe {
+            libc::kill(child.pid as i32, libc::SIGKILL);
+        }
+    }
+    foreign_guard.release();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while linux_process_identity(child.pid)
+        .expect("read foreign child")
+        .is_some_and(|identity| identity.live && identity.start == child.start)
+    {
+        assert!(Instant::now() < deadline, "foreign child outlived cleanup");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -5441,6 +5785,7 @@ fn timed_cleanup_does_not_signal_an_unrelated_session() {
         });
     }
     let mut control = control.spawn().expect("spawn unrelated control session");
+    let mut control_guard = TimedLeaderGuard::register(control.id());
 
     let scratch = Scratch::new_exec("perf-session-isolation").expect("scratch");
     let script = scratch.path().join("leak.sh");
@@ -5462,6 +5807,7 @@ fn timed_cleanup_does_not_signal_an_unrelated_session() {
 
     signal_original_group(control.id(), libc::SIGKILL).expect("stop control session");
     let _ = control.wait();
+    control_guard.release();
     assert!(
         error.contains("live descendant") || error.contains("timed out"),
         "{error}"

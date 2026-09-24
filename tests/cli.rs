@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(unix)]
@@ -1896,14 +1898,104 @@ exec "${{DOT_RUNTIME_REAL_{variable}}}" "$@"
     }
 }
 
-fn real_tool(tool: &str) -> PathBuf {
-    let launcher = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".local/bin").join(tool));
-    std::env::split_paths(&std::env::var_os("PATH").expect("test PATH"))
+/// The process owner's home directory from passwd, immune to process-wide
+/// `HOME` mutation by parallel tests (writers serialize via
+/// `process_env_guard`, but readers like [`real_tool`] do not take it).
+/// Resolved once and cached: the owner's home cannot change under a
+/// running test binary, the cache avoids a syscall per tool lookup, and
+/// a transient lookup failure only fails that one call (the next call
+/// retries) instead of permanently losing the fallback.
+#[cfg(unix)]
+fn passwd_home_dir() -> Option<PathBuf> {
+    static CACHED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    if let Some(home) = CACHED.get() {
+        return Some(home.clone());
+    }
+    let home = passwd_home_dir_uncached()?;
+    let _ = CACHED.set(home.clone());
+    Some(home)
+}
+
+#[cfg(unix)]
+fn passwd_home_dir_uncached() -> Option<PathBuf> {
+    // SAFETY: getpwuid_r writes only the local entry and buffer; the
+    // status, result pointer, and directory pointer are all checked
+    // before the directory is read, and the buffer outlives the read.
+    unsafe {
+        let mut entry: libc::passwd = std::mem::zeroed();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let mut capacity = 8192usize;
+        loop {
+            let mut buffer = vec![0u8; capacity];
+            let status = libc::getpwuid_r(
+                libc::getuid(),
+                &mut entry,
+                buffer.as_mut_ptr() as *mut libc::c_char,
+                buffer.len(),
+                &mut result,
+            );
+            if status == 0 {
+                if result.is_null() || entry.pw_dir.is_null() {
+                    return None;
+                }
+                let dir = std::ffi::CStr::from_ptr(entry.pw_dir);
+                return Some(PathBuf::from(OsStr::from_bytes(dir.to_bytes())));
+            }
+            if status != libc::ERANGE || capacity >= 1 << 20 {
+                return None;
+            }
+            capacity *= 2;
+        }
+    }
+}
+
+/// Launcher-shim paths to exclude from tool resolution, one per known
+/// home. Pure over its inputs so the passwd fallback is pinned with
+/// synthetic homes instead of mutating process state.
+fn launcher_paths(
+    tool: &str,
+    ambient_home: Option<&OsStr>,
+    passwd_home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut launchers = Vec::new();
+    if let Some(home) = ambient_home {
+        launchers.push(PathBuf::from(home).join(".local/bin").join(tool));
+    }
+    if let Some(home) = passwd_home {
+        launchers.push(home.join(".local/bin").join(tool));
+    }
+    launchers
+}
+
+/// First PATH entry for `tool` that is a file and not an excluded
+/// launcher shim.
+fn select_real_tool(tool: &str, path: &OsStr, launchers: &[PathBuf]) -> PathBuf {
+    std::env::split_paths(path)
         .map(|dir| dir.join(tool))
-        .find(|candidate| candidate.is_file() && Some(candidate) != launcher.as_ref())
+        .find(|candidate| {
+            candidate.is_file() && !launchers.iter().any(|launcher| launcher == candidate)
+        })
         .expect("real native tool")
+}
+
+fn real_tool(tool: &str) -> PathBuf {
+    // Exclude the developer's launcher by every known home: ambient HOME
+    // races with parallel tests that mutate process env (writers take
+    // `process_env_guard`, readers do not), so the passwd home is
+    // consulted too. Missing the launcher once resolved a shim's real
+    // Git to a wrapper script that hung a revision probe for the full
+    // marker bound.
+    #[cfg(unix)]
+    let passwd_home = passwd_home_dir();
+    #[cfg(not(unix))]
+    let passwd_home: Option<PathBuf> = None;
+    let launchers = launcher_paths(
+        tool,
+        std::env::var_os("HOME").as_deref(),
+        passwd_home.as_deref(),
+    );
+    let path = std::env::var_os("PATH").expect("test PATH");
+    select_real_tool(tool, &path, &launchers)
 }
 
 /// Keep Git configuration independent of developer hooks and signing policy.
@@ -4788,6 +4880,75 @@ exec "$DOT_TEST_REAL_GIT" "$@"
 
 #[cfg(unix)]
 #[test]
+fn init_host_git_prefers_the_fixture_shim() {
+    // Plain TempDir, not new_exec: the shim is selection-only (mode bits
+    // are inspected, never executed), and an exec dir under target/
+    // would sit inside the source root and be excluded by design.
+    let home = TempDir::new("cli-hostgit-home").expect("home");
+    let state = TempDir::new("cli-hostgit-state").expect("state");
+    let shim_dir = state.path().join("blocking-init-git-bin");
+    std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
+    let git_shim = shim_dir.join("git");
+    std::fs::write(&git_shim, b"#!/bin/sh\nexit 0\n").expect("write Git shim");
+    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
+        .expect("make Git shim executable");
+    let mut paths = vec![shim_dir.clone()];
+    paths.extend(std::env::split_paths(&fixture_path()));
+    let path = std::env::join_paths(paths).expect("Git shim PATH");
+    let selected = dot::init_client_identity::select_host_git(
+        &home.path().to_string_lossy(),
+        env!("CARGO_MANIFEST_DIR"),
+        path.to_string_lossy().as_ref(),
+    );
+    assert_eq!(
+        selected.as_deref(),
+        Some(git_shim.to_string_lossy().as_ref()),
+        "host git must pin the fixture shim, not ambient git"
+    );
+}
+
+#[test]
+fn real_tool_skips_the_passwd_launcher_when_home_is_mutated() {
+    // Fully synthetic: a "passwd home" dir holding a launcher shim first
+    // on PATH, a second dir holding the real tool, and ambient HOME
+    // pointing at a third dir entirely. Selection must skip the passwd
+    // launcher. Pre-fix (ambient-HOME-only exclusion) this selects the
+    // shim and fails — the control below proves the scenario bites.
+    // Nothing here touches process state, so the pin cannot race
+    // parallel readers the way a HOME-mutating test would. The shims are
+    // selection-only (`is_file` probes, never executed), so plain
+    // TempDir is correct.
+    let passwd_home = TempDir::new("cli-passwd-home").expect("passwd home");
+    let launcher_dir = passwd_home.path().join(".local/bin");
+    std::fs::create_dir_all(&launcher_dir).expect("launcher dir");
+    let launcher = launcher_dir.join("git");
+    std::fs::write(&launcher, b"#!/bin/sh\nexit 0\n").expect("launcher shim");
+    let real_dir = TempDir::new("cli-real-tool-dir").expect("real dir");
+    let real = real_dir.path().join("git");
+    std::fs::write(&real, b"#!/bin/sh\nexit 0\n").expect("real shim");
+    let ambient_home = TempDir::new("cli-ambient-home").expect("ambient home");
+    let path = std::env::join_paths([launcher_dir.as_os_str(), real_dir.path().as_os_str()])
+        .expect("synthetic PATH");
+    let launchers = launcher_paths(
+        "git",
+        Some(ambient_home.path().as_os_str()),
+        Some(passwd_home.path()),
+    );
+    assert_eq!(
+        select_real_tool("git", &path, &launchers),
+        real,
+        "passwd launcher must be excluded even when ambient HOME points elsewhere"
+    );
+    let without_fallback = launcher_paths("git", Some(ambient_home.path().as_os_str()), None);
+    assert_eq!(
+        select_real_tool("git", &path, &without_fallback),
+        launcher,
+        "control must select the shim when the passwd fallback is absent"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn direct_signals_during_init_git_clone_stop_the_owned_query() {
     for (signal, expected, name) in HANDLED_SIGNAL_CASES {
         let home = TempDir::new(&format!("cli-init-signal-{name}-home")).expect("home");
@@ -4836,7 +4997,14 @@ exec "$DOT_TEST_REAL_GIT" "$@"
 
         let cancelled = cancel_after_marker_with_signal(child, &marker, signal, || ());
 
-        assert!(cancelled.ready, "init Git clone did not start for {name}");
+        assert!(
+            cancelled.ready,
+            "init Git clone did not start for {name}; status={:?} exited={} signal_result={} {}",
+            cancelled.output.status.code(),
+            cancelled.exited,
+            cancelled.signal_result,
+            cancelled_output_detail(&cancelled.output)
+        );
         assert!(
             cancelled.worker_identity_valid,
             "init Git clone was not isolated for {name}"

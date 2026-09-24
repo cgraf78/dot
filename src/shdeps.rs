@@ -365,7 +365,7 @@ pub fn active_revision(source_root: &Path) -> String {
     command.stdin(Stdio::null()).stderr(Stdio::null());
     let output = crate::cleanup::run_session_output(
         command,
-        None,
+        Some(std::time::Instant::now() + crate::cleanup::REVISION_PROBE_TIMEOUT),
         crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
         crate::cleanup::LingerPolicy::Detach,
     );

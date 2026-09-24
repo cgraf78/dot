@@ -316,13 +316,20 @@ pub fn observed_revision(source_root: &Path) -> Option<String> {
 }
 
 fn observed_revision_uncached(source_root: &Path) -> Option<String> {
+    observed_revision_uncached_with_timeout(source_root, crate::cleanup::REVISION_PROBE_TIMEOUT)
+}
+
+fn observed_revision_uncached_with_timeout(
+    source_root: &Path,
+    timeout: std::time::Duration,
+) -> Option<String> {
     let mut cmd = crate::temp::sanitized_git(source_root, &["rev-parse", "HEAD"]);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let output = crate::cleanup::run_session_output(
         cmd,
-        None,
+        Some(std::time::Instant::now() + timeout),
         crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
         crate::cleanup::LingerPolicy::Detach,
     )
@@ -923,5 +930,37 @@ mod tests {
             ),
             other => panic!("expected reexec mismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn observed_revision_uncached_bounds_a_hanging_git() {
+        // A wedged Git (wrapper script, lock contention, network mount)
+        // must report missing at the probe deadline instead of hanging
+        // startup forever. The lower bound proves the probe waited out
+        // the deadline (not a fast spawn failure); the upper bound sits
+        // well under the shim's 30s sleep, so only a fired timeout can
+        // satisfy it. The 1s test deadline keeps the suite fast;
+        // production uses REVISION_PROBE_TIMEOUT through the same helper.
+        use std::os::unix::fs::PermissionsExt as _;
+        let deadline = std::time::Duration::from_secs(1);
+        let scratch = TempDir::new("revision-probe-hang").expect("scratch");
+        let shim = scratch.path().join("git");
+        std::fs::write(&shim, b"#!/bin/sh\nsleep 30\n").expect("hanging shim");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod shim");
+        let _git = crate::init_client_identity::bind_host_git_for_scope(&shim);
+        let started = std::time::Instant::now();
+        let revision = super::observed_revision_uncached_with_timeout(scratch.path(), deadline);
+        let elapsed = started.elapsed();
+        assert!(revision.is_none(), "hanging probe must report missing");
+        assert!(
+            elapsed >= deadline,
+            "probe returned before its deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < deadline + std::time::Duration::from_secs(10),
+            "probe exceeded its bounded deadline: {elapsed:?}"
+        );
     }
 }
