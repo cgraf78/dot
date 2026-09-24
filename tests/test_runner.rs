@@ -1,7 +1,7 @@
 //! Native process ownership and scheduler regressions.
 #[path = "support/test_fixture.rs"]
 mod fixture;
-use fixture::{Fixture, finish, poll, success};
+use fixture::{Fixture, finish, pid_file, poll, success};
 use std::fs;
 use std::io::{BufRead as _, Read as _};
 use std::path::Path;
@@ -206,8 +206,7 @@ fn native_success_cleans_descendant_in_separate_process_group() {
     let f = Fixture::new();
     f.suite("descendant", "python3 -c 'import os,time; os.setpgid(0,0); open(os.environ[\"HOME\"]+\"/descendant\",\"w\").write(str(os.getpid())); time.sleep(30)' &\nuntil [[ -s $HOME/descendant ]]; do sleep 0.02; done\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"");
     let child = f.command(&["-s"]).spawn().unwrap();
-    poll(|| f.home.join("descendant").is_file());
-    let pid = fs::read_to_string(f.home.join("descendant")).unwrap();
+    let pid = pid_file(&f.home.join("descendant")).to_string();
     success(&finish(child));
     poll(|| !live(pid.trim()));
 }
@@ -225,8 +224,7 @@ fn native_tracks_close_fds_setsid_descendant_on_success_and_cancellation() {
             ),
         );
         let child = f.command(&["-s"]).spawn().unwrap();
-        poll(|| f.home.join("descendant").is_file());
-        let pid = fs::read_to_string(f.home.join("descendant")).unwrap();
+        let pid = pid_file(&f.home.join("descendant")).to_string();
         let started = std::time::Instant::now();
         let output = if cancel {
             signal(child.id(), libc::SIGTERM);
@@ -258,8 +256,7 @@ fn native_changed_process_group_fails_closed_without_unpinned_signal() {
     // is an explicit incomplete-cleanup failure, never a raw PID signal.
     f.suite("descendant", "python3 -c 'import os,time; os.setpgid(0,0); open(os.environ[\"HOME\"]+\"/descendant\",\"w\").write(str(os.getpid())); time.sleep(2)' </dev/null >/dev/null 2>&1 &\nuntil [[ -s $HOME/descendant ]]; do sleep 0.02; done\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"");
     let child = f.command(&["-s"]).spawn().unwrap();
-    poll(|| f.home.join("descendant").is_file());
-    let pid = fs::read_to_string(f.home.join("descendant")).unwrap();
+    let pid = pid_file(&f.home.join("descendant")).to_string();
     let started = std::time::Instant::now();
     let output = finish(child);
 
@@ -307,8 +304,7 @@ fn native_teardown_reaps_orphaned_descendants() {
     let f = Fixture::new();
     f.suite("descendant", "(trap '' TERM; echo $BASHPID >\"$HOME/descendant\"; while :; do sleep 1; done) &\nuntil [[ -s $HOME/descendant ]]; do sleep 0.02; done\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"");
     let child = f.command(&[]).spawn().unwrap();
-    poll(|| f.home.join("descendant").is_file());
-    let pid = fs::read_to_string(f.home.join("descendant")).unwrap();
+    let pid = pid_file(&f.home.join("descendant")).to_string();
     let start = proc_start_time(pid.trim());
     success(&finish(child));
     // The orphan is init's child by the time teardown KILLs it, so only
