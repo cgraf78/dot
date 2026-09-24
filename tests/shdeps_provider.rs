@@ -328,6 +328,15 @@ case ${1:-} in
         printf '%s' "$flood"
       done
       printf '%s\n' '"}'
+      # Trail the frame with unterminated padding larger than the capture
+      # socket's buffer. Otherwise the whole frame can still be buffered
+      # when Dot observes the exit, so it is never rendered and the unread
+      # CLI pipe never blocks. Padding forces Dot to consume the newline
+      # (and queue the ~512KB render) while the provider is still alive;
+      # it stays under the 1MB run budget and is never interpreted.
+      for ((chunk = 0; chunk < 48; chunk++)); do
+        printf '%s' "$flood"
+      done
       exit 130
     fi
     if [[ ${DOT_TEST_PROVIDER_SIGNAL_DURING_TEARDOWN:-0} == 1 ]]; then

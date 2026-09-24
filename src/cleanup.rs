@@ -1893,6 +1893,22 @@ enum ProcessOutputRecordError {
     Failed(std::io::Error),
 }
 
+/// True when a nonblocking send on a relay datagram socket was refused only
+/// because the receive queue is momentarily full. Linux reports that as
+/// `WouldBlock`; Darwin never blocks unix datagram senders and instead reports
+/// ENOBUFS (raw 55, surfaced as `Uncategorized`), and a sustained flood can
+/// briefly exhaust Darwin mbuf clusters as ENOMEM on an otherwise healthy
+/// socket. Every relay send must share this one classification: a site that
+/// only knows `WouldBlock` turns ordinary macOS backpressure into a relay
+/// failure.
+fn output_relay_backpressure(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::ENOBUFS || code == libc::ENOMEM
+        )
+}
+
 fn send_process_output_record(
     channel: &std::sync::Arc<Mutex<ProcessOutputChannel>>,
     packet: &[u8],
@@ -1925,20 +1941,11 @@ fn send_process_output_record(
                     "process output relay accepted a partial record",
                 )));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            // Backpressure retries instead of poisoning the channel; the
+            // sleeping retry lets the relay child drain while cancellation
+            // still wins at the top of the loop.
+            Err(error) if output_relay_backpressure(&error) => {}
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            // Darwin reports a momentarily full datagram buffer as ENOBUFS
-            // (raw 55, surfaced as `Uncategorized`), not `WouldBlock`.
-            // Retry it like any other transient backpressure signal instead
-            // of poisoning the channel; cancellation still wins at the top
-            // of the loop.
-            Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => {}
-            // A sustained provider flood can briefly exhaust Darwin mbuf
-            // clusters, surfacing as ENOMEM on an otherwise healthy socket.
-            // Treat it as transient backpressure like ENOBUFS: the sleeping
-            // retry lets the relay child drain while cancellation still
-            // wins at the top of the loop.
-            Err(error) if error.raw_os_error() == Some(libc::ENOMEM) => {}
             Err(error) => {
                 channel
                     .failed
@@ -2495,7 +2502,13 @@ impl ProcessOutputEndpoint {
                             break;
                         }
                         Ok(_) => break,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // The finish marker queues behind every record the
+                        // caller just sent, so a burst that filled the relay
+                        // socket makes this the send most likely to see
+                        // backpressure. Treating Darwin's ENOBUFS as fatal
+                        // here skipped the marker, and the watchdog then
+                        // killed a healthy relay and reported OutputFailed.
+                        Err(error) if output_relay_backpressure(&error) => {
                             if Instant::now() >= deadline {
                                 break;
                             }
@@ -7428,6 +7441,17 @@ fn terminate_children(children: &mut Vec<Child>) {
 mod tests {
     use super::*;
 
+    /// A PID no process can hold, for tests that insert placeholder owners
+    /// into the process-global registries. Parallel tests share those
+    /// registries, and a concurrent teardown's straggler sweep hands every
+    /// registered leader to `waitid(P_PGID)`: a `u32::MAX - n` placeholder
+    /// wraps negative in `pid_t` there and fails that unrelated teardown
+    /// with `EINVAL`. Values above the kernel's `PID_MAX_LIMIT` (2^22) but
+    /// inside `pid_t` are never allocated, so the sweep sees `ECHILD`.
+    fn placeholder_pid(offset: u32) -> u32 {
+        i32::MAX as u32 - offset
+    }
+
     #[test]
     fn spawn_retryable_covers_pressure_but_not_permanent_errors() {
         assert!(spawn_retryable(&std::io::Error::from(
@@ -7445,6 +7469,25 @@ mod tests {
         assert!(!spawn_retryable(&std::io::Error::from(
             std::io::ErrorKind::PermissionDenied
         )));
+    }
+
+    #[test]
+    fn output_relay_backpressure_covers_darwin_full_buffer_errors() {
+        // The relay finish marker and records share this classification;
+        // Darwin's ENOBUFS/ENOMEM must retry like Linux's EAGAIN or a burst
+        // that fills the relay socket reports a healthy relay as failed.
+        for code in [libc::EAGAIN, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(
+                output_relay_backpressure(&std::io::Error::from_raw_os_error(code)),
+                "errno {code} is transient relay backpressure"
+            );
+        }
+        for code in [libc::EPIPE, libc::ECONNREFUSED, libc::EBADF, libc::EINTR] {
+            assert!(
+                !output_relay_backpressure(&std::io::Error::from_raw_os_error(code)),
+                "errno {code} is not relay backpressure"
+            );
+        }
     }
 
     #[test]
@@ -8003,9 +8046,38 @@ while :; do sleep 0.02; done
         assert_eq!(unsafe { libc::kill(target_pid as i32, 0) }, -1);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn straggler_sweep_tolerates_a_placeholder_leader_registration() {
+        // A protected waitable child routes the P_ALL drain into the
+        // per-leader straggler sweep, which then visits the placeholder
+        // registration another test may hold concurrently. That visit must
+        // be a clean no-op, not an `EINVAL` that fails this teardown.
+        // Registering the placeholder before the spawn keeps the registry
+        // non-empty, so a concurrent reaper can never consume the child
+        // before it is protected.
+        let control = std::sync::Arc::new(std::sync::Mutex::new(NestedControlState::new()));
+        let placeholder = placeholder_pid(51);
+        let registration = register_session_boundary(placeholder, &"e".repeat(64), control);
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let protected = StatusChildRegistration::new(child.id());
+        poll_until(Instant::now() + Duration::from_secs(5), || {
+            exited(&child).map(|done| done.then_some(()))
+        })
+        .unwrap();
+        let result = reap_ready_adopted_zombies(Instant::now() + Duration::from_secs(5));
+        // Reap before releasing the registrations: with every registry empty
+        // a concurrent test's reaper may consume unowned children.
+        let status = child.wait().unwrap();
+        unregister_session_boundary(placeholder, registration);
+        drop(protected);
+        assert!(status.success());
+        result.unwrap();
+    }
+
     #[test]
     fn process_registrations_do_not_remove_a_newer_same_pid_owner() {
-        let pid = u32::MAX - 17;
+        let pid = placeholder_pid(17);
         let control = std::sync::Arc::new(std::sync::Mutex::new(NestedControlState::new()));
         let first = register_session_boundary(pid, &"a".repeat(64), control.clone());
         let second = register_session_boundary(pid, &"b".repeat(64), control);
@@ -8075,7 +8147,7 @@ while :; do sleep 0.02; done
     #[test]
     fn retained_status_child_skips_when_registration_identity_is_unknown() {
         // Nothing lives at this PID, so registration snapshots no identity.
-        let pid = u32::MAX - 23;
+        let pid = placeholder_pid(23);
         let registration = StatusChildRegistration::new(pid);
         let row = ProcessInfo {
             pid,
@@ -10465,7 +10537,7 @@ os._exit(0)
         })
         .unwrap();
         let control = std::sync::Arc::new(std::sync::Mutex::new(NestedControlState::new()));
-        let dummy = u32::MAX - 41;
+        let dummy = placeholder_pid(41);
         let registration = register_session_boundary(dummy, &"f".repeat(64), control);
         reap_ready_adopted_zombies(Instant::now() + Duration::from_secs(5)).unwrap();
         unregister_session_boundary(dummy, registration);

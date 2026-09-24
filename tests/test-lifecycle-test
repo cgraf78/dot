@@ -1019,6 +1019,22 @@ def session_fds():
             fds.append(int(field))
     return fds
 
+def wait_for_content(path, deadline):
+    """Waits until `path` holds non-empty text.
+
+    `write_text` creates the file before its content lands, so an existence
+    poll can observe an empty pid file, and a SIGTERM delivered in that window
+    leaves it empty for good.
+    """
+    while time.monotonic() < deadline:
+        try:
+            if path.read_text(encoding="utf-8").strip():
+                return True
+        except FileNotFoundError:
+            pass
+        time.sleep(0.01)
+    return False
+
 wrapper = sys.argv[1]
 program = r'''
 import os, sys, time
@@ -1038,15 +1054,7 @@ with tempfile.TemporaryDirectory() as temporary:
         stderr=subprocess.PIPE,
         pass_fds=session_fds(),
     )
-    deadline = time.monotonic() + 5
-    while not ready.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert ready.exists(), healthy.poll()
-    # `write_text` creates the file before its content lands, so an
-    # existence poll can observe an empty pid file; wait for content.
-    deadline = time.monotonic() + 5
-    while not ready.read_text(encoding="utf-8").strip() and time.monotonic() < deadline:
-        time.sleep(0.01)
+    assert wait_for_content(ready, time.monotonic() + 5), healthy.poll()
     os.kill(healthy.pid, signal.SIGTERM)
     _stdout, healthy_stderr = healthy.communicate(timeout=5)
     assert healthy.returncode == 125, healthy.returncode
@@ -1078,15 +1086,7 @@ for aliased in (False, True):
             pass_fds=session_fds(),
         )
         os.close(sink)
-        deadline = time.monotonic() + 5
-        while not ready.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert ready.exists(), (aliased, child.poll())
-        # `write_text` creates the file before its content lands, so an
-        # existence poll can observe an empty pid file; wait for content.
-        deadline = time.monotonic() + 5
-        while not ready.read_text(encoding="utf-8").strip() and time.monotonic() < deadline:
-            time.sleep(0.01)
+        assert wait_for_content(ready, time.monotonic() + 5), (aliased, child.poll())
         os.kill(child.pid, signal.SIGTERM)
         blocked = False
         try:

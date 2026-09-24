@@ -280,6 +280,15 @@ struct UpdateIo<'a> {
 /// checks behave exactly as with the raw stream; the engine converts a
 /// remembered failure into its exit-1 delivery contract at the end, exactly
 /// like the old end-of-run flush.
+///
+/// A write rejected by the outward-write abort latch is not remembered. The
+/// latch is raised only by a supervisor that has already decided the terminal
+/// outcome (a trusted provider's 128+signal exit, a deadline, or incomplete
+/// cleanup) and deliberately discards its queued rows so an unread caller
+/// pipe cannot hold teardown. That owner reports its own status; recording
+/// the discard here would rewrite a clean provider cancellation (130) into
+/// the ordinary delivery failure (1) whenever the provider's rows happened to
+/// be queued behind the blocked pipe when it exited.
 struct LiveSink<'a> {
     inner: &'a mut dyn std::io::Write,
     failed: bool,
@@ -289,27 +298,29 @@ impl LiveSink<'_> {
     fn failed(&self) -> bool {
         self.failed
     }
+
+    /// Remember a delivery failure unless it is an intentional abort. The
+    /// latch is sampled at the failing call: it is raised before the aborted
+    /// write returns and cleared only after the aborting supervisor has
+    /// joined its relay, so no aborted write can observe it already cleared.
+    fn record(&mut self, error: std::io::Error) -> std::io::Error {
+        if !crate::cleanup::outward_write_aborted() {
+            self.failed = true;
+        }
+        error
+    }
 }
 
 impl std::io::Write for LiveSink<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         match self.inner.write_all(bytes) {
             Ok(()) => Ok(bytes.len()),
-            Err(error) => {
-                self.failed = true;
-                Err(error)
-            }
+            Err(error) => Err(self.record(error)),
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        match self.inner.flush() {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.failed = true;
-                Err(error)
-            }
-        }
+        self.inner.flush().map_err(|error| self.record(error))
     }
 }
 
@@ -2482,8 +2493,11 @@ mod tests {
     }
 
     #[test]
-    fn live_sink_forwards_rows_and_remembers_delivery_failure() {
+    fn live_sink_forwards_rows() {
         use std::io::Write as _;
+        // Failure memory depends on the process-wide abort latch, which
+        // in-process provider tests raise concurrently; it is pinned in the
+        // latch-owning helper below instead of here.
         let mut inner = Vec::new();
         let mut sink = LiveSink {
             inner: &mut inner,
@@ -2492,11 +2506,50 @@ mod tests {
         sink.write_all(b"row\n").expect("forward rows");
         assert!(!sink.failed());
         assert_eq!(inner, b"row\n");
+    }
+
+    #[test]
+    fn live_sink_does_not_remember_an_intentionally_aborted_write() {
+        const HELPER: &str = "DOT_LIVE_SINK_ABORT_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update_engine::tests::live_sink_does_not_remember_an_intentionally_aborted_write",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "live sink abort helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use std::io::Write as _;
+
+        // The helper owns the process-wide outward-write-abort latch
+        // exclusively: a parallel relay abort or resume would flip which
+        // failure this test observes (loaded-host flake).
         let mut failing = FailingWriter;
         let mut sink = LiveSink {
             inner: &mut failing,
             failed: false,
         };
+        // A supervisor that already owns the terminal status (e.g. a
+        // provider's 128+signal exit) discards its queued rows; that must
+        // not become the engine's exit-1 delivery failure.
+        crate::cleanup::abort_outward_writes();
+        assert!(sink.write_all(b"row\n").is_err());
+        assert!(sink.flush().is_ok());
+        assert!(!sink.failed());
+        crate::cleanup::resume_outward_writes();
+        // Once writes resume, an ordinary failure is remembered and later
+        // becomes the engine's exit-1 delivery failure.
         assert!(sink.write_all(b"row\n").is_err());
         assert!(sink.failed());
     }
