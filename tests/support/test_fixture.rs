@@ -86,6 +86,25 @@ pub fn poll(mut condition: impl FnMut() -> bool) {
     }
 }
 
+/// Waits for a test suite to publish a descendant PID to `path`.
+///
+/// Writers (`echo >file`, Python `open().write()`) create the file before
+/// writing to it, so existence alone can expose an empty file; an empty PID
+/// would then probe `/proc` itself. Each writer emits the PID in one small
+/// write, so non-empty content that parses is complete.
+#[allow(dead_code)] // Only the process-ownership binaries publish descendant PIDs.
+pub fn pid_file(path: &Path) -> u32 {
+    let mut pid = 0;
+    poll(|| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .map(|parsed| pid = parsed)
+            .is_some()
+    });
+    pid
+}
+
 pub fn finish(mut child: Child) -> Output {
     let end = Instant::now() + Duration::from_secs(25);
     loop {

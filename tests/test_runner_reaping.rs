@@ -6,7 +6,7 @@
 #[allow(dead_code)]
 mod fixture;
 
-use fixture::{Fixture, finish, poll, success};
+use fixture::{Fixture, finish, pid_file, success};
 use std::fs;
 
 #[test]
@@ -25,10 +25,9 @@ fn native_supervisor_reaps_descendants_before_returning() {
          printf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
     );
     let child = f.command(&[]).spawn().unwrap();
-    poll(|| f.home.join("descendant").is_file());
-    let pid = fs::read_to_string(f.home.join("descendant")).unwrap();
+    let pid = pid_file(&f.home.join("descendant")).to_string();
     success(&finish(child));
-    let process = std::path::Path::new("/proc").join(pid.trim());
+    let process = std::path::Path::new("/proc").join(&pid);
     assert!(
         !process.exists(),
         "dot returned before its adopted descendant was reaped: {}",

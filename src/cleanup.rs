@@ -9941,12 +9941,16 @@ os._exit(0)
         // runs first and its background subshell rebinds `$!` to the
         // late child, so `wait $!` would wait for the late child (which
         // exits 0) instead of the sleep and the leader would exit 0
-        // instead of 143.
+        // instead of 143. The ready marker is written only after that
+        // capture: Bash runs pending traps between simple commands, so a
+        // stop landing between `sleep 30 &` and `sleep_pid=$!` would
+        // otherwise rebind `$!` before the capture and reintroduce the
+        // same exit-0 race.
         let mut command = Command::new(dot_test_support::bash());
         command
             .args([
                 "-c",
-                "trap 'printf \"TERM\\n\" >>\"$5\"; if [[ ! -e $2 ]]; then : >\"$2\"; (trap '\"'\"': >\"$4\"; exit 0'\"'\"' TERM; : >\"$3\"; while :; do sleep 86400; done) & fi' TERM; : >\"$1\"; sleep 30 & sleep_pid=$!; wait $sleep_pid",
+                "trap 'printf \"TERM\\n\" >>\"$5\"; if [[ ! -e $2 ]]; then : >\"$2\"; (trap '\"'\"': >\"$4\"; exit 0'\"'\"' TERM; : >\"$3\"; while :; do sleep 86400; done) & fi' TERM; sleep 30 & sleep_pid=$!; : >\"$1\"; wait $sleep_pid",
                 "late-term-child",
             ])
             .arg(&ready)
