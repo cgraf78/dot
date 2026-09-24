@@ -6373,7 +6373,16 @@ fn stop_sessions_with_tick(
         first_round = false;
         let observed = observe_sessions(&mut sessions, graceful_deadline);
         if sessions_stably_empty(observed, &mut consecutive_empty) {
-            break;
+            // Confirm before breaking: two snapshots can both miss a
+            // process that is mid-exec (unreadable environ) or
+            // mid-reparent, and breaking skips settle, KILL, and
+            // verification entirely, leaking it. One more complete
+            // snapshot either confirms the emptiness or reopens the
+            // round so the newly visible member is delivered below.
+            let confirm = observe_sessions(&mut sessions, graceful_deadline);
+            if sessions_stably_empty(confirm, &mut consecutive_empty) {
+                break;
+            }
         }
         for session in &mut sessions {
             // New members receive one exact signal through retained authority.
