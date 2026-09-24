@@ -4067,6 +4067,40 @@ mod tests {
 
     static FAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Serialize every test that supervises a command. Supervision is
+    /// exclusive by design (the start barrier rejects a second concurrent
+    /// start) and the fault-injection flags are process-global, so an
+    /// unlocked supervisor both corrupts and is corrupted by a fault
+    /// test running alongside it. The lock tolerates poisoning (a
+    /// predecessor panic must fail just that test, never cascade) and
+    /// resets every fault flag, so a panic that skipped its own reset
+    /// cannot arm faults for the next test. The fd-normalization
+    /// countdown is thread-local for the calling test thread (the same
+    /// thread that sets and consumes it); the start barrier needs no
+    /// reset (its RAII guard disarms on drop, including unwind).
+    fn serial_fault_tests() -> std::sync::MutexGuard<'static, ()> {
+        let guard = FAULT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        PROCESS_TABLE_SCANS.store(0, Ordering::Relaxed);
+        FAIL_SCANS_AFTER_DISCOVERY.store(false, Ordering::Relaxed);
+        DISCOVERED_DESCENDANT.store(false, Ordering::Relaxed);
+        OMIT_RETAINED_ONCE.store(false, Ordering::Relaxed);
+        OMITTED_RETAINED.store(false, Ordering::Relaxed);
+        OMIT_UNRETAINED_ONCE.store(false, Ordering::Relaxed);
+        OMITTED_UNRETAINED.store(false, Ordering::Relaxed);
+        OMITTED_PID.store(0, Ordering::Relaxed);
+        OMITTED_WAS_RETAINED.store(false, Ordering::Relaxed);
+        HIDE_DIRECT_AFTER_OMISSION.store(false, Ordering::Relaxed);
+        FAIL_SCANS_AFTER_OMISSION.store(false, Ordering::Relaxed);
+        FORCED_DIRECT_CHILD_PID.store(0, Ordering::Relaxed);
+        FAIL_ALL_PROCESS_SCANS.store(false, Ordering::Relaxed);
+        FAIL_INTERNAL_FD_NORMALIZATION_AFTER.with(|remaining| remaining.set(-1));
+        CLEANUP_INCOMPLETE.store(false, Ordering::Relaxed);
+        CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
+        guard
+    }
+
     struct ExactProcessGuard {
         member: Option<ProcessMember>,
     }
@@ -4086,21 +4120,33 @@ mod tests {
                 .is_some_and(|member| !pidfd_ready(&member.pidfd, 0).unwrap_or(true))
         }
 
-        fn terminate(&mut self) -> Result<(), String> {
-            let Some(member) = self.member.take() else {
+        /// Kill the pinned process and wait for its pidfd to report
+        /// exit, keeping the pin so the caller can assert death through
+        /// the descriptor instead of the recyclable numeric PID.
+        fn kill_and_wait(&self) -> Result<(), String> {
+            let Some(member) = self.member.as_ref() else {
                 return Ok(());
             };
             signal_pidfd(member.key, &member.pidfd, SIGKILL)?;
             let deadline = Instant::now() + KILL_GRACE;
             while !pidfd_ready(&member.pidfd, 0)? {
                 if Instant::now() >= deadline {
-                    self.member = Some(member);
                     return Err("timed out terminating exact fixture process".to_string());
                 }
                 std::thread::sleep(POLL);
             }
-            drop(member);
-            let _ = reap_adopted_children(Instant::now() + KILL_GRACE);
+            Ok(())
+        }
+
+        fn release(&mut self) {
+            if self.member.take().is_some() {
+                let _ = reap_adopted_children(Instant::now() + KILL_GRACE);
+            }
+        }
+
+        fn terminate(&mut self) -> Result<(), String> {
+            self.kill_and_wait()?;
+            self.release();
             Ok(())
         }
     }
@@ -4109,13 +4155,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.terminate();
         }
-    }
-
-    fn pid_is_live(pid: u32) -> bool {
-        process_identity(pid)
-            .ok()
-            .flatten()
-            .is_some_and(|identity| identity.live)
     }
 
     fn wait_for_pid_file(path: &std::path::Path) -> u32 {
@@ -4133,7 +4172,7 @@ mod tests {
 
     #[test]
     fn direct_child_authority_is_pinned_before_a_failing_broad_scan() {
-        let _serial = FAULT_TEST_LOCK.lock().expect("lock scan-fault tests");
+        let _serial = serial_fault_tests();
         let directory = env::temp_dir().join(format!(
             "dot-performance-supervisor-direct-first-{}",
             std::process::id()
@@ -4209,9 +4248,7 @@ mod tests {
 
     #[test]
     fn command_churn_does_not_trigger_process_table_polling() {
-        FAIL_SCANS_AFTER_DISCOVERY.store(false, Ordering::Relaxed);
-        DISCOVERED_DESCENDANT.store(false, Ordering::Relaxed);
-        PROCESS_TABLE_SCANS.store(0, Ordering::Relaxed);
+        let _serial = serial_fault_tests();
         let status = supervise(
             OsString::from("/bin/bash"),
             vec![
@@ -4232,7 +4269,7 @@ mod tests {
 
     #[test]
     fn retained_pidfd_cleans_escaped_child_after_process_scan_failure() {
-        let _serial = FAULT_TEST_LOCK.lock().expect("lock scan-fault tests");
+        let _serial = serial_fault_tests();
         let directory = env::temp_dir().join(format!(
             "dot-performance-supervisor-scan-failure-{}",
             std::process::id()
@@ -4270,7 +4307,7 @@ mod tests {
 
     #[test]
     fn retained_pidfd_survives_an_omitted_then_failed_process_snapshot() {
-        let _serial = FAULT_TEST_LOCK.lock().expect("lock scan-fault tests");
+        let _serial = serial_fault_tests();
         let directory = env::temp_dir().join(format!(
             "dot-performance-supervisor-omitted-scan-{}",
             std::process::id()
@@ -4347,7 +4384,7 @@ mod tests {
 
     #[test]
     fn omission_before_first_pidfd_fails_bounded_and_retains_lock_authority() {
-        let _serial = FAULT_TEST_LOCK.lock().expect("lock scan-fault tests");
+        let _serial = serial_fault_tests();
         let directory = env::temp_dir().join(format!(
             "dot-performance-supervisor-unobserved-scan-{}",
             std::process::id()
@@ -4440,9 +4477,16 @@ mod tests {
             "unobserved escaped fixture lost lifecycle-lock authority"
         );
         escaped_guard
-            .terminate()
+            .kill_and_wait()
             .expect("kill exact escaped fixture identity");
-        assert!(!pid_is_live(escaped), "escaped fixture did not terminate");
+        // Pinned-identity check like the sibling tests: the numeric PID
+        // can be recycled once init reaps the kill, so `/proc` liveness
+        // on the number alone is a reuse race.
+        assert!(
+            !escaped_guard.is_live(),
+            "escaped fixture did not terminate"
+        );
+        escaped_guard.release();
         let lock_deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let available = Command::new("/usr/bin/flock")
@@ -4549,7 +4593,7 @@ mod tests {
 
     #[test]
     fn start_barrier_rolls_back_partial_descriptor_normalization() {
-        let _serial = FAULT_TEST_LOCK.lock().expect("lock descriptor-fault tests");
+        let _serial = serial_fault_tests();
         START_BARRIER_STATE.store(START_BARRIER_IDLE, Ordering::SeqCst);
         START_BARRIER_WRITE_FD.store(-1, Ordering::SeqCst);
         let before = fs::read_dir("/proc/self/fd")
@@ -4613,8 +4657,7 @@ mod tests {
 
     #[test]
     fn repeated_commands_do_not_retain_process_identity_handles() {
-        FAIL_SCANS_AFTER_DISCOVERY.store(false, Ordering::Relaxed);
-        DISCOVERED_DESCENDANT.store(false, Ordering::Relaxed);
+        let _serial = serial_fault_tests();
         let before = fs::read_dir("/proc/self/fd")
             .expect("read initial descriptor inventory")
             .count();

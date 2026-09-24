@@ -440,10 +440,10 @@ fn normalize_timing(bytes: &[u8]) -> Vec<u8> {
 /// stable comparisons across independent native clients. `.git` carries
 /// checkout identity, `.dotfiles` carries the base checkout,
 /// `.dot-backup` carries timestamped init-time safekeeping, and
-/// `.scm.sqlite` is SCM's async telemetry database (a lingering SCM
-/// helper may create it after Dot returns): none of them is converged
-/// content, so all four stay out of the comparison, exactly like the
-/// `tests/perf_update.rs` technique.
+/// `.scm.sqlite*` is SCM's async telemetry database with its SQLite
+/// sidecars (a lingering SCM helper may create them after Dot returns):
+/// none of them is converged content, so all stay out of the comparison,
+/// exactly like the `tests/perf_update.rs` technique.
 fn snapshot_tree(home: &Path) -> Vec<(String, Vec<u8>)> {
     let mut entries = Vec::new();
     let mut stack = vec![home.to_path_buf()];
@@ -458,7 +458,14 @@ fn snapshot_tree(home: &Path) -> Vec<(String, Vec<u8>)> {
             // filesystem kind they take (a worktree `.git` may be a file,
             // not a directory).
             let skip = path.file_name().is_some_and(|n| {
-                n == ".git" || n == ".dotfiles" || n == ".dot-backup" || n == ".scm.sqlite"
+                n == ".git"
+                    || n == ".dotfiles"
+                    || n == ".dot-backup"
+                    || n == ".scm.sqlite"
+                    // Same prefix rule as `tests/perf_update.rs`: SQLite
+                    // sidecars (`-journal`, `-wal`, `-shm`, and whatever
+                    // arrives next) are telemetry, not content.
+                    || n.to_string_lossy().starts_with(".scm.sqlite-")
             });
             if kind.is_dir() {
                 if !skip {
@@ -487,6 +494,33 @@ fn check_update(argv: &[&str], home: &Path, state: &Path) -> std::process::Outpu
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+#[test]
+fn snapshot_tree_ignores_scm_telemetry_sidecars() {
+    let scratch = Scratch::new("update-run-scm-skip").expect("scratch dir");
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(home.join(".testrc"), "base\n").expect("content");
+    for sidecar in [
+        ".scm.sqlite",
+        ".scm.sqlite-journal",
+        ".scm.sqlite-wal",
+        ".scm.sqlite-shm",
+        // A hypothetical future sidecar: the exclusion is a prefix rule,
+        // not an enumeration that must be extended per SQLite release.
+        ".scm.sqlite-next",
+    ] {
+        std::fs::write(home.join(sidecar), "telemetry\n").expect("sidecar");
+    }
+    assert_eq!(
+        snapshot_tree(&home)
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        [".testrc"],
+        "SCM async telemetry must never join converged content"
+    );
 }
 
 #[test]

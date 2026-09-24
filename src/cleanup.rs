@@ -32,6 +32,11 @@ pub(crate) const CLEANUP_INCOMPLETE_STATUS: i32 = 125;
 /// tears down its owned session.
 pub(crate) const COMMAND_CAPTURE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const COMMAND_CAPTURE_LIMIT_ERROR: &str = "subprocess output exceeded its safety limit";
+/// Quick `git rev-parse` probes must never hang the caller: user Git
+/// wrappers, wedged repositories, and lock contention can stall a probe
+/// indefinitely, so revision reads carry a bounded deadline and report
+/// missing on timeout instead of blocking startup or provider checks.
+pub(crate) const REVISION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_CAPTURE_TICK_BYTES: usize = 64 * 1024;
 const COMMAND_CAPTURE_FINAL_BYTES: usize = 1024 * 1024;
 const SESSION_BOUNDARY_ENV: &str = "DOT_OWNED_SESSION_BOUNDARY_V1";
@@ -1321,6 +1326,9 @@ static FORCE_PROC_SNAPSHOT_UNAVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 static FORCE_FALLBACK_PROCESS_INFO_UNAVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+static FORCE_KILL_VERIFY_TIMEOUT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
@@ -4511,13 +4519,28 @@ impl SessionLease {
 
 /// Normal-completion kill verify window: after an optimistic group
 /// kill for an open lease, the fast path waits this long for the lease
-/// to close before falling back to full discovery. Lingering holders at
-/// this point have already had the drain (cooperative termination with
-/// output collection) and the capture pipes are EOF, so there is no
-/// output left to be courteous about; SIGKILL also catches holders with
-/// TERM blocked or ignored in startup. Anything still open afterwards
-/// (moved-group survivors) takes the full path, exactly as before.
+/// to close. Lingering holders at this point have already had the drain
+/// (cooperative termination with output collection) and the capture
+/// pipes are EOF, so there is no output left to be courteous about;
+/// SIGKILL also catches holders with TERM blocked or ignored in
+/// startup. Anything still open afterwards goes to the retained-group
+/// verify (slow deaths resolve without discovery); only moved-group
+/// survivors take the full discovery path.
 const NORMAL_COMPLETION_KILL_VERIFY: Duration = Duration::from_millis(50);
+
+/// Bounded kill verify with a test seam. `FORCE_KILL_VERIFY_TIMEOUT`
+/// simulates the lease-wait timeout outcome (victims not yet observed
+/// dead when the verify window ends, as in a loaded-host slow death),
+/// so the post-timeout verify path stays pinned. It fakes only the wait
+/// result, not slow victim death itself: the kill still lands and the
+/// victims still die promptly.
+fn kill_verify_closed(lease: &mut SessionLease) -> bool {
+    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+    if FORCE_KILL_VERIFY_TIMEOUT.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    lease.wait_closed(NORMAL_COMPLETION_KILL_VERIFY)
+}
 
 impl Drop for SessionLease {
     fn drop(&mut self) {
@@ -5538,6 +5561,116 @@ fn normal_completion_needs_discovery(_leader: u32, _deadline: Instant) -> std::i
     Ok(true)
 }
 
+/// Split live same-session probe rows into retained-group victims (which
+/// the group SIGKILL covered) and moved-group survivors (which it cannot
+/// have). Returns the retained victims plus whether any moved survivor is
+/// still live.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn partition_session_members(
+    processes: &[ProcessInfo],
+    session: u32,
+    leader: u32,
+) -> (Vec<&ProcessInfo>, bool) {
+    let mut retained = Vec::new();
+    let mut moved = false;
+    for process in processes {
+        if !process.live || process.session != session {
+            continue;
+        }
+        if process.group == leader {
+            retained.push(process);
+        } else {
+            moved = true;
+        }
+    }
+    (retained, moved)
+}
+
+/// Whether a probed session member is gone: vanished, zombie, or
+/// PID-reused (the kernel start tick pins the probed identity, so a
+/// different tick means the original died). A direct `/proc` read, never
+/// a host-wide snapshot. An unreadable-but-present member reads as live:
+/// a failed read is not proof of exit, so it fails closed toward full
+/// discovery.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn retained_member_dead(member: &ProcessInfo) -> bool {
+    match linux_process_info_result(member.pid) {
+        Ok(None) => true,
+        Ok(Some(current)) => !current.live || current.identity.start != member.identity.start,
+        Err(_) => false,
+    }
+}
+
+/// Bounded snapshot-free wait for probed retained-group victims to die.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn wait_retained_members_dead(members: &[&ProcessInfo], deadline: Instant) -> bool {
+    poll_until(deadline, || {
+        Ok(members
+            .iter()
+            .all(|member| retained_member_dead(member))
+            .then_some(()))
+    })
+    .is_ok()
+}
+
+/// Resolve a retained-group SIGKILL whose lease stayed open past the
+/// bounded verify, with two session snapshots and no host-wide
+/// discovery loop. Returns true when every same-session member is
+/// confirmed dead and the lease is closed (the drain may take the fast
+/// path); false means full discovery is still required.
+///
+/// Soundness: the group SIGKILL covers every member still in the
+/// retained group, but fatal delivery is asynchronous — a victim can
+/// fork after the kill and before its death, and the child starts clean
+/// (no pending SIGKILL) in the retained group, invisible to a wait over
+/// the probed members alone. So the first snapshot only enumerates the
+/// victims (a live moved-group row, which the kill cannot have covered,
+/// falls back immediately); the direct PID wait confirms each victim
+/// dead; and a confirming snapshot must then show no live same-session
+/// member at all — the same two-pass standard as `sessions_stably_empty`
+/// — before the lease re-check takes the fast path. An out-of-session
+/// holder the snapshots cannot see is exposed by the lease re-check and
+/// falls back to full discovery, as does a victim that outlives the
+/// bounded direct wait or any unreadable member (failed reads are live).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn verify_retained_group_kill(leader: u32, lease: &mut SessionLease, deadline: Instant) -> bool {
+    let raw = match libc::pid_t::try_from(leader) {
+        Ok(raw) => raw,
+        Err(_) => return false,
+    };
+    // SAFETY: getsid takes a PID and no pointers; the retained zombie
+    // leader still has a session to report.
+    let session = unsafe { libc::getsid(raw) };
+    if session <= 0 {
+        return false;
+    }
+    let session = session as u32;
+    let Some(processes) = process_snapshot(deadline) else {
+        return false;
+    };
+    let (retained, moved) = partition_session_members(&processes, session, leader);
+    if moved {
+        return false;
+    }
+    if !wait_retained_members_dead(&retained, deadline) {
+        return false;
+    }
+    // Confirming pass: children forked after the kill (or members that
+    // rejoined the retained group since) are live here and force the
+    // full discovery path; only a second clean pass plus a closed lease
+    // proves the kill absorbed every holder.
+    let Some(processes) = process_snapshot(deadline) else {
+        return false;
+    };
+    if processes
+        .iter()
+        .any(|process| process.live && process.session == session)
+    {
+        return false;
+    }
+    lease.closed().unwrap_or(false)
+}
+
 impl OwnedSession {
     pub(crate) fn child(&self) -> &Child {
         self.child.as_ref().expect("owned session child")
@@ -5593,15 +5726,17 @@ impl OwnedSession {
             // the drain, usually a fire-and-forget helper lingering with
             // TERM blocked in startup; kill the retained group so it exits
             // promptly instead of being waited out, then verify with a
-            // bounded blocking wait. Anything still open after that is a
-            // moved-group survivor and takes the full discovery path
-            // below, exactly as before. Detach skips all of that.
+            // bounded blocking wait. Anything still open after that is
+            // usually a slow death on a loaded host, which the verify
+            // below resolves without discovery; only a moved-group
+            // survivor takes the full discovery path. Detach skips all
+            // of that.
             match self.lease.closed() {
                 Ok(true) => (true, false),
                 _ if detach_completion => (false, false),
                 _ => {
                     let _ = signal_group_result(child.id(), libc::SIGKILL);
-                    (self.lease.wait_closed(NORMAL_COMPLETION_KILL_VERIFY), true)
+                    (kill_verify_closed(&mut self.lease), true)
                 }
             }
         } else {
@@ -5615,26 +5750,53 @@ impl OwnedSession {
                 }
             }
         };
+        // A group kill whose lease stayed open past the bounded verify
+        // is usually a slow death on a loaded host, not a moved-group
+        // survivor. Resolve it with two session snapshots (enumerate +
+        // confirm) plus snapshot-free direct polls instead of the full
+        // discovery loop.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let (lease_closed, group_kill_verified) = if completion_proven
+            && leader_exited
+            && group_killed
+            && !lease_closed
+            && !detach_completion
+        {
+            let verified = verify_retained_group_kill(
+                child.id(),
+                &mut self.lease,
+                completion_snapshot_deadline(),
+            );
+            (verified, verified)
+        } else {
+            (lease_closed, false)
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let group_kill_verified = false;
         // A closed lease is not proof that no descendant survives: a
         // descendant can intentionally close every inherited descriptor.
         // On Linux the session-snapshot probe below verifies directly;
         // portable platforms always take the full fail-closed discovery
-        // path.
-        let same_group_member =
-            if completion_proven && leader_exited && lease_closed && !detach_completion {
-                match normal_completion_needs_discovery(child.id(), completion_snapshot_deadline())
-                {
-                    Ok(present) => present,
-                    Err(error) => {
-                        return StopOutcome {
-                            status: Err(error),
-                            tick_error: None,
-                        };
-                    }
+        // path. A verified group kill already proved membership directly
+        // and skips the second probe.
+        let same_group_member = if completion_proven
+            && leader_exited
+            && lease_closed
+            && !detach_completion
+            && !group_kill_verified
+        {
+            match normal_completion_needs_discovery(child.id(), completion_snapshot_deadline()) {
+                Ok(present) => present,
+                Err(error) => {
+                    return StopOutcome {
+                        status: Err(error),
+                        tick_error: None,
+                    };
                 }
-            } else {
-                false
-            };
+            }
+        } else {
+            false
+        };
         if completion_proven
             && leader_exited
             && (lease_closed || detach_completion)
@@ -7185,9 +7347,30 @@ impl Session {
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let retained_live = false;
         if current_live || retained_live {
-            self.record_error(std::io::Error::other(
-                "owned subprocesses survived bounded SIGKILL cleanup",
-            ));
+            // Name the survivors: a bare "survived" gives a flake hunter no
+            // way to tell a genuinely unkilled member from a stale live flag
+            // or an adopted foreign identity.
+            let current_pids = self
+                .current
+                .values()
+                .filter(|process| process.live)
+                .map(|process| process.pid.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let retained_pids = self
+                .members
+                .values()
+                .filter(|member| member.process.live)
+                .map(|member| member.process.pid.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let retained_pids = String::new();
+            self.record_error(std::io::Error::other(format!(
+                "owned subprocesses survived bounded SIGKILL cleanup (leader={} current=[{current_pids}] retained=[{retained_pids}])",
+                self.leader,
+            )));
         } else if self.error.is_none() {
             self.record_error(std::io::Error::other(
                 "could not verify owned subprocess cleanup",
@@ -8584,13 +8767,13 @@ os._exit(0)
             .unwrap();
 
         assert!(matches!(result, SessionEnd::Exited(status) if status.success()));
-        // The kill plus bounded verify absorbs the holder without discovery
-        // on the fast path; under load the bounded verify may legitimately
-        // fall back to one discovery snapshot. The pin is that the holder
-        // dies (ESRCH below), not the snapshot count.
+        // The kill plus bounded verify absorbs the holder with at most two
+        // snapshots (enumerate + confirm) instead of the discovery loop;
+        // the pin is that the holder dies (ESRCH below) without repeated
+        // host-wide discovery.
         let snapshots = global_process_snapshot_calls();
         assert!(
-            snapshots <= 1,
+            snapshots <= 2,
             "the retained-group kill plus bounded verify must absorb an in-group holder without repeated host-wide discovery (took {snapshots} snapshots)"
         );
         // SAFETY: the fixture wrote its positive PID; signal zero only probes.
@@ -8599,6 +8782,153 @@ os._exit(0)
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strict_policy_absorbs_kill_verify_timeout_without_discovery() {
+        const HELPER: &str = "DOT_STRICT_KILL_TIMEOUT_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cleanup::tests::strict_policy_absorbs_kill_verify_timeout_without_discovery",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "strict kill-timeout helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        struct ResetKillVerifyTimeout;
+        impl Drop for ResetKillVerifyTimeout {
+            fn drop(&mut self) {
+                FORCE_KILL_VERIFY_TIMEOUT.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        adopt_descendants().unwrap();
+        FORCE_KILL_VERIFY_TIMEOUT.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _reset = ResetKillVerifyTimeout;
+        let scope = dot_test_support::TempDir::new("strict-kill-timeout").unwrap();
+        let marker = scope.path().join("holder.pid");
+        let mut command = Command::new(dot_test_support::bash());
+        command
+            .args([
+                "-c",
+                "(printf '%s\\n' \"$BASHPID\" >\"$1\"; exec /bin/sleep 5) & while [[ ! -s $1 ]]; do :; done; exit 0",
+                "strict-kill-timeout",
+            ])
+            .arg(&marker)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        reset_global_process_snapshot_calls();
+
+        let result = supervise_session(command, None, |_| Ok(())).unwrap();
+        let pid = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+
+        assert!(matches!(result, SessionEnd::Exited(status) if status.success()));
+        // The injected verify timeout simulates a loaded-host slow death;
+        // two session snapshots (enumerate + confirm) plus snapshot-free
+        // direct polls must still absorb the holder without the full
+        // discovery path.
+        let snapshots = global_process_snapshot_calls();
+        assert!(
+            snapshots <= 2,
+            "a kill verify timeout must not trigger repeated host-wide discovery (took {snapshots} snapshots)"
+        );
+        // SAFETY: the fixture wrote its positive PID; signal zero only probes.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn group_kill_verify_partitions_session_members() {
+        let row = |pid, group, session, live| ProcessInfo {
+            pid,
+            parent: 1,
+            group,
+            session,
+            live,
+            identity: ProcessIdentity {
+                pid,
+                start: Some(u64::from(pid)),
+            },
+        };
+        let processes = vec![
+            row(10, 5, 5, true),
+            row(11, 9, 5, true),
+            row(12, 5, 5, false),
+            row(13, 5, 7, true),
+        ];
+        let (retained, moved) = partition_session_members(&processes, 5, 5);
+        assert_eq!(
+            retained.iter().map(|member| member.pid).collect::<Vec<_>>(),
+            vec![10]
+        );
+        assert!(moved, "live moved-group row must force discovery");
+        let (retained, moved) = partition_session_members(&processes[..1], 5, 5);
+        assert_eq!(retained.len(), 1);
+        assert!(!moved);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn group_kill_verify_waits_out_real_deaths() {
+        let mut sleeper = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = sleeper.id();
+        let member = linux_process_info(pid).expect("live sleeper identity");
+        assert!(member.live);
+        assert!(!retained_member_dead(&member));
+        assert!(
+            !wait_retained_members_dead(&[&member], Instant::now() + Duration::from_millis(50)),
+            "a live member must outlast a short direct-wait budget"
+        );
+        // A mismatched start tick reads as PID reuse: the probed member
+        // is gone even though its PID slot is occupied.
+        let stale = ProcessInfo {
+            pid: member.pid,
+            parent: member.parent,
+            group: member.group,
+            session: member.session,
+            live: true,
+            identity: ProcessIdentity {
+                pid,
+                start: Some(member.identity.start.unwrap().wrapping_add(1)),
+            },
+        };
+        assert!(retained_member_dead(&stale));
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+        assert!(retained_member_dead(&member));
+        assert!(wait_retained_members_dead(
+            &[&member],
+            Instant::now() + Duration::from_secs(5)
+        ));
+        assert!(wait_retained_members_dead(&[], Instant::now()));
     }
 
     #[test]
@@ -8720,7 +9050,10 @@ import sys
 import time
 
 child = subprocess.Popen(
-    ["/bin/sleep", "5"],
+    # Longer than the 6s settle below: a genuine cancellation
+    # survivor must still be live when the window ends, so natural
+    # expiry can never mask a real ownership miss.
+    ["/bin/sleep", "10"],
     start_new_session=True,
     close_fds=True,
     stdin=subprocess.DEVNULL,
@@ -8778,10 +9111,15 @@ while True:
                 })
                 .is_some_and(|state| !matches!(state, b'Z' | b'X' | b'x'))
         }
-        let survived = live_descendant(pid);
+        // Re-sample after the settle: the pre-loop sample is stale the
+        // moment a slow death lands inside the window (a loaded-host
+        // flake), and asserting on it fails a correctly killed
+        // descendant.
+        let mut survived = live_descendant(pid);
         let deadline = Instant::now() + Duration::from_secs(6);
-        while live_descendant(pid) && Instant::now() < deadline {
+        while survived && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
+            survived = live_descendant(pid);
         }
 
         assert!(matches!(result, SessionEnd::Interrupted(libc::SIGTERM)));
