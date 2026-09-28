@@ -1330,6 +1330,14 @@ static FORCE_FALLBACK_PROCESS_INFO_UNAVAILABLE: std::sync::atomic::AtomicBool =
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 static FORCE_KILL_VERIFY_TIMEOUT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// Makes the post-kill lease wait report "closed" immediately, as when a
+/// SIGKILLed holder has closed its files but has not yet become a zombie.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+static FORCE_KILL_VERIFY_CLOSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+static RETAINED_GROUP_KILL_VERIFIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
 pub(crate) fn reset_global_process_snapshot_calls() {
@@ -4536,21 +4544,29 @@ impl SessionLease {
 /// (cooperative termination with output collection) and the capture
 /// pipes are EOF, so there is no output left to be courteous about;
 /// SIGKILL also catches holders with TERM blocked or ignored in
-/// startup. Anything still open afterwards goes to the retained-group
-/// verify (slow deaths resolve without discovery); only moved-group
-/// survivors take the full discovery path.
+/// startup. On Linux/Android every group kill then goes through the
+/// retained-group verify (slow deaths resolve without discovery), so this
+/// wait only gives victims time to die before its first snapshot; only
+/// moved-group survivors take the full discovery path. Portable builds
+/// still use this wait's result directly.
 const NORMAL_COMPLETION_KILL_VERIFY: Duration = Duration::from_millis(50);
 
 /// Bounded kill verify with a test seam. `FORCE_KILL_VERIFY_TIMEOUT`
 /// simulates the lease-wait timeout outcome (victims not yet observed
 /// dead when the verify window ends, as in a loaded-host slow death),
-/// so the post-timeout verify path stays pinned. It fakes only the wait
-/// result, not slow victim death itself: the kill still lands and the
-/// victims still die promptly.
+/// so the post-timeout verify path stays pinned. `FORCE_KILL_VERIFY_CLOSED`
+/// simulates the opposite early close (a SIGKILLed holder that closed its
+/// files before becoming a zombie). Both fake only the wait result, not
+/// victim death itself: the kill still lands and the victims still die
+/// promptly.
 fn kill_verify_closed(lease: &mut SessionLease) -> bool {
     #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
     if FORCE_KILL_VERIFY_TIMEOUT.load(std::sync::atomic::Ordering::SeqCst) {
         return false;
+    }
+    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+    if FORCE_KILL_VERIFY_CLOSED.load(std::sync::atomic::Ordering::SeqCst) {
+        return true;
     }
     lease.wait_closed(NORMAL_COMPLETION_KILL_VERIFY)
 }
@@ -5626,9 +5642,9 @@ fn wait_retained_members_dead(members: &[&ProcessInfo], deadline: Instant) -> bo
     .is_ok()
 }
 
-/// Resolve a retained-group SIGKILL whose lease stayed open past the
-/// bounded verify, with two session snapshots and no host-wide
-/// discovery loop. Returns true when every same-session member is
+/// Resolve a retained-group SIGKILL, with two session snapshots and no
+/// host-wide discovery loop, whether or not its lease closed during the
+/// bounded kill verify. Returns true when every same-session member is
 /// confirmed dead and the lease is closed (the drain may take the fast
 /// path); false means full discovery is still required.
 ///
@@ -5647,6 +5663,8 @@ fn wait_retained_members_dead(members: &[&ProcessInfo], deadline: Instant) -> bo
 /// bounded direct wait or any unreadable member (failed reads are live).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn verify_retained_group_kill(leader: u32, lease: &mut SessionLease, deadline: Instant) -> bool {
+    #[cfg(test)]
+    RETAINED_GROUP_KILL_VERIFIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let raw = match libc::pid_t::try_from(leader) {
         Ok(raw) => raw,
         Err(_) => return false,
@@ -5738,12 +5756,11 @@ impl OwnedSession {
             // signals at all. An open lease means a live descendant past
             // the drain, usually a fire-and-forget helper lingering with
             // TERM blocked in startup; kill the retained group so it exits
-            // promptly instead of being waited out, then verify with a
-            // bounded blocking wait. Anything still open after that is
-            // usually a slow death on a loaded host, which the verify
-            // below resolves without discovery; only a moved-group
-            // survivor takes the full discovery path. Detach skips all
-            // of that.
+            // promptly instead of being waited out, then wait briefly for
+            // the lease. On Linux/Android the retained-group verify below
+            // resolves every group kill without discovery, whether or not
+            // the lease closed; only a moved-group survivor takes the full
+            // discovery path. Detach skips all of that.
             match self.lease.closed() {
                 Ok(true) => (true, false),
                 _ if detach_completion => (false, false),
@@ -5763,27 +5780,30 @@ impl OwnedSession {
                 }
             }
         };
-        // A group kill whose lease stayed open past the bounded verify
-        // is usually a slow death on a loaded host, not a moved-group
-        // survivor. Resolve it with two session snapshots (enumerate +
-        // confirm) plus snapshot-free direct polls instead of the full
-        // discovery loop.
+        // Every group kill resolves through the bounded verify: two session
+        // snapshots (enumerate + confirm) plus snapshot-free direct polls
+        // instead of the full discovery loop. A lease still open past the
+        // kill verify is usually a slow death on a loaded host, not a
+        // moved-group survivor. A lease that already closed does not prove
+        // the victims are gone either: a SIGKILLed task closes its files
+        // (and so the lease) before it becomes a zombie, so a single probe
+        // can still see it live on a starved host and fall back to full
+        // discovery. The verify waits for each victim directly instead.
+        // From here `lease_closed` means "may take the fast path": a failed
+        // verify clears it even for a lease that did close, sending the
+        // session to full discovery.
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        let (lease_closed, group_kill_verified) = if completion_proven
-            && leader_exited
-            && group_killed
-            && !lease_closed
-            && !detach_completion
-        {
-            let verified = verify_retained_group_kill(
-                child.id(),
-                &mut self.lease,
-                completion_snapshot_deadline(),
-            );
-            (verified, verified)
-        } else {
-            (lease_closed, false)
-        };
+        let (lease_closed, group_kill_verified) =
+            if completion_proven && leader_exited && group_killed && !detach_completion {
+                let verified = verify_retained_group_kill(
+                    child.id(),
+                    &mut self.lease,
+                    completion_snapshot_deadline(),
+                );
+                (verified, verified)
+            } else {
+                (lease_closed, false)
+            };
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let group_kill_verified = false;
         // A closed lease is not proof that no descendant survives: a
@@ -8921,6 +8941,166 @@ os._exit(0)
         assert!(
             snapshots <= 2,
             "a kill verify timeout must not trigger repeated host-wide discovery (took {snapshots} snapshots)"
+        );
+        // SAFETY: the fixture wrote its positive PID; signal zero only probes.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strict_policy_verifies_a_group_kill_whose_lease_closed_early() {
+        // A SIGKILLed holder closes its files, and so the lease, before it
+        // becomes a zombie. On a starved host a lone probe could still see it
+        // live and fall back to repeated host-wide discovery; every group
+        // kill must instead resolve through the bounded retained-group verify.
+        const HELPER: &str = "DOT_STRICT_KILL_CLOSED_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cleanup::tests::strict_policy_verifies_a_group_kill_whose_lease_closed_early",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "strict kill-closed helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        struct ResetKillVerifyClosed;
+        impl Drop for ResetKillVerifyClosed {
+            fn drop(&mut self) {
+                FORCE_KILL_VERIFY_CLOSED.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        adopt_descendants().unwrap();
+        FORCE_KILL_VERIFY_CLOSED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _reset = ResetKillVerifyClosed;
+        let scope = dot_test_support::TempDir::new("strict-kill-closed").unwrap();
+        let marker = scope.path().join("holder.pid");
+        let mut command = Command::new(dot_test_support::bash());
+        command
+            .args([
+                "-c",
+                "(printf '%s\\n' \"$BASHPID\" >\"$1\"; exec /bin/sleep 5) & while [[ ! -s $1 ]]; do :; done; exit 0",
+                "strict-kill-closed",
+            ])
+            .arg(&marker)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        reset_global_process_snapshot_calls();
+        RETAINED_GROUP_KILL_VERIFIES.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let result = supervise_session(command, None, |_| Ok(())).unwrap();
+        let pid = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+
+        assert!(matches!(result, SessionEnd::Exited(status) if status.success()));
+        assert_eq!(
+            RETAINED_GROUP_KILL_VERIFIES.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a group kill whose lease closed early skipped the retained-group verify"
+        );
+        let snapshots = global_process_snapshot_calls();
+        assert!(
+            snapshots <= 2,
+            "an early-closed group kill must not trigger repeated host-wide discovery (took {snapshots} snapshots)"
+        );
+        // SAFETY: the fixture wrote its positive PID; signal zero only probes.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn early_closed_group_kill_with_a_moved_survivor_still_discovers() {
+        // The verify must not certify a session whose holder left the
+        // retained group: the group SIGKILL cannot have reached it, so the
+        // moved survivor still forces full discovery, which stops it.
+        const HELPER: &str = "DOT_STRICT_KILL_CLOSED_MOVED_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cleanup::tests::early_closed_group_kill_with_a_moved_survivor_still_discovers",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "strict kill-closed moved helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        struct ResetKillVerifyClosed;
+        impl Drop for ResetKillVerifyClosed {
+            fn drop(&mut self) {
+                FORCE_KILL_VERIFY_CLOSED.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        adopt_descendants().unwrap();
+        FORCE_KILL_VERIFY_CLOSED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _reset = ResetKillVerifyClosed;
+        let scope = dot_test_support::TempDir::new("strict-kill-closed-moved").unwrap();
+        let marker = scope.path().join("holder.pid");
+        let mut command = Command::new(dot_test_support::bash());
+        // Job control gives the background holder its own process group
+        // inside the session, outside the leader's retained group.
+        command
+            .args([
+                "-c",
+                "set -m; (printf '%s\\n' \"$BASHPID\" >\"$1\"; exec /bin/sleep 5) & while [[ ! -s $1 ]]; do :; done; exit 0",
+                "strict-kill-closed-moved",
+            ])
+            .arg(&marker)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        reset_global_process_snapshot_calls();
+        RETAINED_GROUP_KILL_VERIFIES.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let _ = supervise_session(command, None, |_| Ok(()));
+        let pid = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+
+        assert_eq!(
+            RETAINED_GROUP_KILL_VERIFIES.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the early-closed group kill skipped the retained-group verify"
+        );
+        let snapshots = global_process_snapshot_calls();
+        assert!(
+            snapshots > 2,
+            "a moved-group survivor must force full discovery (took {snapshots} snapshots)"
         );
         // SAFETY: the fixture wrote its positive PID; signal zero only probes.
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
