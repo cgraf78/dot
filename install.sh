@@ -141,6 +141,8 @@ Options:
   --data-home PATH   archive-root parent (default: XDG_DATA_HOME or ~/.local/share)
   --bin-dir PATH     public command directory (default: ~/.local/bin)
   --man-dir PATH     manual-page directory (default: DATA_HOME/man/man1)
+  --require-attestation
+                     fail unless GitHub CLI can verify the download's provenance
   -h, --help         show this help
 EOF
   if [[ -n "$release_install_init_subcommand" ]]; then
@@ -166,6 +168,8 @@ data_home=
 bin_dir=
 man_dir=
 archive_is_private=0
+require_attestation=0
+attestation_verifier=0
 init_requested=0
 init_args=()
 
@@ -204,6 +208,10 @@ while [[ $# -gt 0 ]]; do
       require_value "$1" "${2:-}"
       man_dir=$2
       shift 2
+      ;;
+    --require-attestation)
+      require_attestation=1
+      shift
       ;;
     --init)
       if [[ -z "$release_install_init_subcommand" ]]; then
@@ -353,11 +361,30 @@ if [[ -n "$release_manpage_path" ]]; then
   reject_reserved_destination "$man_link" 'public manpage'
 fi
 
+if [[ -n "$archive" && "$require_attestation" -eq 1 ]]; then
+  die '--require-attestation applies only to online installs, not --archive'
+fi
+
 if [[ -z "$archive" ]]; then
   command -v curl >/dev/null 2>&1 || die 'curl is required for online installation'
-  command -v gh >/dev/null 2>&1 ||
-    die 'gh is required for online attestation verification'
   [[ -z "$checksum" ]] || die '--checksum is valid only with --archive'
+  # Provenance is verified whenever this host can: GitHub CLI new enough to
+  # have `attestation verify` (2.49+; distro packages often predate it) and
+  # holding a github.com credential. Both probes are local, so they cannot
+  # stall on the network. A fresh host usually has neither yet,
+  # since gh typically arrives through the very tools being installed, so by
+  # default the install proceeds on the published SHA-256 checksum and says
+  # so. The choice depends only on this host, never on the release: once
+  # verification is possible, an archive without a valid attestation is
+  # rejected, so a tampered asset cannot opt out by omitting one.
+  # stdin is closed for every gh call: under `curl | bash` it is the script.
+  if command -v gh >/dev/null 2>&1 &&
+    gh attestation verify --help </dev/null >/dev/null 2>&1 &&
+    gh auth token --hostname github.com </dev/null >/dev/null 2>&1; then
+    attestation_verifier=1
+  elif [[ "$require_attestation" -eq 1 ]]; then
+    die 'provenance verification requires GitHub CLI 2.49+ logged in to github.com (gh auth login)'
+  fi
 
   # Bound connection setup, silent bodies, trickling transfers, and transient
   # failures for all three release-download requests. At their worst-case retry
@@ -462,9 +489,19 @@ actual_sha=$(sha256_file "$archive")
 [[ "$actual_sha" == "$expected_sha" ]] ||
   die "checksum mismatch for $archive_name"
 if [[ "$archive_is_private" -eq 1 ]]; then
-  gh attestation verify "$archive" --repo "$release_repo" \
-    --signer-repo cgraf78/actions >/dev/null ||
-    die "artifact attestation verification failed for $archive_name"
+  if [[ "$attestation_verifier" -eq 1 ]]; then
+    # Pin the host: verify follows GH_HOST, and releases live on github.com
+    # even on machines whose gh defaults to a GitHub Enterprise server.
+    GH_HOST=github.com gh attestation verify "$archive" \
+      --repo "$release_repo" --signer-repo cgraf78/actions \
+      </dev/null >/dev/null ||
+      die "artifact attestation verification failed for $archive_name (check gh auth status)"
+  else
+    printf '%s\n' \
+      "install.sh: provenance not verified: GitHub CLI is missing, too old, or not logged in to github.com" \
+      "install.sh: $archive_name matched its published SHA-256 checksum" \
+      "install.sh: to verify it was built by cgraf78/actions, run gh auth login and rerun with --require-attestation" >&2
+  fi
 fi
 
 archive_list=$scratch/archive.list
