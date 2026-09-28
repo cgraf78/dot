@@ -6,6 +6,7 @@
 //! extensions, execute them through the versioned worker, and render every
 //! result through one recorder.
 
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::ffi::OsStringExt as _;
@@ -816,16 +817,13 @@ fn extensions(
         .iter()
         .map(|entry| entry.as_bytes().to_vec())
         .collect();
-    let mut status = 0;
     let Ok(bash) = doctor_bash(runtime) else {
         return 1;
     };
-    let mut worker =
-        crate::hook_worker::Worker::with_doctor(runtime, root, bash.path().to_path_buf());
-    for spec in discovery.specs {
-        if crate::cleanup::received_signal().is_some() {
-            return 1;
-        }
+    let worker = crate::hook_worker::Worker::with_doctor(runtime, root, bash.path().to_path_buf());
+    let home = text(runtime.value("HOME"));
+    let temporary = temporary_root(runtime);
+    let execute = |spec: &crate::doctor_coordinator::Spec| {
         let mut launch = |call: &crate::doctor_orchestrator::WorkerInvocation<'_>| {
             let outcome = worker.doctor(
                 call.script,
@@ -837,26 +835,112 @@ fn extensions(
             let _ = std::fs::write(call.log, &outcome.output);
             outcome.rc
         };
-        let mut render = |path: &Path, recorder: &mut Recorder| render_records(path, recorder);
-        if crate::doctor_orchestrator::run_extension_for(
-            emit.recorder(),
+        crate::doctor_orchestrator::execute_extension_for(
             &spec.key,
             &spec.script,
             &context_overlays,
-            &text(runtime.value("HOME")),
+            &home,
             euid,
             now_secs(),
-            &temporary_root(runtime),
+            &temporary,
             &mut launch,
-            &mut render,
-        ) != 0
-        {
-            status = 1;
+        )
+    };
+    let jobs = if discovery.specs.len() > 1 {
+        extension_jobs(runtime)
+    } else {
+        1
+    };
+    dispatch_extensions(&discovery.specs, jobs, &execute, emit)
+}
+
+/// Bound on concurrently running doctor extensions: `DOT_DOCTOR_JOBS` when
+/// numeric, else the shared update-job count (`DOT_UPDATE_JOBS`, else the CPU
+/// count). Zero means one, so `DOT_DOCTOR_JOBS=1` restores serial execution.
+fn extension_jobs(runtime: &crate::app::Runtime) -> usize {
+    crate::merges::parallel_jobs(
+        &text(runtime.value("DOT_DOCTOR_JOBS")),
+        &text(runtime.value("DOT_UPDATE_JOBS")),
+    )
+    .parse::<usize>()
+    .unwrap_or(1)
+    .max(1)
+}
+
+/// Executes one discovered extension off the rendering thread. `Sync` because
+/// every worker thread in the window shares the same closure.
+type ExecuteExtension<'a> = dyn Fn(&crate::doctor_coordinator::Spec) -> crate::doctor_orchestrator::ExtensionOutcome
+    + Sync
+    + 'a;
+
+/// Run doctor extensions through a FIFO window of at most `jobs` workers and
+/// file their records strictly in discovery order.
+///
+/// Extensions report through private result files, so execution order is not
+/// observable in the rendered output: each record set is filed only after
+/// every earlier extension's, exactly as the serial loop produced it. Like
+/// the merge-hook window, a full window waits for its *oldest* worker, which
+/// is also the next one to render, so streaming output never stalls behind a
+/// later extension.
+///
+/// Cancellation keeps the serial contract: no extension is launched after the
+/// coordinator observes a signal, the in-flight extension being waited on is
+/// still rendered, and every other in-flight worker is joined (its session
+/// already received the forwarded signal) and discarded with its scratch.
+fn dispatch_extensions(
+    specs: &[crate::doctor_coordinator::Spec],
+    jobs: usize,
+    execute: &ExecuteExtension<'_>,
+    emit: &mut Emitter<'_>,
+) -> i32 {
+    // Worker threads do not inherit thread-local bindings, so carry the
+    // caller's pinned host Git into each one explicitly.
+    let host_git = crate::init_client_identity::current_host_git();
+    let mut status = 0;
+    std::thread::scope(|scope| {
+        let mut pending = specs.iter();
+        let mut in_flight = VecDeque::with_capacity(jobs.min(specs.len()));
+        loop {
+            while in_flight.len() < jobs {
+                if crate::cleanup::received_signal().is_some() {
+                    break;
+                }
+                let Some(spec) = pending.next() else {
+                    break;
+                };
+                let host_git = host_git.clone();
+                in_flight.push_back(scope.spawn(move || {
+                    let _host_git = host_git
+                        .as_deref()
+                        .map(crate::init_client_identity::bind_host_git_for_scope);
+                    execute(spec)
+                }));
+            }
+            let Some(oldest) = in_flight.pop_front() else {
+                break;
+            };
+            let outcome = oldest
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let mut render = |path: &Path, recorder: &mut Recorder| render_records(path, recorder);
+            if crate::doctor_orchestrator::record_extension(emit.recorder(), outcome, &mut render)
+                != 0
+            {
+                status = 1;
+            }
+            emit.emit();
+            if crate::cleanup::received_signal().is_some() {
+                for worker in in_flight.drain(..) {
+                    // A panicking discarded worker must not mask the
+                    // cancellation status; its scratch guard already ran.
+                    drop(worker.join());
+                }
+                break;
+            }
         }
-        emit.emit();
-        if crate::cleanup::received_signal().is_some() {
-            return 1;
-        }
+    });
+    if crate::cleanup::received_signal().is_some() {
+        return 1;
     }
     status
 }

@@ -127,9 +127,11 @@ impl Worker {
     }
 
     /// Run one doctor extension through the same sanitized, authenticated
-    /// worker boundary used by lifecycle and merge hooks.
+    /// worker boundary used by lifecycle and merge hooks. Takes `&self` so
+    /// the doctor coordinator can share one worker across concurrent
+    /// extension threads; every launch owns its own session and scratch.
     pub(crate) fn doctor(
-        &mut self,
+        &self,
         script: &Path,
         temporary: &Path,
         result: &Path,

@@ -190,6 +190,17 @@ The coordinator owns rendering, counters, ordering, and aggregate exit status;
 extensions must not inspect or mutate those internals. `dot_doctor_display_path`
 only formats a path for human output and has no filesystem side effects.
 
+Doctor extensions run concurrently through a bounded window of
+`DOT_DOCTOR_JOBS` workers (default: `DOT_UPDATE_JOBS`, else the CPU count).
+Records still render in lexical discovery order, exactly as a serial run
+produces them, and each extension keeps its own private `TMPDIR`. Extensions
+are diagnostics: they must not depend on another extension's side effects or
+race on shared mutable state; a cache they refresh must be published
+atomically (for example, a sibling temporary plus `mv`). `DOT_DOCTOR_JOBS=1`
+restores strictly serial execution. After cancellation no further extension
+starts; running workers receive the forwarded signal and are reaped, and only
+the extension whose records were next to render is still reported.
+
 Test extensions are executable `tests/*-test` programs. By default, `dot test`
 runs those client suites in parallel. The provider-owned `dot` suite remains
 available through `dot test dot`, or alongside client suites in an unfiltered

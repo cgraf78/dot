@@ -560,16 +560,27 @@ impl Drop for GuardedProbeSession {
     }
 }
 
+/// Hanging doctor extension `NN-hang<suffix>.sh`: traps every forwarded
+/// signal into a marker, records its PID, and starts an escaped-group
+/// descendant that ignores everything but TERM.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn assert_doctor_signal(signal: i32, expected: i32) {
+fn hanging_extension(suffix: &str) -> Vec<u8> {
+    format!(
+        "doctor() {{\n  trap 'printf \"%s\\n\" HUP >>\"$HOME/doctor-worker{suffix}-signal\"' HUP\n  trap 'printf \"%s\\n\" INT >>\"$HOME/doctor-worker{suffix}-signal\"' INT\n  trap 'printf \"%s\\n\" QUIT >>\"$HOME/doctor-worker{suffix}-signal\"' QUIT\n  trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker{suffix}-signal\"' TERM\n  set -m\n  (\n    trap '' HUP INT QUIT\n    trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker{suffix}-descendant-signal\"' TERM\n    printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker{suffix}-descendant\"\n    while :; do sleep 1; done\n  ) </dev/null >/dev/null 2>&1 &\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker{suffix}\"\n  while :; do wait || true; done\n}}\n"
+    )
+    .into_bytes()
+}
+
+/// Cancel `dot doctor` while `hangs` extensions fill its whole worker window
+/// (`DOT_DOCTOR_JOBS=hangs`). Every running worker and escaped descendant must
+/// receive exactly one cleanup TERM and be reaped, the extension queued behind
+/// the full window must never start, and no scratch state may remain.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn assert_doctor_signal_with_window(signal: i32, expected: i32, hangs: usize) {
     let home = TempDir::new("doctor-native-signal-home").expect("home");
     let state = TempDir::new("doctor-native-signal-state").expect("state");
     let root = home.path().join("extensions");
     let directory = root.join("doctor.d");
-    let marker = home.path().join("doctor-worker");
-    let descendant_marker = home.path().join("doctor-worker-descendant");
-    let delivered = home.path().join("doctor-worker-signal");
-    let descendant_delivered = home.path().join("doctor-worker-descendant-signal");
     let later = home.path().join("later-extension");
     let temporary = home.path().join("tmp");
     std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
@@ -580,65 +591,77 @@ fn assert_doctor_signal(signal: i32, expected: i32) {
         b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=none\n",
     )
     .expect("config");
+    let suffixes: Vec<String> = (0..hangs)
+        .map(|index| {
+            if index == 0 {
+                String::new()
+            } else {
+                (index + 1).to_string()
+            }
+        })
+        .collect();
+    for (index, suffix) in suffixes.iter().enumerate() {
+        let name = format!("{:02}-hang{suffix}.sh", 10 + index);
+        std::fs::write(directory.join(&name), hanging_extension(suffix)).expect("extension");
+        seal(&directory.join(&name), 0o644);
+    }
     std::fs::write(
-        directory.join("10-hang.sh"),
-        b"doctor() {\n  trap 'printf \"%s\\n\" HUP >>\"$HOME/doctor-worker-signal\"' HUP\n  trap 'printf \"%s\\n\" INT >>\"$HOME/doctor-worker-signal\"' INT\n  trap 'printf \"%s\\n\" QUIT >>\"$HOME/doctor-worker-signal\"' QUIT\n  trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker-signal\"' TERM\n  set -m\n  (\n    trap '' HUP INT QUIT\n    trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker-descendant-signal\"' TERM\n    printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker-descendant\"\n    while :; do sleep 1; done\n  ) </dev/null >/dev/null 2>&1 &\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker\"\n  while :; do wait || true; done\n}\n",
-    )
-    .expect("extension");
-    std::fs::write(
-        directory.join("20-later.sh"),
+        directory.join("90-later.sh"),
         b"doctor() { printf ran >\"$HOME/later-extension\"; }\n",
     )
     .expect("later extension");
     seal(&root, 0o700);
     seal(&directory, 0o700);
-    seal(&directory.join("10-hang.sh"), 0o644);
-    seal(&directory.join("20-later.sh"), 0o644);
+    seal(&directory.join("90-later.sh"), 0o644);
 
+    let jobs = hangs.to_string();
     let child = command(
         false,
         &home,
         &state,
-        &[("TMPDIR", temporary.to_str().expect("temporary path"))],
+        &[
+            ("TMPDIR", temporary.to_str().expect("temporary path")),
+            ("DOT_DOCTOR_JOBS", jobs.as_str()),
+        ],
     )
     .spawn()
     .expect("doctor");
     let mut child = GuardedDoctorChild::new(child);
     let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let mut worker_identity = None;
-    let mut descendant_identity = None;
-    let (worker, descendant) = loop {
-        if worker_identity.is_none() {
-            worker_identity = std::fs::read_to_string(&marker)
-                .ok()
-                .and_then(|value| value.trim().parse::<i32>().ok())
-                .and_then(doctor_process_identity);
+    let mut identities: Vec<[Option<DoctorProcessIdentity>; 2]> =
+        suffixes.iter().map(|_| [None, None]).collect();
+    let mut sessions = loop {
+        for (suffix, pair) in suffixes.iter().zip(identities.iter_mut()) {
+            for (slot, marker) in pair.iter_mut().zip([
+                format!("doctor-worker{suffix}"),
+                format!("doctor-worker{suffix}-descendant"),
+            ]) {
+                if slot.is_none() {
+                    *slot = std::fs::read_to_string(home.path().join(marker))
+                        .ok()
+                        .and_then(|value| value.trim().parse::<i32>().ok())
+                        .and_then(doctor_process_identity);
+                }
+            }
         }
-        if descendant_identity.is_none() {
-            descendant_identity = std::fs::read_to_string(&descendant_marker)
-                .ok()
-                .and_then(|value| value.trim().parse::<i32>().ok())
-                .and_then(doctor_process_identity);
-        }
-        if let (Some(worker), Some(descendant)) =
-            (worker_identity.clone(), descendant_identity.clone())
-        {
-            break (
-                GuardedProbeSession::from_identity(worker),
-                GuardedProbeSession::from_identity(descendant),
-            );
+        if identities.iter().flatten().all(Option::is_some) {
+            break identities
+                .iter_mut()
+                .flatten()
+                .map(|slot| GuardedProbeSession::from_identity(slot.take().expect("identity")))
+                .collect::<Vec<_>>();
         }
         assert!(
             !child.exited_wnowait().expect("doctor status"),
             "doctor exited before starting its cancellation fixture"
         );
         if std::time::Instant::now() >= ready_deadline {
-            let _worker = worker_identity
-                .take()
-                .map(GuardedProbeSession::from_identity);
-            let _descendant = descendant_identity
-                .take()
-                .map(GuardedProbeSession::from_identity);
+            let _started = identities
+                .iter_mut()
+                .flatten()
+                .filter_map(Option::take)
+                .map(GuardedProbeSession::from_identity)
+                .collect::<Vec<_>>();
             panic!("doctor cancellation fixture did not start");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -651,21 +674,21 @@ fn assert_doctor_signal(signal: i32, expected: i32) {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let mut worker = worker;
-    let mut descendant = descendant;
     let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while (!worker.observe_stopped() || !descendant.observe_stopped())
+    while sessions
+        .iter_mut()
+        .any(|session| !session.observe_stopped())
         && std::time::Instant::now() < cleanup_deadline
     {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let worker_survived = !worker.observe_stopped();
-    let descendant_survived = !descendant.observe_stopped();
-    if worker_survived {
-        worker.force_stop();
-    }
-    if descendant_survived {
-        descendant.force_stop();
+    let survivors = sessions
+        .iter_mut()
+        .map(|session| !session.observe_stopped())
+        .filter(|survived| *survived)
+        .count();
+    for session in &mut sessions {
+        session.force_stop();
     }
     let output = child.reap_with_output().expect("doctor output");
     let observed = output.status.code();
@@ -676,19 +699,27 @@ fn assert_doctor_signal(signal: i32, expected: i32) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!worker_survived, "doctor extension worker survived");
-    assert!(!descendant_survived, "doctor extension descendant survived");
-    for (path, label) in [
-        (&delivered, "worker"),
-        (&descendant_delivered, "escaped-group descendant"),
-    ] {
-        let delivered = std::fs::read_to_string(path).expect("delivered signal marker");
-        let signals = delivered.lines().collect::<Vec<_>>();
-        assert_eq!(
-            signals,
-            ["TERM"],
-            "{label} did not receive exactly one cleanup TERM"
-        );
+    assert_eq!(
+        survivors, 0,
+        "doctor extension workers or descendants survived"
+    );
+    for suffix in &suffixes {
+        for (marker, label) in [
+            (format!("doctor-worker{suffix}-signal"), "worker"),
+            (
+                format!("doctor-worker{suffix}-descendant-signal"),
+                "escaped-group descendant",
+            ),
+        ] {
+            let delivered = std::fs::read_to_string(home.path().join(&marker))
+                .expect("delivered signal marker");
+            let signals = delivered.lines().collect::<Vec<_>>();
+            assert_eq!(
+                signals,
+                ["TERM"],
+                "{label} {suffix:?} did not receive exactly one cleanup TERM"
+            );
+        }
     }
     assert!(
         !later.exists(),
@@ -701,6 +732,25 @@ fn assert_doctor_signal(signal: i32, expected: i32) {
         0,
         "doctor left extension scratch state"
     );
+}
+
+/// The serial window: one hanging extension, and the next extension must
+/// not start after cancellation.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn assert_doctor_signal(signal: i32, expected: i32) {
+    assert_doctor_signal_with_window(signal, expected, 1);
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn native_doctor_int_reaps_every_parallel_extension() {
+    assert_doctor_signal_with_window(libc::SIGINT, 130, 3);
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn native_doctor_term_reaps_every_parallel_extension() {
+    assert_doctor_signal_with_window(libc::SIGTERM, 143, 2);
 }
 
 #[test]
@@ -1183,6 +1233,207 @@ fn unsafe_lock_and_unavailable_provider_match_without_the_old_engine() {
     assert!(output.contains("update lock path is unsafe"));
     assert!(output.contains("Shdeps provider is unavailable"));
     assert_pair(&shell, &native);
+}
+
+/// Build a sealed doctor extension tree under a fresh fixture home.
+fn doctor_extension_fixture(tag: &str, extensions: &[(String, Vec<u8>)]) -> (TempDir, TempDir) {
+    let home = TempDir::new(&format!("doctor-{tag}-home")).expect("home");
+    let state = TempDir::new(&format!("doctor-{tag}-state")).expect("state");
+    let root = home.path().join("extensions");
+    let directory = root.join("doctor.d");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
+    std::fs::create_dir_all(&directory).expect("doctor directory");
+    std::fs::create_dir(home.path().join("tmp")).expect("temporary directory");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=none\n",
+    )
+    .expect("config");
+    for (name, body) in extensions {
+        std::fs::write(directory.join(name), body).expect("extension");
+        seal(&directory.join(name), 0o644);
+    }
+    seal(&root, 0o700);
+    seal(&directory, 0o700);
+    (home, state)
+}
+
+/// Run native doctor with a fixed worker window and the fixture's private
+/// `TMPDIR`, returning the output and whether that `TMPDIR` is empty again.
+fn doctor_with_jobs(home: &TempDir, state: &TempDir, jobs: &str) -> (Output, bool) {
+    let temporary = home.path().join("tmp");
+    let output = command(
+        false,
+        home,
+        state,
+        &[
+            ("TMPDIR", temporary.to_str().expect("temporary path")),
+            ("DOT_DOCTOR_JOBS", jobs),
+        ],
+    )
+    .output()
+    .expect("native doctor");
+    let clean = std::fs::read_dir(&temporary)
+        .expect("temporary directory")
+        .next()
+        .is_none();
+    (output, clean)
+}
+
+/// Extensions covering every record and tail shape: ok/warn/fail/skip rows,
+/// sections, a nonzero worker status, and stray stdout/stderr output. Earlier
+/// extensions sleep longer so parallel completion order is the reverse of
+/// discovery order; the sleep only perturbs scheduling and never
+/// synchronizes anything.
+fn mixed_extensions(count: usize) -> Vec<(String, Vec<u8>)> {
+    (0..count)
+        .map(|index| {
+            let delay = (count - index) as f64 * 0.02;
+            let body = match index % 5 {
+                0 => format!(
+                    "doctor() {{\n  sleep {delay}\n  dot_doctor_section 'Section {index}'\n  dot_doctor_ok 'check {index}' 'detail {index}'\n}}\n"
+                ),
+                1 => format!(
+                    "doctor() {{\n  sleep {delay}\n  dot_doctor_warn 'warning {index}' 'hint {index}'\n  dot_doctor_skip 'skipped {index}'\n}}\n"
+                ),
+                2 => format!(
+                    "doctor() {{\n  sleep {delay}\n  dot_doctor_fail 'failure {index}' 'fix {index}'\n  return 3\n}}\n"
+                ),
+                3 => format!(
+                    "doctor() {{\n  sleep {delay}\n  printf 'stray stdout {index}\\n'\n  printf 'stray stderr {index}\\n' >&2\n  dot_doctor_ok 'noisy {index}'\n}}\n"
+                ),
+                _ => format!("doctor() {{\n  sleep {delay}\n  return 0\n}}\n"),
+            };
+            (format!("{:03}-mixed{index}.sh", 100 + index), body.into_bytes())
+        })
+        .collect()
+}
+
+fn assert_same_doctor(serial: &Output, parallel: &Output, context: &str) {
+    assert_eq!(
+        parallel.status.code(),
+        serial.status.code(),
+        "{context}: exit status; stderr={}",
+        String::from_utf8_lossy(&parallel.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&parallel.stdout),
+        String::from_utf8_lossy(&serial.stdout),
+        "{context}: stdout"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&parallel.stderr),
+        String::from_utf8_lossy(&serial.stderr),
+        "{context}: stderr"
+    );
+}
+
+#[test]
+fn parallel_doctor_extensions_run_concurrently() {
+    // The earlier extension can only report success if the later one runs
+    // while it is still waiting, which a serial loop can never satisfy.
+    let waiter = b"doctor() {\n  local deadline=$((SECONDS + 30))\n  until [[ -e $HOME/later-started ]]; do\n    ((SECONDS < deadline)) || { dot_doctor_fail 'extensions did not overlap'; return 1; }\n    sleep 0.02\n  done\n  dot_doctor_ok 'extensions overlapped'\n}\n";
+    let signaler =
+        b"doctor() {\n  : >\"$HOME/later-started\"\n  dot_doctor_ok 'later extension started'\n}\n";
+    let (home, state) = doctor_extension_fixture(
+        "parallel-overlap",
+        &[
+            ("10-waiter.sh".to_string(), waiter.to_vec()),
+            ("20-signaler.sh".to_string(), signaler.to_vec()),
+        ],
+    );
+    let (output, clean) = doctor_with_jobs(&home, &state, "2");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The bare fixture home fails unrelated client checks, so judge the
+    // extension records rather than the aggregate exit status.
+    assert!(
+        !stdout.contains("did not overlap") && !stdout.contains("doctor extension failed"),
+        "stdout={stdout}"
+    );
+    let overlapped = stdout.find("extensions overlapped").expect("waiter record");
+    let started = stdout
+        .find("later extension started")
+        .expect("signaler record");
+    assert!(
+        overlapped < started,
+        "records must render in discovery order: {stdout}"
+    );
+    assert!(clean, "doctor left extension scratch state");
+}
+
+#[test]
+fn parallel_doctor_output_matches_serial_output() {
+    let (home, state) = doctor_extension_fixture("parallel-parity", &mixed_extensions(10));
+    let (serial, serial_clean) = doctor_with_jobs(&home, &state, "1");
+    let serial_stdout = String::from_utf8_lossy(&serial.stdout);
+    for expected in [
+        "Section 0",
+        "warning 1",
+        "failure 2",
+        "mixed2 doctor extension failed",
+        "mixed3 doctor extension wrote outside the result API",
+        "stray stderr 3",
+    ] {
+        assert!(
+            serial_stdout.contains(expected),
+            "serial fixture lacks {expected:?}: {serial_stdout}"
+        );
+    }
+    assert_ne!(
+        serial.status.code(),
+        Some(0),
+        "fixture failures must fail doctor"
+    );
+    let (parallel, parallel_clean) = doctor_with_jobs(&home, &state, "8");
+    assert_same_doctor(&serial, &parallel, "jobs=8");
+    assert!(
+        serial_clean && parallel_clean,
+        "doctor left extension scratch state"
+    );
+}
+
+#[test]
+fn zero_doctor_jobs_runs_serially() {
+    // `DOT_DOCTOR_JOBS=0` normalizes to one worker like the other job knobs,
+    // so the waiter can never observe the later extension.
+    let waiter = b"doctor() {\n  if [[ -e $HOME/later-started ]]; then dot_doctor_fail 'extensions overlapped'; else dot_doctor_ok 'extensions ran serially'; fi\n}\n";
+    let signaler =
+        b"doctor() {\n  : >\"$HOME/later-started\"\n  dot_doctor_ok 'later extension started'\n}\n";
+    let (home, state) = doctor_extension_fixture(
+        "zero-jobs",
+        &[
+            ("10-waiter.sh".to_string(), waiter.to_vec()),
+            ("20-signaler.sh".to_string(), signaler.to_vec()),
+        ],
+    );
+    let (output, clean) = doctor_with_jobs(&home, &state, "0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("later extension started"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("extensions ran serially"),
+        "stdout={stdout}"
+    );
+    assert!(clean, "doctor left extension scratch state");
+}
+
+#[test]
+fn parallel_doctor_stress_preserves_serial_output() {
+    // Many short extensions through a window narrower than the extension
+    // count exercise refill, ordered drain, and scratch cleanup repeatedly.
+    let (home, state) = doctor_extension_fixture("parallel-stress", &mixed_extensions(40));
+    let (serial, serial_clean) = doctor_with_jobs(&home, &state, "1");
+    assert!(serial_clean, "serial doctor left extension scratch state");
+    for (round, jobs) in ["2", "7", "16", "64", "7"].into_iter().enumerate() {
+        let (parallel, clean) = doctor_with_jobs(&home, &state, jobs);
+        assert_same_doctor(&serial, &parallel, &format!("round {round} jobs={jobs}"));
+        assert!(
+            clean,
+            "round {round} jobs={jobs} left extension scratch state"
+        );
+    }
 }
 
 #[test]
