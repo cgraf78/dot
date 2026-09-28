@@ -619,10 +619,11 @@ fn reexec_guard_probes_git_only_when_a_revision_is_expected() {
     )
     .expect("git shim");
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("shim mode");
-    let mut path = scope.path().as_os_str().to_owned();
-    path.push(":");
-    path.push(parent_path());
-    let path = path.to_str().expect("utf-8 PATH").to_string();
+    // The shim is the only Git on PATH. Its fixture root may sit inside the
+    // Dot checkout, which host-Git selection excludes; with nothing else to
+    // select, the engine falls back to PATH lookup, so the shim observes
+    // every probe either way and neither half of this test passes vacuously.
+    let path = scope.path().to_str().expect("utf-8 PATH").to_string();
     for expected in [None, Some("")] {
         assert_eq!(
             run(
