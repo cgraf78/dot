@@ -639,41 +639,144 @@ fn run_extension_with_context(
     render: &mut dyn FnMut(&Path, &mut Recorder),
     context: &mut dyn FnMut(&Path) -> Option<(PathBuf, String)>,
 ) -> i32 {
-    let temporary = match temporary_root.map_or_else(make_temp_dir, make_temp_dir_in) {
-        Ok(dir) => dir,
-        Err(_) => {
-            let mut message = key.to_vec();
-            message.extend_from_slice(b" doctor extension temporary directory unavailable");
-            rec.fail(&message, Some(b"check TMPDIR permissions and free space"));
-            return 1;
-        }
+    let outcome = execute_extension_with_context(key, script, temporary_root, worker, context);
+    record_extension(rec, outcome, render)
+}
+
+/// Owns one extension's scratch directory and removes it when dropped.
+///
+/// Parallel dispatch separates execution from ordered rendering, so the
+/// directory can outlive the worker thread. Tying removal to `Drop` keeps
+/// cleanup idempotent on every path: a normal render, a discarded outcome
+/// after cancellation, and a worker thread that unwinds before rendering.
+#[derive(Debug)]
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Debug)]
+enum OutcomeState {
+    TemporaryUnavailable,
+    ContextUnavailable,
+    Ran {
+        scratch: Scratch,
+        result: PathBuf,
+        log: PathBuf,
+        rc: i32,
+    },
+}
+
+/// One executed doctor extension whose records have not been filed yet.
+///
+/// Execution touches only the extension's private scratch directory and
+/// never the shared [`Recorder`], so outcomes may be produced concurrently
+/// and filed later, strictly in discovery order, by [`record_extension`].
+/// Dropping an unrecorded outcome discards its records and scratch state.
+#[derive(Debug)]
+pub(crate) struct ExtensionOutcome {
+    key: Vec<u8>,
+    state: OutcomeState,
+}
+
+/// Run one extension's worker against a private scratch directory without
+/// touching the recorder: allocate scratch, create the result file, build the
+/// overlay context, and run `worker`. Allocation failures are captured in the
+/// outcome and reported, in order, by [`record_extension`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_extension_for(
+    key: &[u8],
+    script: &Path,
+    overlays: &[Vec<u8>],
+    home: &str,
+    euid: u32,
+    now_secs: i64,
+    temporary_root: &Path,
+    worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> i32,
+) -> ExtensionOutcome {
+    let mut context =
+        |temporary: &Path| create_context_for(temporary, overlays, home, euid, now_secs);
+    execute_extension_with_context(key, script, Some(temporary_root), worker, &mut context)
+}
+
+fn execute_extension_with_context(
+    key: &[u8],
+    script: &Path,
+    temporary_root: Option<&Path>,
+    worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> i32,
+    context: &mut dyn FnMut(&Path) -> Option<(PathBuf, String)>,
+) -> ExtensionOutcome {
+    let outcome = |state| ExtensionOutcome {
+        key: key.to_vec(),
+        state,
     };
-    let (result, log) = result_paths(&temporary);
+    let scratch = match temporary_root.map_or_else(make_temp_dir, make_temp_dir_in) {
+        Ok(dir) => Scratch(dir),
+        Err(_) => return outcome(OutcomeState::TemporaryUnavailable),
+    };
+    let (result, log) = result_paths(&scratch.0);
     let _ = create_result_file(&result);
-    let (context, token) = match context(&temporary) {
+    let (context, token) = match context(&scratch.0) {
         Some(pair) => pair,
-        None => {
-            let mut message = key.to_vec();
-            message.extend_from_slice(b" doctor extension context unavailable");
-            rec.fail(&message, None);
-            let _ = std::fs::remove_dir_all(&temporary);
-            return 1;
-        }
+        // Dropping `scratch` removes the directory before the failure is
+        // reported, as the serial shell loop did.
+        None => return outcome(OutcomeState::ContextUnavailable),
     };
     let invocation = WorkerInvocation {
         script,
-        temporary: &temporary,
+        temporary: &scratch.0,
         result: &result,
         context: &context,
         token: &token,
         log: &log,
     };
     let rc = worker(&invocation);
-    render(&result, rec);
-    let log_bytes = std::fs::read(&log).unwrap_or_default();
-    extension_tail(rec, key, rc, &log_bytes);
-    let _ = std::fs::remove_dir_all(&temporary);
-    rc
+    outcome(OutcomeState::Ran {
+        scratch,
+        result,
+        log,
+        rc,
+    })
+}
+
+/// File one executed extension's records, then its failure or stray-output
+/// tail, exactly as the serial loop did immediately after the worker
+/// returned. Returns the worker status (1 for allocation failures).
+pub(crate) fn record_extension(
+    rec: &mut Recorder,
+    outcome: ExtensionOutcome,
+    render: &mut dyn FnMut(&Path, &mut Recorder),
+) -> i32 {
+    let key = outcome.key;
+    match outcome.state {
+        OutcomeState::TemporaryUnavailable => {
+            let mut message = key;
+            message.extend_from_slice(b" doctor extension temporary directory unavailable");
+            rec.fail(&message, Some(b"check TMPDIR permissions and free space"));
+            1
+        }
+        OutcomeState::ContextUnavailable => {
+            let mut message = key;
+            message.extend_from_slice(b" doctor extension context unavailable");
+            rec.fail(&message, None);
+            1
+        }
+        OutcomeState::Ran {
+            scratch,
+            result,
+            log,
+            rc,
+        } => {
+            render(&result, rec);
+            let log_bytes = std::fs::read(&log).unwrap_or_default();
+            extension_tail(rec, &key, rc, &log_bytes);
+            drop(scratch);
+            rc
+        }
+    }
 }
 
 /// `dot_ui_title 'dot doctor'` under the pipe projection (no gum,
@@ -821,6 +924,88 @@ mod tests {
             split_spec(b"no-tab"),
             Some((b"no-tab".as_slice(), b"".as_slice()))
         );
+    }
+
+    fn execute_in(root: &Path, key: &[u8], log: &'static [u8]) -> (ExtensionOutcome, PathBuf) {
+        let seen = std::cell::RefCell::new(PathBuf::new());
+        let mut worker = |call: &WorkerInvocation<'_>| {
+            *seen.borrow_mut() = call.temporary.to_path_buf();
+            std::fs::write(call.result, b"").expect("result");
+            std::fs::write(call.log, log).expect("log");
+            0
+        };
+        let mut context = |temporary: &Path| Some((temporary.join("context"), "token".into()));
+        let outcome = execute_extension_with_context(
+            key,
+            Path::new("/fixture/extension.sh"),
+            Some(root),
+            &mut worker,
+            &mut context,
+        );
+        let scratch = seen.into_inner();
+        (outcome, scratch)
+    }
+
+    #[test]
+    fn discarded_outcome_removes_scratch_without_recording() {
+        let root = dot_test_support::TempDir::new("doctor-discard-outcome").expect("root");
+        let (outcome, scratch) = execute_in(root.path(), b"demo", b"");
+        assert!(scratch.is_dir(), "scratch must survive until recording");
+        drop(outcome);
+        assert!(!scratch.exists(), "discarded outcome leaked scratch");
+    }
+
+    #[test]
+    fn outcomes_record_in_caller_order_and_remove_scratch() {
+        let root = dot_test_support::TempDir::new("doctor-ordered-outcome").expect("root");
+        let (first, first_scratch) = execute_in(root.path(), b"first", b"one\n");
+        let (second, second_scratch) = execute_in(root.path(), b"second", b"two\n");
+        let mut rec = Recorder::new();
+        let mut render = |_: &Path, _: &mut Recorder| {};
+        // Execution order is irrelevant: filing follows the caller's order.
+        assert_eq!(record_extension(&mut rec, second, &mut render), 0);
+        assert_eq!(record_extension(&mut rec, first, &mut render), 0);
+        let rendered = String::from_utf8(rec.render()).expect("utf8");
+        let second_at = rendered.find("second doctor extension").expect("second");
+        let first_at = rendered.find("first doctor extension").expect("first");
+        assert!(second_at < first_at, "{rendered}");
+        assert!(!first_scratch.exists() && !second_scratch.exists());
+    }
+
+    #[test]
+    fn allocation_failures_record_when_filed() {
+        let root = dot_test_support::TempDir::new("doctor-failed-outcome").expect("root");
+        let missing = root.path().join("missing/nested");
+        let mut worker = |_: &WorkerInvocation<'_>| panic!("worker must not run");
+        let mut context = |_: &Path| None;
+        let unavailable = execute_extension_with_context(
+            b"gone",
+            Path::new("/fixture/extension.sh"),
+            Some(&missing),
+            &mut worker,
+            &mut context,
+        );
+        let no_context = execute_extension_with_context(
+            b"lost",
+            Path::new("/fixture/extension.sh"),
+            Some(root.path()),
+            &mut worker,
+            &mut context,
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).expect("root").count(),
+            0,
+            "context failure must remove its scratch before filing"
+        );
+        let mut rec = Recorder::new();
+        let mut render = |_: &Path, _: &mut Recorder| {};
+        assert!(rec.render().is_empty(), "execution must not record");
+        assert_eq!(record_extension(&mut rec, unavailable, &mut render), 1);
+        assert_eq!(record_extension(&mut rec, no_context, &mut render), 1);
+        let rendered = String::from_utf8(rec.render()).expect("utf8");
+        assert!(rendered.contains("gone doctor extension temporary directory unavailable"));
+        assert!(rendered.contains("lost doctor extension context unavailable"));
+        assert_eq!(rec.counts().fail, 2);
     }
 
     #[test]

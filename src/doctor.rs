@@ -6,11 +6,13 @@
 //! extensions, execute them through the versioned worker, and render every
 //! result through one recorder.
 
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::doctor_checks::{
     BaseRepoInputs, CronInputs, LifecycleInputs, MergeInputs, MergeSpec, OverlayInputs,
@@ -816,16 +818,14 @@ fn extensions(
         .iter()
         .map(|entry| entry.as_bytes().to_vec())
         .collect();
-    let mut status = 0;
     let Ok(bash) = doctor_bash(runtime) else {
         return 1;
     };
-    let mut worker =
-        crate::hook_worker::Worker::with_doctor(runtime, root, bash.path().to_path_buf());
-    for spec in discovery.specs {
-        if crate::cleanup::received_signal().is_some() {
-            return 1;
-        }
+    let worker = crate::hook_worker::Worker::with_doctor(runtime, root, bash.path().to_path_buf());
+    let home = text(runtime.value("HOME"));
+    let temporary = temporary_root(runtime);
+    let abort = AtomicBool::new(false);
+    let execute = |spec: &crate::doctor_coordinator::Spec| {
         let mut launch = |call: &crate::doctor_orchestrator::WorkerInvocation<'_>| {
             let outcome = worker.doctor(
                 call.script,
@@ -833,32 +833,219 @@ fn extensions(
                 call.result,
                 call.context,
                 call.token,
+                &abort,
             );
             let _ = std::fs::write(call.log, &outcome.output);
             outcome.rc
         };
-        let mut render = |path: &Path, recorder: &mut Recorder| render_records(path, recorder);
-        if crate::doctor_orchestrator::run_extension_for(
-            emit.recorder(),
+        crate::doctor_orchestrator::execute_extension_for(
             &spec.key,
             &spec.script,
             &context_overlays,
-            &text(runtime.value("HOME")),
+            &home,
             euid,
             now_secs(),
-            &temporary_root(runtime),
+            &temporary,
             &mut launch,
-            &mut render,
-        ) != 0
-        {
-            status = 1;
+        )
+    };
+    let jobs = if discovery.specs.len() > 1 {
+        extension_jobs(runtime)
+    } else {
+        1
+    };
+    dispatch_extensions(&discovery.specs, jobs, &execute, &abort, emit)
+}
+
+/// Bound on concurrently running doctor extensions: `DOT_DOCTOR_JOBS` when
+/// numeric, else the shared update-job count (`DOT_UPDATE_JOBS`, else the CPU
+/// count). Zero means one, so `DOT_DOCTOR_JOBS=1` restores serial execution.
+fn extension_jobs(runtime: &crate::app::Runtime) -> usize {
+    jobs_count(&crate::merges::parallel_jobs(
+        &text(runtime.value("DOT_DOCTOR_JOBS")),
+        &text(runtime.value("DOT_UPDATE_JOBS")),
+    ))
+}
+
+/// Parse the normalized job count. The shared policy only yields digit
+/// strings, so a parse failure is overflow: an absurdly large bound means
+/// "unbounded" and saturates rather than silently collapsing to serial.
+fn jobs_count(normalized: &str) -> usize {
+    match normalized.parse::<usize>() {
+        Ok(jobs) => jobs.max(1),
+        Err(_) if !normalized.is_empty() && normalized.bytes().all(|b| b.is_ascii_digit()) => {
+            usize::MAX
         }
-        emit.emit();
-        if crate::cleanup::received_signal().is_some() {
-            return 1;
+        Err(_) => 1,
+    }
+}
+
+/// Executes one discovered extension off the rendering thread. `Sync` because
+/// every worker thread in the window shares the same closure.
+type ExecuteExtension<'a> = dyn Fn(&crate::doctor_coordinator::Spec) -> crate::doctor_orchestrator::ExtensionOutcome
+    + Sync
+    + 'a;
+
+/// Run doctor extensions through a FIFO window of at most `jobs` workers and
+/// file their records strictly in discovery order.
+///
+/// Extensions report through private result files, so execution order is not
+/// observable in the rendered output: each record set is filed only after
+/// every earlier extension's, exactly as the serial loop produced it. Like
+/// the merge-hook window, a full window waits for its *oldest* worker, which
+/// is also the next one to render, so streaming output never stalls behind a
+/// later extension.
+///
+/// Cancellation keeps the serial contract: no extension is launched after the
+/// coordinator observes a signal, the in-flight extension being waited on is
+/// still rendered, and every other in-flight worker is joined (its session
+/// already received the forwarded signal) and discarded with its scratch.
+///
+/// A panicking worker is an engine bug and still unwinds the command, but
+/// only after every sibling extension session has been stopped through
+/// `abort` and joined; unwinding straight out of the scope would instead wait
+/// on siblings that may never finish. The panicking worker raises `abort`
+/// itself, wherever it sits in the window, so a hung *older* sibling that the
+/// dispatcher is blocked on is released too. Outcomes that complete after an
+/// abort are discarded unrendered, since their sessions were cut short. A
+/// thread that cannot be spawned runs its extension inline under the same
+/// panic handling, which degrades to serial behavior rather than failing
+/// the extension.
+fn dispatch_extensions(
+    specs: &[crate::doctor_coordinator::Spec],
+    jobs: usize,
+    execute: &ExecuteExtension<'_>,
+    abort: &AtomicBool,
+    emit: &mut Emitter<'_>,
+) -> i32 {
+    // Worker threads do not inherit thread-local bindings, so carry the
+    // caller's pinned host Git into each one explicitly.
+    let host_git = crate::init_client_identity::carry_host_git();
+    let mut status = 0;
+    let mut panicked = None;
+    std::thread::scope(|scope| {
+        let mut pending = specs.iter();
+        let mut in_flight = VecDeque::with_capacity(jobs.min(specs.len()));
+        loop {
+            while in_flight.len() < jobs && !abort.load(Ordering::SeqCst) {
+                if crate::cleanup::received_signal().is_some() {
+                    break;
+                }
+                let Some(spec) = pending.next() else {
+                    break;
+                };
+                let host_git = host_git.clone();
+                let spawned = std::thread::Builder::new().spawn_scoped(scope, move || {
+                    let _host_git = host_git.bind();
+                    execute_guarded(execute, spec, abort)
+                });
+                in_flight.push_back(match spawned {
+                    Ok(handle) => InFlight::Running(handle),
+                    Err(_) => InFlight::Done(execute_guarded(execute, spec, abort)),
+                });
+            }
+            let Some(oldest) = in_flight.pop_front() else {
+                break;
+            };
+            let outcome = match oldest.join() {
+                Ok(outcome) if !abort.load(Ordering::SeqCst) => outcome,
+                joined => {
+                    // Some worker panicked: stop every session still
+                    // running, then keep the first panic to re-raise
+                    // outside the scope.
+                    abort.store(true, Ordering::SeqCst);
+                    panicked = joined.err();
+                    for sibling in in_flight.drain(..) {
+                        if let Err(panic) = sibling.join() {
+                            panicked.get_or_insert(panic);
+                        }
+                    }
+                    break;
+                }
+            };
+            let mut render = |path: &Path, recorder: &mut Recorder| render_records(path, recorder);
+            if crate::doctor_orchestrator::record_extension(emit.recorder(), outcome, &mut render)
+                != 0
+            {
+                status = 1;
+            }
+            emit.emit();
+            if crate::cleanup::received_signal().is_some() {
+                for worker in in_flight.drain(..) {
+                    // A panicking discarded worker must not mask the
+                    // cancellation status; its scratch guard already ran.
+                    drop(worker.join());
+                }
+                break;
+            }
         }
+    });
+    settle(
+        panicked,
+        abort.load(Ordering::SeqCst),
+        crate::cleanup::received_signal().is_some(),
+        status,
+    )
+}
+
+/// The dispatcher's final verdict, in precedence order: a panic collected
+/// by the abort path re-raises; a received signal returns 1 even when a
+/// worker drained during cancellation panicked and raised `abort` (the
+/// drain discards that payload so it cannot mask the cancellation); an
+/// abort with neither is a broken invariant.
+fn settle(
+    panicked: Option<Box<dyn std::any::Any + Send>>,
+    aborted: bool,
+    signalled: bool,
+    status: i32,
+) -> i32 {
+    if let Some(panic) = panicked {
+        std::panic::resume_unwind(panic);
+    }
+    if signalled {
+        return 1;
+    }
+    if aborted {
+        // Outside cancellation only a worker panic raises `abort`, and the
+        // abort path always collects its payload.
+        panic!("doctor extension worker aborted without a panic payload");
     }
     status
+}
+
+/// Run one extension, converting a panic into an abort of the whole window
+/// before handing the payload back to the dispatcher.
+fn execute_guarded(
+    execute: &ExecuteExtension<'_>,
+    spec: &crate::doctor_coordinator::Spec,
+    abort: &AtomicBool,
+) -> std::thread::Result<crate::doctor_orchestrator::ExtensionOutcome> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(spec)));
+    if result.is_err() {
+        abort.store(true, Ordering::SeqCst);
+    }
+    result
+}
+
+/// One slot of the extension window: a running worker thread, or a result
+/// already produced inline because its thread could not be spawned.
+enum InFlight<'scope> {
+    Running(
+        std::thread::ScopedJoinHandle<
+            'scope,
+            std::thread::Result<crate::doctor_orchestrator::ExtensionOutcome>,
+        >,
+    ),
+    Done(std::thread::Result<crate::doctor_orchestrator::ExtensionOutcome>),
+}
+
+impl InFlight<'_> {
+    fn join(self) -> std::thread::Result<crate::doctor_orchestrator::ExtensionOutcome> {
+        match self {
+            InFlight::Running(handle) => handle.join().and_then(|result| result),
+            InFlight::Done(result) => result,
+        }
+    }
 }
 
 fn now_secs() -> i64 {
@@ -1009,6 +1196,156 @@ mod tests {
     use std::path::Path;
 
     use super::run_configured;
+
+    #[test]
+    fn job_counts_saturate_instead_of_collapsing_to_serial() {
+        assert_eq!(super::jobs_count("3"), 3);
+        assert_eq!(super::jobs_count("0"), 1);
+        assert_eq!(super::jobs_count("99999999999999999999"), usize::MAX);
+        assert_eq!(super::jobs_count(""), 1);
+        assert_eq!(super::jobs_count("x"), 1);
+    }
+
+    /// Dispatch one panicking and one hung extension through a two-worker
+    /// window, with the panicking one at `panicking` (0 = oldest). The hung
+    /// stand-in worker can only finish early through the abort flag, so a
+    /// prompt unwind proves the dispatcher stopped it rather than waited.
+    fn assert_panic_aborts_hung_sibling(panicking: usize) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = dot_test_support::TempDir::new("doctor-dispatch-panic").expect("root");
+        let keys = if panicking == 0 {
+            ["10-panics", "20-hangs"]
+        } else {
+            ["10-hangs", "20-panics"]
+        };
+        let specs: Vec<crate::doctor_coordinator::Spec> = keys
+            .iter()
+            .map(|key| crate::doctor_coordinator::Spec {
+                key: key.as_bytes().to_vec(),
+                script: root.path().join(format!("{key}.sh")),
+            })
+            .collect();
+        let abort = AtomicBool::new(false);
+        let sibling_aborted = AtomicBool::new(false);
+        let sibling_started = AtomicBool::new(false);
+        let execute = |spec: &crate::doctor_coordinator::Spec| {
+            if spec.key.ends_with(b"-panics") {
+                // Fail only once the sibling is provably running, so the
+                // coordinator must actively stop it rather than find it done.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while !sibling_started.load(Ordering::SeqCst) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "sibling never started"
+                    );
+                    std::thread::yield_now();
+                }
+                panic!("injected worker failure");
+            }
+            let mut worker = |_: &crate::doctor_orchestrator::WorkerInvocation<'_>| {
+                sibling_started.store(true, Ordering::SeqCst);
+                // Stands in for a hung extension session: only the abort
+                // flag can end it before the deadline.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while !abort.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                sibling_aborted.store(abort.load(Ordering::SeqCst), Ordering::SeqCst);
+                1
+            };
+            crate::doctor_orchestrator::execute_extension_for(
+                &spec.key,
+                &spec.script,
+                &[],
+                root.path().to_str().expect("home"),
+                crate::temp::current_uid().expect("uid"),
+                super::now_secs(),
+                root.path(),
+                &mut worker,
+            )
+        };
+        let palette = crate::doctor_runtime::Palette::empty();
+        let mut stdout = Vec::new();
+        let started = std::time::Instant::now();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut emit = super::Emitter::new(
+                crate::doctor_orchestrator::Recorder::new(),
+                &palette,
+                &mut stdout,
+            );
+            super::dispatch_extensions(&specs, 2, &execute, &abort, &mut emit)
+        }));
+        let payload = unwound.expect_err("worker panic must still unwind");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"injected worker failure"),
+            "the original panic must be re-raised"
+        );
+        assert!(
+            sibling_aborted.load(Ordering::SeqCst),
+            "sibling was not aborted"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "unwinding waited for the hung sibling"
+        );
+        assert!(stdout.is_empty(), "no records may render after a panic");
+        assert_eq!(
+            std::fs::read_dir(root.path())
+                .expect("root")
+                .filter(|entry| entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with("dot.")))
+                .count(),
+            0,
+            "aborted sibling left scratch state"
+        );
+    }
+
+    #[test]
+    fn oldest_worker_panic_aborts_hung_younger_sibling() {
+        assert_panic_aborts_hung_sibling(0);
+    }
+
+    #[test]
+    fn younger_worker_panic_aborts_hung_older_sibling() {
+        assert_panic_aborts_hung_sibling(1);
+    }
+
+    #[test]
+    fn cancellation_status_wins_over_a_drained_worker_panic() {
+        // A worker drained after a signal may panic and raise `abort`; its
+        // payload is discarded so the command still reports cancellation.
+        assert_eq!(super::settle(None, true, true, 0), 1);
+        assert_eq!(super::settle(None, false, true, 0), 1);
+        assert_eq!(super::settle(None, false, false, 7), 7);
+        let reraised =
+            std::panic::catch_unwind(|| super::settle(Some(Box::new("collected")), true, true, 0))
+                .expect_err("a collected panic re-raises");
+        assert_eq!(reraised.downcast_ref::<&str>(), Some(&"collected"));
+        std::panic::catch_unwind(|| super::settle(None, true, false, 0))
+            .expect_err("abort without a payload or signal is a broken invariant");
+    }
+
+    #[test]
+    fn guarded_execution_raises_abort_on_panic() {
+        // The inline spawn-failure fallback shares this guard with the
+        // worker threads.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let abort = AtomicBool::new(false);
+        let spec = crate::doctor_coordinator::Spec {
+            key: b"10-panics".to_vec(),
+            script: std::path::PathBuf::from("/fixture/10-panics.sh"),
+        };
+        let execute =
+            |_: &crate::doctor_coordinator::Spec| -> crate::doctor_orchestrator::ExtensionOutcome {
+                panic!("injected inline failure")
+            };
+        assert!(super::execute_guarded(&execute, &spec, &abort).is_err());
+        assert!(abort.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn disabled_extensions_do_not_inspect_configured_merge_root() {

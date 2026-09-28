@@ -5,6 +5,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::app::Runtime;
 use crate::profile_lifecycle::{WorkerOutcome, WorkerRun};
@@ -127,16 +128,32 @@ impl Worker {
     }
 
     /// Run one doctor extension through the same sanitized, authenticated
-    /// worker boundary used by lifecycle and merge hooks.
+    /// worker boundary used by lifecycle and merge hooks. Takes `&self` so
+    /// the doctor coordinator can share one worker across concurrent
+    /// extension threads; every launch owns its own session and scratch.
+    ///
+    /// Setting `abort` stops the extension's session with the same bounded
+    /// graceful teardown a signal gets. The coordinator uses it to cancel
+    /// sibling extensions when one worker thread fails, without depending
+    /// on a process-wide signal.
     pub(crate) fn doctor(
-        &mut self,
+        &self,
         script: &Path,
         temporary: &Path,
         result: &Path,
         context: &Path,
         token: &str,
+        abort: &AtomicBool,
     ) -> WorkerOutcome {
-        self.launch("doctor", script, temporary, result, context, token)
+        self.launch_abortable(
+            "doctor",
+            script,
+            temporary,
+            result,
+            context,
+            token,
+            Some(abort),
+        )
     }
 
     fn command(
@@ -298,6 +315,20 @@ impl Worker {
         context: &Path,
         token: &str,
     ) -> WorkerOutcome {
+        self.launch_abortable(mode, script, result_dir, result_file, context, token, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_abortable(
+        &self,
+        mode: &str,
+        script: &Path,
+        result_dir: &Path,
+        result_file: &Path,
+        context: &Path,
+        token: &str,
+        abort: Option<&AtomicBool>,
+    ) -> WorkerOutcome {
         let command = match self.command(mode, script, result_dir, result_file, context, token) {
             Ok(command) => command,
             Err(CommandFailure::Invalid) => {
@@ -313,7 +344,7 @@ impl Worker {
                 };
             }
         };
-        let outcome = combined(command, result_dir);
+        let outcome = combined(command, result_dir, abort);
         // The hook ran arbitrary user code: it may have replaced
         // repository directories, so memoized probe answers are
         // no longer trustworthy.
@@ -349,7 +380,7 @@ fn xdg_home(runtime: &Runtime, key: &str, fallback: &str) -> Option<PathBuf> {
 /// Bash's `2>&1` gives both streams one open file description, so writes keep
 /// their observable order. A private scratch file gives `Command` the same
 /// property without racing independent stdout/stderr readers.
-fn combined(mut command: Command, result_dir: &Path) -> WorkerOutcome {
+fn combined(mut command: Command, result_dir: &Path, abort: Option<&AtomicBool>) -> WorkerOutcome {
     let path = result_dir.join("worker-output");
     let file = match OpenOptions::new()
         .read(true)
@@ -377,7 +408,7 @@ fn combined(mut command: Command, result_dir: &Path) -> WorkerOutcome {
     command
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(file));
-    let status = wait(command);
+    let status = wait_abortable(command, abort);
     let output = std::fs::read(&path).unwrap_or_default();
     let _ = std::fs::remove_file(path);
     WorkerOutcome {
@@ -434,9 +465,23 @@ fn separate(mut command: Command, result_dir: &Path) -> PreSyncOutcome {
 /// descendant is gone. The CLI owns the signal handler; parallel hook threads
 /// only observe its atomic result and perform teardown for their own session.
 fn wait(command: Command) -> Option<i32> {
+    wait_abortable(command, None)
+}
+
+/// [`wait`], additionally stopping the session once `abort` is set. The
+/// supervisor treats a failing tick as a delivery failure: it runs the same
+/// graceful TERM-then-KILL teardown and reports incomplete cleanup, which
+/// reads as a failed launch.
+fn wait_abortable(command: Command, abort: Option<&AtomicBool>) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt as _;
 
-    match crate::cleanup::supervise_session(command, None, |_| Ok(())).ok()? {
+    let tick = |_| match abort {
+        Some(abort) if abort.load(Ordering::SeqCst) => {
+            Err(std::io::Error::other("doctor extension aborted"))
+        }
+        _ => Ok(()),
+    };
+    match crate::cleanup::supervise_session(command, None, tick).ok()? {
         crate::cleanup::SessionEnd::Exited(status) => Some(
             status
                 .code()
@@ -485,11 +530,59 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    use super::{UpdateEnvironment, Worker, wait};
+    use super::{UpdateEnvironment, Worker, wait, wait_abortable};
     use crate::app::Runtime;
     use crate::log::Log;
     use crate::profile_lifecycle;
     use dot_test_support::TempDir;
+
+    #[test]
+    fn abort_flag_stops_a_running_worker_session() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let scope = TempDir::new("hook-worker-abort").expect("scope");
+        let marker = scope.path().join("pid");
+        let mut command = Command::new(dot_test_support::bash());
+        command
+            .args([
+                "-c",
+                "echo $$ >\"$1\"; while :; do sleep 1; done",
+                "hook-abort",
+            ])
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let abort = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        std::thread::scope(|threads| {
+            let session = threads.spawn(|| wait_abortable(command, Some(&abort)));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while std::fs::read_to_string(&marker).map_or(true, |pid| pid.trim().is_empty()) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "session never started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            abort.store(true, Ordering::SeqCst);
+            // An aborted session is not a normal exit, so it reads as a
+            // failed launch rather than any worker status.
+            assert_eq!(session.join().expect("session thread"), None);
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "abort did not stop the session promptly"
+        );
+        let pid: i32 = std::fs::read_to_string(&marker)
+            .expect("pid")
+            .trim()
+            .parse()
+            .expect("pid number");
+        // SAFETY: signal 0 only probes the fixture PID; a reaped session
+        // leader reports ESRCH.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "aborted session survived");
+    }
 
     fn git_repo(path: &Path, origin: &str) {
         std::fs::create_dir_all(path).expect("repo directory");
