@@ -478,9 +478,23 @@ fn provider_records(
         .map(|configured| configured.git_dev_dir.as_str())
         .unwrap_or("");
     let development = Path::new(dev_dir).join("shdeps");
-    let selected = configured
-        .as_ref()
-        .and_then(|configured| installer(runtime, Path::new(source), home, policy, configured));
+    // The installer choice and the provider check both read these; each is
+    // a batch of Git children against the same checkout, so probe once.
+    let development_valid = crate::shdeps_provider::development_checkout_valid(&development);
+    let development_revision = crate::shdeps::active_revision(&development);
+    let selected = configured.as_ref().and_then(|configured| {
+        installer(
+            runtime,
+            Path::new(source),
+            home,
+            policy,
+            configured,
+            &Development {
+                valid: development_valid,
+                revision: &development_revision,
+            },
+        )
+    });
     let installer_path = selected
         .as_ref()
         .map(|(path, _)| path.to_string_lossy().into_owned());
@@ -519,10 +533,10 @@ fn provider_records(
         configure_ok: configured.is_some(),
         dev_dir,
         development_exists: std::fs::symlink_metadata(&development).is_ok(),
-        development_valid: crate::shdeps_provider::development_checkout_valid(&development),
+        development_valid,
         installer,
         locked_revision: crate::shdeps::lock_value(Path::new(source), "revision").as_deref(),
-        development_revision: Some(&crate::shdeps::active_revision(&development)),
+        development_revision: Some(&development_revision),
         binary: binary.as_ref().and_then(|path| path.to_str()),
         expected_abi: expected_abi.as_deref(),
         actual_abi: actual.as_deref(),
@@ -531,12 +545,20 @@ fn provider_records(
     })
 }
 
+/// Probed facts about the Shdeps development checkout
+/// (`<git_dev_dir>/shdeps`) shared by [`installer`] and the provider check.
+struct Development<'a> {
+    valid: bool,
+    revision: &'a str,
+}
+
 fn installer(
     runtime: &crate::app::Runtime,
     source_root: &Path,
     home: &str,
     policy: &str,
     configured: &crate::shdeps_env_abi::ConfiguredEnv,
+    probed: &Development<'_>,
 ) -> Option<(PathBuf, &'static str)> {
     if let Some(lib) = runtime.value("SHDEPS_LIB") {
         let path = Path::new(lib).parent()?.join("install.sh");
@@ -548,13 +570,12 @@ fn installer(
     let path = development.join("install.sh");
     if path.is_file()
         && development.join("shdeps.sh").is_file()
-        && crate::shdeps::active_revision(&development)
-            == crate::shdeps::lock_value(source_root, "revision")?
+        && probed.revision == crate::shdeps::lock_value(source_root, "revision")?
         && crate::shdeps::installer_hash_matches(source_root, &path)
     {
         return Some((path, "pinned-dev"));
     }
-    if policy == "latest" && crate::shdeps_provider::development_checkout_valid(&development) {
+    if policy == "latest" && probed.valid {
         return Some((path, "latest-dev"));
     }
     let installed = runtime

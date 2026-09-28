@@ -731,3 +731,82 @@ fn repo_git_fetch_rejects_missing_base_and_unsafe_fetch_head() {
         1
     );
 }
+#[test]
+fn each_existing_probes_every_overlay_before_any_callback() {
+    // Every status/diff/fetch/push callback invalidates the worktree probe
+    // cache, so probing between callbacks re-ran `rev-parse` per overlay.
+    // All eligibility probes must now precede the first callback.
+    let b = repo("git-probe-order-base");
+    let first = repo("git-probe-order-first");
+    let second = repo("git-probe-order-second");
+    let scope = TempDir::new_exec("git-probe-order-shim").unwrap();
+    let log = scope.path().join("calls.log");
+    let real = [
+        "/usr/bin/git",
+        "/bin/git",
+        "/usr/local/bin/git",
+        "/opt/homebrew/bin/git",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|path| path.is_file())
+    .expect("system git");
+    let shim = scope.path().join("git");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf 'git %s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let overlays = vec![
+        format!("first|{}|url|||git", first.path().display()),
+        format!("second|{}|url|||git", second.path().display()),
+    ];
+    let mut names = vec![];
+    let rc = dot::init_client_identity::with_host_git(&shim, || {
+        repos_git::each_existing(
+            &base(Topology::Ordinary, b.path()),
+            &overlays,
+            &b.path().to_string_lossy(),
+            &[],
+            &mut |kind, name, path, _, _| {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&log)
+                    .and_then(|mut file| {
+                        use std::io::Write as _;
+                        writeln!(file, "callback {name}")
+                    })
+                    .unwrap();
+                names.push(name.to_string());
+                // The caller-visible Git every real callback runs, which
+                // invalidates the worktree probe cache.
+                dot::repos_git::repo_git_forwarded(
+                    &base(Topology::Ordinary, b.path()),
+                    kind,
+                    path,
+                    &["status", "--short"],
+                    &mut Vec::new(),
+                )
+            },
+        )
+    });
+    assert_eq!(rc, 0);
+    assert_eq!(names, ["dotfiles", "first", "second"]);
+    let calls = std::fs::read_to_string(&log).unwrap();
+    let first_callback = calls.find("callback ").expect("callback marker");
+    for overlay in [first.path(), second.path()] {
+        let probe = format!("git -C {} rev-parse --show-toplevel", overlay.display());
+        let at = calls.find(&probe);
+        assert!(
+            at.is_some_and(|at| at < first_callback) && calls.matches(&probe).count() == 1,
+            "probe for {} not exactly once before callbacks:\n{calls}",
+            overlay.display()
+        );
+    }
+}
