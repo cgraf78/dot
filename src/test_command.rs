@@ -489,7 +489,7 @@ fn matches_base(runtime: &Runtime, path: &Path, base: &crate::repos_base::Base) 
 }
 
 fn git(runtime: &Runtime, prefix: &[OsString], args: &[&str]) -> Option<Vec<u8>> {
-    let program = runtime.find_on_path("git")?;
+    let program = runtime.git_program()?;
     let mut command = Command::new(program);
     command
         .args(prefix)

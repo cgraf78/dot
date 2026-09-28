@@ -410,7 +410,7 @@ fn client_matches_uncached(
 }
 
 fn git_dir_output(runtime: &crate::app::Runtime, git_dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let program = runtime.find_on_path("git")?;
+    let program = runtime.git_program()?;
     let mut command = Command::new(program);
     command
         .env_clear()

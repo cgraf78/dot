@@ -46,6 +46,7 @@ pub struct Runtime {
     process_entry: bool,
     bash: Arc<OnceLock<Result<crate::bash::Resolved, crate::bash::Error>>>,
     bash_error_reported: Arc<AtomicBool>,
+    host_git: Arc<OnceLock<Option<PathBuf>>>,
 }
 
 impl Runtime {
@@ -146,6 +147,7 @@ impl Runtime {
             process_entry: false,
             bash: Arc::new(OnceLock::new()),
             bash_error_reported: Arc::new(AtomicBool::new(false)),
+            host_git: Arc::new(OnceLock::new()),
         }
     }
 
@@ -189,6 +191,56 @@ impl Runtime {
                 std::fs::metadata(path)
                     .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
             })
+    }
+
+    /// Resolve and cache the host Git executable outside HOME and the Dot
+    /// checkout ([`crate::init_client_identity::select_command_git`]; `init`
+    /// pins the stricter [`crate::init_client_identity::select_host_git`]).
+    ///
+    /// Both roots are client-controlled: a `git` found there can be a
+    /// dotfiles-provided launcher that re-derives repository context (for
+    /// example by exporting `GIT_DIR` when the target is not a repository),
+    /// which silently answers Dot's inspection probes from the wrong
+    /// repository and costs a shell startup per call. `None` means no
+    /// executable survives the exclusions; callers other than `init` then
+    /// keep ordinary `PATH` lookup so hosts whose only Git lives under HOME
+    /// still work.
+    pub(crate) fn host_git(&self) -> Option<&Path> {
+        self.host_git
+            .get_or_init(|| {
+                let path = self.value("PATH")?.to_str()?;
+                crate::init_client_identity::select_command_git(
+                    &self.home.to_string_lossy(),
+                    &self.source_root.to_string_lossy(),
+                    path,
+                )
+                .map(PathBuf::from)
+            })
+            .as_deref()
+    }
+
+    /// Init's stricter host Git: symlinked executables are refused along
+    /// with everything under HOME or the Dot checkout, and callers get no
+    /// `PATH` fallback ([`crate::init_client_identity::select_host_git`]).
+    pub(crate) fn init_host_git(&self) -> Option<PathBuf> {
+        let path = self.value("PATH")?.to_str()?;
+        crate::init_client_identity::select_host_git(
+            &self.home.to_string_lossy(),
+            &self.source_root.to_string_lossy(),
+            path,
+        )
+        .map(PathBuf::from)
+    }
+
+    /// The Git program for a child built from this runtime's environment:
+    /// the Git bound on this thread (init's strict pin or the dispatcher's
+    /// selection), else the [`Self::host_git`] selection, else the first
+    /// `git` on `PATH`. Preferring the binding keeps runtime-built children
+    /// on the same executable as [`crate::init_client_identity::host_git_command`].
+    pub(crate) fn git_program(&self) -> Option<PathBuf> {
+        crate::init_client_identity::current_host_git()
+            .or_else(|| self.host_git().map(Path::to_path_buf))
+            .or_else(|| self.find_on_path("git"))
     }
 
     /// Resolve and cache the Bash 4+ capability for retained shell boundaries.

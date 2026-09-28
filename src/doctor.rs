@@ -362,7 +362,10 @@ fn runtime_snapshot(
     let source_root = std::fs::canonicalize(source)
         .map(|path| path.as_os_str().as_bytes().to_vec())
         .unwrap_or_default();
-    let git_version = command_output(runtime, "git", &["--version"]);
+    // Report the Git that Dot's own inspection children run.
+    let git_version = runtime
+        .git_program()
+        .and_then(|git| program_output(runtime, &git, &["--version"]));
     RuntimeSnapshot {
         bash_version,
         bash_major,
@@ -893,8 +896,11 @@ fn command(runtime: &crate::app::Runtime, program: &Path) -> Command {
 }
 
 fn command_output(runtime: &crate::app::Runtime, program: &str, args: &[&str]) -> Option<Vec<u8>> {
-    let program = runtime.find_on_path(program)?;
-    let mut command = command(runtime, &program);
+    program_output(runtime, &runtime.find_on_path(program)?, args)
+}
+
+fn program_output(runtime: &crate::app::Runtime, program: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let mut command = command(runtime, program);
     command.args(args);
     let output = crate::cleanup::run_session_output(
         command,
@@ -951,7 +957,7 @@ fn current_platform(runtime: &crate::app::Runtime) -> Option<String> {
 }
 
 fn git_output(runtime: &crate::app::Runtime, cwd: &Path, args: &[&str]) -> Option<PathBuf> {
-    let program = runtime.find_on_path("git")?;
+    let program = runtime.git_program()?;
     let mut command = command(runtime, &program);
     crate::temp::sanitize_git_env(&mut command);
     crate::temp::bind_source_git(&mut command, cwd);

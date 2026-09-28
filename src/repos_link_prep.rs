@@ -223,10 +223,15 @@ pub fn prepare_inventories(inputs: &Inputs<'_>, root: &Path) -> Option<Prepared>
     }
     let bound = jobs_bound(inputs.update_jobs);
     let mut outcomes: Vec<Option<TaskOutcome>> = (0..tasks.len()).map(|_| None).collect();
+    // Workers probe overlay checkouts with Git; the host-Git binding is
+    // thread-local, so carry the dispatcher's selection into each one.
+    let host_git = crate::init_client_identity::carry_host_git();
     for (task_chunk, out_chunk) in tasks.chunks(bound).zip(outcomes.chunks_mut(bound)) {
         std::thread::scope(|scope| {
             for (task, slot) in task_chunk.iter().zip(out_chunk.iter_mut()) {
+                let host_git = host_git.clone();
                 scope.spawn(move || {
+                    let _host_git = host_git.bind();
                     *slot = run_task(task, inputs.home, root);
                 });
             }
