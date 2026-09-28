@@ -1397,7 +1397,7 @@ fn linux_process_identity(pid: u32) -> Result<Option<LinuxProcessIdentity>, Stri
         Err(error) if process_vanished(&error) => return Ok(None),
         Err(error) => return Err(format!("read /proc/{pid}/stat: {error}")),
     };
-    parse_linux_process_identity(pid, &stat).map(Some)
+    parse_linux_process_identity(pid, &stat)
 }
 
 #[cfg(target_os = "linux")]
@@ -1406,7 +1406,10 @@ fn process_vanished(error: &std::io::Error) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn parse_linux_process_identity(pid: u32, stat: &[u8]) -> Result<LinuxProcessIdentity, String> {
+fn parse_linux_process_identity(
+    pid: u32,
+    stat: &[u8],
+) -> Result<Option<LinuxProcessIdentity>, String> {
     let delimiter = stat
         .windows(2)
         .rposition(|window| window == b") ")
@@ -1417,6 +1420,15 @@ fn parse_linux_process_identity(pid: u32, stat: &[u8]) -> Result<LinuxProcessIde
         .collect::<Vec<_>>();
     if fields.len() <= 19 {
         return Err(format!("short /proc/{pid}/stat"));
+    }
+    // A fully-dead row exited between listing and re-read. The kernel only
+    // fills in pgrp and session while the task still has signal state, so
+    // this row reports them as -1, which would fail numeric parsing and doom
+    // a host-wide scan. It is exited churn, like a vanished entry, and never
+    // a live survivor (the supervisor and `src/cleanup.rs` skip it the same
+    // way).
+    if matches!(fields[0], b"X" | b"x") {
+        return Ok(None);
     }
     let parent = std::str::from_utf8(fields[1])
         .ok()
@@ -1430,12 +1442,12 @@ fn parse_linux_process_identity(pid: u32, stat: &[u8]) -> Result<LinuxProcessIde
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| format!("invalid start time in /proc/{pid}/stat"))?;
-    Ok(LinuxProcessIdentity {
+    Ok(Some(LinuxProcessIdentity {
         parent,
         session,
         start,
-        live: !matches!(fields[0], b"Z" | b"X" | b"x"),
-    })
+        live: fields[0] != b"Z",
+    }))
 }
 
 #[cfg(target_os = "linux")]
@@ -5316,25 +5328,49 @@ fn bounded_capture_discards_excess_bytes_without_growing_storage() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn dead_process_rows_are_exited_churn() {
+    // Fully-dead rows exited between listing and re-read; the kernel reports
+    // their pgrp and session as -1. They must read as vanished rather than
+    // failing the whole host-wide scan ("invalid session in /proc/<pid>/stat"
+    // on a loaded CI leg). Row bytes captured from a flaked scan.
+    for state in ["X", "x"] {
+        let stat = format!(
+            "2238178 (sleep) {state} 0 -1 -1 0 -1 4227084 108 0 0 0 0 0 0 0 30 10 0 0 229662513 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 17 38 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+        );
+        assert!(
+            parse_linux_process_identity(2238178, stat.as_bytes())
+                .expect("dead row must not be fatal")
+                .is_none(),
+            "state {state} must be skipped as churn"
+        );
+    }
+    // A live row with a corrupt generation is not churn and stays fatal.
+    let stat = b"77 (sleep) S 1 -1 -1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5 0\n";
+    assert!(parse_linux_process_identity(77, stat).is_err());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn linux_process_identity_parser_is_strict_and_records_start_time() {
     let fields = [
         "S", "1", "2", "44", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "1",
         "0", "777",
     ];
     let stat = format!("42 (fixture name) {}\n", fields.join(" "));
-    let identity = parse_linux_process_identity(42, stat.as_bytes()).expect("valid process record");
+    let identity = parse_linux_process_identity(42, stat.as_bytes())
+        .expect("valid process record")
+        .expect("live row is reported");
     assert_eq!(identity.parent, 1);
     assert_eq!(identity.session, 44);
     assert_eq!(identity.start, 777);
     assert!(identity.live);
-    for state in ["Z", "X", "x"] {
-        let mut terminal = fields;
-        terminal[0] = state;
-        let stat = format!("42 (fixture name) {}\n", terminal.join(" "));
-        let identity =
-            parse_linux_process_identity(42, stat.as_bytes()).expect("terminal process record");
-        assert!(!identity.live, "state {state} must be terminal");
-    }
+    let mut zombie = fields;
+    zombie[0] = "Z";
+    let stat = format!("42 (fixture name) {}\n", zombie.join(" "));
+    let identity = parse_linux_process_identity(42, stat.as_bytes())
+        .expect("zombie process record")
+        .expect("zombie row is reported");
+    assert!(!identity.live, "zombie state must be terminal");
     assert!(parse_linux_process_identity(42, b"partial").is_err());
     assert!(process_vanished(&std::io::Error::from_raw_os_error(
         libc::ENOENT
