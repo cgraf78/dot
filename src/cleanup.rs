@@ -9986,62 +9986,176 @@ os._exit(0)
         );
     }
 
+    /// Set when this test binary re-executes itself as the late-TERM
+    /// fixture leader ([`late_term_leader`]).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const LATE_TERM_LEADER: &str = "DOT_LATE_TERM_LEADER";
+    /// Marker directory shared by the late-TERM fixture processes.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const LATE_TERM_DIR: &str = "DOT_LATE_TERM_DIR";
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const LATE_TERM_TEST: &str =
+        "cleanup::tests::graceful_cleanup_signals_the_leader_once_and_a_late_same_group_child";
+
+    /// TERMs received by a late-TERM fixture process. The handler only
+    /// counts, which is async-signal-safe.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    static LATE_TERM_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    extern "C" fn count_late_term(_: libc::c_int) {
+        LATE_TERM_SEEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn signal_set(signals: &[libc::c_int]) -> libc::sigset_t {
+        // SAFETY: both calls initialize and edit a local, owned sigset.
+        unsafe {
+            let mut set = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut set);
+            for signal in signals {
+                libc::sigaddset(&mut set, *signal);
+            }
+            set
+        }
+    }
+
+    /// Group leader of the late-TERM fixture. On its TERM it forks the
+    /// late same-group child with TERM *blocked*, then exits 143 like a
+    /// shell whose TERM trap ran.
+    ///
+    /// A shell fixture cannot do this. A forked subshell starts with TERM
+    /// at its default action until its own `trap` runs, so a supervisor
+    /// that delivers the late member's one TERM before a starved newborn is
+    /// first scheduled kills it silently (the CI flake). A blocked TERM
+    /// instead stays pending until the child is ready, and the child never
+    /// execs: it inherits the counting handler and waits in `sigsuspend`
+    /// immediately, so it needs no startup time inside the grace window.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn late_term_leader(dir: &Path) -> ! {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        // SAFETY: installs an async-signal-safe handler that only touches
+        // an atomic counter.
+        unsafe {
+            let mut action = std::mem::zeroed::<libc::sigaction>();
+            action.sa_sigaction = count_late_term as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+        std::fs::write(dir.join("ready"), b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while LATE_TERM_SEEN.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            if Instant::now() >= deadline {
+                std::process::exit(1);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // Everything the child touches is prepared before the fork: the
+        // leader is multithreaded (libtest), so the child may only make
+        // async-signal-safe calls.
+        let child_ready =
+            std::ffi::CString::new(dir.join("child-ready").as_os_str().as_bytes()).unwrap();
+        let child_term =
+            std::ffi::CString::new(dir.join("child-term").as_os_str().as_bytes()).unwrap();
+        let term = signal_set(&[libc::SIGTERM]);
+        // SAFETY: masks TERM on this thread; the fork below copies it. The
+        // leader exits right after, so the mask is never restored.
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &term, std::ptr::null_mut()) },
+            0
+        );
+        // SAFETY: the child runs only `late_term_child`, which is
+        // async-signal-safe and ends in `_exit`.
+        match unsafe { libc::fork() } {
+            0 => late_term_child(&child_ready, &child_term),
+            pid if pid > 0 => {
+                std::fs::write(dir.join("spawned"), pid.to_string()).unwrap();
+                let seen = LATE_TERM_SEEN.load(std::sync::atomic::Ordering::SeqCst);
+                std::fs::write(dir.join("leader-term"), "TERM\n".repeat(seen)).unwrap();
+                std::process::exit(143);
+            }
+            _ => std::process::exit(1),
+        }
+    }
+
+    /// Late same-group child, running in the forked copy of the leader:
+    /// async-signal-safe calls only. It is born with TERM blocked and the
+    /// leader's counting handler installed; `sigsuspend` unblocks and
+    /// waits atomically, so a TERM delivered at any point since the fork
+    /// reaches the handler.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn late_term_child(ready: &std::ffi::CStr, term: &std::ffi::CStr) -> ! {
+        let touch = |path: &std::ffi::CStr| {
+            // SAFETY: open/close are async-signal-safe; the path outlives
+            // the call.
+            unsafe {
+                let fd = libc::open(
+                    path.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC,
+                    0o600,
+                );
+                if fd >= 0 {
+                    libc::close(fd);
+                }
+            }
+        };
+        // The counter was copied from the leader, which already saw its
+        // own TERM. No TERM can run the handler before `sigsuspend`
+        // unblocks it, so this reset cannot lose a delivery.
+        LATE_TERM_SEEN.store(0, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: `alarm` bounds an orphaned child (SIGALRM's default
+        // action terminates it), and `sigsuspend` with an empty mask
+        // atomically unblocks TERM and waits for a handled signal.
+        unsafe {
+            libc::alarm(30);
+            touch(ready);
+            let empty = signal_set(&[]);
+            while LATE_TERM_SEEN.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                libc::sigsuspend(&empty);
+            }
+            touch(term);
+            libc::_exit(0)
+        }
+    }
+
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn graceful_cleanup_signals_the_leader_once_and_a_late_same_group_child() {
+        if std::env::var_os(LATE_TERM_LEADER).is_some() {
+            late_term_leader(&PathBuf::from(std::env::var_os(LATE_TERM_DIR).unwrap()));
+        }
         let scope = dot_test_support::TempDir::new("late-term-child").unwrap();
         let ready = scope.path().join("ready");
         let spawned = scope.path().join("spawned");
         let child_ready = scope.path().join("child-ready");
         let child_term = scope.path().join("child-term");
         let leader_term = scope.path().join("leader-term");
-        // A single background sleep plus `wait` bounds trap latency to
-        // scheduling: Bash runs a TERM trap only after its foreground
-        // command finishes, and a `sleep 0.1` fork-exec loop defers the
-        // trap by a whole loaded fork-exec chain, which can push the
-        // spawn-observe-signal-trap chain past the grace window into KILL
-        // (loaded hosts flake). `wait` returns immediately on a trapped
-        // signal, and the sleeps self-bound the fixture if teardown ever
-        // misses them. The late child instead loops over a long sleep:
-        // a `wait`-chained child would exit on its own when the stop
-        // TERM kills its sleep job, winning the race against the
-        // child's own TERM delivery and skipping its trap whenever
-        // the child is first observed late. The loop can only exit
-        // via its TERM trap (or KILL), so the pin is deterministic.
-        // The sleep PID is captured into a named variable instead of
-        // `wait $!`: if the stop lands before `wait` starts, the trap
-        // runs first and its background subshell rebinds `$!` to the
-        // late child, so `wait $!` would wait for the late child (which
-        // exits 0) instead of the sleep and the leader would exit 0
-        // instead of 143. The ready marker is written only after that
-        // capture: Bash runs pending traps between simple commands, so a
-        // stop landing between `sleep 30 &` and `sleep_pid=$!` would
-        // otherwise rebind `$!` before the capture and reintroduce the
-        // same exit-0 race.
-        let mut command = Command::new(dot_test_support::bash());
+        // The leader is this test binary in its fixture role (see
+        // `late_term_leader`): unlike a shell, it can hold the late child's
+        // TERM blocked until the child can take it, so the test pins
+        // delivery rather than how quickly a newborn is first scheduled.
+        let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args([
-                "-c",
-                "trap 'printf \"TERM\\n\" >>\"$5\"; if [[ ! -e $2 ]]; then : >\"$2\"; (trap '\"'\"': >\"$4\"; exit 0'\"'\"' TERM; : >\"$3\"; while :; do sleep 86400; done) & fi' TERM; sleep 30 & sleep_pid=$!; : >\"$1\"; wait $sleep_pid",
-                "late-term-child",
-            ])
-            .arg(&ready)
-            .arg(&spawned)
-            .arg(&child_ready)
-            .arg(&child_term)
-            .arg(&leader_term)
+            .args(["--exact", LATE_TERM_TEST, "--nocapture"])
+            .env(LATE_TERM_LEADER, "1")
+            .env(LATE_TERM_DIR, scope.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         isolate(&mut command);
         let mut child = command.spawn().unwrap();
-        poll_until(Instant::now() + Duration::from_secs(2), || {
+        poll_until(Instant::now() + Duration::from_secs(10), || {
             Ok(ready.exists().then_some(()))
         })
         .unwrap();
 
-        // Graceful path pins the leader at exit 143: its trap runs,
-        // `wait` returns 143, and the script ends with that status. A
+        // Graceful path pins the leader at exit 143 once its handler ran. A
         // KILLed leader (grace lost) dies signaled instead, failing fast
         // here rather than timing out the marker polls below.
         let status = stop_session(&mut child, libc::SIGTERM).expect("graceful stop failed");
@@ -10051,16 +10165,15 @@ os._exit(0)
             "leader was not gracefully TERMed (KILL won the grace?)"
         );
 
-        // The late child is spawned by the leader's TERM trap and is
-        // signaled by the same stop; trap execution (the marker writes)
-        // completes asynchronously, so poll for the markers instead of
-        // asserting them on arrival. On timeout, dump every marker to
-        // show how far the trap chain progressed.
+        // The late child is spawned by the leader's handler and signaled by
+        // the same stop; poll for the markers instead of asserting them on
+        // arrival. On timeout, dump every marker to show how far the chain
+        // progressed.
         let marker_states = || {
             format!(
-                "leader_term={:?} spawned={} child_ready={} child_term={}",
+                "leader_term={:?} spawned={:?} child_ready={} child_term={}",
                 std::fs::read_to_string(&leader_term).unwrap_or_default(),
-                spawned.exists(),
+                std::fs::read_to_string(&spawned).ok(),
                 child_ready.exists(),
                 child_term.exists(),
             )
