@@ -47,21 +47,35 @@ pub fn each_existing(
     args: &[OsString],
     callback: &mut dyn FnMut(RepoKind, &str, &str, &str, &[OsString]) -> i32,
 ) -> i32 {
+    // Decide overlay eligibility before any callback runs. Every callback,
+    // the base record's included, runs caller-visible Git that invalidates
+    // the worktree probe cache, so probing between callbacks re-spawned
+    // `rev-parse` for each overlay even though overlay resolution had just
+    // answered it. Status/diff/fetch/push never create or remove an overlay
+    // worktree themselves; a `push` hook that relocates a sibling overlay
+    // mid-iteration now surfaces as that overlay's Git failure instead of a
+    // silent skip, an accepted trade for a contrived case.
+    let eligible: Vec<(&str, String, &str)> = overlays
+        .iter()
+        .filter_map(|entry| {
+            let fields: Vec<&str> = entry.split('|').collect();
+            let name = fields.first().copied().unwrap_or("");
+            let url = fields.get(2).copied().unwrap_or("");
+            let (path, sync) = overlay_path_sync(entry);
+            (sync == "git" && crate::overlays::is_worktree(Path::new(&path)))
+                .then_some((name, path, url))
+        })
+        .collect();
     if base.exists() {
         let rc = callback(RepoKind::Base, "dotfiles", home, "", args);
         if rc != 0 {
             return rc;
         }
     }
-    for entry in overlays {
-        let fields: Vec<&str> = entry.split('|').collect();
-        let name = fields.first().copied().unwrap_or("");
-        let url = fields.get(2).copied().unwrap_or("");
-        let (path, sync) = overlay_path_sync(entry);
-        if sync != "git" {
-            continue;
-        }
-        if !crate::overlays::is_worktree(Path::new(&path)) {
+    for (name, path, url) in eligible {
+        // A cancelled probe used to read "not a worktree" here, skipping
+        // every overlay after a latched signal; keep that.
+        if crate::cancellation::check().is_err() {
             continue;
         }
         let rc = callback(RepoKind::Overlay, name, &path, url, args);

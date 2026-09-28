@@ -4627,6 +4627,12 @@ exec "$DOT_TEST_REAL_GIT" "$@"
     );
 }
 
+/// A re-exec expectation that makes the startup guard run its revision
+/// probe; the guard skips the probe without one. The blocking shim never
+/// lets the probe answer, so the value is never compared.
+#[cfg(unix)]
+const BLOCKED_STARTUP_PROBE_EXPECTATION: &str = "0000000000000000000000000000000000000000";
+
 #[cfg(unix)]
 #[test]
 fn direct_signals_during_startup_git_stop_the_owned_query() {
@@ -4669,7 +4675,11 @@ exec "$DOT_TEST_REAL_GIT" "$@"
             command
                 .env("PATH", &path)
                 .env("DOT_TEST_REAL_GIT", &real_git)
-                .env("DOT_TEST_GIT_QUERY_READY", &marker);
+                .env("DOT_TEST_GIT_QUERY_READY", &marker)
+                .env(
+                    "DOT_REEXEC_EXPECTED_REVISION",
+                    BLOCKED_STARTUP_PROBE_EXPECTATION,
+                );
         });
 
         let cancelled = cancel_after_marker_with_signal(child, &marker, signal, || ());
@@ -4740,7 +4750,11 @@ exec "$DOT_TEST_REAL_GIT" "$@"
             command
                 .env("PATH", &path)
                 .env("DOT_TEST_REAL_GIT", &real_git)
-                .env("DOT_TEST_GIT_QUERY_READY", &marker);
+                .env("DOT_TEST_GIT_QUERY_READY", &marker)
+                .env(
+                    "DOT_REEXEC_EXPECTED_REVISION",
+                    BLOCKED_STARTUP_PROBE_EXPECTATION,
+                );
         });
 
         let cancelled = cancel_after_marker(child, &marker, || ());

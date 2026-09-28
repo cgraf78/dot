@@ -590,3 +590,66 @@ fn startup_registers_no_new_provenance_path_beyond_this_suite() {
         .collect::<Vec<_>>();
     assert_eq!(rows, ["tests/startup.rs\tstandalone:new"]);
 }
+
+#[test]
+fn reexec_guard_probes_git_only_when_a_revision_is_expected() {
+    // Without an expected generation the guard accepts any observation,
+    // so the revision probe's Git child must not run at all.
+    let home = clean_home("reexec-probe-lazy");
+    let scope = TempDir::new_exec("reexec-probe-shim").expect("shim scope");
+    let log = scope.path().join("calls.log");
+    let real = [
+        "/usr/bin/git",
+        "/bin/git",
+        "/usr/local/bin/git",
+        "/opt/homebrew/bin/git",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|path| path.is_file())
+    .expect("system git");
+    let shim = scope.path().join("git");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real.display()
+        ),
+    )
+    .expect("git shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("shim mode");
+    let mut path = scope.path().as_os_str().to_owned();
+    path.push(":");
+    path.push(parent_path());
+    let path = path.to_str().expect("utf-8 PATH").to_string();
+    for expected in [None, Some("")] {
+        assert_eq!(
+            run(
+                home.path(),
+                &[OsStr::new("version")],
+                &[
+                    ("PATH", Some(&path)),
+                    ("DOT_REEXEC_EXPECTED_REVISION", expected)
+                ],
+            ),
+            (0, version_bytes(), Vec::new())
+        );
+        assert!(!log.exists(), "probe ran for {expected:?}");
+    }
+    // Control: an expected generation still probes through the same Git.
+    let observed = dot::startup::observed_revision(Path::new(repo())).expect("checkout revision");
+    assert_eq!(
+        run(
+            home.path(),
+            &[OsStr::new("version")],
+            &[
+                ("PATH", Some(&path)),
+                ("DOT_REEXEC_EXPECTED_REVISION", Some(&observed))
+            ],
+        ),
+        (0, version_bytes(), Vec::new())
+    );
+    let calls = std::fs::read_to_string(&log).expect("probe log");
+    assert!(calls.contains("rev-parse HEAD"), "calls: {calls}");
+}

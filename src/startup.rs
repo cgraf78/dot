@@ -505,8 +505,7 @@ impl Failure {
 /// Run the startup prelude in shell order: re-exec guard first (exit 1), then
 /// default config load (exit 2). Native dispatch consumes the returned config.
 pub fn preflight(inputs: &Inputs<'_>) -> Result<Config, Failure> {
-    let observed = observed_revision(inputs.source_root);
-    if let Err(line) = check_reexec_revision(inputs.reexec_expected, observed.as_deref()) {
+    if let Err(line) = guard_reexec(inputs.reexec_expected, inputs.source_root) {
         return Err(Failure::Reexec { line });
     }
     match load_default_config(inputs.home, inputs.xdg_config_home, inputs.env_policy) {
@@ -539,8 +538,20 @@ pub(crate) fn check_reexec(runtime: &crate::app::Runtime) -> Result<(), Failure>
     let expected = runtime
         .value("DOT_REEXEC_EXPECTED_REVISION")
         .and_then(OsStr::to_str);
-    let observed = observed_revision(runtime.source_root());
-    check_reexec_revision(expected, observed.as_deref()).map_err(|line| Failure::Reexec { line })
+    guard_reexec(expected, runtime.source_root()).map_err(|line| Failure::Reexec { line })
+}
+
+/// [`check_reexec_revision`] against the checkout's observed revision,
+/// probed only when a re-exec generation is actually expected: the guard
+/// accepts any observation without one, so every ordinary command (and
+/// `help`/`version`) would otherwise pay a Git child whose answer is
+/// discarded.
+fn guard_reexec(expected: Option<&str>, source_root: &Path) -> Result<(), String> {
+    if expected.is_none_or(str::is_empty) {
+        return check_reexec_revision(expected, None);
+    }
+    let observed = observed_revision(source_root);
+    check_reexec_revision(expected, observed.as_deref())
 }
 
 /// Run [`check`] against a one-time snapshot of the ambient process state.

@@ -238,7 +238,15 @@ fn select_with(
     Ok(crate::cli::base_from_values(home, Some("missing"), None))
 }
 
+/// Memoized [`legacy_client_valid_uncached`] with the same TRUE-only,
+/// cancellation-bypassing policy as [`client_matches`]. Dispatch
+/// selects the base before every command and `status`/`diff`/`fetch`/
+/// `push`, `doctor`, and `test` select it again; without the memo each
+/// selection re-ran the five-probe legacy validation. The key binds the
+/// Git directory's device and inode, so a replaced directory re-probes,
+/// and [`invalidate_client_match_cache`] clears these verdicts too.
 fn legacy_client_valid(runtime: &crate::app::Runtime, git_dir: &Path, home: &str) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
     let meta = match std::fs::symlink_metadata(git_dir) {
         Ok(meta) => meta,
         Err(_) => return false,
@@ -246,6 +254,34 @@ fn legacy_client_valid(runtime: &crate::app::Runtime, git_dir: &Path, home: &str
     if !meta.is_dir() || meta.file_type().is_symlink() {
         return false;
     }
+    if crate::cancellation::check().is_err() {
+        return legacy_client_valid_uncached(runtime, git_dir, home);
+    }
+    let mut key = b"legacy\0".to_vec();
+    for part in [
+        git_dir.as_os_str().as_bytes(),
+        meta.dev().to_string().as_bytes(),
+        meta.ino().to_string().as_bytes(),
+        home.as_bytes(),
+    ] {
+        key.extend_from_slice(part);
+        key.push(0);
+    }
+    if let Ok(cache) = client_match_cache().lock() {
+        if cache.contains_key(&key) {
+            return true;
+        }
+    }
+    let valid = legacy_client_valid_uncached(runtime, git_dir, home);
+    if valid {
+        if let Ok(mut cache) = client_match_cache().lock() {
+            cache.insert(key, ());
+        }
+    }
+    valid
+}
+
+fn legacy_client_valid_uncached(runtime: &crate::app::Runtime, git_dir: &Path, home: &str) -> bool {
     let Some(absolute) = git_dir_output(runtime, git_dir, &["rev-parse", "--absolute-git-dir"])
     else {
         return false;
@@ -307,7 +343,8 @@ fn chomp_newlines(mut output: Vec<u8>) -> Vec<u8> {
 }
 
 /// Memoized `client_matches` TRUE verdicts by record identity plus
-/// home. Dispatch validates the base client before running the
+/// home (and, under a `legacy` key prefix, [`legacy_client_valid`]
+/// verdicts by Git directory identity plus home). Dispatch validates the base client before running the
 /// command, and `update` gather validates it again before the pull
 /// phase; each validation is up to five supervised `git` probes
 /// against unchanging state, so the second call shares the first
@@ -510,6 +547,125 @@ mod tests {
                 git_ino: meta.ino().to_string(),
             }
         }
+    }
+
+    /// A legacy `~/.dotfiles` client plus a Git shim that answers the
+    /// five legacy validation probes (`--git-dir <dir> <command> ...`) and
+    /// logs every call. `bare` selects the `core.bare` answer; `false`
+    /// sends validation to the `core.worktree` probe, which the shim
+    /// answers with a foreign worktree so validation fails.
+    struct LegacyGit {
+        scope: dot_test_support::TempDir,
+        home: PathBuf,
+        git_dir: PathBuf,
+        log: PathBuf,
+        shim: PathBuf,
+    }
+
+    impl LegacyGit {
+        fn new(tag: &str, bare: bool) -> Self {
+            let scope = dot_test_support::TempDir::new_exec(&format!("legacy-git-{tag}"))
+                .expect("legacy git scope");
+            let home = scope.path().join("home");
+            let git_dir = home.join(".dotfiles");
+            std::fs::create_dir_all(&git_dir).expect("legacy git dir");
+            let log = scope.path().join("invocations.log");
+            let shim = scope.path().join("git");
+            std::fs::write(
+                &shim,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$3\" in\n  rev-parse) printf '%s\\n' \"$2\";;\n  symbolic-ref) printf 'main\\n';;\n  config)\n    case \"$4\" in\n      --get-all) printf '%s\\n' '{CANNED_URL}';;\n      --bool) printf '{bare}\\n';;\n      *) printf '/elsewhere\\n';;\n    esac;;\nesac\n",
+                    log = log.display(),
+                ),
+            )
+            .expect("legacy git shim");
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("legacy git mode");
+            Self {
+                scope,
+                home,
+                git_dir,
+                log,
+                shim,
+            }
+        }
+
+        fn runtime(&self) -> crate::app::Runtime {
+            let env = std::collections::BTreeMap::from([
+                (OsString::from("HOME"), self.home.as_os_str().to_owned()),
+                (
+                    OsString::from("PATH"),
+                    self.scope.path().as_os_str().to_owned(),
+                ),
+                (
+                    OsString::from("DOT_SOURCE_ROOT"),
+                    OsString::from(env!("CARGO_MANIFEST_DIR")),
+                ),
+            ]);
+            crate::app::Runtime::from_env(&env, &self.home).expect("legacy runtime")
+        }
+
+        fn valid(&self, runtime: &crate::app::Runtime) -> bool {
+            crate::init_client_identity::with_host_git(&self.shim, || {
+                legacy_client_valid(runtime, &self.git_dir, &self.home.to_string_lossy())
+            })
+        }
+
+        fn invocations(&self) -> usize {
+            std::fs::read_to_string(&self.log)
+                .map(|log| log.lines().count())
+                .unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn repeated_legacy_validation_probes_git_once() {
+        let _serial = TEST_SERIAL.lock();
+        let git = LegacyGit::new("dedup", true);
+        let runtime = git.runtime();
+        assert!(git.valid(&runtime));
+        let probes = git.invocations();
+        assert_eq!(probes, 5);
+        assert!(git.valid(&runtime));
+        assert_eq!(git.invocations(), probes);
+    }
+
+    #[test]
+    fn legacy_validation_invalidation_reprobes() {
+        let _serial = TEST_SERIAL.lock();
+        let git = LegacyGit::new("invalidate", true);
+        let runtime = git.runtime();
+        assert!(git.valid(&runtime));
+        invalidate_client_match_cache();
+        assert!(git.valid(&runtime));
+        assert_eq!(git.invocations(), 10);
+    }
+
+    #[test]
+    fn legacy_validation_reprobes_a_replaced_git_dir() {
+        // The verdict is bound to the directory's device and inode, so a
+        // directory swapped in under the same path is validated afresh.
+        let _serial = TEST_SERIAL.lock();
+        let git = LegacyGit::new("replaced", true);
+        let runtime = git.runtime();
+        assert!(git.valid(&runtime));
+        let parked = git.home.join(".dotfiles-parked");
+        std::fs::rename(&git.git_dir, &parked).expect("park git dir");
+        std::fs::create_dir(&git.git_dir).expect("replacement git dir");
+        assert!(git.valid(&runtime));
+        assert_eq!(git.invocations(), 10);
+    }
+
+    #[test]
+    fn legacy_validation_failures_stay_uncached() {
+        let _serial = TEST_SERIAL.lock();
+        let git = LegacyGit::new("foreign", false);
+        let runtime = git.runtime();
+        assert!(!git.valid(&runtime));
+        let probes = git.invocations();
+        assert_eq!(probes, 6);
+        assert!(!git.valid(&runtime));
+        assert_eq!(git.invocations(), probes * 2);
     }
 
     #[test]
