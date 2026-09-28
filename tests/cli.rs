@@ -6548,3 +6548,45 @@ fn update_never_runs_a_git_launcher_under_home() {
         std::fs::read_to_string(&log)
     );
 }
+
+#[test]
+fn update_help_prints_usage_without_converging() {
+    // `dot update --help` used to fall through the leading-flag parser and
+    // run a full update. Every spelling must print usage and touch nothing:
+    // no merge hook, no pull of the pushed base change.
+    let fixture =
+        NativeUpdateFixture::stage().with_merge(b"merge() { printf ran >\"$HOME/merge-ran\"; }\n");
+    seed_advance(&fixture.client.base_seed, "tracked.txt", b"v2\n");
+    for argv in [
+        &["update", "--help"][..],
+        &["pull", "-h"],
+        &["update", "-f", "--help"],
+        &["update", "--cron", "extra", "-h"],
+    ] {
+        let output = fixture.rust_dot_with_bash(argv);
+        assert_eq!(output.status.code(), Some(0), "{argv:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            dot::update::USAGE,
+            "{argv:?}"
+        );
+        assert!(output.stderr.is_empty(), "{argv:?}: {:?}", output.stderr);
+        assert!(
+            !fixture.client.home.join("merge-ran").exists(),
+            "{argv:?} ran a merge hook"
+        );
+        assert_eq!(
+            std::fs::read(fixture.client.home.join("tracked.txt")).expect("tracked file"),
+            b"v1\n",
+            "{argv:?} pulled the base repository"
+        );
+    }
+    // Control: the same fixture does converge without help.
+    let output = fixture.rust_dot_with_bash(&["update", "--quiet"]);
+    assert_native_silent(&output, "update after help");
+    assert!(fixture.client.home.join("merge-ran").exists());
+    assert_eq!(
+        std::fs::read(fixture.client.home.join("tracked.txt")).expect("tracked file"),
+        b"v2\n"
+    );
+}
