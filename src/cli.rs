@@ -438,6 +438,14 @@ fn run_update(
 ) -> i32 {
     let raw: Vec<Vec<u8>> = args.iter().map(argv_bytes).collect();
     let refs: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
+    // Help returns before the update lock or any convergence step.
+    if crate::update::help_requested(&refs) {
+        return if stdout.write_all(crate::update::USAGE.as_bytes()).is_err() {
+            EXIT_ERROR
+        } else {
+            EXIT_SUCCESS
+        };
+    }
     let parsed = crate::update::parse_update_flags(&refs);
     // The shell exports these values before the engine runs. Keep that
     // behavior inside this invocation's child environment instead of

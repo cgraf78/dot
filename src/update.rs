@@ -84,6 +84,33 @@ pub fn overlay_phase_ok(pull_rc: i32, overlay_failed: Option<&str>) -> bool {
     pull_rc == 0 && overlay_failed.and_then(arith_value).unwrap_or(0) == 0
 }
 
+/// `dot update --help` output (also `dot pull`).
+pub const USAGE: &str =
+    "usage: dot update [-f|--force] [-v|--verbose] [--quiet] [--cron] [<git pull args>...]
+
+Converge the base repository, overlays, hooks, and provider. `dot pull` is an
+alias. Arguments after the options are passed to each repository's `git pull`;
+-h and --help always print this usage instead.
+
+  -f, --force    make the provider and hooks re-check every dependency now
+                 instead of honoring their update caches
+  -v, --verbose  show detailed progress, including per-hook results
+      --quiet    suppress progress output
+      --cron     unattended mode: implies --quiet, stays quiet about a busy
+                 update lock, skips the run while local edits are unresolved,
+                 and records the outcome for `dot doctor`
+";
+
+/// Whether `-h`/`--help` appears anywhere in the update arguments. Like the
+/// `--cron` scan it inspects every argument, not just the leading flags:
+/// arguments after the leading flags are otherwise forwarded to each
+/// repository's `git pull`, so without this `--help` reached `git pull`
+/// while the rest of the convergence run (hooks, provider) still executed.
+pub fn help_requested(args: &[&[u8]]) -> bool {
+    args.iter()
+        .any(|arg| *arg == b"-h".as_slice() || *arg == b"--help".as_slice())
+}
+
 /// Parsed leading update flags and the first unconsumed argument index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpdateFlagParse {

@@ -66,6 +66,33 @@ fn leading_flags_stop_at_the_first_unknown_or_positional_word() {
 }
 
 #[test]
+fn help_is_requested_by_an_exact_help_argument_anywhere() {
+    for (args, expected) in [
+        (vec![b"--help".as_slice()], true),
+        (vec![b"-h".as_slice()], true),
+        // After consumed flags and after ignored residue alike: help must
+        // never fall through to a convergence run.
+        (vec![b"-f".as_slice(), b"--help"], true),
+        (vec![b"extra".as_slice(), b"--cron", b"-h"], true),
+        (vec![], false),
+        (vec![b"--quiet".as_slice(), b"--force"], false),
+        // Only exact spellings: no prefixes, bundles, or values.
+        (vec![b"--helpful".as_slice()], false),
+        (vec![b"-hv".as_slice()], false),
+        (vec![b"--help=1".as_slice()], false),
+    ] {
+        assert_eq!(
+            dot::update::help_requested(&args),
+            expected,
+            "{:?}",
+            args.iter()
+                .map(|arg| String::from_utf8_lossy(arg))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
 fn overlay_phase_requires_a_zero_command_and_failure_count() {
     for (rc, failed, expected) in [
         (0, None, true),
