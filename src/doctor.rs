@@ -920,7 +920,7 @@ fn dispatch_extensions(
 ) -> i32 {
     // Worker threads do not inherit thread-local bindings, so carry the
     // caller's pinned host Git into each one explicitly.
-    let host_git = crate::init_client_identity::current_host_git();
+    let host_git = crate::init_client_identity::carry_host_git();
     let mut status = 0;
     let mut panicked = None;
     std::thread::scope(|scope| {
@@ -936,9 +936,7 @@ fn dispatch_extensions(
                 };
                 let host_git = host_git.clone();
                 let spawned = std::thread::Builder::new().spawn_scoped(scope, move || {
-                    let _host_git = host_git
-                        .as_deref()
-                        .map(crate::init_client_identity::bind_host_git_for_scope);
+                    let _host_git = host_git.bind();
                     execute_guarded(execute, spec, abort)
                 });
                 in_flight.push_back(match spawned {
