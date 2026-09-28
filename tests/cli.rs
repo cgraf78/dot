@@ -6399,3 +6399,138 @@ fn update_native_failure_reports_errors_and_restores_state() {
         "repository failure must stop before newly eligible merge hooks"
     );
 }
+
+/// Write a launcher-shaped `git` at `dir/git` that records each call in
+/// `log`, optionally exports `GIT_DIR` (as a dotfiles launcher does when the
+/// target is not a repository), and then runs the real Git.
+fn logging_git_launcher(dir: &Path, log: &Path, git_dir: Option<&Path>) {
+    std::fs::create_dir_all(dir).expect("launcher dir");
+    let export = git_dir
+        .map(|dir| format!("GIT_DIR='{}'\nexport GIT_DIR\n", dir.display()))
+        .unwrap_or_default();
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n{export}exec '{real}' \"$@\"\n",
+        log = log.display(),
+        real = real_tool("git").display(),
+    );
+    let launcher = dir.join("git");
+    std::fs::write(&launcher, script).expect("write launcher");
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+        .expect("launcher mode");
+}
+
+/// The revision this test binary was built from, which the re-exec guard
+/// must observe through whichever Git the engine selects.
+fn checkout_revision() -> String {
+    let output = Command::new(real_tool("git"))
+        .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+        .output()
+        .expect("checkout revision");
+    assert!(output.status.success(), "checkout revision");
+    String::from_utf8(output.stdout)
+        .expect("utf-8 revision")
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn engine_git_skips_launcher_under_home() {
+    // A client-provided launcher first on PATH used to answer the engine's
+    // revision probe, and one that exports GIT_DIR answered it from the
+    // wrong repository. The guard must see the checkout's own revision
+    // without running the launcher at all.
+    let scope = TempDir::new_exec("engine-git-launcher").expect("scope");
+    let home = scope.path().join("home");
+    let launcher_dir = home.join(".local/bin");
+    let log = scope.path().join("launcher.log");
+    let decoy = scope.path().join("decoy.git");
+    logging_git_launcher(&launcher_dir, &log, Some(&decoy));
+    let mut path = launcher_dir.into_os_string();
+    path.push(":");
+    path.push(fixture_path());
+    let output = bin()
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", path)
+        .env("DOT_REEXEC_EXPECTED_REVISION", checkout_revision())
+        .arg("version")
+        .output()
+        .expect("run dot version");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !log.exists(),
+        "launcher ran: {:?}",
+        std::fs::read_to_string(&log)
+    );
+}
+
+#[test]
+fn engine_git_falls_back_to_home_git_when_no_host_git_exists() {
+    // A host whose only Git lives under HOME keeps working through PATH.
+    let scope = TempDir::new_exec("engine-git-home-only").expect("scope");
+    let home = scope.path().join("home");
+    let launcher_dir = home.join(".local/bin");
+    let log = scope.path().join("launcher.log");
+    logging_git_launcher(&launcher_dir, &log, None);
+    let output = bin()
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", &launcher_dir)
+        .env("DOT_REEXEC_EXPECTED_REVISION", checkout_revision())
+        .arg("version")
+        .output()
+        .expect("run dot version");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = std::fs::read_to_string(&log).expect("launcher log");
+    assert!(calls.contains("rev-parse HEAD"), "calls: {calls}");
+}
+
+#[test]
+fn update_never_runs_a_git_launcher_under_home() {
+    // A client-provided launcher first on PATH must not run for any engine
+    // Git child, on any thread: dispatcher probes, overlay pull workers,
+    // link preparation, and merge-hook workers validating an
+    // overlay-provided hook against its checkout.
+    let fixture = NativeUpdateFixture::stage()
+        .with_merge(b"merge() { printf base >\"$HOME/base-merged\"; }\n");
+    let seed = &fixture.client.overlay_seed;
+    std::fs::create_dir_all(seed.join("home/extensions/merge-hooks.d")).expect("overlay hooks");
+    seed_advance(
+        seed,
+        "home/extensions/merge-hooks.d/20-overlay.sh",
+        b"merge() { printf overlay >\"$HOME/overlay-merged\"; }\n",
+    );
+    let launcher_dir = fixture.client.home.join(".local/bin");
+    let log = fixture.client.scope.path().join("launcher.log");
+    logging_git_launcher(&launcher_dir, &log, None);
+    let mut path = launcher_dir.into_os_string();
+    path.push(":");
+    path.push(fixture_path());
+    // One merge job: the base hook's completion clears the probe caches,
+    // so the overlay hook's trust check must spawn Git on its worker thread
+    // instead of reusing the dispatcher's cached answer.
+    let output = fixture.rust_dot_with_bash_and(&["update", "--quiet"], |cmd| {
+        cmd.env("PATH", &path).env("DOT_MERGE_JOBS", "1");
+    });
+    assert_native_silent(&output, "update with a HOME git launcher");
+    for (marker, body) in [("base-merged", "base"), ("overlay-merged", "overlay")] {
+        assert_eq!(
+            std::fs::read_to_string(fixture.client.home.join(marker)).expect(marker),
+            body,
+            "{marker} hook ran"
+        );
+    }
+    assert!(
+        !log.exists(),
+        "launcher ran: {:?}",
+        std::fs::read_to_string(&log)
+    );
+}

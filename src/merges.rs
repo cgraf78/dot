@@ -883,6 +883,9 @@ fn run_batch(
     let root = state.root;
     let overlays = state.overlays;
     let first_index = state.merge_index - hooks.len();
+    // Hook trust validation probes overlay checkouts with Git inside each
+    // worker; the host-Git binding is thread-local, so carry it across.
+    let host_git = crate::init_client_identity::carry_host_git();
     std::thread::scope(|scope| {
         // The shell never retains more PIDs than there are hooks. Do not let a
         // user-controlled but valid numeric job limit reserve unrelated memory.
@@ -894,9 +897,13 @@ fn run_batch(
             workers.push_back((
                 panic_hook,
                 completion_rx,
-                scope.spawn(move || {
-                    let record = run_one(inputs, hook, index, root, overlays);
-                    let _ = completion_tx.send(record);
+                scope.spawn({
+                    let host_git = host_git.clone();
+                    move || {
+                        let _host_git = host_git.bind();
+                        let record = run_one(inputs, hook, index, root, overlays);
+                        let _ = completion_tx.send(record);
+                    }
                 }),
             ));
             // Bash waits for the oldest in-flight worker once the ceiling is

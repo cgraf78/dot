@@ -17,6 +17,10 @@
 //! `dot init: ` prefix. Record, candidate, generation, claim, and
 //! rollback families live in their adjacent native modules.
 //!
+//! The same host-Git boundary serves every command: dispatch binds
+//! init's strict pin, or [`select_command_git`] for ordinary commands,
+//! per thread, and worker threads carry it via [`carry_host_git`].
+//!
 //! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
 
@@ -38,18 +42,19 @@ pub const NO_HOST_GIT: &str = "host Git is unavailable outside HOME and the Dot 
 pub const GIT_SHADOWED: &str = "a shell function named git cannot be used during initialization";
 
 thread_local! {
-    /// Per-invocation executable capability. Init is callable in-process, so
-    /// the binding must not mutate process-global `PATH`.
+    /// Per-command executable capability bound by dispatch (init's strict
+    /// pin, or the ordinary-command selection). Dot is callable in-process,
+    /// so the binding must not mutate process-global `PATH`.
     static HOST_GIT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
-/// Run one init operation with every Git child pinned to `git`.
+/// Run one operation with every Git child pinned to `git`.
 pub fn with_host_git<T>(git: &Path, run: impl FnOnce() -> T) -> T {
     let _restore = bind_host_git_for_scope(git);
     run()
 }
 
-/// Scoped host-Git binding used when an init worker crosses a thread boundary.
+/// Scoped host-Git binding; see [`HostGitCarrier`] for worker threads.
 pub struct HostGitGuard(Option<PathBuf>);
 
 impl Drop for HostGitGuard {
@@ -64,15 +69,39 @@ pub fn bind_host_git_for_scope(git: &Path) -> HostGitGuard {
     HostGitGuard(previous)
 }
 
-/// Return the executable currently bound to this init invocation.
+/// Return the executable currently bound on this thread.
 pub fn current_host_git() -> Option<PathBuf> {
     HOST_GIT.with(|slot| slot.borrow().clone())
 }
 
+/// This thread's host-Git binding, captured for worker threads.
+///
+/// The binding is thread-local (in-process runtimes must not observe each
+/// other), so a worker that spawns Git must rebind it or it silently falls
+/// back to `PATH` lookup. Capture with [`carry_host_git`] before spawning
+/// and hold [`HostGitCarrier::bind`]'s guard for the worker's lifetime.
+#[derive(Debug, Clone)]
+pub struct HostGitCarrier(Option<PathBuf>);
+
+/// Capture the current thread's host-Git binding for a worker thread.
+pub fn carry_host_git() -> HostGitCarrier {
+    HostGitCarrier(current_host_git())
+}
+
+impl HostGitCarrier {
+    /// Bind the captured Git on the calling thread until the guard drops;
+    /// `None` when the capturing thread had no binding.
+    #[must_use]
+    pub fn bind(&self) -> Option<HostGitGuard> {
+        self.0.as_deref().map(bind_host_git_for_scope)
+    }
+}
+
 /// Construct a Git child pinned by [`with_host_git`].
 ///
-/// Isolated helper tests outside the production init boundary retain ordinary
-/// `PATH` lookup.
+/// Command dispatch binds the runtime's host Git for every command, and
+/// worker threads rebind it; an unbound thread (isolated helper tests, or a
+/// host whose only Git lives under HOME) retains ordinary `PATH` lookup.
 pub fn host_git_command() -> Command {
     HOST_GIT.with(|slot| match slot.borrow().as_deref() {
         Some(git) => Command::new(git),
@@ -209,6 +238,44 @@ fn under_root(candidate: &str, root: &str) -> bool {
 /// Returns the selected path (`$REPLY` in the shell); `None` is the
 /// shell's `return 1` with `REPLY` left empty.
 pub fn select_host_git(home: &str, source_root: &str, path: &str) -> Option<String> {
+    select_git(home, source_root, path, |candidate, _, _| {
+        is_host_candidate(Path::new(candidate))
+    })
+}
+
+/// Host Git for ordinary (non-init) commands: the first `git` on `path`
+/// whose physical directory and resolved executable both lie outside
+/// `home` and `source_root`.
+///
+/// Unlike [`select_host_git`], a symlinked executable is accepted once its
+/// target also resolves outside both roots. Package managers publish Git
+/// that way (Homebrew's `bin/git`, Nix profiles), and ordinary commands only
+/// need to skip client-provided launchers, not adopt init's stricter
+/// transaction boundary; rejecting the link would silently fall through to
+/// an older system Git instead.
+pub fn select_command_git(home: &str, source_root: &str, path: &str) -> Option<String> {
+    select_git(home, source_root, path, |candidate, home, source| {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Ok(target) = std::fs::canonicalize(candidate) else {
+            return false;
+        };
+        let executable = std::fs::metadata(&target)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
+        let target = target.to_string_lossy();
+        executable && !under_root(&target, home) && !under_root(&target, source)
+    })
+}
+
+/// Shared `PATH` walk for the host-Git selectors: `accept` sees each
+/// candidate spelled under its physical directory plus the physical
+/// `home` and `source_root`, after which candidates under either root
+/// are rejected.
+fn select_git(
+    home: &str,
+    source_root: &str,
+    path: &str,
+    accept: impl Fn(&str, &str, &str) -> bool,
+) -> Option<String> {
     let home = physical(home)?;
     let source = physical(source_root)?;
     let home = home.to_string_lossy();
@@ -227,7 +294,7 @@ pub fn select_host_git(home: &str, source_root: &str, path: &str) -> Option<Stri
         } else {
             format!("{physical}/git")
         };
-        if !is_host_candidate(Path::new(&candidate)) {
+        if !accept(&candidate, &home, &source) {
             continue;
         }
         if under_root(&candidate, &home) {
@@ -644,6 +711,43 @@ pub fn remote_default_branch(url: &str, scratch: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn carried_host_git_binds_on_worker_threads_and_restores() {
+        let git = Path::new("/carried/host/git");
+        with_host_git(git, || {
+            let carried = carry_host_git();
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        // Unbound by default: the binding is thread-local.
+                        assert_eq!(current_host_git(), None);
+                        {
+                            let _guard = carried.bind();
+                            assert_eq!(current_host_git().as_deref(), Some(git));
+                            assert_eq!(host_git_program(), git.as_os_str());
+                        }
+                        assert_eq!(current_host_git(), None);
+                    })
+                    .join()
+                    .expect("worker");
+            });
+        });
+    }
+
+    #[test]
+    fn carrying_an_unbound_thread_binds_nothing() {
+        let carried = carry_host_git();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    assert!(carried.bind().is_none());
+                    assert_eq!(host_git_program(), "git");
+                })
+                .join()
+                .expect("worker");
+        });
+    }
 
     #[test]
     fn advertised_lines_update_branch_and_oid() {

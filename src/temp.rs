@@ -461,8 +461,9 @@ pub fn source_root() -> Result<PathBuf> {
 /// Builds the `git` command with that isolation boundary applied:
 /// the unset list plus `GIT_CONFIG_NOSYSTEM=1`,
 /// `GIT_CONFIG_GLOBAL=/dev/null`, and the `-c safe.directory=` /
-/// `-C source_root` binding. `git` itself resolves off the engine PATH
-/// like the shell's `command git`.
+/// `-C source_root` binding. `git` itself is the bound host Git
+/// ([`crate::init_client_identity::host_git_command`]), falling back to
+/// the engine PATH like the shell's `command git`.
 pub fn sanitized_git<S: AsRef<std::ffi::OsStr>>(
     source_root: &Path,
     args: &[S],

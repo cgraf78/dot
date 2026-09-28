@@ -235,3 +235,56 @@ fn missing_output_root_fails() {
         .is_none()
     );
 }
+
+#[test]
+fn workers_run_the_dispatcher_bound_host_git() {
+    // The host-Git binding is thread-local; inventory workers must carry
+    // the dispatcher's selection instead of falling back to PATH lookup.
+    let scope = TempDir::new_exec("link-prep-host-git").unwrap();
+    let home = scope.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let (checkout, url) = git_overlay(scope.path(), &home, "overlay");
+    let entries = vec![entry("overlay", &checkout, &url, "git")];
+    let root = scope.path().join("inventories");
+    std::fs::create_dir(&root).unwrap();
+    let log = scope.path().join("host-git.log");
+    let real = [
+        "/usr/bin/git",
+        "/bin/git",
+        "/usr/local/bin/git",
+        "/opt/homebrew/bin/git",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|path| path.is_file())
+    .expect("system git");
+    let shim = scope.path().join("bin/git");
+    stage(
+        scope.path(),
+        "bin/git",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real.display()
+        )
+        .as_bytes(),
+    );
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let got = dot::init_client_identity::with_host_git(&shim, || {
+        repos_link_prep::prepare_inventories(
+            &repos_link_prep::Inputs {
+                entries: &entries,
+                home: home.to_str().unwrap(),
+                update_jobs: Some("2"),
+            },
+            &root,
+        )
+    })
+    .unwrap();
+    assert!(got.inventories.contains_key("overlay"));
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.contains(&format!("-C {}", checkout.display())),
+        "worker Git bypassed the bound host Git: {calls:?}"
+    );
+}

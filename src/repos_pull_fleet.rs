@@ -508,7 +508,7 @@ fn run_chunk(
     out: &mut dyn Write,
     beat: &mut Heartbeat,
 ) {
-    let host_git = crate::init_client_identity::current_host_git();
+    let host_git = crate::init_client_identity::carry_host_git();
     let (completion_tx, completion_rx) = std::sync::mpsc::channel::<()>();
     std::thread::scope(|scope| {
         for (offset, entry) in chunk.iter().enumerate() {
@@ -525,9 +525,7 @@ fn run_chunk(
                 let done = || {
                     let _ = completion_tx.send(());
                 };
-                let _host_git = host_git
-                    .as_deref()
-                    .map(crate::init_client_identity::bind_host_git_for_scope);
+                let _host_git = host_git.bind();
                 let mut moves = MoveCache::default();
                 // Each thread builds its own borrowed overlay inputs
                 // from the shared fleet inputs; the scope guarantees

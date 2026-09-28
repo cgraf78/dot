@@ -280,6 +280,18 @@ pub(crate) fn run_with_runtime(
     // The re-exec guard precedes every command. Informational commands then
     // return without reading user configuration, matching the shell entry
     // point; operational commands load configuration before dispatch.
+    // Every Git child, including the revision probe shared by help/version,
+    // runs the host Git outside the client-controlled roots when one exists.
+    // Worker threads that spawn Git rebind it explicitly (the binding is
+    // thread-local so in-process runtimes cannot observe each other).
+    let host_git = if dispatch(command) == Command::Init {
+        runtime.init_host_git()
+    } else {
+        runtime.host_git().map(Path::to_path_buf)
+    };
+    let _host_git = host_git
+        .as_deref()
+        .map(crate::init_client_identity::bind_host_git_for_scope);
     if crate::startup::informational_command(command) {
         let code = {
             let mut stdout = signals.writer(stdout);
@@ -321,26 +333,12 @@ pub(crate) fn run_with_runtime(
             let selected = dispatch(command);
             let home = runtime.home().to_string_lossy();
             let state = runtime.state_home().to_string_lossy();
-            // Init's host-Git capability must cover startup revision checks,
-            // client-identity selection, and the engine itself. A resumable
-            // transaction can already have moved a client-owned wrapper's
-            // helper, so any PATH fallback during those phases can reject an
-            // otherwise valid journal. The process-wide signal owner is
-            // already active here, before any Git child is launched.
-            let host_git = if selected == Command::Init {
-                runtime
-                    .value("PATH")
-                    .and_then(OsStr::to_str)
-                    .and_then(|path| {
-                        crate::init_client_identity::select_host_git(
-                            &home,
-                            &runtime.source_root().to_string_lossy(),
-                            path,
-                        )
-                    })
-            } else {
-                None
-            };
+            // Init's host-Git capability (bound above) must cover startup
+            // revision checks, client-identity selection, and the engine
+            // itself. A resumable transaction can already have moved a
+            // client-owned wrapper's helper, so init refuses the PATH
+            // fallback that other commands keep. The process-wide signal
+            // owner is already active here, before any Git child is launched.
             if selected == Command::Init && host_git.is_none() {
                 let _ = writeln!(
                     stderr,
@@ -349,9 +347,6 @@ pub(crate) fn run_with_runtime(
                 );
                 return EXIT_ERROR;
             }
-            let _host_git = host_git
-                .as_deref()
-                .map(|git| crate::init_client_identity::bind_host_git_for_scope(Path::new(git)));
             let config = match crate::startup::check(runtime) {
                 Ok(config) => config,
                 Err(failure) => {

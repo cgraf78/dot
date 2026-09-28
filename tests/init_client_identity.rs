@@ -731,3 +731,122 @@ fn default_branch_refuses_garbage() {
     assert_eq!(out, rust_default(&gone_rs, &url));
     assert_eq!(out, "code=1\nout=\n");
 }
+
+/// Fixture root for the ordinary-command selector: a home and a source
+/// root with one launcher-shaped `git` inside each, so every row proves
+/// both client-controlled roots are skipped.
+fn command_roots(tag: &str) -> (TempDir, PathBuf, PathBuf, PathBuf) {
+    let dir = TempDir::new(tag).expect("temp dir");
+    let root = dir.path().to_path_buf();
+    let home = root.join("home");
+    let source = root.join("source");
+    fake_git(&home.join(".local/bin"));
+    fake_git(&source.join("bin"));
+    (dir, root, home, source)
+}
+
+fn command_select(home: &Path, source: &Path, entries: &[PathBuf]) -> Option<String> {
+    let path = entries
+        .iter()
+        .map(|entry| entry.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    init::select_command_git(&home.to_string_lossy(), &source.to_string_lossy(), &path)
+}
+
+#[test]
+fn command_select_skips_launchers_under_home_and_source() {
+    let (_dir, root, home, source) = command_roots("command-git-skip-roots");
+    let system = root.join("system");
+    fake_git(&system);
+    let selected = command_select(
+        &home,
+        &source,
+        &[home.join(".local/bin"), source.join("bin"), system.clone()],
+    );
+    assert_eq!(selected, Some(format!("{}/git", system.display())));
+}
+
+#[test]
+fn command_select_accepts_symlink_resolving_outside_roots() {
+    // Package managers (Homebrew, Nix profiles) publish Git as a link;
+    // init refuses it, ordinary commands must not fall past it.
+    let (_dir, root, home, source) = command_roots("command-git-symlink");
+    let cellar = root.join("cellar");
+    fake_git(&cellar);
+    let linked = root.join("linked");
+    std::fs::create_dir_all(&linked).expect("link dir");
+    std::os::unix::fs::symlink(cellar.join("git"), linked.join("git")).expect("git symlink");
+    let later = root.join("later");
+    fake_git(&later);
+    let entries = [home.join(".local/bin"), linked.clone(), later];
+    assert_eq!(
+        command_select(&home, &source, &entries),
+        Some(format!("{}/git", linked.display()))
+    );
+    // The strict init selector still refuses the same link.
+    let path = entries
+        .iter()
+        .map(|entry| entry.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    assert_eq!(
+        init::select_host_git(&home.to_string_lossy(), &source.to_string_lossy(), &path),
+        Some(format!("{}/git", root.join("later").display()))
+    );
+}
+
+#[test]
+fn command_select_rejects_symlink_into_home() {
+    // A link outside HOME whose target is the client launcher is still
+    // client-controlled code.
+    let (_dir, root, home, source) = command_roots("command-git-link-home");
+    let linked = root.join("linked");
+    std::fs::create_dir_all(&linked).expect("link dir");
+    std::os::unix::fs::symlink(home.join(".local/bin/git"), linked.join("git"))
+        .expect("git symlink");
+    let system = root.join("system");
+    fake_git(&system);
+    assert_eq!(
+        command_select(&home, &source, &[linked, system.clone()]),
+        Some(format!("{}/git", system.display()))
+    );
+}
+
+#[test]
+fn command_select_rejects_unusable_candidates() {
+    let (_dir, root, home, source) = command_roots("command-git-unusable");
+    let flat = root.join("flat");
+    std::fs::create_dir_all(&flat).expect("flat dir");
+    std::fs::write(flat.join("git"), b"#!/bin/sh\n").expect("flat git");
+    chmod(&flat.join("git"), 0o644);
+    let dirgit = root.join("dirgit");
+    std::fs::create_dir_all(dirgit.join("git")).expect("dir git");
+    let dangling = root.join("dangling");
+    std::fs::create_dir_all(&dangling).expect("dangling dir");
+    std::os::unix::fs::symlink(root.join("missing/git"), dangling.join("git"))
+        .expect("dangling symlink");
+    assert_eq!(
+        command_select(
+            &home,
+            &source,
+            &[flat, dirgit, dangling, root.join("missing")]
+        ),
+        None
+    );
+}
+
+#[test]
+fn command_select_returns_none_when_only_home_has_git() {
+    // Callers keep ordinary PATH lookup for this case, so hosts whose
+    // only Git lives under HOME still work.
+    let (_dir, _root, home, source) = command_roots("command-git-home-only");
+    assert_eq!(
+        command_select(
+            &home,
+            &source,
+            &[home.join(".local/bin"), source.join("bin")]
+        ),
+        None
+    );
+}
