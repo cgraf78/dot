@@ -982,16 +982,35 @@ fn dispatch_extensions(
             }
         }
     });
+    settle(
+        panicked,
+        abort.load(Ordering::SeqCst),
+        crate::cleanup::received_signal().is_some(),
+        status,
+    )
+}
+
+/// The dispatcher's final verdict, in precedence order: a panic collected
+/// by the abort path re-raises; a received signal returns 1 even when a
+/// worker drained during cancellation panicked and raised `abort` (the
+/// drain discards that payload so it cannot mask the cancellation); an
+/// abort with neither is a broken invariant.
+fn settle(
+    panicked: Option<Box<dyn std::any::Any + Send>>,
+    aborted: bool,
+    signalled: bool,
+    status: i32,
+) -> i32 {
     if let Some(panic) = panicked {
         std::panic::resume_unwind(panic);
     }
-    if abort.load(Ordering::SeqCst) {
-        // Only a worker panic raises `abort`, and its payload is always
-        // collected above; reaching here means that invariant broke.
-        panic!("doctor extension worker aborted without a panic payload");
-    }
-    if crate::cleanup::received_signal().is_some() {
+    if signalled {
         return 1;
+    }
+    if aborted {
+        // Outside cancellation only a worker panic raises `abort`, and the
+        // abort path always collects its payload.
+        panic!("doctor extension worker aborted without a panic payload");
     }
     status
 }
@@ -1294,6 +1313,21 @@ mod tests {
     #[test]
     fn younger_worker_panic_aborts_hung_older_sibling() {
         assert_panic_aborts_hung_sibling(1);
+    }
+
+    #[test]
+    fn cancellation_status_wins_over_a_drained_worker_panic() {
+        // A worker drained after a signal may panic and raise `abort`; its
+        // payload is discarded so the command still reports cancellation.
+        assert_eq!(super::settle(None, true, true, 0), 1);
+        assert_eq!(super::settle(None, false, true, 0), 1);
+        assert_eq!(super::settle(None, false, false, 7), 7);
+        let reraised =
+            std::panic::catch_unwind(|| super::settle(Some(Box::new("collected")), true, true, 0))
+                .expect_err("a collected panic re-raises");
+        assert_eq!(reraised.downcast_ref::<&str>(), Some(&"collected"));
+        std::panic::catch_unwind(|| super::settle(None, true, false, 0))
+            .expect_err("abort without a payload or signal is a broken invariant");
     }
 
     #[test]
