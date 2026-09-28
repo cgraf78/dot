@@ -487,11 +487,50 @@ pub fn parse_conf(
 /// preparation). Tracking names survive pulls (rebase and
 /// fast-forward stay on the branch); only a fresh clone at the same
 /// path, arbitrary hook code, or git passthrough can change them.
+///
+/// The epochs close the probe/invalidate race between threads: a
+/// probe snapshots the epochs covering its answer before spawning
+/// `git` and inserts only if none moved meanwhile. Otherwise one
+/// thread could cache an answer observed before another thread's hook
+/// replaced the repository, and later callers would trust it. Epochs
+/// are scoped like the invalidations themselves (global, per path,
+/// upstream), so invalidating one path never discards another path's
+/// in-flight answer. Single-threaded callers never invalidate
+/// mid-probe, so their behavior is unchanged.
 #[derive(Default)]
 struct WorktreeProbeCache {
     worktree: HashMap<Vec<u8>, bool>,
     origin: HashMap<(Vec<u8>, Vec<u8>), Result<String, String>>,
     upstream: HashMap<Vec<u8>, String>,
+    /// Bumped by every whole-cache invalidation.
+    generation: u64,
+    /// Bumped whenever upstream answers are evicted.
+    upstream_generation: u64,
+    /// Per-path invalidation counts; absent means never invalidated.
+    path_epochs: HashMap<Vec<u8>, u64>,
+}
+
+/// The epochs one cached answer depends on, captured before its probe.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProbeEpoch {
+    generation: u64,
+    scoped: u64,
+}
+
+impl WorktreeProbeCache {
+    fn path_epoch(&self, path: &[u8]) -> ProbeEpoch {
+        ProbeEpoch {
+            generation: self.generation,
+            scoped: self.path_epochs.get(path).copied().unwrap_or(0),
+        }
+    }
+
+    fn upstream_epoch(&self) -> ProbeEpoch {
+        ProbeEpoch {
+            generation: self.generation,
+            scoped: self.upstream_generation,
+        }
+    }
 }
 
 static WORKTREE_PROBE_CACHE: OnceLock<Mutex<WorktreeProbeCache>> = OnceLock::new();
@@ -503,6 +542,24 @@ fn probe_cache() -> Option<std::sync::MutexGuard<'static, WorktreeProbeCache>> {
         .ok()
 }
 
+/// Run `insert` only if `epoch` still reads `started`, so an answer
+/// probed before a concurrent invalidation is discarded. A `None`
+/// start (poisoned cache) never inserts.
+fn insert_if_current(
+    started: Option<ProbeEpoch>,
+    epoch: impl FnOnce(&WorktreeProbeCache) -> ProbeEpoch,
+    insert: impl FnOnce(&mut WorktreeProbeCache),
+) {
+    let Some(started) = started else {
+        return;
+    };
+    if let Some(mut cache) = probe_cache() {
+        if epoch(&cache) == started {
+            insert(&mut cache);
+        }
+    }
+}
+
 /// Drop every memoized probe answer. Extension hooks run arbitrary
 /// user code that may replace repository directories, so the hook
 /// boundary clears the cache after each execution.
@@ -511,6 +568,10 @@ pub(crate) fn invalidate_worktree_cache() {
         cache.worktree.clear();
         cache.origin.clear();
         cache.upstream.clear();
+        // The generation bump already invalidates every in-flight probe,
+        // so per-path epochs can reset without reopening the race.
+        cache.path_epochs.clear();
+        cache.generation = cache.generation.wrapping_add(1);
     }
 }
 
@@ -520,6 +581,11 @@ pub(crate) fn invalidate_worktree_cache() {
 pub(crate) fn invalidate_worktree_path(path: &Path) {
     let key = path.as_os_str().as_bytes().to_vec();
     if let Some(mut cache) = probe_cache() {
+        // A probe of this path already in flight must not re-insert its
+        // pre-clone answer.
+        let epoch = cache.path_epochs.entry(key.clone()).or_insert(0);
+        *epoch = epoch.wrapping_add(1);
+        cache.upstream_generation = cache.upstream_generation.wrapping_add(1);
         cache.worktree.remove(&key);
         cache.origin.retain(|entry, _| entry.0 != key);
         // Upstream entries key by full command prefix, so evict any
@@ -542,6 +608,7 @@ pub(crate) fn invalidate_worktree_path(path: &Path) {
 pub(crate) fn invalidate_upstream_cache() {
     if let Some(mut cache) = probe_cache() {
         cache.upstream.clear();
+        cache.upstream_generation = cache.upstream_generation.wrapping_add(1);
     }
 }
 
@@ -566,11 +633,15 @@ pub(crate) fn cached_upstream_raw(prefix: &[std::ffi::OsString]) -> Option<Strin
     if cancelled {
         return None;
     }
-    if let Some(cache) = probe_cache() {
-        if let Some(hit) = cache.upstream.get(&key) {
-            return Some(hit.clone());
+    let started = match probe_cache() {
+        Some(cache) => {
+            if let Some(hit) = cache.upstream.get(&key) {
+                return Some(hit.clone());
+            }
+            Some(cache.upstream_epoch())
         }
-    }
+        None => None,
+    };
     let output = crate::repos_base::run_git(
         prefix,
         &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
@@ -579,9 +650,9 @@ pub(crate) fn cached_upstream_raw(prefix: &[std::ffi::OsString]) -> Option<Strin
         return None;
     }
     let answer = String::from_utf8_lossy(&output.stdout).into_owned();
-    if let Some(mut cache) = probe_cache() {
+    insert_if_current(started, WorktreeProbeCache::upstream_epoch, |cache| {
         cache.upstream.insert(key, answer.clone());
-    }
+    });
     Some(answer)
 }
 
@@ -595,15 +666,21 @@ pub fn is_worktree(path: &Path) -> bool {
     if let Some(answer) = probe_cache().and_then(|cache| cache.worktree.get(&key).copied()) {
         return answer;
     }
+    let started = probe_cache().map(|cache| cache.path_epoch(&key));
     let answer = is_worktree_uncached(path);
     // A failed spawn (missing `git`, fork pressure past the retry)
     // reports false but must not pin it: the next probe may run
     // with a working `git`. Only definitive subprocess answers
     // enter the cache.
     if let Some(determined) = answer {
-        if let Some(mut cache) = probe_cache() {
-            cache.worktree.insert(key, determined);
-        }
+        let epoch_key = key.clone();
+        insert_if_current(
+            started,
+            |cache| cache.path_epoch(&epoch_key),
+            |cache| {
+                cache.worktree.insert(key, determined);
+            },
+        );
         return determined;
     }
     false
@@ -702,6 +779,7 @@ pub fn origin_matches(path: &Path, expected: &str) -> Result<String, String> {
     if let Some(answer) = probe_cache().and_then(|cache| cache.origin.get(&key).cloned()) {
         return answer;
     }
+    let started = probe_cache().map(|cache| cache.path_epoch(&key.0));
     let output = retry_once(|| {
         let mut command = crate::init_client_identity::host_git_command();
         command
@@ -745,9 +823,14 @@ pub fn origin_matches(path: &Path, expected: &str) -> Result<String, String> {
         }
         _ => Err("<multiple origin URLs>".to_string()),
     };
-    if let Some(mut cache) = probe_cache() {
-        cache.origin.insert(key, answer.clone());
-    }
+    let epoch_key = key.0.clone();
+    insert_if_current(
+        started,
+        |cache| cache.path_epoch(&epoch_key),
+        |cache| {
+            cache.origin.insert(key, answer.clone());
+        },
+    );
     answer
 }
 
@@ -1537,6 +1620,17 @@ mod tests {
     /// A fake `git` that logs every invocation and emulates the two
     /// read-only probes, so repeated probes assert exact spawn counts
     /// without wall-clock gates.
+    /// The probe cache is process-global and several tests below count
+    /// git spawns or invalidate it wholesale; serialize them so one test's
+    /// invalidation cannot discard another's cached or in-flight answer.
+    static PROBE_CACHE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn probe_cache_serial() -> std::sync::MutexGuard<'static, ()> {
+        PROBE_CACHE_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     struct CountingGit {
         _scope: dot_test_support::TempDir,
         log: std::path::PathBuf,
@@ -1598,6 +1692,7 @@ mod tests {
 
     #[test]
     fn repeated_worktree_probes_spawn_git_once_per_distinct_query() {
+        let _serial = probe_cache_serial();
         let git = CountingGit::new("dedup", "https://example/repo.git");
         let repo = git._scope.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).expect("fixture git dir");
@@ -1613,6 +1708,7 @@ mod tests {
 
     #[test]
     fn worktree_probe_cache_clears_per_path_and_globally() {
+        let _serial = probe_cache_serial();
         let git = CountingGit::new("invalidate", "https://example/repo.git");
         let repo = git._scope.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).expect("fixture git dir");
@@ -1633,8 +1729,96 @@ mod tests {
         });
     }
 
+    /// A counting git shim that blocks every call until `release`
+    /// exists, so a test can invalidate while the probe is in flight.
+    /// Returns the gate's scope, which must outlive the shim's use.
+    fn gated_git(tag: &str) -> (CountingGit, PathBuf, dot_test_support::TempDir) {
+        let gate =
+            dot_test_support::TempDir::new(&format!("overlay-gate-{tag}")).expect("gate scope");
+        let release = gate.path().join("release");
+        let git = CountingGit::with_body(
+            tag,
+            &format!(
+                "while [ ! -e '{release}' ]; do sleep 0.01; done\nif [ \"$3\" = rev-parse ]; then printf '%s\\n' \"$2\"; else printf '%s\\n' https://example/repo.git; fi\n",
+                release = release.display(),
+            ),
+        );
+        (git, release, gate)
+    }
+
+    fn wait_for_invocations(git: &CountingGit, count: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while git.invocations() < count {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "probe never reached git ({} invocations)",
+                git.invocations()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn invalidation_during_a_probe_discards_its_answer() {
+        let _serial = probe_cache_serial();
+        let (git, release, _gate) = gated_git("mid-probe");
+        let repo = git._scope.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("fixture git dir");
+        let shim = git.shim.clone();
+        std::thread::scope(|scope| {
+            let probe = scope.spawn(|| {
+                crate::init_client_identity::with_host_git(shim.as_path(), || {
+                    (
+                        is_worktree(&repo),
+                        origin_matches(&repo, "https://example/repo.git"),
+                    )
+                })
+            });
+            // The worktree probe is now blocked inside git: invalidate the
+            // path underneath it, then let it (and the origin probe) finish.
+            wait_for_invocations(&git, 1);
+            invalidate_worktree_path(&repo);
+            std::fs::write(&release, b"").expect("release gate");
+            let (worktree, origin) = probe.join().expect("probe thread");
+            assert!(worktree);
+            assert!(origin.is_ok());
+        });
+        assert_eq!(git.invocations(), 2);
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            // The stale worktree answer was discarded and re-probes; the
+            // origin probe started after the invalidation and stays cached.
+            assert!(is_worktree(&repo));
+            assert!(origin_matches(&repo, "https://example/repo.git").is_ok());
+        });
+        assert_eq!(git.invocations(), 3);
+    }
+
+    #[test]
+    fn invalidating_one_path_keeps_another_paths_in_flight_answer() {
+        let _serial = probe_cache_serial();
+        let (git, release, _gate) = gated_git("other-path");
+        let repo = git._scope.path().join("repo");
+        let other = git._scope.path().join("other");
+        std::fs::create_dir_all(repo.join(".git")).expect("fixture git dir");
+        let shim = git.shim.clone();
+        std::thread::scope(|scope| {
+            let probe = scope.spawn(|| {
+                crate::init_client_identity::with_host_git(shim.as_path(), || is_worktree(&repo))
+            });
+            wait_for_invocations(&git, 1);
+            invalidate_worktree_path(&other);
+            std::fs::write(&release, b"").expect("release gate");
+            assert!(probe.join().expect("probe thread"));
+        });
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            assert!(is_worktree(&repo));
+        });
+        assert_eq!(git.invocations(), 1);
+    }
+
     #[test]
     fn failed_git_spawns_do_not_poison_the_probe_cache() {
+        let _serial = probe_cache_serial();
         let git = CountingGit::new("no-poison", "https://example/repo.git");
         let repo = git._scope.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).expect("fixture git dir");
@@ -1651,6 +1835,7 @@ mod tests {
 
     #[test]
     fn nonzero_git_exit_pins_the_negative_answer() {
+        let _serial = probe_cache_serial();
         // Git's exit status is the semantic authority: a nonzero
         // refusal (broken repository) is definitive and memoizes,
         // unlike a spawn failure, which re-probes.

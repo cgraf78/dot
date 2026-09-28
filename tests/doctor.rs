@@ -1261,18 +1261,17 @@ fn doctor_extension_fixture(tag: &str, extensions: &[(String, Vec<u8>)]) -> (Tem
 /// Run native doctor with a fixed worker window and the fixture's private
 /// `TMPDIR`, returning the output and whether that `TMPDIR` is empty again.
 fn doctor_with_jobs(home: &TempDir, state: &TempDir, jobs: &str) -> (Output, bool) {
+    doctor_with_env(home, state, &[("DOT_DOCTOR_JOBS", jobs)])
+}
+
+/// [`doctor_with_jobs`] with arbitrary job-policy variables.
+fn doctor_with_env(home: &TempDir, state: &TempDir, extra: &[(&str, &str)]) -> (Output, bool) {
     let temporary = home.path().join("tmp");
-    let output = command(
-        false,
-        home,
-        state,
-        &[
-            ("TMPDIR", temporary.to_str().expect("temporary path")),
-            ("DOT_DOCTOR_JOBS", jobs),
-        ],
-    )
-    .output()
-    .expect("native doctor");
+    let mut env = vec![("TMPDIR", temporary.to_str().expect("temporary path"))];
+    env.extend_from_slice(extra);
+    let output = command(false, home, state, &env)
+        .output()
+        .expect("native doctor");
     let clean = std::fs::read_dir(&temporary)
         .expect("temporary directory")
         .next()
@@ -1332,16 +1331,7 @@ fn assert_same_doctor(serial: &Output, parallel: &Output, context: &str) {
 fn parallel_doctor_extensions_run_concurrently() {
     // The earlier extension can only report success if the later one runs
     // while it is still waiting, which a serial loop can never satisfy.
-    let waiter = b"doctor() {\n  local deadline=$((SECONDS + 30))\n  until [[ -e $HOME/later-started ]]; do\n    ((SECONDS < deadline)) || { dot_doctor_fail 'extensions did not overlap'; return 1; }\n    sleep 0.02\n  done\n  dot_doctor_ok 'extensions overlapped'\n}\n";
-    let signaler =
-        b"doctor() {\n  : >\"$HOME/later-started\"\n  dot_doctor_ok 'later extension started'\n}\n";
-    let (home, state) = doctor_extension_fixture(
-        "parallel-overlap",
-        &[
-            ("10-waiter.sh".to_string(), waiter.to_vec()),
-            ("20-signaler.sh".to_string(), signaler.to_vec()),
-        ],
-    );
+    let (home, state) = overlap_fixture("parallel-overlap");
     let (output, clean) = doctor_with_jobs(&home, &state, "2");
     let stdout = String::from_utf8_lossy(&output.stdout);
     // The bare fixture home fails unrelated client checks, so judge the
@@ -1394,24 +1384,71 @@ fn parallel_doctor_output_matches_serial_output() {
 
 #[test]
 fn zero_doctor_jobs_runs_serially() {
-    // `DOT_DOCTOR_JOBS=0` normalizes to one worker like the other job knobs,
-    // so the waiter can never observe the later extension.
-    let waiter = b"doctor() {\n  if [[ -e $HOME/later-started ]]; then dot_doctor_fail 'extensions overlapped'; else dot_doctor_ok 'extensions ran serially'; fi\n}\n";
-    let signaler =
-        b"doctor() {\n  : >\"$HOME/later-started\"\n  dot_doctor_ok 'later extension started'\n}\n";
-    let (home, state) = doctor_extension_fixture(
-        "zero-jobs",
-        &[
-            ("10-waiter.sh".to_string(), waiter.to_vec()),
-            ("20-signaler.sh".to_string(), signaler.to_vec()),
-        ],
-    );
+    // `DOT_DOCTOR_JOBS=0` normalizes to one worker like the other job knobs.
+    let (home, state) = serial_probe_fixture("zero-jobs");
     let (output, clean) = doctor_with_jobs(&home, &state, "0");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("later extension started"),
         "stdout={stdout}"
     );
+    assert!(
+        stdout.contains("extensions ran serially"),
+        "stdout={stdout}"
+    );
+    assert!(clean, "doctor left extension scratch state");
+}
+
+/// Marks that the later extension started, for the waiter fixtures below.
+const SIGNALER: &[u8] =
+    b"doctor() {\n  : >\"$HOME/later-started\"\n  dot_doctor_ok 'later extension started'\n}\n";
+
+fn overlap_fixture(tag: &str) -> (TempDir, TempDir) {
+    let waiter = b"doctor() {\n  local deadline=$((SECONDS + 30))\n  until [[ -e $HOME/later-started ]]; do\n    ((SECONDS < deadline)) || { dot_doctor_fail 'extensions did not overlap'; return 1; }\n    sleep 0.02\n  done\n  dot_doctor_ok 'extensions overlapped'\n}\n";
+    doctor_extension_fixture(
+        tag,
+        &[
+            ("10-waiter.sh".to_string(), waiter.to_vec()),
+            ("20-signaler.sh".to_string(), SIGNALER.to_vec()),
+        ],
+    )
+}
+
+/// A waiter that polls long enough for any concurrent sibling to start, so
+/// only a strictly serial run reports that it never saw one.
+fn serial_probe_fixture(tag: &str) -> (TempDir, TempDir) {
+    let waiter = b"doctor() {\n  local tries\n  for ((tries = 0; tries < 50; tries++)); do\n    [[ -e $HOME/later-started ]] && { dot_doctor_fail 'extensions overlapped'; return 0; }\n    sleep 0.02\n  done\n  dot_doctor_ok 'extensions ran serially'\n}\n";
+    doctor_extension_fixture(
+        tag,
+        &[
+            ("10-waiter.sh".to_string(), waiter.to_vec()),
+            ("20-signaler.sh".to_string(), SIGNALER.to_vec()),
+        ],
+    )
+}
+
+#[test]
+fn doctor_jobs_fall_back_to_update_jobs() {
+    // Without DOT_DOCTOR_JOBS the window follows DOT_UPDATE_JOBS: two
+    // workers let the waiter observe its sibling.
+    let (home, state) = overlap_fixture("update-jobs-parallel");
+    let (output, clean) = doctor_with_env(&home, &state, &[("DOT_UPDATE_JOBS", "2")]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("extensions overlapped"), "stdout={stdout}");
+    assert!(clean, "doctor left extension scratch state");
+}
+
+#[test]
+fn doctor_jobs_override_update_jobs() {
+    // DOT_DOCTOR_JOBS wins over DOT_UPDATE_JOBS: one worker means the
+    // later extension only starts after the earlier one finished.
+    let (home, state) = serial_probe_fixture("doctor-jobs-override");
+    let (output, clean) = doctor_with_env(
+        &home,
+        &state,
+        &[("DOT_DOCTOR_JOBS", "1"), ("DOT_UPDATE_JOBS", "8")],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("extensions ran serially"),
         "stdout={stdout}"
