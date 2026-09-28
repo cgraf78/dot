@@ -168,12 +168,25 @@ fn seed_overlay(scratch: &Scratch, index: usize, files: usize) -> PathBuf {
     git(&seed, &["commit", "-qm", "seed"]);
     git(&seed, &["branch", "-M", "main"]);
     let origin = scratch.path().join(format!("{name}.git"));
+    clone_bare(&seed, &origin);
+    origin
+}
+
+/// Publish `seed` as the bare remote `origin` with `main` as its HEAD.
+///
+/// `--no-local` sends the objects through Git's pack transport instead of
+/// hardlinking or copying the seed's object files one by one. The local fast
+/// path is not safe against a source whose object directory changes during
+/// the copy: CI saw both "hardlink different from source" and a loose object
+/// vanishing mid-copy while building these seeds.
+fn clone_bare(seed: &Path, origin: &Path) {
     let output = Command::new("git")
         .arg("clone")
         .arg("-q")
         .arg("--bare")
-        .arg(&seed)
-        .arg(&origin)
+        .arg("--no-local")
+        .arg(seed)
+        .arg(origin)
         .env("DOT_GIT_REAL", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -184,8 +197,7 @@ fn seed_overlay(scratch: &Scratch, index: usize, files: usize) -> PathBuf {
         "clone bare {seed:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    git(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-    origin
+    git(origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 }
 
 /// Build the shared remotes once: three overlay remotes plus a base
@@ -218,23 +230,7 @@ fn shared_remotes(scratch: &Scratch) -> (Vec<PathBuf>, PathBuf) {
     git(&base_seed, &["commit", "-qm", "seed"]);
     git(&base_seed, &["branch", "-M", "main"]);
     let base_origin = scratch.path().join("base.git");
-    let output = Command::new("git")
-        .arg("clone")
-        .arg("-q")
-        .arg("--bare")
-        .arg(&base_seed)
-        .arg(&base_origin)
-        .env("DOT_GIT_REAL", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("clone bare");
-    assert!(
-        output.status.success(),
-        "clone bare {base_seed:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    git(&base_origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    clone_bare(&base_seed, &base_origin);
     (overlays, base_origin)
 }
 
