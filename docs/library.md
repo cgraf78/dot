@@ -1,6 +1,7 @@
 # Public shell library
 
-The installed `~/.local/lib/dot` link exposes only `lib/dot/public`. Source
+Of `lib/dot`, releases package only `lib/dot/public`, installed at
+`<data-home>/cgraf78/dot/lib/dot/public`. Source
 `api-version.sh` first and require `DOT_LIBRARY_API=1`.
 
 ## XDG API

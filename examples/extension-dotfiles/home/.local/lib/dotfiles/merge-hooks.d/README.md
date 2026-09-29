@@ -1,4 +1,4 @@
 # Client merge hooks
 
-Executable API-1 hook examples will live here once the hook interface is
-implemented. The directory is intentionally client-owned.
+`10-example.sh` is a minimal API-1 merge hook: it defines `merge()` and logs
+through `dot_hook_log`. The directory is intentionally client-owned.
