@@ -960,7 +960,16 @@ fn receive_nested_registration(
     };
     let control_bytes =
         unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) } as usize;
-    let mut ancillary = vec![0usize; control_bytes.div_ceil(std::mem::size_of::<usize>())];
+    // Every session's control worker polls this each millisecond, so keep the
+    // ancillary buffer on the stack: a heap buffer per poll put parallel
+    // sessions behind the static allocator's global lock. `usize` elements
+    // give cmsghdr alignment; one descriptor needs far less than this.
+    let mut ancillary = [0usize; 8];
+    if control_bytes > std::mem::size_of_val(&ancillary) {
+        return Err(std::io::Error::other(
+            "nested control ancillary space exceeds its fixed buffer",
+        ));
+    }
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &mut iovec;
     message.msg_iovlen = 1;
@@ -3384,37 +3393,152 @@ static FORCE_FAKE_PROC_STAT_ESRCH_ROOT: std::sync::Mutex<Option<std::path::PathB
 static FORCE_FAKE_PROC_STAT_DENIED: std::sync::Mutex<Option<std::path::PathBuf>> =
     std::sync::Mutex::new(None);
 
-/// Read one procfs stat file. The test seams inject an exit race (ESRCH)
-/// or a foreign-app denial (EACCES) only for registered fake paths, so
-/// parallel tests using their own roots or the live process table never
-/// observe them.
+/// Registered test fault for one fake stat path. The seams inject an exit
+/// race (ESRCH) or a foreign-app denial (EACCES) only for registered fake
+/// paths, so parallel tests using their own roots or the live process table
+/// never observe them.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+fn injected_proc_stat_error(path: &Path) -> Option<std::io::Error> {
+    if path.starts_with("/proc") {
+        return None;
+    }
+    if FORCE_FAKE_PROC_STAT_DENIED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .is_some_and(|denied| path == denied)
+    {
+        return Some(std::io::Error::from_raw_os_error(libc::EACCES));
+    }
+    if FORCE_FAKE_PROC_STAT_ESRCH_ROOT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .is_some_and(|root| path.starts_with(root))
+    {
+        return Some(std::io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    None
+}
+
+/// Read one procfs stat file.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn read_proc_stat(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut stat = Vec::new();
+    read_proc_stat_into(path, &mut stat)?;
+    Ok(stat)
+}
+
+/// Read one procfs stat file into a caller-owned buffer, replacing its
+/// contents. Reusing the buffer keeps a table walk off the allocator; the
+/// path itself converts through std's on-stack C-string buffer.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_proc_stat_into(path: &Path, stat: &mut Vec<u8>) -> std::io::Result<()> {
     #[cfg(test)]
-    if !path.starts_with("/proc")
-        && FORCE_FAKE_PROC_STAT_DENIED
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .is_some_and(|denied| path == denied)
-    {
-        return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+    if let Some(error) = injected_proc_stat_error(path) {
+        return Err(error);
     }
-    #[cfg(test)]
-    if !path.starts_with("/proc")
-        && FORCE_FAKE_PROC_STAT_ESRCH_ROOT
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .is_some_and(|root| path.starts_with(root))
-    {
-        return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+    stat.clear();
+    File::open(path)?.read_to_end(stat).map(|_| ())
+}
+
+/// Allocation-free directory listing over raw `getdents64` records.
+///
+/// `std::fs::ReadDir` allocates an owned name for every entry. A host-wide
+/// table walk visits every process, and parallel supervisors (one per
+/// concurrent hook) each walk the table on completion; with the static musl
+/// allocator's global lock, per-entry allocation turned those concurrent
+/// walks into a lock convoy whose cost grew with both the host process count
+/// and the number of parallel sessions. One reusable record buffer keeps the
+/// walk entirely off the allocator.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+struct DirentWalk {
+    directory: File,
+    records: Vec<u8>,
+    len: usize,
+    offset: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl DirentWalk {
+    /// Fixed `linux_dirent64` header: inode (8), offset (8), record length
+    /// (2), and type (1) precede the NUL-terminated name.
+    const NAME_OFFSET: usize = 19;
+
+    fn open(root: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        // Match `opendir`: a non-directory root fails at open instead of
+        // blocking (a FIFO) or reaching the record parser.
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(root)?;
+        Ok(Self {
+            directory,
+            records: vec![0; 32 * 1024],
+            len: 0,
+            offset: 0,
+        })
     }
-    std::fs::read(path)
+
+    /// Next entry name, `Ok(None)` at the end of the directory. Any read or
+    /// record-format error reports an incomplete walk.
+    fn next_name(&mut self) -> std::io::Result<Option<&[u8]>> {
+        use std::os::fd::AsRawFd as _;
+
+        while self.offset >= self.len {
+            // SAFETY: the descriptor is owned by `self.directory`, and the
+            // kernel writes at most `records.len()` bytes into the buffer.
+            let read = unsafe {
+                libc::syscall(
+                    libc::SYS_getdents64,
+                    self.directory.as_raw_fd(),
+                    self.records.as_mut_ptr(),
+                    self.records.len(),
+                )
+            };
+            if read < 0 {
+                let error = std::io::Error::last_os_error();
+                // An interrupted call transferred nothing and left the
+                // directory offset unchanged, so retrying cannot skip rows.
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if read == 0 {
+                return Ok(None);
+            }
+            self.len = usize::try_from(read).map_err(|_| std::io::Error::other("getdents64"))?;
+            self.offset = 0;
+        }
+        let start = self.offset;
+        let record = &self.records[start..self.len];
+        let malformed = || std::io::Error::new(std::io::ErrorKind::InvalidData, "dirent record");
+        if record.len() <= Self::NAME_OFFSET {
+            return Err(malformed());
+        }
+        let reclen = usize::from(u16::from_ne_bytes([record[16], record[17]]));
+        if reclen <= Self::NAME_OFFSET || reclen > record.len() {
+            return Err(malformed());
+        }
+        let name = &record[Self::NAME_OFFSET..reclen];
+        let name_len = name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(name.len());
+        self.offset = start + reclen;
+        Ok(Some(
+            &self.records[start + Self::NAME_OFFSET..start + Self::NAME_OFFSET + name_len],
+        ))
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn proc_process_snapshot(root: &Path, deadline: Instant) -> Option<Vec<ProcessInfo>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
     // Check the deadline once: never start past-due work, but never
     // abandon a walk in flight. A thread starved mid-walk would
     // otherwise discard a completable snapshot and report None,
@@ -3424,28 +3548,37 @@ fn proc_process_snapshot(root: &Path, deadline: Instant) -> Option<Vec<ProcessIn
     if Instant::now() >= deadline {
         return None;
     }
-    let entries = match std::fs::read_dir(root) {
+    let mut entries = match DirentWalk::open(root) {
         Ok(entries) => entries,
         Err(_) => return None,
     };
+    // The stat path and contents are rebuilt in place for every entry, so
+    // the only per-walk allocations are these buffers and the result.
+    let mut path = root.as_os_str().as_bytes().to_vec();
+    path.push(b'/');
+    let prefix = path.len();
+    let mut stat = Vec::with_capacity(512);
     let mut processes = Vec::new();
-    for entry in entries {
-        // An iterator error means the directory walk was incomplete. Falling
+    loop {
+        // A listing error means the directory walk was incomplete. Falling
         // back to the fixed OS process-table command is safer than certifying
         // an empty session from a partial view.
-        let entry = match entry {
-            Ok(entry) => entry,
+        let name = match entries.next_name() {
+            Ok(Some(name)) => name,
+            Ok(None) => break,
             Err(_) => return None,
         };
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
+        let Some(pid) = std::str::from_utf8(name)
+            .ok()
             .and_then(|name| name.parse::<u32>().ok())
         else {
             continue;
         };
-        let stat = match read_proc_stat(&entry.path().join("stat")) {
-            Ok(stat) => stat,
+        path.truncate(prefix);
+        path.extend_from_slice(name);
+        path.extend_from_slice(b"/stat");
+        match read_proc_stat_into(Path::new(std::ffi::OsStr::from_bytes(&path)), &mut stat) {
+            Ok(()) => {}
             Err(error) if proc_process_vanished(&error) => continue,
             // Android hides other apps' stat files behind permission errors;
             // those entries cannot be owned descendants, so skip them rather
@@ -3453,7 +3586,7 @@ fn proc_process_snapshot(root: &Path, deadline: Instant) -> Option<Vec<ProcessIn
             #[cfg(target_os = "android")]
             Err(error) if proc_process_foreign(&error) => continue,
             Err(_) => return None,
-        };
+        }
         // A fully-dead (`X`) entry is exited churn, not a partial view: the
         // kernel reports its ppid/pgrp/session as -1/0, which never parses
         // as live topology. Skip it like a vanished entry — a dead process
@@ -3470,14 +3603,14 @@ fn proc_process_snapshot(root: &Path, deadline: Instant) -> Option<Vec<ProcessIn
 #[cfg(any(target_os = "linux", target_os = "android"))]
 /// Post-comm fields of a procfs stat row: everything after the last `") "`
 /// (comm itself may contain parens and spaces). `None` when the row has no
-/// comm terminator — a short or corrupt read.
-fn proc_stat_fields(stat: &[u8]) -> Option<Vec<&[u8]>> {
+/// comm terminator — a short or corrupt read. Lazy, so table walks parse
+/// each row without allocating.
+fn proc_stat_fields(stat: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
     let end = stat.windows(2).rposition(|part| part == b") ")?;
     Some(
         stat[end + 2..]
             .split(|byte| byte.is_ascii_whitespace())
-            .filter(|field| !field.is_empty())
-            .collect(),
+            .filter(|field| !field.is_empty()),
     )
 }
 
@@ -3488,33 +3621,32 @@ fn proc_stat_fields(stat: &[u8]) -> Option<Vec<&[u8]>> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn proc_stat_state(stat: &[u8]) -> Option<u8> {
     proc_stat_fields(stat)?
-        .first()
+        .next()
         .and_then(|state| state.first().copied())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn parse_proc_process(pid: u32, stat: &[u8]) -> Option<ProcessInfo> {
-    let fields = proc_stat_fields(stat)?;
-    let parse = |index: usize| {
-        fields
-            .get(index)
-            .and_then(|field| std::str::from_utf8(field).ok())
-            .and_then(|field| field.parse::<u32>().ok())
-    };
+    fn number<T: std::str::FromStr>(field: Option<&[u8]>) -> Option<T> {
+        std::str::from_utf8(field?).ok()?.parse().ok()
+    }
+    // Fields are consumed in order: state, ppid, pgrp, session, then the
+    // start tick at index 19 (15 fields past the session).
+    let mut fields = proc_stat_fields(stat)?;
+    let state = fields.next()?;
+    let parent = number(fields.next())?;
+    let group = number(fields.next())?;
+    let session = number(fields.next())?;
+    let start = number::<u64>(fields.nth(15))?;
     Some(ProcessInfo {
         pid,
-        parent: parse(1)?,
-        group: parse(2)?,
-        session: parse(3)?,
-        live: fields.first() != Some(&b"Z".as_slice()),
+        parent,
+        group,
+        session,
+        live: state != b"Z",
         identity: ProcessIdentity {
             pid,
-            start: Some(
-                fields
-                    .get(19)
-                    .and_then(|field| std::str::from_utf8(field).ok())
-                    .and_then(|field| field.parse::<u64>().ok())?,
-            ),
+            start: Some(start),
         },
     })
 }
@@ -12979,6 +13111,343 @@ int kill(pid_t pid, int sig) {
         assert!(!proc_process_foreign(&std::io::Error::from(
             std::io::ErrorKind::NotFound
         )));
+    }
+
+    /// Heap allocations made by the current thread. Allocation-sensitive
+    /// paths assert their per-call budget through this counter; it is
+    /// thread-local so parallel tests cannot perturb a measurement.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn thread_allocations() -> u64 {
+        THREAD_ALLOCATIONS.with(std::cell::Cell::get)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    thread_local! {
+        static THREAD_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Counts every allocation on the calling thread and defers to the
+    /// system allocator. The const thread-local has no destructor, so
+    /// counting never allocates; `try_with` tolerates thread teardown.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    struct CountingAllocator;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn count_allocation() {
+        let _ = THREAD_ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+    }
+
+    // SAFETY: every method forwards unchanged to the system allocator.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            count_allocation();
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            count_allocation();
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(
+            &self,
+            ptr: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            count_allocation();
+            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    /// Build a fake procfs root with `count` live rows (PIDs from 1000).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn fake_proc_root(name: &str, count: u32) -> dot_test_support::TempDir {
+        let root = dot_test_support::TempDir::new(name).unwrap();
+        for pid in 1000..1000 + count {
+            let process = root.path().join(pid.to_string());
+            std::fs::create_dir(&process).unwrap();
+            std::fs::write(
+                process.join("stat"),
+                format!("{pid} (stat) S 1 {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 {pid} 0 0"),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn fake_proc_expected(count: u32) -> Vec<ProcessInfo> {
+        (1000..1000 + count)
+            .map(|pid| ProcessInfo {
+                pid,
+                parent: 1,
+                group: pid,
+                session: pid,
+                live: true,
+                identity: ProcessIdentity {
+                    pid,
+                    start: Some(u64::from(pid)),
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn proc_snapshot_allocations_do_not_scale_with_the_table() {
+        // Parallel supervisors each walk the whole table on completion. A
+        // per-row allocation put those walks behind the static allocator's
+        // global lock, so one busy host serialized every parallel hook's
+        // completion. The walk must allocate a fixed handful of buffers
+        // plus amortized result growth, independent of the row count.
+        fn walk_allocations(root: &Path) -> (u64, usize) {
+            let before = thread_allocations();
+            let snapshot = proc_process_snapshot(root, Instant::now() + Duration::from_secs(30))
+                .expect("fake table walk");
+            (thread_allocations() - before, snapshot.len())
+        }
+        let small = fake_proc_root("proc-alloc-small", 50);
+        let large = fake_proc_root("proc-alloc-large", 1500);
+        let (small_allocations, small_rows) = walk_allocations(small.path());
+        let (large_allocations, large_rows) = walk_allocations(large.path());
+        assert_eq!((small_rows, large_rows), (50, 1500));
+        // 30x the rows may add only the result vector's doubling steps.
+        assert!(
+            large_allocations <= small_allocations + 8,
+            "table walk allocations scale with rows: {small_allocations} for 50, \
+             {large_allocations} for 1500"
+        );
+        assert!(
+            large_allocations < 64,
+            "table walk allocated {large_allocations} times for 1500 rows"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn empty_nested_control_poll_does_not_allocate() {
+        // Every session's control worker polls each millisecond; a heap
+        // buffer per poll contended the global allocator lock across
+        // parallel sessions.
+        let (receiver, _sender) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let before = thread_allocations();
+        for _ in 0..100 {
+            assert!(matches!(receive_nested_registration(&receiver), Ok(None)));
+        }
+        assert_eq!(
+            thread_allocations() - before,
+            0,
+            "an empty control poll allocated"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn proc_snapshot_spans_multiple_directory_reads() {
+        // Long non-process names overflow the reusable record buffer many
+        // times over, so every row must survive the buffer refills.
+        let root = fake_proc_root("proc-multi-read", 64);
+        for index in 0..400 {
+            std::fs::write(root.path().join(format!("{index:0>200}x")), b"").unwrap();
+        }
+        let mut snapshot =
+            proc_process_snapshot(root.path(), Instant::now() + Duration::from_secs(30))
+                .expect("multi-read walk");
+        snapshot.sort_by_key(|process| process.pid);
+        assert_eq!(snapshot, fake_proc_expected(64));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn proc_snapshot_rejects_an_unlistable_root() {
+        let scope = dot_test_support::TempDir::new("proc-unlistable").unwrap();
+        let file = scope.path().join("not-a-directory");
+        std::fs::write(&file, b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(proc_process_snapshot(&file, deadline).is_none());
+        assert!(proc_process_snapshot(&scope.path().join("missing"), deadline).is_none());
+        // A FIFO root must fail at open like `opendir`, not block waiting
+        // for a writer. Walk on a helper thread so a regression fails the
+        // bounded wait instead of hanging the suite.
+        let fifo = scope.path().join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo reads one NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(proc_process_snapshot(&fifo, deadline).is_none());
+        });
+        assert_eq!(
+            receive.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "a FIFO root blocked or produced a snapshot"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn proc_stat_parse_requires_every_topology_field() {
+        let zombie = parse_proc_process(9, b"9 (z) Z 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 55 0 0")
+            .expect("zombie row");
+        assert!(!zombie.live);
+        assert_eq!(zombie.identity.start, Some(55));
+        // Missing the start tick (index 19) or a non-numeric topology field
+        // is a corrupt read, never a partial identity.
+        assert_eq!(
+            parse_proc_process(9, b"9 (z) S 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0"),
+            None
+        );
+        assert_eq!(
+            parse_proc_process(9, b"9 (z) S 1 x 9 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 55"),
+            None
+        );
+        assert_eq!(parse_proc_process(9, b"9 (z) "), None);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn concurrent_proc_snapshots_stay_complete() {
+        // Stress the per-walk buffers: parallel walks share no state and
+        // must each return the exact fake table. One live walk per thread
+        // also runs concurrently and must include this process; live walks
+        // cost a full host table each, so they stay few enough not to
+        // starve timing-sensitive tests running beside this one.
+        let root = fake_proc_root("proc-concurrent", 300);
+        let expected = fake_proc_expected(300);
+        let own = std::process::id();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    // Each walk gets its own budget: the deadline is checked
+                    // only at walk start, and a starved runner must not let
+                    // earlier walks spend a later walk's allowance.
+                    let budget = || Instant::now() + Duration::from_secs(30);
+                    for _ in 0..20 {
+                        let mut fake = proc_process_snapshot(root.path(), budget())
+                            .expect("concurrent fake walk");
+                        fake.sort_by_key(|process| process.pid);
+                        assert_eq!(fake, expected);
+                    }
+                    let live = proc_process_snapshot(Path::new("/proc"), budget())
+                        .expect("concurrent live walk");
+                    assert!(
+                        live.iter()
+                            .any(|process| process.pid == own && process.live),
+                        "a concurrent live walk missed this process"
+                    );
+                });
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parallel_completions_do_not_wait_for_unrelated_churn() {
+        // Parallel hook sessions must complete while an unrelated session
+        // keeps orphaning children onto this subreaper. The churner runs
+        // until the test releases it, so every short session returning
+        // first proves completion is not coupled to the churn ending.
+        // Becoming a subreaper is process-wide, so run in a helper process
+        // that cannot reparent other tests' descendants.
+        const HELPER: &str = "DOT_PARALLEL_COMPLETION_CHURN_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cleanup::tests::parallel_completions_do_not_wait_for_unrelated_churn",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "parallel completion churn helper failed with {:?}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        adopt_descendants().unwrap();
+        let scope = dot_test_support::TempDir::new("parallel-completion-churn").unwrap();
+        let started = scope.path().join("started");
+        let release = scope.path().join("release");
+        // Release the churner on every exit path, including a panicking
+        // assertion, so a failure cannot leave it running to its cap.
+        struct Release(PathBuf);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, b"");
+            }
+        }
+        let release_guard = Release(release.clone());
+        let mut churn = Command::new(dot_test_support::bash());
+        // Mark the start only after several orphans exist, so the sessions
+        // below always overlap real churn. The iteration cap bounds a run
+        // whose release never arrives.
+        churn
+            .arg("-c")
+            .arg(
+                "for ((i = 0; i < 6000; i++)); do [[ -e $2 ]] && exit 0; \
+                 ( sleep 0.01 & ); ((i == 5)) && : >\"$1\"; sleep 0.005; done; exit 1",
+            )
+            .arg("churn")
+            .arg(&started)
+            .arg(&release);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let churner =
+            std::thread::spawn(move || supervise_session(churn, Some(deadline), |_| Ok(())));
+        poll_until(Instant::now() + Duration::from_secs(20), || {
+            Ok(started.exists().then_some(()))
+        })
+        .expect("churner never started");
+        let ends = std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|_| {
+                    scope.spawn(move || {
+                        (0..3)
+                            .map(|_| {
+                                supervise_session(Command::new("true"), Some(deadline), |_| Ok(()))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("session worker panicked"))
+                .collect::<Vec<_>>()
+        });
+        let churn_live = !churner.is_finished();
+        drop(release_guard);
+        let churn_end = churner.join().expect("churner panicked");
+        assert_eq!(ends.len(), 24);
+        for end in &ends {
+            assert!(
+                matches!(end, Ok(SessionEnd::Exited(status)) if status.success()),
+                "a parallel session did not complete normally: {end:?}"
+            );
+        }
+        assert!(
+            churn_live,
+            "the churner ended before the sessions completed"
+        );
+        assert!(
+            matches!(churn_end, Ok(SessionEnd::Exited(status)) if status.success()),
+            "the churner was not released: {churn_end:?}"
+        );
     }
 
     #[test]
