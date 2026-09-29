@@ -1392,12 +1392,22 @@ struct ScanFault {
 
 #[cfg(target_os = "linux")]
 fn linux_process_identity(pid: u32) -> Result<Option<LinuxProcessIdentity>, String> {
-    let stat = match fs::read(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(error) if process_vanished(&error) => return Ok(None),
-        Err(error) => return Err(format!("read /proc/{pid}/stat: {error}")),
-    };
-    parse_linux_process_identity(pid, &stat)
+    match read_proc_stat(pid)? {
+        Ok(stat) => parse_linux_process_identity(pid, &stat),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Raw `/proc/<pid>/stat` bytes. The inner error is a vanished row
+/// (ENOENT/ESRCH), kept rather than collapsed so diagnostics can name the
+/// errno; any other read failure is fatal.
+#[cfg(target_os = "linux")]
+fn read_proc_stat(pid: u32) -> Result<Result<Vec<u8>, std::io::Error>, String> {
+    match fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => Ok(Ok(stat)),
+        Err(error) if process_vanished(&error) => Ok(Err(error)),
+        Err(error) => Err(format!("read /proc/{pid}/stat: {error}")),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1462,11 +1472,158 @@ impl LinuxProcessIdentity {
     }
 }
 
+/// Why `bind_process_member` found no pidfd-bound instance matching the
+/// expected identity. Scans treat every variant alike as exited churn; the
+/// variants exist so the command leader, which its supervisor has not
+/// reaped and so should at worst be a zombie, can report which check lost
+/// it.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum MemberLoss {
+    /// `pidfd_open` reported ESRCH: no task held the PID at open time.
+    PidfdMissing,
+    /// The pidfd opened, but the post-open `/proc/<pid>/stat` re-read found
+    /// no row.
+    RowAbsent(std::io::Error),
+    /// The re-read row was fully dead (`observed` is `None`) or described
+    /// another instance.
+    RowMismatch {
+        observed: Option<LinuxProcessIdentity>,
+        row: Vec<u8>,
+    },
+}
+
+/// Bound on the raw stat row quoted in a diagnostic. A stat row is well
+/// under this except for pathological command names, and truncation keeps
+/// a hostile name from flooding test output.
+#[cfg(target_os = "linux")]
+const LOSS_ROW_LIMIT: usize = 256;
+
+#[cfg(target_os = "linux")]
+impl MemberLoss {
+    /// Names the failed check, the expected identity, and the evidence the
+    /// re-read observed.
+    fn describe(&self, expected: &LinuxProcessIdentity) -> String {
+        let cause = match self {
+            MemberLoss::PidfdMissing => "pidfd_open reported ESRCH".to_string(),
+            MemberLoss::RowAbsent(error) => {
+                format!("pidfd opened but the /proc re-read found the row absent ({error})")
+            }
+            MemberLoss::RowMismatch {
+                observed: None,
+                row,
+            } => format!(
+                "pidfd opened but the /proc re-read found a fully-dead row {}",
+                quote_row(row)
+            ),
+            MemberLoss::RowMismatch {
+                observed: Some(observed),
+                row,
+            } => format!(
+                "pidfd opened but the /proc re-read differs in {} with row {}",
+                mismatched_fields(expected, observed),
+                quote_row(row)
+            ),
+        };
+        format!(
+            "{cause}; expected parent={} session={} start={}",
+            expected.parent, expected.session, expected.start
+        )
+    }
+}
+
+/// The identity fields `same_instance` compares that differ, each with both
+/// values.
+#[cfg(target_os = "linux")]
+fn mismatched_fields(expected: &LinuxProcessIdentity, observed: &LinuxProcessIdentity) -> String {
+    [
+        (
+            "parent",
+            u64::from(expected.parent),
+            u64::from(observed.parent),
+        ),
+        (
+            "session",
+            u64::from(expected.session),
+            u64::from(observed.session),
+        ),
+        ("start", expected.start, observed.start),
+    ]
+    .into_iter()
+    .filter(|(_, expected, observed)| expected != observed)
+    .map(|(field, expected, observed)| {
+        format!("{field} (observed {observed}, expected {expected})")
+    })
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+#[cfg(target_os = "linux")]
+fn quote_row(row: &[u8]) -> String {
+    let shown = String::from_utf8_lossy(&row[..row.len().min(LOSS_ROW_LIMIT)]);
+    if row.len() > LOSS_ROW_LIMIT {
+        format!("{shown:?} (truncated from {} bytes)", row.len())
+    } else {
+        format!("{shown:?}")
+    }
+}
+
+/// Process-level reap evidence for a lost leader. An ignored SIGCHLD (or
+/// SA_NOCLDWAIT) auto-reaps exited children, and ECHILD from a non-reaping
+/// wait means something already reaped the leader; either would explain an
+/// owned child vanishing without first lingering as a zombie.
+#[cfg(target_os = "linux")]
+fn leader_reap_context(pid: u32) -> String {
+    // SAFETY: a null new action only queries the current disposition into
+    // zeroed local storage.
+    let sigchld = unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current) != 0 {
+            format!("unknown ({})", std::io::Error::last_os_error())
+        } else if current.sa_sigaction == libc::SIG_IGN {
+            "ignored".to_string()
+        } else if current.sa_flags & libc::SA_NOCLDWAIT != 0 {
+            "nocldwait".to_string()
+        } else {
+            "waitable".to_string()
+        }
+    };
+    // SAFETY: waitid writes only the local siginfo value; WNOWAIT leaves any
+    // exited leader unreaped for its owner.
+    let wait = unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        if libc::waitid(libc::P_PID, pid, &mut info, flags) != 0 {
+            std::io::Error::last_os_error().to_string()
+        } else if info.si_pid() == 0 {
+            "running".to_string()
+        } else {
+            "exited and unreaped".to_string()
+        }
+    };
+    format!("SIGCHLD {sigchld}, waitid {wait}")
+}
+
+/// Opens a pidfd for `pid` and confirms, after the open, that it still
+/// names the `expected` instance. `None` means the instance is gone or the
+/// PID was reused; callers that need to know which should use
+/// `bind_process_member`.
 #[cfg(target_os = "linux")]
 fn open_process_member(
     pid: u32,
     expected: &LinuxProcessIdentity,
 ) -> Result<Option<SessionMember>, String> {
+    Ok(bind_process_member(pid, expected)?.ok())
+}
+
+/// `open_process_member` with the loss reason kept. The re-read row is
+/// captured once and both classified and reported from those same bytes,
+/// so the diagnostic shows exactly what the check saw.
+#[cfg(target_os = "linux")]
+fn bind_process_member(
+    pid: u32,
+    expected: &LinuxProcessIdentity,
+) -> Result<Result<SessionMember, MemberLoss>, String> {
     // SAFETY: pidfd_open takes only the numeric PID and flags. The returned
     // descriptor binds later signals to this process instance, not a reused
     // numeric PID.
@@ -1474,17 +1631,21 @@ fn open_process_member(
     if descriptor < 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(None);
+            return Ok(Err(MemberLoss::PidfdMissing));
         }
         return Err(format!("open pidfd for {pid}: {error}"));
     }
     // SAFETY: pidfd_open returned a new owned descriptor.
     let pidfd = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
-    match linux_process_identity(pid)? {
+    let row = match read_proc_stat(pid)? {
+        Ok(row) => row,
+        Err(error) => return Ok(Err(MemberLoss::RowAbsent(error))),
+    };
+    match parse_linux_process_identity(pid, &row)? {
         Some(identity) if identity.same_instance(expected) => {}
-        _ => return Ok(None),
+        observed => return Ok(Err(MemberLoss::RowMismatch { observed, row })),
     }
-    Ok(Some(SessionMember {
+    Ok(Ok(SessionMember {
         key: ProcessKey {
             pid,
             start: expected.start,
@@ -1660,8 +1821,17 @@ fn process_boundary(
     if identity.session != leader {
         return Err("command leader did not establish the expected session".to_string());
     }
-    let leader_member = open_process_member(leader, &identity)?
-        .ok_or_else(|| "command leader vanished before pidfd validation".to_string())?;
+    // The leader is this supervisor's unreaped child, so it should be at
+    // worst a zombie here. Losing it anyway has been seen once on CI and
+    // never reproduced, so report which check lost it and the reap
+    // evidence instead of a bare message.
+    let leader_member = bind_process_member(leader, &identity)?.map_err(|loss| {
+        format!(
+            "command leader {leader} vanished before pidfd validation: {}; {}",
+            loss.describe(&identity),
+            leader_reap_context(leader)
+        )
+    })?;
     let leader = leader_member.key;
     let scan_fault = match std::env::var_os(SUPERVISOR_SCAN_FAULT_ENV) {
         None => ScanFault::default(),
@@ -5404,6 +5574,88 @@ fn process_identity_ignores_liveness_when_matching_instances() {
     assert!(!live.same_instance(&reused));
     let reparented = LinuxProcessIdentity { parent: 2, ..live };
     assert!(!live.same_instance(&reparented));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn member_loss_names_the_failed_check_and_expected_identity() {
+    let expected = LinuxProcessIdentity {
+        parent: 1,
+        session: 44,
+        start: 777,
+        live: true,
+    };
+    let expected_text = "expected parent=1 session=44 start=777";
+
+    let missing = MemberLoss::PidfdMissing.describe(&expected);
+    assert!(missing.contains("pidfd_open reported ESRCH"), "{missing}");
+    assert!(missing.ends_with(expected_text), "{missing}");
+
+    let absent =
+        MemberLoss::RowAbsent(std::io::Error::from_raw_os_error(libc::ENOENT)).describe(&expected);
+    assert!(absent.contains("row absent"), "{absent}");
+    assert!(
+        absent.contains("os error 2"),
+        "errno must be named: {absent}"
+    );
+    assert!(absent.ends_with(expected_text), "{absent}");
+
+    let dead_row = b"42 (sleep) X 0 -1 -1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 777 0\n".to_vec();
+    let dead = MemberLoss::RowMismatch {
+        observed: None,
+        row: dead_row,
+    }
+    .describe(&expected);
+    assert!(dead.contains("fully-dead row"), "{dead}");
+    assert!(
+        dead.contains(r#""42 (sleep) X 0 -1"#),
+        "row must be quoted: {dead}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn member_loss_names_only_the_mismatched_fields_with_the_row() {
+    let expected = LinuxProcessIdentity {
+        parent: 1,
+        session: 44,
+        start: 777,
+        live: true,
+    };
+    let row = b"42 (sleep) S 9 44 44 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 778 0\n".to_vec();
+    let observed = parse_linux_process_identity(42, &row)
+        .expect("valid row")
+        .expect("live row");
+    let message = MemberLoss::RowMismatch {
+        observed: Some(observed),
+        row,
+    }
+    .describe(&expected);
+    assert!(
+        message.contains(
+            "differs in parent (observed 9, expected 1), start (observed 778, expected 777)"
+        ),
+        "{message}"
+    );
+    assert!(!message.contains("session ("), "{message}");
+    assert!(message.contains(r#""42 (sleep) S 9 44"#), "{message}");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn member_loss_bounds_the_quoted_row() {
+    let mut row = format!("42 ({}) S", "n".repeat(LOSS_ROW_LIMIT)).into_bytes();
+    row.push(b'\n');
+    let quoted = quote_row(&row);
+    assert!(
+        quoted.ends_with(&format!("(truncated from {} bytes)", row.len())),
+        "{quoted}"
+    );
+    assert!(
+        !quoted.contains(") S"),
+        "bytes past the limit must be dropped: {quoted}"
+    );
+    assert_eq!(quote_row(b"1 (a) S\n"), r#""1 (a) S\n""#);
 }
 
 #[test]
