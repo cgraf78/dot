@@ -88,11 +88,233 @@ pub(crate) fn cached_probe(
     Some(answer)
 }
 
+/// Test-only exclusion for the engine's process-global probe caches.
+///
+/// Unit tests that count `git` spawns need the caches to hold still, but
+/// two process-wide effects legitimately reach them from other test
+/// threads through production paths:
+///
+/// - global clears ([`crate::overlays::invalidate_worktree_cache`],
+///   [`crate::repos_config::invalidate_config_cache`],
+///   [`crate::repos_base::invalidate_client_match_cache`]) run after every
+///   hook worker, git passthrough, provider run, and staged clone; and
+/// - a latched handled signal makes every cached probe bypass its cache
+///   (serving a stale hit during teardown would be wrong), and signal
+///   tests latch the process-wide flag while they own the handlers.
+///
+/// Either effect between a counting test's two probes re-spawns `git`
+/// and doubles its count. Rather than making every such test take a lock,
+/// each global-clear chokepoint takes a shared guard, and counting tests
+/// hold the exclusive side plus signal-handler ownership, which every
+/// signal test holds for as long as its handlers can latch. The holding
+/// thread may still clear the caches itself: a thread-local flag skips the
+/// shared guard so it cannot deadlock on its own exclusive lock.
+///
+/// Lock order is signal ownership, then the gate: a signal test can reach
+/// a global clear (the shared side) while owning the handlers, so taking
+/// the gate first could deadlock against it.
+#[cfg(test)]
+pub(crate) mod probe_cache_test_gate {
+    use std::cell::Cell;
+    use std::collections::HashSet;
+    use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+    use std::thread::ThreadId;
+    use std::time::{Duration, Instant};
+
+    static GATE: RwLock<()> = RwLock::new(());
+
+    /// Threads that have reached a gate acquisition (shared or exclusive).
+    /// Lets the gate's own tests prove a worker is at the lock before
+    /// asserting it is held there, instead of inferring it from elapsed
+    /// time. Thread IDs are never reused, so entries never go stale.
+    static ARRIVALS: Mutex<Option<HashSet<ThreadId>>> = Mutex::new(None);
+
+    fn note_arrival() {
+        let mut arrivals = ARRIVALS.lock().unwrap_or_else(PoisonError::into_inner);
+        arrivals
+            .get_or_insert_with(HashSet::new)
+            .insert(std::thread::current().id());
+    }
+
+    /// Wait (bounded) until `thread` has reached a gate acquisition.
+    pub(crate) fn wait_for_arrival(thread: ThreadId, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let arrived = ARRIVALS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|arrivals| arrivals.contains(&thread));
+            if arrived {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    thread_local! {
+        static EXCLUSIVE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Holds the probe caches still for the current test until dropped.
+    pub(crate) struct Exclusive {
+        // Field order is drop order: release the gate before handler
+        // ownership, the reverse of acquisition.
+        _guard: RwLockWriteGuard<'static, ()>,
+        _signals: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Exclusive {
+        fn drop(&mut self) {
+            EXCLUSIVE.with(|flag| flag.set(false));
+        }
+    }
+
+    /// Block every other thread's global clear and signal latch until the
+    /// guard drops.
+    pub(crate) fn exclusive() -> Exclusive {
+        note_arrival();
+        let signals = crate::cleanup::hold_signal_ownership_for_test();
+        let guard = GATE.write().unwrap_or_else(PoisonError::into_inner);
+        EXCLUSIVE.with(|flag| flag.set(true));
+        Exclusive {
+            _guard: guard,
+            _signals: signals,
+        }
+    }
+
+    /// The guard a global clear takes; `None` on the exclusive holder's
+    /// own thread.
+    pub(crate) fn shared() -> Option<RwLockReadGuard<'static, ()>> {
+        if EXCLUSIVE.with(Cell::get) {
+            return None;
+        }
+        note_arrival();
+        Some(GATE.read().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Run `op` on another thread while `held` keeps the probe caches
+    /// still, and prove it waits at the gate: the worker must first be
+    /// observed arriving at a gate acquisition (so it cannot slip past
+    /// after release), then must not finish while the gate is held. The
+    /// "not finished" observation is one-directional and can never fail
+    /// spuriously under load; arrival and resumption get generous bounded
+    /// deadlines.
+    fn held_at_gate_until_release(
+        held: probe_cache_test_gate::Exclusive,
+        op: impl FnOnce() + Send + 'static,
+    ) {
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            op();
+            let _ = done.send(());
+        });
+        assert!(
+            probe_cache_test_gate::wait_for_arrival(worker.thread().id(), Duration::from_secs(30)),
+            "operation never reached the probe cache gate"
+        );
+        assert!(
+            finished.recv_timeout(Duration::from_millis(100)).is_err(),
+            "gated operation completed while the probe caches were held"
+        );
+        drop(held);
+        finished
+            .recv_timeout(Duration::from_secs(30))
+            .expect("gated operation did not resume after release");
+        worker.join().expect("gated worker panicked");
+    }
+
+    #[test]
+    fn probe_cache_gate_holds_foreign_global_clears_until_released() {
+        held_at_gate_until_release(
+            probe_cache_test_gate::exclusive(),
+            crate::repos_config::invalidate_config_cache,
+        );
+        held_at_gate_until_release(
+            probe_cache_test_gate::exclusive(),
+            crate::repos_base::invalidate_client_match_cache,
+        );
+        held_at_gate_until_release(
+            probe_cache_test_gate::exclusive(),
+            crate::overlays::invalidate_worktree_cache,
+        );
+    }
+
+    #[test]
+    fn probe_cache_gate_holds_signal_ownership() {
+        // Deterministic: while the exclusive side is held, no other thread
+        // can own the handlers, so none can latch the process-wide signal.
+        let _held = probe_cache_test_gate::exclusive();
+        let held_elsewhere = std::thread::spawn(crate::cleanup::signal_ownership_is_held_for_test)
+            .join()
+            .expect("probe thread");
+        assert!(
+            held_elsewhere,
+            "exclusive probe cache gate left signal ownership free"
+        );
+    }
+
+    #[test]
+    fn probe_cache_gate_orders_signal_ownership_before_the_gate() {
+        // A signal test can reach a global clear while owning the handlers.
+        // `exclusive()` must therefore wait for handler ownership before
+        // taking the gate; the reverse order would deadlock here (the
+        // counting thread holding the gate, the signal owner waiting on it).
+        let (owner_ready, owner_is_ready) = std::sync::mpsc::channel();
+        let (go, may_clear) = std::sync::mpsc::channel::<()>();
+        let (cleared, owner_cleared) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let _signals = crate::cleanup::hold_signal_ownership_for_test();
+            owner_ready.send(()).expect("owner ready");
+            may_clear.recv().expect("clear order");
+            crate::repos_config::invalidate_config_cache();
+            let _ = cleared.send(());
+        });
+        owner_is_ready
+            .recv_timeout(Duration::from_secs(30))
+            .expect("signal owner did not start");
+        let (counted, counting_done) = std::sync::mpsc::channel();
+        let counter = std::thread::spawn(move || {
+            let _held = probe_cache_test_gate::exclusive();
+            let _ = counted.send(());
+        });
+        assert!(
+            probe_cache_test_gate::wait_for_arrival(counter.thread().id(), Duration::from_secs(30)),
+            "counting thread never reached the gate"
+        );
+        go.send(()).expect("release the signal owner");
+        // Bounded: under the wrong lock order this clear deadlocks, and the
+        // test must fail rather than hang.
+        owner_cleared
+            .recv_timeout(Duration::from_secs(30))
+            .expect("signal owner's clear deadlocked against the counting thread");
+        owner.join().expect("signal owner");
+        counting_done
+            .recv_timeout(Duration::from_secs(30))
+            .expect("counting thread did not acquire the gate after the owner");
+        counter.join().expect("counting thread");
+    }
+
+    #[test]
+    fn probe_cache_gate_holder_may_clear_on_its_own_thread() {
+        // A counting test's own code path (e.g. a config repair) clears
+        // the caches; that must not deadlock on the holder's write lock.
+        let _held = probe_cache_test_gate::exclusive();
+        crate::repos_config::invalidate_config_cache();
+        crate::repos_base::invalidate_client_match_cache();
+        crate::overlays::invalidate_worktree_cache();
+    }
 
     #[test]
     fn memo_probes_once_then_serves_cached_answers() {
