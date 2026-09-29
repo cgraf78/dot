@@ -1,11 +1,20 @@
 # Security and trust model
 
 The convenience `curl | bash` installation trusts TLS and GitHub delivery for
-the installer itself. It requires the GitHub CLI (`gh`), verifies the platform
-archive's published checksum, and then requires a GitHub artifact attestation
-for `cgraf78/dot` whose signer repository is `cgraf78/actions`. The checksum
-detects corruption and binds the requested asset name; the independently
-verified build provenance is the executable-release trust decision.
+the installer itself. It verifies the platform archive's published checksum,
+which detects corruption and binds the requested asset name. When the host can
+verify provenance (GitHub CLI 2.49 or newer, logged in to github.com), it then
+requires a GitHub artifact attestation for `cgraf78/dot` whose signer
+repository is `cgraf78/actions`; that independently verified build provenance
+is the executable-release trust decision, so any verification failure,
+including a missing attestation, stops the install. The host probe only checks
+that `gh` supports verification and holds a github.com token; an expired
+credential or unreachable attestation service therefore fails the install
+rather than falling back. The choice depends only on the host, never on the
+release, so a tampered asset cannot opt out by omitting its attestation. A host
+without a usable `gh`, which includes most fresh hosts, installs on the
+checksum alone and reports that provenance was not verified;
+`--require-attestation` makes that case fail instead.
 
 The installer publishes one immutable versioned release behind an atomic
 stable link and refuses foreign destinations. Caller-supplied local archives
