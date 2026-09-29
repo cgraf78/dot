@@ -129,6 +129,8 @@ pub struct PullOverlayInputs<'a> {
     pub tool: &'a MoveTool,
     /// Logger for headers and warnings.
     pub log: &'a Log,
+    /// Probes started for this update ([`crate::repos_prefetch`]).
+    pub prefetch: Option<&'a crate::repos_prefetch::Prefetch>,
 }
 
 /// One `_ui_status` row to `out`, returning the next live flag.
@@ -334,30 +336,31 @@ pub fn pull_overlay(
         }
         return done(PullOverlayStatus::Skipped, live);
     }
-    let upstream = match prepare_overlay_upstream(Path::new(inputs.path), inputs.optional) {
-        Ok(upstream) => upstream,
-        Err(_) => {
-            if inputs.optional {
-                return done(PullOverlayStatus::Empty, live);
+    let upstream =
+        match prepare_overlay_upstream(Path::new(inputs.path), inputs.optional, inputs.prefetch) {
+            Ok(upstream) => upstream,
+            Err(_) => {
+                if inputs.optional {
+                    return done(PullOverlayStatus::Empty, live);
+                }
+                if counted {
+                    live = ui_row(
+                        inputs.palette,
+                        quiet,
+                        live,
+                        inputs.multibyte,
+                        "warning",
+                        &format!("{name} dotfiles pull failed"),
+                        out,
+                    );
+                } else {
+                    inputs
+                        .log
+                        .warn(warnings, &format!("  warning: {name} dotfiles pull failed"));
+                }
+                return done(PullOverlayStatus::Failed, live);
             }
-            if counted {
-                live = ui_row(
-                    inputs.palette,
-                    quiet,
-                    live,
-                    inputs.multibyte,
-                    "warning",
-                    &format!("{name} dotfiles pull failed"),
-                    out,
-                );
-            } else {
-                inputs
-                    .log
-                    .warn(warnings, &format!("  warning: {name} dotfiles pull failed"));
-            }
-            return done(PullOverlayStatus::Failed, live);
-        }
-    };
+        };
     // Match the base fast path, including local-delta policy and a
     // final HEAD generation check before accepting the checkout.
     let (accept_status, head_before) = accept_current_generation(

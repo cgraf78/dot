@@ -201,7 +201,7 @@ pub fn overlay_count(entries: &[&str]) -> usize {
 
 /// Resolve `@{u}` to its remote name, or `None` when there is no
 /// usable `remote/branch` shape (missing slash, empty remote).
-fn upstream_remote(upstream: &str) -> Option<&str> {
+pub(crate) fn upstream_remote(upstream: &str) -> Option<&str> {
     let (remote, branch) = upstream.split_once('/')?;
     if remote.is_empty() || branch.is_empty() {
         return None;
@@ -261,13 +261,22 @@ pub fn prepare_base_upstream(base: &crate::repos_base::Base) -> Result<String, u
 /// `_repo_prepare_overlay_upstream`: fetch one overlay's upstream
 /// remote and resolve the fetched tip. Same shape as
 /// [`prepare_base_upstream`], except an unresolvable tip is also a 2
-/// and fetch diagnostics stay quiet when `quiet_errors` holds.
-pub fn prepare_overlay_upstream(path: &std::path::Path, quiet_errors: bool) -> Result<String, u8> {
+/// and fetch diagnostics stay quiet when `quiet_errors` holds. The fetch
+/// is skipped when `prefetch` holds a probe proving it would change nothing.
+pub fn prepare_overlay_upstream(
+    path: &std::path::Path,
+    quiet_errors: bool,
+    prefetch: Option<&crate::repos_prefetch::Prefetch>,
+) -> Result<String, u8> {
     let prefix = vec![std::ffi::OsString::from("-C"), path.as_os_str().to_owned()];
     let upstream = upstream_name(&prefix).ok_or(1u8)?;
     let remote = upstream_remote(&upstream).ok_or(1u8)?;
     let fetch = ["fetch", "--quiet", "--no-write-fetch-head", remote];
-    let fetched = if quiet_errors {
+    // A probe started alongside the base fetch may already prove this fetch
+    // would change nothing; see `crate::repos_prefetch`.
+    let fetched = if prefetch.is_some_and(|probes| probes.take_proof(path, &upstream)) {
+        true
+    } else if quiet_errors {
         crate::repos_base::run_git(&prefix, &fetch).is_some_and(|output| output.status.success())
     } else {
         crate::repos_git::run_git_streaming(&prefix, &fetch) == 0

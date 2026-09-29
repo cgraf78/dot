@@ -318,7 +318,7 @@ fn upstream_preparation_covers_success_and_failure_classes() {
         home: pushed.to_string_lossy().into_owned(),
     };
     assert_eq!(prepare_base_upstream(&base), Ok(expected.clone()));
-    assert_eq!(prepare_overlay_upstream(&pushed, true), Ok(expected));
+    assert_eq!(prepare_overlay_upstream(&pushed, true, None), Ok(expected));
 
     let lonely = lonely_repo(&dir, "lonely");
     let base = Base {
@@ -327,7 +327,7 @@ fn upstream_preparation_covers_success_and_failure_classes() {
         home: lonely.to_string_lossy().into_owned(),
     };
     assert_eq!(prepare_base_upstream(&base), Err(1));
-    assert_eq!(prepare_overlay_upstream(&lonely, true), Err(1));
+    assert_eq!(prepare_overlay_upstream(&lonely, true, None), Err(1));
     git(
         &lonely,
         &["remote", "add", "origin", "/definitely/missing/dot.git"],
@@ -337,7 +337,7 @@ fn upstream_preparation_covers_success_and_failure_classes() {
     let head = git(&lonely, &["rev-parse", "HEAD"]);
     git(&lonely, &["update-ref", "refs/remotes/origin/main", &head]);
     assert_eq!(prepare_base_upstream(&base), Err(2));
-    assert_eq!(prepare_overlay_upstream(&lonely, true), Err(2));
+    assert_eq!(prepare_overlay_upstream(&lonely, true, None), Err(2));
     let missing = Base {
         topology: Topology::Missing,
         client_git_dir: String::new(),

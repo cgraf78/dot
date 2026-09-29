@@ -199,6 +199,7 @@ fn run_overlays(
         tmp: fleet._dir.path(),
         tool: &tool,
         log: &log,
+        prefetch: None,
     };
     let mut stage = stage();
     let mut out = Vec::new();
@@ -320,6 +321,7 @@ fn capture_writes_indexed_status_and_result_files() {
         tmp: fleet._dir.path(),
         tool: &tool,
         log: &logger,
+        prefetch: None,
     };
     let result = fleet._dir.path().join("results");
     std::fs::create_dir(&result).expect("results");
@@ -564,6 +566,7 @@ fn run_overlays_live(
         tmp: fleet._dir.path(),
         tool: &tool,
         log: &log,
+        prefetch: None,
     };
     let mut stage = live_stage();
     let mut out = Vec::new();

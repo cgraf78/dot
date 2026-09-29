@@ -202,6 +202,9 @@ pub struct PullOverlaysInputs<'a> {
     pub tool: &'a MoveTool,
     /// Logger for headers and warnings.
     pub log: &'a Log,
+    /// Probes started for this update; a lane skips its fetch only when
+    /// one proves it redundant (`None` outside `dot update`).
+    pub prefetch: Option<&'a crate::repos_prefetch::Prefetch>,
 }
 
 /// Outcome of [`pull_overlays`] and [`pull_overlays_serial`]: the
@@ -243,7 +246,7 @@ fn progress_number(value: Option<&str>) -> i64 {
 /// Job bound from `DOT_UPDATE_JOBS` (numeric, else the CPU count,
 /// minimum one). The verbatim shell spelling may carry leading
 /// zeros; only the numeric value drives the Rust bound.
-fn jobs_bound(raw: Option<&str>) -> usize {
+pub(crate) fn jobs_bound(raw: Option<&str>) -> usize {
     let text = update_jobs(raw.unwrap_or(""));
     text.parse::<usize>().unwrap_or(1).max(1)
 }
@@ -282,6 +285,7 @@ fn overlay_inputs<'a>(
         tmp: inputs.tmp,
         tool: inputs.tool,
         log: inputs.log,
+        prefetch: inputs.prefetch,
     }
 }
 
@@ -555,6 +559,7 @@ fn run_chunk(
                     tmp: inputs.tmp,
                     tool: inputs.tool,
                     log: inputs.log,
+                    prefetch: inputs.prefetch,
                 };
                 let prefix = result_prefix(&dir.to_string_lossy(), idx);
                 let log_path = PathBuf::from(format!("{prefix}.log"));
@@ -1006,6 +1011,9 @@ pub fn pull_all(
         tmp: inputs.tmp,
         tool: inputs.tool,
         log: inputs.log,
+        // Probes belong to `dot update`'s phased convergence, which pulls
+        // its overlays through `pull_overlays` directly.
+        prefetch: None,
     };
     let overlays_outcome = pull_overlays(&overlay_inputs, stage, moves, out, warnings);
     current += overlays_outcome.tally.current as i64;
