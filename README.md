@@ -16,9 +16,13 @@ Install the native release with:
 curl -fsSL https://raw.githubusercontent.com/cgraf78/dot/main/install.sh | bash
 ```
 
-Online installation requires both `curl` and the GitHub CLI (`gh`). The latter
-verifies the downloaded archive's GitHub artifact attestation before it is
-activated.
+Online installation requires `curl`. When the GitHub CLI (`gh`) 2.49 or newer
+is installed and logged in to github.com, the installer also verifies the
+downloaded archive's GitHub artifact attestation before it is activated and
+fails if that verification fails for any reason, including a missing
+attestation or an expired credential. Otherwise, as on most fresh hosts, it
+installs on the published SHA-256 checksum alone and says so; pass
+`--require-attestation` to fail instead. See [security.md](docs/security.md).
 
 To initialize a client in the same operation:
 
@@ -28,8 +32,9 @@ curl -fsSL https://raw.githubusercontent.com/cgraf78/dot/main/install.sh |
 ```
 
 The installer runs on stock macOS Bash 3.2, downloads the platform archive,
-verifies its published checksum and signer-aware attestation from
-`cgraf78/actions`, and atomically selects a versioned release under
+verifies its published checksum (plus its signer-aware attestation from
+`cgraf78/actions` when `gh` can check it), and atomically selects a versioned
+release under
 `${XDG_DATA_HOME:-$HOME/.local/share}/cgraf78`. The `dot` engine is a native
 executable and does not require Bash. Bash 4 or newer is resolved for configured
 shell capabilities: when a user hook or the reviewed Shdeps bootstrap must run,
@@ -47,7 +52,15 @@ That adapter resolves the same standalone release root and executes its native
 binary without sourcing client code. Missing topology reports the reinstall
 command.
 
-Other regular files and directories are rejected throughout.
+The installer rejects other regular files and directories throughout.
+
+A client that instead manages Dot as a Shdeps `github:release` dependency gets
+`<data-home>/cgraf78/dot` as a plain release directory maintained by Shdeps
+rather than a stable link to a versioned release. The native runtime and
+`dot doctor` accept that layout because they identify a packaged release root
+by its `.dot-install.json` metadata, not by the link. This installer does not:
+rerunning it on such a host fails because the stable release root is a
+user-owned directory, so keep updating Dot through Shdeps there.
 
 ## Runtime model
 
