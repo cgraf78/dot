@@ -165,10 +165,13 @@ fi
 # lifecycle tests stop probes that provably started.
 if [[ $op == fetch && $* == *--git-dir=* && -s $ctl/base-gate ]]; then
   want=$(<"$ctl/base-gate")
-  for ((i = 0; i < 3000; i++)); do
+  # Wall-clock bound: slow runners stretch an iteration count arbitrarily,
+  # and supervised probe setup is much slower on some platforms.
+  gate_end=$((SECONDS + 120))
+  while ((SECONDS < gate_end)); do
     have=("$ctl"/hang.*)
     [[ -e ${{have[0]}} && ${{#have[@]}} -ge $want ]] && break
-    sleep 0.01
+    sleep 0.05
   done
 fi
 if [[ -z $op ]]; then
@@ -635,7 +638,13 @@ fn failed_base_pull_abandons_in_flight_probes() {
     // Both probes were in flight when the base pull failed, and the guard
     // stopped them instead of waiting for either to finish.
     let (pids, finished) = held_probes(&fixture.ctl);
-    assert_eq!(pids.len(), 2, "probes held: {pids:?}");
+    assert_eq!(
+        pids.len(),
+        2,
+        "probes held: {pids:?}\nlog: {:?}\nstderr: {}",
+        fixture.log(),
+        String::from_utf8_lossy(&output.stderr)
+    );
     for pid in &pids {
         wait_until("abandoned probe exit", || !alive(pid));
     }
