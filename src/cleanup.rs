@@ -4814,10 +4814,35 @@ pub(crate) fn run_session_output_with_input(
 }
 
 pub(crate) fn run_session_output_typed(
+    command: Command,
+    deadline: Option<Instant>,
+    limit: usize,
+    linger: LingerPolicy,
+) -> std::result::Result<Output, SessionOutputError> {
+    run_session_output_inner(command, deadline, limit, linger, None)
+}
+
+/// [`run_session_output_typed`] for speculative work the caller may stop
+/// needing: once `abandon` is set, the next supervision tick stops the
+/// session through the ordinary graceful teardown and the call fails. The
+/// owner can then join its worker promptly instead of waiting for a slow
+/// remote to answer a question nobody will read.
+pub(crate) fn run_session_output_abandonable(
+    command: Command,
+    deadline: Option<Instant>,
+    limit: usize,
+    linger: LingerPolicy,
+    abandon: &std::sync::atomic::AtomicBool,
+) -> std::result::Result<Output, SessionOutputError> {
+    run_session_output_inner(command, deadline, limit, linger, Some(abandon))
+}
+
+fn run_session_output_inner(
     mut command: Command,
     deadline: Option<Instant>,
     limit: usize,
     linger: LingerPolicy,
+    abandon: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::result::Result<Output, SessionOutputError> {
     let (mut stdout_reader, stdout_writer) =
         SessionCapture::new().map_err(SessionOutputError::Io)?;
@@ -4830,10 +4855,22 @@ pub(crate) fn run_session_output_typed(
     let mut stderr = Vec::new();
     let mut remaining = limit;
     let mut overflowed = false;
+    let mut abandon_reported = false;
     let end = supervise_session_with_completion(
         command,
         deadline,
         |final_pass| {
+            // Report abandonment once, from a live tick. Teardown keeps
+            // calling the tick to drain the capture pipes, and a writer
+            // blocked on a full pipe must still be able to observe its
+            // stop signal and exit.
+            if !final_pass
+                && !abandon_reported
+                && abandon.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+            {
+                abandon_reported = true;
+                return Err(std::io::Error::other("abandoned by owner"));
+            }
             let budget = if final_pass {
                 COMMAND_CAPTURE_FINAL_BYTES
             } else {

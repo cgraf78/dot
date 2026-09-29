@@ -63,6 +63,16 @@ for client-owned prerequisites that genuinely must precede network access (for
 example an SSH host-alias block needed to clone an optional private overlay).
 Generic dot does not interpret the prepared application or transport state.
 
+One read-only exception precedes pre-sync: while the base repository is
+fetched, `dot update` may query the remotes of overlays that are already
+cloned (`git ls-remote`, without a terminal or credential prompts) and later
+skip an overlay fetch that the query proves would change no ref. The queries
+write nothing locally. Any change to the overlay's Git configuration or to
+`~/.ssh/config` after a query, for example by a pre-sync extension, discards
+it, so that overlay is fetched after pre-sync as before. A skipped fetch
+reflects the remote as of the query: normally a few seconds before the round
+that would otherwise have fetched, and never more than a minute.
+
 The configured extension root and every directory component beneath it must be
 real directories, user-owned, and not group/other writable. Implementations
 must also be user-owned, not group/other writable, and have one hard link. A

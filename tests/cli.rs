@@ -1881,6 +1881,11 @@ fn install_runtime_shims(bin: &Path) {
 printf '%s|{tool}|%s|%s\n' "${{DOT_RUNTIME_MARKER-}}" "${{TMPDIR-}}" "${{WSL_DISTRO_NAME-}}" >> "${{DOT_RUNTIME_TRACE}}"
 if [ '{tool}' = git ] && [ -n "${{DOT_RUNTIME_OVERLAY_PATH-}}" ]; then
     case "$*" in
+        *"${{DOT_RUNTIME_OVERLAY_PATH}}"*ls-remote*)
+            # The barrier below needs the foreground overlay fetch; refuse
+            # the speculative probe so it cannot prove that fetch redundant.
+            exit 2
+            ;;
         *"${{DOT_RUNTIME_OVERLAY_PATH}}"*fetch*--no-write-fetch-head*)
             : > "${{DOT_RUNTIME_BARRIER}}/${{DOT_RUNTIME_MARKER}}-ready"
             while [ ! -e "${{DOT_RUNTIME_BARRIER}}/release" ]; do sleep 0.01; done
