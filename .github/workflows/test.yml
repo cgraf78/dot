@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@b57f9e6b52c3f7293273180bb740318e0ca6e3d1
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@6c9657e53123839a51f727faa19f440470cb9e03
     with:
       # Full matrix on every PR: scheduled-only legs let main break
       # silently between daily runs and cannot validate their fixes.
@@ -116,7 +116,7 @@ jobs:
         tar -C .termux-ci -xzf "$archive"
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@b57f9e6b52c3f7293273180bb740318e0ca6e3d1
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@6c9657e53123839a51f727faa19f440470cb9e03
     with:
       matrix-set: full
       profiles: base,python
@@ -224,4 +224,4 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@b57f9e6b52c3f7293273180bb740318e0ca6e3d1
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@6c9657e53123839a51f727faa19f440470cb9e03
