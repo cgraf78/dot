@@ -173,6 +173,9 @@ if [[ $op == fetch && $* == *--git-dir=* && -s $ctl/base-gate ]]; then
     [[ -e ${{have[0]}} && ${{#have[@]}} -ge $want ]] && break
     sleep 0.05
   done
+  # Fail the base fetch itself; hiding the remote instead trips client
+  # identity checks on some platforms before synchronization starts.
+  [[ -e $ctl/base-fetch-fail ]] && exit 128
 fi
 if [[ -z $op ]]; then
   exec {git} "$@"
@@ -628,9 +631,7 @@ fn job_bound_of_one_keeps_remote_work_serial() {
 #[test]
 fn failed_base_pull_abandons_in_flight_probes() {
     let fixture = Fixture::new("prefetch-abandon", 2);
-    let base = fixture.scratch.path().join("base.git");
-    let hidden = fixture.scratch.path().join("base.git.hidden");
-    std::fs::rename(&base, &hidden).expect("hide base remote");
+    fixture.set("base-fetch-fail", true);
     fixture.set("ls-remote-hang", true);
     std::fs::write(fixture.ctl.join("base-gate"), b"2").expect("gate base fetch");
     let output = fixture.update(None);
@@ -653,7 +654,6 @@ fn failed_base_pull_abandons_in_flight_probes() {
         !held_probes(&fixture.ctl).1,
         "a probe finished after abandonment"
     );
-    std::fs::rename(&hidden, &base).expect("restore base remote");
 }
 
 #[test]
