@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@cff4d77cf738c278a8c1279a89b20c9c546d9c5b
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@b57f9e6b52c3f7293273180bb740318e0ca6e3d1
     with:
       # Full matrix on every PR: scheduled-only legs let main break
       # silently between daily runs and cannot validate their fixes.
@@ -26,10 +26,17 @@ jobs:
       msrv-toolchain: "1.85"
       # Wall-clock tests run once, in release mode, in the dedicated Ubuntu
       # performance job below. Keep the portable matrix deterministic.
-      test-command: |
-        cargo test --locked
-        bash tests/run
-        bash tests/release-scripts-test
+      #
+      # Run the Cargo suites and the native-backed shell acceptance suites as
+      # parallel jobs on every platform. Serially they bounded the macOS leg
+      # at roughly their sum; the two halves are close to balanced. Each shard
+      # starts from a fresh runner, so the acceptance shard builds the debug
+      # `dot` binary that `bin/dot` and the suites execute.
+      test-shards: |
+        [
+          {"name": "cargo", "command": "cargo test --locked"},
+          {"name": "acceptance", "command": "cargo build --locked\nbash tests/run\nbash tests/release-scripts-test"}
+        ]
       # Formatting is platform-independent, so check it once on the
       # Ubuntu quality gate (which installs the rustfmt component)
       # instead of on every platform container. The two supervisor
@@ -109,7 +116,7 @@ jobs:
         tar -C .termux-ci -xzf "$archive"
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@cff4d77cf738c278a8c1279a89b20c9c546d9c5b
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@b57f9e6b52c3f7293273180bb740318e0ca6e3d1
     with:
       matrix-set: full
       profiles: base,python
@@ -217,4 +224,4 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@cff4d77cf738c278a8c1279a89b20c9c546d9c5b
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@b57f9e6b52c3f7293273180bb740318e0ca6e3d1
