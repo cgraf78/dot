@@ -22,7 +22,6 @@ const POLL: Duration = Duration::from_millis(20);
 /// HOME/state, and the shim control directory.
 struct Fixture {
     scratch: Scratch,
-    _exec: Scratch,
     overlays: usize,
     home: PathBuf,
     state: PathBuf,
@@ -113,7 +112,6 @@ impl Fixture {
     /// overlays are cloned before any test observes a probe.
     fn new(label: &str, overlays: usize) -> Self {
         let scratch = Scratch::new(label).expect("scratch");
-        let exec = Scratch::new_exec(label).expect("exec scratch");
         for index in 0..overlays {
             let seed = scratch.path().join(format!("overlay-{index}-seed"));
             // Distinct payload names per overlay keep the link pass
@@ -127,7 +125,10 @@ impl Fixture {
         let base_origin = scratch.path().join("base.git");
         clone_bare(&base_seed, &base_origin);
 
-        let shim_dir = exec.path().join("bin");
+        // Dot selects host Git only outside both the client HOME and the Dot
+        // checkout, so the shim lives beside the fixture HOME in scratch
+        // space (as `tests/cli.rs` does), never under the Cargo target dir.
+        let shim_dir = scratch.path().join("bin");
         let ctl = scratch.path().join("shim-ctl");
         std::fs::create_dir_all(&shim_dir).expect("shim dir");
         std::fs::create_dir_all(&ctl).expect("ctl dir");
@@ -194,7 +195,6 @@ exit "$rc"
         std::fs::create_dir_all(&state).expect("state");
         let fixture = Self {
             scratch,
-            _exec: exec,
             overlays,
             home,
             state,
