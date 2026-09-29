@@ -49,6 +49,8 @@ fn config_cache_key(prefix: &[OsString], args: &[&str]) -> Vec<u8> {
 /// Over-invalidation only costs a re-probe; a missed invalidation
 /// would skip a needed config repair.
 pub(crate) fn invalidate_config_cache() {
+    #[cfg(test)]
+    let _gate = crate::memo::probe_cache_test_gate::shared();
     if let Ok(mut cache) = config_cache().lock() {
         cache.clear();
     }
@@ -210,6 +212,7 @@ mod tests {
     #[test]
     fn repeated_ensure_repo_config_reads_once() {
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = ConfigGit::compliant("dedup");
         let repo = git._scope.path().join("repo");
         let prefix = git.prefix(&repo);
@@ -222,8 +225,51 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_global_clears_cannot_double_counted_reads() {
+        // Regression: hook-worker tests on other threads clear the
+        // process-global config cache through the production hook
+        // boundary. A clearer racing the two ensures must wait for the
+        // counting test instead of forcing a re-probe.
+        let _serial = TEST_SERIAL.lock();
+        let cache_still = crate::memo::probe_cache_test_gate::exclusive();
+        let git = ConfigGit::compliant("concurrent-clear");
+        let repo = git._scope.path().join("repo");
+        let prefix = git.prefix(&repo);
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            ensure_repo_config(Some(&prefix));
+        });
+        // Launch the clear only once the cache is populated, and confirm it
+        // reached the gate. Give an unguarded clear time to land before the
+        // second ensure: a gated one cannot finish while the cache is held,
+        // so this wait never affects the passing path.
+        let (done, cleared) = std::sync::mpsc::channel();
+        let clearer = std::thread::spawn(move || {
+            invalidate_config_cache();
+            let _ = done.send(());
+        });
+        assert!(
+            crate::memo::probe_cache_test_gate::wait_for_arrival(
+                clearer.thread().id(),
+                std::time::Duration::from_secs(30)
+            ),
+            "config clear bypassed the probe cache gate"
+        );
+        let _ = cleared.recv_timeout(std::time::Duration::from_millis(100));
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            ensure_repo_config(Some(&prefix));
+        });
+        assert_eq!(git.invocations(), 2);
+        drop(cache_still);
+        cleared
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("config clear did not resume after release");
+        clearer.join().expect("clearer thread");
+    }
+
+    #[test]
     fn ensure_repo_config_rewrites_mismatches_and_reprobes() {
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = ConfigGit::answering("rewrite", "true", "yes");
         let repo = git._scope.path().join("repo");
         let prefix = git.prefix(&repo);
@@ -240,6 +286,7 @@ mod tests {
     #[test]
     fn config_invalidation_reprobes() {
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = ConfigGit::compliant("invalidate");
         let repo = git._scope.path().join("repo");
         let prefix = git.prefix(&repo);
@@ -255,6 +302,7 @@ mod tests {
     #[test]
     fn config_reads_key_prefixes_separately() {
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = ConfigGit::compliant("keys");
         let first = git._scope.path().join("first");
         let second = git._scope.path().join("second");
@@ -272,6 +320,7 @@ mod tests {
     #[test]
     fn config_git_refusals_pin_empty() {
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let scope =
             dot_test_support::TempDir::new_exec("config-refuse").expect("refusing git scope");
         let log = scope.path().join("invocations.log");
@@ -310,6 +359,7 @@ mod tests {
     #[test]
     fn config_read_failures_stay_uncached() {
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = ConfigGit::compliant("no-poison");
         let repo = git._scope.path().join("repo");
         let prefix = git.prefix(&repo);

@@ -175,6 +175,7 @@ impl Fixture {
                 tmp: &self.home,
                 tool: &tool,
                 log: &logger,
+                prefetch: None,
             },
             &mut moves,
             &mut out,

@@ -560,61 +560,12 @@ fn insert_if_current(
     }
 }
 
-/// Test-only exclusion for the process-global probe cache.
-///
-/// Unit tests that count `git` spawns need the cache to hold still, but
-/// many unrelated tests legitimately reach [`invalidate_worktree_cache`]
-/// through production paths (hook workers, repository commands) on other
-/// test threads. Rather than making every such test take a lock, the one
-/// global-clear chokepoint takes a shared guard, and counting tests hold
-/// the exclusive side. The holding thread may still clear the cache
-/// itself: a thread-local flag skips the shared guard so it cannot
-/// deadlock on its own exclusive lock.
-#[cfg(test)]
-pub(crate) mod probe_cache_test_gate {
-    use std::cell::Cell;
-    use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
-
-    static GATE: RwLock<()> = RwLock::new(());
-
-    thread_local! {
-        static EXCLUSIVE: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// Holds the probe cache still for the current test until dropped.
-    pub(crate) struct Exclusive {
-        _guard: RwLockWriteGuard<'static, ()>,
-    }
-
-    impl Drop for Exclusive {
-        fn drop(&mut self) {
-            EXCLUSIVE.with(|flag| flag.set(false));
-        }
-    }
-
-    /// Block every other thread's global clear until the guard drops.
-    pub(crate) fn exclusive() -> Exclusive {
-        let guard = GATE.write().unwrap_or_else(PoisonError::into_inner);
-        EXCLUSIVE.with(|flag| flag.set(true));
-        Exclusive { _guard: guard }
-    }
-
-    /// The guard a global clear takes; `None` on the exclusive holder's
-    /// own thread.
-    pub(super) fn shared() -> Option<RwLockReadGuard<'static, ()>> {
-        if EXCLUSIVE.with(Cell::get) {
-            return None;
-        }
-        Some(GATE.read().unwrap_or_else(PoisonError::into_inner))
-    }
-}
-
 /// Drop every memoized probe answer. Extension hooks run arbitrary
 /// user code that may replace repository directories, so the hook
 /// boundary clears the cache after each execution.
 pub(crate) fn invalidate_worktree_cache() {
     #[cfg(test)]
-    let _gate = probe_cache_test_gate::shared();
+    let _gate = crate::memo::probe_cache_test_gate::shared();
     if let Some(mut cache) = probe_cache() {
         cache.worktree.clear();
         cache.origin.clear();
@@ -1732,7 +1683,7 @@ mod tests {
 
     #[test]
     fn repeated_worktree_probes_spawn_git_once_per_distinct_query() {
-        let _cache_still = super::probe_cache_test_gate::exclusive();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = CountingGit::new("dedup", "https://example/repo.git");
         let repo = git._scope.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).expect("fixture git dir");
@@ -1748,7 +1699,7 @@ mod tests {
 
     #[test]
     fn worktree_probe_cache_clears_per_path_and_globally() {
-        let _cache_still = super::probe_cache_test_gate::exclusive();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = CountingGit::new("invalidate", "https://example/repo.git");
         let repo = git._scope.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).expect("fixture git dir");
@@ -1800,7 +1751,7 @@ mod tests {
 
     #[test]
     fn invalidation_during_a_probe_discards_its_answer() {
-        let _cache_still = super::probe_cache_test_gate::exclusive();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let (git, release, _gate) = gated_git("mid-probe");
         let repo = git._scope.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).expect("fixture git dir");
@@ -1835,7 +1786,7 @@ mod tests {
 
     #[test]
     fn invalidating_one_path_keeps_another_paths_in_flight_answer() {
-        let _cache_still = super::probe_cache_test_gate::exclusive();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let (git, release, _gate) = gated_git("other-path");
         let repo = git._scope.path().join("repo");
         let other = git._scope.path().join("other");
@@ -1858,7 +1809,7 @@ mod tests {
 
     #[test]
     fn failed_git_spawns_do_not_poison_the_probe_cache() {
-        let _cache_still = super::probe_cache_test_gate::exclusive();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = CountingGit::new("no-poison", "https://example/repo.git");
         let repo = git._scope.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).expect("fixture git dir");
@@ -1875,7 +1826,7 @@ mod tests {
 
     #[test]
     fn nonzero_git_exit_pins_the_negative_answer() {
-        let _cache_still = super::probe_cache_test_gate::exclusive();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         // Git's exit status is the semantic authority: a nonzero
         // refusal (broken repository) is definitive and memoizes,
         // unlike a spawn failure, which re-probes.

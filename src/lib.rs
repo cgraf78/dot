@@ -69,6 +69,7 @@ pub mod repos_link_all;
 pub mod repos_link_exec;
 pub mod repos_link_prep;
 pub mod repos_overlays;
+pub mod repos_prefetch;
 pub mod repos_pull;
 pub mod repos_pull_backup;
 pub mod repos_pull_clone;

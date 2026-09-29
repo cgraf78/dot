@@ -1348,6 +1348,27 @@ static FORCE_KILL_VERIFY_CLOSED: std::sync::atomic::AtomicBool =
 static RETAINED_GROUP_KILL_VERIFIES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Hold process-wide signal-handler ownership without installing handlers.
+/// Every test that installs handlers (and so can latch [`received_signal`])
+/// holds this lock for the guard's lifetime, so a holder observes no latch
+/// until it drops the returned guard. See
+/// [`crate::memo::probe_cache_test_gate`].
+#[cfg(test)]
+pub(crate) fn hold_signal_ownership_for_test() -> std::sync::MutexGuard<'static, ()> {
+    SIGNAL_OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether another thread currently owns the signal handlers.
+#[cfg(test)]
+pub(crate) fn signal_ownership_is_held_for_test() -> bool {
+    matches!(
+        SIGNAL_OWNER.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn reset_global_process_snapshot_calls() {
     GLOBAL_PROCESS_SNAPSHOT_CALLS.with(|calls| calls.set(0));
@@ -4946,10 +4967,35 @@ pub(crate) fn run_session_output_with_input(
 }
 
 pub(crate) fn run_session_output_typed(
+    command: Command,
+    deadline: Option<Instant>,
+    limit: usize,
+    linger: LingerPolicy,
+) -> std::result::Result<Output, SessionOutputError> {
+    run_session_output_inner(command, deadline, limit, linger, None)
+}
+
+/// [`run_session_output_typed`] for speculative work the caller may stop
+/// needing: once `abandon` is set, the next supervision tick stops the
+/// session through the ordinary graceful teardown and the call fails. The
+/// owner can then join its worker promptly instead of waiting for a slow
+/// remote to answer a question nobody will read.
+pub(crate) fn run_session_output_abandonable(
+    command: Command,
+    deadline: Option<Instant>,
+    limit: usize,
+    linger: LingerPolicy,
+    abandon: &std::sync::atomic::AtomicBool,
+) -> std::result::Result<Output, SessionOutputError> {
+    run_session_output_inner(command, deadline, limit, linger, Some(abandon))
+}
+
+fn run_session_output_inner(
     mut command: Command,
     deadline: Option<Instant>,
     limit: usize,
     linger: LingerPolicy,
+    abandon: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::result::Result<Output, SessionOutputError> {
     let (mut stdout_reader, stdout_writer) =
         SessionCapture::new().map_err(SessionOutputError::Io)?;
@@ -4962,10 +5008,22 @@ pub(crate) fn run_session_output_typed(
     let mut stderr = Vec::new();
     let mut remaining = limit;
     let mut overflowed = false;
+    let mut abandon_reported = false;
     let end = supervise_session_with_completion(
         command,
         deadline,
         |final_pass| {
+            // Report abandonment once, from a live tick. Teardown keeps
+            // calling the tick to drain the capture pipes, and a writer
+            // blocked on a full pipe must still be able to observe its
+            // stop signal and exit.
+            if !final_pass
+                && !abandon_reported
+                && abandon.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+            {
+                abandon_reported = true;
+                return Err(std::io::Error::other("abandoned by owner"));
+            }
             let budget = if final_pass {
                 COMMAND_CAPTURE_FINAL_BYTES
             } else {

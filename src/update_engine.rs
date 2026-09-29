@@ -563,6 +563,7 @@ pub fn sync_repos(
             None,
             None,
             false,
+            None,
         );
     };
     // Capture the already-installed generation before pull
@@ -578,6 +579,10 @@ pub fn sync_repos(
             };
         }
     };
+    // Probe already-cloned overlays while the base fetch runs; the overlay
+    // rounds below skip only fetches a probe proves would change nothing.
+    // The guard lives until this phase returns, abandoning unused probes.
+    let prefetch = start_prefetch(inputs);
     // `OVERLAYS=()` plus the deferred base pull.
     let candidate = pull_candidate(inputs, &[]);
     let pull_inputs = crate::repos_pull_fleet::PullAllInputs {
@@ -656,6 +661,7 @@ pub fn sync_repos(
         Some(base),
         Some(snapshot),
         outcome.deferred,
+        Some(&prefetch),
     )
 }
 
@@ -679,9 +685,10 @@ fn sync_tail(
     base: Option<&Base>,
     snapshot: Option<InstalledSnapshot>,
     close_active: bool,
+    prefetch: Option<&crate::repos_prefetch::Prefetch>,
 ) -> SyncDone {
     let mut io = UpdateIo { out, err };
-    let mut conv = converge_overlays(inputs, state, stage, moves, &mut io);
+    let mut conv = converge_overlays(inputs, state, stage, moves, &mut io, prefetch);
     agg.fold_agg(&conv.overlay);
     if conv.rc != 0 {
         if close_active {
@@ -758,6 +765,7 @@ fn pull_overlays_only(
     err: &mut dyn std::io::Write,
     progress_done: &str,
     progress_total: &str,
+    prefetch: Option<&crate::repos_prefetch::Prefetch>,
 ) -> crate::repos_pull_fleet::PullOverlaysOutcome {
     // The overlay lanes need a base for the restore walk; without
     // one the missing topology reads untracked, like the shell's
@@ -774,6 +782,11 @@ fn pull_overlays_only(
             &fallback
         }
     };
+    // Let in-flight probes finish (or abandon them) before the lanes start,
+    // so probes and fetches never exceed the job bound together.
+    if let Some(probes) = prefetch {
+        probes.settle();
+    }
     crate::repos_pull_fleet::pull_overlays(
         &crate::repos_pull_fleet::PullOverlaysInputs {
             entries,
@@ -801,6 +814,7 @@ fn pull_overlays_only(
             tmp: inputs.tmp,
             tool: inputs.tool,
             log: inputs.log,
+            prefetch,
         },
         stage,
         moves,
@@ -823,6 +837,7 @@ fn converge_overlays(
     stage: &mut Stage,
     moves: &mut crate::temp::MoveCache,
     io: &mut UpdateIo<'_>,
+    prefetch: Option<&crate::repos_prefetch::Prefetch>,
 ) -> ConvergeOut {
     let fail = |state: UpdateState, overlay: Agg| ConvergeOut {
         rc: 1,
@@ -841,7 +856,7 @@ fn converge_overlays(
         return fail(update, overlay);
     }
     if update.profiles.present {
-        return converge_profiles(inputs, stage, moves, io, update, overlay);
+        return converge_profiles(inputs, stage, moves, io, update, overlay, prefetch);
     }
     let mut dstate = crate::overlays::State::default();
     if discover_active(inputs, &mut dstate, io.err).is_err() {
@@ -908,6 +923,7 @@ fn converge_overlays(
             "0"
         },
         &(1 + count).to_string(),
+        prefetch,
     );
     overlay.fold_overlay(&outcome);
     let failed = outcome.tally.failed;
@@ -936,6 +952,7 @@ fn converge_profiles(
     io: &mut UpdateIo<'_>,
     mut update: UpdateState,
     mut overlay: Agg,
+    prefetch: Option<&crate::repos_prefetch::Prefetch>,
 ) -> ConvergeOut {
     let fail = |state: UpdateState, overlay: Agg| ConvergeOut {
         rc: 1,
@@ -1015,6 +1032,7 @@ fn converge_profiles(
             "0"
         },
         &(1 + count).to_string(),
+        prefetch,
     );
     overlay.fold_overlay(&outcome);
     let phase_ok =
@@ -1119,6 +1137,7 @@ fn converge_profiles(
             "0"
         },
         &(1 + pull_overlay_count(&additions)).to_string(),
+        prefetch,
     );
     overlay.fold_overlay(&outcome);
     let additions_ok =
@@ -1138,6 +1157,32 @@ fn converge_profiles(
     } else {
         fail(update, overlay)
     }
+}
+
+/// Start overlay probes for the checkouts the current descriptors already
+/// activate. Discovery here is silent and best effort: the authoritative
+/// discovery (and its diagnostics) still runs in each round, and a probe for
+/// an overlay no round selects is simply abandoned.
+fn start_prefetch(inputs: &EngineInputs<'_>) -> crate::repos_prefetch::Prefetch {
+    let mut state = crate::overlays::State::default();
+    let mut discarded = Vec::new();
+    let paths: Vec<String> = if discover_active(inputs, &mut state, &mut discarded).is_ok() {
+        state
+            .active
+            .iter()
+            .map(|record| crate::repos_base::overlay_path_sync(record))
+            .filter(|(path, sync)| sync == "git" && crate::overlays::is_worktree(Path::new(path)))
+            .map(|(path, _)| path)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let ssh_config = Path::new(inputs.home).join(".ssh/config");
+    // `DOT_UPDATE_JOBS` bounds concurrent remote work. The base fetch holds
+    // one slot while probes run, so a bound of one keeps the old strictly
+    // serial behavior.
+    let limit = crate::repos_pull_fleet::jobs_bound(inputs.update_jobs).saturating_sub(1);
+    crate::repos_prefetch::start(&paths, &ssh_config, limit)
 }
 
 /// Discover the eligible or active set into `entries`, mirroring
