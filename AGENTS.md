@@ -12,8 +12,11 @@ packaging, and test-harness boundaries.
 - `src/main.rs` is a thin adapter: exit-code passthrough only.
 - `bin/dot` is the development adapter for the native binary; releases install
   the compiled `dot` executable directly.
-- `build.rs` resolves `DOT_BUILD_COMMIT`/`DOT_BUILD_VERSION`; the
-  `unknown` fallback is contract (`dot version` prints it, never fails).
+- `build.rs` resolves `DOT_BUILD_COMMIT`/`DOT_BUILD_VERSION` strictly from
+  `DOT_BUILD_COMMIT`, then `GITHUB_SHA`, then `git rev-parse HEAD`. An
+  unresolvable or malformed commit, or an invalid version, fails the build
+  instead of baking in `unknown`. Set `DOT_BUILD_COMMIT` to a concrete hash
+  when building outside a git checkout.
 - Public shell API boundaries (`lib/dot/public/*`, `hook-api-v1.tsv`,
   `doctor-api-v1.tsv`, `test-api-v1.tsv`) are compatibility constraints.
 

@@ -33,7 +33,7 @@ runtime or test dependency.
 | `lib/dot/public/{doctor-api-v1.tsv,hook-api-v1.tsv,test-api-v1.tsv}` | New standalone interfaces | Machine-readable public boundary inventories |
 | `lib/dot/public/test-timeout-v1` | `dotfiles:.local/lib/dotfiles/tests/timeout.py` at `dotfiles-v2` | Versioned portable timeout command for suites and provider-owned descendant cleanup |
 | `lib/dot/public/test-reporter-v1` | New standalone interface | Language-neutral, single-terminal-record result transport for executable suites |
-| `support/client-launcher.sh` | New standalone release boundary | Installs or invokes a verified native release artifact; it is not an engine fallback |
+| `support/client-launcher.sh` | New standalone compatibility adapter | Resolves the standalone release root, checks its layout, and executes the native binary; it is not an engine fallback |
 
 ## Test provenance
 

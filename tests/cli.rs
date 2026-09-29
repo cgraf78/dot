@@ -1047,7 +1047,7 @@ fn test_help_has_the_public_byte_contract() {
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "usage: dot test [-s|--sequential] [-v|--verbose] [-j N|--jobs N] [--list] [name ...]\n\
+        "usage: dot test [-s|--sequential] [-v|--verbose] [-j N|--jobs N] [-l|--list] [name ...]\n\
          \n\
          Set DOT_TEST_INCLUDE_PROVIDER=1 to include the provider suite in an\n\
          unfiltered run. Select `dot` by name to run only the provider suite.\n",

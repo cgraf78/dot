@@ -114,11 +114,18 @@ select exact or prefix subsets.
 ## Development
 
 ```bash
-tests/run
+cargo build --locked
+cargo test --locked
+bash tests/run
+bash tests/release-scripts-test
 ```
 
-The provider entry point runs its independent test files concurrently through
-the same bounded coordinator used by `dot test`.
+`cargo test --locked` runs the Rust unit and integration suites. `tests/run`
+drives the native binary through `bin/dot`, which requires a prior
+`cargo build --locked`. The provider entry point runs its independent test
+files concurrently through the same bounded coordinator used by `dot test`.
+`tests/release-scripts-test` covers the release, packaging, and benchmark
+scripts; `tests/run` skips it, so CI runs it separately.
 
 The project uses the shared Rust Linux, macOS, musl, Android, and Termux matrix,
 plus a shell matrix for the installer and public hook APIs.

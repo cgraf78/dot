@@ -134,7 +134,7 @@ fn prepare<'a>(
             }
             b"-l" | b"--list" => list = true,
             b"-h" | b"--help" => {
-                streams.stdout.write_all(b"usage: dot test [-s|--sequential] [-v|--verbose] [-j N|--jobs N] [--list] [name ...]\n\nSet DOT_TEST_INCLUDE_PROVIDER=1 to include the provider suite in an\nunfiltered run. Select `dot` by name to run only the provider suite.\n").map_err(|_| (1, String::new()))?;
+                streams.stdout.write_all(b"usage: dot test [-s|--sequential] [-v|--verbose] [-j N|--jobs N] [-l|--list] [name ...]\n\nSet DOT_TEST_INCLUDE_PROVIDER=1 to include the provider suite in an\nunfiltered run. Select `dot` by name to run only the provider suite.\n").map_err(|_| (1, String::new()))?;
                 return Ok(None);
             }
             raw if raw.starts_with(b"--jobs=") => {
