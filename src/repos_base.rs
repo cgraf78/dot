@@ -381,6 +381,8 @@ fn client_match_key(record: &crate::init_client_record::TransactionRecord, home:
 /// no call. Over-invalidation only costs a re-probe; a missed
 /// invalidation would trust a replaced checkout.
 pub(crate) fn invalidate_client_match_cache() {
+    #[cfg(test)]
+    let _gate = crate::memo::probe_cache_test_gate::shared();
     if let Ok(mut cache) = client_match_cache().lock() {
         cache.clear();
     }
@@ -621,6 +623,7 @@ mod tests {
     #[test]
     fn repeated_legacy_validation_probes_git_once() {
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = LegacyGit::new("dedup", true);
         let runtime = git.runtime();
         assert!(git.valid(&runtime));
@@ -633,6 +636,7 @@ mod tests {
     #[test]
     fn legacy_validation_invalidation_reprobes() {
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = LegacyGit::new("invalidate", true);
         let runtime = git.runtime();
         assert!(git.valid(&runtime));
@@ -646,6 +650,7 @@ mod tests {
         // The verdict is bound to the directory's device and inode, so a
         // directory swapped in under the same path is validated afresh.
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = LegacyGit::new("replaced", true);
         let runtime = git.runtime();
         assert!(git.valid(&runtime));
@@ -659,6 +664,7 @@ mod tests {
     #[test]
     fn legacy_validation_failures_stay_uncached() {
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = LegacyGit::new("foreign", false);
         let runtime = git.runtime();
         assert!(!git.valid(&runtime));
@@ -671,6 +677,7 @@ mod tests {
     #[test]
     fn repeated_client_matches_probes_git_once() {
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = IdentityGit::matching("dedup");
         let record = git.record("main");
         crate::init_client_identity::with_host_git(git.shim.as_path(), || {
@@ -681,8 +688,50 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_global_clears_cannot_double_counted_client_probes() {
+        // Regression: hook-worker tests on other threads clear the
+        // process-global client-match cache through the production hook
+        // boundary. A clearer racing the two matches must wait for the
+        // counting test instead of forcing a re-probe.
+        let _serial = TEST_SERIAL.lock();
+        let cache_still = crate::memo::probe_cache_test_gate::exclusive();
+        let git = IdentityGit::matching("concurrent-clear");
+        let record = git.record("main");
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            assert!(client_matches(&record, &git.home));
+        });
+        // Launch the clear only once the cache is populated, and confirm it
+        // reached the gate. Give an unguarded clear time to land before the
+        // second match: a gated one cannot finish while the cache is held,
+        // so this wait never affects the passing path.
+        let (done, cleared) = std::sync::mpsc::channel();
+        let clearer = std::thread::spawn(move || {
+            invalidate_client_match_cache();
+            let _ = done.send(());
+        });
+        assert!(
+            crate::memo::probe_cache_test_gate::wait_for_arrival(
+                clearer.thread().id(),
+                std::time::Duration::from_secs(30)
+            ),
+            "client-match clear bypassed the probe cache gate"
+        );
+        let _ = cleared.recv_timeout(std::time::Duration::from_millis(100));
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            assert!(client_matches(&record, &git.home));
+        });
+        assert_eq!(git.invocations(), 5);
+        drop(cache_still);
+        cleared
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("client-match clear did not resume after release");
+        clearer.join().expect("clearer thread");
+    }
+
+    #[test]
     fn client_matches_keys_homes_separately() {
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let first = IdentityGit::matching("first");
         let second = IdentityGit::matching("second");
         let first_record = first.record("main");
@@ -702,6 +751,7 @@ mod tests {
     #[test]
     fn client_match_invalidation_reprobes() {
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = IdentityGit::matching("invalidate");
         let record = git.record("main");
         crate::init_client_identity::with_host_git(git.shim.as_path(), || {
@@ -716,6 +766,7 @@ mod tests {
     #[test]
     fn client_matches_mismatches_stay_uncached() {
         let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
         let git = IdentityGit::answering("mismatch", "other", "/elsewhere");
         let record = git.record("main");
         crate::init_client_identity::with_host_git(git.shim.as_path(), || {

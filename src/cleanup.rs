@@ -1339,6 +1339,27 @@ static FORCE_KILL_VERIFY_CLOSED: std::sync::atomic::AtomicBool =
 static RETAINED_GROUP_KILL_VERIFIES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Hold process-wide signal-handler ownership without installing handlers.
+/// Every test that installs handlers (and so can latch [`received_signal`])
+/// holds this lock for the guard's lifetime, so a holder observes no latch
+/// until it drops the returned guard. See
+/// [`crate::memo::probe_cache_test_gate`].
+#[cfg(test)]
+pub(crate) fn hold_signal_ownership_for_test() -> std::sync::MutexGuard<'static, ()> {
+    SIGNAL_OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether another thread currently owns the signal handlers.
+#[cfg(test)]
+pub(crate) fn signal_ownership_is_held_for_test() -> bool {
+    matches!(
+        SIGNAL_OWNER.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn reset_global_process_snapshot_calls() {
     GLOBAL_PROCESS_SNAPSHOT_CALLS.with(|calls| calls.set(0));
