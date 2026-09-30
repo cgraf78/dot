@@ -742,9 +742,12 @@ fn prepare_inner(
 }
 
 /// Run one prepared Shdeps update and return its rendered result metadata.
+///
+/// The preparation is borrowed so the same validated provider snapshot can
+/// serve a later [`prune`] in this update without a second bootstrap.
 pub(crate) fn update(
     inputs: &Inputs<'_>,
-    prepared: Prepared,
+    prepared: &Prepared,
     stage: &mut crate::progress_ui::Stage,
     live_out: &mut dyn std::io::Write,
     live_err: &mut dyn std::io::Write,
@@ -1482,34 +1485,11 @@ fn run_update(
     beat: &mut crate::progress_ui::Heartbeat,
 ) -> Outcome {
     let before = crate::shdeps::active_revision(inputs.source_root);
-    let mut env = ready.env.clone();
-    set(&mut env, "SHDEPS_DIR", ready.directory.as_os_str());
-    let path = env.get(OsStr::new("PATH")).cloned().unwrap_or_default();
-    let mut provider_path = env
-        .get(OsStr::new("SHDEPS_BIN_DIR"))
-        .cloned()
-        .unwrap_or_default();
-    provider_path.push(OsStr::new(":"));
-    provider_path.push(path);
-    set(&mut env, "PATH", provider_path);
-    set(&mut env, "SHDEPS_NESTED", "1");
+    let mut env = provider_env(inputs, ready);
     set(&mut env, "SHDEPS_PROGRESS", "jsonl");
     let mut prompt = prompt_pipe(inputs.runtime);
     if let Some(pipe) = &prompt {
         set(&mut env, "SHDEPS_PROGRESS_PROMPT_ACK", &pipe.path);
-    }
-    if inputs.runtime.value("SHDEPS_JOBS").is_none() {
-        let jobs = crate::merges::update_jobs(inputs.update_jobs.unwrap_or_default());
-        set(&mut env, "SHDEPS_JOBS", jobs);
-    }
-    if inputs
-        .runtime
-        .value("DOT_SHDEPS_ALLOW_GH_AUTH_TOKEN")
-        .and_then(OsStr::to_str)
-        == Some("1")
-        && inputs.runtime.value("SHDEPS_ALLOW_GH_AUTH_TOKEN").is_none()
-    {
-        set(&mut env, "SHDEPS_ALLOW_GH_AUTH_TOKEN", "1");
     }
     let mut command = Command::new(&ready.binary);
     crate::bash::sanitized_env(&mut command, &env);
@@ -1893,6 +1873,179 @@ fn run_update(
             details,
             revision_change: None,
         }
+    }
+}
+
+/// Execution environment shared by every provider command Dot runs from one
+/// preparation: the sanitized preparation state plus the provider directory,
+/// its bin directory first on `PATH`, the nested-caller marker, and the
+/// job/token policy. Progress and prompt wiring are `update`-specific.
+fn provider_env(inputs: &Inputs<'_>, ready: &Ready) -> BTreeMap<OsString, OsString> {
+    let mut env = ready.env.clone();
+    set(&mut env, "SHDEPS_DIR", ready.directory.as_os_str());
+    let path = env.get(OsStr::new("PATH")).cloned().unwrap_or_default();
+    let mut provider_path = env
+        .get(OsStr::new("SHDEPS_BIN_DIR"))
+        .cloned()
+        .unwrap_or_default();
+    provider_path.push(OsStr::new(":"));
+    provider_path.push(path);
+    set(&mut env, "PATH", provider_path);
+    set(&mut env, "SHDEPS_NESTED", "1");
+    if inputs.runtime.value("SHDEPS_JOBS").is_none() {
+        let jobs = crate::merges::update_jobs(inputs.update_jobs.unwrap_or_default());
+        set(&mut env, "SHDEPS_JOBS", jobs);
+    }
+    if inputs
+        .runtime
+        .value("DOT_SHDEPS_ALLOW_GH_AUTH_TOKEN")
+        .and_then(OsStr::to_str)
+        == Some("1")
+        && inputs.runtime.value("SHDEPS_ALLOW_GH_AUTH_TOKEN").is_none()
+    {
+        set(&mut env, "SHDEPS_ALLOW_GH_AUTH_TOKEN", "1");
+    }
+    env
+}
+
+/// Result of one `shdeps prune -y` run, consumed by Dot's Prune stage.
+pub(crate) struct PruneOutcome {
+    /// Provider exit status; `1` when supervision or capture failed.
+    pub(crate) status: i32,
+    /// Trusted cancellation signal when the run was interrupted.
+    pub(crate) interrupted: Option<i32>,
+    /// Teardown could not prove every provider process stopped; the caller
+    /// must stop the update like the Tools stage does.
+    pub(crate) abort: bool,
+    /// Captured stdout: the provider's removal report.
+    pub(crate) stdout: Vec<u8>,
+    /// Captured stderr: provider warnings (for example a failed uninstall
+    /// hook), plus Dot's own truncation diagnostic.
+    pub(crate) stderr: Vec<u8>,
+}
+
+/// Capture sink that keeps the first `remaining` bytes and discards the rest
+/// without failing. Prune output is a report, not a protocol: stopping the
+/// provider mid-removal because an uninstall hook was chatty would leave
+/// state half-removed on every run.
+struct TruncatingCapture<'a> {
+    output: &'a mut Vec<u8>,
+    remaining: usize,
+    truncated: bool,
+}
+
+impl std::io::Write for TruncatingCapture<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let keep = bytes.len().min(self.remaining);
+        self.output.extend_from_slice(&bytes[..keep]);
+        self.remaining -= keep;
+        self.truncated |= keep < bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Remove orphaned dependencies with the provider this update already
+/// prepared and ran.
+///
+/// Reusing the preparation binds prune to the same ABI-validated snapshot and
+/// the same `SHDEPS_CONF_DIR` the Tools stage converged, instead of whatever
+/// `shdeps` happens to be first on the caller's `PATH`. Output is captured
+/// and rendered by the caller after exit (prune emits plain rows, not
+/// progress events); each stream keeps its first
+/// [`PROVIDER_CAPTURE_LIMIT_BYTES`] and discards the rest rather than
+/// stopping the provider. Stdin is closed, but like the Tools stage the
+/// provider keeps the caller's controlling terminal: an uninstall hook that
+/// needs `sudo` can prompt on an interactive terminal, while cron (no
+/// terminal) fails that hook instead of waiting.
+pub(crate) fn prune(inputs: &Inputs<'_>, prepared: &Prepared) -> PruneOutcome {
+    let failed = |stderr: Vec<u8>| PruneOutcome {
+        status: 1,
+        interrupted: None,
+        abort: false,
+        stdout: Vec::new(),
+        stderr,
+    };
+    let ready = &prepared.0;
+    let env = provider_env(inputs, ready);
+    let mut command = Command::new(&ready.binary);
+    crate::bash::sanitized_env(&mut command, &env);
+    let (Ok(mut stdout_capture), Ok(mut stderr_capture)) =
+        (CaptureStream::new(), CaptureStream::new())
+    else {
+        return failed(Vec::new());
+    };
+    let (Ok(stdout_writer), Ok(stderr_writer)) =
+        (stdout_capture.child_stdio(), stderr_capture.child_stdio())
+    else {
+        return failed(Vec::new());
+    };
+    command
+        .args(["prune", "-y"])
+        .current_dir(&ready.directory)
+        .stdin(Stdio::null())
+        .stdout(stdout_writer)
+        .stderr(stderr_writer);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut stdout_sink = TruncatingCapture {
+        output: &mut stdout,
+        remaining: PROVIDER_CAPTURE_LIMIT_BYTES,
+        truncated: false,
+    };
+    let mut stderr_sink = TruncatingCapture {
+        output: &mut stderr,
+        remaining: PROVIDER_CAPTURE_LIMIT_BYTES,
+        truncated: false,
+    };
+    let mut relay_failed = false;
+    let finished = crate::cleanup::supervise_child(command, None, |final_pass| {
+        drain_capture_streams(
+            &mut stdout_capture,
+            &mut stdout_sink,
+            &mut stderr_capture,
+            &mut stderr_sink,
+            final_pass,
+            &mut relay_failed,
+        )
+    });
+    let truncated = stdout_sink.truncated || stderr_sink.truncated;
+    if truncated {
+        stderr.extend_from_slice(
+            format!(
+                "  warning: shdeps prune output exceeded {PROVIDER_CAPTURE_LIMIT_BYTES} bytes; the rest was discarded\n"
+            )
+            .as_bytes(),
+        );
+    }
+    let (status, interrupted) = match finished {
+        Ok(crate::cleanup::SessionEnd::Exited(status)) => {
+            let status = status.code().unwrap_or(1);
+            (status, provider_interruption(status))
+        }
+        Ok(crate::cleanup::SessionEnd::Interrupted(signal)) => (1, Some(signal)),
+        Ok(crate::cleanup::SessionEnd::TimedOut) => (1, None),
+        Ok(crate::cleanup::SessionEnd::CleanupIncomplete) => {
+            return PruneOutcome {
+                status: crate::cleanup::CLEANUP_INCOMPLETE_STATUS,
+                interrupted: None,
+                abort: true,
+                stdout,
+                stderr,
+            };
+        }
+        // Capture sockets failed; the provider was stopped and reaped.
+        Err(_) => (1, crate::cleanup::received_signal()),
+    };
+    PruneOutcome {
+        status,
+        interrupted: interrupted.or_else(crate::cleanup::received_signal),
+        abort: false,
+        stdout,
+        stderr,
     }
 }
 

@@ -600,6 +600,7 @@ fn run_init(
         let code = crate::update_engine::run_update(
             runtime,
             &crate::update_engine::UpdateRequest {
+                caller: crate::update_engine::Caller::Init,
                 config: &config,
                 env: &update_env,
                 args: &[],

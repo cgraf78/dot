@@ -73,6 +73,56 @@ singleton lock check, but performs that bounded remote verification only when
 the lock changes (or for a manual run); it never selects or advances the
 revision automatically.
 
+## Shdeps prune
+
+Set `DOT_SHDEPS_PRUNE` in the environment of `dot update` to let it remove
+orphaned Shdeps dependencies (ones no longer declared for the host) by running
+`shdeps prune -y` itself:
+
+- `never` (default, also when unset or empty): Dot never prunes; run
+  `shdeps prune` yourself.
+- `cron`: only `dot update --cron` prunes. `--quiet` and `DOT_QUIET` do not
+  count; they change output, not what an update does.
+- `always`: every `dot update` and `dot pull` prunes.
+
+For example, a cron entry of `DOT_SHDEPS_PRUNE=cron dot update --cron` prunes
+on every unattended run. `dot init` ignores the variable. Any other value
+prints a warning and reads as `never`; it never fails the update. This is an
+environment variable rather than a config key on purpose: the config file is
+often shared through a client repository, and Dot rejects unknown config keys,
+so a key would stop clients still running an older Dot. Older releases simply
+ignore the variable and do not prune.
+
+Pruning is destructive: Shdeps runs each orphan's `uninstall` hook and deletes
+its managed payloads, links, and state. Dot reads the variable once and removes
+it from the environment it passes to the dependency provider (including prune)
+and to merge, lifecycle, and extension hooks. Plain helper processes such as
+`git pull` still inherit Dot's own process environment.
+
+Prune runs as its own `Prune` stage directly after `Tools`, while the update
+still holds its lock. It uses the same prepared provider and Shdeps config
+directory the `Tools` stage just converged, and runs only when that
+generation's repository sync and overlay links succeeded, so it never acts on
+a frozen or partially synchronized configuration. A failed `Tools` stage (for
+example a dependency or post hook that keeps failing) does not stop it, and
+merge hooks run after it either way. The stage is skipped, with a row naming
+the reason, when sync or linking failed, profile deactivation failed, no
+dependency provider is configured, or Shdeps is unavailable. An update that
+exits early (a busy update lock, or a cron run skipped for unresolved local
+edits) never reaches it. When a `Tools` run updates Dot itself, only the
+continuation under the new revision prunes.
+
+Removal rows render under the stage; quiet and cron runs drop them and report
+only Shdeps warnings on stderr plus one failure line. Output past 1 MiB per
+stream is discarded rather than stopping the prune. Stdin is closed, but an
+uninstall hook that needs `sudo` may still prompt on an interactive terminal;
+under cron it fails instead. A prune failure (for example a failed `uninstall`
+hook) marks the stage failed and makes the update exit nonzero without
+stopping later stages or withholding the profile lifecycle commit. For a cron
+run that failure is recorded as a failed outcome and does not refresh the
+last-success stamp, so a prune that keeps failing makes `dot doctor` report
+cron convergence as stale.
+
 ## Overlay profiles
 
 Clients may define additive overlay profiles in

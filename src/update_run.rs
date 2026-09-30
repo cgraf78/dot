@@ -107,6 +107,7 @@ pub fn run(
     let code = crate::update_engine::run_update(
         runtime,
         &crate::update_engine::UpdateRequest {
+            caller: crate::update_engine::Caller::Update,
             config,
             env: &child_env,
             args: request.args,

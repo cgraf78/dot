@@ -409,6 +409,7 @@ case ${1:-} in
         "$DOT_TEST_PROVIDER_PROMPT_RECORD.reader-ready" \
         "$DOT_TEST_PROVIDER_PROMPT_RECORD"
     fi
+    printf '%s\n' "${DOT_SHDEPS_PRUNE-unset}" >"$DOT_TEST_PROVIDER_PRUNE_RECORD.update-env"
     printf 'force=%s quiet=%s nested=%s jobs=%s\n' \
       "${SHDEPS_FORCE:-0}" "${SHDEPS_QUIET:-0}" "${SHDEPS_NESTED:-0}" "${SHDEPS_JOBS:-unset}" \
       >"$DOT_TEST_PROVIDER_RECORD"
@@ -463,6 +464,23 @@ case ${1:-} in
       kill -TERM -- "-$teardown_descendant"
       wait "$teardown_descendant" 2>/dev/null || true
     fi
+    ;;
+  prune)
+    shift
+    printf 'args=%s quiet=%s nested=%s conf=%s prune_env=%s\n' "$*" "${SHDEPS_QUIET:-0}" \
+      "${SHDEPS_NESTED:-0}" "${SHDEPS_CONF_DIR:-unset}" "${DOT_SHDEPS_PRUNE-unset}" \
+      >>"$DOT_TEST_PROVIDER_PRUNE_RECORD"
+    printf '%s\n' '  old-tool removed'
+    if [[ ${DOT_TEST_PROVIDER_PRUNE_FLOOD:-0} == 1 ]]; then
+      printf -v flood '%8192s' ''
+      for ((chunk = 0; chunk < 256; chunk++)); do
+        printf '%s\n' "$flood"
+      done
+      printf '%s\n' 'finished' >"$DOT_TEST_PROVIDER_PRUNE_RECORD.finished"
+    fi
+    [[ -z ${DOT_TEST_PROVIDER_PRUNE_WARNING:-} ]] ||
+      printf '  warning: %s\n' "$DOT_TEST_PROVIDER_PRUNE_WARNING" >&2
+    exit "${DOT_TEST_PROVIDER_PRUNE_EXIT:-0}"
     ;;
   *) exit 2 ;;
 esac
@@ -600,6 +618,10 @@ raise SystemExit(2)
             .env(
                 "DOT_TEST_PROVIDER_RECORD",
                 self.home.join("provider-record"),
+            )
+            .env(
+                "DOT_TEST_PROVIDER_PRUNE_RECORD",
+                self.home.join("prune-record"),
             )
             .env("DOT_BASH", dot_test_support::bash())
             // Bash fills an absent SHELL with its own path. Pin it explicitly
@@ -4552,4 +4574,329 @@ fn failed_reviewed_download_preserves_each_attempt_diagnostic() {
         UNAVAILABLE,
         b"curl diagnostic\ncurl diagnostic\ncurl diagnostic\n  warning: Shdeps bootstrap download failed\n  warning: failed to fetch the reviewed Shdeps bootstrap\n",
     );
+}
+
+/// An update command with `DOT_SHDEPS_PRUNE` set (`None` leaves it unset to
+/// exercise the default).
+fn pruning(fixture: &Fixture, mode: Option<&str>) -> Command {
+    let mut command = fixture.command();
+    if let Some(mode) = mode {
+        command.env("DOT_SHDEPS_PRUNE", mode);
+    }
+    command
+}
+
+/// Recorded `shdeps prune` invocations, or `None` when prune never ran.
+fn prune_record(fixture: &Fixture) -> Option<String> {
+    std::fs::read_to_string(fixture.home.join("prune-record")).ok()
+}
+
+/// The single expected prune invocation: non-interactive `-y`, run as a
+/// nested provider call against Dot's resolved Shdeps config directory.
+fn expected_prune_record(fixture: &Fixture, quiet: bool) -> String {
+    format!(
+        "args=-y quiet={} nested=1 conf={} prune_env=unset\n",
+        if quiet { 1 } else { 0 },
+        fixture.home.join(".config/shdeps").display()
+    )
+}
+
+const PRUNED_AFTER_TOOLS_FAILURE: &[u8] =
+    b"[1/6] Overlays   running  checking overlay links                         Ns\n\
+[1/6] Overlays   ok       0 overlays current                             Ns\n\
+[2/6] Tools      running  checking configured dependencies               Ns\n\
+[2/6] Tools      failed   1 failed                                       Ns\n\
+\x20\x20failed   Cargo: 1 failed, 12ms\n\
+\x20\x20failed   ripgrep                      network unavailable\n\
+[3/6] Prune      running  pruning orphaned dependencies                  Ns\n\
+[3/6] Prune      ok       orphaned dependencies checked                  Ns\n\
+\x20\x20\x20\x20old-tool removed\n\
+[4/6] Configs    running  checking config hooks                          Ns\n\
+[4/6] Configs    ok       no config hooks                                Ns\n\
+[5/6] Cleanup    running  normalizing worktree                           Ns\n\
+[5/6] Cleanup    ok       no base repo                                   Ns\n\
+Done with errors in Ns. Reload your shell: source ~/.bashrc\n";
+
+#[test]
+fn prune_runs_after_a_tools_failure_when_sync_and_links_succeeded() {
+    // A persistently failing dependency or post hook must not also stop
+    // orphan cleanup: the generation converged, so its config is trusted.
+    let fixture = Fixture::new("shdeps-prune-after-tools-failure");
+    let output = pruning(&fixture, Some("always"))
+        .env("DOT_TEST_PROVIDER_FAIL", "1")
+        .output()
+        .expect("update with failing tools");
+    assert_cli(&output, 1, PRUNED_AFTER_TOOLS_FAILURE, b"");
+    assert_eq!(
+        prune_record(&fixture),
+        Some(expected_prune_record(&fixture, false))
+    );
+}
+
+#[test]
+fn cron_prune_mode_prunes_only_cron_updates() {
+    let fixture = Fixture::new("shdeps-prune-cron-mode");
+    // A manual update keeps today's five-stage output and never prunes,
+    // even when quieted through the environment instead of `--cron`.
+    let manual = pruning(&fixture, Some("cron"))
+        .output()
+        .expect("manual update");
+    assert_cli(&manual, 0, CHANGED, b"");
+    let quiet = pruning(&fixture, Some("cron"))
+        .env("DOT_QUIET", "1")
+        .output()
+        .expect("quiet manual update");
+    assert_cli(&quiet, 0, b"", b"");
+    assert_eq!(prune_record(&fixture), None);
+
+    // The cron run prunes silently: removal rows are dropped like the old
+    // `shdeps prune -y > /dev/null` entry.
+    let cron = pruning(&fixture, Some("cron"))
+        .arg("--cron")
+        .output()
+        .expect("cron update");
+    assert_cli(&cron, 0, b"", b"");
+    assert_eq!(
+        prune_record(&fixture),
+        Some(expected_prune_record(&fixture, true))
+    );
+}
+
+#[test]
+fn prune_is_off_by_default_and_with_never() {
+    for mode in [None, Some("never")] {
+        let fixture = Fixture::new("shdeps-prune-never");
+        let cron = pruning(&fixture, mode)
+            .arg("--cron")
+            .output()
+            .expect("cron update");
+        assert_cli(&cron, 0, b"", b"");
+        let manual = pruning(&fixture, mode).output().expect("manual update");
+        assert_cli(&manual, 0, CHANGED, b"");
+        assert_eq!(prune_record(&fixture), None, "mode {mode:?}");
+    }
+}
+
+#[test]
+fn prune_failure_is_a_stage_failure_that_does_not_abort_later_stages() {
+    // Configs and Cleanup still run after the failed Prune stage.
+    let fixture = Fixture::new("shdeps-prune-failure");
+    let output = pruning(&fixture, Some("always"))
+        .env("DOT_TEST_PROVIDER_PRUNE_EXIT", "1")
+        .env(
+            "DOT_TEST_PROVIDER_PRUNE_WARNING",
+            "old-tool uninstall hook failed",
+        )
+        .output()
+        .expect("update with failing prune");
+    let expected = b"[1/6] Overlays   running  checking overlay links                         Ns\n\
+[1/6] Overlays   ok       0 overlays current                             Ns\n\
+[2/6] Tools      running  checking configured dependencies               Ns\n\
+[2/6] Tools      changed  1 changed                                      Ns\n\
+\x20\x20changed  Cargo: 1 changed\n\
+\x20\x20changed  ripgrep                      installed\n\
+[3/6] Prune      running  pruning orphaned dependencies                  Ns\n\
+[3/6] Prune      failed   dependency prune failed (exit 1)               Ns\n\
+\x20\x20\x20\x20old-tool removed\n\
+[4/6] Configs    running  checking config hooks                          Ns\n\
+[4/6] Configs    ok       no config hooks                                Ns\n\
+[5/6] Cleanup    running  normalizing worktree                           Ns\n\
+[5/6] Cleanup    ok       no base repo                                   Ns\n\
+Done with errors in Ns. Reload your shell: source ~/.bashrc\n";
+    assert_cli(
+        &output,
+        1,
+        expected,
+        b"  warning: old-tool uninstall hook failed\n",
+    );
+
+    // Cron stays silent on stdout but surfaces the provider's warning and
+    // one failure line, and the run still reports failure.
+    let cron = pruning(&fixture, Some("always"))
+        .arg("--cron")
+        .env("DOT_TEST_PROVIDER_PRUNE_EXIT", "1")
+        .env(
+            "DOT_TEST_PROVIDER_PRUNE_WARNING",
+            "old-tool uninstall hook failed",
+        )
+        .output()
+        .expect("cron update with failing prune");
+    assert_cli(
+        &cron,
+        1,
+        b"",
+        b"  warning: old-tool uninstall hook failed\n  warning: shdeps prune failed (exit 1)\n",
+    );
+    // A failed cron prune records a failed cron outcome and does not
+    // refresh the last-success stamp.
+    let log = std::fs::read_to_string(dot::update_status::update_log_path(&fixture.state))
+        .expect("cron outcome log");
+    let last = log.lines().last().expect("one cron outcome");
+    assert_eq!(last.split(' ').nth(1), Some("fail"), "{log}");
+    assert!(!dot::update_status::last_success_path(&fixture.state).exists());
+}
+
+#[test]
+fn prune_is_skipped_when_repository_sync_fails() {
+    let fixture = Fixture::new("shdeps-prune-sync-failure");
+    let descriptors = fixture.home.join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&descriptors).expect("overlay descriptors");
+    std::fs::write(
+        descriptors.join("broken.conf"),
+        format!(
+            "url=file://{}\n",
+            fixture.home.join("missing.git").display()
+        ),
+    )
+    .expect("broken overlay descriptor");
+    let output = pruning(&fixture, Some("always"))
+        .output()
+        .expect("update with sync failure");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = normalize_elapsed(&output.stdout);
+    let text = String::from_utf8_lossy(&stdout);
+    assert!(
+        text.contains("[3/6] Prune      warning  repository sync failed; prune skipped"),
+        "{text}"
+    );
+    assert_eq!(prune_record(&fixture), None);
+}
+
+#[test]
+fn prune_is_skipped_for_a_frozen_generation() {
+    // An invalid profile set freezes the installed links: the generation is
+    // partial, so neither Tools nor Prune may trust the dependency config.
+    let fixture = Fixture::new("shdeps-prune-frozen");
+    std::fs::create_dir_all(fixture.home.join(".config/dot/profiles.d")).expect("profiles.d");
+    let output = pruning(&fixture, Some("always"))
+        .output()
+        .expect("update with frozen links");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = normalize_elapsed(&output.stdout);
+    let text = String::from_utf8_lossy(&stdout);
+    assert!(
+        text.contains("preserving installed overlay links"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[3/6] Prune      warning  repository sync failed; prune skipped"),
+        "{text}"
+    );
+    assert_eq!(prune_record(&fixture), None);
+}
+
+#[test]
+fn prune_is_skipped_when_shdeps_is_unavailable() {
+    let fixture = Fixture::new("shdeps-prune-unavailable");
+    let output = pruning(&fixture, Some("always"))
+        .env("DOT_TEST_PROVIDER_BOOTSTRAP_FAIL", "1")
+        .output()
+        .expect("update without shdeps");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = normalize_elapsed(&output.stdout);
+    let text = String::from_utf8_lossy(&stdout);
+    assert!(
+        text.contains("[3/6] Prune      warning  shdeps unavailable; prune skipped"),
+        "{text}"
+    );
+    assert_eq!(prune_record(&fixture), None);
+}
+
+#[test]
+fn prune_does_not_run_when_the_update_lock_is_busy() {
+    let fixture = Fixture::new("shdeps-prune-lock-busy");
+    let log = dot::log::Log::new(false, false);
+    let mut sink = Vec::new();
+    let guard = dot::update_lock::acquire(&fixture.state, false, &log, None, &mut sink)
+        .expect("hold update lock");
+    let output = pruning(&fixture, Some("cron"))
+        .arg("--cron")
+        .output()
+        .expect("cron update while locked");
+    assert_cli(&output, 75, b"", b"");
+    assert_eq!(prune_record(&fixture), None);
+    drop(guard);
+}
+
+#[test]
+fn chatty_prune_output_is_truncated_without_stopping_the_provider() {
+    // A 2 MiB removal report exceeds the capture limit; the provider must
+    // still finish its removals instead of being stopped mid-prune.
+    let fixture = Fixture::new("shdeps-prune-flood");
+    let output = pruning(&fixture, Some("always"))
+        .arg("--cron")
+        .env("DOT_TEST_PROVIDER_PRUNE_FLOOD", "1")
+        .output()
+        .expect("cron update with chatty prune");
+    assert_cli(
+        &output,
+        0,
+        b"",
+        b"  warning: shdeps prune output exceeded 1048576 bytes; the rest was discarded\n",
+    );
+    assert!(
+        fixture.home.join("prune-record.finished").exists(),
+        "prune provider was stopped before finishing"
+    );
+}
+
+#[test]
+fn provider_reexec_prunes_once_in_the_continuation() {
+    // A Tools run that updates Dot itself hands off to the new revision
+    // before Prune; only that continuation prunes.
+    let fixture = Fixture::new("shdeps-prune-reexec");
+    let output = pruning(&fixture, Some("always"))
+        .env("DOT_TEST_PROVIDER_ADVANCE_SOURCE", "1")
+        .env(
+            "DOT_TEST_PROVIDER_ADVANCED",
+            fixture.home.join("provider-advanced"),
+        )
+        .output()
+        .expect("reexec update");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(fixture.home.join("provider-advanced").exists());
+    let stdout = normalize_elapsed(&output.stdout);
+    let text = String::from_utf8_lossy(&stdout);
+    assert_eq!(text.matches("Prune      ok").count(), 1, "{text}");
+    assert_eq!(
+        prune_record(&fixture),
+        Some(expected_prune_record(&fixture, false))
+    );
+}
+
+#[test]
+fn prune_env_does_not_leak_into_provider_children() {
+    // Dot reads `DOT_SHDEPS_PRUNE` once; neither the provider update nor the
+    // prune it runs (nor their hooks) sees the policy variable.
+    let fixture = Fixture::new("shdeps-prune-env-scrub");
+    let output = pruning(&fixture, Some("always"))
+        .output()
+        .expect("update with prune");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.home.join("prune-record.update-env"))
+            .expect("provider update env record"),
+        "unset\n"
+    );
+    assert_eq!(
+        prune_record(&fixture),
+        Some(expected_prune_record(&fixture, false))
+    );
+}
+
+#[test]
+fn unknown_prune_env_value_warns_and_never_blocks_the_update() {
+    // A value only a newer Dot understands must not stop this one from
+    // converging (and upgrading itself); it reads as `never`.
+    let fixture = Fixture::new("shdeps-prune-env-unknown");
+    let output = pruning(&fixture, Some("weekly"))
+        .output()
+        .expect("update with unknown prune mode");
+    assert_cli(
+        &output,
+        0,
+        CHANGED,
+        b"  warning: ignoring DOT_SHDEPS_PRUNE=weekly; expected never, cron, or always\n",
+    );
+    assert_eq!(prune_record(&fixture), None);
 }
