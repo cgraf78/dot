@@ -44,7 +44,7 @@ use crate::repos_config::ensure_repo_config;
 use crate::repos_dirty::normalize_filtered;
 use crate::repos_overlays::{DestinationInputs, QuarantineInputs};
 use crate::repos_pull::{PullBaseInputs, pull_base};
-use crate::repos_pull_overlay::{PullOverlayInputs, pull_overlay};
+use crate::repos_pull_overlay::{PullOverlayInputs, PullOverlayOutcome, pull_overlay};
 use crate::repos_pull_queries::CandidateEnv;
 use crate::repos_pull_support::{PullTally, overlay_active, record_status, result_prefix};
 use crate::temp::{MoveCache, MoveTool};
@@ -293,8 +293,7 @@ fn overlay_inputs<'a>(
 /// (`${TMPDIR:-/tmp}/dot.XXXXXX` semantics): a unique leaf under
 /// the system temp dir, `None` when nothing is creatable — the
 /// shell's failed `_dot_cleanup_mktemp -d` plus serial fallback.
-fn alloc_result_dir() -> Option<PathBuf> {
-    let root = std::env::temp_dir();
+fn alloc_result_dir(root: &Path) -> Option<PathBuf> {
     for _ in 0..100 {
         let serial = FLEET_COUNTER.fetch_add(1, Ordering::Relaxed);
         let leaf = format!("dot.{}.{serial:016x}", std::process::id());
@@ -397,10 +396,24 @@ fn remove_scratch(path: &Path) {
     let _ = cleanup.remove_path(path);
 }
 
+/// Removes the scratch result directory when dropped, so an unwind
+/// the worker panic guard cannot see (a refused thread spawn panics
+/// in the parent) still does not leak captured overlay logs. Normal
+/// exits remove it explicitly after the replay; the second removal
+/// finds nothing and is a no-op.
+struct ScratchGuard<'a>(&'a Path);
+
+impl Drop for ScratchGuard<'_> {
+    fn drop(&mut self) {
+        remove_scratch(self.0);
+    }
+}
+
 /// Read one worker result: the status word plus rc, mapping an
 /// empty status with a nonzero rc to `failed` (the shell's
-/// coordinator fallback). Missing files read as `("", 1)` so the
-/// caller fails closed like a failed `wait`.
+/// coordinator fallback). Missing files read as `("failed", 1)`
+/// (empty status plus the rc fallback) so the caller fails closed
+/// like a failed `wait`.
 fn read_worker_result(prefix: &str) -> (String, i32) {
     let status = std::fs::read_to_string(format!("{prefix}.status")).unwrap_or_default();
     let rc_text = std::fs::read_to_string(format!("{prefix}.rc")).unwrap_or_default();
@@ -466,17 +479,14 @@ pub fn pull_overlays_serial(
     }
 }
 
-/// Run one chunk of workers in parallel under a scoped thread
-/// borrow, each with its own [`MoveCache`] and its own indexed
-/// result files. A panicking worker leaves its status file missing,
-/// which the ordered replay reads as a plumbing failure.
 /// Reap `count` worker completions, redrawing the live line on
 /// whole seconds while stalled (the `run_to_log_with_ticks`
 /// pattern: the waiting thread polls instead of blocking in a
-/// join). A dropped sender means its worker panicked without
-/// completing: stop waiting (its status file is missing, which the
-/// ordered replay reads as a plumbing failure) and let the
-/// enclosing scope propagate the panic as a bare join would.
+/// join). Workers contain panics in the overlay pull and still
+/// report, so a dropped sender is only a safety net for a panic
+/// outside that guard: stop waiting and let the enclosing scope
+/// re-raise it when it joins (the caller's scratch guard still
+/// removes the result directory on that unwind).
 fn wait_for_chunk(
     rx: &std::sync::mpsc::Receiver<()>,
     count: usize,
@@ -503,11 +513,41 @@ fn wait_for_chunk(
     }
 }
 
+/// The text of a caught panic payload (`panic!` with a literal or a
+/// formatted message), or a placeholder for any other payload type.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        text
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text
+    } else {
+        "non-string panic payload"
+    }
+}
+
+/// Single-overlay pull entry point: [`pull_overlay`] in production.
+/// The fan-out takes it as a parameter so tests can inject a worker
+/// that panics without staging a broken repository.
+type PullOne = fn(
+    &PullOverlayInputs<'_>,
+    &mut MoveCache,
+    &mut dyn Write,
+    &mut dyn Write,
+) -> PullOverlayOutcome;
+
+/// Run one chunk of workers in parallel under a scoped thread
+/// borrow, each with its own [`MoveCache`] and its own indexed
+/// result files. A panic inside a worker's overlay pull is caught
+/// there: the worker skips its rc/status writes and still reports,
+/// so the scope never re-raises it and the ordered replay reads the
+/// missing files as a plumbing failure (rc 1, drained scratch).
+#[allow(clippy::too_many_arguments)]
 fn run_chunk(
     chunk: &[ActiveOverlay<'_>],
     base_idx: i64,
     result_dir: &Path,
     inputs: &PullOverlaysInputs<'_>,
+    pull: PullOne,
     stage: &mut Stage,
     out: &mut dyn Write,
     beat: &mut Heartbeat,
@@ -524,8 +564,8 @@ fn run_chunk(
             scope.spawn(move || {
                 // Every exit reports: the waiter counts completions
                 // instead of joining, so a missing send would stall
-                // it until disconnect. Only a panic skips the send
-                // (its sender drops), which reads as disconnect.
+                // it until disconnect. The pull's panic guard below
+                // keeps even a panicking pull on this path.
                 let done = || {
                     let _ = completion_tx.send(());
                 };
@@ -584,16 +624,46 @@ fn run_chunk(
                 };
                 let mut out_file = file;
                 let mut err_file = clone;
-                let outcome = pull_overlay(&single, &mut moves, &mut out_file, &mut err_file);
-                drop(out_file);
-                drop(err_file);
-                let _ = std::fs::write(&rc_path, outcome.rc.to_string());
-                let _ = std::fs::write(&status_path, outcome.status.as_str());
+                // Contain a panic to this overlay. Uncaught, the scope
+                // re-raises it after the join, unwinding out of the
+                // whole update past the replay (losing the peers'
+                // logs) and the scratch removal. Caught, the missing
+                // rc/status files read as the documented plumbing
+                // failure. Unwind safety: this worker's cache and log
+                // handles are discarded here, and the shared state a
+                // pull touches is immutable or recovers from a lock
+                // poisoned by a panicking holder (the prefetch lock
+                // and process-wide probe caches).
+                let pulled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pull(&single, &mut moves, &mut out_file, &mut err_file)
+                }));
+                match pulled {
+                    Ok(outcome) => {
+                        drop(out_file);
+                        drop(err_file);
+                        let _ = std::fs::write(&rc_path, outcome.rc.to_string());
+                        let _ = std::fs::write(&status_path, outcome.status.as_str());
+                    }
+                    Err(payload) => {
+                        // Keep the bug visible where cron output looks:
+                        // the overlay's own replayed log names it, on
+                        // top of the default hook's stderr report.
+                        inputs.log.warn(
+                            &mut err_file,
+                            &format!(
+                                "  warning: {} overlay pull panicked: {}",
+                                item.name,
+                                panic_message(payload.as_ref())
+                            ),
+                        );
+                    }
+                }
                 done();
             });
         }
-        // The parent-side sender must drop so a panicking worker
-        // reads as disconnect; worker clones report the rest.
+        // The parent-side sender must drop so a worker that dies
+        // without reporting reads as disconnect instead of a hang;
+        // worker clones report the rest.
         drop(completion_tx);
         wait_for_chunk(&completion_rx, chunk.len(), beat, stage, out);
     });
@@ -606,10 +676,34 @@ fn run_chunk(
 /// Progress bumps render through `stage` during the launch pass;
 /// worker logs replay to `out` after the joins (worker warnings
 /// ride the logs to stdout, like the shell's `cat`). Returns 1
-/// only when worker plumbing itself fails (missing rc/status
-/// files); overlay `failed` statuses still return 0.
+/// only when worker plumbing itself fails (a missing log or
+/// rc/status file, including a worker whose pull panicked); overlay
+/// `failed` statuses still return 0.
 pub fn pull_overlays(
     inputs: &PullOverlaysInputs<'_>,
+    stage: &mut Stage,
+    moves: &mut MoveCache,
+    out: &mut dyn Write,
+    warnings: &mut dyn Write,
+) -> PullOverlaysOutcome {
+    fan_out(
+        inputs,
+        &std::env::temp_dir(),
+        pull_overlay,
+        stage,
+        moves,
+        out,
+        warnings,
+    )
+}
+
+/// [`pull_overlays`] with the scratch root and the per-overlay pull
+/// injected (production passes the system temp dir and
+/// [`pull_overlay`]).
+fn fan_out(
+    inputs: &PullOverlaysInputs<'_>,
+    scratch_root: &Path,
+    pull: PullOne,
     stage: &mut Stage,
     moves: &mut MoveCache,
     out: &mut dyn Write,
@@ -627,9 +721,10 @@ pub fn pull_overlays(
             rc: 0,
         };
     }
-    let Some(result_dir) = alloc_result_dir() else {
+    let Some(result_dir) = alloc_result_dir(scratch_root) else {
         return pull_overlays_serial(inputs, stage, moves, out, warnings);
     };
+    let _scratch = ScratchGuard(&result_dir);
     let bound = jobs_bound(inputs.update_jobs).max(1);
     let mut beat = Heartbeat::new(
         crate::update_engine::now_secs(),
@@ -659,7 +754,16 @@ pub fn pull_overlays(
     // the same ordered replay and the same cap).
     let mut base_idx: i64 = 0;
     for chunk in active.chunks(bound) {
-        run_chunk(chunk, base_idx, &result_dir, inputs, stage, out, &mut beat);
+        run_chunk(
+            chunk,
+            base_idx,
+            &result_dir,
+            inputs,
+            pull,
+            stage,
+            out,
+            &mut beat,
+        );
         base_idx += chunk.len() as i64;
     }
     // Ordered replay: collect non-empty logs plus structured
@@ -828,7 +932,7 @@ pub struct PullAllOutcome {
     /// Repos that failed (plus one when the overlay fan-out itself
     /// fails plumbing).
     pub failed: i64,
-    /// Repos skipped (no upstream).
+    /// Repos skipped (no upstream, a user session, or a detached HEAD).
     pub skipped: i64,
     /// True when the stage finish stays deferred.
     pub deferred: bool,
@@ -917,12 +1021,18 @@ pub fn pull_all(
     match base_outcome.status.as_str() {
         "skipped" => {
             if verbose {
+                // Say what actually happened: a detached HEAD or the
+                // user's rebase is not a missing upstream.
+                let reason = base_outcome
+                    .skip
+                    .unwrap_or(crate::repos_pull::SkipReason::NoUpstream);
+                let detail = format!("dotfiles pull skipped ({})", reason.label());
                 let (bytes, _) = crate::progress_ui::status(
                     inputs.palette,
                     quiet,
                     false,
                     b"skipped",
-                    b"dotfiles pull skipped (no upstream)",
+                    detail.as_bytes(),
                     inputs.multibyte,
                 );
                 let _ = out.write_all(&bytes);
@@ -1133,10 +1243,204 @@ mod tests {
         );
     }
 
+    /// Test pull: logs one line and reports current, except `ovl1`,
+    /// which panics mid-pull after writing a partial log line.
+    fn pull_or_panic(
+        inputs: &PullOverlayInputs<'_>,
+        _moves: &mut MoveCache,
+        out: &mut dyn Write,
+        _warnings: &mut dyn Write,
+    ) -> PullOverlayOutcome {
+        let _ = writeln!(out, "log {}", inputs.name);
+        if inputs.name == "ovl1" {
+            panic!("injected overlay worker panic");
+        }
+        PullOverlayOutcome {
+            status: crate::repos_pull_overlay::PullOverlayStatus::Current,
+            rc: 0,
+            live_active: false,
+        }
+    }
+
+    /// Run [`fan_out`] over three pull-eligible overlays in one chunk
+    /// with `pull` injected and scratch under `scope/scratch`. A
+    /// configured URL makes a missing path pull-eligible, so no
+    /// repository is needed: the injected pull never touches git.
+    fn fan_out_three(
+        scope: &Path,
+        pull: PullOne,
+        out: &mut dyn Write,
+        warnings: &mut dyn Write,
+    ) -> PullOverlaysOutcome {
+        let scratch = scope.join("scratch");
+        let home = scope.to_string_lossy().into_owned();
+        let entries: Vec<String> = (0..3)
+            .map(|index| format!("ovl{index}|{home}/missing-{index}|url|x|false|git"))
+            .collect();
+        let dest = DestinationInputs {
+            pwd: home.clone(),
+            home: home.clone(),
+            xdg_state_home: None,
+            install_dir: None,
+            state_dir: None,
+            overlay_paths: Vec::new(),
+            init_backup: None,
+        };
+        let candidate = CandidateEnv {
+            home: home.clone(),
+            checkout: format!("{home}/.local/share/cgraf78/dot"),
+            pwd: home.clone(),
+            source_root: env!("CARGO_MANIFEST_DIR").into(),
+            state_home: format!("{home}/.local/state"),
+            install_root: format!("{home}/.local/share"),
+            provider_state: format!("{home}/.local/state/shdeps"),
+            overlay_paths: Vec::new(),
+            init_backup: None,
+        };
+        let base = Base {
+            topology: crate::repos_base::Topology::Ordinary,
+            client_git_dir: String::new(),
+            home: home.clone(),
+        };
+        let palette = Palette::empty();
+        let log = Log::new(false, false);
+        let mut moves = MoveCache::default();
+        let tool = moves.tool().unwrap();
+        let manifest = format!("{home}/manifest.tsv");
+        let legacy = format!("{home}/legacy.tsv");
+        let inputs = PullOverlaysInputs {
+            entries: &entries,
+            extra_args: &[],
+            home: &home,
+            ui_total: None,
+            dot_quiet: Some("0"),
+            dot_verbose: Some("0"),
+            // All three in one chunk, so a panic races live peers.
+            update_jobs: Some("3"),
+            progress_done: Some("0"),
+            progress_total: Some("0"),
+            bar_width: "8",
+            palette: &palette,
+            multibyte: false,
+            ascii: true,
+            candidate: &candidate,
+            base: &base,
+            quarantine: None,
+            overlays: &[],
+            dest: &dest,
+            manifest: &manifest,
+            legacy_manifest: &legacy,
+            euid: crate::temp::current_uid().unwrap(),
+            source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
+            tmp: scope,
+            tool: &tool,
+            log: &log,
+            prefetch: None,
+        };
+        let mut stage = Stage::begin(Palette::empty(), "0", false, false, false, true);
+        fan_out(
+            &inputs, &scratch, pull, &mut stage, &mut moves, out, warnings,
+        )
+    }
+
+    #[test]
+    fn panicking_worker_is_a_plumbing_failure_not_an_abort() {
+        // One worker panicking must not unwind out of the fan-out: the
+        // parent still replays every captured log, returns the
+        // documented plumbing-failure rc 1, and removes its scratch.
+        let scope = dot_test_support::TempDir::new("fleet-panic").unwrap();
+        let scratch = scope.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let mut out = Vec::new();
+        let mut warnings = Vec::new();
+        let outcome = fan_out_three(scope.path(), pull_or_panic, &mut out, &mut warnings);
+        assert_eq!(outcome.rc, 1);
+        assert_eq!(outcome.tally.failed, 1);
+        assert_eq!(outcome.tally.current, 2);
+        let out = String::from_utf8(out).unwrap();
+        for name in ["ovl0", "ovl1", "ovl2"] {
+            assert!(out.contains(&format!("log {name}\n")), "{out:?}");
+        }
+        // The panic stays visible in the replay, not just on stderr.
+        assert!(
+            out.contains("ovl1 overlay pull panicked: injected overlay worker panic"),
+            "{out:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&scratch).unwrap().count(),
+            0,
+            "scratch result dir leaked"
+        );
+    }
+
+    /// Test pull: logs one line and reports current for every overlay.
+    fn pull_current(
+        inputs: &PullOverlayInputs<'_>,
+        _moves: &mut MoveCache,
+        out: &mut dyn Write,
+        _warnings: &mut dyn Write,
+    ) -> PullOverlayOutcome {
+        let _ = writeln!(out, "log {}", inputs.name);
+        PullOverlayOutcome {
+            status: crate::repos_pull_overlay::PullOverlayStatus::Current,
+            rc: 0,
+            live_active: false,
+        }
+    }
+
+    /// Parent-side stdout that panics on its first write, naming the
+    /// bytes it refused so the test can tell where the unwind began.
+    struct PanickingOut;
+
+    impl Write for PanickingOut {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            panic!(
+                "injected parent-side panic: {}",
+                String::from_utf8_lossy(buf)
+            );
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn parent_side_unwind_still_removes_the_scratch_dir() {
+        // A panic in the parent itself (a refused `scope.spawn`, or
+        // here a panicking replay write) unwinds out of the fan-out
+        // past the explicit removal; the scratch guard alone must
+        // remove the result dir and the worker logs captured in it.
+        let scope = dot_test_support::TempDir::new("fleet-unwind").unwrap();
+        let scratch = scope.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let unwound = std::panic::catch_unwind(|| {
+            fan_out_three(
+                scope.path(),
+                pull_current,
+                &mut PanickingOut,
+                &mut Vec::new(),
+            )
+        });
+        let payload = unwound.err().expect("the parent-side panic must unwind");
+        // The first parent write is the replay of the first worker's
+        // log: the injected workers ran and populated the scratch dir
+        // (the serial fallback would have used the real pull).
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "injected parent-side panic: log ovl0\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(&scratch).unwrap().count(),
+            0,
+            "scratch result dir leaked on unwind"
+        );
+    }
+
     #[test]
     fn chunk_waiter_stops_on_disconnect() {
-        // A dropped sender (a worker that panicked without
-        // completing) ends the wait instead of hanging: no
+        // A dropped sender (a worker that died without reporting)
+        // ends the wait instead of hanging: no
         // completions expected, none rendered, no crash.
         let palette = crate::progress_ui::Palette::empty();
         let mut stage = Stage::begin(palette, "5", false, false, false, true);
