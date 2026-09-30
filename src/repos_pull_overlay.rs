@@ -12,14 +12,15 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
 
-use crate::cleanup::Registry;
 use crate::log::{Log, is_quiet};
 use crate::overlays::{effective_url, is_worktree};
 use crate::progress_ui::Palette;
 use crate::repos_base::Base;
 use crate::repos_config::{has_upstream, origin_matches};
 use crate::repos_overlays::{DestinationInputs, QuarantineInputs};
-use crate::repos_pull::{PullRepoInputs, pull_repo};
+use crate::repos_pull::{
+    PullRepoInputs, REPEATED_CONFLICT, RebaseGuard, StrandedHead, pull_repo, stranded_head,
+};
 use crate::repos_pull_clone::{CloneOverlayInputs, clone_overlay_staged};
 use crate::repos_pull_normalize::{normalize_updated_paths, snapshot_updated_path_parents};
 use crate::repos_pull_queries::{
@@ -177,18 +178,6 @@ fn clone_suppressed(
     clone_overlay_staged(&clone_inputs, moves, &mut sink)
 }
 
-/// Best-effort snapshot removal, like `|| true`.
-fn remove_snapshot(snapshot: &Path) {
-    let mut cleanup = Registry::new();
-    let _ = cleanup.remove_path(snapshot);
-}
-
-/// Checked snapshot removal: a failure flips the status to failed.
-fn remove_snapshot_checked(snapshot: &Path) -> bool {
-    let mut cleanup = Registry::new();
-    cleanup.remove_path(snapshot).is_ok()
-}
-
 /// `_pull_overlay`: clone a missing checkout or pull an existing
 /// one through the same fetch, fast-path, validation, snapshot,
 /// pull, and normalization stages as the base. Stdout carries
@@ -323,6 +312,32 @@ pub fn pull_overlay(
     }
 
     if !has_upstream(&prefix) {
+        // A stranded rebase is local breakage, not an access problem,
+        // so it fails even for optional overlays instead of hiding
+        // behind the quiet no-upstream skip; a detached HEAD warns
+        // and keeps the skip (see `StrandedHead`).
+        if let Some(stranded) = stranded_head(&prefix) {
+            if counted {
+                live = ui_row(
+                    inputs.palette,
+                    quiet,
+                    live,
+                    inputs.multibyte,
+                    "warning",
+                    &format!("{name} overlay {}", stranded.describe()),
+                    out,
+                );
+            } else {
+                inputs.log.warn(
+                    warnings,
+                    &format!("  warning: {name} overlay {}", stranded.describe()),
+                );
+            }
+            if stranded.fails() {
+                return done(PullOverlayStatus::Failed, live);
+            }
+            return done(PullOverlayStatus::Skipped, live);
+        }
         if counted && verbose {
             live = ui_row(
                 inputs.palette,
@@ -401,13 +416,14 @@ pub fn pull_overlay(
         );
         return done(PullOverlayStatus::Failed, live);
     }
+    // In-memory `identity\trelative` text, not a temp file: nothing to
+    // release, and it must never reach a path API (see `pull_base`).
     let snapshot =
         match snapshot_updated_path_parents(&prefix, inputs.path, &head_before, &upstream) {
             Some(snapshot) => snapshot,
             None => return done(PullOverlayStatus::Failed, live),
         };
     if !repo_head_is(&prefix, &head_before) {
-        remove_snapshot(Path::new(&snapshot));
         inputs.log.warn(
             warnings,
             &format!("  warning: {name} overlay changed during synchronization"),
@@ -448,10 +464,18 @@ pub fn pull_overlay(
             verbose,
             log: inputs.log,
         };
-        if pull_repo(&repo_inputs, moves, out, warnings) != 0 {
-            remove_snapshot(Path::new(&snapshot));
+        let rebase = RebaseGuard::arm(&prefix, &head_before, &upstream);
+        // Still quiet and statusless, but never stranded (a rebase
+        // left in progress surfaces as failed on the next run) and
+        // never replayed over the same conflict every run.
+        if rebase.repeats_conflict() {
             return done(PullOverlayStatus::Empty, live);
         }
+        if pull_repo(&repo_inputs, moves, out, warnings) != 0 {
+            rebase.abort_failed(&prefix);
+            return done(PullOverlayStatus::Empty, live);
+        }
+        rebase.succeeded();
         let head_after = repo_head(&prefix);
         let mut status = PullOverlayStatus::Current;
         if !head_before.is_empty() && !head_after.is_empty() && head_before != head_after {
@@ -471,13 +495,9 @@ pub fn pull_overlay(
                     )
                 });
             if !normalized {
-                remove_snapshot(Path::new(&snapshot));
                 return done(PullOverlayStatus::Failed, live);
             }
             status = PullOverlayStatus::Changed;
-        }
-        if !remove_snapshot_checked(Path::new(&snapshot)) {
-            status = PullOverlayStatus::Failed;
         }
         return done(status, live);
     }
@@ -517,8 +537,36 @@ pub fn pull_overlay(
         verbose,
         log: inputs.log,
     };
+    let rebase = RebaseGuard::arm(&prefix, &head_before, &upstream);
+    if rebase.repeats_conflict() {
+        if counted {
+            live = ui_row(
+                inputs.palette,
+                quiet,
+                live,
+                inputs.multibyte,
+                "warning",
+                &format!("{name} overlay {REPEATED_CONFLICT}"),
+                out,
+            );
+        } else {
+            inputs.log.warn(
+                warnings,
+                &format!("  warning: {name} overlay {REPEATED_CONFLICT}"),
+            );
+        }
+        return done(PullOverlayStatus::Failed, live);
+    }
     if pull_repo(&repo_inputs, moves, out, warnings) != 0 {
-        remove_snapshot(Path::new(&snapshot));
+        if !rebase.abort_failed(&prefix) {
+            inputs.log.warn(
+                warnings,
+                &format!(
+                    "  warning: {name} overlay {}",
+                    StrandedHead::Rebase.describe()
+                ),
+            );
+        }
         if counted {
             live = ui_row(
                 inputs.palette,
@@ -536,6 +584,7 @@ pub fn pull_overlay(
         }
         return done(PullOverlayStatus::Failed, live);
     }
+    rebase.succeeded();
     let head_after = repo_head(&prefix);
     let mut status = PullOverlayStatus::Current;
     if !head_before.is_empty() && !head_after.is_empty() && head_before != head_after {
@@ -555,7 +604,6 @@ pub fn pull_overlay(
                 )
             });
         if !normalized {
-            remove_snapshot(Path::new(&snapshot));
             inputs.log.warn(
                 warnings,
                 &format!("  warning: {name} overlay mode normalization failed"),
@@ -584,9 +632,6 @@ pub fn pull_overlay(
             &format!("{name} dotfiles current"),
             out,
         );
-    }
-    if !remove_snapshot_checked(Path::new(&snapshot)) {
-        status = PullOverlayStatus::Failed;
     }
     done(status, live)
 }

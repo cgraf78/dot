@@ -98,6 +98,11 @@ impl Fixture {
             .status()
             .unwrap();
         assert!(status.success());
+        // `pull_overlay` runs git with the host's config; a repo-local
+        // identity keeps its autostash and rebase commits working on
+        // hosts (CI) with none configured.
+        git(&overlay, &["config", "user.name", "t"]);
+        git(&overlay, &["config", "user.email", "t@t"]);
         Self {
             home_text: home.to_string_lossy().into_owned(),
             origin_text: origin.to_string_lossy().into_owned(),
@@ -303,26 +308,224 @@ fn invalid_candidates_and_diverged_updates_fail_without_installing_them() {
     let diverged = Fixture::new("overlay-diverged");
     stage(&diverged.overlay, "home/overlay.txt", b"local\n");
     commit(&diverged.overlay, "local");
+    stage(&diverged.overlay, "home/other.txt", b"seed\n");
+    commit(&diverged.overlay, "other");
+    stage(&diverged.overlay, "home/other.txt", b"user edit\n");
     stage(&diverged.origin, "home/overlay.txt", b"remote\n");
     commit(&diverged.origin, "remote");
     let outcome = diverged.pull(&diverged.origin_text, false, None, false).0;
     assert_eq!(outcome.status, PullOverlayStatus::Failed);
-    let conflicted = std::fs::read(diverged.overlay.join("home/overlay.txt")).unwrap();
-    assert!(
-        conflicted
-            .windows(b"<<<<<<< HEAD".len())
-            .any(|part| part == b"<<<<<<< HEAD")
+    // The failed rebase is aborted: no conflict markers in the live
+    // file, HEAD back on its branch, and the autostashed edit back.
+    assert_eq!(
+        std::fs::read(diverged.overlay.join("home/overlay.txt")).unwrap(),
+        b"local\n"
     );
-    assert!(
-        conflicted
-            .windows(b"local".len())
-            .any(|part| part == b"local")
+    assert_eq!(
+        std::fs::read(diverged.overlay.join("home/other.txt")).unwrap(),
+        b"user edit\n"
     );
-    assert!(
-        conflicted
-            .windows(b"remote".len())
-            .any(|part| part == b"remote")
+    assert!(!rebase_in_progress(&diverged.overlay));
+    assert_eq!(
+        git_status(&diverged.overlay, &["symbolic-ref", "-q", "HEAD"]),
+        Some(0)
     );
+    assert_rebase_aborted(&diverged.overlay);
+}
+
+/// Exit status of a raw git query in `repo` (hermetic config).
+fn git_status(repo: &Path, args: &[&str]) -> Option<i32> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .code()
+}
+
+/// Proof that a rebase really started and was aborted, with the
+/// autostash consumed (identical bytes alone could also mean the
+/// rebase never started).
+fn assert_rebase_aborted(repo: &Path) {
+    let output = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let reflog = output(&["reflog", "-n", "5", "--format=%gs"]);
+    assert!(reflog.contains("rebase (abort)"), "{reflog}");
+    assert_eq!(output(&["stash", "list"]), "");
+}
+
+/// Whether `repo` has a rebase in progress (either backend).
+fn rebase_in_progress(repo: &Path) -> bool {
+    repo.join(".git/rebase-merge").exists() || repo.join(".git/rebase-apply").exists()
+}
+
+#[test]
+fn a_recorded_conflict_is_not_replayed_until_a_side_moves() {
+    let diverged = Fixture::new("overlay-repeat-conflict");
+    stage(&diverged.overlay, "home/overlay.txt", b"local\n");
+    commit(&diverged.overlay, "local");
+    stage(&diverged.origin, "home/overlay.txt", b"remote\n");
+    commit(&diverged.origin, "remote");
+    assert_eq!(
+        diverged
+            .pull(&diverged.origin_text, false, None, false)
+            .0
+            .status,
+        PullOverlayStatus::Failed
+    );
+    let aborts = || {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&diverged.overlay)
+            .args(["reflog", "--format=%gs"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.starts_with("rebase (abort)"))
+            .count()
+    };
+    assert_eq!(aborts(), 1);
+    // Loud and optional repeats both leave the work tree alone.
+    let (outcome, _, warnings) = diverged.pull(&diverged.origin_text, false, None, false);
+    assert_eq!(outcome.status, PullOverlayStatus::Failed);
+    assert!(
+        String::from_utf8_lossy(&warnings).contains("still conflicts with its upstream"),
+        "{}",
+        String::from_utf8_lossy(&warnings)
+    );
+    assert_eq!(
+        diverged
+            .pull(&diverged.origin_text, true, None, false)
+            .0
+            .status,
+        PullOverlayStatus::Empty
+    );
+    assert_eq!(aborts(), 1);
+    stage(&diverged.origin, "home/later.txt", b"later\n");
+    commit(&diverged.origin, "later");
+    assert_eq!(
+        diverged
+            .pull(&diverged.origin_text, false, None, false)
+            .0
+            .status,
+        PullOverlayStatus::Failed
+    );
+    assert_eq!(aborts(), 2);
+}
+
+#[test]
+fn optional_overlay_failed_rebase_is_aborted() {
+    // The optional pull stays quiet and statusless on failure, but it
+    // must still not strand the checkout mid-rebase.
+    let diverged = Fixture::new("overlay-optional-diverged");
+    stage(&diverged.overlay, "home/overlay.txt", b"local\n");
+    commit(&diverged.overlay, "local");
+    stage(&diverged.origin, "home/overlay.txt", b"remote\n");
+    commit(&diverged.origin, "remote");
+    let outcome = diverged.pull(&diverged.origin_text, true, None, false).0;
+    assert_eq!(outcome.status, PullOverlayStatus::Empty);
+    assert!(!rebase_in_progress(&diverged.overlay));
+    assert_rebase_aborted(&diverged.overlay);
+    assert_eq!(
+        std::fs::read(diverged.overlay.join("home/overlay.txt")).unwrap(),
+        b"local\n"
+    );
+}
+
+#[test]
+fn stranded_rebase_fails_and_detached_head_warns_instead_of_silent_skip() {
+    // A rebase left in progress has no `@{u}`; it must read as Failed,
+    // optional or not, and a rebase this run did not start stays
+    // untouched. A bare detached HEAD (a user action) warns and skips.
+    for optional in [false, true] {
+        let stranded = Fixture::new("overlay-stranded");
+        stage(&stranded.overlay, "home/overlay.txt", b"local\n");
+        commit(&stranded.overlay, "local");
+        stage(&stranded.origin, "home/overlay.txt", b"remote\n");
+        commit(&stranded.origin, "remote");
+        git(&stranded.overlay, &["fetch", "-q", "origin"]);
+        assert_eq!(
+            git_status(&stranded.overlay, &["rebase", "origin/HEAD"]),
+            Some(1)
+        );
+        let (outcome, _, warnings) = stranded.pull(&stranded.origin_text, optional, None, false);
+        assert_eq!(
+            outcome.status,
+            PullOverlayStatus::Failed,
+            "optional={optional}"
+        );
+        assert!(
+            String::from_utf8_lossy(&warnings).contains("rebase in progress"),
+            "{}",
+            String::from_utf8_lossy(&warnings)
+        );
+        assert!(rebase_in_progress(&stranded.overlay));
+
+        let detached = Fixture::new("overlay-detached");
+        git(&detached.overlay, &["checkout", "-q", "--detach"]);
+        let (outcome, _, warnings) = detached.pull(&detached.origin_text, optional, None, false);
+        assert_eq!(
+            outcome.status,
+            PullOverlayStatus::Skipped,
+            "optional={optional}"
+        );
+        assert!(
+            String::from_utf8_lossy(&warnings).contains("detached"),
+            "{}",
+            String::from_utf8_lossy(&warnings)
+        );
+    }
+}
+
+#[test]
+fn changed_with_many_sibling_updates_succeeds() {
+    // 40 updated siblings under one parent make the in-memory parent
+    // snapshot far longer than NAME_MAX; it is text, never a path,
+    // so a successful rebase still reports Changed on both the loud
+    // and the optional pull paths.
+    for optional in [false, true] {
+        let fixture = Fixture::new("overlay-many-siblings");
+        for index in 0..40 {
+            stage(
+                &fixture.origin,
+                &format!("home/sibling-{index:02}"),
+                b"sibling\n",
+            );
+        }
+        commit(&fixture.origin, "many siblings");
+        let (outcome, _, warnings) = fixture.pull(&fixture.origin_text, optional, None, false);
+        assert_eq!(
+            outcome.status,
+            PullOverlayStatus::Changed,
+            "optional={optional}: {}",
+            String::from_utf8_lossy(&warnings)
+        );
+        assert_eq!(
+            std::fs::read(fixture.overlay.join("home/sibling-39")).unwrap(),
+            b"sibling\n"
+        );
+    }
 }
 
 #[test]
