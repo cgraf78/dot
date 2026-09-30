@@ -5,9 +5,10 @@
 //! (installed-link snapshot, base/overlay pull, policy reload,
 //! overlay converge, lifecycle prepare), the defensive config
 //! reload, and finalize (provider checkpoint, link phase,
-//! lifecycle retire, shdeps branch, merges, lifecycle commit,
-//! worktree normalize, `_ui_done`). Pure sequencing folds live in
-//! [`crate::update`]; this module owns the impure step execution,
+//! lifecycle retire, shdeps branch, the opt-in shdeps prune stage,
+//! merges, lifecycle commit, worktree normalize, `_ui_done`). Pure
+//! sequencing folds live in [`crate::update`]; this module owns the
+//! impure step execution,
 //! composing [`crate::repos_pull_fleet`], [`crate::repos_link_all`],
 //! [`crate::profile_lifecycle`], [`crate::pre_sync`],
 //! [`crate::merges`], and [`crate::shdeps`].
@@ -40,12 +41,83 @@ pub struct UpdateFlags {
     pub verbose: bool,
 }
 
+/// Command driving one engine run.
+///
+/// Dependency pruning is maintenance owned by `dot update`/`dot pull`. `dot
+/// init` reuses the engine for first convergence, where a prune failure would
+/// fail (and roll back) the installation itself, so init never prunes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caller {
+    /// `dot update` or `dot pull`.
+    Update,
+    /// `dot init` convergence.
+    Init,
+}
+
+/// Environment variable selecting when `dot update` prunes orphaned Shdeps
+/// dependencies.
+///
+/// This is deliberately not a config-file key: the client config is shared
+/// through the base repository and Dot rejects unknown keys, so a key would
+/// brick every client still running an older Dot. Older releases ignore an
+/// unknown environment variable instead (they simply do not prune).
+pub const PRUNE_ENV: &str = "DOT_SHDEPS_PRUNE";
+
+/// When `dot update` removes orphaned Shdeps dependencies itself.
+///
+/// Pruning is destructive (uninstall hooks run and managed payloads are
+/// deleted), so it is opt-in and never runs from `dot init`. Whatever the
+/// mode, the engine prunes only after a converged generation whose
+/// dependency config it already trusted enough to run the Tools stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneMode {
+    /// Never prune (the default).
+    Never,
+    /// Prune only on `dot update --cron`.
+    Cron,
+    /// Prune on every `dot update`/`dot pull`.
+    Always,
+}
+
+impl PruneMode {
+    /// Parse a [`PRUNE_ENV`] value. Unset or empty reads as [`Never`]
+    /// (`${VAR:-}` convention); an unrecognized value is `None` so the
+    /// caller can warn and fall back to `Never` instead of failing the
+    /// update: a value a newer client understands must never stop an
+    /// older one from converging (and upgrading itself).
+    ///
+    /// [`Never`]: PruneMode::Never
+    pub fn parse(value: Option<&str>) -> Option<Self> {
+        match value.unwrap_or_default() {
+            "" | "never" => Some(PruneMode::Never),
+            "cron" => Some(PruneMode::Cron),
+            "always" => Some(PruneMode::Always),
+            _ => None,
+        }
+    }
+
+    /// Whether an update invocation (`cron` = `--cron` was given) prunes.
+    /// Only the explicit cron flag counts: `--quiet` or `DOT_QUIET` change
+    /// output, never what an update does.
+    pub fn applies(self, cron: bool) -> bool {
+        match self {
+            PruneMode::Never => false,
+            PruneMode::Cron => cron,
+            PruneMode::Always => true,
+        }
+    }
+}
+
 /// Shared inputs for the native update driver: every global the
 /// shell `_dot_update` tree reads, plus the UI/logger handles the
 /// pull and link lanes thread the same way.
 pub struct EngineInputs<'a> {
     /// Immutable process boundary for leaf workers launched during this update.
     pub runtime: &'a crate::app::Runtime,
+    /// Command driving this engine run.
+    pub caller: Caller,
+    /// Parsed [`PRUNE_ENV`] for this run (always `Never` for `dot init`).
+    pub prune_mode: PruneMode,
     /// Native update lock claim exposed only to transactional hook workers.
     pub update_lock_token: Option<&'a str>,
     /// Parsed client configuration for this update generation.
@@ -591,7 +663,7 @@ pub fn sync_repos(
         home: inputs.home,
         dot_quiet: inputs.dot_quiet,
         dot_verbose: inputs.dot_verbose,
-        ui_total: Some("5"),
+        ui_total: Some(stage_total(inputs)),
         update_jobs: inputs.update_jobs,
         bar_width: inputs.bar_width,
         defer_finish: Some("1"),
@@ -792,7 +864,7 @@ fn pull_overlays_only(
             entries,
             extra_args: inputs.extra_args,
             home: inputs.home,
-            ui_total: Some("5"),
+            ui_total: Some(stage_total(inputs)),
             dot_quiet: inputs.dot_quiet,
             dot_verbose: inputs.dot_verbose,
             update_jobs: inputs.update_jobs,
@@ -1344,8 +1416,14 @@ fn record_name(record: &str) -> Option<&str> {
 }
 
 /// `_dot_update_skip_inputs`: the Tools/Configs warning close for
-/// a failed input side.
-fn skip_inputs_rows(stage: &mut Stage, out: &mut dyn std::io::Write, reason: &str) {
+/// a failed input side, with the Prune skip row between them when this
+/// run counts a Prune stage.
+fn skip_inputs_rows(
+    stage: &mut Stage,
+    out: &mut dyn std::io::Write,
+    reason: &str,
+    prune: Option<PruneSkip>,
+) {
     let open = stage.start(
         b"Tools",
         Some(b"skipping configured dependencies"),
@@ -1359,6 +1437,9 @@ fn skip_inputs_rows(stage: &mut Stage, out: &mut dyn std::io::Write, reason: &st
         crate::update_engine::now_secs(),
     );
     let _ = out.write_all(&close);
+    if let Some(skip) = prune {
+        prune_skip_row(stage, out, None, skip);
+    }
     let open = stage.start(
         b"Configs",
         Some(b"skipping config hooks"),
@@ -1374,10 +1455,170 @@ fn skip_inputs_rows(stage: &mut Stage, out: &mut dyn std::io::Write, reason: &st
     let _ = out.write_all(&close);
 }
 
+/// Why the Prune stage removed nothing this run. Every reason mirrors a
+/// condition under which the Tools stage also did not converge the
+/// dependency config, so prune never acts on a configuration Dot did not
+/// trust enough to install from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PruneSkip {
+    /// Profile resolution, repository sync, or overlay linking failed, or
+    /// the generation is frozen: the checked-out config may be partial.
+    Inputs,
+    /// Profile deactivation failed, so the Tools stage never ran.
+    Retire,
+    /// No dependency provider is configured (or this invocation skips it).
+    NoProvider,
+    /// Shdeps could not be prepared, so there is nothing to prune with.
+    Unavailable,
+}
+
+impl PruneSkip {
+    /// Stage row (status, detail) for this skip.
+    fn row(self) -> (&'static [u8], &'static [u8]) {
+        match self {
+            PruneSkip::Inputs => (b"warning", b"repository sync failed; prune skipped"),
+            PruneSkip::Retire => (b"warning", b"profile deactivation failed; prune skipped"),
+            PruneSkip::NoProvider => (b"ok", b"no dependency provider"),
+            PruneSkip::Unavailable => (b"warning", b"shdeps unavailable; prune skipped"),
+        }
+    }
+}
+
+/// The provider that converged this generation's Tools stage, retained so
+/// Prune runs with the same validated snapshot and environment.
+struct PruneReady<'a> {
+    provider: crate::shdeps_provider::Inputs<'a>,
+    prepared: crate::shdeps_provider::Prepared,
+}
+
+/// Outcome of the Prune stage for the finalize status fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PruneStatus {
+    /// Pruned cleanly or skipped.
+    Ok,
+    /// Prune ran and failed; later stages still run.
+    Failed,
+    /// Interrupted or teardown incomplete: stop with this status.
+    Stop(i32),
+}
+
+/// Whether this run renders a Prune stage (and counts it in the stage
+/// total). Known before the first row: the mode comes from the invocation
+/// environment, never from a repository that sync may change.
+fn prune_row(caller: Caller, mode: PruneMode, cron: bool) -> bool {
+    caller == Caller::Update && mode.applies(cron)
+}
+
+/// Stage count for this invocation: Repos, Overlays, Tools, Configs, and
+/// Cleanup, plus Prune when this run prunes.
+fn stage_total(inputs: &EngineInputs<'_>) -> &'static str {
+    if prune_row(inputs.caller, inputs.prune_mode, inputs.flags.cron) {
+        "6"
+    } else {
+        "5"
+    }
+}
+
+/// Render the Prune stage as skipped, naming the reason.
+fn prune_skip_row(
+    stage: &mut Stage,
+    out: &mut dyn std::io::Write,
+    verbose: Option<&str>,
+    skip: PruneSkip,
+) {
+    let open = stage.start(
+        b"Prune",
+        Some(b"skipping dependency prune"),
+        now_secs(),
+        verbose,
+    );
+    let _ = out.write_all(&open);
+    let (status, detail) = skip.row();
+    let close = stage.finish(status, detail, now_secs());
+    let _ = out.write_all(&close);
+}
+
+/// Run (or explain skipping) `shdeps prune -y` as its own stage.
+///
+/// Stdout (the removal report) renders as detail rows, which quiet and cron
+/// runs drop like the old `shdeps prune -y > /dev/null` cron entry.
+/// Provider stderr always reaches stderr, and a quiet run adds one failure
+/// line, so cron reports warnings and failures only.
+fn prune_stage(
+    inputs: &EngineInputs<'_>,
+    stage: &mut Stage,
+    io: &mut UpdateIo<'_>,
+    gate: Result<PruneReady<'_>, PruneSkip>,
+) -> PruneStatus {
+    let ready = match gate {
+        Ok(ready) => ready,
+        Err(skip) => {
+            prune_skip_row(stage, io.out, inputs.dot_verbose, skip);
+            return PruneStatus::Ok;
+        }
+    };
+    let open = stage.start(
+        b"Prune",
+        Some(b"pruning orphaned dependencies"),
+        now_secs(),
+        inputs.dot_verbose,
+    );
+    let _ = io.out.write_all(&open);
+    let outcome = crate::shdeps_provider::prune(&ready.provider, &ready.prepared);
+    if outcome.interrupted.is_some() {
+        return PruneStatus::Stop(interruption_status(outcome.interrupted));
+    }
+    if outcome.abort || cancelled() {
+        return PruneStatus::Stop(interruption_status(None));
+    }
+    let close = if outcome.status == 0 {
+        stage.finish(b"ok", b"orphaned dependencies checked", now_secs())
+    } else {
+        stage.finish(
+            b"failed",
+            format!("dependency prune failed (exit {})", outcome.status).as_bytes(),
+            now_secs(),
+        )
+    };
+    let _ = io.out.write_all(&close);
+    for line in outcome.stdout.split(|byte| *byte == b'\n') {
+        let text = crate::progress_ui::sanitize_untrusted_text(line.trim_ascii());
+        if text.is_empty() {
+            continue;
+        }
+        let (row, _) = crate::progress_ui::detail(
+            inputs.palette,
+            quiet(inputs),
+            false,
+            &text,
+            inputs.multibyte,
+        );
+        let _ = io.out.write_all(&row);
+    }
+    let _ = io.err.write_all(&outcome.stderr);
+    if outcome.status == 0 {
+        return PruneStatus::Ok;
+    }
+    if quiet(inputs) {
+        warn_row(
+            io.err,
+            inputs.palette,
+            &format!("  warning: shdeps prune failed (exit {})", outcome.status),
+        );
+    }
+    PruneStatus::Failed
+}
+
 /// `_dot_update_finalize` natively: checkpoint, link phase (or the
 /// frozen preservation rows), lifecycle retire, the provider-none
-/// tools stage, the empty merges close, lifecycle commit, worktree
-/// normalize, and `_ui_done`. Returns the update status.
+/// tools stage, the opt-in prune stage, the empty merges close,
+/// lifecycle commit, worktree normalize, and `_ui_done`. Returns the
+/// update status.
+///
+/// `degraded` receives the failed Tools/Prune stages only when they are
+/// the sole reason for a nonzero status (the run otherwise converged);
+/// any other failure leaves it empty so the cron record reads `fail`.
+/// After a provider re-exec it carries the continuation's value.
 #[allow(clippy::too_many_arguments)]
 fn finalize(
     inputs: &EngineInputs<'_>,
@@ -1387,12 +1628,20 @@ fn finalize(
     now_secs: i64,
     update_status: i32,
     frozen: bool,
+    degraded: &mut crate::update_status::Degraded,
 ) -> i32 {
     if cancelled() {
         return 1;
     }
     let mut status = update_status;
     let mut inputs_ready = status == 0;
+    // Prune trusts exactly what the Tools stage trusted: it runs only after
+    // a prepared provider converged this generation (see the Tools branch).
+    let prune_this_run = prune_row(inputs.caller, inputs.prune_mode, inputs.flags.cron);
+    // Tools and Prune failures are tracked apart from `status` so the cron
+    // record can tell a converged-but-degraded run from one that did not
+    // converge. Both still make the update exit 1 (folded in below).
+    let mut stages = crate::update_status::Degraded::default();
     let checkpoint = format!("{}/dot/provider-reexec-failed", inputs.state_home);
     if !crate::shdeps::consume_checkpoint(Path::new(&checkpoint), inputs.source_root_git) {
         let close = crate::progress_ui::done(
@@ -1431,7 +1680,7 @@ fn finalize(
             manifest: inputs.manifest,
             legacy_manifest: inputs.legacy_manifest,
             update_jobs: inputs.update_jobs,
-            ui_total: Some("5"),
+            ui_total: Some(stage_total(inputs)),
             dot_verbose: inputs.dot_verbose,
             dot_quiet: inputs.dot_quiet,
             dest: inputs.dest,
@@ -1455,7 +1704,12 @@ fn finalize(
         return 1;
     }
     if !inputs_ready {
-        skip_inputs_rows(stage, io.out, "repository synchronization failed");
+        skip_inputs_rows(
+            stage,
+            io.out,
+            "repository synchronization failed",
+            prune_this_run.then_some(PruneSkip::Inputs),
+        );
     } else {
         let extensions_dir = state
             .config
@@ -1491,13 +1745,19 @@ fn finalize(
         );
         if retired != 0 {
             status = 1;
-            skip_inputs_rows(stage, io.out, "profile deactivation failed");
+            skip_inputs_rows(
+                stage,
+                io.out,
+                "profile deactivation failed",
+                prune_this_run.then_some(PruneSkip::Retire),
+            );
         } else {
             if cancelled() {
                 return 1;
             }
             let provider_enabled =
                 !inputs.skip_provider && state.config.provider == crate::config::Provider::Shdeps;
+            let mut prune: Result<PruneReady<'_>, PruneSkip> = Err(PruneSkip::NoProvider);
             if !provider_enabled {
                 let open = stage.start(
                     b"Tools",
@@ -1563,7 +1823,8 @@ fn finalize(
                             crate::update_engine::now_secs(),
                         );
                         let _ = io.out.write_all(&close);
-                        status = 1;
+                        stages.tools = true;
+                        prune = Err(PruneSkip::Unavailable);
                     }
                     Ok(prepared) => {
                         let open = stage.start(
@@ -1575,7 +1836,7 @@ fn finalize(
                         let _ = io.out.write_all(&open);
                         let provider = crate::shdeps_provider::update(
                             &provider_inputs,
-                            prepared,
+                            &prepared,
                             stage,
                             &mut *io.out,
                             &mut *io.err,
@@ -1594,18 +1855,41 @@ fn finalize(
                         let _ = io.out.write_all(&close);
                         let _ = io.out.write_all(&provider.details);
                         if provider.status != 0 {
-                            status = 1;
+                            stages.tools = true;
                         } else if let Some((before, after)) = provider.revision_change {
                             if cancelled() {
                                 return 1;
                             }
-                            return provider_reexec(inputs, io, &before, &after, now_secs);
+                            return provider_reexec(
+                                inputs, io, &before, &after, now_secs, degraded,
+                            );
+                        }
+                        // A failed update (a dependency or post hook) still
+                        // leaves this generation's config trusted: prune on.
+                        // Otherwise release the provider snapshot now.
+                        if prune_this_run {
+                            prune = Ok(PruneReady {
+                                provider: provider_inputs,
+                                prepared,
+                            });
                         }
                     }
                 }
             }
             if cancelled() {
                 return 1;
+            }
+            // Prune directly after Tools so it reads the same Shdeps config
+            // the provider just converged, before any merge hook runs.
+            if prune_this_run {
+                match prune_stage(inputs, stage, io, prune) {
+                    PruneStatus::Ok => {}
+                    PruneStatus::Failed => stages.prune = true,
+                    PruneStatus::Stop(code) => return code,
+                }
+                if cancelled() {
+                    return 1;
+                }
             }
             let extensions_dir = state
                 .config
@@ -1634,7 +1918,7 @@ fn finalize(
                     palette: inputs.palette,
                     multibyte: inputs.multibyte,
                     ascii: inputs.ascii,
-                    ui_total: Some("5"),
+                    ui_total: Some(stage_total(inputs)),
                     bar_width: inputs.bar_width,
                     log: inputs.log,
                 },
@@ -1650,7 +1934,10 @@ fn finalize(
             }
         }
     }
-    match lifecycle_publish_decision(inputs_ready, status, cancelled()) {
+    // A failed Tools stage withholds the lifecycle commit exactly as it did
+    // when it set `status` directly; Prune is deliberately not part of this.
+    let lifecycle_status = if stages.tools { 1 } else { status };
+    match lifecycle_publish_decision(inputs_ready, lifecycle_status, cancelled()) {
         LifecyclePublish::Interrupted => return 1,
         LifecyclePublish::Skip => {}
         LifecyclePublish::Commit => {
@@ -1684,6 +1971,16 @@ fn finalize(
     }
     if cancelled() {
         return 1;
+    }
+    // Converged but degraded only when nothing else failed; the exit status
+    // stays 1 either way, so callers and scripts see no change.
+    *degraded = if status == 0 {
+        stages
+    } else {
+        crate::update_status::Degraded::default()
+    };
+    if !stages.is_empty() {
+        status = 1;
     }
     let based = inputs.base.is_some_and(|base| base.exists());
     if based {
@@ -1735,6 +2032,7 @@ fn provider_reexec(
     before: &str,
     after: &str,
     now_secs: i64,
+    degraded: &mut crate::update_status::Degraded,
 ) -> i32 {
     if cancelled() {
         return 1;
@@ -1834,7 +2132,12 @@ fn provider_reexec(
     if cancelled() {
         return 1;
     }
+    // The continuation is the same command with the same prune mode. The
+    // mode travels as a value because the runtime environment was scrubbed
+    // of `DOT_SHDEPS_PRUNE` at entry.
     let gathered = match gather(
+        inputs.caller,
+        inputs.prune_mode,
         inputs.original_args,
         &runtime,
         &config,
@@ -1850,7 +2153,9 @@ fn provider_reexec(
     if cancelled() {
         return 1;
     }
-    run_gathered(&nested, &mut *io.out, &mut *io.err, now_secs)
+    // The continuation records its own cron outcome; handing its degraded
+    // stages back lets the outer record match instead of reading `fail`.
+    run_gathered(&nested, &mut *io.out, &mut *io.err, now_secs, degraded)
 }
 
 fn cancelled() -> bool {
@@ -1927,6 +2232,8 @@ fn startup_inputs<'a>(inputs: &EngineInputs<'a>) -> crate::startup::Inputs<'a> {
 /// from here, so one value lives through the whole run.
 pub struct Gathered {
     runtime: crate::app::Runtime,
+    caller: Caller,
+    prune_mode: PruneMode,
     update_lock_token: Option<String>,
     config: crate::config::Config,
     flags: UpdateFlags,
@@ -1968,6 +2275,8 @@ impl Gathered {
     pub fn inputs(&self) -> EngineInputs<'_> {
         EngineInputs {
             runtime: &self.runtime,
+            caller: self.caller,
+            prune_mode: self.prune_mode,
             update_lock_token: self.update_lock_token.as_deref(),
             config: &self.config,
             flags: self.flags,
@@ -2078,6 +2387,8 @@ fn base_client(
 
 /// A complete request for one native update invocation.
 pub struct UpdateRequest<'a> {
+    /// Command driving this run.
+    pub caller: Caller,
     /// Parsed client configuration.
     pub config: &'a crate::config::Config,
     /// Command environment after update flag side effects.
@@ -2122,7 +2433,10 @@ impl From<crate::xdg::Error> for GatherError {
 /// `state_home` is its trampoline-normalized XDG state dir and `source_root`
 /// is `$DOT_SOURCE_ROOT`. Capture failures are terminal: there is no legacy
 /// engine whose ambient process state can safely substitute for these values.
+#[allow(clippy::too_many_arguments)]
 fn gather(
+    caller: Caller,
+    prune_mode: PruneMode,
     args: &[std::ffi::OsString],
     runtime: &crate::app::Runtime,
     config: &crate::config::Config,
@@ -2204,6 +2518,8 @@ fn gather(
     };
     Ok(Gathered {
         runtime: runtime.clone(),
+        caller,
+        prune_mode,
         update_lock_token: env_value(env, "DOT_UPDATE_LOCK_TOKEN"),
         config: config.clone(),
         flags,
@@ -2261,6 +2577,46 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Resolve [`PRUNE_ENV`] once at the command boundary and return a runtime
+/// whose environment no longer carries it.
+///
+/// The Shdeps provider and merge, lifecycle, and extension hooks run with the
+/// runtime environment, and none of them should act on Dot's prune policy;
+/// the parsed mode travels to the provider re-exec continuation as a value.
+/// Plain helpers spawned without the runtime environment (for example
+/// `git pull`) still inherit the process environment; they never read it.
+/// `dot init` ignores the variable. An unrecognized value warns (even under
+/// cron) and reads as `never`, so it can never stop an update.
+fn prune_mode(
+    runtime: &crate::app::Runtime,
+    request: &UpdateRequest<'_>,
+    stderr: &mut dyn std::io::Write,
+) -> (PruneMode, crate::app::Runtime) {
+    let raw = request
+        .env
+        .get(OsStr::new(PRUNE_ENV))
+        .map(|value| value.to_string_lossy().into_owned());
+    let scrubbed = runtime.without_env(PRUNE_ENV);
+    if request.caller != Caller::Update {
+        return (PruneMode::Never, scrubbed);
+    }
+    match PruneMode::parse(raw.as_deref()) {
+        Some(mode) => (mode, scrubbed),
+        None => {
+            let value =
+                crate::progress_ui::sanitize_untrusted_text(raw.unwrap_or_default().as_bytes());
+            let mut message = format!("  warning: ignoring {PRUNE_ENV}=").into_bytes();
+            message.extend_from_slice(&value);
+            message.extend_from_slice(b"; expected never, cron, or always");
+            let _ = stderr.write_all(&crate::progress_ui::warn_line(
+                &crate::progress_ui::Palette::empty(),
+                &message,
+            ));
+            (PruneMode::Never, scrubbed)
+        }
+    }
+}
+
 /// Execute one native update through the typed runtime and stream boundary.
 pub fn run_update(
     runtime: &crate::app::Runtime,
@@ -2271,7 +2627,11 @@ pub fn run_update(
         Some(state_home) => state_home,
         None => return 1,
     };
+    let (prune_mode, runtime) = prune_mode(runtime, request, streams.stderr);
+    let runtime = &runtime;
     let gathered = match gather(
+        request.caller,
+        prune_mode,
         request.args,
         runtime,
         request.config,
@@ -2297,7 +2657,14 @@ pub fn run_update(
         inner: &mut *streams.stderr,
         failed: false,
     };
-    let code = run_gathered(&gathered.inputs(), &mut out, &mut err, now_secs());
+    let mut degraded = crate::update_status::Degraded::default();
+    let code = run_gathered(
+        &gathered.inputs(),
+        &mut out,
+        &mut err,
+        now_secs(),
+        &mut degraded,
+    );
     if out.failed() || err.failed() {
         return 1;
     }
@@ -2314,16 +2681,23 @@ pub fn run_update(
 /// `skip` line to the cron outcome log and warns on stderr even in
 /// cron mode, so a frozen slot is visible without re-running.
 /// Finding #6 records `ok`/`fail` the same way on the way out and
-/// refreshes the last-success stamp on success. Interrupted runs
-/// record nothing (cancellation is not an outcome), and non-cron
-/// runs write nothing (the history-tree tests pin the state
-/// directory across plain updates).
+/// refreshes the last-success stamp on success. A run that converged
+/// (sync, links, deactivation, configs; no lifecycle commit failure)
+/// but whose Tools or Prune stage failed records `degraded` with those
+/// stages and refreshes only the convergence stamp, so `dot doctor`
+/// can tell it from a frozen host; its exit status stays 1.
+/// Interrupted runs record nothing (cancellation is not an outcome),
+/// and non-cron runs write nothing (the history-tree tests pin the
+/// state directory across plain updates). `degraded` reports this
+/// run's degraded stages to a provider re-exec's outer run.
 fn run_gathered(
     inputs: &EngineInputs<'_>,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
     now_secs: i64,
+    degraded: &mut crate::update_status::Degraded,
 ) -> i32 {
+    *degraded = crate::update_status::Degraded::default();
     if cancelled() {
         return 1;
     }
@@ -2353,12 +2727,27 @@ fn run_gathered(
         );
         return 0;
     }
-    let rc = run_gathered_inner(inputs, out, err, now_secs);
+    let rc = run_gathered_inner(inputs, out, err, now_secs, degraded);
     if inputs.flags.cron && !cancelled() {
         let state_home = Path::new(inputs.state_home);
         if rc == 0 {
             crate::update_status::append_outcome(state_home, now_secs, "ok", "update", "");
             crate::update_status::record_success(state_home, now_secs);
+            // Exit 0 implies no failed stage: a clean convergence.
+            crate::update_status::record_converged(
+                state_home,
+                now_secs,
+                crate::update_status::Degraded::default(),
+            );
+        } else if !degraded.is_empty() {
+            crate::update_status::append_outcome(
+                state_home,
+                now_secs,
+                "degraded",
+                "update",
+                &degraded.detail(),
+            );
+            crate::update_status::record_converged(state_home, now_secs, *degraded);
         } else {
             crate::update_status::append_outcome(state_home, now_secs, "fail", "update", "");
         }
@@ -2373,15 +2762,16 @@ fn run_gathered_inner(
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
     now_secs: i64,
+    degraded: &mut crate::update_status::Degraded,
 ) -> i32 {
     if cancelled() {
         return 1;
     }
-    // `_ui_begin 5`: the update always runs counted (the assignment
-    // overwrites any ambient total, like the shell).
+    // `_ui_begin 5` (6 with a Prune stage): the update always runs counted
+    // (the assignment overwrites any ambient total, like the shell).
     let mut stage = Stage::begin(
         inputs.palette.clone(),
-        "5",
+        stage_total(inputs),
         quiet(inputs),
         inputs.live,
         inputs.multibyte,
@@ -2402,6 +2792,7 @@ fn run_gathered_inner(
             now_secs,
             1,
             sync.frozen,
+            degraded,
         );
         return rc;
     }
@@ -2438,6 +2829,7 @@ fn run_gathered_inner(
         now_secs,
         0,
         sync.frozen,
+        degraded,
     )
 }
 
@@ -2534,6 +2926,55 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn prune_row_follows_mode_and_never_appears_for_init() {
+        for (caller, mode, cron, expected) in [
+            (Caller::Update, PruneMode::Never, true, false),
+            (Caller::Update, PruneMode::Cron, false, false),
+            (Caller::Update, PruneMode::Cron, true, true),
+            (Caller::Update, PruneMode::Always, false, true),
+            // Init convergence failure rolls back an installation; a prune
+            // failure must never be able to cause that.
+            (Caller::Init, PruneMode::Always, false, false),
+            (Caller::Init, PruneMode::Always, true, false),
+        ] {
+            assert_eq!(
+                prune_row(caller, mode, cron),
+                expected,
+                "{caller:?} {mode:?} cron={cron}"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_mode_parses_env_values_and_rejects_unknown_ones_softly() {
+        for (value, expected) in [
+            (None, Some(PruneMode::Never)),
+            (Some(""), Some(PruneMode::Never)),
+            (Some("never"), Some(PruneMode::Never)),
+            (Some("cron"), Some(PruneMode::Cron)),
+            (Some("always"), Some(PruneMode::Always)),
+            (Some("Cron"), None),
+            (Some("weekly"), None),
+        ] {
+            assert_eq!(PruneMode::parse(value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn prune_mode_applies_by_invocation_kind() {
+        for (mode, cron, expected) in [
+            (PruneMode::Never, false, false),
+            (PruneMode::Never, true, false),
+            (PruneMode::Cron, false, false),
+            (PruneMode::Cron, true, true),
+            (PruneMode::Always, false, true),
+            (PruneMode::Always, true, true),
+        ] {
+            assert_eq!(mode.applies(cron), expected, "{mode:?} cron={cron}");
         }
     }
 
@@ -2655,6 +3096,8 @@ mod tests {
             policy_from_env: false,
         };
         let gathered = gather(
+            Caller::Update,
+            PruneMode::Never,
             &[],
             &runtime,
             &config,
@@ -2743,6 +3186,7 @@ mod tests {
         let code = run_update(
             &runtime,
             &UpdateRequest {
+                caller: Caller::Update,
                 config: &config,
                 env: &env,
                 args: &[],

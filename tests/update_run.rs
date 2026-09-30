@@ -718,6 +718,7 @@ fn update_streams_stage_rows_before_completion() {
         dot::update_engine::run_update(
             &runtime,
             &dot::update_engine::UpdateRequest {
+                caller: dot::update_engine::Caller::Update,
                 config: &config,
                 env: &env,
                 args: &args,
@@ -759,6 +760,7 @@ fn update_streams_stage_rows_before_completion() {
         dot::update_engine::run_update(
             &runtime,
             &dot::update_engine::UpdateRequest {
+                caller: dot::update_engine::Caller::Update,
                 config: &config,
                 env: &env,
                 args: &args,

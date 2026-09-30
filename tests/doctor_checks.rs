@@ -131,6 +131,7 @@ fn cron_freshness_trips_on_stale_and_passes_on_fresh() {
     let check = |last: Option<i64>| {
         render(&check_cron_freshness(&CronInputs {
             last_success: last,
+            last_converged: None,
             now: 1_800_000_000,
         }))
     };
@@ -164,6 +165,116 @@ fn cron_freshness_trips_on_stale_and_passes_on_fresh() {
     assert!(!hostile.contains('✗'));
     let far_future = check(Some(i64::MAX));
     assert!(far_future.contains("✓ cron update succeeded recently"));
+}
+
+#[test]
+fn cron_freshness_separates_degraded_convergence_from_a_frozen_host() {
+    const NOW: i64 = 1_800_000_000;
+    let converged = |at: i64, failing: &str| dot::update_status::Converged {
+        at,
+        failing: failing.to_string(),
+    };
+    let check = |last: Option<i64>, conv: Option<dot::update_status::Converged>| {
+        render(&check_cron_freshness(&CronInputs {
+            last_success: last,
+            last_converged: conv,
+            now: NOW,
+        }))
+    };
+
+    // Converging but Prune keeps failing: degraded, naming the stage and
+    // how long the host has not been fully clean.
+    let degraded = check(Some(NOW - 5 * 3600), Some(converged(NOW - 600, "prune")));
+    assert!(
+        degraded.contains("⚠ cron update degraded: prune failing"),
+        "{degraded}"
+    );
+    assert!(
+        degraded.contains("since last success 5h0m ago; last converged 10m ago"),
+        "{degraded}"
+    );
+    assert!(
+        !degraded.contains("has not succeeded recently"),
+        "{degraded}"
+    );
+    assert!(!degraded.contains('✗'), "{degraded}");
+
+    // Degraded since the first run after an upgrade that never ran clean.
+    let never_clean = check(None, Some(converged(NOW - 60, "tools,prune")));
+    assert!(
+        never_clean.contains("⚠ cron update degraded: tools,prune failing"),
+        "{never_clean}"
+    );
+    assert!(
+        never_clean.contains("no clean cron update recorded; last converged 1m ago"),
+        "{never_clean}"
+    );
+
+    // A recent clean run wins over a newer degraded one inside the
+    // tolerance window, exactly like a transient failure today.
+    let transient = check(Some(NOW - 1800), Some(converged(NOW - 60, "prune")));
+    assert!(
+        transient.contains("✓ cron update succeeded recently"),
+        "{transient}"
+    );
+
+    // A clean convergence stamp counts as success even when the
+    // last-success write was lost.
+    let clean = check(None, Some(converged(NOW - 60, "")));
+    assert!(
+        clean.contains("✓ cron update succeeded recently"),
+        "{clean}"
+    );
+
+    // Convergence stopped too: the frozen warning, noting when the host
+    // last converged degraded.
+    let frozen = check(
+        Some(NOW - 9 * 3600),
+        Some(converged(NOW - 3 * 3600, "prune")),
+    );
+    assert!(
+        frozen.contains("⚠ cron update has not succeeded recently"),
+        "{frozen}"
+    );
+    assert!(
+        frozen.contains("last success 9h0m ago; last converged 3h0m ago"),
+        "{frozen}"
+    );
+    // A lone stale clean convergence stamp is a stale success, not "no
+    // successful cron update recorded".
+    let stale_clean = check(None, Some(converged(NOW - 3 * 3600, "")));
+    assert!(
+        stale_clean.contains("last success 3h0m ago") && !stale_clean.contains("no successful"),
+        "{stale_clean}"
+    );
+    let frozen_never_clean = check(None, Some(converged(NOW - 3 * 3600, "tools")));
+    assert!(
+        frozen_never_clean.contains("⚠ cron update has not succeeded recently")
+            && frozen_never_clean
+                .contains("no successful cron update recorded; last converged 3h0m ago"),
+        "{frozen_never_clean}"
+    );
+
+    // Skew: an older Dot (downgrade) keeps refreshing last-success but not
+    // convergence; the stale degraded stamp must not mask its state.
+    let downgraded_ok = check(Some(NOW - 60), Some(converged(NOW - 9 * 3600, "prune")));
+    assert!(
+        downgraded_ok.contains("✓ cron update succeeded recently"),
+        "{downgraded_ok}"
+    );
+    let downgraded_failing = check(
+        Some(NOW - 3 * 3600),
+        Some(converged(NOW - 9 * 3600, "prune")),
+    );
+    assert!(
+        downgraded_failing.contains("⚠ cron update has not succeeded recently"),
+        "{downgraded_failing}"
+    );
+    assert!(
+        downgraded_failing.contains("last success 3h0m ago")
+            && !downgraded_failing.contains("last converged"),
+        "an older convergence than success adds nothing: {downgraded_failing}"
+    );
 }
 
 fn backdate(path: &Path, secs_ago: u64) {

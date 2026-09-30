@@ -4028,6 +4028,15 @@ fn cron_outcome_log_records_ok_and_fail_with_success_stamp() {
     .expect("success stamp");
     let stamped: i64 = stamp.trim().parse().expect("stamp epoch");
     assert!(stamped > 1_700_000_000, "stamp epoch sane: {stamp}");
+    // A clean run also stamps convergence, with no failing stages.
+    let converged = std::fs::read_to_string(
+        clean
+            .client
+            .home
+            .join(".local/state/dot/update.last-converged"),
+    )
+    .expect("convergence stamp");
+    assert_eq!(converged, stamp, "clean convergence names no stage");
 
     // A failing merge hook fails the run, records `fail`, and leaves
     // no success stamp behind.
@@ -4048,6 +4057,16 @@ fn cron_outcome_log_records_ok_and_fail_with_success_stamp() {
             .join(".local/state/dot/update.last-success")
             .exists(),
         "failed cron run writes no success stamp"
+    );
+    // A failed merge hook means configs did not converge: a real failure,
+    // never the degraded outcome, so no convergence stamp either.
+    assert!(
+        !failing
+            .client
+            .home
+            .join(".local/state/dot/update.last-converged")
+            .exists(),
+        "failed merge hook is not converged"
     );
 
     // Plain updates stay out of the cron log: the history-tree tests

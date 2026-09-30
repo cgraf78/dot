@@ -267,6 +267,15 @@ impl Runtime {
         &self.env
     }
 
+    /// This runtime with `key` removed from the environment handed to every
+    /// child process. Process identity and resolved caches are shared, so
+    /// the result still speaks for the same invocation.
+    pub(crate) fn without_env(&self, key: &str) -> Self {
+        let mut runtime = self.clone();
+        runtime.env.remove(OsStr::new(key));
+        runtime
+    }
+
     pub(crate) fn is_process_entry(&self) -> bool {
         self.process_entry
     }
