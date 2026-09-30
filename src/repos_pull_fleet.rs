@@ -1256,17 +1256,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn panicking_worker_is_a_plumbing_failure_not_an_abort() {
-        // One worker panicking must not unwind out of the fan-out: the
-        // parent still replays every captured log, returns the
-        // documented plumbing-failure rc 1, and removes its scratch.
-        let scope = dot_test_support::TempDir::new("fleet-panic").unwrap();
-        let scratch = scope.path().join("scratch");
-        std::fs::create_dir(&scratch).unwrap();
-        let home = scope.path().to_string_lossy().into_owned();
-        // A configured URL makes a missing path pull-eligible, so no
-        // repository is needed: the injected pull never touches git.
+    /// Run [`fan_out`] over three pull-eligible overlays in one chunk
+    /// with `pull` injected and scratch under `scope/scratch`. A
+    /// configured URL makes a missing path pull-eligible, so no
+    /// repository is needed: the injected pull never touches git.
+    fn fan_out_three(
+        scope: &Path,
+        pull: PullOne,
+        out: &mut dyn Write,
+        warnings: &mut dyn Write,
+    ) -> PullOverlaysOutcome {
+        let scratch = scope.join("scratch");
+        let home = scope.to_string_lossy().into_owned();
         let entries: Vec<String> = (0..3)
             .map(|index| format!("ovl{index}|{home}/missing-{index}|url|x|false|git"))
             .collect();
@@ -1308,7 +1309,7 @@ mod tests {
             ui_total: None,
             dot_quiet: Some("0"),
             dot_verbose: Some("0"),
-            // All three in one chunk, so the panic races live peers.
+            // All three in one chunk, so a panic races live peers.
             update_jobs: Some("3"),
             progress_done: Some("0"),
             progress_total: Some("0"),
@@ -1325,23 +1326,28 @@ mod tests {
             legacy_manifest: &legacy,
             euid: crate::temp::current_uid().unwrap(),
             source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
-            tmp: scope.path(),
+            tmp: scope,
             tool: &tool,
             log: &log,
             prefetch: None,
         };
         let mut stage = Stage::begin(Palette::empty(), "0", false, false, false, true);
+        fan_out(
+            &inputs, &scratch, pull, &mut stage, &mut moves, out, warnings,
+        )
+    }
+
+    #[test]
+    fn panicking_worker_is_a_plumbing_failure_not_an_abort() {
+        // One worker panicking must not unwind out of the fan-out: the
+        // parent still replays every captured log, returns the
+        // documented plumbing-failure rc 1, and removes its scratch.
+        let scope = dot_test_support::TempDir::new("fleet-panic").unwrap();
+        let scratch = scope.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
         let mut out = Vec::new();
         let mut warnings = Vec::new();
-        let outcome = fan_out(
-            &inputs,
-            &scratch,
-            pull_or_panic,
-            &mut stage,
-            &mut moves,
-            &mut out,
-            &mut warnings,
-        );
+        let outcome = fan_out_three(scope.path(), pull_or_panic, &mut out, &mut warnings);
         assert_eq!(outcome.rc, 1);
         assert_eq!(outcome.tally.failed, 1);
         assert_eq!(outcome.tally.current, 2);
@@ -1358,6 +1364,70 @@ mod tests {
             std::fs::read_dir(&scratch).unwrap().count(),
             0,
             "scratch result dir leaked"
+        );
+    }
+
+    /// Test pull: logs one line and reports current for every overlay.
+    fn pull_current(
+        inputs: &PullOverlayInputs<'_>,
+        _moves: &mut MoveCache,
+        out: &mut dyn Write,
+        _warnings: &mut dyn Write,
+    ) -> PullOverlayOutcome {
+        let _ = writeln!(out, "log {}", inputs.name);
+        PullOverlayOutcome {
+            status: crate::repos_pull_overlay::PullOverlayStatus::Current,
+            rc: 0,
+            live_active: false,
+        }
+    }
+
+    /// Parent-side stdout that panics on its first write, naming the
+    /// bytes it refused so the test can tell where the unwind began.
+    struct PanickingOut;
+
+    impl Write for PanickingOut {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            panic!(
+                "injected parent-side panic: {}",
+                String::from_utf8_lossy(buf)
+            );
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn parent_side_unwind_still_removes_the_scratch_dir() {
+        // A panic in the parent itself (a refused `scope.spawn`, or
+        // here a panicking replay write) unwinds out of the fan-out
+        // past the explicit removal; the scratch guard alone must
+        // remove the result dir and the worker logs captured in it.
+        let scope = dot_test_support::TempDir::new("fleet-unwind").unwrap();
+        let scratch = scope.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let unwound = std::panic::catch_unwind(|| {
+            fan_out_three(
+                scope.path(),
+                pull_current,
+                &mut PanickingOut,
+                &mut Vec::new(),
+            )
+        });
+        let payload = unwound.err().expect("the parent-side panic must unwind");
+        // The first parent write is the replay of the first worker's
+        // log: the injected workers ran and populated the scratch dir
+        // (the serial fallback would have used the real pull).
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "injected parent-side panic: log ovl0\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(&scratch).unwrap().count(),
+            0,
+            "scratch result dir leaked on unwind"
         );
     }
 
