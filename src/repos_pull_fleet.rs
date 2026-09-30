@@ -828,7 +828,7 @@ pub struct PullAllOutcome {
     /// Repos that failed (plus one when the overlay fan-out itself
     /// fails plumbing).
     pub failed: i64,
-    /// Repos skipped (no upstream).
+    /// Repos skipped (no upstream, a user session, or a detached HEAD).
     pub skipped: i64,
     /// True when the stage finish stays deferred.
     pub deferred: bool,
@@ -917,12 +917,18 @@ pub fn pull_all(
     match base_outcome.status.as_str() {
         "skipped" => {
             if verbose {
+                // Say what actually happened: a detached HEAD or the
+                // user's rebase is not a missing upstream.
+                let reason = base_outcome
+                    .skip
+                    .unwrap_or(crate::repos_pull::SkipReason::NoUpstream);
+                let detail = format!("dotfiles pull skipped ({})", reason.label());
                 let (bytes, _) = crate::progress_ui::status(
                     inputs.palette,
                     quiet,
                     false,
                     b"skipped",
-                    b"dotfiles pull skipped (no upstream)",
+                    detail.as_bytes(),
                     inputs.multibyte,
                 );
                 let _ = out.write_all(&bytes);
