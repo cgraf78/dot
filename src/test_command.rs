@@ -592,6 +592,11 @@ pub(crate) fn environment(
     path = std::env::join_paths(paths).map_err(|_| (2, "dot test: invalid PATH".into()))?;
     let child_home = if provider { host } else { source };
     let mut env = runtime.env().clone();
+    // Suite interpreters start before their helpers can isolate fixtures. Keep
+    // caller startup files from rewriting the runner's PATH or touching HOME;
+    // suites may still opt in explicitly when testing child shell startup.
+    env.remove(OsStr::new("BASH_ENV"));
+    env.remove(OsStr::new("ENV"));
     env.remove(OsStr::new("DOT_CLIENT_GIT_DIR"));
     env.remove(OsStr::new("DOT_TEST_TIMEOUT_EXPIRED_FILE"));
     for (key, value) in [
