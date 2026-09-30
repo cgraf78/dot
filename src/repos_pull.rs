@@ -255,9 +255,9 @@ pub(crate) enum StrandedHead {
     /// failed, or would discard changes): its mid-rebase files are
     /// live, so the pull fails.
     Unhealed,
-    /// A rebase or `git am` session dot did not start (paused at a
-    /// conflict, `edit`, or `break`): the user's work in progress,
-    /// so the pull warns and skips with rc 0.
+    /// A merge, rebase, or `git am` session dot did not start (paused
+    /// at a conflict, `edit`, or `break`): the user's work in
+    /// progress, so the pull warns and skips with rc 0.
     UserSession,
     /// HEAD is detached with no session in progress (a bisect or a
     /// pinned commit): warns and skips with rc 0.
@@ -295,10 +295,10 @@ impl Stranded {
                     .to_string()
             }
             StrandedHead::Unhealed => unaborted(prefix),
-            StrandedHead::UserSession => {
-                "has a rebase or `git am` in progress that dot did not start; pulls are skipped until it finishes"
-                    .to_string()
-            }
+            StrandedHead::UserSession => format!(
+                "has a merge, cherry-pick, revert, rebase, or `git am` in progress that dot did not start (see {}); pulls are skipped until it finishes",
+                git_hint(prefix, "status")
+            ),
             StrandedHead::Detached => {
                 "has a detached HEAD; pulls are skipped until it is back on a branch".to_string()
             }
@@ -314,25 +314,32 @@ impl Stranded {
     }
 
     /// Whether to print the warning now. dot-owned states always
-    /// warn. For the user's own states, cron (`quiet`) runs every 30
-    /// minutes and mails stderr, so it warns once per state (keyed
-    /// by kind and HEAD); interactive runs always warn. Any warning
-    /// records the key, so an interactive one also covers cron.
+    /// warn; the user's own states go through [`throttled`], keyed by
+    /// kind and HEAD.
     pub(crate) fn warn_now(&self, quiet: bool) -> bool {
         if matches!(self.kind, StrandedHead::Healed | StrandedHead::Unhealed) {
             return true;
         }
-        let Some(dir) = self.git_dir.as_deref() else {
-            return true;
-        };
-        let path = dir.join(WARNED_MARKER);
-        let seen = std::fs::read_to_string(&path).is_ok_and(|text| text == self.key);
-        if !seen {
-            // Best effort: without the record, cron simply warns again.
-            let _ = std::fs::write(&path, &self.key);
-        }
-        !(quiet && seen)
+        throttled(self.git_dir.as_deref(), &self.key, quiet)
     }
+}
+
+/// Once-per-state gate for warnings about states the user must fix:
+/// cron (`quiet`) runs every 30 minutes and mails stderr, so it
+/// prints only when `key` differs from the last warned state in
+/// [`WARNED_MARKER`]; interactive runs always print. Any printed
+/// warning records the key, so an interactive one also covers cron.
+fn throttled(git_dir: Option<&Path>, key: &str, quiet: bool) -> bool {
+    let Some(dir) = git_dir else {
+        return true;
+    };
+    let path = dir.join(WARNED_MARKER);
+    let seen = std::fs::read_to_string(&path).is_ok_and(|text| text == key);
+    if !seen {
+        // Best effort: without the record, cron simply warns again.
+        let _ = std::fs::write(&path, key);
+    }
+    !(quiet && seen)
 }
 
 /// Warning tail for dot's own rebase left in progress (`--abort`
@@ -368,10 +375,22 @@ fn rebase_state_exists(git_dir: &Path) -> bool {
         || (apply.symlink_metadata().is_ok() && apply.join("applying").symlink_metadata().is_err())
 }
 
-/// Whether `git_dir` holds any rebase or `git am` session.
+/// Whether `git_dir` holds any operation the user is in the middle
+/// of: a rebase, `git am`, merge, cherry-pick, or revert. dot must not
+/// rebase over one: a resolved but uncommitted merge has nothing
+/// unmerged, yet `rebase --autostash` would drop `MERGE_HEAD` and with
+/// it the merge's second parent.
 fn session_exists(git_dir: &Path) -> bool {
-    git_dir.join("rebase-merge").symlink_metadata().is_ok()
-        || git_dir.join("rebase-apply").symlink_metadata().is_ok()
+    [
+        "rebase-merge",
+        "rebase-apply",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "sequencer",
+    ]
+    .iter()
+    .any(|entry| git_dir.join(entry).symlink_metadata().is_ok())
 }
 
 /// The rebase state directory replaying exactly `head` onto
@@ -490,30 +509,116 @@ pub(crate) fn repeated_failure(prefix: &[OsString]) -> String {
     )
 }
 
-/// Warning tail for a pull whose autostash did not reapply cleanly.
-pub(crate) fn stash_conflict(prefix: &[OsString], paths: &[String]) -> String {
-    format!(
-        "was updated, but uncommitted changes conflicted with the update and are kept in the stash (see {}); conflict markers are in: {}",
-        git_hint(prefix, "stash list"),
-        paths.join(", ")
-    )
+/// Unmerged index entries: conflict markers in live files. Either the
+/// autostash of the rebase that just succeeded did not reapply
+/// cleanly (the edit stays in the stash; git still exits 0), or they
+/// were already there before this run (that same leftover, or a merge
+/// the user is resolving). A pull on top of them would fail at best
+/// and read the markers as `current` at worst, so it fails instead.
+pub(crate) struct Unmerged {
+    /// Unmerged paths, relative to the work tree.
+    paths: Vec<String>,
+    /// Per-worktree git dir for the cron throttle.
+    git_dir: Option<PathBuf>,
+    /// State identity for the once-per-state cron warning.
+    key: String,
+    /// The autostash of this run's rebase produced them.
+    after_autostash: bool,
 }
 
-/// Paths git left unmerged after a pull it reported as successful.
+impl Unmerged {
+    fn new(paths: Vec<String>, prefix: &[OsString], after_autostash: bool) -> Self {
+        let key = format!(
+            "Unmerged {} {}\n",
+            crate::repos_pull_queries::repo_head(prefix),
+            paths.join("\0")
+        );
+        Self {
+            paths,
+            git_dir: absolute_git_dir(prefix),
+            key,
+            after_autostash,
+        }
+    }
+
+    /// Warning tail listing the files and where the edit went.
+    pub(crate) fn describe(&self, prefix: &[OsString]) -> String {
+        let stash = git_hint(prefix, "stash list");
+        let files = self.paths.join(", ");
+        if self.after_autostash {
+            format!(
+                "was updated, but uncommitted changes conflicted with the update and are kept in the stash (see {stash}); conflict markers are in: {files}"
+            )
+        } else {
+            format!(
+                "has unmerged paths with conflict markers in live files: {files}; pulls stay stopped until they are resolved (after an autostash conflict the uncommitted changes are kept in the stash, see {stash})"
+            )
+        }
+    }
+
+    /// Whether to print the warning now (once per state under cron;
+    /// the status stays failed either way).
+    pub(crate) fn warn_now(&self, quiet: bool) -> bool {
+        throttled(self.git_dir.as_deref(), &self.key, quiet)
+    }
+}
+
+/// What the index allows before any pull work starts.
+pub(crate) enum IndexCheck {
+    /// No unmerged entries.
+    Clean,
+    /// Unmerged entries inside a merge, rebase, or `git am` session
+    /// the user started while HEAD kept its upstream: warn and skip
+    /// like any other user session.
+    Session(Stranded),
+    /// Unmerged entries outside any session: fail without pulling.
+    Unmerged(Unmerged),
+}
+
+/// Check the index before fetching or rebasing. One index-only git
+/// call on every pull (`ls-files -u` reads no work tree); the git dir
+/// is resolved only when something is unmerged.
+pub(crate) fn check_index(prefix: &[OsString]) -> IndexCheck {
+    let paths = unmerged_paths(prefix);
+    if paths.is_empty() {
+        return IndexCheck::Clean;
+    }
+    let git_dir = absolute_git_dir(prefix);
+    if git_dir.as_deref().is_some_and(session_exists) {
+        return IndexCheck::Session(Stranded::new(StrandedHead::UserSession, git_dir, prefix));
+    }
+    IndexCheck::Unmerged(Unmerged::new(paths, prefix, false))
+}
+
+/// Unmerged entries left by a rebase git reported as successful:
 /// `rebase --autostash` exits 0 when reapplying the autostash
-/// conflicts: the edit stays in the stash and the live files hold
-/// conflict markers, which must not read as a clean update. A failed
-/// probe reads as none (the historical result).
+/// conflicts, which must not read as a clean update.
+pub(crate) fn unmerged_after_pull(prefix: &[OsString]) -> Option<Unmerged> {
+    let paths = unmerged_paths(prefix);
+    (!paths.is_empty()).then(|| Unmerged::new(paths, prefix, true))
+}
+
+/// Unmerged index paths (each once, in index order). Index-only, so
+/// cheap even for the `$HOME` work tree. A failed probe reads as none
+/// (the historical result).
 pub(crate) fn unmerged_paths(prefix: &[OsString]) -> Vec<String> {
-    crate::repos_base::run_git(prefix, &["diff", "--name-only", "--diff-filter=U"])
+    let Some(output) = crate::repos_base::run_git(prefix, &["ls-files", "--unmerged", "-z"])
         .filter(|output| output.status.success())
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    else {
+        return Vec::new();
+    };
+    let mut paths: Vec<String> = Vec::new();
+    // Records are `mode object stage<TAB>path`, one per stage.
+    for record in output.stdout.split(|byte| *byte == 0) {
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        let path = String::from_utf8_lossy(&record[tab + 1..]).into_owned();
+        if paths.last() != Some(&path) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 /// Marker in the per-worktree git dir recording the `HEAD upstream`
@@ -543,8 +648,9 @@ pub(crate) struct RebaseGuard {
     /// Per-worktree git dir, or `None` when unresolvable (no abort,
     /// no failure memory).
     git_dir: Option<PathBuf>,
-    /// False when a rebase (or `git am`) was already in progress:
-    /// that session belongs to the user and is never aborted.
+    /// False when a merge, rebase, or `git am` was already in
+    /// progress: that session belongs to the user and is never
+    /// aborted or rebased over.
     armed: bool,
     /// HEAD the rebase replays (its `orig-head`).
     head: String,
@@ -573,10 +679,11 @@ impl RebaseGuard {
         }
     }
 
-    /// A rebase or `git am` session the user started while HEAD kept
-    /// its upstream (an am session stays on the branch). Running the
-    /// rebase over it would fail every cycle, so the caller warns and
-    /// skips like any other user session.
+    /// A merge, rebase, or `git am` session the user started while
+    /// HEAD kept its upstream (a merge or am stays on the branch).
+    /// Rebasing over it would fail every cycle, or silently drop an
+    /// uncommitted merge, so the caller warns and skips like any
+    /// other user session.
     pub(crate) fn user_session(&self, prefix: &[OsString]) -> Option<Stranded> {
         let dir = self.git_dir.as_deref().filter(|_| !self.armed)?;
         Some(Stranded::new(
@@ -721,6 +828,43 @@ pub struct PullBaseOutcome {
     pub status: PullStatus,
     /// The shell return code.
     pub rc: i32,
+    /// Why a `Skipped` pull skipped (`None` otherwise).
+    pub skip: Option<SkipReason>,
+}
+
+/// Why [`pull_base`] skipped, for the verbose status row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// A branch without tracking (or no base checkout).
+    NoUpstream,
+    /// A merge, cherry-pick, revert, rebase, or `git am` the user
+    /// started is in progress.
+    Session,
+    /// HEAD is detached.
+    Detached,
+}
+
+impl SkipReason {
+    /// Parenthesized detail for `dotfiles pull skipped (...)`.
+    pub fn label(self) -> &'static str {
+        match self {
+            SkipReason::NoUpstream => "no upstream",
+            SkipReason::Session => "merge, cherry-pick, revert, rebase, or git am in progress",
+            SkipReason::Detached => "detached HEAD",
+        }
+    }
+}
+
+impl StrandedHead {
+    /// The skip reason for a non-failing stranded state that does not
+    /// continue into a pull.
+    fn skip_reason(self) -> SkipReason {
+        match self {
+            StrandedHead::UserSession => SkipReason::Session,
+            StrandedHead::Detached => SkipReason::Detached,
+            StrandedHead::Healed | StrandedHead::Unhealed => SkipReason::NoUpstream,
+        }
+    }
 }
 
 /// Inputs for [`pull_base`]: the base checkout, the candidate
@@ -771,16 +915,26 @@ pub fn pull_base(
     let failed = || PullBaseOutcome {
         status: PullStatus::Failed,
         rc: 1,
+        skip: None,
     };
-    let done = |status| PullBaseOutcome { status, rc: 0 };
+    let done = |status| PullBaseOutcome {
+        status,
+        rc: 0,
+        skip: None,
+    };
+    let skipped = |reason| PullBaseOutcome {
+        status: PullStatus::Skipped,
+        rc: 0,
+        skip: Some(reason),
+    };
     // A missing topology has no git function to probe, like the
     // shell's failing `_base_git`.
     let Some(prefix) = inputs.base.git_prefix() else {
-        return done(PullStatus::Skipped);
+        return skipped(SkipReason::NoUpstream);
     };
     if !has_upstream(&prefix) {
         let Some(stranded) = stranded_head(&prefix) else {
-            return done(PullStatus::Skipped);
+            return skipped(SkipReason::NoUpstream);
         };
         if stranded.warn_now(inputs.quiet) {
             inputs.log.warn(
@@ -797,7 +951,33 @@ pub fn pull_base(
         // A healed checkout is back on its branch: pull it now rather
         // than waiting a cycle. Anything else keeps the skip.
         if stranded.kind != StrandedHead::Healed || !has_upstream(&prefix) {
-            return done(PullStatus::Skipped);
+            return skipped(stranded.kind.skip_reason());
+        }
+    }
+    // Before any fetch or rebase: conflict markers in live files must
+    // never read as `current`, and nothing may rebase over them.
+    match check_index(&prefix) {
+        IndexCheck::Clean => {}
+        IndexCheck::Session(session) => {
+            if session.warn_now(inputs.quiet) {
+                inputs.log.warn(
+                    warnings,
+                    &format!("  warning: dotfiles checkout {}", session.describe(&prefix)),
+                );
+            }
+            return skipped(SkipReason::Session);
+        }
+        IndexCheck::Unmerged(unmerged) => {
+            if unmerged.warn_now(inputs.quiet) {
+                inputs.log.warn(
+                    warnings,
+                    &format!(
+                        "  warning: dotfiles checkout {}",
+                        unmerged.describe(&prefix)
+                    ),
+                );
+            }
+            return failed();
         }
     }
     let upstream = match prepare_base_upstream(inputs.base) {
@@ -867,7 +1047,7 @@ pub fn pull_base(
                 &format!("  warning: dotfiles checkout {}", session.describe(&prefix)),
             );
         }
-        return done(PullStatus::Skipped);
+        return skipped(SkipReason::Session);
     }
     if rebase.repeats_failure() {
         inputs.log.warn(
@@ -889,7 +1069,7 @@ pub fn pull_base(
     rebase.succeeded();
     // Probed first: normalization itself can fail over the conflict
     // markers, and the stash warning is the one the user must see.
-    let unmerged = unmerged_paths(&prefix);
+    let unmerged = unmerged_after_pull(&prefix);
     let head_after = repo_head(&prefix);
     let mut status = PullStatus::Current;
     if !head_before.is_empty() && !head_after.is_empty() && head_before != head_after {
@@ -908,19 +1088,23 @@ pub fn pull_base(
                     mask,
                 )
             });
-        if !normalized && unmerged.is_empty() {
+        if !normalized && unmerged.is_none() {
             return failed();
         }
         status = PullStatus::Changed;
     }
-    if !unmerged.is_empty() {
-        inputs.log.warn(
-            warnings,
-            &format!(
-                "  warning: dotfiles checkout {}",
-                stash_conflict(&prefix, &unmerged)
-            ),
-        );
+    if let Some(unmerged) = unmerged {
+        // A new event: always shown, and recorded so cron does not
+        // repeat it while the markers stay.
+        if unmerged.warn_now(inputs.quiet) {
+            inputs.log.warn(
+                warnings,
+                &format!(
+                    "  warning: dotfiles checkout {}",
+                    unmerged.describe(&prefix)
+                ),
+            );
+        }
         return failed();
     }
     done(status)

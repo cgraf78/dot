@@ -731,3 +731,71 @@ fn pull_base_warns_once_per_stranded_state_under_cron() {
     assert!(warned(true));
     assert!(!warned(true));
 }
+
+#[test]
+fn pull_base_fails_without_pulling_while_the_index_has_unmerged_paths() {
+    // After an autostash conflict, HEAD already matches upstream: a
+    // later run must not read the conflict markers as `current`, and
+    // must never rebase on top of the unmerged index. Cron warns once
+    // per state but keeps reporting failed.
+    let side = Side::new("current");
+    stage(&side.origin, "base.txt", b"origin change\n");
+    commit(&side.origin, "origin change");
+    stage(&side.home, "base.txt", b"user edit\n");
+    assert_eq!(run(&side, false, false).0.status, PullStatus::Failed);
+    stage(&side.origin, "later.txt", b"later\n");
+    commit(&side.origin, "later");
+    let head = git_stdout(&side.home, &["rev-parse", "HEAD"]);
+    let (outcome, _stdout, stderr) = run(&side, false, false);
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert_eq!(outcome.status, PullStatus::Failed, "{stderr}");
+    assert_eq!(outcome.rc, 1);
+    assert!(stderr.contains("base.txt"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("git -C {} stash list", side.home.display())),
+        "{stderr}"
+    );
+    assert_eq!(git_stdout(&side.home, &["rev-parse", "HEAD"]), head);
+    assert!(!side.home.join("later.txt").exists());
+    let cron = |expect_warning: bool| {
+        let (outcome, _stdout, stderr) = run(&side, true, false);
+        assert_eq!(outcome.status, PullStatus::Failed);
+        assert_eq!(outcome.rc, 1);
+        assert_eq!(
+            String::from_utf8_lossy(&stderr).contains("base.txt"),
+            expect_warning,
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+    };
+    // The interactive warning above already covers this state.
+    cron(false);
+    // Resolving it resumes pulls.
+    git(&side.home, &["checkout", "-q", "HEAD", "--", "base.txt"]);
+    assert_eq!(run(&side, true, false).0.status, PullStatus::Changed);
+    assert!(side.home.join("later.txt").exists());
+}
+
+#[test]
+fn pull_base_skips_a_merge_the_user_has_not_committed() {
+    // A resolved but uncommitted merge has nothing unmerged, yet a
+    // rebase would silently drop `MERGE_HEAD` and with it the merge's
+    // second parent. It is the user's operation: warn and skip.
+    let side = Side::new("changed");
+    git(&side.home, &["checkout", "-q", "-b", "side"]);
+    stage(&side.home, "side.txt", b"side\n");
+    commit(&side.home, "side");
+    git(&side.home, &["checkout", "-q", "-"]);
+    git(
+        &side.home,
+        &["merge", "-q", "--no-ff", "--no-commit", "side"],
+    );
+    assert!(side.home.join(".git/MERGE_HEAD").exists());
+    let (outcome, _stdout, stderr) = run(&side, false, false);
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert_eq!(outcome.status, PullStatus::Skipped, "{stderr}");
+    assert_eq!(outcome.rc, 0);
+    assert!(stderr.contains("merge"), "{stderr}");
+    assert!(side.home.join(".git/MERGE_HEAD").exists());
+    assert!(!side.home.join("newfile.txt").exists());
+}

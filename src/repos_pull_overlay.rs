@@ -19,8 +19,8 @@ use crate::repos_base::Base;
 use crate::repos_config::{has_upstream, origin_matches};
 use crate::repos_overlays::{DestinationInputs, QuarantineInputs};
 use crate::repos_pull::{
-    PullRepoInputs, RebaseGuard, StrandedHead, pull_repo, rebase_command, repeated_failure,
-    stash_conflict, stranded_head, unaborted, unmerged_paths,
+    IndexCheck, PullRepoInputs, RebaseGuard, StrandedHead, check_index, pull_repo, rebase_command,
+    repeated_failure, stranded_head, unaborted, unmerged_after_pull,
 };
 use crate::repos_pull_clone::{CloneOverlayInputs, clone_overlay_staged};
 use crate::repos_pull_normalize::{normalize_updated_paths, snapshot_updated_path_parents};
@@ -381,6 +381,40 @@ pub fn pull_overlay(
         }
         return done(PullOverlayStatus::Skipped, live);
     }
+    // Before any fetch or rebase: conflict markers in live files must
+    // never read as `current`, and nothing may rebase over them. This
+    // fails optional overlays too: it is local state, not access.
+    match check_index(&prefix) {
+        IndexCheck::Clean => {}
+        IndexCheck::Session(session) => {
+            if session.warn_now(quiet) {
+                live = warn_row(
+                    inputs,
+                    quiet,
+                    counted,
+                    live,
+                    &format!("{name} overlay {}", session.describe(&prefix)),
+                    out,
+                    warnings,
+                );
+            }
+            return done(PullOverlayStatus::Skipped, live);
+        }
+        IndexCheck::Unmerged(unmerged) => {
+            if unmerged.warn_now(quiet) {
+                live = warn_row(
+                    inputs,
+                    quiet,
+                    counted,
+                    live,
+                    &format!("{name} overlay {}", unmerged.describe(&prefix)),
+                    out,
+                    warnings,
+                );
+            }
+            return done(PullOverlayStatus::Failed, live);
+        }
+    }
     let upstream =
         match prepare_overlay_upstream(Path::new(inputs.path), inputs.optional, inputs.prefetch) {
             Ok(upstream) => upstream,
@@ -528,7 +562,7 @@ pub fn pull_overlay(
         rebase.succeeded();
         // Probed first: normalization can fail over the conflict
         // markers, and the stash warning is the one to surface.
-        let unmerged = unmerged_paths(&prefix);
+        let unmerged = unmerged_after_pull(&prefix);
         let head_after = repo_head(&prefix);
         let mut status = PullOverlayStatus::Current;
         if !head_before.is_empty() && !head_after.is_empty() && head_before != head_after {
@@ -547,23 +581,25 @@ pub fn pull_overlay(
                         mask,
                     )
                 });
-            if !normalized && unmerged.is_empty() {
+            if !normalized && unmerged.is_none() {
                 return done(PullOverlayStatus::Failed, live);
             }
             status = PullOverlayStatus::Changed;
         }
         // The user's edit sits in the stash with conflict markers in
         // live files: surfaced even for optional overlays.
-        if !unmerged.is_empty() {
-            live = warn_row(
-                inputs,
-                quiet,
-                counted,
-                live,
-                &format!("{name} overlay {}", stash_conflict(&prefix, &unmerged)),
-                out,
-                warnings,
-            );
+        if let Some(unmerged) = unmerged {
+            if unmerged.warn_now(quiet) {
+                live = warn_row(
+                    inputs,
+                    quiet,
+                    counted,
+                    live,
+                    &format!("{name} overlay {}", unmerged.describe(&prefix)),
+                    out,
+                    warnings,
+                );
+            }
             return done(PullOverlayStatus::Failed, live);
         }
         return done(status, live);
@@ -653,7 +689,7 @@ pub fn pull_overlay(
     rebase.succeeded();
     // Probed first: normalization can fail over the conflict markers,
     // and the stash warning is the one the user must see.
-    let unmerged = unmerged_paths(&prefix);
+    let unmerged = unmerged_after_pull(&prefix);
     let head_after = repo_head(&prefix);
     let mut status = PullOverlayStatus::Current;
     if !head_before.is_empty() && !head_after.is_empty() && head_before != head_after {
@@ -672,7 +708,7 @@ pub fn pull_overlay(
                     mask,
                 )
             });
-        if !normalized && unmerged.is_empty() {
+        if !normalized && unmerged.is_none() {
             inputs.log.warn(
                 warnings,
                 &format!("  warning: {name} overlay mode normalization failed"),
@@ -702,16 +738,18 @@ pub fn pull_overlay(
             out,
         );
     }
-    if !unmerged.is_empty() {
-        live = warn_row(
-            inputs,
-            quiet,
-            counted,
-            live,
-            &format!("{name} overlay {}", stash_conflict(&prefix, &unmerged)),
-            out,
-            warnings,
-        );
+    if let Some(unmerged) = unmerged {
+        if unmerged.warn_now(quiet) {
+            live = warn_row(
+                inputs,
+                quiet,
+                counted,
+                live,
+                &format!("{name} overlay {}", unmerged.describe(&prefix)),
+                out,
+                warnings,
+            );
+        }
         return done(PullOverlayStatus::Failed, live);
     }
     done(status, live)

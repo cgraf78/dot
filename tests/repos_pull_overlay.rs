@@ -715,6 +715,79 @@ fn a_conflicting_autostash_is_reported_as_failed() {
 }
 
 #[test]
+fn an_unmerged_index_fails_every_pull_without_rebasing_over_it() {
+    // Optional or not: conflict markers in live overlay files must not
+    // read as current, and no rebase may run on top of them.
+    for optional in [false, true] {
+        let fixture = Fixture::new("overlay-unmerged");
+        stage(&fixture.origin, "home/overlay.txt", b"remote\n");
+        commit(&fixture.origin, "remote");
+        stage(&fixture.overlay, "home/overlay.txt", b"user edit\n");
+        assert_eq!(
+            fixture
+                .pull(&fixture.origin_text, optional, None, false)
+                .0
+                .status,
+            PullOverlayStatus::Failed
+        );
+        stage(&fixture.origin, "home/later.txt", b"later\n");
+        commit(&fixture.origin, "later");
+        let (outcome, _, warnings) = fixture.pull(&fixture.origin_text, optional, None, false);
+        let warnings = String::from_utf8_lossy(&warnings);
+        assert_eq!(
+            outcome.status,
+            PullOverlayStatus::Failed,
+            "optional={optional}: {warnings}"
+        );
+        assert!(warnings.contains("home/overlay.txt"), "{warnings}");
+        assert!(
+            warnings.contains(&format!("git -C {} stash list", fixture.overlay_text)),
+            "{warnings}"
+        );
+        assert!(!fixture.overlay.join("home/later.txt").exists());
+        // Cron keeps failing but does not repeat the warning.
+        let (outcome, _, warnings) =
+            fixture.pull_with(&fixture.origin_text, optional, None, false, true, &[]);
+        assert_eq!(outcome.status, PullOverlayStatus::Failed);
+        assert!(
+            !String::from_utf8_lossy(&warnings).contains("home/overlay.txt"),
+            "{}",
+            String::from_utf8_lossy(&warnings)
+        );
+    }
+}
+
+#[test]
+fn a_conflicted_merge_in_progress_is_skipped_not_failed() {
+    // Unmerged entries from the user's own merge are their work in
+    // progress: skip with rc 0 (optional overlays included) instead
+    // of failing the update or pointing at the stash.
+    for optional in [false, true] {
+        let fixture = Fixture::new("overlay-merge");
+        git(&fixture.overlay, &["checkout", "-q", "-b", "side"]);
+        stage(&fixture.overlay, "home/overlay.txt", b"side\n");
+        commit(&fixture.overlay, "side");
+        git(&fixture.overlay, &["checkout", "-q", "-"]);
+        stage(&fixture.overlay, "home/overlay.txt", b"main\n");
+        commit(&fixture.overlay, "main");
+        assert_eq!(
+            git_status(&fixture.overlay, &["merge", "-q", "side"]),
+            Some(1)
+        );
+        let (outcome, _, warnings) = fixture.pull(&fixture.origin_text, optional, None, false);
+        let warnings = String::from_utf8_lossy(&warnings);
+        assert_eq!(
+            outcome.status,
+            PullOverlayStatus::Skipped,
+            "optional={optional}: {warnings}"
+        );
+        assert!(warnings.contains("merge"), "{warnings}");
+        assert!(!warnings.contains("stash"), "{warnings}");
+        assert!(fixture.overlay.join(".git/MERGE_HEAD").exists());
+    }
+}
+
+#[test]
 fn stranded_warnings_repeat_under_cron_only_when_the_state_changes() {
     let detached = Fixture::new("overlay-detached-cron");
     git(&detached.overlay, &["checkout", "-q", "--detach"]);
