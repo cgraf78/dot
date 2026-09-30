@@ -348,6 +348,73 @@ fn active_overlay_wins_a_path_shared_with_a_skipped_overlay() {
     assert!(manifest.contains("only.conf\tov\t"), "{manifest}");
 }
 
+/// Write `body` as the leftover pending manifest an interrupted run
+/// leaves beside `manifest`, private like the publisher makes it.
+fn leave_pending(manifest: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let pending = PathBuf::from(format!("{}.pending", manifest.display()));
+    std::fs::write(&pending, body).unwrap();
+    std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn skipped_overlay_does_not_carry_leftover_pending_candidates() {
+    // A pending manifest left by an interrupted run holds unverified
+    // candidates, not installed links. Only committed records carry
+    // for a skipped overlay; a candidate it never linked must not be
+    // promoted into the committed generation as if it were installed.
+    let f = Fixture::new(&[("app.conf", "app\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    let app = link_at(&f.home, "app.conf");
+    assert!(app.is_some());
+    let before = std::fs::read_to_string(&f.manifest).unwrap();
+    leave_pending(&f.manifest, &format!("{before}ghost.conf\tov\n"));
+    let overlay = f.overlay.to_string_lossy().into_owned();
+    let moved = vec![format!("ov|{overlay}|file:///elsewhere.git|||git")];
+    let (result, _, err) = f.run_entries(&moved, None, false, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(
+        String::from_utf8(err)
+            .unwrap()
+            .contains("origin does not match")
+    );
+    assert_eq!(link_at(&f.home, "app.conf"), app);
+    assert!(std::fs::symlink_metadata(f.home.join("ghost.conf")).is_err());
+    assert_eq!(std::fs::read_to_string(&f.manifest).unwrap(), before);
+    // The committed generation supersedes the leftover authority.
+    assert!(!PathBuf::from(format!("{}.pending", f.manifest.display())).exists());
+}
+
+#[test]
+fn skipped_overlay_does_not_carry_records_on_reserved_paths() {
+    // A committed record can name a path that is overlay-control
+    // reserved (written before the path was reserved, or by hand).
+    // The authority load filters it out; carrying a skipped overlay's
+    // records must not reintroduce it, and the file there stays put.
+    let f = Fixture::new(&[("app.conf", "app\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    let app = link_at(&f.home, "app.conf");
+    assert!(app.is_some());
+    let before = std::fs::read_to_string(&f.manifest).unwrap();
+    let reserved = ".config/dot/profiles.d/work.conf";
+    stage(&f.home, reserved, b"profile\n");
+    std::fs::write(&f.manifest, format!("{before}{reserved}\tov\n")).unwrap();
+    let overlay = f.overlay.to_string_lossy().into_owned();
+    let moved = vec![format!("ov|{overlay}|file:///elsewhere.git|||git")];
+    let (result, _, err) = f.run_entries(&moved, None, false, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    // Only a skipped overlay reaches the carry; an active one would
+    // re-record `app.conf` and pass without exercising it.
+    assert!(
+        String::from_utf8(err)
+            .unwrap()
+            .contains("origin does not match")
+    );
+    assert_eq!(link_at(&f.home, "app.conf"), app);
+    assert_eq!(std::fs::read(f.home.join(reserved)).unwrap(), b"profile\n");
+    assert_eq!(std::fs::read_to_string(&f.manifest).unwrap(), before);
+}
+
 #[test]
 fn deselected_overlay_links_are_still_cleaned() {
     // An overlay absent from the entries is genuinely gone: its links
