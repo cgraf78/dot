@@ -5,6 +5,31 @@ mod fixture;
 use fixture::{Fixture, success};
 
 #[test]
+fn native_suites_do_not_inherit_shell_startup_files() {
+    for variable in ["BASH_ENV", "ENV"] {
+        let f = Fixture::new();
+        let startup = f.home.join("startup.sh");
+        std::fs::write(&startup, "if [[ ${DOT_TEST:-} == 1 ]]; then\n  touch \"$HOME/startup-ran\"\n  export PATH=/unexpected:$PATH\nfi\n").unwrap();
+        f.suite("startup", "[[ ! -v BASH_ENV && ! -v ENV ]] || exit 21\n[[ ${PATH%%:*} == \"$HOME/.local/bin\" ]] || exit 22\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"");
+        let output = fixture::finish(f.command(&[]).env(variable, &startup).spawn().unwrap());
+        success(&output);
+        assert!(!f.home.join("startup-ran").exists(), "{variable} executed");
+    }
+}
+
+#[test]
+fn native_suites_can_explicitly_enable_child_startup_files() {
+    let f = Fixture::new();
+    std::fs::write(
+        f.home.join("startup.sh"),
+        "touch \"$HOME/child-startup-ran\"\n",
+    )
+    .unwrap();
+    f.suite("startup", "BASH_ENV=\"$HOME/startup.sh\" bash -c ':'\n[[ -f $HOME/child-startup-ran ]] || exit 23\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"");
+    success(&f.run(&[]));
+}
+
+#[test]
 fn native_help_and_list_do_not_load_test_engine() {
     let f = Fixture::new();
     f.suite("core", "exit 0");
