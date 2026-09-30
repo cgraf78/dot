@@ -94,12 +94,23 @@ impl Fixture {
         verbose: bool,
         live: bool,
     ) -> (repos_link_all::LinkOutcome, Vec<u8>, Vec<u8>) {
-        let home = self.home.to_string_lossy().into_owned();
         let overlay = self.overlay.to_string_lossy().into_owned();
         let source = self.source.to_string_lossy().into_owned();
+        let entries = vec![format!("ov|{overlay}|{source}|||git")];
+        self.run_entries(&entries, ui_total, verbose, live)
+    }
+
+    fn run_entries(
+        &self,
+        entries: &[String],
+        ui_total: Option<&str>,
+        verbose: bool,
+        live: bool,
+    ) -> (repos_link_all::LinkOutcome, Vec<u8>, Vec<u8>) {
+        let home = self.home.to_string_lossy().into_owned();
+        let overlay = self.overlay.to_string_lossy().into_owned();
         let manifest = self.manifest.to_string_lossy().into_owned();
         let legacy = self.legacy.to_string_lossy().into_owned();
-        let entries = vec![format!("ov|{overlay}|{source}|||git")];
         let dest = dot::repos_overlays::DestinationInputs {
             home: home.clone(),
             xdg_state_home: None,
@@ -122,7 +133,7 @@ impl Fixture {
             true,
         );
         let inputs = repos_link_all::Inputs {
-            entries: &entries,
+            entries,
             home: &home,
             manifest: &manifest,
             legacy_manifest: &legacy,
@@ -218,6 +229,206 @@ fn non_worktree_overlay_warns_and_is_skipped() {
         String::from_utf8(err)
             .unwrap()
             .contains("not a Git worktree")
+    );
+}
+
+/// The symlink target at `rel` under `home`, or `None` when the path
+/// is missing or not a link.
+fn link_at(home: &Path, rel: &str) -> Option<PathBuf> {
+    std::fs::read_link(home.join(rel)).ok()
+}
+
+#[test]
+fn origin_mismatch_preserves_previously_installed_links() {
+    // "Leaving it untouched" must hold for links installed by an
+    // earlier run too: the skipped overlay's manifest records carry
+    // into the new generation, so stale cleanup keeps its links. The
+    // trigger here is a changed configured `url=` (a base commit
+    // editing `overlays.d`); an in-process `remote set-url` would hit
+    // the memoized origin probe instead.
+    let f = Fixture::new(&[("app.conf", "app\n"), ("sub/nested.conf", "nested\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    let app = link_at(&f.home, "app.conf");
+    let nested = link_at(&f.home, "sub/nested.conf");
+    assert!(app.is_some() && nested.is_some());
+    let before = std::fs::read_to_string(&f.manifest).unwrap();
+    let overlay = f.overlay.to_string_lossy().into_owned();
+    let moved = vec![format!("ov|{overlay}|file:///elsewhere.git|||git")];
+    let (result, out, err) = f.run_entries(&moved, None, true, false);
+    assert_eq!(result.rc, 0);
+    assert_eq!(result.changed, 0);
+    assert!(
+        String::from_utf8(err)
+            .unwrap()
+            .contains("origin does not match")
+    );
+    assert!(
+        !String::from_utf8(out).unwrap().contains("removed:"),
+        "skipped overlay links were cleaned as stale"
+    );
+    assert_eq!(link_at(&f.home, "app.conf"), app);
+    assert_eq!(link_at(&f.home, "sub/nested.conf"), nested);
+    assert_eq!(std::fs::read_to_string(&f.manifest).unwrap(), before);
+    // Restoring the URL converges without relinking.
+    let (again, _, err) = f.run(None, false);
+    assert_eq!(again.rc, 0);
+    assert_eq!(again.current, 1);
+    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+}
+
+#[test]
+fn non_worktree_overlay_preserves_previously_installed_links() {
+    let f = Fixture::new(&[("app.conf", "app\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    let app = link_at(&f.home, "app.conf");
+    assert!(app.is_some());
+    let before = std::fs::read_to_string(&f.manifest).unwrap();
+    std::fs::remove_dir_all(f.overlay.join(".git")).unwrap();
+    // The worktree probe memoizes per path spelling for the process
+    // lifetime (each `dot update` is a fresh process); an equivalent
+    // spelling observes the removed `.git` like the next run would.
+    let overlay = f.overlay.to_string_lossy().into_owned();
+    let source = f.source.to_string_lossy().into_owned();
+    let respelled = vec![format!("ov|{overlay}/.|{source}|||git")];
+    let (result, _, err) = f.run_entries(&respelled, None, false, false);
+    assert_eq!(result.rc, 0);
+    assert!(
+        String::from_utf8(err)
+            .unwrap()
+            .contains("not a Git worktree")
+    );
+    assert_eq!(link_at(&f.home, "app.conf"), app);
+    assert_eq!(std::fs::read_to_string(&f.manifest).unwrap(), before);
+}
+
+#[test]
+fn active_overlay_wins_a_path_shared_with_a_skipped_overlay() {
+    // Carrying happens after every active overlay recorded its paths:
+    // a path an active overlay now provides keeps only that overlay's
+    // record, while the skipped overlay's other links still carry.
+    let f = Fixture::new(&[("app.conf", "app\n"), ("only.conf", "only\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    let only = link_at(&f.home, "only.conf");
+    assert!(only.is_some());
+    let source2 = f.root.join("source2");
+    stage(&source2, "home/app.conf", b"second\n");
+    git(&source2, &f.home, &["init", "-b", "main"]);
+    git(&source2, &f.home, &["add", "-A"]);
+    git(&source2, &f.home, &["commit", "-qm", "seed"]);
+    let overlay2 = f.root.join("overlay2");
+    git(
+        &f.root,
+        &f.home,
+        &[
+            "clone",
+            "-q",
+            source2.to_str().unwrap(),
+            overlay2.to_str().unwrap(),
+        ],
+    );
+    let overlay = f.overlay.to_string_lossy().into_owned();
+    let entries = vec![
+        format!("ov|{overlay}|file:///elsewhere.git|||git"),
+        format!("ov2|{}|{}|||git", overlay2.display(), source2.display()),
+    ];
+    let (result, _, err) = f.run_entries(&entries, None, false, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(link_at(&f.home, "only.conf"), only);
+    let manifest = std::fs::read_to_string(&f.manifest).unwrap();
+    let app_records: Vec<&str> = manifest
+        .lines()
+        .filter(|line| line.starts_with("app.conf\t"))
+        .collect();
+    assert_eq!(
+        link_at(&f.home, "app.conf"),
+        Some(PathBuf::from(".dotfiles-ov2/home/app.conf"))
+    );
+    assert_eq!(app_records.len(), 1, "{manifest}");
+    assert!(app_records[0].starts_with("app.conf\tov2\t"), "{manifest}");
+    assert!(manifest.contains("only.conf\tov\t"), "{manifest}");
+}
+
+/// Write `body` as the leftover pending manifest an interrupted run
+/// leaves beside `manifest`, private like the publisher makes it.
+fn leave_pending(manifest: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let pending = PathBuf::from(format!("{}.pending", manifest.display()));
+    std::fs::write(&pending, body).unwrap();
+    std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn skipped_overlay_does_not_carry_leftover_pending_candidates() {
+    // A pending manifest left by an interrupted run holds unverified
+    // candidates, not installed links. Only committed records carry
+    // for a skipped overlay; a candidate it never linked must not be
+    // promoted into the committed generation as if it were installed.
+    let f = Fixture::new(&[("app.conf", "app\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    let app = link_at(&f.home, "app.conf");
+    assert!(app.is_some());
+    let before = std::fs::read_to_string(&f.manifest).unwrap();
+    leave_pending(&f.manifest, &format!("{before}ghost.conf\tov\n"));
+    let overlay = f.overlay.to_string_lossy().into_owned();
+    let moved = vec![format!("ov|{overlay}|file:///elsewhere.git|||git")];
+    let (result, _, err) = f.run_entries(&moved, None, false, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(
+        String::from_utf8(err)
+            .unwrap()
+            .contains("origin does not match")
+    );
+    assert_eq!(link_at(&f.home, "app.conf"), app);
+    assert!(std::fs::symlink_metadata(f.home.join("ghost.conf")).is_err());
+    assert_eq!(std::fs::read_to_string(&f.manifest).unwrap(), before);
+    // The committed generation supersedes the leftover authority.
+    assert!(!PathBuf::from(format!("{}.pending", f.manifest.display())).exists());
+}
+
+#[test]
+fn skipped_overlay_does_not_carry_records_on_reserved_paths() {
+    // A committed record can name a path that is overlay-control
+    // reserved (written before the path was reserved, or by hand).
+    // The authority load filters it out; carrying a skipped overlay's
+    // records must not reintroduce it, and the file there stays put.
+    let f = Fixture::new(&[("app.conf", "app\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    let app = link_at(&f.home, "app.conf");
+    assert!(app.is_some());
+    let before = std::fs::read_to_string(&f.manifest).unwrap();
+    let reserved = ".config/dot/profiles.d/work.conf";
+    stage(&f.home, reserved, b"profile\n");
+    std::fs::write(&f.manifest, format!("{before}{reserved}\tov\n")).unwrap();
+    let overlay = f.overlay.to_string_lossy().into_owned();
+    let moved = vec![format!("ov|{overlay}|file:///elsewhere.git|||git")];
+    let (result, _, err) = f.run_entries(&moved, None, false, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    // Only a skipped overlay reaches the carry; an active one would
+    // re-record `app.conf` and pass without exercising it.
+    assert!(
+        String::from_utf8(err)
+            .unwrap()
+            .contains("origin does not match")
+    );
+    assert_eq!(link_at(&f.home, "app.conf"), app);
+    assert_eq!(std::fs::read(f.home.join(reserved)).unwrap(), b"profile\n");
+    assert_eq!(std::fs::read_to_string(&f.manifest).unwrap(), before);
+}
+
+#[test]
+fn deselected_overlay_links_are_still_cleaned() {
+    // An overlay absent from the entries is genuinely gone: its links
+    // stay stale and are removed, unlike a skipped overlay's.
+    let f = Fixture::new(&[("app.conf", "app\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    assert!(link_at(&f.home, "app.conf").is_some());
+    let (result, _, err) = f.run_entries(&[], None, false, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(std::fs::symlink_metadata(f.home.join("app.conf")).is_err());
+    assert!(
+        !std::fs::read_to_string(&f.manifest)
+            .unwrap()
+            .contains("app.conf")
     );
 }
 

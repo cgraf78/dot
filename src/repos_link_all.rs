@@ -329,6 +329,59 @@ fn adopt_command(path: &str, expected: &str, actual: &str) -> String {
     }
 }
 
+/// Carry the committed manifest records owned by overlays this run
+/// skipped (non-worktree or origin mismatch) into `manifest_new`,
+/// marking their paths current so stale cleanup leaves them alone.
+/// The skip warnings promise "leaving it untouched"; without this,
+/// a skipped overlay contributes nothing to the new generation and
+/// every link it installed earlier reads as stale (removed, with
+/// shadowed base files restored). Only committed manifests carry:
+/// a leftover pending manifest holds unverified candidates, which
+/// stale cleanup already reconciles path by path. Paths an active
+/// overlay recorded this run keep that overlay's record (no
+/// duplicate owners), and paths the authority load filtered out
+/// (manifest, state, and reserved paths) stay out. Returns false
+/// when a manifest cannot be reread or a record cannot be appended.
+fn carry_skipped(
+    manifests: &[String],
+    pending: &str,
+    skipped: &HashSet<String>,
+    authority_paths: &HashSet<String>,
+    manifest_new: &Path,
+    current: &mut HashSet<String>,
+) -> bool {
+    for manifest in manifests {
+        if manifest == pending {
+            continue;
+        }
+        let Ok(content) = std::fs::read(manifest) else {
+            return false;
+        };
+        for line in repos_overlays::stream_lines(&content) {
+            // The authority load already validated every line.
+            let Some(record) = repos_overlays::parse_manifest_record(&line) else {
+                return false;
+            };
+            if !skipped.contains(&record.owner)
+                || !authority_paths.contains(&record.rel)
+                || current.contains(&record.rel)
+            {
+                continue;
+            }
+            if !repos_overlays::record_final(
+                &record.rel,
+                &record.owner,
+                &record.target,
+                manifest_new,
+                current,
+            ) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// `_link_overlays`: run the whole link phase natively. Rows land
 /// in `out`/`err` exactly like the shell streams; `stage` renders
 /// the counted-UI open/close the pull lane threads the same way.
@@ -591,6 +644,8 @@ pub fn link_overlays(
     let mut targets: Vec<(String, String)> = authority.targets.into_iter().collect();
     targets.sort();
     let mut overlay_state = OverlayState::new();
+    // Overlays left untouched this run; their prior links carry over.
+    let mut skipped: HashSet<String> = HashSet::new();
     let mut done: i64 = 0;
     let verbose = is_verbose(inputs.dot_verbose);
     for entry in inputs.entries {
@@ -616,6 +671,7 @@ pub fn link_overlays(
                         "  warning: {name} overlay path exists but is not a Git worktree; leaving it untouched: {path}"
                     ),
                 );
+                skipped.insert(name);
                 continue;
             }
             if let Err(actual) = overlays::checkout_matches(Path::new(&path), &url, inputs.home) {
@@ -651,6 +707,7 @@ pub fn link_overlays(
                         warn_row(err, inputs.palette, &line);
                     }
                 }
+                skipped.insert(name);
                 continue;
             }
         }
@@ -738,6 +795,35 @@ pub fn link_overlays(
                 return outcome;
             }
         }
+    }
+    // A latched signal makes the worktree/origin probes read false,
+    // so a skip seen now may be spurious: stop quietly like every
+    // other cancelled step instead of warning about the carry.
+    if cancelled() {
+        cleanup(Some(&manifest_new), Some(&inventory_root));
+        return outcome;
+    }
+    // After every active overlay recorded its paths, so active
+    // overlays win any path they share with a skipped one.
+    if !skipped.is_empty()
+        && !carry_skipped(
+            &manifests,
+            &repos_overlays::pending_manifest_path(inputs.manifest),
+            &skipped,
+            &authority.paths,
+            &manifest_new,
+            &mut overlay_state.current,
+        )
+    {
+        warn_row(
+            err,
+            inputs.palette,
+            &format!(
+                "  warning: could not preserve skipped overlay links; recovery authority retained: {pending}"
+            ),
+        );
+        cleanup(Some(&manifest_new), Some(&inventory_root));
+        return outcome;
     }
     // Clean up every previously or provisionally authoritative
     // path omitted from the final manifest. Stale rels sort: the

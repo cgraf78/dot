@@ -394,10 +394,12 @@ fn parallel_fleet_stress_keeps_declaration_order() {
     assert!(warnings.is_empty());
 }
 
-#[test]
-fn pull_all_aggregates_base_and_overlay_outcomes() {
-    let fleet = Fleet::new("fleet-all", 1);
-    commit(&fleet.origins[0], "changed.txt", "changed\n");
+/// Run [`pull_all`] over `fleet` (its home as the ordinary base),
+/// returning the outcome plus both captured streams.
+fn pull_all_in(
+    fleet: &Fleet,
+    verbose: bool,
+) -> (dot::repos_pull_fleet::PullAllOutcome, Vec<u8>, Vec<u8>) {
     let home = fleet.home.to_string_lossy().into_owned();
     let entries = fleet.entries();
     let dest = DestinationInputs {
@@ -436,7 +438,7 @@ fn pull_all_aggregates_base_and_overlay_outcomes() {
         extra_args: &[],
         home: &home,
         dot_quiet: Some("0"),
-        dot_verbose: Some("0"),
+        dot_verbose: Some(if verbose { "1" } else { "0" }),
         ui_total: None,
         update_jobs: Some("2"),
         bar_width: "8",
@@ -461,6 +463,14 @@ fn pull_all_aggregates_base_and_overlay_outcomes() {
     let mut out = Vec::new();
     let mut warnings = Vec::new();
     let outcome = pull_all(&inputs, &mut stage, &mut moves, &mut out, &mut warnings);
+    (outcome, out, warnings)
+}
+
+#[test]
+fn pull_all_aggregates_base_and_overlay_outcomes() {
+    let fleet = Fleet::new("fleet-all", 1);
+    commit(&fleet.origins[0], "changed.txt", "changed\n");
+    let (outcome, _out, warnings) = pull_all_in(&fleet, false);
     assert_eq!(outcome.status, RepoPullStatus::Changed);
     assert_eq!(outcome.rc, 0);
     assert_eq!(
@@ -470,6 +480,26 @@ fn pull_all_aggregates_base_and_overlay_outcomes() {
     assert_eq!(outcome.summary, "1 repo changed, 1 repo skipped");
     assert_eq!(outcome.changed_items, ["ovl0 dotfiles updated"]);
     assert!(warnings.is_empty());
+}
+
+#[test]
+fn verbose_base_skip_row_names_why_it_skipped() {
+    // A branch without tracking keeps the historical row; a detached
+    // HEAD is not "no upstream" and must say what actually happened.
+    let fleet = Fleet::new("fleet-skip-reason", 0);
+    let (outcome, out, _warnings) = pull_all_in(&fleet, true);
+    assert_eq!(outcome.skipped, 1);
+    let out = String::from_utf8_lossy(&out).into_owned();
+    assert!(out.contains("dotfiles pull skipped (no upstream)"), "{out}");
+    git(&fleet.home, &["checkout", "-q", "--detach"]);
+    let (outcome, out, _warnings) = pull_all_in(&fleet, true);
+    assert_eq!(outcome.skipped, 1);
+    let out = String::from_utf8_lossy(&out).into_owned();
+    assert!(
+        out.contains("dotfiles pull skipped (detached HEAD)"),
+        "{out}"
+    );
+    assert!(!out.contains("(no upstream)"), "{out}");
 }
 
 fn live_stage() -> Stage {
