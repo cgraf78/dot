@@ -7,13 +7,27 @@
 //!
 //! - `update.log`: one outcome line per cron run, appended:
 //!   `<epoch> <outcome> <stage>[ <detail>]` with `outcome` one of
-//!   `ok`, `fail`, or `skip`. `skip` lines carry the capped dirty
-//!   file list as their detail; `ok`/`fail` lines name the `update`
-//!   stage. A provider re-exec performs two engine runs, so one cron
-//!   invocation can append two lines.
-//! - `update.last-success`: the epoch of the last successful cron
-//!   run, overwritten. `dot doctor` warns when the stamp is older
-//!   than [`CRON_STALE_AFTER_SECS`].
+//!   `ok`, `degraded`, `fail`, or `skip`. `skip` lines carry the
+//!   capped dirty file list as their detail; `ok`/`degraded`/`fail`
+//!   lines name the `update` stage, and `degraded` lines add the
+//!   failing stages ([`Degraded::detail`], e.g. `tools,prune`). A
+//!   provider re-exec performs two engine runs, so one cron
+//!   invocation can append two lines (both carry the continuation's
+//!   classification).
+//! - `update.last-success`: the epoch of the last fully clean cron
+//!   run (exit 0), overwritten. Its meaning is unchanged from before
+//!   the degraded outcome existed, so an older `dot doctor` reading a
+//!   newer Dot's state still reports exactly what it always did.
+//! - `update.last-converged`: `<epoch>[ <stages>]` for the last cron
+//!   run whose repository sync, overlay links, profile deactivation,
+//!   and config (merge) hooks succeeded and whose profile lifecycle
+//!   commit did not fail (a failed Tools stage skips it, as before).
+//!   Overwritten on `ok` (no stages) and `degraded` (the failing
+//!   stages). `dot doctor` uses it to tell a host that keeps
+//!   converging while Tools or Prune fails from one that stopped
+//!   converging; stamps older than [`CRON_STALE_AFTER_SECS`] read as
+//!   not converging. Older Dot releases neither write nor read it, so
+//!   after a downgrade the stamp only ages out.
 //! - `logs/`: retained failure logs from the quiet runner, pruned to
 //!   the newest [`MAX_RETAINED_LOGS`].
 //!
@@ -37,10 +51,59 @@ pub const MAX_SKIP_FILES: usize = 10;
 /// Retained failure logs kept per directory (newest win).
 pub const MAX_RETAINED_LOGS: usize = 20;
 
-/// Largest `update.last-success` body accepted: a valid stamp is an
-/// ASCII epoch plus newline (at most 21 bytes), so anything past
-/// this is corrupt, never a stamp.
+/// Largest `update.last-success` or `update.last-converged` body
+/// accepted: a valid stamp is an ASCII epoch (at most 20 bytes), an
+/// optional short stage list, and a newline, so anything past this is
+/// corrupt, never a stamp.
 const STAMP_MAX_BYTES: u64 = 64;
+
+/// Stage names persisted in `degraded` outcome lines and the
+/// convergence stamp. Stable vocabulary: `dot doctor` renders them.
+pub const STAGE_TOOLS: &str = "tools";
+/// See [`STAGE_TOOLS`].
+pub const STAGE_PRUNE: &str = "prune";
+
+/// Stages whose failure leaves a cron run converged but degraded:
+/// the dotfiles themselves (repositories, links, configs) are current,
+/// but dependency convergence (Tools) or orphan removal (Prune) failed.
+/// Any other failure means the run did not converge and records `fail`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Degraded {
+    /// The Tools stage failed (provider unavailable, a dependency, or a
+    /// post hook).
+    pub tools: bool,
+    /// The Prune stage ran and failed.
+    pub prune: bool,
+}
+
+impl Degraded {
+    /// True when no degradable stage failed.
+    pub fn is_empty(self) -> bool {
+        !self.tools && !self.prune
+    }
+
+    /// The failing stages, comma-joined in run order (`tools,prune`);
+    /// empty when none failed. Persisted as-is.
+    pub fn detail(self) -> String {
+        [(self.tools, STAGE_TOOLS), (self.prune, STAGE_PRUNE)]
+            .iter()
+            .filter(|(failed, _)| *failed)
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// The last converged cron run read back from `update.last-converged`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Converged {
+    /// Epoch seconds of that run.
+    pub at: i64,
+    /// Its failing stages (`tools,prune`), empty for a clean run. Kept as
+    /// validated text rather than [`Degraded`] so a stage name only a newer
+    /// Dot writes still renders instead of hiding the degraded state.
+    pub failing: String,
+}
 
 /// Create `path` as a private directory, tightening pre-existing
 /// ones: cron state holds dirty filenames plus absolute home paths,
@@ -81,6 +144,11 @@ pub fn update_log_path(state_home: &Path) -> PathBuf {
 /// The last-success stamp (`dot/update.last-success`).
 pub fn last_success_path(state_home: &Path) -> PathBuf {
     dot_dir(state_home).join("update.last-success")
+}
+
+/// The convergence stamp (`dot/update.last-converged`).
+pub fn last_converged_path(state_home: &Path) -> PathBuf {
+    dot_dir(state_home).join("update.last-converged")
 }
 
 /// The retained failure-log directory (`dot/logs`).
@@ -150,10 +218,29 @@ pub fn append_outcome(state_home: &Path, now: i64, outcome: &str, stage: &str, d
 /// Overwrite the last-success stamp with `now` (epoch seconds).
 /// Best-effort like [`append_outcome`], owner-only, FIFO-refusing.
 pub fn record_success(state_home: &Path, now: i64) {
+    write_stamp(&last_success_path(state_home), &format!("{now}\n"));
+}
+
+/// Overwrite the convergence stamp with `now` and the failing stages
+/// (none for a clean run). Best-effort like [`record_success`].
+pub fn record_converged(state_home: &Path, now: i64, degraded: Degraded) {
+    let mut body = now.to_string();
+    if !degraded.is_empty() {
+        body.push(' ');
+        body.push_str(&degraded.detail());
+    }
+    body.push('\n');
+    write_stamp(&last_converged_path(state_home), &body);
+}
+
+/// Truncate-and-write one small stamp file. Not an atomic rename: the
+/// stamps are advisory, written under the update lock, and every reader
+/// treats a torn or empty body as missing, which only ever errs toward
+/// the older (warning) answer for one doctor run.
+fn write_stamp(path: &Path, body: &str) {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    let path = last_success_path(state_home);
     if let Some(parent) = path.parent() {
         let _ = ensure_private_dir(parent);
     }
@@ -164,23 +251,23 @@ pub fn record_success(state_home: &Path, now: i64) {
         .truncate(true)
         .mode(0o600)
         .custom_flags(libc::O_NONBLOCK);
-    let Some(mut file) = open_state_file(&options, &path) else {
+    let Some(mut file) = open_state_file(&options, path) else {
         return;
     };
     let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-    let _ = file.write_all(format!("{now}\n").as_bytes());
+    let _ = file.write_all(body.as_bytes());
 }
 
-/// Read the last-success stamp: the trimmed file content as epoch
-/// seconds, or `None` when missing, unreadable, oversized, or
-/// malformed. Never blocks on a pre-planted FIFO.
-pub fn read_last_success(state_home: &Path) -> Option<i64> {
+/// Read one stamp body capped at [`STAMP_MAX_BYTES`], or `None` when
+/// missing, unreadable, oversized, or not UTF-8. Never blocks on a
+/// pre-planted FIFO.
+fn read_stamp(path: &Path) -> Option<String> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let mut options = std::fs::OpenOptions::new();
     options.read(true).custom_flags(libc::O_NONBLOCK);
-    let file = open_state_file(&options, &last_success_path(state_home))?;
+    let file = open_state_file(&options, path)?;
     let mut content = String::new();
     file.take(STAMP_MAX_BYTES + 1)
         .read_to_string(&mut content)
@@ -188,7 +275,43 @@ pub fn read_last_success(state_home: &Path) -> Option<i64> {
     if content.len() as u64 > STAMP_MAX_BYTES {
         return None;
     }
-    content.trim().parse::<i64>().ok()
+    Some(content)
+}
+
+/// Read the last-success stamp: the trimmed file content as epoch
+/// seconds, or `None` when missing, unreadable, oversized, or
+/// malformed. Never blocks on a pre-planted FIFO.
+pub fn read_last_success(state_home: &Path) -> Option<i64> {
+    read_stamp(&last_success_path(state_home))?
+        .trim()
+        .parse::<i64>()
+        .ok()
+}
+
+/// Read the convergence stamp, or `None` when missing, unreadable,
+/// oversized, or malformed. The stage list must be comma-separated
+/// lowercase ASCII names: anything else (spaces, control bytes, empty
+/// names) is corrupt, so hostile text never reaches doctor output.
+pub fn read_last_converged(state_home: &Path) -> Option<Converged> {
+    let content = read_stamp(&last_converged_path(state_home))?;
+    let line = content.strip_suffix('\n').unwrap_or(&content);
+    let (epoch, failing) = match line.split_once(' ') {
+        Some((epoch, failing)) => (epoch, failing),
+        None => (line, ""),
+    };
+    let at = epoch.parse::<i64>().ok()?;
+    if line.contains(' ') {
+        let valid = failing
+            .split(',')
+            .all(|name| !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_lowercase()));
+        if !valid {
+            return None;
+        }
+    }
+    Some(Converged {
+        at,
+        failing: failing.to_string(),
+    })
 }
 
 /// True when `last_success` is older than

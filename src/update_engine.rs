@@ -1614,6 +1614,11 @@ fn prune_stage(
 /// tools stage, the opt-in prune stage, the empty merges close,
 /// lifecycle commit, worktree normalize, and `_ui_done`. Returns the
 /// update status.
+///
+/// `degraded` receives the failed Tools/Prune stages only when they are
+/// the sole reason for a nonzero status (the run otherwise converged);
+/// any other failure leaves it empty so the cron record reads `fail`.
+/// After a provider re-exec it carries the continuation's value.
 #[allow(clippy::too_many_arguments)]
 fn finalize(
     inputs: &EngineInputs<'_>,
@@ -1623,6 +1628,7 @@ fn finalize(
     now_secs: i64,
     update_status: i32,
     frozen: bool,
+    degraded: &mut crate::update_status::Degraded,
 ) -> i32 {
     if cancelled() {
         return 1;
@@ -1632,9 +1638,10 @@ fn finalize(
     // Prune trusts exactly what the Tools stage trusted: it runs only after
     // a prepared provider converged this generation (see the Tools branch).
     let prune_this_run = prune_row(inputs.caller, inputs.prune_mode, inputs.flags.cron);
-    // Folded into `status` only after the lifecycle decision, so a prune
-    // failure never withholds lifecycle authority from a converged run.
-    let mut prune_failed = false;
+    // Tools and Prune failures are tracked apart from `status` so the cron
+    // record can tell a converged-but-degraded run from one that did not
+    // converge. Both still make the update exit 1 (folded in below).
+    let mut stages = crate::update_status::Degraded::default();
     let checkpoint = format!("{}/dot/provider-reexec-failed", inputs.state_home);
     if !crate::shdeps::consume_checkpoint(Path::new(&checkpoint), inputs.source_root_git) {
         let close = crate::progress_ui::done(
@@ -1816,7 +1823,7 @@ fn finalize(
                             crate::update_engine::now_secs(),
                         );
                         let _ = io.out.write_all(&close);
-                        status = 1;
+                        stages.tools = true;
                         prune = Err(PruneSkip::Unavailable);
                     }
                     Ok(prepared) => {
@@ -1848,12 +1855,14 @@ fn finalize(
                         let _ = io.out.write_all(&close);
                         let _ = io.out.write_all(&provider.details);
                         if provider.status != 0 {
-                            status = 1;
+                            stages.tools = true;
                         } else if let Some((before, after)) = provider.revision_change {
                             if cancelled() {
                                 return 1;
                             }
-                            return provider_reexec(inputs, io, &before, &after, now_secs);
+                            return provider_reexec(
+                                inputs, io, &before, &after, now_secs, degraded,
+                            );
                         }
                         // A failed update (a dependency or post hook) still
                         // leaves this generation's config trusted: prune on.
@@ -1875,7 +1884,7 @@ fn finalize(
             if prune_this_run {
                 match prune_stage(inputs, stage, io, prune) {
                     PruneStatus::Ok => {}
-                    PruneStatus::Failed => prune_failed = true,
+                    PruneStatus::Failed => stages.prune = true,
                     PruneStatus::Stop(code) => return code,
                 }
                 if cancelled() {
@@ -1925,7 +1934,10 @@ fn finalize(
             }
         }
     }
-    match lifecycle_publish_decision(inputs_ready, status, cancelled()) {
+    // A failed Tools stage withholds the lifecycle commit exactly as it did
+    // when it set `status` directly; Prune is deliberately not part of this.
+    let lifecycle_status = if stages.tools { 1 } else { status };
+    match lifecycle_publish_decision(inputs_ready, lifecycle_status, cancelled()) {
         LifecyclePublish::Interrupted => return 1,
         LifecyclePublish::Skip => {}
         LifecyclePublish::Commit => {
@@ -1960,7 +1972,14 @@ fn finalize(
     if cancelled() {
         return 1;
     }
-    if prune_failed {
+    // Converged but degraded only when nothing else failed; the exit status
+    // stays 1 either way, so callers and scripts see no change.
+    *degraded = if status == 0 {
+        stages
+    } else {
+        crate::update_status::Degraded::default()
+    };
+    if !stages.is_empty() {
         status = 1;
     }
     let based = inputs.base.is_some_and(|base| base.exists());
@@ -2013,6 +2032,7 @@ fn provider_reexec(
     before: &str,
     after: &str,
     now_secs: i64,
+    degraded: &mut crate::update_status::Degraded,
 ) -> i32 {
     if cancelled() {
         return 1;
@@ -2133,7 +2153,9 @@ fn provider_reexec(
     if cancelled() {
         return 1;
     }
-    run_gathered(&nested, &mut *io.out, &mut *io.err, now_secs)
+    // The continuation records its own cron outcome; handing its degraded
+    // stages back lets the outer record match instead of reading `fail`.
+    run_gathered(&nested, &mut *io.out, &mut *io.err, now_secs, degraded)
 }
 
 fn cancelled() -> bool {
@@ -2635,7 +2657,14 @@ pub fn run_update(
         inner: &mut *streams.stderr,
         failed: false,
     };
-    let code = run_gathered(&gathered.inputs(), &mut out, &mut err, now_secs());
+    let mut degraded = crate::update_status::Degraded::default();
+    let code = run_gathered(
+        &gathered.inputs(),
+        &mut out,
+        &mut err,
+        now_secs(),
+        &mut degraded,
+    );
     if out.failed() || err.failed() {
         return 1;
     }
@@ -2652,16 +2681,23 @@ pub fn run_update(
 /// `skip` line to the cron outcome log and warns on stderr even in
 /// cron mode, so a frozen slot is visible without re-running.
 /// Finding #6 records `ok`/`fail` the same way on the way out and
-/// refreshes the last-success stamp on success. Interrupted runs
-/// record nothing (cancellation is not an outcome), and non-cron
-/// runs write nothing (the history-tree tests pin the state
-/// directory across plain updates).
+/// refreshes the last-success stamp on success. A run that converged
+/// (sync, links, deactivation, configs; no lifecycle commit failure)
+/// but whose Tools or Prune stage failed records `degraded` with those
+/// stages and refreshes only the convergence stamp, so `dot doctor`
+/// can tell it from a frozen host; its exit status stays 1.
+/// Interrupted runs record nothing (cancellation is not an outcome),
+/// and non-cron runs write nothing (the history-tree tests pin the
+/// state directory across plain updates). `degraded` reports this
+/// run's degraded stages to a provider re-exec's outer run.
 fn run_gathered(
     inputs: &EngineInputs<'_>,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
     now_secs: i64,
+    degraded: &mut crate::update_status::Degraded,
 ) -> i32 {
+    *degraded = crate::update_status::Degraded::default();
     if cancelled() {
         return 1;
     }
@@ -2691,12 +2727,27 @@ fn run_gathered(
         );
         return 0;
     }
-    let rc = run_gathered_inner(inputs, out, err, now_secs);
+    let rc = run_gathered_inner(inputs, out, err, now_secs, degraded);
     if inputs.flags.cron && !cancelled() {
         let state_home = Path::new(inputs.state_home);
         if rc == 0 {
             crate::update_status::append_outcome(state_home, now_secs, "ok", "update", "");
             crate::update_status::record_success(state_home, now_secs);
+            // Exit 0 implies no failed stage: a clean convergence.
+            crate::update_status::record_converged(
+                state_home,
+                now_secs,
+                crate::update_status::Degraded::default(),
+            );
+        } else if !degraded.is_empty() {
+            crate::update_status::append_outcome(
+                state_home,
+                now_secs,
+                "degraded",
+                "update",
+                &degraded.detail(),
+            );
+            crate::update_status::record_converged(state_home, now_secs, *degraded);
         } else {
             crate::update_status::append_outcome(state_home, now_secs, "fail", "update", "");
         }
@@ -2711,6 +2762,7 @@ fn run_gathered_inner(
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
     now_secs: i64,
+    degraded: &mut crate::update_status::Degraded,
 ) -> i32 {
     if cancelled() {
         return 1;
@@ -2740,6 +2792,7 @@ fn run_gathered_inner(
             now_secs,
             1,
             sync.frozen,
+            degraded,
         );
         return rc;
     }
@@ -2776,6 +2829,7 @@ fn run_gathered_inner(
         now_secs,
         0,
         sync.frozen,
+        degraded,
     )
 }
 

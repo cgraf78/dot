@@ -64,6 +64,94 @@ fn success_stamp_round_trips_and_rejects_garbage() {
 }
 
 #[test]
+fn convergence_stamp_round_trips_failing_stages() {
+    let scratch = TempDir::new("update-status-converged").unwrap();
+    let state = scratch.path();
+    assert_eq!(update_status::read_last_converged(state), None);
+    let degraded = update_status::Degraded {
+        tools: true,
+        prune: true,
+    };
+    assert_eq!(degraded.detail(), "tools,prune");
+    update_status::record_converged(state, 1_800_000_000, degraded);
+    assert_eq!(
+        std::fs::read_to_string(update_status::last_converged_path(state)).unwrap(),
+        "1800000000 tools,prune\n"
+    );
+    assert_eq!(
+        update_status::read_last_converged(state),
+        Some(update_status::Converged {
+            at: 1_800_000_000,
+            failing: "tools,prune".to_string(),
+        })
+    );
+    // A clean run overwrites the list away, leaving the success format.
+    update_status::record_converged(state, 1_800_000_060, update_status::Degraded::default());
+    assert_eq!(
+        std::fs::read_to_string(update_status::last_converged_path(state)).unwrap(),
+        "1800000060\n"
+    );
+    assert_eq!(
+        update_status::read_last_converged(state),
+        Some(update_status::Converged {
+            at: 1_800_000_060,
+            failing: String::new(),
+        })
+    );
+}
+
+#[test]
+fn degraded_detail_lists_stages_in_run_order() {
+    let only = |tools, prune| update_status::Degraded { tools, prune }.detail();
+    assert_eq!(only(false, false), "");
+    assert_eq!(only(true, false), "tools");
+    assert_eq!(only(false, true), "prune");
+    assert!(update_status::Degraded::default().is_empty());
+    assert!(
+        !update_status::Degraded {
+            tools: false,
+            prune: true
+        }
+        .is_empty()
+    );
+}
+
+#[test]
+fn convergence_stamp_rejects_garbage_and_hostile_stage_text() {
+    let scratch = TempDir::new("update-status-converged-garbage").unwrap();
+    let state = scratch.path();
+    std::fs::create_dir_all(update_status::dot_dir(state)).unwrap();
+    let path = update_status::last_converged_path(state);
+    for body in [
+        &b"not an epoch\n"[..],
+        b"",
+        b"1800000000 tools prune\n",
+        b"1800000000 tools\x1b[31m\n",
+        b"1800000000 \n",
+        b"1800000000 ,\n",
+        b"1800000000 tools,,prune\n",
+        &[b'9'; 1024][..],
+    ] {
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(
+            update_status::read_last_converged(state),
+            None,
+            "{:?}",
+            String::from_utf8_lossy(body)
+        );
+    }
+    // A stage name only a newer Dot writes still reads (and renders).
+    std::fs::write(&path, b"1800000000 tools,configs\n").unwrap();
+    assert_eq!(
+        update_status::read_last_converged(state),
+        Some(update_status::Converged {
+            at: 1_800_000_000,
+            failing: "tools,configs".to_string(),
+        })
+    );
+}
+
+#[test]
 fn success_stamp_rejects_oversized_and_extreme_values() {
     // Fresh-review-B B3: a corrupt multi-GB stamp must not OOM the
     // reader, and `i64::MIN` must read stale (never overflow).
@@ -174,6 +262,7 @@ fn planted_fifos_never_block_state_access() {
     for path in [
         update_status::update_log_path(&state),
         update_status::last_success_path(&state),
+        update_status::last_converged_path(&state),
     ] {
         let status = std::process::Command::new("mkfifo")
             .arg(&path)
@@ -184,7 +273,11 @@ fn planted_fifos_never_block_state_access() {
     let worker = std::thread::spawn(move || {
         update_status::append_outcome(&state, 1_800_000_000, "ok", "update", "");
         update_status::record_success(&state, 1_800_000_000);
-        update_status::read_last_success(&state)
+        update_status::record_converged(&state, 1_800_000_000, update_status::Degraded::default());
+        (
+            update_status::read_last_success(&state),
+            update_status::read_last_converged(&state),
+        )
     });
     let deadline = std::time::Duration::from_secs(10);
     let start = std::time::Instant::now();
@@ -198,7 +291,7 @@ fn planted_fifos_never_block_state_access() {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    assert_eq!(stamp, None);
+    assert_eq!(stamp, (None, None));
 }
 
 #[test]
@@ -224,6 +317,10 @@ fn cron_state_stays_owner_only() {
 
     update_status::append_outcome(state, 1_800_000_000, "ok", "update", "");
     update_status::record_success(state, 1_800_000_000);
+    let converged = update_status::last_converged_path(state);
+    std::fs::write(&converged, b"1\n").unwrap();
+    std::fs::set_permissions(&converged, std::fs::Permissions::from_mode(0o644)).unwrap();
+    update_status::record_converged(state, 1_800_000_000, update_status::Degraded::default());
     let failed = state.join("scratch.log");
     std::fs::write(&failed, b"boom\n").unwrap();
     update_status::retain_failed_log(&logs, "cmd", 1_800_000_000, &failed).expect("retained log");
@@ -234,6 +331,7 @@ fn cron_state_stays_owner_only() {
     assert_eq!(mode(&dot), 0o700);
     assert_eq!(mode(&log), 0o600);
     assert_eq!(mode(&stamp), 0o600);
+    assert_eq!(mode(&converged), 0o600);
     assert_eq!(mode(&logs), 0o700);
 }
 
@@ -285,6 +383,10 @@ fn state_paths_live_under_the_dot_directory() {
     assert_eq!(
         update_status::last_success_path(state),
         state.join("dot/update.last-success")
+    );
+    assert_eq!(
+        update_status::last_converged_path(state),
+        state.join("dot/update.last-converged")
     );
     assert_eq!(update_status::logs_dir(state), state.join("dot/logs"));
 }

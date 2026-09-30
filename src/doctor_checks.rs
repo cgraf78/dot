@@ -521,42 +521,91 @@ pub fn check_merges(inputs: &MergeInputs) -> Vec<Record> {
     out
 }
 
-/// Inputs for [`check_cron_freshness`]: the cron last-success stamp
-/// plus the current clock, both epoch seconds.
+/// Inputs for [`check_cron_freshness`]: the cron stamps plus the
+/// current clock, all epoch seconds.
 pub struct CronInputs {
-    /// Epoch of the last successful cron run, or `None` when no
-    /// successful run was ever recorded.
+    /// Epoch of the last fully clean cron run, or `None` when no
+    /// clean run was ever recorded.
     pub last_success: Option<i64>,
+    /// The last converged (clean or degraded) cron run, or `None` when
+    /// none was recorded (including every run by a Dot older than the
+    /// convergence stamp).
+    pub last_converged: Option<crate::update_status::Converged>,
     /// Current epoch seconds.
     pub now: i64,
 }
 
 /// Cron convergence freshness (handoff finding #1): warns when the
-/// last successful cron run is older than
+/// last clean cron run is older than
 /// [`crate::update_status::CRON_STALE_AFTER_SECS`]. Warn, not fail:
 /// a stale stamp usually self-heals on the next slot, and sleeping
 /// machines go stale with nothing broken. A missing stamp skips:
 /// fresh installs have never converged.
+///
+/// A host whose runs keep converging while the Tools or Prune stage
+/// fails is reported as degraded with the failing stages instead of
+/// "has not succeeded recently", which stays reserved for a host that
+/// stopped converging. Both use the same staleness window, so a
+/// transient failure after a recent clean run still reads ok, exactly
+/// as before the degraded outcome existed.
 pub fn check_cron_freshness(inputs: &CronInputs) -> Vec<Record> {
+    use crate::update_status::{format_age, is_stale};
+
     let mut out = vec![Record::section("Update")];
-    let Some(last) = inputs.last_success else {
-        out.push(Record::skip(
-            "cron update success is unknown",
-            Some("no successful cron update recorded".to_string()),
-        ));
-        return out;
-    };
-    let age = crate::update_status::format_age(inputs.now.saturating_sub(last));
-    if crate::update_status::is_stale(last, inputs.now) {
-        out.push(Record::warn(
-            "cron update has not succeeded recently",
-            Some(format!("last success {age} ago")),
-        ));
-    } else {
+    let age = |at: i64| format_age(inputs.now.saturating_sub(at));
+    let converged = inputs.last_converged.as_ref();
+    // A clean convergence stamp is a success even if the last-success
+    // write was lost; both are written by the same clean run.
+    let clean = converged
+        .filter(|converged| converged.failing.is_empty())
+        .map(|converged| converged.at)
+        .into_iter()
+        .chain(inputs.last_success)
+        .max();
+    if let Some(clean) = clean.filter(|clean| !is_stale(*clean, inputs.now)) {
         out.push(Record::ok(
             "cron update succeeded recently",
-            Some(format!("{age} ago")),
+            Some(format!("{} ago", age(clean))),
         ));
+        return out;
+    }
+    if let Some(converged) = converged
+        .filter(|converged| !converged.failing.is_empty() && !is_stale(converged.at, inputs.now))
+    {
+        let since = match inputs.last_success {
+            Some(last) => format!("since last success {} ago", age(last)),
+            None => "no clean cron update recorded".to_string(),
+        };
+        out.push(Record::warn(
+            format!("cron update degraded: {} failing", converged.failing),
+            Some(format!("{since}; last converged {} ago", age(converged.at))),
+        ));
+        return out;
+    }
+    // Stale from here on. `clean` (not just last-success) is the success
+    // reference, so a lone clean convergence stamp reads as a success. Only
+    // a degraded convergence newer than it adds information (an older one is
+    // left behind by a downgrade to a Dot that does not write it).
+    let converged_note = converged
+        .filter(|converged| clean.is_none_or(|clean| converged.at > clean))
+        .map(|converged| format!("; last converged {} ago", age(converged.at)))
+        .unwrap_or_default();
+    match clean {
+        Some(clean) => out.push(Record::warn(
+            "cron update has not succeeded recently",
+            Some(format!("last success {} ago{converged_note}", age(clean))),
+        )),
+        // Only degraded runs ever converged, and they stopped too.
+        None if converged.is_some() => out.push(Record::warn(
+            "cron update has not succeeded recently",
+            Some(format!(
+                "no successful cron update recorded{converged_note}"
+            )),
+        )),
+        None => out.push(Record::skip(
+            "cron update success is unknown",
+            Some("no successful cron update recorded".to_string()),
+        )),
     }
     out
 }

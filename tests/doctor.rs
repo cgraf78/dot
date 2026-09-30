@@ -1990,6 +1990,45 @@ fn cron_freshness_reports_stamp_age_end_to_end() {
     );
 }
 
+#[test]
+fn cron_freshness_reports_degraded_convergence_end_to_end() {
+    // Moe E1: a host that keeps converging while Tools or Prune fails must
+    // read as degraded, not as a frozen host that stopped updating.
+    let (home, state, _) = merge_fixture("cron-degraded");
+    let dir = state.path().join("dot");
+    std::fs::create_dir_all(&dir).expect("stamp dir");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    std::fs::write(dir.join("update.last-success"), b"1\n").expect("aged stamp");
+    std::fs::write(
+        dir.join("update.last-converged"),
+        format!("{now} tools,prune\n"),
+    )
+    .expect("fresh degraded convergence");
+    let native = command(false, &home, &state, &[]).output().expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("cron update degraded: tools,prune failing"),
+        "degraded convergence: {stdout}"
+    );
+    assert!(stdout.contains("since last success "), "{stdout}");
+    assert!(
+        !stdout.contains("cron update has not succeeded recently"),
+        "degraded host must not read as frozen: {stdout}"
+    );
+
+    // Convergence that also stopped is the frozen warning again.
+    std::fs::write(dir.join("update.last-converged"), b"2 prune\n").expect("aged convergence");
+    let native = command(false, &home, &state, &[]).output().expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("cron update has not succeeded recently"),
+        "stopped convergence warns as frozen: {stdout}"
+    );
+}
+
 /// Total minutes rendered in `last success 497206h5m ago`. Small ages
 /// without an hour part (`90m`, `45s`) parse to their minute count.
 fn stamp_age_minutes(stdout: &str) -> u64 {

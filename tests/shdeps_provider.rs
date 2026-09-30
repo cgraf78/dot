@@ -4727,13 +4727,203 @@ Done with errors in Ns. Reload your shell: source ~/.bashrc\n";
         b"",
         b"  warning: old-tool uninstall hook failed\n  warning: shdeps prune failed (exit 1)\n",
     );
-    // A failed cron prune records a failed cron outcome and does not
-    // refresh the last-success stamp.
+    // Sync, links, and configs converged, so a failed cron prune records a
+    // degraded outcome naming the stage and stamps convergence, while the
+    // last-success stamp (fully clean runs only) stays unrefreshed.
+    assert_eq!(last_cron_outcome(&fixture), ["degraded", "update", "prune"]);
+    assert_eq!(converged_stages(&fixture), Some("prune".to_string()));
+    assert!(!dot::update_status::last_success_path(&fixture.state).exists());
+}
+
+/// Fields after the epoch of the newest cron outcome line.
+fn last_cron_outcome(fixture: &Fixture) -> Vec<String> {
     let log = std::fs::read_to_string(dot::update_status::update_log_path(&fixture.state))
         .expect("cron outcome log");
     let last = log.lines().last().expect("one cron outcome");
-    assert_eq!(last.split(' ').nth(1), Some("fail"), "{log}");
+    last.split(' ').skip(1).map(str::to_string).collect()
+}
+
+/// The failing-stage list in the convergence stamp (empty for a clean run),
+/// or `None` when no cron run converged. Read by raw path so the test pins
+/// the on-disk layout that `dot doctor` of any version reads.
+fn converged_stages(fixture: &Fixture) -> Option<String> {
+    let body = std::fs::read_to_string(fixture.state.join("dot/update.last-converged")).ok()?;
+    let mut fields = body.trim_end_matches('\n').splitn(2, ' ');
+    let epoch: i64 = fields.next()?.parse().expect("convergence epoch");
+    assert!(epoch > 1_700_000_000, "convergence epoch sane: {body:?}");
+    Some(fields.next().unwrap_or("").to_string())
+}
+
+#[test]
+fn cron_tools_failure_is_degraded_and_a_clean_run_clears_it() {
+    // A persistently failing dependency or post hook must not make a host
+    // that keeps converging look frozen: the outcome names the stage.
+    let fixture = Fixture::new("shdeps-cron-degraded-tools");
+    let degraded = fixture
+        .command()
+        .arg("--cron")
+        .env("DOT_TEST_PROVIDER_FAIL", "1")
+        .output()
+        .expect("cron update with failing tools");
+    // Exit status is unchanged: a degraded run still fails.
+    assert_eq!(degraded.status.code(), Some(1), "{degraded:?}");
+    assert_eq!(last_cron_outcome(&fixture), ["degraded", "update", "tools"]);
+    assert_eq!(converged_stages(&fixture), Some("tools".to_string()));
     assert!(!dot::update_status::last_success_path(&fixture.state).exists());
+
+    // Recovery stamps both files and clears the failing-stage list.
+    let clean = fixture
+        .command()
+        .arg("--cron")
+        .output()
+        .expect("clean cron update");
+    assert_cli(&clean, 0, b"", b"");
+    assert_eq!(last_cron_outcome(&fixture), ["ok", "update"]);
+    assert_eq!(converged_stages(&fixture), Some(String::new()));
+    assert!(dot::update_status::last_success_path(&fixture.state).exists());
+}
+
+#[test]
+fn cron_prune_that_shdeps_defers_with_a_warning_is_a_clean_run() {
+    // Newer Shdeps defers a sudo-needing uninstall without a terminal: it
+    // warns and exits 0. That is expected cron behavior, so the run is `ok`
+    // (not degraded) and the warning still reaches cron's stderr.
+    let fixture = Fixture::new("shdeps-cron-prune-deferred");
+    let output = pruning(&fixture, Some("cron"))
+        .arg("--cron")
+        .env(
+            "DOT_TEST_PROVIDER_PRUNE_WARNING",
+            "old-tool uninstall needs sudo; deferred",
+        )
+        .output()
+        .expect("cron update with a deferred uninstall");
+    assert_cli(
+        &output,
+        0,
+        b"",
+        b"  warning: old-tool uninstall needs sudo; deferred\n",
+    );
+    assert_eq!(last_cron_outcome(&fixture), ["ok", "update"]);
+    assert_eq!(converged_stages(&fixture), Some(String::new()));
+}
+
+#[test]
+fn cron_tools_and_prune_failures_record_both_degraded_stages() {
+    let fixture = Fixture::new("shdeps-cron-degraded-both");
+    let output = pruning(&fixture, Some("cron"))
+        .arg("--cron")
+        .env("DOT_TEST_PROVIDER_FAIL", "1")
+        .env("DOT_TEST_PROVIDER_PRUNE_EXIT", "1")
+        .output()
+        .expect("cron update with failing tools and prune");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        last_cron_outcome(&fixture),
+        ["degraded", "update", "tools,prune"]
+    );
+    assert_eq!(converged_stages(&fixture), Some("tools,prune".to_string()));
+}
+
+#[test]
+fn cron_unavailable_shdeps_is_a_degraded_tools_stage() {
+    // Dotfiles converged; only the dependency provider could not start.
+    let fixture = Fixture::new("shdeps-cron-degraded-unavailable");
+    let output = fixture
+        .command()
+        .arg("--cron")
+        .env("DOT_TEST_PROVIDER_BOOTSTRAP_FAIL", "1")
+        .output()
+        .expect("cron update without shdeps");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(last_cron_outcome(&fixture), ["degraded", "update", "tools"]);
+    assert_eq!(converged_stages(&fixture), Some("tools".to_string()));
+}
+
+#[test]
+fn cron_tools_failure_with_a_failing_merge_hook_is_a_failed_outcome() {
+    // Configs did not converge, so a Tools failure in the same run must not
+    // be reported as merely degraded: `fail`, and no convergence stamp.
+    let fixture = Fixture::new("shdeps-cron-tools-and-merge-failure");
+    let extensions = fixture.home.join("extensions");
+    let merge_hooks = extensions.join("merge-hooks.d");
+    std::fs::create_dir_all(&merge_hooks).expect("merge hooks");
+    std::fs::write(
+        fixture.home.join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=shdeps\nshdeps_update_policy=pinned\n",
+    )
+    .expect("merge config");
+    std::fs::write(merge_hooks.join("10-fail.sh"), b"merge() { return 3; }\n").expect("merge hook");
+    for path in [&extensions, &merge_hooks] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("private extension directory");
+    }
+    let output = fixture
+        .command()
+        .arg("--cron")
+        .env("DOT_TEST_PROVIDER_FAIL", "1")
+        .output()
+        .expect("cron update with failing tools and merge hook");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(last_cron_outcome(&fixture), ["fail", "update"]);
+    assert_eq!(converged_stages(&fixture), None);
+}
+
+#[test]
+fn cron_sync_failure_stays_a_failed_outcome_without_convergence() {
+    // A run that did not converge the dotfiles is a real failure: no
+    // convergence stamp, `fail` outcome, even with prune enabled.
+    let fixture = Fixture::new("shdeps-cron-sync-failure");
+    let descriptors = fixture.home.join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&descriptors).expect("overlay descriptors");
+    std::fs::write(
+        descriptors.join("broken.conf"),
+        format!(
+            "url=file://{}\n",
+            fixture.home.join("missing.git").display()
+        ),
+    )
+    .expect("broken overlay descriptor");
+    let output = pruning(&fixture, Some("cron"))
+        .arg("--cron")
+        .output()
+        .expect("cron update with sync failure");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(last_cron_outcome(&fixture), ["fail", "update"]);
+    assert_eq!(converged_stages(&fixture), None);
+}
+
+#[test]
+fn cron_provider_reexec_carries_a_degraded_continuation_outward() {
+    // The continuation under the new revision records its own outcome; the
+    // outer run must report the same classification, not a plain `fail`.
+    let fixture = Fixture::new("shdeps-cron-degraded-reexec");
+    let output = pruning(&fixture, Some("cron"))
+        .arg("--cron")
+        .env("DOT_TEST_PROVIDER_ADVANCE_SOURCE", "1")
+        .env(
+            "DOT_TEST_PROVIDER_ADVANCED",
+            fixture.home.join("provider-advanced"),
+        )
+        .env("DOT_TEST_PROVIDER_PRUNE_EXIT", "1")
+        .output()
+        .expect("cron reexec update with failing prune");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(fixture.home.join("provider-advanced").exists());
+    let log = std::fs::read_to_string(dot::update_status::update_log_path(&fixture.state))
+        .expect("cron outcome log");
+    let outcomes: Vec<Vec<&str>> = log
+        .lines()
+        .map(|line| line.split(' ').skip(1).collect())
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            ["degraded", "update", "prune"],
+            ["degraded", "update", "prune"]
+        ],
+        "{log}"
+    );
+    assert_eq!(converged_stages(&fixture), Some("prune".to_string()));
 }
 
 #[test]

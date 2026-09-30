@@ -118,10 +118,57 @@ stream is discarded rather than stopping the prune. Stdin is closed, but an
 uninstall hook that needs `sudo` may still prompt on an interactive terminal;
 under cron it fails instead. A prune failure (for example a failed `uninstall`
 hook) marks the stage failed and makes the update exit nonzero without
-stopping later stages or withholding the profile lifecycle commit. For a cron
-run that failure is recorded as a failed outcome and does not refresh the
-last-success stamp, so a prune that keeps failing makes `dot doctor` report
-cron convergence as stale.
+stopping later stages or withholding the profile lifecycle commit. A cron run
+whose only failures are `Tools` and/or `Prune` is recorded as degraded rather
+than failed (see [Cron update status](#cron-update-status)).
+
+## Cron update status
+
+Every `dot update --cron` run records its outcome under
+`${XDG_STATE_HOME:-~/.local/state}/dot/` for `dot doctor`:
+
+- `update.log` gets one line per run: `<epoch> <outcome> <stage>[ <detail>]`.
+  The outcome is `ok`, `degraded`, `fail`, or `skip` (unresolved local edits;
+  the detail lists them). A `degraded` line names the failing stages, for
+  example `1790000000 degraded update tools,prune`. A run in which `Tools`
+  updates Dot itself writes two lines, one per revision.
+- `update.last-success` holds the epoch of the last fully clean run (exit 0).
+- `update.last-converged` holds the epoch of the last run whose repository
+  sync, overlay links, profile deactivation, and config hooks succeeded and
+  whose profile lifecycle commit did not fail, followed by the failing stages
+  when that run was degraded (for example `1790000000 prune`).
+
+A run is degraded when everything except the `Tools` stage (a dependency, a
+post hook, or an unavailable Shdeps) and/or the `Prune` stage succeeded: the
+dotfiles are current, dependencies are not. This applies with or without
+`DOT_SHDEPS_PRUNE`: a cron run whose only failure is `Tools` now logs
+`degraded update tools` where it used to log `fail update`, so scripts that
+search `update.log` for `fail` should also match `degraded`. A failed `Tools`
+stage still defers the profile lifecycle commit to a later clean run, as
+before. Any other failure is `fail` and refreshes neither stamp. A post hook
+or uninstall that Shdeps defers because it needs `sudo` without a terminal
+exits 0: that is expected, so the run stays `ok`, not degraded, and the
+deferral shows up only as the Shdeps warning.
+
+A degraded run still exits 1, like any other failed update. Cron mails
+whatever a job prints (and a cron run prints only warnings and failures), not
+its exit status, so the distinction lives in the recorded state instead of a
+new exit code that existing callers would have to learn.
+
+`dot doctor` checks both stamps against a two-hour window:
+
+- a recent clean run: `cron update succeeded recently`;
+- otherwise, a recent degraded convergence: `cron update degraded: <stages>
+  failing`, with the time since the last clean run;
+- otherwise: `cron update has not succeeded recently`, meaning the host has
+  stopped converging (or has been asleep); this includes a host whose only
+  recorded runs were degraded, which older releases reported as unknown;
+- with no stamp at all: `cron update success is unknown`.
+
+A Dot older than the convergence stamp ignores it and keeps its original
+reading of `update.last-success`, so it reports a degraded host as not
+succeeding. After upgrading, the degraded report appears once the first cron
+run under the new Dot has recorded convergence.
 
 ## Overlay profiles
 

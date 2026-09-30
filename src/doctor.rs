@@ -115,6 +115,7 @@ fn run_configured(
         emit.recorder(),
         crate::doctor_checks::check_cron_freshness(&CronInputs {
             last_success: crate::update_status::read_last_success(runtime.state_home()),
+            last_converged: crate::update_status::read_last_converged(runtime.state_home()),
             now: crate::update_engine::now_secs(),
         }),
     );
