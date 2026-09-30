@@ -35,6 +35,16 @@ trap 'rm -rf -- "$wrapper_root"' EXIT
 coordinator_home=$wrapper_root/home
 mkdir -m 700 "$coordinator_home"
 
+# The suites run with a private global git config and no system config (see
+# run_env below). Carry over only the host's safe.directory entries: CI
+# containers trust the checkout that way, and suites that read the real
+# checkout (provenance-test) otherwise fail with "dubious ownership".
+git_global_config=$wrapper_root/gitconfig
+: >"$git_global_config"
+while IFS= read -r safe_dir; do
+  git config --file "$git_global_config" --add safe.directory "$safe_dir"
+done < <(git config --get-all safe.directory 2>/dev/null || true)
+
 for test_file in "$root"/tests/*-test; do
   [[ -f "$test_file" && -x "$test_file" ]] || continue
   cp "$root/tests/provider-suite-wrapper" \
@@ -56,7 +66,7 @@ run_env=(
   # reach every git the suites run (a global core.hooksPath commit
   # gate, commit signing, or a commit template can then fail or
   # change fixtures). Suites needing config set it explicitly.
-  "GIT_CONFIG_GLOBAL=/dev/null"
+  "GIT_CONFIG_GLOBAL=$git_global_config"
   "GIT_CONFIG_NOSYSTEM=1"
 )
 if [[ -n $outer_jobs ]]; then
