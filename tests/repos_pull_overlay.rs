@@ -10,6 +10,7 @@ use dot::repos_pull_overlay::{
 use dot::repos_pull_queries::CandidateEnv;
 use dot_test_support::TempDir;
 use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -114,13 +115,26 @@ impl Fixture {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn pull(
         &self,
         url: &str,
         optional: bool,
         ui_total: Option<&str>,
         verbose: bool,
+    ) -> (PullOverlayOutcome, Vec<u8>, Vec<u8>) {
+        self.pull_with(url, optional, ui_total, verbose, false, &[])
+    }
+
+    /// [`Self::pull`] plus cron quiet mode and extra rebase arguments
+    /// (for example `--exec` to stop the rebase without a conflict).
+    fn pull_with(
+        &self,
+        url: &str,
+        optional: bool,
+        ui_total: Option<&str>,
+        verbose: bool,
+        quiet: bool,
+        extra: &[&str],
     ) -> (PullOverlayOutcome, Vec<u8>, Vec<u8>) {
         let dest = DestinationInputs {
             pwd: self.home_text.clone(),
@@ -153,17 +167,17 @@ impl Fixture {
         let tool = moves.tool().unwrap();
         let mut out = vec![];
         let mut warnings = vec![];
-        let extra: &[OsString] = &[];
+        let extra: Vec<OsString> = extra.iter().map(OsString::from).collect();
         let outcome = pull_overlay(
             &PullOverlayInputs {
                 name: "work",
                 path: &self.overlay_text,
                 url,
                 optional,
-                extra_args: extra,
+                extra_args: &extra,
                 home: &self.home_text,
                 ui_total,
-                dot_quiet: Some("0"),
+                dot_quiet: Some(if quiet { "1" } else { "0" }),
                 dot_verbose: Some(if verbose { "1" } else { "0" }),
                 palette: &colors,
                 live_active: false,
@@ -410,7 +424,7 @@ fn a_recorded_conflict_is_not_replayed_until_a_side_moves() {
     let (outcome, _, warnings) = diverged.pull(&diverged.origin_text, false, None, false);
     assert_eq!(outcome.status, PullOverlayStatus::Failed);
     assert!(
-        String::from_utf8_lossy(&warnings).contains("still conflicts with its upstream"),
+        String::from_utf8_lossy(&warnings).contains("failed to rebase onto its upstream"),
         "{}",
         String::from_utf8_lossy(&warnings)
     );
@@ -454,10 +468,10 @@ fn optional_overlay_failed_rebase_is_aborted() {
 }
 
 #[test]
-fn stranded_rebase_fails_and_detached_head_warns_instead_of_silent_skip() {
-    // A rebase left in progress has no `@{u}`; it must read as Failed,
-    // optional or not, and a rebase this run did not start stays
-    // untouched. A bare detached HEAD (a user action) warns and skips.
+fn user_rebase_and_detached_head_warn_and_skip_without_failing() {
+    // A rebase dot did not start is the user's work in progress: it
+    // warns and skips, optional or not, never fails the update, and
+    // never suggests aborting it. A bare detached HEAD does the same.
     for optional in [false, true] {
         let stranded = Fixture::new("overlay-stranded");
         stage(&stranded.overlay, "home/overlay.txt", b"local\n");
@@ -470,16 +484,14 @@ fn stranded_rebase_fails_and_detached_head_warns_instead_of_silent_skip() {
             Some(1)
         );
         let (outcome, _, warnings) = stranded.pull(&stranded.origin_text, optional, None, false);
+        let warnings = String::from_utf8_lossy(&warnings);
         assert_eq!(
             outcome.status,
-            PullOverlayStatus::Failed,
-            "optional={optional}"
+            PullOverlayStatus::Skipped,
+            "optional={optional}: {warnings}"
         );
-        assert!(
-            String::from_utf8_lossy(&warnings).contains("rebase in progress"),
-            "{}",
-            String::from_utf8_lossy(&warnings)
-        );
+        assert!(warnings.contains("dot did not start"), "{warnings}");
+        assert!(!warnings.contains("--abort"), "{warnings}");
         assert!(rebase_in_progress(&stranded.overlay));
 
         let detached = Fixture::new("overlay-detached");
@@ -496,6 +508,229 @@ fn stranded_rebase_fails_and_detached_head_warns_instead_of_silent_skip() {
             String::from_utf8_lossy(&warnings)
         );
     }
+}
+
+/// Seed `fixture` with a local commit and an upstream commit that
+/// touch different files, so a rebase replays cleanly unless
+/// something other than a conflict stops it.
+fn diverge_cleanly(fixture: &Fixture) {
+    stage(&fixture.overlay, "home/local.txt", b"local\n");
+    commit(&fixture.overlay, "local");
+    stage(&fixture.origin, "home/new.txt", b"new\n");
+    commit(&fixture.origin, "update");
+}
+
+/// Number of `rebase (abort)` entries in the overlay's HEAD reflog.
+fn abort_count(repo: &Path) -> usize {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["reflog", "--format=%gs"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with("rebase (abort)"))
+        .count()
+}
+
+#[test]
+fn commit_hooks_do_not_stop_the_replay_of_local_commits() {
+    for optional in [false, true] {
+        let fixture = Fixture::new("overlay-hooks");
+        diverge_cleanly(&fixture);
+        let hooks = fixture.overlay.join(".git/gate-hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let hook = hooks.join("prepare-commit-msg");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            &fixture.overlay,
+            &["config", "core.hooksPath", &hooks.to_string_lossy()],
+        );
+        let (outcome, _, warnings) = fixture.pull(&fixture.origin_text, optional, None, false);
+        assert_eq!(
+            outcome.status,
+            PullOverlayStatus::Changed,
+            "optional={optional}: {}",
+            String::from_utf8_lossy(&warnings)
+        );
+    }
+}
+
+#[test]
+fn a_rebase_that_failed_without_conflicts_is_retried_once_then_not_replayed() {
+    let fixture = Fixture::new("overlay-exec-failure");
+    diverge_cleanly(&fixture);
+    let exec = ["--exec", "false"];
+    let run = |optional| {
+        fixture
+            .pull_with(&fixture.origin_text, optional, None, false, false, &exec)
+            .clone_parts()
+    };
+    assert_eq!(run(false).0, PullOverlayStatus::Failed);
+    assert_eq!(abort_count(&fixture.overlay), 1);
+    // The optional pull takes the one retry quietly.
+    assert_eq!(run(true).0, PullOverlayStatus::Empty);
+    assert_eq!(abort_count(&fixture.overlay), 2);
+    let (status, warnings) = run(false);
+    assert_eq!(status, PullOverlayStatus::Failed);
+    assert!(
+        warnings.contains(&format!("git -C {} pull --rebase", fixture.overlay_text)),
+        "{warnings}"
+    );
+    assert_eq!(run(true).0, PullOverlayStatus::Empty);
+    assert_eq!(abort_count(&fixture.overlay), 2);
+}
+
+/// Start a rebase in the overlay that stops mid-way (an `--exec`
+/// that fails after the first pick) and record it the way dot
+/// records its own rebase before running it.
+fn strand_dot_rebase(fixture: &Fixture, exec: &str) {
+    git(&fixture.overlay, &["fetch", "-q", "origin"]);
+    let rev = |spec: &str| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&fixture.overlay)
+            .args(["rev-parse", spec])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    std::fs::write(
+        fixture.overlay.join(".git/dot-rebase-inflight"),
+        format!("{} {}\n", rev("HEAD"), rev("origin/HEAD^{commit}")),
+    )
+    .unwrap();
+    assert_eq!(
+        git_status(&fixture.overlay, &["rebase", "--exec", exec, "origin/HEAD"]),
+        Some(1)
+    );
+    assert!(rebase_in_progress(&fixture.overlay));
+}
+
+#[test]
+fn its_own_interrupted_rebase_is_healed_and_pulled() {
+    for optional in [false, true] {
+        let fixture = Fixture::new("overlay-heal");
+        diverge_cleanly(&fixture);
+        strand_dot_rebase(&fixture, "false");
+        let (outcome, _, warnings) = fixture.pull(&fixture.origin_text, optional, None, false);
+        let warnings = String::from_utf8_lossy(&warnings);
+        assert_eq!(
+            outcome.status,
+            PullOverlayStatus::Changed,
+            "optional={optional}: {warnings}"
+        );
+        assert!(warnings.contains("interrupted"), "{warnings}");
+        assert_eq!(abort_count(&fixture.overlay), 1);
+        assert!(!rebase_in_progress(&fixture.overlay));
+        assert_eq!(
+            std::fs::read(fixture.overlay.join("home/new.txt")).unwrap(),
+            b"new\n"
+        );
+    }
+}
+
+#[test]
+fn a_failed_abort_is_surfaced_even_for_optional_overlays() {
+    // The optional pull stays quiet about ordinary failures, but a
+    // rebase of its own that `--abort` cannot undo (here a stale
+    // index lock) leaves mid-rebase files live: it warns with the
+    // exact command for this checkout and fails, both on the run
+    // itself and when a later run finds its interrupted rebase.
+    // Each scenario is a fresh fixture: the in-process upstream probe
+    // cache would otherwise serve the first run's answer.
+    let lock = "touch .git/index.lock; false";
+    for optional in [false, true] {
+        let fixture = Fixture::new("overlay-abort-fails");
+        diverge_cleanly(&fixture);
+        let hint = format!("git -C {} rebase --abort", fixture.overlay_text);
+        let (outcome, _, warnings) = fixture.pull_with(
+            &fixture.origin_text,
+            optional,
+            None,
+            false,
+            false,
+            &["--exec", lock],
+        );
+        let warnings = String::from_utf8_lossy(&warnings);
+        assert_eq!(
+            outcome.status,
+            PullOverlayStatus::Failed,
+            "optional={optional}: {warnings}"
+        );
+        assert!(warnings.contains(&hint), "{warnings}");
+        assert!(rebase_in_progress(&fixture.overlay));
+        // The record the pull wrote before rebasing names exactly the
+        // state git left, so the next run can claim it.
+        let state = |leaf: &str| {
+            std::fs::read_to_string(fixture.overlay.join(".git/rebase-merge").join(leaf))
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        assert_eq!(
+            std::fs::read_to_string(fixture.overlay.join(".git/dot-rebase-inflight")).unwrap(),
+            format!("{} {}\n", state("orig-head"), state("onto"))
+        );
+
+        let stranded = Fixture::new("overlay-heal-fails");
+        diverge_cleanly(&stranded);
+        strand_dot_rebase(&stranded, lock);
+        let hint = format!("git -C {} rebase --abort", stranded.overlay_text);
+        let (outcome, _, warnings) = stranded.pull(&stranded.origin_text, optional, None, false);
+        let warnings = String::from_utf8_lossy(&warnings);
+        assert_eq!(
+            outcome.status,
+            PullOverlayStatus::Failed,
+            "optional={optional}: {warnings}"
+        );
+        assert!(warnings.contains(&hint), "{warnings}");
+        assert!(rebase_in_progress(&stranded.overlay));
+    }
+}
+
+#[test]
+fn a_conflicting_autostash_is_reported_as_failed() {
+    for optional in [false, true] {
+        let fixture = Fixture::new("overlay-autostash");
+        stage(&fixture.origin, "home/overlay.txt", b"remote\n");
+        commit(&fixture.origin, "remote");
+        stage(&fixture.overlay, "home/overlay.txt", b"user edit\n");
+        let (outcome, _, warnings) = fixture.pull(&fixture.origin_text, optional, None, false);
+        let warnings = String::from_utf8_lossy(&warnings);
+        assert_eq!(
+            outcome.status,
+            PullOverlayStatus::Failed,
+            "optional={optional}: {warnings}"
+        );
+        assert!(warnings.contains("stash"), "{warnings}");
+        assert!(warnings.contains("home/overlay.txt"), "{warnings}");
+    }
+}
+
+#[test]
+fn stranded_warnings_repeat_under_cron_only_when_the_state_changes() {
+    let detached = Fixture::new("overlay-detached-cron");
+    git(&detached.overlay, &["checkout", "-q", "--detach"]);
+    let warned = |quiet| {
+        let (outcome, _, warnings) =
+            detached.pull_with(&detached.origin_text, false, None, false, quiet, &[]);
+        assert_eq!(outcome.status, PullOverlayStatus::Skipped);
+        String::from_utf8_lossy(&warnings).contains("detached")
+    };
+    assert!(warned(true));
+    assert!(!warned(true));
+    assert!(warned(false));
+    stage(&detached.overlay, "home/pinned.txt", b"pinned\n");
+    commit(&detached.overlay, "pinned");
+    assert!(warned(true));
+    assert!(!warned(true));
 }
 
 #[test]
@@ -545,4 +780,15 @@ fn counted_verbose_rows_report_clone_and_current_without_changing_status() {
         out.is_empty(),
         "the generation fast path returns before UI output"
     );
+}
+
+/// Status plus warnings text, for tests that only need those parts.
+trait CloneParts {
+    fn clone_parts(self) -> (PullOverlayStatus, String);
+}
+
+impl CloneParts for (PullOverlayOutcome, Vec<u8>, Vec<u8>) {
+    fn clone_parts(self) -> (PullOverlayStatus, String) {
+        (self.0.status, String::from_utf8_lossy(&self.2).into_owned())
+    }
 }

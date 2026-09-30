@@ -19,7 +19,8 @@ use crate::repos_base::Base;
 use crate::repos_config::{has_upstream, origin_matches};
 use crate::repos_overlays::{DestinationInputs, QuarantineInputs};
 use crate::repos_pull::{
-    PullRepoInputs, REPEATED_CONFLICT, RebaseGuard, StrandedHead, pull_repo, stranded_head,
+    PullRepoInputs, RebaseGuard, StrandedHead, pull_repo, rebase_command, repeated_failure,
+    stash_conflict, stranded_head, unaborted, unmerged_paths,
 };
 use crate::repos_pull_clone::{CloneOverlayInputs, clone_overlay_staged};
 use crate::repos_pull_normalize::{normalize_updated_paths, snapshot_updated_path_parents};
@@ -153,6 +154,33 @@ fn ui_row(
         multibyte,
     );
     let _ = out.write_all(&bytes);
+    live_active
+}
+
+/// A warning as a counted-UI row (silent under `DOT_QUIET`, like
+/// every row) or, without the counted UI, a plain warning line.
+/// Returns the next live flag.
+fn warn_row(
+    inputs: &PullOverlayInputs<'_>,
+    quiet: bool,
+    counted: bool,
+    live_active: bool,
+    detail: &str,
+    out: &mut dyn Write,
+    warnings: &mut dyn Write,
+) -> bool {
+    if counted {
+        return ui_row(
+            inputs.palette,
+            quiet,
+            live_active,
+            inputs.multibyte,
+            "warning",
+            detail,
+            out,
+        );
+    }
+    inputs.log.warn(warnings, &format!("  warning: {detail}"));
     live_active
 }
 
@@ -311,33 +339,35 @@ pub fn pull_overlay(
         return done(PullOverlayStatus::Failed, next);
     }
 
-    if !has_upstream(&prefix) {
-        // A stranded rebase is local breakage, not an access problem,
-        // so it fails even for optional overlays instead of hiding
-        // behind the quiet no-upstream skip; a detached HEAD warns
-        // and keeps the skip (see `StrandedHead`).
+    // A checkout without `@{u}`: dot's own interrupted rebase is
+    // healed and pulled; its own rebase that survives `--abort` fails
+    // even for optional overlays (mid-rebase files are live and would
+    // be linked); the user's session or a detached HEAD warns and
+    // skips, optional or not, without failing the update.
+    let mut upstream_ok = has_upstream(&prefix);
+    if !upstream_ok {
         if let Some(stranded) = stranded_head(&prefix) {
-            if counted {
-                live = ui_row(
-                    inputs.palette,
+            if stranded.warn_now(quiet) {
+                live = warn_row(
+                    inputs,
                     quiet,
+                    counted,
                     live,
-                    inputs.multibyte,
-                    "warning",
-                    &format!("{name} overlay {}", stranded.describe()),
+                    &format!("{name} overlay {}", stranded.describe(&prefix)),
                     out,
-                );
-            } else {
-                inputs.log.warn(
                     warnings,
-                    &format!("  warning: {name} overlay {}", stranded.describe()),
                 );
             }
             if stranded.fails() {
                 return done(PullOverlayStatus::Failed, live);
             }
-            return done(PullOverlayStatus::Skipped, live);
+            upstream_ok = stranded.kind == StrandedHead::Healed && has_upstream(&prefix);
+            if !upstream_ok {
+                return done(PullOverlayStatus::Skipped, live);
+            }
         }
+    }
+    if !upstream_ok {
         if counted && verbose {
             live = ui_row(
                 inputs.palette,
@@ -433,15 +463,7 @@ pub fn pull_overlay(
 
     // The prefix carries `-C <path>`; the pull command supplies the
     // `git` binary itself.
-    let mut command: Vec<OsString> = vec![
-        crate::init_client_identity::host_git_program(),
-        OsString::from("-C"),
-        OsString::from(inputs.path),
-        OsString::from("rebase"),
-        OsString::from("--autostash"),
-        OsString::from(&upstream),
-    ];
-    command.extend(inputs.extra_args.iter().cloned());
+    let command = rebase_command(&prefix, &upstream, inputs.extra_args);
 
     if inputs.optional {
         // The optional pull runs under `DOT_QUIET=1`, restored by
@@ -465,17 +487,48 @@ pub fn pull_overlay(
             log: inputs.log,
         };
         let rebase = RebaseGuard::arm(&prefix, &head_before, &upstream);
-        // Still quiet and statusless, but never stranded (a rebase
-        // left in progress surfaces as failed on the next run) and
-        // never replayed over the same conflict every run.
-        if rebase.repeats_conflict() {
+        if let Some(session) = rebase.user_session(&prefix) {
+            if session.warn_now(quiet) {
+                live = warn_row(
+                    inputs,
+                    quiet,
+                    counted,
+                    live,
+                    &format!("{name} overlay {}", session.describe(&prefix)),
+                    out,
+                    warnings,
+                );
+            }
+            return done(PullOverlayStatus::Skipped, live);
+        }
+        // Still quiet and statusless, but never replayed over the
+        // same failure every run.
+        if rebase.repeats_failure() {
             return done(PullOverlayStatus::Empty, live);
         }
+        rebase.begin();
         if pull_repo(&repo_inputs, moves, out, warnings) != 0 {
-            rebase.abort_failed(&prefix);
+            // A rebase of its own left in progress is not an access
+            // problem: surface it (with the command for this checkout)
+            // instead of hiding it behind the quiet empty status.
+            if !rebase.abort_failed(&prefix) {
+                live = warn_row(
+                    inputs,
+                    quiet,
+                    counted,
+                    live,
+                    &format!("{name} overlay {}", unaborted(&prefix)),
+                    out,
+                    warnings,
+                );
+                return done(PullOverlayStatus::Failed, live);
+            }
             return done(PullOverlayStatus::Empty, live);
         }
         rebase.succeeded();
+        // Probed first: normalization can fail over the conflict
+        // markers, and the stash warning is the one to surface.
+        let unmerged = unmerged_paths(&prefix);
         let head_after = repo_head(&prefix);
         let mut status = PullOverlayStatus::Current;
         if !head_before.is_empty() && !head_after.is_empty() && head_before != head_after {
@@ -494,10 +547,24 @@ pub fn pull_overlay(
                         mask,
                     )
                 });
-            if !normalized {
+            if !normalized && unmerged.is_empty() {
                 return done(PullOverlayStatus::Failed, live);
             }
             status = PullOverlayStatus::Changed;
+        }
+        // The user's edit sits in the stash with conflict markers in
+        // live files: surfaced even for optional overlays.
+        if !unmerged.is_empty() {
+            live = warn_row(
+                inputs,
+                quiet,
+                counted,
+                live,
+                &format!("{name} overlay {}", stash_conflict(&prefix, &unmerged)),
+                out,
+                warnings,
+            );
+            return done(PullOverlayStatus::Failed, live);
         }
         return done(status, live);
     }
@@ -538,53 +605,55 @@ pub fn pull_overlay(
         log: inputs.log,
     };
     let rebase = RebaseGuard::arm(&prefix, &head_before, &upstream);
-    if rebase.repeats_conflict() {
-        if counted {
-            live = ui_row(
-                inputs.palette,
+    if let Some(session) = rebase.user_session(&prefix) {
+        if session.warn_now(quiet) {
+            live = warn_row(
+                inputs,
                 quiet,
+                counted,
                 live,
-                inputs.multibyte,
-                "warning",
-                &format!("{name} overlay {REPEATED_CONFLICT}"),
+                &format!("{name} overlay {}", session.describe(&prefix)),
                 out,
-            );
-        } else {
-            inputs.log.warn(
                 warnings,
-                &format!("  warning: {name} overlay {REPEATED_CONFLICT}"),
             );
         }
+        return done(PullOverlayStatus::Skipped, live);
+    }
+    if rebase.repeats_failure() {
+        live = warn_row(
+            inputs,
+            quiet,
+            counted,
+            live,
+            &format!("{name} overlay {}", repeated_failure(&prefix)),
+            out,
+            warnings,
+        );
         return done(PullOverlayStatus::Failed, live);
     }
+    rebase.begin();
     if pull_repo(&repo_inputs, moves, out, warnings) != 0 {
         if !rebase.abort_failed(&prefix) {
             inputs.log.warn(
                 warnings,
-                &format!(
-                    "  warning: {name} overlay {}",
-                    StrandedHead::Rebase.describe()
-                ),
+                &format!("  warning: {name} overlay {}", unaborted(&prefix)),
             );
         }
-        if counted {
-            live = ui_row(
-                inputs.palette,
-                quiet,
-                live,
-                inputs.multibyte,
-                "warning",
-                &format!("{name} dotfiles pull failed"),
-                out,
-            );
-        } else {
-            inputs
-                .log
-                .warn(warnings, &format!("  warning: {name} dotfiles pull failed"));
-        }
+        live = warn_row(
+            inputs,
+            quiet,
+            counted,
+            live,
+            &format!("{name} dotfiles pull failed"),
+            out,
+            warnings,
+        );
         return done(PullOverlayStatus::Failed, live);
     }
     rebase.succeeded();
+    // Probed first: normalization can fail over the conflict markers,
+    // and the stash warning is the one the user must see.
+    let unmerged = unmerged_paths(&prefix);
     let head_after = repo_head(&prefix);
     let mut status = PullOverlayStatus::Current;
     if !head_before.is_empty() && !head_after.is_empty() && head_before != head_after {
@@ -603,7 +672,7 @@ pub fn pull_overlay(
                     mask,
                 )
             });
-        if !normalized {
+        if !normalized && unmerged.is_empty() {
             inputs.log.warn(
                 warnings,
                 &format!("  warning: {name} overlay mode normalization failed"),
@@ -632,6 +701,18 @@ pub fn pull_overlay(
             &format!("{name} dotfiles current"),
             out,
         );
+    }
+    if !unmerged.is_empty() {
+        live = warn_row(
+            inputs,
+            quiet,
+            counted,
+            live,
+            &format!("{name} overlay {}", stash_conflict(&prefix, &unmerged)),
+            out,
+            warnings,
+        );
+        return done(PullOverlayStatus::Failed, live);
     }
     done(status, live)
 }
