@@ -51,6 +51,13 @@ run_env=(
   "DOT_PROVIDER_TEST_HOME=$provider_test_home"
   "DOT_PROVIDER_TEST_ROOT=$root/tests"
   "DOT_TEST_TESTS_DIR=$wrapper_root"
+  # HOME and XDG_CONFIG_HOME above already hide ~/.gitconfig, but an
+  # inherited GIT_CONFIG_GLOBAL and the host's system config still
+  # reach every git the suites run (a global core.hooksPath commit
+  # gate, commit signing, or a commit template can then fail or
+  # change fixtures). Suites needing config set it explicitly.
+  "GIT_CONFIG_GLOBAL=/dev/null"
+  "GIT_CONFIG_NOSYSTEM=1"
 )
 if [[ -n $outer_jobs ]]; then
   run_env+=("DOT_TEST_JOBS=$outer_jobs")
