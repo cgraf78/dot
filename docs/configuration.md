@@ -112,15 +112,31 @@ exits early (a busy update lock, or a cron run skipped for unresolved local
 edits) never reaches it. When a `Tools` run updates Dot itself, only the
 continuation under the new revision prunes.
 
+Because prune also runs after a failed `Tools` stage, renaming a dependency
+can leave a gap: prune removes the old name's install as soon as it is no
+longer declared, even if installing the replacement failed in the same run.
+The replacement then appears on the next successful run, normally one cron
+cycle later, but it stays missing for as long as its install keeps failing
+(for example one that needs `sudo`, which a cron run cannot provide). Add the
+replacement before removing the old entry when a gap matters.
+
+Prune runs while the update holds its lock, so the lock is held for longer
+than before. A manual `dot update` started during that window finds the lock
+busy and exits 75 without doing anything, just as it would during any other
+cron stage; rerun it once the cron run finishes.
+
 Removal rows render under the stage; quiet and cron runs drop them and report
 only Shdeps warnings on stderr plus one failure line. Output past 1 MiB per
 stream is discarded rather than stopping the prune. Stdin is closed, but an
-uninstall hook that needs `sudo` may still prompt on an interactive terminal;
-under cron it fails instead. A prune failure (for example a failed `uninstall`
-hook) marks the stage failed and makes the update exit nonzero without
-stopping later stages or withholding the profile lifecycle commit. A cron run
-whose only failures are `Tools` and/or `Prune` is recorded as degraded rather
-than failed (see [Cron update status](#cron-update-status)).
+uninstall hook that needs `sudo` may still prompt on an interactive terminal.
+Under cron there is no terminal: current Shdeps defers such an uninstall (and
+a post hook that needs `sudo`) with one warning and exits 0, leaving it for a
+later interactive run, while older Shdeps releases fail it. A prune failure
+(for example a failed `uninstall` hook) marks the stage failed and makes the
+update exit nonzero without stopping later stages or withholding the profile
+lifecycle commit. A cron run whose only failures are `Tools` and/or `Prune` is
+recorded as degraded rather than failed (see
+[Cron update status](#cron-update-status)).
 
 ## Cron update status
 

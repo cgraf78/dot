@@ -1959,8 +1959,10 @@ impl std::io::Write for TruncatingCapture<'_> {
 /// [`PROVIDER_CAPTURE_LIMIT_BYTES`] and discards the rest rather than
 /// stopping the provider. Stdin is closed, but like the Tools stage the
 /// provider keeps the caller's controlling terminal: an uninstall hook that
-/// needs `sudo` can prompt on an interactive terminal, while cron (no
-/// terminal) fails that hook instead of waiting.
+/// needs `sudo` can prompt on an interactive terminal. Without one (cron),
+/// current Shdeps defers that uninstall with a warning and exits 0, so it is
+/// neither a prune failure nor a degraded run; older Shdeps releases fail
+/// the hook instead of waiting.
 pub(crate) fn prune(inputs: &Inputs<'_>, prepared: &Prepared) -> PruneOutcome {
     let failed = |stderr: Vec<u8>| PruneOutcome {
         status: 1,
