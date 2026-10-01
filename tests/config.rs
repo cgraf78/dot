@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use dot::config::{
-    Config, Provider, Request, UpdatePolicy, config_control_bytes, config_error,
+    Config, KNOWN_KEYS, Provider, Request, UpdatePolicy, config_control_bytes, config_error,
     extensions_enabled, load,
 };
 use dot::xdg::{self, Kind};
@@ -85,6 +85,13 @@ const VALID_CORPUS: &[(&str, &str)] = &[
         "version=1\ndependency_provider=none\n",
         "1|||none|base|pinned\n",
     ),
+    // Unknown keys (from a newer Dot) are ignored, not rejected, and
+    // never disturb the known settings around them.
+    ("version=1\nbogus=1\n", "1|||none|base|pinned\n"),
+    (
+        "version=1\nunknown=value\ndefault_profile=dev\nunknown=again\n",
+        "1|||none|dev|pinned\n",
+    ),
 ];
 
 /// Invalid-config corpus with the exact public diagnostic for every row.
@@ -92,8 +99,6 @@ const INVALID_CORPUS: &[(&str, &str)] = &[
     ("extension_api=1\n", "version=1 must be the first setting"),
     ("version=2\n", "unsupported version: 2"),
     ("version=1\nversion=1\n", "duplicate version"),
-    ("version=1\nbogus=1\n", "unknown key: bogus"),
-    ("version=1\nunknown=value\n", "unknown key: unknown"),
     ("version=1\nBad_Key=1\n", "line 2 has an invalid key"),
     ("version=1\n=1\n", "line 2 has an invalid key"),
     ("version\n", "line 1 is not key=value"),
@@ -257,6 +262,37 @@ fn rejects_invalid_corpus_with_actionable_diagnostics() {
 }
 
 #[test]
+fn known_key_list_matches_parser_and_documentation() {
+    // `KNOWN_KEYS` feeds typo suggestions: every entry must be a key the
+    // parser handles, and the list must equal the documentation table, so
+    // a key documented in the table cannot be missing from suggestions.
+    let scratch = TempDir::new("config-known").expect("scratch dir");
+    for key in KNOWN_KEYS.iter().filter(|key| **key != "version") {
+        let path = scratch.write(key, format!("version=1\n{key}=\n").as_bytes());
+        require_fixture(&path, "known-key parse");
+        let recognized = load(&Request {
+            config_path: Some(&path),
+            home: "/home/tester",
+            env_policy: None,
+        })
+        .map_or(true, |config| config.unknown_keys.is_empty());
+        assert!(recognized, "parser treats {key} as unknown");
+    }
+    let docs = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/configuration.md"),
+    )
+    .expect("read configuration docs");
+    let documented: Vec<&str> = docs
+        .lines()
+        .skip_while(|line| *line != "| Key | Values |")
+        .skip(2)
+        .take_while(|line| line.starts_with("| `"))
+        .filter_map(|line| line.split('`').nth(1))
+        .collect();
+    assert_eq!(documented, KNOWN_KEYS);
+}
+
+#[test]
 fn missing_file_uses_documented_defaults() {
     let scratch = TempDir::new("config-diff").expect("scratch dir");
     let home = scratch.path().join("home");
@@ -397,6 +433,7 @@ fn rust_gate(api: bool, dir: Option<&str>) -> bool {
         default_profile: "base".to_string(),
         shdeps_update_policy: UpdatePolicy::Pinned,
         policy_from_env: false,
+        unknown_keys: Vec::new(),
     })
 }
 

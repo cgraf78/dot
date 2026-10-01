@@ -58,8 +58,9 @@ pub enum Caller {
 /// dependencies.
 ///
 /// This is deliberately not a config-file key: the client config is shared
-/// through the base repository and Dot rejects unknown keys, so a key would
-/// brick every client still running an older Dot. Older releases ignore an
+/// through the base repository, and Dot releases from before unknown-key
+/// tolerance (see [`crate::config`]) reject unknown keys, so a key would
+/// brick every client still running one of them. Older releases ignore an
 /// unknown environment variable instead (they simply do not prune).
 pub const PRUNE_ENV: &str = "DOT_SHDEPS_PRUNE";
 
@@ -3094,6 +3095,7 @@ mod tests {
             default_profile: "base".to_string(),
             shdeps_update_policy: crate::config::UpdatePolicy::Pinned,
             policy_from_env: false,
+            unknown_keys: Vec::new(),
         };
         let gathered = gather(
             Caller::Update,
@@ -3141,6 +3143,71 @@ mod tests {
     }
 
     #[test]
+    fn reload_ignores_unknown_config_keys_silently() {
+        // The post-sync reload is exactly where a key added by a newer
+        // client repository first appears; it must neither fail the run
+        // (that stranded older Dot releases before Tools could upgrade
+        // them) nor warn (the invocation boundary owns the warning).
+        let scratch = dot_test_support::TempDir::new("update-reload-unknown")
+            .expect("create temporary directory");
+        let home = scratch.path().join("home");
+        let state = scratch.path().join("state");
+        let config_home = scratch.path().join("config");
+        std::fs::create_dir_all(config_home.join("dot")).expect("config directory");
+        std::fs::create_dir_all(&state).expect("state directory");
+        std::fs::write(config_home.join("dot/config"), b"version=1\nfuture_key=1\n")
+            .expect("reload config with a future key");
+        let env = BTreeMap::from([
+            (OsString::from("HOME"), home.as_os_str().to_owned()),
+            (
+                OsString::from("XDG_STATE_HOME"),
+                state.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("XDG_CONFIG_HOME"),
+                config_home.as_os_str().to_owned(),
+            ),
+            (OsString::from("EUID"), OsString::from("0")),
+            (
+                OsString::from("DOT_BASE_TOPOLOGY"),
+                OsString::from("missing"),
+            ),
+            (
+                OsString::from("DOT_SOURCE_ROOT"),
+                OsString::from(env!("CARGO_MANIFEST_DIR")),
+            ),
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, scratch.path()).expect("runtime");
+        let config = crate::config::Config {
+            version: 1,
+            extension_api: false,
+            extensions_dir: None,
+            provider: crate::config::Provider::None,
+            default_profile: "base".to_string(),
+            shdeps_update_policy: crate::config::UpdatePolicy::Pinned,
+            policy_from_env: false,
+            unknown_keys: Vec::new(),
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_update(
+            &runtime,
+            &UpdateRequest {
+                caller: Caller::Update,
+                config: &config,
+                env: &env,
+                args: &[],
+                state_home: &state,
+            },
+            &mut crate::app::Streams::new(&mut stdout, &mut stderr),
+        );
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(!stderr.contains("dot: config:"), "{stderr}");
+        assert_eq!(code, 0, "stdout: {}", String::from_utf8_lossy(&stdout));
+    }
+
+    #[test]
     fn stderr_is_delivered_even_when_stdout_delivery_fails() {
         let scratch = dot_test_support::TempDir::new("update-stream-failure")
             .expect("create temporary directory");
@@ -3180,6 +3247,7 @@ mod tests {
             default_profile: "base".to_string(),
             shdeps_update_policy: crate::config::UpdatePolicy::Pinned,
             policy_from_env: false,
+            unknown_keys: Vec::new(),
         };
         let mut stdout = FailingWriter;
         let mut stderr = Vec::new();

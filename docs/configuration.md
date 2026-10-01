@@ -15,8 +15,8 @@ default_profile=dev
 shdeps_update_policy=pinned
 ```
 
-The first non-comment setting must be `version=1`. Keys may appear only once.
-Supported keys are:
+The first non-comment setting must be `version=1`. Each supported key may
+appear only once. Supported keys are:
 
 | Key | Values |
 | --- | --- |
@@ -27,12 +27,73 @@ Supported keys are:
 | `default_profile` | Lowercase profile name (default: `base`) |
 | `shdeps_update_policy` | `pinned` or `latest` (default: `pinned`) |
 
-`extensions_dir` requires `extension_api=1`. Unknown keys, control bytes,
-continuations, duplicate keys, unsupported versions, and other variable
-expansions fail before any provider or extension executes. The config must be
-a regular non-symlink file no larger than 65,536 bytes. A HOME-based value
-requires `HOME` itself to be a normalized absolute path; mixed expansion tokens
-such as `$HOME/path/$OTHER` are rejected rather than partially expanded.
+`extensions_dir` requires `extension_api=1`. Control bytes, continuations,
+malformed lines or key names, duplicate supported keys, invalid values,
+unsupported versions, and other variable expansions fail before any provider or
+extension executes. The config must be a regular non-symlink file no larger
+than 65,536 bytes. A HOME-based value requires `HOME` itself to be a normalized
+absolute path; mixed expansion tokens such as `$HOME/path/$OTHER` are rejected
+rather than partially expanded.
+
+## Unknown keys and version skew
+
+The config file usually travels through the client repository, and the client
+repository and Dot update independently. A well-formed key (`[a-z_]+`) that
+this Dot does not know is therefore ignored, not rejected, so a client
+repository that adopts a newer key cannot stop an older Dot from converging and
+upgrading itself. Its value is never read, and repeating it is not an error,
+but its line must still follow the file-wide rules: one `key=value` line with
+no continuation or control bytes. Every rule for the keys above still applies,
+including the `version` check and the rule that `version=1` comes first.
+
+Each operational command prints one warning per ignored key on stderr before
+it runs:
+
+```text
+dot: config: warning: unknown key 'future_key' ignored (newer dot?)
+dot: config: warning: unknown key 'defualt_profile' ignored (did you mean 'default_profile'?)
+```
+
+The second form appears when the key is within two edits of a known key. A
+misspelled key warns instead of failing, so its setting keeps its default until
+the spelling is fixed. That can matter: a misspelled `default_profile` can fall
+back to `base` and deactivate overlays only the intended profile selects, and a
+misspelled `dependency_provider` skips Shdeps, including Dot's own upgrade. The
+trade is deliberate: a hard error would also stop every host from pulling the
+fix. `dot doctor` reports each ignored key as an `unknown configuration key
+ignored` warning instead of printing to stderr. `dot init` also warns about
+keys that arrive with the cloned repository, after its own report. Config
+reloads in the middle of `dot update` stay silent: when a pull brings a new key
+and the same run's Tools stage installs a Dot that knows it, nothing is
+printed. A key that is still unknown at the start of the next command (a typo,
+or no Dot release that knows it yet) warns there, including under `dot update
+--cron`, where cron mails the warning until the key is fixed or a release that
+knows it arrives.
+
+This protection exists only in Dot releases that include it. Older releases
+still reject unknown keys with `dot: config: unknown key: <key>` and exit 2
+from every operational command, including the update that would replace them.
+Recover such a host by installing a newer Dot outside `dot update` (with the
+Shdeps provider, `shdeps --force update`, which installs the Dot version the
+client's Shdeps config selects), then run `dot update`. The
+tolerance covers only this file: profile definitions, profile selectors, and
+strict overlay descriptors still reject unknown keys.
+
+To introduce a config key:
+
+1. Add it to Dot's parser, `KNOWN_KEYS`, and the table above, and ship that
+   release. Choose a `[a-z_]+` name (every release rejects other spellings as
+   malformed) more than two edits away from every existing key, so older
+   releases do not mistake it for a typo in their warning.
+2. Use the key in client repositories only after hosts can run that release.
+   A host that has not upgraded yet warns and ignores the key, so its
+   meaning must be safe to miss for one update cycle.
+3. Never give an existing key a new value: older releases reject values they
+   do not know. Add a new key instead.
+4. Raise `version` only for a change older releases must not misread. That is
+   the deliberate "requires a newer Dot" gate: an older Dot rejects the file
+   with `unsupported version` from every operational command, so each lagging
+   host needs the same out-of-band upgrade as above.
 
 ## Shdeps update policy
 
@@ -89,9 +150,10 @@ For example, a cron entry of `DOT_SHDEPS_PRUNE=cron dot update --cron` prunes
 on every unattended run. `dot init` ignores the variable. Any other value
 prints a warning and reads as `never`; it never fails the update. This is an
 environment variable rather than a config key on purpose: the config file is
-often shared through a client repository, and Dot rejects unknown config keys,
-so a key would stop clients still running an older Dot. Older releases simply
-ignore the variable and do not prune.
+often shared through a client repository, and Dot releases from before
+[unknown-key tolerance](#unknown-keys-and-version-skew) reject unknown config
+keys, so a key would stop clients still running one of them. Older releases
+simply ignore the variable and do not prune.
 
 Pruning is destructive: Shdeps runs each orphan's `uninstall` hook and deletes
 its managed payloads, links, and state. Dot reads the variable once and removes
