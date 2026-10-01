@@ -64,8 +64,27 @@ fn fixture_path() -> OsString {
     path
 }
 
+/// Whether an inherited variable steers Dot, Shdeps, or a non-interactive
+/// Bash child, so a test must not pass it through from the developer's shell
+/// (`DOT_REEXEC_EXPECTED_REVISION` alone fails even `dot version`).
+fn steers_dot(key: &OsStr) -> bool {
+    let key = key.to_string_lossy();
+    key.starts_with("DOT_") || key.starts_with("SHDEPS_") || key == "BASH_ENV" || key == "ENV"
+}
+
+/// Drop the caller's Dot/Shdeps controls from `command`; each test sets
+/// the ones it means explicitly.
+fn scrub_dot_env(command: &mut Command) {
+    for (key, _) in std::env::vars_os().filter(|(key, _)| steers_dot(key)) {
+        command.env_remove(key);
+    }
+}
+
+/// The binary under test, free of inherited Dot/Shdeps controls.
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_dot"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dot"));
+    scrub_dot_env(&mut command);
+    command
 }
 
 #[test]
@@ -311,6 +330,7 @@ fn informational_entry_stays_responsive_across_every_closed_stdio_mask() {
             .collect::<Vec<_>>()
             .join(":");
         let mut command = Command::new(&python);
+        scrub_dot_env(&mut command);
         command
             .args([
                 "-c",
@@ -783,6 +803,11 @@ fn update_passes_flag_exports_to_child_without_mutating_parent() {
         .iter()
         .map(|key| (key.to_string(), std::env::var_os(key)))
         .collect();
+    // Any other inherited control (a policy, an expected re-exec revision)
+    // would steer this in-process run; hide it for each case.
+    let ambient: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(key, _)| steers_dot(key) && !keys.iter().any(|known| key == known))
+        .collect();
     let restore = || {
         // `unsafe` in edition 2024; the case is the only writer of
         // these keys while it runs, and it restores entry state.
@@ -792,6 +817,9 @@ fn update_passes_flag_exports_to_child_without_mutating_parent() {
                     Some(value) => std::env::set_var(key, value),
                     None => std::env::remove_var(key),
                 }
+            }
+            for (key, value) in &ambient {
+                std::env::set_var(key, value);
             }
         }
     };
@@ -805,6 +833,9 @@ fn update_passes_flag_exports_to_child_without_mutating_parent() {
         let state = TempDir::new("cli-update-state").expect("isolated state");
         unsafe {
             for key in keys {
+                std::env::remove_var(key);
+            }
+            for (key, _) in &ambient {
                 std::env::remove_var(key);
             }
             std::env::set_var("DOT_OVERLAY_LINKS_FROZEN", "1");
