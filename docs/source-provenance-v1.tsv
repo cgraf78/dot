@@ -37,6 +37,7 @@ tests/doctor_paths.rs	standalone:new
 tests/extension_trust.rs	standalone:new
 tests/extension_worker.rs	standalone:new
 tests/families.rs	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
+tests/fixture_git.rs	standalone:new
 tests/hook_api.rs	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/hooks-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/init-test	standalone:new
