@@ -1,7 +1,8 @@
 //! Process-state probes for the standalone performance command supervisor.
 
 use std::env;
-use std::ffi::{OsString, c_int, c_ulong, c_void};
+use std::ffi::OsString;
+use std::ffi::{c_int, c_ulong, c_void};
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
