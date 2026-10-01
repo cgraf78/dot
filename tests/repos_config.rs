@@ -3,10 +3,10 @@ use dot::repos_config;
 use dot_test_support::TempDir;
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 fn git(args: &[&std::ffi::OsStr]) {
     assert!(
-        Command::new("git")
+        dot_test_support::git()
             .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -53,7 +53,7 @@ fn prefix(path: &Path) -> Vec<OsString> {
 }
 fn config(path: &Path, key: &str) -> String {
     String::from_utf8(
-        Command::new("git")
+        dot_test_support::git()
             .arg("-C")
             .arg(path)
             .args(["config", key])
@@ -90,7 +90,7 @@ fn has_upstream_matrix() {
         "HEAD".as_ref(),
     ]);
     let branch = String::from_utf8(
-        Command::new("git")
+        dot_test_support::git()
             .arg("-C")
             .arg(&seed)
             .args(["branch", "--show-current"])

@@ -89,7 +89,7 @@ fn private_line_umask_077_stays_600() {
 }
 
 fn git_digest(bytes: &[u8]) -> String {
-    let mut child = Command::new("git")
+    let mut child = dot_test_support::git()
         .args(["hash-object", "--stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -963,23 +963,14 @@ fn discard_missing_stage_passes_vacuously() {
     discard_row("discard-missing", true, &|_| {});
 }
 
-/// Run `git` for fixtures with a pinned identity and no commit
-/// hooks: the ambient user config (`core.hooksPath` pointing at
-/// the dotfiles hook entry) must not slow down or reject
-/// fixture commits. Only the shared fixture repo commits this
-/// way; fixture setup and native contracts run with hooks disabled.
+/// Run `git` for fixtures with a pinned identity; the shared fixture
+/// isolation keeps ambient hooks (a global `core.hooksPath` commit
+/// gate) from slowing down or rejecting fixture commits.
 fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("-C")
         .arg(repo)
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "core.hooksPath=",
-        ])
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -991,17 +982,10 @@ fn git(repo: &Path, args: &[&str]) {
 
 /// Capture one git stdout line for fixtures.
 fn git_line(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(repo)
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "core.hooksPath=",
-        ])
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())

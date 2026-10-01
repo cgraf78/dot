@@ -26,22 +26,12 @@ fn file(root: &Path, name: &str, bytes: &[u8], mode: u32) -> std::path::PathBuf 
     path
 }
 fn isolated_git() -> Command {
-    let mut command = Command::new("git");
+    let mut command = Command::new(dot_test_support::real_tool("git"));
     command
         .env_clear()
         .env("LC_ALL", "C")
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "tag.gpgsign=false",
-        ]);
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    dot_test_support::isolate_git(&mut command);
     command
 }
 fn git_repo(path: &Path, origin: &str) {

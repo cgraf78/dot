@@ -273,7 +273,7 @@ fn checkout_identity_requires_worktree_and_matching_effective_origin() {
     let repo = d.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
     assert!(
-        std::process::Command::new("git")
+        dot_test_support::git()
             .arg("init")
             .arg("-q")
             .arg(&repo)
@@ -282,7 +282,7 @@ fn checkout_identity_requires_worktree_and_matching_effective_origin() {
             .success()
     );
     assert!(
-        std::process::Command::new("git")
+        dot_test_support::git()
             .arg("-C")
             .arg(&repo)
             .args(["remote", "add", "origin", "https://example/repo.git"])

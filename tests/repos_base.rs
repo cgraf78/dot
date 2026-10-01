@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::Path;
 fn git(args: &[&std::ffi::OsStr]) {
     assert!(
-        std::process::Command::new("git")
+        dot_test_support::git()
             .args(args)
             .status()
             .unwrap()

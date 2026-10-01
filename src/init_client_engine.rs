@@ -1723,7 +1723,7 @@ mod parent_hook_tests {
     use std::io::Write as _;
     use std::os::unix::fs::symlink;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     use super::*;
     use dot_test_support::TempDir;
@@ -1796,7 +1796,7 @@ mod parent_hook_tests {
     }
 
     fn hash(bytes: &[u8]) -> String {
-        let mut child = Command::new("git")
+        let mut child = dot_test_support::git()
             .args(["hash-object", "--stdin"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -137,11 +137,10 @@ fn dot(
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("-C")
         .arg(dir)
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("DOT_GIT_REAL", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -180,7 +179,7 @@ fn seed_overlay(scratch: &Scratch, index: usize, files: usize) -> PathBuf {
 /// the copy: CI saw both "hardlink different from source" and a loose object
 /// vanishing mid-copy while building these seeds.
 fn clone_bare(seed: &Path, origin: &Path) {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("clone")
         .arg("-q")
         .arg("--bare")

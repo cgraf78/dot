@@ -356,8 +356,7 @@ fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
 }
 fn git(path: &Path, args: &[&str]) {
     assert!(
-        std::process::Command::new("git")
-            .args(["-c", "core.hooksPath=/dev/null"])
+        dot_test_support::git()
             .arg("-C")
             .arg(path)
             .args(args)
@@ -371,8 +370,7 @@ fn git(path: &Path, args: &[&str]) {
 fn repo(tag: &str) -> TempDir {
     let d = TempDir::new(tag).unwrap();
     assert!(
-        std::process::Command::new("git")
-            .args(["-c", "core.hooksPath=/dev/null"])
+        dot_test_support::git()
             .args(["init", "-q"])
             .arg(d.path())
             .stdout(std::process::Stdio::null())
@@ -547,8 +545,7 @@ fn repo_git_prefix_shapes_cover_separate_and_ordinary() {
     let home = TempDir::new("git-prefix-home").unwrap();
     let gd = TempDir::new("git-prefix-dir").unwrap();
     assert!(
-        std::process::Command::new("git")
-            .args(["-c", "core.hooksPath=/dev/null"])
+        dot_test_support::git()
             .args(["init", "--bare", "-q"])
             .arg(gd.path())
             .stdout(std::process::Stdio::null())
@@ -604,8 +601,7 @@ fn repo_git_quiet_failure_propagates() {
 fn remote_pair(tag: &str) -> (TempDir, TempDir) {
     let remote = TempDir::new(&format!("{tag}-remote")).unwrap();
     assert!(
-        std::process::Command::new("git")
-            .args(["-c", "core.hooksPath=/dev/null"])
+        dot_test_support::git()
             .args(["init", "--bare", "-q"])
             .arg(remote.path())
             .stdout(std::process::Stdio::null())

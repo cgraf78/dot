@@ -1,7 +1,7 @@
 //! Native contracts for the installed-link recovery walk.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use dot::repos_base::{Base, Topology};
 use dot::repos_overlays::{self, DestinationInputs, RestoreInstalledInputs};
@@ -9,20 +9,10 @@ use dot_test_support::TempDir;
 
 /// Run `git -C dir args`, silenced, asserting success.
 fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("-C")
         .arg(dir)
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "tag.gpgSign=false",
-        ])
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -63,7 +53,7 @@ fn dst_state(path: &Path) -> String {
 
 /// Skip-worktree flag for `rel` in the base repo at `home`.
 fn skip_flag(home: &Path, rel: &str) -> String {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(home)
         .args(["ls-files", "-v", "--", rel])

@@ -15,14 +15,13 @@ fn stage(root: &Path, relative: &str, bytes: &[u8]) -> PathBuf {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Output {
-    let output = Command::new("git")
+    let mut command = Command::new(dot_test_support::real_tool("git"));
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("LC_ALL", "C");
+    let output = dot_test_support::isolate_git(&mut command)
         .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "tag.gpgsign=false",
             "-c",
             "user.name=fixture",
             "-c",
@@ -31,11 +30,6 @@ fn git(repo: &Path, args: &[&str]) -> Output {
         ])
         .arg(repo)
         .args(args)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

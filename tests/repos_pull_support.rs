@@ -18,7 +18,7 @@ use dot::repos_pull_support::{
 use dot_test_support::TempDir;
 
 fn git(cwd: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())

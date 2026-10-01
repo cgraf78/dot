@@ -14,14 +14,12 @@ use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt as _;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use dot_test_support::TempDir;
+use dot_test_support::{TempDir, launcher_paths, real_tool, select_real_tool};
 
 static PROCESS_ENV: Mutex<()> = Mutex::new(());
 
@@ -66,6 +64,15 @@ fn fixture_path() -> OsString {
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_dot"))
+}
+
+/// Fixture Git resolved from [`fixture_path`], the PATH the engine under
+/// test runs with, so fixture and engine use the same Git binary.
+fn fixture_git() -> Command {
+    let path = fixture_path();
+    let mut command = Command::new(dot_test_support::real_tool_in("git", &path));
+    dot_test_support::isolate_git(&mut command).env("PATH", path);
+    command
 }
 
 #[test]
@@ -1572,9 +1579,7 @@ fn binary_init_adopts_and_converges_natively() {
     let home = TempDir::new("cli-init-adopt-home").expect("home");
     let state = TempDir::new("cli-init-adopt-state").expect("state");
     let url = format!("file://{}", origin.display());
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
-    let clone = command
+    let clone = fixture_git()
         .args(["clone", "-q", "--branch", &branch, &url])
         .arg(home.path())
         .status()
@@ -1611,9 +1616,7 @@ fn binary_init_adopts_legacy_separate_git_dir_natively() {
     let state = TempDir::new("cli-init-adopt-separate-state").expect("state");
     let url = format!("file://{}", origin.display());
     let git_dir = home.path().join(".dotfiles");
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
-    let clone = command
+    let clone = fixture_git()
         .args(["clone", "-q", "--bare", &url])
         .arg(&git_dir)
         .status()
@@ -1903,106 +1906,6 @@ exec "${{DOT_RUNTIME_REAL_{variable}}}" "$@"
     }
 }
 
-/// The process owner's home directory from passwd, immune to process-wide
-/// `HOME` mutation by parallel tests (writers serialize via
-/// `process_env_guard`, but readers like [`real_tool`] do not take it).
-/// Resolved once and cached: the owner's home cannot change under a
-/// running test binary, the cache avoids a syscall per tool lookup, and
-/// a transient lookup failure only fails that one call (the next call
-/// retries) instead of permanently losing the fallback.
-#[cfg(unix)]
-fn passwd_home_dir() -> Option<PathBuf> {
-    static CACHED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    if let Some(home) = CACHED.get() {
-        return Some(home.clone());
-    }
-    let home = passwd_home_dir_uncached()?;
-    let _ = CACHED.set(home.clone());
-    Some(home)
-}
-
-#[cfg(unix)]
-fn passwd_home_dir_uncached() -> Option<PathBuf> {
-    // SAFETY: getpwuid_r writes only the local entry and buffer; the
-    // status, result pointer, and directory pointer are all checked
-    // before the directory is read, and the buffer outlives the read.
-    unsafe {
-        let mut entry: libc::passwd = std::mem::zeroed();
-        let mut result: *mut libc::passwd = std::ptr::null_mut();
-        let mut capacity = 8192usize;
-        loop {
-            let mut buffer = vec![0u8; capacity];
-            let status = libc::getpwuid_r(
-                libc::getuid(),
-                &mut entry,
-                buffer.as_mut_ptr() as *mut libc::c_char,
-                buffer.len(),
-                &mut result,
-            );
-            if status == 0 {
-                if result.is_null() || entry.pw_dir.is_null() {
-                    return None;
-                }
-                let dir = std::ffi::CStr::from_ptr(entry.pw_dir);
-                return Some(PathBuf::from(OsStr::from_bytes(dir.to_bytes())));
-            }
-            if status != libc::ERANGE || capacity >= 1 << 20 {
-                return None;
-            }
-            capacity *= 2;
-        }
-    }
-}
-
-/// Launcher-shim paths to exclude from tool resolution, one per known
-/// home. Pure over its inputs so the passwd fallback is pinned with
-/// synthetic homes instead of mutating process state.
-fn launcher_paths(
-    tool: &str,
-    ambient_home: Option<&OsStr>,
-    passwd_home: Option<&Path>,
-) -> Vec<PathBuf> {
-    let mut launchers = Vec::new();
-    if let Some(home) = ambient_home {
-        launchers.push(PathBuf::from(home).join(".local/bin").join(tool));
-    }
-    if let Some(home) = passwd_home {
-        launchers.push(home.join(".local/bin").join(tool));
-    }
-    launchers
-}
-
-/// First PATH entry for `tool` that is a file and not an excluded
-/// launcher shim.
-fn select_real_tool(tool: &str, path: &OsStr, launchers: &[PathBuf]) -> PathBuf {
-    std::env::split_paths(path)
-        .map(|dir| dir.join(tool))
-        .find(|candidate| {
-            candidate.is_file() && !launchers.iter().any(|launcher| launcher == candidate)
-        })
-        .expect("real native tool")
-}
-
-fn real_tool(tool: &str) -> PathBuf {
-    // Exclude the developer's launcher by every known home: ambient HOME
-    // races with parallel tests that mutate process env (writers take
-    // `process_env_guard`, readers do not), so the passwd home is
-    // consulted too. Missing the launcher once resolved a shim's real
-    // Git to a wrapper script that hung a revision probe for the full
-    // marker bound.
-    #[cfg(unix)]
-    let passwd_home = passwd_home_dir();
-    #[cfg(not(unix))]
-    let passwd_home: Option<PathBuf> = None;
-    let launchers = launcher_paths(
-        tool,
-        std::env::var_os("HOME").as_deref(),
-        passwd_home.as_deref(),
-    );
-    let path = std::env::var_os("PATH").expect("test PATH");
-    select_real_tool(tool, &path, &launchers)
-}
-
 /// Keep Git configuration independent of developer hooks and signing policy.
 fn isolate_git_config(command: &mut Command) {
     command
@@ -2013,29 +1916,6 @@ fn isolate_git_config(command: &mut Command) {
         .env("GIT_CONFIG_VALUE_1", "false")
         .env("GIT_CONFIG_KEY_2", "tag.gpgSign")
         .env("GIT_CONFIG_VALUE_2", "false");
-}
-
-/// Give test-owned Git commands a writable HOME outside the user's state.
-fn isolate_git(command: &mut Command) {
-    isolate_git_config(command);
-    let home =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("cli-git-home-{}", std::process::id()));
-    std::fs::create_dir_all(&home).expect("create fixture Git home");
-    command.env("HOME", home).env("PATH", fixture_path());
-}
-
-#[test]
-fn fixture_git_commands_do_not_inherit_the_user_home() {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
-    let home = command
-        .get_envs()
-        .find(|(key, _)| *key == "HOME")
-        .and_then(|(_, value)| value)
-        .expect("fixture Git HOME");
-
-    assert!(Path::new(home).starts_with(env!("CARGO_TARGET_TMPDIR")));
-    assert_ne!(Some(home), std::env::var_os("HOME").as_deref());
 }
 
 fn wait_for_runtime_workers(barrier: &Path, markers: &[&str]) -> bool {
@@ -2138,12 +2018,9 @@ fn native_parent_snapshot() -> BTreeMap<OsString, Option<OsString>> {
 }
 
 /// Run `git -C dir args` silenced, asserting success. Fixed
-/// author/committer dates keep fixture SHAs deterministic;
-/// `DOT_GIT_REAL` bypasses any machine-local git launcher shim
+/// author/committer dates keep fixture SHAs deterministic.
 fn repos_git(dir: &Path, args: &[&str]) {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
-    let status = command
+    let status = fixture_git()
         .arg("-C")
         .arg(dir)
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
@@ -2161,9 +2038,7 @@ fn repos_git(dir: &Path, args: &[&str]) {
 /// Run `git --git-dir=<git_dir> --work-tree=<work> args` silenced
 /// (separate-topology base fixtures), asserting success.
 fn repos_git_prefix(git_dir: &Path, work: &Path, args: &[&str]) {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
-    let status = command
+    let status = fixture_git()
         .arg(format!("--git-dir={}", git_dir.display()))
         .arg(format!("--work-tree={}", work.display()))
         .args(args)
@@ -2189,8 +2064,7 @@ fn repos_git_prefix_output(
     work: &Path,
     args: &[&str],
 ) -> std::io::Result<std::process::Output> {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
+    let mut command = fixture_git();
     command
         .arg(format!("--git-dir={}", git_dir.display()))
         .arg(format!("--work-tree={}", work.display()))
@@ -2204,9 +2078,7 @@ fn repos_git_prefix_output(
 
 /// Capture one `git -C dir args` stdout line, trimmed.
 fn repos_git_line(dir: &Path, args: &[&str]) -> String {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
-    let output = command
+    let output = fixture_git()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -2231,9 +2103,7 @@ fn seed_bare_origin(scope: &Path, name: &str) -> (PathBuf, PathBuf, String) {
     std::fs::create_dir_all(&origin).expect("origin dir");
     repos_git(&origin, &["init", "--bare", "-q"]);
     let seed = scope.join(format!("{name}-seed"));
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
-    let status = command
+    let status = fixture_git()
         .arg("clone")
         .arg("-q")
         .arg(&origin)
@@ -2333,9 +2203,7 @@ fn stage_repos_client() -> ReposClient {
     std::fs::write(confd.join("10-alpha.conf"), format!("url={overlay_url}\n"))
         .expect("overlay descriptor");
     let overlay = home.join(".dotfiles-alpha");
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
-    let status = command
+    let status = fixture_git()
         .arg("clone")
         .arg("-q")
         .arg(&overlay_url)
@@ -2747,9 +2615,7 @@ fn repos_diff_clean_prints_headers_without_hunks() {
 /// Capture one separate-topology `git --git-dir/--work-tree` stdout
 /// line, trimmed.
 fn repos_prefix_line(git_dir: &Path, work: &Path, args: &[&str]) -> String {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
-    let output = command
+    let output = fixture_git()
         .arg(format!("--git-dir={}", git_dir.display()))
         .arg(format!("--work-tree={}", work.display()))
         .args(args)
@@ -5191,13 +5057,12 @@ fn update_native_config_reads_survive_the_pull_phase() {
     // Start compliant: a mismatched key would repair (write) in the
     // pre-pull ensure, which correctly invalidates and re-reads.
     // The memo case under test is read-only sharing.
-    let seed_git = real_tool("git");
     let base_git_dir = fixture.client.home.join(".dotfiles");
     for (key, value) in [
         ("core.fsmonitor", "false"),
         ("status.showUntrackedFiles", "no"),
     ] {
-        let status = std::process::Command::new(&seed_git)
+        let status = fixture_git()
             .arg(format!("--git-dir={}", base_git_dir.display()))
             .arg(format!("--work-tree={}", fixture.client.home.display()))
             .args(["config", key, value])
@@ -5926,9 +5791,7 @@ fn assert_clean_checkout(client: &ReposClient, name: &str) {
 }
 
 fn git_base_output(client: &ReposClient, args: &[&str]) -> Vec<u8> {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
-    let output = command
+    let output = fixture_git()
         .arg(format!("--git-dir={}", client.base_git_dir.display()))
         .arg(format!("--work-tree={}", client.home.display()))
         .args(args)
@@ -5946,9 +5809,7 @@ fn git_base_output(client: &ReposClient, args: &[&str]) -> Vec<u8> {
 }
 
 fn git_checkout_output(checkout: &Path, args: &[&str]) -> Vec<u8> {
-    let mut command = Command::new("git");
-    isolate_git(&mut command);
-    let output = command
+    let output = fixture_git()
         .arg("-C")
         .arg(checkout)
         .args(args)
@@ -6459,9 +6320,17 @@ fn logging_git_launcher(dir: &Path, log: &Path, git_dir: Option<&Path>) {
 
 /// The revision this test binary was built from, which the re-exec guard
 /// must observe through whichever Git the engine selects.
+///
+/// This reads the real checkout, so it binds `safe.directory` on the
+/// command line the way the engine's own source Git does: CI containers
+/// otherwise trust a host-owned mount only through the host's global
+/// config, which the fixture isolation hides.
 fn checkout_revision() -> String {
-    let output = Command::new(real_tool("git"))
-        .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+    let root = env!("CARGO_MANIFEST_DIR");
+    let output = dot_test_support::git()
+        .arg("-c")
+        .arg(format!("safe.directory={root}"))
+        .args(["-C", root, "rev-parse", "HEAD"])
         .output()
         .expect("checkout revision");
     assert!(output.status.success(), "checkout revision");

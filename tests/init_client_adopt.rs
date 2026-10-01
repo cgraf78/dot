@@ -2,26 +2,15 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use dot::init_client_adopt as adopt;
 use dot::repos_base::Topology;
 use dot_test_support::TempDir;
 
 fn git(args: &[&str]) {
-    let status = Command::new("git")
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "tag.gpgSign=false",
-        ])
+    let status = dot_test_support::git()
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -32,13 +21,7 @@ fn git(args: &[&str]) {
 }
 
 fn git_out(args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgSign=false",
-        ])
+    let output = dot_test_support::git()
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

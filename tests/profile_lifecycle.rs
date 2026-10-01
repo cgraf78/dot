@@ -18,7 +18,7 @@ fn checkout(home: &Path, name: &str, script: bool) -> String {
     let path = home.join(format!(".dotfiles-{name}"));
     std::fs::create_dir_all(&path).unwrap();
     assert!(
-        std::process::Command::new("git")
+        dot_test_support::git()
             .arg("init")
             .arg("-q")
             .arg(&path)
@@ -28,7 +28,7 @@ fn checkout(home: &Path, name: &str, script: bool) -> String {
     );
     let origin = format!("file:///repo/{name}.git");
     assert!(
-        std::process::Command::new("git")
+        dot_test_support::git()
             .arg("-C")
             .arg(&path)
             .args(["remote", "add", "origin", &origin])

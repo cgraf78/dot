@@ -6,8 +6,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 fn git(p: &Path, a: &[&str]) {
     assert!(
-        std::process::Command::new("git")
-            .args(["-c", "core.hooksPath=/dev/null"])
+        dot_test_support::git()
             .arg("-C")
             .arg(p)
             .args(a)
@@ -21,8 +20,7 @@ fn git(p: &Path, a: &[&str]) {
 fn repo(tag: &str) -> TempDir {
     let d = TempDir::new(tag).unwrap();
     assert!(
-        std::process::Command::new("git")
-            .args(["-c", "core.hooksPath=/dev/null"])
+        dot_test_support::git()
             .args(["init", "-q"])
             .arg(d.path())
             .stdout(std::process::Stdio::null())
@@ -60,8 +58,7 @@ fn filetime_touch(path: &Path) {
         .expect("set mtime");
 }
 fn stage_listed_matching(work: &Path, upstream: &str) -> Vec<u8> {
-    let output = std::process::Command::new("git")
-        .args(["-c", "core.hooksPath=/dev/null"])
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(work)
         .args(["show", &format!("{upstream}:tracked")])
@@ -123,8 +120,7 @@ fn dirty_matrix_covers_base_overlays_sync_and_missing() {
 fn upstream(tag: &str) -> (TempDir, TempDir, PathBuf) {
     let remote = TempDir::new(&format!("{tag}-remote")).unwrap();
     assert!(
-        std::process::Command::new("git")
-            .args(["-c", "core.hooksPath=/dev/null"])
+        dot_test_support::git()
             .args(["init", "--bare", "-q"])
             .arg(remote.path())
             .stdout(std::process::Stdio::null())
@@ -140,8 +136,7 @@ fn upstream(tag: &str) -> (TempDir, TempDir, PathBuf) {
     );
     git(work.path(), &["push", "-qu", "origin", "HEAD"]);
     let branch = String::from_utf8(
-        std::process::Command::new("git")
-            .args(["-c", "core.hooksPath=/dev/null"])
+        dot_test_support::git()
             .arg("-C")
             .arg(work.path())
             .args(["branch", "--show-current"])
@@ -176,8 +171,7 @@ fn configured_upstream_matrix() {
     let home = TempDir::new("dirty-separate-home").unwrap();
     let git_dir = TempDir::new("dirty-separate-git").unwrap();
     assert!(
-        std::process::Command::new("git")
-            .args(["-c", "core.hooksPath=/dev/null"])
+        dot_test_support::git()
             .args(["init", "--bare", "-q"])
             .arg(git_dir.path())
             .stdout(std::process::Stdio::null())
@@ -364,8 +358,7 @@ fn normalize_filtered_visits_base_and_git_overlays_only() {
         std::fs::read(o.path().join("other")).unwrap(),
         b"real edit\n"
     );
-    let local_noise = std::process::Command::new("git")
-        .args(["-c", "core.hooksPath=/dev/null"])
+    let local_noise = dot_test_support::git()
         .arg("-C")
         .arg(local.path())
         .args(["diff-files", "--name-only"])

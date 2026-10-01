@@ -33,12 +33,8 @@ struct Fixture {
 /// configuration (hooks, signing, URL rewriting) so fixtures build the same
 /// everywhere. Dot's own runs use the fixture HOME instead.
 fn fixture_git() -> Command {
-    let mut command = Command::new("git");
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("DOT_GIT_REAL", "1")
-        .stdin(Stdio::null());
+    let mut command = dot_test_support::git();
+    command.env("DOT_GIT_REAL", "1").stdin(Stdio::null());
     command
 }
 
@@ -47,13 +43,6 @@ fn plain_git(dir: &Path, args: &[&str]) {
         .arg("-C")
         .arg(dir)
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("DOT_GIT_REAL", "1")
-        .env("GIT_AUTHOR_NAME", "fixture")
-        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
-        .env("GIT_COMMITTER_NAME", "fixture")
-        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .stdin(Stdio::null())
         .output()
         .expect("spawn git");
     assert!(

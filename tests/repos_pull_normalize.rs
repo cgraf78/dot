@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use dot::repos_pull_normalize::{
     CommitPathType, ParentStatus, commit_path_type, normalize_updated_path,
@@ -13,20 +13,10 @@ use dot::repos_pull_normalize::{
 use dot_test_support::TempDir;
 
 fn git(root: &Path, args: &[&str]) -> Vec<u8> {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(root)
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "tag.gpgSign=false",
-        ])
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

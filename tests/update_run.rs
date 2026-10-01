@@ -290,11 +290,10 @@ fn dot(argv: &[&str], home: &Path, state: &Path) -> std::process::Output {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("-C")
         .arg(dir)
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -318,7 +317,7 @@ fn seed_remote(scratch: &Scratch, name: &str, branch: &str, prefix: &str, files:
     git(&seed, &["commit", "-qm", "seed"]);
     git(&seed, &["branch", "-M", branch]);
     let origin = scratch.path().join(format!("{name}.git"));
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("clone")
         .arg("-q")
         .arg("--bare")
@@ -393,7 +392,7 @@ fn shared_remotes(scratch: &Scratch) -> (PathBuf, PathBuf) {
     git(&base_seed, &["commit", "-qm", "seed"]);
     git(&base_seed, &["branch", "-M", "main"]);
     let base_origin = scratch.path().join("base.git");
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("clone")
         .arg("-q")
         .arg("--bare")

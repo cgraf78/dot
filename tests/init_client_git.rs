@@ -6,21 +6,12 @@ use dot::temp::{self, MoveCache};
 use dot_test_support::TempDir;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn git(cwd: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = dot_test_support::git()
         .current_dir(cwd)
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "commit.gpgsign=false",
-        ])
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .env("HOME", cwd)
         .env("LC_ALL", "C")

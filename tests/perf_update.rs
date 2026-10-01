@@ -1008,14 +1008,14 @@ fn filesystem_description(path: &Path) -> String {
 }
 
 fn file_blob(tools: &PerfTools, path: &Path) -> String {
-    let output = Command::new(&tools.git)
-        .args([OsStr::new("hash-object"), OsStr::new("--no-filters")])
-        .arg(path)
+    let mut command = Command::new(&tools.git);
+    command
         .env_clear()
         .env("LC_ALL", "C")
-        .env("PATH", &tools.client_path)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("PATH", &tools.client_path);
+    let output = dot_test_support::isolate_git(&mut command)
+        .args([OsStr::new("hash-object"), OsStr::new("--no-filters")])
+        .arg(path)
         .output()
         .unwrap_or_else(|error| panic!("fingerprint {}: {error}", path.display()));
     assert!(
@@ -1046,24 +1046,16 @@ fn filesystem_probe_targets(
 }
 
 fn git_output(tools: &PerfTools, dir: &Path, args: &[&str]) -> Output {
-    let output = Command::new(&tools.git)
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    let mut command = Command::new(&tools.git);
+    command
         .env_clear()
         .env("LC_ALL", "C")
         .env("PATH", &tools.client_path)
-        .env("HOME", dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_COUNT", "3")
-        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_0", "/dev/null")
-        .env("GIT_CONFIG_KEY_1", "commit.gpgSign")
-        .env("GIT_CONFIG_VALUE_1", "false")
-        .env("GIT_CONFIG_KEY_2", "tag.gpgSign")
-        .env("GIT_CONFIG_VALUE_2", "false")
+        .env("HOME", dir);
+    let output = dot_test_support::isolate_git(&mut command)
+        .arg("-C")
+        .arg(dir)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

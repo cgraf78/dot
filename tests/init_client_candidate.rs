@@ -63,13 +63,11 @@ impl Twins {
 /// fails their commits, which would make rows order- and
 /// machine-dependent.
 fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("-C")
         .arg(repo)
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -80,14 +78,12 @@ fn git(repo: &Path, args: &[&str]) {
 
 /// Fresh `main`-branch repository, hermetic like [`git`].
 fn git_init(repo: &Path) {
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("init")
         .arg("-q")
         .arg("-b")
         .arg("main")
         .arg(repo)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -101,12 +97,10 @@ fn git_init(repo: &Path) {
 /// through `--cacheinfo`.
 fn stage_link(repo: &Path, name: &str, target: &[u8]) {
     use std::io::Write as _;
-    let mut child = Command::new("git")
+    let mut child = dot_test_support::git()
         .arg("-C")
         .arg(repo)
         .args(["hash-object", "-w", "--stdin"])
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

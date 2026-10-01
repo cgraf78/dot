@@ -4,7 +4,7 @@ use dot::temp::{self, MoveCache};
 use dot_test_support::TempDir;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 fn fixture(t: &str) -> (TempDir, PathBuf) {
     let x = TempDir::new(t).unwrap();
     let h = x.path().join("home");
@@ -19,7 +19,7 @@ fn mode(p: &Path) -> String {
 }
 fn git_init(p: &Path) {
     std::fs::create_dir_all(p).unwrap();
-    let s = Command::new("git")
+    let s = dot_test_support::git()
         .arg("-C")
         .arg(p)
         .args(["init", "-q", "-b", "main"])
@@ -28,7 +28,7 @@ fn git_init(p: &Path) {
     assert!(s.success())
 }
 fn hash(g: &Path, p: &Path) -> String {
-    let o = Command::new("git")
+    let o = dot_test_support::git()
         .arg(format!("--git-dir={}", g.display()))
         .args(["hash-object", "--no-filters", "--"])
         .arg(p)
@@ -189,14 +189,14 @@ fn git_delete_parity() {
     git_init(&g);
     let git = g.join(".git");
     std::fs::write(g.join("file"), b"x").unwrap();
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("-C")
         .arg(&g)
         .args(["-c", "user.name=t", "-c", "user.email=t@t", "add", "file"])
         .status()
         .unwrap();
     assert!(status.success());
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("-C")
         .arg(&g)
         .args([
@@ -204,8 +204,6 @@ fn git_delete_parity() {
             "user.name=t",
             "-c",
             "user.email=t@t",
-            "-c",
-            "core.hooksPath=/dev/null",
             "commit",
             "-q",
             "-m",
@@ -214,7 +212,7 @@ fn git_delete_parity() {
         .status()
         .unwrap();
     assert!(status.success());
-    let o = Command::new("git")
+    let o = dot_test_support::git()
         .arg("-C")
         .arg(&g)
         .args(["rev-parse", "HEAD"])

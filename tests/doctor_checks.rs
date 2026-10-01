@@ -12,17 +12,10 @@ use dot::doctor_checks::{
 use dot_test_support::TempDir;
 
 fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("-C")
         .arg(repo)
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "commit.gpgsign=false",
-        ])
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1001,7 +994,7 @@ fn base_repo_upstream_current_ahead_behind_and_diverged() {
 
     git(&home, &["reset", "-q", "--hard", "origin/main"]);
     let peer = scratch.path().join("peer");
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .args(["clone", "-q"])
         .arg(&remote)
         .arg(&peer)

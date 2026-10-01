@@ -19,34 +19,25 @@ fn log() -> Log {
 }
 
 fn git_program() -> PathBuf {
-    std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
-        .map(|dir| dir.join("git"))
-        .find(|candidate| candidate.is_file())
-        .expect("host git")
+    dot_test_support::real_tool("git")
+}
+
+/// Fixture Git with a cleared environment plus the shared fixture isolation.
+fn fixture_git() -> Command {
+    let mut command = Command::new(git_program());
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("LC_ALL", "C");
+    dot_test_support::isolate_git(&mut command);
+    command
 }
 
 fn git(repo: &Path, args: &[&str]) -> Output {
-    let output = Command::new(git_program())
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "tag.gpgsign=false",
-            "-c",
-            "user.name=fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "-C",
-        ])
+    let output = fixture_git()
+        .arg("-C")
         .arg(repo)
         .args(args)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("LC_ALL", "C")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -619,24 +610,10 @@ fn generation_acceptance_pins_equal_ahead_unrelated_empty_and_head_race() {
         .unwrap()
         .trim()
         .to_string();
-    let moved_output = Command::new(git_program())
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "user.name=fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "-C",
-        ])
+    let moved_output = fixture_git()
+        .arg("-C")
         .arg(&repo)
         .args(["commit-tree", &tree, "-p", &ahead, "-m", "moved"])
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::null())
         .output()
         .expect("commit-tree");
