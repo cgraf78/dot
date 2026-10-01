@@ -124,7 +124,7 @@ pub struct EngineInputs<'a> {
     /// Parsed client configuration for this update generation.
     pub config: &'a crate::config::Config,
     /// Unknown config keys already reported during this invocation (see
-    /// [`warn_reloaded_keys`]). Seeded from [`Self::config`], whose keys
+    /// `warn_reloaded_keys`). Seeded from [`Self::config`], whose keys
     /// the caller reported before the engine started.
     pub config_warned: &'a std::cell::RefCell<Vec<String>>,
     /// Parsed flags.
