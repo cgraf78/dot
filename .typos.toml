@@ -1,0 +1,8 @@
+# Spelling policy for this repository (read by `typos` and Checkrun).
+
+[default]
+extend-ignore-re = [
+  # Escaped UTF-8 fixtures spell "café" as `caf\xc3\xa9` or
+  # `caf\u00e9`; the split-off `caf` is not a misspelling.
+  'caf\\+[xu]',
+]
