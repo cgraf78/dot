@@ -123,6 +123,10 @@ pub struct EngineInputs<'a> {
     pub update_lock_token: Option<&'a str>,
     /// Parsed client configuration for this update generation.
     pub config: &'a crate::config::Config,
+    /// Unknown config keys already reported during this invocation (see
+    /// [`warn_reloaded_keys`]). Seeded from [`Self::config`], whose keys
+    /// the caller reported before the engine started.
+    pub config_warned: &'a std::cell::RefCell<Vec<String>>,
     /// Parsed flags.
     pub flags: UpdateFlags,
     /// Residue after flags (forwarded to the pull phases).
@@ -298,6 +302,31 @@ fn snapshot_installed_links(
 /// Append one `_warn` row to the stderr stream.
 fn warn_row(err: &mut dyn std::io::Write, palette: &Palette, message: &str) {
     let _ = err.write_all(&crate::progress_ui::warn_line(palette, message.as_bytes()));
+}
+
+/// Report what a mid-run config reload newly ignored: each unknown key
+/// that is a near miss of a known key and was not reported yet in this
+/// invocation, with the same line the command boundary prints.
+///
+/// The rest of the run uses the reloaded values, so a misspelled
+/// `dependency_provider` or `default_profile` arriving with this run's
+/// pull would otherwise skip Tools or deactivate overlays with no word
+/// until the next invocation. A key without a suggestion stays silent
+/// here on purpose: it is most likely from a newer Dot, which this
+/// run's Tools stage may install (keys a newer Dot adds are kept more
+/// than two edits from existing ones, so they never get a suggestion).
+fn warn_reloaded_keys(
+    inputs: &EngineInputs<'_>,
+    config: &crate::config::Config,
+    err: &mut dyn std::io::Write,
+) {
+    let mut warned = inputs.config_warned.borrow_mut();
+    for unknown in &config.unknown_keys {
+        if unknown.suggestion().is_some() && !warned.contains(&unknown.key) {
+            let _ = writeln!(err, "{}", unknown.warning());
+            warned.push(unknown.key.clone());
+        }
+    }
 }
 
 /// Result of the native repo-sync phase.
@@ -723,6 +752,7 @@ pub fn sync_repos(
             };
         }
     };
+    warn_reloaded_keys(inputs, &config, err);
     sync_tail(
         inputs,
         UpdateState::new(config),
@@ -1610,16 +1640,36 @@ fn prune_stage(
     PruneStatus::Failed
 }
 
+/// Whether an update's final config degrades the run: it ignored a key
+/// that is a near miss of a known key, so the setting that key most
+/// likely meant kept its default (a misspelled `dependency_provider`
+/// silently skips Shdeps, including Dot's own upgrade).
+///
+/// Like a failed Tools stage, this makes `dot update` exit 1 and records
+/// `degraded update config` under `--cron`, so neither `update.log` nor
+/// `dot doctor` reports the run as clean. Keys without a suggestion never
+/// degrade: they are most likely from a newer Dot and safe to miss for a
+/// cycle (see the key rules in docs/configuration.md). `dot init` is
+/// exempt: it already warns about every key the clone brings, and a
+/// failed convergence would fail the installation itself over a typo.
+fn config_degraded(caller: Caller, config: &crate::config::Config) -> bool {
+    caller == Caller::Update
+        && config
+            .unknown_keys
+            .iter()
+            .any(|unknown| unknown.suggestion().is_some())
+}
+
 /// `_dot_update_finalize` natively: checkpoint, link phase (or the
 /// frozen preservation rows), lifecycle retire, the provider-none
 /// tools stage, the opt-in prune stage, the empty merges close,
 /// lifecycle commit, worktree normalize, and `_ui_done`. Returns the
 /// update status.
 ///
-/// `degraded` receives the failed Tools/Prune stages only when they are
-/// the sole reason for a nonzero status (the run otherwise converged);
-/// any other failure leaves it empty so the cron record reads `fail`.
-/// After a provider re-exec it carries the continuation's value.
+/// `degraded` receives the degraded Config/Tools/Prune stages only when
+/// they are the sole reason for a nonzero status (the run otherwise
+/// converged); any other failure leaves it empty so the cron record reads
+/// `fail`. After a provider re-exec it carries the continuation's value.
 #[allow(clippy::too_many_arguments)]
 fn finalize(
     inputs: &EngineInputs<'_>,
@@ -1639,10 +1689,14 @@ fn finalize(
     // Prune trusts exactly what the Tools stage trusted: it runs only after
     // a prepared provider converged this generation (see the Tools branch).
     let prune_this_run = prune_row(inputs.caller, inputs.prune_mode, inputs.flags.cron);
-    // Tools and Prune failures are tracked apart from `status` so the cron
-    // record can tell a converged-but-degraded run from one that did not
-    // converge. Both still make the update exit 1 (folded in below).
-    let mut stages = crate::update_status::Degraded::default();
+    // Config, Tools, and Prune degradation is tracked apart from `status`
+    // so the cron record can tell a converged-but-degraded run from one
+    // that did not converge. Each still makes the update exit 1 (folded in
+    // below). `state.config` is final here: the defensive reload ran.
+    let mut stages = crate::update_status::Degraded {
+        config: config_degraded(inputs.caller, &state.config),
+        ..crate::update_status::Degraded::default()
+    };
     let checkpoint = format!("{}/dot/provider-reexec-failed", inputs.state_home);
     if !crate::shdeps::consume_checkpoint(Path::new(&checkpoint), inputs.source_root_git) {
         let close = crate::progress_ui::done(
@@ -1983,6 +2037,24 @@ fn finalize(
     if !stages.is_empty() {
         status = 1;
     }
+    // Tools and Prune explain their exit 1 with a failed row; the config
+    // stage has none, and its key warnings print before every stage row, so
+    // repeat the reason beside "Done with errors". Quiet and cron runs skip
+    // this: they print no rows, so the key warnings stand alone.
+    if stages.config && !quiet(inputs) {
+        for unknown in &state.config.unknown_keys {
+            if let Some(known) = unknown.suggestion() {
+                warn_row(
+                    io.err,
+                    inputs.palette,
+                    &format!(
+                        "  warning: update degraded: config key '{}' is ignored; did you mean '{known}'?",
+                        unknown.key
+                    ),
+                );
+            }
+        }
+    }
     let based = inputs.base.is_some_and(|base| base.exists());
     if based {
         let open = stage.start(
@@ -2130,6 +2202,7 @@ fn provider_reexec(
             return 1;
         }
     };
+    warn_reloaded_keys(inputs, &config, io.err);
     if cancelled() {
         return 1;
     }
@@ -2150,6 +2223,12 @@ fn provider_reexec(
         Ok(gathered) => gathered,
         _ => return 1,
     };
+    // One invocation, one warning per key: the continuation inherits
+    // every key reported so far, not only the ones its config holds.
+    gathered
+        .config_warned
+        .borrow_mut()
+        .extend(inputs.config_warned.borrow().iter().cloned());
     let nested = gathered.inputs();
     if cancelled() {
         return 1;
@@ -2237,6 +2316,7 @@ pub struct Gathered {
     prune_mode: PruneMode,
     update_lock_token: Option<String>,
     config: crate::config::Config,
+    config_warned: std::cell::RefCell<Vec<String>>,
     flags: UpdateFlags,
     args: Vec<std::ffi::OsString>,
     extra: Vec<std::ffi::OsString>,
@@ -2280,6 +2360,7 @@ impl Gathered {
             prune_mode: self.prune_mode,
             update_lock_token: self.update_lock_token.as_deref(),
             config: &self.config,
+            config_warned: &self.config_warned,
             flags: self.flags,
             original_args: &self.args,
             extra_args: &self.extra,
@@ -2523,6 +2604,13 @@ fn gather(
         prune_mode,
         update_lock_token: env_value(env, "DOT_UPDATE_LOCK_TOKEN"),
         config: config.clone(),
+        config_warned: std::cell::RefCell::new(
+            config
+                .unknown_keys
+                .iter()
+                .map(|unknown| unknown.key.clone())
+                .collect(),
+        ),
         flags,
         args: args.to_vec(),
         extra,
@@ -2684,7 +2772,8 @@ pub fn run_update(
 /// Finding #6 records `ok`/`fail` the same way on the way out and
 /// refreshes the last-success stamp on success. A run that converged
 /// (sync, links, deactivation, configs; no lifecycle commit failure)
-/// but whose Tools or Prune stage failed records `degraded` with those
+/// but whose Tools or Prune stage failed, or whose config holds a likely
+/// misspelled key ([`config_degraded`]), records `degraded` with those
 /// stages and refreshes only the convergence stamp, so `dot doctor`
 /// can tell it from a frozen host; its exit status stays 1.
 /// Interrupted runs record nothing (cancellation is not an outcome),
@@ -2802,7 +2891,10 @@ fn run_gathered_inner(
     // loader prints its own diagnostic, then `_ui_done 1`).
     let startup = startup_inputs(inputs);
     match crate::startup::preflight(&startup) {
-        Ok(config) => sync.state.config = config,
+        Ok(config) => {
+            warn_reloaded_keys(inputs, &config, err);
+            sync.state.config = config;
+        }
         Err(failure) => {
             let _ = err.write_all(failure.line().as_bytes());
             let _ = err.write_all(b"\n");
@@ -3142,21 +3234,21 @@ mod tests {
         assert!(matches!(error, GatherError::Diagnostic(_)));
     }
 
-    #[test]
-    fn reload_ignores_unknown_config_keys_silently() {
-        // The post-sync reload is exactly where a key added by a newer
-        // client repository first appears; it must neither fail the run
-        // (that stranded older Dot releases before Tools could upgrade
-        // them) nor warn (the invocation boundary owns the warning).
-        let scratch = dot_test_support::TempDir::new("update-reload-unknown")
-            .expect("create temporary directory");
+    /// Run one update whose pre-finalize reload reads `body`, starting
+    /// from a boundary config that already reported `boundary` keys.
+    /// `DOT_BASE_TOPOLOGY=missing` skips the base pull, so this exercises
+    /// only the defensive reload before finalize; the post-base-pull
+    /// reload runs end to end in `tests/cli.rs` (`update_pulling_*` and
+    /// `update_warns_about_a_pulled_typo_*`). Returns the exit code and
+    /// stderr.
+    fn reload_case(label: &str, body: &[u8], caller: Caller, boundary: &[&str]) -> (i32, String) {
+        let scratch = dot_test_support::TempDir::new(label).expect("create temporary directory");
         let home = scratch.path().join("home");
         let state = scratch.path().join("state");
         let config_home = scratch.path().join("config");
         std::fs::create_dir_all(config_home.join("dot")).expect("config directory");
         std::fs::create_dir_all(&state).expect("state directory");
-        std::fs::write(config_home.join("dot/config"), b"version=1\nfuture_key=1\n")
-            .expect("reload config with a future key");
+        std::fs::write(config_home.join("dot/config"), body).expect("reload config");
         let env = BTreeMap::from([
             (OsString::from("HOME"), home.as_os_str().to_owned()),
             (
@@ -3187,14 +3279,20 @@ mod tests {
             default_profile: "base".to_string(),
             shdeps_update_policy: crate::config::UpdatePolicy::Pinned,
             policy_from_env: false,
-            unknown_keys: Vec::new(),
+            unknown_keys: boundary
+                .iter()
+                .map(|key| crate::config::UnknownKey {
+                    key: key.to_string(),
+                    line: 2,
+                })
+                .collect(),
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = run_update(
             &runtime,
             &UpdateRequest {
-                caller: Caller::Update,
+                caller,
                 config: &config,
                 env: &env,
                 args: &[],
@@ -3202,9 +3300,113 @@ mod tests {
             },
             &mut crate::app::Streams::new(&mut stdout, &mut stderr),
         );
-        let stderr = String::from_utf8_lossy(&stderr);
+        (code, String::from_utf8_lossy(&stderr).into_owned())
+    }
+
+    #[test]
+    fn reload_ignores_unknown_config_keys_silently() {
+        // A key with no suggestion is most likely from a newer Dot that
+        // this run's Tools stage may install: the reload must neither
+        // fail the run (that stranded older Dot releases before Tools
+        // could upgrade them) nor warn mid-run.
+        let (code, stderr) = reload_case(
+            "update-reload-unknown",
+            b"version=1\nfuture_key=1\n",
+            Caller::Update,
+            &[],
+        );
         assert!(!stderr.contains("dot: config:"), "{stderr}");
-        assert_eq!(code, 0, "stdout: {}", String::from_utf8_lossy(&stdout));
+        assert_eq!(code, 0, "{stderr}");
+    }
+
+    #[test]
+    fn reload_warns_once_about_a_new_typo_and_degrades_the_update() {
+        // The rest of the run uses the reloaded default, so a near miss
+        // the reload brings warns right away (once) and fails the update
+        // as degraded instead of reporting a clean run.
+        let (code, stderr) = reload_case(
+            "update-reload-typo",
+            b"version=1\ndefualt_profile=dev\nfuture_key=1\n",
+            Caller::Update,
+            &[],
+        );
+        assert_eq!(
+            stderr.matches("dot: config:").collect::<Vec<_>>().len(),
+            1,
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "dot: config: warning: unknown key 'defualt_profile' ignored (did you mean 'default_profile'?)\n"
+            ),
+            "{stderr}"
+        );
+        // An interactive run also names the reason for its exit 1 at the end.
+        assert!(
+            stderr.ends_with(
+                "  warning: update degraded: config key 'defualt_profile' is ignored; did you mean 'default_profile'?\n"
+            ),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("future_key"), "{stderr}");
+        assert_eq!(code, 1, "{stderr}");
+    }
+
+    #[test]
+    fn reload_skips_typos_the_boundary_reported_but_still_degrades() {
+        let (code, stderr) = reload_case(
+            "update-reload-typo-reported",
+            b"version=1\ndefualt_profile=dev\n",
+            Caller::Update,
+            &["defualt_profile"],
+        );
+        assert!(!stderr.contains("dot: config:"), "{stderr}");
+        assert!(stderr.contains("update degraded"), "{stderr}");
+        assert_eq!(code, 1, "{stderr}");
+    }
+
+    #[test]
+    fn init_convergence_is_not_degraded_by_a_typo() {
+        // Init's own reload already warned (`cli::init_config`); failing
+        // its convergence would fail the installation over a typo.
+        let (code, stderr) = reload_case(
+            "update-reload-typo-init",
+            b"version=1\ndefualt_profile=dev\n",
+            Caller::Init,
+            &["defualt_profile"],
+        );
+        assert!(!stderr.contains("dot: config:"), "{stderr}");
+        assert_eq!(code, 0, "{stderr}");
+    }
+
+    #[test]
+    fn config_degrades_only_updates_with_a_suggested_key() {
+        let config = |keys: &[&str]| crate::config::Config {
+            version: 1,
+            extension_api: false,
+            extensions_dir: None,
+            provider: crate::config::Provider::None,
+            default_profile: "base".to_string(),
+            shdeps_update_policy: crate::config::UpdatePolicy::Pinned,
+            policy_from_env: false,
+            unknown_keys: keys
+                .iter()
+                .map(|key| crate::config::UnknownKey {
+                    key: key.to_string(),
+                    line: 2,
+                })
+                .collect(),
+        };
+        assert!(!config_degraded(Caller::Update, &config(&[])));
+        assert!(!config_degraded(Caller::Update, &config(&["future_key"])));
+        assert!(config_degraded(
+            Caller::Update,
+            &config(&["future_key", "dependency_provder"])
+        ));
+        assert!(!config_degraded(
+            Caller::Init,
+            &config(&["dependency_provder"])
+        ));
     }
 
     #[test]

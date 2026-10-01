@@ -355,16 +355,19 @@ pub(crate) fn run_with_runtime(
                     return failure.code();
                 }
             };
-            // Warn about ignored config keys exactly once, here at the
-            // invocation boundary. Mid-run reloads (after a base pull,
-            // before finalize, after a provider re-exec) stay silent on
-            // purpose: in the usual skew a pull brings a key and the same
-            // run's Tools stage installs the Dot that knows it, so only a
-            // key that outlives a whole run (a typo, or no such Dot release
-            // yet) reaches the next invocation's warning, including under
-            // `--cron`. Init's post-clone reload adds keys the clone brought
-            // (see `init_config`). Doctor reports the keys as findings instead.
-            if selected != Command::Doctor {
+            // Warn about ignored config keys once per invocation, here at
+            // the invocation boundary. `update` warns after taking its lock
+            // instead (`update_run::run`), so a cron run that finds the lock
+            // busy exits 75 quietly and `update --help` prints only usage.
+            // Mid-run reloads (after a base pull, before finalize, after a
+            // provider re-exec) report only new likely typos (see
+            // `update_engine::warn_reloaded_keys`): in the usual skew a pull
+            // brings a key and the same run's Tools stage installs the Dot
+            // that knows it, so a key without a suggestion warns only if it
+            // outlives the run, at the next invocation (`--cron` included).
+            // Init's post-clone reload adds keys the clone brought (see
+            // `init_config`). Doctor reports the keys as findings instead.
+            if !matches!(selected, Command::Doctor | Command::Update) {
                 for unknown in &config.unknown_keys {
                     let _ = writeln!(stderr, "{}", unknown.warning());
                 }

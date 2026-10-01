@@ -76,8 +76,16 @@ fn row(path: &str) -> String {
 }
 
 fn git(args: &[&str]) {
+    // No user hooks or signing: a host commit hook (a spell checker, say)
+    // must not judge fixture content such as a deliberately misspelled key.
     let status = Command::new("git")
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgSign=false",
+        ])
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -255,6 +263,27 @@ fn plan_summary_loads_candidate_config_without_shell_engine() {
     );
     assert_eq!(summary(&case, "/tmp/backup", false).expect("summary"), b"dot init plan:\n  repository: github.com/example/dot\n  branch: main\n  tracked paths: 1\n  backup: /tmp/backup\n  dependency provider: shdeps\n  shdeps update policy: latest\n  extensions: enabled\n");
     assert_eq!(shape(&case.candidate.join("dot-config.preview")), Some(b"version=1\nextension_api=1\ndependency_provider=shdeps\nshdeps_update_policy=latest\n".to_vec()));
+}
+
+#[test]
+fn plan_summary_names_ignored_config_keys() {
+    // The operator approves the plan before convergence warns, so the plan
+    // itself names keys the clone's config holds that this Dot ignores.
+    let case = plan_case(
+        "ignored-keys",
+        Some("version=1\nfuture_key=1\ndefualt_profile=dev\ndependency_provider=shdeps\n"),
+        "one\n",
+    );
+    assert_eq!(
+        String::from_utf8(summary(&case, "/backup", false).expect("summary")).expect("UTF-8"),
+        concat!(
+            "dot init plan:\n  repository: github.com/example/dot\n  branch: main\n",
+            "  tracked paths: 1\n  backup: /backup\n  dependency provider: shdeps\n",
+            "  shdeps update policy: pinned\n  extensions: disabled\n",
+            "  ignored config keys: future_key (newer dot?), ",
+            "defualt_profile (did you mean 'default_profile'?)\n",
+        )
+    );
 }
 
 #[test]

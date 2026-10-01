@@ -742,9 +742,30 @@ mod tests {
             Some("shdeps_update_policy")
         );
         assert_eq!(suggest("versoin"), Some("version"));
+        // The threshold is exactly two edits: a third is unrelated, which
+        // is what lets a newer Dot add keys that never read as typos.
+        assert_eq!(suggest("versionab"), Some("version"));
+        assert_eq!(suggest("versionabc"), None);
+        assert_eq!(suggest("default_profile_x"), Some("default_profile"));
+        assert_eq!(suggest("default_profile_xy"), None);
         assert_eq!(suggest("shdeps_prune"), None);
         assert_eq!(suggest("future_key"), None);
         assert_eq!(suggest("x"), None);
+    }
+
+    #[test]
+    fn known_keys_stay_more_than_two_edits_apart() {
+        // An older Dot reads a newer key that is a near miss of one it
+        // knows as a typo: it warns mid-run and degrades (exits 1) every
+        // update until it upgrades. Fail the release that adds such a key.
+        for (i, left) in KNOWN_KEYS.iter().enumerate() {
+            for right in &KNOWN_KEYS[i + 1..] {
+                assert!(
+                    edit_distance(left, right) > 2,
+                    "{left} and {right} are within two edits"
+                );
+            }
+        }
     }
 
     #[test]

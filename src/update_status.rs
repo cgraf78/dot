@@ -10,7 +10,7 @@
 //!   `ok`, `degraded`, `fail`, or `skip`. `skip` lines carry the
 //!   capped dirty file list as their detail; `ok`/`degraded`/`fail`
 //!   lines name the `update` stage, and `degraded` lines add the
-//!   failing stages ([`Degraded::detail`], e.g. `tools,prune`). A
+//!   failing stages ([`Degraded::detail`], e.g. `config,tools,prune`). A
 //!   provider re-exec performs two engine runs, so one cron
 //!   invocation can append two lines (both carry the continuation's
 //!   classification).
@@ -24,7 +24,8 @@
 //!   commit did not fail (a failed Tools stage skips it, as before).
 //!   Overwritten on `ok` (no stages) and `degraded` (the failing
 //!   stages). `dot doctor` uses it to tell a host that keeps
-//!   converging while Tools or Prune fails from one that stopped
+//!   converging while Tools or Prune fails, or while the config
+//!   carries a likely misspelled key, from one that stopped
 //!   converging; stamps older than [`CRON_STALE_AFTER_SECS`] read as
 //!   not converging. Older Dot releases neither write nor read it, so
 //!   after a downgrade the stamp only ages out.
@@ -58,17 +59,25 @@ pub const MAX_RETAINED_LOGS: usize = 20;
 const STAMP_MAX_BYTES: u64 = 64;
 
 /// Stage names persisted in `degraded` outcome lines and the
-/// convergence stamp. Stable vocabulary: `dot doctor` renders them.
+/// convergence stamp. Stable vocabulary: `dot doctor` renders them
+/// (older releases too: their reader accepts any lowercase name).
+pub const STAGE_CONFIG: &str = "config";
+/// See [`STAGE_CONFIG`].
 pub const STAGE_TOOLS: &str = "tools";
-/// See [`STAGE_TOOLS`].
+/// See [`STAGE_CONFIG`].
 pub const STAGE_PRUNE: &str = "prune";
 
 /// Stages whose failure leaves a cron run converged but degraded:
 /// the dotfiles themselves (repositories, links, configs) are current,
-/// but dependency convergence (Tools) or orphan removal (Prune) failed.
+/// but the client config misspells a known key (Config), dependency
+/// convergence (Tools) failed, or orphan removal (Prune) failed.
 /// Any other failure means the run did not converge and records `fail`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Degraded {
+    /// The run's final config holds an unknown key that is a near miss
+    /// of a known one ([`crate::config::UnknownKey::suggestion`]), so the
+    /// setting it most likely meant kept its default for the whole run.
+    pub config: bool,
     /// The Tools stage failed (provider unavailable, a dependency, or a
     /// post hook).
     pub tools: bool,
@@ -79,18 +88,22 @@ pub struct Degraded {
 impl Degraded {
     /// True when no degradable stage failed.
     pub fn is_empty(self) -> bool {
-        !self.tools && !self.prune
+        !self.config && !self.tools && !self.prune
     }
 
-    /// The failing stages, comma-joined in run order (`tools,prune`);
-    /// empty when none failed. Persisted as-is.
+    /// The failing stages, comma-joined in run order
+    /// (`config,tools,prune`); empty when none failed. Persisted as-is.
     pub fn detail(self) -> String {
-        [(self.tools, STAGE_TOOLS), (self.prune, STAGE_PRUNE)]
-            .iter()
-            .filter(|(failed, _)| *failed)
-            .map(|(_, name)| *name)
-            .collect::<Vec<_>>()
-            .join(",")
+        [
+            (self.config, STAGE_CONFIG),
+            (self.tools, STAGE_TOOLS),
+            (self.prune, STAGE_PRUNE),
+        ]
+        .iter()
+        .filter(|(failed, _)| *failed)
+        .map(|(_, name)| *name)
+        .collect::<Vec<_>>()
+        .join(",")
     }
 }
 

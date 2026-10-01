@@ -61,14 +61,26 @@ back to `base` and deactivate overlays only the intended profile selects, and a
 misspelled `dependency_provider` skips Shdeps, including Dot's own upgrade. The
 trade is deliberate: a hard error would also stop every host from pulling the
 fix. `dot doctor` reports each ignored key as an `unknown configuration key
-ignored` warning instead of printing to stderr. `dot init` also warns about
-keys that arrive with the cloned repository, after its own report. Config
-reloads in the middle of `dot update` stay silent: when a pull brings a new key
-and the same run's Tools stage installs a Dot that knows it, nothing is
-printed. A key that is still unknown at the start of the next command (a typo,
-or no Dot release that knows it yet) warns there, including under `dot update
---cron`, where cron mails the warning until the key is fixed or a release that
-knows it arrives.
+ignored` warning instead of printing to stderr. `dot init` lists ignored keys
+in its plan and warns about keys that arrive with the cloned repository, after
+its own report. `dot update` prints its warnings once it holds the update
+lock, so a cron run that finds the lock busy stays quiet.
+
+A misspelled key also degrades `dot update`, which otherwise converges in
+full. When a pull brings one, that run warns as soon as it reloads the config,
+because the rest of the run already uses the default. While the key is
+present, every update that otherwise converges exits 1, ends with a warning
+naming the key (unless quiet), and under `--cron` records `degraded update
+config` in the update log instead of `ok`, so `dot doctor` reports `cron update
+degraded: config failing` rather than a recent success. `dot init` warns but
+does not fail over it.
+
+A key with no suggestion that a pull brings stays silent for the rest of that
+run, which exits 0: when the same run's Tools stage installs a Dot that knows
+the key, nothing is printed. A key that is still unknown at the start of the
+next command (no Dot release that knows it yet) warns there, including under
+`dot update --cron`, where cron mails the warning until a release that knows it
+arrives.
 
 This protection exists only in Dot releases that include it. Older releases
 still reject unknown keys with `dot: config: unknown key: <key>` and exit 2
@@ -83,8 +95,10 @@ To introduce a config key:
 
 1. Add it to Dot's parser, `KNOWN_KEYS`, and the table above, and ship that
    release. Choose a `[a-z_]+` name (every release rejects other spellings as
-   malformed) more than two edits away from every existing key, so older
-   releases do not mistake it for a typo in their warning.
+   malformed) more than two edits away from every existing key (a unit test
+   enforces this), so older releases do not mistake it for a typo: they would
+   warn about it mid-run and report every update as degraded until they
+   upgrade.
 2. Use the key in client repositories only after hosts can run that release.
    A host that has not upgraded yet warns and ignores the key, so its
    meaning must be safe to miss for one update cycle.
@@ -196,8 +210,8 @@ a post hook that needs `sudo`) with one warning and exits 0, leaving it for a
 later interactive run, while older Shdeps releases fail it. A prune failure
 (for example a failed `uninstall` hook) marks the stage failed and makes the
 update exit nonzero without stopping later stages or withholding the profile
-lifecycle commit. A cron run whose only failures are `Tools` and/or `Prune` is
-recorded as degraded rather than failed (see
+lifecycle commit. A cron run whose only failures are `Tools` and/or `Prune`
+(or a misspelled config key) is recorded as degraded rather than failed (see
 [Cron update status](#cron-update-status)).
 
 ## Cron update status
@@ -227,6 +241,12 @@ before. Any other failure is `fail` and refreshes neither stamp. A post hook
 or uninstall that Shdeps defers because it needs `sudo` without a terminal
 exits 0: that is expected, so the run stays `ok`, not degraded, and the
 deferral shows up only as the Shdeps warning.
+
+A run whose config holds a likely misspelled key (one the warning answers with
+`did you mean`) is also degraded, with the `config` stage, for example
+`1790000000 degraded update config`; it converged, but with that setting at its
+default (see [Unknown keys and version skew](#unknown-keys-and-version-skew)).
+An unknown key without a suggestion never degrades a run.
 
 A degraded run still exits 1, like any other failed update. Cron mails
 whatever a job prints (and a cron run prints only warnings and failures), not

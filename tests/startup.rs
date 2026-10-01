@@ -200,15 +200,19 @@ fn unknown_config_keys_warn_once_and_dispatch_proceeds() {
 
 #[test]
 fn unknown_config_key_warning_leads_update_and_cron_runs_once() {
-    // The warning comes from the command boundary, so it precedes
-    // whatever the command does next (here a failing update in an
-    // uninitialized home) and appears exactly once, `--cron` included.
+    // The warning precedes whatever the command does next (here an update
+    // of a home with no base checkout, which converges and exits 0, or a
+    // status report) and appears exactly once, `--cron` included. A key
+    // with no suggestion never fails an update.
     let home = bad_config_home("unknown-config-update", b"version=1\nfuture_key=1\n");
     let warning = "dot: config: warning: unknown key 'future_key' ignored (newer dot?)\n";
     for argv in [vec!["update", "--cron"], vec!["update"], vec!["status"]] {
         let argv: Vec<&OsStr> = argv.iter().map(OsStr::new).collect();
-        let (_, _, stderr) = run(home.path(), &argv, &[("PATH", Some("/usr/bin:/bin"))]);
+        let (code, _, stderr) = run(home.path(), &argv, &[("PATH", Some("/usr/bin:/bin"))]);
         let stderr = String::from_utf8_lossy(&stderr);
+        if argv[0] == "update" {
+            assert_eq!(code, 0, "{argv:?}: {stderr}");
+        }
         assert!(stderr.starts_with(warning), "{argv:?}: {stderr}");
         assert_eq!(
             stderr.matches("future_key").count(),
@@ -216,6 +220,38 @@ fn unknown_config_key_warning_leads_update_and_cron_runs_once() {
             "{argv:?}: {stderr}"
         );
     }
+}
+
+#[test]
+fn update_warns_about_config_keys_only_once_it_holds_the_lock() {
+    // A cron run that finds the update lock busy does nothing, so it must
+    // stay as quiet as `update --help` promises; help never warns either.
+    let home = bad_config_home("unknown-config-busy", b"version=1\nfuture_key=1\n");
+    let state = home.path().join(".local/state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let log = dot::log::Log::new(false, false);
+    let mut sink = Vec::new();
+    let guard = dot::update_lock::acquire(&state, false, &log, None, &mut sink).expect("hold lock");
+    let (code, stdout, stderr) = run(
+        home.path(),
+        &[OsStr::new("update"), OsStr::new("--cron")],
+        &[],
+    );
+    assert_eq!((code, stdout, stderr), (75, Vec::new(), Vec::new()));
+    let (code, _, stderr) = run(home.path(), &[OsStr::new("update")], &[]);
+    assert_eq!(code, 75);
+    assert!(
+        !String::from_utf8_lossy(&stderr).contains("dot: config:"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    drop(guard);
+    let (code, _, stderr) = run(
+        home.path(),
+        &[OsStr::new("update"), OsStr::new("--help")],
+        &[],
+    );
+    assert_eq!((code, stderr), (0, Vec::new()));
 }
 
 #[test]
