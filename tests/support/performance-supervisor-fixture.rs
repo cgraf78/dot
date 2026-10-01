@@ -1,7 +1,7 @@
 //! Process-state probes for the standalone performance command supervisor.
 
 use std::env;
-use std::ffi::{c_int, c_ulong, OsString};
+use std::ffi::{OsString, c_int, c_ulong, c_void};
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
@@ -37,8 +37,10 @@ struct SignalAction {
 unsafe extern "C" {
     fn close(descriptor: c_int) -> c_int;
     fn fcntl(descriptor: c_int, command: c_int, ...) -> c_int;
+    // libc's exact `const void *` signature: newer rustc rejects a mismatched
+    // declaration of a symbol the standard library also uses.
     #[link_name = "write"]
-    fn libc_write(descriptor: c_int, buffer: *const u8, count: usize) -> isize;
+    fn libc_write(descriptor: c_int, buffer: *const c_void, count: usize) -> isize;
     fn sigaction(signal: c_int, action: *const SignalAction, previous: *mut SignalAction) -> c_int;
     fn sigemptyset(set: *mut SignalSet) -> c_int;
 }
@@ -238,8 +240,13 @@ fn write_all(descriptor: c_int, bytes: &[u8]) -> Result<(), String> {
     let mut written = 0;
     while written < bytes.len() {
         // SAFETY: bytes contains initialized storage for the requested range.
-        let result =
-            unsafe { libc_write(descriptor, bytes[written..].as_ptr(), bytes.len() - written) };
+        let result = unsafe {
+            libc_write(
+                descriptor,
+                bytes[written..].as_ptr().cast(),
+                bytes.len() - written,
+            )
+        };
         if result > 0 {
             written += result as usize;
             continue;
