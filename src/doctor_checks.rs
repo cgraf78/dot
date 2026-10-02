@@ -1370,13 +1370,8 @@ fn standalone_control(release: &Path) -> Option<&Path> {
 /// nothing: their updates do not go through either installer.
 pub fn check_install_layout(inputs: &InstallInputs) -> Vec<Record> {
     let mut out = Vec::new();
-    let managed_link = std::fs::symlink_metadata(inputs.managed_root)
-        .is_ok_and(|meta| meta.file_type().is_symlink());
     let managed_real = std::fs::canonicalize(inputs.managed_root).ok();
-    let managed_standalone = managed_real
-        .as_deref()
-        .filter(|_| managed_link)
-        .and_then(standalone_control);
+    let managed_standalone = installer_link(inputs.managed_root);
     let running_standalone = if inputs.release_root {
         standalone_control(inputs.source_real)
     } else {
@@ -1391,22 +1386,14 @@ pub fn check_install_layout(inputs: &InstallInputs) -> Vec<Record> {
                     tilde(&inputs.managed_root.to_string_lossy(), inputs.home)
                 )),
             ));
-            check_adoption_lock(inputs, control, &mut out);
+            check_adoption_lock(inputs, &control, &mut out);
             return out;
         }
         // An adoption whose fallback switch was interrupted leaves no root,
         // only the installer's link parked beside it.
         let parked = parked_root_link(inputs.managed_root);
-        let parked_link =
-            std::fs::symlink_metadata(&parked).is_ok_and(|meta| meta.file_type().is_symlink());
-        let parked_standalone = std::fs::symlink_metadata(inputs.managed_root).is_err()
-            && parked_link
-            && std::fs::canonicalize(&parked)
-                .ok()
-                .as_deref()
-                .and_then(standalone_control)
-                .is_some();
-        if parked_standalone {
+        let root_missing = std::fs::symlink_metadata(inputs.managed_root).is_err();
+        if let Some(control) = installer_link(&parked).filter(|_| root_missing) {
             out.push(Record::warn(
                 "Shdeps adoption of the standalone install was interrupted",
                 Some(format!(
@@ -1414,16 +1401,10 @@ pub fn check_install_layout(inputs: &InstallInputs) -> Vec<Record> {
                     tilde(&parked.to_string_lossy(), inputs.home)
                 )),
             ));
-            if let Some(control) = std::fs::canonicalize(&parked)
-                .ok()
-                .as_deref()
-                .and_then(standalone_control)
-            {
-                check_adoption_lock(inputs, control, &mut out);
-            }
+            check_adoption_lock(inputs, &control, &mut out);
             return out;
         }
-    } else if let Some(control) = managed_standalone.or(running_standalone) {
+    } else if let Some(control) = managed_standalone.or(running_standalone.map(Path::to_path_buf)) {
         out.push(Record::ok(
             "dot release layout",
             Some("standalone installer (rerun install.sh to upgrade)".to_string()),
@@ -1471,9 +1452,26 @@ fn parked_root_link(root: &Path) -> PathBuf {
     root.with_file_name(name)
 }
 
-/// The standalone installer's lock under the Shdeps provider: Shdeps refuses
-/// to adopt (or finish adopting) the install while it exists, so every
-/// update of dot fails until it is gone.
+/// The installer's control directory when `link` is the standalone
+/// installer's own root link: a symlink whose target is exactly
+/// `.dot-standalone/current`. This is the same no-follow evidence Shdeps
+/// requires before it adopts the layout, so doctor never promises an
+/// adoption Shdeps would refuse (a link straight into `releases/`, or an
+/// absolute target, is someone else's).
+fn installer_link(link: &Path) -> Option<PathBuf> {
+    let meta = std::fs::symlink_metadata(link).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    let target = std::fs::read_link(link).ok()?;
+    (target == Path::new(STANDALONE_CONTROL).join("current"))
+        .then(|| link.with_file_name(STANDALONE_CONTROL))
+}
+
+/// The standalone installer's lock under the Shdeps provider: Shdeps checks
+/// it before anything else in the layout and refuses to adopt (or finish
+/// adopting) the install while any entry exists there, so its updates of dot
+/// fail until it is gone.
 fn check_adoption_lock(inputs: &InstallInputs, control: &Path, out: &mut Vec<Record>) {
     let lock = control.join("lock");
     if std::fs::symlink_metadata(&lock).is_ok() {
@@ -1481,7 +1479,7 @@ fn check_adoption_lock(inputs: &InstallInputs, control: &Path, out: &mut Vec<Rec
         out.push(Record::fail(
             "standalone installer lock blocks Shdeps adoption",
             Some(format!(
-                "{shown}: Shdeps will not adopt the install while it exists; if no install.sh is running, remove it (rmdir {shown})"
+                "{shown}: Shdeps will not adopt the install while it exists; remove it if no install.sh is running"
             )),
         ));
     }
