@@ -355,6 +355,23 @@ pub(crate) fn run_with_runtime(
                     return failure.code();
                 }
             };
+            // Warn about ignored config keys once per invocation, here at
+            // the invocation boundary. `update` warns after taking its lock
+            // instead (`update_run::run`), so a cron run that finds the lock
+            // busy exits 75 quietly and `update --help` prints only usage.
+            // Mid-run reloads (after a base pull, before finalize, after a
+            // provider re-exec) report only new likely typos (see
+            // `update_engine::warn_reloaded_keys`): in the usual skew a pull
+            // brings a key and the same run's Tools stage installs the Dot
+            // that knows it, so a key without a suggestion warns only if it
+            // outlives the run, at the next invocation (`--cron` included).
+            // Init's post-clone reload adds keys the clone brought (see
+            // `init_config`). Doctor reports the keys as findings instead.
+            if !matches!(selected, Command::Doctor | Command::Update) {
+                for unknown in &config.unknown_keys {
+                    let _ = writeln!(stderr, "{}", unknown.warning());
+                }
+            }
             if let Err(interrupted) = crate::cancellation::check() {
                 return interrupted.status();
             }
@@ -384,7 +401,14 @@ pub(crate) fn run_with_runtime(
                     }
                     Command::Init => {
                         let raw: Vec<Vec<u8>> = rest.iter().map(argv_bytes).collect();
-                        run_init(runtime, &raw, &mut stdout, &mut stderr, &mut failed)
+                        run_init(
+                            runtime,
+                            &config.unknown_keys,
+                            &raw,
+                            &mut stdout,
+                            &mut stderr,
+                            &mut failed,
+                        )
                     }
                     command
                     @ (Command::Fetch | Command::Push | Command::Status | Command::Diff) => {
@@ -536,6 +560,7 @@ fn run_cron(stdout: &mut dyn Write, failed: &mut bool) -> i32 {
 /// see the [`Command::Init`] contract).
 fn run_init(
     runtime: &crate::app::Runtime,
+    warned: &[crate::config::UnknownKey],
     args: &[Vec<u8>],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -591,11 +616,19 @@ fn run_init(
     let converge_stderr = std::cell::RefCell::new(Vec::new());
     let converge_called = std::cell::Cell::new(false);
     let resume_converge_failed = std::cell::Cell::new(false);
+    // Keys already warned about at the command boundary; convergence
+    // adds any that arrived with the cloned repository.
+    let warned_keys = std::cell::RefCell::new(
+        warned
+            .iter()
+            .map(|unknown| unknown.key.clone())
+            .collect::<Vec<_>>(),
+    );
     let converge = || -> Result<(), Error> {
         converge_called.set(true);
         let mut out = converge_stdout.borrow_mut();
         let mut err = converge_stderr.borrow_mut();
-        let config = init_config(runtime, &mut *err)?;
+        let config = init_config(runtime, &mut warned_keys.borrow_mut(), &mut *err)?;
         let mut streams = crate::app::Streams::new(&mut *out, &mut *err);
         let code = crate::update_engine::run_update(
             runtime,
@@ -676,18 +709,30 @@ fn run_init(
 /// Reload configuration after init publishes the candidate worktree. The
 /// Runtime freezes environment, not files, so this sees configuration cloned
 /// after process startup just like `dot_config_load` in the shell path.
+///
+/// The command-boundary warning saw only the pre-init file, so this warns
+/// about unknown keys the cloned repository brought, skipping (and then
+/// recording) every key in `warned` to keep one warning per key.
 fn init_config(
     runtime: &crate::app::Runtime,
+    warned: &mut Vec<String>,
     stderr: &mut dyn Write,
 ) -> Result<crate::config::Config, Error> {
-    crate::startup::check(runtime).map_err(|failure| {
+    let config = crate::startup::check(runtime).map_err(|failure| {
         let _ = stderr.write_all(failure.line().as_bytes());
         let _ = stderr.write_all(b"\n");
         Error::Command {
             command: "native init configuration reload".to_string(),
             status: Some(format!("exit status: {}", failure.code())),
         }
-    })
+    })?;
+    for unknown in &config.unknown_keys {
+        if !warned.contains(&unknown.key) {
+            let _ = writeln!(stderr, "{}", unknown.warning());
+            warned.push(unknown.key.clone());
+        }
+    }
+    Ok(config)
 }
 
 /// Emit init and convergence streams in execution order. A resumed
@@ -1201,9 +1246,46 @@ mod tests {
         .expect("post-capture config");
 
         let mut err = Vec::new();
-        let config = init_config(&runtime, &mut err).expect("reload cloned config");
+        let config =
+            init_config(&runtime, &mut Vec::new(), &mut err).expect("reload cloned config");
         assert_eq!(config.provider, crate::config::Provider::Shdeps);
         assert!(err.is_empty());
+    }
+
+    #[test]
+    fn init_convergence_warns_once_about_keys_the_clone_brought() {
+        // The boundary warning only saw the pre-init file; keys arriving
+        // with the cloned repository warn at the reload, once each, and
+        // a key the boundary already reported stays quiet.
+        let home = dot_test_support::TempDir::new("cli-init-unknown-home").expect("home");
+        let state = dot_test_support::TempDir::new("cli-init-unknown-state").expect("state");
+        let env = BTreeMap::from([
+            (
+                OsString::from("HOME"),
+                home.path().as_os_str().to_os_string(),
+            ),
+            (
+                OsString::from("XDG_STATE_HOME"),
+                state.path().as_os_str().to_os_string(),
+            ),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, home.path()).expect("runtime");
+        let config_dir = home.path().join(".config/dot");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::write(
+            config_dir.join("config"),
+            b"version=1\nold_key=1\nfuture_key=1\n",
+        )
+        .expect("cloned config");
+
+        let mut warned = vec!["old_key".to_string()];
+        let mut err = Vec::new();
+        init_config(&runtime, &mut warned, &mut err).expect("reload cloned config");
+        init_config(&runtime, &mut warned, &mut err).expect("reload again");
+        assert_eq!(
+            String::from_utf8_lossy(&err),
+            "dot: config: warning: unknown key 'future_key' ignored (newer dot?)\n"
+        );
     }
 
     #[cfg(unix)]

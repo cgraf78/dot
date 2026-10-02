@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
-use std::ffi::{c_int, c_long, c_ulong};
+use std::ffi::{c_int, c_long, c_ulong, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -195,8 +195,13 @@ unsafe extern "C" {
     fn dup2(source: c_int, destination: c_int) -> c_int;
     fn fcntl(descriptor: c_int, command: c_int, ...) -> c_int;
     fn pipe(descriptors: *mut c_int) -> c_int;
-    fn read(descriptor: c_int, buffer: *mut u8, count: usize) -> isize;
-    fn write(descriptor: c_int, buffer: *const u8, count: usize) -> isize;
+    // Declared with libc's exact `void *` signatures: newer rustc rejects a
+    // mismatched declaration of a symbol the standard library also uses
+    // (`suspicious_runtime_symbol_definitions`). Byte-typed wrappers below.
+    #[link_name = "read"]
+    fn libc_read(descriptor: c_int, buffer: *mut c_void, count: usize) -> isize;
+    #[link_name = "write"]
+    fn libc_write(descriptor: c_int, buffer: *const c_void, count: usize) -> isize;
     fn poll(fds: *mut PollFd, count: c_ulong, timeout: c_int) -> c_int;
     fn signal(signal: c_int, handler: usize) -> usize;
     fn _exit(status: c_int) -> !;
@@ -206,6 +211,16 @@ unsafe extern "C" {
     fn sigismember(set: *const SignalSet, signal: c_int) -> c_int;
     fn sigprocmask(how: c_int, set: *const SignalSet, old: *mut SignalSet) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+}
+
+/// `read(2)` into a byte buffer.
+unsafe fn read(descriptor: c_int, buffer: *mut u8, count: usize) -> isize {
+    unsafe { libc_read(descriptor, buffer.cast(), count) }
+}
+
+/// `write(2)` from a byte buffer.
+unsafe fn write(descriptor: c_int, buffer: *const u8, count: usize) -> isize {
+    unsafe { libc_write(descriptor, buffer.cast(), count) }
 }
 
 unsafe extern "C" fn capture_inherited_stdio() {

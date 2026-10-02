@@ -4,6 +4,15 @@
 //! only documented HOME spellings expand, everything else is rejected
 //! before any extension or provider can execute. Error texts are
 //! byte-identical to the shell (`dot: config: …`, exit 2 at the CLI).
+//!
+//! Forward compatibility: the config file usually travels through the
+//! client repository, which updates independently of the Dot release
+//! reading it. A well-formed key this release does not know is
+//! therefore recorded and ignored instead of rejected, so a newer
+//! client repository can never stop an older Dot from converging (and
+//! upgrading itself). Everything this release does know stays strict:
+//! syntax, duplicates of known keys, and invalid values still fail, and
+//! `version` remains the explicit "requires a newer Dot" gate.
 
 use std::path::Path;
 
@@ -30,6 +39,79 @@ pub enum UpdatePolicy {
     Latest,
 }
 
+/// Every key this release understands, in documentation order.
+pub const KNOWN_KEYS: [&str; 6] = [
+    "version",
+    "extension_api",
+    "extensions_dir",
+    "dependency_provider",
+    "default_profile",
+    "shdeps_update_policy",
+];
+
+/// A well-formed key this release does not understand and ignored.
+///
+/// Kept on [`Config`] so the command boundary can warn once per
+/// invocation and `dot doctor` can report it; the parser itself never
+/// writes output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownKey {
+    /// The key exactly as written (`[a-z_]+`, so safe to print).
+    pub key: String,
+    /// One-based line of the first occurrence.
+    pub line: usize,
+}
+
+impl UnknownKey {
+    /// The known key this one most plausibly misspells, if any.
+    ///
+    /// Ignoring unknown keys trades a typo's hard error for a warning,
+    /// so name the likely intended key. Two edits cover a swapped or
+    /// dropped letter without matching unrelated keys; a rare tie
+    /// between two known keys picks the first in documentation order.
+    pub fn suggestion(&self) -> Option<&'static str> {
+        KNOWN_KEYS
+            .iter()
+            .map(|known| (edit_distance(&self.key, known), *known))
+            .filter(|(distance, _)| *distance <= 2)
+            .min_by_key(|(distance, _)| *distance)
+            .map(|(_, known)| known)
+    }
+
+    /// Short reason shown after the key: a typo guess, else the
+    /// version-skew explanation.
+    pub fn hint(&self) -> String {
+        match self.suggestion() {
+            Some(known) => format!("did you mean '{known}'?"),
+            None => "newer dot?".to_string(),
+        }
+    }
+
+    /// The stable one-line stderr warning (no trailing newline).
+    pub fn warning(&self) -> String {
+        format!(
+            "dot: config: warning: unknown key '{}' ignored ({})",
+            self.key,
+            self.hint()
+        )
+    }
+}
+
+/// Levenshtein distance over bytes (keys are ASCII by construction).
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right = right.as_bytes();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (i, a) in left.bytes().enumerate() {
+        let mut current = vec![i + 1; right.len() + 1];
+        for (j, b) in right.iter().enumerate() {
+            let substitute = previous[j] + usize::from(a != *b);
+            current[j + 1] = substitute.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
 /// Parsed client configuration with shell defaults applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -47,6 +129,9 @@ pub struct Config {
     pub shdeps_update_policy: UpdatePolicy,
     /// Whether the policy came from the environment (controls export).
     pub policy_from_env: bool,
+    /// Well-formed keys this release ignored, one entry per distinct
+    /// key in file order (see the module docs).
+    pub unknown_keys: Vec<UnknownKey>,
 }
 
 /// Inputs the shell reads from its surroundings.
@@ -243,6 +328,7 @@ pub fn load(request: &Request<'_>) -> Result<Config> {
         default_profile: "base".to_string(),
         shdeps_update_policy: env_policy.unwrap_or(UpdatePolicy::Pinned),
         policy_from_env: env_policy.is_some(),
+        unknown_keys: Vec::new(),
     };
     let mut configured_policy = UpdatePolicy::Pinned;
 
@@ -400,7 +486,17 @@ pub fn load(request: &Request<'_>) -> Result<Config> {
                     }
                 }
             }
-            _ => return Err(reject(format!("unknown key: {key}"))),
+            // A newer Dot may define this key; ignore it (and any
+            // repeat, whose meaning this release cannot judge) rather
+            // than fail. The value is never interpreted.
+            _ => {
+                if !config.unknown_keys.iter().any(|seen| seen.key == key) {
+                    config.unknown_keys.push(UnknownKey {
+                        key: key.to_string(),
+                        line: line_number,
+                    });
+                }
+            }
         }
     }
 
@@ -514,7 +610,6 @@ mod tests {
             ("extension_api=1\n", "version=1 must be the first setting"),
             ("version=2\n", "unsupported version: 2"),
             ("version=1\nversion=1\n", "duplicate version"),
-            ("version=1\nbogus=1\n", "unknown key: bogus"),
             ("version=1\nVERSION=1\n", "line 2 has an invalid key"),
             ("", "missing version=1"),
             ("version=1\\\n", "line 1 uses a continuation"),
@@ -543,6 +638,133 @@ mod tests {
         for (body, expected) in cases {
             let text = err_text(load_body(body, "/home/u", None));
             assert_eq!(text, format!("dot: config: {expected}"), "body: {body:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_recorded_and_ignored() {
+        // A key from a newer Dot must not stop this one: known settings
+        // still apply, and each distinct unknown key is recorded once
+        // with its first line, whatever its value.
+        let config = load_body(
+            "version=1\nfuture_key=anything at all\ndependency_provider=shdeps\nfuture_key=2\nother_key=\n",
+            "/home/u",
+            None,
+        )
+        .expect("unknown keys load");
+        assert_eq!(config.provider, Provider::Shdeps);
+        assert_eq!(
+            config.unknown_keys,
+            vec![
+                UnknownKey {
+                    key: "future_key".to_string(),
+                    line: 2,
+                },
+                UnknownKey {
+                    key: "other_key".to_string(),
+                    line: 5,
+                },
+            ]
+        );
+        assert!(
+            load_body("version=1\n", "/home/u", None)
+                .expect("loads")
+                .unknown_keys
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unknown_keys_keep_every_known_rule_strict() {
+        // Ignoring unknown keys must not loosen anything this release
+        // understands: the version gate and ordering, key syntax, known
+        // duplicates, and known values all still fail.
+        for (body, expected) in [
+            (
+                "future_key=1\nversion=1\n",
+                "version=1 must be the first setting",
+            ),
+            ("version=2\nfuture_key=1\n", "unsupported version: 2"),
+            (
+                "version=1\nfuture_key=1\nFuture=1\n",
+                "line 3 has an invalid key",
+            ),
+            (
+                "version=1\nfuture_key=1\nfuture_key\n",
+                "line 3 is not key=value",
+            ),
+            ("version=1\nfuture_key=1\\\n", "line 2 uses a continuation"),
+            (
+                "version=1\nfuture_key=1\ndependency_provider=apt\n",
+                "unsupported dependency_provider: apt",
+            ),
+            (
+                "version=1\ndefault_profile=dev\nfuture_key=1\ndefault_profile=dev\n",
+                "duplicate default_profile",
+            ),
+        ] {
+            let text = err_text(load_body(body, "/home/u", None));
+            assert_eq!(text, format!("dot: config: {expected}"), "body: {body:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_key_warning_text_is_stable() {
+        let unknown = |key: &str| UnknownKey {
+            key: key.to_string(),
+            line: 2,
+        };
+        assert_eq!(
+            unknown("future_key").warning(),
+            "dot: config: warning: unknown key 'future_key' ignored (newer dot?)"
+        );
+        assert_eq!(
+            unknown("defualt_profile").warning(),
+            "dot: config: warning: unknown key 'defualt_profile' ignored (did you mean 'default_profile'?)"
+        );
+    }
+
+    #[test]
+    fn unknown_key_suggests_only_near_misses() {
+        let suggest = |key: &str| {
+            UnknownKey {
+                key: key.to_string(),
+                line: 1,
+            }
+            .suggestion()
+        };
+        assert_eq!(suggest("extension_apis"), Some("extension_api"));
+        assert_eq!(suggest("extensions_api"), Some("extension_api"));
+        assert_eq!(suggest("extension_dir"), Some("extensions_dir"));
+        assert_eq!(suggest("dependency_provder"), Some("dependency_provider"));
+        assert_eq!(
+            suggest("shdeps_update_polciy"),
+            Some("shdeps_update_policy")
+        );
+        assert_eq!(suggest("versoin"), Some("version"));
+        // The threshold is exactly two edits: a third is unrelated, which
+        // is what lets a newer Dot add keys that never read as typos.
+        assert_eq!(suggest("versionab"), Some("version"));
+        assert_eq!(suggest("versionabc"), None);
+        assert_eq!(suggest("default_profile_x"), Some("default_profile"));
+        assert_eq!(suggest("default_profile_xy"), None);
+        assert_eq!(suggest("shdeps_prune"), None);
+        assert_eq!(suggest("future_key"), None);
+        assert_eq!(suggest("x"), None);
+    }
+
+    #[test]
+    fn known_keys_stay_more_than_two_edits_apart() {
+        // An older Dot reads a newer key that is a near miss of one it
+        // knows as a typo: it warns mid-run and degrades (exits 1) every
+        // update until it upgrades. Fail the release that adds such a key.
+        for (i, left) in KNOWN_KEYS.iter().enumerate() {
+            for right in &KNOWN_KEYS[i + 1..] {
+                assert!(
+                    edit_distance(left, right) > 2,
+                    "{left} and {right} are within two edits"
+                );
+            }
         }
     }
 
@@ -685,6 +907,7 @@ mod tests {
                 default_profile: "base".to_string(),
                 shdeps_update_policy: UpdatePolicy::Pinned,
                 policy_from_env: false,
+                unknown_keys: Vec::new(),
             })
         }
         assert!(!gate(false, None));

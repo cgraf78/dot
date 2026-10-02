@@ -50,6 +50,10 @@ fn shell_ui(function: &str, args: &[&str]) -> (i32, String) {
         .env("NO_COLOR", "")
         .env("PATH", "")
         .env_remove("TERM")
+        // A non-interactive `bash -c` sources `$BASH_ENV` even with
+        // `--norc`; a user's startup file could restore PATH (and `gum`).
+        .env_remove("BASH_ENV")
+        .env_remove("ENV")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -168,6 +172,8 @@ fn gum_branch_invokes_identical_argv() {
             .env("PATH", dir)
             .env("NO_COLOR", "")
             .env_remove("TERM")
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()

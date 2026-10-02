@@ -78,7 +78,7 @@ fn run_configured(
                 .write_all(&runtime.bash_error_line_once(&error));
         }
     }
-    let runtime_snapshot = runtime_snapshot(runtime, &source, bash_required);
+    let runtime_snapshot = runtime_snapshot(runtime, config, &source, bash_required);
     let engine = engine_snapshot(runtime, &source, &home);
     crate::doctor_orchestrator::check_runtime(
         emit.recorder(),
@@ -347,6 +347,7 @@ fn resolve(
 
 fn runtime_snapshot(
     runtime: &crate::app::Runtime,
+    config: &crate::config::Config,
     source: &str,
     bash_required: bool,
 ) -> RuntimeSnapshot {
@@ -379,6 +380,7 @@ fn runtime_snapshot(
         source_root,
         git_version,
         config_version: b"1".to_vec(),
+        unknown_config_keys: config.unknown_keys.clone(),
     }
 }
 

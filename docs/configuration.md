@@ -15,8 +15,8 @@ default_profile=dev
 shdeps_update_policy=pinned
 ```
 
-The first non-comment setting must be `version=1`. Keys may appear only once.
-Supported keys are:
+The first non-comment setting must be `version=1`. Each supported key may
+appear only once. Supported keys are:
 
 | Key | Values |
 | --- | --- |
@@ -27,12 +27,87 @@ Supported keys are:
 | `default_profile` | Lowercase profile name (default: `base`) |
 | `shdeps_update_policy` | `pinned` or `latest` (default: `pinned`) |
 
-`extensions_dir` requires `extension_api=1`. Unknown keys, control bytes,
-continuations, duplicate keys, unsupported versions, and other variable
-expansions fail before any provider or extension executes. The config must be
-a regular non-symlink file no larger than 65,536 bytes. A HOME-based value
-requires `HOME` itself to be a normalized absolute path; mixed expansion tokens
-such as `$HOME/path/$OTHER` are rejected rather than partially expanded.
+`extensions_dir` requires `extension_api=1`. Control bytes, continuations,
+malformed lines or key names, duplicate supported keys, invalid values,
+unsupported versions, and other variable expansions fail before any provider or
+extension executes. The config must be a regular non-symlink file no larger
+than 65,536 bytes. A HOME-based value requires `HOME` itself to be a normalized
+absolute path; mixed expansion tokens such as `$HOME/path/$OTHER` are rejected
+rather than partially expanded.
+
+## Unknown keys and version skew
+
+The config file usually travels through the client repository, and the client
+repository and Dot update independently. A well-formed key (`[a-z_]+`) that
+this Dot does not know is therefore ignored, not rejected, so a client
+repository that adopts a newer key cannot stop an older Dot from converging and
+upgrading itself. Its value is never read, and repeating it is not an error,
+but its line must still follow the file-wide rules: one `key=value` line with
+no continuation or control bytes. Every rule for the keys above still applies,
+including the `version` check and the rule that `version=1` comes first.
+
+Each operational command prints one warning per ignored key on stderr before
+it runs:
+
+```text
+dot: config: warning: unknown key 'future_key' ignored (newer dot?)
+dot: config: warning: unknown key 'defualt_profile' ignored (did you mean 'default_profile'?)
+```
+
+The second form appears when the key is within two edits of a known key. A
+misspelled key warns instead of failing, so its setting keeps its default until
+the spelling is fixed. That can matter: a misspelled `default_profile` can fall
+back to `base` and deactivate overlays only the intended profile selects, and a
+misspelled `dependency_provider` skips Shdeps, including Dot's own upgrade. The
+trade is deliberate: a hard error would also stop every host from pulling the
+fix. `dot doctor` reports each ignored key as an `unknown configuration key
+ignored` warning instead of printing to stderr. `dot init` lists ignored keys
+in its plan and warns about keys that arrive with the cloned repository, after
+its own report. `dot update` prints its warnings once it holds the update
+lock, so a cron run that finds the lock busy stays quiet.
+
+A misspelled key also degrades `dot update`, which otherwise converges in
+full. When a pull brings one, that run warns as soon as it reloads the config,
+because the rest of the run already uses the default. While the key is
+present, every update that otherwise converges exits 1, ends with a warning
+naming the key (unless quiet), and under `--cron` records `degraded update
+config` in the update log instead of `ok`, so `dot doctor` reports `cron update
+degraded: config failing` rather than a recent success. `dot init` warns but
+does not fail over it.
+
+A key with no suggestion that a pull brings stays silent for the rest of that
+run, which exits 0: when the same run's Tools stage installs a Dot that knows
+the key, nothing is printed. A key that is still unknown at the start of the
+next command (no Dot release that knows it yet) warns there, including under
+`dot update --cron`, where cron mails the warning until a release that knows it
+arrives.
+
+This protection exists only in Dot releases that include it. Older releases
+still reject unknown keys with `dot: config: unknown key: <key>` and exit 2
+from every operational command, including the update that would replace them.
+Recover such a host by installing a newer Dot outside `dot update` (with the
+Shdeps provider, `shdeps --force update`, which installs the Dot version the
+client's Shdeps config selects), then run `dot update`. The
+tolerance covers only this file: profile definitions, profile selectors, and
+strict overlay descriptors still reject unknown keys.
+
+To introduce a config key:
+
+1. Add it to Dot's parser, `KNOWN_KEYS`, and the table above, and ship that
+   release. Choose a `[a-z_]+` name (every release rejects other spellings as
+   malformed) more than two edits away from every existing key (a unit test
+   enforces this), so older releases do not mistake it for a typo: they would
+   warn about it mid-run and report every update as degraded until they
+   upgrade.
+2. Use the key in client repositories only after hosts can run that release.
+   A host that has not upgraded yet warns and ignores the key, so its
+   meaning must be safe to miss for one update cycle.
+3. Never give an existing key a new value: older releases reject values they
+   do not know. Add a new key instead.
+4. Raise `version` only for a change older releases must not misread. That is
+   the deliberate "requires a newer Dot" gate: an older Dot rejects the file
+   with `unsupported version` from every operational command, so each lagging
+   host needs the same out-of-band upgrade as above.
 
 ## Shdeps update policy
 
@@ -89,9 +164,10 @@ For example, a cron entry of `DOT_SHDEPS_PRUNE=cron dot update --cron` prunes
 on every unattended run. `dot init` ignores the variable. Any other value
 prints a warning and reads as `never`; it never fails the update. This is an
 environment variable rather than a config key on purpose: the config file is
-often shared through a client repository, and Dot rejects unknown config keys,
-so a key would stop clients still running an older Dot. Older releases simply
-ignore the variable and do not prune.
+often shared through a client repository, and Dot releases from before
+[unknown-key tolerance](#unknown-keys-and-version-skew) reject unknown config
+keys, so a key would stop clients still running one of them. Older releases
+simply ignore the variable and do not prune.
 
 Pruning is destructive: Shdeps runs each orphan's `uninstall` hook and deletes
 its managed payloads, links, and state. Dot reads the variable once and removes
@@ -134,8 +210,8 @@ a post hook that needs `sudo`) with one warning and exits 0, leaving it for a
 later interactive run, while older Shdeps releases fail it. A prune failure
 (for example a failed `uninstall` hook) marks the stage failed and makes the
 update exit nonzero without stopping later stages or withholding the profile
-lifecycle commit. A cron run whose only failures are `Tools` and/or `Prune` is
-recorded as degraded rather than failed (see
+lifecycle commit. A cron run whose only failures are `Tools` and/or `Prune`
+(or a misspelled config key) is recorded as degraded rather than failed (see
 [Cron update status](#cron-update-status)).
 
 ## Cron update status
@@ -165,6 +241,12 @@ before. Any other failure is `fail` and refreshes neither stamp. A post hook
 or uninstall that Shdeps defers because it needs `sudo` without a terminal
 exits 0: that is expected, so the run stays `ok`, not degraded, and the
 deferral shows up only as the Shdeps warning.
+
+A run whose config holds a likely misspelled key (one the warning answers with
+`did you mean`) is also degraded, with the `config` stage, for example
+`1790000000 degraded update config`; it converged, but with that setting at its
+default (see [Unknown keys and version skew](#unknown-keys-and-version-skew)).
+An unknown key without a suggestion never degrades a run.
 
 A degraded run still exits 1, like any other failed update. Cron mails
 whatever a job prints (and a cron run prints only warnings and failures), not

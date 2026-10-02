@@ -64,8 +64,27 @@ fn fixture_path() -> OsString {
     path
 }
 
+/// Whether an inherited variable steers Dot, Shdeps, or a non-interactive
+/// Bash child, so a test must not pass it through from the developer's shell
+/// (`DOT_REEXEC_EXPECTED_REVISION` alone fails even `dot version`).
+fn steers_dot(key: &OsStr) -> bool {
+    let key = key.to_string_lossy();
+    key.starts_with("DOT_") || key.starts_with("SHDEPS_") || key == "BASH_ENV" || key == "ENV"
+}
+
+/// Drop the caller's Dot/Shdeps controls from `command`; each test sets
+/// the ones it means explicitly.
+fn scrub_dot_env(command: &mut Command) {
+    for (key, _) in std::env::vars_os().filter(|(key, _)| steers_dot(key)) {
+        command.env_remove(key);
+    }
+}
+
+/// The binary under test, free of inherited Dot/Shdeps controls.
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_dot"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dot"));
+    scrub_dot_env(&mut command);
+    command
 }
 
 #[test]
@@ -311,6 +330,7 @@ fn informational_entry_stays_responsive_across_every_closed_stdio_mask() {
             .collect::<Vec<_>>()
             .join(":");
         let mut command = Command::new(&python);
+        scrub_dot_env(&mut command);
         command
             .args([
                 "-c",
@@ -783,6 +803,11 @@ fn update_passes_flag_exports_to_child_without_mutating_parent() {
         .iter()
         .map(|key| (key.to_string(), std::env::var_os(key)))
         .collect();
+    // Any other inherited control (a policy, an expected re-exec revision)
+    // would steer this in-process run; hide it for each case.
+    let ambient: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(key, _)| steers_dot(key) && !keys.iter().any(|known| key == known))
+        .collect();
     let restore = || {
         // `unsafe` in edition 2024; the case is the only writer of
         // these keys while it runs, and it restores entry state.
@@ -792,6 +817,9 @@ fn update_passes_flag_exports_to_child_without_mutating_parent() {
                     Some(value) => std::env::set_var(key, value),
                     None => std::env::remove_var(key),
                 }
+            }
+            for (key, value) in &ambient {
+                std::env::set_var(key, value);
             }
         }
     };
@@ -805,6 +833,9 @@ fn update_passes_flag_exports_to_child_without_mutating_parent() {
         let state = TempDir::new("cli-update-state").expect("isolated state");
         unsafe {
             for key in keys {
+                std::env::remove_var(key);
+            }
+            for (key, _) in &ambient {
                 std::env::remove_var(key);
             }
             std::env::set_var("DOT_OVERLAY_LINKS_FROZEN", "1");
@@ -1530,6 +1561,176 @@ fn binary_init_reloads_the_configuration_it_just_cloned() {
     );
     assert!(state.path().join("dot/init/transaction").is_dir());
     assert!(!state.path().join("dot/init/completed").exists());
+}
+
+/// An initialized client (provider `none`) whose origin's next base commits
+/// write `files` (the client config among them), so the following `dot
+/// update` meets that config first at its post-base-pull reload. Returns
+/// the origin scope (held for the test), home, and state.
+#[cfg(unix)]
+fn client_pulling(label: &str, files: &[(&str, &[u8])]) -> (TempDir, TempDir, TempDir) {
+    let scope = TempDir::new(&format!("{label}-origin")).expect("origin scope");
+    let (origin, seed, branch) = seed_bare_origin(scope.path(), "dotfiles");
+    std::fs::create_dir_all(seed.join(".config/dot")).expect("config parent");
+    seed_advance(&seed, ".config/dot/config", b"version=1\n");
+    let home = TempDir::new(&format!("{label}-home")).expect("home");
+    let state = TempDir::new(&format!("{label}-state")).expect("state");
+    let url = format!("file://{}", origin.display());
+    let initialized = init_bin(&home, &state)
+        .args(["init", "--yes", "--branch", &branch, &url])
+        .output()
+        .expect("native init");
+    assert_eq!(
+        initialized.status.code(),
+        Some(0),
+        "native init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    for (file, body) in files {
+        if let Some(parent) = Path::new(file).parent() {
+            std::fs::create_dir_all(seed.join(parent)).expect("seed parent");
+        }
+        seed_advance(&seed, file, body);
+    }
+    (scope, home, state)
+}
+
+/// One `dot update --cron` run: exit code, stderr, and the last
+/// `update.log` line without its epoch.
+#[cfg(unix)]
+fn cron_update(home: &TempDir, state: &TempDir) -> (Option<i32>, String, String) {
+    let output = init_bin(home, state)
+        .args(["update", "--cron"])
+        .output()
+        .expect("cron update");
+    let log = std::fs::read_to_string(state.path().join("dot/update.log")).unwrap_or_default();
+    let last = log
+        .lines()
+        .last()
+        .and_then(|line| line.split_once(' '))
+        .map(|(_, outcome)| outcome.to_string())
+        .unwrap_or_default();
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        last,
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn update_pulling_a_newer_dot_config_key_stays_quiet_until_the_next_run() {
+    // The run that pulls a key no suggestion explains converges cleanly
+    // and silently: its Tools stage may be about to install the Dot that
+    // knows the key. Only a key that outlives the run warns, once, at the
+    // next invocation, which still converges cleanly.
+    let (_scope, home, state) = client_pulling(
+        "cli-update-newer-key",
+        &[(".config/dot/config", b"version=1\nfuture_key=1\n")],
+    );
+    let (code, stderr, outcome) = cron_update(&home, &state);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("dot: config:"), "{stderr}");
+    assert_eq!(outcome, "ok update");
+    assert_eq!(
+        std::fs::read_to_string(home.path().join(".config/dot/config")).expect("pulled config"),
+        "version=1\nfuture_key=1\n",
+        "the run pulled the new key"
+    );
+
+    let (code, stderr, outcome) = cron_update(&home, &state);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stderr,
+        "dot: config: warning: unknown key 'future_key' ignored (newer dot?)\n"
+    );
+    assert_eq!(outcome, "ok update");
+}
+
+#[cfg(unix)]
+#[test]
+fn update_pulling_a_misspelled_config_key_warns_once_and_records_degraded() {
+    // The rest of the run uses the default the typo left behind, so the
+    // run that pulls it says so right away and is not recorded as clean:
+    // exit 1, `degraded update config`, and no last-success stamp.
+    let (_scope, home, state) = client_pulling(
+        "cli-update-typo-key",
+        &[(".config/dot/config", b"version=1\ndefualt_profile=dev\n")],
+    );
+    let warning = "dot: config: warning: unknown key 'defualt_profile' ignored (did you mean 'default_profile'?)\n";
+    for run in ["pulling", "next"] {
+        let (code, stderr, outcome) = cron_update(&home, &state);
+        assert_eq!(code, Some(1), "{run}: {stderr}");
+        assert_eq!(stderr, warning, "{run}");
+        assert_eq!(outcome, "degraded update config", "{run}");
+        let converged = std::fs::read_to_string(state.path().join("dot/update.last-converged"))
+            .expect("convergence stamp");
+        assert!(converged.ends_with(" config\n"), "{run}: {converged:?}");
+        assert!(
+            !state.path().join("dot/update.last-success").exists(),
+            "{run}: a degraded run is not a success"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn update_warns_about_a_pulled_typo_even_when_overlay_sync_then_fails() {
+    // A failed overlay sync skips the pre-finalize reload, so the
+    // post-base-pull reload is the only place this run can report the
+    // typo it pulled. The run did not converge: `fail`, not `degraded`.
+    let (_scope, home, state) = client_pulling(
+        "cli-update-typo-sync-fail",
+        &[
+            (".config/dot/config", b"version=1\ndefualt_profile=dev\n"),
+            (
+                ".config/dot/overlays.d/10-missing.conf",
+                b"url=file:///nonexistent/dot-test-missing-overlay.git\n",
+            ),
+        ],
+    );
+    let (code, stderr, outcome) = cron_update(&home, &state);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(stderr.matches("dot: config:").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(
+            "dot: config: warning: unknown key 'defualt_profile' ignored (did you mean 'default_profile'?)\n"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(outcome, "fail update");
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_init_warns_once_about_a_key_the_boundary_reported() {
+    // The boundary and init's post-clone reload read the same file here
+    // (an explicit XDG config home outside the clone), so a second
+    // warning could only come from init forgetting what the boundary
+    // already reported.
+    let scope = TempDir::new("cli-init-warned-origin").expect("origin scope");
+    let (origin, _seed, branch) = seed_bare_origin(scope.path(), "dotfiles");
+    let config_home = scope.path().join("xdg-config");
+    std::fs::create_dir_all(config_home.join("dot")).expect("config dir");
+    std::fs::write(
+        config_home.join("dot/config"),
+        b"version=1\nfuture_key=1\ndefualt_profile=dev\n",
+    )
+    .expect("config");
+    let home = TempDir::new("cli-init-warned-home").expect("home");
+    let state = TempDir::new("cli-init-warned-state").expect("state");
+    let url = format!("file://{}", origin.display());
+    let output = init_bin(&home, &state)
+        .args(["init", "--yes", "--branch", &branch, &url])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .output()
+        .expect("native init");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // A typo neither fails init's convergence nor warns again from the
+    // engine's own reloads.
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(stderr.matches("future_key").count(), 1, "{stderr}");
+    assert_eq!(stderr.matches("defualt_profile").count(), 1, "{stderr}");
 }
 
 #[test]

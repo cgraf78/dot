@@ -119,7 +119,7 @@ fn runtime_snapshots_xdg_homes_from_explicit_environment() {
 
 #[test]
 fn informational_commands_ignore_unloadable_config() {
-    let home = bad_config_home("bad-config", b"version=1\nbogus=1\n");
+    let home = bad_config_home("bad-config", b"version=2\n");
     for argv in [
         vec![],
         vec![OsStr::new("help")],
@@ -142,7 +142,7 @@ fn informational_commands_ignore_unloadable_config() {
 
 #[test]
 fn unloadable_config_exits_2_for_operational_and_unknown_commands() {
-    let home = bad_config_home("bad-config-operations", b"version=1\nbogus=1\n");
+    let home = bad_config_home("bad-config-operations", b"version=2\n");
     for word in [
         "frobnicate",
         "update",
@@ -158,16 +158,138 @@ fn unloadable_config_exits_2_for_operational_and_unknown_commands() {
     ] {
         assert_eq!(
             run(home.path(), &[OsStr::new(word)], &[]),
-            (2, Vec::new(), b"dot: config: unknown key: bogus\n".to_vec()),
+            (
+                2,
+                Vec::new(),
+                b"dot: config: unsupported version: 2\n".to_vec()
+            ),
             "config precedes operational dispatch for {word}"
         );
     }
 }
 
 #[test]
+fn unknown_config_keys_warn_once_and_dispatch_proceeds() {
+    // A client repository may carry keys only a newer Dot understands;
+    // this Dot must warn and keep going so its own update can still run.
+    let home = bad_config_home(
+        "unknown-config-key",
+        b"version=1\nfuture_key=1\ndefualt_profile=dev\nfuture_key=2\n",
+    );
+    assert_eq!(
+        run(home.path(), &[OsStr::new("frobnicate")], &[]),
+        (
+            1,
+            Vec::new(),
+            concat!(
+                "dot: config: warning: unknown key 'future_key' ignored (newer dot?)\n",
+                "dot: config: warning: unknown key 'defualt_profile' ignored ",
+                "(did you mean 'default_profile'?)\n",
+                "dot: unknown command: frobnicate\n",
+            )
+            .as_bytes()
+            .to_vec()
+        )
+    );
+    // Informational commands still never read the config.
+    assert_eq!(
+        run(home.path(), &[OsStr::new("version")], &[]),
+        (0, version_bytes(), Vec::new())
+    );
+}
+
+#[test]
+fn unknown_config_key_warning_leads_update_and_cron_runs_once() {
+    // The warning precedes whatever the command does next (here an update
+    // of a home with no base checkout, which converges and exits 0, or a
+    // status report) and appears exactly once, `--cron` included. A key
+    // with no suggestion never fails an update.
+    let home = bad_config_home("unknown-config-update", b"version=1\nfuture_key=1\n");
+    let warning = "dot: config: warning: unknown key 'future_key' ignored (newer dot?)\n";
+    for argv in [vec!["update", "--cron"], vec!["update"], vec!["status"]] {
+        let argv: Vec<&OsStr> = argv.iter().map(OsStr::new).collect();
+        let (code, _, stderr) = run(home.path(), &argv, &[("PATH", Some("/usr/bin:/bin"))]);
+        let stderr = String::from_utf8_lossy(&stderr);
+        if argv[0] == "update" {
+            assert_eq!(code, 0, "{argv:?}: {stderr}");
+        }
+        assert!(stderr.starts_with(warning), "{argv:?}: {stderr}");
+        assert_eq!(
+            stderr.matches("future_key").count(),
+            1,
+            "{argv:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn update_warns_about_config_keys_only_once_it_holds_the_lock() {
+    // A cron run that finds the update lock busy does nothing, so it must
+    // stay as quiet as `update --help` promises; help never warns either.
+    let home = bad_config_home("unknown-config-busy", b"version=1\nfuture_key=1\n");
+    let state = home.path().join(".local/state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let log = dot::log::Log::new(false, false);
+    let mut sink = Vec::new();
+    let guard = dot::update_lock::acquire(&state, false, &log, None, &mut sink).expect("hold lock");
+    let (code, stdout, stderr) = run(
+        home.path(),
+        &[OsStr::new("update"), OsStr::new("--cron")],
+        &[],
+    );
+    assert_eq!((code, stdout, stderr), (75, Vec::new(), Vec::new()));
+    let (code, _, stderr) = run(home.path(), &[OsStr::new("update")], &[]);
+    assert_eq!(code, 75);
+    assert!(
+        !String::from_utf8_lossy(&stderr).contains("dot: config:"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    drop(guard);
+    let (code, _, stderr) = run(
+        home.path(),
+        &[OsStr::new("update"), OsStr::new("--help")],
+        &[],
+    );
+    assert_eq!((code, stderr), (0, Vec::new()));
+}
+
+#[test]
+fn doctor_reports_unknown_config_keys_as_findings_not_stderr() {
+    let home = bad_config_home("unknown-config-doctor", b"version=1\nfuture_key=1\n");
+    // A PATH holding only the system Git and `id` keeps doctor's other
+    // probes (such as crontab) and any user Git wrapper off the host.
+    let bin = clean_home("unknown-config-doctor-path");
+    for tool in ["git", "id"] {
+        let found = ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+            .into_iter()
+            .map(|dir| Path::new(dir).join(tool))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("system {tool}"));
+        std::os::unix::fs::symlink(found, bin.path().join(tool)).expect("tool link");
+    }
+    let path = bin.path().to_str().expect("utf8 path");
+    let (_, stdout, stderr) = run(
+        home.path(),
+        &[OsStr::new("doctor")],
+        &[("PATH", Some(path))],
+    );
+    let stdout = String::from_utf8_lossy(&stdout);
+    assert!(
+        stdout.contains("unknown configuration key ignored")
+            && stdout.contains("future_key on line 2 (newer dot?)"),
+        "{stdout}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&stderr).contains("unknown key"),
+        "doctor must not also warn on stderr: {stderr:?}"
+    );
+}
+
+#[test]
 fn bad_env_policy_exits_2_for_unknown_command_only() {
     // Environment policy validation wins before the deliberately bad file.
-    let home = bad_config_home("bad-policy", b"version=1\nbogus=1\n");
+    let home = bad_config_home("bad-policy", b"version=2\n");
     let env = [("DOT_SHDEPS_UPDATE_POLICY", Some("bogus"))];
     assert_eq!(
         run(home.path(), &[OsStr::new("frobnicate")], &env),

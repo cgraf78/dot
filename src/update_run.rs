@@ -97,6 +97,13 @@ pub fn run(
         Err(Error::LockBusy { .. }) => return update_lock::EXIT_LOCK_BUSY,
         Err(_) => return crate::cli::EXIT_ERROR,
     };
+    // The command boundary leaves `update`'s config warnings to this point:
+    // a run that never gets the lock (busy, exit 75) does nothing, so it
+    // stays as quiet as `--cron` promises. The engine reports only keys
+    // that later reloads add (it treats these as already reported).
+    for unknown in &config.unknown_keys {
+        let _ = writeln!(stderr, "{}", unknown.warning());
+    }
     // Publish the claim explicitly for nested native steps without changing
     // the parent process environment.
     child_env.insert(
