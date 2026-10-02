@@ -1953,6 +1953,12 @@ fn assert_provider_signal(
         !merge_marker.exists(),
         "update started a merge hook after provider cancellation"
     );
+    // Cancellation is not an outcome: an interrupted run leaves no last-run
+    // stamp behind.
+    assert!(
+        !fixture.state.join("dot/update.last-run").exists(),
+        "an interrupted update recorded a last-run outcome"
+    );
     assert_eq!(
         std::fs::read_dir(&tmp)
             .expect("temporary directory")
@@ -4825,6 +4831,33 @@ fn every_update_records_its_last_run_outcome() {
     assert_cli(&cron, 0, b"", b"");
     assert_eq!(last_run_fields(&fixture), ["ok", "cron"]);
     assert_eq!(last_cron_outcome(&fixture), ["ok", "update"]);
+}
+
+#[test]
+fn a_hand_run_update_that_does_not_converge_records_a_plain_failure() {
+    // A failing config hook means the run did not converge: `fail`, never
+    // `degraded`, and no stages.
+    let fixture = Fixture::new("shdeps-last-run-fail");
+    let extensions = fixture.home.join("extensions");
+    let merge_hooks = extensions.join("merge-hooks.d");
+    std::fs::create_dir_all(&merge_hooks).expect("merge hooks");
+    std::fs::write(
+        fixture.home.join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=shdeps\nshdeps_update_policy=pinned\n",
+    )
+    .expect("merge config");
+    std::fs::write(merge_hooks.join("10-fail.sh"), b"merge() { return 3; }\n").expect("merge hook");
+    for path in [&extensions, &merge_hooks] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("private extension directory");
+    }
+    let output = fixture
+        .command()
+        .env("DOT_TEST_PROVIDER_FAIL", "1")
+        .output()
+        .expect("manual update with failing tools and merge hook");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(last_run_fields(&fixture), ["fail", "manual"]);
 }
 
 #[test]

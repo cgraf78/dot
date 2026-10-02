@@ -359,12 +359,31 @@ fn release_revision(source_root: &Path) -> Option<String> {
     if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    let metadata = source_root.join(".dot-install.json");
-    let kind = std::fs::symlink_metadata(&metadata).ok()?.file_type();
-    if !kind.is_file() || kind.is_symlink() {
+    (release_commit(source_root)? == commit).then(|| commit.to_string())
+}
+
+/// Release install metadata file name inside a packaged release root.
+const RELEASE_METADATA: &str = ".dot-install.json";
+
+/// Whether `source_root` is a packaged release root: it carries release
+/// install metadata as a regular file. Such a root has no `.git` of its own,
+/// so Git there would walk up into whatever repository encloses it (a
+/// `$HOME` checkout, say) and answer for the wrong tree.
+pub(crate) fn is_release_root(source_root: &Path) -> bool {
+    std::fs::symlink_metadata(source_root.join(RELEASE_METADATA))
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+/// The commit a packaged release's install metadata names, without checking
+/// it against this build. The provider uses it to notice that the Tools stage
+/// installed a different release than the one running; [`release_revision`]
+/// is the stricter identity that also binds the metadata to this executable.
+/// `None` for a missing, symlinked, unreadable, or ambiguous record.
+pub(crate) fn release_commit(source_root: &Path) -> Option<String> {
+    if !is_release_root(source_root) {
         return None;
     }
-    let body = std::fs::read_to_string(metadata).ok()?;
+    let body = std::fs::read_to_string(source_root.join(RELEASE_METADATA)).ok()?;
     let mut found = None;
     for line in body.lines() {
         let Some(rest) = line.trim().strip_prefix("\"commit\"") else {
@@ -377,7 +396,7 @@ fn release_revision(source_root: &Path) -> Option<String> {
             return None;
         }
     }
-    (found == Some(commit)).then(|| commit.to_string())
+    found.map(str::to_string)
 }
 
 /// Return the packaged native entry only when the release metadata matches this

@@ -273,9 +273,9 @@ new exit code that existing callers would have to learn.
   recorded runs were degraded, which older releases reported as unknown;
 - with no cron stamp, `update.last-run` decides: a cron last run that failed
   or skipped reads `cron update has not succeeded recently`; a hand-run last
-  update
-  older than the window reads `cron update has never run` (a scheduled
-  `dot update --cron` would have run by then), and a newer one
+  update older than the window reads `cron update has never run`, a warning
+  (a scheduled `dot update --cron` would have run by then) or only a skip
+  when no `crontab` is on `PATH` (Termux, containers); a newer one reads
   `cron update has not run yet`;
 - with no stamp at all: `cron update success is unknown`.
 
