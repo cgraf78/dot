@@ -30,7 +30,7 @@ packaging, and test-harness boundaries.
 - Lints: `cargo clippy --locked --all-targets --all-features -- -D warnings`
   (`[lints.rust] warnings = "deny"` covers rustc lints locally; Clippy
   itself is enforced by the CI flag).
-- Standalone Rust: `rustfmt --check support/performance-command-supervisor.rs
+- Standalone Rust: `rustfmt --edition 2024 --check support/performance-command-supervisor.rs
   tests/support/performance-supervisor-fixture.rs` (these files are compiled
   directly and are outside Cargo's module graph).
 - ShellCheck inventory: `.github/shellcheck-files.txt` (do not regress).

@@ -32,7 +32,7 @@ shell_job=$(sed -n '/^  shell:/,/^  shdeps-lock:/p' "$workflow")
 performance_job=$(sed -n '/^  performance:/,/^  required:/p' "$workflow")
 grep -Fq 'bash tests/run' <<<"$rust_job" ||
   fail 'Rust platform CI must run the native-backed shell acceptance suite'
-grep -Fq 'rustfmt --check support/performance-command-supervisor.rs tests/support/performance-supervisor-fixture.rs' \
+grep -Fq 'rustfmt --edition 2024 --check support/performance-command-supervisor.rs tests/support/performance-supervisor-fixture.rs' \
   <<<"$rust_job" || fail 'Rust CI must format-check standalone supervisor sources'
 if grep -Fq -- '--ignored' <<<"$rust_job"; then
   fail 'shared debug/platform CI must not run wall-clock performance gates'
