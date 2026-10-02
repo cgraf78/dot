@@ -386,6 +386,32 @@ pub fn active_revision(source_root: &Path) -> String {
     }
 }
 
+/// The Dot generation installed at `source_root`: a packaged release's
+/// install-metadata commit, otherwise the checkout `HEAD`
+/// ([`active_revision`]). The empty string when neither resolves.
+///
+/// The provider compares this before and after the Tools stage to notice
+/// that Shdeps upgraded Dot itself. A release root (how hosts install Dot
+/// as a `github:release` dependency) has no `.git`, so asking Git there
+/// answered empty both times, or with an enclosing repository's `HEAD`,
+/// and the upgrade went unnoticed. The metadata is deliberately not bound
+/// to the running executable here: after an upgrade it names the new
+/// release, which is the point.
+pub fn installed_revision(source_root: &Path) -> String {
+    layout_revision(source_root, crate::startup::is_release_root(source_root))
+}
+
+/// [`installed_revision`] for a root whose layout (`release`) the caller
+/// sampled earlier. The provider samples it before the Tools stage so its
+/// after-read cannot fall through to Git when the stage left a release root
+/// without readable metadata: Git would answer for an enclosing repository.
+pub(crate) fn layout_revision(source_root: &Path, release: bool) -> String {
+    if release {
+        return crate::startup::release_commit(source_root).unwrap_or_default();
+    }
+    active_revision(source_root)
+}
+
 /// `_dot_provider_read_checkpoint`: the lowercased `after` revision
 /// from the guard record at `path`, or `None` for every shell
 /// refusal: a missing, symlinked, or non-regular file, a wrong
@@ -559,7 +585,10 @@ pub fn consume_checkpoint(path: &Path, source_root: &Path) -> bool {
 /// [`checkpoint_state`] both read it here, so `dot doctor` predicts exactly
 /// what the next update does.
 fn checkpoint_active_revision(source_root: &Path) -> String {
-    active_revision(source_root).to_ascii_lowercase()
+    // The record names the generation the provider installed, so read the
+    // installed generation the same way the provider does (release metadata
+    // for a packaged root, which has no `.git` for Git to answer from).
+    installed_revision(source_root).to_ascii_lowercase()
 }
 
 /// Whether a checkpoint pinning `after` is satisfied by `active`, the

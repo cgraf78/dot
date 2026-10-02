@@ -1369,6 +1369,58 @@ fn doctor_extension_fixture(tag: &str, extensions: &[(String, Vec<u8>)]) -> (Tem
     (home, state)
 }
 
+/// [`doctor_extension_fixture`] around an initialized, healthy client, so
+/// doctor's exit status reflects the extensions alone (the bare fixture has
+/// no client and always exits 1). Returns the origin scope too, which must
+/// outlive the run.
+fn doctor_extension_client_fixture(
+    tag: &str,
+    extensions: &[(String, Vec<u8>)],
+) -> (TempDir, TempDir, TempDir) {
+    let scope = TempDir::new(&format!("doctor-{tag}-origin")).expect("origin scope");
+    let home = TempDir::new(&format!("doctor-{tag}-home")).expect("home");
+    let state = TempDir::new(&format!("doctor-{tag}-state")).expect("state");
+    let origin = origin(scope.path());
+    init_client(&home, &state, &origin);
+    let root = home.path().join("extensions");
+    let directory = root.join("doctor.d");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
+    std::fs::create_dir_all(&directory).expect("doctor directory");
+    std::fs::create_dir(home.path().join("tmp")).expect("temporary directory");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=none\n",
+    )
+    .expect("config");
+    for (name, body) in extensions {
+        std::fs::write(directory.join(name), body).expect("extension");
+        seal(&directory.join(name), 0o644);
+    }
+    seal(&root, 0o700);
+    seal(&directory, 0o700);
+    (scope, home, state)
+}
+
+/// The good extension the client-fixture tests share.
+fn good_extension() -> (String, Vec<u8>) {
+    (
+        "10-good.sh".to_string(),
+        b"doctor() {\n  dot_doctor_section 'Good'\n  dot_doctor_ok 'good extension ran'\n}\n"
+            .to_vec(),
+    )
+}
+
+#[test]
+fn healthy_client_with_a_good_extension_exits_zero() {
+    // The control for the refused/timed-out exit-status tests below.
+    let (_scope, home, state) = doctor_extension_client_fixture("healthy", &[good_extension()]);
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
+    assert!(stdout.contains(" 0 failed"), "{stdout}");
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+}
+
 /// Run native doctor with a fixed worker window and the fixture's private
 /// `TMPDIR`, returning the output and whether that `TMPDIR` is empty again.
 fn doctor_with_jobs(home: &TempDir, state: &TempDir, jobs: &str) -> (Output, bool) {
@@ -1808,7 +1860,7 @@ fn unsafe_and_malformed_extensions_match_without_the_old_engine() {
 fn hung_extension_times_out_and_later_extensions_still_run() {
     // C2: one hung extension used to block every later section until it
     // ended on its own.
-    let (home, state) = doctor_extension_fixture(
+    let (_scope, home, state) = doctor_extension_client_fixture(
         "timeout",
         &[
             (
@@ -1831,6 +1883,8 @@ fn hung_extension_times_out_and_later_extensions_still_run() {
         "{stdout}"
     );
     assert!(stdout.contains("  ✓ later extension ran\n"), "{stdout}");
+    // The timeout is the only failure on this healthy client.
+    assert!(stdout.contains(" 1 failed"), "{stdout}");
     assert_eq!(output.status.code(), Some(1));
     assert!(
         elapsed < std::time::Duration::from_secs(20),
@@ -1854,14 +1908,7 @@ fn hung_extension_times_out_and_later_extensions_still_run() {
 fn dangling_extension_link_is_refused_alone() {
     // A pull that renames an overlay extension leaves a dangling link until
     // the link phase runs; that used to fail discovery and run nothing.
-    let (home, state) = doctor_extension_fixture(
-        "dangling",
-        &[(
-            "10-good.sh".to_string(),
-            b"doctor() {\n  dot_doctor_section 'Good'\n  dot_doctor_ok 'good extension ran'\n}\n"
-                .to_vec(),
-        )],
-    );
+    let (_scope, home, state) = doctor_extension_client_fixture("dangling", &[good_extension()]);
     let directory = home.path().join("extensions/doctor.d");
     std::os::unix::fs::symlink(
         home.path().join("renamed-away.sh"),
@@ -1872,10 +1919,12 @@ fn dangling_extension_link_is_refused_alone() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
     assert!(
-        stdout.contains("  ✗ 20-gone doctor extension refused\n    ~/extensions/doctor.d/20-gone.sh is a dangling link; run dot update to relink overlay extensions\n"),
+        stdout.contains("  ✗ 20-gone doctor extension refused\n    ~/extensions/doctor.d/20-gone.sh is not linked from an active overlay (dangling or retired links); run dot update to relink overlay extensions\n"),
         "{stdout}"
     );
     assert!(!stdout.contains("discovery failed"), "{stdout}");
+    // The refusal alone fails this otherwise healthy client.
+    assert!(stdout.contains(" 1 failed"), "{stdout}");
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
     assert!(clean);
@@ -1884,13 +1933,10 @@ fn dangling_extension_link_is_refused_alone() {
 #[test]
 fn untrusted_extension_is_refused_without_running() {
     // Trust still gates every script, just one at a time.
-    let (home, state) = doctor_extension_fixture(
+    let (_scope, home, state) = doctor_extension_client_fixture(
         "untrusted",
         &[
-            (
-                "10-good.sh".to_string(),
-                b"doctor() {\n  dot_doctor_ok 'good extension ran'\n}\n".to_vec(),
-            ),
+            good_extension(),
             (
                 "20-writable.sh".to_string(),
                 b"doctor() {\n  printf ran >\"$HOME/untrusted-ran\"\n}\n".to_vec(),
@@ -1905,11 +1951,77 @@ fn untrusted_extension_is_refused_without_running() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
     assert!(
-        stdout.contains("  ✗ 20-writable doctor extension refused\n    ~/extensions/doctor.d/20-writable.sh fails the extension trust checks"),
+        stdout.contains("  ✗ 20-writable doctor extension refused\n    ~/extensions/doctor.d/20-writable.sh fails the extension trust checks; check its owner and mode\n"),
         "{stdout}"
     );
     assert!(!home.path().join("untrusted-ran").exists());
+    assert!(stdout.contains(" 1 failed"), "{stdout}");
     assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn unlinked_overlay_extensions_share_one_refusal_row() {
+    // An overlay descriptor typo leaves every overlay-owned extension link
+    // untrusted; that used to print one "check its owner and mode" row per
+    // link, all for the same cause.
+    let (_scope, home, state) =
+        doctor_extension_client_fixture("unlinked-overlay", &[good_extension()]);
+    let checkout = home.path().join("overlay-checkout");
+    std::fs::create_dir_all(&checkout).expect("overlay checkout");
+    let directory = home.path().join("extensions/doctor.d");
+    for index in 0..7 {
+        let target = checkout.join(format!("2{index}-overlay.sh"));
+        std::fs::write(&target, b"doctor() { :; }\n").expect("overlay extension");
+        std::os::unix::fs::symlink(&target, directory.join(format!("2{index}-overlay.sh")))
+            .expect("overlay link");
+    }
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
+    assert_eq!(stdout.matches("doctor extension").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("  ✗ 7 doctor extensions refused\n    20-overlay, 21-overlay, 22-overlay, 23-overlay, 24-overlay, 25-overlay, 26-overlay are not linked from an active overlay (dangling or retired links); run dot update to relink overlay extensions\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("owner and mode"), "{stdout}");
+    // When the overlays themselves failed to resolve, the row says so.
+    let descriptors = home.path().join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&descriptors).expect("descriptors");
+    std::fs::write(
+        descriptors.join("typo.conf"),
+        b"url=file:///nowhere.git\nsync=never\n",
+    )
+    .expect("bad descriptor");
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("overlay descriptor invalid"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "the overlays did not resolve; fix the overlay error above, then run dot update"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn timeout_counts_from_each_extension_launch() {
+    // Serial extensions that each finish well inside the limit must never
+    // time out, however long they waited for a slot.
+    let slow = |index: usize| {
+        (
+            format!("{index}0-slow{index}.sh"),
+            b"doctor() {\n  sleep 2\n  dot_doctor_ok 'slow finished'\n}\n".to_vec(),
+        )
+    };
+    let (home, state) = doctor_extension_fixture("timeout-launch", &[slow(1), slow(2), slow(3)]);
+    let (output, _) = doctor_with_env(
+        &home,
+        &state,
+        &[("DOT_DOCTOR_JOBS", "1"), ("DOT_DOCTOR_TIMEOUT", "5")],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("slow finished").count(), 3, "{stdout}");
+    assert!(!stdout.contains("timed out"), "{stdout}");
 }
 
 #[test]
@@ -1931,10 +2043,10 @@ fn info_rows_and_empty_details_render_without_counting() {
     let (output, _) = doctor_with_env(&home, &state, &[]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("  ✓ no detail\n"), "{stdout}");
-    assert!(stdout.contains("  ⚠ empty warning\n  •"), "{stdout}");
+    assert!(stdout.contains("  ⚠ empty warning\n  ›"), "{stdout}");
     assert!(!stdout.contains("()"), "{stdout}");
-    assert!(stdout.contains("  • selected thing (value)\n"), "{stdout}");
-    assert!(stdout.contains("  • guarded\n"), "{stdout}");
+    assert!(stdout.contains("  › selected thing (value)\n"), "{stdout}");
+    assert!(stdout.contains("  › guarded\n"), "{stdout}");
     let (home_plain, state_plain) = doctor_extension_fixture("info-plain", &body(false));
     let (plain, _) = doctor_with_env(&home_plain, &state_plain, &[]);
     let summary = |out: &str| {
@@ -2320,14 +2432,104 @@ fn hand_updated_host_reports_its_last_run_end_to_end() {
         format!("{} ok manual\n", now_epoch() - 3 * 3600),
     )
     .expect("last run");
-    let native = command(false, &home, &state, &[]).output().expect("doctor");
+    // A PATH holding only the probes doctor runs, so whether a `crontab`
+    // exists is the test's choice, not the host's.
+    let tools = TempDir::new_exec("doctor-last-run-tools").expect("tools");
+    std::os::unix::fs::symlink(dot_test_support::real_tool("git"), tools.path().join("git"))
+        .expect("git link");
+    for tool in ["id", "uname", "hostname"] {
+        let found = ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+            .into_iter()
+            .map(|dir| Path::new(dir).join(tool))
+            .find(|candidate| candidate.is_file());
+        if let Some(found) = found {
+            std::os::unix::fs::symlink(found, tools.path().join(tool)).expect("tool link");
+        }
+    }
+    let cron = TempDir::new_exec("doctor-last-run-crontab").expect("cron tools");
+    let crontab = cron.path().join("crontab");
+    std::fs::write(&crontab, b"#!/bin/sh\nexit 0\n").expect("crontab");
+    seal(&crontab, 0o755);
+    let without_cron = tools.path().display().to_string();
+    let with_cron = format!("{}:{without_cron}", cron.path().display());
+    // With a `crontab` on PATH the host could schedule cron, so a cron
+    // that never ran warns.
+    let native = command(false, &home, &state, &[("PATH", &with_cron)])
+        .output()
+        .expect("doctor");
     let stdout = String::from_utf8_lossy(&native.stdout);
     assert!(stdout.contains("⚠ cron update has never run"), "{stdout}");
     assert!(
-        stdout.contains("✓ last update succeeded (ran by manual 3h0m ago)"),
+        stdout.contains("✓ last update succeeded (manual run 3h0m ago)"),
         "{stdout}"
     );
     assert!(!stdout.contains("success is unknown"), "{stdout}");
+    // Without one (Termux, containers) the same state only skips.
+    let native = command(false, &home, &state, &[("PATH", &without_cron)])
+        .output()
+        .expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains(
+            "· cron update has never run (no crontab on PATH; last update: manual run 3h0m ago)"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn init_convergence_records_the_init_trigger() {
+    let scope = TempDir::new("doctor-init-trigger-origin").expect("origin scope");
+    let home = TempDir::new("doctor-init-trigger-home").expect("home");
+    let state = TempDir::new("doctor-init-trigger-state").expect("state");
+    let origin = origin(scope.path());
+    init_client(&home, &state, &origin);
+    let stamp = std::fs::read_to_string(state.path().join("dot/update.last-run"))
+        .expect("init last-run stamp");
+    assert!(stamp.ends_with(" ok init\n"), "{stamp:?}");
+}
+
+#[test]
+fn release_root_checkpoint_pins_its_install_metadata_end_to_end() {
+    // A packaged release has no `.git`: the checkpoint must compare against
+    // its install metadata, never Git's answer for some enclosing tree.
+    let home = TempDir::new("doctor-release-checkpoint-home").expect("home");
+    let state = TempDir::new("doctor-release-checkpoint-state").expect("state");
+    let scope = TempDir::new("doctor-release-checkpoint-root").expect("release scope");
+    let release = scope.path().join("dot");
+    std::fs::create_dir_all(release.join("lib/dot/public")).expect("release");
+    let pinned = "c".repeat(40);
+    std::fs::write(
+        release.join(".dot-install.json"),
+        format!("{{\n  \"schema\": 1,\n  \"commit\": \"{pinned}\"\n}}\n"),
+    )
+    .expect("metadata");
+    let record = state.path().join("dot/provider-reexec-failed");
+    std::fs::create_dir_all(record.parent().expect("parent")).expect("state dir");
+    std::fs::write(
+        &record,
+        format!(
+            "cgraf78 dot provider reexec checkpoint v1\nbefore={}\nafter={pinned}\n",
+            "a".repeat(40)
+        ),
+    )
+    .expect("checkpoint");
+    seal(&record, 0o600);
+    // The shipped binary derives its own source root, so run in process
+    // with this release as the embedded source root.
+    let (_, stdout, _) = run_in_process(
+        &home,
+        &state,
+        home.path(),
+        &[("DOT_SOURCE_ROOT", release.as_os_str())],
+    );
+    let stdout = String::from_utf8_lossy(&stdout);
+    assert!(stdout.contains("dot release exists"), "{stdout}");
+    assert!(
+        stdout.contains("⚠ provider re-exec checkpoint pending"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("blocks dot update"), "{stdout}");
 }
 
 #[test]
@@ -2386,10 +2588,10 @@ fn blocking_reexec_checkpoint_fails_end_to_end() {
 }
 
 #[test]
-fn standalone_release_under_shdeps_fails_end_to_end() {
+fn standalone_release_under_shdeps_is_reported_end_to_end() {
     // M1: a standalone install (`cgraf78/dot -> .dot-standalone/current`)
-    // read green under the Shdeps provider while Shdeps could never
-    // upgrade it.
+    // read green under the Shdeps provider. Shdeps adopts it on its next
+    // update of Dot, unless the installer's lock blocks that.
     let home = TempDir::new("doctor-standalone-home").expect("home");
     let state = TempDir::new("doctor-standalone-state").expect("state");
     std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
@@ -2415,12 +2617,23 @@ fn standalone_release_under_shdeps_fails_end_to_end() {
     .output()
     .expect("doctor");
     let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(stdout.contains("⚠ dot is standalone-installed"), "{stdout}");
     assert!(
-        stdout.contains("✗ dot release is standalone-installed; Shdeps cannot upgrade it"),
+        stdout.contains("~/.local/share/cgraf78/dot: Shdeps adopts it on its next update of dot"),
         "{stdout}"
     );
+    std::fs::create_dir(cgraf.join(".dot-standalone/lock")).expect("installer lock");
+    let native = command(
+        false,
+        &home,
+        &state,
+        &[("DOT_SOURCE_ROOT", release.to_str().expect("utf8 release"))],
+    )
+    .output()
+    .expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
     assert!(
-        stdout.contains("~/.local/share/cgraf78/dot links into .dot-standalone"),
+        stdout.contains("✗ standalone installer lock blocks Shdeps adoption"),
         "{stdout}"
     );
 }

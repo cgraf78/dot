@@ -224,11 +224,11 @@ fn empty_detail_renders_like_an_omitted_one() {
 fn info_rows_render_inline_and_never_count() {
     assert_eq!(
         info(&Palette::empty(), b"fact", Some(b"value")),
-        "  • fact (value)\n".as_bytes()
+        "  › fact (value)\n".as_bytes()
     );
     assert_eq!(
         info(&marker_palette(), b"fact", Some(b"value")),
-        "  <D>•<R> fact <D>(value)<R>\n".as_bytes()
+        "  <D>›<R> fact <D>(value)<R>\n".as_bytes()
     );
     let rows = [
         Record::info("fact", Some("value".to_string())),
@@ -237,6 +237,6 @@ fn info_rows_render_inline_and_never_count() {
     assert_eq!(rows[0].kind, Kind::Info);
     assert_eq!(
         render(&rows, &Palette::empty()),
-        "  • fact (value)\n  ✓ check\n".as_bytes()
+        "  › fact (value)\n  ✓ check\n".as_bytes()
     );
 }

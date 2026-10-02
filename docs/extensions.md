@@ -187,7 +187,7 @@ Doctor extensions report structured records only; ordinary stdout/stderr is
 diagnosed as out-of-band output. Each result helper accepts `LABEL [DETAIL]`
 except the one-argument section helper. An empty `DETAIL` renders exactly like
 an omitted one. `dot_doctor_info` records a configuration fact that is neither
-a passed nor a skipped check; it renders with `•` and is never counted:
+a passed nor a skipped check; it renders with `›` and is never counted:
 
 ```bash
 doctor() {
@@ -218,11 +218,12 @@ an extension must work against both an older and a newer coordinator:
   `<name> doctor extension timed out`, and continues with the rest. Older
   coordinators have no deadline, so an extension must bound its own probes
   and must not rely on being stopped.
-- An extension file that is a dangling link (an overlay renamed or removed
-  it and the link phase has not run yet) or fails the trust checks is
-  reported as `<name> doctor extension refused` and never runs; the other
-  extensions still run. Older coordinators skipped every extension in that
-  case.
+- An extension that fails the trust checks never runs, and the other
+  extensions still run. Refused links (dangling, or into a checkout that is
+  not an active overlay's, as after a rename or an overlay error) share one
+  `doctor extension(s) refused` row that names them and the next step; a
+  refused regular file gets its own row. Older coordinators skipped every
+  extension in either case.
 
 The coordinator owns rendering, counters, ordering, and aggregate exit status;
 extensions must not inspect or mutate those internals. `dot_doctor_display_path`

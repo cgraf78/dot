@@ -978,6 +978,24 @@ fn doctor_rejects_arguments_it_does_not_take() {
     );
 }
 
+#[test]
+fn doctor_help_and_argument_errors_still_run_the_reexec_guard_first() {
+    // The re-exec guard precedes every command: a provider continuation
+    // that landed on the wrong generation must report that, not usage.
+    let home = TempDir::new("cli-doctor-reexec").expect("fixture home");
+    let state = TempDir::new("cli-doctor-reexec-state").expect("fixture state");
+    let expected = [("DOT_REEXEC_EXPECTED_REVISION", "0".repeat(40))];
+    let extra: Vec<(&str, &str)> = expected.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let guarded = isolated_run(&home, &state, &["version"], &extra);
+    assert_ne!(guarded.status.code(), Some(0), "the guard must refuse");
+    for argv in [&["doctor", "--help"][..], &["doctor", "--bogus"]] {
+        let output = isolated_run(&home, &state, argv, &extra);
+        assert_eq!(output.status.code(), guarded.status.code(), "{argv:?}");
+        assert!(output.stdout.is_empty(), "{argv:?}: {:?}", output.stdout);
+        assert_eq!(output.stderr, guarded.stderr, "{argv:?}");
+    }
+}
+
 /// Initialized file:// client for the doctor pass/extension rows.
 fn stage_doctor_client() -> (TempDir, TempDir, TempDir) {
     let scope = TempDir::new("cli-doctor-origin").expect("origin scope");
