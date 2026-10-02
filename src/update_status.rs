@@ -11,9 +11,12 @@
 //!   capped dirty file list as their detail; `ok`/`degraded`/`fail`
 //!   lines name the `update` stage, and `degraded` lines add the
 //!   failing stages ([`Degraded::detail`], e.g. `config,tools,prune`). A
-//!   provider re-exec performs two engine runs, so one cron
-//!   invocation can append two lines (both carry the continuation's
-//!   classification).
+//!   development checkout's provider re-exec performs two engine runs
+//!   in one process, so one cron invocation can append two lines (both
+//!   carry the continuation's classification). A packaged release hands
+//!   off to its new binary instead ([`crate::handoff`]): only the exec'd
+//!   continuation appends, or the handoff appends `fail` when it cannot
+//!   exec.
 //! - `update.last-success`: the epoch of the last fully clean cron
 //!   run (exit 0), overwritten. Its meaning is unchanged from before
 //!   the degraded outcome existed, so an older `dot doctor` reading a

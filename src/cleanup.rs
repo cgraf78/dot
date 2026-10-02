@@ -1718,6 +1718,81 @@ fn exit_process_with_hook(code: i32, mut after_install: impl FnMut(i32)) -> ! {
     unsafe { libc::_exit(final_code) }
 }
 
+/// Replace the process image with `command` at the end of a real process
+/// entry, the exec counterpart of [`exit_process`]. All output must already
+/// be drained. Returns only on failure: an `Interrupted` error when a handled
+/// signal latched first (the caller's [`exit_process`] then reports
+/// `128 + signal`), otherwise the exec error.
+///
+/// The new image must start with the signal state its own entry expects.
+/// Process entry leaves the handled set blocked with Dot's capture handler
+/// installed, and an exec would carry the blocked mask over. So, still
+/// blocked, the handled signals return to their default actions and SIGCHLD
+/// to the caller's exec-visible policy (a pending signal cannot run the
+/// capture handler and vanish at exec), and only then is the set unblocked:
+/// a signal in the last instant takes its default action, as it would before
+/// the new entry installs its own handlers.
+pub(crate) fn exec_process(command: &mut Command) -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+
+    let blocked = BlockedLaunchSignals::install().ok();
+    while ACTIVE_HANDLERS.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        std::thread::yield_now();
+    }
+    record_pending_signal();
+    if received_signal().is_some() || CLEANUP_INCOMPLETE.load(std::sync::atomic::Ordering::SeqCst) {
+        return std::io::ErrorKind::Interrupted.into();
+    }
+    // SAFETY: only process-wide dispositions change; every pointer names
+    // local storage.
+    let error = match unsafe { reset_child_signal_dispositions() } {
+        // A capture handler still running on another thread can have latched
+        // a signal after the drain above; the exec would lose it.
+        Ok(()) if signal_latched_after_reset() => std::io::ErrorKind::Interrupted.into(),
+        Ok(()) => {
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                for signal in HANDLED_SIGNALS {
+                    libc::sigaddset(&mut set, signal);
+                }
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            }
+            command.exec()
+        }
+        Err(error) => error,
+    };
+    // No exec happened: latch signals again until `exit_process` takes over,
+    // keep the handled set blocked as process entry left it (`blocked`
+    // restores that mask when dropped), and ignore SIGPIPE again as the Rust
+    // runtime does (`Command::exec` resets it before `execvp`), so a closed
+    // stderr fails the caller's diagnostic write instead of killing it.
+    // SAFETY: as in `Signals::install_with_restore`.
+    unsafe {
+        for signal in HANDLED_SIGNALS {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = interrupted as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+    drop(blocked);
+    error
+}
+
+/// Whether a handled signal latched while dispositions were being reset for
+/// an exec, once every capture handler already running has returned.
+fn signal_latched_after_reset() -> bool {
+    while ACTIVE_HANDLERS.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        std::thread::yield_now();
+    }
+    // One may also be pending on this (still blocked) thread since the
+    // first drain; unblocking would deliver it with its default action.
+    record_pending_signal();
+    received_signal().is_some()
+}
+
 /// A writer that turns a latched signal into a non-retriable I/O error.
 ///
 /// `write_all` retries `Interrupted`, so returning that error kind would leave
