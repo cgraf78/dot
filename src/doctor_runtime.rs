@@ -305,12 +305,12 @@ pub fn skip(palette: &Palette, message: &[u8], detail: Option<&[u8]>) -> Vec<u8>
     inline_row(palette, &palette.dim, "·", message, detail)
 }
 
-/// An informational row: `  • message [ (detail)]`, with the same trailer
-/// rule as [`ok`]. Informational rows never touch [`Counts`]. The bullet is
+/// An informational row: `  › message [ (detail)]`, with the same trailer
+/// rule as [`ok`]. Informational rows never touch [`Counts`]. The marker is
 /// one column wide in every font (an information sign renders as a wide
-/// emoji in some, misaligning the rows).
+/// emoji in some, misaligning the rows) and unlike the skip dot at a glance.
 pub fn info(palette: &Palette, message: &[u8], detail: Option<&[u8]>) -> Vec<u8> {
-    inline_row(palette, &palette.dim, "•", message, detail)
+    inline_row(palette, &palette.dim, "›", message, detail)
 }
 
 /// `_dr_section`: a blank line, then the bold title. Sections never

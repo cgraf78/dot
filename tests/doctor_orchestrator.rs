@@ -42,7 +42,7 @@ fn runtime_check_agrees() {
     assert!(
         String::from_utf8(rec.render())
             .expect("utf8")
-            .contains("  • configuration version (1)\n")
+            .contains("  › configuration version (1)\n")
     );
     assert_eq!(rec.counts().warn, 1);
     assert_eq!(rec.counts().fail, 0);

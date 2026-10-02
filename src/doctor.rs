@@ -273,6 +273,7 @@ fn run_configured(
         config,
         euid,
         &overlays.active,
+        overlays.discovery_error.is_some(),
         &constants.overlay_manifest,
         streams.stderr,
         &mut emit,
@@ -832,11 +833,13 @@ fn merge_inventory(
     Some(inventory)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extensions(
     runtime: &crate::app::Runtime,
     config: &crate::config::Config,
     euid: u32,
     overlays: &[String],
+    overlays_unresolved: bool,
     manifest: &str,
     stderr: &mut dyn std::io::Write,
     emit: &mut Emitter<'_>,
@@ -876,12 +879,14 @@ fn extensions(
             return 1;
         }
     };
-    // Each refused script is its own failure; the rest still run.
-    let mut status = 0;
-    for script in &discovery.rejected {
-        record_rejected(emit.recorder(), script, &trust.home);
-        status = 1;
-    }
+    // Refused scripts fail; the rest still run.
+    let status = i32::from(!discovery.rejected.is_empty());
+    record_rejected(
+        emit.recorder(),
+        &discovery.rejected,
+        &trust.home,
+        overlays_unresolved,
+    );
     if let Some(error) = discovery.error {
         let _ = stderr.write_all(&error.message());
         emit.recorder()
@@ -943,26 +948,62 @@ fn extensions(
     dispatch_extensions(&discovery.specs, jobs, &execute, &abort, emit).max(status)
 }
 
-/// One refused doctor extension's failure row. A dangling link is the
-/// common case (an overlay renamed or removed the extension and the link
-/// phase has not caught up), so it gets its own next step.
-fn record_rejected(recorder: &mut Recorder, script: &Path, home: &str) {
-    let name = script.file_name().unwrap_or(script.as_os_str()).as_bytes();
-    let mut message = crate::doctor_coordinator::extension_key(name).to_vec();
-    message.extend_from_slice(b" doctor extension refused");
-    let shown = crate::doctor_paths::tilde(&script.to_string_lossy(), home);
-    let dangling = std::fs::symlink_metadata(script)
-        .is_ok_and(|meta| meta.file_type().is_symlink())
-        && std::fs::metadata(script)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-    let detail = if dangling {
-        format!("{shown} is a dangling link; run dot update to relink overlay extensions")
-    } else {
-        format!(
-            "{shown} fails the extension trust checks; run dot update, then check its owner and mode"
-        )
+/// Failure rows for refused doctor extensions. Links (dangling, or into a
+/// checkout that is not an active overlay's) are almost always overlay
+/// extensions waiting for the link phase: a pull renamed them, or the
+/// overlays did not resolve this run. They share one row naming them all,
+/// because one cause (and one `dot update`) covers every one; per-link rows
+/// blamed owners and modes that are fine. A regular file that fails trust is
+/// a real local problem and keeps a row of its own.
+fn record_rejected(
+    recorder: &mut Recorder,
+    rejected: &[PathBuf],
+    home: &str,
+    overlays_unresolved: bool,
+) {
+    let key = |script: &Path| {
+        let name = script.file_name().unwrap_or(script.as_os_str()).as_bytes();
+        String::from_utf8_lossy(crate::doctor_coordinator::extension_key(name)).into_owned()
     };
-    recorder.fail(&message, Some(detail.as_bytes()));
+    let (links, files): (Vec<&PathBuf>, Vec<&PathBuf>) = rejected.iter().partition(|script| {
+        std::fs::symlink_metadata(script).is_ok_and(|meta| meta.file_type().is_symlink())
+    });
+    if !links.is_empty() {
+        let message = match links.as_slice() {
+            [only] => format!("{} doctor extension refused", key(only)),
+            many => format!("{} doctor extensions refused", many.len()),
+        };
+        let subject = match links.as_slice() {
+            [only] => format!(
+                "{} is",
+                crate::doctor_paths::tilde(&only.to_string_lossy(), home)
+            ),
+            many => format!(
+                "{} are",
+                many.iter()
+                    .map(|link| key(link))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let next = if overlays_unresolved {
+            "the overlays did not resolve; fix the overlay error above, then run dot update"
+        } else {
+            "run dot update to relink overlay extensions"
+        };
+        let detail = format!(
+            "{subject} not linked from an active overlay (dangling or retired links); {next}"
+        );
+        recorder.fail(message.as_bytes(), Some(detail.as_bytes()));
+    }
+    for script in files {
+        let message = format!("{} doctor extension refused", key(script));
+        let detail = format!(
+            "{} fails the extension trust checks; check its owner and mode",
+            crate::doctor_paths::tilde(&script.to_string_lossy(), home)
+        );
+        recorder.fail(message.as_bytes(), Some(detail.as_bytes()));
+    }
 }
 
 /// Default per-extension deadline: well above the slowest shipped extension
