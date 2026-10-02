@@ -561,7 +561,10 @@ fn standalone_installer_lock_fails_under_shdeps_because_adoption_refuses() {
         rows.contains("cgraf78/.dot-standalone/lock: Shdeps will not adopt"),
         "{rows}"
     );
-    assert!(rows.contains("remove it (rmdir "), "{rows}");
+    assert!(
+        rows.contains("remove it if no install.sh is running"),
+        "{rows}"
+    );
 }
 
 #[test]
@@ -595,6 +598,37 @@ fn interrupted_adoption_warns_and_its_lock_blocks_the_resume() {
     std::fs::remove_file(&parked).expect("remove parked link");
     std::os::unix::fs::symlink("elsewhere", &parked).expect("foreign parked link");
     assert!(!layout(&root, &release, true, true).contains("interrupted"));
+}
+
+#[test]
+fn only_the_installers_exact_root_link_counts_as_adoptable() {
+    // Shdeps adopts only `<root> -> .dot-standalone/current`, read without
+    // following links; anything else would be a promise it does not keep.
+    let scratch = TempDir::new("doctor-layout-exact-link").expect("scratch");
+    let (root, release) = standalone_install(scratch.path());
+    std::fs::remove_file(&root).expect("remove root link");
+    std::os::unix::fs::symlink(".dot-standalone/releases/v1-linux", &root)
+        .expect("link into releases");
+    assert!(!layout(&root, &release, true, true).contains("standalone"));
+    std::fs::remove_file(&root).expect("remove root link");
+    std::os::unix::fs::symlink(
+        scratch.path().join("cgraf78/.dot-standalone/current"),
+        &root,
+    )
+    .expect("absolute link");
+    assert!(!layout(&root, &release, true, true).contains("standalone"));
+    // The lock row needs only the root link: Shdeps checks the lock before
+    // it reads `current`, so a dangling `current` still reports the lock.
+    std::fs::remove_file(&root).expect("remove root link");
+    std::os::unix::fs::symlink(".dot-standalone/current", &root).expect("installer link");
+    std::fs::remove_file(scratch.path().join("cgraf78/.dot-standalone/current"))
+        .expect("remove current");
+    std::fs::create_dir(scratch.path().join("cgraf78/.dot-standalone/lock")).expect("lock");
+    let rows = layout(&root, &release, true, true);
+    assert!(
+        rows.contains("✗ standalone installer lock blocks Shdeps adoption"),
+        "{rows}"
+    );
 }
 
 #[test]
