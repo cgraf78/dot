@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::log::Log;
 use crate::progress_ui::{Palette, Stage};
@@ -63,6 +63,73 @@ pub enum Caller {
 /// brick every client still running one of them. Older releases ignore an
 /// unknown environment variable instead (they simply do not prune).
 pub const PRUNE_ENV: &str = "DOT_SHDEPS_PRUNE";
+
+/// The update lock claim a provider continuation re-enters the held lock
+/// with. Hook workers receive it explicitly ([`EngineInputs::update_lock_token`]),
+/// never through the runtime environment.
+const LOCK_TOKEN_ENV: &str = "DOT_UPDATE_LOCK_TOKEN";
+
+/// Set in a provider continuation's environment: a second Dot change there
+/// publishes the provider checkpoint instead of continuing again.
+const REEXEC_ONCE_ENV: &str = "DOT_REEXEC_ONCE";
+
+/// The revision a provider continuation must observe at startup.
+const REEXEC_EXPECTED_ENV: &str = "DOT_REEXEC_EXPECTED_REVISION";
+
+/// Epoch seconds at which the first half of a handed-off update started, so
+/// the continuation's final `Done in` and cron outcome cover the whole run.
+const REEXEC_STARTED_ENV: &str = "DOT_REEXEC_STARTED";
+
+/// Test-only bound in seconds for the release handoff probe (default
+/// [`crate::cleanup::REVISION_PROBE_TIMEOUT`]).
+const PROBE_TIMEOUT_ENV: &str = "_DOT_REEXEC_PROBE_TIMEOUT_SECONDS";
+
+/// Handoff variables a continuation consumes itself. Like the lock claim
+/// they never reach providers, hooks, or other children: a long-lived process
+/// started from a hook (or a Git helper started by a pull) would otherwise
+/// carry `DOT_REEXEC_EXPECTED_REVISION` into every later `dot` it runs, which
+/// fails the startup guard after the next upgrade. The engine strips them
+/// from its runtime and the binary entry from the process environment
+/// ([`crate::handoff::scrub_process_env`]).
+pub(crate) const CONTINUATION_ENV: [&str; 5] = [
+    LOCK_TOKEN_ENV,
+    REEXEC_ONCE_ENV,
+    REEXEC_EXPECTED_ENV,
+    REEXEC_STARTED_ENV,
+    WARNED_ENV,
+];
+
+/// Whether `runtime` is a provider continuation: the second half of an
+/// update whose first half already reported its command-boundary warnings.
+/// Read from the command's own environment; the engine strips the variable
+/// from what its children inherit.
+pub(crate) fn is_continuation(runtime: &crate::app::Runtime) -> bool {
+    runtime.value(REEXEC_ONCE_ENV).and_then(OsStr::to_str) == Some("1")
+}
+
+/// Record a `fail` cron outcome for a release continuation that stops
+/// before its engine records the run (for example when it cannot re-enter
+/// the update lock). The first half skipped its own line on handoff, so
+/// without this the run would leave no outcome at all.
+pub(crate) fn record_continuation_failure(
+    continuation: bool,
+    args: &[OsString],
+    state_home: &Path,
+) {
+    // Cancellation is not an outcome, as everywhere else in the cron log.
+    if continuation && parse_flags(args).0.cron && !cancelled() {
+        crate::update_status::append_outcome(state_home, now_secs(), "fail", "update", "");
+    }
+}
+
+/// Whether a release root may hand the rest of a run off to a new binary:
+/// only `dot update` itself, and only from the binary entry point, which
+/// owns the process image and runs the handoff. `dot init` converges inside
+/// its own transaction and must finish in place; an embedded runtime cannot
+/// replace its process.
+fn release_hands_off(caller: Caller, can_exec: bool) -> bool {
+    caller == Caller::Update && can_exec
+}
 
 /// When `dot update` removes orphaned Shdeps dependencies itself.
 ///
@@ -121,12 +188,28 @@ pub struct EngineInputs<'a> {
     pub prune_mode: PruneMode,
     /// Native update lock claim exposed only to transactional hook workers.
     pub update_lock_token: Option<&'a str>,
+    /// Command environment after the update flag exports and the lock
+    /// claim. A provider continuation starts from it, so it keeps the claim
+    /// and the flag exports that [`Self::runtime`] does not carry.
+    pub env: &'a BTreeMap<OsString, OsString>,
+    /// Whether this run is a provider continuation (`DOT_REEXEC_ONCE=1` in
+    /// the command environment). A further Dot change publishes the provider
+    /// checkpoint instead of continuing again.
+    pub continuation: bool,
     /// Parsed client configuration for this update generation.
     pub config: &'a crate::config::Config,
     /// Unknown config keys already reported during this invocation (see
     /// `warn_reloaded_keys`). Seeded from [`Self::config`], whose keys
     /// the caller reported before the engine started.
     pub config_warned: &'a std::cell::RefCell<Vec<String>>,
+    /// Unknown keys in profile, selector, and descriptor files already
+    /// reported during this invocation (see `warn_data_keys`).
+    pub data_warned: &'a std::cell::RefCell<Vec<crate::unknown_keys::DataKey>>,
+    /// Whether this invocation already printed [`HOLD_WARNING`].
+    pub hold_warned: &'a std::cell::Cell<bool>,
+    /// Warning lines an earlier process of this invocation already
+    /// printed, handed over in [`WARNED_ENV`]; never printed again.
+    pub handed_warnings: &'a BTreeSet<String>,
     /// Parsed flags.
     pub flags: UpdateFlags,
     /// Residue after flags (forwarded to the pull phases).
@@ -323,9 +406,149 @@ fn warn_reloaded_keys(
     let mut warned = inputs.config_warned.borrow_mut();
     for unknown in &config.unknown_keys {
         if unknown.suggestion().is_some() && !warned.contains(&unknown.key) {
-            let _ = writeln!(err, "{}", unknown.warning());
+            let line = unknown.warning();
+            if !inputs.handed_warnings.contains(&line) {
+                let _ = writeln!(err, "{line}");
+            }
             warned.push(unknown.key.clone());
         }
+    }
+}
+
+/// Environment variable that hands the warning lines one `dot update`
+/// invocation already printed to a continuation running as another
+/// process (a release handoff), so each warning still prints once per
+/// invocation. The value is the lines joined by `\n`; a line holding a
+/// newline is left out (it would merely print again). The engine reads it
+/// at entry and never prints a listed line; like the other handoff
+/// variables (the lock claim, `DOT_REEXEC_*`) it is scrubbed from the
+/// environment hooks and providers see and, at the binary entry, from the
+/// process environment. The release handoff builds the value from
+/// [`EngineInputs::warned_handoff`] plus the boundary's prune-policy
+/// warning. Lines are compared as printed, so a continuation whose release
+/// words a warning differently (or knows the key) is unaffected.
+pub const WARNED_ENV: &str = "DOT_UPDATE_WARNED";
+
+/// Parse a [`WARNED_ENV`] value (absent or empty: nothing handed over).
+pub fn handed_warnings(value: Option<&OsStr>) -> BTreeSet<String> {
+    value
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+impl EngineInputs<'_> {
+    /// The [`WARNED_ENV`] value for a continuation process: every unknown
+    /// key, data-file key, and hold warning this invocation has printed so
+    /// far (or was handed).
+    pub fn warned_handoff(&self) -> OsString {
+        warned_value(
+            self.handed_warnings,
+            &self.config_warned.borrow(),
+            &self.data_warned.borrow(),
+            self.hold_warned.get(),
+        )
+    }
+}
+
+/// Encode the printed warnings for [`WARNED_ENV`] (see
+/// [`EngineInputs::warned_handoff`]).
+fn warned_value(
+    handed: &BTreeSet<String>,
+    config_keys: &[String],
+    data_keys: &[crate::unknown_keys::DataKey],
+    held: bool,
+) -> OsString {
+    let mut lines = handed.clone();
+    for key in config_keys {
+        let unknown = crate::config::UnknownKey {
+            key: key.clone(),
+            line: 0,
+        };
+        lines.insert(unknown.warning());
+    }
+    for key in data_keys {
+        lines.insert(key.warning());
+    }
+    if held {
+        lines.insert(HOLD_WARNING.to_string());
+    }
+    let lines: Vec<String> = lines
+        .into_iter()
+        .filter(|line| !line.contains('\n'))
+        .collect();
+    OsString::from(lines.join("\n"))
+}
+
+/// Report keys this release does not know in the profile, selector, and
+/// descriptor files it just read, once per file and key per invocation.
+///
+/// Unlike a mid-run config reload, which stays quiet about keys from a
+/// newer Dot because this run's Tools stage may install one that knows
+/// them, these files act on such keys before Tools runs: a selector stops
+/// matching and an overlay is skipped in this very run. So every run that
+/// reads a key warns, including the one that pulls it. Discovery runs
+/// several times per update, hence the invocation-wide record.
+fn warn_data_keys(
+    inputs: &EngineInputs<'_>,
+    keys: &[crate::unknown_keys::DataKey],
+    err: &mut dyn std::io::Write,
+) {
+    let mut warned = inputs.data_warned.borrow_mut();
+    // One key can warn twice with different effects: a skipped `base`
+    // overlay, then the selection that fell back because of it.
+    for key in keys {
+        if !warned.contains(key) {
+            let line = key.warning();
+            if !inputs.handed_warnings.contains(&line) {
+                let _ = writeln!(err, "{line}");
+            }
+            warned.push(key.clone());
+        }
+    }
+}
+
+/// The one line a held update prints; see "Held overlay sets" in
+/// docs/configuration.md.
+pub const HOLD_WARNING: &str = "dot: overlay: warning: overlay set held: newer keys need a newer dot (installed overlays, links, and config hooks left as they are)";
+
+/// Whether keys this run read leave it unsure which overlays the newer
+/// Dot would activate (see [`crate::unknown_keys::Effect::holds`]).
+fn skew_holds(keys: &[crate::unknown_keys::DataKey]) -> bool {
+    keys.iter().any(|key| key.effect.holds())
+}
+
+/// Hold the installed overlay set: converge nothing about overlays this
+/// run.
+///
+/// Converging to this release's partial reading would deactivate what a
+/// newer Dot keeps: a skipped descriptor drops its overlay, and a skipped
+/// selector (or the unread selectors of a skipped `base` overlay) can
+/// drop the host to `base`, unlinking every other overlay and running
+/// their `profile-deactivate` entry points. A held run instead keeps the
+/// installed links exactly as they are, pulls and activates nothing more,
+/// runs no deactivation or config hooks, and commits no lifecycle change,
+/// but still runs Tools, so the host can install the Dot that knows the
+/// keys and converge on the next run. A fresh host with nothing installed
+/// stays empty: nothing is activated from a selection this release cannot
+/// read. Prune is skipped like any run with such keys.
+fn hold(
+    inputs: &EngineInputs<'_>,
+    mut update: UpdateState,
+    overlay: Agg,
+    err: &mut dyn std::io::Write,
+) -> ConvergeOut {
+    if !inputs.hold_warned.replace(true) && !inputs.handed_warnings.contains(HOLD_WARNING) {
+        let _ = writeln!(err, "{HOLD_WARNING}");
+    }
+    update.held = true;
+    ConvergeOut {
+        rc: 0,
+        state: update,
+        overlay,
     }
 }
 
@@ -367,6 +590,8 @@ struct UpdateState {
     /// Overlay identities from the base-only pass, used to isolate additions.
     /// Descriptor changes do not make an already-pulled overlay an addition.
     phase_one_names: BTreeSet<String>,
+    /// Keys from a newer Dot hold the installed overlay set (see [`hold`]).
+    held: bool,
 }
 
 /// Mutable update streams shared by the sync, converge, and finalize phases.
@@ -438,6 +663,7 @@ impl UpdateState {
             retained: Vec::new(),
             phase_one: Vec::new(),
             phase_one_names: BTreeSet::new(),
+            held: false,
         }
     }
 
@@ -807,6 +1033,24 @@ fn sync_tail(
             state: conv.state,
         };
     }
+    if conv.state.held {
+        // Nothing about the lifecycle changes this run. The base pull may
+        // have restored base paths that installed links shadowed; put the
+        // installed generation back, with no active set to fall back on
+        // (nothing new may be linked).
+        if let (Some(base), Some(snapshot)) = (base, snapshot.as_ref()) {
+            restore_generation(inputs, base, snapshot, &[], io.err);
+        }
+        if close_active {
+            let close = agg.close(stage, "0", inputs.dot_verbose);
+            let _ = io.out.write_all(&close);
+        }
+        return SyncDone {
+            rc: 0,
+            frozen: false,
+            state: conv.state,
+        };
+    }
     // Lifecycle preparation owns the freshly resolved profile state, not the
     // invocation's pre-pull config. Its retained records must be the same
     // values later handed to retirement and commit.
@@ -958,12 +1202,17 @@ fn converge_overlays(
             .write_all(format!("dot: profile: {}\n", error.message).as_bytes());
         return fail(update, overlay);
     }
+    // Definition keys print after selection (`converge_profiles`), which
+    // keeps only those in profiles this host includes.
     if update.profiles.present {
         return converge_profiles(inputs, stage, moves, io, update, overlay, prefetch);
     }
     let mut dstate = crate::overlays::State::default();
-    if discover_active(inputs, &mut dstate, io.err).is_err() {
+    if discover_active(inputs, &mut dstate, io.err, true).is_err() {
         return fail(update, overlay);
+    }
+    if skew_holds(&dstate.unknown_keys) {
+        return hold(inputs, update, overlay, io.err);
     }
     let entries = use_set(&mut dstate, "eligible");
     update.capture(&dstate);
@@ -1032,7 +1281,7 @@ fn converge_overlays(
     let failed = outcome.tally.failed;
     let phase_ok = crate::update::overlay_phase_ok(outcome.rc, Some(&failed.to_string()));
     // Rediscover before returning, even on a failed phase.
-    if discover_active(inputs, &mut dstate, io.err).is_err() {
+    if discover_active(inputs, &mut dstate, io.err, true).is_err() {
         update.active = entries;
         return fail(update, overlay);
     }
@@ -1071,6 +1320,11 @@ fn converge_profiles(
     let mut state = crate::overlays::State::default();
     if discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err).is_err() {
         return fail(update, overlay);
+    }
+    // A skipped `base` overlay already leaves the selection unknown (its
+    // personal selectors go unread), so hold before pulling anything.
+    if skew_holds(&state.unknown_keys) {
+        return hold(inputs, update, overlay, io.err);
     }
     update.phase_one_names = state
         .eligible
@@ -1174,14 +1428,18 @@ fn converge_profiles(
         }
     };
     let phase_refs: Vec<&str> = phase_one_active.iter().map(String::as_str).collect();
-    if let Err(error) = update.profiles.resolve_default(
+    let resolved = update.profiles.resolve_default(
         inputs.config_home,
         inputs.home,
         &phase_refs,
+        &state.unknown_keys,
         &user,
         &host,
         inputs.euid,
-    ) {
+    );
+    // Keys read before a failure still explain the selection.
+    warn_data_keys(inputs, &update.profiles.unknown_keys, io.err);
+    if let Err(error) = resolved {
         let _ = io
             .err
             .write_all(format!("dot: profile: {}\n", error.message).as_bytes());
@@ -1191,6 +1449,9 @@ fn converge_profiles(
     if discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err).is_err() {
         update.active = entries;
         return fail(update, overlay);
+    }
+    if skew_holds(&update.profiles.unknown_keys) || skew_holds(&state.unknown_keys) {
+        return hold(inputs, update, overlay, io.err);
     }
     entries = use_set(&mut state, "eligible");
     update.capture(&state);
@@ -1269,7 +1530,7 @@ fn converge_profiles(
 fn start_prefetch(inputs: &EngineInputs<'_>) -> crate::repos_prefetch::Prefetch {
     let mut state = crate::overlays::State::default();
     let mut discarded = Vec::new();
-    let paths: Vec<String> = if discover_active(inputs, &mut state, &mut discarded).is_ok() {
+    let paths: Vec<String> = if discover_active(inputs, &mut state, &mut discarded, false).is_ok() {
         state
             .active
             .iter()
@@ -1296,10 +1557,13 @@ fn use_set(state: &mut crate::overlays::State, kind: &str) -> Vec<String> {
 }
 
 /// Run `_discover_overlays` natively for the profiles-absent branch.
+/// `report` sends unknown descriptor keys to `err` (the silent prefetch
+/// probe must not consume their one warning).
 fn discover_active(
     inputs: &EngineInputs<'_>,
     state: &mut crate::overlays::State,
     err: &mut dyn std::io::Write,
+    report: bool,
 ) -> Result<(), ()> {
     let xdg_config = if inputs.config_home.is_empty() {
         String::new()
@@ -1327,7 +1591,12 @@ fn discover_active(
         termux: crate::hook_api::is_termux(inputs.prefix),
         host: crate::platform::detect_host().ok(),
     };
-    match crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches) {
+    let result =
+        crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches);
+    if report {
+        warn_data_keys(inputs, &state.unknown_keys, err);
+    }
+    match result {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = err.write_all(format!("{error:?}\n").as_bytes());
@@ -1369,7 +1638,10 @@ fn discover_selected(
         host,
         euid: inputs.euid,
     };
-    match crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches) {
+    let result =
+        crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches);
+    warn_data_keys(inputs, &state.unknown_keys, err);
+    match result {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = err.write_all(format!("{error}\n").as_bytes());
@@ -1501,6 +1773,10 @@ enum PruneSkip {
     NoProvider,
     /// Shdeps could not be prepared, so there is nothing to prune with.
     Unavailable,
+    /// This run met keys it does not know in profile, selector, or
+    /// descriptor files, so the dependency configs it linked may lack
+    /// some a newer Dot would link (see `warn_data_keys`).
+    UnknownKeys,
 }
 
 impl PruneSkip {
@@ -1511,6 +1787,7 @@ impl PruneSkip {
             PruneSkip::Retire => (b"warning", b"profile deactivation failed; prune skipped"),
             PruneSkip::NoProvider => (b"ok", b"no dependency provider"),
             PruneSkip::Unavailable => (b"warning", b"shdeps unavailable; prune skipped"),
+            PruneSkip::UnknownKeys => (b"warning", b"keys from a newer dot; prune skipped"),
         }
     }
 }
@@ -1728,6 +2005,21 @@ fn finalize(
         let _ = io.out.write_all(&close);
         status = 1;
         inputs_ready = false;
+    } else if state.held {
+        // The installed links are the generation to keep (see `hold`).
+        let open = stage.start(
+            b"Overlays",
+            Some(b"preserving installed overlay links"),
+            crate::update_engine::now_secs(),
+            inputs.dot_verbose,
+        );
+        let _ = io.out.write_all(&open);
+        let close = stage.finish(
+            b"warning",
+            b"overlay set held for a newer dot",
+            crate::update_engine::now_secs(),
+        );
+        let _ = io.out.write_all(&close);
     } else {
         let link_inputs = crate::repos_link_all::Inputs {
             entries: &state.active,
@@ -1782,22 +2074,28 @@ fn finalize(
                 verbose: inputs.flags.verbose || crate::log::is_quiet(inputs.dot_verbose),
             },
         );
-        let retired = crate::profile_lifecycle::retire(
-            &crate::profile_lifecycle::RetireInputs {
-                present: state.profiles.present,
-                extensions_enabled: state.extensions_enabled(),
-                retained: &state.retained,
-                eligible: &state.eligible_names,
-                home: inputs.home,
-                euid: inputs.euid,
-                tmpdir: inputs.tmp,
-                verbose: inputs.flags.verbose,
-                log: inputs.log,
-            },
-            &mut worker,
-            io.out,
-            io.err,
-        );
+        // A held run deactivates nothing: the overlays this release would
+        // retire may be exactly the ones the newer Dot keeps.
+        let retired = if state.held {
+            0
+        } else {
+            crate::profile_lifecycle::retire(
+                &crate::profile_lifecycle::RetireInputs {
+                    present: state.profiles.present,
+                    extensions_enabled: state.extensions_enabled(),
+                    retained: &state.retained,
+                    eligible: &state.eligible_names,
+                    home: inputs.home,
+                    euid: inputs.euid,
+                    tmpdir: inputs.tmp,
+                    verbose: inputs.flags.verbose,
+                    log: inputs.log,
+                },
+                &mut worker,
+                io.out,
+                io.err,
+            )
+        };
         if retired != 0 {
             status = 1;
             skip_inputs_rows(
@@ -1911,13 +2209,16 @@ fn finalize(
                         let _ = io.out.write_all(&provider.details);
                         if provider.status != 0 {
                             stages.tools = true;
-                        } else if let Some((before, after)) = provider.revision_change {
+                        }
+                        if let Some(change) = provider.revision_change {
                             if cancelled() {
                                 return 1;
                             }
-                            return provider_reexec(
-                                inputs, io, &before, &after, now_secs, degraded,
-                            );
+                            if let Some(code) =
+                                provider_reexec(inputs, io, &change, now_secs, degraded)
+                            {
+                                return code;
+                            }
                         }
                         // A failed update (a dependency or post hook) still
                         // leaves this generation's config trusted: prune on.
@@ -1933,6 +2234,22 @@ fn finalize(
             }
             if cancelled() {
                 return 1;
+            }
+            // Pruning uninstalls whatever no linked config declares. A run
+            // whose overlay set a key from a newer Dot may have changed (a
+            // skipped overlay, a fallback to `base`, an ignored key in an
+            // included profile) may be missing configs that come back once
+            // Dot upgrades, so it must not remove their packages in between.
+            // A skipped selector that could not have won changed nothing.
+            if prune.is_ok()
+                && (state.held
+                    || inputs
+                        .data_warned
+                        .borrow()
+                        .iter()
+                        .any(|key| key.effect != crate::unknown_keys::Effect::SelectorSkipped))
+            {
+                prune = Err(PruneSkip::UnknownKeys);
             }
             // Prune directly after Tools so it reads the same Shdeps config
             // the provider just converged, before any merge hook runs.
@@ -1951,36 +2268,55 @@ fn finalize(
                 .extensions_dir
                 .as_deref()
                 .unwrap_or(inputs.extensions_dir);
-            let merged = crate::merges::run(
-                &crate::merges::RunInputs {
-                    runtime: inputs.runtime,
-                    update_lock_token: inputs.update_lock_token,
-                    extension_inputs: crate::extension_trust::Inputs {
-                        euid: inputs.euid,
-                        home: inputs.home.to_string(),
-                        extensions_dir: extensions_dir.to_string(),
-                        manifest: inputs.manifest.to_string(),
-                        retiring_root: String::new(),
+            // Config hooks read the active overlay set; a held run's set is
+            // this release's partial reading, not what is installed.
+            let merged = if state.held {
+                let open = stage.start(
+                    b"Configs",
+                    Some(b"skipping config hooks"),
+                    crate::update_engine::now_secs(),
+                    inputs.dot_verbose,
+                );
+                let _ = io.out.write_all(&open);
+                let close = stage.finish(
+                    b"warning",
+                    b"overlay set held; config hooks skipped",
+                    crate::update_engine::now_secs(),
+                );
+                let _ = io.out.write_all(&close);
+                crate::merges::Outcome { status: 0 }
+            } else {
+                crate::merges::run(
+                    &crate::merges::RunInputs {
+                        runtime: inputs.runtime,
+                        update_lock_token: inputs.update_lock_token,
+                        extension_inputs: crate::extension_trust::Inputs {
+                            euid: inputs.euid,
+                            home: inputs.home.to_string(),
+                            extensions_dir: extensions_dir.to_string(),
+                            manifest: inputs.manifest.to_string(),
+                            retiring_root: String::new(),
+                        },
+                        extensions_enabled: crate::config::extensions_enabled(&state.config),
+                        overlays: &state.active,
+                        tmp: inputs.tmp,
+                        update_jobs: inputs.update_jobs,
+                        merge_jobs: inputs.merge_jobs,
+                        verbose: inputs.flags.verbose || crate::log::is_quiet(inputs.dot_verbose),
+                        quiet: quiet(inputs),
+                        force: inputs.flags.force,
+                        palette: inputs.palette,
+                        multibyte: inputs.multibyte,
+                        ascii: inputs.ascii,
+                        ui_total: Some(stage_total(inputs)),
+                        bar_width: inputs.bar_width,
+                        log: inputs.log,
                     },
-                    extensions_enabled: crate::config::extensions_enabled(&state.config),
-                    overlays: &state.active,
-                    tmp: inputs.tmp,
-                    update_jobs: inputs.update_jobs,
-                    merge_jobs: inputs.merge_jobs,
-                    verbose: inputs.flags.verbose || crate::log::is_quiet(inputs.dot_verbose),
-                    quiet: quiet(inputs),
-                    force: inputs.flags.force,
-                    palette: inputs.palette,
-                    multibyte: inputs.multibyte,
-                    ascii: inputs.ascii,
-                    ui_total: Some(stage_total(inputs)),
-                    bar_width: inputs.bar_width,
-                    log: inputs.log,
-                },
-                stage,
-                io.out,
-                io.err,
-            );
+                    stage,
+                    io.out,
+                    io.err,
+                )
+            };
             if merged.status != 0 {
                 status = 1;
             }
@@ -1992,7 +2328,8 @@ fn finalize(
     // A failed Tools stage withholds the lifecycle commit exactly as it did
     // when it set `status` directly; Prune is deliberately not part of this.
     let lifecycle_status = if stages.tools { 1 } else { status };
-    match lifecycle_publish_decision(inputs_ready, lifecycle_status, cancelled()) {
+    // A held run commits no lifecycle change (see `hold`).
+    match lifecycle_publish_decision(inputs_ready && !state.held, lifecycle_status, cancelled()) {
         LifecyclePublish::Interrupted => return 1,
         LifecyclePublish::Skip => {}
         LifecyclePublish::Commit => {
@@ -2099,16 +2436,41 @@ fn finalize(
 
 /// Continue one provider-driven source-generation transition without touching
 /// the process-global environment or reacquiring the already-held update lock.
+///
+/// `Some(status)` ends this run with `status`: a development checkout
+/// continues in a nested in-process run, and a packaged release hands off to
+/// its new binary ([`release_handoff`]). `None` finishes this run in place,
+/// which is the fallback whenever a release cannot be handed off.
 fn provider_reexec(
     inputs: &EngineInputs<'_>,
     io: &mut UpdateIo<'_>,
-    before: &str,
-    after: &str,
+    change: &crate::shdeps_provider::RevisionChange,
     now_secs: i64,
     degraded: &mut crate::update_status::Degraded,
-) -> i32 {
+) -> Option<i32> {
     if cancelled() {
-        return 1;
+        return Some(1);
+    }
+    let (before, after, release) = (
+        change.before.as_str(),
+        change.after.as_str(),
+        change.release,
+    );
+    // `dot init` converges inside its own transaction and an embedded
+    // runtime cannot replace its process: on a release root both finish in
+    // place, exactly as before releases could hand off.
+    if release && !release_hands_off(inputs.caller, inputs.runtime.can_exec()) {
+        return None;
+    }
+    if release && !(crate::shdeps::revision_valid(before) && crate::shdeps::revision_valid(after)) {
+        // Releases never re-executed before, so unreadable metadata must not
+        // turn into a new failure: keep the old finish-in-place behavior.
+        warn_row(
+            io.err,
+            inputs.palette,
+            "  warning: dot changed during the update but its release metadata is unreadable; finishing this update on the running dot",
+        );
+        return None;
     }
     if !crate::shdeps::revision_valid(before) {
         warn_row(
@@ -2125,7 +2487,7 @@ fn provider_reexec(
             &reload_hint(inputs),
         );
         let _ = io.out.write_all(&close);
-        return 1;
+        return Some(1);
     }
     if !crate::shdeps::revision_valid(after) {
         warn_row(
@@ -2142,14 +2504,9 @@ fn provider_reexec(
             &reload_hint(inputs),
         );
         let _ = io.out.write_all(&close);
-        return 1;
+        return Some(1);
     }
-    if inputs
-        .runtime
-        .value("DOT_REEXEC_ONCE")
-        .and_then(OsStr::to_str)
-        == Some("1")
-    {
+    if inputs.continuation {
         let path = crate::shdeps::checkpoint_in(Path::new(inputs.state_home));
         let mut moves = crate::temp::MoveCache::default();
         if crate::shdeps::write_checkpoint(before, after, &path, &mut moves) {
@@ -2174,17 +2531,22 @@ fn provider_reexec(
             &reload_hint(inputs),
         );
         let _ = io.out.write_all(&close);
-        return 1;
+        return Some(1);
     }
-    let mut env = inputs.runtime.env().clone();
-    env.insert(OsString::from("DOT_REEXEC_ONCE"), OsString::from("1"));
-    env.insert(
-        OsString::from("DOT_REEXEC_EXPECTED_REVISION"),
-        OsString::from(after),
-    );
-    let runtime = match crate::app::Runtime::from_env(&env, inputs.runtime.cwd()) {
+    if release {
+        return release_handoff(inputs, io, after, now_secs);
+    }
+    // The nested runtime keeps this run's child environment (no lock claim,
+    // prune policy, or continuation variables: see `CONTINUATION_ENV`),
+    // while the nested capture starts from the command environment so it
+    // keeps the lock claim and flag exports this run was gathered from, plus
+    // the continuation markers it reads as values.
+    let mut env = inputs.env.clone();
+    env.insert(OsString::from(REEXEC_ONCE_ENV), OsString::from("1"));
+    env.insert(OsString::from(REEXEC_EXPECTED_ENV), OsString::from(after));
+    let runtime = match crate::app::Runtime::from_env(inputs.runtime.env(), inputs.runtime.cwd()) {
         Ok(runtime) => runtime,
-        Err(_) => return 1,
+        Err(_) => return Some(1),
     };
     let policy = env_value(&env, "DOT_SHDEPS_UPDATE_POLICY");
     let startup = crate::startup::Inputs {
@@ -2199,17 +2561,17 @@ fn provider_reexec(
         Err(failure) => {
             let _ = io.err.write_all(failure.line().as_bytes());
             let _ = io.err.write_all(b"\n");
-            return 1;
+            return Some(1);
         }
     };
     warn_reloaded_keys(inputs, &config, io.err);
     if cancelled() {
-        return 1;
+        return Some(1);
     }
     // The continuation is the same command with the same prune mode. The
     // mode travels as a value because the runtime environment was scrubbed
     // of `DOT_SHDEPS_PRUNE` at entry.
-    let gathered = match gather(
+    let mut gathered = match gather(
         inputs.caller,
         inputs.prune_mode,
         inputs.original_args,
@@ -2221,7 +2583,7 @@ fn provider_reexec(
         runtime.cwd(),
     ) {
         Ok(gathered) => gathered,
-        _ => return 1,
+        _ => return Some(1),
     };
     // One invocation, one warning per key: the continuation inherits
     // every key reported so far, not only the ones its config holds.
@@ -2229,13 +2591,172 @@ fn provider_reexec(
         .config_warned
         .borrow_mut()
         .extend(inputs.config_warned.borrow().iter().cloned());
+    gathered
+        .data_warned
+        .borrow_mut()
+        .extend(inputs.data_warned.borrow().iter().cloned());
+    gathered.hold_warned.set(inputs.hold_warned.get());
+    gathered
+        .handed_warnings
+        .extend(inputs.handed_warnings.iter().cloned());
     let nested = gathered.inputs();
     if cancelled() {
-        return 1;
+        return Some(1);
     }
     // The continuation records its own cron outcome; handing its degraded
     // stages back lets the outer record match instead of reading `fail`.
-    run_gathered(&nested, &mut *io.out, &mut *io.err, now_secs, degraded)
+    Some(run_gathered(
+        &nested,
+        &mut *io.out,
+        &mut *io.err,
+        now_secs,
+        degraded,
+    ))
+}
+
+/// Hand the rest of this `dot update` to the release binary the Tools stage
+/// just installed: the old engine must not drive the new release's hook
+/// runtime and library files. The binary entry point execs the continuation
+/// after this run unwinds (see [`crate::handoff`]); `Some(0)` ends this half.
+///
+/// The continuation is the same command line under this process's own
+/// environment plus what the command boundary consumed from it (the prune
+/// policy, which the new process parses again) and the handoff contract: the
+/// warning lines already printed ([`WARNED_ENV`], so none prints twice), the
+/// lock claim it re-enters the held lock with, `DOT_REEXEC_ONCE` (a second
+/// Dot change publishes the provider checkpoint instead of handing off
+/// again), and `DOT_REEXEC_EXPECTED_REVISION` (the new binary proves its
+/// identity at startup). Flag exports are not carried: the new process
+/// derives them from the same arguments.
+///
+/// `None` finishes this run in place, as releases always did before: a new
+/// binary that is missing or fails its startup probe must not stop the
+/// update, only warn.
+fn release_handoff(
+    inputs: &EngineInputs<'_>,
+    io: &mut UpdateIo<'_>,
+    after: &str,
+    started: i64,
+) -> Option<i32> {
+    let mut env = inputs.runtime.env().clone();
+    if let Some(prune) = inputs.env.get(OsStr::new(PRUNE_ENV)) {
+        env.insert(OsString::from(PRUNE_ENV), prune.clone());
+    }
+    if let Some(token) = inputs.update_lock_token {
+        env.insert(OsString::from(LOCK_TOKEN_ENV), OsString::from(token));
+    }
+    env.insert(OsString::from(REEXEC_ONCE_ENV), OsString::from("1"));
+    env.insert(OsString::from(REEXEC_EXPECTED_ENV), OsString::from(after));
+    env.insert(
+        OsString::from(REEXEC_STARTED_ENV),
+        OsString::from(started.to_string()),
+    );
+    // Each warning prints once per invocation, across the exec too.
+    env.insert(OsString::from(WARNED_ENV), continuation_warned(inputs));
+    let binary = inputs.source_root_git.join("dot");
+    let probe = probe_release_binary(inputs.runtime, &binary, &env);
+    if cancelled() {
+        return Some(1);
+    }
+    if let Err(problem) = probe {
+        let short = after.get(..12).unwrap_or(after);
+        warn_row(
+            io.err,
+            inputs.palette,
+            &format!(
+                "  warning: dot {short} was installed but {problem}; finishing this update on the running dot"
+            ),
+        );
+        return None;
+    }
+    let mut args = vec![OsString::from("update")];
+    args.extend(inputs.original_args.iter().cloned());
+    let cron_state = inputs.flags.cron.then(|| PathBuf::from(inputs.state_home));
+    let handoff = crate::handoff::Handoff::new(binary, args, env, cron_state);
+    if !inputs.runtime.request_exec(handoff) {
+        return None;
+    }
+    // The continuation's stage counter restarts at 1; say why.
+    if !quiet(inputs) {
+        let short = after.get(..12).unwrap_or(after);
+        let _ = writeln!(
+            io.out,
+            "{}  continuing with dot {short}{}",
+            inputs.palette.dim, inputs.palette.reset
+        );
+    }
+    Some(0)
+}
+
+/// Check that the new release binary can run the continuation before this
+/// process commits to replacing itself; an exec cannot be undone. `dot update
+/// --help` under the continuation's exact environment takes the same startup
+/// path as the continuation (strict release-root resolution, output relay,
+/// re-exec guard, config load, client identity) and returns before the update
+/// lock, so a wrong-platform, truncated, or mismatched binary, or one that
+/// rejects this config, is caught while the old engine can still finish.
+fn probe_release_binary(
+    runtime: &crate::app::Runtime,
+    binary: &Path,
+    env: &BTreeMap<OsString, OsString>,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata =
+        std::fs::symlink_metadata(binary).map_err(|_| "its binary is missing".to_string())?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err("its binary is not an executable file".to_string());
+    }
+    let mut command = std::process::Command::new(binary);
+    command
+        .args(["update", "--help"])
+        .env_clear()
+        .envs(env)
+        .current_dir(runtime.cwd())
+        .stdin(std::process::Stdio::null());
+    let timeout = runtime
+        .value(PROBE_TIMEOUT_ENV)
+        .and_then(OsStr::to_str)
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(
+            crate::cleanup::REVISION_PROBE_TIMEOUT,
+            std::time::Duration::from_secs,
+        );
+    let output = crate::cleanup::run_session_output(
+        command,
+        {
+            // A test knob too large to add keeps the default bound.
+            let now = std::time::Instant::now();
+            Some(
+                now.checked_add(timeout)
+                    .unwrap_or(now + crate::cleanup::REVISION_PROBE_TIMEOUT),
+            )
+        },
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    );
+    let failed = "its binary did not pass its startup check";
+    match output {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            // The new binary's own diagnostic says why (for example a
+            // revision mismatch); keep its first line, safe for a terminal.
+            let line = output
+                .stderr
+                .split(|byte| *byte == b'\n')
+                .next()
+                .unwrap_or_default();
+            let reason = crate::progress_ui::sanitize_untrusted_text(line);
+            let reason = String::from_utf8_lossy(&reason);
+            if reason.is_empty() {
+                Err(failed.to_string())
+            } else {
+                Err(format!("{failed} ({reason})"))
+            }
+        }
+        Err(_) => Err(failed.to_string()),
+    }
 }
 
 fn cancelled() -> bool {
@@ -2315,8 +2836,13 @@ pub struct Gathered {
     caller: Caller,
     prune_mode: PruneMode,
     update_lock_token: Option<String>,
+    env: BTreeMap<OsString, OsString>,
+    continuation: bool,
     config: crate::config::Config,
     config_warned: std::cell::RefCell<Vec<String>>,
+    data_warned: std::cell::RefCell<Vec<crate::unknown_keys::DataKey>>,
+    hold_warned: std::cell::Cell<bool>,
+    handed_warnings: BTreeSet<String>,
     flags: UpdateFlags,
     args: Vec<std::ffi::OsString>,
     extra: Vec<std::ffi::OsString>,
@@ -2359,8 +2885,13 @@ impl Gathered {
             caller: self.caller,
             prune_mode: self.prune_mode,
             update_lock_token: self.update_lock_token.as_deref(),
+            env: &self.env,
+            continuation: self.continuation,
             config: &self.config,
             config_warned: &self.config_warned,
+            data_warned: &self.data_warned,
+            hold_warned: &self.hold_warned,
+            handed_warnings: &self.handed_warnings,
             flags: self.flags,
             original_args: &self.args,
             extra_args: &self.extra,
@@ -2602,7 +3133,9 @@ fn gather(
         runtime: runtime.clone(),
         caller,
         prune_mode,
-        update_lock_token: env_value(env, "DOT_UPDATE_LOCK_TOKEN"),
+        update_lock_token: env_value(env, LOCK_TOKEN_ENV),
+        env: env.clone(),
+        continuation: env_value(env, REEXEC_ONCE_ENV).as_deref() == Some("1"),
         config: config.clone(),
         config_warned: std::cell::RefCell::new(
             config
@@ -2611,6 +3144,9 @@ fn gather(
                 .map(|unknown| unknown.key.clone())
                 .collect(),
         ),
+        data_warned: std::cell::RefCell::new(Vec::new()),
+        hold_warned: std::cell::Cell::new(false),
+        handed_warnings: handed_warnings(env.get(OsStr::new(WARNED_ENV)).map(OsString::as_os_str)),
         flags,
         args: args.to_vec(),
         extra,
@@ -2654,7 +3190,7 @@ fn gather(
         reloads_shell: env_value(env, "DOT_UPDATE_RELOADS_SHELL"),
         shell: env_value(env, "SHELL"),
         shdeps_update_policy: env_value(env, "DOT_SHDEPS_UPDATE_POLICY"),
-        reexec_expected: env_value(env, "DOT_REEXEC_EXPECTED_REVISION"),
+        reexec_expected: env_value(env, REEXEC_EXPECTED_ENV),
     })
 }
 
@@ -2692,18 +3228,52 @@ fn prune_mode(
     match PruneMode::parse(raw.as_deref()) {
         Some(mode) => (mode, scrubbed),
         None => {
-            let value =
-                crate::progress_ui::sanitize_untrusted_text(raw.unwrap_or_default().as_bytes());
-            let mut message = format!("  warning: ignoring {PRUNE_ENV}=").into_bytes();
-            message.extend_from_slice(&value);
-            message.extend_from_slice(b"; expected never, cron, or always");
-            let _ = stderr.write_all(&crate::progress_ui::warn_line(
-                &crate::progress_ui::Palette::empty(),
-                &message,
-            ));
+            let line = invalid_prune_warning(raw.as_deref().unwrap_or_default());
+            // A release continuation inherits the value; its first half
+            // hands the line over once printed.
+            let handed = handed_warnings(
+                request
+                    .env
+                    .get(OsStr::new(WARNED_ENV))
+                    .map(OsString::as_os_str),
+            );
+            if !handed.contains(&line) {
+                let _ = stderr.write_all(&crate::progress_ui::warn_line(
+                    &crate::progress_ui::Palette::empty(),
+                    line.as_bytes(),
+                ));
+            }
             (PruneMode::Never, scrubbed)
         }
     }
+}
+
+/// The warning line (as printed, without its newline) for an unrecognized
+/// [`PRUNE_ENV`] value.
+fn invalid_prune_warning(raw: &str) -> String {
+    let value = crate::progress_ui::sanitize_untrusted_text(raw.as_bytes());
+    format!(
+        "  warning: ignoring {PRUNE_ENV}={}; expected never, cron, or always",
+        String::from_utf8_lossy(&value)
+    )
+}
+
+/// The [`WARNED_ENV`] value a release continuation receives: every warning
+/// this invocation printed so far ([`EngineInputs::warned_handoff`]) plus the
+/// invalid prune-policy warning, which the command boundary prints before the
+/// engine and which the continuation would otherwise repeat.
+fn continuation_warned(inputs: &EngineInputs<'_>) -> OsString {
+    let mut lines = handed_warnings(Some(&inputs.warned_handoff()));
+    if inputs.caller == Caller::Update {
+        if let Some(raw) = inputs.env.get(OsStr::new(PRUNE_ENV)) {
+            let raw = raw.to_string_lossy();
+            if PruneMode::parse(Some(&raw)).is_none() {
+                lines.insert(invalid_prune_warning(&raw));
+            }
+        }
+    }
+    // `handed_warnings` already dropped empty lines; none hold a newline.
+    OsString::from(lines.into_iter().collect::<Vec<_>>().join("\n"))
 }
 
 /// Execute one native update through the typed runtime and stream boundary.
@@ -2716,8 +3286,25 @@ pub fn run_update(
         Some(state_home) => state_home,
         None => return 1,
     };
-    let (prune_mode, runtime) = prune_mode(runtime, request, streams.stderr);
+    let continuation = is_continuation(runtime);
+    let (prune_mode, mut runtime) = prune_mode(runtime, request, streams.stderr);
+    // The lock claim reaches hook workers explicitly, and a continuation
+    // reads its markers from the command environment. A release
+    // continuation inherits all of them in its process environment, so keep
+    // them out of what providers and hooks inherit, like any other run.
+    // `CONTINUATION_ENV` includes the handed-over warnings, which concern
+    // this engine only.
+    for key in CONTINUATION_ENV {
+        runtime = runtime.without_env(key);
+    }
     let runtime = &runtime;
+    // A release continuation's run started with its first half.
+    let started = continuation
+        .then(|| env_value(request.env, REEXEC_STARTED_ENV))
+        .flatten()
+        .and_then(|epoch| epoch.parse::<i64>().ok())
+        .filter(|epoch| *epoch > 0 && *epoch <= now_secs())
+        .unwrap_or_else(now_secs);
     let gathered = match gather(
         request.caller,
         prune_mode,
@@ -2732,6 +3319,7 @@ pub fn run_update(
         Ok(gathered) => gathered,
         Err(error) => {
             error.write(streams.stderr);
+            record_continuation_failure(continuation, request.args, request.state_home);
             return error.code();
         }
     };
@@ -2751,7 +3339,7 @@ pub fn run_update(
         &gathered.inputs(),
         &mut out,
         &mut err,
-        now_secs(),
+        started,
         &mut degraded,
     );
     if out.failed() || err.failed() {
@@ -2828,7 +3416,10 @@ fn run_gathered(
         return 0;
     }
     let rc = run_gathered_inner(inputs, out, err, now_secs, degraded);
-    if cancelled() {
+    // A release handoff ends this half before the run's outcome is known;
+    // the exec'd continuation records the run (or the handoff records its
+    // failure when it cannot exec), so this half records nothing.
+    if cancelled() || inputs.runtime.exec_pending() {
         return rc;
     }
     use crate::update_status::{OUTCOME_DEGRADED, OUTCOME_FAIL, OUTCOME_OK};
@@ -3047,6 +3638,97 @@ fn quarantine_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warned_value_round_trips_every_printed_warning() {
+        let data = crate::unknown_keys::DataKey {
+            path: "/h/.config/dot/overlays.d/20-beta.conf".to_string(),
+            line: 2,
+            key: "future_key".to_string(),
+            effect: crate::unknown_keys::Effect::OverlaySkipped("beta".to_string()),
+        };
+        let handed: BTreeSet<String> = ["earlier line".to_string()].into();
+        let value = warned_value(
+            &handed,
+            &["future_key".to_string()],
+            std::slice::from_ref(&data),
+            true,
+        );
+        let parsed = handed_warnings(Some(&value));
+        let expected: BTreeSet<String> = [
+            "earlier line".to_string(),
+            "dot: config: warning: unknown key 'future_key' ignored (newer dot?)".to_string(),
+            data.warning(),
+            HOLD_WARNING.to_string(),
+        ]
+        .into();
+        assert_eq!(parsed, expected);
+        assert!(handed_warnings(None).is_empty());
+        assert!(handed_warnings(Some(OsStr::new(""))).is_empty());
+        let odd: BTreeSet<String> = ["a\nb".to_string()].into();
+        assert!(handed_warnings(Some(&warned_value(&odd, &[], &[], false))).is_empty());
+    }
+
+    #[test]
+    fn a_continuation_warns_an_invalid_prune_policy_nobody_handed_over() {
+        // Only a handed line is skipped; being a continuation is not enough.
+        let request_env = |handed: Option<&str>| {
+            let mut env = BTreeMap::from([
+                (OsString::from("HOME"), OsString::from("/tmp")),
+                (OsString::from(REEXEC_ONCE_ENV), OsString::from("1")),
+                (OsString::from(PRUNE_ENV), OsString::from("weekly")),
+            ]);
+            if let Some(line) = handed {
+                env.insert(OsString::from(WARNED_ENV), OsString::from(line));
+            }
+            env
+        };
+        let config = crate::config::Config {
+            version: 1,
+            extension_api: false,
+            extensions_dir: None,
+            provider: crate::config::Provider::None,
+            default_profile: "base".to_string(),
+            shdeps_update_policy: crate::config::UpdatePolicy::Pinned,
+            policy_from_env: false,
+            unknown_keys: Vec::new(),
+        };
+        let line = invalid_prune_warning("weekly");
+        for (handed, expected) in [
+            (None, format!("{line}\n")),
+            (Some(line.as_str()), String::new()),
+        ] {
+            let env = request_env(handed);
+            let runtime =
+                crate::app::Runtime::from_env(&env, Path::new("/tmp")).expect("absolute cwd");
+            let request = UpdateRequest {
+                caller: Caller::Update,
+                config: &config,
+                env: &env,
+                args: &[],
+                state_home: Path::new("/tmp"),
+            };
+            let mut stderr = Vec::new();
+            let (mode, _) = prune_mode(&runtime, &request, &mut stderr);
+            assert_eq!(mode, PruneMode::Never);
+            assert_eq!(
+                String::from_utf8_lossy(&stderr),
+                expected,
+                "handed {handed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_update_from_the_binary_entry_hands_a_release_off() {
+        assert!(release_hands_off(Caller::Update, true));
+        // `dot init` finishes in place even where the process could exec:
+        // its transaction owns the run, and a handoff would exec `dot
+        // update` after init returned.
+        assert!(!release_hands_off(Caller::Init, true));
+        assert!(!release_hands_off(Caller::Update, false));
+        assert!(!release_hands_off(Caller::Init, false));
+    }
 
     struct FailingWriter;
 

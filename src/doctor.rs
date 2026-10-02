@@ -227,6 +227,9 @@ fn run_configured(
             included_profiles: profiles.included.clone(),
             phase_one: overlays.phase_one_selected.clone(),
             selectors: profiles.selector_records.clone(),
+            unknown_keys: crate::overlays::unknown_keys(&overlays, &profiles)
+                .cloned()
+                .collect(),
             lifecycle: LifecycleInputs {
                 profiles_present: profiles.present,
                 load_ok: lifecycle_ok,

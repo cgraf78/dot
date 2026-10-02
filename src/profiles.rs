@@ -12,6 +12,19 @@
 //! shell): only validated-ASCII names, keys, and values ever become
 //! `String`.
 //!
+//! Forward compatibility: definitions and selectors travel through the
+//! client and overlay repositories, which update independently of the Dot
+//! release reading them, so a well-formed key this release does not know
+//! must not fail the run (see [`crate::unknown_keys`]). A definition
+//! ignores it; a selector holding one never matches, because the key is
+//! most likely one more match condition and ignoring it could select a
+//! profile on hosts the newer Dot would not, and when such a selector
+//! could have won, selection falls back to `base` (see
+//! [`State::choose_selector`]). A near miss of a known key still fails as
+//! a typo, and every known rule, including `version`, stays strict. Both
+//! files are read after the base pull, so a failure never stops a host
+//! from pulling the fix.
+//!
 //! Two deliberate determinism choices where the shell is vague:
 //! profiles validate in byte-sorted filename order (the shell glob
 //! order is locale-collated; tests pin `LC_ALL=C`), and the
@@ -22,6 +35,14 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
+
+use crate::unknown_keys::{DataKey, Effect};
+
+/// Every key a profile definition understands.
+pub const DEFINITION_KEYS: [&str; 3] = ["version", "profiles", "overlays"];
+
+/// Every key a selector understands.
+pub const SELECTOR_KEYS: [&str; 4] = ["version", "user", "host", "profile"];
 
 /// Profile failure: the shell `_dot_profile_error` (always exit 1)
 /// records `DOT_PROFILE_CONFIGURATION_ERROR` and prints
@@ -71,6 +92,9 @@ pub struct Selector {
     pub host: String,
     /// Required profile name.
     pub profile: String,
+    /// Keys this release does not know; any entry keeps the selector from
+    /// matching (see the module docs).
+    pub unknown_keys: Vec<DataKey>,
 }
 
 /// Loaded profile state (the shell `DOT_PROFILE_*` / `SELECTED_*` /
@@ -99,6 +123,9 @@ pub struct State {
     pub selector_records: Vec<String>,
     /// Last `DOT_PROFILE_CONFIGURATION_ERROR`.
     pub config_error: Option<String>,
+    /// Keys the loaded definitions and the last resolved selectors hold
+    /// that this release does not know, one entry per file and key.
+    pub unknown_keys: Vec<DataKey>,
     /// `DOT_DEFAULT_PROFILE` captured at load time (`base` default).
     default_profile: String,
     parents: HashMap<String, String>,
@@ -106,6 +133,24 @@ pub struct State {
     names: HashSet<String>,
     expansion: HashMap<String, Expansion>,
     candidates: Vec<(u64, String)>,
+    /// Skipped selectors whose known `user`/`host` match this identity:
+    /// specificity, profile, and file.
+    skipped: Vec<(u64, String, String)>,
+}
+
+/// Selection state when a skipped selector could have chosen the profile
+/// (see [`State::choose_selector`]).
+pub const SELECTOR_FALLBACK_STATE: &str = "skipped-selector";
+
+/// How [`State::choose_selector`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// A matching selector chose the profile.
+    Matched,
+    /// No selector matched; the default profile applies.
+    Unmatched,
+    /// A skipped selector could have chosen; `base` applies.
+    Fallback,
 }
 
 /// Include-expansion marker per profile.
@@ -128,12 +173,14 @@ impl Default for State {
             selector_matches: Vec::new(),
             selector_records: Vec::new(),
             config_error: None,
+            unknown_keys: Vec::new(),
             default_profile: "base".to_string(),
             parents: HashMap::new(),
             overlays: HashMap::new(),
             names: HashSet::new(),
             expansion: HashMap::new(),
             candidates: Vec::new(),
+            skipped: Vec::new(),
         }
     }
 }
@@ -367,6 +414,38 @@ pub struct Definition {
     pub parents: String,
     /// Raw `overlays=` value (possibly empty).
     pub overlays: String,
+    /// Keys this release does not know and ignored.
+    pub unknown_keys: Vec<DataKey>,
+}
+
+/// Classify a key `known` does not list: a near miss of a known key fails
+/// as a typo, anything else is recorded with `effect` for the caller to
+/// report. `key` passed [`key_valid`], so it is printable ASCII.
+fn unknown_key(
+    path: &Path,
+    number: usize,
+    key: &[u8],
+    known: &[&'static str],
+    effect: Effect,
+    keys: &mut Vec<DataKey>,
+) -> Result<(), Error> {
+    let key = String::from_utf8_lossy(key).into_owned();
+    if let Some(intended) = crate::unknown_keys::suggestion(&key, known) {
+        return Err(Error::named(format!(
+            "{}: unknown key: {key} (did you mean '{intended}'?)",
+            path.display()
+        )));
+    }
+    crate::unknown_keys::record(
+        keys,
+        DataKey {
+            path: path.display().to_string(),
+            line: number,
+            key,
+            effect,
+        },
+    );
+    Ok(())
 }
 
 /// `_dot_profile_parse_definition`: validate one `.conf` file.
@@ -378,9 +457,10 @@ pub fn parse_definition(path: &Path, bytes: &[u8]) -> Result<Definition, Error> 
     let mut saw_setting = false;
     let mut parents = String::new();
     let mut overlays = String::new();
+    let mut unknown_keys = Vec::new();
     let settings = setting_lines(bytes)
         .map_err(|(number, failure)| Error::named(setting_message(path, number, failure)))?;
-    for (_number, key, value) in settings {
+    for (number, key, value) in settings {
         if !saw_setting && key != b"version" {
             return Err(Error::named(format!(
                 "{}: version=1 must be the first setting",
@@ -438,13 +518,16 @@ pub fn parse_definition(path: &Path, bytes: &[u8]) -> Result<Definition, Error> 
                 }
                 overlays = String::from_utf8_lossy(value).into_owned();
             }
-            _ => {
-                return Err(Error::named(format!(
-                    "{}: unknown key: {}",
-                    path.display(),
-                    String::from_utf8_lossy(key)
-                )));
-            }
+            // Definitions only add members, so missing a newer key can at
+            // worst select fewer overlays: ignore it.
+            _ => unknown_key(
+                path,
+                number,
+                key,
+                &DEFINITION_KEYS,
+                Effect::Ignored,
+                &mut unknown_keys,
+            )?,
         }
     }
     if !seen_version {
@@ -460,7 +543,11 @@ pub fn parse_definition(path: &Path, bytes: &[u8]) -> Result<Definition, Error> 
         )));
     }
     // Values passed every ASCII gate above, so lossy text is exact.
-    Ok(Definition { parents, overlays })
+    Ok(Definition {
+        parents,
+        overlays,
+        unknown_keys,
+    })
 }
 
 /// Read + gate a definition file, like the top of
@@ -475,6 +562,9 @@ pub fn load_definition(path: &Path) -> Result<Definition, Error> {
 impl State {
     /// Store one parsed definition under `name`.
     fn insert(&mut self, name: &str, definition: Definition) {
+        for key in definition.unknown_keys {
+            crate::unknown_keys::record(&mut self.unknown_keys, key);
+        }
         if !definition.parents.is_empty() {
             self.parents.insert(name.to_string(), definition.parents);
         }
@@ -678,12 +768,12 @@ impl State {
         let mut user = String::new();
         let mut host = String::new();
         let mut profile = String::new();
+        let mut unknown_keys = Vec::new();
         let fail =
             |number: usize, what: &str| Error::named(format!("{}:{number} {what}", path.display()));
         let settings = setting_lines(bytes)
             .map_err(|(number, failure)| Error::named(setting_message(path, number, failure)))?;
         for (number, key, value) in settings {
-            let _ = number;
             if !saw_setting && key != b"version" {
                 return Err(Error::named(format!(
                     "{}: version=1 must be the first setting",
@@ -749,13 +839,17 @@ impl State {
                     }
                     profile = String::from_utf8_lossy(value).into_owned();
                 }
-                _ => {
-                    return Err(Error::named(format!(
-                        "{}: unknown key: {}",
-                        path.display(),
-                        String::from_utf8_lossy(key)
-                    )));
-                }
+                // Most likely one more match condition from a newer Dot:
+                // the selector parses (so its known fields stay checked)
+                // but never matches.
+                _ => unknown_key(
+                    path,
+                    number,
+                    key,
+                    &SELECTOR_KEYS,
+                    Effect::SelectorSkipped,
+                    &mut unknown_keys,
+                )?,
             }
         }
         if !seen_version {
@@ -767,7 +861,13 @@ impl State {
         if !seen_profile {
             return Err(Error::named(format!("{}: missing profile", path.display())));
         }
-        if class != SelectorClass::Root && user.is_empty() && host.is_empty() {
+        // A newer key may itself identify the host; the selector never
+        // matches here anyway, so do not fail the run over it.
+        if class != SelectorClass::Root
+            && user.is_empty()
+            && host.is_empty()
+            && unknown_keys.is_empty()
+        {
             return Err(Error::named(format!(
                 "{}: non-root selector requires user or host",
                 path.display()
@@ -783,6 +883,7 @@ impl State {
             user,
             host,
             profile,
+            unknown_keys,
         })
     }
 
@@ -845,8 +946,9 @@ impl State {
                 return Err(self.fail(message));
             }
             let selector = self.load_selector(&file, class, euid)?;
-            let matched = (selector.user.is_empty() || selector.user == self.current_user)
+            let identity = (selector.user.is_empty() || selector.user == self.current_user)
                 && (selector.host.is_empty() || selector.host == self.current_host);
+            let matched = identity && selector.unknown_keys.is_empty();
             let short = String::from_utf8_lossy(&raw).into_owned();
             self.selector_records.push(format!(
                 "{class_name}|{}|{}|{}|{}|{matched}",
@@ -855,17 +957,24 @@ impl State {
                 selector.host,
                 selector.profile
             ));
+            // A selector for another user or host changes nothing here
+            // whatever its unknown condition says, so it stays quiet.
+            if identity {
+                for key in &selector.unknown_keys {
+                    crate::unknown_keys::record(&mut self.unknown_keys, key.clone());
+                }
+            }
+            let specificity =
+                u64::from(!selector.user.is_empty()) + u64::from(!selector.host.is_empty());
             if matched {
                 self.selector_matches
                     .push(format!("{class_name}:{short}:{}", selector.profile));
-                let mut specificity = 0;
-                if !selector.user.is_empty() {
-                    specificity += 1;
-                }
-                if !selector.host.is_empty() {
-                    specificity += 1;
-                }
                 self.candidates.push((specificity, selector.profile));
+            } else if identity {
+                // Its unknown condition might hold here: keep it so the
+                // choice can tell whether it could have won.
+                self.skipped
+                    .push((specificity, selector.profile, file.display().to_string()));
             }
         }
         Ok(())
@@ -873,31 +982,96 @@ impl State {
 
     /// `_dot_profile_choose_selector`: most specific match wins; two
     /// different profiles at the top specificity conflict.
-    pub fn choose_selector(&mut self) -> Result<(), Error> {
+    ///
+    /// A skipped selector (one holding a key this release does not know)
+    /// whose known fields match could have won if it is at least as
+    /// specific as every match. If one such selector names a profile other
+    /// than the one selection otherwise lands on (the top match, or the
+    /// default when nothing matched), or would have settled a tie, the
+    /// choice falls back to `base`, the profile phase one already applies
+    /// on every host. Falling through to a less specific selector or the
+    /// default instead could select more overlays than the newer Dot would
+    /// (a skipped selector is often the one narrowing a shared host), or
+    /// revive a tie that the skipped selector settled. A skipped selector
+    /// that agrees, or ranks below a match, changes nothing.
+    ///
+    /// Ranking a skipped selector by its known fields alone is exact as
+    /// long as new selector keys never count toward specificity, which
+    /// the key rules in docs/configuration.md require.
+    pub fn choose_selector(&mut self) -> Result<Choice, Error> {
         self.selected.clear();
-        let top = self
-            .candidates
-            .iter()
-            .map(|(score, _)| *score)
-            .max()
-            .unwrap_or(0);
-        for (score, profile) in self.candidates.clone() {
-            if score != top {
+        let known_top = self.candidates.iter().map(|(score, _)| *score).max();
+        let mut chosen: Option<String> = None;
+        let mut tie: Option<String> = None;
+        for (score, profile) in &self.candidates {
+            if Some(*score) != known_top {
                 continue;
             }
-            if self.selected.is_empty() {
-                self.selected = profile;
-            } else if self.selected != profile {
-                // The shell publishes `conflict` before failing.
-                self.selection_state = "conflict".to_string();
-                let message = format!(
-                    "equally specific selectors choose {} and {profile}",
-                    self.selected
-                );
-                return Err(self.fail(message));
+            match &chosen {
+                None => chosen = Some(profile.clone()),
+                Some(first) if first != profile => {
+                    tie = Some(profile.clone());
+                    break;
+                }
+                Some(_) => {}
             }
         }
-        Ok(())
+        // `None` orders below every specificity, so with no match every
+        // skipped selector could have won.
+        let above = |score: u64| Some(score) > known_top;
+        if let Some(other) = tie {
+            // A more specific skipped selector might have settled it; a
+            // tie at the top among known selectors is a genuine conflict
+            // the newer Dot reports too.
+            if self.skipped.iter().any(|(score, ..)| above(*score)) {
+                return Ok(self.fall_back(|score, _| above(score)));
+            }
+            let first = chosen.unwrap_or_default();
+            self.selected = first.clone();
+            // The shell publishes `conflict` before failing.
+            self.selection_state = "conflict".to_string();
+            let message = format!("equally specific selectors choose {first} and {other}");
+            return Err(self.fail(message));
+        }
+        let landing = chosen
+            .clone()
+            .unwrap_or_else(|| self.default_profile.clone());
+        let could_change = |score: u64, profile: &str| {
+            (above(score) || Some(score) == known_top) && profile != landing
+        };
+        if self
+            .skipped
+            .iter()
+            .any(|(score, profile, _)| could_change(*score, profile))
+        {
+            return Ok(self.fall_back(could_change));
+        }
+        match chosen {
+            Some(profile) => {
+                self.selected = profile;
+                Ok(Choice::Matched)
+            }
+            None => Ok(Choice::Unmatched),
+        }
+    }
+
+    /// Select `base` for [`State::choose_selector`] and mark the keys of
+    /// the skipped selectors that `could_win` as the cause.
+    fn fall_back(&mut self, could_win: impl Fn(u64, &str) -> bool) -> Choice {
+        let causes: Vec<String> = self
+            .skipped
+            .iter()
+            .filter(|(score, profile, _)| could_win(*score, profile))
+            .map(|(_, _, path)| path.clone())
+            .collect();
+        for key in &mut self.unknown_keys {
+            if key.effect == Effect::SelectorSkipped && causes.contains(&key.path) {
+                key.effect = Effect::SelectorFallback;
+            }
+        }
+        self.selected = "base".to_string();
+        self.selection_state = SELECTOR_FALLBACK_STATE.to_string();
+        Choice::Fallback
     }
 
     /// `_dot_profile_resolve` with the identity already determined
@@ -908,6 +1082,23 @@ impl State {
         root: &Path,
         local: &Path,
         personals: &[&Path],
+        user: &str,
+        host: &str,
+        euid: u32,
+    ) -> Result<(), Error> {
+        self.resolve_reading(root, local, personals, &[], user, host, euid)
+    }
+
+    /// [`State::resolve_with`] where `unread` lists the keys that kept
+    /// phase-one overlays from activating (their personal selectors went
+    /// unread; see [`State::resolve_default`]).
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_reading(
+        &mut self,
+        root: &Path,
+        local: &Path,
+        personals: &[&Path],
+        unread: &[DataKey],
         user: &str,
         host: &str,
         euid: u32,
@@ -929,20 +1120,56 @@ impl State {
         self.selection_state = "implicit-default".to_string();
         self.selector_matches.clear();
         self.selector_records.clear();
+        self.clear_selector_keys();
         self.candidates.clear();
+        self.skipped.clear();
         self.read_selector_dir(SelectorClass::Root, "root", root, euid)?;
         self.read_selector_dir(SelectorClass::Local, "local", local, euid)?;
         for personal in personals {
             self.read_selector_dir(SelectorClass::Personal, "personal", personal, euid)?;
         }
-        self.choose_selector()?;
-        if self.selected.is_empty() {
-            self.selected = self.default_profile_fallback().to_string();
-        } else {
-            self.selection_state = "agreed-match".to_string();
+        // A skipped `base` overlay may hold personal selectors the newer
+        // Dot reads, and they could outrank every selector read here, so
+        // it counts as a skipped selector above them all. (An overlay that
+        // is merely unavailable is unavailable to the newer Dot as well.)
+        for key in unread {
+            if let Effect::OverlaySkipped(name) = &key.effect {
+                self.skipped
+                    .push((u64::MAX, String::new(), key.path.clone()));
+                crate::unknown_keys::record(
+                    &mut self.unknown_keys,
+                    DataKey {
+                        effect: Effect::SelectorsUnread(name.clone()),
+                        ..key.clone()
+                    },
+                );
+            }
+        }
+        match self.choose_selector()? {
+            Choice::Unmatched => self.selected = self.default_profile_fallback().to_string(),
+            Choice::Matched => self.selection_state = "agreed-match".to_string(),
+            Choice::Fallback => {}
         }
         let selected = self.selected.clone();
-        self.flatten(&selected)
+        self.flatten(&selected)?;
+        // A key in a profile this host does not include changes nothing
+        // here; keep only the ones that shaped this selection.
+        let included = self.included.clone();
+        self.unknown_keys.retain(|key| {
+            key.effect != Effect::Ignored
+                || Path::new(&key.path)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|name| included.iter().any(|profile| profile == name))
+        });
+        Ok(())
+    }
+
+    /// Forget selector keys with the selector records they belong to;
+    /// definition keys stay until a resolution narrows them to the
+    /// included profiles or the next [`State::load`] replaces them.
+    fn clear_selector_keys(&mut self) {
+        self.unknown_keys.retain(|key| !key.effect.is_selector());
     }
 
     /// Default profile captured at load time (shell
@@ -982,6 +1209,7 @@ impl State {
         self.selection_state = "phase-one".to_string();
         self.selector_matches.clear();
         self.selector_records.clear();
+        self.clear_selector_keys();
         self.flatten("base")
     }
 }
@@ -991,13 +1219,16 @@ impl State {
 impl State {
     /// `_dot_profile_resolve_default`: XDG selector roots plus one
     /// personal directory per active overlay whose ancestry is
-    /// owned, then [`State::resolve_with`].
+    /// owned, then [`State::resolve_with`]. `skipped_overlays` holds the
+    /// keys phase-one discovery skipped overlays for: their personal
+    /// selectors cannot be read, so selection falls back to `base`.
     #[allow(clippy::too_many_arguments)]
     pub fn resolve_default(
         &mut self,
         xdg_config: &str,
         home: &str,
         overlay_entries: &[&str],
+        skipped_overlays: &[DataKey],
         user: &str,
         host: &str,
         euid: u32,
@@ -1048,7 +1279,15 @@ impl State {
             personals.push(selector_path.to_path_buf());
         }
         let personal_refs: Vec<&Path> = personals.iter().map(PathBuf::as_path).collect();
-        self.resolve_with(&root, &local, &personal_refs, user, host, euid)
+        self.resolve_reading(
+            &root,
+            &local,
+            &personal_refs,
+            skipped_overlays,
+            user,
+            host,
+            euid,
+        )
     }
 }
 

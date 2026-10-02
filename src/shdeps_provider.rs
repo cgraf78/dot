@@ -39,7 +39,19 @@ pub(crate) struct Outcome {
     pub(crate) stage_status: Vec<u8>,
     pub(crate) summary: Vec<u8>,
     pub(crate) details: Vec<u8>,
-    pub(crate) revision_change: Option<(String, String)>,
+    pub(crate) revision_change: Option<RevisionChange>,
+}
+
+/// The Dot generation a provider update moved the source root to.
+pub(crate) struct RevisionChange {
+    /// Installed revision before the provider ran.
+    pub(crate) before: String,
+    /// Installed revision after it.
+    pub(crate) after: String,
+    /// Whether the source root was a packaged release before the provider
+    /// ran. Sampled up front so a release whose metadata the provider broke
+    /// still takes the release path (finish in place), not the checkout one.
+    pub(crate) release: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1484,7 +1496,8 @@ fn run_update(
     live_err: &mut dyn std::io::Write,
     beat: &mut crate::progress_ui::Heartbeat,
 ) -> Outcome {
-    let before = crate::shdeps::active_revision(inputs.source_root);
+    let release = crate::startup::is_release_root(inputs.source_root);
+    let before = crate::shdeps::layout_revision(inputs.source_root, release);
     let mut env = provider_env(inputs, ready);
     set(&mut env, "SHDEPS_PROGRESS", "jsonl");
     let mut prompt = prompt_pipe(inputs.runtime);
@@ -1847,8 +1860,17 @@ fn run_update(
         state.summaries(),
         state.items(),
     );
-    let after = crate::shdeps::active_revision(inputs.source_root);
-    let revision_change = (status == 0 && before != after).then_some((before, after));
+    let after = crate::shdeps::layout_revision(inputs.source_root, release);
+    // A checkout continues only after a clean provider run (unchanged). A
+    // packaged release reports its upgrade even when another dependency
+    // failed: Shdeps swaps the release root atomically, so a changed root is
+    // a complete new release, and the old engine must not finish against it.
+    let changed = before != after && (status == 0 || release);
+    let revision_change = changed.then_some(RevisionChange {
+        before,
+        after,
+        release,
+    });
     if status == 0 {
         Outcome {
             status,
@@ -1871,7 +1893,7 @@ fn run_update(
                 session.summary
             },
             details,
-            revision_change: None,
+            revision_change,
         }
     }
 }
