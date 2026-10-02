@@ -565,11 +565,21 @@ pub(crate) fn check_reexec(runtime: &crate::app::Runtime) -> Result<(), Failure>
 /// accepts any observation without one, so every ordinary command (and
 /// `help`/`version`) would otherwise pay a Git child whose answer is
 /// discarded.
+///
+/// A packaged release observes its install metadata, and only when that
+/// metadata names the commit compiled into this executable: the provider
+/// hands an upgraded release off to its new binary, and this is where that
+/// binary proves it is the generation the handoff expected. Git is never
+/// asked there, because it would answer for an enclosing repository.
 fn guard_reexec(expected: Option<&str>, source_root: &Path) -> Result<(), String> {
     if expected.is_none_or(str::is_empty) {
         return check_reexec_revision(expected, None);
     }
-    let observed = observed_revision(source_root);
+    let observed = if is_release_root(source_root) {
+        release_revision(source_root)
+    } else {
+        observed_revision(source_root)
+    };
     check_reexec_revision(expected, observed.as_deref())
 }
 

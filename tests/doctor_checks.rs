@@ -965,6 +965,7 @@ fn overlays<'a>(
         included_profiles: vec![],
         phase_one: vec![],
         selectors: vec![],
+        unknown_keys: vec![],
         lifecycle: LifecycleInputs {
             profiles_present: present,
             load_ok: true,
@@ -1067,6 +1068,129 @@ fn overlays_discovery_lifecycle_local_and_sync_matrix() {
 }
 
 #[test]
+fn overlays_report_keys_from_a_newer_dot_as_warnings() {
+    // Doctor shows every key a newer Dot introduced, and what it cost,
+    // as a warning row instead of a stderr line.
+    use dot::unknown_keys::{DataKey, Effect};
+    let scratch = TempDir::new("doctor-overlays-newer").expect("scratch");
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let key = |path: &str, line: usize, effect: Effect| DataKey {
+        path: path.to_string(),
+        line,
+        key: "future_key".to_string(),
+        effect,
+    };
+    let mut input = overlays(manifest.clone(), None, true);
+    input.configured_count = 1;
+    input.unknown_keys = vec![
+        key(
+            "/home/test/.config/dot/profiles.d/base.conf",
+            3,
+            Effect::Ignored,
+        ),
+        key(
+            "/home/test/.config/dot/profile-selectors.d/10-host.conf",
+            4,
+            Effect::SelectorSkipped,
+        ),
+        key(
+            "/home/test/.config/dot/profile-selectors.d/20-shared.conf",
+            2,
+            Effect::SelectorFallback,
+        ),
+        // The descriptor names its overlay the legacy way (`beta.local`);
+        // the lifecycle record, matched by file, says `beta`.
+        key(
+            "/home/test/.config/dot/overlays.d/20-beta.local.conf",
+            2,
+            Effect::OverlaySkipped("beta.local".to_string()),
+        ),
+        key(
+            "/home/test/.config/dot/overlays.d/10-personal.conf",
+            5,
+            Effect::SelectorsUnread("personal".to_string()),
+        ),
+    ];
+    input.overlay_lifecycle = vec![
+        "beta|selected-unsupported|/home/test/.config/dot/overlays.d/20-beta.local.conf".into(),
+    ];
+    let records = check_overlays(&input);
+    let output = render(&records);
+    for expected in [
+        "unknown profile key ignored\n    ~/.config/dot/profiles.d/base.conf:3 future_key (newer dot?)",
+        "selector skipped: unknown key\n    ~/.config/dot/profile-selectors.d/10-host.conf:4 future_key (newer dot?)",
+        "selector skipped: unknown key; profile base selected\n    ~/.config/dot/profile-selectors.d/20-shared.conf:2 future_key (newer dot?)",
+        "beta: selected but skipped: unknown descriptor key\n    ~/.config/dot/overlays.d/20-beta.local.conf:2 future_key (newer dot?)",
+        "personal selectors unread: overlay skipped; profile base selected\n    ~/.config/dot/overlays.d/10-personal.conf:5 future_key (newer dot?)",
+        // `dot update` holds the installed set, so the links are not judged
+        // against this reading.
+        "overlay set held: newer keys need a newer dot",
+        "overlay symlinks not checked while the overlay set is held",
+    ] {
+        assert!(
+            output.contains(expected),
+            "missing {expected:?} in {output}"
+        );
+    }
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.kind == dot::doctor_runtime::Kind::Warn)
+            .count(),
+        6,
+        "{output}"
+    );
+
+    // Legacy discovery does not count a skipped `sync=none` descriptor as
+    // configured; its row must still appear.
+    let mut legacy = overlays(manifest, None, false);
+    legacy.unknown_keys = vec![key(
+        "/home/test/.config/dot/overlays.d/10-local.local.conf",
+        3,
+        Effect::OverlaySkipped("local".to_string()),
+    )];
+    legacy.overlay_lifecycle = vec![
+        "local|selected-unsupported|/home/test/.config/dot/overlays.d/10-local.local.conf".into(),
+    ];
+    let output = render(&check_overlays(&legacy));
+    assert!(!output.contains("no overlays to check"), "{output}");
+    assert!(
+        output.contains("local: selected but skipped: unknown descriptor key"),
+        "{output}"
+    );
+}
+
+#[test]
+fn keys_that_cannot_change_the_overlay_set_do_not_report_a_hold() {
+    use dot::unknown_keys::{DataKey, Effect};
+    let scratch = TempDir::new("doctor-overlays-no-hold").expect("scratch");
+    let mut input = overlays(
+        scratch
+            .path()
+            .join("missing")
+            .to_string_lossy()
+            .into_owned(),
+        None,
+        true,
+    );
+    input.unknown_keys = [Effect::Ignored, Effect::SelectorSkipped]
+        .into_iter()
+        .map(|effect| DataKey {
+            path: "/home/test/.config/dot/profiles.d/base.conf".to_string(),
+            line: 2,
+            key: "future_key".to_string(),
+            effect,
+        })
+        .collect();
+    let output = render(&check_overlays(&input));
+    assert!(!output.contains("overlay set held"), "{output}");
+}
+
+#[test]
 fn overlays_git_origin_and_manifest_health_matrix() {
     let scratch = TempDir::new("doctor-overlays-git").expect("scratch");
     let home = scratch.path().join("home");
@@ -1102,6 +1226,7 @@ fn overlays_git_origin_and_manifest_health_matrix() {
         included_profiles: vec![],
         phase_one: vec![],
         selectors: vec![],
+        unknown_keys: vec![],
         lifecycle: LifecycleInputs {
             profiles_present: false,
             load_ok: true,

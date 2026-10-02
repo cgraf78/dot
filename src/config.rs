@@ -70,12 +70,7 @@ impl UnknownKey {
     /// dropped letter without matching unrelated keys; a rare tie
     /// between two known keys picks the first in documentation order.
     pub fn suggestion(&self) -> Option<&'static str> {
-        KNOWN_KEYS
-            .iter()
-            .map(|known| (edit_distance(&self.key, known), *known))
-            .filter(|(distance, _)| *distance <= 2)
-            .min_by_key(|(distance, _)| *distance)
-            .map(|(_, known)| known)
+        crate::unknown_keys::suggestion(&self.key, &KNOWN_KEYS)
     }
 
     /// Whether this key degrades `dot update`: a likely misspelling
@@ -103,21 +98,6 @@ impl UnknownKey {
             self.hint()
         )
     }
-}
-
-/// Levenshtein distance over bytes (keys are ASCII by construction).
-fn edit_distance(left: &str, right: &str) -> usize {
-    let right = right.as_bytes();
-    let mut previous: Vec<usize> = (0..=right.len()).collect();
-    for (i, a) in left.bytes().enumerate() {
-        let mut current = vec![i + 1; right.len() + 1];
-        for (j, b) in right.iter().enumerate() {
-            let substitute = previous[j] + usize::from(a != *b);
-            current[j + 1] = substitute.min(previous[j + 1] + 1).min(current[j] + 1);
-        }
-        previous = current;
-    }
-    previous[right.len()]
 }
 
 /// Parsed client configuration with shell defaults applied.
@@ -766,14 +746,7 @@ mod tests {
         // An older Dot reads a newer key that is a near miss of one it
         // knows as a typo: it warns mid-run and degrades (exits 1) every
         // update until it upgrades. Fail the release that adds such a key.
-        for (i, left) in KNOWN_KEYS.iter().enumerate() {
-            for right in &KNOWN_KEYS[i + 1..] {
-                assert!(
-                    edit_distance(left, right) > 2,
-                    "{left} and {right} are within two edits"
-                );
-            }
-        }
+        assert_eq!(crate::unknown_keys::crowded_pair(&KNOWN_KEYS), None);
     }
 
     #[test]
