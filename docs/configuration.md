@@ -317,9 +317,10 @@ Dot records one, a hand-updated host still reads unknown.
   refuse to pull over them (on a branch with an upstream, outside a merge or
   rebase) and warn while a merge or rebase is in progress; tracked changes,
   a detached HEAD, a missing upstream, and upstream distance warn;
-- a rebase `dot update` froze after it conflicted (the same HEAD is
-  recorded in the repository's `dot-rebase-failed` marker) fails until it is
-  rebased by hand.
+- a rebase `dot update` froze after it conflicted (the same HEAD, on a
+  branch with an upstream, is recorded in the repository's
+  `dot-rebase-failed` marker) fails until it is rebased by hand; for an
+  optional overlay it warns.
 
 ## Overlay profiles
 

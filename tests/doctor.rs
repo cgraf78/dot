@@ -2871,6 +2871,23 @@ fn overlay_state_ignores_inherited_git_selectors() {
     assert!(!stdout.contains("plain: 1 tracked change"), "{stdout}");
 }
 
+#[test]
+fn client_state_ignores_an_inherited_git_index() {
+    // The client probes must not read a Git hook's `GIT_INDEX_FILE` either.
+    let scope = TempDir::new("doctor-client-git-env-origin").expect("origin scope");
+    let home = TempDir::new("doctor-client-git-env-home").expect("home");
+    let state = TempDir::new("doctor-client-git-env-state").expect("state");
+    let origin = origin(scope.path());
+    init_client(&home, &state, &origin);
+    let foreign = scope.path().join("foreign-index");
+    let foreign = foreign.to_str().expect("utf8");
+    let native = command(false, &home, &state, &[("GIT_INDEX_FILE", foreign)])
+        .output()
+        .expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(stdout.contains("✓ no tracked client changes"), "{stdout}");
+}
+
 fn latest_provider(home: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
     let root = home.path().join("provider-dev");
     let provider = root.join("shdeps");

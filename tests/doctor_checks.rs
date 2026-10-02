@@ -1336,6 +1336,20 @@ fn frozen_overlay_rebase_fails_until_rebased_by_hand() {
     assert!(!render(&check_overlays(&input)).contains("conflicted"));
     std::fs::write(&marker, format!("{} {head}\n", "0".repeat(40))).expect("old head");
     assert!(!render(&check_overlays(&input)).contains("conflicted"));
+    // Update skips a detached HEAD before it consults the marker.
+    std::fs::write(&marker, format!("{head} {head}\n")).expect("frozen marker");
+    git(repo, &["checkout", "-q", "--detach"]);
+    assert!(!render(&check_overlays(&input)).contains("conflicted"));
+    git(repo, &["checkout", "-q", "main"]);
+    // An optional overlay's frozen pull only leaves it empty: a warning.
+    let mut optional = input;
+    optional.active_records = vec![format!("ov0|{}|{remote}||true|git", repo.display())];
+    let rows = render(&check_overlays(&optional));
+    assert!(
+        rows.contains("⚠ ov0: the last rebase onto origin/main conflicted; rebase manually"),
+        "{rows}"
+    );
+    assert!(rows.contains("skips this optional overlay"), "{rows}");
 }
 
 /// A bare remote with one commit on `main`, plus `count` clones of it.
