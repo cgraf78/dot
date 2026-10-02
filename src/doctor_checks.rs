@@ -543,6 +543,10 @@ pub struct CronInputs {
     /// when none was recorded (including every run by a Dot older than
     /// that stamp).
     pub last_run: Option<crate::update_status::LastRun>,
+    /// Whether a `crontab` command is on `PATH`. Without one the host
+    /// cannot schedule `dot update --cron`, so a cron that never ran skips
+    /// instead of warning.
+    pub cron_available: bool,
     /// Current epoch seconds.
     pub now: i64,
 }
@@ -668,11 +672,23 @@ fn never_converged_record(inputs: &CronInputs) -> Record {
             )),
         );
     }
+    if !inputs.cron_available {
+        // No `crontab` (Termux, containers): this host is updated by hand
+        // by design, so a lasting warning would only be noise.
+        return Record::skip(
+            "cron update has never run",
+            Some(format!(
+                "no crontab on PATH; last update: {} run {} ago",
+                last.trigger,
+                age(last.at)
+            )),
+        );
+    }
     if is_stale(last.at, inputs.now) {
         return Record::warn(
             "cron update has never run",
             Some(format!(
-                "last update ran by {} {} ago; schedule dot update --cron to keep this host current",
+                "last update: {} run {} ago; schedule dot update --cron to keep this host current",
                 last.trigger,
                 age(last.at)
             )),
@@ -681,7 +697,7 @@ fn never_converged_record(inputs: &CronInputs) -> Record {
     Record::skip(
         "cron update has not run yet",
         Some(format!(
-            "last update ran by {} {} ago",
+            "last update: {} run {} ago",
             last.trigger,
             age(last.at)
         )),
@@ -706,7 +722,7 @@ fn last_run_record(inputs: &CronInputs, clean_cron: Option<i64>) -> Option<Recor
         }
     }
     let detail = format!(
-        "ran by {} {} ago",
+        "{} run {} ago",
         last.trigger,
         format_age(inputs.now.saturating_sub(last.at))
     );
@@ -1293,10 +1309,15 @@ fn standalone_control(release: &Path) -> Option<&Path> {
 /// installer owns the Dot release Shdeps would upgrade, and whether that
 /// owner can still upgrade it.
 ///
-/// Shdeps never upgrades a symlinked install root, so a managed root that
-/// links into the standalone installer's control directory
-/// (`<root> -> .dot-standalone/current`) never upgrades under the Shdeps
-/// provider: that fails, whichever Dot is running. The verdict is anchored
+/// Under the Shdeps provider a managed root that links into the standalone
+/// installer's control directory (`<root> -> .dot-standalone/current`)
+/// warns: Shdeps adopts that layout in place on its next update of Dot
+/// (Shdeps without adoption fails that update, which its own health check
+/// reports). The installer's lock fails, because Shdeps refuses to adopt
+/// while it exists, and an interrupted adoption (the root link parked as
+/// `<root>.shdeps-parked-root`) warns until the next update finishes it.
+/// Doctor stops at this one row; `shdeps health` owns the rest. The verdict
+/// is anchored
 /// on the managed root rather than the running binary, so a test harness
 /// or development checkout running beside a healthy Shdeps install stays
 /// quiet. Without a provider, the standalone installer is the upgrade
@@ -1321,29 +1342,55 @@ pub fn check_install_layout(inputs: &InstallInputs) -> Vec<Record> {
     } else {
         None
     };
-    let standalone = if inputs.shdeps {
-        managed_standalone
-    } else {
-        managed_standalone.or(running_standalone)
-    };
-    if let Some(control) = standalone {
-        if inputs.shdeps {
-            out.push(Record::fail(
-                "dot release is standalone-installed; Shdeps cannot upgrade it",
+    if inputs.shdeps {
+        if let Some(control) = managed_standalone {
+            out.push(Record::warn(
+                "dot is standalone-installed",
                 Some(format!(
-                    "{} links into {STANDALONE_CONTROL}, and Shdeps leaves a symlinked install root alone; replace it with a Shdeps release install",
+                    "{}: Shdeps adopts it on its next update of dot; if this persists, run shdeps health",
                     tilde(&inputs.managed_root.to_string_lossy(), inputs.home)
                 )),
             ));
-        } else {
-            out.push(Record::ok(
-                "dot release layout",
-                Some("standalone installer (rerun install.sh to upgrade)".to_string()),
-            ));
+            check_adoption_lock(inputs, control, &mut out);
+            return out;
         }
-        // A warning, not a failure: the lock blocks only a manual
-        // `install.sh` rerun (never `dot update`), and it is legitimately
-        // present while an installer runs.
+        // An adoption whose fallback switch was interrupted leaves no root,
+        // only the installer's link parked beside it.
+        let parked = parked_root_link(inputs.managed_root);
+        let parked_link =
+            std::fs::symlink_metadata(&parked).is_ok_and(|meta| meta.file_type().is_symlink());
+        let parked_standalone = std::fs::symlink_metadata(inputs.managed_root).is_err()
+            && parked_link
+            && std::fs::canonicalize(&parked)
+                .ok()
+                .as_deref()
+                .and_then(standalone_control)
+                .is_some();
+        if parked_standalone {
+            out.push(Record::warn(
+                "Shdeps adoption of the standalone install was interrupted",
+                Some(format!(
+                    "{}: the next Shdeps update of dot finishes it",
+                    tilde(&parked.to_string_lossy(), inputs.home)
+                )),
+            ));
+            if let Some(control) = std::fs::canonicalize(&parked)
+                .ok()
+                .as_deref()
+                .and_then(standalone_control)
+            {
+                check_adoption_lock(inputs, control, &mut out);
+            }
+            return out;
+        }
+    } else if let Some(control) = managed_standalone.or(running_standalone) {
+        out.push(Record::ok(
+            "dot release layout",
+            Some("standalone installer (rerun install.sh to upgrade)".to_string()),
+        ));
+        // A warning, not a failure: without a provider the lock blocks only a
+        // manual `install.sh` rerun (never `dot update`), and it is
+        // legitimately present while an installer runs.
         let lock = control.join("lock");
         if std::fs::symlink_metadata(&lock).is_ok() {
             out.push(Record::warn(
@@ -1369,6 +1416,35 @@ pub fn check_install_layout(inputs: &InstallInputs) -> Vec<Record> {
     // also failed leaves only the backup, with no root to run from.
     check_install_leftovers(inputs, managed_dir, &mut out);
     out
+}
+
+/// `<root>.shdeps-parked-root`: where Shdeps parks the installer's root
+/// link while a fallback (non-atomic) adoption switch runs, mirroring
+/// Shdeps' `parked_root_link`. A link left there means the switch was
+/// interrupted; Shdeps finishes it on its next update of the dependency.
+fn parked_root_link(root: &Path) -> PathBuf {
+    let mut name = root
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".shdeps-parked-root");
+    root.with_file_name(name)
+}
+
+/// The standalone installer's lock under the Shdeps provider: Shdeps refuses
+/// to adopt (or finish adopting) the install while it exists, so every
+/// update of dot fails until it is gone.
+fn check_adoption_lock(inputs: &InstallInputs, control: &Path, out: &mut Vec<Record>) {
+    let lock = control.join("lock");
+    if std::fs::symlink_metadata(&lock).is_ok() {
+        let shown = tilde(&lock.to_string_lossy(), inputs.home);
+        out.push(Record::fail(
+            "standalone installer lock blocks Shdeps adoption",
+            Some(format!(
+                "{shown}: Shdeps will not adopt the install while it exists; if no install.sh is running, remove it (rmdir {shown})"
+            )),
+        ));
+    }
 }
 
 /// The Shdeps archive marker of the managed release root Dot runs from.
