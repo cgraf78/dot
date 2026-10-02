@@ -141,6 +141,63 @@ fn active_revision_is_exact_for_a_checkout_and_empty_elsewhere() {
     assert_eq!(dot::shdeps::active_revision(&file), "");
 }
 
+fn write_metadata(root: &Path, body: &str) {
+    std::fs::write(root.join(".dot-install.json"), body).expect("release metadata");
+}
+
+/// Release metadata in the packaged one-key-per-line layout.
+fn metadata(commit: &str) -> String {
+    format!("{{\n  \"schema\": 1,\n  \"commit\": \"{commit}\",\n  \"repo\": \"cgraf78/dot\"\n}}\n")
+}
+
+#[test]
+fn installed_revision_reads_a_release_root_from_its_metadata() {
+    let release = TempDir::new("shdeps-installed-release").expect("fixture directory");
+    write_metadata(release.path(), &metadata(R40A));
+    // Unlike the startup identity, this is not bound to the running build:
+    // after an upgrade the metadata names the newly installed release.
+    assert_ne!(R40A, dot::version::COMMIT);
+    assert_eq!(dot::shdeps::installed_revision(release.path()), R40A);
+}
+
+#[test]
+fn installed_revision_never_asks_git_inside_a_release_root() {
+    // A release root under some other repository (a `$HOME` checkout, say)
+    // must not report that repository's HEAD: Git walks up from a root that
+    // has no `.git` of its own.
+    let repo = TempDir::new("shdeps-installed-enclosing").expect("fixture directory");
+    let head = init_repo(repo.path());
+    let release = repo.path().join("share/cgraf78/dot");
+    std::fs::create_dir_all(&release).expect("nested release root");
+    assert_eq!(dot::shdeps::active_revision(&release), head);
+    write_metadata(&release, &metadata(R40B));
+    assert_eq!(dot::shdeps::installed_revision(&release), R40B);
+    // Ambiguous metadata is unreadable, not a reason to fall back to Git.
+    write_metadata(
+        &release,
+        &format!("\"commit\": \"{R40A}\",\n\"commit\": \"{R40B}\"\n"),
+    );
+    assert_eq!(dot::shdeps::installed_revision(&release), "");
+    write_metadata(&release, "{\"schema\": 1}\n");
+    assert_eq!(dot::shdeps::installed_revision(&release), "");
+}
+
+#[test]
+fn installed_revision_keeps_git_for_a_checkout() {
+    let repo = TempDir::new("shdeps-installed-checkout").expect("fixture directory");
+    let head = init_repo(repo.path());
+    assert_eq!(dot::shdeps::installed_revision(repo.path()), head);
+    // A symlinked metadata file does not make a checkout a release root.
+    let elsewhere = TempDir::new("shdeps-installed-link").expect("fixture directory");
+    write_metadata(elsewhere.path(), &metadata(R40A));
+    std::os::unix::fs::symlink(
+        elsewhere.path().join(".dot-install.json"),
+        repo.path().join(".dot-install.json"),
+    )
+    .expect("metadata link");
+    assert_eq!(dot::shdeps::installed_revision(repo.path()), head);
+}
+
 enum ReadStage {
     File(Vec<u8>, u32),
     Link,

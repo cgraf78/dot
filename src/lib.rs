@@ -28,6 +28,7 @@ pub mod extension_trust;
 pub mod extension_worker;
 pub mod families;
 pub mod glob;
+pub mod handoff;
 pub mod hook_api;
 pub(crate) mod hook_worker;
 pub mod init_client_adopt;

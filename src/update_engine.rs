@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::log::Log;
 use crate::progress_ui::{Palette, Stage};
@@ -63,6 +63,24 @@ pub enum Caller {
 /// brick every client still running one of them. Older releases ignore an
 /// unknown environment variable instead (they simply do not prune).
 pub const PRUNE_ENV: &str = "DOT_SHDEPS_PRUNE";
+
+/// The update lock claim a provider continuation re-enters the held lock
+/// with. Hook workers receive it explicitly ([`EngineInputs::update_lock_token`]),
+/// never through the runtime environment.
+const LOCK_TOKEN_ENV: &str = "DOT_UPDATE_LOCK_TOKEN";
+
+/// Set in a provider continuation's environment: a second Dot change there
+/// publishes the provider checkpoint instead of continuing again.
+const REEXEC_ONCE_ENV: &str = "DOT_REEXEC_ONCE";
+
+/// The revision a provider continuation must observe at startup.
+const REEXEC_EXPECTED_ENV: &str = "DOT_REEXEC_EXPECTED_REVISION";
+
+/// Whether `runtime` is a provider continuation: the second half of an
+/// update whose first half already reported its command-boundary warnings.
+pub(crate) fn is_continuation(runtime: &crate::app::Runtime) -> bool {
+    runtime.value(REEXEC_ONCE_ENV).and_then(OsStr::to_str) == Some("1")
+}
 
 /// When `dot update` removes orphaned Shdeps dependencies itself.
 ///
@@ -121,6 +139,10 @@ pub struct EngineInputs<'a> {
     pub prune_mode: PruneMode,
     /// Native update lock claim exposed only to transactional hook workers.
     pub update_lock_token: Option<&'a str>,
+    /// Command environment after the update flag exports and the lock
+    /// claim. A provider continuation starts from it, so it keeps the claim
+    /// and the flag exports that [`Self::runtime`] does not carry.
+    pub env: &'a BTreeMap<OsString, OsString>,
     /// Parsed client configuration for this update generation.
     pub config: &'a crate::config::Config,
     /// Unknown config keys already reported during this invocation (see
@@ -2131,13 +2153,16 @@ fn finalize(
                         let _ = io.out.write_all(&provider.details);
                         if provider.status != 0 {
                             stages.tools = true;
-                        } else if let Some((before, after)) = provider.revision_change {
+                        }
+                        if let Some(change) = provider.revision_change {
                             if cancelled() {
                                 return 1;
                             }
-                            return provider_reexec(
-                                inputs, io, &before, &after, now_secs, degraded,
-                            );
+                            if let Some(code) =
+                                provider_reexec(inputs, io, &change, now_secs, degraded)
+                            {
+                                return code;
+                            }
                         }
                         // A failed update (a dependency or post hook) still
                         // leaves this generation's config trusted: prune on.
@@ -2355,16 +2380,41 @@ fn finalize(
 
 /// Continue one provider-driven source-generation transition without touching
 /// the process-global environment or reacquiring the already-held update lock.
+///
+/// `Some(status)` ends this run with `status`: a development checkout
+/// continues in a nested in-process run, and a packaged release hands off to
+/// its new binary ([`release_handoff`]). `None` finishes this run in place,
+/// which is the fallback whenever a release cannot be handed off.
 fn provider_reexec(
     inputs: &EngineInputs<'_>,
     io: &mut UpdateIo<'_>,
-    before: &str,
-    after: &str,
+    change: &crate::shdeps_provider::RevisionChange,
     now_secs: i64,
     degraded: &mut crate::update_status::Degraded,
-) -> i32 {
+) -> Option<i32> {
     if cancelled() {
-        return 1;
+        return Some(1);
+    }
+    let (before, after, release) = (
+        change.before.as_str(),
+        change.after.as_str(),
+        change.release,
+    );
+    // `dot init` converges inside its own transaction and an embedded
+    // runtime cannot replace its process: on a release root both finish in
+    // place, exactly as before releases could hand off.
+    if release && (inputs.caller != Caller::Update || !inputs.runtime.can_exec()) {
+        return None;
+    }
+    if release && !(crate::shdeps::revision_valid(before) && crate::shdeps::revision_valid(after)) {
+        // Releases never re-executed before, so unreadable metadata must not
+        // turn into a new failure: keep the old finish-in-place behavior.
+        warn_row(
+            io.err,
+            inputs.palette,
+            "  warning: dot changed during the update but its release metadata is unreadable; finishing this update on the running dot",
+        );
+        return None;
     }
     if !crate::shdeps::revision_valid(before) {
         warn_row(
@@ -2381,7 +2431,7 @@ fn provider_reexec(
             &reload_hint(inputs),
         );
         let _ = io.out.write_all(&close);
-        return 1;
+        return Some(1);
     }
     if !crate::shdeps::revision_valid(after) {
         warn_row(
@@ -2398,14 +2448,9 @@ fn provider_reexec(
             &reload_hint(inputs),
         );
         let _ = io.out.write_all(&close);
-        return 1;
+        return Some(1);
     }
-    if inputs
-        .runtime
-        .value("DOT_REEXEC_ONCE")
-        .and_then(OsStr::to_str)
-        == Some("1")
-    {
+    if is_continuation(inputs.runtime) {
         let path = Path::new(inputs.state_home).join("dot/provider-reexec-failed");
         let mut moves = crate::temp::MoveCache::default();
         if crate::shdeps::write_checkpoint(before, after, &path, &mut moves) {
@@ -2430,17 +2475,24 @@ fn provider_reexec(
             &reload_hint(inputs),
         );
         let _ = io.out.write_all(&close);
-        return 1;
+        return Some(1);
     }
-    let mut env = inputs.runtime.env().clone();
-    env.insert(OsString::from("DOT_REEXEC_ONCE"), OsString::from("1"));
-    env.insert(
-        OsString::from("DOT_REEXEC_EXPECTED_REVISION"),
-        OsString::from(after),
-    );
-    let runtime = match crate::app::Runtime::from_env(&env, inputs.runtime.cwd()) {
+    if release {
+        return release_handoff(inputs, io, after);
+    }
+    // The nested runtime keeps this run's child environment (no lock claim,
+    // no prune policy: hooks receive the claim explicitly), while the nested
+    // capture starts from the command environment so it keeps the lock claim
+    // and flag exports this run was gathered from.
+    let mut runtime_env = inputs.runtime.env().clone();
+    let mut env = inputs.env.clone();
+    for map in [&mut runtime_env, &mut env] {
+        map.insert(OsString::from(REEXEC_ONCE_ENV), OsString::from("1"));
+        map.insert(OsString::from(REEXEC_EXPECTED_ENV), OsString::from(after));
+    }
+    let runtime = match crate::app::Runtime::from_env(&runtime_env, inputs.runtime.cwd()) {
         Ok(runtime) => runtime,
-        Err(_) => return 1,
+        Err(_) => return Some(1),
     };
     let policy = env_value(&env, "DOT_SHDEPS_UPDATE_POLICY");
     let startup = crate::startup::Inputs {
@@ -2455,12 +2507,12 @@ fn provider_reexec(
         Err(failure) => {
             let _ = io.err.write_all(failure.line().as_bytes());
             let _ = io.err.write_all(b"\n");
-            return 1;
+            return Some(1);
         }
     };
     warn_reloaded_keys(inputs, &config, io.err);
     if cancelled() {
-        return 1;
+        return Some(1);
     }
     // The continuation is the same command with the same prune mode. The
     // mode travels as a value because the runtime environment was scrubbed
@@ -2477,7 +2529,7 @@ fn provider_reexec(
         runtime.cwd(),
     ) {
         Ok(gathered) => gathered,
-        _ => return 1,
+        _ => return Some(1),
     };
     // One invocation, one warning per key: the continuation inherits
     // every key reported so far, not only the ones its config holds.
@@ -2495,11 +2547,122 @@ fn provider_reexec(
         .extend(inputs.handed_warnings.iter().cloned());
     let nested = gathered.inputs();
     if cancelled() {
-        return 1;
+        return Some(1);
     }
     // The continuation records its own cron outcome; handing its degraded
     // stages back lets the outer record match instead of reading `fail`.
-    run_gathered(&nested, &mut *io.out, &mut *io.err, now_secs, degraded)
+    Some(run_gathered(
+        &nested,
+        &mut *io.out,
+        &mut *io.err,
+        now_secs,
+        degraded,
+    ))
+}
+
+/// Hand the rest of this `dot update` to the release binary the Tools stage
+/// just installed: the old engine must not drive the new release's hook
+/// runtime and library files. The binary entry point execs the continuation
+/// after this run unwinds (see [`crate::handoff`]); `Some(0)` ends this half.
+///
+/// The continuation is the same command line under this process's own
+/// environment plus what the command boundary consumed from it (the prune
+/// policy, which the new process parses again) and the handoff contract: the
+/// lock claim it re-enters the held lock with, `DOT_REEXEC_ONCE` (a second
+/// Dot change publishes the provider checkpoint instead of handing off
+/// again), and `DOT_REEXEC_EXPECTED_REVISION` (the new binary proves its
+/// identity at startup). Flag exports are not carried: the new process
+/// derives them from the same arguments.
+///
+/// `None` finishes this run in place, as releases always did before: a new
+/// binary that is missing or fails its startup probe must not stop the
+/// update, only warn.
+fn release_handoff(inputs: &EngineInputs<'_>, io: &mut UpdateIo<'_>, after: &str) -> Option<i32> {
+    let mut env = inputs.runtime.env().clone();
+    if let Some(prune) = inputs.env.get(OsStr::new(PRUNE_ENV)) {
+        env.insert(OsString::from(PRUNE_ENV), prune.clone());
+    }
+    if let Some(token) = inputs.update_lock_token {
+        env.insert(OsString::from(LOCK_TOKEN_ENV), OsString::from(token));
+    }
+    env.insert(OsString::from(REEXEC_ONCE_ENV), OsString::from("1"));
+    env.insert(OsString::from(REEXEC_EXPECTED_ENV), OsString::from(after));
+    let binary = inputs.source_root_git.join("dot");
+    let probe = probe_release_binary(inputs.runtime, &binary, &env);
+    if cancelled() {
+        return Some(1);
+    }
+    if let Err(problem) = probe {
+        let short = after.get(..12).unwrap_or(after);
+        warn_row(
+            io.err,
+            inputs.palette,
+            &format!(
+                "  warning: dot {short} was installed but {problem}; finishing this update on the running dot"
+            ),
+        );
+        return None;
+    }
+    let mut args = vec![OsString::from("update")];
+    args.extend(inputs.original_args.iter().cloned());
+    let cron_state = inputs.flags.cron.then(|| PathBuf::from(inputs.state_home));
+    let handoff = crate::handoff::Handoff::new(binary, args, env, cron_state);
+    inputs.runtime.request_exec(handoff).then_some(0)
+}
+
+/// Check that the new release binary can run the continuation before this
+/// process commits to replacing itself; an exec cannot be undone. `dot update
+/// --help` under the continuation's exact environment takes the same startup
+/// path as the continuation (strict release-root resolution, output relay,
+/// re-exec guard, config load, client identity) and returns before the update
+/// lock, so a wrong-platform, truncated, or mismatched binary, or one that
+/// rejects this config, is caught while the old engine can still finish.
+fn probe_release_binary(
+    runtime: &crate::app::Runtime,
+    binary: &Path,
+    env: &BTreeMap<OsString, OsString>,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata =
+        std::fs::symlink_metadata(binary).map_err(|_| "its binary is missing".to_string())?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err("its binary is not an executable file".to_string());
+    }
+    let mut command = std::process::Command::new(binary);
+    command
+        .args(["update", "--help"])
+        .env_clear()
+        .envs(env)
+        .current_dir(runtime.cwd())
+        .stdin(std::process::Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        Some(std::time::Instant::now() + crate::cleanup::REVISION_PROBE_TIMEOUT),
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    );
+    let failed = "its binary did not pass its startup check";
+    match output {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            // The new binary's own diagnostic says why (for example a
+            // revision mismatch); keep its first line, safe for a terminal.
+            let line = output
+                .stderr
+                .split(|byte| *byte == b'\n')
+                .next()
+                .unwrap_or_default();
+            let reason = crate::progress_ui::sanitize_untrusted_text(line);
+            let reason = String::from_utf8_lossy(&reason);
+            if reason.is_empty() {
+                Err(failed.to_string())
+            } else {
+                Err(format!("{failed} ({reason})"))
+            }
+        }
+        Err(_) => Err(failed.to_string()),
+    }
 }
 
 fn cancelled() -> bool {
@@ -2579,6 +2742,7 @@ pub struct Gathered {
     caller: Caller,
     prune_mode: PruneMode,
     update_lock_token: Option<String>,
+    env: BTreeMap<OsString, OsString>,
     config: crate::config::Config,
     config_warned: std::cell::RefCell<Vec<String>>,
     data_warned: std::cell::RefCell<Vec<crate::unknown_keys::DataKey>>,
@@ -2626,6 +2790,7 @@ impl Gathered {
             caller: self.caller,
             prune_mode: self.prune_mode,
             update_lock_token: self.update_lock_token.as_deref(),
+            env: &self.env,
             config: &self.config,
             config_warned: &self.config_warned,
             data_warned: &self.data_warned,
@@ -2872,7 +3037,8 @@ fn gather(
         runtime: runtime.clone(),
         caller,
         prune_mode,
-        update_lock_token: env_value(env, "DOT_UPDATE_LOCK_TOKEN"),
+        update_lock_token: env_value(env, LOCK_TOKEN_ENV),
+        env: env.clone(),
         config: config.clone(),
         config_warned: std::cell::RefCell::new(
             config
@@ -2927,7 +3093,7 @@ fn gather(
         reloads_shell: env_value(env, "DOT_UPDATE_RELOADS_SHELL"),
         shell: env_value(env, "SHELL"),
         shdeps_update_policy: env_value(env, "DOT_SHDEPS_UPDATE_POLICY"),
-        reexec_expected: env_value(env, "DOT_REEXEC_EXPECTED_REVISION"),
+        reexec_expected: env_value(env, REEXEC_EXPECTED_ENV),
     })
 }
 
@@ -2964,6 +3130,8 @@ fn prune_mode(
     }
     match PruneMode::parse(raw.as_deref()) {
         Some(mode) => (mode, scrubbed),
+        // A release continuation inherits the value; its first half warned.
+        None if is_continuation(runtime) => (PruneMode::Never, scrubbed),
         None => {
             let value =
                 crate::progress_ui::sanitize_untrusted_text(raw.unwrap_or_default().as_bytes());
@@ -2990,9 +3158,12 @@ pub fn run_update(
         None => return 1,
     };
     let (prune_mode, runtime) = prune_mode(runtime, request, streams.stderr);
-    // The handed-over warnings concern this engine only; hooks and the
-    // provider must not inherit them.
-    let runtime = &runtime.without_env(WARNED_ENV);
+    // The handed-over warnings concern this engine only, and the lock claim
+    // reaches hook workers explicitly. A release continuation inherits both
+    // in its process environment (to re-enter the lock and skip repeats), so
+    // keep them out of what providers and hooks inherit, like any other run.
+    let runtime = runtime.without_env(WARNED_ENV).without_env(LOCK_TOKEN_ENV);
+    let runtime = &runtime;
     let gathered = match gather(
         request.caller,
         prune_mode,
@@ -3093,7 +3264,10 @@ fn run_gathered(
         return 0;
     }
     let rc = run_gathered_inner(inputs, out, err, now_secs, degraded);
-    if inputs.flags.cron && !cancelled() {
+    // A release handoff ends this half before the run's outcome is known;
+    // the exec'd continuation records the run (or the handoff records its
+    // failure when it cannot exec).
+    if inputs.flags.cron && !cancelled() && !inputs.runtime.exec_pending() {
         let state_home = Path::new(inputs.state_home);
         if rc == 0 {
             crate::update_status::append_outcome(state_home, now_secs, "ok", "update", "");

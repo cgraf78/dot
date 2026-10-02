@@ -620,6 +620,12 @@ impl Drop for LockGuard {
 /// Re-enter a lock already owned by this process under `token`
 /// (shell `_dot_update_lock_reenter`, minus trap installation which
 /// [`LockGuard`] drop makes redundant). Returns a guard on success.
+///
+/// This is a cross-version contract: a release handoff ([`crate::handoff`])
+/// execs the newly installed Dot, which re-enters an owner record the
+/// previous release wrote. Keep the lock path, owner format, and token
+/// variable compatible across releases, or the continuation reports the
+/// lock busy after the first half already ended.
 pub fn try_reenter(lock_dir: &Path, token: &str) -> Option<LockGuard> {
     if token.is_empty() {
         return None;

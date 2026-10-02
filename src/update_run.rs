@@ -131,6 +131,12 @@ pub fn run(
         },
         &mut streams,
     );
+    // A provider handoff continues this run in the upgraded binary under the
+    // same PID, which re-enters this lock with the token above; park the
+    // guard in the handoff instead of releasing it.
+    let Some(guard) = runtime.park_lock(guard) else {
+        return code;
+    };
     // Explicit verified release (never silent removal of a lock that
     // no longer names us): removal failures warn through `log` into
     // stderr, like the shell's EXIT-trap release.

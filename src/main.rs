@@ -10,7 +10,9 @@
 //! own path — see
 //! `dot::startup` for the full entry-contract map), exposing stdout/stderr as
 //! unbuffered descriptors so handled signals interrupt backpressured writes,
-//! and translating the returned code into the process exit status. Write failures inside `run` are
+//! and translating the returned code into the process exit status (or, when an
+//! update's Tools stage upgraded this packaged release, executing the new
+//! binary to finish the run; see `dot::handoff`). Write failures inside `run` are
 //! ignored (`let _ =`) rather than panicking: a closed pipe must
 //! surface as the command's normal exit path, never as a Rust panic
 //! message, since panics would break the stderr byte contract.
@@ -81,6 +83,13 @@ fn main() {
     );
     let code = if code == 0 && !flushed { 1 } else { code };
     let code = dot::cleanup::process_output_status(code, relay_finished);
+    // An update whose Tools stage upgraded this packaged release continues in
+    // the new binary. Exec only now: every byte of this half has drained
+    // through the relay, so the continuation's output follows it in order.
+    let code = match runtime.take_exec() {
+        Some(handoff) => handoff.run(code),
+        None => code,
+    };
     dot::cleanup::exit_process(code);
 }
 

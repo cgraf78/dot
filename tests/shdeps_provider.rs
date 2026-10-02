@@ -90,17 +90,78 @@ struct Fixture {
     provider: PathBuf,
 }
 
+/// How the fixture's Dot is installed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// A development checkout: a Git repository owning a Cargo-built binary.
+    Checkout,
+    /// A packaged release root, the shape Shdeps maintains for a
+    /// `github:release` dependency: the binary beside `.dot-install.json`,
+    /// no `.git` of its own.
+    Release,
+}
+
+/// The commit the fixture's initial release metadata names. It differs from
+/// the test binary's compiled commit, the way an installed release differs
+/// from the one the Tools stage is about to install.
+const OLD_RELEASE_COMMIT: &str = "1111111111111111111111111111111111111111";
+
+/// Copy the directory tree at `from` into `to` (files and directories only).
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("tree directory");
+    for entry in std::fs::read_dir(from).expect("read tree") {
+        let entry = entry.expect("tree entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("tree entry type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy tree file");
+        }
+    }
+}
+
+/// Write packaged-release install metadata naming `commit` into `root`.
+fn write_release_metadata(root: &Path, commit: &str) {
+    std::fs::write(
+        root.join(".dot-install.json"),
+        format!(
+            "{{\n  \"schema\": 1,\n  \"method\": \"release\",\n  \"commit\": \"{commit}\",\n  \"repo\": \"cgraf78/dot\"\n}}\n"
+        ),
+    )
+    .expect("release metadata");
+}
+
 impl Fixture {
     fn new(tag: &str) -> Self {
+        Self::with_layout(tag, Layout::Checkout)
+    }
+
+    /// A fixture whose Dot is a packaged release root.
+    fn release(tag: &str) -> Self {
+        Self::with_layout(tag, Layout::Release)
+    }
+
+    fn with_layout(tag: &str, layout: Layout) -> Self {
         let scratch = TempDir::new_exec(tag).expect("scratch");
         let root = scratch.path().join("dot-source");
         let home = scratch.path().join("home");
         let state = scratch.path().join("state");
         let provider = scratch.path().join("provider");
         std::fs::create_dir_all(root.join("support")).expect("support");
-        let binary =
-            dot_test_support::owned_dot_binary(&root, Path::new(env!("CARGO_BIN_EXE_dot")))
-                .expect("fixture-owned binary");
+        let binary = match layout {
+            Layout::Checkout => {
+                dot_test_support::owned_dot_binary(&root, Path::new(env!("CARGO_BIN_EXE_dot")))
+                    .expect("fixture-owned binary")
+            }
+            Layout::Release => {
+                std::fs::create_dir_all(root.join("lib/dot/public")).expect("public API");
+                write_release_metadata(&root, OLD_RELEASE_COMMIT);
+                let binary = root.join("dot");
+                dot_test_support::copy_dot_binary(Path::new(env!("CARGO_BIN_EXE_dot")), &binary)
+                    .expect("release binary");
+                binary
+            }
+        };
         std::fs::create_dir_all(home.join(".config/dot")).expect("config");
         std::fs::create_dir_all(&state).expect("state");
         std::fs::create_dir_all(&provider).expect("provider");
@@ -416,6 +477,22 @@ case ${1:-} in
     if [[ ${DOT_TEST_RECORD_BINARY_MARKER:-0} == 1 ]]; then
       printf 'binary=%s\n' "${DOT_TEST_BINARY_MARKER:-default}" >>"$DOT_TEST_PROVIDER_RECORD"
     fi
+    if [[ -n ${DOT_TEST_PROVIDER_ENV_RECORD:-} ]]; then
+      printf 'token=%s log=%s once=%s\n' "${DOT_UPDATE_LOCK_TOKEN:+set}" \
+        "${SHDEPS_LOG_LEVEL:-unset}" "${DOT_REEXEC_ONCE:-unset}" >>"$DOT_TEST_PROVIDER_ENV_RECORD"
+    fi
+    if [[ -n ${DOT_TEST_PROVIDER_PARENT_RECORD:-} ]]; then
+      printf '%s|%s\n' "$PPID" "$(ps -ww -o args= -p "$PPID")" >>"$DOT_TEST_PROVIDER_PARENT_RECORD"
+    fi
+    if [[ -n ${DOT_TEST_PROVIDER_RELEASES:-} ]]; then
+      IFS=: read -ra releases <<<"$DOT_TEST_PROVIDER_RELEASES"
+      for release in "${releases[@]}"; do
+        [[ -d $release ]] || continue
+        mv "$DOT_SOURCE_ROOT" "$release.replaced"
+        mv "$release" "$DOT_SOURCE_ROOT"
+        break
+      done
+    fi
     advance=0
     generation=1
     if [[ ${DOT_TEST_PROVIDER_ADVANCE_TWICE:-0} == 1 ]]; then
@@ -565,11 +642,13 @@ raise SystemExit(2)
             b"version=1\ndependency_provider=shdeps\nshdeps_update_policy=pinned\n",
         )
         .expect("dot config");
-        git(&root, &["init", "-q"]);
-        git(&root, &["config", "user.name", "fixture"]);
-        git(&root, &["config", "user.email", "fixture@example.invalid"]);
-        git(&root, &["add", "support/shdeps.lock"]);
-        git(&root, &["commit", "-qm", "fixture"]);
+        if layout == Layout::Checkout {
+            git(&root, &["init", "-q"]);
+            git(&root, &["config", "user.name", "fixture"]);
+            git(&root, &["config", "user.email", "fixture@example.invalid"]);
+            git(&root, &["add", "support/shdeps.lock"]);
+            git(&root, &["commit", "-qm", "fixture"]);
+        }
         Self {
             _scratch: scratch,
             root,
@@ -582,6 +661,56 @@ raise SystemExit(2)
 
     fn command(&self) -> Command {
         self.command_for("update")
+    }
+
+    /// Stage a release root the provider fixture can swap in for the
+    /// installed one (`DOT_TEST_PROVIDER_RELEASES`), like Shdeps' atomic
+    /// directory switch. `binary` false leaves the new release without its
+    /// executable.
+    fn stage_release(&self, name: &str, commit: &str, binary: bool) -> PathBuf {
+        let staged = self._scratch.path().join(name);
+        copy_tree(
+            &self.root.join("lib/dot/public"),
+            &staged.join("lib/dot/public"),
+        );
+        std::fs::create_dir_all(staged.join("support")).expect("staged support");
+        std::fs::copy(
+            self.root.join("support/shdeps.lock"),
+            staged.join("support/shdeps.lock"),
+        )
+        .expect("staged provider lock");
+        write_release_metadata(&staged, commit);
+        if binary {
+            dot_test_support::copy_dot_binary(
+                Path::new(env!("CARGO_BIN_EXE_dot")),
+                &staged.join("dot"),
+            )
+            .expect("staged release binary");
+        }
+        staged
+    }
+
+    /// Install one merge hook (`merge()` body in `script`) and enable
+    /// extensions in the fixture config. Hooks run on the source root's
+    /// public hook runtime, so the fixture root receives the real one.
+    fn with_merge_hook(&self, script: &[u8]) {
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("lib/dot/public"),
+            &self.root.join("lib/dot/public"),
+        );
+        let extensions = self.home.join("extensions");
+        let hooks = extensions.join("merge-hooks.d");
+        std::fs::create_dir_all(&hooks).expect("merge-hook directory");
+        std::fs::write(hooks.join("10-record.sh"), script).expect("merge hook");
+        for path in [&extensions, &hooks, &hooks.join("10-record.sh")] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .expect("private extension path");
+        }
+        std::fs::write(
+            self.home.join(".config/dot/config"),
+            b"version=1\ndependency_provider=shdeps\nshdeps_update_policy=pinned\nextension_api=1\nextensions_dir=$HOME/extensions\n",
+        )
+        .expect("extension config");
     }
 
     fn command_for(&self, subcommand: &str) -> Command {
@@ -3292,6 +3421,349 @@ fn second_provider_source_change_publishes_checkpoint_natively() {
             .mode()
             & 0o777,
         0o600
+    );
+}
+
+/// Each provider `update` run's parent Dot process as `(pid, argv)`, in
+/// order: the process that drove each Tools stage.
+fn provider_parents(fixture: &Fixture) -> Vec<(String, String)> {
+    std::fs::read_to_string(fixture.home.join("provider-parents"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let (pid, args) = line.split_once('|').expect("parent record");
+            (pid.to_string(), args.trim().to_string())
+        })
+        .collect()
+}
+
+/// An update of a release-installed Dot whose Tools stage swaps in the
+/// staged `releases` (colon-separated, first existing wins per run). The
+/// outer process runs under a distinctive `argv[0]`, so the provider's
+/// parent record tells the original image from the exec'd new binary.
+fn release_update(fixture: &Fixture, releases: &[&Path]) -> Command {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut command = fixture.command();
+    let joined = std::env::join_paths(releases).expect("release list");
+    command
+        .arg0("dot-before-handoff")
+        .env("DOT_TEST_PROVIDER_RELEASES", joined)
+        .env(
+            "DOT_TEST_PROVIDER_PARENT_RECORD",
+            fixture.home.join("provider-parents"),
+        );
+    command
+}
+
+/// Merge hook recording whether it saw the update lock claim.
+const TOKEN_HOOK: &[u8] =
+    b"merge() { printf '%s\\n' \"${DOT_UPDATE_LOCK_TOKEN:+set}\" >>\"$HOME/hook-token\"; }\n";
+
+#[test]
+fn release_upgrade_hands_off_to_the_new_binary() {
+    // A release install has no `.git`: the upgrade is visible only in its
+    // install metadata. The rest of the run must execute the new binary,
+    // in the same process (so it re-enters the held update lock).
+    let fixture = Fixture::release("shdeps-release-handoff");
+    fixture.with_merge_hook(TOKEN_HOOK);
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
+    let output = release_update(&fixture, &[&next])
+        .output()
+        .expect("release handoff update");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stderr, b"", "{output:?}");
+    let parents = provider_parents(&fixture);
+    assert_eq!(parents.len(), 2, "{parents:?}");
+    assert_eq!(parents[0].0, parents[1].0, "the handoff kept the process");
+    assert_eq!(parents[0].1, "dot-before-handoff update");
+    assert_eq!(
+        parents[1].1,
+        format!("{} update", fixture.root.join("dot").display()),
+        "the continuation runs the new release binary"
+    );
+    // Config hooks run only in the continuation, under the carried claim.
+    assert_eq!(
+        std::fs::read_to_string(fixture.home.join("hook-token")).expect("hook record"),
+        "set\n"
+    );
+    let stdout = String::from_utf8_lossy(&normalize_elapsed(&output.stdout)).into_owned();
+    assert_eq!(
+        stdout.matches("[2/5] Tools      changed").count(),
+        2,
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("Done in Ns.").count(), 1, "{stdout}");
+    assert!(
+        !fixture.state.join("dot/update.lock.d").exists(),
+        "the continuation released the update lock"
+    );
+    assert!(!fixture.state.join("dot/provider-reexec-failed").exists());
+}
+
+#[test]
+fn release_handoff_preserves_flags_and_records_one_cron_outcome() {
+    let fixture = Fixture::release("shdeps-release-handoff-cron");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
+    let output = release_update(&fixture, &[&next])
+        .args(["--cron", "-f"])
+        .output()
+        .expect("cron release handoff update");
+    assert_cli(&output, 0, b"", b"");
+    let parents = provider_parents(&fixture);
+    assert_eq!(parents.len(), 2, "{parents:?}");
+    assert_eq!(
+        parents[1].1,
+        format!("{} update --cron -f", fixture.root.join("dot").display())
+    );
+    // The provider record is rewritten by each Tools run: this is the
+    // continuation's view of the flags.
+    assert_eq!(
+        std::fs::read_to_string(fixture.home.join("provider-record")).expect("flags"),
+        "force=1 quiet=1 nested=1 jobs=2\n"
+    );
+    // One cron invocation, one outcome: the exec'd continuation's.
+    let log = std::fs::read_to_string(dot::update_status::update_log_path(&fixture.state))
+        .expect("cron outcome log");
+    let outcomes: Vec<Vec<&str>> = log
+        .lines()
+        .map(|line| line.split(' ').skip(1).collect())
+        .collect();
+    assert_eq!(outcomes, [["ok", "update"]], "{log}");
+}
+
+#[test]
+fn release_handoff_falls_back_when_the_new_binary_fails_its_guard() {
+    // Metadata that does not match the binary it ships (a broken release,
+    // or a downgrade to a Dot without release-aware guards) must not stop
+    // the update: the running Dot finishes it and says why.
+    let fixture = Fixture::release("shdeps-release-handoff-mismatch");
+    fixture.with_merge_hook(TOKEN_HOOK);
+    let mismatched = "2222222222222222222222222222222222222222";
+    let next = fixture.stage_release("next-release", mismatched, true);
+    let output = release_update(&fixture, &[&next])
+        .output()
+        .expect("release update with a mismatched binary");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "  warning: dot 222222222222 was installed but its binary did not pass its startup check (dot: re-exec revision mismatch: expected {mismatched}, found <missing>); finishing this update on the running dot\n"
+        )
+    );
+    assert_eq!(provider_parents(&fixture).len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(fixture.home.join("hook-token")).expect("hook record"),
+        "set\n"
+    );
+    assert!(!fixture.state.join("dot/update.lock.d").exists());
+}
+
+#[test]
+fn release_handoff_falls_back_when_the_new_binary_is_missing() {
+    let fixture = Fixture::release("shdeps-release-handoff-missing");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, false);
+    let output = release_update(&fixture, &[&next])
+        .output()
+        .expect("release update without its binary");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let short = &dot::version::COMMIT[..12];
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "  warning: dot {short} was installed but its binary is missing; finishing this update on the running dot\n"
+        )
+    );
+    assert_eq!(provider_parents(&fixture).len(), 1);
+    assert!(!fixture.state.join("dot/update.lock.d").exists());
+}
+
+#[test]
+fn second_release_change_publishes_a_checkpoint_the_next_run_consumes() {
+    // The continuation's own Tools stage installs yet another release: the
+    // generation guard stops there instead of handing off again, and the
+    // next run validates the checkpoint against the installed metadata.
+    let fixture = Fixture::release("shdeps-release-handoff-twice");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
+    let third_commit = "3333333333333333333333333333333333333333";
+    let third = fixture.stage_release("third-release", third_commit, true);
+    let output = release_update(&fixture, &[&next, &third])
+        .output()
+        .expect("double release change");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        output.stderr,
+        b"  warning: dot changed twice during one update; rerun to validate the provider checkpoint\n"
+    );
+    assert_eq!(provider_parents(&fixture).len(), 2);
+    let checkpoint = fixture.state.join("dot/provider-reexec-failed");
+    let body = std::fs::read_to_string(&checkpoint).expect("checkpoint");
+    assert_eq!(
+        body,
+        format!(
+            "cgraf78 dot provider reexec checkpoint v1\nbefore={}\nafter={third_commit}\n",
+            dot::version::COMMIT
+        )
+    );
+    assert!(!fixture.state.join("dot/update.lock.d").exists());
+
+    let rerun = fixture.command().output().expect("rerun after checkpoint");
+    assert_cli(&rerun, 0, CHANGED, b"");
+    assert!(!checkpoint.exists(), "the rerun consumed the checkpoint");
+}
+
+#[test]
+fn release_continuation_children_inherit_only_the_process_environment() {
+    // The continuation's process environment carries the handoff contract,
+    // but providers must see what a plain run gives them: no lock claim and
+    // no flag exports (`-v` exports `SHDEPS_LOG_LEVEL` only to Dot's own
+    // command environment).
+    let fixture = Fixture::release("shdeps-release-handoff-env");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
+    let record = fixture.home.join("provider-env");
+    let output = release_update(&fixture, &[&next])
+        .arg("-v")
+        .env("DOT_TEST_PROVIDER_ENV_RECORD", &record)
+        .output()
+        .expect("verbose release handoff update");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(provider_parents(&fixture).len(), 2);
+    assert_eq!(
+        std::fs::read_to_string(&record).expect("provider env record"),
+        "token= log=unset once=unset\ntoken= log=unset once=1\n"
+    );
+}
+
+#[test]
+fn release_handoff_prunes_once_without_leaking_the_policy() {
+    let fixture = Fixture::release("shdeps-release-handoff-prune");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
+    let output = release_update(&fixture, &[&next])
+        .env("DOT_SHDEPS_PRUNE", "always")
+        .output()
+        .expect("pruning release handoff update");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(provider_parents(&fixture).len(), 2);
+    let stdout = String::from_utf8_lossy(&normalize_elapsed(&output.stdout)).into_owned();
+    assert_eq!(stdout.matches("Prune      ok").count(), 1, "{stdout}");
+    assert_eq!(
+        prune_record(&fixture),
+        Some(expected_prune_record(&fixture, false))
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.home.join("prune-record.update-env"))
+            .expect("provider update env record"),
+        "unset\n"
+    );
+}
+
+#[test]
+fn release_handoff_reports_unknown_config_keys_once() {
+    let fixture = Fixture::release("shdeps-release-handoff-unknown-key");
+    std::fs::write(
+        fixture.home.join(".config/dot/config"),
+        b"version=1\ndependency_provider=shdeps\nshdeps_update_policy=pinned\nfuture_feature=1\n",
+    )
+    .expect("config with a future key");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
+    let output = release_update(&fixture, &[&next])
+        .output()
+        .expect("release handoff update with an unknown key");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(provider_parents(&fixture).len(), 2);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "dot: config: warning: unknown key 'future_feature' ignored (newer dot?)\n"
+    );
+}
+
+#[test]
+fn release_upgrade_hands_off_even_when_another_dependency_failed() {
+    // Shdeps swaps the release root atomically, so a changed root is a whole
+    // new release even when some other dependency failed in the same run.
+    let fixture = Fixture::release("shdeps-release-handoff-tools-failure");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
+    let output = release_update(&fixture, &[&next])
+        .env("DOT_TEST_PROVIDER_FAIL", "1")
+        .output()
+        .expect("release handoff after a failed dependency");
+    // The continuation's own Tools run fails the same way.
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let parents = provider_parents(&fixture);
+    assert_eq!(parents.len(), 2, "{parents:?}");
+    assert_eq!(
+        parents[1].1,
+        format!("{} update", fixture.root.join("dot").display())
+    );
+}
+
+#[test]
+fn release_whose_metadata_vanished_finishes_in_place() {
+    // The provider left the release root without readable metadata: the
+    // upgrade cannot be identified, which must not fail an update that
+    // releases always finished in place before.
+    let fixture = Fixture::release("shdeps-release-metadata-gone");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
+    std::fs::remove_file(next.join(".dot-install.json")).expect("drop staged metadata");
+    let output = release_update(&fixture, &[&next])
+        .output()
+        .expect("release update losing its metadata");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        output.stderr,
+        b"  warning: dot changed during the update but its release metadata is unreadable; finishing this update on the running dot\n"
+    );
+    assert_eq!(provider_parents(&fixture).len(), 1);
+}
+
+#[test]
+fn release_exec_failure_after_the_probe_records_a_failed_run() {
+    // The new binary passes its probe and then disappears before the exec
+    // (a racing reinstall): the run fails visibly, records its cron outcome,
+    // and releases the update lock for the next run.
+    let fixture = Fixture::release("shdeps-release-handoff-exec-failure");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, false);
+    write_exec(&next.join("dot"), b"#!/bin/sh\nrm -f \"$0\"\nexit 0\n");
+    let output = release_update(&fixture, &[&next])
+        .arg("--cron")
+        .output()
+        .expect("release handoff whose exec fails");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "dot: cannot start the updated dot at {}: No such file or directory (os error 2); rerun `dot update` to finish\n",
+            fixture.root.join("dot").display()
+        )
+    );
+    assert_eq!(last_cron_outcome(&fixture), ["fail", "update"]);
+    let log = std::fs::read_to_string(dot::update_status::update_log_path(&fixture.state))
+        .expect("cron outcome log");
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(!fixture.state.join("dot/update.lock.d").exists());
+}
+
+#[test]
+fn checkout_reexec_continuation_keeps_the_update_lock_claim() {
+    // The in-process continuation of a development checkout must hand its
+    // hooks the same lock claim the first half had.
+    let fixture = Fixture::new("shdeps-reexec-lock-claim");
+    fixture.with_merge_hook(TOKEN_HOOK);
+    let output = fixture
+        .command()
+        .env("DOT_TEST_PROVIDER_ADVANCE_SOURCE", "1")
+        .env(
+            "DOT_TEST_PROVIDER_ADVANCED",
+            fixture.home.join("provider-advanced"),
+        )
+        .output()
+        .expect("checkout reexec update");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(fixture.home.join("provider-advanced").exists());
+    assert_eq!(
+        std::fs::read_to_string(fixture.home.join("hook-token")).expect("hook record"),
+        "set\n"
     );
 }
 
