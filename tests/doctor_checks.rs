@@ -8,7 +8,7 @@ use dot::doctor_checks::{
     OverlayInputs, ProviderInputs, ProviderInstaller, Record, check_base_repo,
     check_cron_freshness, check_install_layout, check_merges, check_overlays,
     check_profile_lifecycle, check_provider, check_reexec_checkpoint, check_update_lock,
-    completed_identity_matches_home, is_client_checkout, render, shdeps_binary,
+    completed_identity_matches_home, is_client_checkout, parse_status_v2, render, shdeps_binary,
 };
 use dot_test_support::TempDir;
 
@@ -995,6 +995,273 @@ fn overlays_git_origin_and_manifest_health_matrix() {
 }
 
 #[test]
+fn status_v2_parses_branch_upstream_distance_and_entries() {
+    let status = parse_status_v2(
+        "# branch.oid 0123\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -3\n1 .M N... 100644 100644 100644 a b tracked\n2 R. N... 100644 100644 100644 a b R100 new\told\nu UU N... 100644 100644 100644 100644 a b c conflict\n# branch.future value\n",
+    );
+    assert_eq!(status.head.as_deref(), Some("main"));
+    assert_eq!(status.upstream.as_deref(), Some("origin/main"));
+    assert_eq!(status.ahead_behind, Some((2, 3)));
+    assert_eq!((status.changed, status.unmerged), (2, 1));
+    let detached = parse_status_v2("# branch.oid 0123\n# branch.head (detached)\n");
+    assert_eq!(detached.head, None);
+    assert_eq!(detached.upstream, None);
+    // An upstream whose ref is gone has no distance line.
+    let gone = parse_status_v2("# branch.head main\n# branch.upstream origin/gone\n");
+    assert_eq!(gone.ahead_behind, None);
+    assert_eq!(parse_status_v2("# branch.ab +x -1\n").ahead_behind, None);
+}
+
+#[test]
+fn overlay_branch_upstream_and_dirt_follow_update_severities() {
+    // M7: overlays used to get only "cloned" and "URL matches"; the base
+    // client also got branch, upstream, and tracked changes.
+    let scratch = TempDir::new("doctor-overlay-state").expect("scratch");
+    let remote = scratch.path().join("remote.git");
+    std::fs::create_dir_all(&remote).expect("remote");
+    git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    let seed = scratch.path().join("seed");
+    std::fs::create_dir_all(&seed).expect("seed");
+    git(&seed, &["init", "-q", "-b", "main"]);
+    std::fs::write(seed.join("file"), b"one\n").expect("file");
+    git(&seed, &["add", "file"]);
+    git(&seed, &["commit", "-q", "-m", "seed"]);
+    let remote_text = remote.to_str().expect("remote utf8").to_string();
+    git(&seed, &["push", "-q", &remote_text, "main"]);
+    let repo = scratch.path().join("overlay");
+    let status = dot_test_support::git()
+        .args(["clone", "-q"])
+        .arg(&remote)
+        .arg(&repo)
+        .stdin(Stdio::null())
+        .status()
+        .expect("clone overlay");
+    assert!(status.success());
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let mut input = overlays(manifest, None, false);
+    input.configured_count = 1;
+    input.active_records = vec![format!("git|{}|{remote_text}||false|git", repo.display())];
+    input.overlay_lifecycle = vec!["git|active|d".into()];
+    let rows = || render(&check_overlays(&input));
+
+    let clean = rows();
+    assert!(
+        clean.contains("✓ git: remote.origin.url matches conf"),
+        "{clean}"
+    );
+    assert!(
+        clean.contains("✓ git: upstream (origin/main (current))"),
+        "{clean}"
+    );
+    assert!(!clean.contains('⚠') && !clean.contains('✗'), "{clean}");
+
+    std::fs::write(repo.join("file"), b"two\n").expect("dirty");
+    let dirty = rows();
+    assert!(dirty.contains("⚠ git: 1 tracked change(s)"), "{dirty}");
+    assert!(
+        dirty.contains("✓ git: upstream (origin/main (current))"),
+        "{dirty}"
+    );
+    git(&repo, &["checkout", "-q", "--", "file"]);
+
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "local"]);
+    let ahead = rows();
+    assert!(ahead.contains("⚠ git is ahead of upstream"), "{ahead}");
+    assert!(ahead.contains("origin/main: 1 commit(s) ahead"), "{ahead}");
+
+    git(&repo, &["checkout", "-q", "--detach"]);
+    let detached = rows();
+    assert!(detached.contains("⚠ git: HEAD is detached"), "{detached}");
+    assert!(
+        detached.contains("dot update skips this overlay"),
+        "{detached}"
+    );
+
+    git(&repo, &["checkout", "-q", "-b", "side"]);
+    let untracked = rows();
+    assert!(
+        untracked.contains("⚠ git: upstream is not configured"),
+        "{untracked}"
+    );
+
+    // A conflicted merge leaves unmerged entries: every pull refuses.
+    git(&repo, &["checkout", "-q", "main"]);
+    git(&repo, &["reset", "-q", "--hard", "origin/main"]);
+    git(&repo, &["checkout", "-q", "-b", "theirs"]);
+    std::fs::write(repo.join("file"), b"theirs\n").expect("theirs");
+    git(&repo, &["commit", "-q", "-am", "theirs"]);
+    git(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("file"), b"ours\n").expect("ours");
+    git(&repo, &["commit", "-q", "-am", "ours"]);
+    let merge = dot_test_support::git()
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "merge",
+            "-q",
+            "theirs",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("conflicting merge");
+    assert!(!merge.success(), "the merge must conflict");
+    // Mid-merge, update warns and skips the overlay, so doctor warns too.
+    let merging = rows();
+    assert!(
+        merging.contains("⚠ git: 1 unmerged path(s)\n    a merge or rebase is in progress"),
+        "{merging}"
+    );
+    assert!(merging.contains("⚠ git: 1 tracked change(s)"), "{merging}");
+    assert!(!merging.contains('✗'), "{merging}");
+    // Unmerged entries outside any session make every pull fail.
+    for leftover in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE"] {
+        let _ = std::fs::remove_file(repo.join(".git").join(leftover));
+    }
+    let conflicted = rows();
+    assert!(
+        conflicted.contains(
+            "✗ git: 1 unmerged path(s)\n    dot update fails until the conflict is resolved"
+        ),
+        "{conflicted}"
+    );
+}
+
+/// A bare remote with one commit on `main`, plus `count` clones of it.
+fn overlay_clones(root: &Path, count: usize) -> (String, Vec<std::path::PathBuf>) {
+    let remote = root.join("remote.git");
+    std::fs::create_dir_all(&remote).expect("remote");
+    git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    let seed = root.join("seed");
+    std::fs::create_dir_all(&seed).expect("seed");
+    git(&seed, &["init", "-q", "-b", "main"]);
+    std::fs::write(seed.join("file"), b"one\n").expect("file");
+    git(&seed, &["add", "file"]);
+    git(&seed, &["commit", "-q", "-m", "seed"]);
+    let remote_text = remote.to_str().expect("remote utf8").to_string();
+    git(&seed, &["push", "-q", &remote_text, "main"]);
+    let clones = (0..count)
+        .map(|index| {
+            let repo = root.join(format!("overlay{index}"));
+            let status = dot_test_support::git()
+                .args(["clone", "-q"])
+                .arg(&remote)
+                .arg(&repo)
+                .stdin(Stdio::null())
+                .status()
+                .expect("clone overlay");
+            assert!(status.success());
+            repo
+        })
+        .collect();
+    (remote_text, clones)
+}
+
+/// Overlay inputs naming each clone `ov<index>`.
+fn clone_inputs<'a>(
+    manifest: String,
+    remote: &str,
+    clones: &[std::path::PathBuf],
+) -> OverlayInputs<'a> {
+    let mut input = overlays(manifest, None, false);
+    input.configured_count = clones.len();
+    input.active_records = clones
+        .iter()
+        .enumerate()
+        .map(|(index, repo)| format!("ov{index}|{}|{remote}||false|git", repo.display()))
+        .collect();
+    input.overlay_lifecycle = (0..clones.len())
+        .map(|index| format!("ov{index}|active|d"))
+        .collect();
+    input
+}
+
+#[test]
+fn concurrent_overlay_statuses_land_on_their_own_overlay() {
+    // The statuses run in parallel; each result must reach its own row.
+    let scratch = TempDir::new("doctor-overlay-state-stress").expect("scratch");
+    let (remote, clones) = overlay_clones(scratch.path(), 8);
+    for (index, repo) in clones.iter().enumerate() {
+        match index % 4 {
+            1 => std::fs::write(repo.join("file"), b"dirty\n").expect("dirty"),
+            2 => git(repo, &["commit", "-q", "--allow-empty", "-m", "ahead"]),
+            3 => git(repo, &["checkout", "-q", "--detach"]),
+            _ => {}
+        }
+    }
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let input = clone_inputs(manifest, &remote, &clones);
+    for _ in 0..5 {
+        let rows = render(&check_overlays(&input));
+        for index in 0..clones.len() {
+            let expected = match index % 4 {
+                0 => format!("✓ ov{index}: upstream (origin/main (current))"),
+                1 => format!("⚠ ov{index}: 1 tracked change(s)"),
+                2 => format!("⚠ ov{index} is ahead of upstream"),
+                _ => format!("⚠ ov{index}: HEAD is detached"),
+            };
+            assert!(rows.contains(&expected), "missing {expected:?}: {rows}");
+        }
+        assert_eq!(rows.matches("tracked change(s)").count(), 2, "{rows}");
+    }
+}
+
+#[test]
+fn concurrent_overlay_statuses_use_the_bound_host_git() {
+    // Worker threads do not inherit the thread-local host Git binding; the
+    // probes must carry it rather than fall back to `git` on PATH.
+    let scratch = TempDir::new_exec("doctor-overlay-state-host-git").expect("scratch");
+    let (remote, clones) = overlay_clones(scratch.path(), 3);
+    let log = scratch.path().join("git.log");
+    let wrapper = scratch.path().join("host-git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            dot_test_support::real_tool("git").display()
+        ),
+    )
+    .expect("wrapper");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("wrapper mode");
+    }
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let input = clone_inputs(manifest, &remote, &clones);
+    let rows = {
+        let _bound = dot::init_client_identity::bind_host_git_for_scope(&wrapper);
+        render(&check_overlays(&input))
+    };
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    for repo in &clones {
+        let call = format!(
+            "-C {} --no-optional-locks status --porcelain=v2 --branch --untracked-files=no",
+            repo.display()
+        );
+        assert!(calls.contains(&call), "missing {call:?} in {calls}\n{rows}");
+    }
+}
+
+#[test]
 fn shdeps_selection_precedence_and_fallback() {
     let scratch = TempDir::new_exec("doctor-shdeps-native").expect("scratch");
     let explicit = scratch.path().join("chosen");
@@ -1312,6 +1579,53 @@ fn base_repo_ordinary_dirty_detached_upstream_and_mismatch_matrix() {
         &nested,
     )));
     assert!(mismatch.contains("client worktree mismatch"));
+
+    // Unmerged entries make every pull refuse: a failure, not dirt.
+    git(&home, &["checkout", "-q", "main"]);
+    git(&home, &["checkout", "-q", "--", "tracked"]);
+    git(&home, &["checkout", "-q", "-b", "theirs"]);
+    std::fs::write(home.join("tracked"), b"theirs\n").expect("theirs");
+    git(&home, &["commit", "-q", "-am", "theirs"]);
+    git(&home, &["checkout", "-q", "main"]);
+    std::fs::write(home.join("tracked"), b"ours\n").expect("ours");
+    git(&home, &["commit", "-q", "-am", "ours"]);
+    let merge = dot_test_support::git()
+        .arg("-C")
+        .arg(&home)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "merge",
+            "-q",
+            "theirs",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("conflicting merge");
+    assert!(!merge.success(), "the merge must conflict");
+    let conflicted = render(&check_base_repo(&base(
+        "ordinary",
+        &home.join(".git"),
+        &home,
+    )));
+    // Without an upstream update skips the client, so this only warns, and
+    // the unmerged entry still counts as a tracked change.
+    assert!(
+        conflicted.contains("⚠ 1 unmerged client path(s)"),
+        "{conflicted}"
+    );
+    assert!(
+        conflicted.contains("⚠ 1 tracked client change(s)"),
+        "{conflicted}"
+    );
+    assert!(
+        !conflicted.contains("no tracked client changes"),
+        "{conflicted}"
+    );
 }
 
 #[test]
@@ -1339,7 +1653,13 @@ fn base_repo_separate_and_unrecognized_topology_matrix() {
 
     let unknown = render(&check_base_repo(&base("liminal", &bare, &home)));
     assert!(unknown.contains("client worktree mismatch"));
-    assert!(unknown.contains("client upstream is not configured"));
+    // No status at all is reported as such, not as a clean, detached
+    // checkout without an upstream.
+    assert!(
+        unknown.contains("⚠ client repository status is unavailable"),
+        "{unknown}"
+    );
+    assert!(!unknown.contains("no tracked client changes"), "{unknown}");
 }
 
 #[test]

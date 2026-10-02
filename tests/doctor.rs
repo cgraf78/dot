@@ -1025,6 +1025,70 @@ fn init_client(home: &TempDir, state: &TempDir, origin: &Path) {
 }
 
 #[test]
+fn base_repository_state_costs_one_status_call() {
+    // P3: branch, upstream distance, and tracked changes used to cost four
+    // Git processes (and relied on repo config for `-uno`); one
+    // porcelain-v2 status answers all of them.
+    let scope = TempDir::new("doctor-status-calls-origin").expect("origin scope");
+    let home = TempDir::new("doctor-status-calls-home").expect("home");
+    let state = TempDir::new("doctor-status-calls-state").expect("state");
+    let origin = origin(scope.path());
+    init_client(&home, &state, &origin);
+    let wrappers = TempDir::new_exec("doctor-status-calls-git").expect("wrappers");
+    let log = wrappers.path().join("git.log");
+    let wrapper = wrappers.path().join("git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            dot_test_support::real_tool("git").display()
+        ),
+    )
+    .expect("git wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("wrapper mode");
+    let path = format!(
+        "{}:{}",
+        wrappers.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let native = command(false, &home, &state, &[("PATH", &path)])
+        .output()
+        .expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(stdout.contains("✓ no tracked client changes"), "{stdout}");
+    assert!(
+        stdout.contains("✓ client HEAD on branch (main)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("✓ client upstream (origin/main (current))"),
+        "{stdout}"
+    );
+    let calls = std::fs::read_to_string(&log).expect("git log");
+    let base: Vec<&str> = calls
+        .lines()
+        .filter(|line| line.contains("--work-tree="))
+        .collect();
+    assert_eq!(
+        base.iter()
+            .filter(|line| line.ends_with(" status --porcelain=v2 --branch --untracked-files=no"))
+            .count(),
+        1,
+        "{calls}"
+    );
+    for retired in ["symbolic-ref", "rev-list", "@{u}", "status --porcelain\n"] {
+        assert!(
+            !base
+                .iter()
+                .any(|line| format!("{line}\n").contains(retired)),
+            "{retired} still runs: {calls}"
+        );
+    }
+}
+
+#[test]
 fn missing_client_and_clear_lock_match_without_the_old_engine() {
     // Catches routing doctor back through the removed whole-engine adapter and
     // covers failing source/base plus the healthy lock/no-provider/no-overlay
