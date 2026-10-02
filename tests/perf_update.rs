@@ -3331,8 +3331,12 @@ fn should_skip(root: ClientRoot, relative: &Path) -> bool {
             }
         }
     }
+    // `dot/update.last-run` is per-run observability (an epoch plus the
+    // trigger), not converged state: it differs between any two runs, and a
+    // baseline engine older than the stamp never writes it.
     if matches!(root, ClientRoot::State)
         && (relative == Path::new("dot/bash-v1")
+            || relative == Path::new("dot/update.last-run")
             || relative == Path::new("shdeps/shdeps.self-update.stamp")
             || relative == Path::new("shdeps/.lock"))
     {
@@ -4731,6 +4735,20 @@ fn state_snapshot_ignores_directories_holding_only_excluded_markers() {
         snapshot_client(&shell),
         snapshot_client(&rust),
         "directories holding only excluded markers must not break parity"
+    );
+
+    // The any-trigger last-run stamp carries an epoch per run, and an engine
+    // older than it writes none: one side holding it must not break parity.
+    fs::create_dir_all(rust.state.join("dot")).expect("rust state directory");
+    fs::write(
+        rust.state.join("dot/update.last-run"),
+        b"1700000000 ok manual\n",
+    )
+    .expect("rust last-run stamp");
+    assert_eq!(
+        snapshot_client(&shell),
+        snapshot_client(&rust),
+        "the last-run stamp must not break parity"
     );
 
     // Non-excluded content under the same directories is still converged.
