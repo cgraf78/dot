@@ -337,10 +337,20 @@ pub fn check_runtime(
             unknown.line,
             unknown.hint()
         );
-        rec.warn(
-            b"unknown configuration key ignored",
-            Some(detail.as_bytes()),
-        );
+        // Severity follows `dot update`: a likely misspelling makes every
+        // update exit 1 (the meant setting kept its default), so doctor
+        // fails on it too; a key from a newer Dot is safe to miss.
+        if unknown.degrades_update() {
+            rec.fail(
+                b"unknown configuration key ignored",
+                Some(detail.as_bytes()),
+            );
+        } else {
+            rec.warn(
+                b"unknown configuration key ignored",
+                Some(detail.as_bytes()),
+            );
+        }
     }
     check_engine_source(rec, engine, home);
 }

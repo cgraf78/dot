@@ -78,6 +78,14 @@ impl UnknownKey {
             .map(|(_, known)| known)
     }
 
+    /// Whether this key degrades `dot update`: a likely misspelling
+    /// leaves the setting it meant at its default, so every update that
+    /// otherwise converges exits 1 while it is present. `dot doctor`
+    /// shares the rule so its severity matches the update outcome.
+    pub fn degrades_update(&self) -> bool {
+        self.suggestion().is_some()
+    }
+
     /// Short reason shown after the key: a typo guess, else the
     /// version-skew explanation.
     pub fn hint(&self) -> String {

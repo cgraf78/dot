@@ -213,9 +213,11 @@ fn is_executable_bits(mode: u32) -> bool {
 
 /// One owner row for [`check_update_lock`]: the row must agree with
 /// what `acquire` will do. `acquire` reclaims stale owners but
-/// *refuses* when the owner probe cannot verify liveness, so
-/// `Unknown`/`Interrupted` get their own row instead of sharing the
-/// stale "will reclaim" promise.
+/// *refuses* when the owner probe cannot verify liveness, so `Unknown`
+/// fails (every mutating command refuses until the probe succeeds) instead
+/// of sharing the stale "will reclaim" promise. A live owner stays a
+/// warning (the refusal ends when that update does), as does a probe
+/// interrupted by a signal to doctor itself.
 fn lock_owner_record(
     owner: &crate::update_lock::Owner,
     activity: crate::update_lock::OwnerActivity,
@@ -231,9 +233,15 @@ fn lock_owner_record(
             "update lock owner is stale",
             Some("the next mutating command will reclaim it".to_string()),
         ),
-        Activity::Unknown | Activity::Interrupted => Record::warn(
+        Activity::Unknown => Record::fail(
             "update lock owner cannot be verified",
             Some("mutating commands refuse until the owner probe succeeds".to_string()),
+        ),
+        // Only this doctor run was interrupted mid-probe; nothing about the
+        // lock is known to be wrong.
+        Activity::Interrupted => Record::warn(
+            "update lock owner cannot be verified",
+            Some("the owner probe was interrupted".to_string()),
         ),
     }
 }
@@ -531,6 +539,10 @@ pub struct CronInputs {
     /// none was recorded (including every run by a Dot older than the
     /// convergence stamp).
     pub last_converged: Option<crate::update_status::Converged>,
+    /// The last update run of any trigger (`update.last-run`), or `None`
+    /// when none was recorded (including every run by a Dot older than
+    /// that stamp).
+    pub last_run: Option<crate::update_status::LastRun>,
     /// Current epoch seconds.
     pub now: i64,
 }
@@ -548,26 +560,50 @@ pub struct CronInputs {
 /// stopped converging. Both use the same staleness window, so a
 /// transient failure after a recent clean run still reads ok, exactly
 /// as before the degraded outcome existed.
+///
+/// The any-trigger last-run stamp fills the gaps the cron stamps leave: a
+/// host whose cron entry never ran warns once its last hand-run update is
+/// older than the staleness window (instead of reading "unknown" forever),
+/// and the last hand-run update is reported whenever it adds information:
+/// always without a recent clean cron run, otherwise only when it did not
+/// succeed.
 pub fn check_cron_freshness(inputs: &CronInputs) -> Vec<Record> {
+    let mut out = vec![Record::section("Update")];
+    let clean = cron_freshness(inputs, &mut out);
+    if let Some(record) = last_run_record(inputs, clean) {
+        out.push(record);
+    }
+    out
+}
+
+/// The cron row of [`check_cron_freshness`]; returns the epoch of the last
+/// clean cron run when it is recent enough to vouch for the host.
+fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
     use crate::update_status::{format_age, is_stale};
 
-    let mut out = vec![Record::section("Update")];
     let age = |at: i64| format_age(inputs.now.saturating_sub(at));
     let converged = inputs.last_converged.as_ref();
     // A clean convergence stamp is a success even if the last-success
-    // write was lost; both are written by the same clean run.
+    // write was lost; both are written by the same clean run. A clean cron
+    // last run counts too, in case both stamp writes were lost.
+    let clean_cron_run = inputs
+        .last_run
+        .as_ref()
+        .filter(|last| last.is_cron() && last.outcome == crate::update_status::OUTCOME_OK)
+        .map(|last| last.at);
     let clean = converged
         .filter(|converged| converged.failing.is_empty())
         .map(|converged| converged.at)
         .into_iter()
         .chain(inputs.last_success)
+        .chain(clean_cron_run)
         .max();
     if let Some(clean) = clean.filter(|clean| !is_stale(*clean, inputs.now)) {
         out.push(Record::ok(
             "cron update succeeded recently",
             Some(format!("{} ago", age(clean))),
         ));
-        return out;
+        return Some(clean);
     }
     if let Some(converged) = converged
         .filter(|converged| !converged.failing.is_empty() && !is_stale(converged.at, inputs.now))
@@ -580,7 +616,7 @@ pub fn check_cron_freshness(inputs: &CronInputs) -> Vec<Record> {
             format!("cron update degraded: {} failing", converged.failing),
             Some(format!("{since}; last converged {} ago", age(converged.at))),
         ));
-        return out;
+        return None;
     }
     // Stale from here on. `clean` (not just last-success) is the success
     // reference, so a lone clean convergence stamp reads as a success. Only
@@ -602,12 +638,143 @@ pub fn check_cron_freshness(inputs: &CronInputs) -> Vec<Record> {
                 "no successful cron update recorded{converged_note}"
             )),
         )),
-        None => out.push(Record::skip(
+        None => out.push(never_converged_record(inputs)),
+    }
+    None
+}
+
+/// The cron row when no cron run ever converged. Before the last-run stamp
+/// this always read "unknown"; with it, a cron run that only ever failed
+/// warns, and a host updated only by hand warns once its last update is
+/// older than the staleness window (a cron entry would have run by then),
+/// while a host that has never updated at all still reads unknown.
+fn never_converged_record(inputs: &CronInputs) -> Record {
+    use crate::update_status::{format_age, is_stale};
+
+    let age = |at: i64| format_age(inputs.now.saturating_sub(at));
+    let Some(last) = inputs.last_run.as_ref() else {
+        return Record::skip(
             "cron update success is unknown",
             Some("no successful cron update recorded".to_string()),
-        )),
+        );
+    };
+    if last.is_cron() {
+        return Record::warn(
+            "cron update has not succeeded recently",
+            Some(format!(
+                "no successful cron update recorded; last cron run {} {} ago",
+                last.outcome,
+                age(last.at)
+            )),
+        );
     }
-    out
+    if is_stale(last.at, inputs.now) {
+        return Record::warn(
+            "cron update has never run",
+            Some(format!(
+                "last update ran by {} {} ago; schedule dot update --cron to keep this host current",
+                last.trigger,
+                age(last.at)
+            )),
+        );
+    }
+    Record::skip(
+        "cron update has not run yet",
+        Some(format!(
+            "last update ran by {} {} ago",
+            last.trigger,
+            age(last.at)
+        )),
+    )
+}
+
+/// The last hand-run (`manual` or `init`) update, when it adds information
+/// beyond the cron row: always without a recent clean cron run (the cron
+/// row cannot vouch for this host then), otherwise only when it did not
+/// succeed and is newer than that clean run. A failed or degraded run
+/// warns rather than fails: the conditions that make every update exit 1
+/// have rows of their own, and a one-off failure (a network blip) heals on
+/// the next run.
+fn last_run_record(inputs: &CronInputs, clean_cron: Option<i64>) -> Option<Record> {
+    use crate::update_status::{OUTCOME_DEGRADED, OUTCOME_OK, format_age};
+
+    let last = inputs.last_run.as_ref().filter(|last| !last.is_cron())?;
+    let succeeded = last.outcome == OUTCOME_OK;
+    if let Some(clean) = clean_cron {
+        if succeeded || last.at <= clean {
+            return None;
+        }
+    }
+    let detail = format!(
+        "ran by {} {} ago",
+        last.trigger,
+        format_age(inputs.now.saturating_sub(last.at))
+    );
+    Some(if succeeded {
+        Record::ok("last update succeeded", Some(detail))
+    } else if last.outcome == OUTCOME_DEGRADED {
+        let failing = if last.failing.is_empty() {
+            "a stage"
+        } else {
+            last.failing.as_str()
+        };
+        Record::warn(
+            format!("last update degraded: {failing} failing"),
+            Some(format!(
+                "{detail}; rerun dot update to see the failing stage"
+            )),
+        )
+    } else {
+        Record::warn(
+            "last update failed",
+            Some(format!("{detail}; rerun dot update to see what failed")),
+        )
+    })
+}
+
+/// The provider re-exec checkpoint row for the `Update` section (none when
+/// the record is absent). `dot update` refuses to proceed past a record it
+/// cannot consume, so those states fail; a record the next update will
+/// validate and remove only warns. `state` comes from
+/// [`crate::shdeps::checkpoint_state`], which shares the consume logic.
+pub fn check_reexec_checkpoint(
+    state: &crate::shdeps::CheckpointState,
+    path: &Path,
+    home: &str,
+) -> Vec<Record> {
+    use crate::shdeps::CheckpointState;
+
+    let shown = tilde(&path.to_string_lossy(), home);
+    let short = |revision: &str| -> String {
+        if revision.is_empty() {
+            "<unavailable>".to_string()
+        } else {
+            revision.chars().take(12).collect()
+        }
+    };
+    match state {
+        CheckpointState::Absent => Vec::new(),
+        CheckpointState::Pending => vec![Record::warn(
+            "provider re-exec checkpoint pending",
+            Some(format!(
+                "{shown}: dot changed twice during the last update; the next dot update validates and removes it"
+            )),
+        )],
+        CheckpointState::Unreadable => vec![Record::fail(
+            "provider re-exec checkpoint blocks dot update",
+            Some(format!(
+                "{shown} is unsafe or malformed; inspect it, remove it, then run dot update"
+            )),
+        )],
+        CheckpointState::Mismatch { pinned, active } => vec![Record::fail(
+            "provider re-exec checkpoint blocks dot update",
+            Some(format!(
+                "{shown} pins {} but dot is at {}; inspect the provider state, remove the record, then run dot update",
+                short(pinned),
+                short(active)
+            )),
+        )],
+    }
 }
 
 /// Inputs for [`check_profile_lifecycle`]: the profile lifecycle
@@ -969,9 +1136,15 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 ));
             }
             Err(actual) => {
-                out.push(Record::warn(
+                // `dot update` refuses to pull or link an overlay whose
+                // origin differs from its descriptor and exits 1, so the
+                // drift is a failure here too.
+                let adopt = crate::repos_pull_support::adopt_command(&path, &expected, &actual);
+                out.push(Record::fail(
                     format!("{name}: remote URL drift"),
-                    Some(format!("conf={expected} vs actual={actual}")),
+                    Some(format!(
+                        "conf={expected} vs actual={actual}; verify the checkout, then adopt it with: {adopt}"
+                    )),
                 ));
             }
         }
@@ -1071,6 +1244,208 @@ fn check_overlay_links(
             format!("{issues} overlay symlink issue(s)"),
             Some("run 'dot update' to re-link".to_string()),
         ));
+    }
+}
+
+/// Control directory the standalone installer (`install.sh`) keeps beside
+/// the stable release root: `<data>/cgraf78/dot -> .dot-standalone/current
+/// -> releases/<version>-<platform>`, with `lock` held while it runs.
+const STANDALONE_CONTROL: &str = ".dot-standalone";
+/// The standalone installer's versioned release directory parent.
+const STANDALONE_RELEASES: &str = "releases";
+/// Archive ownership marker Shdeps writes into a `github:release` root it
+/// installed (`.shdeps-release-layout` holding exactly `v1 archive`).
+const SHDEPS_LAYOUT_FILE: &str = ".shdeps-release-layout";
+/// The only marker content Shdeps accepts.
+const SHDEPS_LAYOUT_CONTENT: &[u8] = b"v1 archive\n";
+/// Infix of the sibling Shdeps parks the prior root under while it swaps
+/// in a new archive (`<root>.shdeps-archive-backup-<pid>-<nanos>`); one
+/// left behind means an install was interrupted.
+const SHDEPS_BACKUP_INFIX: &str = ".shdeps-archive-backup-";
+
+/// Inputs for [`check_install_layout`].
+pub struct InstallInputs<'a> {
+    /// `$HOME`, for display only.
+    pub home: &'a str,
+    /// The running engine's source root, physically resolved.
+    pub source_real: &'a Path,
+    /// Whether that root is a packaged release (`.dot-install.json`), not
+    /// a checkout.
+    pub release_root: bool,
+    /// `${SHDEPS_INSTALL_DIR:-$HOME/.local/share}/cgraf78/dot`, the root
+    /// Shdeps upgrades, spelled as configured.
+    pub managed_root: &'a Path,
+    /// Whether Shdeps is the configured dependency provider (and so owns
+    /// Dot's upgrade).
+    pub shdeps: bool,
+}
+
+/// The standalone control directory owning `release`, when `release` (a
+/// physical path) is one of the standalone installer's versioned releases.
+fn standalone_control(release: &Path) -> Option<&Path> {
+    let releases = release.parent()?;
+    let control = releases.parent()?;
+    (releases.file_name()? == STANDALONE_RELEASES && control.file_name()? == STANDALONE_CONTROL)
+        .then_some(control)
+}
+
+/// Release-install layout health (stat-level, no processes): which
+/// installer owns the Dot release Shdeps would upgrade, and whether that
+/// owner can still upgrade it.
+///
+/// Shdeps never upgrades a symlinked install root, so a managed root that
+/// links into the standalone installer's control directory
+/// (`<root> -> .dot-standalone/current`) never upgrades under the Shdeps
+/// provider: that fails, whichever Dot is running. The verdict is anchored
+/// on the managed root rather than the running binary, so a test harness
+/// or development checkout running beside a healthy Shdeps install stays
+/// quiet. Without a provider, the standalone installer is the upgrade
+/// path. A Shdeps-installed root must carry the archive marker Shdeps
+/// validates before it touches the root (a wrong marker fails; a missing
+/// one warns because Shdeps backfills it when the public command proves
+/// ownership). Leftover install state is reported too: the standalone
+/// installer refuses to run while its lock exists, and an archive backup
+/// sibling means a Shdeps install was interrupted. Checkouts report
+/// nothing: their updates do not go through either installer.
+pub fn check_install_layout(inputs: &InstallInputs) -> Vec<Record> {
+    let mut out = Vec::new();
+    let managed_link = std::fs::symlink_metadata(inputs.managed_root)
+        .is_ok_and(|meta| meta.file_type().is_symlink());
+    let managed_real = std::fs::canonicalize(inputs.managed_root).ok();
+    let managed_standalone = managed_real
+        .as_deref()
+        .filter(|_| managed_link)
+        .and_then(standalone_control);
+    let running_standalone = if inputs.release_root {
+        standalone_control(inputs.source_real)
+    } else {
+        None
+    };
+    let standalone = if inputs.shdeps {
+        managed_standalone
+    } else {
+        managed_standalone.or(running_standalone)
+    };
+    if let Some(control) = standalone {
+        if inputs.shdeps {
+            out.push(Record::fail(
+                "dot release is standalone-installed; Shdeps cannot upgrade it",
+                Some(format!(
+                    "{} links into {STANDALONE_CONTROL}, and Shdeps leaves a symlinked install root alone; replace it with a Shdeps release install",
+                    tilde(&inputs.managed_root.to_string_lossy(), inputs.home)
+                )),
+            ));
+        } else {
+            out.push(Record::ok(
+                "dot release layout",
+                Some("standalone installer (rerun install.sh to upgrade)".to_string()),
+            ));
+        }
+        // A warning, not a failure: the lock blocks only a manual
+        // `install.sh` rerun (never `dot update`), and it is legitimately
+        // present while an installer runs.
+        let lock = control.join("lock");
+        if std::fs::symlink_metadata(&lock).is_ok() {
+            out.push(Record::warn(
+                "standalone installer lock is present",
+                Some(format!(
+                    "{}: install.sh refuses to run while it exists; remove it if no installer is running",
+                    tilde(&lock.to_string_lossy(), inputs.home)
+                )),
+            ));
+        }
+        return out;
+    }
+    let managed_dir =
+        std::fs::symlink_metadata(inputs.managed_root).is_ok_and(|meta| meta.file_type().is_dir());
+    let running_managed = managed_real.as_deref() == Some(inputs.source_real);
+    if !inputs.shdeps {
+        return out;
+    }
+    if inputs.release_root && managed_dir && running_managed {
+        check_layout_marker(inputs, &mut out);
+    }
+    // Leftovers are reported whichever Dot runs: a failed swap whose rollback
+    // also failed leaves only the backup, with no root to run from.
+    check_install_leftovers(inputs, managed_dir, &mut out);
+    out
+}
+
+/// The Shdeps archive marker of the managed release root Dot runs from.
+fn check_layout_marker(inputs: &InstallInputs, out: &mut Vec<Record>) {
+    let marker = inputs.managed_root.join(SHDEPS_LAYOUT_FILE);
+    let marker_shown = tilde(&marker.to_string_lossy(), inputs.home);
+    match std::fs::symlink_metadata(&marker) {
+        Ok(meta) if meta.file_type().is_file() => {
+            if std::fs::read(&marker).is_ok_and(|content| content == SHDEPS_LAYOUT_CONTENT) {
+                out.push(Record::ok("dot release layout", Some("Shdeps release".to_string())));
+            } else {
+                out.push(Record::fail(
+                    "dot release layout marker is invalid",
+                    Some(format!(
+                        "{marker_shown}: Shdeps refuses to upgrade until it holds 'v1 archive'"
+                    )),
+                ));
+            }
+        }
+        Ok(_) => out.push(Record::fail(
+            "dot release layout marker is invalid",
+            Some(format!(
+                "{marker_shown} is not a regular file; Shdeps refuses to upgrade until it is"
+            )),
+        )),
+        Err(_) => out.push(Record::warn(
+            "dot release has no Shdeps layout marker",
+            Some(format!(
+                "{marker_shown}: Shdeps records it when the public command proves ownership and otherwise refuses to upgrade"
+            )),
+        )),
+    }
+}
+
+/// Install state left behind beside the managed root: an interrupted
+/// Shdeps archive swap's backup sibling and the standalone installer's lock.
+fn check_install_leftovers(inputs: &InstallInputs, managed_dir: bool, out: &mut Vec<Record>) {
+    if let (Some(parent), Some(name)) = (
+        inputs.managed_root.parent(),
+        inputs.managed_root.file_name(),
+    ) {
+        let prefix = format!("{}{SHDEPS_BACKUP_INFIX}", name.to_string_lossy());
+        let mut backups: Vec<String> = std::fs::read_dir(parent)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let entry_name = entry.file_name().to_string_lossy().into_owned();
+                entry_name
+                    .strip_prefix('.')
+                    .unwrap_or(&entry_name)
+                    .starts_with(&prefix)
+                    .then(|| tilde(&entry.path().to_string_lossy(), inputs.home))
+            })
+            .collect();
+        backups.sort();
+        if !backups.is_empty() {
+            let next = if managed_dir {
+                "remove it once dot runs from the current release"
+            } else {
+                "the install root is missing; run dot update to reinstall it"
+            };
+            out.push(Record::warn(
+                "interrupted Shdeps install left a backup",
+                Some(format!("{}; {next}", backups.join(" "))),
+            ));
+        }
+        let lock = parent.join(STANDALONE_CONTROL).join("lock");
+        if std::fs::symlink_metadata(&lock).is_ok() {
+            out.push(Record::warn(
+                "leftover standalone installer lock",
+                Some(format!(
+                    "{}: no longer used by this Shdeps install; remove it",
+                    tilde(&lock.to_string_lossy(), inputs.home)
+                )),
+            ));
+        }
     }
 }
 
@@ -1701,10 +2076,22 @@ mod tests {
         let stale = rendered(Activity::Stale);
         assert!(stale.contains("owner is stale"));
         assert!(stale.contains("will reclaim it"));
-        for activity in [Activity::Unknown, Activity::Interrupted] {
-            let row = rendered(activity);
-            assert!(row.contains("cannot be verified"));
-            assert!(row.contains("refuse"));
+        assert!(rendered(Activity::Active).contains('⚠'));
+        assert!(stale.contains('⚠'));
+        // `acquire` refuses on an unverifiable owner, so doctor fails; a
+        // probe interrupted by a signal to doctor itself only warns.
+        let unknown = rendered(Activity::Unknown);
+        assert!(
+            unknown.contains("✗ update lock owner cannot be verified"),
+            "{unknown}"
+        );
+        assert!(unknown.contains("refuse"));
+        let interrupted = rendered(Activity::Interrupted);
+        assert!(
+            interrupted.contains("⚠ update lock owner cannot be verified"),
+            "{interrupted}"
+        );
+        for row in [unknown, interrupted] {
             assert!(!row.contains("reclaim"));
         }
     }

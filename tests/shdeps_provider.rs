@@ -4779,6 +4779,54 @@ fn cron_tools_failure_is_degraded_and_a_clean_run_clears_it() {
     assert!(dot::update_status::last_success_path(&fixture.state).exists());
 }
 
+/// Fields after the epoch of the any-trigger last-run stamp, read by raw
+/// path so the test pins the on-disk layout `dot doctor` reads.
+fn last_run_fields(fixture: &Fixture) -> Vec<String> {
+    let body =
+        std::fs::read_to_string(fixture.state.join("dot/update.last-run")).expect("last run");
+    let line = body.strip_suffix('\n').expect("one terminated line");
+    let mut fields = line.split(' ');
+    let epoch: i64 = fields
+        .next()
+        .expect("epoch")
+        .parse()
+        .expect("numeric epoch");
+    assert!(epoch > 1_700_000_000, "last-run epoch sane: {body:?}");
+    fields.map(str::to_string).collect()
+}
+
+#[test]
+fn every_update_records_its_last_run_outcome() {
+    // M8: hand-run updates left no outcome behind, so a host updated only by
+    // hand read "unknown" in doctor forever.
+    let fixture = Fixture::new("shdeps-last-run");
+    let degraded = fixture
+        .command()
+        .env("DOT_TEST_PROVIDER_FAIL", "1")
+        .output()
+        .expect("manual update with failing tools");
+    assert_eq!(degraded.status.code(), Some(1), "{degraded:?}");
+    assert_eq!(last_run_fields(&fixture), ["degraded", "manual", "tools"]);
+    // A hand-run update writes nothing else: the cron log and stamps keep
+    // measuring cron-slot health only.
+    assert!(!dot::update_status::update_log_path(&fixture.state).exists());
+    assert!(!dot::update_status::last_success_path(&fixture.state).exists());
+    assert!(!dot::update_status::last_converged_path(&fixture.state).exists());
+
+    let clean = fixture.command().output().expect("clean manual update");
+    assert_eq!(clean.status.code(), Some(0), "{clean:?}");
+    assert_eq!(last_run_fields(&fixture), ["ok", "manual"]);
+
+    let cron = fixture
+        .command()
+        .arg("--cron")
+        .output()
+        .expect("clean cron update");
+    assert_cli(&cron, 0, b"", b"");
+    assert_eq!(last_run_fields(&fixture), ["ok", "cron"]);
+    assert_eq!(last_cron_outcome(&fixture), ["ok", "update"]);
+}
+
 #[test]
 fn cron_prune_that_shdeps_defers_with_a_warning_is_a_clean_run() {
     // Newer Shdeps defers a sudo-needing uninstall without a terminal: it

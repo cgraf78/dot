@@ -441,12 +441,58 @@ fn consume_case(label: &str, kind: ConsumeKind, expected: bool, kept: bool) {
             std::os::unix::fs::symlink(home.path().join("missing"), &target).expect("symlink");
         }
     }
+    // `dot doctor` predicts the consumer without touching the record: the
+    // states it reports as harmless are exactly the ones `dot update`
+    // proceeds past, and every refusal is reported as blocking.
+    let present = target.symlink_metadata().is_ok();
+    let predicted = dot::shdeps::checkpoint_state(&target, source);
+    assert_eq!(
+        target.symlink_metadata().is_ok(),
+        present,
+        "{label} prediction must not consume"
+    );
+    assert_eq!(
+        matches!(
+            predicted,
+            dot::shdeps::CheckpointState::Absent | dot::shdeps::CheckpointState::Pending
+        ),
+        expected,
+        "{label} prediction: {predicted:?}"
+    );
+    assert_eq!(
+        predicted == dot::shdeps::CheckpointState::Absent,
+        !present,
+        "{label} absence: {predicted:?}"
+    );
     assert_eq!(
         dot::shdeps::consume_checkpoint(&target, source),
         expected,
         "{label}"
     );
     assert_eq!(target.symlink_metadata().is_ok(), kept, "{label} survival");
+}
+
+#[test]
+fn checkpoint_state_names_the_pinned_and_active_revisions() {
+    let home = TempDir::new("shdeps-checkpoint-state").expect("fixture directory");
+    let head = init_repo(home.path());
+    let target = stage_mode(
+        home.path(),
+        ".local/state/dot/provider-reexec-failed",
+        &record(R40A, &R40B.to_ascii_uppercase()),
+        0o600,
+    );
+    assert_eq!(
+        dot::shdeps::checkpoint_state(&target, home.path()),
+        dot::shdeps::CheckpointState::Mismatch {
+            pinned: R40B.to_owned(),
+            active: head,
+        }
+    );
+    assert_eq!(
+        dot::shdeps::checkpoint_in(Path::new("/srv/state")),
+        PathBuf::from("/srv/state/dot/provider-reexec-failed")
+    );
 }
 
 #[test]
