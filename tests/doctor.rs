@@ -1809,7 +1809,7 @@ fn dangling_extension_link_is_refused_alone() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
     assert!(
-        stdout.contains("  ✗ 20-gone doctor extension refused\n    ~/extensions/doctor.d/20-gone.sh is not linked from an active overlay (dangling or retired links); run dot update to relink overlay extensions\n"),
+        stdout.contains("  ✗ 20-gone doctor extension refused\n    ~/extensions/doctor.d/20-gone.sh is not linked from an active overlay (a dangling or retired link); run dot update to relink overlay extensions\n"),
         "{stdout}"
     );
     assert!(!stdout.contains("discovery failed"), "{stdout}");
@@ -1889,6 +1889,56 @@ fn unlinked_overlay_extensions_share_one_refusal_row() {
         stdout.contains(
             "the overlays did not resolve; fix the overlay error above, then run dot update"
         ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn authorized_overlay_link_to_an_untrusted_file_keeps_its_own_row() {
+    // A link the overlay manifest authorizes, whose target fails trust (a
+    // group-writable checkout file), is not fixed by relinking: it must not
+    // join the "run dot update" group.
+    let (scope, home, state) =
+        doctor_extension_client_fixture("authorized-untrusted", &[good_extension()]);
+    // The client fixture's origin doubles as the overlay's.
+    let origin = scope.path().join("origin.git");
+    let overlay = home.path().join(".dotfiles-ov");
+    let status = dot_test_support::git()
+        .args(["clone", "-q"])
+        .arg(&origin)
+        .arg(&overlay)
+        .status()
+        .expect("overlay clone");
+    assert!(status.success());
+    let descriptors = home.path().join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&descriptors).expect("descriptors");
+    std::fs::write(
+        descriptors.join("20-ov.conf"),
+        format!("url={}\n", origin.display()),
+    )
+    .expect("descriptor");
+    let rel = "extensions/doctor.d/30-ov.sh";
+    let source = overlay.join("home").join(rel);
+    std::fs::create_dir_all(source.parent().expect("source parent")).expect("source parent");
+    std::fs::write(&source, b"doctor() { :; }\n").expect("overlay extension");
+    seal(&source, 0o664);
+    let overlay_text = overlay.to_str().expect("utf8 overlay");
+    let target = dot::repos_overlays::record_link_target(rel, "ov", overlay_text, Some("git"))
+        .expect("link target");
+    std::os::unix::fs::symlink(&target, home.path().join(rel)).expect("overlay link");
+    let manifest = state.path().join("dot/overlay-links");
+    std::fs::create_dir_all(manifest.parent().expect("manifest parent")).expect("manifest dir");
+    std::fs::write(&manifest, format!("{rel}\tov\t{target}\n")).expect("manifest");
+    seal(&manifest, 0o600);
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ov: cloned"), "{stdout}");
+    assert!(
+        stdout.contains("  ✗ 30-ov doctor extension refused\n    ~/extensions/doctor.d/30-ov.sh links to a file that fails the extension trust checks; check its owner and mode\n"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("not linked from an active overlay"),
         "{stdout}"
     );
 }
