@@ -5,11 +5,13 @@
 
 [default]
 extend-ignore-re = [
-  # Misspelled config keys that exercise the "did you mean" suggestion.
+  # Misspelled config and descriptor keys that exercise the "did you mean"
+  # suggestion.
   "defualt_profile",
   "dependency_provder",
   "shdeps_update_polciy",
   '"versoin"',
+  "platfroms",
   # Truncated and non-UTF-8 command words in CLI dispatch tests.
   'b"updat"',
   '"fo\\xFFb"',

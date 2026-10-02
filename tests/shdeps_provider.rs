@@ -406,6 +406,7 @@ case ${1:-} in
         "$DOT_TEST_PROVIDER_PROMPT_RECORD"
     fi
     printf '%s\n' "${DOT_SHDEPS_PRUNE-unset}" >"$DOT_TEST_PROVIDER_PRUNE_RECORD.update-env"
+    printf '%s\n' "${DOT_UPDATE_WARNED-unset}" >"$DOT_TEST_PROVIDER_PRUNE_RECORD.update-warned"
     printf 'force=%s quiet=%s nested=%s jobs=%s\n' \
       "${SHDEPS_FORCE:-0}" "${SHDEPS_QUIET:-0}" "${SHDEPS_NESTED:-0}" "${SHDEPS_JOBS:-unset}" \
       >"$DOT_TEST_PROVIDER_RECORD"
@@ -4972,6 +4973,94 @@ fn prune_is_skipped_for_a_frozen_generation() {
 }
 
 #[test]
+fn prune_is_skipped_when_a_newer_key_changed_the_overlay_set() {
+    // A newer key holds the overlay set: links and config hooks stay as
+    // they are, and Prune must not remove packages the held overlays still
+    // declare. Tools still runs (so Dot can upgrade) and the run stays
+    // clean.
+    let fixture = Fixture::new("shdeps-prune-newer-key");
+    let descriptors = fixture.home.join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&descriptors).expect("overlay descriptors");
+    let descriptor = descriptors.join("10-local.local.conf");
+    std::fs::write(
+        &descriptor,
+        format!(
+            "sync=none\npath={}\nfuture_key=1\n",
+            fixture.home.join("local").display()
+        ),
+    )
+    .expect("descriptor with a newer key");
+    let output = pruning(&fixture, Some("always"))
+        .output()
+        .expect("update with a newer descriptor key");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = normalize_elapsed(&output.stdout);
+    let text = String::from_utf8_lossy(&stdout);
+    for row in [
+        "[1/6] Overlays   warning  overlay set held for a newer dot",
+        "[2/6] Tools      changed",
+        "[3/6] Prune      warning  keys from a newer dot; prune skipped",
+        "[4/6] Configs    warning  overlay set held; config hooks",
+    ] {
+        assert!(text.contains(row), "missing {row:?}: {text}");
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "dot: overlay: warning: {}: unknown key 'future_key'; overlay 'local' skipped (newer dot?)\n{}\n",
+            descriptor.display(),
+            dot::update_engine::HOLD_WARNING
+        )
+    );
+    assert_eq!(prune_record(&fixture), None);
+}
+
+#[test]
+fn prune_still_runs_when_only_a_selector_that_could_not_win_is_skipped() {
+    // That selector changed nothing on this host, so the overlay set is
+    // exactly what the newer Dot would link.
+    let fixture = Fixture::new("shdeps-prune-skipped-selector");
+    let config = fixture.home.join(".config/dot");
+    let source = fixture.home.join("local-src");
+    std::fs::create_dir_all(source.join("home")).expect("overlay source");
+    let host = dot::platform::detect_host().expect("fixture host");
+    for (file, body) in [
+        (
+            "profiles.d/base.conf",
+            "version=1\noverlays=local\n".to_string(),
+        ),
+        (
+            "overlays.d/10-local.local.conf",
+            format!("sync=none\npath={}\n", source.display()),
+        ),
+        (
+            "profile-selectors.d/10-host.conf",
+            format!("version=1\nhost={host}\nprofile=base\n"),
+        ),
+        (
+            "profile-selectors.d/20-newer.conf",
+            "version=1\nprofile=base\nfuture_key=1\n".to_string(),
+        ),
+    ] {
+        let path = config.join(file);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
+        std::fs::write(path, body).expect("profile fixture");
+    }
+    let output = pruning(&fixture, Some("always"))
+        .output()
+        .expect("update with a skipped selector");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("selector skipped (newer dot?)"),
+        "{output:?}"
+    );
+    assert_eq!(
+        prune_record(&fixture),
+        Some(expected_prune_record(&fixture, false))
+    );
+}
+
+#[test]
 fn prune_is_skipped_when_shdeps_is_unavailable() {
     let fixture = Fixture::new("shdeps-prune-unavailable");
     let output = pruning(&fixture, Some("always"))
@@ -5067,6 +5156,22 @@ fn prune_env_does_not_leak_into_provider_children() {
     assert_eq!(
         prune_record(&fixture),
         Some(expected_prune_record(&fixture, false))
+    );
+}
+
+#[test]
+fn handed_over_warnings_do_not_leak_into_provider_children() {
+    // `DOT_UPDATE_WARNED` concerns the engine of one invocation only.
+    let fixture = Fixture::new("shdeps-warned-env-scrub");
+    let output = pruning(&fixture, Some("always"))
+        .env("DOT_UPDATE_WARNED", "dot: overlay: warning: anything")
+        .output()
+        .expect("update with handed-over warnings");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.home.join("prune-record.update-warned"))
+            .expect("provider update env record"),
+        "unset\n"
     );
 }
 
