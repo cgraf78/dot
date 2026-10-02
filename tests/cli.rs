@@ -1819,15 +1819,23 @@ fn update_pulling_a_newer_profile_key_ignores_it_and_converges() {
     }
 }
 
+/// What a held run prints after the key warnings (see `HOLD_WARNING`).
+#[cfg(unix)]
+fn held(warnings: &[String]) -> String {
+    let mut text: String = warnings.iter().map(|line| format!("{line}\n")).collect();
+    text.push_str(dot::update_engine::HOLD_WARNING);
+    text.push('\n');
+    text
+}
+
 #[cfg(unix)]
 #[test]
-fn update_skips_a_selector_with_a_newer_key_instead_of_matching_more() {
+fn update_holds_a_fresh_host_when_a_narrowing_selector_has_a_newer_key() {
     // A selector is a predicate, and a key this release does not know is
-    // most likely one more condition. Ignoring it could match hosts the
-    // newer Dot would not, so the selector never matches. Here it narrows
-    // this host to `base`; falling through to the fleet-wide `full` would
-    // link more than the newer Dot does, so selection falls back to `base`
-    // (what phase one applies everywhere) instead.
+    // most likely one more condition, so the selector never matches. Here
+    // it narrows this host to `base`; this release cannot know whether it
+    // applies, so it holds the overlay set. A fresh host has nothing
+    // installed, so nothing is activated from the uncertain selection.
     let overlays = local_overlays("cli-update-selector-key");
     let host = dot::platform::detect_host().expect("fixture host");
     let narrow = format!("version=1\nhost={host}\nprofile=base\nfuture_key=1\n");
@@ -1840,13 +1848,13 @@ fn update_skips_a_selector_with_a_newer_key_instead_of_matching_more() {
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(
         stderr,
-        format!(
-            "dot: profile: warning: {}/.config/dot/profile-selectors.d/10-narrow.conf: unknown key 'future_key'; selector skipped, profile 'base' selected (newer dot?)\n",
+        held(&[format!(
+            "dot: profile: warning: {}/.config/dot/profile-selectors.d/10-narrow.conf: unknown key 'future_key'; selector skipped, profile 'base' selected (newer dot?)",
             home.path().display()
-        )
+        )])
     );
     assert_eq!(outcome, "ok update");
-    assert_eq!(linked_overlays(&home), ["alpha"]);
+    assert!(linked_overlays(&home).is_empty());
 }
 
 #[cfg(unix)]
@@ -1888,31 +1896,29 @@ fn repo_commands_report_newer_keys_before_a_selection_error() {
 
 #[cfg(unix)]
 #[test]
-fn update_skips_an_overlay_whose_descriptor_has_a_newer_key() {
+fn update_holds_a_fresh_host_when_a_descriptor_has_a_newer_key() {
     // A descriptor decides what is cloned and linked. Activating it on a
     // partial reading could skip a restriction or a trust rule the newer
-    // Dot applies, so the overlay is skipped (`selected-unsupported`)
-    // while the rest of the profile converges. Discovery runs several
-    // times per update; the warning still prints once.
+    // Dot applies, so the overlay is skipped (`selected-unsupported`) and
+    // the run holds the overlay set. Discovery runs several times per
+    // update; each warning still prints once.
     let overlays = local_overlays("cli-update-descriptor-key");
     let (_scope, home, state) = profile_client(
         "cli-update-descriptor-key",
         &overlays,
         &[(".config/dot/overlays.d/20-beta.conf", "future_key=1\n")],
     );
+    let warning = format!(
+        "dot: overlay: warning: {}/.config/dot/overlays.d/20-beta.conf: unknown key 'future_key'; overlay 'beta' skipped (newer dot?)",
+        home.path().display()
+    );
     let (code, stderr, outcome) = cron_update(&home, &state);
     assert_eq!(code, Some(0), "{stderr}");
-    assert_eq!(
-        stderr,
-        format!(
-            "dot: overlay: warning: {}/.config/dot/overlays.d/20-beta.conf: unknown key 'future_key'; overlay 'beta' skipped (newer dot?)\n",
-            home.path().display()
-        )
-    );
+    assert_eq!(stderr, held(std::slice::from_ref(&warning)));
     assert_eq!(outcome, "ok update");
-    assert_eq!(linked_overlays(&home), ["alpha"]);
+    assert!(linked_overlays(&home).is_empty());
 
-    // Doctor reports it as a warning row, not a stderr line; the repo
+    // Doctor reports it as warning rows, not stderr lines; the repo
     // commands, which list overlays, say why one is missing.
     let doctor = init_bin(&home, &state)
         .arg("doctor")
@@ -1920,10 +1926,13 @@ fn update_skips_an_overlay_whose_descriptor_has_a_newer_key() {
         .expect("doctor");
     let report = String::from_utf8_lossy(&doctor.stdout);
     assert_eq!(doctor.status.code(), Some(0), "{report}");
-    assert!(
-        report.contains("beta: selected but skipped: unknown descriptor key"),
-        "{report}"
-    );
+    for row in [
+        "overlay set held: newer keys need a newer dot",
+        "beta: selected but skipped: unknown descriptor key",
+        "overlay symlinks not checked while the overlay set is held",
+    ] {
+        assert!(report.contains(row), "missing {row:?}: {report}");
+    }
     assert!(doctor.stderr.is_empty(), "{:?}", doctor.stderr);
     let status = init_bin(&home, &state)
         .arg("status")
@@ -1932,19 +1941,51 @@ fn update_skips_an_overlay_whose_descriptor_has_a_newer_key() {
     assert_eq!(status.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&status.stderr),
-        format!(
-            "dot: overlay: warning: {}/.config/dot/overlays.d/20-beta.conf: unknown key 'future_key'; overlay 'beta' skipped (newer dot?)\n",
-            home.path().display()
-        )
+        format!("{warning}\n")
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn update_falls_back_to_base_when_a_base_overlay_is_skipped() {
+fn a_release_continuation_skips_warnings_the_invocation_already_printed() {
+    // A continuation that runs as another process (a release handoff)
+    // receives the printed lines in `DOT_UPDATE_WARNED` and must not print
+    // them again: config boundary keys, data-file keys, and the hold line.
+    let overlays = local_overlays("cli-update-warned-handoff");
+    let (_scope, home, state) = profile_client(
+        "cli-update-warned-handoff",
+        &overlays,
+        &[
+            (".config/dot/overlays.d/20-beta.conf", "future_key=1\n"),
+            (".config/dot/config", "version=1\nfuture_key=1\n"),
+        ],
+    );
+    let (code, first, _) = cron_update(&home, &state);
+    assert_eq!(code, Some(0), "{first}");
+    let (code, again, _) = cron_update(&home, &state);
+    assert_eq!(code, Some(0), "{again}");
+    assert!(
+        again.contains("dot: config: warning: unknown key 'future_key'"),
+        "{again}"
+    );
+    assert!(again.contains(dot::update_engine::HOLD_WARNING), "{again}");
+    let handed = again.trim_end_matches('\n');
+    let output = init_bin(&home, &state)
+        .args(["update", "--cron"])
+        .env(dot::update_engine::WARNED_ENV, handed)
+        .output()
+        .expect("continuation update");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert!(first.contains(dot::update_engine::HOLD_WARNING), "{first}");
+}
+
+#[cfg(unix)]
+#[test]
+fn update_holds_when_a_base_overlay_is_skipped() {
     // A skipped `base` overlay may hold personal selectors the newer Dot
-    // reads; they could outrank the root selector, so this Dot does not
-    // trust the rest of the selection and stays at `base`.
+    // reads, so the selection itself is unknown: the run holds before it
+    // pulls anything.
     let overlays = local_overlays("cli-update-base-overlay-key");
     let (_scope, home, state) = profile_client(
         "cli-update-base-overlay-key",
@@ -1953,16 +1994,12 @@ fn update_falls_back_to_base_when_a_base_overlay_is_skipped() {
     );
     let (code, stderr, outcome) = cron_update(&home, &state);
     assert_eq!(code, Some(0), "{stderr}");
-    let descriptor = format!(
-        "{}/.config/dot/overlays.d/10-alpha.conf",
-        home.path().display()
-    );
     assert_eq!(
         stderr,
-        format!(
-            "dot: overlay: warning: {descriptor}: unknown key 'future_key'; overlay 'alpha' skipped (newer dot?)\n\
-             dot: profile: warning: {descriptor}: unknown key 'future_key'; overlay 'alpha' selectors unread, profile 'base' selected (newer dot?)\n"
-        )
+        held(&[format!(
+            "dot: overlay: warning: {}/.config/dot/overlays.d/10-alpha.conf: unknown key 'future_key'; overlay 'alpha' skipped (newer dot?)",
+            home.path().display()
+        )])
     );
     assert_eq!(outcome, "ok update");
     assert!(linked_overlays(&home).is_empty());
@@ -1970,7 +2007,7 @@ fn update_falls_back_to_base_when_a_base_overlay_is_skipped() {
 
 #[cfg(unix)]
 #[test]
-fn legacy_update_skips_a_local_overlay_whose_descriptor_has_a_newer_key() {
+fn legacy_update_holds_when_a_local_descriptor_has_a_newer_key() {
     // Without profiles, `sync=none` descriptors still parse strictly and
     // get the same treatment; git descriptors keep their permissive,
     // warn-and-ignore parsing.
@@ -1992,13 +2029,290 @@ fn legacy_update_skips_a_local_overlay_whose_descriptor_has_a_newer_key() {
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(
         stderr,
-        format!(
-            "dot: overlay: warning: {}/.config/dot/overlays.d/20-beta.conf: unknown key 'future_key'; overlay 'beta' skipped (newer dot?)\n",
+        held(&[format!(
+            "dot: overlay: warning: {}/.config/dot/overlays.d/20-beta.conf: unknown key 'future_key'; overlay 'beta' skipped (newer dot?)",
             home.path().display()
-        )
+        )])
     );
     assert_eq!(outcome, "ok update");
-    assert_eq!(linked_overlays(&home), ["alpha"]);
+    assert!(linked_overlays(&home).is_empty());
+}
+
+/// A profile client whose overlays are Git checkouts, so they carry real
+/// lifecycle authority: `base` selects `alpha`, `full` adds `beta`, the
+/// root selector picks `full`, and `beta` ships a `profile-deactivate`
+/// entry point that leaves `$HOME/beta-retired` when it runs. Extensions
+/// are enabled so retirement is live. The first update converges it.
+#[cfg(unix)]
+struct GitProfileClient {
+    _overlays: TempDir,
+    _scope: TempDir,
+    home: TempDir,
+    state: TempDir,
+    base_seed: PathBuf,
+    beta_seed: PathBuf,
+    alpha_url: String,
+}
+
+#[cfg(unix)]
+impl GitProfileClient {
+    fn stage(label: &str, first: &[(&str, &str)]) -> Self {
+        let overlays = TempDir::new(&format!("{label}-overlays")).expect("overlay origins");
+        let overlay = |name: &str, extra: &[(&str, &[u8])]| {
+            let (origin, seed, _branch) = seed_bare_origin(overlays.path(), name);
+            std::fs::create_dir_all(seed.join("home")).expect("overlay home");
+            seed_advance(&seed, &format!("home/{name}.txt"), name.as_bytes());
+            for (file, body) in extra {
+                if let Some(parent) = Path::new(file).parent() {
+                    std::fs::create_dir_all(seed.join(parent)).expect("overlay parent");
+                }
+                seed_advance(&seed, file, body);
+            }
+            format!("file://{}", origin.display())
+        };
+        let alpha_url = overlay("alpha", &[]);
+        let beta_url = overlay(
+            "beta",
+            &[(
+                "dot/profile-deactivate",
+                b"deactivate() { printf retired >\"$HOME/beta-retired\"; }\n",
+            )],
+        );
+        let mut files: Vec<(String, String)> = vec![
+            (
+                ".config/dot/config".to_string(),
+                "version=1\nextension_api=1\nextensions_dir=$HOME/extensions\n".to_string(),
+            ),
+            (
+                ".config/dot/overlays.d/10-alpha.conf".to_string(),
+                format!("url={alpha_url}\n"),
+            ),
+            (
+                ".config/dot/overlays.d/20-beta.conf".to_string(),
+                format!("url={beta_url}\n"),
+            ),
+            (
+                ".config/dot/profiles.d/base.conf".to_string(),
+                "version=1\noverlays=alpha\n".to_string(),
+            ),
+            (
+                ".config/dot/profiles.d/full.conf".to_string(),
+                "version=1\nprofiles=base\noverlays=beta\n".to_string(),
+            ),
+            (
+                ".config/dot/profile-selectors.d/00-default.conf".to_string(),
+                "version=1\nprofile=full\n".to_string(),
+            ),
+        ];
+        for (file, line) in first {
+            let entry = files
+                .iter_mut()
+                .find(|(name, _)| name == file)
+                .expect("first-run extra targets a fixture file");
+            entry.1.push_str(line);
+        }
+        let borrowed: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_bytes()))
+            .collect();
+        let (scope, home, state) = client_pulling(label, &borrowed);
+        let extensions = home.path().join("extensions");
+        std::fs::create_dir_all(&extensions).expect("extensions directory");
+        std::fs::set_permissions(&extensions, std::fs::Permissions::from_mode(0o700))
+            .expect("private extensions directory");
+        let base_seed = scope.path().join("dotfiles-seed");
+        let beta_seed = overlays.path().join("beta-seed");
+        GitProfileClient {
+            _overlays: overlays,
+            _scope: scope,
+            home,
+            state,
+            base_seed,
+            beta_seed,
+            alpha_url,
+        }
+    }
+
+    /// One `dot update --cron` with a Bash for the lifecycle hooks.
+    fn update(&self) -> (Option<i32>, String, String) {
+        let output = init_bin(&self.home, &self.state)
+            .args(["update", "--cron"])
+            .env("DOT_BASH", dot_test_support::bash())
+            .output()
+            .expect("cron update");
+        let log =
+            std::fs::read_to_string(self.state.path().join("dot/update.log")).unwrap_or_default();
+        let last = log
+            .lines()
+            .last()
+            .and_then(|line| line.split_once(' '))
+            .map(|(_, outcome)| outcome.to_string())
+            .unwrap_or_default();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            last,
+        )
+    }
+
+    fn publish(&self, file: &str, body: &str) {
+        seed_advance(&self.base_seed, file, body.as_bytes());
+    }
+
+    fn retired(&self) -> bool {
+        self.home.path().join("beta-retired").exists()
+    }
+
+    fn ledger(&self) -> String {
+        std::fs::read_to_string(self.state.path().join("dot/profile-overlay-lifecycle-v1"))
+            .unwrap_or_default()
+    }
+
+    fn path(&self, file: &str) -> String {
+        format!("{}/{file}", self.home.path().display())
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn update_holds_installed_overlays_when_a_base_descriptor_gains_a_newer_key() {
+    // The owner's layout in miniature: one new key in the `base` overlay's
+    // descriptor must not drop the host to nothing. The held run keeps
+    // every installed link, runs no deactivation hook, keeps the ledger,
+    // and exits 0; once the key is gone, normal convergence resumes.
+    let client = GitProfileClient::stage("cli-hold-base-descriptor", &[]);
+    let (code, stderr, _) = client.update();
+    assert_eq!(code, Some(0), "setup: {stderr}");
+    assert_eq!(linked_overlays(&client.home), ["alpha", "beta"]);
+    let ledger = client.ledger();
+    assert!(
+        ledger.contains("beta|"),
+        "beta holds lifecycle authority: {ledger:?}"
+    );
+
+    client.publish(
+        ".config/dot/overlays.d/10-alpha.conf",
+        &format!("url={}\nfuture_key=1\n", client.alpha_url),
+    );
+    // A held run pulls no overlay either.
+    seed_advance(&client.beta_seed, "home/later.txt", b"later\n");
+    let later = client.home.path().join(".dotfiles-beta/home/later.txt");
+    let (code, stderr, outcome) = client.update();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stderr,
+        held(&[format!(
+            "dot: overlay: warning: {}: unknown key 'future_key'; overlay 'alpha' skipped (newer dot?)",
+            client.path(".config/dot/overlays.d/10-alpha.conf")
+        )])
+    );
+    assert_eq!(outcome, "ok update");
+    assert_eq!(linked_overlays(&client.home), ["alpha", "beta"]);
+    assert!(!client.retired(), "a held run deactivated beta");
+    assert_eq!(client.ledger(), ledger, "a held run changed the ledger");
+    assert!(!later.exists(), "a held run pulled beta");
+
+    client.publish(
+        ".config/dot/overlays.d/10-alpha.conf",
+        &format!("url={}\n", client.alpha_url),
+    );
+    let (code, stderr, outcome) = client.update();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stderr, "");
+    assert_eq!(outcome, "ok update");
+    assert_eq!(linked_overlays(&client.home), ["alpha", "beta"]);
+    assert!(!client.retired());
+    assert!(later.exists(), "normal convergence pulls beta again");
+}
+
+#[cfg(unix)]
+#[test]
+fn update_holds_installed_overlays_when_the_root_selector_gains_a_newer_key() {
+    let client = GitProfileClient::stage("cli-hold-root-selector", &[]);
+    let (code, stderr, _) = client.update();
+    assert_eq!(code, Some(0), "setup: {stderr}");
+    assert_eq!(linked_overlays(&client.home), ["alpha", "beta"]);
+    let ledger = client.ledger();
+
+    client.publish(
+        ".config/dot/profile-selectors.d/00-default.conf",
+        "version=1\nprofile=full\nfuture_key=1\n",
+    );
+    let (code, stderr, outcome) = client.update();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stderr,
+        held(&[format!(
+            "dot: profile: warning: {}: unknown key 'future_key'; selector skipped, profile 'base' selected (newer dot?)",
+            client.path(".config/dot/profile-selectors.d/00-default.conf")
+        )])
+    );
+    assert_eq!(outcome, "ok update");
+    assert_eq!(linked_overlays(&client.home), ["alpha", "beta"]);
+    assert!(!client.retired(), "a held run deactivated beta");
+    assert_eq!(client.ledger(), ledger);
+    // Doctor agrees: held, not a deactivation `dot update` should retry.
+    let doctor = init_bin(&client.home, &client.state)
+        .arg("doctor")
+        .output()
+        .expect("doctor");
+    let report = String::from_utf8_lossy(&doctor.stdout);
+    assert_eq!(doctor.status.code(), Some(0), "{report}");
+    assert!(report.contains("overlay set held"), "{report}");
+    assert!(!report.contains("deactivation pending"), "{report}");
+
+    client.publish(
+        ".config/dot/profile-selectors.d/00-default.conf",
+        "version=1\nprofile=full\n",
+    );
+    let (code, stderr, _) = client.update();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stderr, "");
+    assert_eq!(linked_overlays(&client.home), ["alpha", "beta"]);
+    assert!(!client.retired());
+
+    // Control: a real deselection does run the hook, so the checks above
+    // prove the held runs skipped it.
+    client.publish(
+        ".config/dot/profile-selectors.d/00-default.conf",
+        "version=1\nprofile=base\n",
+    );
+    let (code, stderr, _) = client.update();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(linked_overlays(&client.home), ["alpha"]);
+    assert!(
+        client.retired(),
+        "deselecting beta runs its deactivation hook"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn update_activates_nothing_on_a_fresh_host_whose_selection_is_held() {
+    // The first pull already carries the key: nothing is installed, and
+    // nothing is activated from a selection this release cannot read.
+    // Removing the key lets the next run converge normally.
+    let client = GitProfileClient::stage(
+        "cli-hold-fresh",
+        &[(
+            ".config/dot/profile-selectors.d/00-default.conf",
+            "future_key=1\n",
+        )],
+    );
+    let (code, stderr, outcome) = client.update();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.ends_with(&held(&[])), "{stderr}");
+    assert_eq!(outcome, "ok update");
+    assert!(linked_overlays(&client.home).is_empty());
+    assert_eq!(client.ledger(), "");
+
+    client.publish(
+        ".config/dot/profile-selectors.d/00-default.conf",
+        "version=1\nprofile=full\n",
+    );
+    let (code, stderr, _) = client.update();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(linked_overlays(&client.home), ["alpha", "beta"]);
 }
 
 #[cfg(unix)]

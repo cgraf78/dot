@@ -612,6 +612,10 @@ fn overlays_report_keys_from_a_newer_dot_as_warnings() {
         "selector skipped: unknown key; profile base selected\n    ~/.config/dot/profile-selectors.d/20-shared.conf:2 future_key (newer dot?)",
         "beta: selected but skipped: unknown descriptor key\n    ~/.config/dot/overlays.d/20-beta.local.conf:2 future_key (newer dot?)",
         "personal selectors unread: overlay skipped; profile base selected\n    ~/.config/dot/overlays.d/10-personal.conf:5 future_key (newer dot?)",
+        // `dot update` holds the installed set, so the links are not judged
+        // against this reading.
+        "overlay set held: newer keys need a newer dot",
+        "overlay symlinks not checked while the overlay set is held",
     ] {
         assert!(
             output.contains(expected),
@@ -623,7 +627,7 @@ fn overlays_report_keys_from_a_newer_dot_as_warnings() {
             .iter()
             .filter(|record| record.kind == dot::doctor_runtime::Kind::Warn)
             .count(),
-        5,
+        6,
         "{output}"
     );
 
@@ -644,6 +648,32 @@ fn overlays_report_keys_from_a_newer_dot_as_warnings() {
         output.contains("local: selected but skipped: unknown descriptor key"),
         "{output}"
     );
+}
+
+#[test]
+fn keys_that_cannot_change_the_overlay_set_do_not_report_a_hold() {
+    use dot::unknown_keys::{DataKey, Effect};
+    let scratch = TempDir::new("doctor-overlays-no-hold").expect("scratch");
+    let mut input = overlays(
+        scratch
+            .path()
+            .join("missing")
+            .to_string_lossy()
+            .into_owned(),
+        None,
+        true,
+    );
+    input.unknown_keys = [Effect::Ignored, Effect::SelectorSkipped]
+        .into_iter()
+        .map(|effect| DataKey {
+            path: "/home/test/.config/dot/profiles.d/base.conf".to_string(),
+            line: 2,
+            key: "future_key".to_string(),
+            effect,
+        })
+        .collect();
+    let output = render(&check_overlays(&input));
+    assert!(!output.contains("overlay set held"), "{output}");
 }
 
 #[test]

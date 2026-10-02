@@ -90,6 +90,24 @@ pub enum Effect {
 }
 
 impl Effect {
+    /// Whether a key with this effect leaves this release unsure which
+    /// overlays the newer Dot would activate: a skipped descriptor, or a
+    /// selection that fell back because a skipped selector (or the unread
+    /// selectors of a skipped overlay) could have chosen differently.
+    ///
+    /// `dot update` then holds the installed overlay set instead of
+    /// converging to this release's partial reading (see
+    /// `update_engine`). An ignored definition key does not hold: the key
+    /// rules keep definition keys additive, so missing one can only leave
+    /// out overlays that are not active yet. A skipped selector that could
+    /// not have won changes nothing.
+    pub fn holds(&self) -> bool {
+        matches!(
+            self,
+            Effect::SelectorFallback | Effect::SelectorsUnread(_) | Effect::OverlaySkipped(_)
+        )
+    }
+
     /// Whether this key came from a selector (selector keys are forgotten
     /// with the selector records they belong to).
     pub fn is_selector(&self) -> bool {
@@ -220,6 +238,15 @@ mod tests {
             key(Effect::OverlaySkipped("beta".to_string())).warning(),
             "dot: overlay: warning: /c/dot/f.conf: unknown key 'future_key'; overlay 'beta' skipped (newer dot?)"
         );
+    }
+
+    #[test]
+    fn only_effects_that_change_the_overlay_set_hold_it() {
+        assert!(!Effect::Ignored.holds());
+        assert!(!Effect::SelectorSkipped.holds());
+        assert!(Effect::SelectorFallback.holds());
+        assert!(Effect::SelectorsUnread("p".to_string()).holds());
+        assert!(Effect::OverlaySkipped("p".to_string()).holds());
     }
 
     #[test]

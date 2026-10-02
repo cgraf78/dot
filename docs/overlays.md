@@ -13,8 +13,9 @@ filters. They do not accept a URL or optional flag. Filtering is exact and
 case-sensitive for platforms, case-insensitive for normalized hostnames, and
 exclusions win. A selected descriptor, or any `sync=none` descriptor, that
 holds a key this Dot does not know is validated and then skipped instead of
-activated (lifecycle state `selected-unsupported`); see
-[Unknown keys in profile and overlay files](configuration.md#unknown-keys-in-profile-and-overlay-files).
+activated (lifecycle state `selected-unsupported`), and `dot update` holds the
+installed overlay set until a Dot that knows the key runs; see
+[Held overlay sets](configuration.md#held-overlay-sets).
 
 Active overlays are synchronized in descriptor order. Their `home/` entries
 are inventoried before mutation, the complete prospective ownership manifest

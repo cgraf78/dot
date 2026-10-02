@@ -785,6 +785,10 @@ fn present(value: Option<&str>) -> Option<&str> {
 /// [`OverlayInputs::local_validate`] is injected.
 pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
     let mut out = vec![Record::section("Profiles")];
+    // `dot update` holds the installed overlays while this release cannot
+    // tell which ones a newer Dot would activate; the selection reported
+    // here is not what is linked.
+    let held = inputs.unknown_keys.iter().any(|key| key.effect.holds());
     if let Some(error) = present(inputs.profile_config_error) {
         out.push(Record::fail(
             "profile configuration invalid",
@@ -860,7 +864,31 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 Some(data_key_detail(key, inputs.home)),
             ));
         }
-        out.extend(check_profile_lifecycle(&inputs.lifecycle));
+        if held {
+            // Held overlays stay installed and keep their lifecycle
+            // authority: judge every ledger record as still selected, so
+            // nothing reads as a pending deactivation that `dot update`
+            // will not (and must not) run, while trust checks still apply.
+            let lifecycle = &inputs.lifecycle;
+            let mut eligible = lifecycle.eligible.clone();
+            eligible.extend(
+                lifecycle
+                    .records
+                    .iter()
+                    .map(|record| record_name(record).to_string()),
+            );
+            out.extend(check_profile_lifecycle(&LifecycleInputs {
+                profiles_present: lifecycle.profiles_present,
+                load_ok: lifecycle.load_ok,
+                eligible,
+                active: lifecycle.active.clone(),
+                records: lifecycle.records.clone(),
+                extensions_enabled: lifecycle.extensions_enabled,
+                deactivation_ok: lifecycle.deactivation_ok,
+            }));
+        } else {
+            out.extend(check_profile_lifecycle(&inputs.lifecycle));
+        }
     }
 
     out.push(Record::section(format!(
@@ -871,6 +899,15 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
         out.push(Record::fail(
             "overlay descriptor invalid",
             Some(error.to_string()),
+        ));
+    }
+    if held {
+        out.push(Record::warn(
+            "overlay set held: newer keys need a newer dot",
+            Some(
+                "dot update keeps the installed overlays until a dot that knows the keys runs"
+                    .to_string(),
+            ),
         ));
     }
     // Legacy discovery gives a skipped `sync=none` descriptor a lifecycle
@@ -1032,7 +1069,14 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
         }
     }
 
-    if Path::new(&inputs.manifest).is_file() {
+    if held {
+        // The links belong to the held generation, which the reading above
+        // does not describe, so ownership cannot be judged against it.
+        out.push(Record::skip(
+            "overlay symlinks not checked while the overlay set is held",
+            None,
+        ));
+    } else if Path::new(&inputs.manifest).is_file() {
         check_overlay_links(inputs, &overlay_paths, &overlay_syncs, &mut out);
     }
     out

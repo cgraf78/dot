@@ -347,30 +347,31 @@ does without the key depends on what missing it could cost:
 | File | A key this Dot does not know |
 | --- | --- |
 | Profile definition | Ignored; the members it knows still apply |
-| Selector (root, machine-local, or personal) | The selector never matches; if it could have chosen this host's profile, `base` is selected |
-| Overlay descriptor that is selected, or any `sync=none` descriptor | The overlay is skipped: selected but never activated |
+| Selector (root, machine-local, or personal) | The selector never matches; if it could have chosen this host's profile, `dot update` holds the installed overlay set |
+| Overlay descriptor that is selected, or any `sync=none` descriptor | The overlay is skipped (never activated), and `dot update` holds the installed overlay set |
 
 A definition only adds members, so missing a newer key can at worst select
 fewer overlays. A selector is a predicate and a descriptor decides what is
 cloned and linked: a key there is most likely one more condition, such as a
 match restriction, a pinned revision, or a trust rule. Ignoring it could match
 hosts, or clone and link an overlay, that the newer Dot would not, so both fail
-closed.
+closed. Converging to that partial reading would not be safe either: it would
+deactivate overlays the newer Dot keeps. So `dot update` holds the overlay set
+instead (see [Held overlay sets](#held-overlay-sets)).
 
 A skipped selector whose `user` and `host` (if any) match this host, and that
 is at least as specific as every matching selector, could have chosen this
 host's profile. If it names a profile other than the one selection lands on
 without it (the most specific match, or `default_profile` when nothing
 matches), or if it is more specific than two matching selectors that tie,
-selection falls back to `base`, the profile phase one already applies on every
-host. Falling through instead could select more overlays than the newer Dot
-would, because a skipped selector is often the one narrowing a shared host, or
-revive a tie it settled. `base` is narrower in the usual layout, where every
-profile includes it; a profile that does not include `base` can lose overlays
-to the fallback and gain `base`'s, which phase one already clones everywhere.
+this Dot cannot tell which profile applies. Falling through could select more
+overlays than the newer Dot would, because a skipped selector is often the one
+narrowing a shared host, or revive a tie it settled; `dot update` holds the
+overlay set instead. Commands that only report a selection (`status`, `fetch`,
+`push`, `diff`, `test`, and `doctor`) show `base`, the profile phase one
+already applies on every host, as `selected profile (base (skipped-selector))`.
 A skipped selector that agrees, ranks below a match, or names another user or
-host changes nothing, and one for another user or host is not reported. `dot
-doctor` shows the fallback as `selected profile (base (skipped-selector))`.
+host changes nothing, and one for another user or host is not reported.
 
 A descriptor is validated in full before it is skipped, and one that its
 `platforms` or `hosts` filter already excludes stays quiet, because the key
@@ -378,9 +379,10 @@ changes nothing on that host. A skipped descriptor still claims its overlay
 name, so a later descriptor with the same name cannot take its place. Skipping
 an overlay `base` selects also leaves its personal selectors unread, and the
 newer Dot reads them (unlike those of an overlay that is merely unavailable),
-so selection falls back to `base` as for a skipped selector that could have
-won. Without `profiles.d`, `sync=git` descriptors keep their legacy handling:
-unknown lines are ignored and the overlay activates.
+so the selection is unknown as well: `dot update` holds before it pulls
+anything, and reporting commands show `base`. Without `profiles.d`, `sync=git`
+descriptors keep their legacy handling: unknown lines are ignored and the
+overlay activates.
 
 Every rule these files already had still applies: `version=1` comes first and
 is the only accepted version (definitions and selectors), plus key syntax,
@@ -417,21 +419,47 @@ dot: profile: warning: /home/user/.config/dot/profile-selectors.d/10-host.conf: 
 dot: profile: warning: /home/user/.config/dot/profile-selectors.d/00-default.conf: unknown key 'future_key'; selector skipped, profile 'base' selected (newer dot?)
 dot: overlay: warning: /home/user/.config/dot/overlays.d/30-dev.conf: unknown key 'future_key'; overlay 'dev' skipped (newer dot?)
 dot: profile: warning: /home/user/.config/dot/overlays.d/80-personal.conf: unknown key 'future_key'; overlay 'personal' selectors unread, profile 'base' selected (newer dot?)
+dot: overlay: warning: overlay set held: newer keys need a newer dot (installed overlays, links, and config hooks left as they are)
 ```
 
 Unlike a config key from a newer Dot, which stays quiet in the run that pulls
-it, these warn in that run too, because it already acts on them. A skipped
-selector or overlay can change the final overlay set: the links of an overlay
-that was active are removed, its `profile-deactivate` entry point runs, and the
-pre-sync reconcile stage no longer sees it. It returns on the first run of a
-Dot that knows the key. Such a run still exits 0 and records `ok`, not
-`degraded`, but unless every key is in a skipped selector that changed
-nothing, it skips the `Prune` stage (`keys from a newer dot; prune skipped`):
-the overlay set may lack dependency configs that come back once Dot upgrades,
-and pruning in between would uninstall their packages. `dot doctor`
+it, these warn in that run too, because it already acts on them. `dot doctor`
 reports each key as a warning row instead (`unknown profile key ignored`,
 `selector skipped: unknown key`, `personal selectors unread: overlay skipped`,
-or `<overlay>: selected but skipped: unknown descriptor key`).
+or `<overlay>: selected but skipped: unknown descriptor key`). A run with only
+ignored definition keys, or skipped selectors that changed nothing, converges
+normally but skips the `Prune` stage (`keys from a newer dot; prune skipped`)
+unless every key is such a selector: the overlay set may lack dependency
+configs that a newer Dot would link.
+
+### Held overlay sets
+
+When a key makes the overlay set uncertain (a skipped descriptor, a skipped
+selector that could have chosen this host's profile, or a skipped `base`
+overlay whose personal selectors went unread), `dot update`, `pull`, and
+`init` hold the installed overlay set rather than converge to this Dot's
+partial reading, which could unlink every overlay but `base`'s and run their
+`profile-deactivate` entry points. A held run:
+
+- leaves every installed overlay link untouched and activates nothing. When
+  a selector or a non-`base` descriptor triggers the hold, phase one has
+  already run the pre-sync `prepare` stage and refreshed (or, on a fresh host,
+  cloned) the `base` overlays, so their new content shows through the
+  existing links; a skipped `base` overlay holds before any of that. No other
+  overlay is pulled;
+- runs no `profile-deactivate` entry point, pre-sync `reconcile` stage, or
+  config hook, and commits no lifecycle change;
+- still runs `Tools`, so the host can install the Dot that knows the keys,
+  but skips `Prune`;
+- prints `dot: overlay: warning: overlay set held: newer keys need a newer
+  dot (...)` once, exits 0, and records `ok` under `--cron`.
+
+A fresh host with nothing installed stays empty: nothing is activated from a
+selection this Dot cannot read. The next run of a Dot that knows the keys (or
+any run after the keys are removed) converges normally. Until then every run
+holds, so overlay and config-hook changes wait. `dot doctor` reports `overlay
+set held: newer keys need a newer dot` and does not check overlay link
+ownership against its partial reading.
 
 Dot releases built before this change reject any unknown key in these files.
 On such a host `dot update` fails after the base pull, exits 1, and skips its
@@ -446,11 +474,13 @@ To introduce a key in one of these files:
    `SELECTOR_KEYS`, or `DESCRIPTOR_KEYS`) and to the documentation, and ship
    that release. Choose a `[a-z_]+` name more than two edits away from every
    key that file knows or any earlier release knew (unit tests check the
-   current list; keep a removed key in mind). Short names collide easily: `os`
-   is two edits from `host`. Older releases reject a near miss as a typo.
+   current list; keep a removed key in mind). Short names collide easily: a
+   selector can never gain `hosts` (one edit from `host`) or `os` (two edits
+   from `host`), because older releases reject a near miss as a typo, and that
+   fails `dot update` before Tools.
 2. Use the key only after hosts can run that release. Until then, a lagging
-   host ignores it in a definition, skips the selector (possibly selecting
-   `base`), or skips the overlay, for at least one update cycle.
+   host ignores it in a definition, or holds its overlay set when a selector
+   or descriptor needs it, for at least one update cycle.
 3. Never give an existing key a new value or meaning: older releases reject
    values they do not know. A profile definition still needs a member older
    releases know, and a selector still needs `profile`.

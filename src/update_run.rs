@@ -101,8 +101,17 @@ pub fn run(
     // a run that never gets the lock (busy, exit 75) does nothing, so it
     // stays as quiet as `--cron` promises. The engine reports only keys
     // that later reloads add (it treats these as already reported).
+    // A release-handoff continuation skips what the first process printed.
+    let handed = crate::update_engine::handed_warnings(
+        child_env
+            .get(OsStr::new(crate::update_engine::WARNED_ENV))
+            .map(OsString::as_os_str),
+    );
     for unknown in &config.unknown_keys {
-        let _ = writeln!(stderr, "{}", unknown.warning());
+        let line = unknown.warning();
+        if !handed.contains(&line) {
+            let _ = writeln!(stderr, "{line}");
+        }
     }
     // Publish the claim explicitly for nested native steps without changing
     // the parent process environment.
