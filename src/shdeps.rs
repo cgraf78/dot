@@ -347,12 +347,21 @@ pub fn revision_valid(revision: &str) -> bool {
 pub fn checkpoint_path(xdg_state_home: &str, home: &str) -> Option<PathBuf> {
     let path = crate::xdg::path(
         crate::xdg::Kind::State,
-        "dot/provider-reexec-failed",
+        CHECKPOINT_STATE_PATH,
         xdg_state_home,
         home,
     )
     .ok()?;
     Some(PathBuf::from(path))
+}
+
+/// The guard record's path below the XDG state home. `dot update` writes and
+/// consumes it there and `dot doctor` reports it, so both share one spelling.
+pub const CHECKPOINT_STATE_PATH: &str = "dot/provider-reexec-failed";
+
+/// [`checkpoint_path`] under an already resolved state home.
+pub fn checkpoint_in(state_home: &Path) -> PathBuf {
+    state_home.join(CHECKPOINT_STATE_PATH)
 }
 
 /// `_dot_active_revision`: the selected checkout's `HEAD` via the
@@ -559,13 +568,7 @@ pub fn consume_checkpoint(path: &Path, source_root: &Path) -> bool {
         Some(pinned) => pinned,
         None => return false,
     };
-    // The record names the generation the provider installed, so read the
-    // installed generation the same way the provider did (release metadata
-    // for a packaged root).
-    let active = installed_revision(source_root);
-    // The record's `after` is already lowercase; the active side
-    // folds case, like `${active,,}`.
-    if !revision_valid(&active) || active.to_ascii_lowercase() != after {
+    if !checkpoint_pins(&after, &checkpoint_active_revision(source_root)) {
         return false;
     }
     let current = match crate::temp::path_identity(path) {
@@ -576,6 +579,67 @@ pub fn consume_checkpoint(path: &Path, source_root: &Path) -> bool {
         return false;
     }
     std::fs::remove_file(path).is_ok()
+}
+
+/// The active generation a checkpoint is compared against, lowercased like
+/// the shell's `${active,,}` (the record's `after` is already lowercase);
+/// empty when it cannot be resolved. [`consume_checkpoint`] and
+/// [`checkpoint_state`] both read it here, so `dot doctor` predicts exactly
+/// what the next update does.
+fn checkpoint_active_revision(source_root: &Path) -> String {
+    // The record names the generation the provider installed, so read the
+    // installed generation the same way the provider does (release metadata
+    // for a packaged root, which has no `.git` for Git to answer from).
+    installed_revision(source_root).to_ascii_lowercase()
+}
+
+/// Whether a checkpoint pinning `after` is satisfied by `active`, the
+/// condition under which [`consume_checkpoint`] removes the record.
+fn checkpoint_pins(after: &str, active: &str) -> bool {
+    revision_valid(active) && active == after
+}
+
+/// What the next `dot update` does with the provider re-exec checkpoint,
+/// without consuming it. Read-only: `dot doctor` uses it to report a record
+/// that would make every update exit 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointState {
+    /// No record in any form: updates proceed.
+    Absent,
+    /// A valid record pinning the active revision: the next update
+    /// consumes it and proceeds.
+    Pending,
+    /// A record the reader refuses (unsafe file, wrong owner or mode,
+    /// malformed content): every update exits 1 until it is removed.
+    Unreadable,
+    /// A valid record pinning `pinned`, which is not the active revision:
+    /// every update exits 1 until the provider state is inspected.
+    Mismatch {
+        /// The lowercased `after` revision the record pins.
+        pinned: String,
+        /// The lowercased active revision, empty when unresolvable.
+        active: String,
+    },
+}
+
+/// Classify the checkpoint at `path` the way [`consume_checkpoint`] would
+/// treat it, without removing it.
+pub fn checkpoint_state(path: &Path, source_root: &Path) -> CheckpointState {
+    if path.symlink_metadata().is_err() {
+        return CheckpointState::Absent;
+    }
+    let Some(after) = read_checkpoint(path) else {
+        return CheckpointState::Unreadable;
+    };
+    let active = checkpoint_active_revision(source_root);
+    if checkpoint_pins(&after, &active) {
+        CheckpointState::Pending
+    } else {
+        CheckpointState::Mismatch {
+            pinned: after,
+            active,
+        }
+    }
 }
 
 #[cfg(test)]

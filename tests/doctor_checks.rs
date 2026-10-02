@@ -4,9 +4,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use dot::doctor_checks::{
-    BaseRepoInputs, CronInputs, LifecycleInputs, MergeInputs, MergeSpec, OverlayInputs,
-    ProviderInputs, ProviderInstaller, Record, check_base_repo, check_cron_freshness, check_merges,
-    check_overlays, check_profile_lifecycle, check_provider, check_update_lock,
+    BaseRepoInputs, CronInputs, InstallInputs, LifecycleInputs, MergeInputs, MergeSpec,
+    OverlayInputs, ProviderInputs, ProviderInstaller, Record, check_base_repo,
+    check_cron_freshness, check_install_layout, check_merges, check_overlays,
+    check_profile_lifecycle, check_provider, check_reexec_checkpoint, check_update_lock,
     completed_identity_matches_home, is_client_checkout, render, shdeps_binary,
 };
 use dot_test_support::TempDir;
@@ -125,6 +126,8 @@ fn cron_freshness_trips_on_stale_and_passes_on_fresh() {
         render(&check_cron_freshness(&CronInputs {
             last_success: last,
             last_converged: None,
+            last_run: None,
+            cron_available: true,
             now: 1_800_000_000,
         }))
     };
@@ -171,6 +174,8 @@ fn cron_freshness_separates_degraded_convergence_from_a_frozen_host() {
         render(&check_cron_freshness(&CronInputs {
             last_success: last,
             last_converged: conv,
+            last_run: None,
+            cron_available: true,
             now: NOW,
         }))
     };
@@ -268,6 +273,483 @@ fn cron_freshness_separates_degraded_convergence_from_a_frozen_host() {
             && !downgraded_failing.contains("last converged"),
         "an older convergence than success adds nothing: {downgraded_failing}"
     );
+}
+
+fn last_run(at: i64, outcome: &str, trigger: &str, failing: &str) -> dot::update_status::LastRun {
+    dot::update_status::LastRun {
+        at,
+        outcome: outcome.to_string(),
+        trigger: trigger.to_string(),
+        failing: failing.to_string(),
+    }
+}
+
+#[test]
+fn cron_that_never_ran_only_skips_without_a_crontab() {
+    // Termux and containers have no `crontab`: such a host is updated by
+    // hand by design, so a lasting warning would be noise.
+    const NOW: i64 = 1_800_000_000;
+    let rows = render(&check_cron_freshness(&CronInputs {
+        last_success: None,
+        last_converged: None,
+        last_run: Some(last_run(NOW - 9 * 3600, "ok", "manual", "")),
+        cron_available: false,
+        now: NOW,
+    }));
+    assert!(
+        rows.contains(
+            "· cron update has never run (no crontab on PATH; last update: manual run 9h0m ago)"
+        ),
+        "{rows}"
+    );
+    assert!(!rows.contains('⚠'), "{rows}");
+}
+
+#[test]
+fn cron_that_never_ran_warns_once_a_manual_update_is_stale() {
+    const NOW: i64 = 1_800_000_000;
+    let check = |run: Option<dot::update_status::LastRun>| {
+        render(&check_cron_freshness(&CronInputs {
+            last_success: None,
+            last_converged: None,
+            last_run: run,
+            cron_available: true,
+            now: NOW,
+        }))
+    };
+    // Nothing ever updated this host: still unknown.
+    assert!(check(None).contains("· cron update success is unknown"));
+    // Updated by hand recently: cron simply has not had a slot yet.
+    let recent = check(Some(last_run(NOW - 600, "ok", "manual", "")));
+    assert!(
+        recent.contains("· cron update has not run yet (last update: manual run 10m ago)"),
+        "{recent}"
+    );
+    assert!(recent.contains("✓ last update succeeded (manual run 10m ago)"));
+    // A cron entry would have run by now: the frozen "unknown" becomes a
+    // warning instead of staying skipped forever.
+    let stale = check(Some(last_run(NOW - 3 * 3600, "ok", "init", "")));
+    assert!(stale.contains("⚠ cron update has never run"), "{stale}");
+    assert!(
+        stale.contains("last update: init run 3h0m ago; schedule dot update --cron"),
+        "{stale}"
+    );
+    assert!(!stale.contains('✗'), "{stale}");
+    // A cron that keeps skipping for local edits is running, not missing.
+    let skipping = check(Some(last_run(NOW - 60, "skip", "cron", "")));
+    assert!(
+        skipping.contains("⚠ cron update has not succeeded recently"),
+        "{skipping}"
+    );
+    assert!(skipping.contains("last cron run skip 1m ago"), "{skipping}");
+    // A clean cron last run whose stamp writes were lost still counts.
+    let lost_stamps = check(Some(last_run(NOW - 60, "ok", "cron", "")));
+    assert!(
+        lost_stamps.contains("✓ cron update succeeded recently (1m ago)"),
+        "{lost_stamps}"
+    );
+    // Cron runs that only ever failed leave no stamp but a cron last run.
+    let failing = check(Some(last_run(NOW - 60, "fail", "cron", "")));
+    assert!(
+        failing.contains("⚠ cron update has not succeeded recently"),
+        "{failing}"
+    );
+    assert!(
+        failing.contains("no successful cron update recorded; last cron run fail 1m ago"),
+        "{failing}"
+    );
+    assert!(
+        !failing.contains("last update"),
+        "a cron last run is covered by the cron row: {failing}"
+    );
+}
+
+#[test]
+fn hand_run_update_rows_appear_only_when_they_add_information() {
+    const NOW: i64 = 1_800_000_000;
+    let check = |success: Option<i64>, run: dot::update_status::LastRun| {
+        render(&check_cron_freshness(&CronInputs {
+            last_success: success,
+            last_converged: None,
+            last_run: Some(run),
+            cron_available: true,
+            now: NOW,
+        }))
+    };
+    // A recent clean cron run vouches for the host: a successful manual
+    // run adds nothing.
+    let quiet = check(Some(NOW - 600), last_run(NOW - 60, "ok", "manual", ""));
+    assert!(!quiet.contains("last update"), "{quiet}");
+    // A manual failure after that clean run is news.
+    let failed = check(Some(NOW - 600), last_run(NOW - 60, "fail", "manual", ""));
+    assert!(failed.contains("✓ cron update succeeded recently"));
+    assert!(failed.contains("⚠ last update failed"), "{failed}");
+    assert!(
+        failed.contains("manual run 1m ago; rerun dot update to see what failed"),
+        "{failed}"
+    );
+    assert!(!failed.contains('✗'), "{failed}");
+    // ...unless the clean cron run is newer.
+    let healed = check(Some(NOW - 60), last_run(NOW - 600, "fail", "manual", ""));
+    assert!(!healed.contains("last update"), "{healed}");
+    // Degraded names the stages.
+    let degraded = check(
+        None,
+        last_run(NOW - 60, "degraded", "manual", "tools,prune"),
+    );
+    assert!(
+        degraded.contains("⚠ last update degraded: tools,prune failing"),
+        "{degraded}"
+    );
+    // A stale clean cron run no longer vouches: a recent manual success shows.
+    let stale_cron = check(Some(NOW - 9 * 3600), last_run(NOW - 60, "ok", "manual", ""));
+    assert!(stale_cron.contains("⚠ cron update has not succeeded recently"));
+    assert!(
+        stale_cron.contains("✓ last update succeeded"),
+        "{stale_cron}"
+    );
+    // Outcome words from a newer Dot still render as a non-success.
+    let newer = check(None, last_run(NOW - 60, "aborted", "manual", ""));
+    assert!(newer.contains("⚠ last update failed"), "{newer}");
+}
+
+#[test]
+fn reexec_checkpoint_rows_follow_what_update_does() {
+    use dot::shdeps::CheckpointState;
+
+    let path = Path::new("/home/u/.local/state/dot/provider-reexec-failed");
+    let rows = |state: CheckpointState| render(&check_reexec_checkpoint(&state, path, "/home/u"));
+    assert_eq!(rows(CheckpointState::Absent), "");
+    let pending = rows(CheckpointState::Pending);
+    assert!(
+        pending.contains("⚠ provider re-exec checkpoint pending"),
+        "{pending}"
+    );
+    assert!(pending.contains("~/.local/state/dot/provider-reexec-failed"));
+    let unreadable = rows(CheckpointState::Unreadable);
+    assert!(
+        unreadable.contains("✗ provider re-exec checkpoint blocks dot update"),
+        "{unreadable}"
+    );
+    assert!(unreadable.contains("unsafe or malformed"));
+    let mismatch = rows(CheckpointState::Mismatch {
+        pinned: "a".repeat(40),
+        active: String::new(),
+    });
+    assert!(
+        mismatch.contains("✗ provider re-exec checkpoint blocks dot update"),
+        "{mismatch}"
+    );
+    assert!(
+        mismatch.contains("pins aaaaaaaaaaaa but dot is at <unavailable>"),
+        "{mismatch}"
+    );
+}
+
+/// A fake standalone install under `data/cgraf78`: the versioned release,
+/// the `current` link, the control directory, and the stable root link,
+/// exactly as `install.sh` publishes them.
+fn standalone_install(data: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let cgraf = data.join("cgraf78");
+    let release = cgraf.join(".dot-standalone/releases/v1-linux");
+    std::fs::create_dir_all(release.join("lib/dot/public")).expect("release");
+    std::fs::write(release.join(".dot-install.json"), b"{}\n").expect("metadata");
+    std::os::unix::fs::symlink("releases/v1-linux", cgraf.join(".dot-standalone/current"))
+        .expect("current");
+    std::os::unix::fs::symlink(".dot-standalone/current", cgraf.join("dot")).expect("root");
+    (
+        cgraf.join("dot"),
+        std::fs::canonicalize(&release).expect("real"),
+    )
+}
+
+/// A fake Shdeps archive install at `data/cgraf78/dot`.
+fn shdeps_install(data: &Path, marker: Option<&[u8]>) -> std::path::PathBuf {
+    let root = data.join("cgraf78/dot");
+    std::fs::create_dir_all(root.join("lib/dot/public")).expect("release");
+    std::fs::write(root.join(".dot-install.json"), b"{}\n").expect("metadata");
+    if let Some(marker) = marker {
+        std::fs::write(root.join(".shdeps-release-layout"), marker).expect("marker");
+    }
+    root
+}
+
+fn layout(root: &Path, source: &Path, release_root: bool, shdeps: bool) -> String {
+    render(&check_install_layout(&InstallInputs {
+        home: "/nonexistent-home",
+        source_real: source,
+        release_root,
+        managed_root: root,
+        shdeps,
+    }))
+}
+
+#[test]
+fn standalone_install_under_shdeps_warns_until_shdeps_adopts_it() {
+    // Shdeps adopts the installer's layout on its next update of Dot, so the
+    // standalone root alone only warns.
+    let scratch = TempDir::new("doctor-layout-standalone").expect("scratch");
+    let (root, release) = standalone_install(scratch.path());
+    let running = layout(&root, &release, true, true);
+    assert!(
+        running.contains("⚠ dot is standalone-installed"),
+        "{running}"
+    );
+    assert!(
+        running.contains(
+            "Shdeps adopts it on its next update of dot; if this persists, run shdeps health"
+        ),
+        "{running}"
+    );
+    assert!(!running.contains('✗'), "{running}");
+    // Same verdict when a checkout runs Dot but the managed root is still
+    // the standalone link Shdeps would have to adopt.
+    let checkout = scratch.path().join("checkout");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    let from_checkout = layout(&root, &checkout, false, true);
+    assert!(
+        from_checkout.contains("⚠ dot is standalone-installed"),
+        "{from_checkout}"
+    );
+    // A standalone binary running beside a healthy Shdeps install (a test
+    // harness, say) is not the stuck shape: the managed root decides.
+    let other = scratch.path().join("other");
+    let managed = shdeps_install(&other, Some(b"v1 archive\n"));
+    assert_eq!(layout(&managed, &release, true, true), "");
+    // Without a provider the standalone installer is the upgrade path,
+    // whether the managed root or the running release identifies it.
+    let alone = layout(&root, &release, true, false);
+    assert!(
+        alone.contains("✓ dot release layout (standalone installer"),
+        "{alone}"
+    );
+    assert!(!alone.contains('✗'), "{alone}");
+    let running = layout(&scratch.path().join("absent/dot"), &release, true, false);
+    assert!(
+        running.contains("✓ dot release layout (standalone installer"),
+        "{running}"
+    );
+}
+
+#[test]
+fn standalone_installer_lock_warns_because_install_sh_refuses() {
+    let scratch = TempDir::new("doctor-layout-standalone-lock").expect("scratch");
+    let (root, release) = standalone_install(scratch.path());
+    std::fs::create_dir(scratch.path().join("cgraf78/.dot-standalone/lock")).expect("lock");
+    let rows = layout(&root, &release, true, false);
+    // A warning: it blocks only a manual installer rerun, never `dot update`.
+    assert!(
+        rows.contains("⚠ standalone installer lock is present"),
+        "{rows}"
+    );
+    assert!(!rows.contains('✗'), "{rows}");
+    assert!(rows.contains("install.sh refuses to run while it exists"));
+}
+
+#[test]
+fn standalone_installer_lock_fails_under_shdeps_because_adoption_refuses() {
+    let scratch = TempDir::new("doctor-layout-standalone-lock-shdeps").expect("scratch");
+    let (root, release) = standalone_install(scratch.path());
+    std::fs::create_dir(scratch.path().join("cgraf78/.dot-standalone/lock")).expect("lock");
+    let rows = layout(&root, &release, true, true);
+    assert!(rows.contains("⚠ dot is standalone-installed"), "{rows}");
+    assert!(
+        rows.contains("✗ standalone installer lock blocks Shdeps adoption"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("cgraf78/.dot-standalone/lock: Shdeps will not adopt"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("remove it if no install.sh is running"),
+        "{rows}"
+    );
+}
+
+#[test]
+fn interrupted_adoption_warns_and_its_lock_blocks_the_resume() {
+    // Shdeps' fallback switch parks the installer's root link as
+    // `<root>.shdeps-parked-root`; an interrupted switch leaves no root.
+    let scratch = TempDir::new("doctor-layout-parked").expect("scratch");
+    let (root, release) = standalone_install(scratch.path());
+    let parked = scratch.path().join("cgraf78/dot.shdeps-parked-root");
+    std::fs::rename(&root, &parked).expect("park root link");
+    let rows = layout(&root, &release, true, true);
+    assert!(
+        rows.contains("⚠ Shdeps adoption of the standalone install was interrupted"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("the next Shdeps update of dot finishes it"),
+        "{rows}"
+    );
+    assert!(!rows.contains('✗'), "{rows}");
+    // Shdeps refuses to resume while the installer lock exists: never call
+    // that lock unused.
+    std::fs::create_dir(scratch.path().join("cgraf78/.dot-standalone/lock")).expect("lock");
+    let locked = layout(&root, &release, true, true);
+    assert!(
+        locked.contains("✗ standalone installer lock blocks Shdeps adoption"),
+        "{locked}"
+    );
+    assert!(!locked.contains("no longer used"), "{locked}");
+    // A parked link that is not the installer's is not an adoption.
+    std::fs::remove_file(&parked).expect("remove parked link");
+    std::os::unix::fs::symlink("elsewhere", &parked).expect("foreign parked link");
+    assert!(!layout(&root, &release, true, true).contains("interrupted"));
+}
+
+#[test]
+fn only_the_installers_exact_root_link_counts_as_adoptable() {
+    // Shdeps adopts only `<root> -> .dot-standalone/current`, read without
+    // following links; anything else would be a promise it does not keep.
+    let scratch = TempDir::new("doctor-layout-exact-link").expect("scratch");
+    let (root, release) = standalone_install(scratch.path());
+    std::fs::remove_file(&root).expect("remove root link");
+    std::os::unix::fs::symlink(".dot-standalone/releases/v1-linux", &root)
+        .expect("link into releases");
+    assert!(!layout(&root, &release, true, true).contains("standalone"));
+    std::fs::remove_file(&root).expect("remove root link");
+    std::os::unix::fs::symlink(
+        scratch.path().join("cgraf78/.dot-standalone/current"),
+        &root,
+    )
+    .expect("absolute link");
+    assert!(!layout(&root, &release, true, true).contains("standalone"));
+    // The lock row needs only the root link: Shdeps checks the lock before
+    // it reads `current`, so a dangling `current` still reports the lock.
+    std::fs::remove_file(&root).expect("remove root link");
+    std::os::unix::fs::symlink(".dot-standalone/current", &root).expect("installer link");
+    std::fs::remove_file(scratch.path().join("cgraf78/.dot-standalone/current"))
+        .expect("remove current");
+    std::fs::create_dir(scratch.path().join("cgraf78/.dot-standalone/lock")).expect("lock");
+    let rows = layout(&root, &release, true, true);
+    assert!(
+        rows.contains("✗ standalone installer lock blocks Shdeps adoption"),
+        "{rows}"
+    );
+}
+
+#[test]
+fn standalone_link_outside_the_releases_directory_is_not_the_installer_layout() {
+    let scratch = TempDir::new("doctor-layout-not-releases").expect("scratch");
+    let cgraf = scratch.path().join("cgraf78");
+    let other = cgraf.join(".dot-standalone/other/v1-linux");
+    std::fs::create_dir_all(other.join("lib/dot/public")).expect("other");
+    std::fs::write(other.join(".dot-install.json"), b"{}\n").expect("metadata");
+    std::os::unix::fs::symlink(".dot-standalone/other/v1-linux", cgraf.join("dot"))
+        .expect("root link");
+    let real = std::fs::canonicalize(&other).expect("real");
+    for shdeps in [true, false] {
+        let rows = layout(&cgraf.join("dot"), &real, true, shdeps);
+        assert!(!rows.contains("standalone"), "{rows}");
+    }
+}
+
+#[test]
+fn shdeps_release_requires_its_layout_marker() {
+    let scratch = TempDir::new("doctor-layout-shdeps").expect("scratch");
+    let root = shdeps_install(scratch.path(), Some(b"v1 archive\n"));
+    let real = std::fs::canonicalize(&root).expect("real");
+    let healthy = layout(&root, &real, true, true);
+    assert_eq!(healthy, "  ✓ dot release layout (Shdeps release)\n");
+
+    // Shdeps compares the whole file: any other content refuses.
+    for content in [
+        b"v2 archive\n".as_slice(),
+        b"v1 archive\nextra\n",
+        b"v1 archive",
+        b"v1 archive\n\n",
+    ] {
+        std::fs::write(root.join(".shdeps-release-layout"), content).expect("marker");
+        let wrong = layout(&root, &real, true, true);
+        assert!(
+            wrong.contains("✗ dot release layout marker is invalid"),
+            "{content:?}: {wrong}"
+        );
+    }
+
+    std::fs::remove_file(root.join(".shdeps-release-layout")).expect("rm marker");
+    std::fs::create_dir(root.join(".shdeps-release-layout")).expect("marker dir");
+    let directory = layout(&root, &real, true, true);
+    assert!(
+        directory.contains("✗ dot release layout marker is invalid"),
+        "{directory}"
+    );
+
+    std::fs::remove_dir(root.join(".shdeps-release-layout")).expect("rm marker dir");
+    let missing = layout(&root, &real, true, true);
+    assert!(
+        missing.contains("⚠ dot release has no Shdeps layout marker"),
+        "{missing}"
+    );
+    assert!(!missing.contains('✗'), "{missing}");
+}
+
+#[test]
+fn shdeps_release_reports_leftover_install_state() {
+    let scratch = TempDir::new("doctor-layout-leftovers").expect("scratch");
+    let root = shdeps_install(scratch.path(), Some(b"v1 archive\n"));
+    let real = std::fs::canonicalize(&root).expect("real");
+    let cgraf = scratch.path().join("cgraf78");
+    std::fs::create_dir(cgraf.join("dot.shdeps-archive-backup-42-7")).expect("backup");
+    std::fs::create_dir(cgraf.join(".dot.shdeps-archive-backup-43-8")).expect("hidden backup");
+    // Another dependency's backup is not Dot's.
+    std::fs::create_dir(cgraf.join("dots.shdeps-archive-backup-1-1")).expect("other backup");
+    std::fs::create_dir_all(cgraf.join(".dot-standalone/lock")).expect("old lock");
+    let rows = layout(&root, &real, true, true);
+    assert!(
+        rows.contains("✓ dot release layout (Shdeps release)"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("⚠ interrupted Shdeps install left a backup"),
+        "{rows}"
+    );
+    assert!(rows.contains("dot.shdeps-archive-backup-42-7"), "{rows}");
+    assert!(rows.contains(".dot.shdeps-archive-backup-43-8"), "{rows}");
+    assert!(!rows.contains("dots.shdeps"), "{rows}");
+    assert!(
+        rows.contains("⚠ leftover standalone installer lock"),
+        "{rows}"
+    );
+    assert!(!rows.contains('✗'), "{rows}");
+}
+
+#[test]
+fn backup_is_reported_even_when_the_install_root_is_gone() {
+    // A swap whose rollback also failed leaves only the backup behind.
+    let scratch = TempDir::new("doctor-layout-orphan-backup").expect("scratch");
+    let cgraf = scratch.path().join("cgraf78");
+    std::fs::create_dir_all(cgraf.join("dot.shdeps-archive-backup-9-9")).expect("backup");
+    let checkout = scratch.path().join("checkout");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    let rows = layout(&cgraf.join("dot"), &checkout, false, true);
+    assert!(
+        rows.contains("⚠ interrupted Shdeps install left a backup"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("the install root is missing; run dot update to reinstall it"),
+        "{rows}"
+    );
+}
+
+#[test]
+fn install_layout_is_silent_for_checkouts_and_other_providers() {
+    let scratch = TempDir::new("doctor-layout-silent").expect("scratch");
+    let root = shdeps_install(scratch.path(), None);
+    let real = std::fs::canonicalize(&root).expect("real");
+    // No provider: a directory release is someone else's to upgrade.
+    assert_eq!(layout(&root, &real, true, false), "");
+    // A checkout runs Dot: the release directory is not in use.
+    let checkout = scratch.path().join("checkout");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    assert_eq!(layout(&root, &checkout, false, true), "");
+    // No managed root at all.
+    let missing = scratch.path().join("missing/cgraf78/dot");
+    assert_eq!(layout(&missing, &checkout, false, true), "");
 }
 
 fn backdate(path: &Path, secs_ago: u64) {
@@ -734,7 +1216,13 @@ fn overlays_git_origin_and_manifest_health_matrix() {
     };
     let drift = render(&check_overlays(&input));
     assert!(drift.contains("git: cloned"));
-    assert!(drift.contains("remote URL drift"));
+    // `dot update` refuses to pull or link a drifted overlay and exits 1,
+    // so doctor fails on it rather than warning.
+    assert!(drift.contains("✗ git: remote URL drift"), "{drift}");
+    assert!(
+        drift.contains("verify the checkout, then adopt it with: git -C"),
+        "{drift}"
+    );
     assert!(drift.contains("overlay symlinks healthy"));
 
     std::fs::write(&manifest, b"malformed\n").expect("bad manifest");

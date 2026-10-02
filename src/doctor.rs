@@ -15,8 +15,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::doctor_checks::{
-    BaseRepoInputs, CronInputs, LifecycleInputs, MergeInputs, MergeSpec, OverlayInputs,
-    ProviderInputs, ProviderInstaller,
+    BaseRepoInputs, CronInputs, InstallInputs, LifecycleInputs, MergeInputs, MergeSpec,
+    OverlayInputs, ProviderInputs, ProviderInstaller,
 };
 use crate::doctor_orchestrator::{EngineSnapshot, Recorder, RuntimeSnapshot};
 
@@ -86,6 +86,16 @@ fn run_configured(
         &engine,
         home.as_bytes(),
     );
+    append(
+        emit.recorder(),
+        crate::doctor_checks::check_install_layout(&InstallInputs {
+            home: &home,
+            source_real: Path::new(OsStr::from_bytes(&engine.source_real)),
+            release_root: runtime_snapshot.release_root,
+            managed_root: Path::new(OsStr::from_bytes(&engine.managed_raw)),
+            shdeps: config.provider == crate::config::Provider::Shdeps,
+        }),
+    );
     emit.emit();
 
     let topology = topology_name(base.topology);
@@ -116,8 +126,19 @@ fn run_configured(
         crate::doctor_checks::check_cron_freshness(&CronInputs {
             last_success: crate::update_status::read_last_success(runtime.state_home()),
             last_converged: crate::update_status::read_last_converged(runtime.state_home()),
+            last_run: crate::update_status::read_last_run(runtime.state_home()),
+            cron_available: runtime.find_on_path("crontab").is_some(),
             now: crate::update_engine::now_secs(),
         }),
+    );
+    let checkpoint = crate::shdeps::checkpoint_in(runtime.state_home());
+    append(
+        emit.recorder(),
+        crate::doctor_checks::check_reexec_checkpoint(
+            &crate::shdeps::checkpoint_state(&checkpoint, runtime.source_root()),
+            &checkpoint,
+            &home,
+        ),
     );
     emit.emit();
     append(

@@ -62,6 +62,18 @@ by its `.dot-install.json` metadata, not by the link. This installer does not:
 rerunning it on such a host fails because the stable release root is a
 user-owned directory, so keep updating Dot through Shdeps there.
 
+`dot doctor` reports which installer owns the release Shdeps would update.
+Under the Shdeps provider a standalone install warns until Shdeps adopts it on
+its next update of Dot (if it persists, `shdeps health` says why), an
+interrupted adoption (`dot.shdeps-parked-root`) warns until the next update
+finishes it, and a leftover `.dot-standalone/lock` fails, because Shdeps will
+not adopt the install while it exists. A Shdeps release root whose
+`.shdeps-release-layout` marker is not exactly `v1 archive` fails (a missing
+marker warns; Shdeps backfills it when the public command proves ownership),
+and an interrupted Shdeps install's `dot.shdeps-archive-backup-*` sibling
+warns. Without a provider, the standalone installer is the upgrade path and
+its lock only warns.
+
 ## Runtime model
 
 The dot tool checkout is an ordinary repository. The selected client dotfiles
