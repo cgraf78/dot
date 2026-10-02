@@ -92,7 +92,8 @@ concurrently for overlays): unmerged paths fail when `dot update` would
 refuse to pull over them (on a branch with an upstream, outside a merge or
 rebase) and warn otherwise; tracked changes, a detached HEAD, a missing or
 gone upstream (update skips pulling that overlay), and upstream distance
-warn. A clean overlay on its current
+warn. A rebase that update froze after it conflicted fails until it is rebased
+by hand. A clean overlay on its current
 upstream reads as one `<name>: upstream (<upstream> (current))` row.
 
 Changing profiles removes exact managed links during the next convergence.

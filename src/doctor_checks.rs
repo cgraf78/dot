@@ -2040,6 +2040,8 @@ pub const STATUS_ARGS: [&str; 5] = [
 /// One repository's state from one [`STATUS_ARGS`] run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoStatus {
+    /// `# branch.oid`: the HEAD commit, or `None` on an unborn branch.
+    pub oid: Option<String>,
     /// `# branch.head`: the branch, or `None` when HEAD is detached.
     pub head: Option<String>,
     /// `# branch.upstream`, when one is configured.
@@ -2059,7 +2061,9 @@ pub struct RepoStatus {
 pub fn parse_status_v2(text: &str) -> RepoStatus {
     let mut status = RepoStatus::default();
     for line in text.lines() {
-        if let Some(head) = line.strip_prefix("# branch.head ") {
+        if let Some(oid) = line.strip_prefix("# branch.oid ") {
+            status.oid = (oid != "(initial)").then(|| oid.to_string());
+        } else if let Some(head) = line.strip_prefix("# branch.head ") {
             status.head = (head != "(detached)").then(|| head.to_string());
         } else if let Some(upstream) = line.strip_prefix("# branch.upstream ") {
             status.upstream = Some(upstream.to_string());
@@ -2092,7 +2096,7 @@ fn unmerged_record(message: String, prefix: &[OsString], pullable: bool) -> Opti
         return Some(Record::warn(
             message,
             Some(
-                "finish the merge or rebase; dot update skips this repository meanwhile"
+                "resolve them; without a branch and upstream to pull, dot update skips this repository"
                     .to_string(),
             ),
         ));
@@ -2110,25 +2114,68 @@ fn unmerged_record(message: String, prefix: &[OsString], pullable: bool) -> Opti
     }
 }
 
-/// Upstream distance in the base client's established wording; `who` is
-/// the subject ("client", or an overlay name) and the result is the warning
-/// message plus detail, or `None` when current.
-fn distance(who: &str, upstream: &str, ahead: u64, behind: u64) -> Option<(String, String)> {
+/// Upstream distance as a warning message plus detail, or `None` when
+/// current. `subject` renders the message from its predicate: the base
+/// client keeps its established "client is behind upstream" wording, and
+/// overlays use their row style ("nvim: behind upstream").
+fn distance(
+    subject: impl Fn(&str) -> String,
+    upstream: &str,
+    ahead: u64,
+    behind: u64,
+) -> Option<(String, String)> {
     match (ahead, behind) {
         (0, 0) => None,
         (0, behind) => Some((
-            format!("{who} is behind upstream"),
+            subject("behind upstream"),
             format!("{upstream}: {behind} commit(s) behind"),
         )),
         (ahead, 0) => Some((
-            format!("{who} is ahead of upstream"),
+            subject("ahead of upstream"),
             format!("{upstream}: {ahead} commit(s) ahead"),
         )),
         (ahead, behind) => Some((
-            format!("{who} upstream has diverged"),
+            subject("diverged from upstream"),
             format!("{upstream}: {ahead} ahead, {behind} behind"),
         )),
     }
+}
+
+/// The per-worktree Git directory of the checkout at `path`: `.git` itself,
+/// or the target a linked worktree's `.git` file names. Stat-level.
+fn worktree_git_dir(path: &Path) -> Option<PathBuf> {
+    let dot_git = path.join(".git");
+    let meta = std::fs::symlink_metadata(&dot_git).ok()?;
+    if meta.is_dir() {
+        return Some(dot_git);
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let target = text.strip_prefix("gitdir: ")?.trim_end();
+    Some(path.join(target))
+}
+
+/// The frozen-rebase failure row: `dot update` refuses to retry a rebase
+/// that conflicted (or failed twice) while the same HEAD and upstream tip
+/// stay put. Doctor matches the recorded HEAD against `branch.oid`, which
+/// costs no process; an upstream that moved since makes update retry, which
+/// the next update shows.
+fn frozen_rebase_record(
+    message: impl Fn(&str) -> String,
+    git_dir: Option<&Path>,
+    status: &RepoStatus,
+) -> Option<Record> {
+    let head = crate::repos_pull::frozen_rebase_head(git_dir?)?;
+    if status.oid.as_deref() != Some(head.as_str()) {
+        return None;
+    }
+    let upstream = status.upstream.as_deref().unwrap_or("its upstream");
+    Some(Record::fail(
+        message(upstream),
+        Some(
+            "dot update refuses to retry it until you rebase by hand or either side moves"
+                .to_string(),
+        ),
+    ))
 }
 
 /// `_dr_check_base_repo` (`doctor/repos.sh`): client repository
@@ -2218,6 +2265,16 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
             pullable,
         ));
     }
+    let git_dir = if inputs.topology == "separate" {
+        Some(PathBuf::from(inputs.client_git_dir))
+    } else {
+        worktree_git_dir(Path::new(inputs.home))
+    };
+    out.extend(frozen_rebase_record(
+        |upstream| format!("the last client rebase onto {upstream} conflicted; rebase manually"),
+        git_dir.as_deref(),
+        &status,
+    ));
     // Unmerged entries are tracked changes too, as the old porcelain-v1
     // count had it.
     let tracked = status.changed + status.unmerged;
@@ -2238,7 +2295,15 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
         return out;
     };
     match status.ahead_behind {
-        Some((ahead, behind)) => match distance("client", upstream, ahead, behind) {
+        Some((ahead, behind)) => match distance(
+            |predicate| match predicate {
+                "diverged from upstream" => "client upstream has diverged".to_string(),
+                _ => format!("client is {predicate}"),
+            },
+            upstream,
+            ahead,
+            behind,
+        ) {
             None => out.push(Record::ok(
                 "client upstream",
                 Some(format!("{upstream} (current)")),
@@ -2281,6 +2346,11 @@ fn overlay_state_records(
             pullable,
         ));
     }
+    out.extend(frozen_rebase_record(
+        |upstream| format!("{name}: the last rebase onto {upstream} conflicted; rebase manually"),
+        worktree_git_dir(Path::new(path)).as_deref(),
+        status,
+    ));
     let tracked = status.changed + status.unmerged;
     if tracked > 0 {
         out.push(Record::warn(
@@ -2303,7 +2373,12 @@ fn overlay_state_records(
         return;
     };
     match status.ahead_behind {
-        Some((ahead, behind)) => match distance(name, upstream, ahead, behind) {
+        Some((ahead, behind)) => match distance(
+            |predicate| format!("{name}: {predicate}"),
+            upstream,
+            ahead,
+            behind,
+        ) {
             None => out.push(Record::ok(
                 format!("{name}: upstream"),
                 Some(format!("{upstream} (current)")),
@@ -2320,9 +2395,26 @@ fn overlay_state_records(
 }
 
 /// [`STATUS_ARGS`] for one overlay checkout, `None` when Git fails.
+/// Inherited Git selectors (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
+/// ...) are scrubbed: doctor also runs under hooks that export them, and
+/// they would point every probe at the wrong repository.
 fn overlay_status(path: &str) -> Option<RepoStatus> {
-    let prefix = [OsString::from("-C"), OsString::from(path)];
-    let output = crate::repos_base::run_git(&prefix, &STATUS_ARGS)?;
+    let mut command = crate::init_client_identity::host_git_command();
+    crate::temp::sanitize_git_env(&mut command);
+    command
+        .arg("-C")
+        .arg(path)
+        .args(STATUS_ARGS)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .ok()?;
     output
         .status
         .success()

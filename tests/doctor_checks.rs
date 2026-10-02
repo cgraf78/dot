@@ -1178,7 +1178,7 @@ fn overlay_branch_upstream_and_dirt_follow_update_severities() {
 
     git(&repo, &["commit", "-q", "--allow-empty", "-m", "local"]);
     let ahead = rows();
-    assert!(ahead.contains("⚠ git is ahead of upstream"), "{ahead}");
+    assert!(ahead.contains("⚠ git: ahead of upstream"), "{ahead}");
     assert!(ahead.contains("origin/main: 1 commit(s) ahead"), "{ahead}");
 
     git(&repo, &["checkout", "-q", "--detach"]);
@@ -1242,6 +1242,66 @@ fn overlay_branch_upstream_and_dirt_follow_update_severities() {
         ),
         "{conflicted}"
     );
+    // Without a branch to pull, update skips the overlay before it looks at
+    // the index, so the same sessionless entries only warn.
+    let head = String::from_utf8(
+        dot_test_support::git()
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("HEAD")
+            .stdout,
+    )
+    .expect("utf8 HEAD");
+    git(&repo, &["update-ref", "--no-deref", "HEAD", head.trim()]);
+    let detached = rows();
+    assert!(
+        detached.contains(
+            "⚠ git: 1 unmerged path(s)\n    resolve them; without a branch and upstream to pull"
+        ),
+        "{detached}"
+    );
+    assert!(detached.contains("⚠ git: HEAD is detached"), "{detached}");
+    assert!(!detached.contains('✗'), "{detached}");
+}
+
+#[test]
+fn frozen_overlay_rebase_fails_until_rebased_by_hand() {
+    // `dot update` refuses to retry a rebase that conflicted while HEAD and
+    // the upstream tip stay put; doctor matches the recorded HEAD.
+    let scratch = TempDir::new("doctor-overlay-frozen").expect("scratch");
+    let (remote, clones) = overlay_clones(scratch.path(), 1);
+    let repo = &clones[0];
+    let head = String::from_utf8(
+        dot_test_support::git()
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("HEAD")
+            .stdout,
+    )
+    .expect("utf8 HEAD");
+    let head = head.trim();
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let input = clone_inputs(manifest, &remote, &clones);
+    let marker = repo.join(".git/dot-rebase-failed");
+    std::fs::write(&marker, format!("{head} {head}\n")).expect("frozen marker");
+    let frozen = render(&check_overlays(&input));
+    assert!(
+        frozen.contains("✗ ov0: the last rebase onto origin/main conflicted; rebase manually"),
+        "{frozen}"
+    );
+    // One strike still allows a retry, and a moved HEAD is a new attempt.
+    std::fs::write(&marker, format!("{head} {head} retry\n")).expect("one strike");
+    assert!(!render(&check_overlays(&input)).contains("conflicted"));
+    std::fs::write(&marker, format!("{} {head}\n", "0".repeat(40))).expect("old head");
+    assert!(!render(&check_overlays(&input)).contains("conflicted"));
 }
 
 /// A bare remote with one commit on `main`, plus `count` clones of it.
@@ -1318,7 +1378,7 @@ fn concurrent_overlay_statuses_land_on_their_own_overlay() {
             let expected = match index % 4 {
                 0 => format!("✓ ov{index}: upstream (origin/main (current))"),
                 1 => format!("⚠ ov{index}: 1 tracked change(s)"),
-                2 => format!("⚠ ov{index} is ahead of upstream"),
+                2 => format!("⚠ ov{index}: ahead of upstream"),
                 _ => format!("⚠ ov{index}: HEAD is detached"),
             };
             assert!(rows.contains(&expected), "missing {expected:?}: {rows}");
@@ -1794,6 +1854,25 @@ fn base_repo_upstream_current_ahead_behind_and_diverged() {
     let git_dir = home.join(".git");
     let inputs = || base("ordinary", &git_dir, &home);
     assert!(render(&check_base_repo(&inputs())).contains("origin/main (current)"));
+    // A frozen rebase of this HEAD makes every update refuse.
+    let head = String::from_utf8(
+        dot_test_support::git()
+            .arg("-C")
+            .arg(&home)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("HEAD")
+            .stdout,
+    )
+    .expect("utf8 HEAD");
+    let marker = git_dir.join("dot-rebase-failed");
+    std::fs::write(&marker, format!("{} {}\n", head.trim(), head.trim())).expect("marker");
+    let frozen = render(&check_base_repo(&inputs()));
+    assert!(
+        frozen.contains("✗ the last client rebase onto origin/main conflicted; rebase manually"),
+        "{frozen}"
+    );
+    std::fs::remove_file(&marker).expect("remove marker");
 
     git(&home, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
     assert!(render(&check_base_repo(&inputs())).contains("1 commit(s) ahead"));

@@ -631,6 +631,19 @@ const FAILED_MARKER: &str = "dot-rebase-failed";
 /// failure.
 const RETRY_STRIKE: &str = "retry";
 
+/// The HEAD whose rebase is frozen in the per-worktree `git_dir`: the
+/// [`FAILED_MARKER`] holds a bare `HEAD upstream` pair (no
+/// [`RETRY_STRIKE`]), which [`RebaseGuard::repeats_failure`] refuses to
+/// retry while that HEAD and upstream tip stay put. `None` without a
+/// marker or for a one-strike record. One read; `dot doctor` reports it.
+pub(crate) fn frozen_rebase_head(git_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(git_dir.join(FAILED_MARKER)).ok()?;
+    let line = text.strip_suffix('\n')?;
+    let mut words = line.split(' ');
+    let (head, _upstream) = (words.next()?, words.next()?);
+    words.next().is_none().then(|| head.to_string())
+}
+
 /// Marker recording the `HEAD upstream` pair of the rebase dot is
 /// about to run, removed once the pull and any abort are done. A
 /// rebase left in progress that matches it is dot's own, interrupted

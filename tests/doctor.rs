@@ -2782,6 +2782,45 @@ fn linked_worktree_overlay_matches_without_the_old_engine() {
     assert_pair(&shell, &native);
 }
 
+#[test]
+fn overlay_state_ignores_inherited_git_selectors() {
+    // Doctor also runs from hook contexts that export Git selectors; the
+    // overlay status probe must still inspect the overlay itself.
+    let scope = TempDir::new("doctor-overlay-git-env-scope").expect("scope");
+    let home = TempDir::new("doctor-overlay-git-env-home").expect("home");
+    let state = TempDir::new("doctor-overlay-git-env-state").expect("state");
+    let origin = origin(scope.path());
+    let overlay = home.path().join(".dotfiles-plain");
+    let status = dot_test_support::git()
+        .args(["clone", "-q"])
+        .arg(&origin)
+        .arg(&overlay)
+        .status()
+        .expect("overlay clone");
+    assert!(status.success());
+    let overlays = home.path().join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&overlays).expect("overlays directory");
+    std::fs::write(
+        overlays.join("20-plain.conf"),
+        format!("url={}\n", origin.display()),
+    )
+    .expect("descriptor");
+    // A Git pre-commit hook exports `GIT_INDEX_FILE`; read against that
+    // foreign index, a clean overlay looked like every file was deleted.
+    let foreign = scope.path().join("foreign-index");
+    let foreign = foreign.to_str().expect("utf8");
+    let native = command(false, &home, &state, &[("GIT_INDEX_FILE", foreign)])
+        .output()
+        .expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(stdout.contains("plain: cloned"), "{stdout}");
+    assert!(
+        stdout.contains("✓ plain: upstream (origin/main (current))"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("plain: 1 tracked change"), "{stdout}");
+}
+
 fn latest_provider(home: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
     let root = home.path().join("provider-dev");
     let provider = root.join("shdeps");
