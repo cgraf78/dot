@@ -379,7 +379,9 @@ pub fn active_revision(source_root: &Path) -> String {
 
 /// The Dot generation installed at `source_root`: a packaged release's
 /// install-metadata commit, otherwise the checkout `HEAD`
-/// ([`active_revision`]). The empty string when neither resolves.
+/// ([`active_revision`]). The empty string when neither resolves. This is
+/// the one reader for the installed generation; anything comparing against
+/// a provider checkpoint must use it rather than [`active_revision`].
 ///
 /// The provider compares this before and after the Tools stage to notice
 /// that Shdeps upgraded Dot itself. A release root (how hosts install Dot

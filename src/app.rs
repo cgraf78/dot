@@ -312,7 +312,10 @@ impl Runtime {
         true
     }
 
-    /// Whether a process replacement is pending.
+    /// Whether a process replacement is pending: this run's first half has
+    /// ended and its outcome belongs to the continuation. Paths that record
+    /// or publish a run's outcome (the cron outcome in the update engine)
+    /// must skip it while this holds.
     pub(crate) fn exec_pending(&self) -> bool {
         self.handoff.as_ref().is_some_and(|slot| {
             slot.lock()

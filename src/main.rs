@@ -31,6 +31,8 @@ use std::io::Write;
 fn main() {
     dot::startup::apply_umask_ceiling();
     let env = std::env::vars_os().collect::<BTreeMap<_, _>>();
+    // The snapshot keeps Dot's handoff variables; children never inherit them.
+    dot::handoff::scrub_process_env();
     let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
     let mut process_args = std::env::args_os();
     let argv0 = process_args.next();

@@ -478,11 +478,22 @@ case ${1:-} in
       printf 'binary=%s\n' "${DOT_TEST_BINARY_MARKER:-default}" >>"$DOT_TEST_PROVIDER_RECORD"
     fi
     if [[ -n ${DOT_TEST_PROVIDER_ENV_RECORD:-} ]]; then
-      printf 'token=%s log=%s once=%s\n' "${DOT_UPDATE_LOCK_TOKEN:+set}" \
-        "${SHDEPS_LOG_LEVEL:-unset}" "${DOT_REEXEC_ONCE:-unset}" >>"$DOT_TEST_PROVIDER_ENV_RECORD"
+      printf 'token=%s log=%s once=%s expected=%s started=%s\n' "${DOT_UPDATE_LOCK_TOKEN:+set}" \
+        "${SHDEPS_LOG_LEVEL:-unset}" "${DOT_REEXEC_ONCE:-unset}" \
+        "${DOT_REEXEC_EXPECTED_REVISION:-unset}" "${DOT_REEXEC_STARTED:-unset}" \
+        >>"$DOT_TEST_PROVIDER_ENV_RECORD"
     fi
     if [[ -n ${DOT_TEST_PROVIDER_PARENT_RECORD:-} ]]; then
       printf '%s|%s\n' "$PPID" "$(ps -ww -o args= -p "$PPID")" >>"$DOT_TEST_PROVIDER_PARENT_RECORD"
+    fi
+    if [[ -n ${DOT_TEST_PROVIDER_LOCK_OWNER:-} ]]; then
+      { cat "$DOT_TEST_PROVIDER_LOCK_OWNER" 2>/dev/null || printf 'NO-LOCK\n'; printf -- '--\n'; } \
+        >>"$DOT_TEST_PROVIDER_LOCK_RECORD"
+    fi
+    if [[ -n ${DOT_TEST_PROVIDER_STEAL_LOCK:-} && ! -e $DOT_TEST_PROVIDER_STEAL_LOCK.done ]]; then
+      : >"$DOT_TEST_PROVIDER_STEAL_LOCK.done"
+      owner=$(<"$DOT_TEST_PROVIDER_STEAL_LOCK")
+      printf '%s\n' "${owner%%token*}token	stolen" >"$DOT_TEST_PROVIDER_STEAL_LOCK"
     fi
     if [[ -n ${DOT_TEST_PROVIDER_RELEASES:-} ]]; then
       IFS=: read -ra releases <<<"$DOT_TEST_PROVIDER_RELEASES"
@@ -714,7 +725,13 @@ raise SystemExit(2)
     }
 
     fn command_for(&self, subcommand: &str) -> Command {
-        let mut command = Command::new(&self.binary);
+        self.command_via(&self.binary, subcommand)
+    }
+
+    /// [`Self::command_for`] launching the fixture's Dot through `program`
+    /// (for example a launcher symlink).
+    fn command_via(&self, program: &Path, subcommand: &str) -> Command {
+        let mut command = Command::new(program);
         let path = std::env::var_os("PATH").unwrap_or_default();
         let fixture_python = if Path::new("/usr/bin/python3").is_file() {
             PathBuf::from("/usr/bin/python3")
@@ -3456,9 +3473,9 @@ fn release_update(fixture: &Fixture, releases: &[&Path]) -> Command {
     command
 }
 
-/// Merge hook recording whether it saw the update lock claim.
-const TOKEN_HOOK: &[u8] =
-    b"merge() { printf '%s\\n' \"${DOT_UPDATE_LOCK_TOKEN:+set}\" >>\"$HOME/hook-token\"; }\n";
+/// Merge hook recording whether it saw the update lock claim and the
+/// handoff markers (`token|once|expected`); hooks get only the claim.
+const TOKEN_HOOK: &[u8] = b"merge() { printf '%s|%s|%s\\n' \"${DOT_UPDATE_LOCK_TOKEN:+set}\" \"${DOT_REEXEC_ONCE:-unset}\" \"${DOT_REEXEC_EXPECTED_REVISION:-unset}\" >>\"$HOME/hook-token\"; }\n";
 
 #[test]
 fn release_upgrade_hands_off_to_the_new_binary() {
@@ -3485,7 +3502,7 @@ fn release_upgrade_hands_off_to_the_new_binary() {
     // Config hooks run only in the continuation, under the carried claim.
     assert_eq!(
         std::fs::read_to_string(fixture.home.join("hook-token")).expect("hook record"),
-        "set\n"
+        "set|unset|unset\n"
     );
     let stdout = String::from_utf8_lossy(&normalize_elapsed(&output.stdout)).into_owned();
     assert_eq!(
@@ -3494,6 +3511,12 @@ fn release_upgrade_hands_off_to_the_new_binary() {
         "{stdout}"
     );
     assert_eq!(stdout.matches("Done in Ns.").count(), 1, "{stdout}");
+    // The continuation announces itself before its stage counter restarts.
+    let announced = format!(
+        "  continuing with dot {}\n[1/5]",
+        &dot::version::COMMIT[..12]
+    );
+    assert_eq!(stdout.matches(&announced).count(), 1, "{stdout}");
     assert!(
         !fixture.state.join("dot/update.lock.d").exists(),
         "the continuation released the update lock"
@@ -3554,7 +3577,7 @@ fn release_handoff_falls_back_when_the_new_binary_fails_its_guard() {
     assert_eq!(provider_parents(&fixture).len(), 1);
     assert_eq!(
         std::fs::read_to_string(fixture.home.join("hook-token")).expect("hook record"),
-        "set\n"
+        "set|unset|unset\n"
     );
     assert!(!fixture.state.join("dot/update.lock.d").exists());
 }
@@ -3630,7 +3653,7 @@ fn release_continuation_children_inherit_only_the_process_environment() {
     assert_eq!(provider_parents(&fixture).len(), 2);
     assert_eq!(
         std::fs::read_to_string(&record).expect("provider env record"),
-        "token= log=unset once=unset\ntoken= log=unset once=1\n"
+        "token= log=unset once=unset expected=unset started=unset\n".repeat(2)
     );
 }
 
@@ -3745,6 +3768,171 @@ fn release_exec_failure_after_the_probe_records_a_failed_run() {
 }
 
 #[test]
+fn release_continuation_reenters_the_held_lock() {
+    // The lock is held across the exec, never released and retaken, so no
+    // other update can run between the halves: both Tools runs see the very
+    // same owner record (pid, start, and token).
+    let fixture = Fixture::release("shdeps-release-handoff-lock-identity");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
+    let record = fixture.home.join("lock-record");
+    let output = release_update(&fixture, &[&next])
+        .env(
+            "DOT_TEST_PROVIDER_LOCK_OWNER",
+            dot::update_lock::lock_path(&fixture.state).join("owner"),
+        )
+        .env("DOT_TEST_PROVIDER_LOCK_RECORD", &record)
+        .output()
+        .expect("release handoff update");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let body = std::fs::read_to_string(&record).expect("lock record");
+    let halves: Vec<&str> = body.split("--\n").filter(|half| !half.is_empty()).collect();
+    assert_eq!(halves.len(), 2, "{body}");
+    assert!(halves[0].contains("token\t"), "{body}");
+    assert_eq!(halves[0], halves[1], "the continuation took a fresh lock");
+}
+
+#[test]
+fn release_continuation_that_cannot_reenter_the_lock_records_a_failed_run() {
+    // Something replaced the lock's claim during the first half: the
+    // continuation cannot re-enter and stops before its engine, but the cron
+    // run still gets its one outcome line.
+    let fixture = Fixture::release("shdeps-release-handoff-lock-stolen");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
+    let output = release_update(&fixture, &[&next])
+        .arg("--cron")
+        .env(
+            "DOT_TEST_PROVIDER_STEAL_LOCK",
+            dot::update_lock::lock_path(&fixture.state).join("owner"),
+        )
+        .output()
+        .expect("release handoff with a stolen lock");
+    assert_cli(&output, 75, b"", b"");
+    assert_eq!(provider_parents(&fixture).len(), 1);
+    let log = std::fs::read_to_string(dot::update_status::update_log_path(&fixture.state))
+        .expect("cron outcome log");
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert_eq!(last_cron_outcome(&fixture), ["fail", "update"]);
+}
+
+#[test]
+fn release_continuation_stays_cancellable() {
+    // The exec'd image must start with the handled signals unblocked, or
+    // SIGTERM would sit pending for the rest of the continuation.
+    let fixture = Fixture::release("shdeps-release-handoff-sigterm");
+    fixture.with_merge_hook(b"merge() { : >\"$HOME/hook-started\"; sleep 30; }\n");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
+    let mut command = release_update(&fixture, &[&next]);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = command.spawn().expect("spawn release handoff");
+    let started = fixture.home.join("hook-started");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !started.exists() {
+        if std::time::Instant::now() >= deadline || child.try_wait().expect("poll").is_some() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the continuation's config hook never started");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        provider_parents(&fixture).len(),
+        2,
+        "the hook runs in the continuation"
+    );
+    // SAFETY: signals our own child, which is not yet reaped.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let sent = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll") {
+            break Some(status);
+        }
+        if sent.elapsed() > std::time::Duration::from_secs(10) {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(143),
+        "the continuation ignored SIGTERM"
+    );
+}
+
+#[test]
+fn release_handoff_probe_obeys_its_deadline() {
+    // A new binary that hangs on startup must not hang the update: the probe
+    // is bounded and the running Dot finishes the run.
+    let fixture = Fixture::release("shdeps-release-handoff-probe-hang");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, false);
+    write_exec(
+        &next.join("dot"),
+        b"#!/bin/sh\nprintf '%s\\n' \"$$\" >\"$HOME/probe-pid\"\nexec sleep 30\n",
+    );
+    let started = std::time::Instant::now();
+    let output = release_update(&fixture, &[&next])
+        .env("_DOT_REEXEC_PROBE_TIMEOUT_SECONDS", "1")
+        .output()
+        .expect("release update with a hanging binary");
+    // Well under the 10 s default, so an ignored knob fails here.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "the probe ran for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let short = &dot::version::COMMIT[..12];
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "  warning: dot {short} was installed but its binary did not pass its startup check; finishing this update on the running dot\n"
+        )
+    );
+    assert_eq!(provider_parents(&fixture).len(), 1);
+    let pid = std::fs::read_to_string(fixture.home.join("probe-pid"))
+        .expect("probe pid")
+        .trim()
+        .to_string();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while process_running(&pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!process_running(&pid), "the hung probe {pid} survived");
+}
+
+#[test]
+fn release_reached_through_a_launcher_symlink_hands_off() {
+    // Hosts run `~/.local/bin/dot`, a symlink into the release root. The
+    // runtime resolves the physical root, so detection and the exec target
+    // follow the release, not the link.
+    let fixture = Fixture::release("shdeps-release-handoff-symlink");
+    let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
+    let bin = fixture.home.join(".local/bin");
+    std::fs::create_dir_all(&bin).expect("launcher directory");
+    let launcher = bin.join("dot");
+    std::os::unix::fs::symlink(fixture.root.join("dot"), &launcher).expect("launcher link");
+    let output = fixture
+        .command_via(&launcher, "update")
+        .env("DOT_TEST_PROVIDER_RELEASES", &next)
+        .env(
+            "DOT_TEST_PROVIDER_PARENT_RECORD",
+            fixture.home.join("provider-parents"),
+        )
+        .output()
+        .expect("release update through a launcher symlink");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let parents = provider_parents(&fixture);
+    assert_eq!(parents.len(), 2, "{parents:?}");
+    assert_eq!(parents[0].0, parents[1].0);
+    assert_eq!(
+        parents[1].1,
+        format!("{} update", fixture.root.join("dot").display())
+    );
+}
+#[test]
 fn checkout_reexec_continuation_keeps_the_update_lock_claim() {
     // The in-process continuation of a development checkout must hand its
     // hooks the same lock claim the first half had.
@@ -3763,7 +3951,7 @@ fn checkout_reexec_continuation_keeps_the_update_lock_claim() {
     assert!(fixture.home.join("provider-advanced").exists());
     assert_eq!(
         std::fs::read_to_string(fixture.home.join("hook-token")).expect("hook record"),
-        "set\n"
+        "set|unset|unset\n"
     );
 }
 

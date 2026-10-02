@@ -22,6 +22,25 @@ use std::path::PathBuf;
 
 use crate::update_lock::LockGuard;
 
+/// Remove the handoff variables from this process's environment, which every
+/// child spawned without an explicit environment inherits.
+///
+/// The binary entry calls this right after snapshotting the environment into
+/// its runtime (which keeps them for the command boundary and the engine) and
+/// before any thread exists. A release continuation receives the variables
+/// through `execve`, so without this a `git pull` and the helpers it starts
+/// (credential helpers, SSH control masters) would carry them.
+#[doc(hidden)]
+pub fn scrub_process_env() {
+    for key in crate::update_engine::CONTINUATION_ENV {
+        if std::env::var_os(key).is_some() {
+            // SAFETY: called once at process entry, before any thread is
+            // spawned, so no other thread can read the environment.
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+}
+
 /// A pending replacement of this process with an upgraded Dot binary.
 #[derive(Debug)]
 pub struct Handoff {

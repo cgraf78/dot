@@ -76,10 +76,58 @@ const REEXEC_ONCE_ENV: &str = "DOT_REEXEC_ONCE";
 /// The revision a provider continuation must observe at startup.
 const REEXEC_EXPECTED_ENV: &str = "DOT_REEXEC_EXPECTED_REVISION";
 
+/// Epoch seconds at which the first half of a handed-off update started, so
+/// the continuation's final `Done in` and cron outcome cover the whole run.
+const REEXEC_STARTED_ENV: &str = "DOT_REEXEC_STARTED";
+
+/// Test-only bound in seconds for the release handoff probe (default
+/// [`crate::cleanup::REVISION_PROBE_TIMEOUT`]).
+const PROBE_TIMEOUT_ENV: &str = "_DOT_REEXEC_PROBE_TIMEOUT_SECONDS";
+
+/// Handoff variables a continuation consumes itself. Like the lock claim
+/// they never reach providers, hooks, or other children: a long-lived process
+/// started from a hook (or a Git helper started by a pull) would otherwise
+/// carry `DOT_REEXEC_EXPECTED_REVISION` into every later `dot` it runs, which
+/// fails the startup guard after the next upgrade. The engine strips them
+/// from its runtime and the binary entry from the process environment
+/// ([`crate::handoff::scrub_process_env`]).
+pub(crate) const CONTINUATION_ENV: [&str; 4] = [
+    LOCK_TOKEN_ENV,
+    REEXEC_ONCE_ENV,
+    REEXEC_EXPECTED_ENV,
+    REEXEC_STARTED_ENV,
+];
+
 /// Whether `runtime` is a provider continuation: the second half of an
 /// update whose first half already reported its command-boundary warnings.
+/// Read from the command's own environment; the engine strips the variable
+/// from what its children inherit.
 pub(crate) fn is_continuation(runtime: &crate::app::Runtime) -> bool {
     runtime.value(REEXEC_ONCE_ENV).and_then(OsStr::to_str) == Some("1")
+}
+
+/// Record a `fail` cron outcome for a release continuation that stops
+/// before its engine records the run (for example when it cannot re-enter
+/// the update lock). The first half skipped its own line on handoff, so
+/// without this the run would leave no outcome at all.
+pub(crate) fn record_continuation_failure(
+    continuation: bool,
+    args: &[OsString],
+    state_home: &Path,
+) {
+    // Cancellation is not an outcome, as everywhere else in the cron log.
+    if continuation && parse_flags(args).0.cron && !cancelled() {
+        crate::update_status::append_outcome(state_home, now_secs(), "fail", "update", "");
+    }
+}
+
+/// Whether a release root may hand the rest of a run off to a new binary:
+/// only `dot update` itself, and only from the binary entry point, which
+/// owns the process image and runs the handoff. `dot init` converges inside
+/// its own transaction and must finish in place; an embedded runtime cannot
+/// replace its process.
+fn release_hands_off(caller: Caller, can_exec: bool) -> bool {
+    caller == Caller::Update && can_exec
 }
 
 /// When `dot update` removes orphaned Shdeps dependencies itself.
@@ -143,6 +191,10 @@ pub struct EngineInputs<'a> {
     /// claim. A provider continuation starts from it, so it keeps the claim
     /// and the flag exports that [`Self::runtime`] does not carry.
     pub env: &'a BTreeMap<OsString, OsString>,
+    /// Whether this run is a provider continuation (`DOT_REEXEC_ONCE=1` in
+    /// the command environment). A further Dot change publishes the provider
+    /// checkpoint instead of continuing again.
+    pub continuation: bool,
     /// Parsed client configuration for this update generation.
     pub config: &'a crate::config::Config,
     /// Unknown config keys already reported during this invocation (see
@@ -2403,7 +2455,7 @@ fn provider_reexec(
     // `dot init` converges inside its own transaction and an embedded
     // runtime cannot replace its process: on a release root both finish in
     // place, exactly as before releases could hand off.
-    if release && (inputs.caller != Caller::Update || !inputs.runtime.can_exec()) {
+    if release && !release_hands_off(inputs.caller, inputs.runtime.can_exec()) {
         return None;
     }
     if release && !(crate::shdeps::revision_valid(before) && crate::shdeps::revision_valid(after)) {
@@ -2450,7 +2502,7 @@ fn provider_reexec(
         let _ = io.out.write_all(&close);
         return Some(1);
     }
-    if is_continuation(inputs.runtime) {
+    if inputs.continuation {
         let path = Path::new(inputs.state_home).join("dot/provider-reexec-failed");
         let mut moves = crate::temp::MoveCache::default();
         if crate::shdeps::write_checkpoint(before, after, &path, &mut moves) {
@@ -2478,19 +2530,17 @@ fn provider_reexec(
         return Some(1);
     }
     if release {
-        return release_handoff(inputs, io, after);
+        return release_handoff(inputs, io, after, now_secs);
     }
     // The nested runtime keeps this run's child environment (no lock claim,
-    // no prune policy: hooks receive the claim explicitly), while the nested
-    // capture starts from the command environment so it keeps the lock claim
-    // and flag exports this run was gathered from.
-    let mut runtime_env = inputs.runtime.env().clone();
+    // prune policy, or continuation variables: see `CONTINUATION_ENV`),
+    // while the nested capture starts from the command environment so it
+    // keeps the lock claim and flag exports this run was gathered from, plus
+    // the continuation markers it reads as values.
     let mut env = inputs.env.clone();
-    for map in [&mut runtime_env, &mut env] {
-        map.insert(OsString::from(REEXEC_ONCE_ENV), OsString::from("1"));
-        map.insert(OsString::from(REEXEC_EXPECTED_ENV), OsString::from(after));
-    }
-    let runtime = match crate::app::Runtime::from_env(&runtime_env, inputs.runtime.cwd()) {
+    env.insert(OsString::from(REEXEC_ONCE_ENV), OsString::from("1"));
+    env.insert(OsString::from(REEXEC_EXPECTED_ENV), OsString::from(after));
+    let runtime = match crate::app::Runtime::from_env(inputs.runtime.env(), inputs.runtime.cwd()) {
         Ok(runtime) => runtime,
         Err(_) => return Some(1),
     };
@@ -2577,7 +2627,12 @@ fn provider_reexec(
 /// `None` finishes this run in place, as releases always did before: a new
 /// binary that is missing or fails its startup probe must not stop the
 /// update, only warn.
-fn release_handoff(inputs: &EngineInputs<'_>, io: &mut UpdateIo<'_>, after: &str) -> Option<i32> {
+fn release_handoff(
+    inputs: &EngineInputs<'_>,
+    io: &mut UpdateIo<'_>,
+    after: &str,
+    started: i64,
+) -> Option<i32> {
     let mut env = inputs.runtime.env().clone();
     if let Some(prune) = inputs.env.get(OsStr::new(PRUNE_ENV)) {
         env.insert(OsString::from(PRUNE_ENV), prune.clone());
@@ -2587,6 +2642,10 @@ fn release_handoff(inputs: &EngineInputs<'_>, io: &mut UpdateIo<'_>, after: &str
     }
     env.insert(OsString::from(REEXEC_ONCE_ENV), OsString::from("1"));
     env.insert(OsString::from(REEXEC_EXPECTED_ENV), OsString::from(after));
+    env.insert(
+        OsString::from(REEXEC_STARTED_ENV),
+        OsString::from(started.to_string()),
+    );
     let binary = inputs.source_root_git.join("dot");
     let probe = probe_release_binary(inputs.runtime, &binary, &env);
     if cancelled() {
@@ -2607,7 +2666,19 @@ fn release_handoff(inputs: &EngineInputs<'_>, io: &mut UpdateIo<'_>, after: &str
     args.extend(inputs.original_args.iter().cloned());
     let cron_state = inputs.flags.cron.then(|| PathBuf::from(inputs.state_home));
     let handoff = crate::handoff::Handoff::new(binary, args, env, cron_state);
-    inputs.runtime.request_exec(handoff).then_some(0)
+    if !inputs.runtime.request_exec(handoff) {
+        return None;
+    }
+    // The continuation's stage counter restarts at 1; say why.
+    if !quiet(inputs) {
+        let short = after.get(..12).unwrap_or(after);
+        let _ = writeln!(
+            io.out,
+            "{}  continuing with dot {short}{}",
+            inputs.palette.dim, inputs.palette.reset
+        );
+    }
+    Some(0)
 }
 
 /// Check that the new release binary can run the continuation before this
@@ -2636,9 +2707,25 @@ fn probe_release_binary(
         .envs(env)
         .current_dir(runtime.cwd())
         .stdin(std::process::Stdio::null());
+    let timeout = runtime
+        .value(PROBE_TIMEOUT_ENV)
+        .and_then(OsStr::to_str)
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(
+            crate::cleanup::REVISION_PROBE_TIMEOUT,
+            std::time::Duration::from_secs,
+        );
     let output = crate::cleanup::run_session_output(
         command,
-        Some(std::time::Instant::now() + crate::cleanup::REVISION_PROBE_TIMEOUT),
+        {
+            // A test knob too large to add keeps the default bound.
+            let now = std::time::Instant::now();
+            Some(
+                now.checked_add(timeout)
+                    .unwrap_or(now + crate::cleanup::REVISION_PROBE_TIMEOUT),
+            )
+        },
         crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
         crate::cleanup::LingerPolicy::Detach,
     );
@@ -2743,6 +2830,7 @@ pub struct Gathered {
     prune_mode: PruneMode,
     update_lock_token: Option<String>,
     env: BTreeMap<OsString, OsString>,
+    continuation: bool,
     config: crate::config::Config,
     config_warned: std::cell::RefCell<Vec<String>>,
     data_warned: std::cell::RefCell<Vec<crate::unknown_keys::DataKey>>,
@@ -2791,6 +2879,7 @@ impl Gathered {
             prune_mode: self.prune_mode,
             update_lock_token: self.update_lock_token.as_deref(),
             env: &self.env,
+            continuation: self.continuation,
             config: &self.config,
             config_warned: &self.config_warned,
             data_warned: &self.data_warned,
@@ -3039,6 +3128,7 @@ fn gather(
         prune_mode,
         update_lock_token: env_value(env, LOCK_TOKEN_ENV),
         env: env.clone(),
+        continuation: env_value(env, REEXEC_ONCE_ENV).as_deref() == Some("1"),
         config: config.clone(),
         config_warned: std::cell::RefCell::new(
             config
@@ -3157,13 +3247,25 @@ pub fn run_update(
         Some(state_home) => state_home,
         None => return 1,
     };
-    let (prune_mode, runtime) = prune_mode(runtime, request, streams.stderr);
-    // The handed-over warnings concern this engine only, and the lock claim
-    // reaches hook workers explicitly. A release continuation inherits both
-    // in its process environment (to re-enter the lock and skip repeats), so
-    // keep them out of what providers and hooks inherit, like any other run.
-    let runtime = runtime.without_env(WARNED_ENV).without_env(LOCK_TOKEN_ENV);
+    let continuation = is_continuation(runtime);
+    let (prune_mode, mut runtime) = prune_mode(runtime, request, streams.stderr);
+    // The lock claim reaches hook workers explicitly, and a continuation
+    // reads its markers from the command environment. A release
+    // continuation inherits all of them in its process environment, so keep
+    // them out of what providers and hooks inherit, like any other run.
+    for key in CONTINUATION_ENV {
+        runtime = runtime.without_env(key);
+    }
+    // The handed-over warnings concern this engine only.
+    runtime = runtime.without_env(WARNED_ENV);
     let runtime = &runtime;
+    // A release continuation's run started with its first half.
+    let started = continuation
+        .then(|| env_value(request.env, REEXEC_STARTED_ENV))
+        .flatten()
+        .and_then(|epoch| epoch.parse::<i64>().ok())
+        .filter(|epoch| *epoch > 0 && *epoch <= now_secs())
+        .unwrap_or_else(now_secs);
     let gathered = match gather(
         request.caller,
         prune_mode,
@@ -3178,6 +3280,7 @@ pub fn run_update(
         Ok(gathered) => gathered,
         Err(error) => {
             error.write(streams.stderr);
+            record_continuation_failure(continuation, request.args, request.state_home);
             return error.code();
         }
     };
@@ -3197,7 +3300,7 @@ pub fn run_update(
         &gathered.inputs(),
         &mut out,
         &mut err,
-        now_secs(),
+        started,
         &mut degraded,
     );
     if out.failed() || err.failed() {
@@ -3487,6 +3590,17 @@ mod tests {
         assert!(handed_warnings(Some(OsStr::new(""))).is_empty());
         let odd: BTreeSet<String> = ["a\nb".to_string()].into();
         assert!(handed_warnings(Some(&warned_value(&odd, &[], &[], false))).is_empty());
+    }
+
+    #[test]
+    fn only_update_from_the_binary_entry_hands_a_release_off() {
+        assert!(release_hands_off(Caller::Update, true));
+        // `dot init` finishes in place even where the process could exec:
+        // its transaction owns the run, and a handoff would exec `dot
+        // update` after init returned.
+        assert!(!release_hands_off(Caller::Init, true));
+        assert!(!release_hands_off(Caller::Update, false));
+        assert!(!release_hands_off(Caller::Init, false));
     }
 
     struct FailingWriter;

@@ -5550,6 +5550,40 @@ fn direct_signals_during_crontab_stop_the_owned_query() {
     }
 }
 
+#[test]
+fn handoff_variables_never_reach_children_of_the_process_environment() {
+    // A release handoff passes these through `execve`. Children spawned
+    // without an explicit environment (`crontab` here, `git pull` and its
+    // helpers in an update) must not inherit them: a long-lived helper would
+    // carry the expected revision into every later `dot`.
+    let fixture = NativeUpdateFixture::stage();
+    let shim_dir = fixture.client.scope.path().join("env-crontab-bin");
+    std::fs::create_dir_all(&shim_dir).expect("crontab shim directory");
+    let crontab = shim_dir.join("crontab");
+    std::fs::write(
+        &crontab,
+        b"#!/bin/sh\nprintf '%s|%s|%s\\n' \"${DOT_UPDATE_LOCK_TOKEN-unset}\" \"${DOT_REEXEC_ONCE-unset}\" \"${DOT_REEXEC_STARTED-unset}\"\n",
+    )
+    .expect("write crontab shim");
+    std::fs::set_permissions(&crontab, std::fs::Permissions::from_mode(0o755))
+        .expect("make crontab shim executable");
+    let mut paths = vec![shim_dir];
+    paths.extend(std::env::split_paths(&fixture_path()));
+    let path = std::env::join_paths(paths).expect("crontab shim PATH");
+    let output = fixture.rust_dot_with_bash_and(&["cron"], |command| {
+        command
+            .env("PATH", &path)
+            .env("DOT_UPDATE_LOCK_TOKEN", "claim")
+            .env("DOT_REEXEC_ONCE", "1")
+            .env("DOT_REEXEC_STARTED", "1");
+    });
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "unset|unset|unset\n"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn direct_signal_during_legacy_identity_selection_stops_the_owned_query() {
