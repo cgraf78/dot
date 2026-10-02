@@ -63,14 +63,15 @@ rerunning it on such a host fails because the stable release root is a
 user-owned directory, so keep updating Dot through Shdeps there.
 
 A host first bootstrapped with this installer and later managed by Shdeps
-converges to that layout on its own: on Shdeps' next real update of Dot (a
-newer release), Shdeps verifies the installer's own layout and adopts the
-stable root in place, keeping the published `dot` command link working
-throughout. The private `.dot-standalone` directory is left behind, inert, and
-is safe to delete afterwards. This needs a Shdeps release with standalone
-adoption; once Shdeps has recorded Dot, older Shdeps fail closed with "release
-asset format changed; manual layout migration is required" until Shdeps itself
-updates.
+converges to that layout on its own: on Shdeps' next update of Dot, even when
+the installed release is already current, Shdeps verifies the installer's own
+layout and adopts the stable root in place (so a client's Shdeps `post` hook
+for Dot can publish `~/.local/lib/dot` right away), keeping the published `dot`
+command link working throughout. The private `.dot-standalone` directory is
+left behind, inert, and is safe to delete afterwards. This needs a Shdeps
+release with standalone adoption; once Shdeps has recorded Dot, older Shdeps
+fail closed with "release asset format changed; manual layout migration is
+required" until Shdeps itself updates.
 
 ## Runtime model
 
