@@ -92,7 +92,17 @@ pub fn run(
         .get(OsStr::new("DOT_UPDATE_LOCK_TOKEN"))
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty());
-    let guard = match update_lock::acquire(&state, is_cron(request.args), &log, prior, stderr) {
+    let acquired = update_lock::acquire(&state, is_cron(request.args), &log, prior, stderr);
+    if acquired.is_err() {
+        // A release continuation that cannot re-enter the lock its first
+        // half held never reaches the engine; the run still needs its outcome.
+        crate::update_engine::record_continuation_failure(
+            crate::update_engine::is_continuation(runtime),
+            request.args,
+            &state,
+        );
+    }
+    let guard = match acquired {
         Ok(guard) => guard,
         Err(Error::LockBusy { .. }) => return update_lock::EXIT_LOCK_BUSY,
         Err(_) => return crate::cli::EXIT_ERROR,
@@ -101,8 +111,17 @@ pub fn run(
     // a run that never gets the lock (busy, exit 75) does nothing, so it
     // stays as quiet as `--cron` promises. The engine reports only keys
     // that later reloads add (it treats these as already reported).
+    // A release-handoff continuation skips what the first process printed.
+    let handed = crate::update_engine::handed_warnings(
+        child_env
+            .get(OsStr::new(crate::update_engine::WARNED_ENV))
+            .map(OsString::as_os_str),
+    );
     for unknown in &config.unknown_keys {
-        let _ = writeln!(stderr, "{}", unknown.warning());
+        let line = unknown.warning();
+        if !handed.contains(&line) {
+            let _ = writeln!(stderr, "{line}");
+        }
     }
     // Publish the claim explicitly for nested native steps without changing
     // the parent process environment.
@@ -122,6 +141,12 @@ pub fn run(
         },
         &mut streams,
     );
+    // A provider handoff continues this run in the upgraded binary under the
+    // same PID, which re-enters this lock with the token above; park the
+    // guard in the handoff instead of releasing it.
+    let Some(guard) = runtime.park_lock(guard) else {
+        return code;
+    };
     // Explicit verified release (never silent removal of a lock that
     // no longer names us): removal failures warn through `log` into
     // stderr, like the shell's EXIT-trap release.

@@ -25,11 +25,15 @@ bootstrap entrypoints, Git metadata, and official origin before treating that
 checkout as executable developer input. Those identity checks are not a
 recursive content sandbox.
 
-Client configuration is parsed as data. Extension discovery is versioned and
-rejects unsafe roots, path components, file types, ownership, modes, duplicate
-identities, control bytes, unknown grammar, and unbounded input. Hook and doctor
-extensions then run in a fresh worker Bash with only their documented API and
-private temporary storage.
+Client configuration is parsed as data. A key a newer Dot introduced never
+makes a profile selector match or lets a profile-selected (or `sync=none`)
+overlay descriptor activate. When such a key leaves the overlay set uncertain,
+`dot update` holds the installed overlays (no new activation, no deactivation
+hooks) rather than converge to a partial reading. Extension discovery is
+versioned and rejects unsafe roots, path components, file types, ownership,
+modes, duplicate identities, control bytes, unknown grammar, and unbounded
+input. Hook and doctor extensions then run in a fresh worker Bash with only
+their documented API and private temporary storage.
 
 Test extensions are different by design: they are standalone executables that
 run under their declared interpreter with normal user authority and the client

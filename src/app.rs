@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// An absolute `dot` executable explicitly authorized for an embedded runtime.
 ///
@@ -47,6 +47,12 @@ pub struct Runtime {
     bash: Arc<OnceLock<Result<crate::bash::Resolved, crate::bash::Error>>>,
     bash_error_reported: Arc<AtomicBool>,
     host_git: Arc<OnceLock<Option<PathBuf>>>,
+    /// Pending process replacement. Only the binary entry point's runtime
+    /// ([`Self::from_process_args`]) carries the slot: it alone owns the
+    /// output relay and the process image and runs the handoff, so every
+    /// other runtime refuses one and its caller continues in place. Clones
+    /// share the slot, so derived runtimes still speak for the entry.
+    handoff: Option<Arc<Mutex<Option<crate::handoff::Handoff>>>>,
 }
 
 impl Runtime {
@@ -114,7 +120,11 @@ impl Runtime {
             }
             Err(error) => return Err(error),
         };
-        Ok(Self::process_snapshot(env, cwd, source_root))
+        let mut runtime = Self::process_snapshot(env, cwd, source_root);
+        // Only the binary entry point builds a runtime here, and it alone
+        // takes and runs a pending handoff (see `main.rs`).
+        runtime.handoff = Some(Arc::new(Mutex::new(None)));
+        Ok(runtime)
     }
 
     fn process_snapshot(
@@ -148,6 +158,7 @@ impl Runtime {
             bash: Arc::new(OnceLock::new()),
             bash_error_reported: Arc::new(AtomicBool::new(false)),
             host_git: Arc::new(OnceLock::new()),
+            handoff: None,
         }
     }
 
@@ -278,6 +289,69 @@ impl Runtime {
 
     pub(crate) fn is_process_entry(&self) -> bool {
         self.process_entry
+    }
+
+    /// Whether this runtime may replace its process with another binary.
+    pub(crate) fn can_exec(&self) -> bool {
+        self.handoff.is_some()
+    }
+
+    /// Ask the binary entry point to replace this process with `handoff`'s
+    /// continuation once the command returns. `false` when this runtime
+    /// cannot exec or a handoff is already pending; the caller then
+    /// continues in place.
+    pub(crate) fn request_exec(&self, handoff: crate::handoff::Handoff) -> bool {
+        let Some(slot) = &self.handoff else {
+            return false;
+        };
+        let mut pending = slot.lock().unwrap_or_else(|error| error.into_inner());
+        if pending.is_some() {
+            return false;
+        }
+        *pending = Some(handoff);
+        true
+    }
+
+    /// Whether a process replacement is pending: this run's first half has
+    /// ended and its outcome belongs to the continuation. Paths that record
+    /// or publish a run's outcome (the cron outcome in the update engine)
+    /// must skip it while this holds.
+    pub(crate) fn exec_pending(&self) -> bool {
+        self.handoff.as_ref().is_some_and(|slot| {
+            slot.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+        })
+    }
+
+    /// Park the update lock in the pending handoff so the exec'd
+    /// continuation re-enters it. Returns the guard when nothing is pending.
+    pub(crate) fn park_lock(
+        &self,
+        guard: crate::update_lock::LockGuard,
+    ) -> Option<crate::update_lock::LockGuard> {
+        let Some(slot) = &self.handoff else {
+            return Some(guard);
+        };
+        let mut pending = slot.lock().unwrap_or_else(|error| error.into_inner());
+        match pending.as_mut() {
+            Some(handoff) => {
+                handoff.hold(guard);
+                None
+            }
+            None => Some(guard),
+        }
+    }
+
+    /// Take the pending process replacement. The binary entry point calls
+    /// this after its command returns and its output relay has drained.
+    #[doc(hidden)]
+    pub fn take_exec(&self) -> Option<crate::handoff::Handoff> {
+        self.handoff
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
     }
 
     pub(crate) fn value(&self, key: &str) -> Option<&OsStr> {

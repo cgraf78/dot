@@ -912,6 +912,9 @@ pub struct OverlayInputs<'a> {
     /// `DOT_PROFILE_SELECTOR_RECORDS` raw
     /// `class|path|user|host|profile|matched` records.
     pub selectors: Vec<String>,
+    /// Keys the profile, selector, and selected descriptor files hold
+    /// that this release does not know (warning rows, never stderr).
+    pub unknown_keys: Vec<crate::unknown_keys::DataKey>,
     /// Nested [`LifecycleInputs`] for the profiles branch.
     pub lifecycle: LifecycleInputs<'a>,
     /// `${#CONFIGURED_OVERLAY_NAMES[@]}` (names are unused beyond
@@ -932,6 +935,16 @@ pub struct OverlayInputs<'a> {
     /// falls back to `$path/home`, like `${REPLY:-$path/home}`).
     /// Trust policy owned by the overlay slice.
     pub local_validate: &'a dyn Fn(&str) -> Result<(), String>,
+}
+
+/// `~/path:line key (newer dot?)`: where an unknown data-file key sits.
+fn data_key_detail(key: &crate::unknown_keys::DataKey, home: &str) -> String {
+    format!(
+        "{}:{} {} (newer dot?)",
+        tilde(&key.path, home),
+        key.line,
+        key.key
+    )
 }
 
 /// A non-empty option: shell `[[ -n ${var:-} ]]` treats unset and
@@ -955,6 +968,10 @@ fn present(value: Option<&str>) -> Option<&str> {
 /// [`OverlayInputs::local_validate`] is injected.
 pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
     let mut out = vec![Record::section("Profiles")];
+    // `dot update` holds the installed overlays while this release cannot
+    // tell which ones a newer Dot would activate; the selection reported
+    // here is not what is linked.
+    let held = inputs.unknown_keys.iter().any(|key| key.effect.holds());
     if let Some(error) = present(inputs.profile_config_error) {
         out.push(Record::fail(
             "profile configuration invalid",
@@ -1013,7 +1030,48 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 Some(format!("{} -> {}", leaf, fields[4])),
             ));
         }
-        out.extend(check_profile_lifecycle(&inputs.lifecycle));
+        for key in &inputs.unknown_keys {
+            let message = match key.effect {
+                crate::unknown_keys::Effect::Ignored => "unknown profile key ignored",
+                crate::unknown_keys::Effect::SelectorSkipped => "selector skipped: unknown key",
+                crate::unknown_keys::Effect::SelectorFallback => {
+                    "selector skipped: unknown key; profile base selected"
+                }
+                crate::unknown_keys::Effect::SelectorsUnread(_) => {
+                    "personal selectors unread: overlay skipped; profile base selected"
+                }
+                crate::unknown_keys::Effect::OverlaySkipped(_) => continue,
+            };
+            out.push(Record::warn(
+                message,
+                Some(data_key_detail(key, inputs.home)),
+            ));
+        }
+        if held {
+            // Held overlays stay installed and keep their lifecycle
+            // authority: judge every ledger record as still selected, so
+            // nothing reads as a pending deactivation that `dot update`
+            // will not (and must not) run, while trust checks still apply.
+            let lifecycle = &inputs.lifecycle;
+            let mut eligible = lifecycle.eligible.clone();
+            eligible.extend(
+                lifecycle
+                    .records
+                    .iter()
+                    .map(|record| record_name(record).to_string()),
+            );
+            out.extend(check_profile_lifecycle(&LifecycleInputs {
+                profiles_present: lifecycle.profiles_present,
+                load_ok: lifecycle.load_ok,
+                eligible,
+                active: lifecycle.active.clone(),
+                records: lifecycle.records.clone(),
+                extensions_enabled: lifecycle.extensions_enabled,
+                deactivation_ok: lifecycle.deactivation_ok,
+            }));
+        } else {
+            out.extend(check_profile_lifecycle(&inputs.lifecycle));
+        }
     }
 
     out.push(Record::section(format!(
@@ -1026,7 +1084,21 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
             Some(error.to_string()),
         ));
     }
-    if inputs.configured_count == 0 && !Path::new(&inputs.manifest).is_file() {
+    if held {
+        out.push(Record::warn(
+            "overlay set held: newer keys need a newer dot",
+            Some(
+                "dot update keeps the installed overlays until a dot that knows the keys runs"
+                    .to_string(),
+            ),
+        ));
+    }
+    // Legacy discovery gives a skipped `sync=none` descriptor a lifecycle
+    // record but does not count it as configured; still report it.
+    if inputs.configured_count == 0
+        && inputs.overlay_lifecycle.is_empty()
+        && !Path::new(&inputs.manifest).is_file()
+    {
         out.push(Record::skip("no overlays to check", None));
         return out;
     } else if inputs.configured_count == 0 {
@@ -1054,6 +1126,26 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 out.push(Record::skip(
                     format!("{name}: selected but host/platform ineligible"),
                     None,
+                ));
+                continue;
+            }
+            "selected-unsupported" => {
+                // Every key that kept this overlay off, matched by file (the
+                // descriptor names its overlay the legacy way, which can
+                // differ from the profile-aware lifecycle name), or a bare
+                // row if the records ever disagree.
+                let keys: Vec<String> = inputs
+                    .unknown_keys
+                    .iter()
+                    .filter(|key| {
+                        matches!(key.effect, crate::unknown_keys::Effect::OverlaySkipped(_))
+                            && key.path == fields[2]
+                    })
+                    .map(|key| data_key_detail(key, inputs.home))
+                    .collect();
+                out.push(Record::warn(
+                    format!("{name}: selected but skipped: unknown descriptor key"),
+                    (!keys.is_empty()).then(|| keys.join("; ")),
                 ));
                 continue;
             }
@@ -1166,7 +1258,14 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
         }
     }
 
-    if Path::new(&inputs.manifest).is_file() {
+    if held {
+        // The links belong to the held generation, which the reading above
+        // does not describe, so ownership cannot be judged against it.
+        out.push(Record::skip(
+            "overlay symlinks not checked while the overlay set is held",
+            None,
+        ));
+    } else if Path::new(&inputs.manifest).is_file() {
         check_overlay_links(inputs, &overlay_paths, &overlay_syncs, &mut out);
     }
     out
