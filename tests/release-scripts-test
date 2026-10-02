@@ -201,7 +201,7 @@ assert_contains '{"name": "acceptance", "command": "cargo build --locked\nbash t
 if [[ $rust_job == *'test-command:'* ]]; then
   fail 'Rust CI must define its platform coverage only through test-shards'
 fi
-assert_contains $'fmt-command: |\n        cargo fmt --check\n        rustfmt --check support/performance-command-supervisor.rs tests/support/performance-supervisor-fixture.rs' \
+assert_contains $'fmt-command: |\n        cargo fmt --check\n        rustfmt --edition 2024 --check support/performance-command-supervisor.rs tests/support/performance-supervisor-fixture.rs' \
   "$rust_job" 'Rust quality gate formats the supervisor sources outside Cargo targets'
 assert_contains 'test-command: bash tests/library-test' "$shell_job" \
   'shell CI runs sourceable public-library acceptance without a Rust toolchain'
