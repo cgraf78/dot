@@ -4972,6 +4972,89 @@ fn prune_is_skipped_for_a_frozen_generation() {
 }
 
 #[test]
+fn prune_is_skipped_when_a_newer_key_changed_the_overlay_set() {
+    // The skipped overlay's dependency configs return once Dot upgrades;
+    // pruning in between would uninstall their packages for one cycle.
+    // Tools still runs (so Dot can upgrade) and the run stays clean.
+    let fixture = Fixture::new("shdeps-prune-newer-key");
+    let descriptors = fixture.home.join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&descriptors).expect("overlay descriptors");
+    let descriptor = descriptors.join("10-local.local.conf");
+    std::fs::write(
+        &descriptor,
+        format!(
+            "sync=none\npath={}\nfuture_key=1\n",
+            fixture.home.join("local").display()
+        ),
+    )
+    .expect("descriptor with a newer key");
+    let output = pruning(&fixture, Some("always"))
+        .output()
+        .expect("update with a newer descriptor key");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = normalize_elapsed(&output.stdout);
+    let text = String::from_utf8_lossy(&stdout);
+    assert!(text.contains("[2/6] Tools      changed"), "{text}");
+    assert!(
+        text.contains("[3/6] Prune      warning  keys from a newer dot; prune skipped"),
+        "{text}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "dot: overlay: warning: {}: unknown key 'future_key'; overlay 'local' skipped (newer dot?)\n",
+            descriptor.display()
+        )
+    );
+    assert_eq!(prune_record(&fixture), None);
+}
+
+#[test]
+fn prune_still_runs_when_only_a_selector_that_could_not_win_is_skipped() {
+    // That selector changed nothing on this host, so the overlay set is
+    // exactly what the newer Dot would link.
+    let fixture = Fixture::new("shdeps-prune-skipped-selector");
+    let config = fixture.home.join(".config/dot");
+    let source = fixture.home.join("local-src");
+    std::fs::create_dir_all(source.join("home")).expect("overlay source");
+    let host = dot::platform::detect_host().expect("fixture host");
+    for (file, body) in [
+        (
+            "profiles.d/base.conf",
+            "version=1\noverlays=local\n".to_string(),
+        ),
+        (
+            "overlays.d/10-local.local.conf",
+            format!("sync=none\npath={}\n", source.display()),
+        ),
+        (
+            "profile-selectors.d/10-host.conf",
+            format!("version=1\nhost={host}\nprofile=base\n"),
+        ),
+        (
+            "profile-selectors.d/20-newer.conf",
+            "version=1\nprofile=base\nfuture_key=1\n".to_string(),
+        ),
+    ] {
+        let path = config.join(file);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
+        std::fs::write(path, body).expect("profile fixture");
+    }
+    let output = pruning(&fixture, Some("always"))
+        .output()
+        .expect("update with a skipped selector");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("selector skipped (newer dot?)"),
+        "{output:?}"
+    );
+    assert_eq!(
+        prune_record(&fixture),
+        Some(expected_prune_record(&fixture, false))
+    );
+}
+
+#[test]
 fn prune_is_skipped_when_shdeps_is_unavailable() {
     let fixture = Fixture::new("shdeps-prune-unavailable");
     let output = pruning(&fixture, Some("always"))

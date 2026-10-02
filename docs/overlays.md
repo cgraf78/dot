@@ -11,7 +11,10 @@ Git-backed descriptors require `url=` and may use `platforms=`, `hosts=`, and
 normalized absolute `path=` (or `~/...`) and may also use the platform and host
 filters. They do not accept a URL or optional flag. Filtering is exact and
 case-sensitive for platforms, case-insensitive for normalized hostnames, and
-exclusions win.
+exclusions win. A selected descriptor, or any `sync=none` descriptor, that
+holds a key this Dot does not know is validated and then skipped instead of
+activated (lifecycle state `selected-unsupported`); see
+[Unknown keys in profile and overlay files](configuration.md#unknown-keys-in-profile-and-overlay-files).
 
 Active overlays are synchronized in descriptor order. Their `home/` entries
 are inventoried before mutation, the complete prospective ownership manifest

@@ -1708,6 +1708,325 @@ fn update_warns_about_a_pulled_typo_even_when_overlay_sync_then_fails() {
     assert_eq!(outcome, "fail update");
 }
 
+/// Two filesystem-backed overlays for profile scenarios, outside `$HOME`.
+/// Each publishes one file named after itself, so the links a run leaves
+/// show which overlays it activated.
+#[cfg(unix)]
+struct LocalOverlays {
+    _dir: TempDir,
+    alpha: String,
+    beta: String,
+}
+
+#[cfg(unix)]
+fn local_overlays(label: &str) -> LocalOverlays {
+    let dir = TempDir::new(&format!("{label}-overlays")).expect("overlay sources");
+    let source = |name: &str| {
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(root.join("home")).expect("overlay home");
+        std::fs::write(root.join(format!("home/{name}.txt")), name).expect("overlay file");
+        root.to_string_lossy().into_owned()
+    };
+    let (alpha, beta) = (source("alpha"), source("beta"));
+    LocalOverlays {
+        _dir: dir,
+        alpha,
+        beta,
+    }
+}
+
+/// A profile client whose next base pull brings everything at once:
+/// `base` selects `alpha`, `full` adds `beta`, and a root selector picks
+/// `full`. Each `extra` is appended to the named fixture file (or becomes
+/// a new file), so a scenario adds exactly one line to one strict file.
+#[cfg(unix)]
+fn profile_client(
+    label: &str,
+    overlays: &LocalOverlays,
+    extra: &[(&str, &str)],
+) -> (TempDir, TempDir, TempDir) {
+    let mut files: Vec<(String, String)> = vec![
+        (
+            ".config/dot/overlays.d/10-alpha.conf".to_string(),
+            format!("sync=none\npath={}\n", overlays.alpha),
+        ),
+        (
+            ".config/dot/overlays.d/20-beta.conf".to_string(),
+            format!("sync=none\npath={}\n", overlays.beta),
+        ),
+        (
+            ".config/dot/profiles.d/base.conf".to_string(),
+            "version=1\noverlays=alpha\n".to_string(),
+        ),
+        (
+            ".config/dot/profiles.d/full.conf".to_string(),
+            "version=1\nprofiles=base\noverlays=beta\n".to_string(),
+        ),
+        (
+            ".config/dot/profile-selectors.d/00-default.conf".to_string(),
+            "version=1\nprofile=full\n".to_string(),
+        ),
+    ];
+    for (file, line) in extra {
+        match files.iter_mut().find(|(name, _)| name == file) {
+            Some(entry) => entry.1.push_str(line),
+            None => files.push((file.to_string(), line.to_string())),
+        }
+    }
+    let borrowed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, body)| (name.as_str(), body.as_bytes()))
+        .collect();
+    client_pulling(label, &borrowed)
+}
+
+/// Which fixture overlays a run left linked into `$HOME`.
+#[cfg(unix)]
+fn linked_overlays(home: &TempDir) -> Vec<&'static str> {
+    ["alpha", "beta"]
+        .into_iter()
+        .filter(|name| {
+            std::fs::symlink_metadata(home.path().join(format!("{name}.txt")))
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn update_pulling_a_newer_profile_key_ignores_it_and_converges() {
+    // A key from a newer Dot in a profile definition must not stop this
+    // one: the run converges (so its Tools stage can still upgrade Dot),
+    // keeps every known member, and says which key it ignored. Profile
+    // files are read after the pull and act in the same run, so the
+    // warning appears in every run that reads the key, not only the next.
+    let overlays = local_overlays("cli-update-profile-key");
+    let (_scope, home, state) = profile_client(
+        "cli-update-profile-key",
+        &overlays,
+        &[(".config/dot/profiles.d/full.conf", "future_key=1\n")],
+    );
+    let warning = format!(
+        "dot: profile: warning: {}/.config/dot/profiles.d/full.conf: unknown key 'future_key' ignored (newer dot?)\n",
+        home.path().display()
+    );
+    for run in ["pulling", "next"] {
+        let (code, stderr, outcome) = cron_update(&home, &state);
+        assert_eq!(code, Some(0), "{run}: {stderr}");
+        assert_eq!(stderr, warning, "{run}");
+        assert_eq!(outcome, "ok update", "{run}");
+        assert_eq!(linked_overlays(&home), ["alpha", "beta"], "{run}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn update_skips_a_selector_with_a_newer_key_instead_of_matching_more() {
+    // A selector is a predicate, and a key this release does not know is
+    // most likely one more condition. Ignoring it could match hosts the
+    // newer Dot would not, so the selector never matches. Here it narrows
+    // this host to `base`; falling through to the fleet-wide `full` would
+    // link more than the newer Dot does, so selection falls back to `base`
+    // (what phase one applies everywhere) instead.
+    let overlays = local_overlays("cli-update-selector-key");
+    let host = dot::platform::detect_host().expect("fixture host");
+    let narrow = format!("version=1\nhost={host}\nprofile=base\nfuture_key=1\n");
+    let (_scope, home, state) = profile_client(
+        "cli-update-selector-key",
+        &overlays,
+        &[(".config/dot/profile-selectors.d/10-narrow.conf", &narrow)],
+    );
+    let (code, stderr, outcome) = cron_update(&home, &state);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stderr,
+        format!(
+            "dot: profile: warning: {}/.config/dot/profile-selectors.d/10-narrow.conf: unknown key 'future_key'; selector skipped, profile 'base' selected (newer dot?)\n",
+            home.path().display()
+        )
+    );
+    assert_eq!(outcome, "ok update");
+    assert_eq!(linked_overlays(&home), ["alpha"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn repo_commands_report_newer_keys_before_a_selection_error() {
+    // A genuine tie among known selectors still fails, and the keys this
+    // release read before it still explain what it could not use.
+    let overlays = local_overlays("cli-status-selector-tie");
+    let (_scope, home, state) = profile_client(
+        "cli-status-selector-tie",
+        &overlays,
+        &[
+            (
+                ".config/dot/profile-selectors.d/10-tie.conf",
+                "version=1\nprofile=base\n",
+            ),
+            (
+                ".config/dot/profile-selectors.d/20-newer.conf",
+                "version=1\nprofile=full\nfuture_key=1\n",
+            ),
+        ],
+    );
+    let (code, _, _) = cron_update(&home, &state);
+    assert_eq!(code, Some(1), "the pulled tie fails the update");
+    let status = init_bin(&home, &state)
+        .arg("status")
+        .output()
+        .expect("status");
+    assert_eq!(status.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&status.stderr),
+        format!(
+            "dot: profile: warning: {}/.config/dot/profile-selectors.d/20-newer.conf: unknown key 'future_key'; selector skipped (newer dot?)\n\
+             dot: profile: equally specific selectors choose full and base\n",
+            home.path().display()
+        )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn update_skips_an_overlay_whose_descriptor_has_a_newer_key() {
+    // A descriptor decides what is cloned and linked. Activating it on a
+    // partial reading could skip a restriction or a trust rule the newer
+    // Dot applies, so the overlay is skipped (`selected-unsupported`)
+    // while the rest of the profile converges. Discovery runs several
+    // times per update; the warning still prints once.
+    let overlays = local_overlays("cli-update-descriptor-key");
+    let (_scope, home, state) = profile_client(
+        "cli-update-descriptor-key",
+        &overlays,
+        &[(".config/dot/overlays.d/20-beta.conf", "future_key=1\n")],
+    );
+    let (code, stderr, outcome) = cron_update(&home, &state);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stderr,
+        format!(
+            "dot: overlay: warning: {}/.config/dot/overlays.d/20-beta.conf: unknown key 'future_key'; overlay 'beta' skipped (newer dot?)\n",
+            home.path().display()
+        )
+    );
+    assert_eq!(outcome, "ok update");
+    assert_eq!(linked_overlays(&home), ["alpha"]);
+
+    // Doctor reports it as a warning row, not a stderr line; the repo
+    // commands, which list overlays, say why one is missing.
+    let doctor = init_bin(&home, &state)
+        .arg("doctor")
+        .output()
+        .expect("doctor");
+    let report = String::from_utf8_lossy(&doctor.stdout);
+    assert_eq!(doctor.status.code(), Some(0), "{report}");
+    assert!(
+        report.contains("beta: selected but skipped: unknown descriptor key"),
+        "{report}"
+    );
+    assert!(doctor.stderr.is_empty(), "{:?}", doctor.stderr);
+    let status = init_bin(&home, &state)
+        .arg("status")
+        .output()
+        .expect("status");
+    assert_eq!(status.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&status.stderr),
+        format!(
+            "dot: overlay: warning: {}/.config/dot/overlays.d/20-beta.conf: unknown key 'future_key'; overlay 'beta' skipped (newer dot?)\n",
+            home.path().display()
+        )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn update_falls_back_to_base_when_a_base_overlay_is_skipped() {
+    // A skipped `base` overlay may hold personal selectors the newer Dot
+    // reads; they could outrank the root selector, so this Dot does not
+    // trust the rest of the selection and stays at `base`.
+    let overlays = local_overlays("cli-update-base-overlay-key");
+    let (_scope, home, state) = profile_client(
+        "cli-update-base-overlay-key",
+        &overlays,
+        &[(".config/dot/overlays.d/10-alpha.conf", "future_key=1\n")],
+    );
+    let (code, stderr, outcome) = cron_update(&home, &state);
+    assert_eq!(code, Some(0), "{stderr}");
+    let descriptor = format!(
+        "{}/.config/dot/overlays.d/10-alpha.conf",
+        home.path().display()
+    );
+    assert_eq!(
+        stderr,
+        format!(
+            "dot: overlay: warning: {descriptor}: unknown key 'future_key'; overlay 'alpha' skipped (newer dot?)\n\
+             dot: profile: warning: {descriptor}: unknown key 'future_key'; overlay 'alpha' selectors unread, profile 'base' selected (newer dot?)\n"
+        )
+    );
+    assert_eq!(outcome, "ok update");
+    assert!(linked_overlays(&home).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_update_skips_a_local_overlay_whose_descriptor_has_a_newer_key() {
+    // Without profiles, `sync=none` descriptors still parse strictly and
+    // get the same treatment; git descriptors keep their permissive,
+    // warn-and-ignore parsing.
+    let overlays = local_overlays("cli-update-legacy-key");
+    let (_scope, home, state) = client_pulling(
+        "cli-update-legacy-key",
+        &[
+            (
+                ".config/dot/overlays.d/10-alpha.conf",
+                format!("sync=none\npath={}\n", overlays.alpha).as_bytes(),
+            ),
+            (
+                ".config/dot/overlays.d/20-beta.conf",
+                format!("sync=none\npath={}\nfuture_key=1\n", overlays.beta).as_bytes(),
+            ),
+        ],
+    );
+    let (code, stderr, outcome) = cron_update(&home, &state);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stderr,
+        format!(
+            "dot: overlay: warning: {}/.config/dot/overlays.d/20-beta.conf: unknown key 'future_key'; overlay 'beta' skipped (newer dot?)\n",
+            home.path().display()
+        )
+    );
+    assert_eq!(outcome, "ok update");
+    assert_eq!(linked_overlays(&home), ["alpha"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn update_rejects_a_misspelled_profile_key_with_a_suggestion() {
+    // A near miss of a known key is almost certainly a typo (new keys are
+    // kept more than two edits from existing ones), and ignoring it could
+    // drop overlays and run their deactivation hooks. Profile files are
+    // read after the base pull, so failing here cannot stop the host from
+    // pulling a fix.
+    let overlays = local_overlays("cli-update-profile-typo");
+    let (_scope, home, state) = profile_client(
+        "cli-update-profile-typo",
+        &overlays,
+        &[(".config/dot/profiles.d/full.conf", "overlay=alpha\n")],
+    );
+    let (code, stderr, outcome) = cron_update(&home, &state);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "dot: profile: {}/.config/dot/profiles.d/full.conf: unknown key: overlay (did you mean 'overlays'?)\n",
+            home.path().display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(outcome, "fail update");
+}
+
 #[cfg(unix)]
 #[test]
 fn binary_init_warns_once_about_a_key_the_boundary_reported() {

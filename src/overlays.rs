@@ -22,6 +22,19 @@
 //! accidental strictness. Filename identity strips trailing
 //! newlines, matching command-substitution capture.
 //!
+//! Forward compatibility: descriptors travel through the client
+//! repository, which updates independently of the Dot release reading
+//! them, so a well-formed key this release does not know must not fail
+//! discovery (see [`crate::unknown_keys`]). A strict descriptor holding
+//! one is still validated in full, then skipped: it never activates,
+//! because the key could carry a restriction or trust rule (a host
+//! filter, a pinned revision) whose absence would clone or link what the
+//! newer Dot would not; a missing `url`/`path` is then no error either,
+//! since the key may supply the source. A near miss of a known key still
+//! fails as a typo.
+//! Permissive (legacy, `sync=git`) parsing keeps warning about and
+//! ignoring every unknown line, as it always has.
+//!
 //! One documented boundary: descriptor values cross from bytes to
 //! `String` via lossy conversion (the `profiles` precedent), so a
 //! non-UTF8 descriptor compares lossy where the shell compares raw
@@ -32,6 +45,8 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+
+use crate::unknown_keys::{DataKey, Effect};
 
 /// Overlay failure, mirroring the shell exit codes and stderr
 /// shapes. `Display` renders the exact stderr line the shell
@@ -82,6 +97,9 @@ impl std::fmt::Display for Error {
     }
 }
 
+/// Every key a descriptor understands, in the order parsing matches them.
+pub const DESCRIPTOR_KEYS: [&str; 6] = ["url", "path", "platforms", "hosts", "optional", "sync"];
+
 /// Parse outcome for one descriptor: eligible with its
 /// `name|path|url|conf|optional|sync` record, or filtered.
 /// Invalid descriptors surface as [`Error::Warning`].
@@ -117,6 +135,9 @@ pub struct State {
     pub discovery_announced: bool,
     /// Collected `  warning: ...` stderr lines, in order.
     pub warnings: Vec<String>,
+    /// Keys selected strict descriptors hold that this release does not
+    /// know; each names the overlay it kept from activating.
+    pub unknown_keys: Vec<DataKey>,
     /// `PHASE_ONE_SELECTED_OVERLAY_NAMES`.
     pub phase_one_selected: Vec<String>,
     /// `PHASE_ONE_ELIGIBLE_OVERLAYS`.
@@ -288,10 +309,14 @@ pub struct MatchInputs {
 /// `name|path|url|conf|optional|sync` record. `Ok(Some)` is
 /// eligible, `Ok(None)` is valid-but-filtered (exit 1), and
 /// `Err(Error::Warning)` carries the `invalid overlay descriptor
-/// ...` message (exit 2). Only non-fatal unknown-keyेष्ठ warnings
+/// ...` message (exit 2). Only non-fatal permissive warnings
 /// accumulate in `warnings`; the fatal line travels in the error
-/// so engine callers print it exactly once. Unreadable files read
-/// as empty, matching the shell's failed redirect.
+/// so engine callers print it exactly once. A strict descriptor that
+/// is valid and eligible except for keys this release does not know
+/// reads as filtered and records them in `unknown_keys` (see the
+/// module docs), so callers can tell it from a host or platform
+/// filter. Unreadable files read as empty, matching the shell's
+/// failed redirect.
 pub fn parse_conf(
     file: &Path,
     file_text: &str,
@@ -299,6 +324,7 @@ pub fn parse_conf(
     home: &str,
     matches: &MatchInputs,
     warnings: &mut Vec<String>,
+    unknown_keys: &mut Vec<DataKey>,
 ) -> ParseOutcome {
     let invalid =
         |detail: &str| Error::Warning(format!("invalid overlay descriptor {file_text}: {detail}"));
@@ -320,26 +346,22 @@ pub fn parse_conf(
     let mut seen = [0u32; 6];
     let mut strict_error: Option<String> = None;
     let mut unknown_lines: Vec<String> = Vec::new();
+    // Well-formed keys from a newer Dot: (line, key), first line only.
+    let mut newer_keys: Vec<(usize, String)> = Vec::new();
     // url, path, platforms, hosts, optional, sync: first key
     // whose prefix matches wins (the keys are pairwise
     // prefix-distinct, so order is irrelevant).
-    for line in lines {
-        let slot = [
-            "url=",
-            "path=",
-            "platforms=",
-            "hosts=",
-            "optional=",
-            "sync=",
-        ]
-        .iter()
-        .enumerate()
-        .find_map(|(index, key)| line.strip_prefix(key).map(|value| (index, value)));
+    for (index, line) in lines.into_iter().enumerate() {
+        let number = index + 1;
+        let slot = DESCRIPTOR_KEYS.iter().enumerate().find_map(|(index, key)| {
+            line.strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix('='))
+                .map(|value| (index, value))
+        });
         match slot {
             Some((index, value)) => {
                 if seen[index] > 0 && strict_error.is_none() {
-                    let key = ["url", "path", "platforms", "hosts", "optional", "sync"][index];
-                    strict_error = Some(format!("duplicate {key}"));
+                    strict_error = Some(format!("duplicate {}", DESCRIPTOR_KEYS[index]));
                 }
                 seen[index] += 1;
                 match index {
@@ -356,9 +378,25 @@ pub fn parse_conf(
                     continue;
                 }
                 unknown_lines.push(line.to_string());
-                if strict_error.is_none() {
-                    let key = line.split('=').next().unwrap_or(line);
-                    strict_error = Some(format!("unknown key: {key}"));
+                let key = line.split('=').next().unwrap_or(line);
+                let well_formed = line.contains('=')
+                    && !key.is_empty()
+                    && key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_');
+                let typo = crate::unknown_keys::suggestion(key, &DESCRIPTOR_KEYS);
+                if well_formed && typo.is_none() {
+                    if !newer_keys.iter().any(|(_, seen)| seen == key) {
+                        newer_keys.push((number, key.to_string()));
+                    }
+                } else if strict_error.is_none() {
+                    // Malformed lines and near misses stay strict errors.
+                    strict_error = Some(match typo {
+                        Some(known) if well_formed => {
+                            format!("unknown key: {key} (did you mean '{known}'?)")
+                        }
+                        _ => format!("unknown key: {key}"),
+                    });
                 }
             }
         }
@@ -377,7 +415,10 @@ pub fn parse_conf(
         if sync != "none" {
             return Err(invalid("path requires sync=none"));
         }
-        if seen[1] != 1 || path.is_empty() {
+        // A newer key may supply the source: the descriptor is skipped
+        // below either way, so only the path checks are waived.
+        let sourced = seen[1] == 1 && !path.is_empty();
+        if !sourced && newer_keys.is_empty() {
             return Err(invalid("missing path"));
         }
         if seen[0] != 0 {
@@ -389,23 +430,25 @@ pub fn parse_conf(
         if !descriptor_value_safe(name.as_bytes()) || !descriptor_value_safe(file_text.as_bytes()) {
             return Err(invalid("unrepresentable name or path"));
         }
-        if let Some(rest) = path.strip_prefix("~/") {
-            path = format!("{home}/{rest}");
-        } else if !path.starts_with('/') {
-            return Err(invalid("path must be absolute or begin with ~/"));
-        }
-        if !descriptor_value_safe(path.as_bytes()) {
-            return Err(invalid("unrepresentable path"));
-        }
-        if path == "/"
-            || path.ends_with('/')
-            || path.contains("//")
-            || path.contains("/./")
-            || path.ends_with("/.")
-            || path.contains("/../")
-            || path.ends_with("/..")
-        {
-            return Err(invalid("path must be normalized"));
+        if sourced {
+            if let Some(rest) = path.strip_prefix("~/") {
+                path = format!("{home}/{rest}");
+            } else if !path.starts_with('/') {
+                return Err(invalid("path must be absolute or begin with ~/"));
+            }
+            if !descriptor_value_safe(path.as_bytes()) {
+                return Err(invalid("unrepresentable path"));
+            }
+            if path == "/"
+                || path.ends_with('/')
+                || path.contains("//")
+                || path.contains("/./")
+                || path.ends_with("/.")
+                || path.contains("/../")
+                || path.ends_with("/..")
+            {
+                return Err(invalid("path must be normalized"));
+            }
         }
         optional = "false".to_string();
     } else {
@@ -413,15 +456,20 @@ pub fn parse_conf(
             if let Some(detail) = strict_error {
                 return Err(invalid(&detail));
             }
-        }
-        for line in &unknown_lines {
-            warnings.push(format!("  warning: unknown key in {file_text}: {line}"));
+        } else {
+            for line in &unknown_lines {
+                warnings.push(format!("  warning: unknown key in {file_text}: {line}"));
+            }
         }
         if url.is_empty() {
-            if strict {
+            // A newer key may supply the source: the descriptor is skipped
+            // below either way.
+            if !strict {
+                return Ok(None);
+            }
+            if newer_keys.is_empty() {
                 return Err(invalid("missing url"));
             }
-            return Ok(None);
         }
         if !descriptor_value_safe(url.as_bytes()) {
             return Err(invalid("unrepresentable url"));
@@ -455,6 +503,14 @@ pub fn parse_conf(
             return Ok(None);
         }
     }
+    // Strict parsing (always for `sync=none`) skips a descriptor holding
+    // newer keys; permissive parsing warned about those lines above and
+    // keeps ignoring them. Skip only after the known filters, so a host
+    // the descriptor never applies to stays quiet: the key changes
+    // nothing there.
+    if (strict || sync == "none") && !newer_keys.is_empty() {
+        return skip_newer(newer_keys, file_text, &name, unknown_keys);
+    }
     if sync == "git" {
         path = format!("{home}/.dotfiles-{name}");
     }
@@ -466,6 +522,28 @@ pub fn parse_conf(
     Ok(Some(format!(
         "{name}|{path}|{url}|{file_text}|{optional}|{sync}"
     )))
+}
+
+/// Record `newer` keys as what kept overlay `name` from activating; the
+/// descriptor then reads as filtered (see [`parse_conf`]).
+fn skip_newer(
+    newer: Vec<(usize, String)>,
+    file_text: &str,
+    name: &str,
+    unknown_keys: &mut Vec<DataKey>,
+) -> ParseOutcome {
+    for (line, key) in newer {
+        crate::unknown_keys::record(
+            unknown_keys,
+            DataKey {
+                path: file_text.to_string(),
+                line,
+                key,
+                effect: Effect::OverlaySkipped(name.to_string()),
+            },
+        );
+    }
+    Ok(None)
 }
 
 /// Memoized answers for the two read-only overlay repository
@@ -1277,14 +1355,26 @@ pub fn discover(
             state.lifecycle.push(format!("{name}|not-selected|{file}"));
             continue;
         }
-        match parse_conf(
+        let mut unknown_keys = Vec::new();
+        let parsed = parse_conf(
             Path::new(&file),
             &file,
             true,
             &inputs.home,
             matches,
             &mut state.warnings,
-        ) {
+            &mut unknown_keys,
+        );
+        // A descriptor this release cannot fully read is selected but
+        // never eligible; its own lifecycle state keeps it apart from a
+        // host or platform filter. Its keys use the profile-aware name
+        // (`20-beta.local.conf` is `beta` here even with `sync=git`).
+        let unsupported = !unknown_keys.is_empty();
+        for key in &mut unknown_keys {
+            key.effect = Effect::OverlaySkipped(name.clone());
+        }
+        state.unknown_keys.extend(unknown_keys);
+        match parsed {
             Ok(Some(record)) => {
                 state.eligible_names.push(name.clone());
                 state.eligible.push(record.clone());
@@ -1296,6 +1386,11 @@ pub fn discover(
                     let lifecycle = unavailable_state(&record);
                     state.lifecycle.push(format!("{name}|{lifecycle}|{file}"));
                 }
+            }
+            Ok(None) if unsupported => {
+                state
+                    .lifecycle
+                    .push(format!("{name}|selected-unsupported|{file}"));
             }
             Ok(None) => {
                 state
@@ -1359,14 +1454,33 @@ fn discover_legacy(
             continue;
         }
         let text = file.to_string_lossy().into_owned();
-        match parse_conf(
+        let mut unknown_keys = Vec::new();
+        let parsed = parse_conf(
             Path::new(&file),
             &text,
             false,
             &inputs.home,
             matches,
             &mut state.warnings,
-        ) {
+            &mut unknown_keys,
+        );
+        // Only `sync=none` descriptors parse strictly here; one this
+        // release cannot fully read gets a lifecycle record (filtered
+        // descriptors otherwise get none) so doctor can name it.
+        if let Some(DataKey {
+            effect: Effect::OverlaySkipped(name),
+            ..
+        }) = unknown_keys.first()
+        {
+            state
+                .lifecycle
+                .push(format!("{name}|selected-unsupported|{text}"));
+            // It still claims its name: a later same-named descriptor
+            // must not take over its place on this release only.
+            seen.insert(name.clone());
+        }
+        state.unknown_keys.extend(unknown_keys);
+        match parsed {
             Ok(Some(record)) => {
                 let name = record.split('|').next().unwrap_or("").to_string();
                 if !seen.insert(name.clone()) {
@@ -1440,6 +1554,15 @@ pub struct ResolveInputs {
     pub termux: bool,
     /// Current euid for ownership-gated checks.
     pub euid: u32,
+}
+
+/// Every key a resolution's profile, selector, and selected descriptor
+/// files hold that this release does not know, in reading order.
+pub fn unknown_keys<'a>(
+    state: &'a State,
+    profiles: &'a crate::profiles::State,
+) -> impl Iterator<Item = &'a DataKey> {
+    profiles.unknown_keys.iter().chain(&state.unknown_keys)
 }
 
 /// `_dot_resolve_overlays`: top-level overlay resolution across
@@ -1556,6 +1679,7 @@ pub fn resolve(
             &inputs.xdg_config,
             &inputs.home,
             &active,
+            &state.unknown_keys,
             &user,
             &host,
             inputs.euid,
@@ -1565,6 +1689,8 @@ pub fn resolve(
     let phase_one_selected = state.phase_one_selected.clone();
     let phase_one_eligible = state.phase_one_eligible.clone();
     let phase_one_active = state.phase_one_active.clone();
+    // Phase-one keys need no carrying: a skipped `base` overlay makes the
+    // selection fall back to `base`, so the final pass reads it again.
     discover(state, &conf_path, &conf_text, &discover_inputs, &matches)?;
     state.phase_one_selected = phase_one_selected;
     state.phase_one_eligible = phase_one_eligible;

@@ -127,6 +127,9 @@ pub struct EngineInputs<'a> {
     /// `warn_reloaded_keys`). Seeded from [`Self::config`], whose keys
     /// the caller reported before the engine started.
     pub config_warned: &'a std::cell::RefCell<Vec<String>>,
+    /// Unknown keys in profile, selector, and descriptor files already
+    /// reported during this invocation (see `warn_data_keys`).
+    pub data_warned: &'a std::cell::RefCell<Vec<crate::unknown_keys::DataKey>>,
     /// Parsed flags.
     pub flags: UpdateFlags,
     /// Residue after flags (forwarded to the pull phases).
@@ -325,6 +328,31 @@ fn warn_reloaded_keys(
         if unknown.suggestion().is_some() && !warned.contains(&unknown.key) {
             let _ = writeln!(err, "{}", unknown.warning());
             warned.push(unknown.key.clone());
+        }
+    }
+}
+
+/// Report keys this release does not know in the profile, selector, and
+/// descriptor files it just read, once per file and key per invocation.
+///
+/// Unlike a mid-run config reload, which stays quiet about keys from a
+/// newer Dot because this run's Tools stage may install one that knows
+/// them, these files act on such keys before Tools runs: a selector stops
+/// matching and an overlay is skipped in this very run. So every run that
+/// reads a key warns, including the one that pulls it. Discovery runs
+/// several times per update, hence the invocation-wide record.
+fn warn_data_keys(
+    inputs: &EngineInputs<'_>,
+    keys: &[crate::unknown_keys::DataKey],
+    err: &mut dyn std::io::Write,
+) {
+    let mut warned = inputs.data_warned.borrow_mut();
+    // One key can warn twice with different effects: a skipped `base`
+    // overlay, then the selection that fell back because of it.
+    for key in keys {
+        if !warned.contains(key) {
+            let _ = writeln!(err, "{}", key.warning());
+            warned.push(key.clone());
         }
     }
 }
@@ -958,11 +986,13 @@ fn converge_overlays(
             .write_all(format!("dot: profile: {}\n", error.message).as_bytes());
         return fail(update, overlay);
     }
+    // Definition keys print after selection (`converge_profiles`), which
+    // keeps only those in profiles this host includes.
     if update.profiles.present {
         return converge_profiles(inputs, stage, moves, io, update, overlay, prefetch);
     }
     let mut dstate = crate::overlays::State::default();
-    if discover_active(inputs, &mut dstate, io.err).is_err() {
+    if discover_active(inputs, &mut dstate, io.err, true).is_err() {
         return fail(update, overlay);
     }
     let entries = use_set(&mut dstate, "eligible");
@@ -1032,7 +1062,7 @@ fn converge_overlays(
     let failed = outcome.tally.failed;
     let phase_ok = crate::update::overlay_phase_ok(outcome.rc, Some(&failed.to_string()));
     // Rediscover before returning, even on a failed phase.
-    if discover_active(inputs, &mut dstate, io.err).is_err() {
+    if discover_active(inputs, &mut dstate, io.err, true).is_err() {
         update.active = entries;
         return fail(update, overlay);
     }
@@ -1174,14 +1204,18 @@ fn converge_profiles(
         }
     };
     let phase_refs: Vec<&str> = phase_one_active.iter().map(String::as_str).collect();
-    if let Err(error) = update.profiles.resolve_default(
+    let resolved = update.profiles.resolve_default(
         inputs.config_home,
         inputs.home,
         &phase_refs,
+        &state.unknown_keys,
         &user,
         &host,
         inputs.euid,
-    ) {
+    );
+    // Keys read before a failure still explain the selection.
+    warn_data_keys(inputs, &update.profiles.unknown_keys, io.err);
+    if let Err(error) = resolved {
         let _ = io
             .err
             .write_all(format!("dot: profile: {}\n", error.message).as_bytes());
@@ -1269,7 +1303,7 @@ fn converge_profiles(
 fn start_prefetch(inputs: &EngineInputs<'_>) -> crate::repos_prefetch::Prefetch {
     let mut state = crate::overlays::State::default();
     let mut discarded = Vec::new();
-    let paths: Vec<String> = if discover_active(inputs, &mut state, &mut discarded).is_ok() {
+    let paths: Vec<String> = if discover_active(inputs, &mut state, &mut discarded, false).is_ok() {
         state
             .active
             .iter()
@@ -1296,10 +1330,13 @@ fn use_set(state: &mut crate::overlays::State, kind: &str) -> Vec<String> {
 }
 
 /// Run `_discover_overlays` natively for the profiles-absent branch.
+/// `report` sends unknown descriptor keys to `err` (the silent prefetch
+/// probe must not consume their one warning).
 fn discover_active(
     inputs: &EngineInputs<'_>,
     state: &mut crate::overlays::State,
     err: &mut dyn std::io::Write,
+    report: bool,
 ) -> Result<(), ()> {
     let xdg_config = if inputs.config_home.is_empty() {
         String::new()
@@ -1327,7 +1364,12 @@ fn discover_active(
         termux: crate::hook_api::is_termux(inputs.prefix),
         host: crate::platform::detect_host().ok(),
     };
-    match crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches) {
+    let result =
+        crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches);
+    if report {
+        warn_data_keys(inputs, &state.unknown_keys, err);
+    }
+    match result {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = err.write_all(format!("{error:?}\n").as_bytes());
@@ -1369,7 +1411,10 @@ fn discover_selected(
         host,
         euid: inputs.euid,
     };
-    match crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches) {
+    let result =
+        crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches);
+    warn_data_keys(inputs, &state.unknown_keys, err);
+    match result {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = err.write_all(format!("{error}\n").as_bytes());
@@ -1501,6 +1546,10 @@ enum PruneSkip {
     NoProvider,
     /// Shdeps could not be prepared, so there is nothing to prune with.
     Unavailable,
+    /// This run met keys it does not know in profile, selector, or
+    /// descriptor files, so the dependency configs it linked may lack
+    /// some a newer Dot would link (see `warn_data_keys`).
+    UnknownKeys,
 }
 
 impl PruneSkip {
@@ -1511,6 +1560,7 @@ impl PruneSkip {
             PruneSkip::Retire => (b"warning", b"profile deactivation failed; prune skipped"),
             PruneSkip::NoProvider => (b"ok", b"no dependency provider"),
             PruneSkip::Unavailable => (b"warning", b"shdeps unavailable; prune skipped"),
+            PruneSkip::UnknownKeys => (b"warning", b"keys from a newer dot; prune skipped"),
         }
     }
 }
@@ -1934,6 +1984,21 @@ fn finalize(
             if cancelled() {
                 return 1;
             }
+            // Pruning uninstalls whatever no linked config declares. A run
+            // whose overlay set a key from a newer Dot may have changed (a
+            // skipped overlay, a fallback to `base`, an ignored key in an
+            // included profile) may be missing configs that come back once
+            // Dot upgrades, so it must not remove their packages in between.
+            // A skipped selector that could not have won changed nothing.
+            if prune.is_ok()
+                && inputs
+                    .data_warned
+                    .borrow()
+                    .iter()
+                    .any(|key| key.effect != crate::unknown_keys::Effect::SelectorSkipped)
+            {
+                prune = Err(PruneSkip::UnknownKeys);
+            }
             // Prune directly after Tools so it reads the same Shdeps config
             // the provider just converged, before any merge hook runs.
             if prune_this_run {
@@ -2229,6 +2294,10 @@ fn provider_reexec(
         .config_warned
         .borrow_mut()
         .extend(inputs.config_warned.borrow().iter().cloned());
+    gathered
+        .data_warned
+        .borrow_mut()
+        .extend(inputs.data_warned.borrow().iter().cloned());
     let nested = gathered.inputs();
     if cancelled() {
         return 1;
@@ -2317,6 +2386,7 @@ pub struct Gathered {
     update_lock_token: Option<String>,
     config: crate::config::Config,
     config_warned: std::cell::RefCell<Vec<String>>,
+    data_warned: std::cell::RefCell<Vec<crate::unknown_keys::DataKey>>,
     flags: UpdateFlags,
     args: Vec<std::ffi::OsString>,
     extra: Vec<std::ffi::OsString>,
@@ -2361,6 +2431,7 @@ impl Gathered {
             update_lock_token: self.update_lock_token.as_deref(),
             config: &self.config,
             config_warned: &self.config_warned,
+            data_warned: &self.data_warned,
             flags: self.flags,
             original_args: &self.args,
             extra_args: &self.extra,
@@ -2611,6 +2682,7 @@ fn gather(
                 .map(|unknown| unknown.key.clone())
                 .collect(),
         ),
+        data_warned: std::cell::RefCell::new(Vec::new()),
         flags,
         args: args.to_vec(),
         extra,

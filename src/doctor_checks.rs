@@ -729,6 +729,9 @@ pub struct OverlayInputs<'a> {
     /// `DOT_PROFILE_SELECTOR_RECORDS` raw
     /// `class|path|user|host|profile|matched` records.
     pub selectors: Vec<String>,
+    /// Keys the profile, selector, and selected descriptor files hold
+    /// that this release does not know (warning rows, never stderr).
+    pub unknown_keys: Vec<crate::unknown_keys::DataKey>,
     /// Nested [`LifecycleInputs`] for the profiles branch.
     pub lifecycle: LifecycleInputs<'a>,
     /// `${#CONFIGURED_OVERLAY_NAMES[@]}` (names are unused beyond
@@ -749,6 +752,16 @@ pub struct OverlayInputs<'a> {
     /// falls back to `$path/home`, like `${REPLY:-$path/home}`).
     /// Trust policy owned by the overlay slice.
     pub local_validate: &'a dyn Fn(&str) -> Result<(), String>,
+}
+
+/// `~/path:line key (newer dot?)`: where an unknown data-file key sits.
+fn data_key_detail(key: &crate::unknown_keys::DataKey, home: &str) -> String {
+    format!(
+        "{}:{} {} (newer dot?)",
+        tilde(&key.path, home),
+        key.line,
+        key.key
+    )
 }
 
 /// A non-empty option: shell `[[ -n ${var:-} ]]` treats unset and
@@ -830,6 +843,23 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 Some(format!("{} -> {}", leaf, fields[4])),
             ));
         }
+        for key in &inputs.unknown_keys {
+            let message = match key.effect {
+                crate::unknown_keys::Effect::Ignored => "unknown profile key ignored",
+                crate::unknown_keys::Effect::SelectorSkipped => "selector skipped: unknown key",
+                crate::unknown_keys::Effect::SelectorFallback => {
+                    "selector skipped: unknown key; profile base selected"
+                }
+                crate::unknown_keys::Effect::SelectorsUnread(_) => {
+                    "personal selectors unread: overlay skipped; profile base selected"
+                }
+                crate::unknown_keys::Effect::OverlaySkipped(_) => continue,
+            };
+            out.push(Record::warn(
+                message,
+                Some(data_key_detail(key, inputs.home)),
+            ));
+        }
         out.extend(check_profile_lifecycle(&inputs.lifecycle));
     }
 
@@ -843,7 +873,12 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
             Some(error.to_string()),
         ));
     }
-    if inputs.configured_count == 0 && !Path::new(&inputs.manifest).is_file() {
+    // Legacy discovery gives a skipped `sync=none` descriptor a lifecycle
+    // record but does not count it as configured; still report it.
+    if inputs.configured_count == 0
+        && inputs.overlay_lifecycle.is_empty()
+        && !Path::new(&inputs.manifest).is_file()
+    {
         out.push(Record::skip("no overlays to check", None));
         return out;
     } else if inputs.configured_count == 0 {
@@ -871,6 +906,26 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 out.push(Record::skip(
                     format!("{name}: selected but host/platform ineligible"),
                     None,
+                ));
+                continue;
+            }
+            "selected-unsupported" => {
+                // Every key that kept this overlay off, matched by file (the
+                // descriptor names its overlay the legacy way, which can
+                // differ from the profile-aware lifecycle name), or a bare
+                // row if the records ever disagree.
+                let keys: Vec<String> = inputs
+                    .unknown_keys
+                    .iter()
+                    .filter(|key| {
+                        matches!(key.effect, crate::unknown_keys::Effect::OverlaySkipped(_))
+                            && key.path == fields[2]
+                    })
+                    .map(|key| data_key_detail(key, inputs.home))
+                    .collect();
+                out.push(Record::warn(
+                    format!("{name}: selected but skipped: unknown descriptor key"),
+                    (!keys.is_empty()).then(|| keys.join("; ")),
                 ));
                 continue;
             }

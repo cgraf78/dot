@@ -106,7 +106,11 @@ fn prepare<'a>(
         termux: prefix.contains("/com.termux/"),
         euid: uid,
     };
-    if let Err(error) = crate::overlays::resolve(&mut overlays, &mut profiles, "inspect", &inputs) {
+    let resolved = crate::overlays::resolve(&mut overlays, &mut profiles, "inspect", &inputs);
+    for key in crate::overlays::unknown_keys(&overlays, &profiles) {
+        let _ = writeln!(streams.stderr, "{}", key.warning());
+    }
+    if let Err(error) = resolved {
         for warning in &overlays.warnings {
             let _ = writeln!(streams.stderr, "{warning}");
         }

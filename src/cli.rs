@@ -859,7 +859,13 @@ fn run_repos_inner(
     };
     let mut state = crate::overlays::State::default();
     let mut profiles = crate::profiles::State::default();
-    if let Err(error) = crate::overlays::resolve(&mut state, &mut profiles, mode, &inputs) {
+    let resolved = crate::overlays::resolve(&mut state, &mut profiles, mode, &inputs);
+    // Keys from a newer Dot changed what this command sees (a skipped
+    // selector or overlay), so say so, like the config boundary does.
+    for key in crate::overlays::unknown_keys(&state, &profiles) {
+        let _ = writeln!(stderr, "{}", key.warning());
+    }
+    if let Err(error) = resolved {
         for warning in &state.warnings {
             let _ = writeln!(stderr, "{warning}");
         }

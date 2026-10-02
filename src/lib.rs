@@ -91,6 +91,7 @@ pub(crate) mod test_command;
 pub(crate) mod test_runner;
 pub mod test_suites;
 pub mod ui;
+pub mod unknown_keys;
 pub mod update;
 pub mod update_engine;
 pub mod update_lock;
