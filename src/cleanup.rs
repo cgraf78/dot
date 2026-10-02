@@ -5289,10 +5289,14 @@ fn spawn_owned_child(mut command: Command) -> std::io::Result<OwnedLaunch<OwnedC
     let decision = match registrar.join() {
         Ok(Ok(decision)) => decision,
         Ok(Err(error)) => {
-            if let Ok(mut child) = spawned {
-                let _ = child.kill();
-                let _ = wait_child_until(&mut child, cleanup_deadline());
-            }
+            let error = match spawned {
+                Ok(mut child) => {
+                    let _ = child.kill();
+                    let _ = wait_child_until(&mut child, cleanup_deadline());
+                    error
+                }
+                Err(spawn_error) => originating_launch_error(error, spawn_error),
+            };
             blocked.restore()?;
             return Err(error);
         }
@@ -6201,6 +6205,23 @@ fn spawn_with_eagain_retry(
     }
 }
 
+/// Pick the error that started a failed owned launch.
+///
+/// The two sides of the pre-exec handshake fail in cascade. A child that
+/// fails before its PID write (std's stdio `dup2`, `setsid`, the lease
+/// descriptor setup, or a caller's own pre-exec step) exits, and the
+/// registrar then reads EOF. A registrar that fails first answers with a
+/// refusal, and the child then reports `ECANCELED`. Returning the
+/// registrar's EOF would replace the child's real errno with "failed to
+/// fill whole buffer", so the spawn error wins in that case only.
+fn originating_launch_error(registrar: std::io::Error, spawn: std::io::Error) -> std::io::Error {
+    if registrar.kind() == std::io::ErrorKind::UnexpectedEof {
+        spawn
+    } else {
+        registrar
+    }
+}
+
 /// Atomically authorize, launch, and register an isolated child session.
 /// A pre-latched signal returns `None`; a signal pending on the spawning thread
 /// is released only after the child and its transitive ownership marker are
@@ -6333,10 +6354,14 @@ pub(crate) fn spawn_owned_session(
     let decision = match registrar.join() {
         Ok(Ok(decision)) => decision,
         Ok(Err(error)) => {
-            if let Ok(mut child) = spawned {
-                let _ = child.kill();
-                let _ = wait_child_until(&mut child, cleanup_deadline());
-            }
+            let error = match spawned {
+                Ok(mut child) => {
+                    let _ = child.kill();
+                    let _ = wait_child_until(&mut child, cleanup_deadline());
+                    error
+                }
+                Err(spawn_error) => originating_launch_error(error, spawn_error),
+            };
             blocked.restore()?;
             return Err(error);
         }
@@ -10990,6 +11015,43 @@ os._exit(0)
                 "internal endpoint fd {fd} lacks close-on-exec (flags {flags})"
             );
         }
+    }
+
+    /// A command whose own pre-exec step fails with `EPERM`. Caller steps
+    /// run before the launch handshake's PID write, so the registrar sees
+    /// only EOF while the spawn carries the real errno.
+    fn command_failing_before_handshake() -> Command {
+        use std::os::unix::process::CommandExt as _;
+        let mut command = Command::new("true");
+        // SAFETY: the callback only constructs an error value.
+        unsafe {
+            command.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+        }
+        command
+    }
+
+    #[test]
+    fn pre_handshake_child_failure_reports_the_child_errno() {
+        // A latched signal would cancel the launch before it fails.
+        let _signals = hold_signal_ownership_for_test();
+        match spawn_owned_session(command_failing_before_handshake()) {
+            Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EPERM), "{error:?}"),
+            Ok(_) => panic!("a failing pre-exec step must fail the session launch"),
+        }
+        match spawn_owned_child(command_failing_before_handshake()) {
+            Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EPERM), "{error:?}"),
+            Ok(_) => panic!("a failing pre-exec step must fail the foreground launch"),
+        }
+    }
+
+    #[test]
+    fn registrar_failure_outranks_the_child_cancellation() {
+        // The child's ECANCELED only answers the registrar's refusal.
+        let chosen = originating_launch_error(
+            std::io::Error::from_raw_os_error(libc::ENOBUFS),
+            std::io::Error::from_raw_os_error(libc::ECANCELED),
+        );
+        assert_eq!(chosen.raw_os_error(), Some(libc::ENOBUFS));
     }
 
     #[test]
