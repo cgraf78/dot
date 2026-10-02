@@ -92,7 +92,17 @@ pub fn run(
         .get(OsStr::new("DOT_UPDATE_LOCK_TOKEN"))
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty());
-    let guard = match update_lock::acquire(&state, is_cron(request.args), &log, prior, stderr) {
+    let acquired = update_lock::acquire(&state, is_cron(request.args), &log, prior, stderr);
+    if acquired.is_err() {
+        // A release continuation that cannot re-enter the lock its first
+        // half held never reaches the engine; the run still needs its outcome.
+        crate::update_engine::record_continuation_failure(
+            crate::update_engine::is_continuation(runtime),
+            request.args,
+            &state,
+        );
+    }
+    let guard = match acquired {
         Ok(guard) => guard,
         Err(Error::LockBusy { .. }) => return update_lock::EXIT_LOCK_BUSY,
         Err(_) => return crate::cli::EXIT_ERROR,
@@ -131,6 +141,12 @@ pub fn run(
         },
         &mut streams,
     );
+    // A provider handoff continues this run in the upgraded binary under the
+    // same PID, which re-enters this lock with the token above; park the
+    // guard in the handoff instead of releasing it.
+    let Some(guard) = runtime.park_lock(guard) else {
+        return code;
+    };
     // Explicit verified release (never silent removal of a lock that
     // no longer names us): removal failures warn through `log` into
     // stderr, like the shell's EXIT-trap release.
