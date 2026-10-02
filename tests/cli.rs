@@ -5562,7 +5562,7 @@ fn handoff_variables_never_reach_children_of_the_process_environment() {
     let crontab = shim_dir.join("crontab");
     std::fs::write(
         &crontab,
-        b"#!/bin/sh\nprintf '%s|%s|%s\\n' \"${DOT_UPDATE_LOCK_TOKEN-unset}\" \"${DOT_REEXEC_ONCE-unset}\" \"${DOT_REEXEC_STARTED-unset}\"\n",
+        b"#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"${DOT_UPDATE_LOCK_TOKEN-unset}\" \"${DOT_REEXEC_ONCE-unset}\" \"${DOT_REEXEC_STARTED-unset}\" \"${DOT_UPDATE_WARNED-unset}\"\n",
     )
     .expect("write crontab shim");
     std::fs::set_permissions(&crontab, std::fs::Permissions::from_mode(0o755))
@@ -5575,12 +5575,13 @@ fn handoff_variables_never_reach_children_of_the_process_environment() {
             .env("PATH", &path)
             .env("DOT_UPDATE_LOCK_TOKEN", "claim")
             .env("DOT_REEXEC_ONCE", "1")
-            .env("DOT_REEXEC_STARTED", "1");
+            .env("DOT_REEXEC_STARTED", "1")
+            .env("DOT_UPDATE_WARNED", "an earlier warning");
     });
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "unset|unset|unset\n"
+        "unset|unset|unset|unset\n"
     );
 }
 

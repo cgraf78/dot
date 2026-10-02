@@ -495,6 +495,10 @@ case ${1:-} in
       owner=$(<"$DOT_TEST_PROVIDER_STEAL_LOCK")
       printf '%s\n' "${owner%%token*}token	stolen" >"$DOT_TEST_PROVIDER_STEAL_LOCK"
     fi
+    if [[ -n ${DOT_TEST_PROVIDER_APPEND_CONFIG:-} && ! -e $HOME/.config/dot/config.appended ]]; then
+      : >"$HOME/.config/dot/config.appended"
+      printf '%s\n' "$DOT_TEST_PROVIDER_APPEND_CONFIG" >>"$HOME/.config/dot/config"
+    fi
     if [[ -n ${DOT_TEST_PROVIDER_RELEASES:-} ]]; then
       IFS=: read -ra releases <<<"$DOT_TEST_PROVIDER_RELEASES"
       for release in "${releases[@]}"; do
@@ -3682,6 +3686,10 @@ fn release_handoff_prunes_once_without_leaking_the_policy() {
 
 #[test]
 fn release_handoff_reports_unknown_config_keys_once() {
+    // The first half hands the lines it printed to the continuation, which
+    // skips exactly those: the boundary key and the invalid prune policy do
+    // not repeat, while a key that only appeared during the first half's
+    // Tools stage is still reported by the continuation's boundary.
     let fixture = Fixture::release("shdeps-release-handoff-unknown-key");
     std::fs::write(
         fixture.home.join(".config/dot/config"),
@@ -3690,13 +3698,19 @@ fn release_handoff_reports_unknown_config_keys_once() {
     .expect("config with a future key");
     let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
     let output = release_update(&fixture, &[&next])
+        .env("DOT_SHDEPS_PRUNE", "weekly")
+        .env("DOT_TEST_PROVIDER_APPEND_CONFIG", "arrived_midway=1")
         .output()
-        .expect("release handoff update with an unknown key");
+        .expect("release handoff update with unknown keys");
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(provider_parents(&fixture).len(), 2);
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "dot: config: warning: unknown key 'future_feature' ignored (newer dot?)\n"
+        concat!(
+            "dot: config: warning: unknown key 'future_feature' ignored (newer dot?)\n",
+            "  warning: ignoring DOT_SHDEPS_PRUNE=weekly; expected never, cron, or always\n",
+            "dot: config: warning: unknown key 'arrived_midway' ignored (newer dot?)\n",
+        )
     );
 }
 

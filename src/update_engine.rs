@@ -91,11 +91,12 @@ const PROBE_TIMEOUT_ENV: &str = "_DOT_REEXEC_PROBE_TIMEOUT_SECONDS";
 /// fails the startup guard after the next upgrade. The engine strips them
 /// from its runtime and the binary entry from the process environment
 /// ([`crate::handoff::scrub_process_env`]).
-pub(crate) const CONTINUATION_ENV: [&str; 4] = [
+pub(crate) const CONTINUATION_ENV: [&str; 5] = [
     LOCK_TOKEN_ENV,
     REEXEC_ONCE_ENV,
     REEXEC_EXPECTED_ENV,
     REEXEC_STARTED_ENV,
+    WARNED_ENV,
 ];
 
 /// Whether `runtime` is a provider continuation: the second half of an
@@ -419,10 +420,13 @@ fn warn_reloaded_keys(
 /// process (a release handoff), so each warning still prints once per
 /// invocation. The value is the lines joined by `\n`; a line holding a
 /// newline is left out (it would merely print again). The engine reads it
-/// at entry, scrubs it from the environment hooks and providers see, and
-/// never prints a listed line; [`EngineInputs::warned_handoff`] builds the
-/// value to set. Lines are compared as printed, so a continuation whose
-/// release words a warning differently (or knows the key) is unaffected.
+/// at entry and never prints a listed line; like the other handoff
+/// variables (the lock claim, `DOT_REEXEC_*`) it is scrubbed from the
+/// environment hooks and providers see and, at the binary entry, from the
+/// process environment. The release handoff builds the value from
+/// [`EngineInputs::warned_handoff`] plus the boundary's prune-policy
+/// warning. Lines are compared as printed, so a continuation whose release
+/// words a warning differently (or knows the key) is unaffected.
 pub const WARNED_ENV: &str = "DOT_UPDATE_WARNED";
 
 /// Parse a [`WARNED_ENV`] value (absent or empty: nothing handed over).
@@ -2618,6 +2622,7 @@ fn provider_reexec(
 /// The continuation is the same command line under this process's own
 /// environment plus what the command boundary consumed from it (the prune
 /// policy, which the new process parses again) and the handoff contract: the
+/// warning lines already printed ([`WARNED_ENV`], so none prints twice), the
 /// lock claim it re-enters the held lock with, `DOT_REEXEC_ONCE` (a second
 /// Dot change publishes the provider checkpoint instead of handing off
 /// again), and `DOT_REEXEC_EXPECTED_REVISION` (the new binary proves its
@@ -2646,6 +2651,8 @@ fn release_handoff(
         OsString::from(REEXEC_STARTED_ENV),
         OsString::from(started.to_string()),
     );
+    // Each warning prints once per invocation, across the exec too.
+    env.insert(OsString::from(WARNED_ENV), continuation_warned(inputs));
     let binary = inputs.source_root_git.join("dot");
     let probe = probe_release_binary(inputs.runtime, &binary, &env);
     if cancelled() {
@@ -3220,21 +3227,53 @@ fn prune_mode(
     }
     match PruneMode::parse(raw.as_deref()) {
         Some(mode) => (mode, scrubbed),
-        // A release continuation inherits the value; its first half warned.
-        None if is_continuation(runtime) => (PruneMode::Never, scrubbed),
         None => {
-            let value =
-                crate::progress_ui::sanitize_untrusted_text(raw.unwrap_or_default().as_bytes());
-            let mut message = format!("  warning: ignoring {PRUNE_ENV}=").into_bytes();
-            message.extend_from_slice(&value);
-            message.extend_from_slice(b"; expected never, cron, or always");
-            let _ = stderr.write_all(&crate::progress_ui::warn_line(
-                &crate::progress_ui::Palette::empty(),
-                &message,
-            ));
+            let line = invalid_prune_warning(raw.as_deref().unwrap_or_default());
+            // A release continuation inherits the value; its first half
+            // hands the line over once printed.
+            let handed = handed_warnings(
+                request
+                    .env
+                    .get(OsStr::new(WARNED_ENV))
+                    .map(OsString::as_os_str),
+            );
+            if !handed.contains(&line) {
+                let _ = stderr.write_all(&crate::progress_ui::warn_line(
+                    &crate::progress_ui::Palette::empty(),
+                    line.as_bytes(),
+                ));
+            }
             (PruneMode::Never, scrubbed)
         }
     }
+}
+
+/// The warning line (as printed, without its newline) for an unrecognized
+/// [`PRUNE_ENV`] value.
+fn invalid_prune_warning(raw: &str) -> String {
+    let value = crate::progress_ui::sanitize_untrusted_text(raw.as_bytes());
+    format!(
+        "  warning: ignoring {PRUNE_ENV}={}; expected never, cron, or always",
+        String::from_utf8_lossy(&value)
+    )
+}
+
+/// The [`WARNED_ENV`] value a release continuation receives: every warning
+/// this invocation printed so far ([`EngineInputs::warned_handoff`]) plus the
+/// invalid prune-policy warning, which the command boundary prints before the
+/// engine and which the continuation would otherwise repeat.
+fn continuation_warned(inputs: &EngineInputs<'_>) -> OsString {
+    let mut lines = handed_warnings(Some(&inputs.warned_handoff()));
+    if inputs.caller == Caller::Update {
+        if let Some(raw) = inputs.env.get(OsStr::new(PRUNE_ENV)) {
+            let raw = raw.to_string_lossy();
+            if PruneMode::parse(Some(&raw)).is_none() {
+                lines.insert(invalid_prune_warning(&raw));
+            }
+        }
+    }
+    // `handed_warnings` already dropped empty lines; none hold a newline.
+    OsString::from(lines.into_iter().collect::<Vec<_>>().join("\n"))
 }
 
 /// Execute one native update through the typed runtime and stream boundary.
@@ -3253,11 +3292,11 @@ pub fn run_update(
     // reads its markers from the command environment. A release
     // continuation inherits all of them in its process environment, so keep
     // them out of what providers and hooks inherit, like any other run.
+    // `CONTINUATION_ENV` includes the handed-over warnings, which concern
+    // this engine only.
     for key in CONTINUATION_ENV {
         runtime = runtime.without_env(key);
     }
-    // The handed-over warnings concern this engine only.
-    runtime = runtime.without_env(WARNED_ENV);
     let runtime = &runtime;
     // A release continuation's run started with its first half.
     let started = continuation
@@ -3590,6 +3629,56 @@ mod tests {
         assert!(handed_warnings(Some(OsStr::new(""))).is_empty());
         let odd: BTreeSet<String> = ["a\nb".to_string()].into();
         assert!(handed_warnings(Some(&warned_value(&odd, &[], &[], false))).is_empty());
+    }
+
+    #[test]
+    fn a_continuation_warns_an_invalid_prune_policy_nobody_handed_over() {
+        // Only a handed line is skipped; being a continuation is not enough.
+        let request_env = |handed: Option<&str>| {
+            let mut env = BTreeMap::from([
+                (OsString::from("HOME"), OsString::from("/tmp")),
+                (OsString::from(REEXEC_ONCE_ENV), OsString::from("1")),
+                (OsString::from(PRUNE_ENV), OsString::from("weekly")),
+            ]);
+            if let Some(line) = handed {
+                env.insert(OsString::from(WARNED_ENV), OsString::from(line));
+            }
+            env
+        };
+        let config = crate::config::Config {
+            version: 1,
+            extension_api: false,
+            extensions_dir: None,
+            provider: crate::config::Provider::None,
+            default_profile: "base".to_string(),
+            shdeps_update_policy: crate::config::UpdatePolicy::Pinned,
+            policy_from_env: false,
+            unknown_keys: Vec::new(),
+        };
+        let line = invalid_prune_warning("weekly");
+        for (handed, expected) in [
+            (None, format!("{line}\n")),
+            (Some(line.as_str()), String::new()),
+        ] {
+            let env = request_env(handed);
+            let runtime =
+                crate::app::Runtime::from_env(&env, Path::new("/tmp")).expect("absolute cwd");
+            let request = UpdateRequest {
+                caller: Caller::Update,
+                config: &config,
+                env: &env,
+                args: &[],
+                state_home: Path::new("/tmp"),
+            };
+            let mut stderr = Vec::new();
+            let (mode, _) = prune_mode(&runtime, &request, &mut stderr);
+            assert_eq!(mode, PruneMode::Never);
+            assert_eq!(
+                String::from_utf8_lossy(&stderr),
+                expected,
+                "handed {handed:?}"
+            );
+        }
     }
 
     #[test]
