@@ -543,7 +543,7 @@ pub struct CronInputs {
 /// fresh installs have never converged.
 ///
 /// A host whose runs keep converging while the Tools or Prune stage
-/// fails is reported as degraded with the failing stages instead of
+/// fails, or while its config misspells a key, is reported as degraded with the failing stages instead of
 /// "has not succeeded recently", which stays reserved for a host that
 /// stopped converging. Both use the same staleness window, so a
 /// transient failure after a recent clean run still reads ok, exactly

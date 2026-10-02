@@ -505,7 +505,9 @@ pub struct PlanInputs<'a> {
 /// Returns the report bytes the shell prints to stderr: the
 /// repository identity, branch, tracked-path count (the shell's
 /// `wc -l`, so newline bytes, not lines), backup root, dependency
-/// provider, shdeps update policy, and extension state.
+/// provider, shdeps update policy, and extension state, plus an
+/// `ignored config keys` line only when the candidate config holds keys
+/// this Dot does not know (each with its did-you-mean or newer-Dot hint).
 ///
 /// The provider triple comes from the live config engine: when the
 /// candidate holds `$branch:.config/dot/config`, its bytes land in
@@ -536,6 +538,7 @@ pub fn plan_summary(inputs: &PlanInputs<'_>) -> Result<Vec<u8>> {
     let mut provider = b"none".to_vec();
     let mut policy = b"pinned".to_vec();
     let mut extensions = b"disabled".to_vec();
+    let mut ignored = Vec::new();
     let object = format!("{branch}:{CONFIG_BLOB}");
     if git_in(home, candidate, &["cat-file", "-e", &object]).is_some() {
         let shown = git_in(home, candidate, &["show", &object]).ok_or(Error::Command {
@@ -572,6 +575,14 @@ pub fn plan_summary(inputs: &PlanInputs<'_>) -> Result<Vec<u8>> {
         if config.extension_api {
             extensions = b"enabled".to_vec();
         }
+        // Name what the clone's config will not apply before the operator
+        // approves: a misspelled key leaves its setting at the default the
+        // lines above already report.
+        ignored = config
+            .unknown_keys
+            .iter()
+            .map(|unknown| format!("{} ({})", unknown.key, unknown.hint()))
+            .collect();
     }
     if skip_provider && provider != b"none" {
         provider.extend_from_slice(b" (skipped for this invocation)");
@@ -584,6 +595,11 @@ pub fn plan_summary(inputs: &PlanInputs<'_>) -> Result<Vec<u8>> {
     out.extend_from_slice(format!("  dependency provider: {}\n", lossy(&provider)).as_bytes());
     out.extend_from_slice(format!("  shdeps update policy: {}\n", lossy(&policy)).as_bytes());
     out.extend_from_slice(format!("  extensions: {}\n", lossy(&extensions)).as_bytes());
+    if !ignored.is_empty() {
+        out.extend_from_slice(
+            format!("  ignored config keys: {}\n", ignored.join(", ")).as_bytes(),
+        );
+    }
     Ok(out)
 }
 

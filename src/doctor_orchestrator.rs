@@ -280,6 +280,9 @@ pub struct RuntimeSnapshot {
     pub git_version: Option<Vec<u8>>,
     /// `${DOT_CONFIG_VERSION:-1}`, already defaulted by the caller.
     pub config_version: Vec<u8>,
+    /// Config keys this release ignored; each becomes a warning so a
+    /// typo or a Dot that lags the client repository stays visible.
+    pub unknown_config_keys: Vec<crate::config::UnknownKey>,
 }
 
 /// `_dr_check_runtime`: file the `dot runtime` section, the Bash
@@ -327,6 +330,18 @@ pub fn check_runtime(
         }
     }
     rec.ok(b"configuration version", Some(&snapshot.config_version));
+    for unknown in &snapshot.unknown_config_keys {
+        let detail = format!(
+            "{} on line {} ({})",
+            unknown.key,
+            unknown.line,
+            unknown.hint()
+        );
+        rec.warn(
+            b"unknown configuration key ignored",
+            Some(detail.as_bytes()),
+        );
+    }
     check_engine_source(rec, engine, home);
 }
 

@@ -69,6 +69,7 @@ fn convergence_stamp_round_trips_failing_stages() {
     let state = scratch.path();
     assert_eq!(update_status::read_last_converged(state), None);
     let degraded = update_status::Degraded {
+        config: false,
         tools: true,
         prune: true,
     };
@@ -102,18 +103,30 @@ fn convergence_stamp_round_trips_failing_stages() {
 
 #[test]
 fn degraded_detail_lists_stages_in_run_order() {
-    let only = |tools, prune| update_status::Degraded { tools, prune }.detail();
-    assert_eq!(only(false, false), "");
-    assert_eq!(only(true, false), "tools");
-    assert_eq!(only(false, true), "prune");
-    assert!(update_status::Degraded::default().is_empty());
-    assert!(
-        !update_status::Degraded {
-            tools: false,
-            prune: true
+    let only = |config, tools, prune| {
+        update_status::Degraded {
+            config,
+            tools,
+            prune,
         }
-        .is_empty()
-    );
+        .detail()
+    };
+    assert_eq!(only(false, false, false), "");
+    assert_eq!(only(true, false, false), "config");
+    assert_eq!(only(false, true, false), "tools");
+    assert_eq!(only(false, false, true), "prune");
+    assert_eq!(only(true, true, true), "config,tools,prune");
+    assert!(update_status::Degraded::default().is_empty());
+    for (config, prune) in [(false, true), (true, false)] {
+        assert!(
+            !update_status::Degraded {
+                config,
+                tools: false,
+                prune,
+            }
+            .is_empty()
+        );
+    }
 }
 
 #[test]

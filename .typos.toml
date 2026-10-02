@@ -1,7 +1,18 @@
-# Spelling policy for this repository (read by `typos` and Checkrun).
+# Spelling policy for typos (run by the local Checkrun/Sley hooks).
+#
+# Ignore only the deliberate misspellings that tests and docs need, by exact
+# text, so the words themselves stay checked everywhere else.
 
 [default]
 extend-ignore-re = [
+  # Misspelled config keys that exercise the "did you mean" suggestion.
+  "defualt_profile",
+  "dependency_provder",
+  "shdeps_update_polciy",
+  '"versoin"',
+  # Truncated and non-UTF-8 command words in CLI dispatch tests.
+  'b"updat"',
+  '"fo\\xFFb"',
   # Escaped UTF-8 fixtures spell "café" as `caf\xc3\xa9` or
   # `caf\u00e9`; the split-off `caf` is not a misspelling.
   'caf\\+[xu]',

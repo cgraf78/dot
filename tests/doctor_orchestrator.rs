@@ -73,6 +73,7 @@ fn runtime_check_agrees() {
         source_root: b"/src".to_vec(),
         git_version: Some(b"git version 2".to_vec()),
         config_version: b"1".to_vec(),
+        unknown_config_keys: Vec::new(),
     };
     check_runtime(&mut rec, &runtime, &engine(b"/src"), b"/home/u");
     assert_eq!(rec.counts().pass, 4);
@@ -88,6 +89,39 @@ fn runtime_check_agrees() {
 }
 
 #[test]
+fn runtime_check_warns_once_per_unknown_config_key() {
+    let unknown = |key: &str, line| dot::config::UnknownKey {
+        key: key.to_string(),
+        line,
+    };
+    let runtime = RuntimeSnapshot {
+        bash_version: Vec::new(),
+        bash_major: 0,
+        bash_required: false,
+        checkout_root: Some(b"/src".to_vec()),
+        release_root: false,
+        source_raw: b"/src".to_vec(),
+        source_root: b"/src".to_vec(),
+        git_version: Some(b"git version 2".to_vec()),
+        config_version: b"1".to_vec(),
+        unknown_config_keys: vec![unknown("future_key", 2), unknown("defualt_profile", 3)],
+    };
+    let mut rec = Recorder::new();
+    check_runtime(&mut rec, &runtime, &engine(b"/src"), b"/home/u");
+    // Ignored keys never fail doctor: they are warnings beside the
+    // engine-source warning this fixture always produces.
+    assert_eq!(rec.counts().fail, 0);
+    assert_eq!(rec.counts().warn, 3);
+    let rendered = String::from_utf8(rec.render()).expect("utf8 render");
+    assert!(
+        rendered.contains("unknown configuration key ignored")
+            && rendered.contains("future_key on line 2 (newer dot?)")
+            && rendered.contains("defualt_profile on line 3 (did you mean 'default_profile'?)"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn packaged_runtime_does_not_require_checkout_or_bash() {
     let mut rec = Recorder::new();
     let runtime = RuntimeSnapshot {
@@ -100,6 +134,7 @@ fn packaged_runtime_does_not_require_checkout_or_bash() {
         source_root: b"/data/cgraf78/dot/releases/v1-linux-x86_64-musl".to_vec(),
         git_version: Some(b"git version 2".to_vec()),
         config_version: b"1".to_vec(),
+        unknown_config_keys: Vec::new(),
     };
     check_runtime(
         &mut rec,
@@ -271,6 +306,7 @@ fn doctor_skeleton_agrees() {
         source_root: b"/src".to_vec(),
         git_version: Some(b"git".to_vec()),
         config_version: b"1".to_vec(),
+        unknown_config_keys: Vec::new(),
     };
     let mut kernels: Vec<Kernel<'_>> = vec![Box::new(|rec| {
         rec.section(b"Kernel");
