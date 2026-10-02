@@ -1024,6 +1024,59 @@ fn init_client(home: &TempDir, state: &TempDir, origin: &Path) {
     );
 }
 
+/// A logging `git` wrapper doctor will actually select as its host Git.
+///
+/// Doctor resolves Git from `PATH` but skips any candidate under `HOME` or
+/// the Dot checkout (`init_client_identity::select_command_git`), and the
+/// exec-capable fixture root (`TempDir::new_exec`) lives in the checkout's
+/// target directory unless `CARGO_TARGET_DIR` points elsewhere. So the
+/// wrapper goes in the first fixture root outside the checkout whose files
+/// can execute; no such root is a test-environment error, not a pass. The
+/// wrapper execs the real Git directly, never a developer launcher.
+fn host_git_wrapper(label: &str) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let checkout = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("checkout");
+    let real = dot_test_support::real_tool("git");
+    for exec_root in [false, true] {
+        let dir = if exec_root {
+            TempDir::new_exec(label)
+        } else {
+            TempDir::new(label)
+        }
+        .expect("wrapper directory");
+        if dir.path().starts_with(&checkout) {
+            continue;
+        }
+        let log = dir.path().join("git.log");
+        let wrapper = dir.path().join("git");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
+                log.display(),
+                real.display()
+            ),
+        )
+        .expect("git wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("wrapper mode");
+        // A `noexec` mount refuses to run it: try the next root.
+        let probe = Command::new(&wrapper)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if probe.is_ok_and(|status| status.success()) {
+            let _ = std::fs::remove_file(&log);
+            return (dir, wrapper, log);
+        }
+    }
+    panic!(
+        "no exec-capable fixture directory outside the checkout {} for the host Git wrapper",
+        checkout.display()
+    );
+}
+
 #[test]
 fn base_repository_state_costs_one_status_call() {
     // P3: branch, upstream distance, and tracked changes used to cost four
@@ -1034,20 +1087,7 @@ fn base_repository_state_costs_one_status_call() {
     let state = TempDir::new("doctor-status-calls-state").expect("state");
     let origin = origin(scope.path());
     init_client(&home, &state, &origin);
-    let wrappers = TempDir::new_exec("doctor-status-calls-git").expect("wrappers");
-    let log = wrappers.path().join("git.log");
-    let wrapper = wrappers.path().join("git");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
-            log.display(),
-            dot_test_support::real_tool("git").display()
-        ),
-    )
-    .expect("git wrapper");
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
-        .expect("wrapper mode");
+    let (wrappers, wrapper, log) = host_git_wrapper("doctor-status-calls-git");
     let path = format!(
         "{}:{}",
         wrappers.path().display(),
@@ -1066,7 +1106,13 @@ fn base_repository_state_costs_one_status_call() {
         stdout.contains("✓ client upstream (origin/main (current))"),
         "{stdout}"
     );
-    let calls = std::fs::read_to_string(&log).expect("git log");
+    // A bypassed wrapper must fail here, not as a missing file.
+    let calls = std::fs::read_to_string(&log).unwrap_or_else(|_| {
+        panic!(
+            "doctor never ran the logging Git wrapper {}: it resolved Git elsewhere",
+            wrapper.display()
+        )
+    });
     let base: Vec<&str> = calls
         .lines()
         .filter(|line| line.contains("--work-tree="))
