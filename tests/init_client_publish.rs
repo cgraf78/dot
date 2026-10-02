@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use dot::init_client_publish as publish;
 use dot_test_support::TempDir;
@@ -348,17 +348,10 @@ fn cleanup_published_stage_rows() {
 }
 
 fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(root)
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "core.hooksPath=",
-        ])
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -444,7 +437,7 @@ fn run_publish(
     let publish_one = |_: &Path, _: &Path, mode: &str, oid: &str, path: &str| {
         calls.borrow_mut().push(format!("one {mode} {oid} {path}"));
         let spec = format!("{}:{path}", world.commit);
-        let bytes = Command::new("git")
+        let bytes = dot_test_support::git()
             .arg("--git-dir")
             .arg(&world.git_dir)
             .args(["show", &spec])

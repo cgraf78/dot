@@ -80,7 +80,7 @@ fn write(dir: &Path, name: &str, bytes: &[u8]) {
 
 /// Run git for fixtures; asserts success, silences output.
 fn git(args: &[&str]) {
-    let mut cmd = Command::new("git");
+    let mut cmd = dot_test_support::git();
     isolate_git(&mut cmd);
     let status = cmd
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
@@ -96,7 +96,7 @@ fn git(args: &[&str]) {
 /// Run git, feeding optional stdin under extra environment, and
 /// return the chomped stdout. Asserts success, silences stderr.
 fn git_output(args: &[&str], stdin_bytes: Option<&[u8]>, extra_env: &[(&str, &str)]) -> String {
-    let mut cmd = Command::new("git");
+    let mut cmd = dot_test_support::git();
     isolate_git(&mut cmd);
     cmd.args(["-c", "user.name=t", "-c", "user.email=t@t"]);
     cmd.args(args);
@@ -132,7 +132,7 @@ fn git_output(args: &[&str], stdin_bytes: Option<&[u8]>, extra_env: &[(&str, &st
 
 /// `git hash-object --stdin` over raw bytes, for intent names.
 fn hash_bytes(payload: &[u8]) -> String {
-    let mut cmd = Command::new("git");
+    let mut cmd = dot_test_support::git();
     isolate_git(&mut cmd);
     let mut child = cmd
         .args(["hash-object", "--stdin"])
@@ -158,19 +158,11 @@ fn hash_bytes(payload: &[u8]) -> String {
     String::from_utf8(text).expect("hex hash")
 }
 
-/// Exclude ambient hooks, signing policy, templates, and user configuration
-/// from every fixture Git process.
+/// Exclude templates from every fixture Git process on top of the shared
+/// fixture isolation: end states compare repository files byte for byte,
+/// and the host's template set varies by Git version and packaging.
 fn isolate_git(cmd: &mut Command) {
-    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TEMPLATE_DIR", "/dev/null")
-        .env("GIT_CONFIG_COUNT", "3")
-        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_0", "/dev/null")
-        .env("GIT_CONFIG_KEY_1", "commit.gpgSign")
-        .env("GIT_CONFIG_VALUE_1", "false")
-        .env("GIT_CONFIG_KEY_2", "tag.gpgSign")
-        .env("GIT_CONFIG_VALUE_2", "false");
+    cmd.env("GIT_TEMPLATE_DIR", "/dev/null");
 }
 
 /// One inventoried entry: relative path plus kind, mode, and

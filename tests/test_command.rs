@@ -380,10 +380,9 @@ fn native_automatic_jobs_preserves_probe_whitespace() {
 #[cfg(all(unix, not(target_os = "macos")))]
 fn native_registered_source_keeps_non_utf8_path_identity() {
     use std::os::unix::ffi::OsStringExt;
-    use std::process::Command;
     let f = Fixture::new();
     let git = |args: Vec<std::ffi::OsString>| {
-        let output = Command::new("git")
+        let output = dot_test_support::git()
             .args(args)
             .env("HOME", &f.home)
             .output()

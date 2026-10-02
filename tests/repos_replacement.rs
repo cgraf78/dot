@@ -2,7 +2,7 @@
 
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use dot::repos_overlays::{self, ReplaceIdentityKind};
 use dot_test_support::TempDir;
@@ -17,23 +17,8 @@ fn stage(root: &Path, relative: &str, bytes: &[u8], mode: u32) -> PathBuf {
 
 fn hash(value: &str) -> String {
     use std::io::Write as _;
-    let mut child = Command::new("git")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "tag.gpgSign=false",
-            "hash-object",
-            "--stdin",
-        ])
-        .env_clear()
-        .env("LC_ALL", "C")
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", "/tmp")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    let mut child = dot_test_support::git()
+        .args(["hash-object", "--stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

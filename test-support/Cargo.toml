@@ -8,5 +8,10 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+# Passwd home lookup for launcher-shim exclusion (`real_tool`); the
+# engine already depends on libc, so this adds no new crate.
+libc = "0.2"
+
 [lints.rust]
 warnings = "deny"

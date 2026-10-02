@@ -15,34 +15,19 @@ use dot::repos_commands::{
 use dot_test_support::TempDir;
 
 fn real_git() -> PathBuf {
-    std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
-        .map(|dir| dir.join("git"))
-        .find(|path| path.is_file())
-        .expect("host git")
+    dot_test_support::real_tool("git")
 }
 
 fn git(dir: &Path, args: &[&str]) -> Output {
-    let output = Command::new(real_git())
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "tag.gpgsign=false",
-            "-c",
-            "user.name=fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "-C",
-        ])
-        .arg(dir)
-        .args(args)
+    let mut command = Command::new(real_git());
+    command
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("LC_ALL", "C")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("LC_ALL", "C");
+    let output = dot_test_support::isolate_git(&mut command)
+        .arg("-C")
+        .arg(dir)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

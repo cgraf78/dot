@@ -26,12 +26,10 @@ fn write_exec(path: &Path, body: &[u8]) {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(dir)
-        .args(["-c", "core.hooksPath=/dev/null"])
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -45,12 +43,10 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn git_head(dir: &Path) -> Vec<u8> {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "HEAD"])
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1004,7 +1000,7 @@ esac
         );
         git(&checkout, &["commit", "-qm", "provider"]);
         if pinned {
-            let output = Command::new("git")
+            let output = dot_test_support::git()
                 .arg("-C")
                 .arg(&checkout)
                 .args(["rev-parse", "HEAD"])

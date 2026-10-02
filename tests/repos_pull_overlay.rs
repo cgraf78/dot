@@ -12,25 +12,14 @@ use dot_test_support::TempDir;
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("-C")
         .arg(repo)
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgSign=false",
-        ])
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -86,13 +75,11 @@ impl Fixture {
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         let overlay = home.join("overlay");
-        let status = Command::new("git")
+        let status = dot_test_support::git()
             .arg("clone")
             .arg("-q")
             .arg(&origin)
             .arg(&overlay)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -349,13 +336,11 @@ fn invalid_candidates_and_diverged_updates_fail_without_installing_them() {
 
 /// Exit status of a raw git query in `repo` (hermetic config).
 fn git_status(repo: &Path, args: &[&str]) -> Option<i32> {
-    Command::new("git")
+    dot_test_support::git()
         .arg("-C")
         .arg(repo)
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -369,12 +354,10 @@ fn git_status(repo: &Path, args: &[&str]) -> Option<i32> {
 /// rebase never started).
 fn assert_rebase_aborted(repo: &Path) {
     let output = |args: &[&str]| {
-        let output = Command::new("git")
+        let output = dot_test_support::git()
             .arg("-C")
             .arg(repo)
             .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
@@ -406,12 +389,10 @@ fn a_recorded_conflict_is_not_replayed_until_a_side_moves() {
         PullOverlayStatus::Failed
     );
     let aborts = || {
-        let output = Command::new("git")
+        let output = dot_test_support::git()
             .arg("-C")
             .arg(&diverged.overlay)
             .args(["reflog", "--format=%gs"])
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .output()
             .unwrap();
         String::from_utf8_lossy(&output.stdout)
@@ -522,12 +503,10 @@ fn diverge_cleanly(fixture: &Fixture) {
 
 /// Number of `rebase (abort)` entries in the overlay's HEAD reflog.
 fn abort_count(repo: &Path) -> usize {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(repo)
         .args(["reflog", "--format=%gs"])
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .output()
         .unwrap();
     String::from_utf8_lossy(&output.stdout)
@@ -591,12 +570,10 @@ fn a_rebase_that_failed_without_conflicts_is_retried_once_then_not_replayed() {
 fn strand_dot_rebase(fixture: &Fixture, exec: &str) {
     git(&fixture.overlay, &["fetch", "-q", "origin"]);
     let rev = |spec: &str| {
-        let output = Command::new("git")
+        let output = dot_test_support::git()
             .arg("-C")
             .arg(&fixture.overlay)
             .args(["rev-parse", spec])
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .output()
             .unwrap();
         String::from_utf8_lossy(&output.stdout).trim().to_string()

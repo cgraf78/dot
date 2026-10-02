@@ -14,17 +14,14 @@ fn stage(root: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
     path
 }
 fn git(cwd: &Path, home: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .args(args)
+    let mut command = Command::new(dot_test_support::real_tool("git"));
+    command
         .env_clear()
         .env("LC_ALL", "C")
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", home)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "fixture")
-        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
-        .env("GIT_COMMITTER_NAME", "fixture")
-        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .env("HOME", home);
+    let out = dot_test_support::isolate_git(&mut command)
+        .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .output()

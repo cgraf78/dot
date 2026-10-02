@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use dot::log::Log;
 use dot::repos_base::{Base, Topology};
@@ -13,20 +13,10 @@ use dot::repos_pull_queries::CandidateEnv;
 use dot_test_support::TempDir;
 
 fn git(root: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(root)
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "tag.gpgSign=false",
-        ])
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -78,12 +68,10 @@ impl Side {
         stage(&origin, "base.txt", b"v1\n");
         commit(&origin, "seed");
         let home = scope.path().join("home");
-        let output = Command::new("git")
-            .args(["-c", "core.hooksPath=/dev/null", "clone", "-q"])
+        let output = dot_test_support::git()
+            .args(["clone", "-q"])
             .arg(&origin)
             .arg(&home)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -221,12 +209,10 @@ fn run_with(
 
 /// Exit status of a raw git query in `root` (hermetic config).
 fn git_status(root: &Path, args: &[&str]) -> Option<i32> {
-    Command::new("git")
+    dot_test_support::git()
         .arg("-C")
         .arg(root)
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -237,12 +223,10 @@ fn git_status(root: &Path, args: &[&str]) -> Option<i32> {
 
 /// Stdout of a raw git query in `root` (hermetic config).
 fn git_stdout(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(root)
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()

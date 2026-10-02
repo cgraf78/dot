@@ -19,14 +19,12 @@ fn overlay(name: &str, path: &Path, sync: &str) -> String {
 }
 
 fn git(root: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let mut command = Command::new(dot_test_support::real_tool("git"));
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    let status = dot_test_support::isolate_git(&mut command)
         .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "tag.gpgsign=false",
             "-c",
             "user.name=fixture",
             "-c",
@@ -35,10 +33,6 @@ fn git(root: &Path, args: &[&str]) {
         ])
         .arg(root)
         .args(args)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

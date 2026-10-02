@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use dot::log::Log;
 use dot::progress_ui::{Palette, Stage};
@@ -16,7 +16,7 @@ use dot::repos_pull_queries::CandidateEnv;
 use dot_test_support::TempDir;
 
 fn git(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(repo)
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
@@ -40,7 +40,7 @@ fn commit(repo: &Path, name: &str, content: &str) {
 }
 
 fn clone(origin: &Path, path: &Path) {
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("clone")
         .arg("-q")
         .arg(origin)

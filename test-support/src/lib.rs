@@ -8,6 +8,13 @@
 //! and coarse clocks), paths are canonicalized, and the guard removes
 //! the directory on drop.
 
+mod git;
+
+pub use git::{
+    GIT_USER_EMAIL, GIT_USER_NAME, git, isolate_git, launcher_paths, real_tool, real_tool_in,
+    select_real_tool,
+};
+
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

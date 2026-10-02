@@ -48,7 +48,7 @@ impl Twins {
 
 /// Run git for fixtures, with a pinned identity for commits.
 fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("-C")
         .arg(repo)
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
@@ -72,7 +72,7 @@ fn commit(repo: &Path, message: &str) {
 /// `head` (which may be unborn, to force the fallback paths).
 fn make_origin(root: &Path, name: &str, branches: &[&str], head: &str) -> PathBuf {
     let origin = root.join(name);
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("init")
         .arg("-q")
         .arg("-b")
@@ -696,7 +696,7 @@ fn default_branch_refuses_garbage() {
     std::fs::create_dir_all(&rust_scratch).expect("rust scratch");
     // Empty origin: nothing to advertise, nothing to enumerate.
     let empty = twins.shared().join("empty");
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("init")
         .arg("-q")
         .arg("-b")

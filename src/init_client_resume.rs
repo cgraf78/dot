@@ -583,7 +583,7 @@ mod tests {
     #[test]
     fn git_probe_runs_without_host_process_snapshot() {
         let dir = TempDir::new("leaf-git-no-scan").expect("scratch");
-        let status = std::process::Command::new("git")
+        let status = dot_test_support::git()
             .arg("init")
             .arg("-q")
             .current_dir(dir.path())

@@ -588,7 +588,7 @@ mod tests {
         std::fs::create_dir_all(path).expect("repo directory");
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
             .expect("repo directory mode");
-        let status = Command::new("git")
+        let status = dot_test_support::git()
             .arg("init")
             .arg("-q")
             .arg(path)
@@ -598,7 +598,7 @@ mod tests {
             .status()
             .expect("git init");
         assert!(status.success(), "git init {}", path.display());
-        let status = Command::new("git")
+        let status = dot_test_support::git()
             .arg("-C")
             .arg(path)
             .arg("remote")

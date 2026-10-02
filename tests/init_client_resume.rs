@@ -3,22 +3,14 @@
 use std::cell::RefCell;
 use std::os::unix::fs::{MetadataExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use dot::errors::{Error, Result};
 use dot::init_client_resume as resume;
 use dot_test_support::TempDir;
 
 fn git(cwd: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "tag.gpgSign=false",
-        ])
+    let out = dot_test_support::git()
         .args(args)
         .current_dir(cwd)
         .env("LC_ALL", "C")

@@ -45,6 +45,24 @@ while IFS= read -r safe_dir; do
   git config --file "$git_global_config" --add safe.directory "$safe_dir"
 done < <(git config --get-all safe.directory 2>/dev/null || true)
 
+# Git state inherited from the caller reaches every fixture repository the
+# suites build: an outer hook's GIT_DIR/GIT_INDEX_FILE redirects fixture
+# commands at the caller's repository, exported GIT_CONFIG_COUNT or
+# GIT_CONFIG_PARAMETERS entries outrank the private global config below, and
+# a template directory or format default changes every `git init`. Suites
+# that need any of these set them explicitly. Keep in step with the Rust
+# fixture list in test-support/src/git.rs. This runs after the safe.directory
+# harvest above, which may still depend on the caller's config injection.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
+unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE
+unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG_SYSTEM
+unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE
+unset GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_DATE
+unset GIT_TEMPLATE_DIR GIT_DEFAULT_HASH GIT_DEFAULT_REF_FORMAT
+unset GIT_ALLOW_PROTOCOL GIT_PROTOCOL_FROM_USER GIT_ATTR_SOURCE
+unset GIT_LITERAL_PATHSPECS GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS
+unset GIT_ICASE_PATHSPECS
+
 for test_file in "$root"/tests/*-test; do
   [[ -f "$test_file" && -x "$test_file" ]] || continue
   cp "$root/tests/provider-suite-wrapper" \
@@ -68,6 +86,7 @@ run_env=(
   # change fixtures). Suites needing config set it explicitly.
   "GIT_CONFIG_GLOBAL=$git_global_config"
   "GIT_CONFIG_NOSYSTEM=1"
+  "GIT_ATTR_NOSYSTEM=1"
 )
 if [[ -n $outer_jobs ]]; then
   run_env+=("DOT_TEST_JOBS=$outer_jobs")

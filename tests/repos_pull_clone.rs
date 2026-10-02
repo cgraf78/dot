@@ -13,24 +13,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("-C")
         .arg(repo)
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "tag.gpgSign=false",
-        ])
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -40,12 +27,10 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn git_line(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(repo)
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stderr(Stdio::null())
         .output()
         .unwrap();
@@ -104,7 +89,7 @@ fn path_modes_validate_content_shape_and_safe_paths() {
     let repo = Repo::new("clone-path-modes");
     let file_oid = repo.oid("file.txt");
     let nested_oid = repo.oid("sub/nested.txt");
-    let mut child = Command::new("git")
+    let mut child = dot_test_support::git()
         .arg("-C")
         .arg(&repo.root)
         .args(["hash-object", "--stdin"])

@@ -9,7 +9,7 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use dot::errors::Error;
 use dot::init_client_command as cmd;
@@ -51,7 +51,7 @@ impl Fixture {
 
 /// Run git for fixtures; asserts success, silences output.
 fn git(args: &[&str]) {
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .stdin(Stdio::null())
@@ -118,7 +118,7 @@ fn repo_identity(url: &str) -> String {
 
 /// Real commit at `branch` in the origin fixture.
 fn origin_commit(origin: &Path, branch: &str) -> String {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .args(["-C", path_str(origin), "rev-parse", branch])
         .stdin(Stdio::null())
         .output()

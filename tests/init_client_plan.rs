@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use dot::init_client_candidate as candidate;
 use dot::init_client_plan as plan;
@@ -78,7 +78,7 @@ fn row(path: &str) -> String {
 fn git(args: &[&str]) {
     // No user hooks or signing: a host commit hook (a spell checker, say)
     // must not judge fixture content such as a deliberately misspelled key.
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args([
             "-c",

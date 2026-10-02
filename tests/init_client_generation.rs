@@ -7,7 +7,7 @@
 //! temp names and git stores never collide.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use dot::init_client_generation as generation;
 use dot::temp::{self, MoveCache};
@@ -311,7 +311,7 @@ fn marker_matches_rejects_file_git_dir() {
 /// identical across twin sides, so both engines bind the same
 /// branch tip.
 fn fixture_repo(path: &Path) -> String {
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .arg("init")
         .arg("-q")
         .arg("-b")
@@ -332,10 +332,8 @@ fn fixture_repo(path: &Path) -> String {
         ("GIT_COMMITTER_NAME", "t"),
         ("GIT_COMMITTER_EMAIL", "t@t"),
         ("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z"),
-        ("GIT_CONFIG_NOSYSTEM", "1"),
-        ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ];
-    let mut add = Command::new("git");
+    let mut add = dot_test_support::git();
     add.arg("-C")
         .arg(path)
         .args(["add", "-A"])
@@ -346,7 +344,7 @@ fn fixture_repo(path: &Path) -> String {
         add.env(key, value);
     }
     assert!(add.status().expect("git add").success(), "git add");
-    let mut commit = Command::new("git");
+    let mut commit = dot_test_support::git();
     commit
         .arg("-C")
         .arg(path)
@@ -355,8 +353,6 @@ fn fixture_repo(path: &Path) -> String {
             "user.name=t",
             "-c",
             "user.email=t@t",
-            "-c",
-            "commit.gpgsign=false",
             "commit",
             "-q",
             "--no-verify",
@@ -370,7 +366,7 @@ fn fixture_repo(path: &Path) -> String {
         commit.env(key, value);
     }
     assert!(commit.status().expect("git commit").success(), "git commit");
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "HEAD"])
@@ -502,7 +498,7 @@ fn set_git_identity_rejects_missing_dir() {
 /// value plus the clamped modes of two metadata files. Paths never
 /// leave the harness, so twin sides compare directly.
 fn configured_probe(git_dir: &Path) -> (String, u32, u32) {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg(format!("--git-dir={}", git_dir.display()))
         .args(["config", "--local", "--get", "core.sharedRepository"])
         .env("LC_ALL", "C")

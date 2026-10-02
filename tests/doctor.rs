@@ -943,7 +943,7 @@ fn signal_interrupts_backpressured_doctor_rendering() {
 }
 
 fn git(cwd: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let output = dot_test_support::git()
         .arg("-C")
         .arg(cwd)
         .args(args)
@@ -973,7 +973,7 @@ fn origin(scope: &Path) -> std::path::PathBuf {
         &seed,
         &["-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture"],
     );
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .args(["init", "--bare", "-q"])
         .arg(&origin)
         .status()
@@ -1118,7 +1118,7 @@ fn healthy_legacy_client_matches_without_the_old_engine() {
     let home = TempDir::new("doctor-native-legacy-home").expect("home");
     let state = TempDir::new("doctor-native-legacy-state").expect("state");
     let origin = origin(scope.path());
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .args(["clone", "--bare", "-q"])
         .arg(&origin)
         .arg(home.path().join(".dotfiles"))
@@ -1177,7 +1177,7 @@ fn recorded_client_identity_mismatch_refuses_without_the_old_engine() {
         home.path().join(".dotfiles-moved"),
     )
     .expect("move client git directory");
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .args(["init", "--bare", "-q"])
         .arg(home.path().join(".dotfiles"))
         .status()
@@ -2139,7 +2139,7 @@ fn linked_worktree_overlay_matches_without_the_old_engine() {
     let state = TempDir::new("doctor-native-linked-state").expect("state");
     let origin = origin(scope.path());
     let main = scope.path().join("main");
-    let status = Command::new("git")
+    let status = dot_test_support::git()
         .args(["clone", "-q"])
         .arg(&origin)
         .arg(&main)
