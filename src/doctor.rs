@@ -884,7 +884,8 @@ fn extensions(
     record_rejected(
         emit.recorder(),
         &discovery.rejected,
-        &trust.home,
+        &trust,
+        overlays,
         overlays_unresolved,
     );
     if let Some(error) = discovery.error {
@@ -948,25 +949,38 @@ fn extensions(
     dispatch_extensions(&discovery.specs, jobs, &execute, &abort, emit).max(status)
 }
 
-/// Failure rows for refused doctor extensions. Links (dangling, or into a
-/// checkout that is not an active overlay's) are almost always overlay
+/// Failure rows for refused doctor extensions. Links that are dangling or
+/// that the overlay manifest does not authorize are almost always overlay
 /// extensions waiting for the link phase: a pull renamed them, or the
 /// overlays did not resolve this run. They share one row naming them all,
 /// because one cause (and one `dot update`) covers every one; per-link rows
-/// blamed owners and modes that are fine. A regular file that fails trust is
-/// a real local problem and keeps a row of its own.
+/// blamed owners and modes that are fine. An authorized link whose target
+/// fails trust (a writable checkout, say), and a regular file that does, is
+/// a real local problem that `dot update` will not fix: a row of its own.
 fn record_rejected(
     recorder: &mut Recorder,
     rejected: &[PathBuf],
-    home: &str,
+    trust: &crate::extension_trust::Inputs,
+    overlays: &[String],
     overlays_unresolved: bool,
 ) {
+    let home = trust.home.as_str();
     let key = |script: &Path| {
         let name = script.file_name().unwrap_or(script.as_os_str()).as_bytes();
         String::from_utf8_lossy(crate::doctor_coordinator::extension_key(name)).into_owned()
     };
     let (links, files): (Vec<&PathBuf>, Vec<&PathBuf>) = rejected.iter().partition(|script| {
-        std::fs::symlink_metadata(script).is_ok_and(|meta| meta.file_type().is_symlink())
+        let link =
+            std::fs::symlink_metadata(script).is_ok_and(|meta| meta.file_type().is_symlink());
+        let dangling = std::fs::metadata(script).is_err();
+        link && (dangling
+            || !crate::extension_trust::symlink_authorized(
+                script,
+                home,
+                &trust.manifest,
+                overlays,
+                trust.euid,
+            ))
     });
     if !links.is_empty() {
         let message = match links.as_slice() {
@@ -991,17 +1005,26 @@ fn record_rejected(
         } else {
             "run dot update to relink overlay extensions"
         };
-        let detail = format!(
-            "{subject} not linked from an active overlay (dangling or retired links); {next}"
-        );
+        let kind = if links.len() == 1 {
+            "a dangling or retired link"
+        } else {
+            "dangling or retired links"
+        };
+        let detail = format!("{subject} not linked from an active overlay ({kind}); {next}");
         recorder.fail(message.as_bytes(), Some(detail.as_bytes()));
     }
     for script in files {
         let message = format!("{} doctor extension refused", key(script));
-        let detail = format!(
-            "{} fails the extension trust checks; check its owner and mode",
-            crate::doctor_paths::tilde(&script.to_string_lossy(), home)
-        );
+        let shown = crate::doctor_paths::tilde(&script.to_string_lossy(), home);
+        let link =
+            std::fs::symlink_metadata(script).is_ok_and(|meta| meta.file_type().is_symlink());
+        let detail = if link {
+            format!(
+                "{shown} links to a file that fails the extension trust checks; check its owner and mode"
+            )
+        } else {
+            format!("{shown} fails the extension trust checks; check its owner and mode")
+        };
         recorder.fail(message.as_bytes(), Some(detail.as_bytes()));
     }
 }
