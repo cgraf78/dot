@@ -5,7 +5,9 @@
 //! `Some`, including an empty detail. Both empty and colored palettes are
 //! exercised over the complete message and detail matrices.
 
-use dot::doctor_runtime::{Counts, Palette, fail, ok, resolve_palette, section, skip, warn};
+use dot::doctor_runtime::{
+    Counts, Kind, Palette, Record, fail, info, ok, render, resolve_palette, section, skip, warn,
+};
 
 /// Messages exercised for every rendering function, as raw bytes:
 /// plain, empty, spaced, percent/paren (printf-hostile), multibyte,
@@ -185,5 +187,56 @@ fn ansi_slots_pin_shell_escapes() {
             warn: 0,
             fail: 0,
         }
+    );
+}
+
+#[test]
+fn empty_detail_renders_like_an_omitted_one() {
+    // Extensions pass `"$detail"` even when it is empty; that used to render
+    // a bare `()` trailer or an empty indented detail line.
+    for palette in [Palette::empty(), marker_palette()] {
+        let mut counts = Counts::new();
+        let mut unused = Counts::new();
+        assert_eq!(
+            ok(&mut counts, &palette, b"m", Some(b"")),
+            ok(&mut unused, &palette, b"m", None)
+        );
+        assert_eq!(
+            warn(&mut counts, &palette, b"m", Some(b"")),
+            warn(&mut unused, &palette, b"m", None)
+        );
+        assert_eq!(
+            fail(&mut counts, &palette, b"m", Some(b"")),
+            fail(&mut unused, &palette, b"m", None)
+        );
+        assert_eq!(skip(&palette, b"m", Some(b"")), skip(&palette, b"m", None));
+        assert_eq!(info(&palette, b"m", Some(b"")), info(&palette, b"m", None));
+        // Counting is unchanged by the detail.
+        assert_eq!(counts, unused);
+    }
+    assert_eq!(
+        ok(&mut Counts::new(), &Palette::empty(), b"m", Some(b"")),
+        b"  \xe2\x9c\x93 m\n"
+    );
+}
+
+#[test]
+fn info_rows_render_inline_and_never_count() {
+    assert_eq!(
+        info(&Palette::empty(), b"fact", Some(b"value")),
+        "  • fact (value)\n".as_bytes()
+    );
+    assert_eq!(
+        info(&marker_palette(), b"fact", Some(b"value")),
+        "  <D>•<R> fact <D>(value)<R>\n".as_bytes()
+    );
+    let rows = [
+        Record::info("fact", Some("value".to_string())),
+        Record::ok("check", None),
+    ];
+    assert_eq!(rows[0].kind, Kind::Info);
+    assert_eq!(
+        render(&rows, &Palette::empty()),
+        "  • fact (value)\n  ✓ check\n".as_bytes()
     );
 }

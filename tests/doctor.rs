@@ -1695,7 +1695,153 @@ fn unsafe_and_malformed_extensions_match_without_the_old_engine() {
 }
 
 #[test]
-fn first_unsafe_extension_precedes_later_malformed_identity() {
+fn hung_extension_times_out_and_later_extensions_still_run() {
+    // C2: one hung extension used to block every later section until it
+    // ended on its own.
+    let (home, state) = doctor_extension_fixture(
+        "timeout",
+        &[
+            (
+                "10-hangs.sh".to_string(),
+                b"doctor() {\n  dot_doctor_section 'Hangs'\n  dot_doctor_ok 'before the hang'\n  sleep 30 &\n  printf '%s\\n' \"$!\" >\"$HOME/hung-pid\"\n  wait\n}\n".to_vec(),
+            ),
+            (
+                "20-after.sh".to_string(),
+                b"doctor() {\n  dot_doctor_section 'After'\n  dot_doctor_ok 'later extension ran'\n}\n".to_vec(),
+            ),
+        ],
+    );
+    let started = std::time::Instant::now();
+    let (output, clean) = doctor_with_env(&home, &state, &[("DOT_DOCTOR_TIMEOUT", "1")]);
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  ✓ before the hang\n"), "{stdout}");
+    assert!(
+        stdout.contains("  ✗ 10-hangs doctor extension timed out\n    stopped after 1s; set DOT_DOCTOR_TIMEOUT to raise the limit\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("  ✓ later extension ran\n"), "{stdout}");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "doctor waited for the hung extension: {elapsed:?}"
+    );
+    assert!(clean, "the stopped extension left scratch state");
+    // The whole session was stopped, not just abandoned.
+    let pid: i32 = std::fs::read_to_string(home.path().join("hung-pid"))
+        .expect("hung pid")
+        .trim()
+        .parse()
+        .expect("numeric pid");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while process_live(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!process_live(pid), "hung extension process {pid} survived");
+}
+
+#[test]
+fn dangling_extension_link_is_refused_alone() {
+    // A pull that renames an overlay extension leaves a dangling link until
+    // the link phase runs; that used to fail discovery and run nothing.
+    let (home, state) = doctor_extension_fixture(
+        "dangling",
+        &[(
+            "10-good.sh".to_string(),
+            b"doctor() {\n  dot_doctor_section 'Good'\n  dot_doctor_ok 'good extension ran'\n}\n"
+                .to_vec(),
+        )],
+    );
+    let directory = home.path().join("extensions/doctor.d");
+    std::os::unix::fs::symlink(
+        home.path().join("renamed-away.sh"),
+        directory.join("20-gone.sh"),
+    )
+    .expect("dangling link");
+    let (output, clean) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
+    assert!(
+        stdout.contains("  ✗ 20-gone doctor extension refused\n    ~/extensions/doctor.d/20-gone.sh is a dangling link; run dot update to relink overlay extensions\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("discovery failed"), "{stdout}");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert!(clean);
+}
+
+#[test]
+fn untrusted_extension_is_refused_without_running() {
+    // Trust still gates every script, just one at a time.
+    let (home, state) = doctor_extension_fixture(
+        "untrusted",
+        &[
+            (
+                "10-good.sh".to_string(),
+                b"doctor() {\n  dot_doctor_ok 'good extension ran'\n}\n".to_vec(),
+            ),
+            (
+                "20-writable.sh".to_string(),
+                b"doctor() {\n  printf ran >\"$HOME/untrusted-ran\"\n}\n".to_vec(),
+            ),
+        ],
+    );
+    seal(
+        &home.path().join("extensions/doctor.d/20-writable.sh"),
+        0o666,
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
+    assert!(
+        stdout.contains("  ✗ 20-writable doctor extension refused\n    ~/extensions/doctor.d/20-writable.sh fails the extension trust checks"),
+        "{stdout}"
+    );
+    assert!(!home.path().join("untrusted-ran").exists());
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn info_rows_and_empty_details_render_without_counting() {
+    // C3/C4: an empty detail renders like an omitted one, and informational
+    // rows render but never count. The guarded form is how an extension that
+    // must also run under an older coordinator calls the newer helper.
+    let body = |info: bool| {
+        let mut body = String::from(
+            "doctor() {\n  dot_doctor_section 'Facts'\n  dot_doctor_ok 'no detail' ''\n  dot_doctor_warn 'empty warning' ''\n",
+        );
+        if info {
+            body.push_str("  dot_doctor_info 'selected thing' 'value'\n  if declare -F dot_doctor_info >/dev/null; then dot_doctor_info 'guarded'; else dot_doctor_ok 'guarded'; fi\n");
+        }
+        body.push_str("}\n");
+        vec![("10-facts.sh".to_string(), body.into_bytes())]
+    };
+    let (home, state) = doctor_extension_fixture("info", &body(true));
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  ✓ no detail\n"), "{stdout}");
+    assert!(stdout.contains("  ⚠ empty warning\n  •"), "{stdout}");
+    assert!(!stdout.contains("()"), "{stdout}");
+    assert!(stdout.contains("  • selected thing (value)\n"), "{stdout}");
+    assert!(stdout.contains("  • guarded\n"), "{stdout}");
+    let (home_plain, state_plain) = doctor_extension_fixture("info-plain", &body(false));
+    let (plain, _) = doctor_with_env(&home_plain, &state_plain, &[]);
+    let summary = |out: &str| {
+        out.lines()
+            .find(|line| line.contains(" passed · "))
+            .map(str::to_string)
+            .expect("summary line")
+    };
+    assert_eq!(
+        summary(&stdout),
+        summary(&String::from_utf8_lossy(&plain.stdout)),
+        "informational rows must not change the counts"
+    );
+}
+
+#[test]
+fn unsafe_extension_is_refused_beside_a_malformed_identity() {
     let home = TempDir::new("doctor-native-extension-order-home").expect("home");
     let state = TempDir::new("doctor-native-extension-order-state").expect("state");
     let root = home.path().join("extensions");
@@ -1714,8 +1860,22 @@ fn first_unsafe_extension_precedes_later_malformed_identity() {
     seal(&directory.join("10-unsafe.sh"), 0o666);
     seal(&directory.join("Bad.sh"), 0o644);
 
+    // The unsafe script is refused on its own; the malformed identity still
+    // fails discovery as a whole.
     let (shell, native) = pair(&home, &state);
-    assert!(String::from_utf8_lossy(&shell.stderr).contains("unsafe doctor extension"));
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("10-unsafe doctor extension refused"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("doctor extension discovery failed"),
+        "{stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&native.stderr)
+            .contains("invalid doctor extension identity: Bad.sh")
+    );
     assert_pair(&shell, &native);
 }
 

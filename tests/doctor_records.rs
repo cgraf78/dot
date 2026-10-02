@@ -1,6 +1,6 @@
 //! Native contracts for doctor extension result records.
 
-use dot::doctor_records::{Error, fail, ok, read, record, section, skip, warn};
+use dot::doctor_records::{Error, fail, info, ok, read, record, section, skip, warn};
 use dot::doctor_runtime::{Kind, Palette, render};
 use dot_test_support::TempDir;
 
@@ -15,7 +15,8 @@ fn render_empty_message_agrees() {
     let (_dir, path) = fixture("records-empty", b"ok\t\t\n");
     let records = read(&path).expect("read");
     assert_eq!(records.len(), 1);
-    assert_eq!(render(&records, &Palette::empty()), b"  \xe2\x9c\x93  ()\n");
+    // An empty detail renders like an omitted one (no bare `()`).
+    assert_eq!(render(&records, &Palette::empty()), b"  \xe2\x9c\x93 \n");
 }
 
 #[test]
@@ -59,11 +60,15 @@ fn doctor_record_rows_agree() {
     warn(Some(&path), &[b"warn", b"detail"]).expect("warn");
     fail(Some(&path), &[b"fail"]).expect("fail");
     skip(Some(&path), &[b"skip", b""]).expect("skip");
+    info(Some(&path), &[b"info", b"fact"]).expect("info");
     record(Some(&path), b"future", b"message", b"detail").expect("unknown kind");
     let records = read(&path).expect("read");
-    assert_eq!(records.len(), 6);
+    assert_eq!(records.len(), 7);
     assert_eq!(records[0].kind, Kind::Section);
-    assert_eq!(records[5].kind, Kind::Fail);
+    assert_eq!(records[5].kind, Kind::Info);
+    assert_eq!(records[5].detail, Some(b"fact".to_vec()));
+    assert_eq!(records[6].kind, Kind::Fail);
+    assert_eq!(info(Some(&path), &[]), Err(Error::Invalid));
     assert_eq!(record(None, b"ok", b"m", b"d"), Err(Error::NoResultFile));
     assert_eq!(ok(Some(&path), &[]), Err(Error::Invalid));
     assert_eq!(section(Some(&path), &[b"a", b"b"]), Err(Error::Invalid));

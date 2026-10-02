@@ -347,6 +347,37 @@ pub(crate) fn run_with_runtime(
                 );
                 return EXIT_ERROR;
             }
+            // Doctor's arguments are settled before configuration loads, so
+            // `dot doctor --help` works even when the config is what is broken.
+            if selected == Command::Doctor {
+                let raw: Vec<Vec<u8>> = rest.iter().map(argv_bytes).collect();
+                let refs: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
+                let request = crate::doctor::parse_args(&refs);
+                // The re-exec guard still precedes everything doctor prints.
+                if request != crate::doctor::Request::Run {
+                    if let Err(failure) = crate::startup::check_reexec(runtime) {
+                        let _ = stderr.write_all(failure.line().as_bytes());
+                        let _ = stderr.write_all(b"\n");
+                        return failure.code();
+                    }
+                }
+                match request {
+                    crate::doctor::Request::Run => {}
+                    crate::doctor::Request::Help => {
+                        return if stdout.write_all(crate::doctor::USAGE.as_bytes()).is_err() {
+                            EXIT_ERROR
+                        } else {
+                            EXIT_SUCCESS
+                        };
+                    }
+                    crate::doctor::Request::Unexpected(arg) => {
+                        let _ = stderr.write_all(b"dot doctor: unexpected argument: ");
+                        let _ = stderr.write_all(&arg);
+                        let _ = stderr.write_all(b"\nRun `dot doctor --help` for usage.\n");
+                        return EXIT_USAGE;
+                    }
+                }
+            }
             let config = match crate::startup::check(runtime) {
                 Ok(config) => config,
                 Err(failure) => {

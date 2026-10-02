@@ -1,41 +1,26 @@
-//! Doctor orchestration: the load boundary,
-//! the runtime and engine-source checks, one extension run, and the
-//! `_dot_doctor` coordinator.
+//! Doctor orchestration: the runtime and engine-source checks, the
+//! [`Recorder`] every check files through, and one extension run (scratch
+//! lifecycle, overlay context, worker seam, and tail records).
 //!
-//! Owns `_dot_doctor_load`
-//! (~line 17), `_dr_check_runtime` (~line 36),
-//! `_dr_check_engine_source` (~line 62),
-//! `_dot_doctor_run_extension` (~line 135), and `_dot_doctor`
-//! (~line 179). Neighboring pieces stay with their focused modules:
-//! `_dot_doctor_extension_specs` and `_dot_doctor_render_records`
-//! (discovery and result dispatch), the `_dr_*` color/tty rendering
-//! (`doctor_runtime`), `_dr_tilde` (`doctor_paths`), the
-//! kernel checks (`repos`, `lock`, `provider`, `overlays`, `merges`
-//! modules), and the worker spawn (`extension_worker`).
+//! Neighboring pieces stay with their focused modules: extension discovery
+//! and result dispatch (`doctor_coordinator`, `doctor_records`), row
+//! rendering and colors (`doctor_runtime`), path abbreviation
+//! (`doctor_paths`), the built-in checks (`doctor_checks`), the worker
+//! spawn (`hook_worker`), and the production coordinator that sequences
+//! all of them (`doctor`).
 //!
-//! Parity decisions:
-//! - Results flow as re-exported canonical [`Record`] rows (kind, message, detail) with
-//!   shell `$#` arity: `detail` is `None` for one-argument calls and
-//!   `Some` (possibly empty) for two-argument calls. [`Recorder`]
-//!   mirrors the `_DR_*_COUNT` effects (`ok`/`warn`/`fail` count,
-//!   `skip`/`section` do not).
+//! - Results flow as canonical [`Record`] rows (kind, message, detail).
+//!   [`Recorder`] keeps the pass/warn/fail counts (`ok`/`warn`/`fail`
+//!   count; `skip`, `info`, and `section` do not).
 //! - [`Recorder::render`] reproduces the deterministic pipe projection used
-//!   by differential tests. Production renders filed prefixes through
-//!   `doctor_runtime::render` with the invocation palette as checks stream;
-//!   palette policy remains owned by `doctor_runtime`, while title/summary
-//!   styling remains in `ui`.
-//! - Text travels as bytes (`&[u8]` / `Vec<u8]`): messages carry
-//!   paths that may be non-UTF8, and `tr` / `printf` copy bytes
-//!   verbatim.
-//! - Sourcing itself is not portable: [`Loader`] models the
-//!   `_DOT_DOCTOR_LOADED` idempotence plus the ordered section path
-//!   list and a presence check, never the `.` builtin.
-//! - Worker execution and result-file dispatch arrive as injected
-//!   seams (the `worker` hook taking [`WorkerInvocation`] and the
-//!   `render` hook): the worker spawn and the record-file parser
-//!   belong to other modules, but
-//!   the temp lifecycle, context step, tail records, and cleanup
-//!   sequencing here are real.
+//!   by tests. Production renders filed prefixes through
+//!   `doctor_runtime::render` with the invocation palette as checks stream.
+//! - Text travels as bytes (`&[u8]` / `Vec<u8>`): messages carry paths that
+//!   may be non-UTF8.
+//! - Worker execution and result-file dispatch arrive as injected seams (the
+//!   `worker` hook taking [`WorkerInvocation`] and the `render` hook); the
+//!   temp lifecycle, context step, tail records, and cleanup sequencing here
+//!   are real.
 //!
 //! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
@@ -107,13 +92,18 @@ impl Recorder {
         self.push(Kind::Skip, message, detail);
     }
 
+    /// File an informational row; counts unchanged.
+    pub fn info(&mut self, message: &[u8], detail: Option<&[u8]>) {
+        self.push(Kind::Info, message, detail);
+    }
+
     /// File one already-built canonical record and update its aggregate.
     pub fn record(&mut self, record: Record) {
         match record.kind {
             Kind::Ok => self.counts.pass += 1,
             Kind::Warn => self.counts.warn += 1,
             Kind::Fail | Kind::Unknown => self.counts.fail += 1,
-            Kind::Section | Kind::Skip => {}
+            Kind::Section | Kind::Skip | Kind::Info => {}
         }
         self.records.push(record);
     }
@@ -137,90 +127,6 @@ impl Recorder {
     pub fn render(&self) -> Vec<u8> {
         crate::doctor_runtime::render(&self.records, &crate::doctor_runtime::Palette::empty())
     }
-}
-
-/// The seven section files `_dot_doctor_load` sources, in order:
-/// `runtime.sh`, `paths.sh`, `repos.sh`, `lock.sh`, `provider.sh`,
-/// `overlays.sh`, `merges.sh`.
-pub const SECTION_FILES: [&str; 7] = [
-    "runtime.sh",
-    "paths.sh",
-    "repos.sh",
-    "lock.sh",
-    "provider.sh",
-    "overlays.sh",
-    "merges.sh",
-];
-
-/// The ordered section paths for `doctor_dir`
-/// (`$_DOT_DOCTOR_DIR`), mirroring the seven `.` lines: sourcing
-/// itself stays with the shell, so the port publishes the path
-/// list the loader consumes.
-pub fn section_paths(doctor_dir: &Path) -> [PathBuf; 7] {
-    [
-        doctor_dir.join(SECTION_FILES[0]),
-        doctor_dir.join(SECTION_FILES[1]),
-        doctor_dir.join(SECTION_FILES[2]),
-        doctor_dir.join(SECTION_FILES[3]),
-        doctor_dir.join(SECTION_FILES[4]),
-        doctor_dir.join(SECTION_FILES[5]),
-        doctor_dir.join(SECTION_FILES[6]),
-    ]
-}
-
-/// True when every section file exists as a regular file under
-/// `doctor_dir`, so a loader failure surfaces before any `.`
-/// line runs.
-pub fn sections_present(doctor_dir: &Path) -> bool {
-    section_paths(doctor_dir).iter().all(|path| path.is_file())
-}
-
-/// Models `_DOT_DOCTOR_LOADED`: the first [`Loader::load`] publishes
-/// the section paths and marks the loader; later calls are a no-op
-/// returning `None`, like `[[ $_DOT_DOCTOR_LOADED -eq 0 ]] || return 0`.
-#[derive(Debug, Clone, Default)]
-pub struct Loader {
-    /// Whether the section paths were already published.
-    loaded: bool,
-}
-
-impl Loader {
-    /// A fresh loader, like `_DOT_DOCTOR_LOADED=0` at source time.
-    pub fn new() -> Self {
-        Loader::default()
-    }
-
-    /// Whether [`Loader::load`] already published once.
-    pub fn is_loaded(&self) -> bool {
-        self.loaded
-    }
-
-    /// Publish the ordered section paths for `doctor_dir` on the
-    /// first call and mark the loader; return `None` afterwards.
-    pub fn load(&mut self, doctor_dir: &Path) -> Option<[PathBuf; 7]> {
-        if self.loaded {
-            return None;
-        }
-        self.loaded = true;
-        Some(section_paths(doctor_dir))
-    }
-}
-
-/// `cd -P -- path && pwd -P || true` for directories: the physical
-/// path with every component resolved, or `None` when the shell
-/// would print nothing (empty input, missing path, non-directory,
-/// or an unresolvable chain).
-pub fn physical_dir(path: &[u8]) -> Option<Vec<u8>> {
-    use std::os::unix::ffi::OsStrExt as _;
-    if path.is_empty() {
-        return None;
-    }
-    let candidate = Path::new(std::ffi::OsStr::from_bytes(path));
-    let resolved = std::fs::canonicalize(candidate).ok()?;
-    if !resolved.is_dir() {
-        return None;
-    }
-    Some(resolved.as_os_str().as_bytes().to_vec())
 }
 
 /// `_dr_tilde` (owned by the `doctor_paths` lane, mirrored here only
@@ -329,7 +235,8 @@ pub fn check_runtime(
             rec.fail(b"Git runtime is unavailable", None);
         }
     }
-    rec.ok(b"configuration version", Some(&snapshot.config_version));
+    // A configuration fact, not a check: informational, never counted.
+    rec.info(b"configuration version", Some(&snapshot.config_version));
     for unknown in &snapshot.unknown_config_keys {
         let detail = format!(
             "{} on line {} ({})",
@@ -375,47 +282,6 @@ pub struct EngineSnapshot {
     pub development_real: Option<Vec<u8>>,
     /// `${DOT_IGNORE_DEV_CHECKOUT:-0} == 1`.
     pub ignore_dev_checkout: bool,
-}
-
-impl EngineSnapshot {
-    /// Resolve an [`EngineSnapshot`] from the process environment,
-    /// mirroring the shell defaulting and `cd -P` probes:
-    /// `SHDEPS_INSTALL_DIR` / `SHDEPS_GIT_DEV_DIR` fall back to
-    /// `$HOME/.local/share` / `$HOME/git` when unset or empty
-    /// (`${var:-default}`), and unresolvable directories resolve to
-    /// `None` (the source keeps its raw fallback, like the shell's
-    /// `|| source_real=$source`).
-    pub fn from_env(source_raw: &[u8], home: &[u8]) -> Self {
-        let base = |name: &str, fallback_leaf: &[u8]| -> Vec<u8> {
-            std::env::var_os(name)
-                .filter(|value| !value.is_empty())
-                .map(|value| {
-                    use std::os::unix::ffi::OsStrExt as _;
-                    value.as_os_str().as_bytes().to_vec()
-                })
-                .unwrap_or_else(|| {
-                    let mut root = home.to_vec();
-                    root.extend_from_slice(fallback_leaf);
-                    root
-                })
-        };
-        let mut managed_raw = base("SHDEPS_INSTALL_DIR", b"/.local/share");
-        managed_raw.extend_from_slice(b"/cgraf78/dot");
-        let mut development_raw = base("SHDEPS_GIT_DEV_DIR", b"/git");
-        development_raw.extend_from_slice(b"/dot");
-        let source_real = physical_dir(source_raw).unwrap_or_else(|| source_raw.to_vec());
-        let ignore_dev_checkout =
-            std::env::var_os("DOT_IGNORE_DEV_CHECKOUT").is_some_and(|value| value == "1");
-        EngineSnapshot {
-            source_raw: source_raw.to_vec(),
-            source_real,
-            managed_real: physical_dir(&managed_raw),
-            development_real: physical_dir(&development_raw),
-            managed_raw,
-            development_raw,
-            ignore_dev_checkout,
-        }
-    }
 }
 
 /// `_dr_check_engine_source`: file the bypass notice when enabled,
@@ -480,21 +346,10 @@ fn random_suffix() -> u32 {
     }
 }
 
-/// `_dot_cleanup_mktemp -d` for one extension run: a fresh `0700`
-/// directory `${TMPDIR:-/tmp}/dot.<pid>.<n>.<rand>`, mirroring the
-/// mktemp template root and directory mode. Creation races retry;
-/// other failures surface like the shell's allocator failure.
-pub fn make_temp_dir() -> std::io::Result<PathBuf> {
-    let root = std::env::var_os("TMPDIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    make_temp_dir_in(&root)
-}
-
-/// Allocate one doctor scratch directory under a caller-captured temp root.
-/// Native application code uses this form so embedded Runtime invocations do
-/// not fall through to the parent process environment.
+/// Allocate one doctor scratch directory: a fresh `0700` directory
+/// `<root>/dot.<pid>.<n>.<rand>` under a caller-captured temp root, so
+/// embedded Runtime invocations never fall through to the parent process
+/// environment. Creation races retry; other failures surface.
 pub(crate) fn make_temp_dir_in(root: &Path) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt as _;
     use std::sync::atomic::Ordering;
@@ -537,13 +392,27 @@ pub fn collapse_log(log: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// The tail of `_dot_doctor_run_extension`: a nonzero worker status
-/// files `<key> doctor extension failed`, stray log output files
-/// `<key> doctor extension wrote outside the result API`, and a
-/// quiet success files nothing. The detail is the collapsed log,
-/// always passed (possibly empty) on the failure/warn paths.
-pub fn extension_tail(rec: &mut Recorder, key: &[u8], rc: i32, log: &[u8]) {
-    if rc != 0 {
+/// The tail of one extension run: a worker stopped at its deadline files
+/// `<key> doctor extension timed out`, any other nonzero status files
+/// `<key> doctor extension failed`, stray log output files
+/// `<key> doctor extension wrote outside the result API`, and a quiet
+/// success files nothing. The detail is the collapsed log (omitted when
+/// empty); a timeout leads with the limit and how to raise it.
+pub fn extension_tail(rec: &mut Recorder, key: &[u8], exit: WorkerExit, log: &[u8]) {
+    if let Some(limit) = exit.timed_out {
+        let mut message = key.to_vec();
+        message.extend_from_slice(b" doctor extension timed out");
+        let mut detail = format!(
+            "stopped after {}s; set DOT_DOCTOR_TIMEOUT to raise the limit",
+            limit.as_secs()
+        )
+        .into_bytes();
+        if !log.is_empty() {
+            detail.extend_from_slice(b"; output: ");
+            detail.extend_from_slice(&collapse_log(log));
+        }
+        rec.fail(&message, Some(&detail));
+    } else if exit.rc != 0 {
         let mut message = key.to_vec();
         message.extend_from_slice(b" doctor extension failed");
         rec.fail(&message, Some(&collapse_log(log)));
@@ -551,6 +420,25 @@ pub fn extension_tail(rec: &mut Recorder, key: &[u8], rc: i32, log: &[u8]) {
         let mut message = key.to_vec();
         message.extend_from_slice(b" doctor extension wrote outside the result API");
         rec.warn(&message, Some(&collapse_log(log)));
+    }
+}
+
+/// How one extension worker ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerExit {
+    /// Worker status (1 when it was stopped or could not run).
+    pub rc: i32,
+    /// The per-extension deadline that stopped the worker, if it did.
+    pub timed_out: Option<std::time::Duration>,
+}
+
+impl From<i32> for WorkerExit {
+    /// A worker that ended on its own with `rc`.
+    fn from(rc: i32) -> Self {
+        WorkerExit {
+            rc,
+            timed_out: None,
+        }
     }
 }
 
@@ -573,26 +461,6 @@ pub struct WorkerInvocation<'a> {
     pub log: &'a Path,
 }
 
-/// `_dot_overlay_context_create "$temporary" doctor active none`
-/// with the caller's overlay records, resolved against the live
-/// `HOME`, euid, and clock. Returns the context path and token
-/// (`REPLY_PATH` / `REPLY_TOKEN`), or `None` exactly where the
-/// shell takes the `context unavailable` branch.
-pub fn create_context(temporary: &Path, overlays: &[Vec<u8>]) -> Option<(PathBuf, String)> {
-    let home = std::env::var_os("HOME")
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let euid = crate::temp::current_uid()?;
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as i64)
-        .unwrap_or(0);
-    crate::overlay_context::create(
-        temporary, "doctor", "active", "none", overlays, &home, euid, now_secs,
-    )
-    .ok()
-}
-
 /// Create a doctor worker context from one invocation's immutable Runtime
 /// values instead of process-global environment.
 pub fn create_context_for(
@@ -608,27 +476,11 @@ pub fn create_context_for(
     .ok()
 }
 
-/// `_dot_doctor_run_extension`: allocate scratch, create the result
-/// file, build the overlay context, run the worker through
-/// `worker`, dispatch the filed rows through `render` (the
-/// `_dot_doctor_render_records` seam, owned by another lane), file
-/// the tail record, remove the scratch directory best-effort, and
-/// return the worker status. The temp/context failure records and
-/// the early `return 1` paths mirror the shell line for line.
-pub fn run_extension(
-    rec: &mut Recorder,
-    key: &[u8],
-    script: &Path,
-    overlays: &[Vec<u8>],
-    worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> i32,
-    render: &mut dyn FnMut(&Path, &mut Recorder),
-) -> i32 {
-    let mut context = |temporary: &Path| create_context(temporary, overlays);
-    run_extension_with_context(rec, key, script, None, worker, render, &mut context)
-}
-
-/// Run one extension with context identity captured by the native
-/// invocation rather than read from process-global state.
+/// Run one extension end to end: allocate scratch, create the result file,
+/// build the overlay context from the invocation's identity (never
+/// process-global state), run the worker through `worker`, dispatch the
+/// filed rows through `render`, file the tail record, remove the scratch
+/// directory, and return the worker status (1 for allocation failures).
 #[allow(clippy::too_many_arguments)]
 pub fn run_extension_for(
     rec: &mut Recorder,
@@ -639,7 +491,7 @@ pub fn run_extension_for(
     euid: u32,
     now_secs: i64,
     temporary_root: &Path,
-    worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> i32,
+    worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> WorkerExit,
     render: &mut dyn FnMut(&Path, &mut Recorder),
 ) -> i32 {
     let mut context =
@@ -648,7 +500,7 @@ pub fn run_extension_for(
         rec,
         key,
         script,
-        Some(temporary_root),
+        temporary_root,
         worker,
         render,
         &mut context,
@@ -659,8 +511,8 @@ fn run_extension_with_context(
     rec: &mut Recorder,
     key: &[u8],
     script: &Path,
-    temporary_root: Option<&Path>,
-    worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> i32,
+    temporary_root: &Path,
+    worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> WorkerExit,
     render: &mut dyn FnMut(&Path, &mut Recorder),
     context: &mut dyn FnMut(&Path) -> Option<(PathBuf, String)>,
 ) -> i32 {
@@ -691,7 +543,7 @@ enum OutcomeState {
         scratch: Scratch,
         result: PathBuf,
         log: PathBuf,
-        rc: i32,
+        exit: WorkerExit,
     },
 }
 
@@ -720,25 +572,25 @@ pub(crate) fn execute_extension_for(
     euid: u32,
     now_secs: i64,
     temporary_root: &Path,
-    worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> i32,
+    worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> WorkerExit,
 ) -> ExtensionOutcome {
     let mut context =
         |temporary: &Path| create_context_for(temporary, overlays, home, euid, now_secs);
-    execute_extension_with_context(key, script, Some(temporary_root), worker, &mut context)
+    execute_extension_with_context(key, script, temporary_root, worker, &mut context)
 }
 
 fn execute_extension_with_context(
     key: &[u8],
     script: &Path,
-    temporary_root: Option<&Path>,
-    worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> i32,
+    temporary_root: &Path,
+    worker: &mut dyn FnMut(&WorkerInvocation<'_>) -> WorkerExit,
     context: &mut dyn FnMut(&Path) -> Option<(PathBuf, String)>,
 ) -> ExtensionOutcome {
     let outcome = |state| ExtensionOutcome {
         key: key.to_vec(),
         state,
     };
-    let scratch = match temporary_root.map_or_else(make_temp_dir, make_temp_dir_in) {
+    let scratch = match make_temp_dir_in(temporary_root) {
         Ok(dir) => Scratch(dir),
         Err(_) => return outcome(OutcomeState::TemporaryUnavailable),
     };
@@ -758,12 +610,12 @@ fn execute_extension_with_context(
         token: &token,
         log: &log,
     };
-    let rc = worker(&invocation);
+    let exit = worker(&invocation);
     outcome(OutcomeState::Ran {
         scratch,
         result,
         log,
-        rc,
+        exit,
     })
 }
 
@@ -793,115 +645,15 @@ pub(crate) fn record_extension(
             scratch,
             result,
             log,
-            rc,
+            exit,
         } => {
             render(&result, rec);
             let log_bytes = std::fs::read(&log).unwrap_or_default();
-            extension_tail(rec, &key, rc, &log_bytes);
+            extension_tail(rec, &key, exit, &log_bytes);
             drop(scratch);
-            rc
+            exit.rc
         }
     }
-}
-
-/// `dot_ui_title 'dot doctor'` under the pipe projection (no gum,
-/// non-tty): a blank line, the title, and a trailing blank line.
-pub fn doctor_title() -> Vec<u8> {
-    b"\ndot doctor\n\n".to_vec()
-}
-
-/// `dot_ui_summary_box` under the pipe projection (no gum,
-/// non-tty): the 32-wide `═` rule, the summary line, and the rule
-/// again. The color travels only to gum/tty styling, owned by the
-/// `ui` lane.
-pub fn summary_box(summary: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for _ in 0..32 {
-        out.extend_from_slice("═".as_bytes());
-    }
-    out.push(b'\n');
-    out.extend_from_slice(summary);
-    out.push(b'\n');
-    for _ in 0..32 {
-        out.extend_from_slice("═".as_bytes());
-    }
-    out.push(b'\n');
-    out
-}
-
-/// One raw discovery line of `_dot_doctor`'s specs loop:
-/// `[[ -n $spec ]] || continue`, then `IFS=$'\t' read -r key
-/// script`, where the last variable keeps the remainder, so the
-/// split happens at the FIRST tab (`script` may still contain
-/// tabs). Empty lines yield `None` (skipped).
-pub fn split_spec(line: &[u8]) -> Option<(&[u8], &[u8])> {
-    if line.is_empty() {
-        return None;
-    }
-    match line.iter().position(|byte| *byte == b'\t') {
-        Some(tab) => Some((&line[..tab], &line[tab + 1..])),
-        None => Some((line, b"".as_slice())),
-    }
-}
-
-/// One kernel check of `_dot_doctor` (`_dr_check_base_repo`,
-/// `_dr_check_update_lock`, `_dr_check_provider`,
-/// `_dr_check_overlays`, `_dr_check_merges`, owned by other lanes):
-/// files its records and returns nothing. Callers pass the five in
-/// `_dot_doctor` order.
-pub type Kernel<'a> = Box<dyn FnMut(&mut Recorder) + 'a>;
-
-/// One extension dispatch of `_dot_doctor`'s specs loop (the
-/// `_dot_doctor_run_extension` seam): files the extension records
-/// and returns the worker status; nonzero marks `status=1`.
-pub type ExtensionRunner<'a> = Box<dyn FnMut(&mut Recorder, &[u8], &[u8]) -> i32 + 'a>;
-
-/// `_dot_doctor`: write the title, file the runtime check (with its
-/// engine-source tail), run each kernel check in order, dispatch
-/// every discovered spec line (`key\tscript`, skipping blanks), and
-/// close with the blank line plus summary box. `discovery` is the
-/// `_dot_doctor_extension_specs` seam: `Err` files `doctor
-/// extension discovery failed` and marks `status=1` without looping.
-/// Returns the `[[ ... ]]` exit rule via [`overall_ok`].
-#[allow(clippy::too_many_arguments)]
-pub fn run_doctor(
-    out: &mut dyn std::io::Write,
-    rec: &mut Recorder,
-    runtime: &RuntimeSnapshot,
-    engine: &EngineSnapshot,
-    home: &[u8],
-    kernels: &mut [Kernel<'_>],
-    discovery: &Result<Vec<Vec<u8>>, ()>,
-    runner: &mut ExtensionRunner<'_>,
-) -> bool {
-    let _ = out.write_all(&doctor_title());
-    check_runtime(rec, runtime, engine, home);
-    for kernel in kernels.iter_mut() {
-        kernel(rec);
-    }
-    let mut status = 0;
-    match discovery {
-        Err(()) => {
-            rec.fail(b"doctor extension discovery failed", None);
-            status = 1;
-        }
-        Ok(specs) => {
-            for line in specs {
-                let Some((key, script)) = split_spec(line) else {
-                    continue;
-                };
-                if runner(rec, key, script) != 0 {
-                    status = 1;
-                }
-            }
-        }
-    }
-    let counts = rec.counts();
-    let summary = summary_line(counts.pass, counts.warn, counts.fail);
-    let _ = out.write_all(&rec.render());
-    let _ = out.write_all(b"\n");
-    let _ = out.write_all(&summary_box(summary.as_bytes()));
-    overall_ok(counts.fail, status)
 }
 
 #[cfg(test)]
@@ -934,36 +686,19 @@ mod tests {
         assert_eq!(collapse_log(b"a\rb\n"), b"a\rb ");
     }
 
-    #[test]
-    fn split_spec_skips_blanks_and_splits_first_tab() {
-        assert_eq!(split_spec(b""), None);
-        assert_eq!(
-            split_spec(b"a-one\t/fake/a.sh"),
-            Some((b"a-one".as_slice(), b"/fake/a.sh".as_slice()))
-        );
-        assert_eq!(
-            split_spec(b"key\tscript\twith\ttabs"),
-            Some((b"key".as_slice(), b"script\twith\ttabs".as_slice()))
-        );
-        assert_eq!(
-            split_spec(b"no-tab"),
-            Some((b"no-tab".as_slice(), b"".as_slice()))
-        );
-    }
-
     fn execute_in(root: &Path, key: &[u8], log: &'static [u8]) -> (ExtensionOutcome, PathBuf) {
         let seen = std::cell::RefCell::new(PathBuf::new());
         let mut worker = |call: &WorkerInvocation<'_>| {
             *seen.borrow_mut() = call.temporary.to_path_buf();
             std::fs::write(call.result, b"").expect("result");
             std::fs::write(call.log, log).expect("log");
-            0
+            WorkerExit::from(0)
         };
         let mut context = |temporary: &Path| Some((temporary.join("context"), "token".into()));
         let outcome = execute_extension_with_context(
             key,
             Path::new("/fixture/extension.sh"),
-            Some(root),
+            root,
             &mut worker,
             &mut context,
         );
@@ -1006,14 +741,14 @@ mod tests {
         let unavailable = execute_extension_with_context(
             b"gone",
             Path::new("/fixture/extension.sh"),
-            Some(&missing),
+            &missing,
             &mut worker,
             &mut context,
         );
         let no_context = execute_extension_with_context(
             b"lost",
             Path::new("/fixture/extension.sh"),
-            Some(root.path()),
+            root.path(),
             &mut worker,
             &mut context,
         );
