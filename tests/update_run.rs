@@ -790,6 +790,10 @@ fn unreachable_base_client(scratch: &Scratch, tag: &str) -> (PathBuf, PathBuf) {
     let (home, state) = twin_client(scratch, tag, &overlay_origin, &base_origin);
     check_update(&["update"], &home, &state);
     std::fs::rename(&base_origin, scratch.path().join("base.git.gone")).expect("hide base remote");
+    // An empty directory keeps the recorded remote identity resolvable: macOS
+    // resolves a file remote with BSD `realpath`, which refuses a missing
+    // path, so a vanished remote trips the init-identity guard before the pull.
+    std::fs::create_dir(&base_origin).expect("empty base remote");
     (home, state)
 }
 
