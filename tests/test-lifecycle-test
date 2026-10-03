@@ -116,8 +116,15 @@ while True:
         time.sleep(0.01)
     assert ready.exists(), "nested timeout target did not become ready"
     os.kill(child.pid, signal.SIGTERM)
-    stdout, stderr = child.communicate(timeout=7)
-    assert child.returncode == 143, (child.returncode, stdout, stderr)
+    # Generous on purpose: on a slow host a KILL phase that cannot certify
+    # observes past its deadline, and its own status is the useful report.
+    stdout, stderr = child.communicate(timeout=20)
+    assert child.returncode == 143, (
+        "outer wrapper did not report a clean nested-owner cancellation",
+        child.returncode,
+        stdout,
+        stderr.decode(errors="replace"),
+    )
     delivered = terms.read_text(encoding="utf-8").splitlines()
     assert delivered == [str(int(signal.SIGTERM))], (delivered, stdout, stderr)
     pid = int(target_pid.read_text(encoding="utf-8"))
@@ -172,8 +179,13 @@ while True:
         time.sleep(0.01)
     assert concurrent_terms.exists(), "inner timeout never entered its TERM phase"
     os.kill(concurrent.pid, signal.SIGTERM)
-    stdout, stderr = concurrent.communicate(timeout=7)
-    assert concurrent.returncode == 143, (concurrent.returncode, stdout, stderr)
+    stdout, stderr = concurrent.communicate(timeout=20)
+    assert concurrent.returncode == 143, (
+        "outer wrapper did not report a clean cancellation during nested TERM",
+        concurrent.returncode,
+        stdout,
+        stderr.decode(errors="replace"),
+    )
     assert concurrent_terms.read_text(encoding="utf-8").splitlines() == [
         str(int(signal.SIGTERM))
     ]
@@ -686,8 +698,14 @@ with tempfile.TemporaryDirectory() as temporary:
     pid = int(pid_text)
     pidfd = os.pidfd_open(pid)
     os.kill(child.pid, signal.SIGTERM)
-    _stdout, stderr = child.communicate(timeout=7)
-    assert child.returncode == 143, (child.returncode, stderr)
+    # Generous on purpose: on a slow host a KILL phase that cannot certify
+    # observes past its deadline, and its own status is the useful report.
+    _stdout, stderr = child.communicate(timeout=20)
+    assert child.returncode == 143, (
+        "wrapper did not report a clean cancellation past a spoofed registration",
+        child.returncode,
+        stderr.decode(errors="replace"),
+    )
     import select
     poller = select.poll()
     poller.register(pidfd, select.POLLIN)
@@ -1266,6 +1284,223 @@ with tempfile.TemporaryDirectory() as temporary:
         pass_fds=session_fds(),
     )
     assert result.returncode == 0, (result.returncode, result.stderr)
+PY
+
+# A loaded host makes every process-table snapshot slow (a Python procfs walk
+# over a few thousand rows costs 0.1-0.5 s), but certifying a KILL still needs
+# several complete snapshots. Each mode below runs the real wrapper with every
+# snapshot charged half a second of virtual time; a snapshot given less budget
+# than that is starved and comes back unavailable, as a real walk would. A
+# fixed one-second phase then leaves room for at most one post-KILL snapshot,
+# so the KILL phase must keep observing until it can certify, but only while
+# more snapshots can help. Linux-only: the modes rely on pidfd authority.
+"$timeout_python" - "$timeout_command" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+def session_fds():
+    """Owned-session descriptors a nested timeout wrapper must keep holding.
+
+    The suite coordinator advertises its lease/control sockets through the
+    environment. A child that closes those descriptors while keeping the
+    advertisement fails closed, so preserve exactly the ones still open.
+    """
+    fds = []
+    for key in (
+        "DOT_OWNED_SESSION_LEASE_FDS_V1",
+        "DOT_OWNED_SESSION_CONTROL_FDS_V1",
+    ):
+        for field in os.environ.get(key, "").split(":"):
+            if not field.isdecimal():
+                continue
+            try:
+                os.fstat(int(field))
+            except OSError:
+                continue
+            fds.append(int(field))
+    return fds
+
+if not sys.platform.startswith("linux"):
+    raise SystemExit(0)
+wrapper = sys.argv[1]
+helper = r"""
+import importlib.util, os, signal, sys, time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+loader = SourceFileLoader("dot_timeout_slow_snapshot", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+ready, mode = sys.argv[2], sys.argv[3]
+WALK = 0.5
+real_monotonic = time.monotonic
+real_snapshot = module.list_session_processes
+real_drain = module.drain_nested_supervisors
+skew = 0.0
+snapshots = 0
+def monotonic():
+    return real_monotonic() + skew
+def slow_snapshot(session_id, timeout=module.PROCESS_SNAPSHOT_TIMEOUT_SECONDS):
+    global skew, snapshots
+    snapshots += 1
+    if snapshots > 200:
+        print(f"runaway snapshots={snapshots}", file=sys.stderr, flush=True)
+        os._exit(3)
+    if timeout < WALK or (mode == "unavailable" and snapshots > 3):
+        # A starved (or broken) walk spends its budget and yields nothing.
+        skew += min(timeout, WALK)
+        return None
+    # Skew after the real walk so the walk itself sees its full budget.
+    result = real_snapshot(session_id, timeout)
+    skew += WALK
+    return result
+def broken_stop_control(deadline=None, snapshot=None, unregister=True):
+    # Stop-time drains pass their confirming snapshot; failing exactly those
+    # marks the stop sticky fail-closed without disturbing supervision.
+    if snapshot is not None:
+        return False
+    return real_drain(deadline, snapshot, unregister)
+module.time.monotonic = monotonic
+module.list_session_processes = slow_snapshot
+if mode == "fail-closed":
+    module.drain_nested_supervisors = broken_stop_control
+if mode == "unpinned":
+    # No exact authority over members, as on platforms without pidfds.
+    module.claim_member = lambda _process_info, _leader: (None, None)
+if mode == "stuck":
+    # An escaped holder keeps the session lease open after a registration,
+    # so an exact cohort can never certify.
+    module.nested_ever_registered = True
+    module.lease_closed = lambda: False
+# The target ignores TERM before writing its ready marker, so a ready marker
+# proves cleanup really reached the KILL phase. In "unpinned" mode it also
+# leaves a TERM-ignoring member in its own process group, beyond the group
+# KILL.
+program = (
+    "import os, signal, sys, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "if sys.argv[3] == 'unpinned':\n"
+    "    member = os.fork()\n"
+    "    if member == 0:\n"
+    "        os.setpgid(0, 0)\n"
+    "        time.sleep(60)\n"
+    "        os._exit(0)\n"
+    "    open(sys.argv[2], 'w', encoding='ascii').write(str(member))\n"
+    "open(sys.argv[1], 'w', encoding='ascii').write('ready')\n"
+    "time.sleep(60)\n"
+)
+member_file = Path(ready + ".member")
+target = [sys.executable, "-c", program, ready, str(member_file), mode]
+if mode == "nested":
+    # The test cancels this outer owner once the target is ready. The real
+    # inner wrapper registers as its nested owner, is murdered by the outer
+    # KILL, and its link then needs strikes before the outer can certify.
+    status = module.main(["test-timeout-v1", "30", sys.argv[1], "30", *target])
+else:
+    status = module.main(["test-timeout-v1", "2", *target])
+if member_file.exists():
+    # The unpinned member outlives cleanup by design; this helper is its
+    # subreaper, so stop and reap it here.
+    member = int(member_file.read_text(encoding="ascii"))
+    try:
+        os.kill(member, signal.SIGKILL)
+        os.waitpid(member, 0)
+    except (ChildProcessError, ProcessLookupError):
+        pass
+minimum = getattr(module, "KILL_PHASE_MIN_OBSERVATIONS", 0)
+print(
+    f"status={status} ready={Path(ready).exists()} snapshots={snapshots} minimum={minimum}",
+    file=sys.stderr,
+)
+"""
+
+def run(mode):
+    """Run one slow-snapshot cleanup; return its report fields and text."""
+    with tempfile.TemporaryDirectory() as temporary:
+        ready = Path(temporary) / "ready"
+        child = subprocess.Popen(
+            [sys.executable, "-c", helper, wrapper, str(ready), mode],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            pass_fds=session_fds(),
+        )
+        if mode == "nested":
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and child.poll() is None:
+                try:
+                    if ready.read_text(encoding="ascii"):
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.01)
+            if child.poll() is None:
+                child.send_signal(signal.SIGTERM)
+        try:
+            _stdout, stderr = child.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            _stdout, stderr = child.communicate()
+    report = stderr.decode(errors="replace")
+    lines = report.strip().splitlines()
+    fields = dict(
+        item.split("=", 1) for item in (lines[-1].split() if lines else ()) if "=" in item
+    )
+    assert child.returncode == 0 and fields.get("ready") == "True", (
+        f"slow-snapshot helper failed in {mode} mode", child.returncode, report,
+    )
+    return fields, report
+
+def snapshots(fields):
+    return int(fields.get("snapshots", "0"))
+
+# A verified KILL must be reported as such. The TERM phase never runs over:
+# two TERM snapshots, the KILL phase's first, at most one starved, and two
+# empties.
+fields, report = run("certify")
+assert fields.get("status") == "124", (
+    "slow snapshots turned a verified KILL into incomplete cleanup", report,
+)
+assert snapshots(fields) <= 7, ("TERM phase ran over", report)
+
+# The original failure: a murdered nested owner's link needs its strikes.
+fields, report = run("nested")
+assert fields.get("status") == "143", (
+    "slow snapshots turned a verified nested cancellation into incomplete cleanup",
+    report,
+)
+
+# Sticky fail-closed state cannot certify, so the KILL phase ends at its
+# deadline: at most two snapshots per phase.
+fields, report = run("fail-closed")
+assert fields.get("status") == "125", ("broken stop-time control did not fail closed", report)
+assert snapshots(fields) <= 4, ("KILL phase ran over despite sticky fail-closed state", report)
+
+# A live member this owner cannot signal could only exit on its own; running
+# over to wait for that would turn the fail-closed outcome into a pass.
+fields, report = run("unpinned")
+assert fields.get("status") == "125", ("an unpinned live member did not fail closed", report)
+assert snapshots(fields) <= 4, ("KILL phase ran over for a member it cannot signal", report)
+
+# A snapshot that fails even with its own full budget ends overtime at once.
+fields, report = run("unavailable")
+assert fields.get("status") == "125", ("unavailable snapshots did not fail closed", report)
+assert snapshots(fields) <= 6, ("KILL phase kept retrying unavailable snapshots", report)
+
+# An exact cohort that never certifies stops at the declared minimum: one or
+# two TERM snapshots, the KILL phase's first, at most one starved, then the
+# minimum of complete ones.
+fields, report = run("stuck")
+minimum = int(fields.get("minimum", "0"))
+assert fields.get("status") == "125", ("a stuck cohort did not fail closed", report)
+assert minimum + 2 <= snapshots(fields) <= minimum + 4, (
+    "KILL phase overtime did not stop at its minimum", report,
+)
 PY
 
 timeout_fixture=$DOT_TEST_TMP/timeout-helper
