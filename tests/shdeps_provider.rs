@@ -3691,6 +3691,43 @@ fn release_handoff_prunes_once_without_leaking_the_policy() {
 }
 
 #[test]
+fn release_handoff_keeps_the_prune_default_under_cron() {
+    // The continuation re-reads the policy from the environment it is
+    // handed: an unset policy must stay unset there (so the default cron
+    // prune runs once, in the continuation), and an explicit `never` or a
+    // typo must reach it (so neither turns into the default after the
+    // exec). The typo warns once across both halves.
+    let typo = "  warning: ignoring DOT_SHDEPS_PRUNE=weekly; expected never, cron, or always\n";
+    for (mode, expect_prune, stderr) in [
+        (None, true, ""),
+        (Some("never"), false, ""),
+        (Some("weekly"), false, typo),
+    ] {
+        let fixture = Fixture::release("shdeps-release-handoff-default-prune");
+        let next = fixture.stage_release("next-release", dot::version::COMMIT, true);
+        let mut command = release_update(&fixture, &[&next]);
+        command.arg("--cron");
+        if let Some(mode) = mode {
+            command.env("DOT_SHDEPS_PRUNE", mode);
+        }
+        let output = command.output().expect("cron release handoff update");
+        assert_eq!(output.status.code(), Some(0), "{mode:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{mode:?}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            stderr,
+            "{mode:?}: {output:?}"
+        );
+        assert_eq!(provider_parents(&fixture).len(), 2, "{mode:?}");
+        assert_eq!(
+            prune_record(&fixture),
+            expect_prune.then(|| expected_prune_record(&fixture, true)),
+            "mode {mode:?}"
+        );
+    }
+}
+
+#[test]
 fn release_handoff_reports_unknown_config_keys_once() {
     // The first half hands the lines it printed to the continuation, which
     // skips exactly those: the boundary key and the invalid prune policy do
@@ -5340,18 +5377,77 @@ fn cron_prune_mode_prunes_only_cron_updates() {
 }
 
 #[test]
-fn prune_is_off_by_default_and_with_never() {
-    for mode in [None, Some("never")] {
-        let fixture = Fixture::new("shdeps-prune-never");
+fn unset_prune_mode_prunes_cron_updates() {
+    // The default is `cron`: an unattended run prunes without the operator
+    // having to opt in. Empty reads like unset (`${VAR:-}` convention).
+    for mode in [None, Some("")] {
+        let fixture = Fixture::new("shdeps-prune-default-cron");
         let cron = pruning(&fixture, mode)
             .arg("--cron")
             .output()
             .expect("cron update");
         assert_cli(&cron, 0, b"", b"");
-        let manual = pruning(&fixture, mode).output().expect("manual update");
-        assert_cli(&manual, 0, CHANGED, b"");
-        assert_eq!(prune_record(&fixture), None, "mode {mode:?}");
+        assert_eq!(
+            prune_record(&fixture),
+            Some(expected_prune_record(&fixture, true)),
+            "mode {mode:?}"
+        );
     }
+}
+
+#[test]
+fn unset_prune_mode_never_prunes_manual_or_quiet_updates() {
+    // Only `--cron` selects the default prune: a hand run keeps today's
+    // five-stage output, and quieting it (flag or environment) changes
+    // output, never what the update does.
+    let fixture = Fixture::new("shdeps-prune-default-manual");
+    let manual = pruning(&fixture, None).output().expect("manual update");
+    assert_cli(&manual, 0, CHANGED, b"");
+    let quiet_flag = pruning(&fixture, None)
+        .arg("--quiet")
+        .output()
+        .expect("--quiet update");
+    assert_cli(&quiet_flag, 0, b"", b"");
+    let quiet_env = pruning(&fixture, None)
+        .env("DOT_QUIET", "1")
+        .output()
+        .expect("DOT_QUIET update");
+    assert_cli(&quiet_env, 0, b"", b"");
+    assert_eq!(prune_record(&fixture), None);
+}
+
+#[test]
+fn never_prune_mode_opts_out_of_cron_prune() {
+    let fixture = Fixture::new("shdeps-prune-never");
+    let cron = pruning(&fixture, Some("never"))
+        .arg("--cron")
+        .output()
+        .expect("cron update");
+    assert_cli(&cron, 0, b"", b"");
+    let manual = pruning(&fixture, Some("never"))
+        .output()
+        .expect("manual update");
+    assert_cli(&manual, 0, CHANGED, b"");
+    assert_eq!(prune_record(&fixture), None);
+}
+
+#[test]
+fn unknown_prune_env_value_disables_cron_prune() {
+    // A typo must never enable deletion: an unrecognized value reads as
+    // `never`, not as the unset default, so it also turns cron prune off.
+    // The warning still reaches cron's stderr.
+    let fixture = Fixture::new("shdeps-prune-env-unknown-cron");
+    let cron = pruning(&fixture, Some("weekly"))
+        .arg("--cron")
+        .output()
+        .expect("cron update with unknown prune mode");
+    assert_cli(
+        &cron,
+        0,
+        b"",
+        b"  warning: ignoring DOT_SHDEPS_PRUNE=weekly; expected never, cron, or always\n",
+    );
+    assert_eq!(prune_record(&fixture), None);
 }
 
 #[test]
@@ -5535,11 +5631,8 @@ fn a_hand_run_update_that_does_not_converge_records_a_plain_failure() {
     assert_eq!(last_run_fields(&fixture), ["fail", "manual"]);
 }
 
-/// Give `fixture` a base checkout cloned by `dot init` from a local remote,
-/// then remove the remote so every later base pull fails the way an
-/// unreachable dotfiles remote does. The URL is unchanged, so client
-/// identity still matches and only the pull fails.
-fn with_unreachable_base(fixture: &Fixture) {
+/// Seed a local bare base remote with one commit and return its path.
+fn base_remote(fixture: &Fixture) -> PathBuf {
     let scratch = fixture._scratch.path();
     let seed = scratch.join("base-seed");
     std::fs::create_dir_all(&seed).expect("base seed");
@@ -5569,14 +5662,28 @@ fn with_unreachable_base(fixture: &Fixture) {
         .expect("clone bare base");
     assert!(output.status.success(), "clone bare base: {output:?}");
     git(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-    let init = fixture
-        .command_for("init")
+    origin
+}
+
+/// `dot init --yes` against the local `origin`.
+fn init_from(fixture: &Fixture, origin: &Path) -> Command {
+    let mut command = fixture.command_for("init");
+    command
         .arg("--yes")
-        .arg(format!("file://{}", origin.display()))
-        .output()
-        .expect("dot init");
+        .arg(format!("file://{}", origin.display()));
+    command
+}
+
+/// Give `fixture` a base checkout cloned by `dot init` from a local remote,
+/// then remove the remote so every later base pull fails the way an
+/// unreachable dotfiles remote does. The URL is unchanged, so client
+/// identity still matches and only the pull fails.
+fn with_unreachable_base(fixture: &Fixture) {
+    let origin = base_remote(fixture);
+    let init = init_from(fixture, &origin).output().expect("dot init");
     assert_eq!(init.status.code(), Some(0), "init: {init:?}");
-    std::fs::rename(&origin, scratch.join("base.git.gone")).expect("hide base remote");
+    std::fs::rename(&origin, fixture._scratch.path().join("base.git.gone"))
+        .expect("hide base remote");
     // Leave an empty directory in its place: the pull still fails, but the
     // recorded remote identity keeps resolving. macOS resolves a file remote
     // with BSD `realpath`, which refuses a missing path, so a vanished
@@ -5589,11 +5696,24 @@ fn cron_prune_is_skipped_after_a_quiet_base_pull_failure() {
     // DOT-1: prune trusts only a synchronized generation. Quiet mode used to
     // drop a failed base pull from the tally, so the cron run went on to run
     // Tools and prune against the stale checkout, then recorded `ok`.
-    let fixture = Fixture::new("shdeps-prune-base-pull-failure");
+    assert_base_pull_failure_skips_cron_prune("shdeps-prune-base-pull-failure", Some("cron"));
+}
+
+#[test]
+fn default_cron_prune_is_skipped_after_a_quiet_base_pull_failure() {
+    // The unset default prunes cron runs, but only behind the same
+    // synchronized-generation gate as an explicit `cron`.
+    assert_base_pull_failure_skips_cron_prune("shdeps-prune-default-base-pull-failure", None);
+}
+
+/// A cron update with prune `mode` whose base pull fails: exit 1, no Tools,
+/// no prune, and a `fail` outcome that refreshes neither stamp.
+fn assert_base_pull_failure_skips_cron_prune(name: &str, mode: Option<&str>) {
+    let fixture = Fixture::new(name);
     with_unreachable_base(&fixture);
     // `init` ran the provider; only this run's calls matter.
     let _ = std::fs::remove_file(fixture.home.join("provider-record"));
-    let cron = pruning(&fixture, Some("cron"))
+    let cron = pruning(&fixture, mode)
         .arg("--cron")
         .output()
         .expect("cron update");
@@ -5611,6 +5731,28 @@ fn cron_prune_is_skipped_after_a_quiet_base_pull_failure() {
     assert_eq!(last_cron_outcome(&fixture), ["fail", "update"]);
     assert!(!dot::update_status::last_success_path(&fixture.state).exists());
     assert!(!dot::update_status::last_converged_path(&fixture.state).exists());
+}
+
+#[test]
+fn init_ignores_the_prune_policy() {
+    // Init convergence failure rolls back an installation, so a prune
+    // (and its failure) must never run there, whatever the policy says.
+    // Init has no `--cron`, so only `always` would reach prune if init
+    // honored the policy; the unset default is checked alongside it.
+    for mode in [None, Some("always")] {
+        let fixture = Fixture::new("shdeps-prune-init");
+        let origin = base_remote(&fixture);
+        let mut init = init_from(&fixture, &origin);
+        if let Some(mode) = mode {
+            init.env("DOT_SHDEPS_PRUNE", mode);
+        }
+        let init = init.output().expect("dot init");
+        assert_eq!(init.status.code(), Some(0), "init {mode:?}: {init:?}");
+        // The provider converged the new installation, so the Tools stage
+        // that prune follows did run.
+        assert!(fixture.home.join("provider-record").exists(), "{mode:?}");
+        assert_eq!(prune_record(&fixture), None, "mode {mode:?}");
+    }
 }
 
 #[test]

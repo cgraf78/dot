@@ -98,7 +98,8 @@ alias. Arguments after the options are passed to each repository's `git pull`;
       --quiet    suppress progress output
       --cron     unattended mode: implies --quiet, stays quiet about a busy
                  update lock, skips the run while local edits are unresolved,
-                 and records the outcome for `dot doctor`
+                 prunes orphaned Shdeps dependencies (DOT_SHDEPS_PRUNE=never
+                 turns that off), and records the outcome for `dot doctor`
 ";
 
 /// Whether `-h`/`--help` appears anywhere in the update arguments. Like the
