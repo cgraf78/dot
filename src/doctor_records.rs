@@ -1,9 +1,9 @@
 //! Doctor extension result records.
 //!
 //! Owns the private
-//! `_dot_doctor_record` sink plus the five public wrappers built on
+//! `_dot_doctor_record` sink plus the six public wrappers built on
 //! it — `dot_doctor_section`, `dot_doctor_ok`, `dot_doctor_warn`,
-//! `dot_doctor_fail`, and `dot_doctor_skip`. Part 1 (`doctor_runtime`)
+//! `dot_doctor_fail`, `dot_doctor_skip`, and `dot_doctor_info`. Part 1 (`doctor_runtime`)
 //! owns the coordinator-side rendering and counters, and part 2
 //! (`doctor_paths`) owns the path abbreviators; this module owns how
 //! extension workers file result rows for the coordinator to render.
@@ -157,7 +157,14 @@ pub fn skip(result_file: Option<&Path>, args: &[&[u8]]) -> Result<(), Error> {
     verdict(result_file, b"skip", args)
 }
 
-/// Shared verdict sink for [`ok`], [`warn`], [`fail`], and [`skip`]:
+/// `dot_doctor_info`: record an informational row from one or two fields.
+///
+/// Arity and detail rules mirror [`ok`].
+pub fn info(result_file: Option<&Path>, args: &[&[u8]]) -> Result<(), Error> {
+    verdict(result_file, b"info", args)
+}
+
+/// Shared verdict sink for [`ok`], [`warn`], [`fail`], [`skip`], and [`info`]:
 /// one or two fields, with the detail defaulting to empty.
 fn verdict(result_file: Option<&Path>, kind: &[u8], args: &[&[u8]]) -> Result<(), Error> {
     let (message, detail) = match args {
@@ -169,9 +176,9 @@ fn verdict(result_file: Option<&Path>, kind: &[u8], args: &[&[u8]]) -> Result<()
 }
 
 /// Read and dispatch a worker result file into canonical coordinator records.
-/// Known verdict rows always retain their detail column, including an empty
-/// one, because the shell renderer invokes each `_dr_*` helper with two
-/// arguments. Unknown kinds become the coordinator's visible failure record.
+/// Known verdict rows retain their detail column, including an empty one;
+/// the renderer omits an empty detail. Unknown kinds become the
+/// coordinator's visible failure record.
 pub fn read(result_file: &Path) -> std::io::Result<Vec<Record>> {
     // Bash variables cannot retain NUL bytes. `read -r` silently drops them
     // before applying IFS, so normalize once before reproducing its fields.

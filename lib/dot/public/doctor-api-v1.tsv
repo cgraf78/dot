@@ -1,8 +1,19 @@
+# Doctor extension API 1. Base and overlay extensions update independently of
+# the coordinator, so every row must work against an older and a newer dot:
+# - helpers are only ever added; a helper newer than an extension's oldest
+#   supported dot is probed with `declare -F` before use (dot_doctor_info);
+# - an empty DETAIL renders like an omitted one (older coordinators print an
+#   empty "()" trailer; cosmetic only);
+# - each extension has a deadline (DOT_DOCTOR_TIMEOUT seconds, default 60;
+#   0 disables it); past it the coordinator stops the extension and reports
+#   it as timed out. Older coordinators have no deadline, so an extension
+#   must not rely on being stopped.
 # function	arguments	status	result and side effects
 dot_doctor_section	LABEL	0 recorded; 1 unavailable channel; 2 invalid arguments	records a section heading
 dot_doctor_ok	LABEL [DETAIL]	0 recorded; 1 unavailable channel; 2 invalid arguments	records a passing check
 dot_doctor_warn	LABEL [DETAIL]	0 recorded; 1 unavailable channel; 2 invalid arguments	records a warning check
 dot_doctor_fail	LABEL [DETAIL]	0 recorded; 1 unavailable channel; 2 invalid arguments	records a failing check
 dot_doctor_skip	LABEL [DETAIL]	0 recorded; 1 unavailable channel; 2 invalid arguments	records a skipped check
+dot_doctor_info	LABEL [DETAIL]	0 recorded; 1 unavailable channel; 2 invalid arguments	records an informational row that is never counted; newer than the other helpers, so probe `declare -F dot_doctor_info` and fall back to dot_doctor_ok
 dot_doctor_display_path	PATH	0 success; 2 invalid arguments	prints PATH with HOME abbreviated for display
 dot_doctor_source	RELATIVE_PATH	0 sourced; 1 unsafe or unavailable; 2 invalid arguments	sources one validated client support module in the current isolated worker

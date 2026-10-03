@@ -178,12 +178,16 @@ next to its script: `10-example.sh` (or `10-example.serial.sh`) reads
 to absolute paths. `dot doctor` fails unless every declared output exists and
 is strictly newer than the hook script, the sidecar, and the hook's
 identity-named family directory. Hooks without a sidecar (or with an empty
-one) skip verification instead of failing. Sidecars pass the same ownership
-and writability validation as hook scripts.
+one) skip verification instead of failing. Each missing or stale output gets
+its own row, while healthy hooks and unverified hooks are each summarized in a
+single row. Sidecars pass the same ownership and writability validation as
+hook scripts.
 
 Doctor extensions report structured records only; ordinary stdout/stderr is
 diagnosed as out-of-band output. Each result helper accepts `LABEL [DETAIL]`
-except the one-argument section helper:
+except the one-argument section helper. An empty `DETAIL` renders exactly like
+an omitted one. `dot_doctor_info` records a configuration fact that is neither
+a passed nor a skipped check; it renders with `›` and is never counted:
 
 ```bash
 doctor() {
@@ -193,8 +197,33 @@ doctor() {
   dot_doctor_warn 'optional cache missing' 'it will be rebuilt'
   dot_doctor_fail 'required executable missing' 'install example-tool'
   dot_doctor_skip 'remote probe' 'offline mode'
+  if declare -F dot_doctor_info >/dev/null; then
+    dot_doctor_info 'selected backend' 'example'
+  else
+    dot_doctor_ok 'selected backend' 'example'
+  fi
 }
 ```
+
+Base and overlay extensions update independently of the installed `dot`, so
+an extension must work against both an older and a newer coordinator:
+
+- Helpers are only ever added. Probe a helper newer than your oldest
+  supported `dot` with `declare -F` before calling it, as above for
+  `dot_doctor_info`; an older coordinator reports an unknown record kind as
+  an invalid result. Never write records except through the helpers.
+- Each extension has a deadline: `DOT_DOCTOR_TIMEOUT` seconds (default 60;
+  `0` disables it), measured from its launch. Past it the coordinator stops
+  the extension's whole session, keeps the records it already filed, reports
+  `<name> doctor extension timed out`, and continues with the rest. Older
+  coordinators have no deadline, so an extension must bound its own probes
+  and must not rely on being stopped.
+- An extension that fails the trust checks never runs, and the other
+  extensions still run. Refused links (dangling, or into a checkout that is
+  not an active overlay's, as after a rename or an overlay error) share one
+  `doctor extension(s) refused` row that names them and the next step; a
+  refused regular file gets its own row. Older coordinators skipped every
+  extension in either case.
 
 The coordinator owns rendering, counters, ordering, and aggregate exit status;
 extensions must not inspect or mutate those internals. `dot_doctor_display_path`

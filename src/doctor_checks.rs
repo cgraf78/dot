@@ -418,56 +418,96 @@ fn newest_input_mtime_bounded(
     newest
 }
 
+/// One merge spec's output verification result, before aggregation.
+enum MergeVerdict {
+    /// Problems to report row by row (invalid declarations, missing or stale
+    /// outputs).
+    Problems(Vec<Record>),
+    /// No declared outputs, or nothing to compare them against.
+    Unverified,
+    /// Every declared output exists and is newer than every input.
+    Current(usize),
+}
+
 /// Verify one merge spec's declared live outputs: each must exist
 /// and be strictly newer than its newest input. Hooks without
-/// declarations skip (documented, not a failure); invalid
+/// declarations are unverified (documented, not a failure); invalid
 /// declarations fail outright.
-fn verify_merge_outputs(spec: &MergeSpec) -> Vec<Record> {
-    let mut out = Vec::new();
-    for raw in &spec.invalid {
-        out.push(Record::fail(
-            "merge-hook output declaration is invalid",
-            Some(format!("{}: {raw}", spec.identity)),
-        ));
-    }
+fn verify_merge_outputs(spec: &MergeSpec) -> MergeVerdict {
     if !spec.invalid.is_empty() {
-        return out;
+        return MergeVerdict::Problems(
+            spec.invalid
+                .iter()
+                .map(|raw| {
+                    Record::fail(
+                        "merge-hook output declaration is invalid",
+                        Some(format!("{}: {raw}", spec.identity)),
+                    )
+                })
+                .collect(),
+        );
     }
     if spec.outputs.is_empty() {
-        out.push(Record::skip(
-            "merge-hook outputs are unverified",
-            Some(format!("{}: no declared outputs", spec.identity)),
-        ));
-        return out;
+        return MergeVerdict::Unverified;
     }
     let Some(newest) = newest_input_mtime(spec) else {
-        out.push(Record::skip(
-            "merge-hook outputs are unverified",
-            Some(format!("{}: no inputs to compare", spec.identity)),
-        ));
-        return out;
+        return MergeVerdict::Unverified;
     };
-    let mut fresh = 0;
+    let mut problems = Vec::new();
     for output in &spec.outputs {
         let mtime = std::fs::metadata(Path::new(output))
             .and_then(|meta| meta.modified())
             .ok();
         match mtime {
-            None => out.push(Record::fail(
+            None => problems.push(Record::fail(
                 "merge-hook output is missing",
                 Some(format!("{}: {output}", spec.identity)),
             )),
-            Some(mtime) if mtime <= newest => out.push(Record::fail(
+            Some(mtime) if mtime <= newest => problems.push(Record::fail(
                 "merge-hook output is stale",
                 Some(format!("{}: {output}", spec.identity)),
             )),
-            Some(_) => fresh += 1,
+            Some(_) => {}
         }
     }
-    if fresh == spec.outputs.len() {
+    if problems.is_empty() {
+        MergeVerdict::Current(spec.outputs.len())
+    } else {
+        MergeVerdict::Problems(problems)
+    }
+}
+
+/// Every spec's output verification, collapsed: problems keep one row each,
+/// while healthy and unverified hooks each fold into a single summary row
+/// (one row per hook used to bury the problems among dozens of identical
+/// skips).
+fn merge_output_records(specs: &[MergeSpec]) -> Vec<Record> {
+    let mut problems = Vec::new();
+    let mut unverified = 0usize;
+    let (mut current_hooks, mut current_outputs) = (0usize, 0usize);
+    for spec in specs {
+        match verify_merge_outputs(spec) {
+            MergeVerdict::Problems(rows) => problems.extend(rows),
+            MergeVerdict::Unverified => unverified += 1,
+            MergeVerdict::Current(outputs) => {
+                current_hooks += 1;
+                current_outputs += outputs;
+            }
+        }
+    }
+    let mut out = problems;
+    if current_hooks > 0 {
         out.push(Record::ok(
             "merge-hook outputs are current",
-            Some(format!("{}: {fresh} output(s)", spec.identity)),
+            Some(format!(
+                "{current_outputs} output(s) across {current_hooks} hook(s)"
+            )),
+        ));
+    }
+    if unverified > 0 {
+        out.push(Record::skip(
+            "merge-hook outputs are unverified",
+            Some(format!("{unverified} hook(s) declare no checkable outputs")),
         ));
     }
     out
@@ -517,9 +557,7 @@ pub fn check_merges(inputs: &MergeInputs) -> Vec<Record> {
             "merge-hook extensions",
             Some(format!("{count} hook(s)")),
         ));
-        for spec in &inputs.specs {
-            out.extend(verify_merge_outputs(spec));
-        }
+        out.extend(merge_output_records(&inputs.specs));
     } else {
         out.push(Record::skip(
             "merge-hook extensions",
@@ -958,7 +996,9 @@ fn present(value: Option<&str>) -> Option<&str> {
 
 /// `_dr_check_overlays` (`doctor/overlays.sh`): profile selection
 /// reporting, per-overlay lifecycle and source health, and overlay
-/// symlink ownership validation.
+/// symlink ownership validation. The profile identity, selection, and
+/// matching selector are configuration facts, so they render as
+/// informational rows that are never counted.
 ///
 /// Worktree, URL, and origin probes reuse [`crate::overlays`];
 /// manifest parsing and link-target derivation reuse
@@ -986,26 +1026,26 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
         if let (Some(user), Some(host)) =
             (present(inputs.profile_user), present(inputs.profile_host))
         {
-            out.push(Record::ok(
+            out.push(Record::info(
                 "profile identity",
                 Some(format!("{user}@{host}")),
             ));
         }
         if let Some(selected) = present(inputs.selected_profile) {
             let state = present(inputs.selection_state).unwrap_or("unknown");
-            out.push(Record::ok(
+            out.push(Record::info(
                 "selected profile",
                 Some(format!("{selected} ({state})")),
             ));
         }
         if !inputs.included_profiles.is_empty() {
-            out.push(Record::ok(
+            out.push(Record::info(
                 "included profiles",
                 Some(inputs.included_profiles.join(" ")),
             ));
         }
         if !inputs.phase_one.is_empty() {
-            out.push(Record::ok(
+            out.push(Record::info(
                 "phase-one overlays",
                 Some(inputs.phase_one.join(" ")),
             ));
@@ -1025,7 +1065,7 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 Some(leaf) => leaf,
                 None => fields[1].as_str(),
             };
-            out.push(Record::ok(
+            out.push(Record::info(
                 format!("matching selector ({source})"),
                 Some(format!("{} -> {}", leaf, fields[4])),
             ));
@@ -1739,7 +1779,9 @@ pub struct ProviderInputs<'a> {
 /// `_dr_check_provider` (`doctor/provider.sh`): the dependency
 /// provider boundary (reviewed installer selection plus ABI
 /// agreement). Helper outcomes arrive via [`ProviderInputs`];
-/// only the `_dr_tilde` display runs in-process.
+/// only the `_dr_tilde` display runs in-process. The update policy,
+/// provider source, and development revision are configuration facts, so
+/// they render as informational rows that are never counted.
 pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
     let mut out = vec![Record::section("Dependency provider")];
     match inputs.dependency_provider {
@@ -1762,14 +1804,20 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
         inputs.policy
     };
     if !inputs.configure_ok {
-        out.push(Record::ok("Shdeps update policy", Some(policy.to_string())));
+        out.push(Record::info(
+            "Shdeps update policy",
+            Some(policy.to_string()),
+        ));
         out.push(Record::fail(
             "Shdeps provider is unavailable",
             Some("run dot update to bootstrap the reviewed provider release".to_string()),
         ));
         return out;
     }
-    out.push(Record::ok("Shdeps update policy", Some(policy.to_string())));
+    out.push(Record::info(
+        "Shdeps update policy",
+        Some(policy.to_string()),
+    ));
     let development = format!("{}/shdeps", inputs.dev_dir);
     let mut development_invalid = false;
     if policy == "latest" && inputs.development_exists && !inputs.development_valid {
@@ -1805,7 +1853,7 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
     }
     match installer.source {
         "explicit" => {
-            out.push(Record::ok(
+            out.push(Record::info(
                 "Shdeps provider source",
                 Some(format!(
                     "caller-selected reviewed installer: {}",
@@ -1819,7 +1867,7 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
         }
         "pinned-dev" => {
             if policy == "latest" {
-                out.push(Record::ok(
+                out.push(Record::info(
                     "Shdeps provider source",
                     Some(format!(
                         "development checkout selected by Dot lock: {}",
@@ -1833,7 +1881,7 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
             ));
         }
         "latest-dev" => {
-            out.push(Record::ok(
+            out.push(Record::info(
                 "Shdeps provider source",
                 Some(format!(
                     "trusted development checkout: {}",
@@ -1843,7 +1891,7 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
         }
         "managed" => {
             if policy == "latest" {
-                out.push(Record::ok(
+                out.push(Record::info(
                     "Shdeps provider source",
                     Some("managed release via reviewed bootstrap".to_string()),
                 ));
@@ -1867,7 +1915,7 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
         let current = inputs.development_revision.unwrap_or("");
         if !locked.is_empty() && current == locked {
             let short: String = current.chars().take(12).collect();
-            out.push(Record::ok(
+            out.push(Record::info(
                 "Shdeps development revision",
                 Some(format!("matches Dot lock: {short}")),
             ));
@@ -1877,7 +1925,7 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
             } else {
                 current
             };
-            out.push(Record::ok(
+            out.push(Record::info(
                 "Shdeps development revision",
                 Some(format!(
                     "trusted unpinned revision differs from Dot lock; accepted by latest policy: {shown}"

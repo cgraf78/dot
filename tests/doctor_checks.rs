@@ -863,8 +863,40 @@ fn merge_outputs_verify_fresh_missing_and_stale() {
     // No declared outputs skips (documented behavior, not a failure).
     let undeclared = check(vec![merge_spec("fixture", &script, vec![])]);
     assert!(undeclared.contains("· merge-hook outputs are unverified"));
-    assert!(undeclared.contains("no declared outputs"));
+    assert!(undeclared.contains("1 hook(s) declare no checkable outputs"));
     assert!(!undeclared.contains('✗'));
+
+    // C1: healthy and unverified hooks each collapse into one summary row;
+    // problems keep a row each.
+    let mut many: Vec<MergeSpec> = (0..30)
+        .map(|index| merge_spec(&format!("bare{index}"), &script, vec![]))
+        .collect();
+    many.push(merge_spec(
+        "fresh-a",
+        &script,
+        vec![fresh_out.to_string_lossy().into_owned()],
+    ));
+    many.push(merge_spec(
+        "fresh-b",
+        &script,
+        vec![fresh_out.to_string_lossy().into_owned()],
+    ));
+    many.push(merge_spec(
+        "stale",
+        &script,
+        vec![stale_out.to_string_lossy().into_owned()],
+    ));
+    let collapsed = check(many);
+    assert_eq!(
+        collapsed
+            .matches("merge-hook outputs are unverified")
+            .count(),
+        1
+    );
+    assert!(collapsed.contains("(30 hook(s) declare no checkable outputs)"));
+    assert!(collapsed.contains("✓ merge-hook outputs are current (2 output(s) across 2 hook(s))"));
+    assert!(collapsed.contains("✗ merge-hook output is stale\n    stale: "));
+    assert_eq!(collapsed.lines().count(), 7, "{collapsed}");
 
     // A relative declaration fails outright.
     let mut bad = merge_spec("fixture", &script, vec![]);

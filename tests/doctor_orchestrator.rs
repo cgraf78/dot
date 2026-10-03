@@ -3,50 +3,10 @@
 use std::os::unix::fs::PermissionsExt as _;
 
 use dot::doctor_orchestrator::{
-    EngineSnapshot, ExtensionRunner, Kernel, Loader, Recorder, RuntimeSnapshot, SECTION_FILES,
-    check_engine_source, check_runtime, collapse_log, create_result_file, doctor_title,
-    extension_tail, physical_dir, result_paths, run_doctor, run_extension_for, section_paths,
-    sections_present, split_spec, summary_box,
+    EngineSnapshot, Recorder, RuntimeSnapshot, WorkerExit, check_engine_source, check_runtime,
+    collapse_log, create_result_file, extension_tail, result_paths, run_extension_for,
 };
 use dot_test_support::TempDir;
-
-#[test]
-fn load_publishes_sections_once() {
-    let dir = TempDir::new("doctor-load-native").expect("fixture");
-    for file in SECTION_FILES {
-        dir.write(file, b"");
-    }
-    assert!(sections_present(dir.path()));
-    assert_eq!(section_paths(dir.path()).len(), 7);
-    let mut loader = Loader::new();
-    assert_eq!(loader.load(dir.path()), Some(section_paths(dir.path())));
-    assert!(loader.is_loaded());
-    assert_eq!(loader.load(dir.path()), None);
-}
-
-#[test]
-fn physical_dir_matches_cd_p() {
-    let dir = TempDir::new("doctor-physical-dir").expect("fixture");
-    let real = dir.path().join("real");
-    std::fs::create_dir_all(&real).expect("real");
-    let link = dir.path().join("link");
-    std::os::unix::fs::symlink(&real, &link).expect("link");
-    assert_eq!(
-        physical_dir(link.as_os_str().as_encoded_bytes()),
-        Some(
-            std::fs::canonicalize(real)
-                .expect("canonical")
-                .as_os_str()
-                .as_encoded_bytes()
-                .to_vec()
-        )
-    );
-    assert_eq!(physical_dir(b""), None);
-    assert_eq!(
-        physical_dir(dir.path().join("missing").as_os_str().as_encoded_bytes()),
-        None
-    );
-}
 
 fn engine(source: &[u8]) -> EngineSnapshot {
     EngineSnapshot {
@@ -76,7 +36,14 @@ fn runtime_check_agrees() {
         unknown_config_keys: Vec::new(),
     };
     check_runtime(&mut rec, &runtime, &engine(b"/src"), b"/home/u");
-    assert_eq!(rec.counts().pass, 4);
+    // Bash, checkout, and Git pass; the configuration version is an
+    // informational row and never counts.
+    assert_eq!(rec.counts().pass, 3);
+    assert!(
+        String::from_utf8(rec.render())
+            .expect("utf8")
+            .contains("  › configuration version (1)\n")
+    );
     assert_eq!(rec.counts().warn, 1);
     assert_eq!(rec.counts().fail, 0);
     let mut old = runtime.clone();
@@ -200,26 +167,6 @@ fn engine_source_check_agrees() {
 }
 
 #[test]
-fn from_env_resolution_agrees() {
-    let snapshot = EngineSnapshot::from_env(b"/definitely/missing", b"/home/u");
-    assert_eq!(snapshot.managed_raw, b"/home/u/.local/share/cgraf78/dot");
-    assert_eq!(snapshot.development_raw, b"/home/u/git/dot");
-    assert_eq!(snapshot.source_real, b"/definitely/missing");
-}
-
-#[test]
-fn summary_and_split_helpers_agree() {
-    assert_eq!(doctor_title(), b"\ndot doctor\n\n");
-    assert_eq!(split_spec(b""), None);
-    assert_eq!(
-        split_spec(b"key\tpath\twith-tab"),
-        Some((&b"key"[..], &b"path\twith-tab"[..]))
-    );
-    let box_bytes = summary_box(b"1 passed");
-    assert!(box_bytes.windows(8).any(|part| part == b"1 passed"));
-}
-
-#[test]
 fn temp_and_result_file_modes_agree() {
     let dir = TempDir::new("doctor-results-native").expect("fixture");
     let (results, log) = result_paths(dir.path());
@@ -245,7 +192,7 @@ fn extension_run_agrees() {
     let mut rec = Recorder::new();
     let mut worker = |inv: &dot::doctor_orchestrator::WorkerInvocation<'_>| {
         std::fs::write(inv.log, b"noise\nline\n").expect("log");
-        0
+        WorkerExit::from(0)
     };
     let mut render = |_: &std::path::Path, _: &mut Recorder| {};
     let now = std::time::SystemTime::now()
@@ -273,7 +220,7 @@ fn extension_run_agrees() {
     );
     assert_eq!(collapse_log(b"a\nb\n"), b"a b ");
     let mut failed = Recorder::new();
-    extension_tail(&mut failed, b"demo", 7, b"bad\n");
+    extension_tail(&mut failed, b"demo", WorkerExit::from(7), b"bad\n");
     assert_eq!(failed.counts().fail, 1);
 
     let missing_root = root.path().join("missing").join("nested");
@@ -301,64 +248,29 @@ fn extension_run_agrees() {
 }
 
 #[test]
-fn doctor_skeleton_agrees() {
-    let runtime = RuntimeSnapshot {
-        bash_version: b"5".to_vec(),
-        bash_major: 5,
-        bash_required: true,
-        checkout_root: Some(b"/src".to_vec()),
-        release_root: false,
-        source_raw: b"/src".to_vec(),
-        source_root: b"/src".to_vec(),
-        git_version: Some(b"git".to_vec()),
-        config_version: b"1".to_vec(),
-        unknown_config_keys: Vec::new(),
-    };
-    let mut kernels: Vec<Kernel<'_>> = vec![Box::new(|rec| {
-        rec.section(b"Kernel");
-        rec.ok(b"healthy", None);
-        rec.warn(b"watch", Some(b"detail"));
-    })];
-    let mut runner: ExtensionRunner<'_> = Box::new(|rec, key, script| {
-        assert_eq!(key, b"ext");
-        assert_eq!(script, b"/script");
-        rec.skip(b"extension", None);
-        0
-    });
-    let mut out = Vec::new();
+fn timed_out_extension_files_one_failure_with_its_limit() {
     let mut rec = Recorder::new();
-    assert!(run_doctor(
-        &mut out,
+    extension_tail(
         &mut rec,
-        &runtime,
-        &engine(b"/src"),
-        b"/home/u",
-        &mut kernels,
-        &Ok(vec![b"".to_vec(), b"ext\t/script".to_vec()]),
-        &mut runner
-    ));
-    assert!(out.starts_with(&doctor_title()));
-    assert!(out.windows(6).any(|part| part == b"passed"));
-
+        b"20-slow",
+        WorkerExit {
+            rc: 1,
+            timed_out: Some(std::time::Duration::from_secs(20)),
+        },
+        b"partial\n",
+    );
+    assert_eq!(rec.counts().fail, 1);
+    let rendered = String::from_utf8(rec.render()).expect("utf8");
+    assert_eq!(
+        rendered,
+        "  ✗ 20-slow doctor extension timed out\n    stopped after 20s; set DOT_DOCTOR_TIMEOUT to raise the limit; output: partial \n"
+    );
+    // A clean failure keeps its historical row; quiet output adds no
+    // empty detail line.
     let mut failed = Recorder::new();
-    let mut no_kernels: Vec<Kernel<'_>> = vec![];
-    let mut unused: ExtensionRunner<'_> = Box::new(|_, _, _| 0);
-    let mut failed_out = Vec::new();
-    assert!(!run_doctor(
-        &mut failed_out,
-        &mut failed,
-        &runtime,
-        &engine(b"/src"),
-        b"",
-        &mut no_kernels,
-        &Err(()),
-        &mut unused
-    ));
-    let discovery_failed = b"doctor extension discovery failed";
-    assert!(
-        failed
-            .render()
-            .windows(discovery_failed.len())
-            .any(|part| part == discovery_failed)
+    extension_tail(&mut failed, b"30-bad", WorkerExit::from(3), b"");
+    assert_eq!(
+        String::from_utf8(failed.render()).expect("utf8"),
+        "  ✗ 30-bad doctor extension failed\n"
     );
 }

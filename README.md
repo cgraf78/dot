@@ -127,7 +127,8 @@ Only the versioned modules under `lib/dot/public` are sourceable APIs. They are
 the shell boundary for user-authored hooks, not an alternate implementation of
 the engine. See [library.md](docs/library.md).
 
-`dot doctor` runs built-in health checks plus configured `doctor.d` extensions.
+`dot doctor` runs built-in health checks plus configured `doctor.d` extensions
+(`dot doctor --help` lists its environment knobs).
 `dot test` runs trusted executable test extensions from the configured `tests`
 directory. The provider-owned `dot` suite remains visible in `dot test --list`
 and can be selected explicitly with `dot test dot`; set

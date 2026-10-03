@@ -936,6 +936,66 @@ fn doctor_empty_home_reports_the_missing_client() {
     assert!(output.stderr.is_empty(), "doctor is silent on stderr");
 }
 
+#[test]
+fn doctor_help_prints_usage_without_running_checks() {
+    // `dot doctor --help` used to ignore its arguments and run every check.
+    // Help is settled before the config loads, so a broken config cannot
+    // hide it.
+    let home = TempDir::new("cli-doctor-help").expect("fixture home");
+    let state = TempDir::new("cli-doctor-help-state").expect("fixture state");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config dir");
+    std::fs::write(home.path().join(".config/dot/config"), b"version=99\n").expect("config");
+    for argv in [
+        &["doctor", "--help"][..],
+        &["doctor", "-h"],
+        &["doctor", "x", "-h"],
+    ] {
+        let output = isolated_run(&home, &state, argv, &[]);
+        assert_eq!(output.status.code(), Some(0), "{argv:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            dot::doctor::USAGE,
+            "{argv:?}"
+        );
+        assert!(output.stderr.is_empty(), "{argv:?}: {:?}", output.stderr);
+    }
+}
+
+#[test]
+fn doctor_rejects_arguments_it_does_not_take() {
+    let home = TempDir::new("cli-doctor-args").expect("fixture home");
+    let state = TempDir::new("cli-doctor-args-state").expect("fixture state");
+    let output = isolated_run(&home, &state, &["doctor", "--verbose"], &[]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "no checks ran: {:?}",
+        output.stdout
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "dot doctor: unexpected argument: --verbose\nRun `dot doctor --help` for usage.\n"
+    );
+}
+
+#[test]
+fn doctor_help_and_argument_errors_still_run_the_reexec_guard_first() {
+    // The re-exec guard precedes every command: a provider continuation
+    // that landed on the wrong generation must report that, not usage.
+    let home = TempDir::new("cli-doctor-reexec").expect("fixture home");
+    let state = TempDir::new("cli-doctor-reexec-state").expect("fixture state");
+    let expected = [("DOT_REEXEC_EXPECTED_REVISION", "0".repeat(40))];
+    let extra: Vec<(&str, &str)> = expected.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let guarded = isolated_run(&home, &state, &["version"], &extra);
+    assert_ne!(guarded.status.code(), Some(0), "the guard must refuse");
+    for argv in [&["doctor", "--help"][..], &["doctor", "--bogus"]] {
+        let output = isolated_run(&home, &state, argv, &extra);
+        assert_eq!(output.status.code(), guarded.status.code(), "{argv:?}");
+        assert!(output.stdout.is_empty(), "{argv:?}: {:?}", output.stdout);
+        assert_eq!(output.stderr, guarded.stderr, "{argv:?}");
+    }
+}
+
 /// Initialized file:// client for the doctor pass/extension rows.
 fn stage_doctor_client() -> (TempDir, TempDir, TempDir) {
     let scope = TempDir::new("cli-doctor-origin").expect("origin scope");
