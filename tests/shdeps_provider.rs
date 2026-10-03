@@ -5535,6 +5535,84 @@ fn a_hand_run_update_that_does_not_converge_records_a_plain_failure() {
     assert_eq!(last_run_fields(&fixture), ["fail", "manual"]);
 }
 
+/// Give `fixture` a base checkout cloned by `dot init` from a local remote,
+/// then remove the remote so every later base pull fails the way an
+/// unreachable dotfiles remote does. The URL is unchanged, so client
+/// identity still matches and only the pull fails.
+fn with_unreachable_base(fixture: &Fixture) {
+    let scratch = fixture._scratch.path();
+    let seed = scratch.join("base-seed");
+    std::fs::create_dir_all(&seed).expect("base seed");
+    git(&seed, &["init", "-q"]);
+    std::fs::write(seed.join(".testrc"), b"base\n").expect("base payload");
+    git(&seed, &["add", "-A"]);
+    git(
+        &seed,
+        &[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "seed",
+        ],
+    );
+    git(&seed, &["branch", "-M", "main"]);
+    let origin = scratch.join("base.git");
+    let output = dot_test_support::git()
+        .args(["clone", "-q", "--bare"])
+        .arg(&seed)
+        .arg(&origin)
+        .stdin(Stdio::null())
+        .output()
+        .expect("clone bare base");
+    assert!(output.status.success(), "clone bare base: {output:?}");
+    git(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let init = fixture
+        .command_for("init")
+        .arg("--yes")
+        .arg(format!("file://{}", origin.display()))
+        .output()
+        .expect("dot init");
+    assert_eq!(init.status.code(), Some(0), "init: {init:?}");
+    std::fs::rename(&origin, scratch.join("base.git.gone")).expect("hide base remote");
+    // Leave an empty directory in its place: the pull still fails, but the
+    // recorded remote identity keeps resolving. macOS resolves a file remote
+    // with BSD `realpath`, which refuses a missing path, so a vanished
+    // remote would trip the init-identity guard before any pull.
+    std::fs::create_dir(&origin).expect("empty base remote");
+}
+
+#[test]
+fn cron_prune_is_skipped_after_a_quiet_base_pull_failure() {
+    // DOT-1: prune trusts only a synchronized generation. Quiet mode used to
+    // drop a failed base pull from the tally, so the cron run went on to run
+    // Tools and prune against the stale checkout, then recorded `ok`.
+    let fixture = Fixture::new("shdeps-prune-base-pull-failure");
+    with_unreachable_base(&fixture);
+    // `init` ran the provider; only this run's calls matter.
+    let _ = std::fs::remove_file(fixture.home.join("provider-record"));
+    let cron = pruning(&fixture, Some("cron"))
+        .arg("--cron")
+        .output()
+        .expect("cron update");
+    assert_eq!(cron.status.code(), Some(1), "cron: {cron:?}");
+    assert!(cron.stdout.is_empty(), "{cron:?}");
+    assert_eq!(prune_record(&fixture), None);
+    // Tools is skipped exactly as in a loud run, so the provider never ran.
+    assert!(!fixture.home.join("provider-record").exists());
+    // Carry the run's output into a failure here: macOS CI once saw exit 1
+    // with no cron line at all, which the bare log read cannot explain.
+    assert!(
+        dot::update_status::update_log_path(&fixture.state).exists(),
+        "no cron outcome recorded: {cron:?}"
+    );
+    assert_eq!(last_cron_outcome(&fixture), ["fail", "update"]);
+    assert!(!dot::update_status::last_success_path(&fixture.state).exists());
+    assert!(!dot::update_status::last_converged_path(&fixture.state).exists());
+}
+
 #[test]
 fn cron_prune_that_shdeps_defers_with_a_warning_is_a_clean_run() {
     // Newer Shdeps defers a sudo-needing uninstall without a terminal: it

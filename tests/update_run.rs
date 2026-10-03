@@ -278,12 +278,23 @@ fn repository_commands_and_update_accept_an_in_progress_identity() {
 
 /// Run the native binary with the same controlled client.
 fn dot(argv: &[&str], home: &Path, state: &Path) -> std::process::Output {
+    dot_env(argv, home, state, &[])
+}
+
+/// [`dot`] with extra environment (for example `DOT_QUIET`).
+fn dot_env(
+    argv: &[&str],
+    home: &Path,
+    state: &Path,
+    extra: &[(&str, &str)],
+) -> std::process::Output {
     let mut cmd = bin();
     client_env(&mut cmd, home, state);
     cmd.env("DOT_BASH", home.join("absent-old-update-engine"));
-    for arg in argv {
-        cmd.arg(arg);
+    for (key, value) in extra {
+        cmd.env(key, value);
     }
+    cmd.args(argv);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.output().expect("run native dot")
@@ -769,4 +780,96 @@ fn update_streams_stage_rows_before_completion() {
         )
     };
     assert_eq!(failed_code, 1, "delivery failure must exit 1");
+}
+
+/// One converged client whose base remote then disappears, so every later
+/// base pull fails the way an unreachable dotfiles remote does. The URL is
+/// unchanged, so client identity still matches and only the pull fails.
+fn unreachable_base_client(scratch: &Scratch, tag: &str) -> (PathBuf, PathBuf) {
+    let (overlay_origin, base_origin) = shared_remotes(scratch);
+    let (home, state) = twin_client(scratch, tag, &overlay_origin, &base_origin);
+    check_update(&["update"], &home, &state);
+    std::fs::rename(&base_origin, scratch.path().join("base.git.gone")).expect("hide base remote");
+    // An empty directory keeps the recorded remote identity resolvable: macOS
+    // resolves a file remote with BSD `realpath`, which refuses a missing
+    // path, so a vanished remote trips the init-identity guard before the pull.
+    std::fs::create_dir(&base_origin).expect("empty base remote");
+    (home, state)
+}
+
+/// The `update.last-run` fields after its epoch.
+fn last_run_fields(state: &Path) -> Vec<String> {
+    let last = dot::update_status::read_last_run(state).expect("last-run stamp");
+    let mut fields = vec![last.outcome, last.trigger];
+    if !last.failing.is_empty() {
+        fields.push(last.failing);
+    }
+    fields
+}
+
+#[test]
+fn quiet_base_pull_failure_fails_like_a_loud_one() {
+    // DOT-1: quiet mode used to warn about a failed base pull without
+    // tallying it, so `DOT_QUIET=1` exited 0 and recorded `ok` while the
+    // same run without it failed.
+    let scratch = Scratch::new("update-run-quiet-base-fail").expect("scratch dir");
+    let (home, state) = unreachable_base_client(&scratch, "quiet");
+    // The quiet run goes first, so the stamp it leaves is its own (the
+    // converging update before it recorded `ok`).
+    let quiet = dot_env(&["update"], &home, &state, &[("DOT_QUIET", "1")]);
+    assert_eq!(last_run_fields(&state), ["fail", "manual"]);
+    // The restored generation keeps the installed overlay links.
+    assert_eq!(
+        std::fs::read(home.join("file-000.txt")).expect("overlay link kept"),
+        b"overlay-0 payload 0\n"
+    );
+    let loud = dot_env(&["update"], &home, &state, &[]);
+    assert_eq!(loud.status.code(), Some(1), "loud: {loud:?}");
+    assert!(
+        String::from_utf8_lossy(&loud.stdout).contains("1 repo failed"),
+        "{loud:?}"
+    );
+    assert_eq!(quiet.status.code(), loud.status.code(), "quiet: {quiet:?}");
+    // Quiet still hides every stage row; the stderr warning stands in for
+    // the hidden Repos row.
+    assert!(quiet.stdout.is_empty(), "{quiet:?}");
+    assert!(
+        String::from_utf8_lossy(&quiet.stderr).contains("  warning: dotfiles pull failed\n"),
+        "{quiet:?}"
+    );
+    let flag = dot_env(&["update", "--quiet"], &home, &state, &[]);
+    assert_eq!(flag.status.code(), Some(1), "--quiet: {flag:?}");
+    assert!(flag.stdout.is_empty(), "{flag:?}");
+}
+
+#[test]
+fn cron_base_pull_failure_records_fail_and_keeps_success_stamps() {
+    // DOT-1: a cron run whose base pull failed recorded `ok` and refreshed
+    // the success stamps, so a host with an unreachable remote looked
+    // healthy to `dot doctor` forever.
+    let scratch = Scratch::new("update-run-cron-base-fail").expect("scratch dir");
+    let (home, state) = unreachable_base_client(&scratch, "cron");
+    // Old clean stamps: a refresh by this run would overwrite them.
+    const OLD: i64 = 1_700_000_000;
+    dot::update_status::record_success(&state, OLD);
+    dot::update_status::record_converged(&state, OLD, dot::update_status::Degraded::default());
+    let cron = dot_env(&["update", "--cron"], &home, &state, &[]);
+    assert_eq!(cron.status.code(), Some(1), "cron: {cron:?}");
+    assert!(cron.stdout.is_empty(), "{cron:?}");
+    assert!(
+        String::from_utf8_lossy(&cron.stderr).contains("  warning: dotfiles pull failed\n"),
+        "{cron:?}"
+    );
+    let log = std::fs::read_to_string(dot::update_status::update_log_path(&state))
+        .expect("cron outcome log");
+    let last = log.lines().last().expect("one cron outcome");
+    assert_eq!(
+        last.split(' ').skip(1).collect::<Vec<_>>(),
+        ["fail", "update"],
+        "{log}"
+    );
+    assert_eq!(last_run_fields(&state), ["fail", "cron"]);
+    assert_eq!(dot::update_status::read_last_success(&state), Some(OLD));
+    let converged = dot::update_status::read_last_converged(&state).expect("convergence stamp");
+    assert_eq!((converged.at, converged.failing.as_str()), (OLD, ""));
 }
