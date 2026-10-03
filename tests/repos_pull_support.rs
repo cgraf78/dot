@@ -77,7 +77,16 @@ fn conflict_parser_stops_at_the_first_non_file_line() {
 fn backup_dir_creates_a_timestamped_leaf_and_fails_closed() {
     let dir = TempDir::new("pull-backup").expect("fixture dir");
     let mut warnings = Vec::new();
-    let backup = backup_dir(&dir.path().to_string_lossy(), &mut warnings).expect("backup dir");
+    // Name the cause on failure: `backup_dir` reports only `None`. The
+    // forwarded `mkdir` diagnostics say why the root step failed, and the
+    // root's presence separates that step from the native leaf step.
+    let backup = backup_dir(&dir.path().to_string_lossy(), &mut warnings).unwrap_or_else(|| {
+        panic!(
+            "backup dir (root created: {}); forwarded diagnostics: {:?}",
+            dir.path().join(".dot-backup/pull").is_dir(),
+            String::from_utf8_lossy(&warnings)
+        )
+    });
     assert!(backup.is_dir());
     assert_eq!(
         backup.parent(),
