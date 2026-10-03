@@ -5597,6 +5597,12 @@ fn cron_prune_is_skipped_after_a_quiet_base_pull_failure() {
     assert_eq!(prune_record(&fixture), None);
     // Tools is skipped exactly as in a loud run, so the provider never ran.
     assert!(!fixture.home.join("provider-record").exists());
+    // Carry the run's output into a failure here: macOS CI once saw exit 1
+    // with no cron line at all, which the bare log read cannot explain.
+    assert!(
+        dot::update_status::update_log_path(&fixture.state).exists(),
+        "no cron outcome recorded: {cron:?}"
+    );
     assert_eq!(last_cron_outcome(&fixture), ["fail", "update"]);
     assert!(!dot::update_status::last_success_path(&fixture.state).exists());
     assert!(!dot::update_status::last_converged_path(&fixture.state).exists());
