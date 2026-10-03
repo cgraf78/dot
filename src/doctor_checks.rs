@@ -197,11 +197,6 @@ fn captured(output: &str) -> String {
     output.trim_end_matches('\n').to_string()
 }
 
-/// Shell `[[ $value =~ ^[0-9]+$ ]]`.
-fn is_uint(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-}
-
 /// Owner-execute-or-any-execute probe mirroring `[[ -x $path ]]`
 /// for the cases the checks meet: any execute bit set. (Full
 /// `access(2)` semantics for foreign-owned files are not modeled;
@@ -213,9 +208,11 @@ fn is_executable_bits(mode: u32) -> bool {
 
 /// One owner row for [`check_update_lock`]: the row must agree with
 /// what `acquire` will do. `acquire` reclaims stale owners but
-/// *refuses* when the owner probe cannot verify liveness, so
-/// `Unknown`/`Interrupted` get their own row instead of sharing the
-/// stale "will reclaim" promise.
+/// *refuses* when the owner probe cannot verify liveness, so `Unknown`
+/// fails (every mutating command refuses until the probe succeeds) instead
+/// of sharing the stale "will reclaim" promise. A live owner stays a
+/// warning (the refusal ends when that update does), as does a probe
+/// interrupted by a signal to doctor itself.
 fn lock_owner_record(
     owner: &crate::update_lock::Owner,
     activity: crate::update_lock::OwnerActivity,
@@ -231,9 +228,15 @@ fn lock_owner_record(
             "update lock owner is stale",
             Some("the next mutating command will reclaim it".to_string()),
         ),
-        Activity::Unknown | Activity::Interrupted => Record::warn(
+        Activity::Unknown => Record::fail(
             "update lock owner cannot be verified",
             Some("mutating commands refuse until the owner probe succeeds".to_string()),
+        ),
+        // Only this doctor run was interrupted mid-probe; nothing about the
+        // lock is known to be wrong.
+        Activity::Interrupted => Record::warn(
+            "update lock owner cannot be verified",
+            Some("the owner probe was interrupted".to_string()),
         ),
     }
 }
@@ -410,56 +413,96 @@ fn newest_input_mtime_bounded(
     newest
 }
 
+/// One merge spec's output verification result, before aggregation.
+enum MergeVerdict {
+    /// Problems to report row by row (invalid declarations, missing or stale
+    /// outputs).
+    Problems(Vec<Record>),
+    /// No declared outputs, or nothing to compare them against.
+    Unverified,
+    /// Every declared output exists and is newer than every input.
+    Current(usize),
+}
+
 /// Verify one merge spec's declared live outputs: each must exist
 /// and be strictly newer than its newest input. Hooks without
-/// declarations skip (documented, not a failure); invalid
+/// declarations are unverified (documented, not a failure); invalid
 /// declarations fail outright.
-fn verify_merge_outputs(spec: &MergeSpec) -> Vec<Record> {
-    let mut out = Vec::new();
-    for raw in &spec.invalid {
-        out.push(Record::fail(
-            "merge-hook output declaration is invalid",
-            Some(format!("{}: {raw}", spec.identity)),
-        ));
-    }
+fn verify_merge_outputs(spec: &MergeSpec) -> MergeVerdict {
     if !spec.invalid.is_empty() {
-        return out;
+        return MergeVerdict::Problems(
+            spec.invalid
+                .iter()
+                .map(|raw| {
+                    Record::fail(
+                        "merge-hook output declaration is invalid",
+                        Some(format!("{}: {raw}", spec.identity)),
+                    )
+                })
+                .collect(),
+        );
     }
     if spec.outputs.is_empty() {
-        out.push(Record::skip(
-            "merge-hook outputs are unverified",
-            Some(format!("{}: no declared outputs", spec.identity)),
-        ));
-        return out;
+        return MergeVerdict::Unverified;
     }
     let Some(newest) = newest_input_mtime(spec) else {
-        out.push(Record::skip(
-            "merge-hook outputs are unverified",
-            Some(format!("{}: no inputs to compare", spec.identity)),
-        ));
-        return out;
+        return MergeVerdict::Unverified;
     };
-    let mut fresh = 0;
+    let mut problems = Vec::new();
     for output in &spec.outputs {
         let mtime = std::fs::metadata(Path::new(output))
             .and_then(|meta| meta.modified())
             .ok();
         match mtime {
-            None => out.push(Record::fail(
+            None => problems.push(Record::fail(
                 "merge-hook output is missing",
                 Some(format!("{}: {output}", spec.identity)),
             )),
-            Some(mtime) if mtime <= newest => out.push(Record::fail(
+            Some(mtime) if mtime <= newest => problems.push(Record::fail(
                 "merge-hook output is stale",
                 Some(format!("{}: {output}", spec.identity)),
             )),
-            Some(_) => fresh += 1,
+            Some(_) => {}
         }
     }
-    if fresh == spec.outputs.len() {
+    if problems.is_empty() {
+        MergeVerdict::Current(spec.outputs.len())
+    } else {
+        MergeVerdict::Problems(problems)
+    }
+}
+
+/// Every spec's output verification, collapsed: problems keep one row each,
+/// while healthy and unverified hooks each fold into a single summary row
+/// (one row per hook used to bury the problems among dozens of identical
+/// skips).
+fn merge_output_records(specs: &[MergeSpec]) -> Vec<Record> {
+    let mut problems = Vec::new();
+    let mut unverified = 0usize;
+    let (mut current_hooks, mut current_outputs) = (0usize, 0usize);
+    for spec in specs {
+        match verify_merge_outputs(spec) {
+            MergeVerdict::Problems(rows) => problems.extend(rows),
+            MergeVerdict::Unverified => unverified += 1,
+            MergeVerdict::Current(outputs) => {
+                current_hooks += 1;
+                current_outputs += outputs;
+            }
+        }
+    }
+    let mut out = problems;
+    if current_hooks > 0 {
         out.push(Record::ok(
             "merge-hook outputs are current",
-            Some(format!("{}: {fresh} output(s)", spec.identity)),
+            Some(format!(
+                "{current_outputs} output(s) across {current_hooks} hook(s)"
+            )),
+        ));
+    }
+    if unverified > 0 {
+        out.push(Record::skip(
+            "merge-hook outputs are unverified",
+            Some(format!("{unverified} hook(s) declare no checkable outputs")),
         ));
     }
     out
@@ -509,9 +552,7 @@ pub fn check_merges(inputs: &MergeInputs) -> Vec<Record> {
             "merge-hook extensions",
             Some(format!("{count} hook(s)")),
         ));
-        for spec in &inputs.specs {
-            out.extend(verify_merge_outputs(spec));
-        }
+        out.extend(merge_output_records(&inputs.specs));
     } else {
         out.push(Record::skip(
             "merge-hook extensions",
@@ -531,6 +572,14 @@ pub struct CronInputs {
     /// none was recorded (including every run by a Dot older than the
     /// convergence stamp).
     pub last_converged: Option<crate::update_status::Converged>,
+    /// The last update run of any trigger (`update.last-run`), or `None`
+    /// when none was recorded (including every run by a Dot older than
+    /// that stamp).
+    pub last_run: Option<crate::update_status::LastRun>,
+    /// Whether a `crontab` command is on `PATH`. Without one the host
+    /// cannot schedule `dot update --cron`, so a cron that never ran skips
+    /// instead of warning.
+    pub cron_available: bool,
     /// Current epoch seconds.
     pub now: i64,
 }
@@ -548,26 +597,50 @@ pub struct CronInputs {
 /// stopped converging. Both use the same staleness window, so a
 /// transient failure after a recent clean run still reads ok, exactly
 /// as before the degraded outcome existed.
+///
+/// The any-trigger last-run stamp fills the gaps the cron stamps leave: a
+/// host whose cron entry never ran warns once its last hand-run update is
+/// older than the staleness window (instead of reading "unknown" forever),
+/// and the last hand-run update is reported whenever it adds information:
+/// always without a recent clean cron run, otherwise only when it did not
+/// succeed.
 pub fn check_cron_freshness(inputs: &CronInputs) -> Vec<Record> {
+    let mut out = vec![Record::section("Update")];
+    let clean = cron_freshness(inputs, &mut out);
+    if let Some(record) = last_run_record(inputs, clean) {
+        out.push(record);
+    }
+    out
+}
+
+/// The cron row of [`check_cron_freshness`]; returns the epoch of the last
+/// clean cron run when it is recent enough to vouch for the host.
+fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
     use crate::update_status::{format_age, is_stale};
 
-    let mut out = vec![Record::section("Update")];
     let age = |at: i64| format_age(inputs.now.saturating_sub(at));
     let converged = inputs.last_converged.as_ref();
     // A clean convergence stamp is a success even if the last-success
-    // write was lost; both are written by the same clean run.
+    // write was lost; both are written by the same clean run. A clean cron
+    // last run counts too, in case both stamp writes were lost.
+    let clean_cron_run = inputs
+        .last_run
+        .as_ref()
+        .filter(|last| last.is_cron() && last.outcome == crate::update_status::OUTCOME_OK)
+        .map(|last| last.at);
     let clean = converged
         .filter(|converged| converged.failing.is_empty())
         .map(|converged| converged.at)
         .into_iter()
         .chain(inputs.last_success)
+        .chain(clean_cron_run)
         .max();
     if let Some(clean) = clean.filter(|clean| !is_stale(*clean, inputs.now)) {
         out.push(Record::ok(
             "cron update succeeded recently",
             Some(format!("{} ago", age(clean))),
         ));
-        return out;
+        return Some(clean);
     }
     if let Some(converged) = converged
         .filter(|converged| !converged.failing.is_empty() && !is_stale(converged.at, inputs.now))
@@ -580,7 +653,7 @@ pub fn check_cron_freshness(inputs: &CronInputs) -> Vec<Record> {
             format!("cron update degraded: {} failing", converged.failing),
             Some(format!("{since}; last converged {} ago", age(converged.at))),
         ));
-        return out;
+        return None;
     }
     // Stale from here on. `clean` (not just last-success) is the success
     // reference, so a lone clean convergence stamp reads as a success. Only
@@ -602,12 +675,155 @@ pub fn check_cron_freshness(inputs: &CronInputs) -> Vec<Record> {
                 "no successful cron update recorded{converged_note}"
             )),
         )),
-        None => out.push(Record::skip(
+        None => out.push(never_converged_record(inputs)),
+    }
+    None
+}
+
+/// The cron row when no cron run ever converged. Before the last-run stamp
+/// this always read "unknown"; with it, a cron run that only ever failed
+/// warns, and a host updated only by hand warns once its last update is
+/// older than the staleness window (a cron entry would have run by then),
+/// while a host that has never updated at all still reads unknown.
+fn never_converged_record(inputs: &CronInputs) -> Record {
+    use crate::update_status::{format_age, is_stale};
+
+    let age = |at: i64| format_age(inputs.now.saturating_sub(at));
+    let Some(last) = inputs.last_run.as_ref() else {
+        return Record::skip(
             "cron update success is unknown",
             Some("no successful cron update recorded".to_string()),
-        )),
+        );
+    };
+    if last.is_cron() {
+        return Record::warn(
+            "cron update has not succeeded recently",
+            Some(format!(
+                "no successful cron update recorded; last cron run {} {} ago",
+                last.outcome,
+                age(last.at)
+            )),
+        );
     }
-    out
+    if !inputs.cron_available {
+        // No `crontab` (Termux, containers): this host is updated by hand
+        // by design, so a lasting warning would only be noise.
+        return Record::skip(
+            "cron update has never run",
+            Some(format!(
+                "no crontab on PATH; last update: {} run {} ago",
+                last.trigger,
+                age(last.at)
+            )),
+        );
+    }
+    if is_stale(last.at, inputs.now) {
+        return Record::warn(
+            "cron update has never run",
+            Some(format!(
+                "last update: {} run {} ago; schedule dot update --cron to keep this host current",
+                last.trigger,
+                age(last.at)
+            )),
+        );
+    }
+    Record::skip(
+        "cron update has not run yet",
+        Some(format!(
+            "last update: {} run {} ago",
+            last.trigger,
+            age(last.at)
+        )),
+    )
+}
+
+/// The last hand-run (`manual` or `init`) update, when it adds information
+/// beyond the cron row: always without a recent clean cron run (the cron
+/// row cannot vouch for this host then), otherwise only when it did not
+/// succeed and is newer than that clean run. A failed or degraded run
+/// warns rather than fails: the conditions that make every update exit 1
+/// have rows of their own, and a one-off failure (a network blip) heals on
+/// the next run.
+fn last_run_record(inputs: &CronInputs, clean_cron: Option<i64>) -> Option<Record> {
+    use crate::update_status::{OUTCOME_DEGRADED, OUTCOME_OK, format_age};
+
+    let last = inputs.last_run.as_ref().filter(|last| !last.is_cron())?;
+    let succeeded = last.outcome == OUTCOME_OK;
+    if let Some(clean) = clean_cron {
+        if succeeded || last.at <= clean {
+            return None;
+        }
+    }
+    let detail = format!(
+        "{} run {} ago",
+        last.trigger,
+        format_age(inputs.now.saturating_sub(last.at))
+    );
+    Some(if succeeded {
+        Record::ok("last update succeeded", Some(detail))
+    } else if last.outcome == OUTCOME_DEGRADED {
+        let failing = if last.failing.is_empty() {
+            "a stage"
+        } else {
+            last.failing.as_str()
+        };
+        Record::warn(
+            format!("last update degraded: {failing} failing"),
+            Some(format!(
+                "{detail}; rerun dot update to see the failing stage"
+            )),
+        )
+    } else {
+        Record::warn(
+            "last update failed",
+            Some(format!("{detail}; rerun dot update to see what failed")),
+        )
+    })
+}
+
+/// The provider re-exec checkpoint row for the `Update` section (none when
+/// the record is absent). `dot update` refuses to proceed past a record it
+/// cannot consume, so those states fail; a record the next update will
+/// validate and remove only warns. `state` comes from
+/// [`crate::shdeps::checkpoint_state`], which shares the consume logic.
+pub fn check_reexec_checkpoint(
+    state: &crate::shdeps::CheckpointState,
+    path: &Path,
+    home: &str,
+) -> Vec<Record> {
+    use crate::shdeps::CheckpointState;
+
+    let shown = tilde(&path.to_string_lossy(), home);
+    let short = |revision: &str| -> String {
+        if revision.is_empty() {
+            "<unavailable>".to_string()
+        } else {
+            revision.chars().take(12).collect()
+        }
+    };
+    match state {
+        CheckpointState::Absent => Vec::new(),
+        CheckpointState::Pending => vec![Record::warn(
+            "provider re-exec checkpoint pending",
+            Some(format!(
+                "{shown}: dot changed twice during the last update; the next dot update validates and removes it"
+            )),
+        )],
+        CheckpointState::Unreadable => vec![Record::fail(
+            "provider re-exec checkpoint blocks dot update",
+            Some(format!(
+                "{shown} is unsafe or malformed; inspect it, remove it, then run dot update"
+            )),
+        )],
+        CheckpointState::Mismatch { pinned, active } => vec![Record::fail(
+            "provider re-exec checkpoint blocks dot update",
+            Some(format!(
+                "{shown} pins {} but dot is at {}; inspect the provider state, remove the record, then run dot update",
+                short(pinned),
+                short(active)
+            )),
+        )],
+    }
 }
 
 /// Inputs for [`check_profile_lifecycle`]: the profile lifecycle
@@ -775,7 +991,9 @@ fn present(value: Option<&str>) -> Option<&str> {
 
 /// `_dr_check_overlays` (`doctor/overlays.sh`): profile selection
 /// reporting, per-overlay lifecycle and source health, and overlay
-/// symlink ownership validation.
+/// symlink ownership validation. The profile identity, selection, and
+/// matching selector are configuration facts, so they render as
+/// informational rows that are never counted.
 ///
 /// Worktree, URL, and origin probes reuse [`crate::overlays`];
 /// manifest parsing and link-target derivation reuse
@@ -803,26 +1021,26 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
         if let (Some(user), Some(host)) =
             (present(inputs.profile_user), present(inputs.profile_host))
         {
-            out.push(Record::ok(
+            out.push(Record::info(
                 "profile identity",
                 Some(format!("{user}@{host}")),
             ));
         }
         if let Some(selected) = present(inputs.selected_profile) {
             let state = present(inputs.selection_state).unwrap_or("unknown");
-            out.push(Record::ok(
+            out.push(Record::info(
                 "selected profile",
                 Some(format!("{selected} ({state})")),
             ));
         }
         if !inputs.included_profiles.is_empty() {
-            out.push(Record::ok(
+            out.push(Record::info(
                 "included profiles",
                 Some(inputs.included_profiles.join(" ")),
             ));
         }
         if !inputs.phase_one.is_empty() {
-            out.push(Record::ok(
+            out.push(Record::info(
                 "phase-one overlays",
                 Some(inputs.phase_one.join(" ")),
             ));
@@ -842,7 +1060,7 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 Some(leaf) => leaf,
                 None => fields[1].as_str(),
             };
-            out.push(Record::ok(
+            out.push(Record::info(
                 format!("matching selector ({source})"),
                 Some(format!("{} -> {}", leaf, fields[4])),
             ));
@@ -926,6 +1144,19 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
     for entry in &inputs.active_records {
         active.insert(record_name(entry), entry.as_str());
     }
+    // Status every active Git overlay that has its own `.git` up front, in
+    // parallel. The `.git` probe keeps a missing or non-repository path from
+    // resolving to an enclosing repository (an ordinary client rooted at
+    // `$HOME` would answer for the whole home); results are used only after
+    // the worktree check below confirms the checkout.
+    let status_paths: Vec<String> = active
+        .values()
+        .map(|entry| read_fields(entry, 6))
+        .filter(|fields| fields[5] != "none")
+        .map(|fields| fields[1].clone())
+        .filter(|path| std::fs::symlink_metadata(Path::new(path).join(".git")).is_ok())
+        .collect();
+    let statuses = overlay_statuses(status_paths);
     // Overlay paths by name, for the manifest symlink ownership
     // pass (`overlay_paths` / `overlay_syncs` in the shell).
     let mut overlay_paths: BTreeMap<String, String> = BTreeMap::new();
@@ -1061,12 +1292,25 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 ));
             }
             Err(actual) => {
-                out.push(Record::warn(
+                // `dot update` refuses to pull or link an overlay whose
+                // origin differs from its descriptor and exits 1, so the
+                // drift is a failure here too.
+                let adopt = crate::repos_pull_support::adopt_command(&path, &expected, &actual);
+                out.push(Record::fail(
                     format!("{name}: remote URL drift"),
-                    Some(format!("conf={expected} vs actual={actual}")),
+                    Some(format!(
+                        "conf={expected} vs actual={actual}; verify the checkout, then adopt it with: {adopt}"
+                    )),
                 ));
             }
         }
+        overlay_state_records(
+            &name,
+            &path,
+            optional == "true",
+            statuses.get(&path).and_then(Option::as_ref),
+            &mut out,
+        );
     }
 
     if held {
@@ -1170,6 +1414,266 @@ fn check_overlay_links(
             format!("{issues} overlay symlink issue(s)"),
             Some("run 'dot update' to re-link".to_string()),
         ));
+    }
+}
+
+/// Control directory the standalone installer (`install.sh`) keeps beside
+/// the stable release root: `<data>/cgraf78/dot -> .dot-standalone/current
+/// -> releases/<version>-<platform>`, with `lock` held while it runs.
+const STANDALONE_CONTROL: &str = ".dot-standalone";
+/// The standalone installer's versioned release directory parent.
+const STANDALONE_RELEASES: &str = "releases";
+/// Archive ownership marker Shdeps writes into a `github:release` root it
+/// installed (`.shdeps-release-layout` holding exactly `v1 archive`).
+const SHDEPS_LAYOUT_FILE: &str = ".shdeps-release-layout";
+/// The only marker content Shdeps accepts.
+const SHDEPS_LAYOUT_CONTENT: &[u8] = b"v1 archive\n";
+/// Infix of the sibling Shdeps parks the prior root under while it swaps
+/// in a new archive (`<root>.shdeps-archive-backup-<pid>-<nanos>`); one
+/// left behind means an install was interrupted.
+const SHDEPS_BACKUP_INFIX: &str = ".shdeps-archive-backup-";
+
+/// Inputs for [`check_install_layout`].
+pub struct InstallInputs<'a> {
+    /// `$HOME`, for display only.
+    pub home: &'a str,
+    /// The running engine's source root, physically resolved.
+    pub source_real: &'a Path,
+    /// Whether that root is a packaged release (`.dot-install.json`), not
+    /// a checkout.
+    pub release_root: bool,
+    /// `${SHDEPS_INSTALL_DIR:-$HOME/.local/share}/cgraf78/dot`, the root
+    /// Shdeps upgrades, spelled as configured.
+    pub managed_root: &'a Path,
+    /// Whether Shdeps is the configured dependency provider (and so owns
+    /// Dot's upgrade).
+    pub shdeps: bool,
+}
+
+/// The standalone control directory owning `release`, when `release` (a
+/// physical path) is one of the standalone installer's versioned releases.
+fn standalone_control(release: &Path) -> Option<&Path> {
+    let releases = release.parent()?;
+    let control = releases.parent()?;
+    (releases.file_name()? == STANDALONE_RELEASES && control.file_name()? == STANDALONE_CONTROL)
+        .then_some(control)
+}
+
+/// Release-install layout health (stat-level, no processes): which
+/// installer owns the Dot release Shdeps would upgrade, and whether that
+/// owner can still upgrade it.
+///
+/// Under the Shdeps provider a managed root that links into the standalone
+/// installer's control directory (`<root> -> .dot-standalone/current`)
+/// warns: Shdeps adopts that layout in place on its next update of Dot
+/// (Shdeps without adoption fails that update, which its own health check
+/// reports). The installer's lock fails, because Shdeps refuses to adopt
+/// while it exists, and an interrupted adoption (the root link parked as
+/// `<root>.shdeps-parked-root`) warns until the next update finishes it.
+/// Doctor stops at this one row; `shdeps health` owns the rest. The verdict
+/// is anchored
+/// on the managed root rather than the running binary, so a test harness
+/// or development checkout running beside a healthy Shdeps install stays
+/// quiet. Without a provider, the standalone installer is the upgrade
+/// path. A Shdeps-installed root must carry the archive marker Shdeps
+/// validates before it touches the root (a wrong marker fails; a missing
+/// one warns because Shdeps backfills it when the public command proves
+/// ownership). Leftover install state is reported too: the standalone
+/// installer refuses to run while its lock exists, and an archive backup
+/// sibling means a Shdeps install was interrupted. Checkouts report
+/// nothing: their updates do not go through either installer.
+pub fn check_install_layout(inputs: &InstallInputs) -> Vec<Record> {
+    let mut out = Vec::new();
+    let managed_real = std::fs::canonicalize(inputs.managed_root).ok();
+    let managed_standalone = installer_link(inputs.managed_root);
+    let running_standalone = if inputs.release_root {
+        standalone_control(inputs.source_real)
+    } else {
+        None
+    };
+    if inputs.shdeps {
+        if let Some(control) = managed_standalone {
+            out.push(Record::warn(
+                "dot is standalone-installed",
+                Some(format!(
+                    "{}: Shdeps adopts it on its next update of dot; if this persists, run shdeps health",
+                    tilde(&inputs.managed_root.to_string_lossy(), inputs.home)
+                )),
+            ));
+            check_adoption_lock(inputs, &control, &mut out);
+            return out;
+        }
+        // An adoption whose fallback switch was interrupted leaves no root,
+        // only the installer's link parked beside it.
+        let parked = parked_root_link(inputs.managed_root);
+        let root_missing = std::fs::symlink_metadata(inputs.managed_root).is_err();
+        if let Some(control) = installer_link(&parked).filter(|_| root_missing) {
+            out.push(Record::warn(
+                "Shdeps adoption of the standalone install was interrupted",
+                Some(format!(
+                    "{}: the next Shdeps update of dot finishes it",
+                    tilde(&parked.to_string_lossy(), inputs.home)
+                )),
+            ));
+            check_adoption_lock(inputs, &control, &mut out);
+            return out;
+        }
+    } else if let Some(control) = managed_standalone.or(running_standalone.map(Path::to_path_buf)) {
+        out.push(Record::ok(
+            "dot release layout",
+            Some("standalone installer (rerun install.sh to upgrade)".to_string()),
+        ));
+        // A warning, not a failure: without a provider the lock blocks only a
+        // manual `install.sh` rerun (never `dot update`), and it is
+        // legitimately present while an installer runs.
+        let lock = control.join("lock");
+        if std::fs::symlink_metadata(&lock).is_ok() {
+            out.push(Record::warn(
+                "standalone installer lock is present",
+                Some(format!(
+                    "{}: install.sh refuses to run while it exists; remove it if no installer is running",
+                    tilde(&lock.to_string_lossy(), inputs.home)
+                )),
+            ));
+        }
+        return out;
+    }
+    let managed_dir =
+        std::fs::symlink_metadata(inputs.managed_root).is_ok_and(|meta| meta.file_type().is_dir());
+    let running_managed = managed_real.as_deref() == Some(inputs.source_real);
+    if !inputs.shdeps {
+        return out;
+    }
+    if inputs.release_root && managed_dir && running_managed {
+        check_layout_marker(inputs, &mut out);
+    }
+    // Leftovers are reported whichever Dot runs: a failed swap whose rollback
+    // also failed leaves only the backup, with no root to run from.
+    check_install_leftovers(inputs, managed_dir, &mut out);
+    out
+}
+
+/// `<root>.shdeps-parked-root`: where Shdeps parks the installer's root
+/// link while a fallback (non-atomic) adoption switch runs, mirroring
+/// Shdeps' `parked_root_link`. A link left there means the switch was
+/// interrupted; Shdeps finishes it on its next update of the dependency.
+fn parked_root_link(root: &Path) -> PathBuf {
+    let mut name = root
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".shdeps-parked-root");
+    root.with_file_name(name)
+}
+
+/// The installer's control directory when `link` is the standalone
+/// installer's own root link: a symlink whose target is exactly
+/// `.dot-standalone/current`. This is the same no-follow evidence Shdeps
+/// requires before it adopts the layout, so doctor never promises an
+/// adoption Shdeps would refuse (a link straight into `releases/`, or an
+/// absolute target, is someone else's).
+fn installer_link(link: &Path) -> Option<PathBuf> {
+    let meta = std::fs::symlink_metadata(link).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    let target = std::fs::read_link(link).ok()?;
+    (target == Path::new(STANDALONE_CONTROL).join("current"))
+        .then(|| link.with_file_name(STANDALONE_CONTROL))
+}
+
+/// The standalone installer's lock under the Shdeps provider: Shdeps checks
+/// it before anything else in the layout and refuses to adopt (or finish
+/// adopting) the install while any entry exists there, so its updates of dot
+/// fail until it is gone.
+fn check_adoption_lock(inputs: &InstallInputs, control: &Path, out: &mut Vec<Record>) {
+    let lock = control.join("lock");
+    if std::fs::symlink_metadata(&lock).is_ok() {
+        let shown = tilde(&lock.to_string_lossy(), inputs.home);
+        out.push(Record::fail(
+            "standalone installer lock blocks Shdeps adoption",
+            Some(format!(
+                "{shown}: Shdeps will not adopt the install while it exists; remove it if no install.sh is running"
+            )),
+        ));
+    }
+}
+
+/// The Shdeps archive marker of the managed release root Dot runs from.
+fn check_layout_marker(inputs: &InstallInputs, out: &mut Vec<Record>) {
+    let marker = inputs.managed_root.join(SHDEPS_LAYOUT_FILE);
+    let marker_shown = tilde(&marker.to_string_lossy(), inputs.home);
+    match std::fs::symlink_metadata(&marker) {
+        Ok(meta) if meta.file_type().is_file() => {
+            if std::fs::read(&marker).is_ok_and(|content| content == SHDEPS_LAYOUT_CONTENT) {
+                out.push(Record::ok("dot release layout", Some("Shdeps release".to_string())));
+            } else {
+                out.push(Record::fail(
+                    "dot release layout marker is invalid",
+                    Some(format!(
+                        "{marker_shown}: Shdeps refuses to upgrade until it holds 'v1 archive'"
+                    )),
+                ));
+            }
+        }
+        Ok(_) => out.push(Record::fail(
+            "dot release layout marker is invalid",
+            Some(format!(
+                "{marker_shown} is not a regular file; Shdeps refuses to upgrade until it is"
+            )),
+        )),
+        Err(_) => out.push(Record::warn(
+            "dot release has no Shdeps layout marker",
+            Some(format!(
+                "{marker_shown}: Shdeps records it when the public command proves ownership and otherwise refuses to upgrade"
+            )),
+        )),
+    }
+}
+
+/// Install state left behind beside the managed root: an interrupted
+/// Shdeps archive swap's backup sibling and the standalone installer's lock.
+fn check_install_leftovers(inputs: &InstallInputs, managed_dir: bool, out: &mut Vec<Record>) {
+    if let (Some(parent), Some(name)) = (
+        inputs.managed_root.parent(),
+        inputs.managed_root.file_name(),
+    ) {
+        let prefix = format!("{}{SHDEPS_BACKUP_INFIX}", name.to_string_lossy());
+        let mut backups: Vec<String> = std::fs::read_dir(parent)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let entry_name = entry.file_name().to_string_lossy().into_owned();
+                entry_name
+                    .strip_prefix('.')
+                    .unwrap_or(&entry_name)
+                    .starts_with(&prefix)
+                    .then(|| tilde(&entry.path().to_string_lossy(), inputs.home))
+            })
+            .collect();
+        backups.sort();
+        if !backups.is_empty() {
+            let next = if managed_dir {
+                "remove it once dot runs from the current release"
+            } else {
+                "the install root is missing; run dot update to reinstall it"
+            };
+            out.push(Record::warn(
+                "interrupted Shdeps install left a backup",
+                Some(format!("{}; {next}", backups.join(" "))),
+            ));
+        }
+        let lock = parent.join(STANDALONE_CONTROL).join("lock");
+        if std::fs::symlink_metadata(&lock).is_ok() {
+            out.push(Record::warn(
+                "leftover standalone installer lock",
+                Some(format!(
+                    "{}: no longer used by this Shdeps install; remove it",
+                    tilde(&lock.to_string_lossy(), inputs.home)
+                )),
+            ));
+        }
     }
 }
 
@@ -1290,7 +1794,9 @@ pub struct ProviderInputs<'a> {
 /// `_dr_check_provider` (`doctor/provider.sh`): the dependency
 /// provider boundary (reviewed installer selection plus ABI
 /// agreement). Helper outcomes arrive via [`ProviderInputs`];
-/// only the `_dr_tilde` display runs in-process.
+/// only the `_dr_tilde` display runs in-process. The update policy,
+/// provider source, and development revision are configuration facts, so
+/// they render as informational rows that are never counted.
 pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
     let mut out = vec![Record::section("Dependency provider")];
     match inputs.dependency_provider {
@@ -1313,14 +1819,20 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
         inputs.policy
     };
     if !inputs.configure_ok {
-        out.push(Record::ok("Shdeps update policy", Some(policy.to_string())));
+        out.push(Record::info(
+            "Shdeps update policy",
+            Some(policy.to_string()),
+        ));
         out.push(Record::fail(
             "Shdeps provider is unavailable",
             Some("run dot update to bootstrap the reviewed provider release".to_string()),
         ));
         return out;
     }
-    out.push(Record::ok("Shdeps update policy", Some(policy.to_string())));
+    out.push(Record::info(
+        "Shdeps update policy",
+        Some(policy.to_string()),
+    ));
     let development = format!("{}/shdeps", inputs.dev_dir);
     let mut development_invalid = false;
     if policy == "latest" && inputs.development_exists && !inputs.development_valid {
@@ -1356,7 +1868,7 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
     }
     match installer.source {
         "explicit" => {
-            out.push(Record::ok(
+            out.push(Record::info(
                 "Shdeps provider source",
                 Some(format!(
                     "caller-selected reviewed installer: {}",
@@ -1370,7 +1882,7 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
         }
         "pinned-dev" => {
             if policy == "latest" {
-                out.push(Record::ok(
+                out.push(Record::info(
                     "Shdeps provider source",
                     Some(format!(
                         "development checkout selected by Dot lock: {}",
@@ -1384,7 +1896,7 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
             ));
         }
         "latest-dev" => {
-            out.push(Record::ok(
+            out.push(Record::info(
                 "Shdeps provider source",
                 Some(format!(
                     "trusted development checkout: {}",
@@ -1394,7 +1906,7 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
         }
         "managed" => {
             if policy == "latest" {
-                out.push(Record::ok(
+                out.push(Record::info(
                     "Shdeps provider source",
                     Some("managed release via reviewed bootstrap".to_string()),
                 ));
@@ -1418,7 +1930,7 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
         let current = inputs.development_revision.unwrap_or("");
         if !locked.is_empty() && current == locked {
             let short: String = current.chars().take(12).collect();
-            out.push(Record::ok(
+            out.push(Record::info(
                 "Shdeps development revision",
                 Some(format!("matches Dot lock: {short}")),
             ));
@@ -1428,7 +1940,7 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
             } else {
                 current
             };
-            out.push(Record::ok(
+            out.push(Record::info(
                 "Shdeps development revision",
                 Some(format!(
                     "trusted unpinned revision differs from Dot lock; accepted by latest policy: {shown}"
@@ -1598,11 +2110,212 @@ fn base_git_prefix(topology: &str, client_git_dir: &str, home: &str) -> Option<V
 /// call site, not here).
 fn base_git(topology: &str, client_git_dir: &str, home: &str, args: &[&str]) -> Option<String> {
     let prefix = base_git_prefix(topology, client_git_dir, home)?;
-    let output = crate::repos_base::run_git(&prefix, args)?;
+    let output = inspect_git(&prefix, args)?;
     if !output.status.success() {
         return None;
     }
     Some(captured(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Run one read-only repository inspection for doctor: the bound host Git,
+/// `prefix` then `args`, stdout captured, stderr and stdin closed. Inherited
+/// repository selectors (`GIT_INDEX_FILE` from a Git hook, say) are removed
+/// so the probe inspects the repository it names, while the user's Git
+/// configuration still applies.
+fn inspect_git(prefix: &[OsString], args: &[&str]) -> Option<std::process::Output> {
+    let mut command = crate::init_client_identity::host_git_command();
+    crate::temp::scrub_repository_selectors(&mut command);
+    command
+        .args(prefix)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .ok()
+}
+
+/// The single status invocation doctor spends per repository. It answers
+/// branch, upstream distance, and tracked changes at once (one process
+/// instead of four through a possibly slow `git` wrapper).
+/// `--untracked-files=no` is explicit: the base client's work tree is all of
+/// `$HOME`, and a host whose repository config lacks
+/// `status.showUntrackedFiles=no` would otherwise scan it.
+/// `--no-optional-locks` (a global option, so it precedes the subcommand)
+/// keeps status from taking `index.lock` to write its refresh: doctor is
+/// read-only, and a concurrent cron `dot update` must not lose the lock to
+/// it.
+pub const STATUS_ARGS: [&str; 5] = [
+    "--no-optional-locks",
+    "status",
+    "--porcelain=v2",
+    "--branch",
+    "--untracked-files=no",
+];
+
+/// One repository's state from one [`STATUS_ARGS`] run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoStatus {
+    /// `# branch.oid`: the HEAD commit, or `None` on an unborn branch.
+    pub oid: Option<String>,
+    /// `# branch.head`: the branch, or `None` when HEAD is detached.
+    pub head: Option<String>,
+    /// `# branch.upstream`, when one is configured.
+    pub upstream: Option<String>,
+    /// `# branch.ab` as (ahead, behind); Git prints it only when the
+    /// upstream resolves.
+    pub ahead_behind: Option<(u64, u64)>,
+    /// Changed tracked entries (`1` and `2` lines).
+    pub changed: usize,
+    /// Unmerged entries (`u` lines): every pull refuses to rebase over them.
+    pub unmerged: usize,
+}
+
+/// Parse `git status --porcelain=v2 --branch` output. Paths are quoted by
+/// Git when they hold a newline, so every entry is one line; unknown header
+/// and entry kinds (a newer Git) are ignored.
+pub fn parse_status_v2(text: &str) -> RepoStatus {
+    let mut status = RepoStatus::default();
+    for line in text.lines() {
+        if let Some(oid) = line.strip_prefix("# branch.oid ") {
+            status.oid = (oid != "(initial)").then(|| oid.to_string());
+        } else if let Some(head) = line.strip_prefix("# branch.head ") {
+            status.head = (head != "(detached)").then(|| head.to_string());
+        } else if let Some(upstream) = line.strip_prefix("# branch.upstream ") {
+            status.upstream = Some(upstream.to_string());
+        } else if let Some(counts) = line.strip_prefix("# branch.ab ") {
+            let mut parts = counts.split(' ');
+            let ahead = parts.next().and_then(|part| part.strip_prefix('+'));
+            let behind = parts.next().and_then(|part| part.strip_prefix('-'));
+            if let (Some(Ok(ahead)), Some(Ok(behind))) =
+                (ahead.map(str::parse), behind.map(str::parse))
+            {
+                status.ahead_behind = Some((ahead, behind));
+            }
+        } else if line.starts_with("1 ") || line.starts_with("2 ") {
+            status.changed += 1;
+        } else if line.starts_with("u ") {
+            status.unmerged += 1;
+        }
+    }
+    status
+}
+
+/// The row for unmerged entries, in `dot update`'s severity. Update fails
+/// only on a branch with an upstream and outside a merge, rebase, or `am`
+/// session ([`crate::repos_pull::check_index`] decides, so doctor and update
+/// share one rule); inside a session, or without a branch and upstream to
+/// pull, it skips the repository and so do we (a warning). `None` when the
+/// entries vanished since the status ran.
+fn unmerged_record(message: String, prefix: &[OsString], pullable: bool) -> Option<Record> {
+    if !pullable {
+        return Some(Record::warn(
+            message,
+            Some(
+                "resolve them; without a branch and upstream to pull, dot update skips this repository"
+                    .to_string(),
+            ),
+        ));
+    }
+    match crate::repos_pull::check_index(prefix) {
+        crate::repos_pull::IndexCheck::Clean => None,
+        crate::repos_pull::IndexCheck::Session(_) => Some(Record::warn(
+            message,
+            Some("a merge or rebase is in progress; dot update skips this repository until it is finished".to_string()),
+        )),
+        crate::repos_pull::IndexCheck::Unmerged(_) => Some(Record::fail(
+            message,
+            Some("dot update fails until the conflict is resolved; run dot status".to_string()),
+        )),
+    }
+}
+
+/// How a branch relates to its upstream when it is not current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Distance {
+    /// Only upstream has new commits.
+    Behind,
+    /// Only the branch has new commits.
+    Ahead,
+    /// Both have.
+    Diverged,
+}
+
+/// The [`Distance`] and its detail (`origin/main: 2 commit(s) behind`), or
+/// `None` when current. Callers word the message in their own row style.
+fn distance(upstream: &str, ahead: u64, behind: u64) -> Option<(Distance, String)> {
+    match (ahead, behind) {
+        (0, 0) => None,
+        (0, behind) => Some((
+            Distance::Behind,
+            format!("{upstream}: {behind} commit(s) behind"),
+        )),
+        (ahead, 0) => Some((
+            Distance::Ahead,
+            format!("{upstream}: {ahead} commit(s) ahead"),
+        )),
+        (ahead, behind) => Some((
+            Distance::Diverged,
+            format!("{upstream}: {ahead} ahead, {behind} behind"),
+        )),
+    }
+}
+
+/// The per-worktree Git directory of the checkout at `path`: `.git` itself,
+/// or the target a linked worktree's `.git` file names. Stat-level.
+fn worktree_git_dir(path: &Path) -> Option<PathBuf> {
+    let dot_git = path.join(".git");
+    let meta = std::fs::symlink_metadata(&dot_git).ok()?;
+    if meta.is_dir() {
+        return Some(dot_git);
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let target = text.strip_prefix("gitdir: ")?.trim_end();
+    Some(path.join(target))
+}
+
+/// The frozen-rebase failure row: `dot update` refuses to retry a rebase
+/// that conflicted (or failed twice) while the same HEAD and upstream tip
+/// stay put. Doctor matches the recorded HEAD against `branch.oid`, which
+/// costs no process; an upstream that moved since makes update retry, which
+/// the next update shows.
+fn frozen_rebase_record(
+    message: impl Fn(&str) -> String,
+    git_dir: Option<&Path>,
+    status: &RepoStatus,
+    optional: bool,
+) -> Option<Record> {
+    // Update consults the marker only on a branch with an upstream; a
+    // detached HEAD or a missing upstream is skipped (and reported) first.
+    let upstream = status
+        .upstream
+        .as_deref()
+        .filter(|_| status.head.is_some())?;
+    let head = crate::repos_pull::frozen_rebase_head(git_dir?)?;
+    if status.oid.as_deref() != Some(head.as_str()) {
+        return None;
+    }
+    Some(if optional {
+        // An optional overlay's frozen pull leaves it empty for that run
+        // without failing the update.
+        Record::warn(
+            message(upstream),
+            Some("dot update skips this optional overlay until you rebase by hand".to_string()),
+        )
+    } else {
+        Record::fail(
+            message(upstream),
+            Some(
+                "dot update refuses to retry it until you rebase by hand or either side moves"
+                    .to_string(),
+            ),
+        )
+    })
 }
 
 /// `_dr_check_base_repo` (`doctor/repos.sh`): client repository
@@ -1631,23 +2344,22 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
         "client Git directory exists",
         Some(tilde(inputs.client_git_dir, inputs.home)),
     ));
+    let git = |args: &[&str]| base_git(inputs.topology, inputs.client_git_dir, inputs.home, args);
     if inputs.topology == "ordinary" {
         out.push(Record::ok("ordinary client layout", None));
     } else {
-        let is_bare = base_git(
-            inputs.topology,
-            inputs.client_git_dir,
-            inputs.home,
-            &["config", "--get", "core.bare"],
-        )
-        .unwrap_or_else(|| "false".to_string());
-        let has_worktree = base_git(
-            inputs.topology,
-            inputs.client_git_dir,
-            inputs.home,
-            &["config", "--get", "core.worktree"],
-        )
-        .unwrap_or_default();
+        // Both layout keys in one process; `--get` semantics (last value
+        // wins) and the old defaults (`false`, empty) when unset.
+        let (mut is_bare, mut has_worktree) = ("false".to_string(), String::new());
+        let layout =
+            git(&["config", "-z", "--get-regexp", r"^core\.(bare|worktree)$"]).unwrap_or_default();
+        for entry in layout.split('\0') {
+            match entry.split_once('\n') {
+                Some(("core.bare", value)) => is_bare = value.to_string(),
+                Some(("core.worktree", value)) => has_worktree = value.to_string(),
+                _ => {}
+            }
+        }
         if is_bare == "true" {
             out.push(Record::ok("legacy bare client layout", None));
         } else if !has_worktree.is_empty() {
@@ -1662,13 +2374,7 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
             ));
         }
     }
-    let resolved = base_git(
-        inputs.topology,
-        inputs.client_git_dir,
-        inputs.home,
-        &["rev-parse", "--show-toplevel"],
-    )
-    .unwrap_or_default();
+    let resolved = git(&["rev-parse", "--show-toplevel"]).unwrap_or_default();
     if resolved == inputs.home {
         out.push(Record::ok("client worktree resolves to $HOME", None));
     } else {
@@ -1682,101 +2388,198 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
             Some(format!("expected {}, got {got}", inputs.home)),
         ));
     }
-    // `status --porcelain | grep -cvE '^\?\?'`: only non-`??`
-    // lines count; any `git` failure reads `0` through `|| true`.
-    let dirty: usize = match base_git(
-        inputs.topology,
-        inputs.client_git_dir,
-        inputs.home,
-        &["status", "--porcelain"],
-    ) {
-        Some(status) if !status.is_empty() => status
-            .split('\n')
-            .filter(|line| !line.starts_with("??"))
-            .count(),
-        _ => 0,
+    let Some(status) = git(&STATUS_ARGS).map(|text| parse_status_v2(&text)) else {
+        out.push(Record::warn(
+            "client repository status is unavailable",
+            Some("run dot status to inspect".to_string()),
+        ));
+        return out;
     };
-    if dirty == 0 {
+    if status.unmerged > 0 {
+        let pullable = status.head.is_some() && status.upstream.is_some();
+        let prefix = base_git_prefix(inputs.topology, inputs.client_git_dir, inputs.home)
+            .unwrap_or_default();
+        out.extend(unmerged_record(
+            format!("{} unmerged client path(s)", status.unmerged),
+            &prefix,
+            pullable,
+        ));
+    }
+    let git_dir = if inputs.topology == "separate" {
+        Some(PathBuf::from(inputs.client_git_dir))
+    } else {
+        worktree_git_dir(Path::new(inputs.home))
+    };
+    out.extend(frozen_rebase_record(
+        |upstream| format!("the last client rebase onto {upstream} conflicted; rebase manually"),
+        git_dir.as_deref(),
+        &status,
+        false,
+    ));
+    // Unmerged entries are tracked changes too, as the old porcelain-v1
+    // count had it.
+    let tracked = status.changed + status.unmerged;
+    if tracked == 0 {
         out.push(Record::ok("no tracked client changes", None));
     } else {
         out.push(Record::warn(
-            format!("{dirty} tracked client change(s)"),
+            format!("{tracked} tracked client change(s)"),
             Some("run dot status to inspect".to_string()),
         ));
     }
-    let head = base_git(
-        inputs.topology,
-        inputs.client_git_dir,
-        inputs.home,
-        &["symbolic-ref", "--short", "HEAD"],
-    )
-    .unwrap_or_default();
-    if head.is_empty() {
-        out.push(Record::warn("client HEAD is detached", None));
-    } else {
-        out.push(Record::ok("client HEAD on branch", Some(head)));
+    match &status.head {
+        Some(head) => out.push(Record::ok("client HEAD on branch", Some(head.clone()))),
+        None => out.push(Record::warn("client HEAD is detached", None)),
     }
-    let upstream = base_git(
-        inputs.topology,
-        inputs.client_git_dir,
-        inputs.home,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-    )
-    .unwrap_or_default();
-    if upstream.is_empty() {
+    let Some(upstream) = status.upstream.as_deref().filter(|_| status.head.is_some()) else {
         out.push(Record::warn("client upstream is not configured", None));
         return out;
-    }
-    let counts = base_git(
-        inputs.topology,
-        inputs.client_git_dir,
-        inputs.home,
-        &[
-            "rev-list",
-            "--left-right",
-            "--count",
-            &format!("HEAD...{upstream}"),
-        ],
-    )
-    .unwrap_or_default();
-    // `IFS=$'\t' read -r ahead behind`: tab-separated, the
-    // second variable keeping the remainder; no tab at all reads
-    // both empty (the shell guards with `== *tab*` first).
-    let (ahead, behind) = match counts.split_once('\t') {
-        Some((ahead, behind)) => (ahead.to_string(), behind.to_string()),
-        None => (String::new(), String::new()),
     };
-    if is_uint(&ahead) && is_uint(&behind) {
-        let ahead_count: u64 = ahead.parse().unwrap_or(0);
-        let behind_count: u64 = behind.parse().unwrap_or(0);
-        if ahead_count == 0 && behind_count == 0 {
-            out.push(Record::ok(
+    match status.ahead_behind {
+        Some((ahead, behind)) => match distance(upstream, ahead, behind) {
+            None => out.push(Record::ok(
                 "client upstream",
                 Some(format!("{upstream} (current)")),
-            ));
-        } else if ahead_count == 0 {
-            out.push(Record::warn(
-                "client is behind upstream",
-                Some(format!("{upstream}: {behind} commit(s) behind")),
-            ));
-        } else if behind_count == 0 {
-            out.push(Record::warn(
-                "client is ahead of upstream",
-                Some(format!("{upstream}: {ahead} commit(s) ahead")),
-            ));
-        } else {
-            out.push(Record::warn(
-                "client upstream has diverged",
-                Some(format!("{upstream}: {ahead} ahead, {behind} behind")),
-            ));
-        }
-    } else {
-        out.push(Record::warn(
+            )),
+            Some((kind, detail)) => {
+                // The client keeps its established wording.
+                let message = match kind {
+                    Distance::Behind => "client is behind upstream",
+                    Distance::Ahead => "client is ahead of upstream",
+                    Distance::Diverged => "client upstream has diverged",
+                };
+                out.push(Record::warn(message, Some(detail)));
+            }
+        },
+        None => out.push(Record::warn(
             "client upstream could not be compared",
-            Some(upstream),
-        ));
+            Some(upstream.to_string()),
+        )),
     }
     out
+}
+
+/// Branch, upstream, and tracked-change rows for one cloned overlay, in the
+/// severities `dot update` gives them: unmerged entries fail where update
+/// refuses to pull over them (see [`unmerged_record`]), while tracked
+/// changes, a detached HEAD, a missing or gone upstream (update skips
+/// pulling that overlay), and upstream distance warn. A clean overlay on
+/// its current upstream reads as one row.
+fn overlay_state_records(
+    name: &str,
+    path: &str,
+    optional: bool,
+    status: Option<&RepoStatus>,
+    out: &mut Vec<Record>,
+) {
+    let Some(status) = status else {
+        out.push(Record::warn(
+            format!("{name}: repository status is unavailable"),
+            Some("run dot status to inspect".to_string()),
+        ));
+        return;
+    };
+    if status.unmerged > 0 {
+        let pullable = status.head.is_some() && status.upstream.is_some();
+        let prefix = [OsString::from("-C"), OsString::from(path)];
+        out.extend(unmerged_record(
+            format!("{name}: {} unmerged path(s)", status.unmerged),
+            &prefix,
+            pullable,
+        ));
+    }
+    out.extend(frozen_rebase_record(
+        |upstream| format!("{name}: the last rebase onto {upstream} conflicted; rebase manually"),
+        worktree_git_dir(Path::new(path)).as_deref(),
+        status,
+        optional,
+    ));
+    let tracked = status.changed + status.unmerged;
+    if tracked > 0 {
+        out.push(Record::warn(
+            format!("{name}: {tracked} tracked change(s)"),
+            Some("run dot status to inspect".to_string()),
+        ));
+    }
+    if status.head.is_none() {
+        out.push(Record::warn(
+            format!("{name}: HEAD is detached"),
+            Some("dot update skips this overlay until it is back on a branch".to_string()),
+        ));
+        return;
+    }
+    let Some(upstream) = status.upstream.as_deref() else {
+        out.push(Record::warn(
+            format!("{name}: upstream is not configured"),
+            Some("dot update skips pulling this overlay".to_string()),
+        ));
+        return;
+    };
+    match status.ahead_behind {
+        Some((ahead, behind)) => match distance(upstream, ahead, behind) {
+            None => out.push(Record::ok(
+                format!("{name}: upstream"),
+                Some(format!("{upstream} (current)")),
+            )),
+            Some((kind, detail)) => {
+                let predicate = match kind {
+                    Distance::Behind => "behind upstream",
+                    Distance::Ahead => "ahead of upstream",
+                    Distance::Diverged => "diverged from upstream",
+                };
+                out.push(Record::warn(format!("{name}: {predicate}"), Some(detail)));
+            }
+        },
+        // Git names the upstream but cannot resolve it (a gone branch);
+        // update's upstream probe fails the same way and skips the pull.
+        None => out.push(Record::warn(
+            format!("{name}: upstream could not be compared"),
+            Some(format!("{upstream}; dot update skips pulling this overlay")),
+        )),
+    }
+}
+
+/// [`STATUS_ARGS`] for one overlay checkout, `None` when Git fails.
+fn overlay_status(path: &str) -> Option<RepoStatus> {
+    let prefix = [OsString::from("-C"), OsString::from(path)];
+    let output = inspect_git(&prefix, &STATUS_ARGS)?;
+    output
+        .status
+        .success()
+        .then(|| parse_status_v2(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Run [`overlay_status`] for every path concurrently: each is an
+/// independent read-only Git process, and serially they would add one Git
+/// round trip per overlay to every doctor run.
+fn overlay_statuses(paths: Vec<String>) -> BTreeMap<String, Option<RepoStatus>> {
+    let host_git = crate::init_client_identity::carry_host_git();
+    std::thread::scope(|scope| {
+        // A thread the OS refuses runs its probe inline instead; a probe
+        // that panics leaves its path out, which reads as "unavailable".
+        let mut results = BTreeMap::new();
+        let mut handles = Vec::new();
+        for path in paths {
+            let carried = host_git.clone();
+            let spawned = std::thread::Builder::new().spawn_scoped(scope, {
+                let path = path.clone();
+                move || {
+                    let _host_git = carried.bind();
+                    let status = overlay_status(&path);
+                    (path, status)
+                }
+            });
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(_) => {
+                    let status = overlay_status(&path);
+                    results.insert(path, status);
+                }
+            }
+        }
+        results.extend(handles.into_iter().filter_map(|handle| handle.join().ok()));
+        results
+    })
 }
 
 #[cfg(test)]
@@ -1800,10 +2603,22 @@ mod tests {
         let stale = rendered(Activity::Stale);
         assert!(stale.contains("owner is stale"));
         assert!(stale.contains("will reclaim it"));
-        for activity in [Activity::Unknown, Activity::Interrupted] {
-            let row = rendered(activity);
-            assert!(row.contains("cannot be verified"));
-            assert!(row.contains("refuse"));
+        assert!(rendered(Activity::Active).contains('⚠'));
+        assert!(stale.contains('⚠'));
+        // `acquire` refuses on an unverifiable owner, so doctor fails; a
+        // probe interrupted by a signal to doctor itself only warns.
+        let unknown = rendered(Activity::Unknown);
+        assert!(
+            unknown.contains("✗ update lock owner cannot be verified"),
+            "{unknown}"
+        );
+        assert!(unknown.contains("refuse"));
+        let interrupted = rendered(Activity::Interrupted);
+        assert!(
+            interrupted.contains("⚠ update lock owner cannot be verified"),
+            "{interrupted}"
+        );
+        for row in [unknown, interrupted] {
             assert!(!row.contains("reclaim"));
         }
     }

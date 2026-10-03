@@ -17,9 +17,12 @@
 //!   listing, never as an `Err` — instead of "fixing" the swallowed
 //!   status the shell suite pins.
 //! - Per-file trust validation (`_dot_extension_file_validate`) belongs to the
-//!   extension-trust module. [`collect_specs_with`] accepts that predicate so
-//!   trust and identity failures retain the shell loop's first-failure order;
-//!   [`collect_specs`] supplies the trusted test seam used by focused rows.
+//!   extension-trust module. [`collect_specs_with`] accepts that predicate and
+//!   refuses each untrusted file on its own ([`Discovery::rejected`]) instead
+//!   of abandoning discovery: a dangling overlay link left between a pull
+//!   that renamed an extension and the link phase must not hide every other
+//!   extension. [`collect_specs`] supplies the trusted test seam used by
+//!   focused rows.
 //! - Names travel as `&[u8]` throughout (byte sort is `LC_ALL=C`
 //!   sort; the identity character classes are ASCII ranges), so
 //!   non-UTF8 entry names behave like the shell's.
@@ -49,12 +52,6 @@ pub struct Spec {
 /// [`Discovery::error`] with [`SpecError::code`] pinned at 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecError {
-    /// `dot: unsafe doctor extension: <path>` — the trust gate failed before
-    /// the script's identity was interpreted.
-    Unsafe {
-        /// Offending extension path.
-        script: PathBuf,
-    },
     /// `dot: invalid doctor extension identity: <basename>` — the
     /// key matches neither the bare nor the numerically prefixed
     /// identity shape.
@@ -75,7 +72,6 @@ impl SpecError {
     /// pipe swallows it before callers can see it).
     pub fn code(self) -> i32 {
         match self {
-            SpecError::Unsafe { .. } => 1,
             SpecError::InvalidIdentity { .. } => 1,
             SpecError::DuplicateIdentity { .. } => 1,
         }
@@ -85,12 +81,6 @@ impl SpecError {
     /// trailing newline included.
     pub fn message(&self) -> Vec<u8> {
         match self {
-            SpecError::Unsafe { script } => {
-                let mut line = b"dot: unsafe doctor extension: ".to_vec();
-                line.extend_from_slice(script.as_os_str().as_encoded_bytes());
-                line.push(b'\n');
-                line
-            }
             SpecError::InvalidIdentity { file_name } => {
                 let mut line = b"dot: invalid doctor extension identity: ".to_vec();
                 line.extend_from_slice(file_name);
@@ -118,6 +108,9 @@ pub struct Discovery {
     /// shell still exits 0 through the `sort` pipe; callers surface
     /// [`SpecError::message`] on stderr to match.
     pub error: Option<SpecError>,
+    /// Scripts the trust predicate refused, in glob order. They never run
+    /// and never claim an identity; callers report each one.
+    pub rejected: Vec<PathBuf>,
 }
 
 /// Rendered `key\tscript` bytes of one spec: the unit the shell
@@ -214,8 +207,9 @@ pub fn collect_specs(dir: &Path) -> std::io::Result<Discovery> {
 }
 
 /// Discover doctor extensions with the caller's trust predicate in the same
-/// ordered loop as identity validation. This preserves the first failing
-/// condition when an unsafe script precedes a malformed or duplicate name.
+/// ordered loop as identity validation. A refused script is set aside in
+/// [`Discovery::rejected`] and claims no identity; the first malformed or
+/// duplicate identity among trusted scripts still stops discovery.
 pub fn collect_specs_with(
     dir: &Path,
     mut trusted: impl FnMut(&Path) -> bool,
@@ -235,17 +229,19 @@ pub fn collect_specs_with(
     names.sort();
     let dir_bytes = dir.as_os_str().as_encoded_bytes();
     let mut specs: Vec<Spec> = Vec::new();
+    let mut rejected: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     for name in &names {
         let mut script = dir_bytes.to_vec();
         script.push(b'/');
         script.extend_from_slice(name);
         let script = PathBuf::from(std::ffi::OsStr::from_bytes(&script));
+        // Trust still gates every script; a refused one is reported on its
+        // own and claims no identity, so a stale link left by a renamed
+        // extension neither runs nor collides with its replacement.
         if !trusted(&script) {
-            return Ok(Discovery {
-                specs,
-                error: Some(SpecError::Unsafe { script }),
-            });
+            rejected.push(script);
+            continue;
         }
         let key = extension_key(name).to_vec();
         let identity = match extension_identity(&key) {
@@ -256,6 +252,7 @@ pub fn collect_specs_with(
                     error: Some(SpecError::InvalidIdentity {
                         file_name: name.clone(),
                     }),
+                    rejected,
                 });
             }
         };
@@ -263,6 +260,7 @@ pub fn collect_specs_with(
             return Ok(Discovery {
                 specs,
                 error: Some(SpecError::DuplicateIdentity { identity }),
+                rejected,
             });
         }
         specs.push(Spec { key, script });
@@ -271,7 +269,11 @@ pub fn collect_specs_with(
     // rendered bytes (not just keys) keeps `key`-prefix corners
     // byte-exact.
     specs.sort_by_key(spec_line);
-    Ok(Discovery { specs, error: None })
+    Ok(Discovery {
+        specs,
+        error: None,
+        rejected,
+    })
 }
 
 /// The canonical record kind, retained under the coordinator's historical
@@ -279,8 +281,11 @@ pub fn collect_specs_with(
 pub use crate::doctor_runtime::Kind as RecordKind;
 
 /// The `case $kind in ...` dispatch of
-/// `_dot_doctor_render_records`: the five known kinds map to their
-/// renderer, everything else to [`RecordKind::Unknown`].
+/// `_dot_doctor_render_records`: the six known kinds map to their
+/// renderer, everything else to [`RecordKind::Unknown`]. `info` is newer
+/// than the other five: an older coordinator renders it as an invalid
+/// result, which is why extensions probe for `dot_doctor_info` before
+/// calling it (see `doctor-api-v1.tsv`).
 pub fn record_kind(kind: &[u8]) -> RecordKind {
     match kind {
         b"section" => RecordKind::Section,
@@ -288,6 +293,7 @@ pub fn record_kind(kind: &[u8]) -> RecordKind {
         b"warn" => RecordKind::Warn,
         b"fail" => RecordKind::Fail,
         b"skip" => RecordKind::Skip,
+        b"info" => RecordKind::Info,
         _ => RecordKind::Unknown,
     }
 }

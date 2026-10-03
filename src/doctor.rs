@@ -15,10 +15,54 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::doctor_checks::{
-    BaseRepoInputs, CronInputs, LifecycleInputs, MergeInputs, MergeSpec, OverlayInputs,
-    ProviderInputs, ProviderInstaller,
+    BaseRepoInputs, CronInputs, InstallInputs, LifecycleInputs, MergeInputs, MergeSpec,
+    OverlayInputs, ProviderInputs, ProviderInstaller,
 };
 use crate::doctor_orchestrator::{EngineSnapshot, Recorder, RuntimeSnapshot};
+
+/// `dot doctor --help` output.
+pub const USAGE: &str = "usage: dot doctor [-h|--help]
+
+Run the core health checks, then every configured doctor.d extension, and
+report each finding. Exits 1 when a check fails or an extension fails, times
+out, or is refused, and 2 for an argument doctor does not take; warnings do
+not change the exit status.
+
+  -h, --help  print this usage
+
+Environment:
+  DOT_DOCTOR_JOBS     extensions run concurrently (default: DOT_UPDATE_JOBS,
+                      else the CPU count; 1 runs them serially)
+  DOT_DOCTOR_TIMEOUT  seconds each extension may run before it is stopped
+                      and reported as timed out (default 60; 0 disables)
+";
+
+/// What `dot doctor`'s arguments ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Request {
+    /// Run the checks.
+    Run,
+    /// Print [`USAGE`].
+    Help,
+    /// An argument doctor does not take (reported, exit 2).
+    Unexpected(Vec<u8>),
+}
+
+/// Parse `dot doctor`'s arguments. Doctor takes none besides help; it used to
+/// ignore everything, so `dot doctor --help` ran every check instead of
+/// explaining them. Help wins wherever it appears.
+pub fn parse_args(args: &[&[u8]]) -> Request {
+    if args
+        .iter()
+        .any(|arg| *arg == b"-h".as_slice() || *arg == b"--help".as_slice())
+    {
+        return Request::Help;
+    }
+    match args.first() {
+        Some(arg) => Request::Unexpected(arg.to_vec()),
+        None => Request::Run,
+    }
+}
 
 /// Run all core and configured extension health checks.
 pub fn run(runtime: &crate::app::Runtime, streams: &mut crate::app::Streams<'_>) -> i32 {
@@ -86,6 +130,16 @@ fn run_configured(
         &engine,
         home.as_bytes(),
     );
+    append(
+        emit.recorder(),
+        crate::doctor_checks::check_install_layout(&InstallInputs {
+            home: &home,
+            source_real: Path::new(OsStr::from_bytes(&engine.source_real)),
+            release_root: runtime_snapshot.release_root,
+            managed_root: Path::new(OsStr::from_bytes(&engine.managed_raw)),
+            shdeps: config.provider == crate::config::Provider::Shdeps,
+        }),
+    );
     emit.emit();
 
     let topology = topology_name(base.topology);
@@ -97,10 +151,10 @@ fn run_configured(
             topology,
             client_git_dir: git_dir,
             home: &home,
-            is_client_checkout: crate::doctor_checks::is_client_checkout(
-                Path::new(&home),
-                Some(&marker),
-            ),
+            // Consulted only without a separate client: skip its Git probes on
+            // every other host.
+            is_client_checkout: base.topology == crate::repos_base::Topology::Missing
+                && crate::doctor_checks::is_client_checkout(Path::new(&home), Some(&marker)),
         }),
     );
     emit.emit();
@@ -116,8 +170,19 @@ fn run_configured(
         crate::doctor_checks::check_cron_freshness(&CronInputs {
             last_success: crate::update_status::read_last_success(runtime.state_home()),
             last_converged: crate::update_status::read_last_converged(runtime.state_home()),
+            last_run: crate::update_status::read_last_run(runtime.state_home()),
+            cron_available: runtime.find_on_path("crontab").is_some(),
             now: crate::update_engine::now_secs(),
         }),
+    );
+    let checkpoint = crate::shdeps::checkpoint_in(runtime.state_home());
+    append(
+        emit.recorder(),
+        crate::doctor_checks::check_reexec_checkpoint(
+            &crate::shdeps::checkpoint_state(&checkpoint, runtime.source_root()),
+            &checkpoint,
+            &home,
+        ),
     );
     emit.emit();
     append(
@@ -211,6 +276,7 @@ fn run_configured(
         config,
         euid,
         &overlays.active,
+        overlays.discovery_error.is_some(),
         &constants.overlay_manifest,
         streams.stderr,
         &mut emit,
@@ -770,11 +836,13 @@ fn merge_inventory(
     Some(inventory)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extensions(
     runtime: &crate::app::Runtime,
     config: &crate::config::Config,
     euid: u32,
     overlays: &[String],
+    overlays_unresolved: bool,
     manifest: &str,
     stderr: &mut dyn std::io::Write,
     emit: &mut Emitter<'_>,
@@ -814,11 +882,23 @@ fn extensions(
             return 1;
         }
     };
+    // Refused scripts fail; the rest still run.
+    let status = i32::from(!discovery.rejected.is_empty());
+    record_rejected(
+        emit.recorder(),
+        &discovery.rejected,
+        &trust,
+        overlays,
+        overlays_unresolved,
+    );
     if let Some(error) = discovery.error {
         let _ = stderr.write_all(&error.message());
         emit.recorder()
             .fail(b"doctor extension discovery failed", None);
         return 1;
+    }
+    if discovery.specs.is_empty() {
+        return status;
     }
     let context_overlays: Vec<Vec<u8>> = overlays
         .iter()
@@ -830,9 +910,14 @@ fn extensions(
     let worker = crate::hook_worker::Worker::with_doctor(runtime, root, bash.path().to_path_buf());
     let home = text(runtime.value("HOME"));
     let temporary = temporary_root(runtime);
+    let timeout = extension_timeout(runtime);
     let abort = AtomicBool::new(false);
     let execute = |spec: &crate::doctor_coordinator::Spec| {
         let mut launch = |call: &crate::doctor_orchestrator::WorkerInvocation<'_>| {
+            // The deadline starts when the worker launches, not while it
+            // waits for a slot in the window.
+            // A limit too far out to represent is no deadline at all.
+            let deadline = timeout.and_then(|limit| std::time::Instant::now().checked_add(limit));
             let outcome = worker.doctor(
                 call.script,
                 call.temporary,
@@ -840,9 +925,13 @@ fn extensions(
                 call.context,
                 call.token,
                 &abort,
+                deadline,
             );
             let _ = std::fs::write(call.log, &outcome.output);
-            outcome.rc
+            crate::doctor_orchestrator::WorkerExit {
+                rc: outcome.rc,
+                timed_out: timeout.filter(|_| outcome.timed_out),
+            }
         };
         crate::doctor_orchestrator::execute_extension_for(
             &spec.key,
@@ -860,7 +949,111 @@ fn extensions(
     } else {
         1
     };
-    dispatch_extensions(&discovery.specs, jobs, &execute, &abort, emit)
+    dispatch_extensions(&discovery.specs, jobs, &execute, &abort, emit).max(status)
+}
+
+/// Failure rows for refused doctor extensions. Links that are dangling or
+/// that the overlay manifest does not authorize are almost always overlay
+/// extensions waiting for the link phase: a pull renamed them, or the
+/// overlays did not resolve this run. They share one row naming them all,
+/// because one cause (and one `dot update`) covers every one; per-link rows
+/// blamed owners and modes that are fine. An authorized link whose target
+/// fails trust (a writable checkout, say), and a regular file that does, is
+/// a real local problem that `dot update` will not fix: a row of its own.
+fn record_rejected(
+    recorder: &mut Recorder,
+    rejected: &[PathBuf],
+    trust: &crate::extension_trust::Inputs,
+    overlays: &[String],
+    overlays_unresolved: bool,
+) {
+    let home = trust.home.as_str();
+    let key = |script: &Path| {
+        let name = script.file_name().unwrap_or(script.as_os_str()).as_bytes();
+        String::from_utf8_lossy(crate::doctor_coordinator::extension_key(name)).into_owned()
+    };
+    let (links, files): (Vec<&PathBuf>, Vec<&PathBuf>) = rejected.iter().partition(|script| {
+        let link =
+            std::fs::symlink_metadata(script).is_ok_and(|meta| meta.file_type().is_symlink());
+        let dangling = std::fs::metadata(script).is_err();
+        link && (dangling
+            || !crate::extension_trust::symlink_authorized(
+                script,
+                home,
+                &trust.manifest,
+                overlays,
+                trust.euid,
+            ))
+    });
+    if !links.is_empty() {
+        let message = match links.as_slice() {
+            [only] => format!("{} doctor extension refused", key(only)),
+            many => format!("{} doctor extensions refused", many.len()),
+        };
+        let subject = match links.as_slice() {
+            [only] => format!(
+                "{} is",
+                crate::doctor_paths::tilde(&only.to_string_lossy(), home)
+            ),
+            many => format!(
+                "{} are",
+                many.iter()
+                    .map(|link| key(link))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let next = if overlays_unresolved {
+            "the overlays did not resolve; fix the overlay error above, then run dot update"
+        } else {
+            "run dot update to relink overlay extensions"
+        };
+        let kind = if links.len() == 1 {
+            "a dangling or retired link"
+        } else {
+            "dangling or retired links"
+        };
+        let detail = format!("{subject} not linked from an active overlay ({kind}); {next}");
+        recorder.fail(message.as_bytes(), Some(detail.as_bytes()));
+    }
+    for script in files {
+        let message = format!("{} doctor extension refused", key(script));
+        let shown = crate::doctor_paths::tilde(&script.to_string_lossy(), home);
+        let link =
+            std::fs::symlink_metadata(script).is_ok_and(|meta| meta.file_type().is_symlink());
+        let detail = if link {
+            format!(
+                "{shown} links to a file that fails the extension trust checks; check its owner and mode"
+            )
+        } else {
+            format!("{shown} fails the extension trust checks; check its owner and mode")
+        };
+        recorder.fail(message.as_bytes(), Some(detail.as_bytes()));
+    }
+}
+
+/// Default per-extension deadline: well above the slowest shipped extension
+/// (an editor health check with its own 15s bound, on a loaded host running
+/// every extension at once), yet a hung probe no longer holds every later
+/// section hostage.
+const DEFAULT_EXTENSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The per-extension deadline: `DOT_DOCTOR_TIMEOUT` seconds when it is a
+/// whole number (`0` disables the deadline), otherwise the default.
+fn extension_timeout(runtime: &crate::app::Runtime) -> Option<std::time::Duration> {
+    timeout_from(runtime.value("DOT_DOCTOR_TIMEOUT").and_then(OsStr::to_str))
+}
+
+fn timeout_from(value: Option<&str>) -> Option<std::time::Duration> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) if value.bytes().all(|byte| byte.is_ascii_digit()) => match value.parse() {
+            Ok(0) => None,
+            Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+            // Too large to represent: effectively no deadline.
+            Err(_) => None,
+        },
+        _ => Some(DEFAULT_EXTENSION_TIMEOUT),
+    }
 }
 
 /// Bound on concurrently running doctor extensions: `DOT_DOCTOR_JOBS` when
@@ -1204,6 +1397,27 @@ mod tests {
     use super::run_configured;
 
     #[test]
+    fn timeout_parsing_defaults_disables_and_saturates() {
+        use std::time::Duration;
+        let default = Some(super::DEFAULT_EXTENSION_TIMEOUT);
+        assert_eq!(super::timeout_from(None), default);
+        assert_eq!(super::timeout_from(Some("")), default);
+        assert_eq!(
+            super::timeout_from(Some(" 5 ")),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(super::timeout_from(Some("0")), None);
+        for malformed in ["+5", "1.5", "-1", "5s", "x"] {
+            assert_eq!(super::timeout_from(Some(malformed)), default, "{malformed}");
+        }
+        // Too large for u64: no deadline. Fits u64 but not an Instant: the
+        // launch closure's checked add also yields no deadline (no panic).
+        assert_eq!(super::timeout_from(Some("99999999999999999999")), None);
+        let huge = super::timeout_from(Some("18446744073709551615")).expect("fits u64");
+        assert_eq!(std::time::Instant::now().checked_add(huge), None);
+    }
+
+    #[test]
     fn job_counts_saturate_instead_of_collapsing_to_serial() {
         assert_eq!(super::jobs_count("3"), 3);
         assert_eq!(super::jobs_count("0"), 1);
@@ -1258,7 +1472,7 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 sibling_aborted.store(abort.load(Ordering::SeqCst), Ordering::SeqCst);
-                1
+                crate::doctor_orchestrator::WorkerExit::from(1)
             };
             crate::doctor_orchestrator::execute_extension_for(
                 &spec.key,

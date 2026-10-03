@@ -37,6 +37,15 @@ pub(crate) struct UpdateEnvironment<'a> {
     pub(crate) verbose: bool,
 }
 
+/// One doctor extension's end: the worker outcome plus whether the
+/// coordinator's deadline stopped it.
+pub(crate) struct DoctorOutcome {
+    pub(crate) rc: i32,
+    pub(crate) output: Vec<u8>,
+    /// The extension ran past its deadline and its session was stopped.
+    pub(crate) timed_out: bool,
+}
+
 /// One pre-sync worker's separately routed process streams.
 pub(crate) struct PreSyncOutcome {
     pub(crate) rc: i32,
@@ -135,7 +144,12 @@ impl Worker {
     /// Setting `abort` stops the extension's session with the same bounded
     /// graceful teardown a signal gets. The coordinator uses it to cancel
     /// sibling extensions when one worker thread fails, without depending
-    /// on a process-wide signal.
+    /// on a process-wide signal. Passing `deadline` stops a hung extension
+    /// the same way once it passes, and reports it as timed out. The
+    /// supervisor re-checks the deadline after teardown, so an extension
+    /// that exits only just before it (or leaves a helper running past it)
+    /// can still read as timed out; its filed rows render either way.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn doctor(
         &self,
         script: &Path,
@@ -144,8 +158,9 @@ impl Worker {
         context: &Path,
         token: &str,
         abort: &AtomicBool,
-    ) -> WorkerOutcome {
-        self.launch_abortable(
+        deadline: Option<std::time::Instant>,
+    ) -> DoctorOutcome {
+        let (outcome, timed_out) = self.launch_abortable(
             "doctor",
             script,
             temporary,
@@ -153,7 +168,13 @@ impl Worker {
             context,
             token,
             Some(abort),
-        )
+            deadline,
+        );
+        DoctorOutcome {
+            rc: outcome.rc,
+            output: outcome.output,
+            timed_out,
+        }
     }
 
     fn command(
@@ -315,9 +336,20 @@ impl Worker {
         context: &Path,
         token: &str,
     ) -> WorkerOutcome {
-        self.launch_abortable(mode, script, result_dir, result_file, context, token, None)
+        self.launch_abortable(
+            mode,
+            script,
+            result_dir,
+            result_file,
+            context,
+            token,
+            None,
+            None,
+        )
+        .0
     }
 
+    /// Launch one worker; the flag reports a session stopped at `deadline`.
     #[allow(clippy::too_many_arguments)]
     fn launch_abortable(
         &self,
@@ -328,23 +360,30 @@ impl Worker {
         context: &Path,
         token: &str,
         abort: Option<&AtomicBool>,
-    ) -> WorkerOutcome {
+        deadline: Option<std::time::Instant>,
+    ) -> (WorkerOutcome, bool) {
         let command = match self.command(mode, script, result_dir, result_file, context, token) {
             Ok(command) => command,
             Err(CommandFailure::Invalid) => {
-                return WorkerOutcome {
-                    rc: 1,
-                    output: Vec::new(),
-                };
+                return (
+                    WorkerOutcome {
+                        rc: 1,
+                        output: Vec::new(),
+                    },
+                    false,
+                );
             }
             Err(CommandFailure::Bash(error)) => {
-                return WorkerOutcome {
-                    rc: 1,
-                    output: self.runtime.bash_error_line_once(&error),
-                };
+                return (
+                    WorkerOutcome {
+                        rc: 1,
+                        output: self.runtime.bash_error_line_once(&error),
+                    },
+                    false,
+                );
             }
         };
-        let outcome = combined(command, result_dir, abort);
+        let outcome = combined(command, result_dir, abort, deadline);
         // The hook ran arbitrary user code: it may have replaced
         // repository directories, so memoized probe answers are
         // no longer trustworthy.
@@ -379,8 +418,24 @@ fn xdg_home(runtime: &Runtime, key: &str, fallback: &str) -> Option<PathBuf> {
 
 /// Bash's `2>&1` gives both streams one open file description, so writes keep
 /// their observable order. A private scratch file gives `Command` the same
-/// property without racing independent stdout/stderr readers.
-fn combined(mut command: Command, result_dir: &Path, abort: Option<&AtomicBool>) -> WorkerOutcome {
+/// property without racing independent stdout/stderr readers. The flag
+/// reports a session stopped at `deadline`; whatever it wrote before that
+/// is still returned.
+fn combined(
+    mut command: Command,
+    result_dir: &Path,
+    abort: Option<&AtomicBool>,
+    deadline: Option<std::time::Instant>,
+) -> (WorkerOutcome, bool) {
+    let failed = || {
+        (
+            WorkerOutcome {
+                rc: 1,
+                output: Vec::new(),
+            },
+            false,
+        )
+    };
     let path = result_dir.join("worker-output");
     let file = match OpenOptions::new()
         .read(true)
@@ -389,32 +444,23 @@ fn combined(mut command: Command, result_dir: &Path, abort: Option<&AtomicBool>)
         .open(&path)
     {
         Ok(file) => file,
-        Err(_) => {
-            return WorkerOutcome {
-                rc: 1,
-                output: Vec::new(),
-            };
-        }
+        Err(_) => return failed(),
     };
     let stdout = match file.try_clone() {
         Ok(file) => file,
-        Err(_) => {
-            return WorkerOutcome {
-                rc: 1,
-                output: Vec::new(),
-            };
-        }
+        Err(_) => return failed(),
     };
     command
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(file));
-    let status = wait_abortable(command, abort);
+    let waited = wait_session(command, abort, deadline);
     let output = std::fs::read(&path).unwrap_or_default();
     let _ = std::fs::remove_file(path);
-    WorkerOutcome {
-        rc: status.unwrap_or(1),
-        output,
-    }
+    let rc = match waited {
+        Waited::Status(rc) => rc,
+        Waited::TimedOut | Waited::Failed => 1,
+    };
+    (WorkerOutcome { rc, output }, waited == Waited::TimedOut)
 }
 
 /// Allocate one private capture file under the worker's already-private
@@ -473,6 +519,31 @@ fn wait(command: Command) -> Option<i32> {
 /// graceful TERM-then-KILL teardown and reports incomplete cleanup, which
 /// reads as a failed launch.
 fn wait_abortable(command: Command, abort: Option<&AtomicBool>) -> Option<i32> {
+    match wait_session(command, abort, None) {
+        Waited::Status(rc) => Some(rc),
+        Waited::TimedOut | Waited::Failed => None,
+    }
+}
+
+/// How a supervised worker session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waited {
+    /// Exit status, or `128 + signal` for a signal death or interruption.
+    Status(i32),
+    /// The deadline passed; the session was stopped with the bounded
+    /// TERM-then-KILL teardown.
+    TimedOut,
+    /// The launch, an abort, or teardown failed.
+    Failed,
+}
+
+/// Supervise one worker session until it exits, `abort` is set, or
+/// `deadline` passes.
+fn wait_session(
+    command: Command,
+    abort: Option<&AtomicBool>,
+    deadline: Option<std::time::Instant>,
+) -> Waited {
     use std::os::unix::process::ExitStatusExt as _;
 
     let tick = |_| match abort {
@@ -481,16 +552,15 @@ fn wait_abortable(command: Command, abort: Option<&AtomicBool>) -> Option<i32> {
         }
         _ => Ok(()),
     };
-    match crate::cleanup::supervise_session(command, None, tick).ok()? {
-        crate::cleanup::SessionEnd::Exited(status) => Some(
+    match crate::cleanup::supervise_session(command, deadline, tick) {
+        Ok(crate::cleanup::SessionEnd::Exited(status)) => Waited::Status(
             status
                 .code()
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
         ),
-        crate::cleanup::SessionEnd::Interrupted(signal) => Some(128 + signal),
-        crate::cleanup::SessionEnd::TimedOut | crate::cleanup::SessionEnd::CleanupIncomplete => {
-            None
-        }
+        Ok(crate::cleanup::SessionEnd::Interrupted(signal)) => Waited::Status(128 + signal),
+        Ok(crate::cleanup::SessionEnd::TimedOut) => Waited::TimedOut,
+        Ok(crate::cleanup::SessionEnd::CleanupIncomplete) | Err(_) => Waited::Failed,
     }
 }
 

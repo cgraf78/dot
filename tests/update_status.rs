@@ -403,3 +403,86 @@ fn state_paths_live_under_the_dot_directory() {
     );
     assert_eq!(update_status::logs_dir(state), state.join("dot/logs"));
 }
+
+#[test]
+fn last_run_stamp_round_trips_every_trigger_and_outcome() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use update_status::{
+        Degraded, LastRun, OUTCOME_DEGRADED, OUTCOME_FAIL, OUTCOME_OK, OUTCOME_SKIP, Trigger,
+    };
+
+    let scratch = TempDir::new("update-status-last-run").unwrap();
+    let state = scratch.path();
+    assert_eq!(update_status::read_last_run(state), None);
+    let degraded = Degraded {
+        tools: true,
+        prune: true,
+        ..Degraded::default()
+    };
+    for (outcome, trigger, stages, failing) in [
+        (OUTCOME_OK, Trigger::Manual, Degraded::default(), ""),
+        (OUTCOME_FAIL, Trigger::Cron, Degraded::default(), ""),
+        (OUTCOME_SKIP, Trigger::Cron, Degraded::default(), ""),
+        (OUTCOME_DEGRADED, Trigger::Init, degraded, "tools,prune"),
+        // Stages only travel with a degraded outcome.
+        (OUTCOME_FAIL, Trigger::Manual, degraded, ""),
+    ] {
+        update_status::record_last_run(state, 1_800_000_000, outcome, trigger, stages);
+        assert_eq!(
+            update_status::read_last_run(state),
+            Some(LastRun {
+                at: 1_800_000_000,
+                outcome: outcome.to_string(),
+                trigger: trigger.as_str().to_string(),
+                failing: failing.to_string(),
+            })
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(state.join("dot/update.last-run")).unwrap(),
+        "1800000000 fail manual\n",
+        "the on-disk layout is the contract other Dot versions read"
+    );
+    assert_eq!(
+        std::fs::metadata(update_status::last_run_path(state))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn last_run_stamp_accepts_newer_words_and_rejects_garbage() {
+    let scratch = TempDir::new("update-status-last-run-garbage").unwrap();
+    let state = scratch.path();
+    let path = update_status::last_run_path(state);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // A newer Dot's vocabulary still reads.
+    std::fs::write(&path, "1800000000 aborted remote stage\n").unwrap();
+    let newer = update_status::read_last_run(state).expect("newer words");
+    assert_eq!(
+        (
+            newer.outcome.as_str(),
+            newer.trigger.as_str(),
+            newer.failing.as_str()
+        ),
+        ("aborted", "remote", "stage")
+    );
+    for garbage in [
+        "",
+        "not-an-epoch ok manual\n",
+        "1800000000\n",
+        "1800000000 ok\n",
+        "1800000000 OK manual\n",
+        "1800000000 ok manual tools,,prune\n",
+        "1800000000 ok manual tools extra\n",
+        "1800000000 ok \x1b[31m\n",
+    ] {
+        std::fs::write(&path, garbage).unwrap();
+        assert_eq!(update_status::read_last_run(state), None, "{garbage:?}");
+    }
+    std::fs::write(&path, vec![b'9'; 1024]).unwrap();
+    assert_eq!(update_status::read_last_run(state), None);
+}

@@ -39,6 +39,14 @@ dot_doctor_skip() {
   _dot_doctor_record skip "$1" "${2:-}"
 }
 
+# Newer than the other result helpers: an older coordinator has no `info`
+# kind. Probe with `declare -F dot_doctor_info` and fall back to
+# `dot_doctor_ok` so one extension works against either coordinator.
+dot_doctor_info() {
+  [[ $# -ge 1 && $# -le 2 ]] || return 2
+  _dot_doctor_record info "$1" "${2:-}"
+}
+
 dot_doctor_display_path() {
   local path
 

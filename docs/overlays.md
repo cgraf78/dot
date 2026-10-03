@@ -89,6 +89,18 @@ Command side effects are explicit:
 - `push` performs no preparatory clone, pull, or fetch and pushes only the root
   plus selected existing Git checkouts.
 
+For each cloned Git overlay, `dot doctor` reports the same repository state
+it reports for the root client, from one `git --no-optional-locks status
+--porcelain=v2 --branch --untracked-files=no` per repository (run
+concurrently for overlays): unmerged paths fail when `dot update` would
+refuse to pull over them (on a branch with an upstream, outside a merge or
+rebase) and warn otherwise; tracked changes, a detached HEAD, a missing or
+gone upstream (update skips pulling that overlay), and upstream distance
+warn. A rebase that update froze after it conflicted fails until it is rebased
+by hand (a warning for an optional overlay, whose frozen pull only leaves it
+empty). A clean overlay on its current
+upstream reads as one `<name>: upstream (<upstream> (current))` row.
+
 Changing profiles removes exact managed links during the next convergence.
 Git-backed overlays may additionally provide an idempotent
 `dot/profile-deactivate` hook for persistent generated state that cannot be

@@ -4,10 +4,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use dot::doctor_checks::{
-    BaseRepoInputs, CronInputs, LifecycleInputs, MergeInputs, MergeSpec, OverlayInputs,
-    ProviderInputs, ProviderInstaller, Record, check_base_repo, check_cron_freshness, check_merges,
-    check_overlays, check_profile_lifecycle, check_provider, check_update_lock,
-    completed_identity_matches_home, is_client_checkout, render, shdeps_binary,
+    BaseRepoInputs, CronInputs, InstallInputs, LifecycleInputs, MergeInputs, MergeSpec,
+    OverlayInputs, ProviderInputs, ProviderInstaller, Record, check_base_repo,
+    check_cron_freshness, check_install_layout, check_merges, check_overlays,
+    check_profile_lifecycle, check_provider, check_reexec_checkpoint, check_update_lock,
+    completed_identity_matches_home, is_client_checkout, parse_status_v2, render, shdeps_binary,
 };
 use dot_test_support::TempDir;
 
@@ -125,6 +126,8 @@ fn cron_freshness_trips_on_stale_and_passes_on_fresh() {
         render(&check_cron_freshness(&CronInputs {
             last_success: last,
             last_converged: None,
+            last_run: None,
+            cron_available: true,
             now: 1_800_000_000,
         }))
     };
@@ -171,6 +174,8 @@ fn cron_freshness_separates_degraded_convergence_from_a_frozen_host() {
         render(&check_cron_freshness(&CronInputs {
             last_success: last,
             last_converged: conv,
+            last_run: None,
+            cron_available: true,
             now: NOW,
         }))
     };
@@ -268,6 +273,483 @@ fn cron_freshness_separates_degraded_convergence_from_a_frozen_host() {
             && !downgraded_failing.contains("last converged"),
         "an older convergence than success adds nothing: {downgraded_failing}"
     );
+}
+
+fn last_run(at: i64, outcome: &str, trigger: &str, failing: &str) -> dot::update_status::LastRun {
+    dot::update_status::LastRun {
+        at,
+        outcome: outcome.to_string(),
+        trigger: trigger.to_string(),
+        failing: failing.to_string(),
+    }
+}
+
+#[test]
+fn cron_that_never_ran_only_skips_without_a_crontab() {
+    // Termux and containers have no `crontab`: such a host is updated by
+    // hand by design, so a lasting warning would be noise.
+    const NOW: i64 = 1_800_000_000;
+    let rows = render(&check_cron_freshness(&CronInputs {
+        last_success: None,
+        last_converged: None,
+        last_run: Some(last_run(NOW - 9 * 3600, "ok", "manual", "")),
+        cron_available: false,
+        now: NOW,
+    }));
+    assert!(
+        rows.contains(
+            "· cron update has never run (no crontab on PATH; last update: manual run 9h0m ago)"
+        ),
+        "{rows}"
+    );
+    assert!(!rows.contains('⚠'), "{rows}");
+}
+
+#[test]
+fn cron_that_never_ran_warns_once_a_manual_update_is_stale() {
+    const NOW: i64 = 1_800_000_000;
+    let check = |run: Option<dot::update_status::LastRun>| {
+        render(&check_cron_freshness(&CronInputs {
+            last_success: None,
+            last_converged: None,
+            last_run: run,
+            cron_available: true,
+            now: NOW,
+        }))
+    };
+    // Nothing ever updated this host: still unknown.
+    assert!(check(None).contains("· cron update success is unknown"));
+    // Updated by hand recently: cron simply has not had a slot yet.
+    let recent = check(Some(last_run(NOW - 600, "ok", "manual", "")));
+    assert!(
+        recent.contains("· cron update has not run yet (last update: manual run 10m ago)"),
+        "{recent}"
+    );
+    assert!(recent.contains("✓ last update succeeded (manual run 10m ago)"));
+    // A cron entry would have run by now: the frozen "unknown" becomes a
+    // warning instead of staying skipped forever.
+    let stale = check(Some(last_run(NOW - 3 * 3600, "ok", "init", "")));
+    assert!(stale.contains("⚠ cron update has never run"), "{stale}");
+    assert!(
+        stale.contains("last update: init run 3h0m ago; schedule dot update --cron"),
+        "{stale}"
+    );
+    assert!(!stale.contains('✗'), "{stale}");
+    // A cron that keeps skipping for local edits is running, not missing.
+    let skipping = check(Some(last_run(NOW - 60, "skip", "cron", "")));
+    assert!(
+        skipping.contains("⚠ cron update has not succeeded recently"),
+        "{skipping}"
+    );
+    assert!(skipping.contains("last cron run skip 1m ago"), "{skipping}");
+    // A clean cron last run whose stamp writes were lost still counts.
+    let lost_stamps = check(Some(last_run(NOW - 60, "ok", "cron", "")));
+    assert!(
+        lost_stamps.contains("✓ cron update succeeded recently (1m ago)"),
+        "{lost_stamps}"
+    );
+    // Cron runs that only ever failed leave no stamp but a cron last run.
+    let failing = check(Some(last_run(NOW - 60, "fail", "cron", "")));
+    assert!(
+        failing.contains("⚠ cron update has not succeeded recently"),
+        "{failing}"
+    );
+    assert!(
+        failing.contains("no successful cron update recorded; last cron run fail 1m ago"),
+        "{failing}"
+    );
+    assert!(
+        !failing.contains("last update"),
+        "a cron last run is covered by the cron row: {failing}"
+    );
+}
+
+#[test]
+fn hand_run_update_rows_appear_only_when_they_add_information() {
+    const NOW: i64 = 1_800_000_000;
+    let check = |success: Option<i64>, run: dot::update_status::LastRun| {
+        render(&check_cron_freshness(&CronInputs {
+            last_success: success,
+            last_converged: None,
+            last_run: Some(run),
+            cron_available: true,
+            now: NOW,
+        }))
+    };
+    // A recent clean cron run vouches for the host: a successful manual
+    // run adds nothing.
+    let quiet = check(Some(NOW - 600), last_run(NOW - 60, "ok", "manual", ""));
+    assert!(!quiet.contains("last update"), "{quiet}");
+    // A manual failure after that clean run is news.
+    let failed = check(Some(NOW - 600), last_run(NOW - 60, "fail", "manual", ""));
+    assert!(failed.contains("✓ cron update succeeded recently"));
+    assert!(failed.contains("⚠ last update failed"), "{failed}");
+    assert!(
+        failed.contains("manual run 1m ago; rerun dot update to see what failed"),
+        "{failed}"
+    );
+    assert!(!failed.contains('✗'), "{failed}");
+    // ...unless the clean cron run is newer.
+    let healed = check(Some(NOW - 60), last_run(NOW - 600, "fail", "manual", ""));
+    assert!(!healed.contains("last update"), "{healed}");
+    // Degraded names the stages.
+    let degraded = check(
+        None,
+        last_run(NOW - 60, "degraded", "manual", "tools,prune"),
+    );
+    assert!(
+        degraded.contains("⚠ last update degraded: tools,prune failing"),
+        "{degraded}"
+    );
+    // A stale clean cron run no longer vouches: a recent manual success shows.
+    let stale_cron = check(Some(NOW - 9 * 3600), last_run(NOW - 60, "ok", "manual", ""));
+    assert!(stale_cron.contains("⚠ cron update has not succeeded recently"));
+    assert!(
+        stale_cron.contains("✓ last update succeeded"),
+        "{stale_cron}"
+    );
+    // Outcome words from a newer Dot still render as a non-success.
+    let newer = check(None, last_run(NOW - 60, "aborted", "manual", ""));
+    assert!(newer.contains("⚠ last update failed"), "{newer}");
+}
+
+#[test]
+fn reexec_checkpoint_rows_follow_what_update_does() {
+    use dot::shdeps::CheckpointState;
+
+    let path = Path::new("/home/u/.local/state/dot/provider-reexec-failed");
+    let rows = |state: CheckpointState| render(&check_reexec_checkpoint(&state, path, "/home/u"));
+    assert_eq!(rows(CheckpointState::Absent), "");
+    let pending = rows(CheckpointState::Pending);
+    assert!(
+        pending.contains("⚠ provider re-exec checkpoint pending"),
+        "{pending}"
+    );
+    assert!(pending.contains("~/.local/state/dot/provider-reexec-failed"));
+    let unreadable = rows(CheckpointState::Unreadable);
+    assert!(
+        unreadable.contains("✗ provider re-exec checkpoint blocks dot update"),
+        "{unreadable}"
+    );
+    assert!(unreadable.contains("unsafe or malformed"));
+    let mismatch = rows(CheckpointState::Mismatch {
+        pinned: "a".repeat(40),
+        active: String::new(),
+    });
+    assert!(
+        mismatch.contains("✗ provider re-exec checkpoint blocks dot update"),
+        "{mismatch}"
+    );
+    assert!(
+        mismatch.contains("pins aaaaaaaaaaaa but dot is at <unavailable>"),
+        "{mismatch}"
+    );
+}
+
+/// A fake standalone install under `data/cgraf78`: the versioned release,
+/// the `current` link, the control directory, and the stable root link,
+/// exactly as `install.sh` publishes them.
+fn standalone_install(data: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let cgraf = data.join("cgraf78");
+    let release = cgraf.join(".dot-standalone/releases/v1-linux");
+    std::fs::create_dir_all(release.join("lib/dot/public")).expect("release");
+    std::fs::write(release.join(".dot-install.json"), b"{}\n").expect("metadata");
+    std::os::unix::fs::symlink("releases/v1-linux", cgraf.join(".dot-standalone/current"))
+        .expect("current");
+    std::os::unix::fs::symlink(".dot-standalone/current", cgraf.join("dot")).expect("root");
+    (
+        cgraf.join("dot"),
+        std::fs::canonicalize(&release).expect("real"),
+    )
+}
+
+/// A fake Shdeps archive install at `data/cgraf78/dot`.
+fn shdeps_install(data: &Path, marker: Option<&[u8]>) -> std::path::PathBuf {
+    let root = data.join("cgraf78/dot");
+    std::fs::create_dir_all(root.join("lib/dot/public")).expect("release");
+    std::fs::write(root.join(".dot-install.json"), b"{}\n").expect("metadata");
+    if let Some(marker) = marker {
+        std::fs::write(root.join(".shdeps-release-layout"), marker).expect("marker");
+    }
+    root
+}
+
+fn layout(root: &Path, source: &Path, release_root: bool, shdeps: bool) -> String {
+    render(&check_install_layout(&InstallInputs {
+        home: "/nonexistent-home",
+        source_real: source,
+        release_root,
+        managed_root: root,
+        shdeps,
+    }))
+}
+
+#[test]
+fn standalone_install_under_shdeps_warns_until_shdeps_adopts_it() {
+    // Shdeps adopts the installer's layout on its next update of Dot, so the
+    // standalone root alone only warns.
+    let scratch = TempDir::new("doctor-layout-standalone").expect("scratch");
+    let (root, release) = standalone_install(scratch.path());
+    let running = layout(&root, &release, true, true);
+    assert!(
+        running.contains("⚠ dot is standalone-installed"),
+        "{running}"
+    );
+    assert!(
+        running.contains(
+            "Shdeps adopts it on its next update of dot; if this persists, run shdeps health"
+        ),
+        "{running}"
+    );
+    assert!(!running.contains('✗'), "{running}");
+    // Same verdict when a checkout runs Dot but the managed root is still
+    // the standalone link Shdeps would have to adopt.
+    let checkout = scratch.path().join("checkout");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    let from_checkout = layout(&root, &checkout, false, true);
+    assert!(
+        from_checkout.contains("⚠ dot is standalone-installed"),
+        "{from_checkout}"
+    );
+    // A standalone binary running beside a healthy Shdeps install (a test
+    // harness, say) is not the stuck shape: the managed root decides.
+    let other = scratch.path().join("other");
+    let managed = shdeps_install(&other, Some(b"v1 archive\n"));
+    assert_eq!(layout(&managed, &release, true, true), "");
+    // Without a provider the standalone installer is the upgrade path,
+    // whether the managed root or the running release identifies it.
+    let alone = layout(&root, &release, true, false);
+    assert!(
+        alone.contains("✓ dot release layout (standalone installer"),
+        "{alone}"
+    );
+    assert!(!alone.contains('✗'), "{alone}");
+    let running = layout(&scratch.path().join("absent/dot"), &release, true, false);
+    assert!(
+        running.contains("✓ dot release layout (standalone installer"),
+        "{running}"
+    );
+}
+
+#[test]
+fn standalone_installer_lock_warns_because_install_sh_refuses() {
+    let scratch = TempDir::new("doctor-layout-standalone-lock").expect("scratch");
+    let (root, release) = standalone_install(scratch.path());
+    std::fs::create_dir(scratch.path().join("cgraf78/.dot-standalone/lock")).expect("lock");
+    let rows = layout(&root, &release, true, false);
+    // A warning: it blocks only a manual installer rerun, never `dot update`.
+    assert!(
+        rows.contains("⚠ standalone installer lock is present"),
+        "{rows}"
+    );
+    assert!(!rows.contains('✗'), "{rows}");
+    assert!(rows.contains("install.sh refuses to run while it exists"));
+}
+
+#[test]
+fn standalone_installer_lock_fails_under_shdeps_because_adoption_refuses() {
+    let scratch = TempDir::new("doctor-layout-standalone-lock-shdeps").expect("scratch");
+    let (root, release) = standalone_install(scratch.path());
+    std::fs::create_dir(scratch.path().join("cgraf78/.dot-standalone/lock")).expect("lock");
+    let rows = layout(&root, &release, true, true);
+    assert!(rows.contains("⚠ dot is standalone-installed"), "{rows}");
+    assert!(
+        rows.contains("✗ standalone installer lock blocks Shdeps adoption"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("cgraf78/.dot-standalone/lock: Shdeps will not adopt"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("remove it if no install.sh is running"),
+        "{rows}"
+    );
+}
+
+#[test]
+fn interrupted_adoption_warns_and_its_lock_blocks_the_resume() {
+    // Shdeps' fallback switch parks the installer's root link as
+    // `<root>.shdeps-parked-root`; an interrupted switch leaves no root.
+    let scratch = TempDir::new("doctor-layout-parked").expect("scratch");
+    let (root, release) = standalone_install(scratch.path());
+    let parked = scratch.path().join("cgraf78/dot.shdeps-parked-root");
+    std::fs::rename(&root, &parked).expect("park root link");
+    let rows = layout(&root, &release, true, true);
+    assert!(
+        rows.contains("⚠ Shdeps adoption of the standalone install was interrupted"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("the next Shdeps update of dot finishes it"),
+        "{rows}"
+    );
+    assert!(!rows.contains('✗'), "{rows}");
+    // Shdeps refuses to resume while the installer lock exists: never call
+    // that lock unused.
+    std::fs::create_dir(scratch.path().join("cgraf78/.dot-standalone/lock")).expect("lock");
+    let locked = layout(&root, &release, true, true);
+    assert!(
+        locked.contains("✗ standalone installer lock blocks Shdeps adoption"),
+        "{locked}"
+    );
+    assert!(!locked.contains("no longer used"), "{locked}");
+    // A parked link that is not the installer's is not an adoption.
+    std::fs::remove_file(&parked).expect("remove parked link");
+    std::os::unix::fs::symlink("elsewhere", &parked).expect("foreign parked link");
+    assert!(!layout(&root, &release, true, true).contains("interrupted"));
+}
+
+#[test]
+fn only_the_installers_exact_root_link_counts_as_adoptable() {
+    // Shdeps adopts only `<root> -> .dot-standalone/current`, read without
+    // following links; anything else would be a promise it does not keep.
+    let scratch = TempDir::new("doctor-layout-exact-link").expect("scratch");
+    let (root, release) = standalone_install(scratch.path());
+    std::fs::remove_file(&root).expect("remove root link");
+    std::os::unix::fs::symlink(".dot-standalone/releases/v1-linux", &root)
+        .expect("link into releases");
+    assert!(!layout(&root, &release, true, true).contains("standalone"));
+    std::fs::remove_file(&root).expect("remove root link");
+    std::os::unix::fs::symlink(
+        scratch.path().join("cgraf78/.dot-standalone/current"),
+        &root,
+    )
+    .expect("absolute link");
+    assert!(!layout(&root, &release, true, true).contains("standalone"));
+    // The lock row needs only the root link: Shdeps checks the lock before
+    // it reads `current`, so a dangling `current` still reports the lock.
+    std::fs::remove_file(&root).expect("remove root link");
+    std::os::unix::fs::symlink(".dot-standalone/current", &root).expect("installer link");
+    std::fs::remove_file(scratch.path().join("cgraf78/.dot-standalone/current"))
+        .expect("remove current");
+    std::fs::create_dir(scratch.path().join("cgraf78/.dot-standalone/lock")).expect("lock");
+    let rows = layout(&root, &release, true, true);
+    assert!(
+        rows.contains("✗ standalone installer lock blocks Shdeps adoption"),
+        "{rows}"
+    );
+}
+
+#[test]
+fn standalone_link_outside_the_releases_directory_is_not_the_installer_layout() {
+    let scratch = TempDir::new("doctor-layout-not-releases").expect("scratch");
+    let cgraf = scratch.path().join("cgraf78");
+    let other = cgraf.join(".dot-standalone/other/v1-linux");
+    std::fs::create_dir_all(other.join("lib/dot/public")).expect("other");
+    std::fs::write(other.join(".dot-install.json"), b"{}\n").expect("metadata");
+    std::os::unix::fs::symlink(".dot-standalone/other/v1-linux", cgraf.join("dot"))
+        .expect("root link");
+    let real = std::fs::canonicalize(&other).expect("real");
+    for shdeps in [true, false] {
+        let rows = layout(&cgraf.join("dot"), &real, true, shdeps);
+        assert!(!rows.contains("standalone"), "{rows}");
+    }
+}
+
+#[test]
+fn shdeps_release_requires_its_layout_marker() {
+    let scratch = TempDir::new("doctor-layout-shdeps").expect("scratch");
+    let root = shdeps_install(scratch.path(), Some(b"v1 archive\n"));
+    let real = std::fs::canonicalize(&root).expect("real");
+    let healthy = layout(&root, &real, true, true);
+    assert_eq!(healthy, "  ✓ dot release layout (Shdeps release)\n");
+
+    // Shdeps compares the whole file: any other content refuses.
+    for content in [
+        b"v2 archive\n".as_slice(),
+        b"v1 archive\nextra\n",
+        b"v1 archive",
+        b"v1 archive\n\n",
+    ] {
+        std::fs::write(root.join(".shdeps-release-layout"), content).expect("marker");
+        let wrong = layout(&root, &real, true, true);
+        assert!(
+            wrong.contains("✗ dot release layout marker is invalid"),
+            "{content:?}: {wrong}"
+        );
+    }
+
+    std::fs::remove_file(root.join(".shdeps-release-layout")).expect("rm marker");
+    std::fs::create_dir(root.join(".shdeps-release-layout")).expect("marker dir");
+    let directory = layout(&root, &real, true, true);
+    assert!(
+        directory.contains("✗ dot release layout marker is invalid"),
+        "{directory}"
+    );
+
+    std::fs::remove_dir(root.join(".shdeps-release-layout")).expect("rm marker dir");
+    let missing = layout(&root, &real, true, true);
+    assert!(
+        missing.contains("⚠ dot release has no Shdeps layout marker"),
+        "{missing}"
+    );
+    assert!(!missing.contains('✗'), "{missing}");
+}
+
+#[test]
+fn shdeps_release_reports_leftover_install_state() {
+    let scratch = TempDir::new("doctor-layout-leftovers").expect("scratch");
+    let root = shdeps_install(scratch.path(), Some(b"v1 archive\n"));
+    let real = std::fs::canonicalize(&root).expect("real");
+    let cgraf = scratch.path().join("cgraf78");
+    std::fs::create_dir(cgraf.join("dot.shdeps-archive-backup-42-7")).expect("backup");
+    std::fs::create_dir(cgraf.join(".dot.shdeps-archive-backup-43-8")).expect("hidden backup");
+    // Another dependency's backup is not Dot's.
+    std::fs::create_dir(cgraf.join("dots.shdeps-archive-backup-1-1")).expect("other backup");
+    std::fs::create_dir_all(cgraf.join(".dot-standalone/lock")).expect("old lock");
+    let rows = layout(&root, &real, true, true);
+    assert!(
+        rows.contains("✓ dot release layout (Shdeps release)"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("⚠ interrupted Shdeps install left a backup"),
+        "{rows}"
+    );
+    assert!(rows.contains("dot.shdeps-archive-backup-42-7"), "{rows}");
+    assert!(rows.contains(".dot.shdeps-archive-backup-43-8"), "{rows}");
+    assert!(!rows.contains("dots.shdeps"), "{rows}");
+    assert!(
+        rows.contains("⚠ leftover standalone installer lock"),
+        "{rows}"
+    );
+    assert!(!rows.contains('✗'), "{rows}");
+}
+
+#[test]
+fn backup_is_reported_even_when_the_install_root_is_gone() {
+    // A swap whose rollback also failed leaves only the backup behind.
+    let scratch = TempDir::new("doctor-layout-orphan-backup").expect("scratch");
+    let cgraf = scratch.path().join("cgraf78");
+    std::fs::create_dir_all(cgraf.join("dot.shdeps-archive-backup-9-9")).expect("backup");
+    let checkout = scratch.path().join("checkout");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    let rows = layout(&cgraf.join("dot"), &checkout, false, true);
+    assert!(
+        rows.contains("⚠ interrupted Shdeps install left a backup"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("the install root is missing; run dot update to reinstall it"),
+        "{rows}"
+    );
+}
+
+#[test]
+fn install_layout_is_silent_for_checkouts_and_other_providers() {
+    let scratch = TempDir::new("doctor-layout-silent").expect("scratch");
+    let root = shdeps_install(scratch.path(), None);
+    let real = std::fs::canonicalize(&root).expect("real");
+    // No provider: a directory release is someone else's to upgrade.
+    assert_eq!(layout(&root, &real, true, false), "");
+    // A checkout runs Dot: the release directory is not in use.
+    let checkout = scratch.path().join("checkout");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    assert_eq!(layout(&root, &checkout, false, true), "");
+    // No managed root at all.
+    let missing = scratch.path().join("missing/cgraf78/dot");
+    assert_eq!(layout(&missing, &checkout, false, true), "");
 }
 
 fn backdate(path: &Path, secs_ago: u64) {
@@ -381,8 +863,40 @@ fn merge_outputs_verify_fresh_missing_and_stale() {
     // No declared outputs skips (documented behavior, not a failure).
     let undeclared = check(vec![merge_spec("fixture", &script, vec![])]);
     assert!(undeclared.contains("· merge-hook outputs are unverified"));
-    assert!(undeclared.contains("no declared outputs"));
+    assert!(undeclared.contains("1 hook(s) declare no checkable outputs"));
     assert!(!undeclared.contains('✗'));
+
+    // C1: healthy and unverified hooks each collapse into one summary row;
+    // problems keep a row each.
+    let mut many: Vec<MergeSpec> = (0..30)
+        .map(|index| merge_spec(&format!("bare{index}"), &script, vec![]))
+        .collect();
+    many.push(merge_spec(
+        "fresh-a",
+        &script,
+        vec![fresh_out.to_string_lossy().into_owned()],
+    ));
+    many.push(merge_spec(
+        "fresh-b",
+        &script,
+        vec![fresh_out.to_string_lossy().into_owned()],
+    ));
+    many.push(merge_spec(
+        "stale",
+        &script,
+        vec![stale_out.to_string_lossy().into_owned()],
+    ));
+    let collapsed = check(many);
+    assert_eq!(
+        collapsed
+            .matches("merge-hook outputs are unverified")
+            .count(),
+        1
+    );
+    assert!(collapsed.contains("(30 hook(s) declare no checkable outputs)"));
+    assert!(collapsed.contains("✓ merge-hook outputs are current (2 output(s) across 2 hook(s))"));
+    assert!(collapsed.contains("✗ merge-hook output is stale\n    stale: "));
+    assert_eq!(collapsed.lines().count(), 7, "{collapsed}");
 
     // A relative declaration fails outright.
     let mut bad = merge_spec("fixture", &script, vec![]);
@@ -734,11 +1248,358 @@ fn overlays_git_origin_and_manifest_health_matrix() {
     };
     let drift = render(&check_overlays(&input));
     assert!(drift.contains("git: cloned"));
-    assert!(drift.contains("remote URL drift"));
+    // `dot update` refuses to pull or link a drifted overlay and exits 1,
+    // so doctor fails on it rather than warning.
+    assert!(drift.contains("✗ git: remote URL drift"), "{drift}");
+    assert!(
+        drift.contains("verify the checkout, then adopt it with: git -C"),
+        "{drift}"
+    );
     assert!(drift.contains("overlay symlinks healthy"));
 
     std::fs::write(&manifest, b"malformed\n").expect("bad manifest");
     assert!(render(&check_overlays(&input)).contains("1 overlay symlink issue(s)"));
+}
+
+#[test]
+fn status_v2_parses_branch_upstream_distance_and_entries() {
+    let status = parse_status_v2(
+        "# branch.oid 0123\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -3\n1 .M N... 100644 100644 100644 a b tracked\n2 R. N... 100644 100644 100644 a b R100 new\told\nu UU N... 100644 100644 100644 100644 a b c conflict\n# branch.future value\n",
+    );
+    assert_eq!(status.head.as_deref(), Some("main"));
+    assert_eq!(status.upstream.as_deref(), Some("origin/main"));
+    assert_eq!(status.ahead_behind, Some((2, 3)));
+    assert_eq!((status.changed, status.unmerged), (2, 1));
+    let detached = parse_status_v2("# branch.oid 0123\n# branch.head (detached)\n");
+    assert_eq!(detached.head, None);
+    assert_eq!(detached.upstream, None);
+    // An upstream whose ref is gone has no distance line.
+    let gone = parse_status_v2("# branch.head main\n# branch.upstream origin/gone\n");
+    assert_eq!(gone.ahead_behind, None);
+    assert_eq!(parse_status_v2("# branch.ab +x -1\n").ahead_behind, None);
+}
+
+#[test]
+fn overlay_branch_upstream_and_dirt_follow_update_severities() {
+    // M7: overlays used to get only "cloned" and "URL matches"; the base
+    // client also got branch, upstream, and tracked changes.
+    let scratch = TempDir::new("doctor-overlay-state").expect("scratch");
+    let remote = scratch.path().join("remote.git");
+    std::fs::create_dir_all(&remote).expect("remote");
+    git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    let seed = scratch.path().join("seed");
+    std::fs::create_dir_all(&seed).expect("seed");
+    git(&seed, &["init", "-q", "-b", "main"]);
+    std::fs::write(seed.join("file"), b"one\n").expect("file");
+    git(&seed, &["add", "file"]);
+    git(&seed, &["commit", "-q", "-m", "seed"]);
+    let remote_text = remote.to_str().expect("remote utf8").to_string();
+    git(&seed, &["push", "-q", &remote_text, "main"]);
+    let repo = scratch.path().join("overlay");
+    let status = dot_test_support::git()
+        .args(["clone", "-q"])
+        .arg(&remote)
+        .arg(&repo)
+        .stdin(Stdio::null())
+        .status()
+        .expect("clone overlay");
+    assert!(status.success());
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let mut input = overlays(manifest, None, false);
+    input.configured_count = 1;
+    input.active_records = vec![format!("git|{}|{remote_text}||false|git", repo.display())];
+    input.overlay_lifecycle = vec!["git|active|d".into()];
+    let rows = || render(&check_overlays(&input));
+
+    let clean = rows();
+    assert!(
+        clean.contains("✓ git: remote.origin.url matches conf"),
+        "{clean}"
+    );
+    assert!(
+        clean.contains("✓ git: upstream (origin/main (current))"),
+        "{clean}"
+    );
+    assert!(!clean.contains('⚠') && !clean.contains('✗'), "{clean}");
+
+    std::fs::write(repo.join("file"), b"two\n").expect("dirty");
+    let dirty = rows();
+    assert!(dirty.contains("⚠ git: 1 tracked change(s)"), "{dirty}");
+    assert!(
+        dirty.contains("✓ git: upstream (origin/main (current))"),
+        "{dirty}"
+    );
+    git(&repo, &["checkout", "-q", "--", "file"]);
+
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "local"]);
+    let ahead = rows();
+    assert!(ahead.contains("⚠ git: ahead of upstream"), "{ahead}");
+    assert!(ahead.contains("origin/main: 1 commit(s) ahead"), "{ahead}");
+
+    git(&repo, &["checkout", "-q", "--detach"]);
+    let detached = rows();
+    assert!(detached.contains("⚠ git: HEAD is detached"), "{detached}");
+    assert!(
+        detached.contains("dot update skips this overlay"),
+        "{detached}"
+    );
+
+    git(&repo, &["checkout", "-q", "-b", "side"]);
+    let untracked = rows();
+    assert!(
+        untracked.contains("⚠ git: upstream is not configured"),
+        "{untracked}"
+    );
+
+    // A conflicted merge leaves unmerged entries: every pull refuses.
+    git(&repo, &["checkout", "-q", "main"]);
+    git(&repo, &["reset", "-q", "--hard", "origin/main"]);
+    git(&repo, &["checkout", "-q", "-b", "theirs"]);
+    std::fs::write(repo.join("file"), b"theirs\n").expect("theirs");
+    git(&repo, &["commit", "-q", "-am", "theirs"]);
+    git(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("file"), b"ours\n").expect("ours");
+    git(&repo, &["commit", "-q", "-am", "ours"]);
+    let merge = dot_test_support::git()
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "merge",
+            "-q",
+            "theirs",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("conflicting merge");
+    assert!(!merge.success(), "the merge must conflict");
+    // Mid-merge, update warns and skips the overlay, so doctor warns too.
+    let merging = rows();
+    assert!(
+        merging.contains("⚠ git: 1 unmerged path(s)\n    a merge or rebase is in progress"),
+        "{merging}"
+    );
+    assert!(merging.contains("⚠ git: 1 tracked change(s)"), "{merging}");
+    assert!(!merging.contains('✗'), "{merging}");
+    // Unmerged entries outside any session make every pull fail.
+    for leftover in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE"] {
+        let _ = std::fs::remove_file(repo.join(".git").join(leftover));
+    }
+    let conflicted = rows();
+    assert!(
+        conflicted.contains(
+            "✗ git: 1 unmerged path(s)\n    dot update fails until the conflict is resolved"
+        ),
+        "{conflicted}"
+    );
+    // Without a branch to pull, update skips the overlay before it looks at
+    // the index, so the same sessionless entries only warn.
+    let head = String::from_utf8(
+        dot_test_support::git()
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("HEAD")
+            .stdout,
+    )
+    .expect("utf8 HEAD");
+    git(&repo, &["update-ref", "--no-deref", "HEAD", head.trim()]);
+    let detached = rows();
+    assert!(
+        detached.contains(
+            "⚠ git: 1 unmerged path(s)\n    resolve them; without a branch and upstream to pull"
+        ),
+        "{detached}"
+    );
+    assert!(detached.contains("⚠ git: HEAD is detached"), "{detached}");
+    assert!(!detached.contains('✗'), "{detached}");
+}
+
+#[test]
+fn frozen_overlay_rebase_fails_until_rebased_by_hand() {
+    // `dot update` refuses to retry a rebase that conflicted while HEAD and
+    // the upstream tip stay put; doctor matches the recorded HEAD.
+    let scratch = TempDir::new("doctor-overlay-frozen").expect("scratch");
+    let (remote, clones) = overlay_clones(scratch.path(), 1);
+    let repo = &clones[0];
+    let head = String::from_utf8(
+        dot_test_support::git()
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("HEAD")
+            .stdout,
+    )
+    .expect("utf8 HEAD");
+    let head = head.trim();
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let input = clone_inputs(manifest, &remote, &clones);
+    let marker = repo.join(".git/dot-rebase-failed");
+    std::fs::write(&marker, format!("{head} {head}\n")).expect("frozen marker");
+    let frozen = render(&check_overlays(&input));
+    assert!(
+        frozen.contains("✗ ov0: the last rebase onto origin/main conflicted; rebase manually"),
+        "{frozen}"
+    );
+    // One strike still allows a retry, and a moved HEAD is a new attempt.
+    std::fs::write(&marker, format!("{head} {head} retry\n")).expect("one strike");
+    assert!(!render(&check_overlays(&input)).contains("conflicted"));
+    std::fs::write(&marker, format!("{} {head}\n", "0".repeat(40))).expect("old head");
+    assert!(!render(&check_overlays(&input)).contains("conflicted"));
+    // Update skips a detached HEAD before it consults the marker.
+    std::fs::write(&marker, format!("{head} {head}\n")).expect("frozen marker");
+    git(repo, &["checkout", "-q", "--detach"]);
+    assert!(!render(&check_overlays(&input)).contains("conflicted"));
+    git(repo, &["checkout", "-q", "main"]);
+    // An optional overlay's frozen pull only leaves it empty: a warning.
+    let mut optional = input;
+    optional.active_records = vec![format!("ov0|{}|{remote}||true|git", repo.display())];
+    let rows = render(&check_overlays(&optional));
+    assert!(
+        rows.contains("⚠ ov0: the last rebase onto origin/main conflicted; rebase manually"),
+        "{rows}"
+    );
+    assert!(rows.contains("skips this optional overlay"), "{rows}");
+}
+
+/// A bare remote with one commit on `main`, plus `count` clones of it.
+fn overlay_clones(root: &Path, count: usize) -> (String, Vec<std::path::PathBuf>) {
+    let remote = root.join("remote.git");
+    std::fs::create_dir_all(&remote).expect("remote");
+    git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    let seed = root.join("seed");
+    std::fs::create_dir_all(&seed).expect("seed");
+    git(&seed, &["init", "-q", "-b", "main"]);
+    std::fs::write(seed.join("file"), b"one\n").expect("file");
+    git(&seed, &["add", "file"]);
+    git(&seed, &["commit", "-q", "-m", "seed"]);
+    let remote_text = remote.to_str().expect("remote utf8").to_string();
+    git(&seed, &["push", "-q", &remote_text, "main"]);
+    let clones = (0..count)
+        .map(|index| {
+            let repo = root.join(format!("overlay{index}"));
+            let status = dot_test_support::git()
+                .args(["clone", "-q"])
+                .arg(&remote)
+                .arg(&repo)
+                .stdin(Stdio::null())
+                .status()
+                .expect("clone overlay");
+            assert!(status.success());
+            repo
+        })
+        .collect();
+    (remote_text, clones)
+}
+
+/// Overlay inputs naming each clone `ov<index>`.
+fn clone_inputs<'a>(
+    manifest: String,
+    remote: &str,
+    clones: &[std::path::PathBuf],
+) -> OverlayInputs<'a> {
+    let mut input = overlays(manifest, None, false);
+    input.configured_count = clones.len();
+    input.active_records = clones
+        .iter()
+        .enumerate()
+        .map(|(index, repo)| format!("ov{index}|{}|{remote}||false|git", repo.display()))
+        .collect();
+    input.overlay_lifecycle = (0..clones.len())
+        .map(|index| format!("ov{index}|active|d"))
+        .collect();
+    input
+}
+
+#[test]
+fn concurrent_overlay_statuses_land_on_their_own_overlay() {
+    // The statuses run in parallel; each result must reach its own row.
+    let scratch = TempDir::new("doctor-overlay-state-stress").expect("scratch");
+    let (remote, clones) = overlay_clones(scratch.path(), 8);
+    for (index, repo) in clones.iter().enumerate() {
+        match index % 4 {
+            1 => std::fs::write(repo.join("file"), b"dirty\n").expect("dirty"),
+            2 => git(repo, &["commit", "-q", "--allow-empty", "-m", "ahead"]),
+            3 => git(repo, &["checkout", "-q", "--detach"]),
+            _ => {}
+        }
+    }
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let input = clone_inputs(manifest, &remote, &clones);
+    for _ in 0..5 {
+        let rows = render(&check_overlays(&input));
+        for index in 0..clones.len() {
+            let expected = match index % 4 {
+                0 => format!("✓ ov{index}: upstream (origin/main (current))"),
+                1 => format!("⚠ ov{index}: 1 tracked change(s)"),
+                2 => format!("⚠ ov{index}: ahead of upstream"),
+                _ => format!("⚠ ov{index}: HEAD is detached"),
+            };
+            assert!(rows.contains(&expected), "missing {expected:?}: {rows}");
+        }
+        assert_eq!(rows.matches("tracked change(s)").count(), 2, "{rows}");
+    }
+}
+
+#[test]
+fn concurrent_overlay_statuses_use_the_bound_host_git() {
+    // Worker threads do not inherit the thread-local host Git binding; the
+    // probes must carry it rather than fall back to `git` on PATH.
+    let scratch = TempDir::new_exec("doctor-overlay-state-host-git").expect("scratch");
+    let (remote, clones) = overlay_clones(scratch.path(), 3);
+    let log = scratch.path().join("git.log");
+    let wrapper = scratch.path().join("host-git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            dot_test_support::real_tool("git").display()
+        ),
+    )
+    .expect("wrapper");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("wrapper mode");
+    }
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let input = clone_inputs(manifest, &remote, &clones);
+    let rows = {
+        let _bound = dot::init_client_identity::bind_host_git_for_scope(&wrapper);
+        render(&check_overlays(&input))
+    };
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    for repo in &clones {
+        let call = format!(
+            "-C {} --no-optional-locks status --porcelain=v2 --branch --untracked-files=no",
+            repo.display()
+        );
+        assert!(calls.contains(&call), "missing {call:?} in {calls}\n{rows}");
+    }
 }
 
 #[test]
@@ -1059,6 +1920,53 @@ fn base_repo_ordinary_dirty_detached_upstream_and_mismatch_matrix() {
         &nested,
     )));
     assert!(mismatch.contains("client worktree mismatch"));
+
+    // Unmerged entries make every pull refuse: a failure, not dirt.
+    git(&home, &["checkout", "-q", "main"]);
+    git(&home, &["checkout", "-q", "--", "tracked"]);
+    git(&home, &["checkout", "-q", "-b", "theirs"]);
+    std::fs::write(home.join("tracked"), b"theirs\n").expect("theirs");
+    git(&home, &["commit", "-q", "-am", "theirs"]);
+    git(&home, &["checkout", "-q", "main"]);
+    std::fs::write(home.join("tracked"), b"ours\n").expect("ours");
+    git(&home, &["commit", "-q", "-am", "ours"]);
+    let merge = dot_test_support::git()
+        .arg("-C")
+        .arg(&home)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "merge",
+            "-q",
+            "theirs",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("conflicting merge");
+    assert!(!merge.success(), "the merge must conflict");
+    let conflicted = render(&check_base_repo(&base(
+        "ordinary",
+        &home.join(".git"),
+        &home,
+    )));
+    // Without an upstream update skips the client, so this only warns, and
+    // the unmerged entry still counts as a tracked change.
+    assert!(
+        conflicted.contains("⚠ 1 unmerged client path(s)"),
+        "{conflicted}"
+    );
+    assert!(
+        conflicted.contains("⚠ 1 tracked client change(s)"),
+        "{conflicted}"
+    );
+    assert!(
+        !conflicted.contains("no tracked client changes"),
+        "{conflicted}"
+    );
 }
 
 #[test]
@@ -1086,7 +1994,13 @@ fn base_repo_separate_and_unrecognized_topology_matrix() {
 
     let unknown = render(&check_base_repo(&base("liminal", &bare, &home)));
     assert!(unknown.contains("client worktree mismatch"));
-    assert!(unknown.contains("client upstream is not configured"));
+    // No status at all is reported as such, not as a clean, detached
+    // checkout without an upstream.
+    assert!(
+        unknown.contains("⚠ client repository status is unavailable"),
+        "{unknown}"
+    );
+    assert!(!unknown.contains("no tracked client changes"), "{unknown}");
 }
 
 #[test]
@@ -1113,6 +2027,25 @@ fn base_repo_upstream_current_ahead_behind_and_diverged() {
     let git_dir = home.join(".git");
     let inputs = || base("ordinary", &git_dir, &home);
     assert!(render(&check_base_repo(&inputs())).contains("origin/main (current)"));
+    // A frozen rebase of this HEAD makes every update refuse.
+    let head = String::from_utf8(
+        dot_test_support::git()
+            .arg("-C")
+            .arg(&home)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("HEAD")
+            .stdout,
+    )
+    .expect("utf8 HEAD");
+    let marker = git_dir.join("dot-rebase-failed");
+    std::fs::write(&marker, format!("{} {}\n", head.trim(), head.trim())).expect("marker");
+    let frozen = render(&check_base_repo(&inputs()));
+    assert!(
+        frozen.contains("✗ the last client rebase onto origin/main conflicted; rebase manually"),
+        "{frozen}"
+    );
+    std::fs::remove_file(&marker).expect("remove marker");
 
     git(&home, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
     assert!(render(&check_base_repo(&inputs())).contains("1 commit(s) ahead"));

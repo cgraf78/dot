@@ -56,11 +56,30 @@ fn specs_rows_agree() {
         Some(SpecError::DuplicateIdentity { .. })
     ));
 
-    let unsafe_discovery = collect_specs_with(duplicate.path(), |_| false).expect("unsafe");
-    assert!(matches!(
-        unsafe_discovery.error,
-        Some(SpecError::Unsafe { .. })
-    ));
+    // An untrusted script is refused on its own: it neither runs nor claims
+    // an identity, and discovery continues past it.
+    let mixed = TempDir::new("doctor-specs-refused").expect("fixture");
+    mixed.write("10-stale.sh", b"");
+    mixed.write("20-live.sh", b"");
+    mixed.write("stale.sh", b"");
+    let refused = collect_specs_with(mixed.path(), |script| {
+        !script.to_string_lossy().ends_with("10-stale.sh")
+    })
+    .expect("refused");
+    assert_eq!(refused.error, None);
+    assert_eq!(refused.rejected, vec![mixed.path().join("10-stale.sh")]);
+    assert_eq!(
+        refused
+            .specs
+            .iter()
+            .map(|spec| spec.key.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"20-live".as_slice(), b"stale".as_slice()]
+    );
+    let all_refused = collect_specs_with(duplicate.path(), |_| false).expect("unsafe");
+    assert_eq!(all_refused.error, None);
+    assert!(all_refused.specs.is_empty());
+    assert_eq!(all_refused.rejected.len(), 2);
 }
 
 #[test]
@@ -71,6 +90,7 @@ fn dispatch_rows_agree() {
         (&b"warn"[..], Kind::Warn),
         (&b"fail"[..], Kind::Fail),
         (&b"skip"[..], Kind::Skip),
+        (&b"info"[..], Kind::Info),
         (&b"future"[..], Kind::Unknown),
         (&b""[..], Kind::Unknown),
     ] {

@@ -479,13 +479,8 @@ pub fn sanitized_git<S: AsRef<std::ffi::OsStr>>(
 /// Git executable. Runtime-bound callers use this form so executable lookup
 /// remains tied to their immutable PATH without duplicating Git policy.
 pub(crate) fn sanitize_git_env(cmd: &mut std::process::Command) {
+    scrub_repository_selectors(cmd);
     const UNSET: &[&str] = &[
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_INDEX_FILE",
         "GIT_CONFIG",
         "GIT_CONFIG_GLOBAL",
         "GIT_CONFIG_SYSTEM",
@@ -499,6 +494,29 @@ pub(crate) fn sanitize_git_env(cmd: &mut std::process::Command) {
     }
     cmd.env("GIT_CONFIG_NOSYSTEM", "1");
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+}
+
+/// Git variables that point a command at a different repository, work tree,
+/// index, or object store. A Git hook exports several of them (a pre-commit
+/// hook sets `GIT_INDEX_FILE`), so a probe of some other checkout inherits a
+/// foreign index unless they are removed.
+const REPOSITORY_SELECTORS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
+];
+
+/// Remove only the [`REPOSITORY_SELECTORS`], keeping the user's Git
+/// configuration (unlike [`sanitize_git_env`], which also isolates config):
+/// read-only inspection of the user's own checkouts should honor their
+/// `safe.directory`, fsmonitor, and similar settings.
+pub(crate) fn scrub_repository_selectors(cmd: &mut std::process::Command) {
+    for var in REPOSITORY_SELECTORS {
+        cmd.env_remove(var);
+    }
 }
 
 /// Bind one sanitized Git command to the selected source checkout, including
