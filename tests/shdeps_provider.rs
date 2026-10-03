@@ -5577,6 +5577,11 @@ fn with_unreachable_base(fixture: &Fixture) {
         .expect("dot init");
     assert_eq!(init.status.code(), Some(0), "init: {init:?}");
     std::fs::rename(&origin, scratch.join("base.git.gone")).expect("hide base remote");
+    // Leave an empty directory in its place: the pull still fails, but the
+    // recorded remote identity keeps resolving. macOS resolves a file remote
+    // with BSD `realpath`, which refuses a missing path, so a vanished
+    // remote would trip the init-identity guard before any pull.
+    std::fs::create_dir(&origin).expect("empty base remote");
 }
 
 #[test]
