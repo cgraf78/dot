@@ -1024,6 +1024,116 @@ fn init_client(home: &TempDir, state: &TempDir, origin: &Path) {
     );
 }
 
+/// A logging `git` wrapper doctor will actually select as its host Git.
+///
+/// Doctor resolves Git from `PATH` but skips any candidate under `HOME` or
+/// the Dot checkout (`init_client_identity::select_command_git`), and the
+/// exec-capable fixture root (`TempDir::new_exec`) lives in the checkout's
+/// target directory unless `CARGO_TARGET_DIR` points elsewhere. So the
+/// wrapper goes in the first fixture root outside the checkout whose files
+/// can execute; no such root is a test-environment error, not a pass. The
+/// wrapper execs the real Git directly, never a developer launcher.
+fn host_git_wrapper(label: &str) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let checkout = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("checkout");
+    let real = dot_test_support::real_tool("git");
+    for exec_root in [false, true] {
+        let dir = if exec_root {
+            TempDir::new_exec(label)
+        } else {
+            TempDir::new(label)
+        }
+        .expect("wrapper directory");
+        if dir.path().starts_with(&checkout) {
+            continue;
+        }
+        let log = dir.path().join("git.log");
+        let wrapper = dir.path().join("git");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
+                log.display(),
+                real.display()
+            ),
+        )
+        .expect("git wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("wrapper mode");
+        // A `noexec` mount refuses to run it: try the next root.
+        let probe = Command::new(&wrapper)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if probe.is_ok_and(|status| status.success()) {
+            let _ = std::fs::remove_file(&log);
+            return (dir, wrapper, log);
+        }
+    }
+    panic!(
+        "no exec-capable fixture directory outside the checkout {} for the host Git wrapper",
+        checkout.display()
+    );
+}
+
+#[test]
+fn base_repository_state_costs_one_status_call() {
+    // P3: branch, upstream distance, and tracked changes used to cost four
+    // Git processes (and relied on repo config for `-uno`); one
+    // porcelain-v2 status answers all of them.
+    let scope = TempDir::new("doctor-status-calls-origin").expect("origin scope");
+    let home = TempDir::new("doctor-status-calls-home").expect("home");
+    let state = TempDir::new("doctor-status-calls-state").expect("state");
+    let origin = origin(scope.path());
+    init_client(&home, &state, &origin);
+    let (wrappers, wrapper, log) = host_git_wrapper("doctor-status-calls-git");
+    let path = format!(
+        "{}:{}",
+        wrappers.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let native = command(false, &home, &state, &[("PATH", &path)])
+        .output()
+        .expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(stdout.contains("✓ no tracked client changes"), "{stdout}");
+    assert!(
+        stdout.contains("✓ client HEAD on branch (main)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("✓ client upstream (origin/main (current))"),
+        "{stdout}"
+    );
+    // A bypassed wrapper must fail here, not as a missing file.
+    let calls = std::fs::read_to_string(&log).unwrap_or_else(|_| {
+        panic!(
+            "doctor never ran the logging Git wrapper {}: it resolved Git elsewhere",
+            wrapper.display()
+        )
+    });
+    let base: Vec<&str> = calls
+        .lines()
+        .filter(|line| line.contains("--work-tree="))
+        .collect();
+    assert_eq!(
+        base.iter()
+            .filter(|line| line.ends_with(" status --porcelain=v2 --branch --untracked-files=no"))
+            .count(),
+        1,
+        "{calls}"
+    );
+    for retired in ["symbolic-ref", "rev-list", "@{u}", "status --porcelain\n"] {
+        assert!(
+            !base
+                .iter()
+                .any(|line| format!("{line}\n").contains(retired)),
+            "{retired} still runs: {calls}"
+        );
+    }
+}
+
 #[test]
 fn missing_client_and_clear_lock_match_without_the_old_engine() {
     // Catches routing doctor back through the removed whole-engine adapter and
@@ -2720,6 +2830,62 @@ fn linked_worktree_overlay_matches_without_the_old_engine() {
     let (shell, native) = pair(&home, &state);
     assert!(String::from_utf8_lossy(&shell.stdout).contains("linked: cloned"));
     assert_pair(&shell, &native);
+}
+
+#[test]
+fn overlay_state_ignores_inherited_git_selectors() {
+    // Doctor also runs from hook contexts that export Git selectors; the
+    // overlay status probe must still inspect the overlay itself.
+    let scope = TempDir::new("doctor-overlay-git-env-scope").expect("scope");
+    let home = TempDir::new("doctor-overlay-git-env-home").expect("home");
+    let state = TempDir::new("doctor-overlay-git-env-state").expect("state");
+    let origin = origin(scope.path());
+    let overlay = home.path().join(".dotfiles-plain");
+    let status = dot_test_support::git()
+        .args(["clone", "-q"])
+        .arg(&origin)
+        .arg(&overlay)
+        .status()
+        .expect("overlay clone");
+    assert!(status.success());
+    let overlays = home.path().join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&overlays).expect("overlays directory");
+    std::fs::write(
+        overlays.join("20-plain.conf"),
+        format!("url={}\n", origin.display()),
+    )
+    .expect("descriptor");
+    // A Git pre-commit hook exports `GIT_INDEX_FILE`; read against that
+    // foreign index, a clean overlay looked like every file was deleted.
+    let foreign = scope.path().join("foreign-index");
+    let foreign = foreign.to_str().expect("utf8");
+    let native = command(false, &home, &state, &[("GIT_INDEX_FILE", foreign)])
+        .output()
+        .expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(stdout.contains("plain: cloned"), "{stdout}");
+    assert!(
+        stdout.contains("✓ plain: upstream (origin/main (current))"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("plain: 1 tracked change"), "{stdout}");
+}
+
+#[test]
+fn client_state_ignores_an_inherited_git_index() {
+    // The client probes must not read a Git hook's `GIT_INDEX_FILE` either.
+    let scope = TempDir::new("doctor-client-git-env-origin").expect("origin scope");
+    let home = TempDir::new("doctor-client-git-env-home").expect("home");
+    let state = TempDir::new("doctor-client-git-env-state").expect("state");
+    let origin = origin(scope.path());
+    init_client(&home, &state, &origin);
+    let foreign = scope.path().join("foreign-index");
+    let foreign = foreign.to_str().expect("utf8");
+    let native = command(false, &home, &state, &[("GIT_INDEX_FILE", foreign)])
+        .output()
+        .expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(stdout.contains("✓ no tracked client changes"), "{stdout}");
 }
 
 fn latest_provider(home: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {

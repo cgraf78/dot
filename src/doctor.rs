@@ -151,10 +151,10 @@ fn run_configured(
             topology,
             client_git_dir: git_dir,
             home: &home,
-            is_client_checkout: crate::doctor_checks::is_client_checkout(
-                Path::new(&home),
-                Some(&marker),
-            ),
+            // Consulted only without a separate client: skip its Git probes on
+            // every other host.
+            is_client_checkout: base.topology == crate::repos_base::Topology::Missing
+                && crate::doctor_checks::is_client_checkout(Path::new(&home), Some(&marker)),
         }),
     );
     emit.emit();
