@@ -2804,10 +2804,14 @@ fn semantic_tree(root: &Path, home_tree: bool) -> Vec<(String, Vec<u8>)> {
                 .expect("semantic child")
                 .to_string_lossy()
                 .into_owned();
+            // The obsolete Bash bootstrap and the any-trigger last-run
+            // stamp (its epoch and trigger change on every run) are not
+            // converged state.
             let bootstrap = if home_tree {
                 relative == ".local/state/dot/bash-v1"
+                    || relative == ".local/state/dot/update.last-run"
             } else {
-                relative == "dot/bash-v1"
+                relative == "dot/bash-v1" || relative == "dot/update.last-run"
             };
             let checkout = home_tree
                 && path.file_name().is_some_and(|name| {
@@ -4685,6 +4689,16 @@ fn update_native_entry_edges_reject_fallback() {
         skip.iter().any(|field| field == "tracked.txt"),
         "skip names the dirty file: {skip:?}"
     );
+    // The any-trigger last-run stamp records the skip too, so doctor never
+    // mistakes a skipping cron for one that never ran.
+    let last_run = std::fs::read_to_string(
+        unresolved
+            .client
+            .home
+            .join(".local/state/dot/update.last-run"),
+    )
+    .expect("last run");
+    assert!(last_run.ends_with(" skip cron\n"), "{last_run:?}");
     assert_eq!(
         std::fs::read(unresolved.client.home.join("tracked.txt")).expect("read unresolved edit"),
         b"local edit\n",

@@ -2104,6 +2104,12 @@ fn assert_provider_signal(
         !merge_marker.exists(),
         "update started a merge hook after provider cancellation"
     );
+    // Cancellation is not an outcome: an interrupted run leaves no last-run
+    // stamp behind.
+    assert!(
+        !fixture.state.join("dot/update.last-run").exists(),
+        "an interrupted update recorded a last-run outcome"
+    );
     assert_eq!(
         std::fs::read_dir(&tmp)
             .expect("temporary directory")
@@ -5452,6 +5458,81 @@ fn cron_tools_failure_is_degraded_and_a_clean_run_clears_it() {
     assert_eq!(last_cron_outcome(&fixture), ["ok", "update"]);
     assert_eq!(converged_stages(&fixture), Some(String::new()));
     assert!(dot::update_status::last_success_path(&fixture.state).exists());
+}
+
+/// Fields after the epoch of the any-trigger last-run stamp, read by raw
+/// path so the test pins the on-disk layout `dot doctor` reads.
+fn last_run_fields(fixture: &Fixture) -> Vec<String> {
+    let body =
+        std::fs::read_to_string(fixture.state.join("dot/update.last-run")).expect("last run");
+    let line = body.strip_suffix('\n').expect("one terminated line");
+    let mut fields = line.split(' ');
+    let epoch: i64 = fields
+        .next()
+        .expect("epoch")
+        .parse()
+        .expect("numeric epoch");
+    assert!(epoch > 1_700_000_000, "last-run epoch sane: {body:?}");
+    fields.map(str::to_string).collect()
+}
+
+#[test]
+fn every_update_records_its_last_run_outcome() {
+    // M8: hand-run updates left no outcome behind, so a host updated only by
+    // hand read "unknown" in doctor forever.
+    let fixture = Fixture::new("shdeps-last-run");
+    let degraded = fixture
+        .command()
+        .env("DOT_TEST_PROVIDER_FAIL", "1")
+        .output()
+        .expect("manual update with failing tools");
+    assert_eq!(degraded.status.code(), Some(1), "{degraded:?}");
+    assert_eq!(last_run_fields(&fixture), ["degraded", "manual", "tools"]);
+    // A hand-run update writes nothing else: the cron log and stamps keep
+    // measuring cron-slot health only.
+    assert!(!dot::update_status::update_log_path(&fixture.state).exists());
+    assert!(!dot::update_status::last_success_path(&fixture.state).exists());
+    assert!(!dot::update_status::last_converged_path(&fixture.state).exists());
+
+    let clean = fixture.command().output().expect("clean manual update");
+    assert_eq!(clean.status.code(), Some(0), "{clean:?}");
+    assert_eq!(last_run_fields(&fixture), ["ok", "manual"]);
+
+    let cron = fixture
+        .command()
+        .arg("--cron")
+        .output()
+        .expect("clean cron update");
+    assert_cli(&cron, 0, b"", b"");
+    assert_eq!(last_run_fields(&fixture), ["ok", "cron"]);
+    assert_eq!(last_cron_outcome(&fixture), ["ok", "update"]);
+}
+
+#[test]
+fn a_hand_run_update_that_does_not_converge_records_a_plain_failure() {
+    // A failing config hook means the run did not converge: `fail`, never
+    // `degraded`, and no stages.
+    let fixture = Fixture::new("shdeps-last-run-fail");
+    let extensions = fixture.home.join("extensions");
+    let merge_hooks = extensions.join("merge-hooks.d");
+    std::fs::create_dir_all(&merge_hooks).expect("merge hooks");
+    std::fs::write(
+        fixture.home.join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=shdeps\nshdeps_update_policy=pinned\n",
+    )
+    .expect("merge config");
+    std::fs::write(merge_hooks.join("10-fail.sh"), b"merge() { return 3; }\n").expect("merge hook");
+    for path in [&extensions, &merge_hooks] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("private extension directory");
+    }
+    let output = fixture
+        .command()
+        .env("DOT_TEST_PROVIDER_FAIL", "1")
+        .output()
+        .expect("manual update with failing tools and merge hook");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(last_run_fields(&fixture), ["fail", "manual"]);
 }
 
 #[test]

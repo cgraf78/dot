@@ -60,8 +60,10 @@ the spelling is fixed. That can matter: a misspelled `default_profile` can fall
 back to `base` and deactivate overlays only the intended profile selects, and a
 misspelled `dependency_provider` skips Shdeps, including Dot's own upgrade. The
 trade is deliberate: a hard error would also stop every host from pulling the
-fix. `dot doctor` reports each ignored key as an `unknown configuration key
-ignored` warning instead of printing to stderr. `dot init` lists ignored keys
+fix. `dot doctor` reports each ignored key as `unknown configuration key
+ignored` instead of printing to stderr: a failure for a likely misspelling
+(every `dot update` exits 1 while it is present, see below) and a warning for
+any other key. `dot init` lists ignored keys
 in its plan and warns about keys that arrive with the cloned repository, after
 its own report. `dot update` prints its warnings once it holds the update
 lock, so a cron run that finds the lock busy stays quiet.
@@ -230,6 +232,14 @@ Every `dot update --cron` run records its outcome under
   whose profile lifecycle commit did not fail, followed by the failing stages
   when that run was degraded (for example `1790000000 prune`).
 
+Every update run, with or without `--cron` (including `dot init`
+convergence), also overwrites `update.last-run` with
+`<epoch> <outcome> <trigger>[ <stages>]`: the same `ok`, `degraded`, or `fail`
+classification (or `skip` for a cron run skipped for local edits), the
+trigger `cron`, `manual`, or `init`, and the failing stages of a degraded run
+(for example `1790000000 degraded manual tools`). Interrupted runs leave it
+unchanged. Hand-run updates write nothing else.
+
 A run is degraded when everything except the `Tools` stage (a dependency, a
 post hook, or an unavailable Shdeps) and/or the `Prune` stage succeeded: the
 dotfiles are current, dependencies are not. This applies with or without
@@ -261,12 +271,48 @@ new exit code that existing callers would have to learn.
 - otherwise: `cron update has not succeeded recently`, meaning the host has
   stopped converging (or has been asleep); this includes a host whose only
   recorded runs were degraded, which older releases reported as unknown;
+- with no cron stamp, `update.last-run` decides: a cron last run that failed
+  or skipped reads `cron update has not succeeded recently`; a hand-run last
+  update older than the window reads `cron update has never run`, a warning
+  (a scheduled `dot update --cron` would have run by then) or only a skip
+  when no `crontab` is on `PATH` (Termux, containers); a newer one reads
+  `cron update has not run yet`;
 - with no stamp at all: `cron update success is unknown`.
+
+`dot doctor` also reports the last hand-run (`manual` or `init`) update when
+it adds information: `last update succeeded`, `last update degraded: <stages>
+failing`, or `last update failed`, always without a recent clean cron run and
+otherwise only when it did not succeed after that run. A failed hand-run
+update warns: conditions that make every update exit 1 have rows of their own,
+and a one-off failure heals on the next run.
+
+When `Tools` updates Dot twice during one update, the run exits 1 and leaves
+`provider-reexec-failed` in the same directory for the next update to validate
+against the active Dot. `dot doctor` warns while that record is pending and
+fails when the next update cannot consume it (an unsafe or malformed record,
+or one pinning a revision other than the active Dot), because every update
+then exits 1 until it is inspected and removed.
 
 A Dot older than the convergence stamp ignores it and keeps its original
 reading of `update.last-success`, so it reports a degraded host as not
 succeeding. After upgrading, the degraded report appears once the first cron
-run under the new Dot has recorded convergence.
+run under the new Dot has recorded convergence. Likewise a Dot older than
+`update.last-run` neither writes nor reads it: until an update under a newer
+Dot records one, a hand-updated host still reads unknown.
+
+### Doctor severities
+
+`dot doctor` fails on every condition that makes `dot update` refuse or exit
+1, and warns on conditions that update survives or that clear themselves:
+
+- a likely misspelled configuration key fails; a key from a newer Dot warns;
+- an update lock whose owner cannot be verified fails (mutating commands
+  refuse until the probe succeeds); a live owner, a stale owner (reclaimed by
+  the next command), a lock being initialized, and a probe interrupted by a
+  signal to doctor warn;
+- an overlay whose origin differs from its descriptor fails (update refuses
+  to pull or link it), with the command that adopts the configured URL;
+- a provider re-exec checkpoint the next update cannot consume fails.
 
 ## Overlay profiles
 

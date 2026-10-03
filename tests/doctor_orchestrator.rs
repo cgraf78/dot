@@ -108,15 +108,21 @@ fn runtime_check_warns_once_per_unknown_config_key() {
     };
     let mut rec = Recorder::new();
     check_runtime(&mut rec, &runtime, &engine(b"/src"), b"/home/u");
-    // Ignored keys never fail doctor: they are warnings beside the
-    // engine-source warning this fixture always produces.
-    assert_eq!(rec.counts().fail, 0);
-    assert_eq!(rec.counts().warn, 3);
+    // A key from a newer Dot is a warning (beside the engine-source
+    // warning this fixture always produces); a likely misspelling fails,
+    // because it makes every `dot update` exit 1.
+    assert_eq!(rec.counts().fail, 1);
+    assert_eq!(rec.counts().warn, 2);
     let rendered = String::from_utf8(rec.render()).expect("utf8 render");
     assert!(
         rendered.contains("unknown configuration key ignored")
             && rendered.contains("future_key on line 2 (newer dot?)")
             && rendered.contains("defualt_profile on line 3 (did you mean 'default_profile'?)"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("  ⚠ unknown configuration key ignored\n    future_key")
+            && rendered.contains("  ✗ unknown configuration key ignored\n    defualt_profile"),
         "{rendered}"
     );
 }

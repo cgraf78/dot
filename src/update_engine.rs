@@ -1934,7 +1934,7 @@ fn config_degraded(caller: Caller, config: &crate::config::Config) -> bool {
         && config
             .unknown_keys
             .iter()
-            .any(|unknown| unknown.suggestion().is_some())
+            .any(crate::config::UnknownKey::degrades_update)
 }
 
 /// `_dot_update_finalize` natively: checkpoint, link phase (or the
@@ -1974,8 +1974,8 @@ fn finalize(
         config: config_degraded(inputs.caller, &state.config),
         ..crate::update_status::Degraded::default()
     };
-    let checkpoint = format!("{}/dot/provider-reexec-failed", inputs.state_home);
-    if !crate::shdeps::consume_checkpoint(Path::new(&checkpoint), inputs.source_root_git) {
+    let checkpoint = crate::shdeps::checkpoint_in(Path::new(inputs.state_home));
+    if !crate::shdeps::consume_checkpoint(&checkpoint, inputs.source_root_git) {
         let close = crate::progress_ui::done(
             inputs.palette,
             quiet(inputs),
@@ -2507,7 +2507,7 @@ fn provider_reexec(
         return Some(1);
     }
     if inputs.continuation {
-        let path = Path::new(inputs.state_home).join("dot/provider-reexec-failed");
+        let path = crate::shdeps::checkpoint_in(Path::new(inputs.state_home));
         let mut moves = crate::temp::MoveCache::default();
         if crate::shdeps::write_checkpoint(before, after, &path, &mut moves) {
             warn_row(
@@ -3364,10 +3364,11 @@ pub fn run_update(
 /// misspelled key ([`config_degraded`]), records `degraded` with those
 /// stages and refreshes only the convergence stamp, so `dot doctor`
 /// can tell it from a frozen host; its exit status stays 1.
-/// Interrupted runs record nothing (cancellation is not an outcome),
-/// and non-cron runs write nothing (the history-tree tests pin the
-/// state directory across plain updates). `degraded` reports this
-/// run's degraded stages to a provider re-exec's outer run.
+/// Interrupted runs record nothing (cancellation is not an outcome).
+/// Every other run, cron or not, also overwrites the any-trigger
+/// `update.last-run` stamp with the same classification; non-cron runs
+/// write nothing else. `degraded` reports this run's degraded stages to
+/// a provider re-exec's outer run.
 fn run_gathered(
     inputs: &EngineInputs<'_>,
     out: &mut dyn std::io::Write,
@@ -3392,9 +3393,18 @@ fn run_gathered(
         crate::update_status::append_outcome(
             Path::new(inputs.state_home),
             now_secs,
-            "skip",
+            crate::update_status::OUTCOME_SKIP,
             "dirty",
             &detail,
+        );
+        // Without this, a host whose cron keeps skipping would read "cron
+        // update has never run" once its last hand-run update aged out.
+        crate::update_status::record_last_run(
+            Path::new(inputs.state_home),
+            now_secs,
+            crate::update_status::OUTCOME_SKIP,
+            crate::update_status::Trigger::Cron,
+            crate::update_status::Degraded::default(),
         );
         warn_row(
             err,
@@ -3408,11 +3418,27 @@ fn run_gathered(
     let rc = run_gathered_inner(inputs, out, err, now_secs, degraded);
     // A release handoff ends this half before the run's outcome is known;
     // the exec'd continuation records the run (or the handoff records its
-    // failure when it cannot exec).
-    if inputs.flags.cron && !cancelled() && !inputs.runtime.exec_pending() {
-        let state_home = Path::new(inputs.state_home);
-        if rc == 0 {
-            crate::update_status::append_outcome(state_home, now_secs, "ok", "update", "");
+    // failure when it cannot exec), so this half records nothing.
+    if cancelled() || inputs.runtime.exec_pending() {
+        return rc;
+    }
+    use crate::update_status::{OUTCOME_DEGRADED, OUTCOME_FAIL, OUTCOME_OK};
+    let state_home = Path::new(inputs.state_home);
+    let outcome = if rc == 0 {
+        OUTCOME_OK
+    } else if !degraded.is_empty() {
+        OUTCOME_DEGRADED
+    } else {
+        OUTCOME_FAIL
+    };
+    if inputs.flags.cron {
+        let detail = if outcome == OUTCOME_DEGRADED {
+            degraded.detail()
+        } else {
+            String::new()
+        };
+        crate::update_status::append_outcome(state_home, now_secs, outcome, "update", &detail);
+        if outcome == OUTCOME_OK {
             crate::update_status::record_success(state_home, now_secs);
             // Exit 0 implies no failed stage: a clean convergence.
             crate::update_status::record_converged(
@@ -3420,20 +3446,32 @@ fn run_gathered(
                 now_secs,
                 crate::update_status::Degraded::default(),
             );
-        } else if !degraded.is_empty() {
-            crate::update_status::append_outcome(
-                state_home,
-                now_secs,
-                "degraded",
-                "update",
-                &degraded.detail(),
-            );
+        } else if outcome == OUTCOME_DEGRADED {
             crate::update_status::record_converged(state_home, now_secs, *degraded);
-        } else {
-            crate::update_status::append_outcome(state_home, now_secs, "fail", "update", "");
         }
     }
+    // Every run, cron or not, leaves its outcome for `dot doctor`, so a host
+    // updated by hand reports its last result instead of "unknown".
+    crate::update_status::record_last_run(
+        state_home,
+        now_secs,
+        outcome,
+        trigger(inputs),
+        *degraded,
+    );
     rc
+}
+
+/// What started this run, as recorded in `update.last-run`.
+fn trigger(inputs: &EngineInputs<'_>) -> crate::update_status::Trigger {
+    use crate::update_status::Trigger;
+    if inputs.flags.cron {
+        Trigger::Cron
+    } else if inputs.caller == Caller::Init {
+        Trigger::Init
+    } else {
+        Trigger::Manual
+    }
 }
 
 /// `_dot_update` natively: flag-driven stages around [`sync_repos`]

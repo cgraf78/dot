@@ -32,14 +32,21 @@
 //!   converging; stamps older than [`CRON_STALE_AFTER_SECS`] read as
 //!   not converging. Older Dot releases neither write nor read it, so
 //!   after a downgrade the stamp only ages out.
+//! - `update.last-run`: `<epoch> <outcome> <trigger>[ <stages>]` for
+//!   the last update run of any kind, overwritten: `outcome` is `ok`,
+//!   `degraded`, `fail`, or (cron only) `skip`, classified exactly like
+//!   the cron outcome line; `trigger` is `cron`, `manual`, or `init`;
+//!   and `stages` follows a `degraded` outcome. Hosts updated by hand never write the
+//!   cron stamps, so this is how `dot doctor` sees their last outcome
+//!   (and notices a cron entry that never ran). Older Dot releases
+//!   neither write nor read it.
 //! - `logs/`: retained failure logs from the quiet runner, pruned to
 //!   the newest [`MAX_RETAINED_LOGS`].
 //!
 //! Every writer is best-effort: observability must never fail an
 //! update or a command, so filesystem errors are swallowed and
 //! callers keep their historical exit codes. Non-cron updates write
-//! nothing here: the history-tree tests pin the state directory
-//! across plain `update` runs, and the stamp deliberately measures
+//! only `update.last-run`: the cron log and stamps deliberately measure
 //! cron-slot health rather than interactive use.
 
 use std::path::{Path, PathBuf};
@@ -60,6 +67,40 @@ pub const MAX_RETAINED_LOGS: usize = 20;
 /// optional short stage list, and a newline, so anything past this is
 /// corrupt, never a stamp.
 const STAMP_MAX_BYTES: u64 = 64;
+
+/// Outcome words persisted in the cron log and `update.last-run`. Stable
+/// vocabulary: readers accept any lowercase word, so a newer outcome still
+/// renders on an older Dot.
+pub const OUTCOME_OK: &str = "ok";
+/// See [`OUTCOME_OK`].
+pub const OUTCOME_DEGRADED: &str = "degraded";
+/// See [`OUTCOME_OK`].
+pub const OUTCOME_FAIL: &str = "fail";
+/// A cron run skipped because local edits were unresolved (the cron log
+/// records it with the `dirty` stage and the file list).
+pub const OUTCOME_SKIP: &str = "skip";
+
+/// What started an update run, persisted in `update.last-run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// `dot update --cron`.
+    Cron,
+    /// `dot update` or `dot pull` run by hand.
+    Manual,
+    /// `dot init` convergence.
+    Init,
+}
+
+impl Trigger {
+    /// The persisted word.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Trigger::Cron => "cron",
+            Trigger::Manual => "manual",
+            Trigger::Init => "init",
+        }
+    }
+}
 
 /// Stage names persisted in `degraded` outcome lines and the
 /// convergence stamp. Stable vocabulary: `dot doctor` renders them
@@ -121,6 +162,27 @@ pub struct Converged {
     pub failing: String,
 }
 
+/// The last update run read back from `update.last-run`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastRun {
+    /// Epoch seconds of that run.
+    pub at: i64,
+    /// Its outcome word ([`OUTCOME_OK`], [`OUTCOME_DEGRADED`],
+    /// [`OUTCOME_FAIL`], or a word only a newer Dot writes).
+    pub outcome: String,
+    /// Its trigger word ([`Trigger::as_str`], or a newer word).
+    pub trigger: String,
+    /// The failing stages of a degraded run, empty otherwise.
+    pub failing: String,
+}
+
+impl LastRun {
+    /// Whether the run was triggered by cron.
+    pub fn is_cron(&self) -> bool {
+        self.trigger == Trigger::Cron.as_str()
+    }
+}
+
 /// Create `path` as a private directory, tightening pre-existing
 /// ones: cron state holds dirty filenames plus absolute home paths,
 /// so it stays owner-only whatever the ambient umask was.
@@ -165,6 +227,11 @@ pub fn last_success_path(state_home: &Path) -> PathBuf {
 /// The convergence stamp (`dot/update.last-converged`).
 pub fn last_converged_path(state_home: &Path) -> PathBuf {
     dot_dir(state_home).join("update.last-converged")
+}
+
+/// The any-trigger last-run stamp (`dot/update.last-run`).
+pub fn last_run_path(state_home: &Path) -> PathBuf {
+    dot_dir(state_home).join("update.last-run")
 }
 
 /// The retained failure-log directory (`dot/logs`).
@@ -249,6 +316,24 @@ pub fn record_converged(state_home: &Path, now: i64, degraded: Degraded) {
     write_stamp(&last_converged_path(state_home), &body);
 }
 
+/// Overwrite the last-run stamp. `degraded` is persisted only with the
+/// [`OUTCOME_DEGRADED`] outcome. Best-effort like [`record_success`].
+pub fn record_last_run(
+    state_home: &Path,
+    now: i64,
+    outcome: &str,
+    trigger: Trigger,
+    degraded: Degraded,
+) {
+    let mut body = format!("{now} {outcome} {}", trigger.as_str());
+    if outcome == OUTCOME_DEGRADED && !degraded.is_empty() {
+        body.push(' ');
+        body.push_str(&degraded.detail());
+    }
+    body.push('\n');
+    write_stamp(&last_run_path(state_home), &body);
+}
+
 /// Truncate-and-write one small stamp file. Not an atomic rename: the
 /// stamps are advisory, written under the update lock, and every reader
 /// treats a torn or empty body as missing, which only ever errs toward
@@ -326,6 +411,39 @@ pub fn read_last_converged(state_home: &Path) -> Option<Converged> {
     }
     Some(Converged {
         at,
+        failing: failing.to_string(),
+    })
+}
+
+/// Whether `word` is a non-empty lowercase ASCII word, the shape every
+/// persisted outcome, trigger, and stage name takes.
+fn is_word(word: &str) -> bool {
+    !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase())
+}
+
+/// Read the last-run stamp, or `None` when missing, unreadable,
+/// oversized, or malformed. Outcome and trigger must be lowercase ASCII
+/// words and the optional stage list comma-separated words, so hostile
+/// text never reaches doctor output while newer vocabulary still reads.
+pub fn read_last_run(state_home: &Path) -> Option<LastRun> {
+    let content = read_stamp(&last_run_path(state_home))?;
+    let line = content.strip_suffix('\n').unwrap_or(&content);
+    let mut fields = line.split(' ');
+    let at = fields.next()?.parse::<i64>().ok()?;
+    let outcome = fields.next().filter(|word| is_word(word))?;
+    let trigger = fields.next().filter(|word| is_word(word))?;
+    let failing = match fields.next() {
+        Some(stages) if stages.split(',').all(is_word) => stages,
+        Some(_) => return None,
+        None => "",
+    };
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(LastRun {
+        at,
+        outcome: outcome.to_string(),
+        trigger: trigger.to_string(),
         failing: failing.to_string(),
     })
 }

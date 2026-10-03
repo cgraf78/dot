@@ -142,34 +142,35 @@ fn in_process_no_color_disables_terminal_result_colors() {
     );
 }
 
-/// Blank the cron stamp-age rendering (`last success 497206h5m ago`):
-/// shell and native run sequentially, so a minute (or hour) boundary
-/// between the two renders a different age for the same stamp. Only the
-/// age span is blanked — every other byte still compares exactly — and
-/// the cron test below pins the age value itself with a ±1-minute
-/// tolerance instead of exact bytes.
+/// Blank stamp-age renderings (`last success 497206h5m ago`, `ran by init
+/// 4s ago`): shell and native run sequentially, so a second, minute, or hour
+/// boundary between the two renders a different age for the same stamp.
+/// Only the age span before each ` ago` is blanked, every other byte still
+/// compares exactly, and the cron test below pins the age value itself with
+/// a ±1-minute tolerance instead of exact bytes.
 fn normalize_stamp_age(bytes: &[u8]) -> Vec<u8> {
-    const PREFIX: &[u8] = b"last success ";
     const SUFFIX: &[u8] = b" ago";
-    const BLANK: &[u8] = b"last success AGE ago";
     let mut out = Vec::with_capacity(bytes.len());
     let mut rest = bytes;
-    while let Some(start) = rest
-        .windows(PREFIX.len())
-        .position(|window| window == PREFIX)
+    while let Some(at) = rest
+        .windows(SUFFIX.len())
+        .position(|window| window == SUFFIX)
     {
-        out.extend_from_slice(&rest[..start]);
-        let after = &rest[start + PREFIX.len()..];
-        if let Some(end) = after
-            .windows(SUFFIX.len())
-            .position(|window| window == SUFFIX)
-        {
-            out.extend_from_slice(BLANK);
-            rest = &after[end + SUFFIX.len()..];
+        let head = &rest[..at];
+        let age_len = head
+            .iter()
+            .rev()
+            .take_while(|byte| byte.is_ascii_digit() || matches!(byte, b'h' | b'm' | b's'))
+            .count();
+        let age = &head[head.len() - age_len..];
+        out.extend_from_slice(&head[..head.len() - age_len]);
+        if age.first().is_some_and(u8::is_ascii_digit) {
+            out.extend_from_slice(b"AGE");
         } else {
-            out.extend_from_slice(PREFIX);
-            rest = after;
+            out.extend_from_slice(age);
         }
+        out.extend_from_slice(SUFFIX);
+        rest = &rest[at + SUFFIX.len()..];
     }
     out.extend_from_slice(rest);
     out
@@ -2026,6 +2027,232 @@ fn cron_freshness_reports_degraded_convergence_end_to_end() {
     assert!(
         stdout.contains("cron update has not succeeded recently"),
         "stopped convergence warns as frozen: {stdout}"
+    );
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs()
+}
+
+#[test]
+fn hand_updated_host_reports_its_last_run_end_to_end() {
+    // M8: a host updated only by hand used to read "cron update success is
+    // unknown" forever; the any-trigger last-run stamp replaces that.
+    let home = TempDir::new("doctor-last-run-home").expect("home");
+    let state = TempDir::new("doctor-last-run-state").expect("state");
+    let dir = state.path().join("dot");
+    std::fs::create_dir_all(&dir).expect("stamp dir");
+    std::fs::write(
+        dir.join("update.last-run"),
+        format!("{} ok manual\n", now_epoch() - 3 * 3600),
+    )
+    .expect("last run");
+    // A PATH holding only the probes doctor runs, so whether a `crontab`
+    // exists is the test's choice, not the host's.
+    let tools = TempDir::new_exec("doctor-last-run-tools").expect("tools");
+    std::os::unix::fs::symlink(dot_test_support::real_tool("git"), tools.path().join("git"))
+        .expect("git link");
+    for tool in ["id", "uname", "hostname"] {
+        let found = ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+            .into_iter()
+            .map(|dir| Path::new(dir).join(tool))
+            .find(|candidate| candidate.is_file());
+        if let Some(found) = found {
+            std::os::unix::fs::symlink(found, tools.path().join(tool)).expect("tool link");
+        }
+    }
+    let cron = TempDir::new_exec("doctor-last-run-crontab").expect("cron tools");
+    let crontab = cron.path().join("crontab");
+    std::fs::write(&crontab, b"#!/bin/sh\nexit 0\n").expect("crontab");
+    seal(&crontab, 0o755);
+    let without_cron = tools.path().display().to_string();
+    let with_cron = format!("{}:{without_cron}", cron.path().display());
+    // With a `crontab` on PATH the host could schedule cron, so a cron
+    // that never ran warns.
+    let native = command(false, &home, &state, &[("PATH", &with_cron)])
+        .output()
+        .expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(stdout.contains("⚠ cron update has never run"), "{stdout}");
+    assert!(
+        stdout.contains("✓ last update succeeded (manual run 3h0m ago)"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("success is unknown"), "{stdout}");
+    // Without one (Termux, containers) the same state only skips.
+    let native = command(false, &home, &state, &[("PATH", &without_cron)])
+        .output()
+        .expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains(
+            "· cron update has never run (no crontab on PATH; last update: manual run 3h0m ago)"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn init_convergence_records_the_init_trigger() {
+    let scope = TempDir::new("doctor-init-trigger-origin").expect("origin scope");
+    let home = TempDir::new("doctor-init-trigger-home").expect("home");
+    let state = TempDir::new("doctor-init-trigger-state").expect("state");
+    let origin = origin(scope.path());
+    init_client(&home, &state, &origin);
+    let stamp = std::fs::read_to_string(state.path().join("dot/update.last-run"))
+        .expect("init last-run stamp");
+    assert!(stamp.ends_with(" ok init\n"), "{stamp:?}");
+}
+
+#[test]
+fn release_root_checkpoint_pins_its_install_metadata_end_to_end() {
+    // A packaged release has no `.git`: the checkpoint must compare against
+    // its install metadata, never Git's answer for some enclosing tree.
+    let home = TempDir::new("doctor-release-checkpoint-home").expect("home");
+    let state = TempDir::new("doctor-release-checkpoint-state").expect("state");
+    let scope = TempDir::new("doctor-release-checkpoint-root").expect("release scope");
+    let release = scope.path().join("dot");
+    std::fs::create_dir_all(release.join("lib/dot/public")).expect("release");
+    let pinned = "c".repeat(40);
+    std::fs::write(
+        release.join(".dot-install.json"),
+        format!("{{\n  \"schema\": 1,\n  \"commit\": \"{pinned}\"\n}}\n"),
+    )
+    .expect("metadata");
+    let record = state.path().join("dot/provider-reexec-failed");
+    std::fs::create_dir_all(record.parent().expect("parent")).expect("state dir");
+    std::fs::write(
+        &record,
+        format!(
+            "cgraf78 dot provider reexec checkpoint v1\nbefore={}\nafter={pinned}\n",
+            "a".repeat(40)
+        ),
+    )
+    .expect("checkpoint");
+    seal(&record, 0o600);
+    // The shipped binary derives its own source root, so run in process
+    // with this release as the embedded source root.
+    let (_, stdout, _) = run_in_process(
+        &home,
+        &state,
+        home.path(),
+        &[("DOT_SOURCE_ROOT", release.as_os_str())],
+    );
+    let stdout = String::from_utf8_lossy(&stdout);
+    assert!(stdout.contains("dot release exists"), "{stdout}");
+    assert!(
+        stdout.contains("⚠ provider re-exec checkpoint pending"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("blocks dot update"), "{stdout}");
+}
+
+#[test]
+fn misspelled_config_key_fails_end_to_end() {
+    // I5: a likely misspelled key makes every `dot update` exit 1, so
+    // doctor fails on it; a key from a newer Dot stays a warning.
+    let home = TempDir::new("doctor-misspelled-key-home").expect("home");
+    let state = TempDir::new("doctor-misspelled-key-state").expect("state");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\ndefualt_profile=base\nfuture_key=1\n",
+    )
+    .expect("config");
+    let native = command(false, &home, &state, &[]).output().expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("  ✗ unknown configuration key ignored\n    defualt_profile on line 2"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  ⚠ unknown configuration key ignored\n    future_key on line 3"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn blocking_reexec_checkpoint_fails_end_to_end() {
+    // M8: a provider re-exec checkpoint that does not pin the active Dot
+    // makes every `dot update` exit 1; doctor used to say nothing.
+    let home = TempDir::new("doctor-checkpoint-home").expect("home");
+    let state = TempDir::new("doctor-checkpoint-state").expect("state");
+    let record = state.path().join("dot/provider-reexec-failed");
+    std::fs::create_dir_all(record.parent().expect("parent")).expect("state dir");
+    std::fs::write(
+        &record,
+        format!(
+            "cgraf78 dot provider reexec checkpoint v1\nbefore={}\nafter={}\n",
+            "a".repeat(40),
+            "b".repeat(40)
+        ),
+    )
+    .expect("checkpoint");
+    seal(&record, 0o600);
+    let native = command(false, &home, &state, &[]).output().expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("✗ provider re-exec checkpoint blocks dot update"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("pins bbbbbbbbbbbb but dot is at "),
+        "{stdout}"
+    );
+    assert!(record.exists(), "doctor must not consume the checkpoint");
+}
+
+#[test]
+fn standalone_release_under_shdeps_is_reported_end_to_end() {
+    // M1: a standalone install (`cgraf78/dot -> .dot-standalone/current`)
+    // read green under the Shdeps provider. Shdeps adopts it on its next
+    // update of Dot, unless the installer's lock blocks that.
+    let home = TempDir::new("doctor-standalone-home").expect("home");
+    let state = TempDir::new("doctor-standalone-state").expect("state");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\ndependency_provider=shdeps\n",
+    )
+    .expect("config");
+    let cgraf = home.path().join(".local/share/cgraf78");
+    let release = cgraf.join(".dot-standalone/releases/v1-linux");
+    std::fs::create_dir_all(release.join("lib/dot/public")).expect("release");
+    std::fs::write(release.join(".dot-install.json"), b"{}\n").expect("metadata");
+    std::os::unix::fs::symlink("releases/v1-linux", cgraf.join(".dot-standalone/current"))
+        .expect("current");
+    std::os::unix::fs::symlink(".dot-standalone/current", cgraf.join("dot")).expect("root");
+    let release = std::fs::canonicalize(&release).expect("release path");
+    let native = command(
+        false,
+        &home,
+        &state,
+        &[("DOT_SOURCE_ROOT", release.to_str().expect("utf8 release"))],
+    )
+    .output()
+    .expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(stdout.contains("⚠ dot is standalone-installed"), "{stdout}");
+    assert!(
+        stdout.contains("~/.local/share/cgraf78/dot: Shdeps adopts it on its next update of dot"),
+        "{stdout}"
+    );
+    std::fs::create_dir(cgraf.join(".dot-standalone/lock")).expect("installer lock");
+    let native = command(
+        false,
+        &home,
+        &state,
+        &[("DOT_SOURCE_ROOT", release.to_str().expect("utf8 release"))],
+    )
+    .output()
+    .expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("✗ standalone installer lock blocks Shdeps adoption"),
+        "{stdout}"
     );
 }
 
