@@ -15,6 +15,11 @@
 //! trailer or an empty indented line. Colors travel with the call in
 //! [`Palette`] so these helpers stay pure; production resolves it with
 //! [`resolve_palette`], tests with marker strings.
+//!
+//! A verdict row may carry attachments that render on their own lines below
+//! it: list items (`    - item`, at most [`ITEM_LIMIT`] before a `+N more`
+//! line) and next-step hints (`    → hint`). They keep long lists and the
+//! "what to do" text out of the one-line detail, and they never count.
 
 /// One doctor result row, mirroring a single `_dr_*` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +30,12 @@ pub struct Record {
     pub message: Vec<u8>,
     /// The detail verbatim (`$2`), or `None` for one-argument calls.
     pub detail: Option<Vec<u8>>,
+    /// List items attached to this row (`dot_doctor_item`), in filing
+    /// order. Rendered one per line below the row; never counted.
+    pub items: Vec<Vec<u8>>,
+    /// Next steps attached to this row (`dot_doctor_hint`), in filing
+    /// order. Rendered after the items; never counted.
+    pub hints: Vec<Vec<u8>>,
 }
 
 impl Record {
@@ -58,14 +69,56 @@ impl Record {
         Self::text(Kind::Info, message, detail)
     }
 
+    /// Attach one list item, rendered on its own line below the row.
+    pub fn with_item(mut self, item: impl Into<String>) -> Self {
+        self.items.push(item.into().into_bytes());
+        self
+    }
+
+    /// Attach list items in order, each rendered on its own line below the
+    /// row; past [`ITEM_LIMIT`] the rest fold into one `+N more` line.
+    pub fn with_items<I>(mut self, items: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        self.items
+            .extend(items.into_iter().map(|item| item.into().into_bytes()));
+        self
+    }
+
+    /// Attach a next step, rendered as a `→` line after the items.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hints.push(hint.into().into_bytes());
+        self
+    }
+
+    /// A bare row of `kind` carrying `message` and `detail` as bytes.
+    pub fn bytes(kind: Kind, message: &[u8], detail: Option<&[u8]>) -> Self {
+        Self {
+            kind,
+            message: message.to_vec(),
+            detail: detail.map(<[u8]>::to_vec),
+            items: Vec::new(),
+            hints: Vec::new(),
+        }
+    }
+
     fn text(kind: Kind, message: impl Into<String>, detail: Option<String>) -> Self {
         Self {
             kind,
             message: message.into().into_bytes(),
             detail: detail.map(String::into_bytes),
+            items: Vec::new(),
+            hints: Vec::new(),
         }
     }
 }
+
+/// Items shown below one row before the rest fold into `+N more`: enough to
+/// name the first few offenders, short enough that one row with hundreds of
+/// entries cannot bury the rest of the report.
+pub const ITEM_LIMIT: usize = 5;
 
 /// The `_dr_*` helper family a [`Record`] was filed through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,8 +159,8 @@ impl Counts {
     }
 }
 
-/// The six `_DR_*` color slots from `lib/dot/doctor/runtime.sh`,
-/// resolved by the caller (empty under pipes, ANSI escapes on a
+/// The six `_DR_*` color slots of the former shell renderer
+/// (`lib/dot/doctor/runtime.sh`), resolved by the caller (empty under pipes, ANSI escapes on a
 /// color terminal).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Palette {
@@ -194,6 +247,37 @@ pub fn render(records: &[Record], palette: &Palette) -> Vec<u8> {
             Kind::Info => info(palette, &record.message, record.detail.as_deref()),
         };
         out.extend_from_slice(&row);
+        out.extend_from_slice(&attachments(palette, &record.items, &record.hints));
+    }
+    out
+}
+
+/// The lines below one row: up to [`ITEM_LIMIT`] dim `- item` lines, a dim
+/// `+N more` line for the rest, then one `→ hint` line per hint. Empty
+/// entries are dropped, like an empty detail. Rendering stays per record, so
+/// streaming filed prefixes still concatenates to the whole report.
+pub fn attachments(palette: &Palette, items: &[Vec<u8>], hints: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let items: Vec<&Vec<u8>> = items.iter().filter(|item| !item.is_empty()).collect();
+    for item in items.iter().take(ITEM_LIMIT) {
+        out.extend_from_slice(b"    ");
+        out.extend_from_slice(palette.dim.as_bytes());
+        out.extend_from_slice(b"- ");
+        out.extend_from_slice(item);
+        out.extend_from_slice(palette.reset.as_bytes());
+        out.push(b'\n');
+    }
+    if items.len() > ITEM_LIMIT {
+        out.extend_from_slice(b"    ");
+        out.extend_from_slice(palette.dim.as_bytes());
+        out.extend_from_slice(format!("+{} more", items.len() - ITEM_LIMIT).as_bytes());
+        out.extend_from_slice(palette.reset.as_bytes());
+        out.push(b'\n');
+    }
+    for hint in hints.iter().filter(|hint| !hint.is_empty()) {
+        out.extend_from_slice("    → ".as_bytes());
+        out.extend_from_slice(hint);
+        out.push(b'\n');
     }
     out
 }

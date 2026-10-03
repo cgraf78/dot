@@ -240,3 +240,50 @@ fn info_rows_render_inline_and_never_count() {
         "  › fact (value)\n  ✓ check\n".as_bytes()
     );
 }
+
+#[test]
+fn attachments_render_below_their_row_and_fold_past_the_limit() {
+    use dot::doctor_runtime::ITEM_LIMIT;
+    let items: Vec<String> = (1..=ITEM_LIMIT + 2).map(|n| format!("item {n}")).collect();
+    let records = vec![
+        Record::warn("stale", Some("merged".into()))
+            .with_items(items.clone())
+            .with_hint("run cleanup"),
+        Record::ok("listed", None)
+            .with_items(items[..ITEM_LIMIT].to_vec())
+            .with_item(""),
+        Record::info("fact", Some("value".into())).with_hint(""),
+    ];
+    let mut expected = String::from("  ⚠ stale\n    merged\n");
+    for item in &items[..ITEM_LIMIT] {
+        expected.push_str(&format!("    - {item}\n"));
+    }
+    expected.push_str("    +2 more\n    → run cleanup\n  ✓ listed\n");
+    for item in &items[..ITEM_LIMIT] {
+        expected.push_str(&format!("    - {item}\n"));
+    }
+    // Empty attachments drop, like an empty detail.
+    expected.push_str("  › fact (value)\n");
+    assert_eq!(
+        String::from_utf8(render(&records, &Palette::empty())).expect("utf8"),
+        expected
+    );
+    // Items are dim like details; the next step is not.
+    let colored = render(&records[..1], &marker_palette());
+    let colored = String::from_utf8(colored).expect("utf8");
+    assert!(colored.contains("    <D>- item 1<R>\n"), "{colored}");
+    assert!(colored.contains("    <D>+2 more<R>\n"), "{colored}");
+    assert!(colored.contains("    → run cleanup\n"), "{colored}");
+}
+
+#[test]
+fn attachments_never_count() {
+    let mut recorder = dot::doctor_orchestrator::Recorder::new();
+    recorder.record(
+        Record::warn("w", None)
+            .with_items(["a", "b"])
+            .with_hint("h"),
+    );
+    assert_eq!(recorder.counts().warn, 1);
+    assert_eq!(recorder.counts().pass + recorder.counts().fail, 0);
+}

@@ -122,6 +122,8 @@ fn public_extension_inventories_and_documentation_pin_the_literal_contract() {
             "dot_doctor_fail",
             "dot_doctor_skip",
             "dot_doctor_info",
+            "dot_doctor_item",
+            "dot_doctor_hint",
             "dot_doctor_display_path",
             "dot_doctor_source",
         ]

@@ -4,7 +4,7 @@
 //! `lib/dot/doctor/paths.sh` — `_dr_physical_path`,
 //! `_dr_symlink_target_path`, `_dr_symlink_points_to`, `_dr_tilde` —
 //! plus the public display twin `dot_doctor_display_path` from
-//! `lib/dot/doctor-api.sh`. Part 1 (`doctor_runtime`) owns the result
+//! `lib/dot/public/hook-runtime-v1/doctor-api.sh`. Part 1 (`doctor_runtime`) owns the result
 //! lines and counters; this module owns how section checks name
 //! filesystem locations.
 //!

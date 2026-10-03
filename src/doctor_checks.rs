@@ -43,10 +43,9 @@
 //!   probe, the shdeps installer selection, and the lifecycle ledger
 //!   load stay caller concerns: they encode trust policy owned by
 //!   other modules, so tests inject their outcomes.
-//! - The `_dr_check_merges` "inventory is invalid" branch only
-//!   fires when the `wc -l` pipeline itself fails (a bad inventory
-//!   still prints zero lines through `sort`, whose exit status
-//!   decides); the port keeps the branch with `spec_count: None`.
+//! - The `_dr_check_merges` "inventory is invalid" branch fires with
+//!   `spec_count: None`; [`MergeInputs::inventory_error`] carries the
+//!   reason (an unsafe hook, a bad identity) so the row names it.
 //! - [`check_cron_freshness`] and per-hook output verification are
 //!   new observability (handoff findings #1 and #8), not shell
 //!   ports: the shell counted merge specs only and kept no
@@ -72,12 +71,14 @@ use std::path::{Path, PathBuf};
 
 pub use crate::doctor_runtime::{Kind, Record};
 
-/// Render records byte-identical to `doctor/runtime.sh` with color
-/// disabled (piped stdout: every color variable is empty):
+/// Render records with color disabled (piped stdout: every color slot is
+/// empty), through [`crate::doctor_runtime::render`]:
 ///
 /// - section: `\n{message}\n`
-/// - ok/skip: `  ✓/· {message}[ ({detail})]\n`
+/// - ok/skip/info: `  ✓/·/› {message}[ ({detail})]\n`
 /// - warn/fail: `  ⚠/✗ {message}[\n    {detail}]\n`
+/// - then any attachments: `    - {item}\n` (folding into `    +N more\n`
+///   past the limit) and `    → {hint}\n`
 pub fn render(records: &[Record]) -> String {
     String::from_utf8(crate::doctor_runtime::render(
         records,
@@ -333,6 +334,9 @@ pub struct MergeInputs {
     /// spec listing stays shell-side (`merges` slice); only its
     /// count crosses here.
     pub spec_count: Option<usize>,
+    /// Why the inventory is invalid, with its next step, when
+    /// `spec_count` is `None`; the row falls back to the directory.
+    pub inventory_error: Option<String>,
     /// Per-hook output declarations for freshness verification.
     /// Empty skips verification (the historical count-only
     /// behavior); production always passes one entry per
@@ -543,7 +547,7 @@ pub fn check_merges(inputs: &MergeInputs) -> Vec<Record> {
     let Some(count) = inputs.spec_count else {
         out.push(Record::fail(
             "merge-hook extension inventory is invalid",
-            Some(root),
+            Some(inputs.inventory_error.clone().unwrap_or(root)),
         ));
         return out;
     };
