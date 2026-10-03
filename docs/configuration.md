@@ -152,24 +152,36 @@ revision automatically.
 
 ## Shdeps prune
 
-Set `DOT_SHDEPS_PRUNE` in the environment of `dot update` to let it remove
-orphaned Shdeps dependencies (ones no longer declared for the host) by running
-`shdeps prune -y` itself:
+`dot update --cron` removes orphaned Shdeps dependencies (ones no longer
+declared for the host) by running `shdeps prune -y` itself. Set
+`DOT_SHDEPS_PRUNE` in the environment of `dot update` to choose when:
 
-- `never` (default, also when unset or empty): Dot never prunes; run
-  `shdeps prune` yourself.
-- `cron`: only `dot update --cron` prunes. `--quiet` and `DOT_QUIET` do not
-  count; they change output, not what an update does.
+- `cron` (default, also when unset or empty): only `dot update --cron` prunes.
+  `--quiet` and `DOT_QUIET` do not count; they change output, not what an
+  update does.
+- `never`: Dot never prunes, including under `--cron`; run `shdeps prune`
+  yourself.
 - `always`: every `dot update` and `dot pull` prunes.
 
-For example, a cron entry of `DOT_SHDEPS_PRUNE=cron dot update --cron` prunes
-on every unattended run. `dot init` ignores the variable. Any other value
-prints a warning and reads as `never`; it never fails the update. This is an
-environment variable rather than a config key on purpose: the config file is
-often shared through a client repository, and Dot releases from before
+For example, a plain cron entry of `dot update --cron` prunes on every
+unattended run. `dot init` ignores the variable. Any other value prints a
+warning and reads as `never`, so a misspelled value also turns off the default
+cron prune; it never fails the update. This is an environment variable rather
+than a config key on purpose: the config file is often shared through a client
+repository, and Dot releases from before
 [unknown-key tolerance](#unknown-keys-and-version-skew) reject unknown config
-keys, so a key would stop clients still running one of them. Older releases
-simply ignore the variable and do not prune.
+keys, so a key would stop clients still running one of them.
+
+Older releases defaulted to `never` (also for an empty value), so cron prune
+was opt-in through `DOT_SHDEPS_PRUNE=cron dot update --cron`. That entry keeps
+working unchanged. A plain `dot update --cron` entry does not prune on a host
+still running an older release: when its `Tools` stage upgrades Dot and hands
+the run to the new release, the continuation already prunes; an older release
+that finishes the run in place prunes from the next cron run on. Releases from
+before `DOT_SHDEPS_PRUNE` existed ignore the variable and never prune. The
+first cron run of a release with the new default on a host that never pruned
+removes every orphan accumulated so far; set `DOT_SHDEPS_PRUNE=never` in the
+cron entry beforehand to keep them.
 
 Pruning is destructive: Shdeps runs each orphan's `uninstall` hook and deletes
 its managed payloads, links, and state. Dot reads the variable once and removes
@@ -242,8 +254,8 @@ unchanged. Hand-run updates write nothing else.
 
 A run is degraded when everything except the `Tools` stage (a dependency, a
 post hook, or an unavailable Shdeps) and/or the `Prune` stage succeeded: the
-dotfiles are current, dependencies are not. This applies with or without
-`DOT_SHDEPS_PRUNE`: a cron run whose only failure is `Tools` now logs
+dotfiles are current, dependencies are not. This applies whether or not the
+run prunes: a cron run whose only failure is `Tools` now logs
 `degraded update tools` where it used to log `fail update`, so scripts that
 search `update.log` for `fail` should also match `degraded`. A failed `Tools`
 stage still defers the profile lifecycle commit to a later clean run, as
