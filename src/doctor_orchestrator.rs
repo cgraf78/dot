@@ -125,39 +125,10 @@ impl Recorder {
     }
 }
 
-/// `_dr_tilde` (owned by the `doctor_paths` lane, mirrored here only
-/// as the display effect the runtime and engine-source checks call):
-/// `$HOME` becomes `~`, `$HOME/...` becomes `~/...`, everything
-/// else passes through verbatim.
-fn tilde(path: &[u8], home: &[u8]) -> Vec<u8> {
-    if path == home {
-        return b"~".to_vec();
-    }
-    if home.is_empty() {
-        // `"$HOME"/*` with an empty HOME is the `/*` pattern, and
-        // `${p#"$HOME"/}` strips the leading slash, so absolute
-        // paths still abbreviate.
-        if let Some(rest) = path.strip_prefix(b"/") {
-            let mut out = b"~/".to_vec();
-            out.extend_from_slice(rest);
-            return out;
-        }
-        return path.to_vec();
-    }
-    let mut prefix = home.to_vec();
-    prefix.push(b'/');
-    if let Some(rest) = path.strip_prefix(prefix.as_slice()) {
-        let mut out = b"~/".to_vec();
-        out.extend_from_slice(rest);
-        return out;
-    }
-    path.to_vec()
-}
-
 /// Resolved inputs for [`check_runtime`], mirroring the shell locals
 /// of `_dr_check_runtime`: the Bash probe, the canonicalized
-/// checkout/source roots, the `git --version` line, and the
-/// defaulted configuration version.
+/// checkout/source roots, the `git --version` line, and what the
+/// running build is and how it is installed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSnapshot {
     /// `$BASH_VERSION` verbatim.
@@ -180,19 +151,28 @@ pub struct RuntimeSnapshot {
     pub source_root: Vec<u8>,
     /// `git --version` output, `None` when empty (unavailable).
     pub git_version: Option<Vec<u8>>,
-    /// `${DOT_CONFIG_VERSION:-1}`, already defaulted by the caller.
-    pub config_version: Vec<u8>,
+    /// The running build's version stamp (`dot version`).
+    pub version: Vec<u8>,
+    /// How a release is installed (`Shdeps release`, a standalone install)
+    /// when the install-layout check found an owner that can upgrade it;
+    /// `None` when that check reports the layout itself as a problem row.
+    /// Checkouts ignore it and name their location instead.
+    pub install_kind: Option<String>,
     /// Config keys this release ignored; each becomes a warning so a
     /// typo or a Dot that lags the client repository stays visible.
     pub unknown_config_keys: Vec<crate::config::UnknownKey>,
 }
 
-/// `_dr_check_runtime`: file the `dot runtime` section, the Bash
-/// gate (`-ge 4`), the checkout comparison, the Git probe, and the
-/// configuration version, then the engine-source tail via
-/// [`check_engine_source`], like the trailing
-/// `_dr_check_engine_source` call. `home` feeds the display
-/// abbreviations.
+/// `_dr_check_runtime`: file the `dot runtime` section: one row naming the
+/// running build, where it runs from, and how it is installed; the Bash gate
+/// (`-ge 4`); the Git probe; ignored configuration keys; then the
+/// engine-source warnings via [`check_engine_source`]. `home` feeds the
+/// display abbreviations.
+///
+/// A healthy runtime used to take six rows (release exists, engine source,
+/// release layout, a constant configuration version, ...) that never
+/// changed; they fold into the version row, while every warning and failure
+/// keeps a row of its own.
 pub fn check_runtime(
     rec: &mut Recorder,
     snapshot: &RuntimeSnapshot,
@@ -200,6 +180,35 @@ pub fn check_runtime(
     home: &[u8],
 ) {
     rec.section(b"dot runtime");
+    let checkout_ok = match &snapshot.checkout_root {
+        Some(root) => !root.is_empty() && *root == snapshot.source_root,
+        None => false,
+    };
+    let location = engine_location(engine);
+    if snapshot.release_root || checkout_ok {
+        // A release reads as its install kind, never as a "checkout": the
+        // managed root holds a Shdeps archive or a standalone install.
+        let kind = if snapshot.release_root {
+            snapshot.install_kind.as_deref().unwrap_or(match location {
+                EngineLocation::Managed => "managed install",
+                _ => "release",
+            })
+        } else {
+            match location {
+                EngineLocation::Development => "development checkout",
+                EngineLocation::Managed => "managed checkout",
+                EngineLocation::Outside => "checkout",
+            }
+        };
+        let mut message = b"dot ".to_vec();
+        message.extend_from_slice(&snapshot.version);
+        let mut detail = crate::doctor_paths::tilde_bytes(&snapshot.source_raw, home);
+        detail.extend_from_slice(b", ");
+        detail.extend_from_slice(kind.as_bytes());
+        rec.ok(&message, Some(&detail));
+    } else {
+        rec.fail(b"dot checkout is unavailable", Some(&snapshot.source_raw));
+    }
     if !snapshot.bash_required {
         rec.skip(b"Bash runtime is not required", None);
     } else if snapshot.bash_major >= 4 {
@@ -210,19 +219,6 @@ pub fn check_runtime(
             Some(b"Bash 4 or newer is required"),
         );
     }
-    let checkout_ok = match &snapshot.checkout_root {
-        Some(root) => !root.is_empty() && *root == snapshot.source_root,
-        None => false,
-    };
-    if snapshot.release_root {
-        let display = tilde(&snapshot.source_raw, home);
-        rec.ok(b"dot release exists", Some(&display));
-    } else if checkout_ok {
-        let display = tilde(&snapshot.source_raw, home);
-        rec.ok(b"dot checkout exists", Some(&display));
-    } else {
-        rec.fail(b"dot checkout is unavailable", Some(&snapshot.source_raw));
-    }
     match &snapshot.git_version {
         Some(version) => {
             rec.ok(b"Git runtime", Some(version));
@@ -231,8 +227,6 @@ pub fn check_runtime(
             rec.fail(b"Git runtime is unavailable", None);
         }
     }
-    // A configuration fact, not a check: informational, never counted.
-    rec.info(b"configuration version", Some(&snapshot.config_version));
     for unknown in &snapshot.unknown_config_keys {
         let detail = format!(
             "{} on line {} ({})",
@@ -255,7 +249,7 @@ pub fn check_runtime(
             );
         }
     }
-    check_engine_source(rec, engine, home);
+    check_engine_source(rec, engine);
 }
 
 /// Resolved inputs for [`check_engine_source`], mirroring the shell
@@ -280,42 +274,52 @@ pub struct EngineSnapshot {
     pub ignore_dev_checkout: bool,
 }
 
-/// `_dr_check_engine_source`: file the bypass notice when enabled,
-/// then classify the engine source as a development checkout, a
-/// managed checkout, or an outside location (a warning, never a
-/// failure — repository test checkouts must stay green). `home`
-/// feeds the checkout display abbreviation.
-pub fn check_engine_source(rec: &mut Recorder, snapshot: &EngineSnapshot, home: &[u8]) {
+/// Where the running engine lives, relative to the two locations Dot's
+/// provider manages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineLocation {
+    /// The development checkout (`${SHDEPS_GIT_DEV_DIR:-$HOME/git}/dot`).
+    Development,
+    /// The managed install (`${SHDEPS_INSTALL_DIR:-...}/cgraf78/dot`).
+    Managed,
+    /// Anywhere else (a test checkout, an unpacked archive).
+    Outside,
+}
+
+/// Classify the engine source physically. The development checkout wins
+/// when both resolve to it, as it always has.
+pub fn engine_location(snapshot: &EngineSnapshot) -> EngineLocation {
+    let resolves = |real: &Option<Vec<u8>>| {
+        real.as_ref()
+            .is_some_and(|real| !real.is_empty() && *real == snapshot.source_real)
+    };
+    if resolves(&snapshot.development_real) {
+        EngineLocation::Development
+    } else if resolves(&snapshot.managed_real) {
+        EngineLocation::Managed
+    } else {
+        EngineLocation::Outside
+    }
+}
+
+/// `_dr_check_engine_source`: file the bypass notice when enabled, and warn
+/// when the engine source is outside both managed locations (a warning,
+/// never a failure — repository test checkouts must stay green). A managed
+/// or development source has no row of its own: [`check_runtime`] names it
+/// in the version row.
+pub fn check_engine_source(rec: &mut Recorder, snapshot: &EngineSnapshot) {
     if snapshot.ignore_dev_checkout {
         rec.warn(
             b"development checkout bypass enabled",
             Some(b"the provider will use the managed checkout for this invocation"),
         );
     }
-    let development_ok = match &snapshot.development_real {
-        Some(real) => !real.is_empty() && *real == snapshot.source_real,
-        None => false,
-    };
-    if development_ok {
-        let mut detail = b"development checkout: ".to_vec();
-        detail.extend_from_slice(&tilde(&snapshot.development_raw, home));
-        rec.ok(b"dot engine source", Some(&detail));
-        return;
+    if engine_location(snapshot) == EngineLocation::Outside {
+        rec.warn(
+            b"dot engine source is outside managed locations",
+            Some(&snapshot.source_real),
+        );
     }
-    let managed_ok = match &snapshot.managed_real {
-        Some(real) => !real.is_empty() && *real == snapshot.source_real,
-        None => false,
-    };
-    if managed_ok {
-        let mut detail = b"managed checkout: ".to_vec();
-        detail.extend_from_slice(&tilde(&snapshot.managed_raw, home));
-        rec.ok(b"dot engine source", Some(&detail));
-        return;
-    }
-    rec.warn(
-        b"dot engine source is outside managed locations",
-        Some(&snapshot.source_real),
-    );
 }
 
 /// Counter for unique doctor scratch directories (see
@@ -796,24 +800,6 @@ pub(crate) fn record_extension(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tilde_covers_home_corners() {
-        assert_eq!(tilde(b"/home/u/proj", b"/home/u"), b"~/proj");
-        assert_eq!(tilde(b"/home/u", b"/home/u"), b"~");
-        assert_eq!(tilde(b"/home/u2/x", b"/home/u"), b"/home/u2/x");
-        assert_eq!(tilde(b"/home/u", b"/home/u/"), b"/home/u");
-        assert_eq!(tilde(b"/etc/dot", b"/home/u"), b"/etc/dot");
-        // Empty HOME: only the empty path abbreviates to `~`;
-        // absolute paths lose the leading slash under `~/`.
-        assert_eq!(tilde(b"", b""), b"~");
-        assert_eq!(tilde(b"/a", b""), b"~/a");
-        assert_eq!(tilde(b"rel", b""), b"rel");
-        // HOME `/`: only a doubled-slash prefix abbreviates.
-        assert_eq!(tilde(b"/", b"/"), b"~");
-        assert_eq!(tilde(b"//a", b"/"), b"~/a");
-        assert_eq!(tilde(b"/a", b"/"), b"/a");
-    }
 
     #[test]
     fn log_lines_keep_each_non_empty_line() {

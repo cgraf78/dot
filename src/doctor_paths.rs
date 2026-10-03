@@ -178,14 +178,26 @@ pub fn symlink_points_to(link: &Path, expected: &Path) -> bool {
 /// behaves the same way. See [`display_path`] for the public twin,
 /// which special-cases a `/` home instead.
 pub fn tilde(path: &str, home: &str) -> String {
+    // The abbreviation only ever cuts at the ASCII `/` after `home`, so
+    // UTF-8 input stays UTF-8; the lossy conversion never replaces anything.
+    String::from_utf8_lossy(&tilde_bytes(path.as_bytes(), home.as_bytes())).into_owned()
+}
+
+/// [`tilde`] over raw bytes, for paths that may not be UTF-8 (the runtime
+/// and engine-source rows carry them verbatim). The one implementation every
+/// doctor display path goes through.
+pub fn tilde_bytes(path: &[u8], home: &[u8]) -> Vec<u8> {
     if path == home {
-        return "~".to_string();
+        return b"~".to_vec();
     }
-    let prefix = format!("{home}/");
-    if let Some(rest) = path.strip_prefix(&prefix) {
-        return format!("~/{rest}");
+    let mut prefix = home.to_vec();
+    prefix.push(b'/');
+    if let Some(rest) = path.strip_prefix(prefix.as_slice()) {
+        let mut out = b"~/".to_vec();
+        out.extend_from_slice(rest);
+        return out;
     }
-    path.to_string()
+    path.to_vec()
 }
 
 /// `dot_doctor_display_path`: abbreviate `HOME` for display, with an
@@ -244,6 +256,13 @@ mod tests {
         assert_eq!(tilde("", ""), "~");
         assert_eq!(tilde("/etc", ""), "~/etc");
         assert_eq!(tilde("rel", ""), "rel");
+    }
+
+    #[test]
+    fn tilde_bytes_keeps_non_utf8_paths_verbatim() {
+        assert_eq!(tilde_bytes(b"/home/u/\xff", b"/home/u"), b"~/\xff");
+        assert_eq!(tilde_bytes(b"/srv/\xff", b"/home/u"), b"/srv/\xff");
+        assert_eq!(tilde_bytes(b"/home/u", b"/home/u"), b"~");
     }
 
     #[test]

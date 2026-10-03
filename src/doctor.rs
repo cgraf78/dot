@@ -122,24 +122,25 @@ fn run_configured(
                 .write_all(&runtime.bash_error_line_once(&error));
         }
     }
-    let runtime_snapshot = runtime_snapshot(runtime, config, &source, bash_required);
+    let mut runtime_snapshot = runtime_snapshot(runtime, config, &source, bash_required);
     let engine = engine_snapshot(runtime, &source, &home);
+    // The layout runs first so a healthy one is named in the version row;
+    // its problem rows still follow the runtime rows.
+    let layout = crate::doctor_checks::check_install_layout(&InstallInputs {
+        home: &home,
+        source_real: Path::new(OsStr::from_bytes(&engine.source_real)),
+        release_root: runtime_snapshot.release_root,
+        managed_root: Path::new(OsStr::from_bytes(&engine.managed_raw)),
+        shdeps: config.provider == crate::config::Provider::Shdeps,
+    });
+    runtime_snapshot.install_kind = layout.kind.map(str::to_string);
     crate::doctor_orchestrator::check_runtime(
         emit.recorder(),
         &runtime_snapshot,
         &engine,
         home.as_bytes(),
     );
-    append(
-        emit.recorder(),
-        crate::doctor_checks::check_install_layout(&InstallInputs {
-            home: &home,
-            source_real: Path::new(OsStr::from_bytes(&engine.source_real)),
-            release_root: runtime_snapshot.release_root,
-            managed_root: Path::new(OsStr::from_bytes(&engine.managed_raw)),
-            shdeps: config.provider == crate::config::Provider::Shdeps,
-        }),
-    );
+    append(emit.recorder(), layout.records);
     emit.emit();
 
     let topology = topology_name(base.topology);
@@ -452,7 +453,8 @@ fn runtime_snapshot(
         source_raw: source.as_bytes().to_vec(),
         source_root,
         git_version,
-        config_version: b"1".to_vec(),
+        version: crate::version::VERSION.as_bytes().to_vec(),
+        install_kind: None,
         unknown_config_keys: config.unknown_keys.clone(),
     }
 }
@@ -813,8 +815,6 @@ fn merge_inventory(
         let mut spec = MergeSpec {
             identity: identity.to_string_lossy().into_owned(),
             script: script.to_string_lossy().into_owned(),
-            sidecar: None,
-            family_dir: None,
             outputs: Vec::new(),
             invalid: Vec::new(),
         };
@@ -833,7 +833,6 @@ fn merge_inventory(
                     sidecar.display()
                 ));
             } else if let Some((outputs, invalid)) = read_outputs_sidecar(&sidecar, home) {
-                spec.sidecar = Some(sidecar.to_string_lossy().into_owned());
                 spec.outputs = outputs;
                 spec.invalid = invalid;
             } else {
@@ -847,13 +846,6 @@ fn merge_inventory(
                     sidecar.display()
                 ));
             }
-        }
-        let family = directory.join(&identity);
-        let family_real = std::fs::symlink_metadata(&family)
-            .ok()
-            .is_some_and(|meta| meta.is_dir() && !meta.file_type().is_symlink());
-        if family_real {
-            spec.family_dir = Some(family.to_string_lossy().into_owned());
         }
         inventory.push(spec);
     }

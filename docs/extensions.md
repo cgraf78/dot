@@ -175,13 +175,13 @@ next to its script: `10-example.sh` (or `10-example.serial.sh`) reads
 `10-example.outputs`. The sidecar lists one path per line; blank lines and
 `#` comments are ignored, and each entry supports the same leading `~`,
 `$HOME`, and `${HOME}` expansion as `dot_expand_home`. Entries must expand
-to absolute paths. `dot doctor` fails unless every declared output exists and
-is strictly newer than the hook script, the sidecar, and the hook's
-identity-named family directory. Hooks without a sidecar (or with an empty
-one) skip verification instead of failing. Each missing or stale output gets
-its own row, while healthy hooks and unverified hooks are each summarized in a
-single row. Sidecars pass the same ownership and writability validation as
-hook scripts.
+to absolute paths. `dot doctor` fails unless every declared output exists.
+It does not compare modification times: `dot_write_text_if_changed` and the
+managed-block helpers leave an unchanged output untouched, so a correct
+output is routinely older than its hook. Hooks without a sidecar (or with an
+empty one) are not verified and file no row. Each missing output gets its own
+row, while healthy hooks are summarized in a single row. Sidecars pass the
+same ownership and writability validation as hook scripts.
 
 Doctor extensions report structured records only; ordinary stdout/stderr is
 diagnosed as out-of-band output. Each result helper accepts `LABEL [DETAIL]`

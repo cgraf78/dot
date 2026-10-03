@@ -470,6 +470,32 @@ fn heal(dir: &Path, prefix: &[OsString]) -> StrandedHead {
     StrandedHead::Healed
 }
 
+/// What a checkout without a branch to pull is in the middle of, as
+/// [`stranded_head`] would classify it, read-only: no healing, no marker
+/// cleanup, no git process (doctor runs it on every report).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Interruption {
+    /// dot's own rebase, interrupted before it could finish or abort.
+    /// Update aborts it when that discards nothing and fails otherwise.
+    DotRebase,
+    /// A merge, rebase, cherry-pick, revert, or `git am` dot did not
+    /// start. Update warns and skips the checkout.
+    UserSession,
+}
+
+/// Read-only twin of [`stranded_head`]'s classification for the
+/// per-worktree git dir `git_dir`; `None` when nothing is in progress
+/// (a plain detached HEAD, if HEAD has no branch).
+pub(crate) fn interruption(git_dir: &Path) -> Option<Interruption> {
+    if interrupted_by_dot(git_dir) {
+        Some(Interruption::DotRebase)
+    } else if session_exists(git_dir) {
+        Some(Interruption::UserSession)
+    } else {
+        None
+    }
+}
+
 /// Classify a checkout whose `@{u}` probe failed, aborting dot's own
 /// interrupted rebase on the way when that discards nothing. Only
 /// runs on that already-unusual path, so healthy pulls pay no extra
@@ -477,15 +503,16 @@ fn heal(dir: &Path, prefix: &[OsString]) -> StrandedHead {
 /// silent skip).
 pub(crate) fn stranded_head(prefix: &[OsString]) -> Option<Stranded> {
     let git_dir = absolute_git_dir(prefix);
-    let kind = match git_dir.as_deref() {
-        Some(dir) if interrupted_by_dot(dir) => heal(dir, prefix),
+    let found = git_dir.as_deref().map(|dir| (dir, interruption(dir)));
+    let kind = match found {
+        Some((dir, Some(Interruption::DotRebase))) => heal(dir, prefix),
         other => {
             // Whatever is in progress is not dot's: an in-flight
             // record here is stale and must never claim a later one.
-            if let Some(dir) = other {
+            if let Some((dir, _)) = other {
                 let _ = std::fs::remove_file(dir.join(INFLIGHT_MARKER));
             }
-            if other.is_some_and(session_exists) {
+            if matches!(other, Some((_, Some(Interruption::UserSession)))) {
                 StrandedHead::UserSession
             } else {
                 // `symbolic-ref -q` exits 1 exactly for a detached

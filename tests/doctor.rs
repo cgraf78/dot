@@ -1097,13 +1097,10 @@ fn base_repository_state_costs_one_status_call() {
         .output()
         .expect("doctor");
     let stdout = String::from_utf8_lossy(&native.stdout);
-    assert!(stdout.contains("✓ no tracked client changes"), "{stdout}");
+    // The healthy client folds into one row naming its branch.
     assert!(
-        stdout.contains("✓ client HEAD on branch (main)"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("✓ client upstream (origin/main (current))"),
+        stdout.contains("✓ client repository (")
+            && stdout.contains("main, current with origin/main)"),
         "{stdout}"
     );
     // A bypassed wrapper must fail here, not as a missing file.
@@ -1162,7 +1159,7 @@ fn source_checkout_ignores_caller_git_selection() {
         ],
     );
     assert!(
-        String::from_utf8_lossy(&shell.stdout).contains("dot checkout exists"),
+        String::from_utf8_lossy(&shell.stdout).contains(", checkout)\n"),
         "shell source row: {}",
         String::from_utf8_lossy(&shell.stdout)
     );
@@ -1252,9 +1249,13 @@ fn healthy_source_and_client_match_without_the_old_engine() {
 
     let (shell, native) = pair(&home, &state);
     let output = String::from_utf8_lossy(&shell.stdout);
-    assert!(output.contains("dot checkout exists"));
-    assert!(output.contains("client Git directory exists"));
-    assert!(output.contains("client upstream"));
+    assert!(output.contains(", checkout)\n"), "{output}");
+    assert!(
+        output.contains(
+            "✓ client repository (~/.dotfiles, worktree ~, main, current with origin/main)"
+        ),
+        "{output}"
+    );
     assert_pair(&shell, &native);
 }
 
@@ -1793,11 +1794,11 @@ fn in_process_doctor_uses_runtime_identity_probe() {
     assert!(stderr.is_empty(), "doctor stderr: {stderr:?}");
     let output = String::from_utf8_lossy(&stdout);
     assert!(
-        output.contains("profile identity (runtime-user@"),
+        output.contains("; for runtime-user@"),
         "doctor output: {output}"
     );
     assert!(
-        output.contains("web (agreed-match)"),
+        output.contains("› profile web (agreed-match"),
         "doctor output: {output}"
     );
 }
@@ -2056,7 +2057,7 @@ fn authorized_overlay_link_to_an_untrusted_file_keeps_its_own_row() {
     seal(&manifest, 0o600);
     let (output, _) = doctor_with_env(&home, &state, &[]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("ov: cloned"), "{stdout}");
+    assert!(stdout.contains("✓ ov ("), "{stdout}");
     assert!(
         stdout.contains("  ✗ 30-ov doctor extension refused\n    ~/extensions/doctor.d/30-ov.sh links to a file that fails the extension trust checks; check its owner and mode\n"),
         "{stdout}"
@@ -2491,8 +2492,8 @@ fn backdate_mtime(path: &Path, secs_ago: u64) {
 #[test]
 fn declared_merge_outputs_verify_end_to_end() {
     // Handoff finding #8: the `.outputs` sidecar declares live
-    // outputs; doctor verifies each exists and is newer than its
-    // inputs. Hooks without a sidecar skip verification.
+    // outputs; doctor verifies each exists. Hooks without a sidecar skip
+    // verification.
     let (home, state, directory) = merge_fixture("merge-outputs");
     let output = home.path().join("live.conf");
     std::fs::write(
@@ -2512,8 +2513,8 @@ fn declared_merge_outputs_verify_end_to_end() {
         "discovery aggregate kept: {stdout}"
     );
     assert!(
-        stdout.contains("merge-hook outputs are current"),
-        "fresh output passes: {stdout}"
+        stdout.contains("merge-hook outputs exist"),
+        "existing output passes: {stdout}"
     );
 
     // A missing output fails the merge section.
@@ -2525,14 +2526,15 @@ fn declared_merge_outputs_verify_end_to_end() {
         "missing output fails: {stdout}"
     );
 
-    // An output older than the hook script fails as stale.
-    std::fs::write(&output, b"stale\n").expect("stale output");
+    // N2: an output older than the hook script is still current; the
+    // write-if-changed helpers leave an unchanged output untouched.
+    std::fs::write(&output, b"unchanged\n").expect("older output");
     backdate_mtime(&output, 200);
     let (_, native) = pair(&home, &state);
     let stdout = String::from_utf8_lossy(&native.stdout);
     assert!(
-        stdout.contains("merge-hook output is stale"),
-        "stale output fails: {stdout}"
+        stdout.contains("merge-hook outputs exist") && !stdout.contains("stale"),
+        "an older output is not stale: {stdout}"
     );
 }
 
@@ -2567,7 +2569,7 @@ fn bad_sidecars_degrade_per_spec_end_to_end() {
     let (_, native) = pair(&home, &state);
     let stdout = String::from_utf8_lossy(&native.stdout);
     assert!(
-        stdout.contains("merge-hook outputs are current"),
+        stdout.contains("merge-hook outputs exist"),
         "healthy hook still verifies: {stdout}"
     );
     assert!(
@@ -2585,7 +2587,7 @@ fn bad_sidecars_degrade_per_spec_end_to_end() {
     let (_, native) = pair(&home, &state);
     let stdout = String::from_utf8_lossy(&native.stdout);
     assert!(
-        stdout.contains("merge-hook outputs are current"),
+        stdout.contains("merge-hook outputs exist"),
         "healthy hook still verifies: {stdout}"
     );
     assert!(
@@ -2605,8 +2607,8 @@ fn undeclared_merge_outputs_skip_verification_end_to_end() {
     let stdout = String::from_utf8_lossy(&native.stdout);
     assert!(stdout.contains("1 hook(s)"));
     assert!(
-        stdout.contains("merge-hook outputs are unverified"),
-        "no sidecar skips, not fails: {stdout}"
+        !stdout.contains("merge-hook outputs"),
+        "no sidecar files no output row: {stdout}"
     );
     assert_pair(&shell, &native);
 }
@@ -2804,7 +2806,7 @@ fn release_root_checkpoint_pins_its_install_metadata_end_to_end() {
         &[("DOT_SOURCE_ROOT", release.as_os_str())],
     );
     let stdout = String::from_utf8_lossy(&stdout);
-    assert!(stdout.contains("dot release exists"), "{stdout}");
+    assert!(stdout.contains(", release)\n"), "{stdout}");
     assert!(
         stdout.contains("⚠ provider re-exec checkpoint pending"),
         "{stdout}"
@@ -3030,8 +3032,8 @@ fn profile_context_and_unsafe_lifecycle_match_without_the_old_engine() {
 
     let (shell, native) = pair(&home, &state);
     let output = String::from_utf8_lossy(&shell.stdout);
-    assert!(output.contains("profile identity"));
-    assert!(output.contains("selected profile"));
+    assert!(output.contains("› profile "), "{output}");
+    assert!(output.contains("; for "), "{output}");
     assert!(output.contains("profile lifecycle state unsafe"));
     assert!(output.contains("required: selected but unavailable"));
     assert_pair(&shell, &native);
@@ -3109,9 +3111,9 @@ fn overlay_state_ignores_inherited_git_selectors() {
         .output()
         .expect("doctor");
     let stdout = String::from_utf8_lossy(&native.stdout);
-    assert!(stdout.contains("plain: cloned"), "{stdout}");
+    // Clean and current: the overlay folds into one row.
     assert!(
-        stdout.contains("✓ plain: upstream (origin/main (current))"),
+        stdout.contains("✓ plain (") && stdout.contains("main, current with origin/main)"),
         "{stdout}"
     );
     assert!(!stdout.contains("plain: 1 tracked change"), "{stdout}");
@@ -3131,7 +3133,10 @@ fn client_state_ignores_an_inherited_git_index() {
         .output()
         .expect("doctor");
     let stdout = String::from_utf8_lossy(&native.stdout);
-    assert!(stdout.contains("✓ no tracked client changes"), "{stdout}");
+    assert!(
+        stdout.contains("✓ client repository (") && !stdout.contains("tracked client change"),
+        "{stdout}"
+    );
 }
 
 fn latest_provider(home: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -3236,7 +3241,10 @@ fn healthy_latest_provider_matches_without_the_old_engine() {
         ],
     );
     let output = String::from_utf8_lossy(&shell.stdout);
-    assert!(output.contains("Shdeps provider source (trusted development checkout:"));
+    assert!(
+        output.contains("› Shdeps provider (latest policy; trusted development checkout "),
+        "{output}"
+    );
     assert!(output.contains("Shdeps provider ABI (abi:1)"));
     assert_pair(&shell, &native);
 }

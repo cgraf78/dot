@@ -3,9 +3,9 @@
 use std::os::unix::fs::PermissionsExt as _;
 
 use dot::doctor_orchestrator::{
-    EngineSnapshot, FailureNote, Recorder, RuntimeSnapshot, WorkerExit, check_engine_source,
-    check_runtime, create_result_file, extension_tail, failure_path, log_lines, result_paths,
-    run_extension_for,
+    EngineLocation, EngineSnapshot, FailureNote, Recorder, RuntimeSnapshot, WorkerExit,
+    check_engine_source, check_runtime, create_result_file, engine_location, extension_tail,
+    failure_path, log_lines, result_paths, run_extension_for,
 };
 use dot_test_support::TempDir;
 
@@ -33,18 +33,20 @@ fn runtime_check_agrees() {
         source_raw: b"/src".to_vec(),
         source_root: b"/src".to_vec(),
         git_version: Some(b"git version 2".to_vec()),
-        config_version: b"1".to_vec(),
+        version: b"20261003-000000-abcdef12".to_vec(),
+        install_kind: None,
         unknown_config_keys: Vec::new(),
     };
     check_runtime(&mut rec, &runtime, &engine(b"/src"), b"/home/u");
-    // Bash, checkout, and Git pass; the configuration version is an
-    // informational row and never counts.
+    // The version row (naming the checkout), Bash, and Git pass; no
+    // constant configuration-version row is filed.
     assert_eq!(rec.counts().pass, 3);
+    let rendered = String::from_utf8(rec.render()).expect("utf8");
     assert!(
-        String::from_utf8(rec.render())
-            .expect("utf8")
-            .contains("  › configuration version (1)\n")
+        rendered.starts_with("\ndot runtime\n  ✓ dot 20261003-000000-abcdef12 (/src, checkout)\n"),
+        "{rendered}"
     );
+    assert!(!rendered.contains("configuration version"), "{rendered}");
     assert_eq!(rec.counts().warn, 1);
     assert_eq!(rec.counts().fail, 0);
     let mut old = runtime.clone();
@@ -71,7 +73,8 @@ fn runtime_check_warns_once_per_unknown_config_key() {
         source_raw: b"/src".to_vec(),
         source_root: b"/src".to_vec(),
         git_version: Some(b"git version 2".to_vec()),
-        config_version: b"1".to_vec(),
+        version: b"20261003-000000-abcdef12".to_vec(),
+        install_kind: None,
         unknown_config_keys: vec![unknown("future_key", 2), unknown("defualt_profile", 3)],
     };
     let mut rec = Recorder::new();
@@ -107,7 +110,8 @@ fn packaged_runtime_does_not_require_checkout_or_bash() {
         source_raw: b"/data/cgraf78/dot/releases/v1-linux-x86_64-musl".to_vec(),
         source_root: b"/data/cgraf78/dot/releases/v1-linux-x86_64-musl".to_vec(),
         git_version: Some(b"git version 2".to_vec()),
-        config_version: b"1".to_vec(),
+        version: b"20261003-000000-abcdef12".to_vec(),
+        install_kind: None,
         unknown_config_keys: Vec::new(),
     };
     check_runtime(
@@ -117,53 +121,137 @@ fn packaged_runtime_does_not_require_checkout_or_bash() {
         b"/home/u",
     );
     assert_eq!(rec.counts().fail, 0);
-    let output = rec.render();
+    let output = String::from_utf8(rec.render()).expect("utf8");
+    // Outside the managed root the release is a bare "release", and the
+    // engine-source warning says so.
     assert!(
-        output
-            .windows(b"dot release exists".len())
-            .any(|part| part == b"dot release exists")
+        output.contains(
+            "✓ dot 20261003-000000-abcdef12 (/data/cgraf78/dot/releases/v1-linux-x86_64-musl, release)"
+        ),
+        "{output}"
     );
+    assert!(output.contains("Bash runtime is not required"), "{output}");
+}
+
+#[test]
+fn version_row_names_how_the_running_build_is_installed() {
+    // The row that replaced "release exists", "engine source", and "release
+    // layout": the layout's healthy kind wins for a release, a managed
+    // release never reads as a "checkout", and a checkout names its location.
+    let release = |install_kind: Option<&str>, managed: bool| {
+        let runtime = RuntimeSnapshot {
+            bash_version: Vec::new(),
+            bash_major: 0,
+            bash_required: false,
+            checkout_root: None,
+            release_root: true,
+            source_raw: b"/home/u/.local/share/cgraf78/dot".to_vec(),
+            source_root: b"/home/u/.local/share/cgraf78/dot".to_vec(),
+            git_version: Some(b"git version 2".to_vec()),
+            version: b"v1".to_vec(),
+            install_kind: install_kind.map(str::to_string),
+            unknown_config_keys: Vec::new(),
+        };
+        let mut snapshot = engine(&runtime.source_root);
+        if managed {
+            snapshot.managed_real = Some(runtime.source_root.clone());
+        }
+        let mut rec = Recorder::new();
+        check_runtime(&mut rec, &runtime, &snapshot, b"/home/u");
+        (String::from_utf8(rec.render()).expect("utf8"), rec.counts())
+    };
+    let (shdeps, counts) = release(Some("Shdeps release"), true);
     assert!(
-        output
-            .windows(b"Bash runtime is not required".len())
-            .any(|part| part == b"Bash runtime is not required")
+        shdeps.contains("  ✓ dot v1 (~/.local/share/cgraf78/dot, Shdeps release)\n"),
+        "{shdeps}"
     );
+    assert_eq!((counts.warn, counts.fail), (0, 0), "{shdeps}");
+    assert!(!shdeps.contains("checkout"), "{shdeps}");
+    let (managed, _) = release(None, true);
+    assert!(
+        managed.contains("✓ dot v1 (~/.local/share/cgraf78/dot, managed install)"),
+        "{managed}"
+    );
+
+    let checkout = |managed: bool| {
+        let runtime = RuntimeSnapshot {
+            bash_version: b"5.2".to_vec(),
+            bash_major: 5,
+            bash_required: true,
+            checkout_root: Some(b"/home/u/git/dot".to_vec()),
+            release_root: false,
+            source_raw: b"/home/u/git/dot".to_vec(),
+            source_root: b"/home/u/git/dot".to_vec(),
+            git_version: Some(b"git version 2".to_vec()),
+            version: b"v2".to_vec(),
+            install_kind: None,
+            unknown_config_keys: Vec::new(),
+        };
+        let mut snapshot = engine(&runtime.source_root);
+        if managed {
+            snapshot.managed_real = Some(runtime.source_root.clone());
+        } else {
+            snapshot.development_real = Some(runtime.source_root.clone());
+        }
+        let mut rec = Recorder::new();
+        check_runtime(&mut rec, &runtime, &snapshot, b"/home/u");
+        String::from_utf8(rec.render()).expect("utf8")
+    };
+    let development = checkout(false);
+    assert!(
+        development.contains("✓ dot v2 (~/git/dot, development checkout)"),
+        "{development}"
+    );
+    assert!(!development.contains("engine source"), "{development}");
+    assert!(checkout(true).contains("✓ dot v2 (~/git/dot, managed checkout)"));
 }
 
 #[test]
 fn engine_source_check_agrees() {
-    for (managed, development, ignored, needle) in [
+    // A managed or development source files nothing here (the version row
+    // names it); only the bypass and an outside source warn.
+    for (managed, development, ignored, location, warning) in [
         (
             Some(b"/src".to_vec()),
             None,
             false,
-            b"managed checkout".as_slice(),
+            EngineLocation::Managed,
+            None,
         ),
         (
             None,
             Some(b"/src".to_vec()),
             false,
-            b"development checkout".as_slice(),
+            EngineLocation::Development,
+            None,
         ),
-        (None, None, false, b"outside managed locations".as_slice()),
+        (
+            None,
+            None,
+            false,
+            EngineLocation::Outside,
+            Some("outside managed locations"),
+        ),
         (
             Some(b"/src".to_vec()),
             None,
             true,
-            b"bypass enabled".as_slice(),
+            EngineLocation::Managed,
+            Some("bypass enabled"),
         ),
     ] {
         let mut snapshot = engine(b"/src");
         snapshot.managed_real = managed;
         snapshot.development_real = development;
         snapshot.ignore_dev_checkout = ignored;
+        assert_eq!(engine_location(&snapshot), location);
         let mut rec = Recorder::new();
-        check_engine_source(&mut rec, &snapshot, b"/home/u");
-        assert!(
-            rec.render()
-                .windows(needle.len())
-                .any(|part| part == needle)
-        );
+        check_engine_source(&mut rec, &snapshot);
+        let rendered = String::from_utf8(rec.render()).expect("utf8");
+        match warning {
+            Some(needle) => assert!(rendered.contains(needle), "{rendered}"),
+            None => assert!(rendered.is_empty(), "{rendered}"),
+        }
     }
 }
 

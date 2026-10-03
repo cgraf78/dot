@@ -338,8 +338,15 @@ Dot records one, a hand-updated host still reads unknown.
 - a provider re-exec checkpoint the next update cannot consume fails;
 - unmerged paths in the client or a Git overlay fail when update would
   refuse to pull over them (on a branch with an upstream, outside a merge or
-  rebase) and warn while a merge or rebase is in progress; tracked changes,
-  a detached HEAD, a missing upstream, and upstream distance warn;
+  rebase) and warn while a merge or rebase the user started is in progress;
+  tracked changes, a detached HEAD, a missing upstream, and upstream
+  distance warn;
+- a checkout whose HEAD is on no branch is classified the way `dot update`
+  classifies it: dot's own interrupted rebase fails while the checkout has
+  uncommitted changes (every update fails until it is aborted, optional
+  overlays included) and warns otherwise (the next update aborts it and
+  pulls); a merge or rebase the user started and a plain detached HEAD warn
+  (update skips the checkout);
 - a rebase `dot update` froze after it conflicted (the same HEAD, on a
   branch with an upstream, is recorded in the repository's
   `dot-rebase-failed` marker) fails until it is rebased by hand; for an
@@ -446,7 +453,7 @@ overlays than the newer Dot would, because a skipped selector is often the one
 narrowing a shared host, or revive a tie it settled; `dot update` holds the
 overlay set instead. Commands that only report a selection (`status`, `fetch`,
 `push`, `diff`, `test`, and `doctor`) show `base`, the profile phase one
-already applies on every host, as `selected profile (base (skipped-selector))`.
+already applies on every host, as `profile base (skipped-selector; ...)`.
 A skipped selector that agrees, ranks below a match, or names another user or
 host changes nothing, and one for another user or host is not reported.
 
