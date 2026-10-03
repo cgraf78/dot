@@ -1404,23 +1404,61 @@ pub fn mkdir_forwarded(path: &Path, warnings: &mut dyn std::io::Write) -> bool {
     }
     let mut command = std::process::Command::new("mkdir");
     command.arg("-p").arg(path);
+    forward_mkdir(command, warnings)
+}
+
+/// Run a prepared `mkdir` command for [`mkdir_forwarded`]; split out so
+/// tests can substitute a command that cannot launch or dies by signal.
+fn forward_mkdir(command: std::process::Command, warnings: &mut dyn std::io::Write) -> bool {
     // Plain mkdir leaf, no descendants: Detach skips the host-wide completion
     // scan; cancellation still takes the strict path.
-    match crate::cleanup::run_session_output(
+    let outcome = crate::cleanup::run_session_output(
         command,
         None,
         crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
         crate::cleanup::LingerPolicy::Detach,
-    ) {
+    );
+    // Read the latch only for a death by signal, where the outcome itself
+    // cannot say whether a handled signal caused it. An interrupted run
+    // already reports `ErrorKind::Interrupted`.
+    forward_mkdir_outcome(outcome, crate::cancellation::check().is_err(), warnings)
+}
+
+/// Report a forwarded `mkdir` outcome, leaving a diagnostic for every
+/// failure.
+///
+/// The tool's own stderr stays byte-exact. A failure `mkdir` never got to
+/// describe (the launch or its supervision failed, or the process died by
+/// signal before writing) gets one `mkdir: <reason>` line instead of
+/// vanishing. The shell leaves a line on stderr in those cases too: a
+/// lookup or fork error, or a job-status report. Without it, a caller
+/// that then fails closed (`backup_dir`) fails with no visible cause. A
+/// handled signal owns the outcome, so an interrupted run stays silent:
+/// supervision reports it as `ErrorKind::Interrupted`, and `latched` covers
+/// a signal death the outcome cannot attribute. Classifying the error by
+/// its kind avoids re-reading a latch that a concurrent owner may already
+/// have reset.
+fn forward_mkdir_outcome(
+    outcome: std::io::Result<std::process::Output>,
+    latched: bool,
+    warnings: &mut dyn std::io::Write,
+) -> bool {
+    match outcome {
+        Ok(output) if output.status.success() => true,
         Ok(output) => {
-            if !output.status.success() {
+            if !output.stderr.is_empty() {
                 let _ = warnings.write_all(&output.stderr);
+            } else if !latched {
+                let _ = writeln!(warnings, "mkdir: {}", output.status);
             }
-            output.status.success()
+            false
         }
-        // No `mkdir` to leak from: the caller degrades like the
-        // shell past a failed lookup.
-        Err(_) => false,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                let _ = writeln!(warnings, "mkdir: {error}");
+            }
+            false
+        }
     }
 }
 
@@ -2111,6 +2149,73 @@ mod tests {
             0,
             "deterministic mkdir leaf must not pay a host-wide /proc walk"
         );
+    }
+
+    #[test]
+    fn mkdir_launch_failure_leaves_a_diagnostic() {
+        // A latched signal would legitimately silence the diagnostic.
+        let _signals = crate::cleanup::hold_signal_ownership_for_test();
+        let mut warnings = Vec::new();
+        let command = std::process::Command::new("/definitely/missing/dot-mkdir");
+        assert!(!forward_mkdir(command, &mut warnings));
+        let text = String::from_utf8(warnings).expect("utf-8 diagnostic");
+        assert!(text.starts_with("mkdir: "), "{text:?}");
+        assert!(text.contains("os error 2"), "{text:?}");
+        assert!(text.ends_with('\n'), "{text:?}");
+    }
+
+    #[test]
+    fn mkdir_signal_death_leaves_a_diagnostic() {
+        // Synthetic status: the engine's helpers must not spawn a shell
+        // (tests/no-private-engine-test), and a death by signal is all
+        // this branch needs.
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut warnings = Vec::new();
+        let killed = std::process::Output {
+            status: std::process::ExitStatus::from_raw(libc::SIGKILL),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(!forward_mkdir_outcome(Ok(killed), false, &mut warnings));
+        let text = String::from_utf8(warnings).expect("utf-8 diagnostic");
+        assert!(text.starts_with("mkdir: signal: 9"), "{text:?}");
+        assert!(text.ends_with('\n'), "{text:?}");
+    }
+
+    #[test]
+    fn mkdir_stderr_is_forwarded_verbatim_without_a_second_line() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut warnings = Vec::new();
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"mkdir: x: Not a directory\n".to_vec(),
+        };
+        assert!(!forward_mkdir_outcome(Ok(output), false, &mut warnings));
+        assert_eq!(warnings, b"mkdir: x: Not a directory\n");
+    }
+
+    #[test]
+    fn interrupted_mkdir_stays_silent() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut warnings = Vec::new();
+        let interrupted = std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "subprocess interrupted by signal",
+        );
+        // The error kind alone silences it, even with the latch already reset.
+        assert!(!forward_mkdir_outcome(
+            Err(interrupted),
+            false,
+            &mut warnings
+        ));
+        let killed = std::process::Output {
+            status: std::process::ExitStatus::from_raw(libc::SIGTERM),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(!forward_mkdir_outcome(Ok(killed), true, &mut warnings));
+        assert!(warnings.is_empty());
     }
 
     #[test]
