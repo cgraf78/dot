@@ -942,10 +942,10 @@ pub fn sync_repos(
     let outcome = crate::repos_pull_fleet::pull_all(&pull_inputs, stage, moves, out, err);
     // Pulls move HEAD (rebase, fast-forward, fresh clone) and the
     // failure path restores generations, so memoized revisions are
-    // no longer trustworthy. Unconditional: quiet failures and empty
-    // optional statuses tally nothing, so the outcome cannot prove
-    // a clean tree. Tracking names survive clean pulls, but a failed
-    // pull can detach HEAD, so upstream answers go too.
+    // no longer trustworthy. Unconditional: invalidation is cheap,
+    // and a failed pull may still have moved HEAD. Tracking names
+    // survive clean pulls, but a failed pull can detach HEAD, so
+    // upstream answers go too.
     crate::startup::invalidate_revision_cache();
     crate::repos_base::invalidate_client_match_cache();
     crate::overlays::invalidate_upstream_cache();

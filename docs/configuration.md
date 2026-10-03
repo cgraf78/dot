@@ -252,6 +252,17 @@ or uninstall that Shdeps defers because it needs `sudo` without a terminal
 exits 0: that is expected, so the run stays `ok`, not degraded, and the
 deferral shows up only as the Shdeps warning.
 
+A failed base pull is `fail` in every mode, whatever the cause (an
+unreachable dotfiles remote, a conflicted or interrupted rebase, a checkout
+that fails validation). It fails a quiet or cron run exactly as it fails a hand
+run: the update exits 1, keeps the installed overlay links, and skips overlay
+pulls, profile deactivation, `Tools` (including Dot's own upgrade), `Prune`,
+and config hooks until the base pulls again. Quiet only hides the rows;
+`warning: dotfiles pull failed` on stderr reports the failure instead. Older
+releases left a quiet base-pull failure out of the tally, so a cron run against
+an unreachable remote exited 0, logged `ok`, refreshed both stamps, and wrote
+`ok` to `update.last-run`.
+
 A run whose config holds a likely misspelled key (one the warning answers with
 `did you mean`) is also degraded, with the `config` stage, for example
 `1790000000 degraded update config`; it converged, but with that setting at its

@@ -1055,26 +1055,30 @@ pub fn pull_all(
             changed_items.push("dotfiles updated".to_string());
         }
         "failed" => {
-            // The shell warns without tallying when quiet and the
-            // status is not `blocked`; `PullStatus` never emits
-            // `blocked`, so every quiet base failure lands in the
-            // warn-only branch and every loud one tallies failed.
+            // Quiet only changes how the failure is shown: the stderr
+            // warning stands in for the hidden row. The tally is the
+            // same either way, so a quiet (cron) run reaches the
+            // outcome a loud one does: the engine restores the link
+            // generation, skips the stages that need a synchronized
+            // tree, exits 1, and records `fail`. This deliberately
+            // diverges from the shell, which warned without tallying
+            // when quiet, so a host whose dotfiles remote was
+            // unreachable recorded `ok` and refreshed its success
+            // stamps on every cron run.
             if quiet {
                 inputs.log.warn(warnings, "  warning: dotfiles pull failed");
-            } else {
-                if verbose {
-                    let (bytes, _) = crate::progress_ui::status(
-                        inputs.palette,
-                        quiet,
-                        false,
-                        b"failed",
-                        b"dotfiles: pull failed",
-                        inputs.multibyte,
-                    );
-                    let _ = out.write_all(&bytes);
-                }
-                failed += 1;
+            } else if verbose {
+                let (bytes, _) = crate::progress_ui::status(
+                    inputs.palette,
+                    quiet,
+                    false,
+                    b"failed",
+                    b"dotfiles: pull failed",
+                    inputs.multibyte,
+                );
+                let _ = out.write_all(&bytes);
             }
+            failed += 1;
         }
         _ => {
             if verbose {

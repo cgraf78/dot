@@ -400,6 +400,15 @@ fn pull_all_in(
     fleet: &Fleet,
     verbose: bool,
 ) -> (dot::repos_pull_fleet::PullAllOutcome, Vec<u8>, Vec<u8>) {
+    pull_all_with(fleet, false, verbose)
+}
+
+/// [`pull_all_in`] with an explicit `DOT_QUIET` switch.
+fn pull_all_with(
+    fleet: &Fleet,
+    quiet: bool,
+    verbose: bool,
+) -> (dot::repos_pull_fleet::PullAllOutcome, Vec<u8>, Vec<u8>) {
     let home = fleet.home.to_string_lossy().into_owned();
     let entries = fleet.entries();
     let dest = DestinationInputs {
@@ -437,7 +446,7 @@ fn pull_all_in(
         entries: &entries,
         extra_args: &[],
         home: &home,
-        dot_quiet: Some("0"),
+        dot_quiet: Some(if quiet { "1" } else { "0" }),
         dot_verbose: Some(if verbose { "1" } else { "0" }),
         ui_total: None,
         update_jobs: Some("2"),
@@ -500,6 +509,66 @@ fn verbose_base_skip_row_names_why_it_skipped() {
         "{out}"
     );
     assert!(!out.contains("(no upstream)"), "{out}");
+}
+
+/// Point the fleet's base at a tracked remote, then remove the remote so
+/// the base pull fails the way an unreachable dotfiles remote does.
+fn break_base_remote(fleet: &Fleet) {
+    let origin = fleet._dir.path().join("base-origin.git");
+    let status = dot_test_support::git()
+        .args(["clone", "-q", "--bare"])
+        .arg(&fleet.home)
+        .arg(&origin)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn bare clone");
+    assert!(status.success(), "bare clone of the base");
+    let origin_text = origin.to_string_lossy().into_owned();
+    git(&fleet.home, &["remote", "add", "origin", &origin_text]);
+    git(&fleet.home, &["fetch", "-q", "origin"]);
+    let branch = git(&fleet.home, &["symbolic-ref", "--short", "HEAD"]);
+    let upstream = format!("origin/{branch}");
+    git(
+        &fleet.home,
+        &["branch", "-q", "--set-upstream-to", &upstream],
+    );
+    std::fs::remove_dir_all(&origin).expect("remove base remote");
+}
+
+#[test]
+fn quiet_base_pull_failure_is_tallied_like_a_loud_one() {
+    // DOT-1: quiet mode used to warn without tallying, so a quiet run
+    // with an unreachable base remote aggregated to `ok` and rc 0.
+    let fleet = Fleet::new("fleet-base-fail", 1);
+    break_base_remote(&fleet);
+    let (loud, _out, _warnings) = pull_all_with(&fleet, false, false);
+    let (quiet, out, warnings) = pull_all_with(&fleet, true, false);
+    for outcome in [&loud, &quiet] {
+        assert_eq!(outcome.status, RepoPullStatus::Failed);
+        assert_eq!(outcome.rc, 1);
+        assert_eq!(
+            (outcome.current, outcome.failed, outcome.changed),
+            (1, 1, 0)
+        );
+        assert_eq!(outcome.summary, "1 repo current, 1 repo failed");
+    }
+    let warnings = String::from_utf8_lossy(&warnings).into_owned();
+    assert!(
+        warnings.contains("  warning: dotfiles pull failed\n"),
+        "{warnings}"
+    );
+    // Quiet hides the per-repo row even when verbose asks for it; only
+    // the stderr warning reports the failure.
+    let (_, verbose_out, _) = pull_all_with(&fleet, true, true);
+    let verbose_out = String::from_utf8_lossy(&verbose_out).into_owned();
+    assert!(
+        !verbose_out.contains("dotfiles: pull failed"),
+        "{verbose_out}"
+    );
+    let out = String::from_utf8_lossy(&out).into_owned();
+    assert!(!out.contains("dotfiles: pull failed"), "{out}");
 }
 
 fn live_stage() -> Stage {
