@@ -1,6 +1,6 @@
 //! Doctor result rendering and counters.
 //!
-//! Owns the `ok` / `warn` / `fail` / `skip` result lines, the
+//! Owns the `ok` / `warn` / `fail` / `skip` / `info` result lines, the
 //! `section` titles, and the pass/warn/fail counters the section
 //! modules report through. Path, repository, lock, provider, overlay, merge,
 //! and coordinator modules
@@ -8,14 +8,13 @@
 //!
 //! Text flows as bytes: `printf '%s'` copies its arguments verbatim,
 //! so messages and details travel as `&[u8]` and compare exactly,
-//! including empty strings, tabs, and multibyte glyphs. Whether the
-//! detail trailer renders at all depends on the call arity — the
-//! shell tests `$#` — so callers pass `None` for one-argument calls
-//! and `Some` (possibly empty) for two-argument calls, exactly like
-//! `_dot_doctor_render_records` always passing `$detail` through.
-//! Colors travel with the call in [`Palette`] so these helpers stay
-//! pure; production resolves it with [`resolve_palette`], tests with
-//! marker strings.
+//! including empty strings, tabs, and multibyte glyphs. A detail renders
+//! only when it is present and non-empty: extensions routinely pass an
+//! empty second argument (`dot_doctor_ok LABEL "$detail"` with nothing in
+//! `$detail`), and the shell-era renderer turned that into a bare `()`
+//! trailer or an empty indented line. Colors travel with the call in
+//! [`Palette`] so these helpers stay pure; production resolves it with
+//! [`resolve_palette`], tests with marker strings.
 
 /// One doctor result row, mirroring a single `_dr_*` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +53,11 @@ impl Record {
         Self::text(Kind::Skip, message, detail)
     }
 
+    /// Build an informational record from the text-oriented check modules.
+    pub fn info(message: impl Into<String>, detail: Option<String>) -> Self {
+        Self::text(Kind::Info, message, detail)
+    }
+
     fn text(kind: Kind, message: impl Into<String>, detail: Option<String>) -> Self {
         Self {
             kind,
@@ -76,6 +80,10 @@ pub enum Kind {
     Fail,
     /// `_dr_skip`: a skipped check, never counted.
     Skip,
+    /// An informational row (a configuration fact such as the selected
+    /// profile), never counted: it is neither a passed check nor a skipped
+    /// one.
+    Info,
     /// An extension result kind that the public API does not define.
     Unknown,
 }
@@ -183,29 +191,35 @@ pub fn render(records: &[Record], palette: &Palette) -> Vec<u8> {
                 record.detail.as_deref(),
             ),
             Kind::Skip => skip(palette, &record.message, record.detail.as_deref()),
+            Kind::Info => info(palette, &record.message, record.detail.as_deref()),
         };
         out.extend_from_slice(&row);
     }
     out
 }
 
-/// `_dr_ok`: `  ✓ message [ (detail)]`, then the pass count goes up
-/// by one. `detail` is `None` for one-argument calls; `Some` —
-/// even empty — renders the ` (detail)` trailer, like `$# -gt 1`.
-pub fn ok(
-    counts: &mut Counts,
+/// A detail worth rendering: present and non-empty.
+fn shown(detail: Option<&[u8]>) -> Option<&[u8]> {
+    detail.filter(|detail| !detail.is_empty())
+}
+
+/// One `  <glyph> message[ (detail)]` row, the inline-detail layout shared
+/// by `ok`, `skip`, and `info`.
+fn inline_row(
     palette: &Palette,
+    color: &str,
+    glyph: &str,
     message: &[u8],
     detail: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"  ");
-    out.extend_from_slice(palette.green.as_bytes());
-    out.extend_from_slice("✓".as_bytes());
+    out.extend_from_slice(color.as_bytes());
+    out.extend_from_slice(glyph.as_bytes());
     out.extend_from_slice(palette.reset.as_bytes());
     out.push(b' ');
     out.extend_from_slice(message);
-    if let Some(detail) = detail {
+    if let Some(detail) = shown(detail) {
         out.push(b' ');
         out.extend_from_slice(palette.dim.as_bytes());
         out.push(b'(');
@@ -214,14 +228,23 @@ pub fn ok(
         out.extend_from_slice(palette.reset.as_bytes());
     }
     out.push(b'\n');
-    counts.pass += 1;
     out
 }
 
-/// `_dr_warn`: `  ⚠ message` plus, for two-argument calls, an
+/// `_dr_ok`: `  ✓ message [ (detail)]`, then the pass count goes up
+/// by one. The ` (detail)` trailer renders only for a non-empty detail.
+pub fn ok(
+    counts: &mut Counts,
+    palette: &Palette,
+    message: &[u8],
+    detail: Option<&[u8]>,
+) -> Vec<u8> {
+    counts.pass += 1;
+    inline_row(palette, &palette.green, "✓", message, detail)
+}
+
+/// `_dr_warn`: `  ⚠ message` plus, for a non-empty detail, an
 /// indented dim detail line; then the warn count goes up by one.
-/// An empty `Some` still emits the bare indented line, like the
-/// shell's unconditional `printf '\n    %s%s%s'` arm.
 pub fn warn(
     counts: &mut Counts,
     palette: &Palette,
@@ -235,7 +258,7 @@ pub fn warn(
     out.extend_from_slice(palette.reset.as_bytes());
     out.push(b' ');
     out.extend_from_slice(message);
-    if let Some(detail) = detail {
+    if let Some(detail) = shown(detail) {
         out.push(b'\n');
         out.extend_from_slice(b"    ");
         out.extend_from_slice(palette.dim.as_bytes());
@@ -247,7 +270,7 @@ pub fn warn(
     out
 }
 
-/// `_dr_fail`: `  ✗ message` plus, for two-argument calls, an
+/// `_dr_fail`: `  ✗ message` plus, for a non-empty detail, an
 /// indented dim detail line; then the fail count goes up by one.
 /// Layout mirrors [`warn`]; only the glyph slot and the counter
 /// differ.
@@ -264,7 +287,7 @@ pub fn fail(
     out.extend_from_slice(palette.reset.as_bytes());
     out.push(b' ');
     out.extend_from_slice(message);
-    if let Some(detail) = detail {
+    if let Some(detail) = shown(detail) {
         out.push(b'\n');
         out.extend_from_slice(b"    ");
         out.extend_from_slice(palette.dim.as_bytes());
@@ -279,23 +302,15 @@ pub fn fail(
 /// `_dr_skip`: `  · message [ (detail)]`, with the same trailer rule
 /// as [`ok`]. Skips never touch [`Counts`].
 pub fn skip(palette: &Palette, message: &[u8], detail: Option<&[u8]>) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"  ");
-    out.extend_from_slice(palette.dim.as_bytes());
-    out.extend_from_slice("·".as_bytes());
-    out.extend_from_slice(palette.reset.as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(message);
-    if let Some(detail) = detail {
-        out.push(b' ');
-        out.extend_from_slice(palette.dim.as_bytes());
-        out.push(b'(');
-        out.extend_from_slice(detail);
-        out.push(b')');
-        out.extend_from_slice(palette.reset.as_bytes());
-    }
-    out.push(b'\n');
-    out
+    inline_row(palette, &palette.dim, "·", message, detail)
+}
+
+/// An informational row: `  › message [ (detail)]`, with the same trailer
+/// rule as [`ok`]. Informational rows never touch [`Counts`]. The marker is
+/// one column wide in every font (an information sign renders as a wide
+/// emoji in some, misaligning the rows) and unlike the skip dot at a glance.
+pub fn info(palette: &Palette, message: &[u8], detail: Option<&[u8]>) -> Vec<u8> {
+    inline_row(palette, &palette.dim, "›", message, detail)
 }
 
 /// `_dr_section`: a blank line, then the bold title. Sections never

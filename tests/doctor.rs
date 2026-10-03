@@ -1259,6 +1259,58 @@ fn doctor_extension_fixture(tag: &str, extensions: &[(String, Vec<u8>)]) -> (Tem
     (home, state)
 }
 
+/// [`doctor_extension_fixture`] around an initialized, healthy client, so
+/// doctor's exit status reflects the extensions alone (the bare fixture has
+/// no client and always exits 1). Returns the origin scope too, which must
+/// outlive the run.
+fn doctor_extension_client_fixture(
+    tag: &str,
+    extensions: &[(String, Vec<u8>)],
+) -> (TempDir, TempDir, TempDir) {
+    let scope = TempDir::new(&format!("doctor-{tag}-origin")).expect("origin scope");
+    let home = TempDir::new(&format!("doctor-{tag}-home")).expect("home");
+    let state = TempDir::new(&format!("doctor-{tag}-state")).expect("state");
+    let origin = origin(scope.path());
+    init_client(&home, &state, &origin);
+    let root = home.path().join("extensions");
+    let directory = root.join("doctor.d");
+    std::fs::create_dir_all(home.path().join(".config/dot")).expect("config directory");
+    std::fs::create_dir_all(&directory).expect("doctor directory");
+    std::fs::create_dir(home.path().join("tmp")).expect("temporary directory");
+    std::fs::write(
+        home.path().join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/extensions\ndependency_provider=none\n",
+    )
+    .expect("config");
+    for (name, body) in extensions {
+        std::fs::write(directory.join(name), body).expect("extension");
+        seal(&directory.join(name), 0o644);
+    }
+    seal(&root, 0o700);
+    seal(&directory, 0o700);
+    (scope, home, state)
+}
+
+/// The good extension the client-fixture tests share.
+fn good_extension() -> (String, Vec<u8>) {
+    (
+        "10-good.sh".to_string(),
+        b"doctor() {\n  dot_doctor_section 'Good'\n  dot_doctor_ok 'good extension ran'\n}\n"
+            .to_vec(),
+    )
+}
+
+#[test]
+fn healthy_client_with_a_good_extension_exits_zero() {
+    // The control for the refused/timed-out exit-status tests below.
+    let (_scope, home, state) = doctor_extension_client_fixture("healthy", &[good_extension()]);
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
+    assert!(stdout.contains(" 0 failed"), "{stdout}");
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+}
+
 /// Run native doctor with a fixed worker window and the fixture's private
 /// `TMPDIR`, returning the output and whether that `TMPDIR` is empty again.
 fn doctor_with_jobs(home: &TempDir, state: &TempDir, jobs: &str) -> (Output, bool) {
@@ -1695,7 +1747,263 @@ fn unsafe_and_malformed_extensions_match_without_the_old_engine() {
 }
 
 #[test]
-fn first_unsafe_extension_precedes_later_malformed_identity() {
+fn hung_extension_times_out_and_later_extensions_still_run() {
+    // C2: one hung extension used to block every later section until it
+    // ended on its own.
+    let (_scope, home, state) = doctor_extension_client_fixture(
+        "timeout",
+        &[
+            (
+                "10-hangs.sh".to_string(),
+                b"doctor() {\n  dot_doctor_section 'Hangs'\n  dot_doctor_ok 'before the hang'\n  sleep 30 &\n  printf '%s\\n' \"$!\" >\"$HOME/hung-pid\"\n  wait\n}\n".to_vec(),
+            ),
+            (
+                "20-after.sh".to_string(),
+                b"doctor() {\n  dot_doctor_section 'After'\n  dot_doctor_ok 'later extension ran'\n}\n".to_vec(),
+            ),
+        ],
+    );
+    let started = std::time::Instant::now();
+    let (output, clean) = doctor_with_env(&home, &state, &[("DOT_DOCTOR_TIMEOUT", "1")]);
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  ✓ before the hang\n"), "{stdout}");
+    assert!(
+        stdout.contains("  ✗ 10-hangs doctor extension timed out\n    stopped after 1s; set DOT_DOCTOR_TIMEOUT to raise the limit\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("  ✓ later extension ran\n"), "{stdout}");
+    // The timeout is the only failure on this healthy client.
+    assert!(stdout.contains(" 1 failed"), "{stdout}");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "doctor waited for the hung extension: {elapsed:?}"
+    );
+    assert!(clean, "the stopped extension left scratch state");
+    // The whole session was stopped, not just abandoned.
+    let pid: i32 = std::fs::read_to_string(home.path().join("hung-pid"))
+        .expect("hung pid")
+        .trim()
+        .parse()
+        .expect("numeric pid");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while process_live(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!process_live(pid), "hung extension process {pid} survived");
+}
+
+#[test]
+fn dangling_extension_link_is_refused_alone() {
+    // A pull that renames an overlay extension leaves a dangling link until
+    // the link phase runs; that used to fail discovery and run nothing.
+    let (_scope, home, state) = doctor_extension_client_fixture("dangling", &[good_extension()]);
+    let directory = home.path().join("extensions/doctor.d");
+    std::os::unix::fs::symlink(
+        home.path().join("renamed-away.sh"),
+        directory.join("20-gone.sh"),
+    )
+    .expect("dangling link");
+    let (output, clean) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
+    assert!(
+        stdout.contains("  ✗ 20-gone doctor extension refused\n    ~/extensions/doctor.d/20-gone.sh is not linked from an active overlay (a dangling or retired link); run dot update to relink overlay extensions\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("discovery failed"), "{stdout}");
+    // The refusal alone fails this otherwise healthy client.
+    assert!(stdout.contains(" 1 failed"), "{stdout}");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert!(clean);
+}
+
+#[test]
+fn untrusted_extension_is_refused_without_running() {
+    // Trust still gates every script, just one at a time.
+    let (_scope, home, state) = doctor_extension_client_fixture(
+        "untrusted",
+        &[
+            good_extension(),
+            (
+                "20-writable.sh".to_string(),
+                b"doctor() {\n  printf ran >\"$HOME/untrusted-ran\"\n}\n".to_vec(),
+            ),
+        ],
+    );
+    seal(
+        &home.path().join("extensions/doctor.d/20-writable.sh"),
+        0o666,
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
+    assert!(
+        stdout.contains("  ✗ 20-writable doctor extension refused\n    ~/extensions/doctor.d/20-writable.sh fails the extension trust checks; check its owner and mode\n"),
+        "{stdout}"
+    );
+    assert!(!home.path().join("untrusted-ran").exists());
+    assert!(stdout.contains(" 1 failed"), "{stdout}");
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn unlinked_overlay_extensions_share_one_refusal_row() {
+    // An overlay descriptor typo leaves every overlay-owned extension link
+    // untrusted; that used to print one "check its owner and mode" row per
+    // link, all for the same cause.
+    let (_scope, home, state) =
+        doctor_extension_client_fixture("unlinked-overlay", &[good_extension()]);
+    let checkout = home.path().join("overlay-checkout");
+    std::fs::create_dir_all(&checkout).expect("overlay checkout");
+    let directory = home.path().join("extensions/doctor.d");
+    for index in 0..7 {
+        let target = checkout.join(format!("2{index}-overlay.sh"));
+        std::fs::write(&target, b"doctor() { :; }\n").expect("overlay extension");
+        std::os::unix::fs::symlink(&target, directory.join(format!("2{index}-overlay.sh")))
+            .expect("overlay link");
+    }
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
+    assert_eq!(stdout.matches("doctor extension").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("  ✗ 7 doctor extensions refused\n    20-overlay, 21-overlay, 22-overlay, 23-overlay, 24-overlay, 25-overlay, 26-overlay are not linked from an active overlay (dangling or retired links); run dot update to relink overlay extensions\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("owner and mode"), "{stdout}");
+    // When the overlays themselves failed to resolve, the row says so.
+    let descriptors = home.path().join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&descriptors).expect("descriptors");
+    std::fs::write(
+        descriptors.join("typo.conf"),
+        b"url=file:///nowhere.git\nsync=never\n",
+    )
+    .expect("bad descriptor");
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("overlay descriptor invalid"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "the overlays did not resolve; fix the overlay error above, then run dot update"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn authorized_overlay_link_to_an_untrusted_file_keeps_its_own_row() {
+    // A link the overlay manifest authorizes, whose target fails trust (a
+    // group-writable checkout file), is not fixed by relinking: it must not
+    // join the "run dot update" group.
+    let (scope, home, state) =
+        doctor_extension_client_fixture("authorized-untrusted", &[good_extension()]);
+    // The client fixture's origin doubles as the overlay's.
+    let origin = scope.path().join("origin.git");
+    let overlay = home.path().join(".dotfiles-ov");
+    let status = dot_test_support::git()
+        .args(["clone", "-q"])
+        .arg(&origin)
+        .arg(&overlay)
+        .status()
+        .expect("overlay clone");
+    assert!(status.success());
+    let descriptors = home.path().join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&descriptors).expect("descriptors");
+    std::fs::write(
+        descriptors.join("20-ov.conf"),
+        format!("url={}\n", origin.display()),
+    )
+    .expect("descriptor");
+    let rel = "extensions/doctor.d/30-ov.sh";
+    let source = overlay.join("home").join(rel);
+    std::fs::create_dir_all(source.parent().expect("source parent")).expect("source parent");
+    std::fs::write(&source, b"doctor() { :; }\n").expect("overlay extension");
+    seal(&source, 0o664);
+    let overlay_text = overlay.to_str().expect("utf8 overlay");
+    let target = dot::repos_overlays::record_link_target(rel, "ov", overlay_text, Some("git"))
+        .expect("link target");
+    std::os::unix::fs::symlink(&target, home.path().join(rel)).expect("overlay link");
+    let manifest = state.path().join("dot/overlay-links");
+    std::fs::create_dir_all(manifest.parent().expect("manifest parent")).expect("manifest dir");
+    std::fs::write(&manifest, format!("{rel}\tov\t{target}\n")).expect("manifest");
+    seal(&manifest, 0o600);
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ov: cloned"), "{stdout}");
+    assert!(
+        stdout.contains("  ✗ 30-ov doctor extension refused\n    ~/extensions/doctor.d/30-ov.sh links to a file that fails the extension trust checks; check its owner and mode\n"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("not linked from an active overlay"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn timeout_counts_from_each_extension_launch() {
+    // Serial extensions that each finish well inside the limit must never
+    // time out, however long they waited for a slot.
+    let slow = |index: usize| {
+        (
+            format!("{index}0-slow{index}.sh"),
+            b"doctor() {\n  sleep 2\n  dot_doctor_ok 'slow finished'\n}\n".to_vec(),
+        )
+    };
+    let (home, state) = doctor_extension_fixture("timeout-launch", &[slow(1), slow(2), slow(3)]);
+    let (output, _) = doctor_with_env(
+        &home,
+        &state,
+        &[("DOT_DOCTOR_JOBS", "1"), ("DOT_DOCTOR_TIMEOUT", "5")],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("slow finished").count(), 3, "{stdout}");
+    assert!(!stdout.contains("timed out"), "{stdout}");
+}
+
+#[test]
+fn info_rows_and_empty_details_render_without_counting() {
+    // C3/C4: an empty detail renders like an omitted one, and informational
+    // rows render but never count. The guarded form is how an extension that
+    // must also run under an older coordinator calls the newer helper.
+    let body = |info: bool| {
+        let mut body = String::from(
+            "doctor() {\n  dot_doctor_section 'Facts'\n  dot_doctor_ok 'no detail' ''\n  dot_doctor_warn 'empty warning' ''\n",
+        );
+        if info {
+            body.push_str("  dot_doctor_info 'selected thing' 'value'\n  if declare -F dot_doctor_info >/dev/null; then dot_doctor_info 'guarded'; else dot_doctor_ok 'guarded'; fi\n");
+        }
+        body.push_str("}\n");
+        vec![("10-facts.sh".to_string(), body.into_bytes())]
+    };
+    let (home, state) = doctor_extension_fixture("info", &body(true));
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  ✓ no detail\n"), "{stdout}");
+    assert!(stdout.contains("  ⚠ empty warning\n  ›"), "{stdout}");
+    assert!(!stdout.contains("()"), "{stdout}");
+    assert!(stdout.contains("  › selected thing (value)\n"), "{stdout}");
+    assert!(stdout.contains("  › guarded\n"), "{stdout}");
+    let (home_plain, state_plain) = doctor_extension_fixture("info-plain", &body(false));
+    let (plain, _) = doctor_with_env(&home_plain, &state_plain, &[]);
+    let summary = |out: &str| {
+        out.lines()
+            .find(|line| line.contains(" passed · "))
+            .map(str::to_string)
+            .expect("summary line")
+    };
+    assert_eq!(
+        summary(&stdout),
+        summary(&String::from_utf8_lossy(&plain.stdout)),
+        "informational rows must not change the counts"
+    );
+}
+
+#[test]
+fn unsafe_extension_is_refused_beside_a_malformed_identity() {
     let home = TempDir::new("doctor-native-extension-order-home").expect("home");
     let state = TempDir::new("doctor-native-extension-order-state").expect("state");
     let root = home.path().join("extensions");
@@ -1714,8 +2022,22 @@ fn first_unsafe_extension_precedes_later_malformed_identity() {
     seal(&directory.join("10-unsafe.sh"), 0o666);
     seal(&directory.join("Bad.sh"), 0o644);
 
+    // The unsafe script is refused on its own; the malformed identity still
+    // fails discovery as a whole.
     let (shell, native) = pair(&home, &state);
-    assert!(String::from_utf8_lossy(&shell.stderr).contains("unsafe doctor extension"));
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("10-unsafe doctor extension refused"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("doctor extension discovery failed"),
+        "{stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&native.stderr)
+            .contains("invalid doctor extension identity: Bad.sh")
+    );
     assert_pair(&shell, &native);
 }
 
