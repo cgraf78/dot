@@ -4759,6 +4759,20 @@ fn update_native_entry_edges_reject_fallback() {
     )
     .expect("last run");
     assert!(last_run.ends_with(" skip cron\n"), "{last_run:?}");
+    // The cause record repeats that header and names the edited file, so
+    // doctor can say what blocks cron without parsing the outcome log.
+    let state = unresolved.client.home.join(".local/state");
+    let failure = dot::update_status::read_last_failure(&state).expect("skip cause");
+    assert!(
+        failure.describes(&dot::update_status::read_last_run(&state).expect("last run")),
+        "{failure:?}"
+    );
+    let edited: Vec<(&str, &str)> = failure
+        .items
+        .iter()
+        .map(|item| (item.stage.as_str(), item.name.as_str()))
+        .collect();
+    assert_eq!(edited, [("dirty", "tracked.txt")]);
     assert_eq!(
         std::fs::read(unresolved.client.home.join("tracked.txt")).expect("read unresolved edit"),
         b"local edit\n",

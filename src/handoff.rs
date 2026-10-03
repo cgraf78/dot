@@ -47,10 +47,11 @@ pub struct Handoff {
     program: PathBuf,
     args: Vec<OsString>,
     env: BTreeMap<OsString, OsString>,
-    /// Cron state home when the outer run is a `--cron` run. The outer run
-    /// skips its own outcome line because the continuation records the run;
-    /// a handoff that never execs records the `fail` here instead.
-    cron_state: Option<PathBuf>,
+    /// State home and trigger the run's outcome is recorded under. The outer
+    /// run skips its own records because the continuation records the run;
+    /// a handoff that never execs records the `fail` here instead (the cron
+    /// line for a cron run, and the last-run stamp and cause for any run).
+    record: Option<(PathBuf, crate::update_status::Trigger)>,
     lock: Option<LockGuard>,
 }
 
@@ -61,13 +62,13 @@ impl Handoff {
         program: PathBuf,
         args: Vec<OsString>,
         env: BTreeMap<OsString, OsString>,
-        cron_state: Option<PathBuf>,
+        record: Option<(PathBuf, crate::update_status::Trigger)>,
     ) -> Self {
         Self {
             program,
             args,
             env,
-            cron_state,
+            record,
             lock: None,
         }
     }
@@ -85,14 +86,14 @@ impl Handoff {
     /// still execs: the run converges in the new binary, which reports its
     /// own delivery, just as an in-place run kept converging after one.
     /// Returns only when no exec happened (`status`, or 1 when the exec
-    /// failed); the parked lock is then released and a cron run records its
+    /// failed); the parked lock is then released and the run records its
     /// `fail`.
     #[doc(hidden)]
     pub fn run(self, status: i32) -> i32 {
         if crate::cleanup::received_signal().is_some()
             || status == crate::cleanup::CLEANUP_INCOMPLETE_STATUS
         {
-            self.abandon();
+            self.abandon("cleanup did not finish before the handoff to the updated dot");
             return status;
         }
         let mut command = std::process::Command::new(&self.program);
@@ -101,7 +102,7 @@ impl Handoff {
         let program = self.program.clone();
         // Record and release before the diagnostic: the write below is the
         // one that can fail.
-        self.abandon();
+        self.abandon(&format!("cannot start the updated dot: {error}"));
         // A latched signal is a cancellation, not a failed handoff: the
         // entry point's exit maps it to `128 + signal`.
         if crate::cleanup::received_signal().is_none()
@@ -119,19 +120,19 @@ impl Handoff {
         1
     }
 
-    /// Give up the handoff: a cron run that was not cancelled records the
-    /// failed run, and dropping the parked guard releases the lock.
-    fn abandon(self) {
+    /// Give up the handoff: a run that was not cancelled records the failed
+    /// run with `reason` as its cause, and dropping the parked guard
+    /// releases the lock.
+    fn abandon(self, reason: &str) {
         if crate::cleanup::received_signal().is_some() {
             return;
         }
-        if let Some(state) = &self.cron_state {
-            crate::update_status::append_outcome(
+        if let Some((state, trigger)) = &self.record {
+            crate::update_status::record_failed_run(
                 state,
                 crate::update_engine::now_secs(),
-                "fail",
-                "update",
-                "",
+                *trigger,
+                (crate::update_status::STAGE_UPDATE, "dot", reason),
             );
         }
     }
@@ -154,7 +155,14 @@ mod tests {
             PathBuf::from("/nonexistent/dot"),
             vec![OsString::from("update")],
             BTreeMap::new(),
-            cron.then(|| state.to_path_buf()),
+            Some((
+                state.to_path_buf(),
+                if cron {
+                    crate::update_status::Trigger::Cron
+                } else {
+                    crate::update_status::Trigger::Manual
+                },
+            )),
         );
         handoff.hold(guard);
         handoff
@@ -175,6 +183,17 @@ mod tests {
             .expect("cron outcome");
         let fields: Vec<&str> = log.trim_end().split(' ').skip(1).collect();
         assert_eq!(fields, ["fail", "update"]);
+        // Like every other failure writer, it leaves the last-run stamp and
+        // the cause doctor reads beside it.
+        let last = crate::update_status::read_last_run(state.path()).expect("last run");
+        assert_eq!(
+            (last.outcome.as_str(), last.trigger.as_str()),
+            ("fail", "cron")
+        );
+        let failure = crate::update_status::read_last_failure(state.path()).expect("cause");
+        assert!(failure.describes(&last));
+        assert_eq!(failure.items[0].stage, "update");
+        assert!(failure.items[0].detail.contains("cleanup did not finish"));
     }
 
     #[test]
@@ -185,5 +204,30 @@ mod tests {
         assert_eq!(handoff.run(crate::cleanup::CLEANUP_INCOMPLETE_STATUS), 125);
         assert!(!crate::update_lock::lock_path(state.path()).exists());
         assert!(!crate::update_status::update_log_path(state.path()).exists());
+        // The hand run's first half recorded nothing (the continuation was
+        // to), so the failed handoff is its outcome.
+        let last = crate::update_status::read_last_run(state.path()).expect("last run");
+        assert_eq!(
+            (last.outcome.as_str(), last.trigger.as_str()),
+            ("fail", "manual")
+        );
+    }
+
+    #[test]
+    fn a_failed_exec_names_the_binary_error_as_the_cause() {
+        let _signals = crate::cleanup::hold_signal_ownership_for_test();
+        let state = TempDir::new("handoff-exec-fail").expect("state");
+        let handoff = parked(state.path(), true);
+        assert_eq!(handoff.run(0), 1);
+        assert!(!crate::update_lock::lock_path(state.path()).exists());
+        let last = crate::update_status::read_last_run(state.path()).expect("last run");
+        let failure = crate::update_status::read_last_failure(state.path()).expect("cause");
+        assert!(failure.describes(&last), "{failure:?} vs {last:?}");
+        assert!(
+            failure.items[0]
+                .detail
+                .starts_with("cannot start the updated dot:"),
+            "{failure:?}"
+        );
     }
 }

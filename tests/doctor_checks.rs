@@ -127,6 +127,7 @@ fn cron_freshness_trips_on_stale_and_passes_on_fresh() {
             last_success: last,
             last_converged: None,
             last_run: None,
+            last_failure: None,
             cron_available: true,
             now: 1_800_000_000,
         }))
@@ -175,6 +176,7 @@ fn cron_freshness_separates_degraded_convergence_from_a_frozen_host() {
             last_success: last,
             last_converged: conv,
             last_run: None,
+            last_failure: None,
             cron_available: true,
             now: NOW,
         }))
@@ -293,6 +295,7 @@ fn cron_that_never_ran_only_skips_without_a_crontab() {
         last_success: None,
         last_converged: None,
         last_run: Some(last_run(NOW - 9 * 3600, "ok", "manual", "")),
+        last_failure: None,
         cron_available: false,
         now: NOW,
     }));
@@ -313,6 +316,7 @@ fn cron_that_never_ran_warns_once_a_manual_update_is_stale() {
             last_success: None,
             last_converged: None,
             last_run: run,
+            last_failure: None,
             cron_available: true,
             now: NOW,
         }))
@@ -335,13 +339,18 @@ fn cron_that_never_ran_warns_once_a_manual_update_is_stale() {
         "{stale}"
     );
     assert!(!stale.contains('✗'), "{stale}");
-    // A cron that keeps skipping for local edits is running, not missing.
+    // A cron that keeps skipping for local edits is running, not missing,
+    // and the edits are named as what blocks it.
     let skipping = check(Some(last_run(NOW - 60, "skip", "cron", "")));
     assert!(
-        skipping.contains("⚠ cron update has not succeeded recently"),
+        skipping.contains("⚠ cron update skipping: local edits block it"),
         "{skipping}"
     );
-    assert!(skipping.contains("last cron run skip 1m ago"), "{skipping}");
+    assert!(
+        skipping
+            .contains("last cron run 1m ago; no successful cron update recorded; run dot status"),
+        "{skipping}"
+    );
     // A clean cron last run whose stamp writes were lost still counts.
     let lost_stamps = check(Some(last_run(NOW - 60, "ok", "cron", "")));
     assert!(
@@ -355,7 +364,7 @@ fn cron_that_never_ran_warns_once_a_manual_update_is_stale() {
         "{failing}"
     );
     assert!(
-        failing.contains("no successful cron update recorded; last cron run fail 1m ago"),
+        failing.contains("no successful cron update recorded; last cron run failed 1m ago"),
         "{failing}"
     );
     assert!(
@@ -372,6 +381,7 @@ fn hand_run_update_rows_appear_only_when_they_add_information() {
             last_success: success,
             last_converged: None,
             last_run: Some(run),
+            last_failure: None,
             cron_available: true,
             now: NOW,
         }))
@@ -385,7 +395,7 @@ fn hand_run_update_rows_appear_only_when_they_add_information() {
     assert!(failed.contains("✓ cron update succeeded recently"));
     assert!(failed.contains("⚠ last update failed"), "{failed}");
     assert!(
-        failed.contains("manual run 1m ago; rerun dot update to see what failed"),
+        failed.contains("manual run 1m ago; run dot update for the full output"),
         "{failed}"
     );
     assert!(!failed.contains('✗'), "{failed}");
@@ -411,6 +421,407 @@ fn hand_run_update_rows_appear_only_when_they_add_information() {
     // Outcome words from a newer Dot still render as a non-success.
     let newer = check(None, last_run(NOW - 60, "aborted", "manual", ""));
     assert!(newer.contains("⚠ last update failed"), "{newer}");
+}
+
+/// A `update.last-failure` record for `run` with `items`.
+fn failure_for(
+    run: &dot::update_status::LastRun,
+    items: &[(&str, &str, &str)],
+    omitted: usize,
+) -> dot::update_status::LastFailure {
+    dot::update_status::LastFailure {
+        at: run.at,
+        outcome: run.outcome.clone(),
+        trigger: run.trigger.clone(),
+        items: items
+            .iter()
+            .map(|(stage, name, detail)| dot::update_status::FailureItem {
+                stage: stage.to_string(),
+                name: name.to_string(),
+                detail: detail.to_string(),
+            })
+            .collect(),
+        omitted,
+    }
+}
+
+fn cron_rows(
+    success: Option<i64>,
+    run: Option<dot::update_status::LastRun>,
+    failure: Option<dot::update_status::LastFailure>,
+    now: i64,
+) -> String {
+    render(&check_cron_freshness(&CronInputs {
+        last_success: success,
+        last_converged: None,
+        last_run: run,
+        last_failure: failure,
+        cron_available: true,
+        now,
+    }))
+}
+
+#[test]
+fn a_newer_cron_failure_is_not_masked_by_a_recent_clean_run() {
+    // U3: a clean run 100 minutes ago used to vouch for the host until it
+    // aged out, so cron runs failing since then read green.
+    const NOW: i64 = 1_800_000_000;
+    let run = last_run(NOW - 600, "degraded", "cron", "tools");
+    let failure = failure_for(
+        &run,
+        &[(
+            "tools",
+            "watchexec/watchexec",
+            "ambiguous interrupted method transition",
+        )],
+        0,
+    );
+    let rows = cron_rows(Some(NOW - 6000), Some(run.clone()), Some(failure), NOW);
+    assert!(
+        rows.contains("⚠ last cron run degraded: tools failing"),
+        "{rows}"
+    );
+    assert!(!rows.contains("succeeded recently"), "{rows}");
+    assert!(
+        rows.contains(
+            "10m ago; last success 1h40m ago; failing: tools: watchexec/watchexec (ambiguous interrupted method transition); run shdeps health, or dot update for the full output"
+        ),
+        "{rows}"
+    );
+    assert!(!rows.contains('✗'), "{rows}");
+
+    // A failed run names its stage's items and the plain next step.
+    let fail = last_run(NOW - 60, "fail", "cron", "");
+    let failure = failure_for(
+        &fail,
+        &[
+            ("repos", "dotfiles", "pull failed"),
+            ("repos", "work", "pull failed"),
+        ],
+        0,
+    );
+    let rows = cron_rows(Some(NOW - 600), Some(fail.clone()), Some(failure), NOW);
+    assert!(rows.contains("⚠ last cron run failed"), "{rows}");
+    assert!(
+        rows.contains(
+            "failing: repos: dotfiles (pull failed), work (pull failed); run dot update for the full output"
+        ),
+        "{rows}"
+    );
+
+    // An older Dot wrote the stamp but no record: the run still warns,
+    // with only the next step.
+    let rows = cron_rows(Some(NOW - 600), Some(fail), None, NOW);
+    assert!(rows.contains("⚠ last cron run failed"), "{rows}");
+    assert!(
+        rows.contains("1m ago; last success 10m ago; run dot update for the full output"),
+        "{rows}"
+    );
+
+    // A provider that could not even be prepared is not `shdeps health`'s
+    // to explain, even though the run degraded the Tools stage.
+    let unavailable = last_run(NOW - 60, "degraded", "cron", "tools");
+    let failure = failure_for(
+        &unavailable,
+        &[(
+            "provider",
+            "shdeps",
+            "shdeps unavailable; dependency install skipped",
+        )],
+        0,
+    );
+    let rows = cron_rows(Some(NOW - 600), Some(unavailable), Some(failure), NOW);
+    assert!(
+        rows.contains("failing: provider: shdeps (shdeps unavailable; dependency install skipped); run dot update for the full output"),
+        "{rows}"
+    );
+
+    // A clean run after the failure heals it.
+    let healed = cron_rows(
+        Some(NOW - 60),
+        Some(last_run(NOW - 600, "fail", "cron", "")),
+        None,
+        NOW,
+    );
+    assert!(
+        healed.contains("✓ cron update succeeded recently"),
+        "{healed}"
+    );
+}
+
+#[test]
+fn a_cause_only_attaches_to_the_run_it_describes() {
+    // A record left by an earlier run (or superseded by a run of an older
+    // Dot, which writes no record) must never explain the current one.
+    const NOW: i64 = 1_800_000_000;
+    let run = last_run(NOW - 60, "fail", "cron", "");
+    let older = last_run(NOW - 3600, "fail", "cron", "");
+    let stale = failure_for(&older, &[("configs", "10-old-hook", "boom")], 0);
+    let rows = cron_rows(Some(NOW - 600), Some(run.clone()), Some(stale), NOW);
+    assert!(!rows.contains("10-old-hook"), "{rows}");
+    let manual = last_run(NOW - 60, "fail", "manual", "");
+    let other_trigger = failure_for(&manual, &[("configs", "10-hook", "boom")], 0);
+    let rows = cron_rows(Some(NOW - 600), Some(run), Some(other_trigger), NOW);
+    assert!(!rows.contains("10-hook"), "{rows}");
+}
+
+#[test]
+fn causes_attach_to_stale_degraded_and_never_converged_rows() {
+    const NOW: i64 = 1_800_000_000;
+    let run = last_run(NOW - 60, "fail", "cron", "");
+    let failure = failure_for(&run, &[("configs", "40-claude", "exit 3")], 0);
+    // Stale success.
+    let stale = cron_rows(
+        Some(NOW - 9 * 3600),
+        Some(run.clone()),
+        Some(failure.clone()),
+        NOW,
+    );
+    assert!(
+        stale.contains("⚠ cron update has not succeeded recently"),
+        "{stale}"
+    );
+    assert!(
+        stale.contains(
+            "last success 9h0m ago; last cron run failed 1m ago; failing: configs: 40-claude (exit 3); run dot update"
+        ),
+        "{stale}"
+    );
+    // Never converged.
+    let never = cron_rows(None, Some(run.clone()), Some(failure.clone()), NOW);
+    assert!(
+        never.contains(
+            "no successful cron update recorded; last cron run failed 1m ago; failing: configs: 40-claude (exit 3)"
+        ),
+        "{never}"
+    );
+    // Degraded convergence.
+    let degraded_run = last_run(NOW - 60, "degraded", "cron", "tools");
+    let degraded_failure = failure_for(&degraded_run, &[("tools", "ripgrep", "network")], 0);
+    let degraded = render(&check_cron_freshness(&CronInputs {
+        last_success: Some(NOW - 5 * 3600),
+        last_converged: Some(dot::update_status::Converged {
+            at: NOW - 60,
+            failing: "tools".to_string(),
+        }),
+        last_run: Some(degraded_run),
+        last_failure: Some(degraded_failure),
+        cron_available: true,
+        now: NOW,
+    }));
+    assert!(
+        degraded.contains("⚠ cron update degraded: tools failing"),
+        "{degraded}"
+    );
+    assert!(
+        degraded.contains(
+            "last converged 1m ago; failing: tools: ripgrep (network); run shdeps health"
+        ),
+        "{degraded}"
+    );
+
+    // A cron run that failed after that degraded convergence is the news:
+    // its own title and cause, never the degraded stages' label.
+    let newer = render(&check_cron_freshness(&CronInputs {
+        last_success: Some(NOW - 5 * 3600),
+        last_converged: Some(dot::update_status::Converged {
+            at: NOW - 5400,
+            failing: "tools".to_string(),
+        }),
+        last_run: Some(run.clone()),
+        last_failure: Some(failure.clone()),
+        cron_available: true,
+        now: NOW,
+    }));
+    assert!(newer.contains("⚠ last cron run failed"), "{newer}");
+    assert!(
+        newer.contains(
+            "1m ago; last success 5h0m ago; last converged 1h30m ago; failing: configs: 40-claude (exit 3)"
+        ),
+        "{newer}"
+    );
+    assert!(!newer.contains("degraded"), "{newer}");
+}
+
+#[test]
+fn update_warn_rows_always_carry_a_next_step() {
+    const NOW: i64 = 1_800_000_000;
+    // A degraded convergence without the run that wrote it (a later hand
+    // run, or an older Dot) still says where to look.
+    let degraded = render(&check_cron_freshness(&CronInputs {
+        last_success: Some(NOW - 5 * 3600),
+        last_converged: Some(dot::update_status::Converged {
+            at: NOW - 60,
+            failing: "prune".to_string(),
+        }),
+        last_run: None,
+        last_failure: None,
+        cron_available: true,
+        now: NOW,
+    }));
+    assert!(
+        degraded.contains("last converged 1m ago; run shdeps health, or dot update"),
+        "{degraded}"
+    );
+    // A host whose cron simply stopped: check the schedule.
+    let stopped = cron_rows(Some(NOW - 9 * 3600), None, None, NOW);
+    assert!(
+        stopped.contains(
+            "last success 9h0m ago; check that dot update --cron is scheduled (crontab -l), or run dot update"
+        ),
+        "{stopped}"
+    );
+    // A clean stamp from the future (the clock stepped back) cannot hide a
+    // newer failing cron run.
+    let run = last_run(NOW - 60, "fail", "cron", "");
+    let skewed = cron_rows(Some(NOW + 3600), Some(run), None, NOW);
+    assert!(skewed.contains("⚠ last cron run failed"), "{skewed}");
+}
+
+#[test]
+fn many_failing_items_fold_into_a_count_and_long_details_shorten() {
+    const NOW: i64 = 1_800_000_000;
+    let run = last_run(NOW - 60, "degraded", "manual", "tools");
+    let long = "x".repeat(300);
+    let failure = failure_for(
+        &run,
+        &[
+            ("tools", "a", &long),
+            ("tools", "b", ""),
+            ("tools", "c", "why"),
+            ("tools", "d", "why"),
+        ],
+        2,
+    );
+    let rows = cron_rows(None, Some(run), Some(failure), NOW);
+    assert!(
+        rows.contains("⚠ last update degraded: tools failing"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains(", b, c (why) +3 more; run shdeps health"),
+        "{rows}"
+    );
+    let shown = rows
+        .lines()
+        .find(|line| line.contains("failing:"))
+        .expect("cause line");
+    assert!(shown.contains('…') && shown.len() < 300, "{shown}");
+}
+
+#[test]
+fn a_cron_run_skipped_for_local_edits_names_them() {
+    // U4: the skip used to read "has not succeeded recently" once the last
+    // clean run aged out, never saying that local edits block cron.
+    const NOW: i64 = 1_800_000_000;
+    let run = last_run(NOW - 60, "skip", "cron", "");
+    let failure = failure_for(
+        &run,
+        &[
+            ("dirty", ".bashrc", ""),
+            ("dirty", ".zshrc", ""),
+            ("dirty", ".profile", ""),
+            ("dirty", ".inputrc", ""),
+        ],
+        1,
+    );
+    // Even right after a clean run: cron stays frozen until resolved.
+    let fresh = cron_rows(
+        Some(NOW - 600),
+        Some(run.clone()),
+        Some(failure.clone()),
+        NOW,
+    );
+    assert!(
+        fresh.contains("⚠ cron update skipping: local edits block it"),
+        "{fresh}"
+    );
+    assert!(
+        fresh.contains(
+            "last cron run 1m ago; last success 10m ago; edited: .bashrc, .zshrc, .profile +2 more; run dot status, then commit, stash, or resolve the edits"
+        ),
+        "{fresh}"
+    );
+    let stale = cron_rows(Some(NOW - 9 * 3600), Some(run.clone()), Some(failure), NOW);
+    assert!(
+        stale.contains("⚠ cron update skipping: local edits block it")
+            && stale.contains("last success 9h0m ago; edited: .bashrc"),
+        "{stale}"
+    );
+    assert!(!stale.contains("has not succeeded recently"), "{stale}");
+    // A skip that is itself stale means cron stopped too: the frozen row,
+    // still naming the edits of that last run.
+    let old_skip = last_run(NOW - 48 * 3600, "skip", "cron", "");
+    let old_failure = failure_for(&old_skip, &[("dirty", ".zshrc", "")], 0);
+    let stopped = cron_rows(
+        Some(NOW - 72 * 3600),
+        Some(old_skip.clone()),
+        Some(old_failure.clone()),
+        NOW,
+    );
+    assert!(
+        stopped.contains("⚠ cron update has not succeeded recently"),
+        "{stopped}"
+    );
+    assert!(
+        stopped.contains(
+            "last success 72h0m ago; last cron run skipped for local edits 48h0m ago; edited: .zshrc; run dot status"
+        ),
+        "{stopped}"
+    );
+    let never = cron_rows(None, Some(old_skip), Some(old_failure), NOW);
+    assert!(
+        never.contains(
+            "no successful cron update recorded; last cron run skipped for local edits 48h0m ago; edited: .zshrc"
+        ),
+        "{never}"
+    );
+    // An older Dot recorded the skip without files: the row still names
+    // the cause and the next step.
+    let old = cron_rows(Some(NOW - 9 * 3600), Some(run), None, NOW);
+    assert!(
+        old.contains("last success 9h0m ago; run dot status, then commit"),
+        "{old}"
+    );
+}
+
+#[test]
+fn a_live_update_lock_shows_how_long_it_has_been_held() {
+    // K5: a hung update showed only its pid.
+    let scratch = TempDir::new("doctor-lock-age").expect("scratch");
+    let state = scratch.path().join("state");
+    let log = dot::log::Log::new(false, false);
+    let guard =
+        dot::update_lock::acquire(&state, false, &log, None, &mut Vec::new()).expect("lock");
+    let live = dot::update_lock::lock_path(&state);
+    let fresh = render(&check_update_lock(Some(&live)));
+    assert!(fresh.contains("⚠ update is currently running"), "{fresh}");
+    assert!(
+        fresh.contains(&format!("pid {}, running for ", std::process::id())),
+        "{fresh}"
+    );
+    // Held past the staleness window: most likely hung, with how to stop it.
+    let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(5 * 3600 + 12 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(dot::update_lock::owner_file(&live))
+        .expect("owner file")
+        .set_modified(aged)
+        .expect("age owner");
+    let hung = render(&check_update_lock(Some(&live)));
+    assert!(
+        hung.contains("⚠ update has been running for 5h12m"),
+        "{hung}"
+    );
+    assert!(
+        hung.contains(&format!(
+            "pid {pid}; if it is hung, stop it (kill {pid}) and rerun dot update",
+            pid = std::process::id()
+        )),
+        "{hung}"
+    );
+    assert!(!hung.contains('✗'), "{hung}");
+    drop(guard);
 }
 
 #[test]

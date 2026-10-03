@@ -2462,6 +2462,48 @@ fn cron_freshness_reports_degraded_convergence_end_to_end() {
     );
 }
 
+#[test]
+fn cron_failure_cause_reaches_doctor_end_to_end() {
+    // U1/U3: a cron run that failed after a recent clean one is reported
+    // with the cause the update recorded, read from the state files that
+    // `dot update` writes.
+    let (home, state, _) = merge_fixture("cron-failure-cause");
+    let dir = state.path().join("dot");
+    std::fs::create_dir_all(&dir).expect("stamp dir");
+    let now = now_epoch();
+    let failed = now - 60;
+    std::fs::write(dir.join("update.last-success"), format!("{}\n", now - 1800))
+        .expect("recent clean run");
+    std::fs::write(
+        dir.join("update.last-run"),
+        format!("{failed} degraded cron tools\n"),
+    )
+    .expect("newer degraded run");
+    std::fs::write(
+        dir.join("update.last-failure"),
+        format!(
+            "{failed} degraded cron\nitem\ttools\twatchexec/watchexec\terror: blocked transition\n"
+        ),
+    )
+    .expect("cause");
+    let native = command(false, &home, &state, &[]).output().expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("⚠ last cron run degraded: tools failing"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "failing: tools: watchexec/watchexec (error: blocked transition); run shdeps health"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("cron update succeeded recently"),
+        "{stdout}"
+    );
+}
+
 fn now_epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
