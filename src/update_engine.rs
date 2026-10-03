@@ -5,7 +5,7 @@
 //! (installed-link snapshot, base/overlay pull, policy reload,
 //! overlay converge, lifecycle prepare), the defensive config
 //! reload, and finalize (provider checkpoint, link phase,
-//! lifecycle retire, shdeps branch, the opt-in shdeps prune stage,
+//! lifecycle retire, shdeps branch, the shdeps prune stage,
 //! merges, lifecycle commit, worktree normalize, `_ui_done`). Pure
 //! sequencing folds live in [`crate::update`]; this module owns the
 //! impure step execution,
@@ -134,30 +134,43 @@ fn release_hands_off(caller: Caller, can_exec: bool) -> bool {
 /// When `dot update` removes orphaned Shdeps dependencies itself.
 ///
 /// Pruning is destructive (uninstall hooks run and managed payloads are
-/// deleted), so it is opt-in and never runs from `dot init`. Whatever the
-/// mode, the engine prunes only after a converged generation whose
+/// deleted), so it never runs from `dot init`, never from a hand-run update
+/// unless asked for, and an explicit `never` turns it off entirely. Whatever
+/// the mode, the engine prunes only after a converged generation whose
 /// dependency config it already trusted enough to run the Tools stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PruneMode {
-    /// Never prune (the default).
+    /// Never prune (explicit opt-out, and the reading of an unknown value).
     Never,
-    /// Prune only on `dot update --cron`.
+    /// Prune only on `dot update --cron` (the default).
     Cron,
     /// Prune on every `dot update`/`dot pull`.
     Always,
 }
 
 impl PruneMode {
-    /// Parse a [`PRUNE_ENV`] value. Unset or empty reads as [`Never`]
+    /// Parse a [`PRUNE_ENV`] value. Unset or empty reads as [`Cron`]
     /// (`${VAR:-}` convention); an unrecognized value is `None` so the
     /// caller can warn and fall back to `Never` instead of failing the
     /// update: a value a newer client understands must never stop an
     /// older one from converging (and upgrading itself).
     ///
-    /// [`Never`]: PruneMode::Never
+    /// The default used to be `Never`, an opt-in chosen because prune is
+    /// destructive and because clients float to the latest release
+    /// independently, so a default flip reaches every host on its own
+    /// schedule. In practice the owner's fleet opted every host in to
+    /// `cron` through its cron entry, and cron auto-prune is the intended
+    /// design, so the opt-in only cost a line every crontab had to carry,
+    /// and a host whose entry lacked it silently accumulated orphans. Hand
+    /// runs and `dot pull` still never prune by default, and an unknown
+    /// value still reads as `Never` rather than as the default: a typo
+    /// must never be what enables deletion.
+    ///
+    /// [`Cron`]: PruneMode::Cron
     pub fn parse(value: Option<&str>) -> Option<Self> {
         match value.unwrap_or_default() {
-            "" | "never" => Some(PruneMode::Never),
+            "" => Some(PruneMode::Cron),
+            "never" => Some(PruneMode::Never),
             "cron" => Some(PruneMode::Cron),
             "always" => Some(PruneMode::Always),
             _ => None,
@@ -1939,7 +1952,7 @@ fn config_degraded(caller: Caller, config: &crate::config::Config) -> bool {
 
 /// `_dot_update_finalize` natively: checkpoint, link phase (or the
 /// frozen preservation rows), lifecycle retire, the provider-none
-/// tools stage, the opt-in prune stage, the empty merges close,
+/// tools stage, the prune stage, the empty merges close,
 /// lifecycle commit, worktree normalize, and `_ui_done`. Returns the
 /// update status.
 ///
@@ -3211,7 +3224,8 @@ pub fn now_secs() -> i64 {
 /// Plain helpers spawned without the runtime environment (for example
 /// `git pull`) still inherit the process environment; they never read it.
 /// `dot init` ignores the variable. An unrecognized value warns (even under
-/// cron) and reads as `never`, so it can never stop an update.
+/// cron) and reads as `never`, so it can never stop an update, and never as
+/// the unset default, so a typo also turns cron prune off instead of on.
 fn prune_mode(
     runtime: &crate::app::Runtime,
     request: &UpdateRequest<'_>,
@@ -3720,6 +3734,48 @@ mod tests {
     }
 
     #[test]
+    fn unset_prune_policy_defaults_to_cron_for_update_only() {
+        // The command boundary, not just the parser: unset means cron for
+        // `dot update`, init ignores every value, and a typo reads as
+        // `never` (never as the default) so it cannot enable deletion.
+        let config = crate::config::Config {
+            version: 1,
+            extension_api: false,
+            extensions_dir: None,
+            provider: crate::config::Provider::None,
+            default_profile: "base".to_string(),
+            shdeps_update_policy: crate::config::UpdatePolicy::Pinned,
+            policy_from_env: false,
+            unknown_keys: Vec::new(),
+        };
+        for (caller, value, expected) in [
+            (Caller::Update, None, PruneMode::Cron),
+            (Caller::Update, Some(""), PruneMode::Cron),
+            (Caller::Update, Some("never"), PruneMode::Never),
+            (Caller::Update, Some("weekly"), PruneMode::Never),
+            (Caller::Init, None, PruneMode::Never),
+            (Caller::Init, Some("always"), PruneMode::Never),
+        ] {
+            let mut env = BTreeMap::from([(OsString::from("HOME"), OsString::from("/tmp"))]);
+            if let Some(value) = value {
+                env.insert(OsString::from(PRUNE_ENV), OsString::from(value));
+            }
+            let runtime =
+                crate::app::Runtime::from_env(&env, Path::new("/tmp")).expect("absolute cwd");
+            let request = UpdateRequest {
+                caller,
+                config: &config,
+                env: &env,
+                args: &[],
+                state_home: Path::new("/tmp"),
+            };
+            let (mode, scrubbed) = prune_mode(&runtime, &request, &mut Vec::new());
+            assert_eq!(mode, expected, "{caller:?} {value:?}");
+            assert!(scrubbed.value(PRUNE_ENV).is_none(), "{caller:?} {value:?}");
+        }
+    }
+
+    #[test]
     fn only_update_from_the_binary_entry_hands_a_release_off() {
         assert!(release_hands_off(Caller::Update, true));
         // `dot init` finishes in place even where the process could exec:
@@ -3751,6 +3807,7 @@ mod tests {
             (Caller::Update, PruneMode::Always, false, true),
             // Init convergence failure rolls back an installation; a prune
             // failure must never be able to cause that.
+            (Caller::Init, PruneMode::Cron, true, false),
             (Caller::Init, PruneMode::Always, false, false),
             (Caller::Init, PruneMode::Always, true, false),
         ] {
@@ -3765,8 +3822,9 @@ mod tests {
     #[test]
     fn prune_mode_parses_env_values_and_rejects_unknown_ones_softly() {
         for (value, expected) in [
-            (None, Some(PruneMode::Never)),
-            (Some(""), Some(PruneMode::Never)),
+            // Unset and empty default to cron prune; `never` opts out.
+            (None, Some(PruneMode::Cron)),
+            (Some(""), Some(PruneMode::Cron)),
             (Some("never"), Some(PruneMode::Never)),
             (Some("cron"), Some(PruneMode::Cron)),
             (Some("always"), Some(PruneMode::Always)),
