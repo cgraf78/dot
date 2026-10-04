@@ -100,6 +100,16 @@ with_default_signal() {
   fi
 }
 
+# Like assert_contains for a captured command's output, but print that
+# output when the needle is missing: the capture exists only to keep an
+# expected diagnostic out of the job log, not to hide an unexpected one.
+assert_output_contains() {
+  local needle=$1 output=$2 label=$3
+  [[ $output == *"$needle"* ]] && return 0
+  printf '%s\n' "$output" >&2
+  fail "$label: missing [$needle]"
+}
+
 # Canonicalize PATH, allowing missing trailing components like GNU
 # `realpath -m`. busybox realpath rejects `-m`/`--` (it treats flags
 # as paths), so probe once and use python3 (present on every CI leg),
@@ -847,7 +857,7 @@ HOLDER
     done
   )
   reserved_status=0
-  bash -c '
+  reserved_output=$(bash -c '
   set -euo pipefail
   . "$1"
   perf_resolve_artifact_tools
@@ -864,9 +874,14 @@ HOLDER
     exit 86
   fi
 ' _ "$DOT_TEST_ROOT/scripts/benchmark-port.sh" "$reserved_source" \
-    "$reserved_lock_root" || reserved_status=$?
+    "$reserved_lock_root" 2>&1) || reserved_status=$?
+  # The capture keeps the expected refusal out of the log; replay it when the
+  # case goes wrong so the real cause stays visible.
+  [[ $reserved_status == 0 ]] || printf '%s\n' "$reserved_output" >&2
   assert_eq 0 "$reserved_status" \
     'reserved lifecycle root is rejected by non-creating preflight'
+  assert_output_contains 'error: performance artifacts cannot overlap the lifecycle lock root' \
+    "$reserved_output" 'reserved-root rejection names the overlap'
   [[ ! -e $reserved_lock_root && ! -L $reserved_lock_root ]] ||
     fail 'reserved-root rejection created its destination or lock root'
   reserved_after=$(
@@ -1076,7 +1091,7 @@ EOF
   chmod 0700 "$zero_test_cargo"
   zero_test_artifacts=$DOT_TEST_TMP/zero-test-artifacts
   mkdir -p "$zero_test_artifacts"
-  if ! bash -c '
+  if ! zero_test_output=$(bash -c '
   set -euo pipefail
   . "$1"
   declare -F perf_validate_completed_run >/dev/null
@@ -1096,9 +1111,12 @@ EOF
     5555555555555555555555555555555555555555 1 \
     /bin/true /bin/true /bin/true
 ' _ "$DOT_TEST_ROOT/scripts/benchmark-port.sh" "$DOT_TEST_TMP" \
-    "$zero_test_cargo" "$zero_test_artifacts"; then
+    "$zero_test_cargo" "$zero_test_artifacts" 2>&1); then
+    printf '%s\n' "$zero_test_output" >&2
     fail 'performance driver trusted a zero-test Cargo success without evidence'
   fi
+  assert_output_contains 'error: invalid performance evidence: incomplete artifact set' \
+    "$zero_test_output" 'zero-test Cargo success is refused as incomplete evidence'
 
   evidence_validation_root=$DOT_TEST_TMP/performance-evidence-validation
   if ! (
@@ -1311,6 +1329,29 @@ EOF
       perf_validate_completed_run "$1" "${evidence_args[@]}"
     }
 
+    # A negative case must be refused by the validator's own diagnosis, not by
+    # an unrelated failure. The diagnosis goes to a file so expected refusals
+    # stay out of the job log; it is replayed only when the case goes wrong.
+    # The validator runs in this shell, exactly as `validate_fixture` does.
+    expect_rejected() {
+      local directory=$1 description=$2
+      local diagnosis=$evidence_validation_root/rejection.err
+      if validate_fixture "$directory" 2>"$diagnosis"; then
+        printf 'validator accepted %s\n' "$description" >&2
+        exit 1
+      fi
+      expect_diagnosis "$diagnosis" "$description"
+      rm -f -- "$diagnosis"
+    }
+
+    expect_diagnosis() {
+      local diagnosis=$1 description=$2
+      [[ $(<"$diagnosis") == *'error: invalid performance evidence: '* ]] && return 0
+      printf 'validator rejected %s without diagnosing it:\n' "$description" >&2
+      cat -- "$diagnosis" >&2
+      exit 1
+    }
+
     valid=$evidence_validation_root/valid
     write_evidence_results "$valid"
     finalize_fixture "$valid"
@@ -1329,19 +1370,13 @@ EOF
     # `-s -1`, but busybox truncate rejects negative sizes.
     truncated_bytes=$(wc -c <"$truncated/samples.tsv")
     truncate -s $((truncated_bytes - 1)) "$truncated/samples.tsv"
-    if validate_fixture "$truncated"; then
-      printf 'validator accepted a truncated sample file\n' >&2
-      exit 1
-    fi
+    expect_rejected "$truncated" 'a truncated sample file'
 
     mixed=$evidence_validation_root/mixed-run
     cp -R "$valid" "$mixed"
     sed -i '2s/^1111111111111111111111111111111111111111/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/' \
       "$mixed/samples.tsv"
-    if validate_fixture "$mixed"; then
-      printf 'validator accepted mixed run identities\n' >&2
-      exit 1
-    fi
+    expect_rejected "$mixed" 'mixed run identities'
 
     reordered=$evidence_validation_root/reordered
     cp -R "$valid" "$reordered"
@@ -1349,69 +1384,45 @@ EOF
       "$reordered/samples.tsv" \
       >"$reordered/samples.reordered"
     mv "$reordered/samples.reordered" "$reordered/samples.tsv"
-    if validate_fixture "$reordered"; then
-      printf 'validator accepted samples recorded out of execution order\n' >&2
-      exit 1
-    fi
+    expect_rejected "$reordered" 'samples recorded out of execution order'
 
     wrong_count=$evidence_validation_root/wrong-count
     cp -R "$valid" "$wrong_count"
     sed -i '$d' "$wrong_count/samples.tsv"
-    if validate_fixture "$wrong_count"; then
-      printf 'validator accepted incomplete sample coverage\n' >&2
-      exit 1
-    fi
+    expect_rejected "$wrong_count" 'incomplete sample coverage'
 
     altered=$evidence_validation_root/altered-summary
     cp -R "$valid" "$altered"
     sed -i '2s/pass$/fail/' "$altered/summary.tsv"
-    if validate_fixture "$altered"; then
-      printf 'validator accepted an altered summary result\n' >&2
-      exit 1
-    fi
+    expect_rejected "$altered" 'an altered summary result'
 
     unexpected=$evidence_validation_root/unexpected-file
     cp -R "$valid" "$unexpected"
     printf 'PRIVATE_UNKNOWN_DEBUG_FILE\n' >"$unexpected/debug.log"
-    if validate_fixture "$unexpected"; then
-      printf 'validator accepted an unexpected artifact file\n' >&2
-      exit 1
-    fi
+    expect_rejected "$unexpected" 'an unexpected artifact file'
 
     altered_calibration=$evidence_validation_root/altered-calibration
     cp -R "$valid" "$altered_calibration"
     sed -i '3s/\t50\t99$/\t51\t99/' "$altered_calibration/calibration.tsv"
-    if validate_fixture "$altered_calibration"; then
-      printf 'validator accepted a miscomputed calibration ratio\n' >&2
-      exit 1
-    fi
+    expect_rejected "$altered_calibration" 'a miscomputed calibration ratio'
 
     stale_calibration=$evidence_validation_root/stale-calibration
     cp -R "$valid" "$stale_calibration"
     sed -i '2s/4444444444444444444444444444444444444444/5555555555555555555555555555555555555555/' \
       "$stale_calibration/calibration.tsv"
-    if validate_fixture "$stale_calibration"; then
-      printf 'validator accepted stale calibration provenance\n' >&2
-      exit 1
-    fi
+    expect_rejected "$stale_calibration" 'stale calibration provenance'
 
     for immutable in driver metadata samples summary calibration; do
       mutated=$evidence_validation_root/mutated-$immutable
       cp -R "$valid" "$mutated"
       printf '# mutation\n' >>"$mutated/$immutable.tsv"
-      if validate_fixture "$mutated"; then
-        printf 'validator accepted a mutated %s file\n' "$immutable" >&2
-        exit 1
-      fi
+      expect_rejected "$mutated" "a mutated $immutable file"
     done
 
     wrong_invocation=$evidence_validation_root/wrong-invocation
     cp -R "$valid" "$wrong_invocation"
     sed -i 's/--exact/--ignored/' "$wrong_invocation/driver.tsv"
-    if validate_fixture "$wrong_invocation"; then
-      printf 'validator accepted a mismatched Cargo invocation\n' >&2
-      exit 1
-    fi
+    expect_rejected "$wrong_invocation" 'a mismatched Cargo invocation'
 
     for metadata_case in extra missing control absolute private version lock omitted-lock; do
       malformed=$evidence_validation_root/metadata-$metadata_case
@@ -1426,10 +1437,7 @@ EOF
         lock) sed -i "s/^shell_shdeps_lock_revision\t.*/shell_shdeps_lock_revision\t$shdeps_commit/" "$malformed/metadata.tsv" ;;
         omitted-lock) sed -i '/^shell_shdeps_lock_revision\t/d' "$malformed/metadata.tsv" ;;
       esac
-      if validate_fixture "$malformed"; then
-        printf 'validator accepted malformed metadata case %s\n' "$metadata_case" >&2
-        exit 1
-      fi
+      expect_rejected "$malformed" "malformed metadata case $metadata_case"
     done
 
     for completion_case in extra missing hash invocation; do
@@ -1441,21 +1449,22 @@ EOF
         hash) sed -i 's/^driver_blob\t.*/driver_blob\t0000000000000000000000000000000000000000/' "$malformed/completion.tsv" ;;
         invocation) sed -i 's/--exact/--ignored/' "$malformed/completion.tsv" ;;
       esac
-      if validate_fixture "$malformed"; then
-        printf 'validator accepted malformed completion case %s\n' "$completion_case" >&2
-        exit 1
-      fi
+      expect_rejected "$malformed" "malformed completion case $completion_case"
     done
 
     invalid_provisional=$evidence_validation_root/invalid-provisional
     cp -R "$valid" "$invalid_provisional"
     rm "$invalid_provisional/completion.tsv"
     sed -i '$d' "$invalid_provisional/samples.tsv"
-    if perf_validate_provisional_run "$invalid_provisional" "${evidence_args[@]}" &&
+    provisional_diagnosis=$evidence_validation_root/invalid-provisional.err
+    if perf_validate_provisional_run "$invalid_provisional" "${evidence_args[@]}" \
+      2>"$provisional_diagnosis" &&
       perf_write_completion_manifest "$invalid_provisional/completion.tsv"; then
       printf 'invalid provisional evidence reached completion\n' >&2
       exit 1
     fi
+    expect_diagnosis "$provisional_diagnosis" 'invalid provisional evidence'
+    rm -f -- "$provisional_diagnosis"
     [[ ! -e $invalid_provisional/completion.tsv ]] || {
       printf 'validation failure after Rust left a passed completion\n' >&2
       exit 1
@@ -1690,6 +1699,14 @@ EOF
     }
     PERF_MV=$real_mv
   ); then
+    # Each negative case's capture is removed once its diagnosis checks out,
+    # so a capture left behind holds whatever ended the block mid-case, such
+    # as a fatal shell error under `set -u`. Replay it before failing.
+    for capture in "$evidence_validation_root"/*.err; do
+      if [[ -f $capture ]]; then
+        cat -- "$capture" >&2
+      fi
+    done
     fail 'performance evidence validator did not enforce the completion contract'
   fi
 else
@@ -3152,9 +3169,15 @@ EOF
       process_identity "$stderr_relay_pid" stderr_relay_identity ||
         fail 'coordinator death stderr relay identity was unavailable'
       guarded_stderr_relay_identity=$stderr_relay_identity
-      kill -KILL "$supervisor_pid"
+      # Bash prints a "Killed" job notice to whatever stderr is current when it
+      # reaps a signalled background job, which can happen at any command after
+      # the kill. Kill and reap inside one silenced group so the notice cannot
+      # escape; the asserted exit status still proves how the job ended.
       supervisor_status=0
-      wait "$supervisor_pid" || supervisor_status=$?
+      {
+        kill -KILL "$supervisor_pid" || :
+        wait "$supervisor_pid" || supervisor_status=$?
+      } 2>/dev/null
       guarded_job_pid=
       guarded_job_identity=
       assert_eq 137 "$supervisor_status" 'forced coordinator death retains its signal status'
@@ -3265,7 +3288,13 @@ EOF
       process_identity "$supervisor_pid" supervisor_identity ||
         fail 'driver death supervisor identity was unavailable'
       guarded_inner_identity=$supervisor_identity
-      kill -KILL "$driver_pid" 2>/dev/null || :
+      # Reap the killed driver at once inside a silenced group: Bash would
+      # otherwise print its "Killed" job notice at whichever later command
+      # happens to reap it.
+      {
+        kill -KILL "$driver_pid"
+        wait "$driver_pid"
+      } 2>/dev/null || :
       for _ in {1..500}; do
         if ! process_is_live "$driver_pid" "$driver_identity" &&
           ! process_is_live "$supervisor_pid" "$supervisor_identity"; then
@@ -3277,7 +3306,6 @@ EOF
         kill -KILL "$supervisor_pid" 2>/dev/null || :
         fail 'driver death left its coordinator reporting past its watchdog'
       fi
-      wait "$driver_pid" 2>/dev/null || :
       guarded_job_pid=
       guarded_job_identity=
       guarded_inner_pid=
@@ -3393,9 +3421,13 @@ EOF
       fail 'stdout relay retained the stderr destination'
     [[ -z $stderr_relay_stdout ]] ||
       fail 'stderr relay retained the stdout destination'
-    kill -KILL "$cargo_relay_supervisor"
+    # Kill and reap in one silenced group so Bash's "Killed" job notice,
+    # printed whenever the job is reaped, cannot reach the job log.
     cargo_relay_supervisor_status=0
-    wait "$cargo_relay_supervisor" || cargo_relay_supervisor_status=$?
+    {
+      kill -KILL "$cargo_relay_supervisor" || :
+      wait "$cargo_relay_supervisor" || cargo_relay_supervisor_status=$?
+    } 2>/dev/null
     guarded_job_pid=
     guarded_job_identity=
     : >"$cargo_relay_parent_death/release-reader"
@@ -4373,7 +4405,7 @@ printf 'tracked\n' >"$status_repo/tracked"
 "$system_git" -C "$status_repo" -c core.hooksPath=/dev/null \
   -c user.name=fixture -c user.email=fixture@example.invalid \
   commit -qm fixture
-if ! bash -c '
+if ! status_failure_output=$(bash -c '
   set -euo pipefail
   . "$1"
   declare -F perf_source_state >/dev/null
@@ -4384,9 +4416,14 @@ if ! bash -c '
   PERF_GIT=$3
   ! perf_source_state "$4"
 ' _ "$DOT_TEST_ROOT/scripts/benchmark-port.sh" "$DOT_TEST_TMP" \
-  "$failing_git" "$status_repo"; then
+  "$failing_git" "$status_repo" 2>&1); then
+  printf '%s\n' "$status_failure_output" >&2
   fail 'performance source-state preflight did not fail closed on Git status failure'
 fi
+assert_output_contains 'synthetic status failure' \
+  "$status_failure_output" 'Git status failure was injected'
+assert_output_contains 'error: cannot inspect current benchmark worktree' \
+  "$status_failure_output" 'Git status failure is diagnosed as an uninspectable worktree'
 
 if ! bash -c '
   set -euo pipefail
