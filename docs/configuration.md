@@ -427,7 +427,8 @@ Tracked root selectors may omit both `user` and `host` to define a global
 default that overrides `default_profile`. Machine-local and personal selectors
 must include at least one of those fields. Every supplied field must match.
 User names come from `id -un` and compare exactly and case-sensitively.
-Short hostnames come from `hostname -s`; both configured and current values are
+Short hostnames are the kernel host name cut at its first dot (what
+`hostname -s` prints); both configured and current values are
 ASCII-lowercased after removing one trailing dot. A selector containing both
 `user` and `host` is more specific than a selector containing only one field,
 and the most-specific matching level wins. A user-only or host-only record

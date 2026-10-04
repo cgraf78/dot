@@ -72,6 +72,52 @@ use std::path::{Path, PathBuf};
 use crate::doctor_paths::tilde;
 pub use crate::doctor_runtime::{Kind, Record};
 
+/// How long one core doctor probe may run.
+///
+/// A stalled Git or filesystem (a hung network mount under an overlay, say)
+/// used to stall doctor indefinitely. Past this deadline the probe's
+/// session is stopped and reaped like any other timeout, and the repository
+/// rows it feeds read as a warning naming the stall. The bound sits well
+/// above a slow but healthy host (a cold `git status` of a large work tree
+/// on a network home), so only a real stall reaches it. The overlay
+/// resolver's probes (shared with `dot update`, whose answers feed trust
+/// decisions) stay unbounded: a timeout there would read as a missing
+/// checkout and refuse that overlay's extensions. `dot doctor --help`
+/// states this bound ([`crate::doctor::USAGE`]).
+pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The deadline for a core probe starting now.
+pub(crate) fn probe_deadline() -> Option<std::time::Instant> {
+    std::time::Instant::now().checked_add(probe_timeout())
+}
+
+fn probe_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(timeout) = TEST_PROBE_TIMEOUT.with(std::cell::Cell::get) {
+        return timeout;
+    }
+    PROBE_TIMEOUT
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A shorter [`PROBE_TIMEOUT`] for this test thread.
+    static TEST_PROBE_TIMEOUT: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A core probe stopped at its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TimedOut;
+
+/// The detail of every row a timed-out probe turns into a warning.
+pub(crate) fn timed_out_detail() -> String {
+    format!(
+        "Git did not answer within {}s; check for a stalled filesystem or Git process, then rerun dot doctor",
+        PROBE_TIMEOUT.as_secs()
+    )
+}
+
 /// Render records with color disabled (piped stdout: every color slot is
 /// empty), through [`crate::doctor_runtime::render`]:
 ///
@@ -1411,11 +1457,12 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 ));
             }
         }
-        let status = statuses.get(&path).and_then(Option::as_ref);
+        let status = statuses.get(&path);
         overlay_state_records(&name, &path, optional == "true", status, &mut out);
         // Only a clean overlay on its current upstream folds, so the branch
         // facts exist whenever the fold uses them.
         let branch = status
+            .and_then(|status| status.as_ref().ok()?.as_ref())
             .and_then(|status| {
                 Some(current_fact(
                     status.head.as_deref()?,
@@ -2232,21 +2279,34 @@ fn base_git_prefix(topology: &str, client_git_dir: &str, home: &str) -> Option<V
 /// spawn failure, non-zero exit, or unrecognized topology (the
 /// shell `|| true` / `|| printf false` fallbacks apply at each
 /// call site, not here).
-fn base_git(topology: &str, client_git_dir: &str, home: &str, args: &[&str]) -> Option<String> {
-    let prefix = base_git_prefix(topology, client_git_dir, home)?;
-    let output = inspect_git(&prefix, args)?;
+fn base_git(
+    topology: &str,
+    client_git_dir: &str,
+    home: &str,
+    args: &[&str],
+) -> Result<Option<String>, TimedOut> {
+    let Some(prefix) = base_git_prefix(topology, client_git_dir, home) else {
+        return Ok(None);
+    };
+    let Some(output) = inspect_git(&prefix, args, probe_deadline())? else {
+        return Ok(None);
+    };
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
-    Some(captured(&String::from_utf8_lossy(&output.stdout)))
+    Ok(Some(captured(&String::from_utf8_lossy(&output.stdout))))
 }
 
 /// Run one read-only repository inspection for doctor: the bound host Git,
 /// `prefix` then `args`, stdout captured, stderr and stdin closed. Inherited
 /// repository selectors (`GIT_INDEX_FILE` from a Git hook, say) are removed
 /// so the probe inspects the repository it names, while the user's Git
-/// configuration still applies.
-fn inspect_git(prefix: &[OsString], args: &[&str]) -> Option<std::process::Output> {
+/// configuration still applies. `Ok(None)` means Git could not be run.
+fn inspect_git(
+    prefix: &[OsString],
+    args: &[&str],
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<std::process::Output>, TimedOut> {
     let mut command = crate::init_client_identity::host_git_command();
     crate::temp::scrub_repository_selectors(&mut command);
     command
@@ -2255,13 +2315,16 @@ fn inspect_git(prefix: &[OsString], args: &[&str]) -> Option<std::process::Outpu
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    crate::cleanup::run_session_output(
+    match crate::cleanup::run_session_output_typed(
         command,
-        None,
+        deadline,
         crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
         crate::cleanup::LingerPolicy::Detach,
-    )
-    .ok()
+    ) {
+        Ok(output) => Ok(Some(output)),
+        Err(crate::cleanup::SessionOutputError::TimedOut) => Err(TimedOut),
+        Err(_) => Ok(None),
+    }
 }
 
 /// The single status invocation doctor spends per repository. It answers
@@ -2471,14 +2534,25 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
     // What the folded healthy row says about the layout.
     let mut layout_fact = "ordinary layout".to_string();
     let git = |args: &[&str]| base_git(inputs.topology, inputs.client_git_dir, inputs.home, args);
+    // One stalled probe ends the section with a warning: the rows after it
+    // would only restate that Git did not answer, and wrongly as failures.
+    let stalled = |mut out: Vec<Record>| {
+        out.push(Record::warn(
+            "client repository did not answer",
+            Some(timed_out_detail()),
+        ));
+        out
+    };
     if inputs.topology == "ordinary" {
         out.push(Record::ok("ordinary client layout", None));
     } else {
         // Both layout keys in one process; `--get` semantics (last value
         // wins) and the old defaults (`false`, empty) when unset.
         let (mut is_bare, mut has_worktree) = ("false".to_string(), String::new());
-        let layout =
-            git(&["config", "-z", "--get-regexp", r"^core\.(bare|worktree)$"]).unwrap_or_default();
+        let layout = match git(&["config", "-z", "--get-regexp", r"^core\.(bare|worktree)$"]) {
+            Ok(layout) => layout.unwrap_or_default(),
+            Err(TimedOut) => return stalled(out),
+        };
         for entry in layout.split('\0') {
             match entry.split_once('\n') {
                 Some(("core.bare", value)) => is_bare = value.to_string(),
@@ -2502,7 +2576,10 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
             ));
         }
     }
-    let resolved = git(&["rev-parse", "--show-toplevel"]).unwrap_or_default();
+    let resolved = match git(&["rev-parse", "--show-toplevel"]) {
+        Ok(resolved) => resolved.unwrap_or_default(),
+        Err(TimedOut) => return stalled(out),
+    };
     if resolved == inputs.home {
         out.push(Record::ok("client worktree resolves to $HOME", None));
     } else {
@@ -2516,7 +2593,11 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
             Some(format!("expected {}, got {got}", inputs.home)),
         ));
     }
-    let Some(status) = git(&STATUS_ARGS).map(|text| parse_status_v2(&text)) else {
+    let status = match git(&STATUS_ARGS) {
+        Ok(status) => status,
+        Err(TimedOut) => return stalled(out),
+    };
+    let Some(status) = status.map(|text| parse_status_v2(&text)) else {
         out.push(Record::warn(
             "client repository status is unavailable",
             Some("run dot status to inspect".to_string()),
@@ -2607,15 +2688,25 @@ fn overlay_state_records(
     name: &str,
     path: &str,
     optional: bool,
-    status: Option<&RepoStatus>,
+    status: Option<&OverlayStatus>,
     out: &mut Vec<Record>,
 ) {
-    let Some(status) = status else {
-        out.push(Record::warn(
-            format!("{name}: repository status is unavailable"),
-            Some("run dot status to inspect".to_string()),
-        ));
-        return;
+    let status = match status {
+        Some(Ok(Some(status))) => status,
+        Some(Err(TimedOut)) => {
+            out.push(Record::warn(
+                format!("{name}: repository did not answer"),
+                Some(timed_out_detail()),
+            ));
+            return;
+        }
+        Some(Ok(None)) | None => {
+            out.push(Record::warn(
+                format!("{name}: repository status is unavailable"),
+                Some("run dot status to inspect".to_string()),
+            ));
+            return;
+        }
     };
     let prefix = [OsString::from("-C"), OsString::from(path)];
     let git_dir = worktree_git_dir(Path::new(path));
@@ -2835,20 +2926,30 @@ fn fold_healthy(rows: Vec<Record>, message: &str, detail: String) -> Vec<Record>
 }
 
 /// [`STATUS_ARGS`] for one overlay checkout, `None` when Git fails.
-fn overlay_status(path: &str) -> Option<RepoStatus> {
+fn overlay_status(
+    path: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<RepoStatus>, TimedOut> {
     let prefix = [OsString::from("-C"), OsString::from(path)];
-    let output = inspect_git(&prefix, &STATUS_ARGS)?;
-    output
+    let Some(output) = inspect_git(&prefix, &STATUS_ARGS, deadline)? else {
+        return Ok(None);
+    };
+    Ok(output
         .status
         .success()
-        .then(|| parse_status_v2(&String::from_utf8_lossy(&output.stdout)))
+        .then(|| parse_status_v2(&String::from_utf8_lossy(&output.stdout))))
 }
+
+/// One overlay's [`overlay_status`] answer.
+type OverlayStatus = Result<Option<RepoStatus>, TimedOut>;
 
 /// Run [`overlay_status`] for every path concurrently: each is an
 /// independent read-only Git process, and serially they would add one Git
 /// round trip per overlay to every doctor run.
-fn overlay_statuses(paths: Vec<String>) -> BTreeMap<String, Option<RepoStatus>> {
+fn overlay_statuses(paths: Vec<String>) -> BTreeMap<String, OverlayStatus> {
     let host_git = crate::init_client_identity::carry_host_git();
+    // One deadline for the batch: the probes run at once.
+    let deadline = probe_deadline();
     std::thread::scope(|scope| {
         // A thread the OS refuses runs its probe inline instead; a probe
         // that panics leaves its path out, which reads as "unavailable".
@@ -2860,14 +2961,14 @@ fn overlay_statuses(paths: Vec<String>) -> BTreeMap<String, Option<RepoStatus>> 
                 let path = path.clone();
                 move || {
                     let _host_git = carried.bind();
-                    let status = overlay_status(&path);
+                    let status = overlay_status(&path, deadline);
                     (path, status)
                 }
             });
             match spawned {
                 Ok(handle) => handles.push(handle),
                 Err(_) => {
-                    let status = overlay_status(&path);
+                    let status = overlay_status(&path, deadline);
                     results.insert(path, status);
                 }
             }
@@ -2881,6 +2982,101 @@ fn overlay_statuses(paths: Vec<String>) -> BTreeMap<String, Option<RepoStatus>> 
 mod tests {
     use super::*;
     use crate::update_lock::OwnerActivity as Activity;
+
+    /// A host Git that records its pid, then hangs far past any probe
+    /// deadline: a stalled filesystem stand-in.
+    fn hanging_git(scope: &dot_test_support::TempDir) -> (PathBuf, PathBuf) {
+        let pids = scope.path().join("pids");
+        let shim = scope.path().join("git");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\necho $$ >> '{}'\nexec sleep 60\n",
+                pids.display()
+            ),
+        )
+        .expect("hanging git");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        (shim, pids)
+    }
+
+    /// Run `body` with a short probe deadline on this thread.
+    fn with_short_probes<R>(body: impl FnOnce() -> R) -> R {
+        TEST_PROBE_TIMEOUT.with(|slot| slot.set(Some(std::time::Duration::from_millis(300))));
+        let result = body();
+        TEST_PROBE_TIMEOUT.with(|slot| slot.set(None));
+        result
+    }
+
+    /// Every probe the hanging Git started must be gone: the deadline stops
+    /// and reaps the probe's session instead of abandoning it.
+    fn assert_probes_reaped(pids: &Path) {
+        let recorded = std::fs::read_to_string(pids).expect("probe pids");
+        assert!(!recorded.trim().is_empty(), "the probe never ran");
+        for pid in recorded.split_whitespace() {
+            let pid: libc::pid_t = pid.parse().expect("pid");
+            // SAFETY: signal 0 only checks existence; no signal is sent.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            assert!(!alive, "probe {pid} outlived its deadline");
+        }
+    }
+
+    #[test]
+    fn stalled_client_probe_warns_instead_of_hanging() {
+        let scope = dot_test_support::TempDir::new_exec("doctor-stalled-client").expect("scope");
+        let (shim, pids) = hanging_git(&scope);
+        let home = scope.path().join("home");
+        let git_dir = home.join(".dotfiles");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+        let started = std::time::Instant::now();
+        let records = crate::init_client_identity::with_host_git(&shim, || {
+            with_short_probes(|| {
+                check_base_repo(&BaseRepoInputs {
+                    topology: "separate",
+                    client_git_dir: git_dir.to_str().expect("git dir"),
+                    home: home.to_str().expect("home"),
+                    is_client_checkout: false,
+                })
+            })
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "one stalled probe ended the section: {:?}",
+            started.elapsed()
+        );
+        let rendered = render(&records);
+        assert!(
+            rendered.contains("⚠ client repository did not answer"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("did not answer within 30s"), "{rendered}");
+        assert!(
+            !rendered.contains('✗'),
+            "a stall is not a failure: {rendered}"
+        );
+        assert_probes_reaped(&pids);
+    }
+
+    #[test]
+    fn stalled_overlay_status_warns_instead_of_hanging() {
+        let scope = dot_test_support::TempDir::new_exec("doctor-stalled-overlay").expect("scope");
+        let (shim, pids) = hanging_git(&scope);
+        let overlay = scope.path().join("overlay");
+        std::fs::create_dir_all(&overlay).expect("overlay");
+        let path = overlay.to_str().expect("overlay").to_string();
+        let statuses = crate::init_client_identity::with_host_git(&shim, || {
+            with_short_probes(|| overlay_statuses(vec![path.clone()]))
+        });
+        assert_eq!(statuses.get(&path), Some(&Err(TimedOut)));
+        let mut out = Vec::new();
+        overlay_state_records("dev", &path, false, statuses.get(&path), &mut out);
+        let rendered = render(&out);
+        assert!(
+            rendered.contains("⚠ dev: repository did not answer"),
+            "{rendered}"
+        );
+        assert_probes_reaped(&pids);
+    }
 
     #[test]
     fn lock_owner_rows_match_acquire_behavior() {

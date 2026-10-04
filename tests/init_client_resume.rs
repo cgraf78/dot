@@ -743,3 +743,303 @@ fn resume_prepared_prebuilt() {
         assert!(t.exists());
     }
 }
+
+/// The predicate's answer from the separate Git probes it used before they
+/// were coalesced into one `config --get-regexp` and one `rev-parse` read:
+/// the oracle the coalesced reads must reproduce.
+fn separate_probe_verdict(repo: &Repo) -> bool {
+    let probe = |args: &[&str]| {
+        let mut all = vec!["--git-dir", repo.git.to_str().unwrap()];
+        all.extend_from_slice(args);
+        let out = dot_test_support::git()
+            .args(&all)
+            .current_dir(&repo.home)
+            .env("LC_ALL", "C")
+            .env("HOME", &repo.home)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .expect("git");
+        out.status.success().then_some(out.stdout)
+    };
+    let chomp = |mut bytes: Vec<u8>| {
+        while bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        bytes
+    };
+    let urls = probe(&["config", "--get-all", "remote.origin.url"]).unwrap_or_default();
+    let mut lines: Vec<&[u8]> = urls.split(|byte| *byte == b'\n').collect();
+    if urls.ends_with(b"\n") {
+        lines.pop();
+    }
+    if urls.is_empty() || lines.len() != 1 {
+        return false;
+    }
+    let identity = std::str::from_utf8(lines[0])
+        .ok()
+        .and_then(dot::init_client_identity::repo_identity);
+    if identity.as_deref() != Some(repo.identity.as_str()) {
+        return false;
+    }
+    match probe(&["symbolic-ref", "--short", "HEAD"]).map(chomp) {
+        Some(branch) if branch == b"main" => {}
+        _ => return false,
+    }
+    if probe(&["rev-parse", "HEAD"]).is_none() {
+        return false;
+    }
+    match probe(&["config", "--bool", "core.bare"])
+        .map(chomp)
+        .as_deref()
+    {
+        Some(b"true") => true,
+        Some(b"false") => probe(&["config", "core.worktree"])
+            .map(chomp)
+            .is_some_and(|worktree| worktree == repo.home.as_os_str().as_encoded_bytes()),
+        _ => false,
+    }
+}
+
+/// [`matches`] for an adopted client, without the generation marker (and so
+/// without a Git call of its own: a broken config must not panic here).
+fn matches_adopted(repo: &Repo) -> bool {
+    let path = |p: &Path| dot::temp::path_identity(p).map(|(d, i)| format!("{d}:{i}"));
+    let marker = |_: &Path| true;
+    let identity = |u: &str| {
+        dot::init_client_identity::repo_identity(u).ok_or(Error::Usage {
+            message: "identity",
+        })
+    };
+    resume::live_git_matches_record(
+        &repo.inputs("adopted"),
+        &resume::LiveGitDeps {
+            path_identity: &path,
+            generation_matches: &marker,
+            repo_identity: &identity,
+        },
+    )
+}
+
+/// Append raw lines to the client's own config (valueless keys and other
+/// spellings `git config` will not write).
+fn append_config(repo: &Repo, text: &str) {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(repo.git.join("config"))
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+}
+
+/// Every configuration spelling the separate probes understood must give the
+/// coalesced reads the same verdict.
+#[test]
+fn coalesced_identity_reads_match_the_separate_probes() {
+    let home_text = |r: &Repo| r.home.to_str().unwrap().to_string();
+    type Setup = Box<dyn Fn(&Repo)>;
+    let scenarios: Vec<(&str, Setup)> = vec![
+        ("healthy", Box::new(|_| {})),
+        (
+            "bare-yes",
+            Box::new(|r| set(r, &["config", "core.bare", "yes"])),
+        ),
+        (
+            "bare-on-upper",
+            Box::new(|r| set(r, &["config", "core.bare", "ON"])),
+        ),
+        (
+            "bare-one",
+            Box::new(|r| set(r, &["config", "core.bare", "1"])),
+        ),
+        (
+            "bare-minus",
+            Box::new(|r| set(r, &["config", "core.bare", "-1"])),
+        ),
+        (
+            "bare-octal",
+            Box::new(|r| set(r, &["config", "core.bare", "010"])),
+        ),
+        (
+            "bare-bad-octal",
+            Box::new(|r| set(r, &["config", "core.bare", "08"])),
+        ),
+        (
+            "bare-valueless",
+            Box::new(|r| {
+                set(r, &["config", "--unset", "core.bare"]);
+                append_config(r, "[core]\n\tbare\n");
+            }),
+        ),
+        (
+            "bare-junk",
+            Box::new(|r| set(r, &["config", "core.bare", "junk"])),
+        ),
+        (
+            "bare-unset",
+            Box::new(|r| set(r, &["config", "--unset", "core.bare"])),
+        ),
+        (
+            "bare-no-worktree-home",
+            Box::new(move |r| {
+                set(r, &["config", "core.bare", "no"]);
+                set(r, &["config", "core.worktree", &home_text(r)]);
+            }),
+        ),
+        (
+            "bare-off-worktree-wrong",
+            Box::new(|r| {
+                set(r, &["config", "core.bare", "off"]);
+                set(r, &["config", "core.worktree", "/elsewhere"]);
+            }),
+        ),
+        (
+            "bare-zero-worktree-unset",
+            Box::new(|r| set(r, &["config", "core.bare", "0"])),
+        ),
+        (
+            "bare-empty-worktree-home",
+            Box::new(move |r| {
+                set(r, &["config", "--unset", "core.bare"]);
+                append_config(r, "[core]\n\tbare =\n");
+                set(r, &["config", "core.worktree", &home_text(r)]);
+            }),
+        ),
+        (
+            "bare-last-wins",
+            Box::new(|r| {
+                set(r, &["config", "core.bare", "false"]);
+                set(r, &["config", "--add", "core.bare", "true"]);
+            }),
+        ),
+        (
+            "worktree-last-wins",
+            Box::new(move |r| {
+                set(r, &["config", "core.bare", "false"]);
+                set(r, &["config", "core.worktree", "/elsewhere"]);
+                set(r, &["config", "--add", "core.worktree", &home_text(r)]);
+            }),
+        ),
+        (
+            "url-valueless",
+            Box::new(|r| {
+                set(r, &["config", "--unset-all", "remote.origin.url"]);
+                append_config(r, "[remote \"origin\"]\n\turl\n");
+            }),
+        ),
+        (
+            "url-empty",
+            Box::new(|r| set(r, &["config", "remote.origin.url", ""])),
+        ),
+        (
+            "url-two",
+            Box::new(|r| {
+                set(
+                    r,
+                    &["config", "--add", "remote.origin.url", "file:///second"],
+                );
+            }),
+        ),
+        (
+            "url-uppercase-section",
+            Box::new(|r| {
+                // Section and key names are case-insensitive; the subsection is
+                // not, so `Origin` is another remote.
+                let url = git(
+                    &r.home,
+                    &[
+                        "--git-dir",
+                        r.git.to_str().unwrap(),
+                        "config",
+                        "remote.origin.url",
+                    ],
+                );
+                set(r, &["config", "--unset-all", "remote.origin.url"]);
+                append_config(r, &format!("[REMOTE \"origin\"]\n\tURL = {url}\n"));
+            }),
+        ),
+        (
+            "url-other-subsection",
+            Box::new(|r| {
+                let url = git(
+                    &r.home,
+                    &[
+                        "--git-dir",
+                        r.git.to_str().unwrap(),
+                        "config",
+                        "remote.origin.url",
+                    ],
+                );
+                set(r, &["config", "--unset-all", "remote.origin.url"]);
+                append_config(r, &format!("[remote \"Origin\"]\n\turl = {url}\n"));
+            }),
+        ),
+        (
+            "tag-shadows-branch",
+            Box::new(|r| {
+                set(r, &["tag", "main", "HEAD"]);
+            }),
+        ),
+        (
+            "detached",
+            Box::new(|r| {
+                let head = git(
+                    &r.home,
+                    &["--git-dir", r.git.to_str().unwrap(), "rev-parse", "HEAD"],
+                );
+                std::fs::write(r.git.join("HEAD"), format!("{head}\n")).unwrap();
+            }),
+        ),
+        (
+            "unborn",
+            Box::new(|r| {
+                std::fs::write(r.git.join("HEAD"), "ref: refs/heads/main-unborn\n").unwrap();
+            }),
+        ),
+    ];
+    let mut trusted = Vec::new();
+    for (name, setup) in scenarios {
+        let repo = Repo::new(&format!("coalesced-{name}"), false);
+        setup(&repo);
+        let expected = separate_probe_verdict(&repo);
+        assert_eq!(
+            matches_adopted(&repo),
+            expected,
+            "{name}: coalesced reads disagree with the separate probes"
+        );
+        if expected {
+            trusted.push(name);
+        }
+    }
+    // Pin the oracle too, so the comparison cannot pass vacuously.
+    assert_eq!(
+        trusted,
+        [
+            "healthy",
+            "bare-yes",
+            "bare-on-upper",
+            "bare-one",
+            "bare-minus",
+            "bare-octal",
+            "bare-valueless",
+            "bare-no-worktree-home",
+            "bare-empty-worktree-home",
+            "bare-last-wins",
+            "worktree-last-wins",
+            "url-uppercase-section",
+        ]
+    );
+}
+
+/// Git also reads hexadecimal and unit-suffixed integers as booleans; the
+/// coalesced reader refuses them, so such a hand-written `core.bare` makes
+/// the client read as foreign rather than trusted.
+#[test]
+fn unusual_boolean_spellings_fail_closed() {
+    for value in ["0x1", "1k"] {
+        let repo = Repo::new(&format!("bool-{value}"), false);
+        set(&repo, &["config", "core.bare", value]);
+        assert!(!matches_adopted(&repo), "{value}");
+    }
+}

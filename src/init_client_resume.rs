@@ -221,6 +221,125 @@ fn home_child(home: &Path, leaf: &str) -> Vec<u8> {
     joined
 }
 
+/// The configuration keys [`live_git_matches_record`] reads, as one
+/// `git config --get-regexp` pattern over Git's canonical key names (the
+/// section and variable lowercased, the `origin` subsection verbatim).
+const IDENTITY_CONFIG_KEYS: &str = r"^(remote\.origin\.url|core\.bare|core\.worktree)$";
+
+/// The identity keys from one `git config -z --get-regexp` read.
+///
+/// The predicate used to spend three or four Git children on
+/// `config --get-all remote.origin.url`, `config --bool core.bare`, and
+/// `config core.worktree`. Each answer is reproduced from the one read:
+/// every origin URL in order, and the last `core.bare` and `core.worktree`
+/// values (Git's `--get` semantics). A key written without `=` has no value
+/// (`-z` prints only its name), which `--get-all` prints as an empty line
+/// and `--bool` reads as true.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct IdentityConfig {
+    origin_urls: Vec<Option<Vec<u8>>>,
+    bare: Option<Option<Vec<u8>>>,
+    worktree: Option<Vec<u8>>,
+}
+
+impl IdentityConfig {
+    fn parse(raw: &[u8]) -> Self {
+        let mut config = IdentityConfig::default();
+        for entry in raw
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let (key, value) = match entry.iter().position(|byte| *byte == b'\n') {
+                Some(split) => (&entry[..split], Some(entry[split + 1..].to_vec())),
+                None => (entry, None),
+            };
+            match key {
+                b"remote.origin.url" => config.origin_urls.push(value),
+                b"core.bare" => config.bare = Some(value),
+                // A valueless `core.worktree` is a config error Git
+                // refuses before answering at all, so it never gets here.
+                b"core.worktree" => config.worktree = Some(value.unwrap_or_default()),
+                _ => {}
+            }
+        }
+        config
+    }
+
+    /// The bytes `git config --get-all remote.origin.url` prints: one
+    /// newline-terminated line per value. Rebuilding them (instead of
+    /// counting entries) keeps the old framing exactly, so a URL holding a
+    /// newline still splits into two lines and fails the one-URL rule.
+    fn origin_urls_as_get_all(&self) -> Vec<u8> {
+        let mut printed = Vec::new();
+        for url in &self.origin_urls {
+            printed.extend_from_slice(url.as_deref().unwrap_or_default());
+            printed.push(b'\n');
+        }
+        printed
+    }
+
+    /// `git config --bool core.bare`: `None` when the key is unset or its
+    /// last value is not a boolean (both made the old probe fail).
+    fn bare(&self) -> Option<bool> {
+        git_bool(self.bare.as_ref()?.as_deref())
+    }
+}
+
+/// Git's boolean reading of one configuration value: no value is true, an
+/// empty one false, then `true`/`yes`/`on` and `false`/`no`/`off` in any
+/// case, then a decimal `int` (nonzero is true).
+///
+/// Git also accepts hexadecimal, octal, and `k`/`m`/`g`-suffixed integers;
+/// those read as `None` here, so such a hand-written `core.bare` fails
+/// closed (the client reads as foreign) instead of being trusted. Like Git,
+/// a number outside the 32-bit `int` range is not a boolean.
+fn git_bool(value: Option<&[u8]>) -> Option<bool> {
+    let Some(value) = value else {
+        return Some(true);
+    };
+    if value.is_empty() {
+        return Some(false);
+    }
+    let text = std::str::from_utf8(value).ok()?.to_ascii_lowercase();
+    match text.as_str() {
+        "true" | "yes" | "on" => Some(true),
+        "false" | "no" | "off" => Some(false),
+        _ => {
+            // Git reads a leading zero as octal (`010` is 8, `08` is an
+            // error); only the truth value matters here.
+            let digits = text.strip_prefix(['+', '-']).unwrap_or(&text);
+            let number = match digits.strip_prefix('0') {
+                Some(octal) if !octal.is_empty() => i32::from_str_radix(octal, 8).ok()?,
+                _ => text.parse::<i32>().ok()?,
+            };
+            Some(number != 0)
+        }
+    }
+}
+
+/// `HEAD`'s commit and branch from one child, as the predicate used to read
+/// them from `rev-parse HEAD` and `symbolic-ref --short HEAD`.
+///
+/// `--abbrev-ref=loose` shortens with the same loose rule `symbolic-ref
+/// --short` uses, so an ambiguous name keeps the same prefix. A detached
+/// `HEAD` prints the literal `HEAD`, which no checked-out branch can be
+/// called (Git refuses that branch name); it is rejected here as
+/// `symbolic-ref` used to fail. An unborn branch fails the whole call, as
+/// its `rev-parse HEAD` did.
+fn head_commit_and_branch(git_dir: &Path, home: &Path) -> Option<(Vec<u8>, Vec<u8>)> {
+    let output = git_dir_output(
+        git_dir,
+        home,
+        &["rev-parse", "HEAD", "--abbrev-ref=loose", "HEAD"],
+    )?;
+    let output = chomp(output);
+    let mut lines = output.split(|byte| *byte == b'\n');
+    let (Some(commit), Some(branch), None) = (lines.next(), lines.next(), lines.next()) else {
+        return None;
+    };
+    (branch != b"HEAD").then(|| (commit.to_vec(), branch.to_vec()))
+}
+
 /// Strip every trailing newline, like the shell's `$(...)`: the
 /// substitution drops all trailing newlines and nothing else.
 fn chomp(mut bytes: Vec<u8>) -> Vec<u8> {
@@ -402,12 +521,17 @@ pub fn live_git_matches_record(inputs: &LiveGitInputs<'_>, deps: &LiveGitDeps<'_
     if inputs.nonce != "adopted" && !(deps.generation_matches)(inputs.git_dir) {
         return false;
     }
-    let raw = git_dir_output(
-        inputs.git_dir,
-        inputs.home,
-        &["config", "--get-all", "remote.origin.url"],
-    )
-    .unwrap_or_default();
+    // Every identity key in one child: an absent key set reads exactly
+    // like the empty `--get-all` it replaces.
+    let config = IdentityConfig::parse(
+        &git_dir_output(
+            inputs.git_dir,
+            inputs.home,
+            &["config", "-z", "--get-regexp", IDENTITY_CONFIG_KEYS],
+        )
+        .unwrap_or_default(),
+    );
+    let raw = config.origin_urls_as_get_all();
     // NUL bytes cannot live in shell variables; scrub them the way
     // the plan lane's read loops do before framing.
     let scrubbed: Vec<u8> = raw.iter().copied().filter(|byte| *byte != 0).collect();
@@ -426,47 +550,29 @@ pub fn live_git_matches_record(inputs: &LiveGitInputs<'_>, deps: &LiveGitDeps<'_
     if identity != inputs.identity {
         return false;
     }
-    let branch = match git_dir_output(
-        inputs.git_dir,
-        inputs.home,
-        &["symbolic-ref", "--short", "HEAD"],
-    ) {
-        Some(output) => chomp(output),
-        None => return false,
+    let Some((commit, branch)) = head_commit_and_branch(inputs.git_dir, inputs.home) else {
+        return false;
     };
     if branch.as_slice() != inputs.branch.as_bytes() {
         return false;
     }
-    let commit = match git_dir_output(inputs.git_dir, inputs.home, &["rev-parse", "HEAD"]) {
-        Some(output) => chomp(output),
-        None => return false,
-    };
     if !commit_valid(&commit) {
         return false;
     }
     if path_bytes(inputs.git_dir) == home_child(inputs.home, ".dotfiles") {
-        let bare = match git_dir_output(
-            inputs.git_dir,
-            inputs.home,
-            &["config", "--bool", "core.bare"],
-        ) {
-            Some(output) => chomp(output),
-            None => return false,
-        };
-        match bare.as_slice() {
-            b"true" => {}
-            b"false" => {
-                let worktree =
-                    match git_dir_output(inputs.git_dir, inputs.home, &["config", "core.worktree"])
-                    {
-                        Some(output) => chomp(output),
-                        None => return false,
-                    };
-                if worktree.as_slice() != path_bytes(inputs.home) {
+        match config.bare() {
+            Some(true) => {}
+            Some(false) => {
+                // `git config core.worktree`: the last value, and an unset
+                // key fails the probe.
+                let Some(worktree) = config.worktree.as_ref() else {
+                    return false;
+                };
+                if chomp(worktree.clone()).as_slice() != path_bytes(inputs.home) {
                     return false;
                 }
             }
-            _ => return false,
+            None => return false,
         }
     } else if path_bytes(inputs.git_dir) == home_child(inputs.home, ".git") {
         let top = match git_home_output(inputs.home, &["rev-parse", "--show-toplevel"]) {

@@ -1034,6 +1034,17 @@ fn init_client(home: &TempDir, state: &TempDir, origin: &Path) {
 /// can execute; no such root is a test-environment error, not a pass. The
 /// wrapper execs the real Git directly, never a developer launcher.
 fn host_git_wrapper(label: &str) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    host_git_wrapper_running(label, "")
+}
+
+/// [`host_git_wrapper`] that runs the shell `snippet` (after logging, before
+/// the real Git) on every call. The wrapper must live outside the fixture
+/// `HOME` and the Dot checkout: doctor's host-Git selection skips any `git`
+/// under either, as client-provided launchers.
+fn host_git_wrapper_running(
+    label: &str,
+    snippet: &str,
+) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
     let checkout = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("checkout");
     let real = dot_test_support::real_tool("git");
     for exec_root in [false, true] {
@@ -1051,7 +1062,7 @@ fn host_git_wrapper(label: &str) -> (TempDir, std::path::PathBuf, std::path::Pat
         std::fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\n{snippet}exec '{}' \"$@\"\n",
                 log.display(),
                 real.display()
             ),
@@ -1059,13 +1070,31 @@ fn host_git_wrapper(label: &str) -> (TempDir, std::path::PathBuf, std::path::Pat
         .expect("git wrapper");
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
             .expect("wrapper mode");
-        // A `noexec` mount refuses to run it: try the next root.
-        let probe = Command::new(&wrapper)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // A `noexec` mount refuses to run it: try the next root. The probe
+        // asks for `--exec-path`, which no snippet reacts to. A sibling test
+        // thread that forks while this one still has the file open for
+        // writing makes exec fail with ETXTBSY until that child execs, and a
+        // saturated host can refuse the fork (EAGAIN); both transient
+        // refusals are retried, never read as `noexec`.
+        let mut attempts = 0;
+        let probe = loop {
+            let probe = Command::new(&wrapper)
+                .arg("--exec-path")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            match probe {
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::ETXTBSY | libc::EAGAIN))
+                        && attempts < 100 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                probe => break probe,
+            }
+        };
         if probe.is_ok_and(|status| status.success()) {
             let _ = std::fs::remove_file(&log);
             return (dir, wrapper, log);
@@ -2761,14 +2790,13 @@ fn hand_updated_host_reports_its_last_run_end_to_end() {
     let tools = TempDir::new_exec("doctor-last-run-tools").expect("tools");
     std::os::unix::fs::symlink(dot_test_support::real_tool("git"), tools.path().join("git"))
         .expect("git link");
-    for tool in ["id", "uname", "hostname"] {
-        let found = ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
-            .into_iter()
-            .map(|dir| Path::new(dir).join(tool))
-            .find(|candidate| candidate.is_file());
-        if let Some(found) = found {
-            std::os::unix::fs::symlink(found, tools.path().join(tool)).expect("tool link");
-        }
+    // `id -un` names the user; host and platform come from the kernel.
+    let id = ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+        .into_iter()
+        .map(|dir| Path::new(dir).join("id"))
+        .find(|candidate| candidate.is_file());
+    if let Some(id) = id {
+        std::os::unix::fs::symlink(id, tools.path().join("id")).expect("id link");
     }
     let cron = TempDir::new_exec("doctor-last-run-crontab").expect("cron tools");
     let crontab = cron.path().join("crontab");
@@ -4001,4 +4029,173 @@ fn directly_sourced_module_failure_names_the_module_line() {
         stdout.contains("    exited with status 1 at doctor.d/lib/broken.sh:2: false\n"),
         "{stdout}"
     );
+}
+
+/// The shell snippet for [`host_git_wrapper_running`] that holds the
+/// `--version` probe (one of the first core checks) for up to 20s, until
+/// `marker` exists, then records in `observed` whether it appeared.
+fn version_probe_waiting_for(marker: &Path, observed: &Path) -> String {
+    format!(
+        "if [ \"$1\" = --version ]; then\n\
+           i=0\n\
+           while [ ! -e '{marker}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done\n\
+           if [ -e '{marker}' ]; then echo concurrent; else echo serial; fi > '{observed}'\n\
+         fi\n",
+        marker = marker.display(),
+        observed = observed.display(),
+    )
+}
+
+/// P2: extensions start alongside the core checks, not after them, and their
+/// rows still render after every core row.
+#[test]
+fn extensions_run_while_the_core_checks_run() {
+    let extension = (
+        "10-early.sh".to_string(),
+        b"doctor() {\n  : >\"$HOME/extension-started\"\n  dot_doctor_section 'Early'\n  dot_doctor_ok 'early extension ran'\n}\n"
+            .to_vec(),
+    );
+    let (home, state) = doctor_extension_fixture("concurrent", &[extension]);
+    let (wrappers, _wrapper, _log) = host_git_wrapper_running(
+        "doctor-concurrent-git",
+        &version_probe_waiting_for(
+            &home.path().join("extension-started"),
+            &home.path().join("core-observed"),
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        wrappers.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = command(false, &home, &state, &[("PATH", &path)])
+        .output()
+        .expect("doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let observed = std::fs::read_to_string(home.path().join("core-observed")).unwrap_or_default();
+    assert_eq!(observed.trim(), "concurrent", "{stdout}");
+    let core = stdout.find("\ndot runtime\n").expect("core section");
+    let early = stdout.find("\nEarly\n").expect("extension section");
+    assert!(
+        core < early,
+        "extension rows render after the core: {stdout}"
+    );
+    assert!(stdout.contains("  ✓ early extension ran\n"), "{stdout}");
+}
+
+/// Extension output must not depend on whether the extensions finish before
+/// or after the core: run a window of fast and slow extensions repeatedly and
+/// compare every report with the serial one (`DOT_DOCTOR_JOBS=1`).
+#[test]
+fn concurrent_extension_rows_render_identically_to_serial() {
+    let extensions: Vec<(String, Vec<u8>)> = (0..12)
+        .map(|index| {
+            // Every third extension outlasts the core checks.
+            let pause = if index % 3 == 0 { "sleep 0.3\n  " } else { "" };
+            (
+                format!("{:02}-ext{index}.sh", 10 + index),
+                format!(
+                    "doctor() {{\n  {pause}dot_doctor_section 'Extension {index}'\n  dot_doctor_ok 'row a {index}'\n  dot_doctor_warn 'row b {index}' 'detail {index}'\n}}\n"
+                )
+                .into_bytes(),
+            )
+        })
+        .collect();
+    let (home, state) = doctor_extension_fixture("stress", &extensions);
+    let run = |jobs: &str| {
+        let output = command(false, &home, &state, &[("DOT_DOCTOR_JOBS", jobs)])
+            .output()
+            .expect("doctor");
+        (
+            output.status.code(),
+            normalize_stamp_age(&output.stdout),
+            output.stderr,
+        )
+    };
+    let serial = run("1");
+    let serial_text = String::from_utf8_lossy(&serial.1).into_owned();
+    assert!(serial_text.contains("Extension 11"), "{serial_text}");
+    assert_eq!(
+        serial_text.matches("  ⚠ row b ").count(),
+        12,
+        "{serial_text}"
+    );
+    for round in 0..5 {
+        let parallel = run("4");
+        assert_eq!(
+            parallel,
+            serial,
+            "round {round}:\n{}",
+            String::from_utf8_lossy(&parallel.1)
+        );
+    }
+}
+
+/// Extensions now finish while the core checks still run. A finished doctor
+/// extension must not clear the overlay probe answers the core reads, or the
+/// core would probe every overlay again.
+#[test]
+fn finished_extensions_keep_the_cores_overlay_probe_answers() {
+    let scope = TempDir::new("doctor-probe-cache-origin").expect("origin scope");
+    let origin = origin(scope.path());
+    let extension = (
+        "10-quick.sh".to_string(),
+        b"doctor() {\n  dot_doctor_section 'Quick'\n  dot_doctor_ok 'quick extension ran'\n  : >\"$HOME/extension-done\"\n}\n"
+            .to_vec(),
+    );
+    let (home, state) = doctor_extension_fixture("probe-cache", &[extension]);
+    let checkout = home.path().join(".dotfiles-probe");
+    let status = dot_test_support::git()
+        .args(["clone", "-q"])
+        .arg(&origin)
+        .arg(&checkout)
+        .status()
+        .expect("overlay clone");
+    assert!(status.success());
+    let descriptors = home.path().join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&descriptors).expect("overlays directory");
+    std::fs::write(
+        descriptors.join("20-probe.conf"),
+        format!("url={}\n", origin.display()),
+    )
+    .expect("descriptor");
+    // A logging Git whose `--version` probe (an early core check, before
+    // the overlay rows) holds the core until the extension has finished, so
+    // the extension's worker always completes while the core still runs.
+    let done = home.path().join("extension-done");
+    let (wrappers, _wrapper, log) = host_git_wrapper_running(
+        "doctor-probe-cache-git",
+        &format!(
+            "if [ \"$1\" = --version ]; then\n\
+               i=0\n\
+               while [ ! -e '{done}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done\n\
+               sleep 1\n\
+             fi\n",
+            done = done.display(),
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        wrappers.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = command(false, &home, &state, &[("PATH", &path)])
+        .output()
+        .expect("doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The healthy overlay folds into one row (cloned, origin, current).
+    assert!(
+        stdout.contains("  ✓ probe (~/.dotfiles-probe, "),
+        "{stdout}"
+    );
+    assert!(stdout.contains("quick extension ran"), "{stdout}");
+    let calls = std::fs::read_to_string(&log).expect("git log");
+    let probes = |needle: &str| {
+        calls
+            .lines()
+            .filter(|line| line.contains(".dotfiles-probe") && line.contains(needle))
+            .count()
+    };
+    assert_eq!(probes("rev-parse --show-toplevel"), 1, "{calls}");
+    assert_eq!(probes("remote.origin.url"), 1, "{calls}");
 }

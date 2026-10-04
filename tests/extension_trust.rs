@@ -333,3 +333,80 @@ fn retiring_file_distinguishes_usage_from_refusal() {
         Err(trust::Error::Refused)
     );
 }
+
+/// K10: a worker validates every overlay-owned support file an extension
+/// sources, and each validation used to re-run the overlay's two-process Git
+/// identity probe. The worker now verifies a checkout once and keeps
+/// running every per-file stat check.
+#[test]
+fn shell_worker_verifies_each_overlay_checkout_once() {
+    let fixture = TempDir::new_exec("trust-shell-memo").unwrap();
+    let home = fixture.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let ext = dir(&home, "ext", 0o700);
+    let checkout = home.join(".dotfiles-web");
+    git_repo(&checkout, "file:///repo/web.git");
+    for name in ["one", "two"] {
+        file(&checkout, &format!("home/ext/{name}"), b"x\n", 0o644);
+        std::os::unix::fs::symlink(format!("../.dotfiles-web/home/ext/{name}"), ext.join(name))
+            .unwrap();
+    }
+    let manifest = file(&home, "manifest", b"ext/one\tweb\next/two\tweb\n", 0o644);
+    let h = home.to_string_lossy();
+    let record =
+        format!("web|{h}/.dotfiles-web|file:///repo/web.git|{h}/conf/10-web.conf|false|git");
+    // A logging `git` in front of the real one counts the identity probes.
+    let bin = dir(fixture.path(), "bin", 0o700);
+    let log = fixture.path().join("git.log");
+    let real = dot_test_support::real_tool("git");
+    file(
+        &bin,
+        "git",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real.display()
+        )
+        .as_bytes(),
+        0o755,
+    );
+    let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("lib/dot/public/hook-runtime-v1");
+    let script = format!(
+        "set -euo pipefail\n\
+         OVERLAYS=('{record}')\n\
+         . '{runtime}/repos/config.sh'\n\
+         . '{runtime}/repos/overlays.sh'\n\
+         . '{runtime}/extension-trust.sh'\n\
+         _dot_extension_file_validate \"$DOT_EXTENSIONS_DIR/one\"\n\
+         _dot_extension_file_validate \"$DOT_EXTENSIONS_DIR/two\"\n\
+         chmod 666 \"$HOME/.dotfiles-web/home/ext/two\"\n\
+         if _dot_extension_file_validate \"$DOT_EXTENSIONS_DIR/two\"; then exit 3; fi\n",
+        runtime = runtime.display(),
+    );
+    let mut command = Command::new(dot_test_support::bash());
+    dot_test_support::isolate_git(&mut command);
+    let status = command
+        .args(["--noprofile", "--norc", "-c", &script])
+        .env("HOME", &home)
+        .env("DOT_EXTENSIONS_DIR", &ext)
+        .env("DOT_OVERLAY_MANIFEST", &manifest)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("LC_ALL", "C")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "validation (or the writable-file refusal) failed: {status:?}"
+    );
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    let probes = |needle: &str| calls.lines().filter(|line| line.contains(needle)).count();
+    assert_eq!(probes("rev-parse --show-toplevel"), 1, "{calls}");
+    assert_eq!(probes("remote.origin.url"), 1, "{calls}");
+}
