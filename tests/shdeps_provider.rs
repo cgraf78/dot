@@ -957,7 +957,7 @@ while :; do sleep 1; done
 
     fn signal_helper(&self) -> PathBuf {
         let helper = self.home.join("signal-helper.py");
-        write_exec(
+        dot_test_support::publish_fixture_executable(
             &helper,
             br#"#!/usr/bin/env python3
 import os
@@ -987,9 +987,8 @@ received = signal.sigwait(owned)
 with open(signal_file, "w", encoding="ascii") as marker:
     marker.write(f"{int(received)}\n")
 "#,
-        );
-        dot_test_support::wait_until_executable(&helper, &["--dot-fixture-ready"])
-            .expect("signal helper executable");
+        )
+        .expect("signal helper executable");
         helper
     }
 

@@ -473,7 +473,7 @@ fn git_dir_output(runtime: &crate::app::Runtime, git_dir: &Path, args: &[&str]) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt as _};
+    use std::os::unix::fs::MetadataExt;
 
     const CANNED_URL: &str = "https://example.invalid/dotfiles.git";
     const CANNED_HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -496,16 +496,16 @@ mod tests {
             std::fs::create_dir_all(&git_dir).expect("fixture git dir");
             let log = scope.path().join("invocations.log");
             let shim = scope.path().join("git");
-            std::fs::write(
+            // The readiness probe exits before logging, so counts stay
+            // exact; see `dot_test_support::publish_fixture_script`.
+            dot_test_support::publish_fixture_script(
                 &shim,
-                format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\ncase \"$3\" in\n  config) printf 'remote.origin.url\\n%s\\000core.bare\\nfalse\\000core.worktree\\n%s\\000' \"{CANNED_URL}\" \"{worktree}\";;\n  rev-parse) printf '%s\\n%s\\n' \"{CANNED_HEAD}\" \"{branch}\";;\nesac\n",
+                &format!(
+                    "printf '%s\\n' \"$*\" >> {log}\ncase \"$3\" in\n  config) printf 'remote.origin.url\\n%s\\000core.bare\\nfalse\\000core.worktree\\n%s\\000' \"{CANNED_URL}\" \"{worktree}\";;\n  rev-parse) printf '%s\\n%s\\n' \"{CANNED_HEAD}\" \"{branch}\";;\nesac\n",
                     log = log.display(),
                 ),
             )
             .expect("identity git shim");
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-                .expect("identity git mode");
             Self {
                 _scope: scope,
                 home,
@@ -573,16 +573,14 @@ mod tests {
             std::fs::create_dir_all(&git_dir).expect("legacy git dir");
             let log = scope.path().join("invocations.log");
             let shim = scope.path().join("git");
-            std::fs::write(
+            dot_test_support::publish_fixture_script(
                 &shim,
-                format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$3\" in\n  rev-parse) printf '%s\\n' \"$2\";;\n  symbolic-ref) printf 'main\\n';;\n  config)\n    case \"$4\" in\n      --get-all) printf '%s\\n' '{CANNED_URL}';;\n      --bool) printf '{bare}\\n';;\n      *) printf '/elsewhere\\n';;\n    esac;;\nesac\n",
+                &format!(
+                    "printf '%s\\n' \"$*\" >> '{log}'\ncase \"$3\" in\n  rev-parse) printf '%s\\n' \"$2\";;\n  symbolic-ref) printf 'main\\n';;\n  config)\n    case \"$4\" in\n      --get-all) printf '%s\\n' '{CANNED_URL}';;\n      --bool) printf '{bare}\\n';;\n      *) printf '/elsewhere\\n';;\n    esac;;\nesac\n",
                     log = log.display(),
                 ),
             )
             .expect("legacy git shim");
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-                .expect("legacy git mode");
             Self {
                 scope,
                 home,
