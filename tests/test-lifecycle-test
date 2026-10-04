@@ -987,6 +987,15 @@ PY
 # after its relay has been stopped. Exercise both a distinct stderr pipe and a
 # true stdout/stderr alias; malformed target control makes cleanup deliberately
 # fail closed so the diagnostic path is guaranteed to run.
+#
+# The wrapper drains its control socket on every supervision tick and kills the
+# session as soon as it reads the malformed frame, so the frame alone drives
+# the fail-closed teardown. The target publishes its pid before it poisons
+# control, and the test waits for the wrapper's own exit instead of signaling
+# it. Poisoning first let a tick between the two writes kill the target before
+# its pid file had content (the readiness wait then timed out against a wrapper
+# that had already exited 125); a signal sent after readiness could instead win
+# before the frame landed and turn the expected 125 into a clean 143.
 "$timeout_python" - "$timeout_command" <<'PY'
 import fcntl
 import os
@@ -1023,8 +1032,7 @@ def wait_for_content(path, deadline):
     """Waits until `path` holds non-empty text.
 
     `write_text` creates the file before its content lands, so an existence
-    poll can observe an empty pid file, and a SIGTERM delivered in that window
-    leaves it empty for good.
+    poll can observe an empty pid file.
     """
     while time.monotonic() < deadline:
         try:
@@ -1035,13 +1043,60 @@ def wait_for_content(path, deadline):
         time.sleep(0.01)
     return False
 
+def drain(fd):
+    """Returns whatever a pipe currently buffers, without blocking."""
+    os.set_blocking(fd, False)
+    chunks = []
+    try:
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.set_blocking(fd, True)
+    return b"".join(chunks)
+
+def unready(label, child, ready):
+    """Describes a wrapper whose target never published its pid.
+
+    A bare exit status cannot tell an early fail-closed exit from a target
+    that never ran, so report whether the pid file was created and the
+    wrapper's stderr where it is piped (a prefilled pipe holds none). A
+    still-running wrapper gets SIGTERM first so it can tear down its own
+    session and emit its diagnostic; SIGKILL would orphan the target.
+    """
+    if child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+    if child.stderr is not None:
+        stderr = child.communicate(timeout=5)[1]
+    else:
+        child.wait(timeout=5)
+        stderr = None
+    return (
+        label,
+        "target never published its pid",
+        ("pid file created", ready.exists()),
+        child.returncode,
+        stderr,
+    )
+
 wrapper = sys.argv[1]
 program = r'''
 import os, sys, time
 from pathlib import Path
 control = int(os.environ["DOT_OWNED_SESSION_CONTROL_FDS_V1"].split(":")[-1])
-os.write(control, b"invalid")
+# Publish readiness first: the wrapper may kill this session on the very next
+# tick after the malformed frame below lands.
 Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+os.write(control, b"invalid")
 while True:
     time.sleep(0.05)
 '''
@@ -1054,10 +1109,10 @@ with tempfile.TemporaryDirectory() as temporary:
         stderr=subprocess.PIPE,
         pass_fds=session_fds(),
     )
-    assert wait_for_content(ready, time.monotonic() + 5), healthy.poll()
-    os.kill(healthy.pid, signal.SIGTERM)
+    if not wait_for_content(ready, time.monotonic() + 5):
+        raise AssertionError(unready("healthy", healthy, ready))
     _stdout, healthy_stderr = healthy.communicate(timeout=5)
-    assert healthy.returncode == 125, healthy.returncode
+    assert healthy.returncode == 125, (healthy.returncode, healthy_stderr)
     assert b"could not verify child cleanup" in healthy_stderr, healthy_stderr
     target = int(ready.read_text(encoding="utf-8"))
     try:
@@ -1086,28 +1141,27 @@ for aliased in (False, True):
             pass_fds=session_fds(),
         )
         os.close(sink)
-        assert wait_for_content(ready, time.monotonic() + 5), (aliased, child.poll())
-        os.kill(child.pid, signal.SIGTERM)
+        if not wait_for_content(ready, time.monotonic() + 5):
+            raise AssertionError(unready(("aliased", aliased), child, ready))
         blocked = False
+        output = b""
         try:
             status = child.wait(timeout=5)
         except subprocess.TimeoutExpired:
             blocked = True
-            os.set_blocking(source, False)
-            while True:
-                try:
-                    if not os.read(source, 65536):
-                        break
-                except BlockingIOError:
-                    break
-            os.set_blocking(source, True)
+            # Unblock the wrapper, then collect what it finishes writing once
+            # it has exited so the report shows the stuck diagnostic.
+            output = drain(source)
             try:
                 status = child.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 os.kill(child.pid, signal.SIGKILL)
                 status = child.wait(timeout=2)
+            output += drain(source)
         os.close(source)
-        assert not blocked, ("wrapper diagnostic blocked", aliased, status)
+        assert not blocked, (
+            "wrapper diagnostic blocked", aliased, status, output.lstrip(b"x")
+        )
         assert status == 125, (aliased, status)
         target = int(ready.read_text(encoding="utf-8"))
         try:
