@@ -55,6 +55,8 @@ fn live_execution_ticks_and_preserves_failure_status() {
             false,
             true,
         );
+        // Ticks redraw an opened stage's row.
+        let _ = stage.start(b"Tools", None, 0, None);
         let mut ticks = Vec::new();
         let rc = run_to_log_with_ticks(
             &path,
@@ -88,6 +90,8 @@ fn live_ticks_clamp_zero_and_negative_quanta() {
             false,
             true,
         );
+        // Ticks redraw an opened stage's row.
+        let _ = stage.start(b"Tools", None, 0, None);
         let mut ticks = Vec::new();
         let rc = run_to_log_with_ticks(
             &path,

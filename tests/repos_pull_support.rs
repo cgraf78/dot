@@ -326,8 +326,16 @@ fn upstream_preparation_covers_success_and_failure_classes() {
         client_git_dir: String::new(),
         home: pushed.to_string_lossy().into_owned(),
     };
-    assert_eq!(prepare_base_upstream(&base), Ok(expected.clone()));
-    assert_eq!(prepare_overlay_upstream(&pushed, true, None), Ok(expected));
+    let mut diagnostics = Vec::new();
+    assert_eq!(
+        prepare_base_upstream(&base, &mut diagnostics),
+        Ok(expected.clone())
+    );
+    assert_eq!(
+        prepare_overlay_upstream(&pushed, true, None, &mut diagnostics),
+        Ok(expected)
+    );
+    assert_eq!(String::from_utf8_lossy(&diagnostics), "");
 
     let lonely = lonely_repo(&dir, "lonely");
     let base = Base {
@@ -335,8 +343,11 @@ fn upstream_preparation_covers_success_and_failure_classes() {
         client_git_dir: String::new(),
         home: lonely.to_string_lossy().into_owned(),
     };
-    assert_eq!(prepare_base_upstream(&base), Err(1));
-    assert_eq!(prepare_overlay_upstream(&lonely, true, None), Err(1));
+    assert_eq!(prepare_base_upstream(&base, &mut diagnostics), Err(1));
+    assert_eq!(
+        prepare_overlay_upstream(&lonely, true, None, &mut diagnostics),
+        Err(1)
+    );
     git(
         &lonely,
         &["remote", "add", "origin", "/definitely/missing/dot.git"],
@@ -345,14 +356,38 @@ fn upstream_preparation_covers_success_and_failure_classes() {
     git(&lonely, &["config", "branch.main.merge", "refs/heads/main"]);
     let head = git(&lonely, &["rev-parse", "HEAD"]);
     git(&lonely, &["update-ref", "refs/remotes/origin/main", &head]);
-    assert_eq!(prepare_base_upstream(&base), Err(2));
-    assert_eq!(prepare_overlay_upstream(&lonely, true, None), Err(2));
+    assert_eq!(prepare_base_upstream(&base, &mut diagnostics), Err(2));
+    // The failed fetch's own diagnostics reach the caller's stream, every
+    // line indented under the stage, instead of the inherited descriptor.
+    let fetch_output = String::from_utf8(std::mem::take(&mut diagnostics)).expect("UTF-8");
+    assert!(fetch_output.contains("fatal:"), "{fetch_output:?}");
+    assert!(
+        fetch_output
+            .lines()
+            .all(|line| line.is_empty() || line.starts_with("    ")),
+        "{fetch_output:?}"
+    );
+    // Optional overlays keep their failed fetch quiet.
+    assert_eq!(
+        prepare_overlay_upstream(&lonely, true, None, &mut diagnostics),
+        Err(2)
+    );
+    assert_eq!(String::from_utf8_lossy(&diagnostics), "");
+    assert_eq!(
+        prepare_overlay_upstream(&lonely, false, None, &mut diagnostics),
+        Err(2)
+    );
+    let overlay_output = String::from_utf8(diagnostics.clone()).expect("UTF-8");
+    assert!(
+        overlay_output.starts_with("    fatal:"),
+        "{overlay_output:?}"
+    );
     let missing = Base {
         topology: Topology::Missing,
         client_git_dir: String::new(),
         home: dir.path().join("missing").to_string_lossy().into_owned(),
     };
-    assert_eq!(prepare_base_upstream(&missing), Err(1));
+    assert_eq!(prepare_base_upstream(&missing, &mut diagnostics), Err(1));
 }
 
 #[test]

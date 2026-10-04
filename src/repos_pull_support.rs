@@ -239,17 +239,50 @@ fn rev_parse(prefix: &[std::ffi::OsString], args: &[&str]) -> Option<String> {
     Some(text)
 }
 
+/// Run `git fetch` under `prefix` in the foreground, its diagnostics
+/// indented under the stage on `warnings` instead of the inherited
+/// descriptor: written straight to the terminal they landed at the end
+/// of the live Repos row. Stdin and stdout stay inherited, so credential
+/// and SSH prompts (which use the controlling terminal) keep working.
+/// A failed diagnostic write never fails the fetch; `warnings` already
+/// remembers undelivered output for the exit status.
+fn fetch(prefix: &[std::ffi::OsString], args: &[&str], warnings: &mut dyn std::io::Write) -> i32 {
+    /// Forwards to `inner`, reporting success either way.
+    struct Lenient<'a>(&'a mut dyn std::io::Write);
+    impl std::io::Write for Lenient<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.write_all(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            let _ = self.0.flush();
+            Ok(())
+        }
+    }
+    let mut cmd = crate::init_client_identity::host_git_command();
+    cmd.args(prefix)
+        .args(args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit());
+    let mut indented = crate::progress_ui::IndentedLines::new(warnings);
+    crate::cleanup::run_foreground_forward_stderr(cmd, &mut Lenient(&mut indented))
+}
+
 /// `_repo_prepare_base_upstream`: fetch the base checkout's upstream
 /// remote and resolve the fetched tip. Returns the commit id, or the
 /// shell's numeric failure: 1 for no usable upstream, 2 for a failed
-/// fetch, 3 for an unresolvable tip.
-pub fn prepare_base_upstream(base: &crate::repos_base::Base) -> Result<String, u8> {
+/// fetch, 3 for an unresolvable tip. Fetch diagnostics go to `warnings`.
+pub fn prepare_base_upstream(
+    base: &crate::repos_base::Base,
+    warnings: &mut dyn std::io::Write,
+) -> Result<String, u8> {
     let prefix = base.git_prefix().ok_or(1u8)?;
     let upstream = upstream_name(&prefix).ok_or(1u8)?;
     let remote = upstream_remote(&upstream).ok_or(1u8)?;
-    if crate::repos_git::run_git_streaming(
+    if fetch(
         &prefix,
         &["fetch", "--quiet", "--no-write-fetch-head", remote],
+        warnings,
     ) != 0
     {
         return Err(2);
@@ -261,12 +294,14 @@ pub fn prepare_base_upstream(base: &crate::repos_base::Base) -> Result<String, u
 /// `_repo_prepare_overlay_upstream`: fetch one overlay's upstream
 /// remote and resolve the fetched tip. Same shape as
 /// [`prepare_base_upstream`], except an unresolvable tip is also a 2
-/// and fetch diagnostics stay quiet when `quiet_errors` holds. The fetch
-/// is skipped when `prefetch` holds a probe proving it would change nothing.
+/// and fetch diagnostics stay quiet when `quiet_errors` holds (otherwise
+/// they go to `warnings`). The fetch is skipped when `prefetch` holds a
+/// probe proving it would change nothing.
 pub fn prepare_overlay_upstream(
     path: &std::path::Path,
     quiet_errors: bool,
     prefetch: Option<&crate::repos_prefetch::Prefetch>,
+    warnings: &mut dyn std::io::Write,
 ) -> Result<String, u8> {
     let prefix = vec![std::ffi::OsString::from("-C"), path.as_os_str().to_owned()];
     let upstream = upstream_name(&prefix).ok_or(1u8)?;
@@ -279,7 +314,7 @@ pub fn prepare_overlay_upstream(
     } else if quiet_errors {
         crate::repos_base::run_git(&prefix, &fetch).is_some_and(|output| output.status.success())
     } else {
-        crate::repos_git::run_git_streaming(&prefix, &fetch) == 0
+        self::fetch(&prefix, &fetch, warnings) == 0
     };
     if !fetched {
         return Err(2);

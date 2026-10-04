@@ -1281,6 +1281,8 @@ mod tests {
         // proves the waiter stayed until completion.
         let palette = crate::progress_ui::Palette::empty();
         let mut stage = crate::progress_ui::Stage::begin(palette, "5", false, true, false, true);
+        // Heartbeats redraw an opened stage's row.
+        let _ = stage.start(b"Configs", None, crate::update_engine::now_secs(), None);
         let mut out = Vec::new();
         let mut beat = Heartbeat::new(crate::update_engine::now_secs(), 0);
         std::thread::scope(|scope| {

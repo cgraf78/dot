@@ -4850,15 +4850,45 @@ pub(crate) fn run_foreground_status(command: Command) -> i32 {
 /// Stderr stays inherited so progress keeps streaming; stdin is the
 /// caller's. Forwarding is unbounded by design (the relay owns
 /// backpressure), so a whole-repo diff never trips a capture limit.
-pub(crate) fn run_foreground_forward_stdout(
+pub(crate) fn run_foreground_forward_stdout(command: Command, out: &mut dyn std::io::Write) -> i32 {
+    run_foreground_forward(command, Forwarded::Stdout, out)
+}
+
+/// Run a cooperative foreground child like [`run_foreground_status`],
+/// but pipe its stderr and forward every drained chunk to `err`
+/// instead of inheriting the descriptor.
+///
+/// A live progress row is drawn through the output relay; a child
+/// writing straight to the inherited descriptor lands at the end of
+/// that unfinished row (and races the relay's queue). Forwarding
+/// keeps one ordered writer, so the caller's stream can start the
+/// diagnostic on a fresh line. Stdin and stdout stay the caller's,
+/// so prompts (which use the controlling terminal) keep working.
+pub(crate) fn run_foreground_forward_stderr(command: Command, err: &mut dyn std::io::Write) -> i32 {
+    run_foreground_forward(command, Forwarded::Stderr, err)
+}
+
+/// Which descriptor [`run_foreground_forward`] pipes.
+enum Forwarded {
+    Stdout,
+    Stderr,
+}
+
+/// Shared body of the foreground forwarders: pipe one descriptor of a
+/// cooperative foreground child and forward each drained chunk to `sink`.
+fn run_foreground_forward(
     mut command: Command,
-    out: &mut dyn std::io::Write,
+    forwarded: Forwarded,
+    sink: &mut dyn std::io::Write,
 ) -> i32 {
     let (mut reader, writer) = match SessionCapture::new() {
         Ok(pair) => pair,
         Err(_) => return 127,
     };
-    command.stdout(writer);
+    match forwarded {
+        Forwarded::Stdout => command.stdout(writer),
+        Forwarded::Stderr => command.stderr(writer),
+    };
     let mut scratch = Vec::new();
     session_end_status(supervise_child_with_policy(
         command,
@@ -4871,7 +4901,7 @@ pub(crate) fn run_foreground_forward_stdout(
             };
             let mut remaining = usize::MAX;
             let _overflow = reader.drain(&mut scratch, &mut remaining, budget, false)?;
-            out.write_all(&scratch)?;
+            sink.write_all(&scratch)?;
             scratch.clear();
             Ok(())
         },

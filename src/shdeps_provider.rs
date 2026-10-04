@@ -1661,8 +1661,10 @@ fn run_update(
                     // whole seconds instead of freezing between events.
                     // Final passes skip it (the finish row follows
                     // immediately) and failures propagate like event
-                    // renders.
-                    if result.is_ok() && !final_pass {
+                    // renders. A paused prompt skips it too: the provider
+                    // is asking on the terminal (sudo), and a redraw would
+                    // erase its question until the next event resumes.
+                    if result.is_ok() && !final_pass && !session.prompt_active {
                         let now = crate::update_engine::now_secs();
                         if beat.poll(now) {
                             heartbeat_out.write_all(&stage.tick(now))?;
@@ -2328,7 +2330,12 @@ fn handle_event(
     };
     match text(&fields, "event") {
         b"prompt" => {
-            let (bytes, active, ack) = crate::shdeps_ui_render::prompt_pause(session, *live, "1");
+            let (mut bytes, active, ack) =
+                crate::shdeps_ui_render::prompt_pause(session, *live, "1");
+            // The row on screen is the stage's: `live` only tracks rows this
+            // renderer drew itself, so without this the prompt (sudo asking
+            // on the terminal) printed at the end of the unfinished row.
+            bytes.extend_from_slice(&stage.clear());
             output.write_all(&bytes)?;
             output.flush()?;
             *live = active;
@@ -2827,6 +2834,8 @@ mod tests {
         let mut session = crate::shdeps_ui_render::reset(false);
         let mut stage =
             crate::progress_ui::Stage::begin(palette.clone(), "5", false, true, false, true);
+        // Provider events always arrive inside the opened Tools stage.
+        let _ = stage.start(b"Tools", None, crate::update_engine::now_secs(), None);
         let mut output = Vec::new();
         let mut live = true;
         let mut beat = crate::progress_ui::Heartbeat::new(
@@ -2909,7 +2918,10 @@ mod tests {
         // status cannot appear; its 8-cell prefix proves ESC became a
         // space (`warn [31`, never `warn\x1b[31`).
         assert!(warning.windows(8).any(|window| window == b"warn [31"));
-        assert!(!warning.contains(&0x1b));
+        // The only escape left is the row's own erase in front of the note
+        // (the event arrives while the Tools row is live).
+        let note = warning.strip_prefix(b"\r\x1b[K").unwrap_or(&warning);
+        assert!(!note.contains(&0x1b));
         let phase = render_event(r#"{"event":"phase","label":"Bad\nLabel","done":1,"total":2}"#);
         assert!(phase.windows(9).any(|window| window == b"Bad Label"));
         assert!(!phase.windows(9).any(|window| window == b"Bad\nLabel"));
@@ -2995,6 +3007,7 @@ mod tests {
         };
         let mut stage =
             crate::progress_ui::Stage::begin(palette.clone(), "5", false, true, false, true);
+        let _ = stage.start(b"Tools", None, crate::update_engine::now_secs(), None);
         let mut output = Vec::new();
         let mut errors = Vec::new();
         let mut beat = crate::progress_ui::Heartbeat::new(crate::update_engine::now_secs(), 0);

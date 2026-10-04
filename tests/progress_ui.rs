@@ -537,3 +537,43 @@ fn heartbeat_zero_interval_renders_every_poll() {
     let mut beat = Heartbeat::new(50, -3);
     assert!(beat.poll(50));
 }
+
+#[test]
+fn indented_lines_indent_child_output_however_it_is_chunked() {
+    use std::io::Write as _;
+    let mut sink = Vec::new();
+    {
+        let mut indented = IndentedLines::new(&mut sink);
+        indented.write_all(b"fatal: one\nfatal: ").unwrap();
+        indented.write_all(b"two\n\nPlease ").unwrap();
+        indented.write_all(b"retry\n").unwrap();
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&sink),
+        "    fatal: one\n    fatal: two\n\n    Please retry\n"
+    );
+    assert_eq!(CHILD_OUTPUT_INDENT, b"    ");
+}
+
+#[test]
+fn stage_redraws_nothing_before_its_first_stage_opens() {
+    // Progress reported before any stage starts (an overlay pull on a client
+    // without a base checkout) used to render `[0/N]` rows with no label and
+    // an elapsed time counted from the epoch.
+    for live in [true, false] {
+        let mut stage = Stage::begin(palette(), "5", false, live, false, true);
+        assert!(
+            stage
+                .update(b"overlays", 1_700_000_000, Some("1"))
+                .is_empty()
+        );
+        assert!(stage.tick(1_700_000_000).is_empty());
+        assert!(
+            stage
+                .maybe_progress(b"overlay-0", 1, 2, 1_700_000_000, None, "8")
+                .is_empty()
+        );
+        assert!(!stage.start(b"Repos", None, 10, None).is_empty());
+        assert!(!stage.update(b"overlay-0", 11, Some("1")).is_empty());
+    }
+}

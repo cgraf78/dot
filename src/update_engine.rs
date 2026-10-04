@@ -1714,13 +1714,7 @@ fn discover_active(
     if report {
         warn_data_keys(inputs, &state.unknown_keys, err);
     }
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = err.write_all(format!("{error:?}\n").as_bytes());
-            Err(())
-        }
-    }
+    result.map_err(|error| report_discovery_error(inputs, err, &error))
 }
 
 /// Profile-aware discovery with a caller-owned selected list. The discovery
@@ -1759,12 +1753,26 @@ fn discover_selected(
     let result =
         crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches);
     warn_data_keys(inputs, &state.unknown_keys, err);
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = err.write_all(format!("{error}\n").as_bytes());
-            Err(())
-        }
+    result.map_err(|error| report_discovery_error(inputs, err, &error))
+}
+
+/// Print a failed overlay discovery the way every other diagnostic prints:
+/// a descriptor problem as its `  warning:` row, an announced failure as its
+/// `dot: overlay:` line, and the silent failures not at all (they render
+/// empty and must not leave a blank line).
+fn report_discovery_error(
+    inputs: &EngineInputs<'_>,
+    err: &mut dyn std::io::Write,
+    error: &crate::overlays::Error,
+) {
+    let text = error.to_string();
+    if text.is_empty() {
+        return;
+    }
+    if matches!(error, crate::overlays::Error::Warning(_)) {
+        warn_row(err, inputs.palette, &text);
+    } else {
+        let _ = writeln!(err, "{text}");
     }
 }
 
@@ -3547,25 +3555,38 @@ pub fn run_update(
             return error.code();
         }
     };
+    let inputs = gathered.inputs();
     // Every engine row streams through these sinks as its phase files it;
     // either sink remembers a delivery failure so the exit status still
-    // reports undelivered output exactly like the old end-of-run flush.
+    // reports undelivered output exactly like the old end-of-run flush. Both
+    // go through one console so a warning never lands on a live row.
+    let console = crate::live_console::LiveConsole::new(
+        &mut *streams.stdout,
+        &mut *streams.stderr,
+        inputs.live,
+    );
+    let mut console_out = console.stdout();
+    let mut console_err = console.stderr();
     let mut out = LiveSink {
-        inner: &mut *streams.stdout,
+        inner: &mut console_out,
         failed: false,
     };
     let mut err = LiveSink {
-        inner: &mut *streams.stderr,
+        inner: &mut console_err,
         failed: false,
     };
     let mut degraded = crate::update_status::Degraded::default();
-    let code = run_gathered(
-        &gathered.inputs(),
-        &mut out,
-        &mut err,
-        started,
-        &mut degraded,
-    );
+    let code = run_gathered(&inputs, &mut out, &mut err, started, &mut degraded);
+    // A partial stderr line the console held back, or a row an interrupted
+    // stage left open, is delivered here. Only a clean run turns a failed
+    // delivery into status 1: a provider that exited by signal makes its
+    // supervisor abort queued output, which leaves the relay rejecting these
+    // writes, and the provider's 128+signal status must stand.
+    if let Err(error) = console.finish() {
+        if code == 0 {
+            err.record(error);
+        }
+    }
     if out.failed() || err.failed() {
         return 1;
     }

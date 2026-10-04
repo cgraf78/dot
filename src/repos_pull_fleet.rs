@@ -1239,6 +1239,8 @@ mod tests {
         // sleeping out a production second.
         let palette = crate::progress_ui::Palette::empty();
         let mut stage = Stage::begin(palette, "5", false, true, false, true);
+        // Heartbeats redraw an opened stage's row.
+        let _ = stage.start(b"Repos", None, crate::update_engine::now_secs(), None);
         let mut out = Vec::new();
         let mut beat = Heartbeat::new(crate::update_engine::now_secs(), 0);
         let (tx, rx) = std::sync::mpsc::channel::<()>();

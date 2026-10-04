@@ -1014,11 +1014,20 @@ impl Stage {
         }
     }
 
+    /// Whether any stage has opened yet. Before the first [`Stage::start`]
+    /// there is no row to redraw: progress reported then (an overlay pull
+    /// on a client without a base checkout runs before any stage opens)
+    /// would render a `[0/N]` row with no label and an elapsed time
+    /// counted from the epoch.
+    fn started(&self) -> bool {
+        self.index > 0
+    }
+
     /// `_ui_stage_update`: re-render with a new detail — live redraw,
     /// newline progress for verbose non-live callers, silence
     /// otherwise.
     pub fn update(&mut self, detail: &[u8], now_secs: i64, verbose: Option<&str>) -> Vec<u8> {
-        if self.quiet {
+        if self.quiet || !self.started() {
             return Vec::new();
         }
         self.detail = detail.to_vec();
@@ -1060,7 +1069,7 @@ impl Stage {
     /// otherwise. An empty detail reads `working`, like the shell
     /// default when no stage ever started.
     pub fn tick(&mut self, now_secs: i64) -> Vec<u8> {
-        if self.quiet || !self.live {
+        if self.quiet || !self.live || !self.started() {
             return Vec::new();
         }
         let detail = if self.detail.is_empty() {
@@ -1107,6 +1116,15 @@ impl Stage {
             &stamp,
             self.multibyte,
         ));
+        out
+    }
+
+    /// `_ui_clear_live` for this stage: erase its live row if one is on
+    /// screen, so something else (a prompt on the terminal) can use the line.
+    /// The next redraw puts the row back.
+    pub fn clear(&mut self) -> Vec<u8> {
+        let (out, live_active) = clear_live(self.live_active);
+        self.live_active = live_active;
         out
     }
 
@@ -1332,6 +1350,49 @@ pub fn warn_line(palette: &Palette, message: &[u8]) -> Vec<u8> {
     out.extend_from_slice(palette.reset.as_bytes());
     out.push(b'\n');
     out
+}
+
+/// Indent for a child process's own output shown under a stage: four
+/// spaces, the column of [`detail`] rows and of hook `output:` bodies,
+/// one level below Dot's own `  warning:` rows.
+pub const CHILD_OUTPUT_INDENT: &[u8] = b"    ";
+
+/// A writer that indents every line of a child's output with
+/// [`CHILD_OUTPUT_INDENT`], however the bytes are chunked. Empty lines
+/// stay empty (no trailing blanks), and nothing else is rewritten: the
+/// child's own wording and prefixes (`fatal:`, `error:`) pass through.
+pub struct IndentedLines<'a> {
+    inner: &'a mut dyn std::io::Write,
+    at_line_start: bool,
+}
+
+impl<'a> IndentedLines<'a> {
+    /// Indent everything written to `inner`, starting at a line start.
+    pub fn new(inner: &'a mut dyn std::io::Write) -> Self {
+        IndentedLines {
+            inner,
+            at_line_start: true,
+        }
+    }
+}
+
+impl std::io::Write for IndentedLines<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut rendered = Vec::with_capacity(bytes.len() + CHILD_OUTPUT_INDENT.len());
+        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+            if self.at_line_start && line != b"\n" {
+                rendered.extend_from_slice(CHILD_OUTPUT_INDENT);
+            }
+            rendered.extend_from_slice(line);
+            self.at_line_start = line.ends_with(b"\n");
+        }
+        self.inner.write_all(&rendered)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// `_ui_normal_shell_name`: basename without one leading dash, kept

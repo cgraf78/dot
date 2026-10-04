@@ -176,9 +176,19 @@ pub fn pull_repo(
         && (inputs.verbose || rc != 0);
     if loud {
         if let Ok(content) = std::fs::read_to_string(&log) {
-            let visible: Vec<&str> = content
+            // Git's own lines, indented under the Repos stage like any child
+            // output (empty lines stay empty).
+            let indent = String::from_utf8_lossy(crate::progress_ui::CHILD_OUTPUT_INDENT);
+            let visible: Vec<String> = content
                 .lines()
                 .filter(|line| !is_up_to_date_noise(line))
+                .map(|line| {
+                    if line.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{indent}{line}")
+                    }
+                })
                 .collect();
             if !visible.is_empty() {
                 inputs.log.dim(out, &visible.join("\n"));
@@ -1020,7 +1030,7 @@ pub fn pull_base(
             return failed();
         }
     }
-    let upstream = match prepare_base_upstream(inputs.base) {
+    let upstream = match prepare_base_upstream(inputs.base, warnings) {
         Ok(upstream) => upstream,
         Err(_) => return failed(),
     };

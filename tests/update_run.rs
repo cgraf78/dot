@@ -883,3 +883,250 @@ fn cron_base_pull_failure_records_fail_and_keeps_success_stamps() {
     let converged = dot::update_status::read_last_converged(&state).expect("convergence stamp");
     assert_eq!((converged.at, converged.failing.as_str()), (OLD, ""));
 }
+
+/// Run the native binary on a fresh pseudo-terminal as its controlling,
+/// foreground terminal (stdin, stdout, and stderr all on the slave), the way
+/// an interactive shell starts it. Returns the exit status and every byte the
+/// terminal received, in arrival order across both output streams. The line
+/// discipline's output processing stays on, so newlines arrive as `\r\n`.
+fn dot_on_pty(argv: &[&str], home: &Path, state: &Path) -> (Option<i32>, Vec<u8>) {
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: openpty initializes both descriptors; null optional pointers
+    // request the platform default terminal attributes and window size.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                // macOS takes *mut termios/*mut winsize while Linux takes
+                // *const; null_mut() satisfies both through coercion.
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0,
+        "openpty failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // Close-on-exec, so a child another test thread spawns meanwhile cannot
+    // inherit either end and hold the terminal open past this run.
+    for fd in [master, slave] {
+        // SAFETY: F_SETFD on a descriptor openpty just returned.
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    // SAFETY: successful openpty returned two uniquely owned descriptors.
+    let master = unsafe { std::fs::File::from_raw_fd(master) };
+    let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+    let mut cmd = bin();
+    client_env(&mut cmd, home, state);
+    cmd.env("DOT_BASH", home.join("absent-old-update-engine"));
+    cmd.args(argv)
+        .stdin(Stdio::from(slave.try_clone().expect("PTY stdin")))
+        .stdout(Stdio::from(slave.try_clone().expect("PTY stdout")))
+        .stderr(Stdio::from(slave));
+    // SAFETY: the post-fork child is single threaded; these calls make fd 0's
+    // PTY its controlling, foreground terminal before exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0
+                || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0
+                || libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) < 0
+            {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = cmd.spawn().expect("PTY-backed dot");
+    // The command still owns its slave clones; drop them so the master sees
+    // EOF once the child and its descendants close theirs.
+    drop(cmd);
+    // Drain the master for the child's whole lifetime: an unread master
+    // stalls the child on a full terminal buffer, and BSD line disciplines
+    // also hold exit teardown until pending output drains. The drainer ends
+    // at EOF or EIO once every slave descriptor has closed.
+    let (drained, collected) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut master = master;
+        let mut output = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match master.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => output.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        let _ = drained.send(output);
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("observe PTY dot") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("PTY-backed dot did not finish within its deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    // The drainer gets its own grace: an exit seen right at the deadline
+    // must not starve it of the time to hand over what it read.
+    let grace = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .max(std::time::Duration::from_secs(5));
+    let output = collected
+        .recv_timeout(grace)
+        .expect("PTY output never reached end of file after dot exited");
+    (status.code(), output)
+}
+
+/// The bytes a terminal shows before `index` on the same visual line: back to
+/// the last newline or the last carriage-return line erase (`\r\x1b[K`),
+/// whichever is later. A message that starts on its own line has only its
+/// indentation here; one glued to a progress row has the row's text.
+fn visual_line_prefix(output: &[u8], index: usize) -> &[u8] {
+    let head = &output[..index];
+    let after_newline = head
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1);
+    const ERASE: &[u8] = b"\r\x1b[K";
+    let after_erase = head
+        .windows(ERASE.len())
+        .rposition(|window| window == ERASE)
+        .map_or(0, |at| at + ERASE.len());
+    &head[after_newline.max(after_erase)..]
+}
+
+/// `bytes` without SGR colour sequences (`ESC [ <params> m`), keeping every
+/// other control byte, so layout checks read the same with or without colour.
+fn strip_colour(bytes: &[u8]) -> Vec<u8> {
+    let mut plain = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"\x1b[") {
+            let params = bytes[index + 2..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit() || **byte == b';')
+                .count();
+            if bytes.get(index + 2 + params) == Some(&b'm') {
+                index += params + 3;
+                continue;
+            }
+        }
+        plain.push(bytes[index]);
+        index += 1;
+    }
+    plain
+}
+
+/// Every start offset of `needle` in `haystack`.
+fn occurrences(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, window)| *window == needle)
+        .map(|(at, _)| at)
+        .collect()
+}
+
+#[test]
+fn terminal_update_prints_child_errors_on_their_own_indented_lines() {
+    // The base fetch fails while the Repos row is live on the terminal. Its
+    // `fatal:` lines used to land at the end of that unfinished row and wrap;
+    // each must start on a fresh line, indented under the stage.
+    let scratch = Scratch::new("update-run-pty-fetch-failure").expect("scratch dir");
+    let (home, state) = unreachable_base_client(&scratch, "pty");
+    let (code, output) = dot_on_pty(&["update"], &home, &state);
+    let output = strip_colour(&output);
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(code, Some(1), "{text}");
+    let fatal = occurrences(&output, b"fatal:");
+    assert!(
+        !fatal.is_empty(),
+        "no fetch diagnostic reached the terminal: {text}"
+    );
+    for at in fatal {
+        assert_eq!(
+            String::from_utf8_lossy(visual_line_prefix(&output, at)),
+            "    ",
+            "fetch diagnostic shares a line with other output: {text}"
+        );
+    }
+    // The run still closes the stage table: the failed Repos row and the
+    // completion line each sit on their own line after the diagnostic.
+    for row in [&b"[1/5] Repos      failed"[..], b"Done with errors in "] {
+        let at = *occurrences(&output, row)
+            .first()
+            .unwrap_or_else(|| panic!("missing {:?}: {text}", String::from_utf8_lossy(row)));
+        assert!(
+            visual_line_prefix(&output, at).is_empty(),
+            "{:?} does not start its own line: {text}",
+            String::from_utf8_lossy(row)
+        );
+    }
+}
+
+#[test]
+fn piped_update_prints_child_errors_as_plain_indented_lines() {
+    // Without a terminal (cron, pipes) the same failure prints one message
+    // per line with no escape sequences or carriage returns, the fetch
+    // diagnostic indented under the stage like hook output.
+    let scratch = Scratch::new("update-run-piped-fetch-failure").expect("scratch dir");
+    let (home, state) = unreachable_base_client(&scratch, "piped");
+    let output = dot_env(&["update"], &home, &state, &[]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    for (name, stream) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        assert!(
+            !stream.iter().any(|byte| *byte == b'\r' || *byte == 0x1b),
+            "{name} carries terminal control bytes: {output:?}"
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let fatal: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("fatal:"))
+        .collect();
+    assert!(!fatal.is_empty(), "{output:?}");
+    for line in fatal {
+        assert!(
+            line.starts_with("    fatal: "),
+            "unindented diagnostic {line:?}: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn invalid_overlay_descriptor_prints_its_warning_not_a_debug_dump() {
+    // Overlay discovery failures reached stderr through `{:?}`, printing the
+    // Rust enum (`Warning("invalid overlay descriptor ...")`) instead of the
+    // warning line every other path prints.
+    let scratch = Scratch::new("update-run-invalid-descriptor").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "invalid", &overlay_origin, &base_origin);
+    check_update(&["update"], &home, &state);
+    let descriptor = home.join(".config/dot/overlays.d/zz-bad.conf");
+    std::fs::write(&descriptor, b"url=file:///nonexistent\nsync=bogus\n").expect("descriptor");
+    let output = dot(&["update"], &home, &state);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "  warning: invalid overlay descriptor {}: unknown sync value: bogus\n",
+            descriptor.display()
+        ),
+    );
+}
