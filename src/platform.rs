@@ -3,7 +3,8 @@
 //! Owns WSL detection (env vars or a
 //! case-insensitive `microsoft` in the kernel osrelease), `uname -s`
 //! platform names (`darwin` canonicalized to `macos`), short-hostname
-//! detection, comma-spec matching with `!` exclusions, Termux's dual
+//! detection (both read from the kernel through libc, not by spawning
+//! `uname` and `hostname`), comma-spec matching with `!` exclusions, Termux's dual
 //! `linux`+`android` identity, slash-vs-PATH tool lookup, and the
 //! sudo escalation ladder. Lowercasing is ASCII-only, matching the
 //! shell's `${var,,}` under the C locale the engine pins.
@@ -18,7 +19,7 @@ use std::path::Path;
 pub enum Error {
     /// Wrong arity or malformed value (shell exit 2).
     Usage,
-    /// Detection failed: `uname`/`hostname` unusable (shell exit 1).
+    /// Detection failed: `uname(2)`/`gethostname(2)` failed (shell exit 1).
     Unavailable,
 }
 
@@ -62,13 +63,67 @@ pub fn platform_name(uname_s: &str, wsl: bool) -> String {
 /// can change mid-process: the kernel, hostname, and WSL markers
 /// are immutable for the run's lifetime (production code never
 /// mutates the environment). Only successful detections memoize;
-/// a failed `uname`/`hostname` re-probes so a transient spawn
-/// failure cannot pin `Unavailable`.
+/// a failed probe re-probes rather than pinning `Unavailable`.
 static PLATFORM_MEMO: crate::memo::Memo<String> = crate::memo::Memo::new();
 static HOST_MEMO: crate::memo::Memo<String> = crate::memo::Memo::new();
 
+/// The kernel name `uname -s` prints: `uname(2)`'s `sysname`.
+///
+/// Read through libc instead of spawning `uname`: every supervised
+/// child costs a fork plus, for a strict session, a host-wide
+/// process-table walk, and `dot doctor` and `dot update` both ask on
+/// every run. The system call is what the `uname` binary itself
+/// reports, so the answer is unchanged, and it also works where no
+/// `uname` is on `PATH`.
+pub fn kernel_name() -> Option<String> {
+    // SAFETY: `utsname` is plain old data; zeroed is a valid value
+    // and `uname` only writes into the struct it is handed.
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut name) } != 0 {
+        return None;
+    }
+    let value = c_field(&name.sysname);
+    (!value.is_empty()).then_some(value)
+}
+
+/// The short host name `hostname -s` prints: `gethostname(2)` cut
+/// at the first dot.
+///
+/// No resolver lookup is involved: `hostname -s` in the Debian
+/// `hostname` package (the Linux distributions' `hostname`), BSD and
+/// macOS `hostname`, and BusyBox all cut the kernel host name at the
+/// first dot. Like [`kernel_name`], the system call replaces a child
+/// process on every run and keeps working where no `hostname` binary
+/// is installed (minimal container images).
+pub fn short_hostname() -> Option<String> {
+    // Host names are at most 255 bytes on Linux and macOS
+    // (HOST_NAME_MAX); the spare byte guarantees a terminator.
+    let mut buffer = [0 as libc::c_char; 257];
+    // SAFETY: the pointer and length describe the live local buffer,
+    // and the length leaves the final byte as a terminator.
+    if unsafe { libc::gethostname(buffer.as_mut_ptr(), buffer.len() - 1) } != 0 {
+        return None;
+    }
+    let full = c_field(&buffer);
+    Some(match full.split_once('.') {
+        Some((short, _)) => short.to_string(),
+        None => full,
+    })
+}
+
+/// A NUL-terminated C character field as text, lossily like the
+/// subprocess output it replaces.
+fn c_field(field: &[libc::c_char]) -> String {
+    let bytes: Vec<u8> = field
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Detect the live platform: WSL markers from the environment plus
-/// `/proc/sys/kernel/osrelease` when readable, then `uname -s`.
+/// `/proc/sys/kernel/osrelease` when readable, then the kernel name.
 pub fn detect_platform() -> Result<String, Error> {
     detect_inner(&PLATFORM_MEMO, detect_platform_uncached).ok_or(Error::Unavailable)
 }
@@ -84,21 +139,9 @@ fn detect_platform_uncached() -> Result<String, Error> {
     let distro = std::env::var("WSL_DISTRO_NAME").unwrap_or_default();
     let interop = std::env::var("WSL_INTEROP").unwrap_or_default();
     let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok();
-    let mut command = std::process::Command::new("uname");
-    command.arg("-s");
-    let output = crate::cleanup::run_session_output(
-        command,
-        None,
-        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
-        crate::cleanup::LingerPolicy::Strict,
-    )
-    .map_err(|_| Error::Unavailable)?;
-    if !output.status.success() {
-        return Err(Error::Unavailable);
-    }
-    let raw = String::from_utf8_lossy(&output.stdout);
+    let kernel = kernel_name().ok_or(Error::Unavailable)?;
     Ok(platform_name(
-        raw.trim_end_matches(['\r', '\n']),
+        &kernel,
         is_wsl(&distro, &interop, osrelease.as_deref()),
     ))
 }
@@ -109,34 +152,16 @@ pub fn host_name(raw: &str) -> String {
     raw.to_ascii_lowercase()
 }
 
-/// Detect the live short hostname: `hostname -s`, falling back to
-/// plain `hostname` exactly like the shell's `||` chain.
+/// Detect the live short hostname (what `hostname -s` prints); see
+/// [`short_hostname`].
 pub fn detect_host() -> Result<String, Error> {
     detect_inner(&HOST_MEMO, detect_host_uncached).ok_or(Error::Unavailable)
 }
 
 fn detect_host_uncached() -> Result<String, Error> {
-    for args in [&["-s"][..], &[][..]] {
-        // No let-chains: the crate MSRV is 1.85 and let-chains need
-        // 1.88. Same for the other two sites like this one.
-        let mut command = std::process::Command::new("hostname");
-        command.args(args);
-        let output = match crate::cleanup::run_session_output(
-            command,
-            None,
-            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
-            crate::cleanup::LingerPolicy::Strict,
-        ) {
-            Ok(output) => output,
-            Err(_) => continue,
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let raw = String::from_utf8_lossy(&output.stdout);
-        return Ok(host_name(raw.trim_end_matches(['\r', '\n'])));
-    }
-    Err(Error::Unavailable)
+    short_hostname()
+        .map(|short| host_name(&short))
+        .ok_or(Error::Unavailable)
 }
 
 /// Match a comma spec against current values (`_dot_match_specs`).

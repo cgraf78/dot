@@ -226,6 +226,18 @@ pub struct PullOverlaysOutcome {
     pub rc: i32,
 }
 
+impl PullOverlaysOutcome {
+    /// Names of the overlays whose pull failed, in declaration order, read
+    /// back from the [`record_status`] summary lines this module writes.
+    pub fn failed_names(&self) -> impl Iterator<Item = &str> {
+        self.summaries.iter().filter_map(|line| {
+            line.rsplit_once(' ')
+                .filter(|(_, status)| *status == "failed")
+                .map(|(name, _)| name)
+        })
+    }
+}
+
 /// Whether `DOT_QUIET` silences quiet-gated rows.
 fn is_quiet_flag(dot_quiet: Option<&str>) -> bool {
     crate::log::is_quiet(dot_quiet)

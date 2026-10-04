@@ -12,6 +12,37 @@ fn live_platform_and_host_are_canonical() {
     assert_eq!(host, host.to_ascii_lowercase());
 }
 
+/// The libc identity readers must answer what the binaries they replaced
+/// print on this host, so profile and platform selection do not move.
+#[test]
+fn libc_identity_matches_the_binaries_it_replaced() {
+    let printed = |program: &str, args: &[&str]| {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
+        Some(
+            String::from_utf8_lossy(&output.stdout)
+                .trim_end_matches(['\r', '\n'])
+                .to_string(),
+        )
+    };
+    let kernel = platform::kernel_name().expect("kernel name");
+    assert_eq!(Some(kernel), printed("uname", &["-s"]));
+    // `uname -n` prints the kernel host name; `hostname -s` cuts that same
+    // name at its first dot (some `hostname` builds consult the resolver
+    // instead, so they are not a reliable oracle).
+    let short = platform::short_hostname().expect("short host name");
+    assert!(!short.contains('.'), "{short}");
+    let full = printed("uname", &["-n"]).expect("uname -n");
+    assert_eq!(full.split('.').next(), Some(short.as_str()));
+    assert_eq!(
+        platform::detect_host().expect("host"),
+        short.to_ascii_lowercase()
+    );
+}
+
 #[test]
 fn wsl_markers_override_kernel_platform() {
     assert!(platform::is_wsl("Ubuntu", "", None));
@@ -146,4 +177,23 @@ fn sudo_ladder_has_fixed_precedence() {
     assert!(!platform::decide_sudo(false, false, true, &yes));
     assert!(platform::decide_sudo(false, false, false, &yes));
     assert!(!platform::decide_sudo(false, false, false, &no));
+}
+
+/// The shell hook API reads the host the way the engine does, so a hook's
+/// `dot_hook_host_match` agrees with profile selection.
+#[test]
+fn hook_api_host_matches_the_engine_host() {
+    let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("lib/dot/public/hook-runtime-v1/hook-api.sh");
+    let output = std::process::Command::new(dot_test_support::bash())
+        .args(["--noprofile", "--norc", "-c"])
+        .arg(format!(". '{}' && _dot_hook_host", runtime.display()))
+        .env("LC_ALL", "C")
+        .output()
+        .expect("bash");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim_end(),
+        platform::detect_host().expect("host")
+    );
 }

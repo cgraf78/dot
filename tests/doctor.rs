@@ -1034,6 +1034,17 @@ fn init_client(home: &TempDir, state: &TempDir, origin: &Path) {
 /// can execute; no such root is a test-environment error, not a pass. The
 /// wrapper execs the real Git directly, never a developer launcher.
 fn host_git_wrapper(label: &str) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    host_git_wrapper_running(label, "")
+}
+
+/// [`host_git_wrapper`] that runs the shell `snippet` (after logging, before
+/// the real Git) on every call. The wrapper must live outside the fixture
+/// `HOME` and the Dot checkout: doctor's host-Git selection skips any `git`
+/// under either, as client-provided launchers.
+fn host_git_wrapper_running(
+    label: &str,
+    snippet: &str,
+) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
     let checkout = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("checkout");
     let real = dot_test_support::real_tool("git");
     for exec_root in [false, true] {
@@ -1051,7 +1062,7 @@ fn host_git_wrapper(label: &str) -> (TempDir, std::path::PathBuf, std::path::Pat
         std::fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\n{snippet}exec '{}' \"$@\"\n",
                 log.display(),
                 real.display()
             ),
@@ -1059,13 +1070,31 @@ fn host_git_wrapper(label: &str) -> (TempDir, std::path::PathBuf, std::path::Pat
         .expect("git wrapper");
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
             .expect("wrapper mode");
-        // A `noexec` mount refuses to run it: try the next root.
-        let probe = Command::new(&wrapper)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // A `noexec` mount refuses to run it: try the next root. The probe
+        // asks for `--exec-path`, which no snippet reacts to. A sibling test
+        // thread that forks while this one still has the file open for
+        // writing makes exec fail with ETXTBSY until that child execs, and a
+        // saturated host can refuse the fork (EAGAIN); both transient
+        // refusals are retried, never read as `noexec`.
+        let mut attempts = 0;
+        let probe = loop {
+            let probe = Command::new(&wrapper)
+                .arg("--exec-path")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            match probe {
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::ETXTBSY | libc::EAGAIN))
+                        && attempts < 100 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                probe => break probe,
+            }
+        };
         if probe.is_ok_and(|status| status.success()) {
             let _ = std::fs::remove_file(&log);
             return (dir, wrapper, log);
@@ -1097,13 +1126,10 @@ fn base_repository_state_costs_one_status_call() {
         .output()
         .expect("doctor");
     let stdout = String::from_utf8_lossy(&native.stdout);
-    assert!(stdout.contains("✓ no tracked client changes"), "{stdout}");
+    // The healthy client folds into one row naming its branch.
     assert!(
-        stdout.contains("✓ client HEAD on branch (main)"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("✓ client upstream (origin/main (current))"),
+        stdout.contains("✓ client repository (")
+            && stdout.contains("main, current with origin/main)"),
         "{stdout}"
     );
     // A bypassed wrapper must fail here, not as a missing file.
@@ -1162,7 +1188,7 @@ fn source_checkout_ignores_caller_git_selection() {
         ],
     );
     assert!(
-        String::from_utf8_lossy(&shell.stdout).contains("dot checkout exists"),
+        String::from_utf8_lossy(&shell.stdout).contains(", checkout)\n"),
         "shell source row: {}",
         String::from_utf8_lossy(&shell.stdout)
     );
@@ -1252,9 +1278,13 @@ fn healthy_source_and_client_match_without_the_old_engine() {
 
     let (shell, native) = pair(&home, &state);
     let output = String::from_utf8_lossy(&shell.stdout);
-    assert!(output.contains("dot checkout exists"));
-    assert!(output.contains("client Git directory exists"));
-    assert!(output.contains("client upstream"));
+    assert!(output.contains(", checkout)\n"), "{output}");
+    assert!(
+        output.contains(
+            "✓ client repository (~/.dotfiles, worktree ~, main, current with origin/main)"
+        ),
+        "{output}"
+    );
     assert_pair(&shell, &native);
 }
 
@@ -1793,11 +1823,11 @@ fn in_process_doctor_uses_runtime_identity_probe() {
     assert!(stderr.is_empty(), "doctor stderr: {stderr:?}");
     let output = String::from_utf8_lossy(&stdout);
     assert!(
-        output.contains("profile identity (runtime-user@"),
+        output.contains("; for runtime-user@"),
         "doctor output: {output}"
     );
     assert!(
-        output.contains("web (agreed-match)"),
+        output.contains("› profile web (agreed-match"),
         "doctor output: {output}"
     );
 }
@@ -2056,7 +2086,7 @@ fn authorized_overlay_link_to_an_untrusted_file_keeps_its_own_row() {
     seal(&manifest, 0o600);
     let (output, _) = doctor_with_env(&home, &state, &[]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("ov: cloned"), "{stdout}");
+    assert!(stdout.contains("✓ ov ("), "{stdout}");
     assert!(
         stdout.contains("  ✗ 30-ov doctor extension refused\n    ~/extensions/doctor.d/30-ov.sh links to a file that fails the extension trust checks; check its owner and mode\n"),
         "{stdout}"
@@ -2491,8 +2521,8 @@ fn backdate_mtime(path: &Path, secs_ago: u64) {
 #[test]
 fn declared_merge_outputs_verify_end_to_end() {
     // Handoff finding #8: the `.outputs` sidecar declares live
-    // outputs; doctor verifies each exists and is newer than its
-    // inputs. Hooks without a sidecar skip verification.
+    // outputs; doctor verifies each exists. Hooks without a sidecar skip
+    // verification.
     let (home, state, directory) = merge_fixture("merge-outputs");
     let output = home.path().join("live.conf");
     std::fs::write(
@@ -2512,8 +2542,8 @@ fn declared_merge_outputs_verify_end_to_end() {
         "discovery aggregate kept: {stdout}"
     );
     assert!(
-        stdout.contains("merge-hook outputs are current"),
-        "fresh output passes: {stdout}"
+        stdout.contains("merge-hook outputs exist"),
+        "existing output passes: {stdout}"
     );
 
     // A missing output fails the merge section.
@@ -2525,14 +2555,15 @@ fn declared_merge_outputs_verify_end_to_end() {
         "missing output fails: {stdout}"
     );
 
-    // An output older than the hook script fails as stale.
-    std::fs::write(&output, b"stale\n").expect("stale output");
+    // N2: an output older than the hook script is still current; the
+    // write-if-changed helpers leave an unchanged output untouched.
+    std::fs::write(&output, b"unchanged\n").expect("older output");
     backdate_mtime(&output, 200);
     let (_, native) = pair(&home, &state);
     let stdout = String::from_utf8_lossy(&native.stdout);
     assert!(
-        stdout.contains("merge-hook output is stale"),
-        "stale output fails: {stdout}"
+        stdout.contains("merge-hook outputs exist") && !stdout.contains("stale"),
+        "an older output is not stale: {stdout}"
     );
 }
 
@@ -2567,7 +2598,7 @@ fn bad_sidecars_degrade_per_spec_end_to_end() {
     let (_, native) = pair(&home, &state);
     let stdout = String::from_utf8_lossy(&native.stdout);
     assert!(
-        stdout.contains("merge-hook outputs are current"),
+        stdout.contains("merge-hook outputs exist"),
         "healthy hook still verifies: {stdout}"
     );
     assert!(
@@ -2585,7 +2616,7 @@ fn bad_sidecars_degrade_per_spec_end_to_end() {
     let (_, native) = pair(&home, &state);
     let stdout = String::from_utf8_lossy(&native.stdout);
     assert!(
-        stdout.contains("merge-hook outputs are current"),
+        stdout.contains("merge-hook outputs exist"),
         "healthy hook still verifies: {stdout}"
     );
     assert!(
@@ -2605,8 +2636,8 @@ fn undeclared_merge_outputs_skip_verification_end_to_end() {
     let stdout = String::from_utf8_lossy(&native.stdout);
     assert!(stdout.contains("1 hook(s)"));
     assert!(
-        stdout.contains("merge-hook outputs are unverified"),
-        "no sidecar skips, not fails: {stdout}"
+        !stdout.contains("merge-hook outputs"),
+        "no sidecar files no output row: {stdout}"
     );
     assert_pair(&shell, &native);
 }
@@ -2692,6 +2723,48 @@ fn cron_freshness_reports_degraded_convergence_end_to_end() {
     );
 }
 
+#[test]
+fn cron_failure_cause_reaches_doctor_end_to_end() {
+    // U1/U3: a cron run that failed after a recent clean one is reported
+    // with the cause the update recorded, read from the state files that
+    // `dot update` writes.
+    let (home, state, _) = merge_fixture("cron-failure-cause");
+    let dir = state.path().join("dot");
+    std::fs::create_dir_all(&dir).expect("stamp dir");
+    let now = now_epoch();
+    let failed = now - 60;
+    std::fs::write(dir.join("update.last-success"), format!("{}\n", now - 1800))
+        .expect("recent clean run");
+    std::fs::write(
+        dir.join("update.last-run"),
+        format!("{failed} degraded cron tools\n"),
+    )
+    .expect("newer degraded run");
+    std::fs::write(
+        dir.join("update.last-failure"),
+        format!(
+            "{failed} degraded cron\nitem\ttools\twatchexec/watchexec\terror: blocked transition\n"
+        ),
+    )
+    .expect("cause");
+    let native = command(false, &home, &state, &[]).output().expect("doctor");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        stdout.contains("⚠ last cron run degraded: tools failing"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "failing: tools: watchexec/watchexec (error: blocked transition); run shdeps health"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("cron update succeeded recently"),
+        "{stdout}"
+    );
+}
+
 fn now_epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2717,14 +2790,13 @@ fn hand_updated_host_reports_its_last_run_end_to_end() {
     let tools = TempDir::new_exec("doctor-last-run-tools").expect("tools");
     std::os::unix::fs::symlink(dot_test_support::real_tool("git"), tools.path().join("git"))
         .expect("git link");
-    for tool in ["id", "uname", "hostname"] {
-        let found = ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
-            .into_iter()
-            .map(|dir| Path::new(dir).join(tool))
-            .find(|candidate| candidate.is_file());
-        if let Some(found) = found {
-            std::os::unix::fs::symlink(found, tools.path().join(tool)).expect("tool link");
-        }
+    // `id -un` names the user; host and platform come from the kernel.
+    let id = ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+        .into_iter()
+        .map(|dir| Path::new(dir).join("id"))
+        .find(|candidate| candidate.is_file());
+    if let Some(id) = id {
+        std::os::unix::fs::symlink(id, tools.path().join("id")).expect("id link");
     }
     let cron = TempDir::new_exec("doctor-last-run-crontab").expect("cron tools");
     let crontab = cron.path().join("crontab");
@@ -2804,7 +2876,7 @@ fn release_root_checkpoint_pins_its_install_metadata_end_to_end() {
         &[("DOT_SOURCE_ROOT", release.as_os_str())],
     );
     let stdout = String::from_utf8_lossy(&stdout);
-    assert!(stdout.contains("dot release exists"), "{stdout}");
+    assert!(stdout.contains(", release)\n"), "{stdout}");
     assert!(
         stdout.contains("⚠ provider re-exec checkpoint pending"),
         "{stdout}"
@@ -3030,8 +3102,8 @@ fn profile_context_and_unsafe_lifecycle_match_without_the_old_engine() {
 
     let (shell, native) = pair(&home, &state);
     let output = String::from_utf8_lossy(&shell.stdout);
-    assert!(output.contains("profile identity"));
-    assert!(output.contains("selected profile"));
+    assert!(output.contains("› profile "), "{output}");
+    assert!(output.contains("; for "), "{output}");
     assert!(output.contains("profile lifecycle state unsafe"));
     assert!(output.contains("required: selected but unavailable"));
     assert_pair(&shell, &native);
@@ -3109,9 +3181,9 @@ fn overlay_state_ignores_inherited_git_selectors() {
         .output()
         .expect("doctor");
     let stdout = String::from_utf8_lossy(&native.stdout);
-    assert!(stdout.contains("plain: cloned"), "{stdout}");
+    // Clean and current: the overlay folds into one row.
     assert!(
-        stdout.contains("✓ plain: upstream (origin/main (current))"),
+        stdout.contains("✓ plain (") && stdout.contains("main, current with origin/main)"),
         "{stdout}"
     );
     assert!(!stdout.contains("plain: 1 tracked change"), "{stdout}");
@@ -3131,7 +3203,10 @@ fn client_state_ignores_an_inherited_git_index() {
         .output()
         .expect("doctor");
     let stdout = String::from_utf8_lossy(&native.stdout);
-    assert!(stdout.contains("✓ no tracked client changes"), "{stdout}");
+    assert!(
+        stdout.contains("✓ client repository (") && !stdout.contains("tracked client change"),
+        "{stdout}"
+    );
 }
 
 fn latest_provider(home: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -3236,7 +3311,10 @@ fn healthy_latest_provider_matches_without_the_old_engine() {
         ],
     );
     let output = String::from_utf8_lossy(&shell.stdout);
-    assert!(output.contains("Shdeps provider source (trusted development checkout:"));
+    assert!(
+        output.contains("› Shdeps provider (latest policy; trusted development checkout "),
+        "{output}"
+    );
     assert!(output.contains("Shdeps provider ABI (abi:1)"));
     assert_pair(&shell, &native);
 }
@@ -3951,4 +4029,173 @@ fn directly_sourced_module_failure_names_the_module_line() {
         stdout.contains("    exited with status 1 at doctor.d/lib/broken.sh:2: false\n"),
         "{stdout}"
     );
+}
+
+/// The shell snippet for [`host_git_wrapper_running`] that holds the
+/// `--version` probe (one of the first core checks) for up to 20s, until
+/// `marker` exists, then records in `observed` whether it appeared.
+fn version_probe_waiting_for(marker: &Path, observed: &Path) -> String {
+    format!(
+        "if [ \"$1\" = --version ]; then\n\
+           i=0\n\
+           while [ ! -e '{marker}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done\n\
+           if [ -e '{marker}' ]; then echo concurrent; else echo serial; fi > '{observed}'\n\
+         fi\n",
+        marker = marker.display(),
+        observed = observed.display(),
+    )
+}
+
+/// P2: extensions start alongside the core checks, not after them, and their
+/// rows still render after every core row.
+#[test]
+fn extensions_run_while_the_core_checks_run() {
+    let extension = (
+        "10-early.sh".to_string(),
+        b"doctor() {\n  : >\"$HOME/extension-started\"\n  dot_doctor_section 'Early'\n  dot_doctor_ok 'early extension ran'\n}\n"
+            .to_vec(),
+    );
+    let (home, state) = doctor_extension_fixture("concurrent", &[extension]);
+    let (wrappers, _wrapper, _log) = host_git_wrapper_running(
+        "doctor-concurrent-git",
+        &version_probe_waiting_for(
+            &home.path().join("extension-started"),
+            &home.path().join("core-observed"),
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        wrappers.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = command(false, &home, &state, &[("PATH", &path)])
+        .output()
+        .expect("doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let observed = std::fs::read_to_string(home.path().join("core-observed")).unwrap_or_default();
+    assert_eq!(observed.trim(), "concurrent", "{stdout}");
+    let core = stdout.find("\ndot runtime\n").expect("core section");
+    let early = stdout.find("\nEarly\n").expect("extension section");
+    assert!(
+        core < early,
+        "extension rows render after the core: {stdout}"
+    );
+    assert!(stdout.contains("  ✓ early extension ran\n"), "{stdout}");
+}
+
+/// Extension output must not depend on whether the extensions finish before
+/// or after the core: run a window of fast and slow extensions repeatedly and
+/// compare every report with the serial one (`DOT_DOCTOR_JOBS=1`).
+#[test]
+fn concurrent_extension_rows_render_identically_to_serial() {
+    let extensions: Vec<(String, Vec<u8>)> = (0..12)
+        .map(|index| {
+            // Every third extension outlasts the core checks.
+            let pause = if index % 3 == 0 { "sleep 0.3\n  " } else { "" };
+            (
+                format!("{:02}-ext{index}.sh", 10 + index),
+                format!(
+                    "doctor() {{\n  {pause}dot_doctor_section 'Extension {index}'\n  dot_doctor_ok 'row a {index}'\n  dot_doctor_warn 'row b {index}' 'detail {index}'\n}}\n"
+                )
+                .into_bytes(),
+            )
+        })
+        .collect();
+    let (home, state) = doctor_extension_fixture("stress", &extensions);
+    let run = |jobs: &str| {
+        let output = command(false, &home, &state, &[("DOT_DOCTOR_JOBS", jobs)])
+            .output()
+            .expect("doctor");
+        (
+            output.status.code(),
+            normalize_stamp_age(&output.stdout),
+            output.stderr,
+        )
+    };
+    let serial = run("1");
+    let serial_text = String::from_utf8_lossy(&serial.1).into_owned();
+    assert!(serial_text.contains("Extension 11"), "{serial_text}");
+    assert_eq!(
+        serial_text.matches("  ⚠ row b ").count(),
+        12,
+        "{serial_text}"
+    );
+    for round in 0..5 {
+        let parallel = run("4");
+        assert_eq!(
+            parallel,
+            serial,
+            "round {round}:\n{}",
+            String::from_utf8_lossy(&parallel.1)
+        );
+    }
+}
+
+/// Extensions now finish while the core checks still run. A finished doctor
+/// extension must not clear the overlay probe answers the core reads, or the
+/// core would probe every overlay again.
+#[test]
+fn finished_extensions_keep_the_cores_overlay_probe_answers() {
+    let scope = TempDir::new("doctor-probe-cache-origin").expect("origin scope");
+    let origin = origin(scope.path());
+    let extension = (
+        "10-quick.sh".to_string(),
+        b"doctor() {\n  dot_doctor_section 'Quick'\n  dot_doctor_ok 'quick extension ran'\n  : >\"$HOME/extension-done\"\n}\n"
+            .to_vec(),
+    );
+    let (home, state) = doctor_extension_fixture("probe-cache", &[extension]);
+    let checkout = home.path().join(".dotfiles-probe");
+    let status = dot_test_support::git()
+        .args(["clone", "-q"])
+        .arg(&origin)
+        .arg(&checkout)
+        .status()
+        .expect("overlay clone");
+    assert!(status.success());
+    let descriptors = home.path().join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&descriptors).expect("overlays directory");
+    std::fs::write(
+        descriptors.join("20-probe.conf"),
+        format!("url={}\n", origin.display()),
+    )
+    .expect("descriptor");
+    // A logging Git whose `--version` probe (an early core check, before
+    // the overlay rows) holds the core until the extension has finished, so
+    // the extension's worker always completes while the core still runs.
+    let done = home.path().join("extension-done");
+    let (wrappers, _wrapper, log) = host_git_wrapper_running(
+        "doctor-probe-cache-git",
+        &format!(
+            "if [ \"$1\" = --version ]; then\n\
+               i=0\n\
+               while [ ! -e '{done}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done\n\
+               sleep 1\n\
+             fi\n",
+            done = done.display(),
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        wrappers.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = command(false, &home, &state, &[("PATH", &path)])
+        .output()
+        .expect("doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The healthy overlay folds into one row (cloned, origin, current).
+    assert!(
+        stdout.contains("  ✓ probe (~/.dotfiles-probe, "),
+        "{stdout}"
+    );
+    assert!(stdout.contains("quick extension ran"), "{stdout}");
+    let calls = std::fs::read_to_string(&log).expect("git log");
+    let probes = |needle: &str| {
+        calls
+            .lines()
+            .filter(|line| line.contains(".dotfiles-probe") && line.contains(needle))
+            .count()
+    };
+    assert_eq!(probes("rev-parse --show-toplevel"), 1, "{calls}");
+    assert_eq!(probes("remote.origin.url"), 1, "{calls}");
 }

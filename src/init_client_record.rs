@@ -246,10 +246,34 @@ fn join_slash(dir: &Path, component: &str) -> PathBuf {
 /// identity family's `branch_valid` stays the canonical port on
 /// its lane, and an empty name fails on both engines without
 /// forking.
+///
+/// Accepted names are remembered per Git program for the process: every
+/// command reads the identity record when it selects the base client, and
+/// commands that select twice (dispatch, then `doctor`, `test`, or the
+/// update gather) would otherwise ask Git the same question again. The
+/// verdict is a pure function of the name and the Git binary, except for
+/// `@{-N}` spellings, which `--branch` expands against the current
+/// repository; names containing `@` are never remembered. Refusals are not
+/// remembered either, so a transient spawn failure cannot pin one.
 fn branch_valid(branch: &[u8]) -> bool {
     use std::process::Stdio;
     if branch.is_empty() {
         return false;
+    }
+    let program = crate::init_client_identity::host_git_program();
+    let key = (!branch.contains(&b'@')).then(|| {
+        let mut key = program.as_bytes().to_vec();
+        key.push(0);
+        key.extend_from_slice(branch);
+        key
+    });
+    if let Some(key) = &key {
+        if VALID_BRANCHES
+            .lock()
+            .is_ok_and(|accepted| accepted.contains(key))
+        {
+            return true;
+        }
     }
     let mut command = crate::init_client_identity::host_git_command();
     command
@@ -262,8 +286,20 @@ fn branch_valid(branch: &[u8]) -> bool {
         .stderr(Stdio::null());
     // Pure ref-format validation, no repo access: Detach skips the host-wide
     // completion scan; cancellation still takes the strict path.
-    crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Detach) == 0
+    let valid =
+        crate::cleanup::run_session_status(command, crate::cleanup::LingerPolicy::Detach) == 0;
+    if let (true, Some(key)) = (valid, key) {
+        if let Ok(mut accepted) = VALID_BRANCHES.lock() {
+            accepted.insert(key);
+        }
+    }
+    valid
 }
+
+/// Branch names `git check-ref-format --branch` accepted, keyed by the Git
+/// program and the name; see [`branch_valid`].
+static VALID_BRANCHES: std::sync::Mutex<std::collections::BTreeSet<Vec<u8>>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// The source revision from the shared checkout-or-release identity resolver.
 /// Development keeps the sanitized Git authority; packaged releases use the
@@ -775,6 +811,59 @@ pub fn prior_record(prior: &Path, wanted: &str) -> Result<PriorEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shim Git that logs each call and accepts every name but `bad`.
+    fn counting_git(scope: &dot_test_support::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let log = scope.path().join("calls.log");
+        let shim = scope.path().join("git");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ \"$3\" != bad ]\n",
+                log.display()
+            ),
+        )
+        .expect("shim");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        (shim, log)
+    }
+
+    fn calls(log: &Path) -> usize {
+        std::fs::read_to_string(log).map_or(0, |log| log.lines().count())
+    }
+
+    #[test]
+    fn accepted_branch_names_are_checked_once_per_git() {
+        let scope = dot_test_support::TempDir::new_exec("branch-memo").expect("scope");
+        let (shim, log) = counting_git(&scope);
+        crate::init_client_identity::with_host_git(&shim, || {
+            assert!(branch_valid(b"memo-main"));
+            assert!(branch_valid(b"memo-main"));
+        });
+        assert_eq!(calls(&log), 1, "an accepted name is asked once");
+        // Another Git program asks again: the verdict belongs to the binary.
+        let other = dot_test_support::TempDir::new_exec("branch-memo-other").expect("scope");
+        let (other_shim, other_log) = counting_git(&other);
+        crate::init_client_identity::with_host_git(&other_shim, || {
+            assert!(branch_valid(b"memo-main"));
+        });
+        assert_eq!(calls(&other_log), 1);
+    }
+
+    #[test]
+    fn refused_and_repository_relative_names_are_not_remembered() {
+        let scope = dot_test_support::TempDir::new_exec("branch-memo-refused").expect("scope");
+        let (shim, log) = counting_git(&scope);
+        crate::init_client_identity::with_host_git(&shim, || {
+            assert!(!branch_valid(b"bad"));
+            assert!(!branch_valid(b"bad"));
+            // `@{-1}` expands against the current repository.
+            assert!(branch_valid(b"@{-1}"));
+            assert!(branch_valid(b"@{-1}"));
+        });
+        assert_eq!(calls(&log), 4);
+    }
 
     #[test]
     fn branch_check_runs_without_host_process_snapshot() {

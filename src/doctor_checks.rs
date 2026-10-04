@@ -35,9 +35,9 @@
 //! - Checks emit the canonical [`Record`]s instead of calling the `_dr_*`
 //!   emitters; [`render`] delegates to the runtime renderer with color
 //!   disabled so parity tests can byte-compare against the live shell.
-//! - `_dr_tilde` / `_dr_symlink_points_to` (`doctor/paths.sh`) are
-//!   mirrored as private helpers: display-only glue the checks need
-//!   to spell details, with display policy owned by `doctor_paths`.
+//! - `_dr_tilde` / `_dr_symlink_points_to` (`doctor/paths.sh`) come
+//!   from [`crate::doctor_paths`], the one owner of doctor path display
+//!   and resolution.
 //! - `local_validate` (`_overlay_local_source_validate`,
 //!   `find`-walk plus per-entry checks), the profile deactivation
 //!   probe, the shdeps installer selection, and the lifecycle ledger
@@ -69,7 +69,54 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
+use crate::doctor_paths::tilde;
 pub use crate::doctor_runtime::{Kind, Record};
+
+/// How long one core doctor probe may run.
+///
+/// A stalled Git or filesystem (a hung network mount under an overlay, say)
+/// used to stall doctor indefinitely. Past this deadline the probe's
+/// session is stopped and reaped like any other timeout, and the repository
+/// rows it feeds read as a warning naming the stall. The bound sits well
+/// above a slow but healthy host (a cold `git status` of a large work tree
+/// on a network home), so only a real stall reaches it. The overlay
+/// resolver's probes (shared with `dot update`, whose answers feed trust
+/// decisions) stay unbounded: a timeout there would read as a missing
+/// checkout and refuse that overlay's extensions. `dot doctor --help`
+/// states this bound ([`crate::doctor::USAGE`]).
+pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The deadline for a core probe starting now.
+pub(crate) fn probe_deadline() -> Option<std::time::Instant> {
+    std::time::Instant::now().checked_add(probe_timeout())
+}
+
+fn probe_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(timeout) = TEST_PROBE_TIMEOUT.with(std::cell::Cell::get) {
+        return timeout;
+    }
+    PROBE_TIMEOUT
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A shorter [`PROBE_TIMEOUT`] for this test thread.
+    static TEST_PROBE_TIMEOUT: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A core probe stopped at its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TimedOut;
+
+/// The detail of every row a timed-out probe turns into a warning.
+pub(crate) fn timed_out_detail() -> String {
+    format!(
+        "Git did not answer within {}s; check for a stalled filesystem or Git process, then rerun dot doctor",
+        PROBE_TIMEOUT.as_secs()
+    )
+}
 
 /// Render records with color disabled (piped stdout: every color slot is
 /// empty), through [`crate::doctor_runtime::render`]:
@@ -85,85 +132,6 @@ pub fn render(records: &[Record]) -> String {
         &crate::doctor_runtime::Palette::empty(),
     ))
     .expect("doctor checks emit UTF-8 text")
-}
-
-/// `_dr_tilde`: abbreviate `path` under `home` with `~`. Mirrors
-/// the shell `case` arms literally, including the empty-`HOME`
-/// corner (`"$HOME"/*` with empty `HOME` matches `/*`).
-fn tilde(path: &str, home: &str) -> String {
-    if path == home {
-        return "~".to_string();
-    }
-    if home.is_empty() {
-        if let Some(rest) = path.strip_prefix('/') {
-            return format!("~/{rest}");
-        }
-        return path.to_string();
-    }
-    if let Some(rest) = path.strip_prefix(home) {
-        if let Some(rest) = rest.strip_prefix('/') {
-            return format!("~/{rest}");
-        }
-    }
-    path.to_string()
-}
-
-/// `_dr_physical_path`: resolve the parent directory physically
-/// (`cd dir && pwd -P`), keeping the leaf name. Trailing slashes
-/// strip (except root); `/` maps to `//` like the shell
-/// `printf '%s/%s\n' / /`. Returns `None` when the parent is not a
-/// directory or cannot be resolved.
-fn physical_path(path: &str) -> Option<String> {
-    let mut rest = path;
-    while rest != "/" && rest.ends_with('/') {
-        rest = &rest[..rest.len() - 1];
-    }
-    let (dir, base) = if rest == "/" {
-        ("/", "/")
-    } else if let Some(index) = rest.rfind('/') {
-        let (dir, base) = rest.split_at(index);
-        (if dir.is_empty() { "/" } else { dir }, &base[1..])
-    } else {
-        (".", rest)
-    };
-    if !Path::new(dir).is_dir() {
-        return None;
-    }
-    let canonical = std::fs::canonicalize(dir).ok()?;
-    Some(format!("{}/{}", canonical.display(), base))
-}
-
-/// `_dr_symlink_target_path` plus `_dr_symlink_points_to`: whether
-/// `link` resolves (through a possibly relative `readlink` target)
-/// to the same physical path as `expected`. A missing `expected`
-/// (`[[ -e ]]`, links followed) or an unreadable link fails.
-fn symlink_points_to(link: &Path, expected: &str) -> bool {
-    if !Path::new(expected).exists() {
-        return false;
-    }
-    let target = match std::fs::read_link(link) {
-        Ok(target) => target,
-        Err(_) => return false,
-    };
-    let joined: PathBuf = if target.is_absolute() {
-        target
-    } else {
-        let dir = link.parent().unwrap_or_else(|| Path::new("."));
-        let dir = if dir.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            dir
-        };
-        dir.join(&target)
-    };
-    let actual = match physical_path(&joined.to_string_lossy()) {
-        Some(actual) => actual,
-        None => return false,
-    };
-    match physical_path(expected) {
-        Some(expected_physical) => actual == expected_physical,
-        None => false,
-    }
 }
 
 /// Shell `IFS='|' read -r` into `count` variables: split on `|`
@@ -214,17 +182,40 @@ fn is_executable_bits(mode: u32) -> bool {
 /// of sharing the stale "will reclaim" promise. A live owner stays a
 /// warning (the refusal ends when that update does), as does a probe
 /// interrupted by a signal to doctor itself.
+///
+/// `age` is how long the owner has held the lock (seconds since its owner
+/// record was written), when known. A live owner past the cron staleness
+/// window is most likely hung rather than slow, so its row says so.
 fn lock_owner_record(
     owner: &crate::update_lock::Owner,
     activity: crate::update_lock::OwnerActivity,
+    age: Option<i64>,
 ) -> Record {
     use crate::update_lock::OwnerActivity as Activity;
+    use crate::update_status::{CRON_STALE_AFTER_SECS, format_age};
 
     match activity {
-        Activity::Active => Record::warn(
-            "update is currently running",
-            Some(format!("pid {}", owner.pid)),
-        ),
+        Activity::Active => match age {
+            Some(age) if age > CRON_STALE_AFTER_SECS => Record::warn(
+                format!("update has been running for {}", format_age(age)),
+                Some(format!(
+                    "pid {pid}; if it is hung, stop it (kill {pid}) and rerun dot update",
+                    pid = owner.pid
+                )),
+            ),
+            Some(age) => Record::warn(
+                "update is currently running",
+                Some(format!(
+                    "pid {}, running for {}; wait for it to finish",
+                    owner.pid,
+                    format_age(age)
+                )),
+            ),
+            None => Record::warn(
+                "update is currently running",
+                Some(format!("pid {}", owner.pid)),
+            ),
+        },
         Activity::Stale => Record::warn(
             "update lock owner is stale",
             Some("the next mutating command will reclaim it".to_string()),
@@ -279,9 +270,18 @@ pub fn check_update_lock(lock_dir: Option<&Path>) -> Vec<Record> {
         return out;
     }
     if let Some(owner) = crate::update_lock::read_owner(dir) {
+        // The owner record is written once at acquisition (a continuation
+        // re-enters without rewriting it), so its mtime is when the run
+        // took the lock. One stat; clock skew reads as just started.
+        let age = std::fs::metadata(crate::update_lock::owner_file(dir))
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|at| crate::update_engine::now_secs().saturating_sub(at.as_secs() as i64));
         out.push(lock_owner_record(
             &owner,
             crate::update_lock::owner_activity(&owner),
+            age,
         ));
     } else if crate::update_lock::is_initializing(dir) {
         out.push(Record::warn("update lock is being initialized", None));
@@ -294,23 +294,15 @@ pub fn check_update_lock(lock_dir: Option<&Path>) -> Vec<Record> {
     out
 }
 
-/// One merge-hook output declaration for freshness
-/// verification (handoff finding #8): the script and its
-/// `.outputs` sidecar arrive trust-validated from
-/// [`crate::doctor`]; the outputs arrive expanded to absolute
-/// paths. Freshness inputs are the script, the sidecar, and the
-/// identity-named family directory when one exists.
+/// One merge-hook output declaration for output verification
+/// (handoff finding #8): the script and its `.outputs` sidecar arrive
+/// trust-validated from [`crate::doctor`]; the outputs arrive expanded
+/// to absolute paths.
 pub struct MergeSpec {
     /// Hook identity (the spec label doctor reports).
     pub identity: String,
-    /// Hook script path (a freshness input).
+    /// Hook script path.
     pub script: String,
-    /// Outputs-declaration sidecar path, when one exists (a
-    /// freshness input).
-    pub sidecar: Option<String>,
-    /// Identity-named family directory, when one exists
-    /// (freshness inputs root).
-    pub family_dir: Option<String>,
     /// Expanded absolute declared live outputs.
     pub outputs: Vec<String>,
     /// Declared outputs that are not absolute paths after
@@ -337,101 +329,33 @@ pub struct MergeInputs {
     /// Why the inventory is invalid, with its next step, when
     /// `spec_count` is `None`; the row falls back to the directory.
     pub inventory_error: Option<String>,
-    /// Per-hook output declarations for freshness verification.
-    /// Empty skips verification (the historical count-only
-    /// behavior); production always passes one entry per
-    /// inventoried hook.
+    /// Per-hook output declarations for verification. Empty skips
+    /// verification (the historical count-only behavior); production
+    /// always passes one entry per inventoried hook.
     pub specs: Vec<MergeSpec>,
-}
-
-/// Bounds for the family-directory walk below: a merge family is
-/// a handful of hook sources, so thousands of files or deep
-/// nesting means a pathological tree, not freshness inputs.
-const FAMILY_WALK_MAX_FILES: usize = 4096;
-/// Maximum descent below the family directory itself.
-const FAMILY_WALK_MAX_DEPTH: usize = 32;
-
-/// Newest mtime across a merge spec's freshness inputs: the
-/// hook script, its `.outputs` sidecar, and every regular file
-/// under the identity-named family directory (bounded by
-/// [`FAMILY_WALK_MAX_FILES`] files and [`FAMILY_WALK_MAX_DEPTH`]
-/// levels). Missing inputs are ignored; `None` means nothing was
-/// comparable.
-fn newest_input_mtime(spec: &MergeSpec) -> Option<std::time::SystemTime> {
-    newest_input_mtime_bounded(spec, FAMILY_WALK_MAX_FILES, FAMILY_WALK_MAX_DEPTH)
-}
-
-fn newest_input_mtime_bounded(
-    spec: &MergeSpec,
-    max_files: usize,
-    max_depth: usize,
-) -> Option<std::time::SystemTime> {
-    let mut newest: Option<std::time::SystemTime> = None;
-    let mut consider = |path: &Path| {
-        let mtime = std::fs::metadata(path)
-            .and_then(|meta| meta.modified())
-            .ok();
-        if let Some(mtime) = mtime {
-            if newest.is_none_or(|best| mtime > best) {
-                newest = Some(mtime);
-            }
-        }
-    };
-    consider(Path::new(&spec.script));
-    if let Some(sidecar) = spec.sidecar.as_deref() {
-        consider(Path::new(sidecar));
-    }
-    if let Some(dir) = spec.family_dir.as_deref() {
-        // Symlinks never descend (dirent types only), so no cycle
-        // risk; the file/depth budgets bound hostile breadth.
-        let mut stack = vec![(PathBuf::from(dir), 0usize)];
-        let mut files = 0usize;
-        while let Some((dir, depth)) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(entries) => entries,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
-                if files >= max_files {
-                    break;
-                }
-                let path = entry.path();
-                match entry.file_type() {
-                    Ok(kind) if kind.is_dir() => {
-                        if depth < max_depth {
-                            stack.push((path, depth + 1));
-                        }
-                    }
-                    Ok(kind) if kind.is_file() => {
-                        files += 1;
-                        consider(&path);
-                    }
-                    _ => {}
-                }
-            }
-            if files >= max_files {
-                break;
-            }
-        }
-    }
-    newest
 }
 
 /// One merge spec's output verification result, before aggregation.
 enum MergeVerdict {
-    /// Problems to report row by row (invalid declarations, missing or stale
+    /// Problems to report row by row (invalid declarations, missing
     /// outputs).
     Problems(Vec<Record>),
-    /// No declared outputs, or nothing to compare them against.
-    Unverified,
-    /// Every declared output exists and is newer than every input.
+    /// No declared outputs.
+    Undeclared,
+    /// Every declared output exists.
     Current(usize),
 }
 
-/// Verify one merge spec's declared live outputs: each must exist
-/// and be strictly newer than its newest input. Hooks without
-/// declarations are unverified (documented, not a failure); invalid
-/// declarations fail outright.
+/// Verify one merge spec's declared live outputs: each must exist. Hooks
+/// without declarations are not verified (documented, not a failure);
+/// invalid declarations fail outright.
+///
+/// Existence is the whole rule. An output's mtime says nothing about
+/// whether it is current: `dot_write_text_if_changed` and the managed-block
+/// helpers deliberately leave an unchanged destination untouched, so after
+/// any edit to a hook that does not change its output, the output is older
+/// than the hook and an mtime rule would call a correct file stale. No hook
+/// could declare outputs under that rule.
 fn verify_merge_outputs(spec: &MergeSpec) -> MergeVerdict {
     if !spec.invalid.is_empty() {
         return MergeVerdict::Problems(
@@ -447,28 +371,20 @@ fn verify_merge_outputs(spec: &MergeSpec) -> MergeVerdict {
         );
     }
     if spec.outputs.is_empty() {
-        return MergeVerdict::Unverified;
+        return MergeVerdict::Undeclared;
     }
-    let Some(newest) = newest_input_mtime(spec) else {
-        return MergeVerdict::Unverified;
-    };
-    let mut problems = Vec::new();
-    for output in &spec.outputs {
-        let mtime = std::fs::metadata(Path::new(output))
-            .and_then(|meta| meta.modified())
-            .ok();
-        match mtime {
-            None => problems.push(Record::fail(
+    let problems: Vec<Record> = spec
+        .outputs
+        .iter()
+        .filter(|output| std::fs::metadata(Path::new(output)).is_err())
+        .map(|output| {
+            Record::fail(
                 "merge-hook output is missing",
                 Some(format!("{}: {output}", spec.identity)),
-            )),
-            Some(mtime) if mtime <= newest => problems.push(Record::fail(
-                "merge-hook output is stale",
-                Some(format!("{}: {output}", spec.identity)),
-            )),
-            Some(_) => {}
-        }
-    }
+            )
+            .with_hint("run dot update; if it stays missing, check the hook")
+        })
+        .collect();
     if problems.is_empty() {
         MergeVerdict::Current(spec.outputs.len())
     } else {
@@ -477,17 +393,17 @@ fn verify_merge_outputs(spec: &MergeSpec) -> MergeVerdict {
 }
 
 /// Every spec's output verification, collapsed: problems keep one row each,
-/// while healthy and unverified hooks each fold into a single summary row
-/// (one row per hook used to bury the problems among dozens of identical
-/// skips).
+/// while healthy hooks fold into a single summary row (one row per hook
+/// used to bury the problems among dozens of identical rows). Hooks that
+/// declare no outputs file nothing: a permanent "unverified" row on every
+/// run said nothing a user could act on.
 fn merge_output_records(specs: &[MergeSpec]) -> Vec<Record> {
     let mut problems = Vec::new();
-    let mut unverified = 0usize;
     let (mut current_hooks, mut current_outputs) = (0usize, 0usize);
     for spec in specs {
         match verify_merge_outputs(spec) {
             MergeVerdict::Problems(rows) => problems.extend(rows),
-            MergeVerdict::Unverified => unverified += 1,
+            MergeVerdict::Undeclared => {}
             MergeVerdict::Current(outputs) => {
                 current_hooks += 1;
                 current_outputs += outputs;
@@ -497,16 +413,10 @@ fn merge_output_records(specs: &[MergeSpec]) -> Vec<Record> {
     let mut out = problems;
     if current_hooks > 0 {
         out.push(Record::ok(
-            "merge-hook outputs are current",
+            "merge-hook outputs exist",
             Some(format!(
                 "{current_outputs} output(s) across {current_hooks} hook(s)"
             )),
-        ));
-    }
-    if unverified > 0 {
-        out.push(Record::skip(
-            "merge-hook outputs are unverified",
-            Some(format!("{unverified} hook(s) declare no checkable outputs")),
         ));
     }
     out
@@ -580,6 +490,9 @@ pub struct CronInputs {
     /// when none was recorded (including every run by a Dot older than
     /// that stamp).
     pub last_run: Option<crate::update_status::LastRun>,
+    /// Why the last non-ok run failed (`update.last-failure`), or `None`
+    /// when none was recorded. Shown only beside the run it describes.
+    pub last_failure: Option<crate::update_status::LastFailure>,
     /// Whether a `crontab` command is on `PATH`. Without one the host
     /// cannot schedule `dot update --cron`, so a cron that never ran skips
     /// instead of warning.
@@ -598,9 +511,15 @@ pub struct CronInputs {
 /// A host whose runs keep converging while the Tools or Prune stage
 /// fails, or while its config misspells a key, is reported as degraded with the failing stages instead of
 /// "has not succeeded recently", which stays reserved for a host that
-/// stopped converging. Both use the same staleness window, so a
-/// transient failure after a recent clean run still reads ok, exactly
-/// as before the degraded outcome existed.
+/// stopped converging.
+///
+/// A cron run that did not succeed and is newer than the last clean one
+/// always warns, even inside the staleness window: a recent clean run used
+/// to vouch for the host until it aged out, so a run that started failing
+/// right after one read green for up to two hours. A run skipped for local
+/// edits names that as the cause (with the files), since cron stays frozen
+/// until the edits are resolved. Every row about a run that failed shows
+/// its cause from `update.last-failure` when that record describes the run.
 ///
 /// The any-trigger last-run stamp fills the gaps the cron stamps leave: a
 /// host whose cron entry never ran warns once its last hand-run update is
@@ -620,7 +539,7 @@ pub fn check_cron_freshness(inputs: &CronInputs) -> Vec<Record> {
 /// The cron row of [`check_cron_freshness`]; returns the epoch of the last
 /// clean cron run when it is recent enough to vouch for the host.
 fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
-    use crate::update_status::{format_age, is_stale};
+    use crate::update_status::{OUTCOME_OK, OUTCOME_SKIP, format_age, is_stale};
 
     let age = |at: i64| format_age(inputs.now.saturating_sub(at));
     let converged = inputs.last_converged.as_ref();
@@ -630,7 +549,7 @@ fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
     let clean_cron_run = inputs
         .last_run
         .as_ref()
-        .filter(|last| last.is_cron() && last.outcome == crate::update_status::OUTCOME_OK)
+        .filter(|last| last.is_cron() && last.outcome == OUTCOME_OK)
         .map(|last| last.at);
     let clean = converged
         .filter(|converged| converged.failing.is_empty())
@@ -639,26 +558,97 @@ fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
         .chain(inputs.last_success)
         .chain(clean_cron_run)
         .max();
-    if let Some(clean) = clean.filter(|clean| !is_stale(*clean, inputs.now)) {
-        out.push(Record::ok(
-            "cron update succeeded recently",
-            Some(format!("{} ago", age(clean))),
+    // The newest cron run, when it did not succeed after the last clean one.
+    // A clean stamp from the future (the clock stepped back) orders nothing,
+    // and every run overwrites the last-run stamp, so that run wins then.
+    let problem = inputs
+        .last_run
+        .as_ref()
+        .filter(|last| last.is_cron() && last.outcome != OUTCOME_OK)
+        .filter(|last| clean.is_none_or(|clean| last.at > clean || clean > inputs.now));
+    let since = match clean {
+        Some(clean) => format!("last success {} ago", age(clean)),
+        None => "no successful cron update recorded".to_string(),
+    };
+    // Only a recent skip says cron is running and blocked; an old one means
+    // cron stopped too, which the stale rows below report (with the edits).
+    if let Some(last) =
+        problem.filter(|last| last.outcome == OUTCOME_SKIP && !is_stale(last.at, inputs.now))
+    {
+        out.push(Record::warn(
+            "cron update skipping: local edits block it",
+            Some(format!(
+                "last cron run {} ago; {since}; {}",
+                age(last.at),
+                skip_cause(inputs, last)
+            )),
         ));
-        return Some(clean);
+        return None;
+    }
+    let fresh_clean = clean.filter(|clean| !is_stale(*clean, inputs.now));
+    if let Some(clean) = fresh_clean {
+        let Some(last) = problem else {
+            out.push(Record::ok(
+                "cron update succeeded recently",
+                Some(format!("{} ago", age(clean))),
+            ));
+            return Some(clean);
+        };
+        out.push(Record::warn(
+            format!("last cron run {}", outcome_phrase(last)),
+            Some(format!(
+                "{} ago; {since}; {}",
+                age(last.at),
+                run_cause(inputs, last)
+            )),
+        ));
+        return None;
     }
     if let Some(converged) = converged
         .filter(|converged| !converged.failing.is_empty() && !is_stale(converged.at, inputs.now))
     {
+        // A cron run after that degraded convergence did not converge: it
+        // is the news, and the degraded stages would mislabel its cause.
+        if let Some(last) = problem.filter(|last| last.at > converged.at) {
+            out.push(Record::warn(
+                format!("last cron run {}", outcome_phrase(last)),
+                Some(format!(
+                    "{} ago; {since}; last converged {} ago; {}",
+                    age(last.at),
+                    age(converged.at),
+                    run_cause(inputs, last)
+                )),
+            ));
+            return None;
+        }
         let since = match inputs.last_success {
             Some(last) => format!("since last success {} ago", age(last)),
             None => "no clean cron update recorded".to_string(),
         };
+        // The run that wrote the convergence explains it; without that run
+        // (a later hand run, or an older Dot) its stages still pick the step.
+        let cause = problem
+            .filter(|last| last.at == converged.at)
+            .map(|last| run_cause(inputs, last))
+            .unwrap_or_else(|| next_step(stages_need_shdeps(&converged.failing)).to_string());
+        let cause = format!("; {cause}");
         out.push(Record::warn(
             format!("cron update degraded: {} failing", converged.failing),
-            Some(format!("{since}; last converged {} ago", age(converged.at))),
+            Some(format!(
+                "{since}; last converged {} ago{cause}",
+                age(converged.at)
+            )),
         ));
         return None;
     }
+    // The newest failing cron run, named with its cause: the stale titles
+    // below describe the host, not that run. Without one, cron itself may
+    // have stopped running.
+    let cause = match problem {
+        Some(last) => format!("; {}", last_cron_note(inputs, last)),
+        None => "; check that dot update --cron is scheduled (crontab -l), or run dot update"
+            .to_string(),
+    };
     // Stale from here on. `clean` (not just last-success) is the success
     // reference, so a lone clean convergence stamp reads as a success. Only
     // a degraded convergence newer than it adds information (an older one is
@@ -670,18 +660,169 @@ fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
     match clean {
         Some(clean) => out.push(Record::warn(
             "cron update has not succeeded recently",
-            Some(format!("last success {} ago{converged_note}", age(clean))),
+            Some(format!(
+                "last success {} ago{converged_note}{cause}",
+                age(clean)
+            )),
         )),
         // Only degraded runs ever converged, and they stopped too.
         None if converged.is_some() => out.push(Record::warn(
             "cron update has not succeeded recently",
             Some(format!(
-                "no successful cron update recorded{converged_note}"
+                "no successful cron update recorded{converged_note}{cause}"
             )),
         )),
         None => out.push(never_converged_record(inputs)),
     }
     None
+}
+
+/// `last cron run <outcome> <age> ago; <cause and next step>`, for rows
+/// whose title describes the host rather than that run.
+fn last_cron_note(inputs: &CronInputs, last: &crate::update_status::LastRun) -> String {
+    let why = if last.outcome == crate::update_status::OUTCOME_SKIP {
+        skip_cause(inputs, last)
+    } else {
+        run_cause(inputs, last)
+    };
+    format!(
+        "last cron run {} {} ago; {why}",
+        outcome_phrase(last),
+        crate::update_status::format_age(inputs.now.saturating_sub(last.at))
+    )
+}
+
+/// `failed`, `degraded: <stages> failing`, `skipped for local edits`, or a
+/// newer outcome word as is, for text about `run`.
+fn outcome_phrase(run: &crate::update_status::LastRun) -> String {
+    use crate::update_status::{OUTCOME_DEGRADED, OUTCOME_FAIL, OUTCOME_SKIP};
+
+    if run.outcome == OUTCOME_FAIL {
+        "failed".to_string()
+    } else if run.outcome == OUTCOME_SKIP {
+        "skipped for local edits".to_string()
+    } else if run.outcome == OUTCOME_DEGRADED && !run.failing.is_empty() {
+        format!("degraded: {} failing", run.failing)
+    } else {
+        run.outcome.clone()
+    }
+}
+
+/// The `update.last-failure` record when it describes `run`.
+fn failure_of<'a>(
+    inputs: &'a CronInputs,
+    run: &crate::update_status::LastRun,
+) -> Option<&'a crate::update_status::LastFailure> {
+    inputs
+        .last_failure
+        .as_ref()
+        .filter(|failure| failure.describes(run))
+}
+
+/// Failing items shown in one row before `+N more`.
+const SHOWN_FAILURE_ITEMS: usize = 3;
+
+/// Longest item detail shown in a row (the record keeps more).
+const SHOWN_FAILURE_DETAIL_BYTES: usize = 100;
+
+/// Why `run` failed plus the next step, for a row detail:
+/// `failing: tools: ripgrep (network unavailable); <next step>`. Without a
+/// matching record (an older Dot wrote the stamp, or the run named nothing)
+/// only the next step remains. A failing Tools or Prune stage points at
+/// `shdeps health`, which explains dependency state without a rerun.
+fn run_cause(inputs: &CronInputs, run: &crate::update_status::LastRun) -> String {
+    use crate::update_status::{STAGE_PRUNE, STAGE_TOOLS, clean_field};
+
+    let failure = failure_of(inputs, run);
+    let items = failure.map_or(&[][..], |failure| failure.items.as_slice());
+    let mut groups: Vec<(&str, Vec<String>)> = Vec::new();
+    for item in items.iter().take(SHOWN_FAILURE_ITEMS) {
+        let detail = clean_field(&item.detail, SHOWN_FAILURE_DETAIL_BYTES);
+        let text = match (item.name.is_empty(), detail.is_empty()) {
+            (false, false) => format!("{} ({detail})", item.name),
+            (false, true) => item.name.clone(),
+            (true, _) => detail,
+        };
+        match groups.iter_mut().find(|(stage, _)| *stage == item.stage) {
+            Some((_, texts)) => texts.push(text),
+            None => groups.push((&item.stage, vec![text])),
+        }
+    }
+    let more = items.len().saturating_sub(SHOWN_FAILURE_ITEMS)
+        + failure.map_or(0, |failure| failure.omitted);
+    // The record says which stage failed; without one (an older Dot), the
+    // degraded stages do. A provider that could not even be prepared is
+    // not `shdeps health`'s to explain.
+    let dependency = if items.is_empty() {
+        stages_need_shdeps(&run.failing)
+    } else {
+        items
+            .iter()
+            .any(|item| item.stage == STAGE_TOOLS || item.stage == STAGE_PRUNE)
+    };
+    let hint = next_step(dependency);
+    if groups.is_empty() {
+        return hint.to_string();
+    }
+    let mut listed = groups
+        .iter()
+        .map(|(stage, texts)| format!("{stage}: {}", texts.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if more > 0 {
+        listed.push_str(&format!(" +{more} more"));
+    }
+    format!("failing: {listed}; {hint}")
+}
+
+/// Whether a comma-separated degraded stage list names a dependency stage
+/// (Tools or Prune), which `shdeps health` explains without a rerun.
+fn stages_need_shdeps(failing: &str) -> bool {
+    use crate::update_status::{STAGE_PRUNE, STAGE_TOOLS};
+
+    failing
+        .split(',')
+        .any(|stage| stage == STAGE_TOOLS || stage == STAGE_PRUNE)
+}
+
+/// The next step for a failed run: `shdeps health` when a dependency stage
+/// failed, otherwise the update's own output.
+fn next_step(dependency: bool) -> &'static str {
+    if dependency {
+        "run shdeps health, or dot update for the full output"
+    } else {
+        "run dot update for the full output"
+    }
+}
+
+/// The edited files that skipped `run` (a cron skip) plus the next step:
+/// `edited: .bashrc, .zshrc; <next step>`. The record keeps the first few;
+/// without one (an older Dot) only the next step remains.
+fn skip_cause(inputs: &CronInputs, run: &crate::update_status::LastRun) -> String {
+    let hint = "run dot status, then commit, stash, or resolve the edits";
+    let Some(failure) = failure_of(inputs, run) else {
+        return hint.to_string();
+    };
+    let files: Vec<&str> = failure
+        .items
+        .iter()
+        .filter(|item| item.stage == crate::update_status::STAGE_DIRTY)
+        .map(|item| item.name.as_str())
+        .collect();
+    if files.is_empty() {
+        return hint.to_string();
+    }
+    let mut listed = files
+        .iter()
+        .take(SHOWN_FAILURE_ITEMS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = files.len().saturating_sub(SHOWN_FAILURE_ITEMS) + failure.omitted;
+    if more > 0 {
+        listed.push_str(&format!(" +{more} more"));
+    }
+    format!("edited: {listed}; {hint}")
 }
 
 /// The cron row when no cron run ever converged. Before the last-run stamp
@@ -703,9 +844,8 @@ fn never_converged_record(inputs: &CronInputs) -> Record {
         return Record::warn(
             "cron update has not succeeded recently",
             Some(format!(
-                "no successful cron update recorded; last cron run {} {} ago",
-                last.outcome,
-                age(last.at)
+                "no successful cron update recorded; {}",
+                last_cron_note(inputs, last)
             )),
         );
     }
@@ -773,14 +913,12 @@ fn last_run_record(inputs: &CronInputs, clean_cron: Option<i64>) -> Option<Recor
         };
         Record::warn(
             format!("last update degraded: {failing} failing"),
-            Some(format!(
-                "{detail}; rerun dot update to see the failing stage"
-            )),
+            Some(format!("{detail}; {}", run_cause(inputs, last))),
         )
     } else {
         Record::warn(
             "last update failed",
-            Some(format!("{detail}; rerun dot update to see what failed")),
+            Some(format!("{detail}; {}", run_cause(inputs, last))),
         )
     })
 }
@@ -993,11 +1131,63 @@ fn present(value: Option<&str>) -> Option<&str> {
     }
 }
 
+/// The profile selection as one informational row: the selected profile
+/// and how it was chosen, the profiles it includes, the phase-one
+/// overlays, every matching selector, and the identity selectors matched
+/// against. These are configuration facts that never change between runs,
+/// and they used to take five rows; `None` when there is nothing to say.
+fn profile_record(inputs: &OverlayInputs) -> Option<Record> {
+    let mut facts = Vec::new();
+    let selected = present(inputs.selected_profile);
+    if selected.is_some() {
+        facts.push(
+            present(inputs.selection_state)
+                .unwrap_or("unknown")
+                .to_string(),
+        );
+    }
+    if !inputs.included_profiles.is_empty() {
+        facts.push(format!("includes {}", inputs.included_profiles.join(" ")));
+    }
+    if !inputs.phase_one.is_empty() {
+        facts.push(format!("phase-one overlays {}", inputs.phase_one.join(" ")));
+    }
+    for selector in &inputs.selectors {
+        let fields = read_fields(selector, 6);
+        if fields[5] != "true" {
+            continue;
+        }
+        let source: String = match fields[0].as_str() {
+            "root" => "root".to_string(),
+            "local" => "machine-local".to_string(),
+            "personal" => "active personal overlay".to_string(),
+            other => other.to_string(),
+        };
+        let leaf = match fields[1].rsplit('/').next() {
+            Some(leaf) => leaf,
+            None => fields[1].as_str(),
+        };
+        facts.push(format!("{source} selector {leaf} -> {}", fields[4]));
+    }
+    if let (Some(user), Some(host)) = (present(inputs.profile_user), present(inputs.profile_host)) {
+        facts.push(format!("for {user}@{host}"));
+    }
+    if selected.is_none() && facts.is_empty() {
+        return None;
+    }
+    let message = match selected {
+        Some(selected) => format!("profile {selected}"),
+        None => "profile".to_string(),
+    };
+    Some(Record::info(message, Some(facts.join("; "))))
+}
+
 /// `_dr_check_overlays` (`doctor/overlays.sh`): profile selection
 /// reporting, per-overlay lifecycle and source health, and overlay
 /// symlink ownership validation. The profile identity, selection, and
-/// matching selector are configuration facts, so they render as
-/// informational rows that are never counted.
+/// matching selector are configuration facts, so they render as one
+/// informational row that is never counted. A healthy overlay folds into
+/// one row; any problem keeps all of its rows.
 ///
 /// Worktree, URL, and origin probes reuse [`crate::overlays`];
 /// manifest parsing and link-target derivation reuse
@@ -1022,53 +1212,7 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
             Some("no profiles.d directory; using legacy overlay discovery".to_string()),
         ));
     } else {
-        if let (Some(user), Some(host)) =
-            (present(inputs.profile_user), present(inputs.profile_host))
-        {
-            out.push(Record::info(
-                "profile identity",
-                Some(format!("{user}@{host}")),
-            ));
-        }
-        if let Some(selected) = present(inputs.selected_profile) {
-            let state = present(inputs.selection_state).unwrap_or("unknown");
-            out.push(Record::info(
-                "selected profile",
-                Some(format!("{selected} ({state})")),
-            ));
-        }
-        if !inputs.included_profiles.is_empty() {
-            out.push(Record::info(
-                "included profiles",
-                Some(inputs.included_profiles.join(" ")),
-            ));
-        }
-        if !inputs.phase_one.is_empty() {
-            out.push(Record::info(
-                "phase-one overlays",
-                Some(inputs.phase_one.join(" ")),
-            ));
-        }
-        for selector in &inputs.selectors {
-            let fields = read_fields(selector, 6);
-            if fields[5] != "true" {
-                continue;
-            }
-            let source: String = match fields[0].as_str() {
-                "root" => "root".to_string(),
-                "local" => "machine-local".to_string(),
-                "personal" => "active personal overlay".to_string(),
-                other => other.to_string(),
-            };
-            let leaf = match fields[1].rsplit('/').next() {
-                Some(leaf) => leaf,
-                None => fields[1].as_str(),
-            };
-            out.push(Record::info(
-                format!("matching selector ({source})"),
-                Some(format!("{} -> {}", leaf, fields[4])),
-            ));
-        }
+        out.extend(profile_record(inputs));
         for key in &inputs.unknown_keys {
             let message = match key.effect {
                 crate::unknown_keys::Effect::Ignored => "unknown profile key ignored",
@@ -1195,10 +1339,13 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                     })
                     .map(|key| data_key_detail(key, inputs.home))
                     .collect();
-                out.push(Record::warn(
-                    format!("{name}: selected but skipped: unknown descriptor key"),
-                    (!keys.is_empty()).then(|| keys.join("; ")),
-                ));
+                out.push(
+                    Record::warn(
+                        format!("{name}: selected but skipped: unknown descriptor key"),
+                        None,
+                    )
+                    .with_items(keys),
+                );
                 continue;
             }
             "selected-optional-unavailable" => {
@@ -1283,6 +1430,8 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
             ));
             continue;
         }
+        // This overlay's rows, folded into one when every one passes.
+        let start = out.len();
         out.push(Record::ok(
             format!("{name}: cloned"),
             Some(tilde(&path, inputs.home)),
@@ -1308,13 +1457,25 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 ));
             }
         }
-        overlay_state_records(
+        let status = statuses.get(&path);
+        overlay_state_records(&name, &path, optional == "true", status, &mut out);
+        // Only a clean overlay on its current upstream folds, so the branch
+        // facts exist whenever the fold uses them.
+        let branch = status
+            .and_then(|status| status.as_ref().ok()?.as_ref())
+            .and_then(|status| {
+                Some(current_fact(
+                    status.head.as_deref()?,
+                    status.upstream.as_deref()?,
+                ))
+            })
+            .unwrap_or_default();
+        let rows = out.split_off(start);
+        out.extend(fold_healthy(
+            rows,
             &name,
-            &path,
-            optional == "true",
-            statuses.get(&path).and_then(Option::as_ref),
-            &mut out,
-        );
+            format!("{}, {branch}", tilde(&path, inputs.home)),
+        ));
     }
 
     if held {
@@ -1345,11 +1506,18 @@ fn check_overlay_links(
     let content = std::fs::read(&inputs.manifest).unwrap_or_default();
     // `stream_lines` mirrors the shell `while read` loop: NULs
     // stripped, `\n`-split, final partial line kept.
-    let mut issues: u64 = 0;
+    let mut issues: Vec<String> = Vec::new();
     let mut owners: BTreeMap<String, (String, String, bool)> = BTreeMap::new();
-    for line in crate::repos_overlays::stream_lines(&content) {
+    for (index, line) in crate::repos_overlays::stream_lines(&content)
+        .into_iter()
+        .enumerate()
+    {
         let Some(parsed) = crate::repos_overlays::parse_manifest_record(&line) else {
-            issues += 1;
+            issues.push(format!(
+                "{} line {}: unreadable record",
+                tilde(&inputs.manifest, inputs.home),
+                index + 1
+            ));
             continue;
         };
         // Three-column records carry the literal link target as
@@ -1361,24 +1529,28 @@ fn check_overlay_links(
     for (rel, (owner, expected_lexical, exact)) in &owners {
         let dst = format!("{}/{}", inputs.home, rel);
         let dst_path = Path::new(&dst);
+        // Each issue names the link and why, so the row says which links
+        // `dot update` will touch instead of only how many.
+        let mut issue =
+            |reason: &str| issues.push(format!("{} ({reason})", tilde(&dst, inputs.home)));
         let link_meta = std::fs::symlink_metadata(dst_path).ok();
-        let is_link = link_meta
-            .as_ref()
-            .is_some_and(|meta| meta.file_type().is_symlink());
-        if !is_link {
-            issues += 1;
-            continue;
+        match link_meta {
+            None => {
+                issue("missing");
+                continue;
+            }
+            Some(meta) if !meta.file_type().is_symlink() => {
+                issue("not a symlink");
+                continue;
+            }
+            Some(_) => {}
         }
         if !dst_path.exists() {
-            issues += 1;
+            issue("dangling");
             continue;
         }
-        let Some(path) = overlay_paths.get(owner) else {
-            issues += 1;
-            continue;
-        };
-        let Some(sync) = overlay_syncs.get(owner) else {
-            issues += 1;
+        let (Some(path), Some(sync)) = (overlay_paths.get(owner), overlay_syncs.get(owner)) else {
+            issue(&format!("owner {owner} is not active"));
             continue;
         };
         let actual_bytes = std::fs::read_link(dst_path)
@@ -1393,13 +1565,13 @@ fn check_overlay_links(
         ) {
             Some(current) => current,
             None => {
-                issues += 1;
+                issue("target cannot be derived");
                 continue;
             }
         };
         if *exact {
             if expected_lexical != &current || actual != current {
-                issues += 1;
+                issue("points elsewhere");
             }
             continue;
         }
@@ -1407,17 +1579,18 @@ fn check_overlay_links(
             continue;
         }
         let expected = format!("{path}/home/{rel}");
-        if !symlink_points_to(dst_path, &expected) {
-            issues += 1;
+        if !crate::doctor_paths::symlink_points_to(dst_path, Path::new(&expected)) {
+            issue("points elsewhere");
         }
     }
-    if issues == 0 {
+    if issues.is_empty() {
         out.push(Record::ok("overlay symlinks healthy", None));
     } else {
-        out.push(Record::warn(
-            format!("{issues} overlay symlink issue(s)"),
-            Some("run 'dot update' to re-link".to_string()),
-        ));
+        out.push(
+            Record::warn(format!("{} overlay symlink issue(s)", issues.len()), None)
+                .with_items(issues)
+                .with_hint("run dot update to re-link"),
+        );
     }
 }
 
@@ -1486,8 +1659,13 @@ fn standalone_control(release: &Path) -> Option<&Path> {
 /// installer refuses to run while its lock exists, and an archive backup
 /// sibling means a Shdeps install was interrupted. Checkouts report
 /// nothing: their updates do not go through either installer.
-pub fn check_install_layout(inputs: &InstallInputs) -> Vec<Record> {
-    let mut out = Vec::new();
+///
+/// A healthy layout files no row: its kind travels back in
+/// [`InstallLayout::kind`] for the runtime's version row to name, so only
+/// problems take rows of their own.
+pub fn check_install_layout(inputs: &InstallInputs) -> InstallLayout {
+    let mut layout = InstallLayout::default();
+    let out = &mut layout.records;
     let managed_real = std::fs::canonicalize(inputs.managed_root).ok();
     let managed_standalone = installer_link(inputs.managed_root);
     let running_standalone = if inputs.release_root {
@@ -1504,8 +1682,8 @@ pub fn check_install_layout(inputs: &InstallInputs) -> Vec<Record> {
                     tilde(&inputs.managed_root.to_string_lossy(), inputs.home)
                 )),
             ));
-            check_adoption_lock(inputs, &control, &mut out);
-            return out;
+            check_adoption_lock(inputs, &control, out);
+            return layout;
         }
         // An adoption whose fallback switch was interrupted leaves no root,
         // only the installer's link parked beside it.
@@ -1519,14 +1697,11 @@ pub fn check_install_layout(inputs: &InstallInputs) -> Vec<Record> {
                     tilde(&parked.to_string_lossy(), inputs.home)
                 )),
             ));
-            check_adoption_lock(inputs, &control, &mut out);
-            return out;
+            check_adoption_lock(inputs, &control, out);
+            return layout;
         }
     } else if let Some(control) = managed_standalone.or(running_standalone.map(Path::to_path_buf)) {
-        out.push(Record::ok(
-            "dot release layout",
-            Some("standalone installer (rerun install.sh to upgrade)".to_string()),
-        ));
+        layout.kind = Some(STANDALONE_KIND);
         // A warning, not a failure: without a provider the lock blocks only a
         // manual `install.sh` rerun (never `dot update`), and it is
         // legitimately present while an installer runs.
@@ -1540,21 +1715,38 @@ pub fn check_install_layout(inputs: &InstallInputs) -> Vec<Record> {
                 )),
             ));
         }
-        return out;
+        return layout;
     }
     let managed_dir =
         std::fs::symlink_metadata(inputs.managed_root).is_ok_and(|meta| meta.file_type().is_dir());
     let running_managed = managed_real.as_deref() == Some(inputs.source_real);
     if !inputs.shdeps {
-        return out;
+        return layout;
     }
-    if inputs.release_root && managed_dir && running_managed {
-        check_layout_marker(inputs, &mut out);
+    if inputs.release_root && managed_dir && running_managed && check_layout_marker(inputs, out) {
+        layout.kind = Some(SHDEPS_KIND);
     }
     // Leftovers are reported whichever Dot runs: a failed swap whose rollback
     // also failed leaves only the backup, with no root to run from.
-    check_install_leftovers(inputs, managed_dir, &mut out);
-    out
+    check_install_leftovers(inputs, managed_dir, out);
+    layout
+}
+
+/// [`InstallLayout::kind`] of a release the standalone installer owns.
+pub const STANDALONE_KIND: &str = "standalone install; rerun install.sh to upgrade";
+/// [`InstallLayout::kind`] of a release Shdeps owns and can upgrade.
+pub const SHDEPS_KIND: &str = "Shdeps release";
+
+/// What [`check_install_layout`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstallLayout {
+    /// How the running release is installed, when its owner can upgrade it
+    /// (see [`STANDALONE_KIND`] and [`SHDEPS_KIND`]); `None` when the layout
+    /// itself is a problem row. Leftovers beside a healthy layout (an
+    /// installer lock, an archive backup) keep their own rows and the kind.
+    pub kind: Option<&'static str>,
+    /// Rows for every layout problem and leftover found.
+    pub records: Vec<Record>,
 }
 
 /// `<root>.shdeps-parked-root`: where Shdeps parks the installer's root
@@ -1603,22 +1795,22 @@ fn check_adoption_lock(inputs: &InstallInputs, control: &Path, out: &mut Vec<Rec
     }
 }
 
-/// The Shdeps archive marker of the managed release root Dot runs from.
-fn check_layout_marker(inputs: &InstallInputs, out: &mut Vec<Record>) {
+/// The Shdeps archive marker of the managed release root Dot runs from:
+/// `true` when it is valid, otherwise a problem row is filed.
+fn check_layout_marker(inputs: &InstallInputs, out: &mut Vec<Record>) -> bool {
     let marker = inputs.managed_root.join(SHDEPS_LAYOUT_FILE);
     let marker_shown = tilde(&marker.to_string_lossy(), inputs.home);
     match std::fs::symlink_metadata(&marker) {
         Ok(meta) if meta.file_type().is_file() => {
             if std::fs::read(&marker).is_ok_and(|content| content == SHDEPS_LAYOUT_CONTENT) {
-                out.push(Record::ok("dot release layout", Some("Shdeps release".to_string())));
-            } else {
-                out.push(Record::fail(
-                    "dot release layout marker is invalid",
-                    Some(format!(
-                        "{marker_shown}: Shdeps refuses to upgrade until it holds 'v1 archive'"
-                    )),
-                ));
+                return true;
             }
+            out.push(Record::fail(
+                "dot release layout marker is invalid",
+                Some(format!(
+                    "{marker_shown}: Shdeps refuses to upgrade until it holds 'v1 archive'"
+                )),
+            ));
         }
         Ok(_) => out.push(Record::fail(
             "dot release layout marker is invalid",
@@ -1633,6 +1825,7 @@ fn check_layout_marker(inputs: &InstallInputs, out: &mut Vec<Record>) {
             )),
         )),
     }
+    false
 }
 
 /// Install state left behind beside the managed root: an interrupted
@@ -1663,10 +1856,11 @@ fn check_install_leftovers(inputs: &InstallInputs, managed_dir: bool, out: &mut 
             } else {
                 "the install root is missing; run dot update to reinstall it"
             };
-            out.push(Record::warn(
-                "interrupted Shdeps install left a backup",
-                Some(format!("{}; {next}", backups.join(" "))),
-            ));
+            out.push(
+                Record::warn("interrupted Shdeps install left a backup", None)
+                    .with_items(backups)
+                    .with_hint(next),
+            );
         }
         let lock = parent.join(STANDALONE_CONTROL).join("lock");
         if std::fs::symlink_metadata(&lock).is_ok() {
@@ -1795,12 +1989,56 @@ pub struct ProviderInputs<'a> {
     pub prompt_handshake_capability: bool,
 }
 
+/// The provider's update policy, source, and development revision as one
+/// informational row (they used to take three, one of them a permanent
+/// "differs from Dot lock" with a full SHA under the latest policy).
+/// `development` is the development checkout path.
+fn provider_record(inputs: &ProviderInputs, policy: &str, development: &str) -> Record {
+    let mut facts = vec![format!("{policy} policy")];
+    let latest = policy == "latest";
+    let source = inputs.installer.as_ref().map(|installer| installer.source);
+    match (&inputs.installer, source) {
+        (Some(installer), Some("explicit")) => facts.push(format!(
+            "caller-selected reviewed installer {}",
+            tilde(installer.path, inputs.home)
+        )),
+        (_, Some("pinned-dev")) if latest => facts.push(format!(
+            "development checkout {} selected by Dot lock",
+            tilde(development, inputs.home)
+        )),
+        (_, Some("latest-dev")) => facts.push(format!(
+            "trusted development checkout {}",
+            tilde(development, inputs.home)
+        )),
+        (_, Some("managed")) if latest => {
+            facts.push("managed release via reviewed bootstrap".to_string())
+        }
+        _ => {}
+    }
+    if latest && matches!(source, Some("pinned-dev" | "latest-dev")) {
+        let locked = inputs.locked_revision.unwrap_or("");
+        let current = inputs.development_revision.unwrap_or("");
+        let short: String = current.chars().take(12).collect();
+        if !locked.is_empty() && current == locked {
+            facts.push(format!("revision {short} (matches Dot lock)"));
+        } else if current.is_empty() {
+            facts.push("revision <unavailable>".to_string());
+        } else {
+            // Expected under the latest policy, so no full SHA: the
+            // checkout follows its branch, not the lock.
+            facts.push(format!("unpinned revision {short}"));
+        }
+    }
+    Record::info("Shdeps provider", Some(facts.join("; ")))
+}
+
 /// `_dr_check_provider` (`doctor/provider.sh`): the dependency
 /// provider boundary (reviewed installer selection plus ABI
 /// agreement). Helper outcomes arrive via [`ProviderInputs`];
 /// only the `_dr_tilde` display runs in-process. The update policy,
 /// provider source, and development revision are configuration facts, so
-/// they render as informational rows that are never counted.
+/// they render as one informational row that is never counted (see
+/// `provider_record`).
 pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
     let mut out = vec![Record::section("Dependency provider")];
     match inputs.dependency_provider {
@@ -1822,22 +2060,17 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
     } else {
         inputs.policy
     };
+    let development = format!("{}/shdeps", inputs.dev_dir);
+    // The policy, source, and revision are configuration facts: one
+    // informational row, whatever follows.
+    out.push(provider_record(inputs, policy, &development));
     if !inputs.configure_ok {
-        out.push(Record::info(
-            "Shdeps update policy",
-            Some(policy.to_string()),
-        ));
         out.push(Record::fail(
             "Shdeps provider is unavailable",
             Some("run dot update to bootstrap the reviewed provider release".to_string()),
         ));
         return out;
     }
-    out.push(Record::info(
-        "Shdeps update policy",
-        Some(policy.to_string()),
-    ));
-    let development = format!("{}/shdeps", inputs.dev_dir);
     let mut development_invalid = false;
     if policy == "latest" && inputs.development_exists && !inputs.development_valid {
         development_invalid = true;
@@ -1871,85 +2104,19 @@ pub fn check_provider(inputs: &ProviderInputs) -> Vec<Record> {
         ));
     }
     match installer.source {
-        "explicit" => {
-            out.push(Record::info(
-                "Shdeps provider source",
-                Some(format!(
-                    "caller-selected reviewed installer: {}",
-                    tilde(installer.path, inputs.home)
-                )),
-            ));
+        "explicit" | "pinned-dev" | "managed" => {
             out.push(Record::ok(
                 "Shdeps installer is reviewed",
                 Some(tilde(installer.path, inputs.home)),
             ));
         }
-        "pinned-dev" => {
-            if policy == "latest" {
-                out.push(Record::info(
-                    "Shdeps provider source",
-                    Some(format!(
-                        "development checkout selected by Dot lock: {}",
-                        tilde(&development, inputs.home)
-                    )),
-                ));
-            }
-            out.push(Record::ok(
-                "Shdeps installer is reviewed",
-                Some(tilde(installer.path, inputs.home)),
-            ));
-        }
-        "latest-dev" => {
-            out.push(Record::info(
-                "Shdeps provider source",
-                Some(format!(
-                    "trusted development checkout: {}",
-                    tilde(&development, inputs.home)
-                )),
-            ));
-        }
-        "managed" => {
-            if policy == "latest" {
-                out.push(Record::info(
-                    "Shdeps provider source",
-                    Some("managed release via reviewed bootstrap".to_string()),
-                ));
-            }
-            out.push(Record::ok(
-                "Shdeps installer is reviewed",
-                Some(tilde(installer.path, inputs.home)),
-            ));
-        }
+        "latest-dev" => {}
         _ => {
             out.push(Record::fail(
                 "Shdeps provider source is unavailable",
                 Some("run dot update to restore provider selection metadata".to_string()),
             ));
             return out;
-        }
-    }
-    if policy == "latest" && (installer.source == "pinned-dev" || installer.source == "latest-dev")
-    {
-        let locked = inputs.locked_revision.unwrap_or("");
-        let current = inputs.development_revision.unwrap_or("");
-        if !locked.is_empty() && current == locked {
-            let short: String = current.chars().take(12).collect();
-            out.push(Record::info(
-                "Shdeps development revision",
-                Some(format!("matches Dot lock: {short}")),
-            ));
-        } else {
-            let shown = if current.is_empty() {
-                "<unavailable>"
-            } else {
-                current
-            };
-            out.push(Record::info(
-                "Shdeps development revision",
-                Some(format!(
-                    "trusted unpinned revision differs from Dot lock; accepted by latest policy: {shown}"
-                )),
-            ));
         }
     }
     if inputs.binary.is_none() {
@@ -2112,21 +2279,34 @@ fn base_git_prefix(topology: &str, client_git_dir: &str, home: &str) -> Option<V
 /// spawn failure, non-zero exit, or unrecognized topology (the
 /// shell `|| true` / `|| printf false` fallbacks apply at each
 /// call site, not here).
-fn base_git(topology: &str, client_git_dir: &str, home: &str, args: &[&str]) -> Option<String> {
-    let prefix = base_git_prefix(topology, client_git_dir, home)?;
-    let output = inspect_git(&prefix, args)?;
+fn base_git(
+    topology: &str,
+    client_git_dir: &str,
+    home: &str,
+    args: &[&str],
+) -> Result<Option<String>, TimedOut> {
+    let Some(prefix) = base_git_prefix(topology, client_git_dir, home) else {
+        return Ok(None);
+    };
+    let Some(output) = inspect_git(&prefix, args, probe_deadline())? else {
+        return Ok(None);
+    };
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
-    Some(captured(&String::from_utf8_lossy(&output.stdout)))
+    Ok(Some(captured(&String::from_utf8_lossy(&output.stdout))))
 }
 
 /// Run one read-only repository inspection for doctor: the bound host Git,
 /// `prefix` then `args`, stdout captured, stderr and stdin closed. Inherited
 /// repository selectors (`GIT_INDEX_FILE` from a Git hook, say) are removed
 /// so the probe inspects the repository it names, while the user's Git
-/// configuration still applies.
-fn inspect_git(prefix: &[OsString], args: &[&str]) -> Option<std::process::Output> {
+/// configuration still applies. `Ok(None)` means Git could not be run.
+fn inspect_git(
+    prefix: &[OsString],
+    args: &[&str],
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<std::process::Output>, TimedOut> {
     let mut command = crate::init_client_identity::host_git_command();
     crate::temp::scrub_repository_selectors(&mut command);
     command
@@ -2135,13 +2315,16 @@ fn inspect_git(prefix: &[OsString], args: &[&str]) -> Option<std::process::Outpu
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    crate::cleanup::run_session_output(
+    match crate::cleanup::run_session_output_typed(
         command,
-        None,
+        deadline,
         crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
         crate::cleanup::LingerPolicy::Detach,
-    )
-    .ok()
+    ) {
+        Ok(output) => Ok(Some(output)),
+        Err(crate::cleanup::SessionOutputError::TimedOut) => Err(TimedOut),
+        Err(_) => Ok(None),
+    }
 }
 
 /// The single status invocation doctor spends per repository. It answers
@@ -2348,15 +2531,28 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
         "client Git directory exists",
         Some(tilde(inputs.client_git_dir, inputs.home)),
     ));
+    // What the folded healthy row says about the layout.
+    let mut layout_fact = "ordinary layout".to_string();
     let git = |args: &[&str]| base_git(inputs.topology, inputs.client_git_dir, inputs.home, args);
+    // One stalled probe ends the section with a warning: the rows after it
+    // would only restate that Git did not answer, and wrongly as failures.
+    let stalled = |mut out: Vec<Record>| {
+        out.push(Record::warn(
+            "client repository did not answer",
+            Some(timed_out_detail()),
+        ));
+        out
+    };
     if inputs.topology == "ordinary" {
         out.push(Record::ok("ordinary client layout", None));
     } else {
         // Both layout keys in one process; `--get` semantics (last value
         // wins) and the old defaults (`false`, empty) when unset.
         let (mut is_bare, mut has_worktree) = ("false".to_string(), String::new());
-        let layout =
-            git(&["config", "-z", "--get-regexp", r"^core\.(bare|worktree)$"]).unwrap_or_default();
+        let layout = match git(&["config", "-z", "--get-regexp", r"^core\.(bare|worktree)$"]) {
+            Ok(layout) => layout.unwrap_or_default(),
+            Err(TimedOut) => return stalled(out),
+        };
         for entry in layout.split('\0') {
             match entry.split_once('\n') {
                 Some(("core.bare", value)) => is_bare = value.to_string(),
@@ -2365,8 +2561,10 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
             }
         }
         if is_bare == "true" {
+            layout_fact = "legacy bare layout".to_string();
             out.push(Record::ok("legacy bare client layout", None));
         } else if !has_worktree.is_empty() {
+            layout_fact = format!("worktree {}", tilde(&has_worktree, inputs.home));
             out.push(Record::ok(
                 "explicit-worktree client layout",
                 Some(tilde(&has_worktree, inputs.home)),
@@ -2378,7 +2576,10 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
             ));
         }
     }
-    let resolved = git(&["rev-parse", "--show-toplevel"]).unwrap_or_default();
+    let resolved = match git(&["rev-parse", "--show-toplevel"]) {
+        Ok(resolved) => resolved.unwrap_or_default(),
+        Err(TimedOut) => return stalled(out),
+    };
     if resolved == inputs.home {
         out.push(Record::ok("client worktree resolves to $HOME", None));
     } else {
@@ -2392,28 +2593,35 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
             Some(format!("expected {}, got {got}", inputs.home)),
         ));
     }
-    let Some(status) = git(&STATUS_ARGS).map(|text| parse_status_v2(&text)) else {
+    let status = match git(&STATUS_ARGS) {
+        Ok(status) => status,
+        Err(TimedOut) => return stalled(out),
+    };
+    let Some(status) = status.map(|text| parse_status_v2(&text)) else {
         out.push(Record::warn(
             "client repository status is unavailable",
             Some("run dot status to inspect".to_string()),
         ));
         return out;
     };
-    if status.unmerged > 0 {
+    let prefix =
+        base_git_prefix(inputs.topology, inputs.client_git_dir, inputs.home).unwrap_or_default();
+    let git_dir = if inputs.topology == "separate" {
+        Some(PathBuf::from(inputs.client_git_dir))
+    } else {
+        worktree_git_dir(Path::new(inputs.home))
+    };
+    let interrupted = interruption(&status, git_dir.as_deref());
+    // Inside a session the headless row below speaks for the unmerged
+    // entries too, in update's severity.
+    if status.unmerged > 0 && interrupted.is_none() {
         let pullable = status.head.is_some() && status.upstream.is_some();
-        let prefix = base_git_prefix(inputs.topology, inputs.client_git_dir, inputs.home)
-            .unwrap_or_default();
         out.extend(unmerged_record(
             format!("{} unmerged client path(s)", status.unmerged),
             &prefix,
             pullable,
         ));
     }
-    let git_dir = if inputs.topology == "separate" {
-        Some(PathBuf::from(inputs.client_git_dir))
-    } else {
-        worktree_git_dir(Path::new(inputs.home))
-    };
     out.extend(frozen_rebase_record(
         |upstream| format!("the last client rebase onto {upstream} conflicted; rebase manually"),
         git_dir.as_deref(),
@@ -2431,12 +2639,17 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
             Some("run dot status to inspect".to_string()),
         ));
     }
-    match &status.head {
-        Some(head) => out.push(Record::ok("client HEAD on branch", Some(head.clone()))),
-        None => out.push(Record::warn("client HEAD is detached", None)),
-    }
-    let Some(upstream) = status.upstream.as_deref().filter(|_| status.head.is_some()) else {
-        out.push(Record::warn("client upstream is not configured", None));
+    let Some(head) = status.head.as_deref() else {
+        out.push(headless_record(
+            &Subject::client(&prefix),
+            interrupted,
+            tracked == 0,
+        ));
+        return out;
+    };
+    out.push(Record::ok("client HEAD on branch", Some(head.to_string())));
+    let Some(upstream) = status.upstream.as_deref() else {
+        out.push(no_upstream_record(&Subject::client(&prefix), head));
         return out;
     };
     match status.ahead_behind {
@@ -2455,12 +2668,14 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
                 out.push(Record::warn(message, Some(detail)));
             }
         },
-        None => out.push(Record::warn(
-            "client upstream could not be compared",
-            Some(upstream.to_string()),
-        )),
+        None => out.push(gone_upstream_record(&Subject::client(&prefix), upstream)),
     }
-    out
+    let healthy = format!(
+        "{}, {layout_fact}, {}",
+        tilde(inputs.client_git_dir, inputs.home),
+        current_fact(head, upstream)
+    );
+    fold_healthy(out, "client repository", healthy)
 }
 
 /// Branch, upstream, and tracked-change rows for one cloned overlay, in the
@@ -2473,19 +2688,31 @@ fn overlay_state_records(
     name: &str,
     path: &str,
     optional: bool,
-    status: Option<&RepoStatus>,
+    status: Option<&OverlayStatus>,
     out: &mut Vec<Record>,
 ) {
-    let Some(status) = status else {
-        out.push(Record::warn(
-            format!("{name}: repository status is unavailable"),
-            Some("run dot status to inspect".to_string()),
-        ));
-        return;
+    let status = match status {
+        Some(Ok(Some(status))) => status,
+        Some(Err(TimedOut)) => {
+            out.push(Record::warn(
+                format!("{name}: repository did not answer"),
+                Some(timed_out_detail()),
+            ));
+            return;
+        }
+        Some(Ok(None)) | None => {
+            out.push(Record::warn(
+                format!("{name}: repository status is unavailable"),
+                Some("run dot status to inspect".to_string()),
+            ));
+            return;
+        }
     };
-    if status.unmerged > 0 {
+    let prefix = [OsString::from("-C"), OsString::from(path)];
+    let git_dir = worktree_git_dir(Path::new(path));
+    let interrupted = interruption(status, git_dir.as_deref());
+    if status.unmerged > 0 && interrupted.is_none() {
         let pullable = status.head.is_some() && status.upstream.is_some();
-        let prefix = [OsString::from("-C"), OsString::from(path)];
         out.extend(unmerged_record(
             format!("{name}: {} unmerged path(s)", status.unmerged),
             &prefix,
@@ -2494,7 +2721,7 @@ fn overlay_state_records(
     }
     out.extend(frozen_rebase_record(
         |upstream| format!("{name}: the last rebase onto {upstream} conflicted; rebase manually"),
-        worktree_git_dir(Path::new(path)).as_deref(),
+        git_dir.as_deref(),
         status,
         optional,
     ));
@@ -2505,18 +2732,13 @@ fn overlay_state_records(
             Some("run dot status to inspect".to_string()),
         ));
     }
-    if status.head.is_none() {
-        out.push(Record::warn(
-            format!("{name}: HEAD is detached"),
-            Some("dot update skips this overlay until it is back on a branch".to_string()),
-        ));
+    let subject = Subject::overlay(name, &prefix);
+    let Some(head) = status.head.as_deref() else {
+        out.push(headless_record(&subject, interrupted, tracked == 0));
         return;
-    }
+    };
     let Some(upstream) = status.upstream.as_deref() else {
-        out.push(Record::warn(
-            format!("{name}: upstream is not configured"),
-            Some("dot update skips pulling this overlay".to_string()),
-        ));
+        out.push(no_upstream_record(&subject, head));
         return;
     };
     match status.ahead_behind {
@@ -2536,28 +2758,198 @@ fn overlay_state_records(
         },
         // Git names the upstream but cannot resolve it (a gone branch);
         // update's upstream probe fails the same way and skips the pull.
-        None => out.push(Record::warn(
-            format!("{name}: upstream could not be compared"),
-            Some(format!("{upstream}; dot update skips pulling this overlay")),
+        None => out.push(gone_upstream_record(&subject, upstream)),
+    }
+}
+
+/// Who a repository row speaks for, in the wording each section has always
+/// used, so the client and overlay rows for one state read alike.
+struct Subject<'a> {
+    /// Message prefix: `client ` or `<name>: `.
+    prefix: String,
+    /// What `dot update` skips: `the client` or `this overlay`.
+    object: &'static str,
+    /// Git argv prefix that selects this repository, for copy-pasteable
+    /// commands (the base needs its separate Git directory and work tree).
+    git: &'a [OsString],
+}
+
+impl<'a> Subject<'a> {
+    fn client(git: &'a [OsString]) -> Self {
+        Subject {
+            prefix: "client ".to_string(),
+            object: "the client",
+            git,
+        }
+    }
+
+    fn overlay(name: &str, git: &'a [OsString]) -> Self {
+        Subject {
+            prefix: format!("{name}: "),
+            object: "this overlay",
+            git,
+        }
+    }
+
+    fn message(&self, predicate: &str) -> String {
+        format!("{}{predicate}", self.prefix)
+    }
+}
+
+/// What a repository whose HEAD is on no branch is in the middle of, read
+/// from its per-worktree Git directory (stat-level); `None` on a branch or
+/// when nothing is in progress.
+fn interruption(
+    status: &RepoStatus,
+    git_dir: Option<&Path>,
+) -> Option<crate::repos_pull::Interruption> {
+    if status.head.is_some() {
+        return None;
+    }
+    git_dir.and_then(crate::repos_pull::interruption)
+}
+
+/// The row for a repository whose HEAD is on no branch, in `dot update`'s
+/// severity for the same state (`repos_pull::stranded_head`). A rebase
+/// leaves HEAD detached, so this used to read as a plain detached HEAD with
+/// the wrong next step, even for dot's own interrupted rebase that fails
+/// every update:
+///
+/// - dot's own interrupted rebase with nothing uncommitted: the next update
+///   aborts it and pulls (a warning);
+/// - the same with uncommitted changes: every update fails, optional
+///   overlays included, until it is aborted or finished (a failure);
+/// - a session the user started, or a plain detached HEAD: update skips the
+///   repository (a warning).
+fn headless_record(
+    subject: &Subject<'_>,
+    interrupted: Option<crate::repos_pull::Interruption>,
+    clean: bool,
+) -> Record {
+    use crate::repos_pull::{Interruption, git_hint};
+    match interrupted {
+        Some(Interruption::DotRebase) if clean => Record::warn(
+            subject.message("has an interrupted dot rebase"),
+            Some("the next dot update aborts it, which discards nothing, and pulls".to_string()),
+        )
+        .with_hint("run dot update to finish now"),
+        Some(Interruption::DotRebase) => Record::fail(
+            subject.message("has an interrupted dot rebase"),
+            Some(
+                "dot update fails until it is aborted; it aborts it itself only with nothing uncommitted"
+                    .to_string(),
+            ),
+        )
+        .with_hint(format!(
+            "run {}, or resolve it and run {}",
+            git_hint(subject.git, "rebase --abort"),
+            git_hint(subject.git, "rebase --continue")
+        )),
+        Some(Interruption::UserSession) => Record::warn(
+            subject.message("has an unfinished merge, rebase, cherry-pick, revert, or am"),
+            Some(format!(
+                "dot update skips {} until it is finished",
+                subject.object
+            )),
+        )
+        .with_hint(format!(
+            "finish or abort it (see {})",
+            git_hint(subject.git, "status")
+        )),
+        None => Record::warn(
+            subject.message("HEAD is detached"),
+            Some(format!(
+                "dot update skips {} until it is back on a branch",
+                subject.object
+            )),
+        )
+        .with_hint(format!(
+            "check out its branch: {}",
+            git_hint(subject.git, "switch BRANCH")
         )),
     }
 }
 
+/// The row for a branch with no upstream: update skips pulling it.
+fn no_upstream_record(subject: &Subject<'_>, head: &str) -> Record {
+    let target = crate::repos_pull_support::shell_quote(format!("origin/{head}").as_bytes());
+    Record::warn(
+        subject.message("upstream is not configured"),
+        Some(format!("dot update skips pulling {}", subject.object)),
+    )
+    .with_hint(format!(
+        "set one: {}",
+        crate::repos_pull::git_hint(subject.git, &format!("branch --set-upstream-to={target}"))
+    ))
+}
+
+/// The row for an upstream Git names but cannot resolve (a deleted remote
+/// branch): update's upstream probe fails the same way and skips the pull.
+fn gone_upstream_record(subject: &Subject<'_>, upstream: &str) -> Record {
+    Record::warn(
+        subject.message("upstream could not be compared"),
+        Some(format!(
+            "{upstream}; dot update skips pulling {}",
+            subject.object
+        )),
+    )
+    .with_hint(format!(
+        "if it was deleted, point the branch at another: {}",
+        crate::repos_pull::git_hint(subject.git, "branch --set-upstream-to=REMOTE/BRANCH")
+    ))
+}
+
+/// How a healthy branch reads in a folded row.
+fn current_fact(head: &str, upstream: &str) -> String {
+    format!("{head}, current with {upstream}")
+}
+
+/// Fold a repository's rows into one ok row carrying `detail` when every
+/// row passed: a healthy repository used to take three to six identical
+/// checkmarks. Any warning, failure, or skip keeps every row, so a problem
+/// is always shown with its context. Section titles are kept.
+fn fold_healthy(rows: Vec<Record>, message: &str, detail: String) -> Vec<Record> {
+    let passed = |record: &Record| record.kind == Kind::Ok;
+    let healthy = rows.iter().any(passed)
+        && rows
+            .iter()
+            .all(|record| passed(record) || record.kind == Kind::Section);
+    if !healthy {
+        return rows;
+    }
+    let mut out: Vec<Record> = rows
+        .into_iter()
+        .filter(|record| record.kind == Kind::Section)
+        .collect();
+    out.push(Record::ok(message, Some(detail)));
+    out
+}
+
 /// [`STATUS_ARGS`] for one overlay checkout, `None` when Git fails.
-fn overlay_status(path: &str) -> Option<RepoStatus> {
+fn overlay_status(
+    path: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<RepoStatus>, TimedOut> {
     let prefix = [OsString::from("-C"), OsString::from(path)];
-    let output = inspect_git(&prefix, &STATUS_ARGS)?;
-    output
+    let Some(output) = inspect_git(&prefix, &STATUS_ARGS, deadline)? else {
+        return Ok(None);
+    };
+    Ok(output
         .status
         .success()
-        .then(|| parse_status_v2(&String::from_utf8_lossy(&output.stdout)))
+        .then(|| parse_status_v2(&String::from_utf8_lossy(&output.stdout))))
 }
+
+/// One overlay's [`overlay_status`] answer.
+type OverlayStatus = Result<Option<RepoStatus>, TimedOut>;
 
 /// Run [`overlay_status`] for every path concurrently: each is an
 /// independent read-only Git process, and serially they would add one Git
 /// round trip per overlay to every doctor run.
-fn overlay_statuses(paths: Vec<String>) -> BTreeMap<String, Option<RepoStatus>> {
+fn overlay_statuses(paths: Vec<String>) -> BTreeMap<String, OverlayStatus> {
     let host_git = crate::init_client_identity::carry_host_git();
+    // One deadline for the batch: the probes run at once.
+    let deadline = probe_deadline();
     std::thread::scope(|scope| {
         // A thread the OS refuses runs its probe inline instead; a probe
         // that panics leaves its path out, which reads as "unavailable".
@@ -2569,14 +2961,14 @@ fn overlay_statuses(paths: Vec<String>) -> BTreeMap<String, Option<RepoStatus>> 
                 let path = path.clone();
                 move || {
                     let _host_git = carried.bind();
-                    let status = overlay_status(&path);
+                    let status = overlay_status(&path, deadline);
                     (path, status)
                 }
             });
             match spawned {
                 Ok(handle) => handles.push(handle),
                 Err(_) => {
-                    let status = overlay_status(&path);
+                    let status = overlay_status(&path, deadline);
                     results.insert(path, status);
                 }
             }
@@ -2591,6 +2983,101 @@ mod tests {
     use super::*;
     use crate::update_lock::OwnerActivity as Activity;
 
+    /// A host Git that records its pid, then hangs far past any probe
+    /// deadline: a stalled filesystem stand-in.
+    fn hanging_git(scope: &dot_test_support::TempDir) -> (PathBuf, PathBuf) {
+        let pids = scope.path().join("pids");
+        let shim = scope.path().join("git");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\necho $$ >> '{}'\nexec sleep 60\n",
+                pids.display()
+            ),
+        )
+        .expect("hanging git");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        (shim, pids)
+    }
+
+    /// Run `body` with a short probe deadline on this thread.
+    fn with_short_probes<R>(body: impl FnOnce() -> R) -> R {
+        TEST_PROBE_TIMEOUT.with(|slot| slot.set(Some(std::time::Duration::from_millis(300))));
+        let result = body();
+        TEST_PROBE_TIMEOUT.with(|slot| slot.set(None));
+        result
+    }
+
+    /// Every probe the hanging Git started must be gone: the deadline stops
+    /// and reaps the probe's session instead of abandoning it.
+    fn assert_probes_reaped(pids: &Path) {
+        let recorded = std::fs::read_to_string(pids).expect("probe pids");
+        assert!(!recorded.trim().is_empty(), "the probe never ran");
+        for pid in recorded.split_whitespace() {
+            let pid: libc::pid_t = pid.parse().expect("pid");
+            // SAFETY: signal 0 only checks existence; no signal is sent.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            assert!(!alive, "probe {pid} outlived its deadline");
+        }
+    }
+
+    #[test]
+    fn stalled_client_probe_warns_instead_of_hanging() {
+        let scope = dot_test_support::TempDir::new_exec("doctor-stalled-client").expect("scope");
+        let (shim, pids) = hanging_git(&scope);
+        let home = scope.path().join("home");
+        let git_dir = home.join(".dotfiles");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+        let started = std::time::Instant::now();
+        let records = crate::init_client_identity::with_host_git(&shim, || {
+            with_short_probes(|| {
+                check_base_repo(&BaseRepoInputs {
+                    topology: "separate",
+                    client_git_dir: git_dir.to_str().expect("git dir"),
+                    home: home.to_str().expect("home"),
+                    is_client_checkout: false,
+                })
+            })
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "one stalled probe ended the section: {:?}",
+            started.elapsed()
+        );
+        let rendered = render(&records);
+        assert!(
+            rendered.contains("⚠ client repository did not answer"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("did not answer within 30s"), "{rendered}");
+        assert!(
+            !rendered.contains('✗'),
+            "a stall is not a failure: {rendered}"
+        );
+        assert_probes_reaped(&pids);
+    }
+
+    #[test]
+    fn stalled_overlay_status_warns_instead_of_hanging() {
+        let scope = dot_test_support::TempDir::new_exec("doctor-stalled-overlay").expect("scope");
+        let (shim, pids) = hanging_git(&scope);
+        let overlay = scope.path().join("overlay");
+        std::fs::create_dir_all(&overlay).expect("overlay");
+        let path = overlay.to_str().expect("overlay").to_string();
+        let statuses = crate::init_client_identity::with_host_git(&shim, || {
+            with_short_probes(|| overlay_statuses(vec![path.clone()]))
+        });
+        assert_eq!(statuses.get(&path), Some(&Err(TimedOut)));
+        let mut out = Vec::new();
+        overlay_state_records("dev", &path, false, statuses.get(&path), &mut out);
+        let rendered = render(&out);
+        assert!(
+            rendered.contains("⚠ dev: repository did not answer"),
+            "{rendered}"
+        );
+        assert_probes_reaped(&pids);
+    }
+
     #[test]
     fn lock_owner_rows_match_acquire_behavior() {
         // Fresh-review-B B6: only the stale row may promise
@@ -2601,7 +3088,7 @@ mod tests {
             start: "proc:99".to_string(),
             token: "4242.0.0".to_string(),
         };
-        let rendered = |activity| render(&[lock_owner_record(&owner, activity)]);
+        let rendered = |activity| render(&[lock_owner_record(&owner, activity, None)]);
         assert!(rendered(Activity::Active).contains("currently running"));
         assert!(rendered(Activity::Active).contains("pid 4242"));
         let stale = rendered(Activity::Stale);
@@ -2625,61 +3112,5 @@ mod tests {
         for row in [unknown, interrupted] {
             assert!(!row.contains("reclaim"));
         }
-    }
-
-    #[test]
-    fn family_walk_honors_file_and_depth_budgets() {
-        // Fresh-review-A nit-11: the freshness walk must terminate on
-        // pathological trees. Tiny budgets pin both cutoffs without
-        // building a 4096-file fixture.
-        let scratch = dot_test_support::TempDir::new("doctor-family-bounds").expect("scratch");
-        let family = scratch.path().join("family");
-        std::fs::create_dir_all(family.join("sub/deep")).expect("family tree");
-        let old = family.join("old.txt");
-        let deep = family.join("sub/deep/new.txt");
-        std::fs::write(&old, b"old").expect("old input");
-        std::fs::write(&deep, b"new").expect("deep input");
-        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        std::fs::File::options()
-            .write(true)
-            .open(&old)
-            .expect("open old")
-            .set_modified(past)
-            .expect("age old");
-        let spec = MergeSpec {
-            identity: "bound".to_string(),
-            script: scratch
-                .path()
-                .join("missing.sh")
-                .to_string_lossy()
-                .into_owned(),
-            sidecar: None,
-            family_dir: Some(family.to_string_lossy().into_owned()),
-            outputs: Vec::new(),
-            invalid: Vec::new(),
-        };
-        // Unbounded: the deep file is newest.
-        let newest = newest_input_mtime_bounded(&spec, usize::MAX, usize::MAX).expect("newest");
-        assert_eq!(
-            newest,
-            std::fs::metadata(&deep)
-                .expect("deep meta")
-                .modified()
-                .expect("deep mtime")
-        );
-        // Depth 0 never descends: only the top-level old file counts
-        // (compared through a metadata read-back so timestamp
-        // truncation cannot perturb the pin).
-        let shallow = newest_input_mtime_bounded(&spec, usize::MAX, 0).expect("shallow");
-        assert_eq!(
-            shallow,
-            std::fs::metadata(&old)
-                .expect("old meta")
-                .modified()
-                .expect("old mtime")
-        );
-        // Zero file budget: nothing under the family counts (the
-        // script is missing, so no input is comparable at all).
-        assert_eq!(newest_input_mtime_bounded(&spec, 0, usize::MAX), None);
     }
 }

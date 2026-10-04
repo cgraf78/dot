@@ -250,7 +250,23 @@ convergence), also overwrites `update.last-run` with
 classification (or `skip` for a cron run skipped for local edits), the
 trigger `cron`, `manual`, or `init`, and the failing stages of a degraded run
 (for example `1790000000 degraded manual tools`). Interrupted runs leave it
-unchanged. Hand-run updates write nothing else.
+unchanged.
+
+Every run that does not succeed (any trigger, including a cron skip) also
+overwrites `update.last-failure` with its cause. The first line repeats the
+run's `<epoch> <outcome> <trigger>` from `update.last-run`; each further line
+is `item<TAB><stage><TAB><name><TAB><detail>`: a failed Shdeps item and its
+detail, a merge-hook key and the last line of its output, a repository that
+failed to pull, a file whose local edits skipped a cron run, or the stage's
+own reason (for example Shdeps' last stderr line when it stopped before
+reporting any item). At most five items per stage are kept, followed by
+`more<TAB><stage><TAB><count>`; fields are stripped of control characters and
+capped, and the file stays within 4 KiB. Because an item can carry a line of
+hook or Shdeps output, the file is owner-only like the rest of this directory
+and a clean run removes it. Doctor shows a cause only while its header matches
+`update.last-run`, so a cause left by an older run (or next to a stamp written
+by a Dot that does not write this file) never explains a newer run. Beyond
+`update.last-run` and `update.last-failure`, hand-run updates write nothing.
 
 A run is degraded when everything except the `Tools` stage (a dependency, a
 post hook, or an unavailable Shdeps) and/or the `Prune` stage succeeded: the
@@ -288,19 +304,39 @@ new exit code that existing callers would have to learn.
 
 `dot doctor` checks both stamps against a two-hour window:
 
-- a recent clean run: `cron update succeeded recently`;
+- a recent cron run skipped for local edits after the last clean run: `cron
+  update skipping: local edits block it`, naming the edited files and
+  pointing at `dot status`, whatever the age of that clean run (cron stays
+  frozen until the edits are resolved); a skip older than the window means
+  cron stopped too and reads as below;
+- a recent clean run: `cron update succeeded recently`, unless a cron run
+  after it did not succeed: then `last cron run failed` (or `degraded:
+  <stages> failing`), because a recent clean run no longer hides a newer
+  failure. A single failed run (a network blip) therefore warns until the
+  next clean run;
 - otherwise, a recent degraded convergence: `cron update degraded: <stages>
-  failing`, with the time since the last clean run;
+  failing`, with the time since the last clean run, unless a newer cron run
+  did not converge at all, which reads `last cron run failed`;
 - otherwise: `cron update has not succeeded recently`, meaning the host has
   stopped converging (or has been asleep); this includes a host whose only
-  recorded runs were degraded, which older releases reported as unknown;
+  recorded runs were degraded, which older releases reported as unknown. It
+  names the last cron run and its cause, or, when no failing cron run was
+  recorded, suggests checking that `dot update --cron` is still scheduled;
 - with no cron stamp, `update.last-run` decides: a cron last run that failed
-  or skipped reads `cron update has not succeeded recently`; a hand-run last
+  reads `cron update has not succeeded recently`; a hand-run last
   update older than the window reads `cron update has never run`, a warning
   (a scheduled `dot update --cron` would have run by then) or only a skip
   when no `crontab` is on `PATH` (Termux, containers); a newer one reads
   `cron update has not run yet`;
 - with no stamp at all: `cron update success is unknown`.
+
+Every row about a run that did not succeed carries its cause from
+`update.last-failure` when that record describes the run, for example
+`failing: tools: watchexec/watchexec (error: …)` (up to three items, then
+`+N more`), followed by the next step: `shdeps health` when a dependency or
+prune failed, otherwise `dot update` for the full output (including when
+Shdeps itself could not be prepared). State written by a Dot older than the
+record shows the same rows without the cause.
 
 `dot doctor` also reports the last hand-run (`manual` or `init`) update when
 it adds information: `last update succeeded`, `last update degraded: <stages>
@@ -332,14 +368,23 @@ Dot records one, a hand-updated host still reads unknown.
 - an update lock whose owner cannot be verified fails (mutating commands
   refuse until the probe succeeds); a live owner, a stale owner (reclaimed by
   the next command), a lock being initialized, and a probe interrupted by a
-  signal to doctor warn;
+  signal to doctor warn. A live owner's row says how long it has held the lock
+  (from its owner record's mtime), and one held for more than two hours reads
+  `update has been running for <age>`, most likely hung, with its pid to stop;
 - an overlay whose origin differs from its descriptor fails (update refuses
   to pull or link it), with the command that adopts the configured URL;
 - a provider re-exec checkpoint the next update cannot consume fails;
 - unmerged paths in the client or a Git overlay fail when update would
   refuse to pull over them (on a branch with an upstream, outside a merge or
-  rebase) and warn while a merge or rebase is in progress; tracked changes,
-  a detached HEAD, a missing upstream, and upstream distance warn;
+  rebase) and warn while a merge or rebase the user started is in progress;
+  tracked changes, a detached HEAD, a missing upstream, and upstream
+  distance warn;
+- a checkout whose HEAD is on no branch is classified the way `dot update`
+  classifies it: dot's own interrupted rebase fails while the checkout has
+  uncommitted changes (every update fails until it is aborted, optional
+  overlays included) and warns otherwise (the next update aborts it and
+  pulls); a merge or rebase the user started and a plain detached HEAD warn
+  (update skips the checkout);
 - a rebase `dot update` froze after it conflicted (the same HEAD, on a
   branch with an upstream, is recorded in the repository's
   `dot-rebase-failed` marker) fails until it is rebased by hand; for an
@@ -382,7 +427,8 @@ Tracked root selectors may omit both `user` and `host` to define a global
 default that overrides `default_profile`. Machine-local and personal selectors
 must include at least one of those fields. Every supplied field must match.
 User names come from `id -un` and compare exactly and case-sensitively.
-Short hostnames come from `hostname -s`; both configured and current values are
+Short hostnames are the kernel host name cut at its first dot (what
+`hostname -s` prints); both configured and current values are
 ASCII-lowercased after removing one trailing dot. A selector containing both
 `user` and `host` is more specific than a selector containing only one field,
 and the most-specific matching level wins. A user-only or host-only record
@@ -446,7 +492,7 @@ overlays than the newer Dot would, because a skipped selector is often the one
 narrowing a shared host, or revive a tie it settled; `dot update` holds the
 overlay set instead. Commands that only report a selection (`status`, `fetch`,
 `push`, `diff`, `test`, and `doctor`) show `base`, the profile phase one
-already applies on every host, as `selected profile (base (skipped-selector))`.
+already applies on every host, as `profile base (skipped-selector; ...)`.
 A skipped selector that agrees, ranks below a match, or names another user or
 host changes nothing, and one for another user or host is not reported.
 

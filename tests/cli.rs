@@ -221,10 +221,6 @@ fn app_runs_concurrent_native_contexts_without_mutating_process_environment() {
             "{name} git context: {trace}"
         );
         assert!(
-            trace.contains(&format!("{name}|uname|{}|{wsl}", tmp.display())),
-            "{name} uname context: {trace}"
-        );
-        assert!(
             trace.contains(&format!("{name}|mv|{}|{wsl}", tmp.display())),
             "{name} mv context: {trace}"
         );
@@ -2750,7 +2746,7 @@ fn runtime_for_native_update_with_process(
         OsString::from("DOT_RUNTIME_OVERLAY_PATH"),
         client.overlay.as_os_str().to_owned(),
     );
-    for tool in ["git", "uname", "mv"] {
+    for tool in ["git", "mv"] {
         env.insert(
             OsString::from(format!("DOT_RUNTIME_REAL_{}", tool.to_ascii_uppercase())),
             real_tool(tool).into_os_string(),
@@ -2771,7 +2767,7 @@ fn runtime_for_native_update_with_process(
 /// after fleet scratch is allocated; production code gets no test hook.
 fn install_runtime_shims(bin: &Path) {
     std::fs::create_dir_all(bin).expect("shim bin dir");
-    for tool in ["git", "uname", "mv"] {
+    for tool in ["git", "mv"] {
         let variable = tool.to_ascii_uppercase();
         let script = format!(
             r#"#!/bin/sh
@@ -4759,6 +4755,20 @@ fn update_native_entry_edges_reject_fallback() {
     )
     .expect("last run");
     assert!(last_run.ends_with(" skip cron\n"), "{last_run:?}");
+    // The cause record repeats that header and names the edited file, so
+    // doctor can say what blocks cron without parsing the outcome log.
+    let state = unresolved.client.home.join(".local/state");
+    let failure = dot::update_status::read_last_failure(&state).expect("skip cause");
+    assert!(
+        failure.describes(&dot::update_status::read_last_run(&state).expect("last run")),
+        "{failure:?}"
+    );
+    let edited: Vec<(&str, &str)> = failure
+        .items
+        .iter()
+        .map(|item| (item.stage.as_str(), item.name.as_str()))
+        .collect();
+    assert_eq!(edited, [("dirty", "tracked.txt")]);
     assert_eq!(
         std::fs::read(unresolved.client.home.join("tracked.txt")).expect("read unresolved edit"),
         b"local edit\n",

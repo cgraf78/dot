@@ -40,6 +40,9 @@ pub(crate) struct Outcome {
     pub(crate) summary: Vec<u8>,
     pub(crate) details: Vec<u8>,
     pub(crate) revision_change: Option<RevisionChange>,
+    /// `(name, detail)` of every item event the provider reported as
+    /// `failed`, in group discovery order, for the update's failure record.
+    pub(crate) failed_items: Vec<(String, String)>,
 }
 
 /// The Dot generation a provider update moved the source root to.
@@ -1721,6 +1724,7 @@ fn run_update(
                 summary: b"dependency update cleanup incomplete".to_vec(),
                 details: Vec::new(),
                 revision_change: None,
+                failed_items: Vec::new(),
             };
         }
         Err(error) => {
@@ -1749,6 +1753,7 @@ fn run_update(
             summary: b"dependency update interrupted".to_vec(),
             details: Vec::new(),
             revision_change: None,
+            failed_items: Vec::new(),
         };
     }
     if sink_error.is_some() {
@@ -1828,6 +1833,7 @@ fn run_update(
             summary: b"dependency update interrupted".to_vec(),
             details: Vec::new(),
             revision_change: None,
+            failed_items: Vec::new(),
         };
     }
     let ui = crate::shdeps_ui_render::Ui {
@@ -1871,6 +1877,7 @@ fn run_update(
         after,
         release,
     });
+    let failed_items = failed_items(&state);
     if status == 0 {
         Outcome {
             status,
@@ -1880,6 +1887,7 @@ fn run_update(
             summary: session.summary,
             details,
             revision_change,
+            failed_items,
         }
     } else {
         Outcome {
@@ -1894,6 +1902,7 @@ fn run_update(
             },
             details,
             revision_change,
+            failed_items,
         }
     }
 }
@@ -2230,6 +2239,28 @@ fn report_provider_output_limit(output: &mut LimitedWriter<'_>, error: &std::io:
     }
 }
 
+/// The `failed` item rows of `state`, as `(name, detail)` in group discovery
+/// order. Rows are `status<TAB>name<TAB>detail` ([`crate::shdeps_ui::State::record_item`]);
+/// the detail keeps any later tab, which the failure record cleans.
+fn failed_items(state: &crate::shdeps_ui::State) -> Vec<(String, String)> {
+    let mut failed = Vec::new();
+    for group in state.order() {
+        let Some(blob) = state.items_blob(group) else {
+            continue;
+        };
+        for row in blob.split(|byte| *byte == b'\n') {
+            let mut fields = row.splitn(3, |byte| *byte == b'\t');
+            if fields.next() != Some(b"failed".as_slice()) {
+                continue;
+            }
+            let name = String::from_utf8_lossy(fields.next().unwrap_or_default());
+            let detail = String::from_utf8_lossy(fields.next().unwrap_or_default());
+            failed.push((name.into_owned(), detail.into_owned()));
+        }
+    }
+    failed
+}
+
 fn failed_update() -> Outcome {
     Outcome {
         status: 1,
@@ -2239,6 +2270,7 @@ fn failed_update() -> Outcome {
         summary: b"dependency update failed".to_vec(),
         details: Vec::new(),
         revision_change: None,
+        failed_items: Vec::new(),
     }
 }
 

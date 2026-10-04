@@ -128,6 +128,7 @@ fn cron_freshness_trips_on_stale_and_passes_on_fresh() {
             last_success: last,
             last_converged: None,
             last_run: None,
+            last_failure: None,
             cron_available: true,
             now: 1_800_000_000,
         }))
@@ -176,6 +177,7 @@ fn cron_freshness_separates_degraded_convergence_from_a_frozen_host() {
             last_success: last,
             last_converged: conv,
             last_run: None,
+            last_failure: None,
             cron_available: true,
             now: NOW,
         }))
@@ -294,6 +296,7 @@ fn cron_that_never_ran_only_skips_without_a_crontab() {
         last_success: None,
         last_converged: None,
         last_run: Some(last_run(NOW - 9 * 3600, "ok", "manual", "")),
+        last_failure: None,
         cron_available: false,
         now: NOW,
     }));
@@ -314,6 +317,7 @@ fn cron_that_never_ran_warns_once_a_manual_update_is_stale() {
             last_success: None,
             last_converged: None,
             last_run: run,
+            last_failure: None,
             cron_available: true,
             now: NOW,
         }))
@@ -336,13 +340,18 @@ fn cron_that_never_ran_warns_once_a_manual_update_is_stale() {
         "{stale}"
     );
     assert!(!stale.contains('✗'), "{stale}");
-    // A cron that keeps skipping for local edits is running, not missing.
+    // A cron that keeps skipping for local edits is running, not missing,
+    // and the edits are named as what blocks it.
     let skipping = check(Some(last_run(NOW - 60, "skip", "cron", "")));
     assert!(
-        skipping.contains("⚠ cron update has not succeeded recently"),
+        skipping.contains("⚠ cron update skipping: local edits block it"),
         "{skipping}"
     );
-    assert!(skipping.contains("last cron run skip 1m ago"), "{skipping}");
+    assert!(
+        skipping
+            .contains("last cron run 1m ago; no successful cron update recorded; run dot status"),
+        "{skipping}"
+    );
     // A clean cron last run whose stamp writes were lost still counts.
     let lost_stamps = check(Some(last_run(NOW - 60, "ok", "cron", "")));
     assert!(
@@ -356,7 +365,7 @@ fn cron_that_never_ran_warns_once_a_manual_update_is_stale() {
         "{failing}"
     );
     assert!(
-        failing.contains("no successful cron update recorded; last cron run fail 1m ago"),
+        failing.contains("no successful cron update recorded; last cron run failed 1m ago"),
         "{failing}"
     );
     assert!(
@@ -373,6 +382,7 @@ fn hand_run_update_rows_appear_only_when_they_add_information() {
             last_success: success,
             last_converged: None,
             last_run: Some(run),
+            last_failure: None,
             cron_available: true,
             now: NOW,
         }))
@@ -386,7 +396,7 @@ fn hand_run_update_rows_appear_only_when_they_add_information() {
     assert!(failed.contains("✓ cron update succeeded recently"));
     assert!(failed.contains("⚠ last update failed"), "{failed}");
     assert!(
-        failed.contains("manual run 1m ago; rerun dot update to see what failed"),
+        failed.contains("manual run 1m ago; run dot update for the full output"),
         "{failed}"
     );
     assert!(!failed.contains('✗'), "{failed}");
@@ -412,6 +422,407 @@ fn hand_run_update_rows_appear_only_when_they_add_information() {
     // Outcome words from a newer Dot still render as a non-success.
     let newer = check(None, last_run(NOW - 60, "aborted", "manual", ""));
     assert!(newer.contains("⚠ last update failed"), "{newer}");
+}
+
+/// A `update.last-failure` record for `run` with `items`.
+fn failure_for(
+    run: &dot::update_status::LastRun,
+    items: &[(&str, &str, &str)],
+    omitted: usize,
+) -> dot::update_status::LastFailure {
+    dot::update_status::LastFailure {
+        at: run.at,
+        outcome: run.outcome.clone(),
+        trigger: run.trigger.clone(),
+        items: items
+            .iter()
+            .map(|(stage, name, detail)| dot::update_status::FailureItem {
+                stage: stage.to_string(),
+                name: name.to_string(),
+                detail: detail.to_string(),
+            })
+            .collect(),
+        omitted,
+    }
+}
+
+fn cron_rows(
+    success: Option<i64>,
+    run: Option<dot::update_status::LastRun>,
+    failure: Option<dot::update_status::LastFailure>,
+    now: i64,
+) -> String {
+    render(&check_cron_freshness(&CronInputs {
+        last_success: success,
+        last_converged: None,
+        last_run: run,
+        last_failure: failure,
+        cron_available: true,
+        now,
+    }))
+}
+
+#[test]
+fn a_newer_cron_failure_is_not_masked_by_a_recent_clean_run() {
+    // U3: a clean run 100 minutes ago used to vouch for the host until it
+    // aged out, so cron runs failing since then read green.
+    const NOW: i64 = 1_800_000_000;
+    let run = last_run(NOW - 600, "degraded", "cron", "tools");
+    let failure = failure_for(
+        &run,
+        &[(
+            "tools",
+            "watchexec/watchexec",
+            "ambiguous interrupted method transition",
+        )],
+        0,
+    );
+    let rows = cron_rows(Some(NOW - 6000), Some(run.clone()), Some(failure), NOW);
+    assert!(
+        rows.contains("⚠ last cron run degraded: tools failing"),
+        "{rows}"
+    );
+    assert!(!rows.contains("succeeded recently"), "{rows}");
+    assert!(
+        rows.contains(
+            "10m ago; last success 1h40m ago; failing: tools: watchexec/watchexec (ambiguous interrupted method transition); run shdeps health, or dot update for the full output"
+        ),
+        "{rows}"
+    );
+    assert!(!rows.contains('✗'), "{rows}");
+
+    // A failed run names its stage's items and the plain next step.
+    let fail = last_run(NOW - 60, "fail", "cron", "");
+    let failure = failure_for(
+        &fail,
+        &[
+            ("repos", "dotfiles", "pull failed"),
+            ("repos", "work", "pull failed"),
+        ],
+        0,
+    );
+    let rows = cron_rows(Some(NOW - 600), Some(fail.clone()), Some(failure), NOW);
+    assert!(rows.contains("⚠ last cron run failed"), "{rows}");
+    assert!(
+        rows.contains(
+            "failing: repos: dotfiles (pull failed), work (pull failed); run dot update for the full output"
+        ),
+        "{rows}"
+    );
+
+    // An older Dot wrote the stamp but no record: the run still warns,
+    // with only the next step.
+    let rows = cron_rows(Some(NOW - 600), Some(fail), None, NOW);
+    assert!(rows.contains("⚠ last cron run failed"), "{rows}");
+    assert!(
+        rows.contains("1m ago; last success 10m ago; run dot update for the full output"),
+        "{rows}"
+    );
+
+    // A provider that could not even be prepared is not `shdeps health`'s
+    // to explain, even though the run degraded the Tools stage.
+    let unavailable = last_run(NOW - 60, "degraded", "cron", "tools");
+    let failure = failure_for(
+        &unavailable,
+        &[(
+            "provider",
+            "shdeps",
+            "shdeps unavailable; dependency install skipped",
+        )],
+        0,
+    );
+    let rows = cron_rows(Some(NOW - 600), Some(unavailable), Some(failure), NOW);
+    assert!(
+        rows.contains("failing: provider: shdeps (shdeps unavailable; dependency install skipped); run dot update for the full output"),
+        "{rows}"
+    );
+
+    // A clean run after the failure heals it.
+    let healed = cron_rows(
+        Some(NOW - 60),
+        Some(last_run(NOW - 600, "fail", "cron", "")),
+        None,
+        NOW,
+    );
+    assert!(
+        healed.contains("✓ cron update succeeded recently"),
+        "{healed}"
+    );
+}
+
+#[test]
+fn a_cause_only_attaches_to_the_run_it_describes() {
+    // A record left by an earlier run (or superseded by a run of an older
+    // Dot, which writes no record) must never explain the current one.
+    const NOW: i64 = 1_800_000_000;
+    let run = last_run(NOW - 60, "fail", "cron", "");
+    let older = last_run(NOW - 3600, "fail", "cron", "");
+    let stale = failure_for(&older, &[("configs", "10-old-hook", "boom")], 0);
+    let rows = cron_rows(Some(NOW - 600), Some(run.clone()), Some(stale), NOW);
+    assert!(!rows.contains("10-old-hook"), "{rows}");
+    let manual = last_run(NOW - 60, "fail", "manual", "");
+    let other_trigger = failure_for(&manual, &[("configs", "10-hook", "boom")], 0);
+    let rows = cron_rows(Some(NOW - 600), Some(run), Some(other_trigger), NOW);
+    assert!(!rows.contains("10-hook"), "{rows}");
+}
+
+#[test]
+fn causes_attach_to_stale_degraded_and_never_converged_rows() {
+    const NOW: i64 = 1_800_000_000;
+    let run = last_run(NOW - 60, "fail", "cron", "");
+    let failure = failure_for(&run, &[("configs", "40-claude", "exit 3")], 0);
+    // Stale success.
+    let stale = cron_rows(
+        Some(NOW - 9 * 3600),
+        Some(run.clone()),
+        Some(failure.clone()),
+        NOW,
+    );
+    assert!(
+        stale.contains("⚠ cron update has not succeeded recently"),
+        "{stale}"
+    );
+    assert!(
+        stale.contains(
+            "last success 9h0m ago; last cron run failed 1m ago; failing: configs: 40-claude (exit 3); run dot update"
+        ),
+        "{stale}"
+    );
+    // Never converged.
+    let never = cron_rows(None, Some(run.clone()), Some(failure.clone()), NOW);
+    assert!(
+        never.contains(
+            "no successful cron update recorded; last cron run failed 1m ago; failing: configs: 40-claude (exit 3)"
+        ),
+        "{never}"
+    );
+    // Degraded convergence.
+    let degraded_run = last_run(NOW - 60, "degraded", "cron", "tools");
+    let degraded_failure = failure_for(&degraded_run, &[("tools", "ripgrep", "network")], 0);
+    let degraded = render(&check_cron_freshness(&CronInputs {
+        last_success: Some(NOW - 5 * 3600),
+        last_converged: Some(dot::update_status::Converged {
+            at: NOW - 60,
+            failing: "tools".to_string(),
+        }),
+        last_run: Some(degraded_run),
+        last_failure: Some(degraded_failure),
+        cron_available: true,
+        now: NOW,
+    }));
+    assert!(
+        degraded.contains("⚠ cron update degraded: tools failing"),
+        "{degraded}"
+    );
+    assert!(
+        degraded.contains(
+            "last converged 1m ago; failing: tools: ripgrep (network); run shdeps health"
+        ),
+        "{degraded}"
+    );
+
+    // A cron run that failed after that degraded convergence is the news:
+    // its own title and cause, never the degraded stages' label.
+    let newer = render(&check_cron_freshness(&CronInputs {
+        last_success: Some(NOW - 5 * 3600),
+        last_converged: Some(dot::update_status::Converged {
+            at: NOW - 5400,
+            failing: "tools".to_string(),
+        }),
+        last_run: Some(run.clone()),
+        last_failure: Some(failure.clone()),
+        cron_available: true,
+        now: NOW,
+    }));
+    assert!(newer.contains("⚠ last cron run failed"), "{newer}");
+    assert!(
+        newer.contains(
+            "1m ago; last success 5h0m ago; last converged 1h30m ago; failing: configs: 40-claude (exit 3)"
+        ),
+        "{newer}"
+    );
+    assert!(!newer.contains("degraded"), "{newer}");
+}
+
+#[test]
+fn update_warn_rows_always_carry_a_next_step() {
+    const NOW: i64 = 1_800_000_000;
+    // A degraded convergence without the run that wrote it (a later hand
+    // run, or an older Dot) still says where to look.
+    let degraded = render(&check_cron_freshness(&CronInputs {
+        last_success: Some(NOW - 5 * 3600),
+        last_converged: Some(dot::update_status::Converged {
+            at: NOW - 60,
+            failing: "prune".to_string(),
+        }),
+        last_run: None,
+        last_failure: None,
+        cron_available: true,
+        now: NOW,
+    }));
+    assert!(
+        degraded.contains("last converged 1m ago; run shdeps health, or dot update"),
+        "{degraded}"
+    );
+    // A host whose cron simply stopped: check the schedule.
+    let stopped = cron_rows(Some(NOW - 9 * 3600), None, None, NOW);
+    assert!(
+        stopped.contains(
+            "last success 9h0m ago; check that dot update --cron is scheduled (crontab -l), or run dot update"
+        ),
+        "{stopped}"
+    );
+    // A clean stamp from the future (the clock stepped back) cannot hide a
+    // newer failing cron run.
+    let run = last_run(NOW - 60, "fail", "cron", "");
+    let skewed = cron_rows(Some(NOW + 3600), Some(run), None, NOW);
+    assert!(skewed.contains("⚠ last cron run failed"), "{skewed}");
+}
+
+#[test]
+fn many_failing_items_fold_into_a_count_and_long_details_shorten() {
+    const NOW: i64 = 1_800_000_000;
+    let run = last_run(NOW - 60, "degraded", "manual", "tools");
+    let long = "x".repeat(300);
+    let failure = failure_for(
+        &run,
+        &[
+            ("tools", "a", &long),
+            ("tools", "b", ""),
+            ("tools", "c", "why"),
+            ("tools", "d", "why"),
+        ],
+        2,
+    );
+    let rows = cron_rows(None, Some(run), Some(failure), NOW);
+    assert!(
+        rows.contains("⚠ last update degraded: tools failing"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains(", b, c (why) +3 more; run shdeps health"),
+        "{rows}"
+    );
+    let shown = rows
+        .lines()
+        .find(|line| line.contains("failing:"))
+        .expect("cause line");
+    assert!(shown.contains('…') && shown.len() < 300, "{shown}");
+}
+
+#[test]
+fn a_cron_run_skipped_for_local_edits_names_them() {
+    // U4: the skip used to read "has not succeeded recently" once the last
+    // clean run aged out, never saying that local edits block cron.
+    const NOW: i64 = 1_800_000_000;
+    let run = last_run(NOW - 60, "skip", "cron", "");
+    let failure = failure_for(
+        &run,
+        &[
+            ("dirty", ".bashrc", ""),
+            ("dirty", ".zshrc", ""),
+            ("dirty", ".profile", ""),
+            ("dirty", ".inputrc", ""),
+        ],
+        1,
+    );
+    // Even right after a clean run: cron stays frozen until resolved.
+    let fresh = cron_rows(
+        Some(NOW - 600),
+        Some(run.clone()),
+        Some(failure.clone()),
+        NOW,
+    );
+    assert!(
+        fresh.contains("⚠ cron update skipping: local edits block it"),
+        "{fresh}"
+    );
+    assert!(
+        fresh.contains(
+            "last cron run 1m ago; last success 10m ago; edited: .bashrc, .zshrc, .profile +2 more; run dot status, then commit, stash, or resolve the edits"
+        ),
+        "{fresh}"
+    );
+    let stale = cron_rows(Some(NOW - 9 * 3600), Some(run.clone()), Some(failure), NOW);
+    assert!(
+        stale.contains("⚠ cron update skipping: local edits block it")
+            && stale.contains("last success 9h0m ago; edited: .bashrc"),
+        "{stale}"
+    );
+    assert!(!stale.contains("has not succeeded recently"), "{stale}");
+    // A skip that is itself stale means cron stopped too: the frozen row,
+    // still naming the edits of that last run.
+    let old_skip = last_run(NOW - 48 * 3600, "skip", "cron", "");
+    let old_failure = failure_for(&old_skip, &[("dirty", ".zshrc", "")], 0);
+    let stopped = cron_rows(
+        Some(NOW - 72 * 3600),
+        Some(old_skip.clone()),
+        Some(old_failure.clone()),
+        NOW,
+    );
+    assert!(
+        stopped.contains("⚠ cron update has not succeeded recently"),
+        "{stopped}"
+    );
+    assert!(
+        stopped.contains(
+            "last success 72h0m ago; last cron run skipped for local edits 48h0m ago; edited: .zshrc; run dot status"
+        ),
+        "{stopped}"
+    );
+    let never = cron_rows(None, Some(old_skip), Some(old_failure), NOW);
+    assert!(
+        never.contains(
+            "no successful cron update recorded; last cron run skipped for local edits 48h0m ago; edited: .zshrc"
+        ),
+        "{never}"
+    );
+    // An older Dot recorded the skip without files: the row still names
+    // the cause and the next step.
+    let old = cron_rows(Some(NOW - 9 * 3600), Some(run), None, NOW);
+    assert!(
+        old.contains("last success 9h0m ago; run dot status, then commit"),
+        "{old}"
+    );
+}
+
+#[test]
+fn a_live_update_lock_shows_how_long_it_has_been_held() {
+    // K5: a hung update showed only its pid.
+    let scratch = TempDir::new("doctor-lock-age").expect("scratch");
+    let state = scratch.path().join("state");
+    let log = dot::log::Log::new(false, false);
+    let guard =
+        dot::update_lock::acquire(&state, false, &log, None, &mut Vec::new()).expect("lock");
+    let live = dot::update_lock::lock_path(&state);
+    let fresh = render(&check_update_lock(Some(&live)));
+    assert!(fresh.contains("⚠ update is currently running"), "{fresh}");
+    assert!(
+        fresh.contains(&format!("pid {}, running for ", std::process::id())),
+        "{fresh}"
+    );
+    // Held past the staleness window: most likely hung, with how to stop it.
+    let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(5 * 3600 + 12 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(dot::update_lock::owner_file(&live))
+        .expect("owner file")
+        .set_modified(aged)
+        .expect("age owner");
+    let hung = render(&check_update_lock(Some(&live)));
+    assert!(
+        hung.contains("⚠ update has been running for 5h12m"),
+        "{hung}"
+    );
+    assert!(
+        hung.contains(&format!(
+            "pid {pid}; if it is hung, stop it (kill {pid}) and rerun dot update",
+            pid = std::process::id()
+        )),
+        "{hung}"
+    );
+    assert!(!hung.contains('✗'), "{hung}");
+    drop(guard);
 }
 
 #[test]
@@ -475,14 +886,22 @@ fn shdeps_install(data: &Path, marker: Option<&[u8]>) -> std::path::PathBuf {
     root
 }
 
+/// The layout verdict as text: a `kind: ...` line for a healthy layout's
+/// kind (which files no row; the runtime's version row names it), then
+/// every problem row.
 fn layout(root: &Path, source: &Path, release_root: bool, shdeps: bool) -> String {
-    render(&check_install_layout(&InstallInputs {
+    let layout = check_install_layout(&InstallInputs {
         home: "/nonexistent-home",
         source_real: source,
         release_root,
         managed_root: root,
         shdeps,
-    }))
+    });
+    let kind = layout
+        .kind
+        .map(|kind| format!("kind: {kind}\n"))
+        .unwrap_or_default();
+    format!("{kind}{}", render(&layout.records))
 }
 
 #[test]
@@ -521,13 +940,13 @@ fn standalone_install_under_shdeps_warns_until_shdeps_adopts_it() {
     // whether the managed root or the running release identifies it.
     let alone = layout(&root, &release, true, false);
     assert!(
-        alone.contains("✓ dot release layout (standalone installer"),
+        alone.contains("kind: standalone install; rerun install.sh to upgrade"),
         "{alone}"
     );
     assert!(!alone.contains('✗'), "{alone}");
     let running = layout(&scratch.path().join("absent/dot"), &release, true, false);
     assert!(
-        running.contains("✓ dot release layout (standalone installer"),
+        running.contains("kind: standalone install; rerun install.sh to upgrade"),
         "{running}"
     );
 }
@@ -654,7 +1073,7 @@ fn shdeps_release_requires_its_layout_marker() {
     let root = shdeps_install(scratch.path(), Some(b"v1 archive\n"));
     let real = std::fs::canonicalize(&root).expect("real");
     let healthy = layout(&root, &real, true, true);
-    assert_eq!(healthy, "  ✓ dot release layout (Shdeps release)\n");
+    assert_eq!(healthy, "kind: Shdeps release\n");
 
     // Shdeps compares the whole file: any other content refuses.
     for content in [
@@ -700,16 +1119,26 @@ fn shdeps_release_reports_leftover_install_state() {
     std::fs::create_dir(cgraf.join("dots.shdeps-archive-backup-1-1")).expect("other backup");
     std::fs::create_dir_all(cgraf.join(".dot-standalone/lock")).expect("old lock");
     let rows = layout(&root, &real, true, true);
-    assert!(
-        rows.contains("✓ dot release layout (Shdeps release)"),
-        "{rows}"
-    );
+    assert!(rows.starts_with("kind: Shdeps release\n"), "{rows}");
     assert!(
         rows.contains("⚠ interrupted Shdeps install left a backup"),
         "{rows}"
     );
-    assert!(rows.contains("dot.shdeps-archive-backup-42-7"), "{rows}");
-    assert!(rows.contains(".dot.shdeps-archive-backup-43-8"), "{rows}");
+    // Each backup is its own item line, and the next step is a hint.
+    for backup in [
+        "/dot.shdeps-archive-backup-42-7\n",
+        "/.dot.shdeps-archive-backup-43-8\n",
+    ] {
+        assert!(
+            rows.lines()
+                .any(|line| line.starts_with("    - ") && format!("{line}\n").ends_with(backup)),
+            "{backup}: {rows}"
+        );
+    }
+    assert!(
+        rows.contains("    → remove it once dot runs from the current release\n"),
+        "{rows}"
+    );
     assert!(!rows.contains("dots.shdeps"), "{rows}");
     assert!(
         rows.contains("⚠ leftover standalone installer lock"),
@@ -767,15 +1196,13 @@ fn merge_spec(identity: &str, script: &Path, outputs: Vec<String>) -> MergeSpec 
     MergeSpec {
         identity: identity.to_string(),
         script: script.to_string_lossy().into_owned(),
-        sidecar: None,
-        family_dir: None,
         outputs,
         invalid: vec![],
     }
 }
 
 #[test]
-fn merge_outputs_verify_fresh_missing_and_stale() {
+fn merge_outputs_verify_existence() {
     let scratch = TempDir::new("doctor-merge-outputs").expect("scratch");
     let ext = scratch.path().join("extensions");
     std::fs::create_dir_all(ext.join("merge-hooks.d")).expect("hooks");
@@ -791,113 +1218,74 @@ fn merge_outputs_verify_fresh_missing_and_stale() {
         }))
     };
 
-    // Fresh output (newer than the script) passes.
-    let fresh_out = scratch.path().join("fresh.conf");
-    backdate(&script, 100);
-    std::fs::write(&fresh_out, b"live\n").expect("fresh output");
+    // An existing output passes.
+    let live = scratch.path().join("live.conf");
+    std::fs::write(&live, b"live\n").expect("live output");
     let fresh = check(vec![merge_spec(
         "fixture",
         &script,
-        vec![fresh_out.to_string_lossy().into_owned()],
+        vec![live.to_string_lossy().into_owned()],
     )]);
     assert!(fresh.contains("1 hook(s)"));
-    assert!(fresh.contains("✓ merge-hook outputs are current"));
+    assert!(fresh.contains("✓ merge-hook outputs exist (1 output(s) across 1 hook(s))"));
     assert!(!fresh.contains('✗'));
 
-    // Missing output fails.
+    // N2: an output older than its hook is still current. Hooks write
+    // through `dot_write_text_if_changed`, which leaves an unchanged output
+    // untouched, so after an edit to the hook that does not change what it
+    // writes, the output is older than the hook and correct.
+    backdate(&live, 3600);
+    let older = check(vec![merge_spec(
+        "fixture",
+        &script,
+        vec![live.to_string_lossy().into_owned()],
+    )]);
+    assert!(older.contains("✓ merge-hook outputs exist"), "{older}");
+    assert!(!older.contains('✗'), "{older}");
+
+    // A missing output fails, naming the hook and the path, with a next step.
+    let absent = scratch.path().join("absent.conf");
     let missing = check(vec![merge_spec(
         "fixture",
         &script,
-        vec![
-            scratch
-                .path()
-                .join("absent.conf")
-                .to_string_lossy()
-                .into_owned(),
-        ],
+        vec![absent.to_string_lossy().into_owned()],
     )]);
-    assert!(missing.contains("✗ merge-hook output is missing"));
-
-    // Stale output (older than the script) fails.
-    let stale_out = scratch.path().join("stale.conf");
-    std::fs::write(&stale_out, b"stale\n").expect("stale output");
-    backdate(&stale_out, 200);
-    let stale = check(vec![merge_spec(
-        "fixture",
-        &script,
-        vec![stale_out.to_string_lossy().into_owned()],
-    )]);
-    assert!(stale.contains("✗ merge-hook output is stale"));
-
-    // Equal mtimes fail: outputs must be strictly newer than inputs.
-    let tied_out = scratch.path().join("tied.conf");
-    std::fs::write(&tied_out, b"tied\n").expect("tied output");
-    let script_mtime = std::fs::metadata(&script)
-        .expect("script meta")
-        .modified()
-        .expect("mtime");
-    std::fs::File::options()
-        .write(true)
-        .open(&tied_out)
-        .expect("open tied output")
-        .set_modified(script_mtime)
-        .expect("tie mtime");
-    let tied = check(vec![merge_spec(
-        "fixture",
-        &script,
-        vec![tied_out.to_string_lossy().into_owned()],
-    )]);
-    assert!(tied.contains("✗ merge-hook output is stale"));
-
-    // A newer family input also makes the output stale.
-    let family = ext.join("merge-hooks.d/fixture");
-    std::fs::create_dir_all(&family).expect("family");
-    std::fs::write(family.join("input.conf"), b"input\n").expect("family input");
-    let mut family_spec = merge_spec(
-        "fixture",
-        &script,
-        vec![fresh_out.to_string_lossy().into_owned()],
+    assert!(
+        missing.contains(&format!(
+            "✗ merge-hook output is missing\n    fixture: {}\n    → run dot update",
+            absent.display()
+        )),
+        "{missing}"
     );
-    family_spec.family_dir = Some(family.to_string_lossy().into_owned());
-    let family_stale = check(vec![family_spec]);
-    assert!(family_stale.contains("✗ merge-hook output is stale"));
 
-    // No declared outputs skips (documented behavior, not a failure).
+    // No declared outputs files nothing past the hook count: a permanent
+    // "unverified" row could never be acted on.
     let undeclared = check(vec![merge_spec("fixture", &script, vec![])]);
-    assert!(undeclared.contains("· merge-hook outputs are unverified"));
-    assert!(undeclared.contains("1 hook(s) declare no checkable outputs"));
-    assert!(!undeclared.contains('✗'));
+    assert_eq!(
+        undeclared, "\nExtensions\n  ✓ merge-hook extensions (1 hook(s))\n",
+        "{undeclared}"
+    );
 
-    // C1: healthy and unverified hooks each collapse into one summary row;
-    // problems keep a row each.
+    // Healthy hooks collapse into one summary row; problems keep a row each.
     let mut many: Vec<MergeSpec> = (0..30)
         .map(|index| merge_spec(&format!("bare{index}"), &script, vec![]))
         .collect();
+    for name in ["live-a", "live-b"] {
+        many.push(merge_spec(
+            name,
+            &script,
+            vec![live.to_string_lossy().into_owned()],
+        ));
+    }
     many.push(merge_spec(
-        "fresh-a",
+        "gone",
         &script,
-        vec![fresh_out.to_string_lossy().into_owned()],
-    ));
-    many.push(merge_spec(
-        "fresh-b",
-        &script,
-        vec![fresh_out.to_string_lossy().into_owned()],
-    ));
-    many.push(merge_spec(
-        "stale",
-        &script,
-        vec![stale_out.to_string_lossy().into_owned()],
+        vec![absent.to_string_lossy().into_owned()],
     ));
     let collapsed = check(many);
-    assert_eq!(
-        collapsed
-            .matches("merge-hook outputs are unverified")
-            .count(),
-        1
-    );
-    assert!(collapsed.contains("(30 hook(s) declare no checkable outputs)"));
-    assert!(collapsed.contains("✓ merge-hook outputs are current (2 output(s) across 2 hook(s))"));
-    assert!(collapsed.contains("✗ merge-hook output is stale\n    stale: "));
+    assert!(!collapsed.contains("unverified"), "{collapsed}");
+    assert!(collapsed.contains("✓ merge-hook outputs exist (2 output(s) across 2 hook(s))"));
+    assert!(collapsed.contains("✗ merge-hook output is missing\n    gone: "));
     assert_eq!(collapsed.lines().count(), 7, "{collapsed}");
 
     // A relative declaration fails outright.
@@ -1007,6 +1395,38 @@ fn overlays_report_config_legacy_and_empty_inventory() {
     let profiles = render(&check_overlays(&overlays(manifest, None, true)));
     assert!(profiles.contains("no pending deactivations"));
     assert!(profiles.contains("no overlays to check"));
+}
+
+#[test]
+fn profile_selection_is_one_informational_row() {
+    // N1: identity, selection, included profiles, phase-one overlays, and
+    // matching selectors used to take five rows that never change.
+    let scratch = TempDir::new("doctor-profile-row").expect("scratch");
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let mut input = overlays(manifest, None, true);
+    input.profile_user = Some("alice");
+    input.profile_host = Some("box");
+    input.selected_profile = Some("dev");
+    input.selection_state = Some("agreed-match");
+    input.included_profiles = vec!["base".into(), "dev".into()];
+    input.phase_one = vec!["personal".into()];
+    input.selectors = vec![
+        "root|/home/test/.config/dot/profile-selectors.d/00-default.conf|||dev|true".into(),
+        "local|/home/test/.config/dot/profile-selectors.local.d/10-other.conf|bob||web|false"
+            .into(),
+    ];
+    let rendered = render(&check_overlays(&input));
+    assert!(
+        rendered.starts_with(
+            "\nProfiles\n  › profile dev (agreed-match; includes base dev; phase-one overlays personal; root selector 00-default.conf -> dev; for alice@box)\n  ✓ profile lifecycle state"
+        ),
+        "{rendered}"
+    );
+    assert_eq!(rendered.matches('›').count(), 1, "{rendered}");
 }
 
 #[test]
@@ -1126,7 +1546,8 @@ fn overlays_report_keys_from_a_newer_dot_as_warnings() {
         "unknown profile key ignored\n    ~/.config/dot/profiles.d/base.conf:3 future_key (newer dot?)",
         "selector skipped: unknown key\n    ~/.config/dot/profile-selectors.d/10-host.conf:4 future_key (newer dot?)",
         "selector skipped: unknown key; profile base selected\n    ~/.config/dot/profile-selectors.d/20-shared.conf:2 future_key (newer dot?)",
-        "beta: selected but skipped: unknown descriptor key\n    ~/.config/dot/overlays.d/20-beta.local.conf:2 future_key (newer dot?)",
+        // The keys are items, one per line.
+        "beta: selected but skipped: unknown descriptor key\n    - ~/.config/dot/overlays.d/20-beta.local.conf:2 future_key (newer dot?)",
         "personal selectors unread: overlay skipped; profile base selected\n    ~/.config/dot/overlays.d/10-personal.conf:5 future_key (newer dot?)",
         // `dot update` holds the installed set, so the links are not judged
         // against this reading.
@@ -1260,7 +1681,41 @@ fn overlays_git_origin_and_manifest_health_matrix() {
     assert!(drift.contains("overlay symlinks healthy"));
 
     std::fs::write(&manifest, b"malformed\n").expect("bad manifest");
-    assert!(render(&check_overlays(&input)).contains("1 overlay symlink issue(s)"));
+    let malformed = render(&check_overlays(&input));
+    assert!(
+        malformed.contains(&format!(
+            "⚠ 1 overlay symlink issue(s)\n    - {} line 1: unreadable record\n    → run dot update to re-link\n",
+            manifest.display()
+        )),
+        "{malformed}"
+    );
+
+    // K8: each issue names its link (under `~`) and why, as an item.
+    let missing_rel = ".config/gone";
+    let foreign_rel = ".config/foreign";
+    std::fs::write(home.join(foreign_rel), b"a file").expect("foreign file");
+    let dangling_rel = ".config/dangling";
+    std::os::unix::fs::symlink(home.join("nowhere"), home.join(dangling_rel)).expect("dangling");
+    let orphan_rel = ".config/orphan";
+    std::os::unix::fs::symlink(&source, home.join(orphan_rel)).expect("orphan link");
+    std::fs::write(
+        &manifest,
+        format!(
+            "{rel}\tgit\t{link_target}\n{missing_rel}\tgit\tx\n{foreign_rel}\tgit\tx\n{dangling_rel}\tgit\tx\n{orphan_rel}\tretired\tx\n"
+        ),
+    )
+    .expect("manifest with issues");
+    let issues = render(&check_overlays(&input));
+    for item in [
+        "⚠ 4 overlay symlink issue(s)\n",
+        "    - ~/.config/dangling (dangling)\n",
+        "    - ~/.config/foreign (not a symlink)\n",
+        "    - ~/.config/gone (missing)\n",
+        "    - ~/.config/orphan (owner retired is not active)\n",
+        "    → run dot update to re-link\n",
+    ] {
+        assert!(issues.contains(item), "missing {item:?}: {issues}");
+    }
 }
 
 #[test]
@@ -1317,24 +1772,29 @@ fn overlay_branch_upstream_and_dirt_follow_update_severities() {
     input.overlay_lifecycle = vec!["git|active|d".into()];
     let rows = || render(&check_overlays(&input));
 
+    // N1: a clean overlay on its current upstream is one row.
     let clean = rows();
     assert!(
-        clean.contains("✓ git: remote.origin.url matches conf"),
+        clean.contains(&format!(
+            "\n  ✓ git ({}, main, current with origin/main)\n",
+            repo.display()
+        )),
         "{clean}"
     );
-    assert!(
-        clean.contains("✓ git: upstream (origin/main (current))"),
-        "{clean}"
-    );
+    assert!(!clean.contains("remote.origin.url"), "{clean}");
     assert!(!clean.contains('⚠') && !clean.contains('✗'), "{clean}");
 
     std::fs::write(repo.join("file"), b"two\n").expect("dirty");
+    // Any problem expands the overlay to every row, passing ones included.
     let dirty = rows();
     assert!(dirty.contains("⚠ git: 1 tracked change(s)"), "{dirty}");
-    assert!(
-        dirty.contains("✓ git: upstream (origin/main (current))"),
-        "{dirty}"
-    );
+    for row in [
+        "✓ git: cloned",
+        "✓ git: remote.origin.url matches conf",
+        "✓ git: upstream (origin/main (current))",
+    ] {
+        assert!(dirty.contains(row), "missing {row:?}: {dirty}");
+    }
     git(&repo, &["checkout", "-q", "--", "file"]);
 
     git(&repo, &["commit", "-q", "--allow-empty", "-m", "local"]);
@@ -1353,7 +1813,16 @@ fn overlay_branch_upstream_and_dirt_follow_update_severities() {
     git(&repo, &["checkout", "-q", "-b", "side"]);
     let untracked = rows();
     assert!(
-        untracked.contains("⚠ git: upstream is not configured"),
+        untracked.contains(
+            "⚠ git: upstream is not configured\n    dot update skips pulling this overlay\n"
+        ),
+        "{untracked}"
+    );
+    assert!(
+        untracked.contains(&format!(
+            "    → set one: `git -C {} branch --set-upstream-to=origin/side`\n",
+            repo.display()
+        )),
         "{untracked}"
     );
 
@@ -1479,6 +1948,285 @@ fn frozen_overlay_rebase_fails_until_rebased_by_hand() {
     assert!(rows.contains("skips this optional overlay"), "{rows}");
 }
 
+/// `git` in `repo`, stdout trimmed.
+fn git_out(repo: &Path, args: &[&str]) -> String {
+    let output = dot_test_support::git()
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {args:?} in {}",
+        repo.display()
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string()
+}
+
+/// Leave `repo` mid-rebase onto `origin/main` with HEAD detached, the way a
+/// killed `dot update` leaves it: stopped after its first pick, or, with
+/// `conflict`, stopped on a conflicting pick (unmerged entries). With `dots`,
+/// the rebase is recorded as dot's own first, exactly as update records it
+/// before running it.
+fn strand_rebase(repo: &Path, remote: &str, dots: bool, conflict: bool) {
+    let peer = repo.with_extension("peer");
+    let status = dot_test_support::git()
+        .args(["clone", "-q", remote])
+        .arg(&peer)
+        .stdin(Stdio::null())
+        .status()
+        .expect("clone peer");
+    assert!(status.success());
+    let (upstream_file, local_file) = if conflict {
+        ("file", "file")
+    } else {
+        ("upstream", "local")
+    };
+    std::fs::write(peer.join(upstream_file), b"up\n").expect("upstream file");
+    git(&peer, &["add", upstream_file]);
+    git(&peer, &["commit", "-q", "-m", "upstream"]);
+    git(&peer, &["push", "-q", "origin", "main"]);
+    std::fs::write(repo.join(local_file), b"local\n").expect("local file");
+    git(repo, &["add", local_file]);
+    git(repo, &["commit", "-q", "-m", "local"]);
+    git(repo, &["fetch", "-q", "origin"]);
+    if dots {
+        let head = git_out(repo, &["rev-parse", "HEAD"]);
+        let onto = git_out(repo, &["rev-parse", "origin/main"]);
+        std::fs::write(
+            repo.join(".git/dot-rebase-inflight"),
+            format!("{head} {onto}\n"),
+        )
+        .expect("inflight record");
+    }
+    let mut rebase = vec!["rebase"];
+    if !conflict {
+        rebase.extend(["--exec", "false"]);
+    }
+    rebase.push("origin/main");
+    let stopped = dot_test_support::git()
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(&rebase)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("rebase");
+    assert!(!stopped.success(), "the rebase must stop");
+    assert!(repo.join(".git/rebase-merge").is_dir());
+}
+
+#[test]
+fn interrupted_rebase_reads_like_update_not_as_detached() {
+    // K4: a rebase detaches HEAD. Doctor used to call every such checkout a
+    // plain detached HEAD, even dot's own interrupted rebase that fails
+    // every update. It now classifies it the way update does.
+    let scratch = TempDir::new("doctor-overlay-interrupted").expect("scratch");
+    let (remote, clones) = overlay_clones(scratch.path(), 1);
+    let repo = &clones[0];
+    strand_rebase(repo, &remote, true, false);
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let input = clone_inputs(manifest, &remote, &clones);
+    let rows = || render(&check_overlays(&input));
+
+    // Nothing uncommitted: the next update aborts it and pulls.
+    let healable = rows();
+    assert!(
+        healable.contains(
+            "⚠ ov0: has an interrupted dot rebase\n    the next dot update aborts it, which discards nothing, and pulls\n    → run dot update to finish now\n"
+        ),
+        "{healable}"
+    );
+    assert!(!healable.contains("detached"), "{healable}");
+    assert!(!healable.contains('✗'), "{healable}");
+
+    // A tracked edit: update refuses to abort it and fails every run, so
+    // doctor fails with the abort and continue commands for this checkout.
+    std::fs::write(repo.join("file"), b"edited\n").expect("tracked edit");
+    let stuck = rows();
+    assert!(
+        stuck.contains(
+            "✗ ov0: has an interrupted dot rebase\n    dot update fails until it is aborted"
+        ),
+        "{stuck}"
+    );
+    assert!(
+        stuck.contains(&format!(
+            "    → run `git -C {repo} rebase --abort`, or resolve it and run `git -C {repo} rebase --continue`\n",
+            repo = repo.display()
+        )),
+        "{stuck}"
+    );
+    git(repo, &["checkout", "-q", "--", "file"]);
+
+    // Not dot's (no in-flight record): the user's session, which update
+    // skips.
+    std::fs::remove_file(repo.join(".git/dot-rebase-inflight")).expect("drop record");
+    let session = rows();
+    assert!(
+        session.contains(
+            "⚠ ov0: has an unfinished merge, rebase, cherry-pick, revert, or am\n    dot update skips this overlay until it is finished\n"
+        ),
+        "{session}"
+    );
+    assert!(!session.contains("detached"), "{session}");
+
+    // Nothing in progress: a plain detached HEAD.
+    git(repo, &["rebase", "--abort"]);
+    git(repo, &["checkout", "-q", "--detach"]);
+    let detached = rows();
+    assert!(
+        detached.contains(&format!(
+            "⚠ ov0: HEAD is detached\n    dot update skips this overlay until it is back on a branch\n    → check out its branch: `git -C {} switch BRANCH`\n",
+            repo.display()
+        )),
+        "{detached}"
+    );
+}
+
+#[test]
+fn interrupted_dot_rebase_fails_an_optional_overlay_too() {
+    // Update fails a dot rebase it cannot abort even for an optional overlay:
+    // its mid-rebase files are live and would be linked.
+    let scratch = TempDir::new("doctor-optional-interrupted").expect("scratch");
+    let (remote, clones) = overlay_clones(scratch.path(), 1);
+    let repo = &clones[0];
+    strand_rebase(repo, &remote, true, false);
+    std::fs::write(repo.join("file"), b"edited\n").expect("tracked edit");
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let mut input = clone_inputs(manifest, &remote, &clones);
+    input.active_records = vec![format!("ov0|{}|{remote}||true|git", repo.display())];
+    let rows = render(&check_overlays(&input));
+    assert!(
+        rows.contains("✗ ov0: has an interrupted dot rebase"),
+        "{rows}"
+    );
+}
+
+#[test]
+fn conflicted_rebase_reports_one_row_for_its_unmerged_entries() {
+    // A rebase stopped on a conflict leaves unmerged entries. The row for
+    // the rebase speaks for them, in update's severity; the generic
+    // "without a branch to pull, update skips" unmerged row would contradict
+    // it for dot's own rebase, which update fails.
+    let scratch = TempDir::new("doctor-conflicted-rebase").expect("scratch");
+    let (remote, clones) = overlay_clones(scratch.path(), 1);
+    let repo = &clones[0];
+    strand_rebase(repo, &remote, true, true);
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let input = clone_inputs(manifest, &remote, &clones);
+    let rows = || render(&check_overlays(&input));
+    let dots = rows();
+    assert!(
+        dots.contains("✗ ov0: has an interrupted dot rebase"),
+        "{dots}"
+    );
+    assert!(!dots.contains("unmerged"), "{dots}");
+    // The user's own conflicted rebase: one warning, update skips it.
+    std::fs::remove_file(repo.join(".git/dot-rebase-inflight")).expect("drop record");
+    let users = rows();
+    assert!(
+        users.contains("⚠ ov0: has an unfinished merge, rebase, cherry-pick, revert, or am"),
+        "{users}"
+    );
+    assert!(!users.contains("unmerged"), "{users}");
+    assert!(!users.contains('✗'), "{users}");
+}
+
+#[test]
+fn interrupted_client_rebase_reads_like_update() {
+    // K4 and K8 for the client: the same classification and wording as an
+    // overlay, with commands that carry the separate Git directory.
+    let scratch = TempDir::new("doctor-base-interrupted").expect("scratch");
+    let (remote, clones) = overlay_clones(scratch.path(), 1);
+    let home = &clones[0];
+    strand_rebase(home, &remote, true, false);
+    let git_dir = home.join(".git");
+    // The explicit-worktree layout the separate client uses.
+    git(
+        home,
+        &["config", "core.worktree", home.to_str().expect("utf8")],
+    );
+    let rows = || render(&check_base_repo(&base("separate", &git_dir, home)));
+    let healable = rows();
+    assert!(
+        healable.contains(
+            "⚠ client has an interrupted dot rebase\n    the next dot update aborts it, which discards nothing, and pulls\n"
+        ),
+        "{healable}"
+    );
+    assert!(!healable.contains('✗'), "{healable}");
+    std::fs::write(home.join("file"), b"edited\n").expect("tracked edit");
+    let stuck = rows();
+    assert!(
+        stuck.contains("✗ client has an interrupted dot rebase\n    dot update fails"),
+        "{stuck}"
+    );
+    assert!(
+        stuck.contains(&format!(
+            "`git --git-dir={} --work-tree={} rebase --abort`",
+            git_dir.display(),
+            home.display()
+        )),
+        "{stuck}"
+    );
+    // The headless row speaks for the rest: no "upstream is not
+    // configured" on top of it.
+    assert!(!stuck.contains("upstream"), "{stuck}");
+    assert!(!stuck.contains("worktree identity"), "{stuck}");
+    git(home, &["checkout", "-q", "--", "file"]);
+    git(home, &["rebase", "--abort"]);
+
+    git(home, &["checkout", "-q", "--detach"]);
+    let detached = rows();
+    assert!(
+        detached.contains(
+            "⚠ client HEAD is detached\n    dot update skips the client until it is back on a branch\n"
+        ),
+        "{detached}"
+    );
+    assert!(!detached.contains("upstream"), "{detached}");
+
+    git(home, &["checkout", "-q", "-b", "side"]);
+    let untracked = rows();
+    assert!(
+        untracked.contains(
+            "⚠ client upstream is not configured\n    dot update skips pulling the client\n"
+        ),
+        "{untracked}"
+    );
+
+    git(home, &["checkout", "-q", "main"]);
+    git(home, &["branch", "-q", "--set-upstream-to=origin/main"]);
+    git(home, &["update-ref", "-d", "refs/remotes/origin/main"]);
+    let gone = rows();
+    assert!(
+        gone.contains(
+            "⚠ client upstream could not be compared\n    origin/main; dot update skips pulling the client\n"
+        ),
+        "{gone}"
+    );
+}
+
 /// A bare remote with one commit on `main`, plus `count` clones of it.
 fn overlay_clones(root: &Path, count: usize) -> (String, Vec<std::path::PathBuf>) {
     let remote = root.join("remote.git");
@@ -1549,9 +2297,12 @@ fn concurrent_overlay_statuses_land_on_their_own_overlay() {
     let input = clone_inputs(manifest, &remote, &clones);
     for _ in 0..5 {
         let rows = render(&check_overlays(&input));
-        for index in 0..clones.len() {
+        for (index, repo) in clones.iter().enumerate() {
             let expected = match index % 4 {
-                0 => format!("✓ ov{index}: upstream (origin/main (current))"),
+                0 => format!(
+                    "✓ ov{index} ({}, main, current with origin/main)",
+                    repo.display()
+                ),
                 1 => format!("⚠ ov{index}: 1 tracked change(s)"),
                 2 => format!("⚠ ov{index}: ahead of upstream"),
                 _ => format!("⚠ ov{index}: HEAD is detached"),
@@ -1742,8 +2493,59 @@ fn provider_failure_source_development_and_abi_matrix() {
     dev.locked_revision = Some("1234567890abcdef");
     dev.development_revision = Some("1234567890abcdef");
     let dev_output = render(&check_provider(&dev));
-    assert!(dev_output.contains("development checkout"));
-    assert!(dev_output.contains("matches Dot lock: 1234567890ab"));
+    // N1: policy, source, and revision are one informational row.
+    assert!(
+        dev_output.contains(
+            "  › Shdeps provider (latest policy; development checkout /dev/shdeps selected by Dot lock; revision 1234567890ab (matches Dot lock))\n"
+        ),
+        "{dev_output}"
+    );
+    assert_eq!(dev_output.matches('›').count(), 1, "{dev_output}");
+
+    // Under the latest policy an unpinned revision is expected: no full SHA,
+    // no "differs from Dot lock" every run.
+    let mut unpinned = provider(
+        Some("shdeps"),
+        Some(ProviderInstaller {
+            path: "/dev/shdeps/install.sh",
+            source: "latest-dev",
+        }),
+        Some("/bin/shdeps"),
+        Some("1"),
+        Some("abi:1"),
+    );
+    unpinned.policy = "latest";
+    unpinned.development_exists = true;
+    unpinned.development_valid = true;
+    unpinned.locked_revision = Some("1234567890abcdef");
+    unpinned.development_revision = Some("fedcba0987654321fedcba0987654321fedcba09");
+    let unpinned_output = render(&check_provider(&unpinned));
+    assert!(
+        unpinned_output.contains(
+            "  › Shdeps provider (latest policy; trusted development checkout /dev/shdeps; unpinned revision fedcba098765)\n"
+        ),
+        "{unpinned_output}"
+    );
+    assert!(
+        !unpinned_output.contains("fedcba0987654321"),
+        "{unpinned_output}"
+    );
+
+    // The pinned default says only its policy.
+    let pinned = render(&check_provider(&provider(
+        Some("shdeps"),
+        Some(ProviderInstaller {
+            path: "/managed/install.sh",
+            source: "managed",
+        }),
+        Some("/bin/shdeps"),
+        Some("1"),
+        Some("abi:1"),
+    )));
+    assert!(
+        pinned.starts_with("\nDependency provider\n  › Shdeps provider (pinned policy)\n"),
+        "{pinned}"
+    );
 
     let mut invalid_dev = dev;
     invalid_dev.development_valid = false;
@@ -2028,7 +2830,12 @@ fn base_repo_upstream_current_ahead_behind_and_diverged() {
     git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     let git_dir = home.join(".git");
     let inputs = || base("ordinary", &git_dir, &home);
-    assert!(render(&check_base_repo(&inputs())).contains("origin/main (current)"));
+    // N1: a healthy client folds into one row naming its layout and branch.
+    let healthy = render(&check_base_repo(&inputs()));
+    assert_eq!(
+        healthy,
+        "\nClient repository\n  ✓ client repository (~/.git, ordinary layout, main, current with origin/main)\n"
+    );
     // A frozen rebase of this HEAD makes every update refuse.
     let head = String::from_utf8(
         dot_test_support::git()
