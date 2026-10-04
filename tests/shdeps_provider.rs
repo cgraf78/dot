@@ -61,6 +61,16 @@ fn git_head(dir: &Path) -> Vec<u8> {
 }
 
 /// Locate a real host command for the deliberately closed fixture PATH.
+/// The real Python interpreter fixtures run helpers with, never a PATH
+/// `python3` that may be a launcher forking the interpreter and waiting.
+fn fixture_python() -> PathBuf {
+    if Path::new("/usr/bin/python3").is_file() {
+        PathBuf::from("/usr/bin/python3")
+    } else {
+        fixture_command("python3").expect("fixture Python")
+    }
+}
+
 fn fixture_command(name: &str) -> Option<PathBuf> {
     let local_bin = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin"));
     for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
@@ -788,11 +798,7 @@ raise SystemExit(2)
     fn command_via(&self, program: &Path, subcommand: &str) -> Command {
         let mut command = Command::new(program);
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let fixture_python = if Path::new("/usr/bin/python3").is_file() {
-            PathBuf::from("/usr/bin/python3")
-        } else {
-            fixture_command("python3").expect("fixture Python")
-        };
+        let fixture_python = fixture_python();
         command
             .arg(subcommand)
             .env_clear()
@@ -5328,6 +5334,15 @@ fn provider_exit_bounds_an_escaped_continuous_writer() {
 const PREPARATION_TEARDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 const PREPARATION_HOLDER_LIFETIME: &str = "120";
 
+/// Creates the escaped holder's stop file when dropped.
+struct StopFileOnDrop(PathBuf);
+
+impl Drop for StopFileOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, b"stop");
+    }
+}
+
 fn assert_preparation_handles_escaped_stderr(stage: &str) {
     let rust = Fixture::new(&format!("shdeps-{stage}-escaped-stderr"));
     let pid_file = rust.home.join("escaped-preparation-stderr-pid");
@@ -5376,6 +5391,11 @@ fn assert_preparation_handles_escaped_stderr(stage: &str) {
         panic!("escaped {stage} stderr holder did not publish its pid");
     };
     let mut escaped = EscapedProcess::new(pid);
+    // Declared after `escaped` so it drops first: if an assertion panics
+    // before the explicit request below, the holder is still asked to leave
+    // before `EscapedProcess::drop` waits for it, instead of lingering for
+    // its whole lifetime where nothing may signal it.
+    let _stop_on_unwind = StopFileOnDrop(stop_file.clone());
     assert_eq!(
         process_session(pid),
         Some(pid),
@@ -5477,7 +5497,11 @@ fn escaped_output_holder_exits_when_asked_to_stop() {
     let rust = Fixture::new("escaped-holder-stop");
     let pid_file = rust.home.join("escaped-holder-pid");
     let stop_file = rust.home.join("escaped-holder-stop");
-    let mut holder = Command::new(rust.escaped_output_helper())
+    // Run the interpreter directly so `holder` is the holder itself: through
+    // the shebang a launcher could fork it, and killing or polling the
+    // launcher would miss the setsid'd holder.
+    let mut holder = Command::new(fixture_python())
+        .arg(rust.escaped_output_helper())
         .env("DOT_TEST_PROVIDER_ESCAPE_PID", &pid_file)
         .env("DOT_TEST_PROVIDER_ESCAPE_STOP", &stop_file)
         .env(
