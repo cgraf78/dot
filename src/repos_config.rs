@@ -154,6 +154,29 @@ mod tests {
 
     static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
+    /// Argument that makes a fixture git exit before logging, so the
+    /// readiness probe never counts as an invocation.
+    const FIXTURE_READY: &str = "--dot-fixture-ready";
+
+    /// Publish a fixture git script and return once the kernel execs it.
+    ///
+    /// Sibling tests in this binary fork constantly. A fork that lands
+    /// while `fs::write` still holds the script open for writing hands
+    /// the child a copy of that descriptor until its own exec, and an
+    /// exec of the script in that window fails with `ETXTBSY`. The
+    /// engine reads that spawn failure as a missing config value, so
+    /// the counting tests would lose the first logged read (7 calls
+    /// instead of 8). One successful exec proves no writer remains, and
+    /// none can reappear, so the counted runs that follow cannot race.
+    fn publish_git(path: &Path, body: &str) {
+        let script = format!("#!/bin/sh\n[ \"${{1-}}\" != {FIXTURE_READY} ] || exit 0\n{body}");
+        std::fs::write(path, script).expect("fixture git");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("fixture git mode");
+        dot_test_support::wait_until_executable(path, &[FIXTURE_READY])
+            .expect("fixture git executable");
+    }
+
     struct ConfigGit {
         _scope: dot_test_support::TempDir,
         log: std::path::PathBuf,
@@ -166,16 +189,13 @@ mod tests {
                 .expect("config git scope");
             let log = scope.path().join("invocations.log");
             let shim = scope.path().join("git");
-            std::fs::write(
+            publish_git(
                 &shim,
-                format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nif [ \"$3\" = config ]; then\n  if [ \"$4\" = --bool ]; then printf '%s\\n' \"{boolean}\";\n  elif [ -z \"$5\" ]; then printf '%s\\n' \"{plain}\";\n  fi\nfi\n",
+                &format!(
+                    "printf '%s\\n' \"$*\" >> {log}\nif [ \"$3\" = config ]; then\n  if [ \"$4\" = --bool ]; then printf '%s\\n' \"{boolean}\";\n  elif [ -z \"$5\" ]; then printf '%s\\n' \"{plain}\";\n  fi\nfi\n",
                     log = log.display(),
                 ),
-            )
-            .expect("config git shim");
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-                .expect("config git mode");
+            );
             Self {
                 _scope: scope,
                 log,
@@ -325,16 +345,13 @@ mod tests {
             dot_test_support::TempDir::new_exec("config-refuse").expect("refusing git scope");
         let log = scope.path().join("invocations.log");
         let shim = scope.path().join("git");
-        std::fs::write(
+        publish_git(
             &shim,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexit 1\n",
-                log = log.display(),
+            &format!(
+                "printf '%s\\n' \"$*\" >> {log}\nexit 1\n",
+                log = log.display()
             ),
-        )
-        .expect("refusing git shim");
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-            .expect("refusing git mode");
+        );
         let repo = scope.path().join("repo");
         let prefix = vec![OsString::from("-C"), repo.as_os_str().to_os_string()];
         crate::init_client_identity::with_host_git(shim.as_path(), || {
