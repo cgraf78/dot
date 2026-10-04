@@ -21,7 +21,7 @@
 //!   processes routinely write one diagnostic in several fragments. Anything
 //!   on stdout other than a redraw (the row closing, other output) first
 //!   releases a held fragment as its own line, so it stays inside its stage;
-//!   an explicit flush or [`PENDING_LIMIT`] releases it as it is.
+//!   an explicit flush or the 64 KiB `PENDING_LIMIT` releases it as it is.
 //!
 //! Without live mode (pipes, cron, `--quiet`) both streams pass through
 //! byte for byte: there is no row to protect and no terminal to address.
