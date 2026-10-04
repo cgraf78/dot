@@ -399,8 +399,14 @@ case ${1:-} in
     if [[ ${DOT_TEST_PROVIDER_SIGNAL_DURING_TEARDOWN:-0} == 1 ]]; then
       dot_pid=$PPID
       set -m
+      # After latching Dot's SIGINT the descendant must not fork again: the
+      # provider's TERM handler group-KILLs it at that very moment, and Darwin
+      # (unlike Linux) does not make killpg atomic against an in-flight fork.
+      # A `sleep` loop there can leak one lease-holding child past the group
+      # kill, which Dot then rightly reports as 125. `exec` keeps the same PID
+      # and the ignored TERM without creating another process.
       (
-        trap 'kill -STOP "$dot_pid"; printf "%s\n" TERM >"$DOT_TEST_PROVIDER_TEARDOWN_SIGNAL"; kill -INT "$dot_pid"; kill -CONT "$dot_pid"; trap "" TERM; while :; do sleep 1; done' TERM
+        trap 'kill -STOP "$dot_pid"; printf "%s\n" TERM >"$DOT_TEST_PROVIDER_TEARDOWN_SIGNAL"; kill -INT "$dot_pid"; kill -CONT "$dot_pid"; trap "" TERM; exec sleep 30' TERM
         printf '%s\n' "$BASHPID" >"$DOT_TEST_PROVIDER_TEARDOWN_PID"
         while :; do sleep 1; done
       ) </dev/null >/dev/null 2>&1 &
