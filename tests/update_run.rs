@@ -1556,3 +1556,40 @@ fn overlay_fetch_errors_print_under_the_line_naming_the_overlay() {
         }
     }
 }
+
+#[test]
+fn failed_pre_sync_keeps_the_repos_counts_the_shell_engine_printed() {
+    // Only an overlay descriptor fault replaces the Repos counts: every other
+    // convergence failure keeps the row the shell engine printed, which the
+    // release performance gate compares byte for byte (its pre-sync-failure
+    // workload is exactly this client).
+    let scratch = Scratch::new("update-run-pre-sync-row").expect("scratch dir");
+    let (home, state) = waiting_hook_client(&scratch, "pre-sync-row");
+    std::fs::write(
+        home.join("ext/pre-sync.d/10-wait.sh"),
+        b"prepare() { return 7; }\n",
+    )
+    .expect("failing hook");
+    let output = dot_env(
+        &["update"],
+        &home,
+        &state,
+        &[(
+            "DOT_BASH",
+            dot_test_support::real_tool("bash")
+                .to_str()
+                .expect("bash path"),
+        )],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[1/5] Repos      failed   1 repo current "),
+        "{stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("  warning: pre-sync extension failed: 10-wait.sh\n"),
+        "{output:?}"
+    );
+}

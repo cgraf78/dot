@@ -24,9 +24,9 @@ pub struct RepoStageFinish<'a> {
     pub changed_items: &'a [u8],
     /// Verbose flag; verbose output already reported individual changes.
     pub verbose: Option<&'a str>,
-    /// Why a forced failure failed when no repository did (an invalid
-    /// overlay descriptor, a failed pre-sync hook): it becomes the summary,
-    /// so the row never reads `failed` beside counts that all look fine.
+    /// Why a forced failure failed when no repository did (an overlay
+    /// descriptor that stopped discovery): it becomes the summary, so the
+    /// row does not read `failed` beside counts that all look fine.
     pub reason: Option<&'a [u8]>,
 }
 
