@@ -187,7 +187,21 @@ Doctor extensions report structured records only; ordinary stdout/stderr is
 diagnosed as out-of-band output. Each result helper accepts `LABEL [DETAIL]`
 except the one-argument section helper. An empty `DETAIL` renders exactly like
 an omitted one. `dot_doctor_info` records a configuration fact that is neither
-a passed nor a skipped check; it renders with `›` and is never counted:
+a passed nor a skipped check; it renders with `›` and is never counted.
+
+Keep `DETAIL` to one short clause. Two attachment helpers carry the rest,
+each taking one `TEXT` and attaching it to the closest
+ok/warn/fail/skip/info row the extension filed before it:
+
+- `dot_doctor_item TEXT` adds one list entry (a path, a package, a key). Items
+  render as indented `- TEXT` lines; past five, the rest fold into one
+  `+N more` line.
+- `dot_doctor_hint TEXT` adds one next step, rendered as a `→ TEXT` line after
+  the items.
+
+Attachments are not rows and never count. An empty `TEXT` is dropped. One
+filed before any row, or right after a section, has nothing to attach to and
+is reported as an invalid result.
 
 ```bash
 doctor() {
@@ -202,7 +216,27 @@ doctor() {
   else
     dot_doctor_ok 'selected backend' 'example'
   fi
+  local lock stale=("$HOME/.cache/example/a.lock" "$HOME/.cache/example/b.lock")
+  if declare -F dot_doctor_item >/dev/null; then
+    dot_doctor_warn "${#stale[@]} stale locks"
+    for lock in "${stale[@]}"; do
+      dot_doctor_item "$(dot_doctor_display_path "$lock")"
+    done
+    dot_doctor_hint 'run example-tool unlock'
+  else
+    dot_doctor_warn "${#stale[@]} stale locks" \
+      "${stale[*]}; run example-tool unlock"
+  fi
 }
+```
+
+which renders as:
+
+```text
+  ⚠ 2 stale locks
+    - ~/.cache/example/a.lock
+    - ~/.cache/example/b.lock
+    → run example-tool unlock
 ```
 
 Base and overlay extensions update independently of the installed `dot`, so
@@ -210,8 +244,10 @@ an extension must work against both an older and a newer coordinator:
 
 - Helpers are only ever added. Probe a helper newer than your oldest
   supported `dot` with `declare -F` before calling it, as above for
-  `dot_doctor_info`; an older coordinator reports an unknown record kind as
-  an invalid result. Never write records except through the helpers.
+  `dot_doctor_info`, `dot_doctor_item`, and `dot_doctor_hint`; an older
+  coordinator reports an unknown record kind as an invalid result. The
+  helpers ship with the coordinator that renders their records, so the probe
+  is reliable. Never write records except through the helpers.
 - Each extension has a deadline: `DOT_DOCTOR_TIMEOUT` seconds (default 60;
   `0` disables it), measured from its launch. Past it the coordinator stops
   the extension's whole session, keeps the records it already filed, reports
@@ -224,6 +260,20 @@ an extension must work against both an older and a newer coordinator:
   `doctor extension(s) refused` row that names them and the next step; a
   refused regular file gets its own row. Older coordinators skipped every
   extension in either case.
+- A file whose name is not a valid identity (`NN-name.sh` or `name.sh`, with
+  lowercase letters, digits, and hyphens), or whose identity an earlier file
+  in lexical order already claims (`20-tools.sh` and `21-tools.sh`), is
+  refused the same way, with a row naming the file and the fix. The other
+  extensions still run, including the first claimant of a duplicated
+  identity. Older coordinators ran no extension at all in this case.
+- An extension that exits nonzero gets a `<name> doctor extension failed` row
+  with its exit status and, when a failing command under `set -e` stopped
+  it, the file, line, and command (for a public helper that rejected its
+  arguments, the line that called it and the helper's name). A file that
+  fails while it is being sourced says so. The last lines of its captured
+  output are listed below the row. Older coordinators showed only the
+  output, which is often empty. Setting your own `EXIT` trap leaves just the
+  exit status.
 
 The coordinator owns rendering, counters, ordering, and aggregate exit status;
 extensions must not inspect or mutate those internals. `dot_doctor_display_path`

@@ -27,7 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub use crate::doctor_runtime::{Counts, Kind, Record};
+pub use crate::doctor_runtime::{Counts, ITEM_LIMIT, Kind, Record};
 
 /// Summary helpers owned by the coordinator lane
 /// ([`crate::doctor_coordinator`]), re-exported here so orchestrator
@@ -110,11 +110,7 @@ impl Recorder {
 
     /// Push one row without touching the counts.
     fn push(&mut self, kind: Kind, message: &[u8], detail: Option<&[u8]>) {
-        self.records.push(Record {
-            kind,
-            message: message.to_vec(),
-            detail: detail.map(<[u8]>::to_vec),
-        });
+        self.records.push(Record::bytes(kind, message, detail));
     }
 
     /// Render every filed row in order using the deterministic pipe
@@ -383,44 +379,184 @@ pub fn create_result_file(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
-/// `$(tr '\n' ' ' <"$log")`: every newline becomes a space;
-/// command substitution then strips trailing newlines, of which
-/// none remain, so trailing newlines surface as trailing spaces.
-pub fn collapse_log(log: &[u8]) -> Vec<u8> {
-    log.iter()
-        .map(|byte| if *byte == b'\n' { b' ' } else { *byte })
+/// The captured output's non-empty lines, each one row item, so a
+/// multi-line error stays readable instead of collapsing into one line.
+pub fn log_lines(log: &[u8]) -> Vec<Vec<u8>> {
+    log.split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .map(<[u8]>::to_vec)
         .collect()
+}
+
+/// Where the worker leaves its failure note: next to the result file, in the
+/// extension's private scratch directory (`worker.sh` derives the same path
+/// as `$result.failure`).
+pub fn failure_path(result: &Path) -> PathBuf {
+    let mut path = result.as_os_str().to_os_string();
+    path.push(".failure");
+    PathBuf::from(path)
+}
+
+/// The failing command the worker's ERR trap saw as the extension exited
+/// nonzero on it: its status, whether the file was still loading, where it
+/// ran (`doctor.d/<file>:<line>`), and its command text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureNote {
+    /// Status of the failing command.
+    pub status: i32,
+    /// The extension file was still being sourced, before `doctor` ran.
+    pub loading: bool,
+    /// `<path>:<line>` relative to the extension root; empty when the
+    /// failure surfaced at the worker's top level (the file failed to load,
+    /// or `doctor` itself returned the status).
+    pub location: Vec<u8>,
+    /// The failing command as Bash reports it (`$BASH_COMMAND`), or the
+    /// public helper that failed inside Dot's runtime; may be empty.
+    pub command: Vec<u8>,
+}
+
+/// Bound on the command text a note shows: enough for any ordinary line,
+/// while a here-document or a long generated command cannot flood the row.
+const NOTE_COMMAND_LIMIT: usize = 200;
+
+impl FailureNote {
+    /// Parse the worker's `status NUL phase NUL location NUL command` note
+    /// (phase `load` or `run`). Anything else (a truncated write, an unknown
+    /// shape) is no note at all: the row then shows only the exit status.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let mut fields = bytes.splitn(4, |byte| *byte == 0);
+        let status = std::str::from_utf8(fields.next()?).ok()?.parse().ok()?;
+        let loading = match fields.next()? {
+            b"load" => true,
+            b"run" => false,
+            _ => return None,
+        };
+        let location = fields.next()?.to_vec();
+        let command = fields.next()?;
+        Some(FailureNote {
+            status,
+            loading,
+            location,
+            command: display_command(command),
+        })
+    }
+
+    /// Read the note a worker left for `result`, if any.
+    pub fn read(result: &Path) -> Option<Self> {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        std::fs::File::open(failure_path(result))
+            .and_then(|file| file.take(4096).read_to_end(&mut bytes))
+            .ok()?;
+        Self::parse(&bytes)
+    }
+}
+
+/// One display line for a command: control bytes (a multi-line command's
+/// newlines, tabs) become spaces, and a long command is cut on a character
+/// boundary with an ellipsis.
+fn display_command(command: &[u8]) -> Vec<u8> {
+    let mut line: Vec<u8> = command
+        .iter()
+        .map(|byte| if byte.is_ascii_control() { b' ' } else { *byte })
+        .collect();
+    if line.len() > NOTE_COMMAND_LIMIT {
+        let mut cut = NOTE_COMMAND_LIMIT;
+        while cut > 0 && line[cut] & 0xC0 == 0x80 {
+            cut -= 1;
+        }
+        line.truncate(cut);
+        line.extend_from_slice("…".as_bytes());
+    }
+    line
+}
+
+/// `exited with status N`, plus where the extension stopped when the
+/// worker's note matches that status: `at <file>:<line>: <command>`; for a
+/// failure surfacing at the worker's top level, `while loading the
+/// extension file`, or the last command when `doctor` itself returned the
+/// status. The worker drops a note that is not about the exiting command;
+/// a status mismatch is a second guard against pointing at the wrong line.
+fn exit_detail(rc: i32, note: Option<&FailureNote>) -> Vec<u8> {
+    let mut detail = format!("exited with status {rc}").into_bytes();
+    let Some(note) = note.filter(|note| note.status == rc) else {
+        return detail;
+    };
+    if !note.location.is_empty() {
+        detail.extend_from_slice(b" at ");
+        detail.extend_from_slice(&note.location);
+        if !note.command.is_empty() {
+            detail.extend_from_slice(b": ");
+            detail.extend_from_slice(&note.command);
+        }
+    } else if note.loading {
+        detail.extend_from_slice(b" while loading the extension file");
+    } else if !note.command.is_empty() {
+        detail.extend_from_slice(b"; last command: ");
+        detail.extend_from_slice(&note.command);
+    }
+    detail
+}
+
+/// The items for a stopped extension's captured output: the last
+/// [`ITEM_LIMIT`] lines, because the line that explains a crash (a tool's
+/// final error, Bash's own diagnostic) comes last. Also returns how many
+/// earlier lines were left out.
+fn output_tail(log: &[u8]) -> (Vec<Vec<u8>>, usize) {
+    let mut lines = log_lines(log);
+    let omitted = lines.len().saturating_sub(ITEM_LIMIT);
+    lines.drain(..omitted);
+    (lines, omitted)
 }
 
 /// The tail of one extension run: a worker stopped at its deadline files
 /// `<key> doctor extension timed out`, any other nonzero status files
-/// `<key> doctor extension failed`, stray log output files
-/// `<key> doctor extension wrote outside the result API`, and a quiet
-/// success files nothing. The detail is the collapsed log (omitted when
-/// empty); a timeout leads with the limit and how to raise it.
-pub fn extension_tail(rec: &mut Recorder, key: &[u8], exit: WorkerExit, log: &[u8]) {
-    if let Some(limit) = exit.timed_out {
-        let mut message = key.to_vec();
-        message.extend_from_slice(b" doctor extension timed out");
-        let mut detail = format!(
-            "stopped after {}s; set DOT_DOCTOR_TIMEOUT to raise the limit",
-            limit.as_secs()
-        )
-        .into_bytes();
-        if !log.is_empty() {
-            detail.extend_from_slice(b"; output: ");
-            detail.extend_from_slice(&collapse_log(log));
+/// `<key> doctor extension failed` with the exit status and, from `note`,
+/// the failing line; stray log output files `<key> doctor extension wrote
+/// outside the result API`, and a quiet success files nothing. Captured
+/// output lines become the row's items, one per line: the last few for a
+/// stopped extension, all of them (folded by the renderer) for stray output.
+pub fn extension_tail(
+    rec: &mut Recorder,
+    key: &[u8],
+    exit: WorkerExit,
+    log: &[u8],
+    note: Option<&FailureNote>,
+) {
+    let mut message = key.to_vec();
+    if exit.timed_out.is_none() && exit.rc == 0 {
+        if log.is_empty() {
+            return;
         }
-        rec.fail(&message, Some(&detail));
-    } else if exit.rc != 0 {
-        let mut message = key.to_vec();
-        message.extend_from_slice(b" doctor extension failed");
-        rec.fail(&message, Some(&collapse_log(log)));
-    } else if !log.is_empty() {
-        let mut message = key.to_vec();
         message.extend_from_slice(b" doctor extension wrote outside the result API");
-        rec.warn(&message, Some(&collapse_log(log)));
+        let items = log_lines(log);
+        let detail = items.is_empty().then_some(b"blank lines only".as_slice());
+        let mut record = Record::bytes(Kind::Warn, &message, detail);
+        record.items = items;
+        rec.record(record);
+        return;
     }
+    let (items, omitted) = output_tail(log);
+    let mut detail = match exit.timed_out {
+        Some(limit) => {
+            message.extend_from_slice(b" doctor extension timed out");
+            format!("stopped after {}s", limit.as_secs()).into_bytes()
+        }
+        None => {
+            message.extend_from_slice(b" doctor extension failed");
+            exit_detail(exit.rc, note)
+        }
+    };
+    if omitted > 0 {
+        detail.extend_from_slice(format!("; last {ITEM_LIMIT} output lines shown").as_bytes());
+    }
+    let mut record = Record::bytes(Kind::Fail, &message, Some(&detail));
+    record.items = items;
+    if exit.timed_out.is_some() {
+        record = record.with_hint("set DOT_DOCTOR_TIMEOUT to raise the limit");
+    }
+    rec.record(record);
 }
 
 /// How one extension worker ended.
@@ -649,7 +785,8 @@ pub(crate) fn record_extension(
         } => {
             render(&result, rec);
             let log_bytes = std::fs::read(&log).unwrap_or_default();
-            extension_tail(rec, &key, exit, &log_bytes);
+            let note = (exit.rc != 0).then(|| FailureNote::read(&result)).flatten();
+            extension_tail(rec, &key, exit, &log_bytes, note.as_ref());
             drop(scratch);
             exit.rc
         }
@@ -679,11 +816,10 @@ mod tests {
     }
 
     #[test]
-    fn collapse_log_maps_every_newline() {
-        assert_eq!(collapse_log(b""), b"");
-        assert_eq!(collapse_log(b"a\nb\n"), b"a b ");
-        assert_eq!(collapse_log(b"\n"), b" ");
-        assert_eq!(collapse_log(b"a\rb\n"), b"a\rb ");
+    fn log_lines_keep_each_non_empty_line() {
+        assert!(log_lines(b"").is_empty());
+        assert_eq!(log_lines(b"a\n\nb\r\n"), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(log_lines(b"tail"), vec![b"tail".to_vec()]);
     }
 
     fn execute_in(root: &Path, key: &[u8], log: &'static [u8]) -> (ExtensionOutcome, PathBuf) {

@@ -248,24 +248,29 @@ fn run_configured(
         }),
     );
     emit.emit();
-    let merge_specs = extensions_enabled
-        .then(|| {
-            merge_inventory(
-                config,
-                &home,
-                &overlays.active,
-                &constants.overlay_manifest,
-                euid,
-                streams.stderr,
-            )
-        })
-        .flatten();
+    let merge_specs = if extensions_enabled {
+        merge_inventory(
+            config,
+            &home,
+            &overlays.active,
+            &constants.overlay_manifest,
+            euid,
+            streams.stderr,
+        )
+    } else {
+        Ok(Vec::new())
+    };
+    let (merge_specs, inventory_error) = match merge_specs {
+        Ok(specs) => (Some(specs), None),
+        Err(reason) => (None, Some(reason)),
+    };
     append(
         emit.recorder(),
         crate::doctor_checks::check_merges(&MergeInputs {
             enabled: extensions_enabled,
             extensions_dir: config.extensions_dir.clone().unwrap_or_default(),
             spec_count: merge_specs.as_ref().map(Vec::len),
+            inventory_error,
             specs: merge_specs.unwrap_or_default(),
         }),
     );
@@ -278,7 +283,6 @@ fn run_configured(
         &overlays.active,
         overlays.discovery_error.is_some(),
         &constants.overlay_manifest,
-        streams.stderr,
         &mut emit,
     );
     // Cancellation owns the final status at the CLI boundary. Do not render a
@@ -705,6 +709,9 @@ fn read_outputs_sidecar(sidecar: &Path, home: &str) -> Option<(Vec<String>, Vec<
     Some((outputs, invalid))
 }
 
+/// The merge-hook inventory for output verification, or why it is invalid:
+/// the reason, with its next step, becomes the row's detail rather than a
+/// stderr line the report never mentions.
 fn merge_inventory(
     config: &crate::config::Config,
     home: &str,
@@ -712,15 +719,20 @@ fn merge_inventory(
     manifest: &str,
     euid: u32,
     stderr: &mut dyn std::io::Write,
-) -> Option<Vec<MergeSpec>> {
-    let root = config.extensions_dir.as_deref()?;
+) -> Result<Vec<MergeSpec>, String> {
+    let Some(root) = config.extensions_dir.as_deref() else {
+        return Ok(Vec::new());
+    };
     let directory = Path::new(root).join("merge-hooks.d");
     if !directory.exists() {
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
-    let meta = std::fs::symlink_metadata(&directory).ok()?;
+    let shown = |path: &Path| crate::doctor_paths::tilde(&path.to_string_lossy(), home);
+    let untrusted = |path: &Path| untrusted_detail(path, home);
+    let meta = std::fs::symlink_metadata(&directory)
+        .map_err(|error| format!("cannot inspect {}: {error}", shown(&directory)))?;
     if !meta.is_dir() || meta.file_type().is_symlink() {
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
     let trust = crate::extension_trust::Inputs {
         euid,
@@ -730,18 +742,13 @@ fn merge_inventory(
         retiring_root: String::new(),
     };
     if !crate::extension_trust::root_validate(root, euid) {
-        let _ = writeln!(stderr, "dot: unsafe extension root: {root}");
-        return None;
+        return Err(untrusted(Path::new(root)));
     }
     if !crate::extension_trust::directory_validate(&directory, root, euid) {
-        let _ = writeln!(
-            stderr,
-            "dot: unsafe merge-hook directory: {}",
-            directory.display()
-        );
-        return None;
+        return Err(untrusted(&directory));
     }
-    let entries = std::fs::read_dir(&directory).ok()?;
+    let entries = std::fs::read_dir(&directory)
+        .map_err(|error| format!("cannot read {}: {error}", shown(&directory)))?;
     let mut scripts = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -759,8 +766,7 @@ fn merge_inventory(
     for index in 0..scripts.len() {
         let path = &scripts[index];
         if !crate::extension_trust::file_validate(path, &trust, overlays) {
-            let _ = writeln!(stderr, "dot: unsafe merge hook: {}", path.display());
-            return None;
+            return Err(untrusted(path));
         }
         // Identity belongs to the same glob-order iteration as trust in the
         // shell. Reusing the shared collector over the validated prefix keeps
@@ -772,9 +778,24 @@ fn merge_inventory(
             .collect();
         match crate::merges::collect_specs(&refs) {
             Ok(specs) => rows = specs,
-            Err(error) => {
-                let _ = writeln!(stderr, "{error}");
-                return None;
+            Err(crate::merges::SpecError::InvalidIdentity(_)) => {
+                return Err(
+                    crate::doctor_coordinator::SpecError::InvalidIdentity.reason(&shown(path))
+                );
+            }
+            Err(crate::merges::SpecError::DuplicateIdentity(identity)) => {
+                // The earlier claimant is the validated script whose key
+                // maps to the same identity.
+                let claimed_by = scripts[..index].iter().find_map(|script| {
+                    let key = crate::merges::spec_key(script.as_os_str());
+                    (crate::merges::spec_identity(&key).as_ref() == Some(&identity))
+                        .then(|| script.file_name().unwrap_or_default().as_bytes().to_vec())
+                });
+                return Err(crate::doctor_coordinator::SpecError::DuplicateIdentity {
+                    identity: identity.into_vec(),
+                    claimed_by: claimed_by.unwrap_or_default(),
+                }
+                .reason(&shown(path)));
             }
         }
     }
@@ -782,7 +803,10 @@ fn merge_inventory(
     // diagnostics keep their historical precedence.
     let mut inventory = Vec::new();
     for (key, script) in &rows {
-        let identity = crate::merges::spec_identity(key)?;
+        // `collect_specs` accepted every key above, so each has an identity.
+        let Some(identity) = crate::merges::spec_identity(key) else {
+            continue;
+        };
         let mut sidecar_name = key.as_bytes().to_vec();
         sidecar_name.extend_from_slice(b".outputs");
         let sidecar = directory.join(OsStr::from_bytes(&sidecar_name));
@@ -833,7 +857,7 @@ fn merge_inventory(
         }
         inventory.push(spec);
     }
-    Some(inventory)
+    Ok(inventory)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -844,16 +868,22 @@ fn extensions(
     overlays: &[String],
     overlays_unresolved: bool,
     manifest: &str,
-    stderr: &mut dyn std::io::Write,
     emit: &mut Emitter<'_>,
 ) -> i32 {
     if !crate::config::extensions_enabled(config) {
         return 0;
     }
     let root = config.extensions_dir.as_deref().unwrap_or_default();
+    let home = text(runtime.value("HOME"));
+    // Every early return files a row saying what failed and what to do:
+    // a bare nonzero status would leave the summary at "0 failed".
+    let untrusted = |path: &Path| untrusted_detail(path, &home);
     if !crate::extension_trust::root_validate(root, euid) {
-        emit.recorder()
-            .fail(b"doctor extension discovery failed", None);
+        let detail = untrusted(Path::new(root));
+        emit.recorder().fail(
+            b"doctor extension discovery failed",
+            Some(detail.as_bytes()),
+        );
         return 1;
     }
     let directory = Path::new(root).join("doctor.d");
@@ -861,13 +891,16 @@ fn extensions(
         return 0;
     }
     if !crate::extension_trust::directory_validate(&directory, root, euid) {
-        emit.recorder()
-            .fail(b"doctor extension discovery failed", None);
+        let detail = untrusted(&directory);
+        emit.recorder().fail(
+            b"doctor extension discovery failed",
+            Some(detail.as_bytes()),
+        );
         return 1;
     }
     let trust = crate::extension_trust::Inputs {
         euid,
-        home: text(runtime.value("HOME")),
+        home: home.clone(),
         extensions_dir: root.to_string(),
         manifest: manifest.to_string(),
         retiring_root: String::new(),
@@ -876,14 +909,18 @@ fn extensions(
         crate::extension_trust::file_validate(script, &trust, overlays)
     }) {
         Ok(discovery) => discovery,
-        Err(_) => {
-            emit.recorder()
-                .fail(b"doctor extension discovery failed", None);
+        Err(error) => {
+            let shown = crate::doctor_paths::tilde(&directory.to_string_lossy(), &home);
+            let detail = format!("cannot read {shown}: {error}");
+            emit.recorder().fail(
+                b"doctor extension discovery failed",
+                Some(detail.as_bytes()),
+            );
             return 1;
         }
     };
     // Refused scripts fail; the rest still run.
-    let status = i32::from(!discovery.rejected.is_empty());
+    let status = i32::from(!discovery.rejected.is_empty() || !discovery.invalid.is_empty());
     record_rejected(
         emit.recorder(),
         &discovery.rejected,
@@ -891,12 +928,7 @@ fn extensions(
         overlays,
         overlays_unresolved,
     );
-    if let Some(error) = discovery.error {
-        let _ = stderr.write_all(&error.message());
-        emit.recorder()
-            .fail(b"doctor extension discovery failed", None);
-        return 1;
-    }
+    record_invalid(emit.recorder(), &discovery.invalid, &home);
     if discovery.specs.is_empty() {
         return status;
     }
@@ -905,10 +937,15 @@ fn extensions(
         .map(|entry| entry.as_bytes().to_vec())
         .collect();
     let Ok(bash) = doctor_bash(runtime) else {
+        // The Bash runtime row above already failed and says why; this row
+        // names the consequence without counting the same cause twice.
+        emit.recorder().skip(
+            b"doctor extensions did not run",
+            Some(b"they need Bash 4 or newer; see the Bash runtime row"),
+        );
         return 1;
     };
     let worker = crate::hook_worker::Worker::with_doctor(runtime, root, bash.path().to_path_buf());
-    let home = text(runtime.value("HOME"));
     let temporary = temporary_root(runtime);
     let timeout = extension_timeout(runtime);
     let abort = AtomicBool::new(false);
@@ -1026,9 +1063,34 @@ fn record_rejected(
                 "{shown} links to a file that fails the extension trust checks; check its owner and mode"
             )
         } else {
-            format!("{shown} fails the extension trust checks; check its owner and mode")
+            untrusted_detail(script, home)
         };
         recorder.fail(message.as_bytes(), Some(detail.as_bytes()));
+    }
+}
+
+/// The detail for an extension path (root, directory, or script) that fails
+/// the trust checks, with the next step.
+fn untrusted_detail(path: &Path, home: &str) -> String {
+    let shown = crate::doctor_paths::tilde(&path.to_string_lossy(), home);
+    format!("{shown} fails the extension trust checks; check its owner and mode")
+}
+
+/// Failure rows for trusted doctor extensions refused for their file name: an
+/// invalid identity, or one an earlier file already claimed. Each names its
+/// file, the reason, and the fix, like a refused regular file, and the other
+/// extensions still run.
+fn record_invalid(
+    recorder: &mut Recorder,
+    invalid: &[(PathBuf, crate::doctor_coordinator::SpecError)],
+    home: &str,
+) {
+    for (script, error) in invalid {
+        let name = script.file_name().unwrap_or(script.as_os_str()).as_bytes();
+        let mut message = crate::doctor_coordinator::extension_key(name).to_vec();
+        message.extend_from_slice(b" doctor extension refused");
+        let shown = crate::doctor_paths::tilde(&script.to_string_lossy(), home);
+        recorder.fail(&message, Some(error.reason(&shown).as_bytes()));
     }
 }
 

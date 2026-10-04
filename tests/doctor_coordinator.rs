@@ -31,7 +31,7 @@ fn specs_rows_agree() {
         dir.write(name, b"#!/bin/sh\n");
     }
     let discovery = collect_specs(dir.path()).expect("collect");
-    assert!(discovery.error.is_none());
+    assert!(discovery.invalid.is_empty());
     assert_eq!(
         discovery
             .specs
@@ -41,20 +41,39 @@ fn specs_rows_agree() {
         vec![b"10-alpha".as_slice(), b"20-zed".as_slice()]
     );
 
+    // A bad name refuses that one file; the rest still list (K1).
     dir.write("15-Bad.sh", b"");
     let invalid = collect_specs(dir.path()).expect("collect invalid");
-    assert!(matches!(
-        invalid.error,
-        Some(SpecError::InvalidIdentity { .. })
-    ));
+    assert_eq!(
+        invalid.invalid,
+        vec![(dir.path().join("15-Bad.sh"), SpecError::InvalidIdentity)]
+    );
+    assert_eq!(invalid.specs.len(), 2, "{:?}", invalid.specs);
 
+    // The first claimant in glob order keeps a duplicated identity.
     let duplicate = TempDir::new("doctor-specs-duplicate").expect("fixture");
     duplicate.write("10-same.sh", b"");
     duplicate.write("same.sh", b"");
-    assert!(matches!(
-        collect_specs(duplicate.path()).expect("duplicate").error,
-        Some(SpecError::DuplicateIdentity { .. })
-    ));
+    duplicate.write("20-other.sh", b"");
+    let duplicated = collect_specs(duplicate.path()).expect("duplicate");
+    assert_eq!(
+        duplicated.invalid,
+        vec![(
+            duplicate.path().join("same.sh"),
+            SpecError::DuplicateIdentity {
+                identity: b"same".to_vec(),
+                claimed_by: b"10-same.sh".to_vec(),
+            }
+        )]
+    );
+    assert_eq!(
+        duplicated
+            .specs
+            .iter()
+            .map(|spec| spec.key.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"10-same".as_slice(), b"20-other".as_slice()]
+    );
 
     // An untrusted script is refused on its own: it neither runs nor claims
     // an identity, and discovery continues past it.
@@ -66,7 +85,7 @@ fn specs_rows_agree() {
         !script.to_string_lossy().ends_with("10-stale.sh")
     })
     .expect("refused");
-    assert_eq!(refused.error, None);
+    assert!(refused.invalid.is_empty());
     assert_eq!(refused.rejected, vec![mixed.path().join("10-stale.sh")]);
     assert_eq!(
         refused
@@ -77,9 +96,9 @@ fn specs_rows_agree() {
         vec![b"20-live".as_slice(), b"stale".as_slice()]
     );
     let all_refused = collect_specs_with(duplicate.path(), |_| false).expect("unsafe");
-    assert_eq!(all_refused.error, None);
+    assert!(all_refused.invalid.is_empty());
     assert!(all_refused.specs.is_empty());
-    assert_eq!(all_refused.rejected.len(), 2);
+    assert_eq!(all_refused.rejected.len(), 3);
 }
 
 #[test]
@@ -117,4 +136,20 @@ fn summary_rows_agree() {
     assert!(overall_ok(0, 0));
     assert!(!overall_ok(1, 0));
     assert!(!overall_ok(0, 1));
+}
+
+#[test]
+fn identity_refusals_name_the_fix() {
+    assert_eq!(
+        SpecError::InvalidIdentity.reason("~/x/Bad.sh"),
+        "~/x/Bad.sh has an invalid name; rename it to NN-name using lowercase letters, digits, and hyphens"
+    );
+    assert_eq!(
+        SpecError::DuplicateIdentity {
+            identity: b"tools".to_vec(),
+            claimed_by: b"20-tools.sh".to_vec(),
+        }
+        .reason("~/x/21-tools.sh"),
+        "~/x/21-tools.sh repeats identity tools of 20-tools.sh; remove or rename one of them"
+    );
 }

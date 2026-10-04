@@ -116,8 +116,65 @@ case $mode in
     DOT_DOCTOR_RESULT_FILE=$result
     readonly DOT_DOCTOR_RESULT_FILE
     export DOT_DOCTOR_RESULT_FILE
+    # Under `set -e` a failing command ends the extension with no output,
+    # which used to surface as an empty failure row. The ERR trap notes the
+    # last failure in this shell (errtrace carries it into functions); the
+    # EXIT trap hands the note to the coordinator only when the worker
+    # fails. An explicit `exit` other than the noted command means the note
+    # is about a failure the extension tolerated under `set +e`, so it is
+    # dropped; any other failing command, `return` included, overwrites the
+    # note itself, and inside a sourced file or `eval` the exit-time command
+    # is the enclosing one, so only `exit` can be compared. The note lives in
+    # shell variables because subshells and command substitutions, where a
+    # failing command does not stop the extension, must not leave one
+    # behind. It names the innermost frame outside Dot's own runtime: a
+    # helper that rejects its arguments fails inside the public API, but the
+    # fix belongs on the extension line that called it. Reaching this file's
+    # own top level means the extension file failed to load, or `doctor`
+    # itself returned the status; only the phase and last command are known
+    # then. The note path is the coordinator's
+    # `doctor_orchestrator::failure_path`; deriving it from the readonly
+    # result path keeps an extension's own `result` variable out of it.
+    _dot_doctor_failure_file=$DOT_DOCTOR_RESULT_FILE.failure
+    readonly _dot_doctor_failure_file
+    _dot_doctor_phase=load
+    _dot_doctor_failure=()
+    _dot_doctor_note_failure() {
+      local status=$1 command=$2 frame where='' root=${DOT_EXTENSIONS_DIR:-}
+      root=${root%/}
+      for ((frame = 1; frame < ${#BASH_SOURCE[@]}; frame++)); do
+        case ${BASH_SOURCE[frame]} in
+          "$0") break ;;
+          "$DOT_SOURCE_ROOT"/lib/dot/*) command=${FUNCNAME[frame]} ;;
+          *)
+            where=${BASH_SOURCE[frame]}
+            [[ -z $root ]] || where=${where#"$root"/}
+            where+=:${BASH_LINENO[frame - 1]}
+            break
+            ;;
+        esac
+      done
+      # The worker's own `. "$script"` line says nothing about the cause.
+      [[ -n $where || $_dot_doctor_phase != load ]] || command=
+      _dot_doctor_failure=("$status" "$_dot_doctor_phase" "$where" "$command" "$2")
+    }
+    _dot_doctor_report_failure() {
+      [[ $1 -ne 0 && ${#_dot_doctor_failure[@]} -eq 5 ]] || return 0
+      case $2 in
+        exit | 'exit '*) [[ $2 == "${_dot_doctor_failure[4]}" ]] || return 0 ;;
+      esac
+      printf '%s\0%s\0%s\0%s' "${_dot_doctor_failure[@]:0:4}" \
+        >"$_dot_doctor_failure_file" 2>/dev/null || :
+    }
+    trap '_dot_doctor_note_failure "$?" "$BASH_COMMAND"' ERR
+    trap '_dot_doctor_report_failure "$?" "$BASH_COMMAND"' EXIT
+    set -E
     . "$script"
-    declare -F doctor >/dev/null
+    if ! declare -F doctor >/dev/null; then
+      printf 'dot: %s defines no doctor function\n' "${script##*/}" >&2
+      exit 1
+    fi
+    _dot_doctor_phase=run
     doctor
     ;;
 esac

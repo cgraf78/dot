@@ -1,7 +1,8 @@
 # Doctor extension API 1. Base and overlay extensions update independently of
 # the coordinator, so every row must work against an older and a newer dot:
 # - helpers are only ever added; a helper newer than an extension's oldest
-#   supported dot is probed with `declare -F` before use (dot_doctor_info);
+#   supported dot is probed with `declare -F` before use (dot_doctor_info,
+#   dot_doctor_item, dot_doctor_hint);
 # - an empty DETAIL renders like an omitted one (older coordinators print an
 #   empty "()" trailer; cosmetic only);
 # - each extension has a deadline (DOT_DOCTOR_TIMEOUT seconds, default 60;
@@ -15,5 +16,7 @@ dot_doctor_warn	LABEL [DETAIL]	0 recorded; 1 unavailable channel; 2 invalid argu
 dot_doctor_fail	LABEL [DETAIL]	0 recorded; 1 unavailable channel; 2 invalid arguments	records a failing check
 dot_doctor_skip	LABEL [DETAIL]	0 recorded; 1 unavailable channel; 2 invalid arguments	records a skipped check
 dot_doctor_info	LABEL [DETAIL]	0 recorded; 1 unavailable channel; 2 invalid arguments	records an informational row that is never counted; newer than the other helpers, so probe `declare -F dot_doctor_info` and fall back to dot_doctor_ok
+dot_doctor_item	TEXT	0 recorded; 1 unavailable channel; 2 invalid arguments	attaches one list item to the closest verdict row filed before it (rendered as an indented "- TEXT" line; past five, the rest fold into "+N more"; an empty TEXT is dropped; with no verdict row before it, the coordinator reports an invalid result); newer than dot_doctor_info, so probe `declare -F dot_doctor_item` and fall back to joining items into the row's DETAIL
+dot_doctor_hint	TEXT	0 recorded; 1 unavailable channel; 2 invalid arguments	attaches one next step to the closest verdict row filed before it (rendered as a "→ TEXT" line after any items; an empty TEXT is dropped; with no verdict row before it, the coordinator reports an invalid result); newer than dot_doctor_info, so probe `declare -F dot_doctor_hint` and fall back to appending the step to the row's DETAIL
 dot_doctor_display_path	PATH	0 success; 2 invalid arguments	prints PATH with HOME abbreviated for display
 dot_doctor_source	RELATIVE_PATH	0 sourced; 1 unsafe or unavailable; 2 invalid arguments	sources one validated client support module in the current isolated worker

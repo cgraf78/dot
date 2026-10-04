@@ -110,6 +110,7 @@ fn merge_inventory_branch_matrix() {
             enabled,
             extensions_dir: ext.to_string_lossy().into_owned(),
             spec_count: count,
+            inventory_error: None,
             specs: vec![],
         }))
     };
@@ -785,6 +786,7 @@ fn merge_outputs_verify_fresh_missing_and_stale() {
             enabled: true,
             extensions_dir: ext.to_string_lossy().into_owned(),
             spec_count: Some(1),
+            inventory_error: None,
             specs,
         }))
     };
