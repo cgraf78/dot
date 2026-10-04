@@ -496,10 +496,12 @@ mod tests {
             std::fs::create_dir_all(&git_dir).expect("fixture git dir");
             let log = scope.path().join("invocations.log");
             let shim = scope.path().join("git");
+            // The subcommand is matched anywhere: global options such as
+            // `-c key=value` may sit between `--git-dir DIR` and it.
             std::fs::write(
                 &shim,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\ncase \"$3\" in\n  config) printf 'remote.origin.url\\n%s\\000core.bare\\nfalse\\000core.worktree\\n%s\\000' \"{CANNED_URL}\" \"{worktree}\";;\n  rev-parse) printf '%s\\n%s\\n' \"{CANNED_HEAD}\" \"{branch}\";;\nesac\n",
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\ncase \" $* \" in\n  *\" config \"*) printf 'remote.origin.url\\n%s\\000core.bare\\nfalse\\000core.worktree\\n%s\\000' \"{CANNED_URL}\" \"{worktree}\";;\n  *\" rev-parse \"*) printf '%s\\n%s\\n' \"{CANNED_HEAD}\" \"{branch}\";;\nesac\n",
                     log = log.display(),
                 ),
             )

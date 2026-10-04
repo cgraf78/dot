@@ -325,6 +325,24 @@ fn trim_bytes(line: &[u8]) -> &[u8] {
     &line[start..end]
 }
 
+/// Whether a hook's first output line is its title rather than a
+/// diagnostic: its words (ASCII letters and digits, case-insensitive) are
+/// the trailing words of the hook's `name`. Hooks conventionally open with
+/// one (`dot_hook_log "  Agent rules"` from `agent-rules`, `Codex trust`
+/// from `zz-codex-trust`), which reads better as the row name than the
+/// hook key does; anything else (`warning: …`) is output, not a name.
+fn names_hook(line: &[u8], name: &[u8]) -> bool {
+    fn words(text: &[u8]) -> Vec<Vec<u8>> {
+        text.split(|byte| !byte.is_ascii_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(<[u8]>::to_ascii_lowercase)
+            .collect()
+    }
+    let title = words(line);
+    let name = words(name);
+    !title.is_empty() && name.ends_with(&title)
+}
+
 /// Byte-preserving counterpart of [`result_label`] for live worker output.
 /// Bash variables retain every byte except NUL, so lossy UTF-8 conversion at
 /// this boundary would silently rewrite user-authored hook diagnostics.
@@ -964,13 +982,18 @@ fn replay(
         if inputs.verbose && !inputs.quiet {
             // The row names the hook; everything the hook printed follows as
             // its detail lines. A first line was the row title before, so a
-            // hook that opened with a diagnostic left the row unnamed.
+            // hook that opened with a diagnostic left the row unnamed. A
+            // first line that is the hook's own title still names the row,
+            // so it is not repeated below it.
             let (first, rest) = result_label_bytes(&record.hook.key, &record.output);
-            let name = label_from_script(&record.hook.key).as_bytes().to_vec();
+            let key = label_from_script(&record.hook.key).as_bytes().to_vec();
+            let (name, title) = if names_hook(&first, &key) {
+                (first, None)
+            } else {
+                (key, Some(first))
+            };
             let mut details = Vec::with_capacity(rest.len() + 1);
-            if first != name {
-                details.push(first);
-            }
+            details.extend(title.filter(|first| *first != name));
             details.extend(rest);
             let (rendered, _) = render_result(
                 inputs.palette,
@@ -1269,6 +1292,91 @@ mod tests {
              \x20   kept 3 jobs\n\
              \x20 ok       git                          7ms\n\
              \x20   merged\n"
+        );
+    }
+
+    #[test]
+    fn hook_titles_name_their_own_row() {
+        // Hooks open with a title line (`dot_hook_log "  Agent rules"`). The
+        // row is named after the hook, so the title must become that name
+        // instead of repeating as the row's first detail line, while a first
+        // line that is a diagnostic stays a detail under the hook's key.
+        assert!(super::names_hook(b"Agent rules", b"agent-rules"));
+        assert!(super::names_hook(b"Codex trust", b"zz-codex-trust"));
+        assert!(super::names_hook(b"SSHD", b"sshd"));
+        assert!(super::names_hook(b"WezTerm", b"wezterm"));
+        assert!(!super::names_hook(b"warning: tmux merge skipped", b"tmux"));
+        assert!(!super::names_hook(b"trust me", b"zz-codex-trust"));
+        assert!(!super::names_hook(b"", b"git"));
+        assert!(!super::names_hook(b"--", b"git"));
+
+        let scope = TempDir::new("merge-verbose-titles").expect("fixture");
+        let env = BTreeMap::from([
+            (OsString::from("HOME"), scope.path().as_os_str().to_owned()),
+            (
+                OsString::from("DOT_SOURCE_ROOT"),
+                OsString::from(env!("CARGO_MANIFEST_DIR")),
+            ),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, scope.path()).expect("runtime");
+        let palette = crate::progress_ui::Palette::empty();
+        let log = crate::log::Log::new(false, false);
+        let inputs = RunInputs {
+            runtime: &runtime,
+            update_lock_token: None,
+            extension_inputs: crate::extension_trust::Inputs {
+                euid: 0,
+                home: String::new(),
+                extensions_dir: String::new(),
+                manifest: String::new(),
+                retiring_root: String::new(),
+            },
+            extensions_enabled: true,
+            overlays: &[],
+            tmp: scope.path(),
+            update_jobs: None,
+            merge_jobs: None,
+            verbose: true,
+            quiet: false,
+            force: false,
+            palette: &palette,
+            multibyte: false,
+            ascii: true,
+            ui_total: Some("1"),
+            bar_width: "8",
+            log: &log,
+        };
+        let record = |key: &str, output: &[u8]| ResultRecord {
+            hook: Hook {
+                key: OsString::from(key),
+                script: std::path::PathBuf::from(format!("{key}.sh")),
+            },
+            rc: 0,
+            output: output.to_vec(),
+            has_merge: true,
+            elapsed_ms: 7,
+        };
+        let mut out = Vec::new();
+        let mut failures = Vec::new();
+        super::replay(
+            vec![
+                record("10-agent-rules", b"  Agent rules\n    linked 3\n"),
+                record(
+                    "tmux",
+                    b"warning: tmux merge skipped: HOME is not the account home\n",
+                ),
+            ],
+            &inputs,
+            &mut out,
+            &mut Vec::new(),
+            &mut failures,
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "  ok       Agent rules                  7ms\n\
+             \x20   linked 3\n\
+             \x20 ok       tmux                         7ms\n\
+             \x20   warning: tmux merge skipped: HOME is not the account home\n"
         );
     }
 

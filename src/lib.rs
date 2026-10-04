@@ -62,6 +62,7 @@ pub mod pre_sync;
 pub mod profile_lifecycle;
 pub mod profiles;
 pub mod progress_ui;
+pub mod redact;
 pub mod repos_base;
 pub mod repos_commands;
 pub mod repos_config;

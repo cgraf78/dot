@@ -50,7 +50,8 @@
 //!   item, a merge-hook key, a repository, a dirty file, or the stage's
 //!   own reason), at most [`MAX_FAILURE_ITEMS_PER_STAGE`] per stage, and
 //!   `more<TAB><stage><TAB><count>` for the rest. Fields are
-//!   control-sanitized and capped, and the whole body stays within
+//!   credential-redacted (URL userinfo becomes `***`), control-sanitized,
+//!   and capped, and the whole body stays within
 //!   [`FAILURE_MAX_BYTES`]. A separate file rather than more fields in
 //!   `update.last-run`, whose older readers reject anything but words.
 //! - `logs/`: retained failure logs from the quiet runner, pruned to
@@ -236,7 +237,7 @@ impl LastRun {
 /// The failing items one update run collects for `update.last-failure`, in
 /// the order the run met them. Every field is cleaned on [`Failures::push`],
 /// so whatever a provider, hook, or filename carries never reaches the
-/// record or doctor's terminal as control text.
+/// record or doctor's terminal as control text or as URL credentials.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Failures {
     items: Vec<FailureItem>,
@@ -259,8 +260,8 @@ impl Failures {
     /// Record one failing item. Names and details are cleaned and capped
     /// here; an item with neither is dropped (it would explain nothing).
     pub fn push(&mut self, stage: &'static str, name: &str, detail: &str) {
-        let name = clean_field(name, FAILURE_NAME_MAX_BYTES);
-        let detail = clean_field(detail, FAILURE_DETAIL_MAX_BYTES);
+        let name = record_field(name, FAILURE_NAME_MAX_BYTES);
+        let detail = record_field(detail, FAILURE_DETAIL_MAX_BYTES);
         if name.is_empty() && detail.is_empty() {
             return;
         }
@@ -374,7 +375,17 @@ pub fn last_line(output: &[u8]) -> String {
         .map(<[u8]>::trim_ascii)
         .rfind(|line| !line.is_empty())
         .unwrap_or_default();
-    clean_field(&String::from_utf8_lossy(line), FAILURE_DETAIL_MAX_BYTES)
+    record_field(&String::from_utf8_lossy(line), FAILURE_DETAIL_MAX_BYTES)
+}
+
+/// One `update.last-failure` field: URL credentials redacted
+/// ([`crate::redact::credentials`]), then [`clean_field`]. Redaction comes
+/// first so the cap can never cut between a secret and the `@` that marks
+/// it as userinfo. Used on write and again on read, so a record an older
+/// Dot wrote before redaction existed is redacted on display too (unless
+/// that Dot's own cap already cut the URL before its `@`).
+fn record_field(text: &str, max: usize) -> String {
+    clean_field(&crate::redact::credentials(text), max)
 }
 
 /// Create `path` as a private directory, tightening pre-existing
@@ -778,8 +789,8 @@ pub fn read_last_failure(state_home: &Path) -> Option<LastFailure> {
         let mut fields = line.split('\t');
         match (fields.next(), fields.next()) {
             (Some("item"), Some(stage)) if is_word(stage) => {
-                let name = clean_field(fields.next().unwrap_or(""), FAILURE_NAME_MAX_BYTES);
-                let detail = clean_field(fields.next().unwrap_or(""), FAILURE_DETAIL_MAX_BYTES);
+                let name = record_field(fields.next().unwrap_or(""), FAILURE_NAME_MAX_BYTES);
+                let detail = record_field(fields.next().unwrap_or(""), FAILURE_DETAIL_MAX_BYTES);
                 if !name.is_empty() || !detail.is_empty() {
                     items.push(FailureItem {
                         stage: stage.to_string(),

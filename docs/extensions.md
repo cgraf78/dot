@@ -201,7 +201,7 @@ ok/warn/fail/skip/info row the extension filed before it:
 
 Attachments are not rows and never count. An empty `TEXT` is dropped. One
 filed before any row, or right after a section, has nothing to attach to and
-is reported as an invalid result.
+is reported as an invalid result, even when its `TEXT` is empty.
 
 ```bash
 doctor() {
@@ -269,8 +269,11 @@ an extension must work against both an older and a newer coordinator:
 - An extension that exits nonzero gets a `<name> doctor extension failed` row
   with its exit status and, when a failing command under `set -e` stopped
   it, the file, line, and command (for a public helper that rejected its
-  arguments, the line that called it and the helper's name). A file that
-  fails while it is being sourced says so. The last lines of its captured
+  arguments, the line that called it and the helper's name). For a pipeline
+  that fails under `pipefail` in an element other than its last, Bash exposes
+  only the last element's command and line, so the row shows
+  `pipeline with statuses 1 0, ending in: <last command>` with each
+  element's exit status. A file that fails while it is being sourced says so. The last lines of its captured
   output are listed below the row. Older coordinators showed only the
   output, which is often empty. Setting your own `EXIT` trap leaves just the
   exit status.

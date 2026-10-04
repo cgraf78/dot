@@ -336,7 +336,7 @@ fn cron_that_never_ran_warns_once_a_manual_update_is_stale() {
     let stale = check(Some(last_run(NOW - 3 * 3600, "ok", "init", "")));
     assert!(stale.contains("⚠ cron update has never run"), "{stale}");
     assert!(
-        stale.contains("last update: init run 3h0m ago; schedule dot update --cron"),
+        stale.contains("last update: init run 3h0m ago\n    → schedule dot update --cron"),
         "{stale}"
     );
     assert!(!stale.contains('✗'), "{stale}");
@@ -348,8 +348,9 @@ fn cron_that_never_ran_warns_once_a_manual_update_is_stale() {
         "{skipping}"
     );
     assert!(
-        skipping
-            .contains("last cron run 1m ago; no successful cron update recorded; run dot status"),
+        skipping.contains(
+            "last cron run 1m ago; no successful cron update recorded\n    → run dot status"
+        ),
         "{skipping}"
     );
     // A clean cron last run whose stamp writes were lost still counts.
@@ -396,7 +397,7 @@ fn hand_run_update_rows_appear_only_when_they_add_information() {
     assert!(failed.contains("✓ cron update succeeded recently"));
     assert!(failed.contains("⚠ last update failed"), "{failed}");
     assert!(
-        failed.contains("manual run 1m ago; run dot update for the full output"),
+        failed.contains("manual run 1m ago\n    → run dot update for the full output"),
         "{failed}"
     );
     assert!(!failed.contains('✗'), "{failed}");
@@ -485,7 +486,7 @@ fn a_newer_cron_failure_is_not_masked_by_a_recent_clean_run() {
     assert!(!rows.contains("succeeded recently"), "{rows}");
     assert!(
         rows.contains(
-            "10m ago; last success 1h40m ago; failing: tools: watchexec/watchexec (ambiguous interrupted method transition); run shdeps health, or dot update for the full output"
+            "10m ago; last success 1h40m ago; failing: tools: watchexec/watchexec (ambiguous interrupted method transition)\n    → run shdeps health, or dot update for the full output"
         ),
         "{rows}"
     );
@@ -505,7 +506,7 @@ fn a_newer_cron_failure_is_not_masked_by_a_recent_clean_run() {
     assert!(rows.contains("⚠ last cron run failed"), "{rows}");
     assert!(
         rows.contains(
-            "failing: repos: dotfiles (pull failed), work (pull failed); run dot update for the full output"
+            "failing: repos: dotfiles (pull failed), work (pull failed)\n    → run dot update for the full output"
         ),
         "{rows}"
     );
@@ -515,7 +516,7 @@ fn a_newer_cron_failure_is_not_masked_by_a_recent_clean_run() {
     let rows = cron_rows(Some(NOW - 600), Some(fail), None, NOW);
     assert!(rows.contains("⚠ last cron run failed"), "{rows}");
     assert!(
-        rows.contains("1m ago; last success 10m ago; run dot update for the full output"),
+        rows.contains("1m ago; last success 10m ago\n    → run dot update for the full output"),
         "{rows}"
     );
 
@@ -533,7 +534,7 @@ fn a_newer_cron_failure_is_not_masked_by_a_recent_clean_run() {
     );
     let rows = cron_rows(Some(NOW - 600), Some(unavailable), Some(failure), NOW);
     assert!(
-        rows.contains("failing: provider: shdeps (shdeps unavailable; dependency install skipped); run dot update for the full output"),
+        rows.contains("failing: provider: shdeps (shdeps unavailable; dependency install skipped)\n    → run dot update for the full output"),
         "{rows}"
     );
 
@@ -584,7 +585,7 @@ fn causes_attach_to_stale_degraded_and_never_converged_rows() {
     );
     assert!(
         stale.contains(
-            "last success 9h0m ago; last cron run failed 1m ago; failing: configs: 40-claude (exit 3); run dot update"
+            "last success 9h0m ago; last cron run failed 1m ago; failing: configs: 40-claude (exit 3)\n    → run dot update"
         ),
         "{stale}"
     );
@@ -616,7 +617,7 @@ fn causes_attach_to_stale_degraded_and_never_converged_rows() {
     );
     assert!(
         degraded.contains(
-            "last converged 1m ago; failing: tools: ripgrep (network); run shdeps health"
+            "last converged 1m ago; failing: tools: ripgrep (network)\n    → run shdeps health"
         ),
         "{degraded}"
     );
@@ -661,14 +662,14 @@ fn update_warn_rows_always_carry_a_next_step() {
         now: NOW,
     }));
     assert!(
-        degraded.contains("last converged 1m ago; run shdeps health, or dot update"),
+        degraded.contains("last converged 1m ago\n    → run shdeps health, or dot update"),
         "{degraded}"
     );
     // A host whose cron simply stopped: check the schedule.
     let stopped = cron_rows(Some(NOW - 9 * 3600), None, None, NOW);
     assert!(
         stopped.contains(
-            "last success 9h0m ago; check that dot update --cron is scheduled (crontab -l), or run dot update"
+            "last success 9h0m ago\n    → check that dot update --cron is scheduled (crontab -l), or run dot update"
         ),
         "{stopped}"
     );
@@ -700,7 +701,7 @@ fn many_failing_items_fold_into_a_count_and_long_details_shorten() {
         "{rows}"
     );
     assert!(
-        rows.contains(", b, c (why) +3 more; run shdeps health"),
+        rows.contains(", b, c (why) +3 more\n    → run shdeps health"),
         "{rows}"
     );
     let shown = rows
@@ -739,7 +740,7 @@ fn a_cron_run_skipped_for_local_edits_names_them() {
     );
     assert!(
         fresh.contains(
-            "last cron run 1m ago; last success 10m ago; edited: .bashrc, .zshrc, .profile +2 more; run dot status, then commit, stash, or resolve the edits"
+            "last cron run 1m ago; last success 10m ago; edited: .bashrc, .zshrc, .profile +2 more\n    → run dot status, then commit, stash, or resolve the edits"
         ),
         "{fresh}"
     );
@@ -766,7 +767,7 @@ fn a_cron_run_skipped_for_local_edits_names_them() {
     );
     assert!(
         stopped.contains(
-            "last success 72h0m ago; last cron run skipped for local edits 48h0m ago; edited: .zshrc; run dot status"
+            "last success 72h0m ago; last cron run skipped for local edits 48h0m ago; edited: .zshrc\n    → run dot status"
         ),
         "{stopped}"
     );
@@ -781,7 +782,7 @@ fn a_cron_run_skipped_for_local_edits_names_them() {
     // the cause and the next step.
     let old = cron_rows(Some(NOW - 9 * 3600), Some(run), None, NOW);
     assert!(
-        old.contains("last success 9h0m ago; run dot status, then commit"),
+        old.contains("last success 9h0m ago\n    → run dot status, then commit"),
         "{old}"
     );
 }
@@ -816,7 +817,7 @@ fn a_live_update_lock_shows_how_long_it_has_been_held() {
     );
     assert!(
         hung.contains(&format!(
-            "pid {pid}; if it is hung, stop it (kill {pid}) and rerun dot update",
+            "pid {pid}\n    → if it is hung, stop it (kill {pid}) and rerun dot update",
             pid = std::process::id()
         )),
         "{hung}"
@@ -2875,4 +2876,302 @@ fn base_repo_upstream_current_ahead_behind_and_diverged() {
 
     git(&home, &["commit", "-q", "--allow-empty", "-m", "local"]);
     assert!(render(&check_base_repo(&inputs())).contains("1 ahead, 1 behind"));
+}
+
+/// The `→` next step attached to the first row whose line contains `title`,
+/// or `None` when that row has none (or there is no such row).
+fn hint_of<'a>(rendered: &'a str, title: &str) -> Option<&'a str> {
+    let mut lines = rendered.lines().skip_while(|line| !line.contains(title));
+    lines.next()?;
+    lines
+        .take_while(|line| line.starts_with("    "))
+        .find_map(|line| line.strip_prefix("    → "))
+}
+
+/// Every warn or fail row in `rendered` that carries no `→` next step: the
+/// severity contract says each one must say what to do.
+fn problems_without_a_step(rendered: &str) -> Vec<&str> {
+    let lines: Vec<&str> = rendered.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("  ⚠ ") || line.starts_with("  ✗ "))
+        .filter(|(index, _)| {
+            !lines[index + 1..]
+                .iter()
+                .take_while(|line| line.starts_with("    "))
+                .any(|line| line.starts_with("    → "))
+        })
+        .map(|(_, line)| *line)
+        .collect()
+}
+
+#[test]
+fn update_rows_put_the_next_step_on_its_own_line() {
+    // N1: the Update rows used to end their detail with the step
+    // ("…; run shdeps health, …") while every other section files it as a
+    // `→` hint; now the detail is the cause and the hint is the step.
+    const NOW: i64 = 1_800_000_000;
+    let degraded = last_run(NOW - 600, "degraded", "cron", "tools");
+    let tools = failure_for(&degraded, &[("tools", "ripgrep", "network")], 0);
+    let rows = cron_rows(Some(NOW - 6000), Some(degraded), Some(tools), NOW);
+    assert!(
+        rows.contains(
+            "    10m ago; last success 1h40m ago; failing: tools: ripgrep (network)\n    → run shdeps health, or dot update for the full output\n"
+        ),
+        "{rows}"
+    );
+    let skip = last_run(NOW - 60, "skip", "cron", "");
+    let edits = failure_for(&skip, &[("dirty", ".bashrc", "")], 0);
+    let rows = cron_rows(Some(NOW - 600), Some(skip), Some(edits), NOW);
+    assert!(
+        rows.contains(
+            "    last cron run 1m ago; last success 10m ago; edited: .bashrc\n    → run dot status, then commit, stash, or resolve the edits\n"
+        ),
+        "{rows}"
+    );
+    let stopped = cron_rows(Some(NOW - 9 * 3600), None, None, NOW);
+    assert!(
+        stopped.contains(
+            "    last success 9h0m ago\n    → check that dot update --cron is scheduled (crontab -l), or run dot update\n"
+        ),
+        "{stopped}"
+    );
+    let manual = last_run(NOW - 3 * 3600, "ok", "init", "");
+    let never = cron_rows(None, Some(manual), None, NOW);
+    assert_eq!(
+        hint_of(&never, "cron update has never run"),
+        Some("schedule dot update --cron to keep this host current"),
+        "{never}"
+    );
+}
+
+#[test]
+fn every_update_warning_carries_a_next_step() {
+    const NOW: i64 = 1_800_000_000;
+    let fail = last_run(NOW - 60, "fail", "cron", "");
+    let hook = failure_for(&fail, &[("configs", "40-claude", "exit 3")], 0);
+    let skip = last_run(NOW - 60, "skip", "cron", "");
+    let old_skip = last_run(NOW - 48 * 3600, "skip", "cron", "");
+    let manual = last_run(NOW - 60, "fail", "manual", "");
+    let degraded_manual = last_run(NOW - 60, "degraded", "manual", "prune");
+    let mut rendered = vec![
+        cron_rows(Some(NOW - 600), Some(fail.clone()), Some(hook.clone()), NOW),
+        cron_rows(Some(NOW - 600), Some(fail.clone()), None, NOW),
+        cron_rows(
+            Some(NOW - 9 * 3600),
+            Some(fail.clone()),
+            Some(hook.clone()),
+            NOW,
+        ),
+        cron_rows(None, Some(fail.clone()), Some(hook), NOW),
+        cron_rows(Some(NOW - 600), Some(skip.clone()), None, NOW),
+        cron_rows(Some(NOW - 9 * 3600), Some(skip), None, NOW),
+        cron_rows(Some(NOW - 72 * 3600), Some(old_skip), None, NOW),
+        cron_rows(Some(NOW - 9 * 3600), None, None, NOW),
+        cron_rows(None, Some(manual), None, NOW),
+        cron_rows(None, Some(degraded_manual), None, NOW),
+    ];
+    for (converged_at, run) in [(NOW - 60, None), (NOW - 5400, Some(fail))] {
+        rendered.push(render(&check_cron_freshness(&CronInputs {
+            last_success: Some(NOW - 5 * 3600),
+            last_converged: Some(dot::update_status::Converged {
+                at: converged_at,
+                failing: "tools".to_string(),
+            }),
+            last_run: run,
+            last_failure: None,
+            cron_available: true,
+            now: NOW,
+        })));
+    }
+    for rows in &rendered {
+        assert!(rows.contains('⚠'), "{rows}");
+        assert!(problems_without_a_step(rows).is_empty(), "{rows}");
+        // The step is never repeated inline.
+        assert!(!rows.contains("; run "), "{rows}");
+    }
+}
+
+#[test]
+fn update_causes_drop_the_error_prefix_and_shorten_at_a_word() {
+    // N2: the cause started with Shdeps' own `error:` prefix and was cut at
+    // 100 bytes in the middle of a word.
+    const NOW: i64 = 1_800_000_000;
+    let reason = "failed to configure tmux: the configure script could not find a usable ncurses installation in any standard library directory on this host";
+    let run = last_run(NOW - 60, "degraded", "manual", "tools");
+    let failure = failure_for(&run, &[("tools", "tmux", &format!("error: {reason}"))], 0);
+    let rows = cron_rows(None, Some(run), Some(failure), NOW);
+    let line = rows
+        .lines()
+        .find(|line| line.contains("failing:"))
+        .expect("cause line");
+    assert!(
+        line.contains("tools: tmux (failed to configure tmux: "),
+        "{line}"
+    );
+    assert!(!line.contains("error:"), "{line}");
+    let shown = line
+        .split_once("tmux (")
+        .and_then(|(_, rest)| rest.strip_suffix("…)"))
+        .expect("a shortened cause");
+    // Cut after a whole word, at a sane length.
+    assert!(reason.starts_with(shown), "{shown}");
+    assert!(reason[shown.len()..].starts_with(' '), "{shown}");
+    assert!((60..=160).contains(&shown.len()), "{shown}");
+    // A cause that fits is kept whole, and only a leading prefix goes.
+    let run = last_run(NOW - 60, "fail", "manual", "");
+    let failure = failure_for(
+        &run,
+        &[("repos", "dotfiles", "error: pull failed: error: x")],
+        0,
+    );
+    let rows = cron_rows(None, Some(run), Some(failure), NOW);
+    assert!(
+        rows.contains("repos: dotfiles (pull failed: error: x)"),
+        "{rows}"
+    );
+}
+
+#[test]
+fn update_lock_rows_carry_a_next_step() {
+    let scratch = TempDir::new("doctor-lock-steps").expect("scratch");
+    let mut rendered = vec![render(&check_update_lock(None))];
+    let file = scratch.path().join("file");
+    std::fs::write(&file, b"unsafe").expect("write");
+    rendered.push(render(&check_update_lock(Some(&file))));
+    let fresh = scratch.path().join("fresh");
+    std::fs::create_dir_all(&fresh).expect("fresh lock");
+    rendered.push(render(&check_update_lock(Some(&fresh))));
+    let aged = scratch.path().join("aged");
+    std::fs::create_dir_all(&aged).expect("aged lock");
+    let status = Command::new("touch")
+        .args(["-t", "200001010000"])
+        .arg(&aged)
+        .status()
+        .expect("age lock");
+    assert!(status.success());
+    rendered.push(render(&check_update_lock(Some(&aged))));
+    let stale = scratch.path().join("stale");
+    std::fs::create_dir_all(&stale).expect("stale lock");
+    std::fs::write(
+        stale.join("owner"),
+        "pid\t42424242\nstart\tproc:1\ntoken\tstale\n",
+    )
+    .expect("owner");
+    rendered.push(render(&check_update_lock(Some(&stale))));
+    let state = scratch.path().join("state");
+    let log = dot::log::Log::new(false, false);
+    let guard =
+        dot::update_lock::acquire(&state, false, &log, None, &mut Vec::new()).expect("lock");
+    rendered.push(render(&check_update_lock(Some(
+        &dot::update_lock::lock_path(&state),
+    ))));
+    drop(guard);
+    for rows in &rendered {
+        assert!(rows.contains('⚠') || rows.contains('✗'), "{rows}");
+        assert!(problems_without_a_step(rows).is_empty(), "{rows}");
+    }
+}
+
+#[test]
+fn reexec_checkpoint_rows_carry_their_step_as_a_hint() {
+    use dot::shdeps::CheckpointState;
+
+    let path = Path::new("/home/u/.local/state/dot/provider-reexec-failed");
+    for state in [
+        CheckpointState::Pending,
+        CheckpointState::Unreadable,
+        CheckpointState::Mismatch {
+            pinned: "a".repeat(40),
+            active: "b".repeat(40),
+        },
+    ] {
+        let rows = render(&check_reexec_checkpoint(&state, path, "/home/u"));
+        assert!(problems_without_a_step(&rows).is_empty(), "{rows}");
+        assert!(
+            !rows.contains("; the next") && !rows.contains("; inspect"),
+            "{rows}"
+        );
+    }
+}
+
+#[test]
+fn profile_and_client_failures_name_a_next_step() {
+    // N1: these rows failed with no detail at all.
+    let lifecycle = render(&check_profile_lifecycle(&LifecycleInputs {
+        profiles_present: true,
+        load_ok: true,
+        eligible: vec!["work".into()],
+        active: vec!["work|/home/test/.dotfiles-work|url|d|false|git".into()],
+        records: vec!["work|/home/test/.dotfiles-work|url|d|false|git".into()],
+        extensions_enabled: true,
+        deactivation_ok: &|_| false,
+    }));
+    let step = hint_of(&lifecycle, "active profile deactivation authority unsafe")
+        .unwrap_or_else(|| panic!("no step in {lifecycle}"));
+    assert!(
+        step.contains("/home/test/.dotfiles-work/dot/profile-deactivate")
+            && step.contains("dot update"),
+        "{step}"
+    );
+
+    let scratch = TempDir::new("doctor-overlay-steps").expect("scratch");
+    let manifest = scratch
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let mut input = overlays(manifest, None, true);
+    input.configured_count = 2;
+    input.overlay_lifecycle = vec![
+        "required-gone|selected-unavailable|/home/test/.config/dot/overlays.d/20-gone.conf".into(),
+        "orphan|active|d".into(),
+        "beta|active|/home/test/.config/dot/overlays.d/20-beta.local.conf".into(),
+    ];
+    input.active_records = vec!["beta.local|/home/test/.dotfiles-beta|url|d|false|git".into()];
+    let output = render(&check_overlays(&input));
+    let gone = hint_of(&output, "required-gone: selected but unavailable")
+        .unwrap_or_else(|| panic!("no step in {output}"));
+    assert!(
+        gone.contains("dot update") && gone.contains("~/.config/dot/overlays.d/20-gone.conf"),
+        "{gone}"
+    );
+    assert!(
+        hint_of(&output, "orphan: active lifecycle record missing").is_some(),
+        "{output}"
+    );
+    // An invalid descriptor drops every active record: its own row is the fix.
+    input.discovery_error = Some("bad descriptor");
+    let invalid = render(&check_overlays(&input));
+    assert_eq!(
+        hint_of(&invalid, "orphan: active lifecycle record missing"),
+        Some("fix the invalid overlay descriptor reported above, then rerun dot doctor"),
+        "{invalid}"
+    );
+    input.discovery_error = None;
+    let local = hint_of(&output, "beta: active lifecycle record missing")
+        .unwrap_or_else(|| panic!("no step in {output}"));
+    assert!(
+        local.starts_with("~/.config/dot/overlays.d/20-beta.local.conf is a .local descriptor"),
+        "{local}"
+    );
+
+    let home = scratch.path().join("home");
+    let bare = scratch.path().join("bare.git");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&bare).expect("bare");
+    git(&bare, &["init", "-q", "--bare"]);
+    git(&bare, &["config", "core.bare", "false"]);
+    let unidentified = render(&check_base_repo(&base("separate", &bare, &home)));
+    let step = hint_of(&unidentified, "no worktree identity")
+        .unwrap_or_else(|| panic!("no step in {unidentified}"));
+    assert_eq!(
+        step,
+        format!(
+            "restore it with: git --git-dir={} config core.worktree {}",
+            bare.display(),
+            home.display()
+        )
+    );
 }

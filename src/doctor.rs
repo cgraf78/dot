@@ -674,16 +674,21 @@ fn runtime_snapshot(
     let source_root = std::fs::canonicalize(source)
         .map(|path| path.as_os_str().as_bytes().to_vec())
         .unwrap_or_default();
-    // Report the Git that Dot's own inspection children run.
-    let git_version = runtime.git_program().and_then(|git| {
-        program_output(
+    // Report the Git that Dot's own inspection children run. A probe that
+    // misses its deadline means Git did not answer, not that it is missing.
+    let (git_version, git_stalled) = match runtime.git_program().map(|git| {
+        program_output_typed(
             runtime,
             &git,
             &["--version"],
             crate::cleanup::LingerPolicy::Detach,
             crate::doctor_checks::probe_deadline(),
         )
-    });
+    }) {
+        Some(Ok(version)) => (version, false),
+        Some(Err(crate::doctor_checks::TimedOut)) => (None, true),
+        None => (None, false),
+    };
     RuntimeSnapshot {
         bash_version,
         bash_major,
@@ -693,6 +698,7 @@ fn runtime_snapshot(
         source_raw: source.as_bytes().to_vec(),
         source_root,
         git_version,
+        git_stalled,
         version: crate::version::VERSION.as_bytes().to_vec(),
         install_kind: None,
         unknown_config_keys: config.unknown_keys.clone(),
@@ -1624,22 +1630,41 @@ fn program_output(
     linger: crate::cleanup::LingerPolicy,
     deadline: Option<std::time::Instant>,
 ) -> Option<Vec<u8>> {
+    program_output_typed(runtime, program, args, linger, deadline)
+        .ok()
+        .flatten()
+}
+
+/// [`program_output`] that tells a probe which missed `deadline` apart
+/// from one that failed or printed nothing.
+fn program_output_typed(
+    runtime: &crate::app::Runtime,
+    program: &Path,
+    args: &[&str],
+    linger: crate::cleanup::LingerPolicy,
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<Vec<u8>>, crate::doctor_checks::TimedOut> {
     let mut command = command(runtime, program);
     command.args(args);
-    let output = crate::cleanup::run_session_output(
+    let output = match crate::cleanup::run_session_output_typed(
         command,
         deadline,
         crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
         linger,
-    )
-    .ok()?;
-    output.status.success().then(|| {
+    ) {
+        Ok(output) => output,
+        Err(crate::cleanup::SessionOutputError::TimedOut) => {
+            return Err(crate::doctor_checks::TimedOut);
+        }
+        Err(_) => return Ok(None),
+    };
+    Ok(output.status.success().then(|| {
         output
             .stdout
             .strip_suffix(b"\n")
             .unwrap_or(&output.stdout)
             .to_vec()
-    })
+    }))
 }
 
 /// The login name, from `id -un` on the runtime's `PATH` like
@@ -1729,6 +1754,45 @@ mod tests {
         assert_eq!(super::timeout_from(Some("99999999999999999999")), None);
         let huge = super::timeout_from(Some("18446744073709551615")).expect("fits u64");
         assert_eq!(std::time::Instant::now().checked_add(huge), None);
+    }
+
+    #[test]
+    fn a_probe_past_its_deadline_reads_as_timed_out_not_missing() {
+        // The Git runtime row warns on a stall and fails only on a missing
+        // or broken Git, so the probe must keep the two apart.
+        let scope = dot_test_support::TempDir::new_exec("doctor-stalled-version").expect("scope");
+        let script = |name: &str, body: &str| {
+            let path = scope.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+            path
+        };
+        let runtime =
+            crate::app::Runtime::from_env(&BTreeMap::new(), scope.path()).expect("runtime");
+        let probe = |program: &Path, budget: std::time::Duration| {
+            super::program_output_typed(
+                &runtime,
+                program,
+                &["--version"],
+                crate::cleanup::LingerPolicy::Detach,
+                Some(std::time::Instant::now() + budget),
+            )
+        };
+        let short = std::time::Duration::from_millis(300);
+        let long = std::time::Duration::from_secs(20);
+        assert_eq!(
+            probe(&script("stalled", "exec sleep 30"), short),
+            Err(crate::doctor_checks::TimedOut)
+        );
+        assert_eq!(
+            probe(&script("broken", "exit 3"), long),
+            Ok(None),
+            "a failing probe is not a stall"
+        );
+        assert_eq!(
+            probe(&script("healthy", "echo 'git version 2'"), long),
+            Ok(Some(b"git version 2".to_vec()))
+        );
     }
 
     #[test]

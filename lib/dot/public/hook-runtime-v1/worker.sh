@@ -141,7 +141,22 @@ case $mode in
     _dot_doctor_failure=()
     _dot_doctor_note_failure() {
       local status=$1 command=$2 frame where='' root=${DOT_EXTENSIONS_DIR:-}
+      local -a pipe=("${@:3}")
       root=${root%/}
+      # Under `pipefail` a pipeline whose last element succeeded failed in an
+      # earlier one, yet Bash names only the last element (and its line):
+      # the earlier element ran in a subshell whose own ERR trap is gone.
+      # Mark the pipeline and list each element's status rather than blame
+      # a command that succeeded; the statuses lead so the coordinator's
+      # length cap cannot cut them. Statuses that are all zero belong to an
+      # earlier pipeline (a redirection on a group can fail after it), and
+      # `[[` and `((` leave the previous pipeline's statuses in place, so
+      # neither counts. A public helper's name below still wins.
+      if ((${#pipe[@]} > 1)) && [[ ${pipe[${#pipe[@]} - 1]} == 0 &&
+        " ${pipe[*]} " == *[1-9]* && $command != '[['* &&
+        $command != '(('* ]]; then
+        command="pipeline with statuses ${pipe[*]}, ending in: $command"
+      fi
       for ((frame = 1; frame < ${#BASH_SOURCE[@]}; frame++)); do
         case ${BASH_SOURCE[frame]} in
           "$0") break ;;
@@ -166,7 +181,7 @@ case $mode in
       printf '%s\0%s\0%s\0%s' "${_dot_doctor_failure[@]:0:4}" \
         >"$_dot_doctor_failure_file" 2>/dev/null || :
     }
-    trap '_dot_doctor_note_failure "$?" "$BASH_COMMAND"' ERR
+    trap '_dot_doctor_note_failure "$?" "$BASH_COMMAND" "${PIPESTATUS[@]}"' ERR
     trap '_dot_doctor_report_failure "$?" "$BASH_COMMAND"' EXIT
     set -E
     . "$script"
