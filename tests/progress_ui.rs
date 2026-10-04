@@ -604,9 +604,10 @@ fn terminal_rows_fit_the_width_and_cut_at_words() {
     let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
         .with_width(RowWidth::Columns(50));
     let close = String::from_utf8(stage.finish(b"warning", detail, 1)).unwrap();
+    // No clause fits 16 columns: blank rather than a leading fragment.
     assert_eq!(
-        close, "[0/5]            warning  repository           1s\n",
-        "cut mid-word or kept a dangling separator"
+        close, "[0/5]            warning                       1s\n",
+        "kept a fragment"
     );
     // Wide terminals keep the 42-column cell, cut at a word boundary.
     let mut wide = Stage::begin(Palette::empty(), "5", false, true, false, true)
@@ -645,4 +646,63 @@ fn terminal_rows_drop_whole_clauses_and_keep_failures() {
     let narrow = close(40, b"profile resolution or repository sync failed");
     assert!(narrow.contains("failed   "), "{narrow:?}");
     assert!(!narrow.contains("profil"), "{narrow:?}");
+}
+
+#[test]
+fn terminal_rows_show_no_word_fragments() {
+    // At 40 columns single leading words survived (`Tools ok no`,
+    // `Configs ok no`) and read as contradictions; a cell either holds a
+    // whole clause or nothing.
+    let close = |detail: &[u8]| {
+        let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
+            .with_width(RowWidth::Columns(40));
+        String::from_utf8(stage.finish(b"ok", detail, 1)).unwrap()
+    };
+    for detail in [&b"no dependency provider"[..], b"3 repos current"] {
+        let row = close(detail);
+        assert!(row.contains("ok          "), "{row:?}");
+        let first =
+            String::from_utf8_lossy(detail.split(|b| *b == b' ').next().unwrap()).into_owned();
+        assert!(
+            !row.contains(&format!("ok       {first}")),
+            "fragment in {row:?}"
+        );
+    }
+}
+
+#[test]
+fn static_lines_are_skipped_when_their_text_cannot_show() {
+    // At 40 columns the static Repos lines printed as blank `running` rows,
+    // two identical-looking lines; with no room for the text the row is only
+    // cleared, which is all a child that may prompt needs.
+    let mut narrow = Stage::begin(Palette::empty(), "5", false, true, false, true)
+        .with_width(RowWidth::Columns(40));
+    let _ = narrow.start(b"Repos", None, 0, None);
+    assert_eq!(narrow.freeze(b"fetching dotfiles", 0), b"\r\x1b[K");
+    let mut wide = Stage::begin(Palette::empty(), "5", false, true, false, true)
+        .with_width(RowWidth::Columns(80));
+    let _ = wide.start(b"Repos", None, 0, None);
+    let frozen = String::from_utf8(wide.freeze(b"fetching dotfiles", 0)).unwrap();
+    assert!(frozen.contains("running  fetching dotfiles"), "{frozen:?}");
+    assert!(frozen.ends_with('\n'), "{frozen:?}");
+}
+
+#[test]
+fn terminal_progress_rows_keep_their_label_and_bar_whole() {
+    // A progress detail is a label and its bar: narrow rows keep whichever
+    // whole pieces fit, never a cut label.
+    let live = |columns: usize| {
+        let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
+            .with_width(RowWidth::Columns(columns));
+        let _ = stage.start(b"Repos", None, 0, None);
+        String::from_utf8(stage.update(b"overlay-0          [####----] 1/2", 0, None)).unwrap()
+    };
+    assert!(
+        live(60).contains("overlay-0 [####----] 1/2"),
+        "{}",
+        live(60)
+    );
+    assert!(live(48).contains("overlay-0 "), "{}", live(48));
+    assert!(!live(48).contains("[#"), "{}", live(48));
+    assert!(!live(40).contains("overlay"), "{}", live(40));
 }

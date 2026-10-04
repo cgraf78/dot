@@ -1697,3 +1697,64 @@ fn descriptor_names_reach_the_terminal_without_control_bytes() {
         "{output:?}"
     );
 }
+
+#[test]
+fn overlays_failure_summary_fits_the_terminal_in_clauses() {
+    // The Overlays failure summary has no clause boundaries, so terminal
+    // rows cut it mid-phrase (`profile resolution or` at 60 columns,
+    // `profile resolution or repository sync` at 80).
+    let scratch = Scratch::new("update-run-pty-overlays-summary").expect("scratch dir");
+    let (home, state) = unreachable_base_client(&scratch, "overlays-summary");
+    for (columns, expected) in [
+        (
+            80,
+            "Overlays   warning  profile or sync failed; links kept ",
+        ),
+        (60, "Overlays   warning  profile or sync failed "),
+    ] {
+        let run = PtyRun {
+            columns,
+            ..PtyRun::default()
+        };
+        let (_, output) = dot_on_pty_with(&["update"], &home, &state, &run);
+        let text = String::from_utf8_lossy(&strip_colour(&output)).into_owned();
+        assert!(text.contains(expected), "{columns} columns: {text:?}");
+    }
+    // Piped rows keep the shell engine's fixed cell byte for byte.
+    let output = dot(&["update"], &home, &state);
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("[2/5] Overlays   warning  profile resolution or repository sync fail     "),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn forty_column_rows_hold_whole_clauses_or_nothing() {
+    // At 40 columns rows kept single-word fragments (`Tools ok no`) and the
+    // static Repos lines printed with blank text.
+    let scratch = Scratch::new("update-run-pty-forty").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "forty", &overlay_origin, &base_origin);
+    check_update(&["update"], &home, &state);
+    let run = PtyRun {
+        columns: 40,
+        ..PtyRun::default()
+    };
+    let (code, output) = dot_on_pty_with(&["update"], &home, &state, &run);
+    let output = strip_colour(&output);
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(code, Some(0), "{text}");
+    for fragment in ["ok       no ", "ok       1 ", "ok       2 ", "ok       3 "] {
+        assert!(!text.contains(fragment), "{fragment:?} in {text:?}");
+    }
+    for line in text.split("\r\n") {
+        let drawn = line.rsplit("\r\u{1b}[K").next().unwrap_or(line);
+        assert!(
+            !(drawn.contains(" running ")
+                && drawn.ends_with("s")
+                && drawn.split_whitespace().count() == 4),
+            "blank static line {drawn:?} in {text:?}"
+        );
+    }
+}

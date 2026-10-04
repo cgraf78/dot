@@ -2212,9 +2212,10 @@ fn finalize(
             inputs.dot_verbose,
         );
         let _ = io.out.write_all(&open);
-        let close = stage.finish(
+        let close = stage.finish_brief(
             b"warning",
             b"profile resolution or repository sync failed",
+            b"profile or sync failed; links kept",
             crate::update_engine::now_secs(),
         );
         let _ = io.out.write_all(&close);

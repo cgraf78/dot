@@ -563,74 +563,72 @@ impl Fit {
 
 /// [`cell`] for terminal rows: pad to `width`, shortening over-long text
 /// without cutting a word. A summary of clauses (`2 repos current, 1 repo
-/// failed`) drops whole clauses, keeping any that report a failure first;
-/// a single clause keeps its leading whole words. When not even one word
-/// fits, the cell stays blank rather than showing a word fragment.
+/// failed`, a progress label and its bar) drops whole clauses, keeping any
+/// that report a failure first.
+/// When not even one clause fits, the cell stays blank: a leading word
+/// alone (`no` of `no dependency provider`) reads as something else.
 fn word_cell(text: &[u8], width: usize, multibyte: bool) -> Vec<u8> {
     if measured_len(text, multibyte) <= width {
         return pad(text, width, multibyte);
     }
     let clauses = clauses(text);
-    let failing = |clause: &&[u8]| clause.windows(4).any(|window| window == b"fail");
+    let failing = |clause: &[u8]| clause.windows(4).any(|window| window == b"fail");
     let mut chosen = vec![false; clauses.len()];
     let mut used = 0;
     let order = (0..clauses.len())
-        .filter(|at| failing(&clauses[*at]))
-        .chain((0..clauses.len()).filter(|at| !failing(&clauses[*at])));
+        .filter(|at| failing(clauses[*at].1))
+        .chain((0..clauses.len()).filter(|at| !failing(clauses[*at].1)));
     for at in order {
-        let extra = measured_len(clauses[at], multibyte) + if used > 0 { 2 } else { 0 };
+        // Count the widest joiner a kept clause can get; exact once joined.
+        let extra = measured_len(clauses[at].1, multibyte) + if used > 0 { 2 } else { 0 };
         if used + extra <= width {
             chosen[at] = true;
             used += extra;
         }
     }
-    let kept: Vec<&[u8]> = clauses
-        .iter()
-        .zip(&chosen)
-        .filter(|(_, chosen)| **chosen)
-        .map(|(clause, _)| *clause)
-        .collect();
-    if !kept.is_empty() {
-        return pad(&kept.join(b", ".as_slice()), width, multibyte);
+    let mut kept = Vec::new();
+    for ((joiner, clause), chosen) in clauses.iter().zip(&chosen) {
+        if *chosen {
+            if !kept.is_empty() {
+                kept.extend_from_slice(joiner);
+            }
+            kept.extend_from_slice(clause);
+        }
     }
-    let first = clauses
-        .iter()
-        .find(|clause| failing(clause))
-        .or(clauses.first())
-        .copied()
-        .unwrap_or(text);
-    pad(&leading_words(first, width, multibyte), width, multibyte)
+    pad(&kept, width, multibyte)
 }
 
-/// `text` split at its `, ` and `; ` clause separators.
-fn clauses(text: &[u8]) -> Vec<&[u8]> {
+/// `text` split into clauses, each with the joiner that preceded it: `, `
+/// and `; ` separators keep theirs, and a run of spaces (the padding between
+/// a progress label and its bar) becomes one space.
+fn clauses(text: &[u8]) -> Vec<(&'static [u8], &[u8])> {
     let mut parts = Vec::new();
+    let mut joiner: &'static [u8] = b"";
     let mut start = 0;
     let mut at = 0;
     while at + 1 < text.len() {
-        if matches!(text[at], b',' | b';') && text[at + 1] == b' ' {
-            parts.push(text[start..at].trim_ascii());
-            start = at + 2;
-            at += 2;
-        } else {
-            at += 1;
+        let next: Option<(&'static [u8], usize)> = match (text[at], text[at + 1]) {
+            (b',', b' ') => Some((b", ", 2)),
+            (b';', b' ') => Some((b"; ", 2)),
+            (b' ', b' ') => Some((
+                b" ",
+                text[at..].iter().take_while(|byte| **byte == b' ').count(),
+            )),
+            _ => None,
+        };
+        match next {
+            Some((separator, length)) => {
+                parts.push((joiner, text[start..at].trim_ascii()));
+                joiner = separator;
+                at += length;
+                start = at;
+            }
+            None => at += 1,
         }
     }
-    parts.push(text[start..].trim_ascii());
-    parts.retain(|part| !part.is_empty());
+    parts.push((joiner, text[start..].trim_ascii()));
+    parts.retain(|(_, part)| !part.is_empty());
     parts
-}
-
-/// The whole words of `text` that fit in `width` (possibly none).
-fn leading_words(text: &[u8], width: usize, multibyte: bool) -> Vec<u8> {
-    let prefix = take_prefix(text, width, multibyte);
-    let cut = if matches!(text.get(prefix.len()), None | Some(b' ')) {
-        prefix.len()
-    } else {
-        prefix.iter().rposition(|byte| *byte == b' ').unwrap_or(0)
-    };
-    let kept = prefix[..cut].trim_ascii_end();
-    kept.strip_suffix(b":").unwrap_or(kept).to_vec()
 }
 
 /// `_ui_line`: one newline-terminated progress line. `total` and
@@ -1147,6 +1145,14 @@ impl Stage {
         self.live && !self.quiet && self.width == RowWidth::Terminal
     }
 
+    /// The detail cell's width on a terminal row, when rows fit one.
+    fn detail_width(&self) -> Option<usize> {
+        match row_fit(self.index, &self.total, self.columns(), self.multibyte) {
+            Fit::Detail(width) => Some(width),
+            Fit::Fixed => None,
+        }
+    }
+
     /// The terminal width rows must fit, read at each render so a resize
     /// mid-run takes effect on the next redraw.
     fn columns(&self) -> Option<usize> {
@@ -1318,9 +1324,27 @@ impl Stage {
     /// final status. Quiet returns before either, leaving state
     /// untouched like the shell early return.
     pub fn finish(&mut self, status: &[u8], detail: &[u8], now_secs: i64) -> Vec<u8> {
+        self.finish_brief(status, detail, detail, now_secs)
+    }
+
+    /// [`Stage::finish`] with a shorter `brief` summary, in clauses, for a
+    /// terminal row too narrow for `detail` (one without clause boundaries
+    /// would otherwise be cut mid-phrase). Fixed-width rows always show
+    /// `detail`, so piped output keeps its bytes.
+    pub fn finish_brief(
+        &mut self,
+        status: &[u8],
+        detail: &[u8],
+        brief: &[u8],
+        now_secs: i64,
+    ) -> Vec<u8> {
         if self.quiet {
             return Vec::new();
         }
+        let detail = match self.detail_width() {
+            Some(width) if measured_len(detail, self.multibyte) > width => brief,
+            _ => detail,
+        };
         let columns = self.columns();
         let stamp = elapsed(now_secs, self.started_secs);
         let (mut out, live_active) = clear_live(self.live_active);
@@ -1354,6 +1378,15 @@ impl Stage {
         let stamp = elapsed(now_secs, self.started_secs);
         let (mut out, live_active) = clear_live(self.live_active);
         self.live_active = live_active;
+        // Too narrow to say what runs: a blank `running` line would only
+        // look like a stray copy of the row, so the row is just cleared.
+        if self.detail_width().is_some_and(|width| {
+            word_cell(detail, width, self.multibyte)
+                .trim_ascii()
+                .is_empty()
+        }) {
+            return out;
+        }
         out.extend_from_slice(&line_fit(
             &self.palette,
             false,
