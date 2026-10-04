@@ -869,6 +869,16 @@ fn cron_base_pull_failure_records_fail_and_keeps_success_stamps() {
         "{log}"
     );
     assert_eq!(last_run_fields(&state), ["fail", "cron"]);
+    // The repository that failed is the recorded cause of this very run.
+    let failure = dot::update_status::read_last_failure(&state).expect("failure cause");
+    let last = dot::update_status::read_last_run(&state).expect("last-run stamp");
+    assert!(failure.describes(&last), "{failure:?} vs {last:?}");
+    let items: Vec<(&str, &str)> = failure
+        .items
+        .iter()
+        .map(|item| (item.stage.as_str(), item.name.as_str()))
+        .collect();
+    assert_eq!(items, [("repos", "dotfiles")]);
     assert_eq!(dot::update_status::read_last_success(&state), Some(OLD));
     let converged = dot::update_status::read_last_converged(&state).expect("convergence stamp");
     assert_eq!((converged.at, converged.failing.as_str()), (OLD, ""));

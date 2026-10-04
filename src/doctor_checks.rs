@@ -214,17 +214,40 @@ fn is_executable_bits(mode: u32) -> bool {
 /// of sharing the stale "will reclaim" promise. A live owner stays a
 /// warning (the refusal ends when that update does), as does a probe
 /// interrupted by a signal to doctor itself.
+///
+/// `age` is how long the owner has held the lock (seconds since its owner
+/// record was written), when known. A live owner past the cron staleness
+/// window is most likely hung rather than slow, so its row says so.
 fn lock_owner_record(
     owner: &crate::update_lock::Owner,
     activity: crate::update_lock::OwnerActivity,
+    age: Option<i64>,
 ) -> Record {
     use crate::update_lock::OwnerActivity as Activity;
+    use crate::update_status::{CRON_STALE_AFTER_SECS, format_age};
 
     match activity {
-        Activity::Active => Record::warn(
-            "update is currently running",
-            Some(format!("pid {}", owner.pid)),
-        ),
+        Activity::Active => match age {
+            Some(age) if age > CRON_STALE_AFTER_SECS => Record::warn(
+                format!("update has been running for {}", format_age(age)),
+                Some(format!(
+                    "pid {pid}; if it is hung, stop it (kill {pid}) and rerun dot update",
+                    pid = owner.pid
+                )),
+            ),
+            Some(age) => Record::warn(
+                "update is currently running",
+                Some(format!(
+                    "pid {}, running for {}; wait for it to finish",
+                    owner.pid,
+                    format_age(age)
+                )),
+            ),
+            None => Record::warn(
+                "update is currently running",
+                Some(format!("pid {}", owner.pid)),
+            ),
+        },
         Activity::Stale => Record::warn(
             "update lock owner is stale",
             Some("the next mutating command will reclaim it".to_string()),
@@ -279,9 +302,18 @@ pub fn check_update_lock(lock_dir: Option<&Path>) -> Vec<Record> {
         return out;
     }
     if let Some(owner) = crate::update_lock::read_owner(dir) {
+        // The owner record is written once at acquisition (a continuation
+        // re-enters without rewriting it), so its mtime is when the run
+        // took the lock. One stat; clock skew reads as just started.
+        let age = std::fs::metadata(crate::update_lock::owner_file(dir))
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|at| crate::update_engine::now_secs().saturating_sub(at.as_secs() as i64));
         out.push(lock_owner_record(
             &owner,
             crate::update_lock::owner_activity(&owner),
+            age,
         ));
     } else if crate::update_lock::is_initializing(dir) {
         out.push(Record::warn("update lock is being initialized", None));
@@ -580,6 +612,9 @@ pub struct CronInputs {
     /// when none was recorded (including every run by a Dot older than
     /// that stamp).
     pub last_run: Option<crate::update_status::LastRun>,
+    /// Why the last non-ok run failed (`update.last-failure`), or `None`
+    /// when none was recorded. Shown only beside the run it describes.
+    pub last_failure: Option<crate::update_status::LastFailure>,
     /// Whether a `crontab` command is on `PATH`. Without one the host
     /// cannot schedule `dot update --cron`, so a cron that never ran skips
     /// instead of warning.
@@ -598,9 +633,15 @@ pub struct CronInputs {
 /// A host whose runs keep converging while the Tools or Prune stage
 /// fails, or while its config misspells a key, is reported as degraded with the failing stages instead of
 /// "has not succeeded recently", which stays reserved for a host that
-/// stopped converging. Both use the same staleness window, so a
-/// transient failure after a recent clean run still reads ok, exactly
-/// as before the degraded outcome existed.
+/// stopped converging.
+///
+/// A cron run that did not succeed and is newer than the last clean one
+/// always warns, even inside the staleness window: a recent clean run used
+/// to vouch for the host until it aged out, so a run that started failing
+/// right after one read green for up to two hours. A run skipped for local
+/// edits names that as the cause (with the files), since cron stays frozen
+/// until the edits are resolved. Every row about a run that failed shows
+/// its cause from `update.last-failure` when that record describes the run.
 ///
 /// The any-trigger last-run stamp fills the gaps the cron stamps leave: a
 /// host whose cron entry never ran warns once its last hand-run update is
@@ -620,7 +661,7 @@ pub fn check_cron_freshness(inputs: &CronInputs) -> Vec<Record> {
 /// The cron row of [`check_cron_freshness`]; returns the epoch of the last
 /// clean cron run when it is recent enough to vouch for the host.
 fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
-    use crate::update_status::{format_age, is_stale};
+    use crate::update_status::{OUTCOME_OK, OUTCOME_SKIP, format_age, is_stale};
 
     let age = |at: i64| format_age(inputs.now.saturating_sub(at));
     let converged = inputs.last_converged.as_ref();
@@ -630,7 +671,7 @@ fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
     let clean_cron_run = inputs
         .last_run
         .as_ref()
-        .filter(|last| last.is_cron() && last.outcome == crate::update_status::OUTCOME_OK)
+        .filter(|last| last.is_cron() && last.outcome == OUTCOME_OK)
         .map(|last| last.at);
     let clean = converged
         .filter(|converged| converged.failing.is_empty())
@@ -639,26 +680,97 @@ fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
         .chain(inputs.last_success)
         .chain(clean_cron_run)
         .max();
-    if let Some(clean) = clean.filter(|clean| !is_stale(*clean, inputs.now)) {
-        out.push(Record::ok(
-            "cron update succeeded recently",
-            Some(format!("{} ago", age(clean))),
+    // The newest cron run, when it did not succeed after the last clean one.
+    // A clean stamp from the future (the clock stepped back) orders nothing,
+    // and every run overwrites the last-run stamp, so that run wins then.
+    let problem = inputs
+        .last_run
+        .as_ref()
+        .filter(|last| last.is_cron() && last.outcome != OUTCOME_OK)
+        .filter(|last| clean.is_none_or(|clean| last.at > clean || clean > inputs.now));
+    let since = match clean {
+        Some(clean) => format!("last success {} ago", age(clean)),
+        None => "no successful cron update recorded".to_string(),
+    };
+    // Only a recent skip says cron is running and blocked; an old one means
+    // cron stopped too, which the stale rows below report (with the edits).
+    if let Some(last) =
+        problem.filter(|last| last.outcome == OUTCOME_SKIP && !is_stale(last.at, inputs.now))
+    {
+        out.push(Record::warn(
+            "cron update skipping: local edits block it",
+            Some(format!(
+                "last cron run {} ago; {since}; {}",
+                age(last.at),
+                skip_cause(inputs, last)
+            )),
         ));
-        return Some(clean);
+        return None;
+    }
+    let fresh_clean = clean.filter(|clean| !is_stale(*clean, inputs.now));
+    if let Some(clean) = fresh_clean {
+        let Some(last) = problem else {
+            out.push(Record::ok(
+                "cron update succeeded recently",
+                Some(format!("{} ago", age(clean))),
+            ));
+            return Some(clean);
+        };
+        out.push(Record::warn(
+            format!("last cron run {}", outcome_phrase(last)),
+            Some(format!(
+                "{} ago; {since}; {}",
+                age(last.at),
+                run_cause(inputs, last)
+            )),
+        ));
+        return None;
     }
     if let Some(converged) = converged
         .filter(|converged| !converged.failing.is_empty() && !is_stale(converged.at, inputs.now))
     {
+        // A cron run after that degraded convergence did not converge: it
+        // is the news, and the degraded stages would mislabel its cause.
+        if let Some(last) = problem.filter(|last| last.at > converged.at) {
+            out.push(Record::warn(
+                format!("last cron run {}", outcome_phrase(last)),
+                Some(format!(
+                    "{} ago; {since}; last converged {} ago; {}",
+                    age(last.at),
+                    age(converged.at),
+                    run_cause(inputs, last)
+                )),
+            ));
+            return None;
+        }
         let since = match inputs.last_success {
             Some(last) => format!("since last success {} ago", age(last)),
             None => "no clean cron update recorded".to_string(),
         };
+        // The run that wrote the convergence explains it; without that run
+        // (a later hand run, or an older Dot) its stages still pick the step.
+        let cause = problem
+            .filter(|last| last.at == converged.at)
+            .map(|last| run_cause(inputs, last))
+            .unwrap_or_else(|| next_step(stages_need_shdeps(&converged.failing)).to_string());
+        let cause = format!("; {cause}");
         out.push(Record::warn(
             format!("cron update degraded: {} failing", converged.failing),
-            Some(format!("{since}; last converged {} ago", age(converged.at))),
+            Some(format!(
+                "{since}; last converged {} ago{cause}",
+                age(converged.at)
+            )),
         ));
         return None;
     }
+    // The newest failing cron run, named with its cause: the stale titles
+    // below describe the host, not that run. Without one, cron itself may
+    // have stopped running.
+    let cause = match problem {
+        Some(last) => format!("; {}", last_cron_note(inputs, last)),
+        None => "; check that dot update --cron is scheduled (crontab -l), or run dot update"
+            .to_string(),
+    };
     // Stale from here on. `clean` (not just last-success) is the success
     // reference, so a lone clean convergence stamp reads as a success. Only
     // a degraded convergence newer than it adds information (an older one is
@@ -670,18 +782,169 @@ fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
     match clean {
         Some(clean) => out.push(Record::warn(
             "cron update has not succeeded recently",
-            Some(format!("last success {} ago{converged_note}", age(clean))),
+            Some(format!(
+                "last success {} ago{converged_note}{cause}",
+                age(clean)
+            )),
         )),
         // Only degraded runs ever converged, and they stopped too.
         None if converged.is_some() => out.push(Record::warn(
             "cron update has not succeeded recently",
             Some(format!(
-                "no successful cron update recorded{converged_note}"
+                "no successful cron update recorded{converged_note}{cause}"
             )),
         )),
         None => out.push(never_converged_record(inputs)),
     }
     None
+}
+
+/// `last cron run <outcome> <age> ago; <cause and next step>`, for rows
+/// whose title describes the host rather than that run.
+fn last_cron_note(inputs: &CronInputs, last: &crate::update_status::LastRun) -> String {
+    let why = if last.outcome == crate::update_status::OUTCOME_SKIP {
+        skip_cause(inputs, last)
+    } else {
+        run_cause(inputs, last)
+    };
+    format!(
+        "last cron run {} {} ago; {why}",
+        outcome_phrase(last),
+        crate::update_status::format_age(inputs.now.saturating_sub(last.at))
+    )
+}
+
+/// `failed`, `degraded: <stages> failing`, `skipped for local edits`, or a
+/// newer outcome word as is, for text about `run`.
+fn outcome_phrase(run: &crate::update_status::LastRun) -> String {
+    use crate::update_status::{OUTCOME_DEGRADED, OUTCOME_FAIL, OUTCOME_SKIP};
+
+    if run.outcome == OUTCOME_FAIL {
+        "failed".to_string()
+    } else if run.outcome == OUTCOME_SKIP {
+        "skipped for local edits".to_string()
+    } else if run.outcome == OUTCOME_DEGRADED && !run.failing.is_empty() {
+        format!("degraded: {} failing", run.failing)
+    } else {
+        run.outcome.clone()
+    }
+}
+
+/// The `update.last-failure` record when it describes `run`.
+fn failure_of<'a>(
+    inputs: &'a CronInputs,
+    run: &crate::update_status::LastRun,
+) -> Option<&'a crate::update_status::LastFailure> {
+    inputs
+        .last_failure
+        .as_ref()
+        .filter(|failure| failure.describes(run))
+}
+
+/// Failing items shown in one row before `+N more`.
+const SHOWN_FAILURE_ITEMS: usize = 3;
+
+/// Longest item detail shown in a row (the record keeps more).
+const SHOWN_FAILURE_DETAIL_BYTES: usize = 100;
+
+/// Why `run` failed plus the next step, for a row detail:
+/// `failing: tools: ripgrep (network unavailable); <next step>`. Without a
+/// matching record (an older Dot wrote the stamp, or the run named nothing)
+/// only the next step remains. A failing Tools or Prune stage points at
+/// `shdeps health`, which explains dependency state without a rerun.
+fn run_cause(inputs: &CronInputs, run: &crate::update_status::LastRun) -> String {
+    use crate::update_status::{STAGE_PRUNE, STAGE_TOOLS, clean_field};
+
+    let failure = failure_of(inputs, run);
+    let items = failure.map_or(&[][..], |failure| failure.items.as_slice());
+    let mut groups: Vec<(&str, Vec<String>)> = Vec::new();
+    for item in items.iter().take(SHOWN_FAILURE_ITEMS) {
+        let detail = clean_field(&item.detail, SHOWN_FAILURE_DETAIL_BYTES);
+        let text = match (item.name.is_empty(), detail.is_empty()) {
+            (false, false) => format!("{} ({detail})", item.name),
+            (false, true) => item.name.clone(),
+            (true, _) => detail,
+        };
+        match groups.iter_mut().find(|(stage, _)| *stage == item.stage) {
+            Some((_, texts)) => texts.push(text),
+            None => groups.push((&item.stage, vec![text])),
+        }
+    }
+    let more = items.len().saturating_sub(SHOWN_FAILURE_ITEMS)
+        + failure.map_or(0, |failure| failure.omitted);
+    // The record says which stage failed; without one (an older Dot), the
+    // degraded stages do. A provider that could not even be prepared is
+    // not `shdeps health`'s to explain.
+    let dependency = if items.is_empty() {
+        stages_need_shdeps(&run.failing)
+    } else {
+        items
+            .iter()
+            .any(|item| item.stage == STAGE_TOOLS || item.stage == STAGE_PRUNE)
+    };
+    let hint = next_step(dependency);
+    if groups.is_empty() {
+        return hint.to_string();
+    }
+    let mut listed = groups
+        .iter()
+        .map(|(stage, texts)| format!("{stage}: {}", texts.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if more > 0 {
+        listed.push_str(&format!(" +{more} more"));
+    }
+    format!("failing: {listed}; {hint}")
+}
+
+/// Whether a comma-separated degraded stage list names a dependency stage
+/// (Tools or Prune), which `shdeps health` explains without a rerun.
+fn stages_need_shdeps(failing: &str) -> bool {
+    use crate::update_status::{STAGE_PRUNE, STAGE_TOOLS};
+
+    failing
+        .split(',')
+        .any(|stage| stage == STAGE_TOOLS || stage == STAGE_PRUNE)
+}
+
+/// The next step for a failed run: `shdeps health` when a dependency stage
+/// failed, otherwise the update's own output.
+fn next_step(dependency: bool) -> &'static str {
+    if dependency {
+        "run shdeps health, or dot update for the full output"
+    } else {
+        "run dot update for the full output"
+    }
+}
+
+/// The edited files that skipped `run` (a cron skip) plus the next step:
+/// `edited: .bashrc, .zshrc; <next step>`. The record keeps the first few;
+/// without one (an older Dot) only the next step remains.
+fn skip_cause(inputs: &CronInputs, run: &crate::update_status::LastRun) -> String {
+    let hint = "run dot status, then commit, stash, or resolve the edits";
+    let Some(failure) = failure_of(inputs, run) else {
+        return hint.to_string();
+    };
+    let files: Vec<&str> = failure
+        .items
+        .iter()
+        .filter(|item| item.stage == crate::update_status::STAGE_DIRTY)
+        .map(|item| item.name.as_str())
+        .collect();
+    if files.is_empty() {
+        return hint.to_string();
+    }
+    let mut listed = files
+        .iter()
+        .take(SHOWN_FAILURE_ITEMS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = files.len().saturating_sub(SHOWN_FAILURE_ITEMS) + failure.omitted;
+    if more > 0 {
+        listed.push_str(&format!(" +{more} more"));
+    }
+    format!("edited: {listed}; {hint}")
 }
 
 /// The cron row when no cron run ever converged. Before the last-run stamp
@@ -703,9 +966,8 @@ fn never_converged_record(inputs: &CronInputs) -> Record {
         return Record::warn(
             "cron update has not succeeded recently",
             Some(format!(
-                "no successful cron update recorded; last cron run {} {} ago",
-                last.outcome,
-                age(last.at)
+                "no successful cron update recorded; {}",
+                last_cron_note(inputs, last)
             )),
         );
     }
@@ -773,14 +1035,12 @@ fn last_run_record(inputs: &CronInputs, clean_cron: Option<i64>) -> Option<Recor
         };
         Record::warn(
             format!("last update degraded: {failing} failing"),
-            Some(format!(
-                "{detail}; rerun dot update to see the failing stage"
-            )),
+            Some(format!("{detail}; {}", run_cause(inputs, last))),
         )
     } else {
         Record::warn(
             "last update failed",
-            Some(format!("{detail}; rerun dot update to see what failed")),
+            Some(format!("{detail}; {}", run_cause(inputs, last))),
         )
     })
 }
@@ -2601,7 +2861,7 @@ mod tests {
             start: "proc:99".to_string(),
             token: "4242.0.0".to_string(),
         };
-        let rendered = |activity| render(&[lock_owner_record(&owner, activity)]);
+        let rendered = |activity| render(&[lock_owner_record(&owner, activity, None)]);
         assert!(rendered(Activity::Active).contains("currently running"));
         assert!(rendered(Activity::Active).contains("pid 4242"));
         let stale = rendered(Activity::Stale);

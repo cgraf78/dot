@@ -276,6 +276,7 @@ fn planted_fifos_never_block_state_access() {
         update_status::update_log_path(&state),
         update_status::last_success_path(&state),
         update_status::last_converged_path(&state),
+        update_status::last_failure_path(&state),
     ] {
         let status = std::process::Command::new("mkfifo")
             .arg(&path)
@@ -287,9 +288,17 @@ fn planted_fifos_never_block_state_access() {
         update_status::append_outcome(&state, 1_800_000_000, "ok", "update", "");
         update_status::record_success(&state, 1_800_000_000);
         update_status::record_converged(&state, 1_800_000_000, update_status::Degraded::default());
+        update_status::record_last_failure(
+            &state,
+            1_800_000_000,
+            "fail",
+            update_status::Trigger::Cron,
+            &update_status::Failures::default(),
+        );
         (
             update_status::read_last_success(&state),
             update_status::read_last_converged(&state),
+            update_status::read_last_failure(&state),
         )
     });
     let deadline = std::time::Duration::from_secs(10);
@@ -304,7 +313,7 @@ fn planted_fifos_never_block_state_access() {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    assert_eq!(stamp, (None, None));
+    assert_eq!(stamp, (None, None, None));
 }
 
 #[test]
@@ -334,6 +343,16 @@ fn cron_state_stays_owner_only() {
     std::fs::write(&converged, b"1\n").unwrap();
     std::fs::set_permissions(&converged, std::fs::Permissions::from_mode(0o644)).unwrap();
     update_status::record_converged(state, 1_800_000_000, update_status::Degraded::default());
+    let cause = update_status::last_failure_path(state);
+    std::fs::write(&cause, b"1 fail cron\n").unwrap();
+    std::fs::set_permissions(&cause, std::fs::Permissions::from_mode(0o644)).unwrap();
+    update_status::record_last_failure(
+        state,
+        1_800_000_000,
+        "fail",
+        update_status::Trigger::Cron,
+        &update_status::Failures::default(),
+    );
     let failed = state.join("scratch.log");
     std::fs::write(&failed, b"boom\n").unwrap();
     update_status::retain_failed_log(&logs, "cmd", 1_800_000_000, &failed).expect("retained log");
@@ -345,6 +364,7 @@ fn cron_state_stays_owner_only() {
     assert_eq!(mode(&log), 0o600);
     assert_eq!(mode(&stamp), 0o600);
     assert_eq!(mode(&converged), 0o600);
+    assert_eq!(mode(&cause), 0o600);
     assert_eq!(mode(&logs), 0o700);
 }
 
@@ -485,4 +505,356 @@ fn last_run_stamp_accepts_newer_words_and_rejects_garbage() {
     }
     std::fs::write(&path, vec![b'9'; 1024]).unwrap();
     assert_eq!(update_status::read_last_run(state), None);
+}
+
+fn failures(items: &[(&'static str, &str, &str)]) -> update_status::Failures {
+    let mut failures = update_status::Failures::default();
+    for (stage, name, detail) in items {
+        failures.push(stage, name, detail);
+    }
+    failures
+}
+
+#[test]
+fn last_failure_round_trips_its_header_and_items() {
+    let scratch = TempDir::new("update-status-failure").unwrap();
+    let state = scratch.path();
+    assert_eq!(update_status::read_last_failure(state), None);
+    update_status::record_last_failure(
+        state,
+        1_800_000_000,
+        "degraded",
+        update_status::Trigger::Cron,
+        &failures(&[
+            ("tools", "watchexec/watchexec", "blocked transition"),
+            ("prune", "shdeps prune", ""),
+        ]),
+    );
+    assert_eq!(
+        std::fs::read_to_string(update_status::last_failure_path(state)).unwrap(),
+        "1800000000 degraded cron\nitem\ttools\twatchexec/watchexec\tblocked transition\nitem\tprune\tshdeps prune\t\n"
+    );
+    let failure = update_status::read_last_failure(state).expect("record");
+    assert_eq!(
+        (
+            failure.at,
+            failure.outcome.as_str(),
+            failure.trigger.as_str()
+        ),
+        (1_800_000_000, "degraded", "cron")
+    );
+    assert_eq!(failure.items.len(), 2);
+    assert_eq!(failure.items[0].name, "watchexec/watchexec");
+    assert_eq!(failure.items[1].detail, "");
+    assert_eq!(failure.omitted, 0);
+    // It describes exactly the run whose stamp shares its header.
+    let run = |at, outcome: &str, trigger: &str| update_status::LastRun {
+        at,
+        outcome: outcome.to_string(),
+        trigger: trigger.to_string(),
+        failing: "tools,prune".to_string(),
+    };
+    assert!(failure.describes(&run(1_800_000_000, "degraded", "cron")));
+    assert!(!failure.describes(&run(1_800_000_060, "degraded", "cron")));
+    assert!(!failure.describes(&run(1_800_000_000, "fail", "cron")));
+    assert!(!failure.describes(&run(1_800_000_000, "degraded", "manual")));
+}
+
+#[test]
+fn last_failure_without_items_still_records_its_run() {
+    // "Cause unknown" for this run must not fall back to an older cause.
+    let scratch = TempDir::new("update-status-failure-empty").unwrap();
+    let state = scratch.path();
+    update_status::record_last_failure(
+        state,
+        1_800_000_000,
+        "fail",
+        update_status::Trigger::Manual,
+        &update_status::Failures::default(),
+    );
+    let failure = update_status::read_last_failure(state).expect("record");
+    assert!(failure.items.is_empty());
+    assert_eq!(failure.trigger, "manual");
+}
+
+#[test]
+fn last_failure_caps_items_per_stage_and_counts_the_rest() {
+    let scratch = TempDir::new("update-status-failure-cap").unwrap();
+    let state = scratch.path();
+    let names: Vec<String> = (0..8).map(|index| format!("pkg{index}")).collect();
+    let mut many = update_status::Failures::default();
+    for name in &names {
+        many.push(update_status::STAGE_TOOLS, name, "failed");
+    }
+    many.push(update_status::STAGE_CONFIGS, "10-hook", "exit 3");
+    update_status::record_last_failure(
+        state,
+        1_800_000_000,
+        "fail",
+        update_status::Trigger::Cron,
+        &many,
+    );
+    let failure = update_status::read_last_failure(state).expect("record");
+    let kept: Vec<&str> = failure
+        .items
+        .iter()
+        .map(|item| item.name.as_str())
+        .collect();
+    assert_eq!(kept, ["pkg0", "pkg1", "pkg2", "pkg3", "pkg4", "10-hook"]);
+    assert_eq!(failure.omitted, 3);
+}
+
+#[test]
+fn last_failure_stays_within_its_byte_cap() {
+    // Long details across many items: the body never exceeds the cap, and
+    // whatever did not fit is still counted.
+    let scratch = TempDir::new("update-status-failure-bytes").unwrap();
+    let state = scratch.path();
+    let detail = "d".repeat(1000);
+    let name = "n".repeat(1000);
+    let stages = [
+        update_status::STAGE_REPOS,
+        update_status::STAGE_OVERLAYS,
+        update_status::STAGE_TOOLS,
+        update_status::STAGE_PRUNE,
+        update_status::STAGE_CONFIGS,
+        update_status::STAGE_CONFIG,
+        update_status::STAGE_UPDATE,
+    ];
+    let mut many = update_status::Failures::default();
+    for stage in stages {
+        for _ in 0..5 {
+            many.push(stage, &name, &detail);
+        }
+    }
+    update_status::record_last_failure(
+        state,
+        1_800_000_000,
+        "fail",
+        update_status::Trigger::Cron,
+        &many,
+    );
+    let body = std::fs::read(update_status::last_failure_path(state)).unwrap();
+    assert!(
+        body.len() <= update_status::FAILURE_MAX_BYTES,
+        "{}",
+        body.len()
+    );
+    let failure = update_status::read_last_failure(state).expect("record");
+    assert!(!failure.items.is_empty());
+    assert_eq!(failure.items.len() + failure.omitted, stages.len() * 5);
+    // Fields are cut on a character boundary and say so.
+    assert!(
+        failure.items[0].name.ends_with('…'),
+        "{:?}",
+        failure.items[0]
+    );
+    assert!(failure.items[0].name.len() <= 120);
+    assert!(failure.items[0].detail.len() <= 240);
+}
+
+#[test]
+fn last_failure_keeps_every_more_count_when_the_body_is_nearly_full() {
+    // Kept items that bring the body within a few bytes of the cap, then
+    // several stages that are only ever omitted: each of their `more` lines
+    // must still fit, or the reader would cut them and doctor would
+    // undercount "+N more".
+    let scratch = TempDir::new("update-status-failure-more").unwrap();
+    let state = scratch.path();
+    let full = "d".repeat(240);
+    let mut many = update_status::Failures::default();
+    for stage in [
+        update_status::STAGE_TOOLS,
+        update_status::STAGE_CONFIGS,
+        update_status::STAGE_OVERLAYS,
+    ] {
+        for index in 0..5 {
+            many.push(stage, &format!("{index}"), &full);
+        }
+    }
+    // Sized to leave the body just under the cap under a reserve that only
+    // covers one omitted stage.
+    many.push(update_status::STAGE_UPDATE, "n", &"u".repeat(150));
+    let late = [
+        update_status::STAGE_REPOS,
+        update_status::STAGE_DIRTY,
+        update_status::STAGE_PRUNE,
+        update_status::STAGE_CONFIG,
+        update_status::STAGE_TOOLS,
+        update_status::STAGE_CONFIGS,
+    ];
+    for stage in late {
+        many.push(stage, "late", &full);
+    }
+    update_status::record_last_failure(
+        state,
+        1_800_000_000,
+        "fail",
+        update_status::Trigger::Cron,
+        &many,
+    );
+    let body = std::fs::read(update_status::last_failure_path(state)).unwrap();
+    assert!(
+        body.len() <= update_status::FAILURE_MAX_BYTES,
+        "{}",
+        body.len()
+    );
+    let failure = update_status::read_last_failure(state).expect("record");
+    assert_eq!(failure.items.len() + failure.omitted, 22, "{failure:?}");
+}
+
+#[test]
+fn last_failure_fields_are_control_sanitized() {
+    // Provider events, hook output, and filenames are untrusted: none may
+    // forge record lines or reach doctor's terminal as escape sequences.
+    let scratch = TempDir::new("update-status-failure-hostile").unwrap();
+    let state = scratch.path();
+    update_status::record_last_failure(
+        state,
+        1_800_000_000,
+        "fail",
+        update_status::Trigger::Cron,
+        &failures(&[(
+            "tools",
+            "evil\tname\nitem\ttools\tforged\tline",
+            "red \x1b[31mtext\u{9b}31m \r\n tail",
+        )]),
+    );
+    let body = std::fs::read_to_string(update_status::last_failure_path(state)).unwrap();
+    assert_eq!(body.lines().count(), 2, "{body:?}");
+    let failure = update_status::read_last_failure(state).expect("record");
+    assert_eq!(failure.items.len(), 1);
+    assert_eq!(failure.items[0].name, "evil name item tools forged line");
+    // Color sequences go whole, not just their escape byte.
+    assert_eq!(failure.items[0].detail, "red text tail");
+    // A cap too small for the ellipsis keeps nothing instead of panicking.
+    assert_eq!(update_status::clean_field("abcdef", 2), "");
+    assert_eq!(update_status::clean_field("abcdef", 4), "a…");
+    // An item with nothing to say is dropped.
+    let mut empty = update_status::Failures::default();
+    empty.push(update_status::STAGE_TOOLS, " \t", "\n");
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn last_failure_reader_tolerates_newer_and_hostile_records() {
+    let scratch = TempDir::new("update-status-failure-reader").unwrap();
+    let state = scratch.path();
+    let path = update_status::last_failure_path(state);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Newer line kinds and extra fields are skipped or ignored; items keep
+    // reading; hostile text written by something else is cleaned again.
+    std::fs::write(
+        &path,
+        "1800000000 aborted cron\nnote\tsomething new\nitem\ttools\tpkg\twhy\textra\nitem\tBad Stage\tx\ty\nitem\tnewstage\tn\t\x1b[2Jd\nmore\ttools\t2\nmore\ttools\tnot-a-number\n",
+    )
+    .unwrap();
+    let failure = update_status::read_last_failure(state).expect("record");
+    assert_eq!(failure.outcome, "aborted");
+    let items: Vec<(&str, &str, &str)> = failure
+        .items
+        .iter()
+        .map(|item| {
+            (
+                item.stage.as_str(),
+                item.name.as_str(),
+                item.detail.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(items, [("tools", "pkg", "why"), ("newstage", "n", "d")]);
+    assert_eq!(failure.omitted, 2);
+    // A malformed header is no record at all; extra header fields from a
+    // newer Dot are not malformed.
+    std::fs::write(
+        &path,
+        "1800000000 fail cron future-field\nitem\ttools\tpkg\twhy\n",
+    )
+    .unwrap();
+    assert_eq!(
+        update_status::read_last_failure(state)
+            .expect("newer header")
+            .items
+            .len(),
+        1
+    );
+    for header in ["", "x fail cron", "1800000000 Fail cron", "1800000000 fail"] {
+        std::fs::write(&path, format!("{header}\nitem\ttools\tpkg\twhy\n")).unwrap();
+        assert_eq!(update_status::read_last_failure(state), None, "{header:?}");
+    }
+    // An oversized record from a newer Dot yields its leading whole lines.
+    let mut big = String::from("1800000000 fail cron\n");
+    while big.len() < update_status::FAILURE_MAX_BYTES + 500 {
+        big.push_str("item\ttools\tpkg\t");
+        big.push_str(&"x".repeat(100));
+        big.push('\n');
+    }
+    std::fs::write(&path, &big).unwrap();
+    let failure = update_status::read_last_failure(state).expect("leading lines");
+    assert!(!failure.items.is_empty());
+    assert!(
+        failure
+            .items
+            .iter()
+            .all(|item| item.detail == "x".repeat(100))
+    );
+}
+
+#[test]
+fn last_line_finds_the_final_message() {
+    assert_eq!(update_status::last_line(b""), "");
+    assert_eq!(update_status::last_line(b"\n \n"), "");
+    assert_eq!(
+        update_status::last_line(b"warning: first\nerror: the cause\n\n"),
+        "error: the cause"
+    );
+    assert_eq!(
+        update_status::last_line(b"progress\rerror: cr\r\n"),
+        "error: cr"
+    );
+    // Only the tail is scanned, and the line is capped.
+    let mut huge = vec![b'x'; 1 << 20];
+    huge.extend_from_slice(b"\nerror: tail\n");
+    assert_eq!(update_status::last_line(&huge), "error: tail");
+    let long = "y".repeat(10_000);
+    assert!(update_status::last_line(long.as_bytes()).len() <= 240);
+}
+
+#[test]
+fn failed_run_records_every_outcome_file() {
+    // A failure outside the engine leaves the same records the engine does.
+    let scratch = TempDir::new("update-status-failed-run").unwrap();
+    let state = scratch.path();
+    update_status::record_failed_run(
+        state,
+        1_800_000_000,
+        update_status::Trigger::Cron,
+        (
+            update_status::STAGE_UPDATE,
+            "dot",
+            "cannot start the updated dot",
+        ),
+    );
+    let log = std::fs::read_to_string(update_status::update_log_path(state)).unwrap();
+    assert_eq!(log, "1800000000 fail update\n");
+    let last = update_status::read_last_run(state).expect("last run");
+    let failure = update_status::read_last_failure(state).expect("cause");
+    assert!(failure.describes(&last));
+    assert_eq!(failure.items[0].detail, "cannot start the updated dot");
+
+    // A hand run writes no cron line.
+    let manual = TempDir::new("update-status-failed-run-manual").unwrap();
+    update_status::record_failed_run(
+        manual.path(),
+        1_800_000_000,
+        update_status::Trigger::Manual,
+        (update_status::STAGE_UPDATE, "dot", "reason"),
+    );
+    assert!(!update_status::update_log_path(manual.path()).exists());
+    assert_eq!(
+        update_status::read_last_run(manual.path())
+            .expect("last run")
+            .trigger,
+        "manual"
+    );
 }

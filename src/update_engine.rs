@@ -107,19 +107,33 @@ pub(crate) fn is_continuation(runtime: &crate::app::Runtime) -> bool {
     runtime.value(REEXEC_ONCE_ENV).and_then(OsStr::to_str) == Some("1")
 }
 
-/// Record a `fail` cron outcome for a release continuation that stops
-/// before its engine records the run (for example when it cannot re-enter
-/// the update lock). The first half skipped its own line on handoff, so
-/// without this the run would leave no outcome at all.
+/// Record a `fail` outcome for a release continuation that stops before
+/// its engine records the run (for example when it cannot re-enter the
+/// update lock). The first half skipped its own records on handoff, so
+/// without this the run would leave no outcome at all: a cron run gets its
+/// `fail` line, and every run its last-run stamp and `reason` as the cause.
 pub(crate) fn record_continuation_failure(
     continuation: bool,
     args: &[OsString],
     state_home: &Path,
+    reason: &str,
 ) {
     // Cancellation is not an outcome, as everywhere else in the cron log.
-    if continuation && parse_flags(args).0.cron && !cancelled() {
-        crate::update_status::append_outcome(state_home, now_secs(), "fail", "update", "");
+    if !continuation || cancelled() {
+        return;
     }
+    // Only `dot update` hands off (see `release_hands_off`).
+    let trigger = if parse_flags(args).0.cron {
+        crate::update_status::Trigger::Cron
+    } else {
+        crate::update_status::Trigger::Manual
+    };
+    crate::update_status::record_failed_run(
+        state_home,
+        now_secs(),
+        trigger,
+        (crate::update_status::STAGE_UPDATE, "dot", reason),
+    );
 }
 
 /// Whether a release root may hand the rest of a run off to a new binary:
@@ -220,6 +234,9 @@ pub struct EngineInputs<'a> {
     pub data_warned: &'a std::cell::RefCell<Vec<crate::unknown_keys::DataKey>>,
     /// Whether this invocation already printed [`HOLD_WARNING`].
     pub hold_warned: &'a std::cell::Cell<bool>,
+    /// Failing items this run met, persisted as `update.last-failure` when
+    /// the run does not succeed (see [`crate::update_status::Failures`]).
+    pub failures: &'a std::cell::RefCell<crate::update_status::Failures>,
     /// Warning lines an earlier process of this invocation already
     /// printed, handed over in [`WARNED_ENV`]; never printed again.
     pub handed_warnings: &'a BTreeSet<String>,
@@ -454,6 +471,22 @@ pub fn handed_warnings(value: Option<&OsStr>) -> BTreeSet<String> {
 }
 
 impl EngineInputs<'_> {
+    /// Note one failing item for `update.last-failure` (see
+    /// [`crate::update_status::Failures::push`]). Collected for every run;
+    /// written only when the run ends non-ok.
+    fn fail(&self, stage: &'static str, name: &str, detail: &str) {
+        self.failures.borrow_mut().push(stage, name, detail);
+    }
+
+    /// [`EngineInputs::fail`] unless `stage` already has an item: a stage
+    /// that failed for a reason recorded deeper down keeps that reason, and
+    /// one that did not still names itself.
+    fn fail_stage(&self, stage: &'static str, name: &str, detail: &str) {
+        if !self.failures.borrow().has_stage(stage) {
+            self.fail(stage, name, detail);
+        }
+    }
+
     /// The [`WARNED_ENV`] value for a continuation process: every unknown
     /// key, data-file key, and hold warning this invocation has printed so
     /// far (or was handed).
@@ -632,6 +665,44 @@ struct UpdateIo<'a> {
 struct LiveSink<'a> {
     inner: &'a mut dyn std::io::Write,
     failed: bool,
+}
+
+/// A stream wrapper that forwards every write unchanged (results included)
+/// while keeping the last [`crate::update_status::FAILURE_MAX_BYTES`] bytes
+/// it delivered, for [`crate::update_status::last_line`].
+struct TailSink<'a> {
+    inner: &'a mut dyn std::io::Write,
+    tail: Vec<u8>,
+}
+
+impl<'a> TailSink<'a> {
+    fn new(inner: &'a mut dyn std::io::Write) -> Self {
+        Self {
+            inner,
+            tail: Vec::new(),
+        }
+    }
+
+    fn into_tail(self) -> Vec<u8> {
+        self.tail
+    }
+}
+
+impl std::io::Write for TailSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.tail.extend_from_slice(&bytes[..written]);
+        let excess = self
+            .tail
+            .len()
+            .saturating_sub(crate::update_status::FAILURE_MAX_BYTES);
+        self.tail.drain(..excess);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 impl LiveSink<'_> {
@@ -913,6 +984,11 @@ pub fn sync_repos(
     let snapshot = match snapshot_installed_links(inputs, err) {
         Some(snapshot) => snapshot,
         None => {
+            inputs.fail(
+                crate::update_status::STAGE_OVERLAYS,
+                "installed links",
+                "could not snapshot the installed overlay links",
+            );
             return SyncDone {
                 rc: 1,
                 frozen: true,
@@ -963,6 +1039,9 @@ pub fn sync_repos(
     crate::repos_base::invalidate_client_match_cache();
     crate::overlays::invalidate_upstream_cache();
     if outcome.rc != 0 || outcome.failed > 0 {
+        // This pull covers only the base (no overlays yet), and the pull
+        // lanes report no reason beyond their stderr warning.
+        inputs.fail(crate::update_status::STAGE_REPOS, "dotfiles", "pull failed");
         let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose);
         let _ = out.write_all(&close);
         restore_generation(inputs, base, &snapshot, &[], err);
@@ -981,6 +1060,7 @@ pub fn sync_repos(
         Err(failure) => {
             let _ = err.write_all(failure.line().as_bytes());
             let _ = err.write_all(b"\n");
+            inputs.fail(crate::update_status::STAGE_REPOS, "config", failure.line());
             let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose);
             let _ = out.write_all(&close);
             restore_generation(inputs, base, &snapshot, &[], err);
@@ -1033,6 +1113,13 @@ fn sync_tail(
     let mut conv = converge_overlays(inputs, state, stage, moves, &mut io, prefetch);
     agg.fold_agg(&conv.overlay);
     if conv.rc != 0 {
+        // A failed pull names its repository; discovery, profile, and
+        // preflight failures explain themselves only on stderr.
+        inputs.fail_stage(
+            crate::update_status::STAGE_REPOS,
+            "overlays",
+            "overlay or profile resolution failed",
+        );
         if close_active {
             let close = agg.close(stage, "1", inputs.dot_verbose);
             let _ = io.out.write_all(&close);
@@ -1087,6 +1174,11 @@ fn sync_tail(
     conv.state.prior = prepared.prior;
     conv.state.retained = prepared.records;
     if !prepared_ok {
+        inputs.fail(
+            crate::update_status::STAGE_OVERLAYS,
+            "profile lifecycle",
+            "could not prepare the profile lifecycle",
+        );
         if close_active {
             let close = agg.close(stage, "1", inputs.dot_verbose);
             let _ = io.out.write_all(&close);
@@ -1147,7 +1239,7 @@ fn pull_overlays_only(
     if let Some(probes) = prefetch {
         probes.settle();
     }
-    crate::repos_pull_fleet::pull_overlays(
+    let outcome = crate::repos_pull_fleet::pull_overlays(
         &crate::repos_pull_fleet::PullOverlaysInputs {
             entries,
             extra_args: inputs.extra_args,
@@ -1180,7 +1272,20 @@ fn pull_overlays_only(
         moves,
         out,
         err,
-    )
+    );
+    // Every overlay pull of a converge phase passes through here, so this
+    // is the one place that names the repositories that failed.
+    for name in outcome.failed_names() {
+        inputs.fail(crate::update_status::STAGE_REPOS, name, "pull failed");
+    }
+    if outcome.rc != 0 {
+        inputs.fail(
+            crate::update_status::STAGE_REPOS,
+            "overlays",
+            "overlay pull workers failed",
+        );
+    }
+    outcome
 }
 
 /// `_dot_converge_overlays` before profile selection: discover,
@@ -1920,6 +2025,16 @@ fn prune_stage(
     if outcome.status == 0 {
         return PruneStatus::Ok;
     }
+    let reason = crate::update_status::last_line(&outcome.stderr);
+    inputs.fail(
+        crate::update_status::STAGE_PRUNE,
+        "shdeps prune",
+        &if reason.is_empty() {
+            format!("exit {}", outcome.status)
+        } else {
+            reason
+        },
+    );
     if quiet(inputs) {
         warn_row(
             io.err,
@@ -1987,8 +2102,24 @@ fn finalize(
         config: config_degraded(inputs.caller, &state.config),
         ..crate::update_status::Degraded::default()
     };
+    if stages.config {
+        for unknown in &state.config.unknown_keys {
+            if let Some(known) = unknown.suggestion() {
+                inputs.fail(
+                    crate::update_status::STAGE_CONFIG,
+                    &unknown.key,
+                    &format!("ignored; did you mean '{known}'?"),
+                );
+            }
+        }
+    }
     let checkpoint = crate::shdeps::checkpoint_in(Path::new(inputs.state_home));
     if !crate::shdeps::consume_checkpoint(&checkpoint, inputs.source_root_git) {
+        inputs.fail(
+            crate::update_status::STAGE_UPDATE,
+            "provider checkpoint",
+            "the provider re-exec checkpoint could not be consumed",
+        );
         let close = crate::progress_ui::done(
             inputs.palette,
             quiet(inputs),
@@ -2056,6 +2187,11 @@ fn finalize(
         };
         let outcome = crate::repos_link_all::link_overlays(&link_inputs, stage, io.out, io.err);
         if outcome.rc != 0 {
+            inputs.fail(
+                crate::update_status::STAGE_OVERLAYS,
+                "links",
+                "overlay linking failed",
+            );
             status = 1;
             inputs_ready = false;
         }
@@ -2111,6 +2247,11 @@ fn finalize(
         };
         if retired != 0 {
             status = 1;
+            inputs.fail(
+                crate::update_status::STAGE_OVERLAYS,
+                "profile deactivation",
+                "a retiring overlay could not be deactivated",
+            );
             skip_inputs_rows(
                 stage,
                 io.out,
@@ -2170,9 +2311,21 @@ fn finalize(
                     }
                     Err(provider) if provider.abort => {
                         let _ = io.err.write_all(&provider.stderr);
+                        inputs.fail(
+                            crate::update_status::STAGE_PROVIDER,
+                            "shdeps",
+                            &crate::update_status::last_line(&provider.stderr),
+                        );
                         return 1;
                     }
                     Err(provider) => {
+                        let summary = String::from_utf8_lossy(&provider.summary);
+                        let reason = crate::update_status::last_line(&provider.stderr);
+                        inputs.fail(
+                            crate::update_status::STAGE_PROVIDER,
+                            "shdeps",
+                            if reason.is_empty() { &summary } else { &reason },
+                        );
                         if io.err.write_all(&provider.stderr).is_err() {
                             return 1;
                         }
@@ -2200,13 +2353,18 @@ fn finalize(
                             inputs.dot_verbose,
                         );
                         let _ = io.out.write_all(&open);
+                        // Shdeps prints a fatal error (one that aborts before
+                        // any item event, such as a blocked transition) only
+                        // on stderr, so keep its tail for the failure record.
+                        let mut provider_err = TailSink::new(&mut *io.err);
                         let provider = crate::shdeps_provider::update(
                             &provider_inputs,
                             &prepared,
                             stage,
                             &mut *io.out,
-                            &mut *io.err,
+                            &mut provider_err,
                         );
+                        let provider_tail = provider_err.into_tail();
                         if provider.interrupted.is_some() {
                             return interruption_status(provider.interrupted);
                         }
@@ -2222,6 +2380,18 @@ fn finalize(
                         let _ = io.out.write_all(&provider.details);
                         if provider.status != 0 {
                             stages.tools = true;
+                            for (name, detail) in &provider.failed_items {
+                                inputs.fail(crate::update_status::STAGE_TOOLS, name, detail);
+                            }
+                            // No failed item: the provider stopped on its own
+                            // error, which its last stderr line names.
+                            let reason = crate::update_status::last_line(&provider_tail);
+                            let summary = String::from_utf8_lossy(&provider.summary);
+                            inputs.fail_stage(
+                                crate::update_status::STAGE_TOOLS,
+                                "shdeps",
+                                if reason.is_empty() { &summary } else { &reason },
+                            );
                         }
                         if let Some(change) = provider.revision_change {
                             if cancelled() {
@@ -2297,7 +2467,7 @@ fn finalize(
                     crate::update_engine::now_secs(),
                 );
                 let _ = io.out.write_all(&close);
-                crate::merges::Outcome { status: 0 }
+                crate::merges::Outcome::status(0)
             } else {
                 crate::merges::run(
                     &crate::merges::RunInputs {
@@ -2332,6 +2502,14 @@ fn finalize(
             };
             if merged.status != 0 {
                 status = 1;
+                for (key, detail) in &merged.failures {
+                    inputs.fail(crate::update_status::STAGE_CONFIGS, key, detail);
+                }
+                inputs.fail_stage(
+                    crate::update_status::STAGE_CONFIGS,
+                    "merge hooks",
+                    "config hooks could not run",
+                );
             }
             if cancelled() {
                 return 1;
@@ -2368,6 +2546,11 @@ fn finalize(
                         io.err,
                         inputs.palette,
                         "  warning: could not commit profile lifecycle state",
+                    );
+                    inputs.fail(
+                        crate::update_status::STAGE_UPDATE,
+                        "profile lifecycle",
+                        "could not commit profile lifecycle state",
                     );
                     status = 1;
                 }
@@ -2491,6 +2674,11 @@ fn provider_reexec(
             inputs.palette,
             "  warning: active dot revision was invalid before provider update",
         );
+        inputs.fail(
+            crate::update_status::STAGE_UPDATE,
+            "dot",
+            "active dot revision was invalid before provider update",
+        );
         let close = crate::progress_ui::done(
             inputs.palette,
             quiet(inputs),
@@ -2508,6 +2696,11 @@ fn provider_reexec(
             inputs.palette,
             "  warning: active dot revision is unavailable after provider update",
         );
+        inputs.fail(
+            crate::update_status::STAGE_UPDATE,
+            "dot",
+            "active dot revision is unavailable after provider update",
+        );
         let close = crate::progress_ui::done(
             inputs.palette,
             quiet(inputs),
@@ -2520,6 +2713,11 @@ fn provider_reexec(
         return Some(1);
     }
     if inputs.continuation {
+        inputs.fail(
+            crate::update_status::STAGE_UPDATE,
+            "dot",
+            "dot changed twice during one update; rerun to validate the provider checkpoint",
+        );
         let path = crate::shdeps::checkpoint_in(Path::new(inputs.state_home));
         let mut moves = crate::temp::MoveCache::default();
         if crate::shdeps::write_checkpoint(before, after, &path, &mut moves) {
@@ -2557,9 +2755,15 @@ fn provider_reexec(
     let mut env = inputs.env.clone();
     env.insert(OsString::from(REEXEC_ONCE_ENV), OsString::from("1"));
     env.insert(OsString::from(REEXEC_EXPECTED_ENV), OsString::from(after));
+    // Every early stop below is this run's failure; name it, since the
+    // nested run that would record its own cause never starts.
+    let stopped = |detail: &str| {
+        inputs.fail(crate::update_status::STAGE_UPDATE, "dot", detail);
+        Some(1)
+    };
     let runtime = match crate::app::Runtime::from_env(inputs.runtime.env(), inputs.runtime.cwd()) {
         Ok(runtime) => runtime,
-        Err(_) => return Some(1),
+        Err(_) => return stopped("could not continue the update under the changed dot"),
     };
     let policy = env_value(&env, "DOT_SHDEPS_UPDATE_POLICY");
     let startup = crate::startup::Inputs {
@@ -2574,6 +2778,7 @@ fn provider_reexec(
         Err(failure) => {
             let _ = io.err.write_all(failure.line().as_bytes());
             let _ = io.err.write_all(b"\n");
+            inputs.fail(crate::update_status::STAGE_UPDATE, "config", failure.line());
             return Some(1);
         }
     };
@@ -2596,7 +2801,7 @@ fn provider_reexec(
         runtime.cwd(),
     ) {
         Ok(gathered) => gathered,
-        _ => return Some(1),
+        _ => return stopped("could not prepare the update under the changed dot"),
     };
     // One invocation, one warning per key: the continuation inherits
     // every key reported so far, not only the ones its config holds.
@@ -2617,14 +2822,11 @@ fn provider_reexec(
         return Some(1);
     }
     // The continuation records its own cron outcome; handing its degraded
-    // stages back lets the outer record match instead of reading `fail`.
-    Some(run_gathered(
-        &nested,
-        &mut *io.out,
-        &mut *io.err,
-        now_secs,
-        degraded,
-    ))
+    // stages and failing items back lets the outer record match instead of
+    // reading `fail` (or overwriting the continuation's cause with its own).
+    let status = run_gathered(&nested, &mut *io.out, &mut *io.err, now_secs, degraded);
+    inputs.failures.replace(gathered.failures.take());
+    Some(status)
 }
 
 /// Hand the rest of this `dot update` to the release binary the Tools stage
@@ -2684,8 +2886,8 @@ fn release_handoff(
     }
     let mut args = vec![OsString::from("update")];
     args.extend(inputs.original_args.iter().cloned());
-    let cron_state = inputs.flags.cron.then(|| PathBuf::from(inputs.state_home));
-    let handoff = crate::handoff::Handoff::new(binary, args, env, cron_state);
+    let record = (PathBuf::from(inputs.state_home), trigger(inputs));
+    let handoff = crate::handoff::Handoff::new(binary, args, env, Some(record));
     if !inputs.runtime.request_exec(handoff) {
         return None;
     }
@@ -2855,6 +3057,7 @@ pub struct Gathered {
     config_warned: std::cell::RefCell<Vec<String>>,
     data_warned: std::cell::RefCell<Vec<crate::unknown_keys::DataKey>>,
     hold_warned: std::cell::Cell<bool>,
+    failures: std::cell::RefCell<crate::update_status::Failures>,
     handed_warnings: BTreeSet<String>,
     flags: UpdateFlags,
     args: Vec<std::ffi::OsString>,
@@ -2904,6 +3107,7 @@ impl Gathered {
             config_warned: &self.config_warned,
             data_warned: &self.data_warned,
             hold_warned: &self.hold_warned,
+            failures: &self.failures,
             handed_warnings: &self.handed_warnings,
             flags: self.flags,
             original_args: &self.args,
@@ -3159,6 +3363,7 @@ fn gather(
         ),
         data_warned: std::cell::RefCell::new(Vec::new()),
         hold_warned: std::cell::Cell::new(false),
+        failures: std::cell::RefCell::new(crate::update_status::Failures::default()),
         handed_warnings: handed_warnings(env.get(OsStr::new(WARNED_ENV)).map(OsString::as_os_str)),
         flags,
         args: args.to_vec(),
@@ -3333,7 +3538,12 @@ pub fn run_update(
         Ok(gathered) => gathered,
         Err(error) => {
             error.write(streams.stderr);
-            record_continuation_failure(continuation, request.args, request.state_home);
+            record_continuation_failure(
+                continuation,
+                request.args,
+                request.state_home,
+                "the updated dot could not prepare the rest of the run",
+            );
             return error.code();
         }
     };
@@ -3420,6 +3630,18 @@ fn run_gathered(
             crate::update_status::Trigger::Cron,
             crate::update_status::Degraded::default(),
         );
+        // The edited files are the cause; doctor names them beside the skip.
+        let mut edits = crate::update_status::Failures::default();
+        for file in &files {
+            edits.push(crate::update_status::STAGE_DIRTY, file, "");
+        }
+        crate::update_status::record_last_failure(
+            Path::new(inputs.state_home),
+            now_secs,
+            crate::update_status::OUTCOME_SKIP,
+            crate::update_status::Trigger::Cron,
+            &edits,
+        );
         warn_row(
             err,
             inputs.palette,
@@ -3473,6 +3695,20 @@ fn run_gathered(
         trigger(inputs),
         *degraded,
     );
+    // The cause travels in its own record (older readers of the last-run
+    // stamp reject anything but words). A clean run removes it: doctor would
+    // ignore it once the epochs differ, but it may hold output lines.
+    if outcome == OUTCOME_OK {
+        crate::update_status::clear_last_failure(state_home);
+    } else {
+        crate::update_status::record_last_failure(
+            state_home,
+            now_secs,
+            outcome,
+            trigger(inputs),
+            &inputs.failures.borrow(),
+        );
+    }
     rc
 }
 
@@ -3541,6 +3777,7 @@ fn run_gathered_inner(
         Err(failure) => {
             let _ = err.write_all(failure.line().as_bytes());
             let _ = err.write_all(b"\n");
+            inputs.fail(crate::update_status::STAGE_UPDATE, "config", failure.line());
             let close = crate::progress_ui::done(
                 inputs.palette,
                 quiet(inputs),

@@ -100,6 +100,7 @@ pub fn run(
             crate::update_engine::is_continuation(runtime),
             request.args,
             &state,
+            "the updated dot could not re-enter the update lock",
         );
     }
     let guard = match acquired {
