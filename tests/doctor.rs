@@ -1034,6 +1034,17 @@ fn init_client(home: &TempDir, state: &TempDir, origin: &Path) {
 /// can execute; no such root is a test-environment error, not a pass. The
 /// wrapper execs the real Git directly, never a developer launcher.
 fn host_git_wrapper(label: &str) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    host_git_wrapper_running(label, "")
+}
+
+/// [`host_git_wrapper`] that runs the shell `snippet` (after logging, before
+/// the real Git) on every call. The wrapper must live outside the fixture
+/// `HOME` and the Dot checkout: doctor's host-Git selection skips any `git`
+/// under either, as client-provided launchers.
+fn host_git_wrapper_running(
+    label: &str,
+    snippet: &str,
+) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
     let checkout = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("checkout");
     let real = dot_test_support::real_tool("git");
     for exec_root in [false, true] {
@@ -1051,7 +1062,7 @@ fn host_git_wrapper(label: &str) -> (TempDir, std::path::PathBuf, std::path::Pat
         std::fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\n{snippet}exec '{}' \"$@\"\n",
                 log.display(),
                 real.display()
             ),
@@ -1059,13 +1070,31 @@ fn host_git_wrapper(label: &str) -> (TempDir, std::path::PathBuf, std::path::Pat
         .expect("git wrapper");
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
             .expect("wrapper mode");
-        // A `noexec` mount refuses to run it: try the next root.
-        let probe = Command::new(&wrapper)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // A `noexec` mount refuses to run it: try the next root. The probe
+        // asks for `--exec-path`, which no snippet reacts to. A sibling test
+        // thread that forks while this one still has the file open for
+        // writing makes exec fail with ETXTBSY until that child execs, and a
+        // saturated host can refuse the fork (EAGAIN); both transient
+        // refusals are retried, never read as `noexec`.
+        let mut attempts = 0;
+        let probe = loop {
+            let probe = Command::new(&wrapper)
+                .arg("--exec-path")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            match probe {
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::ETXTBSY | libc::EAGAIN))
+                        && attempts < 100 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                probe => break probe,
+            }
+        };
         if probe.is_ok_and(|status| status.success()) {
             let _ = std::fs::remove_file(&log);
             return (dir, wrapper, log);
@@ -4002,25 +4031,19 @@ fn directly_sourced_module_failure_names_the_module_line() {
     );
 }
 
-/// A `git` in front of the real one: its `--version` probe (one of the first
-/// core checks) waits up to 20s for the extension's start marker and records
-/// whether the extension was already running.
-fn version_probe_waiting_for_extension(bin: &Path, home: &Path) {
-    let real = dot_test_support::real_tool("git");
-    let script = format!(
-        "#!/bin/sh\n\
-         if [ \"$1\" = --version ]; then\n\
+/// The shell snippet for [`host_git_wrapper_running`] that holds the
+/// `--version` probe (one of the first core checks) for up to 20s, until
+/// `marker` exists, then records in `observed` whether it appeared.
+fn version_probe_waiting_for(marker: &Path, observed: &Path) -> String {
+    format!(
+        "if [ \"$1\" = --version ]; then\n\
            i=0\n\
-           while [ ! -e '{home}/extension-started' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done\n\
-           if [ -e '{home}/extension-started' ]; then echo concurrent; else echo serial; fi > '{home}/core-observed'\n\
-         fi\n\
-         exec '{real}' \"$@\"\n",
-        home = home.display(),
-        real = real.display(),
-    );
-    std::fs::create_dir_all(bin).expect("bin");
-    std::fs::write(bin.join("git"), script).expect("git wrapper");
-    seal(&bin.join("git"), 0o755);
+           while [ ! -e '{marker}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done\n\
+           if [ -e '{marker}' ]; then echo concurrent; else echo serial; fi > '{observed}'\n\
+         fi\n",
+        marker = marker.display(),
+        observed = observed.display(),
+    )
 }
 
 /// P2: extensions start alongside the core checks, not after them, and their
@@ -4033,11 +4056,16 @@ fn extensions_run_while_the_core_checks_run() {
             .to_vec(),
     );
     let (home, state) = doctor_extension_fixture("concurrent", &[extension]);
-    let bin = home.path().join("bin");
-    version_probe_waiting_for_extension(&bin, home.path());
+    let (wrappers, _wrapper, _log) = host_git_wrapper_running(
+        "doctor-concurrent-git",
+        &version_probe_waiting_for(
+            &home.path().join("extension-started"),
+            &home.path().join("core-observed"),
+        ),
+    );
     let path = format!(
         "{}:{}",
-        bin.display(),
+        wrappers.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
     let output = command(false, &home, &state, &[("PATH", &path)])
@@ -4134,34 +4162,32 @@ fn finished_extensions_keep_the_cores_overlay_probe_answers() {
     // A logging Git whose `--version` probe (an early core check, before
     // the overlay rows) holds the core until the extension has finished, so
     // the extension's worker always completes while the core still runs.
-    let bin = home.path().join("bin");
-    std::fs::create_dir_all(&bin).expect("bin");
-    let log = home.path().join("git.log");
-    let wrapper = format!(
-        "#!/bin/sh\n\
-         printf '%s\\n' \"$*\" >>'{log}'\n\
-         if [ \"$1\" = --version ]; then\n\
-           i=0\n\
-           while [ ! -e '{home}/extension-done' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done\n\
-           sleep 1\n\
-         fi\n\
-         exec '{real}' \"$@\"\n",
-        log = log.display(),
-        home = home.path().display(),
-        real = dot_test_support::real_tool("git").display(),
+    let done = home.path().join("extension-done");
+    let (wrappers, _wrapper, log) = host_git_wrapper_running(
+        "doctor-probe-cache-git",
+        &format!(
+            "if [ \"$1\" = --version ]; then\n\
+               i=0\n\
+               while [ ! -e '{done}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done\n\
+               sleep 1\n\
+             fi\n",
+            done = done.display(),
+        ),
     );
-    std::fs::write(bin.join("git"), wrapper).expect("git wrapper");
-    seal(&bin.join("git"), 0o755);
     let path = format!(
         "{}:{}",
-        bin.display(),
+        wrappers.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
     let output = command(false, &home, &state, &[("PATH", &path)])
         .output()
         .expect("doctor");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("probe: cloned"), "{stdout}");
+    // The healthy overlay folds into one row (cloned, origin, current).
+    assert!(
+        stdout.contains("  ✓ probe (~/.dotfiles-probe, "),
+        "{stdout}"
+    );
     assert!(stdout.contains("quick extension ran"), "{stdout}");
     let calls = std::fs::read_to_string(&log).expect("git log");
     let probes = |needle: &str| {
