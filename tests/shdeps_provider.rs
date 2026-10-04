@@ -1084,7 +1084,12 @@ if stream:
             os.write(descriptor, b"x" * 8192)
     except BrokenPipeError:
         raise SystemExit(0)
-time.sleep(max(0.0, deadline - time.monotonic()))
+# A test that must outlast Dot's teardown gives the holder a long lifetime,
+# then asks it to leave through this file once it has made its assertions:
+# portable cleanup has no stable authority to signal it.
+stop = os.environ.get("DOT_TEST_PROVIDER_ESCAPE_STOP")
+while time.monotonic() < deadline and not (stop and os.path.exists(stop)):
+    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
 "#,
         );
         helper
@@ -5326,11 +5331,13 @@ const PREPARATION_HOLDER_LIFETIME: &str = "120";
 fn assert_preparation_handles_escaped_stderr(stage: &str) {
     let rust = Fixture::new(&format!("shdeps-{stage}-escaped-stderr"));
     let pid_file = rust.home.join("escaped-preparation-stderr-pid");
+    let stop_file = rust.home.join("escaped-preparation-stderr-stop");
     let helper = rust.escaped_output_helper();
     let mut command = rust.command();
     command
         .env("DOT_TEST_PROVIDER_ESCAPE_HELPER", helper)
         .env("DOT_TEST_PROVIDER_ESCAPE_PID", &pid_file)
+        .env("DOT_TEST_PROVIDER_ESCAPE_STOP", &stop_file)
         .env(
             "DOT_TEST_PROVIDER_ESCAPE_LIFETIME",
             PREPARATION_HOLDER_LIFETIME,
@@ -5395,6 +5402,10 @@ fn assert_preparation_handles_escaped_stderr(stage: &str) {
         "Dot did not finish after escaped {stage} stderr holder"
     );
     let escaped_live = escaped.live_in_owned_session();
+    // Portable cleanup leaves the holder running by design and the test
+    // process cannot signal it without stable authority, so it is asked to
+    // exit instead; on Linux Dot has already reaped it.
+    std::fs::write(&stop_file, b"stop").expect("ask escaped holder to exit");
     let stopped = escaped.stop();
     while stdout.is_none() || stderr.is_none() {
         let (is_stdout, bytes) = output_receiver
@@ -5456,6 +5467,59 @@ fn provider_bootstrap_fails_closed_for_escaped_stderr() {
 #[test]
 fn provider_download_fails_closed_for_escaped_stderr() {
     assert_preparation_handles_escaped_stderr("download");
+}
+
+// The preparation tests rely on this on platforms where neither Dot nor the
+// test may signal the escaped holder (macOS): with a lifetime far beyond the
+// test, the holder must still leave promptly once its stop file appears.
+#[test]
+fn escaped_output_holder_exits_when_asked_to_stop() {
+    let rust = Fixture::new("escaped-holder-stop");
+    let pid_file = rust.home.join("escaped-holder-pid");
+    let stop_file = rust.home.join("escaped-holder-stop");
+    let mut holder = Command::new(rust.escaped_output_helper())
+        .env("DOT_TEST_PROVIDER_ESCAPE_PID", &pid_file)
+        .env("DOT_TEST_PROVIDER_ESCAPE_STOP", &stop_file)
+        .env(
+            "DOT_TEST_PROVIDER_ESCAPE_LIFETIME",
+            PREPARATION_HOLDER_LIFETIME,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn escaped holder");
+    let published = wait_for_pid(&pid_file, 10);
+    if published.is_none() {
+        let _ = holder.kill();
+        let _ = holder.wait();
+        panic!("escaped holder did not publish its pid");
+    }
+    assert_eq!(
+        holder.try_wait().expect("poll escaped holder"),
+        None,
+        "escaped holder exited before it was asked to"
+    );
+
+    std::fs::write(&stop_file, b"stop").expect("ask escaped holder to exit");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = holder.try_wait().expect("poll escaped holder") {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    if status.is_none() {
+        let _ = holder.kill();
+        let _ = holder.wait();
+    }
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "escaped holder ignored its stop file: {status:?}"
+    );
 }
 
 #[test]
