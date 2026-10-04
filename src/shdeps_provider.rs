@@ -1531,6 +1531,7 @@ fn run_update(
     let mut session = crate::shdeps_ui_render::reset(false);
     let mut live = false;
     let mut pending = Vec::new();
+    let mut staged_events = Vec::new();
     let mut deferred_stdout = Vec::new();
     let mut final_stderr = Vec::new();
     let mut drain_state = ProviderDrainState {
@@ -1558,6 +1559,7 @@ fn run_update(
             let stdout = &mut stdout;
             let stderr_reader = &mut stderr_reader;
             let pending = &mut pending;
+            let staged_events = &mut staged_events;
             let deferred_stdout = &mut deferred_stdout;
             let final_stderr = &mut final_stderr;
             let drain_state = &mut drain_state;
@@ -1634,7 +1636,8 @@ fn run_update(
                         }
                         return result;
                     }
-                    let result = drain_provider_streams(
+                    let result = live_provider_pass(
+                        staged_events,
                         stdout,
                         pending,
                         stderr_reader,
@@ -1798,48 +1801,43 @@ fn run_update(
         return failed_output();
     }
     let final_stdout = if interrupted.is_none() {
-        let deferred = consume_provider_bytes(
-            &mut pending,
-            &deferred_stdout,
-            false,
-            PROVIDER_FRAME_LIMIT_BYTES,
-            |line| {
-                provider_line(
-                    line,
-                    &mut state,
-                    &mut session,
-                    stage,
-                    inputs,
-                    &mut bounded_live_out,
-                    &mut live,
-                    prompt.as_ref().map(|pipe| pipe.path.as_path()),
-                    &mut remaining_events,
-                    beat,
-                )
-            },
-        );
-        deferred.and_then(|()| {
-            drain_provider_output(
-                &mut stdout,
-                &mut pending,
-                true,
-                &mut drain_state.remaining_bytes,
-                |line| {
-                    provider_line(
-                        line,
-                        &mut state,
-                        &mut session,
-                        stage,
-                        inputs,
-                        &mut bounded_live_out,
-                        &mut live,
-                        prompt.as_ref().map(|pipe| pipe.path.as_path()),
-                        &mut remaining_events,
-                        beat,
-                    )
-                },
+        let mut interpret = |line| {
+            provider_line(
+                line,
+                &mut state,
+                &mut session,
+                stage,
+                inputs,
+                &mut bounded_live_out,
+                &mut live,
+                prompt.as_ref().map(|pipe| pipe.path.as_path()),
+                &mut remaining_events,
+                beat,
             )
-        })
+        };
+        // Events staged by the last live pass precede the final drain's bytes;
+        // the normal exit status now proves they may be interpreted.
+        std::mem::take(&mut staged_events)
+            .into_iter()
+            .try_for_each(&mut interpret)
+            .and_then(|()| {
+                consume_provider_bytes(
+                    &mut pending,
+                    &deferred_stdout,
+                    false,
+                    PROVIDER_FRAME_LIMIT_BYTES,
+                    &mut interpret,
+                )
+            })
+            .and_then(|()| {
+                drain_provider_output(
+                    &mut stdout,
+                    &mut pending,
+                    true,
+                    &mut drain_state.remaining_bytes,
+                    &mut interpret,
+                )
+            })
     } else {
         Ok(())
     };
@@ -2173,6 +2171,54 @@ fn drain_provider_streams(
         state.failed = true;
     }
     result
+}
+
+/// One live supervisor pass over the provider streams.
+///
+/// Interprets only the events staged by the previous pass, then stages the
+/// complete events read now. `supervise_child` polls the provider's exit
+/// before every live tick, so a staged event is interpreted only after a
+/// later poll found the provider still running. Interpreting events read in
+/// this pass instead would race that poll: a provider can queue a complete
+/// prompt and exit with `128+signal` between the poll and the read, and
+/// acknowledging that prompt could release work after cancellation. Events
+/// still staged when the provider exits are left for the caller, which
+/// interprets them only after recognizing a non-interruption status.
+#[allow(clippy::too_many_arguments)]
+fn live_provider_pass(
+    staged: &mut Vec<Vec<u8>>,
+    stdout: &mut CaptureStream,
+    pending: &mut Vec<u8>,
+    stderr: &mut CaptureStream,
+    final_pass: bool,
+    stderr_output: &mut dyn std::io::Write,
+    state: &mut ProviderDrainState,
+    mut consume: impl FnMut(Vec<u8>) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let ready = std::mem::take(staged);
+    let released = if state.failed {
+        Ok(())
+    } else {
+        ready.into_iter().try_for_each(&mut consume)
+    };
+    if released.is_err() {
+        // Like a failed in-pass event: never replay the rest, but keep
+        // draining both sockets so provider teardown cannot block on them.
+        state.failed = true;
+    }
+    let drained = drain_provider_streams(
+        stdout,
+        pending,
+        stderr,
+        final_pass,
+        stderr_output,
+        state,
+        |line| {
+            staged.push(line);
+            Ok(())
+        },
+    );
+    released.and(drained)
 }
 
 fn drain_provider_output(
@@ -2841,7 +2887,7 @@ mod tests {
         CaptureStream, EnsureFailure, Inputs, LimitedWriter, PROVIDER_OUTPUT_LIMIT_ERROR,
         ProviderDrainState, Ready, classify_download_deadline, consume_provider_bytes,
         download_installer, drain_capture_streams, drain_provider_output, drain_provider_streams,
-        handle_event, interruptible_delay, run_update,
+        handle_event, interruptible_delay, live_provider_pass, run_update,
     };
 
     fn render_event(line: &str) -> Vec<u8> {
@@ -3818,6 +3864,236 @@ mod tests {
         .expect("discard after relay failure");
         assert!(replayed.is_empty(), "failed events were replayed");
         assert!(pending.is_empty(), "failed relay retained pending events");
+    }
+
+    /// Poll until `pid` (a direct child of this test process) has exited,
+    /// without reaping it, so the supervisor's own poll still owns the reap.
+    fn wait_for_unreaped_exit(pid: libc::pid_t) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // SAFETY: siginfo is a zeroed local; WNOWAIT leaves the child
+            // for its owning supervisor to reap.
+            let exited = unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                let result = libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                );
+                assert!(
+                    result == 0
+                        || std::io::Error::last_os_error().kind()
+                            == std::io::ErrorKind::Interrupted,
+                    "could not observe provider {pid}: {}",
+                    std::io::Error::last_os_error()
+                );
+                result == 0 && info.si_pid() != 0
+            };
+            if exited {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "provider {pid} did not exit after its release"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn live_pass_defers_an_event_published_with_exit_after_the_poll() {
+        let scratch = dot_test_support::TempDir::new("provider-live-pass-exit").expect("scratch");
+        let pid_file = scratch.path().join("pid");
+        let release = scratch.path().join("release");
+        let mut stdout = CaptureStream::new().expect("stdout capture");
+        let mut stderr = CaptureStream::new().expect("stderr capture");
+        let mut command = std::process::Command::new(dot_test_support::bash());
+        command
+            .args([
+                "-c",
+                "printf '%s\\n' \"$$\" >\"$1.tmp\"; mv \"$1.tmp\" \"$1\"; until [[ -e $2 ]]; do sleep 0.01; done; printf '%s\\n' prompt; exit 130",
+                "provider-live-pass-exit",
+            ])
+            .arg(&pid_file)
+            .arg(&release)
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout.child_stdio().expect("stdout writer"))
+            .stderr(stderr.child_stdio().expect("stderr writer"));
+        let mut pending = Vec::new();
+        let mut staged = Vec::new();
+        let mut deferred = Vec::new();
+        let mut interpreted = Vec::new();
+        let mut drain_state = ProviderDrainState {
+            remaining_bytes: 1024,
+            failed: false,
+        };
+        let mut released = false;
+
+        let end = crate::cleanup::supervise_child(command, None, |final_pass| {
+            if final_pass {
+                return stdout.drain_snapshot(&mut deferred, true);
+            }
+            if !released {
+                // The supervisor has just polled the provider as running.
+                // Publish a complete event and the exit before this tick
+                // reads, which is the window a SIGSTOP or preemption opens.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let pid = loop {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                        break text.trim().parse::<libc::pid_t>().expect("provider pid");
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "provider did not publish its pid"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                };
+                std::fs::write(&release, b"").expect("release provider");
+                wait_for_unreaped_exit(pid);
+                released = true;
+            }
+            live_provider_pass(
+                &mut staged,
+                &mut stdout,
+                &mut pending,
+                &mut stderr,
+                false,
+                &mut std::io::sink(),
+                &mut drain_state,
+                |line| {
+                    interpreted.push(line);
+                    Ok(())
+                },
+            )
+        })
+        .expect("supervise provider");
+
+        assert!(
+            matches!(&end, crate::cleanup::SessionEnd::Exited(status) if status.code() == Some(130)),
+            "provider did not report its interruption status: {end:?}"
+        );
+        assert!(
+            interpreted.is_empty(),
+            "a live pass interpreted an event published with the provider exit: {interpreted:?}"
+        );
+        assert_eq!(staged, [b"prompt\n".to_vec()]);
+        assert!(deferred.is_empty(), "final drain saw {deferred:?}");
+    }
+
+    #[test]
+    fn live_pass_interprets_staged_events_on_the_next_pass() {
+        let (stdout_reader, mut stdout_writer) =
+            std::os::unix::net::UnixStream::pair().expect("stdout capture pair");
+        stdout_reader
+            .set_nonblocking(true)
+            .expect("nonblocking stdout capture");
+        let mut stdout = CaptureStream {
+            reader: stdout_reader,
+            writer: None,
+        };
+        let mut stderr = CaptureStream::new().expect("stderr capture");
+        let mut pending = Vec::new();
+        let mut staged = Vec::new();
+        let mut drain_state = ProviderDrainState {
+            remaining_bytes: 1024,
+            failed: false,
+        };
+        let mut interpreted = Vec::new();
+        stdout_writer
+            .write_all(b"first\nsecond\npart")
+            .expect("stdout events");
+
+        live_provider_pass(
+            &mut staged,
+            &mut stdout,
+            &mut pending,
+            &mut stderr,
+            false,
+            &mut std::io::sink(),
+            &mut drain_state,
+            |line| {
+                interpreted.push(line);
+                Ok(())
+            },
+        )
+        .expect("first live pass");
+        assert!(interpreted.is_empty(), "same-pass events were interpreted");
+
+        stdout_writer.write_all(b"ial\n").expect("stdout tail");
+        live_provider_pass(
+            &mut staged,
+            &mut stdout,
+            &mut pending,
+            &mut stderr,
+            false,
+            &mut std::io::sink(),
+            &mut drain_state,
+            |line| {
+                interpreted.push(line);
+                Ok(())
+            },
+        )
+        .expect("second live pass");
+
+        assert_eq!(interpreted, [b"first\n".to_vec(), b"second\n".to_vec()]);
+        assert_eq!(staged, [b"partial\n".to_vec()]);
+    }
+
+    #[test]
+    fn live_pass_failure_drops_staged_events_and_keeps_draining() {
+        let (stdout_reader, mut stdout_writer) =
+            std::os::unix::net::UnixStream::pair().expect("stdout capture pair");
+        stdout_reader
+            .set_nonblocking(true)
+            .expect("nonblocking stdout capture");
+        let mut stdout = CaptureStream {
+            reader: stdout_reader,
+            writer: None,
+        };
+        let (stderr_reader, mut stderr_writer) =
+            std::os::unix::net::UnixStream::pair().expect("stderr capture pair");
+        stderr_reader
+            .set_nonblocking(true)
+            .expect("nonblocking stderr capture");
+        let mut stderr = CaptureStream {
+            reader: stderr_reader,
+            writer: None,
+        };
+        let mut pending = Vec::new();
+        let mut staged = vec![b"first\n".to_vec(), b"second\n".to_vec()];
+        let mut drain_state = ProviderDrainState {
+            remaining_bytes: 1024,
+            failed: false,
+        };
+        stdout_writer.write_all(b"third\n").expect("stdout event");
+        stderr_writer
+            .write_all(b"cleanup diagnostic\n")
+            .expect("stderr event");
+        let mut interpreted = Vec::new();
+
+        let error = live_provider_pass(
+            &mut staged,
+            &mut stdout,
+            &mut pending,
+            &mut stderr,
+            false,
+            &mut PanicWriter,
+            &mut drain_state,
+            |line| {
+                interpreted.push(line);
+                Err(std::io::Error::other("closed output"))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "closed output");
+        assert!(drain_state.failed);
+        assert_eq!(interpreted, [b"first\n".to_vec()]);
+        assert!(staged.is_empty(), "failed pass retained staged events");
+        assert!(pending.is_empty(), "failed pass retained a partial event");
+        assert_capture_empty(&mut stdout);
+        assert_capture_empty(&mut stderr);
     }
 
     #[test]
