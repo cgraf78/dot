@@ -182,11 +182,14 @@ _dot_hook_platform() {
   printf '%s\n' "$value"
 }
 
+# The kernel host name cut at its first dot: what the engine reads through
+# gethostname(2), so hooks and profile selection agree on every host, including
+# minimal images that ship no `hostname` binary.
 _dot_hook_host() {
   local value
 
-  value=$(hostname -s 2>/dev/null || hostname 2>/dev/null) || return 1
-  _dot_hook_lower "$value"
+  value=$(uname -n 2>/dev/null) || return 1
+  _dot_hook_lower "${value%%.*}"
   printf '%s\n' "$REPLY"
 }
 

@@ -6,6 +6,11 @@
 # cannot drift from publication while mutation/coordinator internals stay out
 # of the client process.
 
+# Overlay checkouts whose Git identity this worker already verified, as
+# newline-framed `name|path|url` records. Assigned at source time so the
+# environment cannot seed it.
+_dot_extension_verified_checkouts=$'\n'
+
 _dot_extension_stat_fields() {
   local path=$1 output
 
@@ -103,7 +108,7 @@ _dot_extension_owned_parent_components_validate() {
 }
 
 _dot_extension_symlink_authorized() {
-  local path=$1 rel line owner='' target='' entry name overlay_path url sync
+  local path=$1 rel line owner='' target='' entry name overlay_path url sync verified
   local source_root resolved expected REPLY_REL REPLY_OWNER REPLY_TARGET
 
   if [[ $HOME == / ]]; then
@@ -136,7 +141,18 @@ _dot_extension_symlink_authorized() {
     [[ $name == "$owner" ]] || continue
     sync=${sync:-git}
     [[ $sync == git ]] || return 1
-    _overlay_checkout_matches "$overlay_path" "$url" || return 1
+    # The identity probe costs two Git processes, and an extension that
+    # sources several support files from one overlay used to pay them for
+    # every file. Verify each checkout once per worker; the stat checks
+    # below still run for every file.
+    verified=$name'|'$overlay_path'|'$url$'\n'
+    case $_dot_extension_verified_checkouts in
+      *$'\n'"$verified"*) ;;
+      *)
+        _overlay_checkout_matches "$overlay_path" "$url" || return 1
+        _dot_extension_verified_checkouts+=$verified
+        ;;
+    esac
     [[ -d $overlay_path && ! -L $overlay_path ]] || return 1
     _dot_extension_directory_stat "$overlay_path" || return 1
     [[ -d $overlay_path/home && ! -L $overlay_path/home ]] || return 1

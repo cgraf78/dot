@@ -346,7 +346,7 @@ fn chomp_newlines(mut output: Vec<u8>) -> Vec<u8> {
 /// home (and, under a `legacy` key prefix, [`legacy_client_valid`]
 /// verdicts by Git directory identity plus home). Dispatch validates the base client before running the
 /// command, and `update` gather validates it again before the pull
-/// phase; each validation is up to five supervised `git` probes
+/// phase; each validation is up to three supervised `git` probes
 /// against unchanging state, so the second call shares the first
 /// answer. Only TRUE pins: a mismatch re-probes, so a checkout
 /// converging mid-run (staged clone landing between phases) is
@@ -499,7 +499,7 @@ mod tests {
             std::fs::write(
                 &shim,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\ncase \"$3\" in\n  config)\n    case \"$4\" in\n      --get-all) printf '%s\\n' \"{CANNED_URL}\";;\n      --bool) printf 'false\\n';;\n      *) printf '%s\\n' \"{worktree}\";;\n    esac;;\n  symbolic-ref) printf '%s\\n' \"{branch}\";;\n  rev-parse) printf '%s\\n' \"{CANNED_HEAD}\";;\nesac\n",
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\ncase \"$3\" in\n  config) printf 'remote.origin.url\\n%s\\000core.bare\\nfalse\\000core.worktree\\n%s\\000' \"{CANNED_URL}\" \"{worktree}\";;\n  rev-parse) printf '%s\\n%s\\n' \"{CANNED_HEAD}\" \"{branch}\";;\nesac\n",
                     log = log.display(),
                 ),
             )
@@ -684,7 +684,8 @@ mod tests {
             assert!(client_matches(&record, &git.home));
             assert!(client_matches(&record, &git.home));
         });
-        assert_eq!(git.invocations(), 5);
+        // One config read plus one HEAD read.
+        assert_eq!(git.invocations(), 2);
     }
 
     #[test]
@@ -720,7 +721,7 @@ mod tests {
         crate::init_client_identity::with_host_git(git.shim.as_path(), || {
             assert!(client_matches(&record, &git.home));
         });
-        assert_eq!(git.invocations(), 5);
+        assert_eq!(git.invocations(), 2);
         drop(cache_still);
         cleared
             .recv_timeout(std::time::Duration::from_secs(30))
@@ -744,8 +745,8 @@ mod tests {
             assert!(client_matches(&second_record, &second.home));
             assert!(client_matches(&second_record, &second.home));
         });
-        assert_eq!(first.invocations(), 5);
-        assert_eq!(second.invocations(), 5);
+        assert_eq!(first.invocations(), 2);
+        assert_eq!(second.invocations(), 2);
     }
 
     #[test]
@@ -756,11 +757,11 @@ mod tests {
         let record = git.record("main");
         crate::init_client_identity::with_host_git(git.shim.as_path(), || {
             assert!(client_matches(&record, &git.home));
-            assert_eq!(git.invocations(), 5);
+            assert_eq!(git.invocations(), 2);
             invalidate_client_match_cache();
             assert!(client_matches(&record, &git.home));
         });
-        assert_eq!(git.invocations(), 10);
+        assert_eq!(git.invocations(), 4);
     }
 
     #[test]

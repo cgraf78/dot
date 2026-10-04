@@ -26,7 +26,9 @@ pub const USAGE: &str = "usage: dot doctor [-h|--help]
 Run the core health checks, then every configured doctor.d extension, and
 report each finding. Exits 1 when a check fails or an extension fails, times
 out, or is refused, and 2 for an argument doctor does not take; warnings do
-not change the exit status.
+not change the exit status. A client or overlay repository status check
+whose Git does not answer within 30 seconds is stopped and reported as a
+warning.
 
   -h, --help  print this usage
 
@@ -95,7 +97,7 @@ fn run_configured(
         Ok(constants) => constants,
         Err(_) => return 1,
     };
-    let Some(euid) = current_uid(runtime) else {
+    let Some(euid) = crate::temp::current_uid() else {
         return 1;
     };
     let base = match crate::repos_base::select(runtime, &home, &state, streams.stderr) {
@@ -112,6 +114,18 @@ fn run_configured(
         stdout_terminal,
         runtime.value("NO_COLOR").and_then(OsStr::to_str),
     );
+    // Extensions depend only on the resolved overlays and trust inputs
+    // above, so they start now and run alongside the core checks instead of
+    // after them; their rows are still filed after every core row.
+    let mut extension_phase = ExtensionPhase::start(ExtensionJob {
+        runtime: runtime.clone(),
+        config: config.clone(),
+        euid,
+        overlays: overlays.active.clone(),
+        overlays_unresolved: overlays.discovery_error.is_some(),
+        manifest: constants.overlay_manifest.clone(),
+        palette: palette.clone(),
+    });
     let mut emit = Emitter::new(Recorder::new(), &palette, &mut *streams.stdout);
     let bash_required = crate::config::extensions_enabled(config)
         || config.provider == crate::config::Provider::Shdeps;
@@ -278,15 +292,7 @@ fn run_configured(
     );
     emit.emit();
 
-    let extension_status = extensions(
-        runtime,
-        config,
-        euid,
-        &overlays.active,
-        overlays.discovery_error.is_some(),
-        &constants.overlay_manifest,
-        &mut emit,
-    );
+    let (extension_status, extension_counts) = extension_phase.finish(&mut emit);
     // Cancellation owns the final status at the CLI boundary. Do not render a
     // normal report after an interrupted extension is reaped; rows already
     // streamed stay visible so the interruption point is diagnosable.
@@ -298,7 +304,12 @@ fn run_configured(
         return 1;
     }
     let recorder = emit.finish();
-    let counts = recorder.counts();
+    let core_counts = recorder.counts();
+    let counts = crate::doctor_runtime::Counts {
+        pass: core_counts.pass + extension_counts.pass,
+        warn: core_counts.warn + extension_counts.warn,
+        fail: core_counts.fail + extension_counts.fail,
+    };
     let summary = crate::doctor_coordinator::summary_line(counts.pass, counts.warn, counts.fail);
     let color = crate::doctor_coordinator::summary_color(counts.fail, counts.warn);
     if streams.stdout.write_all(b"\n").is_err()
@@ -320,6 +331,7 @@ struct Emitter<'a> {
     recorder: Recorder,
     emitted: usize,
     failed: bool,
+    unforwarded: Vec<u8>,
     palette: &'a crate::doctor_runtime::Palette,
     stdout: &'a mut dyn std::io::Write,
 }
@@ -334,6 +346,7 @@ impl<'a> Emitter<'a> {
             recorder,
             emitted: 0,
             failed: false,
+            unforwarded: Vec::new(),
             palette,
             stdout,
         }
@@ -351,14 +364,22 @@ impl<'a> Emitter<'a> {
     /// so a transient failure retries the same rows next time.
     fn emit(&mut self) {
         let pending = &self.recorder.records()[self.emitted..];
-        if pending.is_empty() {
-            return;
+        if !pending.is_empty() {
+            let bytes = crate::doctor_runtime::render(pending, self.palette);
+            if self.stdout.write_all(&bytes).is_ok() {
+                self.emitted = self.recorder.records().len();
+            } else {
+                self.failed = true;
+                return;
+            }
         }
-        let bytes = crate::doctor_runtime::render(pending, self.palette);
-        if self.stdout.write_all(&bytes).is_ok() {
-            self.emitted = self.recorder.records().len();
-        } else {
-            self.failed = true;
+        // Rows forwarded from the extension phase follow every filed row.
+        if !self.unforwarded.is_empty() {
+            if self.stdout.write_all(&self.unforwarded).is_ok() {
+                self.unforwarded.clear();
+            } else {
+                self.failed = true;
+            }
         }
     }
 
@@ -366,8 +387,212 @@ impl<'a> Emitter<'a> {
         self.failed
     }
 
+    /// Write rows another emitter already rendered, after this one's rows.
+    /// A failed write keeps them, and the next emit retries them after any
+    /// row still pending here, so the order never changes.
+    fn forward(&mut self, bytes: &[u8]) {
+        self.unforwarded.extend_from_slice(bytes);
+        self.emit();
+    }
+
     fn finish(self) -> Recorder {
         self.recorder
+    }
+}
+
+/// What the extension phase needs, owned so it can run on its own thread
+/// while the core checks run on the caller's.
+struct ExtensionJob {
+    runtime: crate::app::Runtime,
+    config: crate::config::Config,
+    euid: u32,
+    overlays: Vec<String>,
+    overlays_unresolved: bool,
+    manifest: String,
+    palette: crate::doctor_runtime::Palette,
+}
+
+impl ExtensionJob {
+    /// Run [`extensions`] for this job.
+    fn run(&self, abort: &AtomicBool, emit: &mut Emitter<'_>) -> i32 {
+        extensions(
+            &self.runtime,
+            &self.config,
+            self.euid,
+            &self.overlays,
+            self.overlays_unresolved,
+            &self.manifest,
+            abort,
+            emit,
+        )
+    }
+}
+
+/// Status and counts of a finished extension phase.
+struct ExtensionResult {
+    status: i32,
+    counts: crate::doctor_runtime::Counts,
+    failed: bool,
+}
+
+/// The doctor extension phase, started before the core checks.
+///
+/// The phase runs [`extensions`] unchanged on a thread of its own. Its
+/// rendered rows go to a channel instead of stdout; they wait there until
+/// the core checks finish, and then [`ExtensionPhase::finish`] writes them
+/// in order, still streaming the rows of extensions that are running.
+/// Stdout is byte-identical to running the phase after the core.
+///
+/// Cancellation and cleanup stay the dispatcher's: every extension session
+/// observes a received signal and is stopped and reaped by its own
+/// supervisor. Dropping an unfinished phase joins the thread, so no session
+/// outlives `dot doctor`: after a signal (the only early return once the
+/// phase starts) the sessions are already stopping, and while a core check
+/// panics the phase's abort flag stops them instead of waiting them out.
+///
+/// The phase runs inline, after the core checks as before, when the
+/// extension window is one job (`DOT_DOCTOR_JOBS=1` keeps a fully serial
+/// mode for debugging) or the thread cannot be spawned.
+enum ExtensionPhase {
+    Running {
+        output: std::sync::mpsc::Receiver<Vec<u8>>,
+        abort: std::sync::Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<ExtensionResult>>,
+    },
+    Inline(Box<ExtensionJob>),
+}
+
+impl ExtensionPhase {
+    fn start(job: ExtensionJob) -> Self {
+        if serial_extensions(&job.runtime) {
+            return ExtensionPhase::Inline(Box::new(job));
+        }
+        let (sender, output) = std::sync::mpsc::channel();
+        let abort = std::sync::Arc::new(AtomicBool::new(false));
+        let thread_abort = std::sync::Arc::clone(&abort);
+        // Thread-local bindings do not cross threads; carry the caller's
+        // pinned host Git like `dispatch_extensions` does for its workers.
+        let host_git = crate::init_client_identity::carry_host_git();
+        // Shared so a failed spawn (which drops the closure) gives it back.
+        let job = std::sync::Arc::new(std::sync::Mutex::new(Some(job)));
+        let thread_job = std::sync::Arc::clone(&job);
+        let spawned = std::thread::Builder::new()
+            .name("doctor-extensions".to_string())
+            .spawn(move || {
+                let _host_git = host_git.bind();
+                let job = thread_job
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("extension job is taken once");
+                let mut rows = RowChannel(sender);
+                let mut emit = Emitter::new(Recorder::new(), &job.palette, &mut rows);
+                let status = job.run(&thread_abort, &mut emit);
+                emit.emit();
+                let failed = emit.failed();
+                ExtensionResult {
+                    status,
+                    counts: emit.finish().counts(),
+                    failed,
+                }
+            });
+        let thread = match spawned {
+            Ok(thread) => thread,
+            Err(_) => {
+                let job = job
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("an unspawned thread never took the job");
+                return ExtensionPhase::Inline(Box::new(job));
+            }
+        };
+        ExtensionPhase::Running {
+            output,
+            abort,
+            thread: Some(thread),
+        }
+    }
+
+    /// Wait for the phase, writing its rows through `emit` after every row
+    /// `emit` already wrote, and return its status and counts.
+    fn finish(&mut self, emit: &mut Emitter<'_>) -> (i32, crate::doctor_runtime::Counts) {
+        let (output, thread) = match self {
+            ExtensionPhase::Running { output, thread, .. } => (output, thread),
+            // The old serial order: the core's own emitter and recorder,
+            // whose counts already include these rows.
+            ExtensionPhase::Inline(job) => {
+                let abort = AtomicBool::new(false);
+                let status = job.run(&abort, emit);
+                return (status, crate::doctor_runtime::Counts::default());
+            }
+        };
+        // The sender drops when the phase ends, closing the channel.
+        for rows in output.iter() {
+            emit.forward(&rows);
+        }
+        let thread = thread.take().expect("an extension phase finishes once");
+        let result = match thread.join() {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        if result.failed {
+            emit.failed = true;
+        }
+        (result.status, result.counts)
+    }
+}
+
+impl Drop for ExtensionPhase {
+    fn drop(&mut self) {
+        if let ExtensionPhase::Running {
+            output,
+            abort,
+            thread,
+        } = self
+        {
+            if let Some(thread) = thread.take() {
+                if std::thread::panicking() {
+                    // The dispatcher treats an abort without a worker panic
+                    // as a broken invariant and panics too; the caller is
+                    // already unwinding, so that payload is dropped below.
+                    abort.store(true, Ordering::SeqCst);
+                }
+                // Keep draining so the thread never waits on the channel.
+                for _ in output.iter() {}
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+/// Whether the extension window is one job by explicit setting
+/// (`DOT_DOCTOR_JOBS`, else `DOT_UPDATE_JOBS`, as [`extension_jobs`] reads
+/// them), without the CPU-count probe that an unset pair would need.
+fn serial_extensions(runtime: &crate::app::Runtime) -> bool {
+    let count = |name: &str| {
+        let value = text(runtime.value(name));
+        crate::merges::is_count(&value).then_some(value)
+    };
+    count("DOT_DOCTOR_JOBS")
+        .or_else(|| count("DOT_UPDATE_JOBS"))
+        .is_some_and(|jobs| jobs_count(&jobs) == 1)
+}
+
+/// The extension thread's stdout: each rendered batch becomes one message,
+/// written by the core's thread once the core rows are out.
+struct RowChannel(std::sync::mpsc::Sender<Vec<u8>>);
+
+impl std::io::Write for RowChannel {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .send(bytes.to_vec())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -401,7 +626,7 @@ fn resolve(
         discovery_silent: true,
         default_profile: Some(config.default_profile.clone()),
         user: current_user(runtime),
-        host: current_host(runtime),
+        host: current_host(),
         platform: current_platform(runtime),
         termux: prefix.contains("/com.termux/"),
         euid,
@@ -431,26 +656,40 @@ fn runtime_snapshot(
     } else {
         (Vec::new(), 0)
     };
-    let checkout_root = git_output(
-        runtime,
-        Path::new(source),
-        &["rev-parse", "--show-toplevel"],
-    )
-    .and_then(|root| std::fs::canonicalize(root).ok())
-    .map(|root| root.as_os_str().as_bytes().to_vec());
+    let release_root = release_root(Path::new(source));
+    // Only a development checkout is compared with its Git top level; a
+    // release is reported from its install metadata, so its probe would be
+    // a wasted child on every run.
+    let checkout_root = (!release_root)
+        .then(|| {
+            git_output(
+                runtime,
+                Path::new(source),
+                &["rev-parse", "--show-toplevel"],
+            )
+        })
+        .flatten()
+        .and_then(|root| std::fs::canonicalize(root).ok())
+        .map(|root| root.as_os_str().as_bytes().to_vec());
     let source_root = std::fs::canonicalize(source)
         .map(|path| path.as_os_str().as_bytes().to_vec())
         .unwrap_or_default();
     // Report the Git that Dot's own inspection children run.
-    let git_version = runtime
-        .git_program()
-        .and_then(|git| program_output(runtime, &git, &["--version"]));
+    let git_version = runtime.git_program().and_then(|git| {
+        program_output(
+            runtime,
+            &git,
+            &["--version"],
+            crate::cleanup::LingerPolicy::Detach,
+            crate::doctor_checks::probe_deadline(),
+        )
+    });
     RuntimeSnapshot {
         bash_version,
         bash_major,
         bash_required,
         checkout_root,
-        release_root: release_root(Path::new(source)),
+        release_root,
         source_raw: source.as_bytes().to_vec(),
         source_root,
         git_version,
@@ -861,6 +1100,7 @@ fn extensions(
     overlays: &[String],
     overlays_unresolved: bool,
     manifest: &str,
+    abort: &AtomicBool,
     emit: &mut Emitter<'_>,
 ) -> i32 {
     if !crate::config::extensions_enabled(config) {
@@ -941,7 +1181,6 @@ fn extensions(
     let worker = crate::hook_worker::Worker::with_doctor(runtime, root, bash.path().to_path_buf());
     let temporary = temporary_root(runtime);
     let timeout = extension_timeout(runtime);
-    let abort = AtomicBool::new(false);
     let execute = |spec: &crate::doctor_coordinator::Spec| {
         let mut launch = |call: &crate::doctor_orchestrator::WorkerInvocation<'_>| {
             // The deadline starts when the worker launches, not while it
@@ -954,7 +1193,7 @@ fn extensions(
                 call.result,
                 call.context,
                 call.token,
-                &abort,
+                abort,
                 deadline,
             );
             let _ = std::fs::write(call.log, &outcome.output);
@@ -979,7 +1218,7 @@ fn extensions(
     } else {
         1
     };
-    dispatch_extensions(&discovery.specs, jobs, &execute, &abort, emit).max(status)
+    dispatch_extensions(&discovery.specs, jobs, &execute, abort, emit).max(status)
 }
 
 /// Failure rows for refused doctor extensions. Links that are dangling or
@@ -1358,17 +1597,40 @@ fn command(runtime: &crate::app::Runtime, program: &Path) -> Command {
 }
 
 fn command_output(runtime: &crate::app::Runtime, program: &str, args: &[&str]) -> Option<Vec<u8>> {
-    program_output(runtime, &runtime.find_on_path(program)?, args)
+    // No deadline: the only caller is `id -un`, whose answer selects the
+    // profile. A slow directory service must not make doctor resolve a
+    // different profile than the unbounded lookup in `dot update`.
+    program_output(
+        runtime,
+        &runtime.find_on_path(program)?,
+        args,
+        crate::cleanup::LingerPolicy::Strict,
+        None,
+    )
 }
 
-fn program_output(runtime: &crate::app::Runtime, program: &Path, args: &[&str]) -> Option<Vec<u8>> {
+/// One read-only core probe with a captured, newline-trimmed stdout.
+///
+/// `linger` follows the supervisor's policy: Git builtins are deterministic
+/// leaf tools whose only possible stragglers are a wrapper's short
+/// telemetry helpers, so they detach on normal completion and skip the
+/// host-wide process-table walk a strict stop pays (on a busy host one walk
+/// costs about as much as the probe). Anything else stays strict. Both
+/// policies stop and reap the whole session on timeout or cancellation.
+fn program_output(
+    runtime: &crate::app::Runtime,
+    program: &Path,
+    args: &[&str],
+    linger: crate::cleanup::LingerPolicy,
+    deadline: Option<std::time::Instant>,
+) -> Option<Vec<u8>> {
     let mut command = command(runtime, program);
     command.args(args);
     let output = crate::cleanup::run_session_output(
         command,
-        None,
+        deadline,
         crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
-        crate::cleanup::LingerPolicy::Strict,
+        linger,
     )
     .ok()?;
     output.status.success().then(|| {
@@ -1380,11 +1642,13 @@ fn program_output(runtime: &crate::app::Runtime, program: &Path, args: &[&str]) 
     })
 }
 
-fn current_uid(runtime: &crate::app::Runtime) -> Option<u32> {
-    let output = command_output(runtime, "id", &["-u"])?;
-    String::from_utf8_lossy(&output).trim().parse().ok()
-}
-
+/// The login name, from `id -un` on the runtime's `PATH` like
+/// `dot update`'s profile resolution ([`crate::profiles::current_user`]).
+///
+/// This one stays a child process on purpose: released binaries are static
+/// musl builds, whose `getpwuid` reads only `/etc/passwd` (plus nscd when it
+/// runs), so a directory-service account (LDAP, sssd) would have no name and
+/// profile resolution would fail. `id` resolves names through the host's NSS.
 fn current_user(runtime: &crate::app::Runtime) -> Option<String> {
     let output = command_output(runtime, "id", &["-un"])?;
     Some(
@@ -1394,26 +1658,20 @@ fn current_user(runtime: &crate::app::Runtime) -> Option<String> {
     )
 }
 
-fn current_host(runtime: &crate::app::Runtime) -> Option<String> {
-    for args in [&["-s"][..], &[][..]] {
-        if let Some(output) = command_output(runtime, "hostname", args) {
-            let value = String::from_utf8_lossy(&output);
-            return Some(crate::platform::host_name(
-                value.trim_end_matches(['\r', '\n']),
-            ));
-        }
-    }
-    None
+/// The short host name, read the way `dot update` reads it
+/// ([`crate::platform::short_hostname`]) so both select the same profile.
+fn current_host() -> Option<String> {
+    crate::platform::short_hostname().map(|short| crate::platform::host_name(&short))
 }
 
+/// The platform name from the kernel name, with the runtime's WSL markers.
 fn current_platform(runtime: &crate::app::Runtime) -> Option<String> {
     let distro = text(runtime.value("WSL_DISTRO_NAME"));
     let interop = text(runtime.value("WSL_INTEROP"));
     let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok();
-    let output = command_output(runtime, "uname", &["-s"])?;
-    let value = String::from_utf8_lossy(&output);
+    let kernel = crate::platform::kernel_name()?;
     Some(crate::platform::platform_name(
-        value.trim_end_matches(['\r', '\n']),
+        &kernel,
         crate::platform::is_wsl(&distro, &interop, osrelease.as_deref()),
     ))
 }
@@ -1424,11 +1682,12 @@ fn git_output(runtime: &crate::app::Runtime, cwd: &Path, args: &[&str]) -> Optio
     crate::temp::sanitize_git_env(&mut command);
     crate::temp::bind_source_git(&mut command, cwd);
     command.args(args).stderr(Stdio::null());
+    // A Git builtin: detach like `program_output` explains.
     let output = crate::cleanup::run_session_output(
         command,
-        None,
+        crate::doctor_checks::probe_deadline(),
         crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
-        crate::cleanup::LingerPolicy::Strict,
+        crate::cleanup::LingerPolicy::Detach,
     )
     .ok()?;
     output.status.success().then(|| {
@@ -1470,6 +1729,43 @@ mod tests {
         assert_eq!(super::timeout_from(Some("99999999999999999999")), None);
         let huge = super::timeout_from(Some("18446744073709551615")).expect("fits u64");
         assert_eq!(std::time::Instant::now().checked_add(huge), None);
+    }
+
+    #[test]
+    fn usage_states_the_core_probe_deadline() {
+        let bound = crate::doctor_checks::PROBE_TIMEOUT.as_secs();
+        assert!(super::USAGE.contains(&format!("within {bound} seconds")));
+    }
+
+    #[test]
+    fn explicit_single_job_runs_extensions_after_the_core() {
+        let runtime = |pairs: &[(&str, &str)]| {
+            let env = pairs
+                .iter()
+                .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+                .collect::<BTreeMap<_, _>>();
+            crate::app::Runtime::from_env(&env, &std::env::temp_dir()).expect("runtime")
+        };
+        for (pairs, serial) in [
+            (&[][..], false),
+            (&[("DOT_DOCTOR_JOBS", "1")][..], true),
+            (&[("DOT_DOCTOR_JOBS", "0")][..], true),
+            (&[("DOT_DOCTOR_JOBS", "4")][..], false),
+            (
+                &[("DOT_DOCTOR_JOBS", "x"), ("DOT_UPDATE_JOBS", "1")][..],
+                true,
+            ),
+            (
+                &[("DOT_DOCTOR_JOBS", "2"), ("DOT_UPDATE_JOBS", "1")][..],
+                false,
+            ),
+        ] {
+            assert_eq!(
+                super::serial_extensions(&runtime(pairs)),
+                serial,
+                "{pairs:?}"
+            );
+        }
     }
 
     #[test]
@@ -1620,6 +1916,151 @@ mod tests {
             };
         assert!(super::execute_guarded(&execute, &spec, &abort).is_err());
         assert!(abort.load(Ordering::SeqCst));
+    }
+
+    /// P1: the core's Git probes (the dot checkout's top level and the Git
+    /// version) are read-only builtins, so normal completion must not pay a
+    /// host-wide process-table walk. On a devserver with thousands of
+    /// processes each walk cost about as much as the probe itself.
+    #[test]
+    fn core_git_probes_skip_the_process_table_walk() {
+        let home = dot_test_support::TempDir::new("doctor-git-probe-home").expect("home");
+        let status = dot_test_support::git()
+            .args(["init", "-q"])
+            .current_dir(home.path())
+            .status()
+            .expect("git init fixture");
+        assert!(status.success());
+        let git = dot_test_support::real_tool("git");
+        let env = BTreeMap::<OsString, OsString>::from([
+            ("HOME".into(), home.path().as_os_str().to_os_string()),
+            (
+                "PATH".into(),
+                git.parent().expect("git dir").as_os_str().to_os_string(),
+            ),
+            ("LC_ALL".into(), OsString::from("C")),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, home.path()).expect("runtime");
+        crate::cleanup::reset_global_process_snapshot_calls();
+        let top = super::git_output(&runtime, home.path(), &["rev-parse", "--show-toplevel"]);
+        assert!(top.is_some(), "rev-parse answered");
+        let version = super::program_output(
+            &runtime,
+            &git,
+            &["--version"],
+            crate::cleanup::LingerPolicy::Detach,
+            None,
+        );
+        assert!(version.is_some_and(|version| version.starts_with(b"git version")));
+        assert_eq!(
+            crate::cleanup::global_process_snapshot_calls(),
+            0,
+            "read-only Git probes must not walk the process table"
+        );
+    }
+
+    /// Identity comes from the kernel, read exactly as `dot update` reads it,
+    /// so doctor and update select the same profile without spawning
+    /// `hostname` or `uname`.
+    #[test]
+    fn host_and_platform_match_the_update_identity() {
+        let env = BTreeMap::<OsString, OsString>::from([("PATH".into(), OsString::new())]);
+        let cwd = std::env::temp_dir();
+        let runtime = crate::app::Runtime::from_env(&env, &cwd).expect("runtime");
+        assert_eq!(
+            super::current_host(),
+            crate::platform::detect_host().ok(),
+            "an empty PATH no longer hides the host"
+        );
+        let platform = super::current_platform(&runtime).expect("platform");
+        if std::env::var_os("WSL_DISTRO_NAME").is_none()
+            && std::env::var_os("WSL_INTEROP").is_none()
+        {
+            assert_eq!(Some(platform), crate::platform::detect_platform().ok());
+        }
+    }
+
+    /// A core check that panics while the extension phase runs must stop the
+    /// running extensions, not wait for them.
+    #[test]
+    fn a_core_panic_stops_the_running_extension_phase() {
+        let home = dot_test_support::TempDir::new("doctor-phase-drop-home").expect("home");
+        let root = home.path().join("extensions");
+        let directory = root.join("doctor.d");
+        std::fs::create_dir_all(&directory).expect("doctor directory");
+        let script = directory.join("10-hang.sh");
+        std::fs::write(
+            &script,
+            b"doctor() {\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/hang.pid\"\n  sleep 60\n}\n",
+        )
+        .expect("extension");
+        for (path, mode) in [(&root, 0o700), (&directory, 0o700), (&script, 0o644)] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("mode");
+        }
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut config = crate::config::load(&crate::config::Request {
+            config_path: None,
+            home: home.path().to_str().expect("home text"),
+            env_policy: None,
+        })
+        .expect("default config");
+        config.extension_api = true;
+        config.extensions_dir = Some(root.to_string_lossy().into_owned());
+        let env = BTreeMap::<OsString, OsString>::from([
+            ("HOME".into(), home.path().as_os_str().to_os_string()),
+            ("DOT_SOURCE_ROOT".into(), repo.as_os_str().to_os_string()),
+            ("PATH".into(), OsString::from("/usr/bin:/bin")),
+            (
+                "DOT_BASH".into(),
+                OsStr::new(dot_test_support::bash()).to_os_string(),
+            ),
+            ("DOT_DOCTOR_JOBS".into(), OsString::from("2")),
+            ("LC_ALL".into(), OsString::from("C")),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, home.path()).expect("runtime");
+        let phase = super::ExtensionPhase::start(super::ExtensionJob {
+            runtime,
+            config,
+            euid: crate::temp::current_uid().expect("uid"),
+            overlays: Vec::new(),
+            overlays_unresolved: false,
+            manifest: String::new(),
+            palette: crate::doctor_runtime::Palette::empty(),
+        });
+        assert!(matches!(phase, super::ExtensionPhase::Running { .. }));
+        let pid_file = home.path().join("hang.pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "extension never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let started = std::time::Instant::now();
+        // A core check panics while the phase runs.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _phase = phase;
+            panic!("injected core check failure");
+        }));
+        assert!(unwound.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "drop waited out the extension: {:?}",
+            started.elapsed()
+        );
+        // SAFETY: signal 0 only checks existence; no signal is sent.
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "extension outlived the phase"
+        );
     }
 
     #[test]

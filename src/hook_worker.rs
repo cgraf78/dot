@@ -386,11 +386,16 @@ impl Worker {
         let outcome = combined(command, result_dir, abort, deadline);
         // The hook ran arbitrary user code: it may have replaced
         // repository directories, so memoized probe answers are
-        // no longer trustworthy.
-        crate::overlays::invalidate_worktree_cache();
-        crate::startup::invalidate_revision_cache();
-        crate::repos_base::invalidate_client_match_cache();
-        crate::repos_config::invalidate_config_cache();
+        // no longer trustworthy. Doctor extensions are diagnostics that run
+        // alongside the doctor's own checks, which read those answers as of
+        // the doctor's start, as they did when extensions ran last; clearing
+        // them mid-run would only make those checks probe again.
+        if mode != "doctor" {
+            crate::overlays::invalidate_worktree_cache();
+            crate::startup::invalidate_revision_cache();
+            crate::repos_base::invalidate_client_match_cache();
+            crate::repos_config::invalidate_config_cache();
+        }
         outcome
     }
 }

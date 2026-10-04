@@ -83,7 +83,7 @@ pub fn is_serial(script: &str) -> bool {
 /// True for an all-ASCII-digit, non-empty job count (`case ''
 /// | *[!0-9]*` rejects everything else, checked byte-wise under
 /// `LC_ALL=C`).
-fn is_count(text: &str) -> bool {
+pub(crate) fn is_count(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 

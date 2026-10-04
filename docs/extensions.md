@@ -285,8 +285,9 @@ Records still render in lexical discovery order, exactly as a serial run
 produces them, and each extension keeps its own private `TMPDIR`. Extensions
 are diagnostics: they must not depend on another extension's side effects or
 race on shared mutable state; a cache they refresh must be published
-atomically (for example, a sibling temporary plus `mv`). `DOT_DOCTOR_JOBS=1`
-restores strictly serial execution. After cancellation no further extension
+atomically (for example, a sibling temporary plus `mv`). Extensions start
+alongside the core checks and render after them; `DOT_DOCTOR_JOBS=1` restores
+strictly serial execution. After cancellation no further extension
 starts; running workers receive the forwarded signal and are reaped, and only
 the extension whose records were next to render is still reported.
 
