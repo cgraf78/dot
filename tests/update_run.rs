@@ -890,13 +890,42 @@ fn cron_base_pull_failure_records_fail_and_keeps_success_stamps() {
 /// terminal received, in arrival order across both output streams. The line
 /// discipline's output processing stays on, so newlines arrive as `\r\n`.
 fn dot_on_pty(argv: &[&str], home: &Path, state: &Path) -> (Option<i32>, Vec<u8>) {
+    dot_on_pty_with(argv, home, state, &PtyRun::default())
+}
+
+/// What a [`dot_on_pty_with`] run sets up and does while dot runs.
+#[derive(Default)]
+struct PtyRun<'a> {
+    /// Extra environment.
+    env: Vec<(&'a str, std::ffi::OsString)>,
+    /// Terminal width (0 leaves the size unset, as `openpty` defaults).
+    columns: u16,
+    /// Steps taken in order while dot runs: each waits for its file to
+    /// exist, then for its delay, then types its bytes on the terminal.
+    steps: Vec<(PathBuf, std::time::Duration, &'a [u8])>,
+}
+
+/// [`dot_on_pty`] with extra environment, a window size, and typed input.
+fn dot_on_pty_with(
+    argv: &[&str],
+    home: &Path,
+    state: &Path,
+    run: &PtyRun<'_>,
+) -> (Option<i32>, Vec<u8>) {
+    use std::io::Write as _;
     use std::os::fd::FromRawFd as _;
     use std::os::unix::process::CommandExt as _;
 
     let mut master = -1;
     let mut slave = -1;
-    // SAFETY: openpty initializes both descriptors; null optional pointers
-    // request the platform default terminal attributes and window size.
+    // SAFETY: zeroed is a valid winsize; only the columns and rows are set.
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    size.ws_col = run.columns;
+    size.ws_row = if run.columns == 0 { 0 } else { 40 };
+    // A raw pointer suits both signatures (`*mut` on macOS, `*const` on Linux).
+    let size: *mut libc::winsize = &mut size;
+    // SAFETY: openpty initializes both descriptors; the termios pointer is
+    // null (platform defaults) and the window size is a live local.
     assert_eq!(
         unsafe {
             libc::openpty(
@@ -904,9 +933,9 @@ fn dot_on_pty(argv: &[&str], home: &Path, state: &Path) -> (Option<i32>, Vec<u8>
                 &mut slave,
                 std::ptr::null_mut(),
                 // macOS takes *mut termios/*mut winsize while Linux takes
-                // *const; null_mut() satisfies both through coercion.
+                // *const; mutable pointers satisfy both through coercion.
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                size,
             )
         },
         0,
@@ -925,9 +954,13 @@ fn dot_on_pty(argv: &[&str], home: &Path, state: &Path) -> (Option<i32>, Vec<u8>
     // SAFETY: successful openpty returned two uniquely owned descriptors.
     let master = unsafe { std::fs::File::from_raw_fd(master) };
     let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+    let mut keyboard = master.try_clone().expect("PTY input end");
     let mut cmd = bin();
     client_env(&mut cmd, home, state);
     cmd.env("DOT_BASH", home.join("absent-old-update-engine"));
+    for (key, value) in &run.env {
+        cmd.env(key, value);
+    }
     cmd.args(argv)
         .stdin(Stdio::from(slave.try_clone().expect("PTY stdin")))
         .stdout(Stdio::from(slave.try_clone().expect("PTY stdout")))
@@ -970,10 +1003,23 @@ fn dot_on_pty(argv: &[&str], home: &Path, state: &Path) -> (Option<i32>, Vec<u8>
         }
         let _ = drained.send(output);
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let mut steps = run.steps.iter();
+    let mut step = steps.next();
+    let mut due: Option<std::time::Instant> = None;
     let status = loop {
         if let Some(status) = child.try_wait().expect("observe PTY dot") {
             break status;
+        }
+        if let Some((ready, delay, typed)) = step {
+            if due.is_none() && ready.exists() {
+                due = Some(std::time::Instant::now() + *delay);
+            }
+            if due.is_some_and(|due| std::time::Instant::now() >= due) {
+                keyboard.write_all(typed).expect("type on the PTY");
+                step = steps.next();
+                due = None;
+            }
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
@@ -990,7 +1036,118 @@ fn dot_on_pty(argv: &[&str], home: &Path, state: &Path) -> (Option<i32>, Vec<u8>
     let output = collected
         .recv_timeout(grace)
         .expect("PTY output never reached end of file after dot exited");
+    assert!(
+        step.is_none(),
+        "dot finished ({status:?}) before every scripted step ran: {:?}",
+        String::from_utf8_lossy(&output)
+    );
     (status.code(), output)
+}
+
+/// A directory holding a `git` that runs the real one, except that a
+/// `fetch` whose arguments contain `$DOT_TEST_FETCH_MATCH` first acts like
+/// a fetch that talks to the user: it records `$DOT_TEST_FETCH_MARK.asked`,
+/// asks on `/dev/tty` and reads the answer there (an SSH passphrase), or
+/// with `DOT_TEST_FETCH_HANG=1` writes an unterminated line to stderr and
+/// waits to be interrupted. It also reports whether its stderr is a
+/// terminal. Put it first on `PATH`.
+fn prompting_git(scratch: &Scratch) -> PathBuf {
+    // The real Git, never a developer's launcher shim on PATH.
+    let real = dot_test_support::real_tool("git");
+    let dir = scratch.path().join("prompting-git-bin");
+    std::fs::create_dir_all(&dir).expect("wrapper dir");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in
+*" fetch "*)
+  case "${{DOT_TEST_FETCH_MATCH:+$*}}" in
+  "") ;;
+  *"$DOT_TEST_FETCH_MATCH"*)
+    if [ -t 2 ]; then echo 'stderr is a terminal' >&2; else echo 'stderr is not a terminal' >&2; fi
+    : >"$DOT_TEST_FETCH_MARK.asked"
+    if [ "${{DOT_TEST_FETCH_HANG:-0}}" = 1 ]; then
+      trap 'echo "fetch: interrupted, cleaning up" >&2; exit 130' INT
+      printf 'fetch: waiting' >&2
+      while :; do sleep 1; done
+    fi
+    printf 'Enter passphrase for key: ' >/dev/tty
+    IFS= read -r answer </dev/tty
+    ;;
+  esac
+  ;;
+esac
+exec '{}' "$@"
+"#,
+        real.display()
+    );
+    let git = dir.join("git");
+    std::fs::write(&git, script).expect("wrapper");
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).expect("wrapper mode");
+    dir
+}
+
+/// A converged client initialized with `prompting_git` first on `PATH`
+/// (the initialization identity records the Git it ran), plus that `PATH`
+/// for later runs.
+fn prompting_git_client(scratch: &Scratch, tag: &str) -> (PathBuf, PathBuf, std::ffi::OsString) {
+    let (overlay_origin, base_origin) = shared_remotes(scratch);
+    let path = path_with(&prompting_git(scratch));
+    let home = scratch.path().join(format!("home-{tag}"));
+    let state = scratch.path().join(format!("state-{tag}"));
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&state).expect("state");
+    let with_path = |argv: &[&str]| {
+        let mut cmd = bin();
+        client_env(&mut cmd, &home, &state);
+        cmd.env("PATH", &path)
+            .env("DOT_BASH", home.join("absent-old-update-engine"))
+            .args(argv)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = cmd.output().expect("run native dot");
+        assert!(output.status.success(), "dot {argv:?}: {output:?}");
+    };
+    with_path(&[
+        "init",
+        "--yes",
+        &format!("file://{}", base_origin.display()),
+    ]);
+    let conf_dir = home.join(".config/dot/overlays.d");
+    std::fs::create_dir_all(&conf_dir).expect("conf dir");
+    std::fs::write(
+        conf_dir.join("overlay-0.conf"),
+        format!("url=file://{}\n", overlay_origin.display()),
+    )
+    .expect("write conf");
+    with_path(&["update"]);
+    (home, state, path)
+}
+
+/// `PATH` with `dir` in front.
+fn path_with(dir: &Path) -> std::ffi::OsString {
+    let mut dirs = vec![dir.to_path_buf()];
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    std::env::join_paths(dirs).expect("PATH")
+}
+
+/// Push one change to overlay-0's remote so the next update must fetch it
+/// (a probe would otherwise prove the fetch unnecessary and skip it).
+fn push_overlay_change(scratch: &Scratch) {
+    let seed = scratch.path().join("overlay-0-seed");
+    let origin = scratch.path().join("overlay-0.git");
+    std::fs::write(
+        seed.join("home/file-000.txt"),
+        "overlay-0 payload CHANGED\n",
+    )
+    .expect("write");
+    git(&seed, &["add", "home/file-000.txt"]);
+    git(&seed, &["commit", "-qm", "change"]);
+    git(
+        &seed,
+        &["push", "-q", &origin.to_string_lossy(), "HEAD:main"],
+    );
 }
 
 /// The bytes a terminal shows before `index` on the same visual line: back to
@@ -1129,4 +1286,273 @@ fn invalid_overlay_descriptor_prints_its_warning_not_a_debug_dump() {
             descriptor.display()
         ),
     );
+    // The Repos row read `failed  1 repo current`; it now says what failed
+    // and names the overlay.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[1/5] Repos      failed   overlay zz-bad: invalid descriptor "),
+        "{stdout}"
+    );
+}
+
+/// A client whose update runs a pre-sync extension that records
+/// `$HOME/hook-ready` and then waits, holding the Repos stage open.
+fn waiting_hook_client(scratch: &Scratch, tag: &str) -> (PathBuf, PathBuf) {
+    let (overlay_origin, base_origin) = shared_remotes(scratch);
+    let (home, state) = twin_client(scratch, tag, &overlay_origin, &base_origin);
+    check_update(&["update"], &home, &state);
+    let extensions = home.join("ext");
+    let pre_sync = extensions.join("pre-sync.d");
+    std::fs::create_dir_all(&pre_sync).expect("pre-sync dir");
+    let hook = pre_sync.join("10-wait.sh");
+    std::fs::write(&hook, b"prepare() { : >\"$HOME/hook-ready\"; sleep 30; }\n").expect("hook");
+    for path in [&extensions, &pre_sync, &hook] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    }
+    std::fs::write(
+        home.join(".config/dot/config"),
+        b"version=1\nextension_api=1\nextensions_dir=$HOME/ext\ndependency_provider=none\n",
+    )
+    .expect("config");
+    (home, state)
+}
+
+#[test]
+fn interrupted_update_ends_the_open_row_on_the_terminal() {
+    // Ctrl-C mid-stage used to leave the progress row unterminated, so the
+    // shell prompt landed on it (`...2s^Cuser@host:~$`): after a signal the
+    // output relay refuses writes, so nothing ended the row.
+    let scratch = Scratch::new("update-run-pty-interrupt").expect("scratch dir");
+    let (home, state) = waiting_hook_client(&scratch, "interrupt");
+    // Extensions run under a real Bash (the fixture default points at none).
+    let bash = dot_test_support::real_tool("bash");
+    let run = PtyRun {
+        env: vec![("DOT_BASH", bash.into_os_string())],
+        steps: vec![(
+            home.join("hook-ready"),
+            std::time::Duration::from_millis(300),
+            b"\x03",
+        )],
+        ..PtyRun::default()
+    };
+    let (code, output) = dot_on_pty_with(&["update"], &home, &state, &run);
+    let output = strip_colour(&output);
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(code, Some(130), "{text}");
+    assert!(output.ends_with(b"\r\n"), "line left open: {text:?}");
+    // The row ends its own line: whatever follows (the warning the
+    // teardown printed) starts on the next one, and the last progress the
+    // run reached stays visible.
+    let row = *occurrences(&output, b"[1/5] Repos")
+        .last()
+        .expect("a Repos row");
+    let rest = &output[row..];
+    let end = rest
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("row ended");
+    let row_line = String::from_utf8_lossy(&rest[..end]);
+    assert!(!row_line.contains("warning"), "{row_line:?} in {text:?}");
+}
+
+#[test]
+fn interrupted_fetch_keeps_its_last_words_on_the_terminal() {
+    // A child's diagnostic written while Ctrl-C tears the run down was
+    // dropped (the relay refuses writes after a signal), and its unfinished
+    // line was left open under the shell prompt.
+    let scratch = Scratch::new("update-run-pty-fetch-interrupt").expect("scratch dir");
+    let (home, state, path) = prompting_git_client(&scratch, "fetch-interrupt");
+    let mark = scratch.path().join("fetch");
+    let run = PtyRun {
+        env: vec![
+            ("PATH", path),
+            ("DOT_TEST_FETCH_MATCH", "--work-tree".into()),
+            ("DOT_TEST_FETCH_MARK", mark.clone().into_os_string()),
+            ("DOT_TEST_FETCH_HANG", "1".into()),
+        ],
+        steps: vec![(
+            PathBuf::from(format!("{}.asked", mark.display())),
+            std::time::Duration::from_millis(500),
+            b"\x03",
+        )],
+        ..PtyRun::default()
+    };
+    let (code, output) = dot_on_pty_with(&["update"], &home, &state, &run);
+    let output = strip_colour(&output);
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(code, Some(130), "{text}");
+    let at = *occurrences(&output, b"fetch: interrupted, cleaning up")
+        .first()
+        .unwrap_or_else(|| panic!("teardown diagnostic dropped: {text:?}"));
+    // The unfinished `fetch: waiting` line is ended first, so the rest of
+    // what the child wrote starts on a line of its own.
+    assert!(
+        output[..at].ends_with(b"\n"),
+        "teardown diagnostic shares a line: {text:?}"
+    );
+    assert!(text.contains("    fetch: waiting"), "{text:?}");
+    assert!(output.ends_with(b"\r\n"), "line left open: {text:?}");
+}
+
+#[test]
+fn base_fetch_prompt_starts_on_a_clear_line_and_keeps_a_terminal() {
+    // A fetch that asks on the terminal (an SSH passphrase) used to print
+    // its question at the end of the live Repos row. Its stderr must also
+    // still be a terminal, so notices printed only to a terminal (an SSH
+    // security-key touch request) still show.
+    let scratch = Scratch::new("update-run-pty-base-prompt").expect("scratch dir");
+    let (home, state, path) = prompting_git_client(&scratch, "base-prompt");
+    let mark = scratch.path().join("fetch");
+    let run = PtyRun {
+        env: vec![
+            ("PATH", path),
+            ("DOT_TEST_FETCH_MATCH", "--work-tree".into()),
+            ("DOT_TEST_FETCH_MARK", mark.clone().into_os_string()),
+        ],
+        steps: vec![(
+            PathBuf::from(format!("{}.asked", mark.display())),
+            std::time::Duration::from_millis(1500),
+            b"secret\n",
+        )],
+        ..PtyRun::default()
+    };
+    let (code, output) = dot_on_pty_with(&["update"], &home, &state, &run);
+    let output = strip_colour(&output);
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(code, Some(0), "{text}");
+    let asked = *occurrences(&output, b"Enter passphrase for key: ")
+        .first()
+        .unwrap_or_else(|| panic!("no prompt: {text:?}"));
+    assert!(
+        visual_line_prefix(&output, asked).is_empty(),
+        "prompt shares a line: {text:?}"
+    );
+    assert!(
+        !occurrences(&output, b"    stderr is a terminal").is_empty(),
+        "fetch stderr is not a terminal: {text:?}"
+    );
+}
+
+#[test]
+fn overlay_fetch_prompt_is_not_redrawn_over() {
+    // The heartbeat redrew the Repos row every second while a required
+    // overlay's fetch waited for an answer, wiping its question.
+    let scratch = Scratch::new("update-run-pty-overlay-prompt").expect("scratch dir");
+    let (home, state, path) = prompting_git_client(&scratch, "overlay-prompt");
+    push_overlay_change(&scratch);
+    let mark = scratch.path().join("fetch");
+    let run = PtyRun {
+        env: vec![
+            ("PATH", path),
+            ("DOT_TEST_FETCH_MATCH", "dotfiles-overlay-0".into()),
+            ("DOT_TEST_FETCH_MARK", mark.clone().into_os_string()),
+        ],
+        steps: vec![(
+            PathBuf::from(format!("{}.asked", mark.display())),
+            std::time::Duration::from_millis(2500),
+            b"secret\n",
+        )],
+        ..PtyRun::default()
+    };
+    let (code, output) = dot_on_pty_with(&["update"], &home, &state, &run);
+    let output = strip_colour(&output);
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(code, Some(0), "{text}");
+    let asked = *occurrences(&output, b"Enter passphrase for key: ")
+        .first()
+        .unwrap_or_else(|| panic!("no prompt: {text:?}"));
+    assert!(
+        visual_line_prefix(&output, asked).is_empty(),
+        "prompt shares a line: {text:?}"
+    );
+    let answered = asked
+        + occurrences(&output[asked..], b"secret")
+            .first()
+            .copied()
+            .unwrap_or_else(|| panic!("answer never echoed: {text:?}"));
+    assert!(
+        occurrences(&output[asked..answered], b"\r\x1b[K").is_empty(),
+        "redrawn over the prompt: {:?}",
+        String::from_utf8_lossy(&output[asked..answered])
+    );
+}
+
+#[test]
+fn narrow_terminal_rows_never_wrap() {
+    // Rows were a fixed 75 columns: on a narrower terminal every redraw
+    // wrapped and its erase cleared only the last physical line, leaving
+    // stale half-rows behind.
+    let scratch = Scratch::new("update-run-pty-narrow").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "narrow", &overlay_origin, &base_origin);
+    check_update(&["update"], &home, &state);
+    let run = PtyRun {
+        columns: 60,
+        ..PtyRun::default()
+    };
+    let (code, output) = dot_on_pty_with(&["update"], &home, &state, &run);
+    let output = strip_colour(&output);
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(code, Some(0), "{text}");
+    for line in text.split("\r\n") {
+        for drawn in line.split("\r\u{1b}[K") {
+            assert!(
+                drawn.chars().count() < 60,
+                "{} columns: {drawn:?} in {text:?}",
+                drawn.chars().count()
+            );
+        }
+    }
+    assert!(text.contains("[5/5] Cleanup"), "{text:?}");
+}
+
+/// A converged client whose overlay-0 remote then disappears, so the next
+/// update's overlay fetch fails.
+fn unreachable_overlay_client(scratch: &Scratch, tag: &str) -> (PathBuf, PathBuf) {
+    let (overlay_origin, base_origin) = shared_remotes(scratch);
+    let (home, state) = twin_client(scratch, tag, &overlay_origin, &base_origin);
+    check_update(&["update"], &home, &state);
+    std::fs::rename(&overlay_origin, scratch.path().join("overlay-0.git.gone"))
+        .expect("hide overlay remote");
+    std::fs::create_dir(&overlay_origin).expect("empty overlay remote");
+    (home, state)
+}
+
+#[test]
+fn overlay_fetch_errors_print_under_the_line_naming_the_overlay() {
+    // The fetch's own lines printed ahead of `overlay-0 dotfiles pull
+    // failed` (so in `-v` they sat under the base's row), and with that
+    // row hidden by `--quiet`/`--cron` nothing named the overlay at all.
+    let scratch = Scratch::new("update-run-overlay-fetch-order").expect("scratch dir");
+    let (home, state) = unreachable_overlay_client(&scratch, "order");
+    for verbose in [false, true] {
+        let argv: &[&str] = if verbose {
+            &["update", "-v"]
+        } else {
+            &["update"]
+        };
+        let output = dot(argv, &home, &state);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let named = stdout
+            .find("overlay-0 dotfiles pull failed")
+            .unwrap_or_else(|| panic!("no failure row: {output:?}"));
+        let fatal = stdout
+            .find("    fatal:")
+            .unwrap_or_else(|| panic!("no fetch diagnostic: {output:?}"));
+        assert!(named < fatal, "diagnostic before its overlay: {stdout}");
+    }
+    for argv in [&["update", "--quiet"][..], &["update", "--cron"][..]] {
+        let output = dot(argv, &home, &state);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("  overlay-0 fetch output:\n    fatal:"),
+            "{argv:?}: {output:?}"
+        );
+        for stream in [&output.stdout, &output.stderr] {
+            assert!(
+                !stream.iter().any(|byte| *byte == b'\r' || *byte == 0x1b),
+                "{argv:?}: {output:?}"
+            );
+        }
+    }
 }

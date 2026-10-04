@@ -184,6 +184,26 @@ fn warn_row(
     live_active
 }
 
+/// Write an overlay fetch's indented diagnostics, after a header naming
+/// the overlay when no visible line above them does (a successful fetch
+/// that still printed something, or a failure whose row quiet mode hides).
+fn emit_fetch_output(
+    inputs: &PullOverlayInputs<'_>,
+    output: &[u8],
+    header: bool,
+    warnings: &mut dyn Write,
+) {
+    if output.is_empty() {
+        return;
+    }
+    if header {
+        inputs
+            .log
+            .warn(warnings, &format!("  {} fetch output:", inputs.name));
+    }
+    let _ = warnings.write_all(output);
+}
+
 /// The staged clone with both streams discarded, like the shell's
 /// `>/dev/null 2>&1` redirect. An unreadable umask fails the clone
 /// like any other staging failure.
@@ -415,13 +435,21 @@ pub fn pull_overlay(
             return done(PullOverlayStatus::Failed, live);
         }
     }
-    let upstream = match prepare_overlay_upstream(
+    // The fetch's own diagnostics are held until the outcome is known, so
+    // they print under the line that names this overlay instead of ahead
+    // of it (or, with that line hidden, under a header that names it).
+    let mut fetch_output = Vec::new();
+    let fetched = prepare_overlay_upstream(
         Path::new(inputs.path),
         inputs.optional,
         inputs.prefetch,
-        warnings,
-    ) {
-        Ok(upstream) => upstream,
+        &mut fetch_output,
+    );
+    let upstream = match fetched {
+        Ok(upstream) => {
+            emit_fetch_output(inputs, &fetch_output, true, warnings);
+            upstream
+        }
         Err(_) => {
             if inputs.optional {
                 return done(PullOverlayStatus::Empty, live);
@@ -441,6 +469,7 @@ pub fn pull_overlay(
                     .log
                     .warn(warnings, &format!("  warning: {name} dotfiles pull failed"));
             }
+            emit_fetch_output(inputs, &fetch_output, counted && quiet, warnings);
             return done(PullOverlayStatus::Failed, live);
         }
     };

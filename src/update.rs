@@ -24,6 +24,10 @@ pub struct RepoStageFinish<'a> {
     pub changed_items: &'a [u8],
     /// Verbose flag; verbose output already reported individual changes.
     pub verbose: Option<&'a str>,
+    /// Why a forced failure failed when no repository did (an invalid
+    /// overlay descriptor, a failed pre-sync hook): it becomes the summary,
+    /// so the row never reads `failed` beside counts that all look fine.
+    pub reason: Option<&'a [u8]>,
 }
 
 /// Close a deferred repository stage with its aggregate status and summary.
@@ -64,11 +68,16 @@ pub fn repo_stage_finish(stage: &mut Stage, inputs: &RepoStageFinish<'_>) -> Vec
         parts.push(part(skipped, b"skipped"));
     }
     let fields: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-    let mut output = stage.finish(
-        status,
-        &join_comma(&fields),
-        crate::update_engine::now_secs(),
-    );
+    // With no failed repository the reason replaces the counts: they all
+    // read fine, which is what made `failed  1 repo current` confusing.
+    let summary = match inputs
+        .reason
+        .filter(|reason| forced && failed == 0 && !reason.is_empty())
+    {
+        Some(reason) => reason.to_vec(),
+        None => join_comma(&fields),
+    };
+    let mut output = stage.finish(status, &summary, crate::update_engine::now_secs());
     if arith_value(inputs.verbose.unwrap_or("0")) == Some(0) {
         for item in inputs.changed_items.split(|byte| *byte == b'\n') {
             if !item.is_empty() {

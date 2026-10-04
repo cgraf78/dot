@@ -1569,6 +1569,10 @@ fn run_update(
             let prompt = &mut prompt;
             let remaining_events = &mut remaining_events;
             scope.spawn(move || {
+                // The current prompt has turned terminal echo off (sudo
+                // reading a password), and since when echo is back on.
+                let mut echo_read = false;
+                let mut echo_back: Option<std::time::Instant> = None;
                 let mut bounded_deferred_stdout =
                     LimitedWriter::new(deferred_stdout, PROVIDER_FRAME_LIMIT_BYTES);
                 let mut bounded_final_stderr =
@@ -1663,7 +1667,33 @@ fn run_update(
                     // immediately) and failures propagate like event
                     // renders. A paused prompt skips it too: the provider
                     // is asking on the terminal (sudo), and a redraw would
-                    // erase its question until the next event resumes.
+                    // erase its question. The next event resumes the row,
+                    // and so does the terminal once sudo has read the
+                    // password: it turns echo off to read and back on after,
+                    // and the install that follows may run a long time
+                    // without another event. Echo must stay back on for a
+                    // while first: after a wrong password it is on during
+                    // the failure delay, then off again for the retry.
+                    if session.prompt_active && !final_pass {
+                        match terminal_echo() {
+                            Some(false) => {
+                                echo_read = true;
+                                echo_back = None;
+                            }
+                            Some(true) if echo_read => {
+                                let back = *echo_back.get_or_insert_with(std::time::Instant::now);
+                                if back.elapsed() >= PROMPT_ECHO_SETTLE {
+                                    echo_read = false;
+                                    echo_back = None;
+                                    crate::shdeps_ui_render::prompt_resume(session);
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        echo_read = false;
+                        echo_back = None;
+                    }
                     if result.is_ok() && !final_pass && !session.prompt_active {
                         let now = crate::update_engine::now_secs();
                         if beat.poll(now) {
@@ -2431,6 +2461,20 @@ fn handle_event(
         _ => {}
     }
     Ok(())
+}
+
+/// How long terminal echo must stay back on after a password read before the
+/// stage row returns: longer than PAM's usual delay after a wrong password,
+/// after which sudo turns echo off again to ask once more.
+const PROMPT_ECHO_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether the terminal on stdout echoes input, when stdout is a terminal.
+/// A password prompt (sudo) turns echo off while it reads.
+fn terminal_echo() -> Option<bool> {
+    // SAFETY: tcgetattr only fills the zeroed termios it is handed.
+    let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+    let read = unsafe { libc::tcgetattr(libc::STDOUT_FILENO, &mut attributes) };
+    (read == 0).then_some(attributes.c_lflag & libc::ECHO != 0)
 }
 
 fn prompt_pipe(runtime: &Runtime) -> Option<PromptPipe> {

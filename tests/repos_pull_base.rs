@@ -200,6 +200,7 @@ fn run_with(
         quiet,
         verbose,
         log: &log,
+        terminal: false,
     };
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();

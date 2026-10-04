@@ -242,11 +242,20 @@ fn rev_parse(prefix: &[std::ffi::OsString], args: &[&str]) -> Option<String> {
 /// Run `git fetch` under `prefix` in the foreground, its diagnostics
 /// indented under the stage on `warnings` instead of the inherited
 /// descriptor: written straight to the terminal they landed at the end
-/// of the live Repos row. Stdin and stdout stay inherited, so credential
-/// and SSH prompts (which use the controlling terminal) keep working.
-/// A failed diagnostic write never fails the fetch; `warnings` already
-/// remembers undelivered output for the exit status.
-fn fetch(prefix: &[std::ffi::OsString], args: &[&str], warnings: &mut dyn std::io::Write) -> i32 {
+/// of the live Repos row. Stdin and stdout stay inherited and the child
+/// keeps Dot's controlling terminal, so prompts that open `/dev/tty`
+/// (credentials, SSH passphrases and host keys) still reach the user.
+/// With `terminal`, stderr is a private pseudo-terminal rather than a
+/// pipe, so a child that prints a notice only when stderr is a terminal
+/// (an SSH security-key touch request) still prints it, through
+/// `warnings`. A failed diagnostic write never fails the fetch;
+/// `warnings` already remembers undelivered output for the exit status.
+fn fetch(
+    prefix: &[std::ffi::OsString],
+    args: &[&str],
+    warnings: &mut dyn std::io::Write,
+    terminal: bool,
+) -> i32 {
     /// Forwards to `inner`, reporting success either way.
     struct Lenient<'a>(&'a mut dyn std::io::Write);
     impl std::io::Write for Lenient<'_> {
@@ -265,16 +274,23 @@ fn fetch(prefix: &[std::ffi::OsString], args: &[&str], warnings: &mut dyn std::i
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit());
     let mut indented = crate::progress_ui::IndentedLines::new(warnings);
-    crate::cleanup::run_foreground_forward_stderr(cmd, &mut Lenient(&mut indented))
+    let mut sink = Lenient(&mut indented);
+    if terminal {
+        crate::cleanup::run_foreground_forward_stderr_terminal(cmd, &mut sink)
+    } else {
+        crate::cleanup::run_foreground_forward_stderr(cmd, &mut sink)
+    }
 }
 
 /// `_repo_prepare_base_upstream`: fetch the base checkout's upstream
 /// remote and resolve the fetched tip. Returns the commit id, or the
 /// shell's numeric failure: 1 for no usable upstream, 2 for a failed
-/// fetch, 3 for an unresolvable tip. Fetch diagnostics go to `warnings`.
+/// fetch, 3 for an unresolvable tip. Fetch diagnostics go to `warnings`;
+/// `terminal` says live rows reach a real terminal (see `fetch`).
 pub fn prepare_base_upstream(
     base: &crate::repos_base::Base,
     warnings: &mut dyn std::io::Write,
+    terminal: bool,
 ) -> Result<String, u8> {
     let prefix = base.git_prefix().ok_or(1u8)?;
     let upstream = upstream_name(&prefix).ok_or(1u8)?;
@@ -283,6 +299,7 @@ pub fn prepare_base_upstream(
         &prefix,
         &["fetch", "--quiet", "--no-write-fetch-head", remote],
         warnings,
+        terminal,
     ) != 0
     {
         return Err(2);
@@ -314,7 +331,9 @@ pub fn prepare_overlay_upstream(
     } else if quiet_errors {
         crate::repos_base::run_git(&prefix, &fetch).is_some_and(|output| output.status.success())
     } else {
-        self::fetch(&prefix, &fetch, warnings) == 0
+        // Overlay fetches run in parallel workers whose output is replayed
+        // later, so a pseudo-terminal would only delay what it shows.
+        self::fetch(&prefix, &fetch, warnings, false) == 0
     };
     if !fetched {
         return Err(2);

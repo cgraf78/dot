@@ -509,6 +509,7 @@ fn line_head(palette: &Palette, index: i64, total: &str) -> Vec<u8> {
 /// The color comes from the stage `status` while the cell shows
 /// `cell_text`: for a running live line those differ (colored
 /// `running` slot around the current spinner frame).
+#[allow(clippy::too_many_arguments)] // the row's cells, in order
 fn line_cells(
     palette: &Palette,
     label: &[u8],
@@ -516,6 +517,7 @@ fn line_cells(
     cell_text: &[u8],
     detail: &[u8],
     multibyte: bool,
+    fit: Fit,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&cell(label, 10, multibyte));
@@ -524,8 +526,65 @@ fn line_cells(
     out.extend_from_slice(&cell(cell_text, 8, multibyte));
     out.extend_from_slice(palette.reset.as_bytes());
     out.push(b' ');
-    out.extend_from_slice(&cell(detail, 42, multibyte));
+    match fit {
+        Fit::Fixed => out.extend_from_slice(&cell(detail, DETAIL_WIDTH, multibyte)),
+        Fit::Detail(width) => out.extend_from_slice(&word_cell(detail, width, multibyte)),
+    }
     out
+}
+
+/// Width of a row's detail cell when nothing narrower is asked for: with
+/// the other cells this makes a 75-column row.
+const DETAIL_WIDTH: usize = 42;
+
+/// Columns a row takes besides its `[i/n]` head and detail cell: the
+/// head's space, the label cell and its space, the status cell and its
+/// space, the space before the elapsed column, and that column.
+const ROW_FIXED_COLUMNS: usize = 1 + 10 + 1 + 8 + 1 + 1 + 6;
+
+/// How a row renders its detail cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fit {
+    /// The historical fixed cell (piped and test output stay byte-stable).
+    Fixed,
+    /// A cell this many columns wide, cut at a word boundary.
+    Detail(usize),
+}
+
+impl Fit {
+    /// The detail width that keeps a row with head `head` inside a
+    /// terminal of `columns` columns, one column short of the edge so the
+    /// cursor never wraps (a redraw only erases its own physical line).
+    fn for_terminal(columns: usize, head: &[u8], multibyte: bool) -> Fit {
+        let used = measured_len(head, multibyte) + ROW_FIXED_COLUMNS;
+        Fit::Detail(DETAIL_WIDTH.min(columns.saturating_sub(used + 1)))
+    }
+}
+
+/// [`cell`] for terminal rows: pad to `width`, or cut over-long text at
+/// its last word boundary (dropping a trailing `;`/`,`/`:` left dangling)
+/// when one falls in the cell's second half, else at `width`.
+fn word_cell(text: &[u8], width: usize, multibyte: bool) -> Vec<u8> {
+    if measured_len(text, multibyte) <= width {
+        return pad(text, width, multibyte);
+    }
+    let prefix = take_prefix(text, width, multibyte);
+    let at_boundary = text.get(prefix.len()) == Some(&b' ');
+    let cut = if at_boundary {
+        prefix.len()
+    } else {
+        match prefix.iter().rposition(|byte| *byte == b' ') {
+            Some(space) if measured_len(&prefix[..space], multibyte) * 2 >= width => space,
+            _ => prefix.len(),
+        }
+    };
+    let kept = prefix[..cut].trim_ascii_end();
+    let kept = kept
+        .strip_suffix(b";")
+        .or_else(|| kept.strip_suffix(b","))
+        .or_else(|| kept.strip_suffix(b":"))
+        .unwrap_or(kept);
+    pad(kept, width, multibyte)
 }
 
 /// `_ui_line`: one newline-terminated progress line. `total` and
@@ -543,18 +602,49 @@ pub fn line(
     elapsed: &[u8],
     multibyte: bool,
 ) -> Vec<u8> {
+    line_fit(
+        palette, quiet, index, total, label, status, detail, elapsed, multibyte, None,
+    )
+}
+
+/// [`line`] fitted to a terminal `columns` wide when known.
+#[allow(clippy::too_many_arguments)] // `line` plus its terminal width
+fn line_fit(
+    palette: &Palette,
+    quiet: bool,
+    index: i64,
+    total: &str,
+    label: &[u8],
+    status: &[u8],
+    detail: &[u8],
+    elapsed: &[u8],
+    multibyte: bool,
+    columns: Option<usize>,
+) -> Vec<u8> {
     if quiet {
         return Vec::new();
     }
     let mut out = line_head(palette, index, total);
+    let fit = row_fit(index, total, columns, multibyte);
     out.push(b' ');
     out.extend_from_slice(&line_cells(
-        palette, label, status, status, detail, multibyte,
+        palette, label, status, status, detail, multibyte, fit,
     ));
     out.push(b' ');
     out.extend_from_slice(&column6(elapsed));
     out.push(b'\n');
     out
+}
+
+/// The detail fit for a row in a terminal `columns` wide (fixed when the
+/// width is unknown). Measured on the uncoloured head.
+fn row_fit(index: i64, total: &str, columns: Option<usize>, multibyte: bool) -> Fit {
+    match columns {
+        Some(columns) => {
+            Fit::for_terminal(columns, format!("[{index}/{total}]").as_bytes(), multibyte)
+        }
+        None => Fit::Fixed,
+    }
 }
 
 /// ASCII spinner frames, selected when [`ascii_mode`] holds.
@@ -581,6 +671,28 @@ pub fn live_line(
     ascii: bool,
     multibyte: bool,
 ) -> Vec<u8> {
+    live_line_fit(
+        palette, quiet, index, total, label, status, detail, elapsed, spinner, ascii, multibyte,
+        None,
+    )
+}
+
+/// [`live_line`] fitted to a terminal `columns` wide when known.
+#[allow(clippy::too_many_arguments)] // `live_line` plus its terminal width
+fn live_line_fit(
+    palette: &Palette,
+    quiet: bool,
+    index: i64,
+    total: &str,
+    label: &[u8],
+    status: &[u8],
+    detail: &[u8],
+    elapsed: &[u8],
+    spinner: &mut u64,
+    ascii: bool,
+    multibyte: bool,
+    columns: Option<usize>,
+) -> Vec<u8> {
     if quiet {
         return Vec::new();
     }
@@ -600,7 +712,13 @@ pub fn live_line(
     out.extend_from_slice(&line_head(palette, index, total));
     out.push(b' ');
     out.extend_from_slice(&line_cells(
-        palette, label, status, frame, detail, multibyte,
+        palette,
+        label,
+        status,
+        frame,
+        detail,
+        multibyte,
+        row_fit(index, total, columns, multibyte),
     ));
     out.push(b' ');
     out.extend_from_slice(&column6(elapsed));
@@ -897,6 +1015,27 @@ fn is_bare_name(text: &str) -> bool {
     bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// How wide a stage's rows may be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowWidth {
+    /// The historical fixed 75-column rows (pipes, tests).
+    Fixed,
+    /// Fit the terminal stdout is attached to, read at each render.
+    Terminal,
+    /// Fit a terminal this many columns wide.
+    Columns(usize),
+}
+
+/// The width of the terminal on stdout, when stdout is one that reports a
+/// width. Rows wider than the terminal wrap, and a redraw's line erase then
+/// clears only the last physical line, leaving stale half-rows behind.
+pub fn terminal_columns() -> Option<usize> {
+    // SAFETY: TIOCGWINSZ only fills the zeroed winsize it is handed.
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    let read = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ as _, &mut size) };
+    (read == 0 && size.ws_col > 0).then_some(usize::from(size.ws_col))
+}
+
 /// One live progress stage: the `DOT_UI_*` globals as owned state.
 /// Quiet, live-redraw, counting, and glyph modes resolve once at
 /// [`Stage::begin`] (production reads them from the environment);
@@ -918,6 +1057,8 @@ pub struct Stage {
     /// the end of `_ui_live_line`) so the next clear knows a live
     /// line is on screen.
     live_active: bool,
+    /// Where rows learn how wide they may be.
+    width: RowWidth,
 }
 
 impl Stage {
@@ -944,6 +1085,29 @@ impl Stage {
             started_secs: 0,
             spinner: 0,
             live_active: false,
+            width: RowWidth::Fixed,
+        }
+    }
+
+    /// Fit this stage's rows to `width` instead of the fixed 75 columns.
+    pub fn with_width(mut self, width: RowWidth) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// Whether this stage's live rows reach a real terminal, where a child
+    /// process may prompt the user on the same screen.
+    pub fn on_terminal(&self) -> bool {
+        self.live && !self.quiet && self.width == RowWidth::Terminal
+    }
+
+    /// The terminal width rows must fit, read at each render so a resize
+    /// mid-run takes effect on the next redraw.
+    fn columns(&self) -> Option<usize> {
+        match self.width {
+            RowWidth::Fixed => None,
+            RowWidth::Terminal => terminal_columns(),
+            RowWidth::Columns(columns) => Some(columns),
         }
     }
 
@@ -961,6 +1125,7 @@ impl Stage {
         if self.quiet {
             return Vec::new();
         }
+        let columns = self.columns();
         self.index += 1;
         self.label = label.to_vec();
         self.detail = match detail {
@@ -972,7 +1137,7 @@ impl Stage {
         if self.live {
             let mut out = Vec::new();
             if crate::log::is_quiet(verbose) {
-                out.extend_from_slice(&line(
+                out.extend_from_slice(&line_fit(
                     &self.palette,
                     false,
                     self.index,
@@ -982,9 +1147,10 @@ impl Stage {
                     &self.detail,
                     b"0s",
                     self.multibyte,
+                    columns,
                 ));
             }
-            out.extend_from_slice(&live_line(
+            out.extend_from_slice(&live_line_fit(
                 &self.palette,
                 false,
                 self.index,
@@ -996,11 +1162,12 @@ impl Stage {
                 &mut self.spinner,
                 self.ascii,
                 self.multibyte,
+                columns,
             ));
             self.live_active = true;
             out
         } else {
-            line(
+            line_fit(
                 &self.palette,
                 false,
                 self.index,
@@ -1010,6 +1177,7 @@ impl Stage {
                 &self.detail,
                 b"0s",
                 self.multibyte,
+                columns,
             )
         }
     }
@@ -1030,10 +1198,11 @@ impl Stage {
         if self.quiet || !self.started() {
             return Vec::new();
         }
+        let columns = self.columns();
         self.detail = detail.to_vec();
         let stamp = elapsed(now_secs, self.started_secs);
         if self.live {
-            let out = live_line(
+            let out = live_line_fit(
                 &self.palette,
                 false,
                 self.index,
@@ -1045,11 +1214,12 @@ impl Stage {
                 &mut self.spinner,
                 self.ascii,
                 self.multibyte,
+                columns,
             );
             self.live_active = true;
             out
         } else if crate::log::is_quiet(verbose) {
-            line(
+            line_fit(
                 &self.palette,
                 false,
                 self.index,
@@ -1059,6 +1229,7 @@ impl Stage {
                 &self.detail,
                 &stamp,
                 self.multibyte,
+                columns,
             )
         } else {
             Vec::new()
@@ -1072,13 +1243,14 @@ impl Stage {
         if self.quiet || !self.live || !self.started() {
             return Vec::new();
         }
+        let columns = self.columns();
         let detail = if self.detail.is_empty() {
             b"working".as_slice()
         } else {
             &self.detail
         };
         let stamp = elapsed(now_secs, self.started_secs);
-        let out = live_line(
+        let out = live_line_fit(
             &self.palette,
             false,
             self.index,
@@ -1090,6 +1262,7 @@ impl Stage {
             &mut self.spinner,
             self.ascii,
             self.multibyte,
+            columns,
         );
         self.live_active = true;
         out
@@ -1102,10 +1275,11 @@ impl Stage {
         if self.quiet {
             return Vec::new();
         }
+        let columns = self.columns();
         let stamp = elapsed(now_secs, self.started_secs);
         let (mut out, live_active) = clear_live(self.live_active);
         self.live_active = live_active;
-        out.extend_from_slice(&line(
+        out.extend_from_slice(&line_fit(
             &self.palette,
             false,
             self.index,
@@ -1115,6 +1289,7 @@ impl Stage {
             detail,
             &stamp,
             self.multibyte,
+            columns,
         ));
         out
     }

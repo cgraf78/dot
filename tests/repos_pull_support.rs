@@ -328,7 +328,7 @@ fn upstream_preparation_covers_success_and_failure_classes() {
     };
     let mut diagnostics = Vec::new();
     assert_eq!(
-        prepare_base_upstream(&base, &mut diagnostics),
+        prepare_base_upstream(&base, &mut diagnostics, false),
         Ok(expected.clone())
     );
     assert_eq!(
@@ -343,7 +343,10 @@ fn upstream_preparation_covers_success_and_failure_classes() {
         client_git_dir: String::new(),
         home: lonely.to_string_lossy().into_owned(),
     };
-    assert_eq!(prepare_base_upstream(&base, &mut diagnostics), Err(1));
+    assert_eq!(
+        prepare_base_upstream(&base, &mut diagnostics, false),
+        Err(1)
+    );
     assert_eq!(
         prepare_overlay_upstream(&lonely, true, None, &mut diagnostics),
         Err(1)
@@ -356,7 +359,10 @@ fn upstream_preparation_covers_success_and_failure_classes() {
     git(&lonely, &["config", "branch.main.merge", "refs/heads/main"]);
     let head = git(&lonely, &["rev-parse", "HEAD"]);
     git(&lonely, &["update-ref", "refs/remotes/origin/main", &head]);
-    assert_eq!(prepare_base_upstream(&base, &mut diagnostics), Err(2));
+    assert_eq!(
+        prepare_base_upstream(&base, &mut diagnostics, false),
+        Err(2)
+    );
     // The failed fetch's own diagnostics reach the caller's stream, every
     // line indented under the stage, instead of the inherited descriptor.
     let fetch_output = String::from_utf8(std::mem::take(&mut diagnostics)).expect("UTF-8");
@@ -387,7 +393,10 @@ fn upstream_preparation_covers_success_and_failure_classes() {
         client_git_dir: String::new(),
         home: dir.path().join("missing").to_string_lossy().into_owned(),
     };
-    assert_eq!(prepare_base_upstream(&missing, &mut diagnostics), Err(1));
+    assert_eq!(
+        prepare_base_upstream(&missing, &mut diagnostics, false),
+        Err(1)
+    );
 }
 
 #[test]

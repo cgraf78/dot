@@ -4868,23 +4868,175 @@ pub(crate) fn run_foreground_forward_stderr(command: Command, err: &mut dyn std:
     run_foreground_forward(command, Forwarded::Stderr, err)
 }
 
+/// [`run_foreground_forward_stderr`] for a child that may talk to the
+/// user's terminal: its stderr is a private pseudo-terminal sized like
+/// ours, so a child that checks `isatty(2)` before printing a notice (an
+/// OpenSSH security-key "Confirm user presence" line, a credential helper)
+/// still prints it, and the bytes still reach `err` in order with Dot's
+/// other output. Output processing is off on that terminal, so newlines
+/// arrive unchanged. Falls back to the plain pipe when no pseudo-terminal
+/// can be opened.
+pub(crate) fn run_foreground_forward_stderr_terminal(
+    command: Command,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    match stderr_terminal() {
+        Some((master, slave)) => {
+            run_foreground_forward_with(command, Forwarded::Stderr, err, master, slave)
+        }
+        None => run_foreground_forward(command, Forwarded::Stderr, err),
+    }
+}
+
+/// Open the private pseudo-terminal behind
+/// [`run_foreground_forward_stderr_terminal`]: a nonblocking master and the
+/// slave for the child, both close-on-exec (the child gets the slave
+/// through its stderr redirection), output processing off, and the window
+/// size copied from stdout's terminal when it has one.
+fn stderr_terminal() -> Option<(ForwardReader, Stdio)> {
+    use std::os::fd::FromRawFd as _;
+
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ only fills the zeroed winsize it is handed.
+    let sized = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ as _, &mut size) } == 0;
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty initializes both descriptors; the optional name and
+    // termios pointers are null, and the window size is a live local.
+    let opened = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            if sized {
+                &mut size
+            } else {
+                std::ptr::null_mut()
+            },
+        )
+    };
+    if opened != 0 {
+        return None;
+    }
+    // Move both above the standard descriptors (one closed at entry must not
+    // be reused) with close-on-exec set in the same step.
+    let lift = |fd: i32| {
+        // SAFETY: F_DUPFD_CLOEXEC duplicates a descriptor openpty returned,
+        // which is closed right after either way.
+        let lifted = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        unsafe { libc::close(fd) };
+        (lifted >= 0).then_some(lifted)
+    };
+    let (master, slave) = match (lift(master), lift(slave)) {
+        (Some(master), Some(slave)) => (master, slave),
+        (master, slave) => {
+            for fd in [master, slave].into_iter().flatten() {
+                // SAFETY: closes a descriptor lifted above.
+                unsafe { libc::close(fd) };
+            }
+            return None;
+        }
+    };
+    // SAFETY: the lifted descriptors are uniquely owned.
+    let master = unsafe { std::fs::File::from_raw_fd(master) };
+    let slave = unsafe { std::os::fd::OwnedFd::from_raw_fd(slave) };
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: fcntl/tcgetattr/tcsetattr act on the descriptors just opened.
+    let prepared = unsafe {
+        let mut attributes: libc::termios = std::mem::zeroed();
+        libc::fcntl(
+            master.as_raw_fd(),
+            libc::F_SETFL,
+            libc::fcntl(master.as_raw_fd(), libc::F_GETFL) | libc::O_NONBLOCK,
+        ) == 0
+            && libc::tcgetattr(slave.as_raw_fd(), &mut attributes) == 0
+            && {
+                attributes.c_oflag &= !libc::OPOST;
+                libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &attributes) == 0
+            }
+    };
+    prepared.then(|| (ForwardReader::Terminal(master), Stdio::from(slave)))
+}
+
 /// Which descriptor [`run_foreground_forward`] pipes.
 enum Forwarded {
     Stdout,
     Stderr,
 }
 
+/// The parent's end of a forwarded child descriptor.
+enum ForwardReader {
+    /// A private socket ([`SessionCapture`]).
+    Socket(SessionCapture),
+    /// A pseudo-terminal master ([`stderr_terminal`]).
+    Terminal(std::fs::File),
+}
+
+impl ForwardReader {
+    /// Move up to `budget` available bytes into `output` without blocking.
+    fn drain(&mut self, output: &mut Vec<u8>, budget: usize) -> std::io::Result<()> {
+        match self {
+            ForwardReader::Socket(reader) => {
+                let mut remaining = usize::MAX;
+                reader
+                    .drain(output, &mut remaining, budget, false)
+                    .map(|_| ())
+            }
+            ForwardReader::Terminal(master) => {
+                use std::io::Read as _;
+                let mut drained = 0;
+                let mut chunk = [0u8; 8192];
+                while drained < budget {
+                    let available = (budget - drained).min(chunk.len());
+                    match master.read(&mut chunk[..available]) {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            drained += count;
+                            output.extend_from_slice(&chunk[..count]);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        // Every slave descriptor closed: nothing more can come.
+                        Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Shared body of the foreground forwarders: pipe one descriptor of a
 /// cooperative foreground child and forward each drained chunk to `sink`.
 fn run_foreground_forward(
-    mut command: Command,
+    command: Command,
     forwarded: Forwarded,
     sink: &mut dyn std::io::Write,
 ) -> i32 {
-    let (mut reader, writer) = match SessionCapture::new() {
+    let (reader, writer) = match SessionCapture::new() {
         Ok(pair) => pair,
         Err(_) => return 127,
     };
+    run_foreground_forward_with(
+        command,
+        forwarded,
+        sink,
+        ForwardReader::Socket(reader),
+        writer,
+    )
+}
+
+/// [`run_foreground_forward`] over an already opened reader and the child's
+/// end of it.
+fn run_foreground_forward_with(
+    mut command: Command,
+    forwarded: Forwarded,
+    sink: &mut dyn std::io::Write,
+    mut reader: ForwardReader,
+    writer: Stdio,
+) -> i32 {
+    let prompting = matches!(reader, ForwardReader::Terminal(_));
     match forwarded {
         Forwarded::Stdout => command.stdout(writer),
         Forwarded::Stderr => command.stderr(writer),
@@ -4899,9 +5051,14 @@ fn run_foreground_forward(
             } else {
                 COMMAND_CAPTURE_TICK_BYTES
             };
-            let mut remaining = usize::MAX;
-            let _overflow = reader.drain(&mut scratch, &mut remaining, budget, false)?;
+            reader.drain(&mut scratch, budget)?;
             sink.write_all(&scratch)?;
+            // A child on a terminal may end a chunk mid-line on purpose (a
+            // notice waiting for the user): ask the sink to show it now
+            // instead of holding it for a newline.
+            if prompting && !scratch.is_empty() {
+                sink.flush()?;
+            }
             scratch.clear();
             Ok(())
         },

@@ -577,3 +577,46 @@ fn stage_redraws_nothing_before_its_first_stage_opens() {
         assert!(!stage.update(b"overlay-0", 11, Some("1")).is_empty());
     }
 }
+
+#[test]
+fn terminal_rows_fit_the_width_and_cut_at_words() {
+    // Rows were a fixed 75 columns: narrower terminals wrapped every redraw.
+    let visible = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .trim_start_matches("\r\x1b[K")
+            .trim_end_matches('\n')
+            .chars()
+            .count()
+    };
+    let detail = b"repository synchronization failed; dependency install skipped";
+    for columns in [40, 60, 74] {
+        let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
+            .with_width(RowWidth::Columns(columns));
+        let start = stage.start(b"Tools", Some(detail), 0, None);
+        assert!(visible(&start) < columns, "{columns}: {start:?}");
+        let close = stage.finish(b"warning", detail, 1);
+        assert!(visible(&close) < columns, "{columns}: {close:?}");
+    }
+    let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
+        .with_width(RowWidth::Columns(50));
+    let close = String::from_utf8(stage.finish(b"warning", detail, 1)).unwrap();
+    assert_eq!(
+        close, "[0/5]            warning  repository           1s\n",
+        "cut mid-word or kept a dangling separator"
+    );
+    // Wide terminals keep the 42-column cell, cut at a word boundary.
+    let mut wide = Stage::begin(Palette::empty(), "5", false, true, false, true)
+        .with_width(RowWidth::Columns(120));
+    let close = String::from_utf8(wide.finish(b"warning", detail, 1)).unwrap();
+    assert!(
+        close.contains("warning  repository synchronization failed              1s"),
+        "{close:?}"
+    );
+    // Without a terminal width the historical fixed cell stays byte-for-byte.
+    let mut fixed = Stage::begin(Palette::empty(), "5", false, false, false, true);
+    let close = String::from_utf8(fixed.finish(b"warning", detail, 1)).unwrap();
+    assert_eq!(
+        close,
+        "[0/5]            warning  repository synchronization failed; depende     1s\n"
+    );
+}

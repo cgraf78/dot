@@ -35,6 +35,109 @@
 
 use std::cell::RefCell;
 use std::io::Write;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// A live row was handed to stdout and nothing has ended it yet. A signal
+/// makes the output relay refuse every later write, so the console cannot
+/// end the row itself; [`end_undelivered_output`] does once the relay has
+/// stopped, straight on the terminal.
+static ROW_LEFT_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// A partial stderr line was released to the terminal unterminated (see
+/// [`ROW_LEFT_OPEN`] for why the console may not get to end it).
+static ERR_LEFT_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Stderr bytes the relay refused (after a signal), tail-bounded by
+/// [`UNDELIVERED_LIMIT`], for [`end_undelivered_output`].
+static UNDELIVERED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// Most refused stderr kept for the terminal: the last lines a child wrote
+/// while the run was being torn down.
+const UNDELIVERED_LIMIT: usize = 4096;
+
+/// How long [`end_undelivered_output`] waits for a terminal to accept each
+/// write before giving up.
+const UNDELIVERED_WAIT_MS: i32 = 50;
+
+/// Remember stderr bytes the relay refused.
+fn keep_undelivered(bytes: &[u8]) {
+    let mut kept = UNDELIVERED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    kept.extend_from_slice(bytes);
+    let excess = kept.len().saturating_sub(UNDELIVERED_LIMIT);
+    if excess > 0 {
+        // Keep whole lines: never start mid-line, mid-character, or inside an
+        // escape sequence.
+        let cut = kept[excess..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(kept.len(), |at| excess + at + 1);
+        kept.drain(..cut);
+    }
+}
+
+/// After the output relay has stopped: on a terminal, end a live row the
+/// run left open (an interrupted stage) so the shell prompt starts on its
+/// own line, and show stderr the relay refused during teardown (a child's
+/// last diagnostic). Writes go straight to the entry descriptors, only to
+/// terminals, and only while each accepts them within a short wait, so a
+/// stalled terminal (flow-stopped with Ctrl-S, a hung ssh session) cannot
+/// hold teardown; whatever cannot be written is dropped, as it was before.
+/// `relay_healthy` is false when the relay gave up on a blocked descriptor
+/// or could not be reaped: then nothing is written at all. Called once by
+/// the binary entry point.
+#[doc(hidden)]
+pub fn end_undelivered_output(relay_healthy: bool) {
+    let undelivered = std::mem::take(&mut *UNDELIVERED.lock().unwrap_or_else(|e| e.into_inner()));
+    let row = ROW_LEFT_OPEN.swap(false, Ordering::AcqRel);
+    let line = ERR_LEFT_OPEN.swap(false, Ordering::AcqRel);
+    if !relay_healthy {
+        return;
+    }
+    let terminal = |fd: i32| {
+        crate::cleanup::entry_stdio_open(fd)
+            // SAFETY: isatty only inspects the descriptor.
+            && unsafe { libc::isatty(fd) } == 1
+    };
+    let write = |fd: i32, bytes: &[u8]| {
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let mut ready = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: poll reads one live pollfd and writes its revents.
+            // A refusal, an interruption (another signal), or a terminal
+            // that stays stalled for the wait ends the attempt.
+            if unsafe { libc::poll(&mut ready, 1, UNDELIVERED_WAIT_MS) } != 1
+                || ready.revents & libc::POLLOUT == 0
+            {
+                return;
+            }
+            // SAFETY: writes from a live slice to an open descriptor.
+            let written = unsafe { libc::write(fd, rest.as_ptr().cast(), rest.len()) };
+            if written <= 0 {
+                return;
+            }
+            rest = &rest[written as usize..];
+        }
+    };
+    if row && terminal(libc::STDOUT_FILENO) {
+        write(libc::STDOUT_FILENO, b"\n");
+    }
+    if line && terminal(libc::STDERR_FILENO) {
+        write(libc::STDERR_FILENO, b"\n");
+    }
+    if !undelivered.is_empty() && terminal(libc::STDERR_FILENO) {
+        write(libc::STDERR_FILENO, &undelivered);
+        if !undelivered.ends_with(b"\n") {
+            write(libc::STDERR_FILENO, b"\n");
+        }
+    }
+}
 
 /// Carriage return plus erase-to-end-of-line: the prefix of every live row
 /// redraw, and how this console clears a row before other output.
@@ -102,9 +205,23 @@ impl State<'_> {
     fn erase_row(&mut self) -> std::io::Result<()> {
         if self.line == Line::Row {
             self.out.write_all(ERASE_LINE)?;
-            self.line = Line::Clean;
+            self.set_line(Line::Clean);
         }
         Ok(())
+    }
+
+    /// Record what stdout's current line now holds, publishing whether a
+    /// row is left open for [`end_undelivered_output`].
+    fn set_line(&mut self, line: Line) {
+        self.line = line;
+        ROW_LEFT_OPEN.store(line == Line::Row, Ordering::Release);
+    }
+
+    /// Record whether a released partial stderr line is on screen,
+    /// publishing it for [`end_undelivered_output`].
+    fn set_err_open(&mut self, open: bool) {
+        self.err_open = open;
+        ERR_LEFT_OPEN.store(open, Ordering::Release);
     }
 
     fn write_stdout(&mut self, bytes: &[u8]) -> std::io::Result<()> {
@@ -119,23 +236,36 @@ impl State<'_> {
         }
         // A partial stderr line already on screen would be overwritten.
         if self.err_open {
-            self.err.write_all(b"\n")?;
-            self.err_open = false;
+            // Stop trying either way: a stderr that keeps failing must not
+            // hold every later stdout row back. The published flag still
+            // says the line is open, for the teardown.
+            let ended = self.err.write_all(b"\n");
+            if ended.is_ok() {
+                self.set_err_open(false);
+            } else {
+                self.err_open = false;
+            }
+            ended?;
         }
         if !repositions {
             self.erase_row()?;
         }
         self.out.write_all(bytes)?;
-        self.line = self.line.after(bytes);
+        self.set_line(self.line.after(bytes));
         Ok(())
     }
 
     /// Write `bytes` to stderr after erasing an open row. The erase is
     /// best effort: stderr may reach a log file while stdout's terminal is
     /// gone, so a failed erase still delivers the message, then reports.
-    fn emit_stderr(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    /// `open` is whether `bytes` leave stderr's line unterminated.
+    fn emit_stderr(&mut self, bytes: &[u8], open: bool) -> std::io::Result<()> {
         let erased = self.erase_row();
-        self.err.write_all(bytes)?;
+        if let Err(error) = self.err.write_all(bytes) {
+            keep_undelivered(bytes);
+            return Err(error);
+        }
+        self.set_err_open(open);
         erased
     }
 
@@ -146,8 +276,7 @@ impl State<'_> {
         if let Some(at) = bytes.iter().rposition(|byte| *byte == b'\n') {
             let rest = self.pending.split_off(held + at + 1);
             let lines = std::mem::replace(&mut self.pending, rest);
-            self.err_open = false;
-            self.emit_stderr(&lines)?;
+            self.emit_stderr(&lines, false)?;
         }
         if self.pending.len() >= PENDING_LIMIT {
             self.release_pending(false)?;
@@ -165,8 +294,7 @@ impl State<'_> {
         if terminate {
             partial.push(b'\n');
         }
-        self.err_open = !terminate;
-        self.emit_stderr(&partial)
+        self.emit_stderr(&partial, !terminate)
     }
 }
 
@@ -210,10 +338,13 @@ impl<'a> LiveConsole<'a> {
         }
     }
 
-    /// End the run's output: end a row a stage left open (an interrupted or
-    /// abandoned stage) or unfinished stdout text with a newline, so the last
-    /// progress the run reached stays visible, then any held or open partial
-    /// stderr line, so the shell prompt that follows starts on its own line.
+    /// End the run's output: end a row a stage left open (an abandoned
+    /// stage) or unfinished stdout text with a newline, so the last progress
+    /// the run reached stays visible, then any held or open partial stderr
+    /// line, so the shell prompt that follows starts on its own line. After a
+    /// signal the relay refuses these writes; what they could not deliver is
+    /// left for [`end_undelivered_output`], which the binary entry point runs
+    /// once the relay has stopped.
     pub fn finish(&self) -> std::io::Result<()> {
         let mut state = self.state.borrow_mut();
         if !state.live {
@@ -224,13 +355,20 @@ impl<'a> LiveConsole<'a> {
         let ended = if state.line == Line::Clean {
             Ok(())
         } else {
+            let ended = state.out.write_all(b"\n");
             state.line = Line::Clean;
-            state.out.write_all(b"\n")
+            if ended.is_ok() {
+                ROW_LEFT_OPEN.store(false, Ordering::Release);
+            }
+            ended
         };
         let released = state.release_pending(true);
         let closed = if state.err_open {
-            state.err_open = false;
-            state.err.write_all(b"\n")
+            let closed = state.err.write_all(b"\n");
+            if closed.is_ok() {
+                state.set_err_open(false);
+            }
+            closed
         } else {
             Ok(())
         };

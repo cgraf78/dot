@@ -951,6 +951,9 @@ pub struct PullBaseInputs<'a> {
     pub verbose: bool,
     /// Logger for the dim log dump and backup warnings.
     pub log: &'a Log,
+    /// Live rows reach a real terminal: the fetch may prompt the user, so
+    /// its stderr is a pseudo-terminal (see `prepare_base_upstream`).
+    pub terminal: bool,
 }
 
 /// `_pull_base`: fetch the upstream, fast-path the current
@@ -1030,7 +1033,7 @@ pub fn pull_base(
             return failed();
         }
     }
-    let upstream = match prepare_base_upstream(inputs.base, warnings) {
+    let upstream = match prepare_base_upstream(inputs.base, warnings, inputs.terminal) {
         Ok(upstream) => upstream,
         Err(_) => return failed(),
     };
