@@ -1710,7 +1710,8 @@ fn overlays_failure_summary_fits_the_terminal_in_clauses() {
             80,
             "Overlays   warning  profile or sync failed; links kept ",
         ),
-        (60, "Overlays   warning  profile or sync failed "),
+        (60, "Overlays   warning  sync failed; links kept "),
+        (50, "Overlays   warning  sync failed "),
     ] {
         let run = PtyRun {
             columns,
@@ -1757,4 +1758,77 @@ fn forty_column_rows_hold_whole_clauses_or_nothing() {
             "blank static line {drawn:?} in {text:?}"
         );
     }
+}
+
+#[test]
+fn narrow_rows_keep_short_forms_instead_of_going_blank() {
+    // At 60 columns and below the invalid-descriptor Repos summary went
+    // blank, and at 50 one-clause summaries (`worktree normalized`) blanked
+    // while the elapsed column kept four spare columns.
+    let scratch = Scratch::new("update-run-pty-narrow-short").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "narrow-short", &overlay_origin, &base_origin);
+    check_update(&["update"], &home, &state);
+    let run = PtyRun {
+        columns: 50,
+        ..PtyRun::default()
+    };
+    let (_, output) = dot_on_pty_with(&["update"], &home, &state, &run);
+    let text = String::from_utf8_lossy(&strip_colour(&output)).into_owned();
+    for row in [
+        "Overlays   ok       1 overlay current",
+        "Cleanup    ok       worktree normalized",
+    ] {
+        assert!(text.contains(row), "{row:?} in {text:?}");
+    }
+    std::fs::write(
+        home.join(".config/dot/overlays.d/zz-bad.conf"),
+        b"url=file:///nonexistent\nsync=bogus\n",
+    )
+    .expect("descriptor");
+    for columns in [60, 50] {
+        let run = PtyRun {
+            columns,
+            ..PtyRun::default()
+        };
+        let (_, output) = dot_on_pty_with(&["update"], &home, &state, &run);
+        let text = String::from_utf8_lossy(&strip_colour(&output)).into_owned();
+        assert!(
+            text.contains("Repos      failed   overlay zz-bad "),
+            "{columns} columns: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn narrow_base_fetch_keeps_a_static_line() {
+    // At 50 columns the static `fetching dotfiles` line was skipped, so a
+    // slow or prompting base fetch left the screen blank again.
+    let scratch = Scratch::new("update-run-pty-narrow-fetch").expect("scratch dir");
+    let (home, state, path) = prompting_git_client(&scratch, "narrow-fetch");
+    let mark = scratch.path().join("fetch");
+    let run = PtyRun {
+        columns: 50,
+        env: vec![
+            ("PATH", path),
+            ("DOT_TEST_FETCH_MATCH", "--work-tree".into()),
+            ("DOT_TEST_FETCH_MARK", mark.clone().into_os_string()),
+        ],
+        steps: vec![(
+            PathBuf::from(format!("{}.asked", mark.display())),
+            std::time::Duration::from_millis(500),
+            b"secret\n",
+        )],
+    };
+    let (code, output) = dot_on_pty_with(&["update"], &home, &state, &run);
+    let output = strip_colour(&output);
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(code, Some(0), "{text}");
+    let asked = *occurrences(&output, b"Enter passphrase for key: ")
+        .first()
+        .unwrap_or_else(|| panic!("no prompt: {text:?}"));
+    let fetching = *occurrences(&output, b"[1/5] Repos      running  fetching ")
+        .first()
+        .unwrap_or_else(|| panic!("no static fetch line: {text:?}"));
+    assert!(fetching < asked, "{text:?}");
 }

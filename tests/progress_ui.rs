@@ -575,10 +575,17 @@ fn stage_redraws_nothing_before_its_first_stage_opens() {
         );
         // The static row printed before a required overlay pull, which on
         // such a client also runs before any stage opens.
-        assert!(stage.freeze(b"pulling 1 overlay", 1_700_000_000).is_empty());
+        assert!(
+            stage
+                .freeze(b"pulling 1 overlay", &[], 1_700_000_000)
+                .is_empty()
+        );
         assert!(!stage.start(b"Repos", None, 10, None).is_empty());
         assert!(!stage.update(b"overlay-0", 11, Some("1")).is_empty());
-        assert_eq!(!stage.freeze(b"pulling 1 overlay", 11).is_empty(), live);
+        assert_eq!(
+            !stage.freeze(b"pulling 1 overlay", &[], 11).is_empty(),
+            live
+        );
     }
 }
 
@@ -671,20 +678,35 @@ fn terminal_rows_show_no_word_fragments() {
 }
 
 #[test]
-fn static_lines_are_skipped_when_their_text_cannot_show() {
-    // At 40 columns the static Repos lines printed as blank `running` rows,
-    // two identical-looking lines; with no room for the text the row is only
-    // cleared, which is all a child that may prompt needs.
-    let mut narrow = Stage::begin(Palette::empty(), "5", false, true, false, true)
-        .with_width(RowWidth::Columns(40));
-    let _ = narrow.start(b"Repos", None, 0, None);
-    assert_eq!(narrow.freeze(b"fetching dotfiles", 0), b"\r\x1b[K");
-    let mut wide = Stage::begin(Palette::empty(), "5", false, true, false, true)
-        .with_width(RowWidth::Columns(80));
-    let _ = wide.start(b"Repos", None, 0, None);
-    let frozen = String::from_utf8(wide.freeze(b"fetching dotfiles", 0)).unwrap();
-    assert!(frozen.contains("running  fetching dotfiles"), "{frozen:?}");
-    assert!(frozen.ends_with('\n'), "{frozen:?}");
+fn static_lines_shorten_and_skip_only_identical_repeats() {
+    // A static line keeps the screen from going blank while a child may
+    // prompt: on a narrow terminal it shortens (`fetching`) instead of
+    // vanishing, and only a repeat that would look exactly like the line
+    // before it (both too narrow for any text) is skipped.
+    let frozen = |columns: usize| {
+        let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
+            .with_width(RowWidth::Columns(columns));
+        let _ = stage.start(b"Repos", None, 0, None);
+        let first =
+            String::from_utf8(stage.freeze(b"fetching dotfiles", &[b"fetching"], 0)).unwrap();
+        let second =
+            String::from_utf8(stage.freeze(b"pulling 2 overlays", &[b"pulling"], 0)).unwrap();
+        (first, second)
+    };
+    let (first, second) = frozen(80);
+    assert!(first.contains("running  fetching dotfiles "), "{first:?}");
+    assert!(
+        second.contains("running  pulling 2 overlays "),
+        "{second:?}"
+    );
+    let (first, second) = frozen(40);
+    assert!(first.contains("running  fetching "), "{first:?}");
+    assert!(first.ends_with('\n'), "{first:?}");
+    assert!(second.contains("running  pulling "), "{second:?}");
+    let (first, second) = frozen(34);
+    assert!(first.contains("Repos      running "), "{first:?}");
+    assert!(first.ends_with('\n'), "{first:?}");
+    assert_eq!(second, "", "an identical blank repeat is skipped");
 }
 
 #[test]
@@ -704,5 +726,5 @@ fn terminal_progress_rows_keep_their_label_and_bar_whole() {
     );
     assert!(live(48).contains("overlay-0 "), "{}", live(48));
     assert!(!live(48).contains("[#"), "{}", live(48));
-    assert!(!live(40).contains("overlay"), "{}", live(40));
+    assert!(!live(36).contains("overlay"), "{}", live(36));
 }

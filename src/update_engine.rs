@@ -2215,7 +2215,10 @@ fn finalize(
         let close = stage.finish_brief(
             b"warning",
             b"profile resolution or repository sync failed",
-            b"profile or sync failed; links kept",
+            &[
+                b"profile or sync failed; links kept",
+                b"sync failed; links kept",
+            ],
             crate::update_engine::now_secs(),
         );
         let _ = io.out.write_all(&close);
