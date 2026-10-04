@@ -9773,7 +9773,7 @@ import subprocess
 import sys
 
 child = subprocess.Popen(
-    ["/bin/sleep", "1"],
+    ["/bin/sleep", "30"],
     start_new_session=True,
     close_fds=True,
     stdin=subprocess.DEVNULL,
@@ -9819,13 +9819,17 @@ os._exit(0)
             1,
             "normal exit must take exactly one session snapshot"
         );
+        // The descendant outlives any loaded-host supervision by far, so its
+        // liveness above proves normal success left it alone rather than that
+        // it had not exited yet. Stop it through the pinned identity.
+        assert!(member.signal(libc::SIGKILL).unwrap());
         assert!(
             reap_owned(
                 vec![vec![member]],
                 Instant::now() + Duration::from_secs(3),
                 wait_member,
             )[0],
-            "self-bounded detached fixture was not reaped"
+            "detached fixture was not reaped after SIGKILL"
         );
     }
 
@@ -12184,20 +12188,33 @@ os._exit(0)
             "same-group no-pidfd descendant remained as an adopted zombie"
         );
 
+        // The escapee must still be alive whenever the supervisor looks for
+        // it. A fixed 2s lifetime raced slow process-table walks on a loaded
+        // host: once it expired the escape vanished and the session ended
+        // cleanly. It now lives until the test releases it or the fixture
+        // directory disappears (a failed run drops the TempDir), and gives
+        // up on its own after 600 polls 50ms apart (at least 30s; more on a
+        // loaded host) so nothing can leak it indefinitely.
         let escaped_pid = scope.path().join("escaped.pid");
+        let release = scope.path().join("escaped.release");
         let mut escaped = Command::new(dot_test_support::bash());
         escaped
             .args([
                 "-c",
-                "setsid bash -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; sleep 2' no-pidfd-escaped \"$1\" & while [[ ! -s $1 ]]; do sleep 0.01; done; exit 0",
+                "setsid bash -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; for _ in {1..600}; do [[ -e $2 || ! -d ${2%/*} ]] && exit 0; sleep 0.05; done' no-pidfd-escaped \"$1\" \"$2\" & while [[ ! -s $1 ]]; do sleep 0.01; done; exit 0",
                 "no-pidfd-parent",
             ])
             .arg(&escaped_pid)
+            .arg(&release)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let escaped_end = supervise_session(escaped, None, |_| Ok(())).unwrap();
-        assert!(matches!(escaped_end, SessionEnd::CleanupIncomplete));
+        std::fs::write(&release, b"").unwrap();
+        assert!(
+            matches!(escaped_end, SessionEnd::CleanupIncomplete),
+            "an unpinned session escapee must fail closed"
+        );
         let escaped_pid = std::fs::read_to_string(escaped_pid)
             .unwrap()
             .trim()
