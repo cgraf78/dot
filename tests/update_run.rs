@@ -1353,6 +1353,14 @@ fn interrupted_update_ends_the_open_row_on_the_terminal() {
         .expect("row ended");
     let row_line = String::from_utf8_lossy(&rest[..end]);
     assert!(!row_line.contains("warning"), "{row_line:?} in {text:?}");
+    // The warning the teardown printed was refused by the relay (after the
+    // signal) and still reaches the terminal, on its own line, worded as an
+    // interruption rather than a failure.
+    assert!(
+        String::from_utf8_lossy(&rest[end..])
+            .contains("\n  warning: pre-sync extension interrupted: 10-wait.sh\r\n"),
+        "{text:?}"
+    );
 }
 
 #[test]
@@ -1381,17 +1389,18 @@ fn interrupted_fetch_keeps_its_last_words_on_the_terminal() {
     let output = strip_colour(&output);
     let text = String::from_utf8_lossy(&output);
     assert_eq!(code, Some(130), "{text}");
-    let at = *occurrences(&output, b"fetch: interrupted, cleaning up")
-        .first()
-        .unwrap_or_else(|| panic!("teardown diagnostic dropped: {text:?}"));
-    // The unfinished `fetch: waiting` line is ended first, so the rest of
-    // what the child wrote starts on a line of its own.
-    assert!(
-        output[..at].ends_with(b"\n"),
-        "teardown diagnostic shares a line: {text:?}"
-    );
+    // The child's unfinished `fetch: waiting` line was shown and is ended,
+    // so the shell prompt does not land on it. Whether the child's own
+    // cleanup line is read before the teardown is a race; when it is, it
+    // starts a line of its own.
     assert!(text.contains("    fetch: waiting"), "{text:?}");
     assert!(output.ends_with(b"\r\n"), "line left open: {text:?}");
+    if let Some(at) = occurrences(&output, b"fetch: interrupted, cleaning up").first() {
+        assert!(
+            output[..*at].ends_with(b"\n"),
+            "teardown diagnostic shares a line: {text:?}"
+        );
+    }
 }
 
 #[test]
@@ -1430,6 +1439,17 @@ fn base_fetch_prompt_starts_on_a_clear_line_and_keeps_a_terminal() {
     assert!(
         !occurrences(&output, b"    stderr is a terminal").is_empty(),
         "fetch stderr is not a terminal: {text:?}"
+    );
+    // The screen is never blank while the fetch may ask: a static line says
+    // what runs, and the question starts below it.
+    let fetching = *occurrences(&output, b"[1/5] Repos      running  fetching dotfiles")
+        .first()
+        .unwrap_or_else(|| panic!("no static fetch line: {text:?}"));
+    assert!(fetching < asked, "{text:?}");
+    let line_end = fetching + output[fetching..].iter().position(|b| *b == b'\n').unwrap();
+    assert!(
+        line_end < asked && output[line_end - 1] == b'\r',
+        "{text:?}"
     );
 }
 
@@ -1475,6 +1495,11 @@ fn overlay_fetch_prompt_is_not_redrawn_over() {
         "redrawn over the prompt: {:?}",
         String::from_utf8_lossy(&output[asked..answered])
     );
+    // A static line said what runs, so the screen was not left blank.
+    let pulling = *occurrences(&output, b"[1/5] Repos      running  pulling 1 overlay")
+        .first()
+        .unwrap_or_else(|| panic!("no static pull line: {text:?}"));
+    assert!(pulling < asked, "{text:?}");
 }
 
 #[test]
@@ -1590,6 +1615,85 @@ fn failed_pre_sync_keeps_the_repos_counts_the_shell_engine_printed() {
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .contains("  warning: pre-sync extension failed: 10-wait.sh\n"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn interrupted_merge_hook_reports_interrupted_not_failed() {
+    // A merge hook stopped by Ctrl-C was reported as `merge failed`.
+    let scratch = Scratch::new("update-run-pty-merge-interrupt").expect("scratch dir");
+    let (home, state) = waiting_hook_client(&scratch, "merge-interrupt");
+    let hooks = home.join("ext/merge-hooks.d");
+    std::fs::create_dir_all(&hooks).expect("merge hooks");
+    std::fs::remove_file(home.join("ext/pre-sync.d/10-wait.sh")).expect("drop pre-sync hook");
+    let hook = hooks.join("10-slow.sh");
+    std::fs::write(&hook, b"merge() { : >\"$HOME/hook-ready\"; sleep 30; }\n").expect("hook");
+    for path in [&hooks, &hook] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    }
+    let run = PtyRun {
+        env: vec![(
+            "DOT_BASH",
+            dot_test_support::real_tool("bash").into_os_string(),
+        )],
+        steps: vec![(
+            home.join("hook-ready"),
+            std::time::Duration::from_millis(300),
+            b"\x03",
+        )],
+        ..PtyRun::default()
+    };
+    let (code, output) = dot_on_pty_with(&["update"], &home, &state, &run);
+    let output = strip_colour(&output);
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(code, Some(130), "{text}");
+    assert!(text.contains("warning: merge interrupted"), "{text:?}");
+    assert!(!text.contains("merge failed"), "{text:?}");
+}
+
+#[test]
+fn quiet_base_fetch_output_is_named() {
+    // With the Repos row hidden, the base fetch's lines are named like an
+    // overlay's instead of standing alone.
+    let scratch = Scratch::new("update-run-quiet-base-header").expect("scratch dir");
+    let (home, state) = unreachable_base_client(&scratch, "quiet-header");
+    for argv in [&["update", "--quiet"][..], &["update", "--cron"][..]] {
+        let output = dot(argv, &home, &state);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.starts_with("  dotfiles fetch output:\n    fatal:"),
+            "{argv:?}: {output:?}"
+        );
+    }
+    // The visible row names it otherwise: no header.
+    let output = dot(&["update"], &home, &state);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).starts_with("    fatal:"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn descriptor_names_reach_the_terminal_without_control_bytes() {
+    // The overlay name in the Repos row and the warning come from a file name
+    // that failed validation, so it may hold escapes.
+    let scratch = Scratch::new("update-run-descriptor-escape").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "escape", &overlay_origin, &base_origin);
+    check_update(&["update"], &home, &state);
+    std::fs::write(
+        home.join(".config/dot/overlays.d/zz\x1b[31mbad.conf"),
+        b"url=file:///nonexistent\nsync=bogus\n",
+    )
+    .expect("descriptor");
+    let output = dot(&["update"], &home, &state);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    for stream in [&output.stdout, &output.stderr] {
+        assert!(!stream.contains(&0x1b), "{output:?}");
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("overlay zz [31mbad: invalid descriptor"),
         "{output:?}"
     );
 }

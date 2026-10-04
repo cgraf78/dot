@@ -56,9 +56,9 @@ static UNDELIVERED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// while the run was being torn down.
 const UNDELIVERED_LIMIT: usize = 4096;
 
-/// How long [`end_undelivered_output`] waits for a terminal to accept each
-/// write before giving up.
-const UNDELIVERED_WAIT_MS: i32 = 50;
+/// How long [`end_undelivered_output`] waits, in all, for terminals to
+/// accept what it writes before giving up.
+const UNDELIVERED_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Remember stderr bytes the relay refused.
 fn keep_undelivered(bytes: &[u8]) {
@@ -82,7 +82,7 @@ fn keep_undelivered(bytes: &[u8]) {
 /// run left open (an interrupted stage) so the shell prompt starts on its
 /// own line, and show stderr the relay refused during teardown (a child's
 /// last diagnostic). Writes go straight to the entry descriptors, only to
-/// terminals, and only while each accepts them within a short wait, so a
+/// terminals, and only while they accept them within a short wait, so a
 /// stalled terminal (flow-stopped with Ctrl-S, a hung ssh session) cannot
 /// hold teardown; whatever cannot be written is dropped, as it was before.
 /// `relay_healthy` is false when the relay gave up on a blocked descriptor
@@ -101,29 +101,45 @@ pub fn end_undelivered_output(relay_healthy: bool) {
             // SAFETY: isatty only inspects the descriptor.
             && unsafe { libc::isatty(fd) } == 1
     };
+    // One deadline for every write: the terminal is asked for each byte
+    // without ever blocking (the descriptor is switched to non-blocking for
+    // the attempt and back after, since a writable poll on a terminal only
+    // promises room for one byte).
+    let deadline = std::time::Instant::now() + UNDELIVERED_WAIT;
     let write = |fd: i32, bytes: &[u8]| {
+        // SAFETY: F_GETFL/F_SETFL only read and set this descriptor's flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return;
+        }
         let mut rest = bytes;
         while !rest.is_empty() {
+            // SAFETY: writes from a live slice to an open descriptor.
+            let written = unsafe { libc::write(fd, rest.as_ptr().cast(), rest.len()) };
+            if written > 0 {
+                rest = &rest[written as usize..];
+                continue;
+            }
+            let full = written < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock;
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if !full || left.is_zero() {
+                break;
+            }
             let mut ready = libc::pollfd {
                 fd,
                 events: libc::POLLOUT,
                 revents: 0,
             };
-            // SAFETY: poll reads one live pollfd and writes its revents.
-            // A refusal, an interruption (another signal), or a terminal
-            // that stays stalled for the wait ends the attempt.
-            if unsafe { libc::poll(&mut ready, 1, UNDELIVERED_WAIT_MS) } != 1
-                || ready.revents & libc::POLLOUT == 0
-            {
-                return;
+            // SAFETY: poll reads one live pollfd and writes its revents. An
+            // interruption (another signal) ends the attempt.
+            let wait = i32::try_from(left.as_millis().max(1)).unwrap_or(i32::MAX);
+            if unsafe { libc::poll(&mut ready, 1, wait) } != 1 {
+                break;
             }
-            // SAFETY: writes from a live slice to an open descriptor.
-            let written = unsafe { libc::write(fd, rest.as_ptr().cast(), rest.len()) };
-            if written <= 0 {
-                return;
-            }
-            rest = &rest[written as usize..];
         }
+        // SAFETY: restores the flags read above.
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
     };
     if row && terminal(libc::STDOUT_FILENO) {
         write(libc::STDOUT_FILENO, b"\n");

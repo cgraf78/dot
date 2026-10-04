@@ -1573,6 +1573,8 @@ fn run_update(
                 // reading a password), and since when echo is back on.
                 let mut echo_read = false;
                 let mut echo_back: Option<std::time::Instant> = None;
+                // The provider has prompted during this run.
+                let mut echo_watched = false;
                 let mut bounded_deferred_stdout =
                     LimitedWriter::new(deferred_stdout, PROVIDER_FRAME_LIMIT_BYTES);
                 let mut bounded_final_stderr =
@@ -1673,8 +1675,15 @@ fn run_update(
                     // and the install that follows may run a long time
                     // without another event. Echo must stay back on for a
                     // while first: after a wrong password it is on during
-                    // the failure delay, then off again for the retry.
-                    if session.prompt_active && !final_pass {
+                    // the failure delay, then off again for the retry. Once
+                    // the provider has prompted, echo is watched for the
+                    // rest of its run, so a retry that comes later still
+                    // stops the redraws (without erasing anything: the
+                    // question may already be on the current line).
+                    if session.prompt_active {
+                        echo_watched = true;
+                    }
+                    if echo_watched && !final_pass {
                         match terminal_echo() {
                             Some(false) => {
                                 echo_read = true;
@@ -1690,11 +1699,8 @@ fn run_update(
                             }
                             _ => {}
                         }
-                    } else {
-                        echo_read = false;
-                        echo_back = None;
                     }
-                    if result.is_ok() && !final_pass && !session.prompt_active {
+                    if result.is_ok() && !final_pass && !session.prompt_active && !echo_read {
                         let now = crate::update_engine::now_secs();
                         if beat.poll(now) {
                             heartbeat_out.write_all(&stage.tick(now))?;

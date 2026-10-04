@@ -1033,7 +1033,15 @@ pub fn pull_base(
             return failed();
         }
     }
-    let upstream = match prepare_base_upstream(inputs.base, warnings, inputs.terminal) {
+    // With the Repos row hidden (quiet, cron), name the repository above its
+    // fetch output, as an overlay's is named.
+    let mut header = Vec::new();
+    if inputs.quiet {
+        inputs.log.warn(&mut header, "  dotfiles fetch output:");
+    }
+    let mut fetch_output = crate::repos_pull_support::HeaderFirst::new(warnings, header);
+    let fetched = prepare_base_upstream(inputs.base, &mut fetch_output, inputs.terminal);
+    let upstream = match fetched {
         Ok(upstream) => upstream,
         Err(_) => return failed(),
     };

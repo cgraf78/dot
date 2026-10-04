@@ -984,6 +984,12 @@ fn replay(
             );
             let _ = out.write_all(&rendered);
         } else if record.rc != 0 {
+            // A hook stopped by Ctrl-C did not fail on its own.
+            let outcome = if crate::cleanup::received_signal().is_some() {
+                "interrupted"
+            } else {
+                "failed"
+            };
             if !record.output.is_empty() {
                 inputs.log.warn(
                     err,
@@ -993,12 +999,12 @@ fn replay(
                     let _ = err.write_all(b"    ");
                     let _ = err.write_all(line);
                 }
-                inputs.log.warn(err, "  warning: merge failed");
+                inputs.log.warn(err, &format!("  warning: merge {outcome}"));
             } else {
                 inputs.log.warn(
                     err,
                     &format!(
-                        "  warning: merge failed: {}",
+                        "  warning: merge {outcome}: {}",
                         record.hook.key.to_string_lossy()
                     ),
                 );

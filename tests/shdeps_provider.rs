@@ -463,21 +463,31 @@ case ${1:-} in
       # Act like sudo on the terminal after a wrong first password: ask with
       # echo off, echo back on through the failure delay, ask again, then a
       # long quiet install with no event.
+      # Like sudo, echo goes off before each question is printed. A third
+      # question comes long after the row is back (another sudo call).
       if [[ ${DOT_TEST_PROVIDER_PROMPT_ECHO:-0} == 1 ]]; then
         sleep 0.3
-        printf '[sudo] password: ' >/dev/tty
         stty -echo </dev/tty
+        printf '[sudo] password: ' >/dev/tty
         sleep 1
         stty echo </dev/tty
         printf '\nSorry, try again.\n' >/dev/tty
         sleep 1
-        printf '[sudo] password: ' >/dev/tty
         stty -echo </dev/tty
+        printf '[sudo] password: ' >/dev/tty
         sleep 0.5
         stty echo </dev/tty
         printf '\n' >/dev/tty
         sleep 4
         printf '%s\n' 'install finished' >&2
+        # Let dot's relay deliver that line before writing straight to the
+        # terminal again.
+        sleep 0.5
+        stty -echo </dev/tty
+        printf '[sudo] password again: ' >/dev/tty
+        sleep 1.5
+        stty echo </dev/tty
+        printf 'answered\n' >/dev/tty
       fi
       if [[ -n ${DOT_TEST_PROVIDER_PROMPT_HOLD:-} ]]; then
         sleep "$DOT_TEST_PROVIDER_PROMPT_HOLD"
@@ -4750,6 +4760,15 @@ fn provider_prompt_row_returns_once_the_password_is_read() {
         quiet.windows(row.len()).any(|window| window == row),
         "row did not return during the quiet install: {:?}",
         String::from_utf8_lossy(quiet)
+    );
+    // A later question, after the row came back, pauses the redraws again.
+    let late = find(&output, b"[sudo] password again: ", finished);
+    let answered = find(&output, b"answered", late);
+    let asking = &output[late..answered];
+    assert!(
+        !asking.windows(row.len()).any(|window| window == row),
+        "redrawn over a later prompt: {:?}",
+        String::from_utf8_lossy(asking)
     );
 }
 

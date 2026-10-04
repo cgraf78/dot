@@ -1796,10 +1796,16 @@ fn discover_selected(
 /// the counts its row has always shown (and the performance gate compares
 /// against the shell engine's rows for those), with the cause on stderr.
 fn discovery_reason(state: &crate::overlays::State) -> Option<String> {
-    state
-        .discovery_failed
-        .as_ref()
-        .map(|(name, fault)| format!("overlay {name}: {}", fault.summary()))
+    // The name is whatever the descriptor's file name held, controls and
+    // escapes included (an invalid name is how it got here).
+    state.discovery_failed.as_ref().map(|(name, fault)| {
+        let name = crate::progress_ui::sanitize_untrusted_text(name.as_bytes());
+        format!(
+            "overlay {}: {}",
+            String::from_utf8_lossy(&name),
+            fault.summary()
+        )
+    })
 }
 
 /// Print a failed overlay discovery the way every other diagnostic prints:
@@ -1811,7 +1817,12 @@ fn report_discovery_error(
     err: &mut dyn std::io::Write,
     error: &crate::overlays::Error,
 ) {
-    let text = error.to_string();
+    // Descriptor paths and names come from file names: keep their control
+    // bytes and escapes out of the terminal.
+    let text = String::from_utf8_lossy(&crate::progress_ui::sanitize_untrusted_text(
+        error.to_string().as_bytes(),
+    ))
+    .into_owned();
     if text.is_empty() {
         return;
     }

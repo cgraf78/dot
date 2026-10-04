@@ -561,30 +561,76 @@ impl Fit {
     }
 }
 
-/// [`cell`] for terminal rows: pad to `width`, or cut over-long text at
-/// its last word boundary (dropping a trailing `;`/`,`/`:` left dangling)
-/// when one falls in the cell's second half, else at `width`.
+/// [`cell`] for terminal rows: pad to `width`, shortening over-long text
+/// without cutting a word. A summary of clauses (`2 repos current, 1 repo
+/// failed`) drops whole clauses, keeping any that report a failure first;
+/// a single clause keeps its leading whole words. When not even one word
+/// fits, the cell stays blank rather than showing a word fragment.
 fn word_cell(text: &[u8], width: usize, multibyte: bool) -> Vec<u8> {
     if measured_len(text, multibyte) <= width {
         return pad(text, width, multibyte);
     }
+    let clauses = clauses(text);
+    let failing = |clause: &&[u8]| clause.windows(4).any(|window| window == b"fail");
+    let mut chosen = vec![false; clauses.len()];
+    let mut used = 0;
+    let order = (0..clauses.len())
+        .filter(|at| failing(&clauses[*at]))
+        .chain((0..clauses.len()).filter(|at| !failing(&clauses[*at])));
+    for at in order {
+        let extra = measured_len(clauses[at], multibyte) + if used > 0 { 2 } else { 0 };
+        if used + extra <= width {
+            chosen[at] = true;
+            used += extra;
+        }
+    }
+    let kept: Vec<&[u8]> = clauses
+        .iter()
+        .zip(&chosen)
+        .filter(|(_, chosen)| **chosen)
+        .map(|(clause, _)| *clause)
+        .collect();
+    if !kept.is_empty() {
+        return pad(&kept.join(b", ".as_slice()), width, multibyte);
+    }
+    let first = clauses
+        .iter()
+        .find(|clause| failing(clause))
+        .or(clauses.first())
+        .copied()
+        .unwrap_or(text);
+    pad(&leading_words(first, width, multibyte), width, multibyte)
+}
+
+/// `text` split at its `, ` and `; ` clause separators.
+fn clauses(text: &[u8]) -> Vec<&[u8]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut at = 0;
+    while at + 1 < text.len() {
+        if matches!(text[at], b',' | b';') && text[at + 1] == b' ' {
+            parts.push(text[start..at].trim_ascii());
+            start = at + 2;
+            at += 2;
+        } else {
+            at += 1;
+        }
+    }
+    parts.push(text[start..].trim_ascii());
+    parts.retain(|part| !part.is_empty());
+    parts
+}
+
+/// The whole words of `text` that fit in `width` (possibly none).
+fn leading_words(text: &[u8], width: usize, multibyte: bool) -> Vec<u8> {
     let prefix = take_prefix(text, width, multibyte);
-    let at_boundary = text.get(prefix.len()) == Some(&b' ');
-    let cut = if at_boundary {
+    let cut = if matches!(text.get(prefix.len()), None | Some(b' ')) {
         prefix.len()
     } else {
-        match prefix.iter().rposition(|byte| *byte == b' ') {
-            Some(space) if measured_len(&prefix[..space], multibyte) * 2 >= width => space,
-            _ => prefix.len(),
-        }
+        prefix.iter().rposition(|byte| *byte == b' ').unwrap_or(0)
     };
     let kept = prefix[..cut].trim_ascii_end();
-    let kept = kept
-        .strip_suffix(b";")
-        .or_else(|| kept.strip_suffix(b","))
-        .or_else(|| kept.strip_suffix(b":"))
-        .unwrap_or(kept);
-    pad(kept, width, multibyte)
+    kept.strip_suffix(b":").unwrap_or(kept).to_vec()
 }
 
 /// `_ui_line`: one newline-terminated progress line. `total` and
@@ -1286,6 +1332,34 @@ impl Stage {
             &self.total,
             &self.label,
             status,
+            detail,
+            &stamp,
+            self.multibyte,
+            columns,
+        ));
+        out
+    }
+
+    /// Replace the live row with a static, newline-terminated copy showing
+    /// `detail`, before a child that may prompt on the terminal runs: the
+    /// screen keeps saying what is happening, and nothing redraws over the
+    /// child (the live row returns on the next line with the next render).
+    /// Silent unless the row is live.
+    pub fn freeze(&mut self, detail: &[u8], now_secs: i64) -> Vec<u8> {
+        if self.quiet || !self.live {
+            return Vec::new();
+        }
+        let columns = self.columns();
+        let stamp = elapsed(now_secs, self.started_secs);
+        let (mut out, live_active) = clear_live(self.live_active);
+        self.live_active = live_active;
+        out.extend_from_slice(&line_fit(
+            &self.palette,
+            false,
+            self.index,
+            &self.total,
+            &self.label,
+            b"running",
             detail,
             &stamp,
             self.multibyte,

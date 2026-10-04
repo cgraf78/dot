@@ -620,3 +620,25 @@ fn terminal_rows_fit_the_width_and_cut_at_words() {
         "[0/5]            warning  repository synchronization failed; depende     1s\n"
     );
 }
+
+#[test]
+fn terminal_rows_drop_whole_clauses_and_keep_failures() {
+    // Narrow rows cut summaries mid-word (`2 repo`, `profil`) and could drop
+    // the failure (`2 repos current, 1 repo` without "failed").
+    let close = |columns: usize, detail: &[u8]| {
+        let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
+            .with_width(RowWidth::Columns(columns));
+        String::from_utf8(stage.finish(b"failed", detail, 1)).unwrap()
+    };
+    let summary = b"2 repos current, 1 repo failed";
+    assert!(
+        close(60, summary).contains("failed   1 repo failed "),
+        "{}",
+        close(60, summary)
+    );
+    assert!(close(80, summary).contains("2 repos current, 1 repo failed"));
+    // Not even one word fits: blank, not a fragment.
+    let narrow = close(40, b"profile resolution or repository sync failed");
+    assert!(narrow.contains("failed   "), "{narrow:?}");
+    assert!(!narrow.contains("profil"), "{narrow:?}");
+}

@@ -473,10 +473,12 @@ pub fn pull_overlays_serial(
             inputs.dot_verbose,
             inputs.bar_width,
         );
-        // A required overlay's fetch may ask on the terminal: keep the row
-        // off the screen while it runs (see `run_chunk`).
+        // A required overlay's fetch may ask on the terminal: leave a static
+        // line instead of a live row while it runs (see `run_chunk`).
         if stage.on_terminal() && !entry.optional {
-            let _ = out.write_all(&stage.clear());
+            let mut detail = b"pulling ".to_vec();
+            detail.extend_from_slice(entry.name.as_bytes());
+            let _ = out.write_all(&stage.freeze(&detail, crate::update_engine::now_secs()));
         } else {
             let _ = out.write_all(&rendered);
         }
@@ -574,12 +576,19 @@ fn run_chunk(
 ) {
     let host_git = crate::init_client_identity::carry_host_git();
     // A required overlay's fetch may ask on the terminal (an SSH passphrase
-    // or host key). On a terminal, clear the row before any worker starts
-    // and keep the heartbeat from redrawing it over a question until the
-    // chunk is done; the next stage render puts it back.
+    // or host key). On a terminal, leave a static line saying what runs
+    // before any worker starts and keep the heartbeat from redrawing over a
+    // question until the chunk is done; the next stage render draws the
+    // live row again below.
     let quiet_row = stage.on_terminal() && chunk.iter().any(|entry| !entry.optional);
     if quiet_row {
-        let _ = out.write_all(&stage.clear());
+        let mut detail = b"pulling ".to_vec();
+        detail.extend_from_slice(&crate::progress_ui::count_phrase(
+            chunk.len() as i64,
+            b"overlay",
+            None,
+        ));
+        let _ = out.write_all(&stage.freeze(&detail, crate::update_engine::now_secs()));
     }
     let (completion_tx, completion_rx) = std::sync::mpsc::channel::<()>();
     std::thread::scope(|scope| {
@@ -1047,11 +1056,14 @@ pub fn pull_all(
         terminal: stage.on_terminal(),
     };
     // The base fetch may ask on the terminal (an SSH passphrase or host key,
-    // a credential): clear the row first so a prompt starts at column zero,
-    // and draw it again once the pull returns (nothing redraws it during).
+    // a credential): leave a static line saying what runs, so a prompt
+    // starts at column zero below it and the screen is never blank, and
+    // draw the live row again once the pull returns (nothing redraws it
+    // during).
     let terminal = stage.on_terminal();
     if terminal {
-        let _ = out.write_all(&stage.clear());
+        let _ =
+            out.write_all(&stage.freeze(b"fetching dotfiles", crate::update_engine::now_secs()));
     }
     let base_outcome = pull_base(&base_inputs, moves, out, warnings);
     if terminal {

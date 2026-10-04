@@ -239,6 +239,35 @@ fn rev_parse(prefix: &[std::ffi::OsString], args: &[&str]) -> Option<String> {
     Some(text)
 }
 
+/// A writer that puts `header` in front of the first bytes written to
+/// `inner`, and nothing when nothing is written.
+pub(crate) struct HeaderFirst<'a> {
+    inner: &'a mut dyn std::io::Write,
+    header: Vec<u8>,
+}
+
+impl<'a> HeaderFirst<'a> {
+    /// Write `header` ahead of whatever reaches `inner` first.
+    pub(crate) fn new(inner: &'a mut dyn std::io::Write, header: Vec<u8>) -> Self {
+        HeaderFirst { inner, header }
+    }
+}
+
+impl std::io::Write for HeaderFirst<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if !bytes.is_empty() && !self.header.is_empty() {
+            let header = std::mem::take(&mut self.header);
+            self.inner.write_all(&header)?;
+        }
+        self.inner.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Run `git fetch` under `prefix` in the foreground, its diagnostics
 /// indented under the stage on `warnings` instead of the inherited
 /// descriptor: written straight to the terminal they landed at the end
@@ -275,7 +304,9 @@ fn fetch(
         .stdout(std::process::Stdio::inherit());
     let mut indented = crate::progress_ui::IndentedLines::new(warnings);
     let mut sink = Lenient(&mut indented);
-    if terminal {
+    // The pseudo-terminal's bytes reach stderr: only when stderr is the
+    // terminal too, or terminal formatting would land in a log file.
+    if terminal && std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         crate::cleanup::run_foreground_forward_stderr_terminal(cmd, &mut sink)
     } else {
         crate::cleanup::run_foreground_forward_stderr(cmd, &mut sink)
