@@ -1344,9 +1344,10 @@ impl Stage {
     /// `detail`, before a child that may prompt on the terminal runs: the
     /// screen keeps saying what is happening, and nothing redraws over the
     /// child (the live row returns on the next line with the next render).
-    /// Silent unless the row is live.
+    /// Silent unless the row is live and a stage has opened: before the
+    /// first stage there is no row, only a `[0/N]` with an epoch timer.
     pub fn freeze(&mut self, detail: &[u8], now_secs: i64) -> Vec<u8> {
-        if self.quiet || !self.live {
+        if self.quiet || !self.live || !self.started() {
             return Vec::new();
         }
         let columns = self.columns();

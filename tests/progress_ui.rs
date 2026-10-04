@@ -573,8 +573,12 @@ fn stage_redraws_nothing_before_its_first_stage_opens() {
                 .maybe_progress(b"overlay-0", 1, 2, 1_700_000_000, None, "8")
                 .is_empty()
         );
+        // The static row printed before a required overlay pull, which on
+        // such a client also runs before any stage opens.
+        assert!(stage.freeze(b"pulling 1 overlay", 1_700_000_000).is_empty());
         assert!(!stage.start(b"Repos", None, 10, None).is_empty());
         assert!(!stage.update(b"overlay-0", 11, Some("1")).is_empty());
+        assert_eq!(!stage.freeze(b"pulling 1 overlay", 11).is_empty(), live);
     }
 }
 
