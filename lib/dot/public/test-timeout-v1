@@ -111,7 +111,7 @@ nested_supervisors: dict[str, tuple[int, socket.socket]] = {}
 # count, so neither a peek glitch nor a missed snapshot alone can
 # orphan a live nested session; a truly exited supervisor is
 # persistently EOF and persistently absent, and still unregisters
-# after three observations.
+# after NESTED_UNREGISTER_STRIKES observations.
 nested_unhealthy_strikes: dict[str, int] = {}
 # Whether any nested supervisor ever registered. Registrations arrive
 # during supervision, long before the stop; once set, phase completion
@@ -123,6 +123,25 @@ nested_control_complete = True
 ancestor_registration: socket.socket | None = None
 PROCESS_SNAPSHOT_TIMEOUT_SECONDS = 1
 PROCESS_POLL_SECONDS = 0.05
+# Unhealthy observations that unregister a nested supervisor.
+NESTED_UNREGISTER_STRIKES = 3
+# A stop phase completes after this many consecutive empty observations.
+STABLE_EMPTY_OBSERVATIONS = 2
+# Complete snapshots a KILL phase must have taken in total before it gives
+# up, observing past its wall-clock deadline if needed. KILL cannot be
+# caught, so what remains is certification, and that is counted in
+# snapshots, not seconds. The longest certifying sequence is five: one
+# snapshot to signal a member the KILL reparented, three strikes to
+# unregister a dead registered owner (the last also counts as the first
+# empty), and one more empty. A Python procfs walk over a few thousand
+# processes costs 0.1-0.5 s on a loaded host, so a one-second deadline
+# alone can end the phase after one or two post-KILL snapshots and report
+# a clean session as incomplete (125). Twice the strikes plus the empties
+# leaves room for a snapshot that resets the empty count. The phase still
+# returns as soon as it certifies, so a fast host never waits for this
+# minimum, and it never runs over when more snapshots cannot help (see the
+# overtime gate in stop_process_group).
+KILL_PHASE_MIN_OBSERVATIONS = 2 * (NESTED_UNREGISTER_STRIKES + STABLE_EMPTY_OBSERVATIONS)
 # Extra KILL-phase budget while a live delegated nested supervisor shuts
 # itself down. Without pidfds the owner cannot adopt or signal the
 # supervisor's subtree after murdering it (orphans keep the session
@@ -866,7 +885,7 @@ def drain_nested_supervisors(
         else:
             strikes = nested_unhealthy_strikes.get(token, 0) + 1
             nested_unhealthy_strikes[token] = strikes
-            if unregister and strikes >= 3:
+            if unregister and strikes >= NESTED_UNREGISTER_STRIKES:
                 closed.append(token)
     for token in closed:
         _pid, link = nested_supervisors.pop(token)
@@ -2477,15 +2496,9 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             if process_info.live and process_info.group == process.pid:
                 group_delivered.add((process_info.pid, process_info.start))
 
-    def phase(signum: int, deadline: float, only_new: bool) -> bool:
-        """Signal and require two complete empty session observations."""
-        group_delivered.clear()
-        # Only the KILL phase unregisters: a live owner must survive
-        # TERM (it needs that time to shut its own session down), and a
-        # dead one unregisters within a few KILL observations anyway.
-        kill_phase = signum == signal.SIGKILL
-        processes = observe(deadline, kill_phase)
-        complete_exact_cohort = processes is not None and all(
+    def exact_cohort(processes: list[SessionProcess] | None) -> bool:
+        """Whether every live member is the leader, delegated, or pinned."""
+        return processes is not None and all(
             process_info.pid == process.pid
             or not process_info.live
             or process_info.delegated
@@ -2497,6 +2510,16 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             )
             for process_info in processes
         )
+
+    def phase(signum: int, deadline: float, only_new: bool) -> bool:
+        """Signal and require consecutive complete empty session observations."""
+        group_delivered.clear()
+        # Only the KILL phase unregisters: a live owner must survive
+        # TERM (it needs that time to shut its own session down), and a
+        # dead one unregisters within a few KILL observations anyway.
+        kill_phase = signum == signal.SIGKILL
+        processes = observe(deadline, kill_phase)
+        complete_exact_cohort = exact_cohort(processes)
         # Without pidfds there is no way to adopt or exactly signal a
         # murdered nested supervisor's subtree (no subreaper, no
         # start-identity snapshots): its target and relays orphan with
@@ -2539,8 +2562,46 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             note_group_delivery(processes)
         signal_known(signum, only_new)
         consecutive_empty = 0
-        while time.monotonic() < deadline:
-            processes = observe(deadline, kill_phase)
+        complete_observations = 0
+        # The last in-deadline snapshot is often starved by the nearly
+        # spent budget and comes back unavailable, so judge overtime by
+        # the latest complete one.
+        last_complete = processes
+        while True:
+            overtime = time.monotonic() >= deadline
+            # Overtime is only for counting snapshots a KILL can still
+            # certify. Stop at the deadline when more time cannot help:
+            # sticky fail-closed state (ambiguity, broken nested control)
+            # or a live member this owner cannot signal exactly (it could
+            # only exit on its own, and waiting for that would change the
+            # fail-closed outcome). The delegated-owner wait already has
+            # its own grace and never KILLs the leader, so it gets no
+            # overtime either.
+            if overtime and not (
+                kill_phase
+                and not wait_for_owner
+                and complete_observations < KILL_PHASE_MIN_OBSERVATIONS
+                and not unsafe_direct_member
+                and exact_cohort(last_complete)
+            ):
+                break
+            # Past the deadline each snapshot gets its own bounded budget;
+            # the expired phase deadline would otherwise starve it.
+            processes = observe(
+                time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
+                if overtime
+                else deadline,
+                kill_phase,
+            )
+            if processes is not None:
+                complete_observations += 1
+                last_complete = processes
+            elif overtime:
+                # A snapshot that fails even with its own full budget
+                # (an unreadable table, or one walk slower than the
+                # budget) cannot certify anything; stop instead of
+                # spending the minimum on more failures.
+                break
             signal_known(signum, only_new)
             # A newly forked same-group member receives one exact pidfd signal
             # when available. Without exact authority, never re-enter every
@@ -2567,11 +2628,15 @@ def stop_process_group(first_signal: int) -> CleanupResult:
                 and (not nested_ever_registered or lease_closed())
             ):
                 consecutive_empty += 1
-                if consecutive_empty >= 2:
+                if consecutive_empty >= STABLE_EMPTY_OBSERVATIONS:
                     return True
             else:
                 consecutive_empty = 0
-            time.sleep(min(PROCESS_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+            time.sleep(
+                PROCESS_POLL_SECONDS
+                if overtime
+                else min(PROCESS_POLL_SECONDS, max(0.0, deadline - time.monotonic()))
+            )
         return False
 
     try:

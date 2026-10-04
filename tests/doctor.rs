@@ -1709,6 +1709,14 @@ fn invalid_explicit_bash_prevents_doctor_extension_execution() {
         String::from_utf8_lossy(&stdout)
     );
     assert!(!marker.exists(), "doctor extension ran without Bash 4+");
+    // K7: the extensions that did not run get a row of their own.
+    assert!(
+        String::from_utf8_lossy(&stdout).contains(
+            "  · doctor extensions did not run (they need Bash 4 or newer; see the Bash runtime row)\n"
+        ),
+        "doctor output: {}",
+        String::from_utf8_lossy(&stdout)
+    );
 }
 
 #[test]
@@ -1852,7 +1860,13 @@ fn unsafe_and_malformed_extensions_match_without_the_old_engine() {
     std::os::unix::fs::symlink("doctor-real", root.join("doctor.d")).expect("unsafe collection");
 
     let (shell, native) = pair(&home, &state);
-    assert!(String::from_utf8_lossy(&shell.stdout).contains("doctor extension discovery failed"));
+    assert!(
+        String::from_utf8_lossy(&native.stdout).contains(
+            "  ✗ doctor extension discovery failed\n    ~/extensions/doctor.d fails the extension trust checks; check its owner and mode\n"
+        ),
+        "{}",
+        String::from_utf8_lossy(&native.stdout)
+    );
     assert_pair(&shell, &native);
 }
 
@@ -1879,7 +1893,7 @@ fn hung_extension_times_out_and_later_extensions_still_run() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("  ✓ before the hang\n"), "{stdout}");
     assert!(
-        stdout.contains("  ✗ 10-hangs doctor extension timed out\n    stopped after 1s; set DOT_DOCTOR_TIMEOUT to raise the limit\n"),
+        stdout.contains("  ✗ 10-hangs doctor extension timed out\n    stopped after 1s\n    → set DOT_DOCTOR_TIMEOUT to raise the limit\n"),
         "{stdout}"
     );
     assert!(stdout.contains("  ✓ later extension ran\n"), "{stdout}");
@@ -2132,8 +2146,8 @@ fn unsafe_extension_is_refused_beside_a_malformed_identity() {
     seal(&directory.join("10-unsafe.sh"), 0o666);
     seal(&directory.join("Bad.sh"), 0o644);
 
-    // The unsafe script is refused on its own; the malformed identity still
-    // fails discovery as a whole.
+    // The unsafe script and the malformed name are each refused on their
+    // own; neither fails discovery as a whole (K1).
     let (shell, native) = pair(&home, &state);
     let stdout = String::from_utf8_lossy(&native.stdout);
     assert!(
@@ -2141,14 +2155,230 @@ fn unsafe_extension_is_refused_beside_a_malformed_identity() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("doctor extension discovery failed"),
+        stdout.contains("  ✗ Bad doctor extension refused\n"),
         "{stdout}"
     );
     assert!(
+        !stdout.contains("doctor extension discovery failed"),
+        "{stdout}"
+    );
+    assert!(
+        native.stderr.is_empty(),
+        "{}",
         String::from_utf8_lossy(&native.stderr)
-            .contains("invalid doctor extension identity: Bad.sh")
     );
     assert_pair(&shell, &native);
+}
+
+#[test]
+fn identity_errors_refuse_only_their_own_extension() {
+    // K1: one malformed or duplicate name used to file a detail-less
+    // "discovery failed" row and hide every extension section.
+    let ok = |label: &str| {
+        format!("doctor() {{\n  dot_doctor_section '{label}'\n  dot_doctor_ok '{label} ran'\n}}\n")
+            .into_bytes()
+    };
+    let (_scope, home, state) = doctor_extension_client_fixture(
+        "identity",
+        &[
+            ("10-first.sh".to_string(), ok("first")),
+            ("15-Upper.sh".to_string(), ok("upper")),
+            ("20-tools.sh".to_string(), ok("tools")),
+            ("21-tools.sh".to_string(), ok("renumbered")),
+            ("30-last.sh".to_string(), ok("last")),
+        ],
+    );
+    let (output, clean) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let directory = "~/extensions/doctor.d";
+    assert!(
+        stdout.contains(&format!(
+            "  ✗ 15-Upper doctor extension refused\n    {directory}/15-Upper.sh has an invalid name; rename it to NN-name using lowercase letters, digits, and hyphens\n"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "  ✗ 21-tools doctor extension refused\n    {directory}/21-tools.sh repeats identity tools of 20-tools.sh; remove or rename one of them\n"
+        )),
+        "{stdout}"
+    );
+    for ran in ["first ran", "tools ran", "last ran"] {
+        assert!(stdout.contains(&format!("  ✓ {ran}\n")), "{stdout}");
+    }
+    assert!(!stdout.contains("upper ran"), "{stdout}");
+    assert!(!stdout.contains("renumbered ran"), "{stdout}");
+    assert!(!stdout.contains("discovery failed"), "{stdout}");
+    // The row carries the reason; stderr no longer repeats it.
+    assert!(!stderr.contains("doctor extension identity"), "{stderr}");
+    assert!(stdout.contains(" 2 failed"), "{stdout}");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(clean);
+}
+
+#[test]
+fn unsafe_extension_directory_names_the_path_and_next_step() {
+    // K7: discovery failures carried no detail at all.
+    let (home, state) = doctor_extension_fixture("unsafe-dir", &[good_extension()]);
+    seal(&home.path().join("extensions/doctor.d"), 0o777);
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "  ✗ doctor extension discovery failed\n    ~/extensions/doctor.d fails the extension trust checks; check its owner and mode\n"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// A client fixture running one extension body as `10-crash.sh`.
+fn crash_fixture(tag: &str, body: &str) -> (TempDir, TempDir, TempDir) {
+    doctor_extension_client_fixture(
+        tag,
+        &[("10-crash.sh".to_string(), body.as_bytes().to_vec())],
+    )
+}
+
+#[test]
+fn crashed_extension_reports_status_and_failing_line() {
+    // K3: an extension killed by `set -e` used to file an empty failure row.
+    let (_scope, home, state) = crash_fixture(
+        "crash-line",
+        "doctor() {\n  dot_doctor_section 'Crash'\n  grep -q missing /dev/null\n  dot_doctor_ok 'unreachable'\n}\n",
+    );
+    let (output, clean) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "  ✗ 10-crash doctor extension failed\n    exited with status 1 at doctor.d/10-crash.sh:3: grep -q missing /dev/null\n"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("unreachable"), "{stdout}");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(clean, "the failure note leaked scratch state");
+}
+
+#[test]
+fn rejected_helper_record_reports_the_calling_line() {
+    // A newline in a detail makes the helper return 2, which `set -e` turns
+    // into a silent crash at the call site.
+    let (_scope, home, state) = crash_fixture(
+        "crash-helper",
+        "doctor() {\n  dot_doctor_section 'Crash'\n  dot_doctor_warn 'bad' $'two\\nlines'\n}\n",
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("    exited with status 2 at doctor.d/10-crash.sh:3: dot_doctor_warn\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn failing_last_command_reports_the_command() {
+    // `doctor` ending on a false `[[ ... ]] && ...` returns 1 from the
+    // function itself, so only the command is known, not its line.
+    let (_scope, home, state) = crash_fixture(
+        "crash-last",
+        "doctor() {\n  dot_doctor_ok 'ran'\n  [[ -e /nonexistent/dot-doctor ]] && dot_doctor_warn 'never'\n}\n",
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "  ✗ 10-crash doctor extension failed\n    exited with status 1; last command: [[ -e /nonexistent/dot-doctor ]]\n"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn explicit_return_reports_the_status_and_command() {
+    let (_scope, home, state) = crash_fixture(
+        "crash-return",
+        "doctor() {\n  dot_doctor_ok 'ran'\n  return 4\n}\n",
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "  ✗ 10-crash doctor extension failed\n    exited with status 4; last command: return 4\n"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn handled_failures_inside_substitutions_stay_quiet() {
+    // The failure trap is inherited into command substitutions, where a
+    // failing command does not stop the extension. It must not surface.
+    let (_scope, home, state) = crash_fixture(
+        "crash-quiet",
+        "doctor() {\n  local value\n  value=$(false; printf ok)\n  grep -q missing /dev/null || true\n  dot_doctor_ok \"quiet $value\"\n}\n",
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  ✓ quiet ok\n"), "{stdout}");
+    assert!(!stdout.contains("10-crash doctor extension"), "{stdout}");
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+}
+
+#[test]
+fn extension_without_entry_point_says_so() {
+    let (_scope, home, state) = crash_fixture("crash-entry", "not_doctor() { :; }\n");
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "  ✗ 10-crash doctor extension failed\n    exited with status 1\n    - dot: 10-crash.sh defines no doctor function\n"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn items_and_hints_render_under_their_row() {
+    // K2: lists and next steps used to be glued into one long detail line.
+    let (_scope, home, state) = doctor_extension_client_fixture(
+        "items",
+        &[(
+            "10-items.sh".to_string(),
+            b"doctor() {\n  dot_doctor_section 'Items'\n  if declare -F dot_doctor_item >/dev/null && declare -F dot_doctor_hint >/dev/null; then\n    dot_doctor_warn '7 stale things' 'merged upstream'\n    for n in 1 2 3 4 5 6 7; do dot_doctor_item \"thing $n\"; done\n    dot_doctor_hint 'run cleanup'\n    dot_doctor_ok 'two things'\n    dot_doctor_item 'a'\n    dot_doctor_item ''\n    dot_doctor_item 'b'\n  else\n    dot_doctor_warn 'no item helpers'\n  fi\n}\n"
+                .to_vec(),
+        )],
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "  ⚠ 7 stale things\n    merged upstream\n    - thing 1\n    - thing 2\n    - thing 3\n    - thing 4\n    - thing 5\n    +2 more\n    → run cleanup\n  ✓ two things\n    - a\n    - b\n"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+}
+
+#[test]
+fn orphan_item_is_an_invalid_result() {
+    let (_scope, home, state) = doctor_extension_client_fixture(
+        "orphan",
+        &[(
+            "10-orphan.sh".to_string(),
+            b"doctor() {\n  dot_doctor_section 'Orphan'\n  dot_doctor_item 'lost'\n}\n".to_vec(),
+        )],
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "  ✗ doctor extension emitted an invalid result\n    item has no check row before it: lost\n"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]
@@ -2768,7 +2998,13 @@ fn unsafe_merge_inventory_matches_without_the_old_engine() {
     seal(&directory.join("10-unsafe.sh"), 0o666);
 
     let (shell, native) = pair(&home, &state);
-    assert!(String::from_utf8_lossy(&shell.stdout).contains("extension inventory is invalid"));
+    assert!(
+        String::from_utf8_lossy(&native.stdout).contains(
+            "  ✗ merge-hook extension inventory is invalid\n    ~/extensions/merge-hooks.d/10-unsafe.sh fails the extension trust checks; check its owner and mode\n"
+        ),
+        "{}",
+        String::from_utf8_lossy(&native.stdout)
+    );
     assert_pair(&shell, &native);
 }
 
@@ -2792,9 +3028,19 @@ fn earlier_malformed_merge_identity_precedes_later_unsafe_hook() {
     seal(&directory.join("10-Bad.sh"), 0o644);
     seal(&directory.join("20-unsafe.sh"), 0o666);
 
+    // K7: the reason lands in the row, not only on stderr.
     let (shell, native) = pair(&home, &state);
     assert!(
-        String::from_utf8_lossy(&shell.stderr).contains("invalid merge-hook identity: 10-Bad.sh")
+        String::from_utf8_lossy(&native.stdout).contains(
+            "  ✗ merge-hook extension inventory is invalid\n    ~/extensions/merge-hooks.d/10-Bad.sh has an invalid name; rename it to NN-name using lowercase letters, digits, and hyphens\n"
+        ),
+        "{}",
+        String::from_utf8_lossy(&native.stdout)
+    );
+    assert!(
+        native.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
     );
     assert_pair(&shell, &native);
 }
@@ -3511,13 +3757,18 @@ fn doctor_runs_extensions_through_stdout_delivery_failure() {
         b"doctor() {\n  printf ran >\"$HOME/extension-ran\"\n  printf 'ok\\tSTREAM-MARKER\\t\\n' >>\"$DOT_DOCTOR_RESULT_FILE\"\n}\n",
     )
     .expect("extension");
-    let unsafe_hook = hooks.join("10-unsafe.sh");
-    std::fs::write(&unsafe_hook, b"merge() { :; }\n").expect("hook");
+    // An unsafe outputs sidecar is still reported on stderr, after the
+    // first record emission has already failed.
+    let hook = hooks.join("10-hook.sh");
+    let unsafe_sidecar = hooks.join("10-hook.outputs");
+    std::fs::write(&hook, b"merge() { :; }\n").expect("hook");
+    std::fs::write(&unsafe_sidecar, b"~/out\n").expect("sidecar");
     seal(&root, 0o700);
     seal(&directory, 0o700);
     seal(&directory.join("10-marker.sh"), 0o644);
     seal(&hooks, 0o700);
-    seal(&unsafe_hook, 0o666);
+    seal(&hook, 0o644);
+    seal(&unsafe_sidecar, 0o666);
 
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let env = BTreeMap::<OsString, OsString>::from([
@@ -3547,8 +3798,199 @@ fn doctor_runs_extensions_through_stdout_delivery_failure() {
         "doctor skipped extensions after a stdout failure"
     );
     assert!(
-        String::from_utf8_lossy(&stderr).contains("dot: unsafe merge hook"),
+        String::from_utf8_lossy(&stderr).contains("dot: unsafe merge-hook outputs"),
         "doctor dropped later stderr diagnostics after a stdout failure: {}",
         String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
+fn crash_inside_a_sourced_library_names_the_library_line() {
+    let (_scope, home, state) = crash_fixture(
+        "crash-lib",
+        "doctor() {\n  dot_doctor_source doctor.d/lib/checks.sh\n  dot_doctor_section 'Crash'\n  check_things\n}\n",
+    );
+    let lib = home.path().join("extensions/doctor.d/lib");
+    std::fs::create_dir(&lib).expect("library directory");
+    std::fs::write(
+        lib.join("checks.sh"),
+        b"check_things() {\n  local probe\n  probe=$(printf ok)\n  test \"$probe\" = missing\n}\n",
+    )
+    .expect("library");
+    seal(&lib.join("checks.sh"), 0o644);
+    seal(&lib, 0o700);
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "  ✗ 10-crash doctor extension failed\n    exited with status 1 at doctor.d/lib/checks.sh:4: test \"$probe\" = missing\n"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn extension_result_variable_cannot_redirect_the_failure_note() {
+    // A top-level `result=` in an extension used to steer where the worker
+    // wrote its note (relative to HOME); the note path is readonly now.
+    let (_scope, home, state) =
+        crash_fixture("crash-result", "result=stray\ndoctor() {\n  false\n}\n");
+    let (output, clean) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("    exited with status 1 at doctor.d/10-crash.sh:3: false\n"),
+        "{stdout}"
+    );
+    assert!(!home.path().join("stray.failure").exists());
+    assert!(clean);
+}
+
+#[test]
+fn helper_argument_count_misuse_names_the_helper() {
+    let (_scope, home, state) = crash_fixture(
+        "crash-arity",
+        "doctor() {\n  dot_doctor_section 'Crash'\n  dot_doctor_ok one two three\n}\n",
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("    exited with status 2 at doctor.d/10-crash.sh:3: dot_doctor_ok\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn tolerated_failure_does_not_take_the_blame_for_a_later_exit() {
+    // Under `set +e` the failure trap still notes `grep`, but the extension
+    // exits on line 6 with the same status; the note must not blame line 3.
+    let (_scope, home, state) = crash_fixture(
+        "crash-stale",
+        "doctor() {\n  set +e\n  grep -q missing /dev/null\n  dot_doctor_ok 'ran'\n  set -e\n  exit 1\n}\n",
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("  ✗ 10-crash doctor extension failed\n    exited with status 1\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn load_failure_says_the_file_did_not_load() {
+    // The shipped extensions guard their support modules at the top level:
+    // `dot_doctor_source ... || return`.
+    let (_scope, home, state) = crash_fixture(
+        "crash-load",
+        "dot_doctor_source doctor.d/lib/missing.sh || return\ndoctor() { dot_doctor_ok 'unreachable'; }\n",
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "  ✗ 10-crash doctor extension failed\n    exited with status 1 while loading the extension file\n"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn extension_owned_exit_trap_degrades_to_the_status() {
+    let (_scope, home, state) =
+        crash_fixture("crash-trap", "doctor() {\n  trap ':' EXIT\n  false\n}\n");
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("  ✗ 10-crash doctor extension failed\n    exited with status 1\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn duplicate_merge_identity_names_the_earlier_hook() {
+    let (home, state, directory) = merge_fixture("merge-duplicate");
+    for name in ["10-same.sh", "20-same.serial.sh"] {
+        std::fs::write(directory.join(name), b"merge() { :; }\n").expect("hook");
+        seal(&directory.join(name), 0o644);
+    }
+    let output = command(false, &home, &state, &[])
+        .output()
+        .expect("native doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "  ✗ merge-hook extension inventory is invalid\n    ~/extensions/merge-hooks.d/20-same.serial.sh repeats identity same of 10-same.sh; remove or rename one of them\n"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn helper_argument_errors_still_return_two_inside_conditions() {
+    // Where errexit is off, a misused helper must return its documented
+    // status 2 without recording anything, including with no arguments.
+    let (_scope, home, state) = crash_fixture(
+        "arity-condition",
+        "doctor() {\n  if dot_doctor_ok a b c; then dot_doctor_warn 'accepted three'; else dot_doctor_ok \"three $?\"; fi\n  dot_doctor_ok || dot_doctor_ok \"none $?\"\n  dot_doctor_item || dot_doctor_ok \"item $?\"\n}\n",
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for row in ["  ✓ three 2\n", "  ✓ none 2\n", "  ✓ item 2\n"] {
+        assert!(stdout.contains(row), "{stdout}");
+    }
+    assert!(!stdout.contains("accepted"), "{stdout}");
+    assert!(!stdout.contains("  ✓ a (b)"), "{stdout}");
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+}
+
+#[test]
+fn top_level_failure_in_the_extension_file_names_its_line() {
+    let (_scope, home, state) = crash_fixture(
+        "crash-top",
+        "false\ndoctor() { dot_doctor_ok 'unreachable'; }\n",
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("    exited with status 1 at doctor.d/10-crash.sh:1: false\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn top_level_failure_in_a_support_module_names_its_line() {
+    let (_scope, home, state) = crash_fixture(
+        "crash-module",
+        "doctor() {\n  dot_doctor_source doctor.d/lib/broken.sh\n  dot_doctor_ok 'unreachable'\n}\n",
+    );
+    let lib = home.path().join("extensions/doctor.d/lib");
+    std::fs::create_dir(&lib).expect("library directory");
+    std::fs::write(lib.join("broken.sh"), b"helper() { :; }\nfalse\n").expect("library");
+    seal(&lib.join("broken.sh"), 0o644);
+    seal(&lib, 0o700);
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("    exited with status 1 at doctor.d/10-crash.sh:2: dot_doctor_source\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn directly_sourced_module_failure_names_the_module_line() {
+    let (_scope, home, state) = crash_fixture(
+        "crash-dot-module",
+        "doctor() {
+  . \"$DOT_EXTENSIONS_DIR/doctor.d/lib/broken.sh\"\n  dot_doctor_ok 'unreachable'\n}\n",
+    );
+    let lib = home.path().join("extensions/doctor.d/lib");
+    std::fs::create_dir(&lib).expect("library directory");
+    std::fs::write(lib.join("broken.sh"), b"helper() { :; }\nfalse\n").expect("library");
+    seal(&lib.join("broken.sh"), 0o644);
+    seal(&lib, 0o700);
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("    exited with status 1 at doctor.d/lib/broken.sh:2: false\n"),
+        "{stdout}"
     );
 }

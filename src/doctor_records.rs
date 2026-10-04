@@ -1,9 +1,10 @@
 //! Doctor extension result records.
 //!
 //! Owns the private
-//! `_dot_doctor_record` sink plus the six public wrappers built on
+//! `_dot_doctor_record` sink plus the public wrappers built on
 //! it — `dot_doctor_section`, `dot_doctor_ok`, `dot_doctor_warn`,
-//! `dot_doctor_fail`, `dot_doctor_skip`, and `dot_doctor_info`. Part 1 (`doctor_runtime`)
+//! `dot_doctor_fail`, `dot_doctor_skip`, `dot_doctor_info`, and the two
+//! attachment helpers `dot_doctor_item` and `dot_doctor_hint`. Part 1 (`doctor_runtime`)
 //! owns the coordinator-side rendering and counters, and part 2
 //! (`doctor_paths`) owns the path abbreviators; this module owns how
 //! extension workers file result rows for the coordinator to render.
@@ -25,6 +26,10 @@
 //!   argument slice: [`section`] takes exactly one field, the four
 //!   verdict wrappers take one or two. A one-field call records an
 //!   empty detail, like the shell's `"${2:-}"`.
+//! - `item` and `hint` rows are attachments, not rows: [`read`] folds each
+//!   into the closest verdict row before it in the same result file. One
+//!   with no verdict row before it (first in the file, or right after a
+//!   section) is an authoring error and reads as an invalid result.
 
 use std::path::Path;
 
@@ -164,6 +169,33 @@ pub fn info(result_file: Option<&Path>, args: &[&[u8]]) -> Result<(), Error> {
     verdict(result_file, b"info", args)
 }
 
+/// `dot_doctor_item`: attach one list item to the previous verdict row.
+///
+/// Exactly one field; any other argument count surfaces as
+/// [`Error::Invalid`] (shell `return 2`).
+pub fn item(result_file: Option<&Path>, args: &[&[u8]]) -> Result<(), Error> {
+    attachment(result_file, ITEM, args)
+}
+
+/// `dot_doctor_hint`: attach one next step to the previous verdict row.
+///
+/// Arity rules mirror [`item`].
+pub fn hint(result_file: Option<&Path>, args: &[&[u8]]) -> Result<(), Error> {
+    attachment(result_file, HINT, args)
+}
+
+/// Wire kind of a `dot_doctor_item` attachment row.
+const ITEM: &[u8] = b"item";
+/// Wire kind of a `dot_doctor_hint` attachment row.
+const HINT: &[u8] = b"hint";
+
+fn attachment(result_file: Option<&Path>, kind: &[u8], args: &[&[u8]]) -> Result<(), Error> {
+    let [text] = args else {
+        return Err(Error::Invalid);
+    };
+    record(result_file, kind, text, b"")
+}
+
 /// Shared verdict sink for [`ok`], [`warn`], [`fail`], [`skip`], and [`info`]:
 /// one or two fields, with the detail defaulting to empty.
 fn verdict(result_file: Option<&Path>, kind: &[u8], args: &[&[u8]]) -> Result<(), Error> {
@@ -177,8 +209,9 @@ fn verdict(result_file: Option<&Path>, kind: &[u8], args: &[&[u8]]) -> Result<()
 
 /// Read and dispatch a worker result file into canonical coordinator records.
 /// Known verdict rows retain their detail column, including an empty one;
-/// the renderer omits an empty detail. Unknown kinds become the
-/// coordinator's visible failure record.
+/// the renderer omits an empty detail. Item and hint rows attach to the
+/// verdict row before them. Unknown kinds, and attachments with no verdict
+/// row to attach to, become the coordinator's visible failure record.
 pub fn read(result_file: &Path) -> std::io::Result<Vec<Record>> {
     // Bash variables cannot retain NUL bytes. `read -r` silently drops them
     // before applying IFS, so normalize once before reproducing its fields.
@@ -205,22 +238,51 @@ pub fn read(result_file: &Path) -> std::io::Result<Vec<Record>> {
         if final_line_unterminated && index + 1 == line_count && kind_bytes.is_empty() {
             continue;
         }
+        if kind_bytes == ITEM || kind_bytes == HINT {
+            attach(&mut records, kind_bytes, message);
+            continue;
+        }
         let kind = crate::doctor_coordinator::record_kind(kind_bytes);
         if kind == Kind::Unknown {
-            records.push(Record {
-                kind: Kind::Fail,
-                message: b"doctor extension emitted an invalid result".to_vec(),
-                detail: Some(kind_bytes.to_vec()),
-            });
+            records.push(invalid(kind_bytes));
         } else {
-            records.push(Record {
+            records.push(Record::bytes(
                 kind,
-                message: message.to_vec(),
-                detail: (kind != Kind::Section).then(|| detail.to_vec()),
-            });
+                message,
+                (kind != Kind::Section).then_some(detail),
+            ));
         }
     }
     Ok(records)
+}
+
+/// The coordinator's row for a result line it cannot use.
+fn invalid(detail: &[u8]) -> Record {
+    Record::bytes(
+        Kind::Fail,
+        b"doctor extension emitted an invalid result",
+        Some(detail),
+    )
+}
+
+/// Fold one item or hint into the closest verdict row filed before it. A
+/// section ends the previous row's scope, so an attachment right after one
+/// (or first in the file) has nothing to attach to: report it rather than
+/// guess, so the author sees the misplaced call.
+fn attach(records: &mut Vec<Record>, kind: &[u8], text: &[u8]) {
+    let target = records
+        .last_mut()
+        .filter(|record| record.kind != Kind::Section);
+    match target {
+        Some(record) if kind == ITEM => record.items.push(text.to_vec()),
+        Some(record) => record.hints.push(text.to_vec()),
+        None => {
+            let mut detail = kind.to_vec();
+            detail.extend_from_slice(b" has no check row before it: ");
+            detail.extend_from_slice(text);
+            records.push(invalid(&detail));
+        }
+    }
 }
 
 /// Parse `IFS=$'\t' read -r kind message detail`. Tab is IFS whitespace:

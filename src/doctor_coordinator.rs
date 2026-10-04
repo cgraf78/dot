@@ -7,15 +7,14 @@
 //! (`doctor_paths`) owns the path abbreviators, and part 3
 //! (`doctor_records`) owns the extension-side record sink.
 //!
-//! Parity decisions:
-//! - The discovery loop in `_dot_doctor_extension_specs` ends in
-//!   `done | LC_ALL=C sort`, so the pipeline status is always
-//!   `sort`'s: an invalid or duplicate identity prints its `dot: ...`
-//!   line to stderr and truncates the listing, but the exit status
-//!   stays 0. [`collect_specs`] mirrors that exactly — the identity
-//!   failure travels as [`Discovery::error`] alongside the partial
-//!   listing, never as an `Err` — instead of "fixing" the swallowed
-//!   status the shell suite pins.
+//! Discovery decisions:
+//! - An invalid or duplicate identity refuses that one file
+//!   ([`Discovery::invalid`]) and discovery continues. The shell-era loop
+//!   stopped at the first such name, and the coordinator then ran no
+//!   extension at all: one leftover file after a renumbering hid every
+//!   section behind a detail-less failure. For a duplicate, the first
+//!   claimant in glob order keeps the identity and runs; each later one is
+//!   refused, naming the file it collides with.
 //! - Per-file trust validation (`_dot_extension_file_validate`) belongs to the
 //!   extension-trust module. [`collect_specs_with`] accepts that predicate and
 //!   refuses each untrusted file on its own ([`Discovery::rejected`]) instead
@@ -27,7 +26,7 @@
 //!   sort; the identity character classes are ASCII ranges), so
 //!   non-UTF8 entry names behave like the shell's.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
@@ -45,69 +44,51 @@ pub struct Spec {
     pub script: PathBuf,
 }
 
-/// Identity failure of `_dot_doctor_extension_specs`, carrying the
-/// exact stderr line. Both spellings exit 1 in the shell loop; the
-/// coordinator pipe in front of `sort` swallows that status (see the
-/// module docs), so [`collect_specs`] reports these through
-/// [`Discovery::error`] with [`SpecError::code`] pinned at 1.
+/// Why a trusted extension file was refused for its name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecError {
-    /// `dot: invalid doctor extension identity: <basename>` — the
-    /// key matches neither the bare nor the numerically prefixed
-    /// identity shape.
-    InvalidIdentity {
-        /// Offending file basename (`${script##*/}`).
-        file_name: Vec<u8>,
-    },
-    /// `dot: duplicate doctor extension identity: <identity>` — two
-    /// keys (`20-foo.sh` and `foo.sh`, say) claim one identity.
+    /// The key matches neither the bare nor the numerically prefixed
+    /// identity shape (`Foo.sh`, `1a.sh`).
+    InvalidIdentity,
+    /// An earlier file in glob order already claimed this identity
+    /// (`20-foo.sh` and then `21-foo.sh`, say).
     DuplicateIdentity {
-        /// Twice-claimed identity (the regex's second group).
+        /// The twice-claimed identity (the regex's second group).
         identity: Vec<u8>,
+        /// File name of the earlier file that keeps the identity.
+        claimed_by: Vec<u8>,
     },
 }
 
 impl SpecError {
-    /// Shell loop status for this failure (always 1; the coordinator
-    /// pipe swallows it before callers can see it).
-    pub fn code(self) -> i32 {
+    /// The reason clause for a refusal row about `shown` (the file as
+    /// displayed), ending in the next step.
+    pub fn reason(&self, shown: &str) -> String {
         match self {
-            SpecError::InvalidIdentity { .. } => 1,
-            SpecError::DuplicateIdentity { .. } => 1,
-        }
-    }
-
-    /// Exact stderr bytes the shell's `printf ... >&2` emits,
-    /// trailing newline included.
-    pub fn message(&self) -> Vec<u8> {
-        match self {
-            SpecError::InvalidIdentity { file_name } => {
-                let mut line = b"dot: invalid doctor extension identity: ".to_vec();
-                line.extend_from_slice(file_name);
-                line.push(b'\n');
-                line
-            }
-            SpecError::DuplicateIdentity { identity } => {
-                let mut line = b"dot: duplicate doctor extension identity: ".to_vec();
-                line.extend_from_slice(identity);
-                line.push(b'\n');
-                line
-            }
+            SpecError::InvalidIdentity => format!(
+                "{shown} has an invalid name; rename it to NN-name using lowercase letters, digits, and hyphens"
+            ),
+            SpecError::DuplicateIdentity {
+                identity,
+                claimed_by,
+            } => format!(
+                "{shown} repeats identity {} of {}; remove or rename one of them",
+                String::from_utf8_lossy(identity),
+                String::from_utf8_lossy(claimed_by),
+            ),
         }
     }
 }
 
-/// Outcome of [`collect_specs`]: the sorted listing plus, when the
-/// shell would have errored mid-loop, the truncating failure.
+/// Outcome of [`collect_specs`]: the runnable listing plus every file
+/// refused for its trust or its name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovery {
-    /// Sorted specs printed before any failure (the whole listing
-    /// when [`error`](Discovery::error) is `None`).
+    /// Sorted runnable specs.
     pub specs: Vec<Spec>,
-    /// Identity failure that stopped the shell loop, if any. The
-    /// shell still exits 0 through the `sort` pipe; callers surface
-    /// [`SpecError::message`] on stderr to match.
-    pub error: Option<SpecError>,
+    /// Trusted scripts refused for their identity, in glob order. They
+    /// never run; callers report each one.
+    pub invalid: Vec<(PathBuf, SpecError)>,
     /// Scripts the trust predicate refused, in glob order. They never run
     /// and never claim an identity; callers report each one.
     pub rejected: Vec<PathBuf>,
@@ -192,12 +173,8 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// excluded, like the shell's `*.sh` glob) become specs in
 /// `LC_ALL=C sort` order of their rendered lines.
 ///
-/// Entries stop at the first invalid or duplicate identity, exactly
-/// like the shell loop's `return 1`: earlier specs stay listed
-/// (re-sorted by the trailing `sort`) and the failure surfaces as
-/// [`Discovery::error`], with the shell's 0-through-the-pipe status
-/// left for the caller to mirror (the harness asserts it).
-/// Per-file trust validation stays shell-side (see the module docs).
+/// A file with an invalid or duplicate identity is set aside in
+/// [`Discovery::invalid`] and the rest still list (see the module docs).
 ///
 /// Only I/O failures (an unreadable `dir`) surface as `Err`: the
 /// shell's missing-root early return runs before this logic, so
@@ -208,8 +185,8 @@ pub fn collect_specs(dir: &Path) -> std::io::Result<Discovery> {
 
 /// Discover doctor extensions with the caller's trust predicate in the same
 /// ordered loop as identity validation. A refused script is set aside in
-/// [`Discovery::rejected`] and claims no identity; the first malformed or
-/// duplicate identity among trusted scripts still stops discovery.
+/// [`Discovery::rejected`] and claims no identity; a trusted script with a
+/// malformed or duplicate identity is set aside in [`Discovery::invalid`].
 pub fn collect_specs_with(
     dir: &Path,
     mut trusted: impl FnMut(&Path) -> bool,
@@ -230,7 +207,8 @@ pub fn collect_specs_with(
     let dir_bytes = dir.as_os_str().as_encoded_bytes();
     let mut specs: Vec<Spec> = Vec::new();
     let mut rejected: Vec<PathBuf> = Vec::new();
-    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut invalid: Vec<(PathBuf, SpecError)> = Vec::new();
+    let mut seen: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     for name in &names {
         let mut script = dir_bytes.to_vec();
         script.push(b'/');
@@ -244,25 +222,22 @@ pub fn collect_specs_with(
             continue;
         }
         let key = extension_key(name).to_vec();
-        let identity = match extension_identity(&key) {
-            Some(identity) => identity.to_vec(),
-            None => {
-                return Ok(Discovery {
-                    specs,
-                    error: Some(SpecError::InvalidIdentity {
-                        file_name: name.clone(),
-                    }),
-                    rejected,
-                });
-            }
+        let Some(identity) = extension_identity(&key).map(<[u8]>::to_vec) else {
+            invalid.push((script, SpecError::InvalidIdentity));
+            continue;
         };
-        if !seen.insert(identity.clone()) {
-            return Ok(Discovery {
-                specs,
-                error: Some(SpecError::DuplicateIdentity { identity }),
-                rejected,
-            });
+        if let Some(claimed_by) = seen.get(&identity) {
+            let claimed_by = claimed_by.clone();
+            invalid.push((
+                script,
+                SpecError::DuplicateIdentity {
+                    identity,
+                    claimed_by,
+                },
+            ));
+            continue;
         }
+        seen.insert(identity, name.clone());
         specs.push(Spec { key, script });
     }
     // The shell re-sorts the full rendered lines; sorting the
@@ -271,7 +246,7 @@ pub fn collect_specs_with(
     specs.sort_by_key(spec_line);
     Ok(Discovery {
         specs,
-        error: None,
+        invalid,
         rejected,
     })
 }
@@ -281,11 +256,13 @@ pub fn collect_specs_with(
 pub use crate::doctor_runtime::Kind as RecordKind;
 
 /// The `case $kind in ...` dispatch of
-/// `_dot_doctor_render_records`: the six known kinds map to their
+/// `_dot_doctor_render_records`: the six known row kinds map to their
 /// renderer, everything else to [`RecordKind::Unknown`]. `info` is newer
 /// than the other five: an older coordinator renders it as an invalid
 /// result, which is why extensions probe for `dot_doctor_info` before
-/// calling it (see `doctor-api-v1.tsv`).
+/// calling it (see `doctor-api-v1.tsv`). The `item` and `hint`
+/// attachments are not rows; `doctor_records::read` folds them into the
+/// row before them and never asks this dispatch about them.
 pub fn record_kind(kind: &[u8]) -> RecordKind {
     match kind {
         b"section" => RecordKind::Section,
@@ -299,7 +276,7 @@ pub fn record_kind(kind: &[u8]) -> RecordKind {
 }
 
 /// The `case $relative in ...` guard of `dot_doctor_source`
-/// (`lib/dot/doctor-api.sh`): rejects empty values, absolute paths,
+/// (`lib/dot/public/hook-runtime-v1/doctor-api.sh`): rejects empty values, absolute paths,
 /// bare `.`/`..`, any `./`, `../`, `/./`, `/../` segment games,
 /// trailing slashes and dot segments, doubled slashes, and embedded
 /// newlines or carriage returns. Tabs pass, like the shell.
