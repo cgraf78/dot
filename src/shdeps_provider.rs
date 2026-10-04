@@ -2471,8 +2471,13 @@ const PROMPT_ECHO_SETTLE: std::time::Duration = std::time::Duration::from_secs(3
 /// Whether the terminal on stdout echoes input, when stdout is a terminal.
 /// A password prompt (sudo) turns echo off while it reads.
 fn terminal_echo() -> Option<bool> {
-    // SAFETY: tcgetattr only fills the zeroed termios it is handed.
+    // SAFETY: both reads only fill the zeroed termios they are handed.
     let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+    // Bionic exports `tcgetattr` only from API 28 (release builds target
+    // 21); its older header inlines it as this same ioctl.
+    #[cfg(target_os = "android")]
+    let read = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TCGETS as _, &mut attributes) };
+    #[cfg(not(target_os = "android"))]
     let read = unsafe { libc::tcgetattr(libc::STDOUT_FILENO, &mut attributes) };
     (read == 0).then_some(attributes.c_lflag & libc::ECHO != 0)
 }

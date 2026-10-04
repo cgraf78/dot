@@ -4888,11 +4888,21 @@ pub(crate) fn run_foreground_forward_stderr_terminal(
     }
 }
 
+/// Android: no private pseudo-terminal, so the fetch keeps the plain pipe.
+/// Bionic exports `openpty` only from API 23 and release builds target API
+/// 21, where linking it fails; a security-key notice that needs a terminal
+/// is rare enough on Termux not to warrant a second pseudo-terminal path.
+#[cfg(target_os = "android")]
+fn stderr_terminal() -> Option<(ForwardReader, Stdio)> {
+    None
+}
+
 /// Open the private pseudo-terminal behind
 /// [`run_foreground_forward_stderr_terminal`]: a nonblocking master and the
 /// slave for the child, both close-on-exec (the child gets the slave
 /// through its stderr redirection), output processing off, and the window
 /// size copied from stdout's terminal when it has one.
+#[cfg(not(target_os = "android"))]
 fn stderr_terminal() -> Option<(ForwardReader, Stdio)> {
     use std::os::fd::FromRawFd as _;
 
@@ -4968,7 +4978,8 @@ enum Forwarded {
 enum ForwardReader {
     /// A private socket ([`SessionCapture`]).
     Socket(SessionCapture),
-    /// A pseudo-terminal master ([`stderr_terminal`]).
+    /// A pseudo-terminal master ([`stderr_terminal`]; never on Android).
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     Terminal(std::fs::File),
 }
 
