@@ -3184,7 +3184,12 @@ mod tests {
             let (lock, condition) = &*self.entered;
             *lock.lock().expect("abort-aware writer lock") = true;
             condition.notify_all();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // Only a hang backstop. The test's watchdog publishes the abort
+            // itself within 60 s (provider exit) + 20 s (teardown) + 5 s
+            // (starved observer) of the write starting, so a shorter bound
+            // here would fail a healthy run whose provider exit and teardown
+            // are merely slow, which the watchdog deliberately tolerates.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
             while !crate::cleanup::outward_write_aborted() {
                 let guard = lock.lock().expect("abort-aware writer wait lock");
                 let _ = condition
@@ -3252,9 +3257,10 @@ mod tests {
         }
         let provider = scratch.path().join("provider");
         let release = scratch.path().join("provider-release");
+        let exited = scratch.path().join("provider-exited");
         std::fs::write(
             &provider,
-            b"#!/bin/sh\nprintf '%s\\n' 'queued before cancellation' >&2\ni=0\nwhile [ \"$i\" -lt 6000 ] && [ ! -e \"$DOT_TEST_PROVIDER_CANCEL_RELEASE\" ]; do i=$((i + 1)); sleep 0.01; done\nexit 130\n",
+            b"#!/bin/sh\nprintf '%s\\n' 'queued before cancellation' >&2\ni=0\nwhile [ \"$i\" -lt 6000 ] && [ ! -e \"$DOT_TEST_PROVIDER_CANCEL_RELEASE\" ]; do i=$((i + 1)); sleep 0.01; done\n: >\"$DOT_TEST_PROVIDER_CANCEL_EXITED\"\nexit 130\n",
         )
         .expect("provider fixture");
         std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755))
@@ -3279,6 +3285,10 @@ mod tests {
             (
                 std::ffi::OsString::from("DOT_TEST_PROVIDER_CANCEL_RELEASE"),
                 release.as_os_str().to_owned(),
+            ),
+            (
+                std::ffi::OsString::from("DOT_TEST_PROVIDER_CANCEL_EXITED"),
+                exited.as_os_str().to_owned(),
             ),
         ]);
         let runtime = crate::app::Runtime::from_env(&env, scratch.path()).expect("runtime");
@@ -3340,12 +3350,29 @@ mod tests {
         let watchdog_saw_abort = saw_abort.clone();
         let watchdog_fired_by_watchdog = watchdog_fired.clone();
         let watchdog = std::thread::spawn(move || {
+            let aborted = || {
+                crate::cleanup::outward_write_aborted()
+                    || watchdog_saw_abort.load(std::sync::atomic::Ordering::Acquire)
+            };
+            // The backstop bounds a RED implementation that leaves the pump
+            // waiting after the provider has terminated, so its clock starts
+            // when the provider is about to exit, not when the test starts:
+            // provider startup, the relayed line and the release handshake
+            // all stretch on a loaded host and say nothing about the pump.
+            let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !exited.exists() && !aborted() && std::time::Instant::now() < exit_deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             // The blocked relay delivery witnesses the abort causally: the
             // latch window cannot close until its write returns. A polling
             // observer can still miss a sub-millisecond window under load,
             // so the backstop fires only when neither the latch nor the
-            // writer has shown an abort.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            // writer has shown an abort. After the provider exits, Dot still
+            // reaps its session (TERM grace plus KILL verification, each a
+            // process-table walk that takes seconds on a loaded host) before
+            // the abort is certain; a RED pump never aborts, so a bound well
+            // above that teardown still catches it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             while std::time::Instant::now() < deadline {
                 if crate::cleanup::outward_write_aborted()
                     || watchdog_saw_abort.load(std::sync::atomic::Ordering::Acquire)
