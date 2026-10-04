@@ -97,6 +97,28 @@ impl std::fmt::Display for Error {
     }
 }
 
+/// What stopped discovery at one overlay's descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorFault {
+    /// The descriptor (or its file name) is malformed.
+    Invalid,
+    /// Two descriptors claim the overlay's name.
+    Duplicate,
+    /// A profile selects the overlay but no descriptor defines it.
+    Missing,
+}
+
+impl DescriptorFault {
+    /// A few words for a status row.
+    pub fn summary(self) -> &'static str {
+        match self {
+            DescriptorFault::Invalid => "invalid descriptor",
+            DescriptorFault::Duplicate => "duplicate descriptor",
+            DescriptorFault::Missing => "no descriptor",
+        }
+    }
+}
+
 /// Every key a descriptor understands, in the order parsing matches them.
 pub const DESCRIPTOR_KEYS: [&str; 6] = ["url", "path", "platforms", "hosts", "optional", "sync"];
 
@@ -130,6 +152,10 @@ pub struct State {
     pub selected: Vec<String>,
     /// `DOT_OVERLAY_DISCOVERY_ERROR`.
     pub discovery_error: Option<String>,
+    /// The overlay whose descriptor stopped discovery, and how, when one
+    /// did: the structured cause behind [`State::discovery_error`] for
+    /// status rows.
+    pub discovery_failed: Option<(String, DescriptorFault)>,
     /// Whether the discovery error is announced on stderr (false
     /// under `DOT_OVERLAY_DISCOVERY_SILENT=1`).
     pub discovery_announced: bool,
@@ -1326,6 +1352,7 @@ pub fn discover(
             return discover_error(
                 state,
                 inputs.discovery_silent,
+                (&name, DescriptorFault::Invalid),
                 format!("invalid overlay descriptor filename: {base}"),
             );
         }
@@ -1333,6 +1360,7 @@ pub fn discover(
             return discover_error(
                 state,
                 inputs.discovery_silent,
+                (&name, DescriptorFault::Duplicate),
                 format!("duplicate overlay name '{name}' in {first} and {text}"),
             );
         }
@@ -1345,6 +1373,7 @@ pub fn discover(
             return discover_error(
                 state,
                 inputs.discovery_silent,
+                (name, DescriptorFault::Missing),
                 format!("selected overlay has no descriptor: {name}"),
             );
         }
@@ -1416,6 +1445,7 @@ pub fn discover(
                 };
                 state.eligible.clear();
                 state.active.clear();
+                state.discovery_failed = Some((name.clone(), DescriptorFault::Invalid));
                 state.discovery_error = Some(if message.is_empty() {
                     format!("invalid selected overlay descriptor: {file}")
                 } else {
@@ -1430,8 +1460,14 @@ pub fn discover(
 
 /// Record a discovery error: set `DOT_OVERLAY_DISCOVERY_ERROR`
 /// and announce unless silent. Always fails like the shell.
-fn discover_error(state: &mut State, silent: bool, message: String) -> Result<(), Error> {
+fn discover_error(
+    state: &mut State,
+    silent: bool,
+    (name, fault): (&str, DescriptorFault),
+    message: String,
+) -> Result<(), Error> {
     state.discovery_error = Some(message);
+    state.discovery_failed = Some((name.to_string(), fault));
     state.discovery_announced = !silent;
     Err(Error::Announced(
         state.discovery_error.clone().unwrap_or_default(),
@@ -1514,6 +1550,8 @@ fn discover_legacy(
                     Error::Filtered => continue,
                     other => return Err(other),
                 };
+                state.discovery_failed =
+                    Some((overlay_profile_name(&text), DescriptorFault::Invalid));
                 state.discovery_error = Some(if message.is_empty() {
                     format!("invalid overlay descriptor: {text}")
                 } else {

@@ -1569,6 +1569,12 @@ fn run_update(
             let prompt = &mut prompt;
             let remaining_events = &mut remaining_events;
             scope.spawn(move || {
+                // The current prompt has turned terminal echo off (sudo
+                // reading a password), and since when echo is back on.
+                let mut echo_read = false;
+                let mut echo_back: Option<std::time::Instant> = None;
+                // The provider has prompted during this run.
+                let mut echo_watched = false;
                 let mut bounded_deferred_stdout =
                     LimitedWriter::new(deferred_stdout, PROVIDER_FRAME_LIMIT_BYTES);
                 let mut bounded_final_stderr =
@@ -1661,8 +1667,40 @@ fn run_update(
                     // whole seconds instead of freezing between events.
                     // Final passes skip it (the finish row follows
                     // immediately) and failures propagate like event
-                    // renders.
-                    if result.is_ok() && !final_pass {
+                    // renders. A paused prompt skips it too: the provider
+                    // is asking on the terminal (sudo), and a redraw would
+                    // erase its question. The next event resumes the row,
+                    // and so does the terminal once sudo has read the
+                    // password: it turns echo off to read and back on after,
+                    // and the install that follows may run a long time
+                    // without another event. Echo must stay back on for a
+                    // while first: after a wrong password it is on during
+                    // the failure delay, then off again for the retry. Once
+                    // the provider has prompted, echo is watched for the
+                    // rest of its run, so a retry that comes later still
+                    // stops the redraws (without erasing anything: the
+                    // question may already be on the current line).
+                    if session.prompt_active {
+                        echo_watched = true;
+                    }
+                    if echo_watched && !final_pass {
+                        match terminal_echo() {
+                            Some(false) => {
+                                echo_read = true;
+                                echo_back = None;
+                            }
+                            Some(true) if echo_read => {
+                                let back = *echo_back.get_or_insert_with(std::time::Instant::now);
+                                if back.elapsed() >= PROMPT_ECHO_SETTLE {
+                                    echo_read = false;
+                                    echo_back = None;
+                                    crate::shdeps_ui_render::prompt_resume(session);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if result.is_ok() && !final_pass && !session.prompt_active && !echo_read {
                         let now = crate::update_engine::now_secs();
                         if beat.poll(now) {
                             heartbeat_out.write_all(&stage.tick(now))?;
@@ -2328,7 +2366,12 @@ fn handle_event(
     };
     match text(&fields, "event") {
         b"prompt" => {
-            let (bytes, active, ack) = crate::shdeps_ui_render::prompt_pause(session, *live, "1");
+            let (mut bytes, active, ack) =
+                crate::shdeps_ui_render::prompt_pause(session, *live, "1");
+            // The row on screen is the stage's: `live` only tracks rows this
+            // renderer drew itself, so without this the prompt (sudo asking
+            // on the terminal) printed at the end of the unfinished row.
+            bytes.extend_from_slice(&stage.clear());
             output.write_all(&bytes)?;
             output.flush()?;
             *live = active;
@@ -2424,6 +2467,25 @@ fn handle_event(
         _ => {}
     }
     Ok(())
+}
+
+/// How long terminal echo must stay back on after a password read before the
+/// stage row returns: longer than PAM's usual delay after a wrong password,
+/// after which sudo turns echo off again to ask once more.
+const PROMPT_ECHO_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether the terminal on stdout echoes input, when stdout is a terminal.
+/// A password prompt (sudo) turns echo off while it reads.
+fn terminal_echo() -> Option<bool> {
+    // SAFETY: both reads only fill the zeroed termios they are handed.
+    let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+    // Bionic exports `tcgetattr` only from API 28 (release builds target
+    // 21); its older header inlines it as this same ioctl.
+    #[cfg(target_os = "android")]
+    let read = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TCGETS as _, &mut attributes) };
+    #[cfg(not(target_os = "android"))]
+    let read = unsafe { libc::tcgetattr(libc::STDOUT_FILENO, &mut attributes) };
+    (read == 0).then_some(attributes.c_lflag & libc::ECHO != 0)
 }
 
 fn prompt_pipe(runtime: &Runtime) -> Option<PromptPipe> {
@@ -2827,6 +2889,8 @@ mod tests {
         let mut session = crate::shdeps_ui_render::reset(false);
         let mut stage =
             crate::progress_ui::Stage::begin(palette.clone(), "5", false, true, false, true);
+        // Provider events always arrive inside the opened Tools stage.
+        let _ = stage.start(b"Tools", None, crate::update_engine::now_secs(), None);
         let mut output = Vec::new();
         let mut live = true;
         let mut beat = crate::progress_ui::Heartbeat::new(
@@ -2909,7 +2973,10 @@ mod tests {
         // status cannot appear; its 8-cell prefix proves ESC became a
         // space (`warn [31`, never `warn\x1b[31`).
         assert!(warning.windows(8).any(|window| window == b"warn [31"));
-        assert!(!warning.contains(&0x1b));
+        // The only escape left is the row's own erase in front of the note
+        // (the event arrives while the Tools row is live).
+        let note = warning.strip_prefix(b"\r\x1b[K").unwrap_or(&warning);
+        assert!(!note.contains(&0x1b));
         let phase = render_event(r#"{"event":"phase","label":"Bad\nLabel","done":1,"total":2}"#);
         assert!(phase.windows(9).any(|window| window == b"Bad Label"));
         assert!(!phase.windows(9).any(|window| window == b"Bad\nLabel"));
@@ -2995,6 +3062,7 @@ mod tests {
         };
         let mut stage =
             crate::progress_ui::Stage::begin(palette.clone(), "5", false, true, false, true);
+        let _ = stage.start(b"Tools", None, crate::update_engine::now_secs(), None);
         let mut output = Vec::new();
         let mut errors = Vec::new();
         let mut beat = crate::progress_ui::Heartbeat::new(crate::update_engine::now_secs(), 0);

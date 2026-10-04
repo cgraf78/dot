@@ -284,6 +284,9 @@ pub struct EngineInputs<'a> {
     pub checkout_root: &'a str,
     /// Precomputed `_ui_live_enabled` for the stage.
     pub live: bool,
+    /// Live rows reach a real terminal (not a forced live UI on a pipe):
+    /// rows fit its width, and children that may prompt get the terminal.
+    pub terminal: bool,
     /// Base for throwaway repositories.
     pub tmp: &'a Path,
     /// Probed move tool.
@@ -595,6 +598,7 @@ fn hold(
         rc: 0,
         state: update,
         overlay,
+        reason: None,
     }
 }
 
@@ -842,7 +846,13 @@ impl Agg {
 
     /// The single deferred close
     /// (`_dot_update_repo_stage_finish`).
-    fn close(&self, stage: &mut Stage, forced: &str, verbose: Option<&str>) -> Vec<u8> {
+    fn close(
+        &self,
+        stage: &mut Stage,
+        forced: &str,
+        verbose: Option<&str>,
+        reason: Option<&str>,
+    ) -> Vec<u8> {
         repo_finish(
             stage,
             forced,
@@ -852,6 +862,7 @@ impl Agg {
             &self.skipped.to_string(),
             &self.changed_items,
             verbose,
+            reason.map(str::as_bytes),
         )
     }
 }
@@ -863,6 +874,9 @@ struct ConvergeOut {
     rc: i32,
     state: UpdateState,
     overlay: Agg,
+    /// The overlay descriptor that stopped convergence, phrased for the
+    /// Repos row (see [`discovery_reason`]).
+    reason: Option<String>,
 }
 
 /// Build the pull-phase candidate environment with the overlay
@@ -894,6 +908,7 @@ fn repo_finish(
     skipped: &str,
     changed_items: &[u8],
     verbose: Option<&str>,
+    reason: Option<&[u8]>,
 ) -> Vec<u8> {
     crate::update::repo_stage_finish(
         stage,
@@ -906,6 +921,7 @@ fn repo_finish(
             agg_skipped: Some(skipped),
             changed_items,
             verbose,
+            reason,
         },
     )
 }
@@ -1042,7 +1058,7 @@ pub fn sync_repos(
         // This pull covers only the base (no overlays yet), and the pull
         // lanes report no reason beyond their stderr warning.
         inputs.fail(crate::update_status::STAGE_REPOS, "dotfiles", "pull failed");
-        let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose);
+        let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose, None);
         let _ = out.write_all(&close);
         restore_generation(inputs, base, &snapshot, &[], err);
         return SyncDone {
@@ -1061,7 +1077,7 @@ pub fn sync_repos(
             let _ = err.write_all(failure.line().as_bytes());
             let _ = err.write_all(b"\n");
             inputs.fail(crate::update_status::STAGE_REPOS, "config", failure.line());
-            let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose);
+            let close = Agg::base(&outcome).close(stage, "1", inputs.dot_verbose, None);
             let _ = out.write_all(&close);
             restore_generation(inputs, base, &snapshot, &[], err);
             return SyncDone {
@@ -1121,7 +1137,7 @@ fn sync_tail(
             "overlay or profile resolution failed",
         );
         if close_active {
-            let close = agg.close(stage, "1", inputs.dot_verbose);
+            let close = agg.close(stage, "1", inputs.dot_verbose, conv.reason.as_deref());
             let _ = io.out.write_all(&close);
         }
         if let (Some(base), Some(snapshot)) = (base, snapshot.as_ref()) {
@@ -1142,7 +1158,7 @@ fn sync_tail(
             restore_generation(inputs, base, snapshot, &[], io.err);
         }
         if close_active {
-            let close = agg.close(stage, "0", inputs.dot_verbose);
+            let close = agg.close(stage, "0", inputs.dot_verbose, None);
             let _ = io.out.write_all(&close);
         }
         return SyncDone {
@@ -1180,7 +1196,7 @@ fn sync_tail(
             "could not prepare the profile lifecycle",
         );
         if close_active {
-            let close = agg.close(stage, "1", inputs.dot_verbose);
+            let close = agg.close(stage, "1", inputs.dot_verbose, None);
             let _ = io.out.write_all(&close);
         }
         if let (Some(base), Some(snapshot)) = (base, snapshot.as_ref()) {
@@ -1193,7 +1209,7 @@ fn sync_tail(
         };
     }
     if close_active {
-        let close = agg.close(stage, "0", inputs.dot_verbose);
+        let close = agg.close(stage, "0", inputs.dot_verbose, None);
         let _ = io.out.write_all(&close);
     }
     SyncDone {
@@ -1304,10 +1320,11 @@ fn converge_overlays(
     io: &mut UpdateIo<'_>,
     prefetch: Option<&crate::repos_prefetch::Prefetch>,
 ) -> ConvergeOut {
-    let fail = |state: UpdateState, overlay: Agg| ConvergeOut {
+    let fail = |state: UpdateState, overlay: Agg, reason: Option<String>| ConvergeOut {
         rc: 1,
         state,
         overlay,
+        reason,
     };
     let mut overlay = Agg::zero();
     if let Err(error) = update.profiles.load_default(
@@ -1318,7 +1335,7 @@ fn converge_overlays(
         let _ = io
             .err
             .write_all(format!("dot: profile: {}\n", error.message).as_bytes());
-        return fail(update, overlay);
+        return fail(update, overlay, None);
     }
     // Definition keys print after selection (`converge_profiles`), which
     // keeps only those in profiles this host includes.
@@ -1326,8 +1343,8 @@ fn converge_overlays(
         return converge_profiles(inputs, stage, moves, io, update, overlay, prefetch);
     }
     let mut dstate = crate::overlays::State::default();
-    if discover_active(inputs, &mut dstate, io.err, true).is_err() {
-        return fail(update, overlay);
+    if let Err(reason) = discover_active(inputs, &mut dstate, io.err, true) {
+        return fail(update, overlay, reason);
     }
     if skew_holds(&dstate.unknown_keys) {
         return hold(inputs, update, overlay, io.err);
@@ -1342,7 +1359,7 @@ fn converge_overlays(
         let _ = io.err.write_all(warning.as_bytes());
         let _ = io.err.write_all(b"\n");
         update.active = entries;
-        return fail(update, overlay);
+        return fail(update, overlay, None);
     }
     if pre_sync(
         inputs,
@@ -1355,7 +1372,7 @@ fn converge_overlays(
     .is_err()
     {
         update.active = entries;
-        return fail(update, overlay);
+        return fail(update, overlay, None);
     }
     // The eligible pull phase: the shell bumps `DONE` past the
     // base row first (a fresh process starts at zero without
@@ -1399,9 +1416,9 @@ fn converge_overlays(
     let failed = outcome.tally.failed;
     let phase_ok = crate::update::overlay_phase_ok(outcome.rc, Some(&failed.to_string()));
     // Rediscover before returning, even on a failed phase.
-    if discover_active(inputs, &mut dstate, io.err, true).is_err() {
+    if let Err(reason) = discover_active(inputs, &mut dstate, io.err, true) {
         update.active = entries;
-        return fail(update, overlay);
+        return fail(update, overlay, reason);
     }
     let _ = use_set(&mut dstate, "active");
     update.capture(&dstate);
@@ -1409,6 +1426,7 @@ fn converge_overlays(
         rc: if phase_ok { 0 } else { 1 },
         state: update,
         overlay,
+        reason: None,
     }
 }
 
@@ -1424,20 +1442,23 @@ fn converge_profiles(
     mut overlay: Agg,
     prefetch: Option<&crate::repos_prefetch::Prefetch>,
 ) -> ConvergeOut {
-    let fail = |state: UpdateState, overlay: Agg| ConvergeOut {
+    let fail = |state: UpdateState, overlay: Agg, reason: Option<String>| ConvergeOut {
         rc: 1,
         state,
         overlay,
+        reason,
     };
     if let Err(error) = update.profiles.select_base() {
         let _ = io
             .err
             .write_all(format!("dot: profile: {}\n", error.message).as_bytes());
-        return fail(update, overlay);
+        return fail(update, overlay, None);
     }
     let mut state = crate::overlays::State::default();
-    if discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err).is_err() {
-        return fail(update, overlay);
+    if let Err(reason) =
+        discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err)
+    {
+        return fail(update, overlay, reason);
     }
     // A skipped `base` overlay already leaves the selection unknown (its
     // personal selectors go unread), so hold before pulling anything.
@@ -1460,7 +1481,7 @@ fn converge_profiles(
         let _ = io.err.write_all(warning.as_bytes());
         let _ = io.err.write_all(b"\n");
         update.active = entries;
-        return fail(update, overlay);
+        return fail(update, overlay, None);
     }
     if pre_sync(
         inputs,
@@ -1473,7 +1494,7 @@ fn converge_profiles(
     .is_err()
     {
         update.active = entries;
-        return fail(update, overlay);
+        return fail(update, overlay, None);
     }
     let count = pull_overlay_count(&entries);
     if count > 0 {
@@ -1513,9 +1534,11 @@ fn converge_profiles(
     let phase_ok =
         crate::update::overlay_phase_ok(outcome.rc, Some(&outcome.tally.failed.to_string()));
     // Shell re-discovers the phase-one state even after a failed pull.
-    if discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err).is_err() {
+    if let Err(reason) =
+        discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err)
+    {
         update.active = entries;
-        return fail(update, overlay);
+        return fail(update, overlay, reason);
     }
     let phase_one_active = state.active.clone();
     update.phase_one = phase_one_active.clone();
@@ -1523,7 +1546,7 @@ fn converge_profiles(
     if !phase_ok {
         let _ = use_set(&mut state, "active");
         update.capture(&state);
-        return fail(update, overlay);
+        return fail(update, overlay, None);
     }
     let user = match crate::profiles::current_user() {
         Some(user) => user,
@@ -1532,7 +1555,7 @@ fn converge_profiles(
                 .err
                 .write_all(b"dot: profile: cannot determine current user\n");
             update.active = entries;
-            return fail(update, overlay);
+            return fail(update, overlay, None);
         }
     };
     let host = match crate::platform::detect_host() {
@@ -1542,7 +1565,7 @@ fn converge_profiles(
                 .err
                 .write_all(b"dot: profile: cannot determine current short hostname\n");
             update.active = entries;
-            return fail(update, overlay);
+            return fail(update, overlay, None);
         }
     };
     let phase_refs: Vec<&str> = phase_one_active.iter().map(String::as_str).collect();
@@ -1562,11 +1585,13 @@ fn converge_profiles(
             .err
             .write_all(format!("dot: profile: {}\n", error.message).as_bytes());
         update.active = entries;
-        return fail(update, overlay);
+        return fail(update, overlay, None);
     }
-    if discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err).is_err() {
+    if let Err(reason) =
+        discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err)
+    {
         update.active = entries;
-        return fail(update, overlay);
+        return fail(update, overlay, reason);
     }
     if skew_holds(&update.profiles.unknown_keys) || skew_holds(&state.unknown_keys) {
         return hold(inputs, update, overlay, io.err);
@@ -1581,7 +1606,7 @@ fn converge_profiles(
         let _ = io.err.write_all(warning.as_bytes());
         let _ = io.err.write_all(b"\n");
         update.active = entries;
-        return fail(update, overlay);
+        return fail(update, overlay, None);
     }
     if pre_sync(
         inputs,
@@ -1594,7 +1619,7 @@ fn converge_profiles(
     .is_err()
     {
         update.active = entries;
-        return fail(update, overlay);
+        return fail(update, overlay, None);
     }
     let additions: Vec<String> = entries
         .iter()
@@ -1624,9 +1649,11 @@ fn converge_profiles(
     overlay.fold_overlay(&outcome);
     let additions_ok =
         crate::update::overlay_phase_ok(outcome.rc, Some(&outcome.tally.failed.to_string()));
-    if discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err).is_err() {
+    if let Err(reason) =
+        discover_selected(inputs, &mut state, &update.profiles.overlay_names, io.err)
+    {
         update.active = entries;
-        return fail(update, overlay);
+        return fail(update, overlay, reason);
     }
     let _ = use_set(&mut state, "active");
     update.capture(&state);
@@ -1635,9 +1662,10 @@ fn converge_profiles(
             rc: 0,
             state: update,
             overlay,
+            reason: None,
         }
     } else {
-        fail(update, overlay)
+        fail(update, overlay, None)
     }
 }
 
@@ -1682,7 +1710,7 @@ fn discover_active(
     state: &mut crate::overlays::State,
     err: &mut dyn std::io::Write,
     report: bool,
-) -> Result<(), ()> {
+) -> Result<(), Option<String>> {
     let xdg_config = if inputs.config_home.is_empty() {
         String::new()
     } else {
@@ -1714,13 +1742,10 @@ fn discover_active(
     if report {
         warn_data_keys(inputs, &state.unknown_keys, err);
     }
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = err.write_all(format!("{error:?}\n").as_bytes());
-            Err(())
-        }
-    }
+    result.map_err(|error| {
+        report_discovery_error(inputs, err, &error);
+        discovery_reason(state)
+    })
 }
 
 /// Profile-aware discovery with a caller-owned selected list. The discovery
@@ -1731,7 +1756,7 @@ fn discover_selected(
     state: &mut crate::overlays::State,
     selected: &[String],
     err: &mut dyn std::io::Write,
-) -> Result<(), ()> {
+) -> Result<(), Option<String>> {
     let xdg_config = inputs.config_home.to_string();
     let conf_dir = crate::overlays::conf_dir(&xdg_config, inputs.home);
     let conf_path = match conf_dir {
@@ -1759,12 +1784,52 @@ fn discover_selected(
     let result =
         crate::overlays::discover(state, Path::new(&conf_path), "", &discover_inputs, &matches);
     warn_data_keys(inputs, &state.unknown_keys, err);
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = err.write_all(format!("{error}\n").as_bytes());
-            Err(())
-        }
+    result.map_err(|error| {
+        report_discovery_error(inputs, err, &error);
+        discovery_reason(state)
+    })
+}
+
+/// The Repos-row reason for a failed discovery, when a descriptor broke it.
+///
+/// Only descriptor faults get one: every other way convergence fails keeps
+/// the counts its row has always shown (and the performance gate compares
+/// against the shell engine's rows for those), with the cause on stderr.
+fn discovery_reason(state: &crate::overlays::State) -> Option<String> {
+    // The name is whatever the descriptor's file name held, controls and
+    // escapes included (an invalid name is how it got here).
+    state.discovery_failed.as_ref().map(|(name, fault)| {
+        let name = crate::progress_ui::sanitize_untrusted_text(name.as_bytes());
+        format!(
+            "overlay {}: {}",
+            String::from_utf8_lossy(&name),
+            fault.summary()
+        )
+    })
+}
+
+/// Print a failed overlay discovery the way every other diagnostic prints:
+/// a descriptor problem as its `  warning:` row, an announced failure as its
+/// `dot: overlay:` line, and the silent failures not at all (they render
+/// empty and must not leave a blank line).
+fn report_discovery_error(
+    inputs: &EngineInputs<'_>,
+    err: &mut dyn std::io::Write,
+    error: &crate::overlays::Error,
+) {
+    // Descriptor paths and names come from file names: keep their control
+    // bytes and escapes out of the terminal.
+    let text = String::from_utf8_lossy(&crate::progress_ui::sanitize_untrusted_text(
+        error.to_string().as_bytes(),
+    ))
+    .into_owned();
+    if text.is_empty() {
+        return;
+    }
+    if matches!(error, crate::overlays::Error::Warning(_)) {
+        warn_row(err, inputs.palette, &text);
+    } else {
+        let _ = writeln!(err, "{text}");
     }
 }
 
@@ -1938,10 +2003,16 @@ fn prune_row(caller: Caller, mode: PruneMode, cron: bool) -> bool {
 /// Stage count for this invocation: Repos, Overlays, Tools, Configs, and
 /// Cleanup, plus Prune when this run prunes.
 fn stage_total(inputs: &EngineInputs<'_>) -> &'static str {
-    if prune_row(inputs.caller, inputs.prune_mode, inputs.flags.cron) {
-        "6"
-    } else {
-        "5"
+    // Without a base checkout no Repos stage opens (see `sync_repos`), so
+    // the count drops by one and the last row still reads `[N/N]`.
+    let repos = inputs.base.is_some_and(|base| base.exists());
+    match (
+        prune_row(inputs.caller, inputs.prune_mode, inputs.flags.cron),
+        repos,
+    ) {
+        (true, true) => "6",
+        (true, false) | (false, true) => "5",
+        (false, false) => "4",
     }
 }
 
@@ -3079,6 +3150,7 @@ pub struct Gathered {
     merge_jobs: Option<String>,
     skip_provider: bool,
     live: bool,
+    terminal: bool,
     multibyte: bool,
     ascii: bool,
     euid: u32,
@@ -3132,6 +3204,7 @@ impl Gathered {
             update_jobs: self.update_jobs.as_deref(),
             merge_jobs: self.merge_jobs.as_deref(),
             live: self.live,
+            terminal: self.terminal,
             multibyte: self.multibyte,
             ascii: self.ascii,
             bar_width: &self.bar_width,
@@ -3385,6 +3458,7 @@ fn gather(
         merge_jobs: env_value(env, "DOT_MERGE_JOBS"),
         skip_provider,
         live,
+        terminal: live && stdout_tty,
         multibyte,
         ascii,
         euid,
@@ -3547,25 +3621,38 @@ pub fn run_update(
             return error.code();
         }
     };
+    let inputs = gathered.inputs();
     // Every engine row streams through these sinks as its phase files it;
     // either sink remembers a delivery failure so the exit status still
-    // reports undelivered output exactly like the old end-of-run flush.
+    // reports undelivered output exactly like the old end-of-run flush. Both
+    // go through one console so a warning never lands on a live row.
+    let console = crate::live_console::LiveConsole::new(
+        &mut *streams.stdout,
+        &mut *streams.stderr,
+        inputs.live,
+    );
+    let mut console_out = console.stdout();
+    let mut console_err = console.stderr();
     let mut out = LiveSink {
-        inner: &mut *streams.stdout,
+        inner: &mut console_out,
         failed: false,
     };
     let mut err = LiveSink {
-        inner: &mut *streams.stderr,
+        inner: &mut console_err,
         failed: false,
     };
     let mut degraded = crate::update_status::Degraded::default();
-    let code = run_gathered(
-        &gathered.inputs(),
-        &mut out,
-        &mut err,
-        started,
-        &mut degraded,
-    );
+    let code = run_gathered(&inputs, &mut out, &mut err, started, &mut degraded);
+    // A partial stderr line the console held back, or a row an interrupted
+    // stage left open, is delivered here. Only a clean run turns a failed
+    // delivery into status 1: a provider that exited by signal makes its
+    // supervisor abort queued output, which leaves the relay rejecting these
+    // writes, and the provider's 128+signal status must stand.
+    if let Err(error) = console.finish() {
+        if code == 0 {
+            err.record(error);
+        }
+    }
     if out.failed() || err.failed() {
         return 1;
     }
@@ -3745,7 +3832,12 @@ fn run_gathered_inner(
         inputs.live,
         inputs.multibyte,
         inputs.ascii,
-    );
+    )
+    .with_width(if inputs.terminal {
+        crate::progress_ui::RowWidth::Terminal
+    } else {
+        crate::progress_ui::RowWidth::Fixed
+    });
     let mut moves = crate::temp::MoveCache::default();
     let mut sync = sync_repos(inputs, &mut stage, &mut moves, out, err);
     if cancelled() {

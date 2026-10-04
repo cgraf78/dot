@@ -962,19 +962,34 @@ fn replay(
         }
         merged += 1;
         if inputs.verbose && !inputs.quiet {
-            let (label, details) = result_label_bytes(&record.hook.key, &record.output);
+            // The row names the hook; everything the hook printed follows as
+            // its detail lines. A first line was the row title before, so a
+            // hook that opened with a diagnostic left the row unnamed.
+            let (first, rest) = result_label_bytes(&record.hook.key, &record.output);
+            let name = label_from_script(&record.hook.key).as_bytes().to_vec();
+            let mut details = Vec::with_capacity(rest.len() + 1);
+            if first != name {
+                details.push(first);
+            }
+            details.extend(rest);
             let (rendered, _) = render_result(
                 inputs.palette,
                 false,
                 false,
                 if record.rc == 0 { b"ok" } else { b"warning" },
-                &label,
+                &name,
                 record.elapsed_ms,
                 &details,
                 inputs.multibyte,
             );
             let _ = out.write_all(&rendered);
         } else if record.rc != 0 {
+            // A hook stopped by Ctrl-C did not fail on its own.
+            let outcome = if crate::cleanup::received_signal().is_some() {
+                "interrupted"
+            } else {
+                "failed"
+            };
             if !record.output.is_empty() {
                 inputs.log.warn(
                     err,
@@ -984,12 +999,12 @@ fn replay(
                     let _ = err.write_all(b"    ");
                     let _ = err.write_all(line);
                 }
-                inputs.log.warn(err, "  warning: merge failed");
+                inputs.log.warn(err, &format!("  warning: merge {outcome}"));
             } else {
                 inputs.log.warn(
                     err,
                     &format!(
-                        "  warning: merge failed: {}",
+                        "  warning: merge {outcome}: {}",
                         record.hook.key.to_string_lossy()
                     ),
                 );
@@ -1185,6 +1200,79 @@ mod tests {
     }
 
     #[test]
+    fn verbose_rows_name_the_hook_and_keep_its_lines() {
+        // The hook's first output line used to be the row title, so a hook
+        // that opened with a diagnostic left its row unnamed.
+        let scope = TempDir::new("merge-verbose-names").expect("fixture");
+        let env = BTreeMap::from([
+            (OsString::from("HOME"), scope.path().as_os_str().to_owned()),
+            (
+                OsString::from("DOT_SOURCE_ROOT"),
+                OsString::from(env!("CARGO_MANIFEST_DIR")),
+            ),
+        ]);
+        let runtime = crate::app::Runtime::from_env(&env, scope.path()).expect("runtime");
+        let palette = crate::progress_ui::Palette::empty();
+        let log = crate::log::Log::new(false, false);
+        let inputs = RunInputs {
+            runtime: &runtime,
+            update_lock_token: None,
+            extension_inputs: crate::extension_trust::Inputs {
+                euid: 0,
+                home: String::new(),
+                extensions_dir: String::new(),
+                manifest: String::new(),
+                retiring_root: String::new(),
+            },
+            extensions_enabled: true,
+            overlays: &[],
+            tmp: scope.path(),
+            update_jobs: None,
+            merge_jobs: None,
+            verbose: true,
+            quiet: false,
+            force: false,
+            palette: &palette,
+            multibyte: false,
+            ascii: true,
+            ui_total: Some("1"),
+            bar_width: "8",
+            log: &log,
+        };
+        let record = |key: &str, output: &[u8]| ResultRecord {
+            hook: Hook {
+                key: OsString::from(key),
+                script: std::path::PathBuf::from(format!("{key}.sh")),
+            },
+            rc: 0,
+            output: output.to_vec(),
+            has_merge: true,
+            elapsed_ms: 7,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut failures = Vec::new();
+        super::replay(
+            vec![
+                record("10-cron", b"warning: stale entry\nkept 3 jobs\n"),
+                record("20-git", b"git\nmerged\n"),
+            ],
+            &inputs,
+            &mut out,
+            &mut err,
+            &mut failures,
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "  ok       cron                         7ms\n\
+             \x20   warning: stale entry\n\
+             \x20   kept 3 jobs\n\
+             \x20 ok       git                          7ms\n\
+             \x20   merged\n"
+        );
+    }
+
+    #[test]
     fn scratch_failure_precedes_bash_resolution() {
         let scope = TempDir::new("merge-scratch-precedence").expect("fixture");
         let home = scope.path().join("home");
@@ -1281,6 +1369,8 @@ mod tests {
         // proves the waiter stayed until completion.
         let palette = crate::progress_ui::Palette::empty();
         let mut stage = crate::progress_ui::Stage::begin(palette, "5", false, true, false, true);
+        // Heartbeats redraw an opened stage's row.
+        let _ = stage.start(b"Configs", None, crate::update_engine::now_secs(), None);
         let mut out = Vec::new();
         let mut beat = Heartbeat::new(crate::update_engine::now_secs(), 0);
         std::thread::scope(|scope| {

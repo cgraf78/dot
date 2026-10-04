@@ -121,6 +121,7 @@ fn repository_stage_is_silent_until_deferred() {
             agg_skipped: Some("9"),
             changed_items: b"must-not-render",
             verbose: None,
+            reason: Some(b"must-not-render"),
         },
     );
     assert!(output.is_empty());
@@ -227,6 +228,7 @@ fn repository_stage_renders_all_statuses_counts_and_notes() {
                 agg_skipped: case.skipped,
                 changed_items: case.items,
                 verbose: case.verbose,
+                reason: None,
             },
         );
         let text = String::from_utf8(output).unwrap();
@@ -241,4 +243,43 @@ fn repository_stage_renders_all_statuses_counts_and_notes() {
             );
         }
     }
+}
+
+#[test]
+fn forced_repository_failure_reports_its_reason() {
+    // A coordinator failure with no failed repository used to read
+    // `failed  1 repo current`; the reason now says what failed.
+    let finish = |forced: &str, reason: Option<&[u8]>| {
+        let mut stage = Stage::begin(
+            dot::progress_ui::Palette::empty(),
+            "4",
+            false,
+            false,
+            false,
+            true,
+        );
+        let _ = stage.start(b"Repos", None, 0, None);
+        let output = dot::update::repo_stage_finish(
+            &mut stage,
+            &RepoStageFinish {
+                deferred_active: true,
+                forced_failure: Some(forced),
+                agg_current: Some("1"),
+                agg_changed: Some("0"),
+                agg_failed: Some("0"),
+                agg_skipped: Some("0"),
+                changed_items: b"",
+                verbose: None,
+                reason,
+            },
+        );
+        String::from_utf8(output).unwrap()
+    };
+    let failed = finish("1", Some(b"overlay bad: invalid descriptor"));
+    assert!(
+        failed.contains("failed   overlay bad: invalid descriptor "),
+        "{failed:?}"
+    );
+    // A reason never decorates a run that did not fail.
+    assert!(finish("0", Some(b"ignored")).contains("ok       1 repo current"));
 }

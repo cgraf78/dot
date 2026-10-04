@@ -176,9 +176,19 @@ pub fn pull_repo(
         && (inputs.verbose || rc != 0);
     if loud {
         if let Ok(content) = std::fs::read_to_string(&log) {
-            let visible: Vec<&str> = content
+            // Git's own lines, indented under the Repos stage like any child
+            // output (empty lines stay empty).
+            let indent = String::from_utf8_lossy(crate::progress_ui::CHILD_OUTPUT_INDENT);
+            let visible: Vec<String> = content
                 .lines()
                 .filter(|line| !is_up_to_date_noise(line))
+                .map(|line| {
+                    if line.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{indent}{line}")
+                    }
+                })
                 .collect();
             if !visible.is_empty() {
                 inputs.log.dim(out, &visible.join("\n"));
@@ -941,6 +951,9 @@ pub struct PullBaseInputs<'a> {
     pub verbose: bool,
     /// Logger for the dim log dump and backup warnings.
     pub log: &'a Log,
+    /// Live rows reach a real terminal: the fetch may prompt the user, so
+    /// its stderr is a pseudo-terminal (see `prepare_base_upstream`).
+    pub terminal: bool,
 }
 
 /// `_pull_base`: fetch the upstream, fast-path the current
@@ -1020,7 +1033,15 @@ pub fn pull_base(
             return failed();
         }
     }
-    let upstream = match prepare_base_upstream(inputs.base) {
+    // With the Repos row hidden (quiet, cron), name the repository above its
+    // fetch output, as an overlay's is named.
+    let mut header = Vec::new();
+    if inputs.quiet {
+        inputs.log.warn(&mut header, "  dotfiles fetch output:");
+    }
+    let mut fetch_output = crate::repos_pull_support::HeaderFirst::new(warnings, header);
+    let fetched = prepare_base_upstream(inputs.base, &mut fetch_output, inputs.terminal);
+    let upstream = match fetched {
         Ok(upstream) => upstream,
         Err(_) => return failed(),
     };

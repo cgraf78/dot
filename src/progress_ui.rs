@@ -509,6 +509,7 @@ fn line_head(palette: &Palette, index: i64, total: &str) -> Vec<u8> {
 /// The color comes from the stage `status` while the cell shows
 /// `cell_text`: for a running live line those differ (colored
 /// `running` slot around the current spinner frame).
+#[allow(clippy::too_many_arguments)] // the row's cells, in order
 fn line_cells(
     palette: &Palette,
     label: &[u8],
@@ -516,6 +517,7 @@ fn line_cells(
     cell_text: &[u8],
     detail: &[u8],
     multibyte: bool,
+    fit: Fit,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&cell(label, 10, multibyte));
@@ -524,8 +526,111 @@ fn line_cells(
     out.extend_from_slice(&cell(cell_text, 8, multibyte));
     out.extend_from_slice(palette.reset.as_bytes());
     out.push(b' ');
-    out.extend_from_slice(&cell(detail, 42, multibyte));
+    match fit {
+        Fit::Fixed => out.extend_from_slice(&cell(detail, DETAIL_WIDTH, multibyte)),
+        Fit::Detail(width) => out.extend_from_slice(&word_cell(detail, width, multibyte)),
+    }
     out
+}
+
+/// Width of a row's detail cell when nothing narrower is asked for: with
+/// the other cells this makes a 75-column row.
+const DETAIL_WIDTH: usize = 42;
+
+/// Columns a row takes besides its `[i/n]` head and detail cell: the
+/// head's space, the label cell and its space, the status cell and its
+/// space, the space before the elapsed column, and that column.
+const ROW_FIXED_COLUMNS: usize = 1 + 10 + 1 + 8 + 1 + 1 + 6;
+
+/// How a row renders its detail cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fit {
+    /// The historical fixed cell (piped and test output stay byte-stable).
+    Fixed,
+    /// A cell this many columns wide, cut at a word boundary.
+    Detail(usize),
+}
+
+impl Fit {
+    /// The detail width that keeps a row with head `head` inside a
+    /// terminal of `columns` columns, one column short of the edge so the
+    /// cursor never wraps (a redraw only erases its own physical line).
+    fn for_terminal(columns: usize, head: &[u8], multibyte: bool) -> Fit {
+        let used = measured_len(head, multibyte) + ROW_FIXED_COLUMNS;
+        Fit::Detail(DETAIL_WIDTH.min(columns.saturating_sub(used + 1)))
+    }
+}
+
+/// [`cell`] for terminal rows: pad to `width`, shortening over-long text
+/// without cutting a word. A summary of clauses (`2 repos current, 1 repo
+/// failed`) drops whole clauses, keeping any that report a failure first;
+/// a single clause keeps its leading whole words. When not even one word
+/// fits, the cell stays blank rather than showing a word fragment.
+fn word_cell(text: &[u8], width: usize, multibyte: bool) -> Vec<u8> {
+    if measured_len(text, multibyte) <= width {
+        return pad(text, width, multibyte);
+    }
+    let clauses = clauses(text);
+    let failing = |clause: &&[u8]| clause.windows(4).any(|window| window == b"fail");
+    let mut chosen = vec![false; clauses.len()];
+    let mut used = 0;
+    let order = (0..clauses.len())
+        .filter(|at| failing(&clauses[*at]))
+        .chain((0..clauses.len()).filter(|at| !failing(&clauses[*at])));
+    for at in order {
+        let extra = measured_len(clauses[at], multibyte) + if used > 0 { 2 } else { 0 };
+        if used + extra <= width {
+            chosen[at] = true;
+            used += extra;
+        }
+    }
+    let kept: Vec<&[u8]> = clauses
+        .iter()
+        .zip(&chosen)
+        .filter(|(_, chosen)| **chosen)
+        .map(|(clause, _)| *clause)
+        .collect();
+    if !kept.is_empty() {
+        return pad(&kept.join(b", ".as_slice()), width, multibyte);
+    }
+    let first = clauses
+        .iter()
+        .find(|clause| failing(clause))
+        .or(clauses.first())
+        .copied()
+        .unwrap_or(text);
+    pad(&leading_words(first, width, multibyte), width, multibyte)
+}
+
+/// `text` split at its `, ` and `; ` clause separators.
+fn clauses(text: &[u8]) -> Vec<&[u8]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut at = 0;
+    while at + 1 < text.len() {
+        if matches!(text[at], b',' | b';') && text[at + 1] == b' ' {
+            parts.push(text[start..at].trim_ascii());
+            start = at + 2;
+            at += 2;
+        } else {
+            at += 1;
+        }
+    }
+    parts.push(text[start..].trim_ascii());
+    parts.retain(|part| !part.is_empty());
+    parts
+}
+
+/// The whole words of `text` that fit in `width` (possibly none).
+fn leading_words(text: &[u8], width: usize, multibyte: bool) -> Vec<u8> {
+    let prefix = take_prefix(text, width, multibyte);
+    let cut = if matches!(text.get(prefix.len()), None | Some(b' ')) {
+        prefix.len()
+    } else {
+        prefix.iter().rposition(|byte| *byte == b' ').unwrap_or(0)
+    };
+    let kept = prefix[..cut].trim_ascii_end();
+    kept.strip_suffix(b":").unwrap_or(kept).to_vec()
 }
 
 /// `_ui_line`: one newline-terminated progress line. `total` and
@@ -543,18 +648,49 @@ pub fn line(
     elapsed: &[u8],
     multibyte: bool,
 ) -> Vec<u8> {
+    line_fit(
+        palette, quiet, index, total, label, status, detail, elapsed, multibyte, None,
+    )
+}
+
+/// [`line`] fitted to a terminal `columns` wide when known.
+#[allow(clippy::too_many_arguments)] // `line` plus its terminal width
+fn line_fit(
+    palette: &Palette,
+    quiet: bool,
+    index: i64,
+    total: &str,
+    label: &[u8],
+    status: &[u8],
+    detail: &[u8],
+    elapsed: &[u8],
+    multibyte: bool,
+    columns: Option<usize>,
+) -> Vec<u8> {
     if quiet {
         return Vec::new();
     }
     let mut out = line_head(palette, index, total);
+    let fit = row_fit(index, total, columns, multibyte);
     out.push(b' ');
     out.extend_from_slice(&line_cells(
-        palette, label, status, status, detail, multibyte,
+        palette, label, status, status, detail, multibyte, fit,
     ));
     out.push(b' ');
     out.extend_from_slice(&column6(elapsed));
     out.push(b'\n');
     out
+}
+
+/// The detail fit for a row in a terminal `columns` wide (fixed when the
+/// width is unknown). Measured on the uncoloured head.
+fn row_fit(index: i64, total: &str, columns: Option<usize>, multibyte: bool) -> Fit {
+    match columns {
+        Some(columns) => {
+            Fit::for_terminal(columns, format!("[{index}/{total}]").as_bytes(), multibyte)
+        }
+        None => Fit::Fixed,
+    }
 }
 
 /// ASCII spinner frames, selected when [`ascii_mode`] holds.
@@ -581,6 +717,28 @@ pub fn live_line(
     ascii: bool,
     multibyte: bool,
 ) -> Vec<u8> {
+    live_line_fit(
+        palette, quiet, index, total, label, status, detail, elapsed, spinner, ascii, multibyte,
+        None,
+    )
+}
+
+/// [`live_line`] fitted to a terminal `columns` wide when known.
+#[allow(clippy::too_many_arguments)] // `live_line` plus its terminal width
+fn live_line_fit(
+    palette: &Palette,
+    quiet: bool,
+    index: i64,
+    total: &str,
+    label: &[u8],
+    status: &[u8],
+    detail: &[u8],
+    elapsed: &[u8],
+    spinner: &mut u64,
+    ascii: bool,
+    multibyte: bool,
+    columns: Option<usize>,
+) -> Vec<u8> {
     if quiet {
         return Vec::new();
     }
@@ -600,7 +758,13 @@ pub fn live_line(
     out.extend_from_slice(&line_head(palette, index, total));
     out.push(b' ');
     out.extend_from_slice(&line_cells(
-        palette, label, status, frame, detail, multibyte,
+        palette,
+        label,
+        status,
+        frame,
+        detail,
+        multibyte,
+        row_fit(index, total, columns, multibyte),
     ));
     out.push(b' ');
     out.extend_from_slice(&column6(elapsed));
@@ -897,6 +1061,27 @@ fn is_bare_name(text: &str) -> bool {
     bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// How wide a stage's rows may be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowWidth {
+    /// The historical fixed 75-column rows (pipes, tests).
+    Fixed,
+    /// Fit the terminal stdout is attached to, read at each render.
+    Terminal,
+    /// Fit a terminal this many columns wide.
+    Columns(usize),
+}
+
+/// The width of the terminal on stdout, when stdout is one that reports a
+/// width. Rows wider than the terminal wrap, and a redraw's line erase then
+/// clears only the last physical line, leaving stale half-rows behind.
+pub fn terminal_columns() -> Option<usize> {
+    // SAFETY: TIOCGWINSZ only fills the zeroed winsize it is handed.
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    let read = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ as _, &mut size) };
+    (read == 0 && size.ws_col > 0).then_some(usize::from(size.ws_col))
+}
+
 /// One live progress stage: the `DOT_UI_*` globals as owned state.
 /// Quiet, live-redraw, counting, and glyph modes resolve once at
 /// [`Stage::begin`] (production reads them from the environment);
@@ -918,6 +1103,8 @@ pub struct Stage {
     /// the end of `_ui_live_line`) so the next clear knows a live
     /// line is on screen.
     live_active: bool,
+    /// Where rows learn how wide they may be.
+    width: RowWidth,
 }
 
 impl Stage {
@@ -944,6 +1131,29 @@ impl Stage {
             started_secs: 0,
             spinner: 0,
             live_active: false,
+            width: RowWidth::Fixed,
+        }
+    }
+
+    /// Fit this stage's rows to `width` instead of the fixed 75 columns.
+    pub fn with_width(mut self, width: RowWidth) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// Whether this stage's live rows reach a real terminal, where a child
+    /// process may prompt the user on the same screen.
+    pub fn on_terminal(&self) -> bool {
+        self.live && !self.quiet && self.width == RowWidth::Terminal
+    }
+
+    /// The terminal width rows must fit, read at each render so a resize
+    /// mid-run takes effect on the next redraw.
+    fn columns(&self) -> Option<usize> {
+        match self.width {
+            RowWidth::Fixed => None,
+            RowWidth::Terminal => terminal_columns(),
+            RowWidth::Columns(columns) => Some(columns),
         }
     }
 
@@ -961,6 +1171,7 @@ impl Stage {
         if self.quiet {
             return Vec::new();
         }
+        let columns = self.columns();
         self.index += 1;
         self.label = label.to_vec();
         self.detail = match detail {
@@ -972,7 +1183,7 @@ impl Stage {
         if self.live {
             let mut out = Vec::new();
             if crate::log::is_quiet(verbose) {
-                out.extend_from_slice(&line(
+                out.extend_from_slice(&line_fit(
                     &self.palette,
                     false,
                     self.index,
@@ -982,9 +1193,10 @@ impl Stage {
                     &self.detail,
                     b"0s",
                     self.multibyte,
+                    columns,
                 ));
             }
-            out.extend_from_slice(&live_line(
+            out.extend_from_slice(&live_line_fit(
                 &self.palette,
                 false,
                 self.index,
@@ -996,11 +1208,12 @@ impl Stage {
                 &mut self.spinner,
                 self.ascii,
                 self.multibyte,
+                columns,
             ));
             self.live_active = true;
             out
         } else {
-            line(
+            line_fit(
                 &self.palette,
                 false,
                 self.index,
@@ -1010,21 +1223,32 @@ impl Stage {
                 &self.detail,
                 b"0s",
                 self.multibyte,
+                columns,
             )
         }
+    }
+
+    /// Whether any stage has opened yet. Before the first [`Stage::start`]
+    /// there is no row to redraw: progress reported then (an overlay pull
+    /// on a client without a base checkout runs before any stage opens)
+    /// would render a `[0/N]` row with no label and an elapsed time
+    /// counted from the epoch.
+    fn started(&self) -> bool {
+        self.index > 0
     }
 
     /// `_ui_stage_update`: re-render with a new detail — live redraw,
     /// newline progress for verbose non-live callers, silence
     /// otherwise.
     pub fn update(&mut self, detail: &[u8], now_secs: i64, verbose: Option<&str>) -> Vec<u8> {
-        if self.quiet {
+        if self.quiet || !self.started() {
             return Vec::new();
         }
+        let columns = self.columns();
         self.detail = detail.to_vec();
         let stamp = elapsed(now_secs, self.started_secs);
         if self.live {
-            let out = live_line(
+            let out = live_line_fit(
                 &self.palette,
                 false,
                 self.index,
@@ -1036,11 +1260,12 @@ impl Stage {
                 &mut self.spinner,
                 self.ascii,
                 self.multibyte,
+                columns,
             );
             self.live_active = true;
             out
         } else if crate::log::is_quiet(verbose) {
-            line(
+            line_fit(
                 &self.palette,
                 false,
                 self.index,
@@ -1050,6 +1275,7 @@ impl Stage {
                 &self.detail,
                 &stamp,
                 self.multibyte,
+                columns,
             )
         } else {
             Vec::new()
@@ -1060,16 +1286,17 @@ impl Stage {
     /// otherwise. An empty detail reads `working`, like the shell
     /// default when no stage ever started.
     pub fn tick(&mut self, now_secs: i64) -> Vec<u8> {
-        if self.quiet || !self.live {
+        if self.quiet || !self.live || !self.started() {
             return Vec::new();
         }
+        let columns = self.columns();
         let detail = if self.detail.is_empty() {
             b"working".as_slice()
         } else {
             &self.detail
         };
         let stamp = elapsed(now_secs, self.started_secs);
-        let out = live_line(
+        let out = live_line_fit(
             &self.palette,
             false,
             self.index,
@@ -1081,6 +1308,7 @@ impl Stage {
             &mut self.spinner,
             self.ascii,
             self.multibyte,
+            columns,
         );
         self.live_active = true;
         out
@@ -1093,10 +1321,11 @@ impl Stage {
         if self.quiet {
             return Vec::new();
         }
+        let columns = self.columns();
         let stamp = elapsed(now_secs, self.started_secs);
         let (mut out, live_active) = clear_live(self.live_active);
         self.live_active = live_active;
-        out.extend_from_slice(&line(
+        out.extend_from_slice(&line_fit(
             &self.palette,
             false,
             self.index,
@@ -1106,7 +1335,46 @@ impl Stage {
             detail,
             &stamp,
             self.multibyte,
+            columns,
         ));
+        out
+    }
+
+    /// Replace the live row with a static, newline-terminated copy showing
+    /// `detail`, before a child that may prompt on the terminal runs: the
+    /// screen keeps saying what is happening, and nothing redraws over the
+    /// child (the live row returns on the next line with the next render).
+    /// Silent unless the row is live and a stage has opened: before the
+    /// first stage there is no row, only a `[0/N]` with an epoch timer.
+    pub fn freeze(&mut self, detail: &[u8], now_secs: i64) -> Vec<u8> {
+        if self.quiet || !self.live || !self.started() {
+            return Vec::new();
+        }
+        let columns = self.columns();
+        let stamp = elapsed(now_secs, self.started_secs);
+        let (mut out, live_active) = clear_live(self.live_active);
+        self.live_active = live_active;
+        out.extend_from_slice(&line_fit(
+            &self.palette,
+            false,
+            self.index,
+            &self.total,
+            &self.label,
+            b"running",
+            detail,
+            &stamp,
+            self.multibyte,
+            columns,
+        ));
+        out
+    }
+
+    /// `_ui_clear_live` for this stage: erase its live row if one is on
+    /// screen, so something else (a prompt on the terminal) can use the line.
+    /// The next redraw puts the row back.
+    pub fn clear(&mut self) -> Vec<u8> {
+        let (out, live_active) = clear_live(self.live_active);
+        self.live_active = live_active;
         out
     }
 
@@ -1332,6 +1600,49 @@ pub fn warn_line(palette: &Palette, message: &[u8]) -> Vec<u8> {
     out.extend_from_slice(palette.reset.as_bytes());
     out.push(b'\n');
     out
+}
+
+/// Indent for a child process's own output shown under a stage: four
+/// spaces, the column of [`detail`] rows and of hook `output:` bodies,
+/// one level below Dot's own `  warning:` rows.
+pub const CHILD_OUTPUT_INDENT: &[u8] = b"    ";
+
+/// A writer that indents every line of a child's output with
+/// [`CHILD_OUTPUT_INDENT`], however the bytes are chunked. Empty lines
+/// stay empty (no trailing blanks), and nothing else is rewritten: the
+/// child's own wording and prefixes (`fatal:`, `error:`) pass through.
+pub struct IndentedLines<'a> {
+    inner: &'a mut dyn std::io::Write,
+    at_line_start: bool,
+}
+
+impl<'a> IndentedLines<'a> {
+    /// Indent everything written to `inner`, starting at a line start.
+    pub fn new(inner: &'a mut dyn std::io::Write) -> Self {
+        IndentedLines {
+            inner,
+            at_line_start: true,
+        }
+    }
+}
+
+impl std::io::Write for IndentedLines<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut rendered = Vec::with_capacity(bytes.len() + CHILD_OUTPUT_INDENT.len());
+        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+            if self.at_line_start && line != b"\n" {
+                rendered.extend_from_slice(CHILD_OUTPUT_INDENT);
+            }
+            rendered.extend_from_slice(line);
+            self.at_line_start = line.ends_with(b"\n");
+        }
+        self.inner.write_all(&rendered)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// `_ui_normal_shell_name`: basename without one leading dash, kept

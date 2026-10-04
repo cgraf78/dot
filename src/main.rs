@@ -3,14 +3,16 @@
 //! All behavior lives in `dot::cli` so integration tests exercise the
 //! same code path as the installed binary — a bug fixed in the library
 //! is fixed for every caller, and a behavior tested in-process holds on
-//! the command line. The adapter owns only five things: applying the inherited
+//! the command line. The adapter owns only six things: applying the inherited
 //! permission ceiling, preserving `argv[0]` for executable-identity validation
 //! while excluding it from command dispatch, snapshotting the ambient runtime
 //! (including the resolved source root; the shell `main.sh` derives it from its
 //! own path — see
 //! `dot::startup` for the full entry-contract map), exposing stdout/stderr as
 //! unbuffered descriptors so handled signals interrupt backpressured writes,
-//! and translating the returned code into the process exit status (or, when an
+//! ending on the terminal a progress row a signal left open (see
+//! `dot::live_console::end_undelivered_output`), and translating the returned
+//! code into the process exit status (or, when an
 //! update's Tools stage upgraded this packaged release, executing the new
 //! binary to finish the run; see `dot::handoff`). Write failures inside `run` are
 //! ignored (`let _ =`) rather than panicking: a closed pipe must
@@ -82,6 +84,14 @@ fn main() {
     // `flushed` still controls the status, not whether healthy bytes survive.
     let relay_finished = output_relay.finish(
         !dot::cleanup::outward_write_interrupted() && !dot::cleanup::outward_write_aborted(),
+    );
+    // A signal leaves the relay refusing writes, so a live row the update was
+    // drawing would stay open under the shell prompt; end it (and show a
+    // child's last refused diagnostic) on the terminal now that the relay is
+    // done and nothing can interleave.
+    dot::live_console::end_undelivered_output(
+        relay_finished != dot::cleanup::ProcessOutputFinish::CleanupIncomplete
+            && !dot::cleanup::outward_write_aborted(),
     );
     let code = if code == 0 && !flushed { 1 } else { code };
     let code = dot::cleanup::process_output_status(code, relay_finished);

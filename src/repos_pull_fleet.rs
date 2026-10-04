@@ -473,7 +473,15 @@ pub fn pull_overlays_serial(
             inputs.dot_verbose,
             inputs.bar_width,
         );
-        let _ = out.write_all(&rendered);
+        // A required overlay's fetch may ask on the terminal: leave a static
+        // line instead of a live row while it runs (see `run_chunk`).
+        if stage.on_terminal() && !entry.optional {
+            let mut detail = b"pulling ".to_vec();
+            detail.extend_from_slice(entry.name.as_bytes());
+            let _ = out.write_all(&stage.freeze(&detail, crate::update_engine::now_secs()));
+        } else {
+            let _ = out.write_all(&rendered);
+        }
         let single = overlay_inputs(inputs, entry);
         let outcome = pull_overlay(&single, moves, out, warnings);
         let status = outcome.status.as_str();
@@ -505,6 +513,7 @@ fn wait_for_chunk(
     beat: &mut Heartbeat,
     stage: &mut Stage,
     out: &mut dyn Write,
+    redraw: bool,
 ) {
     // Timeouts never consume the budget: only completions do, so a
     // slow worker delays the replay instead of truncating it.
@@ -514,12 +523,13 @@ fn wait_for_chunk(
             Ok(()) => {
                 remaining -= 1;
             }
-            Err(RecvTimeoutError::Timeout) => {
+            Err(RecvTimeoutError::Timeout) if redraw => {
                 let now = crate::update_engine::now_secs();
                 if beat.poll(now) {
                     let _ = out.write_all(&stage.tick(now));
                 }
             }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -565,6 +575,21 @@ fn run_chunk(
     beat: &mut Heartbeat,
 ) {
     let host_git = crate::init_client_identity::carry_host_git();
+    // A required overlay's fetch may ask on the terminal (an SSH passphrase
+    // or host key). On a terminal, leave a static line saying what runs
+    // before any worker starts and keep the heartbeat from redrawing over a
+    // question until the chunk is done; the next stage render draws the
+    // live row again below.
+    let quiet_row = stage.on_terminal() && chunk.iter().any(|entry| !entry.optional);
+    if quiet_row {
+        let mut detail = b"pulling ".to_vec();
+        detail.extend_from_slice(&crate::progress_ui::count_phrase(
+            chunk.len() as i64,
+            b"overlay",
+            None,
+        ));
+        let _ = out.write_all(&stage.freeze(&detail, crate::update_engine::now_secs()));
+    }
     let (completion_tx, completion_rx) = std::sync::mpsc::channel::<()>();
     std::thread::scope(|scope| {
         for (offset, entry) in chunk.iter().enumerate() {
@@ -677,7 +702,7 @@ fn run_chunk(
         // without reporting reads as disconnect instead of a hang;
         // worker clones report the rest.
         drop(completion_tx);
-        wait_for_chunk(&completion_rx, chunk.len(), beat, stage, out);
+        wait_for_chunk(&completion_rx, chunk.len(), beat, stage, out, !quiet_row);
     });
 }
 
@@ -1028,8 +1053,22 @@ pub fn pull_all(
         quiet,
         verbose,
         log: inputs.log,
+        terminal: stage.on_terminal(),
     };
+    // The base fetch may ask on the terminal (an SSH passphrase or host key,
+    // a credential): leave a static line saying what runs, so a prompt
+    // starts at column zero below it and the screen is never blank, and
+    // draw the live row again once the pull returns (nothing redraws it
+    // during).
+    let terminal = stage.on_terminal();
+    if terminal {
+        let _ =
+            out.write_all(&stage.freeze(b"fetching dotfiles", crate::update_engine::now_secs()));
+    }
     let base_outcome = pull_base(&base_inputs, moves, out, warnings);
+    if terminal {
+        let _ = out.write_all(&stage.tick(crate::update_engine::now_secs()));
+    }
     match base_outcome.status.as_str() {
         "skipped" => {
             if verbose {
@@ -1239,6 +1278,8 @@ mod tests {
         // sleeping out a production second.
         let palette = crate::progress_ui::Palette::empty();
         let mut stage = Stage::begin(palette, "5", false, true, false, true);
+        // Heartbeats redraw an opened stage's row.
+        let _ = stage.start(b"Repos", None, crate::update_engine::now_secs(), None);
         let mut out = Vec::new();
         let mut beat = Heartbeat::new(crate::update_engine::now_secs(), 0);
         let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -1249,7 +1290,7 @@ mod tests {
             completed_sender.store(true, std::sync::atomic::Ordering::Release);
             let _ = tx.send(());
         });
-        wait_for_chunk(&rx, 1, &mut beat, &mut stage, &mut out);
+        wait_for_chunk(&rx, 1, &mut beat, &mut stage, &mut out, true);
         assert!(out.contains(&0x1b), "350ms stall drew no heartbeat");
         // Timeouts must never consume the completion budget: the
         // waiter returns only after the worker reports.
@@ -1464,7 +1505,7 @@ mod tests {
         let mut beat = Heartbeat::new(crate::update_engine::now_secs(), 0);
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         drop(tx);
-        wait_for_chunk(&rx, 3, &mut beat, &mut stage, &mut out);
+        wait_for_chunk(&rx, 3, &mut beat, &mut stage, &mut out, true);
         assert!(out.is_empty());
     }
 }

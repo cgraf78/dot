@@ -458,6 +458,41 @@ case ${1:-} in
         "$SHDEPS_PROGRESS_PROMPT_ACK" \
         "$DOT_TEST_PROVIDER_PROMPT_RECORD.reader-ready" \
         "$DOT_TEST_PROVIDER_PROMPT_RECORD" || exit $?
+      # Stay in the prompt (like sudo waiting for a password) long enough
+      # for a heartbeat to come due, then resume with a rendered event.
+      # Act like sudo on the terminal after a wrong first password: ask with
+      # echo off, echo back on through the failure delay, ask again, then a
+      # long quiet install with no event.
+      # Like sudo, echo goes off before each question is printed. A third
+      # question comes long after the row is back (another sudo call).
+      if [[ ${DOT_TEST_PROVIDER_PROMPT_ECHO:-0} == 1 ]]; then
+        sleep 0.3
+        stty -echo </dev/tty
+        printf '[sudo] password: ' >/dev/tty
+        sleep 1
+        stty echo </dev/tty
+        printf '\nSorry, try again.\n' >/dev/tty
+        sleep 1
+        stty -echo </dev/tty
+        printf '[sudo] password: ' >/dev/tty
+        sleep 0.5
+        stty echo </dev/tty
+        printf '\n' >/dev/tty
+        sleep 4
+        printf '%s\n' 'install finished' >&2
+        # Let dot's relay deliver that line before writing straight to the
+        # terminal again.
+        sleep 0.5
+        stty -echo </dev/tty
+        printf '[sudo] password again: ' >/dev/tty
+        sleep 1.5
+        stty echo </dev/tty
+        printf 'answered\n' >/dev/tty
+      fi
+      if [[ -n ${DOT_TEST_PROVIDER_PROMPT_HOLD:-} ]]; then
+        sleep "$DOT_TEST_PROVIDER_PROMPT_HOLD"
+        printf '%s\n' '{"event":"phase","label":"Installing","done":1,"total":2}'
+      fi
     fi
     if [[ ${DOT_TEST_PROVIDER_PROMPT_AFTER_SIGNAL:-0} == 1 ]]; then
       [[ -p ${SHDEPS_PROGRESS_PROMPT_ACK:-} ]] || exit 21
@@ -540,6 +575,16 @@ case ${1:-} in
       if [[ ${DOT_TEST_PROVIDER_LARGE_OUTPUT:-0} == 1 ]]; then
         printf '%300000s\n' x
         printf '%300000s\n%s\n' y 'provider stderr tail' >&2
+      fi
+      if [[ ${DOT_TEST_PROVIDER_MIDSTAGE_STDERR:-0} == 1 ]]; then
+        # A diagnostic written while the Tools row is live, in two
+        # fragments the way an unbuffered writer emits one formatted line.
+        printf '%s\n' '{"event":"phase","label":"Resolving","done":1,"total":2}'
+        sleep 0.3
+        printf 'error: ' >&2
+        sleep 0.3
+        printf '%s\n' 'provider diagnostic' >&2
+        sleep 0.3
       fi
       if [[ ${DOT_TEST_PROVIDER_VERBOSE_EVENTS:-0} == 1 ]]; then
         printf '%s\n' \
@@ -1252,7 +1297,71 @@ fn elapsed_range(line: &[u8]) -> Option<std::ops::Range<usize>> {
 /// environment, and working directory around the supervisor. This keeps the
 /// fixture hermetic while ensuring a timeout terminates and reaps descendants
 /// instead of abandoning a thread blocked in `Command::output`.
-fn bounded_output(command: Command, seconds: u64) -> Output {
+fn bounded_output(mut command: Command, seconds: u64) -> Output {
+    bounded_output_with(&mut command, seconds, Stdio::piped(), Stdio::piped())
+        .output()
+        .expect("run bounded provider update")
+}
+
+/// [`bounded_output`] with stdout and stderr sharing one pipe, so the bytes
+/// arrive in the order a terminal would show them. Returns the exit code and
+/// the combined stream.
+fn bounded_combined_output(mut command: Command, seconds: u64) -> (Option<i32>, Vec<u8>) {
+    use std::io::Read as _;
+    use std::os::fd::FromRawFd as _;
+
+    // Close-on-exec, so a child another test thread spawns meanwhile cannot
+    // inherit the write end and hold the read below open: atomically where
+    // `pipe2` exists, right after creation elsewhere.
+    let mut fds = [-1; 2];
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: pipe2 fills both descriptors on success.
+    let created = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    // SAFETY: pipe fills both descriptors on success; F_SETFD then marks them.
+    let created = unsafe {
+        let created = libc::pipe(fds.as_mut_ptr());
+        if created == 0 {
+            for fd in fds {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+        created
+    };
+    assert_eq!(
+        created,
+        0,
+        "pipe failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: pipe returned two uniquely owned descriptors.
+    let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    let mut supervised = bounded_output_with(
+        &mut command,
+        seconds,
+        Stdio::from(writer.try_clone().expect("combined stdout")),
+        Stdio::from(writer),
+    );
+    let mut child = supervised.spawn().expect("run bounded provider update");
+    // The supervisor command still owns the pipe's write ends.
+    drop(supervised);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .expect("read combined output");
+    let status = child.wait().expect("reap bounded provider update");
+    (status.code(), bytes)
+}
+
+/// The [`bounded_output`] supervisor command around `command`, with the
+/// given output descriptors.
+fn bounded_output_with(
+    command: &mut Command,
+    seconds: u64,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> Command {
     let program = command.get_program().to_os_string();
     let args: Vec<_> = command.get_args().map(ToOwned::to_owned).collect();
     let env: Vec<_> = command
@@ -1268,8 +1377,8 @@ fn bounded_output(command: Command, seconds: u64) -> Output {
         .args(args)
         .env_clear()
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(stdout)
+        .stderr(stderr);
     for (key, value) in env {
         match value {
             Some(value) => bounded.env(key, value),
@@ -1279,7 +1388,7 @@ fn bounded_output(command: Command, seconds: u64) -> Output {
     if let Some(current_dir) = current_dir {
         bounded.current_dir(current_dir);
     }
-    bounded.output().expect("run bounded provider update")
+    bounded
 }
 
 /// `kill -0` reports a zombie until an unrelated container PID 1 reaps it.
@@ -2126,8 +2235,8 @@ fn assert_provider_signal(
     assert!(
         !output
             .stdout
-            .windows(b"[3/5] Configs".len())
-            .any(|window| window == b"[3/5] Configs"),
+            .windows(b"[3/4] Configs".len())
+            .any(|window| window == b"[3/4] Configs"),
         "update advanced to the merge stage after provider cancellation: {}",
         String::from_utf8_lossy(&output.stdout)
     );
@@ -2138,51 +2247,51 @@ fn assert_provider_signal(
 }
 
 const CHANGED: &[u8] =
-    b"[1/5] Overlays   running  checking overlay links                         Ns\n\
-[1/5] Overlays   ok       0 overlays current                             Ns\n\
-[2/5] Tools      running  checking configured dependencies               Ns\n\
-[2/5] Tools      changed  1 changed                                      Ns\n\
+    b"[1/4] Overlays   running  checking overlay links                         Ns\n\
+[1/4] Overlays   ok       0 overlays current                             Ns\n\
+[2/4] Tools      running  checking configured dependencies               Ns\n\
+[2/4] Tools      changed  1 changed                                      Ns\n\
 \x20\x20changed  Cargo: 1 changed\n\
 \x20\x20changed  ripgrep                      installed\n\
-[3/5] Configs    running  checking config hooks                          Ns\n\
-[3/5] Configs    ok       no config hooks                                Ns\n\
-[4/5] Cleanup    running  normalizing worktree                           Ns\n\
-[4/5] Cleanup    ok       no base repo                                   Ns\n\
+[3/4] Configs    running  checking config hooks                          Ns\n\
+[3/4] Configs    ok       no config hooks                                Ns\n\
+[4/4] Cleanup    running  normalizing worktree                           Ns\n\
+[4/4] Cleanup    ok       no base repo                                   Ns\n\
 Done in Ns. Reload your shell: source ~/.bashrc\n";
 
 const UNAVAILABLE: &[u8] =
-    b"[1/5] Overlays   running  checking overlay links                         Ns\n\
-[1/5] Overlays   ok       0 overlays current                             Ns\n\
-[2/5] Tools      running  checking configured dependencies               Ns\n\
-[2/5] Tools      failed   shdeps unavailable; dependency install ski     Ns\n\
-[3/5] Configs    running  checking config hooks                          Ns\n\
-[3/5] Configs    ok       no config hooks                                Ns\n\
-[4/5] Cleanup    running  normalizing worktree                           Ns\n\
-[4/5] Cleanup    ok       no base repo                                   Ns\n\
+    b"[1/4] Overlays   running  checking overlay links                         Ns\n\
+[1/4] Overlays   ok       0 overlays current                             Ns\n\
+[2/4] Tools      running  checking configured dependencies               Ns\n\
+[2/4] Tools      failed   shdeps unavailable; dependency install ski     Ns\n\
+[3/4] Configs    running  checking config hooks                          Ns\n\
+[3/4] Configs    ok       no config hooks                                Ns\n\
+[4/4] Cleanup    running  normalizing worktree                           Ns\n\
+[4/4] Cleanup    ok       no base repo                                   Ns\n\
 Done with errors in Ns. Reload your shell: source ~/.bashrc\n";
 
 const FAILED_UPDATE: &[u8] =
-    b"[1/5] Overlays   running  checking overlay links                         Ns\n\
-[1/5] Overlays   ok       0 overlays current                             Ns\n\
-[2/5] Tools      running  checking configured dependencies               Ns\n\
-[2/5] Tools      failed   1 failed                                       Ns\n\
+    b"[1/4] Overlays   running  checking overlay links                         Ns\n\
+[1/4] Overlays   ok       0 overlays current                             Ns\n\
+[2/4] Tools      running  checking configured dependencies               Ns\n\
+[2/4] Tools      failed   1 failed                                       Ns\n\
 \x20\x20failed   Cargo: 1 failed, 12ms\n\
 \x20\x20failed   ripgrep                      network unavailable\n\
-[3/5] Configs    running  checking config hooks                          Ns\n\
-[3/5] Configs    ok       no config hooks                                Ns\n\
-[4/5] Cleanup    running  normalizing worktree                           Ns\n\
-[4/5] Cleanup    ok       no base repo                                   Ns\n\
+[3/4] Configs    running  checking config hooks                          Ns\n\
+[3/4] Configs    ok       no config hooks                                Ns\n\
+[4/4] Cleanup    running  normalizing worktree                           Ns\n\
+[4/4] Cleanup    ok       no base repo                                   Ns\n\
 Done with errors in Ns. Reload your shell: source ~/.bashrc\n";
 
 const CHECKED: &[u8] =
-    b"[1/5] Overlays   running  checking overlay links                         Ns\n\
-[1/5] Overlays   ok       0 overlays current                             Ns\n\
-[2/5] Tools      running  checking configured dependencies               Ns\n\
-[2/5] Tools      ok       dependencies checked                           Ns\n\
-[3/5] Configs    running  checking config hooks                          Ns\n\
-[3/5] Configs    ok       no config hooks                                Ns\n\
-[4/5] Cleanup    running  normalizing worktree                           Ns\n\
-[4/5] Cleanup    ok       no base repo                                   Ns\n\
+    b"[1/4] Overlays   running  checking overlay links                         Ns\n\
+[1/4] Overlays   ok       0 overlays current                             Ns\n\
+[2/4] Tools      running  checking configured dependencies               Ns\n\
+[2/4] Tools      ok       dependencies checked                           Ns\n\
+[3/4] Configs    running  checking config hooks                          Ns\n\
+[3/4] Configs    ok       no config hooks                                Ns\n\
+[4/4] Cleanup    running  normalizing worktree                           Ns\n\
+[4/4] Cleanup    ok       no base repo                                   Ns\n\
 Done in Ns. Reload your shell: source ~/.bashrc\n";
 
 fn assert_cli(output: &Output, status: i32, stdout: &[u8], stderr: &[u8]) {
@@ -2262,16 +2371,16 @@ fn provider_conventional_signal_statuses_stop_the_update() {
         assert!(
             !output
                 .stdout
-                .windows(b"[3/5] Configs".len())
-                .any(|window| window == b"[3/5] Configs"),
+                .windows(b"[3/4] Configs".len())
+                .any(|window| window == b"[3/4] Configs"),
             "update continued after provider interruption {code}: {}",
             String::from_utf8_lossy(&output.stdout)
         );
         assert!(
             !output
                 .stdout
-                .windows(b"[4/5] Cleanup".len())
-                .any(|window| window == b"[4/5] Cleanup"),
+                .windows(b"[4/4] Cleanup".len())
+                .any(|window| window == b"[4/4] Cleanup"),
             "cleanup ran after provider interruption {code}: {}",
             String::from_utf8_lossy(&output.stdout)
         );
@@ -2396,7 +2505,7 @@ fn provider_foreground_interrupt_propagates_without_signaling_dot() {
         foreground_gone,
         "provider foreground child survived Dot's exit: {foreground:?}"
     );
-    for phase in [b"[3/5] Configs".as_slice(), b"[4/5] Cleanup"] {
+    for phase in [b"[3/4] Configs".as_slice(), b"[4/4] Cleanup"] {
         assert!(
             !output.windows(phase.len()).any(|window| window == phase),
             "update advanced to {} after provider interruption: {}",
@@ -2667,7 +2776,7 @@ fn assert_preparation_signal(stage: &str) {
         !merge_marker.exists(),
         "merge ran after {stage} cancellation"
     );
-    for row in [b"[3/5] Configs".as_slice(), b"[4/5] Cleanup", b"Done "] {
+    for row in [b"[3/4] Configs".as_slice(), b"[4/4] Cleanup", b"Done "] {
         assert!(
             !output.stdout.windows(row.len()).any(|window| window == row),
             "update emitted a later row after {stage} cancellation: {}",
@@ -2845,8 +2954,8 @@ fn provider_download_combined_output_limit_is_bounded_and_aborts_update() {
     );
     assert!(
         !stdout
-            .windows(b"[3/5] Configs".len())
-            .any(|window| window == b"[3/5] Configs"),
+            .windows(b"[3/4] Configs".len())
+            .any(|window| window == b"[3/4] Configs"),
         "update advanced after download overflow"
     );
 }
@@ -2905,8 +3014,8 @@ fn provider_download_has_an_absolute_supervision_deadline() {
     );
     assert!(
         !stdout
-            .windows(b"[3/5] Configs".len())
-            .any(|window| window == b"[3/5] Configs"),
+            .windows(b"[3/4] Configs".len())
+            .any(|window| window == b"[3/4] Configs"),
         "update advanced after download timeout"
     );
 }
@@ -3078,7 +3187,7 @@ fn signal_during_completed_provider_teardown_stops_later_update_work() {
         "provider cancellation created a re-exec checkpoint"
     );
     assert!(!merge_marker.exists(), "merge ran after teardown signal");
-    for row in [b"[3/5] Configs".as_slice(), b"[4/5] Cleanup", b"Done "] {
+    for row in [b"[3/4] Configs".as_slice(), b"[4/4] Cleanup", b"Done "] {
         assert!(
             !output.stdout.windows(row.len()).any(|window| window == row),
             "update emitted a later row after teardown cancellation: {}",
@@ -3089,10 +3198,10 @@ fn signal_during_completed_provider_teardown_stops_later_update_work() {
 
 #[test]
 fn elapsed_normalization_changes_only_ui_elapsed_positions() {
-    let input = b"[1/5] Tools ok 2 current 10s\nDone in 2s\nDone with errors in 3s\nDone in 4s.\nDone with errors in 5s. Reload your shell: source ~/.bashrc\nDone in 6s. Reload your shell: source ~/.zshrc\n[hook diagnostic] 10s\n[one/5] malformed 8s\nretry after 10s\ncount=9s\xff\n";
+    let input = b"[1/4] Tools ok 2 current 10s\nDone in 2s\nDone with errors in 3s\nDone in 4s.\nDone with errors in 5s. Reload your shell: source ~/.bashrc\nDone in 6s. Reload your shell: source ~/.zshrc\n[hook diagnostic] 10s\n[one/4] malformed 8s\nretry after 10s\ncount=9s\xff\n";
     assert_eq!(
         normalize_elapsed(input),
-        b"[1/5] Tools ok 2 current Ns\nDone in Ns\nDone with errors in Ns\nDone in Ns.\nDone with errors in Ns. Reload your shell: source ~/.bashrc\nDone in Ns. Reload your shell: source ~/.zshrc\n[hook diagnostic] 10s\n[one/5] malformed 8s\nretry after 10s\ncount=9s\xff\n"
+        b"[1/4] Tools ok 2 current Ns\nDone in Ns\nDone with errors in Ns\nDone in Ns.\nDone with errors in Ns. Reload your shell: source ~/.bashrc\nDone in Ns. Reload your shell: source ~/.zshrc\n[hook diagnostic] 10s\n[one/4] malformed 8s\nretry after 10s\ncount=9s\xff\n"
     );
 }
 
@@ -3292,7 +3401,7 @@ fn provider_source_change_reexecs_once_natively() {
             .expect("reexec update")
     };
     let rust_output = run(&rust);
-    let mut expected = b"[1/5] Overlays   running  checking overlay links                         Ns\n[1/5] Overlays   ok       0 overlays current                             Ns\n[2/5] Tools      running  checking configured dependencies               Ns\n[2/5] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ripgrep                      installed\n".to_vec();
+    let mut expected = b"[1/4] Overlays   running  checking overlay links                         Ns\n[1/4] Overlays   ok       0 overlays current                             Ns\n[2/4] Tools      running  checking configured dependencies               Ns\n[2/4] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ripgrep                      installed\n".to_vec();
     expected.extend_from_slice(CHANGED);
     assert_cli(&rust_output, 0, &expected, b"");
     assert!(rust.home.join("provider-advanced").exists());
@@ -3430,7 +3539,7 @@ fn second_provider_source_change_publishes_checkpoint_natively() {
             .expect("double-change update")
     };
     let rust_output = run(&rust);
-    let expected = b"[1/5] Overlays   running  checking overlay links                         Ns\n[1/5] Overlays   ok       0 overlays current                             Ns\n[2/5] Tools      running  checking configured dependencies               Ns\n[2/5] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ripgrep                      installed\n[1/5] Overlays   running  checking overlay links                         Ns\n[1/5] Overlays   ok       0 overlays current                             Ns\n[2/5] Tools      running  checking configured dependencies               Ns\n[2/5] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ripgrep                      installed\nDone with errors in Ns. Reload your shell: source ~/.bashrc\n";
+    let expected = b"[1/4] Overlays   running  checking overlay links                         Ns\n[1/4] Overlays   ok       0 overlays current                             Ns\n[2/4] Tools      running  checking configured dependencies               Ns\n[2/4] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ripgrep                      installed\n[1/4] Overlays   running  checking overlay links                         Ns\n[1/4] Overlays   ok       0 overlays current                             Ns\n[2/4] Tools      running  checking configured dependencies               Ns\n[2/4] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ripgrep                      installed\nDone with errors in Ns. Reload your shell: source ~/.bashrc\n";
     assert_cli(
         &rust_output,
         1,
@@ -3522,14 +3631,14 @@ fn release_upgrade_hands_off_to_the_new_binary() {
     );
     let stdout = String::from_utf8_lossy(&normalize_elapsed(&output.stdout)).into_owned();
     assert_eq!(
-        stdout.matches("[2/5] Tools      changed").count(),
+        stdout.matches("[2/4] Tools      changed").count(),
         2,
         "{stdout}"
     );
     assert_eq!(stdout.matches("Done in Ns.").count(), 1, "{stdout}");
     // The continuation announces itself before its stage counter restarts.
     let announced = format!(
-        "  continuing with dot {}\n[1/5]",
+        "  continuing with dot {}\n[1/4]",
         &dot::version::COMMIT[..12]
     );
     assert_eq!(stdout.matches(&announced).count(), 1, "{stdout}");
@@ -4379,7 +4488,7 @@ fn verbose_provider_events_render_in_order_natively() {
             .output()
             .expect("verbose provider update")
     };
-    let expected = b"[1/5] Overlays   running  checking overlay links                         Ns\n[1/5] Overlays   ok       0 overlays current                             Ns\n[2/5] Tools      running  checking configured dependencies               Ns\n[2/5] Tools      running  Resolving          [####----] 1/2              Ns\n  warning  provider warning\n  Cargo\n  changed  ripgrep                      installed\n[2/5] Tools      changed  1 changed                                      Ns\n[3/5] Configs    running  checking config hooks                          Ns\n[3/5] Configs    ok       no config hooks                                Ns\n[4/5] Cleanup    running  normalizing worktree                           Ns\n[4/5] Cleanup    ok       no base repo                                   Ns\nDone in Ns. Reload your shell: source ~/.bashrc\n";
+    let expected = b"[1/4] Overlays   running  checking overlay links                         Ns\n[1/4] Overlays   ok       0 overlays current                             Ns\n[2/4] Tools      running  checking configured dependencies               Ns\n[2/4] Tools      running  Resolving          [####----] 1/2              Ns\n  warning  provider warning\n  Cargo\n  changed  ripgrep                      installed\n[2/4] Tools      changed  1 changed                                      Ns\n[3/4] Configs    running  checking config hooks                          Ns\n[3/4] Configs    ok       no config hooks                                Ns\n[4/4] Cleanup    running  normalizing worktree                           Ns\n[4/4] Cleanup    ok       no base repo                                   Ns\nDone in Ns. Reload your shell: source ~/.bashrc\n";
     assert_cli(&run(&rust), 0, expected, b"");
 }
 
@@ -4519,6 +4628,147 @@ fn provider_prompt_rendezvous_acknowledges_natively() {
     assert_eq!(
         std::fs::read(rust.home.join("prompt-record")).expect("native prompt acknowledgment"),
         b"ready\n"
+    );
+}
+
+#[test]
+fn provider_stderr_mid_stage_starts_its_own_line() {
+    // With the Tools row live, a provider diagnostic used to be appended to
+    // the unfinished row (and a fragmented one could be split by a redraw).
+    let fixture = Fixture::new("shdeps-provider-midstage-stderr");
+    let mut command = fixture.command();
+    command
+        .env("DOT_UI_FORCE_LIVE", "1")
+        .env("DOT_TEST_PROVIDER_MIDSTAGE_STDERR", "1");
+    let (code, output) = bounded_combined_output(command, 20);
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(code, Some(0), "{text}");
+    let at = output
+        .windows(b"error: provider diagnostic\n".len())
+        .position(|window| window == b"error: provider diagnostic\n")
+        .unwrap_or_else(|| panic!("diagnostic missing or split: {text:?}"));
+    // The bytes right before it erase the live Tools row, so the message
+    // starts at column zero instead of after the row's elapsed stamp.
+    assert!(
+        output[..at].ends_with(b"\r\x1b[K"),
+        "diagnostic glued to the live row: {text:?}"
+    );
+    // Piped without live mode, the same run passes the diagnostic through
+    // as one plain line with no terminal control bytes.
+    let mut plain = fixture.command();
+    plain.env("DOT_TEST_PROVIDER_MIDSTAGE_STDERR", "1");
+    let output = bounded_output(plain, 20);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stderr, b"error: provider diagnostic\n");
+    assert!(
+        !output
+            .stdout
+            .iter()
+            .any(|byte| *byte == b'\r' || *byte == 0x1b),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn provider_prompt_pauses_the_live_heartbeat() {
+    // While the provider asks on the terminal (sudo), the heartbeat must not
+    // redraw the row over its question; the next event resumes rendering.
+    let fixture = Fixture::new("shdeps-provider-prompt-heartbeat");
+    let mut command = fixture.command();
+    command
+        .env("DOT_UI_FORCE_LIVE", "1")
+        .env("DOT_TEST_PROVIDER_PROMPT", "1")
+        .env("DOT_TEST_PROVIDER_PROMPT_HOLD", "2.5")
+        .env(
+            "DOT_TEST_PROVIDER_PROMPT_RECORD",
+            fixture.home.join("prompt-record"),
+        );
+    let output = bounded_output(command, 30);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    // The prompt clears the row (a bare erase); the next thing drawn is the
+    // event that ended the prompt, not a heartbeat redraw of the old row.
+    // That next row starts with its own erase, so the prompt's clear shows up
+    // as two erases in a row (nothing else in this run draws an empty row).
+    let cleared = b"\r\x1b[K\r\x1b[K";
+    let at = output
+        .stdout
+        .windows(cleared.len())
+        .position(|window| window == cleared)
+        .unwrap_or_else(|| panic!("prompt never cleared the row: {text:?}"))
+        + cleared.len();
+    let next_row = output.stdout[at..]
+        .split(|byte| *byte == b'\r')
+        .next()
+        .unwrap_or_default();
+    let next_row = String::from_utf8_lossy(next_row);
+    assert!(
+        next_row.contains("Installing"),
+        "redrawn during the prompt: {next_row:?} in {text:?}"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn provider_prompt_row_returns_once_the_password_is_read() {
+    // After a sudo prompt the Tools row stayed erased, its timer frozen,
+    // until the provider's next event, which a long authenticated install
+    // may not send for minutes. Once the terminal's echo goes off (sudo
+    // reading) and back on (done), the row comes back.
+    let fixture = Fixture::new("shdeps-provider-prompt-echo");
+    let mut command = fixture.command();
+    command
+        .env("DOT_TEST_PROVIDER_PROMPT", "1")
+        .env("DOT_TEST_PROVIDER_PROMPT_ECHO", "1")
+        .env(
+            "DOT_TEST_PROVIDER_PROMPT_RECORD",
+            fixture.home.join("prompt-record"),
+        );
+    let (dot, mut terminal) = spawn_on_pty(command);
+    let (exited, mut output) =
+        wait_bounded_draining(&dot, &mut terminal, std::time::Duration::from_secs(30));
+    output.extend_from_slice(&read_nonblocking_to_end(
+        &mut terminal,
+        std::time::Duration::from_secs(5),
+    ));
+    let mut dot = dot;
+    let status = dot.reap().expect("reap PTY-backed Dot");
+    let text = String::from_utf8_lossy(&output);
+    assert!(exited && status.success(), "{status:?}: {text:?}");
+    // Nothing redraws over either question (the retry comes while echo is
+    // briefly back on), and the row is back before the quiet install that
+    // follows says anything.
+    let find = |haystack: &[u8], needle: &[u8], from: usize| {
+        haystack[from..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .map(|at| from + at)
+            .unwrap_or_else(|| panic!("missing {:?}: {text:?}", String::from_utf8_lossy(needle)))
+    };
+    let asked = find(&output, b"[sudo] password: ", 0);
+    let again = find(&output, b"[sudo] password: ", asked + 1);
+    let finished = find(&output, b"install finished", again);
+    let row = b"checking configured dependencies";
+    let prompting = &output[asked..again];
+    assert!(
+        !prompting.windows(row.len()).any(|window| window == row),
+        "redrawn over the password prompts: {:?}",
+        String::from_utf8_lossy(prompting)
+    );
+    let quiet = &output[again..finished];
+    assert!(
+        quiet.windows(row.len()).any(|window| window == row),
+        "row did not return during the quiet install: {:?}",
+        String::from_utf8_lossy(quiet)
+    );
+    // A later question, after the row came back, pauses the redraws again.
+    let late = find(&output, b"[sudo] password again: ", finished);
+    let answered = find(&output, b"answered", late);
+    let asking = &output[late..answered];
+    assert!(
+        !asking.windows(row.len()).any(|window| window == row),
+        "redrawn over a later prompt: {:?}",
+        String::from_utf8_lossy(asking)
     );
 }
 
@@ -5058,8 +5308,8 @@ fn provider_exit_bounds_an_escaped_continuous_writer() {
     assert!(
         !output
             .stdout
-            .windows(b"[3/5] Configs".len())
-            .any(|window| window == b"[3/5] Configs"),
+            .windows(b"[3/4] Configs".len())
+            .any(|window| window == b"[3/4] Configs"),
         "update advanced after rejecting escaped provider output"
     );
 }
@@ -5217,12 +5467,12 @@ fn escaped_unicode_provider_event_is_literal_with_and_without_jq() {
                 .expect("escaped provider event")
         };
         let rust_output = run(&rust);
-        let mut stdout = b"[1/5] Overlays   running  checking overlay links                         Ns\n[1/5] Overlays   ok       0 overlays current                             Ns\n[2/5] Tools      running  checking configured dependencies               Ns\n[2/5] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ".to_vec();
+        let mut stdout = b"[1/4] Overlays   running  checking overlay links                         Ns\n[1/4] Overlays   ok       0 overlays current                             Ns\n[2/4] Tools      running  checking configured dependencies               Ns\n[2/4] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ".to_vec();
         stdout.extend_from_slice(expected);
         stdout.extend_from_slice(if jq {
-            b"                        installed\n[3/5] Configs    running  checking config hooks                          Ns\n[3/5] Configs    ok       no config hooks                                Ns\n[4/5] Cleanup    running  normalizing worktree                           Ns\n[4/5] Cleanup    ok       no base repo                                   Ns\nDone in Ns. Reload your shell: source ~/.bashrc\n"
+            b"                        installed\n[3/4] Configs    running  checking config hooks                          Ns\n[3/4] Configs    ok       no config hooks                                Ns\n[4/4] Cleanup    running  normalizing worktree                           Ns\n[4/4] Cleanup    ok       no base repo                                   Ns\nDone in Ns. Reload your shell: source ~/.bashrc\n"
         } else {
-            b"                    installed\n[3/5] Configs    running  checking config hooks                          Ns\n[3/5] Configs    ok       no config hooks                                Ns\n[4/5] Cleanup    running  normalizing worktree                           Ns\n[4/5] Cleanup    ok       no base repo                                   Ns\nDone in Ns. Reload your shell: source ~/.bashrc\n"
+            b"                    installed\n[3/4] Configs    running  checking config hooks                          Ns\n[3/4] Configs    ok       no config hooks                                Ns\n[4/4] Cleanup    running  normalizing worktree                           Ns\n[4/4] Cleanup    ok       no base repo                                   Ns\nDone in Ns. Reload your shell: source ~/.bashrc\n"
         });
         assert_cli(&rust_output, 0, &stdout, b"");
     }
@@ -5242,7 +5492,7 @@ fn escaped_quote_provider_detail_pins_fallback_parser_limit() {
     let rust_output = run(&rust);
     // The bootstrap sed parser captures through the slash before the quote,
     // then its `[^\"]*` expression stops. Pin that observable limitation.
-    let expected = b"[1/5] Overlays   running  checking overlay links                         Ns\n[1/5] Overlays   ok       0 overlays current                             Ns\n[2/5] Tools      running  checking configured dependencies               Ns\n[2/5] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ripgrep                      said \\\n[3/5] Configs    running  checking config hooks                          Ns\n[3/5] Configs    ok       no config hooks                                Ns\n[4/5] Cleanup    running  normalizing worktree                           Ns\n[4/5] Cleanup    ok       no base repo                                   Ns\nDone in Ns. Reload your shell: source ~/.bashrc\n";
+    let expected = b"[1/4] Overlays   running  checking overlay links                         Ns\n[1/4] Overlays   ok       0 overlays current                             Ns\n[2/4] Tools      running  checking configured dependencies               Ns\n[2/4] Tools      changed  1 changed                                      Ns\n  changed  Cargo: 1 changed\n  changed  ripgrep                      said \\\n[3/4] Configs    running  checking config hooks                          Ns\n[3/4] Configs    ok       no config hooks                                Ns\n[4/4] Cleanup    running  normalizing worktree                           Ns\n[4/4] Cleanup    ok       no base repo                                   Ns\nDone in Ns. Reload your shell: source ~/.bashrc\n";
     assert_cli(&rust_output, 0, expected, b"");
 }
 
@@ -5322,19 +5572,19 @@ fn expected_prune_record(fixture: &Fixture, quiet: bool) -> String {
 }
 
 const PRUNED_AFTER_TOOLS_FAILURE: &[u8] =
-    b"[1/6] Overlays   running  checking overlay links                         Ns\n\
-[1/6] Overlays   ok       0 overlays current                             Ns\n\
-[2/6] Tools      running  checking configured dependencies               Ns\n\
-[2/6] Tools      failed   1 failed                                       Ns\n\
+    b"[1/5] Overlays   running  checking overlay links                         Ns\n\
+[1/5] Overlays   ok       0 overlays current                             Ns\n\
+[2/5] Tools      running  checking configured dependencies               Ns\n\
+[2/5] Tools      failed   1 failed                                       Ns\n\
 \x20\x20failed   Cargo: 1 failed, 12ms\n\
 \x20\x20failed   ripgrep                      network unavailable\n\
-[3/6] Prune      running  pruning orphaned dependencies                  Ns\n\
-[3/6] Prune      ok       orphaned dependencies checked                  Ns\n\
+[3/5] Prune      running  pruning orphaned dependencies                  Ns\n\
+[3/5] Prune      ok       orphaned dependencies checked                  Ns\n\
 \x20\x20\x20\x20old-tool removed\n\
-[4/6] Configs    running  checking config hooks                          Ns\n\
-[4/6] Configs    ok       no config hooks                                Ns\n\
-[5/6] Cleanup    running  normalizing worktree                           Ns\n\
-[5/6] Cleanup    ok       no base repo                                   Ns\n\
+[4/5] Configs    running  checking config hooks                          Ns\n\
+[4/5] Configs    ok       no config hooks                                Ns\n\
+[5/5] Cleanup    running  normalizing worktree                           Ns\n\
+[5/5] Cleanup    ok       no base repo                                   Ns\n\
 Done with errors in Ns. Reload your shell: source ~/.bashrc\n";
 
 #[test]
@@ -5468,19 +5718,19 @@ fn prune_failure_is_a_stage_failure_that_does_not_abort_later_stages() {
         )
         .output()
         .expect("update with failing prune");
-    let expected = b"[1/6] Overlays   running  checking overlay links                         Ns\n\
-[1/6] Overlays   ok       0 overlays current                             Ns\n\
-[2/6] Tools      running  checking configured dependencies               Ns\n\
-[2/6] Tools      changed  1 changed                                      Ns\n\
+    let expected = b"[1/5] Overlays   running  checking overlay links                         Ns\n\
+[1/5] Overlays   ok       0 overlays current                             Ns\n\
+[2/5] Tools      running  checking configured dependencies               Ns\n\
+[2/5] Tools      changed  1 changed                                      Ns\n\
 \x20\x20changed  Cargo: 1 changed\n\
 \x20\x20changed  ripgrep                      installed\n\
-[3/6] Prune      running  pruning orphaned dependencies                  Ns\n\
-[3/6] Prune      failed   dependency prune failed (exit 1)               Ns\n\
+[3/5] Prune      running  pruning orphaned dependencies                  Ns\n\
+[3/5] Prune      failed   dependency prune failed (exit 1)               Ns\n\
 \x20\x20\x20\x20old-tool removed\n\
-[4/6] Configs    running  checking config hooks                          Ns\n\
-[4/6] Configs    ok       no config hooks                                Ns\n\
-[5/6] Cleanup    running  normalizing worktree                           Ns\n\
-[5/6] Cleanup    ok       no base repo                                   Ns\n\
+[4/5] Configs    running  checking config hooks                          Ns\n\
+[4/5] Configs    ok       no config hooks                                Ns\n\
+[5/5] Cleanup    running  normalizing worktree                           Ns\n\
+[5/5] Cleanup    ok       no base repo                                   Ns\n\
 Done with errors in Ns. Reload your shell: source ~/.bashrc\n";
     assert_cli(
         &output,
@@ -6019,7 +6269,7 @@ fn prune_is_skipped_when_repository_sync_fails() {
     let stdout = normalize_elapsed(&output.stdout);
     let text = String::from_utf8_lossy(&stdout);
     assert!(
-        text.contains("[3/6] Prune      warning  repository sync failed; prune skipped"),
+        text.contains("[3/5] Prune      warning  repository sync failed; prune skipped"),
         "{text}"
     );
     assert_eq!(prune_record(&fixture), None);
@@ -6042,7 +6292,7 @@ fn prune_is_skipped_for_a_frozen_generation() {
         "{text}"
     );
     assert!(
-        text.contains("[3/6] Prune      warning  repository sync failed; prune skipped"),
+        text.contains("[3/5] Prune      warning  repository sync failed; prune skipped"),
         "{text}"
     );
     assert_eq!(prune_record(&fixture), None);
@@ -6073,10 +6323,10 @@ fn prune_is_skipped_when_a_newer_key_changed_the_overlay_set() {
     let stdout = normalize_elapsed(&output.stdout);
     let text = String::from_utf8_lossy(&stdout);
     for row in [
-        "[1/6] Overlays   warning  overlay set held for a newer dot",
-        "[2/6] Tools      changed",
-        "[3/6] Prune      warning  keys from a newer dot; prune skipped",
-        "[4/6] Configs    warning  overlay set held; config hooks",
+        "[1/5] Overlays   warning  overlay set held for a newer dot",
+        "[2/5] Tools      changed",
+        "[3/5] Prune      warning  keys from a newer dot; prune skipped",
+        "[4/5] Configs    warning  overlay set held; config hooks",
     ] {
         assert!(text.contains(row), "missing {row:?}: {text}");
     }
@@ -6147,7 +6397,7 @@ fn prune_is_skipped_when_shdeps_is_unavailable() {
     let stdout = normalize_elapsed(&output.stdout);
     let text = String::from_utf8_lossy(&stdout);
     assert!(
-        text.contains("[3/6] Prune      warning  shdeps unavailable; prune skipped"),
+        text.contains("[3/5] Prune      warning  shdeps unavailable; prune skipped"),
         "{text}"
     );
     assert_eq!(prune_record(&fixture), None);

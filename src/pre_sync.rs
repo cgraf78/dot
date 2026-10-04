@@ -372,8 +372,14 @@ pub fn run(
             token,
         };
         if !runner(&call) {
+            // One stopped by Ctrl-C did not fail on its own.
+            let outcome = if crate::cleanup::received_signal().is_some() {
+                "interrupted"
+            } else {
+                "failed"
+            };
             warnings.push(format!(
-                "  warning: pre-sync extension failed: {}",
+                "  warning: pre-sync extension {outcome}: {}",
                 basename(&spec.script)
             ));
             let _ = std::fs::remove_dir_all(&temporary);

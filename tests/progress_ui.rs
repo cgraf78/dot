@@ -537,3 +537,112 @@ fn heartbeat_zero_interval_renders_every_poll() {
     let mut beat = Heartbeat::new(50, -3);
     assert!(beat.poll(50));
 }
+
+#[test]
+fn indented_lines_indent_child_output_however_it_is_chunked() {
+    use std::io::Write as _;
+    let mut sink = Vec::new();
+    {
+        let mut indented = IndentedLines::new(&mut sink);
+        indented.write_all(b"fatal: one\nfatal: ").unwrap();
+        indented.write_all(b"two\n\nPlease ").unwrap();
+        indented.write_all(b"retry\n").unwrap();
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&sink),
+        "    fatal: one\n    fatal: two\n\n    Please retry\n"
+    );
+    assert_eq!(CHILD_OUTPUT_INDENT, b"    ");
+}
+
+#[test]
+fn stage_redraws_nothing_before_its_first_stage_opens() {
+    // Progress reported before any stage starts (an overlay pull on a client
+    // without a base checkout) used to render `[0/N]` rows with no label and
+    // an elapsed time counted from the epoch.
+    for live in [true, false] {
+        let mut stage = Stage::begin(palette(), "5", false, live, false, true);
+        assert!(
+            stage
+                .update(b"overlays", 1_700_000_000, Some("1"))
+                .is_empty()
+        );
+        assert!(stage.tick(1_700_000_000).is_empty());
+        assert!(
+            stage
+                .maybe_progress(b"overlay-0", 1, 2, 1_700_000_000, None, "8")
+                .is_empty()
+        );
+        // The static row printed before a required overlay pull, which on
+        // such a client also runs before any stage opens.
+        assert!(stage.freeze(b"pulling 1 overlay", 1_700_000_000).is_empty());
+        assert!(!stage.start(b"Repos", None, 10, None).is_empty());
+        assert!(!stage.update(b"overlay-0", 11, Some("1")).is_empty());
+        assert_eq!(!stage.freeze(b"pulling 1 overlay", 11).is_empty(), live);
+    }
+}
+
+#[test]
+fn terminal_rows_fit_the_width_and_cut_at_words() {
+    // Rows were a fixed 75 columns: narrower terminals wrapped every redraw.
+    let visible = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .trim_start_matches("\r\x1b[K")
+            .trim_end_matches('\n')
+            .chars()
+            .count()
+    };
+    let detail = b"repository synchronization failed; dependency install skipped";
+    for columns in [40, 60, 74] {
+        let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
+            .with_width(RowWidth::Columns(columns));
+        let start = stage.start(b"Tools", Some(detail), 0, None);
+        assert!(visible(&start) < columns, "{columns}: {start:?}");
+        let close = stage.finish(b"warning", detail, 1);
+        assert!(visible(&close) < columns, "{columns}: {close:?}");
+    }
+    let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
+        .with_width(RowWidth::Columns(50));
+    let close = String::from_utf8(stage.finish(b"warning", detail, 1)).unwrap();
+    assert_eq!(
+        close, "[0/5]            warning  repository           1s\n",
+        "cut mid-word or kept a dangling separator"
+    );
+    // Wide terminals keep the 42-column cell, cut at a word boundary.
+    let mut wide = Stage::begin(Palette::empty(), "5", false, true, false, true)
+        .with_width(RowWidth::Columns(120));
+    let close = String::from_utf8(wide.finish(b"warning", detail, 1)).unwrap();
+    assert!(
+        close.contains("warning  repository synchronization failed              1s"),
+        "{close:?}"
+    );
+    // Without a terminal width the historical fixed cell stays byte-for-byte.
+    let mut fixed = Stage::begin(Palette::empty(), "5", false, false, false, true);
+    let close = String::from_utf8(fixed.finish(b"warning", detail, 1)).unwrap();
+    assert_eq!(
+        close,
+        "[0/5]            warning  repository synchronization failed; depende     1s\n"
+    );
+}
+
+#[test]
+fn terminal_rows_drop_whole_clauses_and_keep_failures() {
+    // Narrow rows cut summaries mid-word (`2 repo`, `profil`) and could drop
+    // the failure (`2 repos current, 1 repo` without "failed").
+    let close = |columns: usize, detail: &[u8]| {
+        let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
+            .with_width(RowWidth::Columns(columns));
+        String::from_utf8(stage.finish(b"failed", detail, 1)).unwrap()
+    };
+    let summary = b"2 repos current, 1 repo failed";
+    assert!(
+        close(60, summary).contains("failed   1 repo failed "),
+        "{}",
+        close(60, summary)
+    );
+    assert!(close(80, summary).contains("2 repos current, 1 repo failed"));
+    // Not even one word fits: blank, not a fragment.
+    let narrow = close(40, b"profile resolution or repository sync failed");
+    assert!(narrow.contains("failed   "), "{narrow:?}");
+    assert!(!narrow.contains("profil"), "{narrow:?}");
+}
