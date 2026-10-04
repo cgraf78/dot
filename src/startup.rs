@@ -935,17 +935,15 @@ mod tests {
 
     #[test]
     fn reexec_guard_still_probes_with_expected_revision() {
-        use std::os::unix::fs::PermissionsExt as _;
         let scratch = TempDir::new("reexec-probe").expect("scratch");
         let marker = scratch.path().join("git-called");
         let fake = scratch.path().join("git");
-        std::fs::write(
+        // The readiness probe exits before touching the marker.
+        dot_test_support::publish_fixture_script(
             &fake,
-            format!("#!/bin/sh\n: >\"{}\"\nexit 1\n", marker.display()),
+            &format!(": >\"{}\"\nexit 1\n", marker.display()),
         )
         .expect("fake git");
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
-            .expect("fake git mode");
         let env = std::collections::BTreeMap::from([
             (
                 std::ffi::OsString::from("DOT_SOURCE_ROOT"),
@@ -982,13 +980,10 @@ mod tests {
         // well under the shim's 30s sleep, so only a fired timeout can
         // satisfy it. The 1s test deadline keeps the suite fast;
         // production uses REVISION_PROBE_TIMEOUT through the same helper.
-        use std::os::unix::fs::PermissionsExt as _;
         let deadline = std::time::Duration::from_secs(1);
         let scratch = TempDir::new("revision-probe-hang").expect("scratch");
         let shim = scratch.path().join("git");
-        std::fs::write(&shim, b"#!/bin/sh\nsleep 30\n").expect("hanging shim");
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod shim");
+        dot_test_support::publish_fixture_script(&shim, "sleep 30\n").expect("hanging shim");
         let _git = crate::init_client_identity::bind_host_git_for_scope(&shim);
         let started = std::time::Instant::now();
         let revision = super::observed_revision_uncached_with_timeout(scratch.path(), deadline);

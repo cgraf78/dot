@@ -2988,15 +2988,13 @@ mod tests {
     fn hanging_git(scope: &dot_test_support::TempDir) -> (PathBuf, PathBuf) {
         let pids = scope.path().join("pids");
         let shim = scope.path().join("git");
-        std::fs::write(
+        // The readiness probe exits before recording a pid; see
+        // `dot_test_support::publish_fixture_script`.
+        dot_test_support::publish_fixture_script(
             &shim,
-            format!(
-                "#!/bin/sh\necho $$ >> '{}'\nexec sleep 60\n",
-                pids.display()
-            ),
+            &format!("echo $$ >> '{}'\nexec sleep 60\n", pids.display()),
         )
         .expect("hanging git");
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("mode");
         (shim, pids)
     }
 
