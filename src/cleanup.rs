@@ -12344,7 +12344,13 @@ if child == 0:
     # observe an open lease and SIGKILL the group without TERM (flake).
     with open(pid_path, "w", encoding="utf-8") as output:
         output.write(str(os.getpid()))
-    time.sleep(4)
+    # Leak guard only: the TERM marker, not elapsed time, proves teardown
+    # stopped this descendant. A short self-bound races a loaded host's
+    # teardown (several full process-table scans) and turns a correct
+    # TERM into a missed one; SELF-EXIT names a guard that fired.
+    time.sleep(30)
+    with open(term_path, "a", encoding="utf-8") as output:
+        output.write("SELF-EXIT\n")
     os._exit(0)
 while not os.path.exists(pid_path):
     time.sleep(0.005)
@@ -12359,34 +12365,35 @@ os._exit(0)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        let started = Instant::now();
         let end = supervise_session(command, None, |_| Ok(())).unwrap();
         let pid = std::fs::read_to_string(&pid_path)
             .unwrap()
             .trim()
             .parse::<u32>()
             .unwrap();
-        let survived_return = linux_process_info(pid).is_some_and(|process| process.live);
-        if survived_return {
-            poll_until(Instant::now() + Duration::from_secs(5), || {
-                Ok((!linux_process_info(pid).is_some_and(|process| process.live)).then_some(()))
-            })
-            .unwrap();
-        }
+        let survivors = live_fixture_processes(&[pid]);
+        let survived_return = !survivors.is_empty();
+        stop_leaked_fixture(&survivors);
 
+        // No wall-clock bound: teardown latency scales with host load and
+        // process-table size (no wall-clock gates in `cargo test`). The
+        // marker file is the direct evidence that completion delivered TERM
+        // before the descendant's 30s leak guard fired. A regression that
+        // waits a shorter time and only then sends TERM is not detected;
+        // that is the price of having no wall-clock gate.
         assert!(
             matches!(end, SessionEnd::Exited(status) if status.success()),
             "unexpected same-group completion: {end:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "same-group descendant reached its self-bound"
-        );
-        assert!(
             !survived_return,
             "same-group descendant survived completion"
         );
-        assert_eq!(std::fs::read_to_string(term_path).unwrap(), "TERM\n");
+        assert_eq!(
+            std::fs::read_to_string(term_path).ok().as_deref(),
+            Some("TERM\n"),
+            "same-group descendant was not stopped with TERM"
+        );
     }
 
     #[test]
@@ -12424,7 +12431,11 @@ if branch == 0:
         # group without TERM (loaded-host flake).
         with open(child_pid, "w", encoding="utf-8") as output:
             output.write(str(os.getpid()))
-        time.sleep(4)
+        # Leak guard only; the TERM marker is the evidence (see the
+        # single-group variant above).
+        time.sleep(30)
+        with open(child_term, "a", encoding="utf-8") as output:
+            output.write("SELF-EXIT\n")
         os._exit(0)
     os.setpgid(0, 0)
     def stop_parent(_signum, _frame):
@@ -12438,7 +12449,9 @@ if branch == 0:
     os.closerange(3, maximum)
     with open(parent_pid, "w", encoding="utf-8") as output:
         output.write(str(os.getpid()))
-    time.sleep(4)
+    time.sleep(30)
+    with open(parent_term, "a", encoding="utf-8") as output:
+        output.write("SELF-EXIT\n")
     os._exit(0)
 while not (os.path.exists(parent_pid) and os.path.exists(child_pid)):
     time.sleep(0.005)
@@ -12455,7 +12468,6 @@ os._exit(0)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        let started = Instant::now();
         let end = supervise_session(command, None, |_| Ok(())).unwrap();
         let pids = [&parent_pid, &child_pid].map(|path| {
             std::fs::read_to_string(path)
@@ -12464,33 +12476,79 @@ os._exit(0)
                 .parse::<u32>()
                 .unwrap()
         });
-        let survived_return = pids
-            .iter()
-            .any(|pid| linux_process_info(*pid).is_some_and(|process| process.live));
-        if survived_return {
-            poll_until(Instant::now() + Duration::from_secs(5), || {
-                Ok((!pids
-                    .iter()
-                    .any(|pid| linux_process_info(*pid).is_some_and(|process| process.live)))
-                .then_some(()))
-            })
-            .unwrap();
-        }
+        let survivors = live_fixture_processes(&pids);
+        let survived_return = !survivors.is_empty();
+        stop_leaked_fixture(&survivors);
 
+        // Marker files, not elapsed time, prove TERM delivery (see the
+        // single-group variant above).
         assert!(
             matches!(end, SessionEnd::Exited(status) if status.success()),
             "unexpected split-group completion: {end:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "split-group descendants reached their self-bound"
-        );
-        assert!(
             !survived_return,
             "split-group descendants survived completion"
         );
-        assert_eq!(std::fs::read_to_string(parent_term).unwrap(), "TERM\n");
-        assert_eq!(std::fs::read_to_string(child_term).unwrap(), "TERM\n");
+        assert_eq!(
+            std::fs::read_to_string(parent_term).ok().as_deref(),
+            Some("TERM\n"),
+            "moved direct child was not stopped with TERM"
+        );
+        assert_eq!(
+            std::fs::read_to_string(child_term).ok().as_deref(),
+            Some("TERM\n"),
+            "same-group grandchild was not stopped with TERM"
+        );
+    }
+
+    /// Returns the fixture processes still live, with the identity (PID plus
+    /// kernel start tick) observed now, so a later kill can be pinned to it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn live_fixture_processes(pids: &[u32]) -> Vec<ProcessInfo> {
+        pids.iter()
+            .filter_map(|pid| linux_process_info(*pid))
+            .filter(|process| process.live)
+            .collect()
+    }
+
+    /// Kill and reap fixture descendants that a failed teardown left
+    /// running, so a 30-second leak guard cannot outlive the failing test.
+    /// Like `reap_fixture_daemon`, every signal and wait is gated on the
+    /// identity observed in `live_fixture_processes`, so the PID cannot be
+    /// recycled between that observation and the kill. That observation is
+    /// taken after supervision returns, so it pins whatever then holds the
+    /// fixture's PID; a reuse before it is not excluded, which is accepted
+    /// on this already-failing path.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stop_leaked_fixture(survivors: &[ProcessInfo]) {
+        let ours = |survivor: &ProcessInfo| {
+            linux_process_info(survivor.pid).filter(|now| now.identity == survivor.identity)
+        };
+        for survivor in survivors {
+            if ours(survivor).is_some_and(|process| process.live) {
+                // SAFETY: kill takes a PID and a signal number, no pointers;
+                // the identity check above pins the PID to our fixture.
+                unsafe { libc::kill(survivor.pid as libc::pid_t, libc::SIGKILL) };
+            }
+        }
+        poll_until(Instant::now() + Duration::from_secs(5), || {
+            Ok((!survivors
+                .iter()
+                .any(|survivor| ours(survivor).is_some_and(|process| process.live)))
+            .then_some(()))
+        })
+        .expect("leaked fixture descendants outlived SIGKILL");
+        for survivor in survivors {
+            if ours(survivor).is_some() {
+                // Our fixture, now a zombie adopted by this subreaper: reap
+                // it. WNOHANG never blocks, and the identity match proves no
+                // foreign status is collected.
+                let mut status = 0;
+                // SAFETY: WNOHANG never blocks; the PID is identity-verified.
+                unsafe { libc::waitpid(survivor.pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            }
+        }
     }
 
     #[test]
