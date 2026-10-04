@@ -1075,7 +1075,13 @@ fn cleanup_deadline() -> Instant {
 /// it and fails teardown (loaded-host DOT_TEARDOWN_FAIL); 5s covers
 /// loaded hosts and slow CI with headroom while staying bounded. This
 /// budget covers verification snapshots only — interruption paths keep
-/// the 1s grace so Ctrl-C stays responsive.
+/// the 1s grace and their shared KILL window so Ctrl-C stays responsive,
+/// with one exception: once KILL has reached every known member, a proof
+/// still pending at the end of that window may run up to
+/// `KILL_VERIFY_LATE_ATTEMPTS` more walks, each allowed to start within this
+/// budget (see `kill_verification_deadline`). On a loaded host that can
+/// add several seconds to Ctrl-C, timeout and hook/provider cancellation
+/// in exchange for not reporting an already-dead session as incomplete.
 const COMPLETION_SNAPSHOT_BUDGET: Duration = Duration::from_secs(5);
 
 fn completion_snapshot_deadline() -> Instant {
@@ -7024,6 +7030,9 @@ fn stop_sessions_with_tick(
     // final reaping share one additional bounded window rather than renewing
     // a full deadline at each stage; retain half a grace of scan margin for a
     // busy host without allowing teardown latency to accumulate unboundedly.
+    // `kill_verification_deadline` may finish an in-progress proof past this
+    // window (at most `KILL_VERIFY_LATE_ATTEMPTS` walks) instead of reporting
+    // a dead session as incomplete.
     // The reassignment below is Linux/Android-only; portable platforms
     // never run the settle round and keep the initial deadline.
     #[allow(unused_mut)]
@@ -7139,8 +7148,18 @@ fn stop_sessions_with_tick(
             // needed here.
             session.signal_all(libc::SIGKILL);
         }
-        while Instant::now() < hard_deadline {
-            let observed = observe_sessions(&mut sessions, hard_deadline);
+        let mut late_attempts = 0u32;
+        while let Some(pass_deadline) =
+            kill_verification_deadline(Instant::now(), hard_deadline, late_attempts)
+        {
+            if pass_deadline > hard_deadline {
+                late_attempts += 1;
+            }
+            #[cfg(test)]
+            let observed = kill_phase_observation_override()
+                .unwrap_or_else(|| observe_sessions(&mut sessions, pass_deadline));
+            #[cfg(not(test))]
+            let observed = observe_sessions(&mut sessions, pass_deadline);
             if sessions_stably_empty(observed, &mut consecutive_empty) {
                 break;
             }
@@ -7220,6 +7239,59 @@ fn merge_authority_errors(
     }
     Ok(())
 }
+
+/// Deadline for the next post-KILL verification pass, or `None` when the
+/// hard phase is over.
+///
+/// Before `hard_deadline` every pass shares it. Past it, KILL has already
+/// been delivered to every known member, so the remaining work is proof,
+/// not delivery or responsiveness: a loaded host whose graceful loop
+/// overran its deadline can reach this phase with no budget left, with an
+/// empty first snapshot whose confirming pass would start late, or with a
+/// first late walk that still sees a just-KILLed member that has not yet
+/// become a zombie. Failing then reports `CleanupIncomplete` (exit 125)
+/// for a session that is dead or about to be. So, while the proof is
+/// incomplete, late walks continue (the loop re-delivers KILL after any
+/// walk that is not empty) until `KILL_VERIFY_LATE_ATTEMPTS` have started.
+/// Each late attempt gets a fresh snapshot budget because a walk never
+/// starts past its deadline (the budget gates the start, not the walk's
+/// full duration). Three late walks certify after at most one walk that
+/// is refused or still sees a live member, followed by two empty ones.
+/// The proof is never weakened: certification still needs two consecutive
+/// empty snapshots, and a member still live after the cap is reported as
+/// a survivor as before.
+fn kill_verification_deadline(
+    now: Instant,
+    hard_deadline: Instant,
+    late_attempts: u32,
+) -> Option<Instant> {
+    if now < hard_deadline {
+        Some(hard_deadline)
+    } else if late_attempts >= KILL_VERIFY_LATE_ATTEMPTS {
+        None
+    } else {
+        Some(now + COMPLETION_SNAPSHOT_BUDGET)
+    }
+}
+
+// Test seam for the post-KILL verification loop: each queued entry replaces
+// one walk's observation (`None` = refused walk, `Some(false)` = a member
+// still seen live), so loop accounting can be exercised deterministically.
+// Thread-local because the loop runs on the calling test's thread.
+#[cfg(test)]
+thread_local! {
+    static KILL_PHASE_OBSERVATIONS: std::cell::RefCell<std::collections::VecDeque<Option<bool>>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(test)]
+fn kill_phase_observation_override() -> Option<Option<bool>> {
+    KILL_PHASE_OBSERVATIONS.with(|queue| queue.borrow_mut().pop_front())
+}
+
+/// Upper bound on post-KILL verification walks started after the shared
+/// hard deadline. See `kill_verification_deadline`.
+const KILL_VERIFY_LATE_ATTEMPTS: u32 = 3;
 
 /// Require two complete snapshots without a live session member. Process-table
 /// enumeration is not atomic: a member can fork a replacement and exit between
@@ -11442,6 +11514,154 @@ os._exit(0)
         assert_eq!(consecutive_empty, 0);
         assert!(!sessions_stably_empty(Some(true), &mut consecutive_empty));
         assert!(sessions_stably_empty(Some(true), &mut consecutive_empty));
+    }
+
+    #[test]
+    fn kill_verification_shares_the_hard_deadline_while_it_lasts() {
+        let now = Instant::now();
+        let hard = now + Duration::from_secs(1);
+
+        assert_eq!(kill_verification_deadline(now, hard, 0), Some(hard));
+    }
+
+    #[test]
+    fn kill_verification_starts_late_walks_until_the_cap() {
+        let hard = Instant::now();
+        let now = hard + Duration::from_secs(2);
+
+        // Past the hard deadline every walk is late and gets a fresh start
+        // budget, whatever the previous walk saw, until the cap is reached.
+        for late_attempts in 0..KILL_VERIFY_LATE_ATTEMPTS {
+            assert_eq!(
+                kill_verification_deadline(now, hard, late_attempts),
+                Some(now + COMPLETION_SNAPSHOT_BUDGET)
+            );
+        }
+        assert_eq!(
+            kill_verification_deadline(now, hard, KILL_VERIFY_LATE_ATTEMPTS),
+            None
+        );
+    }
+
+    // Stops a TERM-ignoring session whose first supervision tick stalls past
+    // the whole TERM grace and KILL window, as a loaded host does when
+    // process-table walks overrun the graceful loop, so every post-KILL walk
+    // is late. `late_walks` replaces the observations of the first late
+    // walks; the rest are real.
+    fn stop_starved_session(
+        late_walks: &[Option<bool>],
+    ) -> (std::io::Result<std::process::ExitStatus>, u32) {
+        let mut command = Command::new("sh");
+        command.args(["-c", "trap '' TERM; exec sleep 30"]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        isolate(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        // Register the leader as production sessions do. While this session
+        // stalls, its KILLed leader is an unreaped zombie child of the test
+        // process; an unregistered one could be reaped by any concurrent
+        // test's adopted-zombie sweep, hiding it from this session's walks.
+        let _registration = StatusChildRegistration::new(pid);
+        let hard_window = Duration::from_millis(GRACE_ATTEMPTS as u64 * GRACE_INTERVAL_MS * 5 / 2);
+        let mut stalled = false;
+        let mut tick = || {
+            if !stalled {
+                stalled = true;
+                std::thread::sleep(hard_window + Duration::from_millis(200));
+            }
+            Ok(())
+        };
+        KILL_PHASE_OBSERVATIONS
+            .with(|queue| *queue.borrow_mut() = late_walks.iter().copied().collect());
+
+        let result = stop_session_with_tick(&mut child, libc::SIGTERM, &mut tick);
+
+        let unused = KILL_PHASE_OBSERVATIONS.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
+        assert!(stalled, "the starvation stall never ran");
+        assert!(unused.is_empty(), "late walks never consumed {unused:?}");
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        (result, pid)
+    }
+
+    #[test]
+    fn late_walk_that_still_sees_a_killed_member_walks_again() {
+        // A member KILLed moments ago can still look live to the first late
+        // walk; the loop re-delivers KILL and walks again instead of
+        // reporting a session that is about to die as incomplete.
+        let (result, pid) = stop_starved_session(&[Some(false)]);
+
+        result.expect("a just-KILLed member seen live once was reported as incomplete");
+        // SAFETY: signal zero only probes the reaped fixture PID.
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    }
+
+    #[test]
+    fn one_refused_late_walk_is_tolerated() {
+        let (result, _) = stop_starved_session(&[None]);
+
+        result.expect("one refused late walk was reported as incomplete");
+    }
+
+    #[test]
+    fn late_walks_stop_at_the_cap_and_report_incomplete_cleanup() {
+        // A member still seen live after every late attempt is a survivor:
+        // the phase ends at the cap and fails closed.
+        let walks = vec![Some(false); KILL_VERIFY_LATE_ATTEMPTS as usize];
+        let (result, _) = stop_starved_session(&walks);
+
+        assert!(
+            result.is_err(),
+            "a member live on every late walk still certified cleanup"
+        );
+    }
+
+    #[test]
+    fn starved_grace_still_certifies_a_killed_session() {
+        // Stall the first supervision tick past the whole TERM grace and
+        // KILL window, as a loaded host does when process-table walks
+        // overrun the graceful loop. KILL then starts with no shared budget
+        // left; teardown must still prove the session empty instead of
+        // reporting an already-dead session as incomplete cleanup.
+        let mut command = Command::new("sh");
+        command.args(["-c", "trap '' TERM; exec sleep 30"]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        isolate(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        // Register the leader as production sessions do. While this session
+        // stalls, its KILLed leader is an unreaped zombie child of the test
+        // process; an unregistered one could be reaped by any concurrent
+        // test's adopted-zombie sweep, hiding it from this session's walks.
+        let _registration = StatusChildRegistration::new(pid);
+        let hard_window = Duration::from_millis(GRACE_ATTEMPTS as u64 * GRACE_INTERVAL_MS * 5 / 2);
+        let mut stalled = false;
+        let mut tick = || {
+            if !stalled {
+                stalled = true;
+                std::thread::sleep(hard_window + Duration::from_millis(200));
+            }
+            Ok(())
+        };
+
+        let status = stop_session_with_tick(&mut child, libc::SIGTERM, &mut tick)
+            .expect("starved verification reported a dead session as incomplete");
+
+        assert!(stalled, "the starvation stall never ran");
+        assert!(
+            std::os::unix::process::ExitStatusExt::signal(&status).is_some(),
+            "stopped leader exited on its own: {status:?}"
+        );
+        // SAFETY: signal zero only probes the reaped fixture PID.
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
     }
 
     #[test]
