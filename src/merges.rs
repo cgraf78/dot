@@ -615,6 +615,20 @@ pub(crate) struct RunInputs<'a> {
 /// hooks failed, matching `_run_merges` after it has rendered every result.
 pub(crate) struct Outcome {
     pub(crate) status: i32,
+    /// `(hook key, last line of its output)` for each failed hook, in
+    /// replay order, for the update's failure record. Empty when the
+    /// coordinator failed before any hook ran.
+    pub(crate) failures: Vec<(String, String)>,
+}
+
+impl Outcome {
+    /// A coordinator-level result with no per-hook failures.
+    pub(crate) fn status(status: i32) -> Self {
+        Self {
+            status,
+            failures: Vec::new(),
+        }
+    }
 }
 
 /// `_merge_hook_specs`: validate the configured extension root and directory,
@@ -927,6 +941,7 @@ fn replay(
     inputs: &RunInputs<'_>,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
+    failures: &mut Vec<(String, String)>,
 ) -> (i64, i64) {
     let mut merged = 0;
     let mut failed = 0;
@@ -937,6 +952,10 @@ fn replay(
         // remaining absent from the merged count and per-hook rendering.
         if record.rc != 0 {
             failed += 1;
+            failures.push((
+                record.hook.key.to_string_lossy().into_owned(),
+                crate::update_status::last_line(&record.output),
+            ));
         }
         if !record.has_merge {
             continue;
@@ -996,7 +1015,7 @@ pub(crate) fn run(
             inputs
                 .log
                 .warn(err, "  warning: merge-hook discovery failed");
-            return Outcome { status: 1 };
+            return Outcome::status(1);
         }
     };
     if hooks.is_empty() {
@@ -1011,7 +1030,7 @@ pub(crate) fn run(
             b"no config hooks",
             crate::update_engine::now_secs(),
         ));
-        return Outcome { status: 0 };
+        return Outcome::status(0);
     }
     let _ = out.write_all(&stage.start(
         b"Configs",
@@ -1029,7 +1048,7 @@ pub(crate) fn run(
             warning_summary(0, i64::try_from(hooks.len()).unwrap_or(i64::MAX)).as_bytes(),
             crate::update_engine::now_secs(),
         ));
-        return Outcome { status: 1 };
+        return Outcome::status(1);
     };
     // Resolve once before parallel launch so a shared capability failure is
     // reported once rather than being duplicated or hidden by per-hook result
@@ -1043,10 +1062,11 @@ pub(crate) fn run(
             warning_summary(0, i64::try_from(hooks.len()).unwrap_or(i64::MAX)).as_bytes(),
             crate::update_engine::now_secs(),
         ));
-        return Outcome { status: 1 };
+        return Outcome::status(1);
     }
     let mut merged = 0;
     let mut failed = 0;
+    let mut hook_failures = Vec::new();
     // Overlay records are immutable hook context; encode them once for every
     // worker rather than allocating the same byte vectors per hook.
     let overlays: Vec<Vec<u8>> = inputs
@@ -1068,6 +1088,7 @@ pub(crate) fn run(
                 inputs,
                 out,
                 err,
+                &mut hook_failures,
             );
             merged += completed;
             failed += failures;
@@ -1077,6 +1098,7 @@ pub(crate) fn run(
                 inputs,
                 out,
                 err,
+                &mut hook_failures,
             );
             merged += completed;
             failed += failures;
@@ -1089,6 +1111,7 @@ pub(crate) fn run(
         inputs,
         out,
         err,
+        &mut hook_failures,
     );
     merged += completed;
     failed += failures;
@@ -1107,6 +1130,7 @@ pub(crate) fn run(
     ));
     Outcome {
         status: if failed == 0 { 0 } else { 1 },
+        failures: hook_failures,
     }
 }
 

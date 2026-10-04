@@ -522,6 +522,12 @@ case ${1:-} in
       git -C "$DOT_SOURCE_ROOT" add provider-generation
       git -C "$DOT_SOURCE_ROOT" -c core.hooksPath=/dev/null commit -qm provider-generation
     fi
+    if [[ -n ${DOT_TEST_PROVIDER_FATAL:-} ]]; then
+      # Shdeps' own fatal error: no item event, warnings first, then the
+      # cause as the last stderr line.
+      printf '%s\n' 'warning: an earlier, unrelated warning' "$DOT_TEST_PROVIDER_FATAL" '' >&2
+      exit 1
+    fi
     if [[ ${DOT_TEST_PROVIDER_FAIL:-0} == 1 ]]; then
       if [[ ${SHDEPS_PROGRESS:-} == jsonl ]]; then
         printf '%s\n' \
@@ -5506,6 +5512,14 @@ Done with errors in Ns. Reload your shell: source ~/.bashrc\n";
     assert_eq!(last_cron_outcome(&fixture), ["degraded", "update", "prune"]);
     assert_eq!(converged_stages(&fixture), Some("prune".to_string()));
     assert!(!dot::update_status::last_success_path(&fixture.state).exists());
+    assert_eq!(
+        last_failure_items(&fixture),
+        owned(&[(
+            "prune",
+            "shdeps prune",
+            "warning: old-tool uninstall hook failed"
+        )])
+    );
 }
 
 /// Fields after the epoch of the newest cron outcome line.
@@ -5543,6 +5557,11 @@ fn cron_tools_failure_is_degraded_and_a_clean_run_clears_it() {
     assert_eq!(last_cron_outcome(&fixture), ["degraded", "update", "tools"]);
     assert_eq!(converged_stages(&fixture), Some("tools".to_string()));
     assert!(!dot::update_status::last_success_path(&fixture.state).exists());
+    // The failed provider item is the recorded cause.
+    assert_eq!(
+        last_failure_items(&fixture),
+        owned(&[("tools", "ripgrep", "network unavailable")])
+    );
 
     // Recovery stamps both files and clears the failing-stage list.
     let clean = fixture
@@ -5554,6 +5573,56 @@ fn cron_tools_failure_is_degraded_and_a_clean_run_clears_it() {
     assert_eq!(last_cron_outcome(&fixture), ["ok", "update"]);
     assert_eq!(converged_stages(&fixture), Some(String::new()));
     assert!(dot::update_status::last_success_path(&fixture.state).exists());
+    // A clean run removes the cause: it explains nothing any more, and it
+    // may hold a line of provider output.
+    assert!(!dot::update_status::last_failure_path(&fixture.state).exists());
+}
+
+/// The `(stage, name, detail)` items of `update.last-failure`, after
+/// checking that its header describes the last run.
+fn last_failure_items(fixture: &Fixture) -> Vec<(String, String, String)> {
+    let last = dot::update_status::read_last_run(&fixture.state).expect("last run");
+    let failure = dot::update_status::read_last_failure(&fixture.state).expect("last failure");
+    assert!(failure.describes(&last), "{failure:?} vs {last:?}");
+    failure
+        .items
+        .into_iter()
+        .map(|item| (item.stage, item.name, item.detail))
+        .collect()
+}
+
+/// Owned copies of expected `(stage, name, detail)` items.
+fn owned(items: &[(&str, &str, &str)]) -> Vec<(String, String, String)> {
+    items
+        .iter()
+        .map(|(stage, name, detail)| (stage.to_string(), name.to_string(), detail.to_string()))
+        .collect()
+}
+
+#[test]
+fn a_fatal_provider_error_is_recorded_from_its_last_stderr_line() {
+    // A provider that stops on its own error (a blocked method transition)
+    // reports no item, only an error on stderr. That line is the cause;
+    // without it the record could only say that Tools failed.
+    let fixture = Fixture::new("shdeps-fatal-cause");
+    let error = "error: ambiguous interrupted method transition for watchexec/watchexec no longer matches configuration";
+    let output = fixture
+        .command()
+        .arg("--cron")
+        .env("DOT_TEST_PROVIDER_FATAL", error)
+        .output()
+        .expect("cron update with a fatal provider error");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    // The error still reaches cron's stderr unchanged.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(error),
+        "{output:?}"
+    );
+    assert_eq!(last_cron_outcome(&fixture), ["degraded", "update", "tools"]);
+    assert_eq!(
+        last_failure_items(&fixture),
+        owned(&[("tools", "shdeps", error)])
+    );
 }
 
 /// Fields after the epoch of the any-trigger last-run stamp, read by raw
@@ -5629,6 +5698,18 @@ fn a_hand_run_update_that_does_not_converge_records_a_plain_failure() {
         .expect("manual update with failing tools and merge hook");
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(last_run_fields(&fixture), ["fail", "manual"]);
+    // Both causes are kept, in run order: the provider item, then the
+    // failing hook's key (it printed nothing, so no detail).
+    let items = last_failure_items(&fixture);
+    let stages: Vec<(&str, &str)> = items
+        .iter()
+        .map(|(stage, name, _)| (stage.as_str(), name.as_str()))
+        .collect();
+    assert_eq!(
+        stages,
+        [("tools", "ripgrep"), ("configs", "10-fail")],
+        "{items:?}"
+    );
 }
 
 /// Seed a local bare base remote with one commit and return its path.
@@ -5809,6 +5890,14 @@ fn cron_unavailable_shdeps_is_a_degraded_tools_stage() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(last_cron_outcome(&fixture), ["degraded", "update", "tools"]);
     assert_eq!(converged_stages(&fixture), Some("tools".to_string()));
+    // The provider itself is the cause (doctor must not send the user to a
+    // `shdeps` that could not even be prepared).
+    let items = last_failure_items(&fixture);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(
+        (items[0].0.as_str(), items[0].1.as_str()),
+        ("provider", "shdeps")
+    );
 }
 
 #[test]
@@ -5862,6 +5951,13 @@ fn cron_sync_failure_stays_a_failed_outcome_without_convergence() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(last_cron_outcome(&fixture), ["fail", "update"]);
     assert_eq!(converged_stages(&fixture), None);
+    // The overlay whose pull failed is named, not just the stage.
+    let items = last_failure_items(&fixture);
+    assert_eq!(
+        items.first().map(|item| (item.0.as_str(), item.1.as_str())),
+        Some(("repos", "broken")),
+        "{items:?}"
+    );
 }
 
 #[test]
@@ -5896,6 +5992,11 @@ fn cron_provider_reexec_carries_a_degraded_continuation_outward() {
         "{log}"
     );
     assert_eq!(converged_stages(&fixture), Some("prune".to_string()));
+    // The outer run hands the continuation's cause outward too, instead of
+    // overwriting it with an empty record of its own.
+    let items = last_failure_items(&fixture);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0].0, "prune");
 }
 
 #[test]

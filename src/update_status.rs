@@ -40,6 +40,19 @@
 //!   cron stamps, so this is how `dot doctor` sees their last outcome
 //!   (and notices a cron entry that never ran). Older Dot releases
 //!   neither write nor read it.
+//! - `update.last-failure`: why the last non-ok run (any trigger) did not
+//!   succeed, overwritten by every such run and removed by a clean one.
+//!   The first line repeats that run's `<epoch> <outcome> <trigger>` from
+//!   `update.last-run`; doctor shows the cause only while the two match, so
+//!   a record a later run (or an older Dot that does not write it) has
+//!   superseded never explains the wrong run. Then one line per failing
+//!   item, `item<TAB><stage><TAB><name><TAB><detail>` (a failed Shdeps
+//!   item, a merge-hook key, a repository, a dirty file, or the stage's
+//!   own reason), at most [`MAX_FAILURE_ITEMS_PER_STAGE`] per stage, and
+//!   `more<TAB><stage><TAB><count>` for the rest. Fields are
+//!   control-sanitized and capped, and the whole body stays within
+//!   [`FAILURE_MAX_BYTES`]. A separate file rather than more fields in
+//!   `update.last-run`, whose older readers reject anything but words.
 //! - `logs/`: retained failure logs from the quiet runner, pruned to
 //!   the newest [`MAX_RETAINED_LOGS`].
 //!
@@ -110,6 +123,43 @@ pub const STAGE_CONFIG: &str = "config";
 pub const STAGE_TOOLS: &str = "tools";
 /// See [`STAGE_CONFIG`].
 pub const STAGE_PRUNE: &str = "prune";
+
+/// Stage names that only `update.last-failure` items carry (the degraded
+/// stages above appear there too). Lowercase words like every persisted
+/// stage, so an older reader of a newer record never drops one: the Repos
+/// stage (a repository that failed to pull, or an overlay that could not be
+/// resolved), the Overlays stage (linking or profile deactivation), the
+/// Configs stage (a merge hook), local edits that skipped a cron run, and
+/// the update as a whole (anything outside one stage, such as a release
+/// handoff that could not start the new binary), and the dependency
+/// provider itself when it could not be prepared (the Tools stage then
+/// degrades, but `shdeps` may not even be runnable, so doctor must not
+/// send the user to it).
+pub const STAGE_REPOS: &str = "repos";
+/// See [`STAGE_REPOS`].
+pub const STAGE_OVERLAYS: &str = "overlays";
+/// See [`STAGE_REPOS`].
+pub const STAGE_CONFIGS: &str = "configs";
+/// See [`STAGE_REPOS`]. Matches the `skip dirty` cron log line.
+pub const STAGE_DIRTY: &str = "dirty";
+/// See [`STAGE_REPOS`].
+pub const STAGE_UPDATE: &str = "update";
+/// See [`STAGE_REPOS`].
+pub const STAGE_PROVIDER: &str = "provider";
+
+/// Items kept per stage in `update.last-failure`; the rest are counted.
+pub const MAX_FAILURE_ITEMS_PER_STAGE: usize = 5;
+
+/// Largest `update.last-failure` body written or read. A record carries a
+/// handful of short items, so this bounds both the write and every doctor
+/// read to one small block.
+pub const FAILURE_MAX_BYTES: usize = 4096;
+
+/// Longest item name kept (bytes, cut on a character boundary).
+const FAILURE_NAME_MAX_BYTES: usize = 120;
+
+/// Longest item detail kept (bytes, cut on a character boundary).
+const FAILURE_DETAIL_MAX_BYTES: usize = 240;
 
 /// Stages whose failure leaves a cron run converged but degraded:
 /// the dotfiles themselves (repositories, links, configs) are current,
@@ -183,6 +233,150 @@ impl LastRun {
     }
 }
 
+/// The failing items one update run collects for `update.last-failure`, in
+/// the order the run met them. Every field is cleaned on [`Failures::push`],
+/// so whatever a provider, hook, or filename carries never reaches the
+/// record or doctor's terminal as control text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Failures {
+    items: Vec<FailureItem>,
+}
+
+/// One failing item: its stage, what failed (a package, a hook key, a
+/// repository, a file), and why, when known (empty otherwise).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureItem {
+    /// Stage word ([`STAGE_TOOLS`], [`STAGE_REPOS`], ..., or a word only a
+    /// newer Dot writes).
+    pub stage: String,
+    /// What failed.
+    pub name: String,
+    /// Why it failed, empty when unknown.
+    pub detail: String,
+}
+
+impl Failures {
+    /// Record one failing item. Names and details are cleaned and capped
+    /// here; an item with neither is dropped (it would explain nothing).
+    pub fn push(&mut self, stage: &'static str, name: &str, detail: &str) {
+        let name = clean_field(name, FAILURE_NAME_MAX_BYTES);
+        let detail = clean_field(detail, FAILURE_DETAIL_MAX_BYTES);
+        if name.is_empty() && detail.is_empty() {
+            return;
+        }
+        self.items.push(FailureItem {
+            stage: stage.to_string(),
+            name,
+            detail,
+        });
+    }
+
+    /// Whether nothing was recorded.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Whether `stage` has at least one item.
+    pub fn has_stage(&self, stage: &str) -> bool {
+        self.items.iter().any(|item| item.stage == stage)
+    }
+
+    /// The recorded items in run order.
+    pub fn items(&self) -> &[FailureItem] {
+        &self.items
+    }
+}
+
+/// The last non-ok update run's cause, read back from `update.last-failure`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastFailure {
+    /// Epoch seconds of that run: the same value its `update.last-run` stamp
+    /// carries, which is how doctor ties the cause to the run it reports.
+    pub at: i64,
+    /// Its outcome word (never [`OUTCOME_OK`]).
+    pub outcome: String,
+    /// Its trigger word.
+    pub trigger: String,
+    /// The kept items in run order.
+    pub items: Vec<FailureItem>,
+    /// Items the writer counted but did not keep.
+    pub omitted: usize,
+}
+
+impl LastFailure {
+    /// Whether this record describes `run`: same epoch, outcome, and
+    /// trigger. A stamp written by a Dot that does not write this record
+    /// never matches an older record, so stale causes never attach to it.
+    pub fn describes(&self, run: &LastRun) -> bool {
+        self.at == run.at && self.outcome == run.outcome && self.trigger == run.trigger
+    }
+}
+
+/// Make untrusted text safe for a one-line record field: color and other
+/// CSI escape sequences (`ESC [ ... final`, or C1 CSI) are dropped whole,
+/// every other control character (C0, DEL, and C1, so tabs and newlines
+/// too) becomes a space, runs of spaces collapse, and the result is cut to
+/// `max` bytes on a character boundary with a trailing `…` when cut.
+/// Doctor uses it too, to shorten a kept detail for its one-line rows.
+pub fn clean_field(text: &str, max: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max));
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        // Past the cap plus room for the ellipsis cut, the rest is dropped
+        // anyway; stop scanning so huge input costs only `max`.
+        if out.len() > max + 4 {
+            break;
+        }
+        let csi = c == '\u{9b}' || (c == '\u{1b}' && chars.peek() == Some(&'['));
+        if csi {
+            if c == '\u{1b}' {
+                chars.next();
+            }
+            // Parameters and intermediates, up to the final byte.
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+            continue;
+        }
+        let c = if c.is_control() { ' ' } else { c };
+        if c == ' ' && (out.is_empty() || out.ends_with(' ')) {
+            continue;
+        }
+        out.push(c);
+    }
+    let trimmed = out.trim_end();
+    if trimmed.len() <= max {
+        return trimmed.to_string();
+    }
+    let ellipsis = '…';
+    // A cap too small for the ellipsis keeps nothing rather than underflow.
+    let Some(mut cut) = max.checked_sub(ellipsis.len_utf8()) else {
+        return String::new();
+    };
+    while !trimmed.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut capped = trimmed[..cut].trim_end().to_string();
+    capped.push(ellipsis);
+    capped
+}
+
+/// The last non-empty line of untrusted output, or `""`. A failing command
+/// (Shdeps, a merge hook) prints its fatal error last, after any warnings,
+/// so this is the line most likely to name the cause. Only the trailing
+/// [`FAILURE_MAX_BYTES`] are scanned, which bounds the work on huge output.
+pub fn last_line(output: &[u8]) -> String {
+    let tail = &output[output.len().saturating_sub(FAILURE_MAX_BYTES)..];
+    let line = tail
+        .split(|byte| *byte == b'\n' || *byte == b'\r')
+        .map(<[u8]>::trim_ascii)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or_default();
+    clean_field(&String::from_utf8_lossy(line), FAILURE_DETAIL_MAX_BYTES)
+}
+
 /// Create `path` as a private directory, tightening pre-existing
 /// ones: cron state holds dirty filenames plus absolute home paths,
 /// so it stays owner-only whatever the ambient umask was.
@@ -232,6 +426,11 @@ pub fn last_converged_path(state_home: &Path) -> PathBuf {
 /// The any-trigger last-run stamp (`dot/update.last-run`).
 pub fn last_run_path(state_home: &Path) -> PathBuf {
     dot_dir(state_home).join("update.last-run")
+}
+
+/// The last non-ok run's cause (`dot/update.last-failure`).
+pub fn last_failure_path(state_home: &Path) -> PathBuf {
+    dot_dir(state_home).join("update.last-failure")
 }
 
 /// The retained failure-log directory (`dot/logs`).
@@ -332,6 +531,99 @@ pub fn record_last_run(
     }
     body.push('\n');
     write_stamp(&last_run_path(state_home), &body);
+}
+
+/// Overwrite the last-failure record for a non-ok run: a header matching
+/// that run's `update.last-run` stamp, then up to
+/// [`MAX_FAILURE_ITEMS_PER_STAGE`] `item` lines per stage and one `more`
+/// line counting the rest, all within [`FAILURE_MAX_BYTES`]. A run with no
+/// items still writes its header, so doctor can tell "cause unknown" from
+/// a cause left behind by an earlier run. Best-effort like
+/// [`record_success`].
+pub fn record_last_failure(
+    state_home: &Path,
+    now: i64,
+    outcome: &str,
+    trigger: Trigger,
+    failures: &Failures,
+) {
+    /// Per-stage counter in first-seen order (a handful of stages at most).
+    fn count(counts: &[(&str, usize)], stage: &str) -> usize {
+        counts
+            .iter()
+            .find(|(name, _)| *name == stage)
+            .map_or(0, |e| e.1)
+    }
+    fn bump<'a>(counts: &mut Vec<(&'a str, usize)>, stage: &'a str) {
+        match counts.iter_mut().find(|(name, _)| *name == stage) {
+            Some(entry) => entry.1 += 1,
+            None => counts.push((stage, 1)),
+        }
+    }
+
+    let mut body = format!("{now} {outcome} {}\n", trigger.as_str());
+    let mut kept: Vec<(&str, usize)> = Vec::new();
+    let mut omitted: Vec<(&str, usize)> = Vec::new();
+    // Any stage may end up with a `more` line, so reserve the longest one
+    // each distinct stage could need (its count is at most the item count)
+    // before keeping a single item: the counts then always fit the cap.
+    let mut stages: Vec<&str> = Vec::new();
+    for item in &failures.items {
+        if !stages.contains(&item.stage.as_str()) {
+            stages.push(&item.stage);
+        }
+    }
+    let digits = failures.items.len().to_string().len();
+    let reserve: usize = stages
+        .iter()
+        .map(|stage| "more\t\t\n".len() + stage.len() + digits)
+        .sum();
+    for item in &failures.items {
+        let stage = item.stage.as_str();
+        let line = format!("item\t{stage}\t{}\t{}\n", item.name, item.detail);
+        let fits = body.len() + line.len() + reserve <= FAILURE_MAX_BYTES;
+        if fits && count(&kept, stage) < MAX_FAILURE_ITEMS_PER_STAGE {
+            body.push_str(&line);
+            bump(&mut kept, stage);
+        } else {
+            bump(&mut omitted, stage);
+        }
+    }
+    for (stage, count) in omitted {
+        body.push_str(&format!("more\t{stage}\t{count}\n"));
+    }
+    write_stamp(&last_failure_path(state_home), &body);
+}
+
+/// Remove the last-failure record after a clean run: the cause no longer
+/// describes anything, and it may hold a line of hook or provider output
+/// that should not outlive the problem. Best-effort, and it only ever
+/// unlinks: a directory planted at the path stays.
+pub fn clear_last_failure(state_home: &Path) {
+    let path = last_failure_path(state_home);
+    if std::fs::symlink_metadata(&path).is_ok_and(|meta| !meta.is_dir()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Record a run that failed outside the engine (a release handoff that
+/// could not exec, or a continuation that could not start): the `fail` cron
+/// line for a cron run, plus `update.last-run` and `update.last-failure` for
+/// any trigger, so every writer of a failure leaves the same three records
+/// the engine does. `stage`/`name`/`detail` form the one known cause.
+pub fn record_failed_run(
+    state_home: &Path,
+    now: i64,
+    trigger: Trigger,
+    cause: (&'static str, &str, &str),
+) {
+    if trigger == Trigger::Cron {
+        append_outcome(state_home, now, OUTCOME_FAIL, "update", "");
+    }
+    record_last_run(state_home, now, OUTCOME_FAIL, trigger, Degraded::default());
+    let mut failures = Failures::default();
+    failures.push(cause.0, cause.1, cause.2);
+    record_last_failure(state_home, now, OUTCOME_FAIL, trigger, &failures);
 }
 
 /// Truncate-and-write one small stamp file. Not an atomic rename: the
@@ -445,6 +737,70 @@ pub fn read_last_run(state_home: &Path) -> Option<LastRun> {
         outcome: outcome.to_string(),
         trigger: trigger.to_string(),
         failing: failing.to_string(),
+    })
+}
+
+/// Read the last-failure record, or `None` when missing, unreadable, or its
+/// header is malformed. Only the first [`FAILURE_MAX_BYTES`] are read, up to
+/// the last whole line, so a larger record from a newer Dot still yields its
+/// leading items. Lines of an unknown kind are skipped (newer vocabulary),
+/// and every field is cleaned again, so hostile text never reaches doctor
+/// output even if something else wrote the file.
+pub fn read_last_failure(state_home: &Path) -> Option<LastFailure> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NONBLOCK);
+    let file = open_state_file(&options, &last_failure_path(state_home))?;
+    let mut bytes = Vec::new();
+    file.take(FAILURE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > FAILURE_MAX_BYTES {
+        // Drop the cut line: a partial item must not read as a whole one.
+        let end = bytes[..FAILURE_MAX_BYTES]
+            .iter()
+            .rposition(|byte| *byte == b'\n')?;
+        bytes.truncate(end + 1);
+    }
+    let content = String::from_utf8_lossy(&bytes);
+    let mut lines = content.lines();
+    let mut header = lines.next()?.split(' ');
+    let at = header.next()?.parse::<i64>().ok()?;
+    let outcome = header.next().filter(|word| is_word(word))?;
+    // Further header fields from a newer Dot are ignored: these three are
+    // all `describes` needs.
+    let trigger = header.next().filter(|word| is_word(word))?;
+    let mut items = Vec::new();
+    let mut omitted = 0usize;
+    for line in lines {
+        let mut fields = line.split('\t');
+        match (fields.next(), fields.next()) {
+            (Some("item"), Some(stage)) if is_word(stage) => {
+                let name = clean_field(fields.next().unwrap_or(""), FAILURE_NAME_MAX_BYTES);
+                let detail = clean_field(fields.next().unwrap_or(""), FAILURE_DETAIL_MAX_BYTES);
+                if !name.is_empty() || !detail.is_empty() {
+                    items.push(FailureItem {
+                        stage: stage.to_string(),
+                        name,
+                        detail,
+                    });
+                }
+            }
+            (Some("more"), Some(stage)) if is_word(stage) => {
+                let count = fields.next().and_then(|n| n.parse::<usize>().ok());
+                omitted = omitted.saturating_add(count.unwrap_or(0));
+            }
+            _ => {}
+        }
+    }
+    Some(LastFailure {
+        at,
+        outcome: outcome.to_string(),
+        trigger: trigger.to_string(),
+        items,
+        omitted,
     })
 }
 

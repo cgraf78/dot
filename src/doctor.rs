@@ -172,6 +172,7 @@ fn run_configured(
             last_success: crate::update_status::read_last_success(runtime.state_home()),
             last_converged: crate::update_status::read_last_converged(runtime.state_home()),
             last_run: crate::update_status::read_last_run(runtime.state_home()),
+            last_failure: crate::update_status::read_last_failure(runtime.state_home()),
             cron_available: runtime.find_on_path("crontab").is_some(),
             now: crate::update_engine::now_secs(),
         }),
