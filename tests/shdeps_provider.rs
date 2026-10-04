@@ -5314,6 +5314,15 @@ fn provider_exit_bounds_an_escaped_continuous_writer() {
     );
 }
 
+// How long Dot may take to finish once the escaped preparation holder is up.
+// Dot's owned-session teardown chains a TERM grace, KILL verification and
+// completion snapshots whose process-table walks stretch on a loaded host, so
+// the bound must sit well above that. The holder outlives it by a wide margin
+// (`PREPARATION_HOLDER_LIFETIME`): a Dot that waited for the holder to exit
+// on its own instead of reaping it still misses the bound.
+const PREPARATION_TEARDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+const PREPARATION_HOLDER_LIFETIME: &str = "120";
+
 fn assert_preparation_handles_escaped_stderr(stage: &str) {
     let rust = Fixture::new(&format!("shdeps-{stage}-escaped-stderr"));
     let pid_file = rust.home.join("escaped-preparation-stderr-pid");
@@ -5322,7 +5331,10 @@ fn assert_preparation_handles_escaped_stderr(stage: &str) {
     command
         .env("DOT_TEST_PROVIDER_ESCAPE_HELPER", helper)
         .env("DOT_TEST_PROVIDER_ESCAPE_PID", &pid_file)
-        .env("DOT_TEST_PROVIDER_ESCAPE_LIFETIME", "5");
+        .env(
+            "DOT_TEST_PROVIDER_ESCAPE_LIFETIME",
+            PREPARATION_HOLDER_LIFETIME,
+        );
     match stage {
         "bootstrap" => {
             command.env("DOT_TEST_PROVIDER_BOOTSTRAP_ESCAPE_STDERR", "1");
@@ -5362,7 +5374,7 @@ fn assert_preparation_handles_escaped_stderr(stage: &str) {
         Some(pid),
         "fixture did not escape SID"
     );
-    let process_completed = child.wait_bounded(std::time::Duration::from_secs(5));
+    let process_completed = child.wait_bounded(PREPARATION_TEARDOWN_BOUND);
     let mut stdout = None;
     let mut stderr = None;
     let output_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
