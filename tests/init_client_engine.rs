@@ -734,6 +734,74 @@ fn fresh_yes_reaches_converge_structurally() {
     assert!(!read_completed(&fixture.state).is_empty());
 }
 
+/// Older Git (seen with 2.47) runs `guess_remote_head` on every clone,
+/// including `--branch` clones, and when the remote HEAD is detached it
+/// looks up `init.defaultBranch` without the quiet flag. A host with no
+/// configured default then prints the multi-line "Using 'master' as the
+/// name for the initial branch" advice on the clone's stderr, which the
+/// engine merges into the init report. This shim reproduces that on any
+/// Git: it prints the advice for a clone unless the command line itself
+/// configures a default. Ambient config sources are ignored so a
+/// developer's own setting cannot make the test pass vacuously.
+const OLD_GIT_ADVICE_SHIM: &str = r#"#!/bin/sh
+real='@REAL@'
+prefix=
+for arg do
+  if [ "$arg" = clone ]; then
+    # shellcheck disable=SC2086 # The global options are plain words.
+    default=$(unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
+      GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        "$real" -C / $prefix config --get init.defaultBranch 2>/dev/null)
+    [ -n "$default" ] || printf '%s\n' \
+      "hint: Using 'master' as the name for the initial branch. This default branch name" \
+      'hint: is subject to change.' >&2
+    break
+  fi
+  prefix="$prefix $arg"
+done
+exec "$real" "$@"
+"#;
+
+#[test]
+fn fresh_clone_of_detached_head_relays_no_branch_name_advice() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::build("engine-detached-advice");
+    let origin = make_origin(fixture.root());
+    let commit = origin_commit(&origin, "main");
+    git(&[
+        "--git-dir",
+        path_str(&origin),
+        "update-ref",
+        "--no-deref",
+        "HEAD",
+        &commit,
+    ]);
+    let real = dot_test_support::real_tool("git");
+    let shim = fixture.root().join("old-git");
+    std::fs::write(
+        &shim,
+        OLD_GIT_ADVICE_SHIM.replace("@REAL@", path_str(&real)),
+    )
+    .expect("write git shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("git shim mode");
+    let url = format!("file://{}", path_str(&origin));
+    let argv = ["--yes", "--branch", "main", url.as_str()];
+    let (rust, converged) =
+        dot::init_client_identity::with_host_git(&shim, || check_converge(&fixture, &argv, None));
+    let stderr = String::from_utf8_lossy(&rust.stderr);
+    assert_eq!(rust.code, 0, "init succeeds: {stderr}");
+    assert!(
+        !stderr.contains("hint:"),
+        "a successful clone relays no Git advice: {stderr}"
+    );
+    assert!(
+        stderr.starts_with("dot init plan:\n"),
+        "plan printed: {stderr}"
+    );
+    assert_eq!(converged, 1, "fresh success converges once");
+}
+
 #[test]
 fn adopt_mismatch_is_rejected() {
     let fixture = Fixture::build("engine-adopt-mismatch");

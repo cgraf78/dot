@@ -1561,15 +1561,27 @@ impl<'a> Production<'a> {
     }
 }
 
-/// `git clone --quiet --no-checkout --branch <branch>
-/// --single-branch -- <origin> <candidate>`: the shell's candidate
+/// `git -c init.defaultBranch=<branch> clone --quiet --no-checkout
+/// --branch <branch> --single-branch -- <origin> <candidate>`: the
+/// shell's candidate
 /// checkout. A quiet clone prints nothing on success; its failure
 /// diagnostics reach the command's own stdout and stderr on the
 /// shell, so they are captured here and merged into the report
 /// streams by the caller (never dropped, never bypassed).
 fn git_clone(origin: &str, branch: &str, candidate: &Path) -> CloneReport {
     let mut command = identity::host_git_command();
+    // Older Git (seen with 2.47) consults `init.defaultBranch` on every
+    // clone of a remote whose HEAD carries no symref target, such as a
+    // detached HEAD, even with `--branch`, and prints a multi-line
+    // "Using 'master' as the name for the initial branch" hint when the
+    // host leaves it unset. That hint would reach the
+    // report through the merged streams below. Naming the requested
+    // branch answers the lookup without a hint and changes no clone
+    // outcome: `--branch` picks the checkout, `--single-branch` fetches
+    // only that branch, and the same branch is what the lookup prefers.
     command
+        .arg("-c")
+        .arg(format!("init.defaultBranch={branch}"))
         .arg("clone")
         .arg("--quiet")
         .arg("--no-checkout")
