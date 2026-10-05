@@ -641,11 +641,11 @@ mod cancellation_tests {
 
         assert_eq!(status, 128 + libc::SIGTERM);
         assert_eq!(std::fs::read(root.join("note")).unwrap(), original);
-        // Up to 60s to engage the hold, then a teardown of at most about 20s
+        // Up to 60s to engage the hold, then a teardown of at most about 40s
         // even with late walks (1s TERM grace, about 1.5s hard phase, then up
-        // to three late walks, each starting within the 5s budget), so 120s
-        // leaves room for a loaded host while waiting out the 300s move still
-        // fails.
+        // to three late walks, each starting within the 5s budget, and the
+        // 10s dying grace plus at most two such walks), so 120s leaves room
+        // for a loaded host while waiting out the 300s move still fails.
         assert!(
             started.elapsed() < std::time::Duration::from_secs(120),
             "backup waited {:?} for the held move",

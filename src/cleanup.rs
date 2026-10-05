@@ -1079,9 +1079,12 @@ fn cleanup_deadline() -> Instant {
 /// with one exception: once KILL has reached every known member, a proof
 /// still pending at the end of that window may run up to
 /// `KILL_VERIFY_LATE_ATTEMPTS` more walks, each allowed to start within this
-/// budget (see `kill_verification_deadline`). On a loaded host that can
-/// add several seconds to Ctrl-C, timeout and hook/provider cancellation
-/// in exchange for not reporting an already-dead session as incomplete.
+/// budget (see `kill_verification_deadline`), and a member the kernel is
+/// still finishing after its KILL may extend the phase by up to
+/// `KILL_DYING_GRACE` plus at most two walks (see `dying_grace_deadline`). On a loaded host that
+/// can add several seconds to Ctrl-C, timeout and hook/provider
+/// cancellation in exchange for not reporting a dead or dying session as
+/// incomplete.
 const COMPLETION_SNAPSHOT_BUDGET: Duration = Duration::from_secs(5);
 
 fn completion_snapshot_deadline() -> Instant {
@@ -7226,17 +7229,36 @@ fn stop_sessions_with_tick(
             session.signal_all(libc::SIGKILL);
         }
         let mut late_attempts = 0u32;
-        while let Some(pass_deadline) =
-            kill_verification_deadline(Instant::now(), hard_deadline, late_attempts)
-        {
-            if pass_deadline > hard_deadline {
-                late_attempts += 1;
-            }
+        // The previous walk's result (`None` once a walk was refused) and the
+        // end of the dying grace, once it has started.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let (mut last_walk, mut dying_until) = (None, None);
+        loop {
+            let pass_deadline =
+                match kill_verification_deadline(Instant::now(), hard_deadline, late_attempts) {
+                    Some(deadline) => {
+                        if deadline > hard_deadline {
+                            late_attempts += 1;
+                        }
+                        deadline
+                    }
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    None => match dying_grace_deadline(&sessions, last_walk, &mut dying_until) {
+                        Some(deadline) => deadline,
+                        None => break,
+                    },
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    None => break,
+                };
             #[cfg(test)]
             let observed = kill_phase_observation_override()
                 .unwrap_or_else(|| observe_sessions(&mut sessions, pass_deadline));
             #[cfg(not(test))]
             let observed = observe_sessions(&mut sessions, pass_deadline);
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                last_walk = observed;
+            }
             if sessions_stably_empty(observed, &mut consecutive_empty) {
                 break;
             }
@@ -7336,7 +7358,8 @@ fn merge_authority_errors(
 /// is refused or still sees a live member, followed by two empty ones.
 /// The proof is never weakened: certification still needs two consecutive
 /// empty snapshots, and a member still live after the cap is reported as
-/// a survivor as before.
+/// a survivor as before, unless procfs proves it is dying (Linux and
+/// Android; see `dying_grace_deadline`).
 fn kill_verification_deadline(
     now: Instant,
     hard_deadline: Instant,
@@ -7349,6 +7372,98 @@ fn kill_verification_deadline(
     } else {
         Some(now + COMPLETION_SNAPSHOT_BUDGET)
     }
+}
+
+/// How long a KILL phase whose late walks are spent may keep verifying
+/// members the kernel is still finishing (see `dying_grace_deadline`).
+///
+/// A SIGKILLed task acts on the signal only when it leaves the kernel, and
+/// some operations do not return early for it: an `fsync` waiting on
+/// writeback, or a filesystem lock or transaction that a btrfs host under
+/// write load holds for several seconds. Bounded so that a task stuck for
+/// good (a hung network mount) still fails cleanup within this much more
+/// time.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const KILL_DYING_GRACE: Duration = Duration::from_secs(10);
+
+/// Next walk deadline for a KILL phase whose late walks are spent, or
+/// `None` to stop and report.
+///
+/// The late walks prove a session empty when its members die promptly. A
+/// member can instead stay non-zombie for seconds after the KILL while the
+/// kernel finishes an uninterruptible operation, and reporting it then
+/// fails a session that is about to be clean with `CleanupIncomplete`
+/// (exit 125; for `dot test`, the whole run).
+/// So, once, the phase gets `KILL_DYING_GRACE` more: it waits on direct
+/// procfs reads (no host-wide walk) until every member the last walk saw
+/// live is dead, then walks again under the usual two-empty-walks proof
+/// (every walk that is not empty re-delivers KILL as before).
+/// Nothing is certified early: the grace ends, and the survivor is
+/// reported as before, as soon as any member lacks proof that it is dying
+/// (no queued KILL and not exiting, so possibly never signalable, or
+/// unreadable), after a refused walk, or when the grace runs out. A proof
+/// one empty walk short gets its confirming walk, even at the end of the
+/// grace.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn dying_grace_deadline(
+    sessions: &[Session],
+    last_walk: Option<bool>,
+    until: &mut Option<Instant>,
+) -> Option<Instant> {
+    let empty = last_walk?;
+    let until = *until.get_or_insert_with(|| Instant::now() + kill_dying_grace());
+    let now = Instant::now();
+    if now >= until {
+        // A proof one empty walk short still gets its confirming walk, so a
+        // member that died just before the end is not reported. Any other
+        // walk past the end is refused, which keeps the grace bounded.
+        return empty.then(|| now + COMPLETION_SNAPSHOT_BUDGET);
+    }
+    if !empty
+        && sessions
+            .iter()
+            .all(|session| session.live_survivors().is_empty())
+    {
+        // A walk that is not empty with nothing live to wait for (the
+        // leader missing from the snapshot, say) cannot be helped by
+        // waiting; walking again for the whole grace would only burn it.
+        return None;
+    }
+    poll_until(until, || {
+        let mut dying = false;
+        for session in sessions {
+            for (pid, start) in session.live_survivors() {
+                match survivor_fate(pid, start) {
+                    Fate::Dead => {}
+                    Fate::Dying => dying = true,
+                    Fate::Live => return Err(std::io::Error::other("survivor is not dying")),
+                }
+            }
+        }
+        Ok((!dying).then_some(()))
+    })
+    .ok()?;
+    Some(Instant::now() + COMPLETION_SNAPSHOT_BUDGET)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn kill_dying_grace() -> Duration {
+    #[cfg(test)]
+    if let Some(grace) = KILL_DYING_GRACE_OVERRIDE.with(std::cell::Cell::get) {
+        return grace;
+    }
+    KILL_DYING_GRACE
+}
+
+// Test seams for the dying grace: queued fates replace `survivor_fate` reads
+// one per call (real reads resume once the queue is empty), and the grace
+// override shortens the cap. Thread-local like the observation seam below.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+thread_local! {
+    static KILL_DYING_FATES: std::cell::RefCell<std::collections::VecDeque<Fate>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static KILL_DYING_GRACE_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
 }
 
 // Test seam for the post-KILL verification loop: each queued entry replaces
@@ -8155,8 +8270,9 @@ impl Session {
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
             let retained_pids = String::new();
             self.record_error(std::io::Error::other(format!(
-                "owned subprocesses survived bounded SIGKILL cleanup (leader={} current=[{current_pids}] retained=[{retained_pids}])",
+                "owned subprocesses survived bounded SIGKILL cleanup (leader={} current=[{current_pids}] retained=[{retained_pids}]){}",
                 self.leader,
+                self.survivor_details(),
             )));
         } else if self.error.is_none() {
             self.record_error(std::io::Error::other(
@@ -8165,10 +8281,280 @@ impl Session {
         }
     }
 
+    /// One `; pid: ...` clause per live survivor, read fresh from procfs so
+    /// the failure names its own cause (unsignalable, mid-exit, blocked in
+    /// the kernel, or already gone by the time of the report). Purely
+    /// diagnostic: it runs after the outcome is decided and never changes it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn survivor_details(&self) -> String {
+        let mut details = String::new();
+        for (index, (pid, start)) in self.live_survivors().into_iter().enumerate() {
+            if index == SURVIVOR_DETAIL_LIMIT {
+                details.push_str("; ...");
+                break;
+            }
+            details.push_str("; ");
+            details.push_str(&survivor_detail(pid, start));
+        }
+        details
+    }
+
+    /// Every process the latest walk (or pidfd refresh) still saw live: its
+    /// PID with the start tick that pins its identity. A set of pairs, not a
+    /// map by PID, so a stale identity can never hide a live one.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn live_survivors(&self) -> std::collections::BTreeSet<(u32, Option<u64>)> {
+        self.current
+            .values()
+            .chain(self.members.values().map(|member| &member.process))
+            .filter(|process| process.live)
+            .map(|process| (process.pid, process.identity.start))
+            .collect()
+    }
+
+    /// Portable snapshots carry no per-process state worth re-reading.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn survivor_details(&self) -> String {
+        String::new()
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn take_members(&mut self) -> Vec<OwnedMember> {
         std::mem::take(&mut self.members).into_values().collect()
     }
+}
+
+/// Survivors described in one cleanup failure. A runaway fork tree must not
+/// turn the error into a long procfs walk or a screen-filling line; the
+/// first few name the cause, and the pid lists still name every survivor.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SURVIVOR_DETAIL_LIMIT: usize = 4;
+
+/// `PF_EXITING` in the procfs stat `flags` field: the task has entered
+/// `do_exit` and is releasing its resources but is not yet a zombie.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const PF_EXITING: u64 = 0x4;
+
+/// Describe one cleanup survivor from a fresh procfs read. `start` is the
+/// identity the cleanup observed; a different start tick means the PID now
+/// names another process, so the survivor itself is gone.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn survivor_detail(pid: u32, start: Option<u64>) -> String {
+    let stat = match read_proc_stat(Path::new(&format!("/proc/{pid}/stat"))) {
+        Ok(stat) => stat,
+        Err(error) if proc_process_vanished(&error) => return format!("{pid}: gone"),
+        Err(error) => return format!("{pid}: unreadable ({error})"),
+    };
+    // Only reads that never wait on the target: a survivor is often stuck in
+    // the kernel, and `cmdline` (or anything else that reads its memory)
+    // takes its mmap lock, which such a task may hold for good, hanging the
+    // report. The cwd link takes no such lock and names the work the
+    // survivor was doing (a suite's temporary tree, a repository).
+    let read = |name: &str| {
+        let mut bytes = Vec::new();
+        File::open(format!("/proc/{pid}/{name}"))
+            .and_then(|file| file.take(64 * 1024).read_to_end(&mut bytes))
+            .ok()
+            .map(|_| String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let status = read("status");
+    let wchan = read("wchan");
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+    format_survivor(
+        pid,
+        start,
+        &stat,
+        status.as_deref(),
+        wchan.as_deref(),
+        cwd.as_deref(),
+    )
+}
+
+/// The procfs evidence about one process that both the dying check and the
+/// failure report read, parsed in one place so the two cannot disagree.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+struct ProcEvidence<'a> {
+    /// Stat fields from the state letter (procfs field 3) on.
+    fields: Vec<&'a [u8]>,
+    status: Option<&'a str>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl<'a> ProcEvidence<'a> {
+    fn parse(stat: &'a [u8], status: Option<&'a str>) -> Self {
+        Self {
+            fields: proc_stat_fields(stat).map_or_else(Vec::new, Iterator::collect),
+            status,
+        }
+    }
+
+    fn field(&self, index: usize) -> Option<&str> {
+        self.fields
+            .get(index)
+            .and_then(|field| std::str::from_utf8(field).ok())
+    }
+
+    /// Whether the PID now names a different process than the observed
+    /// identity (`start` is the kernel start tick, field 22).
+    fn reused(&self, start: Option<u64>) -> bool {
+        let observed = self.field(19).and_then(|start| start.parse::<u64>().ok());
+        start
+            .zip(observed)
+            .is_some_and(|(expected, observed)| expected != observed)
+    }
+
+    fn exited(&self) -> bool {
+        matches!(self.field(0), Some("Z" | "X"))
+    }
+
+    fn exiting(&self) -> bool {
+        self.field(6)
+            .and_then(|flags| flags.parse::<u64>().ok())
+            .is_some_and(|flags| flags & PF_EXITING != 0)
+    }
+
+    fn status_line(&self, key: &str) -> Option<&str> {
+        self.status?
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map(str::trim)
+    }
+
+    /// Whether a SIGKILL is queued, `None` when status is unreadable.
+    /// SIGKILL is signal 9, bit 8 of the hex masks; the thread-private and
+    /// shared (process-wide) pending sets both count. A group KILL queues
+    /// on every thread's private set until the thread acts on it, which an
+    /// uninterruptible kernel operation postpones.
+    fn sigkill(&self) -> Option<bool> {
+        let pending = |key: &str| {
+            self.status_line(key)
+                .and_then(|mask| u64::from_str_radix(mask, 16).ok())
+        };
+        let (private, shared) = (pending("SigPnd:")?, pending("ShdPnd:")?);
+        Some((private | shared) & (1 << 8) != 0)
+    }
+}
+
+/// What a fresh procfs read says about a member the KILL phase still saw
+/// live.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fate {
+    /// Gone, a zombie, or its PID now names another process.
+    Dead,
+    /// Not yet a zombie, but a KILL is queued or the task is already in
+    /// `do_exit`, so it is expected to die once the kernel finishes its
+    /// current operation. Evidence for waiting, never for certifying: the
+    /// walks still have to see it gone.
+    Dying,
+    /// Nothing proves it will die: it may never have received the KILL
+    /// (for example a setuid member this user may not signal), or its
+    /// state could not be read.
+    Live,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn survivor_fate(pid: u32, start: Option<u64>) -> Fate {
+    #[cfg(test)]
+    if let Some(fate) = KILL_DYING_FATES.with(|fates| fates.borrow_mut().pop_front()) {
+        return fate;
+    }
+    let stat = match read_proc_stat(Path::new(&format!("/proc/{pid}/stat"))) {
+        Ok(stat) => stat,
+        Err(error) if proc_process_vanished(&error) => return Fate::Dead,
+        Err(_) => return Fate::Live,
+    };
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok();
+    fate_from(start, &stat, status.as_deref())
+}
+
+/// Classify one survivor. Unreadable or unparsable evidence is `Live`:
+/// only positive proof of death or of a queued KILL may extend cleanup.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn fate_from(start: Option<u64>, stat: &[u8], status: Option<&str>) -> Fate {
+    let evidence = ProcEvidence::parse(stat, status);
+    if evidence.fields.is_empty() {
+        Fate::Live
+    } else if evidence.reused(start) || evidence.exited() {
+        Fate::Dead
+    } else if evidence.exiting() || evidence.sigkill() == Some(true) {
+        Fate::Dying
+    } else {
+        Fate::Live
+    }
+}
+
+/// Render the procfs evidence for one survivor. Every field answers one
+/// question about why SIGKILL did not finish it: `uid` (real, effective,
+/// saved) whether this user may signal it at all, `sigkill=pending` whether
+/// a KILL is queued but not yet acted on, `exiting` whether it is already
+/// tearing down, `state`/`wchan` where it is blocked, and `comm`/`cwd` what
+/// it is. Unparsable input degrades to `?` fields rather than hiding the
+/// survivor.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn format_survivor(
+    pid: u32,
+    start: Option<u64>,
+    stat: &[u8],
+    status: Option<&str>,
+    wchan: Option<&str>,
+    cwd: Option<&Path>,
+) -> String {
+    let evidence = ProcEvidence::parse(stat, status);
+    if evidence.reused(start) {
+        return format!("{pid}: reused");
+    }
+    let field = |index: usize| evidence.field(index).unwrap_or("?");
+    let comm = stat
+        .iter()
+        .position(|byte| *byte == b'(')
+        .zip(stat.windows(2).rposition(|part| part == b") "))
+        .filter(|(open, close)| open < close)
+        .map_or_else(
+            || "?".to_owned(),
+            |(open, close)| String::from_utf8_lossy(&stat[open + 1..close]).into_owned(),
+        );
+    let uid = evidence.status_line("Uid:").map_or_else(
+        || "?".to_owned(),
+        |uids| {
+            uids.split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
+    let sigkill = match evidence.sigkill() {
+        Some(true) => "pending",
+        Some(false) => "none",
+        None => "?",
+    };
+    let mut detail = format!(
+        "{pid}: state={}{} sigkill={sigkill} uid={uid} ppid={} pgid={} sid={} threads={}",
+        field(0),
+        if evidence.exiting() { " exiting" } else { "" },
+        field(1),
+        field(2),
+        field(3),
+        field(17),
+    );
+    // `0` (or nothing) means the task is running or the kernel hides the
+    // symbol; only a real wait channel says something.
+    if let Some(wchan) = wchan
+        .map(str::trim)
+        .filter(|wchan| !wchan.is_empty() && *wchan != "0")
+    {
+        detail.push_str(&format!(" wchan={wchan}"));
+    }
+    detail.push_str(&format!(" comm={}", comm.escape_debug()));
+    // Unreadable for a task this user may not inspect (another UID) or one
+    // whose filesystem state is already released on exit.
+    if let Some(cwd) = cwd {
+        detail.push_str(&format!(
+            " cwd=\"{}\"",
+            cwd.to_string_lossy().escape_debug()
+        ));
+    }
+    detail
 }
 
 /// TERM grace, then KILL escalation, then reap — mirroring
@@ -10111,10 +10497,11 @@ for _ in range(300):
         let result = supervise_session(command, None, |_| Ok(())).unwrap();
         let elapsed = started.elapsed();
         sender.join().unwrap();
-        // Teardown takes at most about 20s even with late walks (1s TERM
+        // Teardown takes at most about 40s even with late walks (1s TERM
         // grace, about 1.5s hard phase, then up to three late walks, each
-        // starting within the 5s budget), so 60s leaves room for a loaded
-        // host while waiting out the 300s fixture still fails.
+        // starting within the 5s budget, and the 10s dying grace plus at most
+        // two such walks), so 60s leaves room for a loaded host while waiting
+        // out the 300s fixture still fails.
         assert!(
             elapsed < Duration::from_secs(60),
             "cancelled supervision took {elapsed:?}"
@@ -11792,6 +12179,57 @@ os._exit(1)
     fn stop_starved_session(
         late_walks: &[Option<bool>],
     ) -> (std::io::Result<std::process::ExitStatus>, u32) {
+        let (result, pid, _) = stop_starved_session_with_fates(late_walks, true, &[], None);
+        (result, pid)
+    }
+
+    // Stops a starved session (see `stop_starved_session`) with `fates`
+    // replacing the dying grace's procfs reads, requiring every one read.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stop_starved_session_reading(
+        late_walks: &[Option<bool>],
+        fates: &[Fate],
+    ) -> (std::io::Result<std::process::ExitStatus>, u32) {
+        let (result, pid, unused) = stop_starved_session_with_fates(late_walks, true, fates, None);
+        assert!(unused.is_empty(), "the dying grace never read {unused:?}");
+        (result, pid)
+    }
+
+    // As `stop_starved_session`, with `fates` replacing the dying grace's
+    // procfs reads (real reads resume once they run out) and `grace`
+    // shortening its cap. Also returns the fates left unread.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stop_starved_session_with_fates(
+        late_walks: &[Option<bool>],
+        walks_must_run: bool,
+        fates: &[Fate],
+        grace: Option<Duration>,
+    ) -> (std::io::Result<std::process::ExitStatus>, u32, Vec<Fate>) {
+        KILL_DYING_FATES.with(|queue| *queue.borrow_mut() = fates.iter().copied().collect());
+        KILL_DYING_GRACE_OVERRIDE.with(|cell| cell.set(grace));
+        let (result, pid) = stop_starved_session_inner(late_walks, walks_must_run);
+        let unused = KILL_DYING_FATES.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
+        KILL_DYING_GRACE_OVERRIDE.with(|cell| cell.set(None));
+        (result, pid, unused.into())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn stop_starved_session_with_fates(
+        late_walks: &[Option<bool>],
+        walks_must_run: bool,
+        _fates: &[()],
+        _grace: Option<Duration>,
+    ) -> (std::io::Result<std::process::ExitStatus>, u32, Vec<()>) {
+        let (result, pid) = stop_starved_session_inner(late_walks, walks_must_run);
+        (result, pid, Vec::new())
+    }
+
+    // `walks_must_run`: every replaced walk must actually run (false when a
+    // test queues more walks than the phase may take, to prove it stops).
+    fn stop_starved_session_inner(
+        late_walks: &[Option<bool>],
+        walks_must_run: bool,
+    ) -> (std::io::Result<std::process::ExitStatus>, u32) {
         let mut command = Command::new("sh");
         command.args(["-c", "trap '' TERM; exec sleep 30"]);
         command
@@ -11801,6 +12239,19 @@ os._exit(1)
         isolate(&mut command);
         let mut child = command.spawn().unwrap();
         let pid = child.id();
+        // Stop only once the TERM trap is in place (the exec'd sleep
+        // inherits the ignored disposition); an early TERM would kill the
+        // leader before the KILL phase and leave nothing to verify there.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .is_ok_and(|comm| comm.trim() != "sleep")
+            {
+                assert!(Instant::now() < deadline, "fixture never exec'd sleep");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         // Register the leader as production sessions do. While this session
         // stalls, its KILLed leader is an unreaped zombie child of the test
         // process; an unregistered one could be reaped by any concurrent
@@ -11822,7 +12273,10 @@ os._exit(1)
 
         let unused = KILL_PHASE_OBSERVATIONS.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
         assert!(stalled, "the starvation stall never ran");
-        assert!(unused.is_empty(), "late walks never consumed {unused:?}");
+        assert!(
+            !walks_must_run || unused.is_empty(),
+            "late walks never consumed {unused:?}"
+        );
         if result.is_err() {
             let _ = child.kill();
             let _ = child.wait();
@@ -11850,9 +12304,28 @@ os._exit(1)
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn late_walks_stop_at_the_cap_and_report_incomplete_cleanup() {
-        // A member still seen live after every late attempt is a survivor:
-        // the phase ends at the cap and fails closed.
+        // A member still seen live after every late attempt, with nothing
+        // proving it will die, is a survivor: the phase ends at the cap and
+        // fails closed without spending the dying grace.
+        let walks = vec![Some(false); KILL_VERIFY_LATE_ATTEMPTS as usize];
+        let (result, _) = stop_starved_session_reading(&walks, &[Fate::Live]);
+
+        let error = result.expect_err("a member live on every late walk still certified cleanup");
+        assert!(
+            error
+                .to_string()
+                .contains("survived bounded SIGKILL cleanup"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn late_walks_stop_at_the_cap_and_report_incomplete_cleanup() {
+        // Portable builds cannot tell a dying member from a live one, so a
+        // member still seen live after every late attempt fails closed.
         let walks = vec![Some(false); KILL_VERIFY_LATE_ATTEMPTS as usize];
         let (result, _) = stop_starved_session(&walks);
 
@@ -11860,6 +12333,215 @@ os._exit(1)
             result.is_err(),
             "a member live on every late walk still certified cleanup"
         );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn late_walks_wait_out_a_member_the_kernel_is_still_killing() {
+        // The late walks keep seeing a member that has a KILL queued but is
+        // still inside an uninterruptible operation (a long fsync, a btrfs
+        // lock). Reporting it fails a session that is about to be clean, so
+        // the phase waits for it to die and then proves the session empty.
+        let walks = vec![Some(false); KILL_VERIFY_LATE_ATTEMPTS as usize];
+        let (result, pid) =
+            stop_starved_session_reading(&walks, &[Fate::Dying, Fate::Dying, Fate::Dead]);
+
+        result.expect("a member that was still dying was reported as a survivor");
+        // SAFETY: signal zero only probes the reaped fixture PID.
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn dying_grace_ends_when_any_survivor_is_not_dying() {
+        // A member first seen dying, then without a queued KILL (a new
+        // identity, or one this user may not signal), ends the grace at
+        // once instead of waiting it out.
+        let walks = vec![Some(false); KILL_VERIFY_LATE_ATTEMPTS as usize];
+        let (result, _) = stop_starved_session_reading(&walks, &[Fate::Dying, Fate::Live]);
+
+        assert!(
+            result.is_err(),
+            "a member that is not dying certified cleanup"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn dying_grace_is_bounded() {
+        // A member dying for longer than the grace (stuck for good in the
+        // kernel) is reported once the grace runs out.
+        let walks = vec![Some(false); KILL_VERIFY_LATE_ATTEMPTS as usize];
+        // Stay dying for every procfs read the shortened grace can make.
+        let fates = vec![Fate::Dying; 10_000];
+        let (result, _, unused) =
+            stop_starved_session_with_fates(&walks, true, &fates, Some(Duration::from_millis(100)));
+        assert!(
+            unused.len() < fates.len(),
+            "the dying grace never read a fate"
+        );
+
+        let error = result.expect_err("a member dying past the grace certified cleanup");
+        assert!(
+            error
+                .to_string()
+                .contains("survived bounded SIGKILL cleanup"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn dying_grace_deadline_gates_each_walk() {
+        // No live member: an empty last walk only needs its confirming walk,
+        // but a walk that was not empty has nothing to wait for and stops.
+        let sessions = [Session::new(u32::MAX)];
+        let mut until = None;
+        assert!(dying_grace_deadline(&sessions, Some(true), &mut until).is_some());
+        let started = until.expect("the first call starts the grace");
+        assert!(dying_grace_deadline(&sessions, Some(false), &mut until).is_none());
+        assert!(dying_grace_deadline(&sessions, None, &mut until).is_none());
+        assert_eq!(until, Some(started), "the grace was renewed");
+
+        // Past the end only a proof one empty walk short gets its walk.
+        let mut until = Some(Instant::now());
+        assert!(dying_grace_deadline(&sessions, Some(true), &mut until).is_some());
+        assert!(dying_grace_deadline(&sessions, Some(false), &mut until).is_none());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn dying_grace_is_bounded_across_walks() {
+        // Members that die between walks, while every walk still sees one
+        // live (a churning session), must not renew the grace: the phase
+        // stops once it runs out, with walks still queued.
+        let walks = vec![Some(false); 100_000];
+        let fates = vec![Fate::Dead; 100_000];
+        // More walks than the phase may take: some must stay unrun.
+        let (result, _, unused) = stop_starved_session_with_fates(
+            &walks,
+            false,
+            &fates,
+            Some(Duration::from_millis(100)),
+        );
+
+        assert!(
+            unused.len() < fates.len(),
+            "the dying grace never read a fate"
+        );
+        assert!(
+            result.is_err(),
+            "a session never seen empty certified cleanup"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn dying_grace_is_not_spent_after_a_refused_walk() {
+        // A refused final walk is no evidence that the session is empty or
+        // dying; the phase stops at the cap without reading any fate.
+        let mut walks = vec![Some(false); KILL_VERIFY_LATE_ATTEMPTS as usize - 1];
+        walks.push(None);
+        let (result, _) = stop_starved_session_reading(&walks, &[]);
+
+        assert!(result.is_err(), "a refused final walk certified cleanup");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn dying_grace_finishes_a_proof_left_one_walk_short() {
+        // The member died during the late walks, but the last one was the
+        // first empty walk: the proof needs one more walk, not a report of
+        // a session that is already clean.
+        let mut walks = vec![Some(false); KILL_VERIFY_LATE_ATTEMPTS as usize - 1];
+        walks.push(Some(true));
+        let (result, _) = stop_starved_session_reading(&walks, &[]);
+
+        result.expect("a proof one empty walk short was reported as incomplete");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn fate_reads_dying_from_a_queued_kill_or_exit() {
+        let stat = |state: &str, flags: u64, start: u64| {
+            format!("7 (x) {state} 1 7 7 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0 0")
+        };
+        let status = |private: &str, shared: &str| {
+            format!("Uid:\t1\t1\t1\t1\nSigPnd:\t{private}\nShdPnd:\t{shared}\n")
+        };
+        let none = status("0000000000000000", "0000000000000000");
+        let queued = status("0000000000000100", "0000000000000000");
+        let shared = status("0000000000000000", "0000000000000100");
+        let term = status("0000000000004000", "0000000000004000");
+        // A queued KILL on either set, or a task already exiting, is dying.
+        assert_eq!(
+            fate_from(Some(5), stat("D", 0x400100, 5).as_bytes(), Some(&queued)),
+            Fate::Dying
+        );
+        assert_eq!(
+            fate_from(Some(5), stat("R", 0x400100, 5).as_bytes(), Some(&shared)),
+            Fate::Dying
+        );
+        assert_eq!(
+            fate_from(Some(5), stat("D", 0x400104, 5).as_bytes(), Some(&none)),
+            Fate::Dying
+        );
+        assert_eq!(
+            fate_from(Some(5), stat("D", 0x400104, 5).as_bytes(), None),
+            Fate::Dying
+        );
+        // Zombies, dead rows, and recycled PIDs are dead.
+        assert_eq!(
+            fate_from(Some(5), stat("Z", 0x400104, 5).as_bytes(), Some(&none)),
+            Fate::Dead
+        );
+        assert_eq!(
+            fate_from(Some(5), stat("X", 0, 5).as_bytes(), None),
+            Fate::Dead
+        );
+        assert_eq!(
+            fate_from(Some(5), stat("S", 0x400100, 6).as_bytes(), Some(&queued)),
+            Fate::Dead
+        );
+        // No queued KILL (only TERM), unreadable status, or an unparsable
+        // row prove nothing: live.
+        assert_eq!(
+            fate_from(Some(5), stat("S", 0x400100, 5).as_bytes(), Some(&term)),
+            Fate::Live
+        );
+        assert_eq!(
+            fate_from(Some(5), stat("D", 0x400100, 5).as_bytes(), None),
+            Fate::Live
+        );
+        assert_eq!(fate_from(Some(5), b"7 (x", Some(&queued)), Fate::Live);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fate_reads_a_real_process_through_its_life() {
+        let mut command = Command::new("sleep");
+        command.arg("30").stdin(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        // Keep a concurrent test's adopted-zombie sweep from reaping the
+        // killed fixture before `wait` below.
+        let _registration = StatusChildRegistration::new(pid);
+        let start = linux_process_info(pid)
+            .expect("fixture process identity")
+            .identity
+            .start;
+
+        assert_eq!(survivor_fate(pid, start), Fate::Live);
+        child.kill().unwrap();
+        // SIGKILL acts at once on a sleeping task, so it becomes a zombie
+        // (dead) without ever being observed dying; the reaped PID is dead.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while survivor_fate(pid, start) != Fate::Dead {
+            assert!(Instant::now() < deadline, "killed fixture never died");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        child.wait().unwrap();
+        assert_eq!(survivor_fate(pid, start), Fate::Dead);
     }
 
     #[test]
@@ -12418,10 +13100,11 @@ os._exit(1)
             .stderr(Stdio::null());
         let started = Instant::now();
         let grouped_end = supervise_session(grouped, None, |_| Ok(())).unwrap();
-        // Teardown takes at most about 20s even with late walks (1s TERM
+        // Teardown takes at most about 40s even with late walks (1s TERM
         // grace, about 1.5s hard phase, then up to three late walks, each
-        // starting within the 5s budget), so 60s leaves room for a loaded
-        // host while waiting out the 300s fixture still fails.
+        // starting within the 5s budget, and the 10s dying grace plus at most
+        // two such walks), so 60s leaves room for a loaded host while waiting
+        // out the 300s fixture still fails.
         assert!(
             started.elapsed() < Duration::from_secs(60),
             "supervisor took {:?} to kill the TERM-ignoring descendant",
@@ -12980,10 +13663,11 @@ os._exit(0)
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
-        // Teardown takes at most about 20s even with late walks (1s TERM
+        // Teardown takes at most about 40s even with late walks (1s TERM
         // grace, about 1.5s hard phase, then up to three late walks, each
-        // starting within the 5s budget), so 60s leaves room for a loaded
-        // host while waiting out the 300s fixture still fails.
+        // starting within the 5s budget, and the 10s dying grace plus at most
+        // two such walks), so 60s leaves room for a loaded host while waiting
+        // out the 300s fixture still fails.
         assert!(
             elapsed < Duration::from_secs(60),
             "supervisor took {elapsed:?} to reap the TERM-ignoring leader"
@@ -14100,6 +14784,115 @@ int kill(pid_t pid, int sig) {
         );
         plain.note_survivors();
         assert!(plain.error.is_some());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn survivor_detail_names_why_kill_did_not_finish() {
+        // A setuid member that kept root as its real UID, already inside
+        // do_exit (flags 0x400104 carry PF_EXITING) with a KILL queued on the
+        // shared set, blocked on a filesystem wait. Comm holds `) ` so the
+        // parser must split at the last one.
+        let stat = b"77 (su) do) D 1 70 70 0 -1 4194564 0 0 0 0 0 0 0 0 20 0 3 0 4242 0 0";
+        let status = "Name:\tsu) do\nUid:\t0\t0\t0\t0\nSigPnd:\t0000000000000000\n\
+                      ShdPnd:\t0000000000000100\n";
+        assert_eq!(
+            format_survivor(
+                77,
+                Some(4242),
+                stat,
+                Some(status),
+                Some("fuse_wait\n"),
+                Some(Path::new("/tmp/suite.tmp/x (deleted)")),
+            ),
+            "77: state=D exiting sigkill=pending uid=0,0,0 ppid=1 pgid=70 sid=70 threads=3 \
+             wchan=fuse_wait comm=su) do cwd=\"/tmp/suite.tmp/x (deleted)\"",
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn survivor_detail_degrades_without_status_or_command() {
+        // A live task with no KILL queued, unreadable status, a hidden wait
+        // channel, and an unreadable cwd (another UID, or released on exit).
+        let stat = b"78 (sleep) S 1 70 70 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 4242 0 0";
+        assert_eq!(
+            format_survivor(78, None, stat, None, Some("0"), None),
+            "78: state=S sigkill=? uid=? ppid=1 pgid=70 sid=70 threads=1 comm=sleep",
+        );
+        let status = "Uid:\t1000\t1000\t1000\t1000\nSigPnd:\t0\nShdPnd:\t0\n";
+        assert!(
+            format_survivor(78, None, stat, Some(status), None, None)
+                .contains(" sigkill=none uid=1000,1000,1000 "),
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn survivor_detail_reports_a_recycled_pid_as_reused() {
+        let stat = b"79 (sh) S 1 79 79 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 5000 0 0";
+        assert_eq!(
+            format_survivor(79, Some(4242), stat, None, None, None),
+            "79: reused"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn survivor_error_carries_fresh_procfs_detail() {
+        let scope = dot_test_support::TempDir::new("survivor-detail").unwrap();
+        let cwd = std::fs::canonicalize(scope.path()).unwrap();
+        let mut command = Command::new("sleep");
+        command.arg("30").current_dir(&cwd).stdin(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        // Keep a concurrent test's adopted-zombie sweep from reaping the
+        // killed fixture before `wait` below.
+        let _registration = StatusChildRegistration::new(pid);
+        // The fork runs this test binary until exec; wait for the sleep image
+        // so comm is the fixture's, not ours.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let process = loop {
+            let process = linux_process_info(pid).expect("fixture process identity");
+            if survivor_detail(pid, process.identity.start).contains(" comm=sleep") {
+                break process;
+            }
+            assert!(Instant::now() < deadline, "fixture never exec'd sleep");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let mut session = Session::new(pid);
+        session.current.insert(pid, process.clone());
+
+        session.note_survivors();
+
+        let message = session
+            .error
+            .expect("live member must fail cleanup")
+            .to_string();
+        // SAFETY: getuid takes no arguments and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        assert!(
+            message.contains(&format!("current=[{pid}] retained=[]); {pid}: state=")),
+            "{message}"
+        );
+        assert!(message.contains(" sigkill=none "), "{message}");
+        assert!(
+            message.contains(&format!(" uid={uid},{uid},{uid} ")),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(&format!(" comm=sleep cwd=\"{}\"", cwd.display())),
+            "{message}"
+        );
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // A reaped PID is gone, or already names an unrelated process.
+        let after = survivor_detail(pid, process.identity.start);
+        assert!(
+            after == format!("{pid}: gone") || after == format!("{pid}: reused"),
+            "{after}"
+        );
     }
 
     #[test]
