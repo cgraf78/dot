@@ -5065,15 +5065,19 @@ fn update_native_merge_hook_runs_with_a_large_job_limit() {
 #[test]
 fn update_native_verbose_merge_replays_hook_output_in_declaration_order() {
     // A missing stage update or replay would make the quiet happy-path pass
-    // while losing the human-visible hook result contract.
+    // while losing the human-visible hook result contract. Alpha waits for
+    // beta and beta for gamma, which only starts once alpha frees one of the
+    // two workers, so the cross-hook waits are bounded at 3000 x 10ms (30s):
+    // far past CI scheduling delays, still finite, and never the check
+    // itself (the ordering assertions below are).
     let hooks: &[(&str, &[u8])] = &[
         (
             "10-alpha.sh",
-            b"merge() { i=0; while [[ ! -e $HOME/beta-ready ]]; do (( i += 1 )); (( i < 200 )) || return 9; sleep 0.01; done; printf 'Alpha result\\nalpha detail\\n'; printf alpha >\"$HOME/alpha-done\"; }\n",
+            b"merge() { i=0; while [[ ! -e $HOME/beta-ready ]]; do (( i += 1 )); (( i < 3000 )) || return 9; sleep 0.01; done; printf 'Alpha result\\nalpha detail\\n'; printf alpha >\"$HOME/alpha-done\"; }\n",
         ),
         (
             "11-beta.sh",
-            b"merge() { printf ready >\"$HOME/beta-ready\"; i=0; while [[ ! -e $HOME/gamma-ready ]]; do (( i += 1 )); (( i < 200 )) || return 9; sleep 0.01; done; printf 'Beta result\\nbeta detail\\n'; printf beta >\"$HOME/beta-done\"; }\n",
+            b"merge() { printf ready >\"$HOME/beta-ready\"; i=0; while [[ ! -e $HOME/gamma-ready ]]; do (( i += 1 )); (( i < 3000 )) || return 9; sleep 0.01; done; printf 'Beta result\\nbeta detail\\n'; printf beta >\"$HOME/beta-done\"; }\n",
         ),
         (
             "12-gamma.sh",
