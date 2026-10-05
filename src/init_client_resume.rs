@@ -326,11 +326,26 @@ fn git_bool(value: Option<&[u8]>) -> Option<bool> {
 /// called (Git refuses that branch name); it is rejected here as
 /// `symbolic-ref` used to fail. An unborn branch fails the whole call, as
 /// its `rev-parse HEAD` did.
+///
+/// A ref that makes the bare name `HEAD` ambiguous (`refs/heads/HEAD`,
+/// `refs/tags/HEAD`, which `update-ref` or a `push origin HEAD:HEAD` slip
+/// can create) makes `--abbrev-ref` print only an "ambiguous" warning and
+/// no branch line while still exiting 0, so every command would read the
+/// client as foreign. `HEAD` itself always resolves to `$GIT_DIR/HEAD`
+/// first, so silencing that warning (`core.warnAmbiguousRefs=false`)
+/// restores the line `symbolic-ref --short` used to print.
 fn head_commit_and_branch(git_dir: &Path, home: &Path) -> Option<(Vec<u8>, Vec<u8>)> {
     let output = git_dir_output(
         git_dir,
         home,
-        &["rev-parse", "HEAD", "--abbrev-ref=loose", "HEAD"],
+        &[
+            "-c",
+            "core.warnAmbiguousRefs=false",
+            "rev-parse",
+            "HEAD",
+            "--abbrev-ref=loose",
+            "HEAD",
+        ],
     )?;
     let output = chomp(output);
     let mut lines = output.split(|byte| *byte == b'\n');
