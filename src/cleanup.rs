@@ -7041,7 +7041,9 @@ fn stop_sessions_with_tick(
     // it (draining its output through `tick`), not time spent walking the
     // process table. Slow walks are refunded to the deadline, capped at one
     // extra grace, and the next walk waits as long as the slow one took, so
-    // within that cap drain-only rounds get at least half of the time.
+    // within that cap drain-only rounds get (W - 50ms) / (2W - 50ms) of the
+    // time around a walk of W, just under half for slow walks. Walks of a
+    // second or more exhaust the cap quickly and can still starve a handler.
     // An uncatchable first signal (the drop path's KILL) has no handler to
     // service, so its grace is never extended.
     let grace_cap = if first_signal == libc::SIGKILL || first_signal == libc::SIGSTOP {
@@ -7060,12 +7062,30 @@ fn stop_sessions_with_tick(
         .map(|session| session.signal_before_observation(first_signal))
         .collect::<Vec<_>>();
     let walk_started = Instant::now();
-    let _ = observe_sessions(&mut sessions, graceful_deadline);
     #[cfg(test)]
-    GRACE_DISCOVERY_WALK.with(|walk| walk.set(Some(walk_started.elapsed())));
-    let (refunded_deadline, mut next_walk) =
+    if let Some(delay) = GRACE_DISCOVERY_DELAY.with(std::cell::Cell::take) {
+        std::thread::sleep(delay);
+    }
+    let discovery = observe_sessions(&mut sessions, graceful_deadline);
+    #[cfg(test)]
+    {
+        GRACE_DISCOVERY_WALK.with(|walk| walk.set(Some(walk_started.elapsed())));
+        GRACE_DISCOVERY_ENDED.with(|ended| ended.set(Some(Instant::now())));
+    }
+    let (refunded_deadline, drain_gap) =
         grace_after_walk(graceful_deadline, grace_cap, walk_started.elapsed());
     graceful_deadline = refunded_deadline;
+    // The discovery walk's drain gap only serves members it found alive and
+    // signaled. If it saw the session empty, the remaining work is proof; if
+    // it was refused or failed, members may still be unsignaled. Either way
+    // walk at once instead of draining a handler that may not exist.
+    let mut next_walk = if discovery == Some(false) {
+        drain_gap
+    } else {
+        Instant::now()
+    };
+    #[cfg(test)]
+    GRACE_DEADLINE_AFTER_DISCOVERY.with(|slot| slot.set(Some(graceful_deadline)));
     for (session, delivery) in sessions.iter_mut().zip(initial_deliveries) {
         session.finish_initial_delivery(first_signal, delivery);
     }
@@ -7075,19 +7095,37 @@ fn stop_sessions_with_tick(
     // snapshot starved past the grace deadline. Giving up with zero
     // graceful rounds would KILL a session that was never signaled
     // (a late child observed only in the hard phase dies uncatchably
-    // instead of trapping). The hard phase still requires its own
-    // two empties below, so a late round only ever adds delivery,
-    // never weakens verification.
-    let mut first_round = true;
-    while first_round || Instant::now() < graceful_deadline {
-        // After a slow walk, rounds only drain until the walk's cost has
-        // been matched; skipping a walk delays discovery of a new member
-        // but never weakens the empty proof, which still needs walks.
-        let walk = first_round || Instant::now() >= next_walk;
-        first_round = false;
+    // instead of trapping). A forced round runs after the grace deadline,
+    // so it walks with a deadline that is still live: a snapshot refuses
+    // to start once its deadline has passed, and a refused walk would
+    // observe and signal nothing. The hard phase still requires its own
+    // two empties below, so a late round only ever adds delivery, never
+    // weakens verification.
+    let mut walked = false;
+    while !walked || Instant::now() < graceful_deadline {
+        // After a slow walk, including the discovery walk, rounds only
+        // drain until the walk's cost has been matched; skipping a walk
+        // delays discovery of a new member but never weakens the empty
+        // proof, which still needs walks. The guaranteed round is forced
+        // only once the grace has run out without one.
+        let now = Instant::now();
+        let walk = now >= next_walk || (!walked && now >= graceful_deadline);
         if walk {
+            walked = true;
             let walk_started = Instant::now();
-            let observed = graceful_observe(&mut sessions, graceful_deadline);
+            // Only the forced round starts after the grace deadline; give it
+            // a live deadline. Ordinary rounds keep the grace deadline.
+            let walk_deadline = if walk_started >= graceful_deadline {
+                walk_started + Duration::from_millis(GRACE_INTERVAL_MS)
+            } else {
+                graceful_deadline
+            };
+            let observed = graceful_observe(&mut sessions, walk_deadline);
+            #[cfg(test)]
+            {
+                GRACE_WALK_RESULTS.with(|results| results.borrow_mut().push(observed));
+                GRACE_WALK_COSTS.with(|costs| costs.borrow_mut().push(walk_started.elapsed()));
+            }
             (graceful_deadline, next_walk) =
                 grace_after_walk(graceful_deadline, grace_cap, walk_started.elapsed());
             if sessions_stably_empty(observed, &mut consecutive_empty) {
@@ -7105,6 +7143,7 @@ fn stop_sessions_with_tick(
                     break;
                 }
             }
+            next_walk = drain_gap_end(next_walk, consecutive_empty);
             for session in &mut sessions {
                 // New members receive one exact signal through retained
                 // authority. A group-wide retry is reserved for a newly
@@ -7117,6 +7156,8 @@ fn stop_sessions_with_tick(
         // busy host can dominate the loop; one small drain per scan can make
         // a cooperative TERM handler hit the grace deadline merely because
         // it is flushing its final diagnostics.
+        #[cfg(test)]
+        let drain_started = Instant::now();
         for _ in 0..4 {
             let next_tick = tick();
             if tick_result.is_ok() {
@@ -7124,6 +7165,8 @@ fn stop_sessions_with_tick(
             }
         }
         std::thread::sleep(Duration::from_millis(20));
+        #[cfg(test)]
+        GRACE_DRAIN_TIME.with(|time| time.set(time.get() + drain_started.elapsed()));
     }
     // A refunded grace delays the KILL phase by the same amount; shift its
     // window too so certification keeps its budget (at most one extra grace).
@@ -7336,8 +7379,10 @@ fn grace_duration() -> Duration {
 /// drain a TERM handler's output, so it is refunded to the deadline, never
 /// past `cap` (one extra grace), and the next walk waits that long so the
 /// handler gets drain-only rounds in between. Teardown stays bounded: the
-/// graceful phase ends by `cap` plus one walk already in progress. A `cap`
-/// at the deadline disables both (nothing to service).
+/// graceful phase ends by `cap` plus one walk already in progress, or, when
+/// the discovery walk itself ran past `cap`, by the end of that walk plus the
+/// one forced round. A `cap` at the deadline disables both (nothing to
+/// service).
 fn grace_after_walk(deadline: Instant, cap: Instant, spent: Duration) -> (Instant, Instant) {
     if cap <= deadline {
         return (deadline, Instant::now());
@@ -7346,8 +7391,23 @@ fn grace_after_walk(deadline: Instant, cap: Instant, spent: Duration) -> (Instan
     ((deadline + excess).min(cap), Instant::now() + excess)
 }
 
+/// When the next graceful walk may start, given `next_walk` from
+/// `grace_after_walk` and the current run of empty observations. A drain gap
+/// only helps a handler that is still running; once a walk has seen the
+/// session empty, the remaining work is proof, so the next walk is not
+/// delayed.
+fn drain_gap_end(next_walk: Instant, consecutive_empty: u8) -> Instant {
+    if consecutive_empty > 0 {
+        next_walk.min(Instant::now())
+    } else {
+        next_walk
+    }
+}
+
 /// One graceful-phase process-table walk.
 fn graceful_observe(sessions: &mut [Session], deadline: Instant) -> Option<bool> {
+    #[cfg(test)]
+    GRACE_WALK_STARTS.with(|starts| starts.borrow_mut().push(Instant::now()));
     #[cfg(test)]
     if let Some(cost) = GRACE_CANNED_WALKS.with(|walks| walks.borrow_mut().pop_front()) {
         std::thread::sleep(cost);
@@ -7367,6 +7427,60 @@ thread_local! {
     // How long this thread's last initial (real) discovery walk took.
     static GRACE_DISCOVERY_WALK: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
+    // Extra time added to the next discovery walk, standing in for a loaded
+    // host whose first walk is slow; the walk itself stays real.
+    static GRACE_DISCOVERY_DELAY: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+    // The grace deadline after this thread's last discovery walk's refund.
+    static GRACE_DEADLINE_AFTER_DISCOVERY: std::cell::Cell<Option<Instant>> =
+        const { std::cell::Cell::new(None) };
+    // When this thread's last discovery walk ended.
+    static GRACE_DISCOVERY_ENDED: std::cell::Cell<Option<Instant>> =
+        const { std::cell::Cell::new(None) };
+    // When each graceful-loop walk on this thread started.
+    static GRACE_WALK_STARTS: std::cell::RefCell<Vec<Instant>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    // What each graceful-loop walk on this thread observed.
+    static GRACE_WALK_RESULTS: std::cell::RefCell<Vec<Option<bool>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    // How long each graceful-loop walk on this thread took.
+    static GRACE_WALK_COSTS: std::cell::RefCell<Vec<Duration>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    // Time this thread's graceful loops spent in drain rounds.
+    static GRACE_DRAIN_TIME: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// Clears every graceful-loop test seam on this thread when dropped, so a
+/// failing test cannot leak queued walks or growing records into the next.
+#[cfg(test)]
+struct ResetGraceSeams;
+
+#[cfg(test)]
+impl ResetGraceSeams {
+    fn begin() -> Self {
+        Self::clear();
+        Self
+    }
+
+    fn clear() {
+        GRACE_CANNED_WALKS.with(|walks| walks.borrow_mut().clear());
+        GRACE_DISCOVERY_WALK.with(|walk| walk.set(None));
+        GRACE_DISCOVERY_DELAY.with(|delay| delay.set(None));
+        GRACE_DEADLINE_AFTER_DISCOVERY.with(|slot| slot.set(None));
+        GRACE_DISCOVERY_ENDED.with(|ended| ended.set(None));
+        GRACE_WALK_STARTS.with(|starts| starts.borrow_mut().clear());
+        GRACE_WALK_RESULTS.with(|results| results.borrow_mut().clear());
+        GRACE_WALK_COSTS.with(|costs| costs.borrow_mut().clear());
+        GRACE_DRAIN_TIME.with(|time| time.set(Duration::ZERO));
+    }
+}
+
+#[cfg(test)]
+impl Drop for ResetGraceSeams {
+    fn drop(&mut self) {
+        Self::clear();
+    }
 }
 
 /// Upper bound on post-KILL verification walks started after the shared
@@ -13343,16 +13457,10 @@ int kill(pid_t pid, int sig) {
         // through a socket; a grace measured in wall time spends it walking,
         // so it got two drain rounds before the settle round and KILL, and
         // died mid-write.
-        struct ResetWalks;
-        impl Drop for ResetWalks {
-            fn drop(&mut self) {
-                GRACE_CANNED_WALKS.with(|walks| walks.borrow_mut().clear());
-            }
-        }
+        let _reset = ResetGraceSeams::begin();
         GRACE_CANNED_WALKS.with(|walks| {
             *walks.borrow_mut() = [Duration::from_millis(600); 2].into_iter().collect();
         });
-        let _reset = ResetWalks;
         let scope = dot_test_support::TempDir::new("supervisor-slow-grace-walks").unwrap();
         let ready = scope.path().join("ready");
         let completed = scope.path().join("completed");
@@ -13392,22 +13500,26 @@ int kill(pid_t pid, int sig) {
         .unwrap();
         let elapsed = started.elapsed();
         let discovery = GRACE_DISCOVERY_WALK.with(std::cell::Cell::get);
+        let drain_window = GRACE_DRAIN_TIME.with(std::cell::Cell::get);
 
         assert!(matches!(result, SessionEnd::Exited(status) if status.success()));
-        // The refund is capped at one extra grace. A real discovery walk
-        // that alone takes a full grace (an extremely oversubscribed host)
-        // exhausts the cap before the canned walks run, leaving no drain-only
-        // window to test; the bounded-teardown check below still applies.
-        if discovery.is_some_and(|walk| walk >= grace_duration()) {
+        // The refund is capped at one extra grace, so the graceful phase
+        // lasts at most two graces. The handler's drain window is the time
+        // the loop actually spent draining it, measured rather than
+        // estimated. On an extremely oversubscribed host whose real
+        // discovery walk eats most of the cap it can be too short to flush
+        // 1.25MB through a socket; the bounded-teardown check below still
+        // applies then.
+        if drain_window < Duration::from_millis(300) {
             eprintln!(
-                "inconclusive: the real discovery walk took {discovery:?}, \
-                 exhausting the refund cap"
+                "inconclusive: the loop drained the handler for only {drain_window:?} \
+                 (discovery walk {discovery:?})"
             );
         } else {
             assert!(
                 completed.exists(),
                 "slow walks consumed the TERM grace: handler killed after {output} bytes \
-                 (discovery walk {discovery:?})"
+                 (discovery walk {discovery:?}, drained for {drain_window:?})"
             );
         }
         // Bounded: one refunded grace plus the walks and KILL window, far
@@ -13416,6 +13528,180 @@ int kill(pid_t pid, int sig) {
             elapsed < Duration::from_secs(15),
             "teardown with slow walks took {elapsed:?}"
         );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn slow_discovery_walk_is_followed_by_drain_only_rounds() {
+        // A slow discovery walk leaves a TERM handler as starved as a slow
+        // loop walk does, so the first graceful walk must also wait out its
+        // cost instead of running straight away. Only the lower bound is
+        // asserted, so scheduling delay cannot fail it.
+        let _reset = ResetGraceSeams::begin();
+        let delay = Duration::from_millis(600);
+        GRACE_DISCOVERY_DELAY.with(|slot| slot.set(Some(delay)));
+        GRACE_CANNED_WALKS.with(|walks| {
+            *walks.borrow_mut() = [Duration::from_millis(300); 1].into_iter().collect();
+        });
+        let scope = dot_test_support::TempDir::new("supervisor-slow-discovery").unwrap();
+        let ready = scope.path().join("ready");
+        let mut command = Command::new(dot_test_support::bash());
+        command
+            .args([
+                "-c",
+                "set -m; (trap 'exit 0' TERM; printf ready >\"$1\"; while :; do sleep 0.05; done) & until [[ -s $1 ]]; do sleep 0.01; done; exit 0",
+                "supervisor-slow-discovery",
+            ])
+            .arg(&ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let result = supervise_session(command, None, |_| Ok(())).unwrap();
+
+        assert!(
+            matches!(result, SessionEnd::Exited(status) if status.success()),
+            "teardown failed: {result:?}"
+        );
+        let discovery = GRACE_DISCOVERY_WALK
+            .with(std::cell::Cell::get)
+            .expect("discovery walk ran");
+        let first_walk = GRACE_WALK_STARTS
+            .with(|starts| starts.borrow().first().copied())
+            .expect("a graceful walk ran");
+        let discovery_end = GRACE_DISCOVERY_ENDED
+            .with(std::cell::Cell::get)
+            .expect("discovery end recorded");
+        let deadline = GRACE_DEADLINE_AFTER_DISCOVERY
+            .with(std::cell::Cell::get)
+            .expect("refunded deadline recorded");
+        // The walk waits out the discovery walk's excess, unless the refunded
+        // (capped) grace runs out first; then the guaranteed round is forced.
+        // A host slow enough to exhaust the cap still checks the forced walk.
+        let excess = discovery.saturating_sub(Duration::from_millis(GRACE_INTERVAL_MS));
+        let earliest = (discovery_end + excess).min(deadline);
+        let gap = first_walk.saturating_duration_since(discovery_end);
+        assert!(
+            first_walk >= earliest,
+            "the first graceful walk started {gap:?} after a {discovery:?} discovery walk; \
+             it must drain for {:?} first",
+            earliest.saturating_duration_since(discovery_end)
+        );
+    }
+
+    // Stops a session whose leader's TERM handler forks a member that traps
+    // TERM itself, so the supervisor has never seen that member before the
+    // stop. `discovery_delay` is added to the real discovery walk; when it
+    // outlasts the grace deadline the discovery snapshot is refused, so only
+    // a graceful-loop walk can find the member and deliver TERM before the
+    // KILL phase. The member's trap marks `termed`, ignores further TERMs (so
+    // the supervisor's TERM to its `sleep` cannot cut the trap short), sleeps
+    // `trap_time`, then marks `completed`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn starved_discovery_session(discovery_delay: Duration, trap_time: &str) -> (bool, bool) {
+        let scope = dot_test_support::TempDir::new("supervisor-starved-discovery").unwrap();
+        let ready = scope.path().join("ready");
+        let member_ready = scope.path().join("member-ready");
+        let termed = scope.path().join("termed");
+        let completed = scope.path().join("completed");
+        let mut command = Command::new(dot_test_support::bash());
+        command
+            .args([
+                "-c",
+                "trap '(trap \": >\\\"$3\\\"; trap \\\"\\\" TERM; sleep $5; : >\\\"$4\\\"; exit 0\" TERM; : >\"$2\"; while :; do sleep 0.05; done) & wait' TERM; : >\"$1\"; while :; do sleep 0.05; done",
+                "supervisor-starved-discovery",
+            ])
+            .arg(&ready)
+            .arg(&member_ready)
+            .arg(&termed)
+            .arg(&completed)
+            .arg(trap_time)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        isolate(&mut command);
+        let mut child = command.spawn().unwrap();
+        let _registration = StatusChildRegistration::new(child.id());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "fixture leader never became ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        GRACE_DISCOVERY_DELAY.with(|slot| slot.set(Some(discovery_delay)));
+        let mut tick = || {
+            // Hold the first tick until the handler-forked member is up, so
+            // it exists before any graceful-loop walk.
+            let wait = Instant::now() + Duration::from_secs(5);
+            while !member_ready.exists() && Instant::now() < wait {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        };
+        let _ = stop_session_with_tick(&mut child, libc::SIGTERM, &mut tick);
+        let _ = child.kill();
+        let _ = child.wait();
+        (termed.exists(), completed.exists())
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn refused_discovery_walk_still_gives_the_member_its_grace() {
+        // The discovery snapshot starts after the grace deadline and is
+        // refused, so the member is unsignaled; its refunded grace still has
+        // most of a second left. The loop must walk at once and deliver TERM
+        // with that time left for the trap, instead of draining a handler
+        // that was never signaled and reaching the member only at the end.
+        let _reset = ResetGraceSeams::begin();
+        let (termed, completed) =
+            starved_discovery_session(grace_duration() + Duration::from_millis(100), "0.3");
+
+        assert!(termed, "the member never received TERM");
+        // The deadline is already at the cap, so the first walk's own cost is
+        // not refunded: a walk that eats most of the remaining ~0.9s leaves
+        // too little for the 0.3s trap on a starved host. Delivery is still
+        // asserted above; only the trap's completion is skipped then.
+        let first_walk = GRACE_WALK_COSTS.with(|costs| costs.borrow().first().copied());
+        if first_walk.is_some_and(|cost| cost > Duration::from_millis(400)) {
+            eprintln!("inconclusive: the first graceful walk took {first_walk:?}");
+            return;
+        }
+        assert!(
+            completed,
+            "the member's TERM trap was killed before it could finish (first walk {first_walk:?})"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn forced_graceful_round_walks_with_a_live_deadline() {
+        // Discovery outlasts even the refunded grace, so the loop starts
+        // with the deadline already gone. The guaranteed round must still
+        // walk, and with a deadline a snapshot will start under; a walk on
+        // the expired deadline is refused and observes nothing.
+        let _reset = ResetGraceSeams::begin();
+        let _ = starved_discovery_session(grace_duration() * 2 + Duration::from_millis(100), "0");
+        let results = GRACE_WALK_RESULTS.with(|results| results.borrow().clone());
+
+        assert!(
+            !results.is_empty(),
+            "no graceful round ran after a starved discovery walk"
+        );
+        assert!(
+            results[0].is_some(),
+            "the forced graceful round was refused: {results:?}"
+        );
+    }
+
+    #[test]
+    fn empty_walks_never_delay_the_next_walk() {
+        let later = Instant::now() + Duration::from_secs(1);
+        // A walk that still saw a member keeps its drain gap.
+        assert_eq!(drain_gap_end(later, 0), later);
+        // After an empty walk the remaining work is proof: walk again now.
+        assert!(drain_gap_end(later, 1) <= Instant::now());
+        assert!(drain_gap_end(later, 2) <= Instant::now());
     }
 
     #[test]

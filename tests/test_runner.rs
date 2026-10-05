@@ -11,17 +11,16 @@ use std::process::{Command, Stdio};
 ///
 /// Interrupt teardown is bounded by the product, not instantaneous: a one
 /// second TERM grace (up to two when slow process-table walks are refunded
-/// to it, with the KILL window shifted to match), a 1.5 s KILL window, up
-/// to three late verification
-/// walks when process-table walks overran that window, then a one second
-/// lease poll. Native walks take well under a second each, so a loaded host
-/// typically finishes in a few seconds. Only the pathological `ps` fallback
-/// (up to 5 s to read plus 1 s to reap per walk) can approach or pass this
-/// bound. These checks prove that a
-/// signal is honoured at all (a writer blocked on an unread pipe, or a
-/// supervisor that never finishes, does not exit), so the bound sits above
-/// the product's ceiling instead of at its typical latency, and below the
-/// signal fixture's 30 s self-bound so a waited-out worker still fails.
+/// to it, with the KILL window shifted to match), a 1.5 s KILL window, up to
+/// three late verification walks when process-table walks overran that
+/// window, then a one second lease poll. Native walks take well under a
+/// second each, so a loaded host typically finishes in a few seconds. Only
+/// the pathological `ps` fallback (up to 5 s to read plus 1 s to reap per
+/// walk) can approach or pass this bound. These checks prove that a signal
+/// is honoured at all (a writer blocked on an unread pipe, or a supervisor
+/// that never finishes, does not exit), so the bound sits above the
+/// product's ceiling instead of at its typical latency, and below the signal
+/// fixture's 30 s self-bound so a waited-out worker still fails.
 const SIGNAL_EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long a test waits for a suite to publish its readiness marker.
