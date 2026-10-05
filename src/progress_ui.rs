@@ -528,7 +528,7 @@ fn line_cells(
     out.push(b' ');
     match fit {
         Fit::Fixed => out.extend_from_slice(&cell(detail, DETAIL_WIDTH, multibyte)),
-        Fit::Detail(width) => out.extend_from_slice(&word_cell(detail, width, multibyte)),
+        Fit::Detail { width, .. } => out.extend_from_slice(&word_cell(detail, width, multibyte)),
     }
     out
 }
@@ -537,100 +537,133 @@ fn line_cells(
 /// the other cells this makes a 75-column row.
 const DETAIL_WIDTH: usize = 42;
 
-/// Columns a row takes besides its `[i/n]` head and detail cell: the
-/// head's space, the label cell and its space, the status cell and its
-/// space, the space before the elapsed column, and that column.
-const ROW_FIXED_COLUMNS: usize = 1 + 10 + 1 + 8 + 1 + 1 + 6;
+/// Columns a row takes besides its `[i/n]` head, detail cell, and
+/// elapsed column: the head's space, the label cell and its space, the
+/// status cell and its space, and the space before the elapsed column.
+const ROW_FIXED_COLUMNS: usize = 1 + 10 + 1 + 8 + 1 + 1;
+
+/// The elapsed column's width on a full-width row (`printf %6s`).
+const ELAPSED_WIDTH: usize = 6;
+
+/// The narrowest elapsed column on a narrow terminal row: room for `99s`
+/// without the detail cell changing width every second.
+const NARROW_ELAPSED_WIDTH: usize = 3;
 
 /// How a row renders its detail cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fit {
     /// The historical fixed cell (piped and test output stay byte-stable).
     Fixed,
-    /// A cell this many columns wide, cut at a word boundary.
-    Detail(usize),
+    /// A terminal row: a detail cell this wide, shortened by whole
+    /// clauses, and an elapsed column this wide.
+    Detail { width: usize, elapsed: usize },
 }
 
 impl Fit {
-    /// The detail width that keeps a row with head `head` inside a
-    /// terminal of `columns` columns, one column short of the edge so the
-    /// cursor never wraps (a redraw only erases its own physical line).
-    fn for_terminal(columns: usize, head: &[u8], multibyte: bool) -> Fit {
+    /// The cells that keep a row with head `head` and an elapsed stamp of
+    /// `stamp` columns inside a terminal of `columns` columns, one column
+    /// short of the edge so the cursor never wraps (a redraw only erases
+    /// its own physical line). A terminal too narrow for the full detail
+    /// cell also narrows the elapsed column to the stamp, so the detail
+    /// cell keeps those columns.
+    fn for_terminal(columns: usize, head: &[u8], multibyte: bool, stamp: usize) -> Fit {
         let used = measured_len(head, multibyte) + ROW_FIXED_COLUMNS;
-        Fit::Detail(DETAIL_WIDTH.min(columns.saturating_sub(used + 1)))
+        let room = |elapsed: usize| columns.saturating_sub(used + elapsed + 1);
+        if room(ELAPSED_WIDTH) >= DETAIL_WIDTH {
+            return Fit::Detail {
+                width: DETAIL_WIDTH,
+                elapsed: ELAPSED_WIDTH,
+            };
+        }
+        let elapsed = stamp.max(NARROW_ELAPSED_WIDTH);
+        Fit::Detail {
+            width: DETAIL_WIDTH.min(room(elapsed)),
+            elapsed,
+        }
+    }
+
+    /// The elapsed column for `stamp`, right-aligned in this fit's width.
+    fn elapsed(self, stamp: &[u8]) -> Vec<u8> {
+        match self {
+            Fit::Fixed => column6(stamp),
+            Fit::Detail { elapsed, .. } => {
+                let mut out = vec![b' '; elapsed.saturating_sub(stamp.len())];
+                out.extend_from_slice(stamp);
+                out
+            }
+        }
     }
 }
 
 /// [`cell`] for terminal rows: pad to `width`, shortening over-long text
 /// without cutting a word. A summary of clauses (`2 repos current, 1 repo
-/// failed`) drops whole clauses, keeping any that report a failure first;
-/// a single clause keeps its leading whole words. When not even one word
-/// fits, the cell stays blank rather than showing a word fragment.
+/// failed`, a progress label and its bar) drops whole clauses, keeping any
+/// that report a failure first.
+/// When not even one clause fits, the cell stays blank: a leading word
+/// alone (`no` of `no dependency provider`) reads as something else.
 fn word_cell(text: &[u8], width: usize, multibyte: bool) -> Vec<u8> {
     if measured_len(text, multibyte) <= width {
         return pad(text, width, multibyte);
     }
     let clauses = clauses(text);
-    let failing = |clause: &&[u8]| clause.windows(4).any(|window| window == b"fail");
+    let failing = |clause: &[u8]| clause.windows(4).any(|window| window == b"fail");
     let mut chosen = vec![false; clauses.len()];
     let mut used = 0;
     let order = (0..clauses.len())
-        .filter(|at| failing(&clauses[*at]))
-        .chain((0..clauses.len()).filter(|at| !failing(&clauses[*at])));
+        .filter(|at| failing(clauses[*at].1))
+        .chain((0..clauses.len()).filter(|at| !failing(clauses[*at].1)));
     for at in order {
-        let extra = measured_len(clauses[at], multibyte) + if used > 0 { 2 } else { 0 };
+        // Count the widest joiner a kept clause can get; exact once joined.
+        let extra = measured_len(clauses[at].1, multibyte) + if used > 0 { 2 } else { 0 };
         if used + extra <= width {
             chosen[at] = true;
             used += extra;
         }
     }
-    let kept: Vec<&[u8]> = clauses
-        .iter()
-        .zip(&chosen)
-        .filter(|(_, chosen)| **chosen)
-        .map(|(clause, _)| *clause)
-        .collect();
-    if !kept.is_empty() {
-        return pad(&kept.join(b", ".as_slice()), width, multibyte);
+    let mut kept = Vec::new();
+    for ((joiner, clause), chosen) in clauses.iter().zip(&chosen) {
+        if *chosen {
+            if !kept.is_empty() {
+                kept.extend_from_slice(joiner);
+            }
+            kept.extend_from_slice(clause);
+        }
     }
-    let first = clauses
-        .iter()
-        .find(|clause| failing(clause))
-        .or(clauses.first())
-        .copied()
-        .unwrap_or(text);
-    pad(&leading_words(first, width, multibyte), width, multibyte)
+    pad(&kept, width, multibyte)
 }
 
-/// `text` split at its `, ` and `; ` clause separators.
-fn clauses(text: &[u8]) -> Vec<&[u8]> {
+/// `text` split into clauses, each with the joiner that preceded it: `, `,
+/// `; `, and `: ` separators keep theirs, and a run of spaces (the padding between
+/// a progress label and its bar) becomes one space.
+fn clauses(text: &[u8]) -> Vec<(&'static [u8], &[u8])> {
     let mut parts = Vec::new();
+    let mut joiner: &'static [u8] = b"";
     let mut start = 0;
     let mut at = 0;
     while at + 1 < text.len() {
-        if matches!(text[at], b',' | b';') && text[at + 1] == b' ' {
-            parts.push(text[start..at].trim_ascii());
-            start = at + 2;
-            at += 2;
-        } else {
-            at += 1;
+        let next: Option<(&'static [u8], usize)> = match (text[at], text[at + 1]) {
+            (b',', b' ') => Some((b", ", 2)),
+            (b';', b' ') => Some((b"; ", 2)),
+            (b':', b' ') => Some((b": ", 2)),
+            (b' ', b' ') => Some((
+                b" ",
+                text[at..].iter().take_while(|byte| **byte == b' ').count(),
+            )),
+            _ => None,
+        };
+        match next {
+            Some((separator, length)) => {
+                parts.push((joiner, text[start..at].trim_ascii()));
+                joiner = separator;
+                at += length;
+                start = at;
+            }
+            None => at += 1,
         }
     }
-    parts.push(text[start..].trim_ascii());
-    parts.retain(|part| !part.is_empty());
+    parts.push((joiner, text[start..].trim_ascii()));
+    parts.retain(|(_, part)| !part.is_empty());
     parts
-}
-
-/// The whole words of `text` that fit in `width` (possibly none).
-fn leading_words(text: &[u8], width: usize, multibyte: bool) -> Vec<u8> {
-    let prefix = take_prefix(text, width, multibyte);
-    let cut = if matches!(text.get(prefix.len()), None | Some(b' ')) {
-        prefix.len()
-    } else {
-        prefix.iter().rposition(|byte| *byte == b' ').unwrap_or(0)
-    };
-    let kept = prefix[..cut].trim_ascii_end();
-    kept.strip_suffix(b":").unwrap_or(kept).to_vec()
 }
 
 /// `_ui_line`: one newline-terminated progress line. `total` and
@@ -671,24 +704,27 @@ fn line_fit(
         return Vec::new();
     }
     let mut out = line_head(palette, index, total);
-    let fit = row_fit(index, total, columns, multibyte);
+    let fit = row_fit(index, total, columns, multibyte, elapsed.len());
     out.push(b' ');
     out.extend_from_slice(&line_cells(
         palette, label, status, status, detail, multibyte, fit,
     ));
     out.push(b' ');
-    out.extend_from_slice(&column6(elapsed));
+    out.extend_from_slice(&fit.elapsed(elapsed));
     out.push(b'\n');
     out
 }
 
 /// The detail fit for a row in a terminal `columns` wide (fixed when the
 /// width is unknown). Measured on the uncoloured head.
-fn row_fit(index: i64, total: &str, columns: Option<usize>, multibyte: bool) -> Fit {
+fn row_fit(index: i64, total: &str, columns: Option<usize>, multibyte: bool, stamp: usize) -> Fit {
     match columns {
-        Some(columns) => {
-            Fit::for_terminal(columns, format!("[{index}/{total}]").as_bytes(), multibyte)
-        }
+        Some(columns) => Fit::for_terminal(
+            columns,
+            format!("[{index}/{total}]").as_bytes(),
+            multibyte,
+            stamp,
+        ),
         None => Fit::Fixed,
     }
 }
@@ -755,19 +791,14 @@ fn live_line_fit(
         status
     };
     let mut out = b"\r\x1b[K".to_vec();
+    let fit = row_fit(index, total, columns, multibyte, elapsed.len());
     out.extend_from_slice(&line_head(palette, index, total));
     out.push(b' ');
     out.extend_from_slice(&line_cells(
-        palette,
-        label,
-        status,
-        frame,
-        detail,
-        multibyte,
-        row_fit(index, total, columns, multibyte),
+        palette, label, status, frame, detail, multibyte, fit,
     ));
     out.push(b' ');
-    out.extend_from_slice(&column6(elapsed));
+    out.extend_from_slice(&fit.elapsed(elapsed));
     out
 }
 
@@ -1105,6 +1136,8 @@ pub struct Stage {
     live_active: bool,
     /// Where rows learn how wide they may be.
     width: RowWidth,
+    /// What this stage's last static line showed (see [`Stage::freeze`]).
+    frozen: Option<Vec<u8>>,
 }
 
 impl Stage {
@@ -1132,6 +1165,7 @@ impl Stage {
             spinner: 0,
             live_active: false,
             width: RowWidth::Fixed,
+            frozen: None,
         }
     }
 
@@ -1145,6 +1179,21 @@ impl Stage {
     /// process may prompt the user on the same screen.
     pub fn on_terminal(&self) -> bool {
         self.live && !self.quiet && self.width == RowWidth::Terminal
+    }
+
+    /// The detail cell's width on a terminal row with an elapsed stamp of
+    /// `stamp` columns, when rows fit one.
+    fn detail_width(&self, stamp: usize) -> Option<usize> {
+        match row_fit(
+            self.index,
+            &self.total,
+            self.columns(),
+            self.multibyte,
+            stamp,
+        ) {
+            Fit::Detail { width, .. } => Some(width),
+            Fit::Fixed => None,
+        }
     }
 
     /// The terminal width rows must fit, read at each render so a resize
@@ -1180,6 +1229,7 @@ impl Stage {
         };
         self.started_secs = now_secs;
         self.spinner = 0;
+        self.frozen = None;
         if self.live {
             let mut out = Vec::new();
             if crate::log::is_quiet(verbose) {
@@ -1318,11 +1368,27 @@ impl Stage {
     /// final status. Quiet returns before either, leaving state
     /// untouched like the shell early return.
     pub fn finish(&mut self, status: &[u8], detail: &[u8], now_secs: i64) -> Vec<u8> {
+        self.finish_brief(status, detail, &[], now_secs)
+    }
+
+    /// [`Stage::finish`] with shorter summaries, in clauses, for a terminal
+    /// row too narrow for `detail` (one without clause boundaries would
+    /// otherwise be cut mid-phrase or vanish): the first of `briefs` that
+    /// fits whole wins, else the last, shortened by clauses. Fixed-width
+    /// rows always show `detail`, so piped output keeps its bytes.
+    pub fn finish_brief(
+        &mut self,
+        status: &[u8],
+        detail: &[u8],
+        briefs: &[&[u8]],
+        now_secs: i64,
+    ) -> Vec<u8> {
         if self.quiet {
             return Vec::new();
         }
         let columns = self.columns();
         let stamp = elapsed(now_secs, self.started_secs);
+        let detail = self.fitting(detail, briefs, stamp.len());
         let (mut out, live_active) = clear_live(self.live_active);
         self.live_active = live_active;
         out.extend_from_slice(&line_fit(
@@ -1340,20 +1406,51 @@ impl Stage {
         out
     }
 
+    /// The text a row shows: `detail` when it fits (or rows are fixed),
+    /// else the first of `briefs` that fits whole, else the last of them.
+    fn fitting<'t>(&self, detail: &'t [u8], briefs: &[&'t [u8]], stamp: usize) -> &'t [u8] {
+        let Some(width) = self.detail_width(stamp) else {
+            return detail;
+        };
+        let fits = |text: &[u8]| measured_len(text, self.multibyte) <= width;
+        if fits(detail) {
+            return detail;
+        }
+        briefs
+            .iter()
+            .copied()
+            .find(|brief| fits(brief))
+            .or_else(|| briefs.last().copied())
+            .unwrap_or(detail)
+    }
+
     /// Replace the live row with a static, newline-terminated copy showing
-    /// `detail`, before a child that may prompt on the terminal runs: the
-    /// screen keeps saying what is happening, and nothing redraws over the
-    /// child (the live row returns on the next line with the next render).
-    /// Silent unless the row is live and a stage has opened: before the
-    /// first stage there is no row, only a `[0/N]` with an epoch timer.
-    pub fn freeze(&mut self, detail: &[u8], now_secs: i64) -> Vec<u8> {
+    /// `detail` (or the first of `briefs` that fits), before a child that
+    /// may prompt on the terminal runs: the screen keeps saying what is
+    /// happening, and nothing redraws over the child (the live row returns
+    /// on the next line with the next render). A static line that would
+    /// look exactly like the stage's previous one (both too narrow for any
+    /// text) is skipped, leaving the row cleared. Silent unless the row is
+    /// live and a stage has opened: before the first stage there is no row,
+    /// only a `[0/N]` with an epoch timer.
+    pub fn freeze(&mut self, detail: &[u8], briefs: &[&[u8]], now_secs: i64) -> Vec<u8> {
         if self.quiet || !self.live || !self.started() {
             return Vec::new();
         }
         let columns = self.columns();
         let stamp = elapsed(now_secs, self.started_secs);
+        let text = self.fitting(detail, briefs, stamp.len());
         let (mut out, live_active) = clear_live(self.live_active);
         self.live_active = live_active;
+        let shown = match self.detail_width(stamp.len()) {
+            Some(width) => word_cell(text, width, self.multibyte),
+            None => text.to_vec(),
+        };
+        let shown = shown.trim_ascii().to_vec();
+        if self.frozen.as_ref() == Some(&shown) {
+            return out;
+        }
+        self.frozen = Some(shown);
         out.extend_from_slice(&line_fit(
             &self.palette,
             false,
@@ -1361,7 +1458,7 @@ impl Stage {
             &self.total,
             &self.label,
             b"running",
-            detail,
+            text,
             &stamp,
             self.multibyte,
             columns,

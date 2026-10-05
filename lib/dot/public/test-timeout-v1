@@ -123,6 +123,12 @@ nested_control_complete = True
 ancestor_registration: socket.socket | None = None
 PROCESS_SNAPSHOT_TIMEOUT_SECONDS = 1
 PROCESS_POLL_SECONDS = 0.05
+# How long a cleanup diagnostic may wait on a full caller stream.
+DIAGNOSTIC_WRITE_SECONDS = 0.25
+# Handled timer ticks, after that budget, that may find the caller stream
+# writable while the diagnostic write is still unfinished before teardown
+# abandons it. About one second at PROCESS_POLL_SECONDS on an idle host.
+DIAGNOSTIC_CONTENDED_TICKS = 20
 # Unhealthy observations that unregister a nested supervisor.
 NESTED_UNREGISTER_STRIKES = 3
 # A stop phase completes after this many consecutive empty observations.
@@ -1034,50 +1040,110 @@ def diagnostic(message: str) -> None:
         except OSError:
             pass
         return
-    expected_parent = os.getpid()
+    write_diagnostic_bounded(2, payload)
+
+
+class DiagnosticWriteExpired(Exception):
+    """A diagnostic write stayed blocked on a full caller stream."""
+
+
+def stream_writable(fd: int) -> bool:
+    """Return whether a small write to `fd` can make progress right now."""
     try:
-        writer = os.fork()
-    except OSError:
+        return bool(select.select([], [fd], [], 0)[1])
+    except (OSError, ValueError):
+        return False
+
+
+def write_diagnostic_bounded(fd: int, payload: bytes) -> None:
+    """Write in-process, abandoning the write only while the stream is full.
+
+    The caller's pipe or socket may be full and undrained, so a blocking write
+    could strand teardown; setting O_NONBLOCK would change the caller's shared
+    open file description. A repeating real-time timer interrupts a blocked
+    write instead. Once the budget has passed, a tick that finds the stream
+    still full abandons the write. A tick that finds room only counts toward
+    DIAGNOSTIC_CONTENDED_TICKS, which bounds a write that competing writers
+    keep beating to the room. The allowance is counted in ticks this process
+    handled, not in wall time: ITIMER_REAL signals coalesce while a loaded
+    host leaves the wrapper descheduled, so on resuming it handles one tick,
+    sees room and finishes the write. Any wall-clock limit on the write,
+    including killing a forked writer after a fixed time, loses the line
+    whenever the host leaves the writer unscheduled for longer than that.
+
+    The process-directed SIGALRM can be taken by any thread that leaves it
+    unblocked. The executable is single-threaded; an embedded caller must not
+    run other threads with SIGALRM unblocked during teardown.
+    """
+    deadline = time.monotonic() + DIAGNOSTIC_WRITE_SECONDS
+    contended_ticks = 0
+    # Armed only once this write's timer runs: a tick of the caller's own
+    # timer that lands earlier must not abandon a write that never started.
+    armed = False
+
+    def expire(_signum: int, _frame: FrameType | None) -> None:
+        nonlocal armed, contended_ticks
+        if not armed or time.monotonic() < deadline:
+            return
+        if stream_writable(fd):
+            contended_ticks += 1
+            if contended_ticks < DIAGNOSTIC_CONTENDED_TICKS:
+                return
+        # One-shot: a later tick must not raise again while the restoration
+        # below runs.
+        armed = False
+        raise DiagnosticWriteExpired
+
+    # Read before arming: an exception between arming and a later assignment
+    # must not lose the caller's timer or leave this one running.
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    # A caller's expired timer whose SIGALRM is still pending (blocked) reads
+    # back as (0, interval); unblocking below would hand that signal to this
+    # write's handler. Note it so the restoration can re-raise it.
+    caller_alarm_pending = hasattr(signal, "sigpending") and signal.SIGALRM in signal.sigpending()
+    try:
+        previous_handler = signal.signal(signal.SIGALRM, expire)
+    except (OSError, ValueError):
+        # Only the main thread can own signal handlers. The executable is
+        # single-threaded; an embedded caller on another thread loses this
+        # best-effort line rather than risking an unbounded write.
         return
-    if writer == 0:
-        bind_linux_parent_death(expected_parent)
-        for handled_signal in handled_signals + subprocess_restored_signals:
-            signal.signal(handled_signal, signal.SIG_DFL)
-        try:
-            write_all_fd(2, payload)
-        except OSError:
-            os._exit(1)
-        os._exit(0)
-    deadline = time.monotonic() + 0.25
-    while time.monotonic() < deadline:
-        try:
-            waited, _status = os.waitpid(writer, os.WNOHANG)
-        except ChildProcessError:
-            return
-        except InterruptedError:
-            continue
-        except OSError:
-            break
-        if waited == writer:
-            return
-        time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+    previous_mask = None
     try:
-        os.kill(writer, signal.SIGKILL)
-    except (PermissionError, ProcessLookupError):
-        pass
-    reap_deadline = time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
-    while time.monotonic() < reap_deadline:
+        # A caller can exec this wrapper with SIGALRM blocked; the timer must
+        # still be able to interrupt the write.
+        if hasattr(signal, "pthread_sigmask"):
+            previous_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGALRM})
+        signal.setitimer(signal.ITIMER_REAL, DIAGNOSTIC_WRITE_SECONDS, PROCESS_POLL_SECONDS)
+        armed = True
         try:
-            waited, _status = os.waitpid(writer, os.WNOHANG)
-        except ChildProcessError:
-            return
-        except InterruptedError:
-            continue
-        except OSError:
-            return
-        if waited == writer:
-            return
-        time.sleep(min(0.01, max(0.0, reap_deadline - time.monotonic())))
+            write_all_fd(fd, payload)
+        finally:
+            # A tick that lands after the write completes must not escape the
+            # restoration below.
+            armed = False
+    except (DiagnosticWriteExpired, OSError):
+        pass
+    finally:
+        armed = False
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        if previous_handler is not None:
+            signal.signal(signal.SIGALRM, previous_handler)
+        # Restore the caller's mask before its timer or signal can fire: a
+        # caller that blocked SIGALRM must not be killed by its own alarm
+        # landing while this write still had it unblocked.
+        if previous_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        if caller_alarm_pending:
+            # Process-directed, like the timer's own signal; the restored
+            # mask keeps it pending for the caller.
+            os.kill(os.getpid(), signal.SIGALRM)
+        value, interval = previous_timer
+        if value > 0 or interval > 0:
+            # Timers survive exec; keep a caller's alarm, now owned by its
+            # original disposition again. An expired repeating timer resumes
+            # at its interval, as the kernel would on delivering its signal.
+            signal.setitimer(signal.ITIMER_REAL, value if value > 0 else interval, interval)
 
 
 def _kcmp_syscall_number():

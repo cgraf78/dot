@@ -1744,7 +1744,6 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn retry_once_passes_first_success_through() {
@@ -1817,17 +1816,16 @@ mod tests {
             // `config --get-all` reports one canned URL line. The
             // failing variant exits nonzero with empty output, like
             // git refusing a broken repository.
-            std::fs::write(
+            // The readiness probe exits before logging, so counts stay
+            // exact; see `dot_test_support::publish_fixture_script`.
+            dot_test_support::publish_fixture_script(
                 &shim,
-                format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n{body}",
+                &format!(
+                    "printf '%s\\n' \"$*\" >> {log}\n{body}",
                     log = log.display(),
                 ),
             )
             .expect("counting git shim");
-            #[cfg(unix)]
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-                .expect("counting git mode");
             Self {
                 _scope: scope,
                 log,
