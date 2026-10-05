@@ -4121,12 +4121,37 @@ mod tests {
     }
 
     impl ExactProcessGuard {
+        /// Pins the exact instance behind `pid`, or nothing when it has
+        /// exited. An escaped fixture is reparented exactly while it is
+        /// pinned (its leader exits once the marker appears), which changes
+        /// the re-read row without changing the instance; retry while the
+        /// same live start time remains, so a reparenting race cannot leave
+        /// a silently empty guard that never kills the fixture.
         fn acquire(pid: u32) -> Result<Self, String> {
-            let member = match process_identity(pid)? {
-                Some(identity) => open_member(pid, &identity)?,
-                None => None,
-            };
-            Ok(Self { member })
+            // Each retry follows one reparenting step up a finite chain.
+            for _ in 0..8 {
+                let Some(identity) = process_identity(pid)? else {
+                    return Ok(Self { member: None });
+                };
+                if let Some(member) = open_member(pid, &identity)? {
+                    return Ok(Self {
+                        member: Some(member),
+                    });
+                }
+                match process_identity(pid)? {
+                    // Same rule as the integration-test guard: only a live
+                    // row with the same start and session is the same
+                    // instance and worth another bind attempt.
+                    Some(current)
+                        if current.live
+                            && current.start == identity.start
+                            && current.session == identity.session => {}
+                    _ => return Ok(Self { member: None }),
+                }
+            }
+            Err(format!(
+                "could not pin live fixture {pid} across reparenting"
+            ))
         }
 
         fn is_live(&self) -> bool {

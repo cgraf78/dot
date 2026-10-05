@@ -150,7 +150,6 @@ pub fn ensure_repo_config(base: Option<&[OsString]>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
 
     static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
@@ -166,16 +165,14 @@ mod tests {
                 .expect("config git scope");
             let log = scope.path().join("invocations.log");
             let shim = scope.path().join("git");
-            std::fs::write(
+            dot_test_support::publish_fixture_script(
                 &shim,
-                format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nif [ \"$3\" = config ]; then\n  if [ \"$4\" = --bool ]; then printf '%s\\n' \"{boolean}\";\n  elif [ -z \"$5\" ]; then printf '%s\\n' \"{plain}\";\n  fi\nfi\n",
+                &format!(
+                    "printf '%s\\n' \"$*\" >> {log}\nif [ \"$3\" = config ]; then\n  if [ \"$4\" = --bool ]; then printf '%s\\n' \"{boolean}\";\n  elif [ -z \"$5\" ]; then printf '%s\\n' \"{plain}\";\n  fi\nfi\n",
                     log = log.display(),
                 ),
             )
-            .expect("config git shim");
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-                .expect("config git mode");
+            .expect("fixture git");
             Self {
                 _scope: scope,
                 log,
@@ -325,16 +322,14 @@ mod tests {
             dot_test_support::TempDir::new_exec("config-refuse").expect("refusing git scope");
         let log = scope.path().join("invocations.log");
         let shim = scope.path().join("git");
-        std::fs::write(
+        dot_test_support::publish_fixture_script(
             &shim,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexit 1\n",
-                log = log.display(),
+            &format!(
+                "printf '%s\\n' \"$*\" >> {log}\nexit 1\n",
+                log = log.display()
             ),
         )
-        .expect("refusing git shim");
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-            .expect("refusing git mode");
+        .expect("fixture git");
         let repo = scope.path().join("repo");
         let prefix = vec![OsString::from("-C"), repo.as_os_str().to_os_string()];
         crate::init_client_identity::with_host_git(shim.as_path(), || {

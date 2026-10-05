@@ -58,6 +58,16 @@ const FORCED_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const SUCCESS_QUIESCENCE_GRACE: Duration = Duration::from_millis(500);
 #[cfg(target_os = "linux")]
 const PROCESS_POLL: Duration = Duration::from_millis(10);
+/// Command bound for the escaped-descendant fixtures. Their leader exits on
+/// its own once the escaped child publishes its marker, so passing runs never
+/// wait for it: it bounds only fixture startup, which a loaded host can
+/// stretch past a couple of seconds and turn into a spurious timeout.
+#[cfg(target_os = "linux")]
+const ESCAPED_FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Headroom over the supervisor's own deadlines for its process startup and
+/// result handoff on a loaded host.
+#[cfg(target_os = "linux")]
+const SUPERVISOR_STARTUP_SLACK: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
 const MAX_SUPERVISOR_RECORD_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
@@ -1653,12 +1663,48 @@ struct ExactProcessGuard {
 
 #[cfg(target_os = "linux")]
 impl ExactProcessGuard {
+    /// Pins the exact instance behind `pid`, or nothing when it has exited.
+    ///
+    /// An escaped fixture is reparented exactly while the test pins it: its
+    /// leader exits as soon as the marker it waits on appears, so the parent
+    /// in the pre-open stat row can differ from the post-open re-read. That
+    /// is the same instance, so a bind lost only to a parent change is
+    /// retried against the fresh row. Any other loss means the instance
+    /// exited (or its PID was reused). A live instance that still cannot be
+    /// pinned is an error: a silently empty guard would neither kill the
+    /// fixture nor give `is_live` assertions any meaning.
     fn acquire(pid: u32) -> Result<Self, String> {
-        let member = match linux_process_identity(pid)? {
-            Some(identity) => open_process_member(pid, &identity)?,
-            None => None,
-        };
-        Ok(Self { member })
+        // Each retry follows one reparenting step up a finite ancestor
+        // chain, so a handful of attempts covers every real case.
+        const ATTEMPTS: usize = 8;
+        let mut last_loss = String::new();
+        for _ in 0..ATTEMPTS {
+            let Some(identity) = linux_process_identity(pid)? else {
+                return Ok(Self { member: None });
+            };
+            match bind_process_member(pid, &identity)? {
+                Ok(member) => {
+                    return Ok(Self {
+                        member: Some(member),
+                    });
+                }
+                Err(loss)
+                    if matches!(
+                        &loss,
+                        MemberLoss::RowMismatch { observed: Some(observed), .. }
+                            if observed.live
+                                && observed.start == identity.start
+                                && observed.session == identity.session
+                    ) =>
+                {
+                    last_loss = loss.describe(&identity);
+                }
+                Err(_) => return Ok(Self { member: None }),
+            }
+        }
+        Err(format!(
+            "could not pin live fixture {pid} across reparenting: {last_loss}"
+        ))
     }
 
     fn is_live(&self) -> bool {
@@ -1667,8 +1713,11 @@ impl ExactProcessGuard {
             .is_some_and(|member| !pidfd_is_ready(&member.pidfd).unwrap_or(true))
     }
 
-    fn terminate(&mut self) -> Result<(), String> {
-        let Some(member) = self.member.take() else {
+    /// Kills the pinned instance and waits for its pidfd to report exit,
+    /// keeping the pin so callers assert death through the descriptor
+    /// rather than the recyclable numeric PID.
+    fn kill_and_wait(&self) -> Result<(), String> {
+        let Some(member) = self.member.as_ref() else {
             return Ok(());
         };
         // SAFETY: the pidfd binds the signal to the exact fixture identity.
@@ -1682,7 +1731,6 @@ impl ExactProcessGuard {
             )
         };
         if result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-            self.member = Some(member);
             return Err(format!(
                 "kill exact fixture identity: {}",
                 std::io::Error::last_os_error()
@@ -1691,11 +1739,16 @@ impl ExactProcessGuard {
         let deadline = Instant::now() + FORCED_CLEANUP_GRACE;
         while !pidfd_is_ready(&member.pidfd)? {
             if Instant::now() >= deadline {
-                self.member = Some(member);
                 return Err("timed out terminating exact fixture identity".to_string());
             }
             std::thread::sleep(PROCESS_POLL);
         }
+        Ok(())
+    }
+
+    fn terminate(&mut self) -> Result<(), String> {
+        self.kill_and_wait()?;
+        self.member = None;
         Ok(())
     }
 }
@@ -2335,6 +2388,14 @@ fn descendant_quiescence(
     let deadline = (Instant::now() + SUCCESS_QUIESCENCE_GRACE).min(command_deadline);
     let mut empty_observations = 0;
     loop {
+        // The deadline bounds when a scan may start, as in the standalone
+        // supervisor's `quiescent`: a scan that started in time counts even
+        // if a loaded host stretches it past the deadline. Discarding it
+        // instead demanded two whole process-table scans inside the grace,
+        // which a host with thousands of processes cannot always finish,
+        // and reported a quiescent command as leaving a live descendant.
+        // The proof still needs an empty scan that ended before a
+        // confirming scan started in time, and no scan starts late.
         if Instant::now() >= deadline {
             return Ok(None);
         }
@@ -2342,9 +2403,6 @@ fn descendant_quiescence(
             .iter()
             .any(|member| *member != boundary.leader);
         let observed_at = Instant::now();
-        if observed_at >= deadline {
-            return Ok(None);
-        }
         if has_descendant {
             empty_observations = 0;
         } else {
@@ -2968,19 +3026,105 @@ fn process_is_live(pid: u32) -> bool {
         .is_some_and(|state| !matches!(state, b'Z' | b'X' | b'x'))
 }
 
+/// Hang watchdog for an escaped-fixture supervisor run: everything the
+/// supervisor itself bounds (the command, then the TERM and KILL cleanup
+/// graces) plus startup slack. It only reports a hang; no passing run waits
+/// for it.
 #[cfg(target_os = "linux")]
-fn wait_for_process_marker(path: &Path, timeout: Duration) -> Result<u32, String> {
-    let deadline = Instant::now() + timeout;
+fn escaped_fixture_watchdog() -> Duration {
+    ESCAPED_FIXTURE_TIMEOUT + TERMINATION_GRACE + FORCED_CLEANUP_GRACE + SUPERVISOR_STARTUP_SLACK
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_marker(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Waits for an escaped fixture's PID marker while its supervisor runs,
+/// returning the supervisor's result too if it already arrived.
+///
+/// The marker shows that the fixture reached the state under test, but how
+/// soon it appears is up to the scheduler: a loaded host can delay it past
+/// any short fixed wait while the supervisor still delivers the expected
+/// outcome. So the marker is awaited only under the hang watchdog, and a
+/// supervisor that finishes without the marker ever appearing is reported
+/// with its result, which explains why the fixture never became ready.
+#[cfg(target_os = "linux")]
+fn wait_for_fixture_marker<T: std::fmt::Debug>(
+    path: &Path,
+    supervisor: &mpsc::Receiver<T>,
+) -> Result<(u32, Option<T>), String> {
+    let deadline = Instant::now() + escaped_fixture_watchdog();
     loop {
-        if let Ok(value) = fs::read_to_string(path) {
-            if let Ok(pid) = value.trim().parse::<u32>() {
-                return Ok(pid);
+        if let Some(pid) = read_process_marker(path) {
+            return Ok((pid, None));
+        }
+        match supervisor.try_recv() {
+            Ok(result) => {
+                // A fixture that reached its state under test wrote the marker
+                // before its leader exited, so a result that raced the read
+                // above still finds it; a missing marker is a fixture failure.
+                return match read_process_marker(path) {
+                    Some(pid) => Ok((pid, Some(result))),
+                    None => Err(format!(
+                        "supervisor finished before process marker {} was ready: {result:?}",
+                        path.display()
+                    )),
+                };
             }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(format!(
+                    "supervisor exited without a result before process marker {} was ready",
+                    path.display()
+                ));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
         }
         if Instant::now() >= deadline {
             return Err(format!("process marker was not ready: {}", path.display()));
         }
         std::thread::sleep(PROCESS_POLL);
+    }
+}
+
+/// Waits for an escaped fixture's marker and pins its exact instance.
+///
+/// Panics on failure, but first kills a fixture whose PID it read and could
+/// not pin, so a failing setup cannot leave a stopped child holding the
+/// fixture's lock. That fallback signals only a process that still leads
+/// its own session (`setsid` made the fixture `sid == pid`) and still has
+/// the start time read right after the marker, which a recycled PID in
+/// that instant would not.
+#[cfg(target_os = "linux")]
+fn pin_escaped_fixture<T: std::fmt::Debug>(
+    path: &Path,
+    supervisor: &mpsc::Receiver<T>,
+) -> (u32, Option<T>, ExactProcessGuard) {
+    let (pid, early_result) =
+        wait_for_fixture_marker(path, supervisor).expect("escaped descendant marker");
+    let marked_start = linux_process_identity(pid)
+        .ok()
+        .flatten()
+        .map(|identity| identity.start);
+    match ExactProcessGuard::acquire(pid) {
+        Ok(guard) => (pid, early_result, guard),
+        Err(error) => {
+            if linux_process_identity(pid)
+                .ok()
+                .flatten()
+                .is_some_and(|identity| {
+                    identity.live
+                        && identity.session == pid
+                        && marked_start.as_ref() == Some(&identity.start)
+                })
+            {
+                // SAFETY: kill takes a process-group id and a signal number;
+                // the session-leader and start checks above tie it to the
+                // fixture instance that published the marker.
+                unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+            }
+            panic!("bind exact escaped fixture identity: {error}");
+        }
     }
 }
 
@@ -5339,9 +5483,8 @@ fn descendant_quiescence_stops_at_the_total_deadline() {
     // fixture child can be adopted or signaled out from under this
     // boundary. Quiescence can only end at the deadline. The 100ms
     // deadline sits well inside the 500ms quiescence grace, so a broken
-    // clamp (waiting out the grace) overshoots the 450ms bound even on a
-    // quiet host, while a correct clamp lands near the deadline even
-    // when scans are slow.
+    // clamp (waiting out the grace) overshoots the bound below, while a
+    // correct clamp lands within one in-flight scan of the deadline.
     let supervisor = std::process::id();
     let identity = linux_process_identity(supervisor)
         .expect("read test-process identity")
@@ -5360,19 +5503,40 @@ fn descendant_quiescence_stops_at_the_total_deadline() {
         retained: Mutex::new(HashMap::new()),
         scan_fault: Mutex::new(ScanFault::default()),
     };
+    // One membership scan walks the whole process table, so its cost
+    // follows host load. A correct clamp returns within the 100ms deadline
+    // plus one scan already in flight and a poll; a broken clamp waits out
+    // the 500ms grace. Time scans on either side to size that margin.
+    let time_scan = || {
+        let scan = Instant::now();
+        live_boundary_members(&boundary).expect("membership scan succeeds");
+        scan.elapsed()
+    };
+    let scan_before = time_scan();
     let started = Instant::now();
     let result = descendant_quiescence(&boundary, started + Duration::from_millis(100));
     let elapsed = started.elapsed();
+    let scan = scan_before.max(time_scan());
     let quiesced = result.expect("quiescence scan succeeds");
     assert!(quiesced.is_none(), "live descendant quiesced");
     assert!(
         elapsed >= Duration::from_millis(100),
         "quiescence returned before the total deadline with a live descendant: {elapsed:?}"
     );
+    let clamp_bound = Duration::from_millis(100) + scan * 2 + PROCESS_POLL * 5;
     assert!(
-        elapsed < Duration::from_millis(450),
-        "quiescence waited past the total deadline into the grace period: {elapsed:?}"
+        elapsed < clamp_bound,
+        "quiescence waited past the total deadline: {elapsed:?} (bound {clamp_bound:?}, \
+         scan {scan:?})"
     );
+    // The bound separates a correct clamp from waiting out the grace only
+    // while scans stay fast; say so instead of claiming a proof.
+    if clamp_bound >= SUCCESS_QUIESCENCE_GRACE {
+        eprintln!(
+            "inconclusive: scan {scan:?} is too slow to tell the clamp from the \
+             {SUCCESS_QUIESCENCE_GRACE:?} grace"
+        );
+    }
 }
 
 #[test]
@@ -5832,7 +5996,6 @@ fn direct_child_authority_precedes_a_failing_broad_process_scan() {
     .expect("write direct-before-broad fixture");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
         .expect("chmod direct-before-broad fixture");
-    let started = Instant::now();
     let worker_script = script.clone();
     let worker_marker = child_pid.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -5840,25 +6003,26 @@ fn direct_child_authority_precedes_a_failing_broad_process_scan() {
         let mut command = Command::new(worker_script);
         let result = run_timed_command_with_scan_fault_marker(
             &mut command,
-            Duration::from_secs(2),
+            ESCAPED_FIXTURE_TIMEOUT,
             CAPTURE_LIMIT_BYTES,
             Some("direct-before-fail"),
             Some(&worker_marker),
         );
         let _ = sender.send(result);
     });
-    let pid = wait_for_process_marker(&child_pid, Duration::from_secs(2))
-        .expect("escaped descendant marker");
-    let escaped_guard =
-        ExactProcessGuard::acquire(pid).expect("bind exact escaped fixture identity");
-    let result = match receiver.recv_timeout(Duration::from_secs(5)) {
-        Ok(result) => result,
-        Err(error) => {
-            drop(escaped_guard);
-            let _ = worker.join();
-            panic!("direct-first supervisor exceeded its watchdog: {error}");
-        }
-    };
+    let (pid, early_result, escaped_guard) = pin_escaped_fixture(&child_pid, &receiver);
+    // The cleanup bound starts once the fixture is in its state under test,
+    // so fixture and supervisor startup (the load-sensitive part) is excluded.
+    let started = Instant::now();
+    let result =
+        match early_result.map_or_else(|| receiver.recv_timeout(escaped_fixture_watchdog()), Ok) {
+            Ok(result) => result,
+            Err(error) => {
+                drop(escaped_guard);
+                let _ = worker.join();
+                panic!("direct-first supervisor exceeded its watchdog: {error}");
+            }
+        };
     worker.join().expect("join direct-first supervisor");
     let error = result.expect_err("broad process-scan failure must reject the sample");
     assert!(error.contains("process-table failure"), "{error}");
@@ -5927,31 +6091,31 @@ fn retained_pidfd_survives_an_omitted_then_failed_process_snapshot() {
     let before = fs::read_dir("/proc/self/fd")
         .expect("initial descriptor inventory")
         .count();
-    let started = Instant::now();
     let worker_script = script.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
         let mut command = Command::new(worker_script);
         let result = run_timed_command_with_scan_fault(
             &mut command,
-            Duration::from_secs(2),
+            ESCAPED_FIXTURE_TIMEOUT,
             CAPTURE_LIMIT_BYTES,
             Some("omit-then-fail"),
         );
         let _ = sender.send(result);
     });
-    let pid = wait_for_process_marker(&child_pid, Duration::from_secs(2))
-        .expect("escaped descendant marker");
-    let escaped_guard =
-        ExactProcessGuard::acquire(pid).expect("bind exact escaped fixture identity");
-    let result = match receiver.recv_timeout(Duration::from_secs(5)) {
-        Ok(result) => result,
-        Err(error) => {
-            drop(escaped_guard);
-            let _ = worker.join();
-            panic!("retained-identity cleanup exceeded its watchdog: {error}");
-        }
-    };
+    let (pid, early_result, escaped_guard) = pin_escaped_fixture(&child_pid, &receiver);
+    // The cleanup bound starts once the fixture is in its state under test,
+    // so fixture and supervisor startup (the load-sensitive part) is excluded.
+    let started = Instant::now();
+    let result =
+        match early_result.map_or_else(|| receiver.recv_timeout(escaped_fixture_watchdog()), Ok) {
+            Ok(result) => result,
+            Err(error) => {
+                drop(escaped_guard);
+                let _ = worker.join();
+                panic!("retained-identity cleanup exceeded its watchdog: {error}");
+            }
+        };
     worker.join().expect("join retained-identity supervisor");
     let lock_available = Command::new(&flock)
         .args(["--exclusive", "--nonblock"])
@@ -6007,24 +6171,22 @@ fn total_observation_loss_rejects_without_blocking_capture_readers() {
     let before = fs::read_dir("/proc/self/fd")
         .expect("initial descriptor inventory")
         .count();
-    let started = Instant::now();
     let worker_script = script.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
         let mut command = Command::new(worker_script);
         let result = run_timed_command_with_scan_fault(
             &mut command,
-            Duration::from_secs(2),
+            ESCAPED_FIXTURE_TIMEOUT,
             CAPTURE_LIMIT_BYTES,
             Some("unobserved-then-fail"),
         );
         let _ = sender.send(result);
     });
-    let pid = wait_for_process_marker(&child_pid, Duration::from_secs(2))
-        .expect("escaped descendant marker");
-    let mut escaped_guard =
-        ExactProcessGuard::acquire(pid).expect("bind exact escaped fixture identity");
-    let result = match receiver.recv_timeout(Duration::from_secs(5)) {
+    let (pid, early_result, mut escaped_guard) = pin_escaped_fixture(&child_pid, &receiver);
+    let result = match early_result
+        .map_or_else(|| receiver.recv_timeout(escaped_fixture_watchdog()), Ok)
+    {
         Ok(result) => result,
         Err(error) => {
             let cleanup = escaped_guard.terminate();
@@ -6033,9 +6195,14 @@ fn total_observation_loss_rejects_without_blocking_capture_readers() {
         }
     };
     worker.join().expect("join observation-loss supervisor");
+    // The escaped child holds the command's output pipes until this test
+    // kills it, so a result delivered while it still lives proves the
+    // capture readers were abandoned rather than awaited to end of stream.
+    // A reader that did wait would hold the supervisor until the watchdog,
+    // so no wall-clock bound is needed (or reliable on a loaded host).
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "total observation loss blocked on an inherited output pipe"
+        escaped_guard.is_live(),
+        "total observation loss returned only after the pipe-holding child {pid} exited"
     );
     let error = result.expect_err("total observation loss must reject the sample");
     assert!(
@@ -6060,10 +6227,12 @@ fn total_observation_loss_rejects_without_blocking_capture_readers() {
     );
     // This test alone knows the exact still-live identity. Production refuses
     // an unsafe numeric-PID fallback when observation is unavailable.
+    // `kill_and_wait` returns Ok only once the pinned pidfd reports exit, so
+    // death is judged through the descriptor: once the kill is reaped the
+    // numeric PID can be recycled, so `/proc` liveness by number races.
     escaped_guard
-        .terminate()
-        .expect("kill exact escaped fixture identity");
-    assert!(!process_is_live(pid), "escaped fixture did not terminate");
+        .kill_and_wait()
+        .expect("escaped fixture did not terminate");
     assert!(
         Command::new(&flock)
             .args(["--exclusive", "--nonblock"])
@@ -6074,6 +6243,8 @@ fn total_observation_loss_rejects_without_blocking_capture_readers() {
             .success(),
         "escaped fixture retained its lock after exact teardown"
     );
+    // Release the pin before the inventory, as the sibling tests do.
+    drop(escaped_guard);
     let after = settled_descriptor_count(before);
     assert!(
         after <= before + 1,

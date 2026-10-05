@@ -347,7 +347,6 @@ pub fn require_sudo(quiet: &str) -> bool {
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd as _;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::process::CommandExt as _;
 
     #[test]
@@ -523,17 +522,15 @@ mod tests {
         let bin = scope.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let id = bin.join("id");
-        std::fs::write(&id, "#!/bin/sh\nprintf '1000\\n'\n").unwrap();
-        std::fs::set_permissions(&id, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dot_test_support::publish_fixture_script(&id, "printf '1000\\n'\n").unwrap();
         let ready = scope.path().join("sudo.ready");
         let cleaned = scope.path().join("sudo.cleaned");
         let sudo = bin.join("sudo");
-        std::fs::write(
+        dot_test_support::publish_fixture_script(
             &sudo,
-            "#!/bin/sh\nif [ \"${1:-}\" = -n ]; then exit 1; fi\n/usr/bin/python3 -c 'import os,sys; sys.exit(0 if all(os.isatty(fd) and os.tcgetpgrp(fd) == os.getpgrp() for fd in (0,1,2)) else 9)' || exit $?\ntrap ': >\"$DOT_TEST_SUDO_CLEANED\"; exit 0' TERM\n: >\"$DOT_TEST_SUDO_READY\"\nkill -STOP $$\nwhile :; do :; done\n",
+            "if [ \"${1:-}\" = -n ]; then exit 1; fi\n/usr/bin/python3 -c 'import os,sys; sys.exit(0 if all(os.isatty(fd) and os.tcgetpgrp(fd) == os.getpgrp() for fd in (0,1,2)) else 9)' || exit $?\ntrap ': >\"$DOT_TEST_SUDO_CLEANED\"; exit 0' TERM\n: >\"$DOT_TEST_SUDO_READY\"\nkill -STOP $$\nwhile :; do :; done\n",
         )
         .unwrap();
-        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut master = -1;
         let mut slave = -1;
