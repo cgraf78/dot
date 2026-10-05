@@ -3007,10 +3007,11 @@ assert_cancellation sequential -s
 
 descendants=$DOT_TEST_TMP/descendants
 descendant_pid_file=$DOT_TEST_TMP/descendant.pid
+descendant_exit_file=$DOT_TEST_TMP/descendant.exited
 mkdir -p "$descendants"
 cat >"$descendants/descendant-test" <<'SUITE'
 #!/usr/bin/env bash
-python3 - "$DOT_TEST_DESCENDANT_PID_FILE" <<'PY' &
+python3 - "$DOT_TEST_DESCENDANT_PID_FILE" "$DOT_TEST_DESCENDANT_EXIT_FILE" <<'PY' &
 import os
 import sys
 import time
@@ -3019,6 +3020,8 @@ from pathlib import Path
 os.setpgid(0, 0)
 Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
 time.sleep(4)
+# Written only by a member that outlived its sleep, just before it exits.
+Path(sys.argv[2]).write_text("exited", encoding="utf-8")
 PY
 deadline=$((SECONDS + 5))
 while [[ ! -s $DOT_TEST_DESCENDANT_PID_FILE && $SECONDS -lt $deadline ]]; do
@@ -3031,6 +3034,7 @@ chmod 0755 "$descendants/descendant-test"
 descendant_stderr=$DOT_TEST_TMP/descendant.stderr
 set +e
 DOT_TEST_DESCENDANT_PID_FILE=$descendant_pid_file \
+  DOT_TEST_DESCENDANT_EXIT_FILE=$descendant_exit_file \
   run_tests "$descendants" -s descendant >/dev/null 2>"$descendant_stderr"
 descendant_status=$?
 set -e
@@ -3062,18 +3066,14 @@ $(<"$descendant_stderr")"
 $(<"$descendant_stderr")"
       ;;
   esac
-  if [[ $descendant_status == 1 ]]; then
-    # Status 1 means the session was proven empty, so the member must
-    # already be gone (allowing a moment for it to be reaped), well
-    # before its own 4s lifetime would end it.
-    descendant_pid=$(<"$descendant_pid_file")
-    for _ in $(seq 1 20); do
-      process_is_live "$descendant_pid" || break
-      sleep 0.05
-    done
-    if process_is_live "$descendant_pid"; then
-      fail 'descendant suite reported an empty session while its member ran'
-    fi
+  if [[ $descendant_status == 0 || $descendant_status == 1 ]]; then
+    # Both report an empty session, which on Darwin is only true once the
+    # member has ended on its own: it writes its exit marker right after
+    # its sleep, before exiting. A dot that ignored the member and reported
+    # success while it still ran would leave no marker.
+    [[ -e $descendant_exit_file ]] ||
+      fail "descendant suite returned $descendant_status before its member ended:
+$(<"$descendant_stderr")"
   fi
 else
   [[ $descendant_status == 0 ]] || cat "$descendant_stderr" >&2
