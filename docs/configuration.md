@@ -260,8 +260,9 @@ detail, a merge-hook key and the last line of its output, a repository that
 failed to pull, a file whose local edits skipped a cron run, or the stage's
 own reason (for example Shdeps' last stderr line when it stopped before
 reporting any item). At most five items per stage are kept, followed by
-`more<TAB><stage><TAB><count>`; fields are stripped of control characters and
-capped, and the file stays within 4 KiB. Because an item can carry a line of
+`more<TAB><stage><TAB><count>`; fields have URL credentials redacted, are
+stripped of control characters, and are capped, and the file stays within
+4 KiB. Because an item can carry a line of
 hook or Shdeps output, the file is owner-only like the rest of this directory
 and a clean run removes it. Doctor shows a cause only while its header matches
 `update.last-run`, so a cause left by an older run (or next to a stamp written
@@ -332,11 +333,17 @@ new exit code that existing callers would have to learn.
 
 Every row about a run that did not succeed carries its cause from
 `update.last-failure` when that record describes the run, for example
-`failing: tools: watchexec/watchexec (error: …)` (up to three items, then
-`+N more`), followed by the next step: `shdeps health` when a dependency or
-prune failed, otherwise `dot update` for the full output (including when
-Shdeps itself could not be prepared). State written by a Dot older than the
-record shows the same rows without the cause.
+`failing: tools: watchexec/watchexec (ambiguous interrupted method
+transition)` (up to three items, then `+N more`; a leading `error: ` is
+dropped and a long cause is shortened after a whole word). The next step
+follows on its own `→` line, like every other warning's: `shdeps health`
+when a dependency or prune failed, otherwise `dot update` for the full output
+(including when Shdeps itself could not be prepared). State written by a Dot
+older than the record shows the same rows without the cause. URL credentials
+(`https://user:token@host`) are redacted to `https://***@host` both when the
+record is written and when it is shown, so a record an older Dot wrote is
+redacted on display too (unless its own length cap cut the URL before the
+`@`).
 
 `dot doctor` also reports the last hand-run (`manual` or `init`) update when
 it adds information: `last update succeeded`, `last update degraded: <stages>

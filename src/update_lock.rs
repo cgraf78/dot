@@ -774,7 +774,6 @@ pub fn acquire(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn start_probe_runs_without_host_process_snapshot() {
@@ -868,15 +867,15 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         let ready = scratch.path().join("ps.ready");
         let ps = bin.join("ps");
-        std::fs::write(
+        // The readiness probe exits before touching the ready marker.
+        dot_test_support::publish_fixture_script(
             &ps,
-            format!(
-                "#!/bin/sh\n: >'{}'\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+            &format!(
+                ": >'{}'\ntrap '' TERM\nwhile :; do sleep 1; done\n",
                 ready.display()
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
         // SAFETY: this recursive helper is the only test in its process.
         unsafe { std::env::set_var("PATH", &bin) };
         let lock = lock_path(scratch.path());

@@ -204,8 +204,10 @@ pub fn backup_pull_conflicts(
         }
         if backup.is_none() {
             match backup_dir(inputs.home, warnings) {
-                Some(dir) => backup = Some(dir),
-                None => {
+                Ok(dir) => backup = Some(dir),
+                // Fail closed silently like the shell; the reason is for
+                // diagnostics only.
+                Err(_) => {
                     failed = true;
                     break;
                 }

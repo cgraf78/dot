@@ -42,9 +42,37 @@ fn date_stamp() -> Option<String> {
     crate::temp::local_timestamp()
 }
 
+/// Why [`backup_dir`] produced no directory.
+///
+/// The caller fails closed without printing this, like the shell's silent
+/// `REPLY=""`; the reason exists so a failure can be diagnosed instead of
+/// collapsing every cause into one absent value.
+#[derive(Debug)]
+pub enum BackupDirError {
+    /// A handled signal latched before a creation step.
+    Interrupted,
+    /// The leaf attempt at `path` failed with `error` and ended the search:
+    /// the first non-collision sibling error, or the last collision once
+    /// every randomized sibling was taken. A non-collision error on the
+    /// stamped name does not end the search, so it is reported only when
+    /// no sibling attempt ran. `NotFound` with `root_created == false`
+    /// means the root step failed first, so the forwarded `mkdir`
+    /// diagnostics name that failure.
+    Leaf {
+        /// Directory whose creation failed last.
+        path: std::path::PathBuf,
+        /// Error from that creation.
+        error: std::io::Error,
+        /// Whether the earlier root `mkdir -p` step reported success. A
+        /// `NotFound` leaf after a successful root step points at a root
+        /// removed in between rather than at the root step itself.
+        root_created: bool,
+    },
+}
+
 /// `_backup_dir`: create `$HOME/.dot-backup/pull/<stamp>` and report
-/// it (`Some`), falling back to an exclusive randomized sibling when the stamped name
-/// collides and to `None` when nothing is creatable — the shell's
+/// it (`Ok`), falling back to an exclusive randomized sibling when the stamped name
+/// collides and to an error when nothing is creatable — the shell's
 /// `REPLY=""` plus exit 1. A failed `date` degrades exactly like the
 /// shell's empty command substitution (the join keeps the root, whose
 /// `mkdir` then succeeds on the existing directory).
@@ -52,41 +80,57 @@ fn date_stamp() -> Option<String> {
 /// The shell's first `mkdir -p` is unguarded, so its diagnostics leak
 /// to stderr while creation continues below; the owned helper forwards those
 /// bytes to `warnings`. The stamped and randomized leaf attempts stay
-/// suppressed on both sides.
-pub fn backup_dir(home: &str, warnings: &mut dyn std::io::Write) -> Option<std::path::PathBuf> {
+/// suppressed on both sides; their failure travels only in the returned
+/// [`BackupDirError`].
+pub fn backup_dir(
+    home: &str,
+    warnings: &mut dyn std::io::Write,
+) -> Result<std::path::PathBuf, BackupDirError> {
     use std::os::unix::fs::DirBuilderExt;
     use std::path::Path;
-    crate::cancellation::check().ok()?;
+    let interrupted = |_| BackupDirError::Interrupted;
+    crate::cancellation::check().map_err(interrupted)?;
     let root = Path::new(home).join(".dot-backup/pull");
     // Unguarded like the shell: diagnostics leak while creation
     // continues below.
-    crate::temp::mkdir_forwarded(&root, warnings);
+    let root_created = crate::temp::mkdir_forwarded(&root, warnings);
     let stamp = date_stamp().unwrap_or_default();
     let backup = root.join(stamp);
-    crate::cancellation::check().ok()?;
-    if std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&backup)
-        .is_ok()
-    {
-        return Some(backup);
-    }
+    crate::cancellation::check().map_err(interrupted)?;
+    let mut failure = match std::fs::DirBuilder::new().mode(0o700).create(&backup) {
+        Ok(()) => return Ok(backup),
+        Err(error) => BackupDirError::Leaf {
+            path: backup.clone(),
+            error,
+            root_created,
+        },
+    };
+    let Some(leaf) = backup.file_name() else {
+        return Err(failure);
+    };
+    let leaf = leaf.to_string_lossy();
     for _ in 0..crate::temp::TMP_RETRIES {
-        if crate::cancellation::check().is_err() {
-            return None;
-        }
-        let candidate = root.join(format!(
-            "{}.{}",
-            backup.file_name()?.to_string_lossy(),
-            crate::temp::random_suffix()
-        ));
+        crate::cancellation::check().map_err(interrupted)?;
+        let candidate = root.join(format!("{leaf}.{}", crate::temp::random_suffix()));
         match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
-            Ok(()) => return Some(candidate),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return None,
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                failure = BackupDirError::Leaf {
+                    path: candidate,
+                    error,
+                    root_created,
+                };
+            }
+            Err(error) => {
+                return Err(BackupDirError::Leaf {
+                    path: candidate,
+                    error,
+                    root_created,
+                });
+            }
         }
     }
-    None
+    Err(failure)
 }
 
 /// `_pull_cmd`: run `program` with `args` under `LC_ALL=C`, appending

@@ -8,12 +8,21 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-fn git(cwd: &Path, args: &[&str]) -> String {
+/// Run a fixture `git` in `cwd` with `home` as its `HOME`.
+///
+/// `HOME` must be a scratch directory that no assertion inspects or
+/// removes, never the repository being exercised: host Git tooling may
+/// write per-user state there after `git` itself has returned (an SCM
+/// telemetry wrapper creates `$HOME/.scm.sqlite*` asynchronously, as
+/// `tests/update_run.rs` notes). With `HOME` inside the staged
+/// repository, that late write raced `remove_dir_all` and failed it with
+/// `ENOTEMPTY`.
+fn git(home: &Path, cwd: &Path, args: &[&str]) -> String {
     let out = dot_test_support::git()
         .current_dir(cwd)
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
-        .env("HOME", cwd)
+        .env("HOME", home)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -25,6 +34,7 @@ fn git(cwd: &Path, args: &[&str]) -> String {
 
 struct Case {
     _dir: TempDir,
+    git_home: PathBuf,
     home: PathBuf,
     backup: PathBuf,
     live: PathBuf,
@@ -38,21 +48,24 @@ struct Case {
 impl Case {
     fn new(tag: &str) -> Self {
         let dir = TempDir::new(tag).unwrap();
+        let git_home = dir.path().join("git-home");
         let home = dir.path().join("home");
         let origin = dir.path().join("origin");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&origin).unwrap();
-        git(&origin, &["init", "--quiet"]);
+        for directory in [&git_home, &home, &origin] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        git(&git_home, &origin, &["init", "--quiet"]);
         std::fs::write(origin.join("file.txt"), b"seed\n").unwrap();
-        git(&origin, &["add", "file.txt"]);
-        git(&origin, &["commit", "--quiet", "-m", "seed"]);
-        git(&origin, &["branch", "-M", "main"]);
-        let commit = git(&origin, &["rev-parse", "HEAD"]);
+        git(&git_home, &origin, &["add", "file.txt"]);
+        git(&git_home, &origin, &["commit", "--quiet", "-m", "seed"]);
+        git(&git_home, &origin, &["branch", "-M", "main"]);
+        let commit = git(&git_home, &origin, &["rev-parse", "HEAD"]);
         let backup = home.join(".dot-backup");
         let live = home.join(".dotfiles");
         let record = dir.path().join("record");
         Self {
             _dir: dir,
+            git_home,
             home,
             backup,
             live,
@@ -63,6 +76,13 @@ impl Case {
             identity: "github.com/a/b".into(),
             nonce: "n-1".into(),
         }
+    }
+    /// Fixture `git` in `cwd` with this case's scratch `HOME`.
+    fn git(&self, cwd: &Path, args: &[&str]) -> String {
+        git(&self.git_home, cwd, args)
+    }
+    fn tip(&self, repo: &Path, branch: &str) -> String {
+        self.git(repo, &["rev-parse", &format!("refs/heads/{branch}")])
     }
     fn staged(&self) -> PathBuf {
         self.backup.join("git-stage/repo")
@@ -184,13 +204,10 @@ fn run_stage(c: &Case, d: &Deps) -> Result<()> {
 fn publish(c: &Case, d: &Deps) -> Result<()> {
     d.with(c, |deps| stage::publish_git(&c.inputs(), deps))
 }
-fn tip(p: &Path, branch: &str) -> String {
-    git(p, &["rev-parse", &format!("refs/heads/{branch}")])
-}
 fn assert_stage(c: &Case) {
-    assert_eq!(tip(&c.staged(), &c.branch), c.commit);
+    assert_eq!(c.tip(&c.staged(), &c.branch), c.commit);
     assert_eq!(
-        git(&c.staged(), &["config", "core.worktree"]),
+        c.git(&c.staged(), &["config", "core.worktree"]),
         c.home.display().to_string()
     );
     assert_eq!(
@@ -218,7 +235,7 @@ fn stage_git_clones_fresh_stage() {
         )
         .as_bytes()
     );
-    assert_eq!(git(&c.staged(), &["config", "core.bare"]), "false");
+    assert_eq!(c.git(&c.staged(), &["config", "core.bare"]), "false");
 }
 #[test]
 fn stage_git_reuses_live_git_dir() {
@@ -228,14 +245,14 @@ fn stage_git_reuses_live_git_dir() {
     std::fs::rename(c.staged(), &c.live).unwrap();
     run_stage(&c, &d).unwrap();
     assert!(!c.staged().exists());
-    assert_eq!(tip(&c.live, "main"), c.commit);
+    assert_eq!(c.tip(&c.live, "main"), c.commit);
 }
 #[test]
 fn stage_git_reclones_stale_repo() {
     let c = Case::new("stale");
     let d = Deps::new();
     run_stage(&c, &d).unwrap();
-    git(&c.staged(), &["update-ref", "-d", "refs/heads/main"]);
+    c.git(&c.staged(), &["update-ref", "-d", "refs/heads/main"]);
     run_stage(&c, &d).unwrap();
     assert_stage(&c);
     std::fs::remove_dir_all(c.staged()).unwrap();
@@ -305,7 +322,7 @@ fn stage_git_records_staging_on_late_failure() {
             assert!(!c.record.exists());
         } else if slot == "marker" {
             assert_eq!(&*d.phases.borrow(), &["git-staging"]);
-            assert_eq!(tip(&c.staged(), "main"), c.commit);
+            assert_eq!(c.tip(&c.staged(), "main"), c.commit);
         }
     }
 }
@@ -339,7 +356,7 @@ fn publish_git_moves_staged_live() {
     run_stage(&c, &d).unwrap();
     publish(&c, &d).unwrap();
     assert!(!c.staged().exists());
-    assert_eq!(tip(&c.live, "main"), c.commit);
+    assert_eq!(c.tip(&c.live, "main"), c.commit);
     assert_eq!(d.phases.borrow().last().unwrap(), "publishing");
     publish(&c, &d).unwrap();
 }
@@ -348,7 +365,7 @@ fn publish_git_uses_existing_live() {
     let c = Case::new("existing");
     let d = Deps::new();
     run_stage(&c, &d).unwrap();
-    git(
+    c.git(
         &c.home,
         &[
             "clone",
@@ -365,7 +382,7 @@ fn publish_git_uses_existing_live() {
     .unwrap();
     publish(&c, &d).unwrap();
     assert!(c.staged().exists());
-    assert_eq!(tip(&c.live, "main"), c.commit);
+    assert_eq!(c.tip(&c.live, "main"), c.commit);
 }
 #[test]
 fn publish_git_refuses() {
