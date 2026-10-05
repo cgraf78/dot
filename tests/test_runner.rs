@@ -260,19 +260,34 @@ fn native_success_cleans_descendant_in_separate_process_group() {
 
 #[test]
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn native_tracks_close_fds_setsid_descendant_on_success_and_cancellation() {
+fn native_close_fds_setsid_descendant_detaches_on_success_and_stops_on_cancellation() {
     for cancel in [false, true] {
         let f = Fixture::new();
-        let wait = if cancel { "; time.sleep(4)" } else { "" };
+        // On cancellation the parent stays until Dot stops it, so a starved
+        // test thread cannot signal only after the suite already completed.
+        let wait = if cancel {
+            "; [time.sleep(1) for _ in range(300)]"
+        } else {
+            ""
+        };
+        // The descendant setsids and closes every fd. Dot must stop it on
+        // cancellation, while its Python parent still ties it to the suite,
+        // and must never wait for it. On success Dot deliberately leaves such
+        // a detached process running (pinned by
+        // `normal_exit_does_not_claim_a_detached_closed_lease_descendant` in
+        // `src/cleanup.rs`). Its 60s self-bound is far past `finish`'s 25s
+        // deadline, so a Dot that waited for its natural exit fails there,
+        // and the post-cancellation liveness poll (15s) cannot pass by that
+        // exit. A wall-clock bound on the run would also count Dot's
+        // process-table walks, which a loaded host stretches by seconds.
         f.suite(
             "detached",
             &format!(
-                "python3 -c 'import os,subprocess,time; p=subprocess.Popen([\"/bin/sleep\",\"10\"], start_new_session=True, close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); open(os.environ[\"HOME\"]+\"/descendant\",\"w\").write(str(p.pid)){wait}'\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\""
+                "python3 -c 'import os,subprocess,time; p=subprocess.Popen([\"/bin/sleep\",\"60\"], start_new_session=True, close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); open(os.environ[\"HOME\"]+\"/descendant\",\"w\").write(str(p.pid)){wait}'\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\""
             ),
         );
         let child = f.command(&["-s"]).spawn().unwrap();
         let pid = pid_file(&f.home.join("descendant")).to_string();
-        let started = std::time::Instant::now();
         let output = if cancel {
             signal(child.id(), libc::SIGTERM);
             finish(child)
@@ -286,13 +301,17 @@ fn native_tracks_close_fds_setsid_descendant_on_success_and_cancellation() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "owned close-fds descendant was allowed to reach its self-bound \
-             (cancel={cancel}, elapsed={elapsed:?})"
-        );
-        poll(|| !live(pid.trim()));
+        if cancel {
+            poll(|| !live(pid.trim()));
+        } else if live(pid.trim()) {
+            // Detached on success by design; stop it so it cannot outlive
+            // the test.
+            let pid: i32 = pid.trim().parse().expect("numeric descendant pid");
+            // SAFETY: a positive PID and a valid signal. The descendant was
+            // just seen live and cannot exit on its own before its 60s
+            // self-bound, so the PID still names it.
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        }
     }
 }
 
