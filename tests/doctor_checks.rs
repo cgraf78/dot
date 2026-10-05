@@ -54,11 +54,10 @@ fn renderer_has_stable_protocol() {
 fn update_lock_resolution_clear_and_unsafe() {
     let scratch = TempDir::new("doctor-lock-native").expect("scratch");
     let missing = scratch.path().join("missing");
-    assert!(render(&check_update_lock(None)).contains("path cannot be resolved"));
-    assert!(render(&check_update_lock(Some(&missing))).contains("update lock is clear"));
+    assert!(render(&check_update_lock(&missing)).contains("update lock is clear"));
     let file = scratch.path().join("file");
     std::fs::write(&file, b"unsafe").expect("write");
-    assert!(render(&check_update_lock(Some(&file))).contains("path is unsafe"));
+    assert!(render(&check_update_lock(&file)).contains("path is unsafe"));
 }
 
 #[test]
@@ -66,7 +65,7 @@ fn update_lock_initializing_incomplete_live_and_stale() {
     let scratch = TempDir::new("doctor-lock-states").expect("scratch");
     let fresh = scratch.path().join("fresh");
     std::fs::create_dir_all(&fresh).expect("fresh lock");
-    assert!(render(&check_update_lock(Some(&fresh))).contains("being initialized"));
+    assert!(render(&check_update_lock(&fresh)).contains("being initialized"));
 
     let aged = scratch.path().join("aged");
     std::fs::create_dir_all(&aged).expect("aged lock");
@@ -76,14 +75,14 @@ fn update_lock_initializing_incomplete_live_and_stale() {
         .status()
         .expect("age lock");
     assert!(status.success());
-    assert!(render(&check_update_lock(Some(&aged))).contains("record is incomplete"));
+    assert!(render(&check_update_lock(&aged)).contains("record is incomplete"));
 
     let state = scratch.path().join("state");
     let log = dot::log::Log::new(false, false);
     let mut sink = Vec::new();
     let guard = dot::update_lock::acquire(&state, false, &log, None, &mut sink).expect("lock");
     let live = dot::update_lock::lock_path(&state);
-    let output = render(&check_update_lock(Some(&live)));
+    let output = render(&check_update_lock(&live));
     assert!(output.contains("update is currently running"));
     assert!(output.contains(&format!("pid {}", std::process::id())));
     drop(guard);
@@ -95,7 +94,7 @@ fn update_lock_initializing_incomplete_live_and_stale() {
         "pid\t42424242\nstart\tproc:1\ntoken\tstale\n",
     )
     .expect("owner");
-    assert!(render(&check_update_lock(Some(&stale))).contains("owner is stale"));
+    assert!(render(&check_update_lock(&stale)).contains("owner is stale"));
 }
 
 #[test]
@@ -335,7 +334,7 @@ fn cron_that_never_ran_warns_once_a_manual_update_is_stale() {
     let stale = check(Some(last_run(NOW - 3 * 3600, "ok", "init", "")));
     assert!(stale.contains("⚠ cron update has never run"), "{stale}");
     assert!(
-        stale.contains("last update: init run 3h0m ago\n    → schedule dot update --cron"),
+        stale.contains("last update: init run 3h0m ago\n    → schedule 'dot update --cron'"),
         "{stale}"
     );
     assert!(!stale.contains('✗'), "{stale}");
@@ -348,7 +347,7 @@ fn cron_that_never_ran_warns_once_a_manual_update_is_stale() {
     );
     assert!(
         skipping.contains(
-            "last cron run 1m ago; no successful cron update recorded\n    → run dot status"
+            "last cron run 1m ago; no successful cron update recorded\n    → run 'dot status'"
         ),
         "{skipping}"
     );
@@ -396,7 +395,7 @@ fn hand_run_update_rows_appear_only_when_they_add_information() {
     assert!(failed.contains("✓ cron update succeeded recently"));
     assert!(failed.contains("⚠ last update failed"), "{failed}");
     assert!(
-        failed.contains("manual run 1m ago\n    → run dot update for the full output"),
+        failed.contains("manual run 1m ago\n    → run 'dot update' for the full output"),
         "{failed}"
     );
     assert!(!failed.contains('✗'), "{failed}");
@@ -485,7 +484,7 @@ fn a_newer_cron_failure_is_not_masked_by_a_recent_clean_run() {
     assert!(!rows.contains("succeeded recently"), "{rows}");
     assert!(
         rows.contains(
-            "10m ago; last success 1h40m ago; failing: tools: watchexec/watchexec (ambiguous interrupted method transition)\n    → run shdeps health, or dot update for the full output"
+            "10m ago; last success 1h40m ago\n    - tools: watchexec/watchexec (ambiguous interrupted method transition)\n    → run 'shdeps health', or 'dot update' for the full output"
         ),
         "{rows}"
     );
@@ -505,7 +504,7 @@ fn a_newer_cron_failure_is_not_masked_by_a_recent_clean_run() {
     assert!(rows.contains("⚠ last cron run failed"), "{rows}");
     assert!(
         rows.contains(
-            "failing: repos: dotfiles (pull failed), work (pull failed)\n    → run dot update for the full output"
+            "    - repos: dotfiles (pull failed)\n    - repos: work (pull failed)\n    → run 'dot update' for the full output"
         ),
         "{rows}"
     );
@@ -515,7 +514,7 @@ fn a_newer_cron_failure_is_not_masked_by_a_recent_clean_run() {
     let rows = cron_rows(Some(NOW - 600), Some(fail), None, NOW);
     assert!(rows.contains("⚠ last cron run failed"), "{rows}");
     assert!(
-        rows.contains("1m ago; last success 10m ago\n    → run dot update for the full output"),
+        rows.contains("1m ago; last success 10m ago\n    → run 'dot update' for the full output"),
         "{rows}"
     );
 
@@ -533,7 +532,7 @@ fn a_newer_cron_failure_is_not_masked_by_a_recent_clean_run() {
     );
     let rows = cron_rows(Some(NOW - 600), Some(unavailable), Some(failure), NOW);
     assert!(
-        rows.contains("failing: provider: shdeps (shdeps unavailable; dependency install skipped)\n    → run dot update for the full output"),
+        rows.contains("    - provider: shdeps (shdeps unavailable; dependency install skipped)\n    → run 'dot update' for the full output"),
         "{rows}"
     );
 
@@ -584,7 +583,7 @@ fn causes_attach_to_stale_degraded_and_never_converged_rows() {
     );
     assert!(
         stale.contains(
-            "last success 9h0m ago; last cron run failed 1m ago; failing: configs: 40-claude (exit 3)\n    → run dot update"
+            "last success 9h0m ago; last cron run failed 1m ago\n    - configs: 40-claude (exit 3)\n    → run 'dot update'"
         ),
         "{stale}"
     );
@@ -592,7 +591,7 @@ fn causes_attach_to_stale_degraded_and_never_converged_rows() {
     let never = cron_rows(None, Some(run.clone()), Some(failure.clone()), NOW);
     assert!(
         never.contains(
-            "no successful cron update recorded; last cron run failed 1m ago; failing: configs: 40-claude (exit 3)"
+            "no successful cron update recorded; last cron run failed 1m ago\n    - configs: 40-claude (exit 3)"
         ),
         "{never}"
     );
@@ -616,7 +615,7 @@ fn causes_attach_to_stale_degraded_and_never_converged_rows() {
     );
     assert!(
         degraded.contains(
-            "last converged 1m ago; failing: tools: ripgrep (network)\n    → run shdeps health"
+            "last converged 1m ago\n    - tools: ripgrep (network)\n    → run 'shdeps health'"
         ),
         "{degraded}"
     );
@@ -637,7 +636,7 @@ fn causes_attach_to_stale_degraded_and_never_converged_rows() {
     assert!(newer.contains("⚠ last cron run failed"), "{newer}");
     assert!(
         newer.contains(
-            "1m ago; last success 5h0m ago; last converged 1h30m ago; failing: configs: 40-claude (exit 3)"
+            "1m ago; last success 5h0m ago; last converged 1h30m ago\n    - configs: 40-claude (exit 3)"
         ),
         "{newer}"
     );
@@ -661,14 +660,14 @@ fn update_warn_rows_always_carry_a_next_step() {
         now: NOW,
     }));
     assert!(
-        degraded.contains("last converged 1m ago\n    → run shdeps health, or dot update"),
+        degraded.contains("last converged 1m ago\n    → run 'shdeps health', or 'dot update'"),
         "{degraded}"
     );
     // A host whose cron simply stopped: check the schedule.
     let stopped = cron_rows(Some(NOW - 9 * 3600), None, None, NOW);
     assert!(
         stopped.contains(
-            "last success 9h0m ago\n    → check that dot update --cron is scheduled (crontab -l), or run dot update"
+            "last success 9h0m ago\n    → check that 'dot update --cron' is scheduled ('crontab -l'), or run 'dot update'"
         ),
         "{stopped}"
     );
@@ -699,15 +698,53 @@ fn many_failing_items_fold_into_a_count_and_long_details_shorten() {
         rows.contains("⚠ last update degraded: tools failing"),
         "{rows}"
     );
+    // One item per line, and the two the record never kept fold into the
+    // count on a line of its own.
     assert!(
-        rows.contains(", b, c (why) +3 more\n    → run shdeps health"),
+        rows.contains(
+            "    - tools: b\n    - tools: c (why)\n    - tools: d (why)\n    +2 more\n    → run 'shdeps health'"
+        ),
         "{rows}"
     );
     let shown = rows
         .lines()
-        .find(|line| line.contains("failing:"))
+        .find(|line| line.starts_with("    - tools: a ("))
         .expect("cause line");
-    assert!(shown.contains('…') && shown.len() < 300, "{shown}");
+    assert!(shown.contains('…') && shown.len() < 200, "{shown}");
+}
+
+#[test]
+fn the_more_count_is_not_attached_to_the_last_stage_shown() {
+    // The joined cause appended `+N more` to whichever stage group came
+    // last (`configs: 40-claude (…) +3 more`) even when the uncounted items
+    // were Tools and Prune ones. Each item is its own line now, so the
+    // count stands apart, and past the item limit the renderer adds the
+    // rest to it.
+    const NOW: i64 = 1_800_000_000;
+    let run = last_run(NOW - 60, "degraded", "manual", "tools,prune");
+    let failure = failure_for(
+        &run,
+        &[
+            ("tools", "t1", "x"),
+            ("tools", "t2", "x"),
+            ("configs", "40-claude", "exit 3"),
+            ("prune", "shdeps prune", "x"),
+            ("tools", "t3", "x"),
+            ("tools", "t4", "x"),
+        ],
+        2,
+    );
+    let rows = cron_rows(None, Some(run), Some(failure), NOW);
+    assert!(
+        rows.contains("    - configs: 40-claude (exit 3)\n    - prune: shdeps prune (x)\n"),
+        "{rows}"
+    );
+    assert!(!rows.contains("(exit 3) +"), "{rows}");
+    // Five shown, one past the limit plus the two never kept.
+    assert!(
+        rows.contains("    - tools: t3 (x)\n    +3 more\n"),
+        "{rows}"
+    );
 }
 
 #[test]
@@ -739,7 +776,7 @@ fn a_cron_run_skipped_for_local_edits_names_them() {
     );
     assert!(
         fresh.contains(
-            "last cron run 1m ago; last success 10m ago; edited: .bashrc, .zshrc, .profile +2 more\n    → run dot status, then commit, stash, or resolve the edits"
+            "last cron run 1m ago; last success 10m ago; edited: .bashrc, .zshrc, .profile +2 more\n    → run 'dot status', then commit, stash, or resolve the edits"
         ),
         "{fresh}"
     );
@@ -766,7 +803,7 @@ fn a_cron_run_skipped_for_local_edits_names_them() {
     );
     assert!(
         stopped.contains(
-            "last success 72h0m ago; last cron run skipped for local edits 48h0m ago; edited: .zshrc\n    → run dot status"
+            "last success 72h0m ago; last cron run skipped for local edits 48h0m ago; edited: .zshrc\n    → run 'dot status'"
         ),
         "{stopped}"
     );
@@ -781,7 +818,7 @@ fn a_cron_run_skipped_for_local_edits_names_them() {
     // the cause and the next step.
     let old = cron_rows(Some(NOW - 9 * 3600), Some(run), None, NOW);
     assert!(
-        old.contains("last success 9h0m ago\n    → run dot status, then commit"),
+        old.contains("last success 9h0m ago\n    → run 'dot status', then commit"),
         "{old}"
     );
 }
@@ -795,7 +832,7 @@ fn a_live_update_lock_shows_how_long_it_has_been_held() {
     let guard =
         dot::update_lock::acquire(&state, false, &log, None, &mut Vec::new()).expect("lock");
     let live = dot::update_lock::lock_path(&state);
-    let fresh = render(&check_update_lock(Some(&live)));
+    let fresh = render(&check_update_lock(&live));
     assert!(fresh.contains("⚠ update is currently running"), "{fresh}");
     assert!(
         fresh.contains(&format!("pid {}, running for ", std::process::id())),
@@ -809,14 +846,14 @@ fn a_live_update_lock_shows_how_long_it_has_been_held() {
         .expect("owner file")
         .set_modified(aged)
         .expect("age owner");
-    let hung = render(&check_update_lock(Some(&live)));
+    let hung = render(&check_update_lock(&live));
     assert!(
         hung.contains("⚠ update has been running for 5h12m"),
         "{hung}"
     );
     assert!(
         hung.contains(&format!(
-            "pid {pid}\n    → if it is hung, stop it (kill {pid}) and rerun dot update",
+            "pid {pid}\n    → if it is hung, stop it ('kill {pid}') and rerun 'dot update'",
             pid = std::process::id()
         )),
         "{hung}"
@@ -917,7 +954,7 @@ fn standalone_install_under_shdeps_warns_until_shdeps_adopts_it() {
     );
     assert!(
         running.contains(
-            "Shdeps adopts it on its next update of dot; if this persists, run shdeps health"
+            "Shdeps adopts it on its next update of dot\n    → if this persists, run 'shdeps health'"
         ),
         "{running}"
     );
@@ -1161,7 +1198,7 @@ fn backup_is_reported_even_when_the_install_root_is_gone() {
         "{rows}"
     );
     assert!(
-        rows.contains("the install root is missing; run dot update to reinstall it"),
+        rows.contains("→ the install root is missing; run 'dot update' to reinstall it"),
         "{rows}"
     );
 }
@@ -1252,7 +1289,7 @@ fn merge_outputs_verify_existence() {
     )]);
     assert!(
         missing.contains(&format!(
-            "✗ merge-hook output is missing\n    fixture: {}\n    → run dot update",
+            "✗ merge-hook output is missing\n    fixture: {}\n    → run 'dot update'",
             absent.display()
         )),
         "{missing}"
@@ -1316,7 +1353,7 @@ fn lifecycle_branch_matrix() {
     assert!(pending.contains("profile deactivation pending"));
     assert_eq!(
         hint_of(&pending, "extensions are disabled"),
-        Some("set extension_api=1 and extensions_dir in dot's config, then run dot update"),
+        Some("set extension_api=1 and extensions_dir in dot's config, then run 'dot update'"),
         "{pending}"
     );
 }
@@ -1342,6 +1379,18 @@ fn lifecycle_active_retained_and_retiring_authority_matrix() {
     assert!(output.contains("retained profile deactivation authority unavailable"));
     assert!(output.contains("retiring overlay authority unsafe"));
     assert!(output.contains("profile deactivation pending"));
+    // Each of them says what to do next.
+    assert!(problems_without_a_step(&output).is_empty(), "{output}");
+    assert_eq!(
+        hint_of(
+            &output,
+            "retained profile deactivation authority unavailable"
+        ),
+        Some(
+            "'dot update' activates it once it can clone it; if it cannot, check access to its remote"
+        ),
+        "{output}"
+    );
 }
 
 fn overlays<'a>(
@@ -1463,7 +1512,7 @@ fn overlays_discovery_lifecycle_local_and_sync_matrix() {
         "optional|active|d".into(),
     ];
     input.active_records = vec![
-        format!("local|{local}|||false|none"),
+        format!("local|{local}||/home/test/.config/dot/overlays.d/local.conf|false|none"),
         format!("required|{missing}|||false|git"),
         format!("optional|{missing}|||true|git"),
     ];
@@ -1492,11 +1541,25 @@ fn overlays_discovery_lifecycle_local_and_sync_matrix() {
             "missing {expected:?} in {output}"
         );
     }
-    assert_eq!(
-        hint_of(&output, "required: not cloned"),
-        Some("run dot update to clone it"),
-        "{output}"
-    );
+    // Every failure in the matrix says what to do next.
+    for (row, step) in [
+        ("required: not cloned", "run 'dot update' to clone it"),
+        (
+            "overlay descriptor invalid",
+            "fix or remove that descriptor, then run 'dot update'",
+        ),
+        (
+            "unknown: unknown overlay lifecycle state",
+            "rerun 'dot doctor'; if it persists, report it as a dot bug",
+        ),
+        (
+            "local: local source unavailable",
+            "fix that source, or the path in ~/.config/dot/overlays.d/local.conf, then run 'dot update'",
+        ),
+    ] {
+        assert_eq!(hint_of(&output, row), Some(step), "{row}: {output}");
+    }
+    assert!(problems_without_a_step(&output).is_empty(), "{output}");
 }
 
 #[test]
@@ -1575,6 +1638,12 @@ fn overlays_report_keys_from_a_newer_dot_as_warnings() {
             .filter(|record| record.kind == dot::doctor_runtime::Kind::Warn)
             .count(),
         6,
+        "{output}"
+    );
+    // A typo is fixed by hand; a newer key needs a newer dot.
+    assert!(problems_without_a_step(&output).is_empty(), "{output}");
+    assert!(
+        output.contains("    → fix the key if it is a typo; otherwise update dot to a release that knows it ('dot update' does with Shdeps)"),
         "{output}"
     );
 
@@ -1685,7 +1754,7 @@ fn overlays_git_origin_and_manifest_health_matrix() {
     // so doctor fails on it rather than warning.
     assert!(drift.contains("✗ git: remote URL drift"), "{drift}");
     assert!(
-        drift.contains("verify the checkout, then adopt it with: git -C"),
+        drift.contains("    → verify the checkout, then adopt it: run 'git -C"),
         "{drift}"
     );
     assert!(drift.contains("overlay symlinks healthy"));
@@ -1694,7 +1763,7 @@ fn overlays_git_origin_and_manifest_health_matrix() {
     let malformed = render(&check_overlays(&input));
     assert!(
         malformed.contains(&format!(
-            "⚠ 1 overlay symlink issue(s)\n    - {} line 1: unreadable record\n    → run dot update to re-link\n",
+            "⚠ 1 overlay symlink issue(s)\n    - {} line 1: unreadable record\n    → run 'dot update' to re-link\n",
             manifest.display()
         )),
         "{malformed}"
@@ -1722,7 +1791,7 @@ fn overlays_git_origin_and_manifest_health_matrix() {
         "    - ~/.config/foreign (not a symlink)\n",
         "    - ~/.config/gone (missing)\n",
         "    - ~/.config/orphan (owner retired is not active)\n",
-        "    → run dot update to re-link\n",
+        "    → run 'dot update' to re-link\n",
     ] {
         assert!(issues.contains(item), "missing {item:?}: {issues}");
     }
@@ -1830,7 +1899,7 @@ fn overlay_branch_upstream_and_dirt_follow_update_severities() {
     );
     assert!(
         untracked.contains(&format!(
-            "    → set one: `git -C {} branch --set-upstream-to=origin/side`\n",
+            "    → set one: run 'git -C {0} fetch origin && git -C {0} branch --set-upstream-to=origin/side'\n",
             repo.display()
         )),
         "{untracked}"
@@ -1898,7 +1967,7 @@ fn overlay_branch_upstream_and_dirt_follow_update_severities() {
     let detached = rows();
     assert!(
         detached.contains(
-            "⚠ git: 1 unmerged path(s)\n    resolve them; without a branch and upstream to pull"
+            "⚠ git: 1 unmerged path(s)\n    without a branch and upstream to pull, dot update skips this repository\n    → resolve them"
         ),
         "{detached}"
     );
@@ -1956,6 +2025,38 @@ fn frozen_overlay_rebase_fails_until_rebased_by_hand() {
         "{rows}"
     );
     assert!(rows.contains("skips this optional overlay"), "{rows}");
+
+    // Diverged while frozen: the row points at the manual rebase.
+    let peer = scratch.path().join("peer");
+    let status = dot_test_support::git()
+        .args(["clone", "-q"])
+        .arg(&remote)
+        .arg(&peer)
+        .stdin(Stdio::null())
+        .status()
+        .expect("clone peer");
+    assert!(status.success());
+    git(&peer, &["commit", "-q", "--allow-empty", "-m", "upstream"]);
+    git(&peer, &["push", "-q", "origin", "main"]);
+    git(repo, &["fetch", "-q", "origin"]);
+    git(repo, &["commit", "-q", "--allow-empty", "-m", "local"]);
+    let local = String::from_utf8(
+        dot_test_support::git()
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("HEAD")
+            .stdout,
+    )
+    .expect("utf8 HEAD");
+    std::fs::write(&marker, format!("{0} {0}\n", local.trim())).expect("frozen marker");
+    let rows = render(&check_overlays(&optional));
+    let step = hint_of(&rows, "ov0: diverged from upstream").expect("step");
+    assert!(
+        step.starts_with("rebase it by hand first: run 'git -C "),
+        "{rows}"
+    );
 }
 
 /// `git` in `repo`, stdout trimmed.
@@ -2054,7 +2155,7 @@ fn interrupted_rebase_reads_like_update_not_as_detached() {
     let healable = rows();
     assert!(
         healable.contains(
-            "⚠ ov0: has an interrupted dot rebase\n    the next dot update aborts it, which discards nothing, and pulls\n    → run dot update to finish now\n"
+            "⚠ ov0: has an interrupted dot rebase\n    the next dot update aborts it, which discards nothing, and pulls\n    → run 'dot update' to finish now\n"
         ),
         "{healable}"
     );
@@ -2073,7 +2174,7 @@ fn interrupted_rebase_reads_like_update_not_as_detached() {
     );
     assert!(
         stuck.contains(&format!(
-            "    → run `git -C {repo} rebase --abort`, or resolve it and run `git -C {repo} rebase --continue`\n",
+            "    → run 'git -C {repo} rebase --abort', or resolve it and run 'git -C {repo} rebase --continue'\n",
             repo = repo.display()
         )),
         "{stuck}"
@@ -2098,7 +2199,7 @@ fn interrupted_rebase_reads_like_update_not_as_detached() {
     let detached = rows();
     assert!(
         detached.contains(&format!(
-            "⚠ ov0: HEAD is detached\n    dot update skips this overlay until it is back on a branch\n    → check out its branch: `git -C {} switch BRANCH`\n",
+            "⚠ ov0: HEAD is detached\n    dot update skips this overlay until it is back on a branch\n    → check out its branch: 'git -C {} switch BRANCH'\n",
             repo.display()
         )),
         "{detached}"
@@ -2193,7 +2294,7 @@ fn interrupted_client_rebase_reads_like_update() {
     );
     assert!(
         stuck.contains(&format!(
-            "`git --git-dir={} --work-tree={} rebase --abort`",
+            "'git --git-dir={} --work-tree={} rebase --abort'",
             git_dir.display(),
             home.display()
         )),
@@ -2482,6 +2583,11 @@ fn provider_failure_source_development_and_abi_matrix() {
     )));
     assert!(explicit_output.contains("caller-selected reviewed installer"));
     assert!(explicit_output.contains("ABI mismatch"));
+    assert_eq!(
+        hint_of(&explicit_output, "ABI mismatch"),
+        Some("run 'dot update' to install the reviewed provider release"),
+        "{explicit_output}"
+    );
 
     let mut dev = provider(
         Some("shdeps"),
@@ -2875,7 +2981,18 @@ fn base_repo_upstream_current_ahead_behind_and_diverged() {
     std::fs::remove_file(&marker).expect("remove marker");
 
     git(&home, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
-    assert!(render(&check_base_repo(&inputs())).contains("1 commit(s) ahead"));
+    let ahead = render(&check_base_repo(&inputs()));
+    assert!(ahead.contains("1 commit(s) ahead"), "{ahead}");
+    // Each distance says what to do: update never pushes.
+    assert_eq!(
+        hint_of(&ahead, "client is ahead of upstream"),
+        Some(
+            "push the commits when they are ready: run 'git -C HOME push'"
+                .replace("HOME", home.to_str().expect("utf8"))
+                .as_str()
+        ),
+        "{ahead}"
+    );
 
     git(&home, &["reset", "-q", "--hard", "origin/main"]);
     let peer = scratch.path().join("peer");
@@ -2889,10 +3006,45 @@ fn base_repo_upstream_current_ahead_behind_and_diverged() {
     git(&peer, &["commit", "-q", "--allow-empty", "-m", "behind"]);
     git(&peer, &["push", "-q", "origin", "main"]);
     git(&home, &["fetch", "-q", "origin"]);
-    assert!(render(&check_base_repo(&inputs())).contains("1 commit(s) behind"));
+    let behind = render(&check_base_repo(&inputs()));
+    assert!(behind.contains("1 commit(s) behind"), "{behind}");
+    assert_eq!(
+        hint_of(&behind, "client is behind upstream"),
+        Some("run 'dot update' to pull it"),
+        "{behind}"
+    );
 
     git(&home, &["commit", "-q", "--allow-empty", "-m", "local"]);
-    assert!(render(&check_base_repo(&inputs())).contains("1 ahead, 1 behind"));
+    let diverged = render(&check_base_repo(&inputs()));
+    assert!(diverged.contains("1 ahead, 1 behind"), "{diverged}");
+    assert_eq!(
+        hint_of(&diverged, "client upstream has diverged"),
+        Some("run 'dot update'; it rebases the local commits onto origin/main"),
+        "{diverged}"
+    );
+
+    // Once that rebase froze, `dot update` will not retry it: the diverged
+    // row must point at the manual rebase, not back at `dot update`.
+    let head = String::from_utf8(
+        dot_test_support::git()
+            .arg("-C")
+            .arg(&home)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("HEAD")
+            .stdout,
+    )
+    .expect("utf8 HEAD");
+    std::fs::write(&marker, format!("{} {}\n", head.trim(), head.trim())).expect("marker");
+    let frozen = render(&check_base_repo(&inputs()));
+    assert!(frozen.contains("conflicted; rebase manually"), "{frozen}");
+    let step = hint_of(&frozen, "client upstream has diverged").expect("step");
+    assert!(
+        step.starts_with("rebase it by hand first: run 'git ")
+            && step.contains(" rebase origin/main'")
+            && !step.contains("it rebases the local commits"),
+        "{frozen}"
+    );
 }
 
 /// The `→` next step attached to the first row whose line contains `title`,
@@ -2934,7 +3086,7 @@ fn update_rows_put_the_next_step_on_its_own_line() {
     let rows = cron_rows(Some(NOW - 6000), Some(degraded), Some(tools), NOW);
     assert!(
         rows.contains(
-            "    10m ago; last success 1h40m ago; failing: tools: ripgrep (network)\n    → run shdeps health, or dot update for the full output\n"
+            "    10m ago; last success 1h40m ago\n    - tools: ripgrep (network)\n    → run 'shdeps health', or 'dot update' for the full output\n"
         ),
         "{rows}"
     );
@@ -2943,14 +3095,14 @@ fn update_rows_put_the_next_step_on_its_own_line() {
     let rows = cron_rows(Some(NOW - 600), Some(skip), Some(edits), NOW);
     assert!(
         rows.contains(
-            "    last cron run 1m ago; last success 10m ago; edited: .bashrc\n    → run dot status, then commit, stash, or resolve the edits\n"
+            "    last cron run 1m ago; last success 10m ago; edited: .bashrc\n    → run 'dot status', then commit, stash, or resolve the edits\n"
         ),
         "{rows}"
     );
     let stopped = cron_rows(Some(NOW - 9 * 3600), None, None, NOW);
     assert!(
         stopped.contains(
-            "    last success 9h0m ago\n    → check that dot update --cron is scheduled (crontab -l), or run dot update\n"
+            "    last success 9h0m ago\n    → check that 'dot update --cron' is scheduled ('crontab -l'), or run 'dot update'\n"
         ),
         "{stopped}"
     );
@@ -2958,7 +3110,7 @@ fn update_rows_put_the_next_step_on_its_own_line() {
     let never = cron_rows(None, Some(manual), None, NOW);
     assert_eq!(
         hint_of(&never, "cron update has never run"),
-        Some("schedule dot update --cron to keep this host current"),
+        Some("schedule 'dot update --cron' to keep this host current"),
         "{never}"
     );
 }
@@ -3021,7 +3173,7 @@ fn update_causes_drop_the_error_prefix_and_shorten_at_a_word() {
     let rows = cron_rows(None, Some(run), Some(failure), NOW);
     let line = rows
         .lines()
-        .find(|line| line.contains("failing:"))
+        .find(|line| line.starts_with("    - tools: tmux"))
         .expect("cause line");
     assert!(
         line.contains("tools: tmux (failed to configure tmux: "),
@@ -3053,13 +3205,13 @@ fn update_causes_drop_the_error_prefix_and_shorten_at_a_word() {
 #[test]
 fn update_lock_rows_carry_a_next_step() {
     let scratch = TempDir::new("doctor-lock-steps").expect("scratch");
-    let mut rendered = vec![render(&check_update_lock(None))];
+    let mut rendered = Vec::new();
     let file = scratch.path().join("file");
     std::fs::write(&file, b"unsafe").expect("write");
-    rendered.push(render(&check_update_lock(Some(&file))));
+    rendered.push(render(&check_update_lock(&file)));
     let fresh = scratch.path().join("fresh");
     std::fs::create_dir_all(&fresh).expect("fresh lock");
-    rendered.push(render(&check_update_lock(Some(&fresh))));
+    rendered.push(render(&check_update_lock(&fresh)));
     let aged = scratch.path().join("aged");
     std::fs::create_dir_all(&aged).expect("aged lock");
     let status = Command::new("touch")
@@ -3068,7 +3220,7 @@ fn update_lock_rows_carry_a_next_step() {
         .status()
         .expect("age lock");
     assert!(status.success());
-    rendered.push(render(&check_update_lock(Some(&aged))));
+    rendered.push(render(&check_update_lock(&aged)));
     let stale = scratch.path().join("stale");
     std::fs::create_dir_all(&stale).expect("stale lock");
     std::fs::write(
@@ -3076,13 +3228,13 @@ fn update_lock_rows_carry_a_next_step() {
         "pid\t42424242\nstart\tproc:1\ntoken\tstale\n",
     )
     .expect("owner");
-    rendered.push(render(&check_update_lock(Some(&stale))));
+    rendered.push(render(&check_update_lock(&stale)));
     let state = scratch.path().join("state");
     let log = dot::log::Log::new(false, false);
     let guard =
         dot::update_lock::acquire(&state, false, &log, None, &mut Vec::new()).expect("lock");
-    rendered.push(render(&check_update_lock(Some(
-        &dot::update_lock::lock_path(&state),
+    rendered.push(render(&check_update_lock(&dot::update_lock::lock_path(
+        &state,
     ))));
     drop(guard);
     for rows in &rendered {
@@ -3164,7 +3316,7 @@ fn profile_and_client_failures_name_a_next_step() {
     let invalid = render(&check_overlays(&input));
     assert_eq!(
         hint_of(&invalid, "orphan: active lifecycle record missing"),
-        Some("fix the invalid overlay descriptor reported above, then rerun dot doctor"),
+        Some("fix the invalid overlay descriptor reported above, then rerun 'dot doctor'"),
         "{invalid}"
     );
     input.discovery_error = None;
@@ -3181,22 +3333,149 @@ fn profile_and_client_failures_name_a_next_step() {
             && !local.contains("sync=none"),
         "{local}"
     );
+}
 
-    let home = scratch.path().join("home");
-    let bare = scratch.path().join("bare.git");
-    std::fs::create_dir_all(&home).expect("home");
-    std::fs::create_dir_all(&bare).expect("bare");
-    git(&bare, &["init", "-q", "--bare"]);
-    git(&bare, &["config", "core.bare", "false"]);
-    let unidentified = render(&check_base_repo(&base("separate", &bare, &home)));
-    let step = hint_of(&unidentified, "no worktree identity")
-        .unwrap_or_else(|| panic!("no step in {unidentified}"));
-    assert_eq!(
-        step,
-        format!(
-            "restore it with: git --git-dir={} config core.worktree {}",
-            bare.display(),
-            home.display()
-        )
+#[test]
+fn a_home_reached_through_a_symlink_is_not_a_worktree_mismatch() {
+    // Git prints the physical top level; `$HOME` may be a symlink to it
+    // (a home on another volume). The client is fine, and `dot update`
+    // works, but doctor failed it as a mismatch whose `core.worktree`
+    // step changed nothing.
+    let scratch = TempDir::new("doctor-symlinked-home").expect("scratch");
+    let real = scratch.path().join("real");
+    let link = scratch.path().join("home");
+    std::fs::create_dir_all(&real).expect("real home");
+    std::os::unix::fs::symlink(&real, &link).expect("home link");
+    let git_dir = link.join(".dotfiles");
+    git(
+        &real,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            git_dir.to_str().expect("utf8"),
+        ],
     );
+    std::fs::remove_file(real.join(".git")).expect("drop gitfile");
+    git(&git_dir, &["config", "core.bare", "false"]);
+    git(
+        &git_dir,
+        &["config", "core.worktree", link.to_str().expect("utf8")],
+    );
+    let rendered = render(&check_base_repo(&base("separate", &git_dir, &link)));
+    assert!(
+        rendered.contains("client worktree resolves to $HOME"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("mismatch"), "{rendered}");
+}
+
+#[test]
+fn a_ref_named_head_warns_with_a_rename_that_clears_it() {
+    // After the identity probe stopped tripping on it, a `refs/heads/HEAD`
+    // left every Git command, `dot update`'s included, warning "refname
+    // 'HEAD' is ambiguous" while doctor showed the client as healthy.
+    let scratch = TempDir::new("doctor-head-ref").expect("scratch");
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    git(&home, &["init", "-q", "-b", "main"]);
+    git(&home, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+    git(&home, &["update-ref", "refs/heads/HEAD", "refs/heads/main"]);
+    git(&home, &["pack-refs", "--all"]);
+    git(&home, &["update-ref", "refs/tags/HEAD", "refs/heads/main"]);
+    let rendered = render(&check_base_repo(&base(
+        "ordinary",
+        &home.join(".git"),
+        &home,
+    )));
+    assert!(
+        rendered.contains("⚠ client repository: a ref named HEAD makes HEAD ambiguous"),
+        "{rendered}"
+    );
+    // Loose and packed refs are both found.
+    assert!(
+        rendered.contains("    - refs/tags/HEAD\n    - refs/heads/HEAD\n"),
+        "{rendered}"
+    );
+    for line in rendered
+        .lines()
+        .filter_map(|line| line.strip_prefix("    → rename it: run '"))
+    {
+        let step = line.strip_suffix('\'').expect("quoted step");
+        for command in step.split(" && ") {
+            let words: Vec<&str> = command.split(' ').collect();
+            assert_eq!(words[0], "git", "{command}");
+            let status = dot_test_support::git()
+                .args(&words[1..])
+                .status()
+                .expect("run step");
+            assert!(status.success(), "{command}");
+        }
+    }
+    let cleared = render(&check_base_repo(&base(
+        "ordinary",
+        &home.join(".git"),
+        &home,
+    )));
+    assert!(!cleared.contains("ambiguous"), "{cleared}");
+}
+
+#[test]
+fn renaming_a_symbolic_head_ref_keeps_its_branch_and_overwrites_nothing() {
+    // A symbolic `refs/heads/HEAD` -> `refs/heads/main`: a plain
+    // `update-ref -d` would delete `main` through it, and a fixed
+    // `HEAD-renamed` target would overwrite an earlier rename.
+    let scratch = TempDir::new("doctor-head-symref").expect("scratch");
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    git(&home, &["init", "-q", "-b", "main"]);
+    git(&home, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+    git(&home, &["branch", "HEAD-renamed"]);
+    git(
+        &home,
+        &["symbolic-ref", "refs/heads/HEAD", "refs/heads/main"],
+    );
+    let rendered = render(&check_base_repo(&base(
+        "ordinary",
+        &home.join(".git"),
+        &home,
+    )));
+    let step = rendered
+        .lines()
+        .find_map(|line| line.strip_prefix("    → rename it: run '"))
+        .and_then(|line| line.strip_suffix('\''))
+        .unwrap_or_else(|| panic!("no step in {rendered}"));
+    assert!(
+        step.contains("update-ref refs/heads/HEAD-renamed-2 refs/heads/HEAD"),
+        "{step}"
+    );
+    for command in step.split(" && ") {
+        let words: Vec<&str> = command.split(' ').collect();
+        let status = dot_test_support::git()
+            .args(&words[1..])
+            .status()
+            .expect("run step");
+        assert!(status.success(), "{command}");
+    }
+    for branch in ["main", "HEAD-renamed", "HEAD-renamed-2"] {
+        let status = dot_test_support::git()
+            .arg("-C")
+            .arg(&home)
+            .args([
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("refs/heads/{branch}"),
+            ])
+            .stdout(Stdio::null())
+            .status()
+            .expect("rev-parse");
+        assert!(status.success(), "{branch} is gone");
+    }
+    let cleared = render(&check_base_repo(&base(
+        "ordinary",
+        &home.join(".git"),
+        &home,
+    )));
+    assert!(!cleared.contains("ambiguous"), "{cleared}");
 }

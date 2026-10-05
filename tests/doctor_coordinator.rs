@@ -142,7 +142,11 @@ fn summary_rows_agree() {
 fn identity_refusals_name_the_fix() {
     assert_eq!(
         SpecError::InvalidIdentity.reason("~/x/Bad.sh"),
-        "~/x/Bad.sh has an invalid name; rename it to NN-name using lowercase letters, digits, and hyphens"
+        "~/x/Bad.sh has an invalid name"
+    );
+    assert_eq!(
+        SpecError::InvalidIdentity.step(),
+        "rename it to NN-name using lowercase letters, digits, and hyphens"
     );
     assert_eq!(
         SpecError::DuplicateIdentity {
@@ -150,6 +154,14 @@ fn identity_refusals_name_the_fix() {
             claimed_by: b"20-tools.sh".to_vec(),
         }
         .reason("~/x/21-tools.sh"),
-        "~/x/21-tools.sh repeats identity tools of 20-tools.sh; remove or rename one of them"
+        "~/x/21-tools.sh repeats identity tools of 20-tools.sh"
+    );
+    assert_eq!(
+        SpecError::DuplicateIdentity {
+            identity: Vec::new(),
+            claimed_by: Vec::new(),
+        }
+        .step(),
+        "remove or rename one of them"
     );
 }

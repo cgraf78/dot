@@ -244,13 +244,18 @@ fn abort_rebase(prefix: &[OsString]) {
 /// wrong directory; the base needs its separate git dir and work
 /// tree, which `prefix` already spells out.
 pub(crate) fn git_hint(prefix: &[OsString], args: &str) -> String {
+    crate::repos_pull_support::quote_command(&git_command(prefix, args))
+}
+
+/// The bare command [`git_hint`] quotes, for steps that chain several.
+pub(crate) fn git_command(prefix: &[OsString], args: &str) -> String {
     let mut words = vec!["git".to_string()];
     words.extend(
         prefix
             .iter()
             .map(|word| crate::repos_pull_support::shell_quote(word.as_bytes())),
     );
-    format!("`{} {args}`", words.join(" "))
+    format!("{} {args}", words.join(" "))
 }
 
 /// Why a checkout has no `@{u}` although it is not a deliberate
@@ -306,7 +311,7 @@ impl Stranded {
             }
             StrandedHead::Unhealed => unaborted(prefix),
             StrandedHead::UserSession => format!(
-                "has a merge, cherry-pick, revert, rebase, or `git am` in progress that dot did not start (see {}); pulls are skipped until it finishes",
+                "has a merge, cherry-pick, revert, rebase, or 'git am' in progress that dot did not start (see {}); pulls are skipped until it finishes",
                 git_hint(prefix, "status")
             ),
             StrandedHead::Detached => {
@@ -1271,7 +1276,7 @@ mod tests {
         ];
         assert_eq!(
             git_hint(&prefix, "rebase --abort"),
-            "`git --git-dir=/h/a\\ b/.dotfiles --work-tree=/h/a\\ b rebase --abort`"
+            "'git --git-dir=/h/a\\ b/.dotfiles --work-tree=/h/a\\ b rebase --abort'"
         );
     }
 }

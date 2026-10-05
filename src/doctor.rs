@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::doctor_runtime::Record;
+
 use crate::doctor_checks::{
     BaseRepoInputs, CronInputs, InstallInputs, LifecycleInputs, MergeInputs, MergeSpec,
     OverlayInputs, ProviderInputs, ProviderInstaller,
@@ -175,9 +177,9 @@ fn run_configured(
     emit.emit();
     append(
         emit.recorder(),
-        crate::doctor_checks::check_update_lock(Some(&crate::update_lock::lock_path(
+        crate::doctor_checks::check_update_lock(&crate::update_lock::lock_path(
             runtime.state_home(),
-        ))),
+        )),
     );
     emit.emit();
     append(
@@ -676,7 +678,12 @@ fn runtime_snapshot(
         .unwrap_or_default();
     // Report the Git that Dot's own inspection children run. A probe that
     // misses its deadline means Git did not answer, not that it is missing.
-    let (git_version, git_stalled) = match runtime.git_program().map(|git| {
+    let git_program = runtime.git_program();
+    let git_path = git_program
+        .as_ref()
+        .map(|git| git.as_os_str().as_bytes().to_vec())
+        .unwrap_or_default();
+    let (git_version, git_stalled) = match git_program.map(|git| {
         program_output_typed(
             runtime,
             &git,
@@ -699,8 +706,15 @@ fn runtime_snapshot(
         source_root,
         git_version,
         git_stalled,
+        git_path,
         version: crate::version::VERSION.as_bytes().to_vec(),
         install_kind: None,
+        config_path: runtime
+            .config_home()
+            .join("dot/config")
+            .as_os_str()
+            .as_bytes()
+            .to_vec(),
         unknown_config_keys: config.unknown_keys.clone(),
     }
 }
@@ -967,7 +981,7 @@ fn merge_inventory(
     manifest: &str,
     euid: u32,
     stderr: &mut dyn std::io::Write,
-) -> Result<Vec<MergeSpec>, String> {
+) -> Result<Vec<MergeSpec>, crate::doctor_checks::InventoryError> {
     let Some(root) = config.extensions_dir.as_deref() else {
         return Ok(Vec::new());
     };
@@ -976,9 +990,15 @@ fn merge_inventory(
         return Ok(Vec::new());
     }
     let shown = |path: &Path| crate::doctor_paths::tilde(&path.to_string_lossy(), home);
-    let untrusted = |path: &Path| untrusted_detail(path, home);
-    let meta = std::fs::symlink_metadata(&directory)
-        .map_err(|error| format!("cannot inspect {}: {error}", shown(&directory)))?;
+    let fault =
+        |detail: String, step: &'static str| crate::doctor_checks::InventoryError { detail, step };
+    let untrusted = |path: &Path| fault(untrusted_detail(path, home), TRUST_STEP);
+    let meta = std::fs::symlink_metadata(&directory).map_err(|error| {
+        fault(
+            format!("cannot inspect {}: {error}", shown(&directory)),
+            TRUST_STEP,
+        )
+    })?;
     if !meta.is_dir() || meta.file_type().is_symlink() {
         return Ok(Vec::new());
     }
@@ -995,8 +1015,12 @@ fn merge_inventory(
     if !crate::extension_trust::directory_validate(&directory, root, euid) {
         return Err(untrusted(&directory));
     }
-    let entries = std::fs::read_dir(&directory)
-        .map_err(|error| format!("cannot read {}: {error}", shown(&directory)))?;
+    let entries = std::fs::read_dir(&directory).map_err(|error| {
+        fault(
+            format!("cannot read {}: {error}", shown(&directory)),
+            TRUST_STEP,
+        )
+    })?;
     let mut scripts = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -1027,9 +1051,8 @@ fn merge_inventory(
         match crate::merges::collect_specs(&refs) {
             Ok(specs) => rows = specs,
             Err(crate::merges::SpecError::InvalidIdentity(_)) => {
-                return Err(
-                    crate::doctor_coordinator::SpecError::InvalidIdentity.reason(&shown(path))
-                );
+                let error = crate::doctor_coordinator::SpecError::InvalidIdentity;
+                return Err(fault(error.reason(&shown(path)), error.step()));
             }
             Err(crate::merges::SpecError::DuplicateIdentity(identity)) => {
                 // The earlier claimant is the validated script whose key
@@ -1039,11 +1062,11 @@ fn merge_inventory(
                     (crate::merges::spec_identity(&key).as_ref() == Some(&identity))
                         .then(|| script.file_name().unwrap_or_default().as_bytes().to_vec())
                 });
-                return Err(crate::doctor_coordinator::SpecError::DuplicateIdentity {
+                let error = crate::doctor_coordinator::SpecError::DuplicateIdentity {
                     identity: identity.into_vec(),
                     claimed_by: claimed_by.unwrap_or_default(),
-                }
-                .reason(&shown(path)));
+                };
+                return Err(fault(error.reason(&shown(path)), error.step()));
             }
         }
     }
@@ -1119,9 +1142,8 @@ fn extensions(
     let untrusted = |path: &Path| untrusted_detail(path, &home);
     if !crate::extension_trust::root_validate(root, euid) {
         let detail = untrusted(Path::new(root));
-        emit.recorder().fail(
-            b"doctor extension discovery failed",
-            Some(detail.as_bytes()),
+        emit.recorder().record(
+            Record::fail("doctor extension discovery failed", Some(detail)).with_hint(TRUST_STEP),
         );
         return 1;
     }
@@ -1131,9 +1153,8 @@ fn extensions(
     }
     if !crate::extension_trust::directory_validate(&directory, root, euid) {
         let detail = untrusted(&directory);
-        emit.recorder().fail(
-            b"doctor extension discovery failed",
-            Some(detail.as_bytes()),
+        emit.recorder().record(
+            Record::fail("doctor extension discovery failed", Some(detail)).with_hint(TRUST_STEP),
         );
         return 1;
     }
@@ -1279,17 +1300,17 @@ fn record_rejected(
             ),
         };
         let next = if overlays_unresolved {
-            "the overlays did not resolve; fix the overlay error above, then run dot update"
+            "the overlays did not resolve; fix the overlay error above, then run 'dot update'"
         } else {
-            "run dot update to relink overlay extensions"
+            "run 'dot update' to relink overlay extensions"
         };
         let kind = if links.len() == 1 {
             "a dangling or retired link"
         } else {
             "dangling or retired links"
         };
-        let detail = format!("{subject} not linked from an active overlay ({kind}); {next}");
-        recorder.fail(message.as_bytes(), Some(detail.as_bytes()));
+        let detail = format!("{subject} not linked from an active overlay ({kind})");
+        recorder.record(Record::fail(message, Some(detail)).with_hint(next));
     }
     for script in files {
         let message = format!("{} doctor extension refused", key(script));
@@ -1297,22 +1318,23 @@ fn record_rejected(
         let link =
             std::fs::symlink_metadata(script).is_ok_and(|meta| meta.file_type().is_symlink());
         let detail = if link {
-            format!(
-                "{shown} links to a file that fails the extension trust checks; check its owner and mode"
-            )
+            format!("{shown} links to a file that fails the extension trust checks")
         } else {
             untrusted_detail(script, home)
         };
-        recorder.fail(message.as_bytes(), Some(detail.as_bytes()));
+        recorder.record(Record::fail(message, Some(detail)).with_hint(TRUST_STEP));
     }
 }
 
 /// The detail for an extension path (root, directory, or script) that fails
-/// the trust checks, with the next step.
+/// the trust checks; [`TRUST_STEP`] is its next step.
 fn untrusted_detail(path: &Path, home: &str) -> String {
     let shown = crate::doctor_paths::tilde(&path.to_string_lossy(), home);
-    format!("{shown} fails the extension trust checks; check its owner and mode")
+    format!("{shown} fails the extension trust checks")
 }
+
+/// The next step for an extension path that fails the trust checks.
+pub(crate) const TRUST_STEP: &str = "check its owner and mode";
 
 /// Failure rows for trusted doctor extensions refused for their file name: an
 /// invalid identity, or one an earlier file already claimed. Each names its
@@ -1328,7 +1350,14 @@ fn record_invalid(
         let mut message = crate::doctor_coordinator::extension_key(name).to_vec();
         message.extend_from_slice(b" doctor extension refused");
         let shown = crate::doctor_paths::tilde(&script.to_string_lossy(), home);
-        recorder.fail(&message, Some(error.reason(&shown).as_bytes()));
+        recorder.record(
+            Record::bytes(
+                crate::doctor_runtime::Kind::Fail,
+                &message,
+                Some(error.reason(&shown).as_bytes()),
+            )
+            .with_hint(error.step()),
+        );
     }
 }
 

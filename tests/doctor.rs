@@ -2034,7 +2034,7 @@ fn unsafe_and_malformed_extensions_match_without_the_old_engine() {
     let (shell, native) = pair(&home, &state);
     assert!(
         String::from_utf8_lossy(&native.stdout).contains(
-            "  ✗ doctor extension discovery failed\n    ~/extensions/doctor.d fails the extension trust checks; check its owner and mode\n"
+            "  ✗ doctor extension discovery failed\n    ~/extensions/doctor.d fails the extension trust checks\n    → check its owner and mode\n"
         ),
         "{}",
         String::from_utf8_lossy(&native.stdout)
@@ -2105,7 +2105,7 @@ fn dangling_extension_link_is_refused_alone() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
     assert!(
-        stdout.contains("  ✗ 20-gone doctor extension refused\n    ~/extensions/doctor.d/20-gone.sh is not linked from an active overlay (a dangling or retired link); run dot update to relink overlay extensions\n"),
+        stdout.contains("  ✗ 20-gone doctor extension refused\n    ~/extensions/doctor.d/20-gone.sh is not linked from an active overlay (a dangling or retired link)\n    → run 'dot update' to relink overlay extensions\n"),
         "{stdout}"
     );
     assert!(!stdout.contains("discovery failed"), "{stdout}");
@@ -2137,7 +2137,7 @@ fn untrusted_extension_is_refused_without_running() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
     assert!(
-        stdout.contains("  ✗ 20-writable doctor extension refused\n    ~/extensions/doctor.d/20-writable.sh fails the extension trust checks; check its owner and mode\n"),
+        stdout.contains("  ✗ 20-writable doctor extension refused\n    ~/extensions/doctor.d/20-writable.sh fails the extension trust checks\n    → check its owner and mode\n"),
         "{stdout}"
     );
     assert!(!home.path().join("untrusted-ran").exists());
@@ -2166,7 +2166,7 @@ fn unlinked_overlay_extensions_share_one_refusal_row() {
     assert!(stdout.contains("  ✓ good extension ran\n"), "{stdout}");
     assert_eq!(stdout.matches("doctor extension").count(), 1, "{stdout}");
     assert!(
-        stdout.contains("  ✗ 7 doctor extensions refused\n    20-overlay, 21-overlay, 22-overlay, 23-overlay, 24-overlay, 25-overlay, 26-overlay are not linked from an active overlay (dangling or retired links); run dot update to relink overlay extensions\n"),
+        stdout.contains("  ✗ 7 doctor extensions refused\n    20-overlay, 21-overlay, 22-overlay, 23-overlay, 24-overlay, 25-overlay, 26-overlay are not linked from an active overlay (dangling or retired links)\n    → run 'dot update' to relink overlay extensions\n"),
         "{stdout}"
     );
     assert!(!stdout.contains("owner and mode"), "{stdout}");
@@ -2183,7 +2183,7 @@ fn unlinked_overlay_extensions_share_one_refusal_row() {
     assert!(stdout.contains("overlay descriptor invalid"), "{stdout}");
     assert!(
         stdout.contains(
-            "the overlays did not resolve; fix the overlay error above, then run dot update"
+            "links)\n    → the overlays did not resolve; fix the overlay error above, then run 'dot update'"
         ),
         "{stdout}"
     );
@@ -2230,7 +2230,7 @@ fn authorized_overlay_link_to_an_untrusted_file_keeps_its_own_row() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("✓ ov ("), "{stdout}");
     assert!(
-        stdout.contains("  ✗ 30-ov doctor extension refused\n    ~/extensions/doctor.d/30-ov.sh links to a file that fails the extension trust checks; check its owner and mode\n"),
+        stdout.contains("  ✗ 30-ov doctor extension refused\n    ~/extensions/doctor.d/30-ov.sh links to a file that fails the extension trust checks\n    → check its owner and mode\n"),
         "{stdout}"
     );
     assert!(
@@ -2366,13 +2366,13 @@ fn identity_errors_refuse_only_their_own_extension() {
     let directory = "~/extensions/doctor.d";
     assert!(
         stdout.contains(&format!(
-            "  ✗ 15-Upper doctor extension refused\n    {directory}/15-Upper.sh has an invalid name; rename it to NN-name using lowercase letters, digits, and hyphens\n"
+            "  ✗ 15-Upper doctor extension refused\n    {directory}/15-Upper.sh has an invalid name\n    → rename it to NN-name using lowercase letters, digits, and hyphens\n"
         )),
         "{stdout}"
     );
     assert!(
         stdout.contains(&format!(
-            "  ✗ 21-tools doctor extension refused\n    {directory}/21-tools.sh repeats identity tools of 20-tools.sh; remove or rename one of them\n"
+            "  ✗ 21-tools doctor extension refused\n    {directory}/21-tools.sh repeats identity tools of 20-tools.sh\n    → remove or rename one of them\n"
         )),
         "{stdout}"
     );
@@ -2398,7 +2398,7 @@ fn unsafe_extension_directory_names_the_path_and_next_step() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            "  ✗ doctor extension discovery failed\n    ~/extensions/doctor.d fails the extension trust checks; check its owner and mode\n"
+            "  ✗ doctor extension discovery failed\n    ~/extensions/doctor.d fails the extension trust checks\n    → check its owner and mode\n"
         ),
         "{stdout}"
     );
@@ -2966,7 +2966,7 @@ fn cron_failure_cause_reaches_doctor_end_to_end() {
     );
     assert!(
         stdout.contains(
-            "failing: tools: watchexec/watchexec (blocked transition)\n    → run shdeps health"
+            "    - tools: watchexec/watchexec (blocked transition)\n    → run 'shdeps health'"
         ),
         "{stdout}"
     );
@@ -3241,7 +3241,7 @@ fn unsafe_merge_inventory_matches_without_the_old_engine() {
     let (shell, native) = pair(&home, &state);
     assert!(
         String::from_utf8_lossy(&native.stdout).contains(
-            "  ✗ merge-hook extension inventory is invalid\n    ~/extensions/merge-hooks.d/10-unsafe.sh fails the extension trust checks; check its owner and mode\n"
+            "  ✗ merge-hook extension inventory is invalid\n    ~/extensions/merge-hooks.d/10-unsafe.sh fails the extension trust checks\n    → check its owner and mode\n"
         ),
         "{}",
         String::from_utf8_lossy(&native.stdout)
@@ -3273,7 +3273,7 @@ fn earlier_malformed_merge_identity_precedes_later_unsafe_hook() {
     let (shell, native) = pair(&home, &state);
     assert!(
         String::from_utf8_lossy(&native.stdout).contains(
-            "  ✗ merge-hook extension inventory is invalid\n    ~/extensions/merge-hooks.d/10-Bad.sh has an invalid name; rename it to NN-name using lowercase letters, digits, and hyphens\n"
+            "  ✗ merge-hook extension inventory is invalid\n    ~/extensions/merge-hooks.d/10-Bad.sh has an invalid name\n    → rename it to NN-name using lowercase letters, digits, and hyphens\n"
         ),
         "{}",
         String::from_utf8_lossy(&native.stdout)
@@ -4165,7 +4165,7 @@ fn duplicate_merge_identity_names_the_earlier_hook() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            "  ✗ merge-hook extension inventory is invalid\n    ~/extensions/merge-hooks.d/20-same.serial.sh repeats identity same of 10-same.sh; remove or rename one of them\n"
+            "  ✗ merge-hook extension inventory is invalid\n    ~/extensions/merge-hooks.d/20-same.serial.sh repeats identity same of 10-same.sh\n    → remove or rename one of them\n"
         ),
         "{stdout}"
     );

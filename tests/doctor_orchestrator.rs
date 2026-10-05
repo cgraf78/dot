@@ -34,8 +34,10 @@ fn runtime_check_agrees() {
         source_root: b"/src".to_vec(),
         git_version: Some(b"git version 2".to_vec()),
         git_stalled: false,
+        git_path: b"/usr/bin/git".to_vec(),
         version: b"20261003-000000-abcdef12".to_vec(),
         install_kind: None,
+        config_path: b"/home/u/.config/dot/config".to_vec(),
         unknown_config_keys: Vec::new(),
     };
     check_runtime(&mut rec, &runtime, &engine(b"/src"), b"/home/u");
@@ -57,6 +59,13 @@ fn runtime_check_agrees() {
     let mut failures = Recorder::new();
     check_runtime(&mut failures, &old, &engine(b"/src"), b"");
     assert_eq!(failures.counts().fail, 3);
+    let rendered = String::from_utf8(failures.render()).expect("utf8");
+    assert!(
+        rendered.contains(
+            "  ✗ Bash runtime is too old\n    Bash 4 or newer is required\n    → install Bash 4 or newer, or point DOT_BASH at one\n"
+        ),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -75,8 +84,10 @@ fn a_stalled_git_probe_warns_and_a_missing_git_says_what_to_do() {
         source_root: b"/src".to_vec(),
         git_version: None,
         git_stalled: true,
+        git_path: b"/usr/bin/git".to_vec(),
         version: b"20261003-000000-abcdef12".to_vec(),
         install_kind: None,
+        config_path: b"/home/u/.config/dot/config".to_vec(),
         unknown_config_keys: Vec::new(),
     };
     let mut stalled = Recorder::new();
@@ -84,7 +95,7 @@ fn a_stalled_git_probe_warns_and_a_missing_git_says_what_to_do() {
     let rendered = String::from_utf8(stalled.render()).expect("utf8");
     assert!(
         rendered.contains(
-            "  ⚠ Git runtime did not answer\n    git --version did not answer within 30s\n    → check for a stalled"
+            "  ⚠ Git runtime did not answer\n    /usr/bin/git --version did not answer within 30s\n    → check for a stalled"
         ),
         "{rendered}"
     );
@@ -93,6 +104,7 @@ fn a_stalled_git_probe_warns_and_a_missing_git_says_what_to_do() {
     let mut missing = Recorder::new();
     let gone = RuntimeSnapshot {
         git_stalled: false,
+        git_path: b"/usr/bin/git".to_vec(),
         ..runtime
     };
     check_runtime(&mut missing, &gone, &engine(b"/src"), b"/home/u");
@@ -119,8 +131,10 @@ fn runtime_check_warns_once_per_unknown_config_key() {
         source_root: b"/src".to_vec(),
         git_version: Some(b"git version 2".to_vec()),
         git_stalled: false,
+        git_path: b"/usr/bin/git".to_vec(),
         version: b"20261003-000000-abcdef12".to_vec(),
         install_kind: None,
+        config_path: b"/home/u/.config/dot/config".to_vec(),
         unknown_config_keys: vec![unknown("future_key", 2), unknown("defualt_profile", 3)],
     };
     let mut rec = Recorder::new();
@@ -142,6 +156,15 @@ fn runtime_check_warns_once_per_unknown_config_key() {
             && rendered.contains("  ✗ unknown configuration key ignored\n    defualt_profile"),
         "{rendered}"
     );
+    // A likely typo names its fix; a newer key needs a newer dot.
+    assert!(
+        rendered.contains("    → rename it to 'default_profile' in ~/.config/dot/config\n"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("    → fix the key if it is a typo; otherwise update dot"),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -157,8 +180,10 @@ fn packaged_runtime_does_not_require_checkout_or_bash() {
         source_root: b"/data/cgraf78/dot/releases/v1-linux-x86_64-musl".to_vec(),
         git_version: Some(b"git version 2".to_vec()),
         git_stalled: false,
+        git_path: b"/usr/bin/git".to_vec(),
         version: b"20261003-000000-abcdef12".to_vec(),
         install_kind: None,
+        config_path: b"/home/u/.config/dot/config".to_vec(),
         unknown_config_keys: Vec::new(),
     };
     check_runtime(
@@ -196,8 +221,10 @@ fn version_row_names_how_the_running_build_is_installed() {
             source_root: b"/home/u/.local/share/cgraf78/dot".to_vec(),
             git_version: Some(b"git version 2".to_vec()),
             git_stalled: false,
+            git_path: b"/usr/bin/git".to_vec(),
             version: b"v1".to_vec(),
             install_kind: install_kind.map(str::to_string),
+            config_path: b"/home/u/.config/dot/config".to_vec(),
             unknown_config_keys: Vec::new(),
         };
         let mut snapshot = engine(&runtime.source_root);
@@ -232,8 +259,10 @@ fn version_row_names_how_the_running_build_is_installed() {
             source_root: b"/home/u/git/dot".to_vec(),
             git_version: Some(b"git version 2".to_vec()),
             git_stalled: false,
+            git_path: b"/usr/bin/git".to_vec(),
             version: b"v2".to_vec(),
             install_kind: None,
+            config_path: b"/home/u/.config/dot/config".to_vec(),
             unknown_config_keys: Vec::new(),
         };
         let mut snapshot = engine(&runtime.source_root);
@@ -409,7 +438,7 @@ fn timed_out_extension_files_one_failure_with_its_limit() {
     extension_tail(&mut failed, b"30-bad", WorkerExit::from(3), b"", None);
     assert_eq!(
         String::from_utf8(failed.render()).expect("utf8"),
-        "  ✗ 30-bad doctor extension failed\n    exited with status 3\n"
+        "  ✗ 30-bad doctor extension failed\n    exited with status 3\n    → fix it, or run 'dot update' if its repository has a fix; then rerun 'dot doctor'\n"
     );
 }
 
@@ -427,18 +456,18 @@ fn failure_note_names_where_the_extension_stopped() {
             b"1\0run\0doctor.d/10-x.sh:3\0grep -q a b",
             b"grep: b: No such file\n"
         ),
-        "  ✗ 10-x doctor extension failed\n    exited with status 1 at doctor.d/10-x.sh:3: grep -q a b\n    - grep: b: No such file\n"
+        "  ✗ 10-x doctor extension failed\n    exited with status 1 at doctor.d/10-x.sh:3: grep -q a b\n    - grep: b: No such file\n    → fix doctor.d/10-x.sh:3, or run 'dot update' if its repository has a fix; then rerun 'dot doctor'\n"
     );
     // `doctor` itself returned the status: only the command is known.
     assert_eq!(
         tail(4, b"4\0run\0\0return 4", b""),
-        "  ✗ 10-x doctor extension failed\n    exited with status 4; last command: return 4\n"
+        "  ✗ 10-x doctor extension failed\n    exited with status 4; last command: return 4\n    → fix it, or run 'dot update' if its repository has a fix; then rerun 'dot doctor'\n"
     );
     // A note from an unrelated earlier failure must not point at the wrong
     // line: the worker exited with another status.
     assert_eq!(
         tail(3, b"1\0run\0doctor.d/10-x.sh:3\0false", b""),
-        "  ✗ 10-x doctor extension failed\n    exited with status 3\n"
+        "  ✗ 10-x doctor extension failed\n    exited with status 3\n    → fix it, or run 'dot update' if its repository has a fix; then rerun 'dot doctor'\n"
     );
 }
 
@@ -488,18 +517,18 @@ fn failure_note_covers_load_failures_and_long_output() {
     // The file failed while it was being sourced, with no line to blame.
     assert_eq!(
         tail(1, b"1\0load\0\0", b""),
-        "  ✗ 10-x doctor extension failed\n    exited with status 1 while loading the extension file\n"
+        "  ✗ 10-x doctor extension failed\n    exited with status 1 while loading the extension file\n    → fix it, or run 'dot update' if its repository has a fix; then rerun 'dot doctor'\n"
     );
     // A line in the file's own top level is still named.
     assert_eq!(
         tail(1, b"1\0load\0doctor.d/10-x.sh:2\0false", b""),
-        "  ✗ 10-x doctor extension failed\n    exited with status 1 at doctor.d/10-x.sh:2: false\n"
+        "  ✗ 10-x doctor extension failed\n    exited with status 1 at doctor.d/10-x.sh:2: false\n    → fix doctor.d/10-x.sh:2, or run 'dot update' if its repository has a fix; then rerun 'dot doctor'\n"
     );
     // A crash keeps its last output lines: the explanation comes last.
     let log: String = (1..=8).map(|n| format!("line {n}\n")).collect();
     assert_eq!(
         tail(2, b"", log.as_bytes()),
-        "  ✗ 10-x doctor extension failed\n    exited with status 2; last 5 output lines shown\n    - line 4\n    - line 5\n    - line 6\n    - line 7\n    - line 8\n"
+        "  ✗ 10-x doctor extension failed\n    exited with status 2; last 5 output lines shown\n    - line 4\n    - line 5\n    - line 6\n    - line 7\n    - line 8\n    → fix it, or run 'dot update' if its repository has a fix; then rerun 'dot doctor'\n"
     );
     // Stray output made only of blank lines still says what it was.
     let mut rec = Recorder::new();

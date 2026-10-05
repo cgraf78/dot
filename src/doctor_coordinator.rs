@@ -62,20 +62,28 @@ pub enum SpecError {
 
 impl SpecError {
     /// The reason clause for a refusal row about `shown` (the file as
-    /// displayed), ending in the next step.
+    /// displayed); [`SpecError::step`] is its next step.
     pub fn reason(&self, shown: &str) -> String {
         match self {
-            SpecError::InvalidIdentity => format!(
-                "{shown} has an invalid name; rename it to NN-name using lowercase letters, digits, and hyphens"
-            ),
+            SpecError::InvalidIdentity => format!("{shown} has an invalid name"),
             SpecError::DuplicateIdentity {
                 identity,
                 claimed_by,
             } => format!(
-                "{shown} repeats identity {} of {}; remove or rename one of them",
+                "{shown} repeats identity {} of {}",
                 String::from_utf8_lossy(identity),
                 String::from_utf8_lossy(claimed_by),
             ),
+        }
+    }
+
+    /// The next step for a file refused for its name.
+    pub fn step(&self) -> &'static str {
+        match self {
+            SpecError::InvalidIdentity => {
+                "rename it to NN-name using lowercase letters, digits, and hyphens"
+            }
+            SpecError::DuplicateIdentity { .. } => "remove or rename one of them",
         }
     }
 }
