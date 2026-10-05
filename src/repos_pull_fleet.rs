@@ -478,7 +478,11 @@ pub fn pull_overlays_serial(
         if stage.on_terminal() && !entry.optional {
             let mut detail = b"pulling ".to_vec();
             detail.extend_from_slice(entry.name.as_bytes());
-            let _ = out.write_all(&stage.freeze(&detail, crate::update_engine::now_secs()));
+            let _ = out.write_all(&stage.freeze(
+                &detail,
+                &[b"pulling"],
+                crate::update_engine::now_secs(),
+            ));
         } else {
             let _ = out.write_all(&rendered);
         }
@@ -588,7 +592,8 @@ fn run_chunk(
             b"overlay",
             None,
         ));
-        let _ = out.write_all(&stage.freeze(&detail, crate::update_engine::now_secs()));
+        let _ =
+            out.write_all(&stage.freeze(&detail, &[b"pulling"], crate::update_engine::now_secs()));
     }
     let (completion_tx, completion_rx) = std::sync::mpsc::channel::<()>();
     std::thread::scope(|scope| {
@@ -1062,8 +1067,11 @@ pub fn pull_all(
     // during).
     let terminal = stage.on_terminal();
     if terminal {
-        let _ =
-            out.write_all(&stage.freeze(b"fetching dotfiles", crate::update_engine::now_secs()));
+        let _ = out.write_all(&stage.freeze(
+            b"fetching dotfiles",
+            &[b"fetching"],
+            crate::update_engine::now_secs(),
+        ));
     }
     let base_outcome = pull_base(&base_inputs, moves, out, warnings);
     if terminal {
