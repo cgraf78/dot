@@ -89,7 +89,8 @@ def stop(signum, _frame):
 signal.signal(signal.SIGTERM, stop)
 Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
 Path(sys.argv[2]).write_text("ready", encoding="utf-8")
-while True:
+# TERM only logs, so give up after at least 1200s, past every suite timeout.
+for _ in range(24000):
     time.sleep(0.05)
 """
     child = subprocess.Popen(
@@ -383,7 +384,8 @@ def term(signum, _frame):
 signal.signal(signal.SIGTERM, term)
 Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
 Path(sys.argv[3]).write_text("ready", encoding="utf-8")
-while True:
+# TERM only logs, so give up after at least 1200s, past every suite timeout.
+for _ in range(60000):
     time.sleep(0.02)
 '''
 for depth in (1, 2):
@@ -666,9 +668,12 @@ if child == 0:
         maximum = 65536
     os.closerange(3, keep)
     os.closerange(keep + 1, maximum)
-    while True: time.sleep(1)
+    # Both ignore TERM, so give up after at least 1200s, past every suite
+    # timeout.
+    for _ in range(1200): time.sleep(1)
+    os._exit(0)
 open(sys.argv[2], "w", encoding="ascii").write("ready")
-while True: time.sleep(1)
+for _ in range(1200): time.sleep(1)
 '''
 with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary)
@@ -1190,6 +1195,233 @@ for aliased in (False, True):
             raise AssertionError(("invalid control left a target alive", aliased, target))
 PY
 
+# The cleanup diagnostic bounds only a genuinely blocked caller stream. A
+# wrapper that is descheduled past the write budget while the stream still has
+# room must deliver the diagnostic when it resumes: the healthy-pipe scenario
+# above lost its only failure explanation (125 with empty stderr) when a
+# forked best-effort writer was killed before a loaded host ever scheduled it.
+# A stream that stays full, or that competing writers keep filling, must still
+# release teardown even when the caller blocked SIGALRM. The wrapper must leave
+# no timer or handler of its own behind, and must hand a caller's blocked alarm
+# back intact instead of being killed by it or swallowing it.
+"$timeout_python" - "$timeout_command" <<'PY'
+import fcntl
+import importlib.util
+import os
+import signal
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+
+loader = SourceFileLoader("dot_timeout_bounded_diagnostic", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+if not hasattr(signal, "setitimer") or not hasattr(signal, "pthread_sigmask"):
+    raise SystemExit(0)
+
+MESSAGE = "test-timeout-v1: could not verify child cleanup"
+
+def fill(fd):
+    """Fills a pipe through `fd` without leaving it non-blocking."""
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    try:
+        while True:
+            os.write(fd, b"x" * 4096)
+    except BlockingIOError:
+        pass
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+
+def no_timer_left():
+    """Status 4 when a real-time timer is still armed, else 0."""
+    return 4 if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0) else 0
+
+def run_isolated(sink, prepare, check=no_timer_left):
+    """Runs one diagnostic in a fork whose stderr is `sink`.
+
+    The fork keeps signal state, timers, and fd 2 private to the scenario.
+    Its exit status reports a changed signal mask (2), a leaked SIGALRM
+    handler (3), an escaped exception (5), or what `check` returns (timer
+    state by default: 4 for a leaked timer).
+    """
+    child = os.fork()
+    if child == 0:
+        status = 0
+        try:
+            os.dup2(sink, 2)
+            os.close(sink)
+            prepare()
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+            module.diagnostic(MESSAGE)
+            if signal.pthread_sigmask(signal.SIG_BLOCK, []) != mask:
+                status = 2
+            elif signal.getsignal(signal.SIGALRM) != signal.SIG_DFL:
+                status = 3
+            else:
+                status = check()
+        except BaseException:
+            status = 5
+        os._exit(status)
+    os.close(sink)
+    return child
+
+def wait_bounded(child, seconds):
+    """Reaps `child`, or kills it and reports a hang past `seconds`."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(child, os.WNOHANG)
+        if waited == child:
+            if os.WIFEXITED(status):
+                return os.WEXITSTATUS(status)
+            return -os.WTERMSIG(status)
+        time.sleep(0.01)
+    os.kill(child, signal.SIGKILL)
+    os.waitpid(child, 0)
+    return None
+
+def read_all(fd):
+    """Reads `fd` to EOF and closes it."""
+    chunks = []
+    while chunk := os.read(fd, 65536):
+        chunks.append(chunk)
+    os.close(fd)
+    return b"".join(chunks)
+
+# Stopping the writer just before its write, for well over the write budget
+# plus every tick the contended allowance could count in wall time, stands in
+# for a loaded host descheduling it. Timer ticks coalesce while it is stopped,
+# so after SIGCONT it handles one tick, finds room, and must still deliver the
+# line.
+original_write = module.write_all_fd
+stopped_for = module.DIAGNOSTIC_WRITE_SECONDS + 2 * (
+    module.DIAGNOSTIC_CONTENDED_TICKS * module.PROCESS_POLL_SECONDS
+)
+
+def stopped_write(fd, payload):
+    """Stops this process until the test continues it, then writes."""
+    os.kill(os.getpid(), signal.SIGSTOP)
+    original_write(fd, payload)
+
+def stop_before_write():
+    """Installs the stopping write inside the isolated fork."""
+    module.write_all_fd = stopped_write
+
+source, sink = os.pipe()
+child = run_isolated(sink, stop_before_write)
+waited, stop_status = os.waitpid(child, os.WUNTRACED)
+assert waited == child and os.WIFSTOPPED(stop_status), ("writer did not stop", stop_status)
+time.sleep(stopped_for)
+os.kill(child, signal.SIGCONT)
+status = wait_bounded(child, 30)
+output = read_all(source)
+assert status == 0, ("descheduled diagnostic child", status, output)
+assert output == (MESSAGE + "\n").encode(), (
+    "a writable stream lost the diagnostic after a scheduling stall",
+    output,
+)
+
+def block_alarm():
+    """Blocks SIGALRM the way an exec-inherited caller mask would."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+
+# Loose upper bound for the abandon paths: the 0.25 s budget plus at most
+# DIAGNOSTIC_CONTENDED_TICKS ticks, with generous slack for a loaded host, and
+# still far below the 30 s hang bound.
+ABANDON_BOUND = 15
+
+source, sink = os.pipe()
+fill(sink)
+started = time.monotonic()
+child = run_isolated(sink, block_alarm)
+status = wait_bounded(child, 30)
+elapsed = time.monotonic() - started
+os.close(source)
+assert status is not None, "diagnostic stranded teardown on a full stream"
+assert status == 0, ("full-stream diagnostic child", status)
+assert elapsed < ABANDON_BOUND, ("full-stream diagnostic was slow to give up", elapsed)
+
+# Competing writers that keep taking the room the diagnostic waits for: the
+# stream polls writable but the write stays blocked. The handled-tick allowance
+# must still release teardown.
+def contended_stream():
+    """Fakes a writable poll on a stream that stays full."""
+    block_alarm()
+    module.stream_writable = lambda _fd: True
+
+source, sink = os.pipe()
+fill(sink)
+started = time.monotonic()
+child = run_isolated(sink, contended_stream)
+status = wait_bounded(child, 30)
+elapsed = time.monotonic() - started
+os.close(source)
+assert status is not None, "diagnostic stranded teardown on a contended stream"
+assert status == 0, ("contended diagnostic child", status)
+assert elapsed < ABANDON_BOUND, ("contended diagnostic was slow to give up", elapsed)
+
+# A caller that blocked SIGALRM and armed a short timer must not be killed by
+# its own alarm: the wrapper has to restore the blocked mask before it re-arms
+# the caller's timer. A delayed mask restore widens that window so a wrong
+# order fails every time instead of rarely.
+original_sigmask = signal.pthread_sigmask
+
+def slow_setmask(how, mask):
+    """Delays restoring a mask well past the caller's remaining alarm time."""
+    if how == signal.SIG_SETMASK:
+        time.sleep(0.2)
+    return original_sigmask(how, mask)
+
+def blocked_short_alarm():
+    """Blocks SIGALRM, arms a 50 ms alarm, and slows mask restoration."""
+    block_alarm()
+    signal.setitimer(signal.ITIMER_REAL, 0.05)
+    signal.pthread_sigmask = slow_setmask
+
+def alarm_pends():
+    """Status 6 unless the caller's alarm ends up pending, still blocked."""
+    signal.pthread_sigmask = original_sigmask
+    time.sleep(0.2)
+    return 0 if signal.SIGALRM in signal.sigpending() else 6
+
+source, sink = os.pipe()
+child = run_isolated(sink, blocked_short_alarm, alarm_pends)
+status = wait_bounded(child, 30)
+output = read_all(source)
+assert status == 0, ("caller alarm across the diagnostic", status, output)
+assert output == (MESSAGE + "\n").encode(), ("short-alarm diagnostic", output)
+
+# A caller's repeating timer that already expired while SIGALRM was blocked
+# reads back as (0, interval) with its signal pending. The diagnostic must
+# neither swallow that signal nor drop the timer.
+def blocked_expired_repeating_alarm():
+    """Leaves a repeating alarm expired with its blocked signal pending."""
+    block_alarm()
+    signal.setitimer(signal.ITIMER_REAL, 0.01, 30)
+    time.sleep(0.1)
+    if signal.SIGALRM not in signal.sigpending():
+        raise AssertionError("caller alarm did not pend")
+
+def alarm_and_timer_kept():
+    """Status 7 if the pending alarm was lost, 8 if the timer was dropped.
+
+    Untouched, the timer still reads (0, interval) and reloads when its
+    pending signal is delivered; re-armed at its interval is equivalent.
+    """
+    if signal.SIGALRM not in signal.sigpending():
+        return 7
+    value, interval = signal.getitimer(signal.ITIMER_REAL)
+    return 0 if interval == 30 and value >= 0 else 8
+
+source, sink = os.pipe()
+child = run_isolated(sink, blocked_expired_repeating_alarm, alarm_and_timer_kept)
+status = wait_bounded(child, 30)
+output = read_all(source)
+assert status == 0, ("expired repeating caller alarm", status, output)
+assert output == (MESSAGE + "\n").encode(), ("repeating-alarm diagnostic", output)
+PY
+
 # A Linux relay can be blocked inside a write after a readiness notification;
 # its liveness pipe cannot be polled in that state. Parent-death SIGKILL must
 # still close the lifetime if the wrapper itself is killed uncatchably.
@@ -1237,8 +1469,11 @@ if owner == 0:
         os._exit(9)
     os.close(ready_write)
     os.close(sink)
-    while True:
+    # Only the KILL below ends this owner, and a failed assertion skips it,
+    # so give up after at least 1200s, past every suite timeout.
+    for _ in range(1200):
         time.sleep(1)
+    os._exit(0)
 
 os.close(ready_write)
 os.close(sink)
@@ -1313,11 +1548,13 @@ module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
 module.os.pidfd_open = None
 module.signal.pidfd_send_signal = None
+# Both loops give up after at least 1200s, past every suite timeout, in case
+# this helper dies before the escaped member is killed.
 script = """
 trap 'exit 0' TERM
-(trap '' TERM; printf '%s\\n' "$BASHPID" >"$1"; while :; do sleep 1; done) &
+(trap '' TERM; printf '%s\\n' "$BASHPID" >"$1"; for _ in {1..1200}; do sleep 1; done) &
 while [[ ! -s $1 ]]; do sleep 0.01; done
-while :; do sleep 1; done
+for _ in {1..1200}; do sleep 1; done
 """
 status = module.main(["test-timeout-v1", "0.5", "/bin/bash", "-c", script, "fixture", sys.argv[2]])
 pid = int(Path(sys.argv[2]).read_text(encoding="ascii"))
@@ -2780,10 +3017,11 @@ assert_cancellation sequential -s
 
 descendants=$DOT_TEST_TMP/descendants
 descendant_pid_file=$DOT_TEST_TMP/descendant.pid
+descendant_exit_file=$DOT_TEST_TMP/descendant.exited
 mkdir -p "$descendants"
 cat >"$descendants/descendant-test" <<'SUITE'
 #!/usr/bin/env bash
-python3 - "$DOT_TEST_DESCENDANT_PID_FILE" <<'PY' &
+python3 - "$DOT_TEST_DESCENDANT_PID_FILE" "$DOT_TEST_DESCENDANT_EXIT_FILE" <<'PY' &
 import os
 import sys
 import time
@@ -2792,6 +3030,8 @@ from pathlib import Path
 os.setpgid(0, 0)
 Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
 time.sleep(4)
+# Written only by a member that outlived its sleep, just before it exits.
+Path(sys.argv[2]).write_text("exited", encoding="utf-8")
 PY
 deadline=$((SECONDS + 5))
 while [[ ! -s $DOT_TEST_DESCENDANT_PID_FILE && $SECONDS -lt $deadline ]]; do
@@ -2801,18 +3041,52 @@ done
 "$DOT_TEST_REPORTER" complete 1 0
 SUITE
 chmod 0755 "$descendants/descendant-test"
+descendant_stderr=$DOT_TEST_TMP/descendant.stderr
 set +e
 DOT_TEST_DESCENDANT_PID_FILE=$descendant_pid_file \
-  run_tests "$descendants" -s descendant >/dev/null
+  DOT_TEST_DESCENDANT_EXIT_FILE=$descendant_exit_file \
+  run_tests "$descendants" -s descendant >/dev/null 2>"$descendant_stderr"
 descendant_status=$?
 set -e
 if [[ $(uname -s) == Darwin ]]; then
-  # Without pidfds there is no safe delivery to a cross-group
-  # descendant, so the worker fails closed with 125; the liveness
-  # wait below still verifies no leak either way.
-  [[ $descendant_status == 0 || $descendant_status == 125 ]] ||
-    fail "descendant suite returned unexpected status $descendant_status"
+  # Without pidfds the dot test worker has no safe delivery to a
+  # cross-group descendant: it refuses the unpinned signal and records
+  # "safe descendant delivery has no stable process authority", which by
+  # design does not mark cleanup incomplete. The member sleeps 4s, so the
+  # status depends on when it exits on its own:
+  # - 0: it was gone before the worker's teardown observed it;
+  # - 1: the refusal is the run's error and the session was then proven
+  #   empty because the member exited during verification (the native
+  #   `native_changed_process_group_fails_closed_without_unpinned_signal`
+  #   test pins exactly this);
+  # - 125: the final lease poll still saw the member, so cleanup was
+  #   marked incomplete; the refusal is reported then too.
+  # Both fail-closed statuses must name the refusal, so an unrelated
+  # teardown failure cannot pass as one of them.
+  case $descendant_status in
+    0) ;;
+    1 | 125)
+      grep -q 'safe descendant delivery has no stable process authority' \
+        "$descendant_stderr" ||
+        fail "descendant suite returned $descendant_status without the authority refusal:
+$(<"$descendant_stderr")"
+      ;;
+    *)
+      fail "descendant suite returned unexpected status $descendant_status:
+$(<"$descendant_stderr")"
+      ;;
+  esac
+  if [[ $descendant_status == 0 || $descendant_status == 1 ]]; then
+    # Both report an empty session, which on Darwin is only true once the
+    # member has ended on its own: it writes its exit marker right after
+    # its sleep, before exiting. A dot that ignored the member and reported
+    # success while it still ran would leave no marker.
+    [[ -e $descendant_exit_file ]] ||
+      fail "descendant suite returned $descendant_status before its member ended:
+$(<"$descendant_stderr")"
+  fi
 else
+  [[ $descendant_status == 0 ]] || cat "$descendant_stderr" >&2
   assert_eq 0 "$descendant_status" \
     'descendant suite cleans its cross-group member'
 fi

@@ -41,8 +41,8 @@ fn assert_bounded(
 fn probe_script(tag: &str, body: &str) -> (TempDir, PathBuf) {
     let dir = TempDir::new_exec(tag).expect("exec dir");
     let path = dir.path().join("probe");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("probe fixture");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    dot_test_support::install_fixture_executable(&path, format!("#!/bin/sh\n{body}"), 0o755)
+        .expect("install fixture");
     (dir, path)
 }
 

@@ -198,38 +198,50 @@ fn lock_owner_record(
         Activity::Active => match age {
             Some(age) if age > CRON_STALE_AFTER_SECS => Record::warn(
                 format!("update has been running for {}", format_age(age)),
-                Some(format!(
-                    "pid {pid}; if it is hung, stop it (kill {pid}) and rerun dot update",
-                    pid = owner.pid
-                )),
-            ),
+                Some(format!("pid {}", owner.pid)),
+            )
+            .with_hint(format!(
+                "if it is hung, stop it (kill {pid}) and rerun dot update",
+                pid = owner.pid
+            )),
             Some(age) => Record::warn(
                 "update is currently running",
                 Some(format!(
-                    "pid {}, running for {}; wait for it to finish",
+                    "pid {}, running for {}",
                     owner.pid,
                     format_age(age)
                 )),
-            ),
+            )
+            .with_hint("wait for it to finish"),
             None => Record::warn(
                 "update is currently running",
                 Some(format!("pid {}", owner.pid)),
-            ),
+            )
+            .with_hint("wait for it to finish"),
         },
         Activity::Stale => Record::warn(
             "update lock owner is stale",
-            Some("the next mutating command will reclaim it".to_string()),
-        ),
+            Some(format!("pid {} no longer holds it", owner.pid)),
+        )
+        .with_hint("run dot update; it reclaims the stale lock"),
         Activity::Unknown => Record::fail(
             "update lock owner cannot be verified",
-            Some("mutating commands refuse until the owner probe succeeds".to_string()),
-        ),
+            Some(format!(
+                "pid {}; mutating commands refuse until the owner probe succeeds",
+                owner.pid
+            )),
+        )
+        .with_hint(format!(
+            "check that ps -o lstart= -p {} prints a start time, then rerun dot doctor",
+            owner.pid
+        )),
         // Only this doctor run was interrupted mid-probe; nothing about the
         // lock is known to be wrong.
         Activity::Interrupted => Record::warn(
             "update lock owner cannot be verified",
             Some("the owner probe was interrupted".to_string()),
-        ),
+        )
+        .with_hint("rerun dot doctor"),
     }
 }
 
@@ -249,7 +261,13 @@ fn lock_owner_record(
 pub fn check_update_lock(lock_dir: Option<&Path>) -> Vec<Record> {
     let mut out = vec![Record::section("Update lock")];
     let Some(dir) = lock_dir else {
-        out.push(Record::fail("update lock path cannot be resolved", None));
+        // The lock lives under the state directory, which comes from HOME
+        // or XDG_STATE_HOME.
+        out.push(
+            Record::fail("update lock path cannot be resolved", None).with_hint(
+                "set HOME (or XDG_STATE_HOME) to a usable directory, then rerun dot doctor",
+            ),
+        );
         return out;
     };
     let present = std::fs::symlink_metadata(dir).is_ok();
@@ -263,10 +281,13 @@ pub fn check_update_lock(lock_dir: Option<&Path>) -> Vec<Record> {
     // `[[ ! -d $lock_dir || -L $lock_dir ]]`: `-d` follows links,
     // so a symlink to a directory still fails the second arm.
     if !is_dir || is_link {
-        out.push(Record::fail(
-            "update lock path is unsafe",
-            Some(dir.to_string_lossy().into_owned()),
-        ));
+        out.push(
+            Record::fail(
+                "update lock path is unsafe",
+                Some(dir.to_string_lossy().into_owned()),
+            )
+            .with_hint("it must be a real directory: remove it, then rerun dot update"),
+        );
         return out;
     }
     if let Some(owner) = crate::update_lock::read_owner(dir) {
@@ -284,12 +305,20 @@ pub fn check_update_lock(lock_dir: Option<&Path>) -> Vec<Record> {
             age,
         ));
     } else if crate::update_lock::is_initializing(dir) {
-        out.push(Record::warn("update lock is being initialized", None));
+        // An update is between creating the lock and writing its owner; a
+        // crash there turns into the incomplete record below within seconds.
+        out.push(
+            Record::warn("update lock is being initialized", None)
+                .with_hint("rerun dot doctor in a few seconds"),
+        );
     } else {
-        out.push(Record::warn(
-            "update lock record is incomplete",
-            Some("the next mutating command will attempt recovery".to_string()),
-        ));
+        out.push(
+            Record::warn(
+                "update lock record is incomplete",
+                Some("it has no owner record".to_string()),
+            )
+            .with_hint("run dot update; it recovers the lock"),
+        );
     }
     out
 }
@@ -575,14 +604,11 @@ fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
     if let Some(last) =
         problem.filter(|last| last.outcome == OUTCOME_SKIP && !is_stale(last.at, inputs.now))
     {
-        out.push(Record::warn(
+        let cause = skip_cause(inputs, last);
+        out.push(cause.attach(Record::warn(
             "cron update skipping: local edits block it",
-            Some(format!(
-                "last cron run {} ago; {since}; {}",
-                age(last.at),
-                skip_cause(inputs, last)
-            )),
-        ));
+            Some(cause.detail(format!("last cron run {} ago; {since}", age(last.at)))),
+        )));
         return None;
     }
     let fresh_clean = clean.filter(|clean| !is_stale(*clean, inputs.now));
@@ -594,14 +620,11 @@ fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
             ));
             return Some(clean);
         };
-        out.push(Record::warn(
+        let cause = run_cause(inputs, last);
+        out.push(cause.attach(Record::warn(
             format!("last cron run {}", outcome_phrase(last)),
-            Some(format!(
-                "{} ago; {since}; {}",
-                age(last.at),
-                run_cause(inputs, last)
-            )),
-        ));
+            Some(cause.detail(format!("{} ago; {since}", age(last.at)))),
+        )));
         return None;
     }
     if let Some(converged) = converged
@@ -610,15 +633,15 @@ fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
         // A cron run after that degraded convergence did not converge: it
         // is the news, and the degraded stages would mislabel its cause.
         if let Some(last) = problem.filter(|last| last.at > converged.at) {
-            out.push(Record::warn(
+            let cause = run_cause(inputs, last);
+            out.push(cause.attach(Record::warn(
                 format!("last cron run {}", outcome_phrase(last)),
-                Some(format!(
-                    "{} ago; {since}; last converged {} ago; {}",
+                Some(cause.detail(format!(
+                    "{} ago; {since}; last converged {} ago",
                     age(last.at),
-                    age(converged.at),
-                    run_cause(inputs, last)
-                )),
-            ));
+                    age(converged.at)
+                ))),
+            )));
             return None;
         }
         let since = match inputs.last_success {
@@ -630,24 +653,21 @@ fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
         let cause = problem
             .filter(|last| last.at == converged.at)
             .map(|last| run_cause(inputs, last))
-            .unwrap_or_else(|| next_step(stages_need_shdeps(&converged.failing)).to_string());
-        let cause = format!("; {cause}");
-        out.push(Record::warn(
+            .unwrap_or_else(|| Cause::step(next_step(stages_need_shdeps(&converged.failing))));
+        out.push(cause.attach(Record::warn(
             format!("cron update degraded: {} failing", converged.failing),
-            Some(format!(
-                "{since}; last converged {} ago{cause}",
-                age(converged.at)
-            )),
-        ));
+            Some(cause.detail(format!("{since}; last converged {} ago", age(converged.at)))),
+        )));
         return None;
     }
     // The newest failing cron run, named with its cause: the stale titles
     // below describe the host, not that run. Without one, cron itself may
     // have stopped running.
     let cause = match problem {
-        Some(last) => format!("; {}", last_cron_note(inputs, last)),
-        None => "; check that dot update --cron is scheduled (crontab -l), or run dot update"
-            .to_string(),
+        Some(last) => last_cron_note(inputs, last),
+        None => {
+            Cause::step("check that dot update --cron is scheduled (crontab -l), or run dot update")
+        }
     };
     // Stale from here on. `clean` (not just last-success) is the success
     // reference, so a lone clean convergence stamp reads as a success. Only
@@ -658,38 +678,39 @@ fn cron_freshness(inputs: &CronInputs, out: &mut Vec<Record>) -> Option<i64> {
         .map(|converged| format!("; last converged {} ago", age(converged.at)))
         .unwrap_or_default();
     match clean {
-        Some(clean) => out.push(Record::warn(
+        Some(clean) => out.push(cause.attach(Record::warn(
             "cron update has not succeeded recently",
-            Some(format!(
-                "last success {} ago{converged_note}{cause}",
-                age(clean)
-            )),
-        )),
+            Some(cause.detail(format!("last success {} ago{converged_note}", age(clean)))),
+        ))),
         // Only degraded runs ever converged, and they stopped too.
-        None if converged.is_some() => out.push(Record::warn(
+        None if converged.is_some() => out.push(cause.attach(Record::warn(
             "cron update has not succeeded recently",
-            Some(format!(
-                "no successful cron update recorded{converged_note}{cause}"
-            )),
-        )),
+            Some(cause.detail(format!(
+                "no successful cron update recorded{converged_note}"
+            ))),
+        ))),
         None => out.push(never_converged_record(inputs)),
     }
     None
 }
 
-/// `last cron run <outcome> <age> ago; <cause and next step>`, for rows
-/// whose title describes the host rather than that run.
-fn last_cron_note(inputs: &CronInputs, last: &crate::update_status::LastRun) -> String {
+/// `last cron run <outcome> <age> ago[; <cause>]` plus that run's next
+/// step, for rows whose title describes the host rather than that run.
+fn last_cron_note(inputs: &CronInputs, last: &crate::update_status::LastRun) -> Cause {
     let why = if last.outcome == crate::update_status::OUTCOME_SKIP {
         skip_cause(inputs, last)
     } else {
         run_cause(inputs, last)
     };
-    format!(
-        "last cron run {} {} ago; {why}",
+    let note = why.detail(format!(
+        "last cron run {} {} ago",
         outcome_phrase(last),
         crate::update_status::format_age(inputs.now.saturating_sub(last.at))
-    )
+    ));
+    Cause {
+        listed: Some(note),
+        step: why.step,
+    }
 }
 
 /// `failed`, `degraded: <stages> failing`, `skipped for local edits`, or a
@@ -722,22 +743,100 @@ fn failure_of<'a>(
 /// Failing items shown in one row before `+N more`.
 const SHOWN_FAILURE_ITEMS: usize = 3;
 
-/// Longest item detail shown in a row (the record keeps more).
-const SHOWN_FAILURE_DETAIL_BYTES: usize = 100;
+/// Longest item detail shown in a row (the record keeps more): room for a
+/// typical one-line error, while three items still fit a wide terminal row.
+const SHOWN_FAILURE_DETAIL_BYTES: usize = 120;
 
-/// Why `run` failed plus the next step, for a row detail:
-/// `failing: tools: ripgrep (network unavailable); <next step>`. Without a
+/// What a row about a run that did not succeed says beyond its title: the
+/// cause, which joins the row's detail, and the next step, which renders as
+/// the row's `→` hint like every other section's steps.
+struct Cause {
+    /// The cause (`failing: …`, `edited: …`, or a whole note about the
+    /// last cron run), or `None` when nothing names it (an older Dot wrote
+    /// the stamp, or the run recorded no item).
+    listed: Option<String>,
+    /// The next step.
+    step: &'static str,
+}
+
+impl Cause {
+    /// A cause that is only its next step.
+    fn step(step: &'static str) -> Self {
+        Cause { listed: None, step }
+    }
+
+    /// `facts` followed by the cause, when there is one.
+    fn detail(&self, facts: String) -> String {
+        match &self.listed {
+            Some(listed) => format!("{facts}; {listed}"),
+            None => facts,
+        }
+    }
+
+    /// `record` with the next step attached as its hint.
+    fn attach(&self, record: Record) -> Record {
+        record.with_hint(self.step)
+    }
+}
+
+/// One recorded item detail as a row shows it: a leading `error: ` (the
+/// recording tool's own prefix, which says nothing the row's warning does
+/// not) dropped, then shortened after a whole word with an ellipsis. The
+/// record itself keeps the full, already sanitized text.
+fn shown_detail(detail: &str) -> String {
+    let detail = detail.trim();
+    let detail = detail
+        .strip_prefix("error: ")
+        .unwrap_or(detail)
+        .trim_start();
+    shorten(detail, SHOWN_FAILURE_DETAIL_BYTES)
+}
+
+/// `text` cut to at most `max` bytes, ellipsis included, after the last
+/// whole word that fits: a cut mid-word reads as a typo.
+/// Trailing clause punctuation goes too, so a cut at a clause boundary
+/// reads cleanly. A single word longer than the budget (a path, a URL) is
+/// cut at a character boundary instead, since no word boundary exists.
+fn shorten(text: &str, max: usize) -> String {
+    const ELLIPSIS: char = '…';
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut cut = max.saturating_sub(ELLIPSIS.len_utf8());
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    // Ending exactly before a space or clause punctuation keeps the whole
+    // last word; otherwise back off to the previous space, unless that would
+    // drop more than half of the budget.
+    let end = if text[cut..].starts_with([' ', ',', ';', ':']) {
+        cut
+    } else {
+        match text[..cut].rfind(' ') {
+            Some(space) if space >= cut / 2 => space,
+            _ => cut,
+        }
+    };
+    let mut out = text[..end]
+        .trim_end_matches([' ', ',', ';', ':'])
+        .to_string();
+    out.push(ELLIPSIS);
+    out
+}
+
+/// Why `run` failed plus the next step: `failing: tools: ripgrep (network
+/// unavailable)` for the row detail, and the step for its hint. Without a
 /// matching record (an older Dot wrote the stamp, or the run named nothing)
 /// only the next step remains. A failing Tools or Prune stage points at
 /// `shdeps health`, which explains dependency state without a rerun.
-fn run_cause(inputs: &CronInputs, run: &crate::update_status::LastRun) -> String {
-    use crate::update_status::{STAGE_PRUNE, STAGE_TOOLS, clean_field};
+fn run_cause(inputs: &CronInputs, run: &crate::update_status::LastRun) -> Cause {
+    use crate::update_status::{STAGE_PRUNE, STAGE_TOOLS};
 
     let failure = failure_of(inputs, run);
     let items = failure.map_or(&[][..], |failure| failure.items.as_slice());
     let mut groups: Vec<(&str, Vec<String>)> = Vec::new();
     for item in items.iter().take(SHOWN_FAILURE_ITEMS) {
-        let detail = clean_field(&item.detail, SHOWN_FAILURE_DETAIL_BYTES);
+        let detail = shown_detail(&item.detail);
         let text = match (item.name.is_empty(), detail.is_empty()) {
             (false, false) => format!("{} ({detail})", item.name),
             (false, true) => item.name.clone(),
@@ -760,9 +859,9 @@ fn run_cause(inputs: &CronInputs, run: &crate::update_status::LastRun) -> String
             .iter()
             .any(|item| item.stage == STAGE_TOOLS || item.stage == STAGE_PRUNE)
     };
-    let hint = next_step(dependency);
+    let step = next_step(dependency);
     if groups.is_empty() {
-        return hint.to_string();
+        return Cause::step(step);
     }
     let mut listed = groups
         .iter()
@@ -772,7 +871,10 @@ fn run_cause(inputs: &CronInputs, run: &crate::update_status::LastRun) -> String
     if more > 0 {
         listed.push_str(&format!(" +{more} more"));
     }
-    format!("failing: {listed}; {hint}")
+    Cause {
+        listed: Some(format!("failing: {listed}")),
+        step,
+    }
 }
 
 /// Whether a comma-separated degraded stage list names a dependency stage
@@ -795,13 +897,13 @@ fn next_step(dependency: bool) -> &'static str {
     }
 }
 
-/// The edited files that skipped `run` (a cron skip) plus the next step:
-/// `edited: .bashrc, .zshrc; <next step>`. The record keeps the first few;
-/// without one (an older Dot) only the next step remains.
-fn skip_cause(inputs: &CronInputs, run: &crate::update_status::LastRun) -> String {
-    let hint = "run dot status, then commit, stash, or resolve the edits";
+/// The edited files that skipped `run` (a cron skip), `edited: .bashrc,
+/// .zshrc`, plus the next step. The record keeps the first few; without one
+/// (an older Dot) only the next step remains.
+fn skip_cause(inputs: &CronInputs, run: &crate::update_status::LastRun) -> Cause {
+    let step = "run dot status, then commit, stash, or resolve the edits";
     let Some(failure) = failure_of(inputs, run) else {
-        return hint.to_string();
+        return Cause::step(step);
     };
     let files: Vec<&str> = failure
         .items
@@ -810,7 +912,7 @@ fn skip_cause(inputs: &CronInputs, run: &crate::update_status::LastRun) -> Strin
         .map(|item| item.name.as_str())
         .collect();
     if files.is_empty() {
-        return hint.to_string();
+        return Cause::step(step);
     }
     let mut listed = files
         .iter()
@@ -822,7 +924,10 @@ fn skip_cause(inputs: &CronInputs, run: &crate::update_status::LastRun) -> Strin
     if more > 0 {
         listed.push_str(&format!(" +{more} more"));
     }
-    format!("edited: {listed}; {hint}")
+    Cause {
+        listed: Some(format!("edited: {listed}")),
+        step,
+    }
 }
 
 /// The cron row when no cron run ever converged. Before the last-run stamp
@@ -841,13 +946,11 @@ fn never_converged_record(inputs: &CronInputs) -> Record {
         );
     };
     if last.is_cron() {
-        return Record::warn(
+        let note = last_cron_note(inputs, last);
+        return note.attach(Record::warn(
             "cron update has not succeeded recently",
-            Some(format!(
-                "no successful cron update recorded; {}",
-                last_cron_note(inputs, last)
-            )),
-        );
+            Some(note.detail("no successful cron update recorded".to_string())),
+        ));
     }
     if !inputs.cron_available {
         // No `crontab` (Termux, containers): this host is updated by hand
@@ -865,11 +968,12 @@ fn never_converged_record(inputs: &CronInputs) -> Record {
         return Record::warn(
             "cron update has never run",
             Some(format!(
-                "last update: {} run {} ago; schedule dot update --cron to keep this host current",
+                "last update: {} run {} ago",
                 last.trigger,
                 age(last.at)
             )),
-        );
+        )
+        .with_hint("schedule dot update --cron to keep this host current");
     }
     Record::skip(
         "cron update has not run yet",
@@ -903,24 +1007,21 @@ fn last_run_record(inputs: &CronInputs, clean_cron: Option<i64>) -> Option<Recor
         last.trigger,
         format_age(inputs.now.saturating_sub(last.at))
     );
-    Some(if succeeded {
-        Record::ok("last update succeeded", Some(detail))
-    } else if last.outcome == OUTCOME_DEGRADED {
+    if succeeded {
+        return Some(Record::ok("last update succeeded", Some(detail)));
+    }
+    let title = if last.outcome == OUTCOME_DEGRADED {
         let failing = if last.failing.is_empty() {
             "a stage"
         } else {
             last.failing.as_str()
         };
-        Record::warn(
-            format!("last update degraded: {failing} failing"),
-            Some(format!("{detail}; {}", run_cause(inputs, last))),
-        )
+        format!("last update degraded: {failing} failing")
     } else {
-        Record::warn(
-            "last update failed",
-            Some(format!("{detail}; {}", run_cause(inputs, last))),
-        )
-    })
+        "last update failed".to_string()
+    };
+    let cause = run_cause(inputs, last);
+    Some(cause.attach(Record::warn(title, Some(cause.detail(detail)))))
 }
 
 /// The provider re-exec checkpoint row for the `Update` section (none when
@@ -945,26 +1046,31 @@ pub fn check_reexec_checkpoint(
     };
     match state {
         CheckpointState::Absent => Vec::new(),
-        CheckpointState::Pending => vec![Record::warn(
-            "provider re-exec checkpoint pending",
-            Some(format!(
-                "{shown}: dot changed twice during the last update; the next dot update validates and removes it"
-            )),
-        )],
-        CheckpointState::Unreadable => vec![Record::fail(
-            "provider re-exec checkpoint blocks dot update",
-            Some(format!(
-                "{shown} is unsafe or malformed; inspect it, remove it, then run dot update"
-            )),
-        )],
-        CheckpointState::Mismatch { pinned, active } => vec![Record::fail(
-            "provider re-exec checkpoint blocks dot update",
-            Some(format!(
-                "{shown} pins {} but dot is at {}; inspect the provider state, remove the record, then run dot update",
-                short(pinned),
-                short(active)
-            )),
-        )],
+        CheckpointState::Pending => vec![
+            Record::warn(
+                "provider re-exec checkpoint pending",
+                Some(format!("{shown}: dot changed twice during the last update")),
+            )
+            .with_hint("run dot update; it validates and removes the checkpoint"),
+        ],
+        CheckpointState::Unreadable => vec![
+            Record::fail(
+                "provider re-exec checkpoint blocks dot update",
+                Some(format!("{shown} is unsafe or malformed")),
+            )
+            .with_hint("inspect it, remove it, then run dot update"),
+        ],
+        CheckpointState::Mismatch { pinned, active } => vec![
+            Record::fail(
+                "provider re-exec checkpoint blocks dot update",
+                Some(format!(
+                    "{shown} pins {} but dot is at {}",
+                    short(pinned),
+                    short(active)
+                )),
+            )
+            .with_hint("inspect the provider state, remove the record, then run dot update"),
+        ],
     }
 }
 
@@ -1020,10 +1126,18 @@ pub fn check_profile_lifecycle(inputs: &LifecycleInputs) -> Vec<Record> {
         if eligible.contains(name) {
             if let Some(active_record) = active.get(name) {
                 if !(inputs.deactivation_ok)(active_record) {
-                    out.push(Record::fail(
-                        format!("{name}: active profile deactivation authority unsafe"),
-                        None,
-                    ));
+                    // The main rules of `profile_lifecycle::deactivation_script`
+                    // and `extension_trust::deactivation_validate`; the script
+                    // must sit at exactly this path in a git overlay clone.
+                    out.push(
+                        Record::fail(
+                            format!("{name}: active profile deactivation authority unsafe"),
+                            None,
+                        )
+                        .with_hint(format!(
+                            "make ~/.dotfiles-{name}/dot/profile-deactivate a single-link file you own that group and others cannot write (chmod go-w, its parent directories too), in a clone whose origin matches its descriptor; then run dot update"
+                        )),
+                    );
                 }
             } else if !(inputs.deactivation_ok)(record) {
                 out.push(Record::warn(
@@ -1035,10 +1149,15 @@ pub fn check_profile_lifecycle(inputs: &LifecycleInputs) -> Vec<Record> {
         }
         pending.push(name);
         if !inputs.extensions_enabled {
-            out.push(Record::fail(
-                "profile deactivation pending while extensions are disabled",
-                Some(name.to_string()),
-            ));
+            out.push(
+                Record::fail(
+                    "profile deactivation pending while extensions are disabled",
+                    Some(name.to_string()),
+                )
+                .with_hint(
+                    "set extension_api=1 and extensions_dir in dot's config, then run dot update",
+                ),
+            );
             continue;
         }
         if !(inputs.deactivation_ok)(record) {
@@ -1356,10 +1475,16 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 continue;
             }
             "selected-unavailable" => {
-                out.push(Record::fail(
-                    format!("{name}: selected but unavailable"),
-                    None,
-                ));
+                // Its checkout (or local source) is missing or does not match
+                // the descriptor; dot update clones a missing checkout.
+                out.push(
+                    Record::fail(format!("{name}: selected but unavailable"), None).with_hint(
+                        format!(
+                            "run dot update to set it up; if it stays unavailable, check its source against {}",
+                            tilde(&fields[2], inputs.home)
+                        ),
+                    ),
+                );
                 continue;
             }
             "active" => {}
@@ -1374,10 +1499,31 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
         let entry = match active.get(name.as_str()) {
             Some(entry) => *entry,
             None => {
-                out.push(Record::fail(
-                    format!("{name}: active lifecycle record missing"),
-                    None,
-                ));
+                // Two known causes. An invalid descriptor makes discovery drop
+                // every active record while earlier lifecycle lines stay, so
+                // its own row above is the fix. Otherwise the lifecycle names
+                // a descriptor the profile-aware way and its record the legacy
+                // way (`overlays::overlay_name`), which differ only for a
+                // `.local` descriptor without `sync=none`.
+                let descriptor = &fields[2];
+                let step = if inputs.discovery_error.is_some() {
+                    "fix the invalid overlay descriptor reported above, then rerun dot doctor"
+                        .to_string()
+                } else if descriptor.ends_with(".local.conf") {
+                    // Only a Git-backed descriptor gets here, and `sync=none`
+                    // rejects its `url=`, so renaming is the one fix. The new
+                    // name clones a new checkout beside the old one.
+                    format!(
+                        "rename {} without .local, then run dot update; it clones ~/.dotfiles-{name}, and the old ~/.dotfiles-{name}.local checkout stays behind and may hold unpushed work",
+                        tilde(descriptor, inputs.home)
+                    )
+                } else {
+                    "rerun dot doctor; if it persists, report it as a dot bug".to_string()
+                };
+                out.push(
+                    Record::fail(format!("{name}: active lifecycle record missing"), None)
+                        .with_hint(step),
+                );
                 continue;
             }
         };
@@ -1424,10 +1570,13 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 ));
                 continue;
             }
-            out.push(Record::fail(
-                format!("{name}: not cloned"),
-                Some(format!("expected at {}", tilde(&path, inputs.home))),
-            ));
+            out.push(
+                Record::fail(
+                    format!("{name}: not cloned"),
+                    Some(format!("expected at {}", tilde(&path, inputs.home))),
+                )
+                .with_hint("run dot update to clone it"),
+            );
             continue;
         }
         // This overlay's rows, folded into one when every one passes.
@@ -2570,10 +2719,18 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
                 Some(tilde(&has_worktree, inputs.home)),
             ));
         } else {
-            out.push(Record::fail(
-                "client Git directory has no worktree identity",
-                None,
-            ));
+            // Neither bare nor bound to a worktree: `dot init` records the
+            // home directory as `core.worktree`, which this restores.
+            let quote = |text: &str| crate::repos_pull_support::shell_quote(text.as_bytes());
+            out.push(
+                Record::fail("client Git directory has no worktree identity", None).with_hint(
+                    format!(
+                        "restore it with: git --git-dir={} config core.worktree {}",
+                        quote(inputs.client_git_dir),
+                        quote(inputs.home)
+                    ),
+                ),
+            );
         }
     }
     let resolved = match git(&["rev-parse", "--show-toplevel"]) {
@@ -2588,10 +2745,20 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
         } else {
             resolved.as_str()
         };
-        out.push(Record::fail(
-            "client worktree mismatch",
-            Some(format!("expected {}, got {got}", inputs.home)),
-        ));
+        // Setting the work tree to `$HOME` fixes either layout: a separate
+        // Git directory names it, and `$HOME/.git` resolves to it anyway.
+        let quote = |text: &str| crate::repos_pull_support::shell_quote(text.as_bytes());
+        out.push(
+            Record::fail(
+                "client worktree mismatch",
+                Some(format!("expected {}, got {got}", inputs.home)),
+            )
+            .with_hint(format!(
+                "point it at $HOME: git --git-dir={} config core.worktree {}",
+                quote(inputs.client_git_dir),
+                quote(inputs.home)
+            )),
+        );
     }
     let status = match git(&STATUS_ARGS) {
         Ok(status) => status,
@@ -2988,15 +3155,13 @@ mod tests {
     fn hanging_git(scope: &dot_test_support::TempDir) -> (PathBuf, PathBuf) {
         let pids = scope.path().join("pids");
         let shim = scope.path().join("git");
-        std::fs::write(
+        // The readiness probe exits before recording a pid; see
+        // `dot_test_support::publish_fixture_script`.
+        dot_test_support::publish_fixture_script(
             &shim,
-            format!(
-                "#!/bin/sh\necho $$ >> '{}'\nexec sleep 60\n",
-                pids.display()
-            ),
+            &format!("echo $$ >> '{}'\nexec sleep 60\n", pids.display()),
         )
         .expect("hanging git");
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("mode");
         (shim, pids)
     }
 
@@ -3079,6 +3244,20 @@ mod tests {
     }
 
     #[test]
+    fn shorten_keeps_whole_words_and_drops_clause_punctuation() {
+        assert_eq!(shorten("short", 10), "short");
+        assert_eq!(shorten("exactly10b", 10), "exactly10b");
+        // A word followed by clause punctuation at the cut is whole.
+        assert_eq!(shorten("aa, bb: cc dd", 9), "aa, bb…");
+        assert_eq!(shorten("one two three four", 12), "one two…");
+        // No usable space: cut on a character boundary.
+        assert_eq!(shorten("abcdefghijklmnop", 8), "abcde…");
+        assert_eq!(shorten("ééééééé", 8), "éé…");
+        // A space too early would waste the budget, so cut mid-word then.
+        assert_eq!(shorten("a bcdefghijklmnop", 10), "a bcdef…");
+    }
+
+    #[test]
     fn lock_owner_rows_match_acquire_behavior() {
         // Fresh-review-B B6: only the stale row may promise
         // reclamation; `acquire` refuses on `Unknown`/`Interrupted`,
@@ -3093,7 +3272,7 @@ mod tests {
         assert!(rendered(Activity::Active).contains("pid 4242"));
         let stale = rendered(Activity::Stale);
         assert!(stale.contains("owner is stale"));
-        assert!(stale.contains("will reclaim it"));
+        assert!(stale.contains("reclaims the stale lock"));
         assert!(rendered(Activity::Active).contains('⚠'));
         assert!(stale.contains('⚠'));
         // `acquire` refuses on an unverifiable owner, so doctor fails; a
@@ -3109,8 +3288,22 @@ mod tests {
             interrupted.contains("⚠ update lock owner cannot be verified"),
             "{interrupted}"
         );
-        for row in [unknown, interrupted] {
+        assert!(
+            unknown.contains("→ check that ps -o lstart= -p 4242 prints a start time"),
+            "{unknown}"
+        );
+        for row in [&unknown, &interrupted] {
             assert!(!row.contains("reclaim"));
+        }
+        // Every owner row, warn or fail, says what to do next.
+        for activity in [
+            Activity::Active,
+            Activity::Stale,
+            Activity::Unknown,
+            Activity::Interrupted,
+        ] {
+            let row = rendered(activity);
+            assert!(row.contains("\n    → "), "{row}");
         }
     }
 }

@@ -10,7 +10,6 @@ use dot::repos_pull_overlay::{
 use dot::repos_pull_queries::CandidateEnv;
 use dot_test_support::TempDir;
 use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -523,8 +522,7 @@ fn commit_hooks_do_not_stop_the_replay_of_local_commits() {
         let hooks = fixture.overlay.join(".git/gate-hooks");
         std::fs::create_dir(&hooks).unwrap();
         let hook = hooks.join("prepare-commit-msg");
-        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dot_test_support::install_fixture_executable(&hook, "#!/bin/sh\nexit 1\n", 0o755).unwrap();
         git(
             &fixture.overlay,
             &["config", "core.hooksPath", &hooks.to_string_lossy()],

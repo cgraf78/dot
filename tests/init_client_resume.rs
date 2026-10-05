@@ -982,6 +982,18 @@ fn coalesced_identity_reads_match_the_separate_probes() {
             }),
         ),
         (
+            // Refs that make the bare name `HEAD` ambiguous: Git refuses
+            // `git branch HEAD`, but `update-ref` or a `push origin
+            // HEAD:HEAD` slip creates them, and they must not make an
+            // ordinary client on `main` read as foreign.
+            "branch-named-head",
+            Box::new(|r| set(r, &["update-ref", "refs/heads/HEAD", "HEAD"])),
+        ),
+        (
+            "tag-named-head",
+            Box::new(|r| set(r, &["update-ref", "refs/tags/HEAD", "HEAD"])),
+        ),
+        (
             "detached",
             Box::new(|r| {
                 let head = git(
@@ -1028,6 +1040,8 @@ fn coalesced_identity_reads_match_the_separate_probes() {
             "bare-last-wins",
             "worktree-last-wins",
             "url-uppercase-section",
+            "branch-named-head",
+            "tag-named-head",
         ]
     );
 }

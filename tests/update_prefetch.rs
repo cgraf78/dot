@@ -179,9 +179,7 @@ exit "$rc"
             bash = dot_test_support::bash().display(),
             git = real_git().display(),
         );
-        std::fs::write(&shim, script).expect("write shim");
-        std::fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("shim mode");
+        dot_test_support::install_fixture_executable(&shim, script, 0o755).expect("install shim");
         dot_test_support::wait_until_executable(&shim, &["--version"]).expect("shim ready");
 
         let home = scratch.path().join("home");

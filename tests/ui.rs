@@ -137,8 +137,6 @@ fn rust_matches_shell_on_ui_matrix() {
 /// output, then compare stdout and the logged argv.
 #[test]
 fn gum_branch_invokes_identical_argv() {
-    use std::os::unix::fs::PermissionsExt;
-
     // Exec-capable scratch (see `dot_test_support::TempDir::new_exec`):
     // the fixture must RUN (the shell's `style --help` gate), and the
     // system temp dir is `noexec` on some CI images. The guard removes
@@ -149,15 +147,15 @@ fn gum_branch_invokes_identical_argv() {
     let fixture = dir.join("gum");
     // `style --help` must succeed (the shell's third gate); log only
     // real invocations.
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &fixture,
         format!(
             "#!/bin/sh\nif [ \"$1\" = style ] && [ \"$2\" = --help ]; then exit 0; fi\nprintf '%s\\n' \"$*\" >>{log}\nprintf 'GUM:%s\\n' \"$*\"\n",
             log = log.display(),
         ),
+        0o755,
     )
-    .expect("fixture");
-    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    .expect("install fixture");
 
     let run_shell = |function: &str, args: &[&str]| -> (i32, String) {
         let mut cmd = Command::new(bash_bin());

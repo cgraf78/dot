@@ -178,7 +178,10 @@ assert_eq $'failing\nlater' "$failing_hook_log" \
 
 # Exercise the real update coordinator, not the run_dot shell helper: `$!`
 # must name dot itself so TERM proves the registered capture owns the exact
-# fresh-Bash worker rather than an intermediate wrapper.
+# fresh-Bash worker rather than an intermediate wrapper. The TERM-ignoring
+# child gives up on its own after at least 1200s, so a failed run cannot leave
+# it running forever, and records that it ran out: an update that waited for
+# it instead of stopping it fails here even without a suite timeout.
 rm -f "$extensions/merge-hooks.d"/*.sh
 cat >"$extensions/merge-hooks.d/10-cancellable.sh" <<'HOOK'
 merge() {
@@ -186,7 +189,8 @@ merge() {
   (
     trap '' TERM
     printf '%s\n' "$BASHPID" >"$HOME/cancellable-child.pid"
-    while :; do sleep 1; done
+    for ((round = 0; round < 1200; round++)); do sleep 1; done
+    : >"$HOME/cancellable-child.expired"
   ) &
   wait "$!"
 }
@@ -213,6 +217,8 @@ set +e
 wait "$cancellable_dot_pid"
 cancellable_dot_status=$?
 set -e
+[[ ! -e $home/cancellable-child.expired ]] ||
+  fail 'real update waited out the TERM-ignoring hook descendant'
 assert_eq 143 "$cancellable_dot_status" 'real update preserves TERM status'
 cancellable_deadline=$((SECONDS + 5))
 while process_is_live "$cancellable_hook_pid" &&

@@ -801,6 +801,58 @@ fn last_failure_reader_tolerates_newer_and_hostile_records() {
 }
 
 #[test]
+fn last_failure_redacts_url_credentials_when_written() {
+    // A pull error or hook line can echo a token-bearing remote; the record
+    // outlives the run, and doctor prints it to a terminal or transcript.
+    let scratch = TempDir::new("update-status-failure-redact").unwrap();
+    let state = scratch.path();
+    update_status::record_last_failure(
+        state,
+        1_800_000_000,
+        "fail",
+        update_status::Trigger::Cron,
+        &failures(&[(
+            "repos",
+            "https://bot:s3cret@git.example/o/r.git",
+            "fatal: unable to access 'https://bot:s3cret@git.example/o/r.git/': 403",
+        )]),
+    );
+    let body = std::fs::read_to_string(update_status::last_failure_path(state)).unwrap();
+    assert!(!body.contains("s3cret") && !body.contains("bot:"), "{body}");
+    let failure = update_status::read_last_failure(state).expect("record");
+    assert_eq!(failure.items[0].name, "https://***@git.example/o/r.git");
+    assert_eq!(
+        failure.items[0].detail,
+        "fatal: unable to access 'https://***@git.example/o/r.git/': 403"
+    );
+}
+
+#[test]
+fn last_failure_redacts_url_credentials_an_older_dot_wrote() {
+    // A record written before redaction existed must not print its secret.
+    let scratch = TempDir::new("update-status-failure-redact-old").unwrap();
+    let state = scratch.path();
+    let path = update_status::last_failure_path(state);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "1800000000 fail cron\nitem\tconfigs\t40-hook\tpush to https://u:tok@host/x failed\n",
+    )
+    .unwrap();
+    let failure = update_status::read_last_failure(state).expect("record");
+    assert_eq!(failure.items[0].detail, "push to https://***@host/x failed");
+}
+
+#[test]
+fn last_line_redacts_before_it_caps() {
+    // The cap must not cut between the secret and its `@`, which would leave
+    // the secret with nothing marking it as userinfo.
+    let line = format!("{}https://user:{}@host/x", "p".repeat(200), "t".repeat(60));
+    let shown = update_status::last_line(line.as_bytes());
+    assert!(!shown.contains("ttttt"), "{shown}");
+}
+
+#[test]
 fn last_line_finds_the_final_message() {
     assert_eq!(update_status::last_line(b""), "");
     assert_eq!(update_status::last_line(b"\n \n"), "");

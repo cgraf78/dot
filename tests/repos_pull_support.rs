@@ -11,9 +11,9 @@ use std::os::unix::process::CommandExt as _;
 use dot::progress_ui::Palette;
 use dot::repos_base::{Base, Topology};
 use dot::repos_pull_support::{
-    OriginMismatch, PullTally, backup_dir, conflicts_from_log, origin_mismatch, overlay_active,
-    overlay_count, prepare_base_upstream, prepare_overlay_upstream, pull_cmd, record_status,
-    result_prefix, shell_quote,
+    BackupDirError, OriginMismatch, PullTally, backup_dir, conflicts_from_log, origin_mismatch,
+    overlay_active, overlay_count, prepare_base_upstream, prepare_overlay_upstream, pull_cmd,
+    record_status, result_prefix, shell_quote,
 };
 use dot_test_support::TempDir;
 
@@ -77,16 +77,19 @@ fn conflict_parser_stops_at_the_first_non_file_line() {
 fn backup_dir_creates_a_timestamped_leaf_and_fails_closed() {
     let dir = TempDir::new("pull-backup").expect("fixture dir");
     let mut warnings = Vec::new();
-    // Name the cause on failure: `backup_dir` reports only `None`. The
-    // forwarded `mkdir` diagnostics say why the root step failed, and the
-    // root's presence separates that step from the native leaf step.
-    let backup = backup_dir(&dir.path().to_string_lossy(), &mut warnings).unwrap_or_else(|| {
-        panic!(
-            "backup dir (root created: {}); forwarded diagnostics: {:?}",
-            dir.path().join(".dot-backup/pull").is_dir(),
-            String::from_utf8_lossy(&warnings)
-        )
-    });
+    // Name the cause on failure. The typed reason separates a latched
+    // signal from a failed leaf step and carries that step's errno; the
+    // forwarded `mkdir` diagnostics and the root's presence explain a
+    // `NotFound` leaf with `root_created == false`, which means the root
+    // step failed first.
+    let backup =
+        backup_dir(&dir.path().to_string_lossy(), &mut warnings).unwrap_or_else(|failure| {
+            panic!(
+                "backup dir: {failure:?} (root created: {}); forwarded diagnostics: {:?}",
+                dir.path().join(".dot-backup/pull").is_dir(),
+                String::from_utf8_lossy(&warnings)
+            )
+        });
     assert!(backup.is_dir());
     assert_eq!(
         backup.parent(),
@@ -103,7 +106,17 @@ fn backup_dir_creates_a_timestamped_leaf_and_fails_closed() {
     let blocked = TempDir::new("pull-backup-blocked").expect("fixture dir");
     std::fs::write(blocked.path().join(".dot-backup"), b"blocker\n").expect("blocker");
     warnings.clear();
-    assert!(backup_dir(&blocked.path().to_string_lossy(), &mut warnings).is_none());
+    match backup_dir(&blocked.path().to_string_lossy(), &mut warnings) {
+        Err(BackupDirError::Leaf {
+            error,
+            root_created,
+            ..
+        }) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory, "{error:?}");
+            assert!(!root_created, "the blocked root step must report failure");
+        }
+        other => panic!("a blocked root must fail its leaf step: {other:?}"),
+    }
     assert!(!warnings.is_empty(), "mkdir diagnostic is forwarded");
 }
 
@@ -116,17 +129,15 @@ fn pull_cmd_propagates_status_and_missing_program() {
 #[cfg(unix)]
 #[test]
 fn pull_cmd_pins_locale_and_appends_quiet() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let dir = TempDir::new("pull-command-env").expect("fixture dir");
     let script = dir.path().join("probe.sh");
     let record = dir.path().join("record");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &script,
         "#!/bin/sh\nout=$1\nprintf 'lc=%s\\n' \"$LC_ALL\" >\"$out\"\nshift\nprintf 'args=%s\\n' \"$*\" >\"$out.unused\"\n",
+        0o755,
     )
-    .expect("probe");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    .expect("install fixture");
     let script = script.to_string_lossy();
     let record_text = record.to_string_lossy();
     assert_eq!(pull_cmd(true, "sh", &[&script, &record_text]), 0);
@@ -143,8 +154,6 @@ fn pull_cmd_pins_locale_and_appends_quiet() {
 #[cfg(unix)]
 #[test]
 fn pull_cmd_keeps_the_callers_foreground_controlling_tty() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     const HELPER: &str = "DOT_PULL_CMD_PTY_HELPER";
     if std::env::var_os(HELPER).is_some() {
         let program = std::env::var("DOT_TEST_PULL_PROGRAM").expect("pull fixture program");
@@ -155,13 +164,12 @@ fn pull_cmd_keeps_the_callers_foreground_controlling_tty() {
     let scope = TempDir::new("pull-command-pty").expect("fixture dir");
     let observed = scope.path().join("foreground-tty");
     let program = scope.path().join("pull-program");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &program,
         "#!/bin/sh\n/usr/bin/python3 -c 'import os,sys; sys.exit(0 if all(os.isatty(fd) and os.tcgetpgrp(fd) == os.getpgrp() for fd in (0,1,2)) else 9)' || exit $?\n: >\"$DOT_TEST_PULL_PTY_OBSERVED\"\n",
+        0o755,
     )
-    .expect("pull fixture");
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-        .expect("pull fixture mode");
+    .expect("install pull fixture");
 
     let mut master = -1;
     let mut slave = -1;

@@ -10,8 +10,14 @@ use dot_test_support::TempDir;
 fn stage(root: &Path, relative: &str, bytes: &[u8], mode: u32) -> PathBuf {
     let path = root.join(relative);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, bytes).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    // An executable fixture is created by a child so this process never holds
+    // a writer to it (see `install_fixture_executable`).
+    if mode & 0o111 != 0 {
+        dot_test_support::install_fixture_executable(&path, bytes, mode).unwrap();
+    } else {
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
     path
 }
 

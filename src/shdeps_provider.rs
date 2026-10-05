@@ -2881,7 +2881,6 @@ fn owned(metadata: &std::fs::Metadata, euid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use std::io::{Read as _, Write as _};
-    use std::os::unix::fs::PermissionsExt as _;
 
     use super::{
         CaptureStream, EnsureFailure, Inputs, LimitedWriter, PROVIDER_OUTPUT_LIMIT_ERROR,
@@ -2900,8 +2899,8 @@ mod tests {
         let bin = scratch.path().join("bin");
         std::fs::create_dir(&bin).expect("stub bin");
         let stub = bin.join("jq");
-        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("stub jq");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("stub mode");
+        dot_test_support::install_fixture_executable(&stub, "#!/bin/sh\nexit 0\n", 0o755)
+            .expect("install stub");
         let env = std::collections::BTreeMap::from([
             (
                 std::ffi::OsString::from("HOME"),
@@ -3061,9 +3060,12 @@ mod tests {
             std::fs::create_dir_all(directory).expect("fixture directory");
         }
         let provider = scratch.path().join("provider");
-        std::fs::write(&provider, b"#!/bin/sh\nsleep 0.3\nexit 0\n").expect("provider fixture");
-        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755))
-            .expect("provider fixture mode");
+        dot_test_support::install_fixture_executable(
+            &provider,
+            b"#!/bin/sh\nsleep 0.3\nexit 0\n",
+            0o755,
+        )
+        .expect("install provider fixture");
         let env = std::collections::BTreeMap::from([
             (
                 std::ffi::OsString::from("HOME"),
@@ -3258,13 +3260,12 @@ mod tests {
         let provider = scratch.path().join("provider");
         let release = scratch.path().join("provider-release");
         let exited = scratch.path().join("provider-exited");
-        std::fs::write(
+        dot_test_support::install_fixture_executable(
             &provider,
             b"#!/bin/sh\nprintf '%s\\n' 'queued before cancellation' >&2\ni=0\nwhile [ \"$i\" -lt 6000 ] && [ ! -e \"$DOT_TEST_PROVIDER_CANCEL_RELEASE\" ]; do i=$((i + 1)); sleep 0.01; done\n: >\"$DOT_TEST_PROVIDER_CANCEL_EXITED\"\nexit 130\n",
+            0o755,
         )
-        .expect("provider fixture");
-        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755))
-            .expect("provider fixture mode");
+        .expect("install provider fixture");
         let env = std::collections::BTreeMap::from([
             (
                 std::ffi::OsString::from("HOME"),
@@ -3465,8 +3466,6 @@ mod tests {
 
     #[test]
     fn blocking_outward_sink_does_not_block_provider_cancellation() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         const HELPER: &str = "DOT_PROVIDER_BLOCKING_WRITER_HELPER";
         if std::env::var_os(HELPER).is_none() {
             #[cfg(not(target_os = "android"))]
@@ -3520,13 +3519,12 @@ mod tests {
         }
         let stopped = scratch.path().join("provider-stopped");
         let provider = scratch.path().join("provider");
-        std::fs::write(
+        dot_test_support::install_fixture_executable(
             &provider,
             b"#!/bin/sh\ntrap ': >\"$DOT_TEST_PROVIDER_STOPPED\"; exit 143' TERM\nprintf '%s\\n' '{\"event\":\"warning\",\"status\":\"warning\",\"detail\":\"blocking sink\"}'\nwhile :; do sleep 0.05; done\n",
+            0o755,
         )
-        .expect("provider fixture");
-        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755))
-            .expect("provider fixture mode");
+        .expect("install provider fixture");
         let env = std::collections::BTreeMap::from([
             (
                 std::ffi::OsString::from("HOME"),
@@ -3703,12 +3701,12 @@ mod tests {
         .expect("provider lock");
         let attempts = scratch.path().join("attempts");
         let curl = bin.join("curl");
-        std::fs::write(
+        dot_test_support::install_fixture_executable(
             &curl,
             b"#!/bin/sh\nprintf 'attempt\\n' >>\"$DOT_TEST_CURL_RECORD\"\nprintf 'diagnostic\\n' >&2\nexit 22\n",
+            0o755,
         )
-        .expect("curl fixture");
-        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).expect("curl mode");
+        .expect("install curl");
         let env = std::collections::BTreeMap::from([
             (
                 std::ffi::OsString::from("HOME"),
