@@ -33,6 +33,7 @@ fn runtime_check_agrees() {
         source_raw: b"/src".to_vec(),
         source_root: b"/src".to_vec(),
         git_version: Some(b"git version 2".to_vec()),
+        git_stalled: false,
         version: b"20261003-000000-abcdef12".to_vec(),
         install_kind: None,
         unknown_config_keys: Vec::new(),
@@ -59,6 +60,50 @@ fn runtime_check_agrees() {
 }
 
 #[test]
+fn a_stalled_git_probe_warns_and_a_missing_git_says_what_to_do() {
+    // A `git --version` that misses the probe deadline is a stalled
+    // filesystem or Git, like every other stalled core probe: a warning
+    // with a next step, not the hard "unavailable" failure a missing Git
+    // gets.
+    let runtime = RuntimeSnapshot {
+        bash_version: Vec::new(),
+        bash_major: 0,
+        bash_required: false,
+        checkout_root: Some(b"/src".to_vec()),
+        release_root: false,
+        source_raw: b"/src".to_vec(),
+        source_root: b"/src".to_vec(),
+        git_version: None,
+        git_stalled: true,
+        version: b"20261003-000000-abcdef12".to_vec(),
+        install_kind: None,
+        unknown_config_keys: Vec::new(),
+    };
+    let mut stalled = Recorder::new();
+    check_runtime(&mut stalled, &runtime, &engine(b"/src"), b"/home/u");
+    let rendered = String::from_utf8(stalled.render()).expect("utf8");
+    assert!(
+        rendered.contains(
+            "  ⚠ Git runtime did not answer\n    git --version did not answer within 30s\n    → check for a stalled"
+        ),
+        "{rendered}"
+    );
+    assert_eq!(stalled.counts().fail, 0, "{rendered}");
+
+    let mut missing = Recorder::new();
+    let gone = RuntimeSnapshot {
+        git_stalled: false,
+        ..runtime
+    };
+    check_runtime(&mut missing, &gone, &engine(b"/src"), b"/home/u");
+    let rendered = String::from_utf8(missing.render()).expect("utf8");
+    assert!(
+        rendered.contains("  ✗ Git runtime is unavailable\n    → install Git"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn runtime_check_warns_once_per_unknown_config_key() {
     let unknown = |key: &str, line| dot::config::UnknownKey {
         key: key.to_string(),
@@ -73,6 +118,7 @@ fn runtime_check_warns_once_per_unknown_config_key() {
         source_raw: b"/src".to_vec(),
         source_root: b"/src".to_vec(),
         git_version: Some(b"git version 2".to_vec()),
+        git_stalled: false,
         version: b"20261003-000000-abcdef12".to_vec(),
         install_kind: None,
         unknown_config_keys: vec![unknown("future_key", 2), unknown("defualt_profile", 3)],
@@ -110,6 +156,7 @@ fn packaged_runtime_does_not_require_checkout_or_bash() {
         source_raw: b"/data/cgraf78/dot/releases/v1-linux-x86_64-musl".to_vec(),
         source_root: b"/data/cgraf78/dot/releases/v1-linux-x86_64-musl".to_vec(),
         git_version: Some(b"git version 2".to_vec()),
+        git_stalled: false,
         version: b"20261003-000000-abcdef12".to_vec(),
         install_kind: None,
         unknown_config_keys: Vec::new(),
@@ -148,6 +195,7 @@ fn version_row_names_how_the_running_build_is_installed() {
             source_raw: b"/home/u/.local/share/cgraf78/dot".to_vec(),
             source_root: b"/home/u/.local/share/cgraf78/dot".to_vec(),
             git_version: Some(b"git version 2".to_vec()),
+            git_stalled: false,
             version: b"v1".to_vec(),
             install_kind: install_kind.map(str::to_string),
             unknown_config_keys: Vec::new(),
@@ -183,6 +231,7 @@ fn version_row_names_how_the_running_build_is_installed() {
             source_raw: b"/home/u/git/dot".to_vec(),
             source_root: b"/home/u/git/dot".to_vec(),
             git_version: Some(b"git version 2".to_vec()),
+            git_stalled: false,
             version: b"v2".to_vec(),
             install_kind: None,
             unknown_config_keys: Vec::new(),

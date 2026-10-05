@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@6c9657e53123839a51f727faa19f440470cb9e03
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@dea363fed9e62883887a39790006a111a458af31
     with:
       # Full matrix on every PR: scheduled-only legs let main break
       # silently between daily runs and cannot validate their fixes.
@@ -98,7 +98,7 @@ jobs:
         tar -C .termux-ci -xzf "$archive"
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@6c9657e53123839a51f727faa19f440470cb9e03
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@dea363fed9e62883887a39790006a111a458af31
     with:
       matrix-set: full
       profiles: base,python
@@ -117,6 +117,11 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -134,6 +139,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         with:
           # The shell baseline is a reachable ancestor of the port stack. A
           # shallow checkout cannot construct its independent source clone.
@@ -204,6 +214,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         with:
           persist-credentials: false
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@6c9657e53123839a51f727faa19f440470cb9e03
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@dea363fed9e62883887a39790006a111a458af31

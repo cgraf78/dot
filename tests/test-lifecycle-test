@@ -3017,10 +3017,11 @@ assert_cancellation sequential -s
 
 descendants=$DOT_TEST_TMP/descendants
 descendant_pid_file=$DOT_TEST_TMP/descendant.pid
+descendant_exit_file=$DOT_TEST_TMP/descendant.exited
 mkdir -p "$descendants"
 cat >"$descendants/descendant-test" <<'SUITE'
 #!/usr/bin/env bash
-python3 - "$DOT_TEST_DESCENDANT_PID_FILE" <<'PY' &
+python3 - "$DOT_TEST_DESCENDANT_PID_FILE" "$DOT_TEST_DESCENDANT_EXIT_FILE" <<'PY' &
 import os
 import sys
 import time
@@ -3029,6 +3030,8 @@ from pathlib import Path
 os.setpgid(0, 0)
 Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
 time.sleep(4)
+# Written only by a member that outlived its sleep, just before it exits.
+Path(sys.argv[2]).write_text("exited", encoding="utf-8")
 PY
 deadline=$((SECONDS + 5))
 while [[ ! -s $DOT_TEST_DESCENDANT_PID_FILE && $SECONDS -lt $deadline ]]; do
@@ -3038,18 +3041,52 @@ done
 "$DOT_TEST_REPORTER" complete 1 0
 SUITE
 chmod 0755 "$descendants/descendant-test"
+descendant_stderr=$DOT_TEST_TMP/descendant.stderr
 set +e
 DOT_TEST_DESCENDANT_PID_FILE=$descendant_pid_file \
-  run_tests "$descendants" -s descendant >/dev/null
+  DOT_TEST_DESCENDANT_EXIT_FILE=$descendant_exit_file \
+  run_tests "$descendants" -s descendant >/dev/null 2>"$descendant_stderr"
 descendant_status=$?
 set -e
 if [[ $(uname -s) == Darwin ]]; then
-  # Without pidfds there is no safe delivery to a cross-group
-  # descendant, so the worker fails closed with 125; the liveness
-  # wait below still verifies no leak either way.
-  [[ $descendant_status == 0 || $descendant_status == 125 ]] ||
-    fail "descendant suite returned unexpected status $descendant_status"
+  # Without pidfds the dot test worker has no safe delivery to a
+  # cross-group descendant: it refuses the unpinned signal and records
+  # "safe descendant delivery has no stable process authority", which by
+  # design does not mark cleanup incomplete. The member sleeps 4s, so the
+  # status depends on when it exits on its own:
+  # - 0: it was gone before the worker's teardown observed it;
+  # - 1: the refusal is the run's error and the session was then proven
+  #   empty because the member exited during verification (the native
+  #   `native_changed_process_group_fails_closed_without_unpinned_signal`
+  #   test pins exactly this);
+  # - 125: the final lease poll still saw the member, so cleanup was
+  #   marked incomplete; the refusal is reported then too.
+  # Both fail-closed statuses must name the refusal, so an unrelated
+  # teardown failure cannot pass as one of them.
+  case $descendant_status in
+    0) ;;
+    1 | 125)
+      grep -q 'safe descendant delivery has no stable process authority' \
+        "$descendant_stderr" ||
+        fail "descendant suite returned $descendant_status without the authority refusal:
+$(<"$descendant_stderr")"
+      ;;
+    *)
+      fail "descendant suite returned unexpected status $descendant_status:
+$(<"$descendant_stderr")"
+      ;;
+  esac
+  if [[ $descendant_status == 0 || $descendant_status == 1 ]]; then
+    # Both report an empty session, which on Darwin is only true once the
+    # member has ended on its own: it writes its exit marker right after
+    # its sleep, before exiting. A dot that ignored the member and reported
+    # success while it still ran would leave no marker.
+    [[ -e $descendant_exit_file ]] ||
+      fail "descendant suite returned $descendant_status before its member ended:
+$(<"$descendant_stderr")"
+  fi
 else
+  [[ $descendant_status == 0 ]] || cat "$descendant_stderr" >&2
   assert_eq 0 "$descendant_status" \
     'descendant suite cleans its cross-group member'
 fi
