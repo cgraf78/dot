@@ -7453,10 +7453,10 @@ thread_local! {
 
 /// Clears every graceful-loop test seam on this thread when dropped, so a
 /// failing test cannot leak queued walks or growing records into the next.
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 struct ResetGraceSeams;
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 impl ResetGraceSeams {
     fn begin() -> Self {
         Self::clear();
@@ -7476,7 +7476,7 @@ impl ResetGraceSeams {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 impl Drop for ResetGraceSeams {
     fn drop(&mut self) {
         Self::clear();
