@@ -29,11 +29,6 @@ use std::path::{Path, PathBuf};
 
 pub use crate::doctor_runtime::{Counts, ITEM_LIMIT, Kind, Record};
 
-/// Summary helpers owned by the coordinator lane
-/// ([`crate::doctor_coordinator`]), re-exported here so orchestrator
-/// callers keep one import path.
-pub use crate::doctor_coordinator::{SummaryColor, overall_ok, summary_color, summary_line};
-
 /// Collects [`Record`] rows and counts, mirroring the `_dr_*`
 /// helpers' print-plus-count effects without touching stdout.
 #[derive(Debug, Clone, Default)]
@@ -936,6 +931,7 @@ mod tests {
 
     #[test]
     fn summary_helpers_match_shell_rules() {
+        use crate::doctor_coordinator::{SummaryColor, overall_ok, summary_color, summary_line};
         assert_eq!(summary_line(6, 1, 2), "6 passed · 1 warnings · 2 failed");
         assert_eq!(summary_color(1, 0), SummaryColor::Red);
         assert_eq!(summary_color(0, 3), SummaryColor::Yellow);

@@ -1,6 +1,5 @@
 //! Trust checks from `lib/dot/extension-trust.sh` for executable
-//! extension entry points and support files, plus the retiring
-//! resolver. The manifest, link-target, and checkout identity
+//! extension entry points and support files. The manifest, link-target, and checkout identity
 //! helpers are the canonical read-only implementations from
 //! [`crate::repos_overlays`] and [`crate::overlays`].
 //!
@@ -14,7 +13,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 /// Inputs threaded from shell globals: caller identity, home, the
-/// extensions root, the overlay manifest, and the retiring root.
+/// extensions root, and the overlay manifest.
 /// Empty strings read as unset (`${VAR:-}`).
 #[derive(Debug, Clone, Default)]
 pub struct Inputs {
@@ -26,35 +25,20 @@ pub struct Inputs {
     pub extensions_dir: String,
     /// `$DOT_OVERLAY_MANIFEST`.
     pub manifest: String,
-    /// `$DOT_RETIRING_OVERLAY_ROOT`.
-    pub retiring_root: String,
 }
 
-/// Silent trust failure: `Usage` is a caller-arity problem (shell
-/// exit 2), `Refused` a failed check (shell exit 1). Neither prints;
-/// callers report their own warnings.
+/// Silent trust failure (shell exit 1). It never prints; callers report
+/// their own warnings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// Wrong arity, silent (shell exit 2).
-    Usage,
     /// Failed validation, silent (shell exit 1).
     Refused,
-}
-
-impl Error {
-    /// Shell exit code for this failure.
-    pub fn code(&self) -> i32 {
-        match self {
-            Error::Usage => 2,
-            Error::Refused => 1,
-        }
-    }
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, _formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Usage | Error::Refused => Ok(()),
+            Error::Refused => Ok(()),
         }
     }
 }
@@ -430,61 +414,4 @@ pub fn deactivation_validate(
         return Err(Error::Refused);
     }
     Ok(())
-}
-
-/// The shell `case` arms for a retiring-relative path: malformed
-/// shapes are caller errors (shell exit 2).
-fn retiring_shape_ok(relative: &str) -> bool {
-    if relative.is_empty() {
-        return false;
-    }
-    if relative.starts_with('/') {
-        return false;
-    }
-    if relative == "." || relative == ".." {
-        return false;
-    }
-    if relative.starts_with("./") || relative.starts_with("../") {
-        return false;
-    }
-    if relative.ends_with('/') || relative.ends_with("/.") || relative.ends_with("/..") {
-        return false;
-    }
-    if relative.contains("//") || relative.contains("/./") || relative.contains("/../") {
-        return false;
-    }
-    if relative.contains(['\n', '\r']) {
-        return false;
-    }
-    true
-}
-
-/// `dot_retiring_overlay_file`: resolve a support file from the
-/// already-validated retiring checkout. Malformed relatives are
-/// usage errors (shell exit 2); failed checks refuse (exit 1).
-pub fn retiring_overlay_file(relative: &str, inputs: &Inputs) -> Result<String, Error> {
-    if !retiring_shape_ok(relative) {
-        return Err(Error::Usage);
-    }
-    if inputs.retiring_root.is_empty() {
-        return Err(Error::Refused);
-    }
-    let root_path = Path::new(&inputs.retiring_root);
-    match std::fs::symlink_metadata(root_path) {
-        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
-        _ => return Err(Error::Refused),
-    }
-    let path = format!("{}/{relative}", inputs.retiring_root);
-    if !owned_parent_components_validate(&inputs.retiring_root, &path, inputs.euid) {
-        return Err(Error::Refused);
-    }
-    let path = PathBuf::from(path);
-    match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_file() => {}
-        _ => return Err(Error::Refused),
-    }
-    if !readable(&path) || !file_stat(&path, inputs.euid) {
-        return Err(Error::Refused);
-    }
-    Ok(path.to_string_lossy().into_owned())
 }

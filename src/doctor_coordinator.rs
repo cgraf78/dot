@@ -168,14 +168,6 @@ pub fn extension_identity(key: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Byte-substring probe for the `*...*` case arms of
-/// [`source_relative_valid`].
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
-}
-
 /// `_dot_doctor_extension_specs` over a trusted `doctor.d`
 /// directory: entry names ending in `.sh` (leading-dot names
 /// excluded, like the shell's `*.sh` glob) become specs in
@@ -281,37 +273,6 @@ pub fn record_kind(kind: &[u8]) -> RecordKind {
         b"info" => RecordKind::Info,
         _ => RecordKind::Unknown,
     }
-}
-
-/// The `case $relative in ...` guard of `dot_doctor_source`
-/// (`lib/dot/public/hook-runtime-v1/doctor-api.sh`): rejects empty values, absolute paths,
-/// bare `.`/`..`, any `./`, `../`, `/./`, `/../` segment games,
-/// trailing slashes and dot segments, doubled slashes, and embedded
-/// newlines or carriage returns. Tabs pass, like the shell.
-///
-/// Only the shape check is ported: joining under
-/// `$DOT_EXTENSIONS_DIR`, the trust validation, and the actual
-/// sourcing stay shell-side.
-pub fn source_relative_valid(relative: &[u8]) -> bool {
-    if relative.is_empty() {
-        return false;
-    }
-    if relative.first() == Some(&b'/') {
-        return false;
-    }
-    if relative == b"." || relative == b".." {
-        return false;
-    }
-    if relative.starts_with(b"./") || relative.starts_with(b"../") {
-        return false;
-    }
-    if relative.ends_with(b"/.") || relative.ends_with(b"/..") || relative.ends_with(b"/") {
-        return false;
-    }
-    if contains(relative, b"/./") || contains(relative, b"/../") || contains(relative, b"//") {
-        return false;
-    }
-    !relative.iter().any(|byte| *byte == b'\n' || *byte == b'\r')
 }
 
 /// The `_dot_doctor` summary box text:

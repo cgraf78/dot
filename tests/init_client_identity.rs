@@ -1,7 +1,6 @@
 //! Native contract tests for host Git selection and repository
 //! identity: the pinned host `git` search with its client-root
-//! exclusions, the shell-function guard, repository URL
-//! normalization, branch-name validation, and remote
+//! exclusions, repository URL normalization, branch-name validation, and remote
 //! default-branch resolution.
 //!
 //! Separate binary because the git rows drive real `clone` /
@@ -283,22 +282,16 @@ fn select_fails_without_resolvable_roots() {
 /// Shell verdict for one bind probe: (exit code, stdout, stderr).
 /// Success prints the hashed `git`; failures print only the
 /// `dot init: ` diagnostic, like `_dot_init_error`.
-fn shell_bind(
-    home: &Path,
-    fake_home: &str,
-    source: &str,
-    path: &str,
-    shadow: bool,
-) -> (i32, String, String) {
+fn shell_bind(home: &Path, fake_home: &str, source: &str, path: &str) -> (i32, String, String) {
     let _ = home;
-    let (out, err) = rust_bind(fake_home, source, path, shadow);
+    let (out, err) = rust_bind(fake_home, source, path);
     (0, out, err)
 }
 
 /// Rust verdict in the same shape: the `Err` payload renders with
 /// the `dot init: ` prefix the shell's `_dot_init_error` adds.
-fn rust_bind(fake_home: &str, source: &str, path: &str, shadowed: bool) -> (String, String) {
-    match init::bind_host_git(fake_home, source, path, shadowed) {
+fn rust_bind(fake_home: &str, source: &str, path: &str) -> (String, String) {
+    match init::select_host_git(fake_home, source, path).ok_or(init::NO_HOST_GIT) {
         Ok(host) => (format!("code=0\n{host}\n"), String::new()),
         Err(message) => ("code=1\n".to_string(), format!("dot init: {message}\n")),
     }
@@ -317,8 +310,8 @@ fn bind_pins_selected_git() {
     let home = fake_home.to_string_lossy().into_owned();
     let source = source.to_string_lossy().into_owned();
     let path = tools.display().to_string();
-    let (code, out, err) = shell_bind(&twins.shell_home, &home, &source, &path, false);
-    let (rust_out, rust_err) = rust_bind(&home, &source, &path, false);
+    let (code, out, err) = shell_bind(&twins.shell_home, &home, &source, &path);
+    let (rust_out, rust_err) = rust_bind(&home, &source, &path);
     assert_eq!(code, 0);
     assert_eq!((&out, &err), (&rust_out, &rust_err));
     assert_eq!(out, format!("code=0\n{}/git\n", tools.display()));
@@ -377,33 +370,12 @@ fn bind_rejects_missing_git() {
     let home = fake_home.to_string_lossy().into_owned();
     let source = source.to_string_lossy().into_owned();
     let path = empty.display().to_string();
-    let (code, out, err) = shell_bind(&twins.shell_home, &home, &source, &path, false);
-    let (rust_out, rust_err) = rust_bind(&home, &source, &path, false);
+    let (code, out, err) = shell_bind(&twins.shell_home, &home, &source, &path);
+    let (rust_out, rust_err) = rust_bind(&home, &source, &path);
     assert_eq!(code, 0);
     assert_eq!((&out, &err), (&rust_out, &rust_err));
     assert_eq!(out, "code=1\n");
     assert_eq!(err, format!("dot init: {}\n", init::NO_HOST_GIT));
-}
-
-#[test]
-fn bind_rejects_shadowed_git() {
-    let twins = Twins::build("init-ident-bind-shadow");
-    let root = twins.shared();
-    let fake_home = root.join("home");
-    let source = root.join("source");
-    std::fs::create_dir_all(&fake_home).expect("fake home");
-    std::fs::create_dir_all(&source).expect("fake source");
-    let tools = root.join("tools");
-    fake_git(&tools);
-    let home = fake_home.to_string_lossy().into_owned();
-    let source = source.to_string_lossy().into_owned();
-    let path = tools.display().to_string();
-    let (code, out, err) = shell_bind(&twins.shell_home, &home, &source, &path, true);
-    let (rust_out, rust_err) = rust_bind(&home, &source, &path, true);
-    assert_eq!(code, 0);
-    assert_eq!((&out, &err), (&rust_out, &rust_err));
-    assert_eq!(out, "code=1\n");
-    assert_eq!(err, format!("dot init: {}\n", init::GIT_SHADOWED));
 }
 
 /// Shell verdict for one identity probe: `code=0/1` plus the

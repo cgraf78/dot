@@ -50,11 +50,11 @@ mod repos_git {
             .expect("child result marker")
     }
 
-    pub fn repo_git(base: &Base, kind: RepoKind, path: &str, args: &[&str]) -> i32 {
+    pub fn repo_git_forwarded(base: &Base, kind: RepoKind, path: &str, args: &[&str]) -> i32 {
         quiet("git", base, kind, path, args, 0)
     }
 
-    pub fn run_git_streaming(prefix: &[OsString], args: &[&str]) -> i32 {
+    pub fn run_git_forwarded(prefix: &[OsString], args: &[&str]) -> i32 {
         let base = Base {
             topology: dot::repos_base::Topology::Ordinary,
             client_git_dir: String::new(),
@@ -113,25 +113,35 @@ fn repos_git_stream_child() {
                 .unwrap(),
             &mut Vec::new(),
         ),
-        "stream" => dot::repos_git::run_git_streaming(&["-C".into(), path.into()], &args),
+        "stream" => dot::repos_git::run_git_forwarded(
+            &["-C".into(), path.into()],
+            &args,
+            &mut std::io::stdout(),
+        ),
         "clear-probe" => {
             // Invalidation probe: the parent's counting shim answers
             // `rev-parse --show-toplevel` and silently accepts the
             // streaming call. Two worktree probes around one
-            // `repo_git` must spawn twice (memoized middle probe,
+            // `repo_git_forwarded` must spawn twice (memoized middle probe,
             // re-probe after the clear), plus the streaming call
             // itself: three shim invocations total.
             let repo = std::path::PathBuf::from(std::env::var("DOT_REPOS_GIT_PROBE_REPO").unwrap());
             assert!(dot::overlays::is_worktree(&repo));
             assert!(dot::overlays::is_worktree(&repo));
-            let rc = dot::repos_git::repo_git(&base, kind, &path, &args);
+            let rc = dot::repos_git::repo_git_forwarded(
+                &base,
+                kind,
+                &path,
+                &args,
+                &mut std::io::stdout(),
+            );
             assert!(dot::overlays::is_worktree(&repo));
             let log = std::fs::read_to_string(std::env::var("DOT_REPOS_GIT_PROBE_LOG").unwrap())
                 .expect("probe log");
             println!("DOT_PROBES={}", log.lines().count());
             rc
         }
-        _ => dot::repos_git::repo_git(&base, kind, &path, &args),
+        _ => dot::repos_git::repo_git_forwarded(&base, kind, &path, &args, &mut std::io::stdout()),
     };
     println!("DOT_RC={rc}");
 }
@@ -217,10 +227,15 @@ fn repos_git_command_clears_memoized_worktree_probes() {
 }
 
 #[test]
-fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
+fn forwarded_git_keeps_the_callers_foreground_controlling_tty() {
     const HELPER: &str = "DOT_REPOS_GIT_PTY_HELPER";
     if std::env::var_os(HELPER).is_some() {
-        assert_eq!(dot::repos_git::run_git_streaming(&[], &["push"]), 0);
+        // Stdout is forwarded through the writer by design; stdin and
+        // stderr stay the caller's terminal so prompts keep working.
+        assert_eq!(
+            dot::repos_git::run_git_forwarded(&[], &["push"], &mut std::io::sink()),
+            0
+        );
         return;
     }
 
@@ -231,7 +246,7 @@ fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
     let git = bin.join("git");
     dot_test_support::install_fixture_executable(
         &git,
-        "#!/bin/sh\n/usr/bin/python3 -c 'import os,sys; sys.exit(0 if all(os.isatty(fd) and os.tcgetpgrp(fd) == os.getpgrp() for fd in (0,1,2)) else 9)' || exit $?\n: >\"$DOT_TEST_GIT_PTY_OBSERVED\"\n",
+        "#!/bin/sh\n/usr/bin/python3 -c 'import os,sys; sys.exit(0 if all(os.isatty(fd) and os.tcgetpgrp(fd) == os.getpgrp() for fd in (0,2)) else 9)' || exit $?\n: >\"$DOT_TEST_GIT_PTY_OBSERVED\"\n",
         0o755,
     )
     .unwrap();
@@ -261,7 +276,7 @@ fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
     command
         .args([
             "--exact",
-            "streaming_git_keeps_the_callers_foreground_controlling_tty",
+            "forwarded_git_keeps_the_callers_foreground_controlling_tty",
             "--nocapture",
         ])
         .env(HELPER, "1")
@@ -351,7 +366,7 @@ fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
     assert!(status.success(), "PTY Git helper failed with {status:?}");
     assert!(
         observed.exists(),
-        "streaming Git did not retain foreground TTY access"
+        "forwarded Git did not retain foreground TTY access"
     );
 }
 fn git(path: &Path, args: &[&str]) {
@@ -452,7 +467,7 @@ fn repo_git_dispatches_base_and_overlay_with_status_codes() {
     let b = repo("git-dispatch-base");
     let o = repo("git-dispatch-overlay");
     assert_eq!(
-        repos_git::repo_git(
+        repos_git::repo_git_forwarded(
             &base(Topology::Ordinary, b.path()),
             RepoKind::Base,
             "",
@@ -461,7 +476,7 @@ fn repo_git_dispatches_base_and_overlay_with_status_codes() {
         0
     );
     assert_eq!(
-        repos_git::repo_git(
+        repos_git::repo_git_forwarded(
             &base(Topology::Ordinary, b.path()),
             RepoKind::Overlay,
             &o.path().to_string_lossy(),
@@ -470,7 +485,7 @@ fn repo_git_dispatches_base_and_overlay_with_status_codes() {
         0
     );
     assert_eq!(
-        repos_git::repo_git(
+        repos_git::repo_git_forwarded(
             &base(Topology::Ordinary, b.path()),
             RepoKind::Overlay,
             &o.path().to_string_lossy(),
@@ -534,7 +549,7 @@ fn each_existing_short_circuits_exact_status() {
 fn repo_git_prefix_shapes_cover_separate_and_ordinary() {
     let ord = repo("git-prefix-ordinary");
     assert_eq!(
-        repos_git::repo_git(
+        repos_git::repo_git_forwarded(
             &base(Topology::Ordinary, ord.path()),
             RepoKind::Base,
             "",
@@ -560,7 +575,7 @@ fn repo_git_prefix_shapes_cover_separate_and_ordinary() {
         home: home.path().to_string_lossy().into(),
     };
     assert_eq!(
-        repos_git::repo_git(&sep, RepoKind::Base, "", &["rev-parse", "--show-toplevel"]),
+        repos_git::repo_git_forwarded(&sep, RepoKind::Base, "", &["rev-parse", "--show-toplevel"]),
         0
     );
 }
@@ -568,7 +583,7 @@ fn repo_git_prefix_shapes_cover_separate_and_ordinary() {
 fn repo_git_missing_topology_refuses_128() {
     let d = TempDir::new("git-missing").unwrap();
     assert_eq!(
-        repos_git::repo_git(
+        repos_git::repo_git_forwarded(
             &base(Topology::Missing, d.path()),
             RepoKind::Base,
             "",
@@ -584,7 +599,7 @@ fn repo_git_quiet_failure_propagates() {
     git(d.path(), &["add", "dirty"]);
     for kind in [RepoKind::Base, RepoKind::Overlay] {
         assert_eq!(
-            repos_git::repo_git(
+            repos_git::repo_git_forwarded(
                 &base(Topology::Ordinary, d.path()),
                 kind,
                 &d.path().to_string_lossy(),
@@ -594,7 +609,7 @@ fn repo_git_quiet_failure_propagates() {
         );
     }
     assert_eq!(
-        repos_git::run_git_streaming(&["-C".into(), d.path().join("missing").into()], &["status"]),
+        repos_git::run_git_forwarded(&["-C".into(), d.path().join("missing").into()], &["status"]),
         128
     );
 }

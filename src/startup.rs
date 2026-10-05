@@ -583,18 +583,6 @@ fn guard_reexec(expected: Option<&str>, source_root: &Path) -> Result<(), String
     check_reexec_revision(expected, observed.as_deref())
 }
 
-/// Run [`check`] against a one-time snapshot of the ambient process state.
-///
-/// Compatibility-only native callers use this adapter; command dispatch enters
-/// through [`crate::app`] with an explicit snapshot.
-pub fn check_ambient() -> Result<Config, Failure> {
-    let env = std::env::vars_os().collect();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let runtime = crate::app::Runtime::from_env(&env, &cwd)
-        .expect("the current directory fallback is absolute");
-    check(&runtime)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

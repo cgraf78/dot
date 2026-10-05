@@ -10,7 +10,7 @@ use dot::repos_base::{Base, Topology};
 use dot::repos_overlays::DestinationInputs;
 use dot::repos_pull_fleet::{
     PullAllInputs, PullOverlaysInputs, RepoPullStatus, active_overlays, drain_result_dir,
-    overlay_capture, parse_overlay, pull_all, pull_overlays, pull_overlays_serial,
+    parse_overlay, pull_all, pull_overlays, pull_overlays_serial,
 };
 use dot::repos_pull_queries::CandidateEnv;
 use dot_test_support::TempDir;
@@ -255,90 +255,6 @@ fn drain_replays_nonempty_logs_in_sorted_order_and_removes_scratch() {
     drain_result_dir(&path, &mut out);
     assert_eq!(out, b"first\ntenth\n");
     assert!(!path.exists());
-}
-
-#[test]
-fn capture_writes_indexed_status_and_result_files() {
-    let fleet = Fleet::new("fleet-capture", 1);
-    commit(&fleet.origins[0], "changed.txt", "changed\n");
-    let home = fleet.home.to_string_lossy().into_owned();
-    let entries = fleet.entries();
-    let active = active_overlays(&entries);
-    let dest = DestinationInputs {
-        pwd: home.clone(),
-        home: home.clone(),
-        xdg_state_home: None,
-        install_dir: None,
-        state_dir: None,
-        overlay_paths: vec![],
-        init_backup: None,
-    };
-    let candidate = candidate(&home);
-    let base = Base {
-        topology: Topology::Ordinary,
-        client_git_dir: String::new(),
-        home: home.clone(),
-    };
-    let palette = palette();
-    let logger = Log::new(false, false);
-    let manifest = fleet
-        ._dir
-        .path()
-        .join("manifest.tsv")
-        .to_string_lossy()
-        .into_owned();
-    let legacy = fleet
-        ._dir
-        .path()
-        .join("legacy.tsv")
-        .to_string_lossy()
-        .into_owned();
-    let mut moves = dot::temp::MoveCache::default();
-    let tool = moves.tool().expect("move tool");
-    let inputs = PullOverlaysInputs {
-        entries: &entries,
-        extra_args: &[],
-        home: &home,
-        ui_total: None,
-        dot_quiet: Some("0"),
-        dot_verbose: Some("0"),
-        update_jobs: None,
-        progress_done: None,
-        progress_total: None,
-        bar_width: "8",
-        palette: &palette,
-        multibyte: false,
-        ascii: true,
-        candidate: &candidate,
-        base: &base,
-        quarantine: None,
-        overlays: &[],
-        dest: &dest,
-        manifest: &manifest,
-        legacy_manifest: &legacy,
-        euid: dot::temp::current_uid().expect("uid"),
-        source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
-        tmp: fleet._dir.path(),
-        tool: &tool,
-        log: &logger,
-        prefetch: None,
-    };
-    let result = fleet._dir.path().join("results");
-    std::fs::create_dir(&result).expect("results");
-    assert_eq!(
-        overlay_capture(7, &result, &active[0], &inputs, &mut moves),
-        ("changed".into(), 0)
-    );
-    assert_eq!(std::fs::read_to_string(result.join("007.rc")).unwrap(), "0");
-    assert_eq!(
-        std::fs::read_to_string(result.join("007.status")).unwrap(),
-        "changed"
-    );
-    assert!(result.join("007.log").is_file());
-    assert_eq!(
-        std::fs::read_to_string(fleet.overlays[0].join("changed.txt")).unwrap(),
-        "changed\n"
-    );
 }
 
 #[test]

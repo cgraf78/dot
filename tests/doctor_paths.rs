@@ -1,29 +1,16 @@
 //! Native contracts for leaf-preserving physical paths, one-hop symlink
-//! targets, symlink identity, and public display abbreviation.
+//! targets, symlink identity, and display abbreviation, plus the public
+//! `dot_doctor_display_path` helper extensions call.
 //!
-//! Same harness shape as `tests/repos_pull_base.rs`: a fresh `bash`
-//! per case with `env_clear` plus `LC_ALL=C`, filesystem paths
-//! traveling as `$2..` argv (byte-exact, so spaced and non-UTF8
-//! fixtures need no quoting), and `HOME` pinned per case through
-//! `extra_env` (later `env` calls win, so the case value overrides
-//! the fixture home).
-//!
-//! Relative inputs resolve against the child working directory on
-//! both sides, which differs between the shell child (the fixture)
-//! and this process — so every filesystem row is absolute, and the
-//! empty-input corner stays documented in the module instead of
-//! matrixed. `echo`-hostile values (leading dashes, backslashes) are
-//! excluded from the display corpus the way the XDG suite avoids
-//! glob-hostile values: `_dr_tilde` prints via `echo`, and the matrix
-//! pins realistic display paths instead.
+//! Relative inputs resolve against the process working directory, so every
+//! filesystem row is absolute and the empty-input corner stays documented
+//! in the module instead of matrixed.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
-use dot::doctor_paths::{
-    display_path, physical_path, symlink_points_to, symlink_target_path, tilde,
-};
+use dot::doctor_paths::{physical_path, symlink_points_to, symlink_target_path, tilde};
 use dot_test_support::TempDir;
 
 /// Doctor-paths fixture: plain and spaced dirs, a file, absolute and
@@ -241,16 +228,28 @@ fn symlink_points_to_rows_agree() {
     }
 }
 
-/// One display cell: the shell call plus the Rust twin for `tilde`
-/// and for `dot_doctor_display_path` under the same case `HOME`.
-fn check_display_cell(home: &str, path: &str) {
-    let abbreviated = tilde(path, home);
-    let displayed = display_path(&[path], home).expect("one argument");
-    if home == "/" && path.starts_with('/') && path != "/" {
-        assert_eq!(displayed, format!("~/{}", &path[1..]));
-    } else {
-        assert_eq!(displayed, abbreviated);
-    }
+/// Run `dot_doctor_display_path` once per path under `home`, printing each
+/// result (or `<status>` when the helper refuses) on its own line.
+fn display_paths(home: &str, calls: &str, paths: &[&str]) -> Vec<String> {
+    let script = format!(
+        ". \"$DOT_SOURCE_ROOT/lib/dot/public/hook-runtime-v1/doctor-api.sh\"\n\
+         for path in \"$@\"; do {calls}; done\n"
+    );
+    let output = std::process::Command::new(dot_test_support::bash())
+        .args(["--noprofile", "--norc", "-c", &script, "display"])
+        .args(paths)
+        .env_clear()
+        .env("HOME", home)
+        .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run dot_doctor_display_path");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout)
+        .expect("utf8 display")
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 #[test]
@@ -268,26 +267,28 @@ fn tilde_and_display_matrix_agrees() {
         "",
         "/home/u/héllo ✓",
     ];
-    let mut cells = 0;
     for home in homes {
-        for path in paths {
-            check_display_cell(home, path);
-            cells += 1;
+        let displayed = display_paths(home, "dot_doctor_display_path \"$path\"", &paths);
+        assert_eq!(displayed.len(), paths.len(), "home {home:?}");
+        for (path, displayed) in paths.iter().zip(displayed) {
+            // Off a `/` home the public helper is the private rule; at the
+            // root it abbreviates every absolute path instead.
+            let expected = if home == "/" && path.starts_with('/') && *path != "/" {
+                format!("~/{}", &path[1..])
+            } else {
+                tilde(path, home)
+            };
+            assert_eq!(displayed, expected, "home {home:?} path {path:?}");
         }
-    }
-    assert_eq!(cells, 40, "display matrix inventory");
-    // Arity gates: anything but exactly one argument is status 2 on
-    // both sides, printing nothing.
-    for home in homes {
+        // Anything but exactly one argument is status 2, printing nothing.
         assert_eq!(
-            display_path(&[], home).map(|text| text.into_bytes()),
-            Err(dot::doctor_paths::Error::Usage),
-            "rust arity-0 for {home:?}"
-        );
-        assert_eq!(
-            display_path(&["a", "b"], home).map(|text| text.into_bytes()),
-            Err(dot::doctor_paths::Error::Usage),
-            "rust arity-2 for {home:?}"
+            display_paths(
+                home,
+                "dot_doctor_display_path || echo \"<$?>\"; dot_doctor_display_path a b || echo \"<$?>\"",
+                &["once"],
+            ),
+            ["<2>", "<2>"],
+            "arity for home {home:?}"
         );
     }
 }

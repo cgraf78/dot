@@ -182,7 +182,6 @@ fn prepare<'a>(
                 .join("dot/overlay-links")
                 .to_string_lossy()
                 .into_owned(),
-            retiring_root: String::new(),
         },
         overlays: overlays.overlays,
         euid: uid,

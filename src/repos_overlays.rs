@@ -913,18 +913,6 @@ pub fn link_matches(home: &str, rel: &str, name: &str, target: Option<&str>) -> 
             .is_some_and(|link| link == expected.as_bytes())
 }
 
-/// `_overlay_active_provides`: some overlay ships `rel` as a file or
-/// link, independent of any manifest. The sync discipline is
-/// deliberately ignored here, exactly like the shell loop.
-pub fn active_provides(overlays: &[String], rel: &str) -> bool {
-    overlays.iter().any(|entry| {
-        let (path, _) = repos_base::overlay_path_sync(entry);
-        let shipped = format!("{path}/home/{rel}");
-        std::fs::symlink_metadata(&shipped)
-            .is_ok_and(|meta| meta.is_file() || meta.file_type().is_symlink())
-    })
-}
-
 /// `_overlay_active_link_matches`: some overlay both ships `rel` and
 /// owns the live home link for it.
 pub fn active_link_matches(home: &str, overlays: &[String], rel: &str) -> bool {

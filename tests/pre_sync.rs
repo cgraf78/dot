@@ -18,7 +18,6 @@ fn inputs(home: &Path, ext: &Path) -> Inputs {
         home: home.to_string_lossy().into_owned(),
         extensions_dir: ext.to_string_lossy().into_owned(),
         manifest: String::new(),
-        retiring_root: String::new(),
     }
 }
 fn script(root: &Path, name: &str, mode: u32) -> PathBuf {

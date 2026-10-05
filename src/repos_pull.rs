@@ -90,8 +90,8 @@ pub struct PullRepoInputs<'a> {
     pub log: &'a Log,
 }
 
-/// Captured pull run into `log`, like `run_to_file` but with the
-/// locale pinned per invocation: `_pull_cmd` sets `LC_ALL=C` around
+/// Captured pull run into `log` (stdout and stderr through one shared
+/// handle, like `>"$log" 2>&1`) with the locale pinned per invocation: `_pull_cmd` sets `LC_ALL=C` around
 /// every git run so the conflict detector and the quiet-output
 /// filter match literal English, and the shared runner takes a bare
 /// argv with inherited environment. Ticks stay with the worker
@@ -1206,6 +1206,35 @@ pub fn pull_base(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pull_runners_pin_the_c_locale_and_pass_argv_verbatim() {
+        // The conflict-backup detector and the quiet-output filter match
+        // literal English git messages, so both runners pin `LC_ALL=C`
+        // whatever locale the caller has.
+        let scope = dot_test_support::TempDir::new("pull-runner-locale").expect("fixture");
+        let record = scope.path().join("record");
+        let argv = |status: &str| -> Vec<OsString> {
+            vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(format!(
+                    "printf '%s|%s\\n' \"$LC_ALL\" \"$*\" >\"$0\"; printf 'logged\\n'; exit {status}"
+                )),
+                record.clone().into_os_string(),
+                OsString::from("pull"),
+                OsString::from("--quiet"),
+            ]
+        };
+        let log = scope.path().join("pull.log");
+        assert_eq!(run_pull_to_log(&log, &argv("3")), 3);
+        assert_eq!(std::fs::read(&record).unwrap(), b"C|pull --quiet\n");
+        assert_eq!(std::fs::read(&log).unwrap(), b"logged\n");
+        std::fs::remove_file(&record).unwrap();
+        assert_eq!(run_streaming(&argv("0")), 0);
+        assert_eq!(std::fs::read(&record).unwrap(), b"C|pull --quiet\n");
+        assert_eq!(run_streaming(&[]), 127);
+    }
 
     #[test]
     fn logfile_create_allocates_unique_empty_private_files() {

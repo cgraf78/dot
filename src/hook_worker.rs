@@ -218,7 +218,6 @@ impl Worker {
             home: home.to_string(),
             extensions_dir: extensions_dir.to_string_lossy().into_owned(),
             manifest: manifest.to_string_lossy().into_owned(),
-            retiring_root: String::new(),
         };
         let (retiring_name, retiring_root) = if mode == "deactivate" {
             let record = decoded.records.first().ok_or(CommandFailure::Invalid)?;

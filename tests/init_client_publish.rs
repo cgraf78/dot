@@ -637,58 +637,6 @@ fn publish_worktree_refusals() {
     );
 }
 
-#[test]
-fn forward_converge_rows() {
-    for (skip, select_ok, config_ok, sync_ok, finalize_ok, want_ok, want_calls) in [
-        (false, true, true, true, true, true, 5),
-        (true, true, true, true, true, true, 5),
-        (false, true, true, false, true, true, 5),
-        (true, true, true, false, false, false, 5),
-        (false, false, true, true, true, true, 5),
-        (false, true, false, true, true, false, 2),
-    ] {
-        let log = RefCell::new(Vec::new());
-        let ok = |pass| {
-            if pass {
-                Ok(())
-            } else {
-                Err(dot::errors::Error::Usage {
-                    message: "scripted",
-                })
-            }
-        };
-        let hooks = publish::ConvergeHooks {
-            select_client: &|| {
-                log.borrow_mut().push("select".into());
-                ok(select_ok)
-            },
-            load_config: &|| {
-                log.borrow_mut().push("config".into());
-                ok(config_ok)
-            },
-            begin_ui: &|total| log.borrow_mut().push(format!("begin:{total}")),
-            sync_repos: &|seen| {
-                log.borrow_mut().push(format!("sync:{seen}"));
-                ok(sync_ok)
-            },
-            finalize: &|status, seen| {
-                log.borrow_mut().push(format!("finalize:{status}:{seen}"));
-                ok(finalize_ok)
-            },
-        };
-        assert_eq!(publish::forward_converge(skip, &hooks).is_ok(), want_ok);
-        assert_eq!(log.borrow().len(), want_calls);
-        if config_ok {
-            assert_eq!(log.borrow()[2], "begin:5");
-            assert_eq!(log.borrow()[3], format!("sync:{skip}"));
-            assert_eq!(
-                log.borrow()[4],
-                format!("finalize:{}:{skip}", i32::from(!sync_ok))
-            );
-        }
-    }
-}
-
 fn origin_repo(root: &Path, tag: &str, urls: &[&str]) -> PathBuf {
     let repo = root.join(tag);
     std::fs::create_dir(&repo).expect("repo");

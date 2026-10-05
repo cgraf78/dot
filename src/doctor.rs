@@ -1022,7 +1022,6 @@ fn merge_inventory(
         home: home.to_string(),
         extensions_dir: root.to_string(),
         manifest: manifest.to_string(),
-        retiring_root: String::new(),
     };
     if !crate::extension_trust::root_validate(root, euid) {
         return Err(untrusted(Path::new(root)));
@@ -1178,7 +1177,6 @@ fn extensions(
         home: home.clone(),
         extensions_dir: root.to_string(),
         manifest: manifest.to_string(),
-        retiring_root: String::new(),
     };
     let discovery = match crate::doctor_coordinator::collect_specs_with(&directory, |script| {
         crate::extension_trust::file_validate(script, &trust, overlays)

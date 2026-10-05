@@ -18,32 +18,6 @@ fn inventory_names(path: &std::path::Path) -> Vec<String> {
 }
 
 #[test]
-fn protocol_whitelist_and_survivors_are_exact() {
-    for name in worker::OVERLAY_PROTOCOL_KEEP {
-        assert!(worker::overlay_protocol_keep(name));
-    }
-    for name in [
-        "merge",
-        "doctor",
-        "_overlay_private_helper",
-        "",
-        "_overlay_link_target_extra",
-    ] {
-        assert!(!worker::overlay_protocol_keep(name));
-    }
-    let before = vec!["existing".into()];
-    let after = vec![
-        "new".into(),
-        "existing".into(),
-        "_overlay_link_target".into(),
-    ];
-    assert_eq!(
-        worker::protocol_survivors(&before, &after),
-        vec!["existing", "_overlay_link_target"]
-    );
-}
-
-#[test]
 fn public_hook_runtime_remains_sourceable_without_private_engine_files() {
     let root = env!("CARGO_MANIFEST_DIR");
     for path in [
@@ -141,16 +115,15 @@ fn public_extension_inventories_and_documentation_pin_the_literal_contract() {
 }
 
 #[test]
-fn modes_map_to_fixed_entry_points() {
-    for (text, mode, entry) in [
-        ("merge", Mode::Merge, "merge"),
-        ("pre-sync", Mode::PreSync, "prepare"),
-        ("deactivate", Mode::Deactivate, "deactivate"),
-        ("doctor", Mode::Doctor, "doctor"),
+fn modes_parse_their_canonical_spelling() {
+    for (text, mode) in [
+        ("merge", Mode::Merge),
+        ("pre-sync", Mode::PreSync),
+        ("deactivate", Mode::Deactivate),
+        ("doctor", Mode::Doctor),
     ] {
         assert_eq!(Mode::parse(text), Some(mode));
         assert_eq!(mode.as_str(), text);
-        assert_eq!(mode.entry_point(), entry);
     }
     for bad in ["", "prepare", "pre_sync", "Doctor", "unknown"] {
         assert_eq!(Mode::parse(bad), None);
