@@ -56,6 +56,16 @@ const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const FORCED_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 #[cfg(target_os = "linux")]
 const SUCCESS_QUIESCENCE_GRACE: Duration = Duration::from_millis(500);
+/// Membership-scan time that counts against `SUCCESS_QUIESCENCE_GRACE`.
+/// A scan walks the whole process table: tens of milliseconds on a quiet
+/// host, several hundred on a loaded one. Time beyond this allowance is the
+/// harness's observation cost, so it is refunded rather than charged to the
+/// command. The grace then fits about four slow scans however slow they get
+/// (a proof needs two empty ones), and a quiet host behaves as if nothing
+/// were refunded. Lingering the refund lets through is still measured:
+/// elapsed time runs to the quiescence proof.
+#[cfg(target_os = "linux")]
+const QUIESCENCE_SCAN_ALLOWANCE: Duration = Duration::from_millis(100);
 #[cfg(target_os = "linux")]
 const PROCESS_POLL: Duration = Duration::from_millis(10);
 /// Command bound for the escaped-descendant fixtures. Their leader exits on
@@ -64,6 +74,12 @@ const PROCESS_POLL: Duration = Duration::from_millis(10);
 /// stretch past a couple of seconds and turn into a spurious timeout.
 #[cfg(target_os = "linux")]
 const ESCAPED_FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Command bound for fixtures that must pass the quiescence proof. Passing
+/// runs end with that proof, so they never wait for it: it bounds only a
+/// regression, and leaves room for the several slow scans a loaded host
+/// needs to prove quiescence.
+#[cfg(target_os = "linux")]
+const QUIESCING_FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Headroom over the supervisor's own deadlines for its process startup and
 /// result handoff on a loaded host.
 #[cfg(target_os = "linux")]
@@ -2385,7 +2401,22 @@ fn descendant_quiescence(
     boundary: &ProcessBoundary,
     command_deadline: Instant,
 ) -> Result<Option<Instant>, String> {
-    let deadline = (Instant::now() + SUCCESS_QUIESCENCE_GRACE).min(command_deadline);
+    quiescence(command_deadline, || {
+        Ok(live_boundary_members(boundary)?
+            .iter()
+            .any(|member| *member != boundary.leader))
+    })
+}
+
+/// Polls `has_descendant` until two consecutive scans come back empty,
+/// returning when the proof completed, or `None` once the grace (or the
+/// command deadline) leaves no time to start another scan.
+#[cfg(target_os = "linux")]
+fn quiescence(
+    command_deadline: Instant,
+    mut has_descendant: impl FnMut() -> Result<bool, String>,
+) -> Result<Option<Instant>, String> {
+    let mut deadline = (Instant::now() + SUCCESS_QUIESCENCE_GRACE).min(command_deadline);
     let mut empty_observations = 0;
     loop {
         // The deadline bounds when a scan may start, as in the standalone
@@ -2399,10 +2430,19 @@ fn descendant_quiescence(
         if Instant::now() >= deadline {
             return Ok(None);
         }
-        let has_descendant = live_boundary_members(boundary)?
-            .iter()
-            .any(|member| *member != boundary.leader);
+        let scan_started = Instant::now();
+        let has_descendant = has_descendant()?;
         let observed_at = Instant::now();
+        // Refund the scan's excess so the proof does not depend on how fast
+        // this host can scan; the standalone supervisor does not, as it
+        // only runs on a quiet benchmark host. The command deadline stays
+        // absolute, and a slow pass still spends the allowance plus a poll
+        // of the grace, so at most five slow scans fit: a lingering
+        // descendant is rejected within their cost past the grace.
+        let excess = observed_at
+            .saturating_duration_since(scan_started)
+            .saturating_sub(QUIESCENCE_SCAN_ALLOWANCE);
+        deadline = (deadline + excess).min(command_deadline);
         if has_descendant {
             empty_observations = 0;
         } else {
@@ -3032,7 +3072,14 @@ fn process_is_live(pid: u32) -> bool {
 /// for it.
 #[cfg(target_os = "linux")]
 fn escaped_fixture_watchdog() -> Duration {
-    ESCAPED_FIXTURE_TIMEOUT + TERMINATION_GRACE + FORCED_CLEANUP_GRACE + SUPERVISOR_STARTUP_SLACK
+    supervisor_watchdog(ESCAPED_FIXTURE_TIMEOUT)
+}
+
+/// Hang watchdog for a supervisor run with command bound `timeout`: the
+/// command, then the TERM and KILL cleanup graces, plus startup slack.
+#[cfg(target_os = "linux")]
+fn supervisor_watchdog(timeout: Duration) -> Duration {
+    timeout + TERMINATION_GRACE + FORCED_CLEANUP_GRACE + SUPERVISOR_STARTUP_SLACK
 }
 
 #[cfg(target_os = "linux")]
@@ -5384,7 +5431,7 @@ fn timed_command_accepts_only_a_quiescent_success() {
     let mut command = Command::new("/bin/sh");
     command.args(["-c", "printf 'complete\\n'"]);
 
-    let output = run_timed_command(&mut command, Duration::from_secs(2))
+    let output = run_timed_command(&mut command, QUIESCING_FIXTURE_TIMEOUT)
         .expect("quiescent command succeeds");
     assert!(output.output.status.success());
     assert_eq!(output.output.stdout, b"complete\n");
@@ -5396,11 +5443,11 @@ fn timed_command_accepts_only_a_quiescent_success() {
 fn timed_command_allows_a_short_lived_descendant_to_quiesce() {
     let scratch = Scratch::new_exec("perf-quiescence").expect("scratch");
     let marker = scratch.path().join("required-marker");
-    // Margin math: quiescence must observe the descendant's whole life
-    // (spawn chain + timer + exit) plus two confirming scans inside the
-    // 500ms grace. Each full process-table scan costs 100ms+ on a loaded
-    // host, so the timer stays small; the marker below (not a wall-clock
-    // lower bound) proves the supervisor waited for the descendant.
+    // Quiescence must outlast the descendant's whole life (spawn chain,
+    // timer, exit) and then see two empty scans. Slow scans are refunded to
+    // the grace, so the timer only has to stay well inside it; the marker
+    // below (not a wall-clock lower bound) proves the supervisor waited for
+    // the descendant.
     let script = format!(
         "( sleep 0.05; printf complete >'{}' ) </dev/null >/dev/null 2>&1 & exit 0",
         marker.display()
@@ -5408,7 +5455,7 @@ fn timed_command_allows_a_short_lived_descendant_to_quiesce() {
     let mut command = Command::new("/bin/sh");
     command.args(["-c", &script]);
 
-    let output = run_timed_command(&mut command, Duration::from_secs(2))
+    let output = run_timed_command(&mut command, QUIESCING_FIXTURE_TIMEOUT)
         .expect("a child that quiesces within the bounded grace period succeeds");
     assert!(output.output.status.success());
     assert_eq!(
@@ -5536,6 +5583,79 @@ fn descendant_quiescence_stops_at_the_total_deadline() {
              {SUCCESS_QUIESCENCE_GRACE:?} grace"
         );
     }
+}
+
+/// A scan that takes `cost`, for driving `quiescence` without a process
+/// table. It records when each scan started.
+#[cfg(target_os = "linux")]
+fn slow_scan(
+    cost: Duration,
+    has_descendant: bool,
+    starts: &mut Vec<Instant>,
+) -> impl FnMut() -> Result<bool, String> + '_ {
+    move || {
+        starts.push(Instant::now());
+        std::thread::sleep(cost);
+        Ok(has_descendant)
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn quiescence_refunds_scans_slower_than_the_whole_grace() {
+    // Each empty scan outlasts the grace by itself, so without the refund
+    // the confirming scan could never start in time.
+    let mut starts = Vec::new();
+    let cost = SUCCESS_QUIESCENCE_GRACE + QUIESCENCE_SCAN_ALLOWANCE;
+    let result = quiescence(
+        Instant::now() + Duration::from_secs(60),
+        slow_scan(cost, false, &mut starts),
+    )
+    .expect("fake scans succeed");
+    assert!(
+        result.is_some(),
+        "slow empty scans did not prove quiescence"
+    );
+    assert_eq!(starts.len(), 2, "quiescence needs exactly two empty scans");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn quiescence_rejects_a_lingering_descendant_within_a_few_slow_scans() {
+    // Only the excess over the allowance is refunded, so each slow pass
+    // still spends the allowance plus a poll of the grace: scans can start
+    // at about 0, 110, 220, 330 and 440ms of grace, and no more.
+    let mut starts = Vec::new();
+    let cost = QUIESCENCE_SCAN_ALLOWANCE * 2;
+    let result = quiescence(
+        Instant::now() + Duration::from_secs(60),
+        slow_scan(cost, true, &mut starts),
+    )
+    .expect("fake scans succeed");
+    assert!(result.is_none(), "a lingering descendant quiesced");
+    let limit = SUCCESS_QUIESCENCE_GRACE
+        .as_nanos()
+        .div_ceil((QUIESCENCE_SCAN_ALLOWANCE + PROCESS_POLL).as_nanos());
+    assert!(
+        starts.len() as u128 <= limit,
+        "{} slow scans fit the grace (limit {limit})",
+        starts.len()
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn quiescence_refunds_never_start_a_scan_past_the_command_deadline() {
+    let mut starts = Vec::new();
+    let command_deadline = Instant::now() + SUCCESS_QUIESCENCE_GRACE * 2;
+    let cost = SUCCESS_QUIESCENCE_GRACE + QUIESCENCE_SCAN_ALLOWANCE;
+    let result = quiescence(command_deadline, slow_scan(cost, true, &mut starts))
+        .expect("fake scans succeed");
+    assert!(result.is_none(), "a lingering descendant quiesced");
+    assert!(
+        starts.iter().all(|start| *start < command_deadline),
+        "a refunded scan started past the command deadline"
+    );
 }
 
 #[test]
@@ -5901,8 +6021,9 @@ fn timed_command_reaps_a_descendant_left_by_a_successful_parent() {
     )
     .expect("install descendant fixture");
     let mut command = Command::new(&script);
+    let timeout = Duration::from_secs(2);
     let started = Instant::now();
-    let error = run_timed_command(&mut command, Duration::from_secs(2))
+    let error = run_timed_command(&mut command, timeout)
         .expect_err("a successful leader with live descendants is invalid");
     // A loaded host can exhaust the total deadline while quiescence is still
     // forcing cleanup of the never-exiting descendant; both rejections are
@@ -5911,9 +6032,14 @@ fn timed_command_reaps_a_descendant_left_by_a_successful_parent() {
         error.contains("live descendant") || error.contains("timed out"),
         "{error}"
     );
+    // Rejecting the descendant takes several slow scans on a loaded host,
+    // so bound the run only by what the supervisor itself bounds. That is
+    // still well short of the descendant's 30s, so a supervisor that waited
+    // it out instead of killing it fails here.
+    let watchdog = supervisor_watchdog(timeout);
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "successful-parent cleanup exceeded its bounded deadline"
+        started.elapsed() < watchdog,
+        "successful-parent cleanup exceeded its {watchdog:?} watchdog"
     );
     let pid = fs::read_to_string(&child_pid)
         .expect("descendant pid")
