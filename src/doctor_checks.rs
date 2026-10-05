@@ -1135,7 +1135,7 @@ pub fn check_profile_lifecycle(inputs: &LifecycleInputs) -> Vec<Record> {
                             None,
                         )
                         .with_hint(format!(
-                            "make ~/.dotfiles-{name}/dot/profile-deactivate a single-link file you own that group and others cannot write (chmod go-w), in a clone whose origin matches its descriptor; then run dot update"
+                            "make ~/.dotfiles-{name}/dot/profile-deactivate a single-link file you own that group and others cannot write (chmod go-w, its parent directories too), in a clone whose origin matches its descriptor; then run dot update"
                         )),
                     );
                 }

@@ -343,6 +343,8 @@ fn trim_bytes(line: &[u8]) -> &[u8] {
 ///   `Neovim` from `nvim`);
 /// - is a short title, at most four words, that starts with the first word
 ///   of a multi-word key (`Git (home config)` from `git-home`).
+///
+/// Leading ordering words of the key (`zz`, digits) are ignored first.
 fn names_hook(line: &[u8], name: &[u8]) -> bool {
     fn words(text: &[u8]) -> Vec<Vec<u8>> {
         text.split(|byte| !byte.is_ascii_alphanumeric())
@@ -359,7 +361,16 @@ fn names_hook(line: &[u8], name: &[u8]) -> bool {
         return false;
     }
     let title = words(line);
-    let key = words(name);
+    // Ordering prefixes (`zz-`, `10-`) only sort the hook; titles never
+    // repeat them, so a one-word name after one must still match.
+    let mut key = words(name);
+    while key.len() > 1
+        && key[0]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b'z')
+    {
+        key.remove(0);
+    }
     if title.is_empty() || key.is_empty() {
         return false;
     }
@@ -1362,6 +1373,8 @@ mod tests {
             ("git-home", "Git (home config)"),
             ("sync", "sync systemd"),
             ("llms", "LLMs"),
+            ("zz-widget", "Widget"),
+            ("10-widget", "Widget"),
         ] {
             assert!(
                 super::names_hook(title.as_bytes(), key.as_bytes()),
