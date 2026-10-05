@@ -1126,20 +1126,16 @@ pub fn check_profile_lifecycle(inputs: &LifecycleInputs) -> Vec<Record> {
         if eligible.contains(name) {
             if let Some(active_record) = active.get(name) {
                 if !(inputs.deactivation_ok)(active_record) {
-                    // The rules of `profile_lifecycle::deactivation_script` and
-                    // `extension_trust::deactivation_validate`, which refuse
-                    // this script until they all hold.
-                    let script = format!(
-                        "{}/dot/profile-deactivate",
-                        read_fields(active_record, 3)[1]
-                    );
+                    // The main rules of `profile_lifecycle::deactivation_script`
+                    // and `extension_trust::deactivation_validate`; the script
+                    // must sit at exactly this path in a git overlay clone.
                     out.push(
                         Record::fail(
                             format!("{name}: active profile deactivation authority unsafe"),
                             None,
                         )
                         .with_hint(format!(
-                            "{script} must be a regular file you own, in your git overlay clone at ~/.dotfiles-{name} whose origin matches its descriptor, with no parent directory others can write; fix that, then run dot update"
+                            "make ~/.dotfiles-{name}/dot/profile-deactivate a single-link file you own that group and others cannot write (chmod go-w), in a clone whose origin matches its descriptor; then run dot update"
                         )),
                     );
                 }
@@ -1153,10 +1149,15 @@ pub fn check_profile_lifecycle(inputs: &LifecycleInputs) -> Vec<Record> {
         }
         pending.push(name);
         if !inputs.extensions_enabled {
-            out.push(Record::fail(
-                "profile deactivation pending while extensions are disabled",
-                Some(name.to_string()),
-            ));
+            out.push(
+                Record::fail(
+                    "profile deactivation pending while extensions are disabled",
+                    Some(name.to_string()),
+                )
+                .with_hint(
+                    "set extension_api=1 and extensions_dir in dot's config, then run dot update",
+                ),
+            );
             continue;
         }
         if !(inputs.deactivation_ok)(record) {
@@ -1509,8 +1510,11 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                     "fix the invalid overlay descriptor reported above, then rerun dot doctor"
                         .to_string()
                 } else if descriptor.ends_with(".local.conf") {
+                    // Only a Git-backed descriptor gets here, and `sync=none`
+                    // rejects its `url=`, so renaming is the one fix. The new
+                    // name clones a new checkout beside the old one.
                     format!(
-                        "{} is a .local descriptor without sync=none; set sync=none or drop .local from its name, then run dot update",
+                        "rename {} without .local, then run dot update; it clones ~/.dotfiles-{name}, and the old ~/.dotfiles-{name}.local checkout stays behind and may hold unpushed work",
                         tilde(descriptor, inputs.home)
                     )
                 } else {
@@ -1566,10 +1570,13 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 ));
                 continue;
             }
-            out.push(Record::fail(
-                format!("{name}: not cloned"),
-                Some(format!("expected at {}", tilde(&path, inputs.home))),
-            ));
+            out.push(
+                Record::fail(
+                    format!("{name}: not cloned"),
+                    Some(format!("expected at {}", tilde(&path, inputs.home))),
+                )
+                .with_hint("run dot update to clone it"),
+            );
             continue;
         }
         // This overlay's rows, folded into one when every one passes.
@@ -2738,10 +2745,20 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
         } else {
             resolved.as_str()
         };
-        out.push(Record::fail(
-            "client worktree mismatch",
-            Some(format!("expected {}, got {got}", inputs.home)),
-        ));
+        // Setting the work tree to `$HOME` fixes either layout: a separate
+        // Git directory names it, and `$HOME/.git` resolves to it anyway.
+        let quote = |text: &str| crate::repos_pull_support::shell_quote(text.as_bytes());
+        out.push(
+            Record::fail(
+                "client worktree mismatch",
+                Some(format!("expected {}, got {got}", inputs.home)),
+            )
+            .with_hint(format!(
+                "point it at $HOME: git --git-dir={} config core.worktree {}",
+                quote(inputs.client_git_dir),
+                quote(inputs.home)
+            )),
+        );
     }
     let status = match git(&STATUS_ARGS) {
         Ok(status) => status,

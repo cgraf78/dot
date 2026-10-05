@@ -1315,6 +1315,11 @@ fn lifecycle_branch_matrix() {
     let pending = render(&check(true, true, vec![], vec!["old|record".into()], false));
     assert!(pending.contains("extensions are disabled"));
     assert!(pending.contains("profile deactivation pending"));
+    assert_eq!(
+        hint_of(&pending, "extensions are disabled"),
+        Some("set extension_api=1 and extensions_dir in dot's config, then run dot update"),
+        "{pending}"
+    );
 }
 
 #[test]
@@ -1488,6 +1493,11 @@ fn overlays_discovery_lifecycle_local_and_sync_matrix() {
             "missing {expected:?} in {output}"
         );
     }
+    assert_eq!(
+        hint_of(&output, "required: not cloned"),
+        Some("run dot update to clone it"),
+        "{output}"
+    );
 }
 
 #[test]
@@ -2725,6 +2735,18 @@ fn base_repo_ordinary_dirty_detached_upstream_and_mismatch_matrix() {
         &nested,
     )));
     assert!(mismatch.contains("client worktree mismatch"));
+    assert_eq!(
+        hint_of(&mismatch, "client worktree mismatch"),
+        Some(
+            format!(
+                "point it at $HOME: git --git-dir={} config core.worktree {}",
+                home.join(".git").display(),
+                nested.display()
+            )
+            .as_str()
+        ),
+        "{mismatch}"
+    );
 
     // Unmerged entries make every pull refuse: a failure, not dirt.
     git(&home, &["checkout", "-q", "main"]);
@@ -3111,7 +3133,8 @@ fn profile_and_client_failures_name_a_next_step() {
     let step = hint_of(&lifecycle, "active profile deactivation authority unsafe")
         .unwrap_or_else(|| panic!("no step in {lifecycle}"));
     assert!(
-        step.contains("/home/test/.dotfiles-work/dot/profile-deactivate")
+        step.contains("~/.dotfiles-work/dot/profile-deactivate")
+            && step.contains("chmod go-w")
             && step.contains("dot update"),
         "{step}"
     );
@@ -3152,8 +3175,15 @@ fn profile_and_client_failures_name_a_next_step() {
     input.discovery_error = None;
     let local = hint_of(&output, "beta: active lifecycle record missing")
         .unwrap_or_else(|| panic!("no step in {output}"));
+    // `sync=none` would reject the descriptor's `url=`: renaming is the fix,
+    // and the old checkout is left behind.
     assert!(
-        local.starts_with("~/.config/dot/overlays.d/20-beta.local.conf is a .local descriptor"),
+        local.starts_with("rename ~/.config/dot/overlays.d/20-beta.local.conf without .local"),
+        "{local}"
+    );
+    assert!(
+        local.contains("~/.dotfiles-beta.local checkout stays behind")
+            && !local.contains("sync=none"),
         "{local}"
     );
 

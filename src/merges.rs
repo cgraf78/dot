@@ -326,11 +326,23 @@ fn trim_bytes(line: &[u8]) -> &[u8] {
 }
 
 /// Whether a hook's first output line is its title rather than a
-/// diagnostic: its words (ASCII letters and digits, case-insensitive) are
-/// the trailing words of the hook's `name`. Hooks conventionally open with
-/// one (`dot_hook_log "  Agent rules"` from `agent-rules`, `Codex trust`
-/// from `zz-codex-trust`), which reads better as the row name than the
-/// hook key does; anything else (`warning: …`) is output, not a name.
+/// diagnostic. Hooks conventionally open with one (`dot_hook_log "  Agent
+/// rules"` from `agent-rules`), which reads better as the row name than the
+/// hook key does, and the release before the key-named rows showed it there.
+///
+/// Words are runs of ASCII letters and digits, compared case-insensitively.
+/// A line with a `:` is output (`warning: …`, `tmux: …`), never a title.
+/// Otherwise the line names the hook when it:
+/// - is the key's trailing words, more than one of them or the whole key
+///   (`Codex trust` from `zz-codex-trust`; a lone trailing `settings` from
+///   `opencode-settings` would hide which hook ran);
+/// - starts with the key's words (`Claude Code` from `claude`);
+/// - spells the key with other spacing (`VS Code` from `vscode`);
+/// - is a short title, at most three words, that abbreviates to the key:
+///   same first letter, the key's letters in order (`GitHub CLI` from `gh`,
+///   `Neovim` from `nvim`);
+/// - is a short title, at most four words, that starts with the first word
+///   of a multi-word key (`Git (home config)` from `git-home`).
 fn names_hook(line: &[u8], name: &[u8]) -> bool {
     fn words(text: &[u8]) -> Vec<Vec<u8>> {
         text.split(|byte| !byte.is_ascii_alphanumeric())
@@ -338,9 +350,28 @@ fn names_hook(line: &[u8], name: &[u8]) -> bool {
             .map(<[u8]>::to_ascii_lowercase)
             .collect()
     }
+    /// Whether every byte of `short` appears in `long`, in order.
+    fn abbreviates(short: &[u8], long: &[u8]) -> bool {
+        let mut rest = long.iter();
+        short.iter().all(|byte| rest.any(|other| other == byte))
+    }
+    if line.contains(&b':') {
+        return false;
+    }
     let title = words(line);
-    let name = words(name);
-    !title.is_empty() && name.ends_with(&title)
+    let key = words(name);
+    if title.is_empty() || key.is_empty() {
+        return false;
+    }
+    let (title_text, key_text) = (title.concat(), key.concat());
+    (key.ends_with(&title) && (title.len() > 1 || title == key))
+        || title.starts_with(&key)
+        || title_text == key_text
+        || (title.len() <= 3
+            && key_text.len() > 1
+            && title_text[0] == key_text[0]
+            && abbreviates(&key_text, &title_text))
+        || (key.len() > 1 && title.len() <= 4 && title[0] == key[0])
 }
 
 /// Byte-preserving counterpart of [`result_label`] for live worker output.
@@ -1293,6 +1324,66 @@ mod tests {
              \x20 ok       git                          7ms\n\
              \x20   merged\n"
         );
+    }
+
+    #[test]
+    fn real_hook_titles_name_their_rows() {
+        // The first `dot_hook_log` line of every titled hook in the public
+        // dotfiles repositories (base, dev, nvim, personal overlays), plus
+        // stand-ins of the same shape for private ones. The release before
+        // #252 named each of these rows by its title, so none may fall back
+        // to the key with the title repeated below it.
+        for (key, title) in [
+            ("agent-rules", "Agent rules"),
+            ("cron", "cron"),
+            ("ignore", "Ignore"),
+            ("iterm2", "iTerm2"),
+            ("karabiner", "Karabiner"),
+            ("ssh", "SSH"),
+            ("sshd", "SSHD"),
+            ("tmux", "tmux"),
+            ("wezterm", "WezTerm"),
+            ("zz-codex-trust", "Codex trust"),
+            ("claude", "Claude Code"),
+            ("gemini", "Gemini CLI"),
+            ("gh", "GitHub CLI"),
+            ("git", "Git"),
+            ("grok-config", "Grok config"),
+            ("grok", "Grok"),
+            ("hive-memory", "Hive Memory"),
+            ("mise", "mise"),
+            ("muse", "Muse Code"),
+            ("opencode", "OpenCode"),
+            ("sapling", "Sapling"),
+            ("vscode", "VS Code"),
+            ("nvim", "Neovim"),
+            ("opencode-settings", "OpenCode settings"),
+            ("pm", "PackMan CLI"),
+            ("git-home", "Git (home config)"),
+            ("sync", "sync systemd"),
+            ("llms", "LLMs"),
+        ] {
+            assert!(
+                super::names_hook(title.as_bytes(), key.as_bytes()),
+                "{key}: {title}"
+            );
+        }
+        // Diagnostics and status lines stay details under the hook key, and
+        // a lone trailing word (`settings`) does not hide which hook ran.
+        for (key, line) in [
+            ("tmux", "tmux: merge skipped"),
+            ("tmux", "warning: tmux merge skipped"),
+            ("opencode-settings", "settings"),
+            ("zz-codex-trust", "trust"),
+            ("grok-rc", "Grok installer block removed from ~/.bashrc"),
+            ("gh", "go fetch the token again"),
+            ("nvim", "plugins synced"),
+        ] {
+            assert!(
+                !super::names_hook(line.as_bytes(), key.as_bytes()),
+                "{key}: {line}"
+            );
+        }
     }
 
     #[test]

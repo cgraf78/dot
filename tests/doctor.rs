@@ -2312,6 +2312,20 @@ fn crashed_pipeline_says_an_earlier_element_failed() {
 }
 
 #[test]
+fn pipeline_statuses_ignore_the_extensions_ifs() {
+    let (_scope, home, state) = crash_fixture(
+        "crash-pipeline-ifs",
+        "doctor() {\n  IFS=,\n  grep -q missing /dev/null | sort\n}\n",
+    );
+    let (output, _) = doctor_with_env(&home, &state, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(":3: pipeline with statuses 1 0, ending in: sort\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn a_test_after_a_pipeline_is_not_reported_as_the_pipeline() {
     // `[[` and `((` leave the previous pipeline's statuses in place, so they
     // must not be read as a pipeline failure.

@@ -142,6 +142,8 @@ case $mode in
     _dot_doctor_note_failure() {
       local status=$1 command=$2 frame where='' root=${DOT_EXTENSIONS_DIR:-}
       local -a pipe=("${@:3}")
+      # `${pipe[*]}` joins with IFS; the extension's own IFS must not leak.
+      local IFS=' '
       root=${root%/}
       # Under `pipefail` a pipeline whose last element succeeded failed in an
       # earlier one, yet Bash names only the last element (and its line):
