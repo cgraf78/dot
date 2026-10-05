@@ -1344,54 +1344,33 @@ fn bounded_output(mut command: Command, seconds: u64) -> Output {
         .expect("run bounded provider update")
 }
 
-/// [`bounded_output`] with stdout and stderr sharing one pipe, so the bytes
-/// arrive in the order a terminal would show them. Returns the exit code and
-/// the combined stream.
+/// [`bounded_output`] with stdout and stderr captured as one stream, in
+/// the order the command wrote them, for tests about their interleaving.
+/// Returns the exit code and the combined bytes.
+///
+/// Both streams share one regular file, not a pipe: `test-timeout-v1`
+/// relays a pipe or socket stream through its own copier process, one per
+/// stream unless it can prove both descriptors are one open file
+/// description (never on macOS), and two copiers reorder the streams
+/// against each other. A regular file is inherited as is, so both streams
+/// write through one shared description, in exactly the command's order.
 fn bounded_combined_output(mut command: Command, seconds: u64) -> (Option<i32>, Vec<u8>) {
-    use std::io::Read as _;
-    use std::os::fd::FromRawFd as _;
-
-    // Close-on-exec, so a child another test thread spawns meanwhile cannot
-    // inherit the write end and hold the read below open: atomically where
-    // `pipe2` exists, right after creation elsewhere.
-    let mut fds = [-1; 2];
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    // SAFETY: pipe2 fills both descriptors on success.
-    let created = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    // SAFETY: pipe fills both descriptors on success; F_SETFD then marks them.
-    let created = unsafe {
-        let created = libc::pipe(fds.as_mut_ptr());
-        if created == 0 {
-            for fd in fds {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-        }
-        created
-    };
-    assert_eq!(
-        created,
-        0,
-        "pipe failed: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: pipe returned two uniquely owned descriptors.
-    let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
-    let writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
-    let mut supervised = bounded_output_with(
+    let scratch = TempDir::new("combined-output").expect("combined output scratch");
+    let path = scratch.path().join("combined");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("combined output file");
+    let status = bounded_output_with(
         &mut command,
         seconds,
-        Stdio::from(writer.try_clone().expect("combined stdout")),
-        Stdio::from(writer),
-    );
-    let mut child = supervised.spawn().expect("run bounded provider update");
-    // The supervisor command still owns the pipe's write ends.
-    drop(supervised);
-    let mut bytes = Vec::new();
-    reader
-        .read_to_end(&mut bytes)
-        .expect("read combined output");
-    let status = child.wait().expect("reap bounded provider update");
+        Stdio::from(file.try_clone().expect("combined stdout")),
+        Stdio::from(file),
+    )
+    .status()
+    .expect("run bounded provider update");
+    let bytes = std::fs::read(&path).expect("read combined output");
     (status.code(), bytes)
 }
 
@@ -4672,6 +4651,28 @@ fn provider_prompt_rendezvous_acknowledges_natively() {
         std::fs::read(rust.home.join("prompt-record")).expect("native prompt acknowledgment"),
         b"ready\n"
     );
+}
+
+#[test]
+fn combined_capture_keeps_the_order_across_streams() {
+    // The interleaving tests read stdout and stderr as one stream, so the
+    // capture itself must keep their order. Through `test-timeout-v1`, a
+    // shared pipe got one relay per stream wherever the wrapper cannot prove
+    // both descriptors are one open file description (always on macOS), and
+    // the two relays reordered lines: the live-row erase landed after the
+    // stderr line it preceded. (On Linux the wrapper usually proves the
+    // shared description and uses one copier, so a pipe capture would pass
+    // there; this guards the macOS case.)
+    let scratch = TempDir::new_exec("combined-capture-order").expect("scratch");
+    let script = scratch.path().join("alternate");
+    write_exec(
+        &script,
+        b"#!/bin/sh\ni=0\nwhile [ $i -lt 200 ]; do\n  printf 'o%d\\n' $i\n  printf 'e%d\\n' $i >&2\n  i=$((i + 1))\ndone\n",
+    );
+    let (code, output) = bounded_combined_output(Command::new(&script), 20);
+    assert_eq!(code, Some(0));
+    let expected: String = (0..200).map(|i| format!("o{i}\ne{i}\n")).collect();
+    assert_eq!(String::from_utf8_lossy(&output), expected);
 }
 
 #[test]

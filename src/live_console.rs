@@ -570,6 +570,37 @@ mod tests {
     }
 
     #[test]
+    fn stderr_line_is_never_split_from_its_erase_by_a_redraw() {
+        // A heartbeat redraw can come between any two fragments of a
+        // diagnostic. Whatever the split point, the terminal must see the
+        // row, the redraw, then one erase immediately followed by the whole
+        // line, never row text glued to the diagnostic.
+        let line = b"error: provider diagnostic\n";
+        for split in 0..=line.len() {
+            let terminal = run(true, |console| {
+                console.stdout().write_all(ROW).unwrap();
+                console.stderr().write_all(&line[..split]).unwrap();
+                console.stdout().write_all(ROW).unwrap();
+                console.stderr().write_all(&line[split..]).unwrap();
+            });
+            let mut expected = [ROW, ROW].concat();
+            if split == line.len() {
+                // The whole line arrived before the redraw: it was emitted
+                // at once, after its erase, and the redraw follows it.
+                expected = [ROW, ERASE_LINE, line.as_slice(), ROW].concat();
+            } else {
+                expected.extend_from_slice(ERASE_LINE);
+                expected.extend_from_slice(line);
+            }
+            assert_eq!(
+                String::from_utf8_lossy(&terminal.bytes()),
+                String::from_utf8_lossy(&expected),
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
     fn partial_stderr_line_survives_a_redraw() {
         // A child's diagnostic arrives in fragments with a heartbeat redraw
         // between them; the redraw must neither erase nor split the line.
