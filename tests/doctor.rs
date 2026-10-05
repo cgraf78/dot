@@ -581,7 +581,8 @@ fn hanging_extension(suffix: &str) -> Vec<u8> {
 /// Cancel `dot doctor` while `hangs` extensions fill its whole worker window
 /// (`DOT_DOCTOR_JOBS=hangs`). Every running worker and escaped descendant must
 /// receive exactly one cleanup TERM and be reaped, the extension queued behind
-/// the full window must never start, and no scratch state may remain.
+/// the full window must never start, and none of the doctor's own scratch may
+/// remain.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn assert_doctor_signal_with_window(signal: i32, expected: i32, hangs: usize) {
     let home = TempDir::new("doctor-native-signal-home").expect("home");
@@ -634,6 +635,7 @@ fn assert_doctor_signal_with_window(signal: i32, expected: i32, hangs: usize) {
     .spawn()
     .expect("doctor");
     let mut child = GuardedDoctorChild::new(child);
+    let doctor_pid = child.identity.pid;
     let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let mut identities: Vec<[Option<DoctorProcessIdentity>; 2]> =
         suffixes.iter().map(|_| [None, None]).collect();
@@ -681,6 +683,7 @@ fn assert_doctor_signal_with_window(signal: i32, expected: i32, hangs: usize) {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    let doctor_exited = std::time::SystemTime::now();
     let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while sessions
         .iter_mut()
@@ -732,13 +735,131 @@ fn assert_doctor_signal_with_window(signal: i32, expected: i32, hangs: usize) {
         !later.exists(),
         "doctor started an extension after cancellation"
     );
-    assert_eq!(
-        std::fs::read_dir(&temporary)
-            .expect("temporary directory")
-            .count(),
-        0,
-        "doctor left extension scratch state"
+    let leftovers = leftover_scratch(&temporary, doctor_pid, doctor_exited);
+    assert!(
+        leftovers.is_empty(),
+        "doctor left extension scratch state:\n{leftovers}"
     );
+}
+
+/// Describes the doctor's own scratch directories (`dot.<doctor pid>.*`,
+/// see `doctor_orchestrator::make_temp_dir_in`) left under `temporary`, or
+/// returns an empty string when none are.
+///
+/// Other entries are not the doctor's to clean: cancellation TERMs the
+/// core checks' `git` probes as well, and a host `git` wrapper that keeps
+/// its own capture file in `TMPDIR` leaves that file behind when killed.
+///
+/// For each leftover directory, every entry inside is listed with its type,
+/// size, when it was last written relative to when the test saw the doctor
+/// exit, and the start of a regular file's contents. Any live process with
+/// an open descriptor or working directory under `temporary` is named too.
+/// A write after the exit, or a holder, points at a process that outlived
+/// the doctor's teardown.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn leftover_scratch(
+    temporary: &Path,
+    doctor_pid: i32,
+    doctor_exited: std::time::SystemTime,
+) -> String {
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+    let sorted_entries = |directory: &Path| {
+        let mut entries = std::fs::read_dir(directory)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        entries.sort();
+        entries
+    };
+    let describe = |path: &Path| {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => return format!("{}: {error}", path.display()),
+        };
+        let written = match metadata
+            .modified()
+            .map(|time| time.duration_since(doctor_exited))
+        {
+            Ok(Ok(after)) => format!("written {after:?} after the doctor was seen to exit"),
+            Ok(Err(before)) => format!(
+                "written {:?} before the doctor was seen to exit",
+                before.duration()
+            ),
+            Err(error) => format!("mtime unavailable: {error}"),
+        };
+        let mut head = Vec::new();
+        if metadata.is_file() {
+            // Bounded and only for regular files: a FIFO or device would
+            // block or never end.
+            let _ =
+                std::fs::File::open(path).and_then(|file| file.take(256).read_to_end(&mut head));
+        }
+        let kind = if metadata.is_dir() {
+            "directory"
+        } else if metadata.is_file() {
+            "file"
+        } else if metadata.is_symlink() {
+            "symlink"
+        } else {
+            "special file"
+        };
+        format!(
+            "{} ({kind}, {} bytes; {written}): {:?}",
+            path.display(),
+            metadata.len(),
+            String::from_utf8_lossy(&head)
+        )
+    };
+    let prefix = format!("dot.{doctor_pid}.");
+    let mut report = String::new();
+    for entry in std::fs::read_dir(temporary).expect("temporary directory") {
+        let path = entry.expect("temporary entry").path();
+        let own = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&prefix));
+        if !own {
+            continue;
+        }
+        let _ = writeln!(report, "{}", describe(&path));
+        for inner in sorted_entries(&path) {
+            let _ = writeln!(report, "  {}", describe(&inner));
+        }
+    }
+    if report.is_empty() {
+        return report;
+    }
+    let root = std::fs::canonicalize(temporary).unwrap_or_else(|_| temporary.to_path_buf());
+    for process in sorted_entries(Path::new("/proc")) {
+        let Some(pid) = process
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+        else {
+            continue;
+        };
+        let mut links = sorted_entries(&process.join("fd"));
+        links.push(process.join("cwd"));
+        let held = links
+            .iter()
+            .filter_map(|link| std::fs::read_link(link).ok())
+            .filter(|target| target.starts_with(&root))
+            .collect::<Vec<_>>();
+        if !held.is_empty() {
+            let command = std::fs::read(process.join("cmdline")).unwrap_or_default();
+            let _ = writeln!(
+                report,
+                "held by process {pid} ({:?}): {held:?}",
+                String::from_utf8_lossy(&command).replace('\0', " ")
+            );
+        }
+    }
+    report
 }
 
 /// The serial window: one hanging extension, and the next extension must
