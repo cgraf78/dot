@@ -25,17 +25,17 @@ static BASH: OnceLock<PathBuf> = OnceLock::new();
 const EXEC_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const EXEC_READY_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// Absolute path to the engine-runtime `bash` for differential harnesses.
+/// Absolute path to the Bash the hook runtime and shell suites run under.
 ///
 /// Resolved once from the parent test process PATH — never from a
 /// child's scrubbed or swapped env — so hermetic children still spawn
 /// the interpreter the shell suite runs under (`#!/usr/bin/env bash`)
-/// and the `DOT_BASH` engine runtime resolves. A bare `bash` looked up
+/// and a `DOT_BASH` hook runtime resolves. A bare `bash` looked up
 /// at spawn time instead follows the child's env: under `env_clear`
 /// without PATH that falls back to the OS default lookup, which finds
 /// the macOS 3.2 trampoline whose `case`-pattern corners (e.g. a
 /// trailing lone backslash) differ from the pinned 5.x runtime — a
-/// silent wrong oracle surfacing as a mystery divergence.
+/// silently wrong interpreter surfacing as a mystery failure.
 ///
 /// The first `bash` on PATH reporting major version 4+ wins; with no
 /// such binary resolution panics instead of testing the wrong runtime.
@@ -46,8 +46,8 @@ pub fn bash() -> &'static std::path::Path {
         for dir in std::env::split_paths(&path) {
             // Empty entries mean "cwd" to the shell, but a relative
             // interpreter would resolve against whatever directory a
-            // later child sets — skip them rather than bind the oracle
-            // to a test's working directory.
+            // later child sets — skip them rather than bind the
+            // interpreter to a test's working directory.
             if dir.as_os_str().is_empty() {
                 continue;
             }
@@ -60,8 +60,8 @@ pub fn bash() -> &'static std::path::Path {
             }
         }
         panic!(
-            "no bash 4+ on PATH for the differential oracle (saw: {tried:?}); \
-             install bash 5.x, the pinned engine runtime",
+            "no bash 4+ on PATH for the hook runtime (saw: {tried:?}); \
+             install bash 5.x, the pinned runtime",
         );
     })
 }
@@ -322,15 +322,15 @@ impl TempDir {
     /// its path. `name` is a single path segment (same rules as labels);
     /// the post-write metadata check turns a vanished scratch dir into
     /// an explicit environmental panic instead of a misleading
-    /// engine-output diff downstream.
+    /// assertion failure downstream.
     pub fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
         if name.is_empty() || name.contains(['/', '\\', '\0']) || name == "." || name == ".." {
             panic!("unsafe fixture name: {name:?}");
         }
         let path = self.path.join(name);
         std::fs::write(&path, bytes).expect("write fixture");
-        // Post-write stat: the file must be visible before either engine
-        // runs; if scratch storage is flaky the failure points here.
+        // Post-write stat: the file must be visible before the code under
+        // test runs; if scratch storage is flaky the failure points here.
         let size = std::fs::metadata(&path).expect("fixture visible").len();
         assert_eq!(size, bytes.len() as u64, "fixture short write: {name:?}");
         path
@@ -395,15 +395,15 @@ mod tests {
     }
 
     #[test]
-    fn oracle_bash_is_absolute_and_modern() {
+    fn runtime_bash_is_absolute_and_modern() {
         // Regression pin for the macOS CI failure where a bare `bash`
-        // under `env_clear` fell back to the 3.2 trampoline: the oracle
+        // under `env_clear` fell back to the 3.2 trampoline: the runtime
         // must be an absolute 4+ binary resolved from the parent PATH.
         let bash = super::bash();
-        assert!(bash.is_absolute(), "oracle bash must be absolute");
+        assert!(bash.is_absolute(), "runtime bash must be absolute");
         assert!(
             super::bash_major(bash) >= 4,
-            "oracle bash must be 4+, got: {}",
+            "runtime bash must be 4+, got: {}",
             bash.display()
         );
     }
