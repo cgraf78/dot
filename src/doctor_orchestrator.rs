@@ -151,6 +151,10 @@ pub struct RuntimeSnapshot {
     pub source_root: Vec<u8>,
     /// `git --version` output, `None` when empty (unavailable).
     pub git_version: Option<Vec<u8>>,
+    /// Whether that probe missed its deadline: Git exists but did not
+    /// answer (a stalled filesystem or Git process), which warns like every
+    /// other stalled core probe instead of failing as a missing Git.
+    pub git_stalled: bool,
     /// The running build's version stamp (`dot version`).
     pub version: Vec<u8>,
     /// How a release is installed (`Shdeps release`, a standalone install)
@@ -223,9 +227,19 @@ pub fn check_runtime(
         Some(version) => {
             rec.ok(b"Git runtime", Some(version));
         }
-        None => {
-            rec.fail(b"Git runtime is unavailable", None);
-        }
+        None if snapshot.git_stalled => rec.record(
+            Record::warn(
+                "Git runtime did not answer",
+                Some(format!(
+                    "git --version did not answer within {}s",
+                    crate::doctor_checks::PROBE_TIMEOUT.as_secs()
+                )),
+            )
+            .with_hint("check for a stalled filesystem or Git process, then rerun dot doctor"),
+        ),
+        None => rec.record(Record::fail("Git runtime is unavailable", None).with_hint(
+            "install Git or put it on PATH; if it is installed, check that git --version works",
+        )),
     }
     for unknown in &snapshot.unknown_config_keys {
         let detail = format!(
