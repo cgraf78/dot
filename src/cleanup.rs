@@ -1075,7 +1075,13 @@ fn cleanup_deadline() -> Instant {
 /// it and fails teardown (loaded-host DOT_TEARDOWN_FAIL); 5s covers
 /// loaded hosts and slow CI with headroom while staying bounded. This
 /// budget covers verification snapshots only — interruption paths keep
-/// the 1s grace so Ctrl-C stays responsive.
+/// the 1s grace and their shared KILL window so Ctrl-C stays responsive,
+/// with one exception: once KILL has reached every known member, a proof
+/// still pending at the end of that window may run up to
+/// `KILL_VERIFY_LATE_ATTEMPTS` more walks, each allowed to start within this
+/// budget (see `kill_verification_deadline`). On a loaded host that can
+/// add several seconds to Ctrl-C, timeout and hook/provider cancellation
+/// in exchange for not reporting an already-dead session as incomplete.
 const COMPLETION_SNAPSHOT_BUDGET: Duration = Duration::from_secs(5);
 
 fn completion_snapshot_deadline() -> Instant {
@@ -7026,6 +7032,9 @@ fn stop_sessions_with_tick(
     // final reaping share one additional bounded window rather than renewing
     // a full deadline at each stage; retain half a grace of scan margin for a
     // busy host without allowing teardown latency to accumulate unboundedly.
+    // `kill_verification_deadline` may finish an in-progress proof past this
+    // window (at most `KILL_VERIFY_LATE_ATTEMPTS` walks) instead of reporting
+    // a dead session as incomplete.
     // The reassignment below is Linux/Android-only; portable platforms
     // never run the settle round and keep the initial deadline.
     #[allow(unused_mut)]
@@ -7141,8 +7150,18 @@ fn stop_sessions_with_tick(
             // needed here.
             session.signal_all(libc::SIGKILL);
         }
-        while Instant::now() < hard_deadline {
-            let observed = observe_sessions(&mut sessions, hard_deadline);
+        let mut late_attempts = 0u32;
+        while let Some(pass_deadline) =
+            kill_verification_deadline(Instant::now(), hard_deadline, late_attempts)
+        {
+            if pass_deadline > hard_deadline {
+                late_attempts += 1;
+            }
+            #[cfg(test)]
+            let observed = kill_phase_observation_override()
+                .unwrap_or_else(|| observe_sessions(&mut sessions, pass_deadline));
+            #[cfg(not(test))]
+            let observed = observe_sessions(&mut sessions, pass_deadline);
             if sessions_stably_empty(observed, &mut consecutive_empty) {
                 break;
             }
@@ -7222,6 +7241,59 @@ fn merge_authority_errors(
     }
     Ok(())
 }
+
+/// Deadline for the next post-KILL verification pass, or `None` when the
+/// hard phase is over.
+///
+/// Before `hard_deadline` every pass shares it. Past it, KILL has already
+/// been delivered to every known member, so the remaining work is proof,
+/// not delivery or responsiveness: a loaded host whose graceful loop
+/// overran its deadline can reach this phase with no budget left, with an
+/// empty first snapshot whose confirming pass would start late, or with a
+/// first late walk that still sees a just-KILLed member that has not yet
+/// become a zombie. Failing then reports `CleanupIncomplete` (exit 125)
+/// for a session that is dead or about to be. So, while the proof is
+/// incomplete, late walks continue (the loop re-delivers KILL after any
+/// walk that is not empty) until `KILL_VERIFY_LATE_ATTEMPTS` have started.
+/// Each late attempt gets a fresh snapshot budget because a walk never
+/// starts past its deadline (the budget gates the start, not the walk's
+/// full duration). Three late walks certify after at most one walk that
+/// is refused or still sees a live member, followed by two empty ones.
+/// The proof is never weakened: certification still needs two consecutive
+/// empty snapshots, and a member still live after the cap is reported as
+/// a survivor as before.
+fn kill_verification_deadline(
+    now: Instant,
+    hard_deadline: Instant,
+    late_attempts: u32,
+) -> Option<Instant> {
+    if now < hard_deadline {
+        Some(hard_deadline)
+    } else if late_attempts >= KILL_VERIFY_LATE_ATTEMPTS {
+        None
+    } else {
+        Some(now + COMPLETION_SNAPSHOT_BUDGET)
+    }
+}
+
+// Test seam for the post-KILL verification loop: each queued entry replaces
+// one walk's observation (`None` = refused walk, `Some(false)` = a member
+// still seen live), so loop accounting can be exercised deterministically.
+// Thread-local because the loop runs on the calling test's thread.
+#[cfg(test)]
+thread_local! {
+    static KILL_PHASE_OBSERVATIONS: std::cell::RefCell<std::collections::VecDeque<Option<bool>>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(test)]
+fn kill_phase_observation_override() -> Option<Option<bool>> {
+    KILL_PHASE_OBSERVATIONS.with(|queue| queue.borrow_mut().pop_front())
+}
+
+/// Upper bound on post-KILL verification walks started after the shared
+/// hard deadline. See `kill_verification_deadline`.
+const KILL_VERIFY_LATE_ATTEMPTS: u32 = 3;
 
 /// Require two complete snapshots without a live session member. Process-table
 /// enumeration is not atomic: a member can fork a replacement and exit between
@@ -9703,7 +9775,7 @@ import subprocess
 import sys
 
 child = subprocess.Popen(
-    ["/bin/sleep", "1"],
+    ["/bin/sleep", "30"],
     start_new_session=True,
     close_fds=True,
     stdin=subprocess.DEVNULL,
@@ -9749,13 +9821,17 @@ os._exit(0)
             1,
             "normal exit must take exactly one session snapshot"
         );
+        // The descendant outlives any loaded-host supervision by far, so its
+        // liveness above proves normal success left it alone rather than that
+        // it had not exited yet. Stop it through the pinned identity.
+        assert!(member.signal(libc::SIGKILL).unwrap());
         assert!(
             reap_owned(
                 vec![vec![member]],
                 Instant::now() + Duration::from_secs(3),
                 wait_member,
             )[0],
-            "self-bounded detached fixture was not reaped"
+            "detached fixture was not reaped after SIGKILL"
         );
     }
 
@@ -11447,6 +11523,154 @@ os._exit(0)
     }
 
     #[test]
+    fn kill_verification_shares_the_hard_deadline_while_it_lasts() {
+        let now = Instant::now();
+        let hard = now + Duration::from_secs(1);
+
+        assert_eq!(kill_verification_deadline(now, hard, 0), Some(hard));
+    }
+
+    #[test]
+    fn kill_verification_starts_late_walks_until_the_cap() {
+        let hard = Instant::now();
+        let now = hard + Duration::from_secs(2);
+
+        // Past the hard deadline every walk is late and gets a fresh start
+        // budget, whatever the previous walk saw, until the cap is reached.
+        for late_attempts in 0..KILL_VERIFY_LATE_ATTEMPTS {
+            assert_eq!(
+                kill_verification_deadline(now, hard, late_attempts),
+                Some(now + COMPLETION_SNAPSHOT_BUDGET)
+            );
+        }
+        assert_eq!(
+            kill_verification_deadline(now, hard, KILL_VERIFY_LATE_ATTEMPTS),
+            None
+        );
+    }
+
+    // Stops a TERM-ignoring session whose first supervision tick stalls past
+    // the whole TERM grace and KILL window, as a loaded host does when
+    // process-table walks overrun the graceful loop, so every post-KILL walk
+    // is late. `late_walks` replaces the observations of the first late
+    // walks; the rest are real.
+    fn stop_starved_session(
+        late_walks: &[Option<bool>],
+    ) -> (std::io::Result<std::process::ExitStatus>, u32) {
+        let mut command = Command::new("sh");
+        command.args(["-c", "trap '' TERM; exec sleep 30"]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        isolate(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        // Register the leader as production sessions do. While this session
+        // stalls, its KILLed leader is an unreaped zombie child of the test
+        // process; an unregistered one could be reaped by any concurrent
+        // test's adopted-zombie sweep, hiding it from this session's walks.
+        let _registration = StatusChildRegistration::new(pid);
+        let hard_window = Duration::from_millis(GRACE_ATTEMPTS as u64 * GRACE_INTERVAL_MS * 5 / 2);
+        let mut stalled = false;
+        let mut tick = || {
+            if !stalled {
+                stalled = true;
+                std::thread::sleep(hard_window + Duration::from_millis(200));
+            }
+            Ok(())
+        };
+        KILL_PHASE_OBSERVATIONS
+            .with(|queue| *queue.borrow_mut() = late_walks.iter().copied().collect());
+
+        let result = stop_session_with_tick(&mut child, libc::SIGTERM, &mut tick);
+
+        let unused = KILL_PHASE_OBSERVATIONS.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
+        assert!(stalled, "the starvation stall never ran");
+        assert!(unused.is_empty(), "late walks never consumed {unused:?}");
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        (result, pid)
+    }
+
+    #[test]
+    fn late_walk_that_still_sees_a_killed_member_walks_again() {
+        // A member KILLed moments ago can still look live to the first late
+        // walk; the loop re-delivers KILL and walks again instead of
+        // reporting a session that is about to die as incomplete.
+        let (result, pid) = stop_starved_session(&[Some(false)]);
+
+        result.expect("a just-KILLed member seen live once was reported as incomplete");
+        // SAFETY: signal zero only probes the reaped fixture PID.
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    }
+
+    #[test]
+    fn one_refused_late_walk_is_tolerated() {
+        let (result, _) = stop_starved_session(&[None]);
+
+        result.expect("one refused late walk was reported as incomplete");
+    }
+
+    #[test]
+    fn late_walks_stop_at_the_cap_and_report_incomplete_cleanup() {
+        // A member still seen live after every late attempt is a survivor:
+        // the phase ends at the cap and fails closed.
+        let walks = vec![Some(false); KILL_VERIFY_LATE_ATTEMPTS as usize];
+        let (result, _) = stop_starved_session(&walks);
+
+        assert!(
+            result.is_err(),
+            "a member live on every late walk still certified cleanup"
+        );
+    }
+
+    #[test]
+    fn starved_grace_still_certifies_a_killed_session() {
+        // Stall the first supervision tick past the whole TERM grace and
+        // KILL window, as a loaded host does when process-table walks
+        // overrun the graceful loop. KILL then starts with no shared budget
+        // left; teardown must still prove the session empty instead of
+        // reporting an already-dead session as incomplete cleanup.
+        let mut command = Command::new("sh");
+        command.args(["-c", "trap '' TERM; exec sleep 30"]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        isolate(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        // Register the leader as production sessions do. While this session
+        // stalls, its KILLed leader is an unreaped zombie child of the test
+        // process; an unregistered one could be reaped by any concurrent
+        // test's adopted-zombie sweep, hiding it from this session's walks.
+        let _registration = StatusChildRegistration::new(pid);
+        let hard_window = Duration::from_millis(GRACE_ATTEMPTS as u64 * GRACE_INTERVAL_MS * 5 / 2);
+        let mut stalled = false;
+        let mut tick = || {
+            if !stalled {
+                stalled = true;
+                std::thread::sleep(hard_window + Duration::from_millis(200));
+            }
+            Ok(())
+        };
+
+        let status = stop_session_with_tick(&mut child, libc::SIGTERM, &mut tick)
+            .expect("starved verification reported a dead session as incomplete");
+
+        assert!(stalled, "the starvation stall never ran");
+        assert!(
+            std::os::unix::process::ExitStatusExt::signal(&status).is_some(),
+            "stopped leader exited on its own: {status:?}"
+        );
+        // SAFETY: signal zero only probes the reaped fixture PID.
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    }
+
+    #[test]
     fn cleanup_failure_overrides_interrupted_and_timed_out_results() {
         let failed = || Err(std::io::Error::other("injected incomplete cleanup"));
         assert!(matches!(
@@ -11966,20 +12190,33 @@ os._exit(0)
             "same-group no-pidfd descendant remained as an adopted zombie"
         );
 
+        // The escapee must still be alive whenever the supervisor looks for
+        // it. A fixed 2s lifetime raced slow process-table walks on a loaded
+        // host: once it expired the escape vanished and the session ended
+        // cleanly. It now lives until the test releases it or the fixture
+        // directory disappears (a failed run drops the TempDir), and gives
+        // up on its own after 600 polls 50ms apart (at least 30s; more on a
+        // loaded host) so nothing can leak it indefinitely.
         let escaped_pid = scope.path().join("escaped.pid");
+        let release = scope.path().join("escaped.release");
         let mut escaped = Command::new(dot_test_support::bash());
         escaped
             .args([
                 "-c",
-                "setsid bash -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; sleep 2' no-pidfd-escaped \"$1\" & while [[ ! -s $1 ]]; do sleep 0.01; done; exit 0",
+                "setsid bash -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; for _ in {1..600}; do [[ -e $2 || ! -d ${2%/*} ]] && exit 0; sleep 0.05; done' no-pidfd-escaped \"$1\" \"$2\" & while [[ ! -s $1 ]]; do sleep 0.01; done; exit 0",
                 "no-pidfd-parent",
             ])
             .arg(&escaped_pid)
+            .arg(&release)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let escaped_end = supervise_session(escaped, None, |_| Ok(())).unwrap();
-        assert!(matches!(escaped_end, SessionEnd::CleanupIncomplete));
+        std::fs::write(&release, b"").unwrap();
+        assert!(
+            matches!(escaped_end, SessionEnd::CleanupIncomplete),
+            "an unpinned session escapee must fail closed"
+        );
         let escaped_pid = std::fs::read_to_string(escaped_pid)
             .unwrap()
             .trim()
@@ -12109,7 +12346,13 @@ if child == 0:
     # observe an open lease and SIGKILL the group without TERM (flake).
     with open(pid_path, "w", encoding="utf-8") as output:
         output.write(str(os.getpid()))
-    time.sleep(4)
+    # Leak guard only: the TERM marker, not elapsed time, proves teardown
+    # stopped this descendant. A short self-bound races a loaded host's
+    # teardown (several full process-table scans) and turns a correct
+    # TERM into a missed one; SELF-EXIT names a guard that fired.
+    time.sleep(30)
+    with open(term_path, "a", encoding="utf-8") as output:
+        output.write("SELF-EXIT\n")
     os._exit(0)
 while not os.path.exists(pid_path):
     time.sleep(0.005)
@@ -12124,34 +12367,35 @@ os._exit(0)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        let started = Instant::now();
         let end = supervise_session(command, None, |_| Ok(())).unwrap();
         let pid = std::fs::read_to_string(&pid_path)
             .unwrap()
             .trim()
             .parse::<u32>()
             .unwrap();
-        let survived_return = linux_process_info(pid).is_some_and(|process| process.live);
-        if survived_return {
-            poll_until(Instant::now() + Duration::from_secs(5), || {
-                Ok((!linux_process_info(pid).is_some_and(|process| process.live)).then_some(()))
-            })
-            .unwrap();
-        }
+        let survivors = live_fixture_processes(&[pid]);
+        let survived_return = !survivors.is_empty();
+        stop_leaked_fixture(&survivors);
 
+        // No wall-clock bound: teardown latency scales with host load and
+        // process-table size (no wall-clock gates in `cargo test`). The
+        // marker file is the direct evidence that completion delivered TERM
+        // before the descendant's 30s leak guard fired. A regression that
+        // waits a shorter time and only then sends TERM is not detected;
+        // that is the price of having no wall-clock gate.
         assert!(
             matches!(end, SessionEnd::Exited(status) if status.success()),
             "unexpected same-group completion: {end:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "same-group descendant reached its self-bound"
-        );
-        assert!(
             !survived_return,
             "same-group descendant survived completion"
         );
-        assert_eq!(std::fs::read_to_string(term_path).unwrap(), "TERM\n");
+        assert_eq!(
+            std::fs::read_to_string(term_path).ok().as_deref(),
+            Some("TERM\n"),
+            "same-group descendant was not stopped with TERM"
+        );
     }
 
     #[test]
@@ -12189,7 +12433,11 @@ if branch == 0:
         # group without TERM (loaded-host flake).
         with open(child_pid, "w", encoding="utf-8") as output:
             output.write(str(os.getpid()))
-        time.sleep(4)
+        # Leak guard only; the TERM marker is the evidence (see the
+        # single-group variant above).
+        time.sleep(30)
+        with open(child_term, "a", encoding="utf-8") as output:
+            output.write("SELF-EXIT\n")
         os._exit(0)
     os.setpgid(0, 0)
     def stop_parent(_signum, _frame):
@@ -12203,7 +12451,9 @@ if branch == 0:
     os.closerange(3, maximum)
     with open(parent_pid, "w", encoding="utf-8") as output:
         output.write(str(os.getpid()))
-    time.sleep(4)
+    time.sleep(30)
+    with open(parent_term, "a", encoding="utf-8") as output:
+        output.write("SELF-EXIT\n")
     os._exit(0)
 while not (os.path.exists(parent_pid) and os.path.exists(child_pid)):
     time.sleep(0.005)
@@ -12220,7 +12470,6 @@ os._exit(0)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        let started = Instant::now();
         let end = supervise_session(command, None, |_| Ok(())).unwrap();
         let pids = [&parent_pid, &child_pid].map(|path| {
             std::fs::read_to_string(path)
@@ -12229,33 +12478,79 @@ os._exit(0)
                 .parse::<u32>()
                 .unwrap()
         });
-        let survived_return = pids
-            .iter()
-            .any(|pid| linux_process_info(*pid).is_some_and(|process| process.live));
-        if survived_return {
-            poll_until(Instant::now() + Duration::from_secs(5), || {
-                Ok((!pids
-                    .iter()
-                    .any(|pid| linux_process_info(*pid).is_some_and(|process| process.live)))
-                .then_some(()))
-            })
-            .unwrap();
-        }
+        let survivors = live_fixture_processes(&pids);
+        let survived_return = !survivors.is_empty();
+        stop_leaked_fixture(&survivors);
 
+        // Marker files, not elapsed time, prove TERM delivery (see the
+        // single-group variant above).
         assert!(
             matches!(end, SessionEnd::Exited(status) if status.success()),
             "unexpected split-group completion: {end:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "split-group descendants reached their self-bound"
-        );
-        assert!(
             !survived_return,
             "split-group descendants survived completion"
         );
-        assert_eq!(std::fs::read_to_string(parent_term).unwrap(), "TERM\n");
-        assert_eq!(std::fs::read_to_string(child_term).unwrap(), "TERM\n");
+        assert_eq!(
+            std::fs::read_to_string(parent_term).ok().as_deref(),
+            Some("TERM\n"),
+            "moved direct child was not stopped with TERM"
+        );
+        assert_eq!(
+            std::fs::read_to_string(child_term).ok().as_deref(),
+            Some("TERM\n"),
+            "same-group grandchild was not stopped with TERM"
+        );
+    }
+
+    /// Returns the fixture processes still live, with the identity (PID plus
+    /// kernel start tick) observed now, so a later kill can be pinned to it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn live_fixture_processes(pids: &[u32]) -> Vec<ProcessInfo> {
+        pids.iter()
+            .filter_map(|pid| linux_process_info(*pid))
+            .filter(|process| process.live)
+            .collect()
+    }
+
+    /// Kill and reap fixture descendants that a failed teardown left
+    /// running, so a 30-second leak guard cannot outlive the failing test.
+    /// Like `reap_fixture_daemon`, every signal and wait is gated on the
+    /// identity observed in `live_fixture_processes`, so the PID cannot be
+    /// recycled between that observation and the kill. That observation is
+    /// taken after supervision returns, so it pins whatever then holds the
+    /// fixture's PID; a reuse before it is not excluded, which is accepted
+    /// on this already-failing path.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stop_leaked_fixture(survivors: &[ProcessInfo]) {
+        let ours = |survivor: &ProcessInfo| {
+            linux_process_info(survivor.pid).filter(|now| now.identity == survivor.identity)
+        };
+        for survivor in survivors {
+            if ours(survivor).is_some_and(|process| process.live) {
+                // SAFETY: kill takes a PID and a signal number, no pointers;
+                // the identity check above pins the PID to our fixture.
+                unsafe { libc::kill(survivor.pid as libc::pid_t, libc::SIGKILL) };
+            }
+        }
+        poll_until(Instant::now() + Duration::from_secs(5), || {
+            Ok((!survivors
+                .iter()
+                .any(|survivor| ours(survivor).is_some_and(|process| process.live)))
+            .then_some(()))
+        })
+        .expect("leaked fixture descendants outlived SIGKILL");
+        for survivor in survivors {
+            if ours(survivor).is_some() {
+                // Our fixture, now a zombie adopted by this subreaper: reap
+                // it. WNOHANG never blocks, and the identity match proves no
+                // foreign status is collected.
+                let mut status = 0;
+                // SAFETY: WNOHANG never blocks; the PID is identity-verified.
+                unsafe { libc::waitpid(survivor.pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            }
+        }
     }
 
     #[test]

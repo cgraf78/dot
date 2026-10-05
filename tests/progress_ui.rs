@@ -575,10 +575,17 @@ fn stage_redraws_nothing_before_its_first_stage_opens() {
         );
         // The static row printed before a required overlay pull, which on
         // such a client also runs before any stage opens.
-        assert!(stage.freeze(b"pulling 1 overlay", 1_700_000_000).is_empty());
+        assert!(
+            stage
+                .freeze(b"pulling 1 overlay", &[], 1_700_000_000)
+                .is_empty()
+        );
         assert!(!stage.start(b"Repos", None, 10, None).is_empty());
         assert!(!stage.update(b"overlay-0", 11, Some("1")).is_empty());
-        assert_eq!(!stage.freeze(b"pulling 1 overlay", 11).is_empty(), live);
+        assert_eq!(
+            !stage.freeze(b"pulling 1 overlay", &[], 11).is_empty(),
+            live
+        );
     }
 }
 
@@ -604,9 +611,10 @@ fn terminal_rows_fit_the_width_and_cut_at_words() {
     let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
         .with_width(RowWidth::Columns(50));
     let close = String::from_utf8(stage.finish(b"warning", detail, 1)).unwrap();
+    // No clause fits 16 columns: blank rather than a leading fragment.
     assert_eq!(
-        close, "[0/5]            warning  repository           1s\n",
-        "cut mid-word or kept a dangling separator"
+        close, "[0/5]            warning                       1s\n",
+        "kept a fragment"
     );
     // Wide terminals keep the 42-column cell, cut at a word boundary.
     let mut wide = Stage::begin(Palette::empty(), "5", false, true, false, true)
@@ -645,4 +653,78 @@ fn terminal_rows_drop_whole_clauses_and_keep_failures() {
     let narrow = close(40, b"profile resolution or repository sync failed");
     assert!(narrow.contains("failed   "), "{narrow:?}");
     assert!(!narrow.contains("profil"), "{narrow:?}");
+}
+
+#[test]
+fn terminal_rows_show_no_word_fragments() {
+    // At 40 columns single leading words survived (`Tools ok no`,
+    // `Configs ok no`) and read as contradictions; a cell either holds a
+    // whole clause or nothing.
+    let close = |detail: &[u8]| {
+        let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
+            .with_width(RowWidth::Columns(40));
+        String::from_utf8(stage.finish(b"ok", detail, 1)).unwrap()
+    };
+    for detail in [&b"no dependency provider"[..], b"3 repos current"] {
+        let row = close(detail);
+        assert!(row.contains("ok          "), "{row:?}");
+        let first =
+            String::from_utf8_lossy(detail.split(|b| *b == b' ').next().unwrap()).into_owned();
+        assert!(
+            !row.contains(&format!("ok       {first}")),
+            "fragment in {row:?}"
+        );
+    }
+}
+
+#[test]
+fn static_lines_shorten_and_skip_only_identical_repeats() {
+    // A static line keeps the screen from going blank while a child may
+    // prompt: on a narrow terminal it shortens (`fetching`) instead of
+    // vanishing, and only a repeat that would look exactly like the line
+    // before it (both too narrow for any text) is skipped.
+    let frozen = |columns: usize| {
+        let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
+            .with_width(RowWidth::Columns(columns));
+        let _ = stage.start(b"Repos", None, 0, None);
+        let first =
+            String::from_utf8(stage.freeze(b"fetching dotfiles", &[b"fetching"], 0)).unwrap();
+        let second =
+            String::from_utf8(stage.freeze(b"pulling 2 overlays", &[b"pulling"], 0)).unwrap();
+        (first, second)
+    };
+    let (first, second) = frozen(80);
+    assert!(first.contains("running  fetching dotfiles "), "{first:?}");
+    assert!(
+        second.contains("running  pulling 2 overlays "),
+        "{second:?}"
+    );
+    let (first, second) = frozen(40);
+    assert!(first.contains("running  fetching "), "{first:?}");
+    assert!(first.ends_with('\n'), "{first:?}");
+    assert!(second.contains("running  pulling "), "{second:?}");
+    let (first, second) = frozen(34);
+    assert!(first.contains("Repos      running "), "{first:?}");
+    assert!(first.ends_with('\n'), "{first:?}");
+    assert_eq!(second, "", "an identical blank repeat is skipped");
+}
+
+#[test]
+fn terminal_progress_rows_keep_their_label_and_bar_whole() {
+    // A progress detail is a label and its bar: narrow rows keep whichever
+    // whole pieces fit, never a cut label.
+    let live = |columns: usize| {
+        let mut stage = Stage::begin(Palette::empty(), "5", false, true, false, true)
+            .with_width(RowWidth::Columns(columns));
+        let _ = stage.start(b"Repos", None, 0, None);
+        String::from_utf8(stage.update(b"overlay-0          [####----] 1/2", 0, None)).unwrap()
+    };
+    assert!(
+        live(60).contains("overlay-0 [####----] 1/2"),
+        "{}",
+        live(60)
+    );
+    assert!(live(48).contains("overlay-0 "), "{}", live(48));
+    assert!(!live(48).contains("[#"), "{}", live(48));
+    assert!(!live(36).contains("overlay"), "{}", live(36));
 }

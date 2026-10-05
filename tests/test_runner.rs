@@ -7,6 +7,46 @@ use std::io::{BufRead as _, Read as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// How long a test waits for Dot to exit after a cancelling signal.
+///
+/// Interrupt teardown is bounded by the product, not instantaneous: a one
+/// second TERM grace, a 1.5 s KILL window, up to three late verification
+/// walks when process-table walks overran that window, then a one second
+/// lease poll. Native walks take well under a second each, so a loaded host
+/// typically finishes in a few seconds. Only the pathological `ps` fallback
+/// (up to 5 s to read plus 1 s to reap per walk) can approach or pass this
+/// bound. These checks prove that a
+/// signal is honoured at all (a writer blocked on an unread pipe, or a
+/// supervisor that never finishes, does not exit), so the bound sits above
+/// the product's ceiling instead of at its typical latency, and below the
+/// signal fixture's 30 s self-bound so a waited-out worker still fails.
+const SIGNAL_EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long a test waits for a suite to publish its readiness marker.
+/// Matches the fixture `poll` bound: suites start interpreters and write
+/// megabytes of output before their marker, which a loaded host can delay
+/// by seconds.
+const READY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Wait until `child` exits or `deadline` elapses, returning the status if
+/// it exited. Callers decide how to fail so each test keeps its own
+/// teardown and diagnostic.
+fn exit_within(
+    child: &mut std::process::Child,
+    deadline: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let end = std::time::Instant::now() + deadline;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= end {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn pid_marker(path: &Path) -> Option<String> {
     let value = fs::read_to_string(path).ok()?;
     let value = value.trim();
@@ -96,10 +136,7 @@ fn await_output_start(
     child: &mut std::process::Child,
     label: &str,
 ) {
-    if started
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .is_ok()
-    {
+    if started.recv_timeout(READY_DEADLINE).is_ok() {
         return;
     }
     // Give the command's own signal path a chance to reap any suite session,
@@ -118,6 +155,11 @@ fn await_output_start(
     panic!("{label} did not start");
 }
 
+/// Seconds the signal-lifecycle worker and member keep running on their
+/// own. Their exit must stay attributable to Dot's teardown, so this
+/// exceeds the post-signal exit deadline plus the post-exit liveness check.
+const SIGNAL_FIXTURE_SELF_BOUND_SECS: u64 = 30;
+
 fn stop_signal_fixture(child: &mut std::process::Child, home: &Path) {
     // SAFETY: the fixture owns this positive Dot child and SIGTERM is valid.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
@@ -132,7 +174,8 @@ fn stop_signal_fixture(child: &mut std::process::Child, home: &Path) {
     // The worker and member fixtures are self-bounded. If the supervision
     // path under test fails, wait for their own deadlines rather than sending
     // to process numbers observed before Dot exited.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(SIGNAL_FIXTURE_SELF_BOUND_SECS + 5);
     while std::time::Instant::now() < deadline {
         let leader_live = pid_marker(&home.join("ready")).is_some_and(|pid| live(&pid));
         let member_live = pid_marker(&home.join("member")).is_some_and(|pid| live(&pid));
@@ -239,9 +282,11 @@ fn native_tracks_close_fds_setsid_descendant_on_success_and_cancellation() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "owned close-fds descendant was allowed to reach its self-bound"
+            elapsed < std::time::Duration::from_secs(5),
+            "owned close-fds descendant was allowed to reach its self-bound \
+             (cancel={cancel}, elapsed={elapsed:?})"
         );
         poll(|| !live(pid.trim()));
     }
@@ -381,18 +426,41 @@ fn native_cancellation_does_not_stop_another_invocation() {
 
 #[test]
 fn native_parallel_cancellation_has_one_shared_grace_deadline() {
+    const WORKERS: usize = 8;
     let f = Fixture::new();
-    for index in 0..8 {
+    for index in 0..WORKERS {
         f.suite(
             &format!("wait-{index}"),
-            &format!("trap '' TERM\ntouch \"$HOME/ready-{index}\"; while :; do sleep 1; done"),
+            &format!("trap '' TERM\necho $$ >\"$HOME/ready-{index}\"; while :; do sleep 1; done"),
         );
     }
-    let child = f.command(&["-j", "8"]).spawn().unwrap();
-    poll(|| (0..8).all(|index| f.home.join(format!("ready-{index}")).exists()));
-    let started = std::time::Instant::now();
+    let mut child = f.command(&["-j", &WORKERS.to_string()]).spawn().unwrap();
+    let mut alive: Vec<String> = (0..WORKERS)
+        .map(|index| pid_file(&f.home.join(format!("ready-{index}"))).to_string())
+        .collect();
     signal(child.id(), libc::SIGTERM);
+    // Every worker ignores TERM, so each dies only at its KILL. Under one
+    // shared grace deadline those KILLs land together; serialized teardown
+    // would give each worker its own full grace first, spacing the deaths
+    // at least one grace apart. Measure that spacing directly instead of the
+    // total teardown latency, which also includes process-table walks a
+    // loaded host can stretch by seconds without serializing anything.
+    let mut first_death = None;
+    let mut last_death = None;
+    let end = std::time::Instant::now() + SIGNAL_EXIT_DEADLINE;
+    while !alive.is_empty() && std::time::Instant::now() < end {
+        let before = alive.len();
+        alive.retain(|pid| live(pid));
+        if alive.len() < before {
+            let now = std::time::Instant::now();
+            first_death.get_or_insert(now);
+            last_death = Some(now);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let exited = exit_within(&mut child, SIGNAL_EXIT_DEADLINE).is_some();
     let output = finish(child);
+    assert!(exited, "dot test did not finish after SIGTERM");
     assert_eq!(
         output.status.code(),
         Some(143),
@@ -400,9 +468,18 @@ fn native_parallel_cancellation_has_one_shared_grace_deadline() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(alive.is_empty(), "workers survived cancellation: {alive:?}");
+    let grace = std::time::Duration::from_millis(
+        u64::from(dot::cleanup::GRACE_ATTEMPTS) * dot::cleanup::GRACE_INTERVAL_MS,
+    );
+    // Serialized grace periods would spread the deaths over at least
+    // (WORKERS - 1) graces; half of that separates the two designs with
+    // margin on both sides.
+    let serialized = grace * (WORKERS as u32 - 1);
+    let spread = last_death.unwrap() - first_death.unwrap();
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(6),
-        "worker teardown serialized its grace periods"
+        spread < serialized / 2,
+        "worker teardown serialized its grace periods: deaths spread over {spread:?}"
     );
 }
 
@@ -417,7 +494,7 @@ fn native_cancellation_preserves_signal_status_and_reaps_worker() {
         let f = Fixture::new();
         f.suite(
             "wait",
-            "trap '' HUP INT QUIT\ntrap 'printf \"%s\\n\" TERM >>\"$HOME/signal\"' TERM\n(\n  trap 'printf \"%s\\n\" TERM >>\"$HOME/member-signal\"' TERM\n  echo $BASHPID >\"$HOME/member\"\n  deadline=$((SECONDS + 8))\n  while ((SECONDS < deadline)); do sleep 0.05; done\n) &\nuntil [[ -s $HOME/member ]]; do sleep 0.02; done\necho $$ >\"$HOME/ready\"\ndeadline=$((SECONDS + 8))\nwhile ((SECONDS < deadline)); do sleep 0.05; done",
+            &format!("trap '' HUP INT QUIT\ntrap 'printf \"%s\\n\" TERM >>\"$HOME/signal\"' TERM\n(\n  trap 'printf \"%s\\n\" TERM >>\"$HOME/member-signal\"' TERM\n  echo $BASHPID >\"$HOME/member\"\n  deadline=$((SECONDS + {SIGNAL_FIXTURE_SELF_BOUND_SECS}))\n  while ((SECONDS < deadline)); do sleep 0.05; done\n) &\nuntil [[ -s $HOME/member ]]; do sleep 0.02; done\necho $$ >\"$HOME/ready\"\ndeadline=$((SECONDS + {SIGNAL_FIXTURE_SELF_BOUND_SECS}))\nwhile ((SECONDS < deadline)); do sleep 0.05; done"),
         );
         let mut child = f.command(&[]).spawn().unwrap();
         let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -433,15 +510,12 @@ fn native_cancellation_preserves_signal_status_and_reaps_worker() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         signal(child.id(), signal_number);
-        let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while child.try_wait().unwrap().is_none() {
-            if std::time::Instant::now() >= exit_deadline {
-                stop_signal_fixture(&mut child, &f.home);
-                panic!("test runner did not finish after signal {signal_number}");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+        if exit_within(&mut child, SIGNAL_EXIT_DEADLINE).is_none() {
+            stop_signal_fixture(&mut child, &f.home);
+            panic!("test runner did not finish after signal {signal_number}");
         }
-        let observed = child.wait_with_output().unwrap().status.code();
+        let output = child.wait_with_output().unwrap();
+        let observed = output.status.code();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while (live(pid.trim()) || live(member.trim())) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -456,7 +530,12 @@ fn native_cancellation_preserves_signal_status_and_reaps_worker() {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
-        assert_eq!(observed, Some(code));
+        assert_eq!(
+            observed,
+            Some(code),
+            "signal {signal_number} status: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(!worker_survived, "test worker survived cancellation");
         assert!(!member_survived, "test worker member survived cancellation");
         for (path, label) in [
@@ -504,24 +583,14 @@ fn signal_during_parallel_replay_owns_final_status() {
         let mut remainder = Vec::new();
         reader.read_to_end(&mut remainder).unwrap();
     });
-    if started_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .is_err()
-    {
+    if started_rx.recv_timeout(READY_DEADLINE).is_err() {
         // SAFETY: the fixture owns this positive Dot child and SIGTERM is valid.
         unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
         let _ = child.wait();
         panic!("parallel replay did not start");
     }
     signal(child.id(), libc::SIGHUP);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut observed = None;
-    while observed.is_none() && std::time::Instant::now() < deadline {
-        observed = child.try_wait().unwrap();
-        if observed.is_none() {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
+    let observed = exit_within(&mut child, SIGNAL_EXIT_DEADLINE);
     if observed.is_none() {
         let _ = child.kill();
     }
@@ -567,14 +636,7 @@ fn signal_interrupts_backpressured_parallel_replay() {
     });
     await_output_start(&started_rx, &release_tx, &mut child, "parallel replay");
     signal(child.id(), libc::SIGQUIT);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut observed = None;
-    while observed.is_none() && std::time::Instant::now() < deadline {
-        observed = child.try_wait().unwrap();
-        if observed.is_none() {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
+    let observed = exit_within(&mut child, SIGNAL_EXIT_DEADLINE);
     let blocked = observed.is_none();
     release_tx.send(()).unwrap();
     let status = observed.unwrap_or_else(|| child.wait().unwrap());
@@ -621,14 +683,7 @@ fn signal_interrupts_backpressured_result_rendering() {
         "skip result rendering",
     );
     signal(child.id(), libc::SIGINT);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut observed = None;
-    while observed.is_none() && std::time::Instant::now() < deadline {
-        observed = child.try_wait().unwrap();
-        if observed.is_none() {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
+    let observed = exit_within(&mut child, SIGNAL_EXIT_DEADLINE);
     let blocked = observed.is_none();
     release_tx.send(()).unwrap();
     let status = observed.unwrap_or_else(|| child.wait().unwrap());
@@ -677,14 +732,7 @@ fn signal_interrupts_backpressured_sequential_output() {
     });
     await_output_start(&started_rx, &release_tx, &mut child, "sequential output");
     signal(child.id(), libc::SIGTERM);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut observed = None;
-    while observed.is_none() && std::time::Instant::now() < deadline {
-        observed = child.try_wait().unwrap();
-        if observed.is_none() {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
+    let observed = exit_within(&mut child, SIGNAL_EXIT_DEADLINE);
     let blocked = observed.is_none();
     release_tx.send(()).unwrap();
     let status = observed.unwrap_or_else(|| child.wait().unwrap());

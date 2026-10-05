@@ -891,7 +891,7 @@ mod tests {
         command
             .args([
                 "-c",
-                "set -m; (trap '' TERM; echo $BASHPID >\"$1\"; sleep 4) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
+                "set -m; (trap '' TERM; echo $BASHPID >\"$1\"; sleep 30) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
                 "hook-descendant",
             ])
             .arg(&marker)
@@ -904,11 +904,18 @@ mod tests {
             .trim()
             .parse::<i32>()
             .expect("descendant pid");
+        // The descendant outlives this wait by far, so only the worker's
+        // cleanup can end it in time; a self-exit cannot mask a leak.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while process_live(pid) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let survived = process_live(pid);
+        if survived {
+            // SAFETY: the fixture wrote this positive PID and it is still a
+            // live process; stop the leak before reporting it.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
         assert_eq!(status, Some(0));
         assert!(!survived, "completed hook left its descendant running");
     }
