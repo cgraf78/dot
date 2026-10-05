@@ -7027,7 +7027,7 @@ fn stop_sessions_with_tick(
         .iter()
         .map(|child| Session::new(child.id()))
         .collect();
-    let graceful_deadline = cleanup_deadline();
+    let mut graceful_deadline = cleanup_deadline();
     // TERM receives the historical one-second grace. KILL verification and
     // final reaping share one additional bounded window rather than renewing
     // a full deadline at each stage; retain half a grace of scan margin for a
@@ -7035,11 +7035,21 @@ fn stop_sessions_with_tick(
     // `kill_verification_deadline` may finish an in-progress proof past this
     // window (at most `KILL_VERIFY_LATE_ATTEMPTS` walks) instead of reporting
     // a dead session as incomplete.
-    // The reassignment below is Linux/Android-only; portable platforms
-    // never run the settle round and keep the initial deadline.
-    #[allow(unused_mut)]
     let mut hard_deadline = graceful_deadline
         + Duration::from_millis(GRACE_ATTEMPTS as u64 * GRACE_INTERVAL_MS * 3 / 2);
+    // The grace is time the TERM handler gets while this supervisor services
+    // it (draining its output through `tick`), not time spent walking the
+    // process table. Slow walks are refunded to the deadline, capped at one
+    // extra grace, and the next walk waits as long as the slow one took, so
+    // within that cap drain-only rounds get at least half of the time.
+    // An uncatchable first signal (the drop path's KILL) has no handler to
+    // service, so its grace is never extended.
+    let grace_cap = if first_signal == libc::SIGKILL || first_signal == libc::SIGSTOP {
+        graceful_deadline
+    } else {
+        graceful_deadline + grace_duration()
+    };
+    let original_graceful_deadline = graceful_deadline;
     // Deliver to the retained leader before a potentially expensive global
     // snapshot. On pidfd-capable systems every other member is then delivered
     // exactly once after discovery; portable/old-kernel systems use one
@@ -7049,7 +7059,13 @@ fn stop_sessions_with_tick(
         .iter_mut()
         .map(|session| session.signal_before_observation(first_signal))
         .collect::<Vec<_>>();
+    let walk_started = Instant::now();
     let _ = observe_sessions(&mut sessions, graceful_deadline);
+    #[cfg(test)]
+    GRACE_DISCOVERY_WALK.with(|walk| walk.set(Some(walk_started.elapsed())));
+    let (refunded_deadline, mut next_walk) =
+        grace_after_walk(graceful_deadline, grace_cap, walk_started.elapsed());
+    graceful_deadline = refunded_deadline;
     for (session, delivery) in sessions.iter_mut().zip(initial_deliveries) {
         session.finish_initial_delivery(first_signal, delivery);
     }
@@ -7064,25 +7080,38 @@ fn stop_sessions_with_tick(
     // never weakens verification.
     let mut first_round = true;
     while first_round || Instant::now() < graceful_deadline {
+        // After a slow walk, rounds only drain until the walk's cost has
+        // been matched; skipping a walk delays discovery of a new member
+        // but never weakens the empty proof, which still needs walks.
+        let walk = first_round || Instant::now() >= next_walk;
         first_round = false;
-        let observed = observe_sessions(&mut sessions, graceful_deadline);
-        if sessions_stably_empty(observed, &mut consecutive_empty) {
-            // Confirm before breaking: two snapshots can both miss a
-            // process that is mid-exec (unreadable environ) or
-            // mid-reparent, and breaking skips settle, KILL, and
-            // verification entirely, leaking it. One more complete
-            // snapshot either confirms the emptiness or reopens the
-            // round so the newly visible member is delivered below.
-            let confirm = observe_sessions(&mut sessions, graceful_deadline);
-            if sessions_stably_empty(confirm, &mut consecutive_empty) {
-                break;
+        if walk {
+            let walk_started = Instant::now();
+            let observed = graceful_observe(&mut sessions, graceful_deadline);
+            (graceful_deadline, next_walk) =
+                grace_after_walk(graceful_deadline, grace_cap, walk_started.elapsed());
+            if sessions_stably_empty(observed, &mut consecutive_empty) {
+                // Confirm before breaking: two snapshots can both miss a
+                // process that is mid-exec (unreadable environ) or
+                // mid-reparent, and breaking skips settle, KILL, and
+                // verification entirely, leaking it. One more complete
+                // snapshot either confirms the emptiness or reopens the
+                // round so the newly visible member is delivered below.
+                let walk_started = Instant::now();
+                let confirm = graceful_observe(&mut sessions, graceful_deadline);
+                (graceful_deadline, next_walk) =
+                    grace_after_walk(graceful_deadline, grace_cap, walk_started.elapsed());
+                if sessions_stably_empty(confirm, &mut consecutive_empty) {
+                    break;
+                }
             }
-        }
-        for session in &mut sessions {
-            // New members receive one exact signal through retained authority.
-            // A group-wide retry is reserved for a newly observed same-group
-            // cohort that the platform could not pin safely.
-            session.signal_new(first_signal);
+            for session in &mut sessions {
+                // New members receive one exact signal through retained
+                // authority. A group-wide retry is reserved for a newly
+                // observed same-group cohort that the platform could not
+                // pin safely.
+                session.signal_new(first_signal);
+            }
         }
         // Drain several bounded chunks per process-table pass. Snapshotting a
         // busy host can dominate the loop; one small drain per scan can make
@@ -7096,6 +7125,9 @@ fn stop_sessions_with_tick(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    // A refunded grace delays the KILL phase by the same amount; shift its
+    // window too so certification keeps its budget (at most one extra grace).
+    hard_deadline += graceful_deadline.saturating_duration_since(original_graceful_deadline);
     if consecutive_empty < 2 {
         // Escalation is a verification phase, not a fire-and-forget signal.
         // Keep the leader unreaped so its original process-group ID remains
@@ -7289,6 +7321,52 @@ thread_local! {
 #[cfg(test)]
 fn kill_phase_observation_override() -> Option<Option<bool>> {
     KILL_PHASE_OBSERVATIONS.with(|queue| queue.borrow_mut().pop_front())
+}
+
+/// The TERM grace as a duration (`cleanup_deadline` measures from now).
+fn grace_duration() -> Duration {
+    Duration::from_millis(GRACE_ATTEMPTS as u64 * GRACE_INTERVAL_MS)
+}
+
+/// Updates the TERM grace after a graceful-phase walk that took `spent`.
+///
+/// Returns the new grace deadline and the earliest start of the next walk.
+/// A walk within one grace interval is ordinary polling and changes
+/// nothing. The excess of a slower walk was time the supervisor could not
+/// drain a TERM handler's output, so it is refunded to the deadline, never
+/// past `cap` (one extra grace), and the next walk waits that long so the
+/// handler gets drain-only rounds in between. Teardown stays bounded: the
+/// graceful phase ends by `cap` plus one walk already in progress. A `cap`
+/// at the deadline disables both (nothing to service).
+fn grace_after_walk(deadline: Instant, cap: Instant, spent: Duration) -> (Instant, Instant) {
+    if cap <= deadline {
+        return (deadline, Instant::now());
+    }
+    let excess = spent.saturating_sub(Duration::from_millis(GRACE_INTERVAL_MS));
+    ((deadline + excess).min(cap), Instant::now() + excess)
+}
+
+/// One graceful-phase process-table walk.
+fn graceful_observe(sessions: &mut [Session], deadline: Instant) -> Option<bool> {
+    #[cfg(test)]
+    if let Some(cost) = GRACE_CANNED_WALKS.with(|walks| walks.borrow_mut().pop_front()) {
+        std::thread::sleep(cost);
+        return Some(false);
+    }
+    observe_sessions(sessions, deadline)
+}
+
+// Test seam: each queued entry replaces one graceful-loop walk on this
+// thread (the initial discovery walk stays real) with a walk that takes that
+// long and still sees a live member, standing in for a loaded host whose
+// walks take most of the grace.
+#[cfg(test)]
+thread_local! {
+    static GRACE_CANNED_WALKS: std::cell::RefCell<std::collections::VecDeque<Duration>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    // How long this thread's last initial (real) discovery walk took.
+    static GRACE_DISCOVERY_WALK: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Upper bound on post-KILL verification walks started after the shared
@@ -13251,6 +13329,117 @@ int kill(pid_t pid, int sig) {
             output.len() >= 256 * 1024,
             "TERM output never exceeded ordinary socket capacity"
         );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn slow_grace_walks_still_give_a_term_handler_its_grace() {
+        use std::io::Read as _;
+        use std::os::fd::OwnedFd;
+
+        // After the real discovery walk delivers TERM, the next two graceful
+        // walks each take 600ms, as on a loaded host with a large process
+        // table. The TERM handler needs several drain rounds to flush 1.25MB
+        // through a socket; a grace measured in wall time spends it walking,
+        // so it got two drain rounds before the settle round and KILL, and
+        // died mid-write.
+        struct ResetWalks;
+        impl Drop for ResetWalks {
+            fn drop(&mut self) {
+                GRACE_CANNED_WALKS.with(|walks| walks.borrow_mut().clear());
+            }
+        }
+        GRACE_CANNED_WALKS.with(|walks| {
+            *walks.borrow_mut() = [Duration::from_millis(600); 2].into_iter().collect();
+        });
+        let _reset = ResetWalks;
+        let scope = dot_test_support::TempDir::new("supervisor-slow-grace-walks").unwrap();
+        let ready = scope.path().join("ready");
+        let completed = scope.path().join("completed");
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let mut command = Command::new(dot_test_support::bash());
+        command
+            .args([
+                "-c",
+                "set -m; (trap 'printf \"%1310720s\" x; : >\"$2\"; exit 0' TERM; printf ready >\"$1\"; while :; do sleep 0.05; done) & until [[ -s $1 ]]; do sleep 0.01; done; exit 0",
+                "supervisor-slow-grace-walks",
+            ])
+            .arg(&ready)
+            .arg(&completed)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(OwnedFd::from(writer)))
+            .stderr(Stdio::null());
+        let mut output = 0usize;
+        let started = Instant::now();
+        let result = supervise_session(command, None, |_| {
+            let mut drained = 0;
+            while drained < 64 * 1024 {
+                let mut chunk = [0u8; 8192];
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        output += count;
+                        drained += count;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        let elapsed = started.elapsed();
+        let discovery = GRACE_DISCOVERY_WALK.with(std::cell::Cell::get);
+
+        assert!(matches!(result, SessionEnd::Exited(status) if status.success()));
+        // The refund is capped at one extra grace. A real discovery walk
+        // that alone takes a full grace (an extremely oversubscribed host)
+        // exhausts the cap before the canned walks run, leaving no drain-only
+        // window to test; the bounded-teardown check below still applies.
+        if discovery.is_some_and(|walk| walk >= grace_duration()) {
+            eprintln!(
+                "inconclusive: the real discovery walk took {discovery:?}, \
+                 exhausting the refund cap"
+            );
+        } else {
+            assert!(
+                completed.exists(),
+                "slow walks consumed the TERM grace: handler killed after {output} bytes \
+                 (discovery walk {discovery:?})"
+            );
+        }
+        // Bounded: one refunded grace plus the walks and KILL window, far
+        // from unbounded waiting on the handler.
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "teardown with slow walks took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn grace_refunds_only_slow_walks_and_never_past_its_cap() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let cap = now + Duration::from_secs(2);
+        // A walk within one grace interval is ordinary polling.
+        let (unchanged, next) = grace_after_walk(deadline, cap, Duration::from_millis(40));
+        assert_eq!(unchanged, deadline);
+        assert!(next <= Instant::now());
+        // A slow walk's excess over one interval is refunded and delays the
+        // next walk by the same amount.
+        let (refunded, next) = grace_after_walk(deadline, cap, Duration::from_millis(450));
+        assert_eq!(refunded, deadline + Duration::from_millis(400));
+        assert!(next >= now + Duration::from_millis(400));
+        // Refunds stop at the cap.
+        let (capped, _) = grace_after_walk(refunded, cap, Duration::from_secs(5));
+        assert_eq!(capped, cap);
+        // A cap at the deadline (uncatchable first signal) refunds nothing
+        // and never delays the next walk.
+        let (fixed, next) = grace_after_walk(deadline, deadline, Duration::from_secs(1));
+        assert_eq!(fixed, deadline);
+        assert!(next <= Instant::now());
     }
 
     #[test]

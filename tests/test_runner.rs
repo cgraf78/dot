@@ -10,7 +10,9 @@ use std::process::{Command, Stdio};
 /// How long a test waits for Dot to exit after a cancelling signal.
 ///
 /// Interrupt teardown is bounded by the product, not instantaneous: a one
-/// second TERM grace, a 1.5 s KILL window, up to three late verification
+/// second TERM grace (up to two when slow process-table walks are refunded
+/// to it, with the KILL window shifted to match), a 1.5 s KILL window, up
+/// to three late verification
 /// walks when process-table walks overran that window, then a one second
 /// lease poll. Native walks take well under a second each, so a loaded host
 /// typically finishes in a few seconds. Only the pathological `ps` fallback
