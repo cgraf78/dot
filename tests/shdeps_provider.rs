@@ -4670,7 +4670,14 @@ fn combined_capture_keeps_the_order_across_streams() {
         b"#!/bin/sh\ni=0\nwhile [ $i -lt 200 ]; do\n  printf 'o%d\\n' $i\n  printf 'e%d\\n' $i >&2\n  i=$((i + 1))\ndone\n",
     );
     let (code, output) = bounded_combined_output(Command::new(&script), 20);
-    assert_eq!(code, Some(0));
+    // The wrapper's diagnostics land in the same file as the script's output,
+    // so show it all on failure rather than only a bare exit code.
+    assert_eq!(
+        code,
+        Some(0),
+        "combined output: {}",
+        String::from_utf8_lossy(&output)
+    );
     let expected: String = (0..200).map(|i| format!("o{i}\ne{i}\n")).collect();
     assert_eq!(String::from_utf8_lossy(&output), expected);
 }

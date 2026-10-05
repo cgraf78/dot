@@ -9,7 +9,16 @@ if (: <&0 2>&9); then dot_stdio_mask=$((dot_stdio_mask + 1)); fi
 if (: >&1 2>&9); then dot_stdio_mask=$((dot_stdio_mask + 2)); fi
 if (: 3>&2 2>&9); then dot_stdio_mask=$((dot_stdio_mask + 4)); fi
 exec 9>&-
-exec python3 -I -S "$0" --dot-python-entry-v1 "$dot_stdio_mask" "$@"
+# Exec the interpreter by its resolved path. With PATH unset, sh still finds
+# python3 on its built-in search path, but CPython cannot repeat that search
+# for a bare argv[0] and leaves sys.executable empty, so the helpers it
+# relaunches from sys.executable fail and every run exits 126. On a miss, or
+# when a dash/ash `command -v` reports a non-executable match that `exec`
+# would have skipped, fall back to the bare name so sh's own search and its
+# "not found" (127) diagnostic still apply.
+dot_python=$(command -v python3) || dot_python=python3
+[ -x "$dot_python" ] || dot_python=python3
+exec "$dot_python" -I -S "$0" --dot-python-entry-v1 "$dot_stdio_mask" "$@"
 exit 126
 ":"""
 
