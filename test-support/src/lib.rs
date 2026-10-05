@@ -127,6 +127,48 @@ pub fn publish_fixture_executable(path: &Path, contents: &[u8]) -> std::io::Resu
     wait_until_executable(path, &[FIXTURE_READY_ARG])
 }
 
+/// Create an executable fixture of any kind without this process ever
+/// holding a writable descriptor to it.
+///
+/// [`publish_fixture_executable`] needs fixtures that exit early on
+/// [`FIXTURE_READY_ARG`]. For anything else (interpreter scripts whose
+/// first argument may be arbitrary, binaries, fixtures with side effects on
+/// every run) this writes `contents` to a `.src` sibling, which is never
+/// executed, and lets a `cp` child create the executable. The test process
+/// only ever opens the source for writing, so a sibling test thread that
+/// forks meanwhile cannot inherit a writer of the executable, and an exec
+/// of it never fails with `ETXTBSY`. The mode is applied by path afterwards.
+pub fn install_fixture_executable(
+    path: impl AsRef<Path>,
+    contents: impl AsRef<[u8]>,
+    mode: u32,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let mut source = path.as_os_str().to_owned();
+    source.push(".src");
+    let source = PathBuf::from(source);
+    std::fs::write(&source, contents)?;
+    // Absolute first: some tests narrow this process's PATH.
+    let cp = ["/bin/cp", "/usr/bin/cp", "/system/bin/cp"]
+        .iter()
+        .map(Path::new)
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| Path::new("cp"));
+    let status = std::process::Command::new(cp)
+        .arg(&source)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .status()?;
+    let _ = std::fs::remove_file(&source);
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "cp of fixture {} failed: {status}",
+            path.display()
+        )));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
 /// Run [`wait_until_executable`] while observing each busy retry.
 ///
 /// Root integration tests use the callback to deterministically hold and then

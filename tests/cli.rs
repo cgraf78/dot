@@ -1186,18 +1186,20 @@ fn stage_suites() -> SuiteFixture {
     let scope = TempDir::new_exec("cli-test-suites").expect("suite scope");
     let dir = scope.path().join("suites");
     std::fs::create_dir_all(&dir).expect("suite dir");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         dir.join("pass-test"),
         b"#!/usr/bin/env bash\nprintf 'complete\\t0\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"\nexit 0\n",
+        0o755,
     )
     .expect("pass suite");
-    std::fs::write(dir.join("fail-test"), b"#!/usr/bin/env bash\nexit 3\n").expect("fail suite");
+    dot_test_support::install_fixture_executable(
+        dir.join("fail-test"),
+        b"#!/usr/bin/env bash\nexit 3\n",
+        0o755,
+    )
+    .expect("fail suite");
     #[cfg(unix)]
-    {
-        seal(&dir, 0o700);
-        seal(&dir.join("pass-test"), 0o755);
-        seal(&dir.join("fail-test"), 0o755);
-    }
+    seal(&dir, 0o700);
     SuiteFixture { scope, dir }
 }
 
@@ -1446,16 +1448,15 @@ fn poison_curl(scope: &Path) -> (OsString, PathBuf) {
     let record = scope.join("provider-invoked");
     std::fs::create_dir_all(&poison_dir).expect("poison path");
     let executable = poison_dir.join("curl");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &executable,
         format!(
             "#!/bin/sh\nprintf invoked >'{}'\nexit 97\n",
             record.display()
         ),
+        0o755,
     )
-    .expect("poison curl");
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
-        .expect("poison curl mode");
+    .expect("install poison curl");
     let mut path = poison_dir.into_os_string();
     path.push(":");
     path.push(fixture_path());
@@ -2789,10 +2790,7 @@ exec "${{DOT_RUNTIME_REAL_{variable}}}" "$@"
 "#,
         );
         let path = bin.join(tool);
-        std::fs::write(&path, script).expect("write shim");
-        #[cfg(unix)]
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("mark shim executable");
+        dot_test_support::install_fixture_executable(&path, script, 0o755).expect("install shim");
     }
 }
 
@@ -4150,17 +4148,12 @@ impl NativeUpdateFixture {
     }
 
     fn reject_fallback(&self) {
-        std::fs::write(
+        dot_test_support::install_fixture_executable(
             &self.fallback_sentinel,
             b"#!/bin/sh\nprintf 'UNEXPECTED-FALLBACK\n' >&2\nexit 97\n",
+            0o755,
         )
-        .expect("write fallback sentinel");
-        #[cfg(unix)]
-        std::fs::set_permissions(
-            &self.fallback_sentinel,
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .expect("mark fallback sentinel executable");
+        .expect("install fallback sentinel");
     }
 
     fn rust_dot(&self, argv: &[&str]) -> std::process::Output {
@@ -4566,6 +4559,11 @@ const HANDLED_SIGNAL_CASES: [(i32, i32, &str); 4] = [
     (libc::SIGTERM, 143, "term"),
 ];
 
+// The TERM-ignoring fixtures that block under this helper idle in 50 ms
+// steps for at most 6000 iterations: at least 300s, and longer under load,
+// against a worst case here of about 80s (60s readiness, 10s exit, then 5s
+// worker exit plus cleanup). A teardown regression still fails the test,
+// but a fixture nothing reaped exits on its own instead of looping forever.
 #[cfg(unix)]
 fn cancel_after_marker_with_signal<T>(
     child: std::process::Child,
@@ -5067,15 +5065,19 @@ fn update_native_merge_hook_runs_with_a_large_job_limit() {
 #[test]
 fn update_native_verbose_merge_replays_hook_output_in_declaration_order() {
     // A missing stage update or replay would make the quiet happy-path pass
-    // while losing the human-visible hook result contract.
+    // while losing the human-visible hook result contract. Alpha waits for
+    // beta and beta for gamma, which only starts once alpha frees one of the
+    // two workers, so the cross-hook waits are bounded at 3000 x 10ms (30s):
+    // far past CI scheduling delays, still finite, and never the check
+    // itself (the ordering assertions below are).
     let hooks: &[(&str, &[u8])] = &[
         (
             "10-alpha.sh",
-            b"merge() { i=0; while [[ ! -e $HOME/beta-ready ]]; do (( i += 1 )); (( i < 200 )) || return 9; sleep 0.01; done; printf 'Alpha result\\nalpha detail\\n'; printf alpha >\"$HOME/alpha-done\"; }\n",
+            b"merge() { i=0; while [[ ! -e $HOME/beta-ready ]]; do (( i += 1 )); (( i < 3000 )) || return 9; sleep 0.01; done; printf 'Alpha result\\nalpha detail\\n'; printf alpha >\"$HOME/alpha-done\"; }\n",
         ),
         (
             "11-beta.sh",
-            b"merge() { printf ready >\"$HOME/beta-ready\"; i=0; while [[ ! -e $HOME/gamma-ready ]]; do (( i += 1 )); (( i < 200 )) || return 9; sleep 0.01; done; printf 'Beta result\\nbeta detail\\n'; printf beta >\"$HOME/beta-done\"; }\n",
+            b"merge() { printf ready >\"$HOME/beta-ready\"; i=0; while [[ ! -e $HOME/gamma-ready ]]; do (( i += 1 )); (( i < 3000 )) || return 9; sleep 0.01; done; printf 'Beta result\\nbeta detail\\n'; printf beta >\"$HOME/beta-done\"; }\n",
         ),
         (
             "12-gamma.sh",
@@ -5313,22 +5315,21 @@ fn direct_signal_during_git_sync_stops_the_owned_command_and_later_stages() {
     std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
     let marker = fixture.client.home.join("git-sync-ready");
     let git_shim = shim_dir.join("git");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &git_shim,
         br#"#!/bin/sh
 case " $* " in
   *" rebase --autostash "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_SYNC_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
 "#,
+        0o755,
     )
-    .expect("write Git shim");
-    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
-        .expect("make Git shim executable");
+    .expect("install Git shim");
     let mut paths = vec![shim_dir];
     paths.extend(std::env::split_paths(&fixture_path()));
     let path = std::env::join_paths(paths).expect("Git shim PATH");
@@ -5377,14 +5378,14 @@ fn direct_signal_during_fetch_does_not_start_git_cleanup_queries() {
     let marker = fixture.client.home.join("git-fetch-ready");
     let later = fixture.client.home.join("git-after-fetch-cancel");
     let git_shim = shim_dir.join("git");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &git_shim,
         br#"#!/bin/sh
 case " $* " in
   *" fetch "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_FETCH_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
   *" rev-parse --absolute-git-dir "*)
     if [ -s "$DOT_TEST_GIT_FETCH_READY" ]; then
@@ -5394,10 +5395,9 @@ case " $* " in
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
 "#,
+        0o755,
     )
-    .expect("write Git shim");
-    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
-        .expect("make Git shim executable");
+    .expect("install Git shim");
     let mut paths = vec![shim_dir];
     paths.extend(std::env::split_paths(&fixture_path()));
     let path = std::env::join_paths(paths).expect("Git shim PATH");
@@ -5459,22 +5459,21 @@ fn direct_signals_during_startup_git_stop_the_owned_query() {
             .path()
             .join(format!("startup-git-{name}-ready"));
         let git_shim = shim_dir.join("git");
-        std::fs::write(
+        dot_test_support::install_fixture_executable(
             &git_shim,
             br#"#!/bin/sh
 case " $* " in
   *" rev-parse HEAD "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
 "#,
+            0o755,
         )
-        .expect("write Git shim");
-        std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
-            .expect("make Git shim executable");
+        .expect("install Git shim");
         let mut paths = vec![shim_dir];
         paths.extend(std::env::split_paths(&fixture_path()));
         let path = std::env::join_paths(paths).expect("Git shim PATH");
@@ -5534,22 +5533,21 @@ fn informational_commands_own_their_blocking_startup_git_probe() {
             .path()
             .join(format!("info-git-{command_name}-ready"));
         let git_shim = shim_dir.join("git");
-        std::fs::write(
+        dot_test_support::install_fixture_executable(
             &git_shim,
             br#"#!/bin/sh
 case " $* " in
   *" rev-parse HEAD "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
 "#,
+            0o755,
         )
-        .expect("write Git shim");
-        std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
-            .expect("make Git shim executable");
+        .expect("install Git shim");
         let mut paths = vec![shim_dir];
         paths.extend(std::env::split_paths(&fixture_path()));
         let path = std::env::join_paths(paths).expect("Git shim PATH");
@@ -5599,13 +5597,12 @@ fn direct_signals_during_crontab_stop_the_owned_query() {
             .path()
             .join(format!("crontab-{name}-ready"));
         let crontab = shim_dir.join("crontab");
-        std::fs::write(
+        dot_test_support::install_fixture_executable(
             &crontab,
-            b"#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' \"$$\" >\"$DOT_TEST_CRONTAB_READY\"\nwhile :; do sleep 0.05; done\n",
+            b"#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' \"$$\" >\"$DOT_TEST_CRONTAB_READY\"\ni=0; while [ \"$i\" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1\n",
+            0o755,
         )
-        .expect("write crontab shim");
-        std::fs::set_permissions(&crontab, std::fs::Permissions::from_mode(0o755))
-            .expect("make crontab shim executable");
+        .expect("install crontab shim");
         let mut paths = vec![shim_dir];
         paths.extend(std::env::split_paths(&fixture_path()));
         let path = std::env::join_paths(paths).expect("crontab shim PATH");
@@ -5644,13 +5641,12 @@ fn handoff_variables_never_reach_children_of_the_process_environment() {
     let shim_dir = fixture.client.scope.path().join("env-crontab-bin");
     std::fs::create_dir_all(&shim_dir).expect("crontab shim directory");
     let crontab = shim_dir.join("crontab");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &crontab,
         b"#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"${DOT_UPDATE_LOCK_TOKEN-unset}\" \"${DOT_REEXEC_ONCE-unset}\" \"${DOT_REEXEC_STARTED-unset}\" \"${DOT_UPDATE_WARNED-unset}\"\n",
+        0o755,
     )
-    .expect("write crontab shim");
-    std::fs::set_permissions(&crontab, std::fs::Permissions::from_mode(0o755))
-        .expect("make crontab shim executable");
+    .expect("install crontab shim");
     let mut paths = vec![shim_dir];
     paths.extend(std::env::split_paths(&fixture_path()));
     let path = std::env::join_paths(paths).expect("crontab shim PATH");
@@ -5681,22 +5677,21 @@ fn direct_signal_during_legacy_identity_selection_stops_the_owned_query() {
     std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
     let marker = fixture.client.scope.path().join("legacy-select-ready");
     let git_shim = shim_dir.join("git");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &git_shim,
         br#"#!/bin/sh
 case " $* " in
   *" rev-parse --absolute-git-dir "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
 "#,
+        0o755,
     )
-    .expect("write Git shim");
-    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
-        .expect("make Git shim executable");
+    .expect("install Git shim");
     let mut paths = vec![shim_dir];
     paths.extend(std::env::split_paths(&fixture_path()));
     let path = std::env::join_paths(paths).expect("Git shim PATH");
@@ -5746,9 +5741,8 @@ fn init_host_git_prefers_the_fixture_shim() {
     let shim_dir = state.path().join("blocking-init-git-bin");
     std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
     let git_shim = shim_dir.join("git");
-    std::fs::write(&git_shim, b"#!/bin/sh\nexit 0\n").expect("write Git shim");
-    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
-        .expect("make Git shim executable");
+    dot_test_support::install_fixture_executable(&git_shim, b"#!/bin/sh\nexit 0\n", 0o755)
+        .expect("install Git shim");
     let mut paths = vec![shim_dir.clone()];
     paths.extend(std::env::split_paths(&fixture_path()));
     let path = std::env::join_paths(paths).expect("Git shim PATH");
@@ -5821,22 +5815,21 @@ fn direct_signals_during_init_git_clone_stop_the_owned_query() {
         std::fs::create_dir_all(&origin).expect("origin dir");
         let origin_url = format!("file://{}", origin.display());
         let git_shim = shim_dir.join("git");
-        std::fs::write(
+        dot_test_support::install_fixture_executable(
             &git_shim,
             br#"#!/bin/sh
 case " $* " in
   *" clone "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
 "#,
+            0o755,
         )
-        .expect("write Git shim");
-        std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
-            .expect("make Git shim executable");
+        .expect("install Git shim");
         let mut paths = vec![shim_dir];
         paths.extend(std::env::split_paths(&fixture_path()));
         let path = std::env::join_paths(paths).expect("Git shim PATH");
@@ -5903,22 +5896,21 @@ fn assert_signal_during_missing_overlay_clone(signal: i32, expected: i32, name: 
         .path()
         .join(format!("overlay-clone-{name}-ready"));
     let git_shim = shim_dir.join("git");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &git_shim,
         br#"#!/bin/sh
 case " $* " in
   *" clone --quiet --no-hardlinks "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
 "#,
+        0o755,
     )
-    .expect("write Git shim");
-    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
-        .expect("make Git shim executable");
+    .expect("install Git shim");
     let mut paths = vec![shim_dir];
     paths.extend(std::env::split_paths(&fixture_path()));
     let path = std::env::join_paths(paths).expect("Git shim PATH");
@@ -6027,13 +6019,12 @@ fn update_native_config_reads_survive_the_pull_phase() {
     std::fs::create_dir_all(&shim_dir).expect("config shim directory");
     let log = fixture.client.scope.path().join("config-invocations.log");
     let git_shim = shim_dir.join("git");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &git_shim,
         b"#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$DOT_TEST_CONFIG_LOG\"\nexec \"$DOT_TEST_REAL_GIT\" \"$@\"\n",
+        0o755,
     )
-    .expect("write config shim");
-    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
-        .expect("make config shim executable");
+    .expect("install config shim");
     let mut paths = vec![shim_dir];
     paths.extend(std::env::split_paths(&fixture_path()));
     let path = std::env::join_paths(paths).expect("config shim PATH");
@@ -6099,7 +6090,7 @@ fn direct_signal_during_base_tracked_query_prevents_overlay_mutation() {
     std::fs::create_dir_all(&shim_dir).expect("Git shim directory");
     let marker = fixture.client.scope.path().join("base-tracked-ready");
     let git_shim = shim_dir.join("git");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &git_shim,
         br#"#!/bin/sh
 last=
@@ -6107,14 +6098,13 @@ for arg do last=$arg; done
 if [ "$last" = ls-files ]; then
   trap '' TERM
   printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-  while :; do sleep 0.05; done
+  i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
 fi
 exec "$DOT_TEST_REAL_GIT" "$@"
 "#,
+        0o755,
     )
-    .expect("write Git shim");
-    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
-        .expect("make Git shim executable");
+    .expect("install Git shim");
     let mut paths = vec![shim_dir];
     paths.extend(std::env::split_paths(&fixture_path()));
     let path = std::env::join_paths(paths).expect("Git shim PATH");
@@ -6159,7 +6149,7 @@ fn base_tracked_output_overflow_fails_before_overlay_mutation() {
         .path()
         .join("base-tracked-overflow-ready");
     let git_shim = shim_dir.join("git");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &git_shim,
         br#"#!/bin/sh
 last=
@@ -6172,10 +6162,9 @@ if [ "$last" = ls-files ]; then
 fi
 exec "$DOT_TEST_REAL_GIT" "$@"
 "#,
+        0o755,
     )
-    .expect("write Git shim");
-    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
-        .expect("make Git shim executable");
+    .expect("install Git shim");
     let mut paths = vec![shim_dir];
     paths.extend(std::env::split_paths(&fixture_path()));
     let path = std::env::join_paths(paths).expect("Git shim PATH");
@@ -6222,7 +6211,7 @@ fn direct_signal_during_post_fetch_query_stops_the_owned_command() {
     let fetched = fixture.client.home.join("git-fetch-finished");
     let marker = fixture.client.home.join("git-post-fetch-query-ready");
     let git_shim = shim_dir.join("git");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &git_shim,
         br#"#!/bin/sh
 case " $* " in
@@ -6236,16 +6225,15 @@ case " $* " in
     if [ -e "$DOT_TEST_GIT_FETCH_FINISHED" ]; then
       trap '' TERM
       printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-      while :; do sleep 0.05; done
+      i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     fi
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
 "#,
+        0o755,
     )
-    .expect("write Git shim");
-    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755))
-        .expect("make Git shim executable");
+    .expect("install Git shim");
     let mut paths = vec![shim_dir];
     paths.extend(std::env::split_paths(&fixture_path()));
     let path = std::env::join_paths(paths).expect("Git shim PATH");
@@ -6310,7 +6298,7 @@ fn update_native_signal_during_merge_retains_lifecycle_state_and_skips_normaliza
             .client
             .home
             .join("extensions/merge-hooks.d/10-config.sh"),
-        b"merge() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/merge-cancel-ready\"\n  while :; do sleep 0.05; done\n}\n",
+        b"merge() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/merge-cancel-ready\"\n  i=0; while [ \"$i\" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; return 1\n}\n",
     )
     .expect("blocking merge hook");
     std::fs::write(
@@ -6567,7 +6555,7 @@ fn update_native_signal_during_retirement_retains_lifecycle_state_and_skips_norm
     seed_advance(
         &fixture.client.overlay_seed,
         "dot/profile-deactivate",
-        b"deactivate() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/retire-cancel-ready\"\n  while :; do sleep 0.05; done\n}\n",
+        b"deactivate() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/retire-cancel-ready\"\n  i=0; while [ \"$i\" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; return 1\n}\n",
     );
     assert_native_silent(
         &fixture.rust_dot_with_bash(&["update", "--quiet"]),
@@ -7266,9 +7254,8 @@ fn logging_git_launcher(dir: &Path, log: &Path, git_dir: Option<&Path>) {
         real = real_tool("git").display(),
     );
     let launcher = dir.join("git");
-    std::fs::write(&launcher, script).expect("write launcher");
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
-        .expect("launcher mode");
+    dot_test_support::install_fixture_executable(&launcher, script, 0o755)
+        .expect("install launcher");
 }
 
 /// The revision this test binary was built from, which the re-exec guard

@@ -160,9 +160,8 @@ fn launcher_bytes() -> Vec<u8> {
 }
 
 fn write_program(path: &Path, body: &str) {
-    std::fs::write(path, body).expect("write fixture program");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("fixture program mode");
+    dot_test_support::install_fixture_executable(path, body, 0o755)
+        .expect("install fixture program");
 }
 
 fn shell_word(path: &Path) -> String {

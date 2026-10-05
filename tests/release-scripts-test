@@ -10,6 +10,14 @@ set -euo pipefail
 # shellcheck disable=SC1091 # Test helper path is resolved from this file.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/test.sh"
 
+# Fixtures that ignore teardown signals bound their own lifetime, so a failed
+# run cannot leave them running forever. This suite runs without a suite
+# timeout, so a supervisor that waited such a fixture out instead of stopping
+# it would otherwise pass, only late: each bounded fixture that runs out
+# records its expiry here, and the suite fails if any did.
+fixture_expired_dir=$DOT_TEST_TMP/expired-fixtures
+mkdir -p "$fixture_expired_dir"
+
 previous_dist=
 guarded_fixture_pid=
 guarded_fixture_identity=
@@ -586,14 +594,19 @@ EOF
     close_fixture=$DOT_TEST_TMP/close-only-$close_signal
     mkdir -p "$close_fixture"
     close_holder=$close_fixture/holder
+    # The holder ignores every teardown signal and the driver may outlast
+    # its own, so both give up after at least 1200s; one that runs out
+    # records its expiry (see `fixture_expired_dir`).
     cat >"$close_holder" <<'HOLDER'
 #!/bin/bash
 set -u
 trap '' HUP INT QUIT TERM
 printf '%s\n' "$$" >"$1"
-while [[ ! -e $2 ]]; do
+for _ in {1..120000}; do
+  [[ -e $2 ]] && exit 0
   /bin/sleep 0.01
 done
+: >"$3"
 HOLDER
     chmod +x "$close_holder"
     # Monitor mode keeps SIGINT/SIGQUIT trappable in the backgrounded
@@ -607,12 +620,14 @@ HOLDER
     trap perf_finish EXIT
     trap "exit $5" "$4"
     perf_acquire_artifact_lifecycle / "$2/artifacts"
-    /usr/bin/setsid "$2/holder" "$2/holder-pid" "$2/release" &
+    /usr/bin/setsid "$2/holder" "$2/holder-pid" "$2/release" "$6-holder" &
     while [[ ! -s $2/holder-pid ]]; do /bin/sleep 0.01; done
     : >"$3"
-    while :; do /bin/sleep 0.05; done
+    for _ in {1..24000}; do /bin/sleep 0.05; done
+    : >"$6"
   ' _ "$DOT_TEST_ROOT/scripts/benchmark-port.sh" "$close_fixture" \
-      "$close_fixture/ready" "$close_signal" "$close_status" &
+      "$close_fixture/ready" "$close_signal" "$close_status" \
+      "$fixture_expired_dir/close-only-$close_signal" &
     set +m
     close_driver_pid=$!
     for _ in {1..500}; do
@@ -3353,6 +3368,7 @@ EOF
       : >"$cargo_relay_parent_death/downstream-eof"
     ) &
     guarded_output_holder_pid=$!
+    # Self-bounded like the close-only holders, recording its expiry.
     # shellcheck disable=SC2016 # Positional parameters belong to the fixture shell.
     DOT_PERF_TEST_GUARDIAN_PID_FILE="$cargo_relay_parent_death/guardian-pid" \
       DOT_PERF_TEST_RELAY_PID_DIR="$cargo_relay_parent_death/relay-pids" \
@@ -3365,14 +3381,17 @@ EOF
     /usr/bin/setsid /bin/bash --noprofile --norc -c '\''
       trap "" HUP INT QUIT TERM
       printf "%s\n" "$$" >"$1"
-      while :; do /bin/sleep 1; done
-    '\'' escaped "$2" &
+      for _ in {1..1200}; do /bin/sleep 1; done
+      : >"$2"
+    '\'' escaped "$2" "$4-escaped" &
     while [[ ! -s $2 ]]; do /bin/sleep 0.01; done
-    while :; do /bin/sleep 1; done
+    for _ in {1..1200}; do /bin/sleep 1; done
+    : >"$4"
   ' quiet-tree \
       "$cargo_relay_parent_death/target-pid" \
       "$cargo_relay_parent_death/escaped-pid" \
       "$cargo_relay_parent_death/lifecycle-lock" \
+      "$fixture_expired_dir/cargo-relay-parent-death" \
       >"$cargo_relay_parent_death/output" \
       2>"$cargo_relay_parent_death/stderr" &
     cargo_relay_supervisor=$!
@@ -3488,6 +3507,7 @@ EOF
       : >"$cargo_guardian_crash/downstream-eof"
     ) &
     guarded_output_holder_pid=$!
+    # Self-bounded like the close-only holders, recording its expiry.
     # shellcheck disable=SC2016 # Positional parameters belong to the fixture shell.
     DOT_PERF_TEST_GUARDIAN_PID_FILE="$cargo_guardian_crash/guardian-pid" \
       DOT_PERF_TEST_RELAY_PID_DIR="$cargo_guardian_crash/relay-pids" \
@@ -3500,14 +3520,17 @@ EOF
     /usr/bin/setsid /bin/bash --noprofile --norc -c '\''
       trap "" HUP INT QUIT TERM
       printf "%s\n" "$$" >"$1"
-      while :; do /bin/sleep 1; done
-    '\'' escaped "$2" &
+      for _ in {1..1200}; do /bin/sleep 1; done
+      : >"$2"
+    '\'' escaped "$2" "$4-escaped" &
     while [[ ! -s $2 ]]; do /bin/sleep 0.01; done
-    while :; do /bin/sleep 1; done
+    for _ in {1..1200}; do /bin/sleep 1; done
+    : >"$4"
   ' quiet-tree \
       "$cargo_guardian_crash/target-pid" \
       "$cargo_guardian_crash/escaped-pid" \
       "$cargo_guardian_crash/lifecycle-lock" \
+      "$fixture_expired_dir/cargo-guardian-crash" \
       >"$cargo_guardian_crash/output" 2>"$cargo_guardian_crash/stderr" &
     cargo_guardian_coordinator=$!
     guarded_job_pid=$cargo_guardian_coordinator
@@ -3734,6 +3757,7 @@ export DOT_PERF_TEST_SUPERVISOR_DIRECT_PID_FILE='$cargo_unobserved/escaped-pid'
 exec '$cargo_tree/scratch/performance-command-supervisor-barrier-test' "\$@"
 EOF
     chmod 0700 "$cargo_unobserved/supervisor"
+    # Self-bounded like the close-only holders, recording its expiry.
     cat >"$cargo_unobserved/stuck-cargo" <<EOF
 #!/bin/bash
 trap '' HUP INT QUIT TERM
@@ -3743,10 +3767,12 @@ printf '%s\n' "\$PPID" >'$cargo_unobserved/supervisor-pid'
   trap "" HUP INT QUIT TERM
   printf "%s\\n" "\$\$" >"$cargo_unobserved/escaped-pid"
   kill -STOP \$\$
-  while :; do :; done
+  deadline=\$((SECONDS + 1200)); while ((SECONDS < deadline)); do :; done
+  : >"$fixture_expired_dir/cargo-unobserved-escaped"
 ' &
 while [[ ! -s '$cargo_unobserved/escaped-pid' ]]; do :; done
-while :; do :; done
+deadline=\$((SECONDS + 1200)); while ((SECONDS < deadline)); do :; done
+: >'$fixture_expired_dir/cargo-unobserved'
 EOF
     chmod 0700 "$cargo_unobserved/stuck-cargo"
     # The outer pipeline is intentional: before the supervisor proxied command
@@ -3895,6 +3921,7 @@ EOF
     for cancellation_signal in HUP INT QUIT TERM; do
       cargo_cancel=$DOT_TEST_TMP/performance-cargo-cancel-$cancellation_signal
       mkdir -p "$cargo_cancel"
+      # Self-bounded like the close-only holders, recording its expiry.
       cat >"$cargo_cancel/stuck-cargo" <<EOF
 #!/bin/bash
 trap '' HUP INT QUIT TERM
@@ -3903,10 +3930,12 @@ printf '%s\n' "\$\$" >'$cargo_cancel/leader-pid'
   trap "" HUP INT QUIT TERM
   exec </dev/null >/dev/null 2>&1
   printf "%s\\n" "\$\$" >"$cargo_cancel/escaped-pid"
-  while :; do /bin/sleep 1; done
+  for _ in {1..1200}; do /bin/sleep 1; done
+  : >"$fixture_expired_dir/cargo-cancel-$cancellation_signal-escaped"
 ' &
 while [[ ! -s '$cargo_cancel/escaped-pid' ]]; do /bin/sleep 0.01; done
-while :; do /bin/sleep 1; done
+for _ in {1..1200}; do /bin/sleep 1; done
+: >'$fixture_expired_dir/cargo-cancel-$cancellation_signal'
 EOF
       chmod 0700 "$cargo_cancel/stuck-cargo"
       "$cargo_tree/scratch/performance-command-supervisor" -- \
@@ -3976,6 +4005,7 @@ EOF
 
     cargo_parent_death=$DOT_TEST_TMP/performance-cargo-parent-death
     mkdir -p "$cargo_parent_death/scratch/driver-home" "$cargo_parent_death/artifacts"
+    # Self-bounded like the close-only holders, recording its expiry.
     cat >"$cargo_parent_death/stuck-cargo" <<EOF
 #!/bin/bash
 trap '' HUP INT QUIT TERM
@@ -3985,10 +4015,12 @@ printf '%s\n' "\$PPID" >'$cargo_parent_death/supervisor-pid'
   trap "" HUP INT QUIT TERM
   exec </dev/null >/dev/null 2>&1
   printf "%s\\n" "\$\$" >"$cargo_parent_death/escaped-pid"
-  while :; do /bin/sleep 1; done
+  for _ in {1..1200}; do /bin/sleep 1; done
+  : >"$fixture_expired_dir/cargo-parent-death-escaped"
 ' &
 while [[ ! -s '$cargo_parent_death/escaped-pid' ]]; do /bin/sleep 0.01; done
-while :; do /bin/sleep 1; done
+for _ in {1..1200}; do /bin/sleep 1; done
+: >'$fixture_expired_dir/cargo-parent-death'
 EOF
     chmod 0700 "$cargo_parent_death/stuck-cargo"
     bash -c '
@@ -4087,6 +4119,7 @@ EOF
       graceful_status=$((128 + graceful_number))
       cargo_graceful=$DOT_TEST_TMP/performance-cargo-graceful-$graceful_signal
       mkdir -p "$cargo_graceful/scratch/driver-home" "$cargo_graceful/artifacts"
+      # Self-bounded like the close-only holders, recording its expiry.
       cat >"$cargo_graceful/stuck-cargo" <<EOF
 #!/bin/bash
 trap '' HUP INT QUIT TERM
@@ -4096,10 +4129,12 @@ printf '%s\n' "\$PPID" >'$cargo_graceful/supervisor-pid'
   trap "" HUP INT QUIT TERM
   exec </dev/null >/dev/null 2>&1
   printf "%s\\n" "\$\$" >"$cargo_graceful/escaped-pid"
-  while :; do /bin/sleep 1; done
+  for _ in {1..1200}; do /bin/sleep 1; done
+  : >"$fixture_expired_dir/cargo-graceful-$graceful_signal-escaped"
 ' &
 while [[ ! -s '$cargo_graceful/escaped-pid' ]]; do /bin/sleep 0.01; done
-while :; do /bin/sleep 1; done
+for _ in {1..1200}; do /bin/sleep 1; done
+: >'$fixture_expired_dir/cargo-graceful-$graceful_signal'
 EOF
       chmod 0700 "$cargo_graceful/stuck-cargo"
       # Monitor mode keeps SIGINT/SIGQUIT trappable in the backgrounded
@@ -4811,5 +4846,9 @@ perf_prepare_provider_run_root "$provider_sealed" "$provider_bin/shdeps" \
   fail 'run-root identity mismatch'
 "$provider_run/target/release/shdeps" version | grep -q "$provider_short" ||
   fail 'staged binary does not match run-root HEAD'
+
+expired_fixtures=$(ls -A "$fixture_expired_dir")
+[[ -z $expired_fixtures ]] ||
+  fail "self-bounded fixtures ran out instead of being stopped: $expired_fixtures"
 
 printf 'release-scripts-test: ok\n'

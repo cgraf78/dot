@@ -124,8 +124,12 @@ fn executable_probe_retries_text_busy_until_writer_closes() {
     let scope = TempDir::new_exec("commands-text-busy").expect("exec dir");
     let script = scope.path().join("probe.sh");
     let marker = scope.path().join("probe-ran");
-    std::fs::write(&script, "#!/bin/sh\nprintf ready >\"$1\"\n").expect("write");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    dot_test_support::install_fixture_executable(
+        &script,
+        "#!/bin/sh\nprintf ready >\"$1\"\n",
+        0o755,
+    )
+    .expect("install fixture");
     let mut writer = Some(
         std::fs::OpenOptions::new()
             .write(true)

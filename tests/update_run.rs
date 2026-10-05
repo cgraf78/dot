@@ -1081,8 +1081,7 @@ exec '{}' "$@"
         real.display()
     );
     let git = dir.join("git");
-    std::fs::write(&git, script).expect("wrapper");
-    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).expect("wrapper mode");
+    dot_test_support::install_fixture_executable(&git, script, 0o755).expect("install wrapper");
     dir
 }
 

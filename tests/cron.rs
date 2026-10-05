@@ -13,18 +13,13 @@ fn exec_test() -> std::sync::MutexGuard<'static, ()> {
 
 /// Write `body` as an executable `crontab` fixture inside an
 /// exec-capable directory and return the guard. The target dir is
-/// exec-capable by construction (see [`TempDir::new_exec`]); the
-/// caller chmods explicitly because the harness must exec the byte
-/// it just wrote.
+/// exec-capable by construction (see [`TempDir::new_exec`]), and the
+/// fixture helper applies the mode itself, because the harness must
+/// exec the bytes it just wrote.
 fn fixture_bin(tag: &str, body: &str) -> TempDir {
-    use std::os::unix::fs::PermissionsExt as _;
     let dir = TempDir::new_exec(tag).expect("fixture dir");
-    dir.write("crontab", body.as_bytes());
-    std::fs::set_permissions(
-        dir.path().join("crontab"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .expect("chmod fixture");
+    dot_test_support::install_fixture_executable(dir.path().join("crontab"), body, 0o755)
+        .expect("crontab fixture");
     dir
 }
 

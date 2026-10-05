@@ -867,12 +867,19 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         let ready = scratch.path().join("ps.ready");
         let ps = bin.join("ps");
-        // The readiness probe exits before touching the ready marker.
+        // The readiness probe exits before touching the ready marker. The
+        // probe ignores TERM, so it bounds itself: at least 120s, twice the
+        // 60s that `acquire` gets below, so an `acquire` that waited it out
+        // still fails, yet a helper that panicked before reaping it leaves
+        // nothing behind. PATH will hold only this `ps`, so `sleep` is
+        // resolved off the ambient PATH now and baked in.
+        let sleep = dot_test_support::real_tool("sleep");
         dot_test_support::publish_fixture_script(
             &ps,
             &format!(
-                ": >'{}'\ntrap '' TERM\nwhile :; do sleep 1; done\n",
-                ready.display()
+                ": >'{}'\ntrap '' TERM\ni=0\nwhile [ \"$i\" -lt 120 ]; do '{}' 1; i=$((i + 1)); done\n",
+                ready.display(),
+                sleep.display()
             ),
         )
         .unwrap();
@@ -897,12 +904,22 @@ mod tests {
             // SAFETY: the helper owns an installed SIGTERM handler.
             assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
         });
+        let started = std::time::Instant::now();
         let result = acquire(scratch.path(), false, &test_log(), None, &mut Vec::new());
+        let elapsed = started.elapsed();
         sender.join().unwrap();
         let status = signals.finish(if result.is_ok() { 0 } else { 1 });
 
         assert_eq!(status, 128 + libc::SIGTERM);
         assert_eq!(read_owner(&lock), Some(owner));
+        // Teardown takes at most about 20s even with late walks (1s TERM
+        // grace, about 1.5s hard phase, then up to three late walks, each
+        // starting within the 5s budget), so 60s leaves room for a loaded
+        // host while waiting out the 120s fixture still fails.
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "acquire waited {elapsed:?} for the interrupted probe"
+        );
     }
 
     #[test]

@@ -89,7 +89,8 @@ def stop(signum, _frame):
 signal.signal(signal.SIGTERM, stop)
 Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
 Path(sys.argv[2]).write_text("ready", encoding="utf-8")
-while True:
+# TERM only logs, so give up after at least 1200s, past every suite timeout.
+for _ in range(24000):
     time.sleep(0.05)
 """
     child = subprocess.Popen(
@@ -383,7 +384,8 @@ def term(signum, _frame):
 signal.signal(signal.SIGTERM, term)
 Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
 Path(sys.argv[3]).write_text("ready", encoding="utf-8")
-while True:
+# TERM only logs, so give up after at least 1200s, past every suite timeout.
+for _ in range(60000):
     time.sleep(0.02)
 '''
 for depth in (1, 2):
@@ -666,9 +668,12 @@ if child == 0:
         maximum = 65536
     os.closerange(3, keep)
     os.closerange(keep + 1, maximum)
-    while True: time.sleep(1)
+    # Both ignore TERM, so give up after at least 1200s, past every suite
+    # timeout.
+    for _ in range(1200): time.sleep(1)
+    os._exit(0)
 open(sys.argv[2], "w", encoding="ascii").write("ready")
-while True: time.sleep(1)
+for _ in range(1200): time.sleep(1)
 '''
 with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary)
@@ -1464,8 +1469,11 @@ if owner == 0:
         os._exit(9)
     os.close(ready_write)
     os.close(sink)
-    while True:
+    # Only the KILL below ends this owner, and a failed assertion skips it,
+    # so give up after at least 1200s, past every suite timeout.
+    for _ in range(1200):
         time.sleep(1)
+    os._exit(0)
 
 os.close(ready_write)
 os.close(sink)
@@ -1540,11 +1548,13 @@ module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
 module.os.pidfd_open = None
 module.signal.pidfd_send_signal = None
+# Both loops give up after at least 1200s, past every suite timeout, in case
+# this helper dies before the escaped member is killed.
 script = """
 trap 'exit 0' TERM
-(trap '' TERM; printf '%s\\n' "$BASHPID" >"$1"; while :; do sleep 1; done) &
+(trap '' TERM; printf '%s\\n' "$BASHPID" >"$1"; for _ in {1..1200}; do sleep 1; done) &
 while [[ ! -s $1 ]]; do sleep 0.01; done
-while :; do sleep 1; done
+for _ in {1..1200}; do sleep 1; done
 """
 status = module.main(["test-timeout-v1", "0.5", "/bin/bash", "-c", script, "fixture", sys.argv[2]])
 pid = int(Path(sys.argv[2]).read_text(encoding="ascii"))

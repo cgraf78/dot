@@ -20,9 +20,8 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use dot_test_support::TempDir;
 
 fn write_exec(path: &Path, body: &[u8]) {
-    std::fs::write(path, body).expect("write executable fixture");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod executable fixture");
+    dot_test_support::install_fixture_executable(path, body, 0o755)
+        .expect("install executable fixture");
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -176,6 +175,11 @@ impl Fixture {
         std::fs::create_dir_all(&state).expect("state");
         std::fs::create_dir_all(&provider).expect("provider");
         let installer = provider.join("install.sh");
+        // Modes that idle until Dot's teardown ends them (and the prompt
+        // helper's after-signal mode) give up on their own after at least
+        // 300s: far past these tests' deadlines of at most 30s per wait, so
+        // teardown is still what ends them, yet a failed run cannot leave
+        // one running forever.
         write_exec(
             &installer,
             br#"#!/usr/bin/env bash
@@ -325,12 +329,14 @@ case ${1:-} in
       (
         trap '' HUP INT QUIT TERM
         printf '%s\n' "$BASHPID" >"$DOT_TEST_PROVIDER_HANG_DESCENDANT_PID"
-        while :; do sleep 1; done
+        for ((round = 0; round < 300; round++)); do sleep 1; done
       ) </dev/null >/dev/null 2>&1 &
       descendant=$!
       trap 'printf "%s\n" TERM >>"$DOT_TEST_PROVIDER_SIGNAL_RECORD"; kill -KILL -- "-$descendant" 2>/dev/null || true; wait "$descendant" 2>/dev/null || true; exit 143' TERM
       printf '%s\n' "$BASHPID" >"$DOT_TEST_PROVIDER_HANG_PID"
-      while :; do wait || true; done
+      # `wait` returns only for a trapped signal or once the descendant has
+      # gone; the cap just stops an instant-return spin after that.
+      for ((round = 0; round < 1000; round++)); do wait || true; done
     fi
     if [[ ${DOT_TEST_PROVIDER_LIVE_OUTPUT:-0} == 1 ]]; then
       trap '' TERM
@@ -340,7 +346,7 @@ case ${1:-} in
       printf '%s\n' "$BASHPID" >"$DOT_TEST_PROVIDER_LIVE_PID"
       # An orphaned sleep holds the lifetime lease until it exits; keep the
       # idle granularity an order of magnitude under the lease-proof deadline.
-      while :; do sleep 0.1; done
+      for ((round = 0; round < 3000; round++)); do sleep 0.1; done
     fi
     if [[ -n ${DOT_TEST_PROVIDER_OVERFLOW_STREAM:-} ]]; then
       trap ': >"$DOT_TEST_PROVIDER_OVERFLOW_STOPPED"; exit 143' TERM
@@ -354,7 +360,7 @@ case ${1:-} in
           printf '%s' "$flood" >&2
         fi
       done
-      while :; do sleep 1; done
+      for ((round = 0; round < 300; round++)); do sleep 1; done
     fi
     if [[ ${DOT_TEST_PROVIDER_MANY_EVENTS:-0} == 1 ]]; then
       trap ': >"$DOT_TEST_PROVIDER_MANY_EVENTS_STOPPED"; exit 143' TERM
@@ -365,7 +371,7 @@ case ${1:-} in
       done
       printf '%s\n' \
         '{"event":"summary","status":"changed","changed":1,"warnings":0,"current":0,"skipped":0,"failed":0}'
-      while :; do sleep 1; done
+      for ((round = 0; round < 300; round++)); do sleep 1; done
     fi
     if [[ ${DOT_TEST_PROVIDER_BACKPRESSURE:-0} == 1 ]]; then
       trap 'printf "%s\n" INT >"$DOT_TEST_PROVIDER_BACKPRESSURE_SIGNAL"; exit 130' INT
@@ -384,7 +390,7 @@ case ${1:-} in
       # Bash defers a TERM trap across a foreground sleep while teardown
       # grace is one second; keep the idle granularity an order of
       # magnitude under it so the trap always wins.
-      while :; do sleep 0.1; done
+      for ((round = 0; round < 3000; round++)); do sleep 0.1; done
     fi
     if [[ ${DOT_TEST_PROVIDER_BACKPRESSURE_EXIT130:-0} == 1 ]]; then
       printf '%s\n' "$BASHPID" >"$DOT_TEST_PROVIDER_BACKPRESSURE_PID"
@@ -418,7 +424,7 @@ case ${1:-} in
       (
         trap 'kill -STOP "$dot_pid"; printf "%s\n" TERM >"$DOT_TEST_PROVIDER_TEARDOWN_SIGNAL"; kill -INT "$dot_pid"; kill -CONT "$dot_pid"; trap "" TERM; exec sleep 30' TERM
         printf '%s\n' "$BASHPID" >"$DOT_TEST_PROVIDER_TEARDOWN_PID"
-        while :; do sleep 1; done
+        for ((round = 0; round < 300; round++)); do sleep 1; done
       ) </dev/null >/dev/null 2>&1 &
       teardown_descendant=$!
       trap 'kill -KILL -- "-$teardown_descendant" 2>/dev/null || true; wait "$teardown_descendant" 2>/dev/null || true; exit 143' TERM
@@ -706,7 +712,7 @@ if mode == "after-signal":
     token = acknowledgement()
     if token is not None:
         Path(record).write_bytes(token + b"\n")
-    while True:
+    for _ in range(300):
         time.sleep(1)
 raise SystemExit(2)
 "#,
@@ -863,6 +869,9 @@ raise SystemExit(2)
     fn development_git_path(&self) -> std::ffi::OsString {
         let bin = self._scratch.path().join("development-git-bin");
         std::fs::create_dir_all(&bin).expect("development Git bin");
+        // The TERM-ignoring `block` query gives up after at least 300s, far
+        // past these tests' deadlines, and then fails instead of running
+        // the real query.
         write_exec(
             &bin.join("git"),
             br#"#!/bin/sh
@@ -879,7 +888,9 @@ case ${DOT_TEST_DEVELOPMENT_GIT_MODE:-} in
   block)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_DEVELOPMENT_GIT_READY"
-    while :; do sleep 1; done
+    i=0
+    while [ "$i" -lt 300 ]; do sleep 1; i=$((i + 1)); done
+    exit 1
     ;;
   overflow)
     trap ': >"$DOT_TEST_DEVELOPMENT_GIT_STOPPED"; exit 143' TERM
@@ -941,6 +952,8 @@ cp "$DOT_TEST_PROVIDER_DIR/install.sh" "$out"
     fn adversarial_curl_path(&self) -> std::ffi::OsString {
         let bin = self.home.join("adversarial-curl-bin");
         std::fs::create_dir_all(&bin).expect("adversarial curl bin");
+        // This curl ignores TERM, so it gives up on its own after at least
+        // 300s, far past these tests' deadlines.
         write_exec(
             &bin.join("curl"),
             br#"#!/bin/sh
@@ -958,7 +971,8 @@ case ${DOT_TEST_CURL_MODE:-flood} in
   stall) ;;
   *) exit 2 ;;
 esac
-while :; do sleep 1; done
+i=0
+while [ "$i" -lt 300 ]; do sleep 1; i=$((i + 1)); done
 "#,
         );
         let current = std::env::var_os("PATH").unwrap_or_default();
@@ -1194,8 +1208,19 @@ esac
         let checkout = root.join("shdeps");
         std::fs::create_dir_all(&checkout).expect("development checkout");
         for name in ["install.sh", "shdeps.sh", "shdeps"] {
-            std::fs::copy(self.provider.join(name), checkout.join(name))
-                .expect("copy development file");
+            let source = self.provider.join(name);
+            let mode = std::fs::metadata(&source)
+                .expect("development file mode")
+                .permissions()
+                .mode()
+                & 0o7777;
+            if mode & 0o111 != 0 {
+                let body = std::fs::read(&source).expect("read development file");
+                dot_test_support::install_fixture_executable(checkout.join(name), body, mode)
+                    .expect("copy development file");
+            } else {
+                std::fs::copy(&source, checkout.join(name)).expect("copy development file");
+            }
         }
         git(&checkout, &["init", "-q"]);
         git(&checkout, &["config", "user.name", "fixture"]);

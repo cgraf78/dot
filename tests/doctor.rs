@@ -5,7 +5,6 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 
@@ -564,10 +563,17 @@ impl Drop for GuardedProbeSession {
 /// Hanging doctor extension `NN-hang<suffix>.sh`: traps every forwarded
 /// signal into a marker, records its PID, and starts an escaped-group
 /// descendant that ignores everything but TERM.
+///
+/// Neither process ends on a signal short of KILL, so both bound
+/// themselves. The descendant idles for at least 300s, far past the
+/// caller's 35s of readiness, exit and cleanup deadlines. The worker's
+/// `wait` returns only for a trapped signal or after the descendant has
+/// gone, so its cap is unreachable inside the test; it just keeps the
+/// worker from spinning on an instantly returning `wait` afterwards.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn hanging_extension(suffix: &str) -> Vec<u8> {
     format!(
-        "doctor() {{\n  trap 'printf \"%s\\n\" HUP >>\"$HOME/doctor-worker{suffix}-signal\"' HUP\n  trap 'printf \"%s\\n\" INT >>\"$HOME/doctor-worker{suffix}-signal\"' INT\n  trap 'printf \"%s\\n\" QUIT >>\"$HOME/doctor-worker{suffix}-signal\"' QUIT\n  trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker{suffix}-signal\"' TERM\n  set -m\n  (\n    trap '' HUP INT QUIT\n    trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker{suffix}-descendant-signal\"' TERM\n    printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker{suffix}-descendant\"\n    while :; do sleep 1; done\n  ) </dev/null >/dev/null 2>&1 &\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker{suffix}\"\n  while :; do wait || true; done\n}}\n"
+        "doctor() {{\n  trap 'printf \"%s\\n\" HUP >>\"$HOME/doctor-worker{suffix}-signal\"' HUP\n  trap 'printf \"%s\\n\" INT >>\"$HOME/doctor-worker{suffix}-signal\"' INT\n  trap 'printf \"%s\\n\" QUIT >>\"$HOME/doctor-worker{suffix}-signal\"' QUIT\n  trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker{suffix}-signal\"' TERM\n  set -m\n  (\n    trap '' HUP INT QUIT\n    trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker{suffix}-descendant-signal\"' TERM\n    printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker{suffix}-descendant\"\n    i=0; while [ \"$i\" -lt 300 ]; do sleep 1; i=$((i + 1)); done\n  ) </dev/null >/dev/null 2>&1 &\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker{suffix}\"\n  i=0; while [ \"$i\" -lt 1000 ]; do wait || true; i=$((i + 1)); done\n}}\n"
     )
     .into_bytes()
 }
@@ -1064,23 +1070,21 @@ fn host_git_wrapper_running(
         }
         let log = dir.path().join("git.log");
         let wrapper = dir.path().join("git");
-        std::fs::write(
+        dot_test_support::install_fixture_executable(
             &wrapper,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\n{snippet}exec '{}' \"$@\"\n",
                 log.display(),
                 real.display()
             ),
+            0o755,
         )
-        .expect("git wrapper");
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
-            .expect("wrapper mode");
+        .expect("install wrapper");
         // A `noexec` mount refuses to run it: try the next root. The probe
-        // asks for `--exec-path`, which no snippet reacts to. A sibling test
-        // thread that forks while this one still has the file open for
-        // writing makes exec fail with ETXTBSY until that child execs, and a
-        // saturated host can refuse the fork (EAGAIN); both transient
-        // refusals are retried, never read as `noexec`.
+        // asks for `--exec-path`, which no snippet reacts to. The fixture
+        // helper never leaves this process holding a writer, so ETXTBSY is
+        // not expected; it is still retried defensively, as is a saturated
+        // host refusing the fork (EAGAIN), and neither is read as `noexec`.
         let mut attempts = 0;
         let probe = loop {
             let probe = Command::new(&wrapper)
@@ -1219,17 +1223,16 @@ fn extensions_disabled_doctor_does_not_execute_bash_startup_code() {
     let state = TempDir::new("doctor-native-no-bash-code-state").expect("state");
     let marker = home.path().join("startup-ran");
     let bash = home.path().join("bash-probe");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &bash,
         format!(
             "#!/bin/sh\nprintf ran >'{}'\nexec '{}' \"$@\"\n",
             marker.display(),
             dot_test_support::bash().display()
         ),
+        0o755,
     )
-    .expect("Bash probe");
-    std::fs::set_permissions(&bash, std::fs::Permissions::from_mode(0o755))
-        .expect("Bash probe mode");
+    .expect("install Bash probe");
 
     let native = command(
         false,
@@ -1815,9 +1818,10 @@ fn in_process_doctor_uses_runtime_identity_probe() {
     std::fs::create_dir_all(&profiles).expect("profiles directory");
     std::fs::create_dir_all(&selectors).expect("selectors directory");
     let id = bin.join("id");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &id,
         b"#!/bin/sh\ncase $1 in\n  -u) exec /usr/bin/id -u ;;\n  -un) printf 'runtime-user\\n' ;;\nesac\n",
+        0o755,
     )
     .expect("id probe");
     std::fs::write(profiles.join("base.conf"), b"version=1\noverlays=core\n")
@@ -1829,7 +1833,6 @@ fn in_process_doctor_uses_runtime_identity_probe() {
     .expect("web profile");
     let selector = selectors.join("10-runtime.conf");
     std::fs::write(&selector, b"version=1\nuser=runtime-user\nprofile=web\n").expect("selector");
-    seal(&id, 0o755);
     seal(&selectors, 0o700);
     seal(&selector, 0o600);
     let (_, stdout, stderr) = run_in_process(
@@ -2887,8 +2890,8 @@ fn hand_updated_host_reports_its_last_run_end_to_end() {
     }
     let cron = TempDir::new_exec("doctor-last-run-crontab").expect("cron tools");
     let crontab = cron.path().join("crontab");
-    std::fs::write(&crontab, b"#!/bin/sh\nexit 0\n").expect("crontab");
-    seal(&crontab, 0o755);
+    dot_test_support::install_fixture_executable(&crontab, b"#!/bin/sh\nexit 0\n", 0o755)
+        .expect("crontab");
     let without_cron = tools.path().display().to_string();
     let with_cron = format!("{}:{without_cron}", cron.path().display());
     // With a `crontab` on PATH the host could schedule cron, so a cron
@@ -3314,7 +3317,7 @@ fn latest_provider(home: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
     )
     .expect("installer");
     std::fs::write(provider.join("shdeps.sh"), b"# fixture library\n").expect("library");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         provider.join("shdeps"),
         br#"#!/usr/bin/env bash
 doctor_hang() {
@@ -3345,9 +3348,9 @@ if [[ ${1:-} == __api && ${2:-} == capability ]]; then
 fi
 exit 2
 "#,
+        0o755,
     )
     .expect("binary");
-    seal(&provider.join("shdeps"), 0o755);
     git(&provider, &["init", "-q", "-b", "main"]);
     git(&provider, &["config", "user.name", "fixture"]);
     git(

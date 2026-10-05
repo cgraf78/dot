@@ -339,7 +339,6 @@ pub fn jq_layer(
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -542,15 +541,15 @@ mod cancellation_tests {
         // Publish the PID atomically (write then rename) so the parent can
         // always parse it once the ready file exists. PATH holds only `bin`,
         // so the rename uses an absolute `/bin/mv`.
-        std::fs::write(
+        dot_test_support::install_fixture_executable(
             &jq,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$$\" >'{ready}.tmp'\n/bin/mv '{ready}.tmp' '{ready}'\ntrap '' TERM\ni=0\nwhile [ \"$i\" -lt {FIXTURE_LIFETIME_SECS} ]; do /bin/sleep 1; i=$((i + 1)); done\n",
                 ready = ready.display()
             ),
+            0o755,
         )
         .unwrap();
-        std::fs::set_permissions(&jq, std::fs::Permissions::from_mode(0o755)).unwrap();
         // SAFETY: this recursive helper is the only test in its process.
         unsafe { std::env::set_var("PATH", &bin) };
         let source = scratch.join("source.json");

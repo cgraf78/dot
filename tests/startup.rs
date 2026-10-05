@@ -2,7 +2,6 @@
 //! re-exec protection, command bytes, permissions, and provenance.
 
 use std::ffi::OsStr;
-use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -515,16 +514,15 @@ fn binary_applies_umask_ceiling_and_preserves_stricter_masks() {
     let suites = fixture.path().join("suites");
     std::fs::create_dir_all(&suites).expect("suites");
     let suite = suites.join("mode-test");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &suite,
         format!(
             "#!{}\numask >\"$HOME/observed-umask\"\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"\n",
             dot_test_support::bash().display()
         ),
+        0o755,
     )
-    .expect("suite");
-    std::fs::set_permissions(&suite, std::fs::Permissions::from_mode(0o755))
-        .expect("suite permissions");
+    .expect("install suite");
 
     for (inherited, expected) in [(0o000, 0o022), (0o077, 0o077)] {
         let home = fixture.path().join(format!("home-{inherited:03o}"));
@@ -731,16 +729,16 @@ fn reexec_guard_probes_git_only_when_a_revision_is_expected() {
     .find(|path| path.is_file())
     .expect("system git");
     let shim = scope.path().join("git");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &shim,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
             log.display(),
             real.display()
         ),
+        0o755,
     )
-    .expect("git shim");
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("shim mode");
+    .expect("install shim");
     // The shim is the only Git on PATH. Its fixture root may sit inside the
     // Dot checkout, which host-Git selection excludes; with nothing else to
     // select, the engine falls back to PATH lookup, so the shim observes

@@ -1,7 +1,6 @@
 //! Native byte contracts for the Shdeps progress renderers.
 
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt as _;
 
 use dot::progress_ui::Palette;
 use dot::shdeps_ui_render::{
@@ -118,8 +117,8 @@ fn section(live: bool, label: &[u8]) -> Vec<u8> {
 }
 
 fn stage_exec(path: &std::path::Path) {
-    std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("probe");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    dot_test_support::install_fixture_executable(path, b"#!/bin/sh\nexit 0\n", 0o755)
+        .expect("install fixture");
 }
 
 #[test]

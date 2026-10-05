@@ -9,8 +9,14 @@ fn euid() -> u32 {
 fn file(root: &Path, name: &str, body: &[u8], mode: u32) -> std::path::PathBuf {
     let p = root.join(name);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-    std::fs::write(&p, body).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    // An executable fixture is created by a child so this process never holds
+    // a writer to it (see `install_fixture_executable`).
+    if mode & 0o111 != 0 {
+        dot_test_support::install_fixture_executable(&p, body, mode).unwrap();
+    } else {
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
     p
 }
 fn matches() -> MatchInputs {
