@@ -1047,6 +1047,10 @@ fn host_git_wrapper_running(
 ) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
     let checkout = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("checkout");
     let real = dot_test_support::real_tool("git");
+    // Why each candidate root was refused, so a failure names its cause
+    // (inside the checkout, noexec, an exhausted transient retry, or a
+    // failing probe).
+    let mut refused = Vec::new();
     for exec_root in [false, true] {
         let dir = if exec_root {
             TempDir::new_exec(label)
@@ -1055,6 +1059,7 @@ fn host_git_wrapper_running(
         }
         .expect("wrapper directory");
         if dir.path().starts_with(&checkout) {
+            refused.push(format!("{}: inside the checkout", dir.path().display()));
             continue;
         }
         let log = dir.path().join("git.log");
@@ -1095,13 +1100,26 @@ fn host_git_wrapper_running(
                 probe => break probe,
             }
         };
-        if probe.is_ok_and(|status| status.success()) {
-            let _ = std::fs::remove_file(&log);
-            return (dir, wrapper, log);
+        match probe {
+            Ok(status) if status.success() => {
+                let _ = std::fs::remove_file(&log);
+                return (dir, wrapper, log);
+            }
+            Ok(status) => refused.push(format!("{}: probe {status}", dir.path().display())),
+            // A noexec mount fails on the first attempt; only a transient
+            // refusal that outlasted its retries reports a count.
+            Err(error) if attempts == 0 => {
+                refused.push(format!("{}: {error}", dir.path().display()))
+            }
+            Err(error) => refused.push(format!(
+                "{}: {error} after {attempts} transient retries",
+                dir.path().display()
+            )),
         }
     }
     panic!(
-        "no exec-capable fixture directory outside the checkout {} for the host Git wrapper",
+        "no exec-capable fixture directory outside the checkout {} for the host Git wrapper \
+         (refused: {refused:?})",
         checkout.display()
     );
 }

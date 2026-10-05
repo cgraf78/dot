@@ -143,7 +143,9 @@ struct Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.stop(libc::SIGTERM);
+            if let Err(error) = child.stop(libc::SIGTERM) {
+                eprintln!("DOT_TEARDOWN_FAIL: {error:?}");
+            }
         }
     }
 }
@@ -164,7 +166,12 @@ impl Workers {
             .iter_mut()
             .filter_map(|worker| worker.child.take())
             .collect();
-        let _ = crate::cleanup::stop_owned_sessions(&mut children, libc::SIGTERM);
+        for error in crate::cleanup::stop_owned_sessions(&mut children, libc::SIGTERM)
+            .into_iter()
+            .filter_map(std::result::Result::err)
+        {
+            eprintln!("DOT_TEARDOWN_FAIL: {error:?}");
+        }
     }
 }
 
