@@ -297,7 +297,7 @@ fn stages_preserve_gating_state_and_sequence() {
 }
 
 #[test]
-fn completion_reload_shell_clock_and_json_contracts() {
+fn completion_reload_and_warning_contracts() {
     let p = palette();
     assert_eq!(
         done(&p, false, Some("0"), 10, 13, b""),
@@ -321,39 +321,7 @@ fn completion_reload_shell_clock_and_json_contracts() {
         reload_hint(None, None, false, false),
         b"Reload your shell: source ~/.zshrc"
     );
-    for (path, expected) in [
-        ("/bin/bash", Some("bash")),
-        ("-zsh", Some("zsh")),
-        ("/bin/fish", None),
-        ("", None),
-    ] {
-        assert_eq!(normal_shell_name(path), expected);
-    }
-    assert_eq!(
-        parent_shell_name(Some("bash\n"), Some("zsh")),
-        Some("zsh".into())
-    );
-    assert_eq!(
-        parent_shell_name(Some("fish"), Some("  zsh\nextra")),
-        Some("zsh".into())
-    );
     assert_eq!(warn_line(&p, b"careful"), b"<Y>careful<R>\n");
-    assert_eq!(now_ms("1700000000123", 1), b"1700000000123");
-    assert_eq!(now_ms("bad", 42), b"42000");
-    let json = br#"{"name":"dot","count":12,"zero":0,"negative":-2}"#;
-    let have_jq = dot::merge_hooks::jq_available();
-    for jq in [false, true].into_iter().filter(|jq| !*jq || have_jq) {
-        let expected = |value: &[u8]| [value, b"\n"].concat();
-        assert_eq!(json_get("name", json, jq), expected(b"dot"));
-        assert_eq!(json_num("count", json, jq), expected(b"12"));
-        assert_eq!(json_num("zero", json, jq), expected(b"0"));
-        assert_eq!(
-            json_num("negative", json, jq),
-            if jq { expected(b"-2") } else { vec![] }
-        );
-        assert_eq!(json_get("missing", json, jq), b"");
-    }
-    assert_eq!(json_num("count", b"not-json", false), b"");
 }
 
 #[test]
@@ -422,65 +390,6 @@ fn header_progress_and_reload_gate_matrices_are_complete() {
         ),
     ] {
         assert_eq!(reload_hint(None, shell, bashrc, zshrc), expected.as_bytes());
-    }
-}
-
-#[test]
-fn clock_and_json_edge_matrices_are_explicit() {
-    for (stamp, seconds, expected) in [
-        ("1757068800123", 7, "1757068800123"),
-        ("0", 99, "0"),
-        ("0007", 3, "0007"),
-        ("", 7, "7000"),
-        ("abc", 7, "7000"),
-        ("12a34", 7, "7000"),
-        (" 12", 7, "7000"),
-        ("12 ", 7, "7000"),
-        ("+12", 7, "7000"),
-        ("-12", 7, "7000"),
-        ("1\n2", 7, "7000"),
-        ("12.5", 7, "7000"),
-    ] {
-        assert_eq!(now_ms(stamp, seconds), expected.as_bytes(), "{stamp:?}");
-    }
-    let have_jq = dot::merge_hooks::jq_available();
-    for (line, key, fallback, jq_expected) in [
-        (
-            r#"{"event":"done","index":3}"#,
-            "event",
-            b"done\n".as_slice(),
-            b"done\n".as_slice(),
-        ),
-        (r#"{"event":"done","index":3}"#, "index", b"", b"3\n"),
-        (r#"{"e":""}"#, "e", b"\n", b"\n"),
-        (
-            r#"{"k":"first","k":"second"}"#,
-            "k",
-            b"second\n",
-            b"second\n",
-        ),
-        (r#"{"k" : "spaced"}"#, "k", b"", b"spaced\n"),
-        ("not json", "event", b"", b""),
-    ] {
-        assert_eq!(json_get(key, line.as_bytes(), false), fallback);
-        if have_jq {
-            assert_eq!(json_get(key, line.as_bytes(), true), jq_expected);
-        }
-    }
-    for (line, fallback, jq_expected) in [
-        (r#"{"n":42}"#, b"42\n".as_slice(), b"42\n".as_slice()),
-        (r#"{"n":0}"#, b"0\n", b"0\n"),
-        (r#"{"n":1.5}"#, b"1\n", b"1.5\n"),
-        (r#"{"n":-5}"#, b"", b"-5\n"),
-        (r#"{"n":"42"}"#, b"", b""),
-        (r#"{"n":true}"#, b"", b""),
-        (r#"{"n":null}"#, b"", b""),
-        ("not json", b"", b""),
-    ] {
-        assert_eq!(json_num("n", line.as_bytes(), false), fallback);
-        if have_jq {
-            assert_eq!(json_num("n", line.as_bytes(), true), jq_expected);
-        }
     }
 }
 

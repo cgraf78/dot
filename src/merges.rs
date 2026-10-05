@@ -2,12 +2,10 @@
 //!
 //! Ports the dependency-light majority of `lib/dot/merges.sh`:
 //! label derivation, serial detection, job-count selection, result
-//! summaries, result-file prefixes, progress details, hook-spec
-//! collection (sort keys, identity checks, duplicate detection, and
-//! the `LC_ALL=C` sort), and the merge-result parse plus render
-//! halves of `_print_merge_result`. The capture decision kernel of
-//! `_print_merge_capture` is here too, as a data-only outcome — the
-//! logfile and warning rendering stays with the shell UI layer.
+//! summaries, progress details, hook-spec collection (sort keys,
+//! identity checks, duplicate detection, and the `LC_ALL=C` sort),
+//! and the merge-result parse plus render halves of
+//! `_print_merge_result`.
 //!
 //! The coordinator below owns the remaining update path: discovery through
 //! the shared extension-trust checks, bounded batches, serial barriers, and
@@ -32,13 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Instant;
 
-use crate::merge_block::trim_shell_space;
-use crate::progress_ui::{self, Heartbeat, Palette, arith_value};
-
-/// `_merge_trim`: strip shell whitespace from both ends.
-pub fn trim(line: &str) -> &str {
-    trim_shell_space(line)
-}
+use crate::progress_ui::{self, Heartbeat, Palette};
 
 /// Strip one trailing `suffix` from `name`, like the shell
 /// `${_base%.sh}` / `${_base%.serial}` (exactly one occurrence).
@@ -72,12 +64,6 @@ pub fn label_from_script(path: &OsStr) -> OsString {
         return OsString::from_vec(stem[digits + 1..].to_vec());
     }
     key
-}
-
-/// `_merge_hook_is_serial`: true when the script path ends in
-/// `.serial.sh` (the shell tests `$2`, ignoring the key).
-pub fn is_serial(script: &str) -> bool {
-    script.ends_with(".serial.sh")
 }
 
 /// True for an all-ASCII-digit, non-empty job count (`case ''
@@ -216,11 +202,6 @@ pub fn warning_summary(total: i64, failed: i64) -> String {
     format!("{}, {}", summary(total - failed), failure_summary(failed))
 }
 
-/// `_merge_result_prefix`: `<dir>/<idx zero-padded to 3>`.
-pub fn result_prefix(dir: &str, index: u64) -> String {
-    format!("{dir}/{index:03}")
-}
-
 /// `_merge_progress_detail`: the hook label cell plus bar for
 /// `done/total`. Merge hook filenames already define the durable
 /// hook identity, so this stays generic over the label exactly like
@@ -272,44 +253,6 @@ pub fn hook_progress_detail(
 fn counted_ui(raw: Option<&str>) -> bool {
     raw.and_then(progress_ui::arith_value)
         .is_some_and(|value| value > 0)
-}
-
-/// Split a captured hook log the way `_print_merge_result` reads
-/// it: shell-whitespace-trimmed lines with empties dropped; the
-/// first surviving line is the display label and the rest are
-/// detail rows. Splits on `\n` only — the shell `read` sees `\r`
-/// as content, so [`str::lines`] (which strips it) would diverge.
-pub fn parse_result_log(log: &str) -> (Option<String>, Vec<String>) {
-    let body = log.strip_suffix('\n').unwrap_or(log);
-    if body.is_empty() {
-        return (None, Vec::new());
-    }
-    let mut label = None;
-    let mut details = Vec::new();
-    for line in body.split('\n') {
-        let trimmed = trim(line);
-        if trimmed.is_empty() {
-            continue;
-        }
-        if label.is_none() {
-            label = Some(trimmed.to_string());
-        } else {
-            details.push(trimmed.to_string());
-        }
-    }
-    (label, details)
-}
-
-/// `_print_merge_result` label resolution: the first non-blank log
-/// line, or the [script-stem label](label_from_script) when the log
-/// carries none. Verbose hooks own their first output line as the
-/// display label; the runner stays generic.
-pub fn result_label(script: &OsStr, log: &str) -> (OsString, Vec<String>) {
-    let (label, details) = parse_result_log(log);
-    match label {
-        Some(label) => (OsString::from(label), details),
-        None => (label_from_script(script), details),
-    }
 }
 
 fn trim_bytes(line: &[u8]) -> &[u8] {
@@ -385,9 +328,14 @@ fn names_hook(line: &[u8], name: &[u8]) -> bool {
         || (key.len() > 1 && title.len() <= 4 && title[0] == key[0])
 }
 
-/// Byte-preserving counterpart of [`result_label`] for live worker output.
-/// Bash variables retain every byte except NUL, so lossy UTF-8 conversion at
-/// this boundary would silently rewrite user-authored hook diagnostics.
+/// Split a hook's captured output the way `_print_merge_result` reads it:
+/// shell-whitespace-trimmed lines with empties dropped; the first surviving
+/// line is the display label (the [script-stem label](label_from_script)
+/// when there is none) and the rest are detail rows. Splits on `\n` only,
+/// so a `\r` stays content like it does for the shell `read`. Bytes are
+/// preserved: Bash variables retain every byte except NUL, so lossy UTF-8
+/// conversion at this boundary would silently rewrite user-authored hook
+/// diagnostics.
 fn result_label_bytes(script: &OsStr, log: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
     // `read -r` stores each shell line in a Bash variable, which discards NUL
     // bytes while preserving other non-UTF-8 bytes.
@@ -405,8 +353,8 @@ fn result_label_bytes(script: &OsStr, log: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
 
 /// `_print_merge_result` render half: one `_ui_item` row with the
 /// [`progress_ui::duration_ms`] trailer, then one `_ui_detail` row
-/// per detail line. Takes the already-resolved label plus details
-/// from [`result_label`]; the log file read stays with the caller.
+/// per detail line. Takes the already-resolved label plus details; the log
+/// file read stays with the caller.
 #[allow(clippy::too_many_arguments)] // positional parity with the ported shell function
 pub fn render_result(
     palette: &Palette,
@@ -434,97 +382,6 @@ pub fn render_result(
         live_active = live;
     }
     (out, live_active)
-}
-
-/// Data-only outcome of `_print_merge_capture`: which branch the
-/// coordinator takes after reading one hook's result records. The
-/// `has_merge` / `rc` / `elapsed` inputs are the raw single-scalar
-/// file bytes (`None` when unreadable, taking the shell defaults);
-/// surrounding whitespace reads like command substitution. The
-/// `_logfile_print` plus `_warn` rendering of the warning branches
-/// stays shell.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CaptureAction {
-    /// `has_merge` is not exactly one: the hook defined no merge.
-    /// The shell returns 1 without printing.
-    Skipped,
-    /// Verbose foreground row: render the parsed result with an
-    /// `ok` or `warning` status.
-    ShowResult {
-        /// True unless the `rc` scalar reads exactly zero.
-        warning: bool,
-        /// Parsed `elapsed_ms` record (zero when missing or
-        /// unrepresentable — the writer always emits canonical
-        /// shell arithmetic).
-        elapsed_ms: i64,
-    },
-    /// Quiet failure with captured output: print the log file,
-    /// then warn.
-    ShowLogWarning,
-    /// Quiet failure without output: warn with the hook key.
-    ShowEmptyWarning,
-    /// The `rc` scalar is unrepresentable, so bash errors falsy on
-    /// both the status and the nonzero comparisons: a quiet hook
-    /// stays silent (verbose still shows it — that branch only
-    /// reads the verbosity knobs). Counts as merged but never as
-    /// failed, exactly like the shell batch tallies.
-    Silent {
-        /// Always true here: only a nonzero-or-unreadable `rc`
-        /// reaches this variant quietly.
-        warning: bool,
-        /// Parsed `elapsed_ms` record, as in [`CaptureAction::ShowResult`].
-        elapsed_ms: i64,
-    },
-}
-
-/// `_print_merge_capture` decision kernel: skip hooks without a
-/// merge record, show the result row in verbose mode, otherwise
-/// warn on nonzero `rc` (with the log when it is nonempty).
-/// `verbose` and `quiet` are the raw `DOT_VERBOSE` / `DOT_QUIET`
-/// values. Scalars read through the shared `progress_ui` arithmetic
-/// helper:
-/// trimmed decimals literally, bare names and the empty string as
-/// unset (zero), anything else unrepresentable (`None`, failing
-/// both `-eq` and `-ne` like the shell `[[ ]]` errors).
-pub fn capture_action(
-    has_merge: Option<&str>,
-    rc: Option<&str>,
-    elapsed: Option<&str>,
-    verbose: &str,
-    quiet: &str,
-    log_nonempty: bool,
-) -> CaptureAction {
-    if arith_value(has_merge.unwrap_or("0")) != Some(1) {
-        return CaptureAction::Skipped;
-    }
-    let rc_value = arith_value(rc.unwrap_or("1"));
-    let warning = rc_value != Some(0);
-    let elapsed_ms = elapsed.and_then(arith_value).unwrap_or(0);
-    let verbose_on = arith_value(verbose) == Some(1);
-    let quiet_off = arith_value(quiet).is_some_and(|value| value != 1);
-    if verbose_on && quiet_off {
-        return CaptureAction::ShowResult {
-            warning,
-            elapsed_ms,
-        };
-    }
-    match rc_value {
-        Some(0) => CaptureAction::Silent {
-            warning: false,
-            elapsed_ms,
-        },
-        Some(_) => {
-            if log_nonempty {
-                CaptureAction::ShowLogWarning
-            } else {
-                CaptureAction::ShowEmptyWarning
-            }
-        }
-        None => CaptureAction::Silent {
-            warning: true,
-            elapsed_ms,
-        },
-    }
 }
 
 /// Failures collecting hook specs before the `LC_ALL=C` sort. Both
@@ -1223,12 +1080,90 @@ fn is_serial_os(script: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Heartbeat, Hook, ResultRecord, RunInputs, counted_ui, run, scratch, wait_for_worker,
+        Heartbeat, Hook, ResultRecord, RunInputs, counted_ui, is_serial_os, result_label_bytes,
+        run, scratch, trim_bytes, wait_for_worker,
     };
     use dot_test_support::TempDir;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn trim_strips_only_shell_space_at_both_ends() {
+        for (input, expected) in [
+            (b"  padded  ".as_slice(), b"padded".as_slice()),
+            (b"\t\ttabs\n", b"tabs"),
+            (b"", b""),
+            (b"   ", b""),
+            (b"\x0b\x0cvt-ff\r", b"vt-ff"),
+            (b"no-pad", b"no-pad"),
+            (b"inner  space", b"inner  space"),
+            (b"line\nbreak", b"line\nbreak"),
+            ("\u{a0}nbsp\u{a0}".as_bytes(), "\u{a0}nbsp\u{a0}".as_bytes()),
+        ] {
+            assert_eq!(trim_bytes(input), expected, "trim {input:?}");
+        }
+    }
+
+    #[test]
+    fn serial_barrier_is_the_exact_file_name_suffix() {
+        for (script, expected) in [
+            ("10-a.serial.sh", true),
+            ("/hooks/10-a.serial.sh", true),
+            ("10-a.sh", false),
+            (".serial.sh", true),
+            ("serial.sh", false),
+            ("10-a.SERIAL.SH", false),
+            ("x.serial.sh.bak", false),
+        ] {
+            assert_eq!(
+                is_serial_os(std::path::Path::new(script)),
+                expected,
+                "serial barrier {script:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn result_label_takes_the_first_trimmed_line_or_the_script_stem() {
+        type Case<'a> = (&'a str, &'a [u8], &'a [u8], &'a [&'a [u8]]);
+        let cases: &[Case<'_>] = &[
+            (
+                "10-foo.sh",
+                b"Friendly Name\nsecond line\nthird\n",
+                b"Friendly Name",
+                &[b"second line", b"third"],
+            ),
+            (
+                "02_ssh.serial.sh",
+                b"\n  \nSpaced Label  \n  detail one\n\n",
+                b"Spaced Label",
+                &[b"detail one"],
+            ),
+            ("plain.sh", b"", b"plain", &[]),
+            ("10-UPPER.sh", b"   \t  \n", b"UPPER", &[]),
+            ("noext", b"only\n", b"only", &[]),
+            (
+                "a.sh",
+                b"line without trailing newline",
+                b"line without trailing newline",
+                &[],
+            ),
+            ("b.sh", b"l1\r\nl2\r\n", b"l1", &[b"l2"]),
+            (
+                "c.sh",
+                "h\u{fc}\u{fc}ks target\n detail \n".as_bytes(),
+                "h\u{fc}\u{fc}ks target".as_bytes(),
+                &[b"detail"],
+            ),
+            ("d.sh", b"bad\xff\x00label\n", b"bad\xfflabel", &[]),
+        ];
+        for &(script, log, label, details) in cases {
+            let (got_label, got_details) = result_label_bytes(script.as_ref(), log);
+            assert_eq!(got_label, label, "label {script:?}");
+            assert_eq!(got_details, details, "details {script:?}");
+        }
+    }
 
     #[test]
     fn scratch_is_private_and_refuses_a_non_directory_root() {

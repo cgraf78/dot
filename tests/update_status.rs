@@ -1,5 +1,5 @@
 //! Native contracts for cron observability state: outcome records,
-//! the last-success stamp, and retained failure logs.
+//! the last-success and last-converged stamps, and the last failure.
 
 use dot::update_status;
 use dot_test_support::TempDir;
@@ -211,60 +211,6 @@ fn age_format_scales_seconds_minutes_and_hours() {
 }
 
 #[test]
-fn label_sanitization_keeps_filenames_safe() {
-    assert_eq!(update_status::sanitize_label("pull"), "pull");
-    assert_eq!(update_status::sanitize_label("a/b c.log"), "a_b_c.log");
-    assert_eq!(update_status::sanitize_label(""), "command");
-}
-
-#[test]
-fn retained_logs_move_and_prune_to_newest_twenty() {
-    let scratch = TempDir::new("update-status-logs").unwrap();
-    let logs = update_status::logs_dir(scratch.path());
-    let now = std::time::SystemTime::now();
-    for index in 0..25 {
-        let path = logs.join(format!("seed-{index:02}.log"));
-        std::fs::create_dir_all(&logs).unwrap();
-        std::fs::write(&path, b"seed\n").unwrap();
-        let mtime = now - std::time::Duration::from_secs(3600 + index as u64);
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(mtime)
-            .unwrap();
-    }
-    std::fs::write(logs.join("notes.txt"), b"not a log\n").unwrap();
-    let failed = scratch.path().join("scratch.log");
-    std::fs::write(&failed, b"boom\n").unwrap();
-    let retained = update_status::retain_failed_log(&logs, "pul/l", 1_800_000_000, &failed)
-        .expect("retained log");
-    assert!(!failed.exists());
-    assert_eq!(std::fs::read(&retained).unwrap(), b"boom\n");
-    assert!(
-        retained
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("pul_l-1800000000-")
-    );
-    let mut names: Vec<_> = std::fs::read_dir(&logs)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    // Twenty logs survive (non-log files are never managed): the
-    // retained failure plus the nineteen newest seeds, so the six
-    // oldest seeds fall off.
-    assert_eq!(names.len(), update_status::MAX_RETAINED_LOGS + 1);
-    assert!(names.contains(&"notes.txt".to_string()));
-    for pruned in ["seed-24.log", "seed-19.log"] {
-        assert!(!names.contains(&pruned.to_string()), "{names:?}");
-    }
-    assert!(names.contains(&"seed-18.log".to_string()));
-}
-
-#[test]
 fn planted_fifos_never_block_state_access() {
     // Fresh-review-B B4: a same-uid FIFO pre-planted at a state path
     // must be refused promptly, never wedge a cron run or doctor.
@@ -318,8 +264,8 @@ fn planted_fifos_never_block_state_access() {
 
 #[test]
 fn cron_state_stays_owner_only() {
-    // Fresh-review-B E1: `dot/`, `update.log`, the stamp, and `logs/`
-    // are 0700/0600 even when pre-existing paths are wider.
+    // Fresh-review-B E1: `dot/`, `update.log`, and the stamps are
+    // 0700/0600 even when pre-existing paths are wider.
     use std::os::unix::fs::PermissionsExt as _;
 
     let scratch = TempDir::new("update-status-modes").unwrap();
@@ -333,10 +279,6 @@ fn cron_state_stays_owner_only() {
     let stamp = update_status::last_success_path(state);
     std::fs::write(&stamp, b"1\n").unwrap();
     std::fs::set_permissions(&stamp, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let logs = update_status::logs_dir(state);
-    std::fs::create_dir_all(&logs).unwrap();
-    std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o755)).unwrap();
-
     update_status::append_outcome(state, 1_800_000_000, "ok", "update", "");
     update_status::record_success(state, 1_800_000_000);
     let converged = update_status::last_converged_path(state);
@@ -353,10 +295,6 @@ fn cron_state_stays_owner_only() {
         update_status::Trigger::Cron,
         &update_status::Failures::default(),
     );
-    let failed = state.join("scratch.log");
-    std::fs::write(&failed, b"boom\n").unwrap();
-    update_status::retain_failed_log(&logs, "cmd", 1_800_000_000, &failed).expect("retained log");
-
     let mode = |path: &std::path::Path| {
         std::fs::metadata(path).expect("mode").permissions().mode() & 0o777
     };
@@ -365,45 +303,6 @@ fn cron_state_stays_owner_only() {
     assert_eq!(mode(&stamp), 0o600);
     assert_eq!(mode(&converged), 0o600);
     assert_eq!(mode(&cause), 0o600);
-    assert_eq!(mode(&logs), 0o700);
-}
-
-#[test]
-fn failed_copy_removes_its_partial_retained_log() {
-    // Fresh-review-A nit-1: when the cross-filesystem copy fallback
-    // fails midway, no partial entry may consume a retained slot.
-    // Permission-gated (root reads through 0o000, so the forced
-    // failure cannot trigger there).
-    if dot::temp::current_uid().is_some_and(|uid| uid == 0) {
-        return;
-    }
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let scratch = TempDir::new("update-status-partial").unwrap();
-    let logs = update_status::logs_dir(scratch.path());
-    std::fs::create_dir_all(&logs).unwrap();
-    // The exact retained name for this process, label, and epoch.
-    let retained = logs.join(format!("cmd-1800000000-{}.log", std::process::id()));
-    std::fs::write(&retained, b"stale\n").unwrap();
-    // An unreadable scratch file inside an unmodifiable directory:
-    // rename fails (no source-dir write), the copy truncates the
-    // pre-existing entry and then fails reading the source.
-    let hold = scratch.path().join("hold");
-    std::fs::create_dir(&hold).unwrap();
-    let locked = hold.join("locked.log");
-    std::fs::write(&locked, b"data\n").unwrap();
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-    std::fs::set_permissions(&hold, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-    let result = update_status::retain_failed_log(&logs, "cmd", 1_800_000_000, &locked);
-
-    std::fs::set_permissions(&hold, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(result.is_none());
-    assert!(
-        !retained.exists(),
-        "failed copy left a partial retained log"
-    );
-    assert!(locked.exists());
 }
 
 #[test]
@@ -421,7 +320,6 @@ fn state_paths_live_under_the_dot_directory() {
         update_status::last_converged_path(state),
         state.join("dot/update.last-converged")
     );
-    assert_eq!(update_status::logs_dir(state), state.join("dot/logs"));
 }
 
 #[test]

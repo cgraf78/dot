@@ -1728,13 +1728,13 @@ fn discover_active(
         profiles_present: false,
         selected: Vec::new(),
         platform: crate::platform::detect_platform().ok(),
-        termux: crate::hook_api::is_termux(inputs.prefix),
+        termux: crate::platform::is_termux(inputs.prefix),
         host: crate::platform::detect_host().ok(),
         euid: inputs.euid,
     };
     let matches = crate::overlays::MatchInputs {
         platform: crate::platform::detect_platform().ok(),
-        termux: crate::hook_api::is_termux(inputs.prefix),
+        termux: crate::platform::is_termux(inputs.prefix),
         host: crate::platform::detect_host().ok(),
     };
     let result =
@@ -1767,7 +1767,7 @@ fn discover_selected(
     let host = crate::platform::detect_host().ok();
     let matches = crate::overlays::MatchInputs {
         platform: platform.clone(),
-        termux: crate::hook_api::is_termux(inputs.prefix),
+        termux: crate::platform::is_termux(inputs.prefix),
         host: host.clone(),
     };
     let discover_inputs = crate::overlays::Inputs {
@@ -1777,7 +1777,7 @@ fn discover_selected(
         profiles_present: true,
         selected: selected.to_vec(),
         platform,
-        termux: crate::hook_api::is_termux(inputs.prefix),
+        termux: crate::platform::is_termux(inputs.prefix),
         host,
         euid: inputs.euid,
     };

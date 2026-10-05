@@ -82,9 +82,6 @@ pub struct Session {
     /// `DOT_UI_SHDEPS_SUMMARY`, consumed by `update.sh` after shdeps
     /// exits.
     pub summary: Vec<u8>,
-    /// `DOT_UI_SHDEPS_HAS_JQ`, from the `command -v jq` probe (see
-    /// [`have_jq`]).
-    pub has_jq: bool,
     /// `DOT_UI_SHDEPS_PROMPT_ACTIVE`, set while shdeps waits for the
     /// prompt acknowledgment.
     pub prompt_active: bool,
@@ -105,41 +102,14 @@ pub struct Ui<'a> {
     pub multibyte: bool,
 }
 
-/// Whether `jq` resolves on `path_dirs`, like the `command -v jq`
-/// probe inside `_shdeps_ui_reset`. Each colon-separated entry is
-/// tried in order; an entry hits when `jq` under it exists and is
-/// not a directory, matching the probed default-mode shell rows: a
-/// non-executable or unreadable file still counts, as does a fifo
-/// or a symlink to a file, while directories, symlinks to
-/// directories, and broken symlinks never do. POSIX mode would
-/// additionally require executability, but the engine never enables
-/// it, so only the default read is modeled. Empty entries, which
-/// the shell reads as the working directory, stay shell-side and
-/// never hit here; function and alias shadows do not exist in the
-/// engine, so only `PATH` entries are modeled.
-pub fn have_jq(path_dirs: &str) -> bool {
-    path_dirs.split(':').any(|dir| {
-        if dir.is_empty() {
-            return false;
-        }
-        match std::fs::metadata(std::path::Path::new(dir).join("jq")) {
-            Ok(meta) => !meta.file_type().is_dir(),
-            Err(_) => false,
-        }
-    })
-}
-
 /// `_shdeps_ui_reset`: fresh session globals for one update run:
-/// status `ok`, the `dependencies checked` summary, the jq probe
-/// result, and an inactive prompt (the shell's `_shdeps_prompt_resume`
-/// folded in). The caller supplies the probe via [`have_jq`] so the
-/// reset stays pure; the group maps restart empty beside this on the
-/// part-1 record lane.
-pub fn reset(has_jq: bool) -> Session {
+/// status `ok`, the `dependencies checked` summary, and an inactive
+/// prompt (the shell's `_shdeps_prompt_resume` folded in); the group
+/// maps restart empty beside this on the part-1 record lane.
+pub fn reset() -> Session {
     Session {
         status: b"ok".to_vec(),
         summary: b"dependencies checked".to_vec(),
-        has_jq,
         prompt_active: false,
     }
 }

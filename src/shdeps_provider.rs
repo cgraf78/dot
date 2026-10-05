@@ -1528,7 +1528,7 @@ fn run_update(
         .stdout(stdout_writer)
         .stderr(stderr_writer);
     let mut state = crate::shdeps_ui::State::new();
-    let mut session = crate::shdeps_ui_render::reset(false);
+    let mut session = crate::shdeps_ui_render::reset();
     let mut live = false;
     let mut pending = Vec::new();
     let mut staged_events = Vec::new();
@@ -2889,6 +2889,80 @@ mod tests {
         handle_event, interruptible_delay, live_provider_pass, run_update,
     };
 
+    /// A Runtime whose PATH holds only `bin`, rooted in `scratch`.
+    fn probe_runtime(scratch: &std::path::Path) -> crate::app::Runtime {
+        let env = std::collections::BTreeMap::from([
+            (
+                std::ffi::OsString::from("HOME"),
+                scratch.as_os_str().to_owned(),
+            ),
+            (
+                std::ffi::OsString::from("PATH"),
+                std::ffi::OsString::from("/usr/bin:/bin"),
+            ),
+        ]);
+        crate::app::Runtime::from_env(&env, scratch).expect("runtime")
+    }
+
+    /// A fake provider whose `__api version` probe runs `body`.
+    fn probe_provider(scratch: &std::path::Path, tag: &str, body: &str) -> std::path::PathBuf {
+        let path = scratch.join(tag);
+        dot_test_support::install_fixture_executable(&path, format!("#!/bin/sh\n{body}"), 0o755)
+            .expect("install provider fixture");
+        path
+    }
+
+    #[test]
+    fn abi_probe_matches_only_one_exact_line_from_a_successful_probe() {
+        let scratch = dot_test_support::TempDir::new_exec("provider-abi-matrix").expect("scratch");
+        let runtime = probe_runtime(scratch.path());
+        for (tag, body, expected, matched) in [
+            ("match", "printf 'abi:12\\n'", "12", true),
+            ("mismatch", "printf 'abi:13\\n'", "12", false),
+            ("probe-fails", "printf 'abi:12\\n'; exit 3", "12", false),
+            ("long", "printf 'abi:9876543210\\n'", "9876543210", true),
+            ("empty", "exit 0", "12", false),
+            ("extra-line", "printf 'abi:12\\nextra\\n'", "12", false),
+        ] {
+            let binary = probe_provider(scratch.path(), tag, body);
+            let result = super::binary_abi(&runtime, &binary, expected, runtime.env());
+            assert_eq!(matches!(result, super::AbiResult::Match), matched, "{tag}");
+        }
+        let missing = scratch.path().join("missing-provider");
+        assert!(matches!(
+            super::binary_abi(&runtime, &missing, "12", runtime.env()),
+            super::AbiResult::Mismatch
+        ));
+    }
+
+    #[test]
+    fn doctor_abi_version_reports_successful_probe_output() {
+        let scratch = dot_test_support::TempDir::new_exec("provider-abi-version").expect("scratch");
+        let runtime = probe_runtime(scratch.path());
+        for (tag, body, expected) in [
+            ("pinned", "printf 'abi:12\\n'", Some("abi:12")),
+            (
+                "two-lines",
+                "printf 'abi:12\\nextra\\n'",
+                Some("abi:12\nextra"),
+            ),
+            ("unrelated", "printf 'hello world\\n'", Some("hello world")),
+            ("failing", "printf 'abi:12\\n'; exit 7", None),
+            ("empty-success", "exit 0", Some("")),
+        ] {
+            let binary = probe_provider(scratch.path(), tag, body);
+            assert_eq!(
+                super::doctor_abi_version(&runtime, &binary).as_deref(),
+                expected,
+                "{tag}"
+            );
+        }
+        assert_eq!(
+            super::doctor_abi_version(&runtime, &scratch.path().join("missing")),
+            None
+        );
+    }
+
     fn render_event(line: &str) -> Vec<u8> {
         let scratch = dot_test_support::TempDir::new("provider-phase-ingest").expect("scratch");
         let home = scratch.path().join("home");
@@ -2931,7 +3005,7 @@ mod tests {
             bar_width: "8",
         };
         let mut state = crate::shdeps_ui::State::default();
-        let mut session = crate::shdeps_ui_render::reset(false);
+        let mut session = crate::shdeps_ui_render::reset();
         let mut stage =
             crate::progress_ui::Stage::begin(palette.clone(), "5", false, true, false, true);
         // Provider events always arrive inside the opened Tools stage.

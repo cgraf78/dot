@@ -504,9 +504,8 @@ pub fn pull_overlays_serial(
 }
 
 /// Reap `count` worker completions, redrawing the live line on
-/// whole seconds while stalled (the `run_to_log_with_ticks`
-/// pattern: the waiting thread polls instead of blocking in a
-/// join). Workers contain panics in the overlay pull and still
+/// whole seconds while stalled (the waiting thread polls instead
+/// of blocking in a join). Workers contain panics in the overlay pull and still
 /// report, so a dropped sender is only a safety net for a panic
 /// outside that guard: stop waiting and let the enclosing scope
 /// re-raise it when it joins (the caller's scratch guard still

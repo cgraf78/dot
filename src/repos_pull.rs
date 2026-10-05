@@ -9,6 +9,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cleanup::Registry;
 use crate::log::Log;
@@ -21,8 +22,34 @@ use crate::repos_pull_queries::{
     CandidateEnv, accept_current_generation, repo_head, repo_head_is, validate_candidate_tree,
 };
 use crate::repos_pull_support::prepare_base_upstream;
-use crate::run::logfile_create;
 use crate::temp::{MoveCache, MoveTool, read_umask};
+
+/// Allocation counter behind [`logfile_create`].
+static LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// `_logfile_create`: allocate an empty private scratch log under
+/// `${TMPDIR:-/tmp}`. `None` mirrors the silenced mktemp failure; the pull
+/// then streams without a log.
+fn logfile_create() -> Option<PathBuf> {
+    let dir = std::env::var_os("TMPDIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    for _ in 0..100 {
+        let serial = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("dot.{}.{serial:016x}.log", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        if options.open(&path).is_ok() {
+            return Some(path);
+        }
+    }
+    None
+}
 
 /// Inputs for [`pull_repo`], replacing the shell's backup-root plus
 /// command argv with explicit values. The backup context mirrors
@@ -1179,6 +1206,20 @@ pub fn pull_base(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logfile_create_allocates_unique_empty_private_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let first = logfile_create().unwrap();
+        let second = logfile_create().unwrap();
+        assert_ne!(first, second);
+        for path in [first, second] {
+            let meta = std::fs::metadata(&path).unwrap();
+            assert_eq!(meta.len(), 0);
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            std::fs::remove_file(path).ok();
+        }
+    }
 
     #[test]
     fn rebase_state_ignores_an_am_session() {

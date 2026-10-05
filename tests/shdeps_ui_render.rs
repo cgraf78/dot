@@ -4,10 +4,9 @@ use std::collections::HashMap;
 
 use dot::progress_ui::Palette;
 use dot::shdeps_ui_render::{
-    Session, Ui, have_jq, print_group_items_with_status, print_group_summaries,
-    print_verbose_group_rows, print_verbose_items, prompt_pause, prompt_resume, reset,
+    Session, Ui, print_group_items_with_status, print_group_summaries, print_verbose_group_rows,
+    print_verbose_items, prompt_pause, prompt_resume, reset,
 };
-use dot_test_support::TempDir;
 
 fn palette() -> Palette {
     Palette {
@@ -116,54 +115,16 @@ fn section(live: bool, label: &[u8]) -> Vec<u8> {
     out
 }
 
-fn stage_exec(path: &std::path::Path) {
-    dot_test_support::install_fixture_executable(path, b"#!/bin/sh\nexit 0\n", 0o755)
-        .expect("install fixture");
-}
-
-#[test]
-fn have_jq_rows_are_filesystem_contracts() {
-    let fixture = TempDir::new("shdeps-render-jq").expect("fixture");
-    let root = fixture.path();
-    let exec = root.join("exec");
-    let dull = root.join("dull");
-    let directory = root.join("directory");
-    let linked = root.join("linked");
-    let dead = root.join("dead");
-    for dir in [&exec, &dull, &directory, &linked, &dead] {
-        std::fs::create_dir_all(dir).expect("dir");
-    }
-    stage_exec(&exec.join("jq"));
-    std::fs::write(dull.join("jq"), b"not executable").expect("dull");
-    std::fs::create_dir(directory.join("jq")).expect("named dir");
-    std::os::unix::fs::symlink(exec.join("jq"), linked.join("jq")).expect("link");
-    std::os::unix::fs::symlink(root.join("missing"), dead.join("jq")).expect("dead link");
-    assert!(have_jq(exec.to_str().expect("utf8")));
-    assert!(have_jq(dull.to_str().expect("utf8")));
-    assert!(!have_jq(directory.to_str().expect("utf8")));
-    assert!(have_jq(linked.to_str().expect("utf8")));
-    assert!(!have_jq(dead.to_str().expect("utf8")));
-    assert!(!have_jq(""));
-    assert!(!have_jq("/nonexistent-dot-jq-path"));
-    assert!(have_jq(&format!(
-        "/nonexistent-dot-jq-path:{}",
-        exec.display()
-    )));
-}
-
 #[test]
 fn reset_rows_overwrite_every_session_field() {
-    for has_jq in [false, true] {
-        assert_eq!(
-            reset(has_jq),
-            Session {
-                status: b"ok".to_vec(),
-                summary: b"dependencies checked".to_vec(),
-                has_jq,
-                prompt_active: false,
-            }
-        );
-    }
+    assert_eq!(
+        reset(),
+        Session {
+            status: b"ok".to_vec(),
+            summary: b"dependencies checked".to_vec(),
+            prompt_active: false,
+        }
+    );
 }
 
 #[test]
@@ -180,7 +141,7 @@ fn prompt_rows_clear_once_ack_twice_and_resume() {
         (false, "abc", b"".as_slice(), None),
         (false, "00", b"".as_slice(), Some(b"ready\n".as_slice())),
     ] {
-        let mut session = reset(false);
+        let mut session = reset();
         let (out, next_live, ack) = prompt_pause(&mut session, live, fd);
         assert_eq!(out, expected_out);
         assert!(!next_live);

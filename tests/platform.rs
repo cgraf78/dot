@@ -137,48 +137,6 @@ fn host_specs_are_ascii_case_insensitive() {
     );
 }
 
-#[test]
-fn tool_lookup_distinguishes_path_names_and_direct_paths() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = dot_test_support::TempDir::new("tool-contract").expect("temp");
-    let executable = dir.write("tool", b"#!/bin/sh\n");
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-    dir.write("plain", b"x");
-    std::fs::create_dir(dir.path().join("directory")).unwrap();
-    let path = dir.path().to_string_lossy();
-    assert_eq!(platform::tool_present(Some("tool"), &path), Ok(true));
-    assert_eq!(platform::tool_present(Some("plain"), &path), Ok(true));
-    assert_eq!(platform::tool_present(Some("directory"), &path), Ok(false));
-    assert_eq!(platform::tool_present(Some("missing"), &path), Ok(false));
-    assert_eq!(
-        platform::tool_present(Some(executable.to_str().unwrap()), ""),
-        Ok(true)
-    );
-    assert_eq!(
-        platform::tool_present(Some(dir.path().join("missing").to_str().unwrap()), ""),
-        Ok(false)
-    );
-    assert_eq!(
-        platform::tool_present(Some(dir.path().join("directory").to_str().unwrap()), ""),
-        Ok(true)
-    );
-    assert_eq!(
-        platform::tool_present(None, &path),
-        Err(platform::Error::Usage)
-    );
-}
-
-#[test]
-fn sudo_ladder_has_fixed_precedence() {
-    let yes = || true;
-    let no = || false;
-    assert!(platform::decide_sudo(true, false, true, &no));
-    assert!(platform::decide_sudo(false, true, true, &no));
-    assert!(!platform::decide_sudo(false, false, true, &yes));
-    assert!(platform::decide_sudo(false, false, false, &yes));
-    assert!(!platform::decide_sudo(false, false, false, &no));
-}
-
 /// The shell hook API reads the host the way the engine does, so a hook's
 /// `dot_hook_host_match` agrees with profile selection.
 #[test]
