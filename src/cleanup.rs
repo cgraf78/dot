@@ -5651,7 +5651,9 @@ pub(crate) fn supervise_child_with_policy(
         // Observe an already-published exit before interpreting another live
         // event. In particular, a capable provider can leave a complete JSONL
         // prompt queued and then exit with 128+signal; consuming that prompt
-        // first could acknowledge and release work after cancellation.
+        // first could acknowledge and release work after cancellation. The
+        // poll covers only output read before it, so a tick that interprets
+        // events must defer what it reads to a later tick.
         if let Err(error) = tick(false) {
             // The provider owns descendants that Dot cannot safely
             // group-signal in the caller's foreground session. Give it TERM
