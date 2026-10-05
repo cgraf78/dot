@@ -1,7 +1,6 @@
 //! Native contracts for base-repository pull orchestration.
 
 use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -493,8 +492,12 @@ fn pull_base_does_not_run_commit_hooks_while_replaying_local_commits() {
     let hooks = side.home.join(".hooks");
     std::fs::create_dir(&hooks).unwrap();
     let hook = hooks.join("prepare-commit-msg");
-    std::fs::write(&hook, "#!/bin/sh\necho gate failed >&2\nexit 1\n").unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dot_test_support::install_fixture_executable(
+        &hook,
+        "#!/bin/sh\necho gate failed >&2\nexit 1\n",
+        0o755,
+    )
+    .unwrap();
     git(
         &side.home,
         &["config", "core.hooksPath", &hooks.to_string_lossy()],

@@ -129,17 +129,15 @@ fn pull_cmd_propagates_status_and_missing_program() {
 #[cfg(unix)]
 #[test]
 fn pull_cmd_pins_locale_and_appends_quiet() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let dir = TempDir::new("pull-command-env").expect("fixture dir");
     let script = dir.path().join("probe.sh");
     let record = dir.path().join("record");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &script,
         "#!/bin/sh\nout=$1\nprintf 'lc=%s\\n' \"$LC_ALL\" >\"$out\"\nshift\nprintf 'args=%s\\n' \"$*\" >\"$out.unused\"\n",
+        0o755,
     )
-    .expect("probe");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    .expect("install fixture");
     let script = script.to_string_lossy();
     let record_text = record.to_string_lossy();
     assert_eq!(pull_cmd(true, "sh", &[&script, &record_text]), 0);
@@ -156,8 +154,6 @@ fn pull_cmd_pins_locale_and_appends_quiet() {
 #[cfg(unix)]
 #[test]
 fn pull_cmd_keeps_the_callers_foreground_controlling_tty() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     const HELPER: &str = "DOT_PULL_CMD_PTY_HELPER";
     if std::env::var_os(HELPER).is_some() {
         let program = std::env::var("DOT_TEST_PULL_PROGRAM").expect("pull fixture program");
@@ -168,13 +164,12 @@ fn pull_cmd_keeps_the_callers_foreground_controlling_tty() {
     let scope = TempDir::new("pull-command-pty").expect("fixture dir");
     let observed = scope.path().join("foreground-tty");
     let program = scope.path().join("pull-program");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &program,
         "#!/bin/sh\n/usr/bin/python3 -c 'import os,sys; sys.exit(0 if all(os.isatty(fd) and os.tcgetpgrp(fd) == os.getpgrp() for fd in (0,1,2)) else 9)' || exit $?\n: >\"$DOT_TEST_PULL_PTY_OBSERVED\"\n",
+        0o755,
     )
-    .expect("pull fixture");
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-        .expect("pull fixture mode");
+    .expect("install pull fixture");
 
     let mut master = -1;
     let mut slave = -1;

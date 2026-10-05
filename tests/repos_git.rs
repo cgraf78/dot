@@ -175,15 +175,15 @@ fn repos_git_command_clears_memoized_worktree_probes() {
     let log = scope.path().join("git.log");
     // Counting shim: answers `rev-parse --show-toplevel` by
     // echoing the directory, silently accepts anything else.
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         bin.join("git"),
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$3\" = rev-parse ]; then printf '%s\\n' \"$2\"; fi\nexit 0\n",
             log.display()
         ),
+        0o755,
     )
     .unwrap();
-    std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
     let path = std::env::join_paths(
         std::iter::once(bin.clone())
             .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
@@ -229,12 +229,12 @@ fn streaming_git_keeps_the_callers_foreground_controlling_tty() {
     std::fs::create_dir(&bin).unwrap();
     let observed = scope.path().join("foreground-tty");
     let git = bin.join("git");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &git,
         "#!/bin/sh\n/usr/bin/python3 -c 'import os,sys; sys.exit(0 if all(os.isatty(fd) and os.tcgetpgrp(fd) == os.getpgrp() for fd in (0,1,2)) else 9)' || exit $?\n: >\"$DOT_TEST_GIT_PTY_OBSERVED\"\n",
+        0o755,
     )
     .unwrap();
-    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let mut master = -1;
     let mut slave = -1;
@@ -748,16 +748,16 @@ fn each_existing_probes_every_overlay_before_any_callback() {
     .find(|path| path.is_file())
     .expect("system git");
     let shim = scope.path().join("git");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &shim,
         format!(
             "#!/bin/sh\nprintf 'git %s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
             log.display(),
             real.display()
         ),
+        0o755,
     )
     .unwrap();
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
     let overlays = vec![
         format!("first|{}|url|||git", first.path().display()),
         format!("second|{}|url|||git", second.path().display()),

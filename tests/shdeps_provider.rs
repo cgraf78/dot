@@ -20,9 +20,8 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use dot_test_support::TempDir;
 
 fn write_exec(path: &Path, body: &[u8]) {
-    std::fs::write(path, body).expect("write executable fixture");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod executable fixture");
+    dot_test_support::install_fixture_executable(path, body, 0o755)
+        .expect("install executable fixture");
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -1194,8 +1193,19 @@ esac
         let checkout = root.join("shdeps");
         std::fs::create_dir_all(&checkout).expect("development checkout");
         for name in ["install.sh", "shdeps.sh", "shdeps"] {
-            std::fs::copy(self.provider.join(name), checkout.join(name))
-                .expect("copy development file");
+            let source = self.provider.join(name);
+            let mode = std::fs::metadata(&source)
+                .expect("development file mode")
+                .permissions()
+                .mode()
+                & 0o7777;
+            if mode & 0o111 != 0 {
+                let body = std::fs::read(&source).expect("read development file");
+                dot_test_support::install_fixture_executable(checkout.join(name), body, mode)
+                    .expect("copy development file");
+            } else {
+                std::fs::copy(&source, checkout.join(name)).expect("copy development file");
+            }
         }
         git(&checkout, &["init", "-q"]);
         git(&checkout, &["config", "user.name", "fixture"]);

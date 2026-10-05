@@ -439,7 +439,6 @@ mod cancellation_tests {
     use super::*;
     use crate::repos_base::Topology;
     use crate::repos_overlays::DestinationInputs;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
 
     /// Backup warnings shared with the watchdog thread so a staging
@@ -509,12 +508,12 @@ mod cancellation_tests {
 
         let ready = scope.path().join("move.ready");
         let fake_mv = bin.join("mv");
-        std::fs::write(
+        dot_test_support::install_fixture_executable(
             &fake_mv,
             "#!/bin/sh\n\"$DOT_TEST_REAL_MV\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *'.dot-backup/pull/'*)\n    : >\"$DOT_TEST_MOVE_READY\"\n    trap '' TERM\n    while :; do /bin/sleep 1; done\n    ;;\nesac\nexit \"$status\"\n",
+            0o755,
         )
         .unwrap();
-        std::fs::set_permissions(&fake_mv, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Resolve `stat` off the ambient PATH instead of hardcoding
         // `/usr/bin/stat`: busybox-based images (Alpine) install the
         // applet elsewhere, and a dangling fixture symlink makes every

@@ -65,8 +65,14 @@ fn record(before: &str, after: &str) -> Vec<u8> {
 fn stage_mode(root: &Path, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
     let path = root.join(name);
     std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture parents");
-    std::fs::write(&path, bytes).expect("write fixture");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    // An executable fixture is created by a child so this process never holds
+    // a writer to it (see `install_fixture_executable`).
+    if mode & 0o111 != 0 {
+        dot_test_support::install_fixture_executable(&path, bytes, mode).expect("write fixture");
+    } else {
+        std::fs::write(&path, bytes).expect("write fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
     path
 }
 

@@ -5345,21 +5345,20 @@ fn failure_state_parity_covers_home_all_xdg_roots_and_tmp() {
 #[test]
 #[cfg(target_os = "linux")]
 fn timed_command_bounds_and_reaps_a_hanging_descendant() {
-    use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
 
     let scratch = Scratch::new_exec("perf-timeout").expect("scratch");
     let script = scratch.path().join("hang.sh");
     let child_pid = scratch.path().join("child.pid");
-    fs::write(
+    dot_test_support::install_fixture_executable(
         &script,
         format!(
             "#!/bin/sh\ntrap '' TERM\nset -m\n( trap '' TERM; sleep 30 ) &\nprintf '%s\\n' \"$!\" >'{}'\nwait\n",
             child_pid.display()
         ),
+        0o700,
     )
-    .expect("write hanging command");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("chmod hanging command");
+    .expect("install hanging command");
     let mut command = Command::new(&script);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -5892,16 +5891,15 @@ fn timed_command_reaps_a_descendant_left_by_a_successful_parent() {
     let scratch = Scratch::new_exec("perf-success-descendant").expect("scratch");
     let script = scratch.path().join("leak.sh");
     let child_pid = scratch.path().join("child.pid");
-    fs::write(
+    dot_test_support::install_fixture_executable(
         &script,
         format!(
             "#!/bin/sh\nset -m\n( trap '' TERM; sleep 30 ) &\nprintf '%s\\n' \"$!\" >'{}'\nexit 0\n",
             child_pid.display()
         ),
+        0o700,
     )
-    .expect("write descendant fixture");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
-        .expect("chmod descendant fixture");
+    .expect("install descendant fixture");
     let mut command = Command::new(&script);
     let started = Instant::now();
     let error = run_timed_command(&mut command, Duration::from_secs(2))
@@ -5935,7 +5933,7 @@ fn timed_command_rejects_and_reaps_an_escaped_setsid_descendant() {
     let script = scratch.path().join("escape.sh");
     let child_pid = scratch.path().join("child.pid");
     let setsid = system_tool("setsid").expect("Linux setsid tool");
-    fs::write(
+    dot_test_support::install_fixture_executable(
         &script,
         format!(
             "#!/bin/sh\n'{}' /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; sleep 30' _ '{}' </dev/null >/dev/null 2>&1 &\nwhile [ ! -s '{}' ]; do :; done\nexit 0\n",
@@ -5943,10 +5941,9 @@ fn timed_command_rejects_and_reaps_an_escaped_setsid_descendant() {
             child_pid.display(),
             child_pid.display(),
         ),
+        0o700,
     )
-    .expect("write escaped-descendant fixture");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
-        .expect("chmod escaped-descendant fixture");
+    .expect("install escaped-descendant fixture");
     let mut command = Command::new(&script);
 
     let result = run_timed_command(&mut command, Duration::from_secs(2));
@@ -5982,7 +5979,7 @@ fn direct_child_authority_precedes_a_failing_broad_process_scan() {
     let lock_path = scratch.path().join("inherited-lock");
     let setsid = system_tool("setsid").expect("Linux setsid tool");
     let flock = system_tool("flock").expect("Linux flock tool");
-    fs::write(
+    dot_test_support::install_fixture_executable(
         &script,
         format!(
             "#!/bin/sh\nexec 9>'{}'\n'{}' --exclusive --nonblock 9 || exit 91\n'{}' /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; kill -STOP $$; while :; do :; done' _ '{}' &\nwhile [ ! -s '{}' ]; do :; done\nexit 0\n",
@@ -5992,10 +5989,9 @@ fn direct_child_authority_precedes_a_failing_broad_process_scan() {
             child_pid.display(),
             child_pid.display(),
         ),
+        0o700,
     )
-    .expect("write direct-before-broad fixture");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
-        .expect("chmod direct-before-broad fixture");
+    .expect("install direct-before-broad fixture");
     let worker_script = script.clone();
     let worker_marker = child_pid.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -6074,7 +6070,7 @@ fn retained_pidfd_survives_an_omitted_then_failed_process_snapshot() {
     let lock_path = scratch.path().join("inherited-lock");
     let setsid = system_tool("setsid").expect("Linux setsid tool");
     let flock = system_tool("flock").expect("Linux flock tool");
-    fs::write(
+    dot_test_support::install_fixture_executable(
         &script,
         format!(
             "#!/bin/sh\nexec 9>'{}'\n'{}' --exclusive --nonblock 9 || exit 91\n'{}' /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; kill -STOP $$; while :; do :; done' _ '{}' &\nwhile [ ! -s '{}' ]; do :; done\nexit 0\n",
@@ -6084,10 +6080,9 @@ fn retained_pidfd_survives_an_omitted_then_failed_process_snapshot() {
             child_pid.display(),
             child_pid.display(),
         ),
+        0o700,
     )
-    .expect("write omitted-snapshot fixture");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
-        .expect("chmod omitted-snapshot fixture");
+    .expect("install omitted-snapshot fixture");
     let before = fs::read_dir("/proc/self/fd")
         .expect("initial descriptor inventory")
         .count();
@@ -6154,7 +6149,7 @@ fn total_observation_loss_rejects_without_blocking_capture_readers() {
     let lock_path = scratch.path().join("inherited-lock");
     let setsid = system_tool("setsid").expect("Linux setsid tool");
     let flock = system_tool("flock").expect("Linux flock tool");
-    fs::write(
+    dot_test_support::install_fixture_executable(
         &script,
         format!(
             "#!/bin/sh\nexec 9>'{}'\n'{}' --exclusive --nonblock 9 || exit 91\n'{}' /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; kill -STOP $$; while :; do :; done' _ '{}' &\nwhile [ ! -s '{}' ]; do :; done\nexit 0\n",
@@ -6164,10 +6159,9 @@ fn total_observation_loss_rejects_without_blocking_capture_readers() {
             child_pid.display(),
             child_pid.display(),
         ),
+        0o700,
     )
-    .expect("write total-observation-loss fixture");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
-        .expect("chmod total-observation-loss fixture");
+    .expect("install total-observation-loss fixture");
     let before = fs::read_dir("/proc/self/fd")
         .expect("initial descriptor inventory")
         .count();
@@ -6273,13 +6267,12 @@ fn timed_cleanup_does_not_signal_an_unrelated_session() {
 
     let scratch = Scratch::new_exec("perf-session-isolation").expect("scratch");
     let script = scratch.path().join("leak.sh");
-    fs::write(
+    dot_test_support::install_fixture_executable(
         &script,
         "#!/bin/sh\nset -m\n( trap '' TERM; sleep 30 ) &\nexit 0\n",
+        0o700,
     )
-    .expect("write descendant fixture");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
-        .expect("chmod descendant fixture");
+    .expect("install descendant fixture");
     let mut command = Command::new(&script);
     let error = run_timed_command(&mut command, Duration::from_secs(2))
         .expect_err("live descendant must invalidate the command");
@@ -6305,8 +6298,8 @@ fn rustup_style_build_tool_directory_is_a_supported_fallback() {
     let bin = scratch.path().join(".cargo/bin");
     fs::create_dir_all(&bin).expect("tool directory");
     let rustc = bin.join("rustc-fixture");
-    fs::write(&rustc, b"#!/bin/sh\nexit 0\n").expect("tool fixture");
-    fs::set_permissions(&rustc, fs::Permissions::from_mode(0o700)).expect("chmod tool fixture");
+    dot_test_support::install_fixture_executable(&rustc, b"#!/bin/sh\nexit 0\n", 0o700)
+        .expect("install tool fixture");
     let path = std::env::join_paths([bin]).expect("fixture PATH");
 
     assert_eq!(
@@ -6328,12 +6321,12 @@ fn symlinked_proxy_tool_keeps_its_selected_name() {
     let bin = scratch.path().join("bin");
     fs::create_dir_all(&bin).expect("tool directory");
     let manager = bin.join("manager");
-    fs::write(
+    dot_test_support::install_fixture_executable(
         &manager,
         "#!/bin/sh\n[ -n \"$HOME\" ] || exit 1\ncase \"${0##*/}\" in\ncargo) printf 'cargo 1.2.3 (fixture)\\n';;\n*) printf 'manager 9.9.9 (fixture)\\n';;\nesac\n",
+        0o700,
     )
-    .expect("manager fixture");
-    fs::set_permissions(&manager, fs::Permissions::from_mode(0o700)).expect("chmod manager");
+    .expect("install manager");
     let proxy = bin.join("cargo");
     std::os::unix::fs::symlink(&manager, &proxy).expect("proxy symlink");
     let path = std::env::join_paths([bin]).expect("fixture PATH");
@@ -6394,9 +6387,12 @@ fn provider_validation_allows_a_distinct_historical_lock() {
     let provider_binary = scratch.path().join("run-private-target/release/shdeps");
     fs::create_dir_all(provider_binary.parent().expect("provider binary parent"))
         .expect("run-private provider target");
-    fs::write(&provider_binary, b"current provider binary\n").expect("provider binary");
-    fs::set_permissions(&provider_binary, fs::Permissions::from_mode(0o700))
-        .expect("chmod provider binary");
+    dot_test_support::install_fixture_executable(
+        &provider_binary,
+        b"current provider binary\n",
+        0o700,
+    )
+    .expect("install provider binary");
     git(&tools, &provider, &["init", "-q"]);
     git(&tools, &provider, &["config", "user.name", "fixture"]);
     git(
@@ -6459,15 +6455,15 @@ fn fixture_git_ignores_a_hostile_leading_path_entry() {
     fs::create_dir_all(&hostile).expect("hostile directory");
     let marker = scratch.path().join("wrapper-ran");
     let wrapper = hostile.join("git");
-    fs::write(
+    dot_test_support::install_fixture_executable(
         &wrapper,
         format!(
             "#!/bin/sh\nprintf called >'{}'\nexit 93\n",
             marker.display()
         ),
+        0o700,
     )
-    .expect("hostile wrapper");
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
+    .expect("install wrapper");
 
     let tools = PerfTools::system().expect("system performance tools");
     let hostile_path = std::env::join_paths(

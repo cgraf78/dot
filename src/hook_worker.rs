@@ -1037,17 +1037,16 @@ mod tests {
         std::fs::write(&poison, b":\n").expect("BASH_ENV");
         let marker = scope.path().join("bash-invocations");
         let wrapper = scope.path().join("bash-wrapper");
-        std::fs::write(
+        dot_test_support::install_fixture_executable(
             &wrapper,
             format!(
                 "#!/bin/sh\nprintf x >>'{}'\nexec '{}' \"$@\"\n",
                 marker.display(),
                 dot_test_support::bash().display()
             ),
+            0o755,
         )
-        .expect("Bash wrapper");
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
-            .expect("Bash wrapper mode");
+        .expect("install Bash wrapper");
         let record = checkout(&home, b"deactivate() { :; }\n");
         let mut env = runtime(&home, &state, &poison).env().clone();
         env.insert(OsString::from("DOT_BASH"), wrapper.as_os_str().to_owned());

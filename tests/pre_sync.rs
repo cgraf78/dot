@@ -24,8 +24,14 @@ fn inputs(home: &Path, ext: &Path) -> Inputs {
 fn script(root: &Path, name: &str, mode: u32) -> PathBuf {
     let path = root.join(name);
     std::fs::create_dir_all(path.parent().expect("parent")).expect("parents");
-    std::fs::write(&path, b"#!/bin/sh\n").expect("write");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("mode");
+    // An executable fixture is created by a child so this process never holds
+    // a writer to it (see `install_fixture_executable`).
+    if mode & 0o111 != 0 {
+        dot_test_support::install_fixture_executable(&path, b"#!/bin/sh\n", mode).expect("write");
+    } else {
+        std::fs::write(&path, b"#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("mode");
+    }
     path
 }
 fn fixture(tag: &str, names: &[&str]) -> (TempDir, PathBuf) {

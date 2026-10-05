@@ -256,17 +256,17 @@ fn workers_run_the_dispatcher_bound_host_git() {
     .find(|path| path.is_file())
     .expect("system git");
     let shim = scope.path().join("bin/git");
-    stage(
-        scope.path(),
-        "bin/git",
+    std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
+    dot_test_support::install_fixture_executable(
+        &shim,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
             log.display(),
             real.display()
-        )
-        .as_bytes(),
-    );
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ),
+        0o755,
+    )
+    .unwrap();
     let got = dot::init_client_identity::with_host_git(&shim, || {
         repos_link_prep::prepare_inventories(
             &repos_link_prep::Inputs {

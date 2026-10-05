@@ -70,12 +70,12 @@ impl Fixture {
 
 pub fn executable(path: &Path, body: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(
+    dot_test_support::install_fixture_executable(
         path,
         format!("#!{}\n{body}\n", dot_test_support::bash().display()),
+        0o755,
     )
     .unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 pub fn poll(mut condition: impl FnMut() -> bool) {

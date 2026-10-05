@@ -79,9 +79,7 @@ fn fake_bsd_stat() -> TempDir {
            *) exit 1 ;;\n\
          esac\n"
         .replace("{REAL}", &quoted);
-    std::fs::write(&script, &body).expect("write fake stat");
-    #[cfg(unix)]
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod fake");
+    dot_test_support::install_fixture_executable(&script, &body, 0o755).expect("install fake");
     dir
 }
 

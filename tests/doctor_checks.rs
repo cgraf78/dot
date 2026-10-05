@@ -27,9 +27,8 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write executable");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    dot_test_support::install_fixture_executable(path, b"#!/bin/sh\nexit 0\n", 0o755)
+        .expect("install fixture");
 }
 
 fn valid_local(_: &str) -> Result<(), String> {
@@ -2321,20 +2320,16 @@ fn concurrent_overlay_statuses_use_the_bound_host_git() {
     let (remote, clones) = overlay_clones(scratch.path(), 3);
     let log = scratch.path().join("git.log");
     let wrapper = scratch.path().join("host-git");
-    std::fs::write(
+    dot_test_support::install_fixture_executable(
         &wrapper,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
             log.display(),
             dot_test_support::real_tool("git").display()
         ),
+        0o755,
     )
     .expect("wrapper");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
-            .expect("wrapper mode");
-    }
     let manifest = scratch
         .path()
         .join("missing")
