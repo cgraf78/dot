@@ -1538,7 +1538,9 @@ fn process_running_pid(pid: i32) -> bool {
                 .expect("well-formed proc stat");
             stat.get(end + 2) != Some(&b'Z')
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        // A process reaped between the open and the read fails the read
+        // with ESRCH rather than ENOENT; either way it is gone.
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => false,
         Err(error) => panic!("could not inspect process {pid}: {error}"),
     }
 }
@@ -6646,4 +6648,31 @@ fn unknown_prune_env_value_warns_and_never_blocks_the_update() {
         b"  warning: ignoring DOT_SHDEPS_PRUNE=weekly; expected never, cron, or always\n",
     );
     assert_eq!(prune_record(&fixture), None);
+}
+
+/// `/proc/<pid>/stat` fails with ESRCH, not ENOENT, when its process is reaped
+/// between the open and the read. Race the read against the reap of many
+/// short-lived children; one ESRCH used to panic the probe.
+#[cfg(target_os = "linux")]
+#[test]
+fn process_running_pid_treats_a_reap_during_the_read_as_stopped() {
+    for _ in 0..300 {
+        let mut child = Command::new("/bin/true")
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = i32::try_from(child.id()).expect("child pid fits pid_t");
+        let poller = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while Path::new(&format!("/proc/{pid}")).exists()
+                && std::time::Instant::now() < deadline
+            {
+                process_running_pid(pid);
+            }
+        });
+        child.wait().expect("reap short-lived child");
+        poller
+            .join()
+            .expect("probing a process as it is reaped must not panic");
+    }
 }
