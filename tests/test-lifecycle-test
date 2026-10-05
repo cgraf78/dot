@@ -39,6 +39,17 @@ assert_eq 2 "$nan_timeout_status" 'timeout command rejects NaN'
 assert_eq 2 "$zero_timeout_status" 'timeout command rejects zero'
 assert_eq 2 "$negative_timeout_status" 'timeout command rejects negative values'
 
+# Callers may clear the environment entirely. The wrapper relaunches helpers
+# from sys.executable, which a stock CPython leaves empty when it was started
+# by bare name with PATH unset; that used to fail every such run with 126.
+set +e
+empty_env_output=$(env -i "$timeout_command" 5 /bin/sh -c 'printf ok' 2>&1)
+empty_env_status=$?
+set -e
+assert_eq 0 "$empty_env_status" \
+  "timeout command runs without PATH (output: $empty_env_output)"
+assert_eq ok "$empty_env_output" 'timeout command relays output without PATH'
+
 # A nested wrapper is the nearer owner for its target. The outer wrapper must
 # signal that owner once, leave its target dormant while the owner is alive,
 # and still close every relayed pipe before returning.
