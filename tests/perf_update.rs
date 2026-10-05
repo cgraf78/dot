@@ -5979,10 +5979,13 @@ fn direct_child_authority_precedes_a_failing_broad_process_scan() {
     let lock_path = scratch.path().join("inherited-lock");
     let setsid = system_tool("setsid").expect("Linux setsid tool");
     let flock = system_tool("flock").expect("Linux flock tool");
+    // The escaped child ignores TERM and spins once resumed, without
+    // forking, so only KILL ends it. Its spin gives up after 500M rounds:
+    // minutes even in a fast shell, against a watchdog of about 21s.
     dot_test_support::install_fixture_executable(
         &script,
         format!(
-            "#!/bin/sh\nexec 9>'{}'\n'{}' --exclusive --nonblock 9 || exit 91\n'{}' /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; kill -STOP $$; while :; do :; done' _ '{}' &\nwhile [ ! -s '{}' ]; do :; done\nexit 0\n",
+            "#!/bin/sh\nexec 9>'{}'\n'{}' --exclusive --nonblock 9 || exit 91\n'{}' /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; kill -STOP $$; i=0; while [ \"$i\" -lt 500000000 ]; do i=$((i + 1)); done' _ '{}' &\nwhile [ ! -s '{}' ]; do :; done\nexit 0\n",
             lock_path.display(),
             flock.display(),
             setsid.display(),
@@ -6070,10 +6073,13 @@ fn retained_pidfd_survives_an_omitted_then_failed_process_snapshot() {
     let lock_path = scratch.path().join("inherited-lock");
     let setsid = system_tool("setsid").expect("Linux setsid tool");
     let flock = system_tool("flock").expect("Linux flock tool");
+    // The escaped child ignores TERM and spins once resumed, without
+    // forking, so only KILL ends it. Its spin gives up after 500M rounds:
+    // minutes even in a fast shell, against a watchdog of about 21s.
     dot_test_support::install_fixture_executable(
         &script,
         format!(
-            "#!/bin/sh\nexec 9>'{}'\n'{}' --exclusive --nonblock 9 || exit 91\n'{}' /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; kill -STOP $$; while :; do :; done' _ '{}' &\nwhile [ ! -s '{}' ]; do :; done\nexit 0\n",
+            "#!/bin/sh\nexec 9>'{}'\n'{}' --exclusive --nonblock 9 || exit 91\n'{}' /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; kill -STOP $$; i=0; while [ \"$i\" -lt 500000000 ]; do i=$((i + 1)); done' _ '{}' &\nwhile [ ! -s '{}' ]; do :; done\nexit 0\n",
             lock_path.display(),
             flock.display(),
             setsid.display(),
@@ -6149,10 +6155,13 @@ fn total_observation_loss_rejects_without_blocking_capture_readers() {
     let lock_path = scratch.path().join("inherited-lock");
     let setsid = system_tool("setsid").expect("Linux setsid tool");
     let flock = system_tool("flock").expect("Linux flock tool");
+    // The escaped child ignores TERM and spins once resumed, without
+    // forking, so only KILL ends it. Its spin gives up after 500M rounds:
+    // minutes even in a fast shell, against a watchdog of about 21s.
     dot_test_support::install_fixture_executable(
         &script,
         format!(
-            "#!/bin/sh\nexec 9>'{}'\n'{}' --exclusive --nonblock 9 || exit 91\n'{}' /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; kill -STOP $$; while :; do :; done' _ '{}' &\nwhile [ ! -s '{}' ]; do :; done\nexit 0\n",
+            "#!/bin/sh\nexec 9>'{}'\n'{}' --exclusive --nonblock 9 || exit 91\n'{}' /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >\"$1\"; kill -STOP $$; i=0; while [ \"$i\" -lt 500000000 ]; do i=$((i + 1)); done' _ '{}' &\nwhile [ ! -s '{}' ]; do :; done\nexit 0\n",
             lock_path.display(),
             flock.display(),
             setsid.display(),

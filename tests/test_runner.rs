@@ -1,7 +1,7 @@
 //! Native process ownership and scheduler regressions.
 #[path = "support/test_fixture.rs"]
 mod fixture;
-use fixture::{Fixture, finish, pid_file, poll, success};
+use fixture::{BOUNDED_HANG, Fixture, finish, pid_file, poll, success};
 use std::fs;
 use std::io::{BufRead as _, Read as _};
 use std::path::Path;
@@ -207,7 +207,10 @@ fn native_parallel_is_bounded_and_replays_indexed_output() {
 #[test]
 fn native_timeout_kills_term_ignoring_descendant() {
     let f = Fixture::new();
-    f.suite("hang", "trap '' TERM\n(trap '' TERM; echo $BASHPID >\"$HOME/descendant\"; while :; do sleep 1; done) &\nwait");
+    f.suite(
+        "hang",
+        &format!("trap '' TERM\n(trap '' TERM; echo $BASHPID >\"$HOME/descendant\"; {BOUNDED_HANG}) &\nwait"),
+    );
     let child = f
         .command(&[])
         .env("DOT_TEST_SUITE_TIMEOUT_SECONDS", "0.4")
@@ -227,7 +230,7 @@ fn native_cancellation_cleans_both_modes_and_preserves_concurrent_run() {
         let f = Fixture::new();
         f.suite(
             "wait",
-            "trap '' TERM\necho $$ >\"$HOME/leader\"\nwhile :; do sleep 1; done",
+            &format!("trap '' TERM\necho $$ >\"$HOME/leader\"\n{BOUNDED_HANG}"),
         );
         let child = f.command(&args).spawn().unwrap();
         poll(|| f.home.join("leader").exists());
@@ -347,7 +350,7 @@ fn native_concurrent_invocations_have_disjoint_roots() {
 #[cfg(target_os = "linux")]
 fn native_teardown_reaps_orphaned_descendants() {
     let f = Fixture::new();
-    f.suite("descendant", "(trap '' TERM; echo $BASHPID >\"$HOME/descendant\"; while :; do sleep 1; done) &\nuntil [[ -s $HOME/descendant ]]; do sleep 0.02; done\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"");
+    f.suite("descendant", &format!("(trap '' TERM; echo $BASHPID >\"$HOME/descendant\"; {BOUNDED_HANG}) &\nuntil [[ -s $HOME/descendant ]]; do sleep 0.02; done\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\""));
     let child = f.command(&[]).spawn().unwrap();
     let pid = pid_file(&f.home.join("descendant")).to_string();
     let start = proc_start_time(pid.trim());
@@ -410,7 +413,7 @@ fn native_cancellation_does_not_stop_another_invocation() {
     let f = Fixture::new();
     f.suite(
         "first",
-        "echo $$ >\"$HOME/first\"; while :; do sleep 1; done",
+        &format!("echo $$ >\"$HOME/first\"; {BOUNDED_HANG}"),
     );
     f.suite("second", "echo $$ >\"$HOME/second\"; until [[ -e $HOME/release ]]; do sleep 0.02; done; printf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"");
     let first = f.command(&["first"]).spawn().unwrap();
@@ -431,7 +434,7 @@ fn native_parallel_cancellation_has_one_shared_grace_deadline() {
     for index in 0..WORKERS {
         f.suite(
             &format!("wait-{index}"),
-            &format!("trap '' TERM\necho $$ >\"$HOME/ready-{index}\"; while :; do sleep 1; done"),
+            &format!("trap '' TERM\necho $$ >\"$HOME/ready-{index}\"; {BOUNDED_HANG}"),
         );
     }
     let mut child = f.command(&["-j", &WORKERS.to_string()]).spawn().unwrap();

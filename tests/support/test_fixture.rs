@@ -105,6 +105,14 @@ pub fn pid_file(path: &Path) -> u32 {
     pid
 }
 
+/// Bash loop for hang fixtures that only Dot's teardown should end. It
+/// idles in 1s sleeps but gives up after 300 rounds: at least 300s, more
+/// under load, against at most about 80s of deadlines in any one test, so
+/// teardown is still what ends it there, yet a fixture that a failed run
+/// never reaped cannot run forever.
+#[allow(dead_code)] // Only the process-ownership binaries run hang fixtures.
+pub const BOUNDED_HANG: &str = "for ((round = 0; round < 300; round++)); do sleep 1; done";
+
 pub fn finish(mut child: Child) -> Output {
     let end = Instant::now() + Duration::from_secs(25);
     loop {

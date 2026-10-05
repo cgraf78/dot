@@ -8853,6 +8853,7 @@ while :; do sleep 0.02; done
         let script = r#"
 import os
 import sys
+import time
 
 child = os.fork()
 if child == 0:
@@ -8864,15 +8865,19 @@ if child == 0:
         os._exit(0)
     os._exit(0)
 os.waitpid(child, 0)
-while True:
+# Give up after 120s; the zombie normally appears within milliseconds.
+# If the test died and something else reaped it, this busy wait would
+# otherwise spin forever.
+deadline = time.monotonic() + 120
+while time.monotonic() < deadline:
     try:
         pid = open(sys.argv[1], encoding="ascii").read().strip()
         stat = open(f"/proc/{pid}/stat", encoding="ascii").read()
     except (FileNotFoundError, ValueError):
         continue
     if ") Z " in stat:
-        break
-os._exit(0)
+        os._exit(0)
+os._exit(1)
 "#;
         let mut command = Command::new("/usr/bin/python3");
         command
@@ -9880,7 +9885,10 @@ child = subprocess.Popen(
 )
 with open(sys.argv[1], "w", encoding="ascii") as output:
     output.write(f"{child.pid}\n")
-while True:
+# Only the cancellation ends this leader, and a sender that panics
+# never sends it. Give up after at least 300s, five times the 60s
+# that the cancelled supervision gets.
+for _ in range(300):
     time.sleep(1)
 "#;
         let mut command = Command::new("/usr/bin/python3");
@@ -9907,8 +9915,18 @@ while True:
             assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
         });
 
+        let started = Instant::now();
         let result = supervise_session(command, None, |_| Ok(())).unwrap();
+        let elapsed = started.elapsed();
         sender.join().unwrap();
+        // Teardown takes at most about 20s even with late walks (1s TERM
+        // grace, about 1.5s hard phase, then up to three late walks, each
+        // starting within the 5s budget), so 60s leaves room for a loaded
+        // host while waiting out the 300s fixture still fails.
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "cancelled supervision took {elapsed:?}"
+        );
         let pid = std::fs::read_to_string(&marker)
             .unwrap()
             .trim()
@@ -10229,6 +10247,7 @@ os._exit(0)
         let script = r#"
 import os
 import sys
+import time
 
 child = os.fork()
 if child == 0:
@@ -10239,15 +10258,19 @@ if child == 0:
         os._exit(0)
     os._exit(0)
 os.waitpid(child, 0)
-while True:
+# Give up after 120s; the zombie normally appears within milliseconds.
+# If the test died and something else reaped it, this busy wait would
+# otherwise spin forever.
+deadline = time.monotonic() + 120
+while time.monotonic() < deadline:
     try:
         pid = open(sys.argv[1], encoding="ascii").read().strip()
         stat = open(f"/proc/{pid}/stat", encoding="ascii").read()
     except (FileNotFoundError, ValueError):
         continue
     if ") Z " in stat:
-        break
-os._exit(0)
+        os._exit(0)
+os._exit(1)
 "#;
         let mut producer = Command::new("/usr/bin/python3")
             .arg("-c")
@@ -10430,6 +10453,7 @@ os._exit(0)
         let script = r#"
 import os
 import sys
+import time
 
 child = os.fork()
 if child == 0:
@@ -10440,15 +10464,19 @@ if child == 0:
         os._exit(0)
     os._exit(0)
 os.waitpid(child, 0)
-while True:
+# Give up after 120s; the zombie normally appears within milliseconds.
+# If the test died and something else reaped it, this busy wait would
+# otherwise spin forever.
+deadline = time.monotonic() + 120
+while time.monotonic() < deadline:
     try:
         pid = open(sys.argv[1], encoding="ascii").read().strip()
         stat = open(f"/proc/{pid}/stat", encoding="ascii").read()
     except (FileNotFoundError, ValueError):
         continue
     if ") Z " in stat:
-        break
-os._exit(0)
+        os._exit(0)
+os._exit(1)
 "#;
         let mut command = Command::new("/usr/bin/python3");
         command
@@ -10509,6 +10537,7 @@ os._exit(0)
         let script = r#"
 import os
 import sys
+import time
 
 child = os.fork()
 if child == 0:
@@ -10519,15 +10548,19 @@ if child == 0:
         os._exit(0)
     os._exit(0)
 os.waitpid(child, 0)
-while True:
+# Give up after 120s; the zombie normally appears within milliseconds.
+# If the test died and something else reaped it, this busy wait would
+# otherwise spin forever.
+deadline = time.monotonic() + 120
+while time.monotonic() < deadline:
     try:
         pid = open(sys.argv[1], encoding="ascii").read().strip()
         stat = open(f"/proc/{pid}/stat", encoding="ascii").read()
     except (FileNotFoundError, ValueError):
         continue
     if ") Z " in stat:
-        break
-os._exit(0)
+        os._exit(0)
+os._exit(1)
 "#;
         let mut command = Command::new("/usr/bin/python3");
         command
@@ -10687,6 +10720,7 @@ os._exit(0)
         let script = r#"
 import os
 import sys
+import time
 
 child = os.fork()
 if child == 0:
@@ -10697,15 +10731,19 @@ if child == 0:
         os._exit(0)
     os._exit(0)
 os.waitpid(child, 0)
-while True:
+# Give up after 120s; the zombie normally appears within milliseconds.
+# If the test died and something else reaped it, this busy wait would
+# otherwise spin forever.
+deadline = time.monotonic() + 120
+while time.monotonic() < deadline:
     try:
         pid = open(sys.argv[1], encoding="ascii").read().strip()
         stat = open(f"/proc/{pid}/stat", encoding="ascii").read()
     except (FileNotFoundError, ValueError):
         continue
     if ") Z " in stat:
-        break
-os._exit(0)
+        os._exit(0)
+os._exit(1)
 "#;
         let mut producer = Command::new("/usr/bin/python3")
             .arg("-c")
@@ -11057,11 +11095,16 @@ os._exit(0)
         let child_ready = scope.path().join("child-ready");
         let child_term = scope.path().join("child-term");
         let leader_term = scope.path().join("leader-term");
+        // Leader and child only log TERM, and the SIGKILL that ends them
+        // comes last, so a failed poll would leave both running. Each
+        // gives up after 6000 rounds (the child's 50ms apart, the
+        // leader's once stdin closes): at least 300s, far past this
+        // test's few seconds of polls.
         let mut command = Command::new(dot_test_support::bash());
         command
             .args([
                 "-c",
-                "trap 'printf \"TERM\\n\" >>\"$3\"' TERM; while :; do if IFS= read -r line; then (trap 'printf \"TERM\\n\" >>\"$2\"' TERM; : >\"$1\"; while :; do sleep 0.05; done) & else sleep 0.05; fi; done",
+                "trap 'printf \"TERM\\n\" >>\"$3\"' TERM; for _ in {1..6000}; do if IFS= read -r line; then (trap 'printf \"TERM\\n\" >>\"$2\"' TERM; : >\"$1\"; for _ in {1..6000}; do sleep 0.05; done) & else sleep 0.05; fi; done",
                 "term-gap-child",
             ])
             .arg(&child_ready)
@@ -12167,18 +12210,31 @@ os._exit(0)
         FORCE_PIDFD_UNAVAILABLE.store(true, std::sync::atomic::Ordering::SeqCst);
         let scope = dot_test_support::TempDir::new("no-pidfd-runtime").unwrap();
         let grouped_pid = scope.path().join("grouped.pid");
+        // The same-group descendant ignores TERM, so it gives up on its own
+        // after 6000 polls 50ms apart: at least 300s, five times the 60s
+        // the supervisor gets below, so waiting it out still fails.
         let mut grouped = Command::new(dot_test_support::bash());
         grouped
             .args([
                 "-c",
-                "(trap '' TERM; printf '%s\\n' \"$BASHPID\" >\"$1\"; while :; do sleep 0.05; done) & while [[ ! -s $1 ]]; do sleep 0.01; done; exit 0",
+                "(trap '' TERM; printf '%s\\n' \"$BASHPID\" >\"$1\"; for _ in {1..6000}; do sleep 0.05; done) & while [[ ! -s $1 ]]; do sleep 0.01; done; exit 0",
                 "no-pidfd-grouped",
             ])
             .arg(&grouped_pid)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        let started = Instant::now();
         let grouped_end = supervise_session(grouped, None, |_| Ok(())).unwrap();
+        // Teardown takes at most about 20s even with late walks (1s TERM
+        // grace, about 1.5s hard phase, then up to three late walks, each
+        // starting within the 5s budget), so 60s leaves room for a loaded
+        // host while waiting out the 300s fixture still fails.
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "supervisor took {:?} to kill the TERM-ignoring descendant",
+            started.elapsed()
+        );
         assert!(matches!(grouped_end, SessionEnd::Exited(status) if status.success()));
         let grouped_pid = std::fs::read_to_string(grouped_pid)
             .unwrap()
@@ -12690,11 +12746,14 @@ os._exit(0)
     fn supervisor_reaps_the_session_when_a_tick_fails() {
         let scope = dot_test_support::TempDir::new("supervisor-tick-error").unwrap();
         let ready = scope.path().join("ready");
+        // The leader ignores TERM, so it gives up on its own after 6000
+        // polls 50ms apart: at least 300s, five times the 60s the
+        // supervisor gets below, so waiting it out still fails.
         let mut command = Command::new(dot_test_support::bash());
         command
             .args([
                 "-c",
-                "trap '' TERM; printf '%s\\n' \"$$\" >\"$1\"; while :; do sleep 0.05; done",
+                "trap '' TERM; printf '%s\\n' \"$$\" >\"$1\"; for _ in {1..6000}; do sleep 0.05; done",
                 "supervisor-tick-error",
             ])
             .arg(&ready)
@@ -12702,6 +12761,7 @@ os._exit(0)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut failed_ticks = 0;
+        let started = Instant::now();
         let result = supervise_session(command, None, |_| {
             if ready.exists() {
                 failed_ticks += 1;
@@ -12710,6 +12770,7 @@ os._exit(0)
                 Ok(())
             }
         });
+        let elapsed = started.elapsed();
         let pid = std::fs::read_to_string(&ready)
             .expect("supervisor child pid")
             .trim()
@@ -12726,6 +12787,14 @@ os._exit(0)
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
+        );
+        // Teardown takes at most about 20s even with late walks (1s TERM
+        // grace, about 1.5s hard phase, then up to three late walks, each
+        // starting within the 5s budget), so 60s leaves room for a loaded
+        // host while waiting out the 300s fixture still fails.
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "supervisor took {elapsed:?} to reap the TERM-ignoring leader"
         );
     }
 

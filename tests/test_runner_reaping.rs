@@ -6,7 +6,7 @@
 #[allow(dead_code)]
 mod fixture;
 
-use fixture::{Fixture, finish, pid_file, success};
+use fixture::{BOUNDED_HANG, Fixture, finish, pid_file, success};
 use std::fs;
 
 #[test]
@@ -20,9 +20,11 @@ fn native_supervisor_reaps_descendants_before_returning() {
     let f = Fixture::new();
     f.suite(
         "descendant",
-        "(trap '' TERM; echo $BASHPID >\"$HOME/descendant\"; while :; do sleep 1; done) &\n\
+        &format!(
+            "(trap '' TERM; echo $BASHPID >\"$HOME/descendant\"; {BOUNDED_HANG}) &\n\
          until [[ -s $HOME/descendant ]]; do sleep 0.02; done\n\
-         printf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
+         printf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\""
+        ),
     );
     let child = f.command(&[]).spawn().unwrap();
     let pid = pid_file(&f.home.join("descendant")).to_string();

@@ -617,11 +617,15 @@ mod tests {
 
         let scope = TempDir::new("hook-worker-abort").expect("scope");
         let marker = scope.path().join("pid");
+        // Only the abort ends the session, and a failed start assertion
+        // never raises it, leaving the scope to join a session that runs
+        // until its leader exits. The leader therefore gives up on its own
+        // after at least 300s, far past this test's 15s bound.
         let mut command = Command::new(dot_test_support::bash());
         command
             .args([
                 "-c",
-                "echo $$ >\"$1\"; while :; do sleep 1; done",
+                "echo $$ >\"$1\"; for _ in {1..300}; do sleep 1; done",
                 "hook-abort",
             ])
             .arg(&marker)
@@ -783,11 +787,14 @@ mod tests {
 
         let scope = TempDir::new("hook-worker-signal-status").expect("scope");
         let ready = scope.path().join("ready");
+        // A sender that panics before its SIGHUP leaves nothing to stop the
+        // worker, so it gives up on its own after at least 300s, five times
+        // the 60s the cancelled wait gets below.
         let mut command = Command::new(dot_test_support::bash());
         command
             .args([
                 "-c",
-                "trap 'exit 0' TERM; : >\"$1\"; while :; do sleep 1; done",
+                "trap 'exit 0' TERM; : >\"$1\"; for _ in {1..300}; do sleep 1; done",
                 "hook-signal",
             ])
             .arg(&ready)
@@ -804,9 +811,19 @@ mod tests {
             // SAFETY: getpid returns this live helper and SIGHUP is handled.
             assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGHUP) }, 0);
         });
+        let started = std::time::Instant::now();
         let status = wait(command);
+        let elapsed = started.elapsed();
         sender.join().unwrap();
         assert_eq!(status, Some(128 + libc::SIGHUP));
+        // Teardown takes at most about 20s even with late walks (1s TERM
+        // grace, about 1.5s hard phase, then up to three late walks, each
+        // starting within the 5s budget), so 60s leaves room for a loaded
+        // host while waiting out the 300s fixture still fails.
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "cancelled worker took {elapsed:?} to stop"
+        );
         let later = scope.path().join("later");
         let mut later_command = Command::new(dot_test_support::bash());
         later_command
@@ -845,11 +862,14 @@ mod tests {
 
         let scope = TempDir::new("hook-worker-teardown-signal").expect("scope");
         let marker = scope.path().join("descendant");
+        // Only teardown's TERM ends the escaped descendant, so it gives up
+        // on its own after at least 300s; that exit sends no SIGHUP, so a
+        // teardown that never signalled it still fails the status check.
         let mut command = Command::new(dot_test_support::bash());
         command
             .args([
                 "-c",
-                "set -m; (trap 'kill -HUP \"$DOT_PARENT_PID\"; exit 0' TERM; echo $BASHPID >\"$1\"; while :; do sleep 1; done) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
+                "set -m; (trap 'kill -HUP \"$DOT_PARENT_PID\"; exit 0' TERM; echo $BASHPID >\"$1\"; for _ in {1..300}; do sleep 1; done) </dev/null >/dev/null 2>&1 & until [[ -s $1 ]]; do sleep 0.01; done",
                 "hook-teardown-signal",
             ])
             .arg(&marker)

@@ -563,10 +563,17 @@ impl Drop for GuardedProbeSession {
 /// Hanging doctor extension `NN-hang<suffix>.sh`: traps every forwarded
 /// signal into a marker, records its PID, and starts an escaped-group
 /// descendant that ignores everything but TERM.
+///
+/// Neither process ends on a signal short of KILL, so both bound
+/// themselves. The descendant idles for at least 300s, far past the
+/// caller's 35s of readiness, exit and cleanup deadlines. The worker's
+/// `wait` returns only for a trapped signal or after the descendant has
+/// gone, so its cap is unreachable inside the test; it just keeps the
+/// worker from spinning on an instantly returning `wait` afterwards.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn hanging_extension(suffix: &str) -> Vec<u8> {
     format!(
-        "doctor() {{\n  trap 'printf \"%s\\n\" HUP >>\"$HOME/doctor-worker{suffix}-signal\"' HUP\n  trap 'printf \"%s\\n\" INT >>\"$HOME/doctor-worker{suffix}-signal\"' INT\n  trap 'printf \"%s\\n\" QUIT >>\"$HOME/doctor-worker{suffix}-signal\"' QUIT\n  trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker{suffix}-signal\"' TERM\n  set -m\n  (\n    trap '' HUP INT QUIT\n    trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker{suffix}-descendant-signal\"' TERM\n    printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker{suffix}-descendant\"\n    while :; do sleep 1; done\n  ) </dev/null >/dev/null 2>&1 &\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker{suffix}\"\n  while :; do wait || true; done\n}}\n"
+        "doctor() {{\n  trap 'printf \"%s\\n\" HUP >>\"$HOME/doctor-worker{suffix}-signal\"' HUP\n  trap 'printf \"%s\\n\" INT >>\"$HOME/doctor-worker{suffix}-signal\"' INT\n  trap 'printf \"%s\\n\" QUIT >>\"$HOME/doctor-worker{suffix}-signal\"' QUIT\n  trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker{suffix}-signal\"' TERM\n  set -m\n  (\n    trap '' HUP INT QUIT\n    trap 'printf \"%s\\n\" TERM >>\"$HOME/doctor-worker{suffix}-descendant-signal\"' TERM\n    printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker{suffix}-descendant\"\n    i=0; while [ \"$i\" -lt 300 ]; do sleep 1; i=$((i + 1)); done\n  ) </dev/null >/dev/null 2>&1 &\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/doctor-worker{suffix}\"\n  i=0; while [ \"$i\" -lt 1000 ]; do wait || true; i=$((i + 1)); done\n}}\n"
     )
     .into_bytes()
 }

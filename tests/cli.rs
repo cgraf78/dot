@@ -4559,6 +4559,11 @@ const HANDLED_SIGNAL_CASES: [(i32, i32, &str); 4] = [
     (libc::SIGTERM, 143, "term"),
 ];
 
+// The TERM-ignoring fixtures that block under this helper idle in 50 ms
+// steps for at most 6000 iterations: at least 300s, and longer under load,
+// against a worst case here of about 80s (60s readiness, 10s exit, then 5s
+// worker exit plus cleanup). A teardown regression still fails the test,
+// but a fixture nothing reaped exits on its own instead of looping forever.
 #[cfg(unix)]
 fn cancel_after_marker_with_signal<T>(
     child: std::process::Child,
@@ -5313,7 +5318,7 @@ case " $* " in
   *" rebase --autostash "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_SYNC_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
@@ -5376,7 +5381,7 @@ case " $* " in
   *" fetch "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_FETCH_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
   *" rev-parse --absolute-git-dir "*)
     if [ -s "$DOT_TEST_GIT_FETCH_READY" ]; then
@@ -5457,7 +5462,7 @@ case " $* " in
   *" rev-parse HEAD "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
@@ -5531,7 +5536,7 @@ case " $* " in
   *" rev-parse HEAD "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
@@ -5590,7 +5595,7 @@ fn direct_signals_during_crontab_stop_the_owned_query() {
         let crontab = shim_dir.join("crontab");
         dot_test_support::install_fixture_executable(
             &crontab,
-            b"#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' \"$$\" >\"$DOT_TEST_CRONTAB_READY\"\nwhile :; do sleep 0.05; done\n",
+            b"#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' \"$$\" >\"$DOT_TEST_CRONTAB_READY\"\ni=0; while [ \"$i\" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1\n",
             0o755,
         )
         .expect("install crontab shim");
@@ -5675,7 +5680,7 @@ case " $* " in
   *" rev-parse --absolute-git-dir "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
@@ -5813,7 +5818,7 @@ case " $* " in
   *" clone "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
@@ -5894,7 +5899,7 @@ case " $* " in
   *" clone --quiet --no-hardlinks "*)
     trap '' TERM
     printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-    while :; do sleep 0.05; done
+    i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     ;;
 esac
 exec "$DOT_TEST_REAL_GIT" "$@"
@@ -6089,7 +6094,7 @@ for arg do last=$arg; done
 if [ "$last" = ls-files ]; then
   trap '' TERM
   printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-  while :; do sleep 0.05; done
+  i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
 fi
 exec "$DOT_TEST_REAL_GIT" "$@"
 "#,
@@ -6216,7 +6221,7 @@ case " $* " in
     if [ -e "$DOT_TEST_GIT_FETCH_FINISHED" ]; then
       trap '' TERM
       printf '%s\n' "$$" >"$DOT_TEST_GIT_QUERY_READY"
-      while :; do sleep 0.05; done
+      i=0; while [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; exit 1
     fi
     ;;
 esac
@@ -6289,7 +6294,7 @@ fn update_native_signal_during_merge_retains_lifecycle_state_and_skips_normaliza
             .client
             .home
             .join("extensions/merge-hooks.d/10-config.sh"),
-        b"merge() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/merge-cancel-ready\"\n  while :; do sleep 0.05; done\n}\n",
+        b"merge() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/merge-cancel-ready\"\n  i=0; while [ \"$i\" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; return 1\n}\n",
     )
     .expect("blocking merge hook");
     std::fs::write(
@@ -6546,7 +6551,7 @@ fn update_native_signal_during_retirement_retains_lifecycle_state_and_skips_norm
     seed_advance(
         &fixture.client.overlay_seed,
         "dot/profile-deactivate",
-        b"deactivate() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/retire-cancel-ready\"\n  while :; do sleep 0.05; done\n}\n",
+        b"deactivate() {\n  trap '' TERM\n  printf '%s\\n' \"$BASHPID\" >\"$HOME/retire-cancel-ready\"\n  i=0; while [ \"$i\" -lt 6000 ]; do sleep 0.05; i=$((i + 1)); done; return 1\n}\n",
     );
     assert_native_silent(
         &fixture.rust_dot_with_bash(&["update", "--quiet"]),

@@ -508,9 +508,13 @@ mod cancellation_tests {
 
         let ready = scope.path().join("move.ready");
         let fake_mv = bin.join("mv");
+        // The held move ignores TERM, so it bounds itself: at least 300s,
+        // well past the 120s the backup gets below, so a backup that waited
+        // it out still fails, yet a helper that died early leaves no
+        // immortal process behind.
         dot_test_support::install_fixture_executable(
             &fake_mv,
-            "#!/bin/sh\n\"$DOT_TEST_REAL_MV\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *'.dot-backup/pull/'*)\n    : >\"$DOT_TEST_MOVE_READY\"\n    trap '' TERM\n    while :; do /bin/sleep 1; done\n    ;;\nesac\nexit \"$status\"\n",
+            "#!/bin/sh\n\"$DOT_TEST_REAL_MV\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *'.dot-backup/pull/'*)\n    : >\"$DOT_TEST_MOVE_READY\"\n    trap '' TERM\n    i=0\n    while [ \"$i\" -lt 300 ]; do /bin/sleep 1; i=$((i + 1)); done\n    ;;\nesac\nexit \"$status\"\n",
             0o755,
         )
         .unwrap();
@@ -603,6 +607,7 @@ mod cancellation_tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         });
+        let started = std::time::Instant::now();
         let outcome = backup_pull_conflicts(
             &BackupConflictsInputs {
                 home: &home_text,
@@ -636,5 +641,15 @@ mod cancellation_tests {
 
         assert_eq!(status, 128 + libc::SIGTERM);
         assert_eq!(std::fs::read(root.join("note")).unwrap(), original);
+        // Up to 60s to engage the hold, then a teardown of at most about 20s
+        // even with late walks (1s TERM grace, about 1.5s hard phase, then up
+        // to three late walks, each starting within the 5s budget), so 120s
+        // leaves room for a loaded host while waiting out the 300s move still
+        // fails.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(120),
+            "backup waited {:?} for the held move",
+            started.elapsed()
+        );
     }
 }
