@@ -196,6 +196,9 @@ fn run_jq(args: &[&OsStr], tmp: &Path, warn: &mut dyn FnMut(&str)) -> bool {
     crate::cancellation::check().is_ok() && std::fs::write(tmp, &output.stdout).is_ok()
 }
 
+/// Error context when a signal interrupts the `jq empty` probe.
+const JQ_VALIDATION_INTERRUPTED: &str = "jq validation interrupted";
+
 /// The `jq empty` corruption probe. Ordinary nonzero exit means invalid JSON;
 /// cancellation or an unverified teardown remains a typed error so callers
 /// never delete a valid destination merely because validation was interrupted.
@@ -216,7 +219,7 @@ fn jq_valid(dst: &Path) -> Result<bool, Error> {
     ) {
         Ok(output) => Ok(output.status.success()),
         Err(crate::cleanup::SessionOutputError::Interrupted(_)) => Err(Error::Io {
-            context: "jq validation interrupted",
+            context: JQ_VALIDATION_INTERRUPTED,
             source: std::io::ErrorKind::Interrupted.into(),
         }),
         Err(crate::cleanup::SessionOutputError::CleanupIncomplete) => Err(Error::Io {
@@ -337,59 +340,249 @@ pub fn jq_layer(
 mod cancellation_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    // Waiting for the fake `jq` to start and for the helper as a whole are
+    // liveness waits: their failure mode is "never", so the bounds only need to
+    // clear process startup plus bounded teardown on a loaded host. The fake
+    // outlives the helper bound, so a teardown that waited it out instead of
+    // killing it still fails, and a helper killed at the bound cannot leave
+    // the fake looping forever.
+    const FIXTURE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+    const HELPER_TIMEOUT: Duration = Duration::from_secs(90);
+    const FIXTURE_LIFETIME_SECS: u32 = 180;
+    const _: () = assert!(
+        FIXTURE_LIFETIME_SECS as u64 > HELPER_TIMEOUT.as_secs(),
+        "the fake jq must outlive the helper bound"
+    );
+    /// Scratch directory the parent creates and the helper uses, so the
+    /// parent can remove it even when it has to kill the helper.
+    const SCRATCH_ENV: &str = "DOT_MERGE_JQ_CANCEL_SCRATCH";
+    /// File the fake `jq` publishes its PID to once it is running.
+    const READY_FILE: &str = "jq.ready";
+
+    /// How the signal sender thread ended.
+    #[derive(Debug, PartialEq)]
+    enum Delivery {
+        /// The fake `jq` started and SIGTERM was delivered.
+        Delivered,
+        /// `jq_layer` returned before the fake `jq` ever started.
+        LayerFinishedFirst,
+        /// The fake never started; SIGTERM was still delivered so an
+        /// unexpected spawn cannot run forever.
+        NeverReady,
+    }
+
+    /// Drains `pipe` on its own thread so a chatty helper cannot block on a
+    /// full pipe while the parent polls for its exit.
+    fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let _ = pipe.read_to_end(&mut text);
+            String::from_utf8_lossy(&text).into_owned()
+        })
+    }
+
+    /// SIGKILLs the fake `jq` and its process group if it is still running.
+    ///
+    /// The helper normally has the supervisor kill it, but a helper that is
+    /// killed at its bound, or fails, leaves the setsid'd fake behind with
+    /// TERM ignored. Its PID comes from the ready file and is pinned (a
+    /// pidfd on Linux) and confirmed to still be running this scratch's
+    /// fake before any signal, so a recycled PID is never touched. While
+    /// that leader is alive no other group can carry its PID as a group ID,
+    /// so the group kill reaches only the fake and its `sleep` children.
+    fn kill_leftover_fixture(scratch: &std::path::Path) {
+        let jq = scratch.join("bin").join("jq");
+        let Some(pid) = std::fs::read_to_string(scratch.join(READY_FILE))
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            return;
+        };
+        let runs_fixture = || {
+            let command = std::process::Command::new("ps")
+                .args(["-o", "command=", "-p", &pid.to_string()])
+                .output();
+            command.is_ok_and(|output| {
+                String::from_utf8_lossy(&output.stdout).contains(&*jq.to_string_lossy())
+            })
+        };
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: pidfd_open takes a positive PID and flags=0; the
+            // returned descriptor is owned and closed below.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if fd < 0 {
+                return;
+            }
+            let fd = fd as libc::c_int;
+            if runs_fixture() {
+                // SAFETY: the pinned leader is alive, so this group ID is
+                // the fake's own group (or absent, which is harmless).
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+                // SAFETY: fd is a live pidfd owned by this function.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        fd,
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+            }
+            // SAFETY: closes the pidfd opened above exactly once.
+            unsafe { libc::close(fd) };
+        }
+        #[cfg(not(target_os = "linux"))]
+        if runs_fixture() {
+            // SAFETY: signals to a PID just confirmed to run the fake and to
+            // the group it leads.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// Parent-owned scratch: on every exit path, including an unwind, it
+    /// kills a leftover fake `jq` before the directory itself is removed.
+    struct Scratch(dot_test_support::TempDir);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            kill_leftover_fixture(self.0.path());
+        }
+    }
+
+    /// Kills and reaps the helper if `run_helper` unwinds before reaping it.
+    struct HelperGuard(Option<std::process::Child>);
+
+    impl Drop for HelperGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// Re-runs this test in a child process (it owns process signal state)
+    /// and bounds the child, so a lost cancellation fails instead of hanging.
+    fn run_helper(name: &str, helper: &str) {
+        // Declared before the helper guard so it drops after it: the helper
+        // is killed first, then the fake, then the directory.
+        let scratch = Scratch(dot_test_support::TempDir::new("merge-jq-cancel").unwrap());
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(helper, "1")
+            .env(SCRATCH_ENV, scratch.0.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = drain(child.stdout.take().unwrap());
+        let stderr = drain(child.stderr.take().unwrap());
+        let mut helper = HelperGuard(Some(child));
+        let deadline = Instant::now() + HELPER_TIMEOUT;
+        let status = loop {
+            let child = helper.0.as_mut().unwrap();
+            if let Some(status) = child.try_wait().unwrap() {
+                helper.0 = None;
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                drop(helper);
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // Clean up before the assertions so their messages are not delayed;
+        // `Scratch` repeats the (idempotent) kill on unwind paths.
+        kill_leftover_fixture(scratch.0.path());
+        let stdout = stdout.join().unwrap();
+        let stderr = stderr.join().unwrap();
+        match status {
+            Some(status) => assert!(
+                status.success(),
+                "interrupted jq helper failed with {status:?}:\n{stdout}\n{stderr}"
+            ),
+            None => panic!(
+                "interrupted jq helper did not finish within {HELPER_TIMEOUT:?}; \
+                 the cancellation was lost or teardown waited out the fake jq:\n{stdout}\n{stderr}"
+            ),
+        }
+        // A filter typo or a renamed test would otherwise "pass" by running
+        // nothing in the helper.
+        assert!(
+            stdout.contains("test result: ok. 1 passed;"),
+            "interrupted jq helper did not run exactly one test:\n{stdout}\n{stderr}"
+        );
+    }
 
     #[test]
     fn interrupted_jq_validation_never_removes_the_existing_destination() {
         const HELPER: &str = "DOT_MERGE_JQ_CANCEL_HELPER";
+        const NAME: &str = "merge_hooks::cancellation_tests::interrupted_jq_validation_never_removes_the_existing_destination";
         if std::env::var_os(HELPER).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "merge_hooks::cancellation_tests::interrupted_jq_validation_never_removes_the_existing_destination",
-                    "--nocapture",
-                ])
-                .env(HELPER, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "interrupted jq helper failed with {:?}:\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
+            run_helper(NAME, HELPER);
             return;
         }
 
-        let scratch = dot_test_support::TempDir::new("merge-jq-cancel").unwrap();
-        let bin = scratch.path().join("bin");
+        let scratch = std::path::PathBuf::from(std::env::var_os(SCRATCH_ENV).unwrap());
+        let scratch = scratch.as_path();
+        let bin = scratch.join("bin");
         std::fs::create_dir(&bin).unwrap();
-        let ready = scratch.path().join("jq.ready");
+        let ready = scratch.join(READY_FILE);
         let jq = bin.join("jq");
+        // Publish the PID atomically (write then rename) so the parent can
+        // always parse it once the ready file exists. PATH holds only `bin`,
+        // so the rename uses an absolute `/bin/mv`.
         std::fs::write(
             &jq,
             format!(
-                "#!/bin/sh\n: >'{}'\ntrap '' TERM\nwhile :; do /bin/sleep 1; done\n",
-                ready.display()
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" >'{ready}.tmp'\n/bin/mv '{ready}.tmp' '{ready}'\ntrap '' TERM\ni=0\nwhile [ \"$i\" -lt {FIXTURE_LIFETIME_SECS} ]; do /bin/sleep 1; i=$((i + 1)); done\n",
+                ready = ready.display()
             ),
         )
         .unwrap();
         std::fs::set_permissions(&jq, std::fs::Permissions::from_mode(0o755)).unwrap();
         // SAFETY: this recursive helper is the only test in its process.
         unsafe { std::env::set_var("PATH", &bin) };
-        let source = scratch.path().join("source.json");
-        let destination = scratch.path().join("destination.json");
+        let source = scratch.join("source.json");
+        let destination = scratch.join("destination.json");
         std::fs::write(&source, b"{\"new\":true}\n").unwrap();
         std::fs::write(&destination, b"{\"preserve\":true}\n").unwrap();
         let signals = crate::cleanup::Signals::install().unwrap();
         let ready_for_signal = ready.clone();
+        let layer_done = Arc::new(AtomicBool::new(false));
+        let layer_done_for_signal = Arc::clone(&layer_done);
+        // The sender must never return without signalling while `jq_layer`
+        // may still be waiting on the fake: that fake ignores TERM and only a
+        // delivered cancellation makes the supervisor kill it.
         let sender = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while !ready_for_signal.exists() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+            let deadline = Instant::now() + FIXTURE_READY_TIMEOUT;
+            loop {
+                if ready_for_signal.exists() {
+                    break;
+                }
+                if layer_done_for_signal.load(Ordering::SeqCst) {
+                    return Delivery::LayerFinishedFirst;
+                }
+                if Instant::now() >= deadline {
+                    // SAFETY: the helper owns an installed SIGTERM handler.
+                    assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+                    return Delivery::NeverReady;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            assert!(ready_for_signal.exists());
             // SAFETY: the helper owns an installed SIGTERM handler.
             assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+            Delivery::Delivered
         });
         let mut cache = MoveCache::default();
         let mut warnings = Vec::new();
@@ -399,15 +592,30 @@ mod cancellation_tests {
             &destination,
             "$s[0] * $d[0]",
             &mut Ctx {
-                source_root: scratch.path(),
+                source_root: scratch,
                 cache: &mut cache,
                 warnings: &mut warnings,
             },
         );
-        sender.join().unwrap();
+        layer_done.store(true, Ordering::SeqCst);
+        let delivery = sender.join().unwrap();
         let status = signals.finish(if result.is_ok() { 0 } else { 1 });
 
-        assert_eq!(status, 128 + libc::SIGTERM);
+        assert_eq!(
+            delivery,
+            Delivery::Delivered,
+            "the fake jq must start before cancellation; result={result:?} warnings={warnings:?}"
+        );
+        let context = match &result {
+            Err(Error::Io { context, .. }) => Some(*context),
+            _ => None,
+        };
+        assert_eq!(
+            (status, context),
+            (128 + libc::SIGTERM, Some(JQ_VALIDATION_INTERRUPTED)),
+            "interrupted jq validation must report the signal and its typed error: \
+             result={result:?} warnings={warnings:?}"
+        );
         assert_eq!(
             std::fs::read(&destination).unwrap(),
             b"{\"preserve\":true}\n"
