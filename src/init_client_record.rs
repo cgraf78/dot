@@ -814,18 +814,18 @@ mod tests {
 
     /// A shim Git that logs each call and accepts every name but `bad`.
     fn counting_git(scope: &dot_test_support::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt as _;
         let log = scope.path().join("calls.log");
         let shim = scope.path().join("git");
-        std::fs::write(
+        // The readiness probe exits before logging, so counts stay exact;
+        // see `dot_test_support::publish_fixture_script`.
+        dot_test_support::publish_fixture_script(
             &shim,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ \"$3\" != bad ]\n",
+            &format!(
+                "printf '%s\\n' \"$*\" >> '{}'\n[ \"$3\" != bad ]\n",
                 log.display()
             ),
         )
         .expect("shim");
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("mode");
         (shim, log)
     }
 

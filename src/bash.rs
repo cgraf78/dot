@@ -273,13 +273,11 @@ mod tests {
     fn old_bash(root: &Path, relative: &str) -> PathBuf {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().expect("Bash parent")).expect("Bash parent");
-        std::fs::write(
+        dot_test_support::publish_fixture_script(
             &path,
-            b"#!/bin/sh\nprintf 'cgraf78-dot-bash-v1:3:3.2.57(1)-release\\n'\n",
+            "printf 'cgraf78-dot-bash-v1:3:3.2.57(1)-release\\n'\n",
         )
         .expect("old Bash fixture");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("old Bash mode");
         path
     }
 
@@ -457,13 +455,11 @@ mod tests {
         let scope = TempDir::new_exec("bash-noisy-override").expect("scope");
         let candidate = scope.path().join("noisy/bash");
         std::fs::create_dir_all(candidate.parent().expect("Bash parent")).expect("Bash parent");
-        std::fs::write(
+        dot_test_support::publish_fixture_script(
             &candidate,
-            b"#!/bin/sh\nprintf 'cgraf78-dot-bash-v1:5:5.2.15(1)-release\\nunexpected\\n'\n",
+            "printf 'cgraf78-dot-bash-v1:5:5.2.15(1)-release\\nunexpected\\n'\n",
         )
         .expect("noisy Bash fixture");
-        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o755))
-            .expect("noisy Bash mode");
         let env = environment(&[("DOT_BASH", candidate.as_os_str())]);
 
         assert_eq!(
