@@ -250,7 +250,7 @@ pub(crate) fn git_hint(prefix: &[OsString], args: &str) -> String {
             .iter()
             .map(|word| crate::repos_pull_support::shell_quote(word.as_bytes())),
     );
-    format!("`{} {args}`", words.join(" "))
+    crate::repos_pull_support::quote_command(&format!("{} {args}", words.join(" ")))
 }
 
 /// Why a checkout has no `@{u}` although it is not a deliberate
@@ -1271,7 +1271,7 @@ mod tests {
         ];
         assert_eq!(
             git_hint(&prefix, "rebase --abort"),
-            "`git --git-dir=/h/a\\ b/.dotfiles --work-tree=/h/a\\ b rebase --abort`"
+            "'git --git-dir=/h/a\\ b/.dotfiles --work-tree=/h/a\\ b rebase --abort'"
         );
     }
 }

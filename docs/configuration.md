@@ -331,14 +331,16 @@ new exit code that existing callers would have to learn.
   `cron update has not run yet`;
 - with no stamp at all: `cron update success is unknown`.
 
-Every row about a run that did not succeed carries its cause from
-`update.last-failure` when that record describes the run, for example
-`failing: tools: watchexec/watchexec (ambiguous interrupted method
-transition)` (up to three items, then `+N more`; a leading `error: ` is
-dropped and a long cause is shortened after a whole word). The next step
-follows on its own `→` line, like every other warning's: `shdeps health`
-when a dependency or prune failed, otherwise `dot update` for the full output
-(including when Shdeps itself could not be prepared). State written by a Dot
+Every row about a run that did not succeed lists its failing items from
+`update.last-failure` when that record describes the run, one per line, for
+example `- tools: watchexec/watchexec (ambiguous interrupted method
+transition)` (up to five, then `+N more`, which also counts items the record
+did not keep; a leading `error: ` is dropped and a long cause is shortened
+after a whole word). The next step follows on its own `→` line, like every
+other warning's: `shdeps health` when a dependency or prune failed,
+otherwise `dot update` for the full output (including when Shdeps itself
+could not be prepared). Records written by older Dots have the same items and
+render the same way. State written by a Dot
 older than the record shows the same rows without the cause. URL credentials
 (`https://user:token@host`) are redacted to `https://***@host` both when the
 record is written and when it is shown, so a record an older Dot wrote is

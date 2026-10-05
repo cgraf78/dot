@@ -417,6 +417,19 @@ pub fn prepare_overlay_upstream(
     rev_parse(&prefix, &["--verify", tip.as_str()]).ok_or(2u8)
 }
 
+/// A shell command as a next step spells it: in single quotes (`run 'dot
+/// update'`), the style dotfiles' doctor extensions use, so the command's
+/// end is clear inside prose. Callers [`shell_quote`] any path inside it
+/// first. A command whose own quoting holds a `'` is left bare, since
+/// nesting it would break copying the command.
+pub fn quote_command(command: &str) -> String {
+    if command.contains('\'') {
+        command.to_string()
+    } else {
+        format!("'{command}'")
+    }
+}
+
 /// One word of `printf %q` quoting, mirroring C-locale bash on raw
 /// bytes: empty reads `''`, words of `[A-Za-z0-9_@%+=:,./-]` stay
 /// literal, other printable bytes take bare backslash escapes, and

@@ -317,6 +317,36 @@ fn git_bool(value: Option<&[u8]>) -> Option<bool> {
     }
 }
 
+/// The identity keys' raw `--get-regexp -z` output: empty when none is set
+/// (Git's exit 1), `None` when the config cannot be read at all (any other
+/// failure, or the probe could not run).
+fn git_dir_config(git_dir: &Path, home: &Path) -> Option<Vec<u8>> {
+    crate::cancellation::check().ok()?;
+    let mut command = crate::init_client_identity::host_git_command();
+    command
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["config", "-z", "--get-regexp", IDENTITY_CONFIG_KEYS])
+        .env("LC_ALL", "C")
+        .env("HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let output = crate::cleanup::run_session_output(
+        command,
+        None,
+        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+        crate::cleanup::LingerPolicy::Detach,
+    )
+    .ok()?;
+    crate::cancellation::check().ok()?;
+    match output.status.code() {
+        Some(0) => Some(output.stdout),
+        Some(1) => Some(Vec::new()),
+        _ => None,
+    }
+}
+
 /// `HEAD`'s commit and branch from one child, as the predicate used to read
 /// them from `rev-parse HEAD` and `symbolic-ref --short HEAD`.
 ///
@@ -508,6 +538,46 @@ fn remove_forced(path: &Path) -> Result<()> {
     }
 }
 
+/// Why a live client Git directory no longer matches its identity record,
+/// as [`live_git_mismatch`] finds it: the first check that failed. Callers
+/// that only need the verdict use [`live_git_matches_record`]; the
+/// dispatcher names the reason and its recovery when it refuses the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityMismatch {
+    /// The Git directory is missing or not a real directory (a symlink or
+    /// a file now stands in its place).
+    NotDirectory,
+    /// Its device and inode changed: it was recreated, copied, or restored
+    /// since `dot init` recorded it.
+    Replaced,
+    /// Its generation marker no longer names the recorded run.
+    Generation,
+    /// Its Git config could not be read (Git refused it, or the probe
+    /// could not run).
+    Config,
+    /// It has no `origin` URL (`0`) or several (`n`), or one that is not
+    /// UTF-8 (counted as `1`).
+    OriginCount(usize),
+    /// Its single `origin` URL names another repository (or none Dot
+    /// recognizes); carries that URL.
+    OriginRepository(String),
+    /// `HEAD` is detached, unborn, or unreadable.
+    Head,
+    /// `HEAD` is on another branch; carries its name.
+    Branch(String),
+    /// `HEAD` resolved to a malformed commit id.
+    Commit,
+    /// `core.bare` is unset or not a boolean.
+    Bare,
+    /// A non-bare `$HOME/.dotfiles` does not name `$HOME` as its work tree;
+    /// carries the configured value, if any.
+    Worktree(Option<String>),
+    /// An ordinary `$HOME/.git` checkout's top level is not `$HOME`.
+    TopLevel,
+    /// The Git directory is neither `$HOME/.dotfiles` nor `$HOME/.git`.
+    Topology,
+}
+
 /// `_dot_init_live_git_matches_record`: re-verify that the live git
 /// directory still matches the transaction record — same device and
 /// inode, same generation marker (unless adopted), exactly one origin
@@ -523,56 +593,63 @@ fn remove_forced(path: &Path) -> Result<()> {
 /// the one documented narrowing, matching the candidate lane's
 /// `from_utf8_lossy` boundary in the strict direction).
 pub fn live_git_matches_record(inputs: &LiveGitInputs<'_>, deps: &LiveGitDeps<'_>) -> bool {
+    live_git_mismatch(inputs, deps).is_none()
+}
+
+/// The check behind [`live_git_matches_record`], naming the first one that
+/// failed (`None` when the live directory matches). One implementation for
+/// both, so the reason a refusal reports is always the reason it refused.
+pub fn live_git_mismatch(
+    inputs: &LiveGitInputs<'_>,
+    deps: &LiveGitDeps<'_>,
+) -> Option<IdentityMismatch> {
+    use IdentityMismatch as Why;
+
     if !is_real_dir(inputs.git_dir) {
-        return false;
+        return Some(Why::NotDirectory);
     }
     let current = match (deps.path_identity)(inputs.git_dir) {
         Ok(identity) => identity,
-        Err(_) => return false,
+        Err(_) => return Some(Why::NotDirectory),
     };
     if current != format!("{}:{}", inputs.git_dev, inputs.git_ino) {
-        return false;
+        return Some(Why::Replaced);
     }
     if inputs.nonce != "adopted" && !(deps.generation_matches)(inputs.git_dir) {
-        return false;
+        return Some(Why::Generation);
     }
     // Every identity key in one child: an absent key set reads exactly
     // like the empty `--get-all` it replaces.
-    let config = IdentityConfig::parse(
-        &git_dir_output(
-            inputs.git_dir,
-            inputs.home,
-            &["config", "-z", "--get-regexp", IDENTITY_CONFIG_KEYS],
-        )
-        .unwrap_or_default(),
-    );
+    // `--get-regexp` exits 1 when no key matches, which reads like the empty
+    // `--get-all` it replaces; any other failure is an unreadable config,
+    // which fails this check as it always did, now with its own reason.
+    let config = match git_dir_config(inputs.git_dir, inputs.home) {
+        Some(config) => IdentityConfig::parse(&config),
+        None => return Some(Why::Config),
+    };
     let raw = config.origin_urls_as_get_all();
     // NUL bytes cannot live in shell variables; scrub them the way
     // the plan lane's read loops do before framing.
     let scrubbed: Vec<u8> = raw.iter().copied().filter(|byte| *byte != 0).collect();
     let urls = split_lines(&scrubbed);
     if urls.len() != 1 {
-        return false;
+        return Some(Why::OriginCount(urls.len()));
     }
-    let origin = match std::str::from_utf8(urls[0]) {
-        Ok(url) => url,
-        Err(_) => return false,
+    let Ok(origin) = std::str::from_utf8(urls[0]) else {
+        return Some(Why::OriginCount(1));
     };
-    let identity = match (deps.repo_identity)(origin) {
-        Ok(identity) => identity,
-        Err(_) => return false,
-    };
-    if identity != inputs.identity {
-        return false;
+    match (deps.repo_identity)(origin) {
+        Ok(identity) if identity == inputs.identity => {}
+        _ => return Some(Why::OriginRepository(origin.to_string())),
     }
     let Some((commit, branch)) = head_commit_and_branch(inputs.git_dir, inputs.home) else {
-        return false;
+        return Some(Why::Head);
     };
     if branch.as_slice() != inputs.branch.as_bytes() {
-        return false;
+        return Some(Why::Branch(String::from_utf8_lossy(&branch).into_owned()));
     }
     if !commit_valid(&commit) {
-        return false;
+        return Some(Why::Commit);
     }
     if path_bytes(inputs.git_dir) == home_child(inputs.home, ".dotfiles") {
         match config.bare() {
@@ -581,34 +658,28 @@ pub fn live_git_matches_record(inputs: &LiveGitInputs<'_>, deps: &LiveGitDeps<'_
                 // `git config core.worktree`: the last value, and an unset
                 // key fails the probe.
                 let Some(worktree) = config.worktree.as_ref() else {
-                    return false;
+                    return Some(Why::Worktree(None));
                 };
-                if chomp(worktree.clone()).as_slice() != path_bytes(inputs.home) {
-                    return false;
+                let worktree = chomp(worktree.clone());
+                if worktree.as_slice() != path_bytes(inputs.home) {
+                    return Some(Why::Worktree(Some(
+                        String::from_utf8_lossy(&worktree).into_owned(),
+                    )));
                 }
             }
-            None => return false,
+            None => return Some(Why::Bare),
         }
     } else if path_bytes(inputs.git_dir) == home_child(inputs.home, ".git") {
-        let top = match git_home_output(inputs.home, &["rev-parse", "--show-toplevel"]) {
-            Some(output) => chomp(output),
-            None => return false,
-        };
-        let home_real = match physical(inputs.home) {
-            Some(path) => path,
-            None => return false,
-        };
-        let top_real = match physical(Path::new(&OsString::from_vec(top))) {
-            Some(path) => path,
-            None => return false,
-        };
-        if home_real != top_real {
-            return false;
+        let top = git_home_output(inputs.home, &["rev-parse", "--show-toplevel"]).map(chomp);
+        let home_real = physical(inputs.home);
+        let top_real = top.and_then(|top| physical(Path::new(&OsString::from_vec(top))));
+        if home_real.is_none() || home_real != top_real {
+            return Some(Why::TopLevel);
         }
     } else {
-        return false;
+        return Some(Why::Topology);
     }
-    true
+    None
 }
 
 /// `_dot_init_resume_transaction`: replay a transaction forward from

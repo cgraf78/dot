@@ -33,6 +33,10 @@ pub struct Record {
     /// List items attached to this row (`dot_doctor_item`), in filing
     /// order. Rendered one per line below the row; never counted.
     pub items: Vec<Vec<u8>>,
+    /// Further items that exist but are not attached (a record that kept
+    /// only the first few), folded into the `+N more` line. Core rows only;
+    /// the extension API has no way to set it.
+    pub omitted: usize,
     /// Next steps attached to this row (`dot_doctor_hint`), in filing
     /// order. Rendered after the items; never counted.
     pub hints: Vec<Vec<u8>>,
@@ -87,6 +91,13 @@ impl Record {
         self
     }
 
+    /// Count `omitted` further items that are not attached, so the `+N
+    /// more` line covers them too.
+    pub fn with_omitted(mut self, omitted: usize) -> Self {
+        self.omitted += omitted;
+        self
+    }
+
     /// Attach a next step, rendered as a `→` line after the items.
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hints.push(hint.into().into_bytes());
@@ -100,6 +111,7 @@ impl Record {
             message: message.to_vec(),
             detail: detail.map(<[u8]>::to_vec),
             items: Vec::new(),
+            omitted: 0,
             hints: Vec::new(),
         }
     }
@@ -110,6 +122,7 @@ impl Record {
             message: message.into().into_bytes(),
             detail: detail.map(String::into_bytes),
             items: Vec::new(),
+            omitted: 0,
             hints: Vec::new(),
         }
     }
@@ -247,16 +260,27 @@ pub fn render(records: &[Record], palette: &Palette) -> Vec<u8> {
             Kind::Info => info(palette, &record.message, record.detail.as_deref()),
         };
         out.extend_from_slice(&row);
-        out.extend_from_slice(&attachments(palette, &record.items, &record.hints));
+        out.extend_from_slice(&attachments(
+            palette,
+            &record.items,
+            record.omitted,
+            &record.hints,
+        ));
     }
     out
 }
 
 /// The lines below one row: up to [`ITEM_LIMIT`] dim `- item` lines, a dim
-/// `+N more` line for the rest, then one `→ hint` line per hint. Empty
-/// entries are dropped, like an empty detail. Rendering stays per record, so
-/// streaming filed prefixes still concatenates to the whole report.
-pub fn attachments(palette: &Palette, items: &[Vec<u8>], hints: &[Vec<u8>]) -> Vec<u8> {
+/// `+N more` line for the rest and the `omitted` ones, then one `→ hint`
+/// line per hint. Empty entries are dropped, like an empty detail.
+/// Rendering stays per record, so streaming filed prefixes still
+/// concatenates to the whole report.
+pub fn attachments(
+    palette: &Palette,
+    items: &[Vec<u8>],
+    omitted: usize,
+    hints: &[Vec<u8>],
+) -> Vec<u8> {
     let mut out = Vec::new();
     let items: Vec<&Vec<u8>> = items.iter().filter(|item| !item.is_empty()).collect();
     for item in items.iter().take(ITEM_LIMIT) {
@@ -267,10 +291,11 @@ pub fn attachments(palette: &Palette, items: &[Vec<u8>], hints: &[Vec<u8>]) -> V
         out.extend_from_slice(palette.reset.as_bytes());
         out.push(b'\n');
     }
-    if items.len() > ITEM_LIMIT {
+    let more = items.len().saturating_sub(ITEM_LIMIT) + omitted;
+    if more > 0 {
         out.extend_from_slice(b"    ");
         out.extend_from_slice(palette.dim.as_bytes());
-        out.extend_from_slice(format!("+{} more", items.len() - ITEM_LIMIT).as_bytes());
+        out.extend_from_slice(format!("+{more} more").as_bytes());
         out.extend_from_slice(palette.reset.as_bytes());
         out.push(b'\n');
     }

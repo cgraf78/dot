@@ -199,6 +199,22 @@ fn select_with(
                 b"dot: client Git directory no longer matches initialization identity\n".as_slice()
             };
             let _ = stderr.write_all(line);
+            // The refusal stops every command, `dot doctor` included, so
+            // this is the only place that can say what changed and how to
+            // put it back. Classifying re-runs the probes, but only here.
+            // A signal that interrupted the probes makes them read as a
+            // mismatch; only a check that ran to the end has a reason.
+            let classified = crate::cancellation::check()
+                .is_ok()
+                .then(|| client_mismatch(&record, Path::new(home)))
+                .flatten()
+                .filter(|_| crate::cancellation::check().is_ok());
+            if let Some(why) = classified {
+                let completed = completed_record.then_some(&completed);
+                for line in identity_recovery(runtime, &record, home, topology, completed, &why) {
+                    let _ = writeln!(stderr, "dot: {line}");
+                }
+            }
             return Err(());
         }
         return Ok(crate::cli::base_from_values(
@@ -415,6 +431,15 @@ fn client_matches_uncached(
     record: &crate::init_client_record::TransactionRecord,
     home: &Path,
 ) -> bool {
+    client_mismatch(record, home).is_none()
+}
+
+/// Why the live client no longer matches `record` (`None` when it does),
+/// from the same check [`client_matches`] runs.
+fn client_mismatch(
+    record: &crate::init_client_record::TransactionRecord,
+    home: &Path,
+) -> Option<crate::init_client_resume::IdentityMismatch> {
     let git_dir = Path::new(&record.git_dir);
     let path_identity =
         |path: &Path| crate::temp::path_identity(path).map(crate::temp::identity_string);
@@ -445,7 +470,163 @@ fn client_matches_uncached(
         generation_matches: &generation_matches,
         repo_identity: &repo_identity,
     };
-    crate::init_client_resume::live_git_matches_record(&inputs, &deps)
+    crate::init_client_resume::live_git_mismatch(&inputs, &deps)
+}
+
+/// What changed and how to put it back, for a client the identity guard
+/// refuses: one line naming the mismatch, then the recovery. Every step was
+/// checked to restore a working client (or, for a replaced Git directory, to
+/// re-establish its identity) without touching the files in `$HOME`.
+/// `completed` is the record to move aside to re-adopt a replaced
+/// directory, when that is the way back. The few extra Git reads that pick
+/// between steps run only here, on a refusal.
+fn identity_recovery(
+    runtime: &crate::app::Runtime,
+    record: &crate::init_client_record::TransactionRecord,
+    home: &str,
+    topology: &str,
+    completed: Option<&PathBuf>,
+    why: &crate::init_client_resume::IdentityMismatch,
+) -> Vec<String> {
+    use crate::init_client_resume::IdentityMismatch as Why;
+    use crate::repos_pull_support::{quote_command, shell_quote};
+
+    let quote = |text: &str| shell_quote(text.as_bytes());
+    let git_dir = Path::new(&record.git_dir);
+    let git = format!("git --git-dir={}", quote(&record.git_dir));
+    // The recorded origin can carry credentials; no step prints them, and a
+    // final line says where they go back.
+    let origin = crate::redact::credentials(&record.origin);
+    let run = |command: String| format!("to fix it, run {}", quote_command(&command));
+    let has_key = |key: &str| git_dir_output(runtime, git_dir, &["config", "--get", key]).is_some();
+    let checkout = || {
+        run(format!(
+            "{git} --work-tree={} checkout {}",
+            quote(home),
+            quote(&record.branch)
+        ))
+    };
+    let shown = &record.git_dir;
+    let init = quote_command(&format!("dot init {}", quote(&origin)));
+    let mut lines = match why {
+        Why::Branch(found) => vec![
+            format!(
+                "{shown} is on branch '{found}', not '{}', the branch dot init recorded",
+                record.branch
+            ),
+            checkout(),
+        ],
+        Why::Head => vec![
+            format!(
+                "{shown} has a detached or unborn HEAD, not branch '{}'",
+                record.branch
+            ),
+            checkout(),
+        ],
+        Why::Worktree(found) => vec![
+            match found {
+                Some(found) => format!("{shown} has core.worktree {found}, not {home}"),
+                None => format!("{shown} has no core.worktree; it must name {home}"),
+            },
+            run(format!("{git} config core.worktree {}", quote(home))),
+        ],
+        Why::Bare => vec![
+            format!("{shown} has no valid core.bare setting"),
+            run(format!("{git} config core.bare false")),
+        ],
+        Why::Config => vec![
+            format!("{shown} has a Git config that cannot be read"),
+            format!(
+                "run {} to see the error, fix it, then rerun the command",
+                quote_command(&format!("{git} config --list"))
+            ),
+        ],
+        Why::OriginCount(0) => vec![
+            format!("{shown} has no origin URL"),
+            // A remote whose URL alone was removed still exists, and
+            // `remote add` refuses it; `set-url` needs it to exist.
+            if has_key("remote.origin.fetch") {
+                run(format!("{git} remote set-url origin {}", quote(&origin)))
+            } else {
+                run(format!("{git} remote add origin {}", quote(&origin)))
+            },
+        ],
+        Why::OriginCount(1) => vec![
+            format!("{shown} has an origin URL that is not valid UTF-8"),
+            run(format!("{git} remote set-url origin {}", quote(&origin))),
+        ],
+        Why::OriginCount(count) => vec![
+            format!("{shown} has {count} origin URLs"),
+            run(format!(
+                "{git} config --replace-all remote.origin.url {}",
+                quote(&origin)
+            )),
+        ],
+        Why::OriginRepository(found) => vec![
+            format!(
+                "{shown} has origin {}, not {origin}",
+                crate::redact::credentials(found)
+            ),
+            run(format!("{git} remote set-url origin {}", quote(&origin))),
+        ],
+        Why::TopLevel => vec![
+            format!("{shown} no longer resolves its work tree to {home}"),
+            if has_key("core.worktree") {
+                run(format!("{git} config --unset core.worktree"))
+            } else {
+                // A bare `$HOME/.git` resolves no work tree at all.
+                run(format!("{git} config core.bare false"))
+            },
+        ],
+        Why::NotDirectory | Why::Replaced | Why::Generation => {
+            let what = match why {
+                Why::NotDirectory => format!("{shown} is missing or not a real directory"),
+                Why::Replaced => format!("{shown} was replaced or recreated since dot init"),
+                _ => format!("{shown} carries another dot init's generation marker"),
+            };
+            let mut lines = vec![what];
+            if topology == "ordinary" && *why == Why::NotDirectory {
+                // Without a real `$HOME/.git` there is nothing to adopt, and
+                // `dot init` would clone a separate `~/.dotfiles` beside it.
+                lines.push(format!(
+                    "put the Git directory for {home} back at {shown}, then rerun the command"
+                ));
+            } else {
+                // Re-adopting needs a real Git directory there, which a link
+                // or file standing in for the separate layout is not.
+                let adoptable = *why != Why::NotDirectory;
+                let adopt = completed.filter(|_| adoptable).map(|completed| {
+                    format!(
+                        "if you replaced it yourself, move {} aside and run {init} to adopt it",
+                        completed.display()
+                    )
+                });
+                let adopting = adopt.is_some();
+                lines.extend(adopt);
+                // A fresh clone needs the separate layout: an ordinary
+                // `$HOME/.git` record still demands the directory it names.
+                if topology == "separate" {
+                    lines.push(format!(
+                        "{}move {shown} aside (it keeps any local commits) and run {init} for a fresh clone",
+                        if adopting { "otherwise " } else { "" }
+                    ));
+                }
+            }
+            lines
+        }
+        Why::Commit | Why::Topology => vec![
+            format!("{shown} failed an internal identity check"),
+            "rerun the command; if it persists, report it as a dot bug".to_string(),
+        ],
+    };
+    // Shell quoting escapes each `*`, so match the origin as the steps spell it.
+    let quoted = quote(&origin);
+    if origin != record.origin && lines.iter().any(|line| line.contains(&quoted)) {
+        lines.push(
+            "the origin's credentials are shown as ***; put them back when you run it".to_string(),
+        );
+    }
+    lines
 }
 
 fn git_dir_output(runtime: &crate::app::Runtime, git_dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
@@ -550,6 +731,56 @@ mod tests {
                 git_dev: meta.dev().to_string(),
                 git_ino: meta.ino().to_string(),
             }
+        }
+    }
+
+    #[test]
+    fn recovery_steps_never_print_origin_credentials_and_say_where_they_go() {
+        let scope = dot_test_support::TempDir::new("identity-recovery-creds").expect("scope");
+        let env = std::collections::BTreeMap::from([(
+            std::ffi::OsString::from("HOME"),
+            scope.path().as_os_str().to_owned(),
+        )]);
+        let runtime = crate::app::Runtime::from_env(&env, scope.path()).expect("runtime");
+        let home = scope.path().to_str().expect("utf8");
+        let record = crate::init_client_record::TransactionRecord {
+            phase: "complete".to_string(),
+            origin: "https://bot:s3cret@git.example/o/r.git".to_string(),
+            identity: "git.example/o/r".to_string(),
+            branch: "main".to_string(),
+            commit: CANNED_HEAD.to_string(),
+            git_dir: format!("{home}/.dotfiles"),
+            worktree: home.to_string(),
+            backup: "-".to_string(),
+            dot: "/nonexistent".to_string(),
+            dot_revision: CANNED_HEAD.to_string(),
+            nonce: "adopted".to_string(),
+            git_dev: "-".to_string(),
+            git_ino: "-".to_string(),
+        };
+        let completed = scope.path().join("completed");
+        for why in [
+            crate::init_client_resume::IdentityMismatch::OriginRepository(
+                "https://u:p@other.example/x.git".to_string(),
+            ),
+            crate::init_client_resume::IdentityMismatch::Replaced,
+        ] {
+            let lines = super::identity_recovery(
+                &runtime,
+                &record,
+                home,
+                "separate",
+                Some(&completed),
+                &why,
+            );
+            let text = lines.join("\n");
+            assert!(!text.contains("s3cret") && !text.contains(":p@"), "{text}");
+            assert!(
+                text.ends_with(
+                    "the origin's credentials are shown as ***; put them back when you run it"
+                ),
+                "{text}"
+            );
         }
     }
 

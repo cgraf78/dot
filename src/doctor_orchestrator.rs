@@ -155,6 +155,9 @@ pub struct RuntimeSnapshot {
     /// answer (a stalled filesystem or Git process), which warns like every
     /// other stalled core probe instead of failing as a missing Git.
     pub git_stalled: bool,
+    /// The Git program the probe ran (resolved from `PATH`), for the
+    /// stalled row: a host with several Gits must see which one hung.
+    pub git_path: Vec<u8>,
     /// The running build's version stamp (`dot version`).
     pub version: Vec<u8>,
     /// How a release is installed (`Shdeps release`, a standalone install)
@@ -218,9 +221,12 @@ pub fn check_runtime(
     } else if snapshot.bash_major >= 4 {
         rec.ok(b"Bash runtime", Some(&snapshot.bash_version));
     } else {
-        rec.fail(
-            b"Bash runtime is too old",
-            Some(b"Bash 4 or newer is required"),
+        rec.record(
+            Record::fail(
+                "Bash runtime is too old",
+                Some("Bash 4 or newer is required".to_string()),
+            )
+            .with_hint("install Bash 4 or newer, or point DOT_BASH at one"),
         );
     }
     match &snapshot.git_version {
@@ -231,14 +237,15 @@ pub fn check_runtime(
             Record::warn(
                 "Git runtime did not answer",
                 Some(format!(
-                    "git --version did not answer within {}s",
+                    "{} --version did not answer within {}s",
+                    String::from_utf8_lossy(&snapshot.git_path),
                     crate::doctor_checks::PROBE_TIMEOUT.as_secs()
                 )),
             )
-            .with_hint("check for a stalled filesystem or Git process, then rerun dot doctor"),
+            .with_hint(crate::doctor_checks::STALLED_STEP),
         ),
         None => rec.record(Record::fail("Git runtime is unavailable", None).with_hint(
-            "install Git or put it on PATH; if it is installed, check that git --version works",
+            "install Git or put it on PATH; if it is installed, check that 'git --version' works",
         )),
     }
     for unknown in &snapshot.unknown_config_keys {
@@ -251,17 +258,15 @@ pub fn check_runtime(
         // Severity follows `dot update`: a likely misspelling makes every
         // update exit 1 (the meant setting kept its default), so doctor
         // fails on it too; a key from a newer Dot is safe to miss.
-        if unknown.degrades_update() {
-            rec.fail(
-                b"unknown configuration key ignored",
-                Some(detail.as_bytes()),
-            );
+        let row = if unknown.degrades_update() {
+            Record::fail("unknown configuration key ignored", Some(detail))
         } else {
-            rec.warn(
-                b"unknown configuration key ignored",
-                Some(detail.as_bytes()),
-            );
-        }
+            Record::warn("unknown configuration key ignored", Some(detail))
+        };
+        rec.record(row.with_hint(match unknown.suggestion() {
+            Some(known) => format!("rename it to '{known}' in dot's config"),
+            None => crate::doctor_checks::UNKNOWN_KEY_STEP.to_string(),
+        }));
     }
     check_engine_source(rec, engine);
 }
@@ -323,9 +328,12 @@ pub fn engine_location(snapshot: &EngineSnapshot) -> EngineLocation {
 /// in the version row.
 pub fn check_engine_source(rec: &mut Recorder, snapshot: &EngineSnapshot) {
     if snapshot.ignore_dev_checkout {
-        rec.warn(
-            b"development checkout bypass enabled",
-            Some(b"the provider will use the managed checkout for this invocation"),
+        rec.record(
+            Record::warn(
+                "development checkout bypass enabled",
+                Some("the provider will use the managed checkout for this invocation".to_string()),
+            )
+            .with_hint("unset DOT_IGNORE_DEV_CHECKOUT to use the development checkout again"),
         );
     }
     if engine_location(snapshot) == EngineLocation::Outside {
@@ -573,6 +581,16 @@ pub fn extension_tail(
     record.items = items;
     if exit.timed_out.is_some() {
         record = record.with_hint("set DOT_DOCTOR_TIMEOUT to raise the limit");
+    } else {
+        // The extension ships with a dotfiles repository, which owns the
+        // fix; a newer version may already be published.
+        let at = note
+            .filter(|note| note.status == exit.rc && !note.location.is_empty())
+            .map(|note| String::from_utf8_lossy(&note.location).into_owned());
+        let what = at.unwrap_or_else(|| "it".to_string());
+        record = record.with_hint(format!(
+            "fix {what}, or run 'dot update' if its repository has a fix; then rerun 'dot doctor'"
+        ));
     }
     rec.record(record);
 }
@@ -786,7 +804,10 @@ pub(crate) fn record_extension(
         OutcomeState::TemporaryUnavailable => {
             let mut message = key;
             message.extend_from_slice(b" doctor extension temporary directory unavailable");
-            rec.fail(&message, Some(b"check TMPDIR permissions and free space"));
+            rec.record(
+                Record::bytes(Kind::Fail, &message, None)
+                    .with_hint("check TMPDIR permissions and free space"),
+            );
             1
         }
         OutcomeState::ContextUnavailable => {

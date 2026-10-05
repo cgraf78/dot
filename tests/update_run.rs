@@ -197,11 +197,19 @@ fn repository_commands_and_update_share_client_identity_rejections() {
         .join("\n")
         + "\n";
     std::fs::write(&completed, record).expect("tampered completion record");
-    assert_selector_failure(
-        &tampered_home,
-        &tampered_state,
-        b"dot: client Git directory no longer matches initialization identity\n",
-    );
+    // The refusal line stays first; the reason and recovery follow it.
+    for argv in [&["status"][..], &["update", "--quiet"][..]] {
+        let output = dot(argv, &tampered_home, &tampered_state);
+        assert_eq!(output.status.code(), Some(1), "dot {argv:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.starts_with(
+                "dot: client Git directory no longer matches initialization identity\n\
+                 dot: "
+            ) && stderr.contains("carries another dot init's generation marker"),
+            "dot {argv:?}: {stderr}"
+        );
+    }
 
     let foreign_home = scratch.path().join("foreign-home");
     let foreign_state = scratch.path().join("foreign-state");
@@ -1830,4 +1838,199 @@ fn narrow_base_fetch_keeps_a_static_line() {
         .first()
         .unwrap_or_else(|| panic!("no static fetch line: {text:?}"));
     assert!(fetching < asked, "{text:?}");
+}
+
+/// Run the `git ...` command a refusal's `to fix it, run '...'` line names,
+/// through the fixture Git. Scratch paths need no quoting, so the words
+/// split on spaces.
+fn run_recovery_step(stderr: &str) {
+    let step = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("dot: to fix it, run '"))
+        .and_then(|rest| rest.strip_suffix('\''))
+        .unwrap_or_else(|| panic!("no runnable step in {stderr}"));
+    let words: Vec<&str> = step.split(' ').collect();
+    assert_eq!(words[0], "git", "{step}");
+    let output = dot_test_support::git()
+        .args(&words[1..])
+        .output()
+        .expect("run recovery step");
+    assert!(
+        output.status.success(),
+        "{step}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn identity_refusal_names_what_changed_and_a_step_that_restores_the_client() {
+    // The refusal stops every command, `dot doctor` included, and used to
+    // say only that the client "no longer matches". Each case breaks one
+    // recorded fact, checks the refusal names it, runs the step it gives,
+    // and checks the client works again.
+    let scratch = Scratch::new("client-identity-recovery").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let client_git = |home: &Path, args: &[&str]| {
+        let status = dot_test_support::git()
+            .arg(format!("--git-dir={}", home.join(".dotfiles").display()))
+            .arg(format!("--work-tree={}", home.display()))
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("client git");
+        assert!(status.success(), "git {args:?}");
+    };
+    let cases: [(&str, &[&str], &str); 8] = [
+        (
+            "branch",
+            &["checkout", "-q", "-b", "other"],
+            "is on branch 'other', not 'main'",
+        ),
+        (
+            "bare-unset",
+            &["config", "--unset", "core.bare"],
+            "has no valid core.bare setting",
+        ),
+        (
+            "url-unset",
+            &["config", "--unset", "remote.origin.url"],
+            "has no origin URL",
+        ),
+        (
+            "remote-removed",
+            &["remote", "remove", "origin"],
+            "has no origin URL",
+        ),
+        (
+            "two-origins",
+            &[
+                "config",
+                "--add",
+                "remote.origin.url",
+                "https://example.invalid/x.git",
+            ],
+            "has 2 origin URLs",
+        ),
+        (
+            "detached",
+            &["checkout", "-q", "--detach"],
+            "has a detached or unborn HEAD",
+        ),
+        (
+            "worktree",
+            &["config", "--unset", "core.worktree"],
+            "has no core.worktree",
+        ),
+        (
+            "origin",
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/o/r.git",
+            ],
+            "has origin https://example.invalid/o/r.git, not file://",
+        ),
+    ];
+    for (tag, breaks, reason) in cases {
+        let (home, state) = twin_client(&scratch, tag, &overlay_origin, &base_origin);
+        client_git(&home, breaks);
+        let refused = dot(&["status"], &home, &state);
+        assert_eq!(refused.status.code(), Some(1), "{tag}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.starts_with(
+                "dot: client Git directory no longer matches initialization identity\n"
+            ),
+            "{tag}: {stderr}"
+        );
+        assert!(stderr.contains(reason), "{tag}: {stderr}");
+        run_recovery_step(&stderr);
+        let recovered = dot(&["status"], &home, &state);
+        assert!(
+            recovered.status.success(),
+            "{tag}: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+    }
+
+    // An unreadable config is named as such, with how to see Git's error,
+    // rather than as a missing origin with a step that would fail.
+    let (home, state) = twin_client(&scratch, "bad-config", &overlay_origin, &base_origin);
+    let config = home.join(".dotfiles/config");
+    let mut text = std::fs::read_to_string(&config).expect("config");
+    text.push_str("[bogus\n");
+    std::fs::write(&config, text).expect("break config");
+    // The fixture Git first on PATH: a developer's Git launcher that routes
+    // by `$HOME` would otherwise read the broken config for every child.
+    let git = dot_test_support::git();
+    let fixture_git = Path::new(git.get_program())
+        .parent()
+        .expect("git directory");
+    let path = std::env::join_paths(std::iter::once(fixture_git.to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("PATH");
+    let refused = dot_env(
+        &["status"],
+        &home,
+        &state,
+        &[("PATH", path.to_str().expect("utf8 PATH"))],
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("has a Git config that cannot be read"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(" config --list' to see the error"),
+        "{stderr}"
+    );
+
+    // A replaced Git directory: both ways back are named, and the fresh
+    // clone (moving the copy aside keeps its commits) works.
+    let (home, state) = twin_client(&scratch, "replaced", &overlay_origin, &base_origin);
+    let git_dir = home.join(".dotfiles");
+    std::fs::rename(&git_dir, home.join(".dotfiles.old")).expect("move");
+    let copy = Command::new("cp")
+        .arg("-a")
+        .arg(home.join(".dotfiles.old"))
+        .arg(&git_dir)
+        .status()
+        .expect("copy");
+    assert!(copy.success());
+    let refused = dot(&["status"], &home, &state);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("was replaced or recreated since dot init"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "move {} aside and run 'dot init file://",
+            state.join("dot/init/completed").display()
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("otherwise move {} aside", git_dir.display())),
+        "{stderr}"
+    );
+    std::fs::rename(&git_dir, home.join(".dotfiles.replaced")).expect("move aside");
+    let init = dot(
+        &[
+            "init",
+            "--yes",
+            &format!("file://{}", base_origin.display()),
+        ],
+        &home,
+        &state,
+    );
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    assert!(dot(&["status"], &home, &state).status.success());
 }
