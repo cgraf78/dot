@@ -1514,7 +1514,7 @@ pub fn check_overlays(inputs: &OverlayInputs) -> Vec<Record> {
                 out.push(
                     Record::fail(format!("{name}: selected but unavailable"), None).with_hint(
                         format!(
-                            "run 'dot update' to clone it; if it stays unavailable, check its source (a sync=none path, or an existing checkout's origin) against {}",
+                            "run 'dot update' to clone it; if the clone fails, check access to its remote, and if it stays unavailable, check its source (a sync=none path, or an existing checkout's origin) against {}",
                             tilde(&fields[2], inputs.home)
                         ),
                     ),
@@ -2671,6 +2671,23 @@ enum Distance {
     Diverged,
 }
 
+/// What to do about a branch that is not current with its upstream, in
+/// terms of what `dot update` does: it pulls a branch that is behind and
+/// rebases local commits onto the upstream when they diverged, but never
+/// pushes.
+fn distance_step(kind: Distance, upstream: &str, git: &[OsString]) -> String {
+    match kind {
+        Distance::Behind => "run 'dot update' to pull it".to_string(),
+        Distance::Diverged => {
+            format!("run 'dot update'; it rebases the local commits onto {upstream}")
+        }
+        Distance::Ahead => format!(
+            "push the commits when they are ready: run {}",
+            crate::repos_pull::git_hint(git, "push")
+        ),
+    }
+}
+
 /// The [`Distance`] and its detail (`origin/main: 2 commit(s) behind`), or
 /// `None` when current. Callers word the message in their own row style.
 fn distance(upstream: &str, ahead: u64, behind: u64) -> Option<(Distance, String)> {
@@ -2888,7 +2905,9 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
     // symlink compares by what both resolve to (two stats, no child).
     let same_place = resolved == inputs.home
         || (!resolved.is_empty()
-            && std::fs::canonicalize(&resolved).ok() == std::fs::canonicalize(inputs.home).ok());
+            && std::fs::canonicalize(&resolved)
+                .ok()
+                .is_some_and(|top| std::fs::canonicalize(inputs.home).ok() == Some(top)));
     if same_place {
         out.push(Record::ok("client worktree resolves to $HOME", None));
     } else {
@@ -2991,7 +3010,10 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
                     Distance::Ahead => "client is ahead of upstream",
                     Distance::Diverged => "client upstream has diverged",
                 };
-                out.push(Record::warn(message, Some(detail)));
+                out.push(
+                    Record::warn(message, Some(detail))
+                        .with_hint(distance_step(kind, upstream, &prefix)),
+                );
             }
         },
         None => out.push(gone_upstream_record(&Subject::client(&prefix), upstream)),
@@ -3089,7 +3111,10 @@ fn overlay_state_records(
                     Distance::Ahead => "ahead of upstream",
                     Distance::Diverged => "diverged from upstream",
                 };
-                out.push(Record::warn(format!("{name}: {predicate}"), Some(detail)));
+                out.push(
+                    Record::warn(format!("{name}: {predicate}"), Some(detail))
+                        .with_hint(distance_step(kind, upstream, &prefix)),
+                );
             }
         },
         // Git names the upstream but cannot resolve it (a gone branch);
@@ -3213,9 +3238,18 @@ fn no_upstream_record(subject: &Subject<'_>, head: &str) -> Record {
         subject.message("upstream is not configured"),
         Some(format!("dot update skips pulling {}", subject.object)),
     )
+    // Fetch first: a remote that was removed and added back has no
+    // `origin/<branch>` ref yet to point the branch at.
     .with_hint(format!(
-        "set one: {}",
-        crate::repos_pull::git_hint(subject.git, &format!("branch --set-upstream-to={target}"))
+        "set one: run {}",
+        crate::repos_pull_support::quote_command(&format!(
+            "{} && {}",
+            crate::repos_pull::git_command(subject.git, "fetch origin"),
+            crate::repos_pull::git_command(
+                subject.git,
+                &format!("branch --set-upstream-to={target}")
+            )
+        ))
     ))
 }
 

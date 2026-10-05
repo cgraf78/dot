@@ -1844,22 +1844,35 @@ fn narrow_base_fetch_keeps_a_static_line() {
 /// through the fixture Git. Scratch paths need no quoting, so the words
 /// split on spaces.
 fn run_recovery_step(stderr: &str) {
+    if let Err(failure) = try_step(stderr, "dot: to fix it, run '") {
+        panic!("{failure}");
+    }
+}
+
+/// Run the `git ... [&& git ...]` command on the refusal line starting with
+/// `prefix` (which ends in the opening quote), through the fixture Git;
+/// `Err` names the command that failed.
+fn try_step(stderr: &str, prefix: &str) -> Result<(), String> {
     let step = stderr
         .lines()
-        .find_map(|line| line.strip_prefix("dot: to fix it, run '"))
+        .find_map(|line| line.strip_prefix(prefix))
         .and_then(|rest| rest.strip_suffix('\''))
-        .unwrap_or_else(|| panic!("no runnable step in {stderr}"));
-    let words: Vec<&str> = step.split(' ').collect();
-    assert_eq!(words[0], "git", "{step}");
-    let output = dot_test_support::git()
-        .args(&words[1..])
-        .output()
-        .expect("run recovery step");
-    assert!(
-        output.status.success(),
-        "{step}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .unwrap_or_else(|| panic!("no {prefix:?} step in {stderr}"));
+    for command in step.split(" && ") {
+        let words: Vec<&str> = command.split(' ').collect();
+        assert_eq!(words[0], "git", "{step}");
+        let output = dot_test_support::git()
+            .args(&words[1..])
+            .output()
+            .expect("run recovery step");
+        if !output.status.success() {
+            return Err(format!(
+                "{command}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -1936,6 +1949,15 @@ fn identity_refusal_names_what_changed_and_a_step_that_restores_the_client() {
     for (tag, breaks, reason) in cases {
         let (home, state) = twin_client(&scratch, tag, &overlay_origin, &base_origin);
         client_git(&home, breaks);
+        if tag == "remote-removed" {
+            // A global `remote.origin.*` key does not bring the remote back
+            // for `git remote set-url`; the step must still add it.
+            std::fs::write(
+                home.join(".gitconfig"),
+                "[remote \"origin\"]\n\tprune = true\n",
+            )
+            .expect("global config");
+        }
         let refused = dot(&["status"], &home, &state);
         assert_eq!(refused.status.code(), Some(1), "{tag}");
         let stderr = String::from_utf8_lossy(&refused.stderr);
@@ -1946,6 +1968,10 @@ fn identity_refusal_names_what_changed_and_a_step_that_restores_the_client() {
             "{tag}: {stderr}"
         );
         assert!(stderr.contains(reason), "{tag}: {stderr}");
+        if tag == "detached" {
+            // Commits made on the detached HEAD are kept before switching.
+            assert!(stderr.contains("keep them first: run '"), "{tag}: {stderr}");
+        }
         run_recovery_step(&stderr);
         let recovered = dot(&["status"], &home, &state);
         assert!(
@@ -1953,7 +1979,67 @@ fn identity_refusal_names_what_changed_and_a_step_that_restores_the_client() {
             "{tag}: {}",
             String::from_utf8_lossy(&recovered.stderr)
         );
+        if tag == "remote-removed" {
+            assert!(stderr.contains(" remote add origin "), "{stderr}");
+            // The step brings back the tracking refs and the upstream too,
+            // without which `dot update` skips the client.
+            let update = dot(&["update"], &home, &state);
+            let stdout = String::from_utf8_lossy(&update.stdout);
+            assert!(update.status.success(), "{stdout}");
+            assert!(!stdout.contains("skipped"), "{stdout}");
+        }
     }
+
+    // Another ref named like the branch makes Git spell it `heads/main`,
+    // so checking out `main` would change nothing: the step renames the
+    // shadowing tag instead.
+    let (home, state) = twin_client(&scratch, "tag-shadow", &overlay_origin, &base_origin);
+    client_git(&home, &["tag", "main"]);
+    let refused = dot(&["status"], &home, &state);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("but another ref with that name shadows it"),
+        "{stderr}"
+    );
+    try_step(&stderr, "dot: rename refs/tags/main: run '").expect("rename the tag");
+    assert!(
+        stderr.contains("remote.origin.tagOpt --no-tags"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("refs/remotes/main"), "{stderr}");
+    assert!(dot(&["status"], &home, &state).status.success());
+
+    // A tracked file named like the recorded branch, whose ref is gone:
+    // `checkout main` without `--` would restore the file over local edits.
+    let (home, state) = twin_client(&scratch, "path-named", &overlay_origin, &base_origin);
+    std::fs::write(home.join("main"), "committed\n").expect("file named main");
+    client_git(&home, &["add", "main"]);
+    client_git(
+        &home,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "main file",
+        ],
+    );
+    client_git(&home, &["checkout", "-q", "-b", "other"]);
+    client_git(&home, &["branch", "-q", "-D", "main"]);
+    std::fs::write(home.join("main"), "edited\n").expect("edit");
+    let refused = dot(&["status"], &home, &state);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains(" checkout main --'"), "{stderr}");
+    assert!(
+        try_step(&stderr, "dot: to fix it, run '").is_err(),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("main")).expect("file"),
+        "edited\n"
+    );
 
     // An unreadable config is named as such, with how to see Git's error,
     // rather than as a missing origin with a step that would fail.
@@ -2008,7 +2094,7 @@ fn identity_refusal_names_what_changed_and_a_step_that_restores_the_client() {
     );
     assert!(
         stderr.contains(&format!(
-            "move {} aside and run 'dot init file://",
+            "move {} aside and run 'dot init --branch main file://",
             state.join("dot/init/completed").display()
         )),
         "{stderr}"
@@ -2033,4 +2119,65 @@ fn identity_refusal_names_what_changed_and_a_step_that_restores_the_client() {
         String::from_utf8_lossy(&init.stderr)
     );
     assert!(dot(&["status"], &home, &state).status.success());
+}
+
+#[test]
+fn recovery_from_a_replaced_git_dir_keeps_the_recorded_branch() {
+    // A client initialized with `--branch work` whose Git directory was
+    // replaced: a `dot init URL` step without the branch would clone the
+    // remote's default branch instead and not restore this client.
+    let scratch = Scratch::new("client-identity-branch").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let status = dot_test_support::git()
+        .arg(format!("--git-dir={}", base_origin.display()))
+        .args(["branch", "work", "main"])
+        .status()
+        .expect("work branch");
+    assert!(status.success());
+    let _ = &overlay_origin;
+    let home = scratch.path().join("home-work");
+    let state = scratch.path().join("state-work");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&state).expect("state");
+    let url = format!("file://{}", base_origin.display());
+    let init = dot(&["init", "--yes", "--branch", "work", &url], &home, &state);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let git_dir = home.join(".dotfiles");
+    std::fs::rename(&git_dir, home.join(".dotfiles.old")).expect("move");
+    let copy = Command::new("cp")
+        .arg("-a")
+        .arg(home.join(".dotfiles.old"))
+        .arg(&git_dir)
+        .status()
+        .expect("copy");
+    assert!(copy.success());
+    let refused = dot(&["status"], &home, &state);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let step = format!("'dot init --branch work {url}'");
+    assert!(
+        stderr.contains(&format!("run {step} to adopt it")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("run {step} for a fresh clone")),
+        "{stderr}"
+    );
+    // The fresh clone, as printed (plus `--yes` for this noninteractive run).
+    std::fs::rename(&git_dir, home.join(".dotfiles.replaced")).expect("move aside");
+    let init = dot(&["init", "--yes", "--branch", "work", &url], &home, &state);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let recovered = dot(&["status"], &home, &state);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
 }

@@ -211,8 +211,13 @@ fn select_with(
                 .filter(|_| crate::cancellation::check().is_ok());
             if let Some(why) = classified {
                 let completed = completed_record.then_some(&completed);
-                for line in identity_recovery(runtime, &record, home, topology, completed, &why) {
-                    let _ = writeln!(stderr, "dot: {line}");
+                let lines = identity_recovery(runtime, &record, home, topology, completed, &why);
+                // The reads that pick a step can be interrupted too; a step
+                // chosen from an interrupted read is not printed.
+                if crate::cancellation::check().is_ok() {
+                    for line in lines {
+                        let _ = writeln!(stderr, "dot: {line}");
+                    }
                 }
             }
             return Err(());
@@ -498,28 +503,98 @@ fn identity_recovery(
     // final line says where they go back.
     let origin = crate::redact::credentials(&record.origin);
     let run = |command: String| format!("to fix it, run {}", quote_command(&command));
-    let has_key = |key: &str| git_dir_output(runtime, git_dir, &["config", "--get", key]).is_some();
+    // The repository's own config: a global `remote.origin.*` key does not
+    // make a remote exist for `git remote`.
+    let has_key = |key: &str| {
+        git_dir_output(runtime, git_dir, &["config", "--local", "--get", key]).is_some()
+    };
+    let has_ref = |name: &str| {
+        git_dir_output(runtime, git_dir, &["show-ref", "--verify", "-q", name]).is_some()
+    };
+    let branch = quote(&record.branch);
+    // `--` keeps a branch name that also names a tracked file from being
+    // read as a path to check out (which would overwrite that file).
     let checkout = || {
         run(format!(
-            "{git} --work-tree={} checkout {}",
-            quote(home),
-            quote(&record.branch)
+            "{git} --work-tree={} checkout {branch} --",
+            quote(home)
         ))
     };
     let shown = &record.git_dir;
-    let init = quote_command(&format!("dot init {}", quote(&origin)));
+    // The recorded branch, so a client initialized with `--branch` comes
+    // back on that branch rather than the remote's default.
+    let init = quote_command(&format!("dot init --branch {branch} {}", quote(&origin)));
     let mut lines = match why {
-        Why::Branch(found) => vec![
-            format!(
-                "{shown} is on branch '{found}', not '{}', the branch dot init recorded",
-                record.branch
-            ),
-            checkout(),
-        ],
+        Why::Branch(found) => {
+            // Still on the branch when Git spells it `heads/<branch>`: another
+            // ref with that name (a tag, or a stray file in the Git directory)
+            // shadows it, and checking the branch out changes nothing. Name
+            // and move the shadowing refs; without one, it is another branch.
+            let mut shadows = Vec::new();
+            if *found == format!("heads/{}", record.branch) {
+                for kind in ["refs/tags/", "refs/"] {
+                    let name = format!("{kind}{}", record.branch);
+                    if !has_ref(&name) {
+                        continue;
+                    }
+                    let target = (1..)
+                        .map(|n| match n {
+                            1 => format!("{name}-renamed"),
+                            n => format!("{name}-renamed-{n}"),
+                        })
+                        .find(|candidate| !has_ref(candidate))
+                        .unwrap_or_default();
+                    shadows.push(format!(
+                        "rename {name}: run {}",
+                        quote_command(&format!(
+                            "{git} update-ref {} {} && {git} update-ref --no-deref -d {}",
+                            quote(&target),
+                            quote(&name),
+                            quote(&name)
+                        ))
+                    ));
+                    if kind == "refs/tags/" {
+                        // `dot update` fetches tags, so a tag origin also has
+                        // comes back on the next update.
+                        shadows.push(format!(
+                            "if origin has that tag too, stop fetching tags: run {}",
+                            quote_command(&format!("{git} config remote.origin.tagOpt --no-tags"))
+                        ));
+                    }
+                }
+                let stray = git_dir.join(&record.branch);
+                if stray.is_file() {
+                    shadows.push(format!(
+                        "move the stray file {} out of the Git directory",
+                        stray.display()
+                    ));
+                }
+            }
+            if shadows.is_empty() {
+                vec![
+                    format!(
+                        "{shown} is on branch '{found}', not '{}', the branch dot init recorded",
+                        record.branch
+                    ),
+                    checkout(),
+                ]
+            } else {
+                let mut lines = vec![format!(
+                    "{shown} is on branch '{}', but another ref with that name shadows it",
+                    record.branch
+                )];
+                lines.extend(shadows);
+                lines
+            }
+        }
         Why::Head => vec![
             format!(
                 "{shown} has a detached or unborn HEAD, not branch '{}'",
                 record.branch
+            ),
+            format!(
+                "if you made commits there, keep them first: run {}",
+                quote_command(&format!("{git} branch NAME"))
             ),
             checkout(),
         ],
@@ -543,12 +618,23 @@ fn identity_recovery(
         ],
         Why::OriginCount(0) => vec![
             format!("{shown} has no origin URL"),
-            // A remote whose URL alone was removed still exists, and
-            // `remote add` refuses it; `set-url` needs it to exist.
-            if has_key("remote.origin.fetch") {
+            // A remote with any key left still exists: `remote add` refuses
+            // it, and `set-url` needs it. A removed remote took its
+            // tracking refs and the branch's upstream along, without which
+            // `dot update` skips the client, so they come back too.
+            if git_dir_output(
+                runtime,
+                git_dir,
+                &["config", "--local", "--get-regexp", r"^remote\.origin\."],
+            )
+            .is_some()
+            {
                 run(format!("{git} remote set-url origin {}", quote(&origin)))
             } else {
-                run(format!("{git} remote add origin {}", quote(&origin)))
+                run(format!(
+                    "{git} remote add origin {} && {git} fetch origin && {git} branch --set-upstream-to=origin/{branch} {branch}",
+                    quote(&origin)
+                ))
             },
         ],
         Why::OriginCount(1) => vec![
@@ -563,10 +649,14 @@ fn identity_recovery(
             )),
         ],
         Why::OriginRepository(found) => vec![
-            format!(
-                "{shown} has origin {}, not {origin}",
-                crate::redact::credentials(found)
-            ),
+            if found.is_empty() {
+                format!("{shown} has an empty origin URL, not {origin}")
+            } else {
+                format!(
+                    "{shown} has origin {}, not {origin}",
+                    crate::redact::credentials(found)
+                )
+            },
             run(format!("{git} remote set-url origin {}", quote(&origin))),
         ],
         Why::TopLevel => vec![
@@ -623,7 +713,7 @@ fn identity_recovery(
     let quoted = quote(&origin);
     if origin != record.origin && lines.iter().any(|line| line.contains(&quoted)) {
         lines.push(
-            "the origin's credentials are shown as ***; put them back when you run it".to_string(),
+            "the origin's credentials are hidden (shown as \\*\\*\\*); put them back when you run it".to_string(),
         );
     }
     lines
@@ -775,13 +865,56 @@ mod tests {
             );
             let text = lines.join("\n");
             assert!(!text.contains("s3cret") && !text.contains(":p@"), "{text}");
+            // The note spells the redaction the way the quoted steps print it.
+            assert!(
+                text.contains("https://\\*\\*\\*@git.example/o/r.git"),
+                "{text}"
+            );
             assert!(
                 text.ends_with(
-                    "the origin's credentials are shown as ***; put them back when you run it"
+                    "the origin's credentials are hidden (shown as \\*\\*\\*); put them back when you run it"
                 ),
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn an_empty_origin_url_is_named_as_empty() {
+        let scope = dot_test_support::TempDir::new("identity-recovery-empty").expect("scope");
+        let env = std::collections::BTreeMap::from([(
+            std::ffi::OsString::from("HOME"),
+            scope.path().as_os_str().to_owned(),
+        )]);
+        let runtime = crate::app::Runtime::from_env(&env, scope.path()).expect("runtime");
+        let home = scope.path().to_str().expect("utf8");
+        let record = crate::init_client_record::TransactionRecord {
+            phase: "complete".to_string(),
+            origin: "https://git.example/o/r.git".to_string(),
+            identity: "git.example/o/r".to_string(),
+            branch: "main".to_string(),
+            commit: CANNED_HEAD.to_string(),
+            git_dir: format!("{home}/.dotfiles"),
+            worktree: home.to_string(),
+            backup: "-".to_string(),
+            dot: "/nonexistent".to_string(),
+            dot_revision: CANNED_HEAD.to_string(),
+            nonce: "adopted".to_string(),
+            git_dev: "-".to_string(),
+            git_ino: "-".to_string(),
+        };
+        let lines = super::identity_recovery(
+            &runtime,
+            &record,
+            home,
+            "separate",
+            None,
+            &crate::init_client_resume::IdentityMismatch::OriginRepository(String::new()),
+        );
+        assert!(
+            lines[0].ends_with("has an empty origin URL, not https://git.example/o/r.git"),
+            "{lines:?}"
+        );
     }
 
     /// A legacy `~/.dotfiles` client plus a Git shim that answers the

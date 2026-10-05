@@ -1899,7 +1899,7 @@ fn overlay_branch_upstream_and_dirt_follow_update_severities() {
     );
     assert!(
         untracked.contains(&format!(
-            "    → set one: 'git -C {} branch --set-upstream-to=origin/side'\n",
+            "    → set one: run 'git -C {0} fetch origin && git -C {0} branch --set-upstream-to=origin/side'\n",
             repo.display()
         )),
         "{untracked}"
@@ -2949,7 +2949,18 @@ fn base_repo_upstream_current_ahead_behind_and_diverged() {
     std::fs::remove_file(&marker).expect("remove marker");
 
     git(&home, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
-    assert!(render(&check_base_repo(&inputs())).contains("1 commit(s) ahead"));
+    let ahead = render(&check_base_repo(&inputs()));
+    assert!(ahead.contains("1 commit(s) ahead"), "{ahead}");
+    // Each distance says what to do: update never pushes.
+    assert_eq!(
+        hint_of(&ahead, "client is ahead of upstream"),
+        Some(
+            "push the commits when they are ready: run 'git -C HOME push'"
+                .replace("HOME", home.to_str().expect("utf8"))
+                .as_str()
+        ),
+        "{ahead}"
+    );
 
     git(&home, &["reset", "-q", "--hard", "origin/main"]);
     let peer = scratch.path().join("peer");
@@ -2963,10 +2974,22 @@ fn base_repo_upstream_current_ahead_behind_and_diverged() {
     git(&peer, &["commit", "-q", "--allow-empty", "-m", "behind"]);
     git(&peer, &["push", "-q", "origin", "main"]);
     git(&home, &["fetch", "-q", "origin"]);
-    assert!(render(&check_base_repo(&inputs())).contains("1 commit(s) behind"));
+    let behind = render(&check_base_repo(&inputs()));
+    assert!(behind.contains("1 commit(s) behind"), "{behind}");
+    assert_eq!(
+        hint_of(&behind, "client is behind upstream"),
+        Some("run 'dot update' to pull it"),
+        "{behind}"
+    );
 
     git(&home, &["commit", "-q", "--allow-empty", "-m", "local"]);
-    assert!(render(&check_base_repo(&inputs())).contains("1 ahead, 1 behind"));
+    let diverged = render(&check_base_repo(&inputs()));
+    assert!(diverged.contains("1 ahead, 1 behind"), "{diverged}");
+    assert_eq!(
+        hint_of(&diverged, "client upstream has diverged"),
+        Some("run 'dot update'; it rebases the local commits onto origin/main"),
+        "{diverged}"
+    );
 }
 
 /// The `→` next step attached to the first row whose line contains `title`,

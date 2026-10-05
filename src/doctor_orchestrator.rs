@@ -165,6 +165,9 @@ pub struct RuntimeSnapshot {
     /// `None` when that check reports the layout itself as a problem row.
     /// Checkouts ignore it and name their location instead.
     pub install_kind: Option<String>,
+    /// The client config file (`$XDG_CONFIG_HOME/dot/config`), which an
+    /// unknown key's step names.
+    pub config_path: Vec<u8>,
     /// Config keys this release ignored; each becomes a warning so a
     /// typo or a Dot that lags the client repository stays visible.
     pub unknown_config_keys: Vec<crate::config::UnknownKey>,
@@ -264,7 +267,13 @@ pub fn check_runtime(
             Record::warn("unknown configuration key ignored", Some(detail))
         };
         rec.record(row.with_hint(match unknown.suggestion() {
-            Some(known) => format!("rename it to '{known}' in dot's config"),
+            Some(known) => format!(
+                "rename it to '{known}' in {}",
+                String::from_utf8_lossy(&crate::doctor_paths::tilde_bytes(
+                    &snapshot.config_path,
+                    home
+                ))
+            ),
             None => crate::doctor_checks::UNKNOWN_KEY_STEP.to_string(),
         }));
     }

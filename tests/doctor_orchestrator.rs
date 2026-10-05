@@ -37,6 +37,7 @@ fn runtime_check_agrees() {
         git_path: b"/usr/bin/git".to_vec(),
         version: b"20261003-000000-abcdef12".to_vec(),
         install_kind: None,
+        config_path: b"/home/u/.config/dot/config".to_vec(),
         unknown_config_keys: Vec::new(),
     };
     check_runtime(&mut rec, &runtime, &engine(b"/src"), b"/home/u");
@@ -86,6 +87,7 @@ fn a_stalled_git_probe_warns_and_a_missing_git_says_what_to_do() {
         git_path: b"/usr/bin/git".to_vec(),
         version: b"20261003-000000-abcdef12".to_vec(),
         install_kind: None,
+        config_path: b"/home/u/.config/dot/config".to_vec(),
         unknown_config_keys: Vec::new(),
     };
     let mut stalled = Recorder::new();
@@ -132,6 +134,7 @@ fn runtime_check_warns_once_per_unknown_config_key() {
         git_path: b"/usr/bin/git".to_vec(),
         version: b"20261003-000000-abcdef12".to_vec(),
         install_kind: None,
+        config_path: b"/home/u/.config/dot/config".to_vec(),
         unknown_config_keys: vec![unknown("future_key", 2), unknown("defualt_profile", 3)],
     };
     let mut rec = Recorder::new();
@@ -155,7 +158,7 @@ fn runtime_check_warns_once_per_unknown_config_key() {
     );
     // A likely typo names its fix; a newer key needs a newer dot.
     assert!(
-        rendered.contains("    → rename it to 'default_profile' in dot's config\n"),
+        rendered.contains("    → rename it to 'default_profile' in ~/.config/dot/config\n"),
         "{rendered}"
     );
     assert!(
@@ -180,6 +183,7 @@ fn packaged_runtime_does_not_require_checkout_or_bash() {
         git_path: b"/usr/bin/git".to_vec(),
         version: b"20261003-000000-abcdef12".to_vec(),
         install_kind: None,
+        config_path: b"/home/u/.config/dot/config".to_vec(),
         unknown_config_keys: Vec::new(),
     };
     check_runtime(
@@ -220,6 +224,7 @@ fn version_row_names_how_the_running_build_is_installed() {
             git_path: b"/usr/bin/git".to_vec(),
             version: b"v1".to_vec(),
             install_kind: install_kind.map(str::to_string),
+            config_path: b"/home/u/.config/dot/config".to_vec(),
             unknown_config_keys: Vec::new(),
         };
         let mut snapshot = engine(&runtime.source_root);
@@ -257,6 +262,7 @@ fn version_row_names_how_the_running_build_is_installed() {
             git_path: b"/usr/bin/git".to_vec(),
             version: b"v2".to_vec(),
             install_kind: None,
+            config_path: b"/home/u/.config/dot/config".to_vec(),
             unknown_config_keys: Vec::new(),
         };
         let mut snapshot = engine(&runtime.source_root);

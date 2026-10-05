@@ -709,6 +709,12 @@ fn runtime_snapshot(
         git_path,
         version: crate::version::VERSION.as_bytes().to_vec(),
         install_kind: None,
+        config_path: runtime
+            .config_home()
+            .join("dot/config")
+            .as_os_str()
+            .as_bytes()
+            .to_vec(),
         unknown_config_keys: config.unknown_keys.clone(),
     }
 }
