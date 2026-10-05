@@ -1990,6 +1990,23 @@ fn identity_refusal_names_what_changed_and_a_step_that_restores_the_client() {
         }
     }
 
+    // A removed remote that left a stray key behind still "exists" for
+    // `git remote`, so `remote add` refuses it, and `set-url` alone has no
+    // fetch refspec for the upstream step: the step removes it first.
+    let (home, state) = twin_client(&scratch, "stray-key", &overlay_origin, &base_origin);
+    client_git(&home, &["remote", "remove", "origin"]);
+    client_git(&home, &["config", "remote.origin.prune", "true"]);
+    let refused = dot(&["status"], &home, &state);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains(" remote remove origin && "), "{stderr}");
+    run_recovery_step(&stderr);
+    let update = dot(&["update"], &home, &state);
+    let stdout = String::from_utf8_lossy(&update.stdout);
+    assert!(
+        update.status.success() && !stdout.contains("skipped"),
+        "{stdout}"
+    );
+
     // Another ref named like the branch makes Git spell it `heads/main`,
     // so checking out `main` would change nothing: the step renames the
     // shadowing tag instead.
@@ -2180,4 +2197,47 @@ fn recovery_from_a_replaced_git_dir_keeps_the_recorded_branch() {
         "{}",
         String::from_utf8_lossy(&recovered.stderr)
     );
+}
+
+#[test]
+fn a_branch_named_like_a_git_file_is_never_told_to_move_that_file() {
+    // A client on a branch named `config`, shadowed by a tag of that name:
+    // `$GIT_DIR/config` is the repository's config, not a stray ref, and
+    // moving it away would destroy the client's identity.
+    let scratch = Scratch::new("client-identity-config-branch").expect("scratch dir");
+    let (_overlay_origin, base_origin) = shared_remotes(&scratch);
+    let status = dot_test_support::git()
+        .arg(format!("--git-dir={}", base_origin.display()))
+        .args(["branch", "config", "main"])
+        .status()
+        .expect("config branch");
+    assert!(status.success());
+    let home = scratch.path().join("home-config");
+    let state = scratch.path().join("state-config");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&state).expect("state");
+    let url = format!("file://{}", base_origin.display());
+    let init = dot(
+        &["init", "--yes", "--branch", "config", &url],
+        &home,
+        &state,
+    );
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let status = dot_test_support::git()
+        .arg(format!("--git-dir={}", home.join(".dotfiles").display()))
+        .args(["tag", "config"])
+        .status()
+        .expect("tag");
+    assert!(status.success());
+    let refused = dot(&["status"], &home, &state);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("rename refs/tags/config: run '"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("stray file"), "{stderr}");
 }

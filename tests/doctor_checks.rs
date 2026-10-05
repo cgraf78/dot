@@ -2025,6 +2025,38 @@ fn frozen_overlay_rebase_fails_until_rebased_by_hand() {
         "{rows}"
     );
     assert!(rows.contains("skips this optional overlay"), "{rows}");
+
+    // Diverged while frozen: the row points at the manual rebase.
+    let peer = scratch.path().join("peer");
+    let status = dot_test_support::git()
+        .args(["clone", "-q"])
+        .arg(&remote)
+        .arg(&peer)
+        .stdin(Stdio::null())
+        .status()
+        .expect("clone peer");
+    assert!(status.success());
+    git(&peer, &["commit", "-q", "--allow-empty", "-m", "upstream"]);
+    git(&peer, &["push", "-q", "origin", "main"]);
+    git(repo, &["fetch", "-q", "origin"]);
+    git(repo, &["commit", "-q", "--allow-empty", "-m", "local"]);
+    let local = String::from_utf8(
+        dot_test_support::git()
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("HEAD")
+            .stdout,
+    )
+    .expect("utf8 HEAD");
+    std::fs::write(&marker, format!("{0} {0}\n", local.trim())).expect("frozen marker");
+    let rows = render(&check_overlays(&optional));
+    let step = hint_of(&rows, "ov0: diverged from upstream").expect("step");
+    assert!(
+        step.starts_with("rebase it by hand first: run 'git -C "),
+        "{rows}"
+    );
 }
 
 /// `git` in `repo`, stdout trimmed.
@@ -2989,6 +3021,29 @@ fn base_repo_upstream_current_ahead_behind_and_diverged() {
         hint_of(&diverged, "client upstream has diverged"),
         Some("run 'dot update'; it rebases the local commits onto origin/main"),
         "{diverged}"
+    );
+
+    // Once that rebase froze, `dot update` will not retry it: the diverged
+    // row must point at the manual rebase, not back at `dot update`.
+    let head = String::from_utf8(
+        dot_test_support::git()
+            .arg("-C")
+            .arg(&home)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("HEAD")
+            .stdout,
+    )
+    .expect("utf8 HEAD");
+    std::fs::write(&marker, format!("{} {}\n", head.trim(), head.trim())).expect("marker");
+    let frozen = render(&check_base_repo(&inputs()));
+    assert!(frozen.contains("conflicted; rebase manually"), "{frozen}");
+    let step = hint_of(&frozen, "client upstream has diverged").expect("step");
+    assert!(
+        step.starts_with("rebase it by hand first: run 'git ")
+            && step.contains(" rebase origin/main'")
+            && !step.contains("it rebases the local commits"),
+        "{frozen}"
     );
 }
 

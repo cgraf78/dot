@@ -478,6 +478,56 @@ fn client_mismatch(
     crate::init_client_resume::live_git_mismatch(&inputs, &deps)
 }
 
+/// Names Git itself keeps at the top of a Git directory: a branch named like
+/// one of them must never be told to move that file away.
+const GIT_DIR_FILES: [&str; 22] = [
+    "HEAD",
+    "ORIG_HEAD",
+    "FETCH_HEAD",
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_HEAD",
+    "AUTO_MERGE",
+    "config",
+    "index",
+    "description",
+    "packed-refs",
+    "shallow",
+    "COMMIT_EDITMSG",
+    "commondir",
+    "gitdir",
+    "objects",
+    "refs",
+    "logs",
+    "hooks",
+    "info",
+    "worktrees",
+];
+
+/// Whether `path` (`$GIT_DIR/<branch>`) is a stray file Git reads as a ref,
+/// shadowing the branch: not one of Git's own files, and holding exactly
+/// what a loose ref holds, an object id or `ref: <name>`.
+fn stray_ref_file(path: &Path, branch: &str) -> bool {
+    if GIT_DIR_FILES.contains(&branch) || branch.ends_with("_HEAD") {
+        return false;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() > 512 {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let value = text.trim_end_matches('\n');
+    let oid = matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    oid || value
+        .strip_prefix("ref: ")
+        .is_some_and(|name| name.starts_with("refs/"))
+}
+
 /// What changed and how to put it back, for a client the identity guard
 /// refuses: one line naming the mismatch, then the recovery. Every step was
 /// checked to restore a working client (or, for a replaced Git directory, to
@@ -563,7 +613,7 @@ fn identity_recovery(
                     }
                 }
                 let stray = git_dir.join(&record.branch);
-                if stray.is_file() {
+                if stray_ref_file(&stray, &record.branch) {
                     shadows.push(format!(
                         "move the stray file {} out of the Git directory",
                         stray.display()
@@ -622,17 +672,25 @@ fn identity_recovery(
             // it, and `set-url` needs it. A removed remote took its
             // tracking refs and the branch's upstream along, without which
             // `dot update` skips the client, so they come back too.
-            if git_dir_output(
-                runtime,
-                git_dir,
-                &["config", "--local", "--get-regexp", r"^remote\.origin\."],
-            )
-            .is_some()
-            {
+            // A remote left with only a stray key (`prune`) exists too, but
+            // has no fetch refspec for `set-url` to use; removing it first
+            // lets `remote add` write a whole one.
+            if has_key("remote.origin.fetch") {
                 run(format!("{git} remote set-url origin {}", quote(&origin)))
             } else {
+                let stray = git_dir_output(
+                    runtime,
+                    git_dir,
+                    &["config", "--local", "--get-regexp", r"^remote\.origin\."],
+                )
+                .is_some();
                 run(format!(
-                    "{git} remote add origin {} && {git} fetch origin && {git} branch --set-upstream-to=origin/{branch} {branch}",
+                    "{}{git} remote add origin {} && {git} fetch origin && {git} branch --set-upstream-to=origin/{branch} {branch}",
+                    if stray {
+                        format!("{git} remote remove origin && ")
+                    } else {
+                        String::new()
+                    },
                     quote(&origin)
                 ))
             },
@@ -877,6 +935,42 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_file_holding_a_ref_and_not_named_like_gits_own_is_stray() {
+        let scope = dot_test_support::TempDir::new("stray-ref-file").expect("scope");
+        let file = |name: &str, body: &str| {
+            let path = scope.path().join(name);
+            std::fs::write(&path, body).expect("write");
+            path
+        };
+        let oid = "a".repeat(40);
+        assert!(super::stray_ref_file(
+            &file("main", &format!("{oid}\n")),
+            "main"
+        ));
+        assert!(super::stray_ref_file(
+            &file("work", "ref: refs/heads/main\n"),
+            "work"
+        ));
+        assert!(!super::stray_ref_file(
+            &file("notes", "not a ref\n"),
+            "notes"
+        ));
+        // Git's own files never count, whatever they hold.
+        assert!(!super::stray_ref_file(
+            &file("config", &format!("{oid}\n")),
+            "config"
+        ));
+        assert!(!super::stray_ref_file(
+            &file("ORIG_HEAD", &format!("{oid}\n")),
+            "ORIG_HEAD"
+        ));
+        assert!(!super::stray_ref_file(
+            &scope.path().join("absent"),
+            "absent"
+        ));
     }
 
     #[test]

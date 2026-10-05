@@ -2675,8 +2675,14 @@ enum Distance {
 /// terms of what `dot update` does: it pulls a branch that is behind and
 /// rebases local commits onto the upstream when they diverged, but never
 /// pushes.
-fn distance_step(kind: Distance, upstream: &str, git: &[OsString]) -> String {
+fn distance_step(kind: Distance, upstream: &str, git: &[OsString], frozen: bool) -> String {
     match kind {
+        // A rebase update froze after it conflicted: it does not retry until
+        // the branch is rebased by hand, so pointing at it would loop.
+        Distance::Behind | Distance::Diverged if frozen => format!(
+            "rebase it by hand first: run {}; dot update does not retry it until then",
+            crate::repos_pull::git_hint(git, &format!("rebase {upstream}"))
+        ),
         Distance::Behind => "run 'dot update' to pull it".to_string(),
         Distance::Diverged => {
             format!("run 'dot update'; it rebases the local commits onto {upstream}")
@@ -2960,12 +2966,14 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
             pullable,
         ));
     }
-    out.extend(frozen_rebase_record(
+    let frozen = frozen_rebase_record(
         |upstream| format!("the last client rebase onto {upstream} conflicted; rebase manually"),
         git_dir.as_deref(),
         &status,
         false,
-    ));
+    );
+    let rebase_frozen = frozen.is_some();
+    out.extend(frozen);
     if let Some(git_dir) = git_dir.as_deref() {
         let git = format!(
             "git --git-dir={}",
@@ -3010,10 +3018,12 @@ pub fn check_base_repo(inputs: &BaseRepoInputs) -> Vec<Record> {
                     Distance::Ahead => "client is ahead of upstream",
                     Distance::Diverged => "client upstream has diverged",
                 };
-                out.push(
-                    Record::warn(message, Some(detail))
-                        .with_hint(distance_step(kind, upstream, &prefix)),
-                );
+                out.push(Record::warn(message, Some(detail)).with_hint(distance_step(
+                    kind,
+                    upstream,
+                    &prefix,
+                    rebase_frozen,
+                )));
             }
         },
         None => out.push(gone_upstream_record(&Subject::client(&prefix), upstream)),
@@ -3070,12 +3080,14 @@ fn overlay_state_records(
             pullable,
         ));
     }
-    out.extend(frozen_rebase_record(
+    let frozen = frozen_rebase_record(
         |upstream| format!("{name}: the last rebase onto {upstream} conflicted; rebase manually"),
         git_dir.as_deref(),
         status,
         optional,
-    ));
+    );
+    let rebase_frozen = frozen.is_some();
+    out.extend(frozen);
     if let Some(git_dir) = git_dir.as_deref() {
         let git = format!(
             "git -C {}",
@@ -3113,7 +3125,7 @@ fn overlay_state_records(
                 };
                 out.push(
                     Record::warn(format!("{name}: {predicate}"), Some(detail))
-                        .with_hint(distance_step(kind, upstream, &prefix)),
+                        .with_hint(distance_step(kind, upstream, &prefix, rebase_frozen)),
                 );
             }
         },
