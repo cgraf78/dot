@@ -450,7 +450,7 @@ fn client_matches_uncached(
 
 /// Why the live client no longer matches `record` (`None` when it does),
 /// from the same check [`client_matches`] runs.
-fn client_mismatch(
+pub(crate) fn client_mismatch(
     record: &crate::init_client_record::TransactionRecord,
     home: &Path,
 ) -> Option<crate::init_client_resume::IdentityMismatch> {
@@ -582,7 +582,7 @@ fn identity_recovery(
     let shown = &record.git_dir;
     // The recorded branch, so a client initialized with `--branch` comes
     // back on that branch rather than the remote's default.
-    let init = quote_command(&format!("dot init --branch {branch} {}", quote(&origin)));
+    let init = crate::init_client_command::rerun_command(&record.origin, &record.branch);
     let mut lines = match why {
         Why::Branch(found) => {
             // Still on the branch when Git spells it `heads/<branch>`: another

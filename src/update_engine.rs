@@ -2897,7 +2897,16 @@ fn provider_reexec(
     // The continuation records its own cron outcome; handing its degraded
     // stages and failing items back lets the outer record match instead of
     // reading `fail` (or overwriting the continuation's cause with its own).
-    let status = run_gathered(&nested, &mut *io.out, &mut *io.err, now_secs, degraded);
+    // The outermost run finishes an unfinished `dot init` once, from its own
+    // outcome, which is this nested one's.
+    let status = run_gathered(
+        &nested,
+        &mut *io.out,
+        &mut *io.err,
+        now_secs,
+        degraded,
+        &mut false,
+    );
     inputs.failures.replace(gathered.failures.take());
     Some(status)
 }
@@ -3644,7 +3653,18 @@ pub fn run_update(
         failed: false,
     };
     let mut degraded = crate::update_status::Degraded::default();
-    let code = run_gathered(&inputs, &mut out, &mut err, started, &mut degraded);
+    let mut clean = false;
+    let code = run_gathered(
+        &inputs,
+        &mut out,
+        &mut err,
+        started,
+        &mut degraded,
+        &mut clean,
+    );
+    if clean && inputs.caller == Caller::Update {
+        finish_init(&inputs, &mut err);
+    }
     // A partial stderr line the console held back, or a row an interrupted
     // stage left open, is delivered here. Only a clean run turns a failed
     // delivery into status 1: a provider that exited by signal makes its
@@ -3681,15 +3701,18 @@ pub fn run_update(
 /// Every other run, cron or not, also overwrites the any-trigger
 /// `update.last-run` stamp with the same classification; non-cron runs
 /// write nothing else. `degraded` reports this run's degraded stages to
-/// a provider re-exec's outer run.
+/// a provider re-exec's outer run, and `clean` whether it recorded `ok`
+/// (never a skip, an interruption, or a half that handed off).
 fn run_gathered(
     inputs: &EngineInputs<'_>,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
     now_secs: i64,
     degraded: &mut crate::update_status::Degraded,
+    clean: &mut bool,
 ) -> i32 {
     *degraded = crate::update_status::Degraded::default();
+    *clean = false;
     if cancelled() {
         return 1;
     }
@@ -3798,7 +3821,45 @@ fn run_gathered(
             &inputs.failures.borrow(),
         );
     }
+    *clean = outcome == OUTCOME_OK;
     rc
+}
+
+/// Finish an initialization transaction this clean run converged
+/// ([`crate::init_client_engine::finish_converged`]): a `dot init` whose own
+/// convergence failed leaves its committed transaction open until something
+/// completes it, and every command accepts the open transaction meanwhile.
+///
+/// Only a clean run gets here, once per process (after a provider re-exec's
+/// nested run, from the outer run's outcome), and never for a cron run
+/// skipped for local edits, which converged nothing. It runs under the
+/// update lock `dot init` also takes. `dot init`'s own convergence (`Caller::Init`) completes its
+/// transaction itself. A transaction that cannot be finished stays for
+/// `dot doctor` to report with its next step; the update itself succeeded,
+/// so this only warns, and not under `--cron`, which would repeat the
+/// warning in every hourly mail while doctor already carries it.
+fn finish_init(inputs: &EngineInputs<'_>, err: &mut dyn std::io::Write) {
+    // Every step stops at a signal, which reads as a failure; the user
+    // already knows why this run stopped.
+    if cancelled() {
+        return;
+    }
+    let finished =
+        crate::init_client_engine::finish_converged(crate::init_client_engine::EngineCtx {
+            home: inputs.home,
+            xdg_state_home: inputs.state_home,
+            source_root: inputs.runtime.source_root(),
+            skip_provider: inputs.skip_provider,
+            shdeps_update_policy: None,
+            cwd: inputs.runtime.cwd(),
+        });
+    if finished.is_err() && !inputs.flags.cron && !cancelled() {
+        warn_row(
+            err,
+            inputs.palette,
+            "  warning: could not finish the incomplete dot init; run 'dot doctor' for the next step",
+        );
+    }
 }
 
 /// What started this run, as recorded in `update.last-run`.

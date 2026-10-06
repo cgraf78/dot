@@ -284,6 +284,136 @@ fn repository_commands_and_update_accept_an_in_progress_identity() {
     }
 }
 
+/// Plant an initialization transaction beside the completion record: a
+/// private copy of it at `phase`, passed through `edit`.
+fn plant_transaction(state: &Path, phase: &str, edit: impl Fn(String) -> String) -> PathBuf {
+    let record = state.join("dot/init/transaction/record");
+    let parent = record.parent().expect("transaction parent");
+    std::fs::create_dir_all(parent).expect("transaction directory");
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        .expect("private transaction directory");
+    let text = std::fs::read_to_string(state.join("dot/init/completed"))
+        .expect("completion record")
+        .replace("phase=complete\n", &format!("phase={phase}\n"));
+    std::fs::write(&record, edit(text)).expect("transaction record");
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600))
+        .expect("private transaction record");
+    record
+}
+
+#[test]
+fn a_clean_update_finishes_an_in_progress_identity() {
+    let scratch = Scratch::new("update-finishes-init").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "finish", &overlay_origin, &base_origin);
+    let completed = state.join("dot/init/completed");
+    plant_transaction(&state, "converging", |text| text);
+    std::fs::remove_file(&completed).expect("remove completion record");
+    let output = dot(&["update", "--quiet"], &home, &state);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!state.join("dot/init/transaction").exists());
+    let record = std::fs::read_to_string(&completed).expect("completion record");
+    assert!(record.contains("\nphase=complete\n"), "{record}");
+}
+
+#[test]
+fn a_cron_run_skipped_for_local_edits_leaves_an_in_progress_identity() {
+    // The skip exits 0 without converging anything.
+    let scratch = Scratch::new("update-skip-keeps-init").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "skip", &overlay_origin, &base_origin);
+    let record = plant_transaction(&state, "converging", |text| text);
+    std::fs::remove_file(state.join("dot/init/completed")).expect("remove completion record");
+    std::fs::write(home.join(".testrc"), "local edit\n").expect("local edit");
+    let before = std::fs::read(&record).expect("record");
+    let output = dot(&["update", "--cron"], &home, &state);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cron update skipped"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&record).expect("record"), before);
+    assert!(!state.join("dot/init/completed").exists());
+}
+
+#[test]
+fn a_clean_update_leaves_a_transaction_the_client_does_not_match() {
+    // The completion record still names this client, so the update runs,
+    // but the transaction's generation is another run's.
+    let scratch = Scratch::new("update-keeps-foreign-init").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "foreign", &overlay_origin, &base_origin);
+    let completed = state.join("dot/init/completed");
+    let record = plant_transaction(&state, "converging", |text| {
+        let nonce = text
+            .lines()
+            .find(|line| line.starts_with("nonce="))
+            .expect("nonce line")
+            .to_string();
+        text.replace(&format!("{nonce}\n"), "nonce=1-1-1\n")
+    });
+    let (record_before, completed_before) = (
+        std::fs::read(&record).expect("record"),
+        std::fs::read(&completed).expect("completion record"),
+    );
+    let output = dot(&["update", "--quiet"], &home, &state);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "  warning: could not finish the incomplete dot init; run 'dot doctor' for the next step\n"
+    );
+    assert_eq!(std::fs::read(&record).expect("record"), record_before);
+    assert_eq!(
+        std::fs::read(&completed).expect("completion record"),
+        completed_before
+    );
+    // The step that warning points at is the one that works.
+    let doctor = dot(&["doctor"], &home, &state);
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        stdout.contains("⚠ dot init left a stale transaction"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("neither 'dot init' nor 'dot update' can finish it"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_clean_update_leaves_a_transaction_before_its_checkout() {
+    let scratch = Scratch::new("update-keeps-early-init").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "early", &overlay_origin, &base_origin);
+    let record = plant_transaction(&state, "publishing", |text| text);
+    let before = std::fs::read(&record).expect("record");
+    let output = dot(&["update", "--quiet"], &home, &state);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&record).expect("record"), before);
+}
+
 /// Rewrite the record's `git_dev=` line to the next device number, the way
 /// a reboot that renumbers the mount leaves it, keeping the record private.
 fn renumber_record(record: &Path) {

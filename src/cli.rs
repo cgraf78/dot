@@ -668,6 +668,7 @@ fn run_init(
     let converge_stderr = std::cell::RefCell::new(Vec::new());
     let converge_called = std::cell::Cell::new(false);
     let resume_converge_failed = std::cell::Cell::new(false);
+    let incomplete = std::cell::RefCell::new(Vec::new());
     // Keys already warned about at the command boundary; convergence
     // adds any that arrived with the cloned repository.
     let warned_keys = std::cell::RefCell::new(
@@ -724,8 +725,15 @@ fn run_init(
             result
         };
     let rollback = |at: &Path| -> Result<(), Error> { production.rollback(at) };
+    // A fresh run that fails after publishing its transaction leaves the
+    // initialization unfinished; say so, and how to finish it, after
+    // everything else the run printed.
     let fresh = |inputs: &init_client_command::FreshInputs| -> init_client_command::InitReport {
-        production.run_fresh(inputs)
+        let report = production.run_fresh(inputs);
+        if report.code != 0 {
+            *incomplete.borrow_mut() = production.incomplete_notice().unwrap_or_default();
+        }
+        report
     };
     let env = init_client_command::CommandEnv {
         home,
@@ -747,6 +755,7 @@ fn run_init(
         &converge_stdout.into_inner(),
         &converge_stderr.into_inner(),
         resume_converge_failed.get(),
+        &incomplete.into_inner(),
     )
     .is_err()
     {
@@ -790,6 +799,8 @@ fn init_config(
 /// Emit init and convergence streams in execution order. A resumed
 /// transaction prints the update failure before its wrapper diagnostic;
 /// fresh and completed paths contain only pre-convergence init output.
+/// `incomplete` (empty unless a fresh run failed after publishing its
+/// transaction) closes stderr: it explains everything above it.
 fn write_init_output(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -797,16 +808,18 @@ fn write_init_output(
     converge_stdout: &[u8],
     converge_stderr: &[u8],
     resume_converge_failed: bool,
+    incomplete: &[u8],
 ) -> std::io::Result<()> {
     stdout.write_all(&report.stdout)?;
     stdout.write_all(converge_stdout)?;
     if resume_converge_failed {
         stderr.write_all(converge_stderr)?;
-        stderr.write_all(&report.stderr)
+        stderr.write_all(&report.stderr)?;
     } else {
         stderr.write_all(&report.stderr)?;
-        stderr.write_all(converge_stderr)
+        stderr.write_all(converge_stderr)?;
     }
+    stderr.write_all(incomplete)
 }
 
 pub(crate) fn base_from_values(
@@ -1303,12 +1316,38 @@ mod tests {
             b"update stdout\n",
             b"update failed\n",
             true,
+            b"",
         )
         .expect("write ordered streams");
         assert_eq!(out, b"update stdout\n");
         assert_eq!(
             err,
             b"update failed\ndot init: initialization transaction could not be resumed safely\n"
+        );
+    }
+
+    #[test]
+    fn fresh_convergence_failure_names_the_unfinished_init_last() {
+        let report = init_client_command::InitReport {
+            stdout: Vec::new(),
+            stderr: b"dot init plan:\n".to_vec(),
+            code: 1,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        write_init_output(
+            &mut out,
+            &mut err,
+            &report,
+            b"",
+            b"update failed\n",
+            false,
+            b"dot init: initialization is incomplete\n",
+        )
+        .expect("write ordered streams");
+        assert_eq!(
+            err,
+            b"dot init plan:\nupdate failed\ndot init: initialization is incomplete\n"
         );
     }
 

@@ -6,9 +6,10 @@ use std::process::{Command, Stdio};
 use dot::doctor_checks::{
     BaseRepoInputs, CronInputs, InstallInputs, LifecycleInputs, MergeInputs, MergeSpec,
     OverlayInputs, ProviderInputs, ProviderInstaller, Record, check_base_repo,
-    check_cron_freshness, check_install_layout, check_merges, check_overlays,
-    check_profile_lifecycle, check_provider, check_reexec_checkpoint, check_update_lock,
-    completed_identity_matches_home, is_client_checkout, parse_status_v2, render, shdeps_binary,
+    check_cron_freshness, check_init_transaction, check_install_layout, check_merges,
+    check_overlays, check_profile_lifecycle, check_provider, check_reexec_checkpoint,
+    check_update_lock, completed_identity_matches_home, is_client_checkout, parse_status_v2,
+    render, shdeps_binary,
 };
 use dot_test_support::TempDir;
 
@@ -3478,4 +3479,77 @@ fn renaming_a_symbolic_head_ref_keeps_its_branch_and_overwrites_nothing() {
         &home,
     )));
     assert!(!cleared.contains("ambiguous"), "{cleared}");
+}
+
+fn init_rows(state: dot::doctor_checks::InitTransaction) -> String {
+    let path = Path::new("/home/u/.local/state/dot/init/transaction");
+    render(&check_init_transaction(&state, path, "/home/u"))
+}
+
+fn pending_init(phase: &str) -> dot::doctor_checks::InitTransaction {
+    dot::doctor_checks::InitTransaction::Pending {
+        phase: phase.to_string(),
+        origin: "https://user:token@example.com/u/dotfiles.git".to_string(),
+        branch: "main".to_string(),
+    }
+}
+
+#[test]
+fn no_init_transaction_has_no_row() {
+    assert_eq!(init_rows(dot::doctor_checks::InitTransaction::Absent), "");
+}
+
+#[test]
+fn a_committed_unfinished_init_warns_that_update_or_init_finishes_it() {
+    for phase in ["checkout", "converging", "complete"] {
+        assert_eq!(
+            init_rows(pending_init(phase)),
+            format!(
+                "  ⚠ dot init did not finish\n    \
+                 ~/.local/state/dot/init/transaction stopped at phase {phase}\n    \
+                 → run 'dot update' or rerun \
+                 'dot init --branch main https://\\*\\*\\*@example.com/u/dotfiles.git' to finish it\n"
+            )
+        );
+    }
+}
+
+#[test]
+fn an_unfinished_init_before_its_checkout_offers_init_or_rollback() {
+    assert_eq!(
+        init_rows(pending_init("publishing")),
+        "  ⚠ dot init did not finish\n    \
+         ~/.local/state/dot/init/transaction stopped at phase publishing\n    \
+         → rerun 'dot init --branch main https://\\*\\*\\*@example.com/u/dotfiles.git' to finish it, \
+         or run 'dot init --rollback' to undo it\n"
+    );
+}
+
+#[test]
+fn a_stale_init_transaction_warns_to_move_it_aside() {
+    let rows = init_rows(dot::doctor_checks::InitTransaction::Stale {
+        phase: "converging".to_string(),
+    });
+    assert_eq!(
+        rows,
+        "  ⚠ dot init left a stale transaction\n    \
+         ~/.local/state/dot/init/transaction stopped at phase converging and no longer \
+         matches the client\n    \
+         → move ~/.local/state/dot/init/transaction aside; neither 'dot init' nor \
+         'dot update' can finish it\n"
+    );
+}
+
+#[test]
+fn an_unreadable_init_transaction_warns_with_a_step() {
+    let rows = init_rows(dot::doctor_checks::InitTransaction::Unreadable);
+    assert!(
+        rows.starts_with("  ⚠ dot init transaction is unreadable\n"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("~/.local/state/dot/init/transaction"),
+        "{rows}"
+    );
+    assert!(problems_without_a_step(&rows).is_empty(), "{rows}");
 }

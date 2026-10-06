@@ -410,6 +410,35 @@ fn run_rollback(engine: &CommandEngine<'_>, home: &str) -> InitReport {
     }
 }
 
+/// The `dot init` command that resumes initialization of `origin` at
+/// `branch`, quoted the way a next step spells it
+/// ([`crate::repos_pull_support::quote_command`]). The branch is always
+/// explicit: a transaction refuses a run for another branch, and a client
+/// initialized with `--branch` must not resume on the remote's current
+/// default. URL credentials are hidden (`https://***@host`) because the step
+/// lands in terminals, doctor reports, and cron mail.
+pub fn rerun_command(origin: &str, branch: &str) -> String {
+    use crate::repos_pull_support::{quote_command, shell_quote};
+    let origin = crate::redact::credentials(origin);
+    quote_command(&format!(
+        "dot init --branch {} {}",
+        shell_quote(branch.as_bytes()),
+        shell_quote(origin.as_bytes())
+    ))
+}
+
+/// The next step for an initialization transaction left at `phase`: rerun
+/// its command, which resumes it, or, before the checkout is committed, roll
+/// it back instead (rollback refuses a committed transaction).
+pub fn finish_step(phase: &str, origin: &str, branch: &str) -> String {
+    let rerun = rerun_command(origin, branch);
+    if crate::init_client_resume::committed(phase) {
+        format!("rerun {rerun} to finish it")
+    } else {
+        format!("rerun {rerun} to finish it, or run 'dot init --rollback' to undo it")
+    }
+}
+
 /// Empty report with an exit code: the shell's bare `return 1` /
 /// `return 2` sites (underivable state paths, arity failures).
 fn silent(code: i32) -> InitReport {

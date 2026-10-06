@@ -1604,6 +1604,102 @@ impl<'a> Production<'a> {
     }
 }
 
+impl Production<'_> {
+    /// What a fresh run that failed after publishing its transaction tells
+    /// the user: initialization is incomplete, where it stopped, and the
+    /// command that finishes it. `None` when no transaction exists (the
+    /// failure came before publication and left nothing to finish).
+    ///
+    /// Fresh runs used to discard the closing resume's error, so a failed
+    /// first convergence exited 1 with only the update's own output, and the
+    /// transaction it left behind was never mentioned again.
+    pub fn incomplete_notice(&self) -> Option<Vec<u8>> {
+        let transaction = transaction::transaction_dir(self.home_text, self.xdg_state_home).ok()?;
+        let transaction = PathBuf::from(transaction);
+        if !exists_lexical(&transaction) {
+            return None;
+        }
+        let message = match record::read_record(&transaction.join("record"), &self.home) {
+            Ok(journal) => format!(
+                "initialization is incomplete (stopped at phase {}); {}",
+                journal.phase,
+                crate::init_client_command::finish_step(
+                    &journal.phase,
+                    &journal.origin,
+                    &journal.branch
+                )
+            ),
+            Err(_) => "initialization is incomplete; run 'dot init --status' for details".into(),
+        };
+        Some(diagnostic(message.as_bytes()).stderr)
+    }
+
+    /// See [`finish_converged`].
+    fn finish(&self) -> Result<Finish> {
+        let transaction = transaction::transaction_dir(self.home_text, self.xdg_state_home)
+            .map(PathBuf::from)
+            .map_err(|_| silent_refusal("resolve transaction directory"))?;
+        if !exists_lexical(&transaction) {
+            return Ok(Finish::Absent);
+        }
+        let record = transaction.join("record");
+        let journal = record::read_record(&record, &self.home)?;
+        if !resume::committed(&journal.phase) {
+            return Ok(Finish::Uncommitted);
+        }
+        self.resume(&transaction, &record, &journal)?;
+        // Resuming a `complete` record ignores a failed removal, like
+        // `dot init`; a transaction that is still there is not finished.
+        if exists_lexical(&transaction) {
+            return Err(silent_refusal("remove finished transaction"));
+        }
+        Ok(Finish::Completed)
+    }
+}
+
+/// What [`finish_converged`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Finish {
+    /// No initialization transaction exists.
+    Absent,
+    /// The transaction stopped before its checkout committed: the client
+    /// may be half published, so only `dot init` may resume or roll it back.
+    Uncommitted,
+    /// The transaction was completed and removed.
+    Completed,
+}
+
+/// Finish an initialization transaction that a clean `dot update` has just
+/// converged, exactly as rerunning `dot init` would from here.
+///
+/// A committed transaction (`checkout`, `converging`, or `complete`; see
+/// [`resume::committed`]) needs nothing but a convergence and the completion
+/// stamp, and the update that just exited cleanly is that convergence. So
+/// this runs the production resume ([`Production::resume`]) with the
+/// convergence already done: it re-verifies the live client against the
+/// record (the same Git directory, generation, origin, branch, and layout),
+/// records `converging` and then `complete`, publishes the completion
+/// record, and removes the transaction. A transaction that stopped earlier
+/// is left for `dot init`. Without this, nothing but `dot init` ever
+/// completed a transaction, so one whose first convergence failed stayed
+/// open indefinitely while every other command quietly accepted it.
+///
+/// Safety:
+/// - the caller holds the update lock, which `dot init` (resume and rollback
+///   included) also holds for its whole run, so no init step interleaves;
+/// - a live client that no longer matches the record fails before anything
+///   is written, leaving the transaction as it was;
+/// - every step is one `dot init` takes, each an atomic replacement, so a
+///   crash between them leaves a transaction that the next clean update, or
+///   `dot init`, resumes from the step it reached (a `complete` record with
+///   or without its completion copy).
+///
+/// Errors when the record is unreadable or the resume refuses or fails.
+pub fn finish_converged(ctx: EngineCtx<'_>) -> Result<Finish> {
+    let converged = || Ok(());
+    Production::new(ctx, &converged).finish()
+}
+
 /// `git -c init.defaultBranch=<branch> clone --quiet --no-checkout
 /// --branch <branch> --single-branch -- <origin> <candidate>`: the
 /// shell's candidate

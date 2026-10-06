@@ -15,6 +15,20 @@ For a Git directory that was replaced, it offers to adopt the replacement
 (moving the completed record aside and rerunning `dot init`) or, for the
 separate layout, to move it aside and clone fresh.
 
+When the first convergence fails (an overlay that cannot be cloned, say),
+`dot init` exits 1 and its last line names the unfinished transaction and the
+command that finishes it, for example `dot init: initialization is incomplete
+(stopped at phase converging); rerun 'dot init --branch main URL' to finish
+it`. The checkout is already committed, so every command keeps working
+meanwhile; `dot init --status` reports `initialization: incomplete` and
+`dot doctor` warns `dot init did not finish` with the same step. Rerunning that
+command resumes the transaction, and so does the next `dot update` that exits
+cleanly: it re-verifies the client against the transaction record and
+completes it exactly as `dot init` would. A client that no longer matches
+keeps the transaction, which `dot doctor` then reports as stale, to be moved
+aside. A transaction that stopped before its checkout committed is
+left to `dot init`, which resumes it, or `dot init --rollback`.
+
 Initialization normally honors the committed dependency provider while it
 converges repositories, overlays, and extensions. Shared bootstrap environments
 that install an explicit dependency set separately may set
