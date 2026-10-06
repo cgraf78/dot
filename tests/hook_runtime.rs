@@ -163,8 +163,11 @@ fn all_keys(filtered_out_winner: bool) -> Vec<Vec<u8>> {
         b"85-tab\tname.json",
         b"90-extra.json",
     ];
-    #[cfg(not(target_os = "macos"))]
-    keys.push(b"87-bad\xff.json");
+    // `cfg!` rather than `#[cfg]`, so `keys` is mutated on every target
+    // (APFS refuses the non-UTF-8 name, so macOS never creates it).
+    if cfg!(not(target_os = "macos")) {
+        keys.push(b"87-bad\xff.json");
+    }
     sorted(keys)
 }
 
@@ -195,8 +198,11 @@ fn filtering_precedes_replacement_selection_and_has_literal_results() {
         b"85-tab\tname.json",
         b"90-extra.json",
     ];
-    #[cfg(not(target_os = "macos"))]
-    json.push(b"87-bad\xff.json");
+    // `cfg!` rather than `#[cfg]`, so `json` is mutated on every target
+    // (APFS refuses the non-UTF-8 name, so macOS never creates it).
+    if cfg!(not(target_os = "macos")) {
+        json.push(b"87-bad\xff.json");
+    }
     assert_eq!(
         family.keys(&[b"*.json", b"*.replace/*.json"]),
         sorted(json),
