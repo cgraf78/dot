@@ -8,6 +8,9 @@ set -euo pipefail
 # The checkout launcher is development-only and enters a compiled binary.
 native_checkout=$DOT_TEST_TMP/native-checkout
 mkdir -p "$native_checkout/bin" "$native_checkout/target/debug"
+# The binary recognizes its source root by the checkout shape, which
+# includes the manifest beside `bin/` and `target/`.
+: >"$native_checkout/Cargo.toml"
 cp "$DOT_TEST_ROOT/bin/dot" "$native_checkout/bin/dot"
 cp "$DOT_TEST_ROOT/target/debug/dot" "$native_checkout/target/debug/dot"
 native_version=$(HOME=$DOT_TEST_TMP/native-home "$native_checkout/bin/dot" version)

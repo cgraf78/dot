@@ -1728,13 +1728,13 @@ fn discover_active(
         profiles_present: false,
         selected: Vec::new(),
         platform: crate::platform::detect_platform().ok(),
-        termux: crate::hook_api::is_termux(inputs.prefix),
+        termux: crate::platform::is_termux(inputs.prefix),
         host: crate::platform::detect_host().ok(),
         euid: inputs.euid,
     };
     let matches = crate::overlays::MatchInputs {
         platform: crate::platform::detect_platform().ok(),
-        termux: crate::hook_api::is_termux(inputs.prefix),
+        termux: crate::platform::is_termux(inputs.prefix),
         host: crate::platform::detect_host().ok(),
     };
     let result =
@@ -1767,7 +1767,7 @@ fn discover_selected(
     let host = crate::platform::detect_host().ok();
     let matches = crate::overlays::MatchInputs {
         platform: platform.clone(),
-        termux: crate::hook_api::is_termux(inputs.prefix),
+        termux: crate::platform::is_termux(inputs.prefix),
         host: host.clone(),
     };
     let discover_inputs = crate::overlays::Inputs {
@@ -1777,7 +1777,7 @@ fn discover_selected(
         profiles_present: true,
         selected: selected.to_vec(),
         platform,
-        termux: crate::hook_api::is_termux(inputs.prefix),
+        termux: crate::platform::is_termux(inputs.prefix),
         host,
         euid: inputs.euid,
     };
@@ -1850,7 +1850,6 @@ fn pre_sync(
         home: inputs.home.to_string(),
         extensions_dir: extensions_dir.to_string(),
         manifest: inputs.manifest.to_string(),
-        retiring_root: String::new(),
     };
     let records: Vec<Vec<u8>> = eligible
         .iter()
@@ -2553,7 +2552,6 @@ fn finalize(
                             home: inputs.home.to_string(),
                             extensions_dir: extensions_dir.to_string(),
                             manifest: inputs.manifest.to_string(),
-                            retiring_root: String::new(),
                         },
                         extensions_enabled: crate::config::extensions_enabled(&state.config),
                         overlays: &state.active,
@@ -3985,6 +3983,34 @@ fn quarantine_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_count_requires_git_sync_and_an_active_checkout() {
+        let dir = dot_test_support::TempDir::new("pull-overlay-count").expect("fixture dir");
+        let worktree = dir.path().join("worktree");
+        let plain = dir.path().join("plain");
+        let init = dot_test_support::git()
+            .args(["init", "--quiet"])
+            .arg(&worktree)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("git init");
+        assert!(init.success());
+        std::fs::create_dir(&plain).expect("plain dir");
+        let url = "https://example.invalid/repo";
+        let entries = [
+            format!("worktree|{}||||git", worktree.display()),
+            format!("configured|{}|{url}|||git", plain.display()),
+            format!("inactive|{}||||git", plain.display()),
+            format!("disabled|{}|{url}|||none", plain.display()),
+            format!("default|{}|{url}|||", plain.display()),
+            // Surplus fields fold into the sync word, which is then no
+            // longer `git`.
+            format!("surplus|{}|{url}|||git|extra", plain.display()),
+        ];
+        assert_eq!(pull_overlay_count(&entries), 3);
+    }
 
     #[test]
     fn warned_value_round_trips_every_printed_warning() {

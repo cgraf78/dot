@@ -61,7 +61,8 @@ fn print_header(log: &Log, out: &mut dyn Write, op: &str, kind: RepoKind, name: 
 ///
 /// Iteration hands callbacks `OsString` argv (the shell passes raw argv
 /// words through); the one-functions take `&str` like sibling
-/// `repo_git`. The lossy conversion is exact for every portable argv.
+/// `repo_git_forwarded`. The lossy conversion is exact for every
+/// portable argv.
 fn argv_to_strs(args: &[OsString]) -> Vec<String> {
     args.iter()
         .map(|arg| arg.to_string_lossy().into_owned())

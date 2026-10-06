@@ -1,14 +1,14 @@
 //! Published-state recovery and worktree publication for the native init client.
 //!
-//! This module owns the six related functions from
+//! This module owns the related functions from
 //! `_dot_init_published_stage_matches` through `_dot_init_single_origin`
 //! in the compatibility contract: the leaf-stage validator
 //! ([`published_stage_matches`]), the prepared-intent validator
 //! ([`published_intent_matches`]), the published-stage reaper
 //! ([`cleanup_published_stage`]), the per-entry worktree publisher
-//! ([`publish_worktree`]), the update convergence entry
-//! ([`forward_converge`]), and the single-origin reader
-//! ([`single_origin`]).
+//! ([`publish_worktree`]), and the single-origin reader
+//! ([`single_origin`]). Update convergence after publication runs through
+//! the engine ([`crate::init_client_engine`]).
 //!
 //! Neighboring transaction, identity, generation, entry, candidate,
 //! record, deletion, planning, rollback, resume, and dispatch
@@ -27,13 +27,13 @@
 //! commit, branch, and working directory together), and
 //! `REPLY`-carried outputs surface as return values. Cross-lane
 //! predicates the shell calls by name cross as closures
-//! ([`StageHooks`], [`PublishHooks`], [`ConvergeHooks`]), the way
+//! ([`StageHooks`], [`PublishHooks`]), the way
 //! the plan lane takes its verifier. `LC_ALL=C` is pinned around
 //! every child process so git output reads English and byte-ordered
 //! on both engines, and `HOME` is steered at the test home the way
 //! the plan lane steers its probes.
 //!
-//! Error boundary: every shell refusal in these six functions is a
+//! Error boundary: every shell refusal in these functions is a
 //! bare `return 1` with no diagnostic of its own, so every refusal
 //! here surfaces as [`Error::Usage`]; diagnostics printed by callees
 //! (`_dot_client_select`, the update engine) stay owned by their
@@ -79,10 +79,6 @@ const STAGE_CLAIM_NAME: &str = ".dot-init-stage-claim-v1";
 /// Claim kind this family stamps and verifies: the shell's literal
 /// `entry` argument on every claim call below.
 const STAGE_CLAIM_KIND: &str = "entry";
-
-/// Progress denominator the convergence entry announces: the
-/// shell's `_ui_begin 5` literal.
-const CONVERGE_TOTAL: u32 = 5;
 
 /// A published entry intent split into its six returned fields.
 /// This byte-local twin of the entry module's `EntryIntent` keeps
@@ -224,30 +220,6 @@ pub struct PublishHooks<'a> {
     pub entry_intent: &'a EntryIntentFn<'a>,
     /// The entry-family gates (shared with the stage validators).
     pub stages: StageHooks<'a>,
-}
-
-/// The update-engine collaborators [`forward_converge`] sequences,
-/// bundled so the entry point takes one parameter. Diagnostics
-/// printed by these callees stay owned by their lanes; only the
-/// sequencing, the provider scoping, and the status threading live
-/// here.
-pub struct ConvergeHooks<'a> {
-    /// The shell's `_dot_client_select` (runs bare: the verdict is
-    /// sequenced past, never short-circuited).
-    pub select_client: &'a (dyn Fn() -> Result<()> + 'a),
-    /// The shell's `dot_config_load`.
-    pub load_config: &'a (dyn Fn() -> Result<()> + 'a),
-    /// The shell's `_ui_begin` (receives `CONVERGE_TOTAL`).
-    pub begin_ui: &'a (dyn Fn(u32) + 'a),
-    /// The shell's `_dot_update_sync_repos` (receives the
-    /// skip-provider flag the shell scopes dynamically).
-    pub sync_repos: &'a (dyn Fn(bool) -> Result<()> + 'a),
-    /// The shell's `_dot_update_finalize` (receives the threaded
-    /// `0`/`1` status plus the skip-provider flag: the shell's
-    /// override stays in scope through finalize, so the flag
-    /// crosses explicitly here too instead of mutating process
-    /// environment behind the engine).
-    pub finalize: &'a (dyn Fn(i32, bool) -> Result<()> + 'a),
 }
 
 /// Which git binding reads the origin URL: the shell's
@@ -707,40 +679,6 @@ pub fn publish_worktree(
     git_dir_run(git, home, &["update-ref", &head, git.commit])?;
     git_dir_run(git, home, &["symbolic-ref", "HEAD", &head])?;
     let _ = git_dir_run(git, home, &["update-index", "--refresh"]);
-    Ok(())
-}
-
-/// `_dot_init_forward_converge`: select the client binding, load the
-/// committed config, announce the five-stage convergence, sync the
-/// repositories, and finalize with the threaded status. With
-/// `skip_provider`, the dependency provider reads `none` from the
-/// announcement through finalize, but the committed config still
-/// parses first and stays authoritative later — the shell scopes a
-/// local override, and here the flag crosses explicitly to the sync
-/// and finalize collaborators instead of mutating process
-/// environment behind the engine. (The announcement itself provably
-/// ignores the provider — `_ui_begin` only assigns progress
-/// counters — so it takes no flag.) A failed sync threads status
-/// `1` into finalize (the sync diagnostic itself stays owned by its
-/// lane); the config load short-circuits, and the return code is
-/// finalize's.
-///
-/// The selection runs bare, exactly like the shell: its verdict
-/// never short-circuits the sequencing (both `|| return` call sites
-/// run with errexit suppressed, so a selection failure flows into
-/// config and beyond there too; only the bare call site leans on
-/// ambient errexit, which the engine owns). Selection diagnostics
-/// stay owned by the selecting lane — it emits before refusing, the
-/// acquire precedent — so the ignored verdict drops no bytes here.
-pub fn forward_converge(skip_provider: bool, hooks: &ConvergeHooks<'_>) -> Result<()> {
-    let _ = (hooks.select_client)();
-    (hooks.load_config)()?;
-    (hooks.begin_ui)(CONVERGE_TOTAL);
-    let mut status = 0;
-    if (hooks.sync_repos)(skip_provider).is_err() {
-        status = 1;
-    }
-    (hooks.finalize)(status, skip_provider)?;
     Ok(())
 }
 

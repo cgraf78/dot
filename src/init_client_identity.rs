@@ -1,8 +1,8 @@
 //! Host Git selection and repository identity, part 2 of
 //! `lib/dot/init-client.sh`: the pinned host `git` executable outside
-//! both client-controlled roots, its shell-function guard, the client
-//! repository identity normalization, branch-name validation, and
-//! remote default-branch resolution.
+//! both client-controlled roots, the client repository identity
+//! normalization, branch-name validation, and remote default-branch
+//! resolution.
 //!
 //! The shell file holds 79 functions — too big for one lane — so this
 //! module owns only the five helpers from `_dot_init_select_host_git`
@@ -12,9 +12,8 @@
 //! already live behind [`crate::repos_overlays`], and the file-generic
 //! `_dot_init_error` diagnostic is represented as a typed error: a bare
 //! `printf 'dot init: %s\n' ... >&2; return 1` with no family state,
-//! absorbed here into the `Result` payloads [`NO_HOST_GIT`] /
-//! [`GIT_SHADOWED`], which the caller renders with the same
-//! `dot init: ` prefix. Record, candidate, generation, claim, and
+//! absorbed here into the [`NO_HOST_GIT`] payload, which the caller
+//! renders with the same `dot init: ` prefix. Record, candidate, generation, claim, and
 //! rollback families live in their adjacent native modules.
 //!
 //! The same host-Git boundary serves every command: dispatch binds
@@ -35,11 +34,6 @@ use crate::temp::{TMP_RETRIES, random_suffix};
 /// client-root exclusions. Rendered as `dot init: {NO_HOST_GIT}` on
 /// stderr, exactly like the shell.
 pub const NO_HOST_GIT: &str = "host Git is unavailable outside HOME and the Dot checkout";
-
-/// `_dot_init_error` payload when a shell function named `git`
-/// shadows the executable. Rendered as `dot init: {GIT_SHADOWED}`
-/// on stderr, exactly like the shell.
-pub const GIT_SHADOWED: &str = "a shell function named git cannot be used during initialization";
 
 thread_local! {
     /// Per-command executable capability bound by dispatch (init's strict
@@ -306,31 +300,6 @@ fn select_git(
         return Some(candidate);
     }
     None
-}
-
-/// `_dot_init_bind_host_git`: pin the [`select_host_git`] result for
-/// the whole transaction, or fail with the shell's stderr payload
-/// ([`NO_HOST_GIT`] when nothing is selectable, [`GIT_SHADOWED`]
-/// when a shell function named `git` would intercept the call).
-/// `git_shadowed` injects the `declare -F git` probe: Rust has no
-/// shell functions, so the engine passes `false` and only the
-/// differential tests drive `true` for parity. The shell's
-/// `hash -p` / `set -h` table update has no Rust spelling — there
-/// is no shell hash table to mutate — so success returns the path
-/// for the caller to invoke instead of mutating process-global
-/// shell state, which is precisely the class of state the port
-/// eliminates.
-pub fn bind_host_git(
-    home: &str,
-    source_root: &str,
-    path: &str,
-    git_shadowed: bool,
-) -> Result<String, &'static str> {
-    let host = select_host_git(home, source_root, path).ok_or(NO_HOST_GIT)?;
-    if git_shadowed {
-        return Err(GIT_SHADOWED);
-    }
-    Ok(host)
 }
 
 /// Strip every trailing `/` (`while [[ $path == */ ]]`), then one

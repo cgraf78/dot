@@ -1,20 +1,12 @@
-//! Worker decision kernels from `lib/dot/extension-worker.sh`.
+//! Worker launch prechecks for the public hook runtime.
 //!
-//! Owns the pure validation logic behind the four worker entry
-//! points: the overlay-protocol whitelist from
-//! `_dot_extension_worker_load_overlay_protocol`, the ordered API
-//! file lists from `_dot_extension_worker_load_merge_api` and
-//! `_dot_extension_worker_load_doctor_api`, and the argument,
-//! source-root, result-path, retiring-set, and entry-point checks
-//! from `_dot_extension_worker_main`.
-//!
-//! Sourcing and execution stay shell-side like other exec
-//! boundaries (the hook-sourcing precedent in [`crate::merges`]):
-//! the loaders source their files and unset non-protocol helpers,
-//! and `_dot_extension_worker_main` sources client code, consumes
-//! the one-use overlay context, and runs the lifecycle entry point
-//! under traps and readonly guards. Only the decisions that can be
-//! tested without side effects live here.
+//! Owns the pure validation `hook_worker` runs before it starts
+//! `lib/dot/public/hook-runtime-v1/worker.sh`: the argument count, mode,
+//! source-root, result-path, and retiring-set checks. Sourcing and
+//! execution stay shell-side: `worker.sh` loads the public API, unsets
+//! every repository helper outside its overlay-protocol allowlist,
+//! sources client code, and runs the lifecycle entry point for the mode.
+//! Only the decisions that can be tested without side effects live here.
 //!
 //! The implementation stays MSRV-clean (Rust 1.85): no let-chains, no
 //! `Command::envs`.
@@ -57,18 +49,6 @@ impl Mode {
             Mode::Doctor => "doctor",
         }
     }
-
-    /// Lifecycle entry point for the mode: `merge` runs `merge`,
-    /// `pre-sync` runs `prepare`, `deactivate` runs `deactivate`,
-    /// and `doctor` runs `doctor`.
-    pub fn entry_point(&self) -> &'static str {
-        match self {
-            Mode::Merge => "merge",
-            Mode::PreSync => "prepare",
-            Mode::Deactivate => "deactivate",
-            Mode::Doctor => "doctor",
-        }
-    }
 }
 
 /// Silent worker failure: `Usage` is a caller-arity problem (shell
@@ -99,42 +79,6 @@ impl std::fmt::Display for Error {
             Error::Usage | Error::Refused => Ok(()),
         }
     }
-}
-
-/// Canonical read-only authority/identity helpers retained by
-/// `_dot_extension_worker_load_overlay_protocol`; every other
-/// repository helper sourced from `repos/config.sh` and
-/// `repos/overlays.sh` is unset before client code loads.
-pub const OVERLAY_PROTOCOL_KEEP: [&str; 8] = [
-    "_overlay_link_target",
-    "_overlay_private_regular_file",
-    "_overlay_parse_manifest_record",
-    "_overlay_manifest_safe",
-    "_overlay_is_worktree",
-    "_overlay_effective_url",
-    "_overlay_origin_matches",
-    "_overlay_checkout_matches",
-];
-
-/// Whether `name` survives the protocol load, like the shell `case`
-/// over the eight retained helpers.
-pub fn overlay_protocol_keep(name: &str) -> bool {
-    OVERLAY_PROTOCOL_KEEP.contains(&name)
-}
-
-/// Survivors of the protocol load in `after` order: pre-existing
-/// functions always survive, while newly sourced helpers survive
-/// only through the whitelist. Mirrors the loader loop that skips
-/// `existing_functions` entries and unsets every other non-listed
-/// name.
-pub fn protocol_survivors(before: &[String], after: &[String]) -> Vec<String> {
-    let mut survivors = Vec::new();
-    for name in after {
-        if before.iter().any(|known| known == name) || overlay_protocol_keep(name) {
-            survivors.push(name.clone());
-        }
-    }
-    survivors
 }
 
 /// Whether `source_root` has the `/*` shape from

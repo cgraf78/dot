@@ -86,26 +86,11 @@ pub fn each_existing(
     0
 }
 
-/// Run `git` with `prefix` plus `args`, streaming to the terminal:
-/// stdin/stdout/stderr inherited. No `run_git`-style capture
-/// exists with inherited stdio anywhere in `src/`, so this runner
-/// lives here beside its callers. Returns the exit code; a spawn
-/// failure (no `git` on `PATH`) returns 127.
-pub fn run_git_streaming(prefix: &[OsString], args: &[&str]) -> i32 {
-    let mut cmd = crate::init_client_identity::host_git_command();
-    cmd.args(prefix)
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    crate::cleanup::run_foreground_status(cmd)
-}
-
 /// Run `git` with `prefix` plus `args`, forwarding piped stdout to
 /// `out` while stdin/stderr stay inherited.
 ///
-/// Like [`run_git_streaming`], except stdout travels through the
-/// caller's writer instead of the inherited descriptor: a header
+/// Stdout travels through the caller's writer instead of the
+/// inherited descriptor: a header
 /// printed through the output relay would otherwise race git's
 /// direct descriptor writes (body-before-header under load).
 /// Progress keeps streaming on inherited stderr. Returns the exit
@@ -119,11 +104,13 @@ pub fn run_git_forwarded(prefix: &[OsString], args: &[&str], out: &mut dyn Write
     crate::cleanup::run_foreground_forward_stdout(cmd, out)
 }
 
-/// [`repo_git`] with stdout forwarded through `out` (see
-/// [`run_git_forwarded`]) so a relayed header can never lose its
-/// race with git's first output line. Invalidates the same
-/// worktree/revision caches: caller-visible forwarded git can
-/// mutate just like the inherited form.
+/// `_repo_git`: execute `git` for one repo record with stdout forwarded
+/// through `out` (see [`run_git_forwarded`]) so a relayed header can
+/// never lose its race with git's first output line. A base record
+/// dispatches through [`Base::git_prefix`] (a missing topology has no
+/// prefix, like the shell's exit 128); an overlay record runs
+/// `git -C path`. Invalidates the worktree/revision caches:
+/// caller-chosen git can mutate the repository.
 pub fn repo_git_forwarded(
     base: &Base,
     kind: RepoKind,
@@ -142,30 +129,6 @@ pub fn repo_git_forwarded(
     };
     crate::overlays::invalidate_worktree_cache();
     crate::startup::invalidate_revision_cache();
-    rc
-}
-
-/// `_repo_git`: execute `git` for one repo record. A base record
-/// dispatches through [`Base::git_prefix`] (a missing topology has
-/// no prefix, like the shell's exit 128); an overlay record runs
-/// `git -C path`. The shell's `*) -> return 2` arm is unreachable
-/// through the [`RepoKind`] enum, so it has no representation here.
-pub fn repo_git(base: &Base, kind: RepoKind, path: &str, args: &[&str]) -> i32 {
-    let rc = match kind {
-        RepoKind::Base => match base.git_prefix() {
-            Some(prefix) => run_git_streaming(&prefix, args),
-            None => 128,
-        },
-        RepoKind::Overlay => run_git_streaming(&[OsString::from("-C"), OsString::from(path)], args),
-    };
-    // `dot repos git` runs caller-chosen (possibly mutating) git
-    // across repositories, so memoized probe answers are no longer
-    // trustworthy. Engine-internal streaming fetch/pull cannot
-    // change worktree or origin answers and bypasses this boundary.
-    crate::overlays::invalidate_worktree_cache();
-    crate::startup::invalidate_revision_cache();
-    crate::repos_base::invalidate_client_match_cache();
-    crate::repos_config::invalidate_config_cache();
     rc
 }
 

@@ -265,16 +265,6 @@ pub fn relative_path_safe(rel: &[u8]) -> bool {
     segments.all(|segment| !segment.is_empty() && segment != b"." && segment != b"..")
 }
 
-/// `_overlay_conf_invalid`: an invalid-descriptor diagnostic —
-/// `REPLY` becomes `invalid overlay descriptor {file}: {detail}`
-/// with the `  warning: ...` line on stderr (exit 2). The library
-/// never prints: returns [`Error::Warning`] carrying the message,
-/// which [`Error::code`] maps to 2 and [`Error`] `Display` renders
-/// as the stderr line for engine callers to reproduce.
-pub fn conf_invalid(file: &str, detail: &str) -> Error {
-    Error::Warning(format!("invalid overlay descriptor {file}: {detail}"))
-}
-
 /// Mirror of the shell `od -An -t u1 | awk` descriptor-file scan:
 /// regular non-symlink file, at most 65536 bytes, newline the only
 /// accepted control byte, DEL rejected — and, like the shell,

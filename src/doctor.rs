@@ -938,9 +938,8 @@ fn installer(
 const SIDECAR_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Read one `.outputs` sidecar: blank lines and `#` comments
-/// skipped, the rest expanded through
-/// [`crate::merge_hooks::expand_home`]. Absolute results are live
-/// outputs; anything else is invalid (raw line kept for the
+/// skipped, the rest expanded through [`expand_home`]. Absolute results
+/// are live outputs; anything else is invalid (raw line kept for the
 /// diagnostic). `None` means the sidecar exists but cannot be read
 /// (oversized, unreadable, or non-UTF-8).
 fn read_outputs_sidecar(sidecar: &Path, home: &str) -> Option<(Vec<String>, Vec<String>)> {
@@ -961,7 +960,7 @@ fn read_outputs_sidecar(sidecar: &Path, home: &str) -> Option<(Vec<String>, Vec<
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let expanded = crate::merge_hooks::expand_home(line, home);
+        let expanded = expand_home(line, home);
         if Path::new(&expanded).is_absolute() {
             outputs.push(expanded);
         } else {
@@ -969,6 +968,22 @@ fn read_outputs_sidecar(sidecar: &Path, home: &str) -> Option<(Vec<String>, Vec<
         }
     }
     Some((outputs, invalid))
+}
+
+/// Expand the home placeholders a `.outputs` sidecar may use, exactly like
+/// the hook runtime's `dot_expand_home`: replace `${HOME}` then `$HOME`
+/// (single pass, no rescan — like bash `//`), then a leading `~` (`~` alone
+/// or `~/...`; `~otheruser/...` is untouched, never resolved to another
+/// user's home).
+fn expand_home(value: &str, home: &str) -> String {
+    let replaced = value.replace("${HOME}", home).replace("$HOME", home);
+    if replaced == "~" {
+        return home.to_string();
+    }
+    if let Some(rest) = replaced.strip_prefix("~/") {
+        return format!("{home}/{rest}");
+    }
+    replaced
 }
 
 /// The merge-hook inventory for output verification, or why it is invalid:
@@ -1007,7 +1022,6 @@ fn merge_inventory(
         home: home.to_string(),
         extensions_dir: root.to_string(),
         manifest: manifest.to_string(),
-        retiring_root: String::new(),
     };
     if !crate::extension_trust::root_validate(root, euid) {
         return Err(untrusted(Path::new(root)));
@@ -1163,7 +1177,6 @@ fn extensions(
         home: home.clone(),
         extensions_dir: root.to_string(),
         manifest: manifest.to_string(),
-        retiring_root: String::new(),
     };
     let discovery = match crate::doctor_coordinator::collect_specs_with(&directory, |script| {
         crate::extension_trust::file_validate(script, &trust, overlays)
@@ -1763,6 +1776,28 @@ mod tests {
     use std::path::Path;
 
     use super::run_configured;
+
+    #[test]
+    fn sidecar_home_expansion_replaces_only_supported_tokens() {
+        let home = "/home/tester";
+        for (input, expected) in [
+            ("$HOME/.ssh", "/home/tester/.ssh"),
+            ("${HOME}/.ssh", "/home/tester/.ssh"),
+            ("~", "/home/tester"),
+            ("~/doc", "/home/tester/doc"),
+            ("~other", "~other"),
+            ("/abs", "/abs"),
+            ("rel", "rel"),
+            ("", ""),
+            ("$HOME", "/home/tester"),
+            ("${HOME}", "/home/tester"),
+            ("~/$HOME", "/home/tester//home/tester"),
+            ("$HOME~", "/home/tester~"),
+            ("$$HOME", "$/home/tester"),
+        ] {
+            assert_eq!(super::expand_home(input, home), expected, "{input}");
+        }
+    }
 
     #[test]
     fn timeout_parsing_defaults_disables_and_saturates() {

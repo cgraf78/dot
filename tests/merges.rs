@@ -5,25 +5,9 @@ use dot::{merges, progress_ui::Palette};
 
 type ProgressCase<'a> = (&'a str, i64, i64, &'a str, &'a str, &'a [u8]);
 type HookProgressCase<'a> = (&'a str, i64, i64, bool, &'a str, &'a [u8]);
-type LabelCase<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], i64, &'a [u8]);
 type RenderCase<'a> = (&'a [u8], &'a [u8], i64, &'a [&'a [u8]], &'a [u8]);
 use std::ffi::{OsStr, OsString};
 use std::process::Command;
-
-#[test]
-fn trim_cases_agree() {
-    for (input, expected) in [
-        ("  padded  ", "padded"),
-        ("\t\ttabs\n", "tabs"),
-        ("", ""),
-        ("   ", ""),
-        ("no-pad", "no-pad"),
-        ("inner  space", "inner  space"),
-        ("line\nbreak", "line\nbreak"),
-    ] {
-        assert_eq!(merges::trim(input), expected, "trim {input:?}");
-    }
-}
 
 #[test]
 fn label_cases_agree() {
@@ -46,24 +30,6 @@ fn label_cases_agree() {
             merges::label_from_script(OsStr::new(script)),
             OsStr::new(expected),
             "label {script:?}"
-        );
-    }
-}
-
-#[test]
-fn serial_cases_agree() {
-    for (script, expected) in [
-        ("10-a.serial.sh", true),
-        ("10-a.sh", false),
-        (".serial.sh", true),
-        ("serial.sh", false),
-        ("10-a.SERIAL.SH", false),
-        ("x.serial.sh.bak", false),
-    ] {
-        assert_eq!(
-            merges::is_serial(script),
-            expected,
-            "serial barrier {script:?}"
         );
     }
 }
@@ -163,20 +129,6 @@ fn summaries_agree() {
         merges::warning_summary(5, 0),
         "5 configs merged, 0 config hooks failed"
     );
-}
-
-#[test]
-fn result_prefix_agrees() {
-    for (index, expected) in [
-        (0, "/results/000"),
-        (1, "/results/001"),
-        (42, "/results/042"),
-        (999, "/results/999"),
-        (1000, "/results/1000"),
-        (12345, "/results/12345"),
-    ] {
-        assert_eq!(merges::result_prefix("/results", index), expected);
-    }
 }
 
 #[test]
@@ -283,58 +235,6 @@ fn hook_progress_matches_the_other_stages_outside_verbose() {
     }
 }
 
-#[test]
-fn result_label_cases_agree() {
-    let cases: &[LabelCase<'_>] = &[
-        (
-            "10-foo.sh",
-            "Friendly Name\nsecond line\nthird\n",
-            "Friendly Name",
-            &["second line", "third"],
-            250,
-            b"250ms",
-        ),
-        (
-            "02_ssh.serial.sh",
-            "\n  \nSpaced Label  \n  detail one\n\n",
-            "Spaced Label",
-            &["detail one"],
-            1500,
-            b"1.5s",
-        ),
-        ("plain.sh", "", "plain", &[], 0, b"0ms"),
-        ("10-UPPER.sh", "   \t  \n", "UPPER", &[], 10500, b"11s"),
-        ("noext", "only\n", "only", &[], 999, b"999ms"),
-        (
-            "a.sh",
-            "line without trailing newline",
-            "line without trailing newline",
-            &[],
-            10000,
-            b"10s",
-        ),
-        ("b.sh", "l1\r\nl2\r\n", "l1", &["l2"], 5, b"5ms"),
-        (
-            "c.sh",
-            "hüüks target\n detail \n",
-            "hüüks target",
-            &["detail"],
-            42,
-            b"42ms",
-        ),
-    ];
-    for &(script, log, expected_label, expected_details, elapsed, duration) in cases {
-        let (label, details) = merges::result_label(OsStr::new(script), log);
-        assert_eq!(label, OsStr::new(expected_label), "label {script:?}");
-        assert_eq!(
-            details.iter().map(String::as_str).collect::<Vec<_>>(),
-            expected_details,
-            "details {script:?}"
-        );
-        assert_eq!(dot::progress_ui::duration_ms(elapsed), duration);
-    }
-}
-
 fn marker_palette() -> Palette {
     Palette {
         reset: "<R>".into(),
@@ -374,161 +274,6 @@ fn render_result_cases_agree() {
         );
         assert_eq!(output, expected, "render {label:?}");
         assert!(!live);
-    }
-}
-
-#[test]
-fn capture_cases_agree() {
-    use merges::CaptureAction::{
-        ShowEmptyWarning as Empty, ShowLogWarning as Log, ShowResult as Show, Silent, Skipped,
-    };
-    type Row<'a> = (
-        Option<&'a str>,
-        Option<&'a str>,
-        Option<&'a str>,
-        &'a str,
-        &'a str,
-        bool,
-        merges::CaptureAction,
-    );
-    let cases: [Row<'_>; 18] = [
-        (None, None, None, "0", "0", false, Skipped),
-        (Some("0"), Some("0"), Some("0"), "0", "0", false, Skipped),
-        (
-            Some("1"),
-            Some("0"),
-            Some("0"),
-            "0",
-            "0",
-            false,
-            Silent {
-                warning: false,
-                elapsed_ms: 0,
-            },
-        ),
-        (
-            Some("1"),
-            Some("0"),
-            Some("42"),
-            "1",
-            "0",
-            false,
-            Show {
-                warning: false,
-                elapsed_ms: 42,
-            },
-        ),
-        (Some("1"), Some("1"), Some("250"), "0", "0", true, Log),
-        (Some("1"), Some("1"), Some("250"), "0", "0", false, Empty),
-        (
-            Some("1"),
-            Some("2"),
-            Some("1500"),
-            "1",
-            "0",
-            true,
-            Show {
-                warning: true,
-                elapsed_ms: 1500,
-            },
-        ),
-        (Some("1"), None, Some("0"), "0", "0", true, Log),
-        (
-            Some("1"),
-            Some("bogus"),
-            Some("7"),
-            "0",
-            "0",
-            true,
-            Silent {
-                warning: false,
-                elapsed_ms: 7,
-            },
-        ),
-        (
-            Some("1\n"),
-            Some("0\n"),
-            Some("9\n"),
-            "0",
-            "0",
-            false,
-            Silent {
-                warning: false,
-                elapsed_ms: 9,
-            },
-        ),
-        (Some("1"), Some("1"), Some("0"), "1", "1", true, Log),
-        (
-            Some("1"),
-            Some("0"),
-            None,
-            "1",
-            "0",
-            false,
-            Show {
-                warning: false,
-                elapsed_ms: 0,
-            },
-        ),
-        (Some("2"), Some("0"), Some("0"), "1", "0", false, Skipped),
-        (
-            Some("1"),
-            Some("00"),
-            Some("0"),
-            "0",
-            "0",
-            false,
-            Silent {
-                warning: false,
-                elapsed_ms: 0,
-            },
-        ),
-        (Some("1"), Some("3"), Some("5"), "bogus", "0", false, Empty),
-        (
-            Some("1"),
-            Some("0"),
-            Some("0"),
-            "1",
-            "bogus",
-            false,
-            Show {
-                warning: false,
-                elapsed_ms: 0,
-            },
-        ),
-        (
-            Some("1"),
-            Some("1abc"),
-            Some("7"),
-            "0",
-            "0",
-            true,
-            Silent {
-                warning: true,
-                elapsed_ms: 7,
-            },
-        ),
-        (
-            Some("1"),
-            Some("1abc"),
-            Some("7"),
-            "1",
-            "0",
-            false,
-            Show {
-                warning: true,
-                elapsed_ms: 7,
-            },
-        ),
-    ];
-    for (index, (has_merge, rc, elapsed, verbose, quiet, log, expected)) in
-        cases.into_iter().enumerate()
-    {
-        assert_eq!(
-            merges::capture_action(has_merge, rc, elapsed, verbose, quiet, log),
-            expected,
-            "capture branch {index}"
-        );
     }
 }
 

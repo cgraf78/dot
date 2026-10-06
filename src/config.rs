@@ -275,24 +275,6 @@ fn profile_identifier_valid(value: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Scan a config file for control bytes, mirroring
-/// `_dot_config_control_bytes` (`od -An -t u1` piped to an `awk` scan).
-///
-/// Returns `true` when the file is clean (shell exit 0): every byte is
-/// LF, printable, or >= 128. Returns `false` (shell exit 1) when any
-/// byte is < 32 except LF, or is DEL — so CR and TAB are rejected here.
-/// A path that cannot be read also fails: production runs under
-/// `set -o pipefail`, so a failed `od` fails the whole `od | awk`
-/// pipeline (probed: missing files exit 1 everywhere; directories
-/// diverge by platform — BSD `od` exits 0 empty, GNU `od` fails —
-/// so directories are port-tested, not differential).
-pub fn config_control_bytes(path: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(path) else {
-        return false;
-    };
-    !bytes.iter().any(|b| (*b < 32 && *b != b'\n') || *b == 127)
-}
-
 /// Parse one config file with shell defaults for a missing path.
 pub fn load(request: &Request<'_>) -> Result<Config> {
     // The env override is validated before anything else — even before
@@ -833,9 +815,9 @@ mod tests {
     }
 
     #[test]
-    fn control_bytes_scan_matches_shell_od_awk() {
+    fn control_bytes_scan_rejects_every_control_byte_but_lf() {
         // (body, clean): TAB/CR/NUL/DEL/US fail; LF, space, tilde,
-        // and high bytes pass — the shell probe agrees on each.
+        // and high bytes pass.
         let cases: &[(&[u8], bool)] = &[
             (b"", true),
             (b"abc\n", true),
@@ -847,34 +829,16 @@ mod tests {
             (b"a\x7fb", false),
             (b"a\x1fb", false),
         ];
-        for (index, (body, expected)) in cases.iter().enumerate() {
+        for (index, (body, clean)) in cases.iter().enumerate() {
             let fx = fixture(body);
-            assert_eq!(
-                config_control_bytes(&fx.path),
-                *expected,
-                "case {index} body {body:?}"
-            );
+            let rejected_for_control = load(&Request {
+                config_path: Some(&fx.path),
+                home: "/home/u",
+                env_policy: None,
+            })
+            .is_err_and(|error| error.to_string().contains("contains control bytes"));
+            assert_eq!(rejected_for_control, !clean, "case {index} body {body:?}");
         }
-    }
-
-    #[test]
-    fn control_bytes_unreadable_paths_fail_closed() {
-        // Production runs under `set -o pipefail`, so a failed `od`
-        // fails the whole `od | awk` pipeline: missing paths and
-        // directories exit 1 (verified against the live oracle).
-        let dir = TempDir::new("config-control").expect("temp dir");
-        assert!(!config_control_bytes(&dir.path().join("does-not-exist")));
-        assert!(!config_control_bytes(dir.path()));
-    }
-
-    #[test]
-    fn control_bytes_follow_symlinks_like_od() {
-        let dir = TempDir::new("config-controllink").expect("temp dir");
-        let target = dir.path().join("real");
-        std::fs::write(&target, b"version=1\n\x01\n").expect("write");
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&target, &link).expect("symlink");
-        assert!(!config_control_bytes(&link));
     }
 
     #[test]

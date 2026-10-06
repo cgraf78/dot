@@ -23,11 +23,6 @@ pub fn version_line() -> String {
     format!("dot {VERSION} (config 1; extensions 1; library 1)")
 }
 
-/// Crate-level description for logs and diagnostics.
-pub fn description() -> String {
-    format!("dot {VERSION}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

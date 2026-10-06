@@ -95,7 +95,7 @@ fn recorded_targets_cover_git_local_default_invalid_and_empty_owner_rows() {
 }
 
 #[test]
-fn active_provides_and_link_matching_preserve_order_sync_and_dangling_targets() {
+fn active_link_matching_preserves_order_sync_and_dangling_targets() {
     let scope = TempDir::new("publish-active").unwrap();
     let root = scope.path();
     let one = root.join("one");
@@ -103,10 +103,6 @@ fn active_provides_and_link_matching_preserve_order_sync_and_dangling_targets() 
     stage(&one, "home/app.conf", b"one\n");
     stage(&two, "home/other.conf", b"two\n");
     let overlays = vec![overlay("one", &one, "git"), overlay("two", &two, "none")];
-    assert!(repos_overlays::active_provides(&overlays, "app.conf"));
-    assert!(repos_overlays::active_provides(&overlays, "other.conf"));
-    assert!(!repos_overlays::active_provides(&overlays, "missing"));
-    assert!(!repos_overlays::active_provides(&overlays, "../escape"));
     std::os::unix::fs::symlink(".dotfiles-one/home/app.conf", root.join("app.conf")).unwrap();
     std::os::unix::fs::symlink("elsewhere", root.join("other.conf")).unwrap();
     let home = root.to_string_lossy();

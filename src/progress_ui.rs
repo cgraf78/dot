@@ -354,126 +354,11 @@ fn normalize_done_elapsed(line: &[u8], normalized: &mut Vec<u8>) {
     }
 }
 
-/// `_ui_now_ms`: millisecond clock for durations. `date_output` is the
-/// command-substitution-stripped `date +%s%3N` read (empty when `date`
-/// is missing or its `%3N` is unsupported, like BSD `date`); pure
-/// digits pass through, anything else falls back to
-/// `seconds * 1000` (the shell's `${SECONDS:-0}` branch, resolved by
-/// the caller like [`elapsed`]'s clock).
-pub fn now_ms(date_output: &str, seconds: i64) -> Vec<u8> {
-    if !date_output.is_empty() && date_output.bytes().all(|byte| byte.is_ascii_digit()) {
-        date_output.as_bytes().to_vec()
-    } else {
-        (seconds * 1000).to_string().into_bytes()
-    }
-}
-
 /// `_ui_live_enabled`: live redraws unless quiet, on a terminal or
 /// forced. `force_live` mirrors `DOT_UI_FORCE_LIVE` with its `:-0`
 /// default through the shared quiet normalization.
 pub fn live_enabled(quiet: bool, stdout_is_tty: bool, force_live: Option<&str>) -> bool {
     !quiet && (stdout_is_tty || crate::log::is_quiet(force_live))
-}
-
-/// Shared `jq -r --arg k` plumbing for [`json_get`] and [`json_num`]:
-/// not a shell port, just the common spawn both filters need. Feeds
-/// `line` on stdin, suppresses diagnostics, and yields raw stdout on
-/// success — empty when `jq` cannot spawn or the filter fails (the
-/// shell's `2>/dev/null` plus empty-on-error contract).
-fn json_via_jq(key: &str, line: &[u8], filter: &str) -> Vec<u8> {
-    let mut command = std::process::Command::new("jq");
-    command
-        .arg("-r")
-        .arg("--arg")
-        .arg("k")
-        .arg(key)
-        .arg(filter)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    match crate::cleanup::run_session_output_with_input(
-        command,
-        line,
-        None,
-        crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
-        crate::cleanup::LingerPolicy::Strict,
-    ) {
-        Ok(output) if output.status.success() => output.stdout,
-        _ => Vec::new(),
-    }
-}
-
-/// `_json_get`: a string field from one JSONL event. With `jq`
-/// (resolved by the caller from `command -v jq`, like
-/// [`live_enabled`]'s flags) this runs the shell's exact filter, so
-/// escapes, nesting, and duplicate keys match by construction;
-/// without it this replays the `sed` fallback byte for byte: the last
-/// `"key":"value"` wins and the value stops at the next quote (real
-/// event keys are `[a-z0-9_-]`, where regex and literal search agree).
-/// Only stdout is returned: every shell caller reads these through
-/// `$(...)`, so `jq`'s nonzero exit on unparsable input (which prints
-/// nothing) is unobservable downstream.
-pub fn json_get(key: &str, line: &[u8], jq_available: bool) -> Vec<u8> {
-    if jq_available {
-        return json_via_jq(key, line, ".[$k] // empty");
-    }
-    let mut needle = Vec::with_capacity(key.len() + 4);
-    needle.push(b'"');
-    needle.extend_from_slice(key.as_bytes());
-    needle.extend_from_slice(b"\":\"");
-    let mut starts = Vec::new();
-    if needle.len() <= line.len() {
-        for (index, window) in line.windows(needle.len()).enumerate() {
-            if window == needle.as_slice() {
-                starts.push(index);
-            }
-        }
-    }
-    for start in starts.into_iter().rev() {
-        let rest = &line[start + needle.len()..];
-        if let Some(end) = rest.iter().position(|byte| *byte == b'"') {
-            let mut out = rest[..end].to_vec();
-            out.push(b'\n');
-            return out;
-        }
-    }
-    Vec::new()
-}
-
-/// `_json_num`: a numeric field from one JSONL event (empty when
-/// absent or non-numeric). The `jq` arm runs the shell's exact type
-/// gate; the `sed` replay takes the last `"key":` with an immediate
-/// digit run, so `1.5` yields `1` and ` 5` misses, exactly like the
-/// fallback it mirrors.
-pub fn json_num(key: &str, line: &[u8], jq_available: bool) -> Vec<u8> {
-    if jq_available {
-        return json_via_jq(
-            key,
-            line,
-            "if (.[$k] | type) == \"number\" then .[$k] else empty end",
-        );
-    }
-    let mut needle = Vec::with_capacity(key.len() + 3);
-    needle.push(b'"');
-    needle.extend_from_slice(key.as_bytes());
-    needle.extend_from_slice(b"\":");
-    let mut starts = Vec::new();
-    if needle.len() <= line.len() {
-        for (index, window) in line.windows(needle.len()).enumerate() {
-            if window == needle.as_slice() {
-                starts.push(index);
-            }
-        }
-    }
-    for start in starts.into_iter().rev() {
-        let rest = &line[start + needle.len()..];
-        let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
-        if digits > 0 {
-            let mut out = rest[..digits].to_vec();
-            out.push(b'\n');
-            return out;
-        }
-    }
-    Vec::new()
 }
 
 /// `_ui_clear_live`: emit the carriage-return clear exactly once,
@@ -1740,36 +1625,4 @@ impl std::io::Write for IndentedLines<'_> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
-}
-
-/// `_ui_normal_shell_name`: basename without one leading dash, kept
-/// only for `bash`/`zsh`.
-pub fn normal_shell_name(path: &str) -> Option<&str> {
-    let base = path.rsplit('/').next().unwrap_or(path);
-    let base = base.strip_prefix('-').unwrap_or(base);
-    match base {
-        "bash" | "zsh" => Some(base),
-        _ => None,
-    }
-}
-
-/// Pure core of `_ui_parent_shell_name`: the `/proc` reading wins,
-/// `ps` output (first line, surrounding blanks trimmed) is the
-/// fallback. Production feeds the process reads; the shell body
-/// itself is unpinnable process state, so tests pin this core plus
-/// the normalization above it.
-pub fn parent_shell_name(proc_comm: Option<&str>, ps_comm: Option<&str>) -> Option<String> {
-    if let Some(comm) = proc_comm {
-        if let Some(name) = normal_shell_name(comm) {
-            return Some(name.to_string());
-        }
-    }
-    if let Some(raw) = ps_comm {
-        let first = raw.split('\n').next().unwrap_or("");
-        let trimmed = first.trim_matches(|c: char| c.is_ascii_whitespace());
-        if let Some(name) = normal_shell_name(trimmed) {
-            return Some(name.to_string());
-        }
-    }
-    None
 }

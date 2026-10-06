@@ -2,10 +2,11 @@
 
 use dot::doctor_coordinator::{
     SpecError, SummaryColor, collect_specs, collect_specs_with, extension_identity, extension_key,
-    overall_ok, record_kind, source_relative_valid, summary_color, summary_line,
+    overall_ok, record_kind, summary_color, summary_line,
 };
 use dot::doctor_runtime::Kind;
 use dot_test_support::TempDir;
+use std::os::unix::fs::PermissionsExt as _;
 
 #[test]
 fn identity_rows_agree() {
@@ -118,13 +119,44 @@ fn dispatch_rows_agree() {
 }
 
 #[test]
-fn source_rows_agree() {
-    for valid in ["doctor.d/a.sh", "doctor.d/nested/a.sh", "a.sh"] {
-        assert!(source_relative_valid(valid.as_bytes()), "{valid}");
-    }
-    for invalid in ["", "/absolute", "../escape", "a/../escape", "a//b", "a/./b"] {
-        assert!(!source_relative_valid(invalid.as_bytes()), "{invalid}");
-    }
+fn doctor_source_rejects_unsafe_relative_shapes() {
+    // `dot_doctor_source` refuses malformed relative paths as usage errors
+    // (2) before trust validation; well-shaped ones reach the trust check,
+    // which sources a trusted file (0) and refuses missing ones (1).
+    let extensions = TempDir::new("doctor-source-shapes").expect("fixture");
+    let support = extensions.write("support.sh", b"printf 'sourced\\n'\n");
+    std::fs::set_permissions(&support, std::fs::Permissions::from_mode(0o644)).expect("mode");
+    let valid = ["doctor.d/a.sh", "doctor.d/nested/a.sh", "a.sh"];
+    let invalid = ["", "/absolute", "../escape", "a/../escape", "a//b", "a/./b"];
+    let output = std::process::Command::new(dot_test_support::bash())
+        .args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            ". \"$DOT_SOURCE_ROOT/lib/dot/public/hook-runtime-v1/extension-trust.sh\"\n\
+             . \"$DOT_SOURCE_ROOT/lib/dot/public/hook-runtime-v1/doctor-api.sh\"\n\
+             for relative in \"$@\"; do\n\
+               if dot_doctor_source \"$relative\"; then echo 0; else echo \"$?\"; fi\n\
+             done\n",
+            "doctor-source",
+        ])
+        .arg("support.sh")
+        .args(valid.iter().chain(&invalid))
+        .env_clear()
+        .env("HOME", extensions.path())
+        .env("DOT_EXTENSIONS_DIR", extensions.path())
+        .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run dot_doctor_source");
+    assert!(output.status.success(), "{output:?}");
+    let expected: String = ["sourced\n0\n"]
+        .into_iter()
+        .chain(valid.iter().map(|_| "1\n"))
+        .chain(invalid.iter().map(|_| "2\n"))
+        .collect();
+    assert_eq!(String::from_utf8(output.stdout).expect("utf8"), expected);
 }
 
 #[test]

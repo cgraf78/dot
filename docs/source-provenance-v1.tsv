@@ -36,9 +36,9 @@ tests/doctor_runtime.rs	standalone:new
 tests/doctor_paths.rs	standalone:new
 tests/extension_trust.rs	standalone:new
 tests/extension_worker.rs	standalone:new
-tests/families.rs	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/fixture_git.rs	standalone:new
-tests/hook_api.rs	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
+tests/hook_runtime.rs	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
+tests/hook_runtime_generation.rs	standalone:new
 tests/hooks-test	dotfiles:tests/core-merges-test@dotfiles-v1+standalone
 tests/init-test	standalone:new
 tests/init_client_transaction.rs	standalone:new
@@ -51,8 +51,6 @@ tests/link_exec.rs	standalone:new
 tests/link_prep.rs	standalone:new
 tests/log.rs	standalone:new
 tests/no-private-engine-test	standalone:new
-tests/merge_block.rs	standalone:new
-tests/merge_hooks.rs	standalone:new
 tests/merges.rs	standalone:new
 tests/overlay_context.rs	standalone:new
 tests/overlays.rs	standalone:new
@@ -60,6 +58,7 @@ tests/ownership-transfer-test	standalone:new
 tests/perf_budget.rs	standalone:new
 tests/perf_update.rs	standalone:new
 tests/support/perf_policy.rs	standalone:new
+tests/support/hook_runtime.rs	standalone:new
 tests/support/performance-supervisor-fixture.rs	standalone:new
 tests/platform.rs	standalone:new
 tests/profile_lifecycle.rs	standalone:new
@@ -88,7 +87,6 @@ tests/repos_pull_queries.rs	standalone:new
 tests/repos_prefetch.rs	standalone:new
 tests/repos_pull_support.rs	standalone:new
 tests/repos_restore.rs	standalone:new
-tests/run.rs	standalone:new
 tests/progress_ui.rs	standalone:new
 tests/reserved.rs	standalone:new
 tests/run	standalone:new

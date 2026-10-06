@@ -1,8 +1,7 @@
 //! Pull support primitives from `lib/dot/repos/pull.sh`.
 //!
 //! The conflict-log parser, the timestamped backup directory maker,
-//! the locale-pinned pull runner, the worker-fleet accounting, and
-//! the upstream preparation. The conflict-backup orchestrator lives
+//! the worker-fleet accounting, and the upstream preparation. The conflict-backup orchestrator lives
 //! in [`crate::repos_pull_backup`].
 
 /// `_pull_conflicts_from_log`: list the untracked files a failed pull
@@ -133,29 +132,6 @@ pub fn backup_dir(
     Err(failure)
 }
 
-/// `_pull_cmd`: run `program` with `args` under `LC_ALL=C`, appending
-/// `--quiet` in quiet mode.
-///
-/// Stdio inherits like the shell (a pull may prompt and always
-/// streams); only the locale is pinned, because the conflict-backup
-/// detector and the quiet-output filter match literal English git
-/// messages. Returns the child exit code, 127 when spawning fails.
-pub fn pull_cmd(quiet: bool, program: &str, args: &[&str]) -> i32 {
-    let mut argv: Vec<&str> = Vec::with_capacity(args.len() + 1);
-    argv.extend_from_slice(args);
-    if quiet {
-        argv.push("--quiet");
-    }
-    let mut command = std::process::Command::new(program);
-    command
-        .args(&argv)
-        .env("LC_ALL", "C")
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
-    crate::cleanup::run_foreground_status(command)
-}
-
 /// `_pull_overlay_result_prefix`: `<dir>/<idx>` with the worker
 /// index zero-padded to three, exactly like `printf %s/%03d`.
 /// `idx` is always a worker counter in practice.
@@ -213,34 +189,6 @@ pub fn record_status(name: &str, status: &str, tally: &mut PullTally) -> Option<
 /// optional flag, but neither decides.
 pub fn overlay_active(path: &std::path::Path, url: &str) -> bool {
     crate::overlays::is_worktree(path) || !url.is_empty()
-}
-
-/// `_pull_overlay_count`: entries with a `git` sync (the default
-/// when the field is empty) that are active. Entries split like
-/// `IFS='|' read ...` over `name|path|url|conf|optional|sync`,
-/// with any surplus fields folded into the sync field.
-pub fn overlay_count(entries: &[&str]) -> usize {
-    entries
-        .iter()
-        .filter(|entry| {
-            let mut fields = entry.split('|');
-            let _name = fields.next().unwrap_or("");
-            let path = fields.next().unwrap_or("");
-            let url = fields.next().unwrap_or("");
-            let _conf = fields.next().unwrap_or("");
-            let _optional = fields.next().unwrap_or("");
-            let rest = fields.collect::<Vec<_>>().join("|");
-            let sync = if rest.is_empty() {
-                "git"
-            } else {
-                rest.as_str()
-            };
-            if sync != "git" {
-                return false;
-            }
-            overlay_active(std::path::Path::new(path), url)
-        })
-        .count()
 }
 
 /// Resolve `@{u}` to its remote name, or `None` when there is no

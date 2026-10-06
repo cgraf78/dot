@@ -4995,7 +4995,7 @@ fn update_hook_runs_with_only_public_hook_assets() {
     }
 
     let fixture = NativeUpdateFixture::stage().with_pre_sync(
-        b"prepare() { [[ $# -eq 0 ]] || return 91; if command -v ps >/dev/null; then command_line=$(ps -o command= -p $$) || return; [[ $command_line != *file://* ]] || return 92; fi; ! declare -F _ensure_repo_config >/dev/null || return 93; ! declare -F _overlay_record_link_target >/dev/null || return 94; printf prepared >\"$HOME/pre-sync-ran\"; }\n",
+        b"prepare() { [[ $# -eq 0 ]] || return 91; if command -v ps >/dev/null; then command_line=$(ps -o command= -p $$) || return; [[ $command_line != *file://* ]] || return 92; fi; ! declare -F _ensure_repo_config >/dev/null || return 93; ! declare -F _overlay_record_link_target >/dev/null || return 94; for helper in _overlay_link_target _overlay_private_regular_file _overlay_parse_manifest_record _overlay_manifest_safe _overlay_is_worktree _overlay_effective_url _overlay_origin_matches _overlay_checkout_matches; do declare -F \"$helper\" >/dev/null || return 95; done; printf prepared >\"$HOME/pre-sync-ran\"; }\n",
     );
     let release_root = fixture.client.home.join("native-release");
     copy_tree(

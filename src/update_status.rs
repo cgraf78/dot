@@ -1,8 +1,7 @@
 //! Cron observability state under `$XDG_STATE_HOME/dot`.
 //!
-//! Handoff findings #1 (cron dirty-skip observability) and #6 (quiet
-//! runner status plus retained logs) share one state layout, owned
-//! here so writers (the update engine, the quiet runner) and readers
+//! Handoff finding #1 (cron dirty-skip observability) owns one state
+//! layout here so writers (the update engine) and readers
 //! (`dot doctor`) cannot drift:
 //!
 //! - `update.log`: one outcome line per cron run, appended:
@@ -54,8 +53,6 @@
 //!   and capped, and the whole body stays within
 //!   [`FAILURE_MAX_BYTES`]. A separate file rather than more fields in
 //!   `update.last-run`, whose older readers reject anything but words.
-//! - `logs/`: retained failure logs from the quiet runner, pruned to
-//!   the newest [`MAX_RETAINED_LOGS`].
 //!
 //! Every writer is best-effort: observability must never fail an
 //! update or a command, so filesystem errors are swallowed and
@@ -72,9 +69,6 @@ pub const CRON_STALE_AFTER_SECS: i64 = 7200;
 
 /// Dirty files named on one `skip` line before the `+N more` cap.
 pub const MAX_SKIP_FILES: usize = 10;
-
-/// Retained failure logs kept per directory (newest win).
-pub const MAX_RETAINED_LOGS: usize = 20;
 
 /// Largest `update.last-success` or `update.last-converged` body
 /// accepted: a valid stamp is an ASCII epoch (at most 20 bytes), an
@@ -442,11 +436,6 @@ pub fn last_run_path(state_home: &Path) -> PathBuf {
 /// The last non-ok run's cause (`dot/update.last-failure`).
 pub fn last_failure_path(state_home: &Path) -> PathBuf {
     dot_dir(state_home).join("update.last-failure")
-}
-
-/// The retained failure-log directory (`dot/logs`).
-pub fn logs_dir(state_home: &Path) -> PathBuf {
-    dot_dir(state_home).join("logs")
 }
 
 /// Cap a dirty file list for one `skip` line: the first
@@ -834,87 +823,4 @@ pub fn format_age(age_secs: i64) -> String {
         return format!("{}m", age / 60);
     }
     format!("{}h{}m", age / 3600, (age % 3600) / 60)
-}
-
-/// Keep `label` filename-safe for retained logs: ASCII alphanumerics
-/// plus `-`, `_`, and `.` pass through, everything else becomes
-/// `_`. Only the empty label reads `command` (a label of nothing
-/// safe still maps to underscores, which is itself filename-safe).
-pub fn sanitize_label(label: &str) -> String {
-    let cleaned: String = label
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() {
-        "command".to_string()
-    } else {
-        cleaned
-    }
-}
-
-/// Retain a failed scratch log under `logs_dir` as
-/// `<label>-<epoch>-<pid>.log`, pruning to the newest
-/// [`MAX_RETAINED_LOGS`]. Moves with rename, falling back to
-/// copy-plus-remove across filesystems; returns the retained path,
-/// or `None` when retention failed (the caller then removes the
-/// scratch log itself). Best-effort throughout.
-pub fn retain_failed_log(
-    logs_dir: &Path,
-    label: &str,
-    now: i64,
-    scratch: &Path,
-) -> Option<PathBuf> {
-    if ensure_private_dir(logs_dir).is_err() {
-        return None;
-    }
-    let retained = logs_dir.join(format!(
-        "{}-{now}-{}.log",
-        sanitize_label(label),
-        std::process::id()
-    ));
-    if std::fs::rename(scratch, &retained).is_err() {
-        if std::fs::copy(scratch, &retained).is_err() {
-            // A failed copy must not leave a partial entry behind to
-            // consume one of the retained slots.
-            let _ = std::fs::remove_file(&retained);
-            return None;
-        }
-        let _ = std::fs::remove_file(scratch);
-    }
-    prune_logs(logs_dir);
-    Some(retained)
-}
-
-/// Prune `logs_dir` to the newest [`MAX_RETAINED_LOGS`] `*.log`
-/// files by (mtime, name), removing the oldest first. Best-effort:
-/// unreadable directories and removal failures are ignored.
-pub fn prune_logs(logs_dir: &Path) {
-    let entries = match std::fs::read_dir(logs_dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    let mut logs: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".log") {
-            continue;
-        }
-        let mtime = std::fs::metadata(&path)
-            .and_then(|meta| meta.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        logs.push((mtime, name, path));
-    }
-    logs.sort();
-    if logs.len() > MAX_RETAINED_LOGS {
-        for (_, _, path) in logs.iter().take(logs.len() - MAX_RETAINED_LOGS) {
-            let _ = std::fs::remove_file(path);
-        }
-    }
 }

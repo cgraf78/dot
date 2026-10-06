@@ -71,7 +71,6 @@ fn inputs(home: &Path) -> Inputs {
         home: h.clone(),
         extensions_dir: format!("{h}/ext"),
         manifest: String::new(),
-        retiring_root: String::new(),
     }
 }
 
@@ -284,53 +283,85 @@ fn deactivation_requires_fixed_regular_script_and_saved_git_identity() {
     assert!(trust::deactivation_validate(&record, &script_s, &h, euid()).is_err());
 }
 
+/// Run `dot_retiring_overlay_file` once per relative path with `root` as
+/// the retiring checkout, printing `<status> <REPLY>` per call.
+fn retiring_files(root: &Path, relatives: &[&str]) -> Vec<String> {
+    let output = Command::new(dot_test_support::bash())
+        .args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            ". \"$DOT_SOURCE_ROOT/lib/dot/public/hook-runtime-v1/extension-trust.sh\"\n\
+             for relative in \"$@\"; do\n\
+               REPLY=\n\
+               if dot_retiring_overlay_file \"$relative\"; then code=0; else code=$?; fi\n\
+               printf '%s %s\\n' \"$code\" \"$REPLY\"\n\
+             done\n",
+            "retiring",
+        ])
+        .args(relatives)
+        .env_clear()
+        .env("DOT_RETIRING_OVERLAY_ROOT", root)
+        .env("DOT_SOURCE_ROOT", env!("CARGO_MANIFEST_DIR"))
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("LC_ALL", "C")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
 #[test]
 fn retiring_file_distinguishes_usage_from_refusal() {
     let fixture = TempDir::new("trust-retiring").unwrap();
     let root = dir(fixture.path(), "retiring", 0o700);
     let good = file(&root, "support/deep.conf", b"ok", 0o644);
-    let mut input = inputs(fixture.path());
-    input.retiring_root = root.to_string_lossy().into();
-    assert_eq!(
-        trust::retiring_overlay_file("support/deep.conf", &input).unwrap(),
-        good.to_string_lossy()
-    );
-    for malformed in [
+    let malformed = [
         "", "/abs", ".", "..", "./x", "../x", "a/./b", "a/../b", "a/", "a//b",
-    ] {
-        assert_eq!(
-            trust::retiring_overlay_file(malformed, &input),
-            Err(trust::Error::Usage)
-        );
-    }
-    for refused in ["missing", "support"] {
-        assert_eq!(
-            trust::retiring_overlay_file(refused, &input),
-            Err(trust::Error::Refused)
-        );
-    }
+    ];
+    let mut relatives = vec!["support/deep.conf", "missing", "support"];
+    relatives.extend(malformed);
+    let mut expected = vec![
+        format!("0 {}", good.display()),
+        "1 ".to_string(),
+        "1 ".to_string(),
+    ];
+    expected.extend(malformed.iter().map(|_| "2 ".to_string()));
+    assert_eq!(retiring_files(&root, &relatives), expected);
 
+    let refused = |label: &str| {
+        assert_eq!(
+            retiring_files(&root, &["support/deep.conf"]),
+            ["1 "],
+            "{label}"
+        );
+    };
     let real = root.join("support/deep.real");
     std::fs::rename(&good, &real).unwrap();
     std::os::unix::fs::symlink("deep.real", &good).unwrap();
-    assert_eq!(
-        trust::retiring_overlay_file("support/deep.conf", &input),
-        Err(trust::Error::Refused)
-    );
+    refused("symlinked file");
     std::fs::remove_file(&good).unwrap();
     std::fs::rename(&real, &good).unwrap();
     let hardlink = root.join("support/deep.hardlink");
     if std::fs::hard_link(&good, &hardlink).is_ok() {
-        assert_eq!(
-            trust::retiring_overlay_file("support/deep.conf", &input),
-            Err(trust::Error::Refused)
-        );
+        refused("hard-linked file");
         std::fs::remove_file(hardlink).unwrap();
     }
     chmod(&root.join("support"), 0o777);
+    refused("writable parent");
+    chmod(&root.join("support"), 0o700);
     assert_eq!(
-        trust::retiring_overlay_file("support/deep.conf", &input),
-        Err(trust::Error::Refused)
+        retiring_files(fixture.path(), &["retiring/support/deep.conf"]),
+        [format!("0 {}", good.display())]
+    );
+    let missing_root = fixture.path().join("gone");
+    assert_eq!(
+        retiring_files(&missing_root, &["support/deep.conf"]),
+        ["1 "]
     );
 }
 

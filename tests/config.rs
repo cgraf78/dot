@@ -4,8 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use dot::config::{
-    Config, KNOWN_KEYS, Provider, Request, UpdatePolicy, config_control_bytes, config_error,
-    extensions_enabled, load,
+    Config, KNOWN_KEYS, Provider, Request, UpdatePolicy, config_error, extensions_enabled, load,
 };
 use dot::xdg::{self, Kind};
 use dot_test_support::TempDir;
@@ -451,38 +450,6 @@ fn config_error_has_stable_prefix_and_joined_detail() {
             "detail {detail:?}"
         );
     }
-}
-
-/// Every accepted and rejected byte class is explicit, and unreadable paths
-/// fail closed.
-#[test]
-fn control_byte_scan_handles_binary_and_unreadable_paths() {
-    let scratch = TempDir::new("config-control-diff").expect("scratch dir");
-    let bodies: &[&[u8]] = &[
-        b"",
-        b"abc\n",
-        b" ~\n",
-        b"\xff\xfe\x80\n",
-        b"a\tb\n",
-        b"a\rb\n",
-        b"a\x00b",
-        b"a\x7fb",
-        b"a\x1fb",
-    ];
-    let expected = [true, true, true, true, false, false, false, false, false];
-    for (index, (body, expected)) in bodies.iter().zip(expected).enumerate() {
-        let path = scratch.write(&format!("control-{index}"), body);
-        require_fixture(&path, "native control scan");
-        assert_eq!(
-            config_control_bytes(&path),
-            expected,
-            "case {index}: {body:?}"
-        );
-    }
-    // Missing paths and directories cannot supply trusted configuration.
-    let missing = scratch.path().join("does-not-exist");
-    assert!(!config_control_bytes(&missing));
-    assert!(!config_control_bytes(scratch.path()));
 }
 
 /// Only API version one plus a non-empty directory enables extensions.

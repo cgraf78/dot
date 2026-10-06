@@ -2,11 +2,9 @@
 //!
 //! Owns the four path helpers formerly defined in
 //! `lib/dot/doctor/paths.sh` — `_dr_physical_path`,
-//! `_dr_symlink_target_path`, `_dr_symlink_points_to`, `_dr_tilde` —
-//! plus the public display twin `dot_doctor_display_path` from
-//! `lib/dot/public/hook-runtime-v1/doctor-api.sh`. Part 1 (`doctor_runtime`) owns the result
-//! lines and counters; this module owns how section checks name
-//! filesystem locations.
+//! `_dr_symlink_target_path`, `_dr_symlink_points_to`, `_dr_tilde`.
+//! Part 1 (`doctor_runtime`) owns the result lines and counters; this
+//! module owns how section checks name filesystem locations.
 //!
 //! Parity decisions:
 //! - `_dr_physical_path` canonicalizes the *directory* only (`cd`
@@ -21,14 +19,13 @@
 //! - `_dr_symlink_points_to` conflates every failure (missing
 //!   expected path, unreadable link, unresolvable side, mismatch)
 //!   into one nonzero status, so Rust returns `bool`.
-//! - `_dr_tilde` and `dot_doctor_display_path` share the `HOME`
-//!   prefix rule but differ at the root: with `HOME=/` the private
-//!   helper's `"$HOME"/*` pattern is literally `//*` and leaves
-//!   `/foo` alone, while the public helper special-cases `/` and
-//!   abbreviates `/foo` to `~/foo`. The differential matrix pins
-//!   both arms.
+//! - `_dr_tilde` shares the `HOME` prefix rule with the hook API's
+//!   `dot_doctor_display_path` but differs at the root: with `HOME=/`
+//!   the private helper's `"$HOME"/*` pattern is literally `//*` and
+//!   leaves `/foo` alone, while the public helper special-cases `/` and
+//!   abbreviates `/foo` to `~/foo`. The display matrix pins both arms.
 //! - Filesystem inputs travel as `&Path` (byte-exact on Unix, like
-//!   the shell); the two display helpers take `&str`, matching the
+//!   the shell); the display helper takes `&str`, matching the
 //!   crate's `xdg` precedent — display text is abbreviated, never
 //!   probed on disk.
 //! - Relative inputs resolve against the process working directory on
@@ -49,34 +46,18 @@ const ROOT: &[u8] = b"/";
 /// slash-free input (`dir=.`).
 const DOT: &[u8] = b".";
 
-/// Doctor path failure, carrying the shell's exit code.
-///
-/// Both resolution failures surface as status 1; the display-arity
-/// failure surfaces as status 2, mirroring `xdg::Error`.
+/// Doctor path failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// A directory, link, or expected path could not be resolved
     /// (shell `return 1`).
     Unresolvable,
-    /// Wrong argument count for the display helper (shell `return 2`).
-    Usage,
-}
-
-impl Error {
-    /// Shell exit code for this failure.
-    pub fn code(self) -> i32 {
-        match self {
-            Error::Unresolvable => 1,
-            Error::Usage => 2,
-        }
-    }
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Unresolvable => write!(f, "doctor path cannot be resolved"),
-            Error::Usage => write!(f, "invalid doctor display-path arguments"),
         }
     }
 }
@@ -175,8 +156,8 @@ pub fn symlink_points_to(link: &Path, expected: &Path) -> bool {
 /// anything else verbatim. The prefix is the literal `HOME` plus
 /// `/`, so with `HOME=/` only `//`-led paths take the second arm
 /// and `/foo` passes through — the shell's `"$HOME"/*` pattern
-/// behaves the same way. See [`display_path`] for the public twin,
-/// which special-cases a `/` home instead.
+/// behaves the same way. The hook API's `dot_doctor_display_path`
+/// special-cases a `/` home instead.
 pub fn tilde(path: &str, home: &str) -> String {
     // The abbreviation only ever cuts at the ASCII `/` after `home`, so
     // UTF-8 input stays UTF-8; the lossy conversion never replaces anything.
@@ -200,31 +181,6 @@ pub fn tilde_bytes(path: &[u8], home: &[u8]) -> Vec<u8> {
     path.to_vec()
 }
 
-/// `dot_doctor_display_path`: abbreviate `HOME` for display, with an
-/// arity gate.
-///
-/// The single argument abbreviates like [`tilde`], except a `/` home
-/// takes its own branch: `/` becomes `~` and any other absolute path
-/// loses one leading slash behind `~/`, so `/foo` becomes `~/foo`
-/// where [`tilde`] would leave it alone. Any other argument count is
-/// [`Error::Usage`] (shell `return 2`).
-pub fn display_path(args: &[&str], home: &str) -> Result<String, Error> {
-    if args.len() != 1 {
-        return Err(Error::Usage);
-    }
-    let path = args[0];
-    if home == "/" {
-        if path == "/" {
-            return Ok("~".to_string());
-        }
-        if let Some(rest) = path.strip_prefix('/') {
-            return Ok(format!("~/{rest}"));
-        }
-        return Ok(path.to_string());
-    }
-    Ok(tilde(path, home))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,7 +199,7 @@ mod tests {
     fn tilde_root_home_keeps_single_slash_paths() {
         // `"$HOME"/*` with `HOME=/` is literally `//*`: `/foo` passes
         // through while `//foo` abbreviates. `dot_doctor_display_path`
-        // differs here on purpose (see below).
+        // differs here on purpose (`tests/doctor_paths.rs`).
         assert_eq!(tilde("/", "/"), "~");
         assert_eq!(tilde("/foo", "/"), "/foo");
         assert_eq!(tilde("//foo", "/"), "~/foo");
@@ -263,47 +219,5 @@ mod tests {
         assert_eq!(tilde_bytes(b"/home/u/\xff", b"/home/u"), b"~/\xff");
         assert_eq!(tilde_bytes(b"/srv/\xff", b"/home/u"), b"/srv/\xff");
         assert_eq!(tilde_bytes(b"/home/u", b"/home/u"), b"~");
-    }
-
-    #[test]
-    fn display_root_home_abbreviates_absolutes() {
-        assert_eq!(display_path(&["/"], "/"), Ok("~".to_string()));
-        assert_eq!(display_path(&["/foo"], "/"), Ok("~/foo".to_string()));
-        assert_eq!(display_path(&["//x"], "/"), Ok("~//x".to_string()));
-        assert_eq!(display_path(&["rel/path"], "/"), Ok("rel/path".to_string()));
-        assert_eq!(display_path(&[""], "/"), Ok(String::new()));
-    }
-
-    #[test]
-    fn display_delegates_off_root() {
-        // Away from `/`, the public helper is the private rule: every
-        // row must equal `tilde`.
-        for home in ["/home/u", "", "/home/u/"] {
-            for path in [
-                "/home/u",
-                "/home/u/docs",
-                "/home/u2",
-                "/etc",
-                "/",
-                "rel/path",
-                "",
-            ] {
-                assert_eq!(
-                    display_path(&[path], home),
-                    Ok(tilde(path, home)),
-                    "display must equal tilde for home={home:?} path={path:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn display_arity_is_usage() {
-        assert_eq!(display_path(&[], "/home/u"), Err(Error::Usage));
-        assert_eq!(display_path(&["a", "b"], "/home/u"), Err(Error::Usage));
-        assert_eq!(Error::Usage.code(), 2);
-        assert_eq!(Error::Unresolvable.code(), 1);
-        assert!(!Error::Unresolvable.to_string().is_empty());
-        assert!(!Error::Usage.to_string().is_empty());
     }
 }

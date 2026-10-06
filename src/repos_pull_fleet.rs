@@ -2,8 +2,8 @@
 //! pull fan-out with parent-owned scratch files and the top-level
 //! synchronized-set pull.
 //!
-//! Owns `_pull_overlay_capture`, `_pull_overlay_drain_workers`,
-//! `_pull_overlays_serial`, `_pull_overlays`, and `_repo_pull_all`.
+//! Owns `_pull_overlay_drain_workers`, `_pull_overlays_serial`,
+//! `_pull_overlays`, and `_repo_pull_all`.
 //! The single-overlay orchestrator ([`crate::repos_pull_overlay`])
 //! and the accounting leaves ([`crate::repos_pull_support`]) already
 //! own their behavior; this layer only fans out, replays, and
@@ -318,58 +318,6 @@ fn alloc_result_dir(root: &Path) -> Option<PathBuf> {
     None
 }
 
-/// `_pull_overlay_capture`: run one overlay through [`pull_overlay`]
-/// with both streams combined into `<prefix>.log` (like `>log
-/// 2>&1`), then record `<prefix>.rc` and `<prefix>.status` with the
-/// shell's `printf '%s'` (no newline) spellings. The prefix is
-/// [`result_prefix`] (`<dir>/<idx %03d>`). Returns the pull status
-/// word and rc for convenience; the files remain the contract the
-/// ordered replay reads.
-pub fn overlay_capture(
-    idx: i64,
-    result_dir: &Path,
-    active: &ActiveOverlay<'_>,
-    inputs: &PullOverlaysInputs<'_>,
-    moves: &mut MoveCache,
-) -> (String, i32) {
-    let prefix = result_prefix(&result_dir.to_string_lossy(), idx);
-    let log_path = PathBuf::from(format!("{prefix}.log"));
-    let rc_path = PathBuf::from(format!("{prefix}.rc"));
-    let status_path = PathBuf::from(format!("{prefix}.status"));
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .create(true)
-        .open(&log_path);
-    let mut out_file;
-    let mut err_file;
-    match file {
-        Ok(file) => match file.try_clone() {
-            Ok(clone) => {
-                out_file = file;
-                err_file = clone;
-            }
-            Err(_) => {
-                let _ = std::fs::write(&rc_path, "1");
-                let _ = std::fs::write(&status_path, "");
-                return (String::new(), 1);
-            }
-        },
-        Err(_) => {
-            let _ = std::fs::write(&rc_path, "1");
-            let _ = std::fs::write(&status_path, "");
-            return (String::new(), 1);
-        }
-    }
-    let single = overlay_inputs(inputs, active);
-    let outcome = pull_overlay(&single, moves, &mut out_file, &mut err_file);
-    drop(out_file);
-    drop(err_file);
-    let _ = std::fs::write(&rc_path, outcome.rc.to_string());
-    let _ = std::fs::write(&status_path, outcome.status.as_str());
-    (outcome.status.as_str().to_string(), outcome.rc)
-}
-
 /// `_pull_overlay_drain_workers`: replay every non-empty
 /// `<dir>/*.log` to `out` in sorted order, then remove the scratch
 /// directory best-effort (`|| true`). Thread joins own the shell's
@@ -504,9 +452,8 @@ pub fn pull_overlays_serial(
 }
 
 /// Reap `count` worker completions, redrawing the live line on
-/// whole seconds while stalled (the `run_to_log_with_ticks`
-/// pattern: the waiting thread polls instead of blocking in a
-/// join). Workers contain panics in the overlay pull and still
+/// whole seconds while stalled (the waiting thread polls instead
+/// of blocking in a join). Workers contain panics in the overlay pull and still
 /// report, so a dropped sender is only a safety net for a panic
 /// outside that guard: stop waiting and let the enclosing scope
 /// re-raise it when it joins (the caller's scratch guard still

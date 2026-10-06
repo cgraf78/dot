@@ -1,6 +1,6 @@
 //! Owned resources and POSIX process lifecycle.
 //!
-//! Registry owns explicitly registered children, files and temporary paths.
+//! Registry owns explicitly registered temporary paths.
 //! Callers invoke its idempotent cleanup; scoped owners provide Drop where
 //! required. Native suite supervision additionally reserves each session
 //! leader until descendant teardown completes, then reaps through Child.
@@ -1124,19 +1124,10 @@ pub fn valid_pid(text: &str) -> bool {
     !text.is_empty() && text.as_bytes()[0] != b'0' && text.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Shell rule for the optional launch group: empty, or exactly the
-/// leader PID (arbitrary numeric PGIDs never enter the registry).
-pub fn valid_group(pid_text: &str, group_text: &str) -> bool {
-    group_text.is_empty() || group_text == pid_text
-}
-
-/// Owned resources awaiting teardown.
+/// Owned temporary paths awaiting teardown.
 #[derive(Debug, Default)]
 pub struct Registry {
-    children: Vec<Child>,
-    child_registrations: std::collections::BTreeMap<u32, StatusChildRegistration>,
     paths: Vec<PathBuf>,
-    files: Vec<File>,
     running: bool,
 }
 
@@ -1144,31 +1135,6 @@ impl Registry {
     /// Empty registry.
     pub fn new() -> Self {
         Registry::default()
-    }
-
-    /// Track an owned child for TERM/KILL escalation and reaping.
-    pub fn track_child(&mut self, child: Child) {
-        self.child_registrations
-            .insert(child.id(), StatusChildRegistration::new(child.id()));
-        self.children.push(child);
-    }
-
-    /// Stop tracking the child with this pid. Returns whether one was
-    /// present (the shell unregisters every match; PIDs are unique here
-    /// by handle construction).
-    pub fn untrack_child(&mut self, pid: u32) -> bool {
-        let before = self.children.len();
-        self.children.retain(|child| child.id() != pid);
-        let removed = self.children.len() != before;
-        if removed {
-            self.child_registrations.remove(&pid);
-        }
-        removed
-    }
-
-    /// Number of tracked children (for tests).
-    pub fn child_count(&self) -> usize {
-        self.children.len()
     }
 
     /// Register a temp path for removal at cleanup. Empty paths are a
@@ -1193,11 +1159,6 @@ impl Registry {
         self.paths.len()
     }
 
-    /// Hold an open file for closing at cleanup (drop closes it).
-    pub fn hold_file(&mut self, file: File) {
-        self.files.push(file);
-    }
-
     /// Remove one owned path now, mirroring
     /// `_dot_cleanup_remove_path`: unregister first so a path recreated
     /// after removal cannot be deleted by a later cleanup as though it
@@ -1217,21 +1178,15 @@ impl Registry {
         }
     }
 
-    /// Run the full teardown exactly once: TERM grace for children, KILL
-    /// escalation, reap, close files, remove paths (individual path
-    /// failures do not abort the pass, like the shell's `|| true`).
-    /// Reentrant calls while running, or after completion, return
-    /// immediately (shell: `[[ RUNNING -eq 0 ]] || return 0`).
+    /// Remove every registered path (individual path failures do not
+    /// abort the pass, like the shell's `|| true`). A reentrant call while
+    /// running returns immediately (shell: `[[ RUNNING -eq 0 ]] ||
+    /// return 0`).
     pub fn cleanup(&mut self) {
         if self.running {
             return;
         }
         self.running = true;
-        terminate_children(&mut self.children);
-        self.child_registrations.clear();
-        // Files close on drop; drain explicitly so descriptor release
-        // precedes path removal, matching the shell's fd-then-path order.
-        self.files.clear();
         let paths = std::mem::take(&mut self.paths);
         for path in &paths {
             let _ = remove_one(path);
@@ -1258,11 +1213,6 @@ fn remove_one(path: &Path) -> std::io::Result<()> {
             }
         }
     }
-}
-
-/// Send TERM to a registered child before bounded grace and KILL escalation.
-fn terminate(pid: u32) {
-    signal_pid(pid, libc::SIGTERM);
 }
 
 /// Deliver a signal to a positive process identity held by the caller.
@@ -8557,46 +8507,6 @@ fn format_survivor(
     detail
 }
 
-/// TERM grace, then KILL escalation, then reap — mirroring
-/// `_dot_cleanup_owned` for owned (non-group) children.
-fn terminate_children(children: &mut Vec<Child>) {
-    for child in children.iter() {
-        terminate(child.id());
-    }
-    let deadline_grace =
-        Instant::now() + Duration::from_millis(GRACE_ATTEMPTS as u64 * GRACE_INTERVAL_MS);
-    loop {
-        let mut all_done = true;
-        for child in children.iter_mut() {
-            // Still running: keep waiting on it. Exited or stale
-            // handles need nothing further.
-            if let Ok(None) = child.try_wait() {
-                all_done = false;
-            }
-        }
-        if all_done || Instant::now() >= deadline_grace {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(GRACE_INTERVAL_MS));
-    }
-    for child in children.iter_mut() {
-        // SIGKILL for stragglers only: a `try_wait` first keeps an
-        // already-reaped handle from issuing a kill syscall against
-        // a possibly recycled PID (current std short-circuits this,
-        // but that is a toolchain behavior, not a contract).
-        if child.try_wait().ok().flatten().is_none() {
-            let _ = child.kill();
-        }
-    }
-    // Reap every handle so no zombie survives cleanup (shell `wait`).
-    // Drain into a temp vec: `Child::wait` needs `&mut`, and the
-    // registry drops the handles either way.
-    let deadline_reap = cleanup_deadline();
-    for mut child in children.drain(..) {
-        let _ = wait_child_until(&mut child, deadline_reap);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13875,6 +13785,193 @@ os._exit(0)
         }
     }
 
+    /// Drain `master` until `stop` is set or the slave side goes away
+    /// (read returning 0 on Linux, EIO on macOS/BSD). Runs on its own
+    /// thread so the helper can never block writing while the driver
+    /// waits for exit; the driver joins this thread before touching
+    /// the master itself.
+    fn pump_pty_master(
+        master: std::os::fd::OwnedFd,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::os::fd::AsRawFd as _;
+        let fd = master.as_raw_fd();
+        // SAFETY: F_GETFL/F_SETFL on our own dup; nonblocking reads keep
+        // the pump responsive to `stop`.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        let mut chunk = [0u8; 4096];
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            // SAFETY: `chunk` is a live writable buffer.
+            let read =
+                unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+            if read > 0 {
+                continue;
+            } else if read == 0 {
+                break;
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EIO) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// Signal the pump thread to stop and join it. The pump's reads are
+    /// nonblocking, so the join is prompt; the driver owns the master
+    /// again afterward.
+    fn stop_pty_pump(
+        stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: std::thread::JoinHandle<()>,
+    ) {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = thread.join();
+    }
+
+    #[test]
+    fn foreground_prompt_keeps_the_tty_and_resumes_for_cleanup() {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        const HELPER: &str = "DOT_SUDO_PTY_HELPER";
+        if std::env::var_os(HELPER).is_some() {
+            let signals = Signals::install().unwrap();
+            let mut sudo = std::process::Command::new("sudo");
+            sudo.arg("true")
+                .stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit());
+            let accepted = run_foreground_status(sudo) == 0;
+            let status = signals.finish(i32::from(!accepted));
+            assert_eq!(status, 128 + libc::SIGTERM);
+            assert!(
+                std::path::Path::new(&std::env::var_os("DOT_TEST_SUDO_CLEANED").unwrap()).exists(),
+                "stopped interactive sudo did not resume to run its TERM handler"
+            );
+            return;
+        }
+
+        let scope = dot_test_support::TempDir::new("sudo-foreground-pty").unwrap();
+        let bin = scope.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let ready = scope.path().join("sudo.ready");
+        let cleaned = scope.path().join("sudo.cleaned");
+        let sudo = bin.join("sudo");
+        dot_test_support::publish_fixture_script(
+            &sudo,
+            "/usr/bin/python3 -c 'import os,sys; sys.exit(0 if all(os.isatty(fd) and os.tcgetpgrp(fd) == os.getpgrp() for fd in (0,1,2)) else 9)' || exit $?\ntrap ': >\"$DOT_TEST_SUDO_CLEANED\"; exit 0' TERM\n: >\"$DOT_TEST_SUDO_READY\"\nkill -STOP $$\nwhile :; do :; done\n",
+        )
+        .unwrap();
+
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: openpty initializes both descriptors; null name/termios/
+        // winsize pointers request defaults.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    // macOS takes *mut termios/*mut winsize while Linux takes
+                    // *const; null_mut() satisfies both through coercion.
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        // SAFETY: successful openpty returned uniquely owned descriptors.
+        let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "cleanup::tests::foreground_prompt_keeps_the_tty_and_resumes_for_cleanup",
+                "--nocapture",
+            ])
+            .env(HELPER, "1")
+            .env("PATH", &bin)
+            .env("DOT_TEST_SUDO_READY", &ready)
+            .env("DOT_TEST_SUDO_CLEANED", &cleaned)
+            .stdin(std::process::Stdio::from(slave.try_clone().unwrap()))
+            .stdout(std::process::Stdio::from(slave.try_clone().unwrap()))
+            .stderr(std::process::Stdio::from(slave));
+        // SAFETY: the child is single-threaded after fork. These calls create
+        // a fresh session, acquire fd 0's PTY as controlling terminal, and
+        // place the child in its foreground process group before exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0
+                    // ioctl request is c_ulong on Linux/macOS but c_int on Android;
+                    // the inferred cast matches each platform's declaration.
+                    || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0
+                    || libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) < 0
+                {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        // Pump the PTY master continuously from spawn: the helper must
+        // never block writing while the driver waits for exit without
+        // reading (classic PTY producer/consumer deadlock, and the prime
+        // suspect for the macOS stop-phase stall). The pump owns a dup of
+        // the master; the driver only touches the master again after the
+        // pump has stopped and joined.
+        let pump_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut pump_thread = Some({
+            let pump_stop = std::sync::Arc::clone(&pump_stop);
+            // SAFETY: openpty gave us a uniquely owned master; the dup
+            // shares its description, which is exactly what a second
+            // reader needs.
+            let pump_master = master.try_clone().unwrap();
+            std::thread::spawn(move || pump_pty_master(pump_master, pump_stop))
+        });
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !ready.exists() && std::time::Instant::now() < ready_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            stop_pty_pump(&pump_stop, pump_thread.take().unwrap());
+        }
+        assert!(
+            ready.exists(),
+            "interactive sudo did not observe its foreground PTY"
+        );
+        // SAFETY: the fixture owns the test subprocess and its signal handler.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        // macOS teardown is slow (process queries spawn `ps` per poll
+        // versus free /proc reads on Linux): the helper deterministically
+        // needs ~5s to exit after SIGTERM, so a 4s deadline fails a
+        // healthy shutdown. 15s keeps 3x headroom.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                stop_pty_pump(&pump_stop, pump_thread.take().unwrap());
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                stop_pty_pump(&pump_stop, pump_thread.take().unwrap());
+                panic!("PTY helper did not stop");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(status.success(), "PTY helper failed with {status:?}");
+        assert!(
+            cleaned.exists(),
+            "interactive sudo cleanup marker is absent"
+        );
+    }
+
     #[test]
     fn foreground_passthrough_trusts_leader_with_lease_holding_daemon() {
         // Fresh-review-A P2-2 RED pin: a successful foreground leader
@@ -15561,7 +15658,7 @@ int kill(pid_t pid, int sig) {
     }
 
     #[test]
-    fn pid_and_group_rules_match_shell() {
+    fn pid_rule_matches_shell() {
         // `^[1-9][0-9]*$`: positive, no leading zero.
         for good in ["1", "9", "123", "9773"] {
             assert!(valid_pid(good), "{good:?}");
@@ -15569,11 +15666,6 @@ int kill(pid_t pid, int sig) {
         for bad in ["", "0", "01", "007", "-1", "12a", " 1", "1 "] {
             assert!(!valid_pid(bad), "{bad:?}");
         }
-        // Group must be empty or exactly the leader pid.
-        assert!(valid_group("123", ""));
-        assert!(valid_group("123", "123"));
-        assert!(!valid_group("123", "456"));
-        assert!(!valid_group("123", "0"));
     }
 
     #[test]
@@ -15676,39 +15768,6 @@ int kill(pid_t pid, int sig) {
         registry.cleanup();
         assert!(!dir.exists());
         assert_eq!(registry.path_count(), 0);
-    }
-
-    #[test]
-    fn cleanup_terminates_and_reaps_child() {
-        let child = Command::new("sleep")
-            .arg("300")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
-        let mut registry = Registry::new();
-        registry.track_child(child);
-        assert_eq!(registry.child_count(), 1);
-        registry.cleanup();
-        assert_eq!(registry.child_count(), 0);
-        assert!(process_gone(pid), "child {pid} must be reaped");
-    }
-
-    /// `kill -0` probe (test-only): true when the pid is gone or
-    /// permission-denied-detached; mirrors the shell's reap check.
-    #[cfg(unix)]
-    fn process_gone(pid: u32) -> bool {
-        // Reaped children vanish from the table; a tiny race between
-        // wait() and table teardown is impossible (waited == reaped).
-        // Confirm via /proc when present, else assume reaped.
-        let proc = PathBuf::from(format!("/proc/{pid}"));
-        !proc.exists()
-    }
-
-    #[cfg(not(unix))]
-    fn process_gone(_pid: u32) -> bool {
-        true
     }
 
     #[test]
