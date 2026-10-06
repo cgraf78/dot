@@ -579,3 +579,195 @@ printf 'recover=%s\n' "$(rc _dot_file_transaction_recover "$DOT_FILE_TARGET_PATH
     assert_eq!(std::fs::read(&live).unwrap(), b"v1\n");
     assert!(transaction.exists());
 }
+
+/// Rewrite `$1`'s journal record the way a reboot that renumbers the mount
+/// leaves it: every recorded device (the parent's and the file's in the
+/// expected generation, re-sealed, and the candidate's) moves to the next
+/// number. The rewrite also moves the record's mtime to now.
+const RENUMBER_RECORD: &str = r#"
+renumber_record() {
+  local record=$1 version operation phase expected candidate payload
+  local -a fields
+  IFS=$'\t' read -r version operation phase expected candidate <"$record"
+  IFS='|' read -r -a fields <<<"$expected"
+  fields[2]=$((fields[2] + 1))
+  [[ ${fields[5]} == - ]] || fields[5]=$((fields[5] + 1))
+  payload=$(IFS='|'; printf '%s' "${fields[*]:0:10}")
+  expected="$payload|$(_dot_file_text_digest "dot-file-generation-v1|$payload")"
+  [[ $candidate == - ]] || candidate="$((${candidate%%|*} + 1))|${candidate#*|}"
+  (umask 077; printf '%s\t%s\t%s\t%s\t%s\n' "$version" "$operation" "$phase" \
+    "$expected" "$candidate" >"$record.renumbered")
+  mv -f -- "$record.renumbered" "$record"
+}
+"#;
+
+/// The birth time of `path` where both this host and the runtime's `stat`
+/// report one. Without one the runtime keeps the exact device rule, so the
+/// renumbering cases have nothing to prove. The runtime's view decides: on
+/// Alpine `statx` reports a birth time, but BusyBox `stat` cannot print it.
+fn birth(home: &Path, path: &Path) -> Option<std::time::SystemTime> {
+    let birth = dot::persisted_identity::LiveIdentity::of(path)
+        .expect("stat")
+        .birth;
+    let shown = run(
+        home,
+        "if _dot_path_birth_time \"$1\" >/dev/null; then echo known; fi\n",
+        [path],
+    );
+    if birth.is_none() || shown != "known\n" {
+        eprintln!("skipping: no birth time on this host");
+        return None;
+    }
+    birth
+}
+
+/// Give `path` four distinct timestamps (birth, an old access and
+/// modification time, and a change time after its birth), so reading the
+/// wrong one cannot pass for its birth time.
+fn distinguish_times(path: &Path) {
+    use std::os::unix::fs::MetadataExt as _;
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| {
+            file.set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(old)
+                    .set_modified(old),
+            )
+        })
+        .expect("backdate");
+    let Some(birth) = dot::persisted_identity::LiveIdentity::of(path)
+        .expect("stat")
+        .birth
+    else {
+        return;
+    };
+    let born = birth
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Each mode change moves the change time to now; poll until a second
+    // boundary passes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let changed = |mode| {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        std::fs::metadata(path).expect("stat").ctime()
+    };
+    let mut flip = 0o600;
+    while u64::try_from(changed(flip)).unwrap_or(0) <= born {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "change time stayed at the birth second {born}"
+        );
+        flip ^= 0o044;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn runtime_birth_time_agrees_with_what_stat_prints() {
+    // The renumbering cases skip where `_dot_path_birth_time` reports
+    // nothing, so a broken helper would only make them skip; pin it to what
+    // GNU `stat -c %W` or BSD `stat -f %B` print (BusyBox prints a literal
+    // `W`, old coreutils `0` or `-`: no birth time).
+    let dir = TempDir::new("generation-birth-time").unwrap();
+    let path = file(dir.path(), "home/app.conf", b"x\n", 0o644);
+    distinguish_times(&path);
+    let out = run(
+        dir.path(),
+        r#"raw=$(stat -c %W "$1" 2>/dev/null || stat -f %B "$1" 2>/dev/null) || raw=
+printf 'raw=%s\n' "${raw//[[:space:]]/}"
+printf 'helper=%s\n' "$(_dot_path_birth_time "$1" || echo none)"
+"#,
+        [&path],
+    );
+    let (raw, helper) = (field(&out, "raw"), field(&out, "helper"));
+    match raw.parse::<u64>() {
+        Ok(seconds) if seconds > 0 => {
+            assert_eq!(helper, raw);
+            if let Some(birth) = dot::persisted_identity::LiveIdentity::of(&path)
+                .expect("stat")
+                .birth
+            {
+                let since = birth.duration_since(std::time::UNIX_EPOCH).unwrap();
+                assert_eq!(since.as_secs(), seconds);
+            }
+        }
+        _ => assert_eq!(helper, "none", "stat printed {raw:?}"),
+    }
+}
+
+/// Crash a replacement of `$1` by `$2` before or after publication, then
+/// renumber every device its journal recorded.
+fn crash_and_renumber(dir: &Path, dst: &Path, source: &Path, publish: bool) {
+    let publish = if publish {
+        "_dot_move_noreplace \"$transaction/candidate\" \"$1\""
+    } else {
+        ":"
+    };
+    run(
+        dir,
+        &format!(
+            "{RENUMBER_RECORD}{PREPARE_AND_QUARANTINE}\n{publish}\nrenumber_record \"$transaction/record\"\n"
+        ),
+        [dst, source],
+    );
+}
+
+fn recover_renumbered_replace(publish: bool, expected: &[u8]) {
+    let dir = TempDir::new("generation-renumbered").unwrap();
+    let dst = file(dir.path(), "home/app.conf", b"before crash\n", 0o644);
+    let source = file(dir.path(), "home/candidate", b"after crash\n", 0o600);
+    if birth(dir.path(), dst.parent().unwrap()).is_none() || birth(dir.path(), &dst).is_none() {
+        return;
+    }
+    crash_and_renumber(dir.path(), &dst, &source, publish);
+    assert_eq!(
+        run(
+            dir.path(),
+            "if dot_file_generation \"$1\" >/dev/null; then echo 0; else echo 1; fi\n",
+            [&dst],
+        ),
+        "0\n"
+    );
+    assert_eq!(std::fs::read(&dst).unwrap(), expected);
+    assert!(!transaction_dir(&dst).exists());
+}
+
+#[test]
+fn renumbered_device_recovers_a_prepublication_crash() {
+    recover_renumbered_replace(false, b"before crash\n");
+}
+
+#[test]
+fn renumbered_device_recovers_a_postpublication_crash() {
+    // The quarantined original no longer matches the recorded device; only
+    // its inode and a birth before the journal show it is the same file.
+    recover_renumbered_replace(true, b"after crash\n");
+}
+
+#[test]
+fn renumbered_device_still_refuses_objects_born_after_the_journal() {
+    let dir = TempDir::new("generation-renumbered-recreated").unwrap();
+    let dst = file(dir.path(), "home/app.conf", b"before crash\n", 0o644);
+    let source = file(dir.path(), "home/candidate", b"after crash\n", 0o600);
+    let Some(born) = birth(dir.path(), dst.parent().unwrap()) else {
+        return;
+    };
+    crash_and_renumber(dir.path(), &dst, &source, true);
+    // A journal written before the parent directory existed names an
+    // earlier directory that reused its inode number.
+    let record = transaction_dir(&dst).join("record");
+    std::fs::File::open(&record)
+        .and_then(|file| file.set_modified(born - std::time::Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(
+        run(dir.path(), "rc dot_file_generation \"$1\"\n", [&dst]),
+        "1\n"
+    );
+    assert_eq!(std::fs::read(&dst).unwrap(), b"after crash\n");
+    assert!(transaction_dir(&dst).join("previous").exists());
+}

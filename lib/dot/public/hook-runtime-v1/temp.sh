@@ -15,6 +15,62 @@ _dot_path_identity() {
   stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1" 2>/dev/null
 }
 
+# Birth time in epoch seconds, when the platform and filesystem report one:
+# GNU `%W` prints 0 (or `-`) for unknown, BSD `%B` 0 or -1, and busybox has
+# no birth field at all. Every such answer fails, which keeps the exact
+# device rule in `_dot_persisted_identity_matches`.
+_dot_path_birth_time() {
+  local birth
+  birth=$(stat -c '%W' "$1" 2>/dev/null || stat -f '%B' "$1" 2>/dev/null) ||
+    return 1
+  [[ $birth =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$birth"
+}
+
+_dot_path_mtime() {
+  local written
+  written=$(stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1" 2>/dev/null) ||
+    return 1
+  [[ $written =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  printf '%s\n' "$written"
+}
+
+# Whether a `device:inode` read back from the crash-recovery journal JOURNAL
+# still names the live object LIVE (its current `_dot_path_identity`) at
+# PATH. The native engine applies the same rule to its own journals
+# (`src/persisted_identity.rs`, which explains it in full).
+#
+# The device number belongs to the mount, not the object: macOS numbers APFS
+# volumes at mount time and Linux numbers btrfs and other anonymous-device
+# filesystems at mount, so a reboot can renumber it under an unchanged file,
+# and an exact comparison would refuse every journal a crash left before
+# that reboot. So the inode must match, and then either the device matches
+# too (the exact rule) or the object's birth time is known and no later than
+# the journal's mtime: the identity was read before the journal was written,
+# while an object recreated since was born later. Only a device the exact
+# rule could have matched (a canonical decimal) may be renumbered. Without a
+# birth time `stat` can print (BusyBox, coreutils before 8.31, filesystems
+# that store none) the exact rule stands.
+# Both times are whole seconds here, so an object recreated within the
+# second the journal was written, on a renumbered device and reusing the
+# recorded inode number, would also pass.
+_dot_persisted_identity_matches() {
+  local recorded=$1 live=$2 path=$3 journal=$4 recorded_device birth written
+
+  [[ $recorded == *:* && $live == *:* ]] || return 1
+  [[ ${recorded#*:} == "${live#*:}" ]] || return 1
+  recorded_device=${recorded%%:*}
+  [[ $recorded_device == "${live%%:*}" ]] && return 0
+  [[ $recorded_device =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  birth=$(_dot_path_birth_time "$path") || return 1
+  # The birth time must come from the object LIVE describes, not one that
+  # replaced it since.
+  [[ $(_dot_path_identity "$path" 2>/dev/null || true) == "$live" ]] ||
+    return 1
+  written=$(_dot_path_mtime "$journal") || return 1
+  ((birth <= written))
+}
+
 _dot_apply_tracked_file_mode() {
   local path=$1 mode=$2
 
@@ -45,31 +101,6 @@ _dot_apply_umask_ceiling() {
     return 1
   chmod "$normalized" "$path" || return 1
   [[ $(_dot_path_identity "$path" 2>/dev/null || true) == "$identity" ]]
-}
-
-_dot_apply_git_metadata_modes() {
-  local root=$1 inventory path valid=1
-
-  [[ -d $root && ! -L $root ]] || return 1
-  _dot_cleanup_mktemp || return 1
-  inventory=$REPLY
-  if ! find "$root" -print0 >"$inventory"; then
-    _dot_cleanup_remove_path "$inventory" || true
-    return 1
-  fi
-  while IFS= read -r -d '' path; do
-    if [[ (-d $path || -f $path) && ! -L $path ]]; then
-      _dot_apply_umask_ceiling "$path" || {
-        valid=0
-        break
-      }
-    else
-      valid=0
-      break
-    fi
-  done <"$inventory"
-  _dot_cleanup_remove_path "$inventory" || return 1
-  [[ $valid -eq 1 ]]
 }
 
 # Internal Git policy must not inherit a caller's selected repository, object
@@ -182,6 +213,20 @@ _dot_file_target_resolve() {
   DOT_FILE_TARGET_PARENT_ID=$parent_identity
   DOT_FILE_TARGET_PATH_DIGEST=$path_digest
   DOT_FILE_TARGET_TRANSACTION=$physical/.$base.dot-file-transaction-v1
+}
+
+# Whether the `_dot_file_signature` RECORDED in JOURNAL still describes the
+# file at PATH, whose signature is now LIVE: mode, size, digest, and inode
+# exactly, and the device by `_dot_persisted_identity_matches`.
+_dot_file_signature_matches() {
+  local recorded=$1 live=$2 path=$3 journal=$4
+  local recorded_rest=${1#*|} live_rest=${2#*|}
+
+  [[ $recorded == "$live" ]] && return 0
+  [[ $recorded == *'|'* && $live == *'|'* && $recorded_rest == "$live_rest" ]] ||
+    return 1
+  _dot_persisted_identity_matches "${recorded%%|*}:${recorded_rest%%|*}" \
+    "${live%%|*}:${live_rest%%|*}" "$path" "$journal"
 }
 
 _dot_file_signature() {
@@ -377,12 +422,16 @@ _dot_file_transaction_recover() {
   local destination=$1 transaction=$2 previous candidate live_signature=''
   local previous_signature='' target_path_digest=$DOT_FILE_TARGET_PATH_DIGEST
   local target_parent_id=$DOT_FILE_TARGET_PARENT_ID expected_signature
+  local target_parent=$DOT_FILE_TARGET_PARENT record=$transaction/record
 
   [[ -e $transaction || -L $transaction ]] || return 0
   _dot_file_transaction_entries_validate "$transaction" || return 1
   _dot_file_transaction_record_read "$transaction" || return 1
-  [[ $DOT_FILE_GENERATION_PATH_DIGEST == "$target_path_digest" &&
-    $DOT_FILE_GENERATION_PARENT_ID == "$target_parent_id" ]] || return 1
+  # Every identity the record holds was read before it was written, so its
+  # mtime bounds them across a reboot that renumbered the device.
+  [[ $DOT_FILE_GENERATION_PATH_DIGEST == "$target_path_digest" ]] || return 1
+  _dot_persisted_identity_matches "$DOT_FILE_GENERATION_PARENT_ID" \
+    "$target_parent_id" "$target_parent" "$record" || return 1
   expected_signature=$DOT_FILE_GENERATION_SIGNATURE
   previous=$transaction/previous
   candidate=$transaction/candidate
@@ -396,8 +445,9 @@ _dot_file_transaction_recover() {
     previous_signature=$(_dot_file_signature "$previous") || return 1
   fi
   if [[ -n $previous_signature ]] &&
-    [[ $DOT_FILE_GENERATION_STATE != file ||
-      $previous_signature != "$expected_signature" ]]; then
+    { [[ $DOT_FILE_GENERATION_STATE != file ]] ||
+      ! _dot_file_signature_matches "$expected_signature" \
+        "$previous_signature" "$previous" "$record"; }; then
     # A replacement that won the final pre-mutation race was quarantined. Put
     # it back when possible; if another writer already filled the name, retain
     # both versions and fail closed for explicit operator recovery.
@@ -420,8 +470,9 @@ _dot_file_transaction_recover() {
       ;;
     quarantined)
       if [[ $DOT_FILE_TRANSACTION_OPERATION == replace &&
-        -n $live_signature &&
-        $live_signature == "$DOT_FILE_TRANSACTION_CANDIDATE" ]]; then
+        -n $live_signature ]] &&
+        _dot_file_signature_matches "$DOT_FILE_TRANSACTION_CANDIDATE" \
+          "$live_signature" "$destination" "$record"; then
         : # Publication committed before the phase record advanced.
       elif [[ -n $previous_signature && -z $live_signature ]]; then
         _dot_file_transaction_restore_previous "$previous" "$destination" ||

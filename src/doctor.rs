@@ -174,6 +174,17 @@ fn run_configured(
                 && crate::doctor_checks::is_client_checkout(Path::new(&home), Some(&marker)),
         }),
     );
+    if let Ok(transaction) = crate::init_client_transaction::transaction_dir(&home, &state) {
+        let transaction = PathBuf::from(transaction);
+        append(
+            emit.recorder(),
+            crate::doctor_checks::check_init_transaction(
+                &init_transaction(&transaction, &home),
+                &transaction,
+                &home,
+            ),
+        );
+    }
     emit.emit();
     append(
         emit.recorder(),
@@ -323,6 +334,38 @@ fn run_configured(
         counts.fail,
         extension_status,
     ))
+}
+
+/// Read the initialization transaction at `transaction` for
+/// [`crate::doctor_checks::check_init_transaction`].
+fn init_transaction(transaction: &Path, home: &str) -> crate::doctor_checks::InitTransaction {
+    use crate::doctor_checks::InitTransaction;
+    if std::fs::symlink_metadata(transaction).is_err() {
+        return InitTransaction::Absent;
+    }
+    let record = match crate::init_client_record::read_record(
+        &transaction.join("record"),
+        Path::new(home),
+    ) {
+        Ok(record) => record,
+        Err(_) => return InitTransaction::Unreadable,
+    };
+    // The same check `dot update` and `dot init` run before finishing it. A
+    // signal makes its probes fail, which reads as a mismatch; only a check
+    // that ran to the end may call the transaction stale.
+    if crate::init_client_resume::committed(&record.phase)
+        && crate::repos_base::client_mismatch(&record, Path::new(home)).is_some()
+        && crate::cancellation::check().is_ok()
+    {
+        return InitTransaction::Stale {
+            phase: record.phase,
+        };
+    }
+    InitTransaction::Pending {
+        phase: record.phase,
+        origin: record.origin,
+        branch: record.branch,
+    }
 }
 
 /// Streams filed doctor records to stdout as checks complete, so a slow

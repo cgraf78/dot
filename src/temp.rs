@@ -917,12 +917,12 @@ pub fn move_replace_nodir_cached(
     move_replace_nodir_with(source, target, &tool)
 }
 
-/// `_dot_apply_git_metadata_modes`: clamp a whole tree to the umask
-/// ceiling. The shell streams `find -print0`; the port walks
-/// depth-first with per-directory sorted names instead of raw readdir
-/// order, so repeated runs are deterministic. The success end state is
-/// order-independent (every entry gets the same ceiling); like the
-/// shell, the first unclampable entry aborts the walk.
+/// Clamp a whole tree to the umask ceiling (the port of the retired
+/// shell `_dot_apply_git_metadata_modes`). The shell streamed `find
+/// -print0`; the port walks depth-first with per-directory sorted names
+/// instead of raw readdir order, so repeated runs are deterministic. The
+/// success end state is order-independent (every entry gets the same
+/// ceiling); like the shell, the first unclampable entry aborts the walk.
 pub fn apply_git_metadata_modes(root: &Path, mask: u32) -> Result<()> {
     let meta = std::fs::symlink_metadata(root).map_err(|source| Error::Io {
         context: "stat metadata root",

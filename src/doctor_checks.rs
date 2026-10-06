@@ -7,7 +7,8 @@
 //! [`check_profile_lifecycle`], [`check_overlays`],
 //! [`shdeps_binary`], [`check_provider`],
 //! [`completed_identity_matches_home`], [`is_client_checkout`],
-//! [`check_base_repo`], and [`check_cron_freshness`].
+//! [`check_base_repo`], and [`check_cron_freshness`], plus the
+//! native-only [`check_init_transaction`].
 //! [`crate::doctor`] owns orchestration.
 //!
 //! Everything here is a pure function of explicit inputs, the
@@ -1086,6 +1087,93 @@ pub fn check_reexec_checkpoint(
             )
             .with_hint("inspect the provider state, remove the record, then run 'dot update'"),
         ],
+    }
+}
+
+/// What `dot doctor` read from the initialization transaction directory
+/// (`<state>/dot/init/transaction`) for [`check_init_transaction`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InitTransaction {
+    /// No transaction: initialization finished or never started.
+    Absent,
+    /// The directory exists but its record is not one `dot init` can read
+    /// (`dot init` refuses to run until it is moved aside).
+    Unreadable,
+    /// A committed initialization (see [`crate::init_client_resume::committed`])
+    /// stopped at `phase` for a client that no longer matches its record:
+    /// resuming it re-verifies the client and refuses, and rollback refuses
+    /// a committed checkout, so it can only be moved aside. Doctor gets this
+    /// far only when the client matches its completion record or the
+    /// separate client Git directory is gone (which `dot init` rebuilds once
+    /// the transaction is out of the way).
+    Stale {
+        /// The recorded phase.
+        phase: String,
+    },
+    /// An initialization stopped at `phase`, for `origin` at `branch`.
+    Pending {
+        /// The recorded phase.
+        phase: String,
+        /// The recorded origin URL (credentials are hidden on display).
+        origin: String,
+        /// The recorded branch.
+        branch: String,
+    },
+}
+
+/// The unfinished-initialization row for the `Client repository` section
+/// (none when no transaction exists). `dot init` completes its transaction
+/// only when its first convergence succeeds; until then every command
+/// accepts the open transaction, so nothing else would say the client never
+/// finished initializing. Commands keep working, so this warns: a committed
+/// transaction is finished by the next clean `dot update` or by rerunning
+/// the recorded `dot init`, and an earlier one by that rerun or a rollback.
+/// A stale one can only be moved aside.
+pub fn check_init_transaction(state: &InitTransaction, path: &Path, home: &str) -> Vec<Record> {
+    let shown = tilde(&path.to_string_lossy(), home);
+    match state {
+        InitTransaction::Absent => Vec::new(),
+        InitTransaction::Unreadable => {
+            vec![
+            Record::warn(
+                "dot init transaction is unreadable",
+                Some(format!("{shown}/record is not a valid initialization record")),
+            )
+            .with_hint(format!(
+                "inspect it, then move {shown} aside; 'dot init' refuses to run while it is there"
+            )),
+        ]
+        }
+        InitTransaction::Stale { phase } => vec![
+            Record::warn(
+                "dot init left a stale transaction",
+                Some(format!(
+                    "{shown} stopped at phase {phase} and no longer matches the client"
+                )),
+            )
+            .with_hint(format!(
+                "move {shown} aside; neither 'dot init' nor 'dot update' can finish it"
+            )),
+        ],
+        InitTransaction::Pending {
+            phase,
+            origin,
+            branch,
+        } => {
+            let step = crate::init_client_command::finish_step(phase, origin, branch);
+            let hint = if crate::init_client_resume::committed(phase) {
+                format!("run 'dot update' or {step}")
+            } else {
+                step
+            };
+            vec![
+                Record::warn(
+                    "dot init did not finish",
+                    Some(format!("{shown} stopped at phase {phase}")),
+                )
+                .with_hint(hint),
+            ]
+        }
     }
 }
 

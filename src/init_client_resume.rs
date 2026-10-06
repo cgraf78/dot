@@ -692,6 +692,16 @@ pub fn live_git_mismatch(
     None
 }
 
+/// Whether `phase` is past the checkout: the client's Git directory and work
+/// tree are published, so only convergence and the completion stamp remain
+/// (`checkout`, `converging`, `complete`). Resuming such a transaction only
+/// re-verifies the live client before converging, rollback refuses it, and a
+/// clean `dot update` may finish it
+/// ([`crate::init_client_engine::finish_converged`]).
+pub fn committed(phase: &str) -> bool {
+    matches!(phase, "checkout" | "converging" | "complete")
+}
+
 /// `_dot_init_resume_transaction`: replay a transaction forward from
 /// its recorded phase. Early phases (`prepared` through `publishing`)
 /// require the three journals, re-run backup, staging, and

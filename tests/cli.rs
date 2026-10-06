@@ -1442,6 +1442,29 @@ fn binary_init_rollback_without_a_transaction_is_rejected() {
     );
 }
 
+#[test]
+fn binary_init_rollback_after_status_waits_for_the_update_lock() {
+    // The last mode flag wins: this rolls back, so it must not run while
+    // another command holds the update lock.
+    let home = TempDir::new("cli-init-rb-lock").expect("home");
+    let state = TempDir::new("cli-init-rb-lock-state").expect("state");
+    let log = dot::log::Log::new(false, false);
+    let guard = dot::update_lock::acquire(state.path(), false, &log, None, &mut Vec::new())
+        .expect("hold the update lock");
+    let output = init_bin(&home, &state)
+        .args(["init", "--status", "--rollback"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run dot init --status --rollback");
+    drop(guard);
+    assert_eq!(
+        output.status.code(),
+        Some(dot::update_lock::EXIT_LOCK_BUSY),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(unix)]
 fn poison_curl(scope: &Path) -> (OsString, PathBuf) {
     let poison_dir = scope.join("poison-path");
@@ -1657,6 +1680,176 @@ fn client_pulling(label: &str, files: &[(&str, &[u8])]) -> (TempDir, TempDir, Te
         seed_advance(&seed, file, body);
     }
     (scope, home, state)
+}
+
+/// A `dot init` whose convergence failed after its checkout committed.
+#[cfg(unix)]
+struct UnfinishedInit {
+    _scope: TempDir,
+    /// Seed clone of the origin, to fix it.
+    seed: PathBuf,
+    home: TempDir,
+    state: TempDir,
+    branch: String,
+    url: String,
+    /// The failed `dot init` run.
+    init: std::process::Output,
+}
+
+/// The overlay descriptor that fails [`unfinished_init`]'s convergence.
+#[cfg(unix)]
+const UNFINISHED_INIT_OVERLAY: &str = ".config/dot/overlays.d/10-missing.conf";
+
+/// Run a `dot init` whose convergence fails: the origin's first commits
+/// carry an overlay descriptor whose repository does not exist, so the
+/// update the init runs fails after the checkout committed.
+#[cfg(unix)]
+fn unfinished_init(label: &str) -> UnfinishedInit {
+    let scope = TempDir::new(&format!("{label}-origin")).expect("origin scope");
+    let (origin, seed, branch) = seed_bare_origin(scope.path(), "dotfiles");
+    std::fs::create_dir_all(seed.join(".config/dot/overlays.d")).expect("config parent");
+    seed_advance(&seed, ".config/dot/config", b"version=1\n");
+    seed_advance(
+        &seed,
+        UNFINISHED_INIT_OVERLAY,
+        b"url=file:///nonexistent/dot-test-missing-overlay.git\n",
+    );
+    let home = TempDir::new(&format!("{label}-home")).expect("home");
+    let state = TempDir::new(&format!("{label}-state")).expect("state");
+    let url = format!("file://{}", origin.display());
+    let init = init_bin(&home, &state)
+        .args(["init", "--yes", "--branch", &branch, &url])
+        .output()
+        .expect("native init");
+    assert_eq!(
+        init.status.code(),
+        Some(1),
+        "the overlay should fail init's convergence: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    UnfinishedInit {
+        _scope: scope,
+        seed,
+        home,
+        state,
+        branch,
+        url,
+        init,
+    }
+}
+
+/// The phase the initialization transaction under `state` records, if any.
+#[cfg(unix)]
+fn transaction_phase(state: &TempDir) -> Option<String> {
+    let record = std::fs::read_to_string(state.path().join("dot/init/transaction/record")).ok()?;
+    record
+        .lines()
+        .find_map(|line| line.strip_prefix("phase="))
+        .map(str::to_string)
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_init_names_the_unfinished_initialization_when_convergence_fails() {
+    let unfinished = unfinished_init("cli-init-unfinished-notice");
+    let stderr = String::from_utf8_lossy(&unfinished.init.stderr);
+    // The last line, after the update's own diagnostics.
+    assert!(
+        stderr.ends_with(&format!(
+            "dot init: initialization is incomplete (stopped at phase converging); \
+             rerun 'dot init --branch {} {}' to finish it\n",
+            unfinished.branch, unfinished.url
+        )),
+        "{stderr}"
+    );
+    assert_eq!(
+        transaction_phase(&unfinished.state).as_deref(),
+        Some("converging")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_warns_about_an_unfinished_init() {
+    let unfinished = unfinished_init("cli-doctor-unfinished");
+    let output = init_bin(&unfinished.home, &unfinished.state)
+        .arg("doctor")
+        .output()
+        .expect("dot doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = format!(
+        "  ⚠ dot init did not finish\n    \
+         {}/dot/init/transaction stopped at phase converging\n    \
+         → run 'dot update' or rerun 'dot init --branch {} {}' to finish it\n",
+        unfinished.state.path().display(),
+        unfinished.branch,
+        unfinished.url
+    );
+    assert!(stdout.contains(&expected), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_clean_update_finishes_an_unfinished_init() {
+    let unfinished = unfinished_init("cli-update-finishes-init");
+    let (home, state) = (&unfinished.home, &unfinished.state);
+    std::fs::remove_file(unfinished.seed.join(UNFINISHED_INIT_OVERLAY))
+        .expect("drop the bad overlay");
+    seed_advance(
+        &unfinished.seed,
+        ".config/dot/config",
+        b"version=1\n# fixed\n",
+    );
+    let output = init_bin(home, state)
+        .args(["update", "--quiet"])
+        .output()
+        .expect("dot update");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!state.path().join("dot/init/transaction").exists());
+    let completed =
+        std::fs::read_to_string(state.path().join("dot/init/completed")).expect("completed");
+    assert!(completed.contains("\nphase=complete\n"), "{completed}");
+    let doctor = init_bin(home, state)
+        .arg("doctor")
+        .output()
+        .expect("dot doctor");
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(!stdout.contains("dot init did not finish"), "{stdout}");
+    let status = init_bin(home, state)
+        .args(["init", "--status"])
+        .output()
+        .expect("dot init --status");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).starts_with("initialization: complete\n"),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_update_leaves_an_unfinished_init() {
+    let unfinished = unfinished_init("cli-update-keeps-init");
+    let output = init_bin(&unfinished.home, &unfinished.state)
+        .args(["update", "--quiet"])
+        .output()
+        .expect("dot update");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        transaction_phase(&unfinished.state).as_deref(),
+        Some("converging")
+    );
+    assert!(!unfinished.state.path().join("dot/init/completed").exists());
 }
 
 /// One `dot update --cron` run: exit code, stderr, and the last

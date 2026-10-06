@@ -721,7 +721,7 @@ pub fn rollback(deps: &RollbackDeps<'_>, home: &Path) -> Result<()> {
             });
         }
     };
-    if record.phase == "checkout" || record.phase == "converging" || record.phase == "complete" {
+    if crate::init_client_resume::committed(&record.phase) {
         return Err(Error::Usage {
             message: "checkout is committed; rerun the original init command to resume",
         });

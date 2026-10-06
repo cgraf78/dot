@@ -383,6 +383,11 @@ Dot records one, a hand-updated host still reads unknown.
 - an overlay whose origin differs from its descriptor fails (update refuses
   to pull or link it), with the command that adopts the configured URL;
 - a provider re-exec checkpoint the next update cannot consume fails;
+- an unfinished `dot init` warns: commands accept its transaction; a
+  committed one is finished by the next clean `dot update` or by rerunning
+  the recorded `dot init`, an earlier one by that rerun or `dot init
+  --rollback`, and one that no longer matches the client is stale and must
+  be moved aside (see [Initialization](initialization.md));
 - unmerged paths in the client or a Git overlay fail when update would
   refuse to pull over them (on a branch with an upstream, outside a merge or
   rebase) and warn while a merge or rebase the user started is in progress;

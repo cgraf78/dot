@@ -196,11 +196,16 @@ fn birth_time(path: &Path, meta: &std::fs::Metadata, follow: bool) -> Option<Sys
         _middle: [u8; 40],
         btime_sec: i64,
         btime_nsec: u32,
-        _tail: [u8; 164],
+        _between: [u8; 44],
+        dev_major: u32,
+        dev_minor: u32,
+        _tail: [u8; 112],
     }
     const _: () = assert!(std::mem::size_of::<Statx>() == 256);
     const _: () = assert!(std::mem::offset_of!(Statx, ino) == 32);
     const _: () = assert!(std::mem::offset_of!(Statx, btime_sec) == 80);
+    const _: () = assert!(std::mem::offset_of!(Statx, dev_major) == 136);
+    const _: () = assert!(std::mem::offset_of!(Statx, dev_minor) == 140);
     const STATX_INO: libc::c_uint = 0x100;
     const STATX_BTIME: libc::c_uint = 0x800;
 
@@ -234,13 +239,26 @@ fn birth_time(path: &Path, meta: &std::fs::Metadata, follow: bool) -> Option<Sys
     // filled by a successful call.
     let statx = unsafe { buffer.assume_init() };
     // The path may have been replaced between the two stats; a birth time
-    // from another object proves nothing.
-    if statx.mask & STATX_BTIME == 0 || statx.mask & STATX_INO == 0 || statx.ino != meta.ino() {
+    // from another object (even one with the same inode number on another
+    // device) proves nothing. The device fields are always filled.
+    if statx.mask & STATX_BTIME == 0
+        || statx.mask & STATX_INO == 0
+        || !names_object(statx.ino, statx.dev_major, statx.dev_minor, meta)
+    {
         return None;
     }
     let since_epoch =
         std::time::Duration::new(u64::try_from(statx.btime_sec).ok()?, statx.btime_nsec);
     SystemTime::UNIX_EPOCH.checked_add(since_epoch)
+}
+
+/// Whether a `statx` answer (inode, device major and minor) describes the
+/// same object as `meta`, the `stat`/`lstat` result it accompanies: a path
+/// swapped between the two calls for an object with the same inode number
+/// on another device must not lend it its birth time.
+#[cfg(target_os = "linux")]
+fn names_object(ino: u64, dev_major: u32, dev_minor: u32, meta: &std::fs::Metadata) -> bool {
+    ino == meta.ino() && libc::makedev(dev_major, dev_minor) == meta.dev()
 }
 
 /// Birth time of the object `meta` describes, where std reports one
@@ -362,6 +380,18 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert!(ours.is_some());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_statx_answer_must_name_the_same_inode_and_device() {
+        let dir = dot_test_support::TempDir::new("persisted-identity-statx").expect("scope");
+        let meta = std::fs::metadata(dir.path()).expect("stat");
+        let (major, minor) = (libc::major(meta.dev()), libc::minor(meta.dev()));
+        assert!(names_object(meta.ino(), major, minor, &meta));
+        assert!(!names_object(meta.ino() + 1, major, minor, &meta));
+        assert!(!names_object(meta.ino(), major, minor + 1, &meta));
+        assert!(!names_object(meta.ino(), major + 1, minor, &meta));
     }
 
     #[test]

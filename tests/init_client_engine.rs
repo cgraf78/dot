@@ -167,6 +167,22 @@ fn production_run(
     argv: &[&str],
     converge_ok: bool,
 ) -> (cmd::InitReport, usize) {
+    let (report, fired, _) =
+        production_run_noticed(home, state, scratch, skip_provider, argv, converge_ok);
+    (report, fired)
+}
+
+/// [`production_run`] plus the incomplete-initialization notice a failed
+/// fresh run leaves, captured the way `dot init`'s dispatcher captures it.
+fn production_run_noticed(
+    home: &Path,
+    state: &Path,
+    scratch: &Path,
+    skip_provider: Option<&str>,
+    argv: &[&str],
+    converge_ok: bool,
+) -> (cmd::InitReport, usize, Option<Vec<u8>>) {
+    let notice = RefCell::new(None);
     let fired = RefCell::new(0usize);
     let on_converge = || -> Result<(), Error> {
         *fired.borrow_mut() += 1;
@@ -194,7 +210,13 @@ fn production_run(
         wiring.resume(transaction, record, journal)
     };
     let rollback = |at: &Path| wiring.rollback(at);
-    let fresh = |inputs: &cmd::FreshInputs| wiring.run_fresh(inputs);
+    let fresh = |inputs: &cmd::FreshInputs| {
+        let report = wiring.run_fresh(inputs);
+        if report.code != 0 {
+            *notice.borrow_mut() = wiring.incomplete_notice();
+        }
+        report
+    };
     let eng = cmd::CommandEngine {
         remote_default_branch: &probe,
         resume: &resume,
@@ -209,7 +231,8 @@ fn production_run(
     };
     let bytes: Vec<Vec<u8>> = argv.iter().map(|word| word.as_bytes().to_vec()).collect();
     let report = cmd::run(&env, &eng, &bytes);
-    (report, *fired.borrow())
+    let fired = *fired.borrow();
+    (report, fired, notice.into_inner())
 }
 
 /// Run one command with successful convergence when the engine reaches it.
@@ -312,7 +335,18 @@ fn plant_live_checkout(
 ) -> String {
     let commit = origin_commit(&fixture.root().join("origin.git"), branch);
     let (home, state) = (&fixture.home, &fixture.state);
-    let git_dir = home.join(".dotfiles");
+    let git_dir = plant_live_git(fixture, origin, branch);
+    let (dev, ino) = path_identity(&git_dir);
+    plant_transaction(
+        home, state, phase, origin, identity, branch, "-", &commit, "adopted", &dev, &ino,
+    );
+    commit
+}
+
+/// Build a live bare `$HOME/.dotfiles` on `branch` of `origin`, with no
+/// journal, and return it.
+fn plant_live_git(fixture: &Fixture, origin: &str, branch: &str) -> PathBuf {
+    let git_dir = fixture.home.join(".dotfiles");
     git(&["init", "--quiet", "--bare", path_str(&git_dir)]);
     git(&[
         "--git-dir",
@@ -336,11 +370,7 @@ fn plant_live_checkout(
         "remote.origin.url",
         origin,
     ]);
-    let (dev, ino) = path_identity(&git_dir);
-    plant_transaction(
-        home, state, phase, origin, identity, branch, "-", &commit, "adopted", &dev, &ino,
-    );
-    commit
+    git_dir
 }
 
 /// Normalize the fixture root and nondeterministic backup stamp.
@@ -921,6 +951,205 @@ fn completed_rerun_converges_structurally() {
         before,
         "completion record is untouched"
     );
+}
+
+#[test]
+fn fresh_convergence_failure_names_the_unfinished_initialization() {
+    let fixture = Fixture::build("engine-fresh-incomplete");
+    let origin = make_origin(fixture.root());
+    let url = format!("file://{}", path_str(&origin));
+    let argv = ["--yes", "--branch", "main", url.as_str()];
+    let (rust, converged, notice) = production_run_noticed(
+        &fixture.home,
+        &fixture.state,
+        fixture.root(),
+        None,
+        &argv,
+        false,
+    );
+    assert_eq!(rust.code, 1);
+    assert_eq!(converged, 1);
+    let record = std::fs::read_to_string(transaction_dir(&fixture.state).join("record"))
+        .expect("the transaction stays for a rerun");
+    assert!(record.contains("\nphase=converging\n"), "{record}");
+    assert_eq!(
+        String::from_utf8(notice.expect("notice")).expect("UTF-8"),
+        format!(
+            "dot init: initialization is incomplete (stopped at phase converging); \
+             rerun 'dot init --branch main {url}' to finish it\n"
+        )
+    );
+}
+
+#[test]
+fn adoption_convergence_failure_names_the_unfinished_initialization() {
+    let fixture = Fixture::build("engine-adopt-incomplete");
+    let origin = make_origin(fixture.root());
+    let url = format!("file://{}", path_str(&origin));
+    plant_live_git(&fixture, &url, "main");
+    let argv = ["--branch", "main", url.as_str()];
+    let (rust, converged, notice) = production_run_noticed(
+        &fixture.home,
+        &fixture.state,
+        fixture.root(),
+        None,
+        &argv,
+        false,
+    );
+    assert_eq!(rust.code, 1);
+    assert_eq!(converged, 1, "adoption converges once");
+    assert_eq!(
+        String::from_utf8(notice.expect("notice")).expect("UTF-8"),
+        format!(
+            "dot init: initialization is incomplete (stopped at phase converging); \
+             rerun 'dot init --branch main {url}' to finish it\n"
+        )
+    );
+}
+
+#[test]
+fn fresh_failure_before_the_transaction_leaves_no_notice() {
+    let fixture = Fixture::build("engine-fresh-no-notice");
+    let missing = format!("file://{}/nope.git", path_str(fixture.root()));
+    let argv = ["--branch", "main", missing.as_str()];
+    let (rust, _, notice) = production_run_noticed(
+        &fixture.home,
+        &fixture.state,
+        fixture.root(),
+        None,
+        &argv,
+        true,
+    );
+    assert_eq!(rust.code, 1);
+    assert_eq!(notice, None);
+}
+
+/// The engine inputs `dot update` finishes an initialization with.
+fn finish(fixture: &Fixture) -> dot::errors::Result<engine::Finish> {
+    engine::finish_converged(engine::EngineCtx {
+        home: path_str(&fixture.home),
+        xdg_state_home: path_str(&fixture.state),
+        source_root: Path::new(env!("CARGO_MANIFEST_DIR")),
+        skip_provider: false,
+        shdeps_update_policy: None,
+        cwd: &fixture.home,
+    })
+}
+
+/// The phase a journal at `path` records.
+fn recorded_phase(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .expect("journal")
+        .lines()
+        .find_map(|line| line.strip_prefix("phase="))
+        .expect("phase line")
+        .to_string()
+}
+
+#[test]
+fn finish_converged_completes_every_committed_phase() {
+    for phase in ["checkout", "converging", "complete"] {
+        let fixture = Fixture::build("engine-finish-committed");
+        let origin = make_origin(fixture.root());
+        let url = format!("file://{}", path_str(&origin));
+        plant_live_checkout(&fixture, &url, &repo_identity(&url), "main", phase);
+        assert_eq!(finish(&fixture).expect(phase), engine::Finish::Completed);
+        assert!(!transaction_dir(&fixture.state).exists(), "{phase}");
+        let completed = fixture.state.join("dot/init/completed");
+        assert_eq!(recorded_phase(&completed), "complete", "{phase}");
+    }
+}
+
+#[test]
+fn finish_converged_retires_a_transaction_left_after_its_completion_record() {
+    // A crash between publishing the completion record and removing the
+    // transaction leaves both.
+    let fixture = Fixture::build("engine-finish-both");
+    let origin = make_origin(fixture.root());
+    let url = format!("file://{}", path_str(&origin));
+    plant_live_checkout(&fixture, &url, &repo_identity(&url), "main", "complete");
+    let completed = fixture.state.join("dot/init/completed");
+    std::fs::copy(transaction_dir(&fixture.state).join("record"), &completed)
+        .expect("completion record");
+    assert_eq!(finish(&fixture).expect("finish"), engine::Finish::Completed);
+    assert!(!transaction_dir(&fixture.state).exists());
+    assert_eq!(recorded_phase(&completed), "complete");
+}
+
+#[test]
+fn finish_converged_leaves_a_transaction_before_its_checkout() {
+    for phase in ["prepared", "publishing"] {
+        let fixture = Fixture::build("engine-finish-uncommitted");
+        let origin = make_origin(fixture.root());
+        let url = format!("file://{}", path_str(&origin));
+        plant_live_checkout(&fixture, &url, &repo_identity(&url), "main", phase);
+        let record = transaction_dir(&fixture.state).join("record");
+        let before = std::fs::read(&record).expect("record");
+        assert_eq!(finish(&fixture).expect(phase), engine::Finish::Uncommitted);
+        assert_eq!(std::fs::read(&record).expect("record"), before, "{phase}");
+        assert!(!fixture.state.join("dot/init/completed").exists());
+    }
+}
+
+#[test]
+fn finish_converged_reports_a_transaction_it_could_not_remove() {
+    // Resuming a `complete` record ignores a failed removal, like `dot init`.
+    if dot::temp::current_uid() == Some(0) {
+        eprintln!("SKIP: root removes entries from a read-only directory");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::build("engine-finish-stuck");
+    let origin = make_origin(fixture.root());
+    let url = format!("file://{}", path_str(&origin));
+    plant_live_checkout(&fixture, &url, &repo_identity(&url), "main", "complete");
+    let transaction = transaction_dir(&fixture.state);
+    let mode = |bits| std::fs::Permissions::from_mode(bits);
+    std::fs::set_permissions(&transaction, mode(0o500)).expect("read-only transaction");
+    let finished = finish(&fixture);
+    std::fs::set_permissions(&transaction, mode(0o700)).expect("restore transaction");
+    assert!(finished.is_err());
+    assert!(transaction.join("record").exists());
+}
+
+#[test]
+fn finish_converged_without_a_transaction_does_nothing() {
+    let fixture = Fixture::build("engine-finish-absent");
+    assert_eq!(finish(&fixture).expect("finish"), engine::Finish::Absent);
+    assert!(!fixture.state.join("dot/init").exists());
+}
+
+#[test]
+fn finish_converged_refuses_a_client_that_no_longer_matches() {
+    let fixture = Fixture::build("engine-finish-mismatch");
+    let origin = make_origin(fixture.root());
+    let url = format!("file://{}", path_str(&origin));
+    plant_live_checkout(&fixture, &url, &repo_identity(&url), "main", "converging");
+    // Another branch checked out since: the record no longer names it.
+    let git_dir = fixture.home.join(".dotfiles");
+    git(&["--git-dir", path_str(&git_dir), "branch", "other", "main"]);
+    git(&[
+        "--git-dir",
+        path_str(&git_dir),
+        "symbolic-ref",
+        "HEAD",
+        "refs/heads/other",
+    ]);
+    let record = transaction_dir(&fixture.state).join("record");
+    let before = std::fs::read(&record).expect("record");
+    assert!(finish(&fixture).is_err());
+    assert_eq!(std::fs::read(&record).expect("record"), before);
+    assert!(!fixture.state.join("dot/init/completed").exists());
+}
+
+#[test]
+fn finish_converged_refuses_an_unreadable_record() {
+    let fixture = Fixture::build("engine-finish-unreadable");
+    let transaction = transaction_dir(&fixture.state);
+    std::fs::create_dir_all(&transaction).expect("transaction");
+    std::fs::write(transaction.join("record"), b"garbage\n").expect("record");
+    assert!(finish(&fixture).is_err());
+    assert!(transaction.join("record").exists());
 }
 
 /// Write one journal record with explicit commit, nonce, and device

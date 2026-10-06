@@ -167,10 +167,11 @@ pub enum Command {
     /// validation, trusted launch, bounded scheduling and owned cancellation
     /// report their aggregate status directly.
     Test,
-    /// `init`: owner traps, then [`init_acquires_lock`] decides the
+    /// `init`: owner traps, then [`init_needs_lock`] decides the
     /// nested `case ${1:-}` — `_dot_update_lock_acquire` unless the
     /// first argument is `--status`, `--help`, or `-h` (lock failure
-    /// returns its status) — then `dot_init_command "$@"`, wired to
+    /// returns its status), and also whenever the parsed mode rolls back
+    /// or runs — then `dot_init_command "$@"`, wired to
     /// [`init_client_command::run`] (see `run_init` below).
     ///
     /// Exit-code note: the dispatcher text ignores the kernel status
@@ -226,6 +227,26 @@ pub fn init_acquires_lock(first_arg: Option<&[u8]>) -> bool {
         }
         None => true,
     }
+}
+
+/// Whether `dot init ARGS` takes the update lock: the shell's
+/// first-argument rule ([`init_acquires_lock`]), plus a rollback the
+/// command will actually run. The parser lets the last mode flag win, so
+/// `dot init --status --rollback` rolls back; the first-argument rule alone
+/// (the shell's too) ran that rollback without the lock that `dot update`
+/// and every other mutating `dot init` hold. Only a leading `--status` can
+/// reach the second clause, and only `--rollback` can change its mode; a
+/// rollback with an origin or a branch is refused without mutating
+/// anything, so it keeps its old status under contention.
+pub fn init_needs_lock(args: &[Vec<u8>]) -> bool {
+    init_acquires_lock(args.first().map(Vec::as_slice))
+        || matches!(
+            init_client_command::parse(args),
+            init_client_command::ParseOutcome::Args(parsed)
+                if parsed.mode == init_client_command::InitMode::Rollback
+                    && parsed.origin.is_empty()
+                    && parsed.branch.is_empty()
+        )
 }
 
 /// Run the CLI writing to the given streams; returns the exit code.
@@ -627,7 +648,7 @@ fn run_init(
     let remote_default_branch =
         |url: &str| -> Option<String> { identity::remote_default_branch(url, &scratch) };
     let log = crate::log::Log::new(false, false);
-    let guard = if init_acquires_lock(args.first().map(Vec::as_slice)) {
+    let guard = if init_needs_lock(args) {
         match crate::update_lock::acquire(runtime.state_home(), false, &log, None, stderr) {
             Ok(guard) => Some(guard),
             Err(Error::LockBusy { .. }) => return crate::update_lock::EXIT_LOCK_BUSY,
@@ -647,6 +668,7 @@ fn run_init(
     let converge_stderr = std::cell::RefCell::new(Vec::new());
     let converge_called = std::cell::Cell::new(false);
     let resume_converge_failed = std::cell::Cell::new(false);
+    let incomplete = std::cell::RefCell::new(Vec::new());
     // Keys already warned about at the command boundary; convergence
     // adds any that arrived with the cloned repository.
     let warned_keys = std::cell::RefCell::new(
@@ -703,8 +725,15 @@ fn run_init(
             result
         };
     let rollback = |at: &Path| -> Result<(), Error> { production.rollback(at) };
+    // A fresh run that fails after publishing its transaction leaves the
+    // initialization unfinished; say so, and how to finish it, after
+    // everything else the run printed.
     let fresh = |inputs: &init_client_command::FreshInputs| -> init_client_command::InitReport {
-        production.run_fresh(inputs)
+        let report = production.run_fresh(inputs);
+        if report.code != 0 {
+            *incomplete.borrow_mut() = production.incomplete_notice().unwrap_or_default();
+        }
+        report
     };
     let env = init_client_command::CommandEnv {
         home,
@@ -726,6 +755,7 @@ fn run_init(
         &converge_stdout.into_inner(),
         &converge_stderr.into_inner(),
         resume_converge_failed.get(),
+        &incomplete.into_inner(),
     )
     .is_err()
     {
@@ -769,6 +799,8 @@ fn init_config(
 /// Emit init and convergence streams in execution order. A resumed
 /// transaction prints the update failure before its wrapper diagnostic;
 /// fresh and completed paths contain only pre-convergence init output.
+/// `incomplete` (empty unless a fresh run failed after publishing its
+/// transaction) closes stderr: it explains everything above it.
 fn write_init_output(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -776,16 +808,18 @@ fn write_init_output(
     converge_stdout: &[u8],
     converge_stderr: &[u8],
     resume_converge_failed: bool,
+    incomplete: &[u8],
 ) -> std::io::Result<()> {
     stdout.write_all(&report.stdout)?;
     stdout.write_all(converge_stdout)?;
     if resume_converge_failed {
         stderr.write_all(converge_stderr)?;
-        stderr.write_all(&report.stderr)
+        stderr.write_all(&report.stderr)?;
     } else {
         stderr.write_all(&report.stderr)?;
-        stderr.write_all(converge_stderr)
+        stderr.write_all(converge_stderr)?;
     }
+    stderr.write_all(incomplete)
 }
 
 pub(crate) fn base_from_values(
@@ -1125,6 +1159,38 @@ mod tests {
     }
 
     #[test]
+    fn init_lock_follows_the_mode_the_arguments_select() {
+        let words = |argv: &[&str]| {
+            argv.iter()
+                .map(|w| w.as_bytes().to_vec())
+                .collect::<Vec<_>>()
+        };
+        // The last mode flag wins, so these roll back or run, and need the
+        // lock `dot update` and every other `dot init` take.
+        for argv in [
+            &["--status", "--rollback"][..],
+            &["--status", "--rollback", "--status", "--rollback"],
+        ] {
+            assert!(init_needs_lock(&words(argv)), "argv: {argv:?}");
+        }
+        // Read-only and refused command lines keep the first-argument rule.
+        for argv in [
+            &["--status"][..],
+            &["--help"],
+            &["--status", "--help", "--rollback"],
+            &["-h", "--rollback"],
+            &["--status", "origin"],
+            &["--status", "--rollback", "origin"],
+            &["--status", "--rollback", "--branch", "main"],
+        ] {
+            assert!(!init_needs_lock(&words(argv)), "argv: {argv:?}");
+        }
+        for argv in [&[][..], &["--rollback"], &["--yes", "origin"], &["--bogus"]] {
+            assert!(init_needs_lock(&words(argv)), "argv: {argv:?}");
+        }
+    }
+
+    #[test]
     fn base_from_values_honors_model_publication() {
         // The `model.sh` publication read at the dispatcher boundary:
         // known topologies pass through, anything else (unset,
@@ -1250,12 +1316,38 @@ mod tests {
             b"update stdout\n",
             b"update failed\n",
             true,
+            b"",
         )
         .expect("write ordered streams");
         assert_eq!(out, b"update stdout\n");
         assert_eq!(
             err,
             b"update failed\ndot init: initialization transaction could not be resumed safely\n"
+        );
+    }
+
+    #[test]
+    fn fresh_convergence_failure_names_the_unfinished_init_last() {
+        let report = init_client_command::InitReport {
+            stdout: Vec::new(),
+            stderr: b"dot init plan:\n".to_vec(),
+            code: 1,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        write_init_output(
+            &mut out,
+            &mut err,
+            &report,
+            b"",
+            b"update failed\n",
+            false,
+            b"dot init: initialization is incomplete\n",
+        )
+        .expect("write ordered streams");
+        assert_eq!(
+            err,
+            b"dot init plan:\nupdate failed\ndot init: initialization is incomplete\n"
         );
     }
 
