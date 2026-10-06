@@ -1442,6 +1442,29 @@ fn binary_init_rollback_without_a_transaction_is_rejected() {
     );
 }
 
+#[test]
+fn binary_init_rollback_after_status_waits_for_the_update_lock() {
+    // The last mode flag wins: this rolls back, so it must not run while
+    // another command holds the update lock.
+    let home = TempDir::new("cli-init-rb-lock").expect("home");
+    let state = TempDir::new("cli-init-rb-lock-state").expect("state");
+    let log = dot::log::Log::new(false, false);
+    let guard = dot::update_lock::acquire(state.path(), false, &log, None, &mut Vec::new())
+        .expect("hold the update lock");
+    let output = init_bin(&home, &state)
+        .args(["init", "--status", "--rollback"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run dot init --status --rollback");
+    drop(guard);
+    assert_eq!(
+        output.status.code(),
+        Some(dot::update_lock::EXIT_LOCK_BUSY),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(unix)]
 fn poison_curl(scope: &Path) -> (OsString, PathBuf) {
     let poison_dir = scope.join("poison-path");

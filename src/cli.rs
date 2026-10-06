@@ -167,10 +167,11 @@ pub enum Command {
     /// validation, trusted launch, bounded scheduling and owned cancellation
     /// report their aggregate status directly.
     Test,
-    /// `init`: owner traps, then [`init_acquires_lock`] decides the
+    /// `init`: owner traps, then [`init_needs_lock`] decides the
     /// nested `case ${1:-}` — `_dot_update_lock_acquire` unless the
     /// first argument is `--status`, `--help`, or `-h` (lock failure
-    /// returns its status) — then `dot_init_command "$@"`, wired to
+    /// returns its status), and also whenever the parsed mode rolls back
+    /// or runs — then `dot_init_command "$@"`, wired to
     /// [`init_client_command::run`] (see `run_init` below).
     ///
     /// Exit-code note: the dispatcher text ignores the kernel status
@@ -226,6 +227,26 @@ pub fn init_acquires_lock(first_arg: Option<&[u8]>) -> bool {
         }
         None => true,
     }
+}
+
+/// Whether `dot init ARGS` takes the update lock: the shell's
+/// first-argument rule ([`init_acquires_lock`]), plus a rollback the
+/// command will actually run. The parser lets the last mode flag win, so
+/// `dot init --status --rollback` rolls back; the first-argument rule alone
+/// (the shell's too) ran that rollback without the lock that `dot update`
+/// and every other mutating `dot init` hold. Only a leading `--status` can
+/// reach the second clause, and only `--rollback` can change its mode; a
+/// rollback with an origin or a branch is refused without mutating
+/// anything, so it keeps its old status under contention.
+pub fn init_needs_lock(args: &[Vec<u8>]) -> bool {
+    init_acquires_lock(args.first().map(Vec::as_slice))
+        || matches!(
+            init_client_command::parse(args),
+            init_client_command::ParseOutcome::Args(parsed)
+                if parsed.mode == init_client_command::InitMode::Rollback
+                    && parsed.origin.is_empty()
+                    && parsed.branch.is_empty()
+        )
 }
 
 /// Run the CLI writing to the given streams; returns the exit code.
@@ -627,7 +648,7 @@ fn run_init(
     let remote_default_branch =
         |url: &str| -> Option<String> { identity::remote_default_branch(url, &scratch) };
     let log = crate::log::Log::new(false, false);
-    let guard = if init_acquires_lock(args.first().map(Vec::as_slice)) {
+    let guard = if init_needs_lock(args) {
         match crate::update_lock::acquire(runtime.state_home(), false, &log, None, stderr) {
             Ok(guard) => Some(guard),
             Err(Error::LockBusy { .. }) => return crate::update_lock::EXIT_LOCK_BUSY,
@@ -1121,6 +1142,38 @@ mod tests {
         assert!(init_acquires_lock(None));
         for arg in [b"".as_slice(), b"--other".as_slice(), b"update".as_slice()] {
             assert!(init_acquires_lock(Some(arg)), "arg: {arg:?}");
+        }
+    }
+
+    #[test]
+    fn init_lock_follows_the_mode_the_arguments_select() {
+        let words = |argv: &[&str]| {
+            argv.iter()
+                .map(|w| w.as_bytes().to_vec())
+                .collect::<Vec<_>>()
+        };
+        // The last mode flag wins, so these roll back or run, and need the
+        // lock `dot update` and every other `dot init` take.
+        for argv in [
+            &["--status", "--rollback"][..],
+            &["--status", "--rollback", "--status", "--rollback"],
+        ] {
+            assert!(init_needs_lock(&words(argv)), "argv: {argv:?}");
+        }
+        // Read-only and refused command lines keep the first-argument rule.
+        for argv in [
+            &["--status"][..],
+            &["--help"],
+            &["--status", "--help", "--rollback"],
+            &["-h", "--rollback"],
+            &["--status", "origin"],
+            &["--status", "--rollback", "origin"],
+            &["--status", "--rollback", "--branch", "main"],
+        ] {
+            assert!(!init_needs_lock(&words(argv)), "argv: {argv:?}");
+        }
+        for argv in [&[][..], &["--rollback"], &["--yes", "origin"], &["--bogus"]] {
+            assert!(init_needs_lock(&words(argv)), "argv: {argv:?}");
         }
     }
 
