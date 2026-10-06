@@ -116,7 +116,12 @@ remove through `dot_remove_if_generation "$destination" "$generation"`.
 These conditional mutations fail when the file, parent directory, or supported
 file type changed. A prepared temporary may be consumed even when publication
 fails, so callers should remove it with `rm -f` on the failure path. Recovery
-uses a private same-directory journal and preserves any late winner.
+uses a private same-directory journal and preserves any late winner. A journal
+a crash left behind still recovers after a reboot that renumbers the
+filesystem's device: the recorded parent and files are recognized by inode
+and by a birth time no later than the journal. Where `stat` cannot report a
+birth time (BusyBox, coreutils before 8.31, filesystems that store none) the
+device must still match.
 
 This merge hook exercises every hook API surface. Real hooks normally use only
 the subset owned by their target format:
