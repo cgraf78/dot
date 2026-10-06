@@ -31,8 +31,11 @@ pub fn credentials(text: &str) -> String {
     while let Some(index) = rest.find("://") {
         let (head, tail) = rest.split_at(index + 3);
         out.push_str(head);
-        let scheme_start = head[..index]
-            .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || "+-.".contains(ch)))
+        // Scan bytes: a scheme is ASCII, and a multi-byte character ends in
+        // a non-ASCII continuation byte, so `at + 1` is a char boundary.
+        let scheme_start = head.as_bytes()[..index]
+            .iter()
+            .rposition(|byte| !(byte.is_ascii_alphanumeric() || b"+-.".contains(byte)))
             .map_or(0, |at| at + 1);
         let scheme = head[scheme_start..index].to_ascii_lowercase();
         let end = tail
@@ -127,6 +130,23 @@ mod tests {
             credentials("remote https://a:b@host"),
             "remote https://***@host"
         );
+    }
+
+    #[test]
+    fn non_ascii_text_before_a_scheme_is_kept() {
+        // A multi-byte character right before the scheme once made the
+        // scheme scan slice inside it and panic; `remote:` lines put
+        // server-chosen text there.
+        for (text, redacted) in [
+            (
+                "unable to access \u{201e}https://user:tok@host/\u{201c}",
+                "unable to access \u{201e}https://***@host/\u{201c}",
+            ),
+            ("\u{e9}https://tok@host", "\u{e9}https://***@host"),
+            ("\u{2192}ssh://git@host/r", "\u{2192}ssh://git@host/r"),
+        ] {
+            assert_eq!(credentials(text), redacted, "{text}");
+        }
     }
 
     #[test]
