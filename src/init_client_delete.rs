@@ -34,8 +34,10 @@ use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::SystemTime;
 
 use crate::errors::{Error, Result};
+use crate::persisted_identity;
 use crate::temp;
 
 /// File name of the staged-generation marker inside a git directory.
@@ -82,7 +84,9 @@ fn owned_by_us(path: &Path) -> bool {
 
 /// `stat -c '%d:%i'` rendered as text, or empty when the stat fails:
 /// the shell's `$(_dot_path_identity "$path" 2>/dev/null || true)`.
-/// `stat` follows symlinks on both engines.
+/// `stat` follows symlinks on both engines. Only for identities this
+/// process captured itself; journaled ones go through
+/// [`persisted_identity::path_matches`].
 fn live_identity_string(path: &Path) -> String {
     temp::path_identity(path)
         .map(temp::identity_string)
@@ -369,11 +373,13 @@ fn hash_live_file(git_dir: &Path, target: &Path) -> Option<String> {
 /// (`mode & 077 == 0`). The optional identity (`dev:ino` text) and
 /// mode (bare octal text like `stat` prints, so `"0700"` never equals
 /// `"700"`) narrow the match when present, exactly like the shell's
-/// `${2:-}` / `${3:-}` defaults.
+/// `${2:-}` / `${3:-}` defaults. `journaled` bounds a renumbered device
+/// in a journaled identity (see [`persisted_identity`]).
 pub fn private_directory_matches(
     path: &Path,
     expected_identity: Option<&str>,
     expected_mode: Option<&str>,
+    journaled: Option<SystemTime>,
 ) -> bool {
     if !is_real_dir(path) || !owned_by_us(path) {
         return false;
@@ -392,7 +398,9 @@ pub fn private_directory_matches(
     if expected_mode.is_some_and(|mode| mode != text) {
         return false;
     }
-    if expected_identity.is_some_and(|identity| live_identity_string(path) != identity) {
+    if expected_identity
+        .is_some_and(|identity| !persisted_identity::path_matches(path, identity, journaled))
+    {
         return false;
     }
     true
@@ -408,8 +416,9 @@ pub fn private_empty_directory_matches(
     path: &Path,
     expected_identity: Option<&str>,
     expected_mode: Option<&str>,
+    journaled: Option<SystemTime>,
 ) -> bool {
-    if !private_directory_matches(path, expected_identity, expected_mode) {
+    if !private_directory_matches(path, expected_identity, expected_mode, journaled) {
         return false;
     }
     match std::fs::read_dir(path) {
@@ -420,9 +429,10 @@ pub fn private_empty_directory_matches(
 
 /// `_dot_init_leaf_delete_matches`: the parked candidate still has
 /// the recorded identity, still lives under `home`, and still
-/// carries the tracked `mode`/`oid` generation. The identity
-/// compares as text with a failed stat counting as empty, exactly
-/// like the shell's `$(... || true)`.
+/// carries the tracked `mode`/`oid` generation. A failed stat never
+/// matches, like the shell's empty `$(... || true)`; `journaled` bounds
+/// a renumbered device (see [`persisted_identity`]).
+#[allow(clippy::too_many_arguments)]
 pub fn leaf_delete_matches(
     candidate: &Path,
     expected_identity: &str,
@@ -431,8 +441,9 @@ pub fn leaf_delete_matches(
     mode: &str,
     oid: &str,
     home: &Path,
+    journaled: Option<SystemTime>,
 ) -> bool {
-    if live_identity_string(candidate) != expected_identity {
+    if !persisted_identity::path_matches(candidate, expected_identity, journaled) {
         return false;
     }
     let relative = match strip_home_prefix(home, candidate) {
@@ -449,8 +460,14 @@ pub fn parent_delete_matches(
     candidate: &Path,
     expected_identity: &str,
     expected_mode: &str,
+    journaled: Option<SystemTime>,
 ) -> bool {
-    private_empty_directory_matches(candidate, Some(expected_identity), Some(expected_mode))
+    private_empty_directory_matches(
+        candidate,
+        Some(expected_identity),
+        Some(expected_mode),
+        journaled,
+    )
 }
 
 /// `_dot_init_git_delete_matches`: the parked candidate still has
@@ -464,6 +481,9 @@ pub fn parent_delete_matches(
 ///
 /// `nonce`, `commit`, `identity`, and `branch` are `DOT_INIT_NONCE`,
 /// `DOT_INIT_COMMIT`, `DOT_INIT_IDENTITY`, and `DOT_INIT_BRANCH`.
+///
+/// `journaled` bounds a renumbered device in the recorded identity (see
+/// [`persisted_identity`]).
 pub fn git_delete_matches(
     candidate: &Path,
     expected_identity: &str,
@@ -471,8 +491,9 @@ pub fn git_delete_matches(
     commit: &str,
     identity: &str,
     branch: &str,
+    journaled: Option<SystemTime>,
 ) -> bool {
-    if live_identity_string(candidate) != expected_identity {
+    if !persisted_identity::path_matches(candidate, expected_identity, journaled) {
         return false;
     }
     generation_matches(candidate, nonce, commit, identity, branch)

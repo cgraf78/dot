@@ -58,8 +58,10 @@ use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::errors::{Error, Result};
+use crate::persisted_identity;
 use crate::repos_base::run_git;
 use crate::repos_overlays::init_safe_relative_path;
 use crate::temp::{self, MoveCache};
@@ -530,6 +532,10 @@ pub struct PublishOneInputs<'a> {
     pub write_line: &'a WriteIntentLine<'a>,
     /// Published-content verification (the candidate lane).
     pub candidate_matches: &'a CandidateMatches<'a>,
+    /// When the transaction's journals (this intent included) were last
+    /// written before this run: bounds a renumbered device in the intent's
+    /// recorded identities (see [`persisted_identity`]).
+    pub journaled: Option<SystemTime>,
 }
 
 /// Any filesystem presence, dangling links included: the shell's
@@ -565,10 +571,15 @@ fn git_show(git_dir: &str, commit: &str, path: &str) -> (Vec<u8>, bool) {
 /// `_dot_init_entry_stage_valid`: `stage` is an owned real
 /// directory with no group/other permission bits, and — when
 /// `expected_identity` is nonempty — its `dev:ino` identity
-/// matches. The shell's octal-digit guard is subsumed by computing
-/// the bits directly, the way the overlay lane's
+/// matches (`journaled` bounds a renumbered device; see
+/// [`persisted_identity`]). The shell's octal-digit guard is subsumed by
+/// computing the bits directly, the way the overlay lane's
 /// `private_directory` does.
-pub fn entry_stage_valid(stage: &Path, expected_identity: Option<&str>) -> bool {
+pub fn entry_stage_valid(
+    stage: &Path,
+    expected_identity: Option<&str>,
+    journaled: Option<SystemTime>,
+) -> bool {
     let meta = match std::fs::symlink_metadata(stage) {
         Ok(meta) => meta,
         Err(_) => return false,
@@ -590,8 +601,7 @@ pub fn entry_stage_valid(stage: &Path, expected_identity: Option<&str>) -> bool 
         // The shell defaults the missing argument to empty and
         // skips the check on `[[ -z $expected_identity ]]`.
         Some("") => true,
-        Some(expected) => temp::path_identity(stage)
-            .is_ok_and(|identity| temp::identity_string(identity) == expected),
+        Some(expected) => persisted_identity::path_matches(stage, expected, journaled),
     }
 }
 
@@ -679,9 +689,13 @@ pub fn publish_one(inputs: &PublishOneInputs<'_>, moves: &mut MoveCache) -> Resu
     let mut stage_ino = intent.ino.clone();
     let mut next_dev = intent.next_dev.clone();
     let mut next_ino = intent.next_ino.clone();
+    // The bound for identities read back from the intent; one captured
+    // below in this call compares exactly (`None`).
+    let mut stage_journaled = inputs.journaled;
+    let mut next_journaled = inputs.journaled;
     if phase == "pending" {
         if any_presence(&stage) {
-            if !entry_stage_valid(&stage, None) {
+            if !entry_stage_valid(&stage, None, None) {
                 return Err(Error::Usage {
                     message: "entry stage is not valid",
                 });
@@ -719,6 +733,7 @@ pub fn publish_one(inputs: &PublishOneInputs<'_>, moves: &mut MoveCache) -> Resu
             message: "entry stage has no identity",
         })?;
         stage_dev = dev.to_string();
+        stage_journaled = None;
         stage_ino = ino.to_string();
         // The staged line binds the container before the blob
         // redirect below can leave partial bytes: a crash during
@@ -733,7 +748,7 @@ pub fn publish_one(inputs: &PublishOneInputs<'_>, moves: &mut MoveCache) -> Resu
     }
     if phase == "staged" {
         let wanted = format!("{stage_dev}:{stage_ino}");
-        if !entry_stage_valid(&stage, Some(wanted.as_str())) {
+        if !entry_stage_valid(&stage, Some(wanted.as_str()), stage_journaled) {
             return Err(Error::Usage {
                 message: "entry stage is not valid",
             });
@@ -806,6 +821,7 @@ pub fn publish_one(inputs: &PublishOneInputs<'_>, moves: &mut MoveCache) -> Resu
             message: "entry next has no identity",
         })?;
         next_dev = dev.to_string();
+        next_journaled = None;
         next_ino = ino.to_string();
         let line = format!(
             "prepared\t{}\t{}\t{}\t{}\t{stage_dev}\t{stage_ino}\t{next_dev}\t{next_ino}",
@@ -814,7 +830,7 @@ pub fn publish_one(inputs: &PublishOneInputs<'_>, moves: &mut MoveCache) -> Resu
         (inputs.write_line)(inputs.intent, line.as_str(), true)?;
     }
     let wanted_stage = format!("{stage_dev}:{stage_ino}");
-    if !entry_stage_valid(&stage, Some(wanted_stage.as_str())) {
+    if !entry_stage_valid(&stage, Some(wanted_stage.as_str()), stage_journaled) {
         return Err(Error::Usage {
             message: "entry stage is not valid",
         });
@@ -832,10 +848,10 @@ pub fn publish_one(inputs: &PublishOneInputs<'_>, moves: &mut MoveCache) -> Resu
     let wanted_next = format!("{next_dev}:{next_ino}");
     // The shell reads the identity through `|| true`: a missing
     // candidate compares as empty and fails the gate.
-    let landed = temp::path_identity(&next).map_err(|_| Error::Usage {
+    let landed = persisted_identity::LiveIdentity::of(&next).map_err(|_| Error::Usage {
         message: "entry next has no identity",
     })?;
-    if temp::identity_string(landed) != wanted_next {
+    if !persisted_identity::matches(&wanted_next, &landed, next_journaled) {
         return Err(Error::Usage {
             message: "entry next changed under us",
         });
@@ -852,10 +868,10 @@ pub fn publish_one(inputs: &PublishOneInputs<'_>, moves: &mut MoveCache) -> Resu
         });
     }
     temp::move_noreplace_cached(&next, &target, moves)?;
-    let placed = temp::path_identity(&target).map_err(|_| Error::Usage {
+    let placed = persisted_identity::LiveIdentity::of(&target).map_err(|_| Error::Usage {
         message: "published entry has no identity",
     })?;
-    if temp::identity_string(placed) != wanted_next {
+    if !persisted_identity::matches(&wanted_next, &placed, next_journaled) {
         return Err(Error::Usage {
             message: "published entry changed under us",
         });

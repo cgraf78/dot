@@ -66,7 +66,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use crate::errors::{Error, Result};
-use crate::temp;
 
 /// Stage directory mode the publish family requires: the shell's
 /// literal `700` argument on every private-directory gate below.
@@ -201,6 +200,10 @@ pub struct StageHooks<'a> {
     pub private_empty_directory_matches: &'a PrivateEmptyDirectoryMatches<'a>,
     /// See [`StageClaimRemove`].
     pub stage_claim_remove: &'a StageClaimRemove<'a>,
+    /// When the transaction's journals were last written before this run:
+    /// bounds a renumbered device in an intent's recorded identities (see
+    /// [`crate::persisted_identity`]).
+    pub journaled: Option<std::time::SystemTime>,
 }
 
 /// The candidate/publish-family collaborators [`publish_worktree`]
@@ -498,11 +501,8 @@ pub fn published_intent_matches(
         });
     }
     let target = join2(home, path);
-    let live = temp::path_identity(&target)
-        .ok()
-        .map(temp::identity_string)
-        .unwrap_or_default();
-    if live != format!("{}:{}", record.next_dev, record.next_ino) {
+    let next = format!("{}:{}", record.next_dev, record.next_ino);
+    if !crate::persisted_identity::path_matches(&target, &next, hooks.journaled) {
         return Err(Error::Usage {
             message: "published file changed under its intent",
         });

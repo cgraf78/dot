@@ -187,10 +187,57 @@ fn replacement_generation_matches_content_and_nofollow_legacy_identity() {
         ),
     ] {
         assert_eq!(
-            repos_overlays::replacement_generation_matches(&path, &expected, kind, root),
+            repos_overlays::replacement_generation_matches(&path, &expected, kind, root, None),
             answer,
             "{name}"
         );
+    }
+}
+
+/// `fingerprint` with its leading device field renumbered, the way a
+/// record written before a reboot carries it.
+fn renumbered(fingerprint: &str) -> String {
+    let (dev, rest) = fingerprint.split_once(':').unwrap();
+    format!("{}:{rest}", dev.parse::<u64>().unwrap() + 1)
+}
+
+#[test]
+fn replacement_generation_survives_a_renumbered_device_only_for_older_objects() {
+    let scope = TempDir::new("replacement-renumbered").unwrap();
+    let root = scope.path();
+    let file = stage(root, "app.conf", b"body\n", 0o600);
+    let link = root.join("link.conf");
+    std::os::unix::fs::symlink("app.conf", &link).unwrap();
+    for path in [file, link] {
+        let Some(born) = dot::persisted_identity::LiveIdentity::of_leaf(&path)
+            .unwrap()
+            .birth
+        else {
+            eprintln!("skipping: no birth time on this host");
+            return;
+        };
+        let second = std::time::Duration::from_secs(1);
+        let (after, before) = (Some(born + second), born.checked_sub(second));
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        let content = renumbered(&repos_overlays::replacement_identity(root, &path).unwrap());
+        let legacy = renumbered(&format!("{}:{}", meta.dev(), meta.ino()));
+        for (expected, kind) in [(&content, "content"), (&legacy, "legacy")] {
+            let matches = |journaled| {
+                repos_overlays::replacement_generation_matches(
+                    &path, expected, kind, root, journaled,
+                )
+            };
+            let name = format!("{} {kind}", path.display());
+            assert!(matches(after), "{name}");
+            assert!(!matches(before), "{name}");
+            assert!(!matches(None), "{name}");
+        }
+        // A changed body is another generation whatever the device says.
+        let mut stale = content.clone();
+        stale.push('0');
+        assert!(!repos_overlays::replacement_generation_matches(
+            &path, &stale, "content", root, after
+        ));
     }
 }
 

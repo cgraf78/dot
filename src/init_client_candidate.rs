@@ -540,7 +540,10 @@ pub fn snapshot_path(path: &Path) -> Result<String> {
 /// size as rendered strings (so a `0644` spelling never equals the
 /// `644` a live `stat` prints, on either engine), plus the content
 /// hash for regular files or the chomped target for symlinks.
-/// Directories match on identity and mode alone.
+/// Directories match on identity and mode alone. The snapshot was
+/// journaled by an earlier run when this one resumes or rolls back, so
+/// `journaled` bounds a renumbered device (see
+/// [`crate::persisted_identity`]).
 #[allow(clippy::too_many_arguments)]
 pub fn path_state_matches(
     path: &Path,
@@ -550,7 +553,10 @@ pub fn path_state_matches(
     mode: &str,
     size: &str,
     value: &str,
+    journaled: Option<std::time::SystemTime>,
 ) -> bool {
+    use crate::persisted_identity::{self as persisted, LiveIdentity};
+    let recorded = format!("{device}:{inode}");
     if kind == "absent" {
         return !exists_or_link(path);
     }
@@ -572,11 +578,7 @@ pub fn path_state_matches(
             // Directories carry no content token: identity and mode
             // below are the whole check, like the shell's early
             // `return 0`.
-            let identity = match temp::path_identity(path) {
-                Ok(identity) => temp::identity_string(identity),
-                Err(_) => return false,
-            };
-            if identity != format!("{device}:{inode}") {
+            if !persisted::path_matches(path, &recorded, journaled) {
                 return false;
             }
             let current_mode = match temp::file_mode(path) {
@@ -596,13 +598,13 @@ pub fn path_state_matches(
             Err(_) => return false,
         };
         (
-            temp::identity_string((meta.dev(), meta.ino())),
+            LiveIdentity::from_metadata(path, &meta, false),
             format!("{:o}", meta.mode() & 0o7777),
             meta.size().to_string(),
         )
     } else {
-        let identity = match temp::path_identity(path) {
-            Ok(identity) => temp::identity_string(identity),
+        let identity = match LiveIdentity::of(path) {
+            Ok(identity) => identity,
             Err(_) => return false,
         };
         let current_mode = match temp::file_mode(path) {
@@ -615,7 +617,7 @@ pub fn path_state_matches(
         };
         (identity, current_mode, current_size)
     };
-    if identity != format!("{device}:{inode}") {
+    if !persisted::matches(&recorded, &identity, journaled) {
         return false;
     }
     if current_mode != mode {

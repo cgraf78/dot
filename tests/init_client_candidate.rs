@@ -697,6 +697,7 @@ fn check_state(
         &rust_fields[3],
         &rust_fields[4],
         &rust_fields[5],
+        None,
     ) {
         0
     } else {
@@ -1053,4 +1054,64 @@ fn trailing_slash_home() {
         candidate::conflict_root("plain.txt", &scope.home),
         "plain.txt"
     );
+}
+
+/// Replay `path`'s snapshot with its device field renumbered, as a resume
+/// after a reboot reads it, against a journal written just after (or, with
+/// `journal_after_birth` false, just before) the object's birth. `None`
+/// (after saying so) where this host reports no birth time: the exact
+/// device rule then still applies and there is nothing to prove.
+fn replay_renumbered(path: &Path, journal_after_birth: bool) -> Option<bool> {
+    let birth = dot::persisted_identity::LiveIdentity::of_leaf(path)
+        .expect("lstat")
+        .birth;
+    let Some(born) = birth else {
+        eprintln!("skipping: no birth time on this host");
+        return None;
+    };
+    let second = std::time::Duration::from_secs(1);
+    let journaled = if journal_after_birth {
+        Some(born + second)
+    } else {
+        born.checked_sub(second)
+    };
+    let line = candidate::snapshot_path(path).expect("snapshot line");
+    let mut fields = split_snapshot(&line);
+    let dev: u64 = fields[1].parse().expect("frozen device");
+    fields[1] = (dev + 1).to_string();
+    Some(candidate::path_state_matches(
+        path, &fields[0], &fields[1], &fields[2], &fields[3], &fields[4], &fields[5], journaled,
+    ))
+}
+
+/// One of each snapshot kind under a fresh directory.
+fn renumbering_fixture(tag: &str) -> (TempDir, Vec<PathBuf>) {
+    let dir = TempDir::new(tag).expect("scratch");
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"data\n").expect("file");
+    let tree = dir.path().join("tree");
+    std::fs::create_dir(&tree).expect("tree");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink("file", &link).expect("link");
+    (dir, vec![file, tree, link])
+}
+
+#[test]
+fn snapshots_survive_a_renumbered_device() {
+    let (_dir, paths) = renumbering_fixture("candidate-renumbered");
+    for path in paths {
+        if let Some(matched) = replay_renumbered(&path, true) {
+            assert!(matched, "{}", path.display());
+        }
+    }
+}
+
+#[test]
+fn snapshots_of_objects_born_after_their_journal_are_refused_when_renumbered() {
+    let (_dir, paths) = renumbering_fixture("candidate-born-after");
+    for path in paths {
+        if let Some(matched) = replay_renumbered(&path, false) {
+            assert!(!matched, "{}", path.display());
+        }
+    }
 }

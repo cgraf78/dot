@@ -524,7 +524,7 @@ fn move_conflicts_refuses_a_live_file_rewritten_after_snapshot() {
     std::fs::write(&live, b"late\n").expect("replace live bytes after planning");
     let matches =
         |path: &Path, kind: &str, dev: &str, ino: &str, mode: &str, size: &str, value: &str| {
-            candidate::path_state_matches(path, kind, dev, ino, mode, size, value)
+            candidate::path_state_matches(path, kind, dev, ino, mode, size, value, None)
         };
     let result = plan::move_conflicts(
         &manifest,

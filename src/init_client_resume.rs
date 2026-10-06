@@ -66,10 +66,12 @@ use std::process::Stdio;
 
 use crate::errors::{Error, Result};
 
-/// Path identity provision: `_dot_path_identity` (`stat` device and
-/// inode), owned by the temp lane. The value crosses as a string so
-/// the comparison below stays a string comparison like the shell's.
-pub type PathIdentity<'a> = dyn Fn(&Path) -> Result<String> + 'a;
+/// Path identity provision: the live device, inode, and birth time
+/// (`stat`, following links like `_dot_path_identity`), which
+/// [`crate::persisted_identity::matches`] weighs against the recorded
+/// `dev:ino`. Injected so tests can stand in for a reboot that renumbers
+/// the device.
+pub type PathIdentity<'a> = dyn Fn(&Path) -> Result<crate::persisted_identity::LiveIdentity> + 'a;
 
 /// Generation-marker check: `_dot_init_generation_marker_matches`,
 /// owned by the generation lane. Skipped for adopted runs, exactly
@@ -122,6 +124,10 @@ pub struct LiveGitInputs<'a> {
     pub git_dev: &'a str,
     /// Recorded inode (`DOT_INIT_GIT_INO`).
     pub git_ino: &'a str,
+    /// When the record holding `git_dev`/`git_ino` was written, captured
+    /// before this run rewrote it (`TransactionRecord::journaled`): a
+    /// device renumbered since then still matches an inode born before it.
+    pub journaled: Option<std::time::SystemTime>,
     /// Run nonce (`DOT_INIT_NONCE`; `adopted` skips the marker gate).
     pub nonce: &'a str,
     /// Expected repository identity (`DOT_INIT_IDENTITY`).
@@ -547,8 +553,9 @@ pub enum IdentityMismatch {
     /// The Git directory is missing or not a real directory (a symlink or
     /// a file now stands in its place).
     NotDirectory,
-    /// Its device and inode changed: it was recreated, copied, or restored
-    /// since `dot init` recorded it.
+    /// Its inode changed, or its device did and it cannot be shown to
+    /// predate the record: it was recreated, copied, or restored since
+    /// `dot init` recorded it.
     Replaced,
     /// Its generation marker no longer names the recorded run.
     Generation,
@@ -579,8 +586,10 @@ pub enum IdentityMismatch {
 }
 
 /// `_dot_init_live_git_matches_record`: re-verify that the live git
-/// directory still matches the transaction record — same device and
-/// inode, same generation marker (unless adopted), exactly one origin
+/// directory still matches the transaction record — the same object
+/// (same inode, and same device unless a remount renumbered it; see
+/// [`crate::persisted_identity`]), same generation marker (unless
+/// adopted), exactly one origin
 /// URL normalizing to the recorded identity, the recorded branch
 /// checked out at a well-formed commit, and a trusted topology (a
 /// bare `$HOME/.dotfiles`, a non-bare one rooted at `$HOME`, or an
@@ -608,11 +617,12 @@ pub fn live_git_mismatch(
     if !is_real_dir(inputs.git_dir) {
         return Some(Why::NotDirectory);
     }
-    let current = match (deps.path_identity)(inputs.git_dir) {
+    let live = match (deps.path_identity)(inputs.git_dir) {
         Ok(identity) => identity,
         Err(_) => return Some(Why::NotDirectory),
     };
-    if current != format!("{}:{}", inputs.git_dev, inputs.git_ino) {
+    let recorded = format!("{}:{}", inputs.git_dev, inputs.git_ino);
+    if !crate::persisted_identity::matches(&recorded, &live, inputs.journaled) {
         return Some(Why::Replaced);
     }
     if inputs.nonce != "adopted" && !(deps.generation_matches)(inputs.git_dir) {

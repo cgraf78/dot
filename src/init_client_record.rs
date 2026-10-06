@@ -129,6 +129,11 @@ pub struct TransactionRecord {
     pub git_dev: String,
     /// Staged git inode (`-` or digits).
     pub git_ino: String,
+    /// When the record file was last written, as [`read_record`] found it:
+    /// the bound a renumbered `git_dev` is held to (see
+    /// [`crate::persisted_identity`]). Not a record field, so the format
+    /// older releases parse is unchanged.
+    pub journaled: Option<std::time::SystemTime>,
 }
 
 /// A validated parent intent: the shell's `REPLY` from
@@ -618,6 +623,7 @@ pub fn read_record(record: &Path, home: &Path) -> Result<TransactionRecord> {
         nonce: record_text(nonce)?,
         git_dev: record_text(git_dev)?,
         git_ino: record_text(git_ino)?,
+        journaled: meta.modified().ok(),
     })
 }
 

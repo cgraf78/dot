@@ -392,6 +392,15 @@ fn client_match_key(record: &crate::init_client_record::TransactionRecord, home:
         key.extend_from_slice(part);
         key.push(0);
     }
+    // A renumbered device's verdict also depends on when the record was
+    // written, so a record with the same fields but an older mtime does
+    // not share it.
+    let journaled = record
+        .journaled
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos().to_string())
+        .unwrap_or_default();
+    key.extend_from_slice(journaled.as_bytes());
     key
 }
 
@@ -446,8 +455,7 @@ fn client_mismatch(
     home: &Path,
 ) -> Option<crate::init_client_resume::IdentityMismatch> {
     let git_dir = Path::new(&record.git_dir);
-    let path_identity =
-        |path: &Path| crate::temp::path_identity(path).map(crate::temp::identity_string);
+    let path_identity = |path: &Path| crate::persisted_identity::LiveIdentity::of(path);
     let generation_matches = |path: &Path| {
         crate::init_client_generation::generation_marker_matches(
             path,
@@ -465,6 +473,7 @@ fn client_mismatch(
         git_dir,
         git_dev: &record.git_dev,
         git_ino: &record.git_ino,
+        journaled: record.journaled,
         nonce: &record.nonce,
         identity: &record.identity,
         branch: &record.branch,
@@ -878,6 +887,8 @@ mod tests {
                 nonce: "adopted".to_string(),
                 git_dev: meta.dev().to_string(),
                 git_ino: meta.ino().to_string(),
+                // Journaled now, after the fixture directory was created.
+                journaled: Some(std::time::SystemTime::now()),
             }
         }
     }
@@ -905,6 +916,7 @@ mod tests {
             nonce: "adopted".to_string(),
             git_dev: "-".to_string(),
             git_ino: "-".to_string(),
+            journaled: None,
         };
         let completed = scope.path().join("completed");
         for why in [
@@ -996,6 +1008,7 @@ mod tests {
             nonce: "adopted".to_string(),
             git_dev: "-".to_string(),
             git_ino: "-".to_string(),
+            journaled: None,
         };
         let lines = super::identity_recovery(
             &runtime,
@@ -1220,6 +1233,66 @@ mod tests {
             assert!(client_matches(&record, &git.home));
         });
         assert_eq!(git.invocations(), 4);
+    }
+
+    /// Whether this host reports birth times for the fixture's Git
+    /// directory. Without one the exact device rule still applies, so the
+    /// renumbering tests below have nothing to prove (Android, or a
+    /// filesystem that stores no birth time).
+    fn reports_birth_time(git: &IdentityGit) -> bool {
+        let known = crate::persisted_identity::LiveIdentity::of(&git.home.join(".dotfiles"))
+            .is_ok_and(|live| live.birth.is_some());
+        if !known {
+            eprintln!("skipping: no birth time on this host");
+        }
+        known
+    }
+
+    /// `record` as a process before a reboot journaled it: same inode, but
+    /// the device number the mount had then.
+    fn renumber(record: &mut crate::init_client_record::TransactionRecord) {
+        let dev: u64 = record.git_dev.parse().expect("recorded device");
+        record.git_dev = (dev + 1).to_string();
+    }
+
+    #[test]
+    fn a_reboot_that_renumbers_the_device_keeps_the_client() {
+        let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
+        let git = IdentityGit::matching("renumbered");
+        if !reports_birth_time(&git) {
+            return;
+        }
+        let mut record = git.record("main");
+        renumber(&mut record);
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            assert_eq!(client_mismatch(&record, &git.home), None);
+            assert!(client_matches(&record, &git.home));
+        });
+    }
+
+    #[test]
+    fn a_git_dir_born_after_its_record_is_refused_on_a_renumbered_device() {
+        let _serial = TEST_SERIAL.lock();
+        let _cache_still = crate::memo::probe_cache_test_gate::exclusive();
+        let git = IdentityGit::matching("born-after-record");
+        if !reports_birth_time(&git) {
+            return;
+        }
+        let mut record = git.record("main");
+        renumber(&mut record);
+        let birth = crate::persisted_identity::LiveIdentity::of(&git.home.join(".dotfiles"))
+            .expect("stat")
+            .birth
+            .expect("birth time");
+        record.journaled = birth.checked_sub(std::time::Duration::from_secs(1));
+        crate::init_client_identity::with_host_git(git.shim.as_path(), || {
+            assert_eq!(
+                client_mismatch(&record, &git.home),
+                Some(crate::init_client_resume::IdentityMismatch::Replaced)
+            );
+            assert!(!client_matches(&record, &git.home));
+        });
     }
 
     #[test]

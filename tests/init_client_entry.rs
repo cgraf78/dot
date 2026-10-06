@@ -568,8 +568,69 @@ fn valid_row(tag: &str, build: &dyn Fn(&Path), identity: Option<&str>, want: boo
         Some(fixed) => Some(fixed.to_string()),
         None => None,
     };
-    let rust = entry::entry_stage_valid(&dir.path().join("stage"), expected.as_deref());
+    let rust = entry::entry_stage_valid(&dir.path().join("stage"), expected.as_deref(), None);
     assert_eq!(rust, want, "entry_stage_valid contract on {tag}");
+}
+
+/// An owned private stage, its identity as journaled before a reboot
+/// renumbered the mount, and journal times just after and just before its
+/// birth.
+struct RenumberedStage {
+    _dir: TempDir,
+    stage: PathBuf,
+    recorded: String,
+    after: Option<std::time::SystemTime>,
+    before: Option<std::time::SystemTime>,
+}
+
+/// A [`RenumberedStage`], or `None` (after saying so) where this host
+/// reports no birth time: the exact device rule then still applies and
+/// there is nothing to prove.
+fn renumbered_stage(tag: &str) -> Option<RenumberedStage> {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = TempDir::new(tag).expect("temp dir");
+    let stage = dir.path().join("stage");
+    std::fs::create_dir(&stage).expect("stage");
+    chmod(&stage, 0o700);
+    let Some(born) = dot::persisted_identity::LiveIdentity::of(&stage)
+        .expect("stat")
+        .birth
+    else {
+        eprintln!("skipping: no birth time on this host");
+        return None;
+    };
+    let meta = std::fs::metadata(&stage).expect("stat");
+    let second = std::time::Duration::from_secs(1);
+    Some(RenumberedStage {
+        _dir: dir,
+        stage,
+        recorded: format!("{}:{}", meta.dev() + 1, meta.ino()),
+        after: Some(born + second),
+        before: born.checked_sub(second),
+    })
+}
+
+#[test]
+fn stage_valid_survives_a_renumbered_device() {
+    let Some(fixture) = renumbered_stage("valid-renumbered") else {
+        return;
+    };
+    assert!(entry::entry_stage_valid(
+        &fixture.stage,
+        Some(&fixture.recorded),
+        fixture.after
+    ));
+}
+
+#[test]
+fn stage_valid_refuses_a_renumbered_stage_born_after_its_journal() {
+    let Some(fixture) = renumbered_stage("valid-born-after") else {
+        return;
+    };
+    let valid =
+        |journaled| entry::entry_stage_valid(&fixture.stage, Some(&fixture.recorded), journaled);
+    assert!(!valid(fixture.before));
+    assert!(!valid(None));
 }
 
 #[test]
@@ -1161,6 +1222,7 @@ fn publish_at(world: &PublishWorld, commit: &str, mode: &str, oid: &str, path: &
         claim_remove: &claim_remove,
         write_line: &write_line,
         candidate_matches: &candidate,
+        journaled: None,
     };
     entry::publish_one(&inputs, &mut MoveCache::default()).is_ok()
 }

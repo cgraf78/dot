@@ -51,6 +51,7 @@ pub(crate) mod memo;
 pub mod merges;
 pub mod overlay_context;
 pub mod overlays;
+pub mod persisted_identity;
 pub mod platform;
 pub mod pre_sync;
 pub mod profile_lifecycle;

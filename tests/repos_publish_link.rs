@@ -339,6 +339,70 @@ fn recover_replacement_converges_settled_parked_and_linked_crash_states() {
     }
 }
 
+/// `identity` (`dev:ino...`) with its device renumbered, the way a record
+/// written before a reboot carries it.
+fn renumbered(identity: &str) -> String {
+    let (dev, rest) = identity.split_once(':').unwrap();
+    format!("{}:{rest}", dev.parse::<u64>().unwrap() + 1)
+}
+
+/// Recover a parked replacement whose record names its file and parent
+/// under the device numbers the mount had before a reboot. With
+/// `backdate`, the record claims to predate both objects. `None` (after
+/// saying so) where this host reports no birth time.
+fn recover_renumbered(backdate: bool) -> Option<(bool, String)> {
+    let mut moves = dot::temp::MoveCache::default();
+    let tool = moves.tool().unwrap();
+    let scope = TempDir::new("publish-recover-renumbered").unwrap();
+    let root = scope.path();
+    let manifest = root.join("manifest.tsv").to_string_lossy().into_owned();
+    let mut fixture = crash(root, "dest/app.conf", &manifest);
+    let Some(born) = dot::persisted_identity::LiveIdentity::of(fixture.physical.parent().unwrap())
+        .unwrap()
+        .birth
+    else {
+        eprintln!("skipping: no birth time on this host");
+        return None;
+    };
+    private_dir(&fixture.transaction);
+    std::fs::rename(&fixture.physical, fixture.transaction.join("previous")).unwrap();
+    fixture.parent_identity = renumbered(&fixture.parent_identity);
+    fixture.expected = renumbered(&fixture.expected);
+    std::fs::write(&fixture.record, record_body(&fixture, "want-target")).unwrap();
+    std::fs::set_permissions(&fixture.record, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if backdate {
+        std::fs::File::open(&fixture.record)
+            .and_then(|file| file.set_modified(born - std::time::Duration::from_secs(1)))
+            .unwrap();
+    }
+    let ok = repos_overlays::recover_replacement(
+        &fixture.record,
+        &manifest,
+        dot::temp::current_uid().unwrap(),
+        root,
+        root,
+        &root.to_string_lossy(),
+        &tool,
+    );
+    Some((ok, state(&fixture.physical)))
+}
+
+#[test]
+fn recover_replacement_survives_a_renumbered_device() {
+    if let Some((ok, physical)) = recover_renumbered(false) {
+        assert!(ok);
+        assert_eq!(physical, "file:old");
+    }
+}
+
+#[test]
+fn recover_replacement_refuses_renumbered_objects_born_after_the_record() {
+    if let Some((ok, physical)) = recover_renumbered(true) {
+        assert!(!ok);
+        assert_eq!(physical, "absent");
+    }
+}
+
 #[test]
 fn recover_replacements_uses_byte_order_and_stops_at_the_first_bad_record() {
     let mut moves = dot::temp::MoveCache::default();
