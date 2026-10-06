@@ -48,11 +48,12 @@
 //! diagnostics), and [`Production::run_fresh`] renders the fresh
 //! tail's own diagnostic sites directly.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::SystemTime;
 
 use crate::errors::{Error, Result};
 use crate::init_client_adopt::{self as adopt, AdoptError};
@@ -74,7 +75,7 @@ use crate::init_client_safe_path as safe_path;
 use crate::init_client_transaction as transaction;
 use crate::repos_base::Topology;
 use crate::temp;
-use crate::{reserved, xdg};
+use crate::{persisted_identity, reserved, xdg};
 
 /// The shell's fixed resume-failure text
 /// (`_dot_init_error 'initialization transaction could not be
@@ -131,6 +132,13 @@ pub struct Production<'a> {
     /// the `set_git_identity` adapters during staging, read by the
     /// record rewrites.
     git_identity: RefCell<(String, String)>,
+    /// When the open transaction's journals were last written before this
+    /// run touched them (`persisted_identity::newest_journal_time`), set
+    /// when [`Production::resume`] or [`Production::rollback`] opens the
+    /// transaction. Every `dev:ino` the transaction journaled is held to
+    /// it when a reboot has renumbered the device since; `None` keeps the
+    /// exact rule.
+    journal_epoch: Cell<Option<SystemTime>>,
     /// Update-engine convergence (see the module docs).
     on_converge: &'a dyn Fn() -> Result<()>,
 }
@@ -200,7 +208,12 @@ impl<'a> Production<'a> {
             private_directory_matches: Box::new(
                 |path: &Path, identity: Option<&str>, mode: Option<&str>| {
                     matched(
-                        delete::private_directory_matches(path, identity, mode),
+                        delete::private_directory_matches(
+                            path,
+                            identity,
+                            mode,
+                            self.journal_epoch.get(),
+                        ),
                         "private directory does not match",
                     )
                 },
@@ -208,7 +221,12 @@ impl<'a> Production<'a> {
             private_empty_directory_matches: Box::new(
                 |path: &Path, identity: Option<&str>, mode: Option<&str>| {
                     matched(
-                        delete::private_empty_directory_matches(path, identity, mode),
+                        delete::private_empty_directory_matches(
+                            path,
+                            identity,
+                            mode,
+                            self.journal_epoch.get(),
+                        ),
                         "private directory is not empty",
                     )
                 },
@@ -230,6 +248,7 @@ impl<'a> Production<'a> {
             shdeps_update_policy: ctx.shdeps_update_policy,
             cwd: ctx.cwd,
             git_identity: RefCell::new((String::from("-"), String::from("-"))),
+            journal_epoch: Cell::new(None),
             on_converge,
         }
     }
@@ -422,6 +441,17 @@ impl<'a> Production<'a> {
         record::write_record(record, phase, &fields, &mut cache)
     }
 
+    /// Open `transaction`'s journals for this run: record when they were
+    /// last written as the bound for every identity they hold (see
+    /// `journal_epoch`) and return it. Call before anything rewrites a
+    /// journal: a rewrite would move the bound past an object recreated
+    /// since the crash.
+    fn open_journals(&self, transaction: &Path) -> Option<SystemTime> {
+        self.journal_epoch
+            .set(persisted_identity::newest_journal_time(transaction));
+        self.journal_epoch.get()
+    }
+
     /// Seed the staged-identity cell from a freshly read journal:
     /// later `_dot_init_set_git_identity` refreshes overwrite it,
     /// exactly like the shell's globals.
@@ -441,6 +471,8 @@ impl<'a> Production<'a> {
         journal: &TransactionRecord,
     ) -> Result<()> {
         self.seed_identity(journal);
+        // Before any step rewrites a journal (see `open_journals`).
+        let journaled = self.open_journals(transaction);
         let backup = Path::new(&journal.backup);
         let git_dir = Path::new(&journal.git_dir);
         let origin = Path::new(&journal.origin);
@@ -450,7 +482,7 @@ impl<'a> Production<'a> {
                 "cannot provision private directory",
             )
         };
-        let path_identity = |path: &Path| temp::path_identity(path).map(temp::identity_string);
+        let path_identity = |path: &Path| persisted_identity::LiveIdentity::of(path);
         let repo_identity = |origin: &str| {
             identity::repo_identity(origin).ok_or(Error::Usage {
                 message: "unsupported repository URL",
@@ -464,7 +496,7 @@ impl<'a> Production<'a> {
                              mode: &str,
                              size: &str,
                              value: &str| {
-            candidate::path_state_matches(target, kind, dev, ino, mode, size, value)
+            candidate::path_state_matches(target, kind, dev, ino, mode, size, value, journaled)
         };
         let move_conflicts = |manifest: &Path, backup: &Path| {
             let mut cache = temp::MoveCache::default();
@@ -604,14 +636,19 @@ impl<'a> Production<'a> {
             })
         };
         let private_directory_matches = |path: &Path, identity: &str, mode: &str| {
-            delete::private_directory_matches(path, non_empty(identity), non_empty(mode))
+            delete::private_directory_matches(path, non_empty(identity), non_empty(mode), journaled)
         };
         let stage_only_next = |stage: &Path| entry::entry_stage_only_next(stage);
         let stage_claim_matches = |stage: &Path, kind: &str, path: &str| {
             entry::stage_claim_matches(stage, kind, path, &journal.nonce, self.source_root)
         };
         let private_empty_directory_matches = |path: &Path, identity: &str, mode: &str| {
-            delete::private_empty_directory_matches(path, non_empty(identity), non_empty(mode))
+            delete::private_empty_directory_matches(
+                path,
+                non_empty(identity),
+                non_empty(mode),
+                journaled,
+            )
         };
         let stage_claim_remove = |stage: &Path, kind: &str, path: &str| {
             entry::stage_claim_remove(stage, kind, path, &journal.nonce, self.source_root)
@@ -625,6 +662,7 @@ impl<'a> Production<'a> {
             stage_claim_matches: &stage_claim_matches,
             private_empty_directory_matches: &private_empty_directory_matches,
             stage_claim_remove: &stage_claim_remove,
+            journaled,
         };
         let hooks = publish::PublishHooks {
             prior_record: &prior_record,
@@ -666,6 +704,7 @@ impl<'a> Production<'a> {
             git_dir,
             git_dev: &journal.git_dev,
             git_ino: &journal.git_ino,
+            journaled: journal.journaled,
             nonce: &journal.nonce,
             identity: &journal.identity,
             branch: &journal.branch,
@@ -775,6 +814,7 @@ impl<'a> Production<'a> {
             claim_remove: &claim_remove,
             write_line: &write_line,
             candidate_matches: &candidate_matches,
+            journaled: self.journal_epoch.get(),
         };
         let mut moves = temp::MoveCache::default();
         entry::publish_one(&inputs, &mut moves)
@@ -854,6 +894,8 @@ impl<'a> Production<'a> {
         let transaction = transaction::transaction_dir(self.home_text, self.xdg_state_home)
             .map(PathBuf::from)
             .map_err(|_| silent_refusal("resolve transaction directory"))?;
+        // Before rollback moves anything (see `open_journals`).
+        let journaled = self.open_journals(&transaction);
         let (ctx, branch, repo_identity) =
             self.read_ctx(&transaction.join("record"))
                 .map_err(|_| Error::Usage {
@@ -866,7 +908,7 @@ impl<'a> Production<'a> {
                              mode: &str,
                              size: &str,
                              value: &str| {
-            candidate::path_state_matches(target, kind, dev, ino, mode, size, value)
+            candidate::path_state_matches(target, kind, dev, ino, mode, size, value, journaled)
         };
         let entry_intent = |intent: &Path, mode: &str, oid: &str, path: &Path| {
             let path = path_text(path)?;
@@ -895,7 +937,9 @@ impl<'a> Production<'a> {
                                   mode: &str,
                                   oid: &str| {
             let verifier = |park: &Path| {
-                delete::leaf_delete_matches(park, identity, git_dir, commit, mode, oid, &self.home)
+                delete::leaf_delete_matches(
+                    park, identity, git_dir, commit, mode, oid, &self.home, journaled,
+                )
             };
             let mut cache = temp::MoveCache::default();
             matched(
@@ -905,7 +949,7 @@ impl<'a> Production<'a> {
         };
         let entry_stage_valid = |stage: &Path, expected: Option<&str>| {
             matched(
-                entry::entry_stage_valid(stage, expected),
+                entry::entry_stage_valid(stage, expected, journaled),
                 "entry stage is not valid",
             )
         };
@@ -923,11 +967,8 @@ impl<'a> Production<'a> {
             )
         };
         let discard_staged_next = |stage: &Path| entry::discard_staged_next(stage);
-        let path_identity = |path: &Path| {
-            temp::path_identity(path)
-                .ok()
-                .map(temp::identity_string)
-                .unwrap_or_default()
+        let identity_matches = |path: &Path, recorded: &str| {
+            persisted_identity::path_matches(path, recorded, journaled)
         };
         let candidate_matches_git =
             |git_dir: &Path, commit: &str, mode: &str, oid: &str, relative: &str| {
@@ -958,7 +999,8 @@ impl<'a> Production<'a> {
             )
         };
         let remove_parked_parent = |target: &Path, park: &Path, identity: &str, mode: &str| {
-            let verifier = |park: &Path| delete::parent_delete_matches(park, identity, mode);
+            let verifier =
+                |park: &Path| delete::parent_delete_matches(park, identity, mode, journaled);
             let mut cache = temp::MoveCache::default();
             matched(
                 delete::delete_parked_generation(target, park, "parent", &verifier, &mut cache),
@@ -968,7 +1010,7 @@ impl<'a> Production<'a> {
         let private_directory_matches =
             |stage: &Path, identity: Option<&str>, mode: Option<&str>| {
                 matched(
-                    delete::private_directory_matches(stage, identity, mode),
+                    delete::private_directory_matches(stage, identity, mode, journaled),
                     "private directory does not match",
                 )
             };
@@ -977,7 +1019,7 @@ impl<'a> Production<'a> {
         let private_empty_directory_matches =
             |stage: &Path, identity: Option<&str>, mode: Option<&str>| {
                 matched(
-                    delete::private_empty_directory_matches(stage, identity, mode),
+                    delete::private_empty_directory_matches(stage, identity, mode, journaled),
                     "private directory is not empty",
                 )
             };
@@ -990,6 +1032,7 @@ impl<'a> Production<'a> {
                     &ctx.commit,
                     &repo_identity,
                     &branch,
+                    journaled,
                 )
             };
             let mut cache = temp::MoveCache::default();
@@ -1017,7 +1060,7 @@ impl<'a> Production<'a> {
             stage_claim_matches: Box::new(stage_claim_matches),
             entry_stage_only_next: Box::new(entry_stage_only_next),
             discard_staged_next: Box::new(discard_staged_next),
-            path_identity: Box::new(path_identity),
+            identity_matches: Box::new(identity_matches),
             candidate_matches_git: Box::new(candidate_matches_git),
             stage_claim_remove: Box::new(stage_claim_remove),
             parent_record: Box::new(parent_record),
@@ -1275,8 +1318,7 @@ impl<'a> Production<'a> {
                 }
             } else {
                 let git_dir = PathBuf::from(&journal.git_dir);
-                let path_identity =
-                    |path: &Path| temp::path_identity(path).map(temp::identity_string);
+                let path_identity = |path: &Path| persisted_identity::LiveIdentity::of(path);
                 let generation_matches = |git_dir: &Path| {
                     generation::generation_marker_matches(
                         git_dir,
@@ -1294,6 +1336,7 @@ impl<'a> Production<'a> {
                     git_dir: &git_dir,
                     git_dev: &journal.git_dev,
                     git_ino: &journal.git_ino,
+                    journaled: journal.journaled,
                     nonce: &journal.nonce,
                     identity: &journal.identity,
                     branch: &journal.branch,
@@ -1761,6 +1804,7 @@ mod parent_hook_tests {
             nonce: "parent-test".into(),
             git_dev: "-".into(),
             git_ino: "-".into(),
+            journaled: None,
         }
     }
 
@@ -1846,6 +1890,60 @@ mod parent_hook_tests {
             ensure(production, record, transaction, b"a/b/file").expect("stable rerun");
             assert!(home.join("a").is_dir());
             assert!(home.join("a/b").is_dir());
+        });
+    }
+
+    /// Set the modification time of `transaction` and every journal in it.
+    fn stamp_journals(transaction: &Path, time: SystemTime) {
+        let mut paths = vec![transaction.to_path_buf()];
+        for entry in std::fs::read_dir(transaction).expect("journals") {
+            paths.push(entry.expect("journal").path());
+        }
+        for path in paths {
+            std::fs::File::open(&path)
+                .and_then(|file| file.set_modified(time))
+                .expect("stamp journal");
+        }
+    }
+
+    #[test]
+    fn production_parent_hooks_hold_renumbered_intents_to_the_opened_journals() {
+        // A resume after a reboot: the published parent's intent names its
+        // directory under the device number the mount had before.
+        with_parent_fixture(|production, record, home, transaction| {
+            ensure(production, record, transaction, b"a/file").expect("first publish");
+            let parent = home.join("a");
+            let Some(born) = persisted_identity::LiveIdentity::of(&parent)
+                .expect("stat parent")
+                .birth
+            else {
+                eprintln!("skipping: no birth time on this host");
+                return;
+            };
+            let intent_path = transaction.join(format!("parent-intent.{}", hash(b"a")));
+            let line = std::fs::read_to_string(&intent_path).expect("intent");
+            let mut fields: Vec<String> = line.trim_end().split('\t').map(str::to_owned).collect();
+            let dev: u64 = fields[3].parse().expect("recorded device");
+            fields[3] = (dev + 1).to_string();
+            intent(transaction, "a", &(fields.join("\t") + "\n"));
+            let second = std::time::Duration::from_secs(1);
+
+            // Journals that predate the directory name an earlier one, and
+            // the bound stays the one captured when they were opened even
+            // if they are rewritten later in the run.
+            stamp_journals(transaction, born - second);
+            assert_eq!(production.open_journals(transaction), Some(born - second));
+            stamp_journals(transaction, born + second);
+            assert!(matches!(
+                ensure(production, record, transaction, b"a/file"),
+                Err(Error::Usage {
+                    message: "private directory does not match"
+                })
+            ));
+
+            // Reopened, the same journals now postdate the directory.
+            assert_eq!(production.open_journals(transaction), Some(born + second));
+            ensure(production, record, transaction, b"a/file").expect("renumbered parent");
         });
     }
 

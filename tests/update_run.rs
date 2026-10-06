@@ -284,6 +284,98 @@ fn repository_commands_and_update_accept_an_in_progress_identity() {
     }
 }
 
+/// Rewrite the record's `git_dev=` line to the next device number, the way
+/// a reboot that renumbers the mount leaves it, keeping the record private.
+fn renumber_record(record: &Path) {
+    let text = std::fs::read_to_string(record).expect("identity record");
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("git_dev="))
+        .expect("recorded device");
+    let dev: u64 = line.parse().expect("numeric device");
+    let text = text.replace(
+        &format!("git_dev={dev}\n"),
+        &format!("git_dev={}\n", dev + 1),
+    );
+    std::fs::write(record, text).expect("rewrite identity record");
+    std::fs::set_permissions(record, std::fs::Permissions::from_mode(0o600))
+        .expect("private identity record");
+}
+
+/// Where this host reports the client Git directory's birth time. Without
+/// one the exact device rule still applies (Android, or a filesystem that
+/// stores none), so the renumbering cases have nothing to prove.
+fn git_dir_birth(home: &Path) -> Option<std::time::SystemTime> {
+    let birth = dot::persisted_identity::LiveIdentity::of(&home.join(".dotfiles"))
+        .expect("stat client git dir")
+        .birth;
+    if birth.is_none() {
+        eprintln!("skipping: no birth time on this host");
+    }
+    birth
+}
+
+#[test]
+fn a_reboot_that_renumbers_the_device_keeps_every_identity_record() {
+    // A Mac after a reboot: APFS renumbered the volume, the
+    // client Git directory kept its inode, and every command refused.
+    for phase in ["complete", "converging"] {
+        let scratch = Scratch::new("client-selector-renumbered").expect("scratch dir");
+        let (overlay_origin, base_origin) = shared_remotes(&scratch);
+        let (home, state) = twin_client(&scratch, "renumbered", &overlay_origin, &base_origin);
+        if git_dir_birth(&home).is_none() {
+            return;
+        }
+        let completed = state.join("dot/init/completed");
+        let record = if phase == "complete" {
+            completed
+        } else {
+            let transaction = state.join("dot/init/transaction/record");
+            let parent = transaction.parent().expect("transaction parent");
+            std::fs::create_dir_all(parent).expect("transaction directory");
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .expect("private transaction directory");
+            let text = std::fs::read_to_string(&completed)
+                .expect("completion record")
+                .replace("phase=complete\n", "phase=converging\n");
+            std::fs::write(&transaction, text).expect("transaction record");
+            std::fs::remove_file(&completed).expect("remove completion record");
+            transaction
+        };
+        renumber_record(&record);
+        let output = dot(&["status"], &home, &state);
+        assert!(
+            output.status.success(),
+            "dot status refused a renumbered {phase} identity: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn a_git_dir_recreated_after_its_record_is_still_refused_when_renumbered() {
+    let scratch = Scratch::new("client-selector-recreated").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "recreated", &overlay_origin, &base_origin);
+    let Some(birth) = git_dir_birth(&home) else {
+        return;
+    };
+    let completed = state.join("dot/init/completed");
+    renumber_record(&completed);
+    // The record was written before this Git directory was born: it names
+    // an earlier directory that reused the same inode number.
+    std::fs::File::open(&completed)
+        .and_then(|file| file.set_modified(birth - std::time::Duration::from_secs(1)))
+        .expect("backdate completion record");
+    let output = dot(&["status"], &home, &state);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("was replaced or recreated since dot init"),
+        "{stderr}"
+    );
+}
+
 /// Run the native binary with the same controlled client.
 fn dot(argv: &[&str], home: &Path, state: &Path) -> std::process::Output {
     dot_env(argv, home, state, &[])

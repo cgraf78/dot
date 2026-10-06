@@ -36,6 +36,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::errors::{Error, Result};
+use crate::persisted_identity;
 use crate::repos_base;
 use crate::reserved;
 use crate::temp;
@@ -1623,7 +1624,8 @@ impl ReplaceIdentityKind {
 
 /// One validated replacement record: the seven
 /// `OVERLAY_REPLACE_*` values `_overlay_replacement_read`
-/// publishes as globals, as one owned value.
+/// publishes as globals, plus when the record was written, as one
+/// owned value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplaceRecord {
     /// Guarded destination path.
@@ -1640,6 +1642,11 @@ pub struct ReplaceRecord {
     pub transaction: String,
     /// `dev:ino` of the physical parent at publish time.
     pub parent_identity: String,
+    /// When the record file was written, as [`replacement_read`] found it:
+    /// recovery runs in a later process, possibly after a reboot that
+    /// renumbered the device under `expected` and `parent_identity`, and
+    /// this bounds such a renumbering (see [`crate::persisted_identity`]).
+    pub journaled: Option<std::time::SystemTime>,
 }
 
 /// `_overlay_replacement_record_path`: the record name for
@@ -1790,27 +1797,63 @@ pub fn replacement_legacy_record_path_matches(
 /// `_overlay_replacement_generation_matches`: the live generation
 /// at `path` still equals `expected` under `identity_kind`. A
 /// failed fingerprint fails (the shell `|| return 1`), unlike the
-/// quarantine halves' empty-compare shape.
+/// quarantine halves' empty-compare shape. `journaled` is when the
+/// record carrying `expected` was written; a device renumbered since
+/// then still matches an older object (see
+/// [`crate::persisted_identity`]).
 pub fn replacement_generation_matches(
     path: &Path,
     expected: &str,
     identity_kind: &str,
     source_root: &Path,
+    journaled: Option<std::time::SystemTime>,
 ) -> bool {
     match identity_kind {
-        "content" => {
-            replacement_identity(source_root, path).is_ok_and(|observed| observed == expected)
-        }
+        "content" => replacement_identity(source_root, path)
+            .is_ok_and(|observed| fingerprint_matches(path, &observed, expected, journaled)),
         // Plain `stat` never takes `-L` in this domain: like the
         // content fingerprint's halves, the legacy pair is the
         // leaf's own device and inode, so a link answers itself —
         // never its target. (`temp::path_identity` follows and
         // does not apply here.)
-        "legacy" => live_generation(path)
-            .map(|(identity, _)| identity)
-            .is_ok_and(|observed| observed == expected),
+        "legacy" => persisted_identity::LiveIdentity::of_leaf(path)
+            .is_ok_and(|live| persisted_identity::matches(expected, &live, journaled)),
         _ => false,
     }
+}
+
+/// Whether the live content fingerprint `observed` (`dev:ino:rest`) of
+/// `path` is the journaled `expected` one: equal outright, or equal past
+/// the device and inode while those still name the same object under a
+/// renumbered device.
+fn fingerprint_matches(
+    path: &Path,
+    observed: &str,
+    expected: &str,
+    journaled: Option<std::time::SystemTime>,
+) -> bool {
+    if observed == expected {
+        return true;
+    }
+    let split = |fingerprint: &str| {
+        let (dev, rest) = fingerprint.split_once(':')?;
+        let (ino, tail) = rest.split_once(':')?;
+        Some((format!("{dev}:{ino}"), tail.to_string()))
+    };
+    let (Some((observed_identity, observed_tail)), Some((expected_identity, expected_tail))) =
+        (split(observed), split(expected))
+    else {
+        return false;
+    };
+    if observed_tail != expected_tail {
+        return false;
+    }
+    // The birth time must come from the object that was fingerprinted: a
+    // second leaf stat that lands on another object fails here.
+    persisted_identity::LiveIdentity::of_leaf(path).is_ok_and(|live| {
+        temp::identity_string((live.dev, live.ino)) == observed_identity
+            && persisted_identity::matches(&expected_identity, &live, journaled)
+    })
 }
 
 /// `_overlay_replacement_transaction_safe`: a private directory
@@ -1875,6 +1918,9 @@ pub fn replacement_read(
     if !private_regular_file(record, euid) {
         return None;
     }
+    // Before the read: a record rewritten in between only makes the bound
+    // older, which is stricter.
+    let journaled = persisted_identity::journal_time(record);
     let content = std::fs::read(record).ok()?;
     // `line=$(<"$record")`: every trailing newline stripped, any
     // other newline rejected.
@@ -1943,6 +1989,7 @@ pub fn replacement_read(
         identity_kind,
         transaction: transaction.to_string(),
         parent_identity: parent_identity.to_string(),
+        journaled,
     })
 }
 
@@ -2150,20 +2197,25 @@ pub fn recover_replacement(
         None => return false,
     };
     // The shell `stat` has no `-P`: the recorded parent identity
-    // is compared following, and a vanished parent reads empty
-    // (which never equals the shaped expectation).
-    if temp::path_identity(&physical_parent)
-        .map(temp::identity_string)
-        .unwrap_or_default()
-        != fields.parent_identity
-    {
+    // is compared following, and a vanished parent never matches.
+    if !persisted_identity::path_matches(
+        &physical_parent,
+        &fields.parent_identity,
+        fields.journaled,
+    ) {
         return false;
     }
     // Lexical freshness: the destination still resolves at the
     // recorded physical leaf under the recorded parent.
     let mut lexical_parent_current = false;
     if let Ok(leaf) = reserved::physical_leaf_candidate(&fields.destination, pwd) {
-        if leaf.path == fields.physical && leaf.parent_identity == fields.parent_identity {
+        if leaf.path == fields.physical
+            && persisted_identity::path_matches(
+                Path::new(&leaf.physical_parent),
+                &fields.parent_identity,
+                fields.journaled,
+            )
+        {
             lexical_parent_current = true;
         }
     }
@@ -2173,6 +2225,7 @@ pub fn recover_replacement(
             &fields.expected,
             fields.identity_kind.as_str(),
             source_root,
+            fields.journaled,
         ) {
             return false;
         }
@@ -2196,6 +2249,7 @@ pub fn recover_replacement(
             &fields.expected,
             fields.identity_kind.as_str(),
             source_root,
+            fields.journaled,
         ) {
             return false;
         }
@@ -2252,6 +2306,7 @@ pub fn recover_replacement(
         &fields.expected,
         fields.identity_kind.as_str(),
         source_root,
+        fields.journaled,
     ) || std::fs::symlink_metadata(&physical).is_ok_and(|meta| meta.file_type().is_symlink())
         && readlink_stripped(&physical).is_some_and(|link| link == fields.target.as_bytes())
     {

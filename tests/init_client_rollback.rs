@@ -1286,7 +1286,9 @@ fn native_deps<'a>(home: &'a Path, xdg: &'a Path, rec: &'a Rec) -> rb::RollbackD
         }),
         remove_parked_leaf: Box::new(move |target, park, identity, git_dir, commit, mode, oid| {
             let verifier = |candidate: &Path| {
-                delete::leaf_delete_matches(candidate, identity, git_dir, commit, mode, oid, home)
+                delete::leaf_delete_matches(
+                    candidate, identity, git_dir, commit, mode, oid, home, None,
+                )
             };
             let mut cache = temp::MoveCache::default();
             matched(
@@ -1296,7 +1298,7 @@ fn native_deps<'a>(home: &'a Path, xdg: &'a Path, rec: &'a Rec) -> rb::RollbackD
         }),
         entry_stage_valid: Box::new(move |stage, expected| {
             matched(
-                entry::entry_stage_valid(stage, expected),
+                entry::entry_stage_valid(stage, expected, None),
                 "entry stage is not valid",
             )
         }),
@@ -1316,11 +1318,8 @@ fn native_deps<'a>(home: &'a Path, xdg: &'a Path, rec: &'a Rec) -> rb::RollbackD
             )
         }),
         discard_staged_next: Box::new(entry::discard_staged_next),
-        path_identity: Box::new(|path| {
-            temp::path_identity(path)
-                .ok()
-                .map(temp::identity_string)
-                .unwrap_or_default()
+        identity_matches: Box::new(|path, recorded| {
+            dot::persisted_identity::path_matches(path, recorded, None)
         }),
         candidate_matches_git: Box::new(move |git_dir, commit, mode, oid, relative| {
             matched(
@@ -1354,7 +1353,7 @@ fn native_deps<'a>(home: &'a Path, xdg: &'a Path, rec: &'a Rec) -> rb::RollbackD
         }),
         remove_parked_parent: Box::new(move |target, park, identity, mode| {
             let verifier =
-                |candidate: &Path| delete::parent_delete_matches(candidate, identity, mode);
+                |candidate: &Path| delete::parent_delete_matches(candidate, identity, mode, None);
             let mut cache = temp::MoveCache::default();
             matched(
                 delete::delete_parked_generation(target, park, "parent", &verifier, &mut cache),
@@ -1363,7 +1362,7 @@ fn native_deps<'a>(home: &'a Path, xdg: &'a Path, rec: &'a Rec) -> rb::RollbackD
         }),
         private_directory_matches: Box::new(move |stage, identity, mode| {
             matched(
-                delete::private_directory_matches(stage, identity, mode),
+                delete::private_directory_matches(stage, identity, mode, None),
                 "private directory does not match",
             )
         }),
@@ -1372,7 +1371,7 @@ fn native_deps<'a>(home: &'a Path, xdg: &'a Path, rec: &'a Rec) -> rb::RollbackD
         }),
         private_empty_directory_matches: Box::new(move |stage, identity, mode| {
             matched(
-                delete::private_empty_directory_matches(stage, identity, mode),
+                delete::private_empty_directory_matches(stage, identity, mode, None),
                 "private directory is not empty",
             )
         }),
@@ -1385,6 +1384,7 @@ fn native_deps<'a>(home: &'a Path, xdg: &'a Path, rec: &'a Rec) -> rb::RollbackD
                     &rec.commit,
                     &rec.identity,
                     &rec.branch,
+                    None,
                 )
             };
             let mut cache = temp::MoveCache::default();
@@ -1419,7 +1419,7 @@ fn native_deps<'a>(home: &'a Path, xdg: &'a Path, rec: &'a Rec) -> rb::RollbackD
                                  mode: &str,
                                  size: &str,
                                  value: &str| {
-                candidate::path_state_matches(target, kind, dev, ino, mode, size, value)
+                candidate::path_state_matches(target, kind, dev, ino, mode, size, value, None)
             };
             let mut cache = temp::MoveCache::default();
             plan::restore_backups(backup, home, &state_matches, &mut cache).map_err(|_| {
@@ -2396,9 +2396,9 @@ fn stub_deps<'a>(log: &'a Log, behavior: &'a Behavior) -> rb::RollbackDeps<'a> {
                 Err(stub_error())
             }
         }),
-        path_identity: Box::new(|path| {
+        identity_matches: Box::new(|path, recorded| {
             log.push(format!("path_identity {}", path.display()));
-            behavior.identity.clone()
+            behavior.identity == recorded
         }),
         candidate_matches_git: Box::new(|git_dir, commit, mode, oid, rel| {
             log.push(format!(

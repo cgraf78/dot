@@ -81,6 +81,14 @@ fn remove_claim(stage: &Path, kind: &str, path: &str) -> dot::Result<()> {
 }
 
 fn with_stage_hooks<T>(run: impl FnOnce(&publish::StageHooks<'_>) -> T) -> T {
+    with_journaled_stage_hooks(None, run)
+}
+
+/// [`with_stage_hooks`] for intents journaled at `journaled`.
+fn with_journaled_stage_hooks<T>(
+    journaled: Option<std::time::SystemTime>,
+    run: impl FnOnce(&publish::StageHooks<'_>) -> T,
+) -> T {
     let a = |path: &Path, expected: &str, mode: &str| private_dir(path, expected, mode);
     let b = |stage: &Path| only_next(stage);
     let c = |stage: &Path, kind: &str, path: &str| claim_matches(stage, kind, path);
@@ -92,6 +100,7 @@ fn with_stage_hooks<T>(run: impl FnOnce(&publish::StageHooks<'_>) -> T) -> T {
         stage_claim_matches: &c,
         private_empty_directory_matches: &d,
         stage_claim_remove: &e,
+        journaled,
     })
 }
 
@@ -251,6 +260,88 @@ fn intent_matches_prepared_states() {
             .is_ok()
         )
     });
+}
+
+/// `published_intent_matches` for a prepared intent whose stage was
+/// consumed and whose `next` identity is `target`'s journaled before a
+/// reboot renumbered the mount, read back against `journaled`.
+fn renumbered_intent_matches(
+    home: &Path,
+    target: &Path,
+    journaled: Option<std::time::SystemTime>,
+) -> bool {
+    let (dev, ino) = identity(target)
+        .split_once(':')
+        .map(|(dev, ino)| (dev.parse::<u64>().expect("device"), ino.to_string()))
+        .expect("identity");
+    let record = intent(
+        "prepared",
+        &home.join("consumed"),
+        "1:2",
+        &format!("{}:{ino}", dev + 1),
+        home,
+    );
+    let read = |_: &Path, _: &str, _: &str, _: &str| {
+        Ok(publish::IntentRecord {
+            phase: record.phase.clone(),
+            stage: record.stage.clone(),
+            dev: record.dev.clone(),
+            ino: record.ino.clone(),
+            next_dev: record.next_dev.clone(),
+            next_ino: record.next_ino.clone(),
+        })
+    };
+    with_journaled_stage_hooks(journaled, |hooks| {
+        publish::published_intent_matches(
+            &home.join("intent"),
+            "100644",
+            "oid",
+            "a/b",
+            home,
+            &read,
+            hooks,
+        )
+        .is_ok()
+    })
+}
+
+#[test]
+fn intent_matches_survive_a_renumbered_device() {
+    let dir = TempDir::new("publish-intent-renumbered").expect("temp");
+    let target = write(dir.path(), "a/b", b"published");
+    let Some(born) = dot::persisted_identity::LiveIdentity::of(&target)
+        .expect("stat")
+        .birth
+    else {
+        eprintln!("skipping: no birth time on this host");
+        return;
+    };
+    let second = std::time::Duration::from_secs(1);
+    assert!(renumbered_intent_matches(
+        dir.path(),
+        &target,
+        Some(born + second)
+    ));
+}
+
+#[test]
+fn intent_matches_refuse_a_renumbered_file_born_after_its_intent() {
+    let dir = TempDir::new("publish-intent-born-after").expect("temp");
+    let target = write(dir.path(), "a/b", b"published");
+    let Some(born) = dot::persisted_identity::LiveIdentity::of(&target)
+        .expect("stat")
+        .birth
+    else {
+        eprintln!("skipping: no birth time on this host");
+        return;
+    };
+    let second = std::time::Duration::from_secs(1);
+    assert!(!renumbered_intent_matches(
+        dir.path(),
+        &target,
+        born.checked_sub(second)
+    ));
+    assert!(!renumbered_intent_matches(dir.path(), &target, None));
 }
 
 #[test]
@@ -482,6 +573,7 @@ fn run_publish(
             stage_claim_matches: &c,
             private_empty_directory_matches: &d,
             stage_claim_remove: &e,
+            journaled: None,
         },
     };
     let binding = publish::PublishGit {

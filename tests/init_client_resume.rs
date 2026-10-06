@@ -4,9 +4,11 @@ use std::cell::RefCell;
 use std::os::unix::fs::{MetadataExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{Duration, SystemTime};
 
 use dot::errors::{Error, Result};
 use dot::init_client_resume as resume;
+use dot::persisted_identity::LiveIdentity;
 use dot_test_support::TempDir;
 
 fn git(cwd: &Path, args: &[&str]) -> String {
@@ -39,6 +41,8 @@ struct Repo {
     identity: String,
     dev: String,
     ino: String,
+    /// When the record naming `dev:ino` was written: after the clone.
+    journaled: Option<SystemTime>,
 }
 impl Repo {
     fn new(tag: &str, ordinary: bool) -> Self {
@@ -92,6 +96,7 @@ impl Repo {
             identity,
             dev: meta.dev().to_string(),
             ino: meta.ino().to_string(),
+            journaled: Some(SystemTime::now()),
         }
     }
     fn inputs<'a>(&'a self, nonce: &'a str) -> resume::LiveGitInputs<'a> {
@@ -99,6 +104,7 @@ impl Repo {
             git_dir: &self.git,
             git_dev: &self.dev,
             git_ino: &self.ino,
+            journaled: self.journaled,
             nonce,
             identity: &self.identity,
             branch: "main",
@@ -123,7 +129,7 @@ fn matches(repo: &Repo, nonce: &str, generation: bool) -> bool {
         );
         std::fs::write(repo.git.join("dot-init-generation-v1"), marker).unwrap();
     }
-    let path = |p: &Path| dot::temp::path_identity(p).map(|(d, i)| format!("{d}:{i}"));
+    let path = |p: &Path| LiveIdentity::of(p);
     let marker = |path: &Path| {
         dot::init_client_generation::generation_marker_matches(path, nonce, &commit, &repo.identity)
     };
@@ -210,7 +216,7 @@ fn pred_wrong_identity() {
 #[test]
 fn pred_wrong_branch() {
     let r = Repo::new("branch", false);
-    let path = |p: &Path| dot::temp::path_identity(p).map(|(d, i)| format!("{d}:{i}"));
+    let path = |p: &Path| LiveIdentity::of(p);
     let marker = |_: &Path| true;
     let identity = |u: &str| {
         dot::init_client_identity::repo_identity(u).ok_or(Error::Usage {
@@ -356,7 +362,7 @@ fn run(
     setup(&tx, &backup);
     let events = RefCell::new(Vec::new());
     let note = |s: &str| events.borrow_mut().push(s.into());
-    let path = |p: &Path| dot::temp::path_identity(p).map(|(d, i)| format!("{d}:{i}"));
+    let path = |p: &Path| LiveIdentity::of(p);
     let live_commit = git(
         &repo.home,
         &["--git-dir", repo.git.to_str().unwrap(), "rev-parse", "HEAD"],
@@ -804,7 +810,7 @@ fn separate_probe_verdict(repo: &Repo) -> bool {
 /// [`matches`] for an adopted client, without the generation marker (and so
 /// without a Git call of its own: a broken config must not panic here).
 fn matches_adopted(repo: &Repo) -> bool {
-    let path = |p: &Path| dot::temp::path_identity(p).map(|(d, i)| format!("{d}:{i}"));
+    let path = |p: &Path| LiveIdentity::of(p);
     let marker = |_: &Path| true;
     let identity = |u: &str| {
         dot::init_client_identity::repo_identity(u).ok_or(Error::Usage {
@@ -819,6 +825,149 @@ fn matches_adopted(repo: &Repo) -> bool {
             repo_identity: &identity,
         },
     )
+}
+
+/// Why [`matches_adopted`] refuses (`None` when it does not).
+fn mismatch_adopted(repo: &Repo) -> Option<resume::IdentityMismatch> {
+    let path = |p: &Path| LiveIdentity::of(p);
+    let marker = |_: &Path| true;
+    let identity = |u: &str| {
+        dot::init_client_identity::repo_identity(u).ok_or(Error::Usage {
+            message: "identity",
+        })
+    };
+    resume::live_git_mismatch(
+        &repo.inputs("adopted"),
+        &resume::LiveGitDeps {
+            path_identity: &path,
+            generation_matches: &marker,
+            repo_identity: &identity,
+        },
+    )
+}
+
+/// The Git directory's birth time, or `None` (after saying so) where this
+/// host reports none: there the exact device rule still applies and the
+/// renumbering cases have nothing to prove.
+fn git_birth(repo: &Repo) -> Option<SystemTime> {
+    let birth = LiveIdentity::of(&repo.git).expect("stat git dir").birth;
+    if birth.is_none() {
+        eprintln!("skipping: no birth time on this host");
+    }
+    birth
+}
+
+/// Stand in for a reboot that renumbered the mount: the record keeps the
+/// device number the filesystem had when `dot init` journaled it.
+fn renumber(repo: &mut Repo) {
+    let dev: u64 = repo.dev.parse().unwrap();
+    repo.dev = (dev + 1).to_string();
+}
+
+/// Swap the Git directory for a fresh object holding the same repository:
+/// park the original and put `make(parked, live)` in its place.
+fn replace_git(repo: &Repo, make: impl FnOnce(&Path, &Path)) {
+    let parked = repo.git.with_extension("parked");
+    std::fs::rename(&repo.git, &parked).unwrap();
+    make(&parked, &repo.git);
+}
+
+#[test]
+fn pred_device_renumbered_by_a_reboot_still_matches() {
+    let mut r = Repo::new("renumbered", false);
+    if git_birth(&r).is_none() {
+        return;
+    }
+    renumber(&mut r);
+    assert_eq!(mismatch_adopted(&r), None);
+}
+
+#[test]
+fn pred_device_renumbered_needs_a_journal_time() {
+    let mut r = Repo::new("renumbered-unjournaled", false);
+    renumber(&mut r);
+    r.journaled = None;
+    assert_eq!(
+        mismatch_adopted(&r),
+        Some(resume::IdentityMismatch::Replaced)
+    );
+}
+
+#[test]
+fn pred_recreated_after_the_record_is_refused_even_on_its_old_inode() {
+    // A directory recreated after the record was written, reusing the
+    // recorded inode number on a renumbered device: only its birth time
+    // gives it away. Recreate it for real, then record its new inode (as
+    // inode reuse would) and a journal time just before its birth.
+    let mut r = Repo::new("recreated", false);
+    if git_birth(&r).is_none() {
+        return;
+    }
+    let origin = r.origin.clone();
+    replace_git(&r, |_, live| {
+        let url = format!("file://{}", origin.display());
+        git(
+            live.parent().unwrap(),
+            &["clone", "--quiet", "--bare", &url, live.to_str().unwrap()],
+        );
+    });
+    let live = LiveIdentity::of(&r.git).unwrap();
+    r.ino = live.ino.to_string();
+    r.dev = live.dev.to_string();
+    renumber(&mut r);
+    r.journaled = live.birth.unwrap().checked_sub(Duration::from_secs(1));
+    assert_eq!(
+        mismatch_adopted(&r),
+        Some(resume::IdentityMismatch::Replaced)
+    );
+    // The same directory journaled after its birth is the renumbered case.
+    r.journaled = Some(SystemTime::now());
+    assert_eq!(mismatch_adopted(&r), None);
+}
+
+#[test]
+fn pred_recreated_on_a_new_inode_is_refused() {
+    let r = Repo::new("recreated-new-inode", false);
+    let origin = r.origin.clone();
+    replace_git(&r, |_, live| {
+        let url = format!("file://{}", origin.display());
+        git(
+            live.parent().unwrap(),
+            &["clone", "--quiet", "--bare", &url, live.to_str().unwrap()],
+        );
+    });
+    // The parked original still holds its inode, so the clone cannot.
+    assert_eq!(
+        mismatch_adopted(&r),
+        Some(resume::IdentityMismatch::Replaced)
+    );
+}
+
+#[test]
+fn pred_copied_or_restored_git_dir_is_refused() {
+    // A copy (or a restore, which is a copy from a backup) is a new
+    // object with a new inode, even when the copy preserves times.
+    for renumbered in [false, true] {
+        let mut r = Repo::new("copied", false);
+        replace_git(&r, |parked, live| {
+            let status = std::process::Command::new("cp")
+                .arg("-Rp")
+                .arg(parked)
+                .arg(live)
+                .status()
+                .expect("cp");
+            assert!(status.success());
+        });
+        if renumbered {
+            renumber(&mut r);
+        }
+        r.journaled = Some(SystemTime::now() + Duration::from_secs(3600));
+        assert_eq!(
+            mismatch_adopted(&r),
+            Some(resume::IdentityMismatch::Replaced),
+            "renumbered: {renumbered}"
+        );
+    }
 }
 
 /// Append raw lines to the client's own config (valueless keys and other
