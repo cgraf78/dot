@@ -809,3 +809,187 @@ fn a_later_overlay_takes_over_a_path_without_the_earlier_one_changing() {
         Some(PathBuf::from(".dotfiles-ov/home/shared.conf"))
     );
 }
+
+/// The record of directories the link phase created, beside the manifest.
+fn dirs_record(f: &Fixture) -> PathBuf {
+    PathBuf::from(format!("{}.dirs", f.manifest.display()))
+}
+
+#[test]
+fn removed_link_takes_the_directories_dot_created_with_it() {
+    let f = Fixture::new(&[("app.conf", "app\n"), ("deep/er/x.conf", "x\n")]);
+    assert_eq!(f.run(Some("4"), false).0.rc, 0);
+    assert!(link_at(&f.home, "deep/er/x.conf").is_some());
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(dirs_record(&f))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    git(&f.overlay, &f.home, &["rm", "-q", "home/deep/er/x.conf"]);
+    let (result, out, err) = f.run(Some("4"), false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+    assert!(std::fs::symlink_metadata(f.home.join("deep")).is_err());
+    assert!(link_at(&f.home, "app.conf").is_some());
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains("changed  1 overlay current, 1 stale link removed"),
+        "{out}"
+    );
+    assert!(out.contains("changed  ov overlay unlinked 1"), "{out}");
+    assert!(!dirs_record(&f).exists(), "an empty record lingers");
+    // The next run has nothing left to remove.
+    let (result, out, _) = f.run(Some("4"), false);
+    assert_eq!(result.rc, 0);
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("ok       1 overlay current"), "{out}");
+}
+
+#[test]
+fn uncounted_removal_rows_name_the_pruned_directories() {
+    let f = Fixture::new(&[("deep/x.conf", "x\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    git(&f.overlay, &f.home, &["rm", "-q", "home/deep/x.conf"]);
+    let (result, out, err) = f.run(None, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("  removed: deep/x.conf\n"), "{out}");
+    assert!(out.contains("  removed empty directory: deep\n"), "{out}");
+    assert!(std::fs::symlink_metadata(f.home.join("deep")).is_err());
+}
+
+#[test]
+fn removed_link_keeps_directories_dot_did_not_create() {
+    let f = Fixture::new(&[("user/x.conf", "x\n"), ("user/sub/y.conf", "y\n")]);
+    std::fs::create_dir(f.home.join("user")).unwrap();
+    assert_eq!(f.run(None, false).0.rc, 0);
+    assert!(link_at(&f.home, "user/sub/y.conf").is_some());
+    git(&f.overlay, &f.home, &["rm", "-q", "-r", "home/user"]);
+    let (result, _, err) = f.run(None, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(std::fs::symlink_metadata(f.home.join("user/sub")).is_err());
+    assert!(f.home.join("user").is_dir(), "a user directory was removed");
+}
+
+#[test]
+fn removed_link_keeps_a_created_directory_that_holds_other_files() {
+    let f = Fixture::new(&[("d/a.conf", "a\n"), ("d/b.conf", "b\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    std::fs::write(f.home.join("d/mine"), "mine\n").unwrap();
+    git(&f.overlay, &f.home, &["rm", "-q", "-r", "home/d"]);
+    let (result, _, err) = f.run(None, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(std::fs::symlink_metadata(f.home.join("d/a.conf")).is_err());
+    assert_eq!(std::fs::read(f.home.join("d/mine")).unwrap(), b"mine\n");
+    // Once it empties, a later removal below it takes it after all.
+    std::fs::remove_file(f.home.join("d/mine")).unwrap();
+    stage(&f.overlay, "home/d/c.conf", b"c\n");
+    git(&f.overlay, &f.home, &["add", "home/d/c.conf"]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    assert!(link_at(&f.home, "d/c.conf").is_some());
+    git(&f.overlay, &f.home, &["rm", "-qf", "home/d/c.conf"]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    assert!(std::fs::symlink_metadata(f.home.join("d")).is_err());
+}
+
+#[test]
+fn removed_link_keeps_a_directory_recreated_since_dot_made_it() {
+    // The record pins the directory's identity: one the user removed and
+    // made again is theirs, even under the same name.
+    let f = Fixture::new(&[("d/a.conf", "a\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    let target = link_at(&f.home, "d/a.conf").unwrap();
+    let keep = f.root.join("keep");
+    std::fs::rename(f.home.join("d"), &keep).unwrap();
+    std::fs::create_dir(f.home.join("d")).unwrap();
+    std::os::unix::fs::symlink(&target, f.home.join("d/a.conf")).unwrap();
+    git(&f.overlay, &f.home, &["rm", "-q", "home/d/a.conf"]);
+    let (result, _, err) = f.run(None, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(std::fs::symlink_metadata(f.home.join("d/a.conf")).is_err());
+    assert!(
+        f.home.join("d").is_dir(),
+        "a recreated directory was removed"
+    );
+}
+
+#[test]
+fn malformed_directory_record_is_replaced_without_pruning() {
+    let f = Fixture::new(&[("d/a.conf", "a\n"), ("e/b.conf", "b\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    std::fs::write(dirs_record(&f), "not a record\n").unwrap();
+    git(&f.overlay, &f.home, &["rm", "-q", "home/d/a.conf"]);
+    let (result, _, err) = f.run(None, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(std::fs::symlink_metadata(f.home.join("d/a.conf")).is_err());
+    assert!(
+        f.home.join("d").is_dir(),
+        "an unrecorded directory was removed"
+    );
+    let record = std::fs::read_to_string(dirs_record(&f)).unwrap_or_default();
+    assert!(!record.contains("not a record"), "{record}");
+}
+
+#[test]
+fn unsafe_directory_record_is_not_trusted() {
+    // A record others could have written (group-writable here) proves
+    // nothing about who created a directory.
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new(&[("d/a.conf", "a\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    std::fs::set_permissions(dirs_record(&f), std::fs::Permissions::from_mode(0o660)).unwrap();
+    git(&f.overlay, &f.home, &["rm", "-q", "home/d/a.conf"]);
+    let (result, _, err) = f.run(None, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(std::fs::symlink_metadata(f.home.join("d/a.conf")).is_err());
+    assert!(
+        f.home.join("d").is_dir(),
+        "an untrusted record pruned a directory"
+    );
+}
+
+#[test]
+fn unwritable_directory_record_warns_without_failing_the_phase() {
+    let f = Fixture::new(&[("d/a.conf", "a\n")]);
+    std::fs::create_dir_all(dirs_record(&f)).unwrap();
+    let (result, _, err) = f.run(None, false);
+    assert_eq!(result.rc, 0);
+    assert!(link_at(&f.home, "d/a.conf").is_some());
+    let err = String::from_utf8(err).unwrap();
+    assert!(
+        err.contains("warning: could not record overlay link directories"),
+        "{err}"
+    );
+}
+
+#[test]
+fn deselected_overlay_reports_its_removed_links_in_one_note() {
+    let f = Fixture::new(&[("a.conf", "a\n"), ("b.conf", "b\n")]);
+    assert_eq!(f.run(Some("4"), false).0.rc, 0);
+    let (result, out, err) = f.run_entries(&[], Some("4"), false, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(result.removed, vec!["a.conf", "b.conf"]);
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("changed  2 stale links removed  "), "{out}");
+    assert!(out.contains("changed  ov overlay unlinked 2\n"), "{out}");
+    assert!(!out.contains("a.conf"), "{out}");
+}
+
+#[test]
+fn overlay_dropping_every_home_file_unlinks_them_despite_untracked_leftovers() {
+    let f = Fixture::new(&[("a.conf", "a\n"), ("b.conf", "b\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    git(&f.overlay, &f.home, &["rm", "-q", "-r", "home"]);
+    stage(&f.overlay, "home/.DS_Store", b"finder\n");
+    let (result, _, err) = f.run(None, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    for rel in ["a.conf", "b.conf", ".DS_Store"] {
+        assert!(
+            std::fs::symlink_metadata(f.home.join(rel)).is_err(),
+            "{rel}"
+        );
+    }
+}

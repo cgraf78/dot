@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 
 use crate::progress_ui::{Palette, arith_value};
 use crate::repos_base::Base;
+use crate::repos_link_dirs::CreatedDir;
 use crate::repos_overlays::AuthorityCache;
 
 /// Shared inputs for [`link_overlay`]: every value the shell reads
@@ -110,6 +111,9 @@ pub struct OverlayState {
     pub current: HashSet<String>,
     /// Live-line flag for [`crate::progress_ui::status`].
     pub live_active: bool,
+    /// Directories created for links since the caller last drained this,
+    /// for [`crate::repos_link_dirs::CreatedDirs::record`].
+    pub created_dirs: Vec<CreatedDir>,
 }
 
 impl OverlayState {
@@ -119,6 +123,7 @@ impl OverlayState {
         Self {
             current: HashSet::new(),
             live_active: false,
+            created_dirs: Vec::new(),
         }
     }
 }
@@ -372,11 +377,26 @@ fn link_one(
         .map(|parent| parent.to_string_lossy().into_owned())
         .unwrap_or_default();
     let parent_is_dir = std::fs::metadata(&dst_parent).is_ok_and(|meta| meta.is_dir());
-    if !parent_is_dir
-        && (crate::cleanup::received_signal().is_some()
-            || !crate::repos_overlays::ensure_destination_parent(inputs.home, &dst_parent))
-    {
-        return None;
+    if !parent_is_dir {
+        if crate::cleanup::received_signal().is_some() {
+            return None;
+        }
+        // Record what this creates even when a later step fails: stale
+        // cleanup may remove only directories the link phase made.
+        let mut created = Vec::new();
+        let made = crate::repos_overlays::ensure_destination_parent_recording(
+            inputs.home,
+            &dst_parent,
+            &mut created,
+        );
+        state.created_dirs.extend(
+            created
+                .iter()
+                .filter_map(|rel| CreatedDir::probe(inputs.home, rel)),
+        );
+        if !made {
+            return None;
+        }
     }
     let target = crate::repos_overlays::record_link_target(
         rel,

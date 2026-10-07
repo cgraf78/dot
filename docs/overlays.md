@@ -24,6 +24,13 @@ the checkout (bytecode caches, editor swap files, scratch notes) never are, so
 has no index and publishes every file under `home/`. A link to a file the
 overlay no longer provides is removed like any other stale link.
 
+Dot records each directory it creates under `$HOME` to hold a link, beside its
+private link manifest. Removing a stale link also removes those recorded
+parents once they are empty; a directory that existed before Dot linked into
+it is never removed, and one removed and recreated since is kept because Dot
+compares the directory's identity, not just its name. The Overlays stage
+reports removed links as a change (`N stale links removed`).
+
 Active overlays are synchronized in descriptor order. Their `home/` entries
 are inventoried before mutation, the complete prospective ownership manifest
 is published first, and later overlays win same-relative-path collisions:

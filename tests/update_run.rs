@@ -852,6 +852,36 @@ fn update_links_only_files_the_overlay_tracks() {
 }
 
 #[test]
+fn update_removes_a_retired_link_with_the_directories_it_created() {
+    // The overlay stops shipping a file whose parents only existed for its
+    // link: the update removes the link and those parents, and reports the
+    // removal as a change instead of `1 overlay current`.
+    let scratch = Scratch::new("update-run-retired-link").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "native", &overlay_origin, &base_origin);
+    push_overlay_files(&scratch, &[("home/opt/tool/deep/x.pyc", Some("x\n"))]);
+    check_update(&["update"], &home, &state);
+    assert!(home.join("opt/tool/deep/x.pyc").is_symlink());
+    std::fs::create_dir_all(home.join(".config")).expect("user dir");
+    push_overlay_files(&scratch, &[("home/opt/tool/deep/x.pyc", None)]);
+    let output = check_update(&["update"], &home, &state);
+    assert!(
+        std::fs::symlink_metadata(home.join("opt")).is_err(),
+        "the directories created for the link were left behind"
+    );
+    assert!(home.join(".config").is_dir());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 overlay current, 1 stale link removed"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("overlay-0 overlay unlinked 1"), "{stdout}");
+    let steady = check_update(&["update"], &home, &state);
+    let stdout = String::from_utf8_lossy(&steady.stdout);
+    assert!(!stdout.contains("stale link"), "{stdout}");
+}
+
+#[test]
 fn colliding_overlays_settle_on_the_later_one() {
     // `overlay-1` also ships `file-000.txt`; descriptor order makes it the
     // later overlay, so it owns the path and a second update is a no-op
