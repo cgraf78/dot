@@ -276,10 +276,10 @@ fn twin_client(
 /// stability comparisons between native runs. `.git` carries
 /// checkout identity, `.dotfiles` carries the base checkout,
 /// `.dot-backup` carries timestamped init-time safekeeping, and
-/// `.scm.sqlite` is SCM's async telemetry database (a lingering SCM
-/// helper may create it after Dot returns): none of them is converged
-/// content, so all four stay out of the comparison, exactly like the
-/// `tests/perf_update.rs` technique.
+/// `.scm.sqlite*` is SCM's async telemetry database with its SQLite
+/// sidecars (a lingering SCM helper may create them after Dot returns):
+/// none of them is converged content, so all stay out of the comparison,
+/// exactly like the `tests/perf_update.rs` technique.
 fn snapshot_tree(home: &Path) -> Vec<(String, Vec<u8>)> {
     let mut entries = Vec::new();
     let mut stack = vec![home.to_path_buf()];
@@ -294,7 +294,14 @@ fn snapshot_tree(home: &Path) -> Vec<(String, Vec<u8>)> {
             // filesystem kind they take (a worktree `.git` may be a file,
             // not a directory).
             let skip = path.file_name().is_some_and(|n| {
-                n == ".git" || n == ".dotfiles" || n == ".dot-backup" || n == ".scm.sqlite"
+                n == ".git"
+                    || n == ".dotfiles"
+                    || n == ".dot-backup"
+                    || n == ".scm.sqlite"
+                    // Same prefix rule as `tests/update_run.rs` and
+                    // `tests/perf_update.rs`: SQLite sidecars (`-journal`,
+                    // `-wal`, `-shm`, ...) are telemetry, not content.
+                    || n.to_string_lossy().starts_with(".scm.sqlite-")
             });
             if kind.is_dir() {
                 if !skip {
