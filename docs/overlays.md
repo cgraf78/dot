@@ -17,12 +17,27 @@ activated (lifecycle state `selected-unsupported`), and `dot update` holds the
 installed overlay set until a Dot that knows the key runs; see
 [Held overlay sets](configuration.md#held-overlay-sets).
 
+A Git-backed overlay publishes the files its index tracks under `home/`:
+committed and staged files are linked, while untracked and ignored files in
+the checkout (bytecode caches, editor swap files, scratch notes) never are, so
+`git add` a new file before `dot update` to try it. A filesystem-backed overlay
+has no index and publishes every file under `home/`. A link to a file the
+overlay no longer provides is removed like any other stale link.
+
+Dot records each directory it creates under `$HOME` to hold a link, beside its
+private link manifest. Removing a stale link also removes those recorded
+parents once they are empty; a directory that existed before Dot linked into
+it is never removed, and one removed and recreated since is kept because Dot
+compares the directory's identity, not just its name. The Overlays stage
+reports removed links as a change (`N stale links removed`).
+
 Active overlays are synchronized in descriptor order. Their `home/` entries
 are inventoried before mutation, the complete prospective ownership manifest
-is published first, and later overlays win same-relative-path collisions.
-Tracked base paths receive `skip-worktree` only while an exact managed symlink
-is live. Stale links are removed only when their literal target matches durable
-authority, and the base path is then restored.
+is published first, and later overlays win same-relative-path collisions:
+only the last overlay that ships a path links and records it, so a steady
+state relinks nothing. Tracked base paths receive `skip-worktree` only while
+an exact managed symlink is live. Stale links are removed only when their
+literal target matches durable authority, and the base path is then restored.
 
 Dependencies install after linking, so a tool can replace a path an overlay
 owns (for example, by relinking its own binary over an overlay launcher). After

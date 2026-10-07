@@ -85,10 +85,16 @@ The update fixtures cover a base-only client, three disjoint 20-file overlays,
 and a composed client with three selected overlays plus one profile-excluded
 overlay. The composed client exercises the provider pinned by the current
 candidate plus pre-sync and merge hooks, uses the managed-block merge API, and
-has an ordered collision whose last selected overlay wins. The current
-provider must retain the historical shell lock's ABI; the two lock revisions
-may differ. Running the same current provider through both clients checks that
-compatibility. A separate pre-sync refusal measures a representative failure
+has an ordered collision whose last selected overlay wins. The Bash baseline
+relinked that shared path from every overlay on every update and closed the
+Overlays stage with `3 overlays changed` plus one note per overlay; the native
+engine links it only from the winner and closes the same steady state with
+`3 overlays current`. The harness requires that exact Bash shape and rewrites
+it to the native row before comparing stdout; this is the only intentional
+stdout divergence, and the three extra relinks per Bash run slightly favor the
+native ratio. The current provider must retain the historical shell lock's
+ABI; the two lock revisions may differ. Running the same current provider
+through both clients checks that compatibility. A separate pre-sync refusal measures a representative failure
 without allowing state mutation. Shell and Rust use separate HOME, XDG config,
 data, state, cache, and temporary roots, but each scenario shares the same
 local bare remotes. Pair order alternates on every iteration, producing 15
@@ -105,6 +111,10 @@ the provider checkout, the legacy Bash runtime marker, and the provider's
 wall-clock freshness stamp. Dynamic engine identity fields in the shared init
 receipt and client-root prefixes in private ledgers are normalized, while
 semantic receipt fields and all other persistent state remain significant.
+The overlay link manifest compares as its live links (the last record per
+path, sorted by path): record order follows each engine's inventory order
+(directory-read order for Bash, Git index order for native), and Bash recorded
+a shared path once per overlay where native records only its winner.
 Configuration and extension inputs must also remain immutable. Only progress
 rows and the completion-summary elapsed field are normalized in captured
 output; diagnostic durations, counts, and versions remain significant.

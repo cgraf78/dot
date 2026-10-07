@@ -7,6 +7,10 @@
 //! from these inventories; this layer only discovers and freezes the
 //! candidate file sets.
 //!
+//! A Git overlay's candidates are the files its index tracks under
+//! `home/` (`tracked_inventory`); a local (`sync=none`) overlay has no
+//! index, so its whole `home/` tree is walked (`walk_inventory`).
+//!
 //! Inclusion mirrors the shell gate for gate: an entry needs a `home/`
 //! directory, a matching Git worktree for `git`-synced overlays, or a
 //! readable physical source root for local overlays. Anything else is
@@ -25,9 +29,9 @@
 //!
 //! Two boundaries are documented, not hidden:
 //!
-//! - Walk order is filesystem (`readdir`) order, like the shell
-//!   `find ... -print0`: the byte order of one inventory is stable on
-//!   one host but not a contract across hosts. Differential tests
+//! - Inventory order is index order for Git overlays and filesystem
+//!   (`readdir`) order for local ones: the byte order of one inventory
+//!   is stable on one host but not a contract across hosts. Tests
 //!   compare sorted entry sets.
 //! - An empty overlay path reads as skipped here (fail closed). The
 //!   shell would resolve it against `/home` and walk the live home
@@ -156,28 +160,196 @@ fn walk_inventory(home: &Path) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Run one task: gates, walk, and staging-file write. `None` is the
-/// shell `return 1` (unwritable staging, lost source root, failed
-/// walk); the caller discards the whole root, like `_link_overlays`
-/// removing `inventory_root` on failure.
+/// Collect the NUL-delimited inventory bytes for a Git overlay at
+/// `checkout`: every path its index tracks under `home/` (submodule
+/// contents included) that is a regular file or symlink on disk, in
+/// index order, with the same backup-name filter as
+/// [`walk_inventory`].
+///
+/// The index, not the worktree, defines what an overlay owns. Anything
+/// else in the checkout (a bytecode cache, an editor swap file, a
+/// scratch note) was never published by the overlay, and linking it
+/// would publish it into `$HOME` on this host only. Staged files count,
+/// so `git add` is enough to try a new file before committing it. One
+/// `ls-files` reads the index without walking the worktree, so the
+/// inventory costs one Git spawn per overlay (in its prep worker)
+/// instead of a directory walk.
+///
+/// A tracked path whose worktree copy is missing, became a directory,
+/// or sits below a symlinked directory is skipped: the walk never
+/// descended symlinked directories either, so nothing outside the
+/// checkout can enter the inventory. A path listed twice for one file
+/// (each stage of a merge conflict, or two index spellings of one name
+/// on a case- or normalization-insensitive volume) is linked once: both
+/// copies would otherwise replace each other's link on every run.
+///
+/// `None` when Git fails, and when the index file itself is missing
+/// while the inventory came out empty over a non-empty `home/` (a
+/// deleted `.git/index` lists nothing and exits zero): the caller fails
+/// the whole preparation rather than guess at ownership, which would
+/// otherwise remove every link of the overlay. An intact index that
+/// tracks nothing under `home/` is an empty overlay, not an error.
+fn tracked_inventory(checkout: &Path) -> Option<Vec<u8>> {
+    use std::collections::{HashMap, HashSet};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let output = crate::overlays::retry_once(|| {
+        let mut command = crate::init_client_identity::host_git_command();
+        // An inherited `GIT_INDEX_FILE` (a `dot update` run from a Git
+        // hook) would otherwise list some other index as this overlay's.
+        crate::temp::scrub_repository_selectors(&mut command);
+        command.arg("-C").arg(checkout).args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--recurse-submodules",
+            "--",
+            "home",
+        ]);
+        crate::cleanup::run_session_output(
+            command,
+            None,
+            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+            crate::cleanup::LingerPolicy::Detach,
+        )
+    })
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut out = Vec::new();
+    // Parent directories already proven real (not symlinks) below the
+    // checkout, so sibling files share one `lstat` per directory.
+    let mut real_dirs: HashSet<PathBuf> = HashSet::new();
+    // `dev:ino` of each emitted entry, with the index spellings it took.
+    let mut emitted: HashMap<(u64, u64), Vec<Vec<u8>>> = HashMap::new();
+    for rel in output.stdout.split(|byte| *byte == 0) {
+        // Only `home/...` records: a pathspec setting such as
+        // `GIT_ICASE_PATHSPECS` could match `Home/` too, and its paths
+        // would not strip to a home-relative destination.
+        if !rel.starts_with(b"home/") {
+            continue;
+        }
+        let path = checkout.join(std::ffi::OsStr::from_bytes(rel));
+        let Some(base) = path.file_name() else {
+            continue;
+        };
+        if is_backup_name(base.as_bytes()) || !real_parents(checkout, &path, &mut real_dirs) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_file() && !meta.file_type().is_symlink() {
+            continue;
+        }
+        // A file with one link has one name, so any repeat of its inode
+        // is another spelling of it (whatever the volume folds: case,
+        // Unicode normalization). Distinct names of a hardlinked file
+        // still link separately; only ASCII-case spellings collapse.
+        let spellings = emitted.entry((meta.dev(), meta.ino())).or_default();
+        if !spellings.is_empty()
+            && (meta.nlink() == 1
+                || spellings
+                    .iter()
+                    .any(|spelling| spelling.eq_ignore_ascii_case(rel)))
+        {
+            continue;
+        }
+        spellings.push(rel.to_vec());
+        out.extend_from_slice(path.as_os_str().as_bytes());
+        out.push(0);
+    }
+    if out.is_empty()
+        && std::fs::read_dir(checkout.join("home"))
+            .is_ok_and(|mut entries| entries.next().is_some())
+        && !index_exists(checkout)?
+    {
+        return None;
+    }
+    Some(out)
+}
+
+/// Whether the index file of the repository at `checkout` exists, asked
+/// only for an empty inventory (one extra Git spawn on that rare path).
+/// `None` when Git fails.
+fn index_exists(checkout: &Path) -> Option<bool> {
+    let output = crate::overlays::retry_once(|| {
+        let mut command = crate::init_client_identity::host_git_command();
+        crate::temp::scrub_repository_selectors(&mut command);
+        command
+            .arg("-C")
+            .arg(checkout)
+            .args(["rev-parse", "--git-path", "index"]);
+        crate::cleanup::run_session_output(
+            command,
+            None,
+            crate::cleanup::COMMAND_CAPTURE_LIMIT_BYTES,
+            crate::cleanup::LingerPolicy::Detach,
+        )
+    })
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let index = text.strip_suffix('\n').unwrap_or(&text);
+    // A relative answer is relative to the `-C` directory.
+    Some(checkout.join(index).exists())
+}
+
+/// Whether every directory between `checkout` and `path` is a real
+/// directory, never a symlink, memoizing proven ones in `real_dirs`.
+fn real_parents(
+    checkout: &Path,
+    path: &Path,
+    real_dirs: &mut std::collections::HashSet<PathBuf>,
+) -> bool {
+    let mut pending = Vec::new();
+    let mut dir = path.parent();
+    while let Some(current) = dir {
+        if current == checkout || real_dirs.contains(current) {
+            break;
+        }
+        pending.push(current.to_path_buf());
+        dir = current.parent();
+    }
+    for current in pending.into_iter().rev() {
+        if !std::fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_dir()) {
+            return false;
+        }
+        real_dirs.insert(current);
+    }
+    true
+}
+
+/// Run one task: gates, inventory, and staging-file write. `None` is
+/// the shell `return 1` (unwritable staging, lost source root, failed
+/// walk or index read); the caller discards the whole root, like
+/// `_link_overlays` removing `inventory_root` on failure.
 fn run_task(task: &Task<'_>, home: &str, root: &Path) -> Option<TaskOutcome> {
     let home_dir = Path::new(task.path).join("home");
-    let (source_root, source_identity) = if task.sync == "git" {
+    let (source_root, source_identity, bytes) = if task.sync == "git" {
         if !crate::overlays::is_worktree(Path::new(task.path)) {
             return Some(TaskOutcome::Skip);
         }
         if crate::overlays::checkout_matches(Path::new(task.path), task.url, home).is_err() {
             return Some(TaskOutcome::Skip);
         }
-        (None, None)
+        (None, None, tracked_inventory(Path::new(task.path))?)
     } else {
         // `cd -P` plus `pwd -P`: the physical root or failure when
         // the directory is gone.
         let real = std::fs::canonicalize(&home_dir).ok()?;
         let identity = crate::repos_overlays::file_identity(&real)?;
-        (Some(real.to_string_lossy().into_owned()), Some(identity))
+        // A local source has no index: its whole tree is the overlay.
+        let bytes = walk_inventory(&home_dir).ok()?;
+        (
+            Some(real.to_string_lossy().into_owned()),
+            Some(identity),
+            bytes,
+        )
     };
-    let bytes = walk_inventory(&home_dir).ok()?;
     let staging = root.join(format!(".build-{}", task.pos));
     crate::cancellation::check().ok()?;
     std::fs::write(&staging, &bytes).ok()?;
