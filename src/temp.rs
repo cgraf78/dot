@@ -1008,6 +1008,33 @@ mod tests {
     }
 
     #[test]
+    fn mkdir_death_before_its_launch_handshake_names_the_status() {
+        // The macOS `backup_dir` flake: the forked child died before the
+        // launch handshake, and the root step reported only "failed to fill
+        // whole buffer".
+        use std::os::unix::process::CommandExt as _;
+        let _signals = crate::cleanup::hold_signal_ownership_for_test();
+        let dir = TempDir::new("mkdir-pre-handshake-death").expect("scratch");
+        let target = dir.path().join("never");
+        let mut command = std::process::Command::new("mkdir");
+        command.arg("-p").arg(&target);
+        // SAFETY: raise is async-signal-safe and SIGKILL cannot be blocked.
+        unsafe {
+            command.pre_exec(|| {
+                libc::raise(libc::SIGKILL);
+                Ok(())
+            });
+        }
+        let mut warnings = Vec::new();
+        assert!(!forward_mkdir(command, &mut warnings));
+        assert_eq!(
+            String::from_utf8_lossy(&warnings),
+            "mkdir: launched child ended before its handshake (signal: 9 (SIGKILL))\n"
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
     fn mkdir_signal_death_leaves_a_diagnostic() {
         // Synthetic status: the engine's helpers must not spawn a shell
         // (tests/no-private-engine-test), and a death by signal is all

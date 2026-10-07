@@ -5447,11 +5447,7 @@ fn spawn_owned_child(mut command: Command) -> std::io::Result<OwnedLaunch<OwnedC
         Ok(Ok(decision)) => decision,
         Ok(Err(error)) => {
             let error = match spawned {
-                Ok(mut child) => {
-                    let _ = child.kill();
-                    let _ = wait_child_until(&mut child, cleanup_deadline());
-                    error
-                }
+                Ok(mut child) => abandoned_launch_error(error, &mut child),
                 Err(spawn_error) => originating_launch_error(error, spawn_error),
             };
             blocked.restore()?;
@@ -6381,6 +6377,37 @@ fn originating_launch_error(registrar: std::io::Error, spawn: std::io::Error) ->
     }
 }
 
+/// Reap a child that `spawn` returned although its launch handshake failed,
+/// and pick the error that names the failure.
+///
+/// `Command::spawn` takes the closing of its exec-status pipe for a
+/// successful exec, but a child that dies before its PID write (a signal,
+/// or a crash in the platform's fork-child handlers) closes that pipe too.
+/// The launch then comes back live while the registrar reads EOF, and
+/// "failed to fill whole buffer" names neither cause. EOF means every copy
+/// of the child's handshake end is closed, and an unauthorized child cannot
+/// have exec'd, so the child is already exiting: wait for it before any
+/// kill so the report carries its own status rather than ours. A registrar
+/// that failed any other way keeps its error, and the child is stopped.
+fn abandoned_launch_error(registrar: std::io::Error, child: &mut Child) -> std::io::Error {
+    if registrar.kind() != std::io::ErrorKind::UnexpectedEof {
+        let _ = child.kill();
+        let _ = wait_child_until(child, cleanup_deadline());
+        return registrar;
+    }
+    let status = match wait_child_until(child, cleanup_deadline()) {
+        Ok(status) => status.to_string(),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = wait_child_until(child, cleanup_deadline());
+            format!("no status: {error}")
+        }
+    };
+    std::io::Error::other(format!(
+        "launched child ended before its handshake ({status})"
+    ))
+}
+
 /// Atomically authorize, launch, and register an isolated child session.
 /// A pre-latched signal returns `None`; a signal pending on the spawning thread
 /// is released only after the child and its transitive ownership marker are
@@ -6514,11 +6541,7 @@ pub(crate) fn spawn_owned_session(
         Ok(Ok(decision)) => decision,
         Ok(Err(error)) => {
             let error = match spawned {
-                Ok(mut child) => {
-                    let _ = child.kill();
-                    let _ = wait_child_until(&mut child, cleanup_deadline());
-                    error
-                }
+                Ok(mut child) => abandoned_launch_error(error, &mut child),
                 Err(spawn_error) => originating_launch_error(error, spawn_error),
             };
             blocked.restore()?;
@@ -11849,6 +11872,38 @@ os._exit(1)
         match spawn_owned_child(command_failing_before_handshake()) {
             Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EPERM), "{error:?}"),
             Ok(_) => panic!("a failing pre-exec step must fail the foreground launch"),
+        }
+    }
+
+    /// A command whose child dies by SIGKILL in its own pre-exec step, before
+    /// the launch handshake's PID write. `Command::spawn` takes the closed
+    /// exec-status pipe for a successful exec and returns the dead child, so
+    /// only the registrar sees the failure, as EOF.
+    fn command_killed_before_handshake() -> Command {
+        use std::os::unix::process::CommandExt as _;
+        let mut command = Command::new("true");
+        // SAFETY: raise is async-signal-safe and SIGKILL cannot be blocked.
+        unsafe {
+            command.pre_exec(|| {
+                libc::raise(libc::SIGKILL);
+                Ok(())
+            });
+        }
+        command
+    }
+
+    #[test]
+    fn child_death_before_handshake_reports_the_child_status() {
+        // A latched signal would cancel the launch before the child dies.
+        let _signals = hold_signal_ownership_for_test();
+        let expected = "launched child ended before its handshake (signal: 9 (SIGKILL))";
+        match spawn_owned_session(command_killed_before_handshake()) {
+            Err(error) => assert_eq!(error.to_string(), expected, "{error:?}"),
+            Ok(_) => panic!("a child killed before its handshake must fail the session launch"),
+        }
+        match spawn_owned_child(command_killed_before_handshake()) {
+            Err(error) => assert_eq!(error.to_string(), expected, "{error:?}"),
+            Ok(_) => panic!("a child killed before its handshake must fail the foreground launch"),
         }
     }
 
