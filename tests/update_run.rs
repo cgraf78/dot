@@ -852,6 +852,33 @@ fn update_links_only_files_the_overlay_tracks() {
 }
 
 #[test]
+fn colliding_overlays_settle_on_the_later_one() {
+    // `overlay-1` also ships `file-000.txt`; descriptor order makes it the
+    // later overlay, so it owns the path and a second update is a no-op
+    // instead of both overlays relinking it every run.
+    let scratch = Scratch::new("update-run-collision").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let second = seed_remote(&scratch, "overlay-1", "main", "home/", 1);
+    let (home, state) = twin_client(&scratch, "native", &overlay_origin, &base_origin);
+    std::fs::write(
+        home.join(".config/dot/overlays.d/overlay-1.conf"),
+        format!("url=file://{}\n", second.display()),
+    )
+    .expect("write conf");
+    check_update(&["update"], &home, &state);
+    assert_eq!(
+        std::fs::read(home.join("file-000.txt")).expect("collided file"),
+        b"overlay-1 payload 0\n"
+    );
+    let before = snapshot_tree(&home);
+    let output = check_update(&["update"], &home, &state);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("2 overlays current"), "{stdout}");
+    assert!(!stdout.contains("overlays changed"), "{stdout}");
+    assert_eq!(snapshot_tree(&home), before);
+}
+
+#[test]
 fn update_from_a_git_hook_reads_each_overlay_index() {
     // A `dot update` run from a Git hook inherits `GIT_INDEX_FILE`; the
     // overlay inventory must still read the overlay's own index, or every

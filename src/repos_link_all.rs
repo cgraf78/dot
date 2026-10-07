@@ -143,10 +143,11 @@ pub struct RecordedLink {
 /// line that does not parse, records nothing: the next link phase owns
 /// reporting an unsafe manifest, and a probe must never invent work.
 ///
-/// Overlays that ship the same path each record it, in link order, and
-/// the last one linked owns the live link (later overlays win), so a
-/// path reads back against its last record only; an earlier owner's
-/// record could never match.
+/// Only the last overlay that ships a path links and records it (later
+/// overlays win), but a manifest an older Dot wrote records it once per
+/// overlay, in link order, with the last one owning the live link; a
+/// path therefore reads back against its last record only, since an
+/// earlier owner's record could never match.
 pub fn recorded_links(home: &str, manifest: &str) -> Vec<RecordedLink> {
     let Ok(content) = std::fs::read(manifest) else {
         return Vec::new();
@@ -725,6 +726,35 @@ pub fn link_overlays(
     // every live destination again.
     let mut targets: Vec<(String, String)> = authority.targets.into_iter().collect();
     targets.sort();
+    // Every prepared inventory, read once up front so each overlay knows
+    // which of its paths a later overlay owns (see
+    // [`repos_link_exec::shadowed_paths`]). An unreadable one stays out:
+    // the loop below fails on it before linking that overlay.
+    let mut inventories: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut order: Vec<(String, String)> = Vec::new();
+    for entry in inputs.entries {
+        let (name, path, _, _) = split_entry(entry);
+        let Some(bytes) = prepared
+            .inventories
+            .get(&name)
+            .and_then(|inventory| std::fs::read(inventory).ok())
+        else {
+            continue;
+        };
+        inventories.insert(name.clone(), bytes);
+        order.push((name, format!("{path}/home")));
+    }
+    let shadowed = repos_link_exec::shadowed_paths(
+        &order
+            .iter()
+            .map(|(name, overlay_home)| repos_link_exec::Inventory {
+                name,
+                overlay_home,
+                bytes: &inventories[name],
+            })
+            .collect::<Vec<_>>(),
+    );
+    let unshadowed = HashSet::new();
     let mut overlay_state = OverlayState::new();
     // Overlays left untouched this run; their prior links carry over.
     let mut skipped: HashSet<String> = HashSet::new();
@@ -817,7 +847,7 @@ pub fn link_overlays(
             );
             let _ = out.write_all(&progress);
         }
-        let Some(inventory_path) = prepared.inventories.get(&name) else {
+        let Some(inventory) = inventories.get(&name) else {
             warn_row(
                 err,
                 inputs.palette,
@@ -827,20 +857,6 @@ pub fn link_overlays(
             );
             cleanup(Some(&manifest_new), Some(&inventory_root));
             return outcome;
-        };
-        let inventory = match std::fs::read(inventory_path) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                warn_row(
-                    err,
-                    inputs.palette,
-                    &format!(
-                        "  warning: could not link {name} overlay; recovery authority retained: {pending}"
-                    ),
-                );
-                cleanup(Some(&manifest_new), Some(&inventory_root));
-                return outcome;
-            }
         };
         let overlay_home = format!("{path}/home");
         let link_inputs = repos_link_exec::Inputs {
@@ -869,10 +885,10 @@ pub fn link_overlays(
             dot_quiet: inputs.dot_quiet,
             dot_verbose: inputs.dot_verbose,
             ui_total: inputs.ui_total,
+            shadowed: shadowed.get(&name).unwrap_or(&unshadowed),
             report: inputs.follow_up,
         };
-        match repos_link_exec::link_overlay(&link_inputs, &mut overlay_state, &inventory, out, err)
-        {
+        match repos_link_exec::link_overlay(&link_inputs, &mut overlay_state, inventory, out, err) {
             repos_link_exec::Outcome::Changed(reply) => {
                 outcome.changed += 1;
                 outcome.changed_items.push(reply);

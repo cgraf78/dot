@@ -3889,6 +3889,59 @@ fn validate_first_spawn(
     Ok(())
 }
 
+/// The Overlays close the pinned Bash baseline prints on every update of
+/// the ordered-collision fixture: it relinked the shared path from each
+/// overlay in turn, so every overlay reported a change, with one note
+/// each. The native engine links a shared path only from its last
+/// provider, so the same steady state closes current with no notes. This
+/// is the one intentional stdout divergence (see
+/// docs/rust-port-performance.md).
+const BASH_COLLISION_RELINK_ROW: &[u8] = b"Overlays   changed  3 overlays changed";
+/// The native close for the same steady state.
+const NATIVE_COLLISION_ROW: &[u8] = b"Overlays   ok       3 overlays current";
+
+/// Rewrite the Bash baseline's collision relink rows in normalized
+/// `stdout` to the native steady state, requiring the exact Bash shape so
+/// any other Overlays difference still fails parity.
+fn reconcile_collision_relinks(workload: Workload, stdout: Vec<u8>) -> Vec<u8> {
+    if workload != Workload::FeatureCollision {
+        return stdout;
+    }
+    let rows = occurrences(&stdout, BASH_COLLISION_RELINK_ROW);
+    assert_eq!(
+        rows,
+        1,
+        "the Bash collision relink row appears once: {}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let mut reconciled = replace_bytes(&stdout, BASH_COLLISION_RELINK_ROW, NATIVE_COLLISION_ROW);
+    for index in 0..OVERLAYS {
+        let note = format!("  changed  overlay-{index} overlay linked 1\n");
+        assert_eq!(
+            occurrences(&reconciled, note.as_bytes()),
+            1,
+            "the Bash collision relink note for overlay-{index} appears once: {}",
+            String::from_utf8_lossy(&stdout)
+        );
+        reconciled = replace_bytes(&reconciled, note.as_bytes(), b"");
+    }
+    reconciled
+}
+
+/// Non-overlapping occurrences of `needle` in `haystack`.
+fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    let mut count = 0;
+    let mut index = 0;
+    while let Some(offset) = haystack[index..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        count += 1;
+        index += offset + needle.len();
+    }
+    count
+}
+
 fn compare_outputs(
     workload: Workload,
     engines: &Engines,
@@ -3897,7 +3950,10 @@ fn compare_outputs(
     rust: &TimedOutput,
 ) {
     assert_eq!(
-        normalize_output(&shell.output.stdout, &engines.shell, &clients.shell),
+        reconcile_collision_relinks(
+            workload,
+            normalize_output(&shell.output.stdout, &engines.shell, &clients.shell)
+        ),
         normalize_output(&rust.output.stdout, &engines.rust, &clients.rust),
         "{} stdout parity",
         workload.label()
@@ -6707,4 +6763,25 @@ shared\tov\t.dotfiles-ov/home/shared\n";
         normalize_state_value(state, Path::new("dot/other"), bash.to_vec()),
         bash.to_vec()
     );
+}
+
+#[test]
+fn collision_relink_rows_reconcile_only_for_the_collision_workload() {
+    let bash = b"[2/5] Overlays   changed  3 overlays changed  Ns\n  changed  overlay-0 overlay linked 1\n  changed  overlay-1 overlay linked 1\n  changed  overlay-2 overlay linked 1\n[3/5] Tools\n".to_vec();
+    let native = b"[2/5] Overlays   ok       3 overlays current  Ns\n[3/5] Tools\n".to_vec();
+    assert_eq!(
+        reconcile_collision_relinks(Workload::FeatureCollision, bash.clone()),
+        native
+    );
+    assert_eq!(
+        reconcile_collision_relinks(Workload::DisjointClean, bash.clone()),
+        bash
+    );
+}
+
+#[test]
+#[should_panic(expected = "relink note for overlay-1")]
+fn collision_relink_reconciliation_requires_the_exact_bash_shape() {
+    let partial = b"[2/5] Overlays   changed  3 overlays changed  Ns\n  changed  overlay-0 overlay linked 1\n".to_vec();
+    reconcile_collision_relinks(Workload::FeatureCollision, partial);
 }

@@ -26,10 +26,11 @@ overlay no longer provides is removed like any other stale link.
 
 Active overlays are synchronized in descriptor order. Their `home/` entries
 are inventoried before mutation, the complete prospective ownership manifest
-is published first, and later overlays win same-relative-path collisions.
-Tracked base paths receive `skip-worktree` only while an exact managed symlink
-is live. Stale links are removed only when their literal target matches durable
-authority, and the base path is then restored.
+is published first, and later overlays win same-relative-path collisions:
+only the last overlay that ships a path links and records it, so a steady
+state relinks nothing. Tracked base paths receive `skip-worktree` only while
+an exact managed symlink is live. Stale links are removed only when their
+literal target matches durable authority, and the base path is then restored.
 
 Dependencies install after linking, so a tool can replace a path an overlay
 owns (for example, by relinking its own binary over an overlay launcher). After

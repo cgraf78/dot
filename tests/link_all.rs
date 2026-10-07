@@ -709,3 +709,103 @@ fn link_to_a_file_the_overlay_stops_tracking_is_removed() {
         b"scratch\n"
     );
 }
+
+/// A second Git overlay `name` shipping `files`, cloned beside the
+/// fixture's, and its entry record.
+fn second_overlay(f: &Fixture, name: &str, files: &[(&str, &str)]) -> String {
+    let source = f.root.join(format!("{name}-source"));
+    for (rel, body) in files {
+        stage(&source, &format!("home/{rel}"), body.as_bytes());
+    }
+    git(&source, &f.home, &["init", "-b", "main"]);
+    git(&source, &f.home, &["add", "-A"]);
+    git(&source, &f.home, &["commit", "-qm", "seed"]);
+    let checkout = f.root.join(name);
+    git(
+        &f.root,
+        &f.home,
+        &[
+            "clone",
+            "-q",
+            source.to_str().unwrap(),
+            checkout.to_str().unwrap(),
+        ],
+    );
+    format!("{name}|{}|{}|||git", checkout.display(), source.display())
+}
+
+#[test]
+fn colliding_overlays_converge_on_the_last_one_without_relinking() {
+    // Two overlays shipping the same path: the later one owns the link,
+    // and a steady state relinks nothing (the earlier overlay used to
+    // relink the path on every run, then the later one took it back).
+    let f = Fixture::new(&[("shared.conf", "first\n"), ("only.conf", "only\n")]);
+    let entries = vec![
+        f.entry(),
+        second_overlay(&f, "ov2", &[("shared.conf", "second\n")]),
+    ];
+    let (first, _, err) = f.run_entries(&entries, Some("4"), false, false);
+    assert_eq!(first.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(
+        link_at(&f.home, "shared.conf"),
+        Some(PathBuf::from(".dotfiles-ov2/home/shared.conf"))
+    );
+    assert_eq!(
+        first.changed_items,
+        vec!["ov overlay linked 1", "ov2 overlay linked 1"]
+    );
+    let (second, out, err) = f.run_entries(&entries, Some("4"), false, false);
+    assert_eq!(second.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+    assert_eq!(second.changed, 0, "{:?}", second.changed_items);
+    assert_eq!(second.current, 2);
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .contains("2 overlays current"),
+    );
+    assert_eq!(
+        link_at(&f.home, "shared.conf"),
+        Some(PathBuf::from(".dotfiles-ov2/home/shared.conf"))
+    );
+    let manifest = std::fs::read_to_string(&f.manifest).unwrap();
+    let shared: Vec<&str> = manifest
+        .lines()
+        .filter(|line| line.starts_with("shared.conf\t"))
+        .collect();
+    assert_eq!(shared.len(), 1, "{manifest}");
+    assert!(shared[0].starts_with("shared.conf\tov2\t"), "{manifest}");
+}
+
+#[test]
+fn a_later_overlay_takes_over_a_path_without_the_earlier_one_changing() {
+    let f = Fixture::new(&[("shared.conf", "first\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    assert_eq!(
+        link_at(&f.home, "shared.conf"),
+        Some(PathBuf::from(".dotfiles-ov/home/shared.conf"))
+    );
+    let entries = vec![
+        f.entry(),
+        second_overlay(&f, "ov2", &[("shared.conf", "second\n")]),
+    ];
+    let (result, _, err) = f.run_entries(&entries, None, false, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(result.changed_items, vec!["ov2 overlay linked 1"]);
+    assert_eq!(result.current, 1);
+    assert_eq!(
+        link_at(&f.home, "shared.conf"),
+        Some(PathBuf::from(".dotfiles-ov2/home/shared.conf"))
+    );
+    let (steady, _, err) = f.run_entries(&entries, None, false, false);
+    assert_eq!(steady.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(steady.changed, 0, "{:?}", steady.changed_items);
+    // Dropping the later overlay hands the path back to the earlier one.
+    let (result, _, err) = f.run_entries(&[f.entry()], None, false, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(result.changed_items, vec!["ov overlay linked 1"]);
+    assert_eq!(
+        link_at(&f.home, "shared.conf"),
+        Some(PathBuf::from(".dotfiles-ov/home/shared.conf"))
+    );
+}

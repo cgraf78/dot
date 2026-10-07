@@ -29,7 +29,7 @@
 //!   the failure path, so [`Outcome::Failed`] carries no reply text
 //!   and differential tests normalize the failure reply away.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 
@@ -92,6 +92,9 @@ pub struct Inputs<'a> {
     pub dot_verbose: Option<&'a str>,
     /// `DOT_UI_TOTAL`: link rows print at zero or under verbose.
     pub ui_total: Option<&'a str>,
+    /// Paths a later overlay ships too ([`shadowed_paths`]): that overlay
+    /// owns them, so this one neither links nor records them.
+    pub shadowed: &'a HashSet<String>,
     /// Paths whose conflict skips this pass reports (`None`: every path).
     /// A repair pass after a later stage scopes them to the paths it
     /// repairs: the Overlays stage already reported every other conflict
@@ -243,6 +246,48 @@ fn inventory_records(inventory: &[u8]) -> Vec<&[u8]> {
     records
 }
 
+/// The home-relative path an inventory record `src` names: the shell's
+/// byte prefix strip of `"$overlay_home/"`, lossy past this boundary.
+fn record_rel(overlay_home: &str, src: &[u8]) -> String {
+    let prefix = format!("{overlay_home}/");
+    let rel_bytes = src.strip_prefix(prefix.as_bytes()).unwrap_or(src);
+    String::from_utf8_lossy(rel_bytes).into_owned()
+}
+
+/// One overlay's prepared inventory, as [`shadowed_paths`] reads it.
+pub struct Inventory<'a> {
+    /// Overlay name.
+    pub name: &'a str,
+    /// `"$path/home"` prefix the inventory paths strip.
+    pub overlay_home: &'a str,
+    /// NUL-delimited inventory bytes.
+    pub bytes: &'a [u8],
+}
+
+/// For each overlay, the paths a later overlay in `inventories` (link
+/// order) also ships. Later overlays win a shared path, so only its last
+/// provider links and records it: an earlier overlay that linked it
+/// first would replace the winner's link on every run, and the winner
+/// would take it back, so both reported a change on every update.
+pub fn shadowed_paths(inventories: &[Inventory<'_>]) -> HashMap<String, HashSet<String>> {
+    let mut later: HashSet<String> = HashSet::new();
+    let mut shadowed = HashMap::new();
+    for inventory in inventories.iter().rev() {
+        let rels: Vec<String> = inventory_records(inventory.bytes)
+            .into_iter()
+            .map(|src| record_rel(inventory.overlay_home, src))
+            .collect();
+        let mine: HashSet<String> = rels
+            .iter()
+            .filter(|rel| later.contains(*rel))
+            .cloned()
+            .collect();
+        later.extend(rels);
+        shadowed.insert(inventory.name.to_string(), mine);
+    }
+    shadowed
+}
+
 /// Link one `home/` source path into `$HOME`, replicating the
 /// `_link_overlay` loop body line for line.
 #[allow(clippy::too_many_arguments)]
@@ -258,10 +303,11 @@ fn link_one(
         return None;
     }
     let verbose = is_verbose(inputs.dot_verbose);
-    let prefix = format!("{}/", inputs.overlay_home);
-    let rel_bytes = src.strip_prefix(prefix.as_bytes()).unwrap_or(src);
-    let rel = String::from_utf8_lossy(rel_bytes);
-    let rel = rel.as_ref();
+    let rel = record_rel(inputs.overlay_home, src);
+    let rel = rel.as_str();
+    if inputs.shadowed.contains(rel) {
+        return Some(FileStep::Skipped);
+    }
     if crate::repos_overlays::path_is_authority(
         inputs.home,
         rel,
@@ -617,6 +663,42 @@ mod tests {
             inventory_records(b"a\0\0b\0"),
             vec![b"a".as_slice(), b"".as_slice(), b"b".as_slice()]
         );
+    }
+
+    #[test]
+    fn shadowed_paths_name_what_a_later_overlay_ships() {
+        let inventory = |name, records: &[&str]| {
+            let mut bytes = Vec::new();
+            for record in records {
+                bytes.extend_from_slice(format!("/{name}/home/{record}").as_bytes());
+                bytes.push(0);
+            }
+            bytes
+        };
+        let a = inventory("a", &["x", "z", "a-only"]);
+        let b = inventory("b", &["y", "z"]);
+        let c = inventory("c", &["x", "y"]);
+        let shadowed = shadowed_paths(&[
+            Inventory {
+                name: "a",
+                overlay_home: "/a/home",
+                bytes: &a,
+            },
+            Inventory {
+                name: "b",
+                overlay_home: "/b/home",
+                bytes: &b,
+            },
+            Inventory {
+                name: "c",
+                overlay_home: "/c/home",
+                bytes: &c,
+            },
+        ]);
+        let set = |rels: &[&str]| rels.iter().map(|rel| rel.to_string()).collect();
+        assert_eq!(shadowed["a"], set(&["x", "z"]));
+        assert_eq!(shadowed["b"], set(&["y"]));
+        assert_eq!(shadowed["c"], set(&[]));
     }
 
     #[test]
