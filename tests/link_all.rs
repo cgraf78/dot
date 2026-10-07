@@ -126,11 +126,16 @@ impl Fixture {
         self.run_pass(entries, Some("4"), false, false, Some(&paths))
     }
 
+    /// The recorded links sorted by path: the manifest follows the overlay
+    /// walk, whose order is the filesystem's directory order (ext4 hashes
+    /// it), and no caller depends on that order.
     fn recorded(&self) -> Vec<repos_link_all::RecordedLink> {
-        repos_link_all::recorded_links(
+        let mut links = repos_link_all::recorded_links(
             &self.home.to_string_lossy(),
             &self.manifest.to_string_lossy(),
-        )
+        );
+        links.sort_by(|a, b| a.rel.cmp(&b.rel));
+        links
     }
 
     fn run_pass(
@@ -292,8 +297,8 @@ fn recorded_links_reads_a_collided_path_against_its_last_owner_only() {
     assert_eq!(
         f.recorded(),
         vec![
-            owned("shared.conf", "b", true),
-            owned("only.conf", "a", false)
+            owned("only.conf", "a", false),
+            owned("shared.conf", "b", true)
         ]
     );
 }
