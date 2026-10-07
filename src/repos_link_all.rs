@@ -34,7 +34,7 @@
 //!   separate `chmod`: observably identical and never briefly
 //!   broader.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -94,6 +94,13 @@ pub struct Inputs<'a> {
     pub bar_width: &'a str,
     /// Logger for headers and `_log` rows.
     pub log: &'a Log,
+    /// A repair pass after a later stage, for these replaced paths (see
+    /// [`recorded_links`]): the same convergence and skip decisions, but
+    /// no stage row, progress, or per-overlay skip warning of its own,
+    /// and conflict-skip warnings only for these paths, because the
+    /// Overlays stage already rendered the rest this run and the caller
+    /// reports what the pass restored.
+    pub follow_up: Option<&'a HashSet<String>>,
 }
 
 /// Outcome of [`link_overlays`]: the shell return code plus the
@@ -107,6 +114,69 @@ pub struct LinkOutcome {
     pub current: i64,
     /// `"$name overlay linked $n"` replies, in link order.
     pub changed_items: Vec<String>,
+    /// Overlays left untouched (not a worktree, origin mismatch) whose
+    /// prior records carried into the new manifest unverified.
+    pub skipped: HashSet<String>,
+}
+
+/// One link the committed manifest records, and whether its home path
+/// still reads back the recorded target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedLink {
+    /// Home-relative path.
+    pub rel: String,
+    /// Overlay that owns the path.
+    pub owner: String,
+    /// Whether `$HOME/rel` is a symlink whose literal target is the
+    /// recorded one (the same byte comparison the link loop uses to
+    /// accept a current link).
+    pub intact: bool,
+}
+
+/// Every link `manifest` records under `home`, in manifest order, with
+/// its live state: one manifest read plus one `readlink` per record, no
+/// overlay walk and no Git. This is the cheap probe behind the repair
+/// pass that runs after the Tools stage: a stage that replaced,
+/// retargeted, or removed an overlay link after the link phase published
+/// it shows up as a record that is no longer intact, and only then does
+/// the full link phase run again. An absent or unreadable manifest, or a
+/// line that does not parse, records nothing: the next link phase owns
+/// reporting an unsafe manifest, and a probe must never invent work.
+///
+/// Overlays that ship the same path each record it, in link order, and
+/// the last one linked owns the live link (later overlays win), so a
+/// path reads back against its last record only; an earlier owner's
+/// record could never match.
+pub fn recorded_links(home: &str, manifest: &str) -> Vec<RecordedLink> {
+    let Ok(content) = std::fs::read(manifest) else {
+        return Vec::new();
+    };
+    let mut records = Vec::new();
+    for line in repos_overlays::stream_lines(&content) {
+        let Some(record) = repos_overlays::parse_manifest_record(&line) else {
+            return Vec::new();
+        };
+        records.push(record);
+    }
+    let last: HashMap<String, usize> = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| (record.rel.clone(), index))
+        .collect();
+    records
+        .into_iter()
+        .enumerate()
+        .filter(|(index, record)| last.get(&record.rel) == Some(index))
+        .map(|(_, record)| {
+            let intact = std::fs::read_link(format!("{home}/{}", record.rel))
+                .is_ok_and(|live| live.as_os_str().as_encoded_bytes() == record.target.as_bytes());
+            RecordedLink {
+                rel: record.rel,
+                owner: record.owner,
+                intact,
+            }
+        })
+        .collect()
 }
 
 /// `[[ ${text:-0} -gt 0 ]]`: unset and empty read zero, malformed
@@ -133,6 +203,12 @@ fn split_entry(entry: &str) -> (String, String, String, String) {
     let _ = parts.next();
     let sync = parts.next().unwrap_or("").to_string();
     (name, path, url, sync)
+}
+
+/// Whether this pass reports a conflict skip at `rel` (see
+/// [`Inputs::follow_up`]).
+fn reports(inputs: &Inputs<'_>, rel: &str) -> bool {
+    inputs.follow_up.is_none_or(|paths| paths.contains(rel))
 }
 
 /// Append one `_warn` row to the stderr stream.
@@ -398,6 +474,7 @@ pub fn link_overlays(
         changed: 0,
         current: 0,
         changed_items: Vec::new(),
+        skipped: HashSet::new(),
     };
     if cancelled() {
         return outcome;
@@ -513,26 +590,31 @@ pub fn link_overlays(
     // The header and the empty-phase early return only run when
     // something can link (or counted UI forces the stage open).
     // The quiet gate lives inside the stage rendering.
+    // A follow-up pass renders none of this: its stage already closed.
+    let follow_up = inputs.follow_up.is_some();
     if has_overlay_home || gt_zero(inputs.ui_total) {
-        if gt_zero(inputs.ui_total) {
-            let open = stage.start(
-                b"Overlays",
-                Some(b"checking overlay links"),
-                crate::update_engine::now_secs(),
-                inputs.dot_verbose,
-            );
-            let _ = out.write_all(&open);
-        } else {
-            let open = stage.header_text(b"Overlays");
+        if !follow_up {
+            let open = if gt_zero(inputs.ui_total) {
+                stage.start(
+                    b"Overlays",
+                    Some(b"checking overlay links"),
+                    crate::update_engine::now_secs(),
+                    inputs.dot_verbose,
+                )
+            } else {
+                stage.header_text(b"Overlays")
+            };
             let _ = out.write_all(&open);
         }
         if !has_overlay_home && manifests.is_empty() {
-            let close = stage.finish(
-                b"ok",
-                b"0 overlays current",
-                crate::update_engine::now_secs(),
-            );
-            let _ = out.write_all(&close);
+            if !follow_up {
+                let close = stage.finish(
+                    b"ok",
+                    b"0 overlays current",
+                    crate::update_engine::now_secs(),
+                );
+                let _ = out.write_all(&close);
+            }
             outcome.rc = 0;
             return outcome;
         }
@@ -663,7 +745,13 @@ pub fn link_overlays(
             continue;
         }
         if sync == "git" {
+            // A follow-up pass skips the same overlays silently: the
+            // Overlays stage already warned about each one this run.
             if !overlays::is_worktree(Path::new(&path)) {
+                if follow_up {
+                    skipped.insert(name);
+                    continue;
+                }
                 warn_row(
                     err,
                     inputs.palette,
@@ -675,6 +763,10 @@ pub fn link_overlays(
                 continue;
             }
             if let Err(actual) = overlays::checkout_matches(Path::new(&path), &url, inputs.home) {
+                if follow_up {
+                    skipped.insert(name);
+                    continue;
+                }
                 let expected = overlays::effective_url(&url, inputs.home);
                 let command = adopt_command(&path, &expected, &actual);
                 if gt_zero(inputs.ui_total) {
@@ -712,15 +804,19 @@ pub fn link_overlays(
             }
         }
         done += 1;
-        let progress = stage.maybe_progress(
-            name.as_bytes(),
-            done,
-            overlay_total,
-            crate::update_engine::now_secs(),
-            inputs.dot_verbose,
-            inputs.bar_width,
-        );
-        let _ = out.write_all(&progress);
+        // Progress redraws the open stage's live row; a follow-up pass
+        // has none (redrawing would revive the closed row's label).
+        if !follow_up {
+            let progress = stage.maybe_progress(
+                name.as_bytes(),
+                done,
+                overlay_total,
+                crate::update_engine::now_secs(),
+                inputs.dot_verbose,
+                inputs.bar_width,
+            );
+            let _ = out.write_all(&progress);
+        }
         let Some(inventory_path) = prepared.inventories.get(&name) else {
             warn_row(
                 err,
@@ -773,6 +869,7 @@ pub fn link_overlays(
             dot_quiet: inputs.dot_quiet,
             dot_verbose: inputs.dot_verbose,
             ui_total: inputs.ui_total,
+            report: inputs.follow_up,
         };
         match repos_link_exec::link_overlay(&link_inputs, &mut overlay_state, &inventory, out, err)
         {
@@ -849,11 +946,13 @@ pub fn link_overlays(
                     .map(|path| path.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 if !targets.contains(&(rel.clone(), target)) {
-                    warn_row(
-                        err,
-                        inputs.palette,
-                        &format!("  skip (stale overlay link was replaced): {rel}"),
-                    );
+                    if reports(inputs, rel) {
+                        warn_row(
+                            err,
+                            inputs.palette,
+                            &format!("  skip (stale overlay link was replaced): {rel}"),
+                        );
+                    }
                     continue;
                 }
                 if candidate_reserved(inputs, &dst) {
@@ -909,11 +1008,11 @@ pub fn link_overlays(
                 // base restore below, like the shell branch.
             }
             Ok(_) => {
-                if !tracked.contains(rel)
+                let local = !tracked.contains(rel)
                     || !inputs
                         .base
-                        .is_some_and(|base| repos_overlays::tracked_path_clean(base, rel))
-                {
+                        .is_some_and(|base| repos_overlays::tracked_path_clean(base, rel));
+                if local && reports(inputs, rel) {
                     warn_row(
                         err,
                         inputs.palette,
@@ -1059,7 +1158,7 @@ pub fn link_overlays(
     // Counted close: `ok` with a current phrase when nothing
     // changed, `changed` with both phrases on a mixed run. Notes
     // print unless verbose already showed the rows.
-    if gt_zero(inputs.ui_total) {
+    if gt_zero(inputs.ui_total) && !follow_up {
         let mut parts: Vec<Vec<u8>> = Vec::new();
         if outcome.changed > 0 {
             let mut phrase =
@@ -1089,6 +1188,7 @@ pub fn link_overlays(
             }
         }
     }
+    outcome.skipped = skipped;
     outcome.rc = 0;
     outcome
 }

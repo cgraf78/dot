@@ -105,6 +105,7 @@ impl Fixture {
             dot_quiet: None,
             dot_verbose: verbose.then_some("1"),
             ui_total: None,
+            report: None,
         };
         let mut state = OverlayState::new();
         let mut out = Vec::new();

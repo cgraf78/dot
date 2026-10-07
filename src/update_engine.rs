@@ -17,7 +17,7 @@
 //! parsed before entry, so the provider is a closed enum rather than an
 //! open-ended shell value that needs a fallback lane.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -1941,9 +1941,10 @@ fn skip_inputs_rows(
 }
 
 /// Why the Prune stage removed nothing this run. Every reason mirrors a
-/// condition under which the Tools stage also did not converge the
-/// dependency config, so prune never acts on a configuration Dot did not
-/// trust enough to install from.
+/// condition under which the Tools stage did not converge the dependency
+/// config, or the linked config may have changed since it did, so prune
+/// never acts on a configuration Dot did not trust enough to install
+/// from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PruneSkip {
     /// Profile resolution, repository sync, or overlay linking failed, or
@@ -1951,6 +1952,9 @@ enum PruneSkip {
     Inputs,
     /// Profile deactivation failed, so the Tools stage never ran.
     Retire,
+    /// Restoring overlay links the Tools stage replaced failed, so the
+    /// linked dependency configs may be partial.
+    Links,
     /// No dependency provider is configured (or this invocation skips it).
     NoProvider,
     /// Shdeps could not be prepared, so there is nothing to prune with.
@@ -1967,6 +1971,7 @@ impl PruneSkip {
         match self {
             PruneSkip::Inputs => (b"warning", b"repository sync failed; prune skipped"),
             PruneSkip::Retire => (b"warning", b"profile deactivation failed; prune skipped"),
+            PruneSkip::Links => (b"warning", b"link repair failed; prune skipped"),
             PruneSkip::NoProvider => (b"ok", b"no dependency provider"),
             PruneSkip::Unavailable => (b"warning", b"shdeps unavailable; prune skipped"),
             PruneSkip::UnknownKeys => (b"warning", b"keys from a newer dot; prune skipped"),
@@ -2115,6 +2120,127 @@ fn prune_stage(
     PruneStatus::Failed
 }
 
+/// The link phase's inputs for this run's `active` overlay records;
+/// `follow_up` selects the repair pass for those replaced paths (see
+/// [`restore_replaced_links`]).
+fn link_inputs<'a>(
+    inputs: &'a EngineInputs<'_>,
+    active: &'a [String],
+    follow_up: Option<&'a HashSet<String>>,
+) -> crate::repos_link_all::Inputs<'a> {
+    crate::repos_link_all::Inputs {
+        entries: active,
+        home: inputs.home,
+        manifest: inputs.manifest,
+        legacy_manifest: inputs.legacy_manifest,
+        update_jobs: inputs.update_jobs,
+        ui_total: Some(stage_total(inputs)),
+        // Verbose per-overlay and per-link rows would land under the
+        // closed Tools row and repeat every overlay; the repair's notes
+        // name what it restored.
+        dot_verbose: if follow_up.is_some() {
+            None
+        } else {
+            inputs.dot_verbose
+        },
+        dot_quiet: inputs.dot_quiet,
+        dest: inputs.dest,
+        base: inputs.base,
+        euid: inputs.euid,
+        source_root_git: inputs.source_root_git,
+        tmp: inputs.tmp,
+        tool: inputs.tool,
+        palette: inputs.palette,
+        multibyte: inputs.multibyte,
+        bar_width: inputs.bar_width,
+        log: inputs.log,
+        follow_up,
+    }
+}
+
+/// Restore overlay links the Tools stage replaced, before anything later
+/// in the run (prune, config hooks) reads them. Returns false when the
+/// repair pass failed or was interrupted; the caller stops on a signal,
+/// and otherwise skips Prune and Configs, as after a failed Overlays
+/// stage.
+///
+/// A dependency install may put its own file or link over a path an
+/// overlay owns (Shdeps relinking a tool's binary over the overlay's
+/// launcher for it). The Overlays stage ran before Tools, so without
+/// this pass the overlay link stays replaced until the next update.
+///
+/// The probe is one manifest read plus one `readlink` per recorded link
+/// ([`crate::repos_link_all::recorded_links`]); a no-op update stops
+/// there. Only a replaced link reruns the link phase, and it runs the
+/// unchanged engine in follow-up mode, so every ownership and conflict
+/// rule is exactly the Overlays stage's: a replacement that stage would
+/// refuse (a regular file, a guarded foreign link) is refused here with
+/// the same warning. Conflict warnings cover only the replaced paths:
+/// the Overlays stage already reported every other conflict this run.
+/// Each restored path gets one note under the Tools row; quiet runs drop
+/// notes, like the Overlays stage's own.
+///
+/// `skipped` names the overlays the Overlays stage left untouched: their
+/// records carried over unverified and the repair pass skips them again,
+/// so their links never trigger it (it could restore nothing).
+fn restore_replaced_links(
+    inputs: &EngineInputs<'_>,
+    active: &[String],
+    skipped: &HashSet<String>,
+    stage: &mut Stage,
+    io: &mut UpdateIo<'_>,
+) -> bool {
+    let replaced: Vec<String> = crate::repos_link_all::recorded_links(inputs.home, inputs.manifest)
+        .into_iter()
+        .filter(|link| !link.intact && !skipped.contains(&link.owner))
+        .map(|link| link.rel)
+        .collect();
+    if replaced.is_empty() {
+        return true;
+    }
+    let paths: HashSet<String> = replaced.iter().cloned().collect();
+    let outcome = crate::repos_link_all::link_overlays(
+        &link_inputs(inputs, active, Some(&paths)),
+        stage,
+        io.out,
+        io.err,
+    );
+    if outcome.rc != 0 {
+        // An interrupted pass is not a repair failure: the caller stops.
+        if cancelled() {
+            return false;
+        }
+        inputs.fail(
+            crate::update_status::STAGE_OVERLAYS,
+            "links",
+            "overlay links replaced during Tools could not be restored",
+        );
+        let note = stage.note(
+            b"failed",
+            b"overlay links replaced during Tools could not be restored",
+        );
+        let _ = io.out.write_all(&note);
+        return false;
+    }
+    // A refused path drops out of the republished manifest, and one an
+    // overlay no longer ships was never restored: report only paths whose
+    // new record reads back intact.
+    let restored: HashSet<String> =
+        crate::repos_link_all::recorded_links(inputs.home, inputs.manifest)
+            .into_iter()
+            .filter(|link| link.intact)
+            .map(|link| link.rel)
+            .collect();
+    for rel in replaced.iter().filter(|rel| restored.contains(*rel)) {
+        let note = stage.note(
+            b"changed",
+            format!("restored overlay link replaced during Tools: {rel}").as_bytes(),
+        );
+        let _ = io.out.write_all(&note);
+    }
+    true
+}
+
 /// Whether an update's final config degrades the run: it ignored a key
 /// that is a near miss of a known key, so the setting that key most
 /// likely meant kept its default (a misspelled `dependency_provider`
@@ -2203,6 +2329,8 @@ fn finalize(
     }
     let base_prefix = inputs.base.as_ref().and_then(|base| base.git_prefix());
     crate::repos_config::ensure_repo_config(base_prefix.as_deref());
+    // Overlays the link phase left untouched (see `restore_replaced_links`).
+    let mut skipped_overlays = HashSet::new();
     if frozen {
         let open = stage.start(
             b"Overlays",
@@ -2239,26 +2367,7 @@ fn finalize(
         );
         let _ = io.out.write_all(&close);
     } else {
-        let link_inputs = crate::repos_link_all::Inputs {
-            entries: &state.active,
-            home: inputs.home,
-            manifest: inputs.manifest,
-            legacy_manifest: inputs.legacy_manifest,
-            update_jobs: inputs.update_jobs,
-            ui_total: Some(stage_total(inputs)),
-            dot_verbose: inputs.dot_verbose,
-            dot_quiet: inputs.dot_quiet,
-            dest: inputs.dest,
-            base: inputs.base,
-            euid: inputs.euid,
-            source_root_git: inputs.source_root_git,
-            tmp: inputs.tmp,
-            tool: inputs.tool,
-            palette: inputs.palette,
-            multibyte: inputs.multibyte,
-            bar_width: inputs.bar_width,
-            log: inputs.log,
-        };
+        let link_inputs = link_inputs(inputs, &state.active, None);
         let outcome = crate::repos_link_all::link_overlays(&link_inputs, stage, io.out, io.err);
         if outcome.rc != 0 {
             inputs.fail(
@@ -2269,6 +2378,7 @@ fn finalize(
             status = 1;
             inputs_ready = false;
         }
+        skipped_overlays = outcome.skipped;
     }
     if cancelled() {
         return 1;
@@ -2339,6 +2449,7 @@ fn finalize(
             let provider_enabled =
                 !inputs.skip_provider && state.config.provider == crate::config::Provider::Shdeps;
             let mut prune: Result<PruneReady<'_>, PruneSkip> = Err(PruneSkip::NoProvider);
+            let mut links_intact = true;
             if !provider_enabled {
                 let open = stage.start(
                     b"Tools",
@@ -2477,10 +2588,28 @@ fn finalize(
                                 return code;
                             }
                         }
-                        // A failed update (a dependency or post hook) still
-                        // leaves this generation's config trusted: prune on.
-                        // Otherwise release the provider snapshot now.
-                        if prune_this_run {
+                        // After any handoff (a continuation relinks in its
+                        // own Overlays stage). A held run keeps the
+                        // installed generation and never relinks.
+                        links_intact = state.held
+                            || restore_replaced_links(
+                                inputs,
+                                &state.active,
+                                &skipped_overlays,
+                                stage,
+                                io,
+                            );
+                        if cancelled() {
+                            return 1;
+                        }
+                        if !links_intact {
+                            status = 1;
+                            prune = Err(PruneSkip::Links);
+                        } else if prune_this_run {
+                            // A failed update (a dependency or post hook)
+                            // still leaves this generation's config trusted:
+                            // prune on. Otherwise release the provider
+                            // snapshot now.
                             prune = Ok(PruneReady {
                                 provider: provider_inputs,
                                 prepared,
@@ -2538,6 +2667,23 @@ fn finalize(
                 let close = stage.finish(
                     b"warning",
                     b"overlay set held; config hooks skipped",
+                    crate::update_engine::now_secs(),
+                );
+                let _ = io.out.write_all(&close);
+                crate::merges::Outcome::status(0)
+            } else if !links_intact {
+                // Like a failed Overlays stage: hooks must not read a
+                // partially restored link generation.
+                let open = stage.start(
+                    b"Configs",
+                    Some(b"skipping config hooks"),
+                    crate::update_engine::now_secs(),
+                    inputs.dot_verbose,
+                );
+                let _ = io.out.write_all(&open);
+                let close = stage.finish(
+                    b"warning",
+                    b"link repair failed; config hooks skipped",
                     crate::update_engine::now_secs(),
                 );
                 let _ = io.out.write_all(&close);

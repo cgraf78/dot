@@ -2,6 +2,7 @@
 
 use dot::repos_link_all;
 use dot_test_support::TempDir;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -104,6 +105,42 @@ impl Fixture {
         verbose: bool,
         live: bool,
     ) -> (repos_link_all::LinkOutcome, Vec<u8>, Vec<u8>) {
+        self.run_pass(entries, ui_total, verbose, live, None)
+    }
+
+    /// The fixture overlay's record (`ov`), as [`Self::run`] links it.
+    fn entry(&self) -> String {
+        let overlay = self.overlay.to_string_lossy().into_owned();
+        let source = self.source.to_string_lossy().into_owned();
+        format!("ov|{overlay}|{source}|||git")
+    }
+
+    /// The repair pass (`follow_up`) for `paths` over `entries` under
+    /// counted UI.
+    fn run_follow_up(
+        &self,
+        entries: &[String],
+        paths: &[&str],
+    ) -> (repos_link_all::LinkOutcome, Vec<u8>, Vec<u8>) {
+        let paths: HashSet<String> = paths.iter().map(|path| path.to_string()).collect();
+        self.run_pass(entries, Some("4"), false, false, Some(&paths))
+    }
+
+    fn recorded(&self) -> Vec<repos_link_all::RecordedLink> {
+        repos_link_all::recorded_links(
+            &self.home.to_string_lossy(),
+            &self.manifest.to_string_lossy(),
+        )
+    }
+
+    fn run_pass(
+        &self,
+        entries: &[String],
+        ui_total: Option<&str>,
+        verbose: bool,
+        live: bool,
+        follow_up: Option<&HashSet<String>>,
+    ) -> (repos_link_all::LinkOutcome, Vec<u8>, Vec<u8>) {
         let home = self.home.to_string_lossy().into_owned();
         let overlay = self.overlay.to_string_lossy().into_owned();
         let manifest = self.manifest.to_string_lossy().into_owned();
@@ -148,6 +185,7 @@ impl Fixture {
             multibyte: false,
             bar_width: "8",
             log: &log,
+            follow_up,
         };
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -176,6 +214,154 @@ fn fresh_phase_links_files_commits_manifest_and_converges() {
     assert_eq!(second.changed, 0);
     assert_eq!(second.current, 1);
     assert!(err.is_empty());
+}
+
+fn link(rel: &str, intact: bool) -> repos_link_all::RecordedLink {
+    owned(rel, "ov", intact)
+}
+
+fn owned(rel: &str, owner: &str, intact: bool) -> repos_link_all::RecordedLink {
+    repos_link_all::RecordedLink {
+        rel: rel.into(),
+        owner: owner.into(),
+        intact,
+    }
+}
+
+#[test]
+fn recorded_links_reads_each_record_back_against_its_home_link() {
+    let f = Fixture::new(&[
+        ("a.conf", "a\n"),
+        ("b.conf", "b\n"),
+        ("c.conf", "c\n"),
+        ("d.conf", "d\n"),
+    ]);
+    assert_eq!(f.recorded(), Vec::new(), "no manifest records nothing");
+    assert_eq!(f.run(None, false).0.rc, 0);
+    assert_eq!(
+        f.recorded(),
+        vec![
+            link("a.conf", true),
+            link("b.conf", true),
+            link("c.conf", true),
+            link("d.conf", true),
+        ]
+    );
+    // Retargeted, removed, and replaced with content: none reads back.
+    std::fs::remove_file(f.home.join("a.conf")).unwrap();
+    std::os::unix::fs::symlink(f.root.join("elsewhere"), f.home.join("a.conf")).unwrap();
+    std::fs::remove_file(f.home.join("b.conf")).unwrap();
+    std::fs::remove_file(f.home.join("c.conf")).unwrap();
+    std::fs::write(f.home.join("c.conf"), "local\n").unwrap();
+    assert_eq!(
+        f.recorded(),
+        vec![
+            link("a.conf", false),
+            link("b.conf", false),
+            link("c.conf", false),
+            link("d.conf", true),
+        ]
+    );
+}
+
+#[test]
+fn recorded_links_reads_nothing_from_a_malformed_manifest() {
+    let f = Fixture::new(&[("a.conf", "a\n")]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    let mut manifest = std::fs::read(&f.manifest).unwrap();
+    manifest.extend_from_slice(b"no tab here\n");
+    std::fs::write(&f.manifest, manifest).unwrap();
+    std::fs::remove_file(f.home.join("a.conf")).unwrap();
+    assert_eq!(f.recorded(), Vec::new());
+}
+
+/// Overlays colliding on a path each record it; the last one linked owns
+/// the live link, so only its record counts.
+#[test]
+fn recorded_links_reads_a_collided_path_against_its_last_owner_only() {
+    let f = Fixture::new(&[]);
+    std::fs::create_dir_all(f.manifest.parent().unwrap()).unwrap();
+    std::fs::write(
+        &f.manifest,
+        "shared.conf\ta\t.dotfiles-a/home/shared.conf\n\
+         shared.conf\tb\t.dotfiles-b/home/shared.conf\n\
+         only.conf\ta\t.dotfiles-a/home/only.conf\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(".dotfiles-b/home/shared.conf", f.home.join("shared.conf")).unwrap();
+    assert_eq!(
+        f.recorded(),
+        vec![
+            owned("shared.conf", "b", true),
+            owned("only.conf", "a", false)
+        ]
+    );
+}
+
+#[test]
+fn follow_up_pass_restores_a_replaced_link_without_rendering_a_stage() {
+    let f = Fixture::new(&[("app.conf", "app\n"), ("keep.conf", "keep\n")]);
+    assert_eq!(f.run(Some("4"), false).0.rc, 0);
+    let target = std::fs::read_link(f.home.join("app.conf")).unwrap();
+    std::fs::remove_file(f.home.join("app.conf")).unwrap();
+    std::os::unix::fs::symlink(f.root.join("raw-binary"), f.home.join("app.conf")).unwrap();
+    let (result, out, err) = f.run_follow_up(&[f.entry()], &["app.conf"]);
+    assert_eq!(result.rc, 0);
+    assert_eq!(result.changed_items, vec!["ov overlay linked 1"]);
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+    assert_eq!(std::fs::read_link(f.home.join("app.conf")).unwrap(), target);
+    assert!(f.recorded().iter().all(|link| link.intact));
+}
+
+#[test]
+fn follow_up_pass_reports_conflicts_only_for_the_paths_it_repairs() {
+    let f = Fixture::new(&[("mine.conf", "overlay\n"), ("app.conf", "app\n")]);
+    std::fs::write(f.home.join("mine.conf"), "user\n").unwrap();
+    let (result, _, err) = f.run(Some("4"), false);
+    assert_eq!(result.rc, 0);
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "  skip (would clobber untracked file): mine.conf\n  \
+skip (stale overlay path has local content): mine.conf\n"
+    );
+    std::fs::remove_file(f.home.join("app.conf")).unwrap();
+    std::fs::write(f.home.join("app.conf"), "tool\n").unwrap();
+    let (result, out, err) = f.run_follow_up(&[f.entry()], &["app.conf"]);
+    assert_eq!(result.rc, 0);
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "  skip (would clobber untracked file): app.conf\n  \
+skip (stale overlay path has local content): app.conf\n"
+    );
+    assert_eq!(std::fs::read(f.home.join("app.conf")).unwrap(), b"tool\n");
+}
+
+#[test]
+fn follow_up_pass_skips_an_unusable_overlay_without_repeating_its_warning() {
+    let f = Fixture::new(&[("app.conf", "app\n")]);
+    let plain = f.root.join("plain");
+    stage(&plain, "home/plain.conf", b"plain\n");
+    let entries = vec![
+        f.entry(),
+        format!("plain|{}|file:///plain.git|||git", plain.display()),
+    ];
+    let (result, _, err) = f.run_entries(&entries, Some("4"), false, false);
+    assert_eq!(result.rc, 0);
+    assert_eq!(result.skipped, ["plain".to_string()].into());
+    assert!(
+        String::from_utf8_lossy(&err)
+            .contains("plain overlay path exists but is not a Git worktree"),
+        "the Overlays stage warns: {}",
+        String::from_utf8_lossy(&err)
+    );
+    let (result, out, err) = f.run_follow_up(&entries, &["plain.conf"]);
+    assert_eq!(result.rc, 0);
+    assert_eq!(result.skipped, ["plain".to_string()].into());
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+    assert!(!f.home.join("plain.conf").exists());
 }
 
 #[test]

@@ -556,6 +556,24 @@ case ${1:-} in
       : >"$HOME/.config/dot/config.appended"
       printf '%s\n' "$DOT_TEST_PROVIDER_APPEND_CONFIG" >>"$HOME/.config/dot/config"
     fi
+    if [[ -n ${DOT_TEST_PROVIDER_INODE_OF:-} ]]; then
+      ls -i "$DOT_TEST_PROVIDER_INODE_OF" >"$DOT_TEST_PROVIDER_INODE_RECORD"
+    fi
+    if [[ -n ${DOT_TEST_PROVIDER_PLANT:-} ]]; then
+      (umask 077 && printf '%s\n' 'planted' >"$DOT_TEST_PROVIDER_PLANT")
+    fi
+    if [[ -n ${DOT_TEST_PROVIDER_REPLACE:-} ]]; then
+      # Like a dependency install that relinks its own binary over a path
+      # an overlay owns: a symlink to the raw binary, a regular file, or
+      # nothing at all.
+      rm -f "$DOT_TEST_PROVIDER_REPLACE"
+      case ${DOT_TEST_PROVIDER_REPLACE_WITH:-} in
+        link:*) ln -s "${DOT_TEST_PROVIDER_REPLACE_WITH#link:}" "$DOT_TEST_PROVIDER_REPLACE" ;;
+        file) printf '%s\n' 'provider copy' >"$DOT_TEST_PROVIDER_REPLACE" ;;
+        absent) ;;
+        *) exit 28 ;;
+      esac
+    fi
     if [[ -n ${DOT_TEST_PROVIDER_RELEASES:-} ]]; then
       IFS=: read -ra releases <<<"$DOT_TEST_PROVIDER_RELEASES"
       for release in "${releases[@]}"; do
@@ -776,6 +794,59 @@ raise SystemExit(2)
             .expect("staged release binary");
         }
         staged
+    }
+
+    /// Declare a Git overlay `dev` whose `home/` tree holds `rels`, served
+    /// from a local bare remote, and return the target the first one's
+    /// home link reads once linked (the relative form Dot records for Git
+    /// overlays).
+    fn with_overlay_files(&self, rels: &[&str]) -> String {
+        let seed = self._scratch.path().join("dev-seed");
+        for rel in rels {
+            let file = seed.join("home").join(rel);
+            std::fs::create_dir_all(file.parent().expect("overlay file parent"))
+                .expect("overlay seed tree");
+            std::fs::write(&file, b"overlay file\n").expect("overlay file");
+        }
+        git(&seed, &["init", "-q", "-b", "main"]);
+        git(&seed, &["add", "-A"]);
+        git(
+            &seed,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+        );
+        let origin = self._scratch.path().join("dev.git");
+        let output = dot_test_support::git()
+            .arg("clone")
+            .arg("-q")
+            .arg("--bare")
+            .arg(&seed)
+            .arg(&origin)
+            .stdin(Stdio::null())
+            .output()
+            .expect("clone overlay remote");
+        assert!(
+            output.status.success(),
+            "clone overlay remote: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let descriptors = self.home.join(".config/dot/overlays.d");
+        std::fs::create_dir_all(&descriptors).expect("overlay descriptors");
+        std::fs::write(
+            descriptors.join("10-dev.conf"),
+            format!("url=file://{}\n", origin.display()),
+        )
+        .expect("overlay descriptor");
+        let rel = rels[0];
+        let depth = rel.matches('/').count();
+        format!("{}.dotfiles-dev/home/{rel}", "../".repeat(depth))
     }
 
     /// Install one merge hook (`merge()` body in `script`) and enable
@@ -6683,4 +6754,261 @@ fn process_running_pid_treats_a_reap_during_the_read_as_stopped() {
             .join()
             .expect("probing a process as it is reaped must not panic");
     }
+}
+
+/// A converged client whose `dev` overlay links `.local/bin/hm`: the
+/// fixture, the recorded link target, and the home link path.
+fn overlay_heal_fixture(tag: &str) -> (Fixture, String, PathBuf) {
+    let fixture = Fixture::new(tag);
+    let target = fixture.with_overlay_files(&[".local/bin/hm"]);
+    converge_overlay_heal_fixture(fixture, target)
+}
+
+/// Converge `fixture`, whose `dev` overlay ships `.local/bin/hm` with
+/// home link `target`, and return [`overlay_heal_fixture`]'s triple.
+fn converge_overlay_heal_fixture(fixture: Fixture, target: String) -> (Fixture, String, PathBuf) {
+    let link = fixture.home.join(".local/bin/hm");
+    let output = bounded_output(fixture.command(), 30);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "converging update failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_link(&link).expect("overlay link"),
+        Path::new(&target)
+    );
+    (fixture, target, link)
+}
+
+const OVERLAY_CURRENT: &[u8] =
+    b"[1/4] Overlays   running  checking overlay links                         Ns\n\
+[1/4] Overlays   ok       1 overlay current                              Ns\n\
+[2/4] Tools      running  checking configured dependencies               Ns\n\
+[2/4] Tools      changed  1 changed                                      Ns\n\
+\x20\x20changed  Cargo: 1 changed\n\
+\x20\x20changed  ripgrep                      installed\n\
+[3/4] Configs    running  checking config hooks                          Ns\n\
+[3/4] Configs    ok       no config hooks                                Ns\n\
+[4/4] Cleanup    running  normalizing worktree                           Ns\n\
+[4/4] Cleanup    ok       no base repo                                   Ns\n\
+Done in Ns. Reload your shell: source ~/.bashrc\n";
+
+const OVERLAY_RESTORED: &[u8] =
+    b"[1/4] Overlays   running  checking overlay links                         Ns\n\
+[1/4] Overlays   ok       1 overlay current                              Ns\n\
+[2/4] Tools      running  checking configured dependencies               Ns\n\
+[2/4] Tools      changed  1 changed                                      Ns\n\
+\x20\x20changed  Cargo: 1 changed\n\
+\x20\x20changed  ripgrep                      installed\n\
+\x20\x20changed  restored overlay link replaced during Tools: .local/bin/hm\n\
+[3/4] Configs    running  checking config hooks                          Ns\n\
+[3/4] Configs    ok       no config hooks                                Ns\n\
+[4/4] Cleanup    running  normalizing worktree                           Ns\n\
+[4/4] Cleanup    ok       no base repo                                   Ns\n\
+Done in Ns. Reload your shell: source ~/.bashrc\n";
+
+/// Intact links never rerun the link phase: the manifest the Tools stage
+/// saw is still the published one when the update ends (any link phase
+/// republishes it under a new inode), and nothing new renders.
+#[test]
+fn intact_overlay_links_leave_the_update_unchanged() {
+    use std::os::unix::fs::MetadataExt as _;
+    let (fixture, target, link) = overlay_heal_fixture("shdeps-overlay-heal-noop");
+    let manifest = fixture.state.join("dot/overlay-links");
+    let record = fixture.home.join("manifest-inode");
+    let mut command = fixture.command();
+    command
+        .env("DOT_TEST_PROVIDER_INODE_OF", &manifest)
+        .env("DOT_TEST_PROVIDER_INODE_RECORD", &record);
+    let output = bounded_output(command, 30);
+    assert_cli(&output, 0, OVERLAY_CURRENT, b"");
+    let seen = std::fs::read_to_string(&record).expect("manifest inode the provider saw");
+    let seen: u64 = seen
+        .split_whitespace()
+        .next()
+        .and_then(|inode| inode.parse().ok())
+        .expect("inode field");
+    assert_eq!(
+        std::fs::metadata(&manifest).expect("manifest").ino(),
+        seen,
+        "the link phase ran again after an update that replaced nothing"
+    );
+    assert_eq!(
+        std::fs::read_link(&link).expect("overlay link"),
+        Path::new(&target)
+    );
+}
+
+/// Point the fixture provider's update at `link`, replacing it the way
+/// `with` describes (see `DOT_TEST_PROVIDER_REPLACE_WITH`).
+fn replacing(fixture: &Fixture, link: &Path, with: &str) -> Command {
+    let mut command = fixture.command();
+    command
+        .env("DOT_TEST_PROVIDER_REPLACE", link)
+        .env("DOT_TEST_PROVIDER_REPLACE_WITH", with);
+    command
+}
+
+#[test]
+fn overlay_link_replaced_by_tools_is_restored_in_the_same_update() {
+    let (fixture, target, link) = overlay_heal_fixture("shdeps-overlay-heal");
+    let raw = fixture.home.join(".local/share/shdeps/hm");
+    let output = bounded_output(
+        replacing(&fixture, &link, &format!("link:{}", raw.display())),
+        30,
+    );
+    assert_cli(&output, 0, OVERLAY_RESTORED, b"");
+    assert_eq!(
+        std::fs::read_link(&link).expect("restored overlay link"),
+        Path::new(&target)
+    );
+}
+
+#[test]
+fn overlay_link_removed_by_tools_is_restored_in_the_same_update() {
+    let (fixture, target, link) = overlay_heal_fixture("shdeps-overlay-heal-removed");
+    let output = bounded_output(replacing(&fixture, &link, "absent"), 30);
+    assert_cli(&output, 0, OVERLAY_RESTORED, b"");
+    assert_eq!(
+        std::fs::read_link(&link).expect("restored overlay link"),
+        Path::new(&target)
+    );
+}
+
+#[test]
+fn overlay_link_restored_under_quiet_prints_nothing() {
+    let (fixture, target, link) = overlay_heal_fixture("shdeps-overlay-heal-quiet");
+    let raw = fixture.home.join(".local/share/shdeps/hm");
+    let mut command = replacing(&fixture, &link, &format!("link:{}", raw.display()));
+    command.arg("--quiet");
+    let output = bounded_output(command, 30);
+    assert_cli(&output, 0, b"", b"");
+    assert_eq!(
+        std::fs::read_link(&link).expect("restored overlay link"),
+        Path::new(&target)
+    );
+}
+
+/// Content a tool left where an overlay link was is refused with exactly
+/// the warnings the next Overlays stage would print, and kept.
+#[test]
+fn overlay_path_replaced_with_content_is_refused_like_the_overlays_stage() {
+    const REFUSED: &[u8] = b"  skip (would clobber untracked file): .local/bin/hm\n  \
+skip (stale overlay path has local content): .local/bin/hm\n";
+    let (fixture, _, link) = overlay_heal_fixture("shdeps-overlay-heal-refused");
+    let output = bounded_output(replacing(&fixture, &link, "file"), 30);
+    assert_cli(&output, 0, OVERLAY_CURRENT, REFUSED);
+    assert_eq!(
+        std::fs::read(&link).expect("provider content"),
+        b"provider copy\n"
+    );
+    // The next update's Overlays stage refuses the same path with the same
+    // warnings: the repair pass applied its rules, not looser ones.
+    let output = bounded_output(fixture.command(), 30);
+    assert_cli(&output, 0, OVERLAY_CURRENT, REFUSED);
+    assert_eq!(
+        std::fs::read(&link).expect("provider content"),
+        b"provider copy\n"
+    );
+}
+
+#[test]
+fn overlay_link_restored_under_verbose_renders_only_its_note_after_tools() {
+    let (fixture, target, link) = overlay_heal_fixture("shdeps-overlay-heal-verbose");
+    let raw = fixture.home.join(".local/share/shdeps/hm");
+    let mut command = replacing(&fixture, &link, &format!("link:{}", raw.display()));
+    command.arg("--verbose");
+    let output = bounded_output(command, 30);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let after_tools = stdout
+        .split_once("Tools      changed")
+        .map(|(_, rest)| rest)
+        .expect("Tools row");
+    let rows: Vec<&str> = after_tools
+        .lines()
+        .filter(|line| line.contains("overlay") || line.contains(".local/bin/hm"))
+        .collect();
+    assert_eq!(
+        rows,
+        vec!["  changed  restored overlay link replaced during Tools: .local/bin/hm"],
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_link(&link).expect("restored overlay link"),
+        Path::new(&target)
+    );
+}
+
+#[test]
+fn failed_overlay_link_repair_fails_the_update_and_skips_config_hooks() {
+    const FAILED: &[u8] =
+        b"[1/5] Overlays   running  checking overlay links                         Ns\n\
+[1/5] Overlays   ok       1 overlay current                              Ns\n\
+[2/5] Tools      running  checking configured dependencies               Ns\n\
+[2/5] Tools      changed  1 changed                                      Ns\n\
+\x20\x20changed  Cargo: 1 changed\n\
+\x20\x20changed  ripgrep                      installed\n\
+\x20\x20failed   overlay links replaced during Tools could not be restored\n\
+[3/5] Prune      running  skipping dependency prune                      Ns\n\
+[3/5] Prune      warning  link repair failed; prune skipped              Ns\n\
+[4/5] Configs    running  skipping config hooks                          Ns\n\
+[4/5] Configs    warning  link repair failed; config hooks skipped       Ns\n\
+[5/5] Cleanup    running  normalizing worktree                           Ns\n\
+[5/5] Cleanup    ok       no base repo                                   Ns\n\
+Done with errors in Ns. Reload your shell: source ~/.bashrc\n";
+    let (fixture, _, link) = overlay_heal_fixture("shdeps-overlay-heal-failed");
+    let pending = fixture.state.join("dot/overlay-links.pending");
+    let raw = fixture.home.join(".local/share/shdeps/hm");
+    let mut command = replacing(&fixture, &link, &format!("link:{}", raw.display()));
+    command
+        .env("DOT_TEST_PROVIDER_PLANT", &pending)
+        .env("DOT_SHDEPS_PRUNE", "always");
+    let output = bounded_output(command, 30);
+    assert_cli(
+        &output,
+        1,
+        FAILED,
+        format!(
+            "  warning: unsafe overlay recovery manifest; refusing to link: {}\n",
+            pending.display()
+        )
+        .as_bytes(),
+    );
+    let last_run = std::fs::read_to_string(fixture.state.join("dot/update.last-run"))
+        .expect("last-run record");
+    assert!(last_run.ends_with(" fail manual\n"), "{last_run:?}");
+    assert!(
+        !fixture.home.join("prune-record").exists(),
+        "prune ran after a failed link repair"
+    );
+    assert_eq!(std::fs::read_link(&link).expect("replaced link"), raw);
+}
+
+/// A conflict the Overlays stage already reported this run is not
+/// reported again by the repair pass for a different path.
+#[test]
+fn overlay_link_repair_does_not_repeat_an_earlier_conflict() {
+    let fixture = Fixture::new("shdeps-overlay-heal-conflict");
+    let target = fixture.with_overlay_files(&[".local/bin/hm", ".config/conflict.conf"]);
+    std::fs::create_dir_all(fixture.home.join(".config")).expect("config directory");
+    std::fs::write(fixture.home.join(".config/conflict.conf"), b"mine\n").expect("user file");
+    let (fixture, target, link) = converge_overlay_heal_fixture(fixture, target);
+    const CONFLICT: &[u8] = b"  skip (would clobber untracked file): .config/conflict.conf\n  \
+skip (stale overlay path has local content): .config/conflict.conf\n";
+    let output = bounded_output(fixture.command(), 30);
+    assert_cli(&output, 0, OVERLAY_CURRENT, CONFLICT);
+    let raw = fixture.home.join(".local/share/shdeps/hm");
+    let output = bounded_output(
+        replacing(&fixture, &link, &format!("link:{}", raw.display())),
+        30,
+    );
+    assert_cli(&output, 0, OVERLAY_RESTORED, CONFLICT);
+    assert_eq!(
+        std::fs::read_link(&link).expect("restored overlay link"),
+        Path::new(&target)
+    );
 }

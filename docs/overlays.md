@@ -24,6 +24,18 @@ Tracked base paths receive `skip-worktree` only while an exact managed symlink
 is live. Stale links are removed only when their literal target matches durable
 authority, and the base path is then restored.
 
+Dependencies install after linking, so a tool can replace a path an overlay
+owns (for example, by relinking its own binary over an overlay launcher). After
+the `Tools` stage, `dot update` reads every recorded link back and, only when
+one no longer matches, reruns the link phase under the same ownership and
+conflict rules. A removed link, or one a tool retargeted where the link phase
+may replace a symlink, is restored in the same run and reported under the
+`Tools` row as `restored overlay link replaced during Tools: <path>`. Whatever
+the link phase refuses to replace (content, or a foreign symlink on a tracked
+or `sync=none` path) is kept, with the same warning the next update would
+print. A repair that fails makes the update exit 1 and skips `Prune`, config
+hooks, and the profile lifecycle commit.
+
 Link replacement parks the exact authorized generation in a private sibling
 transaction, publishes without following a late directory, revalidates the
 physical parent identity, and either commits or restores the parked object.
