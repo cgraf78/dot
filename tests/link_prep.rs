@@ -56,6 +56,75 @@ fn git_overlay(root: &Path, home: &Path, name: &str) -> (PathBuf, String) {
     );
     (checkout, source.to_string_lossy().into_owned())
 }
+/// Whether `dir`'s filesystem folds case (APFS and HFS+ by default),
+/// probed at run time so one test body covers both kinds of volume.
+fn case_insensitive(dir: &Path) -> bool {
+    let probe = dir.join("case-probe");
+    std::fs::write(&probe, b"").unwrap();
+    let folded = dir.join("CASE-PROBE").exists();
+    std::fs::remove_file(&probe).unwrap();
+    folded
+}
+
+/// Track `rel` in `checkout`'s index under exactly that spelling, whatever
+/// is on disk. `git add` on a case-insensitive volume (`core.ignorecase`)
+/// would fold the spelling to an existing entry's; the index entry is
+/// what the inventory reads, so the tests pin it directly.
+fn track_spelling(checkout: &Path, home: &Path, rel: &str, body: &[u8]) {
+    let blob = checkout.join(".git/spelling-blob");
+    std::fs::write(&blob, body).unwrap();
+    let mut command = Command::new(dot_test_support::real_tool("git"));
+    command
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home);
+    let out = dot_test_support::isolate_git(&mut command)
+        .args(["hash-object", "-w"])
+        .arg(&blob)
+        .current_dir(checkout)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    std::fs::remove_file(&blob).unwrap();
+    let oid = String::from_utf8(out.stdout).unwrap();
+    git(
+        checkout,
+        home,
+        &[
+            "-c",
+            "core.ignorecase=false",
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{},{rel}", oid.trim()),
+        ],
+    );
+}
+
+/// Every path `checkout`'s index lists, NUL-split.
+fn index_paths(checkout: &Path, home: &Path) -> Vec<String> {
+    let mut command = Command::new(dot_test_support::real_tool("git"));
+    command
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home);
+    let out = dot_test_support::isolate_git(&mut command)
+        .args(["ls-files", "-z"])
+        .current_dir(checkout)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    out.stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect()
+}
+
 fn entry(name: &str, path: &Path, url: &str, sync: &str) -> String {
     format!("{name}|{}|{url}|||{sync}", path.display())
 }
@@ -509,28 +578,26 @@ fn git_inventory_lists_a_conflicted_path_once() {
 
 #[test]
 fn git_inventory_links_one_file_once_across_case_spellings() {
-    // On a case-insensitive volume `README` and `readme` in the index name
-    // one file; a hardlink stands in for that alias here. A differently
-    // named hardlink is a separate path and still links.
+    // The index lists `README` and `readme`; on a case-insensitive volume
+    // both name one file, and linking both would make each replace the
+    // other's link on every run. A case-sensitive volume stands in for the
+    // alias with a hardlink. A differently named hardlink (`other`) is a
+    // separate path on any volume and still links.
     let scope = TempDir::new("link-prep-case").unwrap();
     let home = scope.path().join("home");
     std::fs::create_dir(&home).unwrap();
     let (checkout, url) = git_overlay(scope.path(), &home, "overlay");
-    for name in ["README", "readme", "other"] {
-        stage(&checkout, &format!("home/{name}"), name.as_bytes());
+    let readme = stage(&checkout, "home/README", b"readme\n");
+    std::fs::hard_link(&readme, checkout.join("home/other")).unwrap();
+    if !case_insensitive(&checkout.join("home")) {
+        std::fs::hard_link(&readme, checkout.join("home/readme")).unwrap();
     }
-    git(
-        &checkout,
-        &home,
-        &["add", "home/README", "home/readme", "home/other"],
-    );
-    for alias in ["readme", "other"] {
-        std::fs::remove_file(checkout.join("home").join(alias)).unwrap();
-        std::fs::hard_link(
-            checkout.join("home/README"),
-            checkout.join("home").join(alias),
-        )
-        .unwrap();
+    for rel in ["home/README", "home/readme", "home/other"] {
+        track_spelling(&checkout, &home, rel, b"readme\n");
+    }
+    let tracked = index_paths(&checkout, &home);
+    for rel in ["home/README", "home/readme", "home/other"] {
+        assert!(tracked.iter().any(|path| path == rel), "{tracked:?}");
     }
     let records = git_inventory(&scope, &home, &checkout, &url);
     assert!(
@@ -578,8 +645,17 @@ fn git_inventory_keeps_only_home_records_under_case_insensitive_pathspecs() {
     let home = scope.path().join("home");
     std::fs::create_dir(&home).unwrap();
     let (checkout, url) = git_overlay(scope.path(), &home, "overlay");
+    // The index spells the path `Home/`; on a case-insensitive volume its
+    // file lands in `home/` (one directory), on a case-sensitive one in a
+    // separate `Home/`. Either way the record does not strip to a
+    // home-relative destination and stays out.
     stage(&checkout, "Home/other.conf", b"other\n");
-    git(&checkout, &home, &["add", "Home/other.conf"]);
+    track_spelling(&checkout, &home, "Home/other.conf", b"other\n");
+    let tracked = index_paths(&checkout, &home);
+    assert!(
+        tracked.iter().any(|path| path == "Home/other.conf"),
+        "{tracked:?}"
+    );
     let shim = scope.path().join("bin/git");
     std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
     dot_test_support::install_fixture_executable(
