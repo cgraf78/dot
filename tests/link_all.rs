@@ -676,3 +676,36 @@ fn live_link_progress_reports_non_negative_elapsed() {
         String::from_utf8_lossy(&out)
     );
 }
+
+#[test]
+fn link_to_a_file_the_overlay_stops_tracking_is_removed() {
+    // An earlier generation linked the file (a staged file, or any file
+    // before inventories read the index); once the index no longer lists
+    // it, stale cleanup removes exactly that recorded link and leaves the
+    // checkout's copy alone.
+    let f = Fixture::new(&[("app.conf", "app\n")]);
+    stage(&f.overlay, "home/scratch.conf", b"scratch\n");
+    git(&f.overlay, &f.home, &["add", "home/scratch.conf"]);
+    assert_eq!(f.run(None, false).0.rc, 0);
+    assert!(link_at(&f.home, "scratch.conf").is_some());
+    git(
+        &f.overlay,
+        &f.home,
+        &["rm", "-q", "--cached", "home/scratch.conf"],
+    );
+    let (result, out, err) = f.run(None, false);
+    assert_eq!(result.rc, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(std::fs::symlink_metadata(f.home.join("scratch.conf")).is_err());
+    assert!(link_at(&f.home, "app.conf").is_some());
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .contains("removed: scratch.conf")
+    );
+    let manifest = std::fs::read_to_string(&f.manifest).unwrap();
+    assert!(!manifest.contains("scratch.conf"), "{manifest}");
+    assert_eq!(
+        std::fs::read(f.overlay.join("home/scratch.conf")).unwrap(),
+        b"scratch\n"
+    );
+}

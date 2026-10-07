@@ -17,6 +17,13 @@ activated (lifecycle state `selected-unsupported`), and `dot update` holds the
 installed overlay set until a Dot that knows the key runs; see
 [Held overlay sets](configuration.md#held-overlay-sets).
 
+A Git-backed overlay publishes the files its index tracks under `home/`:
+committed and staged files are linked, while untracked and ignored files in
+the checkout (bytecode caches, editor swap files, scratch notes) never are, so
+`git add` a new file before `dot update` to try it. A filesystem-backed overlay
+has no index and publishes every file under `home/`. A link to a file the
+overlay no longer provides is removed like any other stale link.
+
 Active overlays are synchronized in descriptor order. Their `home/` entries
 are inventoried before mutation, the complete prospective ownership manifest
 is published first, and later overlays win same-relative-path collisions.

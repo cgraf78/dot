@@ -105,6 +105,10 @@ the provider checkout, the legacy Bash runtime marker, and the provider's
 wall-clock freshness stamp. Dynamic engine identity fields in the shared init
 receipt and client-root prefixes in private ledgers are normalized, while
 semantic receipt fields and all other persistent state remain significant.
+The overlay link manifest compares as its live links (the last record per
+path, sorted by path): record order follows each engine's inventory order
+(directory-read order for Bash, Git index order for native), and Bash recorded
+a shared path once per overlay where native records only its winner.
 Configuration and extension inputs must also remain immutable. Only progress
 rows and the completion-summary elapsed field are normalized in captured
 output; diagnostic durations, counts, and versions remain significant.

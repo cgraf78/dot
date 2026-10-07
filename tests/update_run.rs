@@ -798,6 +798,86 @@ fn dirty_update_converges() {
     assert_eq!(bytes, b"overlay-0 payload CHANGED\n");
 }
 
+/// Commit `files` (relative to the overlay repository root) to the shared
+/// overlay remote: `Some(body)` writes the file, `None` removes it.
+fn push_overlay_files(scratch: &Scratch, files: &[(&str, Option<&str>)]) {
+    let seed = scratch.path().join("overlay-0-seed");
+    let origin = scratch.path().join("overlay-0.git");
+    for (rel, body) in files {
+        match body {
+            Some(body) => {
+                let path = seed.join(rel);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+                std::fs::write(path, body).expect("write");
+                git(&seed, &["add", rel]);
+            }
+            None => git(&seed, &["rm", "-q", rel]),
+        }
+    }
+    git(&seed, &["commit", "-qm", "change files"]);
+    git(
+        &seed,
+        &["push", "-q", &origin.to_string_lossy(), "HEAD:main"],
+    );
+}
+
+#[test]
+fn update_links_only_files_the_overlay_tracks() {
+    // A tool that writes into an overlay checkout (a bytecode cache next to
+    // a tracked script, a scratch note) must not publish into $HOME.
+    let scratch = Scratch::new("update-run-tracked-only").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "native", &overlay_origin, &base_origin);
+    push_overlay_files(&scratch, &[("home/.local/bin/tool", Some("#!/bin/sh\n"))]);
+    check_update(&["update"], &home, &state);
+    assert!(home.join(".local/bin/tool").is_symlink());
+    let checkout = home.join(".dotfiles-overlay-0");
+    std::fs::write(checkout.join(".git/info/exclude"), "__pycache__/\n").expect("exclude");
+    let cache = checkout.join("home/.local/bin/__pycache__");
+    std::fs::create_dir_all(&cache).expect("cache dir");
+    std::fs::write(cache.join("tool.cpython-312.pyc"), "bytecode\n").expect("ignored file");
+    std::fs::write(checkout.join("home/notes.txt"), "scratch\n").expect("untracked file");
+    let output = check_update(&["update"], &home, &state);
+    assert!(
+        std::fs::symlink_metadata(home.join(".local/bin/__pycache__")).is_err(),
+        "an ignored file was linked"
+    );
+    assert!(
+        std::fs::symlink_metadata(home.join("notes.txt")).is_err(),
+        "an untracked file was linked"
+    );
+    assert!(home.join(".local/bin/tool").is_symlink());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("1 overlay current"), "{stdout}");
+}
+
+#[test]
+fn update_from_a_git_hook_reads_each_overlay_index() {
+    // A `dot update` run from a Git hook inherits `GIT_INDEX_FILE`; the
+    // overlay inventory must still read the overlay's own index, or every
+    // overlay link would read as no longer provided and be removed.
+    let scratch = Scratch::new("update-run-hook-index").expect("scratch dir");
+    let (overlay_origin, base_origin) = shared_remotes(&scratch);
+    let (home, state) = twin_client(&scratch, "native", &overlay_origin, &base_origin);
+    check_update(&["update"], &home, &state);
+    assert!(home.join("file-000.txt").is_symlink());
+    let foreign = scratch.path().join("hook-index");
+    let output = dot_env(
+        &["update"],
+        &home,
+        &state,
+        &[("GIT_INDEX_FILE", foreign.to_str().expect("utf-8 path"))],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for index in 0..3 {
+        assert!(home.join(format!("file-{index:03}.txt")).is_symlink());
+    }
+}
+
 #[test]
 fn pull_alias_matches_update() {
     let scratch = Scratch::new("update-run-pull").expect("scratch dir");

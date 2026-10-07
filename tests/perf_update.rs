@@ -3579,9 +3579,36 @@ fn dir_holds_only_excluded(root: ClientRoot, full: &Path, home: &Path) -> bool {
     true
 }
 
+/// The overlay link manifest as the set of links it describes: the last
+/// record per path (the one whose link is live), sorted by path. Record
+/// order follows each engine's inventory order (directory-read order for
+/// the Bash `find`, index order for the native Git inventory), and the
+/// Bash baseline recorded a path once per overlay shipping it where the
+/// native engine records only its last provider; neither difference is
+/// converged content.
+fn normalize_overlay_manifest(value: &[u8]) -> Vec<u8> {
+    let mut last: std::collections::BTreeMap<&[u8], &[u8]> = std::collections::BTreeMap::new();
+    for line in value.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let rel = line.split(|byte| *byte == b'\t').next().unwrap_or(line);
+        last.insert(rel, line);
+    }
+    let mut normalized = Vec::with_capacity(value.len());
+    for line in last.values() {
+        normalized.extend_from_slice(line);
+        normalized.push(b'\n');
+    }
+    normalized
+}
+
 fn normalize_state_value(root: Option<ClientRoot>, relative: &Path, value: Vec<u8>) -> Vec<u8> {
     if !matches!(root, Some(ClientRoot::State)) {
         return value;
+    }
+    if relative == Path::new("dot/overlay-links") {
+        return normalize_overlay_manifest(&value);
     }
     if relative != Path::new("dot/init/completed") {
         return value;
@@ -6651,4 +6678,33 @@ fn performance_summary_requires_sample_count_ratio_and_p95() {
         rust: vec![76; RUNS],
     };
     assert!(!summary_row(Workload::FeatureCollision, &slow_composed).passed);
+}
+
+#[test]
+fn overlay_manifest_normalizes_to_its_live_links() {
+    // Record order follows inventory order, and the Bash baseline recorded
+    // a shared path once per overlay; only the last record per path is
+    // live.
+    let bash = b"b\tov\t.dotfiles-ov/home/b\nshared\tov\t.dotfiles-ov/home/shared\n\
+a\tov\t.dotfiles-ov/home/a\nshared\tov2\t.dotfiles-ov2/home/shared\n";
+    let native = b"a\tov\t.dotfiles-ov/home/a\nb\tov\t.dotfiles-ov/home/b\n\
+shared\tov2\t.dotfiles-ov2/home/shared\n";
+    let state = Some(ClientRoot::State);
+    let manifest = Path::new("dot/overlay-links");
+    assert_eq!(
+        normalize_state_value(state, manifest, bash.to_vec()),
+        normalize_state_value(state, manifest, native.to_vec())
+    );
+    // A different live owner still differs.
+    let other = b"a\tov\t.dotfiles-ov/home/a\nb\tov\t.dotfiles-ov/home/b\n\
+shared\tov\t.dotfiles-ov/home/shared\n";
+    assert_ne!(
+        normalize_state_value(state, manifest, bash.to_vec()),
+        normalize_state_value(state, manifest, other.to_vec())
+    );
+    // Other state files stay byte-exact.
+    assert_eq!(
+        normalize_state_value(state, Path::new("dot/other"), bash.to_vec()),
+        bash.to_vec()
+    );
 }
