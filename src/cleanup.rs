@@ -10378,10 +10378,16 @@ os._exit(0)
         let signals = Signals::install().unwrap();
         let scope = dot_test_support::TempDir::new("closed-lease-cancel").unwrap();
         let marker = scope.path().join("descendant.pid");
+        let leader_stderr = scope.path().join("leader.stderr");
         let script = r#"
+import faulthandler
+import os
 import subprocess
 import sys
 import time
+
+# Name a crash on the captured stderr, should this leader ever die early.
+faulthandler.enable()
 
 child = subprocess.Popen(
     # Longer than the 6s settle below: a genuine cancellation
@@ -10395,7 +10401,7 @@ child = subprocess.Popen(
     stderr=subprocess.DEVNULL,
 )
 with open(sys.argv[1], "w", encoding="ascii") as output:
-    output.write(f"{child.pid}\n")
+    output.write(f"{child.pid} {os.getpid()}\n")
 # Only the cancellation ends this leader, and a sender that panics
 # never sends it. Give up after at least 300s, five times the 60s
 # that the cancelled supervision gets.
@@ -10409,27 +10415,61 @@ for _ in range(300):
             .arg(&marker)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(File::create(&leader_stderr).unwrap()));
+        // The fixture's descendant and leader PIDs, once both are written.
+        fn fixture_pids(marker: &Path) -> Option<(u32, u32)> {
+            let text = std::fs::read_to_string(marker).ok()?;
+            let mut pids = text.split_whitespace().filter(|pid| valid_pid(pid));
+            Some((pids.next()?.parse().ok()?, pids.next()?.parse().ok()?))
+        }
         let marker_for_signal = marker.clone();
         let sender = std::thread::spawn(move || {
-            // The fixture creates the marker before writing the child PID,
-            // so existence alone races the write: signal only once the
-            // marker carries a parseable PID.
-            poll_until(Instant::now() + Duration::from_secs(2), || {
-                let ready = std::fs::read_to_string(&marker_for_signal)
-                    .ok()
-                    .is_some_and(|text| valid_pid(text.trim()));
-                Ok(ready.then_some(()))
+            // The fixture creates the marker before writing the PIDs, so
+            // existence alone races the write: signal only once the marker
+            // carries both.
+            let (_, leader) = poll_until(Instant::now() + Duration::from_secs(2), || {
+                Ok(fixture_pids(&marker_for_signal))
             })
             .unwrap();
+            // Only a live leader makes this a cancellation: one that already
+            // exited completed normally, which by design leaves its
+            // own-session descendants running. Record which one this was,
+            // with the cause of an early exit (WNOWAIT keeps the status for
+            // the supervisor).
+            let leader_at_signal = linux_process_info(leader);
+            // SAFETY: siginfo is initialized; waitid writes only this local.
+            let early_exit = unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                let waited = libc::waitid(
+                    libc::P_PID,
+                    leader,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                );
+                (waited == 0 && info.si_pid() != 0).then(|| (info.si_code, info.si_status()))
+            };
             // SAFETY: this helper process owns an installed SIGTERM handler.
             assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+            (leader_at_signal, early_exit)
         });
 
+        reset_global_process_snapshot_calls();
         let started = Instant::now();
         let result = supervise_session(command, None, |_| Ok(())).unwrap();
         let elapsed = started.elapsed();
-        sender.join().unwrap();
+        let snapshots = global_process_snapshot_calls();
+        let (leader_at_signal, early_exit) = sender.join().unwrap();
+        // Tells the two ways to an interrupted result apart: cancellation
+        // walks the process table at least three times, while a leader that
+        // exited first takes normal completion's single-snapshot fast path.
+        let path_detail = || {
+            format!(
+                "leader when signaled: {leader_at_signal:?}; leader exit before the signal \
+                 (si_code, si_status): {early_exit:?}; supervision took {elapsed:?} with \
+                 {snapshots} process snapshots; leader stderr: {:?}",
+                std::fs::read_to_string(&leader_stderr).unwrap_or_default()
+            )
+        };
         // Teardown takes at most about 40s even with late walks (1s TERM
         // grace, about 1.5s hard phase, then up to three late walks, each
         // starting within the 5s budget, and the 10s dying grace plus at most
@@ -10439,11 +10479,8 @@ for _ in range(300):
             elapsed < Duration::from_secs(60),
             "cancelled supervision took {elapsed:?}"
         );
-        let pid = std::fs::read_to_string(&marker)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
+        let (pid, _) = fixture_pids(&marker).unwrap();
+        let pid = i32::try_from(pid).unwrap();
         // A zombie is already dead: signal-zero still succeeds until
         // the (possibly loaded) reaper collects it, so only a live
         // process counts as a cancellation survivor.
@@ -10470,7 +10507,11 @@ for _ in range(300):
             survived = live_descendant(pid);
         }
 
-        assert!(matches!(result, SessionEnd::Interrupted(libc::SIGTERM)));
+        assert!(
+            matches!(result, SessionEnd::Interrupted(libc::SIGTERM)),
+            "{result:?}; {}",
+            path_detail()
+        );
         // On failure, dump the survivor's state: a live `sleep`
         // proves a genuine discovery miss, while any other command
         // proves PID reuse between the kill and the sample.
@@ -10480,7 +10521,7 @@ for _ in range(300):
             let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
                 .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
                 .unwrap_or_else(|_| "<unreadable>".to_string());
-            format!("stat={stat} cmdline={cmdline}")
+            format!("stat={stat} cmdline={cmdline}; {}", path_detail())
         };
         assert!(
             !survived,
