@@ -92,6 +92,11 @@ pub struct Inputs<'a> {
     pub dot_verbose: Option<&'a str>,
     /// `DOT_UI_TOTAL`: link rows print at zero or under verbose.
     pub ui_total: Option<&'a str>,
+    /// Paths whose conflict skips this pass reports (`None`: every path).
+    /// A repair pass after a later stage scopes them to the paths it
+    /// repairs: the Overlays stage already reported every other conflict
+    /// this run, and the skip decisions themselves never change.
+    pub report: Option<&'a HashSet<String>>,
 }
 
 /// Mutable per-overlay link state: the installed-path set (the
@@ -148,6 +153,12 @@ fn is_verbose(dot_verbose: Option<&str>) -> bool {
 /// the shell's `[[ "${DOT_UI_TOTAL:-0}" -eq 0 || ... == 1 ]]`.
 fn link_rows_visible(ui_total: Option<&str>, verbose: bool) -> bool {
     ui_total.and_then(arith_value).unwrap_or(0) == 0 || verbose
+}
+
+/// Whether this pass reports a conflict skip at `rel` (see
+/// [`Inputs::report`]).
+fn reports(inputs: &Inputs<'_>, rel: &str) -> bool {
+    inputs.report.is_none_or(|paths| paths.contains(rel))
 }
 
 /// Append one `_warn` row to the stderr stream.
@@ -397,11 +408,13 @@ fn link_one(
                         rel,
                     )
                 {
-                    warn_row(
-                        err,
-                        inputs.palette,
-                        format!("  skip (would replace unmanaged symlink): {rel}"),
-                    );
+                    if reports(inputs, rel) {
+                        warn_row(
+                            err,
+                            inputs.palette,
+                            format!("  skip (would replace unmanaged symlink): {rel}"),
+                        );
+                    }
                     return Some(FileStep::Skipped);
                 }
                 match crate::repos_overlays::replacement_identity(
@@ -412,27 +425,33 @@ fn link_one(
                     Err(_) => return None,
                 }
             } else if ftype.is_dir() {
-                warn_row(
-                    err,
-                    inputs.palette,
-                    format!("  skip (directory in the way): {rel}"),
-                );
+                if reports(inputs, rel) {
+                    warn_row(
+                        err,
+                        inputs.palette,
+                        format!("  skip (directory in the way): {rel}"),
+                    );
+                }
                 return Some(FileStep::Skipped);
             } else if !tracked {
-                warn_row(
-                    err,
-                    inputs.palette,
-                    format!("  skip (would clobber untracked file): {rel}"),
-                );
+                if reports(inputs, rel) {
+                    warn_row(
+                        err,
+                        inputs.palette,
+                        format!("  skip (would clobber untracked file): {rel}"),
+                    );
+                }
                 return Some(FileStep::Skipped);
             } else {
                 let base = inputs.base?;
                 if !crate::repos_overlays::tracked_path_clean(base, rel) {
-                    warn_row(
-                        err,
-                        inputs.palette,
-                        format!("  skip (would clobber modified tracked file): {rel}"),
-                    );
+                    if reports(inputs, rel) {
+                        warn_row(
+                            err,
+                            inputs.palette,
+                            format!("  skip (would clobber modified tracked file): {rel}"),
+                        );
+                    }
                     return Some(FileStep::Skipped);
                 }
                 match crate::repos_overlays::replacement_identity(
