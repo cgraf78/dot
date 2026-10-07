@@ -1146,7 +1146,7 @@ pub fn write_private_line(
 /// line write: an exclusively-created `0600` sibling. Creation,
 /// chmod, then write matches the shell order, so no signal window
 /// leaves content at umask permissions.
-fn stage_sibling(destination: &Path, contents: &[u8]) -> Option<PathBuf> {
+pub(crate) fn stage_sibling(destination: &Path, contents: &[u8]) -> Option<PathBuf> {
     use std::io::{Read as _, Write as _};
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let parent = destination.parent()?;
@@ -2060,6 +2060,17 @@ pub fn init_safe_relative_path(path: &str) -> bool {
 /// `DirBuilder`. An existing directory (links followed, like
 /// `mkdir -p`) is kept; any other occupant fails.
 pub fn ensure_destination_parent(home: &str, parent: &str) -> bool {
+    ensure_destination_parent_recording(home, parent, &mut Vec::new())
+}
+
+/// [`ensure_destination_parent`], appending the home-relative path of
+/// each directory it creates (outermost first) to `created`, including
+/// one created just before a later step failed.
+pub fn ensure_destination_parent_recording(
+    home: &str,
+    parent: &str,
+    created: &mut Vec<String>,
+) -> bool {
     use std::os::unix::fs::DirBuilderExt as _;
     if parent == home {
         return true;
@@ -2081,8 +2092,13 @@ pub fn ensure_destination_parent(home: &str, parent: &str) -> bool {
         Err(_) => return false,
     };
     let mut current = PathBuf::from(home);
+    let mut current_rel = String::new();
     for component in relative.split('/') {
         current.push(component);
+        if !current_rel.is_empty() {
+            current_rel.push('/');
+        }
+        current_rel.push_str(component);
         // `-d` follows symlinks, matching `mkdir -p` support for
         // user-owned parent indirection.
         if std::fs::metadata(&current).is_ok_and(|meta| meta.is_dir()) {
@@ -2101,6 +2117,7 @@ pub fn ensure_destination_parent(home: &str, parent: &str) -> bool {
         {
             return false;
         }
+        created.push(current_rel.clone());
         if temp::apply_umask_ceiling(&current, Some(0o777), mask).is_err() {
             return false;
         }

@@ -42,6 +42,7 @@ use crate::log::Log;
 use crate::overlays;
 use crate::progress_ui::{Palette, Stage};
 use crate::repos_base::Base;
+use crate::repos_link_dirs;
 use crate::repos_link_exec::{self, OverlayState};
 use crate::repos_link_prep;
 use crate::repos_overlays::{self, AuthorityCache, DestinationInputs};
@@ -117,6 +118,8 @@ pub struct LinkOutcome {
     /// Overlays left untouched (not a worktree, origin mismatch) whose
     /// prior records carried into the new manifest unverified.
     pub skipped: HashSet<String>,
+    /// Stale links stale cleanup removed, in cleanup order.
+    pub removed: Vec<String>,
 }
 
 /// One link the committed manifest records, and whether its home path
@@ -143,10 +146,11 @@ pub struct RecordedLink {
 /// line that does not parse, records nothing: the next link phase owns
 /// reporting an unsafe manifest, and a probe must never invent work.
 ///
-/// Overlays that ship the same path each record it, in link order, and
-/// the last one linked owns the live link (later overlays win), so a
-/// path reads back against its last record only; an earlier owner's
-/// record could never match.
+/// Only the last overlay that ships a path links and records it (later
+/// overlays win), but a manifest an older Dot wrote records it once per
+/// overlay, in link order, with the last one owning the live link; a
+/// path therefore reads back against its last record only, since an
+/// earlier owner's record could never match.
 pub fn recorded_links(home: &str, manifest: &str) -> Vec<RecordedLink> {
     let Ok(content) = std::fs::read(manifest) else {
         return Vec::new();
@@ -458,13 +462,63 @@ fn carry_skipped(
     true
 }
 
+/// Owner of every path the `manifests` record (the last record wins, like
+/// the live link), for reporting removals per overlay. Unreadable or
+/// unparsable records name no owner: the authority load already
+/// validated these files, and a report must never fail the phase.
+fn recorded_owners(manifests: &[String]) -> HashMap<String, String> {
+    let mut owners = HashMap::new();
+    for manifest in manifests {
+        let Ok(content) = std::fs::read(manifest) else {
+            continue;
+        };
+        for line in repos_overlays::stream_lines(&content) {
+            if let Some(record) = repos_overlays::parse_manifest_record(&line) {
+                owners.insert(record.rel, record.owner);
+            }
+        }
+    }
+    owners
+}
+
 /// `_link_overlays`: run the whole link phase natively. Rows land
 /// in `out`/`err` exactly like the shell streams; `stage` renders
 /// the counted-UI open/close the pull lane threads the same way.
 /// Every row reads the wall clock at render time, so progress
 /// stamps can never run behind the stage they update.
+///
+/// The record of directories the phase created
+/// ([`repos_link_dirs::CreatedDirs`]) is loaded first and saved last,
+/// whatever the outcome, so a failure after creating or pruning a
+/// directory still leaves an accurate record (an interrupted run saves
+/// nothing, which only ever keeps directories).
 pub fn link_overlays(
     inputs: &Inputs<'_>,
+    stage: &mut Stage,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> LinkOutcome {
+    let mut dirs = repos_link_dirs::CreatedDirs::load(inputs.manifest, inputs.euid);
+    let outcome = link_phase(inputs, &mut dirs, stage, out, err);
+    if !cancelled() && !dirs.save(inputs.manifest, inputs.home, inputs.tool) {
+        warn_row(
+            err,
+            inputs.palette,
+            &format!(
+                "  warning: could not record overlay link directories: {}",
+                repos_link_dirs::record_path(inputs.manifest).display()
+            ),
+        );
+    }
+    outcome
+}
+
+/// The link phase behind [`link_overlays`], recording the directories it
+/// creates for links in `dirs` and pruning recorded ones that stale
+/// cleanup empties.
+fn link_phase(
+    inputs: &Inputs<'_>,
+    dirs: &mut repos_link_dirs::CreatedDirs,
     stage: &mut Stage,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
@@ -475,6 +529,7 @@ pub fn link_overlays(
         current: 0,
         changed_items: Vec::new(),
         skipped: HashSet::new(),
+        removed: Vec::new(),
     };
     if cancelled() {
         return outcome;
@@ -725,6 +780,35 @@ pub fn link_overlays(
     // every live destination again.
     let mut targets: Vec<(String, String)> = authority.targets.into_iter().collect();
     targets.sort();
+    // Every prepared inventory, read once up front so each overlay knows
+    // which of its paths a later overlay owns (see
+    // [`repos_link_exec::shadowed_paths`]). An unreadable one stays out:
+    // the loop below fails on it before linking that overlay.
+    let mut inventories: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut order: Vec<(String, String)> = Vec::new();
+    for entry in inputs.entries {
+        let (name, path, _, _) = split_entry(entry);
+        let Some(bytes) = prepared
+            .inventories
+            .get(&name)
+            .and_then(|inventory| std::fs::read(inventory).ok())
+        else {
+            continue;
+        };
+        inventories.insert(name.clone(), bytes);
+        order.push((name, format!("{path}/home")));
+    }
+    let shadowed = repos_link_exec::shadowed_paths(
+        &order
+            .iter()
+            .map(|(name, overlay_home)| repos_link_exec::Inventory {
+                name,
+                overlay_home,
+                bytes: &inventories[name],
+            })
+            .collect::<Vec<_>>(),
+    );
+    let unshadowed = HashSet::new();
     let mut overlay_state = OverlayState::new();
     // Overlays left untouched this run; their prior links carry over.
     let mut skipped: HashSet<String> = HashSet::new();
@@ -817,7 +901,7 @@ pub fn link_overlays(
             );
             let _ = out.write_all(&progress);
         }
-        let Some(inventory_path) = prepared.inventories.get(&name) else {
+        let Some(inventory) = inventories.get(&name) else {
             warn_row(
                 err,
                 inputs.palette,
@@ -827,20 +911,6 @@ pub fn link_overlays(
             );
             cleanup(Some(&manifest_new), Some(&inventory_root));
             return outcome;
-        };
-        let inventory = match std::fs::read(inventory_path) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                warn_row(
-                    err,
-                    inputs.palette,
-                    &format!(
-                        "  warning: could not link {name} overlay; recovery authority retained: {pending}"
-                    ),
-                );
-                cleanup(Some(&manifest_new), Some(&inventory_root));
-                return outcome;
-            }
         };
         let overlay_home = format!("{path}/home");
         let link_inputs = repos_link_exec::Inputs {
@@ -869,10 +939,17 @@ pub fn link_overlays(
             dot_quiet: inputs.dot_quiet,
             dot_verbose: inputs.dot_verbose,
             ui_total: inputs.ui_total,
+            shadowed: shadowed.get(&name).unwrap_or(&unshadowed),
             report: inputs.follow_up,
         };
-        match repos_link_exec::link_overlay(&link_inputs, &mut overlay_state, &inventory, out, err)
-        {
+        let linked =
+            repos_link_exec::link_overlay(&link_inputs, &mut overlay_state, inventory, out, err);
+        // Before the failure check: a directory made for a link that then
+        // failed is still one this phase created.
+        for dir in overlay_state.created_dirs.drain(..) {
+            dirs.record(dir);
+        }
+        match linked {
             repos_link_exec::Outcome::Changed(reply) => {
                 outcome.changed += 1;
                 outcome.changed_items.push(reply);
@@ -928,6 +1005,11 @@ pub fn link_overlays(
     let mut stale_rels: Vec<&String> = authority.paths.iter().collect();
     stale_rels.sort();
     let mut stale_header = false;
+    // Removals per previous owner, in first-removal order, for the notes;
+    // owners load on the first removal, before this run's manifest
+    // replaces the records naming them.
+    let mut owners: Option<HashMap<String, String>> = None;
+    let mut unlinked: Vec<(String, i64)> = Vec::new();
     // `DOT_VERBOSE=1` (and the uncounted path) shows the cleaning
     // rows; the counted path stays quiet unless verbose.
     let verbose_rows = !gt_zero(inputs.ui_total) || verbose;
@@ -939,6 +1021,7 @@ pub fn link_overlays(
         if overlay_state.current.contains(rel) {
             continue;
         }
+        let mut removed_link = false;
         let dst = format!("{}/{}", inputs.home, rel);
         match std::fs::symlink_metadata(&dst) {
             Ok(meta) if meta.file_type().is_symlink() => {
@@ -1004,6 +1087,17 @@ pub fn link_overlays(
                 if verbose_rows {
                     inputs.log.log(out, &format!("  removed: {rel}"));
                 }
+                outcome.removed.push(rel.clone());
+                let owner = owners
+                    .get_or_insert_with(|| recorded_owners(&manifests))
+                    .get(rel)
+                    .cloned()
+                    .unwrap_or_default();
+                match unlinked.iter_mut().find(|(seen, _)| *seen == owner) {
+                    Some((_, count)) => *count += 1,
+                    None => unlinked.push((owner, 1)),
+                }
+                removed_link = true;
                 // A removed stale link still falls through to the
                 // base restore below, like the shell branch.
             }
@@ -1047,6 +1141,16 @@ pub fn link_overlays(
                 );
                 cleanup(Some(&manifest_new), Some(&inventory_root));
                 return outcome;
+            }
+        }
+        // After the base restore, which may need the same parents.
+        if removed_link {
+            for dir in dirs.prune_parents(inputs.home, rel) {
+                if verbose_rows {
+                    inputs
+                        .log
+                        .log(out, &format!("  removed empty directory: {dir}"));
+                }
             }
         }
     }
@@ -1156,9 +1260,12 @@ pub fn link_overlays(
         }
     }
     // Counted close: `ok` with a current phrase when nothing
-    // changed, `changed` with both phrases on a mixed run. Notes
-    // print unless verbose already showed the rows.
+    // changed, `changed` with both phrases on a mixed run, plus the
+    // stale links removed (a removal is a change too, even when every
+    // overlay was already current). Notes print unless verbose already
+    // showed the rows.
     if gt_zero(inputs.ui_total) && !follow_up {
+        let removed = outcome.removed.len() as i64;
         let mut parts: Vec<Vec<u8>> = Vec::new();
         if outcome.changed > 0 {
             let mut phrase =
@@ -1166,15 +1273,25 @@ pub fn link_overlays(
             phrase.extend_from_slice(b" changed");
             parts.push(phrase);
         }
-        if outcome.current > 0 || outcome.changed == 0 {
+        if outcome.current > 0 || (outcome.changed == 0 && removed == 0) {
             let mut phrase =
                 crate::progress_ui::count_phrase(outcome.current, b"overlay", Some(b"overlays"));
             phrase.extend_from_slice(b" current");
             parts.push(phrase);
         }
+        if removed > 0 {
+            let mut phrase =
+                crate::progress_ui::count_phrase(removed, b"stale link", Some(b"stale links"));
+            phrase.extend_from_slice(b" removed");
+            parts.push(phrase);
+        }
         let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
         let summary = crate::progress_ui::join_comma(&refs);
-        let status = if outcome.changed > 0 { "changed" } else { "ok" };
+        let status = if outcome.changed > 0 || removed > 0 {
+            "changed"
+        } else {
+            "ok"
+        };
         let close = stage.finish(
             status.as_bytes(),
             &summary,
@@ -1183,6 +1300,17 @@ pub fn link_overlays(
         let _ = out.write_all(&close);
         if !verbose {
             for item in &outcome.changed_items {
+                let note = stage.note(b"changed", item.as_bytes());
+                let _ = out.write_all(&note);
+            }
+            // One note per previous owner, like the linked notes; the
+            // paths themselves show in verbose and uncounted rows.
+            for (owner, count) in &unlinked {
+                let item = if owner.is_empty() {
+                    format!("stale overlay links unlinked {count}")
+                } else {
+                    format!("{owner} overlay unlinked {count}")
+                };
                 let note = stage.note(b"changed", item.as_bytes());
                 let _ = out.write_all(&note);
             }

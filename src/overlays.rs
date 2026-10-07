@@ -850,7 +850,7 @@ pub fn effective_url(url: &str, home: &str) -> String {
 /// spawn pressure (fork bursts under parallel suites) without changing
 /// any definitive answer: both attempts run the same read-only command,
 /// and two failures return the second error.
-fn retry_once<T, E>(mut attempt: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+pub(crate) fn retry_once<T, E>(mut attempt: impl FnMut() -> Result<T, E>) -> Result<T, E> {
     match attempt() {
         Ok(value) => Ok(value),
         Err(_) => {
