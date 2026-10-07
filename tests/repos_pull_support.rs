@@ -118,6 +118,16 @@ fn backup_dir_creates_a_timestamped_leaf_and_fails_closed() {
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn fixture_passwd_lookup_runs_before_parallel_tests() {
+    // The backup test above forks its root `mkdir` while parallel tests
+    // make their first fixture `git()` call. If the linker dropped the
+    // initializer, that call's passwd lookup could overlap the fork again,
+    // the suspected trigger of the macOS pre-handshake child death.
+    assert!(dot_test_support::passwd_home_resolved_before_main());
+}
+
+#[test]
 fn prefixes_and_status_tallies_cover_every_status() {
     assert_eq!(result_prefix("out", 0), "out/000");
     assert_eq!(result_prefix("out", 7), "out/007");

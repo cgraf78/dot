@@ -193,19 +193,54 @@ pub fn select_real_tool(tool: &str, path: &OsStr, launchers: &[PathBuf]) -> Path
 /// The process owner's home directory from passwd, immune to process-wide
 /// `HOME` mutation by parallel tests (writers serialize on their own
 /// guard, but readers like [`real_tool`] do not take it).
-/// Resolved once and cached: the owner's home cannot change under a
-/// running test binary, the cache avoids a syscall per tool lookup, and
-/// a transient lookup failure only fails that one call (the next call
-/// retries) instead of permanently losing the fallback.
+///
+/// Resolved once and cached, since the owner's home cannot change under a
+/// running test binary: before `main` where the platform runs initializers
+/// ([`RESOLVE_PASSWD_HOME`]), otherwise on the first call. A failed lookup
+/// stays cached as absent instead of retrying, because a retry would put
+/// the lookup back into the parallel phase the initializer keeps it out
+/// of; ambient `HOME` still excludes its own launcher then.
 fn passwd_home_dir() -> Option<PathBuf> {
-    static CACHED: OnceLock<PathBuf> = OnceLock::new();
-    if let Some(home) = CACHED.get() {
-        return Some(home.clone());
-    }
-    let home = passwd_home_dir_uncached()?;
-    let _ = CACHED.set(home.clone());
-    Some(home)
+    // Take the initializer's address so the linker keeps its object; plain
+    // `used` lets the macOS linker drop it from test binaries.
+    std::hint::black_box(&RESOLVE_PASSWD_HOME);
+    PASSWD_HOME.get_or_init(passwd_home_dir_uncached).clone()
 }
+
+/// Whether the passwd home was resolved before `main`, outside the
+/// parallel phase. Lets a test prove the linker kept
+/// [`RESOLVE_PASSWD_HOME`] in a binary that depends on this crate, where a
+/// dropped initializer would silently move the lookup back into it.
+pub fn passwd_home_resolved_before_main() -> bool {
+    std::hint::black_box(&RESOLVE_PASSWD_HOME);
+    RESOLVED_BEFORE_MAIN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static PASSWD_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
+static RESOLVED_BEFORE_MAIN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn resolve_passwd_home() {
+    let _ = PASSWD_HOME.set(passwd_home_dir_uncached());
+    RESOLVED_BEFORE_MAIN.store(true, std::sync::atomic::Ordering::Release);
+}
+
+// Look up the passwd home while the test binary is still single-threaded.
+// The engine forks every owned child for its pre-exec launch handshake, and
+// on macOS `backup_dir`'s root `mkdir` child died before that handshake
+// ("failed to fill whole buffer") within milliseconds of the binary
+// starting, when parallel tests make their first, still uncached `git()`
+// lookup. Before the handshake the child runs nothing that can die, so it
+// died inside libSystem's own fork handling; `getpwuid_r` (libinfo talking
+// to opendirectoryd) was the libSystem machinery other threads could be
+// inside at that moment, and forking during it is the suspected trigger.
+#[used]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
+#[cfg_attr(
+    any(target_os = "linux", target_os = "android"),
+    unsafe(link_section = ".init_array")
+)]
+static RESOLVE_PASSWD_HOME: extern "C" fn() = resolve_passwd_home;
 
 fn passwd_home_dir_uncached() -> Option<PathBuf> {
     // SAFETY: getpwuid_r writes only the local entry and buffer; the
