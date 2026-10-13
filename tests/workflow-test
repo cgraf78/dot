@@ -75,7 +75,8 @@ grep -Fq 'if: ${{ success() }}' <<<"$performance_job" ||
 if grep -Fq 'if: ${{ always() }}' <<<"$performance_job"; then
   fail 'performance artifacts must not be uploaded after a failed gate'
 fi
-grep -Fq 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
+# Require a full commit pin, not a specific one, so Dependabot bumps pass.
+grep -Eq 'uses: actions/upload-artifact@[0-9a-f]{40}( |$)' \
   <<<"$performance_job" || fail 'performance artifact upload must use the pinned action'
 for artifact in driver metadata samples summary calibration completion; do
   # shellcheck disable=SC2016 # Workflow expression must remain literal.
