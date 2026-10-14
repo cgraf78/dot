@@ -14372,42 +14372,62 @@ os._exit(0)
         }
         let scope = dot_test_support::TempDir::new("foreground-post-exit-sink-error").unwrap();
         let finished = scope.path().join("writer-finished");
+        let progress = scope.path().join("writer-progress.json");
+        let terminal = scope.path().join("writer-terminal");
         let mut command = Command::new("/usr/bin/python3");
         command
             .args([
                 "-c",
-                r#"import os, select, sys, time
+                r#"import json, os, select, sys, time
 from pathlib import Path
+started = time.monotonic()
+progress = Path(sys.argv[2])
+def report(phase, offset=0, error=None, terminal=False):
+    state = dict(phase=phase, offset=offset, elapsed=time.monotonic()-started,
+                 pid=os.getpid(), error=repr(error), errno=getattr(error, 'errno', None))
+    temporary = progress.with_suffix('.tmp')
+    temporary.write_text(json.dumps(state))
+    temporary.replace(progress)
+    if terminal:
+        Path(sys.argv[3]).write_text('terminal\n')
 leader = os.getpid()
 if os.fork():
     os._exit(0)
 deadline = time.monotonic() + 5
+report('waiting_for_reap')
 while True:
     try:
         os.kill(leader, 0)
     except ProcessLookupError:
         break
     if time.monotonic() >= deadline:
+        report('reap_timeout', terminal=True)
         os._exit(20)
     time.sleep(0.001)
 os.set_blocking(1, False)
 payload = b'x' * (2 * 1024 * 1024)
 offset = 0
+report('writing')
 try:
     while offset < len(payload):
         if time.monotonic() >= deadline:
+            report('write_timeout', offset, terminal=True)
             os._exit(21)
         try:
             offset += os.write(1, payload[offset:])
         except BlockingIOError:
             select.select([], [1], [], 0.01)
-except BrokenPipeError:
+except OSError as error:
+    report('write_error', offset, error, terminal=True)
     os._exit(22)
 Path(sys.argv[1]).write_text('finished\n')
+report('finished', offset, terminal=True)
 os._exit(0)
 "#,
             ])
             .arg(&finished)
+            .arg(&progress)
+            .arg(&terminal)
             .stdin(Stdio::null())
             .stderr(Stdio::null());
         let mut sink = PartialFailure {
@@ -14415,9 +14435,23 @@ os._exit(0)
             bytes: Vec::new(),
         };
         let status = run_foreground_forward_stdout(command, &mut sink);
+        // Read the child's terminal evidence before asserting. The supervisor
+        // may have closed the socket immediately before a writer records its
+        // error, so poll the state rather than assuming that write already ran.
+        let evidence = poll_until(Instant::now() + Duration::from_secs(6), || {
+            Ok(terminal
+                .exists()
+                .then(|| std::fs::read_to_string(&progress)))
+        });
+        let diagnostic = format!(
+            "status={status}, sink_calls={}, sink_bytes={}, writer={evidence:?}, latest={:?}",
+            sink.calls,
+            sink.bytes.len(),
+            std::fs::read_to_string(&progress),
+        );
         assert!(
             finished.exists(),
-            "finite post-exit writer remained blocked"
+            "finite post-exit writer did not finish: {diagnostic}"
         );
         assert_eq!(
             status, 127,
