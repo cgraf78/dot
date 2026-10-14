@@ -1605,112 +1605,119 @@ fn run_update(
                     LimitedWriter::new(&mut relay_out, PROVIDER_CAPTURE_LIMIT_BYTES);
                 let mut bounded_live_err =
                     LimitedWriter::new(&mut relay_err, PROVIDER_CAPTURE_LIMIT_BYTES);
-                let finished = crate::cleanup::supervise_child(command, None, |final_pass| {
-                    // `supervise_child` learns the normal exit status immediately
-                    // before its final drain. Defer that drain's interpretation
-                    // until the status is available below: the provider uses a
-                    // normal `128+signal` exit after cleanup, and acknowledging a
-                    // queued prompt before recognizing that status could release
-                    // new work after cancellation.
-                    if final_pass && !drain_state.failed {
-                        let stdout_result = drain_cumulative_stream(
-                            stdout,
-                            &mut bounded_deferred_stdout,
-                            &mut drain_state.remaining_bytes,
-                            true,
-                        );
-                        let result = match stdout_result {
-                            Ok(()) => drain_cumulative_stream(
+                let mut teardown_diagnostic = Vec::new();
+                let finished = crate::cleanup::supervise_child_reported(
+                    command,
+                    None,
+                    |final_pass| {
+                        // `supervise_child` learns the normal exit status immediately
+                        // before its final drain. Defer that drain's interpretation
+                        // until the status is available below: the provider uses a
+                        // normal `128+signal` exit after cleanup, and acknowledging a
+                        // queued prompt before recognizing that status could release
+                        // new work after cancellation.
+                        if final_pass {
+                            // Lease verification can call us repeatedly after the
+                            // provider exits. Keep both streams draining even after
+                            // a capture failure, without interpreting or releasing
+                            // queued prompts from a cancelled provider.
+                            return drain_cumulative_capture_streams(
+                                stdout,
+                                &mut bounded_deferred_stdout,
                                 stderr_reader,
                                 &mut bounded_final_stderr,
-                                &mut drain_state.remaining_bytes,
                                 true,
-                            ),
-                            Err(error) => {
-                                let _ = stderr_reader.drain_snapshot(&mut std::io::sink(), true);
-                                Err(error)
-                            }
-                        };
-                        if result.is_err() {
-                            drain_state.failed = true;
+                                &mut drain_state.remaining_bytes,
+                                &mut drain_state.failed,
+                            );
                         }
-                        return result;
-                    }
-                    let result = live_provider_pass(
-                        staged_events,
-                        stdout,
-                        pending,
-                        stderr_reader,
-                        final_pass,
-                        &mut bounded_live_err,
-                        drain_state,
-                        |line| {
-                            // Teardown still drains the bounded socket so a TERM
-                            // handler cannot deadlock on backpressure. Cancellation
-                            // never interprets or acknowledges another event.
-                            if crate::cleanup::received_signal().is_none() {
-                                return provider_line(
-                                    line,
-                                    state,
-                                    session,
-                                    stage,
-                                    inputs,
-                                    &mut bounded_live_out,
-                                    live,
-                                    prompt.as_ref().map(|pipe| pipe.path.as_path()),
-                                    remaining_events,
-                                    beat,
-                                );
-                            }
-                            Ok(())
-                        },
-                    );
-                    // Heartbeat: the supervisor ticks every millisecond,
-                    // so a quiet provider redraws its elapsed stamp on
-                    // whole seconds instead of freezing between events.
-                    // Final passes skip it (the finish row follows
-                    // immediately) and failures propagate like event
-                    // renders. A paused prompt skips it too: the provider
-                    // is asking on the terminal (sudo), and a redraw would
-                    // erase its question. The next event resumes the row,
-                    // and so does the terminal once sudo has read the
-                    // password: it turns echo off to read and back on after,
-                    // and the install that follows may run a long time
-                    // without another event. Echo must stay back on for a
-                    // while first: after a wrong password it is on during
-                    // the failure delay, then off again for the retry. Once
-                    // the provider has prompted, echo is watched for the
-                    // rest of its run, so a retry that comes later still
-                    // stops the redraws (without erasing anything: the
-                    // question may already be on the current line).
-                    if session.prompt_active {
-                        echo_watched = true;
-                    }
-                    if echo_watched && !final_pass {
-                        match terminal_echo() {
-                            Some(false) => {
-                                echo_read = true;
-                                echo_back = None;
-                            }
-                            Some(true) if echo_read => {
-                                let back = *echo_back.get_or_insert_with(std::time::Instant::now);
-                                if back.elapsed() >= PROMPT_ECHO_SETTLE {
-                                    echo_read = false;
-                                    echo_back = None;
-                                    crate::shdeps_ui_render::prompt_resume(session);
+                        let result = live_provider_pass(
+                            staged_events,
+                            stdout,
+                            pending,
+                            stderr_reader,
+                            final_pass,
+                            &mut bounded_live_err,
+                            drain_state,
+                            |line| {
+                                // Teardown still drains the bounded socket so a TERM
+                                // handler cannot deadlock on backpressure. Cancellation
+                                // never interprets or acknowledges another event.
+                                if crate::cleanup::received_signal().is_none() {
+                                    return provider_line(
+                                        line,
+                                        state,
+                                        session,
+                                        stage,
+                                        inputs,
+                                        &mut bounded_live_out,
+                                        live,
+                                        prompt.as_ref().map(|pipe| pipe.path.as_path()),
+                                        remaining_events,
+                                        beat,
+                                    );
                                 }
+                                Ok(())
+                            },
+                        );
+                        // Heartbeat: the supervisor ticks every millisecond,
+                        // so a quiet provider redraws its elapsed stamp on
+                        // whole seconds instead of freezing between events.
+                        // Final passes skip it (the finish row follows
+                        // immediately) and failures propagate like event
+                        // renders. A paused prompt skips it too: the provider
+                        // is asking on the terminal (sudo), and a redraw would
+                        // erase its question. The next event resumes the row,
+                        // and so does the terminal once sudo has read the
+                        // password: it turns echo off to read and back on after,
+                        // and the install that follows may run a long time
+                        // without another event. Echo must stay back on for a
+                        // while first: after a wrong password it is on during
+                        // the failure delay, then off again for the retry. Once
+                        // the provider has prompted, echo is watched for the
+                        // rest of its run, so a retry that comes later still
+                        // stops the redraws (without erasing anything: the
+                        // question may already be on the current line).
+                        if session.prompt_active {
+                            echo_watched = true;
+                        }
+                        if echo_watched && !final_pass {
+                            match terminal_echo() {
+                                Some(false) => {
+                                    echo_read = true;
+                                    echo_back = None;
+                                }
+                                Some(true) if echo_read => {
+                                    let back =
+                                        *echo_back.get_or_insert_with(std::time::Instant::now);
+                                    if back.elapsed() >= PROMPT_ECHO_SETTLE {
+                                        echo_read = false;
+                                        echo_back = None;
+                                        crate::shdeps_ui_render::prompt_resume(session);
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
-                    }
-                    if result.is_ok() && !final_pass && !session.prompt_active && !echo_read {
-                        let now = crate::update_engine::now_secs();
-                        if beat.poll(now) {
-                            heartbeat_out.write_all(&stage.tick(now))?;
+                        if result.is_ok() && !final_pass && !session.prompt_active && !echo_read {
+                            let now = crate::update_engine::now_secs();
+                            if beat.poll(now) {
+                                heartbeat_out.write_all(&stage.tick(now))?;
+                            }
                         }
-                    }
-                    result
-                });
+                        result
+                    },
+                    |error| {
+                        // The supervisor aborts queued outward writes on cleanup
+                        // failure. Preserve our diagnostic separately until the
+                        // relay has joined and the caller can render it safely.
+                        let _ = writeln!(
+                            teardown_diagnostic,
+                            "{}: shdeps update: {error}",
+                            crate::cleanup::TEARDOWN_FAILURE_PREFIX,
+                        );
+                    },
+                );
                 let abort_output = match &finished {
                     Ok(crate::cleanup::SessionEnd::Exited(status)) => {
                         status.code().and_then(provider_interruption).is_some()
@@ -1727,6 +1734,7 @@ fn run_update(
                     finished,
                     bounded_live_out.remaining(),
                     bounded_live_err.remaining(),
+                    teardown_diagnostic,
                 )
             })
         };
@@ -1738,9 +1746,20 @@ fn run_update(
     crate::cleanup::resume_outward_writes();
     // A panicking supervisor reads as a failed update, never a crash
     // (the outward-write latch above still resumes first).
-    let Some((finished, live_out_remaining, live_err_remaining)) = supervised else {
+    let Some((finished, live_out_remaining, live_err_remaining, teardown_diagnostic)) = supervised
+    else {
         return failed_output();
     };
+    if !teardown_diagnostic.is_empty()
+        && sink_error
+            .as_ref()
+            .is_none_or(|failure| failure.intentional_abort)
+    {
+        // LiveConsole owns progress-line erasure. Diagnostic bytes are ours,
+        // so they bypass provider capture limits; a failed sink is never
+        // re-entered merely to report its failure.
+        let _ = live_err.write_all(&teardown_diagnostic);
+    }
     let mut bounded_live_out = LimitedWriter {
         output: live_out,
         remaining: live_out_remaining,
@@ -1989,6 +2008,9 @@ pub(crate) struct PruneOutcome {
     /// Captured stderr: provider warnings (for example a failed uninstall
     /// hook), plus Dot's own truncation diagnostic.
     pub(crate) stderr: Vec<u8>,
+    /// Dot's cleanup diagnostic remains reportable when cancellation discards
+    /// the provider's queued output.
+    pub(crate) cleanup_diagnostic: Vec<u8>,
 }
 
 /// Capture sink that keeps the first `remaining` bytes and discards the rest
@@ -2037,6 +2059,7 @@ pub(crate) fn prune(inputs: &Inputs<'_>, prepared: &Prepared) -> PruneOutcome {
         abort: false,
         stdout: Vec::new(),
         stderr,
+        cleanup_diagnostic: Vec::new(),
     };
     let ready = &prepared.0;
     let env = provider_env(inputs, ready);
@@ -2071,16 +2094,28 @@ pub(crate) fn prune(inputs: &Inputs<'_>, prepared: &Prepared) -> PruneOutcome {
         truncated: false,
     };
     let mut relay_failed = false;
-    let finished = crate::cleanup::supervise_child(command, None, |final_pass| {
-        drain_capture_streams(
-            &mut stdout_capture,
-            &mut stdout_sink,
-            &mut stderr_capture,
-            &mut stderr_sink,
-            final_pass,
-            &mut relay_failed,
-        )
-    });
+    let mut teardown_diagnostic = Vec::new();
+    let finished = crate::cleanup::supervise_child_reported(
+        command,
+        None,
+        |final_pass| {
+            drain_capture_streams(
+                &mut stdout_capture,
+                &mut stdout_sink,
+                &mut stderr_capture,
+                &mut stderr_sink,
+                final_pass,
+                &mut relay_failed,
+            )
+        },
+        |error| {
+            let _ = writeln!(
+                teardown_diagnostic,
+                "{}: shdeps prune: {error}",
+                crate::cleanup::TEARDOWN_FAILURE_PREFIX,
+            );
+        },
+    );
     let truncated = stdout_sink.truncated || stderr_sink.truncated;
     if truncated {
         stderr.extend_from_slice(
@@ -2104,6 +2139,7 @@ pub(crate) fn prune(inputs: &Inputs<'_>, prepared: &Prepared) -> PruneOutcome {
                 abort: true,
                 stdout,
                 stderr,
+                cleanup_diagnostic: teardown_diagnostic,
             };
         }
         // Capture sockets failed; the provider was stopped and reaped.
@@ -2115,6 +2151,7 @@ pub(crate) fn prune(inputs: &Inputs<'_>, prepared: &Prepared) -> PruneOutcome {
         abort: false,
         stdout,
         stderr,
+        cleanup_diagnostic: teardown_diagnostic,
     }
 }
 
@@ -2885,8 +2922,9 @@ mod tests {
     use super::{
         CaptureStream, EnsureFailure, Inputs, LimitedWriter, PROVIDER_OUTPUT_LIMIT_ERROR,
         ProviderDrainState, Ready, classify_download_deadline, consume_provider_bytes,
-        download_installer, drain_capture_streams, drain_provider_output, drain_provider_streams,
-        handle_event, interruptible_delay, live_provider_pass, run_update,
+        download_installer, drain_capture_streams, drain_cumulative_capture_streams,
+        drain_provider_output, drain_provider_streams, handle_event, interruptible_delay,
+        live_provider_pass, run_update,
     };
 
     /// A Runtime whose PATH holds only `bin`, rooted in `scratch`.
@@ -4242,6 +4280,94 @@ mod tests {
         assert_eq!(drain_state.remaining_bytes, 0);
         assert!(stderr_output.is_empty());
         assert_capture_empty(&mut stderr);
+    }
+
+    #[test]
+    fn final_capture_budget_persists_across_passes_and_drains_after_overflow() {
+        let (stdout_reader, mut stdout_writer) =
+            std::os::unix::net::UnixStream::pair().expect("stdout capture pair");
+        stdout_reader
+            .set_nonblocking(true)
+            .expect("nonblocking stdout");
+        let mut stdout = CaptureStream {
+            reader: stdout_reader,
+            writer: None,
+        };
+        let (stderr_reader, mut stderr_writer) =
+            std::os::unix::net::UnixStream::pair().expect("stderr capture pair");
+        stderr_reader
+            .set_nonblocking(true)
+            .expect("nonblocking stderr");
+        let mut stderr = CaptureStream {
+            reader: stderr_reader,
+            writer: None,
+        };
+        let mut stdout_output = Vec::new();
+        let mut stderr_output = Vec::new();
+        let mut state = ProviderDrainState {
+            remaining_bytes: 10,
+            failed: false,
+        };
+
+        // Keep writers open between passes, as a post-exit descendant does.
+        // Tiny budgets exercise overflow without a platform throughput race
+        // against the supervisor's bounded lifetime-lease deadline.
+        stdout_writer.write_all(b"first").expect("first stdout");
+        stderr_writer.write_all(b"mid").expect("first stderr");
+        drain_cumulative_capture_streams(
+            &mut stdout,
+            &mut stdout_output,
+            &mut stderr,
+            &mut stderr_output,
+            true,
+            &mut state.remaining_bytes,
+            &mut state.failed,
+        )
+        .expect("first final pass");
+        assert_eq!(stdout_output, b"first");
+        assert_eq!(stderr_output, b"mid");
+        assert_eq!(state.remaining_bytes, 2);
+
+        stdout_writer.write_all(b"xxx").expect("overflow stdout");
+        stderr_writer
+            .write_all(b"discarded")
+            .expect("overflow stderr");
+        let error = drain_cumulative_capture_streams(
+            &mut stdout,
+            &mut stdout_output,
+            &mut stderr,
+            &mut PanicWriter,
+            true,
+            &mut state.remaining_bytes,
+            &mut state.failed,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), PROVIDER_OUTPUT_LIMIT_ERROR);
+        assert!(state.failed);
+        assert_eq!(state.remaining_bytes, 0);
+        assert_capture_empty(&mut stdout);
+        assert_capture_empty(&mut stderr);
+
+        stdout_writer
+            .write_all(b"late stdout")
+            .expect("late stdout");
+        stderr_writer
+            .write_all(b"late stderr")
+            .expect("late stderr");
+        drain_cumulative_capture_streams(
+            &mut stdout,
+            &mut PanicWriter,
+            &mut stderr,
+            &mut PanicWriter,
+            true,
+            &mut state.remaining_bytes,
+            &mut state.failed,
+        )
+        .expect("drain-only final retry");
+        assert_capture_empty(&mut stdout);
+        assert_capture_empty(&mut stderr);
+        assert!(state.failed);
+        assert_eq!(state.remaining_bytes, 0);
     }
 
     #[test]

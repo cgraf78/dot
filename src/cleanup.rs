@@ -934,8 +934,7 @@ fn nested_peer_pid(fd: i32) -> std::io::Result<u32> {
         {
             return Err(std::io::Error::last_os_error());
         }
-        return u32::try_from(pid)
-            .map_err(|_| std::io::Error::other("invalid nested-supervisor peer PID"));
+        u32::try_from(pid).map_err(|_| std::io::Error::other("invalid nested-supervisor peer PID"))
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
@@ -4076,14 +4075,26 @@ pub(crate) enum SessionEnd {
     CleanupIncomplete,
 }
 
+pub(crate) const TEARDOWN_FAILURE_PREFIX: &str = "DOT_TEARDOWN_FAIL";
+
 fn end_after_cleanup(
     cleanup: std::io::Result<std::process::ExitStatus>,
     completed: SessionEnd,
 ) -> SessionEnd {
+    end_after_cleanup_reported(cleanup, completed, &mut |error| {
+        eprintln!("{TEARDOWN_FAILURE_PREFIX}: {error:?}");
+    })
+}
+
+fn end_after_cleanup_reported(
+    cleanup: std::io::Result<std::process::ExitStatus>,
+    completed: SessionEnd,
+    report: &mut dyn FnMut(&std::io::Error),
+) -> SessionEnd {
     match cleanup {
         Ok(_) => completed,
         Err(error) => {
-            eprintln!("DOT_TEARDOWN_FAIL: {error:?}");
+            report(&error);
             CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
             SessionEnd::CleanupIncomplete
         }
@@ -4096,10 +4107,22 @@ fn decide_after_cleanup(
     deferred_error: Option<std::io::Error>,
     completed: impl FnOnce(std::process::ExitStatus) -> SessionEnd,
 ) -> std::io::Result<SessionEnd> {
+    decide_after_cleanup_reported(cleanup, deadline, deferred_error, completed, &mut |error| {
+        eprintln!("{TEARDOWN_FAILURE_PREFIX}: {error:?}");
+    })
+}
+
+fn decide_after_cleanup_reported(
+    cleanup: std::io::Result<std::process::ExitStatus>,
+    deadline: Option<Instant>,
+    deferred_error: Option<std::io::Error>,
+    completed: impl FnOnce(std::process::ExitStatus) -> SessionEnd,
+    report: &mut dyn FnMut(&std::io::Error),
+) -> std::io::Result<SessionEnd> {
     let status = match cleanup {
         Ok(status) => status,
         Err(error) => {
-            eprintln!("DOT_TEARDOWN_FAIL: {error:?}");
+            report(&error);
             CLEANUP_INCOMPLETE.store(true, std::sync::atomic::Ordering::SeqCst);
             return Ok(SessionEnd::CleanupIncomplete);
         }
@@ -5012,6 +5035,7 @@ fn run_foreground_forward_with(
         Forwarded::Stderr => command.stderr(writer),
     };
     let mut scratch = Vec::new();
+    let mut sink_failed = false;
     session_end_status(supervise_child_with_policy(
         command,
         None,
@@ -5022,15 +5046,25 @@ fn run_foreground_forward_with(
                 COMMAND_CAPTURE_TICK_BYTES
             };
             reader.drain(&mut scratch, budget)?;
-            sink.write_all(&scratch)?;
-            // A child on a terminal may end a chunk mid-line on purpose (a
-            // notice waiting for the user): ask the sink to show it now
-            // instead of holding it for a newline.
-            if prompting && !scratch.is_empty() {
-                sink.flush()?;
-            }
+            let delivered = if sink_failed {
+                Ok(())
+            } else {
+                sink.write_all(&scratch).and_then(|()| {
+                    // A terminal child can end mid-line while waiting for the
+                    // user. Flush that notice instead of holding its fragment.
+                    if prompting && !scratch.is_empty() {
+                        sink.flush()
+                    } else {
+                        Ok(())
+                    }
+                })
+            };
+            // A failed write may already have delivered a prefix. Never replay
+            // that chunk or re-enter the failed sink on later teardown ticks;
+            // keep draining the child into bounded discard-only storage.
             scratch.clear();
-            Ok(())
+            sink_failed |= delivered.is_err();
+            delivered
         },
         ForegroundLeasePolicy::TrustLeader,
     ))
@@ -5522,6 +5556,7 @@ pub(crate) enum ForegroundLeasePolicy {
 /// terminal and promises to stop every process tree it creates. Dot therefore
 /// signals and reaps only the exact retained child PID; group delivery would
 /// also target Dot and the invoking shell.
+#[cfg(test)]
 pub(crate) fn supervise_child(
     command: Command,
     deadline: Option<Instant>,
@@ -5537,8 +5572,38 @@ pub(crate) fn supervise_child(
 pub(crate) fn supervise_child_with_policy(
     command: Command,
     deadline: Option<Instant>,
+    tick: impl FnMut(bool) -> std::io::Result<()>,
+    policy: ForegroundLeasePolicy,
+) -> std::io::Result<SessionEnd> {
+    supervise_foreground(command, deadline, tick, policy, |error| {
+        eprintln!("{TEARDOWN_FAILURE_PREFIX}: {error}");
+    })
+}
+
+/// Report cleanup evidence through the caller's ordered output boundary.
+/// Post-exit ticks may repeat while the lease is open; they must drain only,
+/// deferring event interpretation until the provider's exit is classified.
+pub(crate) fn supervise_child_reported(
+    command: Command,
+    deadline: Option<Instant>,
+    tick: impl FnMut(bool) -> std::io::Result<()>,
+    report: impl FnMut(&std::io::Error),
+) -> std::io::Result<SessionEnd> {
+    supervise_foreground(
+        command,
+        deadline,
+        tick,
+        ForegroundLeasePolicy::Strict,
+        report,
+    )
+}
+
+fn supervise_foreground(
+    command: Command,
+    deadline: Option<Instant>,
     mut tick: impl FnMut(bool) -> std::io::Result<()>,
     policy: ForegroundLeasePolicy,
+    mut report: impl FnMut(&std::io::Error),
 ) -> std::io::Result<SessionEnd> {
     let mut child = match spawn_owned_child(command)? {
         OwnedLaunch::Live(child) => child,
@@ -5546,38 +5611,54 @@ pub(crate) fn supervise_child_with_policy(
     };
     loop {
         if let Some(signal) = received_signal() {
-            let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut || tick(false));
+            let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut tick);
             let _ = tick(true);
-            return Ok(end_after_cleanup(
+            return Ok(end_after_cleanup_reported(
                 stopped.status,
                 SessionEnd::Interrupted(signal),
+                &mut report,
             ));
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut || tick(false));
+            let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut tick);
             let deferred_error = stopped.tick_error.or_else(|| tick(true).err());
-            return decide_after_cleanup(stopped.status, deadline, deferred_error, |_| {
-                SessionEnd::TimedOut
-            });
+            return decide_after_cleanup_reported(
+                stopped.status,
+                deadline,
+                deferred_error,
+                |_| SessionEnd::TimedOut,
+                &mut report,
+            );
         }
-        match child.try_wait() {
+        match child.try_wait_with_tick(&mut tick) {
             Ok(Some(status)) => {
                 child.disarm();
-                return decide_after_cleanup(Ok(status), deadline, tick(true).err(), |status| {
-                    SessionEnd::Exited(status)
-                });
+                return decide_after_cleanup_reported(
+                    Ok(status),
+                    deadline,
+                    tick(true).err(),
+                    SessionEnd::Exited,
+                    &mut report,
+                );
             }
             Ok(None) if deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
-                let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut || tick(false));
+                let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut tick);
                 let deferred_error = stopped.tick_error.or_else(|| tick(true).err());
-                return decide_after_cleanup(stopped.status, deadline, deferred_error, |_| {
-                    SessionEnd::TimedOut
-                });
+                return decide_after_cleanup_reported(
+                    stopped.status,
+                    deadline,
+                    deferred_error,
+                    |_| SessionEnd::TimedOut,
+                    &mut report,
+                );
             }
             Ok(None) => {}
             Err(error) => {
-                let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut || tick(false));
-                let _ = tick(true);
+                let lease_failure = error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<ForegroundLeaseFailure>());
+                let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut tick);
+                let final_error = tick(true).err();
                 // Passthrough trust: the leader already exited with a
                 // known status and only the lease proof failed — on
                 // normal completion (no signal, no expired deadline)
@@ -5585,16 +5666,40 @@ pub(crate) fn supervise_child_with_policy(
                 // Cancellation, timeout, and the Strict provider
                 // policy keep the fail-closed outcome below.
                 if matches!(policy, ForegroundLeasePolicy::TrustLeader)
+                    && lease_failure
                     && received_signal().is_none()
                     && !deadline.is_some_and(|deadline| Instant::now() >= deadline)
                 {
                     if let Some(status) = child.reaped_status() {
-                        return Ok(SessionEnd::Exited(status));
+                        let failure = error
+                            .into_inner()
+                            .expect("typed foreground lease failure")
+                            .downcast::<ForegroundLeaseFailure>()
+                            .expect("foreground lease evidence");
+                        // Trust covers benign daemon lifetime only. It cannot
+                        // turn a known capture/delivery failure into success.
+                        return failure
+                            .drain_error
+                            .or(final_error)
+                            .map_or(Ok(SessionEnd::Exited(status)), Err);
                     }
                 }
-                return decide_after_cleanup(stopped.status, deadline, Some(error), |_| {
-                    SessionEnd::CleanupIncomplete
-                });
+                // The reaped fast path only does a zero-time recheck. Keep the
+                // first proof's duration and socket error rather than replacing
+                // that evidence with the recheck's generic timeout.
+                let mut deferred = Some(error);
+                let cleanup = if lease_failure && stopped.status.is_err() {
+                    Err(deferred.take().expect("initial lease failure"))
+                } else {
+                    stopped.status
+                };
+                return decide_after_cleanup_reported(
+                    cleanup,
+                    deadline,
+                    deferred,
+                    |_| SessionEnd::CleanupIncomplete,
+                    &mut report,
+                );
             }
         }
         // Observe an already-published exit before interpreting another live
@@ -5608,30 +5713,80 @@ pub(crate) fn supervise_child_with_policy(
             // group-signal in the caller's foreground session. Give it TERM
             // even when output delivery failed, and keep draining during the
             // grace period so its cleanup cannot deadlock behind a full pipe.
-            let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut || tick(false));
+            let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut tick);
             let _ = tick(true);
-            return decide_after_cleanup(stopped.status, deadline, Some(error), |_| {
-                SessionEnd::CleanupIncomplete
-            });
+            return decide_after_cleanup_reported(
+                stopped.status,
+                deadline,
+                Some(error),
+                |_| SessionEnd::CleanupIncomplete,
+                &mut report,
+            );
         }
         if let Some(signal) = received_signal() {
-            let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut || tick(false));
+            let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut tick);
             let _ = tick(true);
-            return Ok(end_after_cleanup(
+            return Ok(end_after_cleanup_reported(
                 stopped.status,
                 SessionEnd::Interrupted(signal),
+                &mut report,
             ));
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut || tick(false));
+            let stopped = child.stop_with_tick_outcome(libc::SIGTERM, &mut tick);
             let deferred_error = stopped.tick_error.or_else(|| tick(true).err());
-            return decide_after_cleanup(stopped.status, deadline, deferred_error, |_| {
-                SessionEnd::TimedOut
-            });
+            return decide_after_cleanup_reported(
+                stopped.status,
+                deadline,
+                deferred_error,
+                |_| SessionEnd::TimedOut,
+                &mut report,
+            );
         }
         // One-millisecond exit polling, matching the session supervisor:
         // short foreground commands otherwise overshoot every reap.
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Evidence captured from the retained foreground child, never by inspecting
+/// its numeric PID after reap (that PID may already belong to another process).
+#[derive(Debug)]
+struct ForegroundLeaseFailure {
+    leader: u32,
+    status: Option<std::process::ExitStatus>,
+    elapsed: Duration,
+    cause: std::io::Error,
+    drain_error: Option<std::io::Error>,
+}
+
+impl std::fmt::Display for ForegroundLeaseFailure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            out,
+            "foreground lease verification failed (original leader PID {}, ",
+            self.leader
+        )?;
+        match self.status {
+            Some(status) => write!(out, "reaped status {status}, ")?,
+            None => write!(out, "leader status unavailable, ")?,
+        }
+        write!(
+            out,
+            "waited {}ms): {}",
+            self.elapsed.as_millis(),
+            self.cause
+        )?;
+        if let Some(error) = &self.drain_error {
+            write!(out, "; output draining also failed: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ForegroundLeaseFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
     }
 }
 
@@ -5685,12 +5840,15 @@ impl OwnedChild {
         self.reaped
     }
 
-    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+    fn try_wait_with_tick(
+        &mut self,
+        tick: &mut dyn FnMut(bool) -> std::io::Result<()>,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
         if let Some(status) = self.reaped {
             // Already reaped: the PID has been free since the reap,
             // so only re-prove the lease here — never signal (the
             // stop path's reaped fast path owns that invariant).
-            self.prove_lease_closed()?;
+            self.prove_lease_closed(tick)?;
             return Ok(Some(status));
         }
         let status = self.child().try_wait()?;
@@ -5698,21 +5856,78 @@ impl OwnedChild {
             // std `try_wait` reaps on success: record it before the
             // lease poll, during which the PID stays free.
             self.reaped = status;
-            self.prove_lease_closed()?;
+            self.prove_lease_closed(tick)?;
         }
         Ok(status)
     }
 
-    fn prove_lease_closed(&mut self) -> std::io::Result<()> {
-        let Some(lease) = self.lease.as_mut() else {
+    /// Keep servicing capture backpressure after reap. Every tick is drain-only:
+    /// a provider may have queued a prompt before exiting with 128+signal, so
+    /// interpreting or acknowledging events here could restart cancelled work.
+    fn prove_lease_closed(
+        &mut self,
+        tick: &mut dyn FnMut(bool) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if self.lease.is_none() {
             return Ok(());
-        };
-        poll_until(cleanup_deadline(), || {
-            lease.closed().map(|closed| closed.then_some(()))
-        })
-        .map_err(|_| {
-            std::io::Error::other("foreground subprocess descendants retained their lifetime lease")
-        })
+        }
+        let started = Instant::now();
+        let deadline = cleanup_deadline();
+        let mut tick_error = None;
+        loop {
+            match self.lease.as_mut().expect("foreground lease").closed() {
+                Ok(true) => return tick_error.map_or(Ok(()), Err),
+                Err(error) => return Err(self.lease_error(started, error, tick_error)),
+                Ok(false) => {}
+            }
+            // Continue bounded draining even after a delivery or capture-limit
+            // error. The provider callback switches to discard-only mode, so a
+            // failed sink cannot hold its writers open until this deadline.
+            if let Err(error) = tick(true) {
+                if tick_error.is_none() {
+                    tick_error = Some(error);
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                // The final drain may have just let the last writer exit.
+                return match self.lease.as_mut().expect("foreground lease").closed() {
+                    Ok(true) => tick_error.map_or(Ok(()), Err),
+                    Err(error) => Err(self.lease_error(started, error, tick_error)),
+                    Ok(false) => {
+                        Err(self.lease_error(started, Self::open_lease_error(), tick_error))
+                    }
+                };
+            }
+            std::thread::sleep(
+                Duration::from_millis(1).min(deadline.saturating_duration_since(now)),
+            );
+        }
+    }
+
+    fn open_lease_error() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "foreground subprocess descendants retained their lifetime lease",
+        )
+    }
+
+    fn lease_error(
+        &self,
+        started: Instant,
+        cause: std::io::Error,
+        drain_error: Option<std::io::Error>,
+    ) -> std::io::Error {
+        std::io::Error::new(
+            cause.kind(),
+            ForegroundLeaseFailure {
+                leader: self.child.as_ref().expect("retained child").id(),
+                status: self.reaped,
+                elapsed: started.elapsed(),
+                cause,
+                drain_error,
+            },
+        )
     }
 
     fn disarm(&mut self) {
@@ -5727,13 +5942,14 @@ impl OwnedChild {
         signal: i32,
         tick: &mut dyn FnMut() -> std::io::Result<()>,
     ) -> std::io::Result<std::process::ExitStatus> {
-        self.stop_with_tick_outcome(signal, tick).into_result()
+        self.stop_with_tick_outcome(signal, &mut |_| tick())
+            .into_result()
     }
 
     fn stop_with_tick_outcome(
         &mut self,
         signal: i32,
-        tick: &mut dyn FnMut() -> std::io::Result<()>,
+        tick: &mut dyn FnMut(bool) -> std::io::Result<()>,
     ) -> StopOutcome {
         if let Some(status) = self.reaped {
             // Already reaped: the numeric PID has been free since
@@ -5744,16 +5960,15 @@ impl OwnedChild {
             // caller just ran a full-deadline lease poll, so one
             // non-blocking recheck catches a just-closed race; the
             // outcome reports the lease proof directly.
+            let started = Instant::now();
             let lease_closed = match self.lease.as_mut() {
-                None => true,
-                Some(lease) => lease.closed().unwrap_or(false),
+                None => Ok(true),
+                Some(lease) => lease.closed(),
             };
-            let outcome = if lease_closed {
-                Ok(status)
-            } else {
-                Err(std::io::Error::other(
-                    "foreground subprocess descendants retained their lifetime lease",
-                ))
+            let outcome = match lease_closed {
+                Ok(true) => Ok(status),
+                Ok(false) => Err(self.lease_error(started, Self::open_lease_error(), None)),
+                Err(error) => Err(self.lease_error(started, error, None)),
             };
             self.disarm();
             return StopOutcome {
@@ -5768,7 +5983,7 @@ impl OwnedChild {
         // (notably on macOS, where small socket buffers fill fast).
         // Best-effort unblock; errors are observed on the grace ticks.
         for _ in 0..4 {
-            let _ = tick();
+            let _ = tick(false);
         }
         signal_pid(pid, signal);
         if signal != libc::SIGKILL {
@@ -5783,7 +5998,7 @@ impl OwnedChild {
             Instant::now() + Duration::from_millis(GRACE_ATTEMPTS as u64 * GRACE_INTERVAL_MS);
         let mut tick_error = None;
         loop {
-            match self.try_wait() {
+            match self.try_wait_with_tick(tick) {
                 Err(error) => {
                     return StopOutcome {
                         status: Err(error),
@@ -5806,7 +6021,7 @@ impl OwnedChild {
                     // (notably on macOS, where small socket buffers and
                     // loaded-timer oversleep compound).
                     for _ in 0..4 {
-                        if let Err(error) = tick() {
+                        if let Err(error) = tick(false) {
                             // Retain the first delivery failure but continue
                             // teardown. Later ticks may still drain bytes from the
                             // child-facing socket even when its external sink is
@@ -5823,7 +6038,10 @@ impl OwnedChild {
         let _ = self.child().kill();
         let mut status = wait_child_until(self.child(), cleanup_deadline());
         if status.is_ok() {
-            if let Err(error) = self.prove_lease_closed() {
+            // wait_child_until reaps too: publish that fact before polling
+            // or any fallback can ever address this now-reusable PID.
+            self.reaped = status.as_ref().ok().copied();
+            if let Err(error) = self.prove_lease_closed(tick) {
                 status = Err(error);
             }
         }
@@ -7206,23 +7424,20 @@ fn stop_sessions_with_tick(
         // end of the dying grace, once it has started.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let (mut last_walk, mut dying_until) = (None, None);
-        loop {
-            let pass_deadline =
-                match kill_verification_deadline(Instant::now(), hard_deadline, late_attempts) {
-                    Some(deadline) => {
-                        if deadline > hard_deadline {
-                            late_attempts += 1;
-                        }
-                        deadline
+        while let Some(pass_deadline) = {
+            match kill_verification_deadline(Instant::now(), hard_deadline, late_attempts) {
+                Some(deadline) => {
+                    if deadline > hard_deadline {
+                        late_attempts += 1;
                     }
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
-                    None => match dying_grace_deadline(&sessions, last_walk, &mut dying_until) {
-                        Some(deadline) => deadline,
-                        None => break,
-                    },
-                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                    None => break,
-                };
+                    Some(deadline)
+                }
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                None => dying_grace_deadline(&sessions, last_walk, &mut dying_until),
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                None => None,
+            }
+        } {
             #[cfg(test)]
             let observed = kill_phase_observation_override()
                 .unwrap_or_else(|| observe_sessions(&mut sessions, pass_deadline));
@@ -14114,6 +14329,227 @@ os._exit(0)
             "provider path must stay strict on an open lease, got {end:?}"
         );
         reap_fixture_daemon(&daemon_pidfile);
+    }
+
+    /// An unconnected stream produces a real read error without closing or
+    /// reusing another owner's descriptor, unlike an injected EBADF.
+    fn unreadable_foreground_lease() -> SessionLease {
+        use std::os::fd::FromRawFd as _;
+        let mut lease = SessionLease::install(&mut Command::new("unused")).unwrap();
+        // SAFETY: socket returns one new, uniquely owned descriptor.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        lease.reader = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        lease.reader.set_nonblocking(true).unwrap();
+        lease
+    }
+
+    #[test]
+    fn foreground_post_exit_forwarding_never_reenters_a_failed_sink() {
+        struct PartialFailure {
+            calls: usize,
+            bytes: Vec<u8>,
+            release: PathBuf,
+        }
+        impl std::io::Write for PartialFailure {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                match self.calls {
+                    1 => {
+                        let count = bytes.len().min(7);
+                        self.bytes.extend_from_slice(&bytes[..count]);
+                        Ok(count)
+                    }
+                    2 => {
+                        std::fs::write(&self.release, b"failed\n")?;
+                        Err(std::io::Error::other("injected partial sink failure"))
+                    }
+                    _ => {
+                        self.bytes.extend_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let scope = dot_test_support::TempDir::new("foreground-post-exit-sink-error").unwrap();
+        let finished = scope.path().join("writer-finished");
+        let progress = scope.path().join("writer-progress.json");
+        let terminal = scope.path().join("writer-terminal");
+        let release = scope.path().join("writer-release");
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .args([
+                "-c",
+                r#"import json, os, select, socket, sys, time
+from pathlib import Path
+started = time.monotonic()
+progress = Path(sys.argv[2])
+def report(phase, offset=0, error=None, terminal=False):
+    state = dict(phase=phase, offset=offset, elapsed=time.monotonic()-started,
+                 pid=os.getpid(), error=repr(error), errno=getattr(error, 'errno', None))
+    temporary = progress.with_suffix('.tmp')
+    temporary.write_text(json.dumps(state))
+    temporary.replace(progress)
+    if terminal:
+        Path(sys.argv[3]).write_text('terminal\n')
+leader = os.getpid()
+if os.fork():
+    os._exit(0)
+deadline = time.monotonic() + 5
+report('waiting_for_reap')
+while True:
+    try:
+        os.kill(leader, 0)
+    except ProcessLookupError:
+        break
+    if time.monotonic() >= deadline:
+        report('reap_timeout', terminal=True)
+        os._exit(20)
+    time.sleep(0.001)
+os.set_blocking(1, False)
+# Keep the owner alive: destroying this socket would close stdout. A small
+# actual socket capacity exercises backpressure without a throughput gate.
+stdout_socket = socket.socket(fileno=1)
+stdout_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+capacity = stdout_socket.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+payload = b'x' * (64 * 1024)
+assert len(payload) > capacity, (len(payload), capacity)
+offset = 0
+report('writing')
+try:
+    while offset < len(payload):
+        if time.monotonic() >= deadline:
+            report('write_timeout', offset, terminal=True)
+            os._exit(21)
+        try:
+            # Stop halfway until the sink has actually failed. This forces a
+            # second post-exit tick even if one drain could read all 64KiB.
+            if offset == len(payload) // 2:
+                while not Path(sys.argv[4]).exists():
+                    if time.monotonic() >= deadline:
+                        report('write_timeout', offset, terminal=True)
+                        os._exit(21)
+                    time.sleep(0.001)
+            end = len(payload) // 2 if offset < len(payload) // 2 else len(payload)
+            offset += os.write(1, payload[offset:end])
+        except BlockingIOError:
+            select.select([], [1], [], 0.01)
+except OSError as error:
+    report('write_error', offset, error, terminal=True)
+    os._exit(22)
+Path(sys.argv[1]).write_text('finished\n')
+report('finished', offset, terminal=True)
+os._exit(0)
+"#,
+            ])
+            .arg(&finished)
+            .arg(&progress)
+            .arg(&terminal)
+            .arg(&release)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        let mut sink = PartialFailure {
+            calls: 0,
+            bytes: Vec::new(),
+            release,
+        };
+        let status = run_foreground_forward_stdout(command, &mut sink);
+        // Read the child's terminal evidence before asserting. The supervisor
+        // may have closed the socket immediately before a writer records its
+        // error, so poll the state rather than assuming that write already ran.
+        let evidence = poll_until(Instant::now() + Duration::from_secs(6), || {
+            Ok(terminal
+                .exists()
+                .then(|| std::fs::read_to_string(&progress)))
+        });
+        let diagnostic = format!(
+            "status={status}, sink_calls={}, sink_bytes={}, writer={evidence:?}, latest={:?}",
+            sink.calls,
+            sink.bytes.len(),
+            std::fs::read_to_string(&progress),
+        );
+        assert!(
+            finished.exists(),
+            "finite post-exit writer did not finish: {diagnostic}"
+        );
+        assert_eq!(
+            status, 127,
+            "sink failure must reject successful leader status"
+        );
+        assert_eq!(
+            sink.calls, 2,
+            "failed sink was re-entered during lease draining"
+        );
+        assert_eq!(
+            sink.bytes, b"xxxxxxx",
+            "partially delivered bytes were replayed"
+        );
+    }
+
+    #[test]
+    fn foreground_lease_read_failure_preserves_cause() {
+        let mut lease = unreadable_foreground_lease();
+        let expected = lease.closed().unwrap_err();
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let mut child = OwnedChild::new(command.spawn().unwrap());
+        child.lease = Some(lease);
+        let error = child.prove_lease_closed(&mut |_| Ok(())).unwrap_err();
+        assert_eq!(error.kind(), expected.kind());
+        assert!(error.to_string().contains(&expected.to_string()), "{error}");
+        assert!(!error.to_string().contains("descendants retained"));
+    }
+
+    #[test]
+    fn foreground_trust_does_not_hide_post_exit_delivery_failure_with_open_lease() {
+        let scope = dot_test_support::TempDir::new("foreground-trust-output-error").unwrap();
+        let leader = scope.path().join("leader.pid");
+        let daemon = scope.path().join("daemon.pid");
+        let command = daemonizing_fixture(&leader, &daemon, 0);
+        let mut failed_once = false;
+        let result = supervise_child_with_policy(
+            command,
+            None,
+            |post_exit| {
+                if post_exit && !failed_once {
+                    failed_once = true;
+                    Err(std::io::Error::other("injected post-exit delivery failure"))
+                } else {
+                    Ok(())
+                }
+            },
+            ForegroundLeasePolicy::TrustLeader,
+        );
+        // Keep fixture cleanup before assertions: the trusted leader intentionally
+        // leaves a holder behind, and failure must never leak that test process.
+        reap_fixture_daemon(&daemon);
+        assert!(failed_once, "post-exit capture failure was not exercised");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "injected post-exit delivery failure",
+            "trusted leader success must not mask the capture failure"
+        );
+    }
+
+    #[test]
+    fn foreground_reaped_recheck_preserves_read_failure() {
+        let mut lease = unreadable_foreground_lease();
+        let expected = lease.closed().unwrap_err();
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let mut child = OwnedChild::new(command.spawn().unwrap());
+        child.reaped = Some(child.child().wait().unwrap());
+        child.lease = Some(lease);
+        let error = child
+            .stop_with_tick_outcome(libc::SIGTERM, &mut |_| Ok(()))
+            .status
+            .unwrap_err();
+        assert_eq!(error.kind(), expected.kind());
+        assert!(error.to_string().contains(&expected.to_string()), "{error}");
+        assert!(!error.to_string().contains("descendants retained"));
     }
 
     /// LD_PRELOAD shim sources: interposed `kill(2)` logs every

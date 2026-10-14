@@ -2066,6 +2066,9 @@ fn prune_stage(
     );
     let _ = io.out.write_all(&open);
     let outcome = crate::shdeps_provider::prune(&ready.provider, &ready.prepared);
+    // Cleanup evidence is Dot's own output. Render it through LiveConsole
+    // before cancellation discards the provider's queued removal report.
+    let _ = io.err.write_all(&outcome.cleanup_diagnostic);
     if outcome.interrupted.is_some() {
         return PruneStatus::Stop(interruption_status(outcome.interrupted));
     }
