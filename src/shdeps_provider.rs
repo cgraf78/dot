@@ -2922,8 +2922,9 @@ mod tests {
     use super::{
         CaptureStream, EnsureFailure, Inputs, LimitedWriter, PROVIDER_OUTPUT_LIMIT_ERROR,
         ProviderDrainState, Ready, classify_download_deadline, consume_provider_bytes,
-        download_installer, drain_capture_streams, drain_provider_output, drain_provider_streams,
-        handle_event, interruptible_delay, live_provider_pass, run_update,
+        download_installer, drain_capture_streams, drain_cumulative_capture_streams,
+        drain_provider_output, drain_provider_streams, handle_event, interruptible_delay,
+        live_provider_pass, run_update,
     };
 
     /// A Runtime whose PATH holds only `bin`, rooted in `scratch`.
@@ -4279,6 +4280,94 @@ mod tests {
         assert_eq!(drain_state.remaining_bytes, 0);
         assert!(stderr_output.is_empty());
         assert_capture_empty(&mut stderr);
+    }
+
+    #[test]
+    fn final_capture_budget_persists_across_passes_and_drains_after_overflow() {
+        let (stdout_reader, mut stdout_writer) =
+            std::os::unix::net::UnixStream::pair().expect("stdout capture pair");
+        stdout_reader
+            .set_nonblocking(true)
+            .expect("nonblocking stdout");
+        let mut stdout = CaptureStream {
+            reader: stdout_reader,
+            writer: None,
+        };
+        let (stderr_reader, mut stderr_writer) =
+            std::os::unix::net::UnixStream::pair().expect("stderr capture pair");
+        stderr_reader
+            .set_nonblocking(true)
+            .expect("nonblocking stderr");
+        let mut stderr = CaptureStream {
+            reader: stderr_reader,
+            writer: None,
+        };
+        let mut stdout_output = Vec::new();
+        let mut stderr_output = Vec::new();
+        let mut state = ProviderDrainState {
+            remaining_bytes: 10,
+            failed: false,
+        };
+
+        // Keep writers open between passes, as a post-exit descendant does.
+        // Tiny budgets exercise overflow without a platform throughput race
+        // against the supervisor's bounded lifetime-lease deadline.
+        stdout_writer.write_all(b"first").expect("first stdout");
+        stderr_writer.write_all(b"mid").expect("first stderr");
+        drain_cumulative_capture_streams(
+            &mut stdout,
+            &mut stdout_output,
+            &mut stderr,
+            &mut stderr_output,
+            true,
+            &mut state.remaining_bytes,
+            &mut state.failed,
+        )
+        .expect("first final pass");
+        assert_eq!(stdout_output, b"first");
+        assert_eq!(stderr_output, b"mid");
+        assert_eq!(state.remaining_bytes, 2);
+
+        stdout_writer.write_all(b"xxx").expect("overflow stdout");
+        stderr_writer
+            .write_all(b"discarded")
+            .expect("overflow stderr");
+        let error = drain_cumulative_capture_streams(
+            &mut stdout,
+            &mut stdout_output,
+            &mut stderr,
+            &mut PanicWriter,
+            true,
+            &mut state.remaining_bytes,
+            &mut state.failed,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), PROVIDER_OUTPUT_LIMIT_ERROR);
+        assert!(state.failed);
+        assert_eq!(state.remaining_bytes, 0);
+        assert_capture_empty(&mut stdout);
+        assert_capture_empty(&mut stderr);
+
+        stdout_writer
+            .write_all(b"late stdout")
+            .expect("late stdout");
+        stderr_writer
+            .write_all(b"late stderr")
+            .expect("late stderr");
+        drain_cumulative_capture_streams(
+            &mut stdout,
+            &mut PanicWriter,
+            &mut stderr,
+            &mut PanicWriter,
+            true,
+            &mut state.remaining_bytes,
+            &mut state.failed,
+        )
+        .expect("drain-only final retry");
+        assert_capture_empty(&mut stdout);
+        assert_capture_empty(&mut stderr);
+        assert!(state.failed);
+        assert_eq!(state.remaining_bytes, 0);
     }
 
     #[test]

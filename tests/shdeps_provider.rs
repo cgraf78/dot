@@ -1191,7 +1191,7 @@ os.set_blocking(fd, False)
 line = b"lease-flush:" + b"x" * 8192
 if stream == "stdout":
     line = b'{"event":"warning","status":"warning","detail":"' + line + b'"}'
-payload = (line + b"\n") * int(os.environ.get("DOT_TEST_PROVIDER_POST_EXIT_CHUNKS", "64"))
+payload = (line + b"\n") * 64
 if prompt_path:
     payload += b'{"event":"prompt","status":"running","detail":"waiting"}\n'
 offset = 0
@@ -5442,34 +5442,6 @@ fn provider_retained_lease_diagnostic_erases_the_live_progress_row() {
         "teardown diagnostic glued to live row: {}",
         String::from_utf8_lossy(&bytes)
     );
-}
-
-#[test]
-fn provider_post_exit_capture_overflow_fails_without_leaving_the_writer_blocked() {
-    for stream in ["stdout", "stderr"] {
-        let fixture = Fixture::new(&format!("shdeps-provider-post-exit-overflow-{stream}"));
-        let finished = fixture.home.join("writer-finished");
-        let mut command = fixture.command();
-        command
-            .env("DOT_TEST_PROVIDER_POST_EXIT_STREAM", stream)
-            .env(
-                "DOT_TEST_PROVIDER_POST_EXIT_HELPER",
-                fixture.post_exit_output_helper(),
-            )
-            .env("DOT_TEST_PROVIDER_POST_EXIT_DONE", &finished)
-            .env("DOT_TEST_PROVIDER_POST_EXIT_CHUNKS", "256");
-        let output = bounded_output(command, 10);
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "post-exit {stream} overflow status"
-        );
-        assert!(
-            finished.exists(),
-            "post-exit {stream} writer remained blocked"
-        );
-        assert!(output.stdout.len() <= 2 * 1024 * 1024 && output.stderr.len() <= 2 * 1024 * 1024);
-    }
 }
 
 #[test]
