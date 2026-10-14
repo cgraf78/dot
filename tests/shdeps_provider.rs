@@ -289,6 +289,9 @@ case ${1:-} in
     esac
     ;;
   update)
+    if [[ -n ${DOT_TEST_PROVIDER_POST_EXIT_STREAM:-} ]]; then
+      exec "$DOT_TEST_PROVIDER_PYTHON" "$DOT_TEST_PROVIDER_POST_EXIT_HELPER"
+    fi
     if [[ -n ${DOT_TEST_PROVIDER_EXIT_CODE:-} ]]; then
       exit "$DOT_TEST_PROVIDER_EXIT_CODE"
     fi
@@ -646,6 +649,10 @@ case ${1:-} in
     fi
     ;;
   prune)
+    if [[ -n ${DOT_TEST_PROVIDER_PRUNE_POST_EXIT_HOLD:-} ]]; then
+      export DOT_TEST_PROVIDER_POST_EXIT_HOLD=$DOT_TEST_PROVIDER_PRUNE_POST_EXIT_HOLD
+      exec "$DOT_TEST_PROVIDER_PYTHON" "$DOT_TEST_PROVIDER_POST_EXIT_HELPER"
+    fi
     shift
     printf 'args=%s quiet=%s nested=%s conf=%s prune_env=%s\n' "$*" "${SHDEPS_QUIET:-0}" \
       "${SHDEPS_NESTED:-0}" "${SHDEPS_CONF_DIR:-unset}" "${DOT_SHDEPS_PRUNE-unset}" \
@@ -1135,6 +1142,74 @@ cp "$DOT_TEST_PROVIDER_DIR/install.sh" "$out"
         let mut paths = vec![bin];
         paths.extend(std::env::split_paths(&current));
         std::env::join_paths(paths).expect("escaped curl PATH")
+    }
+
+    /// Finite writer whose inherited lease stays open until its post-exit
+    /// output is drained. Waiting for ESRCH gates the flood on Dot reaping the
+    /// provider, so live-output draining cannot accidentally satisfy the test.
+    fn post_exit_output_helper(&self) -> PathBuf {
+        let helper = self.home.join("post-exit-output-helper.py");
+        write_exec(
+            &helper,
+            br#"#!/usr/bin/env python3
+import os
+import select
+import time
+from pathlib import Path
+
+leader = os.getpid()
+prompt_path = os.environ.get("DOT_TEST_PROVIDER_POST_EXIT_PROMPT_PATH")
+if prompt_path:
+    reader = os.open(os.environ["SHDEPS_PROGRESS_PROMPT_ACK"], os.O_RDONLY | os.O_NONBLOCK)
+    Path(prompt_path).write_text(os.environ["SHDEPS_PROGRESS_PROMPT_ACK"], encoding="utf-8")
+    deadline = time.monotonic() + 10
+    while not Path(os.environ["DOT_TEST_PROVIDER_POST_EXIT_RELEASE"]).exists():
+        if time.monotonic() >= deadline:
+            os._exit(22)
+        time.sleep(0.001)
+if os.fork():
+    os._exit(130 if prompt_path else 0)
+deadline = time.monotonic() + 5
+while True:
+    try:
+        os.kill(leader, 0)
+    except ProcessLookupError:
+        break
+    if time.monotonic() >= deadline:
+        os._exit(23)
+    time.sleep(0.001)
+hold = os.environ.get("DOT_TEST_PROVIDER_POST_EXIT_HOLD")
+if hold:
+    # Cooperatively stop on both assertion failure and normal completion;
+    # tests must not signal an already orphaned PID without stable authority.
+    while not Path(hold).exists() and time.monotonic() < deadline:
+        time.sleep(0.001)
+    os._exit(0)
+stream = os.environ["DOT_TEST_PROVIDER_POST_EXIT_STREAM"]
+fd = 1 if stream == "stdout" else 2
+os.set_blocking(fd, False)
+line = b"lease-flush:" + b"x" * 8192
+if stream == "stdout":
+    line = b'{"event":"warning","status":"warning","detail":"' + line + b'"}'
+payload = (line + b"\n") * int(os.environ.get("DOT_TEST_PROVIDER_POST_EXIT_CHUNKS", "64"))
+if prompt_path:
+    payload += b'{"event":"prompt","status":"running","detail":"waiting"}\n'
+offset = 0
+try:
+    while offset < len(payload):
+        if time.monotonic() >= deadline:
+            os._exit(24)
+        try:
+            offset += os.write(fd, payload[offset:])
+        except BlockingIOError:
+            select.select([], [fd], [], 0.01)
+except BrokenPipeError:
+    os._exit(25)
+Path(os.environ["DOT_TEST_PROVIDER_POST_EXIT_DONE"]).write_text("finished\n", encoding="ascii")
+os._exit(0)
+"#,
+        );
+        helper
     }
 
     /// Long-lived escaped-output holder. Callers must spawn it via
@@ -5302,6 +5377,203 @@ fn trusted_provider_exit_interrupts_an_undrained_cli_pipe_without_a_signal() {
                 .expect("provider handle")
                 .observe_stopped(),
         "trusted provider survived its terminal cancellation status"
+    );
+}
+
+#[test]
+fn provider_post_exit_stdout_is_drained_before_verifying_descendant_exit() {
+    assert_provider_post_exit_output("stdout");
+}
+
+#[test]
+fn provider_post_exit_stderr_is_drained_before_verifying_descendant_exit() {
+    assert_provider_post_exit_output("stderr");
+}
+
+#[test]
+fn provider_retained_lease_failure_identifies_the_operation_once() {
+    let fixture = Fixture::new("shdeps-provider-retained-lease-context");
+    let stop = fixture.home.join("holder-stop");
+    let _stop_on_unwind = StopFileOnDrop(stop.clone());
+    let mut command = fixture.command();
+    command
+        .env("DOT_TEST_PROVIDER_POST_EXIT_STREAM", "stdout")
+        .env(
+            "DOT_TEST_PROVIDER_POST_EXIT_HELPER",
+            fixture.post_exit_output_helper(),
+        )
+        .env("DOT_TEST_PROVIDER_POST_EXIT_HOLD", &stop);
+    let output = bounded_output(command, 10);
+    std::fs::write(&stop, b"stop\n").expect("release retained lease holder");
+    assert_eq!(output.status.code(), Some(125));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("DOT_TEARDOWN_FAIL: shdeps update:").count(),
+        1,
+        "teardown diagnostic did not identify its provider operation: {stderr}"
+    );
+    assert!(stderr.contains("lifetime lease"), "missing cause: {stderr}");
+}
+
+#[test]
+fn provider_retained_lease_diagnostic_erases_the_live_progress_row() {
+    let fixture = Fixture::new("shdeps-provider-retained-lease-live");
+    let stop = fixture.home.join("holder-stop");
+    let _stop_on_unwind = StopFileOnDrop(stop.clone());
+    let mut command = fixture.command();
+    command
+        .env("DOT_UI_FORCE_LIVE", "1")
+        .env("DOT_TEST_PROVIDER_POST_EXIT_STREAM", "stdout")
+        .env(
+            "DOT_TEST_PROVIDER_POST_EXIT_HELPER",
+            fixture.post_exit_output_helper(),
+        )
+        .env("DOT_TEST_PROVIDER_POST_EXIT_HOLD", &stop);
+    let (code, bytes) = bounded_combined_output(command, 10);
+    std::fs::write(&stop, b"stop\n").expect("release retained live lease holder");
+    assert_eq!(code, Some(125));
+    let diagnostic = b"DOT_TEARDOWN_FAIL: shdeps update:";
+    let at = bytes
+        .windows(diagnostic.len())
+        .position(|window| window == diagnostic)
+        .unwrap_or_else(|| panic!("diagnostic missing: {}", String::from_utf8_lossy(&bytes)));
+    assert!(
+        bytes[..at].ends_with(b"\r\x1b[K"),
+        "teardown diagnostic glued to live row: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
+
+#[test]
+fn provider_post_exit_capture_overflow_fails_without_leaving_the_writer_blocked() {
+    for stream in ["stdout", "stderr"] {
+        let fixture = Fixture::new(&format!("shdeps-provider-post-exit-overflow-{stream}"));
+        let finished = fixture.home.join("writer-finished");
+        let mut command = fixture.command();
+        command
+            .env("DOT_TEST_PROVIDER_POST_EXIT_STREAM", stream)
+            .env(
+                "DOT_TEST_PROVIDER_POST_EXIT_HELPER",
+                fixture.post_exit_output_helper(),
+            )
+            .env("DOT_TEST_PROVIDER_POST_EXIT_DONE", &finished)
+            .env("DOT_TEST_PROVIDER_POST_EXIT_CHUNKS", "256");
+        let output = bounded_output(command, 10);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "post-exit {stream} overflow status"
+        );
+        assert!(
+            finished.exists(),
+            "post-exit {stream} writer remained blocked"
+        );
+        assert!(output.stdout.len() <= 2 * 1024 * 1024 && output.stderr.len() <= 2 * 1024 * 1024);
+    }
+}
+
+#[test]
+fn prune_retained_lease_failure_identifies_the_operation_once() {
+    let fixture = Fixture::new("shdeps-prune-retained-lease-context");
+    let stop = fixture.home.join("holder-stop");
+    let _stop_on_unwind = StopFileOnDrop(stop.clone());
+    let mut command = pruning(&fixture, Some("always"));
+    command
+        .env(
+            "DOT_TEST_PROVIDER_POST_EXIT_HELPER",
+            fixture.post_exit_output_helper(),
+        )
+        .env("DOT_TEST_PROVIDER_PRUNE_POST_EXIT_HOLD", &stop);
+    let output = bounded_output(command, 10);
+    std::fs::write(&stop, b"stop\n").expect("release retained prune lease holder");
+    assert_eq!(output.status.code(), Some(125));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("DOT_TEARDOWN_FAIL: shdeps prune:").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains("lifetime lease"), "missing cause: {stderr}");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn provider_post_exit_draining_does_not_acknowledge_cancelled_prompts() {
+    let fixture = Fixture::new("shdeps-provider-post-exit-cancelled-prompt");
+    let prompt_path_file = fixture.home.join("prompt-path");
+    let release = fixture.home.join("writer-release");
+    let finished = fixture.home.join("writer-finished");
+    let mut command = fixture.command();
+    command
+        .env("DOT_TEST_PROVIDER_POST_EXIT_STREAM", "stdout")
+        .env(
+            "DOT_TEST_PROVIDER_POST_EXIT_HELPER",
+            fixture.post_exit_output_helper(),
+        )
+        .env("DOT_TEST_PROVIDER_POST_EXIT_DONE", &finished)
+        .env("DOT_TEST_PROVIDER_POST_EXIT_PROMPT_PATH", &prompt_path_file)
+        .env("DOT_TEST_PROVIDER_POST_EXIT_RELEASE", &release)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut dot = spawn_test_session(command);
+    assert!(
+        wait_for_nonempty(&prompt_path_file, 10),
+        "provider did not publish prompt FIFO"
+    );
+    let prompt_path = std::fs::read_to_string(&prompt_path_file).expect("prompt FIFO path");
+    let mut observer = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(prompt_path)
+        .expect("open prompt FIFO observer");
+    std::fs::write(&release, b"ready\n").expect("release post-exit provider");
+    assert!(
+        dot.wait_bounded(std::time::Duration::from_secs(10)),
+        "Dot did not exit"
+    );
+    let status = dot.reap().expect("reap interrupted Dot");
+    let acknowledgement = read_nonblocking_to_end(&mut observer, std::time::Duration::from_secs(2));
+    assert_eq!(status.code(), Some(130));
+    assert!(finished.exists(), "post-exit writer never finished");
+    assert!(
+        acknowledgement.is_empty(),
+        "cancelled prompt was acknowledged: {acknowledgement:?}"
+    );
+}
+
+/// Removing post-exit capture draining must fail even though the provider
+/// leader exits successfully: its finite child needs that drain to finish.
+fn assert_provider_post_exit_output(stream: &str) {
+    let fixture = Fixture::new(&format!("shdeps-provider-post-exit-{stream}"));
+    let finished = fixture.home.join("writer-finished");
+    let mut command = fixture.command();
+    command
+        .env("DOT_TEST_PROVIDER_POST_EXIT_STREAM", stream)
+        .env(
+            "DOT_TEST_PROVIDER_POST_EXIT_HELPER",
+            fixture.post_exit_output_helper(),
+        )
+        .env("DOT_TEST_PROVIDER_POST_EXIT_DONE", &finished);
+    let output = bounded_output(command, 10);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "finite post-exit {stream} writer caused teardown failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(finished.exists(), "finite post-exit writer never finished");
+    let bytes = if stream == "stdout" {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    assert_eq!(
+        bytes
+            .windows(b"lease-flush:".len())
+            .filter(|chunk| *chunk == b"lease-flush:")
+            .count(),
+        64,
+        "post-exit {stream} output was lost"
     );
 }
 
