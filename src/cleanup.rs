@@ -14349,6 +14349,7 @@ os._exit(0)
         struct PartialFailure {
             calls: usize,
             bytes: Vec<u8>,
+            release: PathBuf,
         }
         impl std::io::Write for PartialFailure {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -14359,7 +14360,10 @@ os._exit(0)
                         self.bytes.extend_from_slice(&bytes[..count]);
                         Ok(count)
                     }
-                    2 => Err(std::io::Error::other("injected partial sink failure")),
+                    2 => {
+                        std::fs::write(&self.release, b"failed\n")?;
+                        Err(std::io::Error::other("injected partial sink failure"))
+                    }
                     _ => {
                         self.bytes.extend_from_slice(bytes);
                         Ok(bytes.len())
@@ -14374,11 +14378,12 @@ os._exit(0)
         let finished = scope.path().join("writer-finished");
         let progress = scope.path().join("writer-progress.json");
         let terminal = scope.path().join("writer-terminal");
+        let release = scope.path().join("writer-release");
         let mut command = Command::new("/usr/bin/python3");
         command
             .args([
                 "-c",
-                r#"import json, os, select, sys, time
+                r#"import json, os, select, socket, sys, time
 from pathlib import Path
 started = time.monotonic()
 progress = Path(sys.argv[2])
@@ -14405,7 +14410,13 @@ while True:
         os._exit(20)
     time.sleep(0.001)
 os.set_blocking(1, False)
-payload = b'x' * (2 * 1024 * 1024)
+# Keep the owner alive: destroying this socket would close stdout. A small
+# actual socket capacity exercises backpressure without a throughput gate.
+stdout_socket = socket.socket(fileno=1)
+stdout_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+capacity = stdout_socket.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+payload = b'x' * (64 * 1024)
+assert len(payload) > capacity, (len(payload), capacity)
 offset = 0
 report('writing')
 try:
@@ -14414,7 +14425,16 @@ try:
             report('write_timeout', offset, terminal=True)
             os._exit(21)
         try:
-            offset += os.write(1, payload[offset:])
+            # Stop halfway until the sink has actually failed. This forces a
+            # second post-exit tick even if one drain could read all 64KiB.
+            if offset == len(payload) // 2:
+                while not Path(sys.argv[4]).exists():
+                    if time.monotonic() >= deadline:
+                        report('write_timeout', offset, terminal=True)
+                        os._exit(21)
+                    time.sleep(0.001)
+            end = len(payload) // 2 if offset < len(payload) // 2 else len(payload)
+            offset += os.write(1, payload[offset:end])
         except BlockingIOError:
             select.select([], [1], [], 0.01)
 except OSError as error:
@@ -14428,11 +14448,13 @@ os._exit(0)
             .arg(&finished)
             .arg(&progress)
             .arg(&terminal)
+            .arg(&release)
             .stdin(Stdio::null())
             .stderr(Stdio::null());
         let mut sink = PartialFailure {
             calls: 0,
             bytes: Vec::new(),
+            release,
         };
         let status = run_foreground_forward_stdout(command, &mut sink);
         // Read the child's terminal evidence before asserting. The supervisor
