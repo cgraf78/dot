@@ -9,7 +9,7 @@ packaging, and test-harness boundaries.
 ## Layout
 
 - `src/lib.rs` owns the implementation (one module per domain); `src/main.rs`
-  only passes exit codes through. `bin/dot` is the development adapter;
+  is a thin adapter over `dot::cli`. `bin/dot` is the development adapter;
   releases install the compiled binary directly.
 - `build.rs` resolves the build commit from `DOT_BUILD_COMMIT`, then
   `GITHUB_SHA`, then `git rev-parse HEAD`, and fails rather than bake in
@@ -24,9 +24,11 @@ packaging, and test-harness boundaries.
 
 ## Invariants
 
-- Output stays byte-exact apart from the exclusions in the historical
-  `docs/rust-port-plan.md` (timing fields, spinner frames). Never drift the
-  TSV contracts without an intentional change.
+- `docs/rust-port-spec.md` is the compatibility and performance record
+  (`tests/perf_budget.rs` checks its budgets); `docs/rust-port-plan.md` is the
+  historical port plan. Output stays byte-exact apart from timing fields,
+  spinner frames, and already-parallel completion order. Never drift the TSV
+  contracts without an intentional change.
 - New parallelism needs a stress test, not just parity tests.
 - Linux-only test code must be cfg-gated: Termux CI compiles every test target
   with `cargo check --locked --tests --target <android>`.
@@ -36,7 +38,7 @@ packaging, and test-harness boundaries.
 
 What CI runs (`test.yml` plus the shared `rust-ci` and `shell-ci`):
 
-- `cargo test --locked`, then
+- Two parallel shards: `cargo test --locked`, and
   `cargo build --locked && bash tests/run && bash tests/release-scripts-test`
 - `bash tests/library-test` (shell matrix, no Rust toolchain)
 - `cargo fmt --check`, plus `rustfmt --edition 2024 --check` on the two
@@ -71,7 +73,8 @@ client Git launcher, and owns a `DOT_TEST_TMP` scratch root;
 - `docs/source-provenance-v1.tsv` must list exactly
   `git ls-files install.sh bin lib/dot support tests`; a new file without a
   row fails `tests/provenance-test`.
-- `tests/workflow-test` pins lines of `test.yml`; edit them together.
+- `tests/workflow-test` and `tests/release-scripts-test` pin lines of
+  `test.yml` and `release.yml`; edit them together.
 - Base dotfiles CI installs the latest dot release, so a bad release turns it
   red.
 

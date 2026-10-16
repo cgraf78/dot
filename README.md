@@ -35,12 +35,13 @@ How it compares:
 curl -fsSL https://raw.githubusercontent.com/cgraf78/dot/main/install.sh | bash
 ```
 
-The installer needs only `curl` and runs on stock macOS Bash 3.2. It verifies
+The installer needs `curl`, `tar`, and `sha256sum` or `shasum`, and runs on
+stock macOS Bash 3.2. It verifies
 the release's published SHA-256 checksum, plus its GitHub artifact
 attestation when a logged-in `gh` 2.49 or newer is available (see
 [security.md](docs/security.md)). It links `dot` into `~/.local/bin`
 (`$PREFIX/bin` on Termux), so make sure that directory is on your `PATH`. The
-engine itself needs no shell; user hooks and the Shdeps provider need Bash 4
+engine itself needs no shell; user hooks and shdeps integration need Bash 4
 or newer.
 
 To initialize a client in the same operation:
@@ -62,7 +63,7 @@ own repository, then use the daily commands:
 ```bash
 dot init https://github.com/<you>/dotfiles.git
 dot status   # show base and overlay status
-dot update   # sync repositories, run hooks and any configured provider
+dot update   # sync repositories, run hooks, run shdeps if configured
 dot push     # push the base repository and active Git overlays
 dot doctor   # run health checks
 ```
