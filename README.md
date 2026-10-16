@@ -62,15 +62,15 @@ own repository, then use the daily commands:
 ```bash
 dot init https://github.com/<you>/dotfiles.git
 dot status   # show base and overlay status
-dot update   # sync repositories, run hooks, install tools
+dot update   # sync repositories, run hooks and any configured provider
 dot push     # push the base repository and active Git overlays
 dot doctor   # run health checks
 ```
 
 `dot init` lists any existing files the repository would replace and asks
 before replacing them (pass `--yes` to skip the prompt); replaced files go to
-`~/.dot-backup/`. Run
-`dot help` for every command and `dot init --help` for recovery options.
+`~/.dot-backup/`. Run `dot help` for every command and `dot init --help` for
+recovery options.
 
 ## Runtime model
 
