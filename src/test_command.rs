@@ -531,6 +531,51 @@ pub(crate) fn system_tmpdir(runtime: &Runtime) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
+/// Caller variables that address the live interactive session: the tmux
+/// server and pane, the VS Code window's CLI and Git IPC sockets, the WezTerm
+/// GUI, the X11 or Wayland display (clipboard writes, real windows), and the
+/// SSH agent (signing with the user's keys or prompting a hardware token).
+/// Running `dot test` from a terminal must not let a suite that misses one of
+/// these act on that session. Suites that exercise them set their own fakes.
+///
+/// This removes the environment's pointers, not every route to the session:
+/// libwayland still tries `$XDG_RUNTIME_DIR/wayland-0`, `wezterm cli` finds
+/// the GUI socket itself, and macOS `open` and `pbcopy` need no variable.
+/// `tests/test_command.rs` and `docs/extensions.md` pin this list.
+const LIVE_SESSION_VARIABLES: [&str; 9] = [
+    "TMUX",
+    "TMUX_PANE",
+    "VSCODE_IPC_HOOK_CLI",
+    "VSCODE_GIT_IPC_HANDLE",
+    "WEZTERM_UNIX_SOCKET",
+    "WEZTERM_PANE",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "SSH_AUTH_SOCK",
+];
+
+/// Live-session channels with a default that unsetting would fall back to,
+/// so each gets a value that fails closed instead.
+///
+/// - `TMUX_TMPDIR`: without `TMUX`, a bare `tmux` (or `tmux -L`) resolves its
+///   socket under `/tmp/tmux-UID`, where the user's own server lives, and
+///   tmux also falls back to `/tmp` when `TMUX_TMPDIR` does not exist.
+///   `/dev/null` always exists but cannot hold the `tmux-UID` directory, so
+///   every such client fails before connecting. Tests that need a server
+///   pass `-S` with a socket under `DOT_TEST_SYSTEM_TMPDIR`.
+/// - `BROWSER`: `xdg-open`, `gh`, and `sensible-browser` fall back to the
+///   desktop's opener when it is unset; `false` makes them fail instead.
+///   Python's `webbrowser` still tries its other registered browsers.
+/// - `DBUS_SESSION_BUS_ADDRESS`: GLib and sd-bus fall back to
+///   `$XDG_RUNTIME_DIR/bus`, the live session bus behind desktop
+///   notifications and Secret Service credential lookups; client libraries
+///   reject the unknown `disabled:` transport.
+const LIVE_SESSION_OVERRIDES: [(&str, &str); 3] = [
+    ("TMUX_TMPDIR", "/dev/null"),
+    ("BROWSER", "false"),
+    ("DBUS_SESSION_BUS_ADDRESS", "disabled:"),
+];
+
 /// Prepare the deterministic host Git backend and each suite's environment.
 pub(crate) fn environment(
     context: &Context<'_>,
@@ -602,6 +647,12 @@ pub(crate) fn environment(
     env.remove(OsStr::new("ENV"));
     env.remove(OsStr::new("DOT_CLIENT_GIT_DIR"));
     env.remove(OsStr::new("DOT_TEST_TIMEOUT_EXPIRED_FILE"));
+    for key in LIVE_SESSION_VARIABLES {
+        env.remove(OsStr::new(key));
+    }
+    for (key, value) in LIVE_SESSION_OVERRIDES {
+        env.insert(key.into(), value.into());
+    }
     for (key, value) in [
         ("HOME", child_home.as_os_str().to_owned()),
         ("PATH", path),
