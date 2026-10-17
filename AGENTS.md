@@ -67,6 +67,7 @@ client Git launcher, and owns a `DOT_TEST_TMP` scratch root;
   `consumer-ci/sync.sh <this checkout>` from cgraf78/actions at the locked SHA.
 - `.github/cgraf78-actions.lock` and every `uses: cgraf78/actions/...@sha`
   move together, only via `consumer-ci/sync.sh`.
+- `retry-infrastructure.yml` keys on the workflow name `Tests`; don't rename it.
 - Files in `scripts/.release-scripts.manifest` are vendored from
   cgraf78/actions; `scripts/release.conf` (including the release payload
   lists) and `scripts/release-smoke-hook.sh` are repo-owned.
