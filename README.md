@@ -1,6 +1,10 @@
 # dot
 
-![Tests](https://github.com/cgraf78/dot/actions/workflows/test.yml/badge.svg?branch=main)
+[![Tests](https://github.com/cgraf78/dot/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cgraf78/dot/actions/workflows/test.yml?query=branch%3Amain)
+[![Latest release](https://img.shields.io/github/release-date/cgraf78/dot?display_date=published_at&label=latest%20release)](https://github.com/cgraf78/dot/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-67ac09)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-%3E%3D1.85-blue)](Cargo.toml)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL%20%7C%20Termux-lightgrey)](#installation)
 
 `dot` manages your dotfiles by tracking `$HOME` directly in Git. Your base
 dotfiles repository's work tree is your home directory, so the base needs no
