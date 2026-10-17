@@ -3393,10 +3393,13 @@ fn parse_ps_snapshot(bytes: &[u8]) -> Option<Vec<ProcessInfo>> {
         if fields.next().is_some() {
             return None;
         }
-        // A fully-dead (`X`) row is exited churn: `ps` reports its
-        // ppid/pgrp/session as -1, which never parses as live topology.
-        // Skip it like a vanished entry instead of failing the snapshot.
-        if state.starts_with('X') {
+        // An exited row is churn: a fully-dead (`X`) row, or a row reaped
+        // mid-read that keeps its last state beside procfs's `0 -1 -1`
+        // placeholder (see `proc_stat_exited`). Neither parses as live
+        // topology, so skip it like a vanished entry instead of failing the
+        // snapshot. (busybox `ps` prints the placeholder unsigned, which the
+        // procfs re-validation below catches instead.)
+        if state.starts_with('X') || (parent, group, session) == ("0", "-1", "-1") {
             continue;
         }
         let parent = parent.parse::<u32>().ok()?;
@@ -3641,11 +3644,11 @@ fn proc_process_snapshot(root: &Path, deadline: Instant) -> Option<Vec<ProcessIn
             Err(error) if proc_process_foreign(&error) => continue,
             Err(_) => return None,
         }
-        // A fully-dead (`X`) entry is exited churn, not a partial view: the
-        // kernel reports its ppid/pgrp/session as -1/0, which never parses
-        // as live topology. Skip it like a vanished entry — a dead process
-        // is definitively not a live survivor the snapshot must report.
-        if proc_stat_state(&stat) == Some(b'X') {
+        // An exited row (fully dead, or reaped mid-read) is churn, not a
+        // partial view: its placeholder topology never parses as live. Skip
+        // it like a vanished entry — a dead process is definitively not a
+        // live survivor the snapshot must report.
+        if proc_stat_exited(&stat) {
             continue;
         }
         let info = parse_proc_process(pid, &stat)?;
@@ -3668,15 +3671,32 @@ fn proc_stat_fields(stat: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
     )
 }
 
-/// The single-letter process state of a procfs stat row (`R`, `S`, `Z`,
-/// `X`, ...), or `None` for a short/corrupt read. Shares the comm scan
-/// with [`parse_proc_process`] so the two can never disagree about where
-/// comm ends (comm may itself contain `") X "`).
+/// Whether a procfs stat row describes a process that had already exited
+/// when it was read: exited churn, never a live survivor. Shares the comm
+/// scan with [`parse_proc_process`] so the two can never disagree about
+/// where comm ends (comm may itself contain `") X "`).
+///
+/// A fully-dead (`X`, or `x` on older kernels) row is one case. The other
+/// is a task reaped while its row was being formatted: the kernel samples
+/// the state letter first and fills in ppid, pgrp, and session only while
+/// the task still has signal state, so the row keeps its last state
+/// (usually `Z`) beside the placeholder triple `0 -1 -1`. A task that
+/// still has signal state always reports a real (non-negative) session, so
+/// the triple proves the task was released. That is the process exiting,
+/// except for exec from a non-leader thread, which releases the old leader
+/// while the PID lives on; that microsecond window is the same one the
+/// fully-dead `X` skip has always had, and the two-pass empty checks absorb
+/// it.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn proc_stat_state(stat: &[u8]) -> Option<u8> {
-    proc_stat_fields(stat)?
-        .next()
-        .and_then(|state| state.first().copied())
+fn proc_stat_exited(stat: &[u8]) -> bool {
+    let Some(mut fields) = proc_stat_fields(stat) else {
+        return false;
+    };
+    if matches!(fields.next(), Some(b"X" | b"x")) {
+        return true;
+    }
+    [fields.next(), fields.next(), fields.next()]
+        == [Some(&b"0"[..]), Some(&b"-1"[..]), Some(&b"-1"[..])]
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -3768,9 +3788,9 @@ fn linux_process_info_result(pid: u32) -> std::io::Result<Option<ProcessInfo>> {
         Err(error) if proc_process_vanished(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
-    // A fully-dead (`X`) row exited between listing and re-read: exited
-    // churn, like a vanished entry — never a live survivor to report.
-    if proc_stat_state(&stat) == Some(b'X') {
+    // An exited row (fully dead, or reaped mid-read) is churn, like a
+    // vanished entry — never a live survivor to report.
+    if proc_stat_exited(&stat) {
         return Ok(None);
     }
     parse_proc_process(pid, &stat)
@@ -7913,6 +7933,8 @@ fn wait_member(member: &OwnedMember) -> WaitState {
                             // ESRCH is the same churn observed between open and read.
                             WaitState::Reaped
                         }
+                        // A row reaped mid-read is the same churn as ESRCH.
+                        Ok(stat) if proc_stat_exited(&stat) => WaitState::Reaped,
                         Ok(stat) => match parse_proc_process(member.process.pid, &stat) {
                             Some(current) if current.identity == member.process.identity => {
                                 WaitState::NotChild
@@ -13783,15 +13805,20 @@ os._exit(0)
         assert_eq!(parse_ps_snapshot(b"123 S\n"), None);
         assert_eq!(parse_ps_snapshot(b"123 1 123 123 Z\nmalformed\n"), None);
         assert_eq!(parse_ps_snapshot(b"123 1 123 123 S extra\n"), None);
+        // Only the full `0 -1 -1` placeholder is exited churn; a lone -1 is
+        // a corrupt live row and still fails the snapshot.
+        assert_eq!(parse_ps_snapshot(b"789 1 -1 -1 Z\n"), None);
+        assert_eq!(parse_ps_snapshot(b"789 0 -1 5 S\n"), None);
     }
 
     #[test]
     fn portable_snapshot_skips_fully_dead_rows() {
         // A fully-dead (`X`) row is exited churn: its ppid/pgrp/session
-        // read back as -1, which never parses as live topology. It must
+        // read back as -1, which never parses as live topology. A row
+        // reaped mid-read keeps its last state beside `0 -1 -1`. Both must
         // skip like a blank line instead of failing the snapshot.
         assert_eq!(
-            parse_ps_snapshot(b"123 1 122 121 S\n456 -1 -1 -1 X\n"),
+            parse_ps_snapshot(b"123 1 122 121 S\n456 -1 -1 -1 X\n789 0 -1 -1 Z\n"),
             Some(vec![ProcessInfo {
                 pid: 123,
                 parent: 1,
@@ -15638,6 +15665,15 @@ int kill(pid_t pid, int sig) {
             b"456 (dot) X 0 -1 -1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
         )
         .unwrap();
+        // A zombie reaped while its row was read keeps `Z` beside the
+        // placeholder topology; it is the same churn.
+        let reaped = root.path().join("789");
+        std::fs::create_dir(&reaped).unwrap();
+        std::fs::write(
+            reaped.join("stat"),
+            b"789 (sh) Z 0 -1 -1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+        )
+        .unwrap();
         let snapshot = proc_process_snapshot(root.path(), Instant::now() + Duration::from_secs(5));
         let snapshot = snapshot.expect("a dead row failed the whole snapshot");
         assert_eq!(
@@ -15692,19 +15728,48 @@ int kill(pid_t pid, int sig) {
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn proc_stat_state_reads_past_tricky_comm() {
-        // Comm may contain parens, spaces, and even `") X "`: the state
-        // must come from after the LAST comm terminator, exactly like the
-        // topology parser (a comm-content match would skip a live row).
-        assert_eq!(
-            proc_stat_state(b"123 (nested ) X ) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 77"),
-            Some(b'R')
-        );
-        assert_eq!(
-            proc_stat_state(b"456 (dot) X 0 -1 -1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"),
-            Some(b'X')
-        );
-        assert_eq!(proc_stat_state(b"123 (truncated"), None);
+    fn proc_stat_exited_reads_past_tricky_comm() {
+        // Comm may contain parens, spaces, and even `") X "` or
+        // `") Z 0 -1 -1 "`: the state and topology must come from after the
+        // LAST comm terminator, exactly like the topology parser (a
+        // comm-content match would skip a live row).
+        assert!(!proc_stat_exited(
+            b"123 (nested ) X ) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 77"
+        ));
+        assert!(!proc_stat_exited(
+            b"123 (a ) Z 0 -1 -1 b) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 77"
+        ));
+        assert!(proc_stat_exited(
+            b"456 (dot) X 0 -1 -1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+        ));
+        assert!(!proc_stat_exited(b"123 (truncated"));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn proc_stat_rows_reaped_mid_read_are_exited() {
+        // The kernel samples the state before it fills in ppid, pgrp, and
+        // session, which it can only do while the task still has signal
+        // state. A task reaped in between keeps its last state beside the
+        // placeholder `0 -1 -1`. Row captured from a reaping storm.
+        for state in ["Z", "R", "S", "D", "x"] {
+            let stat = format!(
+                "1073373 (python3.12) {state} 0 -1 -1 0 -1 4227148 215 0 0 0 0 0 0 0 20 0 0 0 437730334 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 17 74 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+            );
+            assert!(proc_stat_exited(stat.as_bytes()), "state {state}");
+        }
+        // A live zombie still reports its real topology and is not exited.
+        assert!(!proc_stat_exited(
+            b"77 (sleep) Z 1 77 77 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5 0"
+        ));
+        // Only the full placeholder triple proves the exit; a lone -1 is a
+        // corrupt live row that must keep failing closed.
+        assert!(!proc_stat_exited(
+            b"77 (sleep) S 1 -1 -1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5 0"
+        ));
+        assert!(!proc_stat_exited(
+            b"77 (sleep) S 0 77 -1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5 0"
+        ));
     }
 
     #[test]

@@ -1449,13 +1449,14 @@ fn parse_linux_process_identity(
     if fields.len() <= 19 {
         return Err(format!("short /proc/{pid}/stat"));
     }
-    // A fully-dead row exited between listing and re-read. The kernel only
-    // fills in pgrp and session while the task still has signal state, so
-    // this row reports them as -1, which would fail numeric parsing and doom
-    // a host-wide scan. It is exited churn, like a vanished entry, and never
-    // a live survivor (the supervisor and `src/cleanup.rs` skip it the same
-    // way).
-    if matches!(fields[0], b"X" | b"x") {
+    // A row that exited between listing and re-read is churn, like a
+    // vanished entry, and never a live survivor. The kernel only fills in
+    // ppid, pgrp, and session while the task still has signal state, so a
+    // fully-dead (`X`) row reports the placeholder `0 -1 -1`, and so does a
+    // task reaped after its state letter was sampled, which keeps that
+    // letter (usually `Z`). Either would fail numeric parsing and doom a
+    // host-wide scan (`src/cleanup.rs` `proc_stat_exited` skips both).
+    if matches!(fields[0], b"X" | b"x") || fields[1..4] == [&b"0"[..], &b"-1"[..], &b"-1"[..]] {
         return Ok(None);
     }
     let parent = std::str::from_utf8(fields[1])
@@ -1503,8 +1504,8 @@ enum MemberLoss {
     /// The pidfd opened, but the post-open `/proc/<pid>/stat` re-read found
     /// no row.
     RowAbsent(std::io::Error),
-    /// The re-read row was fully dead (`observed` is `None`) or described
-    /// another instance.
+    /// The re-read row had exited (fully dead or reaped mid-read;
+    /// `observed` is `None`) or described another instance.
     RowMismatch {
         observed: Option<LinuxProcessIdentity>,
         row: Vec<u8>,
@@ -1531,7 +1532,7 @@ impl MemberLoss {
                 observed: None,
                 row,
             } => format!(
-                "pidfd opened but the /proc re-read found a fully-dead row {}",
+                "pidfd opened but the /proc re-read found an exited row {}",
                 quote_row(row)
             ),
             MemberLoss::RowMismatch {
@@ -5905,6 +5906,20 @@ fn dead_process_rows_are_exited_churn() {
             "state {state} must be skipped as churn"
         );
     }
+    // A task reaped after the kernel sampled its state keeps that state
+    // (usually `Z`) beside the same placeholder topology. Row captured from
+    // a reaping storm; CI hit it as "invalid session in /proc/<pid>/stat".
+    for state in ["Z", "R", "S"] {
+        let stat = format!(
+            "1073373 (python3.12) {state} 0 -1 -1 0 -1 4227148 215 0 0 0 0 0 0 0 20 0 0 0 437730334 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 17 74 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+        );
+        assert!(
+            parse_linux_process_identity(1073373, stat.as_bytes())
+                .expect("a row reaped mid-read must not be fatal")
+                .is_none(),
+            "state {state} reaped mid-read must be skipped as churn"
+        );
+    }
     // A live row with a corrupt generation is not churn and stays fatal.
     let stat = b"77 (sleep) S 1 -1 -1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5 0\n";
     assert!(parse_linux_process_identity(77, stat).is_err());
@@ -5997,7 +6012,7 @@ fn member_loss_names_the_failed_check_and_expected_identity() {
         row: dead_row,
     }
     .describe(&expected);
-    assert!(dead.contains("fully-dead row"), "{dead}");
+    assert!(dead.contains("exited row"), "{dead}");
     assert!(
         dead.contains(r#""42 (sleep) X 0 -1"#),
         "row must be quoted: {dead}"
