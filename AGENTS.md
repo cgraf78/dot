@@ -6,41 +6,80 @@
 product behavior. Shell remains only at explicit public extension, bootstrap,
 packaging, and test-harness boundaries.
 
-## Architecture
+## Layout
 
-- `src/lib.rs` owns the Rust implementation (one module per domain).
-- `src/main.rs` is a thin adapter: exit-code passthrough only.
-- `bin/dot` is the development adapter for the native binary; releases install
-  the compiled `dot` executable directly.
-- `build.rs` resolves `DOT_BUILD_COMMIT`/`DOT_BUILD_VERSION` strictly from
-  `DOT_BUILD_COMMIT`, then `GITHUB_SHA`, then `git rev-parse HEAD`. An
-  unresolvable or malformed commit, or an invalid version, fails the build
-  instead of baking in `unknown`. Set `DOT_BUILD_COMMIT` to a concrete hash
-  when building outside a git checkout.
-- Public shell API boundaries (`lib/dot/public/*`, `hook-api-v1.tsv`,
-  `doctor-api-v1.tsv`, `test-api-v1.tsv`) are compatibility constraints.
+- `src/lib.rs` owns the implementation (one module per domain); `src/main.rs`
+  is a thin adapter over `dot::cli`. `bin/dot` is the development adapter;
+  releases install the compiled binary directly.
+- `build.rs` resolves the build commit from `DOT_BUILD_COMMIT`, then
+  `GITHUB_SHA`, then `git rev-parse HEAD`, and fails rather than bake in
+  `unknown`; set `DOT_BUILD_COMMIT` when building outside a git checkout.
+- `lib/dot/public/` is the only sourceable shell API. Its `*-api-v1.tsv`
+  contracts (`api`, `hook`, `doctor`, `test`) are compatibility constraints.
+- `support/` holds release payload and the performance supervisor;
+  `test-support/` is the Rust test helper crate. `tests/*.rs` are Cargo
+  integration tests; `tests/*-test` are shell suites driven by `tests/run`.
+- `examples/{minimal,extension,profile}-dotfiles/` are synthetic clients
+  checked by `tests/config.rs` and `tests/profiles.rs`.
+
+## Invariants
+
+- `docs/rust-port-spec.md` is the compatibility and performance record
+  (`tests/perf_budget.rs` checks its budgets); `docs/rust-port-plan.md` is the
+  historical port plan. Output stays byte-exact apart from timing fields,
+  spinner frames, and already-parallel completion order. Never drift the TSV
+  contracts without an intentional change.
+- New parallelism needs a stress test, not just parity tests.
+- Linux-only test code must be cfg-gated: Termux CI compiles every test target
+  with `cargo check --locked --tests --target <android>`.
+- `rust-version = "1.85"` is enforced by an MSRV `cargo check` in CI.
 
 ## Testing
 
-- Rust: `cargo test --locked` (unit, integration, and deterministic performance
-  policy tests; no wall-clock gates).
-- Performance: `scripts/benchmark-port.sh` (Linux-only ignored release-mode
-  paired gate over clean committed source trees).
-- Public-boundary shell acceptance: `bash tests/run`.
-- Lints: `cargo clippy --locked --all-targets --all-features -- -D warnings`
-  (`[lints.rust] warnings = "deny"` covers rustc lints locally; Clippy
-  itself is enforced by the CI flag).
-- Standalone Rust: `rustfmt --edition 2024 --check support/performance-command-supervisor.rs
-  tests/support/performance-supervisor-fixture.rs` (these files are compiled
-  directly and are outside Cargo's module graph).
-- ShellCheck inventory: `.github/shellcheck-files.txt` (do not regress).
+What CI runs (`test.yml` plus the shared `rust-ci` and `shell-ci`):
 
-## Rules for native changes
+- Two parallel shards: `cargo test --locked`, and
+  `cargo build --locked && bash tests/run && bash tests/release-scripts-test`
+- `bash tests/library-test` (shell matrix, no Rust toolchain)
+- `cargo fmt --check`, plus `rustfmt --edition 2024 --check` on the two
+  standalone supervisor sources named in `test.yml` (outside Cargo targets)
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps`
+- `cargo audit --file Cargo.lock`
+- `bash tests/provenance-test` and `scripts/benchmark-port.sh` (Linux-only)
+- `scripts/verify-shdeps-lock` when `support/shdeps.lock` changes (network)
 
-- Every behavior change needs a focused native test and the applicable
-  public-boundary acceptance suites green.
-- New parallelism needs a stress test, not just parity tests.
-- Byte-exact outputs modulo stated exclusions (timing fields, spinner
-  frames, already-parallel replay order — see plan).
-- Keep `docs/rust-port-spec.md` as a historical compatibility record; never
-  drift the TSVs without an intentional change.
+## Test isolation
+
+`tests/lib/test.sh` unsets the `XDG_*` roots, prefers a plain Git over any
+client Git launcher, and owns a `DOT_TEST_TMP` scratch root;
+`tests/lib/repo.sh` runs `bin/dot` with a synthetic `HOME`. Use both.
+
+## CI and generated files
+
+- CI's ShellCheck job fails on any shell program missing from
+  `.github/shellcheck-files.txt` (untracked files included) and on stale rows;
+  local `tests/run` does not detect this. Before pushing, run
+  `bash <actions@lock>/.github/actions/shellcheck-inventory/run.sh "$PWD" .github/shellcheck-files.txt`.
+- `install.sh` is generated by the cgraf78/actions release-installer
+  (`RELEASE_STANDALONE_INSTALLER=true` in `scripts/release.conf`) and
+  byte-checked by `actions-sync`. Edit `scripts/release.conf`, then run
+  `consumer-ci/sync.sh <this checkout>` from cgraf78/actions at the locked SHA.
+- `.github/cgraf78-actions.lock` and every `uses: cgraf78/actions/...@sha`
+  move together, only via `consumer-ci/sync.sh`.
+- Files in `scripts/.release-scripts.manifest` are vendored from
+  cgraf78/actions; `scripts/release.conf` (including the release payload
+  lists) and `scripts/release-smoke-hook.sh` are repo-owned.
+- `docs/source-provenance-v1.tsv` must list exactly
+  `git ls-files install.sh bin lib/dot support tests`; a new file without a
+  row fails `tests/provenance-test`.
+- `tests/workflow-test` and `tests/release-scripts-test` pin lines of
+  `test.yml` and `release.yml`; edit them together.
+- Base dotfiles CI installs the latest dot release, so a bad release turns it
+  red.
+
+## Release
+
+After `main` is green, run `scripts/release.sh --push`. Tags look like
+`YYYYMMDD-HHMMSS-<8hex>`; `release.yml` calls the shared `rust-release`
+workflow (Linux, macOS, Android aarch64 and x86_64, with attestations).
