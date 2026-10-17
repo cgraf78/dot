@@ -14,6 +14,11 @@ attestation or an expired credential. Otherwise, as on most fresh hosts, it
 installs on the published SHA-256 checksum alone and says so; pass
 `--require-attestation` to fail instead. See [security.md](security.md).
 
+To verify a downloaded archive manually, use the shared
+[attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations)
+with source repository `cgraf78/dot` and the pinned shared release workflow
+in `cgraf78/actions` as signer.
+
 ## Layout
 
 The installer runs on stock macOS Bash 3.2, downloads the platform archive,
