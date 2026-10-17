@@ -83,3 +83,9 @@ client Git launcher, and owns a `DOT_TEST_TMP` scratch root;
 After `main` is green, run `scripts/release.sh --push`. Tags look like
 `YYYYMMDD-HHMMSS-<8hex>`; `release.yml` calls the shared `rust-release`
 workflow (Linux, macOS, Android aarch64 and x86_64, with attestations).
+
+Verify published artifacts using the shared
+[attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations).
+Constrain the source to `cgraf78/dot` and the signer to
+`cgraf78/actions/.github/workflows/rust-release.yml` at the revision pinned
+by the release commit.

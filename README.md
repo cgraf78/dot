@@ -44,6 +44,11 @@ attestation when a logged-in `gh` 2.49 or newer is available (see
 engine itself needs no shell; user hooks and shdeps integration need Bash 4
 or newer.
 
+For manual archive verification, follow the shared
+[attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations).
+The release source is `cgraf78/dot`; its signer is the reusable release
+workflow in `cgraf78/actions`.
+
 To initialize a client in the same operation:
 
 ```bash
@@ -141,5 +146,8 @@ scripts; `tests/run` skips it, so CI runs it separately.
 
 The project uses the shared Rust Linux, macOS, musl, Android, and Termux matrix,
 plus a shell matrix for the installer and public hook APIs.
+
+For release preparation, see [AGENTS.md](AGENTS.md#release), including the
+shared verification procedure for published artifacts.
 
 Licensed under the [MIT License](LICENSE).

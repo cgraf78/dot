@@ -16,6 +16,14 @@ without a usable `gh`, which includes most fresh hosts, installs on the
 checksum alone and reports that provenance was not verified;
 `--require-attestation` makes that case fail instead.
 
+Manual verification should constrain both the release source (`cgraf78/dot`)
+and the shared signer workflow
+(`cgraf78/actions/.github/workflows/rust-release.yml` at the revision pinned
+by the release commit). The shared
+[attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations)
+documents these separate identities, the verification command, and failure
+diagnosis.
+
 The installer publishes one immutable versioned release behind an atomic
 stable link and refuses foreign destinations. Caller-supplied local archives
 use their explicitly supplied checksum but are not treated as online attested
