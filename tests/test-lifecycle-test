@@ -1998,6 +1998,59 @@ if process_is_live "$closed_fd_descendant" "$closed_fd_identity"; then
   kill -KILL "$closed_fd_descendant" 2>/dev/null || true
 fi
 
+# A double fork orphans the escapee before the leader exits: its parent is
+# gone, and it holds no group, session, or descriptor of the owned session.
+# On Linux only subreaper adoption still reaches it, and an empty-looking
+# first observation must not certify cleanup while it lives.
+double_fork_descendant_pid=$timeout_fixture/double-fork-descendant.pid
+cat >"$timeout_fixture/double-fork-parent.py" <<'PY'
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+if os.fork() == 0:
+    child = subprocess.Popen(
+        ["/bin/sleep", "30"],
+        env={},
+        start_new_session=True,
+        close_fds=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    Path(sys.argv[1]).write_text(str(child.pid), encoding="utf-8")
+    os._exit(0)
+os.wait()
+PY
+chmod 0755 "$timeout_fixture/double-fork-parent.py"
+set +e
+"$timeout_command" 10 "$timeout_fixture/double-fork-parent.py" \
+  "$double_fork_descendant_pid"
+double_fork_status=$?
+set -e
+double_fork_descendant=$(<"$double_fork_descendant_pid")
+double_fork_identity=
+process_identity "$double_fork_descendant" double_fork_identity || true
+if [[ $(uname -s) == Darwin ]]; then
+  [[ $double_fork_status == 0 || $double_fork_status == 125 ]] ||
+    fail "portable double-fork escape returned unexpected status $double_fork_status"
+else
+  assert_eq 0 "$double_fork_status" \
+    'Linux timeout attributes a double-forked close-fds descendant'
+fi
+deadline=$((SECONDS + 3))
+while process_is_live "$double_fork_descendant" "$double_fork_identity" &&
+  ((SECONDS < deadline)); do
+  sleep 0.05
+done
+if process_is_live "$double_fork_descendant" "$double_fork_identity"; then
+  kill -KILL "$double_fork_descendant" 2>/dev/null || true
+  [[ $(uname -s) == Darwin ]] ||
+    fail 'normal timeout completion lost a double-forked descendant'
+fi
+
 printf 'stale\n' >"$timeout_expired"
 set +e
 DOT_TEST_TIMEOUT_EXPIRED_FILE=$timeout_expired \
@@ -2152,6 +2205,7 @@ assert delivered == [signal.SIGTERM]
 PY
 
 "$timeout_python" - "$timeout_command" <<'PY'
+import errno
 import importlib.util
 import io
 import signal
@@ -2227,36 +2281,43 @@ assert module.parse_ps_snapshot("123 S\n", 123) is None
 assert module.parse_ps_snapshot("123 1 123 123 Z\nmalformed\n", 123) is None
 
 
-class PermissionEntry:
-    name = "123"
-
-    def __truediv__(self, _name):
-        return self
-
-    def read_bytes(self):
-        raise PermissionError
+# An unreadable row (hidepid, or a racing permission change) and a failed
+# directory listing each leave the snapshot unauthoritative. Root CI ignores
+# file modes, so inject both failures at the os boundary instead.
+real_open = module.os.open
+real_listdir = module.os.listdir
 
 
-class PermissionRoot:
-    def iterdir(self):
-        return iter([PermissionEntry()])
+def deny_stat_open(path, *args, **kwargs):
+    if str(path).endswith("/123/stat"):
+        raise PermissionError(errno.EACCES, "injected stat denial", path)
+    return real_open(path, *args, **kwargs)
 
 
-assert module.list_proc_session_processes(123, PermissionRoot()) is None
+def fail_listdir(_path):
+    raise OSError(errno.EIO, "injected listing failure")
 
 
-class FailingIterator:
-    def __iter__(self):
-        yield PermissionEntry()
-        raise OSError("injected iterator failure")
-
-
-class FailingRoot:
-    def iterdir(self):
-        return FailingIterator()
-
-
-assert module.list_proc_session_processes(123, FailingRoot()) is None
+with tempfile.TemporaryDirectory() as temporary:
+    proc_root = Path(temporary)
+    for pid in (123, 124):
+        (proc_root / str(pid)).mkdir()
+        (proc_root / str(pid) / "stat").write_bytes(proc_stat(pid, "row", 2, 123))
+    assert module.list_proc_session_pids(123, proc_root) == [123, 124]
+    module.os.open = deny_stat_open
+    try:
+        assert module.list_proc_session_processes(123, proc_root) is None
+    finally:
+        module.os.open = real_open
+    module.os.listdir = fail_listdir
+    try:
+        assert module.list_proc_session_processes(123, proc_root) is None
+    finally:
+        module.os.listdir = real_listdir
+    # A row longer than one read chunk is still read whole.
+    long_row = proc_root / "long"
+    long_row.write_bytes(b"x" * 10000)
+    assert module.read_proc_file(str(long_row)) == b"x" * 10000
 
 assert module.list_proc_session_pids(123, Path("/missing/proc/root")) is None
 identity = module.SessionProcess(123, 123, 123, True, 77)
@@ -2610,30 +2671,169 @@ assert pidfd_delivery == [
 assert closed == [9]
 
 
+# Under the Linux subreaper, an already-empty session certifies from its
+# pre-signal observation plus one confirming observation: two process-table
+# walks and no poll sleep. This is the common case of a command that leaves
+# nothing behind.
+real_subreaper_enabled = module.subreaper_enabled
+real_reap_unregistered = module.reap_unregistered_adopted_zombies
+module.subreaper_enabled = True
+module.reap_unregistered_adopted_zombies = lambda _deadline: True
+process = Process()
+module.process = process
+empty_walks = 0
+
+
+def empty_snapshots(_session_id, _timeout=1):
+    global empty_walks
+    empty_walks += 1
+    return [module.SessionProcess(123, 123, 123, False, 10)]
+
+
+module.list_session_processes = empty_snapshots
+module.os.getsid = lambda _pid: 123
+module.os.kill = lambda _pid, _signum: None
+module.os.killpg = lambda *_args: (_ for _ in ()).throw(
+    AssertionError("an empty cohort must not use killpg")
+)
+clock = Clock()
+empty_sleeps = []
+module.time.monotonic = clock.monotonic
+module.time.sleep = lambda seconds: (empty_sleeps.append(seconds), clock.sleep(seconds))
+cleanup = module.stop_process_group(signal.SIGTERM)
+assert cleanup == module.CleanupResult(0, True), cleanup
+assert process.waited
+assert empty_walks == module.STABLE_EMPTY_OBSERVATIONS, empty_walks
+assert empty_sleeps == [], empty_sleeps
+
+
+# The pre-signal empty counts only while emptiness holds. A member that the
+# next observation finds resets the count and receives its exact signal, and
+# two fresh consecutive empties are still required: one later empty walk
+# alone must not certify.
+process = Process()
+module.process = process
+reset_member = module.SessionProcess(124, 123, 123, True, 11)
+reset_member_live = True
+reset_walks = 0
+
+
+def reset_snapshots(_session_id, _timeout=1):
+    global reset_walks
+    reset_walks += 1
+    snapshot = [module.SessionProcess(123, 123, 123, False, 10)]
+    if reset_walks == 2:
+        snapshot.append(reset_member._replace(live=reset_member_live))
+    return snapshot
+
+
+def stop_reset_member(fd, signum, info, flags):
+    global reset_member_live
+    pidfd_delivery.append((fd, signum, info, flags))
+    reset_member_live = False
+
+
+module.list_session_processes = reset_snapshots
+module.os.pidfd_open = lambda pid, flags: 9 if (pid, flags) == (124, 0) else None
+module.proc_process = lambda pid: (
+    reset_member._replace(live=reset_member_live) if pid == 124 else None
+)
+pidfd_delivery = []
+module.signal.pidfd_send_signal = stop_reset_member
+closed = []
+module.os.close = closed.append
+clock = Clock()
+module.time.monotonic = clock.monotonic
+module.time.sleep = clock.sleep
+cleanup = module.stop_process_group(signal.SIGTERM)
+assert cleanup == module.CleanupResult(0, True), cleanup
+assert pidfd_delivery == [(9, signal.SIGTERM, None, 0)], pidfd_delivery
+assert reset_walks == 4, f"one empty walk after a reset certified: {reset_walks}"
+assert closed == [9]
+
+
+# A walk is not atomic: a member can fork after the listing and exit before
+# its own row is read, hiding the child. Under the subreaper that exit leaves
+# a new zombie identity, so an empty walk that adds an identity restarts the
+# run, and only two empty walks with no new identity certify.
+process = Process()
+module.process = process
+growing_walks = 0
+
+
+def growing_snapshots(_session_id, _timeout=1):
+    global growing_walks
+    growing_walks += 1
+    snapshot = [module.SessionProcess(123, 123, 123, False, 10)]
+    for hop in range(1, min(growing_walks, 3)):
+        # Each hop's zombie is this wrapper's adoptee in its own session.
+        zombie = 123 + hop
+        snapshot.append(
+            module.SessionProcess(
+                zombie, zombie, zombie, False, 10 + hop, parent=module.os.getpid()
+            )
+        )
+    return snapshot
+
+
+module.list_session_processes = growing_snapshots
+module.os.pidfd_open = None
+module.signal.pidfd_send_signal = None
+module.proc_process = lambda _pid: None
+module.os.kill = lambda _pid, _signum: None
+clock = Clock()
+growing_sleeps = []
+module.time.monotonic = clock.monotonic
+module.time.sleep = lambda seconds: (growing_sleeps.append(seconds), clock.sleep(seconds))
+cleanup = module.stop_process_group(signal.SIGTERM)
+assert cleanup == module.CleanupResult(0, True), cleanup
+assert growing_walks == 4, f"an empty walk with a new zombie certified: {growing_walks}"
+assert growing_sleeps == [], growing_sleeps
+
+# Without the subreaper an exited orphan leaves no zombie behind, so the
+# phase keeps its original cadence: only post-signal walks count, each
+# followed by a poll sleep.
+module.subreaper_enabled = False
+module.reap_unregistered_adopted_zombies = real_reap_unregistered
+process = Process()
+module.process = process
+empty_walks = 0
+module.list_session_processes = empty_snapshots
+clock = Clock()
+empty_sleeps = []
+module.time.monotonic = clock.monotonic
+module.time.sleep = lambda seconds: (empty_sleeps.append(seconds), clock.sleep(seconds))
+cleanup = module.stop_process_group(signal.SIGTERM)
+assert cleanup == module.CleanupResult(0, True), cleanup
+assert empty_walks == 1 + module.STABLE_EMPTY_OBSERVATIONS, empty_walks
+assert len(empty_sleeps) == module.STABLE_EMPTY_OBSERVATIONS - 1, empty_sleeps
+module.subreaper_enabled = real_subreaper_enabled
+
+
 process = Process()
 module.process = process
 module.interrupted_signal = None
 for handled_signal in module.handled_signals:
     signal.signal(handled_signal, module.capture_signal)
-module.list_session_processes = lambda _session_id, _timeout=1: [
-    module.SessionProcess(123, 123, 123, False, 10)
-]
 module.os.pidfd_open = None
 module.signal.pidfd_send_signal = None
 module.os.getsid = lambda _pid: 123
 
 
-def signal_while_stopping(_seconds):
+def signal_while_stopping(_session_id, _timeout=1):
+    # Deliver mid-stop, from inside an observation: an already-empty session
+    # certifies without ever sleeping between its observations.
     handler = signal.getsignal(signal.SIGQUIT)
     assert callable(handler), "cleanup replaced the cancellation handler"
     handler(signal.SIGQUIT, None)
+    return [module.SessionProcess(123, 123, 123, False, 10)]
 
 
+module.list_session_processes = signal_while_stopping
 clock = Clock()
 module.time.monotonic = clock.monotonic
-module.time.sleep = lambda seconds: (
-    signal_while_stopping(seconds),
-    setattr(clock, "now", clock.now + module.PROCESS_POLL_SECONDS),
+module.time.sleep = lambda _seconds: setattr(
+    clock, "now", clock.now + module.PROCESS_POLL_SECONDS
 )
 cleanup = module.stop_process_group(signal.SIGTERM)
 assert cleanup == module.CleanupResult(0, True)
@@ -2821,6 +3021,210 @@ finally:
     module.sys.stderr = saved_stderr
 assert stderr.getvalue() == "test-timeout-v1: could not verify child cleanup\n"
 
+PY
+
+# Supervision, relay, and watchdog waits wake on the exit or stop request they
+# wait for instead of the next poll tick, and keep plain sleeps without
+# pidfds. Helper-mode starts skip the imports only the wrapper needs.
+"$timeout_python" - "$timeout_command" <<'PY'
+import importlib.util
+import os
+import subprocess
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+
+
+script = sys.argv[1]
+
+
+def load(name):
+    loader = SourceFileLoader(name, script)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    loaded = importlib.util.module_from_spec(spec)
+    loader.exec_module(loaded)
+    return loaded
+
+
+module = load("dot_timeout_waits")
+assert hasattr(module, "subprocess") and hasattr(module, "Path")
+for mode in (module.LAUNCH_HELPER_MODE, module.RELAY_HELPER_MODE):
+    sys.argv = [script, mode]
+    helper = load("dot_timeout_helper_mode")
+    assert not hasattr(helper, "subprocess") and not hasattr(helper, "Path"), mode
+sys.argv = [script]
+
+readable, writer = os.pipe()
+os.write(writer, b"x")
+started = time.monotonic()
+assert module.pause(30, (None, readable)) == {readable}
+assert time.monotonic() - started < 10, "a readable descriptor did not end the pause"
+os.close(readable)
+os.close(writer)
+
+real_sleep = module.time.sleep
+slept = []
+module.time.sleep = slept.append
+try:
+    assert module.pause(0.25, (None,)) == set()
+    assert module.pause(0.5) == set()
+finally:
+    module.time.sleep = real_sleep
+assert slept == [0.25, 0.5], slept
+
+real_pidfd_open = getattr(module.os, "pidfd_open", None)
+module.os.pidfd_open = None
+try:
+    assert module.watch_child_exit(os.getpid()) is None
+finally:
+    if real_pidfd_open is None:
+        del module.os.pidfd_open
+    else:
+        module.os.pidfd_open = real_pidfd_open
+
+real_api_level = getattr(module.sys, "getandroidapilevel", None)
+if real_pidfd_open is not None and (real_api_level is None or real_api_level() >= 31):
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+    )
+    try:
+        # Old Android traps pidfd_open instead of failing it.
+        module.sys.getandroidapilevel = lambda: 30
+        assert module.watch_child_exit(child.pid) is None
+        module.sys.getandroidapilevel = lambda: 31
+        watch = module.watch_child_exit(child.pid)
+        assert watch is not None and watch > 2, watch
+        started = time.monotonic()
+        assert module.pause(0.05, (watch,)) == set()
+        assert time.monotonic() - started >= 0.04, "a live child woke the pause"
+        child.kill()
+        started = time.monotonic()
+        assert module.pause(30, (watch,)) == {watch}
+        assert time.monotonic() - started < 10, "child exit did not end the pause"
+        os.close(watch)
+    finally:
+        if real_api_level is None:
+            del module.sys.getandroidapilevel
+        else:
+            module.sys.getandroidapilevel = real_api_level
+        child.kill()
+        child.wait()
+PY
+
+# A fork chain can hop during walks: each process forks after a walk lists
+# /proc and exits before that walk reads its row, so no walk sees it live. A
+# deliberately slow listing makes every walk wide enough for a hop, as a
+# loaded host does. The wrapper must find the last hop or fail closed; it must
+# never report success while the chain survives. Linux-only: this exercises
+# the subreaper's zombie-identity rule for empty walks.
+"$timeout_python" - "$timeout_command" <<'PY'
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def session_fds():
+    """Owned-session descriptors the coordinator advertises and still holds.
+
+    Under `dot test` the wrapper inside the helper validates the inherited
+    lease/control advertisement, so pass exactly the descriptors still open.
+    """
+    fds = []
+    for key in (
+        "DOT_OWNED_SESSION_LEASE_FDS_V1",
+        "DOT_OWNED_SESSION_CONTROL_FDS_V1",
+    ):
+        for field in os.environ.get(key, "").split(":"):
+            if not field.isdecimal():
+                continue
+            try:
+                os.fstat(int(field))
+            except OSError:
+                continue
+            fds.append(int(field))
+    return fds
+
+
+if not sys.platform.startswith("linux"):
+    raise SystemExit(0)
+helper = r"""
+import importlib.util, os, signal, sys, time
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("dot_timeout_hops", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+pidfile = sys.argv[2]
+real_listdir = module.os.listdir
+def slow_listdir(path):
+    names = real_listdir(path)
+    if os.fspath(path) == "/proc":
+        time.sleep(0.15)
+    return names
+module.os.listdir = slow_listdir
+chain = (
+    "import os, sys, time\n"
+    "if os.fork() == 0:\n"
+    "    os.setsid()\n"
+    "    null = os.open('/dev/null', os.O_RDWR)\n"
+    "    for fd in (0, 1, 2):\n"
+    "        os.dup2(null, fd)\n"
+    "    os.closerange(3, 65536)\n"
+    "    for _hop in range(3):\n"
+    "        time.sleep(0.1)\n"
+    "        if os.fork():\n"
+    "            os._exit(0)\n"
+    "    fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)\n"
+    "    os.write(fd, str(os.getpid()).encode())\n"
+    "    os.close(fd)\n"
+    "    time.sleep(30)\n"
+    "    os._exit(0)\n"
+)
+status = module.main(["test-timeout-v1", "20", sys.executable, "-c", chain, pidfile])
+survivor = None
+time.sleep(0.5)
+try:
+    survivor = int(open(pidfile, encoding="ascii").read())
+except (OSError, ValueError):
+    pass
+alive = False
+if survivor is not None:
+    try:
+        stat = open(f"/proc/{survivor}/stat", "rb").read()
+        alive = stat.rsplit(b") ", 1)[1][:1] != b"Z"
+    except OSError:
+        pass
+    # This helper was the wrapper and so is the survivor's subreaper.
+    try:
+        os.kill(survivor, signal.SIGKILL)
+        os.waitpid(survivor, 0)
+    except (ChildProcessError, ProcessLookupError):
+        pass
+print(f"status={status} alive={alive}", file=sys.stderr)
+"""
+for attempt in range(3):
+    with tempfile.TemporaryDirectory() as temporary:
+        pidfile = Path(temporary) / "survivor"
+        child = subprocess.run(
+            [sys.executable, "-c", helper, sys.argv[1], str(pidfile)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            pass_fds=session_fds(),
+            timeout=60,
+        )
+    report = child.stderr.decode(errors="replace").strip()
+    assert child.returncode == 0, (child.returncode, report)
+    fields = dict(item.split("=", 1) for item in report.splitlines()[-1].split())
+    assert fields["status"] in ("0", "125"), report
+    assert not (fields["status"] == "0" and fields["alive"] == "True"), (
+        f"attempt {attempt}: cleanup reported success while a fork chain survived",
+        report,
+    )
 PY
 
 suites=$DOT_TEST_TMP/suites
