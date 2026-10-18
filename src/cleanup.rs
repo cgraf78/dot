@@ -1421,9 +1421,10 @@ fn environ_diagnosis(pid: u32, expected: &str) -> String {
                     .join(":")
             });
             format!(
-                "reread {} bytes, marker={}, expected={expected}",
+                "reread {} bytes, marker={}, expected={expected}, env_end_unset={}",
                 bytes.len(),
-                marker.as_deref().unwrap_or("none")
+                marker.as_deref().unwrap_or("none"),
+                environ_not_built(&Path::new("/proc").join(pid.to_string()))
             )
         }
     }
@@ -3996,12 +3997,37 @@ enum BoundaryMatch {
     ForeignMarker,
     Absent,
     Unknown,
+    /// The candidate is part-way through `execve`: the kernel has installed
+    /// its new address space but not yet recorded where the environment
+    /// lives, so the environ reads back empty although the marker will be
+    /// there once exec finishes. Its ownership is undecided, so the walk
+    /// must not certify the session empty.
+    Pending,
+}
+
+// Test seam: when set on this thread, `process_boundary` reads this fake
+// procfs root instead of `/proc`, so ownership classification of a
+// mid-exec candidate can be pinned without racing a real exec.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+thread_local! {
+    static PROC_BOUNDARY_ROOT: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn process_boundary(pid: u32, expected: &str) -> BoundaryMatch {
+    #[cfg(test)]
+    if let Some(root) = PROC_BOUNDARY_ROOT.with(|root| root.borrow().clone()) {
+        return process_boundary_in(&root, pid, expected);
+    }
+    process_boundary_in(Path::new("/proc"), pid, expected)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_boundary_in(root: &Path, pid: u32, expected: &str) -> BoundaryMatch {
     const MAX_ENVIRON_BYTES: u64 = 1024 * 1024;
-    let Ok(file) = File::open(format!("/proc/{pid}/environ")) else {
+    let process = root.join(pid.to_string());
+    let Ok(file) = File::open(process.join("environ")) else {
         return BoundaryMatch::Unknown;
     };
     let mut bytes = Vec::new();
@@ -4014,6 +4040,16 @@ fn process_boundary(pid: u32, expected: &str) -> BoundaryMatch {
         return BoundaryMatch::Unknown;
     }
     let Some(tokens) = boundary_tokens(&bytes) else {
+        // An empty environ is either a cleared environment or an exec still
+        // in progress: the kernel answers an empty read until exec records
+        // where the new environment lives, which comes after it has closed
+        // close-on-exec descriptors (so the parent already saw the exec
+        // succeed) and after it has loaded the program's interpreter (which
+        // a cold page cache can stretch to tens of milliseconds). Only the
+        // empty case pays the extra stat read.
+        if bytes.is_empty() && environ_not_built(&process) {
+            return BoundaryMatch::Pending;
+        }
         return BoundaryMatch::Absent;
     };
     if let Some(index) = tokens
@@ -4028,6 +4064,43 @@ fn process_boundary(pid: u32, expected: &str) -> BoundaryMatch {
     } else {
         BoundaryMatch::ForeignMarker
     }
+}
+
+/// Whether the process under `process` (a procfs PID directory) is alive
+/// with an address space whose environment bounds are not set yet, which
+/// happens between exec installing the new address space and exec laying
+/// out argv and envp. Stat's `env_end` (field 51, Linux 3.5+) is still zero
+/// then; a cleared environment instead reports `env_start == env_end` with
+/// both nonzero.
+///
+/// - A task without an address space also reads an empty environ and
+///   prints zero bounds. A zombie never gets one back, so it is excluded
+///   here by state; it would otherwise hold every walk open until the
+///   deadline. A task between releasing its address space and becoming a
+///   zombie still counts, but that lasts only until it finishes exiting.
+/// - Exec sets both bounds to the same value just before it walks envp,
+///   so a nonempty environment can briefly look cleared too, and an
+///   environ read just before exec lays it out paired with a stat read
+///   just after it does the same. Each can happen at most once per exec,
+///   and the two-walk empty proof absorbs a single misread.
+/// - A stat that is unreadable or too short (an older kernel) keeps the
+///   previous classification.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn environ_not_built(process: &Path) -> bool {
+    // Fields after comm start at field 3 (state), so field 51 is index 48.
+    const ENV_END_INDEX: usize = 51 - 3;
+    let Ok(stat) = read_proc_stat(&process.join("stat")) else {
+        return false;
+    };
+    let Some(mut fields) = proc_stat_fields(&stat) else {
+        return false;
+    };
+    if matches!(fields.next(), None | Some(b"Z" | b"X" | b"x")) {
+        return false;
+    }
+    fields
+        .nth(ENV_END_INDEX - 1)
+        .is_some_and(|env_end| env_end == b"0")
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -8328,6 +8401,10 @@ impl Session {
                 },
             )
         });
+        // A live direct child still inside exec, whose ownership no check
+        // could decide yet (see `BoundaryMatch::Pending`).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let mut pending_adoption = false;
         let mut changed = true;
         while changed {
             changed = false;
@@ -8440,9 +8517,16 @@ impl Session {
                             // orphan that also closed every descriptor is
                             // indistinguishable from foreign and escapes
                             // rather than risk killing foreign processes.
+                            //
+                            // A candidate still inside exec (`Pending`) has
+                            // no readable marker yet either. The lease can
+                            // still prove it ours; otherwise it holds the
+                            // walk open below, unowned and unsignaled, until
+                            // exec finishes and a later walk can classify it.
                             BoundaryMatch::Absent
                             | BoundaryMatch::Unknown
-                            | BoundaryMatch::ForeignMarker => {
+                            | BoundaryMatch::ForeignMarker
+                            | BoundaryMatch::Pending => {
                                 let held = session_lease.is_some_and(|lease| {
                                     process_holds_session_lease(process.pid, lease)
                                 });
@@ -8451,6 +8535,12 @@ impl Session {
                                     trace.as_mut().filter(|(target, _)| *target == process.pid)
                                 {
                                     walk.lease_held = Some(held);
+                                }
+                                if !held
+                                    && process.live
+                                    && matches!(observed, BoundaryMatch::Pending)
+                                {
+                                    pending_adoption = true;
                                 }
                                 held
                             }
@@ -8550,9 +8640,13 @@ impl Session {
             }
         }
         let current_empty = self.current.values().all(|process| !process.live);
+        // An undecided mid-exec candidate keeps the walk open: certifying
+        // empty now would end teardown before exec finishes and leave a
+        // reparented orphan running that the next walk would have owned.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let empty = leader_observed
             && current_empty
+            && !pending_adoption
             && self.members.values().all(|member| !member.process.live);
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let empty = leader_observed && current_empty;
@@ -16066,6 +16160,237 @@ int kill(pid_t pid, int sig) {
         assert!(
             process_snapshot(completion_snapshot_deadline()).is_some(),
             "the completion snapshot budget cannot cover the live table"
+        );
+    }
+
+    /// A procfs stat row for `pid` with every numeric field zero except the
+    /// topology, the start tick, and the environment bounds (fields 50-51).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stat_with_environ_bounds(
+        pid: u32,
+        state: &str,
+        parent: u32,
+        env_start: u64,
+        env_end: u64,
+    ) -> String {
+        // Post-comm fields: index 0 is field 3 (state), so field N is N - 3.
+        let mut fields = vec!["0".to_string(); 50];
+        fields[0] = state.to_string();
+        fields[1] = parent.to_string();
+        fields[2] = pid.to_string();
+        fields[3] = pid.to_string();
+        fields[22 - 3] = "77".to_string();
+        fields[50 - 3] = env_start.to_string();
+        fields[51 - 3] = env_end.to_string();
+        format!("{pid} (sleep) {}\n", fields.join(" "))
+    }
+
+    /// Write a fake procfs PID directory: `environ` (when given) and `stat`
+    /// (when given).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn fake_proc_entry(root: &Path, pid: u32, environ: Option<&[u8]>, stat: Option<&str>) {
+        let entry = root.join(pid.to_string());
+        std::fs::create_dir_all(&entry).unwrap();
+        if let Some(environ) = environ {
+            std::fs::write(entry.join("environ"), environ).unwrap();
+        }
+        if let Some(stat) = stat {
+            std::fs::write(entry.join("stat"), stat).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn empty_environ_mid_exec_is_pending_not_absent() {
+        // Exec closes close-on-exec descriptors (the parent sees the exec
+        // succeed) before it records the new environment's bounds, and the
+        // kernel reads an empty environ until then. Such a candidate is
+        // undecided, while a cleared environment is genuinely absent.
+        let root = dot_test_support::TempDir::new("proc-boundary-pending").unwrap();
+        let boundary = "a".repeat(64);
+        let marker = format!("PATH=/bin\0{SESSION_BOUNDARY_ENV}={boundary}\0");
+
+        fake_proc_entry(
+            root.path(),
+            11,
+            Some(b""),
+            Some(&stat_with_environ_bounds(11, "S", 1, 0, 0)),
+        );
+        assert!(matches!(
+            process_boundary_in(root.path(), 11, &boundary),
+            BoundaryMatch::Pending
+        ));
+
+        // A cleared environment: bounds set and equal.
+        fake_proc_entry(
+            root.path(),
+            12,
+            Some(b""),
+            Some(&stat_with_environ_bounds(12, "S", 1, 900, 900)),
+        );
+        assert!(matches!(
+            process_boundary_in(root.path(), 12, &boundary),
+            BoundaryMatch::Absent
+        ));
+
+        // A stat too short to carry the bounds (an older kernel) or gone
+        // keeps the previous classification.
+        fake_proc_entry(
+            root.path(),
+            13,
+            Some(b""),
+            Some("13 (sleep) S 1 13 13 0 -1 0"),
+        );
+        assert!(matches!(
+            process_boundary_in(root.path(), 13, &boundary),
+            BoundaryMatch::Absent
+        ));
+        fake_proc_entry(root.path(), 14, Some(b""), None);
+        assert!(matches!(
+            process_boundary_in(root.path(), 14, &boundary),
+            BoundaryMatch::Absent
+        ));
+
+        // A nonempty environ never consults the bounds; an unreadable one
+        // stays unknown.
+        fake_proc_entry(
+            root.path(),
+            15,
+            Some(marker.as_bytes()),
+            Some(&stat_with_environ_bounds(15, "S", 1, 0, 0)),
+        );
+        assert!(matches!(
+            process_boundary_in(root.path(), 15, &boundary),
+            BoundaryMatch::Matches
+        ));
+        fake_proc_entry(
+            root.path(),
+            16,
+            None,
+            Some(&stat_with_environ_bounds(16, "S", 1, 0, 0)),
+        );
+        assert!(matches!(
+            process_boundary_in(root.path(), 16, &boundary),
+            BoundaryMatch::Unknown
+        ));
+
+        // A zombie has no address space: some kernels let its environ open
+        // and read empty, with zero bounds in stat. It will never finish an
+        // exec, so it must not hold walks open as Pending.
+        for (pid, state) in [(17, "Z"), (18, "X")] {
+            fake_proc_entry(
+                root.path(),
+                pid,
+                Some(b""),
+                Some(&stat_with_environ_bounds(pid, state, 1, 0, 0)),
+            );
+            assert!(
+                matches!(
+                    process_boundary_in(root.path(), pid, &boundary),
+                    BoundaryMatch::Absent
+                ),
+                "state {state}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn mid_exec_direct_adoptee_blocks_empty_certification() {
+        // The closed-lease flake (CI runs 39112543634 and 39146444551): a
+        // reparented orphan still inside exec read back an empty environ on
+        // every walk, was classified as markerless, and the session was
+        // certified empty with it running. While exec is unfinished the walk
+        // must stay open without owning or signaling the candidate.
+        // Restores the real procfs root and releases the placeholder
+        // leader's registration even if an observation panics, so a failure
+        // here cannot leak into parallel tests.
+        struct Reset {
+            leader: u32,
+            registration: u64,
+        }
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                PROC_BOUNDARY_ROOT.with(|root| root.borrow_mut().take());
+                unregister_session_boundary(self.leader, self.registration);
+            }
+        }
+
+        let root = dot_test_support::TempDir::new("mid-exec-adoptee").unwrap();
+        let leader = placeholder_pid(61);
+        let candidate = placeholder_pid(62);
+        let control = std::sync::Arc::new(std::sync::Mutex::new(NestedControlState::new()));
+        let registration = register_session_boundary(leader, &"b".repeat(64), control);
+        let reset = Reset {
+            leader,
+            registration,
+        };
+        PROC_BOUNDARY_ROOT.with(|slot| *slot.borrow_mut() = Some(root.path().to_path_buf()));
+        let snapshot = [
+            // The retained leader has exited (a zombie), as in the flake.
+            ProcessInfo {
+                pid: leader,
+                parent: 1,
+                group: leader,
+                session: leader,
+                live: false,
+                identity: ProcessIdentity {
+                    pid: leader,
+                    start: Some(10),
+                },
+            },
+            // The orphan, reparented to this supervisor in its own session.
+            ProcessInfo {
+                pid: candidate,
+                parent: std::process::id(),
+                group: candidate,
+                session: candidate,
+                live: true,
+                identity: ProcessIdentity {
+                    pid: candidate,
+                    start: Some(77),
+                },
+            },
+        ];
+
+        let mid_exec = stat_with_environ_bounds(candidate, "S", std::process::id(), 0, 0);
+        fake_proc_entry(root.path(), candidate, Some(b""), Some(&mid_exec));
+        let mut session = Session::new(leader);
+        let mid_exec_empty = session.observe(&snapshot);
+        let owned_mid_exec = session.current.contains_key(&candidate);
+
+        // Once exec has finished with a cleared environment and no lease,
+        // the candidate is indistinguishable from a foreign child and the
+        // session may certify empty, exactly as before.
+        let cleared = stat_with_environ_bounds(candidate, "S", std::process::id(), 900, 900);
+        fake_proc_entry(root.path(), candidate, Some(b""), Some(&cleared));
+        let cleared_empty = session.observe(&snapshot);
+
+        // An unreaped zombie child that reads like an unfinished exec (empty
+        // environ, zero bounds) must not hold the walk open: it never
+        // finishes exiting on its own, so it would stall every teardown.
+        let zombie = stat_with_environ_bounds(candidate, "Z", std::process::id(), 0, 0);
+        fake_proc_entry(root.path(), candidate, Some(b""), Some(&zombie));
+        let mut zombie_snapshot = snapshot.clone();
+        zombie_snapshot[1].live = false;
+        let zombie_empty = Session::new(leader).observe(&zombie_snapshot);
+        drop(reset);
+
+        assert!(
+            !mid_exec_empty,
+            "a mid-exec direct adoptee let the walk certify the session empty"
+        );
+        assert!(
+            !owned_mid_exec,
+            "a mid-exec candidate must stay unowned until it can be classified"
+        );
+        assert!(
+            cleared_empty,
+            "a finished, cleared-environment foreign child must not block certification"
+        );
+        assert!(
+            zombie_empty,
+            "an unreaped zombie direct child must not block certification"
         );
     }
 
