@@ -77,20 +77,30 @@ import errno
 import array
 import fcntl
 import os
-import secrets
 import select
 import selectors
 import signal
 import socket
 import stat
 import struct
-import subprocess
 import sys
 import time
+from collections import namedtuple
 from collections.abc import Sequence
-from pathlib import Path
 from types import FrameType
-from typing import NamedTuple
+
+LAUNCH_HELPER_MODE = "--dot-launch-helper-v1"
+RELAY_HELPER_MODE = "--dot-relay-helper-v1"
+# The launch and relay helpers re-execute this file only to plumb descriptors
+# before an exec or to copy bytes, and every call waits on their startup:
+# launch before the target runs, relays before cleanup can finish. Neither
+# touches subprocess or pathlib, so skip those imports there. For the same
+# reason the record types below use collections.namedtuple (already loaded by
+# selectors) rather than typing.NamedTuple; together that is about 10 ms of
+# each helper start.
+if sys.argv[1:2] not in ([LAUNCH_HELPER_MODE], [RELAY_HELPER_MODE]):
+    import subprocess
+    from pathlib import Path
 
 process: subprocess.Popen | None = None
 interrupted_signal: int | None = None
@@ -113,6 +123,9 @@ stdio_relay_state_fds: dict[int, int] = {}
 stdio_relay_states: dict[int, bytes] = {}
 stdio_relay_parent_fds: dict[int, int] = {}
 stdio_relay_status: int | None = None
+# A pidfd that turns readable when the retained leader exits, so supervision
+# wakes at once instead of at the next poll tick. None without pidfds.
+leader_exit_fd: int | None = None
 nested_supervisors: dict[str, tuple[int, socket.socket]] = {}
 # Consecutive unhealthy observations per registration: an anomalous
 # link peek (EOF or error) while the confirming snapshot does not show
@@ -140,7 +153,9 @@ DIAGNOSTIC_WRITE_SECONDS = 0.25
 DIAGNOSTIC_CONTENDED_TICKS = 20
 # Unhealthy observations that unregister a nested supervisor.
 NESTED_UNREGISTER_STRIKES = 3
-# A stop phase completes after this many consecutive empty observations.
+# A stop phase completes after this many consecutive empty observations
+# (see phase() for when the pre-signal one counts). Each is a full
+# process-table walk, the dominant per-call cost on a busy host.
 STABLE_EMPTY_OBSERVATIONS = 2
 # Complete snapshots a KILL phase must have taken in total before it gives
 # up, observing past its wall-clock deadline if needed. KILL cannot be
@@ -169,8 +184,6 @@ SESSION_LEASE_FDS_ENV = "DOT_OWNED_SESSION_LEASE_FDS_V1"
 SESSION_CONTROL_FDS_ENV = "DOT_OWNED_SESSION_CONTROL_FDS_V1"
 MAX_ENVIRON_BYTES = 1024 * 1024
 MAX_ANCESTOR_BOUNDARIES = 16
-LAUNCH_HELPER_MODE = "--dot-launch-helper-v1"
-RELAY_HELPER_MODE = "--dot-relay-helper-v1"
 LAUNCH_PROTOCOL_BYTES = 4
 LAUNCH_CONFIG_MAGIC = b"DTC1"
 MAX_LAUNCH_CONFIG_BYTES = 4 * 1024 * 1024
@@ -180,17 +193,21 @@ CONTROL_FRAME_MAGIC = b"DTS2"
 CONTROL_FRAME_BYTES = len(CONTROL_FRAME_MAGIC) + 4 + 64
 
 
-class SessionProcess(NamedTuple):
-    """One observed process-table identity inside the owned session."""
+class SessionProcess(
+    namedtuple(
+        "SessionProcess",
+        "pid group session live start parent delegated ambiguous",
+        defaults=(0, False, False),
+    )
+):
+    """One observed process-table identity inside the owned session.
 
-    pid: int
-    group: int
-    session: int
-    live: bool
-    start: int | None
-    parent: int = 0
-    delegated: bool = False
-    ambiguous: bool = False
+    Fields: pid, group and session (int); live (bool); start (int | None,
+    the kernel start time, None where the platform cannot report it);
+    parent (int, default 0); delegated and ambiguous (bool, default False).
+    """
+
+    __slots__ = ()
 
 
 class MemberHandle:
@@ -246,11 +263,10 @@ class MemberHandle:
         return waited == self.process.pid
 
 
-class CleanupResult(NamedTuple):
-    """Leader status plus proof that no live session member remained."""
+class CleanupResult(namedtuple("CleanupResult", "status complete")):
+    """Leader status (int) plus proof that no live session member remained."""
 
-    status: int
-    complete: bool
+    __slots__ = ()
 
 
 class CleanupIncompleteError(RuntimeError):
@@ -312,7 +328,7 @@ def install_signal_handlers() -> None:
 
 def finish(status: int, cleanup_complete: bool = True) -> int:
     """Close signal ownership without losing a signal in the handoff window."""
-    global ancestor_registration, control_reader, lease_reader
+    global ancestor_registration, control_reader, leader_exit_fd, lease_reader
     global terminal_cleanup_incomplete
     old_mask = None
     if hasattr(signal, "pthread_sigmask"):
@@ -327,6 +343,8 @@ def finish(status: int, cleanup_complete: bool = True) -> int:
     if control_reader is not None:
         close_fd(control_reader)
         control_reader = None
+    close_fd(leader_exit_fd)
+    leader_exit_fd = None
     relays_complete = stop_stdio_relays(
         time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS
     )
@@ -678,6 +696,55 @@ def normalize_internal_pair(left: int, right: int) -> tuple[int, int]:
         close_fd(left)
         close_fd(right)
         raise
+
+
+def watch_child_exit(pid: int) -> int | None:
+    """Return a descriptor that turns readable once child `pid` exits.
+
+    `pid` must be an unreaped child of this process, so the number cannot
+    name a recycled process. Without pidfds (macOS, Linux before 5.3) this
+    returns None and callers keep polling on their usual interval.
+    """
+    opener = getattr(os, "pidfd_open", None)
+    if opener is None:
+        return None
+    # Android before 12 (API 31) lacks pidfd_open in its app seccomp
+    # allowlist, which traps (SIGSYS) rather than failing the call. Python
+    # reports only the API level it was built for, not the device's, so a
+    # build for older Android skips these waits even on a newer device; they
+    # are only an optimization.
+    android_api_level = getattr(sys, "getandroidapilevel", None)
+    if android_api_level is not None and android_api_level() < 31:
+        return None
+    try:
+        return normalize_internal_fd(opener(pid, 0))
+    except (OSError, TypeError):
+        return None
+
+
+def pause(timeout: float, wake: Sequence[int | None] = ()) -> set[int]:
+    """Sleep up to `timeout`, returning early once any `wake` fd is readable.
+
+    Returns the descriptors found readable (none after a plain sleep). Waking
+    early only shortens a poll interval: every caller re-checks the state it
+    waits for, so a spurious or missed wakeup costs at most the interval it
+    would have slept anyway. A pidfd stays readable once its process exits,
+    and an outside tracer can hold that exit out of this process's waits, so
+    callers drop an exit watch once it fires rather than spin on it.
+    """
+    descriptors = [descriptor for descriptor in wake if descriptor is not None]
+    if not descriptors:
+        time.sleep(timeout)
+        return set()
+    try:
+        # poll, unlike select, takes descriptors above FD_SETSIZE.
+        poller = select.poll()
+        for descriptor in descriptors:
+            poller.register(descriptor, select.POLLIN)
+        return {descriptor for descriptor, _events in poller.poll(timeout * 1000)}
+    except (OSError, ValueError):
+        time.sleep(timeout)
+        return set()
 
 
 def protocol_pipe() -> tuple[int, int]:
@@ -1430,6 +1497,7 @@ def stdio_relay_watchdog(
     os.closerange(3, parent_read)
     os.closerange(parent_read + 1, maximum)
     os.set_blocking(parent_read, False)
+    relay_exit = watch_child_exit(relay)
     stopping_at = None
     while True:
         try:
@@ -1473,7 +1541,15 @@ def stdio_relay_watchdog(
             except (PermissionError, ProcessLookupError):
                 pass
             os._exit(125)
-        time.sleep(PROCESS_POLL_SECONDS)
+        # Wake on relay exit or on the wrapper's stop request. Once
+        # stopping, the liveness pipe stays readable at EOF, so wait on the
+        # relay alone rather than spinning until the KILL lands.
+        if relay_exit in pause(
+            PROCESS_POLL_SECONDS,
+            (relay_exit,) if stopping_at is not None else (parent_read, relay_exit),
+        ):
+            close_fd(relay_exit)
+            relay_exit = None
 
 
 def start_stdio_relays(
@@ -1590,6 +1666,17 @@ def stop_stdio_relays(deadline: float) -> bool:
         if stdio_relay_status is None:
             stdio_relay_status = failure
 
+    # Each watchdog stays an unreaped child until a wait below collects it,
+    # so its pidfd wakes those waits the moment it exits.
+    exit_watches = {pid: watch_child_exit(pid) for pid in pending}
+
+    def wait_for_watchdogs(timeout: float) -> None:
+        fired = pause(timeout, [exit_watches[pid] for pid in pending])
+        for pid in pending:
+            if exit_watches[pid] in fired:
+                close_fd(exit_watches[pid])
+                exit_watches[pid] = None
+
     # Observe already-terminal input relays before issuing our own SIGKILL so
     # an independent exec/I/O failure cannot be mislabeled intentional.
     poll_stdio_relay_states()
@@ -1627,7 +1714,9 @@ def stop_stdio_relays(deadline: float) -> bool:
                 pending.pop(pid)
                 forget_relay(pid)
         if pending:
-            time.sleep(min(PROCESS_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+            wait_for_watchdogs(
+                min(PROCESS_POLL_SECONDS, max(0.0, deadline - time.monotonic()))
+            )
     for pid, direction in pending.items():
         if direction == "output":
             relay_state = stdio_relay_states.get(pid, b"")
@@ -1652,7 +1741,7 @@ def stop_stdio_relays(deadline: float) -> bool:
                 pending.pop(pid)
                 forget_relay(pid)
         if pending:
-            time.sleep(
+            wait_for_watchdogs(
                 min(PROCESS_POLL_SECONDS, max(0.0, kill_deadline - time.monotonic()))
             )
     for pid in pending:
@@ -1663,6 +1752,8 @@ def stop_stdio_relays(deadline: float) -> bool:
             os.killpg(pid, signal.SIGKILL)
         except (PermissionError, ProcessLookupError):
             pass
+    for descriptor in exit_watches.values():
+        close_fd(descriptor)
     return complete and not pending
 
 
@@ -1758,7 +1849,7 @@ def launch_helper(argv: Sequence[str]) -> None:
 
 def launch_process(argv: Sequence[str], child_env: dict[str, str]) -> subprocess.Popen | None:
     """Launch through a freshly execed, single-threaded authorization helper."""
-    global ancestor_registration, control_reader, lease_reader, process
+    global ancestor_registration, control_reader, leader_exit_fd, lease_reader, process
     if interrupted_signal is not None:
         return None
     old_mask = None
@@ -1932,6 +2023,7 @@ def launch_process(argv: Sequence[str], child_env: dict[str, str]) -> subprocess
             raise OSError(errno.EPROTO, "target exec was never attempted")
         start_stdio_relays(relay_specs, child_env[SESSION_BOUNDARY_ENV])
         relay_specs.clear()
+        leader_exit_fd = watch_child_exit(child.pid)
         return child
     except BaseException:
         if child is not None and process is child and authorized:
@@ -2004,25 +2096,41 @@ def parse_proc_process(pid: int, stat: bytes) -> SessionProcess | None:
         return None
 
 
+def read_proc_file(path: str) -> bytes:
+    """Read one small procfs file whole through a single descriptor."""
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        chunks = []
+        while chunk := os.read(descriptor, 4096):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
 def list_proc_session_processes(
     session_id: int,
-    proc_root: Path = Path("/proc"),
+    proc_root: str | os.PathLike[str] = "/proc",
     deadline: float | None = None,
 ) -> list[SessionProcess] | None:
     """Return one Linux session's identities, or None when unavailable."""
+    # Every observation reads one stat row per host process, thousands on a
+    # busy host. Plain names and descriptors keep that walk near the kernel's
+    # own cost; a Path object and buffered reader per row cost a quarter more.
+    root = os.fspath(proc_root)
     try:
-        entries = list(proc_root.iterdir())
+        names = os.listdir(root)
     except OSError:
         return None
 
     processes: list[SessionProcess] = []
-    for entry in entries:
+    for name in names:
         if deadline is not None and time.monotonic() >= deadline:
             return None
-        if not entry.name.isdecimal():
+        if not name.isdecimal():
             continue
         try:
-            stat = (entry / "stat").read_bytes()
+            stat = read_proc_file(f"{root}/{name}/stat")
         except FileNotFoundError:
             # Processes can disappear during collection.
             continue
@@ -2034,7 +2142,7 @@ def list_proc_session_processes(
             return None
 
         try:
-            pid = int(entry.name)
+            pid = int(name)
         except ValueError:
             return None
         process = parse_proc_process(pid, stat)
@@ -2045,7 +2153,7 @@ def list_proc_session_processes(
 
 
 def list_proc_session_pids(
-    session_id: int, proc_root: Path = Path("/proc")
+    session_id: int, proc_root: str | os.PathLike[str] = "/proc"
 ) -> list[int] | None:
     """Return one Linux session's PIDs, or None when procfs is unavailable."""
     processes = list_proc_session_processes(session_id, proc_root)
@@ -2278,10 +2386,12 @@ def owned_processes(
     )
 
 
-def proc_process(pid: int, proc_root: Path = Path("/proc")) -> SessionProcess | None:
+def proc_process(
+    pid: int, proc_root: str | os.PathLike[str] = "/proc"
+) -> SessionProcess | None:
     """Read one Linux identity for post-pidfd validation."""
     try:
-        stat = (proc_root / str(pid) / "stat").read_bytes()
+        stat = read_proc_file(f"{os.fspath(proc_root)}/{pid}/stat")
     except OSError:
         return None
     return parse_proc_process(pid, stat)
@@ -2586,6 +2696,34 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             for process_info in processes
         )
 
+    def certifies_empty(processes: list[SessionProcess] | None) -> bool:
+        """Whether one complete observation shows no live owned identity.
+
+        A registered nested supervisor vetoes completion even when the
+        snapshot looks empty: on platforms without pidfds the snapshot can
+        miss a live owner, and completing early would skip its shutdown
+        (and the KILL-phase wait) while it still holds relays and the
+        lease. Dead supervisors unregister within a few stop-drain
+        observations, so the veto always lifts; the phase deadline still
+        bounds a wedged owner. And once this stop ever involved nested
+        owners, completion additionally requires a drained lease: the
+        kernel closes file descriptors on death, so a drained lease is
+        proof the subtree is really gone no matter what the snapshot shows.
+        """
+        return (
+            processes is not None
+            and any(item.pid == process.pid for item in processes)
+            and all(not item.live for item in processes)
+            and all(not member.process.live for member in known_members.values())
+            and not unsafe_direct_member
+            and not nested_supervisors
+            and (not nested_ever_registered or lease_closed())
+        )
+
+    def identities(processes: list[SessionProcess]) -> set[tuple[int, int | None]]:
+        """Every owned identity one observation shows, live or zombie."""
+        return {(item.pid, item.start) for item in processes}
+
     def phase(signum: int, deadline: float, only_new: bool) -> bool:
         """Signal and require consecutive complete empty session observations."""
         group_delivered.clear()
@@ -2636,7 +2774,28 @@ def stop_process_group(first_signal: int) -> CleanupResult:
         elif not wait_for_owner and send_process_group_signal(signum, processes):
             note_group_delivery(processes)
         signal_known(signum, only_new)
+        # A /proc walk is not atomic. A member can fork after the walk lists
+        # the table and exit before the walk reads its own row, so the walk
+        # shows nothing live while the child runs on; that child can do the
+        # same to the next walk. Under the Linux subreaper nothing reaps an
+        # owned process during a stop: every such exit ends as this
+        # wrapper's unreaped zombie, a new identity in the walk that missed
+        # the child. So there an empty walk extends the run of empties only
+        # if it adds no identity, and a run that does not grow proves the
+        # session quiet. That proof is independent of timing, so the
+        # pre-signal walk may start the run (with no live member the signal
+        # reached nobody) and no poll sleep separates confirmations. A row's
+        # liveness is its main thread's state, so a process whose main
+        # thread alone exited counts as dead, as it always has, and stays
+        # outside this proof. Without the subreaper, exited orphans vanish
+        # into init instead, so keep counting only post-signal walks, spaced
+        # by the poll interval.
+        settles_by_identity = subreaper_enabled
         consecutive_empty = 0
+        empty_identities: set[tuple[int, int | None]] = set()
+        if settles_by_identity and certifies_empty(processes):
+            consecutive_empty = 1
+            empty_identities = identities(processes)
         complete_observations = 0
         # The last in-deadline snapshot is often starved by the nearly
         # spent budget and comes back unavailable, so judge overtime by
@@ -2682,29 +2841,19 @@ def stop_process_group(first_signal: int) -> CleanupResult:
             # when available. Without exact authority, never re-enter every
             # unchanged catchable-signal handler; the anchored KILL phase will
             # still stop that late member.
-            # A registered nested supervisor vetoes completion even when
-            # the snapshot looks empty: on platforms without pidfds the
-            # snapshot can miss a live owner, and completing early would
-            # skip its shutdown (and the KILL-phase wait) while it still
-            # holds relays and the lease. Dead supervisors unregister
-            # within a few stop-drain observations, so the veto always
-            # lifts; the phase deadline still bounds a wedged owner.
-            # And once this stop ever involved nested owners, completion
-            # additionally requires a drained lease: the kernel closes
-            # file descriptors on death, so a drained lease is proof the
-            # subtree is really gone no matter what the snapshot shows.
-            if (
-                processes is not None
-                and any(item.pid == process.pid for item in processes)
-                and all(not item.live for item in processes)
-                and all(not member.process.live for member in known_members.values())
-                and not unsafe_direct_member
-                and not nested_supervisors
-                and (not nested_ever_registered or lease_closed())
-            ):
+            if certifies_empty(processes):
+                observed = identities(processes)
+                if settles_by_identity and not observed <= empty_identities:
+                    # A member exited since the last empty walk, possibly
+                    # after forking a child that walk missed: restart the
+                    # run from this walk.
+                    consecutive_empty = 0
                 consecutive_empty += 1
+                empty_identities = observed
                 if consecutive_empty >= STABLE_EMPTY_OBSERVATIONS:
                     return True
+                if settles_by_identity:
+                    continue
             else:
                 consecutive_empty = 0
             time.sleep(
@@ -2777,8 +2926,8 @@ def stop_process_group(first_signal: int) -> CleanupResult:
 
 def main(argv: Sequence[str], terminal: bool = False) -> int:
     """Run the requested command and return a shell-compatible status."""
-    global ancestor_registration, boundary_token, control_reader, lease_reader
-    global process, subreaper_enabled
+    global ancestor_registration, boundary_token, control_reader, leader_exit_fd
+    global lease_reader, process, subreaper_enabled
     global nested_control_complete
     global stdio_relay_status, terminal_cleanup_incomplete, terminal_handoff_required
 
@@ -2813,12 +2962,17 @@ def main(argv: Sequence[str], terminal: bool = False) -> int:
         ancestor_registration.close()
         ancestor_registration = None
     control_reader = None
+    close_fd(leader_exit_fd)
+    leader_exit_fd = None
     install_signal_handlers()
 
     try:
         child_env = os.environ.copy()
         child_env.pop("DOT_TEST_TIMEOUT_EXPIRED_FILE", None)
-        boundary_token = secrets.token_hex(32)
+        # Same 64-hex-digit token as `secrets.token_hex(32)` without importing
+        # `secrets`, whose hashing dependencies cost each Python process
+        # this file starts (wrapper, launch helper, relays) several ms.
+        boundary_token = os.urandom(32).hex()
         child_env[SESSION_BOUNDARY_ENV] = extend_boundary_chain(
             child_env.get(SESSION_BOUNDARY_ENV), boundary_token
         )
@@ -2871,7 +3025,12 @@ def main(argv: Sequence[str], terminal: bool = False) -> int:
             if time.monotonic() >= deadline:
                 continue
             break
-        time.sleep(min(remaining, PROCESS_POLL_SECONDS))
+        woke = pause(min(remaining, PROCESS_POLL_SECONDS), (leader_exit_fd,))
+        if leader_exit_fd in woke:
+            # One shot: the next check finds the exited leader waitable,
+            # unless an outside tracer holds its exit; then plain polling.
+            close_fd(leader_exit_fd)
+            leader_exit_fd = None
 
     if interrupted_signal is not None:
         cleanup = stop_process_group(interrupted_signal)
