@@ -305,7 +305,18 @@ available through `dot test dot`, or alongside client suites in an unfiltered
 run when `DOT_TEST_INCLUDE_PROVIDER=1`; exact and prefix filters otherwise
 select a subset. Each suite receives isolated temp, cache, and state roots,
 closed stdin, `DOT_TEST_HOST_HOME`,
-`DOT_TEST_SOURCE_HOME`, and an absolute `DOT_TEST_REPORTER`.
+`DOT_TEST_SOURCE_HOME`, and an absolute `DOT_TEST_REPORTER`. The runner
+removes the caller's live-session pointers: `TMUX`, `TMUX_PANE`,
+`VSCODE_IPC_HOOK_CLI`, `VSCODE_GIT_IPC_HANDLE`, `WEZTERM_UNIX_SOCKET`,
+`WEZTERM_PANE`, `DISPLAY`, `WAYLAND_DISPLAY`, and `SSH_AUTH_SOCK` are unset,
+and `TMUX_TMPDIR=/dev/null`, `BROWSER=false`, and
+`DBUS_SESSION_BUS_ADDRESS=disabled:` make the fallbacks tmux, URL openers,
+and D-Bus clients would otherwise use fail. A suite that needs a tmux server
+passes `-S` with a socket under `DOT_TEST_SYSTEM_TMPDIR` or sets its own
+`TMUX_TMPDIR`; suites that exercise the other variables set their own fakes.
+Routes these variables do not govern, such as macOS `open` and `pbcopy`,
+desktop-mode `xdg-open`, and Python's `webbrowser` trying its other
+browsers, remain the suite's to avoid.
 `DOT_TEST_TIMEOUT` names the same portable, versioned timeout command used by
 the coordinator for suites that need bounded subcommands; its first argument
 must be a finite positive duration in seconds, optionally suffixed with `s`,

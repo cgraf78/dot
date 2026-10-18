@@ -3,6 +3,7 @@
 #[path = "support/test_fixture.rs"]
 mod fixture;
 use fixture::{Fixture, success};
+use std::collections::BTreeMap;
 
 #[test]
 fn native_suites_do_not_inherit_shell_startup_files() {
@@ -523,4 +524,118 @@ fn native_suite_observes_pre_override_system_tmpdir() {
     assert_eq!(system, f.scope.path().join("tmp").to_str().unwrap());
     assert_ne!(system, tmpdir);
     assert!(tmpdir.starts_with(system));
+}
+
+/// Caller variables that address the live session and must not reach a suite.
+const SCRUBBED: [&str; 9] = [
+    "TMUX",
+    "TMUX_PANE",
+    "VSCODE_IPC_HOOK_CLI",
+    "VSCODE_GIT_IPC_HANDLE",
+    "WEZTERM_UNIX_SOCKET",
+    "WEZTERM_PANE",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "SSH_AUTH_SOCK",
+];
+
+/// Fail-closed overrides and a kept terminal identity.
+const OBSERVED: [&str; 4] = [
+    "TMUX_TMPDIR",
+    "BROWSER",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "TERM_PROGRAM",
+];
+
+/// Which suite path `observe_session` launches through.
+enum Launch {
+    /// A client suite from `DOT_TEST_TESTS_DIR`.
+    Client,
+    /// The provider-owned `dot` suite, launched through its `tests/run`.
+    Provider,
+}
+
+/// Run one suite that records `SCRUBBED` and `OBSERVED` as `NAME=value`
+/// lines, or `NAME` alone when unset, under the given caller environment.
+fn observe_session(launch: Launch, caller: &[(&str, &str)]) -> BTreeMap<String, Option<String>> {
+    let f = Fixture::new();
+    let body = format!(
+        "for name in {}; do\n  if [[ -n ${{!name+x}} ]]; then printf '%s=%s\\n' \"$name\" \"${{!name}}\"; else printf '%s\\n' \"$name\"; fi\ndone >\"$HOME/observed\"\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
+        [SCRUBBED.as_slice(), OBSERVED.as_slice()]
+            .concat()
+            .join(" ")
+    );
+    let mut command = match launch {
+        Launch::Client => {
+            f.suite("session", &body);
+            f.command(&[])
+        }
+        Launch::Provider => {
+            fixture::executable(&f.root.join("tests/run"), &body);
+            let mut command = f.command(&["dot"]);
+            command.env_remove("DOT_TEST_TESTS_DIR");
+            command
+        }
+    };
+    command.envs(caller.iter().copied());
+    success(&fixture::finish(command.spawn().unwrap()));
+    std::fs::read_to_string(f.home.join("observed"))
+        .unwrap()
+        .lines()
+        .map(|line| match line.split_once('=') {
+            Some((name, value)) => (name.to_owned(), Some(value.to_owned())),
+            None => (line.to_owned(), None),
+        })
+        .collect()
+}
+
+/// Assert every pointer is unset and every override holds its fail-closed value.
+fn assert_fail_closed(observed: &BTreeMap<String, Option<String>>) {
+    for name in SCRUBBED {
+        assert_eq!(observed[name], None, "{name} reached the suite");
+    }
+    assert_eq!(observed["TMUX_TMPDIR"].as_deref(), Some("/dev/null"));
+    assert_eq!(observed["BROWSER"].as_deref(), Some("false"));
+    assert_eq!(
+        observed["DBUS_SESSION_BUS_ADDRESS"].as_deref(),
+        Some("disabled:")
+    );
+}
+
+/// A caller session with every scrubbed pointer and override set to a fake.
+/// Built from `SCRUBBED` so a name added there is always exercised.
+fn fake_session() -> Vec<(&'static str, &'static str)> {
+    let mut caller: Vec<_> = SCRUBBED
+        .iter()
+        .map(|name| (*name, "/nonexistent/live-session"))
+        .collect();
+    caller.extend([
+        ("TMUX_TMPDIR", "/nonexistent/tmux-root"),
+        ("BROWSER", "/nonexistent/browser"),
+        ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/bus"),
+    ]);
+    caller
+}
+
+#[test]
+fn native_suites_do_not_inherit_the_live_session() {
+    assert_fail_closed(&observe_session(Launch::Client, &fake_session()));
+}
+
+#[test]
+fn native_provider_suite_does_not_inherit_the_live_session() {
+    assert_fail_closed(&observe_session(Launch::Provider, &fake_session()));
+}
+
+#[test]
+fn native_suites_fail_closed_without_a_caller_session() {
+    assert_fail_closed(&observe_session(Launch::Client, &[]));
+}
+
+#[test]
+fn native_suites_keep_terminal_identity() {
+    // TERM_PROGRAM names a terminal but addresses nothing; suites that branch
+    // on it still see the caller's.
+    let observed = observe_session(Launch::Client, &[("TERM_PROGRAM", "tmux")]);
+    assert_eq!(observed["TERM_PROGRAM"].as_deref(), Some("tmux"));
 }
