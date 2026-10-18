@@ -540,8 +540,10 @@ pub(crate) fn system_tmpdir(runtime: &Runtime) -> PathBuf {
 ///
 /// This removes the environment's pointers, not every route to the session:
 /// libwayland still tries `$XDG_RUNTIME_DIR/wayland-0`, `wezterm cli` finds
-/// the GUI socket itself, and macOS `open` and `pbcopy` need no variable.
-/// `tests/test_command.rs` and `docs/extensions.md` pin this list.
+/// the GUI socket itself, xdg-open in a detected desktop hands off to `gio`
+/// or `kde-open`, and macOS `open` and `pbcopy` need no variable.
+/// `tests/test_command.rs` and `docs/extensions.md` mirror this list; update
+/// them together.
 const LIVE_SESSION_VARIABLES: [&str; 9] = [
     "TMUX",
     "TMUX_PANE",
@@ -560,10 +562,12 @@ const LIVE_SESSION_VARIABLES: [&str; 9] = [
 /// - `TMUX_TMPDIR`: without `TMUX`, a bare `tmux` (or `tmux -L`) resolves its
 ///   socket under `/tmp/tmux-UID`, where the user's own server lives, and
 ///   tmux also falls back to `/tmp` when `TMUX_TMPDIR` does not exist.
-///   `/dev/null` always exists but cannot hold the `tmux-UID` directory, so
-///   every such client fails before connecting. Tests that need a server
-///   pass `-S` with a socket under `DOT_TEST_SYSTEM_TMPDIR`.
-/// - `BROWSER`: `xdg-open`, `gh`, and `sensible-browser` fall back to the
+///   `/dev/null` exists on every supported platform but cannot hold the
+///   `tmux-UID` directory, so every such client fails before connecting.
+///   Tests that need a server pass `-S` with a socket under
+///   `DOT_TEST_SYSTEM_TMPDIR`, or set their own `TMUX_TMPDIR`.
+/// - `BROWSER`: generic-mode `xdg-open`, `sensible-browser`, and `gh`
+///   (absent `GH_BROWSER` or its own `browser` setting) fall back to the
 ///   desktop's opener when it is unset; `false` makes them fail instead.
 ///   Python's `webbrowser` still tries its other registered browsers.
 /// - `DBUS_SESSION_BUS_ADDRESS`: GLib and sd-bus fall back to

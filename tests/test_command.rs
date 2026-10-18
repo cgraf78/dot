@@ -551,7 +551,7 @@ const OBSERVED: [&str; 4] = [
 enum Launch {
     /// A client suite from `DOT_TEST_TESTS_DIR`.
     Client,
-    /// The provider-owned `dot` suite, which takes its own environment branch.
+    /// The provider-owned `dot` suite, launched through its `tests/run`.
     Provider,
 }
 
@@ -589,6 +589,7 @@ fn observe_session(launch: Launch, caller: &[(&str, &str)]) -> BTreeMap<String, 
         .collect()
 }
 
+/// Assert every pointer is unset and every override holds its fail-closed value.
 fn assert_fail_closed(observed: &BTreeMap<String, Option<String>>) {
     for name in SCRUBBED {
         assert_eq!(observed[name], None, "{name} reached the suite");
@@ -602,29 +603,28 @@ fn assert_fail_closed(observed: &BTreeMap<String, Option<String>>) {
 }
 
 /// A caller session with every scrubbed pointer and override set to a fake.
-const FAKE_SESSION: [(&str, &str); 12] = [
-    ("TMUX", "/nonexistent/tmux-0/default,1,0"),
-    ("TMUX_PANE", "%1"),
-    ("VSCODE_IPC_HOOK_CLI", "/nonexistent/vscode-ipc.sock"),
-    ("VSCODE_GIT_IPC_HANDLE", "/nonexistent/vscode-git.sock"),
-    ("WEZTERM_UNIX_SOCKET", "/nonexistent/wezterm.sock"),
-    ("WEZTERM_PANE", "1"),
-    ("DISPLAY", ":0"),
-    ("WAYLAND_DISPLAY", "wayland-0"),
-    ("SSH_AUTH_SOCK", "/nonexistent/agent.sock"),
-    ("TMUX_TMPDIR", "/nonexistent/tmux-root"),
-    ("BROWSER", "/nonexistent/browser"),
-    ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/bus"),
-];
+/// Built from `SCRUBBED` so a name added there is always exercised.
+fn fake_session() -> Vec<(&'static str, &'static str)> {
+    let mut caller: Vec<_> = SCRUBBED
+        .iter()
+        .map(|name| (*name, "/nonexistent/live-session"))
+        .collect();
+    caller.extend([
+        ("TMUX_TMPDIR", "/nonexistent/tmux-root"),
+        ("BROWSER", "/nonexistent/browser"),
+        ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/bus"),
+    ]);
+    caller
+}
 
 #[test]
 fn native_suites_do_not_inherit_the_live_session() {
-    assert_fail_closed(&observe_session(Launch::Client, &FAKE_SESSION));
+    assert_fail_closed(&observe_session(Launch::Client, &fake_session()));
 }
 
 #[test]
 fn native_provider_suite_does_not_inherit_the_live_session() {
-    assert_fail_closed(&observe_session(Launch::Provider, &FAKE_SESSION));
+    assert_fail_closed(&observe_session(Launch::Provider, &fake_session()));
 }
 
 #[test]

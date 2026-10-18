@@ -312,9 +312,11 @@ removes the caller's live-session pointers: `TMUX`, `TMUX_PANE`,
 and `TMUX_TMPDIR=/dev/null`, `BROWSER=false`, and
 `DBUS_SESSION_BUS_ADDRESS=disabled:` make the fallbacks tmux, URL openers,
 and D-Bus clients would otherwise use fail. A suite that needs a tmux server
-passes `-S` with a socket under `DOT_TEST_SYSTEM_TMPDIR`; suites that
-exercise the other variables set their own fakes. Routes that need no
-variable, such as macOS `open` and `pbcopy`, remain the suite's to avoid.
+passes `-S` with a socket under `DOT_TEST_SYSTEM_TMPDIR` or sets its own
+`TMUX_TMPDIR`; suites that exercise the other variables set their own fakes.
+Routes these variables do not govern, such as macOS `open` and `pbcopy`,
+desktop-mode `xdg-open`, and Python's `webbrowser` trying its other
+browsers, remain the suite's to avoid.
 `DOT_TEST_TIMEOUT` names the same portable, versioned timeout command used by
 the coordinator for suites that need bounded subcommands; its first argument
 must be a finite positive duration in seconds, optionally suffixed with `s`,
