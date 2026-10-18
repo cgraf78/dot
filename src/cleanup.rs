@@ -1306,6 +1306,196 @@ static FORCE_KILL_VERIFY_CLOSED: std::sync::atomic::AtomicBool =
 static RETAINED_GROUP_KILL_VERIFIES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// PID whose ownership decisions `Session::observe_snapshot` and the signal
+/// rounds record into [`ADOPTION_TRACE`]; zero leaves tracing unarmed.
+///
+/// Only the closed-lease cancellation fixture arms it, from its helper
+/// process, once its escaped `sleep` PID is known. That fixture has failed
+/// on fresh CI VMs by finishing an `Interrupted` teardown with the `sleep`
+/// alive, never claimed and never signaled, and no local run reproduces
+/// it. The trace makes the next failure name which ownership check missed
+/// the process. It is a process-wide static rather than a thread-local
+/// because the fixture's sender thread learns the PID while the supervisor
+/// walks on the test thread; every other test leaves it at zero, and
+/// non-test builds do not contain it.
+#[cfg(all(test, target_os = "linux"))]
+static ADOPTION_TRACE_TARGET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The rendered trace for [`ADOPTION_TRACE_TARGET`].
+#[cfg(all(test, target_os = "linux"))]
+static ADOPTION_TRACE: std::sync::Mutex<AdoptionTrace> = std::sync::Mutex::new(AdoptionTrace {
+    lines: Vec::new(),
+    walks: 0,
+    run: None,
+});
+
+/// Trace lines plus the bookkeeping that folds repeated walks into one line.
+/// A survivor that stays owned can keep the KILL phase walking for seconds,
+/// and one line per identical walk would bury the assertion message.
+#[cfg(all(test, target_os = "linux"))]
+struct AdoptionTrace {
+    lines: Vec<String>,
+    walks: usize,
+    /// The first walk number and body of the last line, while that line is
+    /// still a run of identical walks.
+    run: Option<(usize, String)>,
+}
+
+/// Start tracing `pid`, discarding any earlier trace.
+#[cfg(all(test, target_os = "linux"))]
+fn arm_adoption_trace(pid: u32) {
+    let mut trace = ADOPTION_TRACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    trace.lines.clear();
+    trace.walks = 0;
+    trace.run = None;
+    ADOPTION_TRACE_TARGET.store(pid, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The armed PID, if any.
+#[cfg(all(test, target_os = "linux"))]
+fn adoption_trace_target() -> Option<u32> {
+    match ADOPTION_TRACE_TARGET.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => None,
+        pid => Some(pid),
+    }
+}
+
+/// Record one delivery event; it also ends any run of identical walks.
+#[cfg(all(test, target_os = "linux"))]
+fn record_adoption_trace(line: String) {
+    let mut trace = ADOPTION_TRACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    trace.run = None;
+    trace.lines.push(line);
+}
+
+/// Record one observation, numbered among the observations so far, folding
+/// it into the previous line when nothing changed since that walk.
+#[cfg(all(test, target_os = "linux"))]
+fn record_adoption_walk(walk: &AdoptionWalk) {
+    let mut trace = ADOPTION_TRACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    trace.walks += 1;
+    let index = trace.walks;
+    let body = walk.render();
+    match trace.run.take() {
+        Some((first, previous)) if previous == body => {
+            if let Some(line) = trace.lines.last_mut() {
+                *line = format!("walks {first}-{index}: {body}");
+            }
+            trace.run = Some((first, body));
+        }
+        _ => {
+            trace.lines.push(format!("walk {index}: {body}"));
+            trace.run = Some((index, body));
+        }
+    }
+}
+
+/// The trace recorded since [`arm_adoption_trace`].
+#[cfg(all(test, target_os = "linux"))]
+fn adoption_trace() -> Vec<String> {
+    ADOPTION_TRACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lines
+        .clone()
+}
+
+/// Why `process_boundary` did not match the traced PID, read again
+/// moments after the walk's own read: the environ size, the marker it
+/// carries, and the boundary the session expected, or the read error.
+#[cfg(all(test, target_os = "linux"))]
+fn environ_diagnosis(pid: u32, expected: &str) -> String {
+    match std::fs::read(format!("/proc/{pid}/environ")) {
+        Err(error) => format!("reread error ({error})"),
+        Ok(bytes) => {
+            let marker = boundary_tokens(&bytes).map(|tokens| {
+                tokens
+                    .iter()
+                    .map(|token| String::from_utf8_lossy(token).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(":")
+            });
+            format!(
+                "reread {} bytes, marker={}, expected={expected}",
+                bytes.len(),
+                marker.as_deref().unwrap_or("none")
+            )
+        }
+    }
+}
+
+/// What one `observe_snapshot` call decided about the traced PID.
+///
+/// The topology, retained-status, and registered-leader fields are filled
+/// whenever the row is present. The adoption fields stay `-` when no pass
+/// reached that check (the row was owned or pre-filtered first), so a
+/// missing value is itself a clue. Each fixpoint pass overwrites what it
+/// evaluates, so the values shown are the ones the final decision used.
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Default)]
+struct AdoptionWalk {
+    leader: String,
+    row: Option<String>,
+    inherited: Option<bool>,
+    direct_adoptee: Option<bool>,
+    prefiltered: bool,
+    retained_status: Option<bool>,
+    registered_leader: Option<bool>,
+    boundary_lookup: Option<bool>,
+    boundary: Option<String>,
+    environ: Option<String>,
+    lease_lookup: Option<bool>,
+    lease_held: Option<bool>,
+    owned: bool,
+    claim: Option<String>,
+    empty: bool,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl AdoptionWalk {
+    fn render(&self) -> String {
+        fn show<T: std::fmt::Display>(value: &Option<T>) -> String {
+            value
+                .as_ref()
+                .map_or_else(|| "-".to_string(), ToString::to_string)
+        }
+        let Some(row) = &self.row else {
+            // A claimed member can drop out of a walk; its kernel refresh
+            // still lands in `claim`.
+            return format!(
+                "leader={} row=absent claim={} session_empty={}",
+                self.leader,
+                show(&self.claim),
+                self.empty
+            );
+        };
+        format!(
+            "leader={} row=[{row}] inherited={} direct_adoptee={} prefiltered={} \
+             retained_status={} registered_leader={} boundary_lookup={} boundary={} \
+             environ={} lease_lookup={} lease_held={} owned={} claim={} session_empty={}",
+            self.leader,
+            show(&self.inherited),
+            show(&self.direct_adoptee),
+            self.prefiltered,
+            show(&self.retained_status),
+            show(&self.registered_leader),
+            show(&self.boundary_lookup),
+            show(&self.boundary),
+            show(&self.environ),
+            show(&self.lease_lookup),
+            show(&self.lease_held),
+            self.owned,
+            show(&self.claim),
+            self.empty,
+        )
+    }
+}
+
 /// Hold process-wide signal-handler ownership without installing handlers.
 /// Every test that installs handlers (and so can latch [`received_signal`])
 /// holds this lock for the guard's lifetime, so a holder observes no latch
@@ -8102,6 +8292,42 @@ impl Session {
         let session_lease = session_lease_inode(leader);
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let parent = std::process::id();
+        // Test-only diagnosis for the closed-lease fixture (see
+        // `ADOPTION_TRACE_TARGET`): what this walk decided about one PID.
+        #[cfg(all(test, target_os = "linux"))]
+        let mut trace = adoption_trace_target().map(|target| {
+            let leader_state = match processes.iter().find(|process| process.pid == leader) {
+                None => "absent",
+                Some(process) if process.live => "live",
+                Some(_) => "zombie",
+            };
+            // The parent row matters when the ppid is neither the leader nor
+            // this supervisor: `inherited` then depends on that row alone.
+            let row = processes
+                .iter()
+                .find(|process| process.pid == target)
+                .map(|row| {
+                    let parent_row = processes
+                        .iter()
+                        .find(|process| process.pid == row.parent)
+                        .map_or_else(
+                            || "absent".to_string(),
+                            |parent| format!("present(live={})", parent.live),
+                        );
+                    format!(
+                        "ppid={} parent_row={parent_row} pgid={} sid={} live={}",
+                        row.parent, row.group, row.session, row.live
+                    )
+                });
+            (
+                target,
+                AdoptionWalk {
+                    leader: format!("{leader} {leader_state}"),
+                    row,
+                    ..AdoptionWalk::default()
+                },
+            )
+        });
         let mut changed = true;
         while changed {
             changed = false;
@@ -8116,6 +8342,17 @@ impl Session {
                     .is_some_and(|candidate| self.delegated.contains(&candidate.identity));
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 let direct_adoptee = process.parent == parent;
+                // Each fixpoint pass overwrites these (see `AdoptionWalk`).
+                // The extra registry reads run only for the traced PID.
+                #[cfg(all(test, target_os = "linux"))]
+                if let Some((_, walk)) = trace.as_mut().filter(|(target, _)| *target == process.pid)
+                {
+                    walk.inherited = Some(inherited);
+                    walk.direct_adoptee = Some(direct_adoptee);
+                    walk.prefiltered = process.session != leader && !inherited && !direct_adoptee;
+                    walk.retained_status = Some(is_retained_status_child(process));
+                    walk.registered_leader = Some(is_registered_session_leader(process.pid));
+                }
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 let delegated = !direct_adoptee
                     && (inherited_delegation
@@ -8173,6 +8410,21 @@ impl Session {
                     let boundary_match = _boundary
                         .as_deref()
                         .map(|boundary| process_boundary(process.pid, boundary));
+                    #[cfg(all(test, target_os = "linux"))]
+                    if let Some((_, walk)) =
+                        trace.as_mut().filter(|(target, _)| *target == process.pid)
+                    {
+                        walk.boundary_lookup = Some(_boundary.is_some());
+                        walk.boundary = boundary_match.as_ref().map(|found| format!("{found:?}"));
+                        walk.lease_lookup = Some(session_lease.is_some());
+                        if let (Some(expected), Some(found)) =
+                            (_boundary.as_deref(), boundary_match.as_ref())
+                        {
+                            if !matches!(found, BoundaryMatch::Matches | BoundaryMatch::Delegated) {
+                                walk.environ = Some(environ_diagnosis(process.pid, expected));
+                            }
+                        }
+                    }
                     match boundary_match.as_ref() {
                         None => false,
                         Some(observed) => match observed {
@@ -8190,9 +8442,18 @@ impl Session {
                             // rather than risk killing foreign processes.
                             BoundaryMatch::Absent
                             | BoundaryMatch::Unknown
-                            | BoundaryMatch::ForeignMarker => session_lease.is_some_and(|lease| {
-                                process_holds_session_lease(process.pid, lease)
-                            }),
+                            | BoundaryMatch::ForeignMarker => {
+                                let held = session_lease.is_some_and(|lease| {
+                                    process_holds_session_lease(process.pid, lease)
+                                });
+                                #[cfg(all(test, target_os = "linux"))]
+                                if let Some((_, walk)) =
+                                    trace.as_mut().filter(|(target, _)| *target == process.pid)
+                                {
+                                    walk.lease_held = Some(held);
+                                }
+                                held
+                            }
                         },
                     }
                 } else {
@@ -8224,13 +8485,35 @@ impl Session {
                     .members
                     .get(&process.pid)
                     .is_some_and(|member| member.process.identity == process.identity);
+                #[cfg(all(test, target_os = "linux"))]
+                let traced = trace.as_mut().filter(|(target, _)| *target == process.pid);
                 if same_identity {
+                    #[cfg(all(test, target_os = "linux"))]
+                    if let Some((_, walk)) = traced {
+                        walk.claim = Some("already a member".to_string());
+                    }
                     self.members
                         .get_mut(&process.pid)
                         .expect("observed member")
                         .refresh(process);
                 } else {
-                    match OwnedMember::claim(process) {
+                    let claimed = OwnedMember::claim(process);
+                    #[cfg(all(test, target_os = "linux"))]
+                    if let Some((_, walk)) = traced {
+                        walk.claim = Some(match &claimed {
+                            Ok(Some(_)) => "claimed".to_string(),
+                            // Tell a vanished pidfd target, an unreadable
+                            // re-read, and a changed identity apart.
+                            Ok(None) => format!(
+                                "none (observed start {:?}; procfs now {:?})",
+                                process.identity.start,
+                                linux_process_info_result(process.pid)
+                                    .map(|now| now.map(|now| now.identity.start))
+                            ),
+                            Err(error) => format!("error ({error})"),
+                        });
+                    }
+                    match claimed {
                         Ok(Some(member)) => {
                             self.members.insert(process.pid, member);
                         }
@@ -8254,15 +8537,34 @@ impl Session {
                 // keeps authority stable while procfs supplies only current
                 // liveness and topology for the pinned numeric identity.
                 member.refresh_from_kernel();
+                #[cfg(all(test, target_os = "linux"))]
+                if let Some((_, walk)) = trace
+                    .as_mut()
+                    .filter(|(target, _)| *target == member.process.pid)
+                {
+                    walk.claim = Some(format!(
+                        "member missing from walk, kernel says live={}",
+                        member.process.live
+                    ));
+                }
             }
         }
         let current_empty = self.current.values().all(|process| !process.live);
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        return leader_observed
+        let empty = leader_observed
             && current_empty
             && self.members.values().all(|member| !member.process.live);
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        (leader_observed && current_empty)
+        let empty = leader_observed && current_empty;
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some((target, mut walk)) = trace {
+            walk.owned = processes
+                .iter()
+                .any(|process| process.pid == target && owned.contains(&process.identity));
+            walk.empty = empty;
+            record_adoption_walk(&walk);
+        }
+        empty
     }
 
     fn record_error(&mut self, error: std::io::Error) {
@@ -8378,10 +8680,31 @@ impl Session {
                 })
                 .map(|(&pid, _)| pid)
                 .collect::<Vec<_>>();
+            // A traced member left out of this round before its first
+            // delivery must say why: a claimed member that is never signaled
+            // is one way the closed-lease fixture's survivor could arise.
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some(member) = adoption_trace_target()
+                .filter(|target| !pending.contains(target))
+                .and_then(|target| self.members.get(&target))
+                .filter(|member| !member.signaled)
+            {
+                record_adoption_trace(format!(
+                    "signal_new({_signal}) skipped member: live={} signaled={} delegated={}",
+                    member.process.live,
+                    member.signaled,
+                    self.delegated.contains(&member.process.identity)
+                ));
+            }
             for pid in pending {
                 let member = self.members.get_mut(&pid).expect("retained member");
                 if !member.signaled {
-                    match member.signal(_signal) {
+                    let outcome = member.signal(_signal);
+                    #[cfg(all(test, target_os = "linux"))]
+                    if adoption_trace_target() == Some(pid) {
+                        record_adoption_trace(format!("signal_new({_signal}) -> {outcome:?}"));
+                    }
+                    match outcome {
                         Ok(true) => member.signaled = true,
                         Ok(false) => {}
                         Err(error) => {
@@ -8437,7 +8760,14 @@ impl Session {
                     !group_delivered
                         || requires_direct_signal_authority(&member.process, self.leader)
                 })
-                .filter_map(|member| member.signal(signal).err())
+                .filter_map(|member| {
+                    let outcome = member.signal(signal);
+                    #[cfg(all(test, target_os = "linux"))]
+                    if adoption_trace_target() == Some(member.process.pid) {
+                        record_adoption_trace(format!("signal_all({signal}) -> {outcome:?}"));
+                    }
+                    outcome.err()
+                })
                 .collect::<Vec<_>>();
             for error in errors {
                 self.record_error(error);
@@ -10664,10 +10994,14 @@ for _ in range(300):
             // The fixture creates the marker before writing the PIDs, so
             // existence alone races the write: signal only once the marker
             // carries both.
-            let (_, leader) = poll_until(Instant::now() + Duration::from_secs(2), || {
+            let (descendant, leader) = poll_until(Instant::now() + Duration::from_secs(2), || {
                 Ok(fixture_pids(&marker_for_signal))
             })
             .unwrap();
+            // Arm before the signal, so every teardown walk records what it
+            // decided about the escaped descendant. A failure then names the
+            // ownership check that missed it.
+            arm_adoption_trace(descendant);
             // Only a live leader makes this a cancellation: one that already
             // exited completed normally, which by design leaves its
             // own-session descendants running. Record which one this was,
@@ -10700,11 +11034,20 @@ for _ in range(300):
         // walks the process table at least three times, while a leader that
         // exited first takes normal completion's single-snapshot fast path.
         let path_detail = || {
+            // An empty trace means no teardown walk ran at all (normal
+            // completion's fast path), which is a finding in itself.
+            let trace = adoption_trace();
+            let trace = if trace.is_empty() {
+                "(no teardown walk ran)".to_string()
+            } else {
+                trace.join("\n  ")
+            };
             format!(
                 "leader when signaled: {leader_at_signal:?}; leader exit before the signal \
                  (si_code, si_status): {early_exit:?}; supervision took {elapsed:?} with \
-                 {snapshots} process snapshots; leader stderr: {:?}",
-                std::fs::read_to_string(&leader_stderr).unwrap_or_default()
+                 {snapshots} process snapshots; leader stderr: {:?}; adoption trace:\n  {}",
+                std::fs::read_to_string(&leader_stderr).unwrap_or_default(),
+                trace
             )
         };
         // Teardown takes at most about 40s even with late walks (1s TERM
