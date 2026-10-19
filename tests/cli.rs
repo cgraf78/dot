@@ -1144,7 +1144,10 @@ fn test_help_has_the_public_byte_contract() {
         "usage: dot test [-s|--sequential] [-v|--verbose] [-j N|--jobs N] [-l|--list] [name ...]\n\
          \n\
          Set DOT_TEST_INCLUDE_PROVIDER=1 to include the provider suite in an\n\
-         unfiltered run. Select `dot` by name to run only the provider suite.\n",
+         unfiltered run. Select `dot` by name to run only the provider suite.\n\
+         \n\
+         On Termux, suites run one at a time unless -j or DOT_TEST_JOBS names\n\
+         a job count.\n",
     );
     assert!(output.stderr.is_empty());
 }
