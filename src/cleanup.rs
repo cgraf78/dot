@@ -1452,6 +1452,9 @@ struct AdoptionWalk {
     environ: Option<String>,
     lease_lookup: Option<bool>,
     lease_held: Option<bool>,
+    /// For a Pending row: whether it could be this session's orphan, and
+    /// so held the walk (subject to the grace).
+    pending_scope: Option<bool>,
     owned: bool,
     claim: Option<String>,
     empty: bool,
@@ -1478,7 +1481,8 @@ impl AdoptionWalk {
         format!(
             "leader={} row=[{row}] inherited={} direct_adoptee={} prefiltered={} \
              retained_status={} registered_leader={} boundary_lookup={} boundary={} \
-             environ={} lease_lookup={} lease_held={} owned={} claim={} session_empty={}",
+             environ={} lease_lookup={} lease_held={} pending_scope={} owned={} claim={} \
+             session_empty={}",
             self.leader,
             show(&self.inherited),
             show(&self.direct_adoptee),
@@ -1490,6 +1494,7 @@ impl AdoptionWalk {
             show(&self.environ),
             show(&self.lease_lookup),
             show(&self.lease_held),
+            show(&self.pending_scope),
             self.owned,
             show(&self.claim),
             self.empty,
@@ -4074,10 +4079,14 @@ fn process_boundary_in(root: &Path, pid: u32, expected: &str) -> BoundaryMatch {
 /// both nonzero.
 ///
 /// - A task without an address space also reads an empty environ and
-///   prints zero bounds. A zombie never gets one back, so it is excluded
-///   here by state; it would otherwise hold every walk open until the
-///   deadline. A task between releasing its address space and becoming a
-///   zombie still counts, but that lasts only until it finishes exiting.
+///   prints zero bounds (kernels before 6.14 let its environ open). It will
+///   never finish an exec, so it is excluded: a zombie by state, and a task
+///   still exiting by `PF_EXITING` in stat's flags (field 9), which exit
+///   sets before it releases the address space. Releasing a large one can
+///   take long enough that a stream of exiting children would otherwise
+///   hold walks open. (Exec from a non-main thread kills the old main
+///   thread first, which then looks the same; escapees are almost always
+///   single-threaded, and the zombie that follows was never held either.)
 /// - Exec sets both bounds to the same value just before it walks envp,
 ///   so a nonempty environment can briefly look cleared too, and an
 ///   environ read just before exec lays it out paired with a stat read
@@ -4087,20 +4096,63 @@ fn process_boundary_in(root: &Path, pid: u32, expected: &str) -> BoundaryMatch {
 ///   previous classification.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn environ_not_built(process: &Path) -> bool {
-    // Fields after comm start at field 3 (state), so field 51 is index 48.
+    // Fields after comm start at field 3 (state, index 0), so field N is
+    // at N - 3.
+    const STATE_INDEX: usize = 0;
+    const FLAGS_INDEX: usize = 9 - 3;
     const ENV_END_INDEX: usize = 51 - 3;
+    // `PF_EXITING` from the kernel's sched.h; Android shares the value.
+    const PF_EXITING: u64 = 0x4;
     let Ok(stat) = read_proc_stat(&process.join("stat")) else {
         return false;
     };
-    let Some(mut fields) = proc_stat_fields(&stat) else {
+    let Some(fields) = proc_stat_fields(&stat).map(Iterator::collect::<Vec<_>>) else {
         return false;
     };
-    if matches!(fields.next(), None | Some(b"Z" | b"X" | b"x")) {
+    let exiting = fields
+        .get(FLAGS_INDEX)
+        .and_then(|flags| std::str::from_utf8(flags).ok()?.parse::<u64>().ok())
+        .map(|flags| flags & PF_EXITING != 0);
+    !matches!(
+        fields.get(STATE_INDEX).copied(),
+        None | Some(b"Z" | b"X" | b"x")
+    ) && exiting == Some(false)
+        && fields
+            .get(ENV_END_INDEX)
+            .is_some_and(|env_end| *env_end == b"0")
+}
+
+/// Total time undecided mid-exec candidates (see `BoundaryMatch::Pending`)
+/// may hold one teardown's walks open, counted from the first walk that
+/// only a candidate kept from certifying, so an earlier candidate's hold
+/// shortens a later one's. A normal exec leaves that state in well under a
+/// millisecond, and a cold page cache on a loaded host was seen stretching
+/// it past 70ms. Anything longer is a stuck exec, which escapes as it did
+/// before Pending existed, or a stream of short-lived candidates that must
+/// not be able to starve the empty proof until the deadline. It equals the
+/// TERM grace by design: a hold should never outlast the time a cooperative
+/// member gets to exit.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const PENDING_ADOPTION_GRACE: Duration =
+    Duration::from_millis(GRACE_ATTEMPTS as u64 * GRACE_INTERVAL_MS);
+
+/// Whether an undecided mid-exec direct child could be an escaped
+/// descendant of the session led by `leader`. Session membership is only
+/// ever inherited or newly created, never joined, and an owned leader
+/// always starts its own session. So a child in this supervisor's own
+/// session is one of the host's ordinary children, and a child in another
+/// live owned session belongs to that session's teardown; neither may hold
+/// this session's walks open. (A foreground child shares the host session,
+/// so its mid-exec orphans keep the classification they had before Pending
+/// existed.)
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn pending_candidate_may_be_ours(process: &ProcessInfo, leader: u32) -> bool {
+    // SAFETY: getsid takes a PID (0 = this process) and no pointers.
+    let host_session = unsafe { libc::getsid(0) };
+    if u32::try_from(host_session).is_ok_and(|host| host == process.session) {
         return false;
     }
-    fields
-        .nth(ENV_END_INDEX - 1)
-        .is_some_and(|env_end| env_end == b"0")
+    process.session == leader || !is_registered_session_leader(process.session)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -8134,6 +8186,10 @@ struct Session {
     // this surfaces as the supervision call's error so callers must handle
     // the refusal explicitly.
     authority_error: Option<std::io::Error>,
+    /// When an undecided mid-exec candidate first held a walk open; see
+    /// `PENDING_ADOPTION_GRACE`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pending_since: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -8288,6 +8344,8 @@ impl Session {
             members: std::collections::BTreeMap::new(),
             error: None,
             authority_error: None,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            pending_since: None,
         }
     }
 
@@ -8535,10 +8593,15 @@ impl Session {
                                     trace.as_mut().filter(|(target, _)| *target == process.pid)
                                 {
                                     walk.lease_held = Some(held);
+                                    if matches!(observed, BoundaryMatch::Pending) {
+                                        walk.pending_scope =
+                                            Some(pending_candidate_may_be_ours(process, leader));
+                                    }
                                 }
                                 if !held
                                     && process.live
                                     && matches!(observed, BoundaryMatch::Pending)
+                                    && pending_candidate_may_be_ours(process, leader)
                                 {
                                     pending_adoption = true;
                                 }
@@ -8643,11 +8706,24 @@ impl Session {
         // An undecided mid-exec candidate keeps the walk open: certifying
         // empty now would end teardown before exec finishes and leave a
         // reparented orphan running that the next walk would have owned.
+        // The hold is bounded per teardown (see `PENDING_ADOPTION_GRACE`).
+        // The grace clock starts only when the candidate is the one thing
+        // keeping this walk from certifying, so a hold during the TERM
+        // grace (with members still alive) does not spend it.
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        let empty = leader_observed
+        let otherwise_empty = leader_observed
             && current_empty
-            && !pending_adoption
             && self.members.values().all(|member| !member.process.live);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let pending_holds = otherwise_empty
+            && pending_adoption
+            && self
+                .pending_since
+                .get_or_insert_with(Instant::now)
+                .elapsed()
+                < PENDING_ADOPTION_GRACE;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let empty = otherwise_empty && !pending_holds;
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let empty = leader_observed && current_empty;
         #[cfg(all(test, target_os = "linux"))]
@@ -16173,9 +16249,23 @@ int kill(pid_t pid, int sig) {
         env_start: u64,
         env_end: u64,
     ) -> String {
+        stat_with_flags(pid, state, 0, parent, env_start, env_end)
+    }
+
+    /// [`stat_with_environ_bounds`] with the task flags (field 9) set.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stat_with_flags(
+        pid: u32,
+        state: &str,
+        flags: u64,
+        parent: u32,
+        env_start: u64,
+        env_end: u64,
+    ) -> String {
         // Post-comm fields: index 0 is field 3 (state), so field N is N - 3.
         let mut fields = vec!["0".to_string(); 50];
         fields[0] = state.to_string();
+        fields[9 - 3] = flags.to_string();
         fields[1] = parent.to_string();
         fields[2] = pid.to_string();
         fields[3] = pid.to_string();
@@ -16272,6 +16362,47 @@ int kill(pid_t pid, int sig) {
         assert!(matches!(
             process_boundary_in(root.path(), 16, &boundary),
             BoundaryMatch::Unknown
+        ));
+
+        // A task that is exiting (PF_EXITING) has released, or is about to
+        // release, its address space; before 6.14 its environ still opens
+        // and reads empty with zero bounds. It will never finish an exec.
+        // The flags are a live kernel value with other bits set as well.
+        fake_proc_entry(
+            root.path(),
+            19,
+            Some(b""),
+            Some(&stat_with_flags(19, "R", 0x0040_4044, 1, 0, 0)),
+        );
+        assert!(matches!(
+            process_boundary_in(root.path(), 19, &boundary),
+            BoundaryMatch::Absent
+        ));
+        // The same flags without PF_EXITING (a task mid-exec) stay Pending,
+        // and unparsable flags keep the previous classification.
+        fake_proc_entry(
+            root.path(),
+            20,
+            Some(b""),
+            Some(&stat_with_flags(20, "R", 0x0040_4040, 1, 0, 0)),
+        );
+        assert!(matches!(
+            process_boundary_in(root.path(), 20, &boundary),
+            BoundaryMatch::Pending
+        ));
+        let garbled = stat_with_environ_bounds(21, "R", 1, 0, 0).replacen(
+            " R 1 21 21 0 0 0 ",
+            " R 1 21 21 0 0 x ",
+            1,
+        );
+        assert!(
+            garbled.contains(" 0 0 x "),
+            "flags field not garbled: {garbled}"
+        );
+        fake_proc_entry(root.path(), 21, Some(b""), Some(&garbled));
+        assert!(matches!(
+            process_boundary_in(root.path(), 21, &boundary),
+            BoundaryMatch::Absent
         ));
 
         // A zombie has no address space: some kernels let its environ open
@@ -16391,6 +16522,121 @@ int kill(pid_t pid, int sig) {
         assert!(
             zombie_empty,
             "an unreaped zombie direct child must not block certification"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pending_holds_only_for_a_possible_orphan_and_only_briefly() {
+        // Scheduled CI run 39225724568: every live direct child of the
+        // supervising process that was mid-exec read as Pending, including
+        // the host's ordinary children spawned by unrelated work. A steady
+        // stream of them held every concurrent teardown open until its
+        // deadline. Only a child that could be an escaped descendant of this
+        // session may hold its walks open, and only for a bounded grace.
+        struct Reset {
+            registrations: Vec<(u32, u64)>,
+        }
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                PROC_BOUNDARY_ROOT.with(|root| root.borrow_mut().take());
+                for (leader, registration) in self.registrations.drain(..) {
+                    unregister_session_boundary(leader, registration);
+                }
+            }
+        }
+
+        let root = dot_test_support::TempDir::new("pending-scope").unwrap();
+        let leader = placeholder_pid(63);
+        let other_leader = placeholder_pid(64);
+        let candidate = placeholder_pid(65);
+        let register = |pid: u32, token: char| {
+            let control = std::sync::Arc::new(std::sync::Mutex::new(NestedControlState::new()));
+            (
+                pid,
+                register_session_boundary(pid, &token.to_string().repeat(64), control),
+            )
+        };
+        let _reset = Reset {
+            registrations: vec![register(leader, 'c'), register(other_leader, 'd')],
+        };
+        PROC_BOUNDARY_ROOT.with(|slot| *slot.borrow_mut() = Some(root.path().to_path_buf()));
+        let mid_exec = stat_with_environ_bounds(candidate, "S", std::process::id(), 0, 0);
+        fake_proc_entry(root.path(), candidate, Some(b""), Some(&mid_exec));
+        // SAFETY: getsid takes a PID (0 = this process) and no pointers.
+        let host_session = u32::try_from(unsafe { libc::getsid(0) }).unwrap();
+        let snapshot = |session: u32| {
+            [
+                ProcessInfo {
+                    pid: leader,
+                    parent: 1,
+                    group: leader,
+                    session: leader,
+                    live: false,
+                    identity: ProcessIdentity {
+                        pid: leader,
+                        start: Some(10),
+                    },
+                },
+                ProcessInfo {
+                    pid: candidate,
+                    parent: std::process::id(),
+                    group: session,
+                    session,
+                    live: true,
+                    identity: ProcessIdentity {
+                        pid: candidate,
+                        start: Some(77),
+                    },
+                },
+            ]
+        };
+
+        // The closed-lease orphan's shape: its own new session. Still held,
+        // and only now does the grace clock start.
+        let mut held = Session::new(leader);
+        let own_session = held.observe(&snapshot(candidate));
+        let clock_started = held.pending_since.is_some();
+        // While the leader is still alive the walk is not empty anyway, so
+        // the candidate must not spend the grace.
+        let mut live_leader = snapshot(candidate);
+        live_leader[0].live = true;
+        let mut busy = Session::new(leader);
+        let busy_empty = busy.observe(&live_leader);
+        let busy_clock = busy.pending_since;
+        // The host's ordinary child: the supervisor's own session, which no
+        // owned descendant can ever join.
+        let host_child = Session::new(leader).observe(&snapshot(host_session));
+        // A member of another live owned session: that session's teardown
+        // owns it.
+        let other_member = Session::new(leader).observe(&snapshot(other_leader));
+        // A possible orphan still mid-exec after the grace no longer holds
+        // the walk open.
+        let mut expired = Session::new(leader);
+        expired.pending_since = Instant::now().checked_sub(PENDING_ADOPTION_GRACE);
+        let after_grace = expired.observe(&snapshot(candidate));
+
+        assert!(
+            !own_session,
+            "a mid-exec possible orphan must hold the walk open"
+        );
+        assert!(clock_started, "the hold did not start the grace clock");
+        assert!(!busy_empty, "a walk with a live leader certified empty");
+        assert!(
+            busy_clock.is_none(),
+            "a hold during a non-empty walk spent the grace"
+        );
+        assert!(
+            host_child,
+            "a mid-exec host-session child held the walk open"
+        );
+        assert!(
+            other_member,
+            "another owned session's mid-exec member held the walk open"
+        );
+        assert!(
+            after_grace,
+            "a Pending candidate held the walk open past its grace"
         );
     }
 
