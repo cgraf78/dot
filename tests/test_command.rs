@@ -349,11 +349,57 @@ fn native_automatic_jobs_uses_runtime_darwin_fallback() {
     for index in 0..8 {
         f.suite(
             &format!("jobs-{index}"),
-            "[[ $DOT_TEST_JOBS == 7 ]]\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
+            "[[ $DOT_TEST_JOBS == 7 ]] || exit 1\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
         );
     }
     let output = fixture::finish(f.command(&[]).env("PATH", bin).spawn().unwrap());
     success(&output);
+}
+
+/// Runs eight suites that each assert the effective `DOT_TEST_JOBS`, with a
+/// processor probe that reports 64, under the given `PREFIX` and request.
+fn assert_jobs_under_prefix(prefix: &str, request: &[(&str, &str)], args: &[&str], expected: u32) {
+    let f = Fixture::new();
+    let bin = f.scope.path().join("tools");
+    std::fs::create_dir(&bin).unwrap();
+    fixture::executable(&bin.join("getconf"), "printf '64\\n'");
+    for index in 0..8 {
+        f.suite(
+            &format!("jobs-{index}"),
+            &format!(
+                "[[ $DOT_TEST_JOBS == {expected} ]] || exit 1\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\""
+            ),
+        );
+    }
+    let mut command = f.command(args);
+    command.env("PATH", &bin).env("PREFIX", prefix);
+    for (name, value) in request {
+        command.env(name, value);
+    }
+    let output = fixture::finish(command.spawn().unwrap());
+    success(&output);
+}
+
+#[test]
+fn native_automatic_jobs_run_one_at_a_time_on_termux() {
+    // A parallel run gets the whole Termux app killed on a phone, so the
+    // default ignores the processor probe there.
+    assert_jobs_under_prefix("/data/data/com.termux/files/usr", &[], &[], 1);
+}
+
+#[test]
+fn native_explicit_jobs_still_win_on_termux() {
+    let termux = "/data/data/com.termux/files/usr";
+    assert_jobs_under_prefix(termux, &[("DOT_TEST_JOBS", "3")], &[], 3);
+    assert_jobs_under_prefix(termux, &[], &["-j", "2"], 2);
+}
+
+#[test]
+fn native_automatic_jobs_ignore_a_non_termux_prefix() {
+    // Only Termux's `PREFIX` changes the default; Homebrew-style or empty
+    // values keep the probe (capped at 8 here by the eight suites).
+    assert_jobs_under_prefix("/opt/homebrew", &[], &[], 8);
+    assert_jobs_under_prefix("", &[], &[], 8);
 }
 
 #[test]
@@ -368,7 +414,7 @@ fn native_automatic_jobs_preserves_probe_whitespace() {
         for index in 0..8 {
             f.suite(
                 &format!("jobs-{index}"),
-                "[[ $DOT_TEST_JOBS == 4 ]]\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
+                "[[ $DOT_TEST_JOBS == 4 ]] || exit 1\nprintf 'complete\\t1\\t0\\n' >\"$DOT_TEST_RESULT_FILE\"",
             );
         }
         success(&fixture::finish(
