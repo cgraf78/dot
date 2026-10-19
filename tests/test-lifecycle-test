@@ -1516,7 +1516,9 @@ PY
 # Old Linux/Android kernels without pidfd support still reap same-group
 # adopted zombies before reporting a completed timeout. The test removes the
 # Python pidfd entry points in-process instead of exposing a production test
-# environment switch.
+# environment switch. Old Android (API below 31) exposes them, but its seccomp
+# policy kills the process on the syscall, so that mode keeps them present and
+# fatal and requires the run to take the same fallback without touching them.
 "$timeout_python" - "$timeout_command" <<'PY'
 import os
 import subprocess
@@ -1557,8 +1559,21 @@ loader = SourceFileLoader("dot_timeout_no_pidfd", sys.argv[1])
 spec = importlib.util.spec_from_loader(loader.name, loader)
 module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
-module.os.pidfd_open = None
-module.signal.pidfd_send_signal = None
+if sys.argv[3] == "absent":
+    module.os.pidfd_open = None
+    module.signal.pidfd_send_signal = None
+else:
+    def trapped(*_args):
+        # Stand in for SIGSYS, reaping the fixture's group first so a failed
+        # run does not leave its sleepers behind.
+        target = getattr(module, "process", None)
+        if target is not None:
+            try: os.killpg(target.pid, signal.SIGKILL)
+            except OSError: pass
+        os._exit(128 + signal.SIGSYS)
+    module.sys.getandroidapilevel = lambda: 30
+    module.os.pidfd_open = trapped
+    module.signal.pidfd_send_signal = trapped
 # Both loops give up after at least 1200s, past every suite timeout, in case
 # this helper dies before the escaped member is killed.
 script = """
@@ -1574,18 +1589,19 @@ if status != 124 or Path(f"/proc/{pid}").exists():
     except ProcessLookupError: pass
     raise SystemExit(1)
 '''
-with tempfile.TemporaryDirectory() as temporary:
-    pid_file = str(Path(temporary) / "member.pid")
-    result = subprocess.run(
-        [sys.executable, "-c", helper, wrapper, pid_file],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        timeout=7,
-        check=False,
-        pass_fds=session_fds(),
-    )
-    assert result.returncode == 0, (result.returncode, result.stderr)
+for mode in ("absent", "old-android"):
+    with tempfile.TemporaryDirectory() as temporary:
+        pid_file = str(Path(temporary) / "member.pid")
+        result = subprocess.run(
+            [sys.executable, "-c", helper, wrapper, pid_file, mode],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=7,
+            check=False,
+            pass_fds=session_fds(),
+        )
+        assert result.returncode == 0, (mode, result.returncode, result.stderr)
 PY
 
 # A loaded host makes every process-table snapshot slow (a Python procfs walk
@@ -2209,6 +2225,7 @@ import errno
 import importlib.util
 import io
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -2220,6 +2237,11 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 assert spec is not None
 module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
+# These scenarios stub the pidfd entry points and expect them used. A host
+# Python built for Android before API 31 (Termux) would gate them off, so
+# pin the reported level at the first one that permits pidfds.
+if hasattr(module.sys, "getandroidapilevel"):
+    module.sys.getandroidapilevel = lambda: 31
 real_launch_process = module.launch_process
 real_authorize_launch = module.authorize_launch
 real_os_close = module.os.close
@@ -2506,6 +2528,72 @@ assert all(signum == 0 for _pid, signum in raw_delivery), (
 )
 assert group_delivery[0] == (123, signal.SIGTERM)
 assert (123, signal.SIGKILL) in group_delivery
+
+
+# A live registered nested supervisor owns sessions that only pidfds let
+# this owner adopt and stop exactly. Where pidfds are unusable, including
+# Android before API 31 whose entry points exist but trap, the KILL phase
+# waits out the owner's own shutdown instead of group-killing it.
+def unclaimable(_pid, _flags):
+    raise OSError(errno.EPERM, "member stays unclaimable")
+
+
+saved = (
+    module.drain_nested_supervisors,
+    module.lease_closed,
+    module.os.kill,
+    module.os.killpg,
+    module.os.pidfd_open,
+    module.signal.pidfd_send_signal,
+    getattr(module.sys, "getandroidapilevel", None),
+)
+owner_link, owner_peer = socket.socketpair()
+module.drain_nested_supervisors = lambda *_args, **_kwargs: True
+module.lease_closed = lambda: True
+module.os.kill = lambda _pid, _signum: None
+module.os.pidfd_open = unclaimable
+module.signal.pidfd_send_signal = lambda _fd, _signum, _info, _flags: None
+try:
+    for level, group_killed in ((30, False), (31, True)):
+        module.sys.getandroidapilevel = lambda level=level: level
+        module.nested_supervisors["owner"] = (125, owner_link)
+        process = Process()
+        module.process = process
+        module.interrupted_signal = None
+        module.list_session_processes = lambda _session_id, _timeout=1: [
+            module.SessionProcess(123, 123, 123, True, 10),
+            module.SessionProcess(125, 123, 123, True, 12),
+        ]
+        module.os.getsid = lambda _pid: 123
+        group_delivery = []
+        module.os.killpg = lambda pid, signum: group_delivery.append((pid, signum))
+        clock = Clock()
+        module.time.monotonic = clock.monotonic
+        module.time.sleep = clock.sleep
+        cleanup = module.stop_process_group(signal.SIGTERM)
+        assert not cleanup.complete, level
+        assert group_delivery[0] == (123, signal.SIGTERM), (level, group_delivery)
+        assert ((123, signal.SIGKILL) in group_delivery) == group_killed, (
+            level,
+            group_delivery,
+        )
+finally:
+    module.nested_supervisors.clear()
+    owner_link.close()
+    owner_peer.close()
+    (
+        module.drain_nested_supervisors,
+        module.lease_closed,
+        module.os.kill,
+        module.os.killpg,
+        module.os.pidfd_open,
+        module.signal.pidfd_send_signal,
+        real_api_level,
+    ) = saved
+    if real_api_level is None:
+        del module.sys.getandroidapilevel
+    else:
+        module.sys.getandroidapilevel = real_api_level
 
 
 process = Process()
@@ -3111,6 +3199,82 @@ if real_pidfd_open is not None and (real_api_level is None or real_api_level() >
             module.sys.getandroidapilevel = real_api_level
         child.kill()
         child.wait()
+PY
+
+# Old Android traps pidfd syscalls (SIGSYS) instead of failing them, so below
+# API 31 no pidfd entry point may run: claiming, signaling, and refreshing a
+# member fall back as on platforms without pidfds. At 31 or above, or off
+# Android, they still use pidfds. Recording stubs stand in for the syscalls so
+# this runs on every platform.
+"$timeout_python" - "$timeout_command" <<'PY'
+import importlib.util
+import signal
+import sys
+from importlib.machinery import SourceFileLoader
+
+loader = SourceFileLoader("dot_timeout_android_pidfd", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+# Far above any descriptor the harness holds, so a stray close cannot hit one.
+fake_fd = 1 << 20
+opened = []
+sent = []
+module.os.pidfd_open = lambda pid, flags: opened.append((pid, flags)) or fake_fd
+module.signal.pidfd_send_signal = lambda fd, signum, info, flags: sent.append(
+    (fd, signum, info, flags)
+)
+member = module.SessionProcess(124, 123, 123, True, 11)
+observed = {124: member}
+module.proc_process = lambda pid: observed.get(pid)
+
+
+def set_api_level(level):
+    if level is None:
+        if hasattr(module.sys, "getandroidapilevel"):
+            del module.sys.getandroidapilevel
+    else:
+        module.sys.getandroidapilevel = lambda: level
+    opened.clear()
+    sent.clear()
+
+
+# Below API 31 a live, unchanged member is unclaimable, not gone.
+set_api_level(30)
+assert module.claim_member(member, 123) == (None, "unavailable")
+assert opened == [] and sent == [], (opened, sent)
+
+# Below API 31 a recycled PID still reads as gone, from /proc alone.
+set_api_level(30)
+observed[124] = member._replace(start=12)
+assert module.claim_member(member, 123) == (None, "gone")
+assert opened == [] and sent == [], (opened, sent)
+observed[124] = member
+
+# Below API 31 no pidfd signal or liveness probe reaches a retained handle.
+set_api_level(30)
+handle = module.MemberHandle(member, fake_fd)
+assert not module.signal_member(handle, signal.SIGTERM)
+del observed[124]
+assert handle.refresh(), "an unobservable handle must stay live (fail closed)"
+observed[124] = member
+assert sent == [], sent
+
+# Below API 31 an exit watch is never opened.
+set_api_level(30)
+assert module.watch_child_exit(124) is None
+assert opened == [], opened
+
+# At API 31 and off Android, claims and signals still use pidfds.
+for level in (31, None):
+    set_api_level(level)
+    handle, claim = module.claim_member(member, 123)
+    assert claim == "claimed" and handle is not None and handle.fd == fake_fd, level
+    assert opened == [(124, 0)], (level, opened)
+    assert module.signal_member(handle, signal.SIGTERM), level
+    assert sent == [(fake_fd, signal.SIGTERM, None, 0)], (level, sent)
 PY
 
 # A fork chain can hop during walks: each process forks after a walk lists

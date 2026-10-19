@@ -86,7 +86,7 @@ import struct
 import sys
 import time
 from collections import namedtuple
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from types import FrameType
 
 LAUNCH_HELPER_MODE = "--dot-launch-helper-v1"
@@ -210,6 +210,27 @@ class SessionProcess(
     __slots__ = ()
 
 
+def pidfd_api(owner: object, name: str) -> Callable[..., int | None] | None:
+    """Return pidfd entry point `name` from `owner`, or None where unusable.
+
+    Every pidfd call goes through here so callers take the same fallback as
+    under a Python without these entry points (macOS, for one).
+    """
+    # Android before 12 (API 31) lacks the pidfd syscalls in its app seccomp
+    # allowlist, which traps (SIGSYS) and kills the process rather than
+    # failing the call. Python reports only the API level it was built for,
+    # not the device's, so a build for older Android gives up pidfds even on a
+    # newer device, as CPython 3.13+ itself does by omitting these entry
+    # points from such builds; this covers older Pythons that still expose
+    # them. Losing pidfds costs early wakeups and exact member authority, so
+    # a member that escapes the group fails cleanup closed (125), as on
+    # macOS; it never costs safety.
+    android_api_level = getattr(sys, "getandroidapilevel", None)
+    if android_api_level is not None and android_api_level() < 31:
+        return None
+    return getattr(owner, name, None)
+
+
 class MemberHandle:
     """A Linux pidfd that pins one exact observed process identity."""
 
@@ -226,7 +247,7 @@ class MemberHandle:
         """Refresh liveness without changing which identity the pidfd owns."""
         current = proc_process(self.process.pid)
         if current is None:
-            sender = getattr(signal, "pidfd_send_signal", None)
+            sender = pidfd_api(signal, "pidfd_send_signal")
             if sender is None:
                 # An observation failure is never proof that the retained
                 # identity exited. Keep it live so cleanup fails closed.
@@ -702,19 +723,11 @@ def watch_child_exit(pid: int) -> int | None:
     """Return a descriptor that turns readable once child `pid` exits.
 
     `pid` must be an unreaped child of this process, so the number cannot
-    name a recycled process. Without pidfds (macOS, Linux before 5.3) this
+    name a recycled process. Without usable pidfds (see pidfd_api) this
     returns None and callers keep polling on their usual interval.
     """
-    opener = getattr(os, "pidfd_open", None)
+    opener = pidfd_api(os, "pidfd_open")
     if opener is None:
-        return None
-    # Android before 12 (API 31) lacks pidfd_open in its app seccomp
-    # allowlist, which traps (SIGSYS) rather than failing the call. Python
-    # reports only the API level it was built for, not the device's, so a
-    # build for older Android skips these waits even on a newer device; they
-    # are only an optimization.
-    android_api_level = getattr(sys, "getandroidapilevel", None)
-    if android_api_level is not None and android_api_level() < 31:
         return None
     try:
         return normalize_internal_fd(opener(pid, 0))
@@ -2408,8 +2421,8 @@ def claim_member(
     process_info: SessionProcess, _session_id: int
 ) -> tuple[MemberHandle | None, str]:
     """Pin one identity and distinguish disappearance from unavailable proof."""
-    opener = getattr(os, "pidfd_open", None)
-    sender = getattr(signal, "pidfd_send_signal", None)
+    opener = pidfd_api(os, "pidfd_open")
+    sender = pidfd_api(signal, "pidfd_send_signal")
     if opener is None or sender is None or process_info.start is None:
         if process_info.start is not None:
             current = proc_process(process_info.pid)
@@ -2455,7 +2468,7 @@ def claim_member(
 
 def signal_member(member: MemberHandle, signum: int) -> bool:
     """Signal only the process identity pinned by a retained pidfd."""
-    sender = getattr(signal, "pidfd_send_signal", None)
+    sender = pidfd_api(signal, "pidfd_send_signal")
     if sender is None:
         return False
     try:
@@ -2742,9 +2755,7 @@ def stop_process_group(first_signal: int) -> CleanupResult:
         # group-signaling it. Platforms with exact authority keep the
         # previous behavior: the murdered subtree is adopted and
         # exactly stopped.
-        exact_signals_unavailable = (
-            getattr(signal, "pidfd_send_signal", None) is None
-        )
+        exact_signals_unavailable = pidfd_api(signal, "pidfd_send_signal") is None
         supervisor_pids = {pid for pid, _link in nested_supervisors.values()}
         # An open registration link is itself the liveness proof: the
         # drain above peeks every link each observe, and process death
