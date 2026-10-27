@@ -363,7 +363,10 @@ case ${1:-} in
           printf '%s' "$flood" >&2
         fi
       done
-      for ((round = 0; round < 300; round++)); do sleep 1; done
+      # Bash defers a TERM trap across a foreground sleep while
+      # teardown grace is one second; keep the idle granularity an
+      # order of magnitude under it so the trap always wins.
+      for ((round = 0; round < 3000; round++)); do sleep 0.1; done
     fi
     if [[ ${DOT_TEST_PROVIDER_MANY_EVENTS:-0} == 1 ]]; then
       trap ': >"$DOT_TEST_PROVIDER_MANY_EVENTS_STOPPED"; exit 143' TERM
