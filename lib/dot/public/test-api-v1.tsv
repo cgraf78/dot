@@ -3,3 +3,4 @@ reporter	DOT_TEST_REPORTER skip [reason]	record one skipped suite
 environment	DOT_TEST_INCLUDE_PROVIDER=0|1	include the provider suite in an unfiltered dot test run when set to 1
 environment	DOT_TEST_TIMEOUT SECONDS COMMAND [ARG ...]	run one command under the provider timeout supervisor with finite positive SECONDS
 environment	DOT_TEST_TIMEOUT_EXPIRED_FILE	optional private marker created only when the provider deadline expires
+environment	DOT_RUN_BOUNDED SECONDS COMMAND [ARG ...]	runs one external command through the native owned supervisor; decimal nonnegative SECONDS, 0 disables the deadline; child status, 124 timeout, 125 invalid/setup/cleanup failure, 126 nonexecutable, 127 missing target, 128+signal cancellation; shell interpreter may reserve descriptors such as FD 255
