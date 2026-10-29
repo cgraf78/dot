@@ -118,9 +118,23 @@ sys.stdin.buffer.read()
             result.add(fd)
         return result
 
+    if sys.platform.startswith("linux"):
+        # Fedora's libffi retains its loaded-library descriptor on the first
+        # ctypes import, independently of this supervisor. Initialize the
+        # Linux subreaper's language runtime before measuring owned channels.
+        import ctypes
+
+        ctypes.CDLL(None)
     before = open_fds()
     status = module.main([script, "5", sys.executable, "-c", target, marker], terminal=True)
-    assert open_fds() == before, ("startup left descriptors", open_fds() - before)
+    after = open_fds()
+    opened = {}
+    for fd in after - before:
+        try:
+            opened[fd] = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            opened[fd] = f"mode {os.fstat(fd).st_mode:o}"
+    assert after == before, ("startup altered descriptors", opened, "closed", before - after)
     assert module.lease_reader is None and module.control_reader is None
     assert module.ancestor_registration is None
     module.terminal_exit(status)
