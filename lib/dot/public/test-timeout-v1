@@ -1553,10 +1553,21 @@ def stdio_relay_watchdog(
 
 
 def start_stdio_relays(
-    relay_specs: list[tuple[str, int, int]], boundary_chain: str
+    relay_specs: list[tuple[str, int, int]],
+    boundary_chain: str,
+    deadline: float,
+    output_only: bool = False,
 ) -> None:
-    """Start every prepared relay only after target exec authorization."""
+    """Start relays and prove their interpreter entered the transfer loop.
+
+    Output relays are ready before authorizing target exec. Input starts only
+    after exec, so an interrupted authorization cannot consume caller input.
+    All readiness waits share the launch's absolute protocol deadline rather
+    than charging interpreter startup against the later output-drain budget.
+    """
     while relay_specs:
+        if output_only and relay_specs[0][0] != "output":
+            return
         direction, source, destination = relay_specs.pop(0)
         state_read = state_write = None
         parent_read = parent_write = None
@@ -1600,11 +1611,16 @@ def start_stdio_relays(
             close_fd(source)
         if destination >= 3:
             close_fd(destination)
+        ready = read_exact_fd(state_read, 1, deadline)
+        if ready != b"R":
+            raise OSError(errno.EPROTO, "stdio relay did not enter its transfer loop")
+        stdio_relay_states[pid] = ready
 
 
 def close_relay_specs(relay_specs: list[tuple[str, int, int]]) -> None:
     """Close prepared internal endpoints when target launch never completes."""
-    for _direction, source, destination in relay_specs:
+    while relay_specs:
+        _direction, source, destination = relay_specs.pop()
         if source >= 3:
             close_fd(source)
         if destination >= 3:
@@ -1634,7 +1650,7 @@ def poll_stdio_relay_states() -> None:
             endpoint.detach()
 
 
-def stop_stdio_relays(deadline: float) -> bool:
+def stop_stdio_relays(deadline: float, drain_output: bool = True) -> bool:
     """Boundedly drain, then kill and reap all wrapper-owned relay processes."""
     global stdio_relay_status
     pending = dict(stdio_relay_pids)
@@ -1692,7 +1708,7 @@ def stop_stdio_relays(deadline: float) -> bool:
             pending.pop(pid)
             forget_relay(pid)
     for pid, direction in pending.items():
-        if direction != "input":
+        if direction != "input" and drain_output:
             continue
         # Closing the private liveness writer asks the isolated watchdog to
         # kill and reap its possibly blocked relay.  The wrapper never has to
@@ -1718,7 +1734,7 @@ def stop_stdio_relays(deadline: float) -> bool:
                 min(PROCESS_POLL_SECONDS, max(0.0, deadline - time.monotonic()))
             )
     for pid, direction in pending.items():
-        if direction == "output":
+        if direction == "output" and drain_output:
             relay_state = stdio_relay_states.get(pid, b"")
             if relay_state == b"C" and stdio_relay_status is None:
                 stdio_relay_status = 1
@@ -1978,6 +1994,14 @@ def launch_process(argv: Sequence[str], child_env: dict[str, str]) -> subprocess
         ready_read = None
         if helper_pid != child.pid or os.getsid(child.pid) != child.pid:
             raise OSError(errno.EPROTO, "launch authorization did not match child session")
+        # A fast target can exit before a newly forked relay has even execed
+        # its interpreter. Starting the one-second drain clock at that point
+        # used to cancel unread output under contention. Prove the output
+        # workers ready while the target is still behind its exec barrier.
+        relay_specs.sort(key=lambda spec: spec[0] != "output")
+        start_stdio_relays(
+            relay_specs, child_env[SESSION_BOUNDARY_ENV], protocol_deadline, output_only=True
+        )
         authorization_mask = None
         if hasattr(signal, "pthread_sigmask"):
             authorization_mask = signal.pthread_sigmask(
@@ -2021,40 +2045,50 @@ def launch_process(argv: Sequence[str], child_env: dict[str, str]) -> subprocess
             raise OSError(exec_error, os.strerror(exec_error), argv[0])
         if not exec_attempted:
             raise OSError(errno.EPROTO, "target exec was never attempted")
-        start_stdio_relays(relay_specs, child_env[SESSION_BOUNDARY_ENV])
+        start_stdio_relays(relay_specs, child_env[SESSION_BOUNDARY_ENV], protocol_deadline)
         relay_specs.clear()
         leader_exit_fd = watch_child_exit(child.pid)
         return child
     except BaseException:
-        if child is not None and process is child and authorized:
-            cleanup = stop_process_group(signal.SIGKILL)
-            process = None
-            if not cleanup.complete:
-                close_fd(lease_reader)
-                lease_reader = None
-                close_fd(control_reader)
-                control_reader = None
-                if ancestor_registration is not None:
-                    ancestor_registration.close()
-                    ancestor_registration = None
-                raise CleanupIncompleteError(
-                    "authorized launch cleanup could not be verified"
-                )
-        else:
-            if child is not None and process is child:
+        try:
+            if child is not None and process is child and authorized:
+                # An input relay may still be initializing after target exec.
+                # Cancellation there must forward the original signal before
+                # escalation, exactly as cancellation during supervision does.
+                cleanup = stop_process_group(interrupted_signal or signal.SIGKILL)
                 process = None
-            if child is not None and child.poll() is None:
-                stop_launch_helper(child)
-        close_fd(lease_reader)
-        lease_reader = None
-        close_fd(control_reader)
-        control_reader = None
-        if ancestor_registration is not None:
-            ancestor_registration.close()
-            ancestor_registration = None
-        close_relay_specs(relay_specs)
+                if not cleanup.complete:
+                    raise CleanupIncompleteError(
+                        "authorized launch cleanup could not be verified"
+                    )
+            else:
+                if child is not None and process is child:
+                    process = None
+                if child is not None and child.poll() is None:
+                    stop_launch_helper(child)
+                # Either exec was never authorized, or an explicit failed-exec
+                # receipt already reaped the helper. Neither can have target
+                # output; abort startup but still prove every relay was reaped.
+                if not stop_stdio_relays(
+                    time.monotonic() + PROCESS_SNAPSHOT_TIMEOUT_SECONDS, drain_output=False
+                ):
+                    raise CleanupIncompleteError("unused relay cleanup could not be verified")
+        finally:
+            # Abort failure must still release all unstarted specs and parent
+            # registrations. The outer owner retains cleanup's failure status.
+            close_fd(lease_reader)
+            lease_reader = None
+            close_fd(control_reader)
+            control_reader = None
+            if ancestor_registration is not None:
+                ancestor_registration.close()
+                ancestor_registration = None
+            close_relay_specs(relay_specs)
         raise
     finally:
+        # A denied authorization returns without entering the exception path.
+        # Input relays are still unstarted then and must release their pipes.
+        close_relay_specs(relay_specs)
         for descriptor in (
             ready_read,
             ready_write,

@@ -50,6 +50,10 @@ assert_eq 0 "$empty_env_status" \
   "timeout command runs without PATH (output: $empty_env_output)"
 assert_eq ok "$empty_env_output" 'timeout command relays output without PATH'
 
+# Interpreter startup is a protocol phase, not part of the output-drain
+# timeout. A gated real relay must prevent exec until it can transfer bytes.
+"$timeout_python" "$root/tests/timeout-relay-startup.py" "$timeout_command"
+
 # A nested wrapper is the nearer owner for its target. The outer wrapper must
 # signal that owner once, leave its target dormant while the owner is alive,
 # and still close every relayed pipe before returning.
