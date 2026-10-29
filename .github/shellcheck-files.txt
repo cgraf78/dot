@@ -51,3 +51,4 @@ program	tests/run
 program	tests/shdeps-lock-verifier-test
 program	tests/test-lifecycle-test
 program	tests/workflow-test
+program	lib/dot/public/run-bounded-v1

@@ -1556,6 +1556,12 @@ pub(crate) struct Signals {
 }
 
 impl Signals {
+    /// Own cancellation for a low-level real process entry without constructing
+    /// an application runtime or installing its configuration/output adapters.
+    pub(crate) fn for_process_entry() -> std::io::Result<Self> {
+        Self::install_with_restore(false)
+    }
+
     #[cfg(test)]
     pub(crate) fn install() -> std::io::Result<Self> {
         Self::install_with_restore(true)
@@ -6913,6 +6919,77 @@ fn spawn_with_eagain_retry(
     }
 }
 
+/// An errno returned after the owned pre-exec authorization completed. Keep
+/// this distinct from a supervisor setup failure with the same errno.
+#[derive(Debug)]
+struct TargetExecFailure(std::io::Error);
+
+impl std::fmt::Display for TargetExecFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for TargetExecFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Conventional shell status only for a proven target-exec failure, never an
+/// internal allocation, registration, signal, or teardown failure.
+pub(crate) fn target_exec_status(error: &std::io::Error) -> Option<i32> {
+    let failure = error.get_ref()?.downcast_ref::<TargetExecFailure>()?;
+    match failure.0.raw_os_error() {
+        Some(libc::ENOENT) => Some(127),
+        Some(libc::EACCES | libc::ENOEXEC) => Some(126),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod target_exec_boundary_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt as _;
+
+    fn rejected_pre_exec(errno: i32) {
+        let _signals = Signals::install().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 91"]);
+        // SAFETY: this callback only returns the injected child setup errno.
+        unsafe {
+            command.pre_exec(move || Err(std::io::Error::from_raw_os_error(errno)));
+        }
+        let error = match spawn_owned_session(command) {
+            Err(error) => error,
+            Ok(_) => panic!("injected pre-exec failure launched the target"),
+        };
+        assert_eq!(error.raw_os_error(), Some(errno));
+        assert_eq!(target_exec_status(&error), None);
+    }
+
+    #[test]
+    fn pre_exec_eacces_is_setup_failure_not_a_nonexecutable_target() {
+        rejected_pre_exec(libc::EACCES);
+    }
+
+    #[test]
+    fn pre_exec_enoent_is_setup_failure_not_a_missing_target() {
+        rejected_pre_exec(libc::ENOENT);
+    }
+
+    #[test]
+    fn authorized_exec_enoent_is_a_missing_target() {
+        let _signals = Signals::install().unwrap();
+        let error = match spawn_owned_session(Command::new("/unavailable/dot-bounded-target")) {
+            Err(error) => error,
+            Ok(_) => panic!("missing executable launched"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(target_exec_status(&error), Some(127));
+    }
+}
+
 /// Pick the error that started a failed owned launch.
 ///
 /// The two sides of the pre-exec handshake fail in cascade. A child that
@@ -7126,6 +7203,7 @@ pub(crate) fn spawn_owned_session(
             ));
         }
         Err(error) => {
+            let authorized = decision.registration.is_some();
             if let Some(registration) = decision.registration {
                 unregister_session_boundary(decision.pid, registration);
             }
@@ -7133,7 +7211,21 @@ pub(crate) fn spawn_owned_session(
             if let Some(signal) = decision.signal {
                 return Ok(OwnedLaunch::Cancelled(signal));
             }
-            return Err(error);
+            // All user-provided pre-exec callbacks, setsid and lease setup
+            // preceded the authorization handshake. These particular errnos
+            // after authorization therefore identify target exec failure.
+            return Err(
+                if authorized
+                    && matches!(
+                        error.raw_os_error(),
+                        Some(libc::ENOENT | libc::EACCES | libc::ENOEXEC)
+                    )
+                {
+                    std::io::Error::new(error.kind(), TargetExecFailure(error))
+                } else {
+                    error
+                },
+            );
         }
     };
     lease.parent_spawned(

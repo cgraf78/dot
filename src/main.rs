@@ -31,14 +31,21 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 fn main() {
+    let mut process_args = std::env::args_os();
+    let argv0 = process_args.next();
+    let args = process_args.collect::<Vec<_>>();
+    // This versioned process primitive deliberately precedes configuration,
+    // source discovery, environment scrubbing, umask policy and output relays.
+    // Its child inherits the caller's streams and descriptors byte-for-byte.
+    if let Some(code) = dot::bounded_command::dispatch(&args) {
+        dot::cleanup::exit_process(code);
+    }
     dot::startup::apply_umask_ceiling();
     let env = std::env::vars_os().collect::<BTreeMap<_, _>>();
     // The snapshot keeps Dot's handoff variables; children never inherit them.
     dot::handoff::scrub_process_env();
     let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-    let mut process_args = std::env::args_os();
-    let argv0 = process_args.next();
-    let args = process_args.collect::<Vec<_>>();
+
     let command = args
         .first()
         .map(|arg| arg.as_encoded_bytes())

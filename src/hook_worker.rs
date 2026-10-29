@@ -297,6 +297,10 @@ impl Worker {
             .arg(decoded_path)
             .env("HOME", self.runtime.home())
             .env("DOT_SOURCE_ROOT", source_root)
+            .env(
+                "DOT_RUN_BOUNDED",
+                source_root.join("lib/dot/public/run-bounded-v1"),
+            )
             .env("TMPDIR", result_dir)
             .env("XDG_CONFIG_HOME", self.runtime.config_home())
             .env("XDG_STATE_HOME", self.runtime.state_home())

@@ -299,6 +299,34 @@ strictly serial execution. After cancellation no further extension
 starts; running workers receive the forwarded signal and are reaped, and only
 the extension whose records were next to render is still reported.
 
+`dot_doctor_run_bounded SECONDS COMMAND [ARG ...]` runs one external probe
+through Dot's native process supervisor. Feature-probe it with `declare -F`
+because older coordinators do not provide the helper. Decimal nonnegative
+seconds are accepted; textual zero (including `0.0`) disables the deadline.
+Positive values below nanosecond resolution remain a one-nanosecond deadline.
+The command inherits stdin, stdout, stderr, umask, and nonreserved extra
+descriptors. The supervisor returns the child
+status, `124` for a deadline, `125` for invalid input or unavailable/unproven
+supervision, `126` for a nonexecutable target, `127` for a missing target, or
+`128 + signal` for handled cancellation. Every return attempts
+owned descendant cleanup with TERM/KILL escalation while retaining safe process
+identity; an unproven cleanup returns `125`. Dot uses its standard nominal
+one-second TERM grace plus bounded discovery and KILL verification. No Bash job
+control is involved.
+
+`DOT_RUN_BOUNDED` is the absolute path of the public executable
+`lib/dot/public/run-bounded-v1`, exported to doctor and test workers. It takes
+the same arguments and execs the native supervisor, so callers needing direct
+PID cancellation can invoke it without an extra shell wrapper. It is also
+available from a source checkout or release independently of a configured
+client: `dot run-bounded-v1 SECONDS COMMAND [ARG ...]` bypasses normal Dot
+configuration, source discovery and output relays. Internal supervision
+channels are private. The shell helper preserves nonreserved extra descriptors,
+including FDs 3 and 9; its interpreter can reserve descriptors such as Bash's
+FD 255. Invoke the native `dot run-bounded-v1` entry directly when arbitrary
+descriptor numbers must be preserved. This interface does not depend on Python
+or an external timeout command.
+
 Test extensions are executable `tests/*-test` programs. By default, `dot test`
 runs those client suites in parallel. The provider-owned `dot` suite remains
 available through `dot test dot`, or alongside client suites in an unfiltered

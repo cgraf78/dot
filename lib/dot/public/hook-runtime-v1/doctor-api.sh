@@ -142,3 +142,11 @@ dot_doctor_source() {
     return 1
   }
 }
+
+# Added after API 1: older coordinators do not define this function. Probe with
+# declare -F before calling. The public executable also permits exact-PID
+# cancellation without launching a job-control shell around the command.
+dot_doctor_run_bounded() {
+  [[ -n ${DOT_RUN_BOUNDED:-} && -x $DOT_RUN_BOUNDED ]] || return 125
+  "$DOT_RUN_BOUNDED" "$@"
+}

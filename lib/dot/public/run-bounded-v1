@@ -1,0 +1,18 @@
+#!/bin/sh
+# Keep this public process boundary transparent: exec preserves its PID, all
+# stdio, nonreserved extra descriptors and umask. The interpreter may reserve
+# descriptors (for example Bash FD 255); call native Dot directly to preserve
+# arbitrary descriptor numbers. Native Dot owns launch and teardown.
+case $0 in
+  */*) dot_bounded_root=${0%/*}/../../.. ;;
+  *) exit 125 ;;
+esac
+for dot_bounded_binary in \
+  "$dot_bounded_root/dot" \
+  "$dot_bounded_root/target/debug/dot" \
+  "$dot_bounded_root/target/release/dot"; do
+  if [ -f "$dot_bounded_binary" ] && [ -x "$dot_bounded_binary" ]; then
+    exec "$dot_bounded_binary" run-bounded-v1 "$@"
+  fi
+done
+exit 125

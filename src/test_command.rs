@@ -716,6 +716,13 @@ pub(crate) fn environment(
                 .into_os_string(),
         ),
         (
+            "DOT_RUN_BOUNDED",
+            runtime
+                .source_root()
+                .join("lib/dot/public/run-bounded-v1")
+                .into_os_string(),
+        ),
+        (
             "DOT_TEST_TIMEOUT",
             runtime
                 .source_root()

@@ -16,6 +16,7 @@ lib/dot/public/hook-runtime-v1/repos/config.sh	dotfiles:core/repos/config.sh@dot
 lib/dot/public/hook-runtime-v1/repos/overlays.sh	dotfiles:core/repos/overlays.sh@dotfiles-v1
 lib/dot/public/hook-runtime-v1/temp.sh	dotfiles:core/temp.sh@dotfiles-v1
 lib/dot/public/hook-runtime-v1/worker.sh	standalone:new
+lib/dot/public/run-bounded-v1	standalone:new
 lib/dot/public/test-reporter-v1	standalone:new
 lib/dot/public/test-timeout-v1	dotfiles:.local/lib/dotfiles/tests/timeout.py@dotfiles-v2
 lib/dot/public/test-api-v1.tsv	standalone:new
@@ -28,6 +29,7 @@ support/performance-command-supervisor.rs	standalone:new
 support/shdeps.lock	shdeps:installer-lock
 tests/batch-verification-test	standalone:new
 tests/cleanup.rs	standalone:new
+tests/bounded_command.rs	standalone:new
 tests/cli.rs	standalone:new
 tests/client-launcher-test	standalone:new
 tests/config.rs	standalone:new

@@ -10,6 +10,7 @@
 
 pub mod app;
 pub(crate) mod bash;
+pub mod bounded_command;
 mod cancellation;
 pub mod cleanup;
 pub mod cli;
