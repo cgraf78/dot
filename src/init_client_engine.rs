@@ -967,8 +967,8 @@ impl<'a> Production<'a> {
             )
         };
         let discard_staged_next = |stage: &Path| entry::discard_staged_next(stage);
-        let identity_matches = |path: &Path, recorded: &str| {
-            persisted_identity::path_matches(path, recorded, journaled)
+        let identity_matches = |mode: &str, path: &Path, recorded: &str| {
+            persisted_identity::path_matches_mode(mode, path, recorded, journaled)
         };
         let candidate_matches_git =
             |git_dir: &Path, commit: &str, mode: &str, oid: &str, relative: &str| {

@@ -102,12 +102,13 @@ pub type EntryStageOnlyNext<'a> = dyn Fn(&Path) -> Result<()> + 'a;
 /// `_dot_init_discard_staged_next` by position (`stage`).
 pub type DiscardStagedNext<'a> = dyn Fn(&Path) -> Result<()> + 'a;
 
-/// Whether the object at a path (first argument, followed like
-/// `_dot_path_identity`) is still the one a journaled `dev:ino` (second)
-/// names. A failed stat never matches, like the shell's empty
-/// `$(... || true)`; the engine binds the bound for a renumbered device
-/// (see [`crate::persisted_identity`]).
-pub type IdentityMatches<'a> = dyn Fn(&Path, &str) -> bool + 'a;
+/// Whether the object at a path (second argument) is still the one
+/// a journaled `dev:ino` (third) names, for the given mode (first):
+/// the link itself for mode `120000`, the followed object for
+/// everything else. A failed stat never matches, like the shell's
+/// empty `$(... || true)`; the engine binds the bound for a
+/// renumbered device (see [`crate::persisted_identity`]).
+pub type IdentityMatches<'a> = dyn Fn(&str, &Path, &str) -> bool + 'a;
 
 /// `_dot_init_candidate_matches_git` by position
 /// (`git_dir commit mode oid relative`).
@@ -174,7 +175,8 @@ pub struct RollbackDeps<'a> {
     pub entry_stage_only_next: Box<EntryStageOnlyNext<'a>>,
     /// Runs `_dot_init_discard_staged_next`.
     pub discard_staged_next: Box<DiscardStagedNext<'a>>,
-    /// Compares a journaled identity (see [`IdentityMatches`]).
+    /// Compares a journaled identity (see [`IdentityMatches`]);
+    /// mode-aware, so a symlink compares the link itself.
     pub identity_matches: Box<IdentityMatches<'a>>,
     /// Runs `_dot_init_candidate_matches_git`.
     pub candidate_matches_git: Box<CandidateMatchesGit<'a>>,
@@ -489,7 +491,7 @@ pub fn rollback_entry(
                 (deps.entry_stage_only_next)(&stage)?;
                 let next = join2(&stage, "next");
                 if exists_lexical(&next) {
-                    if !(deps.identity_matches)(&next, &next_identity) {
+                    if !(deps.identity_matches)(mode, &next, &next_identity) {
                         return Err(Error::Usage {
                             message: "rollback entry next generation changed",
                         });

@@ -502,7 +502,7 @@ pub fn published_intent_matches(
     }
     let target = join2(home, path);
     let next = format!("{}:{}", record.next_dev, record.next_ino);
-    if !crate::persisted_identity::path_matches(&target, &next, hooks.journaled) {
+    if !crate::persisted_identity::path_matches_mode(mode, &target, &next, hooks.journaled) {
         return Err(Error::Usage {
             message: "published file changed under its intent",
         });

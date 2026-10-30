@@ -82,15 +82,17 @@ fn owned_by_us(path: &Path) -> bool {
     }
 }
 
-/// `stat -c '%d:%i'` rendered as text, or empty when the stat fails:
-/// the shell's `$(_dot_path_identity "$path" 2>/dev/null || true)`.
-/// `stat` follows symlinks on both engines. Only for identities this
-/// process captured itself; journaled ones go through
-/// [`persisted_identity::path_matches`].
-fn live_identity_string(path: &Path) -> String {
-    temp::path_identity(path)
-        .map(temp::identity_string)
-        .unwrap_or_default()
+/// `stat -c '%d:%i'` of the object itself, never following links,
+/// or `None` when the stat fails.
+/// The restore check below compares the parked and replaced
+/// identities of the same object; a parked link is that object,
+/// not its target, and a dangling link has no followed identity
+/// at all. For regular files and directories `lstat` and `stat`
+/// agree, so this changes nothing for them.
+fn leaf_identity_string(path: &Path) -> Option<String> {
+    persisted_identity::LiveIdentity::of_leaf(path)
+        .ok()
+        .map(|live| format!("{}:{}", live.dev, live.ino))
 }
 
 /// Raw bytes of a path, so `$HOME/` prefix checks and `$HOME/$path`
@@ -277,13 +279,19 @@ pub fn delete_park_path(target: &Path, kind: &str, key: &str, nonce: &str) -> Re
 /// `commit` revision selects nothing here — the shell binds `$2` and
 /// never reads it — but the arity stays so callers map positionally.
 ///
-/// Symlinks hash their `readlink` bytes *plus the trailing newline*:
-/// the shell's `link_target=$(readlink "$target"; printf .)` trick
-/// preserves `readlink`'s own newline (`${link_target%.}` only drops
-/// the sentinel dot), so `git hash-object --stdin` sees
-/// `"<target>\n"`. A live symlink therefore hashes differently from
-/// its tree blob (which stores the bare target) and never matches —
-/// that is the shell's observed behavior, reproduced byte for byte.
+/// Symlinks hash their bare `readlink` bytes: git stores a symlink
+/// blob as exactly the target bytes, with no trailing newline. The
+/// shell-era check hashed `"<target>\n"` instead — its
+/// `link_target=$(readlink "$target"; printf .)` trick preserved
+/// `readlink`'s own newline (`${link_target%.}` only drops the
+/// sentinel dot) — so a live symlink could never match its tree
+/// blob and init publication of any symlink always failed. That
+/// defect stayed latent because no tracked tree carried a symlink
+/// until dotfiles gained one, and the Rust port reproduced it byte
+/// for byte. This engine deliberately breaks that parity: hashing
+/// the bare bytes makes a live symlink match its tree blob, the
+/// same convention `init_client_candidate` and the pull path
+/// (`file_text_digest` over raw link bytes) already use.
 /// Regular files hash through `git hash-object --no-filters` with an
 /// owner-execute check (`100755` needs any execute bit,
 /// `100644` needs none); any other mode fails outright.
@@ -305,8 +313,7 @@ pub fn candidate_matches_git(
                 Ok(link) => link,
                 Err(_) => return false,
             };
-            let mut payload = link.as_os_str().as_bytes().to_vec();
-            payload.push(b'\n');
+            let payload = link.as_os_str().as_bytes().to_vec();
             match hash_stdin_git_dir(git_dir, &payload) {
                 Some(actual) => actual == oid,
                 None => false,
@@ -443,7 +450,7 @@ pub fn leaf_delete_matches(
     home: &Path,
     journaled: Option<SystemTime>,
 ) -> bool {
-    if !persisted_identity::path_matches(candidate, expected_identity, journaled) {
+    if !persisted_identity::path_matches_mode(mode, candidate, expected_identity, journaled) {
         return false;
     }
     let relative = match strip_home_prefix(home, candidate) {
@@ -633,14 +640,13 @@ pub fn delete_parked_generation(
     }
     if !verifier(park) {
         if parked_now && !exists_lexical(target) {
-            let parked_identity = match temp::path_identity(park) {
-                Ok(identity) => temp::identity_string(identity),
-                Err(_) => return false,
+            let Some(parked_identity) = leaf_identity_string(park) else {
+                return false;
             };
             if temp::move_noreplace_cached(park, target, cache).is_err() {
                 return false;
             }
-            if live_identity_string(target) != parked_identity {
+            if leaf_identity_string(target).as_deref() != Some(parked_identity.as_str()) {
                 return false;
             }
         }
