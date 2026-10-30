@@ -262,6 +262,79 @@ fn intent_matches_prepared_states() {
     });
 }
 
+#[test]
+fn intent_matches_prepared_symlink() {
+    let dir = TempDir::new("publish-intent-link").expect("temp");
+    let home = dir.path();
+    // A published link, nested and dangling like the real incident:
+    // its recorded identity is the link's own, and no followed stat
+    // can produce it.
+    let link = home.join("cfg/link");
+    std::fs::create_dir_all(home.join("cfg")).expect("cfg");
+    std::os::unix::fs::symlink("app-target", &link).expect("link");
+    let link_id = {
+        let meta = std::fs::symlink_metadata(&link).expect("link stat");
+        format!("{}:{}", meta.dev(), meta.ino())
+    };
+    let consumed = home.join("consumed");
+    let record = intent("prepared", &consumed, "1:2", &link_id, home);
+    let read = |_: &Path, _: &str, _: &str, _: &str| {
+        Ok(publish::IntentRecord {
+            phase: record.phase.clone(),
+            stage: record.stage.clone(),
+            dev: record.dev.clone(),
+            ino: record.ino.clone(),
+            next_dev: record.next_dev.clone(),
+            next_ino: record.next_ino.clone(),
+        })
+    };
+    with_stage_hooks(|hooks| {
+        assert!(
+            publish::published_intent_matches(
+                &home.join("intent"),
+                "120000",
+                "oid",
+                "cfg/link",
+                home,
+                &read,
+                hooks
+            )
+            .is_ok(),
+            "dangling published link must match its own identity"
+        );
+    });
+    // A resolving link whose recorded identity names its target
+    // must NOT match: the check reads the link, not the target.
+    let target = write(home, "cfg/app-target", b"target");
+    let target_id = identity(&target);
+    let record = intent("prepared", &consumed, "1:2", &target_id, home);
+    let read = |_: &Path, _: &str, _: &str, _: &str| {
+        Ok(publish::IntentRecord {
+            phase: record.phase.clone(),
+            stage: record.stage.clone(),
+            dev: record.dev.clone(),
+            ino: record.ino.clone(),
+            next_dev: record.next_dev.clone(),
+            next_ino: record.next_ino.clone(),
+        })
+    };
+    with_stage_hooks(|hooks| {
+        assert!(
+            publish::published_intent_matches(
+                &home.join("intent"),
+                "120000",
+                "oid",
+                "cfg/link",
+                home,
+                &read,
+                hooks
+            )
+            .is_err(),
+            "target identity must not match the link"
+        );
+    });
+}
+
 /// `published_intent_matches` for a prepared intent whose stage was
 /// consumed and whose `next` identity is `target`'s journaled before a
 /// reboot renumbered the mount, read back against `journaled`.

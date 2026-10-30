@@ -667,6 +667,37 @@ pub fn discard_staged_next(stage: &Path) -> Result<()> {
     }
 }
 
+/// Identity of a publish candidate: the link itself for symlinks
+/// (`lstat`), the file for everything else (`stat`). The shell's
+/// `stat -c '%d:%i'` follows links, so a staged symlink — whose
+/// target resolves only once the link reaches its final path —
+/// dangles under `stat` and can never be identified; the link's
+/// own device/inode is the identity that survives the move, and
+/// the landed and placed checks below must read the same object.
+fn candidate_identity(mode: &str, path: &Path) -> Result<(u64, u64)> {
+    if mode == "120000" {
+        let meta = std::fs::symlink_metadata(path).map_err(|_| Error::Usage {
+            message: "entry next has no identity",
+        })?;
+        Ok((meta.dev(), meta.ino()))
+    } else {
+        temp::path_identity(path).map_err(|_| Error::Usage {
+            message: "entry next has no identity",
+        })
+    }
+}
+
+/// Live identity of a publish candidate, mirroring
+/// [`candidate_identity`]: the link itself for symlinks, the file
+/// for everything else.
+fn live_candidate_identity(mode: &str, path: &Path) -> Result<persisted_identity::LiveIdentity> {
+    if mode == "120000" {
+        persisted_identity::LiveIdentity::of_leaf(path)
+    } else {
+        persisted_identity::LiveIdentity::of(path)
+    }
+}
+
 /// `_dot_init_publish_one`: drive one entry from its intent record
 /// to its home path through the stage directory. A `pending`
 /// intent claims (or revalidates) the stage and binds it to its
@@ -817,9 +848,7 @@ pub fn publish_one(inputs: &PublishOneInputs<'_>, moves: &mut MoveCache) -> Resu
                 message: "entry candidate does not match git",
             });
         }
-        let (dev, ino) = temp::path_identity(&next).map_err(|_| Error::Usage {
-            message: "entry next has no identity",
-        })?;
+        let (dev, ino) = candidate_identity(inputs.mode, &next)?;
         next_dev = dev.to_string();
         next_journaled = None;
         next_ino = ino.to_string();
@@ -848,7 +877,7 @@ pub fn publish_one(inputs: &PublishOneInputs<'_>, moves: &mut MoveCache) -> Resu
     let wanted_next = format!("{next_dev}:{next_ino}");
     // The shell reads the identity through `|| true`: a missing
     // candidate compares as empty and fails the gate.
-    let landed = persisted_identity::LiveIdentity::of(&next).map_err(|_| Error::Usage {
+    let landed = live_candidate_identity(inputs.mode, &next).map_err(|_| Error::Usage {
         message: "entry next has no identity",
     })?;
     if !persisted_identity::matches(&wanted_next, &landed, next_journaled) {
@@ -868,7 +897,7 @@ pub fn publish_one(inputs: &PublishOneInputs<'_>, moves: &mut MoveCache) -> Resu
         });
     }
     temp::move_noreplace_cached(&next, &target, moves)?;
-    let placed = persisted_identity::LiveIdentity::of(&target).map_err(|_| Error::Usage {
+    let placed = live_candidate_identity(inputs.mode, &target).map_err(|_| Error::Usage {
         message: "published entry has no identity",
     })?;
     if !persisted_identity::matches(&wanted_next, &placed, next_journaled) {

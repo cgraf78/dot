@@ -379,6 +379,13 @@ fn identity_of(path: &Path) -> String {
     dot::temp::identity_string(identity)
 }
 
+/// `dev:ino` identity text of the link itself, never following it.
+fn leaf_identity_of(path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::symlink_metadata(path).expect("link stat identity");
+    format!("{}:{}", meta.dev(), meta.ino())
+}
+
 /// Write a parent-intent journal: six tab fields, trailing
 /// newline, private mode.
 fn write_parent_intent(
@@ -1025,6 +1032,142 @@ fn entry_prepared_removes_tracked_target_and_stage() {
 }
 
 #[test]
+fn entry_prepared_symlink_next_removes_both() {
+    let case = Case::build("e6-link-prepared-match");
+    let oid = hash_bytes(b"app-target");
+    let path = "cfg/link";
+    let mut sides = Vec::new();
+    for (home, xdg) in [
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
+    ] {
+        let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
+        git(&["init", rec.git_dir.to_str().expect("utf8 git dir")]);
+        let (_, stage) = entry_stage(&rec.nonce, path);
+        let stage_abs = make_stage(home, &stage, Some(("entry", &rec.nonce, path)), &[]);
+        // A staged link dangles from its stage location, like the
+        // real incident: the identity check must read the link.
+        std::os::unix::fs::symlink("app-target", stage_abs.join("next")).expect("stage link");
+        let identity = identity_of(&stage_abs);
+        let (dev, ino) = identity.split_once(':').expect("dev:ino");
+        let next_identity = leaf_identity_of(&stage_abs.join("next"));
+        let (next_dev, next_ino) = next_identity.split_once(':').expect("dev:ino");
+        write_intent(
+            &transaction,
+            path,
+            "120000",
+            &oid,
+            &stage,
+            "prepared",
+            dev,
+            ino,
+            next_dev,
+            next_ino,
+        );
+        sides.push((rec, transaction, stage));
+    }
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, actual_stage) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(&sides[0].2));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_entry(
+        &deps,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
+        "120000",
+        &oid,
+        Path::new(path),
+    );
+    assert!(rust.is_ok(), "e6-link: native rollback must accept");
+    assert!(
+        !case.actual_home.join(actual_stage).exists(),
+        "e6-link: actual stage removed"
+    );
+    assert_parity(
+        "e6-link",
+        expected_code,
+        &rust,
+        &[],
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
+    );
+}
+
+#[test]
+fn entry_prepared_removes_published_symlink_target_and_stage() {
+    let case = Case::build("e10-link-tracked-target");
+    let oid = hash_bytes(b"app-target");
+    let path = "cfg/link";
+    let mut sides = Vec::new();
+    for (home, xdg) in [
+        (&case.expected_home, &case.expected_xdg),
+        (&case.actual_home, &case.actual_xdg),
+    ] {
+        let (rec, transaction, _) = entry_side(home, xdg, &"cd".repeat(20));
+        git(&["init", rec.git_dir.to_str().expect("utf8 git dir")]);
+        let (_, stage) = entry_stage(&rec.nonce, path);
+        let stage_abs = make_stage(home, &stage, Some(("entry", &rec.nonce, path)), &[]);
+        let identity = identity_of(&stage_abs);
+        let (dev, ino) = identity.split_once(':').expect("dev:ino");
+        std::fs::create_dir_all(home.join("cfg")).expect("cfg");
+        // A published link, dangling in home: the park verifier
+        // must read the link, not its absent target.
+        std::os::unix::fs::symlink("app-target", home.join(path)).expect("target link");
+        let target_identity = leaf_identity_of(&home.join(path));
+        let (next_dev, next_ino) = target_identity.split_once(':').expect("dev:ino");
+        write_intent(
+            &transaction,
+            path,
+            "120000",
+            &oid,
+            &stage,
+            "prepared",
+            dev,
+            ino,
+            next_dev,
+            next_ino,
+        );
+        sides.push((rec, transaction, stage));
+    }
+    let (_expected_rec, _expected_tx, _) = &sides[0];
+    let (actual_rec, actual_tx, actual_stage) = &sides[1];
+    let actual_intent = actual_tx.join(format!("publish-intent.{}", hash_bytes(path.as_bytes())));
+    let expected_code = 0;
+    remove_fixture(&case.expected_home.join(&sides[0].2));
+    remove_fixture(&case.expected_home.join(path));
+    let deps = native_deps(&case.actual_home, &case.actual_xdg, actual_rec);
+    let rust = rb::rollback_entry(
+        &deps,
+        &case.actual_home,
+        &entry_ctx(actual_rec),
+        &actual_intent,
+        "120000",
+        &oid,
+        Path::new(path),
+    );
+    assert!(rust.is_ok(), "e10-link: native rollback must accept");
+    assert!(
+        !case.actual_home.join(path).exists(),
+        "e10-link: actual target removed"
+    );
+    assert!(
+        !case.actual_home.join(actual_stage).exists(),
+        "e10-link: actual stage removed"
+    );
+    assert_parity(
+        "e10-link",
+        expected_code,
+        &rust,
+        &[],
+        &inventory(&[&case.expected_home]),
+        &inventory(&[&case.actual_home]),
+    );
+}
+
+#[test]
 fn entry_missing_intent_refuses() {
     let case = Case::build("e12-missing-intent");
     let oid = hash_bytes(b"note body");
@@ -1318,8 +1461,8 @@ fn native_deps<'a>(home: &'a Path, xdg: &'a Path, rec: &'a Rec) -> rb::RollbackD
             )
         }),
         discard_staged_next: Box::new(entry::discard_staged_next),
-        identity_matches: Box::new(|path, recorded| {
-            dot::persisted_identity::path_matches(path, recorded, None)
+        identity_matches: Box::new(|mode, path, recorded| {
+            dot::persisted_identity::path_matches_mode(mode, path, recorded, None)
         }),
         candidate_matches_git: Box::new(move |git_dir, commit, mode, oid, relative| {
             matched(
@@ -2396,7 +2539,7 @@ fn stub_deps<'a>(log: &'a Log, behavior: &'a Behavior) -> rb::RollbackDeps<'a> {
                 Err(stub_error())
             }
         }),
-        identity_matches: Box::new(|path, recorded| {
+        identity_matches: Box::new(|_mode, path, recorded| {
             log.push(format!("path_identity {}", path.display()));
             behavior.identity == recorded
         }),

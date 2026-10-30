@@ -177,6 +177,28 @@ pub fn path_matches(path: &Path, recorded: &str, journaled: Option<SystemTime>) 
     LiveIdentity::of(path).is_ok_and(|live| matches(recorded, &live, journaled))
 }
 
+/// [`matches()`] for the object at `path` itself, never following
+/// symlinks. A failed stat never matches.
+pub fn path_matches_leaf(path: &Path, recorded: &str, journaled: Option<SystemTime>) -> bool {
+    LiveIdentity::of_leaf(path).is_ok_and(|live| matches(recorded, &live, journaled))
+}
+
+/// [`matches()`] for the object at `path`: the link itself for
+/// mode `120000` (the link is the tracked object), the followed
+/// object for everything else. A failed stat never matches.
+pub fn path_matches_mode(
+    mode: &str,
+    path: &Path,
+    recorded: &str,
+    journaled: Option<SystemTime>,
+) -> bool {
+    if mode == "120000" {
+        path_matches_leaf(path, recorded, journaled)
+    } else {
+        path_matches(path, recorded, journaled)
+    }
+}
+
 /// Birth time of the object `meta` describes. Linux reads it through `statx`
 /// directly: std does that only on glibc, and release binaries are static
 /// musl builds.

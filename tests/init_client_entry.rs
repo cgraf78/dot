@@ -1315,14 +1315,30 @@ fn publish_executable_top_level() {
 }
 
 #[test]
-fn publish_symlink_candidate_check_refuses() {
+fn publish_symlink() {
     let world = publish_world("publish-link");
     seed_pending(&world.home, "120000", &world.link_oid, "cfg/link");
-    assert!(!publish(&world, "120000", &world.link_oid, "cfg/link"));
-    assert_stage_bound(&world.home);
+    assert!(publish(&world, "120000", &world.link_oid, "cfg/link"));
+    let target = world.home.join("cfg/link");
     assert_eq!(
-        std::fs::read_link(stage_leftovers(&world.home)[0].join("next")).expect("link"),
+        std::fs::read_link(&target).expect("link"),
         PathBuf::from("app-target")
+    );
+    assert!(stage_leftovers(&world.home).is_empty());
+    // The intent binds the link itself, not its target: the link
+    // dangles in this home (`app-target` is never published), so a
+    // following stat would have no identity at all.
+    let fields = intent_fields(&world.home);
+    assert_eq!(fields[0], b"prepared");
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::symlink_metadata(&target).expect("link stat");
+    assert_eq!(
+        format!(
+            "{}:{}",
+            String::from_utf8_lossy(&fields[7]),
+            String::from_utf8_lossy(&fields[8])
+        ),
+        format!("{}:{}", meta.dev(), meta.ino())
     );
 }
 
