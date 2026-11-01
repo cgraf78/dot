@@ -5263,17 +5263,24 @@ fn update_native_verbose_merge_replays_hook_output_in_declaration_order() {
     // A missing stage update or replay would make the quiet happy-path pass
     // while losing the human-visible hook result contract. Alpha waits for
     // beta and beta for gamma, which only starts once alpha frees one of the
-    // two workers, so the cross-hook waits are bounded at 3000 x 10ms (30s):
-    // far past CI scheduling delays, still finite, and never the check
-    // itself (the ordering assertions below are).
+    // two workers, so the cross-hook waits are bounded by a 300s wall-clock
+    // deadline: still finite, and never the check itself (the ordering
+    // assertions below are). The bound is wall clock, not iterations:
+    // each poll forks `sleep`, so under load an iteration costs far more
+    // than 10ms and an iteration count is not a time bound at all. The
+    // 300s is provisional, not a claimed root cause: the failing
+    // scheduled run's effective iteration bound was ~150s (3000 polls at
+    // ~50ms under load), so 300s is 2x that worst case pending diagnostic
+    // evidence from a recurrence. The investigation stays open, and the
+    // timeout lines below name the awaited marker.
     let hooks: &[(&str, &[u8])] = &[
         (
             "10-alpha.sh",
-            b"merge() { i=0; while [[ ! -e $HOME/beta-ready ]]; do (( i += 1 )); (( i < 3000 )) || return 9; sleep 0.01; done; printf 'Alpha result\\nalpha detail\\n'; printf alpha >\"$HOME/alpha-done\"; }\n",
+            b"merge() { deadline=$((SECONDS + 300)); while [[ ! -e $HOME/beta-ready ]]; do (( SECONDS < deadline )) || { printf 'timed out waiting for beta-ready after 300s\\n'; return 9; }; sleep 0.01; done; printf 'Alpha result\\nalpha detail\\n'; printf alpha >\"$HOME/alpha-done\"; }\n",
         ),
         (
             "11-beta.sh",
-            b"merge() { printf ready >\"$HOME/beta-ready\"; i=0; while [[ ! -e $HOME/gamma-ready ]]; do (( i += 1 )); (( i < 3000 )) || return 9; sleep 0.01; done; printf 'Beta result\\nbeta detail\\n'; printf beta >\"$HOME/beta-done\"; }\n",
+            b"merge() { printf ready >\"$HOME/beta-ready\"; deadline=$((SECONDS + 300)); while [[ ! -e $HOME/gamma-ready ]]; do (( SECONDS < deadline )) || { printf 'timed out waiting for gamma-ready after 300s\\n'; return 9; }; sleep 0.01; done; printf 'Beta result\\nbeta detail\\n'; printf beta >\"$HOME/beta-done\"; }\n",
         ),
         (
             "12-gamma.sh",
@@ -5295,8 +5302,28 @@ fn update_native_verbose_merge_replays_hook_output_in_declaration_order() {
         cmd.env("DOT_UPDATE_JOBS", "1");
         cmd.env("DOT_MERGE_JOBS", "2");
     });
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(output.stderr, b"");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "update status; stdout={} stderr={} markers={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        [
+            "beta-ready",
+            "alpha-done",
+            "beta-done",
+            "gamma-ready",
+            "barrier-done",
+            "delta-done",
+        ]
+        .map(|name| (name, fixture.client.home.join(name).exists())),
+    );
+    assert_eq!(
+        output.stderr,
+        b"",
+        "update stderr; stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     let positions = [
         b"Alpha result".as_slice(),
         b"Beta result".as_slice(),
