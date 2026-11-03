@@ -1773,6 +1773,33 @@ def stop_stdio_relays(deadline: float, drain_output: bool = True) -> bool:
     return complete and not pending
 
 
+def wait_process_bounded(popen: subprocess.Popen, timeout_seconds: float) -> int:
+    """Wait for a child with a timeout, working around a broken platform wait.
+
+    Fedora's Python 3.15 raises TypeError from Popen.wait(timeout=...)
+    when the child is still alive: its subprocess._wait_pidfd calls
+    os.pidfd_open, which is None in that build. Polling gives the same
+    bounded semantics on such a platform instead of crashing the tool.
+    The fallback triggers only for that exact broken configuration; on
+    platforms without this defect the TypeError propagates unchanged.
+    """
+    try:
+        return popen.wait(timeout=timeout_seconds)
+    except TypeError:
+        if not ("pidfd_open" in dir(os) and os.pidfd_open is None):
+            raise
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            status = popen.poll()
+            if status is not None:
+                return status
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(
+                    popen.args, timeout_seconds
+                ) from None
+            time.sleep(PROCESS_POLL_SECONDS)
+
+
 def stop_launch_helper(child: subprocess.Popen) -> None:
     """Kill and reap a helper that never completed safe target exec."""
     try:
@@ -1780,7 +1807,7 @@ def stop_launch_helper(child: subprocess.Popen) -> None:
     except (PermissionError, ProcessLookupError):
         pass
     try:
-        child.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
+        wait_process_bounded(child, PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as error:
         raise CleanupIncompleteError(
             "launch helper did not reap before its deadline"
@@ -2034,7 +2061,7 @@ def launch_process(argv: Sequence[str], child_env: dict[str, str]) -> subprocess
         close_fd(error_read)
         error_read = None
         if exec_error is not None:
-            child.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
+            wait_process_bounded(child, PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
             process = None
             close_fd(lease_reader)
             lease_reader = None
@@ -2240,7 +2267,7 @@ def list_session_processes(
         if ps_process is not None:
             try:
                 ps_process.kill()
-                ps_process.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
+                wait_process_bounded(ps_process, PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
             except (OSError, subprocess.SubprocessError):
                 pass
         return None
@@ -2910,12 +2937,12 @@ def stop_process_group(first_signal: int) -> CleanupResult:
                 False,
             )
         try:
-            status = process.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
+            status = wait_process_bounded(process, PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             # The retained Popen handle is stable authority for its own leader.
             process.kill()
             try:
-                status = process.wait(timeout=PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
+                status = wait_process_bounded(process, PROCESS_SNAPSHOT_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
                 # A broken platform wait implementation must not turn bounded
                 # cleanup into an indefinite hang or a false success.
