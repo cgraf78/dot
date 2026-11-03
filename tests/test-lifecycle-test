@@ -1520,7 +1520,9 @@ PY
 # Old Linux/Android kernels without pidfd support still reap same-group
 # adopted zombies before reporting a completed timeout. The test removes the
 # Python pidfd entry points in-process instead of exposing a production test
-# environment switch.
+# environment switch. It hides them only from the module under test: CPython's
+# own subprocess shares the global os module, and Python 3.15 caches pidfd
+# support at import, so a patched global os.pidfd_open breaks Popen.wait.
 "$timeout_python" - "$timeout_command" <<'PY'
 import os
 import subprocess
@@ -1554,15 +1556,20 @@ if not sys.platform.startswith("linux"):
     raise SystemExit(0)
 wrapper = sys.argv[1]
 helper = r'''
-import importlib.util, os, signal, sys
+import importlib.util, os, signal, sys, types
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+def without(source, name):
+    copy = types.ModuleType(source.__name__)
+    copy.__dict__.update(source.__dict__)
+    copy.__dict__.pop(name, None)
+    return copy
 loader = SourceFileLoader("dot_timeout_no_pidfd", sys.argv[1])
 spec = importlib.util.spec_from_loader(loader.name, loader)
 module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
-module.os.pidfd_open = None
-module.signal.pidfd_send_signal = None
+module.os = without(os, "pidfd_open")
+module.signal = without(signal, "pidfd_send_signal")
 # Both loops give up after at least 1200s, past every suite timeout, in case
 # this helper dies before the escaped member is killed.
 script = """
@@ -2216,14 +2223,30 @@ import signal
 import subprocess
 import sys
 import tempfile
+import types
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+
+
+def private(source):
+    """Copy a standard module so os/signal stubs reach only the module under test.
+
+    CPython's own subprocess shares the global os module, and Python 3.15
+    caches pidfd support at import, so a globally stubbed os.pidfd_open
+    would break Popen.wait(timeout=...) for every unreaped child here.
+    """
+    copy = types.ModuleType(source.__name__)
+    copy.__dict__.update(source.__dict__)
+    return copy
+
 
 loader = SourceFileLoader("dot_timeout", sys.argv[1])
 spec = importlib.util.spec_from_loader(loader.name, loader)
 assert spec is not None
 module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
+module.os = private(module.os)
+module.signal = private(module.signal)
 real_launch_process = module.launch_process
 real_authorize_launch = module.authorize_launch
 real_os_close = module.os.close
@@ -3036,6 +3059,7 @@ import os
 import subprocess
 import sys
 import time
+import types
 from importlib.machinery import SourceFileLoader
 
 
@@ -3078,14 +3102,15 @@ finally:
 assert slept == [0.25, 0.5], slept
 
 real_pidfd_open = getattr(module.os, "pidfd_open", None)
-module.os.pidfd_open = None
+# Hide pidfd_open from the module under test only: CPython's own subprocess
+# shares the global os, and Python 3.15 would call a stubbed os.pidfd_open.
+module.os = types.ModuleType(os.__name__)
+module.os.__dict__.update(os.__dict__)
+module.os.__dict__.pop("pidfd_open", None)
 try:
     assert module.watch_child_exit(os.getpid()) is None
 finally:
-    if real_pidfd_open is None:
-        del module.os.pidfd_open
-    else:
-        module.os.pidfd_open = real_pidfd_open
+    module.os = os
 
 real_api_level = getattr(module.sys, "getandroidapilevel", None)
 if real_pidfd_open is not None and (real_api_level is None or real_api_level() >= 31):
